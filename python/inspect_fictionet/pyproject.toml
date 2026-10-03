@@ -1,0 +1,29 @@
+[project]
+name = "inspect-fictionet"
+version = "0.1.0"
+description = "Use a Fictionet world as an Inspect sandbox, in one line."
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "inspect-ai>=0.3.276",
+    "platformdirs>=4.12.2",
+    "pyyaml>=6.0.3",
+]
+
+[project.optional-dependencies]
+k8s = [
+    "inspect-k8s-sandbox>=0.13.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.17,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[project.urls]
+Repository = "https://github.com/amlalabs/fictionet-sdk"

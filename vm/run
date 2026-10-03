@@ -1,0 +1,488 @@
+#!/usr/bin/env bash
+# vm/run: a Debian VM under QEMU and KVM, for Fictionet's tests and demos.
+#
+# It needs no root and no Docker on this machine: only qemu-system-x86_64,
+# qemu-img, genisoimage (or mkisofs or xorriso), curl, ssh and a usable
+# /dev/kvm. Inside the VM the tests have root, so tun devices, network
+# namespaces, Docker and kind all work there. Everything is cached under
+# .vm/ in the repository. vm/README.md explains the design.
+#
+#   vm/run up              boot the VM (downloads and prepares the image the first time)
+#   vm/run ssh [command]   a shell in the VM, or run one command there, as root
+#   vm/run sync            copy this working tree into the VM, at /src
+#   vm/run build           sync, then build the static binaries in the VM
+#   vm/run test <name>     run one of the repository's test suites in the VM
+#   vm/run test list       list the suites
+#   vm/run demo <name>     what demos/<name> runs
+#   vm/run status          is the VM running, and on which ports
+#   vm/run down            shut the VM down and throw away its disk overlay
+#   vm/run clean           shut down and delete everything under .vm/
+#
+# Settings, from the environment: VM_CPUS (default 4), VM_MEM (the VM's
+# memory, default 5G), VM_KEEP=1 (a demo or test leaves the VM running when
+# it booted it). QEMU runs in a systemd user scope capped at VM_MEM plus
+# 1 GiB, so a VM that grows can never take the machine's memory with it;
+# VM_SCOPE=0 turns that off.
+
+set -euo pipefail
+# The disks hold the VM's files and keys: keep them to this user.
+umask 077
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+here="$root/vm"
+vmdir="$root/.vm"
+images="$vmdir/images"
+rundir="$vmdir/run"
+sshdir="$vmdir/ssh"
+cpus="${VM_CPUS:-4}"
+mem="${VM_MEM:-5G}"
+# shellcheck source=versions.sh
+. "$here/versions.sh"
+
+debian_dir="https://cloud.debian.org/images/cloud/trixie/$DEBIAN_BUILD"
+debian_file="debian-13-genericcloud-amd64-$DEBIAN_BUILD.qcow2"
+base="$images/$debian_file"
+cache_disk="$vmdir/cache.qcow2"
+cache_size=80G
+root_size=24G
+
+say() { printf '%s\n' "$*" >&2; }
+die() { say "vm/run: $*"; exit 1; }
+now() { date +%s.%N; }
+since() { awk -v a="$1" -v b="$(now)" 'BEGIN { printf "%.1f", b - a }'; }
+
+need() {
+    local missing=()
+    for tool in "$@"; do command -v "$tool" >/dev/null || missing+=("$tool"); done
+    ((${#missing[@]} == 0)) || die "missing on this machine: ${missing[*]}"
+}
+
+check_host() {
+    need qemu-system-x86_64 qemu-img curl ssh ssh-keygen sha512sum tar
+    [[ -r /dev/kvm && -w /dev/kvm ]] ||
+        die "/dev/kvm is not usable by $(id -un). Add yourself to the kvm group, or see vm/README.md."
+}
+
+# --- The base image -------------------------------------------------------
+
+fetch_base() {
+    [[ -f $base ]] && return
+    mkdir -p "$images"
+    say "Downloading the Debian 13 cloud image ($DEBIAN_BUILD), about 400 MB"
+    curl -fL --retry 3 --progress-bar -o "$images/SHA512SUMS" "$debian_dir/SHA512SUMS"
+    curl -fL --retry 3 --progress-bar -o "$base.part" "$debian_dir/$debian_file"
+    local want got
+    want="$(awk -v f="$debian_file" '$2 == f { print $1 }' "$images/SHA512SUMS")"
+    [[ -n $want ]] || die "$debian_file is not in Debian's SHA512SUMS"
+    got="$(sha512sum "$base.part" | awk '{print $1}')"
+    [[ $got == "$want" ]] || { rm -f "$base.part"; die "the image's SHA-512 does not match Debian's SHA512SUMS"; }
+    say "SHA-512 matches Debian's SHA512SUMS"
+    mv "$base.part" "$base"
+}
+
+# The prepared image is named after everything that goes into it, so a
+# change to the provisioning makes a new one.
+# The SSH key is part of it: an image only takes the key it was prepared with.
+prepared_key() {
+    cat "$here/versions.sh" "$here/guest/provision.sh" "$sshdir/id_ed25519.pub" | sha256sum | cut -c1-12
+}
+
+ssh_key() {
+    [[ -f $sshdir/id_ed25519 ]] && return
+    mkdir -p "$sshdir"
+    ssh-keygen -q -t ed25519 -N '' -C fictionet-vm -f "$sshdir/id_ed25519"
+}
+
+make_seed() {
+    local dir="$1" out="$2"
+    mkdir -p "$dir"
+    cat >"$dir/meta-data" <<EOF
+instance-id: fictionet-prepare
+local-hostname: fictionet-vm
+EOF
+    cat >"$dir/user-data" <<EOF
+#cloud-config
+hostname: fictionet-vm
+disable_root: false
+ssh_pwauth: false
+ssh_authorized_keys:
+  - $(cat "$sshdir/id_ed25519.pub")
+EOF
+    local iso
+    iso="$(command -v genisoimage || command -v mkisofs || true)"
+    if [[ -n $iso ]]; then
+        "$iso" -quiet -output "$out" -volid cidata -joliet -rock "$dir/user-data" "$dir/meta-data"
+    elif command -v xorriso >/dev/null; then
+        xorriso -as mkisofs -quiet -output "$out" -volid cidata -joliet -rock "$dir/user-data" "$dir/meta-data"
+    else
+        die "need genisoimage, mkisofs or xorriso to make the cloud-init seed"
+    fi
+}
+
+ensure_prepared() {
+    check_host
+    mkdir -p "$vmdir"
+    chmod 700 "$vmdir"
+    fetch_base
+    ssh_key
+    local key
+    key="$(prepared_key)"
+    prepared="$images/prepared-$key.qcow2"
+    [[ -f $prepared ]] && return
+    local t0
+    t0="$(now)"
+    say "Preparing the VM image once (packages, Docker, kind, Rust). This takes a few minutes."
+    local tmp="$prepared.part"
+    # Parts left by a prepare that was cut short.
+    rm -f "$images"/prepared-*.part
+    # Backing files are named relative to the overlay, so .vm/ can move.
+    qemu-img create -q -f qcow2 -F qcow2 -b "$debian_file" "$tmp" "$root_size"
+    mkdir -p "$rundir"
+    make_seed "$rundir/seed" "$rundir/seed.iso"
+    rm -f "$sshdir/known_hosts"
+    boot "$tmp" writeback "$rundir/seed.iso"
+    wait_ssh 300
+    vm_ssh 'mkdir -p /root/provision'
+    tar -C "$here" -cf - versions.sh guest/provision.sh | vm_ssh 'tar -xf - -C /root/provision'
+    if ! vm_ssh 'bash /root/provision/guest/provision.sh' 2>&1 | tee "$vmdir/prepare.log"; then
+        stop_vm
+        die "preparing failed; see .vm/prepare.log"
+    fi
+    grep -q '^prepared$' "$vmdir/prepare.log" || { stop_vm; die "preparing failed; see .vm/prepare.log"; }
+    stop_vm
+    rm -rf "$rundir"
+    # Older prepared images are no longer used.
+    find "$images" -name 'prepared-*.qcow2' ! -name "prepared-$key.qcow2" -delete
+    mv "$tmp" "$prepared"
+    rm -f "$sshdir/known_hosts"
+    say "Prepared the image in $(since "$t0") s"
+}
+
+# --- Running the VM ---------------------------------------------------------
+
+pid() { cat "$rundir/qemu.pid" 2>/dev/null || true; }
+running() {
+    local p
+    p="$(pid)"
+    # The process must be this checkout's VM: QEMU, with this run's pidfile.
+    [[ -n $p ]] && kill -0 "$p" 2>/dev/null &&
+        tr '\0' '\n' <"/proc/$p/cmdline" 2>/dev/null | grep -qxF -- "$rundir/qemu.pid"
+}
+
+free_port() {
+    local p
+    for p in "$@" $(shuf -i 20000-60000 -n 50); do
+        (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null || { echo "$p"; return; }
+    done
+    die "no free port found"
+}
+
+# boot DISK CACHE-MODE [SEED-ISO]
+boot() {
+    local disk="$1" mode="$2" seed="${3:-}"
+    mkdir -p "$rundir"
+    [[ -f $cache_disk ]] || qemu-img create -q -f qcow2 "$cache_disk" "$cache_size"
+    local ssh_port dash_port
+    ssh_port="$(free_port 2222)"
+    dash_port="$(free_port 7878)"
+    echo "$ssh_port" >"$rundir/ssh-port"
+    echo "$dash_port" >"$rundir/dashboard-port"
+    local args=(
+        -name fictionet-vm
+        -machine q35,accel=kvm -cpu host -smp "$cpus" -m "$mem"
+        # The Debian cloud kernel does not boot without a display adapter, so
+        # there is one, with nothing showing it.
+        -nodefaults -display none -vga std
+        -serial "file:$rundir/console.log"
+        -drive "if=none,id=root,file=$disk,format=qcow2,cache=$mode,discard=unmap"
+        -device virtio-blk-pci,drive=root,bootindex=0
+        -drive "if=none,id=cache,file=$cache_disk,format=qcow2,cache=writeback,discard=unmap"
+        -device virtio-blk-pci,drive=cache,serial=fncache
+        -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$ssh_port-:22,hostfwd=tcp:127.0.0.1:$dash_port-:7878"
+        -device virtio-net-pci,netdev=net0,mac=52:54:00:f1:c7:01
+        -device virtio-rng-pci
+        -pidfile "$rundir/qemu.pid" -daemonize
+    )
+    [[ -n $seed ]] && args+=(-drive "if=virtio,file=$seed,format=raw,readonly=on")
+    # A disk left by a VM that was killed may have leaked clusters; fix them.
+    qemu-img check -q -r leaks "$cache_disk" >/dev/null 2>&1 || true
+    local scope=()
+    if [[ ${VM_SCOPE:-1} != 0 ]]; then
+        if systemd-run --user --scope -q true >/dev/null 2>&1; then
+            scope=(systemd-run --user --scope -q --unit "fictionet-vm-$$"
+                -p MemoryMax="$(scope_limit)" -p MemorySwapMax=0)
+        else
+            say "No systemd user session here, so QEMU runs without the memory cap (VM_SCOPE=0 silences this)."
+        fi
+    fi
+    # fd 9 is the lock (see lock()); the daemon must not keep it.
+    "${scope[@]}" qemu-system-x86_64 "${args[@]}" 9<&-
+}
+
+# The memory cap for QEMU's scope: the VM's memory, plus 1 GiB for QEMU.
+scope_limit() {
+    local m="${mem^^}" mib
+    case "$m" in
+        *G) mib=$(( ${m%G} * 1024 )) ;;
+        *M) mib=${m%M} ;;
+        *) mib=$m ;;
+    esac
+    echo "$(( mib + 1024 ))M"
+}
+
+ssh_opts() {
+    local port
+    port="$(cat "$rundir/ssh-port")"
+    # -F /dev/null: none of the user's own settings, so no agent, X11 or
+    # port forwarding into this machine. Paths are quoted for ssh's own
+    # parser, so a checkout path with spaces works.
+    printf '%s\n' -F /dev/null -p "$port" -i "$sshdir/id_ed25519" \
+        -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR \
+        -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes \
+        -o HostKeyAlias=fictionet-vm -o StrictHostKeyChecking=accept-new \
+        -o "UserKnownHostsFile=\"$sshdir/known_hosts\"" \
+        -o ControlMaster=auto -o "ControlPath=\"$rundir/ssh.sock\"" -o ControlPersist=120 \
+        -o ServerAliveInterval=10 -o ServerAliveCountMax=3
+}
+
+vm_ssh() {
+    local opts
+    mapfile -t opts < <(ssh_opts)
+    # The SSH master that stays in the background must not keep the lock.
+    ssh "${opts[@]}" root@127.0.0.1 "$@" 9<&-
+}
+
+# Like vm_ssh, with a terminal when there is one, so Ctrl-C reaches the VM.
+vm_ssh_tty() {
+    if [[ -t 0 && -t 1 ]]; then vm_ssh -t "$@"; else vm_ssh "$@"; fi
+}
+
+wait_ssh() {
+    local limit="$1" i
+    for ((i = 0; i < limit * 5; i++)); do
+        running || { tail -20 "$rundir/console.log" >&2 || true; rm -f "$rundir/qemu.pid"; die "QEMU exited while booting"; }
+        if vm_ssh -o ConnectTimeout=1 true 2>/dev/null; then return; fi
+        sleep 0.2
+    done
+    tail -20 "$rundir/console.log" >&2 || true
+    stop_vm
+    die "the VM did not answer SSH within $limit s"
+}
+
+stop_vm() {
+    running || { rm -f "$rundir/qemu.pid"; return 0; }
+    local p
+    p="$(pid)"
+    # Asked over SSH in the background, so a guest that never answers cannot
+    # hold this up: after 60 s QEMU is stopped anyway.
+    vm_ssh -o ConnectTimeout=5 'systemctl poweroff' >/dev/null 2>&1 &
+    local asked=$!
+    for _ in $(seq 300); do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+    kill "$asked" 2>/dev/null || true
+    wait "$asked" 2>/dev/null || true
+    if kill -0 "$p" 2>/dev/null; then
+        say "the VM did not power off; stopping QEMU"
+        kill "$p" 2>/dev/null || true
+        for _ in $(seq 50); do kill -0 "$p" 2>/dev/null || break; sleep 0.2; done
+        kill -9 "$p" 2>/dev/null || true
+    fi
+    ssh -F /dev/null -O exit -o "ControlPath=\"$rundir/ssh.sock\"" x 2>/dev/null || true
+    rm -f "$rundir/qemu.pid"
+}
+
+cmd_up() {
+    if running; then
+        say "The VM is already running (SSH on 127.0.0.1:$(cat "$rundir/ssh-port"))."
+        return
+    fi
+    ensure_prepared
+    local t0
+    t0="$(now)"
+    rm -rf "$rundir"
+    mkdir -p "$rundir"
+    # A fresh overlay per run: the prepared image is never written to.
+    qemu-img create -q -f qcow2 -F qcow2 -b "../images/${prepared##*/}" "$rundir/disk.qcow2"
+    boot "$rundir/disk.qcow2" unsafe
+    wait_ssh 180
+    # Containers left from a run that was cut short; images and build
+    # caches on the cache disk stay.
+    vm_ssh 'docker ps -aq | xargs -r docker rm -f >/dev/null; kind get clusters 2>/dev/null | xargs -r -n1 kind delete cluster --name >/dev/null 2>&1; true'
+    echo "$(since "$t0")" >"$rundir/boot-seconds"
+    say "The VM is up in $(since "$t0") s: $cpus vCPUs, $mem, SSH on 127.0.0.1:$(cat "$rundir/ssh-port"), port 7878 on 127.0.0.1:$(cat "$rundir/dashboard-port")."
+}
+
+cmd_down() {
+    if ! running; then
+        rm -rf "$rundir"
+        say "The VM is not running."
+        return
+    fi
+    stop_vm
+    rm -rf "$rundir"
+    say "The VM is down, and its overlay is deleted."
+}
+
+cmd_clean() {
+    cmd_down
+    rm -rf "$vmdir"
+    say "Deleted .vm/ (the images and the cache disk)."
+}
+
+cmd_status() {
+    if running; then
+        say "running: pid $(pid), SSH on 127.0.0.1:$(cat "$rundir/ssh-port"), port 7878 on 127.0.0.1:$(cat "$rundir/dashboard-port")"
+    else
+        say "not running"
+    fi
+    if [[ -d $vmdir ]]; then du -sh --apparent-size "$vmdir" | awk '{print "apparent size of .vm/: " $1}' >&2; du -sh "$vmdir" | awk '{print "disk used by .vm/: " $1}' >&2; fi
+}
+
+require_running() { running || die "the VM is not running; start it with vm/run up"; }
+
+cmd_ssh() {
+    require_running
+    if (($# == 0)); then vm_ssh -t; else vm_ssh_tty "$*"; fi
+}
+
+# Copies the working tree (tracked files and untracked ones that are not
+# ignored) into /src in the VM. Ignored files, such as target/ and .vm/,
+# stay behind. File times are kept, so cargo rebuilds only what changed.
+cmd_sync() {
+    require_running
+    local t0
+    t0="$(now)"
+    (
+        cd "$root"
+        # Only git knows what is ignored (.env, target/, .vm/), so a checkout
+        # is required.
+        git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "vm/run sync needs a git checkout"
+        git ls-files -z --cached --others --exclude-standard |
+            while IFS= read -r -d '' f; do
+                if [[ -e $f || -L $f ]]; then printf '%s\0' "$f"; fi
+            done | tar --null -T - -czf -
+    ) | vm_ssh 'rm -rf /src && mkdir /src && tar -xzf - -C /src'
+    say "Copied the working tree to /src in the VM ($(since "$t0") s)"
+}
+
+# Builds the given things in the VM (see vm/guest/build.sh).
+cmd_build() {
+    require_running
+    cmd_sync
+    local t0
+    t0="$(now)"
+    vm_ssh "bash /src/vm/guest/build.sh ${*:-sdk}"
+    say "Built in $(since "$t0") s"
+}
+
+tests_list() {
+    cat <<'EOF'
+netns            fictionet attach --type tun into an `ip netns` namespace (vm/guest/tests/netns.sh)
+docker-web       tests/docker/web/run.sh: web::Sites under Docker Compose, attach --type tun
+docker-proxy     tests/docker/proxy/run.sh: attach --type https_proxy and socks5 under Docker Compose
+docker-ping      tests/docker/ping/run.sh
+docker-tcpudp    tests/docker/tcpudp/run.sh
+k8s              tests/k8s/run.sh: the Helm chart on kind, attach --type tun
+k8s-proxy        tests/k8s/proxy.sh: the Helm chart on kind, https_proxy and socks5 under Pod Security "restricted"
+border-world     cargo test in examples/border/world
+border-scripted  border_scripted, lab and home settings (Inspect, mockllm)
+border-probes    border_probes, lab and home settings (Inspect, mockllm)
+fakewiki-probes  fakewiki_probes and the leak checker's negative control (Inspect, mockllm)
+cargo            cargo test --features tokio, with the root-only tun test turned on
+EOF
+}
+
+# Starts the VM if it is not running, and remembers whether it did, so the
+# caller can shut it down again.
+booted_here=0
+ensure_up() {
+    if running; then
+        say "Using the running VM."
+    else
+        # Ours from the start, so a boot that fails half way is stopped too.
+        booted_here=1
+        trap finish EXIT
+        cmd_up
+    fi
+}
+finish() {
+    local status=$?
+    if [[ $booted_here == 1 && ${VM_KEEP:-0} != 1 ]]; then
+        cmd_down
+    elif [[ $booted_here == 1 ]]; then
+        say "The VM is still running (VM_KEEP=1). Stop it with vm/run down."
+    fi
+    exit "$status"
+}
+
+cmd_test() {
+    local name="${1:-}"
+    if [[ -z $name || $name == list ]]; then tests_list; return; fi
+    tests_list | awk '{print $1}' | grep -qx -- "$name" || { tests_list >&2; die "no test suite named $name"; }
+    ensure_up
+    trap finish EXIT
+    cmd_sync
+    local t0 status
+    t0="$(now)"
+    set +e
+    vm_ssh "bash /src/vm/guest/test.sh $name" 2>&1 | tee "$vmdir/test-$name.log"
+    status="${PIPESTATUS[0]}"
+    set -e
+    say ""
+    if [[ $status == 0 ]]; then
+        say "vm/run test $name: PASSED in $(since "$t0") s (log in .vm/test-$name.log)"
+    else
+        say "vm/run test $name: FAILED (exit $status) after $(since "$t0") s (log in .vm/test-$name.log)"
+    fi
+    return "$status"
+}
+
+cmd_demo() {
+    local name="${1:-}"
+    [[ -n $name && -f $root/demos/guest/$name.sh ]] || die "no demo named '$name' (see demos/README.md)"
+    local t_all
+    t_all="$(now)"
+    ensure_up
+    trap finish EXIT
+    cmd_sync
+    local t0
+    t0="$(now)"
+    vm_ssh "bash /src/vm/guest/build.sh $(sed -n 's/^# needs: //p' "$root/demos/guest/$name.sh")"
+    say "Built in $(since "$t0") s"
+    t0="$(now)"
+    local status=0
+    # The dashboard demo prints the address the browser can open.
+    vm_ssh_tty "FICTIONET_DASHBOARD_PORT=$(cat "$rundir/dashboard-port") DASHBOARD_SECONDS=${DASHBOARD_SECONDS:-} \
+        bash /src/demos/guest/$name.sh" || status=$?
+    say ""
+    say "demos/$name: the demo took $(since "$t0") s; $(since "$t_all") s in all, with the VM's boot and the build."
+    return "$status"
+}
+
+# One command at a time changes the VM: a second waits for the first. The
+# lock is on this script, which clean never deletes.
+lock() {
+    exec 9<"${BASH_SOURCE[0]}"
+    flock -n 9 || { say "Waiting for another vm/run command to finish"; flock 9; }
+}
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+    case "$cmd" in up | down | clean | sync | build | test | demo | prepare) lock ;; esac
+    case "$cmd" in
+        up) cmd_up ;;
+        down) cmd_down ;;
+        clean) cmd_clean ;;
+        status) cmd_status ;;
+        ssh) cmd_ssh "$@" ;;
+        sync) cmd_sync ;;
+        build) cmd_build "$@" ;;
+        test) cmd_test "$@" ;;
+        demo) cmd_demo "$@" ;;
+        prepare) ensure_prepared ;;
+        *) sed -n '2,/^$/s/^# \{0,1\}//p' "${BASH_SOURCE[0]}" | sed -n '/^vm\/run: /,/^Settings/p' | head -n -1 >&2
+           exit 2 ;;
+    esac
+}
+
+main "$@"

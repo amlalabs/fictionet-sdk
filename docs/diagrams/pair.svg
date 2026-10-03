@@ -1,0 +1,29 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 172" role="img" aria-labelledby="fn-pair-t fn-pair-d" style="display:block;width:100%;max-width:504px;min-width:340px;height:auto">
+<title id="fn-pair-t">A cable made by pair()</title>
+<desc id="fn-pair-d">Two End values joined by two queues, one in each direction. A packet sent into one End comes out of the other, in order. The queues have no size limit. Dropping either End closes the cable: the other End reads what is still queued for it, then RecvError::Closed.</desc>
+<defs><marker id="fn-pair-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="4" y="44" width="84" height="56" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="332" y="44" width="84" height="56" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<path d="M88,60 H330" stroke-width="1.5" marker-end="url(#fn-pair-a)"/>
+<path d="M332,84 H90" stroke-width="1.5" marker-end="url(#fn-pair-a)"/>
+</g>
+<g fill="currentColor" fill-opacity="0.3" stroke="currentColor" stroke-width="1">
+<rect x="182" y="54" width="12" height="12" rx="2"/>
+<rect x="200" y="54" width="12" height="12" rx="2"/>
+<rect x="218" y="54" width="12" height="12" rx="2"/>
+<rect x="200" y="78" width="12" height="12" rx="2"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13" text-anchor="middle">
+<text x="46" y="71" font-family="'Source Code Pro',monospace" font-size="14">End</text>
+<text x="46" y="88" font-size="11.5">.0 of the pair</text>
+<text x="374" y="71" font-family="'Source Code Pro',monospace" font-size="14">End</text>
+<text x="374" y="88" font-size="11.5">.1 of the pair</text>
+<text x="210" y="40">one queue each way, in order</text>
+<text x="210" y="116">send on one End, recv on the other</text>
+<text x="210" y="146" font-size="12">No size limit. Dropping either End closes the cable.</text>
+<text x="210" y="163" font-size="12">The other End reads what is queued for it, then Closed.</text>
+</g>
+</svg>
+</div>

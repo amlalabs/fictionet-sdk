@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# demos/web: a world of websites, and a sandbox that reaches it with dig, curl and ping.
+#
+# One command, no root: it boots the Fictionet VM if it is not running
+# (vm/run up), runs demos/guest/web.sh inside it, and cleans up. See
+# demos/README.md.
+exec "$(dirname "$0")/../vm/run" demo web "$@"

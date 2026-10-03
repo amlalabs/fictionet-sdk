@@ -1,0 +1,40 @@
+# Values for charts/fictionet-sandbox: two sandboxes, `default` behind
+# attach --type https_proxy and `socks` behind --type socks5. No container
+# has a capability or runs as root, so the pods pass Pod Security
+# "restricted". The images are the ones k8s-tun.yaml uses.
+# tests/k8s/proxy.sh installs these values.
+attach:
+  image: fictionet-attach:dev
+  imagePullPolicy: Never
+  type: https_proxy
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+serviceDefaults:
+  image: fictionet-agent:dev
+  imagePullPolicy: Never
+  command: [sleep, infinity]
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
+  env:
+    - name: CURL_CA_BUNDLE
+      value: /run/ca/ca.pem
+  shared:
+    - name: ca
+      mountPath: /run/ca
+  world:
+    image: fictionet-web-world:dev
+    imagePullPolicy: Never
+    args: [/run/fictionet/world.sock, /run/ca/ca.pem]
+services:
+  default: {}
+  socks:
+    attach:
+      type: socks5

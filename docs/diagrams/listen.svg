@@ -1,0 +1,59 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 520 472" role="img" aria-labelledby="fn-listen-t fn-listen-d" style="display:block;width:100%;max-width:624px;min-width:440px;height:auto">
+<title id="fn-listen-t">How an attachment's packets move</title>
+<desc id="fn-listen-d">Three parts: the world's thread with the Attachment, the helper thread that listen starts, and the connection to attach. 1: recv reads the connection directly, up to 64 packets a turn. 2: with nothing to read, the waker goes to the helper thread, 3: which wakes the world when the connection is readable. 4: send writes each packet at once, as one datagram. 5: if the connection is full, the packet waits in the out queue. The queue has a 32 MiB budget, and each packet counts its length plus 64 bytes. A packet that would go past the budget is dropped. 6: the helper thread writes the queue out, in order, as attach makes room.</desc>
+<defs><marker id="fn-listen-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="20" width="200" height="70" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="310" y="20" width="200" height="70" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="330" y="150" width="160" height="44" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="110" y="260" width="200" height="46" rx="6" stroke-dasharray="5 4"/>
+<path d="M150,258 L72,94" stroke-width="1.5" marker-end="url(#fn-listen-a)"/>
+<path d="M212,40 H306" marker-end="url(#fn-listen-a)"/>
+<path d="M310,72 H214" marker-end="url(#fn-listen-a)"/>
+<path d="M150,92 L226,256" stroke-width="1.5" marker-end="url(#fn-listen-a)"/>
+<path d="M200,90 L326,162" marker-end="url(#fn-listen-a)"/>
+<path d="M410,196 L294,258" stroke-width="1.5" marker-end="url(#fn-listen-a)"/>
+<path d="M410,92 V146" stroke-dasharray="3 3"/>
+</g>
+<g fill="currentColor" fill-opacity="0.12" stroke="currentColor" stroke-width="1">
+<circle cx="111" cy="176" r="9"/>
+<circle cx="259" cy="40" r="9"/>
+<circle cx="262" cy="72" r="9"/>
+<circle cx="188" cy="174" r="9"/>
+<circle cx="263" cy="126" r="9"/>
+<circle cx="352" cy="227" r="9"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<g font-size="11" text-anchor="middle">
+<text x="111" y="180">1</text><text x="259" y="44">2</text><text x="262" y="76">3</text><text x="188" y="178">4</text><text x="263" y="130">5</text><text x="352" y="231">6</text>
+</g>
+<text x="110" y="42" text-anchor="middle" font-weight="500">the world’s thread</text>
+<text x="110" y="62" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12.5">Attachment</text>
+<text x="110" y="79" text-anchor="middle" font-size="11.5">recv and send</text>
+<text x="410" y="42" text-anchor="middle" font-weight="500">helper thread</text>
+<text x="410" y="62" text-anchor="middle" font-size="11.5">started by listen,</text>
+<text x="410" y="78" text-anchor="middle" font-size="11.5">waits in epoll</text>
+<text x="410" y="170" text-anchor="middle">out queue</text>
+<text x="410" y="186" text-anchor="middle" font-size="11.5">a 32 MiB budget</text>
+<text x="210" y="281" text-anchor="middle">connection to attach</text>
+<text x="210" y="297" text-anchor="middle" font-size="11.5">one datagram per packet</text>
+<g font-size="12">
+<text x="14" y="340" text-anchor="middle">1</text>
+<text x="28" y="340">recv reads the connection directly, up to 64 packets a turn.</text>
+<text x="14" y="358" text-anchor="middle">2</text>
+<text x="28" y="358">With nothing to read, the waker goes to the helper thread,</text>
+<text x="14" y="376" text-anchor="middle">3</text>
+<text x="28" y="376">which wakes the world when the connection is readable.</text>
+<text x="14" y="394" text-anchor="middle">4</text>
+<text x="28" y="394">send writes each packet at once, as one datagram.</text>
+<text x="14" y="412" text-anchor="middle">5</text>
+<text x="28" y="412">If the connection is full, the packet waits in the out queue.</text>
+<text x="28" y="430">Its budget is 32 MiB, with 64 bytes counted per packet on top of its length.</text>
+<text x="28" y="448">A packet that would go past the budget is dropped.</text>
+<text x="14" y="466" text-anchor="middle">6</text>
+<text x="28" y="466">The helper thread writes the queue out, in order, as attach makes room.</text>
+</g>
+</g>
+</svg>
+</div>

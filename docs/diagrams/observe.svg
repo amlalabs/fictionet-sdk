@@ -1,0 +1,51 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 300" role="img" aria-labelledby="fn-observe-t fn-observe-d" style="display:block;width:100%;max-width:840px;min-width:560px;height:auto">
+<title id="fn-observe-t">Who connects to the world socket</title>
+<desc id="fn-observe-d">The world process runs the world, which keeps track of its tasks, links, packet counts and events, and listens on the world socket. Three kinds of client connect to that one Unix socket. fictionet attach sends a hello of a sandbox type such as tun and then relays the sandbox's packets. fictionet dashboard sends a hello of type observe, then requests and replies; it serves the dashboard to a browser over HTTP on 127.0.0.1. fictionet observe also sends a hello of type observe, and prints the replies as JSON lines for scripts.</desc>
+<defs><marker id="fn-observe-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="6" y="20" width="200" height="262" rx="8" stroke-dasharray="4 3"/>
+<rect x="22" y="48" width="168" height="86" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="22" y="178" width="168" height="86" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<path d="M106,136 V176" stroke-dasharray="3 3" marker-start="url(#fn-observe-a)"/>
+<rect x="344" y="42" width="166" height="52" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="344" y="128" width="166" height="52" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="344" y="214" width="166" height="52" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="560" y="42" width="132" height="52" rx="6"/>
+<rect x="560" y="128" width="132" height="52" rx="6"/>
+<rect x="560" y="214" width="132" height="52" rx="6"/>
+<path d="M192,221 C260,221 280,68 342,68" stroke-width="1.5" marker-start="url(#fn-observe-a)" marker-end="url(#fn-observe-a)"/>
+<path d="M192,221 C260,221 280,154 342,154" stroke-width="1.5" marker-start="url(#fn-observe-a)" marker-end="url(#fn-observe-a)"/>
+<path d="M192,221 C260,221 280,240 342,240" stroke-width="1.5" marker-start="url(#fn-observe-a)" marker-end="url(#fn-observe-a)"/>
+<path d="M512,68 H558" stroke-width="1.5" marker-start="url(#fn-observe-a)" marker-end="url(#fn-observe-a)"/>
+<path d="M512,154 H558" stroke-width="1.5" marker-end="url(#fn-observe-a)"/>
+<path d="M512,240 H558" stroke-width="1.5" marker-end="url(#fn-observe-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="12" text-anchor="middle">
+<text x="106" y="14" font-size="12.5">the world process</text>
+<text x="106" y="72" font-family="'Source Code Pro',monospace" font-size="13.5">run</text>
+<text x="106" y="92">tasks, links, counts</text>
+<text x="106" y="108">and events, kept as</text>
+<text x="106" y="124">the world runs</text>
+<text x="146" y="160" font-size="11">attachments</text>
+<text x="106" y="202" font-family="'Source Code Pro',monospace" font-size="13.5">listen</text>
+<text x="106" y="222">the world socket,</text>
+<text x="106" y="238">/run/fictionet/</text>
+<text x="106" y="254">world.sock</text>
+<text x="272" y="114" font-size="11">one Unix socket,</text>
+<text x="272" y="128" font-size="11">many connections</text>
+<text x="427" y="64" font-family="'Source Code Pro',monospace" font-size="13">fictionet attach</text>
+<text x="427" y="82" font-size="11">hello type tun: packets</text>
+<text x="427" y="150" font-family="'Source Code Pro',monospace" font-size="13">fictionet dashboard</text>
+<text x="427" y="168" font-size="11">hello type observe</text>
+<text x="427" y="236" font-family="'Source Code Pro',monospace" font-size="13">fictionet observe</text>
+<text x="427" y="254" font-size="11">hello type observe</text>
+<text x="626" y="64">the sandbox</text>
+<text x="626" y="82" font-size="11">its tun0 device</text>
+<text x="626" y="150">a browser</text>
+<text x="626" y="168" font-size="11">127.0.0.1:7878</text>
+<text x="626" y="236">a shell or script</text>
+<text x="626" y="254" font-size="11">JSON lines</text>
+</g>
+</svg>
+</div>

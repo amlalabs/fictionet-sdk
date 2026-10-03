@@ -1,0 +1,104 @@
+# The web test: a world written with web::Sites, attach next to the
+# sandbox, the sandbox with curl and dig, and a real upstream site for
+# web::proxy(). Run it with ./run.sh, which also checks the results and
+# cleans up.
+name: fictionet-web
+
+x-build: &build
+  context: ../../..
+  dockerfile: tests/docker/web/Dockerfile
+  target: runtime
+
+services:
+  # A real site on the world's own network, reached only through the proxy.
+  upstream:
+    build: *build
+    image: fictionet-web:dev
+    command: ["web_world", "--upstream", "80"]
+
+  world:
+    build: *build
+    image: fictionet-web:dev
+    command: ["web_world", "/run/fictionet/world.sock", "/run/ca/ca.pem"]
+    # The world has the host's network (for the proxy). The sandbox never does.
+    # NET_ADMIN lets the world raise its socket buffers to attach past the
+    # system limit, so a burst of packets is not lost. The world is trusted.
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - sock:/run/fictionet
+      - ca:/run/ca
+    depends_on:
+      - upstream
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/fictionet/world.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  attach:
+    build: *build
+    image: fictionet-web:dev
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/fictionet/world.sock
+      - --name
+      - abc
+      - --type
+      - tun
+      - --ip-addr
+      - 10.0.0.2/24
+      - --gateway
+      - 10.0.0.1
+      - --dns
+      - 10.0.0.1
+      - --ip-addr-v6
+      - 2001:db8::2/64
+      - --gateway-v6
+      - 2001:db8::1
+      - --dns-v6
+      - 2001:db8::1
+      - --ready-file
+      - /run/attach-ready
+    network_mode: none
+    # Docker turns IPv6 off in a container with no IPv6 network. The
+    # sandbox's IPv6 lives on tun0, so turn it back on.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 0
+      net.ipv6.conf.default.disable_ipv6: 0
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    volumes:
+      - sock:/run/fictionet
+    depends_on:
+      world:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/attach-ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  agent:
+    build:
+      context: ../../..
+      dockerfile: tests/docker/web/Dockerfile
+      target: agent
+    image: fictionet-web-agent:dev
+    command: ["sleep", "infinity"]
+    init: true
+    network_mode: "service:attach"
+    # Only the world's CA certificate, not the world socket.
+    volumes:
+      - ca:/run/ca:ro
+    depends_on:
+      attach:
+        condition: service_healthy
+
+volumes:
+  sock:
+  ca:

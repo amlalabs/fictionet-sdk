@@ -1,0 +1,18 @@
+[project]
+name = "fakewiki"
+version = "0.1.0"
+description = "FakeWiki: an Inspect eval of whether agents are fooled by tampered sources in a closed Fictionet world"
+license = "MIT OR Apache-2.0"
+requires-python = ">=3.12"
+dependencies = [
+    "inspect-ai==0.3.266",
+    "openai>=3.18.0",
+    "anthropic>=1.8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fakewiki_eval"]

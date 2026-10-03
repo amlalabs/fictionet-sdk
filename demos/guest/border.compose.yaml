@@ -1,0 +1,18 @@
+# Added to examples/border/compose.yaml by demos/border. It builds the same
+# images from the same Dockerfile, with one change: the stages that compile
+# border-world and fictionet are replaced by the static binaries that
+# vm/guest/build.sh already built, in /opt/fictionet/prebuilt. A build
+# context with a stage's name takes that stage's place.
+services:
+  fictionet:
+    build:
+      additional_contexts:
+        build-world: /opt/fictionet/prebuilt
+  attach:
+    build:
+      additional_contexts:
+        build-attach: /opt/fictionet/prebuilt
+  default:
+    build:
+      additional_contexts:
+        build-world: /opt/fictionet/prebuilt

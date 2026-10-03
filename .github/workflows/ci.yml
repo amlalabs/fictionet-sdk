@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default features
+            features: ""
+          - name: no default features
+            features: "--no-default-features"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --locked --all-targets ${{ matrix.features }}
+      - name: Test
+        run: cargo test --locked ${{ matrix.features }}
+      - name: Docs
+        run: cargo doc --locked --no-deps ${{ matrix.features }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: Clippy
+        run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+
+  msrv:
+    name: MSRV (1.91)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.91
+      - uses: Swatinem/rust-cache@v2
+      - name: Check
+        run: cargo check --locked --all-targets
+
+  fuzz:
+    name: fuzz (60 s per target)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Build the targets
+        run: cargo fuzz build -O -a
+      - name: Run each target for 60 seconds
+        run: |
+          for t in $(cargo fuzz list); do
+            echo "::group::$t"
+            cargo fuzz run -O -a "$t" "fuzz/corpus/$t" -- -max_total_time=60 -timeout=20 -rss_limit_mb=4096
+            echo "::endgroup::"
+          done
+      - name: Keep what a target found
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

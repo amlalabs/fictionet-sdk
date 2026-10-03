@@ -1,0 +1,492 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "patternProperties": {
+    "^sampleMetadata": {}
+  },
+  "properties": {
+    "annotations": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "automountServiceAccountToken": {
+      "type": "boolean"
+    },
+    "global": {
+      "type": "object",
+      "properties": {
+        "nameOverride": {
+          "type": "string"
+        },
+        "fullnameOverride": {
+          "type": "string"
+        }
+      }
+    },
+    "runtimeClassName": {
+      "type": "string"
+    },
+    "podSecurityContext": {
+      "type": "object"
+    },
+    "networkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "waitForEnforcement": {
+          "type": "boolean"
+        },
+        "waitAddresses": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^([0-9.]+|\\[[0-9A-Fa-f:.]+\\]):[0-9]+$"
+          }
+        },
+        "waitTimeout": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "corednsImage": {
+      "type": "string"
+    },
+    "attach": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string"
+        },
+        "imagePullPolicy": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "tun",
+            "https_proxy",
+            "socks5"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "worldWait": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "downLinks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ipAddr": {
+          "type": "string"
+        },
+        "gateway": {
+          "type": "string"
+        },
+        "dns": {
+          "type": "string"
+        },
+        "ipAddrV6": {
+          "type": "string"
+        },
+        "gatewayV6": {
+          "type": "string"
+        },
+        "dnsV6": {
+          "type": "string"
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 1280,
+          "maximum": 65535
+        },
+        "extraArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resources": {
+          "type": "object"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "runAsUser": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "image": {
+            "type": "string"
+          },
+          "imagePullPolicy": {
+            "type": "string"
+          },
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "args": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "workingDir": {
+            "type": "string"
+          },
+          "env": {
+            "type": "array"
+          },
+          "resources": {
+            "type": "object"
+          },
+          "readinessProbe": {
+            "type": "object"
+          },
+          "securityContext": {
+            "type": "object"
+          },
+          "volumeMounts": {
+            "type": "array"
+          },
+          "volumes": {
+            "type": "array"
+          },
+          "shared": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "mountPath"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                },
+                "mountPath": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "world": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "image": {
+                "type": "string"
+              },
+              "imagePullPolicy": {
+                "type": "string"
+              },
+              "command": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "args": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "env": {
+                "type": "array"
+              },
+              "resources": {
+                "type": "object"
+              },
+              "securityContext": {
+                "type": "object"
+              }
+            }
+          },
+          "attach": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "image": {
+                "type": "string"
+              },
+              "imagePullPolicy": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "tun",
+                  "https_proxy",
+                  "socks5"
+                ]
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 255
+              },
+              "worldWait": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "downLinks": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "ipAddr": {
+                "type": "string"
+              },
+              "gateway": {
+                "type": "string"
+              },
+              "dns": {
+                "type": "string"
+              },
+              "ipAddrV6": {
+                "type": "string"
+              },
+              "gatewayV6": {
+                "type": "string"
+              },
+              "dnsV6": {
+                "type": "string"
+              },
+              "mtu": {
+                "type": "integer",
+                "minimum": 1280,
+                "maximum": 65535
+              },
+              "extraArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "resources": {
+                "type": "object"
+              },
+              "port": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 65535
+              },
+              "runAsUser": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    },
+    "serviceDefaults": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "image": {
+          "type": "string"
+        },
+        "imagePullPolicy": {
+          "type": "string"
+        },
+        "command": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "workingDir": {
+          "type": "string"
+        },
+        "env": {
+          "type": "array"
+        },
+        "resources": {
+          "type": "object"
+        },
+        "readinessProbe": {
+          "type": "object"
+        },
+        "securityContext": {
+          "type": "object"
+        },
+        "volumeMounts": {
+          "type": "array"
+        },
+        "volumes": {
+          "type": "array"
+        },
+        "shared": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "name",
+              "mountPath"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+              },
+              "mountPath": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "world": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "string"
+            },
+            "imagePullPolicy": {
+              "type": "string"
+            },
+            "command": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "args": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "env": {
+              "type": "array"
+            },
+            "resources": {
+              "type": "object"
+            },
+            "securityContext": {
+              "type": "object"
+            }
+          }
+        },
+        "attach": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "image": {
+              "type": "string"
+            },
+            "imagePullPolicy": {
+              "type": "string"
+            },
+            "type": {
+              "type": "string",
+              "enum": [
+                "tun",
+                "https_proxy",
+                "socks5"
+              ]
+            },
+            "name": {
+              "type": "string",
+              "maxLength": 255
+            },
+            "worldWait": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "downLinks": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "ipAddr": {
+              "type": "string"
+            },
+            "gateway": {
+              "type": "string"
+            },
+            "dns": {
+              "type": "string"
+            },
+            "ipAddrV6": {
+              "type": "string"
+            },
+            "gatewayV6": {
+              "type": "string"
+            },
+            "dnsV6": {
+              "type": "string"
+            },
+            "mtu": {
+              "type": "integer",
+              "minimum": 1280,
+              "maximum": 65535
+            },
+            "extraArgs": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "resources": {
+              "type": "object"
+            },
+            "port": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "runAsUser": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        }
+      }
+    }
+  }
+}

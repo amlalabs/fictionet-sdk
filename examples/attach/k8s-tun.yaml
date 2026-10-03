@@ -1,0 +1,29 @@
+# Values for charts/fictionet-sandbox: one sandbox attached with
+# attach.type tun (the default). The world is the web_world example, and
+# the agent is a Debian image that runs as uid 1000 with no capabilities.
+# All three images are built from deploy/Dockerfile and loaded into the
+# cluster with `kind load`, so none is pulled (imagePullPolicy: Never).
+# tests/k8s/run.sh installs these values.
+attach:
+  image: fictionet-attach:dev
+  imagePullPolicy: Never
+services:
+  default:
+    image: fictionet-agent:dev
+    imagePullPolicy: Never
+    command: [sleep, infinity]
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      allowPrivilegeEscalation: false
+      capabilities:
+        drop: [ALL]
+      seccompProfile:
+        type: RuntimeDefault
+    shared:
+      - name: ca
+        mountPath: /run/ca
+    world:
+      image: fictionet-web-world:dev
+      imagePullPolicy: Never
+      args: [/run/fictionet/world.sock, /run/ca/ca.pem]

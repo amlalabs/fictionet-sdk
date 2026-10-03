@@ -1,0 +1,90 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 700 560" role="img" aria-labelledby="fn-sites-t fn-sites-d" style="display:block;width:100%;max-width:770px;min-width:640px;height:auto">
+<title id="fn-sites-t">The network that Sites::serve builds</title>
+<desc id="fn-sites-d">Each attached sandbox gets its own filter task, which answers DHCP, binds one IPv4 and one IPv6 address, and drops spoofed sources and packets for other sandboxes. Each filter connects to one router through a /32 or /128 route for each bound address, such as 10.0.0.2/32. The router has three kinds of routes. First, the gateway at 10.0.0.1 and 2001:db8::1, with DNS on UDP and TCP port 53 and ping replies. Second, one machine per site address, such as 198.18.0.1 or 2001:2::1, with HTTP on TCP port 80, TLS then HTTP on TCP port 443, ICMP port unreachable for UDP, and ping replies. Third, the default routes 0.0.0.0/0 and ::/0, which answer every other address with ICMP host unreachable, or ICMPv6 address unreachable, from the gateway.</desc>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="30" y="14" width="160" height="40" rx="6" stroke-dasharray="5 4"/>
+<rect x="210" y="14" width="160" height="40" rx="6" stroke-dasharray="5 4"/>
+<rect x="390" y="14" width="80" height="40" rx="6" stroke-dasharray="5 4"/>
+<rect x="30" y="94" width="160" height="48" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="210" y="94" width="160" height="48" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="390" y="94" width="80" height="48" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="30" y="200" width="510" height="44" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="20" y="300" width="170" height="146" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="216" y="306" width="190" height="170" rx="6"/>
+<rect x="210" y="300" width="190" height="170" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="420" y="300" width="130" height="92" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<g stroke-width="1">
+<rect x="32" y="350" width="146" height="24" rx="4"/>
+<rect x="32" y="380" width="146" height="24" rx="4"/>
+<rect x="32" y="410" width="146" height="24" rx="4"/>
+<rect x="222" y="350" width="166" height="24" rx="4"/>
+<rect x="222" y="380" width="166" height="24" rx="4"/>
+<rect x="222" y="410" width="166" height="24" rx="4"/>
+<rect x="222" y="440" width="166" height="24" rx="4"/>
+</g>
+<g stroke-width="1.75">
+<path d="M110,54 V94"/>
+<path d="M290,54 V94"/>
+<path d="M430,54 V94"/>
+<path d="M110,142 V200"/>
+<path d="M290,142 V200"/>
+<path d="M430,142 V200"/>
+<path d="M105,244 V300"/>
+<path d="M305,244 V300"/>
+<path d="M485,244 V300"/>
+</g>
+</g>
+<g fill="currentColor">
+<circle cx="110" cy="94" r="3.5"/><circle cx="290" cy="94" r="3.5"/><circle cx="430" cy="94" r="3.5"/>
+<circle cx="110" cy="142" r="3.5"/><circle cx="290" cy="142" r="3.5"/><circle cx="430" cy="142" r="3.5"/>
+<circle cx="110" cy="200" r="3.5"/><circle cx="290" cy="200" r="3.5"/><circle cx="430" cy="200" r="3.5"/>
+<circle cx="105" cy="244" r="3.5"/><circle cx="305" cy="244" r="3.5"/><circle cx="485" cy="244" r="3.5"/>
+<circle cx="105" cy="300" r="3.5"/><circle cx="305" cy="300" r="3.5"/><circle cx="485" cy="300" r="3.5"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="110" y="39" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12.5">Attachment “a”</text>
+<text x="290" y="39" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12.5">Attachment “b”</text>
+<text x="430" y="39" text-anchor="middle">…</text>
+<text x="110" y="115" text-anchor="middle">filter</text>
+<text x="110" y="132" text-anchor="middle" font-size="11.5">one task per sandbox</text>
+<text x="290" y="115" text-anchor="middle">filter</text>
+<text x="290" y="132" text-anchor="middle" font-size="11.5">one task per sandbox</text>
+<text x="430" y="122" text-anchor="middle">…</text>
+<text x="118" y="176" font-family="'Source Code Pro',monospace" font-size="11.5">10.0.0.2/32</text>
+<text x="298" y="176" font-family="'Source Code Pro',monospace" font-size="11.5">10.0.0.3/32</text>
+<text x="285" y="220" text-anchor="middle" font-family="'Source Code Pro',monospace">route::router</text>
+<text x="285" y="236" text-anchor="middle" font-size="11.5">one task. The longest prefix wins.</text>
+<text x="105" y="320" text-anchor="middle" font-weight="500">gateway</text>
+<text x="105" y="338" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">10.0.0.1, 2001:db8::1</text>
+<text x="105" y="367" text-anchor="middle" font-size="12">UDP 53: DNS</text>
+<text x="105" y="397" text-anchor="middle" font-size="12">TCP 53: DNS</text>
+<text x="105" y="427" text-anchor="middle" font-size="12">ICMP: answers pings</text>
+<text x="305" y="320" text-anchor="middle" font-weight="500">a machine per address</text>
+<text x="305" y="338" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">198.18.0.1, 2001:2::1, …</text>
+<text x="305" y="367" text-anchor="middle" font-size="12">TCP 80: HTTP</text>
+<text x="305" y="397" text-anchor="middle" font-size="12">TCP 443: TLS, then HTTP</text>
+<text x="305" y="427" text-anchor="middle" font-size="12">UDP: port unreachable</text>
+<text x="305" y="457" text-anchor="middle" font-size="12">ICMP: answers pings</text>
+<text x="485" y="320" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">0.0.0.0/0, ::/0</text>
+<text x="485" y="340" text-anchor="middle" font-size="11.5">every other address:</text>
+<text x="485" y="357" text-anchor="middle" font-size="11.5">ICMP(v6) unreachable,</text>
+<text x="485" y="374" text-anchor="middle" font-size="11.5">from the gateway</text>
+<g font-size="11.5">
+<text x="562" y="30">every sandbox that</text>
+<text x="562" y="45">attaches, now or later</text>
+<text x="562" y="104">answers DHCP, binds</text>
+<text x="562" y="119">v4 and v6 addresses,</text>
+<text x="562" y="134">drops spoofed sources</text>
+<text x="562" y="149">and other sandboxes</text>
+<text x="562" y="170">a /32 or /128 route per</text>
+<text x="562" y="185">address, once bound</text>
+</g>
+<g font-size="12">
+<text x="20" y="508">Default subnets: 10.0.0.0/24 and 2001:db8::/64. Sites without Site::at: 198.18.0.0/15, 2001:2::/48.</text>
+<text x="20" y="526">A name’s first lookup runs the callback. Then its site gets a machine and a route.</text>
+<text x="20" y="544">Port 443 is open only on a machine with a TLS site. Other TCP ports get a RST.</text>
+</g>
+</g>
+</svg>
+</div>

@@ -1,0 +1,12 @@
+# Build output, here and in the examples' own packages
+target/
+# Python environments, caches and eval logs
+.venv/
+__pycache__/
+.pytest_cache/
+logs/
+# Secrets and local state
+.env
+/.aws
+/.vm
+/examples/scan/recording/

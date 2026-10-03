@@ -1,0 +1,60 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 530" role="img" aria-labelledby="fn-bind-t fn-bind-d" style="display:block;width:100%;max-width:660px;min-width:520px;height:auto">
+<title id="fn-bind-t">How one sandbox's address is bound</title>
+<desc id="fn-bind-d">A sandbox attaches unbound, and Sites makes an Event::Attached. While unbound, packets other than DHCP that cannot bind are dropped. A DHCP DISCOVER gets an OFFER of the lowest free address, or the one requested if it is free, and the address is held for the sandbox. From unbound or held, a DHCP REQUEST that Sites acknowledges, or a first packet that is not DHCP from a free address in the subnet, binds the address, with an Event::Bound and a /32 route. While bound, renewals get an ACK, a REQUEST for another address gets a NAK, RELEASE and DECLINE change nothing, and packets from other sources are dropped. When the sandbox detaches its TCP connections are reset, its address is free again, and Sites makes an Event::Detached. Detaching from any state frees what the sandbox held. DHCP from 0.0.0.0 is always accepted, and an INFORM from the sandbox's own address is answered without binding it.</desc>
+<defs><marker id="fn-bind-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="40" y="70" width="160" height="48" rx="10" fill="currentColor" fill-opacity="0.06"/>
+<rect x="400" y="70" width="160" height="48" rx="10" fill="currentColor" fill-opacity="0.06"/>
+<rect x="220" y="250" width="160" height="64" rx="10" fill="currentColor" fill-opacity="0.06"/>
+<rect x="200" y="390" width="200" height="62" rx="10" stroke-dasharray="5 4"/>
+<path d="M150,28 V68" marker-end="url(#fn-bind-a)"/>
+<path d="M200,94 H398" marker-end="url(#fn-bind-a)"/>
+<path d="M120,118 C120,200 240,200 260,248" marker-end="url(#fn-bind-a)"/>
+<path d="M480,118 C480,200 360,200 340,248" marker-end="url(#fn-bind-a)"/>
+<path d="M40,84 h-22 v22 h20" marker-end="url(#fn-bind-a)"/>
+<path d="M380,264 h24 v30 h-22" marker-end="url(#fn-bind-a)"/>
+<path d="M300,314 V388" marker-end="url(#fn-bind-a)"/>
+</g>
+<circle cx="150" cy="22" r="6" fill="currentColor"/>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="160" y="50" font-size="12">attaches, <tspan font-family="'Source Code Pro',monospace">Event::Attached</tspan></text>
+<text x="10" y="62" font-size="11.5">drops other packets</text>
+<text x="120" y="99" text-anchor="middle" font-weight="500">unbound</text>
+<text x="480" y="92" text-anchor="middle" font-weight="500">held</text>
+<text x="480" y="108" text-anchor="middle" font-size="11.5">offered, not yet bound</text>
+<text x="300" y="87" text-anchor="middle" font-size="12">DISCOVER → OFFER</text>
+<text x="300" y="111" text-anchor="middle" font-size="11.5">the lowest free address, or</text>
+<text x="300" y="125" text-anchor="middle" font-size="11.5">the one asked for, if free</text>
+<g font-size="11.5">
+<text x="112" y="168" text-anchor="end">REQUEST → ACK,</text>
+<text x="112" y="183" text-anchor="end">or a first packet</text>
+<text x="112" y="198" text-anchor="end">that is not DHCP,</text>
+<text x="112" y="213" text-anchor="end">from a free address</text>
+<text x="490" y="168">REQUEST → ACK,</text>
+<text x="490" y="183">or a first packet</text>
+<text x="490" y="198">that is not DHCP,</text>
+<text x="490" y="213">from a free address</text>
+</g>
+<text x="300" y="272" text-anchor="middle" font-weight="500">bound</text>
+<text x="300" y="289" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">Event::Bound</text>
+<text x="300" y="305" text-anchor="middle" font-size="11.5">and a /32 route</text>
+<g font-size="11.5">
+<text x="412" y="258">renewals → ACK</text>
+<text x="412" y="273">another address → NAK</text>
+<text x="412" y="288">RELEASE, DECLINE: no change</text>
+<text x="412" y="303">other sources: dropped</text>
+<text x="310" y="344">detaches: its TCP connections</text>
+<text x="310" y="359">are reset first</text>
+</g>
+<text x="300" y="410" text-anchor="middle" font-weight="500">detached</text>
+<text x="300" y="427" text-anchor="middle" font-size="11.5">the address is free again</text>
+<text x="300" y="443" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">Event::Detached</text>
+<g font-size="12">
+<text x="10" y="482">Detaching from any state frees what the sandbox held.</text>
+<text x="10" y="500">DHCP from 0.0.0.0 to the server is always accepted.</text>
+<text x="10" y="518">An INFORM from the sandbox’s own address is answered and binds nothing.</text>
+</g>
+</g>
+</svg>
+</div>

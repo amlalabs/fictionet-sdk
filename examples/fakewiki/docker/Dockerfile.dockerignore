@@ -1,0 +1,13 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!docs
+!dashboard
+!examples/*.rs
+!examples/fakewiki/world/Cargo.toml
+!examples/fakewiki/world/Cargo.lock
+!examples/fakewiki/world/src
+!examples/fakewiki/world/backend
+!examples/fakewiki/fixtures/corpus.json
+**/__pycache__

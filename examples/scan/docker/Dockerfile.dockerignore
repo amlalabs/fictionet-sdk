@@ -1,0 +1,8 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!docs
+!dashboard
+!examples/*.rs
+!examples/scan/main.rs

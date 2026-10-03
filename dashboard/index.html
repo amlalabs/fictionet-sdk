@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fictionet dashboard</title>
+<link rel="icon" href="icon.svg">
+<link rel="stylesheet" href="app.css">
+<script src="groups.js" defer></script>
+<script src="app.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <header class="bar">
+    <div class="wordmark">
+      <svg viewBox="0 0 32 32" aria-hidden="true"><rect class="wm-bg" width="32" height="32" rx="7"/><path class="wm-fg-line" d="M9 22 16 10l7 12"/><circle class="wm-fg" cx="9" cy="22" r="2.6"/><circle class="wm-fg" cx="23" cy="22" r="2.6"/><rect class="wm-accent" x="13.4" y="7.4" width="5.2" height="5.2"/></svg>
+      Fictionet <span>dashboard</span>
+    </div>
+    <div class="status" id="status" data-state="connecting"><i class="dot"></i><span id="status-text">Connecting</span></div>
+    <div class="stats" id="stats">
+      <span><b id="stat-sandboxes">0</b> sandboxes</span>
+      <span><b id="stat-tasks">0</b> tasks</span>
+      <span><b id="stat-links">0</b> links</span>
+      <span><b id="stat-rate">0</b> packets/s</span>
+    </div>
+    <div class="grow"></div>
+    <label class="search">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="7" cy="7" r="4.6" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="m10.4 10.4 3.4 3.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      <input id="search" type="search" placeholder="Find a task, sandbox or route" aria-label="Find a task, sandbox or route" autocomplete="off">
+    </label>
+    <button class="icon-button" id="theme" type="button" aria-label="Switch between light and dark">
+      <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="5.5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M8 2.5a5.5 5.5 0 0 1 0 11z" fill="currentColor"/></svg>
+    </button>
+  </header>
+
+  <div class="main">
+    <div class="stage" id="stage">
+      <svg class="graph" id="graph" aria-label="The running world: tasks, sandboxes and the links between them">
+        <g id="viewport"><g id="frames"></g><g id="edges"></g><g id="dots"></g><g id="labels"></g><g id="nodes"></g></g>
+      </svg>
+      <div class="empty" id="empty">
+        <h2 id="empty-title">Waiting for the world</h2>
+        <p id="empty-text">The dashboard draws the world once the program calls <span class="mono">fictionet::run</span>.</p>
+      </div>
+      <nav class="crumbs" id="crumbs" aria-label="The groups around the selection" hidden></nav>
+      <div class="legend" aria-hidden="true">
+        <span><i class="l-sandbox"></i>Sandbox</span>
+        <span><i class="l-task"></i>Task</span>
+        <span><i class="l-group"></i>Group</span>
+        <span><i class="l-packet"></i>Packets</span>
+      </div>
+      <div class="stage-tools">
+        <button class="icon-button" id="reset" type="button" aria-label="Lay the graph out again, forgetting where nodes were dragged" title="Lay out again (or double-click the background)">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3.5 8a4.5 4.5 0 1 0 1.4-3.3M3.2 2.4v2.6h2.6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <button class="icon-button" id="fit" type="button" aria-label="Fit the graph to the view" title="Fit the graph to the view">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+    </div>
+    <aside class="side" id="side" aria-label="Details"></aside>
+  </div>
+
+  <section class="drawer" id="drawer" hidden aria-label="Packets">
+    <div class="grip" id="grip" aria-hidden="true"></div>
+    <div class="drawer-head">
+      <h2 id="drawer-title">Packets</h2>
+      <div class="dirs"><span class="dir-a" id="dir-a"></span><span class="dir-b" id="dir-b"></span></div>
+      <span class="sampled" id="sampled" hidden></span>
+      <div class="grow"></div>
+      <input id="pfilter" type="search" placeholder="Filter: dns, 10.0.0.2, GET" aria-label="Filter packets" autocomplete="off">
+      <button class="button" id="pause" type="button">Pause</button>
+      <a class="button" id="pcap" download>
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2v8m0 0L5 7m3 3 3-3M3 13h10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Capture for Wireshark
+      </a>
+      <button class="icon-button" id="close-drawer" type="button" aria-label="Close the packet view">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+      </button>
+    </div>
+    <div class="drawer-body">
+      <div class="plist" id="plist">
+        <table>
+          <colgroup><col class="c-no"><col class="c-time"><col class="c-dir"><col class="c-addr"><col class="c-addr"><col class="c-proto"><col class="c-len"><col></colgroup>
+          <thead><tr><th>No.</th><th>Time</th><th aria-label="Direction"></th><th>Source</th><th>Destination</th><th>Protocol</th><th>Length</th><th>Info</th></tr></thead>
+          <tbody id="prows"></tbody>
+        </table>
+      </div>
+      <div class="detail">
+        <div class="tree" id="tree"><p class="placeholder">Select a packet to see its layers.</p></div>
+        <div class="hex" id="hex" hidden><div class="hex-tabs" id="hex-tabs"></div><pre id="hex-dump"></pre></div>
+      </div>
+    </div>
+  </section>
+</div>
+<div class="tip" id="tip" hidden></div>
+</body>
+</html>

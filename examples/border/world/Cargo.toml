@@ -1,0 +1,42 @@
+[package]
+name = "border-world"
+version = "0.0.0"
+edition = "2024"
+description = "The Border world on Fictionet: a bank, an impostor, a BGP border router and the hops between them."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, so its dependencies (rcgen and the rest) stay out of the
+# fictionet crate's lock file.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "border-world"
+path = "src/main.rs"
+
+[dependencies]
+base64 = "0.22"
+flate2 = "1"
+bytes = "1"
+fictionet = { path = "../../.." }
+http = "1"
+http-body-util = "0.1"
+hyper = "1"
+rcgen = { version = "0.13", features = ["x509-parser"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+time = { version = "0.3", features = ["macros"] }
+tower-service = "0.3"
+
+[dev-dependencies]
+fictionet = { path = "../../..", features = ["tokio"] }
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
+[profile.release]
+debug = 1

@@ -1,0 +1,58 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 400" role="img" aria-labelledby="fn-tap-t fn-tap-d" style="display:block;width:100%;max-width:816px;min-width:480px;height:auto">
+<title id="fn-tap-t">Virtual machines attached with tap</title>
+<desc id="fn-tap-d">fictionet attach --type tap reaches a VM's network card in one of two ways. Top: QEMU with -netdev stream sends the frames of the VM's card, eth0, over a Unix socket, vm1.sock, which fictionet attach --type tap --vm qemu:vm1.sock listens on. No TAP device and no root are needed. Bottom: Firecracker, Cloud Hypervisor, or QEMU with -netdev tap, holds the file side of a TAP device, tap0, in a network namespace. fictionet attach --type tap --vm tap:tap0 makes a second TAP device, tap0-fn, and the kernel redirects every frame from tap0 to tap0-fn and back. Either way, attach answers ARP and IPv6 neighbor discovery itself, hands the VM the addresses given as flags by DHCP, strips the Ethernet headers, and relays IP packets to the world process.</desc>
+<defs><marker id="fn-tap-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="10" width="660" height="380" rx="10" stroke-dasharray="2 4"/>
+<rect x="30" y="40" width="130" height="64" rx="8" stroke-dasharray="5 4"/>
+<rect x="210" y="40" width="150" height="64" rx="6" stroke-dasharray="5 4"/>
+<rect x="30" y="160" width="370" height="140" rx="10" stroke-dasharray="2 4"/>
+<rect x="46" y="194" width="110" height="64" rx="8" stroke-dasharray="5 4"/>
+<rect x="184" y="194" width="84" height="64" rx="6" stroke-dasharray="5 4"/>
+<rect x="302" y="194" width="84" height="64" rx="6" stroke-dasharray="5 4"/>
+<rect x="430" y="40" width="220" height="64" rx="6" stroke-dasharray="5 4"/>
+<rect x="430" y="194" width="220" height="64" rx="6" stroke-dasharray="5 4"/>
+<rect x="430" y="322" width="220" height="52" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<path d="M162,72 H208" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+<path d="M362,72 H428" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+<path d="M158,226 H182" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+<path d="M270,226 H300" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+<path d="M388,226 H428" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+<path d="M600,106 C640,150 640,290 610,320" stroke-width="1.75" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+<path d="M540,260 V320" stroke-width="1.75" stroke-dasharray="6 4" marker-start="url(#fn-tap-a)" marker-end="url(#fn-tap-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="22" y="29" font-size="12">the host</text>
+<text x="95" y="62" text-anchor="middle" font-size="11.5">a QEMU VM</text>
+<text x="95" y="80" text-anchor="middle" font-family="'Source Code Pro',monospace">eth0</text>
+<text x="95" y="96" text-anchor="middle" font-size="11">the agent’s programs</text>
+<text x="285" y="62" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">-netdev stream</text>
+<text x="285" y="80" text-anchor="middle" font-size="11.5">a Unix socket,</text>
+<text x="285" y="96" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">vm1.sock</text>
+<text x="185" y="64" text-anchor="middle" font-size="10.5">frames</text>
+<text x="540" y="62" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">fictionet attach --type tap</text>
+<text x="540" y="80" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">--vm qemu:vm1.sock</text>
+<text x="540" y="96" text-anchor="middle" font-size="11.5">no TAP device, no root</text>
+<text x="42" y="180" font-size="12">network namespace “vm1”</text>
+<text x="101" y="214" text-anchor="middle" font-size="10.5">Firecracker, Cloud</text>
+<text x="101" y="228" text-anchor="middle" font-size="10.5">Hypervisor, QEMU</text>
+<text x="101" y="248" text-anchor="middle" font-family="'Source Code Pro',monospace">eth0</text>
+<text x="226" y="220" text-anchor="middle" font-family="'Source Code Pro',monospace">tap0</text>
+<text x="226" y="238" text-anchor="middle" font-size="10.5">the VM program</text>
+<text x="226" y="251" text-anchor="middle" font-size="10.5">holds it</text>
+<text x="344" y="220" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">tap0-fn</text>
+<text x="344" y="238" text-anchor="middle" font-size="10.5">attach’s,</text>
+<text x="344" y="251" text-anchor="middle" font-size="10.5">no offloads</text>
+<text x="215" y="284" text-anchor="middle" font-size="11">the kernel redirects every frame tap0 ↔ tap0-fn</text>
+<text x="540" y="216" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">fictionet attach --type tap</text>
+<text x="540" y="234" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">--vm tap:tap0 --netns …/vm1</text>
+<text x="540" y="250" text-anchor="middle" font-size="11.5">needs CAP_NET_ADMIN there</text>
+<text x="30" y="328" font-size="11.5">Either way, attach answers ARP and IPv6 neighbor</text>
+<text x="30" y="344" font-size="11.5">discovery, hands the VM its address flags by DHCP,</text>
+<text x="30" y="360" font-size="11.5">strips Ethernet headers, and relays IP packets.</text>
+<text x="540" y="344" text-anchor="middle">the world process</text>
+<text x="540" y="362" text-anchor="middle" font-size="11.5">sees IP packets, as from tun</text>
+</g>
+</svg>
+</div>

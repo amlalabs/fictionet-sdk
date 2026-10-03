@@ -1,0 +1,82 @@
+# The ping test: a world, attach next to the sandbox, and the sandbox.
+# Run it with ./run.sh, which also checks the results and cleans up.
+name: fictionet-ping
+
+x-build: &build
+  context: ../../..
+  dockerfile: tests/docker/ping/Dockerfile
+  target: runtime
+
+services:
+  world:
+    build: *build
+    image: fictionet-ping:dev
+    command: ["ping_world", "/run/fictionet/world.sock"]
+    network_mode: none
+    volumes:
+      - sock:/run/fictionet
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/fictionet/world.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  attach:
+    build: *build
+    image: fictionet-ping:dev
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/fictionet/world.sock
+      - --name
+      - abc
+      - --type
+      - tun
+      - --ip-addr
+      - 10.0.0.2/24
+      - --gateway
+      - 10.0.0.1
+      - --dns
+      - 10.0.0.1
+      - --ip-addr-v6
+      - fd00::2/64
+      - --gateway-v6
+      - fd00::1
+      - --no-dns-v6
+      - --ready-file
+      - /run/attach-ready
+    # Attach makes the sandbox's only interface. Docker gives it none.
+    network_mode: none
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun
+    volumes:
+      - sock:/run/fictionet
+    depends_on:
+      world:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/attach-ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  agent:
+    build:
+      context: ../../..
+      dockerfile: tests/docker/ping/Dockerfile
+      target: agent
+    image: fictionet-ping-agent:dev
+    command: ["sleep", "infinity"]
+    init: true
+    # The sandbox shares attach's network namespace and resolv.conf. It has
+    # Docker's default capabilities, so no NET_ADMIN.
+    network_mode: "service:attach"
+    depends_on:
+      attach:
+        condition: service_healthy
+
+volumes:
+  sock:

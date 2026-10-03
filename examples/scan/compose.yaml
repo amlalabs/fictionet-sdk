@@ -1,0 +1,99 @@
+# The nmap demo: nmap finds a five-host range, and one host is a real
+# container. See README.md.
+#
+#   world             - the scan example: four simulated hosts and a router.
+#                       No network at all; its only door is the world socket
+#                       on the `sock` volume.
+#   container-attach  - fictionet attach --type tun for the real container,
+#                       at 10.0.0.50.
+#   container         - nginx and OpenSSH, in container-attach's network
+#                       namespace, so its only interface is tun0.
+#   scanner-attach    - fictionet attach --type tun for the agent, at 10.0.9.2.
+#   scanner           - the agent, with nmap. NET_RAW lets nmap send SYN scans
+#                       and pings. It does not see the world socket.
+#   dashboard         - fictionet dashboard, published on 127.0.0.1 only.
+
+x-build: &build
+  context: ../..
+  dockerfile: examples/scan/docker/Dockerfile
+
+x-attach: &attach
+  image: fictionet-scan:dev
+  network_mode: none
+  cap_add: [NET_ADMIN]
+  devices:
+    - /dev/net/tun
+  volumes:
+    - sock:/run/fictionet/sock
+  depends_on:
+    world:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "test", "-f", "/run/attach-ready"]
+    interval: 1s
+    timeout: 2s
+    retries: 30
+
+services:
+  world:
+    build:
+      <<: *build
+      target: fictionet
+    image: fictionet-scan:dev
+    command: ["scan", "/run/fictionet/sock/world.sock"]
+    network_mode: none
+    volumes:
+      - sock:/run/fictionet/sock
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/fictionet/sock/world.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  container-attach:
+    <<: *attach
+    command: [fictionet, attach, --world, unix:/run/fictionet/sock/world.sock, --name, container, --type, tun,
+              --ip-addr, 10.0.0.50/24, --gateway, 10.0.0.1, --no-dns, --no-ip-addr-v6, --no-gateway-v6,
+              --no-dns-v6, --no-resolv-conf, --ready-file, /run/attach-ready]
+
+  container:
+    build:
+      <<: *build
+      target: container
+    image: fictionet-scan-container:dev
+    network_mode: "service:container-attach"
+    depends_on:
+      container-attach:
+        condition: service_healthy
+
+  scanner-attach:
+    <<: *attach
+    command: [fictionet, attach, --world, unix:/run/fictionet/sock/world.sock, --name, scanner, --type, tun,
+              --ip-addr, 10.0.9.2/24, --gateway, 10.0.9.1, --no-dns, --no-ip-addr-v6, --no-gateway-v6,
+              --no-dns-v6, --no-resolv-conf, --ready-file, /run/attach-ready]
+
+  scanner:
+    build:
+      <<: *build
+      target: scanner
+    image: fictionet-scan-scanner:dev
+    network_mode: "service:scanner-attach"
+    cap_add: [NET_RAW]
+    init: true
+    depends_on:
+      scanner-attach:
+        condition: service_healthy
+
+  dashboard:
+    image: fictionet-scan:dev
+    command: [fictionet, dashboard, --world, unix:/run/fictionet/sock/world.sock, --listen, "0.0.0.0:7878"]
+    ports:
+      - "127.0.0.1:${SCAN_DASHBOARD_PORT:-7880}:7878"
+    volumes:
+      - sock:/run/fictionet/sock
+    depends_on:
+      world:
+        condition: service_healthy
+
+volumes:
+  sock:

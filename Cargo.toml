@@ -1,0 +1,63 @@
+[package]
+name = "fictionet"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.91"
+description = "A simulated internet for AI agent evals and RL environments."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/amlalabs/fictionet-sdk"
+homepage = "https://fictionet.com"
+readme = "README.md"
+keywords = ["network", "simulation", "sandbox", "agents", "testing"]
+categories = ["network-programming", "simulation", "development-tools::testing"]
+publish = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+# On by default. tokio itself is always a dependency (hyper and h2 run on
+# it); this feature adds hyper's client, hyper-util and hyper-rustls with
+# webpki-roots, for fictionet::tokio and web::proxy(). Turn default
+# features off to leave those out.
+default = ["tokio"]
+tokio = ["dep:hyper-util", "dep:hyper-rustls", "hyper/client"]
+
+[lints.rust]
+# `cargo fuzz` builds with `--cfg fuzzing`, which adds `fictionet::fuzzing`.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[dependencies]
+bytes = "1"
+h2 = "0.4"
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+http = "1.5.0"
+http-body = "1.1.0"
+http-body-util = "0.1"
+httparse = "1.10"
+hyper = { version = "1.11.1", default-features = false, features = ["http1", "http2", "server"] }
+hyper-rustls = { version = "0.27", optional = true, default-features = false, features = ["http1", "http2", "ring", "tls12", "webpki-roots"] }
+hyper-util = { version = "0.1", optional = true, default-features = false, features = ["client-legacy", "http1", "http2", "tokio"] }
+libc = "0.2.189"
+ring = "0.17"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+smoltcp = { version = "0.14", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp", "socket-tcp-reno", "async"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "net", "time", "io-util", "sync"] }
+tower-service = "0.3.3"
+
+[dev-dependencies]
+axum = { version = "0.8", default-features = false }
+hyper = { version = "1.11.1", features = ["client"] }
+etherparse = "0.21"
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "io-util"] }
+
+[[example]]
+name = "web_world"
+required-features = ["tokio"]
+
+# The performance suite: `cargo bench --bench perf`. See CONTRIBUTING.md.
+[[bench]]
+name = "perf"
+harness = false

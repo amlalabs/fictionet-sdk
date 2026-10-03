@@ -1,0 +1,30 @@
+4POST /c HTTP/1.1
+Hsot: other.test
+Tr#nsfer-Encoding:%chtest
+oding:%chtHTTst: boTTP/1.1
+Hmst: HTTst: both¥tesest
+Trfdasnr-Encoding: chunk1
+Hsot: other.test
+raTrang: chunk1
+Hsot: other.test
+raTransfer-Encoding: chunk1
+Hsot: other.test
+ransfer-Encoding: ch
+coding:%chtest
+Consfer-EncodinchtHTTst: boTTP/1.1
+Hmst: HTTst: both¥tesest
+Trfdasnr-Encoding: cer-Encoding:%chtest
+oding:%chtHTTst: boTTP/1.1
+Hmst: HTTst: both¥tesest
+Trfdasnr-Encoding: chunk1
+Hsot: other.test
+raTrang: chunknk1
+Hsot: other.test
+raTransfer-Encoding: chunk1
+Hsot: other.test
+ransfer-Encoding: ch
+coding:%
+
+gbc
+0
+

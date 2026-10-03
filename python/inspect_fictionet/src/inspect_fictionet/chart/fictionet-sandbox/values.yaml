@@ -1,0 +1,193 @@
+# Values for fictionet-sandbox. Each entry under `services` becomes one pod
+# with three containers:
+#
+#   1. world   (native sidecar) runs the world. It listens on a Unix
+#      socket in an emptyDir that only it and attach mount.
+#   2. attach  (native sidecar). With attach.type tun (the default), it
+#      takes the pod's eth0 down, makes tun0 with a default route, and
+#      relays its packets to the world. It is the only container with
+#      NET_ADMIN. With https_proxy or socks5, it listens on 127.0.0.1 in
+#      the pod as a proxy instead, with no privileges, and the agent gets
+#      the proxy variables. The NetworkPolicy is then what keeps the agent
+#      in.
+#   3. With a proxy type only, wait-blocked (a regular init container)
+#      waits until the NetworkPolicy blocks the pod's direct traffic. See
+#      networkPolicy below.
+#   4. the agent's container, named after the service. It is the first
+#      entry in `containers`, so Inspect runs its commands there. It
+#      starts once attach's startup probe passes and wait-blocked exits.
+
+# Set by Inspect on every install (`annotations.inspectTaskName`,
+# `labels.inspectSampleUUID`). Put on the StatefulSets and pods.
+annotations: {}
+labels: {}
+
+# Pods get no service account token.
+automountServiceAccountToken: false
+
+global:
+  nameOverride: ""
+  fullnameOverride: ""
+
+# The pods' RuntimeClass, such as gvisor. Empty: the cluster's default.
+runtimeClassName: ""
+
+# The pods' securityContext. For Pod Security "restricted" with a proxy
+# type, set runAsNonRoot: true and seccompProfile {type: RuntimeDefault},
+# and run the agent's image as a user other than root.
+podSecurityContext: {}
+
+# A NetworkPolicy that denies all ingress and egress for these pods. With
+# tun, the agent's packets never reach eth0, so this is a second layer,
+# for any way back to eth0. With a proxy type, eth0 stays up and this is
+# the only layer: keep it on. It needs a CNI that enforces NetworkPolicy,
+# including on traffic to the pod's own node (Kubernetes lets a CNI always
+# allow that), and no other NetworkPolicy may select these pods: policies
+# add up, so one that allows traffic opens a way around the proxy.
+networkPolicy:
+  enabled: true
+  # Proxy types: run wait-blocked before the agent. A CNI may enforce a
+  # new policy some time after the pod starts. wait-blocked tries a TCP
+  # connection from the pod to the API server, and to each address in
+  # waitAddresses, every half second, and exits once all of them have
+  # failed 3 rounds in a row. Only then does the agent's container start.
+  # If an address still answers after waitTimeout seconds, it exits 1 and
+  # the pod does not start. Keep this on: without it, the agent may run
+  # before the policy holds it.
+  waitForEnforcement: true
+  # More ip:port addresses that must stop answering, such as a public
+  # address the cluster can reach (1.1.1.1:443), to catch a policy that
+  # allows egress outside the cluster. A failed connection is also what a
+  # down address looks like, so addresses that are always up make the
+  # check stronger.
+  waitAddresses: []
+  waitTimeout: 120
+
+# Accepted and ignored: Inspect sets it when INSPECT_SANDBOX_COREDNS_IMAGE
+# is set. This chart runs no CoreDNS: the world answers DNS.
+corednsImage: ""
+
+# fictionet attach, for every service. A service's own `attach` overrides
+# these, key by key.
+attach:
+  # An image with the static `fictionet` binary at /fictionet, built
+  # from deploy/Dockerfile (target attach). Required.
+  image: ""
+  imagePullPolicy: IfNotPresent
+  # tun, https_proxy or socks5. tun needs NET_ADMIN and MKNOD in attach's
+  # container. The proxy types need no privileges in any container.
+  type: tun
+  # The name attach gives the world. Empty: the service's name.
+  name: ""
+  # Seconds to wait for the world's socket to appear and accept.
+  worldWait: 60
+  # Links to take down before tun0 is set up: the CNI's link. tun only.
+  downLinks: [eth0]
+  # The sandbox's addresses. An empty value turns the setting off (the
+  # flag's --no- form). With tun, the DNS server also goes in the pod's
+  # dnsConfig. The proxy types use ipAddr (without its prefix) and dns,
+  # and ignore the rest: attach makes the packets and looks names up.
+  ipAddr: 10.0.0.2/24
+  gateway: 10.0.0.1
+  dns: 10.0.0.1
+  ipAddrV6: ""
+  gatewayV6: ""
+  dnsV6: ""
+  mtu: 1500
+  # Proxy types: the port attach listens on, at 127.0.0.1 in the pod. 0:
+  # 8080 for https_proxy, 1080 for socks5.
+  port: 0
+  # Proxy types: the user attach runs as. It must be allowed to open the
+  # world's socket, so the world's user: 65532 in the images that
+  # deploy/Dockerfile builds. 0 runs attach as root, for a world that runs
+  # as root. Pod Security "restricted" refuses that.
+  runAsUser: 65532
+  extraArgs: []
+  # Attach's resources. A few connections' buffers and a handful of
+  # threads fit well within this.
+  resources:
+    requests:
+      memory: 32Mi
+    limits:
+      memory: 512Mi
+
+# The sandboxes: one pod per entry, named by its key. Inspect's default
+# sandbox is the service named `default`. Each entry starts from
+# `serviceDefaults` below; what it gives replaces the default, key by key
+# (lists are replaced whole). For example:
+#
+# services:
+#   default:
+#     image: python:3.12-bookworm
+#     command: [tail, -f, /dev/null]
+#     world:
+#       image: registry.example/my-world:1
+#       args: [/run/fictionet/world.sock]
+services: {}
+
+serviceDefaults:
+  # The agent's sandbox image. Required.
+  image: ""
+  imagePullPolicy: ""
+  command: []
+  args: []
+  workingDir: ""
+  env: []
+  # The agent's resources. The limits are the memory and CPU that
+  # Inspect's own chart gives a sandbox. The requests, which the scheduler
+  # goes by, are small, so many sandboxes fit on a node. A service's own
+  # `resources` replaces this whole, so give `resources: {}` for no
+  # limits. Kubernetes has no per-container process limit: the kubelet's
+  # podPidsLimit sets one per pod, so set it on the nodes that run
+  # sandboxes.
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 100m
+    limits:
+      memory: 2Gi
+      cpu: "1"
+  readinessProbe: {}
+  # The agent's securityContext. The default drops every capability,
+  # NET_RAW and NET_ADMIN among them. Add runAsNonRoot: true and a
+  # runAsUser when the image allows it.
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    seccompProfile:
+      type: RuntimeDefault
+  # Extra volumeMounts for the agent, of volumes in `volumes` below.
+  volumeMounts: []
+  # Extra pod volumes.
+  volumes: []
+  # Directories the world writes and the agent reads, such as the
+  # world's CA certificate. Each is an emptyDir, mounted read-write in
+  # the world and read-only in the agent, at the same path.
+  shared: []
+  #   - name: ca
+  #     mountPath: /run/ca
+  # The world. Its socket must be /run/fictionet/world.sock: the
+  # emptyDir /run/fictionet is shared with attach, and only with attach.
+  world:
+    image: ""
+    imagePullPolicy: ""
+    command: []
+    args: []
+    env: []
+    # The world is trusted, but the agent's traffic drives how much it
+    # allocates. A service's own world `resources` replaces this whole.
+    resources:
+      requests:
+        memory: 64Mi
+      limits:
+        memory: 2Gi
+    securityContext:
+      allowPrivilegeEscalation: false
+      readOnlyRootFilesystem: true
+      capabilities:
+        drop: [ALL]
+      seccompProfile:
+        type: RuntimeDefault
+  # Overrides of the top-level `attach` for this service only.
+  attach: {}

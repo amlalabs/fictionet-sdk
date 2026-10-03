@@ -1,0 +1,60 @@
+# Harbor's agent container is the service `main`, built from Dockerfile in
+# this directory. This file adds the world and attach, and puts `main` in
+# attach's network namespace.
+services:
+  world:
+    build: { context: ., dockerfile: world.Dockerfile }
+    image: fictionet-hosted:dev
+    command: [web_world, /run/fictionet/world.sock, /run/ca/ca.pem]
+    network_mode: none
+    volumes: [sock:/run/fictionet, ca:/run/ca]
+    healthcheck:
+      test: ['CMD', 'test', '-S', '/run/fictionet/world.sock']
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  attach:
+    build: { context: ., dockerfile: world.Dockerfile }
+    image: fictionet-hosted:dev
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/fictionet/world.sock
+      - --name
+      - main
+      - --type
+      - tun
+      - --ip-addr
+      - 10.0.0.2/24
+      - --gateway
+      - 10.0.0.1
+      - --dns
+      - 10.0.0.1
+      - --no-ip-addr-v6
+      - --no-gateway-v6
+      - --no-dns-v6
+      - --ready-file
+      - /run/attach-ready
+    network_mode: none
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    volumes: [sock:/run/fictionet]
+    depends_on:
+      world: { condition: service_healthy }
+    healthcheck:
+      test: ['CMD', 'test', '-f', '/run/attach-ready']
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  main:
+    network_mode: 'service:attach'
+    volumes: [ca:/run/ca:ro]
+    depends_on:
+      attach: { condition: service_healthy }
+
+volumes:
+  sock:
+  ca:

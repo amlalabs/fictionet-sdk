@@ -1,0 +1,122 @@
+# The proxy test: the web_world example, one attach with --type
+# https_proxy and one with --type socks5, and a sandbox whose only network
+# is an internal one shared with the two attaches. Run it with ./run.sh,
+# which makes a token, checks the results and cleans up.
+name: fictionet-proxy
+
+x-build: &build
+  context: ../../..
+  dockerfile: tests/docker/proxy/Dockerfile
+  target: runtime
+
+# What both attaches share. Each one is its own sandbox to the world, with
+# its own name and address. Attach reaches the world through the socket
+# volume, and the sandbox reaches attach on the internal network.
+x-attach: &attach
+  build: *build
+  image: fictionet-proxy:dev
+  networks: [sandbox]
+  volumes:
+    - sock:/run/fictionet
+  environment:
+    TOKEN: ${FICTIONET_TOKEN:?run ./run.sh, which makes a token}
+  depends_on:
+    world:
+      condition: service_healthy
+  healthcheck:
+    test: ["CMD", "fictionet", "ready", "/run/attach.ready"]
+    interval: 1s
+    timeout: 2s
+    retries: 30
+
+services:
+  world:
+    build: *build
+    image: fictionet-proxy:dev
+    command: ["web_world", "/run/fictionet/world.sock", "/run/ca/ca.pem"]
+    # The world needs no network: attach reaches it through the socket.
+    network_mode: none
+    # Lets the world raise its socket buffers to attach past the system
+    # limit, so a burst of packets is not lost. The world is trusted.
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - sock:/run/fictionet
+      - ca:/run/ca
+    healthcheck:
+      test: ["CMD", "test", "-S", "/run/fictionet/world.sock"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  attach-http:
+    <<: *attach
+    command:
+      - sh
+      - -c
+      - >-
+        printf '%s\n' "$$TOKEN" > /run/token &&
+        exec fictionet attach --world unix:/run/fictionet/world.sock --name agent-http
+        --type https_proxy --listen 0.0.0.0:8080 --token-file /run/token
+        --ip-addr 10.0.0.2 --dns 10.0.0.1 --ready-file /run/attach.ready
+
+  attach-socks:
+    <<: *attach
+    command:
+      - sh
+      - -c
+      - >-
+        printf '%s\n' "$$TOKEN" > /run/token &&
+        exec fictionet attach --world unix:/run/fictionet/world.sock --name agent-socks
+        --type socks5 --listen 0.0.0.0:1080 --token-file /run/token
+        --ip-addr 10.0.0.3 --dns 10.0.0.1 --ready-file /run/attach.ready
+
+  agent:
+    build:
+      context: ../../..
+      dockerfile: tests/docker/proxy/Dockerfile
+      target: agent
+    image: fictionet-proxy-agent:dev
+    command: ["sleep", "infinity"]
+    init: true
+    networks: [sandbox]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Only the world's CA certificate, not the world socket.
+    volumes:
+      - ca:/run/ca:ro
+    environment:
+      HTTP_PROXY: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
+      http_proxy: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
+      HTTPS_PROXY: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
+      https_proxy: http://fictionet:${FICTIONET_TOKEN}@attach-http:8080
+      NO_PROXY: ""
+      no_proxy: ""
+      NODE_USE_ENV_PROXY: "1"
+      # The SOCKS5 door, for the checks that use it.
+      SOCKS: socks5h://fictionet:${FICTIONET_TOKEN}@attach-socks:1080
+      # The world's CA, for every client's own trust store.
+      SSL_CERT_FILE: /run/ca/ca.pem
+      CURL_CA_BUNDLE: /run/ca/ca.pem
+      REQUESTS_CA_BUNDLE: /run/ca/ca.pem
+      NODE_EXTRA_CA_CERTS: /run/ca/ca.pem
+      GIT_SSL_CAINFO: /run/ca/ca.pem
+    depends_on:
+      attach-http:
+        condition: service_healthy
+      attach-socks:
+        condition: service_healthy
+
+networks:
+  # No way out: the sandbox reaches the two attaches and nothing else.
+  # internal: no route out. The isolated gateway modes: no address for the
+  # host on this network, so services on the host are out of reach too.
+  sandbox:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+      com.docker.network.bridge.gateway_mode_ipv6: isolated
+
+volumes:
+  sock:
+  ca:

@@ -1,0 +1,74 @@
+# The web world, attach and an agent, for a hosted sandbox that runs Docker
+# inside it (Daytona, E2B), directly or through inspect-sandboxes.
+#
+#   world   - web_world, with no network of its own. Its only door is the
+#             world socket on the `sock` volume.
+#   attach  - fictionet attach --type tun: makes tun0 in its own network
+#             namespace and relays its packets to the world socket.
+#   default - the agent. It joins attach's network namespace, so its only
+#             interface is tun0. It has no extra capabilities and does not
+#             see the world socket. Inspect runs tools in the service
+#             named `default`.
+
+services:
+  world:
+    build: .
+    image: fictionet-hosted:dev
+    command: [web_world, /run/fictionet/world.sock, /run/ca/ca.pem]
+    init: true   # passes SIGTERM on to web_world, so it stops at once
+    network_mode: none
+    volumes: [sock:/run/fictionet, ca:/run/ca]
+    healthcheck:
+      test: ['CMD', 'test', '-S', '/run/fictionet/world.sock']
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  attach:
+    build: .
+    image: fictionet-hosted:dev
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/fictionet/world.sock
+      - --name
+      - agent
+      - --type
+      - tun
+      - --ip-addr
+      - 10.0.0.2/24
+      - --gateway
+      - 10.0.0.1
+      - --dns
+      - 10.0.0.1
+      - --no-ip-addr-v6
+      - --no-gateway-v6
+      - --no-dns-v6
+      - --ready-file
+      - /run/attach-ready
+    network_mode: none
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    volumes: [sock:/run/fictionet]
+    depends_on:
+      world: { condition: service_healthy }
+    healthcheck:
+      test: ['CMD', 'test', '-f', '/run/attach-ready']
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  default:
+    build: { context: ., dockerfile: agent.Dockerfile }
+    image: fictionet-hosted-agent:dev
+    command: [sleep, infinity]
+    init: true
+    network_mode: 'service:attach'
+    volumes: [ca:/run/ca:ro]
+    depends_on:
+      attach: { condition: service_healthy }
+
+volumes:
+  sock:
+  ca:

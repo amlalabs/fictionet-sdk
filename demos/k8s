@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# demos/k8s: kind in the VM, the Helm chart, and an agent pod whose only network is the world.
+#
+# One command, no root: it boots the Fictionet VM if it is not running
+# (vm/run up), runs demos/guest/k8s.sh inside it, and cleans up. See
+# demos/README.md.
+exec "$(dirname "$0")/../vm/run" demo k8s "$@"

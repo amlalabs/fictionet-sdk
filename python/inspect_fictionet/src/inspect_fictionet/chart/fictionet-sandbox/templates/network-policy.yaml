@@ -1,0 +1,24 @@
+{{- if .Values.networkPolicy.enabled }}
+# Denies all ingress and egress for the release's pods. With tun, the
+# agent's packets go to tun0 and over a Unix socket to the world, never to
+# eth0, so this is a second layer, for any way back to eth0. The first is
+# the order of the containers: the agent starts only once attach has taken
+# eth0 down. With a proxy type, eth0 stays up and this policy is the only
+# layer. A CNI may apply it a few seconds after the pod starts, so the
+# wait-blocked init container keeps the agent from starting until the pod
+# can no longer reach the API server. Policies add up: another policy that
+# selects these pods and allows traffic opens a way past this one.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "fictionet.fullname" . }}-deny-all
+  labels:
+    {{- include "fictionet.labels" . | nindent 4 }}
+  annotations:
+    {{- toYaml .Values.annotations | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "fictionet.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress, Egress]
+{{- end }}

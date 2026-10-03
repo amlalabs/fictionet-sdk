@@ -1,0 +1,41 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 400" role="img" aria-labelledby="fn-pod-t fn-pod-d" style="display:block;width:100%;max-width:720px;min-width:480px;height:auto">
+<title id="fn-pod-t">A tun sandbox in a Kubernetes pod</title>
+<desc id="fn-pod-d">One pod, with one network namespace shared by its three containers. The agent's container comes first. It has every capability dropped, and its programs send their IP packets to tun0, which has the address 10.0.0.2/24. The native sidecar attach made tun0 and relays its packets to the native sidecar world, over the Unix socket /run/fictionet/world.sock in an emptyDir that only those two mount. Attach has NET_ADMIN and MKNOD. The pod's eth0, from the CNI, is down, with no address and no route: attach took it down before it made tun0. The pod's dnsConfig names the world's DNS server, 10.0.0.1. The agent's container starts once attach's startup probe passes.</desc>
+<defs><marker id="fn-pod-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="10" width="580" height="330" rx="10" stroke-dasharray="2 4"/>
+<rect x="30" y="44" width="210" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="360" y="44" width="210" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="240" y="152" width="120" height="48" rx="6" stroke-dasharray="5 4"/>
+<rect x="360" y="244" width="210" height="76" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="30" y="244" width="210" height="76" rx="6" stroke-dasharray="1 3"/>
+<path d="M135,122 V176 H238" marker-end="url(#fn-pod-a)"/>
+<path d="M362,176 H420 V122" marker-start="url(#fn-pod-a)" marker-end="url(#fn-pod-a)"/>
+<path d="M515,122 V242" stroke-width="1.75" marker-start="url(#fn-pod-a)" marker-end="url(#fn-pod-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="22" y="30" font-size="12">pod: one network namespace, shared by all three containers</text>
+<text x="135" y="66" text-anchor="middle">the agent’s container</text>
+<text x="135" y="84" text-anchor="middle" font-size="11.5">first in containers</text>
+<text x="135" y="102" text-anchor="middle" font-size="11.5">every capability dropped</text>
+<text x="465" y="66" text-anchor="middle">native sidecar “attach”</text>
+<text x="465" y="84" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">fictionet attach</text>
+<text x="465" y="102" text-anchor="middle" font-size="11.5">NET_ADMIN, MKNOD</text>
+<text x="300" y="173" text-anchor="middle" font-family="'Source Code Pro',monospace">tun0</text>
+<text x="300" y="190" text-anchor="middle" font-size="11.5">10.0.0.2/24</text>
+<text x="143" y="146" font-size="11.5">IP packets</text>
+<text x="428" y="146" font-size="11.5">makes it</text>
+<text x="525" y="178" font-size="11.5">socket in</text>
+<text x="525" y="194" font-size="11.5">an emptyDir</text>
+<text x="465" y="266" text-anchor="middle">native sidecar “world”</text>
+<text x="465" y="284" text-anchor="middle" font-size="11.5">the world process</text>
+<text x="465" y="302" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">/run/fictionet/world.sock</text>
+<text x="135" y="266" text-anchor="middle" font-family="'Source Code Pro',monospace">eth0</text>
+<text x="135" y="284" text-anchor="middle" font-size="11.5">from the CNI; taken down</text>
+<text x="135" y="302" text-anchor="middle" font-size="11.5">by attach: no address, no route</text>
+<text x="300" y="366" text-anchor="middle" font-size="12">The pod’s dnsConfig names the world’s DNS server, 10.0.0.1.</text>
+<text x="300" y="384" text-anchor="middle" font-size="12">The agent’s container starts once attach’s startup probe passes.</text>
+</g>
+</svg>
+</div>

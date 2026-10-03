@@ -1,0 +1,11 @@
+*
+!Cargo.toml
+!Cargo.lock
+!src
+!docs
+!dashboard
+!examples/*.rs
+!examples/border/world/Cargo.toml
+!examples/border/world/Cargo.lock
+!examples/border/world/src
+!examples/border/docker/bird.conf

@@ -1,0 +1,93 @@
+# FakeWiki on Fictionet, for Inspect's stock "docker" provider.
+#
+#   fictionet - the world: web::Sites in Rust, FakeWiki's pages in Python on
+#               its own 127.0.0.1. No network at all (network_mode: none).
+#               Its only door is the world socket on the `sock` volume.
+#   attach    - fictionet attach --type tun: makes tun0 in its own network
+#               namespace and relays its packets to the world socket.
+#   default   - the agent. It joins attach's network namespace, so its only
+#               interface is tun0. It has no extra capabilities and does not
+#               see the world socket.
+#
+# The variant is interpolated from sample metadata (SAMPLE_METADATA_VARIANT),
+# which Inspect only does when the sandbox config is a file path.
+
+x-build: &build
+  context: ../..
+  dockerfile: examples/fakewiki/docker/Dockerfile
+
+services:
+  fictionet:
+    build:
+      <<: *build
+      target: world
+    image: fictionet-fakewiki-world:dev
+    network_mode: none
+    # The world is trusted. NET_ADMIN lets it raise its socket buffers to
+    # attach past the system limit, so a burst of packets is not lost.
+    cap_add: [NET_ADMIN]
+    environment:
+      FAKEWIKI_VARIANT: ${SAMPLE_METADATA_VARIANT:-unset}
+    volumes:
+      - sock:/run/fictionet/sock
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/fictionet/ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+
+  attach:
+    build:
+      <<: *build
+      target: attach
+    image: fictionet-fakewiki-attach:dev
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/fictionet/sock/world.sock
+      - --name
+      - agent
+      - --type
+      - tun
+      - --ip-addr
+      - 10.0.0.2/24
+      - --gateway
+      - 10.0.0.1
+      - --dns
+      - 10.0.0.1
+      - --no-ip-addr-v6
+      - --no-gateway-v6
+      - --no-dns-v6
+      - --ready-file
+      - /run/attach-ready
+    network_mode: none
+    cap_add: [NET_ADMIN]
+    devices:
+      - /dev/net/tun
+    volumes:
+      - sock:/run/fictionet/sock
+    depends_on:
+      fictionet:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/attach-ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+
+  default:
+    build:
+      <<: *build
+      target: agent
+    image: fictionet-fakewiki-agent:dev
+    network_mode: "service:attach"
+    depends_on:
+      attach:
+        condition: service_healthy
+    init: true
+
+volumes:
+  sock:

@@ -1,0 +1,50 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 440" role="img" aria-labelledby="fn-netns-t fn-netns-d" style="display:block;width:100%;max-width:720px;min-width:480px;height:auto">
+<title id="fn-netns-t">A tun sandbox in a network namespace on a host</title>
+<desc id="fn-netns-d">On the host, the world process listens on world.sock, and fictionet attach, started with --netns /run/netns/agent, connects to it. Attach makes tun0, with the address 10.0.0.2/24, inside the network namespace /run/netns/agent. It writes the DNS servers to /etc/netns/agent/resolv.conf on the host, and leaves the host's own /etc/resolv.conf alone. The agent is started with ip netns exec agent. That command makes a new mount namespace for the agent and bind-mounts /etc/netns/agent/resolv.conf over /etc/resolv.conf there, so only the agent and its children see it. A process that enters the namespace with nsenter instead keeps the host's /etc/resolv.conf.</desc>
+<defs><marker id="fn-netns-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="10" width="580" height="420" rx="10" stroke-dasharray="2 4"/>
+<rect x="30" y="40" width="254" height="48" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="340" y="40" width="230" height="48" rx="6" stroke-dasharray="5 4"/>
+<rect x="300" y="150" width="280" height="176" rx="10" stroke-dasharray="2 4"/>
+<rect x="316" y="186" width="96" height="48" rx="6" stroke-dasharray="5 4"/>
+<rect x="444" y="180" width="122" height="58" rx="6" stroke-dasharray="5 4"/>
+<rect x="444" y="250" width="122" height="58" rx="6" stroke-dasharray="5 4"/>
+<rect x="30" y="160" width="150" height="48" rx="6" stroke-dasharray="5 4"/>
+<rect x="30" y="336" width="250" height="48" rx="6" stroke-dasharray="5 4"/>
+<path d="M286,64 H338" stroke-width="1.75" marker-start="url(#fn-netns-a)" marker-end="url(#fn-netns-a)"/>
+<path d="M364,90 V184" marker-end="url(#fn-netns-a)"/>
+<path d="M414,210 H442" marker-start="url(#fn-netns-a)" marker-end="url(#fn-netns-a)"/>
+<path d="M350,90 V120 H230 V334" marker-end="url(#fn-netns-a)"/>
+<path d="M282,360 H430 V228 H442" marker-end="url(#fn-netns-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="22" y="29" font-size="12">the host</text>
+<text x="157" y="60" text-anchor="middle">the world process</text>
+<text x="157" y="78" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">listen(UnixSocket(".../world.sock"))</text>
+<text x="455" y="60" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">fictionet attach</text>
+<text x="455" y="78" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">--netns /run/netns/agent</text>
+<text x="312" y="56" text-anchor="middle" font-size="11">the relay</text>
+<text x="372" y="140" font-size="11.5">makes tun0 inside</text>
+<text x="570" y="168" text-anchor="end" font-size="12">network namespace “agent”</text>
+<text x="364" y="207" text-anchor="middle" font-family="'Source Code Pro',monospace">tun0</text>
+<text x="364" y="224" text-anchor="middle" font-size="11.5">10.0.0.2/24</text>
+<text x="505" y="200" text-anchor="middle">the agent</text>
+<text x="505" y="216" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">ip netns exec</text>
+<text x="505" y="230" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">agent ...</text>
+<text x="505" y="268" text-anchor="middle" font-size="11.5">a process from</text>
+<text x="505" y="283" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">nsenter --net=...</text>
+<text x="505" y="299" text-anchor="middle" font-size="11.5">keeps the host’s file</text>
+<text x="105" y="180" text-anchor="middle" font-size="11.5">the host’s own</text>
+<text x="105" y="197" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">/etc/resolv.conf</text>
+<text x="105" y="226" text-anchor="middle" font-size="11.5">attach leaves it alone</text>
+<text x="238" y="250" font-size="11.5">attach</text>
+<text x="238" y="265" font-size="11.5">writes</text>
+<text x="155" y="357" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">/etc/netns/agent/resolv.conf</text>
+<text x="155" y="374" text-anchor="middle" font-size="11.5">on the host</text>
+<text x="292" y="380" font-size="11.5">ip netns exec agent mounts it over</text>
+<text x="292" y="396" font-size="11.5">/etc/resolv.conf, for the agent only</text>
+</g>
+</svg>
+</div>

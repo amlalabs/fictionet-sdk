@@ -1,0 +1,41 @@
+name: VM demo
+
+# Runs demos/web in the Fictionet VM (vm/run), the way a newcomer would:
+# QEMU and KVM on the runner, and nothing else. Started by hand from the
+# Actions tab.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  web:
+    name: demos/web
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Let the runner's user open /dev/kvm
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Install QEMU
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends qemu-system-x86 qemu-utils genisoimage
+      # Only Debian's image. The prepared image holds the SSH key of the run
+      # that made it, so each run prepares its own.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            .vm/images/debian-*.qcow2
+            .vm/images/SHA512SUMS
+          key: vm-debian-${{ hashFiles('vm/versions.sh') }}
+      - name: demos/web
+        run: demos/web
+      - name: The VM's console, if it failed
+        if: failure()
+        run: tail -50 .vm/run/console.log .vm/prepare.log || true

@@ -1,0 +1,95 @@
+# Border on Fictionet, home setting (border_eval `-T setting=home`): the same
+# world, with the agent on an ordinary user's machine (the Dockerfile's
+# `home` target) on a home network, 192.168.1.0/24, with the router and its
+# DNS at 192.168.1.1. The machine is called rw-desktop: the agent's
+# container takes the hostname of attach, whose network it shares. The
+# image tags are this file's own, so building it never replaces the lab
+# images.
+
+x-build: &build
+  context: ../..
+  dockerfile: examples/border/docker/Dockerfile
+
+services:
+  fictionet:
+    build:
+      <<: *build
+      target: world-home
+    image: fictionet-border-world:home
+    network_mode: none
+    cap_add: [NET_ADMIN]
+    environment:
+      BORDER_VARIANT: ${SAMPLE_METADATA_VARIANT:-}
+      BORDER_TASK: ${SAMPLE_METADATA_TASK:-}
+    volumes:
+      - sock:/run/relay
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/fictionet/ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+
+  attach:
+    build:
+      <<: *build
+      target: attach
+    image: fictionet-border-attach:dev
+    hostname: rw-desktop
+    command:
+      - fictionet
+      - attach
+      - --world
+      - unix:/run/relay/relay.sock
+      - --name
+      - agent
+      - --type
+      - tun
+      - --ip-addr
+      - 192.168.1.23/24
+      - --gateway
+      - 192.168.1.1
+      - --dns
+      - 192.168.1.1
+      - --no-ip-addr-v6
+      - --no-gateway-v6
+      - --no-dns-v6
+      - --ready-file
+      - /run/attach-ready
+    network_mode: none
+    cap_add: [NET_ADMIN]
+    # The agent shares this network namespace. IPv4 only, as in the original study.
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+      net.ipv6.conf.lo.disable_ipv6: "1"
+    devices:
+      - /dev/net/tun
+    volumes:
+      - sock:/run/relay
+    depends_on:
+      fictionet:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/run/attach-ready"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+      start_period: 1s
+
+  default:
+    build:
+      <<: *build
+      target: home
+    image: fictionet-border-home:dev
+    network_mode: "service:attach"
+    # As in the original study: no raw sockets, and no gaining privileges.
+    cap_drop: [NET_RAW]
+    security_opt: ["no-new-privileges:true"]
+    depends_on:
+      attach:
+        condition: service_healthy
+    init: true
+
+volumes:
+  sock:

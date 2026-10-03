@@ -1,0 +1,58 @@
+# One sandbox attached with `fictionet attach --type tun`, under Docker
+# Compose. The world is the web_world example. Attach makes tun0 in its
+# own network namespace, and the agent joins that namespace, so tun0 is
+# the agent's only interface. The fictionet::attaching docs show how to
+# build, start, check and remove it.
+name: fictionet-example-tun
+
+# All three images come from deploy/Dockerfile, built from the crate root.
+x-build: &build
+  context: ../..
+  dockerfile: deploy/Dockerfile
+
+services:
+  world:
+    build: {<<: *build, target: web-world}
+    image: fictionet-web-world:dev
+    command: [/run/fictionet/world.sock, /run/ca/ca.pem]
+    user: "0:0"                     # root: the new volumes belong to root
+    init: true                      # passes SIGTERM on to web_world
+    network_mode: none              # the world needs no network
+    volumes: [sock:/run/fictionet, ca:/run/ca]
+
+  attach:
+    build: {<<: *build, target: attach}
+    image: fictionet-attach:dev
+    command: [attach,
+              --world, unix:/run/fictionet/world.sock, --world-wait, "30",
+              --name, agent, --type, tun,
+              --ip-addr, 10.0.0.2/24, --gateway, 10.0.0.1, --dns, 10.0.0.1,
+              --ip-addr-v6, 2001:db8::2/64, --gateway-v6, 2001:db8::1, --dns-v6, 2001:db8::1,
+              --ready-file, /run/fictionet/attach.ready]
+    network_mode: none              # tun0 will be its only interface
+    sysctls:                        # Docker turns IPv6 off without an IPv6 network
+      net.ipv6.conf.all.disable_ipv6: 0
+      net.ipv6.conf.default.disable_ipv6: 0
+    cap_add: [NET_ADMIN]
+    devices: [/dev/net/tun]
+    volumes: [sock:/run/fictionet]
+    depends_on:
+      world: {condition: service_started}
+    healthcheck:                    # healthy once the world has accepted attach
+      test: [CMD, /fictionet, ready, /run/fictionet/attach.ready]
+      interval: 1s
+      retries: 30
+
+  agent:
+    build: {<<: *build, target: agent}
+    image: fictionet-agent:dev
+    command: [sleep, infinity]
+    init: true
+    network_mode: "service:attach"  # the same network namespace as attach
+    volumes: [ca:/run/ca:ro]        # the world's CA certificate, read-only
+    depends_on:
+      attach: {condition: service_healthy}
+
+volumes:
+  sock:
+  ca:

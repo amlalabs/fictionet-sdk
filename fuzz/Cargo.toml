@@ -1,0 +1,111 @@
+[package]
+name = "fictionet-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+fictionet = { path = "..", features = ["tokio"] }
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false }
+httparse = "1.10"
+libc = "0.2"
+libfuzzer-sys = "0.4"
+rcgen = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tower-service = "0.3"
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "sync", "macros"] }
+
+# Not part of the SDK's workspace.
+[workspace]
+members = ["."]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "relay"
+path = "fuzz_targets/relay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "packets"
+path = "fuzz_targets/packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ip_reassembly"
+path = "fuzz_targets/ip_reassembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dns"
+path = "fuzz_targets/dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_http"
+path = "fuzz_targets/proxy_http.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_socks5"
+path = "fuzz_targets/proxy_socks5.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tls"
+path = "fuzz_targets/tls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stack"
+path = "fuzz_targets/stack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tcp"
+path = "fuzz_targets/tcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "web"
+path = "fuzz_targets/web.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "web_http"
+path = "fuzz_targets/web_http.rs"
+test = false
+doc = false
+bench = false

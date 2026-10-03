@@ -1,0 +1,23 @@
+4POST /c HTTP/1.1
+Hsot: othe: 100-c
+Expect: otost: bT /c HTTP/1.1
+Hsot: othertse.tP/1.1
+Host: both.t¬…¤e7|st
+Expect: oth.t7…¤|est
+Expect: 100-c
+Expect: oth.t7…1
+Host: both.t¬7…¤|est
+Expect: oth.t7…¤|est
+Expect: 100-c
+Expect: oth.t7…¤|est
+Expect: oth.t7…¤|est
+Expect: ¤|est
+Expect: 100-
+
+xHHHHHhHHo=er.test
+ransfer-Encoding: ch
+
+6
+abc
+0
+

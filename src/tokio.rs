@@ -1,0 +1,116 @@
+//! Hands stdlib connections to tokio-based libraries such as hyper and
+//! axum. Needs the `tokio` feature, which is on by default.
+//!
+//! Read this page when a world serves a connection with a library that
+//! expects tokio's `AsyncRead` and `AsyncWrite`. Fictionet's own
+//! [`Connection`] trait is not tied to any runtime. Calling
+//! [`into_tokio`](ConnectionTokioExt::into_tokio) on a connection wraps it
+//! in a [`Compat`], which implements tokio's traits. Nothing in the core
+//! depends on this module.
+//!
+//! The world must then run on a tokio runtime, as it must for any
+//! tokio-based library: [`block_on`](crate::block_on) is not a tokio
+//! runtime. Await [`run`](crate::run) inside `#[tokio::main]` instead.
+//!
+//! Here a TLS connection is finished and handed to hyper:
+//!
+//! ```
+//! use fictionet::prelude::*;
+//! # use std::sync::Arc;
+//! # use fictionet::{Cx, Result, stdlib::{tcp, tls}};
+//! # async fn serve(cx: Cx, hello: tls::ClientHello<tcp::TcpConnection>, config: Arc<rustls::ServerConfig>) -> Result {
+//!
+//! let conn = hello.finish(&cx, config).await?;
+//! let io = hyper_util::rt::TokioIo::new(conn.into_tokio(&cx));
+//! # drop(io);
+//! # Ok(())
+//! # }
+//! ```
+
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use crate::stdlib::{ConnError, Connection};
+use crate::Cx;
+
+/// Adds [`into_tokio`](ConnectionTokioExt::into_tokio) to every
+/// [`Connection`]. Imported by [`prelude`](crate::prelude).
+pub trait ConnectionTokioExt: Connection + Sized {
+    /// Wraps this connection in a [`Compat`], which implements tokio's
+    /// `AsyncRead` and `AsyncWrite`.
+    ///
+    /// The wrapper keeps a clone of `cx`, because tokio's traits take no
+    /// context. Its reads and writes still stop when `cx`'s
+    /// [region](crate::Cx#regions) is cancelled: they fail with an I/O
+    /// error of kind `Interrupted`, since an I/O error is the only way
+    /// tokio's traits can report it. Other [`ConnError`]s map to the
+    /// matching I/O error kinds, such as `ConnectionReset`.
+    fn into_tokio(self, cx: &Cx) -> Compat<Self> {
+        Compat { inner: self, cx: cx.clone() }
+    }
+}
+
+impl<C: Connection> ConnectionTokioExt for C {}
+
+/// A [`Connection`] with tokio's `AsyncRead` and `AsyncWrite`. Made by
+/// [`into_tokio`](ConnectionTokioExt::into_tokio).
+pub struct Compat<C> {
+    inner: C,
+    cx: Cx,
+}
+
+impl<C> Compat<C> {
+    /// Unwraps the connection inside.
+    pub fn into_inner(self) -> C {
+        self.inner
+    }
+}
+
+fn to_io(e: ConnError) -> std::io::Error {
+    use std::io::ErrorKind;
+    let kind = match e {
+        ConnError::Cancelled => ErrorKind::Interrupted,
+        ConnError::Refused => ErrorKind::ConnectionRefused,
+        ConnError::Reset => ErrorKind::ConnectionReset,
+        ConnError::TimedOut => ErrorKind::TimedOut,
+        ConnError::Closed => ErrorKind::BrokenPipe,
+        ConnError::Broken => ErrorKind::InvalidData,
+    };
+    std::io::Error::new(kind, e)
+}
+
+impl<C: Connection + Unpin> ::tokio::io::AsyncRead for Compat<C> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        task: &mut Context<'_>,
+        buf: &mut ::tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        match this.inner.poll_read(&this.cx, task, buf.initialize_unfilled()) {
+            Poll::Ready(Ok(n)) => {
+                buf.advance(n);
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(to_io(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<C: Connection + Unpin> ::tokio::io::AsyncWrite for Compat<C> {
+    fn poll_write(self: Pin<&mut Self>, task: &mut Context<'_>, data: &[u8]) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        this.inner.poll_write(&this.cx, task, data).map_err(to_io)
+    }
+
+    /// A connection hands bytes on as soon as `poll_write` takes them, so
+    /// there is nothing to flush.
+    fn poll_flush(self: Pin<&mut Self>, _task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, task: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        this.inner.poll_shutdown(&this.cx, task).map_err(to_io)
+    }
+}

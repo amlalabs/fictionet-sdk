@@ -1,0 +1,86 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 680 476" role="img" aria-labelledby="fn-low-t fn-low-d" style="display:block;width:100%;max-width:816px;min-width:480px;height:auto">
+<title id="fn-low-t">How each attach type becomes IP packets</title>
+<desc id="fn-low-d">Four rows, one per attach type, read left to right: what the sandbox sends, what reaches fictionet attach, how attach turns it into IP packets, the world socket, and the world's Attachment. tun: the sandbox kernel's IP stack sends IP packets through tun0; attach reads them from the tun file descriptor and relays each one unchanged. tap: a VM's kernel sends Ethernet frames through its card; they reach attach over QEMU's stream socket, or through a TAP device and a traffic-control redirect; attach strips the Ethernet header and answers ARP, neighbor discovery, DHCP and router solicitations itself. https_proxy and socks5: a program such as curl sends a CONNECT request and then bytes over a TCP connection to attach; attach's own TCP/IP stack, the stdlib's, at the sandbox's address, sends a DNS query to the world's DNS server and opens one TCP connection into the world for each request. Every IP packet then crosses the world socket as one packet message, and the world's Attachment receives IP packets, whatever the type.</desc>
+<defs><marker id="fn-low-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="40" width="160" height="412" rx="10" stroke-dasharray="2 4"/>
+<rect x="22" y="56" width="136" height="76" rx="8" stroke-dasharray="5 4"/>
+<rect x="22" y="152" width="136" height="76" rx="8" stroke-dasharray="5 4"/>
+<rect x="22" y="248" width="136" height="76" rx="8" stroke-dasharray="5 4"/>
+<rect x="22" y="344" width="136" height="76" rx="8" stroke-dasharray="5 4"/>
+<rect x="190" y="56" width="134" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="190" y="152" width="134" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="190" y="248" width="134" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="190" y="344" width="134" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="346" y="56" width="160" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="346" y="152" width="160" height="76" rx="6" stroke-dasharray="5 4"/>
+<rect x="346" y="248" width="160" height="172" rx="6" stroke-dasharray="5 4"/>
+<rect x="534" y="56" width="32" height="364" rx="6" stroke-dasharray="5 4"/>
+<rect x="594" y="56" width="76" height="364" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<path d="M160,94 H188" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M160,190 H188" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M160,286 H188" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M160,382 H188" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M326,94 H344" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M326,190 H344" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M326,286 H344" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M326,382 H344" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M508,94 H532" stroke-width="1.75" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M508,190 H532" stroke-width="1.75" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M508,334 H532" stroke-width="1.75" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+<path d="M568,238 H592" stroke-width="1.75" stroke-dasharray="6 4" marker-start="url(#fn-low-a)" marker-end="url(#fn-low-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="90" y="28" text-anchor="middle" font-size="12">the sandbox</text>
+<text x="257" y="28" text-anchor="middle" font-size="12">what reaches attach</text>
+<text x="426" y="28" text-anchor="middle" font-size="12">how attach lowers it</text>
+<text x="632" y="28" text-anchor="middle" font-size="12">the world</text>
+<text x="90" y="77" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">tun</text>
+<text x="90" y="98" text-anchor="middle" font-size="11">the kernel’s IP stack</text>
+<text x="90" y="116" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">tun0</text>
+<text x="257" y="84" text-anchor="middle" font-size="11.5">IP packets</text>
+<text x="257" y="102" text-anchor="middle" font-size="10.5">read from the</text>
+<text x="257" y="116" text-anchor="middle" font-size="10.5">tun file descriptor</text>
+<text x="426" y="80" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">relay_packets</text>
+<text x="426" y="99" text-anchor="middle" font-size="10.5">copies each packet</text>
+<text x="426" y="113" text-anchor="middle" font-size="10.5">unchanged, both ways</text>
+<text x="90" y="173" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">tap</text>
+<text x="90" y="194" text-anchor="middle" font-size="11">a VM’s kernel</text>
+<text x="90" y="212" text-anchor="middle" font-size="11">and its network card</text>
+<text x="257" y="173" text-anchor="middle" font-size="11.5">Ethernet frames</text>
+<text x="257" y="192" text-anchor="middle" font-size="10.5">QEMU’s stream socket,</text>
+<text x="257" y="206" text-anchor="middle" font-size="10.5">or a TAP device and</text>
+<text x="257" y="220" text-anchor="middle" font-size="10.5">a tc mirred redirect</text>
+<text x="426" y="173" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">Link::frame_from_vm</text>
+<text x="426" y="192" text-anchor="middle" font-size="10.5">strips Ethernet; answers</text>
+<text x="426" y="206" text-anchor="middle" font-size="10.5">ARP and neighbor discovery,</text>
+<text x="426" y="220" text-anchor="middle" font-size="10.5">and DHCP if given addresses</text>
+<text x="90" y="269" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">https_proxy</text>
+<text x="90" y="290" text-anchor="middle" font-size="11">curl, told by</text>
+<text x="90" y="308" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">HTTPS_PROXY</text>
+<text x="257" y="277" text-anchor="middle" font-size="11.5">CONNECT host:443,</text>
+<text x="257" y="295" text-anchor="middle" font-size="10.5">then the TLS bytes,</text>
+<text x="257" y="309" text-anchor="middle" font-size="10.5">on one TCP connection</text>
+<text x="90" y="365" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">socks5</text>
+<text x="90" y="386" text-anchor="middle" font-size="11">curl, told by</text>
+<text x="90" y="404" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="10.5">socks5h://</text>
+<text x="257" y="373" text-anchor="middle" font-size="11.5">SOCKS5 CONNECT,</text>
+<text x="257" y="391" text-anchor="middle" font-size="10.5">then the TLS bytes,</text>
+<text x="257" y="405" text-anchor="middle" font-size="10.5">on one TCP connection</text>
+<text x="426" y="290" text-anchor="middle" font-size="11.5">attach’s own TCP/IP stack</text>
+<text x="426" y="308" text-anchor="middle" font-size="10.5">the stdlib’s TCP and UDP,</text>
+<text x="426" y="322" text-anchor="middle" font-size="10.5">at the sandbox’s --ip-addr</text>
+<text x="426" y="350" text-anchor="middle" font-size="10.5">1. a DNS query to --dns</text>
+<text x="426" y="368" text-anchor="middle" font-size="10.5">2. a TCP connection into</text>
+<text x="426" y="382" text-anchor="middle" font-size="10.5">the world, one per request</text>
+<text x="426" y="400" text-anchor="middle" font-size="10.5">3. bytes copied both ways</text>
+<text transform="translate(554 238) rotate(-90)" text-anchor="middle" font-size="11">the world socket: one packet message per IP packet</text>
+<text x="632" y="222" text-anchor="middle" font-size="11.5">the</text>
+<text x="632" y="238" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">Attachment</text>
+<text x="632" y="256" text-anchor="middle" font-size="10.5">IP packets</text>
+<text x="632" y="270" text-anchor="middle" font-size="10.5">only</text>
+<text x="22" y="470" font-size="11.5">World code is not told the type: it gets the same kind of Attachment from each.</text>
+</g>
+</svg>
+</div>

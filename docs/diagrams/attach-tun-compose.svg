@@ -1,0 +1,45 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 470" role="img" aria-labelledby="fn-compose-t fn-compose-d" style="display:block;width:100%;max-width:720px;min-width:480px;height:auto">
+<title id="fn-compose-t">A tun sandbox in Docker Compose</title>
+<desc id="fn-compose-d">Three containers. The world container runs the world process, which listens on /run/fictionet/world.sock. The attach container reaches that socket through the shared volume sock, and relays packets to the world. The attach and agent containers share one network namespace, because the agent has network_mode service:attach. Attach makes tun0, with the address 10.0.0.2/24, in that namespace, and the agent's programs send their IP packets through it. Attach has NET_ADMIN and /dev/net/tun. The agent has neither. On the host, Docker keeps one resolv.conf file, under /var/lib/docker/containers/ and the attach container's id. It bind-mounts that one file at /etc/resolv.conf in both containers. Attach rewrites it in place, and the agent reads the same file.</desc>
+<defs><marker id="fn-compose-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="10" width="580" height="74" rx="10" stroke-dasharray="2 4"/>
+<rect x="150" y="22" width="380" height="50" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="10" y="130" width="580" height="200" rx="10" stroke-dasharray="2 4"/>
+<rect x="30" y="166" width="220" height="70" rx="6" stroke-dasharray="5 4"/>
+<rect x="350" y="166" width="220" height="70" rx="6" stroke-dasharray="5 4"/>
+<rect x="230" y="262" width="140" height="48" rx="6" stroke-dasharray="5 4"/>
+<rect x="120" y="376" width="360" height="48" rx="6" stroke-dasharray="5 4"/>
+<path d="M230,164 V74" stroke-width="1.75" marker-start="url(#fn-compose-a)" marker-end="url(#fn-compose-a)"/>
+<path d="M170,238 V286 H228" marker-start="url(#fn-compose-a)" marker-end="url(#fn-compose-a)"/>
+<path d="M460,238 V286 H372" marker-start="url(#fn-compose-a)" marker-end="url(#fn-compose-a)"/>
+<path d="M60,238 V400 H118" marker-end="url(#fn-compose-a)"/>
+<path d="M482,400 H540 V238" marker-end="url(#fn-compose-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="22" y="29" font-size="12">container “world”</text>
+<text x="340" y="43" text-anchor="middle">the world process</text>
+<text x="340" y="61" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">listen(UnixSocket("/run/fictionet/world.sock"))</text>
+<text x="240" y="106" font-size="11.5">the relay, through the volume “sock”</text>
+<text x="578" y="149" text-anchor="end" font-size="12">one network namespace, shared by both containers</text>
+<text x="140" y="188" text-anchor="middle">container “attach”</text>
+<text x="140" y="206" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">fictionet attach</text>
+<text x="140" y="224" text-anchor="middle" font-size="11.5">NET_ADMIN, /dev/net/tun</text>
+<text x="460" y="188" text-anchor="middle">container “agent”</text>
+<text x="460" y="206" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11">network_mode: "service:attach"</text>
+<text x="460" y="224" text-anchor="middle" font-size="11.5">no NET_ADMIN</text>
+<text x="300" y="283" text-anchor="middle" font-family="'Source Code Pro',monospace">tun0</text>
+<text x="300" y="300" text-anchor="middle" font-size="11.5">10.0.0.2/24</text>
+<text x="178" y="258" font-size="11.5">makes it</text>
+<text x="452" y="258" text-anchor="end" font-size="11.5">IP packets</text>
+<text x="68" y="352" font-size="11.5">attach writes it, in place:</text>
+<text x="68" y="367" font-size="11.5">its /etc/resolv.conf</text>
+<text x="532" y="352" text-anchor="end" font-size="11.5">the agent reads the same file:</text>
+<text x="532" y="367" text-anchor="end" font-size="11.5">its /etc/resolv.conf</text>
+<text x="300" y="397" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">/var/lib/docker/containers/&lt;id&gt;/resolv.conf</text>
+<text x="300" y="414" text-anchor="middle" font-size="11.5">one host file, in the attach container’s directory</text>
+<text x="300" y="452" text-anchor="middle" font-size="12">Docker mounts that one host file at /etc/resolv.conf in both containers.</text>
+</g>
+</svg>
+</div>

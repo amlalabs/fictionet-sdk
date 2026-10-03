@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 580 560" role="img" aria-labelledby="fn-attach-t fn-attach-d" width="580" height="560">
+<style>svg{color:#1f2328}@media (prefers-color-scheme:dark){svg{color:#e6edf3}}</style>
+<title id="fn-attach-t">How a sandbox reaches a world</title>
+<desc id="fn-attach-d">Inside the sandbox's network namespace, the agent's programs send IP packets through a TUN device. fictionet attach, one per sandbox, holds the TUN device and relays its packets to the world. The relay runs over a Unix SOCK_SEQPACKET socket, one message per datagram. In the world process, listen runs a helper thread that accepts the connection, reads the hello and answers accept or refuse. It hands the sandbox to the Attacher, which puts it in the Attachments channel. The world takes it with attachments.get, by name, and gets an Attachment, an Interface. The world's own thread reads packets straight from the socket, and writes each one at once when the socket has room. A packet that must wait for room goes into a queue, and the helper thread of listen writes the queue out.</desc>
+<defs><marker id="fn-attach-a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="currentColor"/></marker></defs>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<rect x="10" y="10" width="560" height="84" rx="10" stroke-dasharray="2 4"/>
+<rect x="10" y="300" width="560" height="250" rx="10" stroke-dasharray="2 4"/>
+<rect x="30" y="40" width="200" height="40" rx="6" stroke-dasharray="5 4"/>
+<rect x="320" y="40" width="200" height="40" rx="6" stroke-dasharray="5 4"/>
+<rect x="320" y="118" width="200" height="52" rx="6" stroke-dasharray="5 4"/>
+<rect x="30" y="334" width="270" height="62" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="30" y="424" width="270" height="46" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="30" y="492" width="270" height="38" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<rect x="330" y="476" width="220" height="56" rx="6" fill="currentColor" fill-opacity="0.06"/>
+<path d="M232,60 H318" marker-start="url(#fn-attach-a)" marker-end="url(#fn-attach-a)"/>
+<path d="M420,82 V116" marker-start="url(#fn-attach-a)" marker-end="url(#fn-attach-a)"/>
+<path d="M390,172 V474" stroke-width="1.75" marker-start="url(#fn-attach-a)" marker-end="url(#fn-attach-a)"/>
+<path d="M390,365 H302" marker-end="url(#fn-attach-a)"/>
+<path d="M165,396 V422" marker-end="url(#fn-attach-a)"/>
+<path d="M165,470 V490" marker-end="url(#fn-attach-a)"/>
+<path d="M300,511 H328" marker-end="url(#fn-attach-a)"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="22" y="29" font-size="12">the sandbox’s network namespace</text>
+<text x="130" y="65" text-anchor="middle">the agent’s programs</text>
+<text x="420" y="65" text-anchor="middle">TUN device</text>
+<text x="275" y="53" text-anchor="middle" font-size="11.5">IP packets</text>
+<text x="420" y="140" text-anchor="middle">fictionet attach</text>
+<text x="420" y="158" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="11.5">--name agent --type tun</text>
+<text x="300" y="136" text-anchor="end" font-size="12">one per sandbox, wherever it</text>
+<text x="300" y="152" text-anchor="end" font-size="12">can get the sandbox’s packets</text>
+<text x="380" y="214" text-anchor="end" font-size="12">a Unix SOCK_SEQPACKET</text>
+<text x="380" y="230" text-anchor="end" font-size="12">socket, such as world.sock.</text>
+<text x="380" y="246" text-anchor="end" font-size="12">One message per datagram.</text>
+<text x="22" y="320" font-size="12">the world process</text>
+<text x="165" y="354" text-anchor="middle"><tspan font-family="'Source Code Pro',monospace" font-size="12.5">listen</tspan>: one helper thread</text>
+<text x="165" y="371" text-anchor="middle" font-size="11.5">accepts, reads the hello,</text>
+<text x="165" y="387" text-anchor="middle" font-size="11.5">answers accept or refuse</text>
+<text x="346" y="358" text-anchor="middle" font-size="11.5">handshake</text>
+<text x="165" y="444" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12.5">Attacher → Attachments</text>
+<text x="165" y="461" text-anchor="middle" font-size="11.5">a channel, in arrival order</text>
+<text x="165" y="516" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12">attachments.get(&amp;cx, "agent")</text>
+<text x="400" y="408" font-size="11.5">read, and written at</text>
+<text x="400" y="423" font-size="11.5">once, on the world’s</text>
+<text x="400" y="438" font-size="11.5">thread. Packets that wait</text>
+<text x="400" y="453" font-size="11.5">for room: the helper</text>
+<text x="400" y="468" font-size="11.5">thread of listen.</text>
+<text x="440" y="499" text-anchor="middle" font-family="'Source Code Pro',monospace" font-size="12.5">Attachment “agent”</text>
+<text x="440" y="518" text-anchor="middle" font-size="11.5">an Interface</text>
+</g>
+</svg>

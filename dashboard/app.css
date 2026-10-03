@@ -1,0 +1,1094 @@
+/* The Fictionet dashboard. Colors are the tokens of fictionet.com's palette;
+   nothing below names a color outside :root. */
+:root {
+  --paper: #f7f6f0;
+  --raised: #fbfaf6;
+  --sunken: #e9eddf;
+  --sunken-hover: #e2e8d8;
+  --ink: #263e35;
+  --on-ink: #f7f6f0;
+  --text: #5f6c59;
+  --muted: #66715f;
+  --subtle: #6c7663;
+  --control: #858f7b;
+  --faint: #acb5a8;
+  --line: #dedfd4;
+  --line-strong: #d2d8c8;
+  --edge: #b9c2b0;
+  --edge-live: #6f8c78;
+  --accent: #df5835;
+  --accent-text: #b4441f;
+  --success: #2f6128;
+  --danger: #a3432a;
+  --danger-soft: #f6e3dc;
+  --selection: #e5ac87;
+  --on-selection: #243d33;
+  --hex-mark: #f3d3c2;
+  --shadow: rgba(38, 62, 53, 0.18);
+  --sans: 'DM Sans Variable', 'DM Sans', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'IBM Plex Mono', 'JetBrains Mono', 'SF Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+  color-scheme: light;
+}
+:root[data-theme='dark'] {
+  --paper: #141915;
+  --raised: #1b211c;
+  --sunken: #1d241e;
+  --sunken-hover: #232b24;
+  --ink: #e2e4d6;
+  --on-ink: #141915;
+  --text: #aeb6a3;
+  --muted: #9ba391;
+  --subtle: #878f7e;
+  --control: #6c7563;
+  --faint: #4d564a;
+  --line: #2a312b;
+  --line-strong: #363f37;
+  --edge: #465046;
+  --edge-live: #8fae97;
+  --accent: #f0704c;
+  --accent-text: #f0704c;
+  --success: #8fcb84;
+  --danger: #f08f72;
+  --danger-soft: #3a221b;
+  --selection: #6b3a27;
+  --on-selection: #f7efe6;
+  --hex-mark: #5a3122;
+  --shadow: rgba(0, 0, 0, 0.55);
+  color-scheme: dark;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    --paper: #141915;
+    --raised: #1b211c;
+    --sunken: #1d241e;
+    --sunken-hover: #232b24;
+    --ink: #e2e4d6;
+    --on-ink: #141915;
+    --text: #aeb6a3;
+    --muted: #9ba391;
+    --subtle: #878f7e;
+    --control: #6c7563;
+    --faint: #4d564a;
+    --line: #2a312b;
+    --line-strong: #363f37;
+    --edge: #465046;
+    --edge-live: #8fae97;
+    --accent: #f0704c;
+    --accent-text: #f0704c;
+    --success: #8fcb84;
+    --danger: #f08f72;
+    --danger-soft: #3a221b;
+    --selection: #6b3a27;
+    --on-selection: #f7efe6;
+    --hex-mark: #5a3122;
+    --shadow: rgba(0, 0, 0, 0.55);
+    color-scheme: dark;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+body {
+  font: 400 13px/1.45 var(--sans);
+  color: var(--ink);
+  background: var(--paper);
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+::selection {
+  background: var(--selection);
+  color: var(--on-selection);
+}
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+button {
+  cursor: pointer;
+}
+svg :focus:not(:focus-visible) {
+  outline: none;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.mono {
+  font-family: var(--mono);
+}
+[hidden] {
+  display: none !important;
+}
+
+/* The page: a bar on top, the graph and its side panel, and the packet
+   drawer below. */
+.app {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+}
+
+/* The bar. */
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 22px;
+  height: 52px;
+  padding: 0 16px 0 18px;
+  border-bottom: 1px solid var(--line);
+  background: var(--paper);
+}
+.wordmark {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: -0.5px;
+  white-space: nowrap;
+}
+.wordmark svg {
+  width: 20px;
+  height: 20px;
+}
+.wordmark .wm-bg {
+  fill: var(--ink);
+}
+.wordmark .wm-fg {
+  fill: var(--paper);
+}
+.wordmark .wm-fg-line {
+  fill: none;
+  stroke: var(--paper);
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.wordmark .wm-accent {
+  fill: var(--accent);
+}
+.wordmark span {
+  font-weight: 400;
+  color: var(--muted);
+  letter-spacing: -0.2px;
+}
+.status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 9px;
+  border-radius: 999px;
+  background: var(--sunken);
+  color: var(--text);
+  white-space: nowrap;
+}
+.status .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--faint);
+}
+.status[data-state='running'] .dot {
+  background: var(--success);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 22%, transparent);
+}
+.status[data-state='ended'] .dot {
+  background: var(--danger);
+}
+.stats {
+  display: flex;
+  gap: 18px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.stats b {
+  font-weight: 550;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}
+.bar .grow {
+  flex: 1;
+}
+.search {
+  position: relative;
+}
+.search input {
+  width: 230px;
+  height: 32px;
+  padding: 0 10px 0 30px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--raised);
+}
+.search input::placeholder {
+  color: var(--subtle);
+}
+.search svg {
+  position: absolute;
+  left: 9px;
+  top: 9px;
+  width: 14px;
+  height: 14px;
+  color: var(--subtle);
+}
+.icon-button {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--raised);
+}
+.icon-button:hover {
+  background: var(--sunken-hover);
+}
+.icon-button svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* The graph and the side panel. */
+.main {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  min-height: 0;
+}
+.stage {
+  position: relative;
+  min-width: 0;
+  overflow: hidden;
+  background-color: var(--paper);
+  background-image: radial-gradient(circle, var(--line-strong) 1px, transparent 1.2px);
+  background-size: 22px 22px;
+  cursor: grab;
+}
+.stage.panning,
+.stage.dragging,
+.stage.dragging .node {
+  cursor: grabbing;
+}
+
+/* The groups around the selection, over the top left of the graph. */
+.crumbs {
+  position: absolute;
+  left: 16px;
+  top: 14px;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 2px;
+  max-width: calc(100% - 32px);
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--paper) 90%, transparent);
+  font-size: 12.5px;
+}
+.crumbs button {
+  min-height: 24px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--text);
+}
+.crumbs button:hover {
+  background: var(--sunken-hover);
+  color: var(--ink);
+}
+.crumbs button.here,
+.crumbs .leaf {
+  color: var(--ink);
+  font-weight: 600;
+}
+.crumbs .leaf {
+  padding: 0 6px;
+}
+.crumbs .sep {
+  color: var(--faint);
+}
+.stage svg.graph {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  user-select: none;
+}
+.stage-tools {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.legend {
+  position: absolute;
+  left: 16px;
+  bottom: 14px;
+  display: flex;
+  gap: 16px;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--paper) 88%, transparent);
+  color: var(--muted);
+  font-size: 12px;
+}
+.legend span {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.legend i {
+  display: inline-block;
+}
+.legend .l-sandbox {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  background: var(--ink);
+  box-shadow: inset 0 0 0 3.5px var(--ink), inset 0 0 0 6px var(--accent);
+}
+.legend .l-task {
+  width: 14px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1.5px solid var(--control);
+  background: var(--raised);
+}
+.legend .l-group {
+  width: 14px;
+  height: 11px;
+  border-radius: 3px;
+  border: 1.5px solid var(--ink);
+  background: var(--raised);
+  box-shadow: 2px 2px 0 -0.5px var(--raised), 2px 2px 0 1px var(--control);
+}
+.legend .l-packet {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.empty {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  text-align: center;
+  color: var(--muted);
+  pointer-events: none;
+}
+.empty h2 {
+  margin: 0 0 6px;
+  font-size: 19px;
+  font-weight: 500;
+  letter-spacing: -0.4px;
+  color: var(--ink);
+}
+.empty p {
+  max-width: 420px;
+  margin: 0;
+}
+
+/* Graph drawing. */
+.edge .hit {
+  stroke: transparent;
+  stroke-width: 16;
+  fill: none;
+  cursor: pointer;
+}
+.edge .wire {
+  stroke: var(--edge);
+  fill: none;
+  stroke-linecap: round;
+  transition: stroke 0.3s;
+}
+.edge.live .wire {
+  stroke: var(--edge-live);
+}
+.edge:hover .wire {
+  stroke: var(--ink);
+}
+.edge.selected .wire {
+  stroke: var(--accent);
+}
+.route-label {
+  pointer-events: none;
+}
+.route-label rect {
+  fill: var(--paper);
+  stroke: var(--line-strong);
+}
+.route-label text {
+  font: 500 10.5px var(--mono);
+  fill: var(--text);
+}
+.packet-dot {
+  fill: var(--accent);
+  /* Clicks go through to the link under the moving packets. */
+  pointer-events: none;
+}
+.packet-dot.back {
+  fill: var(--ink);
+}
+.node {
+  cursor: pointer;
+}
+.node .box {
+  fill: var(--raised);
+  stroke: var(--control);
+  stroke-width: 1.25;
+}
+.node:hover .box {
+  stroke: var(--ink);
+}
+.node .name {
+  font: 550 12.5px var(--sans);
+  fill: var(--ink);
+}
+.node .where {
+  font: 400 10.5px var(--mono);
+  fill: var(--muted);
+}
+.node.sandbox .box {
+  fill: var(--ink);
+  stroke: var(--ink);
+}
+.node.sandbox .name {
+  fill: var(--on-ink);
+  font-size: 13.5px;
+}
+.node.sandbox .where {
+  fill: var(--on-ink);
+  opacity: 0.72;
+}
+.node.sandbox .mark {
+  fill: var(--accent);
+}
+.node.world .box {
+  stroke-dasharray: 3 3;
+}
+.node.selected .box {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+/* A closed group: a box with two cards behind it. */
+.node.group .card {
+  fill: var(--raised);
+  stroke: var(--control);
+  stroke-width: 1;
+}
+.node.group .box {
+  stroke: var(--ink);
+  stroke-width: 1.5;
+}
+.node.group .name {
+  font-weight: 600;
+  font-size: 13px;
+}
+.node.group.selected .box {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.toggle {
+  cursor: pointer;
+}
+.toggle rect {
+  fill: var(--sunken);
+  stroke: var(--line-strong);
+}
+.toggle path {
+  stroke: var(--ink);
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  fill: none;
+}
+.toggle:hover rect {
+  fill: var(--sunken-hover);
+  stroke: var(--ink);
+}
+
+/* An open group: a frame behind what it holds, its name on top. */
+.frame .fbox {
+  fill: color-mix(in srgb, var(--sunken) 45%, transparent);
+  stroke: var(--line-strong);
+  stroke-width: 1.25;
+}
+.frame.depth1 .fbox,
+.frame.depth3 .fbox {
+  fill: color-mix(in srgb, var(--raised) 70%, transparent);
+}
+.frame.selected .fbox {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+.frame .fhead {
+  cursor: grab;
+}
+.frame .fhit {
+  fill: transparent;
+}
+.frame .fhead:hover .fhit {
+  fill: color-mix(in srgb, var(--sunken-hover) 70%, transparent);
+}
+.frame .fname {
+  font: 600 12.5px var(--sans);
+  fill: var(--ink);
+}
+.route-label.count text {
+  fill: var(--muted);
+}
+.edge.merged .wire {
+  stroke-dasharray: none;
+}
+.node .badge rect {
+  fill: var(--danger-soft);
+  stroke: var(--danger);
+}
+.node .badge text {
+  font: 600 10px var(--mono);
+  fill: var(--danger);
+}
+.dim {
+  opacity: 0.18;
+}
+.match .box {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+/* A ring around the node an event came from. */
+.pulse {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: pulse 0.9s ease-out forwards;
+  pointer-events: none;
+}
+.pulse.drop,
+.pulse.route_removed {
+  stroke: var(--danger);
+}
+@keyframes pulse {
+  from {
+    opacity: 0.9;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.18);
+  }
+}
+button.link:disabled {
+  cursor: default;
+  color: var(--muted);
+}
+
+/* The tooltip. */
+.tip {
+  position: fixed;
+  z-index: 10;
+  min-width: 190px;
+  max-width: 340px;
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 9px;
+  background: var(--raised);
+  box-shadow: 0 10px 30px -12px var(--shadow);
+  pointer-events: none;
+  font-size: 12px;
+}
+.tip h3 {
+  margin: 0 0 2px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.tip .sub {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  margin-bottom: 7px;
+  overflow-wrap: anywhere;
+}
+.tip table {
+  border-collapse: collapse;
+  width: 100%;
+  font-variant-numeric: tabular-nums;
+}
+.tip td {
+  padding: 2px 0;
+}
+.tip td + td {
+  text-align: right;
+  padding-left: 14px;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.tip .hint {
+  margin-top: 7px;
+  color: var(--subtle);
+}
+
+/* The side panel. */
+.side {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--raised);
+  overflow-y: auto;
+}
+.side section {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.side h2 {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin: 0 0 10px;
+  font-size: 13px;
+  font-weight: 600;
+}
+.side h2 small {
+  font-weight: 400;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.side .lead {
+  margin: 0;
+  color: var(--text);
+}
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 14px;
+  margin: 0;
+}
+.kv dt {
+  color: var(--muted);
+}
+.kv dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.kv dd.mono {
+  font-size: 12px;
+}
+.selection-title {
+  margin: 0 0 3px;
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: -0.3px;
+}
+.selection-kind {
+  margin: 0 0 12px;
+  color: var(--muted);
+}
+.rows {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rows li {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+}
+.rows li:first-child {
+  border-top: 0;
+}
+.rows .what {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rows .where {
+  color: var(--muted);
+  font: 11px var(--mono);
+}
+.rows .count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+button.link {
+  padding: 0;
+  border: 0;
+  background: none;
+  text-align: left;
+  min-height: 24px;
+  font-weight: 500;
+}
+button.link:hover {
+  color: var(--accent-text);
+  text-decoration: underline;
+}
+.note {
+  display: grid !important;
+  grid-template-columns: 52px 1fr;
+  gap: 2px 10px !important;
+}
+.note time {
+  color: var(--subtle);
+  font: 11px var(--mono);
+}
+.note .kind {
+  font-weight: 600;
+}
+.note .kind.drop,
+.note .kind.route_removed {
+  color: var(--danger);
+}
+.note .kind.tls_keys {
+  color: var(--success);
+}
+.note .text {
+  grid-column: 2;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.side .tools {
+  margin-top: 12px;
+}
+.rows.tree li {
+  border-top: 0;
+  padding: 3px 0;
+}
+.side .quiet {
+  color: var(--subtle);
+  margin: 0;
+}
+
+/* The packet drawer. */
+.drawer-head .grow {
+  flex: 1;
+}
+.plist col.c-no {
+  width: 58px;
+}
+.plist col.c-time {
+  width: 82px;
+}
+.plist col.c-dir {
+  width: 30px;
+}
+.plist col.c-addr {
+  width: 17%;
+}
+.plist col.c-proto {
+  width: 70px;
+}
+.plist col.c-len {
+  width: 58px;
+}
+.drawer {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  height: var(--drawer, 44vh);
+  min-height: 160px;
+  border-top: 1px solid var(--line-strong);
+  background: var(--raised);
+}
+.grip {
+  height: 7px;
+  margin-top: -4px;
+  cursor: ns-resize;
+}
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 6px 12px 8px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.drawer-head h2 {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.drawer-head .dirs {
+  display: flex;
+  gap: 14px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.dir-a,
+.dir-b {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.dir-a::before,
+.dir-b::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.dir-b::before {
+  background: var(--ink);
+}
+.drawer-head input {
+  width: 220px;
+  height: 28px;
+  padding: 0 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--paper);
+}
+.button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  background: var(--paper);
+  white-space: nowrap;
+  text-decoration: none;
+  color: var(--ink);
+}
+.button:hover {
+  background: var(--sunken-hover);
+}
+.button svg {
+  width: 14px;
+  height: 14px;
+}
+.drawer-head .sampled {
+  color: var(--accent-text);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.drawer-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr);
+  min-height: 0;
+}
+.plist {
+  overflow: auto;
+  border-right: 1px solid var(--line);
+  font-variant-numeric: tabular-nums;
+}
+.plist table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+.plist th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--raised);
+  color: var(--muted);
+  font-weight: 500;
+  font-size: 12px;
+  text-align: left;
+}
+.plist td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line);
+  font: 12px/1.5 var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.plist tr:hover td {
+  background: var(--sunken);
+}
+.plist tr.on td {
+  background: var(--selection);
+  color: var(--on-selection);
+}
+.plist td.dir {
+  text-align: center;
+}
+.plist td.dir i {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.plist tr.back td.dir i {
+  background: var(--ink);
+}
+.plist tr.reset td,
+.plist tr.drop td,
+.plist tr.malformed td {
+  color: var(--danger);
+}
+.plist tr.decrypted td.proto {
+  color: var(--success);
+}
+.plist tr.after-gap td {
+  border-top: 1px dashed var(--control);
+}
+.plist tr.gap td {
+  color: var(--subtle);
+  font-style: italic;
+  cursor: default;
+  background: none;
+}
+.proto-tag {
+  font-weight: 600;
+}
+.detail {
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) minmax(0, 0.85fr);
+  min-height: 0;
+}
+.detail:has(.hex[hidden]) {
+  grid-template-rows: minmax(0, 1fr);
+}
+.tree {
+  overflow: auto;
+  padding: 8px 4px 8px 12px;
+  font-size: 12.5px;
+}
+.tree details {
+  margin: 0 0 2px;
+}
+.tree summary {
+  padding: 3px 6px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.tree summary:hover {
+  background: var(--sunken);
+}
+.tree summary b {
+  font-weight: 600;
+}
+.tree summary span {
+  color: var(--muted);
+}
+.tree .field {
+  display: grid;
+  grid-template-columns: minmax(120px, auto) 1fr;
+  gap: 12px;
+  margin-left: 20px;
+  padding: 2px 6px;
+  border-radius: 5px;
+  cursor: default;
+}
+.tree .field:hover,
+.tree .field.on {
+  background: var(--hex-mark);
+}
+.tree .field .k {
+  color: var(--muted);
+}
+.tree .field .v {
+  font: 12px var(--mono);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+.tree .placeholder {
+  padding: 14px 8px;
+  color: var(--subtle);
+}
+.hex {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-top: 1px solid var(--line);
+  background: var(--sunken);
+}
+.hex-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 6px 10px 0;
+  background: var(--raised);
+}
+.hex-tabs:empty {
+  display: none;
+}
+.hex-tabs button {
+  padding: 3px 9px;
+  border: 0;
+  border-radius: 6px 6px 0 0;
+  background: none;
+  color: var(--muted);
+}
+.hex-tabs button.on {
+  background: var(--sunken);
+  color: var(--ink);
+}
+.hex pre {
+  flex: 1;
+  overflow: auto;
+  margin: 0;
+  padding: 8px 12px 12px;
+  background: var(--sunken);
+  font: 11.5px/1.55 var(--mono);
+  color: var(--text);
+}
+.hex .off {
+  color: var(--subtle);
+}
+.hex mark {
+  background: var(--hex-mark);
+  color: var(--ink);
+  border-radius: 2px;
+}
+
+@media (max-width: 980px) {
+  .main {
+    grid-template-columns: 1fr;
+  }
+  .side {
+    display: none;
+  }
+  .stats {
+    display: none;
+  }
+  .drawer-body {
+    grid-template-columns: 1fr;
+  }
+  .detail {
+    display: none;
+  }
+}
+@media (forced-colors: active) {
+  .edge .wire,
+  .node .box,
+  .node.group .card,
+  .frame .fbox,
+  .toggle rect {
+    stroke: CanvasText;
+  }
+  .toggle path,
+  .frame .fname {
+    stroke: CanvasText;
+    fill: CanvasText;
+  }
+  .packet-dot {
+    fill: Highlight;
+  }
+}

@@ -1,0 +1,39 @@
+<div style="overflow-x:auto;margin:1.25em 0">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 480 352" role="img" aria-labelledby="fn-regions-t fn-regions-d" style="display:block;width:100%;max-width:576px;min-width:400px;height:auto">
+<title id="fn-regions-t">How a region ends, on Ok and on an error</title>
+<desc id="fn-regions-d">Two timelines. First: the world returns Ok while work it spawned keeps running. The region is not cancelled, and the future from run finishes once that work has ended. Second: task A returns Err(e). The region is cancelled at that moment. Task B, waiting in recv, gets Cancelled and ends. The future from run then returns Err(e), the first error.</desc>
+<g fill="currentColor" fill-opacity="0.18" stroke="currentColor" stroke-width="1.25">
+<rect x="130" y="41" width="120" height="14" rx="3"/>
+<rect x="160" y="73" width="240" height="14" rx="3"/>
+<rect x="130" y="105" width="270" height="14" rx="3"/>
+<rect x="130" y="221" width="130" height="14" rx="3"/>
+<rect x="150" y="253" width="150" height="14" rx="3"/>
+<rect x="130" y="285" width="200" height="14" rx="3"/>
+</g>
+<g fill="none" stroke="currentColor" stroke-width="1.25">
+<path d="M10,174 H470" stroke-opacity="0.4"/>
+<path d="M260,218 V304" stroke-dasharray="4 3"/>
+</g>
+<g fill="currentColor" font-family="'Fira Sans',Arial,sans-serif" font-size="13">
+<text x="10" y="22" font-weight="500">When the world returns Ok</text>
+<text x="10" y="52">world</text>
+<text x="10" y="84">spawned work</text>
+<text x="10" y="116">run’s future</text>
+<text x="256" y="52" font-family="'Source Code Pro',monospace" font-size="12.5">Ok(())</text>
+<text x="406" y="84" font-size="12">ends</text>
+<text x="406" y="116" font-size="12">returns Ok</text>
+<text x="10" y="144" font-size="12">The region is not cancelled. Its work keeps running,</text>
+<text x="10" y="160" font-size="12">and run finishes once all of it has ended.</text>
+<text x="10" y="200" font-weight="500">When work returns an error</text>
+<text x="266" y="214" font-size="12">region cancelled</text>
+<text x="10" y="232">task A</text>
+<text x="10" y="264">task B</text>
+<text x="10" y="296">run’s future</text>
+<text x="266" y="232" font-family="'Source Code Pro',monospace" font-size="12.5">Err(e)</text>
+<text x="306" y="264" font-size="12">its recv returns Cancelled</text>
+<text x="336" y="296" font-size="12">returns Err(e)</text>
+<text x="10" y="326" font-size="12">Every wait in the region ends with Cancelled. Each task</text>
+<text x="10" y="342" font-size="12">then ends on its own, and the first error comes out of run.</text>
+</g>
+</svg>
+</div>

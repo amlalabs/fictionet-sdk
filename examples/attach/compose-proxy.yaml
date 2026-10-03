@@ -1,0 +1,78 @@
+# One sandbox behind `fictionet attach --type https_proxy`, under Docker
+# Compose. The world is the web_world example, with no network. Attach
+# reaches it through the socket volume, and listens as an HTTP proxy on
+# the sandbox's network, which is internal: the agent can reach attach,
+# and nothing else. The fictionet::attaching docs show how to build,
+# start, check and remove it.
+name: fictionet-example-proxy
+
+# All three images come from deploy/Dockerfile, built from the crate root.
+x-build: &build
+  context: ../..
+  dockerfile: deploy/Dockerfile
+
+services:
+  world:
+    build: {<<: *build, target: web-world}
+    image: fictionet-web-world:dev
+    command: [/run/fictionet/world.sock, /run/ca/ca.pem]
+    user: "0:0"                     # root: the new volumes belong to root
+    init: true                      # passes SIGTERM on to web_world
+    network_mode: none              # the world needs no network
+    volumes: [sock:/run/fictionet, ca:/run/ca]
+
+  attach:
+    build: {<<: *build, target: attach}
+    image: fictionet-attach:dev
+    command: [attach,
+              --world, unix:/run/fictionet/world.sock, --world-wait, "30",
+              --name, agent, --type, https_proxy,
+              --listen, 0.0.0.0:8080, --token-file, /run/secrets/token,
+              --ip-addr, 10.0.0.2, --dns, 10.0.0.1,
+              --ready-file, /run/fictionet/attach.ready]
+    networks: [sandbox]
+    secrets: [token]                # the token, at /run/secrets/token
+    volumes: [sock:/run/fictionet]
+    depends_on:
+      world: {condition: service_started}
+    healthcheck:                    # healthy once the world has accepted attach
+      test: [CMD, /fictionet, ready, /run/fictionet/attach.ready]
+      interval: 1s
+      retries: 30
+
+  agent:
+    build: {<<: *build, target: agent}
+    image: fictionet-agent:dev
+    command: [sleep, infinity]
+    init: true
+    networks: [sandbox]
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    volumes: [ca:/run/ca:ro]        # the world's CA certificate, read-only
+    environment:
+      HTTPS_PROXY: &proxy http://fictionet:${FICTIONET_TOKEN:?set FICTIONET_TOKEN}@attach:8080
+      https_proxy: *proxy
+      HTTP_PROXY: *proxy
+      http_proxy: *proxy
+      NO_PROXY: ""
+      no_proxy: ""
+      NODE_USE_ENV_PROXY: "1"
+      CURL_CA_BUNDLE: /run/ca/ca.pem
+      SSL_CERT_FILE: /run/ca/ca.pem
+    depends_on:
+      attach: {condition: service_healthy}
+
+networks:
+  sandbox:
+    internal: true                  # no route out of this network
+    driver_opts:                    # and no address for the host on it,
+      com.docker.network.bridge.gateway_mode_ipv4: isolated   # so the agent
+      com.docker.network.bridge.gateway_mode_ipv6: isolated   # reaches only attach
+
+secrets:
+  token:
+    environment: FICTIONET_TOKEN
+
+volumes:
+  sock:
+  ca:
