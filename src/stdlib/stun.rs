@@ -19,8 +19,9 @@
 //! Nothing here reads a socket. A world that plays a STUN server takes each
 //! UDP datagram it receives, reads it with [`Message::parse`], passes it and
 //! the datagram's source address to [`answer_binding`], and sends the
-//! reply's bytes back. Over TCP, a [`Decoder`] splits the byte stream into
-//! messages first. MESSAGE-INTEGRITY and the other authentication
+//! reply's bytes back. Over TCP, [`Frames`] and [`codec::Stream`] split the
+//! byte stream into messages. [`Decoder`] also offers borrowed frames.
+//! MESSAGE-INTEGRITY and the other authentication
 //! attributes are kept as raw bytes ([`Attribute::Other`]); checking them is
 //! up to world code. The HMAC covers the bytes as they were sent, padding
 //! included, so world code checks it over the datagram, or over the frame
@@ -29,9 +30,9 @@
 //! not match the bytes written: world code computes it again for a message
 //! it sends.
 //!
-//! Every reader checks lengths and ranges, because the agent can send any
-//! bytes it likes. Writers clamp what they write, so the bytes they make
-//! always read back.
+//! [`Message::write`] and [`codec::Wire`] preserve every field or return an
+//! error. [`Message::clipped`] and the existing [`Message::to_bytes`] clamp
+//! values to the sending limits. All writers produce bytes the parser accepts.
 //!
 //! ```
 //! use std::net::SocketAddr;
@@ -58,7 +59,16 @@
 //! assert!(response.fingerprint);
 //! ```
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+extern crate alloc;
+
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+
+use super::codec::{self, Decode, Step};
 
 /// The UDP and TCP port STUN servers listen on.
 pub const PORT: u16 = 3478;
@@ -86,10 +96,10 @@ pub const MAX_BUFFERED: usize = MAX_MESSAGE;
 /// NONCE and an ERROR-CODE reason. RFC 8489 asks readers to take up to 763
 /// bytes, for senders that follow the older RFC 5389.
 pub const MAX_TEXT: usize = 763;
-/// The most characters a writer puts in SOFTWARE, REALM, NONCE and an
+/// The most characters the clipping writer puts in SOFTWARE, REALM, NONCE and an
 /// ERROR-CODE reason. RFC 8489 has senders keep them under 128.
 pub const MAX_TEXT_CHARS: usize = 127;
-/// The most bytes of UTF-8 a writer puts in a USERNAME. RFC 8489 has
+/// The most bytes of UTF-8 the clipping writer puts in a USERNAME. RFC 8489 has
 /// senders keep it under 509.
 pub const MAX_USERNAME: usize = 508;
 /// XORed into the CRC-32 of a message to make its FINGERPRINT value. It is
@@ -210,7 +220,7 @@ pub fn split_type(t: u16) -> (u16, Class) {
 /// the magic cookie is in place. Use it to tell STUN apart from other
 /// traffic on the same port. It reads at most 8 bytes and needs at least 8.
 pub fn is_stun(b: &[u8]) -> bool {
-    b.len() >= 8 && b[0] & 0xc0 == 0 && be32(b, 4) == MAGIC_COOKIE
+    b.first().is_some_and(|first| first & 0xc0 == 0) && be32(b, 4) == Some(MAGIC_COOKIE)
 }
 
 /// One attribute. Types this module reads become their own variant. Every
@@ -219,9 +229,9 @@ pub fn is_stun(b: &[u8]) -> bool {
 pub enum Attribute {
     /// MAPPED-ADDRESS: an address in the clear. Old servers sent it in
     /// place of XOR-MAPPED-ADDRESS. On the wire an address is only an IP
-    /// and a port, so a writer drops an IPv6 flow label and scope ID, and
-    /// a reader sets both to zero. The same holds for the other address
-    /// variants.
+    /// and a port. The clipping writer drops an IPv6 flow label and scope
+    /// ID. The strict writer refuses nonzero values. A reader sets both
+    /// to zero. The same holds for the other address variants.
     MappedAddress(SocketAddr),
     /// XOR-MAPPED-ADDRESS: the address the server saw the request come
     /// from. On the wire it is XORed with the magic cookie and transaction
@@ -230,11 +240,11 @@ pub enum Attribute {
     XorMappedAddress(SocketAddr),
     /// ALTERNATE-SERVER: another server to try, sent with error 300.
     AlternateServer(SocketAddr),
-    /// USERNAME. A reader takes up to [`MAX_TEXT`] bytes; a writer sends at
-    /// most [`MAX_USERNAME`].
+    /// USERNAME. The parser and strict writer accept [`MAX_TEXT`] bytes.
+    /// The clipping writer sends at most [`MAX_USERNAME`] bytes.
     Username(String),
-    /// REALM. A reader takes up to [`MAX_TEXT`] bytes; a writer sends at
-    /// most [`MAX_TEXT_CHARS`] characters.
+    /// REALM. The parser and strict writer accept [`MAX_TEXT`] bytes.
+    /// The clipping writer sends at most [`MAX_TEXT_CHARS`] characters.
     Realm(String),
     /// NONCE, with the same limits as REALM.
     Nonce(String),
@@ -305,24 +315,20 @@ impl Attribute {
             attr::NONCE => Ok(Attribute::Nonce(read_text(typ, value, MAX_TEXT)?)),
             attr::SOFTWARE => Ok(Attribute::Software(read_text(typ, value, MAX_TEXT)?)),
             attr::ERROR_CODE => {
-                if value.len() < 4 {
-                    return Err(bad());
-                }
-                let class = u16::from(value[2] & 0x07);
-                let number = u16::from(value[3]);
+                let [_, _, class_byte, number_byte, reason @ ..] = value else { return Err(bad()) };
+                let class = u16::from(class_byte & 0x07);
+                let number = u16::from(*number_byte);
                 if !(3..=6).contains(&class) || number > 99 {
-                    return Err(ParseError::ErrorCode { class: value[2] & 0x07, number: value[3] });
+                    return Err(ParseError::ErrorCode { class: class_byte & 0x07, number: *number_byte });
                 }
-                let reason = read_text(typ, &value[4..], MAX_TEXT)?;
+                let reason = read_text(typ, reason, MAX_TEXT)?;
                 Ok(Attribute::ErrorCode { code: class * 100 + number, reason })
             }
             attr::UNKNOWN_ATTRIBUTES => {
                 if !value.len().is_multiple_of(2) {
                     return Err(bad());
                 }
-                Ok(Attribute::UnknownAttributes(
-                    value.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect(),
-                ))
+                Ok(Attribute::UnknownAttributes(value.chunks_exact(2).filter_map(|c| be16(c, 0)).collect()))
             }
             attr::FINGERPRINT => Err(ParseError::FingerprintNotLast),
             _ if !integrity_length_ok(typ, value.len()) => Err(bad()),
@@ -360,16 +366,48 @@ impl Attribute {
                 if is_known(*typ) || !integrity_length_ok(*typ, value.len()) {
                     return None;
                 }
-                value[..value.len().min(MAX_VALUE)].to_vec()
+                value.get(..value.len().min(MAX_VALUE))?.to_vec()
             }
         })
+    }
+
+    // Each allocation is bounded by MAX_VALUE. Text uses the parser's
+    // limit so every parsed message can be written without changing it.
+    fn strict_value(&self, transaction: &[u8; 12]) -> Result<Vec<u8>, WriteError> {
+        let bad = WriteError::Attribute { typ: self.typ() };
+        match self {
+            Attribute::MappedAddress(a) | Attribute::XorMappedAddress(a) | Attribute::AlternateServer(a) => {
+                if let SocketAddr::V6(a) = a
+                    && (a.flowinfo() != 0 || a.scope_id() != 0)
+                {
+                    return Err(bad);
+                }
+            }
+            Attribute::Username(s) | Attribute::Realm(s) | Attribute::Nonce(s) | Attribute::Software(s) => {
+                return if s.len() <= MAX_TEXT { Ok(s.as_bytes().to_vec()) } else { Err(bad) };
+            }
+            Attribute::ErrorCode { code, reason } => {
+                if !(300..=699).contains(code) || reason.len() > MAX_TEXT {
+                    return Err(bad);
+                }
+                let mut value = vec![0, 0, (code / 100) as u8, (code % 100) as u8];
+                value.extend_from_slice(reason.as_bytes());
+                return Ok(value);
+            }
+            Attribute::UnknownAttributes(types) if types.len() > MAX_VALUE / 2 => return Err(bad),
+            Attribute::Other { value, .. } if value.len() > MAX_VALUE => return Err(bad),
+            _ => {}
+        }
+        // All fields that value() clamps have been checked or written above.
+        self.value(transaction).ok_or(bad)
     }
 }
 
 /// One STUN message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
-    /// The method, 12 bits. Writers drop any higher bits.
+    /// The method, 12 bits. The clipping writer drops higher bits.
+    /// The strict writer refuses them.
     pub method: u16,
     /// The class.
     pub class: Class,
@@ -448,8 +486,8 @@ impl ParseError {
     }
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ParseError::Truncated => f.write_str("message cut short"),
             ParseError::TrailingBytes(n) => write!(f, "{n} bytes after the message"),
@@ -470,7 +508,41 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
+
+/// Why a message cannot be written without changing its fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The method has bits outside the 12-bit field.
+    Method(u16),
+    /// The attribute count, including FINGERPRINT, exceeds [`MAX_ATTRIBUTES`].
+    TooManyAttributes,
+    /// The encoded attributes, including FINGERPRINT, exceed [`MAX_BODY`].
+    BodyTooLong,
+    /// An attribute cannot be read back as the same value.
+    ///
+    /// This includes invalid lengths, text over [`MAX_TEXT`], invalid error
+    /// codes, and nonzero IPv6 flow labels or scope IDs. It also includes
+    /// known types stored in [`Attribute::Other`] and attributes the parser
+    /// would ignore after an integrity attribute.
+    Attribute {
+        /// The attribute's type.
+        typ: u16,
+    },
+}
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
+            Self::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
+            Self::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
+            Self::Attribute { typ } => write!(f, "attribute {typ:#06x} cannot be written unchanged"),
+        }
+    }
+}
+
+impl core::error::Error for WriteError {}
 
 impl Message {
     /// A message with no attributes and no FINGERPRINT.
@@ -500,32 +572,33 @@ impl Message {
         if b.len() > total {
             return Err(ParseError::TrailingBytes(b.len() - total));
         }
-        let (method, class) = split_type(be16(b, 0));
+        let (method, class) = split_type(be16(b, 0).ok_or(ParseError::Truncated)?);
         let mut transaction = [0u8; 12];
-        transaction.copy_from_slice(&b[8..HEADER_LEN]);
+        transaction.copy_from_slice(b.get(8..HEADER_LEN).ok_or(ParseError::Truncated)?);
         let mut attributes = Vec::new();
         let mut fingerprint = false;
         let mut integrity = Integrity::None;
         let mut at = HEADER_LEN;
         let mut count = 0usize;
         while at < total {
-            if total - at < 4 {
+            let tail = b.get(at..total).ok_or(ParseError::AttributeTruncated { typ: 0 })?;
+            let [hi, lo, len_hi, len_lo, rest @ ..] = tail else {
                 return Err(ParseError::AttributeTruncated { typ: 0 });
-            }
-            let typ = be16(b, at);
-            let len = usize::from(be16(b, at + 2));
-            let start = at + 4;
-            if total - start < len {
-                return Err(ParseError::AttributeTruncated { typ });
-            }
+            };
+            let typ = u16::from_be_bytes([*hi, *lo]);
+            let len = usize::from(u16::from_be_bytes([*len_hi, *len_lo]));
+            let value = rest.get(..len).ok_or(ParseError::AttributeTruncated { typ })?;
             count += 1;
             if count > MAX_ATTRIBUTES {
                 return Err(ParseError::TooManyAttributes);
             }
-            let value = &b[start..start + len];
             // Offsets stay multiples of 4 and the body is one, so the
             // padding always fits once the value does.
-            let next = start + padded(len);
+            let next = at
+                .checked_add(4)
+                .and_then(|n| n.checked_add(padded(len)))
+                .filter(|&n| n <= total)
+                .ok_or(ParseError::AttributeTruncated { typ })?;
             if typ == attr::FINGERPRINT {
                 if next != total {
                     return Err(ParseError::FingerprintNotLast);
@@ -533,8 +606,8 @@ impl Message {
                 if len != 4 {
                     return Err(ParseError::AttributeValue { typ, len });
                 }
-                let expected = crc32(&b[..at]) ^ FINGERPRINT_XOR;
-                let found = be32(value, 0);
+                let expected = crc32(b.get(..at).ok_or(ParseError::Truncated)?) ^ FINGERPRINT_XOR;
+                let found = be32(value, 0).ok_or(ParseError::AttributeValue { typ, len })?;
                 if expected != found {
                     return Err(ParseError::Fingerprint { expected, found });
                 }
@@ -562,6 +635,13 @@ impl Message {
     /// MESSAGE-INTEGRITY or MESSAGE-INTEGRITY-SHA256 (see
     /// [`Message::parse`]).
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.clipped()
+    }
+
+    /// Writes bytes with the same clipping rules as [`Message::to_bytes`].
+    /// Text is shortened, invalid values are clamped or omitted, and
+    /// attributes that exceed the message limits are omitted.
+    pub fn clipped(&self) -> Vec<u8> {
         let reserve = if self.fingerprint { 8 } else { 0 };
         let max_count = MAX_ATTRIBUTES - usize::from(self.fingerprint);
         let mut body = Vec::new();
@@ -595,6 +675,63 @@ impl Message {
             out.extend_from_slice(&crc.to_be_bytes());
         }
         out
+    }
+
+    /// Appends one message without changing its fields.
+    ///
+    /// Refuses values the parser would reject or read differently. Text
+    /// may use all [`MAX_TEXT`] bytes accepted by the parser. Padding is
+    /// zeroed and FINGERPRINT is computed again. Integrity values remain
+    /// raw bytes; callers must compute them for the bytes they send.
+    ///
+    /// On error, `out` is unchanged. Temporary buffers are bounded by
+    /// [`MAX_MESSAGE`] and [`MAX_VALUE`]. The caller bounds `out` across
+    /// repeated writes. Use [`Message::clipped`] to apply the sending limits.
+    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if self.method > 0x0fff {
+            return Err(WriteError::Method(self.method));
+        }
+        let reserve = if self.fingerprint { 8 } else { 0 };
+        if self.attributes.len() > MAX_ATTRIBUTES - usize::from(self.fingerprint) {
+            return Err(WriteError::TooManyAttributes);
+        }
+        let mut body = Vec::new();
+        let mut integrity = Integrity::None;
+        for attribute in &self.attributes {
+            let typ = attribute.typ();
+            if !integrity_keeps(&mut integrity, typ) {
+                return Err(WriteError::Attribute { typ });
+            }
+            let value = attribute.strict_value(&self.transaction)?;
+            let end = body
+                .len()
+                .checked_add(4)
+                .and_then(|n| n.checked_add(padded(value.len())))
+                .filter(|&n| n <= MAX_BODY - reserve)
+                .ok_or(WriteError::BodyTooLong)?;
+            let len = u16::try_from(value.len()).map_err(|_| WriteError::Attribute { typ })?;
+            body.extend_from_slice(&typ.to_be_bytes());
+            body.extend_from_slice(&len.to_be_bytes());
+            body.extend_from_slice(&value);
+            body.resize(end, 0);
+        }
+        let body_len = body.len().checked_add(reserve).ok_or(WriteError::BodyTooLong)?;
+        let total = HEADER_LEN.checked_add(body_len).filter(|&n| n <= MAX_MESSAGE).ok_or(WriteError::BodyTooLong)?;
+        let length = u16::try_from(body_len).map_err(|_| WriteError::BodyTooLong)?;
+        let mut frame = Vec::with_capacity(total);
+        frame.extend_from_slice(&message_type(self.method, self.class).to_be_bytes());
+        frame.extend_from_slice(&length.to_be_bytes());
+        frame.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        frame.extend_from_slice(&self.transaction);
+        frame.extend_from_slice(&body);
+        if self.fingerprint {
+            let crc = crc32(&frame) ^ FINGERPRINT_XOR;
+            frame.extend_from_slice(&attr::FINGERPRINT.to_be_bytes());
+            frame.extend_from_slice(&4u16.to_be_bytes());
+            frame.extend_from_slice(&crc.to_be_bytes());
+        }
+        out.extend_from_slice(&frame);
+        Ok(())
     }
 
     /// The first attribute of type `typ`. RFC 8489 says a receiver reads
@@ -715,6 +852,19 @@ impl Message {
     }
 }
 
+impl codec::Wire for Message {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
+        Message::parse(bytes)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+        Message::write(self, out)
+    }
+}
+
 /// Answers a request the way a plain STUN server does. `source` is the
 /// address the request came from, as the world's socket saw it.
 ///
@@ -735,6 +885,63 @@ pub fn answer_binding(request: &Message, source: SocketAddr) -> Option<Message> 
         return Some(m);
     }
     Some(request.success_response(source))
+}
+
+/// Reads complete STUN frames from a byte slice.
+///
+/// Only headers are checked. Invalid top bits, lengths, or magic cookies
+/// return a stream error. Map frames through [`Message::parse`] to receive
+/// attribute errors as items and continue with the next message.
+///
+/// This decoder owns no input. Its capacity is [`MAX_MESSAGE`]. An
+/// incomplete frame returns [`Step::Need`], including at EOF, so
+/// [`codec::Stream`] reports truncation. [`codec::Stream::with_next`] gives
+/// access to each item's exact bytes, including padding.
+/// [`Decoder::next_frame`] remains available for borrowed frames without
+/// an owned frame allocation.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Decode, Stream, Wire}, stun::{Frames, Message}};
+///
+/// let message = Message::binding_request([7; 12]);
+/// let bytes = Wire::to_bytes(&message)?;
+/// let mut stream = Stream::new(Frames::new().map(|frame| Message::parse(&frame)));
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// let item = stream.with_next(|item, raw, span| {
+///     assert_eq!(raw, bytes);
+///     assert_eq!(span, 0..bytes.len() as u64);
+///     item
+/// });
+/// assert_eq!(item, Some(Ok(Ok(message))));
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// # Ok::<(), fictionet::stdlib::stun::WriteError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Vec<u8>;
+    type Error = ParseError;
+
+    const NAME: &'static str = "STUN";
+
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+        let Some(total) = header(input)? else { return Ok(Step::Need) };
+        let frame = input.get(..total).ok_or(ParseError::Truncated)?;
+        Ok(Step::Item(frame.to_vec(), total))
+    }
 }
 
 /// Splits a STUN byte stream, as sent over TCP or TLS, into messages. Feed
@@ -778,7 +985,7 @@ impl Decoder {
             self.start = 0;
         }
         let n = bytes.len().min(MAX_BUFFERED - self.buffered());
-        self.buf.extend_from_slice(&bytes[..n]);
+        self.buf.extend_from_slice(bytes.get(..n).unwrap_or_default());
         n
     }
 
@@ -797,11 +1004,11 @@ impl Decoder {
             self.reported = true;
             return self.failed.map(Err);
         }
-        match header(&self.buf[self.start..]) {
+        match header(self.buf.get(self.start..)?) {
             Ok(Some(total)) => {
                 let at = self.start;
-                self.start += total;
-                Some(Ok(&self.buf[at..at + total]))
+                self.start = at.checked_add(total)?;
+                Some(Ok(self.buf.get(at..self.start)?))
             }
             Ok(None) => None,
             Err(e) => {
@@ -846,7 +1053,7 @@ impl Decoder {
 pub fn crc32(data: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &byte in data {
-        crc = CRC_TABLE[usize::from((crc as u8) ^ byte)] ^ (crc >> 8);
+        crc = CRC_TABLE.get(usize::from((crc as u8) ^ byte)).copied().unwrap_or_default() ^ (crc >> 8);
     }
     !crc
 }
@@ -876,21 +1083,15 @@ fn header(b: &[u8]) -> Result<Option<usize>, ParseError> {
     {
         return Err(ParseError::TopBits(first));
     }
-    if b.len() < 4 {
-        return Ok(None);
-    }
-    let length = be16(b, 2);
+    let Some(length) = be16(b, 2) else { return Ok(None) };
     if !length.is_multiple_of(4) {
         return Err(ParseError::Length(length));
     }
-    if b.len() < 8 {
-        return Ok(None);
-    }
-    let cookie = be32(b, 4);
+    let Some(cookie) = be32(b, 4) else { return Ok(None) };
     if cookie != MAGIC_COOKIE {
         return Err(ParseError::MagicCookie(cookie));
     }
-    let total = HEADER_LEN + usize::from(length);
+    let total = HEADER_LEN.checked_add(usize::from(length)).ok_or(ParseError::Length(length))?;
     if b.len() < total {
         return Ok(None);
     }
@@ -917,25 +1118,25 @@ fn is_known(typ: u16) -> bool {
 /// The XOR key for an address: the cookie, then the transaction ID.
 fn xor_key(transaction: &[u8; 12]) -> [u8; 16] {
     let mut key = [0u8; 16];
-    key[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    key[4..].copy_from_slice(transaction);
+    for (out, byte) in key.iter_mut().zip(MAGIC_COOKIE.to_be_bytes().iter().chain(transaction)) {
+        *out = *byte;
+    }
     key
 }
 
 fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr, ParseError> {
-    if v.len() < 4 {
-        return Err(ParseError::AttributeValue { typ, len: v.len() });
-    }
+    let bad = || ParseError::AttributeValue { typ, len: v.len() };
+    let [_, family, hi, lo, address @ ..] = v else { return Err(bad()) };
     let key = xor.map(xor_key).unwrap_or([0; 16]);
-    let port = be16(v, 2) ^ u16::from_be_bytes([key[0], key[1]]);
-    match v[1] {
+    let port = u16::from_be_bytes([*hi, *lo]) ^ be16(&key, 0).ok_or_else(bad)?;
+    match *family {
         1 => {
             if v.len() != 8 {
                 return Err(ParseError::AttributeValue { typ, len: v.len() });
             }
             let mut ip = [0u8; 4];
-            for (i, o) in ip.iter_mut().enumerate() {
-                *o = v[4 + i] ^ key[i];
+            for ((out, byte), mask) in ip.iter_mut().zip(address).zip(key) {
+                *out = byte ^ mask;
             }
             Ok(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(ip), port)))
         }
@@ -944,8 +1145,8 @@ fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr
                 return Err(ParseError::AttributeValue { typ, len: v.len() });
             }
             let mut ip = [0u8; 16];
-            for (i, o) in ip.iter_mut().enumerate() {
-                *o = v[4 + i] ^ key[i];
+            for ((out, byte), mask) in ip.iter_mut().zip(address).zip(key) {
+                *out = byte ^ mask;
             }
             Ok(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(ip), port, 0, 0)))
         }
@@ -956,7 +1157,7 @@ fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr
 /// An address value. The IPv6 flow label and scope are not sent.
 fn write_address(a: SocketAddr, xor: Option<&[u8; 12]>) -> Vec<u8> {
     let key = xor.map(xor_key).unwrap_or([0; 16]);
-    let port = a.port() ^ u16::from_be_bytes([key[0], key[1]]);
+    let port = a.port() ^ be16(&key, 0).unwrap_or_default();
     let (family, ip): (u8, Vec<u8>) = match a.ip() {
         IpAddr::V4(ip) => (1, ip.octets().to_vec()),
         IpAddr::V6(ip) => (2, ip.octets().to_vec()),
@@ -971,7 +1172,7 @@ fn read_text(typ: u16, v: &[u8], max: usize) -> Result<String, ParseError> {
     if v.len() > max {
         return Err(ParseError::Text { typ });
     }
-    match std::str::from_utf8(v) {
+    match core::str::from_utf8(v) {
         Ok(s) => Ok(s.to_string()),
         Err(_) => Err(ParseError::Text { typ }),
     }
@@ -980,7 +1181,7 @@ fn read_text(typ: u16, v: &[u8], max: usize) -> Result<String, ParseError> {
 /// `s` cut to at most `max` characters.
 fn clamp_chars(s: &str, max: usize) -> &str {
     match s.char_indices().nth(max) {
-        Some((end, _)) => &s[..end],
+        Some((end, _)) => s.get(..end).unwrap_or_default(),
         None => s,
     }
 }
@@ -1034,24 +1235,25 @@ fn clamp_text(s: &str, max: usize) -> &str {
     while !s.is_char_boundary(end) {
         end -= 1;
     }
-    &s[..end]
+    s.get(..end).unwrap_or_default()
 }
 
 fn padded(len: usize) -> usize {
     len.div_ceil(4) * 4
 }
 
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
+fn be16(b: &[u8], i: usize) -> Option<u16> {
+    Some(u16::from_be_bytes(*b.get(i..)?.first_chunk::<2>()?))
 }
 
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+fn be32(b: &[u8], i: usize) -> Option<u32> {
+    Some(u32::from_be_bytes(*b.get(i..)?.first_chunk::<4>()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Fail, Stream, Wire, contract, finish, pump, test_support};
 
     const TID: [u8; 12] = [0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae];
 
@@ -1648,6 +1850,269 @@ mod tests {
         assert_eq!(m.unknown_attributes(), Some(&[0x0024, 0x7000][..]));
     }
 
+    #[test]
+    fn codec_stack_end_to_end() {
+        let request = Message::binding_request([8; 12]);
+        let bad_attribute = with_body(&[0, 1, 0, 0]);
+        let attribute_error = ParseError::AttributeValue { typ: attr::MAPPED_ADDRESS, len: 0 };
+        let header_error = ParseError::TopBits(0xc0);
+        let mut bytes = SAMPLE_REQUEST.to_vec();
+        bytes.extend_from_slice(&bad_attribute);
+        request.write(&mut bytes).unwrap();
+        let consumed = bytes.len();
+        bytes.push(0xc0);
+        request.write(&mut bytes).unwrap();
+
+        let expected = vec![
+            Ok(Message::parse(&SAMPLE_REQUEST)),
+            Ok(Err(attribute_error)),
+            Ok(Ok(request.clone())),
+            Err(Fail::Protocol(header_error)),
+        ];
+        let source = "192.0.2.1:32853".parse().unwrap();
+        for pattern in [&[][..], &[1], &[3, 1, 17]] {
+            let mut stream = Stream::new(Frames::new().map(|frame| Message::parse(&frame)));
+            let mut results = Vec::new();
+            let mut replies = Vec::new();
+            let mut expected_replies = Vec::new();
+            let mut at = 0;
+            for chunk in test_support::chunks(&bytes, pattern) {
+                assert_eq!(stream.push(chunk), chunk.len());
+                while let Some(result) = stream.with_next(|item, raw, span| {
+                    let end = at + raw.len();
+                    assert_eq!(raw, bytes.get(at..end).unwrap());
+                    assert_eq!(span, at as u64..end as u64);
+                    at = end;
+                    if let Ok(message) = &item {
+                        let reply = answer_binding(message, source).unwrap();
+                        Wire::write(&reply, &mut replies).unwrap();
+                        expected_replies.push(Ok(reply));
+                    }
+                    item
+                }) {
+                    results.push(result);
+                }
+                assert!(stream.buffered() <= MAX_MESSAGE);
+            }
+            assert_eq!(results, expected);
+            assert_eq!(at, consumed);
+            assert_eq!(stream.offset(), consumed as u64);
+            assert_eq!(stream.failed(), Some(&Fail::Protocol(header_error)));
+            assert!(stream.is_done());
+            stream.end();
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.push(&request.to_bytes()), HEADER_LEN);
+            assert_eq!(stream.next(), None);
+
+            let mut response_stream = Stream::new(Frames::new().map(|frame| Message::parse(&frame)));
+            let mut responses = Vec::new();
+            for byte in &replies {
+                assert_eq!(pump(&mut response_stream, core::slice::from_ref(byte), |item| responses.push(item)), Ok(1));
+            }
+            finish(&mut response_stream, |item| responses.push(item)).unwrap();
+            assert_eq!(responses, expected_replies);
+            assert!(response_stream.is_done());
+            assert_eq!(response_stream.failed(), None);
+        }
+
+        // The existing borrowed API still reports the same flattened results.
+        let mut legacy = Decoder::new();
+        let mut results = Vec::new();
+        feed_all(&mut legacy, &bytes, &mut results);
+        assert_eq!(
+            results,
+            vec![Message::parse(&SAMPLE_REQUEST), Err(attribute_error), Ok(request), Err(header_error)]
+        );
+        assert_eq!(legacy.buffered(), 0);
+        assert_eq!(legacy.feed(&bytes), bytes.len());
+        assert_eq!(legacy.next_frame(), None);
+        contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), &bytes);
+    }
+
+    #[test]
+    fn codec_eof_and_early_header_errors() {
+        for sample in samples() {
+            for cut in 0..sample.len() {
+                let mut stream = Stream::new(Frames::new());
+                assert_eq!(stream.push(sample.get(..cut).unwrap()), cut);
+                assert_eq!(stream.next(), None);
+                stream.end();
+                let expected = if cut == 0 { None } else { Some(Err(Fail::Truncated { unread: cut })) };
+                assert_eq!(stream.next(), expected);
+                assert!(stream.is_done());
+                assert_eq!(stream.next(), None);
+            }
+        }
+        for (bytes, error) in [
+            (&[0x80][..], ParseError::TopBits(0x80)),
+            (&[0, 1, 0, 2][..], ParseError::Length(2)),
+            (&[0, 1, 0xff, 0xfc, 1, 2, 3, 4][..], ParseError::MagicCookie(0x0102_0304)),
+        ] {
+            let mut stream = Stream::new(Frames::new());
+            assert_eq!(stream.push(bytes), bytes.len());
+            assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
+            assert_eq!(stream.failed(), Some(&Fail::Protocol(error)));
+            assert_eq!(stream.next(), None);
+        }
+    }
+
+    #[test]
+    fn codec_contracts_and_capacity() {
+        for sample in samples() {
+            contract::check_decode(Frames::new, sample);
+            contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), sample);
+            contract::check_wire::<Message>(sample);
+        }
+        let mut message = Message::binding_request([1; 12]);
+        message.attributes.push(Attribute::Other { typ: 0x8099, value: vec![0x5a; MAX_VALUE] });
+        let bytes = Wire::to_bytes(&message).unwrap();
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+        assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
+        assert_eq!(Frames::new().held(), 0);
+        contract::check_decode(Frames::new, &bytes);
+        contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), &bytes);
+        contract::check_wire::<Message>(&bytes);
+
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&bytes), MAX_MESSAGE);
+        assert_eq!(stream.push(&bytes), 0);
+        assert_eq!(stream.next(), Some(Ok(bytes.clone())));
+        assert_eq!(stream.buffered(), 0);
+        assert_eq!(stream.push(&bytes), MAX_MESSAGE);
+        stream.end();
+        assert_eq!(stream.next(), Some(Ok(bytes)));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), None);
+    }
+
+    #[test]
+    fn strict_writer_preserves_long_text_and_clipping_stays_available() {
+        let text = format!("{}a", "é".repeat(MAX_TEXT / 2));
+        assert_eq!(text.len(), MAX_TEXT);
+        let mut message = Message::binding_request([4; 12]);
+        message.attributes = vec![
+            Attribute::Username(text.clone()),
+            Attribute::Realm(text.clone()),
+            Attribute::Nonce(text.clone()),
+            Attribute::Software(text.clone()),
+            Attribute::ErrorCode { code: 699, reason: text },
+        ];
+        message.fingerprint = true;
+        let bytes = Wire::to_bytes(&message).unwrap();
+        assert_eq!(Message::parse(&bytes), Ok(message.clone()));
+        contract::check_wire::<Message>(&bytes);
+        assert_eq!(message.clipped(), message.to_bytes());
+        let clipped = Message::parse(&message.to_bytes()).unwrap();
+        assert_ne!(clipped, message);
+        assert!(within_sending_limits(&clipped));
+
+        let mut appended = SAMPLE_REQUEST.to_vec();
+        message.write(&mut appended).unwrap();
+        assert_eq!(appended.get(..SAMPLE_REQUEST.len()).unwrap(), SAMPLE_REQUEST);
+        assert_eq!(Message::parse(appended.get(SAMPLE_REQUEST.len()..).unwrap()), Ok(message));
+        assert!(matches!(<Message as Wire>::parse(&appended), Err(ParseError::TrailingBytes(_))));
+    }
+
+    fn assert_write_error(message: &Message, error: WriteError) {
+        let mut out = vec![0x5a, 0xa5];
+        assert_eq!(message.write(&mut out), Err(error));
+        assert_eq!(out, [0x5a, 0xa5]);
+        contract::check_wire_value(message);
+        assert_eq!(message.to_bytes(), message.clipped());
+        assert!(Message::parse(&message.to_bytes()).is_ok());
+    }
+
+    #[test]
+    fn strict_writer_refuses_changed_attributes_transactionally() {
+        let long = "x".repeat(MAX_TEXT + 1);
+        let scoped = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 3478, 0, 1));
+        let flow = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 3478, 1, 0));
+        let mut attributes = vec![
+            Attribute::Username(long.clone()),
+            Attribute::Realm(long.clone()),
+            Attribute::Nonce(long.clone()),
+            Attribute::Software(long.clone()),
+            Attribute::ErrorCode { code: 400, reason: long },
+            Attribute::ErrorCode { code: 299, reason: String::new() },
+            Attribute::ErrorCode { code: 700, reason: String::new() },
+            Attribute::UnknownAttributes(vec![1; MAX_VALUE / 2 + 1]),
+            Attribute::Other { typ: 0x8099, value: vec![0; MAX_VALUE + 1] },
+            Attribute::Other { typ: attr::MESSAGE_INTEGRITY, value: vec![0; 19] },
+            Attribute::Other { typ: attr::MESSAGE_INTEGRITY_SHA256, value: vec![0; 18] },
+            Attribute::MappedAddress(scoped),
+            Attribute::XorMappedAddress(flow),
+            Attribute::AlternateServer(scoped),
+        ];
+        for typ in [
+            attr::MAPPED_ADDRESS,
+            attr::XOR_MAPPED_ADDRESS,
+            attr::ALTERNATE_SERVER,
+            attr::USERNAME,
+            attr::REALM,
+            attr::NONCE,
+            attr::SOFTWARE,
+            attr::ERROR_CODE,
+            attr::UNKNOWN_ATTRIBUTES,
+            attr::FINGERPRINT,
+        ] {
+            attributes.push(Attribute::Other { typ, value: vec![] });
+        }
+        for attribute in attributes {
+            let error = WriteError::Attribute { typ: attribute.typ() };
+            let mut message = Message::binding_request([0; 12]);
+            message.attributes = vec![Attribute::Software("valid prefix".into()), attribute];
+            message.fingerprint = true;
+            assert_write_error(&message, error);
+        }
+        let mut message = Message::binding_request([0; 12]);
+        message.method = 0x1001;
+        assert_write_error(&message, WriteError::Method(0x1001));
+    }
+
+    #[test]
+    fn strict_writer_checks_integrity_order() {
+        let sha1 = Attribute::Other { typ: attr::MESSAGE_INTEGRITY, value: vec![1; 20] };
+        let sha256 = Attribute::Other { typ: attr::MESSAGE_INTEGRITY_SHA256, value: vec![2; 16] };
+        let mut message = Message::binding_request([0; 12]);
+        message.fingerprint = true;
+        message.attributes = vec![Attribute::Software("sdk".into()), sha1.clone(), sha256.clone()];
+        let bytes = Wire::to_bytes(&message).unwrap();
+        contract::check_wire::<Message>(&bytes);
+        for (first, second) in [
+            (sha1.clone(), Attribute::Software("ignored".into())),
+            (sha1.clone(), sha1.clone()),
+            (sha256.clone(), sha1),
+            (sha256.clone(), sha256),
+        ] {
+            let error = WriteError::Attribute { typ: second.typ() };
+            message.attributes = vec![first, second];
+            assert_write_error(&message, error);
+        }
+    }
+
+    #[test]
+    fn strict_writer_checks_body_and_attribute_limits() {
+        let mut message = Message::binding_request([0; 12]);
+        message.attributes = vec![Attribute::Other { typ: 0x8099, value: vec![] }; MAX_ATTRIBUTES];
+        contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
+        message.fingerprint = true;
+        assert_write_error(&message, WriteError::TooManyAttributes);
+        message.attributes.pop();
+        contract::check_wire::<Message>(&Wire::to_bytes(&message).unwrap());
+        message.fingerprint = false;
+        message.attributes = vec![Attribute::Other { typ: 0x8099, value: vec![0; MAX_VALUE] }];
+        assert_eq!(Wire::to_bytes(&message).unwrap().len(), MAX_MESSAGE);
+        message.fingerprint = true;
+        assert_write_error(&message, WriteError::BodyTooLong);
+        message.attributes = vec![Attribute::Other { typ: 0x8099, value: vec![0; MAX_VALUE - 8] }];
+        let bytes = Wire::to_bytes(&message).unwrap();
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+        contract::check_wire::<Message>(&bytes);
+        message.fingerprint = false;
+        message.attributes.push(Attribute::Other { typ: 0x8099, value: vec![0; 5] });
+        assert_write_error(&message, WriteError::BodyTooLong);
+    }
+
     /// A deterministic generator for the fuzz loop.
     struct Lcg(u64);
 
@@ -1670,6 +2135,7 @@ mod tests {
     }
 
     fn check_round_trip(b: &[u8]) {
+        contract::check_wire::<Message>(b);
         if let Ok(m) = Message::parse(b) {
             // Writing what was read gives bytes that read back and write
             // the same. Only text over the sending limits and ignored

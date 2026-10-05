@@ -2,10 +2,15 @@
 //! datagrams and TCP streams.
 #![no_main]
 
-use fictionet::stdlib::stun::{Attribute, Decoder, MAX_BUFFERED, MAX_VALUE, Message, answer_binding};
+use fictionet::stdlib::codec::{Decode, contract};
+use fictionet::stdlib::stun::{Attribute, Decoder, Frames, MAX_BUFFERED, MAX_VALUE, Message, answer_binding};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), data);
+    contract::check_wire::<Message>(data);
+
     // The bytes as one datagram. A message read can be written, and the
     // bytes read back and write the same. Writing only drops attributes a
     // reader ignores and cuts text to the sending limits, so the bytes are
@@ -24,6 +29,7 @@ fuzz_target!(|data: &[u8]| {
         let _ = (back.username(), back.realm(), back.nonce(), back.software(), back.error_code());
         let source = "192.0.2.1:32853".parse().unwrap();
         if let Some(reply) = answer_binding(&m, source) {
+            contract::check_wire_value(&reply);
             let back = Message::parse(&reply.to_bytes()).unwrap();
             assert_eq!(back.transaction, m.transaction);
         }
@@ -34,6 +40,16 @@ fuzz_target!(|data: &[u8]| {
     if let [hi, lo, value @ ..] = data {
         let typ = u16::from_be_bytes([*hi, *lo]);
         let r = Attribute::parse(typ, value, &[0x5a; 12]);
+        let mut message = Message::binding_request([0x5a; 12]);
+        message.attributes.push(Attribute::Other { typ, value: value.iter().take(MAX_VALUE + 1).copied().collect() });
+        contract::check_wire_value(&message);
+        message.method = typ;
+        contract::check_wire_value(&message);
+        if let Ok(attribute) = &r {
+            message.method = 1;
+            message.attributes = vec![attribute.clone()];
+            contract::check_wire_value(&message);
+        }
         if value.len() > MAX_VALUE {
             assert!(r.is_err());
         }
