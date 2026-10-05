@@ -3,6 +3,8 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::rtcp::{Frame, Frames};
 use fictionet::stdlib::rtcp::{
     App, Body, Bye, Decoder, DlrrItem, ExtendedReport, Fir, MAX_BUFFERED, MAX_DATAGRAM, MAX_PACKET, Nack, Packet,
     PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi, SdesChunk, SdesItem, SenderReport, Sli,
@@ -188,6 +190,7 @@ fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let packets = list(&mut u, 6, packet)?;
     for p in &packets {
+        contract::check_wire_value(p);
         if let Ok(bytes) = p.to_bytes() {
             assert!(bytes.len() <= MAX_PACKET && bytes.len() % 4 == 0);
             assert_eq!(Packet::parse(&bytes), Ok((p.clone(), bytes.len())));
@@ -222,6 +225,17 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_decode(|| Frames::new().map(|frame| parse_packets(&frame.0)), data);
+    contract::check_wire::<Frame>(data);
+    contract::check_wire::<Packet>(data);
+    let envelope = Frame(data.get(..MAX_DATAGRAM + 1).unwrap_or(data).to_vec());
+    contract::check_wire_value(&envelope);
+    if let Ok(bytes) = Wire::to_bytes(&envelope) {
+        contract::check_wire::<Frame>(&bytes);
+    }
+
     // The bytes as one datagram.
     datagram(data);
     // The bytes as an RFC 4571 stream, split two ways: all at once, and a

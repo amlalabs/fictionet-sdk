@@ -2,6 +2,8 @@
 //! UDP datagrams and TCP streams, and as it builds them to write.
 #![no_main]
 
+use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::openvpn::{Frame, Frames};
 use fictionet::stdlib::openvpn::{
     Ack, Control, ControlBody, ControlKind, Decoder, EncodeError, Error, FrameError, MAX_HMAC_LEN, MAX_PACKET, Packet,
     TlsAuth, TlsCrypt, Wrapping, frame, split_first_byte, split_tcp,
@@ -115,6 +117,21 @@ fn build(data: &[u8]) -> Packet {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_wire::<Frame>(data);
+    let envelope = Frame(data.get(..MAX_PACKET + 1).unwrap_or(data).to_vec());
+    contract::check_wire_value(&envelope);
+    if let Ok(bytes) = Wire::to_bytes(&envelope) {
+        contract::check_wire::<Frame>(&bytes);
+    }
+    for wrapping in WRAPPINGS {
+        contract::check_decode(
+            || Frames::new().map(|frame| Packet::parse(&frame.0, wrapping)),
+            data,
+        );
+    }
+
     // The bytes as one UDP datagram, read with each wrapping.
     for w in WRAPPINGS {
         if let Ok(p) = Packet::parse(data, w) {

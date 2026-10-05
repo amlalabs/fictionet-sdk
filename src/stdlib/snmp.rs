@@ -28,6 +28,12 @@
 //! [`Element`] reads and writes BER that is not SNMP, under the same
 //! limits.
 //!
+//! New TCP stacks use [`Frames`] with [`super::codec::Stream`]. Body
+//! failures are items, while invalid BER envelopes end the stream.
+//! [`Message`] implements [`super::codec::Wire`] for exact parsing and
+//! transactional writing. The legacy [`Decoder`] keeps its larger buffer,
+//! raw message items, and repeating errors.
+//!
 //! ```
 //! use fictionet::stdlib::snmp::{Message, Oid, Pdu, Value, VarBind};
 //!
@@ -59,6 +65,8 @@
 
 use std::fmt;
 use std::str::FromStr;
+
+use super::codec::{Decode, Step, Wire};
 
 /// The UDP port agents listen on for requests.
 pub const PORT: u16 = 161;
@@ -1410,6 +1418,88 @@ impl Message {
 
 // ---------------------------------------------------------------------------
 // Streams.
+
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Message::parse(bytes)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+// One tag, one length-form byte, and up to 126 redundant length bytes.
+// RFC 3417 permits nonminimal definite lengths; 0xff is reserved.
+const MAX_BER_HEADER: usize = 128;
+
+/// Reads SNMP messages from BER TLV envelopes over TCP (RFC 3430).
+///
+/// This decoder owns no input. Malformed message bodies are `Err` items;
+/// a bad outer tag, invalid length, or oversized envelope ends framing.
+/// The whole message limit includes the BER header. Capacity is at least
+/// 128 bytes to read the longest permitted definite-length header, even
+/// when the configured limit is smaller. The header suffices to refuse
+/// an oversized message before its body arrives. Partial messages return
+/// [`Step::Need`], including at EOF, so [`super::codec::Stream`] reports
+/// truncation. The existing BER tolerance and version policy are preserved.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a framer with [`MAX_MESSAGE`] as its whole-message limit.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`]. Zero
+    /// refuses every message. The BER tag and length count toward the limit.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
+    }
+
+    /// The largest accepted message, including its BER header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Result<Message, Error>;
+    type Error = Error;
+    const NAME: &'static str = "SNMP/TCP";
+
+    fn capacity(&self) -> usize {
+        self.limit.max(MAX_BER_HEADER)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        let Some(length) = message_len(input)? else {
+            return Ok(Step::Need);
+        };
+        if length > self.limit {
+            return Err(Error::TooLong(length));
+        }
+        Ok(match input.get(..length) {
+            Some(bytes) => Step::Item(Message::parse(bytes), length),
+            None => Step::Need,
+        })
+    }
+}
 
 /// Splits an SNMP-over-TCP byte stream (RFC 3430) into messages. Feed it
 /// the bytes a connection reads, in order, and take messages out until it

@@ -41,6 +41,11 @@
 //! many acknowledgements, a packet over [`MAX_PACKET`], and so on. What a
 //! writer writes, the reader reads back as the same value.
 //!
+//! New TCP stacks use [`Frames`] with [`super::codec::Stream`] and
+//! [`Frame`] with [`super::codec::Wire`]. Packet parsing still takes an
+//! explicit wrapping. The legacy [`Decoder`] remains separate because it
+//! clears buffered bytes on failure and repeats its error.
+//!
 //! ```
 //! use fictionet::stdlib::openvpn::{Ack, Control, ControlBody, ControlKind, Decoder, Packet, Wrapping};
 //!
@@ -72,6 +77,8 @@
 //! assert_eq!(wire[..3], [0, 26, 0x40]);
 //! assert_eq!(Packet::parse(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The port OpenVPN servers listen on, over UDP and over TCP.
 pub const PORT: u16 = 1194;
@@ -738,6 +745,160 @@ pub fn split_tcp(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
     match b.get(LENGTH_PREFIX_LEN..end) {
         Some(packet) => Ok(Some((packet, end))),
         None => Ok(None),
+    }
+}
+
+/// A TCP envelope containing one OpenVPN packet, without its length prefix.
+///
+/// [`Wire`] reads and writes the two-byte prefix and 1 to [`MAX_PACKET`]
+/// payload bytes. The payload is opaque. Parse it with [`Packet::parse`]
+/// and an explicit [`Wrapping`]; that context cannot be inferred from bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// The packet bytes, excluding the TCP length prefix.
+    pub Vec<u8>,
+);
+
+/// Why the bounded TCP framer refused an envelope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamError {
+    /// The TCP length prefix is invalid.
+    Frame(FrameError),
+    /// The declared packet exceeds the configured payload limit.
+    TooLong {
+        /// The declared payload length.
+        length: usize,
+        /// The maximum accepted payload length.
+        limit: usize,
+    },
+}
+
+impl core::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::TooLong { length, limit } => {
+                write!(f, "OpenVPN packet of {length} bytes, over {limit}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for StreamError {}
+
+/// Why an exact TCP envelope parse failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The length prefix was refused.
+    Frame(StreamError),
+    /// The input ended before a complete envelope.
+    Truncated,
+    /// Bytes follow the first envelope.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete OpenVPN TCP envelope"),
+            Self::Trailing => f.write_str("bytes follow the OpenVPN TCP envelope"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = StreamError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Frames::new()
+            .decode(bytes, true)
+            .map_err(FrameParseError::Frame)?
+        {
+            Step::Item(frame, used) if used == bytes.len() => Ok(frame),
+            Step::Item(_, _) => Err(FrameParseError::Trailing),
+            _ => Err(FrameParseError::Truncated),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), StreamError> {
+        if self.0.is_empty() {
+            return Err(StreamError::Frame(FrameError::ZeroLength));
+        }
+        let length = u16::try_from(self.0.len()).map_err(|_| StreamError::TooLong {
+            length: self.0.len(),
+            limit: MAX_PACKET,
+        })?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+/// Reads OpenVPN TCP envelopes without retaining input.
+///
+/// Capacity is the payload limit plus [`LENGTH_PREFIX_LEN`]. An oversized
+/// packet is refused from its prefix. Partial envelopes return [`Step::Need`],
+/// including at EOF, so [`super::codec::Stream`] reports truncation.
+/// Map each frame through [`Packet::parse`] with the connection's wrapping
+/// to receive packet errors as items while framing continues.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a framer accepting payloads up to [`MAX_PACKET`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Sets the payload limit, clamped to [`MAX_PACKET`]. Zero refuses
+    /// every packet. The two-byte prefix is excluded from this limit.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_PACKET),
+        }
+    }
+
+    /// The largest accepted packet, excluding its length prefix.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = StreamError;
+    const NAME: &'static str = "OpenVPN/TCP";
+
+    fn capacity(&self) -> usize {
+        LENGTH_PREFIX_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, StreamError> {
+        if let Some(&[hi, lo]) = input.get(..LENGTH_PREFIX_LEN) {
+            let length = usize::from(u16::from_be_bytes([hi, lo]));
+            if length > self.limit {
+                return Err(StreamError::TooLong {
+                    length,
+                    limit: self.limit,
+                });
+            }
+        }
+        Ok(match split_tcp(input).map_err(StreamError::Frame)? {
+            Some((packet, used)) => Step::Item(Frame(packet.to_vec()), used),
+            None => Step::Need,
+        })
     }
 }
 

@@ -2,6 +2,8 @@
 //! messages, as a world playing an SSH server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::ssh::{Frames, MAX_PAYLOAD};
 use fictionet::stdlib::ssh::{
     DECODER_CAPACITY, Decoder, Event, Line, Message, Packet, Reader, StreamError, parse_line,
 };
@@ -47,6 +49,14 @@ fn bytewise(mut d: Decoder, data: &[u8]) -> Vec<Result<Event, StreamError>> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_wire::<Packet>(data);
+    contract::check_wire_value(&Packet {
+        payload: data.get(..MAX_PAYLOAD + 1).unwrap_or(data).to_vec(),
+        padding: vec![0; usize::from(data.first().copied().unwrap_or(0))],
+    });
+
     // The stream, split two ways: all at once, and a byte at a time.
     let events = whole(Decoder::new(), data);
     assert_eq!(events, bytewise(Decoder::new(), data));
@@ -64,6 +74,7 @@ fuzz_target!(|data: &[u8]| {
             }
             // So can a packet, and the message it carries.
             Event::Packet { packet, .. } => {
+                contract::check_wire_value(packet);
                 let bytes = packet.to_bytes();
                 assert_eq!(
                     Packet::parse(&bytes),

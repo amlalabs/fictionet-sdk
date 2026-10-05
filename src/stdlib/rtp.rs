@@ -35,6 +35,12 @@
 //! bytes it likes. Writers clamp what they write, so the bytes they make
 //! always read back.
 //!
+//! New stream stacks use the shared [`Frames`] and [`Frame`] from
+//! [`super::rtcp`]. [`RtpPacket`] implements [`super::codec::Wire`] for
+//! strict datagram writing. The legacy [`Decoder`] keeps its larger
+//! [`MAX_BUFFERED`] read-ahead limit. Existing RTCP items stay available;
+//! new RTCP codec stacks use the richer [`super::rtcp`] types.
+//!
 //! ```
 //! use fictionet::stdlib::rtp::{
 //!     Element, HeaderExtension, Packet, ReceiverReport, ReportBlock, RtcpPacket, RtpPacket, SdesChunk,
@@ -182,6 +188,17 @@ pub mod feedback {
 
 // ---------------------------------------------------------------------------
 // RTP
+
+use super::codec::Wire;
+
+/// The shared RFC 4571 envelope, including null frames.
+pub use super::rtcp::Frame;
+/// A shared RFC 4571 payload length error.
+pub use super::rtcp::FrameError;
+/// An exact RFC 4571 envelope parse error.
+pub use super::rtcp::FrameParseError;
+/// The shared RFC 4571 framer for RTP and RTCP datagrams.
+pub use super::rtcp::Frames;
 
 /// One RTP packet: the header's fields, the extension and the payload.
 /// The version is always 2, and the padding, extension and CSRC count bits
@@ -381,6 +398,41 @@ impl RtpPacket {
             out.push(self.padding);
         }
         out
+    }
+}
+
+/// An RTP packet cannot be written without changing its value.
+///
+/// A field exceeds its wire range or [`MAX_PACKET`], an extension element
+/// would be omitted, or an extension would parse as another variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError;
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RTP packet cannot be represented without changing its value")
+    }
+}
+
+impl core::error::Error for EncodeError {}
+
+impl Wire for RtpPacket {
+    type ParseError = RtpError;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, RtpError> {
+        RtpPacket::parse(bytes)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        // The legacy writer stages at most MAX_PACKET bytes. Comparing
+        // before appending refuses clipping, padding, and variant aliases.
+        let bytes = self.to_bytes();
+        if RtpPacket::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
 }
 
