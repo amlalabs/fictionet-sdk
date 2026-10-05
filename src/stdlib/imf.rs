@@ -25,6 +25,11 @@
 //! returns an [`Error`] rather than write something the readers here would
 //! refuse.
 //!
+//! New streams use [`Messages`] with [`super::codec::Stream`]. The header
+//! is one item; the body follows in bounded chunks. [`Wire`] on [`Header`]
+//! provides exact parsing and strict writing. The deprecated decoder keeps
+//! its original header-at-EOF and body extraction behavior.
+//!
 //! ```
 //! use fictionet::stdlib::imf::{
 //!     decode_text, parse_address_list, split_message, write_address_list, Address, DateTime, Header,
@@ -55,6 +60,8 @@
 //! let bytes = reply.to_bytes().unwrap();
 //! assert_eq!(bytes, "To: John Doe <jdoe@machine.example>\r\nSubject: Re: Café hours\r\n\r\n".as_bytes());
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The longest header section, counting the blank line that ends it.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -232,6 +239,202 @@ impl Header {
     }
 }
 
+/// The default and largest body chunk emitted by [`Messages`].
+pub const MAX_BODY_CHUNK: usize = 8 * 1024;
+
+/// Why bytes do not contain exactly one writable header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// Header fields or their strict encoding were refused.
+    Header(Error),
+    /// The terminating blank line has not arrived.
+    Truncated,
+    /// Bytes follow the terminating blank line.
+    Trailing,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Header(e) => e.fmt(f),
+            Self::Truncated => f.write_str("IMF header ended before its blank line"),
+            Self::Trailing => f.write_str("bytes follow the IMF header"),
+        }
+    }
+}
+impl core::error::Error for ParseError {}
+
+impl Wire for Header {
+    type ParseError = ParseError;
+    type WriteError = Error;
+
+    /// Reads exactly one header that the strict writer can represent.
+    /// Obsolete control text and headers whose folding exceeds the size
+    /// limit are refused. [`Header::parse`] and [`Messages`] still read them.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let (header, used) = Header::parse(bytes).map_err(ParseError::Header)?.ok_or(ParseError::Truncated)?;
+        if used != bytes.len() {
+            return Err(ParseError::Trailing);
+        }
+        strict_header(&header).map_err(ParseError::Header)?;
+        Ok(header)
+    }
+
+    /// Appends a header without normalizing its value. Leading value
+    /// whitespace is [`Error::FieldValue`]. Refusal leaves `out` unchanged.
+    /// The legacy [`Header::to_bytes`] still trims leading whitespace.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&strict_header(self)?);
+        Ok(())
+    }
+}
+
+fn strict_header(header: &Header) -> Result<Vec<u8>, Error> {
+    // Bound fields before entering the legacy folding writer. Its temporary
+    // output is at most three times MAX_HEADER_BYTES (one CRLF per byte).
+    if header.fields.len() > MAX_FIELDS {
+        return Err(Error::TooManyFields);
+    }
+    let mut size = 2usize;
+    for field in &header.fields {
+        size = size.saturating_add(field.name.len()).saturating_add(field.value.len()).saturating_add(4);
+        if size > MAX_HEADER_BYTES {
+            return Err(Error::TooLarge);
+        }
+    }
+    let bytes = header.to_bytes()?;
+    match Header::parse(&bytes)? {
+        Some((parsed, used)) if used == bytes.len() && parsed == *header => Ok(bytes),
+        _ => Err(Error::FieldValue),
+    }
+}
+
+/// One header result or a bounded part of its body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Event {
+    /// The complete header. A field error does not hide the body boundary.
+    Header(Result<Header, Error>),
+    /// Body bytes, at most [`Messages::chunk_size`] bytes.
+    Body(Vec<u8>),
+}
+
+/// Reads one message as a header item followed by bounded body chunks.
+///
+/// The enclosing SMTP or MIME layer supplies EOF. A complete header ends
+/// with a blank line. An unfinished header returns [`Step::Need`] at EOF,
+/// so [`super::codec::Stream`] reports truncation. EOF after the header is clean.
+/// A header that reaches its limit without a blank line ends the stream.
+/// Field errors within a complete header are [`Event::Header`] error items.
+///
+/// Body chunks have exactly [`chunk_size`](Self::chunk_size) bytes except
+/// for the final chunk at EOF. This keeps items independent of input cuts.
+/// No input or body bytes are retained outside the stream's buffer. Its
+/// capacity is the larger of the header limit and chunk size.
+/// To transfer the body to another decoder, call
+/// [`handoff_body`](Self::handoff_body) after the header item, poll End,
+/// then use [`super::codec::Stream::swap`] or [`super::codec::Stream::into_parts`].
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, pump, finish}, imf::{Messages, Event}};
+/// let mut stream = Stream::new(Messages::with_limits(64, 3));
+/// let mut items = Vec::new();
+/// pump(&mut stream, b"Subject: mail\r\n\r\nhello", |item| items.push(item))?;
+/// finish(&mut stream, |item| items.push(item))?;
+/// assert!(matches!(items.first(), Some(Event::Header(Ok(_)))));
+/// assert_eq!(items.get(1), Some(&Event::Body(b"hel".to_vec())));
+/// assert_eq!(items.get(2), Some(&Event::Body(b"lo".to_vec())));
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::imf::Error>>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct Messages {
+    header_limit: usize,
+    chunk_size: usize,
+    scanned: usize,
+    body: bool,
+    handoff: bool,
+}
+
+impl Messages {
+    /// Reads headers up to [`MAX_HEADER_BYTES`] and chunks up to [`MAX_BODY_CHUNK`].
+    pub fn new() -> Self {
+        Self::with_limits(MAX_HEADER_BYTES, MAX_BODY_CHUNK)
+    }
+
+    /// Sets the header limit and body chunk size. Each is clamped from 1
+    /// through its named maximum. The header limit includes the blank line.
+    pub fn with_limits(header_limit: usize, chunk_size: usize) -> Self {
+        Self {
+            header_limit: header_limit.clamp(1, MAX_HEADER_BYTES),
+            chunk_size: chunk_size.clamp(1, MAX_BODY_CHUNK),
+            scanned: 0,
+            body: false,
+            handoff: false,
+        }
+    }
+
+    /// The largest header, including its terminating blank line.
+    pub fn header_limit(&self) -> usize {
+        self.header_limit
+    }
+
+    /// The size of body chunks before EOF.
+    pub fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Ends decoding at the next poll, leaving unread body bytes in place.
+    /// Call between items after the header. Before the header this does nothing.
+    pub fn handoff_body(&mut self) {
+        if self.body {
+            self.handoff = true;
+        }
+    }
+}
+
+impl Default for Messages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Messages {
+    type Item = Event;
+    type Error = Error;
+    const NAME: &'static str = "IMF";
+
+    fn capacity(&self) -> usize {
+        self.header_limit.max(self.chunk_size)
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, Error> {
+        if self.handoff {
+            return Ok(Step::End);
+        }
+        if self.body {
+            if input.is_empty() && eof {
+                return Ok(Step::End);
+            }
+            if input.len() < self.chunk_size && !eof || input.is_empty() {
+                return Ok(Step::Need);
+            }
+            let used = input.len().min(self.chunk_size);
+            let bytes = input.get(..used).ok_or(Error::TooLarge)?;
+            return Ok(Step::Item(Event::Body(bytes.to_vec()), used));
+        }
+        let window = input.get(..input.len().min(self.header_limit)).ok_or(Error::TooLarge)?;
+        if let Some((fields_end, end)) = find_end(window, self.scanned) {
+            let fields = window.get(..fields_end).ok_or(Error::TooLarge)?;
+            self.body = true;
+            return Ok(Step::Item(Event::Header(parse_fields(fields)), end));
+        }
+        if window.len() == self.header_limit {
+            return Err(Error::TooLarge);
+        }
+        self.scanned = window.len().saturating_sub(1);
+        Ok(Step::Need)
+    }
+}
+
 /// Splits a whole message into its header and its body. A message with no
 /// blank line is all header, with an empty body, as RFC 5322 allows.
 pub fn split_message(b: &[u8]) -> Result<(Header, &[u8]), Error> {
@@ -252,6 +455,7 @@ pub fn split_message(b: &[u8]) -> Result<(Header, &[u8]), Error> {
 /// [`Decoder::header`] has returned the header and [`Decoder::take_body`]
 /// has taken them.
 #[derive(Clone, Debug, Default)]
+#[deprecated(note = "use codec::Stream with imf::Messages")]
 pub struct Decoder {
     buf: Vec<u8>,
     checked: usize,
@@ -271,6 +475,7 @@ enum State {
     Failed(Error),
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -312,6 +517,7 @@ impl Decoder {
     /// The header, once its blank line has come. It returns `None` while
     /// it needs more bytes, and again after it has returned the header. It
     /// keeps returning the same error once the stream has broken.
+    #[deprecated(note = "use imf::Event::Header from codec::Stream<imf::Messages>")]
     pub fn header(&mut self) -> Option<Result<Header, Error>> {
         if matches!(self.state, State::Header) {
             self.advance();
@@ -378,6 +584,7 @@ impl Decoder {
     /// The body bytes that have come since the header, taken out of the
     /// decoder. Until [`Decoder::header`] has returned the header this is
     /// empty.
+    #[deprecated(note = "use imf::Event::Body or Messages::handoff_body and Stream::swap")]
     pub fn take_body(&mut self) -> Vec<u8> {
         match self.state {
             State::Body => std::mem::take(&mut self.buf),
@@ -1556,6 +1763,7 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the legacy API.
 mod tests {
     use super::*;
 

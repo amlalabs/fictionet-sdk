@@ -1,10 +1,12 @@
 //! Internet Message Format headers, addresses, dates, message IDs and
 //! encoded words, as a world playing a mail server reads them.
 #![no_main]
+#![allow(deprecated)] // Also exercise the unchanged compatibility API.
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::imf::{
-    DateTime, Decoder, ENCODED_LINE_LEN, Error, Header, MAX_HEADER_BYTES, decode_text, encode_text, parse_address_list,
-    parse_message_ids, split_message, write_address_list, write_message_ids,
+    DateTime, Decoder, ENCODED_LINE_LEN, Error, Header, MAX_HEADER_BYTES, Messages, decode_text, encode_text,
+    parse_address_list, parse_message_ids, split_message, write_address_list, write_message_ids,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -34,6 +36,16 @@ fn read_stream(data: &[u8], step: usize) -> (Option<Result<Header, Error>>, Vec<
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Messages::new, data);
+    contract::check_decode(|| Messages::with_limits(64, 7), data);
+    contract::check_wire::<Header>(data);
+    let mut built = Header::default();
+    built.push("Subject", &String::from_utf8_lossy(data.get(..4096).unwrap_or(data)));
+    contract::check_wire_value(&built);
+    let mut body = Wire::to_bytes(&Header::default()).unwrap();
+    body.extend_from_slice(data.get(..4096).unwrap_or(data));
+    contract::check_decode(|| Messages::with_limits(64, 7), &body);
+
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces with the body left to pile up. Each reads what split_message
     // reads.
