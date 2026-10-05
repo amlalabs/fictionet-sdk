@@ -6,6 +6,10 @@ use fictionet::stdlib::nfs::{
     DirOp, FileHandle, MAX_FH, MAX_NAME, MountRequest, MountResponse, NfsError, Request, Response, procedure,
 };
 use fictionet::stdlib::onc_rpc::{Body, Decoder, Message};
+use fictionet::stdlib::{
+    codec::{Decode, contract},
+    onc_rpc,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Reads `bytes` as the arguments and the results of procedure `p`. Any
@@ -54,6 +58,22 @@ fuzz_target!(|data: &[u8]| {
     // The bytes as a TCP stream of calls, split two ways: all at once,
     // and a byte at a time.
     let limit = 1 << 16;
+    contract::check_decode(|| onc_rpc::Fragments::with_limit(limit), data);
+    contract::check_decode(|| onc_rpc::records(limit), data);
+    contract::check_decode(
+        || {
+            onc_rpc::messages(limit).map(|message| {
+                message.map(|message| match message.body {
+                    Body::Call(call) => Some((message.xid, Request::parse(&call))),
+                    Body::Reply(_) => None,
+                })
+            })
+        },
+        data,
+    );
+    // NFS arguments need a procedure; Wire belongs to the RPC envelope.
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<onc_rpc::Record>(data);
     let mut whole = Decoder::with_limit(limit);
     whole.feed(data);
     let mut records = Vec::new();
@@ -72,6 +92,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Each record, and the bytes on their own as a UDP datagram.
     for bytes in records.iter().map(Vec::as_slice).chain([data]) {
+        contract::check_wire::<Message>(bytes);
         let Ok(Message { xid, body: Body::Call(call) }) = Message::parse(bytes) else { continue };
         // A request read makes the same call again.
         if let Ok(req) = Request::parse(&call) {

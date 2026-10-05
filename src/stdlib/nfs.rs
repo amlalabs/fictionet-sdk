@@ -19,6 +19,27 @@
 //! code. A world that plays a client writes calls with [`Request::call`]
 //! and reads results with [`Response::parse`].
 //!
+//! For TCP, [`onc_rpc::messages`](super::onc_rpc::messages) combines record
+//! marking, bounded assembly, and RPC parsing. Read NFS arguments with a
+//! closure. Procedure numbers remain ordinary arguments, outside [`Wire`](super::codec::Wire):
+//!
+//! ```
+//! use fictionet::stdlib::{codec::{Decode, Stream}, nfs, onc_rpc};
+//!
+//! let requests = onc_rpc::messages(onc_rpc::MAX_RECORD).map(|message| {
+//!     message.map(|message| match message.body {
+//!         onc_rpc::Body::Call(call) => {
+//!             // Route by program and version, and check RPC version first.
+//!             let request = nfs::Request::parse(&call);
+//!             Some((message.xid, call, request))
+//!         }
+//!         onc_rpc::Body::Reply(_) => None,
+//!     })
+//! });
+//! let mut stream = Stream::new(requests);
+//! assert!(stream.next().is_none());
+//! ```
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. File handles, names, paths, data and lists all have limits,
 //! given below as constants. The writers keep to those limits, so the
@@ -2710,6 +2731,30 @@ mod tests {
             let mut longer = args.clone();
             longer.extend_from_slice(&[0; 4]);
             assert_eq!(MountRequest::read(req.procedure(), &longer), Err(XdrError::Trailing(4)));
+        }
+    }
+
+    #[test]
+    fn requests_compose_with_codec_records() {
+        use crate::stdlib::{
+            codec::{Decode, Wire, contract},
+            onc_rpc,
+        };
+
+        const RECORD_LIMIT: usize = 4096;
+        let make = || {
+            onc_rpc::messages(RECORD_LIMIT).map(|message| {
+                message.map(|message| match message.body {
+                    Body::Call(call) => Some((message.xid, Request::read(call.procedure, &call.args))),
+                    Body::Reply(_) => None,
+                })
+            })
+        };
+        for request in requests() {
+            let message = request.call(19);
+            let bytes = <Message as Wire>::to_bytes(&message).unwrap();
+            contract::check_wire::<Message>(&bytes);
+            contract::check_decode(make, &onc_rpc::encode_fragments(&bytes, 5));
         }
     }
 
