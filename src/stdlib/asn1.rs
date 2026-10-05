@@ -679,7 +679,7 @@ impl Decode for Elements {
 /// into one element at a time. Feed it the bytes a connection reads, in
 /// order, and take elements out until it has none.
 ///
-/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Errors repeat and there is no EOF handling.
 /// Use [`super::codec::Stream`] with [`Elements`] for EOF and one-time errors.
 #[derive(Debug)]
 pub struct Decoder {

@@ -3,12 +3,13 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::{Oid, StringKind};
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Stream, contract, finish, pump};
 use fictionet::stdlib::x509::{
-    AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl, CrlDistributionPoints, CrlNumber,
-    CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName, IssuerAltName, KeyUsage, MAX_PEM_BUFFER, MAX_PEM_DATA,
-    Name, Pem, PemBlocks, PemDecoder, RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList,
-    TbsCertificate, Value, pem_decode,
+    AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl,
+    CrlDistributionPoints, CrlNumber, CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName,
+    IssuerAltName, KeyUsage, MAX_PEM_BUFFER, MAX_PEM_DATA, Name, Pem, PemBlocks, PemDecoder,
+    RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value,
+    pem_decode,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -149,6 +150,16 @@ fn der(data: &[u8]) {
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(PemBlocks::new, data);
     contract::check_decode(|| PemBlocks::with_limit(128), data);
+    // Accepted whole inputs fit below the stream's whole-block bound.
+    if data.len() <= MAX_PEM_BUFFER
+        && let Ok(expected) = pem_decode(data)
+    {
+        let mut stream = Stream::new(PemBlocks::new());
+        let mut actual = Vec::new();
+        pump(&mut stream, data, |block| actual.push(block)).unwrap();
+        finish(&mut stream, |block| actual.push(block)).unwrap();
+        assert_eq!(actual, expected);
+    }
     contract::check_wire::<Pem>(data);
     let block = Pem { label: "CERTIFICATE".into(), data: data.get(..MAX_PEM_DATA + 1).unwrap_or(data).to_vec() };
     contract::check_wire_value(&block);

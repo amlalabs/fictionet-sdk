@@ -745,6 +745,10 @@ fn write_resp(w: &mut Writer, t: &NegTokenResp) {
 /// negTokenInit or a negTokenResp, with a definite length; only its outer
 /// header is checked.
 pub fn token_len(b: &[u8]) -> Result<Option<usize>, Error> {
+    token_len_limited(b, MAX_TOKEN)
+}
+
+fn token_len_limited(b: &[u8], limit: usize) -> Result<Option<usize>, Error> {
     let Some(&first) = b.first() else { return Ok(None) };
     if !matches!(first, GSS_TAG | INIT_TAG | RESP_TAG) {
         return Err(Error::NotToken);
@@ -756,7 +760,7 @@ pub fn token_len(b: &[u8]) -> Result<Option<usize>, Error> {
     };
     let Length::Definite(n) = h.length else { return Err(Error::Indefinite) };
     let total = h.len.checked_add(n).ok_or(Error::TooLong)?;
-    if total > MAX_TOKEN {
+    if total > limit {
         return Err(Error::TooLong);
     }
     Ok(if b.len() >= total { Some(total) } else { None })
@@ -827,18 +831,41 @@ impl core::error::Error for EncodeError {}
 
 /// Reads complete tokens without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for a buffer limited to [`MAX_TOKEN`].
+/// Use with [`super::codec::Stream`] for a buffer bounded by the configured
+/// token limit, with at least 16 bytes to read or refuse any ASN.1 header.
 /// Only outer headers are checked. Map items through [`NegotiationToken::parse`]
 /// or [`InitialContextToken::parse`] to interpret them. Partial tokens return
 /// [`super::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
 
 impl Frames {
-    /// Creates a frame decoder with no retained state.
+    /// Creates a decoder accepting tokens up to [`MAX_TOKEN`] bytes.
     pub fn new() -> Self {
-        Self
+        Self::with_limit(MAX_TOKEN)
+    }
+
+    /// Sets the whole-token limit, clamped to [`MAX_TOKEN`].
+    /// Zero refuses every token. Oversized tokens are refused from
+    /// their headers, before their contents arrive.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_TOKEN),
+        }
+    }
+
+    /// The maximum token size, including its ASN.1 header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -848,11 +875,11 @@ impl Decode for Frames {
     const NAME: &'static str = "SPNEGO";
 
     fn capacity(&self) -> usize {
-        MAX_TOKEN
+        self.limit.max(16)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
-        Ok(match token_len(input)? {
+        Ok(match token_len_limited(input, self.limit)? {
             Some(n) => Step::Item(input.get(..n).ok_or(asn1::Error::Truncated)?.to_vec(), n),
             None => Step::Need,
         })
@@ -865,7 +892,7 @@ impl Decode for Frames {
 /// [`NegotiationToken::parse`] or [`InitialContextToken::parse`]. It holds
 /// at most [`MAX_TOKEN`] bytes not yet taken out.
 ///
-/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Errors repeat and there is no EOF handling.
 /// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Debug, Default)]
 pub struct Decoder {

@@ -58,7 +58,6 @@
 //! let mut decoder = Decoder::new();
 //! let mut got = Vec::new();
 //! for chunk in wire.chunks(5) {
-//!     #[allow(deprecated)] // Deliberately uses the compatibility decoder.
 //!     decoder.feed(chunk);
 //!     while let Some(m) = decoder.next_message() {
 //!         got.push(m.unwrap());
@@ -1265,18 +1264,39 @@ impl Wire for Frame {
 /// Reads Kerberos TCP records without holding input bytes.
 ///
 /// Use with [`super::codec::Stream`] for a buffer limited to
-/// [`TCP_HEADER_LEN`] plus [`MAX_MESSAGE`] bytes. The four-byte prefix
+/// [`TCP_HEADER_LEN`] plus the configured message limit. The four-byte prefix
 /// suffices to refuse reserved bits and oversized messages. Map each
 /// payload through [`Message::parse`] to interpret it. Partial records
 /// return [`super::codec::Step::Need`], including at EOF. The stream
 /// reports truncation at EOF and framing errors once.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
 
 impl Frames {
-    /// Creates a frame decoder with no retained state.
+    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
     pub fn new() -> Self {
-        Self
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the message limit, excluding the TCP header, clamped to
+    /// [`MAX_MESSAGE`]. Zero accepts only empty records.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
+    }
+
+    /// The maximum message size, excluding its TCP header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -1286,13 +1306,16 @@ impl Decode for Frames {
     const NAME: &'static str = "Kerberos TCP";
 
     fn capacity(&self) -> usize {
-        TCP_HEADER_LEN.saturating_add(MAX_MESSAGE)
+        TCP_HEADER_LEN.saturating_add(self.limit)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, FrameError> {
         let Some(&[a, b, c, d]) = input.get(..TCP_HEADER_LEN) else { return Ok(Step::Need) };
         let length = u32::from_be_bytes([a, b, c, d]);
         let n = frame_len(length)?;
+        if n > self.limit {
+            return Err(FrameError::TooLong(length));
+        }
         let total = TCP_HEADER_LEN.checked_add(n).ok_or(FrameError::TooLong(length))?;
         Ok(match input.get(TCP_HEADER_LEN..total) {
             Some(bytes) => Step::Item(bytes.to_vec(), total),
@@ -1312,7 +1335,7 @@ impl Decode for Frames {
 /// out after each `feed` holds at most one message beyond what one `feed`
 /// added.
 ///
-/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Errors repeat and there is no EOF handling.
 /// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
@@ -1337,7 +1360,6 @@ impl Decoder {
 
     /// Adds bytes read from the connection. After a bad length the stream
     /// cannot be read any further, and they are dropped.
-    #[deprecated(note = "use codec::Stream with kerberos::Frames for bounded input")]
     pub fn feed(&mut self, bytes: &[u8]) {
         if self.failed.is_some() || self.pending.is_some() {
             return;
@@ -1996,7 +2018,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn every_truncated_prefix_fails() {
         for m in all_messages() {
             let der = m.to_der().unwrap();
@@ -2034,7 +2055,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn decoder_splits_a_stream() {
         let msgs = all_messages();
         let stream: Vec<u8> = msgs.iter().flat_map(|m| m.to_tcp().unwrap()).collect();
@@ -2066,7 +2086,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn decoder_takes_many_small_messages_in_linear_time() {
         let one = Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_tcp().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
@@ -2082,7 +2101,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn decoder_drops_bytes_after_a_bad_header() {
         // A bad length is caught as it is fed, so what follows it is not
         // held even when the caller feeds without taking messages out.
@@ -2118,7 +2136,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn a_drained_decoder_lets_go_of_a_large_buffer() {
         let big = Message::ApRep(ApRep { enc_part: enc(18, None, &vec![0; MAX_MESSAGE - 100]) }).to_tcp().unwrap();
         let mut d = Decoder::new();
@@ -2278,7 +2295,6 @@ mod tests {
 
     /// Checks what can be read from `data` writes back, and returns how
     /// many messages it read.
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn check_any(data: &[u8]) -> usize {
         let mut read = 0;
         for rules in [Rules::Der, Rules::Ber] {
@@ -2332,7 +2348,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)] // Exercises the compatibility feed API.
     fn fuzz_loop() {
         let mut rng = Lcg(0x6b65_7262_6572_6f73);
         let mut seeds: Vec<Vec<u8>> = all_messages().iter().map(|m| m.to_der().unwrap()).collect();

@@ -2219,6 +2219,10 @@ const MAX_PEM_CHARS: usize = MAX_PEM_DATA.div_ceil(3) * 4;
 
 /// One PEM block: a label, such as `CERTIFICATE`, and the bytes its
 /// base64 holds.
+///
+/// [`Wire::parse`] accepts exactly one block with at most [`MAX_PEM_FRAME`]
+/// encoded bytes, including whitespace. [`pem_decode`] and [`PemDecoder`]
+/// do not impose this whole-block bound.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Pem {
     /// The label, from the `-----BEGIN` line.
@@ -2474,7 +2478,9 @@ impl Wire for Pem {
 
     /// Reads exactly one block bounded by [`MAX_PEM_FRAME`]. An optional
     /// final LF, CR, or CRLF is accepted. Surrounding text and other blocks
-    /// are refused. Decoded data is bounded by [`MAX_PEM_DATA`].
+    /// are refused. Decoded data is bounded by [`MAX_PEM_DATA`]. The encoded
+    /// size includes whitespace, unlike the bounds on [`pem_decode`] and
+    /// [`PemDecoder`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_PEM_FRAME {
             return Err(Error::TooLong);
@@ -2512,9 +2518,12 @@ impl Wire for Pem {
 
 /// Reads PEM blocks without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`]. The buffer holds at most the configured
-/// whole-block limit plus one byte, to refuse an oversized block. Text lines
-/// outside blocks are skipped. Partial blocks return [`super::codec::Step::Need`],
+/// Use with [`super::codec::Stream`]. The buffer holds at most the larger of
+/// the configured whole-block limit and [`MAX_PEM_LINE`], plus one byte to
+/// refuse oversized input. Blocks are bounded by [`MAX_PEM_FRAME`], including
+/// whitespace; [`pem_decode`] and [`PemDecoder`] have no whole-block bound.
+/// Text lines outside blocks are skipped, including the final line at EOF,
+/// and obey only [`MAX_PEM_LINE`]. Partial blocks return [`super::codec::Step::Need`],
 /// including at EOF, so the stream reports truncation. An end marker completes
 /// an item without consuming its optional line ending. Framing errors are
 /// reported once. Scan positions are relative to the unread start.
@@ -2533,7 +2542,8 @@ impl PemBlocks {
     }
 
     /// Sets the encoded block limit, clamped to [`MAX_PEM_FRAME`].
-    /// Zero refuses every block. Lines also obey [`MAX_PEM_LINE`].
+    /// Zero refuses every block. All lines obey [`MAX_PEM_LINE`]; text lines
+    /// outside blocks do not count against the block limit.
     pub fn with_limit(limit: usize) -> Self {
         Self { limit: limit.min(MAX_PEM_FRAME), line: 0, searched: 0, label_end: None }
     }
@@ -2562,13 +2572,13 @@ impl Decode for PemBlocks {
     const NAME: &'static str = "PEM";
 
     fn capacity(&self) -> usize {
-        self.limit.saturating_add(1)
+        self.limit.max(MAX_PEM_LINE).saturating_add(1)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<DecodeStep<Pem>, Error> {
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<DecodeStep<Pem>, Error> {
         // Bound direct calls as well as Stream input. Do not inspect a later
         // block before returning the current item.
-        let input = input.get(..self.limit.saturating_add(1)).unwrap_or(input);
+        let input = input.get(..self.capacity()).unwrap_or(input);
         loop {
             let rest = input.get(self.line..).ok_or(Error::Pem)?;
             if let Some(label_end) = self.label_end {
@@ -2591,29 +2601,33 @@ impl Decode for PemBlocks {
                 .and_then(|b| b.iter().position(|c| matches!(c, b'\n' | b'\r')))
                 .map(|n| self.searched.saturating_add(n));
             let Some(end) = newline else {
-                if rest.len() > MAX_PEM_LINE || input.len() > self.limit {
+                if rest.len() > MAX_PEM_LINE
+                    || (self.label_end.is_some() && input.len() > self.limit)
+                {
                     return Err(Error::TooLong);
+                }
+                if eof && self.label_end.is_none() && !input.is_empty() {
+                    self.reset();
+                    return Ok(DecodeStep::Skip(input.len()));
                 }
                 self.searched = input.len();
                 return Ok(DecodeStep::Need);
             };
-            if end.saturating_sub(self.line) > MAX_PEM_LINE || end >= self.limit {
+            if end.saturating_sub(self.line) > MAX_PEM_LINE {
                 return Err(Error::TooLong);
             }
             if self.label_end.is_none() {
                 let line = input.get(..end).ok_or(Error::Pem)?;
-                let trimmed = line.iter().rposition(|c| !matches!(c, b' ' | b'\t')).map_or(0, |n| n.saturating_add(1));
-                let label = line
-                    .get(..trimmed)
-                    .and_then(|b| b.strip_prefix(PEM_BEGIN))
-                    .and_then(|b| b.strip_suffix(PEM_DASHES));
-                match label.filter(|label| valid_label(label)) {
+                match begin_label(line) {
                     Some(label) => self.label_end = Some(PEM_BEGIN.len().saturating_add(label.len())),
                     None => {
                         self.reset();
                         return Ok(DecodeStep::Skip(end.saturating_add(1)));
                     }
                 }
+            }
+            if end >= self.limit {
+                return Err(Error::TooLong);
             }
             self.line = end.saturating_add(1);
             self.searched = self.line;
@@ -2626,7 +2640,7 @@ impl Decode for PemBlocks {
 /// order, and take blocks out until it has none. It holds at most
 /// [`MAX_PEM_BUFFER`] bytes it has not read, and one block's base64.
 ///
-/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Errors repeat and there is no EOF handling.
 /// Use [`super::codec::Stream`] with [`PemBlocks`] for EOF and one-time errors.
 #[derive(Debug, Default)]
 pub struct PemDecoder {
@@ -4290,13 +4304,30 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
 
     #[test]
     fn codec_pem_scans_without_retaining_partial_bytes() {
-        use super::super::codec::{Decode, Fail, Stream, contract, pump};
+        use super::super::codec::{Decode, Fail, Stream, contract, finish, pump};
         let text = b"-----BEGIN TEST-----\r\nAQID\r\n-----END TEST-----\r\n";
         contract::check_decode(PemBlocks::new, text);
         for limit in 0..=text.len() {
             contract::check_decode(|| PemBlocks::with_limit(limit), text);
         }
         assert_eq!(PemBlocks::with_limit(usize::MAX).limit(), MAX_PEM_FRAME);
+        for text in [
+            &b"-----BEGIN TEST-----\nAQID\n-----END TEST-----\n# trailing comment"[..],
+            b"-----BEGIN TEST-----\nAQID\n-----END TEST-----  ",
+            b"-----BEGIN TEST-----\nAQID\n-----END TEST-----\t",
+            b"just text",
+        ] {
+            contract::check_decode(PemBlocks::new, text);
+            let mut stream = Stream::new(PemBlocks::new());
+            let mut blocks = Vec::new();
+            for byte in text {
+                pump(&mut stream, core::slice::from_ref(byte), |p| blocks.push(p)).unwrap();
+                assert_eq!(stream.held(), 0);
+            }
+            assert_eq!(finish(&mut stream, |p| blocks.push(p)), Ok(()));
+            assert_eq!(blocks, pem_decode(text).unwrap());
+            assert_eq!(stream.buffered(), 0);
+        }
         let mut stream = Stream::new(PemBlocks::new());
         let partial = b"-----BEGIN TEST-----\nAQID\n";
         for byte in partial {

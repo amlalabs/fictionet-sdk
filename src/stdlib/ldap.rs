@@ -2414,6 +2414,11 @@ impl Wire for Message {
 /// Use with [`super::codec::Stream`] for bounded input. Partial messages
 /// return [`super::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and errors once. A malformed message ends the stream.
+/// This includes a well-framed message that [`Message::parse`] rejects:
+/// [RFC 4511 section 4.1.1](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.1.1)
+/// requires termination for malformed envelopes and encodings. For parsing
+/// failures as individual items, use
+/// `asn1::Elements::new(Rules::Ber).map(|bytes| Message::parse(&bytes))`.
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
     limit: usize,
@@ -2488,7 +2493,7 @@ impl Decode for Frames {
 /// and says how much that was; once the held bytes are a whole message,
 /// taking it out makes room for more.
 ///
-/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Errors repeat and there is no EOF handling.
 /// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Clone, Debug)]
 pub struct Decoder {

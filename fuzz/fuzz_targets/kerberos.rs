@@ -38,7 +38,6 @@ fn round_trip(b: &[u8]) {
 /// (all at once if it is empty), taking messages out after every
 /// `drain_every` feeds. It returns the records up to and including the
 /// first error, and checks that once a length is bad, nothing more is held.
-#[allow(deprecated)] // Exercises the compatibility feed API.
 fn split(data: &[u8], sizes: &[usize], drain_every: usize) -> Vec<Result<Vec<u8>, FrameError>> {
     let mut d = Decoder::new();
     let mut out = Vec::new();
@@ -121,7 +120,6 @@ fuzz_target!(|data: &[u8]| {
     // A record framed for TCP comes back out whole.
     if let Ok(f) = frame(data) {
         let mut d = Decoder::new();
-        #[allow(deprecated)] // Exercises the compatibility feed API.
         d.feed(&f);
         assert_eq!(d.next_message(), Some(Ok(data.to_vec())));
     }

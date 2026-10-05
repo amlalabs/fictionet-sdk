@@ -279,6 +279,135 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
 }
 
 #[test]
+fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
+    let text = x509::Pem {
+        label: "TEST".into(),
+        data: vec![1, 2, 3],
+    }
+    .encode()?;
+    for input in [
+        format!("{text}# trailing comment"),
+        format!("{}  ", text.trim_end_matches('\n')),
+        format!("{}\t", text.trim_end_matches('\n')),
+        "just text".into(),
+    ] {
+        let expected = x509::pem_decode(input.as_bytes())?;
+        round_trip(x509::PemBlocks::new, input.as_bytes(), &expected);
+    }
+    truncated(x509::PemBlocks::new, b"-----BEGIN TEST-----\nAQID");
+    Ok(())
+}
+
+#[test]
+fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error::Error>> {
+    let text = x509::Pem {
+        label: "TEST".into(),
+        data: vec![1, 2, 3],
+    }
+    .encode()?;
+    let limit = text.len() - 1;
+    let comment = "#".repeat(128);
+    let input = format!("{comment}\n{text}{comment}\n{text}{comment}");
+    round_trip(
+        || x509::PemBlocks::with_limit(limit),
+        input.as_bytes(),
+        &x509::pem_decode(input.as_bytes())?,
+    );
+    refused(
+        || x509::PemBlocks::with_limit(limit - 1),
+        text.as_bytes(),
+        x509::Error::TooLong,
+    );
+
+    let mut line = vec![b'#'; x509::MAX_PEM_LINE];
+    round_trip(|| x509::PemBlocks::with_limit(0), &line, &[]);
+    line.push(b'\n');
+    round_trip(|| x509::PemBlocks::with_limit(0), &line, &[]);
+    *line.last_mut().unwrap() = b'#';
+    refused(
+        || x509::PemBlocks::with_limit(0),
+        &line,
+        x509::Error::TooLong,
+    );
+    line.push(b'\n');
+    refused(
+        || x509::PemBlocks::with_limit(0),
+        &line,
+        x509::Error::TooLong,
+    );
+    Ok(())
+}
+
+#[test]
+fn frame_limits_refuse_lengths_before_bodies() {
+    for limit in [0, 1, 2, 15, 16, 32] {
+        refused(
+            || ocsp::Frames::with_limit(limit),
+            &[0x30, 0x81, 0x80],
+            ocsp::Error::TooLong,
+        );
+        refused(
+            || spnego::Frames::with_limit(limit),
+            &[0xa1, 0x81, 0x80],
+            spnego::Error::TooLong,
+        );
+        refused(
+            || kerberos::Frames::with_limit(limit),
+            &[0, 0, 0, 128],
+            kerberos::FrameError::TooLong(128),
+        );
+        assert_eq!(ocsp::Frames::with_limit(limit).capacity(), limit.max(16));
+        assert_eq!(spnego::Frames::with_limit(limit).capacity(), limit.max(16));
+        assert_eq!(kerberos::Frames::with_limit(limit).capacity(), limit + 4);
+    }
+    refused(
+        || ocsp::Frames::with_limit(0),
+        &[0x30, 0],
+        ocsp::Error::TooLong,
+    );
+    refused(
+        || spnego::Frames::with_limit(0),
+        &[0xa1, 0],
+        spnego::Error::TooLong,
+    );
+    round_trip(|| ocsp::Frames::with_limit(2), &[0x30, 0], &[vec![0x30, 0]]);
+    round_trip(
+        || spnego::Frames::with_limit(2),
+        &[0xa1, 0],
+        &[vec![0xa1, 0]],
+    );
+    round_trip(|| kerberos::Frames::with_limit(0), &[0, 0, 0, 0], &[vec![]]);
+    round_trip(
+        || kerberos::Frames::with_limit(1),
+        &[0, 0, 0, 1, 42],
+        &[vec![42]],
+    );
+    assert_eq!(
+        ocsp::Frames::with_limit(usize::MAX).limit(),
+        ocsp::MAX_MESSAGE
+    );
+    assert_eq!(
+        spnego::Frames::with_limit(usize::MAX).limit(),
+        spnego::MAX_TOKEN
+    );
+    assert_eq!(
+        kerberos::Frames::with_limit(usize::MAX).limit(),
+        kerberos::MAX_MESSAGE
+    );
+    assert_eq!(ocsp::Frames::default().limit(), ocsp::MAX_MESSAGE);
+    assert_eq!(spnego::Frames::default().limit(), spnego::MAX_TOKEN);
+    assert_eq!(kerberos::Frames::default().limit(), kerberos::MAX_MESSAGE);
+}
+
+#[test]
+#[deny(deprecated)]
+fn kerberos_legacy_feed_remains_available() {
+    let mut decoder = kerberos::Decoder::new();
+    decoder.feed(&[0, 0, 0, 1, 42]);
+    assert_eq!(decoder.next_message(), Some(Ok(vec![42])));
+}
+
+#[test]
 fn kerberos_tcp_messages_round_trip() -> Result<(), Box<dyn core::error::Error>> {
     let message = kerberos::Message::ApRep(kerberos::ApRep {
         enc_part: kerberos::EncryptedData {
