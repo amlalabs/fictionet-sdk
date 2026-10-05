@@ -1,9 +1,10 @@
 //! SMTP commands, replies, DATA and stream chunking invariance.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::smtp::{
     Command, CommandDecoder, Error, MAX_BUFFERED, MAX_DATA, Reply, ReplyDecoder, Request,
-    write_data,
+    Replies, Server, write_data,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -67,6 +68,18 @@ fn message(data: &[u8], size: usize) -> Option<Result<Vec<u8>, Error>> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Server::new, data);
+    contract::check_decode(Replies::new, data);
+    contract::check_decode(
+        || {
+            let mut server = Server::new();
+            server.start_data().unwrap();
+            server
+        },
+        data,
+    );
+    contract::check_wire::<Command>(data);
+    contract::check_wire::<Reply>(data);
     let got = commands(data, data.len(), true);
     for (size, drain) in [(1, true), (7, false), (MAX_BUFFERED + 1, false)] {
         assert_eq!(commands(data, size, drain), got);
@@ -101,6 +114,7 @@ fuzz_target!(|data: &[u8]| {
         .split_once(' ')
         .map_or((text.as_ref(), None), |(v, a)| (v, Some(a)));
     let command = Command::new(verb, arg);
+    contract::check_wire_value(&command);
     if let Ok(bytes) = command.to_bytes() {
         let mut expected = command;
         expected.verb.make_ascii_uppercase();
@@ -110,6 +124,10 @@ fuzz_target!(|data: &[u8]| {
         code: 250,
         lines: text.split('\n').map(str::to_string).collect(),
     };
+    contract::check_wire_value(&reply);
+    if let Ok(bytes) = Wire::to_bytes(&reply) {
+        contract::check_decode(Replies::new, &bytes);
+    }
     if let Ok(bytes) = reply.to_bytes() {
         assert_eq!(Reply::parse(&bytes), Ok(Some((reply, bytes.len()))));
     }

@@ -2,7 +2,11 @@
 //! them, and as a world playing a client reads the server's.
 #![no_main]
 
-use fictionet::stdlib::imap::{Command, Decoder, Error, Event, Response, ResponseDecoder};
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::imap::{
+    Command, Commands, Decoder, Error, Event, MAX_LITERAL, MAX_TEXT,
+    Response, ResponseDecoder, Responses, Value,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Every event a decoder gives, fed `data` in chunks of `step` bytes,
@@ -66,11 +70,30 @@ fn responses(data: &[u8], step: usize) -> Vec<Result<Response, Error>> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Commands::new, data);
+    contract::check_decode(Responses::new, data);
+    contract::check_wire::<Command>(data);
+    contract::check_wire::<Response>(data);
+    contract::check_wire_value(&Command::new(
+        "a",
+        "APPEND",
+        vec![Value::Literal {
+            data: data.get(..MAX_LITERAL + 1).unwrap_or(data).to_vec(),
+            non_sync: data.first().is_some_and(|b| b & 1 == 1),
+        }],
+    ));
+    contract::check_wire_value(&Response::greeting(&String::from_utf8_lossy(
+        data.get(..MAX_TEXT + 1).unwrap_or(data),
+    )));
     // The stream, split two ways: all at once, and a byte at a time.
     let whole = events(data, data.len());
     assert_eq!(whole, events(data, 1));
     for e in whole.iter().flatten() {
         if let Event::Command(c) = e {
+            contract::check_wire_value(c);
+            if let Ok(bytes) = Wire::to_bytes(c) {
+                contract::check_decode(Commands::new, &bytes);
+            }
             // A command read can be written, and reads back the same.
             let bytes = c.to_bytes();
             assert_eq!(&Command::parse(&bytes).unwrap(), c);
@@ -82,6 +105,7 @@ fuzz_target!(|data: &[u8]| {
     let whole = responses(data, data.len());
     assert_eq!(whole, responses(data, 1));
     for r in whole.iter().flatten() {
+        contract::check_wire_value(r);
         let bytes = r.to_bytes();
         assert_eq!(&Response::parse(&bytes).unwrap(), r);
         assert_eq!(responses(&bytes, bytes.len()), vec![Ok(r.clone())]);

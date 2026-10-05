@@ -2,9 +2,11 @@
 //! reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::pop3::{
     Command, CommandDecoder, MAX_AUTH_LINE, MAX_COMMAND_LINE, Reply, ReplyDecoder, Request,
-    parse_scan_listing, parse_unique_id_listing, write_scan_listing, write_unique_id_listing,
+    Commands, Replies, MAX_EXPECTATIONS, parse_scan_listing, parse_unique_id_listing,
+    write_scan_listing, write_unique_id_listing,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -14,6 +16,21 @@ fn multi_line(i: usize) -> bool {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Commands::new, data);
+    for multi in [false, true] {
+        contract::check_decode(
+            || {
+                let mut replies = Replies::new();
+                for _ in 0..MAX_EXPECTATIONS {
+                    replies.expect(multi).unwrap();
+                }
+                replies
+            },
+            data,
+        );
+    }
+    contract::check_wire::<Command>(data);
+    contract::check_wire::<Reply>(data);
     // The stream as commands, split two ways: all at once, and a byte at a
     // time. A bad line spoils only itself, so every result is kept.
     let mut whole = CommandDecoder::new();
@@ -132,6 +149,21 @@ fuzz_target!(|data: &[u8]| {
         },
     };
     let has_body = reply.ok && reply.body.is_some();
+    contract::check_wire_value(&reply);
+    contract::check_wire_value(&Command {
+        keyword: sa.to_string(),
+        argument: Some(sb.to_string()),
+    });
+    if let Ok(bytes) = Wire::to_bytes(&reply) {
+        contract::check_decode(
+            || {
+                let mut replies = Replies::new();
+                replies.expect(has_body).unwrap();
+                replies
+            },
+            &bytes,
+        );
+    }
     let bytes = reply.to_bytes();
     let (back, used) = Reply::parse(&bytes, has_body).unwrap().unwrap();
     assert_eq!(used, bytes.len());
