@@ -1,11 +1,13 @@
 //! Protobuf messages and their gRPC and delimited framing, as a world
 //! playing a gRPC server reads them.
 #![no_main]
+#![allow(deprecated)] // This target also checks the compatibility API.
 
 use std::collections::BTreeMap;
 
 use fictionet::stdlib::protobuf::{Decoder, Frame, Framing, MAX_BUFFERED, MAX_FIELDS, Message, Value};
 use libfuzzer_sys::fuzz_target;
+use fictionet::stdlib::codec::contract;
 
 // Counts fields as MAX_FIELDS does: group members included.
 fn total_fields(m: &Message) -> usize {
@@ -13,6 +15,12 @@ fn total_fields(m: &Message) -> usize {
 }
 
 fuzz_target!(|data: &[u8]| {
+    use fictionet::stdlib::protobuf::{DelimitedFrame, Frames};
+    contract::check_decode(|| Frames::new(Framing::Grpc), data);
+    contract::check_decode(|| Frames::new(Framing::Delimited), data);
+    contract::check_wire::<Frame>(data);
+    contract::check_wire::<DelimitedFrame>(data);
+    contract::check_wire::<Message>(data);
     // Any bytes as a message: what parses writes, and reads back the same.
     if let Ok(m) = Message::parse(data) {
         let bytes = m.to_bytes().unwrap();
@@ -82,6 +90,8 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(frames, third);
 
         for f in &frames {
+            contract::check_wire_value(f);
+            contract::check_wire_value(&DelimitedFrame(f.clone()));
             // A frame read can be written, and reads back the same.
             let bytes = f.to_bytes(framing).unwrap();
             assert_eq!(Frame::parse(framing, &bytes), Ok(Some((f.clone(), bytes.len()))));

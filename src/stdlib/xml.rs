@@ -30,7 +30,12 @@
 //! from a DTD count toward the size cap too, so a short declaration used on
 //! many elements cannot grow the events past it.
 //!
+//! Use [`Frames`] with [`codec::Stream`] for bounded event decoding.
+//! [`Frame`] implements [`Wire`] for complete documents without losing bytes.
+//! The deprecated [`Parser`] keeps its original buffering and errors.
+//!
 //! ```
+//! # #![allow(deprecated)]
 //! use fictionet::stdlib::xml::{Event, Parser, Writer};
 //!
 //! let mut parser = Parser::new();
@@ -67,6 +72,15 @@
 //! assert_eq!(w.finish().unwrap(), r#"<reply ok="a&quot;b">1 &amp; 2</reply>"#);
 //! ```
 
+extern crate alloc;
+
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use super::codec::{self, Decode, Wire};
+
 /// The largest document a [`Parser`] reads or a [`Writer`] writes, in
 /// bytes.
 pub const MAX_DOCUMENT: usize = 4 << 20;
@@ -87,8 +101,8 @@ pub const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 /// The namespace of `xmlns` attributes, which declare namespaces.
 pub const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::sync::Arc;
 
 /// A name as written, split at its colon, with the namespace it resolves
 /// to.
@@ -248,6 +262,8 @@ pub enum ErrorKind {
     /// The input ended inside markup, with elements still open, or before
     /// any root element.
     UnexpectedEnd,
+    /// EOF arrived with an element still open in [`Frames`].
+    Incomplete,
     /// The document is longer than [`MAX_DOCUMENT`], or the attribute
     /// defaults it supplies add up to more than that. For a [`Writer`], the
     /// piece would not fit with the end tags of the open elements.
@@ -264,8 +280,8 @@ pub enum ErrorKind {
     TooManyNamespaces,
 }
 
-impl std::fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             ErrorKind::InvalidUtf8 => "not UTF-8",
             ErrorKind::InvalidChar => "a character XML does not allow",
@@ -286,6 +302,7 @@ impl std::fmt::Display for ErrorKind {
             ErrorKind::UndeclaredPrefix => "an undeclared namespace prefix",
             ErrorKind::BadNamespace => "a forbidden namespace declaration",
             ErrorKind::UnexpectedEnd => "the input ended early",
+            ErrorKind::Incomplete => "the input ended with an open element",
             ErrorKind::TooLarge => "a document over the size limit",
             ErrorKind::TooDeep => "elements nested past the depth limit",
             ErrorKind::NameTooLong => "a name over the length limit",
@@ -295,7 +312,7 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
-impl std::error::Error for ErrorKind {}
+impl core::error::Error for ErrorKind {}
 
 /// Why a document is not well formed, and where. Once a parser gives an
 /// error, the document cannot be read any further.
@@ -308,13 +325,202 @@ pub struct Error {
     pub offset: usize,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{} at byte {}", self.kind, self.offset)
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
+
+/// One complete XML document in its original wire form.
+///
+/// Keeping the bytes preserves declarations and spacing that [`Event`]
+/// intentionally omits. [`Wire`] validates the complete document and
+/// refuses trailing content outside XML's document grammar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    /// The document bytes, bounded by [`MAX_DOCUMENT`] when parsed or written.
+    pub data: Vec<u8>,
+}
+
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        parse(input)?;
+        Ok(Self {
+            data: input.to_vec(),
+        })
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        parse(&self.data)?;
+        out.extend_from_slice(&self.data);
+        Ok(())
+    }
+}
+
+/// Reads XML events from caller-owned input.
+///
+/// The document and each token are bounded by [`MAX_DOCUMENT`]. Scanning
+/// resumes where it stopped when more bytes arrive. EOF completes final
+/// text. Partial markup returns [`codec::Step::Need`]; an open element
+/// returns [`ErrorKind::Incomplete`]. Syntax and limit errors are terminal.
+/// Capacity is [`MAX_DOCUMENT`] plus one byte to detect overflow.
+/// Use [`codec::Stream`] for bounded buffering and one-time errors.
+#[derive(Clone, Debug, Default)]
+pub struct Frames {
+    offset: usize,
+    state_held: usize,
+    declarations_held: usize,
+    bom_checked: bool,
+    pending: Option<Event>,
+    scan: Scan,
+    doc: Doc,
+}
+
+impl Frames {
+    /// Starts a document within the module's named limits.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn error(&self, kind: ErrorKind) -> Error {
+        Error {
+            kind,
+            offset: self.offset,
+        }
+    }
+
+    fn consume(&mut self, n: usize) {
+        self.offset += n;
+        self.scan = Scan::default();
+        self.update_held();
+    }
+
+    fn update_held(&mut self) {
+        // Shared namespace text is counted once in interned. Names and
+        // bindings are bounded by the document, depth, and namespace caps.
+        let names = self.doc.stack.iter().fold(0usize, |n, open| {
+            n.saturating_add(open.qname.len())
+                .saturating_add(open.name.local.len())
+                .saturating_add(open.name.prefix.as_ref().map_or(0, String::len))
+                .saturating_add(open.bound.iter().map(String::len).sum::<usize>())
+        });
+        let namespaces = self.doc.interned.keys().map(|s| s.len()).sum::<usize>();
+        let prefixes = self.doc.scope.keys().map(String::len).sum::<usize>();
+        let pending = match &self.pending {
+            Some(Event::End(n)) => {
+                n.local.len()
+                    + n.prefix.as_ref().map_or(0, String::len)
+                    + n.namespace.as_ref().map_or(0, |s| s.len())
+            }
+            _ => 0,
+        };
+        self.state_held = names
+            .saturating_add(namespaces)
+            .saturating_add(prefixes)
+            .saturating_add(self.declarations_held)
+            .saturating_add(pending);
+    }
+
+    fn need(&self, input: &[u8], eof: bool) -> Result<codec::Step<Event>, Error> {
+        if self.offset.saturating_add(input.len()) > MAX_DOCUMENT {
+            return Err(self.error(ErrorKind::TooLarge));
+        }
+        if eof && !self.doc.stack.is_empty() {
+            return Err(self.error(ErrorKind::Incomplete));
+        }
+        Ok(codec::Step::Need)
+    }
+}
+
+impl Decode for Frames {
+    type Item = Event;
+    type Error = Error;
+    const NAME: &'static str = "XML";
+
+    fn capacity(&self) -> usize {
+        MAX_DOCUMENT + 1
+    }
+
+    fn held(&self) -> usize {
+        self.state_held
+            .saturating_add(XML_NAMESPACE.len() + XMLNS_NAMESPACE.len())
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Event>, Error> {
+        if let Some(event) = self.pending.take() {
+            self.update_held();
+            return Ok(codec::Step::Item(event, 0));
+        }
+        if input.is_empty() {
+            if eof && self.offset > 0 && !self.doc.root_seen {
+                return Err(self.error(ErrorKind::UnexpectedEnd));
+            }
+            return self.need(input, eof);
+        }
+        // Do not let bytes beyond the document cap complete a token.
+        let room = MAX_DOCUMENT.saturating_sub(self.offset);
+        let rest = input.get(..input.len().min(room)).unwrap_or_default();
+        let finished = eof && input.len() <= room;
+        if !self.bom_checked {
+            match prefix_state(rest, b"\xEF\xBB\xBF") {
+                None => return self.need(input, eof),
+                Some(true) => {
+                    self.bom_checked = true;
+                    self.consume(3);
+                    return Ok(codec::Step::Skip(3));
+                }
+                Some(false) => self.bom_checked = true,
+            }
+        }
+        let kind = match token_kind(rest) {
+            Some(k) => k.map_err(|k| self.error(k))?,
+            None => return self.need(input, eof),
+        };
+        let len = match find_end(rest, kind, &mut self.scan, finished).map_err(|k| self.error(k))? {
+            Some(len) if len > 0 => len,
+            _ => return self.need(input, eof),
+        };
+        let tok = core::str::from_utf8(rest.get(..len).unwrap_or_default())
+            .map_err(|_| self.error(ErrorKind::InvalidUtf8))?;
+        if !tok.chars().all(is_xml_char) {
+            return Err(self.error(ErrorKind::InvalidChar));
+        }
+        let empty = kind == Kind::StartTag && tok.ends_with("/>");
+        let event = read_token(&mut self.doc, kind, tok).map_err(|k| self.error(k))?;
+        if kind == Kind::Doctype {
+            // The DTD table is set once. Do not walk it on every token.
+            self.declarations_held = self.doc.attlists.iter().fold(0usize, |n, (name, list)| {
+                n.saturating_add(name.len())
+                    .saturating_add(list.types.keys().map(String::len).sum::<usize>())
+                    .saturating_add(
+                        list.defaults
+                            .iter()
+                            .map(|(k, v)| k.len() + v.len())
+                            .sum::<usize>(),
+                    )
+            });
+        }
+        if let Some(Event::Start(start)) = &event
+            && empty
+        {
+            let name = self
+                .doc
+                .end(&start.name.qname())
+                .map_err(|k| self.error(k))?;
+            self.pending = Some(Event::End(name));
+        }
+        self.consume(len);
+        Ok(match event {
+            Some(event) => codec::Step::Item(event, len),
+            None => codec::Step::Skip(len),
+        })
+    }
+}
 
 /// A pull parser. Feed it a document's bytes, in order and in pieces of any
 /// size, call [`Parser::finish`] when they end, and take events out until
@@ -324,6 +530,7 @@ impl std::error::Error for Error {}
 /// parser holds at most [`MAX_DOCUMENT`] bytes, and scans each byte a
 /// bounded number of times, however the input arrives.
 #[derive(Clone, Debug, Default)]
+#[deprecated(note = "use codec::Stream with xml::Frames")]
 pub struct Parser {
     buf: Vec<u8>,
     /// Where the next token starts in `buf`.
@@ -370,6 +577,7 @@ enum Step {
     More,
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Parser {
     /// A parser at the start of a document.
     pub fn new() -> Parser {
@@ -508,7 +716,7 @@ impl Parser {
             None if finished => return Err(ErrorKind::UnexpectedEnd),
             None => return Ok(Step::More),
         };
-        let tok = std::str::from_utf8(&rest[..len]).map_err(|_| ErrorKind::InvalidUtf8)?;
+        let tok = core::str::from_utf8(&rest[..len]).map_err(|_| ErrorKind::InvalidUtf8)?;
         if !tok.chars().all(is_xml_char) {
             return Err(ErrorKind::InvalidChar);
         }
@@ -528,6 +736,7 @@ impl Parser {
 }
 
 /// Reads a whole document at once: its events, or the first error.
+#[allow(deprecated)] // Preserve the one-shot parser behavior.
 pub fn parse(document: &[u8]) -> Result<Vec<Event>, Error> {
     let mut p = Parser::new();
     p.feed(document);
@@ -1474,7 +1683,7 @@ struct Doc {
     bindings: usize,
     /// Each URI bound now, with the shared copy and how many bindings
     /// hold it.
-    interned: HashMap<Arc<str>, (Arc<str>, usize)>,
+    interned: BTreeMap<Arc<str>, (Arc<str>, usize)>,
     xml_ns: Arc<str>,
     xmlns_ns: Arc<str>,
     /// The attribute declarations of the internal subset, by element name.
@@ -1492,7 +1701,7 @@ impl Default for Doc {
             stack: Vec::new(),
             scope: BTreeMap::new(),
             bindings: 0,
-            interned: HashMap::new(),
+            interned: BTreeMap::new(),
             xml_ns: Arc::from(XML_NAMESPACE),
             xmlns_ns: Arc::from(XMLNS_NAMESPACE),
             attlists: BTreeMap::new(),
@@ -1897,7 +2106,7 @@ impl Writer {
         let (started, root_seen) = (self.doc.started, self.doc.root_seen);
         let mut hints: Vec<Arc<str>> = Vec::new();
         if let Some(e) = expect {
-            let names = std::iter::once(&e.name).chain(e.attributes.iter().map(|a| &a.name));
+            let names = core::iter::once(&e.name).chain(e.attributes.iter().map(|a| &a.name));
             for ns in names.filter_map(|n| n.namespace.as_ref()) {
                 if !hints.iter().any(|h| Arc::ptr_eq(h, ns)) {
                     hints.push(ns.clone());
@@ -2096,6 +2305,7 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 

@@ -29,7 +29,12 @@
 //! at most [`MAX_DEPTH`] deep. Writers keep to the same limits, so whatever they write, the
 //! parser reads back.
 //!
+//! Use [`Frames`] with [`super::codec::Stream`] for bounded framing.
+//! [`Wire`] reads complete messages, gRPC frames, and [`DelimitedFrame`]s.
+//! The deprecated [`Decoder`] keeps its original buffering and errors.
+//!
 //! ```
+//! # #![allow(deprecated)]
 //! use fictionet::stdlib::protobuf::{Decoder, Frame, Framing, Message};
 //!
 //! // A gRPC request carrying `{ name: "tank-3", level: 150 }`, where
@@ -51,6 +56,11 @@
 //! let bytes = Frame { compressed: false, data }.to_bytes(Framing::Grpc).unwrap();
 //! assert_eq!(bytes[..5], [0, 0, 0, 0, 7]);
 //! ```
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use super::codec::{Decode, Step, Wire};
 
 /// The largest message, in bytes, that this module reads or writes. It is
 /// the default limit on a received message in gRPC (4 MiB).
@@ -124,8 +134,8 @@ pub enum Error {
     Compressed,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Truncated => write!(f, "protobuf: the bytes end inside a field"),
             Error::VarintOverflow => write!(f, "protobuf: a varint is longer than 64 bits"),
@@ -143,7 +153,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Reads the varint at the start of `b`. It returns the value and how many
 /// bytes it took. Varints may carry extra zero groups (an overlong
@@ -368,7 +378,7 @@ impl Message {
         let mut last = None;
         for v in self.all(number) {
             if let Value::Bytes(b) = v {
-                last = Some(std::str::from_utf8(b).map_err(|_| Error::Utf8)?);
+                last = Some(core::str::from_utf8(b).map_err(|_| Error::Utf8)?);
             }
         }
         Ok(last)
@@ -435,7 +445,7 @@ impl Message {
         let mut out = Vec::new();
         for v in self.all(number) {
             if let Value::Bytes(b) = v {
-                out.push(std::str::from_utf8(b).map_err(|_| Error::Utf8)?);
+                out.push(core::str::from_utf8(b).map_err(|_| Error::Utf8)?);
             }
         }
         Ok(out)
@@ -842,12 +852,166 @@ impl Frame {
     }
 }
 
+/// Why an exact framed parse failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// Invalid framing or incomplete input.
+    Frame(Error),
+    /// Bytes followed the first complete frame.
+    Trailing {
+        /// The number of bytes after the frame.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Trailing { remaining } => {
+                write!(f, "trailing bytes after the frame: {remaining}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+fn exact_frame(framing: Framing, input: &[u8]) -> Result<Frame, FrameParseError> {
+    match Frame::parse(framing, input).map_err(FrameParseError::Frame)? {
+        Some((frame, used)) if used == input.len() => Ok(frame),
+        Some((_, used)) => Err(FrameParseError::Trailing {
+            remaining: input.len().saturating_sub(used),
+        }),
+        None => Err(FrameParseError::Frame(Error::Truncated)),
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = Error;
+
+    /// Reads exactly one gRPC frame. The inherent parser still takes a framing.
+    fn parse(input: &[u8]) -> Result<Self, FrameParseError> {
+        exact_frame(Framing::Grpc, input)
+    }
+
+    /// Appends one gRPC frame. Refuses oversized bodies before changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes(Framing::Grpc)?);
+        Ok(())
+    }
+}
+
+/// A frame whose [`Wire`] form uses a varint length instead of gRPC framing.
+/// Compressed values are refused by the writer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DelimitedFrame(
+    /// The message bytes and compression flag.
+    pub Frame,
+);
+
+impl Wire for DelimitedFrame {
+    type ParseError = FrameParseError;
+    type WriteError = Error;
+
+    fn parse(input: &[u8]) -> Result<Self, FrameParseError> {
+        exact_frame(Framing::Delimited, input).map(Self)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.0.to_bytes(Framing::Delimited)?);
+        Ok(())
+    }
+}
+
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        Self::parse(input)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads length-prefixed frames without retaining input bytes.
+///
+/// The gRPC form delegates to [`super::grpc::Messages`]. Malformed headers
+/// and oversized lengths end the stream. Incomplete frames return
+/// [`Step::Need`], including at EOF. Capacity is [`MAX_MESSAGE`] plus
+/// [`GRPC_HEADER_LEN`] or [`MAX_VARINT_LEN`], according to the framing.
+/// Map items through [`Message::parse`]
+/// to handle payload errors per item. Use [`codec::Stream`](super::codec::Stream) for bounded input.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    framing: Framing,
+    grpc: super::grpc::Messages,
+}
+
+impl Frames {
+    /// Reads `framing` with bodies bounded by [`MAX_MESSAGE`].
+    pub fn new(framing: Framing) -> Self {
+        Self {
+            framing,
+            grpc: super::grpc::Messages::with_limit(MAX_MESSAGE),
+        }
+    }
+
+    /// The framing this decoder reads.
+    pub fn framing(&self) -> Framing {
+        self.framing
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = Error;
+    const NAME: &'static str = "Protobuf";
+
+    fn capacity(&self) -> usize {
+        match self.framing {
+            Framing::Grpc => self.grpc.capacity(),
+            Framing::Delimited => MAX_VARINT_LEN + MAX_MESSAGE,
+        }
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Frame>, Error> {
+        if self.framing == Framing::Grpc {
+            return match self.grpc.decode(input, eof) {
+                Ok(Step::Item(m, n)) => Ok(Step::Item(
+                    Frame {
+                        compressed: m.compressed,
+                        data: m.data,
+                    },
+                    n,
+                )),
+                Ok(Step::Skip(n)) => Ok(Step::Skip(n)),
+                Ok(Step::Need) => Ok(Step::Need),
+                Ok(Step::End) => Ok(Step::End),
+                Err(super::grpc::FrameError::Flag(b)) => Err(Error::Flag(b)),
+                Err(super::grpc::FrameError::TooLarge { .. }) => Err(Error::TooLong),
+                Err(super::grpc::FrameError::Truncated { .. }) => Err(Error::Truncated),
+            };
+        }
+        Ok(match Frame::parse(self.framing, input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a byte stream into frames. Feed it the bytes a connection or
 /// request body reads, in order, and take frames out until it has none.
 /// It holds at most [`MAX_BUFFERED`] bytes that have not been taken out.
 /// Two decoders are equal when they read the same framing, hold the same
 /// bytes not yet taken out, and have broken in the same way, if at all.
 #[derive(Clone, Debug)]
+#[deprecated(note = "use codec::Stream with protobuf::Frames")]
 pub struct Decoder {
     framing: Framing,
     buf: Vec<u8>,
@@ -856,14 +1020,17 @@ pub struct Decoder {
     failed: Option<Error>,
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl PartialEq for Decoder {
     fn eq(&self, other: &Decoder) -> bool {
         self.framing == other.framing && self.pending() == other.pending() && self.failed == other.failed
     }
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Eq for Decoder {}
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Decoder {
     /// A decoder for `framing`, holding no bytes.
     pub fn new(framing: Framing) -> Decoder {
@@ -939,6 +1106,7 @@ impl Decoder {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 
