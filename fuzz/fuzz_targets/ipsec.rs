@@ -3,9 +3,24 @@
 #![no_main]
 
 use fictionet::stdlib::ipsec::{AhPacket, Datagram, Decoder, IpsecError, Kind, Packet, Plaintext, MAX_DATAGRAM, MAX_PADDING};
+use fictionet::stdlib::{codec::{Collect, contract}, ipsec};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Collect::<ipsec::EspPacket>::new(ipsec::MAX_PACKET), data);
+    contract::check_wire::<ipsec::EspPacket>(data);
+    contract::check_decode(|| Collect::<ipsec::AhPacket>::new(ipsec::MAX_PACKET), data);
+    contract::check_wire::<ipsec::AhPacket>(data);
+    contract::check_decode(|| Collect::<ipsec::Datagram>::new(ipsec::MAX_DATAGRAM), data);
+    contract::check_wire::<ipsec::Datagram>(data);
+
+    let packet = ipsec::EspPacket {
+        spi: data.first().copied().map_or(0, u32::from),
+        sequence: 1,
+        payload: data.iter().take(ipsec::MAX_PACKET + 1).copied().collect(),
+    };
+    contract::check_wire_value(&packet);
+    contract::check_wire_value(&Datagram::Esp(packet));
     for kind in [Kind::Esp, Kind::Ah, Kind::Udp] {
         let parsed = Packet::parse(kind, data);
 

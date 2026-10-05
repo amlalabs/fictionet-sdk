@@ -3,6 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::geneve::{Decoder, GeneveOption, Header, Packet};
+use fictionet::stdlib::{codec::{Collect, contract}, geneve};
 use libfuzzer_sys::fuzz_target;
 
 /// A packet built from any field values, valid or not. Each option takes
@@ -34,6 +35,9 @@ fn packet_from(data: &[u8]) -> Option<Packet> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Collect::<geneve::Packet>::new(geneve::MAX_DATAGRAM), data);
+    contract::check_wire::<geneve::Packet>(data);
+
     let parsed = Packet::parse(data);
 
     // The datagram, fed two ways: all at once, and a byte at a time.
@@ -67,6 +71,7 @@ fuzz_target!(|data: &[u8]| {
     // The writer, on any field values: it writes bytes that read back the
     // same, or refuses and leaves the buffer alone.
     if let Some(p) = packet_from(data) {
+        contract::check_wire_value(&p);
         let mut out = vec![0xee];
         match p.write(&mut out) {
             Ok(()) => assert_eq!(Packet::parse(&out[1..]).as_ref(), Ok(&p)),

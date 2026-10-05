@@ -7,6 +7,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use fictionet::stdlib::pim::{
     ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Decoder, Endpoints, Message, PimError, checksum,
 };
+use fictionet::stdlib::{codec::{Collect, Decode, contract}, pim};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -27,6 +28,17 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8], e: &Endpoints) {
+    contract::check_decode(|| Collect::<pim::Datagram>::new(pim::MAX_MESSAGE), data);
+    contract::check_decode(
+        || Collect::<pim::Datagram>::new(pim::MAX_MESSAGE)
+            .map(|datagram| Message::parse(&datagram.0, e)),
+        data,
+    );
+    contract::check_wire::<pim::Datagram>(data);
+    contract::check_wire_value(&pim::Datagram(
+        data.iter().take(pim::MAX_MESSAGE + 1).copied().collect(),
+    ));
+
     let parsed = Message::parse(data, e);
 
     // The message, fed two ways: all at once, and a byte at a time.

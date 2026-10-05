@@ -13,6 +13,7 @@ use fictionet::stdlib::vrrp::{
     Addresses, Advertisement, AdvertisementV2, AdvertisementV3, Decoder, Endpoints, GROUP_V4, GROUP_V6, MAX_ADDRESSES,
     VrrpError, checksum, legacy_checksum,
 };
+use fictionet::stdlib::{codec::{Collect, Decode, contract}, vrrp};
 use libfuzzer_sys::fuzz_target;
 
 const LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
@@ -115,6 +116,17 @@ fn endpoints_from(data: &[u8]) -> Endpoints {
 }
 
 fn check(data: &[u8], e: &Endpoints) {
+    contract::check_decode(|| Collect::<vrrp::Datagram>::new(vrrp::MAX_MESSAGE), data);
+    contract::check_decode(
+        || Collect::<vrrp::Datagram>::new(vrrp::MAX_MESSAGE)
+            .map(|datagram| Advertisement::parse(&datagram.0, e)),
+        data,
+    );
+    contract::check_wire::<vrrp::Datagram>(data);
+    contract::check_wire_value(&vrrp::Datagram(
+        data.iter().take(vrrp::MAX_MESSAGE + 1).copied().collect(),
+    ));
+
     let parsed = Advertisement::parse(data, e);
 
     // The advertisement, fed two ways: all at once, and a byte at a time.

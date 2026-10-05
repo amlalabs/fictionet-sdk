@@ -3,9 +3,24 @@
 #![no_main]
 
 use fictionet::stdlib::gre::{Decoder, Header, Packet};
+use fictionet::stdlib::{codec::{Collect, contract}, gre};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Collect::<gre::Packet>::new(gre::MAX_PACKET), data);
+    contract::check_wire::<gre::Packet>(data);
+
+    let payload = data.iter().take(gre::MAX_PACKET + 1).copied().collect();
+    let packet = Packet {
+        header: Header::Pptp(gre::PptpHeader {
+            call_id: 1,
+            sequence: data.first().copied().map(u32::from),
+            ack: None,
+        }),
+        payload,
+    };
+    contract::check_wire_value(&packet);
+
     let parsed = Packet::parse(data);
 
     // The packet, fed two ways: all at once, and a byte at a time.

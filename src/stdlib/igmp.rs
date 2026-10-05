@@ -96,6 +96,14 @@
 //! assert_eq!(reports.len(), 1);
 //! assert_eq!(reports[0].to_bytes().unwrap(), [0x22, 0, 0xea, 0xf9, 0, 0, 0, 1, 2, 0, 0, 0, 239, 1, 2, 3]);
 //! ```
+//!
+//! [`Message`] implements [`Wire`](super::codec::Wire) for exact parsing
+//! and transactional writing. Its trait parser refuses trailing bytes;
+//! [`Message::parse`] keeps ignoring them. Declared auxiliary data is part
+//! of the message and is still ignored. For chunks of one message, use
+//! `Stream::new(Collect::<Message>::new(MAX_MESSAGE))` and end the stream
+//! at the message boundary. [`Decoder`] keeps its early type check,
+//! constructor, and repeated feed errors.
 
 use std::net::Ipv4Addr;
 
@@ -632,6 +640,66 @@ impl Message {
         let c = checksum(&out);
         out[2..4].copy_from_slice(&c.to_be_bytes());
         Ok(out)
+    }
+}
+
+/// Why an exact [`Wire`](super::codec::Wire) parse refused a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The message's fields, length, or checksum are invalid.
+    Message(IgmpError),
+    /// Bytes follow the message and its declared auxiliary data.
+    Trailing {
+        /// Number of bytes after the message.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Message(e) => e.fmt(f),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after the IGMP message"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
+
+impl super::codec::Wire for Message {
+    type ParseError = ParseError;
+    type WriteError = IgmpError;
+
+    /// Reads exactly one message, including any declared auxiliary data.
+    /// Reserved fields and auxiliary data follow [`Message::parse`].
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let message = Message::parse(bytes).map_err(ParseError::Message)?;
+        let short = ParseError::Message(IgmpError::Truncated);
+        let used = match &message {
+            Message::QueryV3(q) => V3_QUERY_LEN.saturating_add(q.sources.len().saturating_mul(4)),
+            Message::ReportV3 { records } => {
+                let mut at = HEADER_LEN;
+                for record in records {
+                    let aux_at = at.checked_add(1).ok_or(short)?;
+                    let aux = usize::from(*bytes.get(aux_at).ok_or(short)?).saturating_mul(4);
+                    at = at.checked_add(RECORD_HEADER_LEN)
+                        .and_then(|n| n.checked_add(record.sources.len().checked_mul(4)?))
+                        .and_then(|n| n.checked_add(aux)).ok_or(short)?;
+                }
+                at
+            }
+            _ => HEADER_LEN,
+        };
+        if used != bytes.len() {
+            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
+        }
+        Ok(message)
+    }
+
+    /// Appends at most [`MAX_MESSAGE`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), IgmpError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
     }
 }
 

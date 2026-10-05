@@ -47,6 +47,12 @@
 //! assert_eq!(back, packet);
 //! assert_eq!(back.header.option(0x0105, 1).unwrap().data, [0, 0, 0, 7]);
 //! ```
+//!
+//! [`Packet`] implements [`Wire`](super::codec::Wire) for exact parsing and
+//! transactional writing. For chunks of one datagram, use
+//! `Stream::new(Collect::<Packet>::new(MAX_DATAGRAM))` and end the stream
+//! at the datagram boundary. [`Decoder`] keeps its early header checks,
+//! header access, constructor, and repeated feed errors.
 
 /// The UDP port Geneve endpoints listen on.
 pub const PORT: u16 = 6081;
@@ -407,6 +413,21 @@ impl Packet {
         let header =
             Header { control: self.header.control, protocol: self.header.protocol, vni: self.header.vni, options: Vec::new() };
         Packet { header, payload }
+    }
+}
+
+impl super::codec::Wire for Packet {
+    type ParseError = GeneveError;
+    type WriteError = GeneveError;
+
+    /// Reads exactly one datagram of at most [`MAX_DATAGRAM`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, GeneveError> {
+        Packet::parse(bytes)
+    }
+
+    /// Appends one datagram. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), GeneveError> {
+        Packet::write(self, out)
     }
 }
 

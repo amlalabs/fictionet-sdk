@@ -78,6 +78,15 @@
 //! );
 //! assert_eq!(Message::parse(&bytes), Ok(reply));
 //! ```
+//!
+//! [`Message`] and [`NgMessage`] implement [`Wire`](super::codec::Wire)
+//! for exact parsing and transactional writing. The trait writer preserves
+//! received RIP messages up to [`MAX_MESSAGE`]; [`Message::to_bytes`] keeps
+//! its [`MAX_DATAGRAM`] sending limit. For chunks of one message, use
+//! `Stream::new(Collect::<Message>::new(MAX_MESSAGE))`, or `NgMessage` with
+//! [`MAX_NG_MESSAGE`], and end the stream at the datagram boundary.
+//! [`Decoder`] and [`NgDecoder`] keep their constructors, early checks,
+//! byte access, and repeated feed errors.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -421,6 +430,12 @@ impl Message {
     /// Only a message with a cryptographic trailer can be: one with a
     /// 16-byte digest holds at most 23 routes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, RipError> {
+        self.wire_bytes(MAX_DATAGRAM)
+    }
+
+    // The codec preserves every parsed message up to MAX_MESSAGE. The
+    // legacy writer keeps its smaller sending limit.
+    fn wire_bytes(&self, limit: usize) -> Result<Vec<u8>, RipError> {
         let routes = match &self.entries {
             Entries::WholeTable => 1,
             Entries::Routes(r) => r.len(),
@@ -485,10 +500,27 @@ impl Message {
         if Message::parse(&out)? != *self {
             return Err(RipError::Unrepresentable);
         }
-        if out.len() > MAX_DATAGRAM {
+        if out.len() > limit {
             return Err(RipError::TooManyEntries);
         }
         Ok(out)
+    }
+}
+
+impl super::codec::Wire for Message {
+    type ParseError = RipError;
+    type WriteError = RipError;
+
+    /// Reads exactly one message, bounded by [`MAX_MESSAGE`].
+    fn parse(bytes: &[u8]) -> Result<Self, RipError> {
+        Message::parse(bytes)
+    }
+
+    /// Appends at most [`MAX_MESSAGE`] bytes. Leaves `out` unchanged on error.
+    /// Unlike [`Message::to_bytes`], this preserves larger received messages.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), RipError> {
+        out.extend_from_slice(&self.wire_bytes(MAX_MESSAGE)?);
+        Ok(())
     }
 }
 
@@ -869,6 +901,22 @@ impl NgMessage {
             return Err(RipError::Unrepresentable);
         }
         Ok(out)
+    }
+}
+
+impl super::codec::Wire for NgMessage {
+    type ParseError = RipError;
+    type WriteError = RipError;
+
+    /// Reads exactly one RIPng message, bounded by [`MAX_NG_MESSAGE`].
+    fn parse(bytes: &[u8]) -> Result<Self, RipError> {
+        NgMessage::parse(bytes)
+    }
+
+    /// Appends at most [`MAX_NG_MESSAGE`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), RipError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
     }
 }
 
