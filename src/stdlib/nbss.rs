@@ -69,6 +69,8 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0x82, 0x00, 0x00, 0x00]);
 //! ```
 
+use super::codec::{Decode, Step, Wire};
+
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
 /// The length of a packet's header, before its body.
@@ -440,6 +442,105 @@ impl Packet {
         out.extend_from_slice(&((body.len() & 0xffff) as u16).to_be_bytes());
         out.extend_from_slice(body);
         Ok(out)
+    }
+}
+
+/// Why an exact [`Wire`] parse did not contain one complete packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The packet was invalid.
+    Packet(Error),
+    /// The input ended before a complete packet.
+    Incomplete,
+    /// Bytes followed the complete packet.
+    Trailing {
+        /// Number of bytes after the packet.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete NBSS packet"),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after NBSS packet"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
+
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one packet of at most [`MAX_PACKET`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        match Packet::parse(bytes).map_err(ParseError::Packet)? {
+            Some((packet, used)) if used == bytes.len() => Ok(packet),
+            Some((_, used)) => Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) }),
+            None => Err(ParseError::Incomplete),
+        }
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads session packets without retaining input.
+///
+/// Use with [`super::codec::Stream`] for bounded buffering. The header
+/// suffices to refuse a body above [`limit`](Self::limit). Partial packets
+/// return [`Step::Need`], including at EOF. The driver reports truncation
+/// and reports errors once. All packet errors end this decoder.
+/// The legacy [`Decoder`] retains its repeated errors and clears its buffer
+/// on failure, so it remains a separate implementation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting bodies up to [`MAX_LENGTH`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_LENGTH)
+    }
+
+    /// Sets the body limit, clamped to [`MAX_LENGTH`]. Zero permits empty bodies.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_LENGTH) }
+    }
+
+    /// The largest accepted body, excluding its four-byte header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = Error;
+    const NAME: &'static str = "NBSS";
+
+    fn capacity(&self) -> usize {
+        HEADER_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
+        Ok(match parse_limited(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
     }
 }
 

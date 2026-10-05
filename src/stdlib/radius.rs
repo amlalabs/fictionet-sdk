@@ -66,6 +66,8 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use super::codec::{Decode, Step, Wire};
+
 /// The UDP port RADIUS servers take Access-Requests on.
 pub const AUTH_PORT: u16 = 1812;
 /// The UDP port RADIUS servers take Accounting-Requests on.
@@ -583,6 +585,88 @@ impl Packet {
         }
         self.attributes.extend(attributes);
         Ok(())
+    }
+}
+
+/// Why an exact [`Wire`] parse did not contain one complete packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The packet was invalid or incomplete.
+    Packet(PacketError),
+    /// Bytes followed the packet's declared length, including datagram padding.
+    Trailing {
+        /// Number of bytes after the packet.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after RADIUS packet"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
+
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = TooLong;
+
+    /// Reads exactly one packet. Datagram padding is refused.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let packet = Packet::parse(bytes).map_err(ParseError::Packet)?;
+        let used = packet.encoded_len();
+        if used != bytes.len() {
+            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
+        }
+        Ok(packet)
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), TooLong> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads RADIUS over TCP or TLS packets without retaining input.
+///
+/// Use with [`super::codec::Stream`] for a buffer bounded by [`MAX_PACKET`].
+/// The first four bytes suffice to refuse an invalid length. Partial packets
+/// return [`Step::Need`], including at EOF, so the driver reports truncation.
+/// Attribute errors end the stream, as they do in [`Decoder`]. The legacy
+/// decoder remains separate to preserve repeated errors and buffer clearing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a packet decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = PacketError;
+    const NAME: &'static str = "RADIUS";
+
+    fn capacity(&self) -> usize {
+        MAX_PACKET
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+        let Some(&[_, _, hi, lo]) = input.get(..4) else { return Ok(Step::Need) };
+        let length = u16::from_be_bytes([hi, lo]);
+        let used = usize::from(length);
+        if !(HEADER_LEN..=MAX_PACKET).contains(&used) {
+            return Err(PacketError::Length(length));
+        }
+        let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
+        Ok(Step::Item(Packet::parse(bytes)?, used))
     }
 }
 

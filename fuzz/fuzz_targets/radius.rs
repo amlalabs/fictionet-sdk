@@ -5,9 +5,10 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::radius::{
-    Attribute, Code, DataType, Decoder, Evs, Extended, MAX_BUFFERED, MAX_PACKET, MAX_VALUE, Packet, PacketError,
-    RESERVED_EXTENDED_TYPES, TooLong, Value, Vsa,
+    Attribute, Code, DataType, Decoder, Evs, Extended, Frames, MAX_BUFFERED, MAX_PACKET, MAX_VALUE, Packet,
+    PacketError, RESERVED_EXTENDED_TYPES, TooLong, Value, Vsa,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -148,6 +149,7 @@ fn construct(data: &[u8]) -> Option<()> {
             }
         }
     }
+    contract::check_wire_value(&p);
     // A packet is written whole or not at all.
     match p.to_bytes() {
         Ok(bytes) => {
@@ -162,6 +164,9 @@ fn construct(data: &[u8]) -> Option<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Packet>(data);
+
     // The bytes as one datagram.
     if let Ok(p) = Packet::parse(data) {
         // A packet read can be written, and reads back the same.

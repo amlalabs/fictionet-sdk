@@ -2,8 +2,9 @@
 //! server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::diameter::{
-    Address, Avp, Decoder, Format, Identity, MAX_AVP_DATA, Message, Uri, Value, base_format, check,
+    Address, Avp, Decoder, Format, Frames, Identity, MAX_AVP_DATA, Message, Uri, Value, base_format, check,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -48,6 +49,21 @@ fn take_all(d: &mut Decoder, data: &[u8]) -> Vec<Message> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Message>(data);
+    contract::check_decode(|| Frames::with_limit(0), data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+    let mut built = Message::request(u32::from(data.first().copied().unwrap_or(0)) << 20, 0, 1, 2);
+    built.error = true;
+    built.avps.push(Avp {
+        code: 1,
+        vendor: Some(0),
+        mandatory: true,
+        protected: false,
+        data: data.get(..MAX_AVP_DATA + 1).unwrap_or(data).to_vec(),
+    });
+    contract::check_wire_value(&built);
+
     // The stream, split two ways: as much at a time as the decoder takes,
     // and a byte at a time.
     let messages = take_all(&mut Decoder::new(), data);

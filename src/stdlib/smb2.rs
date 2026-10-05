@@ -68,6 +68,8 @@
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
+use super::codec::{Decode, Step, Wire};
+
 /// The TCP port SMB servers listen on for direct TCP.
 pub const PORT: u16 = 445;
 /// The length of the direct TCP header, before each frame's payload.
@@ -472,6 +474,108 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>, EncodeError> {
     out.extend_from_slice(&n.to_be_bytes()[1..]);
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+/// One direct TCP frame with an uninterpreted payload.
+///
+/// [`Wire`] includes the four-byte transport header. Interpret the payload
+/// with [`Packet::parse`]. A payload error does not prevent finding the next
+/// frame. Empty payloads are allowed, as in [`parse_frame`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame {
+    /// Payload bytes, limited to [`MAX_MESSAGE`] on read and write.
+    pub payload: Vec<u8>,
+}
+
+/// Why an exact [`Wire`] parse did not contain one complete TCP frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The transport header was invalid.
+    Frame(FrameError),
+    /// The input ended before a complete frame.
+    Incomplete,
+    /// Bytes followed the complete frame.
+    Trailing {
+        /// Number of bytes after the frame.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete SMB direct TCP frame"),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after SMB direct TCP frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one transport frame of at most [`MAX_BUFFERED`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match parse_frame(bytes).map_err(FrameParseError::Frame)? {
+            Some((payload, used)) if used == bytes.len() => Ok(Self { payload: payload.to_vec() }),
+            Some((_, used)) => Err(FrameParseError::Trailing { remaining: bytes.len().saturating_sub(used) }),
+            None => Err(FrameParseError::Incomplete),
+        }
+    }
+
+    /// Appends the transport header and payload. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&frame(&self.payload)?);
+        Ok(())
+    }
+}
+
+/// Reads direct TCP frames without retaining input.
+///
+/// Use with [`super::codec::Stream`] for a buffer bounded by [`MAX_BUFFERED`].
+/// The four-byte header suffices to refuse a payload above [`MAX_MESSAGE`].
+/// Partial frames return [`Step::Need`], including at EOF, so the driver
+/// reports truncation. Framing errors end the stream and are reported once.
+/// Map items through [`Packet::parse`] to receive payload errors as items.
+/// The legacy [`Decoder`] remains separate to preserve repeated errors and
+/// buffer clearing on failure.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Decode, Stream, Wire}, smb2::{Frame, Frames, Packet}};
+/// let bytes = Wire::to_bytes(&Frame { payload: b"\xffSMBhello".to_vec() })?;
+/// let mut stream = Stream::new(Frames::new().map(|f| Packet::parse(&f.payload)));
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
+/// # Ok::<(), fictionet::stdlib::smb2::EncodeError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "SMB direct TCP";
+
+    fn capacity(&self) -> usize {
+        MAX_BUFFERED
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match parse_frame(input)? {
+            Some((payload, used)) => Step::Item(Frame { payload: payload.to_vec() }, used),
+            None => Step::Need,
+        })
+    }
 }
 
 /// Splits an SMB direct TCP byte stream into frame payloads. Feed it the

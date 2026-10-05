@@ -3,9 +3,10 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::dcerpc::{
-    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Decoder, EncodeError, Error, MAX_BUFFERED,
-    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SyntaxId, Uuid, flags,
+    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Decoder, EncodeError, Error, Frames,
+    MAX_BUFFERED, MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SyntaxId, Uuid, flags,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -48,6 +49,7 @@ fn split(data: &[u8], bytewise: bool) -> Vec<std::result::Result<Pdu, Error>> {
 /// A PDU read is written back and reads the same, unless the writer's
 /// padding or reserved fields make it longer than a fragment.
 fn rewrite(pdu: &Pdu) {
+    contract::check_wire_value(pdu);
     match pdu.to_bytes() {
         Ok(bytes) => {
             assert!(bytes.len() <= MAX_FRAG);
@@ -156,6 +158,7 @@ fn alloc_hint(p: &Pdu) -> Option<u32> {
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let p = pdu(&mut u)?;
+    contract::check_wire_value(&p);
     if let Ok(bytes) = p.to_bytes() {
         assert!(bytes.len() <= MAX_FRAG);
         assert_eq!(Pdu::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
@@ -240,6 +243,11 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Pdu>(data);
+    contract::check_decode(|| Frames::with_limit(0), data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+
     // The stream, split two ways: all at once, and a byte at a time. Both
     // give the same PDUs and the same errors.
     let results = split(data, false);
