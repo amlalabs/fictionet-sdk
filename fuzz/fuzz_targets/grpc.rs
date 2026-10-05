@@ -2,8 +2,9 @@
 //! a world playing a gRPC server reads them, and the writers that answer.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::grpc::{
-    decode_message, encode_message, Code, ContentType, Decoder, FrameError, Message, MethodPath, Rejection, Request, Status,
+    decode_message, encode_message, Code, ContentType, Decoder, FrameError, Message, Messages, MethodPath, Rejection, Request, Status,
     Timeout, MAX_MESSAGE,
 };
 use libfuzzer_sys::fuzz_target;
@@ -70,6 +71,9 @@ fn check_request(headers: &[(&[u8], &[u8])]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), data);
+    contract::check_wire::<Message>(data);
+
     // The stream, split two ways: all at once, and a byte at a time. Both
     // agree with reading it message by message, and with each other at
     // the end of the stream.
@@ -105,6 +109,7 @@ fuzz_target!(|data: &[u8]| {
     // as before, and the first one over it is refused.
     if let Some(&l) = data.first() {
         let limit = usize::from(l);
+        contract::check_decode(|| Messages::with_limit(limit), data);
         let (small, _) = decode(data, 3, limit);
         for (a, b) in small.iter().zip(whole.iter()) {
             match a {
@@ -120,8 +125,14 @@ fuzz_target!(|data: &[u8]| {
 
     // A message built from the input, not read from it, writes and reads
     // back the same.
-    let built = Message { compressed: data.first().is_some_and(|b| b & 1 == 1), data: data.to_vec() };
+    let built = Message {
+        compressed: data.first().is_some_and(|b| b & 1 == 1),
+        data: data.get(..MAX_MESSAGE).unwrap_or(data).to_vec(),
+    };
+    contract::check_wire_value(&built);
     let bytes = built.to_bytes().unwrap();
+    contract::check_wire::<Message>(&bytes);
+    contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), &bytes);
     assert_eq!(Message::parse(&bytes), Ok(Some((built, bytes.len()))));
 
     // Header values on their own.
