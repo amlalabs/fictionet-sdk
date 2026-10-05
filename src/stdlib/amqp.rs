@@ -18,6 +18,10 @@
 //! to the connection. Which exchanges and queues exist, and where a message
 //! goes, is up to world code.
 //!
+//! New stacks use [`Frames`] with [`super::codec::Stream`]. [`Frame`]
+//! implements [`Wire`] for exact parsing and transactional writing.
+//! The legacy [`Decoder`] keeps its original buffer and error behavior.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A frame the stream cannot hold breaks the stream with a
 //! [`FrameError`]. A payload that breaks the specification gives a
@@ -71,6 +75,8 @@
 //! assert_eq!((body.kind, body.channel, &body.payload[..]), (FrameKind::Body, 1, &b"hello"[..]));
 //! assert!(decoder.next_frame().is_none());
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port AMQP brokers listen on.
 pub const PORT: u16 = 5672;
@@ -367,6 +373,144 @@ impl Frame {
     /// A heartbeat frame.
     pub fn heartbeat() -> Frame {
         Frame { kind: FrameKind::Heartbeat, channel: 0, payload: Vec::new() }
+    }
+}
+
+/// Why bytes do not contain exactly one AMQP frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame was refused.
+    Frame(FrameError),
+    /// The input ended before a complete frame arrived.
+    Truncated,
+    /// Bytes followed the frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("AMQP frame ended early"),
+            Self::Trailing => f.write_str("bytes after the AMQP frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one frame, bounded by [`MAX_FRAME_SIZE`].
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(bytes, MAX_FRAME_SIZE).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == bytes.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends a frame. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads AMQP frames without retaining input bytes.
+///
+/// Use with [`super::codec::Stream`] for bounded input and one-time errors.
+/// Partial frames return [`Step::Need`], including at EOF. Frame faults
+/// end the stream. Parse method and content payloads separately to receive
+/// their [`DecodeError`] values as items with [`Decode::map`].
+/// The legacy [`Decoder`] keeps its repeating errors and buffer policy.
+///
+/// ```
+/// use fictionet::stdlib::{amqp::{Frame, Frames}, codec::{Stream, Wire}};
+///
+/// let frame = Frame::heartbeat();
+/// let bytes = Wire::to_bytes(&frame)?;
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(frame)));
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// # Ok::<(), fictionet::stdlib::amqp::EncodeError>(())
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    frame_max: u32,
+    expect_header: bool,
+    header_received: bool,
+}
+
+impl Frames {
+    /// Reads frames up to [`DEFAULT_FRAME_MAX`] bytes, including framing.
+    pub fn new() -> Self {
+        Self::with_limit(DEFAULT_FRAME_MAX)
+    }
+
+    /// Reads frames up to [`frame_limit`]`(frame_max)` bytes.
+    /// A larger frame is refused from its header.
+    pub fn with_limit(frame_max: u32) -> Self {
+        Self { frame_max: frame_limit(frame_max), expect_header: false, header_received: false }
+    }
+
+    /// Reads the client's protocol header before reading frames.
+    /// The header is consumed as [`Step::Skip`].
+    pub fn server() -> Self {
+        Self { expect_header: true, ..Self::new() }
+    }
+
+    /// Sets the negotiated frame limit between items.
+    /// The value is clamped by [`frame_limit`].
+    pub fn set_frame_max(&mut self, frame_max: u32) {
+        self.frame_max = frame_limit(frame_max);
+    }
+
+    /// The maximum frame size, including framing bytes.
+    pub fn frame_max(&self) -> u32 {
+        self.frame_max
+    }
+
+    /// Whether a decoder made by [`Frames::server`] read its protocol header.
+    pub fn header_received(&self) -> bool {
+        self.header_received
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "AMQP 0-9-1";
+
+    fn capacity(&self) -> usize {
+        self.frame_max as usize
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        if self.expect_header && !self.header_received {
+            let Some(header) = input.get(..PROTOCOL_HEADER.len()) else { return Ok(Step::Need) };
+            if header != PROTOCOL_HEADER {
+                let mut got = [0; 8];
+                got.copy_from_slice(header);
+                return Err(FrameError::ProtocolHeader(got));
+            }
+            self.header_received = true;
+            return Ok(Step::Skip(PROTOCOL_HEADER.len()));
+        }
+        Ok(match Frame::parse(input, self.frame_max)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
     }
 }
 

@@ -3,10 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::amqp::{
-    BasicProperties, ContentHeader, Decoder, Frame, FrameError, FrameKind, MAX_PAYLOAD, Method, Table, content_frames,
+    BasicProperties, ContentHeader, Decoder, Frame, FrameError, FrameKind, Frames, MAX_PAYLOAD, Method, Table, content_frames,
     frame_limit, plain_credentials,
 };
 use libfuzzer_sys::fuzz_target;
+use fictionet::stdlib::codec::contract;
 
 /// Feeds `data` in chunks, taking frames out after each feed, as a world
 /// does. Every frame, then the error that broke the stream, if one did.
@@ -96,6 +97,10 @@ fn payload(p: &[u8], frame_max: u32) {
 
 fuzz_target!(|data: &[u8]| {
     let frame_max = data.first().map_or(0, |&b| u32::from(b) << 9);
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(Frames::server, data);
+    contract::check_decode(|| Frames::with_limit(frame_max), data);
+    contract::check_wire::<Frame>(data);
     // The stream, split two ways: all at once, and a byte at a time, as a
     // client's frames and as a broker's input with the protocol header.
     for server in [false, true] {
@@ -105,6 +110,7 @@ fuzz_target!(|data: &[u8]| {
         for f in &whole.0 {
             // A frame read can be written, and reads back the same.
             let bytes = f.to_bytes().unwrap();
+            contract::check_wire::<Frame>(&bytes);
             let (back, used) = Frame::parse(&bytes, 0).unwrap().unwrap();
             assert_eq!(&back, f);
             assert_eq!(used, bytes.len());
@@ -120,6 +126,7 @@ fuzz_target!(|data: &[u8]| {
             channel: u16::from_be_bytes([*c0, *c1]),
             payload: rest.to_vec(),
         };
+        contract::check_wire_value(&f);
         if let Ok(bytes) = f.to_bytes() {
             assert!(f.payload.len() <= MAX_PAYLOAD);
             assert_eq!(Frame::parse(&bytes, 0), Ok(Some((f, bytes.len()))));
