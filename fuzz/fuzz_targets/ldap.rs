@@ -2,8 +2,9 @@
 //! playing a directory server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::ldap::{
-    Decoder, DerefAliases, Dn, Error, Filter, MAX_TEXT, Message, Op, Scope, SearchRequest,
+    Decoder, DerefAliases, Dn, Error, Filter, Frames, MAX_TEXT, Message, Op, Scope, SearchRequest,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -35,6 +36,10 @@ fn decode(chunks: &mut dyn Iterator<Item = &[u8]>, limit: usize) -> (Vec<Message
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_wire::<Message>(data);
+
     // The stream, split two ways: all at once, and a byte at a time.
     let whole = decode(&mut std::iter::once(data), usize::MAX);
     let bytewise = decode(&mut data.chunks(1), usize::MAX);
@@ -103,6 +108,7 @@ fuzz_target!(|data: &[u8]| {
         }),
         controls: Vec::new(),
     };
+    contract::check_wire_value(&search);
     if let Ok(bytes) = search.to_bytes() {
         assert_eq!(Message::parse(&bytes).as_ref(), Ok(&search));
     }

@@ -3,8 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::Rules;
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::kerberos::{
-    Decoder, EncryptedData, Error, FrameError, KdcReqBody, KrbError, Message, Ticket, frame,
+    Decoder, EncryptedData, Error, Frame, FrameError, Frames, KdcReqBody, KrbError, MAX_MESSAGE, Message, Ticket, frame,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -12,6 +13,7 @@ use libfuzzer_sys::fuzz_target;
 fn round_trip(b: &[u8]) {
     for rules in [Rules::Der, Rules::Ber] {
         if let Ok(m) = Message::parse_with(b, rules) {
+            contract::check_wire_value(&m);
             // Written again, a message near the size limit may grow past it.
             match m.to_der() {
                 Ok(der) => assert_eq!(Message::parse(&der), Ok(m.clone())),
@@ -73,6 +75,11 @@ fn split(data: &[u8], sizes: &[usize], drain_every: usize) -> Vec<Result<Vec<u8>
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Frame>(data);
+    contract::check_wire_value(&Frame(data.get(..MAX_MESSAGE + 1).unwrap_or(data).to_vec()));
+
     // The stream, split several ways: all at once, a byte at a time, and
     // in pieces the input picks, taking messages out now and then. Each
     // gives the same records and the same error.

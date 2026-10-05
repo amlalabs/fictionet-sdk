@@ -92,6 +92,7 @@
 //! ```
 
 use super::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
+use super::codec::{Decode, Step, Wire};
 use std::fmt;
 
 /// The port KDCs listen on, over UDP and TCP.
@@ -1167,6 +1168,162 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+/// A Kerberos message cannot be written without changing its value.
+///
+/// A field exceeds a named limit, is invalid, or would parse differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError;
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Kerberos message cannot be represented without changing its value")
+    }
+}
+
+impl core::error::Error for EncodeError {}
+
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one DER message whose re-encoding fits [`MAX_MESSAGE`].
+    /// Short flags and signed integer forms can expand when written.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let message = Message::parse(bytes)?;
+        message.to_der()?;
+        Ok(message)
+    }
+
+    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = self.to_der().map_err(|_| EncodeError)?;
+        if Message::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// One TCP record's payload, bounded by [`MAX_MESSAGE`].
+///
+/// [`super::codec::Wire`] reads exactly one length-prefixed record and
+/// writes the prefix and payload. The payload is not interpreted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// Message bytes without the four-byte TCP length.
+    pub Vec<u8>,
+);
+
+/// Why bytes do not contain exactly one complete TCP record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The record's length was refused.
+    Frame(FrameError),
+    /// The input ended inside the prefix or payload.
+    Truncated,
+    /// Bytes followed the complete record.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("Kerberos TCP record ended early"),
+            Self::Trailing => f.write_str("bytes after the Kerberos TCP record"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = FrameError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Frames::new().decode(bytes, true).map_err(FrameParseError::Frame)? {
+            Step::Item(data, n) if n == bytes.len() => Ok(Self(data)),
+            Step::Item(_, _) => Err(FrameParseError::Trailing),
+            _ => Err(FrameParseError::Truncated),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+        let length = u32::try_from(self.0.len()).map_err(|_| FrameError::TooLong(u32::MAX))?;
+        if self.0.len() > MAX_MESSAGE {
+            return Err(FrameError::TooLong(length));
+        }
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+/// Reads Kerberos TCP records without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for a buffer limited to
+/// [`TCP_HEADER_LEN`] plus the configured message limit. The four-byte prefix
+/// suffices to refuse reserved bits and oversized messages. Map each
+/// payload through [`Message::parse`] to interpret it. Partial records
+/// return [`super::codec::Step::Need`], including at EOF. The stream
+/// reports truncation at EOF and framing errors once.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the message limit, excluding the TCP header, clamped to
+    /// [`MAX_MESSAGE`]. Zero accepts only empty records.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
+    }
+
+    /// The maximum message size, excluding its TCP header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Vec<u8>;
+    type Error = FrameError;
+    const NAME: &'static str = "Kerberos TCP";
+
+    fn capacity(&self) -> usize {
+        TCP_HEADER_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, FrameError> {
+        let Some(&[a, b, c, d]) = input.get(..TCP_HEADER_LEN) else { return Ok(Step::Need) };
+        let length = u32::from_be_bytes([a, b, c, d]);
+        let n = frame_len(length)?;
+        if n > self.limit {
+            return Err(FrameError::TooLong(length));
+        }
+        let total = TCP_HEADER_LEN.checked_add(n).ok_or(FrameError::TooLong(length))?;
+        Ok(match input.get(TCP_HEADER_LEN..total) {
+            Some(bytes) => Step::Item(bytes.to_vec(), total),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a Kerberos TCP byte stream into messages. Feed it the bytes a
 /// connection reads, in order, and take messages out until it has none.
 ///
@@ -1177,6 +1334,9 @@ impl std::error::Error for FrameError {}
 /// message of at most [`MAX_MESSAGE`] bytes. A caller that takes messages
 /// out after each `feed` holds at most one message beyond what one `feed`
 /// added.
+///
+/// Errors repeat and there is no EOF handling.
+/// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -2228,5 +2388,73 @@ mod tests {
         }
         // Some changed messages still read, so the round trip is tested.
         assert!(read > 50, "only {read} read");
+    }
+
+    #[test]
+    fn codec_frames_bound_input_and_keep_empty_records() {
+        use super::super::codec::{Decode, Fail, Stream, Wire, contract};
+        assert_eq!(Frames::new().capacity(), TCP_HEADER_LEN + MAX_MESSAGE);
+        let frame = Frame(vec![9; MAX_MESSAGE]);
+        let bytes = <Frame as Wire>::to_bytes(&frame).unwrap();
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.push(&[0]), 0);
+        assert_eq!(stream.next(), Some(Ok(frame.0)));
+        contract::check_decode(Frames::new, &[0, 0, 0, 0, 0x80, 0, 0, 0]);
+        assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0000)))));
+        assert_eq!(stream.next(), None);
+        contract::check_wire_value(&Frame(Vec::new()));
+    }
+
+    #[test]
+    fn codec_writers_are_exact_and_transactional() {
+        use super::super::codec::{Wire, contract};
+        for message in all_messages() {
+            contract::check_wire_value(&message);
+            contract::check_wire::<Message>(&message.to_der().unwrap());
+        }
+        let mut out = vec![42];
+        let oversized = Frame(vec![0; MAX_MESSAGE + 1]);
+        assert!(oversized.write(&mut out).is_err());
+        assert_eq!(out, [42]);
+        assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 0, 0]), Err(FrameParseError::Trailing));
+        assert_eq!(<Frame as Wire>::parse(&[0, 0, 0, 1]), Err(FrameParseError::Truncated));
+        let mut request = as_req();
+        request.padata = Some(Vec::new());
+        // Optional empty lists are refused by both writers.
+        let message = Message::AsReq(request);
+        assert!(message.to_der().is_err());
+        assert_eq!(message.write(&mut out), Err(EncodeError));
+        assert_eq!(out, [42]);
+    }
+
+    #[test]
+    fn codec_wire_parse_refuses_reencoding_past_the_limit() {
+        use super::super::codec::Wire;
+        let build = |cipher_len| {
+            let mut w = Writer::new();
+            w.constructed(Tag::application(15), |w| {
+                w.sequence(|w| {
+                    w_int(w, 0, PVNO);
+                    w_int(w, 1, msg_type::AP_REP);
+                    w.explicit(2, |w| {
+                        w.sequence(|w| {
+                            w_int(w, 0, 18);
+                            w_int(w, 1, -1); // Accepted as UInt32::MAX; DER expands it.
+                            w.explicit(2, |w| w.octet_string(&vec![0; cipher_len]));
+                        });
+                    });
+                });
+            });
+            w.finish().unwrap()
+        };
+        let payload_len = MAX_MESSAGE - 100;
+        let overhead = build(payload_len).len() - payload_len;
+        let bytes = build(MAX_MESSAGE - overhead);
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+        let message = Message::parse(&bytes).unwrap();
+        assert_eq!(message.to_der(), Err(Error::TooLong));
+        assert_eq!(<Message as Wire>::parse(&bytes), Err(Error::TooLong));
     }
 }

@@ -80,6 +80,7 @@
 //! ```
 
 use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port OCSP responders usually listen on, since OCSP runs over
 /// plain HTTP.
@@ -934,11 +935,155 @@ fn hex_digit(c: u8) -> Result<u8, Error> {
     }
 }
 
+impl Wire for OcspRequest {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse(bytes)
+    }
+
+    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = self.to_der().map_err(|_| EncodeError)?;
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for OcspResponse {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse(bytes)
+    }
+
+    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = self.to_der().map_err(|_| EncodeError)?;
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for BasicResponse {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse(bytes)
+    }
+
+    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = self.to_der().map_err(|_| EncodeError)?;
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// An OCSP value cannot be written without changing its value.
+///
+/// The value exceeds a named limit, contains an invalid field, or would
+/// parse differently after encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError;
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("OCSP value cannot be represented without changing its value")
+    }
+}
+
+impl core::error::Error for EncodeError {}
+
+/// Reads whole DER messages without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for a buffer bounded by the configured
+/// message limit, with at least 16 bytes to read or refuse any ASN.1 header.
+/// Only headers are checked. Map each item through [`OcspRequest::parse`]
+/// or [`OcspResponse::parse`] to interpret it. Partial messages return
+/// [`super::codec::Step::Need`], including at EOF, so the stream reports
+/// truncation. Framing errors are reported once.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`].
+    /// Zero refuses every message. Oversized messages are refused from
+    /// their headers, before their contents arrive.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
+    }
+
+    /// The maximum message size, including its ASN.1 header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Vec<u8>;
+    type Error = Error;
+    const NAME: &'static str = "OCSP";
+
+    fn capacity(&self) -> usize {
+        self.limit.max(16)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
+        let header = match Header::parse(input, Rules::Der) {
+            Ok(header) => header,
+            Err(asn1::Error::Truncated) => return Ok(Step::Need),
+            Err(e) => return Err(e.into()),
+        };
+        let Length::Definite(n) = header.length else {
+            return Err(asn1::Error::Indefinite.into());
+        };
+        let total = header.len.checked_add(n).ok_or(Error::TooLong)?;
+        if total > self.limit {
+            return Err(Error::TooLong);
+        }
+        Ok(match input.get(..total) {
+            Some(bytes) => Step::Item(bytes.to_vec(), total),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a byte stream into whole DER messages, such as an HTTP body that
 /// comes in pieces. Feed it the bytes in order, and take messages out until
 /// it has none. Read each one with [`OcspRequest::parse`] or
 /// [`OcspResponse::parse`]. It holds at most [`MAX_MESSAGE`] bytes not yet
 /// taken out.
+///
+/// Errors repeat and there is no EOF handling.
+/// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -2390,5 +2535,33 @@ mod tests {
         assert_eq!(basic.data.nonce(), Some(&b"0123456789abcdef"[..]));
         assert_eq!(basic.data.responses[0].status, CertStatus::Good);
         assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
+    }
+
+    #[test]
+    fn codec_frames_bound_headers_and_report_once() {
+        use super::super::codec::{Decode, Fail, Stream, contract};
+        assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
+        let mut stream = Stream::new(Frames::new());
+        let bytes = [0x30, 0x83, 1, 0, 0];
+        contract::check_decode(Frames::new, &bytes);
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.buffered(), bytes.len());
+    }
+
+    #[test]
+    fn codec_writers_are_exact_and_transactional() {
+        use super::super::codec::{Wire, contract};
+        let response = OcspResponse::error(ResponseStatus::TryLater);
+        contract::check_wire_value(&response);
+        let mut bytes = <OcspResponse as Wire>::to_bytes(&response).unwrap();
+        contract::check_wire::<OcspResponse>(&bytes);
+        bytes.push(0);
+        assert!(<OcspResponse as Wire>::parse(&bytes).is_err());
+        let mut out = vec![42];
+        assert!(OcspResponse::error(ResponseStatus::Successful).write(&mut out).is_err());
+        assert!(OcspRequest::new(Vec::new()).write(&mut out).is_err());
+        assert_eq!(out, [42]);
     }
 }

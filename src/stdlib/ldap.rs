@@ -60,6 +60,7 @@
 //! ```
 
 use super::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
+use super::codec::{Decode, Step, Wire};
 use std::fmt;
 
 /// The port LDAP servers listen on, over TCP, and CLDAP over UDP.
@@ -2388,6 +2389,101 @@ fn parse_ava(s: &[u8], start: usize) -> Result<(Ava, usize), Error> {
 // ---------------------------------------------------------------------------
 // The stream.
 
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Message::parse(bytes)
+    }
+
+    /// Appends a message bounded by [`MAX_MESSAGE`]. Refuses values that
+    /// would change when parsed, without changing the destination.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.to_bytes()?;
+        if Message::parse(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Unwritable("message changes when parsed"));
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Reads LDAP messages without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for bounded input. Partial messages
+/// return [`super::codec::Step::Need`], including at EOF. The stream reports
+/// truncation at EOF and errors once. A malformed message ends the stream.
+/// This includes a well-framed message that [`Message::parse`] rejects:
+/// [RFC 4511 section 4.1.1](https://www.rfc-editor.org/rfc/rfc4511.html#section-4.1.1)
+/// requires termination for malformed envelopes and encodings. For parsing
+/// failures as individual items, use
+/// `asn1::Elements::new(Rules::Ber).map(|bytes| Message::parse(&bytes))`.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting messages up to [`MAX_MESSAGE`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`].
+    /// The buffer holds at least 16 bytes to read or refuse any header.
+    /// Zero refuses every message.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
+    }
+
+    /// The maximum message size, including its ASN.1 header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Message;
+    type Error = Error;
+    const NAME: &'static str = "LDAP";
+
+    fn capacity(&self) -> usize {
+        self.limit.max(HEADER_ROOM)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
+        let header = match asn1::Header::parse(input, Rules::Ber) {
+            Ok(header) => header,
+            Err(asn1::Error::Truncated) => return Ok(Step::Need),
+            Err(asn1::Error::TooLong) => return Err(Error::TooLarge(declared_total(input))),
+            Err(e) => return Err(Error::Ber(e)),
+        };
+        if header.tag != Tag::SEQUENCE {
+            return Err(unexpected(Tag::SEQUENCE, header.tag));
+        }
+        let Length::Definite(n) = header.length else {
+            return Err(Error::Ber(asn1::Error::Indefinite));
+        };
+        let total = header.len.saturating_add(n);
+        if total > self.limit {
+            return Err(Error::TooLarge(total));
+        }
+        Ok(match input.get(..total) {
+            Some(bytes) => Step::Item(Message::parse(bytes)?, total),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits an LDAP byte stream into messages. Feed it the bytes a connection
 /// reads, in order, and take messages out until it has none.
 ///
@@ -2396,6 +2492,9 @@ fn parse_ava(s: &[u8], start: usize) -> Result<(Ava, usize), Error> {
 /// cannot make it grow without bound. [`Decoder::feed`] takes what fits
 /// and says how much that was; once the held bytes are a whole message,
 /// taking it out makes room for more.
+///
+/// Errors repeat and there is no EOF handling.
+/// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -4343,5 +4442,47 @@ mod tests {
         let (all, err) = decode_all(&stream, true);
         assert_eq!(all.len(), ROUNDS);
         assert_eq!(err, None);
+    }
+
+    #[test]
+    fn codec_frames_obey_small_limits_and_report_once() {
+        use super::super::codec::{Decode, Fail, Stream, contract};
+        let bytes = Message {
+            id: 1,
+            op: Op::UnbindRequest,
+            controls: Vec::new(),
+        }
+        .to_bytes()
+        .unwrap();
+        for limit in 0..=16 {
+            assert_eq!(Frames::with_limit(limit).capacity(), 16);
+            contract::check_decode(|| Frames::with_limit(limit), &bytes);
+        }
+        assert_eq!(Frames::with_limit(usize::MAX).limit(), MAX_MESSAGE);
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[0x30, 0x80]), 2);
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::Ber(asn1::Error::Indefinite))))
+        );
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.buffered(), 2);
+    }
+
+    #[test]
+    fn codec_message_writer_rolls_back() {
+        use super::super::codec::{Wire, contract};
+        let mut message = Message {
+            id: 1,
+            op: Op::UnbindRequest,
+            controls: Vec::new(),
+        };
+        contract::check_wire_value(&message);
+        contract::check_wire::<Message>(&message.to_bytes().unwrap());
+        message.id = MAX_INT + 1;
+        let mut out = vec![42];
+        assert!(message.write(&mut out).is_err());
+        assert_eq!(out, [42]);
+        contract::check_wire_value(&message);
     }
 }
