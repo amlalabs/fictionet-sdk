@@ -2,10 +2,21 @@
 //! them from the agent and writes them back.
 #![no_main]
 
-use fictionet::stdlib::spnego::{Decoder, Error, InitialContextToken, MAX_TOKEN, NegotiationToken, token_len};
+use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::spnego::{
+    Decoder, Error, Frames, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<InitialContextToken>(data);
+    contract::check_wire::<NegotiationToken>(data);
+    contract::check_wire_value(&InitialContextToken {
+        mech: Mech::Spnego,
+        inner: data.get(..MAX_TOKEN + 1).unwrap_or(data).to_vec(),
+    });
+
     // The stream, split two ways: all at once, as much as the decoder
     // takes, and a byte at a time. It never holds more than MAX_TOKEN.
     let mut whole = Decoder::new();
@@ -52,6 +63,7 @@ fuzz_target!(|data: &[u8]| {
         // token near the size limit may grow past it when written, and a
         // hintAddress an agent sent is never written.
         if let Ok(token) = NegotiationToken::parse(t) {
+            contract::check_wire_value(&token);
             let address = matches!(&token, NegotiationToken::Init(i)
                 if i.neg_hints.as_ref().is_some_and(|h| h.hint_address.is_some()));
             match token.to_bytes() {

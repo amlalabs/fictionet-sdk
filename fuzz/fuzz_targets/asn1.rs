@@ -3,9 +3,10 @@
 #![no_main]
 
 use fictionet::stdlib::asn1::{
-    Class, Decoder, Element, Error, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer, check_generalized_time,
-    check_utc_time, element_len,
+    Class, Decoder, Element, Elements, Error, Frame, MAX_INPUT, Oid, Reader, Rules, StringKind, Tag, Writer,
+    check_generalized_time, check_utc_time, element_len,
 };
+use fictionet::stdlib::codec::contract;
 use libfuzzer_sys::fuzz_target;
 
 const KINDS: [StringKind; 11] = [
@@ -185,6 +186,11 @@ fn copy(e: Element<'_>, w: &mut Writer) -> Option<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Elements::new(Rules::Ber), data);
+    contract::check_decode(|| Elements::new(Rules::Der), data);
+    contract::check_wire::<Frame>(data);
+    contract::check_wire_value(&Frame(data.get(..MAX_INPUT + 1).unwrap_or(data).to_vec()));
+
     // The stream, split two ways: all at once, and a byte at a time.
     for rules in [Rules::Ber, Rules::Der] {
         assert_eq!(split(data, rules, false), split(data, rules, true));

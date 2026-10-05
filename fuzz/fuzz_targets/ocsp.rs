@@ -3,10 +3,11 @@
 //! bytes, as a world playing a client or responder writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::ocsp::{
-    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Decoder, Extension, MAX_MESSAGE, MAX_NONCE,
-    OcspRequest, OcspResponse, Request, ResponderId, ResponseBytes, ResponseData, ResponseStatus, SingleResponse,
-    decode_get_path, find_nonce,
+    AlgorithmIdentifier, BasicResponse, CertId, CertStatus, CrlReason, Decoder, Extension, Frames, MAX_MESSAGE,
+    MAX_NONCE, OcspRequest, OcspResponse, Request, ResponderId, ResponseBytes, ResponseData, ResponseStatus,
+    SingleResponse, decode_get_path, find_nonce,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -86,6 +87,7 @@ fn written(mut data: &[u8]) {
         }
         Err(_) => assert!(nonce.is_empty() || nonce.len() > MAX_NONCE),
     }
+    contract::check_wire_value(&req);
     if let Ok(der) = req.to_der() {
         assert_eq!(OcspRequest::parse(&der).unwrap(), req);
         // Unsigned, the request is a SEQUENCE header and the TBSRequest.
@@ -125,6 +127,7 @@ fn written(mut data: &[u8]) {
     };
     if let Some(status) = ResponseStatus::from_code(code) {
         let resp = OcspResponse { status, bytes };
+        contract::check_wire_value(&resp);
         if let Ok(der) = resp.to_der() {
             assert_eq!(OcspResponse::parse(&der).unwrap(), resp);
         }
@@ -132,6 +135,11 @@ fn written(mut data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<OcspRequest>(data);
+    contract::check_wire::<OcspResponse>(data);
+    contract::check_wire::<BasicResponse>(data);
+
     // The body, split two ways: all at once, and a byte at a time.
     let messages = split(data, usize::MAX);
     assert_eq!(messages, split(data, 1));

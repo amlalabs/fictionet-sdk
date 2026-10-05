@@ -58,6 +58,8 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
+use super::codec::{Decode, Step, Wire};
+
 /// The longest element, header and contents together, a reader accepts and
 /// a writer writes. A [`Decoder`] never holds much more than this.
 pub const MAX_INPUT: usize = 1 << 20;
@@ -562,9 +564,123 @@ pub fn element_len(b: &[u8], rules: Rules) -> Result<Option<usize>, Error> {
     }
 }
 
+/// One encoded BER element, bounded by [`MAX_INPUT`].
+///
+/// Only framing is checked. Use [`Reader`] to interpret its contents.
+/// [`Wire`] reads exactly one element and writes its bytes unchanged.
+/// The borrowed [`Element`] and [`Reader`] keep their existing APIs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// The tag, length, contents, and any end-of-contents marker.
+    pub Vec<u8>,
+);
+
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        check_frame(bytes)?;
+        Ok(Self(bytes.to_vec()))
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        check_frame(&self.0)?;
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+fn check_frame(bytes: &[u8]) -> Result<(), Error> {
+    if bytes.len() > MAX_INPUT {
+        return Err(Error::TooLong);
+    }
+    match element_len(bytes, Rules::Ber)? {
+        Some(n) if n == bytes.len() => Ok(()),
+        Some(_) => Err(Error::Trailing),
+        None => Err(Error::Truncated),
+    }
+}
+
+/// Reads ASN.1 elements without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for a buffer limited to [`MAX_INPUT`].
+/// Partial elements return [`Step::Need`], including at EOF. The stream
+/// reports truncation at EOF and framing errors once. An indefinite BER
+/// length keeps a scan position relative to the unread start, so feeding
+/// one byte at a time takes linear time. Only framing is checked.
+///
+/// ```
+/// use fictionet::stdlib::{asn1::{Elements, Frame, Rules}, codec::{Stream, Wire, finish, pump}};
+///
+/// let bytes = <Frame as Wire>::to_bytes(&Frame(vec![5, 0]))?;
+/// let mut stream = Stream::new(Elements::new(Rules::Der));
+/// let mut elements = Vec::new();
+/// for byte in &bytes {
+///     pump(&mut stream, core::slice::from_ref(byte), |item| elements.push(item))?;
+/// }
+/// finish(&mut stream, |item| elements.push(item))?;
+/// assert_eq!(elements, [bytes]);
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct Elements {
+    rules: Rules,
+    resume: Option<Scan>,
+}
+
+impl Elements {
+    /// Creates an element decoder using `rules` and [`MAX_INPUT`].
+    pub fn new(rules: Rules) -> Self {
+        Self { rules, resume: None }
+    }
+
+    /// The encoding rules used to frame elements.
+    pub fn rules(&self) -> Rules {
+        self.rules
+    }
+}
+
+impl Decode for Elements {
+    type Item = Vec<u8>;
+    type Error = Error;
+    const NAME: &'static str = "ASN.1";
+
+    fn capacity(&self) -> usize {
+        MAX_INPUT
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
+        let at = match self.resume {
+            Some(at) => Some(at),
+            None => match read_header(input, 0, self.rules) {
+                Ok(h) if h.length == Length::Indefinite && !is_eoc_tag(h.tag) => Some(Scan { pos: h.len, open: 1 }),
+                _ => None,
+            },
+        };
+        let total = match at {
+            Some(at) => match scan(input, self.rules, 0, at)? {
+                Ok((_, end)) => Some(end),
+                Err(at) => {
+                    self.resume = Some(at);
+                    None
+                }
+            },
+            None => element_len(input, self.rules)?,
+        };
+        let Some(total) = total else { return Ok(Step::Need) };
+        let bytes = input.get(..total).ok_or(Error::Truncated)?;
+        self.resume = None;
+        Ok(Step::Item(bytes.to_vec(), total))
+    }
+}
+
 /// Splits a byte stream of ASN.1 elements, such as an LDAP connection,
 /// into one element at a time. Feed it the bytes a connection reads, in
 /// order, and take elements out until it has none.
+///
+/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Use [`super::codec::Stream`] with [`Elements`] for EOF and one-time errors.
 #[derive(Debug)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -3434,5 +3550,48 @@ mod tests {
         // After an error every byte is taken and dropped.
         assert_eq!(d.feed(&endless), endless.len());
         assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn codec_wire_is_exact_and_transactional() {
+        use super::super::codec::{Wire, contract};
+        for bytes in [&[5, 0][..], &[0x30, 0x80, 5, 0, 0, 0], &[4], &[5, 0, 5, 0]] {
+            contract::check_wire::<Frame>(bytes);
+            contract::check_wire_value(&Frame(bytes.to_vec()));
+        }
+        assert_eq!(<Frame as Wire>::parse(&[5, 0, 5, 0]), Err(Error::Trailing));
+        let mut out = vec![42];
+        assert_eq!(Frame(vec![4]).write(&mut out), Err(Error::Truncated));
+        assert_eq!(out, [42]);
+        let mut too_long = vec![4, 0x83, 0x10, 0, 0];
+        too_long.resize(MAX_INPUT + 1, 0);
+        assert_eq!(<Frame as Wire>::parse(&too_long), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn codec_indefinite_scan_survives_compaction() {
+        use super::super::codec::{Stream, contract};
+        let mut w = Writer::new();
+        w.octet_string(&[1; 256]);
+        let first = w.finish().unwrap();
+        let mut bytes = first.clone();
+        bytes.extend_from_slice(&[0x30, 0x80, 5, 0]);
+        let mut stream = Stream::new(Elements::new(Rules::Ber));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Ok(first)));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.decoder().resume.unwrap().pos, 4);
+        // The consumed prefix is larger than the suffix, forcing compaction.
+        assert_eq!(stream.push(&[0x30, 0x80, 5, 0]), 4);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.decoder().resume.unwrap().pos, 8);
+        assert_eq!(stream.push(&[0, 0, 0, 0, 5, 0]), 6);
+        assert_eq!(stream.next(), Some(Ok(vec![0x30, 0x80, 5, 0, 0x30, 0x80, 5, 0, 0, 0, 0, 0])));
+        assert_eq!(stream.next(), Some(Ok(vec![5, 0])));
+        assert_eq!(stream.decoder().rules(), Rules::Ber);
+        assert_eq!(stream.decoder().held(), 0);
+        bytes.extend_from_slice(&[0x30, 0x80, 5, 0, 0, 0, 0, 0, 5, 0]);
+        contract::check_decode(|| Elements::new(Rules::Ber), &bytes);
+        contract::check_decode(|| Elements::new(Rules::Der), &bytes);
     }
 }

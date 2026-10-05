@@ -56,6 +56,7 @@
 //! ```
 
 use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer};
+use super::codec::{Decode, Step, Wire};
 use std::fmt;
 
 /// The longest token, wrapper included, a reader accepts and a writer
@@ -761,11 +762,111 @@ pub fn token_len(b: &[u8]) -> Result<Option<usize>, Error> {
     Ok(if b.len() >= total { Some(total) } else { None })
 }
 
+impl Wire for InitialContextToken {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one wrapper, bounded by [`MAX_TOKEN`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let token = Self::parse(bytes)?;
+        // BER can expand when written as DER. The Wire domain includes
+        // only values that the strict writer can represent.
+        token.to_bytes()?;
+        Ok(token)
+    }
+
+    /// Appends DER bounded by [`MAX_TOKEN`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = self.to_bytes().map_err(|_| EncodeError)?;
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for NegotiationToken {
+    type ParseError = Error;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one writable token. Refuses values whose DER exceeds
+    /// [`MAX_TOKEN`] and hint addresses that senders must omit.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let token = Self::parse(bytes)?;
+        // BER can expand when written as DER. The Wire domain includes
+        // only values that the strict writer can represent.
+        token.to_bytes()?;
+        Ok(token)
+    }
+
+    /// Appends DER bounded by [`MAX_TOKEN`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let bytes = self.to_bytes().map_err(|_| EncodeError)?;
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// A token cannot be written without changing its value.
+///
+/// A field exceeds a named limit, cannot be sent, or would parse differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError;
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SPNEGO token cannot be represented without changing its value")
+    }
+}
+
+impl core::error::Error for EncodeError {}
+
+/// Reads complete tokens without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for a buffer limited to [`MAX_TOKEN`].
+/// Only outer headers are checked. Map items through [`NegotiationToken::parse`]
+/// or [`InitialContextToken::parse`] to interpret them. Partial tokens return
+/// [`super::codec::Step::Need`], including at EOF. The stream reports
+/// truncation at EOF and framing errors once.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Vec<u8>;
+    type Error = Error;
+    const NAME: &'static str = "SPNEGO";
+
+    fn capacity(&self) -> usize {
+        MAX_TOKEN
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
+        Ok(match token_len(input)? {
+            Some(n) => Step::Item(input.get(..n).ok_or(asn1::Error::Truncated)?.to_vec(), n),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a byte stream of tokens sent back to back into one token's bytes
 /// at a time, for a transport that does not frame them itself. Feed it the
 /// bytes in order, take tokens out until it has none, and read each with
 /// [`NegotiationToken::parse`] or [`InitialContextToken::parse`]. It holds
 /// at most [`MAX_TOKEN`] bytes not yet taken out.
+///
+/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
 #[derive(Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -1608,5 +1709,41 @@ mod tests {
                 check(tok);
             }
         }
+    }
+
+    #[test]
+    fn codec_frames_bound_headers_and_report_once() {
+        use super::super::codec::{Decode, Fail, Stream, contract};
+        assert_eq!(Frames::new().capacity(), MAX_TOKEN);
+        let mut stream = Stream::new(Frames::new());
+        let bytes = [GSS_TAG, 0x83, 1, 0, 0];
+        contract::check_decode(Frames::new, &bytes);
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.buffered(), bytes.len());
+    }
+
+    #[test]
+    fn codec_wire_domain_excludes_hint_addresses() {
+        use super::super::codec::{Wire, contract};
+        // The compatibility reader accepts a received hintAddress, while
+        // senders must omit it. Only the Wire parser restricts this domain.
+        let bytes = [0xa0, 10, 0x30, 8, 0xa3, 6, 0x30, 4, 0xa1, 2, 4, 0];
+        let token = NegotiationToken::parse(&bytes).unwrap();
+        assert_eq!(token.to_bytes(), Err(Error::HintAddress));
+        assert_eq!(<NegotiationToken as Wire>::parse(&bytes), Err(Error::HintAddress));
+        contract::check_wire::<NegotiationToken>(&bytes);
+        contract::check_wire_value(&token);
+        let mut out = vec![42];
+        assert_eq!(token.write(&mut out), Err(EncodeError));
+        assert_eq!(out, [42]);
+        let good = NegotiationToken::Resp(NegTokenResp::default());
+        contract::check_wire_value(&good);
+        let wrapper = InitialContextToken { mech: Mech::Kerberos, inner: vec![1, 0, 5, 0] };
+        contract::check_wire_value(&wrapper);
+        let mut bytes = wrapper.to_bytes().unwrap();
+        bytes.push(0);
+        assert!(<InitialContextToken as Wire>::parse(&bytes).is_err());
     }
 }

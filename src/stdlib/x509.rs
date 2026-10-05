@@ -90,6 +90,7 @@
 //! ```
 
 use super::asn1::{self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer};
+use super::codec::{Decode, Step as DecodeStep, Wire};
 use std::fmt;
 use std::fmt::Write as _;
 
@@ -2460,10 +2461,173 @@ fn first_pem_block(text: &[u8], label: &str) -> Result<Vec<u8>, Error> {
     }
 }
 
+/// The most encoded bytes in one streamed PEM block, through its end marker.
+///
+/// This allows twice the maximum base64 size plus two maximum-length lines
+/// for boundaries and whitespace. [`PemBlocks`] retains the whole block in
+/// the stream buffer so any unfinished block is reported as truncation.
+pub const MAX_PEM_FRAME: usize = 2 * MAX_PEM_CHARS + 2 * MAX_PEM_LINE;
+
+impl Wire for Pem {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one block bounded by [`MAX_PEM_FRAME`]. An optional
+    /// final LF, CR, or CRLF is accepted. Surrounding text and other blocks
+    /// are refused. Decoded data is bounded by [`MAX_PEM_DATA`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_PEM_FRAME {
+            return Err(Error::TooLong);
+        }
+        if !bytes.starts_with(PEM_BEGIN) {
+            return Err(Error::Pem);
+        }
+        let mut scanner = Scanner::default();
+        let mut rest = bytes;
+        loop {
+            match scanner.step(rest, 0)? {
+                Step::Line(n) => {
+                    if scanner.open.is_none() {
+                        return Err(Error::Pem);
+                    }
+                    rest = rest.get(n..).ok_or(Error::Pem)?;
+                }
+                Step::Block(block, n) => {
+                    let tail = rest.get(n..).ok_or(Error::Pem)?;
+                    return if matches!(tail, b"" | b"\n" | b"\r" | b"\r\n") { Ok(block) } else { Err(Error::Pem) };
+                }
+                Step::Need => return Err(Error::Pem),
+            }
+        }
+    }
+
+    /// Appends the block with 64-character base64 lines and LF endings.
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let text = self.encode()?;
+        out.extend_from_slice(text.as_bytes());
+        Ok(())
+    }
+}
+
+/// Reads PEM blocks without holding input bytes.
+///
+/// Use with [`super::codec::Stream`]. The buffer holds at most the configured
+/// whole-block limit plus one byte, to refuse an oversized block. Text lines
+/// outside blocks are skipped. Partial blocks return [`super::codec::Step::Need`],
+/// including at EOF, so the stream reports truncation. An end marker completes
+/// an item without consuming its optional line ending. Framing errors are
+/// reported once. Scan positions are relative to the unread start.
+#[derive(Clone, Debug)]
+pub struct PemBlocks {
+    limit: usize,
+    line: usize,
+    searched: usize,
+    label_end: Option<usize>,
+}
+
+impl PemBlocks {
+    /// Creates a decoder with the whole-block limit [`MAX_PEM_FRAME`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PEM_FRAME)
+    }
+
+    /// Sets the encoded block limit, clamped to [`MAX_PEM_FRAME`].
+    /// Zero refuses every block. Lines also obey [`MAX_PEM_LINE`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_PEM_FRAME), line: 0, searched: 0, label_end: None }
+    }
+
+    /// The maximum encoded block size, through its end marker.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    fn reset(&mut self) {
+        self.line = 0;
+        self.searched = 0;
+        self.label_end = None;
+    }
+}
+
+impl Default for PemBlocks {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for PemBlocks {
+    type Item = Pem;
+    type Error = Error;
+    const NAME: &'static str = "PEM";
+
+    fn capacity(&self) -> usize {
+        self.limit.saturating_add(1)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<DecodeStep<Pem>, Error> {
+        // Bound direct calls as well as Stream input. Do not inspect a later
+        // block before returning the current item.
+        let input = input.get(..self.limit.saturating_add(1)).unwrap_or(input);
+        loop {
+            let rest = input.get(self.line..).ok_or(Error::Pem)?;
+            if let Some(label_end) = self.label_end {
+                let label = input.get(PEM_BEGIN.len()..label_end).ok_or(Error::Pem)?;
+                if let Some(tail) = rest.strip_prefix(PEM_END).and_then(|b| b.strip_prefix(label))
+                    && tail.starts_with(PEM_DASHES)
+                {
+                    let marker_len = PEM_END.len().saturating_add(label.len()).saturating_add(PEM_DASHES.len());
+                    let used = self.line.saturating_add(marker_len);
+                    if used > self.limit {
+                        return Err(Error::TooLong);
+                    }
+                    let block = <Pem as Wire>::parse(input.get(..used).ok_or(Error::Pem)?)?;
+                    self.reset();
+                    return Ok(DecodeStep::Item(block, used));
+                }
+            }
+            let newline = input
+                .get(self.searched..)
+                .and_then(|b| b.iter().position(|c| matches!(c, b'\n' | b'\r')))
+                .map(|n| self.searched.saturating_add(n));
+            let Some(end) = newline else {
+                if rest.len() > MAX_PEM_LINE || input.len() > self.limit {
+                    return Err(Error::TooLong);
+                }
+                self.searched = input.len();
+                return Ok(DecodeStep::Need);
+            };
+            if end.saturating_sub(self.line) > MAX_PEM_LINE || end >= self.limit {
+                return Err(Error::TooLong);
+            }
+            if self.label_end.is_none() {
+                let line = input.get(..end).ok_or(Error::Pem)?;
+                let trimmed = line.iter().rposition(|c| !matches!(c, b' ' | b'\t')).map_or(0, |n| n.saturating_add(1));
+                let label = line
+                    .get(..trimmed)
+                    .and_then(|b| b.strip_prefix(PEM_BEGIN))
+                    .and_then(|b| b.strip_suffix(PEM_DASHES));
+                match label.filter(|label| valid_label(label)) {
+                    Some(label) => self.label_end = Some(PEM_BEGIN.len().saturating_add(label.len())),
+                    None => {
+                        self.reset();
+                        return Ok(DecodeStep::Skip(end.saturating_add(1)));
+                    }
+                }
+            }
+            self.line = end.saturating_add(1);
+            self.searched = self.line;
+        }
+    }
+}
+
 /// Splits a stream of PEM text into blocks, such as a bundle of
 /// certificates a world reads from a connection. Feed it the bytes in
 /// order, and take blocks out until it has none. It holds at most
 /// [`MAX_PEM_BUFFER`] bytes it has not read, and one block's base64.
+///
+/// This compatibility decoder preserves repeating errors and buffer counts.
+/// Use [`super::codec::Stream`] with [`PemBlocks`] for EOF and one-time errors.
 #[derive(Debug, Default)]
 pub struct PemDecoder {
     buf: Vec<u8>,
@@ -4101,5 +4265,52 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(name.common_name(), Some("first"));
         name.push(oid(oid::COMMON_NAME), Value::Raw(vec![0x14, 0x01, b'a']));
         assert_eq!(name.common_name(), None);
+    }
+
+    #[test]
+    fn codec_pem_wire_is_exact_and_transactional() {
+        use super::super::codec::{Wire, contract};
+        let block = Pem { label: "TEST".into(), data: vec![1, 2, 3, 4] };
+        contract::check_wire_value(&block);
+        let bytes = <Pem as Wire>::to_bytes(&block).unwrap();
+        contract::check_wire::<Pem>(&bytes);
+        for tail in [&b"text"[..], &bytes] {
+            let mut bad = bytes.clone();
+            bad.extend_from_slice(tail);
+            assert!(<Pem as Wire>::parse(&bad).is_err());
+        }
+        let mut bad = b"prefix\n".to_vec();
+        bad.extend_from_slice(&bytes);
+        assert!(<Pem as Wire>::parse(&bad).is_err());
+        let mut out = vec![42];
+        assert!(Pem { label: "bad--label".into(), data: Vec::new() }.write(&mut out).is_err());
+        assert!(Pem { label: "TEST".into(), data: vec![0; MAX_PEM_DATA + 1] }.write(&mut out).is_err());
+        assert_eq!(out, [42]);
+    }
+
+    #[test]
+    fn codec_pem_scans_without_retaining_partial_bytes() {
+        use super::super::codec::{Decode, Fail, Stream, contract, pump};
+        let text = b"-----BEGIN TEST-----\r\nAQID\r\n-----END TEST-----\r\n";
+        contract::check_decode(PemBlocks::new, text);
+        for limit in 0..=text.len() {
+            contract::check_decode(|| PemBlocks::with_limit(limit), text);
+        }
+        assert_eq!(PemBlocks::with_limit(usize::MAX).limit(), MAX_PEM_FRAME);
+        let mut stream = Stream::new(PemBlocks::new());
+        let partial = b"-----BEGIN TEST-----\nAQID\n";
+        for byte in partial {
+            pump(&mut stream, core::slice::from_ref(byte), |_| panic!("unfinished block")).unwrap();
+            assert_eq!(stream.held(), 0);
+        }
+        assert_eq!(stream.buffered(), partial.len());
+        stream.end();
+        assert_eq!(stream.next(), Some(Err(Fail::Truncated { unread: partial.len() })));
+        assert_eq!(stream.next(), None);
+        let mut decoder = PemBlocks::new();
+        for n in 1..=partial.len() {
+            assert!(matches!(decoder.decode(&partial[..n], false).unwrap(), super::super::codec::Step::Need));
+            assert_eq!(decoder.searched, n);
+        }
     }
 }
