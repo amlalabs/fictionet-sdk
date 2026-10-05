@@ -4,18 +4,13 @@
 #![allow(deprecated)] // Also exercise the compatibility decoder.
 
 use fictionet::stdlib::codec::{Decode, contract};
-use fictionet::stdlib::kafka::{
-    Decoder, Frame, Frames, MAX_FRAME, Reader, Request, Response, api_key,
-};
+use fictionet::stdlib::kafka::{Decoder, Frame, Frames, MAX_FRAME, Reader, Request, Response, api_key};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
     contract::check_wire::<Frame>(data);
-    contract::check_decode(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
-        data,
-    );
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
     contract::check_decode(|| Frames::new().map(|frame| Request::parse(&frame.0)), data);
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
 

@@ -10,14 +10,8 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
     contract::check_wire::<Packet>(data);
-    contract::check_decode(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
-        data,
-    );
-    contract::check_decode(
-        || Frames::new().map(|packet| Message::parse(&packet.data)),
-        data,
-    );
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_decode(|| Frames::new().map(|packet| Message::parse(&packet.data)), data);
     let reserved = data
         .get(..8)
         .map(|bytes| {
@@ -29,11 +23,7 @@ fuzz_target!(|data: &[u8]| {
     let built = Packet {
         flags: data.first().copied().unwrap_or(0),
         reserved,
-        data: data
-            .iter()
-            .take(fictionet::stdlib::zabbix::DEFAULT_LIMIT + 1)
-            .copied()
-            .collect(),
+        data: data.iter().take(fictionet::stdlib::zabbix::DEFAULT_LIMIT + 1).copied().collect(),
     };
     contract::check_wire_value(&built);
 
@@ -79,11 +69,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(Message::parse(m.json().as_bytes()), Ok(m));
     let m = Message::response(false, Some(&text)).unwrap();
     assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
-    let v = SenderValue {
-        host: text.to_string(),
-        key: text.to_string(),
-        value: text.to_string(),
-    };
+    let v = SenderValue { host: text.to_string(), key: text.to_string(), value: text.to_string() };
     let m = Message::sender_data(&[v]).unwrap();
     assert_eq!(Message::parse(m.json().as_bytes()), Ok(m));
 });

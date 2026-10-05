@@ -5,8 +5,7 @@
 
 use fictionet::stdlib::codec::{Decode, contract};
 use fictionet::stdlib::thrift::{
-    Decoder, Error, Frame, Frames, MAX_FRAME, Message, Messages, Protocol, StreamDecoder, Type,
-    Value,
+    Decoder, Error, Frame, Frames, MAX_FRAME, Message, Messages, Protocol, StreamDecoder, Type, Value,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -36,10 +35,7 @@ fn rewrites(m: &Message, protocol: Protocol) {
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Messages::new, data);
     contract::check_decode(Frames::new, data);
-    contract::check_decode(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
-        data,
-    );
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
     contract::check_wire::<Frame>(data);
     contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame.0)), data);
     contract::check_wire_value(&Frame(data.iter().take(MAX_FRAME + 1).copied().collect()));
@@ -84,11 +80,7 @@ fuzz_target!(|data: &[u8]| {
         let mut d = StreamDecoder::new();
         let mut got = Vec::new();
         let mut failed = None;
-        let pieces: Vec<&[u8]> = if whole {
-            vec![data]
-        } else {
-            data.chunks(1).collect()
-        };
+        let pieces: Vec<&[u8]> = if whole { vec![data] } else { data.chunks(1).collect() };
         'feed: for piece in pieces {
             d.feed(piece);
             while let Some(r) = d.next_message() {

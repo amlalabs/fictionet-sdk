@@ -93,8 +93,8 @@
 
 extern crate alloc;
 
-use alloc::{vec, vec::Vec};
 use super::codec::{Decode, Step, Wire};
+use alloc::{vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The TCP port BGP speakers listen on.
@@ -564,6 +564,7 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = EncodeError;
 
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
         match Self::parse(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
@@ -2058,7 +2059,6 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 #[cfg(test)]
-#[deny(deprecated)] // This bounded compatibility API remains supported.
 mod tests {
     use super::*;
 

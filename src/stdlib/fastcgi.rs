@@ -72,8 +72,8 @@
 
 extern crate alloc;
 
-use alloc::{collections::BTreeMap, vec::Vec};
 use super::codec::{Decode, Step, Wire};
+use alloc::{collections::BTreeMap, vec::Vec};
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
 /// convention. The specification names no port.
@@ -339,6 +339,7 @@ impl Wire for Record {
     type ParseError = RecordParseError;
     type WriteError = RecordWriteError;
 
+    /// Reads exactly one record. Incomplete input and trailing bytes are errors.
     fn parse(b: &[u8]) -> Result<Self, RecordParseError> {
         match Self::parse(b).map_err(RecordParseError::Record)? {
             Some((record, used)) if used == b.len() => Ok(record),
@@ -388,6 +389,25 @@ impl core::error::Error for FrameError {
             Self::TooLong { .. } => None,
         }
     }
+}
+
+fn parse_record_limited(b: &[u8], limit: usize) -> Result<Option<(Record, usize)>, FrameError> {
+    // Preserve Record::parse error ordering: Version comes before TooLong.
+    if let Some(&version) = b.first()
+        && version != VERSION
+    {
+        return Err(FrameError::Record(RecordError::Version(version)));
+    }
+    if let Some(&[_, _, _, _, hi, lo, padding, _]) = b.get(..HEADER_LEN) {
+        // The two length fields bound this sum by MAX_RECORD.
+        let length = HEADER_LEN
+            .saturating_add(usize::from(u16::from_be_bytes([hi, lo])))
+            .saturating_add(usize::from(padding));
+        if length > limit {
+            return Err(FrameError::TooLong { length, limit });
+        }
+    }
+    Record::parse(b).map_err(FrameError::Record)
 }
 
 /// Reads FastCGI records without holding input bytes.
@@ -450,22 +470,7 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Record>, FrameError> {
-        // Preserve Record::parse error ordering: Version comes before TooLong.
-        if let Some(&version) = input.first()
-            && version != VERSION
-        {
-            return Err(FrameError::Record(RecordError::Version(version)));
-        }
-        if let Some(&[_, _, _, _, hi, lo, padding, _]) = input.get(..HEADER_LEN) {
-            // The two length fields bound this sum by MAX_RECORD.
-            let length = HEADER_LEN
-                .saturating_add(usize::from(u16::from_be_bytes([hi, lo])))
-                .saturating_add(usize::from(padding));
-            if length > self.limit {
-                return Err(FrameError::TooLong { length, limit: self.limit });
-            }
-        }
-        Ok(match Record::parse(input).map_err(FrameError::Record)? {
+        Ok(match parse_record_limited(input, self.limit)? {
             Some((record, used)) => Step::Item(record, used),
             None => Step::Need,
         })
@@ -477,8 +482,8 @@ impl Decode for Frames {
 /// It holds at most [`MAX_BUFFERED`] bytes that have not been taken out.
 ///
 /// This compatibility decoder keeps its original feed limits and repeated
-/// errors. Use [`Frames`] with [`super::codec::Stream`] for counted input,
-/// EOF handling and errors reported once.
+/// errors. Use [`Frames`] with [`super::codec::Stream`] for EOF handling
+/// and errors reported once.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,

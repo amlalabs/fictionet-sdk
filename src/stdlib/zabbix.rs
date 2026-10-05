@@ -19,8 +19,8 @@
 //! the connection. Compressed data is reported with
 //! [`Packet::is_compressed`] and left as it came; it is not
 //! decompressed. A message keeps its JSON text as it was sent and names
-//! only its kind, so world code reads the rest with whatever JSON
-//! reader it likes.
+//! only its kind, so world code reads the rest with whatever JSON reader it
+//! likes.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A decoder takes a size limit and refuses a packet whose data
@@ -58,8 +58,8 @@
 
 extern crate alloc;
 
-use alloc::{format, string::{String, ToString}, vec::Vec};
 use super::codec::{Decode, Step, Wire};
+use alloc::{format, string::{String, ToString}, vec::Vec};
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
 pub const AGENT_PORT: u16 = 10050;
@@ -314,6 +314,7 @@ impl Wire for Packet {
     type ParseError = PacketParseError;
     type WriteError = PacketError;
 
+    /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
     fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
         match Self::parse(b).map_err(PacketParseError::Packet)? {
             Some((packet, used)) if used == b.len() => Ok(packet),
@@ -353,6 +354,8 @@ impl Wire for Packet {
 /// plus [`Self::limit`]. Partial packets return [`Step::Need`], including at
 /// EOF. The stream reports truncation at EOF and framing errors once.
 /// Compressed payloads remain bytes. Body parsing stays separate.
+/// [`Wire`] accepts data up to [`MAX_DATA`], but [`Frames::new`] refuses data
+/// over [`DEFAULT_LIMIT`]; use [`Frames::with_limit`] for larger packets.
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
@@ -423,7 +426,7 @@ impl Decode for Frames {
 /// [`super::codec::Stream`] for bounded input, EOF handling and errors
 /// reported once.
 #[derive(Clone, Debug)]
-#[deprecated(note = "buffers without a limit; use codec::Stream with zabbix::Frames")]
+#[deprecated(note = "use codec::Stream with zabbix::Frames")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are

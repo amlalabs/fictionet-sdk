@@ -76,8 +76,8 @@
 
 extern crate alloc;
 
-use alloc::{string::String, vec, vec::Vec};
 use super::codec::{Decode, Step, Wire};
+use alloc::{string::String, vec, vec::Vec};
 
 /// The TCP port Thrift servers commonly listen on.
 pub const PORT: u16 = 9090;
@@ -540,7 +540,7 @@ pub enum Error {
     TooDeep,
     /// There are more values than [`MAX_VALUES`].
     TooMany,
-    /// A message read by a [`StreamDecoder`] is longer than [`MAX_MESSAGE`].
+    /// A message read by [`Messages`] or [`StreamDecoder`] is longer than [`MAX_MESSAGE`].
     TooLong,
 }
 
@@ -595,14 +595,14 @@ impl core::error::Error for WriteError {}
 /// reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
-    /// The length was negative or above [`MAX_FRAME`].
+    /// The length was negative or above the configured limit.
     Length(i32),
 }
 
 impl core::fmt::Display for FrameError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FrameError::Length(n) => write!(f, "frame length {n}, outside 0..={MAX_FRAME}"),
+            FrameError::Length(n) => write!(f, "frame length {n} is negative or over the limit"),
         }
     }
 }
@@ -687,6 +687,7 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = WriteError;
 
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
         match parse_frame(b).map_err(FrameParseError::Frame)? {
             Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
@@ -737,9 +738,7 @@ impl Frames {
     /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts empty
     /// payloads. An oversized frame is refused from its four-byte header.
     pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_FRAME),
-        }
+        Self { limit: limit.min(MAX_FRAME) }
     }
 
     /// The maximum payload length, excluding the size prefix.
@@ -780,7 +779,7 @@ impl Decode for Frames {
 /// [`super::codec::Stream`] for bounded input, EOF handling and errors
 /// reported once.
 #[derive(Clone, Debug, Default)]
-#[deprecated(note = "buffers without a limit; use codec::Stream with thrift::Frames")]
+#[deprecated(note = "use codec::Stream with thrift::Frames")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -879,17 +878,19 @@ impl Messages {
         // grow held storage. Each nesting level needs at most two tasks.
         let mut tasks = Vec::with_capacity(2 * MAX_DEPTH);
         tasks.push(Task::Head);
-        Self {
-            pos: 0,
-            tasks,
-            compact: false,
-            values: 0,
-        }
+        Self { pos: 0, tasks, compact: false, values: 0 }
     }
 
     fn scan(&mut self, input: &[u8]) -> Result<bool, Error> {
+        if self.pos > input.len() {
+            self.pos = 0;
+            self.tasks.clear();
+            self.tasks.push(Task::Head);
+            self.compact = false;
+            self.values = 0;
+        }
         while let Some(&task) = self.tasks.last() {
-            let mut r = Reader::new(&input[self.pos..], self.compact);
+            let mut r = Reader::new(input.get(self.pos..).ok_or(Error::Truncated)?, self.compact);
             r.values = self.values;
             match step(task, &mut r, &mut self.tasks) {
                 Ok(()) => {
@@ -911,6 +912,15 @@ impl Messages {
             }
         }
         Ok(true)
+    }
+}
+
+impl Clone for Messages {
+    fn clone(&self) -> Self {
+        // Vec::clone drops spare capacity, which would let held storage grow on Need.
+        let mut tasks = Vec::with_capacity(self.tasks.capacity());
+        tasks.extend_from_slice(&self.tasks);
+        Self { pos: self.pos, tasks, compact: self.compact, values: self.values }
     }
 }
 
@@ -937,7 +947,7 @@ impl Decode for Messages {
         match self.scan(input) {
             Ok(false) => Ok(Step::Need),
             Ok(true) => {
-                let (message, protocol, used) = Message::parse(&input[..self.pos])?;
+                let (message, protocol, used) = Message::parse(input.get(..self.pos).ok_or(Error::Truncated)?)?;
                 self.pos = 0;
                 self.tasks.clear();
                 self.tasks.push(Task::Head);
@@ -969,7 +979,7 @@ impl Decode for Messages {
 /// Use [`Messages`] with [`super::codec::Stream`] for bounded input,
 /// EOF handling and errors reported once.
 #[derive(Clone, Debug)]
-#[deprecated(note = "buffers without a limit; use codec::Stream<thrift::Messages>")]
+#[deprecated(note = "use codec::Stream with thrift::Messages")]
 pub struct StreamDecoder {
     buf: Vec<u8>,
     /// Where the current message starts in `buf`. Bytes before it are
@@ -2260,10 +2270,7 @@ mod tests {
 
         // The binary value fits its own limit, but the whole message does not.
         let message = Message {
-            body: vec![Field {
-                id: 1,
-                value: Value::Binary(vec![0; MAX_BINARY_LEN]),
-            }],
+            body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_BINARY_LEN]) }],
             ..add_call()
         };
         let bytes = message.to_bytes(Protocol::Binary).unwrap();
@@ -2281,10 +2288,7 @@ mod tests {
         // A message exactly at the limit still succeeds.
         let overhead = bytes.len() - MAX_BINARY_LEN;
         let message = Message {
-            body: vec![Field {
-                id: 1,
-                value: Value::Binary(vec![0; MAX_MESSAGE - overhead]),
-            }],
+            body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_MESSAGE - overhead]) }],
             ..add_call()
         };
         let bytes = message.to_bytes(Protocol::Binary).unwrap();
@@ -2293,6 +2297,38 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok((message, Protocol::Binary))));
         assert_eq!(stream.buffered(), 0);
+    }
+
+    #[test]
+    fn messages_clone_preserves_scan_storage() {
+        let message = add_call();
+        for protocol in PROTOCOLS {
+            let bytes = message.to_bytes(protocol).unwrap();
+            let mut decoder = Messages::new();
+            let held = decoder.held();
+            for end in 0..bytes.len() {
+                assert_eq!(decoder.decode(&bytes[..end], false), Ok(Step::Need));
+                let mut cloned = decoder.clone();
+                assert_eq!(cloned.held(), held);
+                assert_eq!(cloned.decode(&bytes[..end], false), Ok(Step::Need));
+                assert_eq!(cloned.held(), held);
+                assert_eq!(cloned.decode(&bytes, false), Ok(Step::Item((message.clone(), protocol), bytes.len())));
+            }
+        }
+    }
+
+    #[test]
+    fn messages_rescan_after_shorter_input() {
+        let message = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
+        for protocol in PROTOCOLS {
+            let bytes = message.to_bytes(protocol).unwrap();
+            for (len, eof) in [(0, true), (2, false)] {
+                let mut decoder = Messages::new();
+                assert_eq!(decoder.decode(&bytes[..bytes.len() - 1], false), Ok(Step::Need));
+                assert_eq!(decoder.decode(&bytes[..len], eof), Ok(Step::Need));
+                assert_eq!(decoder.decode(&bytes, false), Ok(Step::Item((message.clone(), protocol), bytes.len())));
+            }
+        }
     }
 
     #[test]
@@ -2305,10 +2341,7 @@ mod tests {
                 seq: seq as i32,
                 body: vec![Field {
                     id: 1,
-                    value: Value::Struct(vec![Field {
-                        id: 2,
-                        value: Value::I64(-123),
-                    }]),
+                    value: Value::Struct(vec![Field { id: 2, value: Value::I64(-123) }]),
                 }],
                 ..add_call()
             };
@@ -2336,11 +2369,7 @@ mod tests {
         }
         assert_eq!(stream_all(&bytes, || 1), (want, None));
         contract::check_decode(Messages::new, &bytes);
-        contract::check_decode_with_held_limit(
-            Messages::new,
-            &bytes,
-            2 * MAX_DEPTH * core::mem::size_of::<Task>(),
-        );
+        contract::check_decode_with_held_limit(Messages::new, &bytes, 2 * MAX_DEPTH * core::mem::size_of::<Task>());
     }
 
     #[test]
@@ -2365,14 +2394,10 @@ mod tests {
                 }
             }
             if depth <= MAX_DEPTH {
-                assert!(
-                    matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len())
-                );
+                assert!(matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
                 // State is relative to the new unread start after an item.
                 assert_eq!(decoder.decode(&[], false), Ok(Step::Need));
-                assert!(
-                    matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len())
-                );
+                assert!(matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
             } else {
                 assert_eq!(Messages::new().decode(&bytes, false), Err(Error::TooDeep));
             }

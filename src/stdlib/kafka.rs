@@ -73,8 +73,8 @@
 
 extern crate alloc;
 
-use alloc::{borrow::ToOwned, string::String, vec::Vec};
 use super::codec::{Decode, Step, Wire};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
 pub const PORT: u16 = 9092;
@@ -871,6 +871,7 @@ impl Wire for Frame {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         match parse_frame(b, MAX_FRAME)? {
             Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
@@ -964,7 +965,7 @@ impl Decode for Frames {
 /// [`super::codec::Stream`] for bounded input, EOF handling and errors
 /// reported once.
 #[derive(Clone, Debug)]
-#[deprecated(note = "buffers without a limit; use codec::Stream with kafka::Frames")]
+#[deprecated(note = "use codec::Stream with kafka::Frames")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
