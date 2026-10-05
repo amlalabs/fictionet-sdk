@@ -2,10 +2,12 @@
 //! reads them from what the agent sends, and writes them back.
 #![no_main]
 
+use fictionet::stdlib::asn1::{Oid, StringKind};
 use fictionet::stdlib::x509::{
     AuthorityInfoAccess, AuthorityKeyIdentifier, BasicConstraints, Certificate, Crl, CrlDistributionPoints, CrlNumber,
-    CrlReason, ExtendedKeyUsage, ExtensionValue, IssuerAltName, KeyUsage, Name, Pem, PemDecoder, SubjectAltName,
-    SubjectKeyIdentifier, TbsCertList, TbsCertificate, pem_decode,
+    CrlReason, ExtendedKeyUsage, ExtensionValue, GeneralName, IssuerAltName, KeyUsage, MAX_PEM_BUFFER, Name, Pem,
+    PemDecoder, RevokedCertificate, SubjectAltName, SubjectKeyIdentifier, TbsCertList, TbsCertificate, Value,
+    pem_decode,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -33,20 +35,71 @@ fn extension_value(data: &[u8]) {
 }
 
 /// Every block a decoder gives, fed `data` in pieces of `chunk` bytes,
-/// and whether the stream broke.
-fn blocks(data: &[u8], chunk: usize) -> (Vec<Pem>, bool) {
+/// and whether the stream broke. With `lazy`, it feeds until the decoder
+/// takes no more before it takes blocks out.
+fn blocks(data: &[u8], chunk: usize, lazy: bool) -> (Vec<Pem>, bool) {
     let mut d = PemDecoder::new();
     let mut out = Vec::new();
-    for c in data.chunks(chunk.max(1)) {
-        d.feed(c);
+    let mut rest = data;
+    while !rest.is_empty() {
+        let n = d.feed(&rest[..chunk.max(1).min(rest.len())]);
+        rest = &rest[n..];
+        assert!(d.buffered() <= MAX_PEM_BUFFER);
+        if lazy && n > 0 && !rest.is_empty() {
+            continue;
+        }
+        let before = d.buffered();
+        let mut took = false;
         while let Some(r) = d.next_block() {
+            took = true;
             match r {
                 Ok(p) => out.push(p),
                 Err(_) => return (out, true),
             }
         }
+        // A decoder that took nothing reads at least a line.
+        assert!(n > 0 || took || d.buffered() < before);
+    }
+    while let Some(r) = d.next_block() {
+        match r {
+            Ok(p) => out.push(p),
+            Err(_) => return (out, true),
+        }
     }
     (out, false)
+}
+
+/// A value built from the input, not read from it: its writer either
+/// refuses it or writes bytes that read back as the same value.
+fn built(data: &[u8]) {
+    fn same<T: ExtensionValue + PartialEq + std::fmt::Debug>(v: T) {
+        if let Ok(der) = v.to_der() {
+            assert_eq!(T::from_der(&der).unwrap(), v);
+        }
+    }
+    let text = String::from_utf8_lossy(data).into_owned();
+    for g in [
+        GeneralName::Unsupported(data.to_vec()),
+        GeneralName::Ip(data.to_vec()),
+        GeneralName::Dns(text.clone()),
+        GeneralName::Uri(text.clone()),
+        GeneralName::Email(text.clone()),
+    ] {
+        same(SubjectAltName(vec![g]));
+    }
+    if let Ok(oid) = Oid::from_contents(&[0x55, 0x04, 0x03]) {
+        for value in [Value::Raw(data.to_vec()), Value::Text { kind: StringKind::Utf8, text }] {
+            let mut n = Name::default();
+            n.push(oid.clone(), value);
+            if let Ok(der) = n.to_der() {
+                assert_eq!(Name::from_der(&der).unwrap(), n);
+            }
+        }
+    }
+    if let [a, b, ..] = *data {
+        same(KeyUsage(u16::from_be_bytes([a, b])));
+        same(BasicConstraints { ca: a & 1 != 0, path_len: (b & 1 != 0).then_some(u64::from(a)) });
+    }
 }
 
 /// The DER checks: what reads writes back.
@@ -62,6 +115,10 @@ fn der(data: &[u8]) {
         for x in &c.tbs.extensions {
             extension_value(&x.value);
         }
+        // A tbs changed after reading no longer matches the bytes.
+        let mut changed = c.clone();
+        changed.tbs.serial.push(0);
+        assert!(changed.to_der().is_err());
     }
     if let Ok(c) = Crl::parse(data) {
         assert_eq!(c.to_der().unwrap(), data);
@@ -76,6 +133,10 @@ fn der(data: &[u8]) {
         }
         let pem = c.to_pem().unwrap();
         assert_eq!(Crl::from_pem(pem.as_bytes()).unwrap(), c);
+        let mut changed = c.clone();
+        let date = changed.tbs.this_update.clone();
+        changed.tbs.revoked.push(RevokedCertificate { serial: vec![1], revocation_date: date, extensions: Vec::new() });
+        assert!(changed.to_der().is_err());
     }
     if let Ok(n) = Name::from_der(data) {
         assert_eq!(Name::from_der(&n.to_der().unwrap()).unwrap(), n);
@@ -86,13 +147,16 @@ fn der(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     der(data);
+    built(data);
 
-    // The bytes as PEM text, split three ways: all at once, a byte at a
-    // time, and in pieces of a size the input picks.
-    let whole = blocks(data, data.len());
-    assert_eq!(blocks(data, 1), whole);
+    // The bytes as PEM text, split four ways: all at once, a byte at a
+    // time, in pieces of a size the input picks, and those pieces fed
+    // until the decoder is full before any block is taken out.
+    let whole = blocks(data, data.len(), false);
+    assert_eq!(blocks(data, 1, false), whole);
     let chunk = data.first().map_or(1, |&b| usize::from(b % 16) + 1);
-    assert_eq!(blocks(data, chunk), whole);
+    assert_eq!(blocks(data, chunk, false), whole);
+    assert_eq!(blocks(data, chunk, true), whole);
     if let Ok(list) = pem_decode(data) {
         assert!(!whole.1);
         assert_eq!(list, whole.0);

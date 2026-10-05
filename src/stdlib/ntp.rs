@@ -155,7 +155,13 @@ impl Mode {
 ///
 /// The all-zero timestamp means "unknown" in NTP, as in the origin of a
 /// client's first request. [`Timestamp::ZERO`] names it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// Timestamps do not implement `Ord`. Their bits run backward at each era
+/// wrap: a time one second into 2036's era 1 has smaller bits than one a
+/// second before it. To order times, compare [`Timestamp::to_unix`] or
+/// [`Timestamp::to_unix_near`]. For a sort key with no time meaning, use
+/// [`Timestamp::to_bits`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Timestamp {
     /// Whole seconds since the start of the era.
     pub seconds: u32,
@@ -333,7 +339,8 @@ pub struct Packet {
     /// Whether a leap second is coming, or the clock is unset.
     pub leap: Leap,
     /// The NTP version, 1 to 7. 4 is current. The reader refuses 0, and the
-    /// writer clamps it to that range.
+    /// writer clamps it to that range. [`server_reply`] and [`kiss_reply`]
+    /// answer only versions 1 to 4.
     pub version: u8,
     /// What kind of packet this is.
     pub mode: Mode,
@@ -551,42 +558,63 @@ impl Default for ServerInfo {
 /// Why [`server_reply`] or [`kiss_reply`] would not answer a packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyError {
-    /// The packet was not a client request. Holds its mode. Peers and
-    /// broadcast servers do not get server replies.
+    /// The packet was not a request: neither a client's (mode 3) nor a
+    /// symmetric active peer's (mode 1). Holds its mode. Replies and
+    /// broadcasts get no answer.
     NotClient(Mode),
+    /// The request's version was not 1 to 4, the versions RFC 4330 and RFC
+    /// 5905 define. Holds it. A reply copies the request's version, so it
+    /// would claim a protocol this module does not speak.
+    Version(u8),
 }
 
 impl std::fmt::Display for ReplyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ReplyError::NotClient(m) => write!(f, "NTP mode {} packet, not a client request (mode 3)", m.bits()),
+            ReplyError::NotClient(m) => write!(f, "NTP mode {} packet, not a request (mode 3 or 1)", m.bits()),
+            ReplyError::Version(v) => write!(f, "NTP version {v} request, not 1 to 4"),
         }
     }
 }
 
 impl std::error::Error for ReplyError {}
 
-/// A server's (mode 4) reply to a client request, as RFC 5905 builds it.
-/// `receive` is when the request came in and `transmit` when the reply
-/// goes out, both by the world's clock; a world that has no reason to
-/// tell them apart can pass the same time twice. The reply uses the
-/// request's version and poll, and copies the request's transmit time into
-/// its origin so the client can match the two. A stratum of 16 or more is
-/// sent as 0, as RFC 5905's `fast_xmit()` does. The reply carries no
-/// trailer.
+/// The mode a reply to `request` takes: server (4) for a client request
+/// (3), and symmetric passive (2) for a symmetric active peer (1), as RFC
+/// 4330, section 5, says. Only versions 1 to 4 are answered.
+fn reply_mode(request: &Packet) -> Result<Mode, ReplyError> {
+    let mode = match request.mode {
+        Mode::Client => Mode::Server,
+        Mode::SymmetricActive => Mode::SymmetricPassive,
+        other => return Err(ReplyError::NotClient(other)),
+    };
+    if !(1..=VERSION).contains(&request.version) {
+        return Err(ReplyError::Version(request.version));
+    }
+    Ok(mode)
+}
+
+/// A server's reply to a request, as RFC 5905 builds it: mode 4 to a
+/// client (mode 3), and mode 2 to a symmetric active peer (mode 1), as RFC
+/// 4330 does so that clients such as Windows Time in symmetric active mode
+/// get the time too. `receive` is when the request came in and `transmit`
+/// when the reply goes out, both by the world's clock; a world that has no
+/// reason to tell them apart can pass the same time twice. The reply uses
+/// the request's version (1 to 4; others are refused) and poll, and copies
+/// the request's transmit time into its origin so the client can match the
+/// two. A stratum of 16 or more is sent as 0, as RFC 5905's `fast_xmit()`
+/// does. The reply carries no trailer.
 pub fn server_reply(
     request: &Packet,
     server: &ServerInfo,
     receive: Timestamp,
     transmit: Timestamp,
 ) -> Result<Packet, ReplyError> {
-    if request.mode != Mode::Client {
-        return Err(ReplyError::NotClient(request.mode));
-    }
+    let mode = reply_mode(request)?;
     Ok(Packet {
         leap: server.leap,
         version: request.version,
-        mode: Mode::Server,
+        mode,
         stratum: if server.stratum >= 16 { 0 } else { server.stratum },
         poll: request.poll,
         precision: server.precision,
@@ -601,19 +629,18 @@ pub fn server_reply(
     })
 }
 
-/// A kiss-o'-death reply to a client request: stratum 0, the leap
-/// indicator unsynchronized, and `code` in the reference ID. The request's
-/// transmit time goes into all four timestamps, so the reply tells the
-/// client nothing about the server's clock.
+/// A kiss-o'-death reply to a request: stratum 0, the leap indicator
+/// unsynchronized, and `code` in the reference ID. It takes the mode and
+/// version [`server_reply`] would. The request's transmit time goes into
+/// all four timestamps, so the reply tells the client nothing about the
+/// server's clock.
 pub fn kiss_reply(request: &Packet, code: KissCode) -> Result<Packet, ReplyError> {
-    if request.mode != Mode::Client {
-        return Err(ReplyError::NotClient(request.mode));
-    }
+    let mode = reply_mode(request)?;
     let t = request.transmit;
     Ok(Packet {
         leap: Leap::Unsynchronized,
         version: request.version,
-        mode: Mode::Server,
+        mode,
         stratum: 0,
         poll: request.poll,
         precision: 0,
@@ -806,9 +833,63 @@ mod tests {
     }
 
     #[test]
-    fn replies_only_to_clients() {
+    fn a_symmetric_active_peer_gets_a_symmetric_passive_reply() {
+        // RFC 4330, section 5: mode 1 is answered with mode 2, so Windows
+        // Time with its symmetric-active flag (0x4) gets the time too.
+        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes();
+        b[0] = 0x21; // LI 0, version 4, symmetric active.
+        let req = Packet::parse(&b).unwrap();
+        let t = Timestamp::from_unix(1_700_000_001, 0);
+        let reply = server_reply(&req, &ServerInfo::default(), t, t).unwrap();
+        assert_eq!(reply.mode, Mode::SymmetricPassive);
+        assert_eq!(reply.origin, req.transmit);
+        assert_eq!(reply.to_bytes()[0], 0x22);
+        let kod = kiss_reply(&req, KissCode::Rate).unwrap();
+        assert_eq!(kod.mode, Mode::SymmetricPassive);
+        assert_eq!(Packet::parse(&kod.to_bytes()).unwrap().kiss_code(), Some(KissCode::Rate));
+    }
+
+    #[test]
+    fn only_versions_1_to_4_get_replies() {
+        // RFC 5905, appendix A.5.1, drops versions past its own, and RFC
+        // 4330 defines versions 1 to 4. A reply must not claim version 5.
+        let t = Timestamp::from_unix(1_700_000_001, 0);
+        let mut b = Packet::client_request(t).to_bytes();
+        for v in 1..=7u8 {
+            b[0] = (v << 3) | 3;
+            let req = Packet::parse(&b).unwrap();
+            assert_eq!(req.to_bytes(), b);
+            let r = server_reply(&req, &ServerInfo::default(), t, t);
+            let k = kiss_reply(&req, KissCode::Deny);
+            if v <= 4 {
+                assert_eq!(r.unwrap().version, v);
+                assert_eq!(k.unwrap().version, v);
+            } else {
+                assert_eq!(r, Err(ReplyError::Version(v)));
+                assert_eq!(k, Err(ReplyError::Version(v)));
+                assert!(!ReplyError::Version(v).to_string().is_empty());
+            }
+        }
+        // A request built in code with version 0 is refused too.
+        let mut req = Packet::client_request(t);
+        req.version = 0;
+        assert_eq!(server_reply(&req, &ServerInfo::default(), t, t), Err(ReplyError::Version(0)));
+    }
+
+    #[test]
+    fn timestamps_order_by_time_through_unix() {
+        // Two seconds apart across the 2036 wrap. The bits run backward
+        // there, so chronological order goes through to_unix.
+        let before = Timestamp::from_unix(ERA_PIVOT - 1, 0);
+        let after = Timestamp::from_unix(ERA_PIVOT + 1, 0);
+        assert!(after.to_bits() < before.to_bits());
+        assert!(after.to_unix() > before.to_unix());
+    }
+
+    #[test]
+    fn replies_only_to_requests() {
         let mut p = Packet::client_request(Timestamp::ZERO);
-        for mode in [Mode::SymmetricActive, Mode::SymmetricPassive, Mode::Server, Mode::Broadcast] {
+        for mode in [Mode::SymmetricPassive, Mode::Server, Mode::Broadcast] {
             p.mode = mode;
             let e = server_reply(&p, &ServerInfo::default(), Timestamp::ZERO, Timestamp::ZERO).unwrap_err();
             assert_eq!(e, ReplyError::NotClient(mode));

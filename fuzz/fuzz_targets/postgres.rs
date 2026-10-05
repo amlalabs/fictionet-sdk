@@ -3,54 +3,82 @@
 #![no_main]
 
 use fictionet::stdlib::postgres::{
-    Backend, BackendDecoder, Decoder, Frontend, SaslInitialResponse, Startup, read_password,
+    Backend, BackendDecoder, Decoder, Error, Frontend, SMALL_MESSAGE, SaslInitialResponse, Startup, read_password,
 };
 use libfuzzer_sys::fuzz_target;
 
-/// Every frontend message a server decoder gives, and the error that
-/// ends the stream, if any. The stream is fed `chunk` bytes at a time.
-fn frontend(data: &[u8], chunk: usize) -> Vec<Result<Frontend, fictionet::stdlib::postgres::Error>> {
-    let mut d = Decoder::new();
+/// Every message a decoder gives, with the errors that drop one message
+/// and the error that ends the stream, if any. The stream is fed `chunk`
+/// bytes at a time; whatever a feed does not take is fed again once the
+/// messages are out. Every few feeds an empty one comes between two
+/// messages, as a world that reads and feeds in turn would do it.
+fn drain<M>(
+    data: &[u8],
+    chunk: usize,
+    mut feed: impl FnMut(&[u8]) -> usize,
+    mut next: impl FnMut() -> Option<Result<M, Error>>,
+    held: impl Fn() -> (usize, usize),
+) -> Vec<Result<M, Error>> {
     let mut out = Vec::new();
-    for piece in data.chunks(chunk) {
-        d.feed(piece);
-        while let Some(m) = d.next_message() {
-            let stop = m.is_err();
-            out.push(m);
-            if stop {
-                return out;
+    for mut piece in data.chunks(chunk.max(1)) {
+        loop {
+            let took = feed(piece);
+            piece = &piece[took..];
+            let (buffered, capacity) = held();
+            assert!(buffered <= capacity);
+            let before = out.len();
+            while let Some(m) = next() {
+                let stop = matches!(&m, Err(e) if !e.is_recoverable());
+                out.push(m);
+                if stop {
+                    return out;
+                }
+                assert_eq!(feed(&[]), 0);
             }
+            if piece.is_empty() {
+                break;
+            }
+            // A full decoder always has a message or an error.
+            assert!(took > 0 || out.len() > before, "the decoder is stuck");
         }
     }
     out
 }
 
-/// The same for a client decoder reading backend messages.
-fn backend(data: &[u8], chunk: usize) -> Vec<Result<Backend, fictionet::stdlib::postgres::Error>> {
-    let mut d = BackendDecoder::new();
-    let mut out = Vec::new();
-    for piece in data.chunks(chunk) {
-        d.feed(piece);
-        while let Some(m) = d.next_message() {
-            let stop = m.is_err();
-            out.push(m);
-            if stop {
-                return out;
-            }
-        }
-    }
-    out
+fn frontend(data: &[u8], chunk: usize) -> Vec<Result<Frontend, Error>> {
+    // The smallest limit, so a short input can fill the decoder.
+    let d = std::cell::RefCell::new(Decoder::new().with_max_message(SMALL_MESSAGE));
+    drain(
+        data,
+        chunk,
+        |b| d.borrow_mut().feed(b),
+        || d.borrow_mut().next_message(),
+        || (d.borrow().buffered(), d.borrow().capacity()),
+    )
+}
+
+fn backend(data: &[u8], chunk: usize) -> Vec<Result<Backend, Error>> {
+    let d = std::cell::RefCell::new(BackendDecoder::new().with_max_message(SMALL_MESSAGE));
+    drain(
+        data,
+        chunk,
+        |b| d.borrow_mut().feed(b),
+        || d.borrow_mut().next_message(),
+        || (d.borrow().buffered(), d.borrow().capacity()),
+    )
 }
 
 fuzz_target!(|data: &[u8]| {
-    // The stream, split two ways: all at once, and a byte at a time. The
-    // second pass puts a StartupMessage in front, so the fuzzer reaches
-    // the typed messages.
+    // The stream, split three ways: all at once, a byte at a time, and in
+    // pieces whose size the first byte picks. The second pass puts a
+    // StartupMessage in front, so the fuzzer reaches the typed messages.
+    let odd = 1 + usize::from(data.first().copied().unwrap_or(0));
     let mut after_startup = Frontend::Startup(Startup::new("u", "d")).to_bytes();
     after_startup.extend_from_slice(data);
     for stream in [data, &after_startup[..]] {
         let whole = frontend(stream, stream.len().max(1));
         assert_eq!(whole, frontend(stream, 1));
+        assert_eq!(whole, frontend(stream, odd));
         for m in whole.iter().flatten() {
             // A message read can be written, and reads back the same.
             let bytes = m.to_bytes();
@@ -75,13 +103,16 @@ fuzz_target!(|data: &[u8]| {
 
     let whole = backend(data, data.len().max(1));
     assert_eq!(whole, backend(data, 1));
+    assert_eq!(whole, backend(data, odd));
     for m in whole.iter().flatten() {
         let bytes = m.to_bytes();
         assert_eq!(Backend::parse(&bytes), Ok(Some((m.clone(), bytes.len()))));
     }
 
-    // Any bytes as a message on their own.
+    // Any bytes as a message on their own, and as authentication bodies.
     let _ = Frontend::parse(data);
     let _ = Frontend::parse_startup(data);
     let _ = Backend::parse(data);
+    let _ = read_password(data);
+    let _ = SaslInitialResponse::parse(data);
 });

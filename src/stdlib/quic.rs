@@ -15,9 +15,10 @@
 //! Nothing here reads a socket, and nothing here encrypts or decrypts.
 //! Real QUIC protects every packet but Version Negotiation and Retry: the
 //! payload with AEAD, and some header bits and the packet number with
-//! header protection. This module reads and writes packets whose
-//! protection the caller has already removed, or will add after. A world
-//! that plays a QUIC server reads a datagram with [`split_datagram`],
+//! header protection. This module reads and writes packets whose header
+//! protection the caller has already removed, or will add after.
+//! [`Packet`] says where the AEAD tag goes. A world that plays a QUIC
+//! server reads a datagram with [`split_datagram`],
 //! reads each packet's frames with [`parse_frames`], puts CRYPTO and
 //! STREAM data back in order with a [`Reassembler`], and writes its
 //! answers with [`write_frames`] and [`Packet::to_bytes`].
@@ -207,8 +208,9 @@ pub enum Error {
     /// A long header's Length field is too small to hold the packet
     /// number. It holds the field.
     Length(u64),
-    /// A Version Negotiation packet's version list is not a whole number
-    /// of 4-byte versions. It holds the list's length in bytes.
+    /// A Version Negotiation packet's version list is empty or not a
+    /// whole number of 4-byte versions. It holds the list's length in
+    /// bytes. RFC 8999 has a receiver ignore a packet with no versions.
     VersionList(usize),
     /// A Retry packet has no token.
     EmptyToken,
@@ -227,8 +229,14 @@ pub enum Error {
     LongFrameType(u64),
     /// A payload holds more than [`MAX_FRAMES`] frames.
     TooManyFrames,
-    /// An ACK frame has more than [`MAX_ACK_RANGES`] extra ranges.
-    TooManyAckRanges,
+    /// An ACK frame has more than [`MAX_ACK_RANGES`] extra ranges. It
+    /// holds the frame type, 0x02 or 0x03.
+    TooManyAckRanges(u64),
+    /// A writer was given bits for a packet's first byte that do not fit
+    /// their field: `unused` in Version Negotiation (7 bits) or Retry (4
+    /// bits), or `bits` in another version's packet (7 bits). It holds the
+    /// value.
+    FirstByte(u8),
     /// A datagram holds more than [`MAX_COALESCED`] packets.
     TooManyPackets,
     /// A packet with no Length field is followed by another packet in the
@@ -256,7 +264,7 @@ impl Error {
             | Error::UnknownFrame(_)
             | Error::FrameEncoding(_)
             | Error::TooManyFrames
-            | Error::TooManyAckRanges => error_code::FRAME_ENCODING_ERROR,
+            | Error::TooManyAckRanges(_) => error_code::FRAME_ENCODING_ERROR,
             Error::VarintTooLarge(_) => error_code::INTERNAL_ERROR,
             Error::Window(_) => error_code::CRYPTO_BUFFER_EXCEEDED,
             _ => error_code::PROTOCOL_VIOLATION,
@@ -267,8 +275,10 @@ impl Error {
     /// a frame caused it.
     pub fn frame_type(&self) -> Option<u64> {
         match self {
-            Error::UnknownFrame(t) | Error::FrameEncoding(t) | Error::LongFrameType(t) => Some(*t),
-            Error::TooManyAckRanges => Some(frame_type::ACK),
+            Error::UnknownFrame(t)
+            | Error::FrameEncoding(t)
+            | Error::LongFrameType(t)
+            | Error::TooManyAckRanges(t) => Some(*t),
             _ => None,
         }
     }
@@ -285,7 +295,7 @@ impl std::fmt::Display for Error {
             Error::Version(v) => write!(f, "version {v:#010x} does not fit the packet type"),
             Error::PacketNumber { value, len } => write!(f, "packet number {value} does not fit in {len} bytes"),
             Error::Length(n) => write!(f, "Length field {n} cannot hold the packet number"),
-            Error::VersionList(n) => write!(f, "a {n}-byte version list is not whole versions"),
+            Error::VersionList(n) => write!(f, "a {n}-byte version list is empty or not whole versions"),
             Error::EmptyToken => f.write_str("a Retry packet with no token"),
             Error::VarintTooLarge(v) => write!(f, "{v} is above 2^62 - 1"),
             Error::Empty => f.write_str("no frames or packets"),
@@ -293,7 +303,8 @@ impl std::fmt::Display for Error {
             Error::FrameEncoding(t) => write!(f, "frame of type {t:#x} breaks its rules"),
             Error::LongFrameType(t) => write!(f, "frame type {t:#x} is not in its shortest form"),
             Error::TooManyFrames => write!(f, "more than {MAX_FRAMES} frames"),
-            Error::TooManyAckRanges => write!(f, "more than {MAX_ACK_RANGES} ACK ranges"),
+            Error::TooManyAckRanges(_) => write!(f, "more than {MAX_ACK_RANGES} ACK ranges"),
+            Error::FirstByte(b) => write!(f, "{b:#04x} does not fit its bits of the first byte"),
             Error::TooManyPackets => write!(f, "more than {MAX_COALESCED} packets in a datagram"),
             Error::MisplacedPacket => f.write_str("a packet with no Length field is not last in its datagram"),
             Error::MixedConnectionIds => f.write_str("packets in one datagram have different connection IDs"),
@@ -421,8 +432,11 @@ impl PacketNumber {
 
 // Packets (RFC 9000, section 17; RFC 9369, section 3.2).
 
-/// Which packet number space and keys a packet belongs to. Frames are
-/// allowed in some and not others ([`Frame::allowed_in`]).
+/// Which kind of packet, and so which keys, carries a frame: the
+/// encryption level. Frames are allowed in some and not others
+/// ([`Frame::allowed_in`]). 0-RTT and 1-RTT packets have different keys
+/// but share one packet number space (RFC 9000, section 12.3), so packet
+/// numbers and acknowledgments are kept per [`Space::number_space`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Space {
     /// Initial packets.
@@ -435,8 +449,27 @@ pub enum Space {
     OneRtt,
 }
 
-/// One QUIC packet, with its header and packet protection removed. The
-/// payload is kept as bytes; [`parse_frames`] reads the frames in it.
+impl Space {
+    /// The packet number space packets of this kind number from and are
+    /// acknowledged in. It is [`Space::OneRtt`] for 0-RTT, the
+    /// application data space both share, and the kind itself otherwise.
+    pub fn number_space(self) -> Space {
+        match self {
+            Space::ZeroRtt => Space::OneRtt,
+            s => s,
+        }
+    }
+}
+
+/// One QUIC packet, with its header protection removed. The payload is
+/// kept as bytes; [`parse_frames`] reads the frames in it once the AEAD
+/// protection is removed. In Initial, 0-RTT and Handshake packets, the
+/// payload is what the Length field covers past the packet number, so on
+/// the wire it ends with the 16-byte AEAD tag. A reader decrypts the
+/// payload [`Packet::parse`] gives and reads the frames from the
+/// plaintext. A writer appends 16 bytes to the plaintext frames, so the
+/// Length field counts the tag, writes the packet, then protects it in
+/// place.
 /// Connection IDs are byte vectors. Long header packets of versions 1 and
 /// 2 allow up to [`MAX_CID_LEN`] bytes, and the other kinds up to
 /// [`MAX_ANY_CID_LEN`].
@@ -495,7 +528,7 @@ impl Packet {
         let scid = r.cid()?;
         if version == VERSION_NEGOTIATION {
             let rest = r.rest();
-            if !rest.len().is_multiple_of(4) {
+            if rest.is_empty() || !rest.len().is_multiple_of(4) {
                 return Err(Error::VersionList(rest.len()));
             }
             let versions = rest.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect();
@@ -555,15 +588,20 @@ impl Packet {
 
     /// The packet's bytes. It fails if a field cannot be written: a
     /// connection ID or packet number too long, a version that does not
-    /// fit the packet type, a Retry with no token, or a packet longer than
+    /// fit the packet type, first-byte bits that do not fit their field, a
+    /// Version Negotiation packet with no versions, a Retry with no token,
+    /// or a packet longer than
     /// [`MAX_DATAGRAM`]. Anything it writes, [`Packet::parse`] reads back
     /// the same, given the short header's connection ID length.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         match self {
             Packet::VersionNegotiation { unused, dcid, scid, versions } => {
+                if versions.is_empty() {
+                    return Err(Error::VersionList(0));
+                }
                 check_len(versions.len().saturating_mul(4))?;
-                out.push(0x80 | (unused & 0x7f));
+                out.push(0x80 | fits(*unused, 0x7f)?);
                 out.extend_from_slice(&VERSION_NEGOTIATION.to_be_bytes());
                 write_cid(dcid, MAX_ANY_CID_LEN, &mut out)?;
                 write_cid(scid, MAX_ANY_CID_LEN, &mut out)?;
@@ -586,7 +624,7 @@ impl Packet {
                     return Err(Error::EmptyToken);
                 }
                 check_len(token.len())?;
-                out.push(0xc0 | bits << 4 | (unused & 0x0f));
+                out.push(0xc0 | bits << 4 | fits(*unused, 0x0f)?);
                 out.extend_from_slice(&version.to_be_bytes());
                 write_cid(dcid, MAX_CID_LEN, &mut out)?;
                 write_cid(scid, MAX_CID_LEN, &mut out)?;
@@ -615,7 +653,7 @@ impl Packet {
                     return Err(Error::Version(*version));
                 }
                 check_len(rest.len())?;
-                out.push(0x80 | (bits & 0x7f));
+                out.push(0x80 | fits(*bits, 0x7f)?);
                 out.extend_from_slice(&version.to_be_bytes());
                 write_cid(dcid, MAX_ANY_CID_LEN, &mut out)?;
                 write_cid(scid, MAX_ANY_CID_LEN, &mut out)?;
@@ -680,8 +718,9 @@ impl Packet {
         }
     }
 
-    /// The packet number space a packet's frames belong to, for the kinds
-    /// that carry frames.
+    /// The kind of packet for the rules on which frames it may carry, for
+    /// the kinds that carry frames. Its [`Space::number_space`] is the
+    /// packet number space.
     pub fn space(&self) -> Option<Space> {
         match self {
             Packet::Initial { .. } => Some(Space::Initial),
@@ -766,6 +805,11 @@ fn parse_short(first: u8, r: &mut Reader<'_>, dcid_len: usize) -> Result<(Packet
 fn pn_from(bytes: &[u8], len: u8) -> PacketNumber {
     let value = bytes.iter().fold(0u32, |v, &x| (v << 8) | u32::from(x));
     PacketNumber { value, len }
+}
+
+/// `v`, if it has no bits outside `mask`.
+fn fits(v: u8, mask: u8) -> Result<u8, Error> {
+    if v & !mask == 0 { Ok(v) } else { Err(Error::FirstByte(v)) }
 }
 
 fn check_len(n: usize) -> Result<(), Error> {
@@ -1027,8 +1071,12 @@ pub enum Frame {
 impl Frame {
     /// Reads the frame at the start of `b`, a packet payload or what is
     /// left of one, and returns it with how many bytes it took. A run of
-    /// PADDING takes every 0x00 byte in a row.
+    /// PADDING takes every 0x00 byte in a row. Like [`parse_frames`], it
+    /// refuses more than [`MAX_PAYLOAD`] bytes.
     pub fn parse(b: &[u8]) -> Result<(Frame, usize), Error> {
+        if b.len() > MAX_PAYLOAD {
+            return Err(Error::TooLong(b.len()));
+        }
         let mut r = Reader::new(b);
         let frame = parse_frame(&mut r)?;
         Ok((frame, r.pos))
@@ -1091,7 +1139,11 @@ impl Frame {
             Frame::Padding(_) | Frame::Ping => true,
             Frame::ConnectionClose { frame_type: Some(_), .. } => true,
             Frame::Ack(_) | Frame::Crypto { .. } => space != Space::ZeroRtt,
-            Frame::NewToken(_) | Frame::PathResponse(_) | Frame::HandshakeDone => one_rtt,
+            // RFC 9000, section 12.5, and erratum 7365, which corrects
+            // table 3: RETIRE_CONNECTION_ID is not allowed in 0-RTT.
+            Frame::NewToken(_) | Frame::PathResponse(_) | Frame::HandshakeDone | Frame::RetireConnectionId(_) => {
+                one_rtt
+            }
             _ => app,
         }
     }
@@ -1120,7 +1172,7 @@ impl Frame {
             Frame::Ping | Frame::HandshakeDone => out.push(ty as u8),
             Frame::Ack(a) => {
                 if a.ranges.len() > MAX_ACK_RANGES {
-                    return Err(Error::TooManyAckRanges);
+                    return Err(Error::TooManyAckRanges(ty));
                 }
                 if a.packets().is_none() {
                     return Err(Error::FrameEncoding(ty));
@@ -1272,7 +1324,7 @@ fn parse_body(ty: u64, r: &mut Reader<'_>) -> Result<Frame, Error> {
             let delay = r.varint()?;
             let count = r.varint()?;
             if count > MAX_ACK_RANGES as u64 {
-                return Err(Error::TooManyAckRanges);
+                return Err(Error::TooManyAckRanges(ty));
             }
             let first_range = r.varint()?;
             // Each range takes at least 2 bytes.
@@ -2025,8 +2077,8 @@ mod tests {
         );
         let mut b = vec![0x02, 0, 0];
         write_varint(MAX_ACK_RANGES as u64 + 1, &mut b).unwrap();
-        assert_eq!(parse_frames(&b), Err(Error::TooManyAckRanges));
-        assert_eq!(Error::TooManyAckRanges.frame_type(), Some(t::ACK));
+        assert_eq!(parse_frames(&b), Err(Error::TooManyAckRanges(t::ACK)));
+        assert_eq!(Error::TooManyAckRanges(t::ACK).frame_type(), Some(t::ACK));
         // Data ending past 2^62 - 1.
         assert_eq!(parse_frames(&hex("06ffffffffffffffff0100")), Err(Error::FrameEncoding(t::CRYPTO)));
         assert_eq!(parse_frames(&hex("0c00ffffffffffffffff00")), Err(Error::FrameEncoding(0x0c)));
@@ -2071,7 +2123,7 @@ mod tests {
             ranges: vec![AckRange { gap: 0, len: 0 }; MAX_ACK_RANGES + 1],
             ecn: None,
         };
-        assert_eq!(Frame::Ack(many).to_bytes(), Err(Error::TooManyAckRanges));
+        assert_eq!(Frame::Ack(many).to_bytes(), Err(Error::TooManyAckRanges(t::ACK)));
         // Codes for CONNECTION_CLOSE.
         assert_eq!(Error::UnknownFrame(0x40).transport_code(), error_code::FRAME_ENCODING_ERROR);
         assert_eq!(Error::UnknownFrame(0x40).frame_type(), Some(0x40));
@@ -2112,6 +2164,84 @@ mod tests {
     }
 
     #[test]
+    fn second_review() {
+        use frame_type as t;
+        // Frame::parse holds to MAX_PAYLOAD as parse_frames does, so
+        // whatever it reads can be written.
+        let zeros = vec![0; MAX_PAYLOAD + 1];
+        assert_eq!(Frame::parse(&zeros), Err(Error::TooLong(MAX_PAYLOAD + 1)));
+        let (f, used) = Frame::parse(&zeros[..MAX_PAYLOAD]).unwrap();
+        assert_eq!((f.to_bytes().unwrap().len(), used), (MAX_PAYLOAD, MAX_PAYLOAD));
+        let mut crypto = hex("06007fff");
+        crypto.resize(MAX_PAYLOAD + 1, 0);
+        assert_eq!(Frame::parse(&crypto), Err(Error::TooLong(MAX_PAYLOAD + 1)));
+
+        // RFC 9000, section 12.5 and erratum 7365: RETIRE_CONNECTION_ID
+        // is not allowed in 0-RTT.
+        let retire = Frame::RetireConnectionId(0);
+        let got = [Space::Initial, Space::ZeroRtt, Space::Handshake, Space::OneRtt].map(|s| retire.allowed_in(s));
+        assert_eq!(got, [false, false, false, true]);
+
+        // RFC 8999, section 6: a Version Negotiation packet with no
+        // versions is ignored, so it is neither read nor written.
+        assert_eq!(Packet::parse(&hex("c0 00000000 00 00"), 0), Err(Error::VersionList(0)));
+        let empty = Packet::VersionNegotiation { unused: 0x40, dcid: vec![], scid: vec![], versions: vec![] };
+        assert_eq!(empty.to_bytes(), Err(Error::VersionList(0)));
+
+        // RFC 9000, section 12.3: 0-RTT and 1-RTT packets share one
+        // packet number space.
+        assert_eq!(Space::ZeroRtt.number_space(), Space::OneRtt);
+        for s in [Space::Initial, Space::Handshake, Space::OneRtt] {
+            assert_eq!(s.number_space(), s);
+        }
+
+        // Writers refuse first-byte bits that do not fit their field,
+        // rather than dropping them.
+        let vn = Packet::VersionNegotiation { unused: 0x80, dcid: vec![], scid: vec![], versions: vec![VERSION_1] };
+        assert_eq!(vn.to_bytes(), Err(Error::FirstByte(0x80)));
+        let retry = Packet::Retry {
+            version: VERSION_1,
+            unused: 0x10,
+            dcid: vec![],
+            scid: vec![],
+            token: vec![1],
+            tag: [0; RETRY_TAG_LEN],
+        };
+        assert_eq!(retry.to_bytes(), Err(Error::FirstByte(0x10)));
+        let other = Packet::OtherVersion { bits: 0x80, version: 5, dcid: vec![], scid: vec![], rest: vec![] };
+        assert_eq!(other.to_bytes(), Err(Error::FirstByte(0x80)));
+
+        // An ACK frame with too many ranges names its own type, 0x02 or
+        // 0x03.
+        for ty in [t::ACK, t::ACK_ECN] {
+            let mut b = vec![ty as u8, 0, 0];
+            write_varint(MAX_ACK_RANGES as u64 + 1, &mut b).unwrap();
+            assert_eq!(parse_frames(&b), Err(Error::TooManyAckRanges(ty)));
+            assert_eq!(Error::TooManyAckRanges(ty).frame_type(), Some(ty));
+        }
+        let ranges = vec![AckRange { gap: 0, len: 0 }; MAX_ACK_RANGES + 1];
+        let ecn = Some(EcnCounts { ect0: 0, ect1: 0, ce: 0 });
+        let ack = Frame::Ack(Ack { largest: MAX_VARINT, delay: 0, first_range: 0, ranges, ecn });
+        assert_eq!(ack.to_bytes(), Err(Error::TooManyAckRanges(t::ACK_ECN)));
+
+        // The Length field covers the payload as it is on the wire,
+        // AEAD tag included. A sender reserves the tag's bytes at the end
+        // of the payload before it protects the packet.
+        let mut payload = write_frames(&[Frame::Ping]).unwrap();
+        payload.resize(payload.len() + 16, 0);
+        let hs = Packet::Handshake {
+            version: VERSION_1,
+            dcid: vec![],
+            scid: vec![],
+            number: PacketNumber { value: 0, len: 1 },
+            payload,
+        };
+        let b = hs.to_bytes().unwrap();
+        assert_eq!(b[7], 1 + 1 + 16);
+        assert_eq!(Packet::parse(&b, 0).unwrap(), (hs, b.len()));
+    }
+
+    #[test]
     fn errors_display() {
         let all = [
             Error::Truncated,
@@ -2130,7 +2260,8 @@ mod tests {
             Error::FrameEncoding(0x18),
             Error::LongFrameType(0x01),
             Error::TooManyFrames,
-            Error::TooManyAckRanges,
+            Error::TooManyAckRanges(2),
+            Error::FirstByte(0x80),
             Error::TooManyPackets,
             Error::MisplacedPacket,
             Error::MixedConnectionIds,
@@ -2532,7 +2663,7 @@ mod tests {
             if let Ok(b) = p.to_bytes() {
                 let (back, used) = Packet::parse(&b, p.dcid().len()).unwrap();
                 assert_eq!(used, b.len());
-                assert_eq!(back.to_bytes().unwrap(), b);
+                assert_eq!(back, p);
             }
         }
     }

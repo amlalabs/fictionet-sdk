@@ -487,3 +487,228 @@ path = "fuzz_targets/spnego.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "bgp"
+path = "fuzz_targets/bgp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tds"
+path = "fuzz_targets/tds.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "thrift"
+path = "fuzz_targets/thrift.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipp"
+path = "fuzz_targets/ipp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "zabbix"
+path = "fuzz_targets/zabbix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "l2tp"
+path = "fuzz_targets/l2tp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gre"
+path = "fuzz_targets/gre.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "igmp"
+path = "fuzz_targets/igmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "coap"
+path = "fuzz_targets/coap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pop3"
+path = "fuzz_targets/pop3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nbss"
+path = "fuzz_targets/nbss.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nbdgm"
+path = "fuzz_targets/nbdgm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vrrp"
+path = "fuzz_targets/vrrp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pcp"
+path = "fuzz_targets/pcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dtls"
+path = "fuzz_targets/dtls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wireguard"
+path = "fuzz_targets/wireguard.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "radius"
+path = "fuzz_targets/radius.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "diameter"
+path = "fuzz_targets/diameter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ike"
+path = "fuzz_targets/ike.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipsec"
+path = "fuzz_targets/ipsec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "openvpn"
+path = "fuzz_targets/openvpn.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ospf"
+path = "fuzz_targets/ospf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rip"
+path = "fuzz_targets/rip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pim"
+path = "fuzz_targets/pim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "smb2"
+path = "fuzz_targets/smb2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntlmssp"
+path = "fuzz_targets/ntlmssp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dcerpc"
+path = "fuzz_targets/dcerpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tpkt"
+path = "fuzz_targets/tpkt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "whois"
+path = "fuzz_targets/whois.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtcp"
+path = "fuzz_targets/rtcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "portmap"
+path = "fuzz_targets/portmap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wake_on_lan"
+path = "fuzz_targets/wake_on_lan.rs"
+test = false
+doc = false
+bench = false
+

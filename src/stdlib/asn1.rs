@@ -157,8 +157,8 @@ pub enum Error {
     /// Under DER, a set's elements are out of order, or a writer's set has
     /// two elements with the same tag.
     SetOrder,
-    /// [`Writer::implicit`] was given a closure that did not write exactly
-    /// one element.
+    /// [`Writer::implicit`] or [`Writer::explicit`] was given a closure
+    /// that did not write exactly one element.
     Implicit,
 }
 
@@ -186,7 +186,7 @@ impl fmt::Display for Error {
             Error::Charset => f.write_str("characters outside the string type's set"),
             Error::Time => f.write_str("malformed time"),
             Error::SetOrder => f.write_str("set elements out of order or repeated"),
-            Error::Implicit => f.write_str("implicit tag needs exactly one element"),
+            Error::Implicit => f.write_str("a tag needs exactly one element under it"),
         }
     }
 }
@@ -585,21 +585,30 @@ impl Decoder {
         Decoder { buf: Vec::new(), start: 0, rules, failed: None, resume: None }
     }
 
-    /// Adds bytes read from the connection. After an error the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            self.compact();
-            self.buf.extend_from_slice(bytes);
+    /// Adds bytes read from the connection, from the start of `bytes`, and
+    /// returns how many it took. It holds at most [`MAX_INPUT`] bytes not
+    /// yet taken out, so it may take only part of `bytes`: take elements
+    /// out with [`Decoder::next_element`], then feed it the rest. Once it
+    /// holds [`MAX_INPUT`] bytes, `next_element` always gives an element or
+    /// an error, so a loop of the two never stalls. After an error the
+    /// stream cannot be read any further, and every byte is taken and
+    /// dropped.
+    #[must_use = "the bytes past the count it returns were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        self.compact();
+        let n = bytes.len().min(MAX_INPUT - self.buffered().min(MAX_INPUT));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole element's bytes, if one has come. Read them with
     /// [`Reader::new`]. It returns `None` when it needs more bytes, and
-    /// keeps returning the same error once the stream has broken. A decoder
-    /// holds at most [`MAX_INPUT`] bytes beyond what has been taken out,
-    /// plus what one `feed` added. Taken bytes are freed on a later `feed`,
-    /// so its buffer is never much more than twice what it holds.
+    /// keeps returning the same error once the stream has broken. Taken
+    /// bytes are freed on a later `feed`, so the buffer is never much more
+    /// than twice [`MAX_INPUT`].
     pub fn next_element(&mut self) -> Option<Result<Vec<u8>, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -848,13 +857,15 @@ impl<'a> Element<'a> {
             if !child.tag.same_type(Tag::BIT_STRING) {
                 return Err(Error::Unexpected { expected: Tag::BIT_STRING, found: child.tag });
             }
+            // Only the last segment may leave bits unused (8.6.4). Any
+            // segment after one that did is refused, even an empty
+            // constructed one.
+            if *unused != 0 {
+                return Err(Error::BitString);
+            }
             if child.tag.constructed {
                 child.append_bit_segments(out, unused)?;
             } else {
-                // Only the last segment may leave bits unused (8.6.4.2).
-                if *unused != 0 {
-                    return Err(Error::BitString);
-                }
                 let (u, bytes) = bit_segment(child.contents, self.rules)?;
                 out.extend_from_slice(bytes);
                 *unused = u;
@@ -1481,20 +1492,26 @@ impl StringKind {
             StringKind::Universal => {
                 b.len().is_multiple_of(4)
                     && b.chunks_exact(4).all(|c| char::from_u32(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).is_some())
+                    && no_shifts(b.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])))
             }
             StringKind::Bmp => {
                 b.len().is_multiple_of(2)
                     && b.chunks_exact(2).all(|c| !(0xd800..=0xdfff).contains(&u16::from_be_bytes([c[0], c[1]])))
+                    && no_shifts(b.chunks_exact(2).map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))))
             }
             StringKind::Teletex | StringKind::Videotex | StringKind::Graphic | StringKind::General => true,
         };
         if ok { Ok(()) } else { Err(Error::Charset) }
     }
 
-    /// Decodes `b` to text, after checking it.
+    /// Decodes `b` to text, after checking it. More than [`MAX_INPUT`]
+    /// bytes is [`Error::TooLong`].
     pub fn decode(self, b: &[u8]) -> Result<String, Error> {
         if !self.is_decoded() {
             return Err(Error::Charset);
+        }
+        if b.len() > MAX_INPUT {
+            return Err(Error::TooLong);
         }
         self.check(b)?;
         Ok(match self {
@@ -1509,11 +1526,24 @@ impl StringKind {
     }
 
     /// Encodes `s` as the type's bytes, if every character is allowed.
+    /// An encoding of more than [`MAX_INPUT`] bytes is [`Error::TooLong`],
+    /// so whatever [`StringKind::decode`] gives, this takes back.
     pub fn encode(self, s: &str) -> Result<Vec<u8>, Error> {
         if !self.is_decoded() {
             return Err(Error::Charset);
         }
-        if s.len() > MAX_INPUT {
+        // Every character takes at most 4 bytes of UTF-8, and at least 2
+        // bytes in a BMPString and 4 in a UniversalString, so a longer `s`
+        // is too long in every type. Below that, counting is cheap.
+        if s.len() > 4 * MAX_INPUT {
+            return Err(Error::TooLong);
+        }
+        let len = match self {
+            StringKind::Universal => 4 * s.chars().count(),
+            StringKind::Bmp => 2 * s.chars().count(),
+            _ => s.len(),
+        };
+        if len > MAX_INPUT {
             return Err(Error::TooLong);
         }
         let out = match self {
@@ -1531,6 +1561,27 @@ impl StringKind {
         self.check(&out)?;
         Ok(out)
     }
+}
+
+/// Whether UCS characters, as a BMPString or UniversalString holds them,
+/// stay clear of the ISO/IEC 2022 shifts and escape sequences X.690 8.23.9
+/// forbids: SHIFT OUT, SHIFT IN, SINGLE SHIFT TWO and THREE, and ESC
+/// followed by an intermediate byte (announcers, designations and the
+/// identifying sequences of ISO/IEC 10646), by `N` or `O` (single shifts),
+/// or by `n`, `o`, `|`, `}` or `~` (locking shifts). An ESC at the end is
+/// an unfinished sequence and is refused too. Other control functions of
+/// ISO/IEC 6429, such as TAB, LF, CR and CSI sequences, are allowed.
+fn no_shifts(chars: impl Iterator<Item = u32>) -> bool {
+    let mut after_esc = false;
+    for c in chars {
+        if matches!(c, 0x0e | 0x0f | 0x8e | 0x8f)
+            || (after_esc && matches!(c, 0x20..=0x2f | 0x4e | 0x4f | 0x6e | 0x6f | 0x7c..=0x7e))
+        {
+            return false;
+        }
+        after_esc = c == 0x1b;
+    }
+    !after_esc
 }
 
 /// A cursor over time text.
@@ -1579,17 +1630,18 @@ impl Text<'_> {
     }
 }
 
-/// Checks a calendar date and a time of day.
-fn check_date(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> Result<(), Error> {
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+/// Checks a calendar date and a time of day. Second 60, a positive leap
+/// second, is allowed when `leap` is set.
+fn check_date(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32, leap: bool) -> Result<(), Error> {
+    let leap_year = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
     let days = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 if leap => 29,
+        2 if leap_year => 29,
         2 => 28,
         _ => return Err(Error::Time),
     };
-    if day == 0 || day > days || hour > 23 || minute > 59 || second > 59 {
+    if day == 0 || day > days || hour > 23 || minute > 59 || second > if leap { 60 } else { 59 } {
         return Err(Error::Time);
     }
     Ok(())
@@ -1614,14 +1666,15 @@ pub fn check_utc_time(b: &[u8], rules: Rules) -> Result<(), Error> {
         0
     };
     let year = if yy >= 50 { 1900 + yy } else { 2000 + yy };
-    check_date(year, month, day, hour, minute, second)?;
+    check_date(year, month, day, hour, minute, second, false)?;
     t.zone(true, rules)
 }
 
 /// Checks GeneralizedTime text (X.680 46): `YYYYMMDDhh[mm[ss]]`, an
 /// optional fraction after `.` or `,`, and `Z`, an offset or nothing. DER
 /// needs the minutes, the seconds and `Z`, and a fraction, if any, after
-/// `.` with no trailing zero (X.690 11.7).
+/// `.` with no trailing zero (X.690 11.7). The seconds may be 60, a leap
+/// second, as ISO 8601 allows.
 pub fn check_generalized_time(b: &[u8], rules: Rules) -> Result<(), Error> {
     if b.len() > MAX_TIME_LEN {
         return Err(Error::Time);
@@ -1654,7 +1707,7 @@ pub fn check_generalized_time(b: &[u8], rules: Rules) -> Result<(), Error> {
             return Err(Error::Time);
         }
     }
-    check_date(year, month, day, hour, minute, second)?;
+    check_date(year, month, day, hour, minute, second, true)?;
     t.zone(false, rules)
 }
 
@@ -1671,11 +1724,25 @@ enum Order {
 /// be written (a string with characters its type does not allow, too much
 /// nesting, too many bytes) is not written, and [`Writer::finish`] returns
 /// the first such error.
-#[derive(Debug, Default)]
+///
+/// The closure a constructed value takes gets a writer of its own, so
+/// whatever it does to that writer (even replacing it) cannot change what
+/// was written before.
+#[derive(Debug)]
 pub struct Writer {
     out: Vec<u8>,
+    /// How deep the next element written sits.
     depth: usize,
     error: Option<Error>,
+    /// The most bytes `out` may hold: [`MAX_INPUT`] for a writer of its
+    /// own, and what is left of its parent's room for a closure's writer.
+    room: usize,
+}
+
+impl Default for Writer {
+    fn default() -> Writer {
+        Writer { out: Vec::new(), depth: 0, error: None, room: MAX_INPUT }
+    }
 }
 
 impl Writer {
@@ -1724,36 +1791,70 @@ impl Writer {
         let mut head = Vec::with_capacity(11);
         tag.encode(&mut head);
         encode_length(contents.len(), &mut head);
-        if head.len() + contents.len() > MAX_INPUT - self.out.len().min(MAX_INPUT) {
+        if head.len() + contents.len() > self.left() {
             return self.fail(Error::TooLong);
         }
         self.out.extend_from_slice(&head);
         self.out.extend_from_slice(contents);
     }
 
-    fn nest(&mut self, tag: Tag, order: Order, f: impl FnOnce(&mut Writer)) {
+    /// How many more bytes `out` may take.
+    fn left(&self) -> usize {
+        self.room.min(MAX_INPUT).saturating_sub(self.out.len())
+    }
+
+    /// Runs `f` on a writer of its own whose elements sit at `depth`, and
+    /// returns what it wrote. If `f` put another writer in its place, one
+    /// made for another depth, what that writer holds is read again at
+    /// `depth`, so nothing nests deeper than a reader opens.
+    fn run(&self, depth: usize, f: impl FnOnce(&mut Writer)) -> Result<Vec<u8>, Error> {
+        let mut child = Writer { out: Vec::new(), depth, error: None, room: self.left() };
+        f(&mut child);
+        if let Some(e) = child.error {
+            return Err(e);
+        }
+        if child.depth != depth {
+            for e in (Reader { rest: &child.out, rules: Rules::Der, depth }) {
+                check_der(&e?)?;
+            }
+        }
+        Ok(child.out)
+    }
+
+    /// The contents of a constructed value whose children `f` writes, in
+    /// `order`, or `None` after an error.
+    fn nest(&mut self, order: Order, f: impl FnOnce(&mut Writer)) -> Option<Vec<u8>> {
         if self.error.is_some() {
-            return;
+            return None;
         }
         if self.depth >= MAX_DEPTH {
-            return self.fail(Error::TooDeep);
+            self.fail(Error::TooDeep);
+            return None;
         }
-        let start = self.out.len();
-        self.depth += 1;
-        f(self);
-        self.depth -= 1;
-        if self.error.is_some() {
-            return;
-        }
-        let contents = self.out.split_off(start);
+        let contents = match self.run(self.depth + 1, f) {
+            Ok(c) => c,
+            Err(e) => {
+                self.fail(e);
+                return None;
+            }
+        };
         let contents = match order {
             Order::AsWritten => contents,
             Order::Tags | Order::Encodings => match sorted(&contents, order) {
                 Ok(c) => c,
-                Err(e) => return self.fail(e),
+                Err(e) => {
+                    self.fail(e);
+                    return None;
+                }
             },
         };
-        self.put(tag.as_constructed(), &contents);
+        Some(contents)
+    }
+
+    fn nest_put(&mut self, tag: Tag, order: Order, f: impl FnOnce(&mut Writer)) {
+        if let Some(contents) = self.nest(order, f) {
+            self.put(tag.as_constructed(), &contents);
+        }
     }
 
     /// Writes a BOOLEAN.
@@ -1798,6 +1899,12 @@ impl Writer {
     pub fn integer_unsigned(&mut self, magnitude: &[u8]) {
         let skip = magnitude.iter().take_while(|&&b| b == 0).count();
         let m = &magnitude[skip..];
+        if self.error.is_some() {
+            return;
+        }
+        if m.len() >= MAX_INPUT {
+            return self.fail(Error::TooLong);
+        }
         if m.first().is_none_or(|&b| b & 0x80 != 0) {
             let mut c = Vec::with_capacity(m.len() + 1);
             c.push(0);
@@ -1900,30 +2007,39 @@ impl Writer {
         if tag.class == Class::Universal {
             return self.fail(Error::Tag);
         }
-        self.nest(tag, Order::AsWritten, f);
+        self.nest_put(tag, Order::AsWritten, f);
     }
 
-    /// Writes an explicitly tagged `[number]` around what `f` writes.
+    /// Writes an explicitly tagged `[number]` around the one element `f`
+    /// writes (X.690 8.14.3). If `f` writes none or more than one, the
+    /// error is [`Error::Implicit`].
     pub fn explicit(&mut self, number: u32, f: impl FnOnce(&mut Writer)) {
-        self.nest(Tag::context(number), Order::AsWritten, f);
+        let tag = Tag::context(number);
+        if let Some(contents) = self.nest(Order::AsWritten, f) {
+            let mut r = Reader::new(&contents, Rules::Der);
+            match (r.read(), r.is_empty()) {
+                (Ok(_), true) => self.put(tag.as_constructed(), &contents),
+                _ => self.fail(Error::Implicit),
+            }
+        }
     }
 
     /// Writes a SEQUENCE (or SEQUENCE OF) whose children `f` writes, in
     /// order.
     pub fn sequence(&mut self, f: impl FnOnce(&mut Writer)) {
-        self.nest(Tag::SEQUENCE, Order::AsWritten, f);
+        self.nest_put(Tag::SEQUENCE, Order::AsWritten, f);
     }
 
     /// Writes a SET whose children `f` writes. They are put in tag order,
     /// as DER requires, and two with the same tag are an error.
     pub fn set(&mut self, f: impl FnOnce(&mut Writer)) {
-        self.nest(Tag::SET, Order::Tags, f);
+        self.nest_put(Tag::SET, Order::Tags, f);
     }
 
     /// Writes a SET OF whose children `f` writes. They are put in the order
     /// of their encodings, as DER requires.
     pub fn set_of(&mut self, f: impl FnOnce(&mut Writer)) {
-        self.nest(Tag::SET, Order::Encodings, f);
+        self.nest_put(Tag::SET, Order::Encodings, f);
     }
 
     /// Writes one element already encoded in DER, such as the
@@ -1941,7 +2057,7 @@ impl Writer {
             check_der(&e)
         });
         match checked {
-            Ok(()) if der.len() > MAX_INPUT - self.out.len().min(MAX_INPUT) => self.fail(Error::TooLong),
+            Ok(()) if der.len() > self.left() => self.fail(Error::TooLong),
             Ok(()) => self.out.extend_from_slice(der),
             Err(e) => self.fail(e),
         }
@@ -1957,12 +2073,10 @@ impl Writer {
         if tag.class == Class::Universal {
             return self.fail(Error::Tag);
         }
-        let start = self.out.len();
-        f(self);
-        if self.error.is_some() {
-            return;
-        }
-        let written = self.out.split_off(start);
+        let written = match self.run(self.depth, f) {
+            Ok(w) => w,
+            Err(e) => return self.fail(e),
+        };
         let mut r = Reader::new(&written, Rules::Der);
         match (r.read(), r.is_empty()) {
             (Ok(e), true) => self.put(Tag { constructed: e.tag.constructed, ..tag }, e.contents),
@@ -2162,7 +2276,7 @@ mod tests {
         for rules in [Rules::Ber, Rules::Der] {
             // The stream, split two ways: all at once, and a byte at a time.
             let mut whole = Decoder::new(rules);
-            whole.feed(data);
+            assert_eq!(whole.feed(data), data.len());
             let mut all = Vec::new();
             let mut end = None;
             while let Some(r) = whole.next_element() {
@@ -2178,7 +2292,7 @@ mod tests {
             let mut again = Vec::new();
             let mut end_again = None;
             'outer: for b in data {
-                bytewise.feed(std::slice::from_ref(b));
+                assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
                 while let Some(r) = bytewise.next_element() {
                     match r {
                         Ok(e) => again.push(e),
@@ -2621,7 +2735,7 @@ mod tests {
             "20001301000000Z",
             "20000101240000Z",
             "20000101006000Z",
-            "20000101000060Z",
+            "20000101000061Z",
             "20000101000000.Z",
             "20000101000000Zx",
             "20000101000000+2400",
@@ -2827,7 +2941,7 @@ mod tests {
         let mut d = Decoder::new(Rules::Ber);
         let mut result = None;
         for chunk in endless.chunks(1 << 16) {
-            d.feed(chunk);
+            assert_eq!(d.feed(chunk), chunk.len());
             assert!(d.buffered() <= MAX_INPUT + (1 << 16));
             if let Some(r) = d.next_element() {
                 result = Some(r);
@@ -2911,7 +3025,7 @@ mod tests {
         let mut d = Decoder::new(Rules::Ber);
         let mut got = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
+            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
             while let Some(e) = d.next_element() {
                 got.push(e.unwrap());
             }
@@ -2920,10 +3034,10 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         // DER refuses the indefinite one, and the stream stays broken.
         let mut d = Decoder::new(Rules::Der);
-        d.feed(&stream);
+        assert_eq!(d.feed(&stream), stream.len());
         assert_eq!(d.next_element(), Some(Ok(a.clone())));
         assert_eq!(d.next_element(), Some(Err(Error::Indefinite)));
-        d.feed(&a);
+        assert_eq!(d.feed(&a), a.len());
         assert_eq!(d.next_element(), Some(Err(Error::Indefinite)));
         assert_eq!(d.buffered(), 0);
     }
@@ -2952,7 +3066,7 @@ mod tests {
         let mut d = Decoder::new(Rules::Ber);
         let mut got = Vec::new();
         for byte in &b {
-            d.feed(std::slice::from_ref(byte));
+            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
             while let Some(e) = d.next_element() {
                 got.push(e.unwrap());
             }
@@ -2968,7 +3082,7 @@ mod tests {
         let n = MAX_INPUT / 2;
         let stream = [0x05, 0x00].repeat(n);
         let mut d = Decoder::new(Rules::Der);
-        d.feed(&stream);
+        assert_eq!(d.feed(&stream), stream.len());
         let mut count = 0;
         while let Some(e) = d.next_element() {
             assert_eq!(e.unwrap(), [0x05, 0x00]);
@@ -2983,7 +3097,7 @@ mod tests {
         let mut d = Decoder::new(Rules::Ber);
         let mut got = Vec::new();
         for chunk in stream.chunks(7) {
-            d.feed(chunk);
+            assert_eq!(d.feed(chunk), chunk.len());
             while let Some(e) = d.next_element() {
                 got.push(e.unwrap());
             }
@@ -3052,7 +3166,7 @@ mod tests {
         );
         let mut d = Decoder::new(Rules::Der);
         assert_eq!(d.rules(), Rules::Der);
-        d.feed(&t[..1]);
+        assert_eq!(d.feed(&t[..1]), 1);
         assert_eq!((d.next_element(), d.buffered()), (None, 1));
         assert_eq!(BitString::new(vec![0; MAX_INPUT + 1], 0), Err(Error::TooLong));
     }
@@ -3091,5 +3205,234 @@ mod tests {
             }
             check(&data);
         }
+    }
+
+    #[test]
+    fn bit_string_segment_after_unused_bits_is_refused() {
+        // X.690 8.6.4: only the last segment may leave bits unused. An
+        // empty constructed segment after a seven-bit one is still a later
+        // segment.
+        let b = [0x23, 0x06, 0x03, 0x02, 0x01, 0xfe, 0x23, 0x00];
+        assert_eq!(one(&b, Rules::Ber).unwrap().bit_string(), Err(Error::BitString));
+        // Nested one level down too.
+        let b = [0x23, 0x08, 0x23, 0x04, 0x03, 0x02, 0x01, 0xfe, 0x23, 0x00];
+        assert_eq!(one(&b, Rules::Ber).unwrap().bit_string(), Err(Error::BitString));
+        // Empty segments before the last are fine.
+        let b = [0x23, 0x06, 0x23, 0x00, 0x03, 0x02, 0x01, 0xfe];
+        let v = one(&b, Rules::Ber).unwrap().bit_string().unwrap();
+        assert_eq!((v.bytes(), v.unused()), (&[0xfe][..], 1));
+    }
+
+    #[test]
+    fn generalized_time_takes_a_leap_second() {
+        // ISO 8601, which X.680 46 follows, writes a positive leap second
+        // as second 60.
+        for t in ["20161231235960Z", "20161231235960.5Z"] {
+            assert_eq!(check_generalized_time(t.as_bytes(), Rules::Der), Ok(()), "{t}");
+            let mut w = Writer::new();
+            w.generalized_time(t);
+            let b = w.finish().unwrap();
+            assert_eq!(Reader::new(&b, Rules::Der).read_generalized_time().unwrap(), t);
+        }
+        assert_eq!(check_generalized_time(b"20170101085960+0900", Rules::Ber), Ok(()));
+        assert_eq!(check_generalized_time(b"20161231235961Z", Rules::Ber), Err(Error::Time));
+        assert_eq!(check_utc_time(b"161231235960Z", Rules::Der), Err(Error::Time));
+    }
+
+    #[test]
+    fn ucs_strings_refuse_iso_2022_shifts() {
+        // X.690 8.23.9: SHIFT OUT and SHIFT IN, single shifts, and ISO/IEC
+        // 2022 escape sequences may not appear in a BMPString or a
+        // UniversalString. TAB, LF, CR and other controls may.
+        for bad in [
+            &[0x00, 0x0e][..],
+            &[0x00, 0x0f],
+            &[0x00, 0x8e],
+            &[0x00, 0x8f],
+            &[0x00, 0x1b, 0x00, 0x28, 0x00, 0x42],
+            &[0x00, 0x1b, 0x00, 0x6e],
+            &[0x00, 0x1b],
+        ] {
+            assert_eq!(StringKind::Bmp.check(bad), Err(Error::Charset), "{bad:02x?}");
+            let mut b = vec![0x1e, bad.len() as u8];
+            b.extend_from_slice(bad);
+            assert_eq!(Reader::new(&b, Rules::Der).read_text(), Err(Error::Charset));
+        }
+        assert_eq!(StringKind::Universal.check(&[0, 0, 0, 0x0e]), Err(Error::Charset));
+        assert_eq!(StringKind::Universal.check(&[0, 0, 0, 0x1b, 0, 0, 0, 0x24]), Err(Error::Charset));
+        let mut w = Writer::new();
+        w.text(StringKind::Bmp, "\u{000e}");
+        assert_eq!(w.finish(), Err(Error::Charset));
+        let mut w = Writer::new();
+        w.text(StringKind::Universal, "a\u{001b}(B");
+        assert_eq!(w.finish(), Err(Error::Charset));
+        // Allowed controls, and ESC before a CSI sequence or another ESC.
+        for ok in ["a\tb\r\n", "\u{1b}[1m", "\u{1b}\u{1b}[", "\u{85}"] {
+            for kind in [StringKind::Bmp, StringKind::Universal] {
+                let b = kind.encode(ok).unwrap();
+                assert_eq!(kind.decode(&b).unwrap(), ok);
+            }
+        }
+        assert_eq!(StringKind::Bmp.encode("\u{1b}\u{1b}("), Err(Error::Charset));
+    }
+
+    #[test]
+    fn large_bmp_text_round_trips() {
+        // 400,000 characters of U+0800 are 800,000 bytes as a BMPString
+        // but 1,200,000 bytes of UTF-8. What a reader gives, a writer
+        // takes back.
+        let s = "\u{800}".repeat(400_000);
+        let mut w = Writer::new();
+        w.text(StringKind::Bmp, &s);
+        let b = w.finish().unwrap();
+        let (kind, back) = Reader::new(&b, Rules::Der).read_text().unwrap();
+        assert_eq!((kind, back.len()), (StringKind::Bmp, s.len()));
+        assert!(StringKind::Bmp.encode(&back).unwrap() == b[5..]);
+        // A UniversalString is measured by its own bytes too: 300,000
+        // ASCII characters are 1,200,000 bytes.
+        assert_eq!(StringKind::Universal.encode(&"a".repeat(300_000)), Err(Error::TooLong));
+        assert_eq!(StringKind::Universal.encode(&"a".repeat(200_000)).map(|b| b.len()), Ok(800_000));
+        assert_eq!(StringKind::Utf8.encode(&"a".repeat(MAX_INPUT + 1)), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn string_decode_is_bounded() {
+        let big = vec![b'a'; MAX_INPUT + 1];
+        assert_eq!(StringKind::Utf8.decode(&big), Err(Error::TooLong));
+        assert_eq!(StringKind::Utf8.decode(&big[..MAX_INPUT]).map(|s| s.len()), Ok(MAX_INPUT));
+    }
+
+    #[test]
+    fn integer_unsigned_checks_size_first() {
+        let mut w = Writer::new();
+        w.integer_unsigned(&vec![0x80; MAX_INPUT]);
+        assert_eq!(w.error(), Some(Error::TooLong));
+        assert!(w.is_empty());
+        let mut w = Writer::new();
+        w.integer_unsigned(&[0x80]);
+        assert_eq!(w.finish().unwrap(), [0x02, 0x02, 0x00, 0x80]);
+    }
+
+    #[test]
+    fn explicit_needs_exactly_one_element() {
+        // X.690 8.14.3: the contents are the complete base encoding.
+        let mut w = Writer::new();
+        w.explicit(0, |_| {});
+        assert_eq!(w.finish(), Err(Error::Implicit));
+        let mut w = Writer::new();
+        w.explicit(0, |w| {
+            w.null();
+            w.null();
+        });
+        assert_eq!(w.finish(), Err(Error::Implicit));
+        assert_eq!(der(|w| w.explicit(0, |w| w.null())), [0xa0, 0x02, 0x05, 0x00]);
+    }
+
+    #[test]
+    fn closures_cannot_corrupt_the_writer() {
+        // Replacing the writer a closure is given cannot touch what was
+        // written before, or the nesting count.
+        let mut w = Writer::new();
+        w.null();
+        w.implicit(Tag::context(0), |inner| *inner = Writer::new());
+        assert_eq!(w.finish(), Err(Error::Implicit));
+
+        let mut w = Writer::new();
+        w.null();
+        w.sequence(|inner| *inner = Writer::new());
+        w.null();
+        assert_eq!(w.finish().unwrap(), [0x05, 0x00, 0x30, 0x00, 0x05, 0x00]);
+
+        // A replacement holding elements of its own: they are kept, inside
+        // the sequence, and the earlier NULL stays where it was.
+        let mut w = Writer::new();
+        w.null();
+        w.sequence(|inner| {
+            let mut other = Writer::new();
+            other.sequence(|w| w.integer_i64(5));
+            *inner = other;
+        });
+        let b = w.finish().unwrap();
+        assert_eq!(b, [0x05, 0x00, 0x30, 0x05, 0x30, 0x03, 0x02, 0x01, 0x05]);
+        check(&b);
+
+        // A replacement made at depth 0 cannot carry nesting past the
+        // limit into a deeper place.
+        fn deep(w: &mut Writer, n: usize) {
+            if n > 0 {
+                w.sequence(|w| deep(w, n - 1));
+            }
+        }
+        let mut w = Writer::new();
+        w.sequence(|inner| {
+            let mut other = Writer::new();
+            deep(&mut other, MAX_DEPTH);
+            assert_eq!(other.error(), None);
+            *inner = other;
+        });
+        assert_eq!(w.finish(), Err(Error::TooDeep));
+
+        // Taking the writer out with `mem::take` works the same way.
+        let mut w = Writer::new();
+        w.set(|inner| {
+            inner.integer_i64(1);
+            let taken = std::mem::take(inner);
+            assert_eq!(taken.len(), 3);
+        });
+        assert_eq!(w.finish().unwrap(), [0x31, 0x00]);
+
+        // A closure's writer has only the room its parent has left.
+        let mut w = Writer::new();
+        w.octet_string(&vec![0; MAX_INPUT - 20]);
+        w.sequence(|inner| {
+            inner.octet_string(&[0; 30]);
+            assert_eq!(inner.error(), Some(Error::TooLong));
+        });
+        assert_eq!(w.finish(), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn decoder_holds_a_bounded_number_of_bytes() {
+        // One large feed is taken only up to MAX_INPUT bytes.
+        let stream = [0x05, 0x00].repeat(MAX_INPUT);
+        let mut d = Decoder::new(Rules::Der);
+        assert_eq!(d.feed(&stream), MAX_INPUT);
+        assert_eq!(d.buffered(), MAX_INPUT);
+        // Feeding again without taking anything out takes nothing.
+        assert_eq!(d.feed(&stream[MAX_INPUT..]), 0);
+        assert_eq!(d.buffered(), MAX_INPUT);
+        // A loop of feeding and taking out gets every element.
+        let mut d = Decoder::new(Rules::Der);
+        let mut rest = &stream[..];
+        let mut count = 0;
+        while !rest.is_empty() {
+            let n = d.feed(rest);
+            rest = &rest[n..];
+            while let Some(e) = d.next_element() {
+                assert_eq!(e.unwrap(), [0x05, 0x00]);
+                count += 1;
+            }
+            assert!(d.buf.capacity() <= 4 * MAX_INPUT);
+        }
+        assert_eq!(count, MAX_INPUT);
+        // An element that never ends gives an error at the limit instead
+        // of stalling the loop.
+        let mut d = Decoder::new(Rules::Ber);
+        let mut endless = vec![0x30, 0x80];
+        endless.resize(MAX_INPUT + 100, 0x05);
+        assert_eq!(d.feed(&[0x24, 0x80]), 2);
+        let mut rest = &[0x04, 0x01, 0x00].repeat(MAX_INPUT)[..];
+        let result = loop {
+            let n = d.feed(rest);
+            rest = &rest[n..];
+            if let Some(r) = d.next_element() {
+                break r;
+            }
+            assert!(n > 0);
+        };
+        assert_eq!(result, Err(Error::TooLong));
+        // After an error every byte is taken and dropped.
+        assert_eq!(d.feed(&endless), endless.len());
+        assert_eq!(d.buffered(), 0);
     }
 }

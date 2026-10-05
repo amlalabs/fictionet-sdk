@@ -27,9 +27,10 @@ fn client_turn(s: &ClientSession, version: Version, vnc: bool) -> Option<ClientM
     Some(match s.phase() {
         Phase::ClientVersion => ClientMessage::Version(version),
         Phase::SecurityChoice => {
+            // Type 0 is not a type, and cannot be picked.
             let offered = s.offered();
             let pick = [if vnc { 2 } else { 1 }, 1, 2].into_iter().find(|t| offered.contains(t));
-            ClientMessage::SecurityType(pick.unwrap_or(offered[0]))
+            ClientMessage::SecurityType(pick.or_else(|| offered.iter().copied().find(|&t| t != 0))?)
         }
         Phase::VncResponse => ClientMessage::VncResponse([9; 16]),
         Phase::ClientInit => ClientMessage::ClientInit { shared: true },
@@ -37,24 +38,42 @@ fn client_turn(s: &ClientSession, version: Version, vnc: bool) -> Option<ClientM
     })
 }
 
+/// Sends whatever the server has to send, then takes out what the client
+/// sent, until it needs more bytes. It returns false once the stream broke.
+fn server_pump(s: &mut ServerSession, vnc: bool, got: &mut Vec<Result<ClientMessage, Error>>) -> bool {
+    loop {
+        if let Some(m) = server_turn(s, vnc) {
+            s.send(&m).unwrap();
+            continue;
+        }
+        match s.next_message() {
+            Some(Ok(m)) => got.push(Ok(m)),
+            Some(Err(e)) => {
+                got.push(Err(e));
+                return false;
+            }
+            None => {
+                // Sends that do not change how the client's bytes split,
+                // between any two feeds.
+                if s.phase() == Phase::Normal {
+                    s.send(&ServerMessage::Bell).unwrap();
+                }
+                return true;
+            }
+        }
+    }
+}
+
 fn as_server<'a>(vnc: bool, chunks: impl Iterator<Item = &'a [u8]>) -> Vec<Result<ClientMessage, Error>> {
     let mut s = ServerSession::new();
     let mut got = Vec::new();
+    // The server speaks first, before any of the client's bytes come, so
+    // every chunking feeds them in the same phases.
+    server_pump(&mut s, vnc, &mut got);
     for chunk in chunks {
         s.feed(chunk);
-        loop {
-            if let Some(m) = server_turn(&s, vnc) {
-                s.send(&m).unwrap();
-                continue;
-            }
-            match s.next_message() {
-                Some(Ok(m)) => got.push(Ok(m)),
-                Some(Err(e)) => {
-                    got.push(Err(e));
-                    return got;
-                }
-                None => break,
-            }
+        if !server_pump(&mut s, vnc, &mut got) {
+            break;
         }
     }
     got
@@ -67,7 +86,7 @@ fn as_client<'a>(
 ) -> Vec<Result<(ServerMessage, PixelFormat), Error>> {
     let mut s = ClientSession::new();
     let mut got = Vec::new();
-    for chunk in chunks {
+    'feed: for chunk in chunks {
         s.feed(chunk);
         loop {
             if let Some(m) = client_turn(&s, version, vnc) {
@@ -78,9 +97,16 @@ fn as_client<'a>(
                 Some(Ok(m)) => got.push(Ok((m, s.pixel_format()))),
                 Some(Err(e)) => {
                     got.push(Err(e));
-                    return got;
+                    break 'feed;
                 }
-                None => break,
+                None => {
+                    // A pointer event between feeds, even mid-update, must
+                    // not change what is read.
+                    if s.phase() == Phase::Normal {
+                        s.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
+                    }
+                    break;
+                }
             }
         }
     }
@@ -98,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(whole, as_server(vnc, data.chunks(1)));
     for m in whole.iter().flatten() {
         // A message read can be written, and reads back the same.
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         if !m.is_handshake() {
             assert_eq!(ClientMessage::parse(&bytes), Ok(Some((m.clone(), bytes.len()))));
         }
@@ -117,7 +143,7 @@ fuzz_target!(|data: &[u8]| {
     // Any bytes as a message on their own.
     let _ = Version::parse(data);
     if let Ok(Some((m, _))) = ClientMessage::parse(data) {
-        assert_eq!(ClientMessage::parse(&m.to_bytes()).unwrap().unwrap().0, m);
+        assert_eq!(ClientMessage::parse(&m.to_bytes().unwrap()).unwrap().unwrap().0, m);
     }
     let mut format = PixelFormat::TRUE_COLOR_32;
     format.bits_per_pixel = [8, 16, 32, 24][usize::from(choice) % 4];

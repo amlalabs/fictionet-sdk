@@ -827,13 +827,20 @@ impl Writer {
 }
 
 /// Splits a byte stream into JSON values, for protocols that send one
-/// JSON text after another on a connection (JSON-RPC over TCP, JSON
-/// lines). Feed it the bytes in order and take values out until it has
-/// none. Whitespace between values is skipped.
+/// JSON text after another on a connection, such as JSON-RPC over TCP.
+/// Feed it the bytes in order and take values out until it has none.
+/// Whitespace between values is skipped, and values need none between
+/// them, so `{}{}` is two values.
+///
+/// It does not look at line breaks. A protocol that frames each value as
+/// one line (JSON Lines, NDJSON) should split the stream at `\n` and
+/// [`parse`] each line, so that a value spread over two lines, or two
+/// values on one line, is refused.
 ///
 /// A value ends at its closing bracket or quote. A top-level number or
 /// literal (`12`, `true`) ends at the first byte that cannot be part of
-/// it, so one at the very end of what has come waits for one more byte.
+/// it, so one at the very end of what has come waits for one more byte,
+/// or for [`Decoder::finish`] to say the stream has ended.
 #[derive(Debug, Default)]
 pub struct Decoder {
     limits: Limits,
@@ -848,6 +855,8 @@ pub struct Decoder {
     pos: usize,
     scan: Scan,
     failed: Option<Error>,
+    /// Whether [`Decoder::finish`] said no more bytes will come.
+    ended: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -878,19 +887,42 @@ impl Decoder {
         Decoder { limits, ..Decoder::default() }
     }
 
-    /// Adds bytes read from the connection. After an error the stream
-    /// cannot be read any further, and they are dropped.
+    /// Adds bytes read from the connection. After an error, or after
+    /// [`Decoder::finish`], the stream cannot be read any further, and
+    /// they are dropped.
     pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            self.buf.extend_from_slice(bytes);
+        if self.failed.is_some() || self.ended {
+            return;
         }
+        // Drop the bytes already read once they are at least as many as
+        // the unread ones, so moving the rest costs no more than reading
+        // them did.
+        if self.start > 0 && self.start >= self.buf.len() - self.start {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Says the stream has ended: no more bytes will come. After it,
+    /// [`Decoder::next_value`] gives the values still held, a number or
+    /// literal at the very end included, then an
+    /// [`ErrorKind::UnexpectedEnd`] error if the stream stopped in the
+    /// middle of a value (or the error parsing those bytes finds first),
+    /// or `None` if it stopped between values.
+    pub fn finish(&mut self) {
+        self.ended = true;
     }
 
     /// The next whole value, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. Error offsets count from the start of the
-    /// stream. A decoder never holds more than the size limit of one
-    /// unfinished value, plus what one `feed` added.
+    /// needs more bytes, or after [`Decoder::finish`] when the stream has
+    /// ended cleanly, and keeps returning the same error once the stream
+    /// has broken. Error offsets count from the start of the stream.
+    ///
+    /// The decoder holds the bytes fed and not yet read. Once
+    /// `next_value` has returned `None`, that is at most one unfinished
+    /// value, which the size limit caps, and bytes already read are
+    /// dropped by the next [`Decoder::feed`].
     pub fn next_value(&mut self) -> Option<Result<Value, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -899,13 +931,22 @@ impl Decoder {
         let max_depth = self.limits.depth();
         loop {
             let Some(&c) = self.buf.get(self.start.saturating_add(self.pos)) else {
-                if self.scan == Scan::Idle {
-                    self.take(self.pos);
-                    self.pos = 0;
+                if !self.ended || self.scan == Scan::Idle {
+                    if self.scan == Scan::Idle {
+                        self.take(self.pos);
+                        self.pos = 0;
+                    }
+                    self.buf.drain(..self.start);
+                    self.start = 0;
+                    // Give back the room a large feed took.
+                    if self.buf.capacity() > size.saturating_mul(2).max(4096) {
+                        self.buf.shrink_to(self.buf.len());
+                    }
+                    return None;
                 }
-                self.buf.drain(..self.start);
-                self.start = 0;
-                return None;
+                // The stream has ended inside a value. Parsing what came
+                // finds the end, or an earlier error.
+                return Some(self.end_value(self.pos));
             };
             let mut end = None;
             match &mut self.scan {
@@ -982,37 +1023,43 @@ impl Decoder {
                 }
             }
             if let Some(end) = end {
-                let value = &self.buf[self.start..self.start + end];
-                let mut result = parse_with(value, &self.limits);
-                if let Err(e) = result
-                    && self.scan == Scan::Scalar
-                    && e.kind == ErrorKind::UnexpectedEnd
-                {
-                    // The stream did not end: the byte after the scalar
-                    // broke it. Name that byte, as parsing the scalar and
-                    // the byte together does.
-                    let with_next = &self.buf[self.start..=self.start + end];
-                    if let Err(e) = parse_with(with_next, &self.limits) {
-                        result = Err(e);
-                    }
-                }
-                let base = self.consumed;
-                self.take(end);
-                self.scan = Scan::Idle;
-                self.pos = 0;
-                return Some(match result {
-                    Ok(v) => Ok(v),
-                    Err(e) => {
-                        let e = Error::at(e.kind, base.saturating_add(e.offset));
-                        self.failed = Some(e);
-                        self.buf = Vec::new();
-                        self.start = 0;
-                        Err(e)
-                    }
-                });
+                return Some(self.end_value(end));
             }
             if self.pos > size {
                 return Some(self.fail(ErrorKind::TooLarge, size));
+            }
+        }
+    }
+
+    /// Parses the value in the first `end` unread bytes and moves past it.
+    fn end_value(&mut self, end: usize) -> Result<Value, Error> {
+        let stop = self.start.saturating_add(end).min(self.buf.len());
+        let value = &self.buf[self.start..stop];
+        let mut result = parse_with(value, &self.limits);
+        if let Err(e) = result
+            && self.scan == Scan::Scalar
+            && e.kind == ErrorKind::UnexpectedEnd
+            && let Some(with_next) = self.buf.get(self.start..=stop)
+        {
+            // The stream did not end: the byte after the scalar broke
+            // it. Name that byte, as parsing the scalar and the byte
+            // together does.
+            if let Err(e) = parse_with(with_next, &self.limits) {
+                result = Err(e);
+            }
+        }
+        let base = self.consumed;
+        self.take(end);
+        self.scan = Scan::Idle;
+        self.pos = 0;
+        match result {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                let e = Error::at(e.kind, base.saturating_add(e.offset));
+                self.failed = Some(e);
+                self.buf = Vec::new();
+                self.start = 0;
+                Err(e)
             }
         }
     }
@@ -1332,8 +1379,88 @@ mod tests {
                 let mut d = Decoder::new();
                 d.feed(&doc[..cut]);
                 assert_eq!(d.next_value(), None);
+                // Once the stream ends, the decoder reports what parsing
+                // reports, or nothing when no value had started.
+                d.finish();
+                let want = if doc[..cut].iter().all(|&c| is_ws(c)) { None } else { Some(Err(e)) };
+                assert_eq!(d.next_value(), want, "{:?}", String::from_utf8_lossy(&doc[..cut]));
             }
         }
+    }
+
+    #[test]
+    fn decoder_drops_bytes_it_has_read() {
+        // One value per feed, taking one value each time and never asking
+        // for the `None` after it. The read bytes must not pile up.
+        let mut d = Decoder::new();
+        for _ in 0..10_000 {
+            d.feed(b"{}");
+            assert_eq!(d.next_value(), Some(Ok(Value::Object(vec![]))));
+            assert_eq!(d.buffered(), 0);
+        }
+        assert!(d.buf.len() <= 4, "{} bytes held", d.buf.len());
+        // A large feed does not keep its room once it has been read.
+        let mut d = Decoder::new();
+        d.feed(&vec![b' '; 3 * MAX_SIZE]);
+        assert_eq!(d.next_value(), None);
+        assert!(d.buf.capacity() <= 2 * MAX_SIZE, "{} bytes of room kept", d.buf.capacity());
+        d.feed(b"[1]");
+        assert_eq!(d.next_value(), Some(Ok(parse(b"[1]").unwrap())));
+    }
+
+    #[test]
+    fn decoder_finish_ends_the_stream() {
+        // A number or literal at the very end of the stream.
+        for text in ["42", "-1.5e3", "true", "false", "null", "0"] {
+            let mut d = Decoder::new();
+            d.feed(text.as_bytes());
+            assert_eq!(d.next_value(), None);
+            d.finish();
+            assert_eq!(d.next_value(), Some(Ok(parse(text.as_bytes()).unwrap())), "{text}");
+            assert_eq!(d.next_value(), None);
+        }
+        // A last line with no line break after it.
+        let mut d = Decoder::new();
+        d.feed(b"{\"a\":1}\n42");
+        d.finish();
+        assert_eq!(d.next_value(), Some(Ok(parse(b"{\"a\":1}").unwrap())));
+        assert_eq!(d.next_value(), Some(Ok(n("42"))));
+        assert_eq!(d.next_value(), None);
+        // A value cut off by the end, with a stream offset.
+        let cases: [(&[u8], Error); 6] = [
+            (b"{\"a\":", Error::at(ErrorKind::UnexpectedEnd, 5)),
+            (b"[1] [2,", Error::at(ErrorKind::UnexpectedEnd, 7)),
+            (b" \"abc", Error::at(ErrorKind::UnexpectedEnd, 5)),
+            (b"tru", Error::at(ErrorKind::UnexpectedEnd, 3)),
+            (b"1e", Error::at(ErrorKind::UnexpectedEnd, 2)),
+            (b"[x", Error::at(ErrorKind::UnexpectedByte(b'x'), 1)),
+        ];
+        for (input, want) in cases {
+            for bytewise in [false, true] {
+                let got = decode_finished(input, bytewise);
+                assert_eq!(got.last(), Some(&Err(want)), "{:?}", String::from_utf8_lossy(input));
+            }
+        }
+        // Bytes after the end are dropped, and the end stays.
+        let mut d = Decoder::new();
+        d.feed(b" ");
+        d.finish();
+        d.feed(b"1 ");
+        assert_eq!(d.next_value(), None);
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn decoder_does_not_frame_lines() {
+        // The decoder splits concatenated JSON texts, not lines. Two
+        // values on one line are two values, and one value may span
+        // lines. A JSON Lines reader splits at `\n` and parses each line.
+        let mut d = Decoder::new();
+        d.feed(b"{}{}\n{\n\"a\":1\n}\n");
+        assert_eq!(d.next_value(), Some(Ok(Value::Object(vec![]))));
+        assert_eq!(d.next_value(), Some(Ok(Value::Object(vec![]))));
+        assert_eq!(d.next_value(), Some(Ok(parse(b"{\"a\":1}").unwrap())));
+        assert_eq!(d.next_value(), None);
     }
 
     #[test]
@@ -1571,6 +1698,44 @@ mod tests {
         out
     }
 
+    /// Every value the decoder gives for `data` as a whole stream, ended
+    /// with [`Decoder::finish`], up to and including its first error.
+    fn decode_finished(data: &[u8], bytewise: bool) -> Vec<Result<Value, Error>> {
+        let mut d = Decoder::new();
+        let mut out = Vec::new();
+        let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
+        for chunk in chunks {
+            d.feed(chunk);
+            // Take at most one value per feed, so read bytes wait in the
+            // buffer while more come.
+            if let Some(v) = d.next_value() {
+                let stop = v.is_err();
+                out.push(v);
+                if stop {
+                    return out;
+                }
+            }
+        }
+        d.finish();
+        while let Some(v) = d.next_value() {
+            let stop = v.is_err();
+            out.push(v);
+            if stop {
+                break;
+            }
+        }
+        out
+    }
+
+    /// A whole JSON text, as a stream that then ends, gives just its value.
+    fn stream_matches_parse(data: &[u8]) {
+        let whole = decode_finished(data, false);
+        assert_eq!(whole, decode_finished(data, true), "{:?}", String::from_utf8_lossy(data));
+        if let Ok(v) = parse(data) {
+            assert_eq!(whole, [Ok(v)], "{:?}", String::from_utf8_lossy(data));
+        }
+    }
+
     #[test]
     fn lcg_fuzz() {
         let mut r = Lcg(0x5eed_1234);
@@ -1582,6 +1747,7 @@ mod tests {
                 round_trip(&v);
             }
             assert_eq!(decode_all(&data, false), decode_all(&data, true));
+            stream_matches_parse(&data);
             for v in decode_all(&data, false).into_iter().flatten() {
                 round_trip(&v);
             }
@@ -1593,6 +1759,7 @@ mod tests {
             round_trip(&v);
             let mut text = v.write().unwrap().into_bytes();
             assert_eq!(decode_all(&text, false), decode_all(&text, true));
+            stream_matches_parse(&text);
             if !text.is_empty() {
                 let at = r.below(text.len());
                 text[at] = r.next() as u8;
@@ -1602,6 +1769,8 @@ mod tests {
                 let cut = r.below(text.len());
                 let _ = parse(&text[..cut]);
                 assert_eq!(decode_all(&text[..cut], false), decode_all(&text[..cut], true));
+                stream_matches_parse(&text[..cut]);
+                stream_matches_parse(&text);
             }
         }
     }

@@ -35,7 +35,7 @@
 //! assert_eq!(request.tpdu_size(), Some(1024));
 //!
 //! // Accept it with source reference 0x4242, echoing its parameters.
-//! let confirm = Tpdu::ConnectionConfirm(request.confirm(0x4242));
+//! let confirm = Tpdu::ConnectionConfirm(request.confirm(0x4242).unwrap());
 //! assert_eq!(
 //!     confirm.to_packet(),
 //!     [3, 0, 0, 22, 17, 0xd0, 0, 1, 0x42, 0x42, 0, 0xc0, 1, 10, 0xc1, 2, 1, 0, 0xc2, 2, 1, 2]
@@ -104,13 +104,20 @@ pub mod parameter {
     pub const CALLING_TSAP: u8 = 0xc1;
     /// In CR and CC: the called transport selector (TSAP).
     pub const CALLED_TSAP: u8 = 0xc2;
+    /// In CR: the classes the caller accepts besides its preferred one,
+    /// one byte each, with the class in the high four bits. A class 0
+    /// request does not carry it.
+    pub const ALTERNATIVE_CLASSES: u8 = 0xc7;
     /// In ER: the header of the TPDU that was rejected.
     pub const INVALID_TPDU: u8 = 0xc1;
     /// In DR: free text on why the connection is closing.
     pub const ADDITIONAL_INFORMATION: u8 = 0xe0;
 }
 
-/// Reasons a disconnect request gives.
+/// Reasons a disconnect request gives. X.224 13.5.3 allows only the
+/// first four, 0 to 3, in class 0; the others, from 128 up, belong to
+/// classes 1 to 4. A world that plays a strict class 0 stack refuses
+/// with one of the first four.
 pub mod reason {
     /// No reason given.
     pub const NOT_SPECIFIED: u8 = 0;
@@ -210,6 +217,9 @@ pub fn write_packet(tpdu: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The most spare room a [`Decoder`] keeps once its bytes are taken out.
+const DECODER_RETAINED: usize = 2 * MAX_PACKET;
+
 /// Splits a TPKT byte stream into TPDUs. Feed it the bytes a connection
 /// reads, in order, and take TPDUs out until it has none.
 #[derive(Clone, Debug, Default)]
@@ -235,6 +245,7 @@ impl Decoder {
             if self.start > 0 && self.start >= self.buf.len() / 2 {
                 self.buf.drain(..self.start);
                 self.start = 0;
+                self.buf.shrink_to(DECODER_RETAINED.max(self.buf.len()));
             }
             self.buf.extend_from_slice(bytes);
         }
@@ -245,7 +256,10 @@ impl Decoder {
     /// once the stream has broken. A world that takes packets out after
     /// each `feed` never holds more than one packet's bytes
     /// ([`MAX_PACKET`]) beyond what has been taken out, plus what that
-    /// `feed` added.
+    /// `feed` added. Once every packet fed has been taken out, the decoder
+    /// keeps at most two packets' worth of spare room, however much one
+    /// `feed` added. The decoder buffers what it is fed and nothing more,
+    /// so a world that feeds without taking packets out holds all of it.
     pub fn next_packet(&mut self) -> Option<Result<Vec<u8>, TpktError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -254,6 +268,13 @@ impl Decoder {
             Ok(Some((tpdu, used))) => {
                 let tpdu = tpdu.to_vec();
                 self.start += used;
+                if self.start == self.buf.len() {
+                    // Everything fed has been taken out. Keep room for a
+                    // couple of packets, not for the largest burst fed.
+                    self.buf.clear();
+                    self.buf.shrink_to(DECODER_RETAINED);
+                    self.start = 0;
+                }
                 Some(Ok(tpdu))
             }
             Ok(None) => None,
@@ -303,8 +324,13 @@ impl Default for Variable {
 impl Variable {
     /// Reads a variable part. It is [`Variable::Parameters`] when every
     /// parameter's length stays inside `b`, and [`Variable::Raw`]
-    /// otherwise.
+    /// otherwise. Bytes longer than [`MAX_HEADER`] cannot be a header's
+    /// variable part, and are always [`Variable::Raw`], so the list of
+    /// parameters stays small whatever the input.
     pub fn parse(b: &[u8]) -> Variable {
+        if b.len() > MAX_HEADER {
+            return Variable::Raw(b.to_vec());
+        }
         let mut params = Vec::new();
         let mut rest = b;
         while let [code, len, tail @ ..] = rest {
@@ -315,11 +341,12 @@ impl Variable {
         if rest.is_empty() { Variable::Parameters(params) } else { Variable::Raw(b.to_vec()) }
     }
 
-    /// The value of the first parameter with `code`, if this is a list of
-    /// parameters that has one.
+    /// The value of the last parameter with `code`, if this is a list of
+    /// parameters that has one. X.224 13.2.3 says that when a parameter
+    /// comes more than once, the later value is used.
     pub fn get(&self, code: u8) -> Option<&[u8]> {
         match self {
-            Variable::Parameters(params) => params.iter().find(|p| p.code == code).map(|p| p.value.as_slice()),
+            Variable::Parameters(params) => params.iter().rev().find(|p| p.code == code).map(|p| p.value.as_slice()),
             Variable::Raw(_) => None,
         }
     }
@@ -348,7 +375,7 @@ impl Variable {
 
     /// Sets the parameter with `code` to `value`. The first parameter with
     /// that code keeps its place and takes the new value, and any later
-    /// ones are removed. With none, it is added at the end. Raw bytes are
+    /// ones are removed, so [`Variable::get`] returns `value`. With none, it is added at the end. Raw bytes are
     /// replaced by a list holding just this parameter. A value longer than
     /// [`MAX_PARAMETER`] is left out when the TPDU is written.
     pub fn set(&mut self, code: u8, value: Vec<u8>) {
@@ -375,6 +402,11 @@ impl Variable {
 }
 
 /// A connection request (CR) or connection confirm (CC).
+///
+/// X.224 13.3 limits a CR to 128 bytes. Neither the reader nor the writers
+/// hold to that, since RDP clients send longer requests (a cookie or
+/// routing token in the header); a world that plays a strict stack checks
+/// the length itself.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Connect {
     /// The initial credit, four bits. Class 0 always uses 0.
@@ -433,9 +465,12 @@ impl Connect {
 
     /// Sets the TPDU size parameter to the largest power of two from 128 to
     /// 8192 that is no more than `bytes`, or 128 if `bytes` is smaller.
-    /// A size already there is replaced.
+    /// In class 0 the most is [`MAX_CLASS0_TPDU_SIZE`], 2048, since X.224
+    /// does not allow 4096 or 8192 there; set [`Connect::class`] first to
+    /// ask for more in another class. A size already there is replaced.
     pub fn with_tpdu_size(mut self, bytes: usize) -> Connect {
-        let n = (7..=13u8).rev().find(|n| 1usize << n <= bytes).unwrap_or(7);
+        let max = if self.class == 0 { MAX_CLASS0_TPDU_SIZE.trailing_zeros() as u8 } else { 13 };
+        let n = (7..=max).rev().find(|n| 1usize << n <= bytes).unwrap_or(7);
         self.variable.set(parameter::TPDU_SIZE, vec![n]);
         self
     }
@@ -454,12 +489,39 @@ impl Connect {
         self
     }
 
-    /// A class 0 confirm that accepts this request, from `src_ref`. It
-    /// echoes the request's TSAP parameters and TPDU size, in their order.
-    /// A TPDU size above [`MAX_CLASS0_TPDU_SIZE`] is lowered to it, and a
-    /// size value that is not a code from 7 to 13 is left out. A world
-    /// that wants a smaller TPDU size or other TSAPs changes them.
-    pub fn confirm(&self, src_ref: u16) -> Connect {
+    /// Whether a responder may answer this request in class 0, by X.224
+    /// table 3: the request offers class 0 or 1, as its preferred class or
+    /// as an alternative, and pairs its classes as the table allows. A
+    /// request whose preferred class is 2, with no alternative class 0,
+    /// may not be answered in class 0.
+    pub fn allows_class0(&self) -> bool {
+        let alternatives: Vec<u8> =
+            self.variable.get(parameter::ALTERNATIVE_CLASSES).unwrap_or(&[]).iter().map(|a| a >> 4).collect();
+        let pairs = |a: &u8| match self.class {
+            1 => *a <= 1,
+            2 => *a == 0 || *a == 2,
+            3 => *a <= 3,
+            4 => *a <= 4,
+            _ => false,
+        };
+        self.class <= 4
+            && alternatives.iter().all(pairs)
+            && (self.class <= 1 || alternatives.iter().any(|a| *a <= 1))
+    }
+
+    /// A class 0 confirm that accepts this request, from `src_ref`, or
+    /// `None` when the request does not allow class 0 (see
+    /// [`Connect::allows_class0`]); a world refuses such a request. The
+    /// confirm echoes the request's TSAP parameters and TPDU size, in
+    /// their order, each once with the value that counts: the last one,
+    /// when a parameter comes more than once. A TPDU size above
+    /// [`MAX_CLASS0_TPDU_SIZE`] is lowered to it, and a size value that is
+    /// not a code from 7 to 13 is left out. A world that wants a smaller
+    /// TPDU size or other TSAPs changes them.
+    pub fn confirm(&self, src_ref: u16) -> Option<Connect> {
+        if !self.allows_class0() {
+            return None;
+        }
         // 2048 is 2 to the 11th, so this is 11.
         let max_code = MAX_CLASS0_TPDU_SIZE.trailing_zeros() as u8;
         let echo = |p: &Parameter| match (p.code, p.value.as_slice()) {
@@ -468,15 +530,20 @@ impl Connect {
             _ => None,
         };
         let params = match &self.variable {
-            Variable::Parameters(params) => params.iter().filter_map(echo).collect(),
+            Variable::Parameters(params) => params
+                .iter()
+                .enumerate()
+                .filter(|(i, p)| !params[i + 1..].iter().any(|q| q.code == p.code))
+                .filter_map(|(_, p)| echo(p))
+                .collect(),
             Variable::Raw(_) => Vec::new(),
         };
-        Connect { dst_ref: self.src_ref, src_ref, variable: Variable::Parameters(params), ..Connect::default() }
+        Some(Connect { dst_ref: self.src_ref, src_ref, variable: Variable::Parameters(params), ..Connect::default() })
     }
 
     /// The disconnect request that refuses this request, giving `reason`
-    /// from [`reason`]. Its source reference is 0, since no connection was
-    /// made.
+    /// from [`reason`]; class 0 allows only 0 to 3. Its source reference
+    /// is 0, since no connection was made.
     pub fn refuse(&self, reason: u8) -> Disconnect {
         Disconnect { dst_ref: self.src_ref, src_ref: 0, reason, ..Disconnect::default() }
     }
@@ -526,6 +593,8 @@ pub struct Data {
 }
 
 /// An error TPDU (ER): the answer to a TPDU the receiver could not read.
+/// Class 0 requires the invalid TPDU parameter, which
+/// [`ErrorTpdu::rejecting`] always sets; the reader takes an ER without it.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ErrorTpdu {
     /// The peer's reference for the connection, or 0 if there is none.
@@ -808,10 +877,12 @@ impl Reassembler {
 }
 
 /// Cuts `message` into data TPDUs no longer than `tpdu_size` bytes each,
-/// header included, with EOT on the last. A size below 4 is taken as 4,
-/// and one above [`MAX_TPDU`] as that. An empty message is one empty TPDU.
+/// header included, with EOT on the last. A size below 128, the smallest
+/// TPDU size X.224 allows, is taken as 128, and one above [`MAX_TPDU`] as
+/// that, so the segments never hold much more memory than the message.
+/// An empty message is one empty TPDU.
 pub fn segment(message: &[u8], tpdu_size: usize) -> Vec<Data> {
-    let room = tpdu_size.clamp(DATA_FIXED + 2, MAX_TPDU) - (DATA_FIXED + 1);
+    let room = tpdu_size.clamp(ISO_DEFAULT_TPDU_SIZE, MAX_TPDU) - (DATA_FIXED + 1);
     let mut out: Vec<Data> = message.chunks(room).map(|c| Data { eot: false, number: 0, data: c.to_vec() }).collect();
     match out.last_mut() {
         Some(last) => last.eot = true,
@@ -908,7 +979,7 @@ mod tests {
         let built = Connect::request(1).with_tpdu_size(1024).with_calling_tsap(&[1, 0]).with_called_tsap(&[1, 2]);
         assert_eq!(built, cr);
         assert_eq!(Tpdu::ConnectionRequest(built).to_packet(), S7_CR);
-        let cc = cr.confirm(0x0044);
+        let cc = cr.confirm(0x0044).unwrap();
         assert_eq!((cc.dst_ref, cc.src_ref), (1, 0x44));
         let packet = Tpdu::ConnectionConfirm(cc.clone()).to_packet();
         assert_eq!(&packet[4..10], &[0x11, 0xd0, 0x00, 0x01, 0x00, 0x44]);
@@ -928,18 +999,23 @@ mod tests {
     // and a confirm may not offer a size the request did not allow.
     #[test]
     fn confirm_keeps_class0_tpdu_size() {
-        let cr = Connect::request(1).with_tpdu_size(8192).with_called_tsap(&[1, 2]);
-        let cc = cr.confirm(2);
+        // A class 0 request built here never asks for more than 2048, so
+        // a peer's request for 8192 is set by hand.
+        assert_eq!(Connect::request(1).with_tpdu_size(8192).tpdu_size(), Some(MAX_CLASS0_TPDU_SIZE));
+        let mut cr = Connect::request(1).with_called_tsap(&[1, 2]);
+        cr.variable.set(parameter::TPDU_SIZE, vec![13]);
+        let cc = cr.confirm(2).unwrap();
         assert_eq!(cc.tpdu_size(), Some(MAX_CLASS0_TPDU_SIZE));
         assert_eq!(cc.called_tsap(), Some(&[1, 2][..]));
-        let cr = Connect::request(1).with_tpdu_size(4096);
-        assert_eq!(cr.confirm(2).tpdu_size(), Some(2048));
+        let mut cr = Connect::request(1);
+        cr.variable.set(parameter::TPDU_SIZE, vec![12]);
+        assert_eq!(cr.confirm(2).unwrap().tpdu_size(), Some(2048));
         let cr = Connect::request(1).with_tpdu_size(512);
-        assert_eq!(cr.confirm(2).tpdu_size(), Some(512));
+        assert_eq!(cr.confirm(2).unwrap().tpdu_size(), Some(512));
         // A size value outside the code points is not echoed back.
         for bad in [vec![3u8], vec![14], vec![], vec![7, 0]] {
             let cr = Connect { variable: Variable::Parameters(vec![Parameter { code: parameter::TPDU_SIZE, value: bad }]), ..Connect::default() };
-            assert_eq!(cr.confirm(2).variable, Variable::Parameters(vec![]));
+            assert_eq!(cr.confirm(2).unwrap().variable, Variable::Parameters(vec![]));
         }
     }
 
@@ -948,7 +1024,7 @@ mod tests {
     #[test]
     fn builders_replace_parameters() {
         let cr = Connect::request(1).with_tpdu_size(1024).with_called_tsap(&[1, 2]).with_calling_tsap(&[1, 0]);
-        let cc = cr.confirm(2).with_tpdu_size(512).with_called_tsap(&[9]);
+        let cc = cr.confirm(2).unwrap().with_tpdu_size(512).with_called_tsap(&[9]);
         assert_eq!(cc.tpdu_size(), Some(512));
         assert_eq!(cc.called_tsap(), Some(&[9][..]));
         // Each code once, in the order they first came.
@@ -996,7 +1072,10 @@ mod tests {
         assert_eq!(size(&[7, 0]), None);
         assert_eq!(Connect::default().with_tpdu_size(2047).tpdu_size(), Some(1024));
         assert_eq!(Connect::default().with_tpdu_size(1).tpdu_size(), Some(128));
-        assert_eq!(Connect::default().with_tpdu_size(usize::MAX).tpdu_size(), Some(8192));
+        assert_eq!(Connect::default().with_tpdu_size(usize::MAX).tpdu_size(), Some(2048));
+        let class4 = Connect { class: 4, ..Connect::default() };
+        assert_eq!(class4.clone().with_tpdu_size(usize::MAX).tpdu_size(), Some(8192));
+        assert_eq!(class4.with_tpdu_size(5000).tpdu_size(), Some(4096));
     }
 
     // MS-RDPBCGR 4.1.1: the client's X.224 connection request, with a
@@ -1013,7 +1092,7 @@ mod tests {
         let Variable::Raw(raw) = &cr.variable else { panic!() };
         assert!(raw.starts_with(b"Cookie: "));
         assert_eq!(cr.called_tsap(), None);
-        assert_eq!(cr.confirm(9).variable, Variable::Parameters(vec![]));
+        assert_eq!(cr.confirm(9).unwrap().variable, Variable::Parameters(vec![]));
         assert_eq!(Tpdu::ConnectionRequest(cr).to_bytes(), tpdu);
     }
 
@@ -1196,7 +1275,7 @@ mod tests {
         }
         assert_eq!(got, Some(msg));
         assert_eq!(segment(&[], 128), vec![Data { eot: true, number: 0, data: vec![] }]);
-        assert_eq!(segment(b"abc", 0).len(), 3);
+        assert_eq!(segment(b"abc", 0).len(), 1);
         assert_eq!(segment(b"abc", usize::MAX).len(), 1);
     }
 
@@ -1223,6 +1302,117 @@ mod tests {
         assert_eq!(d.buffered(), 0);
     }
 
+    // X.224 13.2.3: when a parameter comes more than once, the later
+    // value is used, and a confirm echoes only that one.
+    #[test]
+    fn duplicate_parameters_use_the_last() {
+        let Ok(Tpdu::ConnectionRequest(cr)) = Tpdu::parse(&[0x0c, 0xe0, 0, 0, 0, 1, 0, 0xc0, 1, 0x0a, 0xc0, 1, 7]) else {
+            panic!()
+        };
+        assert_eq!(cr.tpdu_size(), Some(128));
+        let cc = cr.confirm(2).unwrap();
+        assert_eq!(cc.variable, Variable::Parameters(vec![Parameter { code: parameter::TPDU_SIZE, value: vec![7] }]));
+        let v = Variable::parse(&[0xc2, 1, 1, 0xc1, 1, 5, 0xc2, 1, 2]);
+        assert_eq!(v.get(parameter::CALLED_TSAP), Some(&[2][..]));
+        let c = Connect { variable: v, ..Connect::default() };
+        let cc = c.confirm(1).unwrap();
+        let Variable::Parameters(params) = &cc.variable else { panic!() };
+        let codes: Vec<u8> = params.iter().map(|p| p.code).collect();
+        assert_eq!(codes, [parameter::CALLING_TSAP, parameter::CALLED_TSAP]);
+        assert_eq!(cc.called_tsap(), Some(&[2][..]));
+    }
+
+    // X.224 6.5.4 and table 3: class 0 answers a request only when the
+    // request offers class 0 or 1.
+    #[test]
+    fn confirm_follows_the_class_table() {
+        let Ok(Tpdu::ConnectionRequest(cr)) = Tpdu::parse(&[6, 0xe0, 0, 0, 0, 1, 0x20]) else { panic!() };
+        assert_eq!(cr.class, 2);
+        assert!(!cr.allows_class0());
+        assert_eq!(cr.confirm(2), None);
+        let with_alternatives = |class: u8, alts: &[u8]| {
+            let mut c = Connect { class, ..Connect::request(1) };
+            if !alts.is_empty() {
+                c.variable.set(parameter::ALTERNATIVE_CLASSES, alts.iter().map(|a| a << 4).collect());
+            }
+            c.allows_class0()
+        };
+        // Preferred class, alternatives, and whether class 0 is valid.
+        let table: [(u8, &[u8], bool); 16] = [
+            (0, &[], true),
+            (0, &[1], false),
+            (1, &[], true),
+            (1, &[0], true),
+            (1, &[2], false),
+            (2, &[], false),
+            (2, &[0], true),
+            (2, &[1], false),
+            (2, &[2], false),
+            (3, &[], false),
+            (3, &[0], true),
+            (3, &[1], true),
+            (3, &[2], false),
+            (3, &[4], false),
+            (4, &[1, 0], true),
+            (5, &[], false),
+        ];
+        for (class, alts, valid) in table {
+            assert_eq!(with_alternatives(class, alts), valid, "class {class}, alternatives {alts:?}");
+        }
+        let mut c = Connect { class: 4, ..Connect::request(1) };
+        c.variable.set(parameter::ALTERNATIVE_CLASSES, vec![0x00]);
+        assert_eq!(c.confirm(3).map(|cc| cc.class), Some(0));
+    }
+
+    // A variable part longer than a header could hold is kept as raw
+    // bytes, not split into a list many times its size.
+    #[test]
+    fn variable_parse_is_bounded() {
+        assert!(matches!(Variable::parse(&[0xc1, 0].repeat(127)), Variable::Parameters(p) if p.len() == 127));
+        assert_eq!(Variable::parse(&[0xc1, 0].repeat(200)), Variable::Raw([0xc1, 0].repeat(200)));
+    }
+
+    // Segments are at least the smallest TPDU size, so a tiny size does
+    // not turn each byte into its own allocation.
+    #[test]
+    fn segment_size_has_a_floor() {
+        let msg = vec![7u8; 1000];
+        for size in [0, 4, 127, 128] {
+            let segs = segment(&msg, size);
+            assert_eq!(segs.len(), 8, "size {size}");
+            assert!(segs.iter().all(|s| s.data.len() + 3 <= ISO_DEFAULT_TPDU_SIZE));
+            assert_eq!(segs.iter().flat_map(|s| s.data.iter().copied()).collect::<Vec<u8>>(), msg);
+        }
+    }
+
+    // After a large burst is taken out, the decoder does not keep the
+    // burst's allocation.
+    #[test]
+    fn decoder_releases_room_after_a_burst() {
+        let one = Tpdu::Data(Data { eot: true, number: 0, data: vec![1; 1000] }).to_packet();
+        let mut d = Decoder::new();
+        d.feed(&one.repeat(1000));
+        let mut n = 0;
+        while let Some(p) = d.next_packet() {
+            p.unwrap();
+            n += 1;
+        }
+        assert_eq!(n, 1000);
+        assert_eq!(d.buffered(), 0);
+        assert!(d.buf.capacity() <= DECODER_RETAINED, "{}", d.buf.capacity());
+        // With part of a packet left over, the next feed gives the room back.
+        let mut stream = one.repeat(1000);
+        stream.extend_from_slice(&one[..10]);
+        d.feed(&stream);
+        while let Some(p) = d.next_packet() {
+            p.unwrap();
+        }
+        d.feed(&one[10..]);
+        assert!(d.buf.capacity() <= DECODER_RETAINED, "{}", d.buf.capacity());
+        assert_eq!(d.next_packet(), Some(Ok(one[4..].to_vec())));
+        assert_eq!(d.buffered(), 0);
+    }
+
     #[test]
     fn decoder_takes_many_small_packets_in_linear_time() {
         let one = Tpdu::Data(Data { eot: true, number: 0, data: vec![1] }).to_packet();
@@ -1240,23 +1430,40 @@ mod tests {
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
-    /// The checks the fuzz target makes, on one buffer.
-    fn check(data: &[u8]) {
-        let mut whole = Decoder::new();
-        whole.feed(data);
+    /// Every packet a decoder gives for `data` fed in pieces of `step`
+    /// bytes, the error that ended the stream, if any, and what is left.
+    fn decode(data: &[u8], step: usize) -> (Vec<Vec<u8>>, Option<TpktError>, usize) {
+        let mut d = Decoder::new();
         let mut packets = Vec::new();
-        while let Some(Ok(p)) = whole.next_packet() {
-            packets.push(p);
-        }
-        let mut bytewise = Decoder::new();
-        let mut again = Vec::new();
-        for b in data {
-            bytewise.feed(std::slice::from_ref(b));
-            while let Some(Ok(p)) = bytewise.next_packet() {
-                again.push(p);
+        for piece in data.chunks(step.max(1)) {
+            d.feed(piece);
+            while let Some(r) = d.next_packet() {
+                match r {
+                    Ok(p) => packets.push(p),
+                    Err(e) => return (packets, Some(e), d.buffered()),
+                }
             }
         }
-        assert_eq!(packets, again);
+        (packets, None, d.buffered())
+    }
+
+    /// The checks the fuzz target makes, on one buffer.
+    fn check(data: &[u8]) {
+        let (packets, error, left) = decode(data, data.len());
+        for step in [1, 2, 7] {
+            assert_eq!(decode(data, step), (packets.clone(), error, left), "step {step}");
+        }
+        // Any bytes cut into segments come back whole.
+        let size = data.first().map_or(128, |&b| usize::from(b) * 3);
+        let mut r = Reassembler::new();
+        let mut got = None;
+        for s in segment(data, size) {
+            let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes()) else { panic!() };
+            assert_eq!(back, s);
+            assert!(got.is_none());
+            got = r.push(&back).unwrap();
+        }
+        assert_eq!(got.as_deref(), Some(data));
         let mut r = Reassembler::with_limit(64);
         for p in packets.iter().map(Vec::as_slice).chain([data]) {
             assert_eq!(parse_packet(&write_packet(p)).unwrap().unwrap().0.len(), p.len().clamp(MIN_TPDU, MAX_TPDU));
@@ -1270,8 +1477,14 @@ mod tests {
                         assert!(r.pending() <= 64);
                     }
                     if let Tpdu::ConnectionRequest(c) = &t {
-                        let cc = Tpdu::ConnectionConfirm(c.confirm(1));
-                        assert_eq!(Tpdu::parse(&cc.to_bytes()), Ok(cc));
+                        match c.confirm(1) {
+                            Some(cc) => {
+                                assert_eq!(cc.class, 0);
+                                let cc = Tpdu::ConnectionConfirm(cc);
+                                assert_eq!(Tpdu::parse(&cc.to_bytes()), Ok(cc));
+                            }
+                            None => assert!(!c.allows_class0()),
+                        }
                     }
                 }
                 Err(e) => {
@@ -1341,13 +1554,17 @@ mod tests {
                     variable,
                     data,
                 }),
-                3 => Tpdu::Data(Data { eot: rng.below(2) == 0, number: rng.next() as u8, data }),
+                3 => Tpdu::Data(Data { eot: rng.below(2) == 0, number: rng.below(128) as u8, data }),
                 _ => Tpdu::Error(ErrorTpdu { dst_ref: rng.next() as u16, cause: rng.next() as u8, variable }),
             };
             let packet = t.to_packet();
             let back = tpdu_from_packet(&packet);
             // Reading it back again changes nothing more.
             assert_eq!(tpdu_from_packet(&back.to_packet()), back);
+            // Data that fits in a packet comes back as it was.
+            if let Tpdu::Data(_) = t {
+                assert_eq!(back, t);
+            }
             for s in segment(&packet, rng.below(200) as usize) {
                 assert!(Tpdu::parse(&Tpdu::Data(s).to_bytes()).is_ok());
             }

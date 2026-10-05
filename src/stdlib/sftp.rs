@@ -17,7 +17,9 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Each field has a limit (see [`MAX_PATH`], [`MAX_DATA`] and the
 //! others), and a reader refuses a field over its limit. Writers cut a
-//! field to its limit, so what they write always reads back.
+//! field to its limit, so what they write always reads back. A STATUS
+//! message or language tag is cut where a UTF-8 character starts, so
+//! valid text stays valid.
 //!
 //! ```
 //! use fictionet::stdlib::sftp::{Attrs, Decoder, Packet, Request, Response, Status, VERSION};
@@ -25,9 +27,9 @@
 //! /// A server holding one file, `/motd`, 12 bytes long.
 //! fn answer(packet: &Packet) -> Response {
 //!     match Request::parse(packet) {
-//!         Ok(Request::Init { version, .. }) => {
-//!             Response::Version { version: version.min(VERSION), extensions: Vec::new() }
-//!         }
+//!         // Like OpenSSH, answer every INIT with version 3, the only
+//!         // version these packets are laid out for.
+//!         Ok(Request::Init { .. }) => Response::Version { version: VERSION, extensions: Vec::new() },
 //!         Ok(Request::Stat { id, path }) | Ok(Request::Lstat { id, path }) => {
 //!             if path == b"/motd" {
 //!                 let attrs = Attrs { size: Some(12), permissions: Some(0o100644), ..Attrs::default() };
@@ -43,12 +45,13 @@
 //!
 //! let mut decoder = Decoder::new();
 //! // INIT, version 3: length 5, type 1, then the version.
-//! decoder.feed(&[0, 0, 0, 5, 1, 0, 0, 0, 3]);
+//! assert_eq!(decoder.feed(&[0, 0, 0, 5, 1, 0, 0, 0, 3]), 9);
 //! let init = decoder.next_packet().unwrap().unwrap();
 //! assert_eq!(answer(&init).to_bytes(), [0, 0, 0, 5, 2, 0, 0, 0, 3]);
 //!
 //! // STAT /motd, request id 1.
-//! decoder.feed(&Request::Stat { id: 1, path: b"/motd".to_vec() }.to_bytes());
+//! let bytes = Request::Stat { id: 1, path: b"/motd".to_vec() }.to_bytes();
+//! assert_eq!(decoder.feed(&bytes), bytes.len());
 //! let stat = decoder.next_packet().unwrap().unwrap();
 //! assert_eq!(
 //!     answer(&stat).to_bytes(),
@@ -269,22 +272,33 @@ impl Decoder {
         Decoder { buf: Vec::new(), start: 0, limit: limit.min(MAX_PACKET), failed: None }
     }
 
-    /// Adds bytes read from the channel. After a [`PacketError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Takes bytes read from the channel, from the start of `bytes`, and
+    /// returns how many it took. It takes them all unless that would make
+    /// it hold more than one packet of its limit, length field included.
+    /// Then take packets out and feed it the rest. When it takes no
+    /// bytes, it holds a whole packet or a broken length field, so a loop
+    /// of feeding and taking out always ends. After a [`PacketError`] the
+    /// stream cannot be read any further, and it takes and drops every
+    /// byte.
+    #[must_use = "bytes past the count returned were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let room = (LENGTH_LEN + self.limit).saturating_sub(self.buffered());
+        let n = bytes.len().min(room);
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole packet, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
     /// stream has broken. A decoder never holds more than one packet's
-    /// bytes beyond what has been taken out, plus what one `feed` added.
+    /// bytes beyond what has been taken out.
     pub fn next_packet(&mut self) -> Option<Result<Packet, PacketError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -306,7 +320,7 @@ impl Decoder {
 
     /// How many bytes are held, waiting for the rest of a packet.
     pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
+        self.buf.len().saturating_sub(self.start)
     }
 }
 
@@ -325,7 +339,7 @@ pub enum ParseError {
     /// longer than its limit, or the body was longer than a packet can
     /// hold.
     TooLong,
-    /// A count of names or extensions was over its limit.
+    /// A count of names or extended attributes was over its limit.
     TooMany,
     /// A set of attributes had flags version 3 does not define, so the
     /// fields after them cannot be read.
@@ -589,7 +603,8 @@ pub fn names_that_fit(names: &[NameEntry]) -> usize {
 #[allow(missing_docs)] // each variant's doc names its fields
 pub enum Request {
     /// INIT: the client's highest `version`, and the `extensions` it
-    /// offers. The first packet of a session.
+    /// offers. The first packet of a session. A reader skips extensions
+    /// over their limits, as it would any it does not know.
     Init { version: u32, extensions: Vec<Extension> },
     /// OPEN: open the file at `path` with [`open_flags`] `flags`, and set
     /// `attrs` if it is created. Answered with HANDLE or STATUS.
@@ -816,8 +831,10 @@ impl Request {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(missing_docs)] // each variant's doc names its fields
 pub enum Response {
-    /// VERSION: the `version` the session will use (the lower of the
-    /// client's and the server's), and the `extensions` the server offers.
+    /// VERSION: the `version` the session will use, and the `extensions`
+    /// the server offers. The specification asks for the lower of the
+    /// client's version and the server's. This module writes only version
+    /// 3 packets, so a server built on it answers 3, as OpenSSH does.
     Version { version: u32, extensions: Vec<Extension> },
     /// STATUS: how a request ended, with a `message` for people to read
     /// and the `language` tag it is written in. Both may be empty.
@@ -837,9 +854,12 @@ pub enum Response {
 }
 
 impl Response {
-    /// A STATUS response with `message` and an English language tag.
+    /// A STATUS response with `message` and an English language tag. A
+    /// message over [`MAX_TEXT`] bytes is cut where a character starts,
+    /// as it would be when written, before it is copied.
     pub fn status(id: u32, status: Status, message: &str) -> Response {
-        Response::Status { id, status, message: message.as_bytes().to_vec(), language: b"en".to_vec() }
+        let message = cut_text(message.as_bytes(), MAX_TEXT).to_vec();
+        Response::Status { id, status, message, language: b"en".to_vec() }
     }
 
     /// Reads the response in `packet`. A STATUS that stops after its code,
@@ -932,8 +952,8 @@ impl Response {
             }
             Response::Status { status, message, language, .. } => {
                 put_u32(&mut b, status.code());
-                put_str(&mut b, message, MAX_TEXT);
-                put_str(&mut b, language, MAX_TEXT);
+                put_text(&mut b, message);
+                put_text(&mut b, language);
             }
             Response::Handle { handle, .. } => put_str(&mut b, handle, MAX_HANDLE),
             Response::Data { data, .. } => put_str(&mut b, data, MAX_DATA),
@@ -1011,14 +1031,23 @@ impl<'a> Reader<'a> {
         Ok(Extension { name: self.string(MAX_EXTENSION_NAME)?, data: self.string(MAX_TEXT)? })
     }
 
-    /// Extension pairs up to the end of the body.
+    /// A string of any length that fits in the body, not copied.
+    fn raw_string(&mut self) -> Result<&'a [u8], ParseError> {
+        let n = usize::try_from(self.u32()?).unwrap_or(usize::MAX);
+        self.take(n)
+    }
+
+    /// Extension pairs up to the end of the body. The specification says
+    /// to ignore extensions a reader does not know, so a pair over a
+    /// limit, or past the first [`MAX_EXTENSIONS`], is skipped rather
+    /// than refused. The body bounds what is read.
     fn extensions(&mut self) -> Result<Vec<Extension>, ParseError> {
         let mut out = Vec::new();
         while !self.b.is_empty() {
-            if out.len() == MAX_EXTENSIONS {
-                return Err(ParseError::TooMany);
+            let (name, data) = (self.raw_string()?, self.raw_string()?);
+            if out.len() < MAX_EXTENSIONS && name.len() <= MAX_EXTENSION_NAME && data.len() <= MAX_TEXT {
+                out.push(Extension { name: name.to_vec(), data: data.to_vec() });
             }
-            out.push(self.extension()?);
         }
         Ok(out)
     }
@@ -1042,6 +1071,28 @@ fn put_str(out: &mut Vec<u8>, s: &[u8], max: usize) {
     let s = &s[..s.len().min(max)];
     put_u32(out, s.len() as u32);
     out.extend_from_slice(s);
+}
+
+/// The longest start of `s`, at most `max` bytes, that does not end
+/// inside a UTF-8 character. Bytes that are not UTF-8 are cut at `max`.
+fn cut_text(s: &[u8], max: usize) -> &[u8] {
+    if s.len() <= max {
+        return s;
+    }
+    // A UTF-8 character has at most three continuation bytes.
+    let mut n = max;
+    for _ in 0..3 {
+        if n == 0 || s[n] & 0xc0 != 0x80 {
+            break;
+        }
+        n -= 1;
+    }
+    if s[n] & 0xc0 == 0x80 { &s[..max] } else { &s[..n] }
+}
+
+/// A STATUS message or language tag, cut by [`cut_text`].
+fn put_text(out: &mut Vec<u8>, s: &[u8]) {
+    put_str(out, cut_text(s, MAX_TEXT), MAX_TEXT);
 }
 
 fn put_extension(out: &mut Vec<u8>, e: &Extension) {
@@ -1310,9 +1361,9 @@ mod tests {
         for _ in 0..=MAX_EXTENSIONS {
             init.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
         }
-        assert_eq!(Request::parse(&p(packet_type::INIT, &init)), Err(ParseError::TooMany));
-        init.truncate(init.len() - 8);
-        assert!(Request::parse(&p(packet_type::INIT, &init)).is_ok());
+        // Extensions past the limit are skipped, not refused.
+        let Ok(Request::Init { extensions, .. }) = Request::parse(&p(packet_type::INIT, &init)) else { panic!() };
+        assert_eq!(extensions.len(), MAX_EXTENSIONS);
         // Attribute flags version 3 does not define.
         assert_eq!(
             Response::parse(&p(packet_type::ATTRS, &[0, 0, 0, 1, 0, 0, 0, 0x10])),
@@ -1377,7 +1428,7 @@ mod tests {
         let mut d = Decoder::default();
         let mut got = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
+            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
             while let Some(p) = d.next_packet() {
                 got.push(Request::parse(&p.unwrap()).unwrap());
             }
@@ -1386,17 +1437,17 @@ mod tests {
         assert_eq!(got[1], Request::Stat { id: 1, path: s(b"/etc/passwd") });
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
-        d.feed(&[0, 0, 0, 0, 1]);
+        assert_eq!(d.feed(&[0, 0, 0, 0, 1]), 5);
         assert_eq!(d.next_packet(), Some(Err(PacketError::Empty)));
-        d.feed(&a);
+        assert_eq!(d.feed(&a), a.len());
         assert_eq!(d.next_packet(), Some(Err(PacketError::Empty)));
         assert_eq!(d.buffered(), 0);
         // A decoder with a lower limit.
         let mut small = Decoder::with_limit(8);
-        small.feed(&b);
+        assert_eq!(small.feed(&b), LENGTH_LEN + 8);
         assert!(matches!(small.next_packet(), Some(Err(PacketError::TooLong(_)))));
         let mut half = Decoder::new();
-        half.feed(&b[..6]);
+        assert_eq!(half.feed(&b[..6]), 6);
         assert_eq!(half.next_packet(), None);
         assert_eq!(half.buffered(), 6);
     }
@@ -1407,11 +1458,13 @@ mod tests {
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(p) = d.next_packet() {
-            p.unwrap();
-            n += 1;
+        let (mut rest, mut n) = (&stream[..], 0);
+        while !rest.is_empty() {
+            rest = &rest[d.feed(rest)..];
+            while let Some(p) = d.next_packet() {
+                p.unwrap();
+                n += 1;
+            }
         }
         assert_eq!(n, 200_000);
         assert_eq!(d.buffered(), 0);
@@ -1491,6 +1544,114 @@ mod tests {
         assert!(Packet::parse(&bytes).unwrap().is_some());
     }
 
+    #[test]
+    fn decoder_holds_at_most_one_packet() {
+        // Feeding without taking packets out must not grow the buffer
+        // past one packet of the decoder's limit.
+        let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes();
+        let mut d = Decoder::with_limit(64);
+        let mut taken = 0;
+        for _ in 0..1000 {
+            taken += d.feed(&one);
+        }
+        assert!(d.buffered() <= LENGTH_LEN + 64, "{}", d.buffered());
+        assert_eq!(taken, d.buffered());
+        // Feeding and taking out in turn reads every packet.
+        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100).collect();
+        let mut d = Decoder::with_limit(64);
+        let (mut rest, mut n) = (&stream[..], 0);
+        loop {
+            let used = d.feed(rest);
+            rest = &rest[used..];
+            while let Some(p) = d.next_packet() {
+                p.unwrap();
+                n += 1;
+            }
+            if rest.is_empty() {
+                break;
+            }
+            assert!(used > 0);
+        }
+        assert_eq!(n, 100);
+        // A broken stream takes and drops every byte.
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&[0, 0, 0, 0]), 4);
+        assert_eq!(d.next_packet(), Some(Err(PacketError::Empty)));
+        assert_eq!(d.feed(&[0; 100]), 100);
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn status_text_is_cut_at_a_character() {
+        let text = "a".repeat(MAX_TEXT - 1) + "\u{e9}";
+        let resp = Response::status(1, Status::Failure, &text);
+        let Response::Status { message, .. } = &resp else { panic!() };
+        // The constructor copies no more than it writes.
+        assert!(message.len() <= MAX_TEXT, "{}", message.len());
+        let written = |r: &Response| {
+            let Ok(Response::Status { message, language, .. }) = Response::parse(&r.to_packet()) else { panic!() };
+            (message, language)
+        };
+        let (m, _) = written(&resp);
+        assert_eq!(std::str::from_utf8(&m), Ok(&text[..MAX_TEXT - 1]));
+        let long = Response::Status {
+            id: 1,
+            status: Status::Failure,
+            message: text.clone().into_bytes(),
+            language: text.clone().into_bytes(),
+        };
+        let (m, l) = written(&long);
+        assert!(std::str::from_utf8(&m).is_ok() && std::str::from_utf8(&l).is_ok());
+        assert_eq!(m.len(), MAX_TEXT - 1);
+        // Four-byte characters, and a message that fits, are kept whole.
+        let wide = "\u{1f600}".repeat(300);
+        let (m, _) = written(&Response::status(1, Status::Failure, &wide));
+        assert_eq!(m, wide.as_bytes()[..MAX_TEXT].to_vec());
+        let (m, _) = written(&Response::status(1, Status::Ok, "\u{e9}t\u{e9}"));
+        assert_eq!(m, "\u{e9}t\u{e9}".as_bytes());
+        // Bytes that are not UTF-8 are cut at the limit.
+        let bad = Response::Status { id: 1, status: Status::Ok, message: vec![0x80; 2000], language: vec![] };
+        assert_eq!(written(&bad).0.len(), MAX_TEXT);
+    }
+
+    #[test]
+    fn unknown_extensions_over_the_limits_are_skipped() {
+        let mut body = vec![0, 0, 0, 3];
+        let ext = |b: &mut Vec<u8>, name: &[u8], data_len: usize| {
+            b.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            b.extend_from_slice(name);
+            b.extend_from_slice(&(data_len as u32).to_be_bytes());
+            b.extend(std::iter::repeat_n(b'z', data_len));
+        };
+        ext(&mut body, b"x@example.com", MAX_TEXT + 1);
+        ext(&mut body, &[b'n'; MAX_EXTENSION_NAME + 1], 1);
+        ext(&mut body, b"posix-rename@openssh.com", 1);
+        for kind in [packet_type::INIT, packet_type::VERSION] {
+            let p = Packet { kind, body: body.clone() };
+            let kept = vec![Extension { name: s(b"posix-rename@openssh.com"), data: s(b"z") }];
+            if kind == packet_type::INIT {
+                assert_eq!(Request::parse(&p), Ok(Request::Init { version: 3, extensions: kept }));
+            } else {
+                assert_eq!(Response::parse(&p), Ok(Response::Version { version: 3, extensions: kept }));
+            }
+        }
+        // Past MAX_EXTENSIONS, the rest are skipped too.
+        let mut many = vec![0, 0, 0, 3];
+        for _ in 0..MAX_EXTENSIONS + 5 {
+            ext(&mut many, b"a", 0);
+        }
+        let Ok(Request::Init { extensions, .. }) = Request::parse(&Packet { kind: packet_type::INIT, body: many })
+        else {
+            panic!()
+        };
+        assert_eq!(extensions.len(), MAX_EXTENSIONS);
+        // A pair that runs past the end is still an error.
+        let mut cut = vec![0, 0, 0, 3];
+        ext(&mut cut, b"a", 10);
+        cut.truncate(cut.len() - 1);
+        assert_eq!(Request::parse(&Packet { kind: packet_type::INIT, body: cut }), Err(ParseError::Truncated));
+    }
+
     /// A deterministic generator, so a failure repeats.
     struct Lcg(u64);
 
@@ -1526,7 +1687,7 @@ mod tests {
             }
             // Whole, and a byte at a time.
             let mut whole = Decoder::new();
-            whole.feed(&buf);
+            assert_eq!(whole.feed(&buf), buf.len());
             let mut packets = Vec::new();
             while let Some(Ok(p)) = whole.next_packet() {
                 packets.push(p);
@@ -1534,7 +1695,7 @@ mod tests {
             let mut bytewise = Decoder::new();
             let mut again = Vec::new();
             for b in &buf {
-                bytewise.feed(std::slice::from_ref(b));
+                assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
                 while let Some(Ok(p)) = bytewise.next_packet() {
                     again.push(p);
                 }

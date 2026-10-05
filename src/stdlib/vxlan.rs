@@ -29,7 +29,10 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Reserved bits are ignored on receipt and written as zero, as both
 //! specifications say, so a packet read and written again may differ from
-//! the bytes it came from only in those bits.
+//! the bytes it came from only in those bits. Writers return an error,
+//! rather than change the packet, when a field does not fit: a VNI wider
+//! than 24 bits, a payload longer than [`MAX_PAYLOAD`], or the reserved
+//! next-protocol value 0.
 //!
 //! ```
 //! use fictionet::stdlib::vxlan::{GpePacket, Packet, next_protocol};
@@ -43,7 +46,7 @@
 //! assert_eq!(packet.vni, 5001);
 //! assert_eq!(packet.frame.len(), 14);
 //! assert_eq!(packet.frame[12..], [0x08, 0x06]);
-//! assert_eq!(packet.to_bytes(), datagram);
+//! assert_eq!(packet.to_bytes(), Ok(datagram));
 //!
 //! // The same network over VXLAN-GPE, carrying an IPv4 packet instead.
 //! let gpe = GpePacket {
@@ -53,7 +56,7 @@
 //!     oam: false,
 //!     payload: vec![0x45, 0, 0, 20],
 //! };
-//! let bytes = gpe.to_bytes();
+//! let bytes = gpe.to_bytes().unwrap();
 //! assert_eq!(bytes[..8], [0x0c, 0, 0, 0x01, 0x00, 0x13, 0x89, 0]);
 //! assert_eq!(GpePacket::parse(&bytes), Ok(gpe));
 //! ```
@@ -93,7 +96,9 @@ pub mod flags {
 
 /// Values of the VXLAN-GPE next-protocol field. 0x00 is reserved, 0x7E
 /// and 0x7F are for experiments, and 0x80 to 0xFF name shim headers that
-/// sit in front of the inner packet. Readers keep any value as given.
+/// sit in front of the inner packet. Readers keep any value but 0 as
+/// given. With the P flag set, 0 names no protocol, so readers reject it
+/// and writers refuse to write it.
 pub mod next_protocol {
     /// An IPv4 packet.
     pub const IPV4: u8 = 0x01;
@@ -110,7 +115,7 @@ pub mod next_protocol {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Packet {
     /// The VXLAN Network Identifier: which virtual network the frame
-    /// belongs to. Only the low 24 bits are written.
+    /// belongs to. At most [`MAX_VNI`]: writers reject a wider value.
     pub vni: u32,
     /// The inner Ethernet frame, from its destination address on, with no
     /// frame check sequence. Readers do not look inside it.
@@ -118,16 +123,19 @@ pub struct Packet {
 }
 
 /// One VXLAN-GPE datagram: the network it is for, what it carries, its
-/// flags and the inner packet. The default is VNI 0, the P, B and O
-/// flags clear (so an Ethernet payload) and an empty payload.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// flags and the inner packet. The default is VNI 0, an Ethernet payload
+/// named with the P flag (next protocol [`next_protocol::ETHERNET`]), the
+/// B and O flags clear and an empty payload. The draft also allows
+/// Ethernet with the P flag clear (`next_protocol: None`), but Linux GPE
+/// endpoints drop such packets, so the default sets the flag.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GpePacket {
-    /// The VXLAN Network Identifier, as in [`Packet::vni`]. Only the low
-    /// 24 bits are written.
+    /// The VXLAN Network Identifier, as in [`Packet::vni`]. At most
+    /// [`MAX_VNI`]: writers reject a wider value.
     pub vni: u32,
     /// What the payload is, one of the [`next_protocol`] values or another
-    /// byte, when the P flag is set. `None` when the P flag is clear,
-    /// which means the payload is an Ethernet frame.
+    /// byte but the reserved 0, when the P flag is set. `None` when the P
+    /// flag is clear, which means the payload is an Ethernet frame.
     pub next_protocol: Option<u8>,
     /// The B flag: broadcast, unknown unicast or multicast traffic.
     pub bum: bool,
@@ -135,6 +143,12 @@ pub struct GpePacket {
     pub oam: bool,
     /// The inner packet or frame. Readers do not look inside it.
     pub payload: Vec<u8>,
+}
+
+impl Default for GpePacket {
+    fn default() -> GpePacket {
+        GpePacket { vni: 0, next_protocol: Some(next_protocol::ETHERNET), bum: false, oam: false, payload: Vec::new() }
+    }
 }
 
 /// Why a datagram is not a VXLAN or VXLAN-GPE packet. A real endpoint
@@ -154,6 +168,16 @@ pub enum Error {
     /// VXLAN-GPE only: the P flag was clear but the next-protocol field
     /// was not zero. It holds the field.
     NextProtocolWithoutP(u8),
+    /// VXLAN-GPE only: the P flag was set with the next-protocol field 0,
+    /// a value the draft reserves, so the header names no protocol. A
+    /// writer returns it for `next_protocol: Some(0)`.
+    ReservedNextProtocol,
+    /// Writers only: the VNI was wider than 24 bits, more than
+    /// [`MAX_VNI`]. It holds the VNI.
+    VniTooLarge(u32),
+    /// Writers only: the frame or payload was longer than [`MAX_PAYLOAD`],
+    /// so no datagram could carry it. It holds how long it was.
+    PayloadTooLong(usize),
 }
 
 impl std::fmt::Display for Error {
@@ -164,6 +188,11 @@ impl std::fmt::Display for Error {
             Error::NoVni => write!(f, "I flag clear, so no valid VNI"),
             Error::Version(v) => write!(f, "VXLAN-GPE version {v}, not 0"),
             Error::NextProtocolWithoutP(p) => write!(f, "next protocol {p} with the P flag clear"),
+            Error::ReservedNextProtocol => write!(f, "next protocol 0, which is reserved, with the P flag set"),
+            Error::VniTooLarge(v) => write!(f, "VNI {v} is wider than 24 bits"),
+            Error::PayloadTooLong(n) => {
+                write!(f, "{n}-byte payload, longer than the {MAX_PAYLOAD} bytes a datagram can carry")
+            }
         }
     }
 }
@@ -182,10 +211,10 @@ impl Packet {
     }
 
     /// The datagram's bytes: the header, with only the I flag set and the
-    /// reserved bits zero, then the frame. A frame longer than
-    /// [`MAX_PAYLOAD`] is cut to that length, since no datagram can hold
-    /// more.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// reserved bits zero, then the frame. Fails with
+    /// [`Error::VniTooLarge`] for a VNI over [`MAX_VNI`] and with
+    /// [`Error::PayloadTooLong`] for a frame longer than [`MAX_PAYLOAD`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         write(flags::I, 0, self.vni, &self.frame)
     }
 }
@@ -205,6 +234,9 @@ impl GpePacket {
         // split checked that b holds at least the header.
         let field = b[3];
         let next_protocol = if first & flags::P != 0 {
+            if field == 0 {
+                return Err(Error::ReservedNextProtocol);
+            }
             Some(field)
         } else if field != 0 {
             return Err(Error::NextProtocolWithoutP(field));
@@ -222,9 +254,14 @@ impl GpePacket {
 
     /// The datagram's bytes: the header, with version 0, the I flag, the
     /// P, B and O flags as the fields say, and the reserved bits zero,
-    /// then the payload. A payload longer than [`MAX_PAYLOAD`] is cut to
-    /// that length, since no datagram can hold more.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// then the payload. Fails with [`Error::ReservedNextProtocol`] for
+    /// `next_protocol: Some(0)`, [`Error::VniTooLarge`] for a VNI over
+    /// [`MAX_VNI`] and [`Error::PayloadTooLong`] for a payload longer than
+    /// [`MAX_PAYLOAD`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        if self.next_protocol == Some(0) {
+            return Err(Error::ReservedNextProtocol);
+        }
         let mut first = flags::I;
         if self.next_protocol.is_some() {
             first |= flags::P;
@@ -258,14 +295,20 @@ fn split(b: &[u8]) -> Result<(u8, u32, &[u8]), Error> {
 }
 
 /// Writes a header with the given flags byte, next-protocol field and
-/// VNI, then at most [`MAX_PAYLOAD`] bytes of the payload.
-fn write(first: u8, next: u8, vni: u32, payload: &[u8]) -> Vec<u8> {
-    let payload = &payload[..payload.len().min(MAX_PAYLOAD)];
-    let v = (vni & MAX_VNI).to_be_bytes();
+/// VNI, then the payload. Checks the VNI and the payload's length before
+/// it allocates.
+fn write(first: u8, next: u8, vni: u32, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    if vni > MAX_VNI {
+        return Err(Error::VniTooLarge(vni));
+    }
+    if payload.len() > MAX_PAYLOAD {
+        return Err(Error::PayloadTooLong(payload.len()));
+    }
+    let v = vni.to_be_bytes();
     let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
     out.extend_from_slice(&[first, 0, 0, next, v[1], v[2], v[3], 0]);
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -287,7 +330,7 @@ mod tests {
         let p = Packet::parse(&d).unwrap();
         assert_eq!(p.vni, 5001);
         assert_eq!(p.frame, d[8..]);
-        assert_eq!(p.to_bytes(), d);
+        assert_eq!(p.to_bytes(), Ok(d));
         // The largest VNI.
         let p = Packet::parse(&[0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]).unwrap();
         assert_eq!(p, Packet { vni: MAX_VNI, frame: vec![] });
@@ -298,13 +341,13 @@ mod tests {
         let d = [0xf7 | flags::I, 0xaa, 0xbb, 0xcc, 0, 0, 7, 0xdd, 1, 2];
         let p = Packet::parse(&d).unwrap();
         assert_eq!(p, Packet { vni: 7, frame: vec![1, 2] });
-        assert_eq!(p.to_bytes(), [0x08, 0, 0, 0, 0, 0, 7, 0, 1, 2]);
+        assert_eq!(p.to_bytes().unwrap(), [0x08, 0, 0, 0, 0, 0, 7, 0, 1, 2]);
         // In VXLAN-GPE: the two high bits, the 16 reserved bits and the
         // last byte.
         let d = [0xc0 | flags::I | flags::P, 0xaa, 0xbb, 0x02, 0, 0, 9, 0xdd];
         let g = GpePacket::parse(&d).unwrap();
         assert_eq!(g.next_protocol, Some(next_protocol::IPV6));
-        assert_eq!(g.to_bytes(), [0x0c, 0, 0, 0x02, 0, 0, 9, 0]);
+        assert_eq!(g.to_bytes().unwrap(), [0x0c, 0, 0, 0x02, 0, 0, 9, 0]);
     }
 
     #[test]
@@ -322,7 +365,7 @@ mod tests {
                 payload: vec![9, 9]
             }
         );
-        assert_eq!(g.to_bytes(), d);
+        assert_eq!(g.to_bytes().unwrap(), d);
         assert_eq!(g.protocol(), next_protocol::NSH);
         // P clear: the payload is Ethernet, and the field is zero.
         let d = [0x08, 0, 0, 0, 0, 0, 1, 0];
@@ -330,10 +373,10 @@ mod tests {
         assert_eq!(g.next_protocol, None);
         assert_eq!(g.protocol(), next_protocol::ETHERNET);
         assert!(!g.bum && !g.oam);
-        assert_eq!(g.to_bytes(), d);
+        assert_eq!(g.to_bytes().unwrap(), d);
         // A plain VXLAN header reads as VXLAN-GPE with P clear.
         let g = GpePacket::parse(&example()).unwrap();
-        assert_eq!(g.to_bytes(), example());
+        assert_eq!(g.to_bytes(), Ok(example()));
         // An unassigned next protocol is kept as it is.
         let d = [0x0c, 0, 0, 0x99, 0, 0, 1, 0];
         assert_eq!(GpePacket::parse(&d).unwrap().next_protocol, Some(0x99));
@@ -361,6 +404,9 @@ mod tests {
             Error::NoVni,
             Error::Version(2),
             Error::NextProtocolWithoutP(1),
+            Error::ReservedNextProtocol,
+            Error::VniTooLarge(0x0100_0000),
+            Error::PayloadTooLong(70_000),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -385,35 +431,63 @@ mod tests {
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
-        let p = Packet { vni: 0xffff_ffff, frame: vec![1; MAX_DATAGRAM * 2] };
-        let bytes = p.to_bytes();
+    fn writers_reject_a_vni_wider_than_24_bits() {
+        // RFC 7348 section 5: the VNI is 24 bits. Masking would send the
+        // frame to another network, so the writer refuses.
+        let p = Packet { vni: 0x0100_0001, frame: vec![0; 60] };
+        assert_eq!(p.to_bytes(), Err(Error::VniTooLarge(0x0100_0001)));
+        let g = GpePacket { vni: 0xab00_0001, ..GpePacket::default() };
+        assert_eq!(g.to_bytes(), Err(Error::VniTooLarge(0xab00_0001)));
+        let p = Packet { vni: MAX_VNI, frame: vec![] };
+        assert_eq!(p.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]));
+    }
+
+    #[test]
+    fn writers_reject_a_payload_too_long_for_a_datagram() {
+        // The longest payload fits, at exactly the longest datagram.
+        let p = Packet { vni: 1, frame: vec![1; MAX_PAYLOAD] };
+        let bytes = p.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_DATAGRAM);
-        let back = Packet::parse(&bytes).unwrap();
-        assert_eq!(back.vni, MAX_VNI);
-        assert_eq!(back.frame.len(), MAX_PAYLOAD);
-        let g = GpePacket { vni: 0x0100_0002, next_protocol: Some(0), bum: true, oam: false, payload: vec![2; 70_000] };
-        let bytes = g.to_bytes();
+        assert_eq!(Packet::parse(&bytes), Ok(p));
+        let g = GpePacket { vni: 2, payload: vec![2; MAX_PAYLOAD], ..GpePacket::default() };
+        let bytes = g.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_DATAGRAM);
-        let back = GpePacket::parse(&bytes).unwrap();
-        assert_eq!(back.vni, 2);
-        assert_eq!(back.next_protocol, Some(0));
-        assert_eq!(back.payload.len(), MAX_PAYLOAD);
+        assert_eq!(GpePacket::parse(&bytes), Ok(g));
+        // One byte more is an error, not a cut frame.
+        let p = Packet { vni: 1, frame: vec![1; MAX_PAYLOAD + 1] };
+        assert_eq!(p.to_bytes(), Err(Error::PayloadTooLong(MAX_PAYLOAD + 1)));
+        let g = GpePacket { vni: 2, payload: vec![2; 70_000], ..GpePacket::default() };
+        assert_eq!(g.to_bytes(), Err(Error::PayloadTooLong(70_000)));
+    }
+
+    #[test]
+    fn reserved_next_protocol_zero_is_rejected() {
+        // Draft-12 section 11.2 reserves 0x00. With P set it names no
+        // protocol: the reader rejects it and the writer will not write it.
+        assert_eq!(GpePacket::parse(&[0x0c, 0, 0, 0, 0, 0, 1, 0]), Err(Error::ReservedNextProtocol));
+        assert_eq!(GpePacket::parse(&[0x0f, 0, 0, 0, 0, 0, 1, 0, 9]), Err(Error::ReservedNextProtocol));
+        let g = GpePacket { vni: 1, next_protocol: Some(0), ..GpePacket::default() };
+        assert_eq!(g.to_bytes(), Err(Error::ReservedNextProtocol));
+        // P clear with a zero field is still implicit Ethernet.
+        let g = GpePacket { vni: 1, next_protocol: None, ..GpePacket::default() };
+        assert_eq!(g.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0, 0, 1, 0]));
+        assert_eq!(g.protocol(), next_protocol::ETHERNET);
     }
 
     #[test]
     fn defaults_write_valid_headers() {
         let p = Packet::default();
-        assert_eq!(p.to_bytes(), [0x08, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(Packet::parse(&p.to_bytes()), Ok(p));
+        assert_eq!(p.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(Packet::parse(&p.to_bytes().unwrap()), Ok(p));
+        // The GPE default names Ethernet with the P flag, as Linux GPE
+        // endpoints require: P=1, next protocol 3.
         let g = GpePacket::default();
+        assert_eq!(g.next_protocol, Some(next_protocol::ETHERNET));
         assert_eq!(g.protocol(), next_protocol::ETHERNET);
-        assert_eq!(g.to_bytes(), [0x08, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(GpePacket::parse(&g.to_bytes()), Ok(g));
-        // A VNI wider than 24 bits loses its high byte on the way out.
-        let g = GpePacket { vni: 0xab00_0001, next_protocol: Some(0), ..GpePacket::default() };
-        let back = GpePacket::parse(&g.to_bytes()).unwrap();
-        assert_eq!(back, GpePacket { vni: 1, ..g });
+        assert_eq!(g.to_bytes(), Ok(vec![0x0c, 0, 0, 0x03, 0, 0, 0, 0]));
+        assert_eq!(GpePacket::parse(&g.to_bytes().unwrap()), Ok(g));
+        let g = GpePacket { vni: 1, payload: vec![0xff; 14], ..GpePacket::default() };
+        assert_eq!(g.to_bytes().unwrap()[..8], [0x0c, 0, 0, 0x03, 0, 0, 1, 0]);
     }
 
     /// A deterministic linear congruential generator, so the fuzz loop
@@ -429,12 +503,12 @@ mod tests {
 
     fn check(data: &[u8]) {
         if let Ok(p) = Packet::parse(data) {
-            let bytes = p.to_bytes();
+            let bytes = p.to_bytes().unwrap();
             assert_eq!(bytes.len(), data.len());
             assert_eq!(Packet::parse(&bytes), Ok(p));
         }
         if let Ok(g) = GpePacket::parse(data) {
-            let bytes = g.to_bytes();
+            let bytes = g.to_bytes().unwrap();
             assert_eq!(bytes.len(), data.len());
             assert_eq!(GpePacket::parse(&bytes), Ok(g));
         }
@@ -471,21 +545,29 @@ mod tests {
             }
         }
         assert!(parsed > 1000, "{parsed}");
-        // Random packets written and read back.
+        // Random packets, any VNI and any next protocol, written and
+        // read back. A write either keeps the whole value or fails.
         for _ in 0..5_000 {
-            let vni = u32::from_be_bytes([rng.next(), rng.next(), rng.next(), rng.next()]);
+            let vni = u32::from_be_bytes([rng.next() % 4, rng.next(), rng.next(), rng.next()]);
             let payload: Vec<u8> = (0..rng.next() % 32).map(|_| rng.next()).collect();
             let p = Packet { vni, frame: payload.clone() };
-            assert_eq!(Packet::parse(&p.to_bytes()), Ok(Packet { vni: vni & MAX_VNI, frame: payload.clone() }));
+            match p.to_bytes() {
+                Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(p)),
+                Err(e) => assert!(vni > MAX_VNI && e == Error::VniTooLarge(vni)),
+            }
             let flags = rng.next();
             let g = GpePacket {
-                vni: vni & MAX_VNI,
-                next_protocol: if flags & 1 == 0 { None } else { Some(rng.next()) },
+                vni,
+                next_protocol: if flags & 1 == 0 { None } else { Some(rng.next() % 8) },
                 bum: flags & 2 != 0,
                 oam: flags & 4 != 0,
                 payload,
             };
-            assert_eq!(GpePacket::parse(&g.to_bytes()), Ok(g));
+            match g.to_bytes() {
+                Ok(bytes) => assert_eq!(GpePacket::parse(&bytes), Ok(g)),
+                Err(Error::VniTooLarge(v)) => assert!(v == vni && vni > MAX_VNI),
+                Err(e) => assert!(e == Error::ReservedNextProtocol && g.next_protocol == Some(0)),
+            }
         }
     }
 }

@@ -62,12 +62,14 @@ use std::collections::VecDeque;
 /// The largest integer a reader accepts, 2^62 - 1, the largest QUIC stream
 /// ID. Writers lower larger values to it.
 pub const MAX_INTEGER: u64 = (1 << 62) - 1;
-/// The longest string, before or after Huffman decoding. Writers cut
-/// longer strings to this length.
+/// The longest string, before or after Huffman decoding. Writers, the
+/// Huffman encoder included, cut longer strings to this length.
 pub const MAX_STRING: usize = 64 << 10;
 /// The largest dynamic table capacity. A larger maximum given to
-/// [`Decoder::new`] or [`Encoder::new`] is lowered to it, so a world
-/// should not advertise more.
+/// [`Decoder::new`] or [`Encoder::new`] still sets how Required Insert
+/// Counts are encoded, as RFC 9204 requires, but the table never grows past
+/// this. A decoder refuses a larger capacity, so a world should not
+/// advertise more.
 pub const MAX_TABLE_CAPACITY: u64 = 64 << 10;
 /// What each entry adds to the table's size, besides its name and value.
 pub const ENTRY_OVERHEAD: u64 = 32;
@@ -83,14 +85,22 @@ pub const MAX_FIELDS: usize = 4096;
 /// The most streams a decoder lets wait for inserts. A larger number given
 /// to [`Decoder::new`] is lowered to it.
 pub const MAX_BLOCKED_STREAMS: usize = 256;
-/// The most bytes of field sections a decoder holds for blocked streams.
+/// The most bytes of field sections a decoder holds: those waiting for
+/// inserts, and those released but not yet taken from
+/// [`Decoder::unblocked`].
 pub const MAX_BLOCKED_BYTES: usize = 1 << 20;
-/// The most field sections a decoder holds for blocked streams. One
-/// stream may have several, such as a header and a trailer section.
+/// The most field sections a decoder holds, counted as for
+/// [`MAX_BLOCKED_BYTES`]. One stream may have several, such as a header and
+/// a trailer section.
 pub const MAX_BLOCKED_SECTIONS: usize = 4 * MAX_BLOCKED_STREAMS;
 /// The longest encoder stream instruction: a byte, two integers and two
-/// strings. A decoder never holds more bytes of an unfinished one.
+/// strings. A reader of either stream holds at most this many bytes of an
+/// unfinished instruction, plus at most this many more while it reads.
 pub const MAX_INSTRUCTION: usize = 2 * (10 + MAX_STRING);
+/// The most bytes an encoder or decoder holds for its stream before they
+/// are taken. Past it, a call that would add more is [`Error::Backlog`];
+/// one instruction may take the total past it.
+pub const MAX_PENDING_STREAM: usize = 1 << 20;
 /// The most field sections an encoder tracks while it waits for their
 /// acknowledgments. Past it, the encoder stops using the dynamic table.
 pub const MAX_OUTSTANDING: usize = 1024;
@@ -267,6 +277,11 @@ pub enum Error {
     /// field section not yet acknowledged refers to, or one whose insert
     /// the decoder has not acknowledged.
     Referenced,
+    /// At least [`MAX_PENDING_STREAM`] bytes wait to be taken with
+    /// [`Encoder::take_encoder_stream`] or [`Decoder::take_decoder_stream`].
+    /// Nothing changed; take them and try again. This is the caller's
+    /// state, not the peer's fault, and not a connection error.
+    Backlog,
 }
 
 impl std::fmt::Display for Error {
@@ -289,6 +304,7 @@ impl std::fmt::Display for Error {
             Error::FieldSectionTooLarge => f.write_str("field section too large"),
             Error::TooManyFields => f.write_str("too many fields"),
             Error::Referenced => f.write_str("would evict an entry still in use"),
+            Error::Backlog => f.write_str("too many stream bytes not yet taken"),
         }
     }
 }
@@ -485,13 +501,17 @@ const fn build_huffman() -> Huffman {
     h
 }
 
-/// How many bytes `s` takes Huffman-coded.
+/// How many bytes [`huffman_encode`] makes of `s`: `s` cut to
+/// [`MAX_STRING`], Huffman-coded.
 pub fn huffman_len(s: &[u8]) -> usize {
+    let s = &s[..s.len().min(MAX_STRING)];
     let bits: usize = s.iter().map(|&b| usize::from(HUFFMAN_LENGTHS[usize::from(b)])).sum();
     bits.div_ceil(8)
 }
 
-/// `s` Huffman-coded, padded with 1 bits.
+/// `s` Huffman-coded, padded with 1 bits. Like the other writers, it cuts
+/// `s` to [`MAX_STRING`] bytes, so [`huffman_decode`] always reads the
+/// result back.
 pub fn huffman_encode(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(huffman_len(s));
     huffman_encode_into(&mut out, s);
@@ -499,6 +519,7 @@ pub fn huffman_encode(s: &[u8]) -> Vec<u8> {
 }
 
 fn huffman_encode_into(out: &mut Vec<u8>, s: &[u8]) {
+    let s = &s[..s.len().min(MAX_STRING)];
     let (mut acc, mut bits) = (0u64, 0u32);
     for &b in s {
         let len = u32::from(HUFFMAN_LENGTHS[usize::from(b)]);
@@ -590,24 +611,29 @@ pub struct DynamicTable {
     size: u64,
     capacity: u64,
     max_capacity: u64,
+    advertised: u64,
     inserted: u64,
 }
 
 impl DynamicTable {
-    /// An empty table with capacity 0, which may grow to `max_capacity`
-    /// (lowered to [`MAX_TABLE_CAPACITY`]).
+    /// An empty table with capacity 0, for a decoder that advertised
+    /// `max_capacity` as its SETTINGS_QPACK_MAX_TABLE_CAPACITY. The
+    /// capacity may grow to `max_capacity` lowered to
+    /// [`MAX_TABLE_CAPACITY`]; Required Insert Counts are encoded with
+    /// `max_capacity` as advertised.
     pub fn new(max_capacity: u64) -> DynamicTable {
         DynamicTable {
             entries: VecDeque::new(),
             size: 0,
             capacity: 0,
             max_capacity: max_capacity.min(MAX_TABLE_CAPACITY),
+            advertised: max_capacity,
             inserted: 0,
         }
     }
 
     /// The most the capacity may be: the decoder's
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY.
+    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, lowered to [`MAX_TABLE_CAPACITY`].
     pub fn max_capacity(&self) -> u64 {
         self.max_capacity
     }
@@ -638,10 +664,11 @@ impl DynamicTable {
         self.inserted
     }
 
-    /// The most entries the table can hold: the maximum capacity over 32.
+    /// MaxEntries of RFC 9204 section 3.2.2: the advertised maximum
+    /// capacity over 32, before it is lowered to [`MAX_TABLE_CAPACITY`].
     /// Required Insert Counts are encoded with it.
     pub fn max_entries(&self) -> u64 {
-        self.max_capacity / ENTRY_OVERHEAD
+        self.advertised / ENTRY_OVERHEAD
     }
 
     /// The absolute index of the oldest entry still held.
@@ -1104,16 +1131,56 @@ fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u
 pub enum Section {
     /// The section's fields, in order.
     Fields(Vec<Field>),
-    /// The section needs inserts the decoder has not received. Its fields
-    /// come out of [`Decoder::unblocked`] once they arrive.
+    /// The section needs inserts the decoder has not received, or waits
+    /// behind an earlier section on its stream that does or that has not
+    /// been taken out yet. Its fields come out of [`Decoder::unblocked`] or
+    /// [`Decoder::next_unblocked`], in the order its stream sent them.
     Blocked,
 }
 
 #[derive(Clone, Debug)]
-struct BlockedSection {
+struct HeldSection {
     stream: u64,
     prefix: SectionPrefix,
     body: Vec<u8>,
+}
+
+/// Reads whole instructions from `bytes`, after the unfinished one held in
+/// `buf`, and applies each. It copies at most [`MAX_INSTRUCTION`] bytes of
+/// `bytes` into `buf` at a time and keeps only what is left of an
+/// unfinished instruction, so `buf` stays below a few times
+/// [`MAX_INSTRUCTION`] whatever the input.
+/// Reads one instruction from the front of a buffer, if it is all there.
+type Parse<T> = fn(&[u8]) -> Result<Option<(T, usize)>, Error>;
+
+fn read_stream<T>(
+    buf: &mut Vec<u8>,
+    bytes: &[u8],
+    parse: Parse<T>,
+    mut apply: impl FnMut(T) -> Result<(), Error>,
+) -> Result<(), Error> {
+    for chunk in bytes.chunks(MAX_INSTRUCTION) {
+        buf.extend_from_slice(chunk);
+        let mut start = 0;
+        let result = loop {
+            match parse(&buf[start..]) {
+                Ok(Some((ins, used))) => {
+                    start += used;
+                    if let Err(e) = apply(ins) {
+                        break Err(e);
+                    }
+                }
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        };
+        buf.drain(..start);
+        result?;
+    }
+    if buf.capacity() > 2 * MAX_INSTRUCTION {
+        buf.shrink_to(MAX_INSTRUCTION);
+    }
+    Ok(())
 }
 
 /// The decoding side of QPACK: it keeps the dynamic table the peer's
@@ -1125,11 +1192,15 @@ pub struct Decoder {
     max_blocked: usize,
     field_limit: u64,
     buf: Vec<u8>,
-    start: usize,
     failed: Option<Error>,
-    blocked: Vec<BlockedSection>,
-    blocked_bytes: usize,
-    ready: Vec<(u64, Result<Vec<Field>, Error>)>,
+    /// Sections waiting for inserts, or behind one that is, oldest first.
+    blocked: Vec<HeldSection>,
+    /// Sections whose inserts have arrived, still encoded, oldest first.
+    /// They are decoded and acknowledged as they are taken out, so the
+    /// encoder keeps their entries until then.
+    ready: VecDeque<HeldSection>,
+    /// The body bytes of `blocked` and `ready`.
+    held_bytes: usize,
     out: Vec<u8>,
     /// The insert count the encoder knows of, from acknowledgments and
     /// increments already written.
@@ -1140,18 +1211,18 @@ impl Decoder {
     /// A decoder with the settings it advertises: its
     /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, SETTINGS_QPACK_BLOCKED_STREAMS
     /// and SETTINGS_MAX_FIELD_SECTION_SIZE. Each is lowered to this
-    /// module's limit.
+    /// module's limit, except that Required Insert Counts are read with the
+    /// table capacity as advertised.
     pub fn new(max_table_capacity: u64, max_blocked_streams: usize, max_field_section_size: u64) -> Decoder {
         Decoder {
             table: DynamicTable::new(max_table_capacity),
             max_blocked: max_blocked_streams.min(MAX_BLOCKED_STREAMS),
             field_limit: max_field_section_size.min(MAX_FIELD_SECTION_SIZE),
             buf: Vec::new(),
-            start: 0,
             failed: None,
             blocked: Vec::new(),
-            blocked_bytes: 0,
-            ready: Vec::new(),
+            ready: VecDeque::new(),
+            held_bytes: 0,
             out: Vec::new(),
             reported: 0,
         }
@@ -1165,33 +1236,20 @@ impl Decoder {
     /// Adds bytes read from the peer's encoder stream and applies each
     /// whole instruction. An error is a connection error; once there is
     /// one, every later call returns it and bytes are dropped. Sections
-    /// the new inserts unblock are decoded at once and wait in
-    /// [`Decoder::unblocked`].
+    /// the new inserts unblock wait, still encoded, for
+    /// [`Decoder::unblocked`] or [`Decoder::next_unblocked`].
     pub fn feed_encoder_stream(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
+        let mut buf = std::mem::take(&mut self.buf);
+        let result = read_stream(&mut buf, bytes, EncoderInstruction::parse, |ins| self.apply(ins));
+        self.buf = buf;
+        if let Err(e) = result {
+            self.failed = Some(e);
+            self.buf = Vec::new();
         }
-        self.buf.extend_from_slice(bytes);
-        loop {
-            let result = match EncoderInstruction::parse(&self.buf[self.start..]) {
-                Ok(Some((ins, used))) => {
-                    self.start += used;
-                    self.apply(ins)
-                }
-                Ok(None) => return Ok(()),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = result {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                return Err(e);
-            }
-        }
+        result
     }
 
     fn apply(&mut self, ins: EncoderInstruction) -> Result<(), Error> {
@@ -1216,20 +1274,20 @@ impl Decoder {
         Ok(())
     }
 
+    /// Moves each blocked section whose inserts have all arrived, and that
+    /// has no blocked section before it on its stream, to `ready`.
     fn unblock(&mut self) {
         let count = self.table.insert_count();
-        let mut i = 0;
-        while i < self.blocked.len() {
-            if self.blocked[i].prefix.required_insert_count <= count {
-                let b = self.blocked.remove(i);
-                self.blocked_bytes -= b.body.len();
-                let result = decode_fields(&self.table, b.prefix, &b.body, self.field_limit);
-                if result.is_ok() {
-                    self.acknowledge(b.stream, b.prefix.required_insert_count);
-                }
-                self.ready.push((b.stream, result));
+        if !self.blocked.iter().any(|b| b.prefix.required_insert_count <= count) {
+            return;
+        }
+        let mut stuck = std::collections::HashSet::new();
+        for b in std::mem::take(&mut self.blocked) {
+            if b.prefix.required_insert_count <= count && !stuck.contains(&b.stream) {
+                self.ready.push_back(b);
             } else {
-                i += 1;
+                stuck.insert(b.stream);
+                self.blocked.push(b);
             }
         }
     }
@@ -1243,25 +1301,39 @@ impl Decoder {
 
     /// Decodes the encoded field section that came on `stream`, a QUIC
     /// stream ID below 2^62. A section that needs inserts not yet received
-    /// is held and gives [`Section::Blocked`]. If that would block more
-    /// streams than the limit, or hold more than [`MAX_BLOCKED_SECTIONS`]
-    /// or [`MAX_BLOCKED_BYTES`], it is [`Error::TooManyBlocked`]. Any error
-    /// is the connection error [`error_code::DECOMPRESSION_FAILED`].
+    /// is held and gives [`Section::Blocked`], as is one behind such a
+    /// section, or behind one not yet taken out, on the same stream. If
+    /// that would block more streams than the limit, or hold more than
+    /// [`MAX_BLOCKED_SECTIONS`] or [`MAX_BLOCKED_BYTES`], it is
+    /// [`Error::TooManyBlocked`]. Any of these errors is the connection
+    /// error [`error_code::DECOMPRESSION_FAILED`]. [`Error::Backlog`] is
+    /// not: it means the decoder stream holds [`MAX_PENDING_STREAM`] bytes
+    /// not yet taken, and nothing was read.
     pub fn decode_section(&mut self, stream: u64, bytes: &[u8]) -> Result<Section, Error> {
+        if self.out.len() >= MAX_PENDING_STREAM {
+            return Err(Error::Backlog);
+        }
         if bytes.len() > MAX_SECTION_BYTES {
             return Err(Error::FieldSectionTooLarge);
         }
         let (prefix, used) = SectionPrefix::parse(bytes, self.table.max_entries(), self.table.insert_count())?;
         let body = &bytes[used..];
-        if prefix.required_insert_count > self.table.insert_count() {
-            let new_stream = !self.blocked.iter().any(|b| b.stream == stream);
-            let too_many = new_stream && self.blocked_streams() >= self.max_blocked;
-            let full = self.blocked.len() >= MAX_BLOCKED_SECTIONS;
-            if too_many || full || self.blocked_bytes + body.len() > MAX_BLOCKED_BYTES {
+        let needs_inserts = prefix.required_insert_count > self.table.insert_count();
+        let behind_blocked = self.blocked.iter().any(|b| b.stream == stream);
+        let behind_ready = self.ready.iter().any(|b| b.stream == stream);
+        if needs_inserts || behind_blocked || behind_ready {
+            let too_many = needs_inserts && !behind_blocked && self.blocked_streams() >= self.max_blocked;
+            let full = self.blocked.len() + self.ready.len() >= MAX_BLOCKED_SECTIONS;
+            if too_many || full || self.held_bytes + body.len() > MAX_BLOCKED_BYTES {
                 return Err(Error::TooManyBlocked);
             }
-            self.blocked_bytes += body.len();
-            self.blocked.push(BlockedSection { stream, prefix, body: body.to_vec() });
+            self.held_bytes += body.len();
+            let held = HeldSection { stream, prefix, body: body.to_vec() };
+            if needs_inserts || behind_blocked {
+                self.blocked.push(held);
+            } else {
+                self.ready.push_back(held);
+            }
             return Ok(Section::Blocked);
         }
         let fields = decode_fields(&self.table, prefix, body, self.field_limit)?;
@@ -1269,10 +1341,30 @@ impl Decoder {
         Ok(Section::Fields(fields))
     }
 
-    /// The sections that were blocked and have since been decoded, with
-    /// their streams, oldest first. Each is taken out once.
+    /// Decodes and takes out the oldest section that was blocked and whose
+    /// inserts have since arrived, with its stream, and acknowledges it. It
+    /// is `None` if there is none, or if the decoder stream holds
+    /// [`MAX_PENDING_STREAM`] bytes not yet taken. An error in the result
+    /// is the connection error [`error_code::DECOMPRESSION_FAILED`].
+    pub fn next_unblocked(&mut self) -> Option<(u64, Result<Vec<Field>, Error>)> {
+        if self.out.len() >= MAX_PENDING_STREAM {
+            return None;
+        }
+        let b = self.ready.pop_front()?;
+        self.held_bytes -= b.body.len();
+        let result = decode_fields(&self.table, b.prefix, &b.body, self.field_limit);
+        if result.is_ok() {
+            self.acknowledge(b.stream, b.prefix.required_insert_count);
+        }
+        Some((b.stream, result))
+    }
+
+    /// Every section [`Decoder::next_unblocked`] would give, oldest first.
+    /// Sections on one stream come out in the order they were sent. Since
+    /// each may decode to the field section size limit, a world that wants
+    /// to bound memory takes them one at a time instead.
     pub fn unblocked(&mut self) -> Vec<(u64, Result<Vec<Field>, Error>)> {
-        std::mem::take(&mut self.ready)
+        std::iter::from_fn(|| self.next_unblocked()).collect()
     }
 
     /// How many streams have a section waiting for inserts. This is what
@@ -1285,17 +1377,20 @@ impl Decoder {
     }
 
     /// Drops what waits for `stream`, which was reset or abandoned, and
-    /// tells the encoder so, unless the table can hold nothing.
-    pub fn cancel_stream(&mut self, stream: u64) {
-        let before = self.blocked.len();
-        self.blocked.retain(|b| b.stream != stream);
-        if self.blocked.len() != before {
-            self.blocked_bytes = self.blocked.iter().map(|b| b.body.len()).sum();
+    /// tells the encoder so, unless the table can hold nothing. If the
+    /// decoder stream holds [`MAX_PENDING_STREAM`] bytes not yet taken, it
+    /// is [`Error::Backlog`] and nothing changes.
+    pub fn cancel_stream(&mut self, stream: u64) -> Result<(), Error> {
+        if self.out.len() >= MAX_PENDING_STREAM {
+            return Err(Error::Backlog);
         }
-        self.ready.retain(|(s, _)| *s != stream);
+        self.blocked.retain(|b| b.stream != stream);
+        self.ready.retain(|b| b.stream != stream);
+        self.held_bytes = self.blocked.iter().chain(&self.ready).map(|b| b.body.len()).sum();
         if self.table.max_capacity() > 0 {
             self.out.extend_from_slice(&DecoderInstruction::StreamCancel(stream).to_bytes());
         }
+        Ok(())
     }
 
     /// The bytes to write to the decoder stream: acknowledgments and
@@ -1330,7 +1425,6 @@ pub struct Encoder {
     outstanding: VecDeque<Outstanding>,
     out: Vec<u8>,
     buf: Vec<u8>,
-    start: usize,
     failed: Option<Error>,
 }
 
@@ -1338,7 +1432,8 @@ impl Encoder {
     /// An encoder for a peer that advertised this
     /// SETTINGS_QPACK_MAX_TABLE_CAPACITY and
     /// SETTINGS_MAX_FIELD_SECTION_SIZE. Each is lowered to this module's
-    /// limit. The table starts with capacity 0.
+    /// limit, except that Required Insert Counts are written with the table
+    /// capacity as advertised. The table starts with capacity 0.
     pub fn new(max_table_capacity: u64, max_field_section_size: u64) -> Encoder {
         Encoder {
             table: DynamicTable::new(max_table_capacity),
@@ -1347,7 +1442,6 @@ impl Encoder {
             outstanding: VecDeque::new(),
             out: Vec::new(),
             buf: Vec::new(),
-            start: 0,
             failed: None,
         }
     }
@@ -1373,7 +1467,12 @@ impl Encoder {
 
     /// Whether room for `size` more within `capacity` keeps every entry
     /// that is not evictable.
+    /// It is also [`Error::Backlog`] if the encoder stream holds
+    /// [`MAX_PENDING_STREAM`] bytes not yet taken.
     fn room(&self, size: u64, capacity: u64) -> Result<(), Error> {
+        if self.out.len() >= MAX_PENDING_STREAM {
+            return Err(Error::Backlog);
+        }
         let kept = self.table.first_kept(size, capacity).ok_or(Error::EntryTooLarge)?;
         if kept > self.evict_limit() { Err(Error::Referenced) } else { Ok(()) }
     }
@@ -1381,7 +1480,9 @@ impl Encoder {
     /// Sets the table's capacity and writes the instruction. A capacity
     /// above the maximum is [`Error::Capacity`]. One that would evict an
     /// entry in use, or one whose insert the decoder has not acknowledged,
-    /// is [`Error::Referenced`].
+    /// is [`Error::Referenced`]. If the encoder stream holds
+    /// [`MAX_PENDING_STREAM`] bytes not yet taken, it is [`Error::Backlog`].
+    /// On an error nothing changes.
     pub fn set_capacity(&mut self, capacity: u64) -> Result<(), Error> {
         if capacity > self.table.max_capacity() {
             return Err(Error::Capacity(capacity));
@@ -1398,7 +1499,9 @@ impl Encoder {
     /// is [`Error::StringTooLong`], and an entry larger than the capacity
     /// [`Error::EntryTooLarge`]. One that would evict an entry in use, or
     /// one whose insert the decoder has not acknowledged, is
-    /// [`Error::Referenced`]. On an error nothing changes.
+    /// [`Error::Referenced`]. If the encoder stream holds
+    /// [`MAX_PENDING_STREAM`] bytes not yet taken, it is [`Error::Backlog`].
+    /// On an error nothing changes.
     pub fn insert(&mut self, name: &[u8], value: &[u8]) -> Result<u64, Error> {
         if name.len() > MAX_STRING || value.len() > MAX_STRING {
             return Err(Error::StringTooLong);
@@ -1537,27 +1640,14 @@ impl Encoder {
         if let Some(e) = self.failed {
             return Err(e);
         }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
+        let mut buf = std::mem::take(&mut self.buf);
+        let result = read_stream(&mut buf, bytes, DecoderInstruction::parse, |ins| self.apply(ins));
+        self.buf = buf;
+        if let Err(e) = result {
+            self.failed = Some(e);
+            self.buf = Vec::new();
         }
-        self.buf.extend_from_slice(bytes);
-        loop {
-            let result = match DecoderInstruction::parse(&self.buf[self.start..]) {
-                Ok(Some((ins, used))) => {
-                    self.start += used;
-                    self.apply(ins)
-                }
-                Ok(None) => return Ok(()),
-                Err(e) => Err(e),
-            };
-            if let Err(e) = result {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                return Err(e);
-            }
-        }
+        result
     }
 
     fn apply(&mut self, ins: DecoderInstruction) -> Result<(), Error> {
@@ -1702,7 +1792,9 @@ mod tests {
         assert_eq!(huffman_decode(&[0x18]), Err(Error::Huffman));
         assert_eq!(huffman_decode(&[0x1f]).unwrap(), b"a");
         // Too long once decoded: '0' is 5 bits, so this gives 1.6 bytes per byte.
-        let long = huffman_encode(&vec![b'0'; MAX_STRING + 1]);
+        // Eight '0's are 40 zero bits, so MAX_STRING of them are MAX_STRING
+        // * 5 / 8 zero bytes; five more bytes hold eight more.
+        let long = vec![0; MAX_STRING * 5 / 8 + 5];
         assert_eq!(huffman_decode(&long), Err(Error::StringTooLong));
         assert_eq!(huffman_decode(&huffman_encode(&vec![b'0'; MAX_STRING])).unwrap().len(), MAX_STRING);
     }
@@ -1756,7 +1848,7 @@ mod tests {
         // the stream is cancelled.
         let s8 = hex("0500 80 c1 81");
         assert_eq!(d.decode_section(8, &s8), Ok(Section::Blocked));
-        d.cancel_stream(8);
+        d.cancel_stream(8).unwrap();
         assert_eq!(d.take_decoder_stream(), [0x48]);
         d.feed_encoder_stream(&hex("02")).unwrap();
         assert_eq!(d.unblocked(), []);
@@ -2105,7 +2197,7 @@ mod tests {
                         dynamic_sections += usize::from(bytes[0] != 0);
                         assert_eq!(fields(d.decode_section(stream, &bytes).unwrap()), list);
                         if rng.below(4) == 0 {
-                            d.cancel_stream(stream);
+                            d.cancel_stream(stream).unwrap();
                         }
                     }
                 }
@@ -2296,5 +2388,148 @@ mod tests {
         encode_integer(&mut out, 5, 0xff, 3);
         assert_eq!(out, [0xe3]);
         assert_eq!(decode_integer(&out, 5), Ok(Some((3, 1))));
+    }
+
+    #[test]
+    fn sections_on_one_stream_are_acknowledged_in_order() {
+        // RFC 9204 section 4.4.1: the encoder takes a Section Acknowledgment
+        // to mean the oldest unacknowledged section on that stream.
+        let mut d = Decoder::new(220, 1, 1 << 16);
+        d.feed_encoder_stream(&[0x3f, 0xbd, 0x01]).unwrap();
+        // Needs entry 1, then a section that needs entry 0, then one that
+        // needs nothing.
+        assert_eq!(d.decode_section(0, &[0x03, 0x00, 0x80]), Ok(Section::Blocked));
+        assert_eq!(d.decode_section(0, &[0x02, 0x00, 0x80]), Ok(Section::Blocked));
+        assert_eq!(d.decode_section(0, &[0x00, 0x00, 0xd1]), Ok(Section::Blocked));
+        d.feed_encoder_stream(&[0x41, b'a', 0x01, b'1']).unwrap();
+        // The second section has its entry, but waits behind the first.
+        assert_eq!(d.unblocked(), []);
+        assert_eq!(d.take_decoder_stream(), [0x01]);
+        d.feed_encoder_stream(&[0x41, b'b', 0x01, b'2']).unwrap();
+        assert_eq!(
+            d.unblocked(),
+            [
+                (0, Ok(vec![Field::new("b", "2")])),
+                (0, Ok(vec![Field::new("a", "1")])),
+                (0, Ok(vec![Field::new(":method", "GET")])),
+            ]
+        );
+        // The acknowledgment of the section needing two inserts reports both.
+        assert_eq!(d.take_decoder_stream(), [0x80, 0x80]);
+        // A section that could be decoded at once also waits behind one
+        // not yet taken out of the decoder.
+        assert_eq!(d.decode_section(4, &[0x04, 0x00, 0x80]), Ok(Section::Blocked));
+        d.feed_encoder_stream(&[0x41, b'c', 0x01, b'3']).unwrap();
+        assert_eq!(d.decode_section(4, &[0x00, 0x00, 0xd1]), Ok(Section::Blocked));
+        assert_eq!(d.decode_section(8, &[0x00, 0x00, 0xd1]), Ok(Section::Fields(vec![Field::new(":method", "GET")])));
+        assert_eq!(d.unblocked(), [(4, Ok(vec![Field::new("c", "3")])), (4, Ok(vec![Field::new(":method", "GET")]))]);
+    }
+
+    #[test]
+    fn released_sections_stay_within_the_held_limits() {
+        // Sections released by inserts but not yet taken still count
+        // against the limits, so block-and-insert cycles cannot grow memory.
+        let mut d = Decoder::new(MAX_TABLE_CAPACITY, 1, MAX_FIELD_SECTION_SIZE);
+        d.feed_encoder_stream(&EncoderInstruction::SetCapacity(MAX_TABLE_CAPACITY).to_bytes()).unwrap();
+        let mut failed = None;
+        'cycles: for cycle in 0..3u64 {
+            let section = SectionPrefix { required_insert_count: cycle + 1, base: cycle + 1 }
+                .to_bytes(d.table().max_entries())
+                .unwrap();
+            let mut section = section;
+            section.extend_from_slice(&[0x80, 0x80, 0x80, 0x80]);
+            for _ in 0..MAX_BLOCKED_SECTIONS {
+                if let Err(e) = d.decode_section(0, &section) {
+                    failed = Some(e);
+                    break 'cycles;
+                }
+            }
+            let ins = EncoderInstruction::InsertWithLiteralName { name: b"n".to_vec(), value: vec![b'v'; 60_000] };
+            d.feed_encoder_stream(&ins.to_bytes()).unwrap();
+        }
+        assert_eq!(failed, Some(Error::TooManyBlocked));
+        // Taking them out one at a time decodes one at a time.
+        let (stream, first) = d.next_unblocked().unwrap();
+        assert_eq!((stream, first.unwrap().len()), (0, 4));
+        assert_eq!(d.unblocked().len(), MAX_BLOCKED_SECTIONS - 1);
+        assert_eq!(d.next_unblocked(), None);
+    }
+
+    #[test]
+    fn advertised_capacity_sets_the_insert_count_modulus() {
+        // RFC 9204 section 4.5.1.1: MaxEntries comes from the advertised
+        // SETTINGS_QPACK_MAX_TABLE_CAPACITY, even above this module's limit.
+        let advertised = 128 << 10;
+        let mut e = Encoder::new(advertised, 1 << 16);
+        assert_eq!(e.table().max_entries(), 4096);
+        assert_eq!(e.table().max_capacity(), MAX_TABLE_CAPACITY);
+        e.set_capacity(MAX_TABLE_CAPACITY).unwrap();
+        for i in 0..4096u32 {
+            e.insert(b"x", i.to_string().as_bytes()).unwrap();
+            e.feed_decoder_stream(&[0x01]).unwrap();
+        }
+        let bytes = e.encode_section(0, &[Field::new("x", "4095")]).unwrap();
+        let (prefix, _) = SectionPrefix::parse(&bytes, advertised / ENTRY_OVERHEAD, 4096).unwrap();
+        assert_eq!(prefix.required_insert_count, 4096);
+        // A decoder that advertised the same reads it back.
+        let mut d = Decoder::new(advertised, 0, 1 << 16);
+        assert_eq!(d.table().max_entries(), 4096);
+        let mut s = SectionPrefix { required_insert_count: 0, base: 0 }.to_bytes(4096).unwrap();
+        s.push(0xd1);
+        assert!(d.decode_section(0, &s).is_ok());
+    }
+
+    #[test]
+    fn stream_readers_keep_bounded_buffers() {
+        let mut d = Decoder::new(4096, 0, 1 << 16);
+        d.feed_encoder_stream(&vec![0x20; 4 << 20]).unwrap();
+        d.feed_encoder_stream(&[0x20]).unwrap();
+        assert!(d.buf.capacity() <= 4 * MAX_INSTRUCTION, "{}", d.buf.capacity());
+        let mut e = Encoder::new(4096, 1 << 16);
+        e.feed_decoder_stream(&vec![0x40; 4 << 20]).unwrap();
+        e.feed_decoder_stream(&[0x40]).unwrap();
+        assert!(e.buf.capacity() <= 4 * MAX_INSTRUCTION, "{}", e.buf.capacity());
+        // An instruction split across calls still reads.
+        let ins = EncoderInstruction::InsertWithLiteralName { name: b"n".to_vec(), value: vec![b'v'; 100] };
+        let mut bytes = EncoderInstruction::SetCapacity(4096).to_bytes();
+        bytes.extend(ins.to_bytes());
+        let (a, b) = bytes.split_at(40);
+        d.feed_encoder_stream(a).unwrap();
+        d.feed_encoder_stream(b).unwrap();
+        assert_eq!(d.table().len(), 1);
+    }
+
+    #[test]
+    fn pending_stream_output_is_bounded() {
+        let mut e = Encoder::new(4096, 1 << 16);
+        let mut refused = false;
+        for _ in 0..(2 << 20) {
+            if e.set_capacity(0).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused && e.out.len() <= 2 << 20, "{}", e.out.len());
+        e.take_encoder_stream();
+        assert_eq!(e.set_capacity(0), Ok(()));
+
+        let mut d = Decoder::new(4096, 0, 1 << 16);
+        let mut refused = false;
+        for stream in 0..(2u64 << 20) {
+            if d.cancel_stream(stream).is_err() {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused && d.out.len() <= 2 << 20, "{}", d.out.len());
+        d.take_decoder_stream();
+        assert_eq!(d.cancel_stream(0), Ok(()));
+    }
+
+    #[test]
+    fn huffman_writer_output_always_reads_back() {
+        let long = vec![b'0'; MAX_STRING + 1];
+        assert_eq!(huffman_decode(&huffman_encode(&long)).unwrap(), &long[..MAX_STRING]);
+        assert_eq!(huffman_len(&long), huffman_len(&long[..MAX_STRING]));
     }
 }

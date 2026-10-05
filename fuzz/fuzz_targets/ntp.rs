@@ -10,10 +10,21 @@ fuzz_target!(|data: &[u8]| {
         // Every field is kept, so what was read writes back the same bytes.
         assert_eq!(p.to_bytes(), data);
         let _ = p.kiss_code().map(|k| k.to_string());
-        if let Ok(r) = server_reply(&p, &ServerInfo::default(), p.receive, p.transmit) {
+        // Only requests of versions 1 to 4 are answered: a client gets
+        // mode 4, and a symmetric active peer mode 2, in its own version.
+        let answer = match p.mode {
+            Mode::Client if p.version <= 4 => Some(Mode::Server),
+            Mode::SymmetricActive if p.version <= 4 => Some(Mode::SymmetricPassive),
+            _ => None,
+        };
+        let r = server_reply(&p, &ServerInfo::default(), p.receive, p.transmit);
+        assert_eq!(r.as_ref().ok().map(|r| (r.mode, r.version)), answer.map(|m| (m, p.version)));
+        if let Ok(r) = r {
             assert_eq!(Packet::parse(&r.to_bytes()).as_ref(), Ok(&r));
         }
-        if let Ok(r) = kiss_reply(&p, KissCode::from_bytes(p.reference_id)) {
+        let r = kiss_reply(&p, KissCode::from_bytes(p.reference_id));
+        assert_eq!(r.as_ref().ok().map(|r| (r.mode, r.version)), answer.map(|m| (m, p.version)));
+        if let Ok(r) = r {
             assert_eq!(Packet::parse(&r.to_bytes()).as_ref(), Ok(&r));
         }
         // A timestamp read as Unix time comes back within a few units,

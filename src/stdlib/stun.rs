@@ -22,7 +22,12 @@
 //! reply's bytes back. Over TCP, a [`Decoder`] splits the byte stream into
 //! messages first. MESSAGE-INTEGRITY and the other authentication
 //! attributes are kept as raw bytes ([`Attribute::Other`]); checking them is
-//! up to world code.
+//! up to world code. The HMAC covers the bytes as they were sent, padding
+//! included, so world code checks it over the datagram, or over the frame
+//! [`Decoder::next_frame`] returns, not over [`Message::to_bytes`]. A writer
+//! zeroes padding, so a MESSAGE-INTEGRITY copied from a message read may
+//! not match the bytes written: world code computes it again for a message
+//! it sends.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Writers clamp what they write, so the bytes they make
@@ -74,6 +79,9 @@ pub const MAX_ATTRIBUTES: usize = 256;
 /// The longest value an [`Attribute::Other`] or UNKNOWN-ATTRIBUTES list may
 /// have: the longest body, less one attribute header.
 pub const MAX_VALUE: usize = MAX_BODY - 4;
+/// The most bytes a [`Decoder`] holds that have not been taken out: one
+/// longest message.
+pub const MAX_BUFFERED: usize = MAX_MESSAGE;
 /// The most bytes of UTF-8 a reader takes in USERNAME, SOFTWARE, REALM,
 /// NONCE and an ERROR-CODE reason. RFC 8489 asks readers to take up to 763
 /// bytes, for senders that follow the older RFC 5389.
@@ -210,7 +218,10 @@ pub fn is_stun(b: &[u8]) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Attribute {
     /// MAPPED-ADDRESS: an address in the clear. Old servers sent it in
-    /// place of XOR-MAPPED-ADDRESS.
+    /// place of XOR-MAPPED-ADDRESS. On the wire an address is only an IP
+    /// and a port, so a writer drops an IPv6 flow label and scope ID, and
+    /// a reader sets both to zero. The same holds for the other address
+    /// variants.
     MappedAddress(SocketAddr),
     /// XOR-MAPPED-ADDRESS: the address the server saw the request come
     /// from. On the wire it is XORed with the magic cookie and transaction
@@ -278,8 +289,13 @@ impl Attribute {
     /// Reads one attribute's value. `transaction` is the message's, needed
     /// to undo the XOR in XOR-MAPPED-ADDRESS. FINGERPRINT is not read here,
     /// since it depends on the bytes before it; it comes back as an error.
+    /// A value longer than [`MAX_VALUE`], which no message can hold, is
+    /// refused before anything is copied.
     pub fn parse(typ: u16, value: &[u8], transaction: &[u8; 12]) -> Result<Attribute, ParseError> {
         let bad = || ParseError::AttributeValue { typ, len: value.len() };
+        if value.len() > MAX_VALUE {
+            return Err(bad());
+        }
         match typ {
             attr::MAPPED_ADDRESS => Ok(Attribute::MappedAddress(read_address(typ, value, None)?)),
             attr::ALTERNATE_SERVER => Ok(Attribute::AlternateServer(read_address(typ, value, None)?)),
@@ -723,14 +739,18 @@ pub fn answer_binding(request: &Message, source: SocketAddr) -> Option<Message> 
 
 /// Splits a STUN byte stream, as sent over TCP or TLS, into messages. Feed
 /// it the bytes a connection reads, in order, and take messages out until
-/// it has none.
+/// it has none. It never holds more than [`MAX_BUFFERED`] bytes that have
+/// not been taken out.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the unread bytes in `buf` start. Taking a message out moves
-    /// this instead of the bytes after it, so splitting is linear.
+    /// this instead of the bytes after it, so splitting is linear. `feed`
+    /// drops the bytes before it once they are half the buffer.
     start: usize,
     failed: Option<ParseError>,
+    /// Whether `failed` has been returned once.
+    reported: bool,
 }
 
 impl Decoder {
@@ -739,11 +759,17 @@ impl Decoder {
         Decoder::default()
     }
 
-    /// Adds bytes read from the connection. Once the stream has broken
-    /// (see [`Decoder::is_broken`]) they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Takes bytes read from the connection, from the start of `bytes`,
+    /// and returns how many it took. It takes them all unless that would
+    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take messages
+    /// out and feed it the rest. When it takes no bytes it holds at least
+    /// one whole message, so a loop of feeding and taking out always ends.
+    /// Once the stream has broken (see [`Decoder::is_broken`]) it takes
+    /// every byte and drops it.
+    #[must_use = "bytes past the count returned were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.failed.is_some() {
-            return;
+            return bytes.len();
         }
         // Drop the bytes already read once they are at least half the
         // buffer, so each byte is moved a bounded number of times.
@@ -751,34 +777,36 @@ impl Decoder {
             self.buf.drain(..self.start);
             self.start = 0;
         }
-        self.buf.extend_from_slice(bytes);
+        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes. An error in one message's attributes is returned
-    /// once, and the message is skipped. An error in a header
-    /// ([`ParseError::is_framing`]) breaks the stream, and the same error
-    /// comes back from then on. Once it has returned `None`, fewer than
-    /// [`MAX_MESSAGE`] bytes wait in [`Decoder::buffered`], so a caller
-    /// that takes every message out after each `feed` keeps the buffer
-    /// small.
-    pub fn next_message(&mut self) -> Option<Result<Message, ParseError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
+    /// The bytes of the next whole message, as they came, if one has come.
+    /// Only its header is checked. World code that checks
+    /// MESSAGE-INTEGRITY reads the HMAC over these bytes, then reads the
+    /// message with [`Message::parse`]. It returns `None` when it needs
+    /// more bytes. An error in a header ([`ParseError::is_framing`])
+    /// breaks the stream: it is returned once, and `None` comes back from
+    /// then on, with the error in [`Decoder::error`].
+    pub fn next_frame(&mut self) -> Option<Result<&[u8], ParseError>> {
+        if self.failed.is_some() {
+            if self.reported {
+                return None;
+            }
+            self.reported = true;
+            return self.failed.map(Err);
         }
         match header(&self.buf[self.start..]) {
             Ok(Some(total)) => {
-                let result = Message::parse(&self.buf[self.start..self.start + total]);
+                let at = self.start;
                 self.start += total;
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
-                Some(result)
+                Some(Ok(&self.buf[at..at + total]))
             }
             Ok(None) => None,
             Err(e) => {
                 self.failed = Some(e);
+                self.reported = true;
                 self.buf = Vec::new();
                 self.start = 0;
                 Some(Err(e))
@@ -786,9 +814,25 @@ impl Decoder {
         }
     }
 
+    /// The next whole message, if one has come. It returns `None` when it
+    /// needs more bytes. An error in one message's attributes is returned
+    /// once, and the message is skipped. An error in a header
+    /// ([`ParseError::is_framing`]) breaks the stream: it is returned once,
+    /// and `None` comes back from then on. So a loop that takes messages
+    /// out until `None` always ends. Once it has returned `None`, fewer
+    /// than [`MAX_MESSAGE`] bytes wait in [`Decoder::buffered`].
+    pub fn next_message(&mut self) -> Option<Result<Message, ParseError>> {
+        Some(self.next_frame()?.and_then(Message::parse))
+    }
+
     /// Whether a header error has broken the stream.
     pub fn is_broken(&self) -> bool {
         self.failed.is_some()
+    }
+
+    /// The header error that broke the stream, if one has.
+    pub fn error(&self) -> Option<ParseError> {
+        self.failed
     }
 
     /// How many bytes are held, waiting for the rest of a message.
@@ -1249,7 +1293,7 @@ mod tests {
             for n in 0..s.len() {
                 assert_eq!(Message::parse(&s[..n]), Err(ParseError::Truncated), "{n} bytes");
                 let mut d = Decoder::new();
-                d.feed(&s[..n]);
+                put(&mut d, &s[..n]);
                 assert_eq!(d.next_message(), None);
             }
         }
@@ -1267,7 +1311,7 @@ mod tests {
         let mut d = Decoder::new();
         let mut got = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
+            put(&mut d, std::slice::from_ref(byte));
             while let Some(m) = d.next_message() {
                 got.push(m.map(|m| m.class));
             }
@@ -1277,12 +1321,14 @@ mod tests {
         assert_eq!(got, [Ok(Request), Ok(SuccessResponse), Ok(SuccessResponse), bad, Ok(SuccessResponse)]);
         assert_eq!(d.buffered(), 0);
         assert!(!d.is_broken());
-        // A broken stream stays broken.
-        d.feed(&[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4]);
+        // A broken stream stays broken. The error is returned once, and
+        // the decoder drops what it is fed after it.
+        put(&mut d, &[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4]);
         assert_eq!(d.next_message(), Some(Err(ParseError::MagicCookie(0x0102_0304))));
-        d.feed(&SAMPLE_REQUEST);
-        assert_eq!(d.next_message(), Some(Err(ParseError::MagicCookie(0x0102_0304))));
+        put(&mut d, &SAMPLE_REQUEST);
+        assert_eq!(d.next_message(), None);
         assert!(d.is_broken());
+        assert_eq!(d.error(), Some(ParseError::MagicCookie(0x0102_0304)));
         assert_eq!(d.buffered(), 0);
     }
 
@@ -1482,30 +1528,106 @@ mod tests {
             stream.extend_from_slice(&one);
         }
         let mut d = Decoder::new();
-        d.feed(&stream);
         let start = std::time::Instant::now();
         let mut count = 0;
-        while let Some(m) = d.next_message() {
-            assert!(m.is_ok());
-            count += 1;
+        let mut rest = &stream[..];
+        while !rest.is_empty() {
+            let took = d.feed(rest);
+            assert!(took > 0 || d.buffered() == MAX_BUFFERED);
+            rest = &rest[took..];
+            while let Some(m) = d.next_message() {
+                assert!(m.is_ok());
+                count += 1;
+            }
         }
         assert_eq!(count, n);
         assert_eq!(d.buffered(), 0);
         assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
         // Interleaved feeds keep working once part of the buffer is read.
-        d.feed(&one[..5]);
+        put(&mut d, &one[..5]);
         assert_eq!(d.next_message(), None);
         assert_eq!(d.buffered(), 5);
-        d.feed(&one[5..]);
-        d.feed(&one);
+        put(&mut d, &one[5..]);
+        put(&mut d, &one);
         assert!(d.next_message().unwrap().is_ok());
         assert_eq!(d.buffered(), one.len());
-        d.feed(&one[..3]);
+        put(&mut d, &one[..3]);
         assert!(d.next_message().unwrap().is_ok());
         assert_eq!(d.next_message(), None);
         assert_eq!(d.buffered(), 3);
         let copy = d.clone();
         assert_eq!(copy.buffered(), 3);
+    }
+
+    // A decoder holds at most MAX_BUFFERED bytes, however much one feed
+    // offers, and its buffer stays small once the bytes are taken out.
+    #[test]
+    fn decoder_is_bounded() {
+        let one = Message::binding_request([1; 12]).to_bytes();
+        let stream: Vec<u8> = std::iter::repeat_n(&one[..], 100_000).flatten().copied().collect();
+        let mut d = Decoder::new();
+        let took = d.feed(&stream);
+        assert_eq!(took, MAX_BUFFERED);
+        assert_eq!(d.buffered(), MAX_BUFFERED);
+        // Full, it takes nothing until a message is taken out.
+        assert_eq!(d.feed(&stream[took..]), 0);
+        let mut got = Vec::new();
+        feed_all(&mut d, &stream[took..], &mut got);
+        drain(&mut d, &mut got);
+        assert_eq!(got.len(), 100_000);
+        assert!(got.iter().all(Result::is_ok));
+        assert_eq!(d.buffered(), 0);
+        assert!(d.buf.capacity() <= 4 * MAX_BUFFERED, "{}", d.buf.capacity());
+    }
+
+    // A loop that takes messages out until None ends after a framing error.
+    #[test]
+    fn framing_error_ends_the_drain_loop() {
+        let mut d = Decoder::new();
+        put(&mut d, &[0xc0]);
+        let mut results = Vec::new();
+        while let Some(r) = d.next_message() {
+            results.push(r);
+            assert!(results.len() < 10, "the loop does not end");
+        }
+        assert_eq!(results, [Err(ParseError::TopBits(0xc0))]);
+        assert_eq!(d.error(), Some(ParseError::TopBits(0xc0)));
+        assert_eq!(d.next_frame(), None);
+    }
+
+    // Attribute::parse refuses a value no message can hold before copying
+    // it.
+    #[test]
+    fn attribute_parse_refuses_huge_values() {
+        let big = vec![0u8; MAX_VALUE + 2];
+        for typ in [0x8099, attr::UNKNOWN_ATTRIBUTES, attr::USERNAME] {
+            assert_eq!(
+                Attribute::parse(typ, &big, &[0; 12]),
+                Err(ParseError::AttributeValue { typ, len: MAX_VALUE + 2 })
+            );
+        }
+        assert!(Attribute::parse(0x8099, &big[..MAX_VALUE], &[0; 12]).is_ok());
+    }
+
+    // RFC 8489, section 14.5: MESSAGE-INTEGRITY covers the bytes as sent,
+    // padding included. The RFC 5769 request pads USERNAME with spaces,
+    // which a writer would zero, so the decoder hands out each frame's
+    // bytes as they came.
+    #[test]
+    fn decoder_frames_keep_the_bytes_sent() {
+        let mut stream = Vec::new();
+        for s in samples() {
+            stream.extend_from_slice(s);
+        }
+        let mut d = Decoder::new();
+        put(&mut d, &stream);
+        for s in samples() {
+            let frame = d.next_frame().unwrap().unwrap();
+            assert_eq!(frame, s);
+            assert!(Message::parse(frame).is_ok());
+        }
+        assert_eq!(d.next_frame(), None);
+        assert_ne!(Message::parse(&SAMPLE_REQUEST).unwrap().to_bytes(), SAMPLE_REQUEST);
     }
 
     #[test]
@@ -1563,12 +1685,29 @@ mod tests {
         }
     }
 
+    /// Feeds all of `b`, which must fit.
+    fn put(d: &mut Decoder, b: &[u8]) {
+        assert_eq!(d.feed(b), b.len());
+    }
+
     /// Every result a decoder gives, up to and including a framing error.
+    /// The loop ends on its own: a broken decoder returns `None`.
     fn drain(d: &mut Decoder, out: &mut Vec<Result<Message, ParseError>>) {
-        while !d.is_broken()
-            && let Some(r) = d.next_message()
-        {
+        while let Some(r) = d.next_message() {
             out.push(r);
+        }
+    }
+
+    /// Feeds all of `b`, taking messages out whenever the decoder is full.
+    fn feed_all(d: &mut Decoder, mut b: &[u8], out: &mut Vec<Result<Message, ParseError>>) {
+        loop {
+            let took = d.feed(b);
+            b = &b[took..];
+            drain(d, out);
+            assert!(d.buffered() <= MAX_BUFFERED);
+            if b.is_empty() {
+                break;
+            }
         }
     }
 
@@ -1577,14 +1716,13 @@ mod tests {
     /// agree. After every feed the decoder holds less than one message.
     fn check_decoder(b: &[u8], chunk: usize) -> usize {
         let mut whole = Decoder::new();
-        whole.feed(b);
         let mut expected = Vec::new();
-        drain(&mut whole, &mut expected);
+        feed_all(&mut whole, b, &mut expected);
         for size in [chunk, 1] {
             let mut d = Decoder::new();
             let mut got = Vec::new();
             for piece in b.chunks(size) {
-                d.feed(piece);
+                put(&mut d, piece);
                 drain(&mut d, &mut got);
                 assert!(d.buffered() < MAX_MESSAGE);
                 if d.is_broken() {

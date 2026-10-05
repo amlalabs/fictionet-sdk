@@ -28,7 +28,7 @@
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Every buffer is bounded by a named limit, such as
-//! [`MAX_PACKET`] and [`MAX_BANNER_LINES`].
+//! [`MAX_PACKET`], [`MAX_BANNER_LINES`] and [`DECODER_CAPACITY`].
 //!
 //! ```
 //! use fictionet::stdlib::ssh::{Decoder, Event, Identification, KexInit, Message, Packet};
@@ -85,12 +85,27 @@ pub const MAX_PACKET_LENGTH: u32 = (MAX_PACKET - 4) as u32;
 pub const MAX_PAYLOAD: usize = 32768;
 /// The shortest packet, counting its length field.
 pub const MIN_PACKET: usize = 16;
-/// The longest algorithm name, service name or language tag.
+/// The most bytes a [`Decoder`] holds that have not been taken out: one
+/// whole packet, which is more than the longest line.
+pub const DECODER_CAPACITY: usize = MAX_PACKET;
+/// The longest algorithm name or service name.
 pub const MAX_NAME: usize = 64;
-/// The longest name-list in a KEXINIT, in bytes.
-pub const MAX_NAME_LIST: usize = 3072;
-/// The longest text in a DISCONNECT or DEBUG message, in bytes.
-pub const MAX_TEXT: usize = 8192;
+/// The longest name-list a KEXINIT can carry, in bytes: what is left of
+/// the largest payload after the fixed fields and nine empty lists. RFC
+/// 4253 sets no smaller limit. A writer shares this room among the ten
+/// lists.
+pub const MAX_NAME_LIST: usize = MAX_PAYLOAD - KEXINIT_FIXED;
+/// The longest text, or language tag, a DISCONNECT or DEBUG message can
+/// carry, in bytes: what is left of the largest payload after a DEBUG's
+/// fixed fields. RFC 4253 sets no smaller limit. A writer shares this room
+/// between the text and its language tag.
+pub const MAX_TEXT: usize = MAX_PAYLOAD - DEBUG_FIXED;
+/// The bytes of a KEXINIT that are not inside its name-lists.
+const KEXINIT_FIXED: usize = 1 + 16 + 10 * 4 + 1 + 4;
+/// The bytes of a DEBUG that are not inside its two strings.
+const DEBUG_FIXED: usize = 1 + 1 + 4 + 4;
+/// The bytes of a DISCONNECT that are not inside its two strings.
+const DISCONNECT_FIXED: usize = 1 + 4 + 4 + 4;
 /// The longest data an IGNORE message may carry: what is left of the
 /// largest payload after the message number and the string length.
 pub const MAX_DATA: usize = MAX_PAYLOAD - 5;
@@ -168,11 +183,8 @@ impl Identification {
         software: &str,
         comments: Option<&str>,
     ) -> Result<Identification, StreamError> {
-        let id = Identification {
-            proto: proto.to_string(),
-            software: software.to_string(),
-            comments: comments.map(str::to_string),
-        };
+        // Everything is checked before anything is copied, so a long part
+        // costs no allocation.
         if !version_part(proto.as_bytes()) || !version_part(software.as_bytes()) {
             return Err(StreamError::BadVersion);
         }
@@ -181,10 +193,14 @@ impl Identification {
         {
             return Err(StreamError::BadVersion);
         }
-        if id.len() > MAX_VERSION_LINE {
+        if line_len(proto, software, comments) > MAX_VERSION_LINE {
             return Err(StreamError::LineTooLong);
         }
-        Ok(id)
+        Ok(Identification {
+            proto: proto.to_string(),
+            software: software.to_string(),
+            comments: comments.map(str::to_string),
+        })
     }
 
     /// Reads a version line's text, without its line ending.
@@ -244,14 +260,16 @@ impl Identification {
     }
 
     fn len(&self) -> usize {
-        let comments = self
-            .comments
-            .as_ref()
-            .map_or(0, |c| c.len().saturating_add(1));
-        (7 + self.proto.len())
-            .saturating_add(self.software.len())
-            .saturating_add(comments)
+        line_len(&self.proto, &self.software, self.comments.as_deref())
     }
+}
+
+/// The length of a version line with these parts, counting its CR LF.
+fn line_len(proto: &str, software: &str, comments: Option<&str>) -> usize {
+    let comments = comments.map_or(0, |c| c.len().saturating_add(1));
+    (7 + proto.len())
+        .saturating_add(software.len())
+        .saturating_add(comments)
 }
 
 /// Whether [`parse_line`] would still return `Ok(None)` for `b`, given
@@ -472,22 +490,32 @@ impl Decoder {
         }
     }
 
-    /// Adds bytes read from the connection. After a [`StreamError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Adds bytes read from the connection and returns how many it took.
+    /// It holds at most [`DECODER_CAPACITY`] bytes not yet taken out, so
+    /// it may take fewer than it is given. Take events out with
+    /// [`Decoder::next_event`], then feed it the rest. Once it is full,
+    /// `next_event` always gives an event or an error. After a
+    /// [`StreamError`] the stream cannot be read any further, and every
+    /// byte is taken and dropped.
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+            self.buf.shrink_to(DECODER_CAPACITY.max(self.buf.len()));
+        }
+        let n = bytes
+            .len()
+            .min(DECODER_CAPACITY.saturating_sub(self.buffered()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next event, if one has come. It returns `None` when it needs
     /// more bytes, and keeps returning the same error once the stream has
-    /// broken. A decoder never holds more than one line's or one packet's
-    /// bytes beyond what has been taken out, plus what one `feed` added.
+    /// broken.
     pub fn next_event(&mut self) -> Option<Result<Event, StreamError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -656,9 +684,10 @@ fn shortest(mut b: &[u8]) -> &[u8] {
     }
 }
 
-/// Reads the RFC 4251 data types from the front of a byte slice. Nothing
-/// it returns is larger than the slice, so it allocates no more than the
-/// input holds.
+/// Reads the RFC 4251 data types from the front of a byte slice. What it
+/// allocates grows in proportion to the bytes it reads: a string or mpint
+/// is a copy of its bytes, and each name in a name-list costs one `String`
+/// for at least two bytes of input.
 #[derive(Clone, Debug)]
 pub struct Reader<'a> {
     rest: &'a [u8],
@@ -732,6 +761,11 @@ impl<'a> Reader<'a> {
     /// rules for algorithm names: 1 to [`MAX_NAME`] bytes of printable
     /// US-ASCII, and at most one `@`, with text on both sides of it.
     pub fn name_list(&mut self, max: usize) -> Result<Vec<String>, DecodeError> {
+        self.list(max, is_name)
+    }
+
+    /// A name-list whose names pass `ok`.
+    fn list(&mut self, max: usize, ok: fn(&[u8]) -> bool) -> Result<Vec<String>, DecodeError> {
         let b = self.string()?;
         if b.len() > max {
             return Err(DecodeError::TooLong);
@@ -741,7 +775,7 @@ impl<'a> Reader<'a> {
         }
         b.split(|&c| c == b',')
             .map(|name| {
-                if is_name(name) {
+                if ok(name) {
                     Ok(String::from_utf8_lossy(name).into_owned())
                 } else {
                     Err(DecodeError::Name)
@@ -777,6 +811,14 @@ fn is_name(b: &[u8]) -> bool {
         && b.len() <= MAX_NAME
         && at_ok
         && b.iter().all(|&c| (0x21..=0x7e).contains(&c) && c != b',')
+}
+
+/// Whether `b` may be a language tag in a KEXINIT's name-list. RFC 4253
+/// section 7.1 names RFC 3066 tags, which may be longer than an algorithm
+/// name, so only the name-list rules of RFC 4251 section 5 apply: at least
+/// one byte of printable US-ASCII, with no comma.
+fn is_tag(b: &[u8]) -> bool {
+    !b.is_empty() && b.iter().all(|&c| (0x21..=0x7e).contains(&c) && c != b',')
 }
 
 /// Writes a `byte`.
@@ -816,8 +858,14 @@ pub fn put_mpint(out: &mut Vec<u8>, v: &Mpint) {
 /// in a name-list, and names that would take the list past `max`, are left
 /// out.
 pub fn put_name_list(out: &mut Vec<u8>, names: &[String], max: usize) {
+    put_list(out, names, max, is_name);
+}
+
+/// Writes a name-list of at most `max` bytes, of the names that pass `ok`,
+/// and returns its length.
+fn put_list(out: &mut Vec<u8>, names: &[String], max: usize, ok: fn(&[u8]) -> bool) -> usize {
     let mut list = Vec::new();
-    for name in names.iter().filter(|n| is_name(n.as_bytes())) {
+    for name in names.iter().filter(|n| ok(n.as_bytes())) {
         let sep = usize::from(!list.is_empty());
         if list.len() + sep + name.len() > max {
             continue;
@@ -828,6 +876,7 @@ pub fn put_name_list(out: &mut Vec<u8>, names: &[String], max: usize) {
         list.extend_from_slice(name.as_bytes());
     }
     put_string(out, &list);
+    list.len()
 }
 
 /// The reason codes a DISCONNECT gives.
@@ -933,28 +982,43 @@ pub struct KexInit {
     pub reserved: u32,
 }
 
+/// One KEXINIT name-list and the check each of its names must pass.
+type NameList<'a> = (&'a Vec<String>, fn(&[u8]) -> bool);
+
 impl KexInit {
-    /// The algorithm both sides use, by the rule of RFC 4253 section 7.1:
-    /// the first one in the client's list that is also in the server's.
+    /// The first algorithm in the client's list that is also in the
+    /// server's. For ciphers, MACs and compression this is the whole rule
+    /// of RFC 4253 section 7.1, so it is the algorithm both sides use. For
+    /// key exchange and host keys that section adds more: if both first
+    /// choices match, that key exchange is used, and otherwise a key
+    /// exchange needs a host key algorithm both sides have that can sign or
+    /// encrypt as it requires. This function knows nothing of what an
+    /// algorithm can do, so world code that offers key exchanges with
+    /// different needs checks those itself. It takes time in proportion to
+    /// the two lists' lengths together.
     pub fn choose<'a>(client: &'a [String], server: &[String]) -> Option<&'a str> {
+        let server: std::collections::HashSet<&str> = server.iter().map(String::as_str).collect();
         client
             .iter()
-            .find(|c| server.contains(c))
             .map(String::as_str)
+            .find(|c| server.contains(c))
     }
 
-    fn lists(&self) -> [&Vec<String>; 10] {
+    /// The ten name-lists in wire order, each with the check its names
+    /// must pass: algorithm names for the first eight, language tags for
+    /// the last two.
+    fn lists(&self) -> [NameList<'_>; 10] {
         [
-            &self.kex_algorithms,
-            &self.server_host_key_algorithms,
-            &self.encryption_client_to_server,
-            &self.encryption_server_to_client,
-            &self.mac_client_to_server,
-            &self.mac_server_to_client,
-            &self.compression_client_to_server,
-            &self.compression_server_to_client,
-            &self.languages_client_to_server,
-            &self.languages_server_to_client,
+            (&self.kex_algorithms, is_name),
+            (&self.server_host_key_algorithms, is_name),
+            (&self.encryption_client_to_server, is_name),
+            (&self.encryption_server_to_client, is_name),
+            (&self.mac_client_to_server, is_name),
+            (&self.mac_server_to_client, is_name),
+            (&self.compression_client_to_server, is_name),
+            (&self.compression_server_to_client, is_name),
+            (&self.languages_client_to_server, is_tag),
+            (&self.languages_server_to_client, is_tag),
         ]
     }
 }
@@ -1018,33 +1082,32 @@ impl Message {
             msg::DISCONNECT => Message::Disconnect {
                 reason: DisconnectReason::from_code(r.uint32()?),
                 description: r.text(MAX_TEXT)?,
-                language: r.text(MAX_NAME)?,
+                language: r.text(MAX_TEXT)?,
             },
             msg::IGNORE => Message::Ignore(r.string()?.to_vec()),
             msg::UNIMPLEMENTED => Message::Unimplemented(r.uint32()?),
             msg::DEBUG => Message::Debug {
                 always_display: r.boolean()?,
                 message: r.text(MAX_TEXT)?,
-                language: r.text(MAX_NAME)?,
+                language: r.text(MAX_TEXT)?,
             },
             msg::SERVICE_REQUEST => Message::ServiceRequest(r.text(MAX_NAME)?),
             msg::SERVICE_ACCEPT => Message::ServiceAccept(r.text(MAX_NAME)?),
             msg::KEXINIT => {
                 let mut cookie = [0u8; 16];
                 cookie.copy_from_slice(r.take(16)?);
-                let mut list = || r.name_list(MAX_NAME_LIST);
                 let k = KexInit {
                     cookie,
-                    kex_algorithms: list()?,
-                    server_host_key_algorithms: list()?,
-                    encryption_client_to_server: list()?,
-                    encryption_server_to_client: list()?,
-                    mac_client_to_server: list()?,
-                    mac_server_to_client: list()?,
-                    compression_client_to_server: list()?,
-                    compression_server_to_client: list()?,
-                    languages_client_to_server: list()?,
-                    languages_server_to_client: list()?,
+                    kex_algorithms: r.list(MAX_NAME_LIST, is_name)?,
+                    server_host_key_algorithms: r.list(MAX_NAME_LIST, is_name)?,
+                    encryption_client_to_server: r.list(MAX_NAME_LIST, is_name)?,
+                    encryption_server_to_client: r.list(MAX_NAME_LIST, is_name)?,
+                    mac_client_to_server: r.list(MAX_NAME_LIST, is_name)?,
+                    mac_server_to_client: r.list(MAX_NAME_LIST, is_name)?,
+                    compression_client_to_server: r.list(MAX_NAME_LIST, is_name)?,
+                    compression_server_to_client: r.list(MAX_NAME_LIST, is_name)?,
+                    languages_client_to_server: r.list(MAX_NAME_LIST, is_tag)?,
+                    languages_server_to_client: r.list(MAX_NAME_LIST, is_tag)?,
                     first_kex_packet_follows: r.boolean()?,
                     reserved: r.uint32()?,
                 };
@@ -1076,9 +1139,12 @@ impl Message {
         }
     }
 
-    /// The message's payload. Texts and data past their limits are cut,
-    /// texts at a character boundary. Names a name-list may not hold are
-    /// left out. So the payload always fits in a packet and reads back.
+    /// The message's payload. Texts and data past what fits in
+    /// [`MAX_PAYLOAD`] are cut, texts at a character boundary. A text keeps
+    /// its room before its language tag does. Names a name-list may not
+    /// hold are left out, and so are names past the room the lists before
+    /// them left. So the payload always fits in a packet and reads back,
+    /// and a message [`Message::parse`] gave is written as it came.
     /// An [`Message::Other`] whose number is one this module reads cannot
     /// be written as it stands, so it is written as an IGNORE carrying its
     /// bytes.
@@ -1091,8 +1157,12 @@ impl Message {
                 language,
             } => {
                 put_uint32(&mut out, reason.code());
-                put_string(&mut out, cut(description, MAX_TEXT).as_bytes());
-                put_string(&mut out, cut(language, MAX_NAME).as_bytes());
+                put_texts(
+                    &mut out,
+                    description,
+                    language,
+                    MAX_PAYLOAD - DISCONNECT_FIXED,
+                );
             }
             Message::Ignore(data) => put_string(&mut out, &data[..data.len().min(MAX_DATA)]),
             Message::Unimplemented(seq) => put_uint32(&mut out, *seq),
@@ -1102,16 +1172,16 @@ impl Message {
                 language,
             } => {
                 put_boolean(&mut out, *always_display);
-                put_string(&mut out, cut(message, MAX_TEXT).as_bytes());
-                put_string(&mut out, cut(language, MAX_NAME).as_bytes());
+                put_texts(&mut out, message, language, MAX_PAYLOAD - DEBUG_FIXED);
             }
             Message::ServiceRequest(name) | Message::ServiceAccept(name) => {
                 put_string(&mut out, cut(name, MAX_NAME).as_bytes());
             }
             Message::KexInit(k) => {
                 out.extend_from_slice(&k.cookie);
-                for list in k.lists() {
-                    put_name_list(&mut out, list, MAX_NAME_LIST);
+                let mut room = MAX_NAME_LIST;
+                for (list, ok) in k.lists() {
+                    room -= put_list(&mut out, list, room, ok);
                 }
                 put_boolean(&mut out, k.first_kex_packet_follows);
                 put_uint32(&mut out, k.reserved);
@@ -1140,6 +1210,14 @@ impl Message {
 /// Whether [`Message::parse`] reads message number `n` as its own variant.
 fn is_known(n: u8) -> bool {
     matches!(n, 1..=6 | 20 | 21)
+}
+
+/// Writes a text and its language tag as two strings, cut to `room` bytes
+/// between them. The text is cut last.
+fn put_texts(out: &mut Vec<u8>, text: &str, language: &str, room: usize) {
+    let text = cut(text, room);
+    put_string(out, text.as_bytes());
+    put_string(out, cut(language, room - text.len()).as_bytes());
 }
 
 /// `s` cut to at most `max` bytes, at a character boundary.
@@ -1676,11 +1754,11 @@ mod tests {
 
     #[test]
     fn writers_cap_what_they_write() {
-        let huge = "é".repeat(MAX_TEXT);
+        let half = "é".repeat(MAX_PAYLOAD / 4);
         let m = Message::Disconnect {
             reason: DisconnectReason::ProtocolError,
-            description: huge.clone(),
-            language: huge.clone(),
+            description: half.clone(),
+            language: half.clone(),
         };
         let Ok(Message::Disconnect {
             description,
@@ -1690,21 +1768,31 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!((description.len(), language.len()), (MAX_TEXT, MAX_NAME));
+        // The text keeps its room, and the tag gets what is left.
+        assert_eq!(description, half);
+        let room = MAX_PAYLOAD - DISCONNECT_FIXED - half.len();
+        assert_eq!(language.len(), room - room % 2);
+        let m_text = format!("a{}", "é".repeat(MAX_PAYLOAD));
         let m = Message::Debug {
             always_display: true,
-            message: format!("a{huge}"),
-            language: String::new(),
+            message: m_text.clone(),
+            language: "en".into(),
         };
-        let Ok(Message::Debug { message, .. }) = Message::parse(&m.to_payload()) else {
+        let p = m.to_payload();
+        assert!(p.len() <= MAX_PAYLOAD);
+        let Ok(Message::Debug {
+            message, language, ..
+        }) = Message::parse(&p)
+        else {
             panic!()
         };
-        assert_eq!(message.len(), MAX_TEXT - 1);
+        assert_eq!((message.len(), language.as_str()), (MAX_TEXT - 1, "e"));
+        assert!(m_text.starts_with(&message));
         let m = Message::Ignore(vec![0; MAX_PAYLOAD * 2]);
         let p = m.to_payload();
         assert_eq!(p.len(), MAX_PAYLOAD);
         assert!(Packet::parse(&m.to_packet()).unwrap().is_some());
-        let m = Message::ServiceAccept(huge);
+        let m = Message::ServiceAccept(half);
         assert!(Message::parse(&m.to_payload()).is_ok());
         let full = vec!["x".repeat(MAX_NAME); 1000];
         let k = KexInit {
@@ -1802,9 +1890,9 @@ mod tests {
     fn decoder_takes_many_packets_from_one_feed() {
         let one = Message::NewKeys.to_packet();
         let mut d = Decoder::after_version();
-        let count = 50_000;
-        d.feed(&one.repeat(count));
-        d.feed(&one[..3]);
+        let count = DECODER_CAPACITY / one.len();
+        assert_eq!(d.feed(&one.repeat(count)), count * one.len());
+        assert_eq!(d.feed(&one[..3]), 3);
         for i in 0..count {
             assert!(matches!(
                 d.next_event(),
@@ -1827,12 +1915,18 @@ mod tests {
         stream.extend(one.repeat(count));
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
+        let mut fed = d.feed(&stream);
         assert!(matches!(d.next_event(), Some(Ok(Event::Version(_)))));
         let mut n = 0;
-        while let Some(e) = d.next_event() {
-            e.unwrap();
-            n += 1;
+        loop {
+            while let Some(e) = d.next_event() {
+                e.unwrap();
+                n += 1;
+            }
+            if fed == stream.len() {
+                break;
+            }
+            fed += d.feed(&stream[fed..]);
         }
         assert_eq!((n, d.buffered()), (count, 0));
         assert!(
@@ -1898,6 +1992,131 @@ mod tests {
         assert_eq!(KexInit::choose(&[], &client), None);
     }
 
+    #[test]
+    fn decoder_holds_at_most_its_capacity() {
+        // A stream that never finishes a line or packet: the decoder takes
+        // only what it can hold, and next_event then gives an error.
+        let mut d = Decoder::after_version();
+        let mut head = vec![0, 0, 0x88, 0xb4, 4];
+        head.resize(200_000, 7);
+        let n = d.feed(&head);
+        assert_eq!((n, d.buffered()), (DECODER_CAPACITY, DECODER_CAPACITY));
+        assert_eq!(d.feed(&head[n..]), 0);
+        assert!(matches!(d.next_event(), Some(Err(_))));
+        assert_eq!(d.feed(&head[n..]), head.len() - n);
+        assert_eq!(d.buffered(), 0);
+        // The same for lines before the version line.
+        let mut d = Decoder::new();
+        d.feed(&vec![b'x'; 200_000]);
+        assert!(d.buffered() <= DECODER_CAPACITY, "{}", d.buffered());
+        assert_eq!(d.next_event(), Some(Err(StreamError::LineTooLong)));
+        // A decoder that is full always has an event: the largest packet.
+        let big = Message::Ignore(vec![1; MAX_DATA]).to_packet();
+        let mut d = Decoder::after_version();
+        let stream = big.repeat(3);
+        let mut fed = 0;
+        let mut got = 0;
+        while fed < stream.len() {
+            fed += d.feed(&stream[fed..]);
+            assert!(d.buffered() <= DECODER_CAPACITY);
+            while let Some(e) = d.next_event() {
+                e.unwrap();
+                got += 1;
+            }
+        }
+        assert_eq!((got, d.buffered()), (3, 0));
+        assert!(
+            d.buf.capacity() <= 2 * DECODER_CAPACITY,
+            "{}",
+            d.buf.capacity()
+        );
+    }
+
+    #[test]
+    fn long_fields_that_fit_a_payload_are_read() {
+        // RFC 4253 limits DEBUG text and KEXINIT lists only by the payload.
+        let m = Message::Debug {
+            always_display: false,
+            message: "a".repeat(8193),
+            language: String::new(),
+        };
+        let p = m.to_payload();
+        assert_eq!(p.len(), 8203);
+        assert_eq!(Message::parse(&p), Ok(m));
+        let list: Vec<String> = (0..200).map(|i| format!("k{i:03}@example.com")).collect();
+        let k = KexInit {
+            kex_algorithms: list.clone(),
+            server_host_key_algorithms: names(&["ssh-ed25519"]),
+            ..KexInit::default()
+        };
+        let p = Message::KexInit(k.clone()).to_payload();
+        assert_eq!(Message::parse(&p), Ok(Message::KexInit(k)));
+        // Lists that together fill the payload are all written and read.
+        let k = KexInit {
+            kex_algorithms: list.clone(),
+            server_host_key_algorithms: list.clone(),
+            encryption_client_to_server: list.clone(),
+            encryption_server_to_client: list.clone(),
+            mac_client_to_server: list.clone(),
+            mac_server_to_client: list.clone(),
+            compression_client_to_server: list.clone(),
+            compression_server_to_client: list,
+            ..KexInit::default()
+        };
+        let p = Message::KexInit(k.clone()).to_payload();
+        assert!(p.len() <= MAX_PAYLOAD);
+        assert_eq!(Message::parse(&p), Ok(Message::KexInit(k)));
+    }
+
+    #[test]
+    fn language_tags_may_be_longer_than_names() {
+        // RFC 3066 tags have no length limit, so the 64-byte limit for
+        // algorithm names does not apply to them.
+        let tag = format!("x-{}abcdefgh", "abcdefgh-".repeat(7));
+        assert!(tag.len() > MAX_NAME);
+        let k = KexInit {
+            kex_algorithms: names(&["curve25519-sha256"]),
+            languages_client_to_server: vec![tag.clone(), "en".into()],
+            languages_server_to_client: vec![tag.clone()],
+            ..KexInit::default()
+        };
+        let m = Message::KexInit(k);
+        assert_eq!(Message::parse(&m.to_payload()), Ok(m));
+        let m = Message::Disconnect {
+            reason: DisconnectReason::ByApplication,
+            description: "bye".into(),
+            language: tag.clone(),
+        };
+        assert_eq!(Message::parse(&m.to_payload()), Ok(m));
+        // Tags still follow the name-list rules: no empty tags or commas.
+        let mut kex = vec![20];
+        kex.extend_from_slice(&[0; 16]);
+        for _ in 0..8 {
+            put_string(&mut kex, b"a");
+        }
+        put_string(&mut kex, b"en,,fr");
+        put_string(&mut kex, b"");
+        kex.extend_from_slice(&[0; 5]);
+        assert_eq!(Message::parse(&kex), Err(DecodeError::Name));
+    }
+
+    #[test]
+    fn choose_takes_linear_time() {
+        let client: Vec<String> = (0..50_000).map(|i| format!("client-{i:08}")).collect();
+        let server: Vec<String> = (0..50_000).map(|i| format!("server-{i:08}")).collect();
+        let started = std::time::Instant::now();
+        assert_eq!(KexInit::choose(&client, &server), None);
+        let mut both = server.clone();
+        both.push(client[49_999].clone());
+        both.push(client[123].clone());
+        assert_eq!(KexInit::choose(&client, &both), Some("client-00000123"));
+        assert!(
+            started.elapsed().as_millis() < 1000,
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
     fn stream() -> Vec<u8> {
         let mut s = Vec::new();
         s.extend(banner_line("Hello").unwrap());
@@ -1923,16 +2142,28 @@ mod tests {
         }
     }
 
-    fn decode_whole(b: &[u8]) -> Vec<Result<Event, StreamError>> {
-        let mut d = Decoder::new();
-        d.feed(b);
+    /// The events of `b`, fed in pieces as large as the decoder takes.
+    fn decode_whole_with(mut d: Decoder, mut b: &[u8]) -> Vec<Result<Event, StreamError>> {
         let mut out = Vec::new();
-        collect(&mut d, &mut out);
-        out
+        loop {
+            let n = d.feed(b);
+            b = &b[n..];
+            collect(&mut d, &mut out);
+            if b.is_empty() || out.last().is_some_and(Result::is_err) {
+                return out;
+            }
+        }
+    }
+
+    fn decode_whole(b: &[u8]) -> Vec<Result<Event, StreamError>> {
+        decode_whole_with(Decoder::new(), b)
     }
 
     fn decode_bytewise(b: &[u8]) -> Vec<Result<Event, StreamError>> {
-        let mut d = Decoder::new();
+        decode_bytewise_with(Decoder::new(), b)
+    }
+
+    fn decode_bytewise_with(mut d: Decoder, b: &[u8]) -> Vec<Result<Event, StreamError>> {
         let mut out = Vec::new();
         for byte in b {
             if out
@@ -2061,6 +2292,10 @@ mod tests {
     fn check_stream(b: &[u8]) {
         let events = decode_whole(b);
         assert_eq!(events, decode_bytewise(b));
+        assert_eq!(
+            decode_whole_with(Decoder::after_version(), b),
+            decode_bytewise_with(Decoder::after_version(), b)
+        );
         for e in events.iter().flatten() {
             match e {
                 Event::Banner(text) => assert!(!text.starts_with(b"SSH-") && !text.contains(&0)),

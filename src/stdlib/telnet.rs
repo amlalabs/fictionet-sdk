@@ -372,6 +372,9 @@ pub struct Decoder {
     /// A CR outside binary mode waits for the next byte: a NUL after it is
     /// dropped.
     pending_cr: bool,
+    /// A CR outside binary mode was followed by a command: a NUL as the
+    /// next data byte still belongs to it and is dropped.
+    cr_nul: bool,
     binary: bool,
     sb: Vec<u8>,
     sb_overflow: bool,
@@ -384,8 +387,10 @@ impl Decoder {
     }
 
     /// Sets whether the data this end receives is in binary mode (RFC
-    /// 856), where CR NUL is not undone. A world turns it on when the
-    /// peer's side of [`option::BINARY`] is enabled.
+    /// 856), where CR NUL is not undone. A world turns it on and off as
+    /// [`Negotiation`] reports a [`Change`] for the peer's side of
+    /// [`option::BINARY`], reading with [`Decoder::feed_next`] so the
+    /// switch falls right after the command that made it.
     pub fn set_binary(&mut self, binary: bool) {
         self.binary = binary;
     }
@@ -410,6 +415,29 @@ impl Decoder {
         out
     }
 
+    /// Reads bytes up to and including the first negotiation (WILL, WONT,
+    /// DO or DONT), and returns the events and how many bytes it read.
+    /// With no negotiation in `bytes`, it reads them all, as
+    /// [`Decoder::feed`] does.
+    ///
+    /// A negotiation takes effect where it sits in the stream (RFC 854),
+    /// so the bytes after a WILL BINARY or WONT BINARY are in the new
+    /// mode. A world that switches binary mode calls this in a loop,
+    /// handles each negotiation, and calls [`Decoder::set_binary`] before
+    /// it feeds the rest.
+    pub fn feed_next(&mut self, bytes: &[u8]) -> (Vec<Event>, usize) {
+        let mut out = Vec::new();
+        let mut data = Vec::new();
+        for (i, &b) in bytes.iter().enumerate() {
+            self.step(b, &mut data, &mut out);
+            if matches!(out.last(), Some(Event::Negotiation { .. })) {
+                return (out, i + 1);
+            }
+        }
+        flush(&mut data, &mut out);
+        (out, bytes.len())
+    }
+
     /// Ends the stream: a held CR comes back as data, and a command or
     /// subnegotiation left open is a [`DecodeError::Truncated`]. The
     /// decoder is then ready for a new stream, still in the same mode.
@@ -418,6 +446,7 @@ impl Decoder {
         if std::mem::take(&mut self.pending_cr) {
             out.push(Event::Data(vec![CR]));
         }
+        self.cr_nul = false;
         if self.state != State::Data {
             out.push(Event::Error(DecodeError::Truncated));
         }
@@ -437,6 +466,11 @@ impl Decoder {
                     if b == NUL {
                         return;
                     }
+                    // Commands are not data: a NUL after them still
+                    // follows the CR (RFC 854, RFC 1123 3.2.6).
+                    self.cr_nul = b == IAC;
+                } else if b != IAC && std::mem::take(&mut self.cr_nul) && b == NUL {
+                    return;
                 }
                 if b == IAC {
                     self.state = State::Iac;
@@ -494,6 +528,7 @@ impl Decoder {
     fn command(&mut self, b: u8, data: &mut Vec<u8>, out: &mut Vec<Event>) {
         self.state = State::Data;
         if b == IAC {
+            self.cr_nul = false;
             data.push(IAC);
         } else if let Some(verb) = Verb::from_byte(b) {
             self.state = State::Verb(verb);
@@ -566,8 +601,8 @@ pub enum Subnegotiation {
     /// The server asks for the terminal type (RFC 1091): SEND.
     TerminalTypeSend,
     /// The client names its terminal type (RFC 1091): IS and a name of 1
-    /// to [`MAX_TERMINAL_TYPE`] printable ASCII characters, such as
-    /// "VT100" or "XTERM". Names are case-insensitive.
+    /// to [`MAX_TERMINAL_TYPE`] printable ASCII characters or spaces, such
+    /// as "VT100", "XTERM" or "MTTS 137". Names are case-insensitive.
     TerminalTypeIs(String),
     /// The client's window size in characters (RFC 1073). Zero means the
     /// size is not known.
@@ -601,10 +636,15 @@ pub enum SubnegotiationError {
     /// A terminal type name that is empty or longer than
     /// [`MAX_TERMINAL_TYPE`].
     NameLength(usize),
-    /// A terminal type name with a byte that is not printable ASCII.
+    /// A terminal type name with a byte that is not printable ASCII or a
+    /// space.
     NameByte(u8),
     /// A window size whose data is not exactly 4 bytes long.
     WindowSizeLength(usize),
+    /// Data for another option longer than [`MAX_SUBNEGOTIATION`] bytes,
+    /// which a [`Decoder`] never returns and the writer could not send
+    /// whole.
+    TooLong(usize),
 }
 
 impl std::fmt::Display for SubnegotiationError {
@@ -618,6 +658,9 @@ impl std::fmt::Display for SubnegotiationError {
             }
             SubnegotiationError::NameByte(b) => write!(f, "byte {b} in a terminal type name"),
             SubnegotiationError::WindowSizeLength(n) => write!(f, "window size of {n} bytes, not 4"),
+            SubnegotiationError::TooLong(n) => {
+                write!(f, "subnegotiation data of {n} bytes, more than {MAX_SUBNEGOTIATION}")
+            }
         }
     }
 }
@@ -638,7 +681,7 @@ impl Subnegotiation {
                         if rest.is_empty() || rest.len() > MAX_TERMINAL_TYPE {
                             return Err(SubnegotiationError::NameLength(rest.len()));
                         }
-                        if let Some(&b) = rest.iter().find(|b| !b.is_ascii_graphic()) {
+                        if let Some(&b) = rest.iter().find(|b| !is_name_byte(b)) {
                             return Err(SubnegotiationError::NameByte(b));
                         }
                         // Every byte is ASCII, so this is one char per byte.
@@ -654,6 +697,7 @@ impl Subnegotiation {
                 }),
                 _ => Err(SubnegotiationError::WindowSizeLength(data.len())),
             },
+            _ if data.len() > MAX_SUBNEGOTIATION => Err(SubnegotiationError::TooLong(data.len())),
             _ => Ok(Subnegotiation::Other { option, data: data.to_vec() }),
         }
     }
@@ -668,9 +712,10 @@ impl Subnegotiation {
     }
 
     /// The data between the option code and IAC SE, before IAC escapes.
-    /// A terminal type name keeps only its printable ASCII characters, up
-    /// to [`MAX_TERMINAL_TYPE`] of them, and is "UNKNOWN" if none are
-    /// left. Other data is cut to [`MAX_SUBNEGOTIATION`] bytes.
+    /// A terminal type name keeps only its printable ASCII characters and
+    /// spaces, up to [`MAX_TERMINAL_TYPE`] of them, and is "UNKNOWN" if
+    /// none are left. Other data is cut to [`MAX_SUBNEGOTIATION`] bytes,
+    /// which [`Subnegotiation::parse`] never returns.
     ///
     /// A [`Subnegotiation::Other`] for a terminal type or window size is
     /// written in the typed form. Terminal type data that starts with IS
@@ -707,11 +752,18 @@ impl Subnegotiation {
     }
 }
 
-/// IS and a terminal type name: only its printable ASCII bytes, at most
+/// Whether `b` may be in a terminal type name: printable ASCII or a space.
+/// RFC 1091 allows any NVT ASCII string, and MTTS clients send names such
+/// as "MTTS 137".
+fn is_name_byte(b: &u8) -> bool {
+    (0x20..=0x7e).contains(b)
+}
+
+/// IS and a terminal type name: only its printable ASCII bytes and spaces, at most
 /// [`MAX_TERMINAL_TYPE`] of them, or "UNKNOWN" if none are left.
 fn terminal_type_is(name: impl Iterator<Item = u8>) -> Vec<u8> {
     let mut out = vec![terminal_type::IS];
-    out.extend(name.filter(u8::is_ascii_graphic).take(MAX_TERMINAL_TYPE));
+    out.extend(name.filter(is_name_byte).take(MAX_TERMINAL_TYPE));
     if out.len() == 1 {
         out.extend_from_slice(b"UNKNOWN");
     }
@@ -773,8 +825,21 @@ pub struct Reaction {
 
 /// The state of every option at both ends, negotiated with the Q method
 /// of RFC 1143. It answers each WILL, WONT, DO and DONT the way RFC 854
-/// asks, and never answers in a way that makes the two ends loop. An
-/// option counts as enabled only in [`OptionState::Yes`].
+/// asks, and never answers in a way that makes the two ends loop.
+///
+/// An option counts as enabled where it is in effect on the wire. This
+/// end's option is enabled only in [`OptionState::Yes`]: it stops as soon
+/// as it sends WONT. The peer's option is enabled in [`OptionState::Yes`]
+/// and in [`OptionState::WantNo`]: after this end sends DONT, the peer
+/// goes on doing the option until its WONT arrives. So a [`Change`] for
+/// the remote side comes with the peer's command, at the place in the
+/// stream where it takes effect.
+///
+/// [`option::TIMING_MARK`] is not a mode (RFC 860). Each DO TIMING-MARK
+/// is answered, with WILL if this end allows it and WONT if not, and a
+/// WILL that answers this end's DO ends the request. The option goes
+/// back to [`OptionState::No`] each time and reports no [`Change`]. A
+/// world writes the WILL after the output that came before the request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Negotiation {
     local: [OptionState; 256],
@@ -824,9 +889,10 @@ impl Negotiation {
         self.state(Side::Local, option) == OptionState::Yes
     }
 
-    /// Whether the peer does `option`.
+    /// Whether the peer does `option`: in [`OptionState::Yes`], or in
+    /// [`OptionState::WantNo`] while this end waits for its WONT.
     pub fn remote(&self, option: u8) -> bool {
-        self.state(Side::Remote, option) == OptionState::Yes
+        enabled(Side::Remote, self.state(Side::Remote, option))
     }
 
     /// Answers a negotiation command from the peer.
@@ -838,8 +904,14 @@ impl Negotiation {
             Verb::Do => (Side::Local, true, self.allow_local[i]),
             Verb::Dont => (Side::Local, false, false),
         };
-        let state = self.slot(side, option);
-        let (next, reply) = received(*state, on, allowed);
+        let state = *self.slot(side, option);
+        let (next, reply) = if option == option::TIMING_MARK && side == Side::Remote && on && state == OptionState::No {
+            // A WILL TIMING-MARK this end did not ask for is ignored. A DO
+            // in answer could make the peer send another WILL.
+            (OptionState::No, Some(false))
+        } else {
+            received(state, on, allowed)
+        };
         self.update(side, option, next, reply)
     }
 
@@ -881,10 +953,12 @@ impl Negotiation {
     /// changed. `send` is whether to ask for the option on (`Some(true)`)
     /// or off (`Some(false)`).
     fn update(&mut self, side: Side, option: u8, next: OptionState, send: Option<bool>) -> Reaction {
+        // A timing mark is never left on, so the next request is answered.
+        let next = if option == option::TIMING_MARK && next == OptionState::Yes { OptionState::No } else { next };
         let slot = self.slot(side, option);
-        let was = *slot == OptionState::Yes;
+        let was = enabled(side, *slot);
         *slot = next;
-        let now = next == OptionState::Yes;
+        let now = enabled(side, next);
         let verb = |on: bool| match (side, on) {
             (Side::Local, true) => Verb::Will,
             (Side::Local, false) => Verb::Wont,
@@ -895,6 +969,15 @@ impl Negotiation {
             send: send.map(|on| verb(on).to_bytes(option)),
             change: (was != now).then_some(Change { side, option, enabled: now }),
         }
+    }
+}
+
+/// Whether an option in `state` is in effect for `side`: see
+/// [`Negotiation`].
+fn enabled(side: Side, state: OptionState) -> bool {
+    match side {
+        Side::Local => state == OptionState::Yes,
+        Side::Remote => matches!(state, OptionState::Yes | OptionState::WantNo { .. }),
     }
 }
 
@@ -1057,7 +1140,7 @@ mod tests {
             (24, &[5], Subnegotiation::TerminalTypeSend),
             (24, &[], Subnegotiation::TerminalTypeSend),
             (24, &[1, 9], Subnegotiation::TerminalTypeSend),
-            (24, b"\0vt 100", Subnegotiation::TerminalTypeIs("vt100".into())),
+            (24, b"\0vt\t100", Subnegotiation::TerminalTypeIs("vt100".into())),
             (31, &[0, 80], Subnegotiation::WindowSize { width: 80, height: 0 }),
             (31, &[0, 80, 0, 24, 9], Subnegotiation::WindowSize { width: 80, height: 24 }),
         ];
@@ -1139,7 +1222,7 @@ mod tests {
         long.extend_from_slice(&[b'A'; 41]);
         assert_eq!(Subnegotiation::parse(tt, &long), Err(NameLength(41)));
         assert!(Subnegotiation::parse(tt, &long[..41]).is_ok());
-        assert_eq!(Subnegotiation::parse(tt, b"\0VT 100"), Err(NameByte(b' ')));
+        assert_eq!(Subnegotiation::parse(tt, b"\0VT\t100"), Err(NameByte(b'\t')));
         assert_eq!(Subnegotiation::parse(tt, b"\0VT\xc3\xa9"), Err(NameByte(0xc3)));
         assert_eq!(Subnegotiation::parse(option::NAWS, &[0, 80, 0]), Err(WindowSizeLength(3)));
         assert_eq!(Subnegotiation::parse(option::NAWS, &[0; 5]), Err(WindowSizeLength(5)));
@@ -1147,7 +1230,8 @@ mod tests {
             Subnegotiation::parse(option::LINEMODE, &[1, 2]),
             Ok(Subnegotiation::Other { option: option::LINEMODE, data: vec![1, 2] })
         );
-        for e in [Empty, UnknownCode(2), TrailingBytes, NameLength(0), NameByte(1), WindowSizeLength(3)] {
+        for e in [Empty, UnknownCode(2), TrailingBytes, NameLength(0), NameByte(1), WindowSizeLength(3), TooLong(1025)]
+        {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1155,7 +1239,7 @@ mod tests {
     #[test]
     fn writers_make_what_the_parser_accepts() {
         // Names are cleaned up, cut, or replaced.
-        let cases = [("xterm 256color", "xterm256color"), ("", "UNKNOWN"), ("é", "UNKNOWN")];
+        let cases = [("xterm\t256color", "xterm256color"), ("MTTS 137", "MTTS 137"), ("", "UNKNOWN"), ("é", "UNKNOWN")];
         for (given, written) in cases {
             let sub = Subnegotiation::TerminalTypeIs(given.to_string());
             assert_eq!(Subnegotiation::parse(24, &sub.data()), Ok(Subnegotiation::TerminalTypeIs(written.into())));
@@ -1321,7 +1405,9 @@ mod tests {
         assert_eq!(n.receive(Verb::Will, 3).send, None);
         assert!(n.remote(3));
         assert_eq!(n.disable_remote(3).send, Some([255, 254, 3]));
-        assert_eq!(n.receive(Verb::Wont, 3), Reaction::default());
+        assert!(n.remote(3));
+        let off = Change { side: Side::Remote, option: 3, enabled: false };
+        assert_eq!(n.receive(Verb::Wont, 3), Reaction { send: None, change: Some(off) });
         assert!(!n.remote(3));
         // Asked on, then off before the answer: the answer is turned down.
         n.enable_local(5);
@@ -1330,6 +1416,145 @@ mod tests {
         assert_eq!(n.state(Side::Local, 5), OptionState::WantNo { opposite: false });
         assert_eq!(n.receive(Verb::Dont, 5), Reaction::default());
         assert_eq!(n.state(Side::Local, 5), OptionState::No);
+    }
+
+    /// Reads `bytes` the way a world should: a negotiation at a time,
+    /// answering each and switching binary mode on the remote side's
+    /// changes before the bytes after it are read.
+    fn negotiated(n: &mut Negotiation, d: &mut Decoder, mut bytes: &[u8]) -> Vec<Event> {
+        let mut events = Vec::new();
+        while !bytes.is_empty() {
+            let (got, used) = d.feed_next(bytes);
+            bytes = &bytes[used..];
+            for e in &got {
+                if let Event::Negotiation { verb, option } = e
+                    && let Some(c) = n.receive(*verb, *option).change
+                    && c.side == Side::Remote
+                    && c.option == option::BINARY
+                {
+                    d.set_binary(c.enabled);
+                }
+            }
+            events.extend(got);
+        }
+        events
+    }
+
+    // RFC 854 rule 3(c): a command takes effect where it sits in the
+    // stream, so binary mode starts right after the peer's WILL BINARY,
+    // even within one read, and ends right after its WONT.
+    #[test]
+    fn binary_switches_at_the_command() {
+        let will = Event::Negotiation { verb: Verb::Will, option: option::BINARY };
+        let wont = Event::Negotiation { verb: Verb::Wont, option: option::BINARY };
+        let mut n = Negotiation::new();
+        n.allow_remote(option::BINARY, true);
+        n.enable_remote(option::BINARY);
+        let mut d = Decoder::new();
+        let bytes = [b'a', 13, 0, 255, 251, 0, 13, 0, 255, 252, 0, 13, 0];
+        let whole = [data(b"a\r"), will.clone(), data(b"\r\0"), wont, data(b"\r")];
+        let mut events = negotiated(&mut n, &mut d, &bytes);
+        events.extend(d.finish());
+        assert_eq!(merged(events), whole);
+        // Every split gives the same events.
+        for cut in 0..=bytes.len() {
+            let mut n = Negotiation::new();
+            n.allow_remote(option::BINARY, true);
+            n.enable_remote(option::BINARY);
+            let mut d = Decoder::new();
+            let mut events = negotiated(&mut n, &mut d, &bytes[..cut]);
+            events.extend(negotiated(&mut n, &mut d, &bytes[cut..]));
+            events.extend(d.finish());
+            assert_eq!(merged(events), whole, "cut at {cut}");
+        }
+        // feed_next stops right after a negotiation.
+        let mut d = Decoder::new();
+        assert_eq!(d.feed_next(&[b'x', 255, 251, 0, b'y']), (vec![data(b"x"), will], 4));
+        assert_eq!(d.feed_next(b"yz"), (vec![data(b"yz")], 2));
+        assert_eq!(d.feed_next(&[]), (vec![], 0));
+    }
+
+    // RFC 856 and RFC 854 rule 3(c): after this end sends DONT BINARY, the
+    // peer goes on sending binary data until its WONT arrives.
+    #[test]
+    fn remote_option_stays_on_until_the_peer_answers() {
+        let mut n = Negotiation::new();
+        n.allow_remote(option::BINARY, true);
+        n.receive(Verb::Will, option::BINARY);
+        assert!(n.remote(option::BINARY));
+        let r = n.disable_remote(option::BINARY);
+        assert_eq!(r, Reaction { send: Some([255, 254, 0]), change: None });
+        assert!(n.remote(option::BINARY));
+        let r = n.receive(Verb::Wont, option::BINARY);
+        assert_eq!(r.change, Some(Change { side: Side::Remote, option: 0, enabled: false }));
+        assert!(!n.remote(option::BINARY));
+        // This end stops doing a local option as soon as it says WONT.
+        n.allow_local(option::BINARY, true);
+        n.receive(Verb::Do, option::BINARY);
+        let r = n.disable_local(option::BINARY);
+        assert_eq!(r.change, Some(Change { side: Side::Local, option: 0, enabled: false }));
+        assert!(!n.local(option::BINARY));
+    }
+
+    // RFC 860: each DO TIMING-MARK asks for a new mark, so each is answered.
+    #[test]
+    fn timing_mark_is_answered_every_time() {
+        let tm = option::TIMING_MARK;
+        let mut n = Negotiation::new();
+        assert_eq!(n.receive(Verb::Do, tm).send, Some([255, 252, tm]));
+        n.allow_local(tm, true);
+        for _ in 0..3 {
+            assert_eq!(n.receive(Verb::Do, tm), Reaction { send: Some([255, 251, tm]), change: None });
+            assert_eq!(n.state(Side::Local, tm), OptionState::No);
+        }
+        // Asking for a mark, again and again.
+        n.allow_remote(tm, true);
+        for _ in 0..3 {
+            assert_eq!(n.enable_remote(tm).send, Some([255, 253, tm]));
+            assert_eq!(n.receive(Verb::Will, tm), Reaction::default());
+            assert_eq!(n.state(Side::Remote, tm), OptionState::No);
+        }
+        // A WILL that was not asked for is ignored with DONT, so the two
+        // ends cannot loop.
+        assert_eq!(n.receive(Verb::Will, tm).send, Some([255, 254, tm]));
+        assert_eq!(n.state(Side::Remote, tm), OptionState::No);
+    }
+
+    // RFC 854: a command between a CR and its NUL does not change the data,
+    // which is CR NUL, a bare CR.
+    #[test]
+    fn cr_nul_around_a_command() {
+        let will_echo = Event::Negotiation { verb: Verb::Will, option: 1 };
+        assert_eq!(decode(&[13, 255, 251, 1, 0, b'a']), [data(b"\r"), will_echo.clone(), data(b"a")]);
+        assert_eq!(
+            decode(&[13, 255, 241, 255, 241, 0]),
+            [data(b"\r"), Event::Command(Command::Nop), Event::Command(Command::Nop)]
+        );
+        // A data byte in between ends the wait: here an escaped IAC.
+        assert_eq!(decode(&[13, 255, 255, 0]), [data(&[13, 255, 0])]);
+        assert_eq!(decode(&[13, 255, 251, 1, 10]), [data(b"\r"), will_echo, data(b"\n")]);
+    }
+
+    // MTTS clients send names with a space, such as "MTTS 137"; RFC 1091
+    // allows any NVT ASCII string.
+    #[test]
+    fn terminal_type_names_with_spaces() {
+        let sub = Subnegotiation::parse(24, b"\0MTTS 137");
+        assert_eq!(sub, Ok(Subnegotiation::TerminalTypeIs("MTTS 137".into())));
+        assert_eq!(Subnegotiation::TerminalTypeIs("MTTS 137".into()).data(), b"\0MTTS 137");
+    }
+
+    // Data the writer could not send whole is refused by the parser, so
+    // whatever parses writes back unchanged.
+    #[test]
+    fn long_other_data_is_refused() {
+        for len in [MAX_SUBNEGOTIATION - 1, MAX_SUBNEGOTIATION] {
+            let sub = Subnegotiation::parse(99, &vec![7; len]).unwrap();
+            assert_eq!(sub.data().len(), len);
+        }
+        let len = MAX_SUBNEGOTIATION + 1;
+        assert_eq!(Subnegotiation::parse(99, &vec![7; len]), Err(SubnegotiationError::TooLong(len)));
+        assert!(!SubnegotiationError::TooLong(len).to_string().is_empty());
     }
 
     /// A small deterministic generator, so failures repeat.

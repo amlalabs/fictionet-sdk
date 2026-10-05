@@ -24,11 +24,18 @@
 //! Every reader checks lengths, counts, format codes and text, because
 //! the agent can send any bytes it likes. A message longer than
 //! PostgreSQL itself accepts is refused as soon as its length arrives,
-//! before its body comes. Text must be UTF-8, as on a server whose
-//! encoding is UTF8. Every writer produces a message the readers accept:
-//! strings are cut at their first NUL byte, and a message that would be
-//! too long loses items from the end of its lists, or the end of its
-//! last string or byte field.
+//! before its body comes. Text must be UTF-8, as on a connection whose
+//! `client_encoding` is UTF8, which [`Startup::new`] asks for. A server
+//! world that is asked for another encoding should refuse it, since
+//! these readers cannot read that text. Text-format parameters must be
+//! UTF-8 with no NUL byte as well. Every writer produces a message the
+//! readers accept: strings and text values are cut at their first NUL
+//! byte, and a message that would be too long loses items from the end
+//! of its lists, or the end of its last string or byte field.
+//!
+//! The decoders hold at most one message's worth of bytes: `feed` says
+//! how many bytes it took, and the rest is fed again once messages have
+//! been taken out.
 //!
 //! ```
 //! use fictionet::stdlib::postgres::{
@@ -453,9 +460,19 @@ pub struct Startup {
 }
 
 impl Startup {
-    /// A protocol 3.0 StartupMessage for `user` and `database`.
+    /// A protocol 3.0 StartupMessage for `user` and `database`, with
+    /// `client_encoding` set to `UTF8`. This module reads UTF-8 text only,
+    /// and without the setting the server would send text in the
+    /// database's own encoding.
     pub fn new(user: &str, database: &str) -> Startup {
-        Startup { minor_version: 0, params: vec![("user".into(), user.into()), ("database".into(), database.into())] }
+        Startup {
+            minor_version: 0,
+            params: vec![
+                ("user".into(), user.into()),
+                ("database".into(), database.into()),
+                ("client_encoding".into(), "UTF8".into()),
+            ],
+        }
     }
 
     /// This StartupMessage with one more parameter, such as
@@ -738,7 +755,9 @@ impl Frontend {
     /// be longer than PostgreSQL accepts for its type loses list items
     /// from the end, or the end of its last string or byte field. A Bind
     /// or FunctionCall whose format count is not 0, 1 or the number of
-    /// values gets the first format alone. A cancel key is cut to
+    /// values gets the first format alone. A text-format parameter or
+    /// argument is cut at its first NUL, and before any bytes that are not
+    /// UTF-8; binary ones are written as they are. A cancel key is cut to
     /// [`MAX_SECRET_KEY`] bytes, and an empty one is written as 4 zero
     /// bytes, since PostgreSQL refuses an empty key.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -758,11 +777,19 @@ impl Frontend {
             Frontend::Bind(b) => {
                 let each = b.param_formats.len() > 1 && b.param_formats.len() == b.params.len();
                 let single = !each && !b.param_formats.is_empty();
+                let all: &[Format] = if each {
+                    &b.param_formats
+                } else if single {
+                    &b.param_formats[..1]
+                } else {
+                    &[]
+                };
+                let params = written_values(all, &b.params);
                 // Two NULs and three counts are always written.
                 let fixed = 2 + 6 + if single { 2 } else { 0 };
                 let mut avail = o.room().saturating_sub(fixed);
                 let per = if each { 2 } else { 0 };
-                let (np, used) = fit_count(&b.params, avail, |v| per + value_size(v));
+                let (np, used) = fit_count(&params, avail, |v| per + value_size(*v));
                 avail -= used;
                 let (nr, used_r) = fit_count(&b.result_formats, avail, |_| 2);
                 let lists = fixed - 2 + used + used_r;
@@ -777,8 +804,8 @@ impl Frontend {
                 };
                 o.formats(formats);
                 o.u16(count16(np));
-                for v in &b.params[..np] {
-                    o.value(v);
+                for v in &params[..np] {
+                    o.value(*v);
                 }
                 o.formats(&b.result_formats[..nr]);
             }
@@ -799,7 +826,15 @@ impl Frontend {
                 o.u32(f.function);
                 let fixed = 6 + if single { 2 } else { 0 };
                 let per = if each { 2 } else { 0 };
-                let (na, _) = fit_count(&f.args, o.room().saturating_sub(fixed), |v| per + value_size(v));
+                let all: &[Format] = if each {
+                    &f.arg_formats
+                } else if single {
+                    &f.arg_formats[..1]
+                } else {
+                    &[]
+                };
+                let args = written_values(all, &f.args);
+                let (na, _) = fit_count(&args, o.room().saturating_sub(fixed), |v| per + value_size(*v));
                 let formats: &[Format] = if each {
                     &f.arg_formats[..na]
                 } else if single {
@@ -809,8 +844,8 @@ impl Frontend {
                 };
                 o.formats(formats);
                 o.u16(count16(na));
-                for v in &f.args[..na] {
-                    o.value(v);
+                for v in &args[..na] {
+                    o.value(*v);
                 }
                 o.i16(f.result_format.code());
             }
@@ -1144,7 +1179,10 @@ impl Backend {
 
     /// The message's bytes. Strings are cut at their first NUL, and an
     /// error field with code 0 or an empty SASL mechanism name is left
-    /// out, since either would end its list. A message that would be
+    /// out, since either would end its list. An error field whose code
+    /// came before is left out too, so [`Diagnostic::get`] reads the same
+    /// field on both sides. SASL mechanisms and unrecognized options keep
+    /// at most [`MAX_COUNT`] items. A message that would be
     /// longer than [`MAX_MESSAGE`] loses list items from the end, or the
     /// end of its last string or byte field. Lists with a 16-bit count
     /// keep at most [`MAX_COUNT`] items. A secret key is cut to
@@ -1168,14 +1206,16 @@ impl Backend {
                     }
                     Authentication::Sasl(names) => {
                         let mut avail = o.room().saturating_sub(1);
+                        let mut n = 0;
                         for name in names {
                             let name = until_nul(name);
                             if name.is_empty() {
                                 continue;
                             }
-                            if name.len() + 1 > avail {
+                            if name.len() + 1 > avail || n == MAX_COUNT {
                                 break;
                             }
+                            n += 1;
                             avail -= name.len() + 1;
                             o.cstr(name, 0);
                         }
@@ -1200,18 +1240,20 @@ impl Backend {
                 o.formats(&columns);
             }
             Backend::DataRow(values) => {
-                let (n, _) = fit_count(values, o.room().saturating_sub(2), value_size);
+                let (n, _) = fit_count(values, o.room().saturating_sub(2), |v| value_size(v.as_deref()));
                 o.u16(count16(n));
                 for v in &values[..n] {
-                    o.value(v);
+                    o.value(v.as_deref());
                 }
             }
             Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
                 let mut avail = o.room().saturating_sub(1);
+                let mut seen = [false; 256];
                 for (code, value) in &d.fields {
-                    if *code == 0 {
+                    if *code == 0 || seen[usize::from(*code)] {
                         continue;
                     }
+                    seen[usize::from(*code)] = true;
                     let size = 1 + cstr_size(value);
                     if size > avail {
                         break;
@@ -1236,7 +1278,7 @@ impl Backend {
                 let mut n = 0;
                 for name in unrecognized {
                     let size = cstr_size(name);
-                    if size > avail {
+                    if size > avail || n == MAX_COUNT {
                         break;
                     }
                     avail -= size;
@@ -1290,8 +1332,11 @@ impl Backend {
 }
 
 /// Why bytes are not a message this module can read. Every one of them
-/// is a protocol violation: PostgreSQL sends an ErrorResponse, if it can,
-/// and closes the connection.
+/// is a protocol violation. PostgreSQL closes the connection after all of
+/// them but one: a typed message whose body is malformed
+/// ([`Error::is_recoverable`]) gets an ERROR, and the session goes on at
+/// the next message (in an extended-query batch, at the next Sync). During
+/// authentication that error is FATAL too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     /// The connection opened with a TLS record, not a startup-phase
@@ -1327,6 +1372,17 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// Whether the stream goes on after this error: true for a typed
+    /// message whose length and type were sound but whose body was
+    /// malformed. A [`Decoder`] or [`BackendDecoder`] drops that message
+    /// and reads the next one; after any other error it reads nothing
+    /// more.
+    pub fn is_recoverable(&self) -> bool {
+        matches!(self, Error::Malformed { tag, .. } if *tag != 0)
+    }
+}
+
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -1354,7 +1410,9 @@ pub enum Malformed {
     TrailingBytes,
     /// A string had no NUL before the end of the body.
     UnterminatedString,
-    /// A string was not UTF-8.
+    /// A string was not UTF-8, or a text-format parameter or function
+    /// argument was not UTF-8 text: PostgreSQL checks those against the
+    /// client encoding, which counts a NUL byte as invalid.
     NotUtf8,
     /// A format code other than 0 (text) or 1 (binary), or a binary
     /// column in a copy response whose overall format is text.
@@ -1373,6 +1431,13 @@ pub enum Malformed {
     BadKeyLength(usize),
     /// An Authentication request code this module does not know.
     BadAuth(u32),
+    /// A list with no count of its own, or a 32-bit count, holding more
+    /// than [`MAX_COUNT`] items: SASL mechanisms, error fields or
+    /// unrecognized protocol options.
+    TooManyItems,
+    /// An error or notice field code that came twice. "Any given field
+    /// type should appear at most once per message."
+    DuplicateField(u8),
 }
 
 impl std::fmt::Display for Malformed {
@@ -1389,6 +1454,8 @@ impl std::fmt::Display for Malformed {
             Malformed::BadStatus(b) => write!(f, "invalid transaction status {}", show_tag(*b)),
             Malformed::BadKeyLength(n) => write!(f, "invalid cancel key length {n}"),
             Malformed::BadAuth(c) => write!(f, "unknown authentication request {c}"),
+            Malformed::TooManyItems => write!(f, "a list holds more than {MAX_COUNT} items"),
+            Malformed::DuplicateField(c) => write!(f, "field {} appears twice", show_tag(*c)),
         }
     }
 }
@@ -1460,24 +1527,37 @@ impl Decoder {
         self
     }
 
-    /// Adds bytes read from the connection. After an [`Error`], or once
-    /// the connection is [`Phase::Closed`], they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Adds bytes read from the connection and returns how many it took.
+    /// It holds at most [`Decoder::capacity`] bytes, so it may take fewer
+    /// than it is given. Take messages out with
+    /// [`Decoder::next_message`], then feed it the rest; once it is full,
+    /// `next_message` always gives a message or an error. After an error
+    /// that ends the stream, or once the connection is
+    /// [`Phase::Closed`], every byte is taken and dropped.
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.failed.is_some() || self.phase == Phase::Closed {
-            return;
+            return bytes.len();
         }
-        if self.pos > 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
+        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
+        if n > 0 {
+            compact(&mut self.buf, &mut self.pos);
+            self.buf.extend_from_slice(&bytes[..n]);
         }
-        self.buf.extend_from_slice(bytes);
+        n
+    }
+
+    /// The most bytes the decoder holds: its largest message and its
+    /// header. A whole message always fits.
+    pub fn capacity(&self) -> usize {
+        self.max + 5
     }
 
     /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes or the connection is closed, and keeps returning
-    /// the same error once the stream has broken. A decoder never holds
-    /// more than one message's bytes beyond what has been taken out, plus
-    /// what one `feed` added.
+    /// needs more bytes or the connection is closed. A typed message
+    /// whose body is malformed gives an error that
+    /// [`Error::is_recoverable`] and is dropped, and the next message
+    /// follows, as in PostgreSQL. Any other error ends the stream, and
+    /// the decoder keeps returning it.
     pub fn next_message(&mut self) -> Option<Result<Frontend, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -1485,7 +1565,17 @@ impl Decoder {
         let rest = self.buf.get(self.pos..).unwrap_or(&[]);
         let parsed = match self.phase {
             Phase::Startup => parse_startup_from(rest, !self.started),
-            Phase::Messages => Frontend::parse_max(rest, self.max),
+            Phase::Messages => match split_typed(rest, frontend_limit, self.max) {
+                Ok(Some((tag, body, used))) => match frontend_body(tag, body) {
+                    Ok(message) => Ok(Some((message, used))),
+                    Err(reason) => {
+                        self.pos += used;
+                        return Some(Err(Error::Malformed { tag, reason }));
+                    }
+                },
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            },
             Phase::Closed => return None,
         };
         let parsed = match parsed {
@@ -1515,6 +1605,12 @@ impl Decoder {
             Ok(None) => None,
             Err(e) => {
                 self.failed = Some(e);
+                // A ClientHello stays for TLS to read; nothing else is
+                // read again.
+                if e != Error::DirectTls {
+                    self.buf = Vec::new();
+                    self.pos = 0;
+                }
                 Some(Err(e))
             }
         }
@@ -1598,34 +1694,51 @@ impl BackendDecoder {
         self
     }
 
-    /// Adds bytes read from the connection. After an [`Error`] they are
-    /// dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Adds bytes read from the connection and returns how many it took.
+    /// It holds at most [`BackendDecoder::capacity`] bytes, so it may take
+    /// fewer than it is given. Take messages out with
+    /// [`BackendDecoder::next_message`], then feed it the rest; once it is
+    /// full, `next_message` always gives a message or an error. After an
+    /// error that ends the stream, every byte is taken and dropped.
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.failed.is_some() {
-            return;
+            return bytes.len();
         }
-        if self.pos > 0 {
-            self.buf.drain(..self.pos);
-            self.pos = 0;
+        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
+        if n > 0 {
+            compact(&mut self.buf, &mut self.pos);
+            self.buf.extend_from_slice(&bytes[..n]);
         }
-        self.buf.extend_from_slice(bytes);
+        n
+    }
+
+    /// The most bytes the decoder holds: its largest message and its
+    /// header. A whole message always fits.
+    pub fn capacity(&self) -> usize {
+        self.max + 5
     }
 
     /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken.
+    /// needs more bytes. A message whose body is malformed gives an error
+    /// that [`Error::is_recoverable`] and is dropped, and the next message
+    /// follows, as libpq does. Any other error ends the stream, and the
+    /// decoder keeps returning it.
     pub fn next_message(&mut self) -> Option<Result<Backend, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
         }
-        match Backend::parse_max(self.buf.get(self.pos..).unwrap_or(&[]), self.max) {
-            Ok(Some((message, used))) => {
+        let rest = self.buf.get(self.pos..).unwrap_or(&[]);
+        match split_typed(rest, backend_limit, self.max) {
+            Ok(Some((tag, body, used))) => {
+                let parsed = backend_body(tag, body);
                 self.pos += used;
-                Some(Ok(message))
+                Some(parsed.map_err(|reason| Error::Malformed { tag, reason }))
             }
             Ok(None) => None,
             Err(e) => {
                 self.failed = Some(e);
+                self.buf = Vec::new();
+                self.pos = 0;
                 Some(Err(e))
             }
         }
@@ -1634,6 +1747,15 @@ impl BackendDecoder {
     /// How many bytes are held, waiting for the rest of a message.
     pub fn buffered(&self) -> usize {
         self.buf.len() - self.pos
+    }
+}
+
+/// Drops the bytes before `pos` once they are at least as many as the
+/// bytes after it, so each byte read is moved at most once on average.
+fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
+    if *pos > 0 && *pos >= buf.len() - *pos {
+        buf.drain(..*pos);
+        *pos = 0;
     }
 }
 
@@ -1773,6 +1895,7 @@ fn frontend_body(tag: u8, body: &[u8]) -> Result<Frontend, Malformed> {
             let params = r.values()?;
             let result_formats = r.formats()?;
             check_format_count(param_formats.len(), params.len())?;
+            check_text_values(&param_formats, &params)?;
             Frontend::Bind(Bind { portal, statement, param_formats, params, result_formats })
         }
         t::CLOSE => {
@@ -1797,6 +1920,7 @@ fn frontend_body(tag: u8, body: &[u8]) -> Result<Frontend, Malformed> {
             let args = r.values()?;
             let result_format = r.format()?;
             check_format_count(arg_formats.len(), args.len())?;
+            check_text_values(&arg_formats, &args)?;
             Frontend::FunctionCall(FunctionCall { function, arg_formats, args, result_format })
         }
         t::AUTH_RESPONSE => Frontend::AuthResponse(r.rest().to_vec()),
@@ -1843,6 +1967,9 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
                         if name.is_empty() {
                             break;
                         }
+                        if names.len() == MAX_COUNT {
+                            return Err(Malformed::TooManyItems);
+                        }
                         names.push(name);
                     }
                     Authentication::Sasl(names)
@@ -1883,10 +2010,15 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
         t::EMPTY_QUERY_RESPONSE => Backend::EmptyQueryResponse,
         t::ERROR_RESPONSE | t::NOTICE_RESPONSE => {
             let mut fields = Vec::new();
+            // Each code comes once, so there are at most 255 fields.
+            let mut seen = [false; 256];
             loop {
                 let code = r.u8()?;
                 if code == 0 {
                     break;
+                }
+                if std::mem::replace(&mut seen[usize::from(code)], true) {
+                    return Err(Malformed::DuplicateField(code));
                 }
                 fields.push((code, r.cstr()?));
             }
@@ -1897,8 +2029,12 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
         t::NEGOTIATE_PROTOCOL_VERSION => {
             let version = r.u32()?;
             let n = r.u32()?;
+            // Each name takes one byte on the wire and far more in memory,
+            // so the count is held to the cap.
+            if usize::try_from(n).map_or(true, |n| n > MAX_COUNT) {
+                return Err(Malformed::TooManyItems);
+            }
             let mut unrecognized = Vec::new();
-            // Each name takes at least its NUL, so the body bounds the loop.
             for _ in 0..n {
                 unrecognized.push(r.cstr()?);
             }
@@ -1952,6 +2088,41 @@ fn backend_body(tag: u8, body: &[u8]) -> Result<Backend, Malformed> {
 /// PostgreSQL's rule for format lists: none, one for all, or one each.
 fn check_format_count(formats: usize, values: usize) -> Result<(), Malformed> {
     if formats <= 1 || formats == values { Ok(()) } else { Err(Malformed::FormatCount) }
+}
+
+/// Refuses a text-format value that is not UTF-8 text with no NUL.
+fn check_text_values(formats: &[Format], values: &[Value]) -> Result<(), Malformed> {
+    for (i, v) in values.iter().enumerate() {
+        if let Some(b) = v
+            && format_for(formats, i) == Format::Text
+            && text_value(b).len() != b.len()
+        {
+            return Err(Malformed::NotUtf8);
+        }
+    }
+    Ok(())
+}
+
+/// A text-format value as it may be written: cut at its first NUL, and
+/// before the first bytes that are not UTF-8.
+fn text_value(b: &[u8]) -> &[u8] {
+    let b = b.iter().position(|&c| c == 0).map_or(b, |i| &b[..i]);
+    match std::str::from_utf8(b) {
+        Ok(_) => b,
+        Err(e) => &b[..e.valid_up_to()],
+    }
+}
+
+/// The values of a Bind or FunctionCall as written, under the format
+/// list that is written: text values go through [`text_value`].
+fn written_values<'a>(formats: &[Format], values: &'a [Value]) -> Vec<Option<&'a [u8]>> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            v.as_deref().map(|b| if format_for(formats, i) == Format::Text { text_value(b) } else { b })
+        })
+        .collect()
 }
 
 /// The format of item `i` under that rule.
@@ -2122,7 +2293,7 @@ impl Out {
 
     /// A value's length (or -1) and bytes. The caller has checked that it
     /// fits.
-    fn value(&mut self, v: &Value) {
+    fn value(&mut self, v: Option<&[u8]>) {
         match v {
             None => self.i32(-1),
             Some(b) => {
@@ -2158,8 +2329,8 @@ fn fit_count<T>(items: &[T], avail: usize, size: impl Fn(&T) -> usize) -> (usize
 }
 
 /// The bytes a value takes: its length field and its bytes.
-fn value_size(v: &Value) -> usize {
-    4usize.saturating_add(v.as_ref().map_or(0, Vec::len))
+fn value_size(v: Option<&[u8]>) -> usize {
+    4usize.saturating_add(v.map_or(0, <[u8]>::len))
 }
 
 /// The bytes a string takes: up to its first NUL, and a NUL.
@@ -2218,7 +2389,7 @@ mod tests {
 
     fn startup_bytes() -> Vec<u8> {
         let mut b = vec![0, 0, 0, 0, 0, 3, 0, 0];
-        b.extend_from_slice(b"user\0alice\0database\0shop\0\0");
+        b.extend_from_slice(b"user\0alice\0database\0shop\0client_encoding\0UTF8\0\0");
         let n = b.len() as u32;
         b[..4].copy_from_slice(&n.to_be_bytes());
         b
@@ -2227,9 +2398,9 @@ mod tests {
     #[test]
     fn startup_message() {
         let bytes = startup_bytes();
-        assert_eq!(bytes.len(), 34);
+        assert_eq!(bytes.len(), 55);
         let (m, used) = Frontend::parse_startup(&bytes).unwrap().unwrap();
-        assert_eq!(used, 34);
+        assert_eq!(used, 55);
         assert_eq!(m, Frontend::Startup(Startup::new("alice", "shop")));
         assert_eq!(m.to_bytes(), bytes);
         let Frontend::Startup(s) = m else { panic!() };
@@ -2570,7 +2741,8 @@ mod tests {
         );
         assert_eq!(g(b'E', b"SERROR\0"), Err(m(b'E', Malformed::Truncated)));
         assert_eq!(g(b'D', b"\0\x01\xff\xff\xff\xf0"), Err(m(b'D', Malformed::BadValueLength(-16))));
-        assert_eq!(g(b'v', b"\0\0\0\0\xff\xff\xff\xff"), Err(m(b'v', Malformed::UnterminatedString)));
+        assert_eq!(g(b'v', b"\0\0\0\0\0\0\0\x01"), Err(m(b'v', Malformed::UnterminatedString)));
+        assert_eq!(g(b'v', b"\0\0\0\0\xff\xff\xff\xff"), Err(m(b'v', Malformed::TooManyItems)));
         assert_eq!(g(b't', b"\0\x02\0\0\0\x17"), Err(m(b't', Malformed::Truncated)));
     }
 
@@ -2752,6 +2924,8 @@ mod tests {
             bad(b'Z', Malformed::BadStatus(1)),
             bad(0, Malformed::BadKeyLength(0)),
             bad(b'R', Malformed::BadAuth(99)),
+            bad(b'v', Malformed::TooManyItems),
+            bad(b'E', Malformed::DuplicateField(b'C')),
         ];
         for e in all {
             assert!(!e.to_string().is_empty());
@@ -2878,6 +3052,190 @@ mod tests {
         assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 10_001, max: 10_000 })));
         d.feed(b"Z\0\0\0\x05I");
         assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 10_001, max: 10_000 })));
+    }
+
+    /// Startup, then `bytes`, in a decoder that has taken the startup out.
+    fn after_startup() -> Decoder {
+        let mut d = Decoder::new();
+        d.feed(&startup_bytes());
+        assert!(matches!(d.next_message(), Some(Ok(Frontend::Startup(_)))));
+        d
+    }
+
+    #[test]
+    fn feed_holds_at_most_its_capacity() {
+        // A 64 KiB feed to a decoder of 10,000-byte messages is not copied
+        // whole.
+        let mut d = Decoder::new().with_max_message(10_000);
+        let big = vec![b'?'; 65_536];
+        let took = d.feed(&big);
+        assert!(took <= d.capacity() && d.buffered() <= d.capacity(), "{took}");
+        assert!(d.next_message().unwrap().is_err());
+        // After an error that ends the stream, bytes are dropped and the
+        // storage is let go.
+        assert_eq!(d.feed(&big), big.len());
+        assert_eq!(d.buf.capacity(), 0);
+        // Feeding without taking messages out stops at the capacity, and
+        // then every message comes out.
+        let mut d = after_startup();
+        let sync = Frontend::Sync.to_bytes();
+        let mut fed = 0;
+        while d.feed(&sync) == sync.len() {
+            fed += 1;
+        }
+        assert!(d.buffered() <= d.capacity());
+        let mut got = 0;
+        while let Some(m) = d.next_message() {
+            assert_eq!(m, Ok(Frontend::Sync));
+            got += 1;
+        }
+        assert_eq!(got, fed);
+        let mut d = BackendDecoder::new().with_max_message(10_000);
+        assert!(d.feed(&big) <= d.capacity());
+        assert!(d.next_message().unwrap().is_err());
+        assert_eq!(d.feed(&big), big.len());
+        assert_eq!(d.buf.capacity(), 0);
+    }
+
+    #[test]
+    fn interleaved_reads_do_not_shift_the_backlog() {
+        // An empty feed copies nothing, and the bytes taken out are only
+        // dropped once they outweigh the rest, so a backlog is not moved
+        // once per message.
+        let mut d = BackendDecoder::new();
+        let one = Backend::ParseComplete.to_bytes();
+        let backlog: Vec<u8> = (0..100).flat_map(|_| one.clone()).collect();
+        d.feed(&backlog);
+        for i in 1..=40 {
+            assert_eq!(d.next_message(), Some(Ok(Backend::ParseComplete)));
+            d.feed(&[]);
+            assert_eq!(d.pos, 5 * i);
+        }
+        d.feed(&one);
+        assert_eq!(d.pos, 200);
+        let mut d = after_startup();
+        d.feed(&Frontend::Sync.to_bytes());
+        d.feed(&Frontend::Sync.to_bytes());
+        assert_eq!(d.next_message(), Some(Ok(Frontend::Sync)));
+        let pos = d.pos;
+        d.feed(&[]);
+        assert_eq!(d.pos, pos);
+    }
+
+    #[test]
+    fn malformed_body_drops_only_its_message() {
+        // PostgreSQL raises an ERROR for a message whose body does not fit
+        // its length and goes on at the next one (pq_getmsgend).
+        let mut d = after_startup();
+        d.feed(b"P\0\0\0\x09\0\0\0\0x");
+        d.feed(&Frontend::Sync.to_bytes());
+        let e = d.next_message().unwrap().unwrap_err();
+        assert_eq!(e, bad(b'P', Malformed::TrailingBytes));
+        assert!(e.is_recoverable());
+        assert_eq!(d.next_message(), Some(Ok(Frontend::Sync)));
+        // A broken frame still ends the stream.
+        d.feed(b"S\0\0\0\x03");
+        let e = d.next_message().unwrap().unwrap_err();
+        assert!(!e.is_recoverable());
+        assert_eq!(d.next_message(), Some(Err(e)));
+        // The same for a client: libpq skips a message whose contents do
+        // not agree with its length.
+        let mut d = BackendDecoder::new();
+        d.feed(b"Z\0\0\0\x05X");
+        d.feed(&Backend::ParseComplete.to_bytes());
+        assert_eq!(d.next_message(), Some(Err(bad(b'Z', Malformed::BadStatus(b'X')))));
+        assert_eq!(d.next_message(), Some(Ok(Backend::ParseComplete)));
+        // Startup-phase errors are fatal in PostgreSQL.
+        assert!(!bad(0, Malformed::TrailingBytes).is_recoverable());
+    }
+
+    #[test]
+    fn text_values_are_text() {
+        // "The text format does not allow embedded nulls", and PostgreSQL
+        // checks text values against the client encoding.
+        let bind = |formats: &[u8], value: &[u8]| {
+            let mut b = b"\0\0".to_vec();
+            b.extend_from_slice(formats);
+            b.extend_from_slice(&[0, 1]);
+            b.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            b.extend_from_slice(value);
+            b.extend_from_slice(&[0, 0]);
+            Frontend::parse(&typed(b'B', &b))
+        };
+        assert_eq!(bind(b"\0\0", b"a\0b"), Err(bad(b'B', Malformed::NotUtf8)));
+        assert_eq!(bind(b"\0\x01\0\0", b"\xff"), Err(bad(b'B', Malformed::NotUtf8)));
+        assert!(bind(b"\0\x01\0\x01", b"a\0\xff").is_ok());
+        let call = |format: u8, value: &[u8]| {
+            let mut b = vec![0, 0, 0, 1, 0, 1, 0, format, 0, 1];
+            b.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            b.extend_from_slice(value);
+            b.extend_from_slice(&[0, 0]);
+            Frontend::parse(&typed(b'F', &b))
+        };
+        assert_eq!(call(0, b"\0"), Err(bad(b'F', Malformed::NotUtf8)));
+        assert!(call(1, b"\0").is_ok());
+        // Writers cut a text value at its first NUL, or before bytes that
+        // are not UTF-8, and leave binary values alone.
+        let m = Frontend::Bind(Bind {
+            param_formats: vec![Format::Text, Format::Binary],
+            params: vec![Some(b"a\0b".to_vec()), Some(b"a\0b".to_vec())],
+            ..Bind::default()
+        });
+        let Frontend::Bind(back) = Frontend::parse(&m.to_bytes()).unwrap().unwrap().0 else { panic!() };
+        assert_eq!(back.params, [Some(b"a".to_vec()), Some(b"a\0b".to_vec())]);
+        let m = Frontend::FunctionCall(FunctionCall { args: vec![Some(b"ok\xc3".to_vec())], ..FunctionCall::default() });
+        let Frontend::FunctionCall(back) = Frontend::parse(&m.to_bytes()).unwrap().unwrap().0 else { panic!() };
+        assert_eq!(back.args, [Some(b"ok".to_vec())]);
+    }
+
+    #[test]
+    fn startup_asks_for_utf8() {
+        // The readers take UTF-8 text only, so a client asks for it rather
+        // than taking the database's default encoding.
+        assert_eq!(Startup::new("alice", "shop").get("client_encoding"), Some("UTF8"));
+    }
+
+    #[test]
+    fn error_fields_come_once() {
+        // "Any given field type should appear at most once per message."
+        let g = |body: &[u8]| Backend::parse(&typed(b'E', body));
+        assert_eq!(g(b"C42P01\0C00000\0\0"), Err(bad(b'E', Malformed::DuplicateField(b'C'))));
+        let d = Diagnostic::error(sqlstate::SYNTAX_ERROR, "x").with(field_code::CODE, sqlstate::INTERNAL_ERROR);
+        let (back, _) = Backend::parse(&Backend::ErrorResponse(d).to_bytes()).unwrap().unwrap();
+        assert_eq!(back, Backend::ErrorResponse(Diagnostic::error(sqlstate::SYNTAX_ERROR, "x")));
+    }
+
+    #[test]
+    fn unbounded_lists_are_capped() {
+        // A million one-byte names would take far more memory than wire.
+        let mut body = PROTOCOL_3_0.to_be_bytes().to_vec();
+        body.extend_from_slice(&1_000_000u32.to_be_bytes());
+        body.extend(std::iter::repeat_n(0u8, 1_000_000));
+        let m = typed(b'v', &body);
+        assert_eq!(
+            Backend::parse_max(&m, MAX_MESSAGE),
+            Err(bad(b'v', Malformed::TooManyItems))
+        );
+        let mut body = 10u32.to_be_bytes().to_vec();
+        for _ in 0..=MAX_COUNT {
+            body.extend_from_slice(b"a\0");
+        }
+        body.push(0);
+        assert_eq!(Backend::parse(&typed(b'R', &body)), Err(bad(b'R', Malformed::TooManyItems)));
+        // Writers keep to the cap.
+        let names = vec!["a".to_string(); MAX_COUNT + 5];
+        let m = Backend::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: names.clone() };
+        let Backend::NegotiateProtocolVersion { unrecognized, .. } = Backend::parse(&m.to_bytes()).unwrap().unwrap().0
+        else {
+            panic!()
+        };
+        assert_eq!(unrecognized.len(), MAX_COUNT);
+        let m = Backend::Authentication(Authentication::Sasl(names));
+        let Backend::Authentication(Authentication::Sasl(back)) = Backend::parse(&m.to_bytes()).unwrap().unwrap().0
+        else {
+            panic!()
+        };
+        assert_eq!(back.len(), MAX_COUNT);
     }
 
     #[test]
@@ -3022,38 +3380,67 @@ mod tests {
         }
     }
 
-    /// Every message, with its error if the stream breaks, fed in pieces
-    /// of `chunk` bytes.
-    fn drain_frontend(input: &[u8], chunk: usize) -> Vec<Result<Frontend, Error>> {
-        let mut d = Decoder::new();
+    /// Every message, with the errors on the way and the one that breaks
+    /// the stream, fed in pieces of `chunk` bytes. Whatever a feed does
+    /// not take is fed again once the messages are out.
+    fn drain<M>(
+        input: &[u8],
+        chunk: usize,
+        mut feed: impl FnMut(&[u8]) -> usize,
+        mut next: impl FnMut() -> Option<Result<M, Error>>,
+    ) -> Vec<Result<M, Error>> {
         let mut out = Vec::new();
-        for piece in input.chunks(chunk.max(1)) {
-            d.feed(piece);
-            while let Some(m) = d.next_message() {
-                let stop = m.is_err();
-                out.push(m);
-                if stop {
-                    return out;
+        for mut piece in input.chunks(chunk.max(1)) {
+            loop {
+                let took = feed(piece);
+                piece = &piece[took..];
+                let before = out.len();
+                while let Some(m) = next() {
+                    let stop = matches!(&m, Err(e) if !e.is_recoverable());
+                    out.push(m);
+                    if stop {
+                        return out;
+                    }
                 }
+                if piece.is_empty() {
+                    break;
+                }
+                // A full decoder always has a message or an error.
+                assert!(took > 0 || out.len() > before, "the decoder is stuck");
             }
         }
         out
     }
 
+    fn drain_frontend(input: &[u8], chunk: usize) -> Vec<Result<Frontend, Error>> {
+        let d = std::cell::RefCell::new(Decoder::new().with_max_message(SMALL_MESSAGE));
+        drain(input, chunk, |b| d.borrow_mut().feed(b), || d.borrow_mut().next_message())
+    }
+
     fn drain_backend(input: &[u8], chunk: usize) -> Vec<Result<Backend, Error>> {
-        let mut d = BackendDecoder::new();
-        let mut out = Vec::new();
-        for piece in input.chunks(chunk.max(1)) {
-            d.feed(piece);
-            while let Some(m) = d.next_message() {
-                let stop = m.is_err();
-                out.push(m);
-                if stop {
-                    return out;
-                }
+        let d = std::cell::RefCell::new(BackendDecoder::new().with_max_message(SMALL_MESSAGE));
+        drain(input, chunk, |b| d.borrow_mut().feed(b), || d.borrow_mut().next_message())
+    }
+
+    #[test]
+    fn large_feeds_come_out_whole() {
+        // A feed larger than the capacity is taken in parts, and every
+        // message comes out, with a malformed one dropped on the way.
+        let mut input = startup_bytes();
+        for i in 0..3000 {
+            if i == 1000 {
+                input.extend_from_slice(b"P\0\0\0\x09\0\0\0\0x");
             }
+            input.extend(Frontend::Query(format!("SELECT {i}")).to_bytes());
         }
-        out
+        assert!(input.len() > SMALL_MESSAGE * 3);
+        let got = drain_frontend(&input, input.len());
+        assert_eq!(got.len(), 3002);
+        assert_eq!(got[1001], Err(bad(b'P', Malformed::TrailingBytes)));
+        assert_eq!(got[3001], Ok(Frontend::Query("SELECT 2999".into())));
+        assert_eq!(got, drain_frontend(&input, 7));
+        let stream: Vec<u8> = (0..3000).flat_map(|_| Backend::ParseComplete.to_bytes()).collect();
+        assert_eq!(drain_backend(&stream, stream.len()).len(), 3000);
     }
 
     fn mutate(rng: &mut Lcg, valid: &[u8]) -> Vec<u8> {
@@ -3231,8 +3618,13 @@ mod tests {
         match m {
             Frontend::Startup(s) => s.params.iter().all(|(n, v)| ok(n) && ok(v) && !n.is_empty()),
             Frontend::CancelRequest { secret_key, .. } => (1..=MAX_SECRET_KEY).contains(&secret_key.len()),
-            Frontend::Bind(b) => ok(&b.portal) && ok(&b.statement),
-            Frontend::FunctionCall(f) => f.arg_formats.len() <= 1 || f.arg_formats.len() == f.args.len(),
+            Frontend::Bind(b) => {
+                ok(&b.portal) && ok(&b.statement) && check_text_values(&b.param_formats, &b.params).is_ok()
+            }
+            Frontend::FunctionCall(f) => {
+                (f.arg_formats.len() <= 1 || f.arg_formats.len() == f.args.len())
+                    && check_text_values(&f.arg_formats, &f.args).is_ok()
+            }
             Frontend::Close { name, .. } | Frontend::Describe { name, .. } => ok(name),
             Frontend::CopyFail(s) | Frontend::Query(s) | Frontend::Execute { portal: s, .. } => ok(s),
             Frontend::Parse { name, query, .. } => ok(name) && ok(query),

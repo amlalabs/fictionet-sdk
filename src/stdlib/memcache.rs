@@ -25,9 +25,14 @@
 //! Every reader checks keys, line lengths, numbers and data lengths,
 //! because the agent can send any bytes it likes. A command that breaks the
 //! protocol becomes an [`Error`], and [`Error::reply`] is what memcached
-//! answers it with. Only a line longer than [`MAX_LINE`] breaks the stream
-//! for good, since memcached closes the connection then. Writers check the
-//! same rules and refuse what a reader would refuse.
+//! answers it with, unless [`CommandDecoder::quiet_error`] says the command
+//! asked for no reply. Only a line longer than [`MAX_LINE`] (or
+//! [`MAX_GET_LINE`] for `get` and `gets`) breaks the stream for good, and
+//! the server should then close the connection, as memcached does with a
+//! line it will not take. A decoder holds at most [`MAX_BUFFERED`] bytes,
+//! so `feed` takes fewer bytes than it is given when it is full; take
+//! commands out and feed the rest again. Writers check the same rules and
+//! refuse what a reader would refuse.
 //!
 //! ```
 //! use std::collections::HashMap;
@@ -35,10 +40,15 @@
 //!
 //! let mut cache: HashMap<Vec<u8>, (u32, Vec<u8>)> = HashMap::new();
 //! let mut decoder = CommandDecoder::new();
-//! decoder.feed(b"set greeting 5 0 5\r\nhello\r\nget greeting other\r\nfrob\r\n");
+//! let input = b"set greeting 5 0 5\r\nhello\r\nget greeting other\r\nfrob\r\n";
+//! assert_eq!(decoder.feed(input), input.len());
 //! let mut out = Vec::new();
 //! while let Some(command) = decoder.next_command() {
 //!     let replies = match command {
+//!         // The stream is broken: close the connection.
+//!         Err(e) if e.is_fatal() => break,
+//!         // The command asked for no reply, so its error gets none.
+//!         Err(_) if decoder.quiet_error() => vec![],
 //!         Ok(Command::Store { key, flags, data, .. }) => {
 //!             cache.insert(key, (flags, data));
 //!             vec![Response::Stored]
@@ -67,12 +77,23 @@
 pub const PORT: u16 = 11211;
 /// The longest key, in bytes.
 pub const MAX_KEY: usize = 250;
-/// The longest text protocol line, counting its CR LF. A longer line
-/// breaks the stream.
+/// The longest text protocol line, counting its CR LF, other than a `get`
+/// or `gets` command. A longer line breaks the stream. This is the
+/// module's own bound: memcached closes the connection once 2048 bytes
+/// have come without an LF, unless the line is a `get` or `gets`.
 pub const MAX_LINE: usize = 8192;
 /// The longest data block a reader takes in, and a writer writes. It is
 /// memcached's default item size limit, 1 MiB.
 pub const MAX_VALUE: usize = 1024 * 1024;
+/// The longest `get` or `gets` command line, counting its CR LF. memcached
+/// takes multigets of any length; this module bounds them at 1 MiB, room
+/// for over 4000 keys of the longest length. A command decoder treats a
+/// line as one of these when it starts with `get ` or `gets ` after at
+/// most 100 spaces, as memcached does.
+pub const MAX_GET_LINE: usize = MAX_VALUE;
+/// The most bytes a text decoder holds: enough for the longest line or the
+/// largest data block with its CR LF.
+pub const MAX_BUFFERED: usize = MAX_VALUE + 2;
 /// The largest data length a line may state. A larger one is a format
 /// error, as in memcached, which reads it into a 32-bit signed number.
 pub const MAX_DECLARED: usize = i32::MAX as usize - 2;
@@ -83,8 +104,9 @@ pub const MAX_META_FLAGS: usize = 24;
 /// written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The line was longer than [`MAX_LINE`]. The stream cannot be read
-    /// any further, and a real server closes the connection.
+    /// The line was longer than [`MAX_LINE`], or [`MAX_GET_LINE`] for a
+    /// `get` or `gets`. The stream cannot be read any further, and a real
+    /// server closes the connection.
     LineTooLong,
     /// The first word was not a command, or not a reply, this module
     /// knows. An empty line is one too. A command with too few or too many
@@ -92,7 +114,11 @@ pub enum Error {
     UnknownCommand,
     /// A number was not a number or out of range, a word held a space or
     /// control byte, or a meta command, `delete`, `gat` or a reply had the
-    /// wrong words.
+    /// wrong words. A meta command's flags are checked as memcached checks
+    /// them, and this is the error for a flag it does not know, a flag
+    /// given twice, a token that is not the number the flag takes, a mode
+    /// the command does not have, an opaque token over 32 bytes counting
+    /// its `O`, or, with `b`, a key that is not base64.
     Format,
     /// The delta of `incr` or `decr` was not a number from 0 to
     /// `u64::MAX`.
@@ -267,90 +293,93 @@ impl Command {
     /// a word with a space or control byte, more than [`MAX_META_FLAGS`]
     /// flags, a line over [`MAX_LINE`] or data over [`MAX_VALUE`].
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut line = Vec::new();
+        let limit = if matches!(self, Command::Get { .. }) { MAX_GET_LINE } else { MAX_LINE };
+        let mut line = Line::new(limit);
         let mut data = None;
         match self {
             Command::Store { verb, key, flags, exptime, data: d, noreply } => {
-                word(&mut line, verb.name().as_bytes());
-                put_key(&mut line, key)?;
-                number(&mut line, flags);
-                number(&mut line, exptime);
-                number(&mut line, d.len());
-                put_noreply(&mut line, *noreply);
+                line.word(&[verb.name().as_bytes()])?;
+                line.key(key)?;
+                line.number(flags)?;
+                line.number(exptime)?;
+                line.number(d.len())?;
+                line.noreply(*noreply)?;
                 data = Some(d);
             }
             Command::Cas { key, flags, exptime, unique, data: d, noreply } => {
-                word(&mut line, b"cas");
-                put_key(&mut line, key)?;
-                number(&mut line, flags);
-                number(&mut line, exptime);
-                number(&mut line, d.len());
-                number(&mut line, unique);
-                put_noreply(&mut line, *noreply);
+                line.word(&[b"cas"])?;
+                line.key(key)?;
+                line.number(flags)?;
+                line.number(exptime)?;
+                line.number(d.len())?;
+                line.number(unique)?;
+                line.noreply(*noreply)?;
                 data = Some(d);
             }
             Command::Get { keys, cas } => {
-                word(&mut line, if *cas { b"gets" } else { b"get" });
-                put_keys(&mut line, keys)?;
+                line.word(&[if *cas { b"gets" } else { b"get" }])?;
+                line.keys(keys)?;
             }
             Command::Gat { exptime, keys, cas } => {
-                word(&mut line, if *cas { b"gats" } else { b"gat" });
-                number(&mut line, exptime);
-                put_keys(&mut line, keys)?;
+                line.word(&[if *cas { b"gats" } else { b"gat" }])?;
+                line.number(exptime)?;
+                line.keys(keys)?;
             }
             Command::Delete { key, noreply } => {
-                word(&mut line, b"delete");
-                put_key(&mut line, key)?;
-                put_noreply(&mut line, *noreply);
+                line.word(&[b"delete"])?;
+                line.key(key)?;
+                line.noreply(*noreply)?;
             }
             Command::Incr { key, delta, noreply } | Command::Decr { key, delta, noreply } => {
-                word(&mut line, if matches!(self, Command::Incr { .. }) { b"incr" } else { b"decr" });
-                put_key(&mut line, key)?;
-                number(&mut line, delta);
-                put_noreply(&mut line, *noreply);
+                line.word(&[if matches!(self, Command::Incr { .. }) { b"incr" } else { b"decr" }])?;
+                line.key(key)?;
+                line.number(delta)?;
+                line.noreply(*noreply)?;
             }
             Command::Touch { key, exptime, noreply } => {
-                word(&mut line, b"touch");
-                put_key(&mut line, key)?;
-                number(&mut line, exptime);
-                put_noreply(&mut line, *noreply);
+                line.word(&[b"touch"])?;
+                line.key(key)?;
+                line.number(exptime)?;
+                line.noreply(*noreply)?;
             }
             Command::Stats { args } => {
-                word(&mut line, b"stats");
+                line.word(&[b"stats"])?;
                 for a in args {
-                    put_token(&mut line, a)?;
+                    line.token(a)?;
                 }
             }
-            Command::Version => word(&mut line, b"version"),
+            Command::Version => line.word(&[b"version"])?,
             Command::Verbosity { level, noreply } => {
-                word(&mut line, b"verbosity");
-                number(&mut line, level);
-                put_noreply(&mut line, *noreply);
+                line.word(&[b"verbosity"])?;
+                line.number(level)?;
+                line.noreply(*noreply)?;
             }
             Command::FlushAll { delay, noreply } => {
-                word(&mut line, b"flush_all");
+                line.word(&[b"flush_all"])?;
                 if let Some(d) = delay {
-                    number(&mut line, d);
+                    line.number(d)?;
                 }
-                put_noreply(&mut line, *noreply);
+                line.noreply(*noreply)?;
             }
-            Command::Quit => word(&mut line, b"quit"),
-            Command::MetaGet { key, flags } => meta_line(&mut line, b"mg", key, None, flags)?,
+            Command::Quit => line.word(&[b"quit"])?,
+            Command::MetaGet { key, flags } => line.meta(b"mg", key, None, flags)?,
             Command::MetaSet { key, flags, data: d } => {
-                meta_line(&mut line, b"ms", key, Some(d.len()), flags)?;
+                line.meta(b"ms", key, Some(d.len()), flags)?;
                 data = Some(d);
             }
-            Command::MetaDelete { key, flags } => meta_line(&mut line, b"md", key, None, flags)?,
-            Command::MetaArithmetic { key, flags } => meta_line(&mut line, b"ma", key, None, flags)?,
-            Command::MetaDebug { key, flags } => meta_line(&mut line, b"me", key, None, flags)?,
-            Command::MetaNoop => word(&mut line, b"mn"),
+            Command::MetaDelete { key, flags } => line.meta(b"md", key, None, flags)?,
+            Command::MetaArithmetic { key, flags } => line.meta(b"ma", key, None, flags)?,
+            Command::MetaDebug { key, flags } => line.meta(b"me", key, None, flags)?,
+            Command::MetaNoop => line.word(&[b"mn"])?,
         }
-        finish(line, data.map(|d| &d[..]))
+        line.finish(data.map(|d| &d[..]))
     }
 
-    /// Whether the client asked for no reply: `noreply` on the classic
-    /// commands, or the `q` flag on a meta command. A quiet meta command
-    /// still gets a reply when it fails.
+    /// Whether the command carries `noreply`, on the classic commands, or
+    /// the `q` flag, on `mg`, `ms`, `md` and `ma`. With `noreply` the
+    /// server sends nothing back. With `q` it leaves out only the usual
+    /// reply: `EN` for `mg`, and `HD` for `ms`, `md` and `ma`. It still
+    /// sends a value, any other status, and any error.
     pub fn is_quiet(&self) -> bool {
         match self {
             Command::Store { noreply, .. }
@@ -438,6 +467,8 @@ pub enum Response {
     Ok,
     /// `ERROR`: the command was not one the server knows.
     Error,
+    /// `RESET`: the answer to `stats reset`.
+    Reset,
     /// `CLIENT_ERROR`, with a message: the command broke the protocol.
     ClientError(Vec<u8>),
     /// `SERVER_ERROR`, with a message: the server failed.
@@ -463,7 +494,7 @@ impl Response {
     /// refuses what a reader would refuse, as [`Command::to_bytes`] does.
     /// Message and version text may not hold CR or LF.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut line = Vec::new();
+        let mut line = Line::new(MAX_LINE);
         let mut data = None;
         let fixed: &[u8] = match self {
             Response::Stored => b"STORED",
@@ -475,52 +506,47 @@ impl Response {
             Response::End => b"END",
             Response::Ok => b"OK",
             Response::Error => b"ERROR",
+            Response::Reset => b"RESET",
             _ => b"",
         };
         match self {
-            Response::ClientError(m) => text_line(&mut line, b"CLIENT_ERROR", m)?,
-            Response::ServerError(m) => text_line(&mut line, b"SERVER_ERROR", m)?,
-            Response::Version(v) => text_line(&mut line, b"VERSION", v)?,
+            Response::ClientError(m) => line.text(b"CLIENT_ERROR", m)?,
+            Response::ServerError(m) => line.text(b"SERVER_ERROR", m)?,
+            Response::Version(v) => line.text(b"VERSION", v)?,
             Response::Value { key, flags, cas, data: d } => {
-                word(&mut line, b"VALUE");
-                put_key(&mut line, key)?;
-                number(&mut line, flags);
-                number(&mut line, d.len());
+                line.word(&[b"VALUE"])?;
+                line.key(key)?;
+                line.number(flags)?;
+                line.number(d.len())?;
                 if let Some(c) = cas {
-                    number(&mut line, c);
+                    line.number(c)?;
                 }
                 data = Some(d);
             }
             Response::Stat { name, value } => {
-                word(&mut line, b"STAT");
-                put_token(&mut line, name)?;
-                check_text(value)?;
-                line.push(b' ');
-                line.extend_from_slice(value);
+                line.word(&[b"STAT"])?;
+                line.token(name)?;
+                line.rest(value, true)?;
             }
-            Response::Number(n) => number(&mut line, n),
+            Response::Number(n) => line.number(n)?,
             Response::Meta { status, flags } => {
-                word(&mut line, status.code().as_bytes());
-                put_meta_flags(&mut line, flags)?;
+                line.word(&[status.code().as_bytes()])?;
+                line.meta_flags(flags)?;
             }
             Response::MetaValue { flags, data: d } => {
-                word(&mut line, b"VA");
-                number(&mut line, d.len());
-                put_meta_flags(&mut line, flags)?;
+                line.word(&[b"VA"])?;
+                line.number(d.len())?;
+                line.meta_flags(flags)?;
                 data = Some(d);
             }
             Response::MetaDebug { key, info } => {
-                word(&mut line, b"ME");
-                put_key(&mut line, key)?;
-                check_text(info)?;
-                if !info.is_empty() {
-                    line.push(b' ');
-                    line.extend_from_slice(info);
-                }
+                line.word(&[b"ME"])?;
+                line.key(key)?;
+                line.rest(info, false)?;
             }
-            _ => word(&mut line, fixed),
+            _ => line.word(&[fixed])?,
         }
-        finish(line, data.map(|d| &d[..]))
+        line.finish(data.map(|d| &d[..]))
     }
 }
 
@@ -541,13 +567,16 @@ impl Default for CommandDecoder {
 impl CommandDecoder {
     /// A decoder holding no bytes.
     pub fn new() -> CommandDecoder {
-        CommandDecoder { stream: Stream::new() }
+        CommandDecoder { stream: Stream::new(true) }
     }
 
-    /// Adds bytes read from the connection. After a fatal error they are
-    /// dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        self.stream.feed(bytes);
+    /// Adds bytes read from the connection, and returns how many it took.
+    /// It takes fewer than it was given only when it holds
+    /// [`MAX_BUFFERED`] bytes; take commands out, then feed the rest again.
+    /// After a fatal error it takes every byte and drops it.
+    #[must_use = "bytes not taken must be fed again"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        self.stream.feed(bytes)
     }
 
     /// The next command, if a whole one has come. It returns `None` when it
@@ -556,11 +585,22 @@ impl CommandDecoder {
     /// that means the data block is read as a command too. The exceptions,
     /// also as in memcached, are a block too large to take and an `ms` line
     /// that failed after its length was read: their blocks are dropped.
-    /// A fatal error repeats on every call. A decoder holds at most one
-    /// line and one data block beyond what has been taken out, plus what
-    /// one `feed` added.
+    /// A fatal error repeats on every call, so a loop that takes commands
+    /// must stop at one ([`Error::is_fatal`]).
     pub fn next_command(&mut self) -> Option<Result<Command, Error>> {
-        self.stream.next(parse_command, attach_command)
+        self.stream.next(parse_command, attach_command, |c| {
+            matches!(c, Command::Store { noreply: true, .. } | Command::Cas { noreply: true, .. })
+        })
+    }
+
+    /// Whether the error [`next_command`](Self::next_command) last gave
+    /// came from a classic command that asked for `noreply`, such as
+    /// `set k 0 0 2000000 noreply` or `incr k x noreply`. memcached sends
+    /// no reply for such an error, so a server should send none either. It
+    /// is false after a command, and after an error from a meta command,
+    /// whose errors are always sent.
+    pub fn quiet_error(&self) -> bool {
+        self.stream.quiet
     }
 
     /// How many bytes are held, waiting for the rest of a command.
@@ -570,7 +610,10 @@ impl CommandDecoder {
 }
 
 /// Reads text protocol replies from a server's byte stream, for a world
-/// that plays a client. It works as [`CommandDecoder`] does.
+/// that plays a client. It works as [`CommandDecoder`] does, except that
+/// every line is held to [`MAX_LINE`], and a bad `VALUE` or `VA` line
+/// whose length was read has its data block dropped, so the block is not
+/// read as replies.
 #[derive(Clone, Debug)]
 pub struct ResponseDecoder {
     stream: Stream<Response>,
@@ -585,20 +628,21 @@ impl Default for ResponseDecoder {
 impl ResponseDecoder {
     /// A decoder holding no bytes.
     pub fn new() -> ResponseDecoder {
-        ResponseDecoder { stream: Stream::new() }
+        ResponseDecoder { stream: Stream::new(false) }
     }
 
-    /// Adds bytes read from the connection. After a fatal error they are
-    /// dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        self.stream.feed(bytes);
+    /// Adds bytes read from the connection, and returns how many it took,
+    /// as [`CommandDecoder::feed`] does.
+    #[must_use = "bytes not taken must be fed again"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        self.stream.feed(bytes)
     }
 
     /// The next reply, if a whole one has come, with the same rules as
     /// [`CommandDecoder::next_command`]. A line it does not know is
     /// [`Error::UnknownCommand`].
     pub fn next_response(&mut self) -> Option<Result<Response, Error>> {
-        self.stream.next(parse_response, attach_response)
+        self.stream.next(parse_response, attach_response, |_| false)
     }
 
     /// How many bytes are held, waiting for the rest of a reply.
@@ -611,28 +655,33 @@ impl ResponseDecoder {
 /// follows it, if one does.
 type Head<T> = fn(&[u8]) -> Result<(T, Option<usize>), Fail>;
 
-/// A line that could not be read, and how many bytes after it to drop: the
-/// data block the line stated, with its CR LF, or 0.
+/// A line that could not be read, how many bytes after it to drop (the
+/// data block the line stated, with its CR LF, or 0), and whether the line
+/// asked for no reply.
 #[derive(Debug)]
 struct Fail {
     error: Error,
     skip: u64,
+    quiet: bool,
 }
 
-impl From<Error> for Fail {
-    fn from(error: Error) -> Fail {
-        // A block too large to take is dropped, as memcached does.
-        let skip = if let Error::TooLarge(n) = error { n as u64 + 2 } else { 0 };
-        Fail { error, skip }
+impl Fail {
+    /// The failure for `error`, dropping `skip` bytes after the line. A
+    /// block too large to take is dropped whatever `skip` says, as
+    /// memcached does.
+    fn new(error: Error, skip: u64, quiet: bool) -> Fail {
+        let skip = if let Error::TooLarge(n) = error { n as u64 + 2 } else { skip };
+        Fail { error, skip, quiet }
     }
 }
 
 /// The line and data block splitter both text decoders share.
 #[derive(Clone, Debug)]
 struct Stream<T> {
+    /// The bytes held. It never holds more than [`MAX_BUFFERED`].
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are dropped
-    /// in `feed` once they are half the buffer.
+    /// in `feed` once they are half the buffer, or room is needed.
     start: usize,
     /// How many bytes from `start` are known to hold no LF, so a line that
     /// comes a byte at a time is searched once.
@@ -642,29 +691,50 @@ struct Stream<T> {
     /// A line read, waiting for its data block of the given length.
     pending: Option<(T, usize)>,
     broken: bool,
+    /// Whether a `get` or `gets` line may run to [`MAX_GET_LINE`].
+    get_lines: bool,
+    /// Whether the last error came from a line that asked for no reply.
+    quiet: bool,
 }
 
 impl<T> Stream<T> {
-    fn new() -> Stream<T> {
-        Stream { buf: Vec::new(), start: 0, scanned: 0, skip: 0, pending: None, broken: false }
+    fn new(get_lines: bool) -> Stream<T> {
+        Stream {
+            buf: Vec::new(),
+            start: 0,
+            scanned: 0,
+            skip: 0,
+            pending: None,
+            broken: false,
+            get_lines,
+            quiet: false,
+        }
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.broken {
-            return;
+            return bytes.len();
         }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
+        if self.start > 0 && (self.start >= self.buf.len() / 2 || self.buf.len() + bytes.len() > MAX_BUFFERED) {
             self.buf.drain(..self.start);
             self.start = 0;
         }
-        self.buf.extend_from_slice(bytes);
+        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buf.len()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     fn buffered(&self) -> usize {
         self.buf.len() - self.start
     }
 
-    fn next(&mut self, head: Head<T>, attach: fn(&mut T, Vec<u8>)) -> Option<Result<T, Error>> {
+    fn next(
+        &mut self,
+        head: Head<T>,
+        attach: fn(&mut T, Vec<u8>),
+        quiet_block: fn(&T) -> bool,
+    ) -> Option<Result<T, Error>> {
+        self.quiet = false;
         if self.broken {
             return Some(Err(Error::LineTooLong));
         }
@@ -689,16 +759,18 @@ impl<T> Stream<T> {
             self.scanned = 0;
             let (mut message, _) = self.pending.take()?;
             if !ended {
+                self.quiet = quiet_block(&message);
                 return Some(Err(Error::BadDataChunk));
             }
             attach(&mut message, data);
             return Some(Ok(message));
         }
         let rest = &self.buf[self.start..];
-        let window = &rest[..rest.len().min(MAX_LINE)];
+        let limit = if self.get_lines && is_get_line(rest) { MAX_GET_LINE } else { MAX_LINE };
+        let window = &rest[..rest.len().min(limit)];
         let from = self.scanned.min(window.len());
         let Some(end) = window[from..].iter().position(|&b| b == b'\n').map(|p| p + from) else {
-            if rest.len() >= MAX_LINE {
+            if rest.len() >= limit {
                 return Some(Err(self.break_stream()));
             }
             self.scanned = window.len();
@@ -707,7 +779,7 @@ impl<T> Stream<T> {
         let line = &rest[..end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         // Written back with CR LF, the line must still fit.
-        if line.len() + 2 > MAX_LINE {
+        if line.len() + 2 > limit {
             return Some(Err(self.break_stream()));
         }
         let result = head(line);
@@ -718,10 +790,11 @@ impl<T> Stream<T> {
             Ok((message, Some(n))) => {
                 self.pending = Some((message, n));
                 // Takes the block if it has come; this cannot reach here again.
-                self.next(head, attach)
+                self.next(head, attach, quiet_block)
             }
-            Err(Fail { error, skip }) => {
+            Err(Fail { error, skip, quiet }) => {
                 self.skip = skip;
+                self.quiet = quiet;
                 Some(Err(error))
             }
         }
@@ -737,22 +810,32 @@ impl<T> Stream<T> {
     }
 }
 
+/// Whether held bytes start a `get` or `gets` line, after at most 100
+/// spaces: the lines memcached lets run past its usual bound.
+fn is_get_line(rest: &[u8]) -> bool {
+    // Counting past 100 would only refuse the line, and would make a long
+    // run of spaces that comes a byte at a time slow to read.
+    let spaces = rest.iter().take(101).take_while(|&&b| b == b' ').count();
+    let word = &rest[spaces..];
+    spaces <= 100 && (word.starts_with(b"get ") || word.starts_with(b"gets "))
+}
+
 fn parse_command(line: &[u8]) -> Result<(Command, Option<usize>), Fail> {
-    let mut skip = 0;
-    parse_command_line(line, &mut skip).map_err(|error| match Fail::from(error) {
-        Fail { skip: 0, .. } => Fail { error, skip },
-        fail => fail,
-    })
+    let (mut skip, mut quiet) = (0, false);
+    parse_command_line(line, &mut skip, &mut quiet).map_err(|error| Fail::new(error, skip, quiet))
 }
 
 /// Reads a command line. When an error comes after the line's data length
 /// is known, and the data block should be dropped with it, `skip` says how
-/// many bytes that is.
-fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<usize>), Error> {
+/// many bytes that is. Once a classic command's `noreply` is known,
+/// `quiet` says whether it was there, since memcached sends no reply for
+/// an error after that.
+fn parse_command_line(line: &[u8], skip: &mut u64, quiet: &mut bool) -> Result<(Command, Option<usize>), Error> {
     let t = tokens(line);
     let Some((&verb, args)) = t.split_first() else { return Err(Error::UnknownCommand) };
     if let Some(verb) = StoreVerb::from_name(verb) {
         let (args, noreply) = optional_noreply(args, 4)?;
+        *quiet = noreply;
         let [key, flags, exptime, bytes] = args else { return Err(Error::UnknownCommand) };
         let (key, flags, exptime, n) = (key_of(key)?, small(flags)?, signed(exptime)?, length(bytes)?);
         return block(Command::Store { verb, key, flags, exptime, data: Vec::new(), noreply }, n);
@@ -760,6 +843,7 @@ fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<us
     let command = match verb {
         b"cas" => {
             let (args, noreply) = optional_noreply(args, 5)?;
+            *quiet = noreply;
             let [key, flags, exptime, bytes, unique] = args else { return Err(Error::UnknownCommand) };
             let (key, flags, exptime, n) = (key_of(key)?, small(flags)?, signed(exptime)?, length(bytes)?);
             let unique = unsigned(unique)?;
@@ -781,6 +865,7 @@ fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<us
                 return Err(Error::UnknownCommand);
             }
             let (args, noreply) = strip_noreply(args, 1);
+            *quiet = noreply;
             // memcached still takes an old time argument, if it is 0.
             match args {
                 [key] => Command::Delete { key: key_of(key)?, noreply },
@@ -790,12 +875,14 @@ fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<us
         }
         b"incr" | b"decr" => {
             let (args, noreply) = optional_noreply(args, 2)?;
+            *quiet = noreply;
             let [key, delta] = args else { return Err(Error::UnknownCommand) };
             let (key, delta) = (key_of(key)?, unsigned(delta).map_err(|_| Error::Delta)?);
             if verb == b"incr" { Command::Incr { key, delta, noreply } } else { Command::Decr { key, delta, noreply } }
         }
         b"touch" => {
             let (args, noreply) = optional_noreply(args, 2)?;
+            *quiet = noreply;
             let [key, exptime] = args else { return Err(Error::UnknownCommand) };
             let key = key_of(key)?;
             Command::Touch { key, exptime: signed(exptime).map_err(|_| Error::Exptime)?, noreply }
@@ -810,6 +897,7 @@ fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<us
         b"mn" => Command::MetaNoop,
         b"verbosity" => {
             let (args, noreply) = optional_noreply(args, 1)?;
+            *quiet = noreply;
             let [level] = args else { return Err(Error::UnknownCommand) };
             Command::Verbosity { level: small(level)?, noreply }
         }
@@ -820,6 +908,7 @@ fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<us
             // A final noreply is taken off, and a word after the delay is
             // ignored, as memcached does.
             let (args, noreply) = strip_noreply(args, 0);
+            *quiet = noreply;
             match args.first() {
                 None => Command::FlushAll { delay: None, noreply },
                 Some(delay) => Command::FlushAll { delay: Some(signed(delay)?), noreply },
@@ -837,11 +926,13 @@ fn parse_command_line(line: &[u8], skip: &mut u64) -> Result<(Command, Option<us
             let n = length(bytes)?;
             *skip = n as u64 + 2;
             let flags = meta_flags(flags)?;
+            check_meta(b"ms", &key, &flags)?;
             return block(Command::MetaSet { key, flags, data: Vec::new() }, n);
         }
         b"mg" | b"md" | b"ma" | b"me" => {
             let [key, flags @ ..] = args else { return Err(Error::Format) };
             let (key, flags) = (key_of(key)?, meta_flags(flags)?);
+            check_meta(verb, &key, &flags)?;
             match verb {
                 b"mg" => Command::MetaGet { key, flags },
                 b"md" => Command::MetaDelete { key, flags },
@@ -861,10 +952,13 @@ fn attach_command(command: &mut Command, block: Vec<u8>) {
 }
 
 fn parse_response(line: &[u8]) -> Result<(Response, Option<usize>), Fail> {
-    parse_response_line(line).map_err(Fail::from)
+    let mut skip = 0;
+    parse_response_line(line, &mut skip).map_err(|error| Fail::new(error, skip, false))
 }
 
-fn parse_response_line(line: &[u8]) -> Result<(Response, Option<usize>), Error> {
+/// Reads a reply line. When an error comes after a `VALUE` or `VA` line's
+/// data length is known, `skip` says how many bytes to drop with it.
+fn parse_response_line(line: &[u8], skip: &mut u64) -> Result<(Response, Option<usize>), Error> {
     let (first, rest) = match line.iter().position(|&b| b == b' ') {
         Some(i) => (&line[..i], Some(&line[i + 1..])),
         None => (line, None),
@@ -879,7 +973,16 @@ fn parse_response_line(line: &[u8]) -> Result<(Response, Option<usize>), Error> 
         b"END" => Some(Response::End),
         b"OK" => Some(Response::Ok),
         b"ERROR" => Some(Response::Error),
-        _ if !first.is_empty() && first.iter().all(u8::is_ascii_digit) => Some(Response::Number(unsigned(first)?)),
+        b"RESET" => Some(Response::Reset),
+        _ if !first.is_empty() && first.iter().all(u8::is_ascii_digit) => {
+            let n = unsigned(first)?;
+            // protocol.txt lets the new value of a decr be padded with
+            // spaces at the end.
+            return match rest {
+                Some(pad) if pad.iter().any(|&b| b != b' ') => Err(Error::Format),
+                _ => Ok((Response::Number(n), None)),
+            };
+        }
         _ => None,
     };
     if let Some(r) = fixed {
@@ -911,16 +1014,22 @@ fn parse_response_line(line: &[u8]) -> Result<(Response, Option<usize>), Error> 
             let t = tokens(rest.unwrap_or(b""));
             let (key, flags, bytes, cas) = match t[..] {
                 [key, flags, bytes] => (key, flags, bytes, None),
-                [key, flags, bytes, cas] => (key, flags, bytes, Some(unsigned(cas)?)),
+                [key, flags, bytes, cas] => (key, flags, bytes, Some(cas)),
                 _ => return Err(Error::Format),
             };
-            let (key, flags, n) = (key_of(key)?, small(flags)?, length(bytes)?);
+            // Once the length is known, a bad word drops the data block too,
+            // so its bytes are not read as replies.
+            let n = length(bytes)?;
+            *skip = n as u64 + 2;
+            let (key, flags, cas) = (key_of(key)?, small(flags)?, cas.map(unsigned).transpose()?);
             return block(Response::Value { key, flags, cas, data: Vec::new() }, n);
         }
         b"VA" => {
             let t = tokens(rest.unwrap_or(b""));
             let [bytes, flags @ ..] = &t[..] else { return Err(Error::Format) };
-            let (n, flags) = (length(bytes)?, meta_flags(flags)?);
+            let n = length(bytes)?;
+            *skip = n as u64 + 2;
+            let flags = meta_flags(flags)?;
             return block(Response::MetaValue { flags, data: Vec::new() }, n);
         }
         code => match MetaStatus::from_code(code) {
@@ -973,10 +1082,15 @@ fn is_token_byte(b: u8) -> bool {
     b > b' ' && b != 0x7f
 }
 
-fn key_of(t: &[u8]) -> Result<Vec<u8>, Error> {
+fn check_key(t: &[u8]) -> Result<(), Error> {
     if t.is_empty() || t.len() > MAX_KEY || !t.iter().all(|&b| is_token_byte(b)) {
         return Err(Error::Key);
     }
+    Ok(())
+}
+
+fn key_of(t: &[u8]) -> Result<Vec<u8>, Error> {
+    check_key(t)?;
     Ok(t.to_vec())
 }
 
@@ -987,10 +1101,15 @@ fn keys_of(ts: &[&[u8]]) -> Result<Vec<Vec<u8>>, Error> {
     ts.iter().map(|k| key_of(k)).collect()
 }
 
-fn token_of(t: &[u8]) -> Result<Vec<u8>, Error> {
+fn check_token(t: &[u8]) -> Result<(), Error> {
     if t.is_empty() || !t.iter().all(|&b| is_token_byte(b)) {
         return Err(Error::Format);
     }
+    Ok(())
+}
+
+fn token_of(t: &[u8]) -> Result<Vec<u8>, Error> {
+    check_token(t)?;
     Ok(t.to_vec())
 }
 
@@ -1004,6 +1123,69 @@ fn meta_flags(ts: &[&[u8]]) -> Result<Vec<MetaFlag>, Error> {
             Ok(MetaFlag { flag: t[0], token: t[1..].to_vec() })
         })
         .collect()
+}
+
+/// The flags memcached takes on `mg`, `ms`, `md` and `ma`. It refuses any
+/// other.
+const META_COMMAND_FLAGS: &[u8] = b"bcCDEfFhIJklLMNOPqRstTuvx";
+
+/// The longest opaque token memcached takes, counting its `O`.
+const MAX_OPAQUE: usize = 32;
+
+/// Checks the flags of a meta command as memcached does: each flag is one
+/// it knows and comes once, a number is a number of the flag's type, a
+/// mode is one the command has, an opaque token is at most 32 bytes with
+/// its `O`, and with `b` the key decodes as base64. `me` takes any flags.
+fn check_meta(verb: &[u8], key: &[u8], flags: &[MetaFlag]) -> Result<(), Error> {
+    if verb == b"me" {
+        return Ok(());
+    }
+    let mut seen = [false; 128];
+    for f in flags {
+        // Every known flag is ASCII, so the index is in range.
+        if !META_COMMAND_FLAGS.contains(&f.flag) || std::mem::replace(&mut seen[usize::from(f.flag)], true) {
+            return Err(Error::Format);
+        }
+        let t = &f.token[..];
+        let ok = match f.flag {
+            b'N' | b'T' | b'R' => signed(t).is_ok(),
+            b'F' => small(t).is_ok(),
+            b'C' | b'E' | b'J' | b'D' => unsigned(t).is_ok(),
+            b'M' => match (verb, t) {
+                (b"ms", [m]) => b"EAPRS".contains(m),
+                (b"ma", [m]) => b"I+D-".contains(m),
+                (_, [_]) => true,
+                _ => false,
+            },
+            b'O' => t.len() < MAX_OPAQUE,
+            b'b' => is_base64(key),
+            _ => true,
+        };
+        if !ok {
+            return Err(Error::Format);
+        }
+    }
+    Ok(())
+}
+
+/// Whether memcached's base64 decoder takes `key`. It skips bytes outside
+/// the alphabet, needs a nonzero multiple of 4 of the rest, and stops at
+/// the first group that holds padding, which may hold at most two `=`.
+fn is_base64(key: &[u8]) -> bool {
+    let alphabet = |b: u8| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=';
+    let count = key.iter().filter(|&&b| alphabet(b)).count();
+    if count == 0 || count % 4 != 0 {
+        return false;
+    }
+    let (mut n, mut pad) = (0, 0);
+    for &b in key.iter().filter(|&&b| alphabet(b)) {
+        n += 1;
+        pad += usize::from(b == b'=');
+        if n % 4 == 0 && pad > 0 {
+            return pad <= 2;
+        }
+    }
+    true
 }
 
 /// Message text: anything but CR and LF.
@@ -1045,92 +1227,124 @@ fn block<T>(message: T, n: usize) -> Result<(T, Option<usize>), Error> {
     if n > MAX_VALUE { Err(Error::TooLarge(n)) } else { Ok((message, Some(n))) }
 }
 
-fn word(line: &mut Vec<u8>, w: &[u8]) {
-    if !line.is_empty() {
-        line.push(b' ');
+/// A line being written. Each word is checked against `limit`, counting
+/// the CR LF still to come, before it is copied, so a line never grows
+/// past its limit.
+#[derive(Debug)]
+struct Line {
+    buf: Vec<u8>,
+    limit: usize,
+}
+
+impl Line {
+    fn new(limit: usize) -> Line {
+        Line { buf: Vec::new(), limit }
     }
-    line.extend_from_slice(w);
-}
 
-fn number(line: &mut Vec<u8>, n: impl std::fmt::Display) {
-    word(line, n.to_string().as_bytes());
-}
-
-fn put_key(line: &mut Vec<u8>, key: &[u8]) -> Result<(), Error> {
-    key_of(key)?;
-    word(line, key);
-    Ok(())
-}
-
-fn put_keys(line: &mut Vec<u8>, keys: &[Vec<u8>]) -> Result<(), Error> {
-    if keys.is_empty() {
-        return Err(Error::Format);
+    /// Whether `n` more bytes fit, with the CR LF.
+    fn fits(&self, n: usize) -> Result<(), Error> {
+        if self.buf.len().saturating_add(n).saturating_add(2) > self.limit {
+            return Err(Error::LineTooLong);
+        }
+        Ok(())
     }
-    keys.iter().try_for_each(|k| put_key(line, k))
-}
 
-fn put_token(line: &mut Vec<u8>, t: &[u8]) -> Result<(), Error> {
-    token_of(t)?;
-    word(line, t);
-    Ok(())
-}
-
-fn put_noreply(line: &mut Vec<u8>, noreply: bool) {
-    if noreply {
-        word(line, b"noreply");
+    /// Adds one word made of `parts`, after a space unless it is the first.
+    fn word(&mut self, parts: &[&[u8]]) -> Result<(), Error> {
+        let space = usize::from(!self.buf.is_empty());
+        self.fits(parts.iter().fold(space, |n, p| n.saturating_add(p.len())))?;
+        if space == 1 {
+            self.buf.push(b' ');
+        }
+        for p in parts {
+            self.buf.extend_from_slice(p);
+        }
+        Ok(())
     }
-}
 
-fn put_meta_flags(line: &mut Vec<u8>, flags: &[MetaFlag]) -> Result<(), Error> {
-    if flags.len() > MAX_META_FLAGS {
-        return Err(Error::Format);
+    fn number(&mut self, n: impl std::fmt::Display) -> Result<(), Error> {
+        self.word(&[n.to_string().as_bytes()])
     }
-    for f in flags {
-        if !is_token_byte(f.flag) || !f.token.iter().all(|&b| is_token_byte(b)) {
+
+    fn key(&mut self, key: &[u8]) -> Result<(), Error> {
+        check_key(key)?;
+        self.word(&[key])
+    }
+
+    fn keys(&mut self, keys: &[Vec<u8>]) -> Result<(), Error> {
+        if keys.is_empty() {
             return Err(Error::Format);
         }
-        word(line, &[f.flag]);
-        line.extend_from_slice(&f.token);
+        keys.iter().try_for_each(|k| self.key(k))
     }
-    Ok(())
-}
 
-fn meta_line(line: &mut Vec<u8>, verb: &[u8], key: &[u8], n: Option<usize>, flags: &[MetaFlag]) -> Result<(), Error> {
-    word(line, verb);
-    put_key(line, key)?;
-    if let Some(n) = n {
-        number(line, n);
+    fn token(&mut self, t: &[u8]) -> Result<(), Error> {
+        check_token(t)?;
+        self.word(&[t])
     }
-    put_meta_flags(line, flags)
-}
 
-fn text_line(line: &mut Vec<u8>, first: &[u8], text: &[u8]) -> Result<(), Error> {
-    check_text(text)?;
-    word(line, first);
-    if !text.is_empty() {
-        line.push(b' ');
-        line.extend_from_slice(text);
+    fn noreply(&mut self, noreply: bool) -> Result<(), Error> {
+        if noreply { self.word(&[b"noreply"]) } else { Ok(()) }
     }
-    Ok(())
-}
 
-/// The line with its CR LF, then the data block with its own, after
-/// checking both fit.
-fn finish(mut line: Vec<u8>, data: Option<&[u8]>) -> Result<Vec<u8>, Error> {
-    if let Some(d) = data
-        && d.len() > MAX_VALUE
-    {
-        return Err(Error::TooLarge(d.len()));
+    /// Adds message text, which may hold spaces, after a space. Empty text
+    /// adds nothing unless `always` is set.
+    fn rest(&mut self, text: &[u8], always: bool) -> Result<(), Error> {
+        if text.is_empty() && !always {
+            return Ok(());
+        }
+        self.fits(text.len().saturating_add(1))?;
+        check_text(text)?;
+        self.buf.push(b' ');
+        self.buf.extend_from_slice(text);
+        Ok(())
     }
-    if line.len() + 2 > MAX_LINE {
-        return Err(Error::LineTooLong);
+
+    /// A first word, then message text.
+    fn text(&mut self, first: &[u8], text: &[u8]) -> Result<(), Error> {
+        self.word(&[first])?;
+        self.rest(text, false)
     }
-    line.extend_from_slice(b"\r\n");
-    if let Some(d) = data {
-        line.extend_from_slice(d);
-        line.extend_from_slice(b"\r\n");
+
+    fn meta_flags(&mut self, flags: &[MetaFlag]) -> Result<(), Error> {
+        if flags.len() > MAX_META_FLAGS {
+            return Err(Error::Format);
+        }
+        for f in flags {
+            if !is_token_byte(f.flag) || !f.token.iter().all(|&b| is_token_byte(b)) {
+                return Err(Error::Format);
+            }
+            self.word(&[&[f.flag], &f.token])?;
+        }
+        Ok(())
     }
-    Ok(line)
+
+    fn meta(&mut self, verb: &[u8], key: &[u8], n: Option<usize>, flags: &[MetaFlag]) -> Result<(), Error> {
+        self.word(&[verb])?;
+        self.key(key)?;
+        if let Some(n) = n {
+            self.number(n)?;
+        }
+        self.meta_flags(flags)?;
+        check_meta(verb, key, flags)
+    }
+
+    /// The line with its CR LF, then the data block with its own, after
+    /// checking the block fits.
+    fn finish(self, data: Option<&[u8]>) -> Result<Vec<u8>, Error> {
+        if let Some(d) = data
+            && d.len() > MAX_VALUE
+        {
+            return Err(Error::TooLarge(d.len()));
+        }
+        let mut out = self.buf;
+        out.extend_from_slice(b"\r\n");
+        if let Some(d) = data {
+            out.extend_from_slice(d);
+            out.extend_from_slice(b"\r\n");
+        }
+        Ok(out)
+    }
 }
 
 /// The length of the binary protocol header.
@@ -1142,6 +1356,9 @@ pub const RESPONSE_MAGIC: u8 = 0x81;
 /// The longest binary body: the most extras, the longest key and the
 /// longest value.
 pub const MAX_BODY: usize = 255 + MAX_KEY + MAX_VALUE;
+/// The most bytes a [`BinaryDecoder`] holds: one packet of the longest
+/// body, with its header.
+pub const MAX_BINARY_BUFFERED: usize = BINARY_HEADER_LEN + MAX_BODY;
 
 /// Binary protocol opcodes. The ones ending in `Q` are quiet: the server
 /// answers them only on failure, or, for gets, only on a hit.
@@ -1232,9 +1449,13 @@ pub enum Status {
     NonNumeric,
     /// 0x0007: the vbucket belongs to another server.
     WrongVbucket,
-    /// 0x0008.
+    /// 0x0020: SASL authentication failed, or is needed first. The binary
+    /// protocol page's status table gives 0x0008, but memcached and its
+    /// SASL page use 0x0020, so 0x0008 is [`Status::Other`].
     AuthError,
-    /// 0x0009: SASL authentication needs another step.
+    /// 0x0021: SASL authentication needs another step. As with
+    /// [`Status::AuthError`], memcached uses this code, not the table's
+    /// 0x0009.
     AuthContinue,
     /// 0x0081.
     UnknownCommand,
@@ -1256,8 +1477,8 @@ impl Status {
             Status::ItemNotStored => 0x05,
             Status::NonNumeric => 0x06,
             Status::WrongVbucket => 0x07,
-            Status::AuthError => 0x08,
-            Status::AuthContinue => 0x09,
+            Status::AuthError => 0x20,
+            Status::AuthContinue => 0x21,
             Status::UnknownCommand => 0x81,
             Status::OutOfMemory => 0x82,
             Status::Other(c) => c,
@@ -1275,8 +1496,8 @@ impl Status {
             0x05 => Status::ItemNotStored,
             0x06 => Status::NonNumeric,
             0x07 => Status::WrongVbucket,
-            0x08 => Status::AuthError,
-            0x09 => Status::AuthContinue,
+            0x20 => Status::AuthError,
+            0x21 => Status::AuthContinue,
             0x81 => Status::UnknownCommand,
             0x82 => Status::OutOfMemory,
             c => Status::Other(c),
@@ -1314,6 +1535,11 @@ impl std::error::Error for BinaryError {}
 
 /// One binary protocol packet: the header's fields and the body. The
 /// lengths in the header are worked out from the body, so none is kept.
+/// Reading and writing a packet checks only its framing, not whether its
+/// extras, key and value suit its opcode: a GET request with extras is
+/// still a whole packet. memcached reads such a request, answers it with
+/// [`Status::InvalidArguments`] and closes the connection, and a world
+/// that plays a server does the same in its own code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
     /// Request or response.
@@ -1500,22 +1726,31 @@ impl BinaryDecoder {
         BinaryDecoder::default()
     }
 
-    /// Adds bytes read from the connection. After a [`BinaryError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Adds bytes read from the connection, and returns how many it took.
+    /// It takes fewer than it was given only when it holds
+    /// [`MAX_BINARY_BUFFERED`] bytes; take packets out, then feed the rest
+    /// again. After a [`BinaryError`] the stream cannot be read any
+    /// further, and it takes every byte and drops it.
+    #[must_use = "bytes not taken must be fed again"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0
+            && (self.start >= self.buf.len() / 2 || self.buf.len() + bytes.len() > MAX_BINARY_BUFFERED)
+        {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let n = bytes.len().min(MAX_BINARY_BUFFERED.saturating_sub(self.buf.len()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole packet, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. A decoder holds at most one packet's bytes beyond
-    /// what has been taken out, plus what one `feed` added.
+    /// stream has broken, so a loop that takes packets must stop at an
+    /// error.
     pub fn next_packet(&mut self) -> Option<Result<Packet, BinaryError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -1663,18 +1898,40 @@ fn be32(b: &[u8], i: usize) -> u32 {
 mod tests {
     use super::*;
 
-    /// Every command a decoder gives for `bytes`, fed at once, up to and
-    /// including the first fatal error.
+    /// Feeds `bytes`, which must all be taken.
+    macro_rules! feed {
+        ($d:expr, $bytes:expr) => {{
+            let bytes: &[u8] = $bytes;
+            assert_eq!($d.feed(bytes), bytes.len());
+        }};
+    }
+
+    /// Every command a decoder gives for `bytes`, fed as fast as it takes
+    /// them, up to and including the first fatal error.
     fn commands(bytes: &[u8]) -> Vec<Result<Command, Error>> {
         let mut d = CommandDecoder::new();
-        d.feed(bytes);
-        drain(|| d.next_command())
+        let (mut out, mut rest) = (Vec::new(), bytes);
+        loop {
+            let n = d.feed(rest);
+            rest = &rest[n..];
+            out.extend(drain(|| d.next_command()));
+            if rest.is_empty() || matches!(out.last(), Some(Err(e)) if e.is_fatal()) {
+                return out;
+            }
+        }
     }
 
     fn responses(bytes: &[u8]) -> Vec<Result<Response, Error>> {
         let mut d = ResponseDecoder::new();
-        d.feed(bytes);
-        drain(|| d.next_response())
+        let (mut out, mut rest) = (Vec::new(), bytes);
+        loop {
+            let n = d.feed(rest);
+            rest = &rest[n..];
+            out.extend(drain(|| d.next_response()));
+            if rest.is_empty() || matches!(out.last(), Some(Err(e)) if e.is_fatal()) {
+                return out;
+            }
+        }
     }
 
     fn drain<T>(mut next: impl FnMut() -> Option<Result<T, Error>>) -> Vec<Result<T, Error>> {
@@ -1973,9 +2230,9 @@ mod tests {
             let bytes = c.to_bytes().unwrap();
             for n in 0..bytes.len() {
                 let mut d = CommandDecoder::new();
-                d.feed(&bytes[..n]);
+                feed!(d, &bytes[..n]);
                 assert_eq!(d.next_command(), None, "{n} bytes of {:?}", String::from_utf8_lossy(&bytes));
-                d.feed(&bytes[n..]);
+                feed!(d, &bytes[n..]);
                 assert_eq!(d.next_command(), Some(Ok(c.clone())));
                 assert_eq!(d.buffered(), 0);
             }
@@ -1984,9 +2241,9 @@ mod tests {
             let bytes = r.to_bytes().unwrap();
             for n in 0..bytes.len() {
                 let mut d = ResponseDecoder::new();
-                d.feed(&bytes[..n]);
+                feed!(d, &bytes[..n]);
                 assert_eq!(d.next_response(), None, "{n} bytes");
-                d.feed(&bytes[n..]);
+                feed!(d, &bytes[n..]);
                 assert_eq!(d.next_response(), Some(Ok(r.clone())));
             }
         }
@@ -2043,7 +2300,10 @@ mod tests {
         }
         let many = format!("mg k{}\r\n", " v".repeat(MAX_META_FLAGS + 1));
         assert_eq!(commands(many.as_bytes()), [Err(Error::Format)]);
-        assert!(commands(format!("mg k{}\r\n", " v".repeat(MAX_META_FLAGS)).as_bytes())[0].is_ok());
+        // The most flags, each a different one.
+        let most = "mg k k s t c f v h u q x l O1 P L I N1 T1 R1 F1 C1 E1 J1 D1 MZ\r\n";
+        assert_eq!(most.split(' ').count() - 2, MAX_META_FLAGS);
+        assert!(commands(most.as_bytes())[0].is_ok(), "{:?}", commands(most.as_bytes()));
         // Bad keys.
         let long = format!("get {}\r\n", "k".repeat(MAX_KEY + 1));
         assert_eq!(commands(long.as_bytes()), [Err(Error::Key)]);
@@ -2058,7 +2318,7 @@ mod tests {
         let mut d = CommandDecoder::new();
         let mut got = Vec::new();
         for b in b"ms k 4 v \x7f\r\nquit\r\nmn\r\n" {
-            d.feed(std::slice::from_ref(b));
+            feed!(d, std::slice::from_ref(b));
             got.extend(std::iter::from_fn(|| d.next_command()));
         }
         assert_eq!(got, [Err(Error::Format), Ok(Command::MetaNoop)]);
@@ -2103,7 +2363,7 @@ mod tests {
         let mut d = CommandDecoder::new();
         let mut got = Vec::new();
         for b in &stream {
-            d.feed(std::slice::from_ref(b));
+            feed!(d, std::slice::from_ref(b));
             while let Some(r) = d.next_command() {
                 got.push(r);
             }
@@ -2125,15 +2385,15 @@ mod tests {
     fn long_lines_break_the_stream() {
         // MAX_LINE bytes and no LF.
         let mut d = CommandDecoder::new();
-        d.feed(&vec![b'a'; MAX_LINE - 1]);
+        feed!(d, &vec![b'a'; MAX_LINE - 1]);
         assert_eq!(d.next_command(), None);
-        d.feed(b"a");
+        feed!(d, b"a");
         assert_eq!(d.next_command(), Some(Err(Error::LineTooLong)));
-        d.feed(b"version\r\n");
+        feed!(d, b"version\r\n");
         assert_eq!(d.next_command(), Some(Err(Error::LineTooLong)));
         assert_eq!(d.buffered(), 0);
         // The longest line fits with its CR LF; with a bare LF it is one too long.
-        let mut line = b"get ".to_vec();
+        let mut line = b"stats ".to_vec();
         while line.len() < MAX_LINE - 2 {
             line.extend_from_slice(b"k ");
         }
@@ -2155,7 +2415,6 @@ mod tests {
             &b"STORED now\r\n"[..],
             b"END \r\n",
             b"18446744073709551616\r\n",
-            b"12 \r\n",
             b"VALUE k 0\r\n",
             b"VALUE k 0 1 2 3\r\n",
             b"VALUE k 0 1 x\r\n",
@@ -2214,7 +2473,7 @@ mod tests {
         assert_eq!(store.to_bytes(), Err(Error::TooLarge(MAX_VALUE + 1)));
         assert_eq!(Response::MetaValue { flags: vec![], data: big }.to_bytes(), Err(Error::TooLarge(MAX_VALUE + 1)));
         let keys = vec![key("kkkkkkkk"); MAX_LINE / 9 + 1];
-        assert_eq!(Command::Get { keys, cas: false }.to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(Command::Gat { exptime: 0, keys, cas: false }.to_bytes(), Err(Error::LineTooLong));
         assert_eq!(Response::ClientError(b"a\nb".to_vec()).to_bytes(), Err(Error::Format));
         assert_eq!(Response::Version(b"\r".to_vec()).to_bytes(), Err(Error::Format));
         assert_eq!(Response::Stat { name: key("a b"), value: vec![] }.to_bytes(), Err(Error::Format));
@@ -2304,7 +2563,7 @@ mod tests {
         let mut d = BinaryDecoder::new();
         let mut got = Vec::new();
         for b in &stream {
-            d.feed(std::slice::from_ref(b));
+            feed!(d, std::slice::from_ref(b));
             while let Some(p) = d.next_packet() {
                 got.push(p.unwrap().magic);
             }
@@ -2313,15 +2572,15 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         // Decoders can be cloned, to fork a connection's state.
         let mut text = CommandDecoder::new();
-        text.feed(b"get a");
+        feed!(text, b"get a");
         let mut fork = text.clone();
-        fork.feed(b"\r\n");
+        feed!(fork, b"\r\n");
         assert_eq!(fork.next_command(), Some(Ok(Command::Get { keys: vec![key("a")], cas: false })));
         assert_eq!(text.next_command(), None);
         let _ = (d.clone(), ResponseDecoder::new().clone());
-        d.feed(&[0x00]);
+        feed!(d, &[0x00]);
         assert_eq!(d.next_packet(), Some(Err(BinaryError::Magic(0))));
-        d.feed(&GET_REQUEST);
+        feed!(d, &GET_REQUEST);
         assert_eq!(d.next_packet(), Some(Err(BinaryError::Magic(0))));
         assert_eq!(d.buffered(), 0);
     }
@@ -2382,10 +2641,10 @@ mod tests {
         let started = std::time::Instant::now();
         for _ in 0..200 {
             for _ in 0..MAX_LINE - 3 {
-                d.feed(b" ");
+                feed!(d, b" ");
                 assert_eq!(d.next_command(), None);
             }
-            d.feed(b"\r\n");
+            feed!(d, b"\r\n");
             assert_eq!(d.next_command(), Some(Err(Error::UnknownCommand)));
         }
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
@@ -2445,7 +2704,7 @@ mod tests {
             let mut d = CommandDecoder::new();
             let mut bytewise = Vec::new();
             'outer: for b in &buf {
-                d.feed(std::slice::from_ref(b));
+                feed!(d, std::slice::from_ref(b));
                 while let Some(r) = d.next_command() {
                     let fatal = matches!(r, Err(e) if e.is_fatal());
                     bytewise.push(r);
@@ -2464,7 +2723,7 @@ mod tests {
             let mut d = ResponseDecoder::new();
             let mut bytewise = Vec::new();
             'outer: for b in &buf {
-                d.feed(std::slice::from_ref(b));
+                feed!(d, std::slice::from_ref(b));
                 while let Some(r) = d.next_response() {
                     let fatal = matches!(r, Err(e) if e.is_fatal());
                     bytewise.push(r);
@@ -2497,7 +2756,7 @@ mod tests {
         for _ in 0..4000 {
             let buf = fuzz_buffer(&mut rng, &pieces);
             let mut whole = BinaryDecoder::new();
-            whole.feed(&buf);
+            feed!(whole, &buf);
             let mut packets = Vec::new();
             while let Some(Ok(p)) = whole.next_packet() {
                 packets.push(p);
@@ -2505,7 +2764,7 @@ mod tests {
             let mut bytewise = BinaryDecoder::new();
             let mut again = Vec::new();
             for b in &buf {
-                bytewise.feed(std::slice::from_ref(b));
+                feed!(bytewise, std::slice::from_ref(b));
                 while let Some(Ok(p)) = bytewise.next_packet() {
                     again.push(p);
                 }
@@ -2521,5 +2780,296 @@ mod tests {
                 assert_eq!(f.to_bytes().unwrap(), buf);
             }
         }
+    }
+
+    // Findings from review, one test each.
+
+    #[test]
+    fn decoders_hold_a_bounded_number_of_bytes() {
+        // Unterminated text: fed far more than the bound at once.
+        let flood = vec![b'a'; 4 * MAX_BUFFERED];
+        let mut d = CommandDecoder::new();
+        assert!(d.feed(&flood) <= MAX_BUFFERED);
+        assert!(d.buffered() <= MAX_BUFFERED);
+        assert_eq!(d.next_command(), Some(Err(Error::LineTooLong)));
+        assert_eq!(d.buffered(), 0);
+        // Whole commands, fed again and again without taking any out.
+        let mut d = CommandDecoder::new();
+        let mut taken = 0;
+        for _ in 0..(2 * MAX_BUFFERED / 7) {
+            taken += d.feed(b"get k\r\n");
+            assert!(d.buffered() <= MAX_BUFFERED);
+        }
+        assert!(taken <= MAX_BUFFERED);
+        // Taking commands out makes room, and every command still comes.
+        let stream = b"get k\r\n".repeat(2 * MAX_BUFFERED / 7);
+        assert_eq!(commands(&stream).len(), 2 * MAX_BUFFERED / 7);
+        let mut r = ResponseDecoder::new();
+        assert!(r.feed(&flood) <= MAX_BUFFERED);
+        // Binary: a bad magic byte at the front of a flood.
+        let mut b = BinaryDecoder::new();
+        let flood = vec![0u8; 4 * MAX_BINARY_BUFFERED];
+        assert!(b.feed(&flood) <= MAX_BINARY_BUFFERED);
+        assert!(b.buffered() <= MAX_BINARY_BUFFERED);
+        assert_eq!(b.next_packet(), Some(Err(BinaryError::Magic(0))));
+        assert_eq!(b.feed(&flood), flood.len());
+        assert_eq!(b.buffered(), 0);
+        // The largest packet still fits.
+        let mut p = Packet::parse(&GET_REQUEST).unwrap().unwrap().0;
+        p.value = vec![0; MAX_BODY - p.key.len()];
+        let bytes = p.to_bytes().unwrap();
+        let mut b = BinaryDecoder::new();
+        assert_eq!(b.feed(&bytes), bytes.len());
+        assert_eq!(b.next_packet(), Some(Ok(p)));
+    }
+
+    /// The loop of the module's example: replies for every command, until
+    /// the stream breaks.
+    fn serve(input: &[u8]) -> (Vec<u8>, usize) {
+        let mut decoder = CommandDecoder::new();
+        let mut out = Vec::new();
+        let mut turns = 0;
+        let mut rest = input;
+        while !rest.is_empty() {
+            let n = decoder.feed(rest);
+            rest = &rest[n..];
+            while let Some(command) = decoder.next_command() {
+                turns += 1;
+                assert!(turns < 1000, "the loop does not end");
+                let replies = match command {
+                    Err(e) if e.is_fatal() => return (out, turns),
+                    Err(_) if decoder.quiet_error() => vec![],
+                    Ok(Command::Get { .. }) => vec![Response::End],
+                    Ok(_) => vec![Response::Error],
+                    Err(e) => vec![e.reply()],
+                };
+                for reply in replies {
+                    out.extend(reply.to_bytes().unwrap());
+                }
+            }
+        }
+        (out, turns)
+    }
+
+    #[test]
+    fn the_example_loop_ends_on_a_fatal_error() {
+        let mut input = b"get a\r\n".to_vec();
+        input.extend(vec![b'x'; MAX_LINE]);
+        let (out, turns) = serve(&input);
+        assert_eq!(out, b"END\r\n");
+        assert_eq!(turns, 2);
+    }
+
+    #[test]
+    fn writers_check_length_before_copying() {
+        let big = vec![b'x'; 16 * MAX_LINE];
+        let mut line = Line::new(MAX_LINE);
+        line.word(&[b"SERVER_ERROR"]).unwrap();
+        assert_eq!(line.rest(&big, false), Err(Error::LineTooLong));
+        assert_eq!(line.word(&[&big]), Err(Error::LineTooLong));
+        assert_eq!(line.token(&big), Err(Error::LineTooLong));
+        // Nothing of the long text was copied.
+        assert!(line.buf.capacity() < MAX_LINE, "{}", line.buf.capacity());
+        assert_eq!(line.buf, b"SERVER_ERROR");
+        // The same through the public writers.
+        assert_eq!(Response::ServerError(big.clone()).to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(Command::Stats { args: vec![big.clone()] }.to_bytes(), Err(Error::LineTooLong));
+        assert_eq!(Response::Stat { name: key("a"), value: big.clone() }.to_bytes(), Err(Error::LineTooLong));
+        let flags = vec![MetaFlag::new(b'O', &big)];
+        assert_eq!(Response::Meta { status: MetaStatus::Header, flags }.to_bytes(), Err(Error::LineTooLong));
+        // A line that just fits is written.
+        let fits = vec![b'x'; MAX_LINE - 2 - b"SERVER_ERROR ".len()];
+        assert_eq!(Response::ServerError(fits).to_bytes().unwrap().len(), MAX_LINE);
+    }
+
+    #[test]
+    fn sasl_status_codes_are_memcacheds() {
+        // A SASL auth response asking for another step, as memcached sends it.
+        let continue_auth = [
+            0x81, opcode::SASL_AUTH, 0, 0, 0, 0, 0x00, 0x21, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let (p, _) = Packet::parse(&continue_auth).unwrap().unwrap();
+        assert_eq!(Status::from_code(p.status), Status::AuthContinue);
+        assert_eq!(Status::from_code(0x20), Status::AuthError);
+        assert_eq!(Status::AuthError.code(), 0x20);
+        assert_eq!(p.reply(Status::AuthError).to_bytes().unwrap()[6..8], [0x00, 0x20]);
+        assert_eq!(Status::from_code(0x08), Status::Other(0x08));
+        assert_eq!(Status::from_code(0x09), Status::Other(0x09));
+    }
+
+    #[test]
+    fn meta_flags_are_checked_as_memcached_checks_them() {
+        for line in [
+            &b"mg k v v\r\n"[..],
+            b"ma n Dnope\r\n",
+            b"ma n D-1\r\n",
+            b"ma n Jx\r\n",
+            b"mg k T\r\n",
+            b"mg k Tx\r\n",
+            b"mg k T2147483648\r\n",
+            b"mg k N1x\r\n",
+            b"md k C-1\r\n",
+            b"ms k 1 F4294967296\r\nx\r\n",
+            b"ma n MZ\r\n",
+            b"ma n MII\r\n",
+            b"mg k M\r\n",
+            b"mg k Z\r\n",
+            b"mg k W\r\n",
+            b"mg k Oabcdefghijklmnopqrstuvwxyz123456\r\n",
+            b"mg a b\r\n",
+            b"mg ==== b\r\n",
+            b"mg A=== b\r\n",
+        ] {
+            assert_eq!(commands(line), [Err(Error::Format)], "{}", String::from_utf8_lossy(line));
+        }
+        // ms drops its block after a bad flag.
+        assert_eq!(commands(b"ms k 1 MZ\r\nx\r\nmn\r\n"), [Err(Error::Format), Ok(Command::MetaNoop)]);
+        assert_eq!(commands(b"ms k 1 T1 T2\r\nx\r\nmn\r\n"), [Err(Error::Format), Ok(Command::MetaNoop)]);
+        // What memcached takes.
+        for line in [
+            &b"mg k v T-1 N30 R5\r\n"[..],
+            b"ma n D18446744073709551615 J0 M+ N0\r\n",
+            b"ma n MD\r\n",
+            b"ms k 1 MA F4294967295 C1 E2 I\r\nx\r\n",
+            b"md k q x C5\r\n",
+            b"mg k Oabcdefghijklmnopqrstuvwxyz12345 MQ\r\n",
+            b"mg Zm9v b v\r\n",
+            b"mg Zg== b\r\n",
+            b"me k Z Z\r\n",
+        ] {
+            assert!(matches!(&commands(line)[..], [Ok(_)]), "{}", String::from_utf8_lossy(line));
+        }
+        // Writers refuse the same.
+        let f = |flag, token: &str| MetaFlag::new(flag, token.as_bytes());
+        for (verb, flags) in [
+            ("mg", vec![f(b'v', ""), f(b'v', "")]),
+            ("ma", vec![f(b'D', "nope")]),
+            ("ma", vec![f(b'M', "Z")]),
+            ("mg", vec![f(b'Z', "")]),
+            ("mg", vec![f(b'O', &"o".repeat(MAX_OPAQUE))]),
+            ("mg", vec![f(b'b', "")]),
+        ] {
+            let c = match verb {
+                "mg" => Command::MetaGet { key: key("k"), flags },
+                _ => Command::MetaArithmetic { key: key("k"), flags },
+            };
+            assert_eq!(c.to_bytes(), Err(Error::Format), "{c:?}");
+        }
+        let ms = Command::MetaSet { key: key("k"), flags: vec![f(b'M', "Z")], data: b"x".to_vec() };
+        assert_eq!(ms.to_bytes(), Err(Error::Format));
+    }
+
+    #[test]
+    fn noreply_errors_are_quiet() {
+        let errors = |bytes: &[u8]| {
+            let mut d = CommandDecoder::new();
+            let mut out = Vec::new();
+            let mut rest = bytes;
+            while !rest.is_empty() {
+                let n = d.feed(rest);
+                rest = &rest[n..];
+                while let Some(r) = d.next_command() {
+                    out.push(r.map(|_| ()).map_err(|e| (e, d.quiet_error())));
+                }
+            }
+            out
+        };
+        let n = MAX_VALUE + 1;
+        let mut big = format!("set k 0 0 {n} noreply\r\n").into_bytes();
+        big.extend(vec![b'x'; n]);
+        big.extend_from_slice(b"\r\nmn\r\n");
+        assert_eq!(errors(&big), [Err((Error::TooLarge(n), true)), Ok(())]);
+        assert_eq!(errors(b"set k 0 0 1 noreply\r\nxy\r\n")[0], Err((Error::BadDataChunk, true)));
+        assert_eq!(errors(b"cas k 0 0 1 1 noreply\r\nxy\r\n")[0], Err((Error::BadDataChunk, true)));
+        assert_eq!(errors(b"set k x 0 1 noreply\r\n"), [Err((Error::Format, true))]);
+        assert_eq!(errors(b"incr k x noreply\r\n"), [Err((Error::Delta, true))]);
+        assert_eq!(errors(b"touch k x noreply\r\n"), [Err((Error::Exptime, true))]);
+        assert_eq!(errors(b"delete k 5 noreply\r\n"), [Err((Error::Format, true))]);
+        assert_eq!(errors(b"flush_all x noreply\r\n"), [Err((Error::Format, true))]);
+        // Without noreply, a word count memcached answers with ERROR, a
+        // word other than noreply, and every meta error are not quiet.
+        assert_eq!(errors(b"set k 0 0 1\r\nxy\r\n")[0], Err((Error::BadDataChunk, false)));
+        assert_eq!(errors(b"set k x 0 1 nope\r\n"), [Err((Error::Format, false))]);
+        assert_eq!(errors(b"set k 0 noreply\r\n"), [Err((Error::UnknownCommand, false))]);
+        assert_eq!(errors(b"ms k 1 q\r\nxy\r\n")[0], Err((Error::BadDataChunk, false)));
+        assert_eq!(errors(b"mg k q v v\r\n"), [Err((Error::Format, false))]);
+        // A command after a quiet error is not quiet.
+        let mut d = CommandDecoder::new();
+        feed!(d, b"incr k x noreply\r\nmn\r\n");
+        assert!(d.next_command().unwrap().is_err() && d.quiet_error());
+        assert!(d.next_command().unwrap().is_ok() && !d.quiet_error());
+    }
+
+    #[test]
+    fn a_bad_value_line_drops_its_block() {
+        assert_eq!(responses(b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n"), [Err(Error::Format), Ok(Response::End)]);
+        assert_eq!(responses(b"VALUE k x 3\r\nEND\r\nEND\r\n"), [Err(Error::Format), Ok(Response::End)]);
+        assert_eq!(responses(b"VALUE \x01 0 3\r\nEND\r\nEND\r\n"), [Err(Error::Key), Ok(Response::End)]);
+        assert_eq!(responses(b"VA 3 \x01\r\nEND\r\nEND\r\n"), [Err(Error::Format), Ok(Response::End)]);
+        // The same a byte at a time.
+        let mut d = ResponseDecoder::new();
+        let mut got = Vec::new();
+        for b in b"VALUE k 0 8 nope\r\nSTORED\r\n\r\nEND\r\n" {
+            feed!(d, std::slice::from_ref(b));
+            got.extend(std::iter::from_fn(|| d.next_response()));
+        }
+        assert_eq!(got, [Err(Error::Format), Ok(Response::End)]);
+    }
+
+    #[test]
+    fn a_decremented_number_may_be_padded() {
+        assert_eq!(responses(b"12 \r\n9   \r\n"), [Ok(Response::Number(12)), Ok(Response::Number(9))]);
+        assert_eq!(responses(b"12 x\r\n"), [Err(Error::Format)]);
+        assert_eq!(responses(b"12  3\r\n"), [Err(Error::Format)]);
+    }
+
+    #[test]
+    fn stats_reset_has_its_reply() {
+        assert_eq!(responses(b"RESET\r\n"), [Ok(Response::Reset)]);
+        assert_eq!(Response::Reset.to_bytes().unwrap(), b"RESET\r\n");
+        assert_eq!(responses(b"RESET now\r\n"), [Err(Error::Format)]);
+        assert_eq!(one(b"stats reset\r\n"), Command::Stats { args: vec![key("reset")] });
+    }
+
+    #[test]
+    fn long_multigets_are_taken() {
+        // 33 keys of the longest length: over MAX_LINE.
+        let keys: Vec<Vec<u8>> = (0..33u8).map(|i| vec![b'a' + i % 26; MAX_KEY]).collect();
+        let get = Command::Get { keys: keys.clone(), cas: false };
+        let bytes = get.to_bytes().unwrap();
+        assert!(bytes.len() > MAX_LINE);
+        assert_eq!(one(&bytes), get);
+        let gets = Command::Get { keys, cas: true };
+        let mut stream = format!("{}gets", " ".repeat(100)).into_bytes();
+        stream.extend_from_slice(&gets.to_bytes().unwrap()[4..]);
+        stream.extend_from_slice(b"mn\r\n");
+        assert_eq!(commands(&stream), [Ok(gets.clone()), Ok(Command::MetaNoop)]);
+        // A byte at a time.
+        let mut d = CommandDecoder::new();
+        let mut got = Vec::new();
+        for b in &stream {
+            feed!(d, std::slice::from_ref(b));
+            got.extend(std::iter::from_fn(|| d.next_command()));
+        }
+        assert_eq!(got, [Ok(gets), Ok(Command::MetaNoop)]);
+        // Other long lines still break the stream, as does a get after more
+        // than 100 spaces, and one past MAX_GET_LINE.
+        let mut far = format!("{}get", " ".repeat(101)).into_bytes();
+        far.extend_from_slice(&bytes[3..]);
+        assert_eq!(commands(&far), [Err(Error::LineTooLong)]);
+        let mut gat = b"gat 0".to_vec();
+        gat.extend_from_slice(&bytes[3..]);
+        assert_eq!(commands(&gat), [Err(Error::LineTooLong)]);
+        let huge = vec![vec![b'k'; MAX_KEY]; MAX_GET_LINE / MAX_KEY];
+        assert_eq!(Command::Get { keys: huge.clone(), cas: false }.to_bytes(), Err(Error::LineTooLong));
+        let mut line = b"get".to_vec();
+        for k in &huge {
+            line.push(b' ');
+            line.extend_from_slice(k);
+        }
+        line.extend_from_slice(b"\r\n");
+        assert_eq!(commands(&line), [Err(Error::LineTooLong)]);
+        // Replies are held to MAX_LINE.
+        assert_eq!(responses(&bytes), [Err(Error::LineTooLong)]);
     }
 }

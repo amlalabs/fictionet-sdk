@@ -2,22 +2,55 @@
 //! world playing an agent reads them.
 #![no_main]
 
-use fictionet::stdlib::snmp::{Decoder, Element, ErrorStatus, Message, Oid};
+use fictionet::stdlib::snmp::{
+    BasicPdu, Decoder, Element, Error, ErrorStatus, MAX_BUFFERED, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,
+    Version,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // The bytes as one datagram.
     if let Ok(m) = Message::parse(data) {
         // A message read can be written, and reads back the same. Writing
-        // never makes it longer, so no binding is dropped.
-        let bytes = m.to_bytes();
+        // never makes it longer.
+        let bytes = m.to_bytes().unwrap();
         assert!(bytes.len() <= data.len());
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
-        // Answers to it always read back, keeping the bindings that fit.
+        // Answers to it follow its version and are no longer than it, so
+        // they are written whole and read back the same.
         let answers = [m.response(m.pdu.bindings().to_vec()), m.error_response(ErrorStatus::GenErr, 1)];
         for r in answers.into_iter().flatten() {
-            let back = Message::parse(&r.to_bytes()).unwrap();
-            assert!(r.pdu.bindings().starts_with(back.pdu.bindings()));
+            assert!(m.follows_version() && r.follows_version());
+            let b = r.to_bytes().unwrap();
+            assert!(b.len() <= data.len());
+            assert_eq!(Message::parse(&b), Ok(r));
+        }
+    }
+
+    // A message built from the bytes, as world code builds one: it is
+    // written whole and reads back the same, or refused as too long.
+    let name: Oid = "1.3.6.1.2.1.1.5.0".parse().unwrap();
+    let copies = usize::from(data.first().copied().unwrap_or(0) % 4);
+    let built = Message {
+        version: if data.len() % 2 == 0 { Version::V1 } else { Version::V2c },
+        community: data.to_vec(),
+        pdu: Pdu::Set(BasicPdu::new(
+            1,
+            vec![
+                VarBind::new(name.clone(), Value::OctetString(data.to_vec())),
+                VarBind::new(name, Value::Opaque(data.repeat(copies))),
+            ],
+        )),
+    };
+    match built.to_bytes() {
+        Ok(b) => {
+            assert_eq!(b.len(), built.encoded_len());
+            assert!(b.len() <= MAX_MESSAGE);
+            assert_eq!(Message::parse(&b), Ok(built));
+        }
+        Err(e) => {
+            assert!(built.encoded_len() > MAX_MESSAGE);
+            assert_eq!(e, Error::TooLong(built.encoded_len()));
         }
     }
 
@@ -36,9 +69,10 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(o.to_string().parse::<Oid>(), Ok(o));
     }
 
-    // The stream, split two ways: all at once, and a byte at a time. Both
-    // give the same messages, then the same error or the same bytes held.
-    let take = |d: &mut Decoder, out: &mut Vec<Vec<u8>>| -> Option<fictionet::stdlib::snmp::Error> {
+    // The stream, split two ways: in pieces as large as the decoder
+    // takes, and a byte at a time. Both give the same messages, then the
+    // same error or the same bytes held, never more than MAX_BUFFERED.
+    let take = |d: &mut Decoder, out: &mut Vec<Vec<u8>>| -> Option<Error> {
         while let Some(r) = d.next_message() {
             match r {
                 Ok(m) => out.push(m),
@@ -48,17 +82,27 @@ fuzz_target!(|data: &[u8]| {
         None
     };
     let mut whole = Decoder::new();
-    whole.feed(data);
     let mut messages = Vec::new();
-    let whole_err = take(&mut whole, &mut messages);
+    let mut whole_err = None;
+    let mut rest = data;
+    while whole_err.is_none() {
+        let n = whole.feed(rest);
+        rest = &rest[n..];
+        whole_err = take(&mut whole, &mut messages);
+        assert!(whole.buffered() <= MAX_BUFFERED);
+        if rest.is_empty() {
+            break;
+        }
+    }
     let mut bytewise = Decoder::new();
     let mut again = Vec::new();
     let mut bytewise_err = None;
     for b in data {
-        bytewise.feed(std::slice::from_ref(b));
+        assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
         if let Some(e) = take(&mut bytewise, &mut again) {
             bytewise_err.get_or_insert(e);
         }
+        assert!(bytewise.buffered() <= MAX_BUFFERED);
     }
     assert_eq!(messages, again);
     assert_eq!(whole_err, bytewise_err);

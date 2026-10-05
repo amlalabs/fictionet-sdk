@@ -3,8 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::memcache::{
-    BinaryDecoder, Command, CommandDecoder, CounterExtras, Error, Packet, Response, ResponseDecoder, StoreExtras,
-    UdpFrame,
+    BinaryDecoder, BinaryError, Command, CommandDecoder, CounterExtras, Error, MAX_BINARY_BUFFERED, MAX_BUFFERED,
+    MetaFlag, MetaStatus, Packet, Response, ResponseDecoder, Status, StoreExtras, UDP_MAX_DATAGRAM, UdpFrame,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -21,15 +21,16 @@ fn drain<T>(mut next: impl FnMut() -> Option<Result<T, Error>>) -> Vec<Result<T,
     out
 }
 
-fn commands(data: &[u8], bytewise: bool) -> Vec<Result<Command, Error>> {
+/// Feeds `data` in pieces of at most `step` bytes, taking messages out
+/// after each, and checks the decoder never holds more than its bound.
+fn commands(data: &[u8], step: usize) -> Vec<Result<Command, Error>> {
     let mut d = CommandDecoder::new();
-    if !bytewise {
-        d.feed(data);
-        return drain(|| d.next_command());
-    }
     let mut out = Vec::new();
-    for b in data {
-        d.feed(std::slice::from_ref(b));
+    let mut rest = data;
+    while !rest.is_empty() {
+        let n = d.feed(&rest[..rest.len().min(step)]);
+        assert!(d.buffered() <= MAX_BUFFERED);
+        rest = &rest[n..];
         out.extend(drain(|| d.next_command()));
         if matches!(out.last(), Some(Err(e)) if e.is_fatal()) {
             break;
@@ -38,15 +39,14 @@ fn commands(data: &[u8], bytewise: bool) -> Vec<Result<Command, Error>> {
     out
 }
 
-fn responses(data: &[u8], bytewise: bool) -> Vec<Result<Response, Error>> {
+fn responses(data: &[u8], step: usize) -> Vec<Result<Response, Error>> {
     let mut d = ResponseDecoder::new();
-    if !bytewise {
-        d.feed(data);
-        return drain(|| d.next_response());
-    }
     let mut out = Vec::new();
-    for b in data {
-        d.feed(std::slice::from_ref(b));
+    let mut rest = data;
+    while !rest.is_empty() {
+        let n = d.feed(&rest[..rest.len().min(step)]);
+        assert!(d.buffered() <= MAX_BUFFERED);
+        rest = &rest[n..];
         out.extend(drain(|| d.next_response()));
         if matches!(out.last(), Some(Err(e)) if e.is_fatal()) {
             break;
@@ -55,41 +55,76 @@ fn responses(data: &[u8], bytewise: bool) -> Vec<Result<Response, Error>> {
     out
 }
 
+/// Every packet up to and including the first error.
+fn packets(data: &[u8], step: usize) -> Vec<Result<Packet, BinaryError>> {
+    let mut d = BinaryDecoder::new();
+    let mut out = Vec::new();
+    let mut rest = data;
+    while !rest.is_empty() {
+        let n = d.feed(&rest[..rest.len().min(step)]);
+        assert!(d.buffered() <= MAX_BINARY_BUFFERED);
+        rest = &rest[n..];
+        while let Some(p) = d.next_packet() {
+            let failed = p.is_err();
+            out.push(p);
+            if failed {
+                return out;
+            }
+        }
+    }
+    out
+}
+
+/// A value a caller built, not one a reader made: if a writer takes it,
+/// a reader must read back the same.
+fn check_command(c: Command) {
+    if let Ok(bytes) = c.to_bytes() {
+        assert_eq!(commands(&bytes, usize::MAX), [Ok(c)]);
+    }
+}
+
+fn check_response(r: Response) {
+    if let Ok(bytes) = r.to_bytes() {
+        assert_eq!(responses(&bytes, usize::MAX), [Ok(r)]);
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     // The stream, split two ways: all at once, and a byte at a time.
-    let whole = commands(data, false);
-    assert_eq!(whole, commands(data, true));
+    let whole = commands(data, usize::MAX);
+    assert_eq!(whole, commands(data, 1));
     for c in whole.iter().flatten() {
         // A command read can be written, and reads back the same.
         let bytes = c.to_bytes().unwrap();
-        assert_eq!(commands(&bytes, false), [Ok(c.clone())]);
+        assert_eq!(commands(&bytes, usize::MAX), [Ok(c.clone())]);
     }
-    let whole = responses(data, false);
-    assert_eq!(whole, responses(data, true));
+    let whole = responses(data, usize::MAX);
+    assert_eq!(whole, responses(data, 1));
     for r in whole.iter().flatten() {
         let bytes = r.to_bytes().unwrap();
-        assert_eq!(responses(&bytes, false), [Ok(r.clone())]);
+        assert_eq!(responses(&bytes, usize::MAX), [Ok(r.clone())]);
     }
 
-    // The binary protocol, the same two ways.
-    let mut whole = BinaryDecoder::new();
-    whole.feed(data);
-    let mut packets = Vec::new();
-    while let Some(Ok(p)) = whole.next_packet() {
-        packets.push(p);
-    }
-    let mut bytewise = BinaryDecoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(p)) = bytewise.next_packet() {
-            again.push(p);
-        }
-    }
-    assert_eq!(packets, again);
-    for p in &packets {
+    // Writers given values built from the input, not read from it.
+    let words: Vec<Vec<u8>> = data.split(|&b| b == b' ').map(<[u8]>::to_vec).collect();
+    let flags: Vec<MetaFlag> = words.iter().skip(1).filter_map(|w| Some(MetaFlag::new(*w.first()?, &w[1..]))).collect();
+    let first = words.first().cloned().unwrap_or_default();
+    check_command(Command::Get { keys: words.clone(), cas: data.len() % 2 == 0 });
+    check_command(Command::Stats { args: words.clone() });
+    check_command(Command::MetaGet { key: first.clone(), flags: flags.clone() });
+    check_command(Command::MetaArithmetic { key: first.clone(), flags: flags.clone() });
+    check_command(Command::MetaSet { key: first.clone(), flags: flags.clone(), data: data.to_vec() });
+    check_response(Response::ServerError(data.to_vec()));
+    check_response(Response::Stat { name: first.clone(), value: data.to_vec() });
+    check_response(Response::Meta { status: MetaStatus::Header, flags });
+
+    // The binary protocol, the same two ways, errors included.
+    let whole = packets(data, usize::MAX);
+    assert_eq!(whole, packets(data, 1));
+    for p in whole.iter().flatten() {
         let bytes = p.to_bytes().unwrap();
         assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
+        assert_eq!(Status::from_code(p.status).code(), p.status);
         if let Some(e) = StoreExtras::parse(&p.extras) {
             assert_eq!(e.to_bytes()[..], p.extras[..]);
         }
@@ -102,4 +137,15 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(f) = UdpFrame::parse(data) {
         assert_eq!(f.to_bytes().unwrap(), data);
     }
+    // Any bytes as a reply, split into datagrams and put back together.
+    let frames = UdpFrame::split(7, data).unwrap();
+    let mut back = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let bytes = f.to_bytes().unwrap();
+        assert!(bytes.len() <= UDP_MAX_DATAGRAM);
+        let again = UdpFrame::parse(&bytes).unwrap();
+        assert_eq!((again.request_id, usize::from(again.sequence), usize::from(again.total)), (7, i, frames.len()));
+        back.extend(again.payload);
+    }
+    assert_eq!(back, data);
 });

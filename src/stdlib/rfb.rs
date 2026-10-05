@@ -34,7 +34,15 @@
 //! with [`Error::Encoding`].
 //!
 //! Every reader checks lengths against the limits below, because the agent
-//! can send any bytes it likes.
+//! can send any bytes it likes. Every writer refuses a message it cannot
+//! put on the wire as it is, rather than cut it short.
+//!
+//! The sessions also keep the rules RFC 6143 sets for the normal phase.
+//! A server sends a framebuffer update only after the client asked for
+//! one, uses only the encodings the client listed, keeps rectangles inside
+//! the framebuffer, and sends color map entries only for a color map
+//! format. A client changes its pixel format only when no update request
+//! is outstanding.
 //!
 //! ```
 //! use fictionet::stdlib::rfb::{ClientMessage, PixelFormat, ServerInit, ServerMessage, ServerSession, Version};
@@ -70,14 +78,17 @@ pub const CHALLENGE_LEN: usize = 16;
 /// The length of a pixel format on the wire.
 pub const PIXEL_FORMAT_LEN: usize = 16;
 /// The longest text this module reads or writes: a failure reason, a
-/// desktop name or cut text. Longer text is refused when read and cut to
-/// this length when written.
+/// desktop name or cut text. Longer text is refused both ways.
 pub const MAX_TEXT: usize = 1 << 20;
 /// The longest message this module reads or writes, in bytes. It bounds
 /// a framebuffer update, which can otherwise claim gigabytes.
 pub const MAX_MESSAGE: usize = 1 << 26;
 /// The most bytes a session holds that the peer sent before its turn.
 pub const MAX_PENDING: usize = 1 << 16;
+/// The most bytes a session holds that have not been taken out as
+/// messages: room for two of the longest messages. Feeding more breaks the
+/// stream with [`Error::TooLong`], so take messages out between feeds.
+pub const MAX_BUFFERED: usize = 2 * MAX_MESSAGE;
 /// The most security types a 3.7 or 3.8 server can offer.
 pub const MAX_SECURITY_TYPES: usize = 255;
 /// The most encodings, colors or rectangles one message can carry: the
@@ -155,12 +166,32 @@ pub enum Error {
     Unsupported(u32),
     /// The peer sent more than [`MAX_PENDING`] bytes before its turn.
     OutOfTurn,
+    /// A pixel format RFC 6143 does not allow: bits per pixel other than
+    /// 8, 16 or 32, a depth past bits per pixel, or, for true color, a
+    /// maximum that is not one less than a power of two or a color that
+    /// does not fit in the pixel.
+    PixelFormat,
+    /// A rectangle that reaches past the framebuffer, a CopyRect whose
+    /// source does, or a DesktopSize rectangle that is not the last in its
+    /// update.
+    Rectangle,
+    /// A server message the client did not ask for: a framebuffer update
+    /// with no request outstanding, a rectangle in an encoding the client
+    /// did not list (Raw is always allowed), CopyRect in answer to a
+    /// request that was not incremental, or color map entries while pixels
+    /// are true color.
+    NotRequested,
+    /// SetPixelFormat while a framebuffer update request is outstanding or
+    /// an update is being read, when the client could not tell which
+    /// format the update is in.
+    Outstanding,
     /// A message sent in a phase where it does not belong.
     Phase(Phase),
     /// A message that cannot be written as it is: an empty list of
     /// security types, a security type of 0, a security offer in the wrong
-    /// dialect, too many rectangles, or pixel data whose length does not
-    /// fit the rectangle.
+    /// dialect, a failure reason in a dialect before 3.8, a version part
+    /// past 999, more than [`MAX_ITEMS`] rectangles, encodings or colors,
+    /// or pixel data whose length does not fit the rectangle.
     Unwritable,
 }
 
@@ -175,6 +206,10 @@ impl std::fmt::Display for Error {
             Error::NotOffered(t) => write!(f, "security type {t} was not offered"),
             Error::Unsupported(t) => write!(f, "security type {t} is not followed"),
             Error::OutOfTurn => f.write_str("too many bytes sent before the peer's turn"),
+            Error::PixelFormat => f.write_str("pixel format not allowed"),
+            Error::Rectangle => f.write_str("rectangle outside the framebuffer or out of order"),
+            Error::NotRequested => f.write_str("server message the client did not ask for"),
+            Error::Outstanding => f.write_str("pixel format changed while an update is outstanding"),
             Error::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
             Error::Unwritable => f.write_str("message cannot be written as it is"),
         }
@@ -184,7 +219,8 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// A protocol version, as in `RFB 003.008\n`. Each part has three digits
-/// on the wire, so values past 999 are written as 999.
+/// on the wire, so a message that carries a part past 999 cannot be
+/// written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Version {
     /// The major version, 3 for every version in use.
@@ -224,7 +260,8 @@ impl Version {
         run(b, version)
     }
 
-    /// The version line's bytes.
+    /// The version line's bytes. A part past 999 is written as 999; the
+    /// message writers refuse such a version instead.
     pub fn to_bytes(self) -> [u8; VERSION_LEN] {
         let mut out = *b"RFB 000.000\n";
         for (at, n) in [(4, self.major.min(999)), (8, self.minor.min(999))] {
@@ -233,6 +270,11 @@ impl Version {
             out[at + 2] = b'0' + (n % 10) as u8;
         }
         out
+    }
+
+    /// Whether both parts fit in three digits.
+    fn writable(self) -> bool {
+        self.major <= 999 && self.minor <= 999
     }
 
     /// The handshake this version means, when it is the one both sides
@@ -320,6 +362,26 @@ impl PixelFormat {
         out[11] = self.green_shift;
         out[12] = self.blue_shift;
         out
+    }
+
+    /// Whether RFC 6143, section 7.4, allows this format: bits per pixel
+    /// of 8, 16 or 32, no more than that many bits of depth, and for true
+    /// color, each maximum one less than a power of two whose bits, moved
+    /// up by the color's shift, fit in the pixel. A color map format's
+    /// maximums and shifts are not used, so they are not checked.
+    pub fn is_valid(&self) -> bool {
+        if self.bytes_per_pixel().is_none() || self.depth > self.bits_per_pixel {
+            return false;
+        }
+        if !self.true_color {
+            return true;
+        }
+        [(self.red_max, self.red_shift), (self.green_max, self.green_shift), (self.blue_max, self.blue_shift)]
+            .into_iter()
+            .all(|(max, shift)| {
+                let bits = 16 - max.leading_zeros();
+                max & max.wrapping_add(1) == 0 && u32::from(shift) + bits <= u32::from(self.bits_per_pixel)
+            })
     }
 
     /// Bytes per pixel, or `None` if bits per pixel is not 8, 16 or 32.
@@ -489,21 +551,34 @@ impl ClientMessage {
         )
     }
 
-    /// The message's bytes. Encodings past [`MAX_ITEMS`] and text past
-    /// [`MAX_TEXT`] are left out.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The message's bytes. A message that cannot be written so it reads
+    /// back the same is [`Error::Unwritable`] (a version part past 999,
+    /// more than [`MAX_ITEMS`] encodings), [`Error::TooLong`] (text past
+    /// [`MAX_TEXT`]) or [`Error::PixelFormat`] (a format
+    /// [`PixelFormat::is_valid`] refuses).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         match self {
-            ClientMessage::Version(v) => out.extend_from_slice(&v.to_bytes()),
+            ClientMessage::Version(v) => {
+                if !v.writable() {
+                    return Err(Error::Unwritable);
+                }
+                out.extend_from_slice(&v.to_bytes());
+            }
             ClientMessage::SecurityType(t) => out.push(*t),
             ClientMessage::VncResponse(r) => out.extend_from_slice(r),
             ClientMessage::ClientInit { shared } => out.push(u8::from(*shared)),
             ClientMessage::SetPixelFormat(f) => {
+                if !f.is_valid() {
+                    return Err(Error::PixelFormat);
+                }
                 out.extend_from_slice(&[client_type::SET_PIXEL_FORMAT, 0, 0, 0]);
                 out.extend_from_slice(&f.to_bytes());
             }
             ClientMessage::SetEncodings(list) => {
-                let list = &list[..list.len().min(MAX_ITEMS)];
+                if list.len() > MAX_ITEMS {
+                    return Err(Error::Unwritable);
+                }
                 out.extend_from_slice(&[client_type::SET_ENCODINGS, 0]);
                 out.extend_from_slice(&(list.len() as u16).to_be_bytes());
                 for e in list {
@@ -527,10 +602,10 @@ impl ClientMessage {
             }
             ClientMessage::ClientCutText(text) => {
                 out.extend_from_slice(&[client_type::CLIENT_CUT_TEXT, 0, 0, 0]);
-                put_text(&mut out, text);
+                put_text(&mut out, text)?;
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -555,17 +630,29 @@ impl ServerMessage {
     }
 
     /// The message's bytes, for a handshake in `dialect` and pixels in
-    /// `format`. Colors past [`MAX_ITEMS`] and text past [`MAX_TEXT`] are
-    /// left out. A message that cannot be written so it reads back is
-    /// [`Error::Unwritable`], [`Error::BitsPerPixel`] or [`Error::TooLong`].
-    /// That includes a security type list in 3.3, and a single security
-    /// type in 3.7 or 3.8.
+    /// `format`. A message that cannot be written so it reads back the same
+    /// is [`Error::Unwritable`], [`Error::BitsPerPixel`], [`Error::TooLong`],
+    /// [`Error::PixelFormat`] or [`Error::Rectangle`]. That includes a
+    /// security type list in 3.3, a single security type in 3.7 or 3.8, an
+    /// offer of type 0, a failure reason before 3.8, more than
+    /// [`MAX_ITEMS`] colors, text past [`MAX_TEXT`], a ServerInit format
+    /// [`PixelFormat::is_valid`] refuses, and a DesktopSize rectangle that
+    /// is not the last.
     pub fn to_bytes(&self, dialect: Dialect, format: &PixelFormat) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         match self {
-            ServerMessage::Version(v) => out.extend_from_slice(&v.to_bytes()),
+            ServerMessage::Version(v) => {
+                if !v.writable() {
+                    return Err(Error::Unwritable);
+                }
+                out.extend_from_slice(&v.to_bytes());
+            }
             ServerMessage::SecurityTypes(types) => {
-                if dialect == Dialect::V3_3 || types.is_empty() || types.len() > MAX_SECURITY_TYPES {
+                if dialect == Dialect::V3_3
+                    || types.is_empty()
+                    || types.len() > MAX_SECURITY_TYPES
+                    || types.contains(&security::INVALID)
+                {
                     return Err(Error::Unwritable);
                 }
                 out.push(types.len() as u8);
@@ -582,21 +669,26 @@ impl ServerMessage {
                     Dialect::V3_3 => out.extend_from_slice(&[0, 0, 0, 0]),
                     Dialect::V3_7 | Dialect::V3_8 => out.push(0),
                 }
-                put_text(&mut out, reason);
+                put_text(&mut out, reason)?;
             }
             ServerMessage::VncChallenge(c) => out.extend_from_slice(c),
             ServerMessage::SecurityOk => out.extend_from_slice(&[0, 0, 0, 0]),
             ServerMessage::SecurityFailed(reason) => {
                 out.extend_from_slice(&[0, 0, 0, 1]);
                 if dialect == Dialect::V3_8 {
-                    put_text(&mut out, reason);
+                    put_text(&mut out, reason)?;
+                } else if !reason.is_empty() {
+                    return Err(Error::Unwritable);
                 }
             }
             ServerMessage::ServerInit(init) => {
+                if !init.format.is_valid() {
+                    return Err(Error::PixelFormat);
+                }
                 out.extend_from_slice(&init.width.to_be_bytes());
                 out.extend_from_slice(&init.height.to_be_bytes());
                 out.extend_from_slice(&init.format.to_bytes());
-                put_text(&mut out, &init.name);
+                put_text(&mut out, &init.name)?;
             }
             ServerMessage::FramebufferUpdate(rects) => {
                 if rects.len() > MAX_ITEMS {
@@ -604,6 +696,9 @@ impl ServerMessage {
                 }
                 out.extend_from_slice(&[server_type::FRAMEBUFFER_UPDATE, 0]);
                 out.extend_from_slice(&(rects.len() as u16).to_be_bytes());
+                if rects.iter().rev().skip(1).any(|r| r.contents == Contents::DesktopSize) {
+                    return Err(Error::Rectangle);
+                }
                 for r in rects {
                     for v in [r.x, r.y, r.width, r.height] {
                         out.extend_from_slice(&v.to_be_bytes());
@@ -637,7 +732,9 @@ impl ServerMessage {
                 }
             }
             ServerMessage::SetColorMapEntries { first, colors } => {
-                let colors = &colors[..colors.len().min(MAX_ITEMS)];
+                if colors.len() > MAX_ITEMS {
+                    return Err(Error::Unwritable);
+                }
                 out.extend_from_slice(&[server_type::SET_COLOR_MAP_ENTRIES, 0]);
                 out.extend_from_slice(&first.to_be_bytes());
                 out.extend_from_slice(&(colors.len() as u16).to_be_bytes());
@@ -650,7 +747,7 @@ impl ServerMessage {
             ServerMessage::Bell => out.push(server_type::BELL),
             ServerMessage::ServerCutText(text) => {
                 out.extend_from_slice(&[server_type::SERVER_CUT_TEXT, 0, 0, 0]);
-                put_text(&mut out, text);
+                put_text(&mut out, text)?;
             }
         }
         Ok(out)
@@ -722,11 +819,37 @@ struct State {
     dialect: Dialect,
     offered: Vec<u8>,
     format: PixelFormat,
+    /// The framebuffer's size: from ServerInit, then from the last
+    /// DesktopSize rectangle.
+    width: u16,
+    height: u16,
+    /// Whether the client asked for an update the server has not yet sent.
+    requested: bool,
+    /// Whether one of those requests was not incremental, which rules out
+    /// CopyRect.
+    full: bool,
+    /// Which encodings past Raw the client listed in its last SetEncodings.
+    copy_rect: bool,
+    cursor: bool,
+    desktop_size: bool,
 }
 
 impl State {
     fn new() -> State {
-        State { phase: Phase::ServerVersion, server_version: Version::V3_8, dialect: Dialect::V3_8, offered: Vec::new(), format: PixelFormat::TRUE_COLOR_32 }
+        State {
+            phase: Phase::ServerVersion,
+            server_version: Version::V3_8,
+            dialect: Dialect::V3_8,
+            offered: Vec::new(),
+            format: PixelFormat::TRUE_COLOR_32,
+            width: 0,
+            height: 0,
+            requested: false,
+            full: false,
+            copy_rect: false,
+            cursor: false,
+            desktop_size: false,
+        }
     }
 
     /// The phase after security type `t` was settled on.
@@ -751,11 +874,23 @@ impl State {
                 if !self.offered.contains(t) {
                     return Err(Error::NotOffered(*t));
                 }
+                if *t == security::INVALID {
+                    return Err(Error::Unwritable);
+                }
                 self.phase = self.after_type(u32::from(*t));
             }
             (Phase::VncResponse, ClientMessage::VncResponse(_)) => self.phase = Phase::SecurityResult,
             (Phase::ClientInit, ClientMessage::ClientInit { .. }) => self.phase = Phase::ServerInit,
             (Phase::Normal, ClientMessage::SetPixelFormat(f)) => self.format = *f,
+            (Phase::Normal, ClientMessage::SetEncodings(list)) => {
+                self.copy_rect = list.contains(&encoding::COPY_RECT);
+                self.cursor = list.contains(&encoding::CURSOR);
+                self.desktop_size = list.contains(&encoding::DESKTOP_SIZE);
+            }
+            (Phase::Normal, ClientMessage::FramebufferUpdateRequest { incremental, .. }) => {
+                self.requested = true;
+                self.full |= !incremental;
+            }
             (Phase::Normal, m) if !m.is_handshake() => {}
             (p, _) => return Err(Error::Phase(p)),
         }
@@ -789,10 +924,64 @@ impl State {
             (Phase::SecurityResult, ServerMessage::SecurityFailed(_)) => self.phase = Phase::Closed,
             (Phase::ServerInit, ServerMessage::ServerInit(init)) => {
                 self.format = init.format;
+                self.width = init.width;
+                self.height = init.height;
                 self.phase = Phase::Normal;
+            }
+            (Phase::Normal, ServerMessage::FramebufferUpdate(rects)) => {
+                let (mut width, mut height) = (self.width, self.height);
+                // RFC 6143, section 7.6.1, and The RFB Protocol, section
+                // 2.1: updates stay inside the framebuffer.
+                let inside = |x: u16, y: u16, r: &Rectangle| {
+                    let fits = |at: u16, len: u16, max: u16| u32::from(at) + u32::from(len) <= u32::from(max);
+                    if fits(x, r.width, self.width) && fits(y, r.height, self.height) { Ok(()) } else { Err(Error::Rectangle) }
+                };
+                for r in rects {
+                    match r.contents {
+                        Contents::Raw(_) => inside(r.x, r.y, r)?,
+                        Contents::CopyRect { src_x, src_y } => {
+                            inside(r.x, r.y, r)?;
+                            inside(src_x, src_y, r)?;
+                        }
+                        // The x and y are the cursor's hot spot.
+                        Contents::Cursor { .. } => {}
+                        Contents::DesktopSize => (width, height) = (r.width, r.height),
+                    }
+                }
+                self.width = width;
+                self.height = height;
+                self.requested = false;
+                self.full = false;
             }
             (Phase::Normal, m) if !m.is_handshake() => {}
             (p, _) => return Err(Error::Phase(p)),
+        }
+        Ok(())
+    }
+
+    /// Whether the server may send `m` now, by what the client asked for.
+    /// The client's reader does not hold the server to this, as clients in
+    /// use do not, but a world playing a server keeps to it.
+    fn requested(&self, m: &ServerMessage) -> Result<(), Error> {
+        match m {
+            ServerMessage::FramebufferUpdate(rects) => {
+                if !self.requested {
+                    return Err(Error::NotRequested);
+                }
+                for r in rects {
+                    let listed = match r.contents {
+                        Contents::Raw(_) => true,
+                        Contents::CopyRect { .. } => self.copy_rect && !self.full,
+                        Contents::Cursor { .. } => self.cursor,
+                        Contents::DesktopSize => self.desktop_size,
+                    };
+                    if !listed {
+                        return Err(Error::NotRequested);
+                    }
+                }
+            }
+            ServerMessage::SetColorMapEntries { .. } if self.format.true_color => return Err(Error::NotRequested),
+            _ => {}
         }
         Ok(())
     }
@@ -833,6 +1022,9 @@ impl State {
             Phase::ServerInit => {
                 let (width, height) = (c.u16()?, c.u16()?);
                 let format = PixelFormat::parse(&c.array()?);
+                if !format.is_valid() {
+                    return Err(Stop::Fail(Error::PixelFormat));
+                }
                 ServerMessage::ServerInit(ServerInit { width, height, format, name: text(c)? })
             }
             Phase::Normal => server_normal(c, &self.format, partial)?,
@@ -884,12 +1076,25 @@ impl Reader {
         e
     }
 
-    /// Adds bytes, then holds them to the limits for this phase, so the
-    /// buffer stays bounded even if no message is asked for.
+    /// Adds bytes, holding them to the limits for this phase, so the
+    /// buffer stays bounded even if no message is asked for. Bytes past a
+    /// limit are not copied.
     fn feed_in(&mut self, bytes: &[u8], turn: bool, phase: Phase) {
-        self.feed(bytes);
-        if !turn {
-            self.out_of_turn(phase);
+        if self.failed.is_some() {
+            return;
+        }
+        let total = self.held().saturating_add(bytes.len());
+        match phase {
+            Phase::Unsupported(t) if total > 0 => {
+                self.fail(Error::Unsupported(t));
+            }
+            _ if turn && total > MAX_BUFFERED => {
+                self.fail(Error::TooLong);
+            }
+            _ if !turn && total > MAX_PENDING => {
+                self.fail(Error::OutOfTurn);
+            }
+            _ => self.feed(bytes),
         }
     }
 
@@ -970,7 +1175,8 @@ impl ServerSession {
     /// Adds bytes read from the client. After a read error, or once the
     /// server has refused the connection, they are dropped. More than
     /// [`MAX_PENDING`] bytes before the client's turn break the stream at
-    /// once, so the session never holds more than that while it waits.
+    /// once, so the session never holds more than that while it waits, and
+    /// it never holds more than [`MAX_BUFFERED`] at all.
     pub fn feed(&mut self, bytes: &[u8]) {
         let phase = self.state.phase;
         if phase != Phase::Closed {
@@ -995,13 +1201,20 @@ impl ServerSession {
     }
 
     /// The bytes that send `msg` to the client. A message that does not
-    /// belong in this phase is [`Error::Phase`], and nothing changes.
+    /// belong in this phase is [`Error::Phase`]; one the client did not ask
+    /// for is [`Error::NotRequested`]; a rectangle outside the framebuffer
+    /// is [`Error::Rectangle`]; one that cannot be written is the error
+    /// [`ServerMessage::to_bytes`] gives. On any error nothing changes.
     pub fn send(&mut self, msg: &ServerMessage) -> Result<Vec<u8>, Error> {
         let mut next = self.state.clone();
         next.server_step(msg)?;
+        self.state.requested(msg)?;
         let bytes = msg.to_bytes(self.state.dialect, &self.state.format)?;
+        if next.phase != self.state.phase {
+            // The client's bytes now split another way.
+            self.reader.need = 0;
+        }
         self.state = next;
-        self.reader.need = 0;
         Ok(bytes)
     }
 
@@ -1010,8 +1223,9 @@ impl ServerSession {
         self.state.phase
     }
 
-    /// The handshake the two versions picked: the lower one's. Before the
-    /// client's version comes, it is [`Dialect::V3_8`].
+    /// The handshake the two versions picked: the lower one's, as TigerVNC
+    /// picks it. Before the client's version comes, it is
+    /// [`Dialect::V3_8`].
     pub fn dialect(&self) -> Dialect {
         self.state.dialect
     }
@@ -1060,7 +1274,8 @@ impl ClientSession {
     /// Adds bytes read from the server. After a read error, or once the
     /// server has refused the connection, they are dropped. More than
     /// [`MAX_PENDING`] bytes before the server's turn break the stream at
-    /// once, so the session never holds more than that while it waits.
+    /// once, so the session never holds more than that while it waits, and
+    /// it never holds more than [`MAX_BUFFERED`] at all.
     pub fn feed(&mut self, bytes: &[u8]) {
         let phase = self.state.phase;
         if phase != Phase::Closed {
@@ -1085,17 +1300,35 @@ impl ClientSession {
     }
 
     /// The bytes that send `msg` to the server. A message that does not
-    /// belong in this phase is [`Error::Phase`], and a security type the
-    /// server did not offer is [`Error::NotOffered`]; nothing changes.
+    /// belong in this phase is [`Error::Phase`], a security type the
+    /// server did not offer is [`Error::NotOffered`], SetPixelFormat while
+    /// an update request is outstanding or an update is being read is
+    /// [`Error::Outstanding`], and one that cannot be written is the error
+    /// [`ClientMessage::to_bytes`] gives. On any error nothing changes.
     pub fn send(&mut self, msg: &ClientMessage) -> Result<Vec<u8>, Error> {
+        let format_change = matches!(msg, ClientMessage::SetPixelFormat(_));
+        // The RFB Protocol, section 7.4.1: with a request outstanding, the
+        // client could not tell which format the next update is in.
+        if format_change && self.state.phase == Phase::Normal && (self.state.requested || self.update_started()) {
+            return Err(Error::Outstanding);
+        }
         let mut next = self.state.clone();
         next.client_step(msg)?;
+        let bytes = msg.to_bytes()?;
+        if format_change || next.phase != self.state.phase {
+            // The server's bytes now split another way. No update is in
+            // progress, so `partial` holds nothing.
+            self.reader.need = 0;
+        }
         self.state = next;
-        // A new pixel format changes how an update is read, so read it
-        // again from the start.
-        self.reader.need = 0;
-        self.partial = None;
-        Ok(msg.to_bytes())
+        Ok(bytes)
+    }
+
+    /// Whether the bytes held start a framebuffer update.
+    fn update_started(&self) -> bool {
+        self.partial.is_some()
+            || (self.state.phase == Phase::Normal
+                && self.reader.buf.get(self.reader.start) == Some(&server_type::FRAMEBUFFER_UPDATE))
     }
 
     /// The phase the connection is in.
@@ -1115,8 +1348,9 @@ impl ClientSession {
     }
 
     /// The pixel format updates come in: from ServerInit, then from the
-    /// client's last SetPixelFormat. A server may send updates in the old
-    /// format until it has read the new one; this session assumes it has.
+    /// client's last SetPixelFormat. The client sends that only when no
+    /// update request is outstanding, so the next update is in the new
+    /// format.
     pub fn pixel_format(&self) -> PixelFormat {
         self.state.format
     }
@@ -1216,10 +1450,13 @@ fn text(c: &mut Cur<'_>) -> Result<Vec<u8>, Stop> {
     Ok(c.take(n)?.to_vec())
 }
 
-fn put_text(out: &mut Vec<u8>, text: &[u8]) {
-    let text = &text[..text.len().min(MAX_TEXT)];
+fn put_text(out: &mut Vec<u8>, text: &[u8]) -> Result<(), Error> {
+    if text.len() > MAX_TEXT {
+        return Err(Error::TooLong);
+    }
     out.extend_from_slice(&(text.len() as u32).to_be_bytes());
     out.extend_from_slice(text);
+    Ok(())
 }
 
 /// The bytes of a width by height block of pixels in `format`.
@@ -1241,7 +1478,11 @@ fn client_normal(c: &mut Cur<'_>) -> Result<ClientMessage, Stop> {
     Ok(match c.u8()? {
         client_type::SET_PIXEL_FORMAT => {
             c.take(3)?;
-            ClientMessage::SetPixelFormat(PixelFormat::parse(&c.array()?))
+            let format = PixelFormat::parse(&c.array()?);
+            if !format.is_valid() {
+                return Err(Stop::Fail(Error::PixelFormat));
+            }
+            ClientMessage::SetPixelFormat(format)
         }
         client_type::SET_ENCODINGS => {
             c.take(1)?;
@@ -1327,6 +1568,10 @@ fn rectangles(
     while p.rects.len() < p.count {
         let at = c.pos;
         match rectangle(c, format) {
+            // RFC 6143, section 7.8.2: DesktopSize comes last.
+            Ok(r) if r.contents == Contents::DesktopSize && p.rects.len() + 1 < p.count => {
+                return Err(Stop::Fail(Error::Rectangle));
+            }
             Ok(r) => p.rects.push(r),
             Err(Stop::Need(n)) => {
                 p.pos = at;
@@ -1403,12 +1648,13 @@ mod tests {
             Phase::ClientVersion => ClientMessage::Version(version),
             Phase::SecurityChoice => {
                 let o = s.offered();
+                // Type 0 is not a type, and cannot be picked.
                 let t = if vnc && o.contains(&2) {
                     2
                 } else if o.contains(&1) {
                     1
                 } else {
-                    o[0]
+                    *o.iter().find(|&&t| t != security::INVALID)?
                 };
                 ClientMessage::SecurityType(t)
             }
@@ -1510,7 +1756,7 @@ mod tests {
         assert_eq!(s.phase(), c.phase());
         if s.phase() == Phase::ClientInit {
             to_server(&mut s, &mut c, ClientMessage::ClientInit { shared: false });
-            let init = ServerInit { width: 2, height: 2, format: PixelFormat::TRUE_COLOR_32, name: b"desk".to_vec() };
+            let init = ServerInit { width: 1024, height: 768, format: PixelFormat::TRUE_COLOR_32, name: b"desk".to_vec() };
             to_client(&mut s, &mut c, ServerMessage::ServerInit(init));
             assert_eq!(s.phase(), Phase::Normal);
             assert_eq!(c.phase(), Phase::Normal);
@@ -1519,10 +1765,18 @@ mod tests {
     }
 
     fn sample_client_messages() -> Vec<ClientMessage> {
-        let mut f = PixelFormat::TRUE_COLOR_32;
-        f.bits_per_pixel = 16;
-        f.depth = 16;
-        f.big_endian = true;
+        let f = PixelFormat {
+            bits_per_pixel: 16,
+            depth: 16,
+            big_endian: true,
+            true_color: true,
+            red_max: 31,
+            green_max: 63,
+            blue_max: 31,
+            red_shift: 11,
+            green_shift: 5,
+            blue_shift: 0,
+        };
         vec![
             ClientMessage::SetPixelFormat(f),
             ClientMessage::SetEncodings(vec![encoding::COPY_RECT, encoding::RAW, encoding::CURSOR, encoding::DESKTOP_SIZE]),
@@ -1548,8 +1802,8 @@ mod tests {
                     height: 1,
                     contents: Contents::Cursor { pixels: vec![0xaa; 36], mask: vec![0xff, 0x80] },
                 },
-                Rectangle { x: 0, y: 0, width: 800, height: 600, contents: Contents::DesktopSize },
                 Rectangle { x: 0, y: 0, width: 0, height: 0, contents: Contents::Raw(vec![]) },
+                Rectangle { x: 0, y: 0, width: 800, height: 600, contents: Contents::DesktopSize },
             ]),
             ServerMessage::FramebufferUpdate(vec![]),
             ServerMessage::SetColorMapEntries {
@@ -1575,9 +1829,16 @@ mod tests {
         assert_eq!(Version::parse(b"G"), Err(Error::Version));
         assert_eq!(Version::parse(b"RFB 0x"), Err(Error::Version));
         assert_eq!(Version::parse(b"RFB 003.008\r"), Err(Error::Version));
-        // The writer clamps what three digits cannot hold.
+        // The line clamps what three digits cannot hold, and the message
+        // writers refuse it.
         let big = Version { major: 1000, minor: 65535 };
         assert_eq!(Version::parse(&big.to_bytes()), Ok(Some((Version { major: 999, minor: 999 }, 12))));
+        assert_eq!(ClientMessage::Version(big).to_bytes(), Err(Error::Unwritable));
+        let f = PixelFormat::TRUE_COLOR_32;
+        assert_eq!(ServerMessage::Version(big).to_bytes(Dialect::V3_8, &f), Err(Error::Unwritable));
+        let mut s = ServerSession::new();
+        assert_eq!(s.send(&ServerMessage::Version(big)), Err(Error::Unwritable));
+        assert_eq!(s.phase(), Phase::ServerVersion);
         // Dialects, as RFC 6143 says: anything else is 3.3.
         assert_eq!(Version::V3_8.dialect(), Dialect::V3_8);
         assert_eq!(Version::V3_7.dialect(), Dialect::V3_7);
@@ -1618,7 +1879,12 @@ mod tests {
         // A 3.7 failure has no reason on the wire.
         let (s, c) = converse(Version::V3_7, ServerMessage::SecurityTypes(vec![2]), Some(2), Some(ServerMessage::SecurityFailed(vec![])));
         assert_eq!((s.phase(), c.phase()), (Phase::Closed, Phase::Closed));
-        assert_eq!(ServerMessage::SecurityFailed(b"x".to_vec()).to_bytes(Dialect::V3_7, &PixelFormat::TRUE_COLOR_32), Ok(vec![0, 0, 0, 1]));
+        assert_eq!(ServerMessage::SecurityFailed(vec![]).to_bytes(Dialect::V3_7, &PixelFormat::TRUE_COLOR_32), Ok(vec![0, 0, 0, 1]));
+        // A reason the wire cannot carry is refused, not dropped.
+        assert_eq!(
+            ServerMessage::SecurityFailed(b"x".to_vec()).to_bytes(Dialect::V3_7, &PixelFormat::TRUE_COLOR_32),
+            Err(Error::Unwritable)
+        );
     }
 
     #[test]
@@ -1878,6 +2144,18 @@ mod tests {
         odd[3] = 1;
         odd[13..].copy_from_slice(&[0, 0, 0]);
         assert_eq!(p.to_bytes(), odd);
+        // RFC 6143, section 7.4.
+        assert!(f.is_valid());
+        assert!(!p.is_valid());
+        let rgb565 = PixelFormat { bits_per_pixel: 16, depth: 16, red_max: 31, green_max: 63, blue_max: 31, red_shift: 11, green_shift: 5, blue_shift: 0, ..f };
+        assert!(rgb565.is_valid());
+        assert!(!PixelFormat { red_shift: 12, ..rgb565 }.is_valid());
+        assert!(!PixelFormat { red_max: 30, ..rgb565 }.is_valid());
+        assert!(!PixelFormat { depth: 17, ..rgb565 }.is_valid());
+        assert!(!PixelFormat { bits_per_pixel: 24, ..f }.is_valid());
+        assert!(PixelFormat { red_max: 65535, red_shift: 16, green_max: 0, blue_max: 0, ..f }.is_valid());
+        // A color map format's maximums and shifts are not used.
+        assert!(PixelFormat { bits_per_pixel: 8, depth: 8, true_color: false, red_shift: 255, red_max: 250, ..f }.is_valid());
     }
 
     #[test]
@@ -1909,7 +2187,7 @@ mod tests {
     #[test]
     fn client_messages_round_trip_and_truncate() {
         for m in sample_client_messages() {
-            let bytes = m.to_bytes();
+            let bytes = m.to_bytes().unwrap();
             assert_eq!(ClientMessage::parse(&bytes), Ok(Some((m.clone(), bytes.len()))));
             for n in 0..bytes.len() {
                 assert_eq!(ClientMessage::parse(&bytes[..n]), Ok(None), "{m:?} cut to {n}");
@@ -1923,9 +2201,9 @@ mod tests {
             assert_eq!(s.next_message(), Some(Ok(m)));
         }
         // Handshake messages are fixed bytes.
-        assert_eq!(ClientMessage::SecurityType(2).to_bytes(), [2]);
-        assert_eq!(ClientMessage::VncResponse([5; 16]).to_bytes(), [5; 16]);
-        assert_eq!(ClientMessage::ClientInit { shared: false }.to_bytes(), [0]);
+        assert_eq!(ClientMessage::SecurityType(2).to_bytes(), Ok(vec![2]));
+        assert_eq!(ClientMessage::VncResponse([5; 16]).to_bytes(), Ok(vec![5; 16]));
+        assert_eq!(ClientMessage::ClientInit { shared: false }.to_bytes(), Ok(vec![0]));
         assert!(ClientMessage::ClientInit { shared: false }.is_handshake());
         assert!(!ClientMessage::ClientCutText(vec![]).is_handshake());
     }
@@ -2033,19 +2311,29 @@ mod tests {
         bad.bits_per_pixel = 16;
         let both = ServerMessage::FramebufferUpdate(vec![half.clone(), half]);
         assert_eq!(both.to_bytes(Dialect::V3_8, &bad), Err(Error::TooLong));
-        // Long text and lists are cut and still read back.
-        let text = ClientMessage::ClientCutText(vec![b'a'; MAX_TEXT + 5]).to_bytes();
-        let Ok(Some((ClientMessage::ClientCutText(t), _))) = ClientMessage::parse(&text) else { panic!() };
-        assert_eq!(t.len(), MAX_TEXT);
-        let enc = ClientMessage::SetEncodings(vec![0; MAX_ITEMS + 3]).to_bytes();
-        let Ok(Some((ClientMessage::SetEncodings(e), _))) = ClientMessage::parse(&enc) else { panic!() };
-        assert_eq!(e.len(), MAX_ITEMS);
-        let colors = ServerMessage::SetColorMapEntries { first: 0, colors: vec![Color { red: 1, green: 1, blue: 1 }; MAX_ITEMS + 1] };
-        let b = colors.to_bytes(Dialect::V3_8, &f).unwrap();
-        let Ok(Some((ServerMessage::SetColorMapEntries { colors, .. }, _))) = ServerMessage::parse(&b, &f) else { panic!() };
-        assert_eq!(colors.len(), MAX_ITEMS);
+        // Long text and lists are refused, not cut, so what is written
+        // reads back the same.
+        assert_eq!(ClientMessage::ClientCutText(vec![b'a'; MAX_TEXT + 1]).to_bytes(), Err(Error::TooLong));
+        let longest = ClientMessage::ClientCutText(vec![b'a'; MAX_TEXT]);
+        let b = longest.to_bytes().unwrap();
+        assert_eq!(ClientMessage::parse(&b), Ok(Some((longest, b.len()))));
+        assert_eq!(ClientMessage::SetEncodings(vec![0; MAX_ITEMS + 1]).to_bytes(), Err(Error::Unwritable));
+        let most = ClientMessage::SetEncodings(vec![0; MAX_ITEMS]);
+        let b = most.to_bytes().unwrap();
+        assert_eq!(ClientMessage::parse(&b), Ok(Some((most, b.len()))));
+        let colors = |n| ServerMessage::SetColorMapEntries { first: 0, colors: vec![Color { red: 1, green: 1, blue: 1 }; n] };
+        assert_eq!(colors(MAX_ITEMS + 1).to_bytes(Dialect::V3_8, &f), Err(Error::Unwritable));
+        let b = colors(MAX_ITEMS).to_bytes(Dialect::V3_8, &f).unwrap();
+        assert_eq!(ServerMessage::parse(&b, &f), Ok(Some((colors(MAX_ITEMS), b.len()))));
         let name = ServerMessage::ServerInit(ServerInit { width: 1, height: 1, format: f, name: vec![0; MAX_TEXT + 1] });
-        assert_eq!(name.to_bytes(Dialect::V3_8, &f).unwrap().len(), 24 + MAX_TEXT);
+        assert_eq!(name.to_bytes(Dialect::V3_8, &f), Err(Error::TooLong));
+        for long in [
+            ServerMessage::ServerCutText(vec![0; MAX_TEXT + 1]),
+            ServerMessage::SecurityFailure(vec![0; MAX_TEXT + 1]),
+            ServerMessage::SecurityFailed(vec![0; MAX_TEXT + 1]),
+        ] {
+            assert_eq!(long.to_bytes(Dialect::V3_8, &f), Err(Error::TooLong));
+        }
     }
 
     #[test]
@@ -2056,7 +2344,7 @@ mod tests {
         stream.push(2);
         stream.extend_from_slice(&[9; 16]);
         stream.push(1);
-        stream.extend_from_slice(&ClientMessage::KeyEvent { down: true, key: 65 }.to_bytes());
+        stream.extend_from_slice(&ClientMessage::KeyEvent { down: true, key: 65 }.to_bytes().unwrap());
         let whole = drive_server(true, [&stream[..]]);
         assert_eq!(whole.len(), 5);
         assert!(whole.iter().all(|m| m.is_ok()));
@@ -2103,7 +2391,7 @@ mod tests {
 
     #[test]
     fn many_small_messages_in_linear_time() {
-        let one = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }.to_bytes();
+        let one = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }.to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
         let started = std::time::Instant::now();
         let (mut s, _) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
@@ -2116,6 +2404,280 @@ mod tests {
         assert_eq!(n, 200_000);
         assert_eq!(s.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
+    /// A server and a client past the handshake, with a 1024 by 768
+    /// framebuffer.
+    fn normal_pair() -> (ServerSession, ClientSession) {
+        converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk))
+    }
+
+    /// Passes a client message to the server through bytes.
+    fn client_says(s: &mut ServerSession, c: &mut ClientSession, m: ClientMessage) {
+        s.feed(&c.send(&m).unwrap());
+        assert_eq!(s.next_message(), Some(Ok(m)));
+    }
+
+    /// Passes a server message to the client through bytes.
+    fn server_says(s: &mut ServerSession, c: &mut ClientSession, m: ServerMessage) {
+        c.feed(&s.send(&m).unwrap());
+        assert_eq!(c.next_message(), Some(Ok(m)));
+    }
+
+    #[test]
+    fn feed_bounds_bytes_in_turn() {
+        // A world that feeds in its peer's turn and never takes a message
+        // out still holds no more than MAX_BUFFERED bytes.
+        let (_, mut c) = normal_pair();
+        let chunk = vec![0u8; 1 << 20];
+        for _ in 0..MAX_BUFFERED / chunk.len() {
+            c.feed(&chunk);
+        }
+        assert_eq!(c.buffered(), MAX_BUFFERED);
+        c.feed(&[0]);
+        assert_eq!(c.buffered(), 0);
+        assert_eq!(c.next_message(), Some(Err(Error::TooLong)));
+        // One feed past the limit is refused before it is copied.
+        let (mut s, _) = normal_pair();
+        s.feed(&vec![0; MAX_BUFFERED + 1]);
+        assert_eq!(s.buffered(), 0);
+        assert_eq!(s.next_message(), Some(Err(Error::TooLong)));
+        // And so is one feed past MAX_PENDING before the peer's turn.
+        let mut s = ServerSession::new();
+        s.feed(&vec![0; MAX_PENDING + 1]);
+        assert_eq!(s.buffered(), 0);
+        assert_eq!(s.next_message(), Some(Err(Error::OutOfTurn)));
+    }
+
+    #[test]
+    fn sends_between_feeds_keep_update_progress() {
+        // A client that sends pointer events while an update comes in does
+        // not read the update's rectangles over again.
+        let rects = vec![Rectangle { x: 0, y: 0, width: 1, height: 1, contents: Contents::Raw(vec![1, 2, 3, 4]) }; MAX_ITEMS];
+        let bytes = ServerMessage::FramebufferUpdate(rects).to_bytes(Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
+        let (_, mut c) = normal_pair();
+        let started = std::time::Instant::now();
+        c.feed(&bytes[..4]);
+        let mut got = 0;
+        for r in bytes[4..].chunks(16) {
+            c.feed(r);
+            match c.next_message() {
+                Some(m) => {
+                    m.unwrap();
+                    got += 1;
+                }
+                None => {
+                    c.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
+                }
+            }
+        }
+        assert_eq!(got, 1);
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn pixel_format_waits_for_outstanding_updates() {
+        // The RFB Protocol, section 7.4.1.
+        let f8 = PixelFormat {
+            bits_per_pixel: 8,
+            depth: 8,
+            big_endian: false,
+            true_color: true,
+            red_max: 7,
+            green_max: 7,
+            blue_max: 3,
+            red_shift: 0,
+            green_shift: 3,
+            blue_shift: 6,
+        };
+        let update = [0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd];
+        // An update half read keeps its format.
+        let (_, mut c) = normal_pair();
+        c.feed(&update[..18]);
+        assert_eq!(c.next_message(), None);
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)), Err(Error::Outstanding));
+        assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
+        c.feed(&update[18..]);
+        let Some(Ok(ServerMessage::FramebufferUpdate(r))) = c.next_message() else { panic!() };
+        assert_eq!(r[0].contents, Contents::Raw(vec![0xaa, 0xbb, 0xcc, 0xdd]));
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)).map(|b| b.len()), Ok(20));
+        // So does an update whose first byte alone has come.
+        let (_, mut c) = normal_pair();
+        c.feed(&update[..1]);
+        assert_eq!(c.next_message(), None);
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)), Err(Error::Outstanding));
+        // An outstanding request waits for its update.
+        let (_, mut c) = normal_pair();
+        c.send(&ClientMessage::FramebufferUpdateRequest { incremental: true, x: 0, y: 0, width: 1, height: 1 }).unwrap();
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(f8)), Err(Error::Outstanding));
+        c.feed(&update);
+        c.next_message().unwrap().unwrap();
+        c.send(&ClientMessage::SetPixelFormat(f8)).unwrap();
+        assert_eq!(c.pixel_format(), f8);
+        c.feed(&[0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0x5a]);
+        let Some(Ok(ServerMessage::FramebufferUpdate(r))) = c.next_message() else { panic!() };
+        assert_eq!(r[0].contents, Contents::Raw(vec![0x5a]));
+    }
+
+    #[test]
+    fn invalid_pixel_formats_are_refused() {
+        // RFC 6143, section 7.4.
+        let bad = PixelFormat { bits_per_pixel: 8, depth: 24, red_max: 250, red_shift: 255, ..PixelFormat::TRUE_COLOR_32 };
+        let mut b = vec![client_type::SET_PIXEL_FORMAT, 0, 0, 0];
+        b.extend_from_slice(&bad.to_bytes());
+        assert_eq!(ClientMessage::parse(&b), Err(Error::PixelFormat));
+        assert_eq!(ClientMessage::SetPixelFormat(bad).to_bytes(), Err(Error::PixelFormat));
+        let (mut s, mut c) = normal_pair();
+        assert_eq!(c.send(&ClientMessage::SetPixelFormat(bad)), Err(Error::PixelFormat));
+        assert_eq!(c.pixel_format(), PixelFormat::TRUE_COLOR_32);
+        s.feed(&b);
+        assert_eq!(s.next_message(), Some(Err(Error::PixelFormat)));
+        // A ServerInit in 24 bits per pixel is refused before the first
+        // update, on both sides.
+        let mut c = ClientSession::new();
+        c.feed(b"RFB 003.003\n");
+        c.next_message().unwrap().unwrap();
+        c.send(&ClientMessage::Version(Version::V3_3)).unwrap();
+        c.feed(&[0, 0, 0, 1]);
+        c.next_message().unwrap().unwrap();
+        c.send(&ClientMessage::ClientInit { shared: true }).unwrap();
+        let f24 = PixelFormat { bits_per_pixel: 24, ..PixelFormat::TRUE_COLOR_32 };
+        let init = ServerMessage::ServerInit(ServerInit { width: 1, height: 1, format: f24, name: vec![] });
+        assert_eq!(init.to_bytes(Dialect::V3_3, &f24), Err(Error::PixelFormat));
+        let mut bytes = vec![0, 1, 0, 1];
+        bytes.extend_from_slice(&f24.to_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        c.feed(&bytes);
+        assert_eq!(c.next_message(), Some(Err(Error::PixelFormat)));
+    }
+
+    #[test]
+    fn rectangles_stay_inside_the_framebuffer() {
+        let f = PixelFormat::TRUE_COLOR_32;
+        let (mut s, mut c) = converse(Version::V3_3, ServerMessage::SecurityType(1), None, None);
+        client_says(&mut s, &mut c, ClientMessage::SetEncodings(vec![encoding::COPY_RECT, encoding::DESKTOP_SIZE]));
+        let update = |rects| ServerMessage::FramebufferUpdate(rects);
+        let rect = |x, y, width, height, contents| Rectangle { x, y, width, height, contents };
+        let request = ClientMessage::FramebufferUpdateRequest { incremental: true, x: 0, y: 0, width: 1024, height: 768 };
+        client_says(&mut s, &mut c, request.clone());
+        for bad in [
+            update(vec![rect(1024, 0, 1, 1, Contents::Raw(vec![0; 4]))]),
+            update(vec![rect(0, 700, 1, 69, Contents::Raw(vec![0; 69 * 4]))]),
+            update(vec![rect(u16::MAX, 0, 2, 0, Contents::Raw(vec![]))]),
+            update(vec![rect(0, 0, 10, 10, Contents::CopyRect { src_x: 1020, src_y: 0 })]),
+        ] {
+            assert_eq!(s.send(&bad), Err(Error::Rectangle), "{bad:?}");
+            let mut c2 = c.clone();
+            c2.feed(&bad.to_bytes(Dialect::V3_8, &f).unwrap());
+            assert_eq!(c2.next_message(), Some(Err(Error::Rectangle)), "{bad:?}");
+        }
+        // The edges are inside, and the cursor's hot spot is not checked.
+        let good = update(vec![
+            rect(1023, 767, 1, 1, Contents::Raw(vec![0; 4])),
+            rect(1024, 768, 0, 0, Contents::Raw(vec![])),
+            rect(0, 0, 24, 8, Contents::CopyRect { src_x: 1000, src_y: 760 }),
+        ]);
+        c.feed(&s.send(&good).unwrap());
+        assert_eq!(c.next_message(), Some(Ok(good)));
+        // DesktopSize shrinks the framebuffer for the updates after it.
+        client_says(&mut s, &mut c, request);
+        let shrink = update(vec![rect(1000, 0, 8, 8, Contents::Raw(vec![0; 256])), rect(0, 0, 640, 480, Contents::DesktopSize)]);
+        c.feed(&s.send(&shrink).unwrap());
+        assert_eq!(c.next_message(), Some(Ok(shrink)));
+        client_says(&mut s, &mut c, ClientMessage::FramebufferUpdateRequest { incremental: true, x: 0, y: 0, width: 1, height: 1 });
+        let past = update(vec![rect(640, 0, 1, 1, Contents::Raw(vec![0; 4]))]);
+        assert_eq!(s.send(&past), Err(Error::Rectangle));
+        c.feed(&past.to_bytes(Dialect::V3_8, &f).unwrap());
+        assert_eq!(c.next_message(), Some(Err(Error::Rectangle)));
+    }
+
+    #[test]
+    fn desktop_size_comes_last() {
+        // RFC 6143, section 7.8.2.
+        let f = PixelFormat::TRUE_COLOR_32;
+        let early = vec![
+            Rectangle { x: 0, y: 0, width: 800, height: 600, contents: Contents::DesktopSize },
+            Rectangle { x: 0, y: 0, width: 1, height: 1, contents: Contents::Raw(vec![0; 4]) },
+        ];
+        assert_eq!(ServerMessage::FramebufferUpdate(early.clone()).to_bytes(Dialect::V3_8, &f), Err(Error::Rectangle));
+        let late: Vec<Rectangle> = early.into_iter().rev().collect();
+        let b = ServerMessage::FramebufferUpdate(late.clone()).to_bytes(Dialect::V3_8, &f).unwrap();
+        assert_eq!(ServerMessage::parse(&b, &f), Ok(Some((ServerMessage::FramebufferUpdate(late), b.len()))));
+        // The same bytes with the rectangles swapped do not read.
+        let mut swapped = b[..4].to_vec();
+        swapped.extend_from_slice(&b[4 + 16..]);
+        swapped.extend_from_slice(&b[4..4 + 16]);
+        assert_eq!(ServerMessage::parse(&swapped, &f), Err(Error::Rectangle));
+    }
+
+    #[test]
+    fn server_sends_only_what_the_client_asked_for() {
+        // RFC 6143, sections 7.5.2, 7.6.1 and 7.6.2, and The RFB Protocol,
+        // section 7.5.3, on CopyRect.
+        let (mut s, mut c) = normal_pair();
+        let raw = ServerMessage::FramebufferUpdate(vec![Rectangle { x: 0, y: 0, width: 1, height: 1, contents: Contents::Raw(vec![0; 4]) }]);
+        let copy = ServerMessage::FramebufferUpdate(vec![Rectangle { x: 0, y: 0, width: 1, height: 1, contents: Contents::CopyRect { src_x: 1, src_y: 1 } }]);
+        let cursor = ServerMessage::FramebufferUpdate(vec![Rectangle {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            contents: Contents::Cursor { pixels: vec![0; 4], mask: vec![0x80] },
+        }]);
+        let resize = ServerMessage::FramebufferUpdate(vec![Rectangle { x: 0, y: 0, width: 640, height: 480, contents: Contents::DesktopSize }]);
+        // No request yet.
+        assert_eq!(s.send(&raw), Err(Error::NotRequested));
+        assert_eq!(s.send(&ServerMessage::FramebufferUpdate(vec![])), Err(Error::NotRequested));
+        let full = ClientMessage::FramebufferUpdateRequest { incremental: false, x: 0, y: 0, width: 1024, height: 768 };
+        let incremental = ClientMessage::FramebufferUpdateRequest { incremental: true, x: 0, y: 0, width: 1024, height: 768 };
+        client_says(&mut s, &mut c, full.clone());
+        // Encodings the client did not list.
+        for m in [&copy, &cursor, &resize] {
+            assert_eq!(s.send(m), Err(Error::NotRequested), "{m:?}");
+        }
+        client_says(&mut s, &mut c, ClientMessage::SetEncodings(vec![encoding::COPY_RECT, encoding::CURSOR, encoding::DESKTOP_SIZE]));
+        // Listed, but a request that was not incremental rules out CopyRect.
+        assert_eq!(s.send(&copy), Err(Error::NotRequested));
+        server_says(&mut s, &mut c, cursor);
+        // That update answered the request.
+        assert_eq!(s.send(&raw), Err(Error::NotRequested));
+        client_says(&mut s, &mut c, incremental.clone());
+        client_says(&mut s, &mut c, incremental);
+        server_says(&mut s, &mut c, copy);
+        assert_eq!(s.send(&raw), Err(Error::NotRequested));
+        client_says(&mut s, &mut c, full);
+        server_says(&mut s, &mut c, resize);
+        // Color map entries only for a color map format.
+        let colors = ServerMessage::SetColorMapEntries { first: 0, colors: vec![Color { red: 1, green: 2, blue: 3 }] };
+        assert_eq!(s.send(&colors), Err(Error::NotRequested));
+        let map = PixelFormat { bits_per_pixel: 8, depth: 8, true_color: false, ..PixelFormat::TRUE_COLOR_32 };
+        client_says(&mut s, &mut c, ClientMessage::SetPixelFormat(map));
+        server_says(&mut s, &mut c, colors);
+        // Bell and cut text need no request.
+        server_says(&mut s, &mut c, ServerMessage::Bell);
+        server_says(&mut s, &mut c, ServerMessage::ServerCutText(b"x".to_vec()));
+    }
+
+    #[test]
+    fn security_type_zero_is_refused() {
+        // RFC 6143, section 7.1.2: 0 is Invalid.
+        let mut s = ServerSession::new();
+        s.send(&ServerMessage::Version(Version::V3_8)).unwrap();
+        s.feed(b"RFB 003.008\n");
+        s.next_message().unwrap().unwrap();
+        assert_eq!(s.send(&ServerMessage::SecurityTypes(vec![0])), Err(Error::Unwritable));
+        assert_eq!(s.send(&ServerMessage::SecurityTypes(vec![1, 0])), Err(Error::Unwritable));
+        assert_eq!(s.phase(), Phase::SecurityOffer);
+        // A client world cannot pick 0, even from a peer that offered it.
+        let mut c = ClientSession::new();
+        c.feed(b"RFB 003.008\n");
+        c.next_message().unwrap().unwrap();
+        c.send(&ClientMessage::Version(Version::V3_8)).unwrap();
+        c.feed(&[2, 0, 1]);
+        assert_eq!(c.next_message(), Some(Ok(ServerMessage::SecurityTypes(vec![0, 1]))));
+        assert_eq!(c.send(&ClientMessage::SecurityType(0)), Err(Error::Unwritable));
+        assert_eq!(c.phase(), Phase::SecurityChoice);
+        assert_eq!(c.send(&ClientMessage::SecurityType(1)), Ok(vec![1]));
     }
 
     /// A stream that starts with some of a valid handshake and goes on at
@@ -2152,7 +2714,7 @@ mod tests {
             for m in whole.iter().flatten() {
                 if !m.is_handshake() {
                     normal += 1;
-                    let b = m.to_bytes();
+                    let b = m.to_bytes().unwrap();
                     assert_eq!(ClientMessage::parse(&b), Ok(Some((m.clone(), b.len()))));
                 }
             }
@@ -2167,7 +2729,7 @@ mod tests {
             let raw = rng.bytes(len);
             let _ = Version::parse(&raw);
             if let Ok(Some((m, _))) = ClientMessage::parse(&raw) {
-                assert_eq!(ClientMessage::parse(&m.to_bytes()).unwrap().unwrap().0, m);
+                assert_eq!(ClientMessage::parse(&m.to_bytes().unwrap()).unwrap().unwrap().0, m);
             }
             let mut f = PixelFormat::TRUE_COLOR_32;
             f.bits_per_pixel = [8, 16, 32, 24][i % 4];
@@ -2201,15 +2763,28 @@ mod tests {
                     height: rng.next() as u16,
                 },
             };
-            let b = m.to_bytes();
-            assert_eq!(ClientMessage::parse(&b), Ok(Some((m, b.len()))));
+            match m {
+                ClientMessage::SetPixelFormat(f) if !f.is_valid() => {
+                    assert_eq!(m.to_bytes(), Err(Error::PixelFormat));
+                    let mut b = vec![client_type::SET_PIXEL_FORMAT, 0, 0, 0];
+                    b.extend_from_slice(&f.to_bytes());
+                    assert_eq!(ClientMessage::parse(&b), Err(Error::PixelFormat));
+                }
+                _ => {
+                    let b = m.to_bytes().unwrap();
+                    assert_eq!(ClientMessage::parse(&b), Ok(Some((m, b.len()))));
+                }
+            }
             let f = [PixelFormat { bits_per_pixel: 8, ..PixelFormat::TRUE_COLOR_32 }, PixelFormat::TRUE_COLOR_32][rng.below(2) as usize];
             let bpp = f.bytes_per_pixel().unwrap();
-            let rects = (0..rng.below(4))
-                .map(|_| {
+            let count = rng.below(4);
+            let rects = (0..count)
+                .map(|i| {
                     let (width, height) = (rng.below(9) as u16, rng.below(9) as u16);
                     let n = usize::from(width) * usize::from(height);
-                    let contents = match rng.below(4) {
+                    // DesktopSize only as the last rectangle.
+                    let kinds = if i + 1 == count { 4 } else { 3 };
+                    let contents = match rng.below(kinds) {
                         0 => Contents::Raw(rng.bytes(n * bpp)),
                         1 => Contents::CopyRect { src_x: rng.next() as u16, src_y: rng.next() as u16 },
                         2 => Contents::Cursor {

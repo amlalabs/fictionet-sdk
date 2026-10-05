@@ -23,7 +23,15 @@
 //! decoder skips it and goes on to the next line, as real servers do. The
 //! error says which reply a server sends: a bad line ([`CommandError`]) is
 //! answered with [`code::SYNTAX_ERROR`] (500), and a bad argument
-//! ([`ArgumentError`]) with [`code::ARGUMENT_ERROR`] (501).
+//! ([`ArgumentError`]) with [`code::ARGUMENT_ERROR`] (501). A decoder holds
+//! at most [`MAX_BUFFERED`] bytes that have not been taken out, and its
+//! `feed` says how many bytes it took.
+//!
+//! A command writer refuses ([`WriteError`]) rather than send a line that
+//! would read back as a different command. A pathname may hold a carriage
+//! return: RFC 2640 sends it as CR NUL, and a reader turns CR NUL back into
+//! CR. A command reader also drops Telnet commands, such as the interrupt
+//! and synch that clients send before `ABOR`.
 //!
 //! ```
 //! use fictionet::stdlib::ftp::{code, CommandDecoder, Reply, ReplyDecoder, Request};
@@ -31,7 +39,8 @@
 //!
 //! // A server answers three commands.
 //! let mut commands = CommandDecoder::new();
-//! commands.feed(b"USER anonymous\r\nPASV\r\nEPRT |1|10.0.0.5|6275|\r\n");
+//! let stream = b"USER anonymous\r\nPASV\r\nEPRT |1|10.0.0.5|6275|\r\n";
+//! assert_eq!(commands.feed(stream), stream.len());
 //! let mut out = Vec::new();
 //! while let Some(line) = commands.next_command() {
 //!     let reply = match line.map(|c| Request::from_command(&c)) {
@@ -53,7 +62,8 @@
 //!
 //! // A client reads a multi-line reply to FEAT.
 //! let mut replies = ReplyDecoder::new();
-//! replies.feed(b"211-Extensions supported:\r\n EPSV\r\n MLST size*;modify*;\r\n211 End\r\n");
+//! let stream = b"211-Extensions supported:\r\n EPSV\r\n MLST size*;modify*;\r\n211 End\r\n";
+//! assert_eq!(replies.feed(stream), stream.len());
 //! let reply = replies.next_reply().unwrap().unwrap();
 //! let features = reply.features().unwrap();
 //! assert_eq!(features.len(), 2);
@@ -61,6 +71,7 @@
 //! assert_eq!(features[1].params.as_deref(), Some("size*;modify*;"));
 //! ```
 
+use std::borrow::Cow;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::num::NonZeroU8;
 
@@ -79,6 +90,9 @@ pub const MAX_REPLY_LINES: usize = 1024;
 /// The most features one `FEAT` reply may list: every line but the first
 /// and the last.
 pub const MAX_FEATURES: usize = MAX_REPLY_LINES - 2;
+/// The most bytes a decoder holds that have not been taken out. A `feed`
+/// that would hold more takes only part of its bytes, and says how many.
+pub const MAX_BUFFERED: usize = 16 * MAX_LINE;
 
 /// The longest line's content, without its CRLF.
 const MAX_CONTENT: usize = MAX_LINE - 2;
@@ -96,7 +110,8 @@ pub struct Command {
     pub verb: String,
     /// Everything after the space that follows the verb, or `None` if no
     /// space follows it. `RETR` has no argument, and `RETR ` has an empty
-    /// one.
+    /// one. It holds a CR where the line held CR NUL, and a LF only right
+    /// after such a CR (RFC 2640, section 3.1).
     pub arg: Option<String>,
 }
 
@@ -111,7 +126,9 @@ pub enum CommandError {
     /// The line did not start with one to four letters followed by a space
     /// or the end of the line.
     Verb,
-    /// The line was not UTF-8, or held a carriage return or a NUL byte.
+    /// The line was not UTF-8 once Telnet commands were dropped, held a NUL
+    /// or a carriage return other than as CR NUL, or ended inside a Telnet
+    /// command.
     Text,
 }
 
@@ -121,7 +138,7 @@ impl std::fmt::Display for CommandError {
             CommandError::LineTooLong => "command line too long",
             CommandError::Empty => "empty command line",
             CommandError::Verb => "command verb is not one to four letters",
-            CommandError::Text => "command line is not UTF-8 text without CR or NUL",
+            CommandError::Text => "command line is not UTF-8 text without a bare CR or NUL",
         })
     }
 }
@@ -134,12 +151,15 @@ impl Command {
         Command { verb: verb.to_string(), arg: arg.map(str::to_string) }
     }
 
-    /// Reads one command line, without its line ending.
+    /// Reads one command line, without its line ending. Telnet commands in
+    /// it, such as `IAC IP` and `IAC DM`, are dropped, and CR NUL is read
+    /// as CR.
     pub fn parse(line: &[u8]) -> Result<Command, CommandError> {
         if line.len() > MAX_CONTENT {
             return Err(CommandError::LineTooLong);
         }
-        let line = text(line).ok_or(CommandError::Text)?;
+        let line = command_text(line).ok_or(CommandError::Text)?;
+        let line = line.as_str();
         if line.is_empty() {
             return Err(CommandError::Empty);
         }
@@ -153,31 +173,83 @@ impl Command {
         Ok(Command { verb: verb.to_ascii_uppercase(), arg: arg.map(str::to_string) })
     }
 
-    /// The command line's bytes, ending in CRLF. The verb keeps only its
-    /// first four letters, in upper case, and a verb with none becomes
-    /// `NOOP`. The argument loses any CR, LF and NUL, and is cut so the
-    /// line fits in [`MAX_LINE`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut verb: String = self
-            .verb
-            .chars()
-            .filter(char::is_ascii_alphabetic)
-            .take(MAX_VERB)
-            .map(|c| c.to_ascii_uppercase())
-            .collect();
-        if verb.is_empty() {
-            verb.push_str("NOOP");
-        }
-        let mut out = verb.into_bytes();
-        if let Some(arg) = &self.arg {
-            let arg = clean(arg);
-            let room = MAX_CONTENT - out.len() - 1;
-            out.push(b' ');
-            out.extend_from_slice(cut(&arg, room).as_bytes());
-        }
-        out.extend_from_slice(b"\r\n");
-        out
+    /// The command line's bytes, ending in CRLF, with the verb in upper
+    /// case and each CR in the argument sent as CR NUL. It fails if the
+    /// verb is not one to four ASCII letters, if the argument holds a NUL
+    /// or a LF that does not follow a CR, or if the line would not fit in
+    /// [`MAX_LINE`]. What it writes reads back as the same command.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, WriteError> {
+        write_command(&self.verb, self.arg.as_deref())
     }
+}
+
+/// Why a command could not be written. A writer refuses rather than send
+/// a line that reads back as something else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The verb was not one to four ASCII letters.
+    Verb,
+    /// The argument held a NUL, or a LF that does not follow a CR. A line
+    /// can carry neither.
+    Text,
+    /// The line would be longer than [`MAX_LINE`].
+    LineTooLong,
+    /// The request's argument does not fit its verb, so a server would not
+    /// read it back as this request.
+    Argument(ArgumentError),
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::Verb => f.write_str("command verb is not one to four letters"),
+            WriteError::Text => f.write_str("argument holds a NUL or a LF not after a CR"),
+            WriteError::LineTooLong => f.write_str("command line too long"),
+            WriteError::Argument(e) => write!(f, "argument does not fit the verb: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Writes `verb` and `arg` as a command line, checking them first so
+/// that nothing large is copied before the checks pass.
+fn write_command(verb: &str, arg: Option<&str>) -> Result<Vec<u8>, WriteError> {
+    if verb.is_empty() || verb.len() > MAX_VERB || !verb.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return Err(WriteError::Verb);
+    }
+    let mut len = verb.len() + 2;
+    if let Some(arg) = arg {
+        let b = arg.as_bytes();
+        if b.len() > MAX_LINE {
+            return Err(WriteError::LineTooLong);
+        }
+        for (i, &c) in b.iter().enumerate() {
+            match c {
+                0 => return Err(WriteError::Text),
+                b'\n' if i == 0 || b[i - 1] != b'\r' => return Err(WriteError::Text),
+                b'\r' => len += 1,
+                _ => {}
+            }
+        }
+        len += 1 + b.len();
+    }
+    if len > MAX_LINE {
+        return Err(WriteError::LineTooLong);
+    }
+    let mut out = Vec::with_capacity(len);
+    out.extend(verb.bytes().map(|b| b.to_ascii_uppercase()));
+    if let Some(arg) = arg {
+        out.push(b' ');
+        for &c in arg.as_bytes() {
+            out.push(c);
+            if c == b'\r' {
+                out.push(0);
+            }
+        }
+    }
+    out.extend_from_slice(b"\r\n");
+    Ok(out)
 }
 
 /// The representation type that `TYPE` sets (RFC 959, section 3.1.1).
@@ -273,10 +345,13 @@ pub enum Request {
     Stou,
     /// `APPE`: append to this file.
     Appe(String),
-    /// `ALLO`: set aside this much space, as written.
+    /// `ALLO`: set aside this much space, as written: a decimal number,
+    /// then optionally ` R ` and a record or page size (RFC 959, section
+    /// 5.3.2).
     Allo(String),
-    /// `REST`: start the next transfer at this marker. In stream mode it
-    /// is a byte offset (RFC 3659, section 5).
+    /// `REST`: start the next transfer at this marker, of printable ASCII
+    /// characters other than space. In stream mode it is a byte offset
+    /// (RFC 3659, section 5).
     Rest(String),
     /// `RNFR`: rename this file. `RNTO` follows.
     Rnfr(String),
@@ -314,7 +389,8 @@ pub enum Request {
     Epsv(Option<EpsvArg>),
     /// `FEAT`: list the extensions the server supports.
     Feat,
-    /// `OPTS`: set options for a command, as written.
+    /// `OPTS`: set options for a command, as written. It starts with the
+    /// command's name, of printable ASCII characters (RFC 2389, section 4).
     Opts(String),
     /// `MDTM`: say when this file was last changed.
     Mdtm(String),
@@ -396,8 +472,8 @@ impl Request {
             "STOR" => Request::Stor(need()?),
             "STOU" => none(Request::Stou)?,
             "APPE" => Request::Appe(need()?),
-            "ALLO" => Request::Allo(need()?),
-            "REST" => Request::Rest(need()?),
+            "ALLO" => Request::Allo(need().and_then(|a| if allo_ok(&a) { Ok(a) } else { Err(E::Invalid) })?),
+            "REST" => Request::Rest(need().and_then(|a| if rest_ok(&a) { Ok(a) } else { Err(E::Invalid) })?),
             "RNFR" => Request::Rnfr(need()?),
             "RNTO" => Request::Rnto(need()?),
             "ABOR" => none(Request::Abor)?,
@@ -421,7 +497,7 @@ impl Request {
                 }
             }),
             "FEAT" => none(Request::Feat)?,
-            "OPTS" => Request::Opts(need()?),
+            "OPTS" => Request::Opts(need().and_then(|a| if opts_ok(&a) { Ok(a) } else { Err(E::Invalid) })?),
             "MDTM" => Request::Mdtm(need()?),
             "SIZE" => Request::Size(need()?),
             "MLST" => Request::Mlst(maybe()),
@@ -433,77 +509,123 @@ impl Request {
     /// The command that sends this request, for a world that plays a
     /// client. Aliases such as `XPWD` are written as their RFC 959 verbs.
     pub fn to_command(&self) -> Command {
-        let (verb, arg): (&str, Option<String>) = match self {
-            Request::User(a) => ("USER", Some(a.clone())),
-            Request::Pass(a) => ("PASS", Some(a.clone())),
-            Request::Acct(a) => ("ACCT", Some(a.clone())),
-            Request::Cwd(a) => ("CWD", Some(a.clone())),
+        let (verb, arg) = self.parts();
+        Command { verb: verb.to_string(), arg: arg.map(Cow::into_owned) }
+    }
+
+    /// The verb and argument of [`to_command`](Self::to_command), without
+    /// copying the argument.
+    fn parts(&self) -> (&str, Option<Cow<'_, str>>) {
+        fn b(a: &str) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed(a))
+        }
+        fn opt(a: &Option<String>) -> Option<Cow<'_, str>> {
+            a.as_deref().map(Cow::Borrowed)
+        }
+        let fixed = |a: &'static str| Some(Cow::Borrowed(a));
+        match self {
+            Request::User(a) => ("USER", b(a)),
+            Request::Pass(a) => ("PASS", b(a)),
+            Request::Acct(a) => ("ACCT", b(a)),
+            Request::Cwd(a) => ("CWD", b(a)),
             Request::Cdup => ("CDUP", None),
-            Request::Smnt(a) => ("SMNT", Some(a.clone())),
+            Request::Smnt(a) => ("SMNT", b(a)),
             Request::Rein => ("REIN", None),
             Request::Quit => ("QUIT", None),
-            Request::Port(addr) => ("PORT", Some(write_port(*addr))),
+            Request::Port(addr) => ("PORT", Some(Cow::Owned(write_port(*addr)))),
             Request::Pasv => ("PASV", None),
-            Request::Type(t) => ("TYPE", Some(write_type(*t))),
-            Request::Stru(s) => {
-                let s = match s {
+            Request::Type(t) => ("TYPE", Some(Cow::Owned(write_type(*t)))),
+            Request::Stru(s) => (
+                "STRU",
+                fixed(match s {
                     Structure::File => "F",
                     Structure::Record => "R",
                     Structure::Page => "P",
-                };
-                ("STRU", Some(s.to_string()))
-            }
-            Request::Mode(m) => {
-                let m = match m {
+                }),
+            ),
+            Request::Mode(m) => (
+                "MODE",
+                fixed(match m {
                     TransferMode::Stream => "S",
                     TransferMode::Block => "B",
                     TransferMode::Compressed => "C",
-                };
-                ("MODE", Some(m.to_string()))
-            }
-            Request::Retr(a) => ("RETR", Some(a.clone())),
-            Request::Stor(a) => ("STOR", Some(a.clone())),
+                }),
+            ),
+            Request::Retr(a) => ("RETR", b(a)),
+            Request::Stor(a) => ("STOR", b(a)),
             Request::Stou => ("STOU", None),
-            Request::Appe(a) => ("APPE", Some(a.clone())),
-            Request::Allo(a) => ("ALLO", Some(a.clone())),
-            Request::Rest(a) => ("REST", Some(a.clone())),
-            Request::Rnfr(a) => ("RNFR", Some(a.clone())),
-            Request::Rnto(a) => ("RNTO", Some(a.clone())),
+            Request::Appe(a) => ("APPE", b(a)),
+            Request::Allo(a) => ("ALLO", b(a)),
+            Request::Rest(a) => ("REST", b(a)),
+            Request::Rnfr(a) => ("RNFR", b(a)),
+            Request::Rnto(a) => ("RNTO", b(a)),
             Request::Abor => ("ABOR", None),
-            Request::Dele(a) => ("DELE", Some(a.clone())),
-            Request::Rmd(a) => ("RMD", Some(a.clone())),
-            Request::Mkd(a) => ("MKD", Some(a.clone())),
+            Request::Dele(a) => ("DELE", b(a)),
+            Request::Rmd(a) => ("RMD", b(a)),
+            Request::Mkd(a) => ("MKD", b(a)),
             Request::Pwd => ("PWD", None),
-            Request::List(a) => ("LIST", a.clone()),
-            Request::Nlst(a) => ("NLST", a.clone()),
-            Request::Site(a) => ("SITE", Some(a.clone())),
+            Request::List(a) => ("LIST", opt(a)),
+            Request::Nlst(a) => ("NLST", opt(a)),
+            Request::Site(a) => ("SITE", b(a)),
             Request::Syst => ("SYST", None),
-            Request::Stat(a) => ("STAT", a.clone()),
-            Request::Help(a) => ("HELP", a.clone()),
+            Request::Stat(a) => ("STAT", opt(a)),
+            Request::Help(a) => ("HELP", opt(a)),
             Request::Noop => ("NOOP", None),
-            Request::Eprt(addr) => ("EPRT", Some(write_eprt(*addr))),
+            Request::Eprt(addr) => ("EPRT", Some(Cow::Owned(write_eprt(*addr)))),
             Request::Epsv(a) => (
                 "EPSV",
                 a.map(|a| match a {
-                    EpsvArg::Protocol(n) => n.to_string(),
-                    EpsvArg::All => "ALL".to_string(),
+                    EpsvArg::Protocol(n) => Cow::Owned(n.to_string()),
+                    EpsvArg::All => Cow::Borrowed("ALL"),
                 }),
             ),
             Request::Feat => ("FEAT", None),
-            Request::Opts(a) => ("OPTS", Some(a.clone())),
-            Request::Mdtm(a) => ("MDTM", Some(a.clone())),
-            Request::Size(a) => ("SIZE", Some(a.clone())),
-            Request::Mlst(a) => ("MLST", a.clone()),
-            Request::Mlsd(a) => ("MLSD", a.clone()),
-            Request::Other(c) => return c.clone(),
-        };
-        Command { verb: verb.to_string(), arg }
+            Request::Opts(a) => ("OPTS", b(a)),
+            Request::Mdtm(a) => ("MDTM", b(a)),
+            Request::Size(a) => ("SIZE", b(a)),
+            Request::Mlst(a) => ("MLST", opt(a)),
+            Request::Mlsd(a) => ("MLSD", opt(a)),
+            Request::Other(c) => (c.verb.as_str(), opt(&c.arg)),
+        }
     }
 
-    /// The request's command line, ending in CRLF.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.to_command().to_bytes()
+    /// The request's command line, ending in CRLF. It fails as
+    /// [`Command::to_bytes`] does, and with [`WriteError::Argument`] if
+    /// [`Request::from_command`] would not read the line, such as `ALLO`
+    /// with a size that is not a number.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, WriteError> {
+        let (verb, arg) = self.parts();
+        let bytes = write_command(verb, arg.as_deref())?;
+        let line = bytes.strip_suffix(b"\r\n").unwrap_or(&bytes);
+        let command = Command::parse(line).map_err(|_| WriteError::Text)?;
+        Request::from_command(&command).map_err(WriteError::Argument)?;
+        Ok(bytes)
     }
+}
+
+/// Whether `a` is an `ALLO` argument: `<decimal-integer> [R <decimal-integer>]`,
+/// the parts joined by single spaces.
+fn allo_ok(a: &str) -> bool {
+    let number = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit());
+    let mut parts = a.split(' ');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(n), None, None, None) => number(n),
+        (Some(n), Some(r), Some(m), None) => number(n) && r.eq_ignore_ascii_case("R") && number(m),
+        _ => false,
+    }
+}
+
+/// Whether `a` is a `REST` marker: one or more printable ASCII characters
+/// other than space (RFC 959, section 5.3.2).
+fn rest_ok(a: &str) -> bool {
+    !a.is_empty() && a.bytes().all(|c| c.is_ascii_graphic())
+}
+
+/// Whether `a` starts with a command name of printable ASCII characters,
+/// followed by a space or nothing (RFC 2389, section 4).
+fn opts_ok(a: &str) -> bool {
+    let name = a.split(' ').next().unwrap_or("");
+    !name.is_empty() && name.bytes().all(|c| c.is_ascii_graphic())
 }
 
 fn parse_type(a: &str) -> Option<DataType> {
@@ -797,8 +919,8 @@ pub mod code {
 ///
 /// A reply of one line is written `220 Ready`. A reply of several is
 /// written with a hyphen after the code on the first line and a space on
-/// the last, and the lines between are text as it is (RFC 959, section
-/// 4.2):
+/// the last, and the lines between are text as it is, with a space in
+/// front of any that starts with three digits (RFC 959, section 4.2):
 ///
 /// ```text
 /// 211-Extensions supported:
@@ -816,8 +938,9 @@ pub struct Reply {
     pub lines: Vec<String>,
 }
 
-/// Why bytes are not an FTP reply. The stream holds no more replies a
-/// reader can find, and a client closes the connection.
+/// Why bytes are not an FTP reply. After any of these but
+/// [`ReplyError::TooManyLines`], the stream holds no more replies a reader
+/// can find, and a client closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyError {
     /// A line was longer than [`MAX_LINE`].
@@ -827,7 +950,9 @@ pub enum ReplyError {
     /// A reply did not start with a code from 100 to 599 followed by a
     /// space, a hyphen or the end of the line.
     Syntax,
-    /// A reply ran to more than [`MAX_REPLY_LINES`] lines.
+    /// A reply ran to more than [`MAX_REPLY_LINES`] lines. A
+    /// [`ReplyDecoder`] drops the reply's lines up to its last one, as RFC
+    /// 1123 (section 4.1.2.11) asks, and goes on to the next reply.
     TooManyLines,
 }
 
@@ -848,11 +973,12 @@ impl std::error::Error for ReplyError {}
 /// ` MLST size*;modify*;`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Feature {
-    /// The feature's name, such as `MDTM`, in upper case. Names are
-    /// case-insensitive, and a reader turns them to upper case.
+    /// The feature's name, such as `MDTM`, as sent. RFC 2389 (section 3.2)
+    /// leaves case to each feature's own definition, so compare names with
+    /// [`str::eq_ignore_ascii_case`] where that definition allows it.
     pub name: String,
-    /// Everything after the space that follows the name, or `None` if no
-    /// space follows it.
+    /// Everything after the space that follows the name, or `None` if
+    /// nothing follows it. Parameters are printable ASCII, spaces and tabs.
     pub params: Option<String>,
 }
 
@@ -862,7 +988,8 @@ pub enum FeatureError {
     /// The reply's code was not 211.
     Code(ReplyCode),
     /// A feature line did not start with a space and a name of printable
-    /// ASCII characters.
+    /// ASCII characters, or its parameters held other characters than
+    /// printable ASCII, spaces and tabs.
     Line,
 }
 
@@ -878,14 +1005,17 @@ impl std::fmt::Display for FeatureError {
 impl std::error::Error for FeatureError {}
 
 impl Reply {
-    /// A reply of one line.
+    /// A reply of one line. Text that would not fit in [`MAX_LINE`] is cut,
+    /// as [`Reply::to_bytes`] would cut it.
     pub fn new(code: ReplyCode, text: &str) -> Reply {
-        Reply { code, lines: vec![text.to_string()] }
+        Reply { code, lines: vec![cut(text, MAX_REPLY_TEXT).to_string()] }
     }
 
     /// Reads the reply at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the reply and how many bytes
-    /// of `b` it took. Lines end in CRLF, or in LF alone.
+    /// of `b` it took. Lines end in CRLF, or in LF alone. Each call reads
+    /// `b` from its start, so to read a stream as it comes in, use a
+    /// [`ReplyDecoder`], which reads each byte once.
     pub fn parse(b: &[u8]) -> Result<Option<(Reply, usize)>, ReplyError> {
         let mut builder = Builder::default();
         let mut at = 0;
@@ -906,30 +1036,32 @@ impl Reply {
 
     /// The reply's bytes, each line ending in CRLF. Lines lose any CR, LF
     /// and NUL and are cut to fit in [`MAX_LINE`]. A line between the
-    /// first and the last that would read as the last gets a space in
-    /// front, as RFC 959 asks. A reply with more than [`MAX_REPLY_LINES`]
+    /// first and the last that starts with three digits gets a space in
+    /// front, as RFC 959 asks, so that no client reads it as the last. A reply with more than [`MAX_REPLY_LINES`]
     /// lines keeps the first ones and the last. A reply with no lines is
     /// written with empty text.
     pub fn to_bytes(&self) -> Vec<u8> {
         let code = self.code.get().to_string();
         let mut out = Vec::new();
         let n = self.lines.len();
+        // Cut before cleaning, so a long line is never copied whole.
+        let text = |t: &str, max: usize| clean(cut(t, max));
         if n <= 1 {
-            let text = self.lines.first().map(|t| clean(t)).unwrap_or_default();
-            push_line(&mut out, &format!("{code} {}", cut(&text, MAX_REPLY_TEXT)));
+            let t = self.lines.first().map(|t| text(t, MAX_REPLY_TEXT)).unwrap_or_default();
+            push_line(&mut out, &format!("{code} {t}"));
             return out;
         }
         let keep = n.min(MAX_REPLY_LINES);
-        push_line(&mut out, &format!("{code}-{}", cut(&clean(&self.lines[0]), MAX_REPLY_TEXT)));
+        push_line(&mut out, &format!("{code}-{}", text(&self.lines[0], MAX_REPLY_TEXT)));
         for line in &self.lines[1..keep - 1] {
-            let line = clean(line);
-            if ends(&line, self.code) {
+            let line = text(line, MAX_CONTENT);
+            if line.bytes().take(3).filter(u8::is_ascii_digit).count() == 3 {
                 push_line(&mut out, &format!(" {}", cut(&line, MAX_CONTENT - 1)));
             } else {
-                push_line(&mut out, cut(&line, MAX_CONTENT));
+                push_line(&mut out, &line);
             }
         }
-        push_line(&mut out, &format!("{code} {}", cut(&clean(&self.lines[n - 1]), MAX_REPLY_TEXT)));
+        push_line(&mut out, &format!("{code} {}", text(&self.lines[n - 1], MAX_REPLY_TEXT)));
         out
     }
 
@@ -941,14 +1073,19 @@ impl Reply {
 
     /// The address in a reply to `PASV`. Servers word the reply in
     /// different ways, so this reads the six numbers from the first digit
-    /// of the first line on, as RFC 1123 (section 4.1.2.6) advises.
+    /// of a line on, as RFC 1123 (section 4.1.2.6) advises. In a reply of
+    /// several lines it takes the first line that holds them.
     pub fn passive_address(&self) -> Result<SocketAddrV4, AddressError> {
         if self.code != code::PASSIVE {
             return Err(AddressError::Code);
         }
-        let line = self.lines.first().ok_or(AddressError::Syntax)?;
-        let start = line.find(|c: char| c.is_ascii_digit()).ok_or(AddressError::Syntax)?;
-        scan_host_port(&line[start..]).map(|(addr, _)| addr).ok_or(AddressError::Syntax)
+        self.lines
+            .iter()
+            .find_map(|line| {
+                let start = line.find(|c: char| c.is_ascii_digit())?;
+                scan_host_port(&line[start..]).map(|(addr, _)| addr)
+            })
+            .ok_or(AddressError::Syntax)
     }
 
     /// The reply to `EPSV`: code 229 and the port in the form RFC 2428
@@ -957,45 +1094,42 @@ impl Reply {
         Reply::new(code::EXTENDED_PASSIVE, &format!("Entering Extended Passive Mode (|||{port}|)"))
     }
 
-    /// The port in a reply to `EPSV`: the number in `(|||port|)` on the
-    /// first line, where `|` may be any printable ASCII character.
+    /// The port in a reply to `EPSV`: the number in `(|||port|)`, where `|`
+    /// may be any printable ASCII character, `)` included. In a reply of
+    /// several lines it takes the first line that holds one.
     pub fn extended_passive_port(&self) -> Result<u16, AddressError> {
         if self.code != code::EXTENDED_PASSIVE {
             return Err(AddressError::Code);
         }
-        let line = self.lines.first().ok_or(AddressError::Syntax)?;
-        let open = line.find('(').ok_or(AddressError::Syntax)?;
-        let inside = &line[open + 1..];
-        let d = inside.chars().next().filter(|c| c.is_ascii_graphic()).ok_or(AddressError::Syntax)?;
-        let mut fields = inside[1..].split(d);
-        let (Some(""), Some(""), Some(port), Some(rest)) = (fields.next(), fields.next(), fields.next(), fields.next())
-        else {
-            return Err(AddressError::Syntax);
-        };
-        if !rest.starts_with(')') {
-            return Err(AddressError::Syntax);
-        }
-        decimal(port, 5).and_then(|n| u16::try_from(n).ok()).ok_or(AddressError::Syntax)
+        self.lines.iter().find_map(|line| epsv_port(line)).ok_or(AddressError::Syntax)
     }
 
     /// The reply to `FEAT` that lists `features` (RFC 2389, section 3.2).
     /// With none it is the one line `211 No features.`. A name keeps only
-    /// its printable ASCII characters, in upper case, and a feature whose
-    /// name has none is left out. At most [`MAX_FEATURES`] are listed.
+    /// its printable ASCII characters, and a feature whose name has none
+    /// is left out. Parameters keep only printable ASCII, spaces and tabs,
+    /// and are left out if none are kept. A line is cut to fit in
+    /// [`MAX_LINE`]. At most [`MAX_FEATURES`] are listed.
     pub fn feature_list(features: &[Feature]) -> Reply {
         let mut lines = vec!["Extensions supported:".to_string()];
         for f in features {
             if lines.len() > MAX_FEATURES {
                 break;
             }
-            let name: String = f.name.chars().filter(char::is_ascii_graphic).map(|c| c.to_ascii_uppercase()).collect();
-            if name.is_empty() {
+            let mut line = String::from(" ");
+            line.extend(f.name.chars().filter(char::is_ascii_graphic).take(MAX_CONTENT - 1));
+            if line.len() == 1 {
                 continue;
             }
-            match &f.params {
-                Some(p) => lines.push(format!(" {name} {}", clean(p))),
-                None => lines.push(format!(" {name}")),
+            if let Some(p) = &f.params {
+                let room = MAX_CONTENT.saturating_sub(line.len() + 1);
+                let mut params = p.chars().filter(|&c| feature_char(c)).take(room).peekable();
+                if params.peek().is_some() {
+                    line.push(' ');
+                    line.extend(params);
+                }
             }
+            lines.push(line);
         }
         if lines.len() == 1 {
             return Reply::new(code::SYSTEM_STATUS, "No features.");
@@ -1016,43 +1150,79 @@ impl Reply {
             .map(|line| {
                 let rest = line.strip_prefix(' ').ok_or(FeatureError::Line)?;
                 let (name, params) = match rest.split_once(' ') {
-                    Some((name, params)) => (name, Some(params.to_string())),
+                    // A space with nothing after it is read as no parameters.
+                    Some((name, "")) => (name, None),
+                    Some((name, params)) => (name, Some(params)),
                     None => (rest, None),
                 };
                 if name.is_empty() || !name.bytes().all(|b| b.is_ascii_graphic()) {
                     return Err(FeatureError::Line);
                 }
-                Ok(Feature { name: name.to_ascii_uppercase(), params })
+                if params.is_some_and(|p| !p.chars().all(feature_char)) {
+                    return Err(FeatureError::Line);
+                }
+                Ok(Feature { name: name.to_string(), params: params.map(str::to_string) })
             })
             .collect()
     }
 }
 
+/// Whether `c` may be in a feature's parameters: printable ASCII, space or
+/// tab (`TCHAR` in RFC 2389, section 2.1).
+fn feature_char(c: char) -> bool {
+    c.is_ascii_graphic() || c == ' ' || c == '\t'
+}
+
+/// The port in `(|||port|)` on one line of a reply to `EPSV`.
+fn epsv_port(line: &str) -> Option<u16> {
+    let open = line.find('(')?;
+    let inside = &line[open + 1..];
+    let d = inside.chars().next().filter(|c| c.is_ascii_graphic())?;
+    // Split off only the three fields, so `)` may be the delimiter.
+    let mut fields = inside[1..].splitn(4, d);
+    let (Some(""), Some(""), Some(port), Some(rest)) = (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return None;
+    };
+    if !rest.starts_with(')') {
+        return None;
+    }
+    decimal(port, 5).and_then(|n| u16::try_from(n).ok())
+}
+
 /// Builds a reply from its lines, one at a time.
 #[derive(Clone, Debug, Default)]
 struct Builder {
-    /// The code and lines so far of a multi-line reply.
-    open: Option<(ReplyCode, Vec<String>)>,
+    /// The code and lines so far of a multi-line reply, and whether it ran
+    /// past [`MAX_REPLY_LINES`] and its lines were dropped.
+    open: Option<(ReplyCode, Vec<String>, bool)>,
 }
 
 impl Builder {
     /// Takes one line's content. It returns the reply that line finishes,
-    /// if it finishes one.
+    /// if it finishes one. A reply with too many lines is an error once
+    /// its last line comes, and the builder is then ready for the next.
     fn take(&mut self, line: &[u8]) -> Result<Option<Reply>, ReplyError> {
         let line = text(line).ok_or(ReplyError::Text)?;
-        if let Some((code, lines)) = &mut self.open {
+        if let Some((code, lines, over)) = &mut self.open {
             if ends(line, *code) {
                 let code = *code;
+                let over = *over;
                 let mut lines = std::mem::take(lines);
-                lines.push(line.get(4..).unwrap_or("").to_string());
                 self.open = None;
+                if over {
+                    return Err(ReplyError::TooManyLines);
+                }
+                lines.push(line.get(4..).unwrap_or("").to_string());
                 return Ok(Some(Reply { code, lines }));
             }
             // Leave room for the last line.
-            if lines.len() + 1 >= MAX_REPLY_LINES {
-                return Err(ReplyError::TooManyLines);
+            if *over || lines.len() + 1 >= MAX_REPLY_LINES {
+                *over = true;
+                *lines = Vec::new();
+            } else {
+                lines.push(line.to_string());
             }
-            lines.push(line.to_string());
             return Ok(None);
         }
         let b = line.as_bytes();
@@ -1067,7 +1237,7 @@ impl Builder {
         match b.get(3) {
             None | Some(b' ') => Ok(Some(Reply { code, lines: vec![rest] })),
             Some(b'-') => {
-                self.open = Some((code, vec![rest]));
+                self.open = Some((code, vec![rest], false));
                 Ok(None)
             }
             Some(_) => Err(ReplyError::Syntax),
@@ -1094,12 +1264,46 @@ enum Split {
     TooLong(Option<usize>),
 }
 
-/// Finds the first line in `b`. A line ends at LF, and a CR right before
-/// the LF is not part of its content. A line's content may be at most
-/// [`MAX_LINE`] less 2 bytes.
+/// The two bytes taken to come before the bytes a reader holds: the end
+/// of a line, or of nothing.
+const LINE_START: [u8; 2] = [b'\n', b'\n'];
+
+/// Where the first line end in `b` is: the first LF that does not follow
+/// CR NUL. A LF after CR NUL is part of a pathname (RFC 2640, section
+/// 3.1). `prev` holds the two bytes before `b`.
+fn next_end(prev: [u8; 2], b: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(off) = b[from..].iter().position(|&c| c == b'\n') {
+        let i = from + off;
+        let p1 = if i >= 1 { b[i - 1] } else { prev[1] };
+        let p2 = match i {
+            0 => prev[0],
+            1 => prev[1],
+            _ => b[i - 2],
+        };
+        if !(p2 == b'\r' && p1 == 0) {
+            return Some(i);
+        }
+        from = i + 1;
+    }
+    None
+}
+
+/// The last two bytes of the stream once `b` follows `prev`.
+fn last_two(prev: [u8; 2], b: &[u8]) -> [u8; 2] {
+    match b {
+        [] => prev,
+        [x] => [prev[1], *x],
+        [.., x, y] => [*x, *y],
+    }
+}
+
+/// Finds the first line in `b`. A line ends at a LF that does not follow
+/// CR NUL, and a CR right before that LF is not part of its content. A
+/// line's content may be at most [`MAX_LINE`] less 2 bytes.
 fn split_line(b: &[u8]) -> Split {
     let window = &b[..b.len().min(MAX_LINE)];
-    match window.iter().position(|&c| c == b'\n') {
+    match next_end(LINE_START, window) {
         Some(i) => {
             let end = if i > 0 && b[i - 1] == b'\r' { i - 1 } else { i };
             if end > MAX_CONTENT { Split::TooLong(Some(i + 1)) } else { Split::Line { end, used: i + 1 } }
@@ -1110,6 +1314,8 @@ fn split_line(b: &[u8]) -> Split {
 }
 
 /// Splits a byte stream into lines, and skips lines that are too long.
+/// It keeps at most [`MAX_LINE`] bytes of any one line and at most
+/// [`MAX_BUFFERED`] bytes in all.
 #[derive(Clone, Debug, Default)]
 struct Lines {
     buf: Vec<u8>,
@@ -1117,29 +1323,76 @@ struct Lines {
     /// dropped when they make up half of `buf`, so taking many short lines
     /// out of one large feed takes linear time.
     start: usize,
-    /// Whether the bytes up to the next LF belong to a line too long to
-    /// keep.
-    skipping: bool,
-    /// How many bytes after `start` are known to hold no LF.
+    /// How many bytes after `start` are known to hold no line end.
     scanned: usize,
+    /// How many bytes of the last line, which has no end yet, are held.
+    tail: usize,
+    /// Whether the bytes up to the next line end belong to a line too long
+    /// to keep, and are dropped.
+    dropping: bool,
+    /// The last two bytes fed, kept or dropped, to tell which LF ends a
+    /// line.
+    prev: [u8; 2],
 }
 
 impl Lines {
-    fn feed(&mut self, mut bytes: &[u8]) {
-        if self.skipping {
-            match bytes.iter().position(|&c| c == b'\n') {
-                Some(i) => {
-                    self.skipping = false;
-                    bytes = &bytes[i + 1..];
-                }
-                None => return,
-            }
-        }
+    /// Takes bytes from the start of `bytes`, and says how many it took.
+    fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.start > 0 && self.start >= self.buf.len() / 2 {
             self.buf.drain(..self.start);
             self.start = 0;
         }
-        self.buf.extend_from_slice(bytes);
+        let mut used = 0;
+        while used < bytes.len() {
+            let rest = &bytes[used..];
+            if self.dropping {
+                let Some(i) = next_end(self.prev, rest) else {
+                    self.prev = last_two(self.prev, rest);
+                    return bytes.len();
+                };
+                if self.tail > 0 {
+                    // The start of the long line is held. End it, so the
+                    // reader finds it too long and skips it.
+                    if self.held().len() >= MAX_BUFFERED {
+                        break;
+                    }
+                    self.buf.push(b'\n');
+                    self.tail = 0;
+                }
+                self.dropping = false;
+                self.prev = last_two(self.prev, &rest[..=i]);
+                used += i + 1;
+                continue;
+            }
+            let room = MAX_BUFFERED.saturating_sub(self.held().len());
+            let n = rest.len().min(room).min(MAX_LINE - self.tail);
+            if n == 0 {
+                break;
+            }
+            let piece = &rest[..n];
+            let take = match next_end(self.prev, piece) {
+                Some(i) => {
+                    self.tail = 0;
+                    i + 1
+                }
+                None => {
+                    self.tail += n;
+                    n
+                }
+            };
+            self.buf.extend_from_slice(&piece[..take]);
+            self.prev = last_two(self.prev, &piece[..take]);
+            used += take;
+            if self.tail >= MAX_LINE {
+                // The line is too long. Its last byte is made plain, so the
+                // LF that will end it cannot read as part of a pathname.
+                self.dropping = true;
+                if let Some(last) = self.buf.last_mut() {
+                    *last = b'x';
+                }
+            }
+        }
+        used
     }
 
     /// The bytes not yet taken out.
@@ -1152,6 +1405,7 @@ impl Lines {
         self.buf = Vec::new();
         self.start = 0;
         self.scanned = 0;
+        self.tail = 0;
     }
 
     /// Takes `n` bytes out.
@@ -1170,7 +1424,12 @@ impl Lines {
         let held = self.held();
         // Bytes fed one at a time are each looked at once.
         let from = self.scanned.min(held.len());
-        if held.len() < MAX_LINE && !held[from..].contains(&b'\n') {
+        let before = match from {
+            0 => LINE_START,
+            1 => [LINE_START[1], held[0]],
+            _ => [held[from - 2], held[from - 1]],
+        };
+        if held.len() < MAX_LINE && next_end(before, &held[from..]).is_none() {
             self.scanned = held.len();
             return None;
         }
@@ -1186,11 +1445,13 @@ impl Lines {
                 Some(Err(()))
             }
             Split::TooLong(None) => {
-                match held.iter().position(|&c| c == b'\n') {
+                match next_end(LINE_START, held) {
                     Some(i) => self.take(i + 1),
                     None => {
+                        // Only the long line's start is held, and the rest
+                        // is being dropped as it comes.
                         self.clear();
-                        self.skipping = true;
+                        self.dropping = true;
                     }
                 }
                 Some(Err(()))
@@ -1212,15 +1473,19 @@ impl CommandDecoder {
         CommandDecoder::default()
     }
 
-    /// Adds bytes read from the connection.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        self.lines.feed(bytes);
+    /// Adds bytes read from the connection, and says how many it took. It
+    /// takes them all unless it would then hold more than
+    /// [`MAX_BUFFERED`] bytes. Take commands out with
+    /// [`next_command`](Self::next_command), then feed the rest again. The
+    /// bytes of a line too long to keep are taken and dropped.
+    #[must_use = "a decoder may take only part of the bytes"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        self.lines.feed(bytes)
     }
 
     /// The next whole line, read as a command. It returns `None` when it
     /// needs more bytes. An error covers one line only, and the next call
-    /// reads the line after it. A decoder never holds more than one line's
-    /// bytes beyond what has been taken out, plus what one `feed` added.
+    /// reads the line after it.
     pub fn next_command(&mut self) -> Option<Result<Command, CommandError>> {
         Some(match self.lines.next_line()? {
             Ok(line) => Command::parse(&line),
@@ -1228,7 +1493,8 @@ impl CommandDecoder {
         })
     }
 
-    /// How many bytes are held, waiting for the rest of a line.
+    /// How many bytes are held, waiting to be taken out. It is never more
+    /// than [`MAX_BUFFERED`].
     pub fn buffered(&self) -> usize {
         self.lines.held().len()
     }
@@ -1250,18 +1516,24 @@ impl ReplyDecoder {
         ReplyDecoder::default()
     }
 
-    /// Adds bytes read from the connection. After a [`ReplyError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            self.lines.feed(bytes);
+    /// Adds bytes read from the connection, and says how many it took, as
+    /// [`CommandDecoder::feed`] does. After a [`ReplyError`] other than
+    /// [`ReplyError::TooManyLines`] the stream cannot be read any further,
+    /// and it takes every byte and drops it.
+    #[must_use = "a decoder may take only part of the bytes"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        self.lines.feed(bytes)
     }
 
     /// The next whole reply, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. A decoder holds at most [`MAX_REPLY_LINES`] lines
-    /// of one reply, plus what one `feed` added.
+    /// stream has broken. A reply with too many lines is one
+    /// [`ReplyError::TooManyLines`], and the next call reads the reply
+    /// after it. A decoder holds at most [`MAX_REPLY_LINES`] lines of one
+    /// reply, plus [`MAX_BUFFERED`] bytes.
     pub fn next_reply(&mut self) -> Option<Result<Reply, ReplyError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -1274,6 +1546,7 @@ impl ReplyDecoder {
             match result {
                 Ok(Some(reply)) => return Some(Ok(reply)),
                 Ok(None) => {}
+                Err(ReplyError::TooManyLines) => return Some(Err(ReplyError::TooManyLines)),
                 Err(e) => {
                     self.failed = Some(e);
                     self.lines = Lines::default();
@@ -1284,7 +1557,8 @@ impl ReplyDecoder {
         }
     }
 
-    /// How many bytes are held, waiting for the rest of a line.
+    /// How many bytes are held, waiting to be taken out. It is never more
+    /// than [`MAX_BUFFERED`].
     pub fn buffered(&self) -> usize {
         self.lines.held().len()
     }
@@ -1296,6 +1570,55 @@ fn text(line: &[u8]) -> Option<&str> {
         return None;
     }
     std::str::from_utf8(line).ok()
+}
+
+/// The Telnet byte that starts a command (RFC 854).
+const IAC: u8 = 0xff;
+
+/// A command line as text: Telnet commands dropped, CR NUL read as CR, and
+/// a LF kept only right after CR NUL. It is `None` if what is left is not
+/// UTF-8, holds a NUL or any other CR or LF, or the line ends inside a
+/// Telnet command, or IAC is followed by a byte that is not a command
+/// (240 to 254, RFC 854). A doubled IAC stands for the byte 0xFF, which is
+/// never UTF-8, so it is `None` too.
+fn command_text(line: &[u8]) -> Option<String> {
+    let mut out = Vec::with_capacity(line.len());
+    let mut i = 0;
+    let mut after_cr_nul = false;
+    while i < line.len() {
+        let c = line[i];
+        let was_cr_nul = after_cr_nul;
+        after_cr_nul = false;
+        match c {
+            IAC => match line.get(i + 1)? {
+                // WILL, WONT, DO and DONT name an option in the next byte.
+                251..=254 => {
+                    line.get(i + 2)?;
+                    i += 3;
+                }
+                240..=250 => i += 2,
+                _ => return None,
+            },
+            b'\r' => {
+                if line.get(i + 1) != Some(&0) {
+                    return None;
+                }
+                out.push(b'\r');
+                after_cr_nul = true;
+                i += 2;
+            }
+            b'\n' if was_cr_nul => {
+                out.push(b'\n');
+                i += 1;
+            }
+            0 | b'\n' => return None,
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `s` without CR, LF or NUL.
@@ -1323,37 +1646,51 @@ mod tests {
     use super::*;
     use std::net::SocketAddrV6;
 
-    fn commands(stream: &[u8]) -> Vec<Result<Command, CommandError>> {
-        let mut d = CommandDecoder::new();
-        d.feed(stream);
-        std::iter::from_fn(|| d.next_command()).collect()
-    }
-
-    fn commands_bytewise(stream: &[u8]) -> Vec<Result<Command, CommandError>> {
+    /// Commands from `stream`, fed in pieces of at most `size` bytes and
+    /// taken out after each feed.
+    fn commands_in(stream: &[u8], size: usize) -> Vec<Result<Command, CommandError>> {
         let mut d = CommandDecoder::new();
         let mut out = Vec::new();
-        for b in stream {
-            d.feed(std::slice::from_ref(b));
-            while let Some(c) = d.next_command() {
-                out.push(c);
+        for mut chunk in stream.chunks(size.max(1)) {
+            while !chunk.is_empty() {
+                let n = d.feed(chunk);
+                chunk = &chunk[n..];
+                assert!(d.buffered() <= MAX_BUFFERED);
+                let before = out.len();
+                out.extend(std::iter::from_fn(|| d.next_command()));
+                assert!(n > 0 || out.len() > before, "no progress");
             }
         }
         out
     }
 
-    /// Replies up to and including the first error.
+    fn commands(stream: &[u8]) -> Vec<Result<Command, CommandError>> {
+        commands_in(stream, stream.len())
+    }
+
+    fn commands_bytewise(stream: &[u8]) -> Vec<Result<Command, CommandError>> {
+        commands_in(stream, 1)
+    }
+
+    /// Replies up to and including the first error that stops the stream.
     fn replies(stream: &[u8], bytewise: bool) -> Vec<Result<Reply, ReplyError>> {
         let mut d = ReplyDecoder::new();
         let mut out = Vec::new();
-        let chunks: Vec<&[u8]> = if bytewise { stream.chunks(1).collect() } else { vec![stream] };
-        for chunk in chunks {
-            d.feed(chunk);
-            while let Some(r) = d.next_reply() {
-                let stop = r.is_err();
-                out.push(r);
-                if stop {
-                    return out;
+        let size = if bytewise { 1 } else { stream.len().max(1) };
+        for mut chunk in stream.chunks(size) {
+            while !chunk.is_empty() {
+                let n = d.feed(chunk);
+                chunk = &chunk[n..];
+                assert!(d.buffered() <= MAX_BUFFERED);
+                let before = out.len();
+                while let Some(r) = d.next_reply() {
+                    let stop = matches!(r, Err(e) if e != ReplyError::TooManyLines);
+                    out.push(r);
+                    if stop {
+                        return out;
+                    }
                 }
+                assert!(n > 0 || out.len() > before, "no progress");
             }
         }
         out
@@ -1379,7 +1716,7 @@ mod tests {
         // RFC 959, section 4.1.2: a PORT argument, port 24 * 256 + 131.
         let to = SocketAddrV4::new(Ipv4Addr::new(132, 235, 1, 2), 6275);
         assert_eq!(request("PORT 132,235,1,2,24,131"), Ok(Request::Port(to)));
-        assert_eq!(Request::Port(to).to_bytes(), b"PORT 132,235,1,2,24,131\r\n");
+        assert_eq!(Request::Port(to).to_bytes().unwrap(), b"PORT 132,235,1,2,24,131\r\n");
         assert_eq!(request("TYPE A N"), Ok(Request::Type(DataType::Ascii(Some(Format::NonPrint)))));
         assert_eq!(request("TYPE i"), Ok(Request::Type(DataType::Image)));
         assert_eq!(request("TYPE L 8"), Ok(Request::Type(DataType::Local(NonZeroU8::new(8).unwrap()))));
@@ -1473,9 +1810,10 @@ mod tests {
         assert_eq!(reply_of(b"211-x\r\nSIZE\r\n211 e\r\n").features(), Err(FeatureError::Line));
         assert_eq!(reply_of(b"211-x\r\n  SIZE\r\n211 e\r\n").features(), Err(FeatureError::Line));
         assert_eq!(reply_of(b"211-x\r\n \x01\r\n211 e\r\n").features(), Err(FeatureError::Line));
-        // Names in lower case are read in upper case.
+        // Names keep their case, and a space with nothing after it is no
+        // parameters.
         let f = reply_of(b"211-x\r\n mdtm \r\n211 e\r\n").features().unwrap();
-        assert_eq!(f, [Feature { name: "MDTM".into(), params: Some(String::new()) }]);
+        assert_eq!(f, [Feature { name: "mdtm".into(), params: None }]);
     }
 
     #[test]
@@ -1508,6 +1846,7 @@ mod tests {
             Request::Stou,
             Request::Appe("a".into()),
             Request::Allo("100 R 10".into()),
+            Request::Allo("5".into()),
             Request::Rest("0".into()),
             Request::Rnfr("a".into()),
             Request::Rnto("b".into()),
@@ -1536,8 +1875,12 @@ mod tests {
             Request::Mlst(None),
             Request::Mlsd(Some("/".into())),
             Request::Other(Command::new("CCC", None)),
+            // RFC 2640, section 3.1: CR in a pathname, and LF after it.
+            Request::Dele("a\rb".into()),
+            Request::Stor("foo\r\nboo.bar".into()),
+            Request::Rnto("end\r".into()),
         ];
-        let stream: Vec<u8> = all.iter().flat_map(Request::to_bytes).collect();
+        let stream: Vec<u8> = all.iter().flat_map(|r| r.to_bytes().unwrap()).collect();
         let back: Vec<_> = commands(&stream).into_iter().map(|c| Request::from_command(&c.unwrap()).unwrap()).collect();
         assert_eq!(back, all);
     }
@@ -1548,9 +1891,15 @@ mod tests {
         assert_eq!(Command::parse(b" USER x"), Err(CommandError::Verb));
         assert_eq!(Command::parse(b"USERS x"), Err(CommandError::Verb));
         assert_eq!(Command::parse(b"US3R x"), Err(CommandError::Verb));
-        assert_eq!(Command::parse(b"\xff\xf4ABOR"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"\xffABOR"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"ABOR\xff"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"ABOR\xff\xfb"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"RETR \xff\xff"), Err(CommandError::Text));
         assert_eq!(Command::parse(b"RETR a\rb"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"RETR a\r"), Err(CommandError::Text));
         assert_eq!(Command::parse(b"RETR a\0b"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"RETR a\nb"), Err(CommandError::Text));
+        assert_eq!(Command::parse(b"RETR \r\0\0"), Err(CommandError::Text));
         assert_eq!(Command::parse(&[b'A'; MAX_LINE - 1]), Err(CommandError::LineTooLong));
         // Empty and lowercase arguments are kept as sent.
         assert_eq!(Command::parse(b"retr "), Ok(Command::new("RETR", Some(""))));
@@ -1579,6 +1928,15 @@ mod tests {
         assert_eq!(request("EPSV 3x"), Err(E::Invalid));
         assert_eq!(request("EPSV 65536"), Err(E::Invalid));
         assert_eq!(request("PORT 1,2,3,4,5"), Err(E::Address(AddressError::Syntax)));
+        // RFC 959, section 5.3.2, and RFC 2389, section 4.
+        for bad in
+            ["ALLO xyz", "ALLO ", "ALLO 1 R", "ALLO 1 X 2", "ALLO 1  R 2", "REST a b", "REST ", "OPTS ", "OPTS  x"]
+        {
+            assert_eq!(request(bad), Err(E::Invalid), "{bad:?}");
+        }
+        assert_eq!(request("ALLO 10 r 2"), Ok(Request::Allo("10 r 2".into())));
+        assert_eq!(request("REST !x~"), Ok(Request::Rest("!x~".into())));
+        assert_eq!(request("OPTS UTF8"), Ok(Request::Opts("UTF8".into())));
         assert_eq!(request("EPRT |3|1.2.3.4|5|"), Err(E::Address(AddressError::Family)));
     }
 
@@ -1621,6 +1979,9 @@ mod tests {
         assert_eq!(empty.passive_address(), Err(Syntax));
         let empty = Reply { code: code::EXTENDED_PASSIVE, lines: vec![] };
         assert_eq!(empty.extended_passive_port(), Err(Syntax));
+        // `)` as the delimiter (RFC 2428, section 3).
+        let r = reply_of(b"229 Entering Extended Passive Mode ()))6446))\r\n");
+        assert_eq!(r.extended_passive_port(), Ok(6446));
         // A scoped IPv6 address loses its scope.
         let scoped = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5, 7, 9));
         assert_eq!(parse_eprt(&write_eprt(scoped)), Ok(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 5)));
@@ -1654,10 +2015,10 @@ mod tests {
         assert_eq!(reply_of(&most).lines.len(), MAX_REPLY_LINES);
         // The decoder stays broken.
         let mut d = ReplyDecoder::new();
-        d.feed(b"200 ok\r\nhello\r\n200 ok\r\n");
+        assert_eq!(d.feed(b"200 ok\r\nhello\r\n200 ok\r\n"), 23);
         assert_eq!(d.next_reply(), Some(Ok(Reply::new(code::OK, "ok"))));
         assert_eq!(d.next_reply(), Some(Err(ReplyError::Syntax)));
-        d.feed(b"200 ok\r\n");
+        assert_eq!(d.feed(b"200 ok\r\n"), 8);
         assert_eq!(d.next_reply(), Some(Err(ReplyError::Syntax)));
         assert_eq!(d.buffered(), 0);
     }
@@ -1687,9 +2048,9 @@ mod tests {
         // A long line with no end yet holds no more than a line's bytes.
         let mut d = CommandDecoder::new();
         for _ in 0..3 * MAX_LINE {
-            d.feed(b"x");
+            assert_eq!(d.feed(b"x"), 1);
             while d.next_command().is_some() {}
-            assert!(d.buffered() < MAX_LINE);
+            assert!(d.buffered() <= MAX_LINE);
         }
     }
 
@@ -1714,20 +2075,32 @@ mod tests {
 
     #[test]
     fn writers_clean_and_cap() {
-        // CR and LF cannot start another command.
+        // CR LF cannot start another command: it is sent as CR NUL LF.
         let c = Request::Retr("a\r\nDELE b".into());
-        let got = commands(&c.to_bytes());
-        assert_eq!(got, [Ok(Command::new("RETR", Some("aDELE b")))]);
-        // Bad verbs are cleaned.
-        assert_eq!(Command::new("x-y z", None).to_bytes(), b"XYZ\r\n");
-        assert_eq!(Command::new("12", Some("a")).to_bytes(), b"NOOP a\r\n");
-        assert_eq!(Command::new("abcdef", None).to_bytes(), b"ABCD\r\n");
-        // Long arguments are cut on a character boundary.
-        let long = Request::Stor("é".repeat(MAX_LINE));
-        let bytes = long.to_bytes();
-        assert!(bytes.len() <= MAX_LINE);
-        let Ok(Request::Stor(name)) = Request::from_command(&commands(&bytes)[0].clone().unwrap()) else { panic!() };
-        assert!(name.len() >= MAX_LINE - 8);
+        let got = commands(&c.to_bytes().unwrap());
+        assert_eq!(got, [Ok(Command::new("RETR", Some("a\r\nDELE b")))]);
+        // What cannot be sent is refused, not changed.
+        assert_eq!(Request::Dele("a\nb".into()).to_bytes(), Err(WriteError::Text));
+        assert_eq!(Request::Dele("a\0b".into()).to_bytes(), Err(WriteError::Text));
+        assert_eq!(Command::new("x-y z", None).to_bytes(), Err(WriteError::Verb));
+        assert_eq!(Command::new("12", Some("a")).to_bytes(), Err(WriteError::Verb));
+        assert_eq!(Command::new("", None).to_bytes(), Err(WriteError::Verb));
+        assert_eq!(Command::new("abcdef", None).to_bytes(), Err(WriteError::Verb));
+        assert_eq!(Command::new("retr", Some("x")).to_bytes().unwrap(), b"RETR x\r\n");
+        assert_eq!(Request::Allo("xyz".into()).to_bytes(), Err(WriteError::Argument(ArgumentError::Invalid)));
+        assert_eq!(
+            Request::Other(Command::new("RETR", None)).to_bytes(),
+            Err(WriteError::Argument(ArgumentError::Missing))
+        );
+        // Long arguments are refused, the longest that fits is kept whole,
+        // and a CR counts twice.
+        assert_eq!(Request::Stor("é".repeat(MAX_LINE)).to_bytes(), Err(WriteError::LineTooLong));
+        assert_eq!(Request::Stor("x".repeat(64 << 20)).to_bytes(), Err(WriteError::LineTooLong));
+        let fits = "x".repeat(MAX_LINE - 7);
+        assert_eq!(Request::Stor(fits.clone()).to_bytes().unwrap().len(), MAX_LINE);
+        assert_eq!(commands(&Request::Stor(fits.clone()).to_bytes().unwrap()), [Ok(Command::new("STOR", Some(&fits)))]);
+        let cr = format!("{}\r", &fits[1..]);
+        assert_eq!(Request::Stor(cr).to_bytes(), Err(WriteError::LineTooLong));
         // Reply lines.
         let r = Reply {
             code: code::HELP,
@@ -1740,6 +2113,13 @@ mod tests {
         assert_eq!(back.lines[1], " 214 end");
         assert_eq!(back.lines[2], " 214");
         assert_eq!(back.lines.len(), 5);
+        // RFC 959, section 4.2: any middle line starting with three digits
+        // is padded, not only one with the reply's own code.
+        let r =
+            Reply { code: code::READY, lines: vec!["a".into(), "230 Logged in".into(), "999-x".into(), "end".into()] };
+        assert_eq!(r.to_bytes(), b"220-a\r\n 230 Logged in\r\n 999-x\r\n220 end\r\n");
+        let r = Reply { code: code::READY, lines: vec!["a".into(), "2\r30 x".into(), "end".into()] };
+        assert_eq!(r.to_bytes(), b"220-a\r\n 230 x\r\n220 end\r\n");
         // Too many lines keep the first ones and the last.
         let r = Reply { code: code::HELP, lines: (0..MAX_REPLY_LINES + 5).map(|i| i.to_string()).collect() };
         let back = reply_of(&r.to_bytes());
@@ -1750,13 +2130,29 @@ mod tests {
         let one = Reply::new(code::OK, &"x".repeat(2 * MAX_LINE));
         assert_eq!(one.to_bytes().len(), MAX_LINE);
         reply_of(&one.to_bytes());
-        // Features: bad names are cleaned or left out, and the list capped.
+        // Features: bad names and parameters are cleaned or left out, and
+        // the list capped.
         let f = vec![
-            Feature { name: "a b".into(), params: Some("p\r\nq".into()) },
+            Feature { name: "a b".into(), params: Some("p\r\nq\x01\té".into()) },
             Feature { name: " ".into(), params: None },
+            Feature { name: "X".into(), params: Some(String::new()) },
+            Feature { name: "Y".into(), params: Some("\x01".into()) },
+            Feature { name: "x".repeat(2 * MAX_LINE), params: Some("p".repeat(2 * MAX_LINE)) },
         ];
-        let got = Reply::feature_list(&f).features().unwrap();
-        assert_eq!(got, [Feature { name: "AB".into(), params: Some("pq".into()) }]);
+        let r = Reply::feature_list(&f);
+        assert!(r.lines.iter().all(|l| l.len() <= MAX_CONTENT));
+        assert_eq!(r.to_bytes(), Reply::parse(&r.to_bytes()).unwrap().unwrap().0.to_bytes());
+        let got = r.features().unwrap();
+        assert_eq!(
+            got[..3],
+            [
+                Feature { name: "ab".into(), params: Some("pq\t".into()) },
+                Feature { name: "X".into(), params: None },
+                Feature { name: "Y".into(), params: None },
+            ]
+        );
+        assert_eq!(got[3].name.len(), MAX_CONTENT - 1);
+        assert_eq!(got[3].params, None);
         let many: Vec<_> = (0..MAX_REPLY_LINES).map(|i| Feature { name: format!("F{i}"), params: None }).collect();
         let r = Reply::feature_list(&many);
         assert_eq!(r.features().unwrap().len(), MAX_FEATURES);
@@ -1799,25 +2195,13 @@ mod tests {
     fn decoders_take_many_short_lines_in_linear_time() {
         let started = std::time::Instant::now();
         let stream = b"NOOP\r\n".repeat(500_000);
-        let mut d = CommandDecoder::new();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(c) = d.next_command() {
-            assert_eq!(c, Ok(Command::new("NOOP", None)));
-            n += 1;
-        }
-        assert_eq!(n, 500_000);
-        assert_eq!(d.buffered(), 0);
+        let got = commands(&stream);
+        assert_eq!(got.len(), 500_000);
+        assert!(got.iter().all(|c| *c == Ok(Command::new("NOOP", None))));
         let stream = b"200 ok\r\n".repeat(500_000);
-        let mut d = ReplyDecoder::new();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(r) = d.next_reply() {
-            assert_eq!(r, Ok(Reply::new(code::OK, "ok")));
-            n += 1;
-        }
-        assert_eq!(n, 500_000);
-        assert_eq!(d.buffered(), 0);
+        let got = replies(&stream, false);
+        assert_eq!(got.len(), 500_000);
+        assert!(got.iter().all(|r| *r == Ok(Reply::new(code::OK, "ok"))));
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
@@ -1832,14 +2216,7 @@ mod tests {
         assert_eq!(commands(&long), want);
         assert_eq!(commands_bytewise(&long), want);
         for size in [7, 100, MAX_LINE - 1, MAX_LINE + 3] {
-            let mut d = CommandDecoder::new();
-            let mut got = Vec::new();
-            for chunk in long.chunks(size) {
-                d.feed(chunk);
-                got.extend(std::iter::from_fn(|| d.next_command()));
-                assert!(d.buffered() < MAX_LINE + size);
-            }
-            assert_eq!(got, want, "chunks of {size}");
+            assert_eq!(commands_in(&long, size), want, "chunks of {size}");
         }
     }
 
@@ -1893,6 +2270,12 @@ mod tests {
                 b"\0",
                 b"\xff",
                 b"\xc3\xa9",
+                b"\xff\xf4\xff\xf2",
+                b"\xff\xfb",
+                b"\r\0",
+                b"230 ",
+                b"ALLO ",
+                b"REST ",
             ];
             let n = self.below(40);
             let mut out = Vec::new();
@@ -1905,6 +2288,102 @@ mod tests {
             }
             out
         }
+    }
+
+    /// `r` written and read back: the same but for a space in front of
+    /// middle lines that start with three digits, and written the same
+    /// again.
+    fn same_reply(r: &Reply) {
+        let bytes = r.to_bytes();
+        let back = reply_of(&bytes);
+        assert_eq!(back.to_bytes(), bytes);
+        assert_eq!(back.code, r.code);
+        assert_eq!(back.lines.len(), r.lines.len());
+        for (i, (a, b)) in r.lines.iter().zip(&back.lines).enumerate() {
+            let padded =
+                i > 0 && i + 1 < r.lines.len() && a.bytes().take(3).all(|c| c.is_ascii_digit()) && a.len() >= 3;
+            assert_eq!(*b, if padded { format!(" {a}") } else { a.clone() });
+        }
+    }
+
+    // One test for each finding of the October 2026 review.
+
+    #[test]
+    fn feed_holds_at_most_max_buffered() {
+        // One long line fed at once keeps only a line's bytes.
+        let mut d = CommandDecoder::new();
+        let big = vec![b'x'; 1 << 20];
+        assert_eq!(d.feed(&big), big.len());
+        assert!(d.buffered() <= MAX_LINE, "held {}", d.buffered());
+        assert_eq!(d.next_command(), Some(Err(CommandError::LineTooLong)));
+        assert_eq!(d.feed(b"yy\r\nNOOP\r\n"), 10);
+        assert_eq!(d.next_command(), Some(Ok(Command::new("NOOP", None))));
+        // Many lines fed without taking any out stop at MAX_BUFFERED.
+        let mut d = CommandDecoder::new();
+        let mut taken = 0;
+        for _ in 0..100_000 {
+            taken += d.feed(b"NOOP\r\n");
+        }
+        assert!(d.buffered() <= MAX_BUFFERED);
+        assert_eq!(taken, d.buffered());
+        // The same for replies, and a long line among short ones.
+        let mut d = ReplyDecoder::new();
+        let stream = [b"200 ok\r\n".repeat(MAX_BUFFERED), vec![b'x'; 3 * MAX_BUFFERED]].concat();
+        let n = d.feed(&stream);
+        assert!(n < stream.len());
+        assert!(d.buffered() <= MAX_BUFFERED);
+        assert_eq!(replies(&[b"200 a\r\n".as_slice(), &vec![b'x'; 1 << 20], b"\r\n"].concat(), false).len(), 2);
+    }
+
+    #[test]
+    fn crnul_pathnames_round_trip() {
+        // RFC 2640, section 3.1, its own example.
+        assert_eq!(commands(b"STOR foo\r\0\nboo.bar\r\n"), [Ok(Command::new("STOR", Some("foo\r\nboo.bar")))]);
+        assert_eq!(commands_bytewise(b"STOR foo\r\0\nboo.bar\r\n"), commands(b"STOR foo\r\0\nboo.bar\r\n"));
+        assert_eq!(Request::Stor("foo\r\nboo.bar".into()).to_bytes().unwrap(), b"STOR foo\r\0\nboo.bar\r\n");
+        let got = commands(&Request::Dele("a\rb".into()).to_bytes().unwrap());
+        assert_eq!(got, [Ok(Command::new("DELE", Some("a\rb")))]);
+        // A bare LF still ends a line.
+        assert_eq!(commands(b"STOR a\nNOOP\r\n").len(), 2);
+    }
+
+    #[test]
+    fn telnet_commands_are_dropped() {
+        // RFC 959, section 4.1.3: IP and Synch before ABOR.
+        assert_eq!(commands(b"\xff\xf4\xff\xf2ABOR\r\n"), [Ok(Command::new("ABOR", None))]);
+        assert_eq!(commands(b"NO\xff\xfb\x01OP\r\n"), [Ok(Command::new("NOOP", None))]);
+    }
+
+    #[test]
+    fn passive_helpers_read_multiline_replies() {
+        let r = reply_of(b"227-Preparing\r\n227 Entering Passive Mode (127,0,0,1,19,137)\r\n");
+        assert_eq!(r.passive_address(), Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 19 * 256 + 137)));
+        let r = reply_of(b"229-Preparing (soon)\r\n229 Entering Extended Passive Mode (|||6446|)\r\n");
+        assert_eq!(r.extended_passive_port(), Ok(6446));
+    }
+
+    #[test]
+    fn too_many_lines_is_recoverable() {
+        // RFC 1123, section 4.1.2.11.
+        let mut s = b"200-first\r\n".to_vec();
+        for _ in 0..2 * MAX_REPLY_LINES {
+            s.extend_from_slice(b"x\r\n");
+        }
+        s.extend_from_slice(b"200 last\r\n220 next\r\n");
+        let want = vec![Err(ReplyError::TooManyLines), Ok(Reply::new(code::READY, "next"))];
+        assert_eq!(replies(&s, false), want);
+        assert_eq!(replies(&s, true), want);
+    }
+
+    #[test]
+    fn feature_names_keep_their_case() {
+        let r = reply_of(b"211-x\r\n x-Custom a\tb\r\n211 End\r\n");
+        let f = r.features().unwrap();
+        assert_eq!(f, [Feature { name: "x-Custom".into(), params: Some("a\tb".into()) }]);
+        assert_eq!(Reply::feature_list(&f).features(), Ok(f));
+        // RFC 2389, section 2.1: parameters are TCHAR.
+        assert_eq!(reply_of(b"211-x\r\n X \x01\r\n211 End\r\n").features(), Err(FeatureError::Line));
+        assert_eq!(reply_of("211-x\r\n X é\r\n211 End\r\n".as_bytes()).features(), Err(FeatureError::Line));
     }
 
     #[test]
@@ -1920,23 +2399,38 @@ mod tests {
             let mut rest = data.as_slice();
             while !rest.is_empty() {
                 let (chunk, tail) = rest.split_at(1 + rng.below(rest.len().min(MAX_LINE + 9)));
-                d.feed(chunk);
-                chunked.extend(std::iter::from_fn(|| d.next_command()));
+                let mut chunk = chunk;
+                while !chunk.is_empty() {
+                    let n = d.feed(chunk);
+                    chunk = &chunk[n..];
+                    assert!(d.buffered() <= MAX_BUFFERED);
+                    chunked.extend(std::iter::from_fn(|| d.next_command()));
+                }
                 rest = tail;
             }
             assert_eq!(chunked, whole);
             for c in whole.iter().flatten() {
-                assert_eq!(commands(&c.to_bytes()), [Ok(c.clone())]);
+                assert_eq!(commands(&c.to_bytes().unwrap()), [Ok(c.clone())]);
                 if let Ok(r) = Request::from_command(c) {
-                    let again = commands(&r.to_bytes());
+                    let again = commands(&r.to_bytes().unwrap());
                     assert_eq!(again.len(), 1);
                     assert_eq!(Request::from_command(again[0].as_ref().unwrap()), Ok(r));
                 }
             }
+            // Commands built from any text are written so they read back,
+            // or refused.
+            let text = String::from_utf8_lossy(&data);
+            let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
+            let built = Command::new(verb, Some(arg));
+            if let Ok(bytes) = built.to_bytes() {
+                let mut want = built.clone();
+                want.verb.make_ascii_uppercase();
+                assert_eq!(commands(&bytes), [Ok(want)]);
+            }
             let got = replies(&data, false);
             assert_eq!(got, replies(&data, true));
             for r in got.iter().flatten() {
-                assert_eq!(reply_of(&r.to_bytes()), *r);
+                same_reply(r);
                 if let Ok(f) = r.features() {
                     assert_eq!(Reply::feature_list(&f).features(), Ok(f));
                 }

@@ -1,186 +1,0 @@
-v=0
-o=1 0 0 -7 0 v
-s= b000
-e=5s$&TTTT
-p= 7v 9 vTTTT7v 9 pvs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&s= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 vTTTT7vl9v 9 vTTTT7v 9 :$= b0=$&:$$%$TTTT
-p= 7v 9 vTTTT7v 9 pvs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTv 9 vTTT 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTvTTTT7v 9v 9 vTTTT7v 9 :$= b0=$&:$$%$TTTT
-p= 7v 9 vTTTT7v 9 pvs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTv 9 vTTT 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTTTTTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 vTTTT7vl9v 9 vTTTT7v 9 :$= b0=$&:$$%$TTTT
-p= 7v 9 vTTTT7v 9 pvs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTv 9 vTTT 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTvTTTT7v 9v 9 vTTTT7v 9 :$= b0=$&:$$%$TTTT
-p= 7v == 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 vTTTT7v 9v 9TTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 vTTTT7vTTTvTTTT7v 9v 9 vTTTT7v 9 :$= b0=$&:$$%$TTTT
-p= 7v 9 vTTTT7v 9 pvs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTv 9 vTTT 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTTTTTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 vTTTT7vl9v 9 vTTTT7v 9 :$= b0=$&:$$%$TTTT
-p= 7v 9 vTTTT7v 9 pvs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT=v 9 vTTTT7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 7 
-p== 7v  v	s= TTTTTTTTTTT
-p= 7v 9 vs= 
-p=Y&TTTT
-p= 7v 9 Vs= 
-p=Y&TTTT
-p= 7v 9 TTTTTTTTTT= 
-p== 9v 9 vTTTT7v 9 :$= b0=$&:$$%$:00000000
-b=0$u5u:00000000
-b=0$u5uuuuuuuuuu5uuuuuuuu$$%$:00000000
-b=0$u5uuuuuuuuuu5uuuuuu0:505
-t=15 0

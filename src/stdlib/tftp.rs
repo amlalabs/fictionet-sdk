@@ -82,8 +82,11 @@ pub const MAX_REQUEST: usize = 512;
 /// The longest string (a filename, mode, option name, option value or
 /// error message), in bytes, not counting its closing NUL.
 pub const MAX_STRING: usize = 512;
-/// The most options a request or OACK may carry.
-pub const MAX_OPTIONS: usize = 16;
+/// The most options a request or OACK may carry. Each option takes at
+/// least two bytes, so a request within [`MAX_REQUEST`] bytes never
+/// reaches this limit: RFC 2347 bounds requests only by their size, and
+/// the limit binds only OACKs.
+pub const MAX_OPTIONS: usize = MAX_REQUEST / 2;
 /// The longest decimal number an option value may hold: `u64::MAX` has
 /// 20 digits.
 pub const MAX_DIGITS: usize = 20;
@@ -603,17 +606,38 @@ pub struct ReadTransfer {
 }
 
 impl ReadTransfer {
-    /// A transfer with no options: it starts with block 1. The block size
-    /// is clamped to [`MIN_BLOCK_SIZE`]..=[`MAX_BLOCK_SIZE`].
-    pub fn new(data: Vec<u8>, block_size: u16) -> ReadTransfer {
-        ReadTransfer::start(data, block_size, None)
+    /// A transfer with no options: it starts with block 1, in blocks of
+    /// [`DEFAULT_BLOCK_SIZE`] bytes, the only size a client expects
+    /// without an OACK (RFC 1350). Another block size takes an agreed
+    /// `blksize` option; use [`ReadTransfer::negotiated`] for that.
+    pub fn new(data: Vec<u8>) -> ReadTransfer {
+        ReadTransfer::start(data, DEFAULT_BLOCK_SIZE, None)
     }
 
     /// A transfer with what [`negotiate`] agreed. It starts with an OACK
     /// when there are options to acknowledge, and with block 1 if not.
+    ///
+    /// The OACK is `agreed.oack` as [`Packet::to_bytes`] writes it: the
+    /// options that fit, clipped, with repeats left out. A `blksize`
+    /// option whose value is not a number from [`MIN_BLOCK_SIZE`] to
+    /// [`MAX_BLOCK_SIZE`] is left out too. The block size is the one the
+    /// OACK's `blksize` gives the client, or [`DEFAULT_BLOCK_SIZE`] when
+    /// it has none, so `agreed.block_size` is not used and the client and
+    /// server always agree on it.
     pub fn negotiated(data: Vec<u8>, agreed: &Negotiated) -> ReadTransfer {
-        let oack = if agreed.oack.is_empty() { None } else { Some(agreed.oack.clone()) };
-        ReadTransfer::start(data, agreed.block_size, oack)
+        let mut block_size = DEFAULT_BLOCK_SIZE;
+        let mut oack = Vec::new();
+        for (name, value) in writable_options(&agreed.oack, 2, MAX_PACKET) {
+            if name.eq_ignore_ascii_case(option::BLKSIZE) {
+                match parse_number(value).and_then(|v| u16::try_from(v).ok()) {
+                    Some(v) if (MIN_BLOCK_SIZE..=MAX_BLOCK_SIZE).contains(&v) => block_size = v,
+                    _ => continue,
+                }
+            }
+            oack.push(TftpOption::new(name, value));
+        }
+        let oack = if oack.is_empty() { None } else { Some(oack) };
+        ReadTransfer::start(data, block_size, oack)
     }
 
     fn start(data: Vec<u8>, block_size: u16, oack: Option<Vec<TftpOption>>) -> ReadTransfer {
@@ -720,6 +744,9 @@ pub fn to_netascii(text: &[u8]) -> Vec<u8> {
 
 /// Text from netascii form: CR LF becomes LF and CR NUL becomes CR. Any
 /// other CR is kept as it is. The output is never longer than the input.
+///
+/// This reads a whole file. A pair can be split across two DATA blocks,
+/// so to read a file block by block use a [`NetasciiDecoder`] instead.
 pub fn from_netascii(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -740,6 +767,55 @@ pub fn from_netascii(bytes: &[u8]) -> Vec<u8> {
         }
     }
     out
+}
+
+/// Reads netascii a block at a time, as DATA packets bring it. It gives
+/// the same bytes as [`from_netascii`] on the whole file, however the file
+/// is split, and keeps at most one byte between calls: a CR whose
+/// partner is in the next block.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NetasciiDecoder {
+    pending_cr: bool,
+}
+
+impl NetasciiDecoder {
+    /// A decoder at the start of a file.
+    pub fn new() -> NetasciiDecoder {
+        NetasciiDecoder::default()
+    }
+
+    /// The text for the next block of netascii. The output is at most one
+    /// byte longer than `block`.
+    pub fn decode(&mut self, block: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(block.len().saturating_add(1));
+        for &c in block {
+            if std::mem::replace(&mut self.pending_cr, false) {
+                match c {
+                    b'\n' => {
+                        out.push(b'\n');
+                        continue;
+                    }
+                    0 => {
+                        out.push(b'\r');
+                        continue;
+                    }
+                    _ => out.push(b'\r'),
+                }
+            }
+            if c == b'\r' {
+                self.pending_cr = true;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The text left at the end of the file: a last CR, kept as it is, or
+    /// nothing.
+    pub fn finish(self) -> Vec<u8> {
+        if self.pending_cr { vec![b'\r'] } else { Vec::new() }
+    }
 }
 
 /// The wire block number for block `k`, counting from 1 without
@@ -800,20 +876,29 @@ fn put_str(out: &mut Vec<u8>, s: &str) {
     out.push(0);
 }
 
-/// Writes the first [`MAX_OPTIONS`] options, leaving out repeats of a name
-/// already written, and stopping at the first that would take `out` past
-/// `limit` bytes.
-fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) {
-    let mut written: Vec<&str> = Vec::new();
+/// The options [`put_options`] writes after `start` bytes: the first
+/// [`MAX_OPTIONS`], clipped, leaving out repeats of a name already
+/// written, and stopping at the first that would go past `limit` bytes.
+fn writable_options(options: &[TftpOption], start: usize, limit: usize) -> Vec<(&str, &str)> {
+    let mut written: Vec<(&str, &str)> = Vec::new();
+    let mut len = start;
     for o in options.iter().take(MAX_OPTIONS) {
         let (name, value) = (clip(&o.name), clip(&o.value));
-        if written.iter().any(|w| w.eq_ignore_ascii_case(name)) {
+        if written.iter().any(|(w, _)| w.eq_ignore_ascii_case(name)) {
             continue;
         }
-        if out.len() + name.len() + value.len() + 2 > limit {
+        let next = len + name.len() + value.len() + 2;
+        if next > limit {
             break;
         }
-        written.push(name);
+        len = next;
+        written.push((name, value));
+    }
+    written
+}
+
+fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) {
+    for (name, value) in writable_options(options, out.len(), limit) {
         put_str(out, name);
         put_str(out, value);
     }
@@ -1000,7 +1085,7 @@ mod tests {
         let bytes = Packet::OptionAck { options }.to_bytes();
         assert!(bytes.len() <= MAX_PACKET);
         let Packet::OptionAck { options } = Packet::parse(&bytes).unwrap() else { panic!() };
-        assert_eq!(options.len(), MAX_OPTIONS);
+        assert_eq!(options.len(), 40);
         assert!(options[0].name.len() <= MAX_STRING);
         let d = Packet::Data { block: 1, data: vec![1; MAX_PACKET * 2] };
         let Packet::Data { data, .. } = Packet::parse(&d.to_bytes()).unwrap() else { panic!() };
@@ -1086,7 +1171,7 @@ mod tests {
 
     #[test]
     fn transfer_without_options() {
-        let mut t = ReadTransfer::new(b"hello".to_vec(), 512);
+        let mut t = ReadTransfer::new(b"hello".to_vec());
         assert_eq!(t.blocks(), 1);
         assert_eq!(t.current(), Some(Packet::Data { block: 1, data: b"hello".to_vec() }));
         // ACK 0 is the block before: a duplicate.
@@ -1101,7 +1186,7 @@ mod tests {
 
     #[test]
     fn exact_multiple_ends_with_an_empty_block() {
-        let t = ReadTransfer::new(vec![7; 1024], 512);
+        let t = ReadTransfer::new(vec![7; 1024]);
         assert_eq!(t.blocks(), 3);
         assert_eq!(run(t.clone()), vec![7; 1024]);
         let mut t = t;
@@ -1109,17 +1194,18 @@ mod tests {
         t.on_ack(2);
         assert_eq!(t.current(), Some(Packet::Data { block: 3, data: vec![] }));
         // An empty file is one empty block.
-        let t = ReadTransfer::new(vec![], 512);
+        let t = ReadTransfer::new(vec![]);
         assert_eq!(t.current(), Some(Packet::Data { block: 1, data: vec![] }));
     }
 
     #[test]
     fn block_numbers_wrap() {
         let data: Vec<u8> = (0..70_000u32 * 8 + 3).map(|i| i as u8).collect();
-        let t = ReadTransfer::new(data.clone(), 8);
+        let t = ReadTransfer::negotiated(data.clone(), &negotiate(&[TftpOption::new("blksize", "8")], None, 8));
         assert_eq!(t.blocks(), 70_001);
         assert_eq!(run(t.clone()), data);
         let mut t = t;
+        assert!(matches!(t.on_ack(0), Event::Send(Packet::Data { block: 1, .. })));
         for k in 1..=65535u16 {
             assert!(matches!(t.on_ack(k), Event::Send(_)));
         }
@@ -1145,9 +1231,10 @@ mod tests {
         assert_eq!(t.on_packet(&error), Event::Unexpected);
         assert_eq!(t.on_ack(1), Event::Unexpected);
         assert_eq!(t.current(), None);
-        // Block sizes out of range are clamped.
-        assert_eq!(ReadTransfer::new(vec![], 0).block_size(), MIN_BLOCK_SIZE);
-        assert_eq!(ReadTransfer::new(vec![], u16::MAX).block_size(), MAX_BLOCK_SIZE);
+        // RFC 1350: with no options, blocks are 512 bytes.
+        let t = ReadTransfer::new(vec![1; 1000]);
+        assert_eq!(t.block_size(), DEFAULT_BLOCK_SIZE);
+        assert_eq!(t.current(), Some(Packet::Data { block: 1, data: vec![1; 512] }));
     }
 
     // RFC 2347: "The maximum size of a request packet is 512 octets."
@@ -1228,11 +1315,114 @@ mod tests {
         assert_ne!(ErrorCode::Other(9), ErrorCode::OptionNegotiation);
     }
 
+    // RFC 1350: with no blksize in the OACK, blocks are 512 bytes. A
+    // Negotiated whose block_size and oack disagree must follow the oack,
+    // which is what the client sees.
+    #[test]
+    fn negotiated_block_size_follows_the_oack() {
+        let quiet = Negotiated { block_size: 8, timeout: None, transfer_size: None, oack: vec![] };
+        let t = ReadTransfer::negotiated(vec![1; 1000], &quiet);
+        assert_eq!(t.block_size(), DEFAULT_BLOCK_SIZE);
+        assert_eq!(t.current(), Some(Packet::Data { block: 1, data: vec![1; 512] }));
+        let loud = Negotiated {
+            block_size: 1024,
+            timeout: None,
+            transfer_size: None,
+            oack: vec![TftpOption::new("BlkSize", "8")],
+        };
+        assert_eq!(ReadTransfer::negotiated(vec![1; 1000], &loud).block_size(), 8);
+        // A blksize the client could not accept is not sent, and the
+        // default holds.
+        let bad = Negotiated {
+            block_size: 7,
+            timeout: None,
+            transfer_size: None,
+            oack: vec![TftpOption::new("blksize", "7")],
+        };
+        let t = ReadTransfer::negotiated(vec![], &bad);
+        assert_eq!((t.block_size(), t.current()), (DEFAULT_BLOCK_SIZE, Some(Packet::Data { block: 1, data: vec![] })));
+        // A repeat is not what the client sees, so it does not count.
+        let twice = Negotiated {
+            block_size: 16,
+            timeout: None,
+            transfer_size: None,
+            oack: vec![TftpOption::new("blksize", "8"), TftpOption::new("blksize", "16")],
+        };
+        let t = ReadTransfer::negotiated(vec![], &twice);
+        assert_eq!(t.block_size(), 8);
+        let Some(oack) = t.current() else { panic!() };
+        assert_eq!(Packet::parse(&oack.to_bytes()), Ok(oack));
+    }
+
+    // What a transfer keeps of a caller's OACK is bounded by what can be
+    // written, not by the caller's list.
+    #[test]
+    fn negotiated_keeps_a_bounded_oack() {
+        let big = "x".repeat(100_000);
+        let mut oack: Vec<TftpOption> = (0..100_000).map(|i| TftpOption::new(&format!("o{i}"), "1")).collect();
+        oack.insert(0, TftpOption::new(&big, &big));
+        let agreed = Negotiated { block_size: 512, timeout: None, transfer_size: None, oack };
+        let t = ReadTransfer::negotiated(vec![], &agreed);
+        let Some(Packet::OptionAck { options }) = t.current() else { panic!() };
+        assert!(options.len() <= MAX_OPTIONS);
+        assert!(options.iter().all(|o| o.name.len() <= MAX_STRING && o.value.len() <= MAX_STRING));
+        let p = Packet::OptionAck { options };
+        assert_eq!(Packet::parse(&p.to_bytes()), Ok(p));
+    }
+
+    // RFC 2347 bounds a request only by its 512 bytes. Seventeen small
+    // options fit easily, and a server ignores the ones it does not know.
+    #[test]
+    fn requests_with_many_small_options_read() {
+        let mut rrq = b"\x00\x01f\x00octet\x00".to_vec();
+        for i in 0..=16 {
+            rrq.extend_from_slice(format!("x{i}\x001\x00").as_bytes());
+        }
+        assert_eq!(rrq.len(), 102);
+        let p = Packet::parse(&rrq).unwrap();
+        let Packet::ReadRequest(r) = &p else { panic!() };
+        assert_eq!(r.options.len(), 17);
+        assert_eq!(p.to_bytes(), rrq);
+        assert_eq!(negotiate(&r.options, Some(1), 512).oack, []);
+    }
+
     #[test]
     fn netascii() {
         assert_eq!(to_netascii(b"a\nb\rc"), b"a\r\nb\r\0c");
         assert_eq!(from_netascii(b"a\r\nb\r\0c\r"), b"a\nb\rc\r");
         assert_eq!(from_netascii(&to_netascii(b"x\r\n\n\r")), b"x\r\n\n\r");
+    }
+
+    /// Decodes `chunks` one at a time.
+    fn decode_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
+        let mut d = NetasciiDecoder::new();
+        let mut out = Vec::new();
+        for c in chunks {
+            let text = d.decode(c);
+            assert!(text.len() <= c.len() + 1);
+            out.extend(text);
+        }
+        out.extend(d.finish());
+        out
+    }
+
+    // RFC 764 pairs can be split across DATA blocks. With 8-byte blocks,
+    // "1234567\r" then "\0X" is the text "1234567\rX".
+    #[test]
+    fn netascii_across_blocks() {
+        assert_eq!(decode_chunks([&b"1234567\r"[..], b"\0X"]), b"1234567\rX");
+        assert_eq!(decode_chunks([&b"1234567\r"[..], b"\nX"]), b"1234567\nX");
+        assert_eq!(decode_chunks([&b"a\r"[..], b"", b"\r", b"b\r"]), b"a\r\rb\r");
+        let wire = to_netascii(b"x\r\n\n\ry\r\r\0\r");
+        let mut odd = wire.clone();
+        odd.extend_from_slice(b"\rz\r\r\n\r");
+        for w in [wire, odd] {
+            let whole = from_netascii(&w);
+            for at in 0..=w.len() {
+                assert_eq!(decode_chunks([&w[..at], &w[at..]]), whole, "split at {at}");
+            }
+            assert_eq!(decode_chunks(w.chunks(1)), whole);
+        }
     }
 
     #[test]
@@ -1286,7 +1476,8 @@ mod tests {
             }
             // A transfer fed random ACKs never panics, and only sends
             // DATA blocks of the right size.
-            let mut t = ReadTransfer::new(buf.clone(), rng.below(40) as u16);
+            let blksize = negotiate(&[TftpOption::new("blksize", &rng.below(40).to_string())], None, 40);
+            let mut t = ReadTransfer::negotiated(buf.clone(), &blksize);
             for _ in 0..rng.below(20) {
                 let ack = if rng.below(2) == 0 { wire(t.in_flight()) } else { rng.next() as u16 };
                 if let Event::Send(Packet::Data { data, .. }) = t.on_ack(ack) {
@@ -1294,6 +1485,8 @@ mod tests {
                 }
             }
             assert_eq!(from_netascii(&to_netascii(&buf)), buf);
+            let size = rng.below(9) as usize + 1;
+            assert_eq!(decode_chunks(buf.chunks(size)), from_netascii(&buf));
         }
     }
 }

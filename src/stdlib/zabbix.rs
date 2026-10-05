@@ -1,0 +1,1278 @@
+//! The Zabbix protocol: reading and writing packets and the JSON messages
+//! agents, senders and servers exchange, with no I/O.
+//!
+//! Zabbix monitors servers and network gear. An agent on each host answers
+//! the server's questions on TCP port 10050, and agents in active mode,
+//! along with tools like `zabbix_sender`, push values to the server on
+//! port 10051. Each message goes in a packet: the four bytes `ZBXD`, a
+//! flags byte, then the data length and a reserved length, little-endian.
+//! The lengths take 4 bytes each, or 8 each when the large packet flag is
+//! set. When the compression flag is set the data is zlib-compressed and
+//! the reserved length is its size before compression. This module follows
+//! the "Header and data length" and "Protocols" sections of the Zabbix
+//! manual.
+//!
+//! Nothing here reads a socket. A world that plays a Zabbix server feeds
+//! the bytes a [`tcp`](crate::stdlib::tcp) connection reads to a
+//! [`Decoder`], gets [`Packet`]s back, reads each one's [`Message`], and
+//! writes the reply's bytes back to the connection. Compressed data is
+//! reported with [`Packet::is_compressed`] and left as it came; it is not
+//! decompressed. A message keeps its JSON text as it was sent and names
+//! only its kind, so world code reads the rest with whatever JSON reader it
+//! likes.
+//!
+//! Every reader checks lengths, because the agent can send any bytes it
+//! likes. A decoder takes a size limit and refuses a packet whose data
+//! would pass it, before the data comes.
+//!
+//! ```
+//! use fictionet::stdlib::zabbix::{Decoder, Kind, Message};
+//!
+//! // What zabbix_sender sends for one value.
+//! let json = br#"{"request":"sender data","data":[{"host":"web1","key":"cpu","value":"0.5"}]}"#;
+//! let mut sent = b"ZBXD\x01".to_vec();
+//! sent.extend_from_slice(&(json.len() as u32).to_le_bytes());
+//! sent.extend_from_slice(&[0, 0, 0, 0]);
+//! sent.extend_from_slice(json);
+//!
+//! let mut decoder = Decoder::new();
+//! decoder.feed(&sent);
+//! let packet = decoder.next_packet().unwrap().unwrap();
+//! assert!(!packet.is_compressed());
+//! let message = Message::parse(&packet.data).unwrap();
+//! assert_eq!(message.kind(), &Kind::SenderData);
+//! assert_eq!(message.json().as_bytes(), json);
+//!
+//! let reply = Message::response(true, Some("processed: 1; failed: 0; total: 1")).unwrap();
+//! let bytes = reply.to_packet().to_bytes();
+//! assert_eq!(&bytes[..5], b"ZBXD\x01");
+//! assert_eq!(&bytes[13..], br#"{"response":"success","info":"processed: 1; failed: 0; total: 1"}"#);
+//! ```
+
+/// The TCP port a Zabbix agent listens on for the server's questions.
+pub const AGENT_PORT: u16 = 10050;
+/// The TCP port a Zabbix server or proxy listens on for pushed data.
+pub const SERVER_PORT: u16 = 10051;
+/// The four bytes every packet starts with.
+pub const MAGIC: [u8; 4] = *b"ZBXD";
+/// The header's length when its lengths take 4 bytes each.
+pub const HEADER_LEN: usize = 13;
+/// The header's length when the large packet flag is set and its lengths
+/// take 8 bytes each.
+pub const LARGE_HEADER_LEN: usize = 21;
+/// The most data one packet may carry: 1 GiB, the limit Zabbix itself
+/// sets on what it receives.
+pub const MAX_DATA: usize = 1 << 30;
+/// The size limit a [`Decoder`] made with [`Decoder::new`] uses.
+pub const DEFAULT_LIMIT: usize = 16 << 20;
+/// How deeply arrays and objects may nest in a message's JSON.
+pub const MAX_DEPTH: usize = 64;
+
+/// The bits of the header's flags byte.
+pub mod flags {
+    /// Set on every packet: this is the Zabbix communications protocol.
+    pub const PROTOCOL: u8 = 0x01;
+    /// The data is zlib-compressed.
+    pub const COMPRESSED: u8 = 0x02;
+    /// The lengths take 8 bytes each instead of 4.
+    pub const LARGE: u8 = 0x04;
+    /// Every bit this module knows.
+    pub const KNOWN: u8 = PROTOCOL | COMPRESSED | LARGE;
+}
+
+/// Why bytes are not a Zabbix packet. Whatever the reason, the connection holds no
+/// more packets a reader can find, and a real server closes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketError {
+    /// The packet did not start with `ZBXD`.
+    Magic,
+    /// The flags byte lacked the protocol bit, or had a bit this module
+    /// does not know.
+    Flags(u8),
+    /// The data length was over the size limit.
+    TooLarge {
+        /// The data length the header gave.
+        len: u64,
+        /// The limit it passed.
+        limit: usize,
+    },
+    /// The reserved length was over the size limit. Zabbix checks it
+    /// whether or not the data is compressed.
+    ReservedTooLarge {
+        /// The reserved length the header gave.
+        len: u64,
+        /// The limit it passed.
+        limit: usize,
+    },
+}
+
+impl std::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PacketError::Magic => f.write_str("packet does not start with ZBXD"),
+            PacketError::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
+            PacketError::TooLarge { len, limit } => write!(f, "data length {len} is over the limit of {limit}"),
+            PacketError::ReservedTooLarge { len, limit } => {
+                write!(f, "reserved length {len} is over the limit of {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for PacketError {}
+
+/// A packet header: the flags and the two lengths that follow `ZBXD`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Header {
+    /// The flags byte; see [`flags`].
+    pub flags: u8,
+    /// How many bytes of data follow the header.
+    pub data_len: u64,
+    /// The data's size before compression when it is compressed, and
+    /// usually 0 when it is not.
+    pub reserved: u64,
+}
+
+impl Header {
+    /// Reads the header at the start of `b`. It returns `Ok(None)` if `b`
+    /// holds only part of one, and otherwise the header and its length.
+    /// A wrong magic or flags byte is reported as soon as it comes. The
+    /// lengths are not checked against any limit here.
+    pub fn parse(b: &[u8]) -> Result<Option<(Header, usize)>, PacketError> {
+        let n = b.len().min(MAGIC.len());
+        if b[..n] != MAGIC[..n] {
+            return Err(PacketError::Magic);
+        }
+        let Some(&flag_byte) = b.get(4) else {
+            return Ok(None);
+        };
+        if flag_byte & flags::PROTOCOL == 0 || flag_byte & !flags::KNOWN != 0 {
+            return Err(PacketError::Flags(flag_byte));
+        }
+        let large = flag_byte & flags::LARGE != 0;
+        let (len, width) = if large { (LARGE_HEADER_LEN, 8) } else { (HEADER_LEN, 4) };
+        if b.len() < len {
+            return Ok(None);
+        }
+        let data_len = le(&b[5..5 + width]);
+        let reserved = le(&b[5 + width..len]);
+        Ok(Some((Header { flags: flag_byte, data_len, reserved }, len)))
+    }
+
+    /// The header's bytes. The protocol bit is always set and unknown bits
+    /// are cleared. The large packet flag is set when a length needs more
+    /// than 4 bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut f = (self.flags & flags::KNOWN) | flags::PROTOCOL;
+        if self.data_len > u64::from(u32::MAX) || self.reserved > u64::from(u32::MAX) {
+            f |= flags::LARGE;
+        }
+        let mut out = Vec::with_capacity(LARGE_HEADER_LEN);
+        out.extend_from_slice(&MAGIC);
+        out.push(f);
+        if f & flags::LARGE != 0 {
+            out.extend_from_slice(&self.data_len.to_le_bytes());
+            out.extend_from_slice(&self.reserved.to_le_bytes());
+        } else {
+            // Both fit in 4 bytes, or the large flag would be set.
+            out.extend_from_slice(&(self.data_len as u32).to_le_bytes());
+            out.extend_from_slice(&(self.reserved as u32).to_le_bytes());
+        }
+        out
+    }
+}
+
+fn le(b: &[u8]) -> u64 {
+    b.iter().rev().fold(0u64, |acc, &x| (acc << 8) | u64::from(x))
+}
+
+/// One Zabbix packet: the header's flags and reserved length, and the data.
+/// The data length is worked out from the data, so it is not kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Packet {
+    /// The flags byte; see [`flags`].
+    pub flags: u8,
+    /// The reserved length: the data's size before compression when it is
+    /// compressed.
+    pub reserved: u64,
+    /// The data as it came, still compressed if it was.
+    pub data: Vec<u8>,
+}
+
+impl Packet {
+    /// A packet of uncompressed data with a 4-byte-length header.
+    pub fn new(data: Vec<u8>) -> Packet {
+        Packet { flags: flags::PROTOCOL, reserved: 0, data }
+    }
+
+    /// Reads the packet at the start of `b`, with data up to [`MAX_DATA`]
+    /// bytes. It returns `Ok(None)` if `b` holds only part of one, and
+    /// otherwise the packet and how many bytes of `b` it took.
+    pub fn parse(b: &[u8]) -> Result<Option<(Packet, usize)>, PacketError> {
+        Packet::parse_limited(b, MAX_DATA)
+    }
+
+    /// Like [`Packet::parse`], with data up to `limit` bytes. A limit over
+    /// [`MAX_DATA`] counts as [`MAX_DATA`]. The reserved length must be
+    /// within the limit too, as Zabbix requires, since it is the size the
+    /// data will have once decompressed.
+    pub fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, PacketError> {
+        let limit = limit.min(MAX_DATA);
+        let Some((header, used)) = Header::parse(b)? else {
+            return Ok(None);
+        };
+        let len = match usize::try_from(header.data_len) {
+            Ok(n) if n <= limit => n,
+            _ => return Err(PacketError::TooLarge { len: header.data_len, limit }),
+        };
+        if !usize::try_from(header.reserved).is_ok_and(|n| n <= limit) {
+            return Err(PacketError::ReservedTooLarge { len: header.reserved, limit });
+        }
+        let Some(end) = used.checked_add(len) else {
+            return Err(PacketError::TooLarge { len: header.data_len, limit });
+        };
+        let Some(data) = b.get(used..end) else {
+            return Ok(None);
+        };
+        Ok(Some((Packet { flags: header.flags, reserved: header.reserved, data: data.to_vec() }, end)))
+    }
+
+    /// The packet's bytes: the header, then the data. Data longer than
+    /// [`MAX_DATA`] is cut to that length, and a reserved length over
+    /// [`MAX_DATA`] is lowered to it, since [`Packet::parse`] takes no more.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let data = &self.data[..self.data.len().min(MAX_DATA)];
+        let reserved = self.reserved.min(MAX_DATA as u64);
+        let header = Header { flags: self.flags, data_len: data.len() as u64, reserved };
+        let mut out = header.to_bytes();
+        out.extend_from_slice(data);
+        out
+    }
+
+    /// Whether the data is zlib-compressed. This module does not
+    /// decompress it.
+    pub fn is_compressed(&self) -> bool {
+        self.flags & flags::COMPRESSED != 0
+    }
+
+    /// Whether the header's lengths take 8 bytes each.
+    pub fn is_large(&self) -> bool {
+        self.flags & flags::LARGE != 0
+    }
+
+    /// The data's size before compression, as the sender gave it, if the
+    /// data is compressed.
+    pub fn uncompressed_len(&self) -> Option<u64> {
+        self.is_compressed().then_some(self.reserved)
+    }
+}
+
+/// Splits a Zabbix byte stream into packets. Feed it the bytes a
+/// connection reads, in order, and take packets out until it has none.
+#[derive(Clone, Debug)]
+pub struct Decoder {
+    buf: Vec<u8>,
+    /// Where the bytes not yet taken out start. Bytes before it are
+    /// dropped in `feed` once they are half the buffer, so taking out many
+    /// small packets costs time in proportion to their bytes.
+    start: usize,
+    limit: usize,
+    failed: Option<PacketError>,
+}
+
+impl Default for Decoder {
+    fn default() -> Decoder {
+        Decoder::new()
+    }
+}
+
+impl Decoder {
+    /// A decoder holding no bytes, which refuses data over
+    /// [`DEFAULT_LIMIT`] bytes.
+    pub fn new() -> Decoder {
+        Decoder::with_limit(DEFAULT_LIMIT)
+    }
+
+    /// A decoder holding no bytes, which refuses data over `limit` bytes.
+    /// A limit over [`MAX_DATA`] counts as [`MAX_DATA`].
+    pub fn with_limit(limit: usize) -> Decoder {
+        Decoder { buf: Vec::new(), start: 0, limit: limit.min(MAX_DATA), failed: None }
+    }
+
+    /// The most data one packet may carry.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Adds bytes read from the connection. After a [`PacketError`] the
+    /// stream cannot be read any further, and they are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.failed.is_none() {
+            if self.start > 0 && self.start >= self.buf.len() / 2 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// The next whole packet, if one has come. It returns `None` when it
+    /// needs more bytes, and keeps returning the same error once the
+    /// stream has broken. A packet over the limit is refused as soon as
+    /// its header comes, so a decoder never holds more than one packet's
+    /// bytes beyond what has been taken out, plus what one `feed` added.
+    pub fn next_packet(&mut self) -> Option<Result<Packet, PacketError>> {
+        if let Some(e) = self.failed {
+            return Some(Err(e));
+        }
+        match Packet::parse_limited(&self.buf[self.start..], self.limit) {
+            Ok(Some((packet, used))) => {
+                self.start += used;
+                Some(Ok(packet))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.failed = Some(e);
+                self.buf = Vec::new();
+                self.start = 0;
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// How many bytes are held, waiting for the rest of a packet.
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+}
+
+/// What a JSON message is, from its top-level `request` or `response`
+/// member.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+    /// `"request":"active checks"`: an active agent asks which items to
+    /// collect.
+    ActiveChecks,
+    /// `"request":"agent data"`: an active agent sends the values it
+    /// collected.
+    AgentData,
+    /// `"request":"sender data"`: `zabbix_sender` or a similar tool sends
+    /// values for trapper items.
+    SenderData,
+    /// Any other request, with its name.
+    OtherRequest(String),
+    /// A reply, with its `response` member, usually `success` or `failed`.
+    Response(String),
+}
+
+/// Why bytes are not a Zabbix JSON message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageError {
+    /// The bytes are not UTF-8.
+    Utf8,
+    /// The JSON is malformed at this byte offset.
+    Syntax(usize),
+    /// Arrays and objects nest deeper than [`MAX_DEPTH`].
+    TooDeep,
+    /// The JSON is not an object.
+    NotObject,
+    /// The object has no string `request` or `response` member.
+    NoKind,
+    /// The JSON would be longer than [`MAX_DATA`] bytes.
+    TooLong,
+}
+
+impl std::fmt::Display for MessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MessageError::Utf8 => f.write_str("message is not UTF-8"),
+            MessageError::Syntax(at) => write!(f, "malformed JSON at byte {at}"),
+            MessageError::TooDeep => write!(f, "JSON nests deeper than {MAX_DEPTH}"),
+            MessageError::NotObject => f.write_str("JSON is not an object"),
+            MessageError::NoKind => f.write_str("JSON object has no request or response member"),
+            MessageError::TooLong => write!(f, "JSON is longer than {MAX_DATA} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for MessageError {}
+
+/// One value `zabbix_sender` sends: which host and item it is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SenderValue {
+    /// The host's name as the server knows it.
+    pub host: String,
+    /// The item key.
+    pub key: String,
+    /// The value, as text.
+    pub value: String,
+}
+
+/// One value an active agent sends, with its place in the agent's buffer
+/// and when it was collected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentValue {
+    /// The host's name as the server knows it.
+    pub host: String,
+    /// The item key.
+    pub key: String,
+    /// The value, as text.
+    pub value: String,
+    /// The value's number, counting up within a session, so the server
+    /// can drop values it has already seen.
+    pub id: u64,
+    /// When it was collected, in seconds since the Unix epoch.
+    pub clock: u64,
+    /// The nanoseconds past `clock`.
+    pub ns: u32,
+}
+
+/// A Zabbix JSON message: its kind and its JSON text as it was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    kind: Kind,
+    json: String,
+}
+
+impl Message {
+    /// Reads a message from a packet's uncompressed data. The JSON must be
+    /// well formed, be an object, and have a string `request` or
+    /// `response` member at the top level. If it has both, `request`
+    /// decides the kind. If a member appears twice, the first one counts,
+    /// and if that one is not a string it names no kind.
+    pub fn parse(data: &[u8]) -> Result<Message, MessageError> {
+        if data.len() > MAX_DATA {
+            return Err(MessageError::TooLong);
+        }
+        let json = std::str::from_utf8(data).map_err(|_| MessageError::Utf8)?;
+        let (request, response) = scan(json.as_bytes())?;
+        let kind = match (request, response) {
+            (Some(r), _) => match r.as_str() {
+                "active checks" => Kind::ActiveChecks,
+                "agent data" => Kind::AgentData,
+                "sender data" => Kind::SenderData,
+                _ => Kind::OtherRequest(r),
+            },
+            (None, Some(r)) => Kind::Response(r),
+            (None, None) => return Err(MessageError::NoKind),
+        };
+        Ok(Message { kind, json: json.to_string() })
+    }
+
+    /// What the message is.
+    pub fn kind(&self) -> &Kind {
+        &self.kind
+    }
+
+    /// The JSON text, as it was sent or written.
+    pub fn json(&self) -> &str {
+        &self.json
+    }
+
+    /// The JSON text, taken out of the message without a copy.
+    pub fn into_json(self) -> String {
+        self.json
+    }
+
+    /// The message in a packet of uncompressed data.
+    pub fn to_packet(&self) -> Packet {
+        Packet::new(self.json.as_bytes().to_vec())
+    }
+
+    /// An active agent's request for the items to collect for `host`.
+    pub fn active_checks(host: &str) -> Result<Message, MessageError> {
+        let mut j = String::from(r#"{"request":"active checks","host":"#);
+        push_str(&mut j, host);
+        j.push('}');
+        Message::finish(Kind::ActiveChecks, j)
+    }
+
+    /// A sender's values for trapper items.
+    pub fn sender_data(values: &[SenderValue]) -> Result<Message, MessageError> {
+        let mut j = String::from(r#"{"request":"sender data","data":["#);
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                j.push(',');
+            }
+            j.push_str(r#"{"host":"#);
+            push_str(&mut j, &v.host);
+            j.push_str(r#","key":"#);
+            push_str(&mut j, &v.key);
+            j.push_str(r#","value":"#);
+            push_str(&mut j, &v.value);
+            j.push('}');
+            if j.len() > MAX_DATA {
+                return Err(MessageError::TooLong);
+            }
+        }
+        j.push_str("]}");
+        Message::finish(Kind::SenderData, j)
+    }
+
+    /// An active agent's collected values, in session `session`, sent at
+    /// `clock` seconds and `ns` nanoseconds. The caller gives the time,
+    /// since this module reads no clock.
+    pub fn agent_data(session: &str, values: &[AgentValue], clock: u64, ns: u32) -> Result<Message, MessageError> {
+        let mut j = String::from(r#"{"request":"agent data","session":"#);
+        push_str(&mut j, session);
+        j.push_str(r#","data":["#);
+        for (i, v) in values.iter().enumerate() {
+            if i > 0 {
+                j.push(',');
+            }
+            j.push_str(r#"{"host":"#);
+            push_str(&mut j, &v.host);
+            j.push_str(r#","key":"#);
+            push_str(&mut j, &v.key);
+            j.push_str(r#","value":"#);
+            push_str(&mut j, &v.value);
+            j.push_str(&format!(r#","id":{},"clock":{},"ns":{}}}"#, v.id, v.clock, v.ns));
+            if j.len() > MAX_DATA {
+                return Err(MessageError::TooLong);
+            }
+        }
+        j.push_str(&format!(r#"],"clock":{clock},"ns":{ns}}}"#));
+        Message::finish(Kind::AgentData, j)
+    }
+
+    /// A server's reply: `success` or `failed`, with an optional `info`
+    /// text such as `processed: 1; failed: 0; total: 1`.
+    pub fn response(success: bool, info: Option<&str>) -> Result<Message, MessageError> {
+        let word = if success { "success" } else { "failed" };
+        let mut j = format!(r#"{{"response":"{word}""#);
+        if let Some(info) = info {
+            j.push_str(r#","info":"#);
+            push_str(&mut j, info);
+        }
+        j.push('}');
+        Message::finish(Kind::Response(word.to_string()), j)
+    }
+
+    fn finish(kind: Kind, json: String) -> Result<Message, MessageError> {
+        if json.len() > MAX_DATA {
+            return Err(MessageError::TooLong);
+        }
+        Ok(Message { kind, json })
+    }
+}
+
+/// Appends `s` as a JSON string, quoted and escaped.
+fn push_str(out: &mut String, s: &str) {
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// Checks that `b` is one JSON value, and an object, and returns the
+/// values of its first top-level `request` and `response` members, each
+/// only if it is a string. It loops instead of
+/// recursing, with a stack no deeper than [`MAX_DEPTH`].
+fn scan(b: &[u8]) -> Result<(Option<String>, Option<String>), MessageError> {
+    let mut s = Scanner { b, i: 0 };
+    s.ws();
+    // Any well-formed JSON value is read to the end first, so text that is
+    // not JSON at all is a syntax error rather than "not an object".
+    let object = s.peek() == Some(b'{');
+    let mut request = None;
+    let mut response = None;
+    // true for an object, false for an array.
+    let mut stack: Vec<bool> = Vec::new();
+    // The top-level key whose value comes next, if it is the first
+    // `request` or `response` member.
+    let mut pending: Option<String> = None;
+    // Whether a top-level `request` and `response` member have come yet.
+    let mut seen = [false; 2];
+    'value: loop {
+        // A value is expected.
+        s.ws();
+        let at = s.i;
+        match s.peek() {
+            Some(b'{') => {
+                s.i += 1;
+                pending = None;
+                if stack.len() >= MAX_DEPTH {
+                    return Err(MessageError::TooDeep);
+                }
+                stack.push(true);
+                s.ws();
+                if s.peek() == Some(b'}') {
+                    s.i += 1;
+                    stack.pop();
+                } else {
+                    let key = s.key()?;
+                    if stack.len() == 1 {
+                        pending = claim(key, &mut seen);
+                    }
+                    continue 'value;
+                }
+            }
+            Some(b'[') => {
+                s.i += 1;
+                pending = None;
+                if stack.len() >= MAX_DEPTH {
+                    return Err(MessageError::TooDeep);
+                }
+                stack.push(false);
+                s.ws();
+                if s.peek() == Some(b']') {
+                    s.i += 1;
+                    stack.pop();
+                } else {
+                    continue 'value;
+                }
+            }
+            Some(b'"') => {
+                let v = s.string()?;
+                match pending.take().as_deref() {
+                    Some("request") => request = Some(v),
+                    Some("response") => response = Some(v),
+                    _ => {}
+                }
+            }
+            Some(b'-' | b'0'..=b'9') => {
+                pending = None;
+                s.number()?;
+            }
+            Some(b't') => {
+                pending = None;
+                s.literal(b"true")?;
+            }
+            Some(b'f') => {
+                pending = None;
+                s.literal(b"false")?;
+            }
+            Some(b'n') => {
+                pending = None;
+                s.literal(b"null")?;
+            }
+            _ => return Err(MessageError::Syntax(at)),
+        }
+        // A value ended.
+        loop {
+            s.ws();
+            let Some(&top) = stack.last() else {
+                // The top-level object ended.
+                return if s.i != b.len() {
+                    Err(MessageError::Syntax(s.i))
+                } else if !object {
+                    Err(MessageError::NotObject)
+                } else {
+                    Ok((request, response))
+                };
+            };
+            match s.peek() {
+                Some(b',') => {
+                    s.i += 1;
+                    if top {
+                        s.ws();
+                        let key = s.key()?;
+                        if stack.len() == 1 {
+                            pending = claim(key, &mut seen);
+                        }
+                    }
+                    continue 'value;
+                }
+                Some(b'}') if top => {
+                    s.i += 1;
+                    stack.pop();
+                }
+                Some(b']') if !top => {
+                    s.i += 1;
+                    stack.pop();
+                }
+                _ => return Err(MessageError::Syntax(s.i)),
+            }
+        }
+    }
+}
+
+/// Keeps a top-level key only if it is the first `request` or the first
+/// `response` member, so a later one never stands in for an earlier one.
+fn claim(key: String, seen: &mut [bool; 2]) -> Option<String> {
+    let slot = match key.as_str() {
+        "request" => &mut seen[0],
+        "response" => &mut seen[1],
+        _ => return None,
+    };
+    if std::mem::replace(slot, true) { None } else { Some(key) }
+}
+
+struct Scanner<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl Scanner<'_> {
+    fn peek(&self) -> Option<u8> {
+        self.b.get(self.i).copied()
+    }
+
+    fn ws(&mut self) {
+        while matches!(self.peek(), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+            self.i += 1;
+        }
+    }
+
+    /// An object key, then the colon after it.
+    fn key(&mut self) -> Result<String, MessageError> {
+        if self.peek() != Some(b'"') {
+            return Err(MessageError::Syntax(self.i));
+        }
+        let key = self.string()?;
+        self.ws();
+        if self.peek() != Some(b':') {
+            return Err(MessageError::Syntax(self.i));
+        }
+        self.i += 1;
+        Ok(key)
+    }
+
+    fn literal(&mut self, word: &[u8]) -> Result<(), MessageError> {
+        if self.b.get(self.i..).is_some_and(|rest| rest.starts_with(word)) {
+            self.i += word.len();
+            Ok(())
+        } else {
+            Err(MessageError::Syntax(self.i))
+        }
+    }
+
+    fn digits(&mut self) -> usize {
+        let from = self.i;
+        while matches!(self.peek(), Some(b'0'..=b'9')) {
+            self.i += 1;
+        }
+        self.i - from
+    }
+
+    fn number(&mut self) -> Result<(), MessageError> {
+        if self.peek() == Some(b'-') {
+            self.i += 1;
+        }
+        match self.peek() {
+            Some(b'0') => self.i += 1,
+            Some(b'1'..=b'9') => {
+                self.digits();
+            }
+            _ => return Err(MessageError::Syntax(self.i)),
+        }
+        if self.peek() == Some(b'.') {
+            self.i += 1;
+            if self.digits() == 0 {
+                return Err(MessageError::Syntax(self.i));
+            }
+        }
+        if matches!(self.peek(), Some(b'e' | b'E')) {
+            self.i += 1;
+            if matches!(self.peek(), Some(b'+' | b'-')) {
+                self.i += 1;
+            }
+            if self.digits() == 0 {
+                return Err(MessageError::Syntax(self.i));
+            }
+        }
+        Ok(())
+    }
+
+    fn hex4(&mut self) -> Result<u32, MessageError> {
+        let mut v = 0u32;
+        for _ in 0..4 {
+            let d = match self.peek() {
+                Some(c @ b'0'..=b'9') => c - b'0',
+                Some(c @ b'a'..=b'f') => c - b'a' + 10,
+                Some(c @ b'A'..=b'F') => c - b'A' + 10,
+                _ => return Err(MessageError::Syntax(self.i)),
+            };
+            v = (v << 4) | u32::from(d);
+            self.i += 1;
+        }
+        Ok(v)
+    }
+
+    /// A string starting at the opening quote, decoded. The input is
+    /// already known to be UTF-8, so bytes copied whole stay UTF-8.
+    fn string(&mut self) -> Result<String, MessageError> {
+        self.i += 1;
+        let mut out: Vec<u8> = Vec::new();
+        loop {
+            let at = self.i;
+            let Some(c) = self.peek() else {
+                return Err(MessageError::Syntax(at));
+            };
+            self.i += 1;
+            match c {
+                b'"' => break,
+                0..=0x1f => return Err(MessageError::Syntax(at)),
+                b'\\' => {
+                    let Some(e) = self.peek() else {
+                        return Err(MessageError::Syntax(self.i));
+                    };
+                    self.i += 1;
+                    let ch = match e {
+                        b'"' => '"',
+                        b'\\' => '\\',
+                        b'/' => '/',
+                        b'b' => '\u{8}',
+                        b'f' => '\u{c}',
+                        b'n' => '\n',
+                        b'r' => '\r',
+                        b't' => '\t',
+                        b'u' => {
+                            let hi = self.hex4()?;
+                            let code = if (0xd800..0xdc00).contains(&hi) {
+                                if self.peek() != Some(b'\\') || self.b.get(self.i + 1) != Some(&b'u') {
+                                    return Err(MessageError::Syntax(self.i));
+                                }
+                                self.i += 2;
+                                let lo = self.hex4()?;
+                                if !(0xdc00..0xe000).contains(&lo) {
+                                    return Err(MessageError::Syntax(self.i));
+                                }
+                                0x10000 + ((hi - 0xd800) << 10) + (lo - 0xdc00)
+                            } else {
+                                hi
+                            };
+                            match char::from_u32(code) {
+                                Some(ch) => ch,
+                                None => return Err(MessageError::Syntax(self.i)),
+                            }
+                        }
+                        _ => return Err(MessageError::Syntax(self.i - 1)),
+                    };
+                    let mut buf = [0u8; 4];
+                    out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                }
+                c => out.push(c),
+            }
+        }
+        String::from_utf8(out).map_err(|_| MessageError::Utf8)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn packet_bytes(flags: u8, data: &[u8], reserved: u32) -> Vec<u8> {
+        let mut v = b"ZBXD".to_vec();
+        v.push(flags);
+        v.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        v.extend_from_slice(&reserved.to_le_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    // The manual's Python example builds a packet as
+    // b"ZBXD\1" + struct.pack("<II", len(data), 0) + data.
+    #[test]
+    fn header_example() {
+        let data = b"agent.ping";
+        let bytes = packet_bytes(1, data, 0);
+        assert_eq!(&bytes[..13], b"ZBXD\x01\x0a\x00\x00\x00\x00\x00\x00\x00");
+        let (p, used) = Packet::parse(&bytes).unwrap().unwrap();
+        assert_eq!(used, bytes.len());
+        assert_eq!(p, Packet::new(data.to_vec()));
+        assert_eq!(p.to_bytes(), bytes);
+        assert!(!p.is_compressed());
+        assert!(!p.is_large());
+        assert_eq!(p.uncompressed_len(), None);
+    }
+
+    #[test]
+    fn compressed_and_large_headers() {
+        // Compressed: the reserved length is the size before compression.
+        let bytes = packet_bytes(0x03, &[0x78, 0x9c, 1, 2], 100);
+        let (p, _) = Packet::parse(&bytes).unwrap().unwrap();
+        assert!(p.is_compressed());
+        assert_eq!(p.uncompressed_len(), Some(100));
+        assert_eq!(p.data, [0x78, 0x9c, 1, 2]);
+        assert_eq!(p.to_bytes(), bytes);
+
+        // Large: 8-byte lengths.
+        let mut big = b"ZBXD\x05".to_vec();
+        big.extend_from_slice(&3u64.to_le_bytes());
+        big.extend_from_slice(&0u64.to_le_bytes());
+        big.extend_from_slice(b"abc");
+        let (h, hl) = Header::parse(&big).unwrap().unwrap();
+        assert_eq!(hl, LARGE_HEADER_LEN);
+        assert_eq!(h, Header { flags: 5, data_len: 3, reserved: 0 });
+        let (p, used) = Packet::parse(&big).unwrap().unwrap();
+        assert_eq!(used, big.len());
+        assert!(p.is_large());
+        assert_eq!(p.to_bytes(), big);
+
+        // A reserved length over 4 bytes forces the large flag.
+        let h = Header { flags: 0x03, data_len: 1, reserved: 1 << 40 };
+        let bytes = h.to_bytes();
+        assert_eq!(bytes[4], 0x07);
+        assert_eq!(Header::parse(&bytes), Ok(Some((Header { flags: 0x07, ..h }, LARGE_HEADER_LEN))));
+        // Unknown bits are cleared and the protocol bit is set on writing.
+        let p = Packet { flags: 0xf8, reserved: 0, data: vec![] };
+        assert_eq!(p.to_bytes(), packet_bytes(1, &[], 0));
+    }
+
+    #[test]
+    fn packet_errors() {
+        assert_eq!(Packet::parse(b"ZBXE"), Err(PacketError::Magic));
+        assert_eq!(Packet::parse(b"X"), Err(PacketError::Magic));
+        assert_eq!(Packet::parse(b"HTTP/1.1"), Err(PacketError::Magic));
+        assert_eq!(Packet::parse(b"ZBXD\x00"), Err(PacketError::Flags(0)));
+        assert_eq!(Packet::parse(b"ZBXD\x02"), Err(PacketError::Flags(2)));
+        assert_eq!(Packet::parse(b"ZBXD\x09"), Err(PacketError::Flags(9)));
+        let bytes = packet_bytes(1, b"hello", 0);
+        assert_eq!(Packet::parse_limited(&bytes, 4), Err(PacketError::TooLarge { len: 5, limit: 4 }));
+        assert!(Packet::parse_limited(&bytes, 5).unwrap().is_some());
+        // Over the limit is known from the header alone.
+        assert_eq!(Packet::parse_limited(&bytes[..13], 4), Err(PacketError::TooLarge { len: 5, limit: 4 }));
+        let mut huge = b"ZBXD\x05".to_vec();
+        huge.extend_from_slice(&u64::MAX.to_le_bytes());
+        huge.extend_from_slice(&0u64.to_le_bytes());
+        assert_eq!(Packet::parse(&huge), Err(PacketError::TooLarge { len: u64::MAX, limit: MAX_DATA }));
+        // A limit over MAX_DATA counts as MAX_DATA.
+        assert_eq!(Decoder::with_limit(usize::MAX).limit(), MAX_DATA);
+        for e in [PacketError::Magic, PacketError::Flags(0), PacketError::TooLarge { len: 1, limit: 0 }] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    // Zabbix checks the reserved length against its maximum too, whether
+    // or not the data is compressed.
+    #[test]
+    fn reserved_length_is_checked_against_the_limit() {
+        let bytes = packet_bytes(3, &[0x78, 0x9c], 100);
+        assert_eq!(Packet::parse_limited(&bytes, 99), Err(PacketError::ReservedTooLarge { len: 100, limit: 99 }));
+        assert!(Packet::parse_limited(&bytes, 100).unwrap().is_some());
+        // Known from the header alone.
+        assert_eq!(Packet::parse_limited(&bytes[..13], 99), Err(PacketError::ReservedTooLarge { len: 100, limit: 99 }));
+        let plain = packet_bytes(1, b"x", 5);
+        assert_eq!(Packet::parse_limited(&plain, 4), Err(PacketError::ReservedTooLarge { len: 5, limit: 4 }));
+        let mut d = Decoder::with_limit(10);
+        d.feed(&packet_bytes(3, &[1], 11)[..13]);
+        assert_eq!(d.next_packet(), Some(Err(PacketError::ReservedTooLarge { len: 11, limit: 10 })));
+        // The writer keeps the reserved length within MAX_DATA, so what it
+        // writes reads back.
+        let p = Packet { flags: 0x03, reserved: 1 << 40, data: vec![1] };
+        let bytes = p.to_bytes();
+        let (back, _) = Packet::parse(&bytes).unwrap().unwrap();
+        assert_eq!(back.reserved, MAX_DATA as u64);
+        assert!(!PacketError::ReservedTooLarge { len: 1, limit: 0 }.to_string().is_empty());
+    }
+
+    // Text that is not JSON at all is a syntax error, not "not an object".
+    #[test]
+    fn malformed_json_is_a_syntax_error() {
+        use MessageError::*;
+        assert_eq!(Message::parse(b"abc"), Err(Syntax(0)));
+        assert_eq!(Message::parse(b"agent.ping"), Err(Syntax(0)));
+        assert_eq!(Message::parse(b"[1,"), Err(Syntax(3)));
+        assert_eq!(Message::parse(b"\"abc"), Err(Syntax(4)));
+        assert_eq!(Message::parse(b"[1] x"), Err(Syntax(4)));
+        assert_eq!(Message::parse(b" [1] "), Err(NotObject));
+        assert_eq!(Message::parse(b"12"), Err(NotObject));
+        assert_eq!(Message::parse(b"null"), Err(NotObject));
+    }
+
+    // Parse says the first of a repeated member counts. A later string
+    // must not stand in for a first one that is not a string.
+    #[test]
+    fn first_member_counts_even_when_not_a_string() {
+        use MessageError::*;
+        assert_eq!(Message::parse(br#"{"request":1,"request":"x"}"#), Err(NoKind));
+        assert_eq!(Message::parse(br#"{"response":null,"response":"success"}"#), Err(NoKind));
+        let m = Message::parse(br#"{"request":[],"response":"failed","request":"active checks"}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::Response("failed".into()));
+        let m = Message::parse(br#"{"request":{"a":"b"},"request":"x","response":"success"}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::Response("success".into()));
+    }
+
+    #[test]
+    fn every_truncated_prefix_needs_more() {
+        let mut large = b"ZBXD\x07".to_vec();
+        large.extend_from_slice(&4u64.to_le_bytes());
+        large.extend_from_slice(&9u64.to_le_bytes());
+        large.extend_from_slice(b"wxyz");
+        for bytes in [packet_bytes(1, b"{\"request\":\"active checks\",\"host\":\"a\"}", 0), large] {
+            for n in 0..bytes.len() {
+                assert_eq!(Packet::parse(&bytes[..n]), Ok(None), "{n} bytes");
+            }
+            assert!(Packet::parse(&bytes).unwrap().is_some());
+        }
+        let json = br#"{"request":"agent data","data":[{"a":[1.5e3,true,null,"\u00e9"]}]}"#;
+        assert!(Message::parse(json).is_ok());
+        for n in 0..json.len() {
+            assert!(Message::parse(&json[..n]).is_err(), "{n} bytes");
+        }
+    }
+
+    // Message examples from the manual's protocol pages.
+    #[test]
+    fn message_examples() {
+        let m = Message::parse(br#"{"request":"sender data","data":[{"host":"<hostname>","key":"trap","value":"test value"}]}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::SenderData);
+        let m = Message::parse(
+            br#"{"response":"success","info":"processed: 1; failed: 0; total: 1; seconds spent: 0.060753"}"#,
+        )
+        .unwrap();
+        assert_eq!(m.kind(), &Kind::Response("success".into()));
+        let m = Message::parse(br#"{"request":"active checks","host":"Zabbix server","host_metadata":"mysql,nginx","hostinterface":"zabbix.server.lan","ip":"159.168.1.1","port":12050}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::ActiveChecks);
+        let m = Message::parse(br#"{"request":"agent data","session":"1234456akdsjhfoui","data":[{"host":"Zabbix server","key":"agent.version","value":"2.4.0","id":1,"clock":1400675595,"ns":76808644}],"clock":1400675595,"ns":78211329}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::AgentData);
+        let m = Message::parse(br#" { "request" : "proxy config" } "#).unwrap();
+        assert_eq!(m.kind(), &Kind::OtherRequest("proxy config".into()));
+        // Escapes in the kind are decoded; the first member wins; a
+        // nested request does not count.
+        let m = Message::parse(br#"{"x":{"request":"no"},"request":"sender\u0020data","request":"later"}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::SenderData);
+        let m = Message::parse(br#"{"response":"failed","request":"active checks"}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::ActiveChecks);
+        let m = Message::parse(br#"{"k":"\ud83d\ude00","request":"\ud83d\ude00"}"#).unwrap();
+        assert_eq!(m.kind(), &Kind::OtherRequest("\u{1f600}".into()));
+    }
+
+    #[test]
+    fn message_errors() {
+        use MessageError::*;
+        assert_eq!(Message::parse(b"{\"request\":\"\xff\"}"), Err(Utf8));
+        assert_eq!(Message::parse(b""), Err(Syntax(0)));
+        assert_eq!(Message::parse(b"  "), Err(Syntax(2)));
+        assert_eq!(Message::parse(b"[]"), Err(NotObject));
+        assert_eq!(Message::parse(b"\"request\""), Err(NotObject));
+        assert_eq!(Message::parse(b"{}"), Err(NoKind));
+        assert_eq!(Message::parse(br#"{"request":1}"#), Err(NoKind));
+        assert_eq!(Message::parse(br#"{"a":{"request":"x"}}"#), Err(NoKind));
+        let deep = format!("{{\"request\":\"x\",\"a\":{}{}}}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert_eq!(Message::parse(deep.as_bytes()), Err(TooDeep));
+        let ok = format!("{{\"request\":\"x\",\"a\":{}{}}}", "[".repeat(MAX_DEPTH - 1), "]".repeat(MAX_DEPTH - 1));
+        assert!(Message::parse(ok.as_bytes()).is_ok());
+        for bad in [
+            &br#"{"request":"x",}"#[..],
+            br#"{"request":"x"} x"#,
+            br#"{"request":"x"}}"#,
+            br#"{"request" "x"}"#,
+            br#"{request:"x"}"#,
+            br#"{"request":"x","a":01}"#,
+            br#"{"request":"x","a":1.}"#,
+            br#"{"request":"x","a":1e}"#,
+            br#"{"request":"x","a":-}"#,
+            br#"{"request":"x","a":tru}"#,
+            br#"{"request":"x","a":[1,]}"#,
+            br#"{"request":"x","a":[1}"#,
+            br#"{"request":"x","a":"\q"}"#,
+            br#"{"request":"x","a":"\u12"}"#,
+            br#"{"request":"x","a":"\ud800"}"#,
+            br#"{"request":"x","a":"\ud800\u0041"}"#,
+            br#"{"request":"x","a":"\udc00"}"#,
+            b"{\"request\":\"x\",\"a\":\"\x01\"}",
+            br#"{"request":"x","a":+1}"#,
+        ] {
+            assert!(matches!(Message::parse(bad), Err(Syntax(_))), "{}", String::from_utf8_lossy(bad));
+        }
+        for e in [Utf8, Syntax(3), TooDeep, NotObject, NoKind, TooLong] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn writers_round_trip() {
+        let m = Message::active_checks("web \"1\"\n\u{1}").unwrap();
+        assert_eq!(m.json(), r#"{"request":"active checks","host":"web \"1\"\n\u0001"}"#);
+        let sv = SenderValue { host: "h".into(), key: "k[\\]".into(), value: "v\t".into() };
+        let av = AgentValue { host: "h".into(), key: "agent.version".into(), value: "7.0".into(), id: 1, clock: 1400675595, ns: 76808644 };
+        let all = [
+            m,
+            Message::sender_data(&[sv.clone(), sv]).unwrap(),
+            Message::sender_data(&[]).unwrap(),
+            Message::agent_data("s", &[av.clone(), av], 1400675595, 78211329).unwrap(),
+            Message::response(true, Some("processed: 1; failed: 0; total: 1")).unwrap(),
+            Message::response(false, None).unwrap(),
+        ];
+        for m in all {
+            let bytes = m.to_packet().to_bytes();
+            let (p, used) = Packet::parse(&bytes).unwrap().unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(Message::parse(&p.data).unwrap(), m);
+        }
+        let m = Message::response(true, None).unwrap();
+        assert_eq!(m.clone().into_json(), m.json());
+        assert_eq!(
+            Message::sender_data(&[SenderValue { host: "a".into(), key: "b".into(), value: "c".into() }]).unwrap().json(),
+            r#"{"request":"sender data","data":[{"host":"a","key":"b","value":"c"}]}"#
+        );
+    }
+
+    #[test]
+    fn decoder_splits_a_stream() {
+        let a = Message::active_checks("a").unwrap().to_packet().to_bytes();
+        let b = Packet { flags: 3, reserved: 7, data: vec![1, 2, 3] }.to_bytes();
+        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
+        let mut d = Decoder::default();
+        let mut got = Vec::new();
+        for byte in &stream {
+            d.feed(std::slice::from_ref(byte));
+            while let Some(p) = d.next_packet() {
+                got.push(p.unwrap());
+            }
+        }
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1].uncompressed_len(), Some(7));
+        assert_eq!(d.buffered(), 0);
+        // A packet over the limit breaks the stream for good.
+        let mut d = Decoder::with_limit(4);
+        d.feed(&packet_bytes(1, b"hello", 0)[..13]);
+        assert_eq!(d.next_packet(), Some(Err(PacketError::TooLarge { len: 5, limit: 4 })));
+        d.feed(&a);
+        assert_eq!(d.next_packet(), Some(Err(PacketError::TooLarge { len: 5, limit: 4 })));
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn decoder_takes_many_small_packets_in_linear_time() {
+        let one = Packet::new(vec![b'x'; 3]).to_bytes();
+        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+        let started = std::time::Instant::now();
+        let mut d = Decoder::new();
+        d.feed(&stream);
+        let mut n = 0;
+        while let Some(p) = d.next_packet() {
+            p.unwrap();
+            n += 1;
+        }
+        assert_eq!(n, 200_000);
+        assert_eq!(d.buffered(), 0);
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: usize) -> usize {
+            self.next() as usize % n
+        }
+    }
+
+    fn check_stream(data: &[u8], limit: usize) {
+        let mut whole = Decoder::with_limit(limit);
+        whole.feed(data);
+        let mut packets = Vec::new();
+        let mut first_err = None;
+        while let Some(r) = whole.next_packet() {
+            match r {
+                Ok(p) => packets.push(p),
+                Err(e) => {
+                    first_err = Some(e);
+                    break;
+                }
+            }
+        }
+        let mut bytewise = Decoder::with_limit(limit);
+        let mut again = Vec::new();
+        let mut err_again = None;
+        for b in data {
+            bytewise.feed(std::slice::from_ref(b));
+            while let Some(r) = bytewise.next_packet() {
+                match r {
+                    Ok(p) => again.push(p),
+                    Err(e) => {
+                        err_again = Some(e);
+                        break;
+                    }
+                }
+            }
+            if err_again.is_some() {
+                break;
+            }
+        }
+        assert_eq!(packets, again);
+        assert_eq!(first_err, err_again);
+        for p in &packets {
+            let bytes = p.to_bytes();
+            let (back, used) = Packet::parse(&bytes).unwrap().unwrap();
+            assert_eq!(&back, p);
+            assert_eq!(used, bytes.len());
+            if let Ok(m) = Message::parse(&p.data) {
+                assert_eq!(m.json().as_bytes(), &p.data[..]);
+                assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
+            }
+        }
+        let _ = Message::parse(data);
+        let _ = Header::parse(data);
+        if let Ok(Some((p, used))) = Packet::parse(data) {
+            assert!(used <= data.len());
+            assert_eq!(Packet::parse(&p.to_bytes()), Ok(Some((p.clone(), used))));
+        }
+        // Writers take any text, and what they write reads back.
+        let text = String::from_utf8_lossy(data);
+        let m = Message::active_checks(&text).unwrap();
+        assert_eq!(Message::parse(m.json().as_bytes()), Ok(m));
+        let m = Message::response(false, Some(&text)).unwrap();
+        assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
+        let v = SenderValue { host: text.to_string(), key: text.to_string(), value: text.to_string() };
+        let m = Message::sender_data(&[v]).unwrap();
+        assert_eq!(Message::parse(m.json().as_bytes()), Ok(m));
+    }
+
+    #[test]
+    fn lcg_fuzz() {
+        let mut r = Lcg(0x5e_ed2a_bb1c);
+        let seeds: Vec<Vec<u8>> = vec![
+            packet_bytes(1, br#"{"request":"sender data","data":[{"host":"h","key":"k","value":"1"}]}"#, 0),
+            packet_bytes(3, &[0x78, 0x9c, 0, 0], 40),
+            Packet { flags: 5, reserved: 0, data: br#"{"response":"success"}"#.to_vec() }.to_bytes(),
+            Message::agent_data("s", &[], 1, 2).unwrap().to_packet().to_bytes(),
+        ];
+        let alphabet = b"{}[]\":,\\ -0123456789.eEtrufalsnquxdABZD\x01\x05\x07";
+        for round in 0..6000 {
+            let mut buf = Vec::new();
+            match round % 3 {
+                0 => {
+                    // Random bytes, often starting with a header.
+                    if r.below(2) == 0 {
+                        buf.extend_from_slice(b"ZBXD");
+                        buf.push([1, 3, 5, 7, 0, 9][r.below(6)]);
+                        let n = r.below(40) as u32;
+                        buf.extend_from_slice(&n.to_le_bytes());
+                        buf.extend_from_slice(&[0; 4]);
+                    }
+                    for _ in 0..r.below(60) {
+                        buf.push(r.next() as u8);
+                    }
+                }
+                1 => {
+                    // Valid packets, joined, then mutated.
+                    for _ in 0..1 + r.below(3) {
+                        buf.extend_from_slice(&seeds[r.below(seeds.len())]);
+                    }
+                    for _ in 0..r.below(4) {
+                        let i = r.below(buf.len());
+                        buf[i] = r.next() as u8;
+                    }
+                    buf.truncate(r.below(buf.len() + 1));
+                }
+                _ => {
+                    // JSON-shaped text, alone and in a packet.
+                    let mut j = b"{\"request\":".to_vec();
+                    for _ in 0..r.below(40) {
+                        j.push(alphabet[r.below(alphabet.len())]);
+                    }
+                    let _ = Message::parse(&j);
+                    buf = packet_bytes(1, &j, 0);
+                }
+            }
+            check_stream(&buf, [4, 30, DEFAULT_LIMIT][r.below(3)]);
+        }
+    }
+}

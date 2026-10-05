@@ -2,32 +2,56 @@
 //! matching on any strings.
 #![no_main]
 
-use fictionet::stdlib::mqtt::{Decoder, MAX_PACKET, Packet, check_topic_filter, check_topic_name, topic_matches};
+use fictionet::stdlib::mqtt::{
+    ConnAck, ConnectReturnCode, Decoder, Error, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
+    topic_matches,
+};
 use libfuzzer_sys::fuzz_target;
+
+/// Feeds `data` to `d` in pieces of `piece` bytes, taking packets out as
+/// they come, until it ends or the stream breaks. It returns the packets,
+/// the error if there was one, and the bytes still held.
+fn run(d: &mut Decoder, data: &[u8], piece: usize) -> (Vec<Packet>, Option<Error>, usize) {
+    let mut packets = Vec::new();
+    for chunk in data.chunks(piece.max(1)) {
+        let mut rest = chunk;
+        loop {
+            let n = d.feed(rest);
+            assert!(d.buffered() <= d.capacity());
+            rest = &rest[n..];
+            let mut took = false;
+            while let Some(p) = d.next_packet() {
+                match p {
+                    Ok(p) => packets.push(p),
+                    Err(e) => return (packets, Some(e), d.buffered()),
+                }
+                took = true;
+            }
+            if rest.is_empty() {
+                break;
+            }
+            assert!(n > 0 || took, "a full decoder gave nothing");
+        }
+    }
+    (packets, None, d.buffered())
+}
 
 fuzz_target!(|data: &[u8]| {
     // The stream, split two ways: all at once, and a byte at a time. The
-    // decoders take packets as large as Packet::parse does, so a large
-    // input reads the same both ways.
-    let mut whole = Decoder::with_max_packet(MAX_PACKET);
-    whole.feed(data);
-    let mut packets = Vec::new();
-    while let Some(Ok(p)) = whole.next_packet() {
-        packets.push(p);
-    }
-    let mut bytewise = Decoder::with_max_packet(MAX_PACKET);
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(p)) = bytewise.next_packet() {
-            again.push(p);
-        }
-    }
-    assert_eq!(packets, again);
+    // packets, the error and the bytes left must agree, at the largest
+    // limit, which Packet::parse uses, and at a small one taken from the
+    // input.
+    let whole = run(&mut Decoder::with_max_packet(MAX_PACKET), data, data.len());
+    assert_eq!(run(&mut Decoder::with_max_packet(MAX_PACKET), data, 1), whole);
+    let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
+    let small_whole = run(&mut Decoder::with_max_packet(small), data, data.len());
+    assert_eq!(run(&mut Decoder::with_max_packet(small), data, 1), small_whole);
+    let packets = whole.0;
 
     for p in &packets {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes().unwrap();
+        assert_eq!(p.encoded_len(), Ok(bytes.len()));
         let (back, used) = Packet::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, p);
         assert_eq!(used, bytes.len());
@@ -35,6 +59,33 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(Some((p, used))) = Packet::parse(data) {
         assert!(used <= data.len());
         assert_eq!(packets.first(), Some(&p));
+    }
+
+    // Values built from the bytes, not read: whatever the writer takes
+    // reads back as the same value.
+    if let [a, b, c, rest @ ..] = data {
+        let mut built = Vec::new();
+        if let Some(code) = ConnectReturnCode::from_code(*b % 8) {
+            built.push(Packet::ConnAck(ConnAck { session_present: a & 1 != 0, code }));
+        }
+        if let (Some(qos), Ok(topic)) = (QoS::from_level(a & 3), std::str::from_utf8(&rest[..rest.len().min(8)])) {
+            let id = u16::from_be_bytes([*b, *c]);
+            built.push(Packet::Publish(Publish {
+                dup: a & 4 != 0,
+                qos,
+                retain: a & 8 != 0,
+                topic: topic.to_string(),
+                packet_id: if a & 16 != 0 { Some(id) } else { None },
+                payload: rest.to_vec(),
+            }));
+        }
+        for p in built {
+            let written = p.to_bytes();
+            assert_eq!(p.encoded_len(), written.as_ref().map(Vec::len).map_err(|e| *e));
+            if let Ok(bytes) = written {
+                assert_eq!(Packet::parse(&bytes), Ok(Some((p, bytes.len()))));
+            }
+        }
     }
 
     // The bytes as a filter and a topic, split at the first 0xff.

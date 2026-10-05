@@ -7,7 +7,7 @@
 //! data and news. It ends each command with a tagged response: the same
 //! tag, then `OK`, `NO` or `BAD`. This module follows RFC 3501 (IMAP4rev1)
 //! and RFC 9051 (IMAP4rev2), with the non-synchronizing literals of RFC
-//! 7888.
+//! 7888 and the binary literals of RFC 3516.
 //!
 //! An argument is an atom (`INBOX`, `1:*`, `\Seen`, `BODY[HEADER]`), a
 //! quoted string (`"Sent Items"`), a parenthesized list, or a literal. A
@@ -15,7 +15,7 @@
 //! line goes on after them. For a synchronizing literal, `{n}`, the client
 //! waits for a continuation request (a line that starts with `+`) before
 //! it sends the bytes. For a non-synchronizing one, `{n+}`, it does not
-//! wait.
+//! wait. A binary literal, `~{n}`, may also hold NUL bytes.
 //!
 //! Nothing here reads a socket. A world that plays a mail server feeds
 //! the bytes it reads from a TCP connection to a [`Decoder`] and takes
@@ -70,10 +70,12 @@ pub const MAX_DEPTH: usize = 32;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
     /// A bare word, such as `INBOX`, `NIL`, `42`, `1:*`, `\Seen` or
-    /// `BODY[HEADER.FIELDS (FROM)]`. A section in square brackets may hold
-    /// spaces and parentheses. A reader rejects a `[` with no `]` after
-    /// it on the line, such as `SELECT foo[`, though IMAP allows it. A
-    /// writer sends a string that is not a word as a quoted string or a
+    /// `BODY[HEADER.FIELDS (FROM)]`. The section in square brackets after
+    /// `BODY`, `BODY.PEEK`, `BINARY`, `BINARY.PEEK` or `BINARY.SIZE` may
+    /// hold spaces, parentheses and quoted strings; a reader writes a
+    /// literal there, such as a header name sent as `{4}`, as a quoted
+    /// string. Anywhere else `[` is an ordinary character, as in `foo[`.
+    /// A writer sends a string that is not a word as a quoted string or a
     /// literal.
     Atom(String),
     /// A string in double quotes, with its escapes undone. A writer sends
@@ -94,8 +96,25 @@ pub enum Value {
         /// Servers always write `{n}`, so this is false in responses.
         non_sync: bool,
     },
+    /// A binary literal, `~{n}` (RFC 3516 and RFC 9051 `literal8`), as
+    /// in APPEND and in a FETCH `BINARY[...]` response. It may hold any
+    /// bytes, NUL included. A writer cuts it to [`MAX_LITERAL`].
+    Binary {
+        /// The literal's bytes.
+        data: Vec<u8>,
+        /// Whether it was `~{n+}`, which the client sends without
+        /// waiting. Servers always write `~{n}`.
+        non_sync: bool,
+    },
     /// A parenthesized list. A writer sends a list nested deeper than
     /// [`MAX_DEPTH`] as `NIL`.
+    ///
+    /// In a response, the lists at the start of a list are written next
+    /// to each other with no space, as IMAP wants for the body parts of a
+    /// multipart BODYSTRUCTURE, `((...)(...) "MIXED")`, and for the
+    /// addresses in an ENVELOPE, `((...)(...))`. Every other item is set
+    /// off by a space. A response reader takes lists with or without a
+    /// space between them.
     List(Vec<Value>),
 }
 
@@ -120,12 +139,12 @@ impl Value {
         Value::atom("NIL")
     }
 
-    /// The bytes of an atom, quoted string or literal. Check
+    /// The bytes of an atom, quoted string or literal of either kind. Check
     /// [`Value::is_nil`] first where `NIL` may come.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match self {
             Value::Atom(a) => Some(a.as_bytes()),
-            Value::Quoted(b) | Value::Literal { data: b, .. } => Some(b),
+            Value::Quoted(b) | Value::Literal { data: b, .. } | Value::Binary { data: b, .. } => Some(b),
             Value::List(_) => None,
         }
     }
@@ -212,18 +231,49 @@ impl Command {
         Ok(Command { tag: tag_s, name, args })
     }
 
-    /// The command's bytes, for a world that plays a client. Literals go
-    /// out with the rest, so a world that waits for continuation requests
-    /// should use non-synchronizing ones. A byte the tag or name cannot
-    /// hold is written as `x` or `X`, and an empty one as that letter.
+    /// The command's bytes, for a world that plays a client, all in one
+    /// piece. They hold every literal's bytes right after its `{n}`, so
+    /// where the command has a synchronizing literal, send the pieces of
+    /// [`Command::to_chunks`] instead. A byte the tag or name cannot hold
+    /// is written as `x` or `X`, and an empty one as that letter.
     /// Arguments that would push the command past [`MAX_TEXT`] or
     /// [`MAX_MESSAGE`] are left out, from the first that does not fit.
+    ///
+    /// A string that must go as a literal (see [`Value::Quoted`]) goes as
+    /// a non-synchronizing one, `{n+}`, when it is at most 4096 bytes,
+    /// which every IMAP4rev2 server takes (RFC 9051, section 4.3), and as
+    /// a synchronizing one, `{n}`, when it is longer.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = clean(&self.tag, tag_char, b'x', MAX_TEXT - 5);
+        self.write(&mut Vec::new())
+    }
+
+    /// The command's bytes cut after each synchronizing literal's `{n}`
+    /// and CRLF. A client sends the first piece, and each later one only
+    /// after the server's continuation request. Joined, the pieces are
+    /// [`Command::to_bytes`].
+    pub fn to_chunks(&self) -> Vec<Vec<u8>> {
+        let mut splits = Vec::new();
+        let mut bytes = self.write(&mut splits);
+        let mut chunks = Vec::with_capacity(splits.len() + 1);
+        for &at in splits.iter().rev() {
+            chunks.push(bytes.split_off(at));
+        }
+        chunks.push(bytes);
+        chunks.reverse();
+        chunks
+    }
+
+    /// Writes the command, noting where each synchronizing literal's
+    /// bytes start in `splits`.
+    fn write(&self, splits: &mut Vec<usize>) -> Vec<u8> {
+        // The shortest command is `tag SP name CRLF`, with a name of one
+        // byte.
+        let mut out = clean(&self.tag, tag_char, b'x', MAX_TEXT - 4);
         out.push(b' ');
-        let name = clean(&self.name.to_ascii_uppercase(), atom_char, b'X', MAX_TEXT - 2 - out.len());
+        let mut name = clean(&self.name, atom_char, b'X', MAX_TEXT - 2 - out.len());
+        name.make_ascii_uppercase();
         out.extend_from_slice(&name);
-        write_args(&mut out, &self.args, false, false);
+        write_args(&mut out, &self.args, false, false, splits);
         out.extend_from_slice(b"\r\n");
         out
     }
@@ -442,33 +492,40 @@ impl Response {
     }
 
     /// The response's bytes. A status word is always followed by a
-    /// space, as is a code, even with no text after it. CR, LF and NUL in
-    /// text become spaces, and a `]` in a code becomes a space. Text that
-    /// starts with a bracketed word and has no code reads back as a code.
-    /// Text past [`MAX_TEXT`] is cut, and data items that would not fit
-    /// are left out, from the first that does not.
+    /// space, as is a code, even with no text after it, unless a tag so
+    /// long leaves no room for the space. CR, LF and NUL in text become
+    /// spaces, and a `]` in a code becomes a space. Text that starts with
+    /// a bracketed word and has no code reads back as a code. A tag is
+    /// kept whole when `tag SP status CRLF` fits in [`MAX_TEXT`], and cut
+    /// to fit if not. Code and text past [`MAX_TEXT`] are cut, and data
+    /// items that would not fit are left out, from the first that does
+    /// not.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
             Response::Continue { text } => {
                 out.extend_from_slice(b"+ ");
-                out.extend_from_slice(fit(&clean_text(text), MAX_TEXT - 4).as_bytes());
+                out.extend_from_slice(clean_text(fit(text, MAX_TEXT - 4)).as_bytes());
             }
             Response::Status { tag, status, code, text } => {
+                let word = status.as_str().as_bytes();
                 match tag {
                     Some(t) if !matches!(status, Status::Preauth | Status::Bye) => {
-                        out = clean(t, tag_char, b'x', MAX_TEXT - 12);
+                        out = clean(t, tag_char, b'x', MAX_TEXT - 3 - word.len());
                     }
                     _ => out.push(b'*'),
                 }
                 out.push(b' ');
-                out.extend_from_slice(status.as_str().as_bytes());
+                out.extend_from_slice(word);
                 // The grammar wants a space after the status word, and
                 // after a code, even when no text follows.
-                out.push(b' ');
+                if out.len() + 3 <= MAX_TEXT {
+                    out.push(b' ');
+                }
                 if let Some(code) = code {
-                    let code: String = clean_text(code).chars().map(|c| if c == ']' { ' ' } else { c }).collect();
-                    let code = fit(&code, (MAX_TEXT - 2 - out.len()).saturating_sub(3));
+                    let room = (MAX_TEXT - 2).saturating_sub(out.len()).saturating_sub(3);
+                    let code: String =
+                        clean_text(fit(code, room)).chars().map(|c| if c == ']' { ' ' } else { c }).collect();
                     if !code.is_empty() {
                         out.push(b'[');
                         out.extend_from_slice(code.as_bytes());
@@ -476,12 +533,11 @@ impl Response {
                     }
                 }
                 let room = (MAX_TEXT - 2).saturating_sub(out.len());
-                let text = clean_text(text);
-                out.extend_from_slice(fit(&text, room).as_bytes());
+                out.extend_from_slice(clean_text(fit(text, room)).as_bytes());
             }
             Response::Data(values) => {
                 out.push(b'*');
-                write_args(&mut out, values, true, true);
+                write_args(&mut out, values, true, true, &mut Vec::new());
             }
         }
         out.extend_from_slice(b"\r\n");
@@ -563,8 +619,9 @@ pub enum Event {
     /// for every line that ends in `{size}`, even one whose start breaks
     /// the grammar; that command is an [`Error::Syntax`] once it is whole.
     Continue {
-        /// The tag of the command, if it has a well-formed one.
-        tag: Option<String>,
+        /// The tag of the command, if it has a well-formed one. Every
+        /// continuation of one command shares one copy of it.
+        tag: Option<std::sync::Arc<str>>,
         /// The literal's size, at most [`MAX_LITERAL`].
         size: usize,
     },
@@ -577,6 +634,8 @@ pub struct Decoder {
     buf: Buf,
     framer: Framer,
     waiting: bool,
+    /// The tag of the command being read, once a continuation needed it.
+    tag: Option<Option<std::sync::Arc<str>>>,
     failed: Option<Error>,
 }
 
@@ -612,12 +671,15 @@ impl Decoder {
                 Step::More => return None,
                 Step::Literal { non_sync: false, size } => {
                     self.waiting = true;
-                    return Some(Ok(Event::Continue { tag: tag_of(self.buf.data()), size }));
+                    let data = self.buf.data();
+                    let tag = self.tag.get_or_insert_with(|| tag_of(data).map(std::sync::Arc::from)).clone();
+                    return Some(Ok(Event::Continue { tag, size }));
                 }
                 Step::Literal { .. } => {}
                 Step::Done(end) => {
                     let r = Command::parse(self.buf.data().get(..end).unwrap_or(&[]));
                     self.buf.consume(end);
+                    self.tag = None;
                     return Some(r.map(Event::Command));
                 }
                 Step::TooLarge { size, non_sync, line_end } => {
@@ -627,6 +689,7 @@ impl Decoder {
                     }
                     self.buf.consume(line_end);
                     self.framer = Framer::default();
+                    self.tag = None;
                     return Some(Err(e));
                 }
                 Step::TooLong => return Some(Err(self.fail(Error::TooLong))),
@@ -645,6 +708,7 @@ impl Decoder {
         self.waiting = false;
         self.buf.consume(self.framer.line_start);
         self.framer = Framer::default();
+        self.tag = None;
         true
     }
 
@@ -690,6 +754,7 @@ impl Decoder {
         self.buf = Buf::default();
         self.framer = Framer::default();
         self.waiting = false;
+        self.tag = None;
         e
     }
 }
@@ -759,7 +824,9 @@ impl ResponseDecoder {
 /// Bytes read and not yet taken. Taking bytes moves a start index, and
 /// the bytes are moved down only once as many are taken as are left, so
 /// a stream of many short messages costs time in proportion to its
-/// length.
+/// length. Once every byte is taken, it gives back memory past
+/// [`MAX_TEXT`], so a connection that once held a large message does not
+/// keep that much.
 #[derive(Clone, Debug, Default)]
 struct Buf {
     bytes: Vec<u8>,
@@ -780,6 +847,7 @@ impl Buf {
         self.start = self.start.saturating_add(n).min(self.bytes.len());
         if self.start == self.bytes.len() {
             self.bytes.clear();
+            self.bytes.shrink_to(MAX_TEXT);
             self.start = 0;
         } else if self.start >= self.bytes.len() - self.start {
             self.bytes.drain(..self.start);
@@ -925,35 +993,83 @@ fn tag_char(b: u8) -> bool {
     (atom_char(b) || b == b']') && b != b'+'
 }
 
-/// A byte an argument word may hold outside square brackets. It is wider
-/// than `ATOM-CHAR`, to take flags, sequence sets and list patterns.
+/// A byte an argument word may hold outside a section. It is wider than
+/// `ATOM-CHAR`, to take flags, sequence sets and list patterns.
 fn word_char(b: u8) -> bool {
-    (0x21..=0x7e).contains(&b) && !matches!(b, b'(' | b')' | b'{' | b'"' | b'[')
+    (0x21..=0x7e).contains(&b) && !matches!(b, b'(' | b')' | b'{' | b'"')
 }
 
-/// The length of the word at the start of `b`. A `[` opens a section
-/// that runs to the next `]` and may hold spaces.
-fn word_len(b: &[u8]) -> Result<usize, &'static str> {
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        if c == b'[' {
-            let close = b[i + 1..].iter().position(|&x| x == b']' || !(0x20..=0x7e).contains(&x));
-            match close.map(|p| i + 1 + p) {
-                Some(j) if b[j] == b']' => i = j + 1,
-                _ => return Err("an atom has [ without ]"),
-            }
-        } else if word_char(c) {
-            i += 1;
+/// The words a section in square brackets follows (RFC 9051 `fetch-att`
+/// and `msg-att-static`).
+const SECTIONED: &[&[u8]] = &[b"BODY", b"BODY.PEEK", b"BINARY", b"BINARY.PEEK", b"BINARY.SIZE"];
+
+/// Reads the word at the cursor. After one of [`SECTIONED`], a `[` opens
+/// a section that runs to its `]` and may hold spaces, parentheses,
+/// quoted strings and, when `literals` is `Some`, literals, which go into
+/// the word as quoted strings. `Some(true)` takes non-synchronizing ones
+/// too. With `None` a literal is an error, so a word that reads back the
+/// same is one a writer may send as an atom.
+fn scan_word(c: &mut Cursor<'_>, literals: Option<bool>) -> Result<String, Fault> {
+    let start = c.i;
+    let mut out = String::new();
+    while let Some(x) = c.peek() {
+        if x == b'[' && SECTIONED.iter().any(|w| c.b[start..c.i].eq_ignore_ascii_case(w)) {
+            c.i += 1;
+            out.push('[');
+            scan_section(c, &mut out, literals)?;
+            out.push(']');
+        } else if word_char(x) {
+            c.i += 1;
+            out.push(char::from(x));
         } else {
             break;
         }
     }
-    Ok(i)
+    Ok(out)
+}
+
+/// Reads a section after its `[`, through its `]`, into `out`.
+fn scan_section(c: &mut Cursor<'_>, out: &mut String, literals: Option<bool>) -> Result<(), Fault> {
+    loop {
+        match c.peek() {
+            Some(b']') => {
+                c.i += 1;
+                return Ok(());
+            }
+            Some(b'"') => push_quoted(out, &parse_quoted(c)?),
+            Some(b'{') if literals.is_some() => {
+                let (data, _) = parse_literal(c, literals == Some(true), false)?;
+                let quotable = data.len() <= MAX_QUOTED && !data.iter().any(|&b| matches!(b, b'\r' | b'\n'));
+                if !quotable || std::str::from_utf8(&data).is_err() {
+                    return Err(Fault::Syntax("a literal in a section must be a short line of UTF-8"));
+                }
+                push_quoted(out, &data);
+            }
+            Some(x) if (0x20..=0x7e).contains(&x) && x != b'{' => {
+                c.i += 1;
+                out.push(char::from(x));
+            }
+            _ => return Err(Fault::Syntax("an atom has [ without ]")),
+        }
+    }
+}
+
+/// Adds `"s"` to `out`, with `"` and `\` escaped. `s` is UTF-8.
+fn push_quoted(out: &mut String, s: &[u8]) {
+    out.push('"');
+    for ch in String::from_utf8_lossy(s).chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
 }
 
 /// Whether `s` is written as an atom.
 fn atom_ok(s: &[u8]) -> bool {
-    !s.is_empty() && word_len(s) == Ok(s.len())
+    let mut c = Cursor { b: s, i: 0, lits: 0 };
+    !s.is_empty() && matches!(scan_word(&mut c, None), Ok(w) if c.i == s.len() && w.as_bytes() == s)
 }
 
 /// The well-formed tag at the start of `b`, if it has one.
@@ -1031,19 +1147,26 @@ impl<'a> Cursor<'a> {
 }
 
 /// Reads `*(SP value)` and the final CRLF, which must end the bytes.
-/// Lists are read with a stack, not by recursion.
-fn parse_values(c: &mut Cursor<'_>, allow_non_sync: bool) -> Result<Vec<Value>, Fault> {
+/// Lists are read with a stack, not by recursion. A command is read with
+/// `client` set: it may hold non-synchronizing literals. In a response a
+/// list may follow a list with no space between them, as the parts of a
+/// multipart body and the addresses of an envelope do.
+fn parse_values(c: &mut Cursor<'_>, client: bool) -> Result<Vec<Value>, Fault> {
     let mut levels: Vec<Vec<Value>> = vec![Vec::new()];
     loop {
+        let after_list = matches!(levels.last().and_then(|l| l.last()), Some(Value::List(_)));
+        let adjacent = !client && after_list && c.peek() == Some(b'(');
         if levels.len() == 1 {
             if c.at_end() {
                 c.i += 2;
                 break;
             }
-            if c.peek() != Some(b' ') {
-                return Err(Fault::Syntax("expected a space or the end of the line"));
+            if !adjacent {
+                if c.peek() != Some(b' ') {
+                    return Err(Fault::Syntax("expected a space or the end of the line"));
+                }
+                c.i += 1;
             }
-            c.i += 1;
         } else {
             if c.peek() == Some(b')') {
                 c.i += 1;
@@ -1053,7 +1176,7 @@ fn parse_values(c: &mut Cursor<'_>, allow_non_sync: bool) -> Result<Vec<Value>, 
                 }
                 continue;
             }
-            if levels.last().is_some_and(|l| !l.is_empty()) {
+            if levels.last().is_some_and(|l| !l.is_empty()) && !adjacent {
                 if c.peek() != Some(b' ') {
                     return Err(Fault::Syntax("expected a space or ) in a list"));
                 }
@@ -1070,15 +1193,21 @@ fn parse_values(c: &mut Cursor<'_>, allow_non_sync: bool) -> Result<Vec<Value>, 
                 continue;
             }
             Some(b'"') => Value::Quoted(parse_quoted(c)?),
-            Some(b'{') => parse_literal(c, allow_non_sync)?,
+            Some(b'{') => {
+                let (data, non_sync) = parse_literal(c, client, false)?;
+                Value::Literal { data, non_sync }
+            }
+            Some(b'~') if c.b.get(c.i + 1) == Some(&b'{') => {
+                c.i += 1;
+                let (data, non_sync) = parse_literal(c, client, true)?;
+                Value::Binary { data, non_sync }
+            }
             _ => {
-                let rest = c.b.get(c.i..).unwrap_or(&[]);
-                let n = word_len(rest).map_err(Fault::Syntax)?;
-                if n == 0 {
+                let w = scan_word(c, Some(client))?;
+                if w.is_empty() {
                     return Err(Fault::Syntax("expected a value"));
                 }
-                c.i += n;
-                Value::Atom(ascii(&rest[..n]))
+                Value::Atom(w)
             }
         };
         if let Some(l) = levels.last_mut() {
@@ -1115,7 +1244,9 @@ fn parse_quoted(c: &mut Cursor<'_>) -> Result<Vec<u8>, Fault> {
     }
 }
 
-fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool) -> Result<Value, Fault> {
+/// Reads a literal from its `{`: its bytes, and whether it was
+/// non-synchronizing. Only a `binary` one, after `~`, may hold NUL.
+fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool, binary: bool) -> Result<(Vec<u8>, bool), Fault> {
     c.i += 1;
     let digits = c.take_while(|b| b.is_ascii_digit());
     if digits.is_empty() {
@@ -1138,12 +1269,12 @@ fn parse_literal(c: &mut Cursor<'_>, allow_non_sync: bool) -> Result<Value, Faul
     }
     let n = size as usize;
     let data = c.b.get(c.i..c.i.saturating_add(n)).ok_or(Fault::Syntax("a literal is cut short"))?;
-    if data.contains(&0) {
+    if !binary && data.contains(&0) {
         return Err(Fault::Syntax("a literal holds NUL"));
     }
     c.i += n;
     c.lits += n;
-    Ok(Value::Literal { data: data.to_vec(), non_sync })
+    Ok((data.to_vec(), non_sync))
 }
 
 /// `s` as bytes, with each byte `ok` refuses written as `fill`, cut to
@@ -1170,108 +1301,171 @@ fn fit(s: &str, max: usize) -> &str {
     &s[..n]
 }
 
+/// The longest non-synchronizing literal a client sends, unless the
+/// server says it takes longer ones (RFC 9051, section 4.3).
+const MAX_NON_SYNC: usize = 4096;
+
 /// Writes ` value` for each value that fits. `out` holds only text so
-/// far; a CRLF will follow.
-fn write_args(out: &mut Vec<u8>, args: &[Value], server: bool, data: bool) {
+/// far; a CRLF will follow. For a client, where the bytes of each
+/// synchronizing literal start go in `splits`.
+fn write_args(out: &mut Vec<u8>, args: &[Value], server: bool, data: bool, splits: &mut Vec<usize>) {
     let mut text = out.len() + 2;
     let mut total = text;
     let mut tmp = Vec::new();
+    let mut at = Vec::new();
     for (i, v) in args.iter().enumerate() {
         tmp.clear();
+        at.clear();
         tmp.push(b' ');
-        let lit = match v {
+        let mut w = Writer {
+            out: &mut tmp,
+            splits: &mut at,
+            server,
+            lit: 0,
+            max: MAX_MESSAGE - total,
+            max_text: MAX_TEXT - text,
+        };
+        let fits = match v {
             // A data response that starts with a status word would read
             // as a status line.
             Value::Atom(a) if data && i == 0 && Status::from_word(a.as_bytes()).is_some() => {
-                write_string(a.as_bytes(), &mut tmp, server)
+                w.string(a.as_bytes());
+                w.fits()
             }
-            _ => write_value(v, &mut tmp, server),
+            _ => w.value(v),
         };
+        let lit = w.lit;
         let t = tmp.len() - lit;
-        if text + t > MAX_TEXT || total + tmp.len() > MAX_MESSAGE {
+        if !fits || text + t > MAX_TEXT || total + tmp.len() > MAX_MESSAGE {
             break;
         }
+        splits.extend(at.iter().map(|&p| p + out.len()));
         text += t;
         total += tmp.len();
         out.extend_from_slice(&tmp);
     }
 }
 
-/// Writes one value, with a stack for lists. It returns how many literal
-/// bytes it wrote.
-fn write_value(v: &Value, out: &mut Vec<u8>, server: bool) -> usize {
-    let mut lit = 0;
-    let mut stack: Vec<(std::slice::Iter<'_, Value>, bool)> = Vec::new();
-    let mut next = Some(v);
-    loop {
-        if let Some(v) = next.take() {
-            match v {
-                Value::List(items) if stack.len() < MAX_DEPTH => {
-                    out.push(b'(');
-                    stack.push((items.iter(), true));
-                }
-                Value::List(_) => out.extend_from_slice(b"NIL"),
-                Value::Atom(a) if atom_ok(a.as_bytes()) => out.extend_from_slice(a.as_bytes()),
-                Value::Atom(a) => lit += write_string(a.as_bytes(), out, server),
-                Value::Quoted(q) => lit += write_string(q, out, server),
-                Value::Literal { data, non_sync } => lit += write_literal(data, *non_sync && !server, out),
-            }
-        }
-        let Some((iter, first)) = stack.last_mut() else { break };
-        match iter.next() {
-            Some(item) => {
-                if !*first {
-                    out.push(b' ');
-                }
-                *first = false;
-                next = Some(item);
-            }
-            None => {
-                out.push(b')');
-                stack.pop();
-            }
-        }
-    }
-    lit
+/// Writes values into `out`, and stops once they pass `max` bytes, or
+/// `max_text` outside literals, so it never holds much more than will be
+/// sent.
+struct Writer<'a> {
+    out: &'a mut Vec<u8>,
+    splits: &'a mut Vec<usize>,
+    server: bool,
+    /// Literal bytes written.
+    lit: usize,
+    max: usize,
+    max_text: usize,
 }
 
-/// `s` without its NUL bytes, which IMAP never carries.
+impl Writer<'_> {
+    fn fits(&self) -> bool {
+        self.out.len() <= self.max && self.out.len() - self.lit <= self.max_text
+    }
+
+    /// Writes one value, with a stack for lists. It returns false if it
+    /// stopped because the value does not fit.
+    fn value(&mut self, v: &Value) -> bool {
+        // Each list's items left, whether its first is still to come, and
+        // whether every item so far was a list written as one.
+        let mut stack: Vec<(std::slice::Iter<'_, Value>, bool, bool)> = Vec::new();
+        let mut next = Some(v);
+        loop {
+            if let Some(v) = next.take() {
+                match v {
+                    Value::List(items) if stack.len() < MAX_DEPTH => {
+                        self.out.push(b'(');
+                        stack.push((items.iter(), true, true));
+                    }
+                    Value::List(_) => self.out.extend_from_slice(b"NIL"),
+                    Value::Atom(a) if a.len() > self.max_text => return false,
+                    Value::Atom(a) if atom_ok(a.as_bytes()) => self.out.extend_from_slice(a.as_bytes()),
+                    Value::Atom(a) => self.string(a.as_bytes()),
+                    Value::Quoted(q) => self.string(q),
+                    Value::Literal { data, non_sync } => self.literal(data, *non_sync, false),
+                    Value::Binary { data, non_sync } => self.literal(data, *non_sync, true),
+                }
+                if !self.fits() {
+                    return false;
+                }
+            }
+            let depth = stack.len();
+            let Some((iter, first, run)) = stack.last_mut() else { break };
+            match iter.next() {
+                Some(item) => {
+                    // A response writes the lists that start a list next
+                    // to each other, as `1*body` and `1*address` want.
+                    let open = matches!(item, Value::List(_)) && depth < MAX_DEPTH;
+                    if !(*first || (self.server && *run && open)) {
+                        self.out.push(b' ');
+                    }
+                    *run &= open;
+                    *first = false;
+                    next = Some(item);
+                }
+                None => {
+                    self.out.push(b')');
+                    stack.pop();
+                }
+            }
+        }
+        true
+    }
+
+    /// Writes a string quoted if it can be, and as a literal if not. A
+    /// quoted string holds UTF-8 with no CR or LF. NUL bytes are left
+    /// out.
+    fn string(&mut self, s: &[u8]) {
+        let n = s.iter().filter(|&&b| b != 0).count();
+        if n <= MAX_QUOTED {
+            let s = drop_nul(s);
+            if !s.iter().any(|&b| matches!(b, b'\r' | b'\n')) && std::str::from_utf8(&s).is_ok() {
+                self.out.push(b'"');
+                for &b in s.iter() {
+                    if b == b'"' || b == b'\\' {
+                        self.out.push(b'\\');
+                    }
+                    self.out.push(b);
+                }
+                self.out.push(b'"');
+                return;
+            }
+        }
+        self.literal(s, n <= MAX_NON_SYNC, false);
+    }
+
+    /// Writes a literal, cut to [`MAX_LITERAL`]. A plain one leaves NUL
+    /// bytes out; a binary one keeps them. Servers never write
+    /// non-synchronizing literals.
+    fn literal(&mut self, data: &[u8], non_sync: bool, binary: bool) {
+        let non_sync = non_sync && !self.server;
+        let n = if binary { data.len() } else { data.iter().filter(|&&b| b != 0).count() }.min(MAX_LITERAL);
+        if binary {
+            self.out.push(b'~');
+        }
+        self.out.push(b'{');
+        self.out.extend_from_slice(n.to_string().as_bytes());
+        if non_sync {
+            self.out.push(b'+');
+        }
+        self.out.extend_from_slice(b"}\r\n");
+        if !self.server && !non_sync {
+            self.splits.push(self.out.len());
+        }
+        if binary {
+            self.out.extend_from_slice(&data[..n]);
+        } else {
+            self.out.extend(data.iter().copied().filter(|&b| b != 0).take(n));
+        }
+        self.lit += n;
+    }
+}
+
+/// `s` without its NUL bytes, which IMAP never carries outside binary
+/// literals.
 fn drop_nul(s: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if s.contains(&0) { s.iter().copied().filter(|&b| b != 0).collect::<Vec<u8>>().into() } else { s.into() }
-}
-
-/// Writes a string quoted if it can be, and as a literal if not. A
-/// quoted string holds UTF-8 with no CR or LF. It returns how many
-/// literal bytes it wrote.
-fn write_string(s: &[u8], out: &mut Vec<u8>, server: bool) -> usize {
-    let s = drop_nul(s);
-    let s = &s[..];
-    if s.len() <= MAX_QUOTED && !s.iter().any(|&b| matches!(b, b'\r' | b'\n')) && std::str::from_utf8(s).is_ok() {
-        out.push(b'"');
-        for &b in s {
-            if b == b'"' || b == b'\\' {
-                out.push(b'\\');
-            }
-            out.push(b);
-        }
-        out.push(b'"');
-        0
-    } else {
-        write_literal(s, !server, out)
-    }
-}
-
-fn write_literal(data: &[u8], non_sync: bool, out: &mut Vec<u8>) -> usize {
-    let data = drop_nul(data);
-    let data = &data[..data.len().min(MAX_LITERAL)];
-    out.push(b'{');
-    out.extend_from_slice(data.len().to_string().as_bytes());
-    if non_sync {
-        out.push(b'+');
-    }
-    out.extend_from_slice(b"}\r\n");
-    out.extend_from_slice(data);
-    data.len()
 }
 
 #[cfg(test)]
@@ -1510,7 +1704,7 @@ mod tests {
         tagged(b"a X {}\r\n", "a literal's size must follow {");
         tagged(b"a X {3}x\r\n", "a literal's size must end with } and CRLF");
         tagged(b"a X {3}\r\nab", "a literal is cut short");
-        tagged(b"a X B[1\r\n", "an atom has [ without ]");
+        tagged(b"a X BODY[1\r\n", "an atom has [ without ]");
         let mut deep = b"a X ".to_vec();
         deep.extend(std::iter::repeat_n(b'(', MAX_DEPTH + 1));
         deep.extend(std::iter::repeat_n(b')', MAX_DEPTH + 1));
@@ -1770,9 +1964,10 @@ mod tests {
         }
         assert_eq!(depth, MAX_DEPTH);
         assert!(item.is_nil());
-        // A long quoted string goes out as a literal.
+        // A long quoted string goes out as a literal, which is longer than
+        // a client may send without waiting.
         let b = Command::new("a", "X", vec![Value::string(&vec![b'q'; MAX_QUOTED + 1])]).to_bytes();
-        assert!(matches!(cmd(&b).args[0], Value::Literal { non_sync: true, .. }));
+        assert!(matches!(cmd(&b).args[0], Value::Literal { non_sync: false, .. }));
     }
 
     // Problems found against the RFC 9051 grammar (section 9).
@@ -1921,6 +2116,255 @@ mod tests {
         // An atom NIL reads as the empty value.
         assert_eq!(Response::list(&[], Some('/'), b"NIL").to_bytes(), b"* LIST () \"/\" \"NIL\"\r\n");
         assert_eq!(Response::list(&[], Some('/'), b"nil").to_bytes(), b"* LIST () \"/\" \"nil\"\r\n");
+    }
+
+    // Problems found in the second review.
+
+    #[test]
+    fn lists_next_to_lists() {
+        // body-type-mpart = 1*body SP media-subtype, and env-from =
+        // "(" 1*address ")": the lists come with no space between them.
+        let b: &[u8] = b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" NIL NIL NIL \"7BIT\" 1 1)(\"TEXT\" \"HTML\" NIL NIL NIL \"7BIT\" 1 1) \"ALTERNATIVE\"))\r\n";
+        let r = Response::parse(b).unwrap();
+        let Response::Data(v) = &r else { panic!() };
+        let body = &v[2].as_list().unwrap()[1];
+        assert_eq!(body.as_list().map(<[Value]>::len), Some(3));
+        assert_eq!(r.to_bytes(), b);
+        assert_eq!(responses(b, true), vec![Ok(r.clone())]);
+        let b: &[u8] = b"* 2 FETCH (ENVELOPE (NIL \"hi\" ((NIL NIL \"a\" \"x.org\")(NIL NIL \"b\" \"x.org\")) ((NIL NIL \"a\" \"x.org\")) NIL ((NIL NIL \"c\" \"x.org\")) NIL NIL NIL NIL))\r\n";
+        assert_eq!(Response::parse(b).unwrap().to_bytes(), b);
+        let b: &[u8] = b"* NAMESPACE ((\"\" \"/\")(\"#shared/\" \"/\")) NIL NIL\r\n";
+        assert_eq!(Response::parse(b).unwrap().to_bytes(), b);
+        // A space between them is taken too.
+        let r = Response::parse(b"* X ((a) (b))\r\n").unwrap();
+        assert_eq!(
+            r,
+            Response::Data(vec![
+                Value::atom("X"),
+                Value::List(vec![Value::List(atoms(&["a"])), Value::List(atoms(&["b"]))])
+            ])
+        );
+        assert_eq!(r.to_bytes(), b"* X ((a)(b))\r\n");
+        // A list after other items, as in body-ext, keeps its space.
+        let r = Response::Data(vec![Value::List(vec![Value::nil(), Value::List(vec![]), Value::List(vec![])])]);
+        assert_eq!(r.to_bytes(), b"* (NIL () ())\r\n");
+        // Commands keep spaces between lists, as search-key wants.
+        let c = Command::new(
+            "a",
+            "SEARCH",
+            vec![Value::List(vec![Value::List(atoms(&["SEEN"])), Value::List(atoms(&["NEW"]))])],
+        );
+        assert_eq!(c.to_bytes(), b"a SEARCH ((SEEN) (NEW))\r\n");
+        assert!(syntax(b"a SEARCH ((SEEN)(NEW))\r\n"));
+        // Lists past MAX_DEPTH become NIL, with a space between them.
+        let mut v = Value::List(vec![Value::List(vec![]), Value::List(vec![])]);
+        for _ in 0..MAX_DEPTH - 1 {
+            v = Value::List(vec![v]);
+        }
+        let b = Response::Data(vec![v]).to_bytes();
+        assert!(b.windows(10).any(|w| w == b"(NIL NIL))"), "{}", String::from_utf8_lossy(&b));
+        assert!(Response::parse(&b).is_ok());
+    }
+
+    #[test]
+    fn decoders_give_back_memory() {
+        let mut d = Decoder::new();
+        let mut s = b"a APPEND INBOX {1048576+}\r\n".to_vec();
+        s.extend(std::iter::repeat_n(b'm', MAX_LITERAL));
+        s.extend_from_slice(b"\r\n");
+        d.feed(&s);
+        assert!(matches!(d.next_event(), Some(Ok(Event::Command(_)))));
+        assert_eq!(d.buffered(), 0);
+        assert!(d.buf.bytes.capacity() <= MAX_TEXT, "{}", d.buf.bytes.capacity());
+    }
+
+    #[test]
+    fn writers_stop_at_their_limits() {
+        // A value too large to send is not written out whole first.
+        let v = Value::List(vec![Value::Literal { data: vec![b'z'; MAX_LITERAL], non_sync: false }; 100]);
+        let mut out = Vec::new();
+        let mut splits = Vec::new();
+        let mut w =
+            Writer { out: &mut out, splits: &mut splits, server: true, lit: 0, max: MAX_MESSAGE, max_text: MAX_TEXT };
+        assert!(!w.value(&v));
+        assert!(out.len() <= MAX_MESSAGE + MAX_LITERAL + 32, "{}", out.len());
+        let mut out = Vec::new();
+        let mut w =
+            Writer { out: &mut out, splits: &mut splits, server: true, lit: 0, max: MAX_MESSAGE, max_text: MAX_TEXT };
+        assert!(!w.value(&Value::List(vec![Value::atom(&"a".repeat(MAX_TEXT + 1))])));
+        assert!(out.len() <= 1);
+        // The command still holds what fits.
+        let r = Response::Data(vec![v]);
+        assert_eq!(r.to_bytes(), b"*\r\n");
+    }
+
+    #[test]
+    fn binary_literals() {
+        // literal8 = "~{" number64 "}" CRLF *OCTET (RFC 9051 section 9),
+        // in FETCH BINARY responses and in APPEND.
+        let b: &[u8] = b"* 1 FETCH (BINARY[1] ~{3}\r\na\0b)\r\n";
+        let r = Response::parse(b).unwrap();
+        let bin = Value::Binary { data: b"a\0b".to_vec(), non_sync: false };
+        assert_eq!(r, Response::fetch(1, vec![Value::atom("BINARY[1]"), bin.clone()]));
+        assert_eq!(r.to_bytes(), b);
+        assert_eq!(responses(b, true), vec![Ok(r)]);
+        let b: &[u8] = b"a APPEND INBOX ~{3+}\r\na\0b\r\n";
+        let c = cmd(b);
+        assert_eq!(c.args[1], Value::Binary { data: b"a\0b".to_vec(), non_sync: true });
+        assert_eq!(c.to_bytes(), b);
+        let ev = events(b"a APPEND INBOX ~{3}\r\na\0b\r\n", true);
+        assert!(matches!(ev[0], Ok(Event::Continue { size: 3, .. })));
+        assert!(matches!(&ev[1], Ok(Event::Command(c)) if c.args[1] == bin));
+        // Servers never write ~{n+}.
+        let r = Response::fetch(1, vec![Value::atom("BINARY[]"), Value::Binary { data: vec![0], non_sync: true }]);
+        assert_eq!(r.to_bytes(), b"* 1 FETCH (BINARY[] ~{1}\r\n\0)\r\n");
+        // A plain literal still may not hold NUL, and ~ alone is a word.
+        assert!(syntax(b"a X {1}\r\n\0\r\n"));
+        assert_eq!(cmd(b"a X ~ ~a\r\n").args, atoms(&["~", "~a"]));
+    }
+
+    #[test]
+    fn client_literals_and_continuations() {
+        // RFC 9051 section 4.3: non-synchronizing literals larger than
+        // 4096 octets must be sent as synchronizing literals.
+        let long = vec![b'\n'; MAX_NON_SYNC + 1];
+        let c = Command::new("a", "X", vec![Value::string(&long)]);
+        assert!(c.to_bytes().starts_with(b"a X {4097}\r\n"));
+        let c = Command::new("a", "X", vec![Value::string(&long[1..])]);
+        assert!(c.to_bytes().starts_with(b"a X {4096+}\r\n"));
+        // to_chunks cuts after each synchronizing literal's line.
+        let c = Command::new(
+            "a",
+            "LOGIN",
+            vec![
+                Value::Literal { data: b"alice".to_vec(), non_sync: false },
+                Value::Literal { data: b"x".to_vec(), non_sync: true },
+                Value::Binary { data: b"p\0w".to_vec(), non_sync: false },
+            ],
+        );
+        let chunks = c.to_chunks();
+        assert_eq!(
+            chunks,
+            vec![b"a LOGIN {5}\r\n".to_vec(), b"alice {1+}\r\nx ~{3}\r\n".to_vec(), b"p\0w\r\n".to_vec()]
+        );
+        assert_eq!(chunks.concat(), c.to_bytes());
+        assert_eq!(Command::new("a", "NOOP", vec![]).to_chunks(), vec![b"a NOOP\r\n".to_vec()]);
+        // Arguments left out leave no cut behind.
+        let big = Value::Literal { data: vec![b'y'; MAX_LITERAL], non_sync: false };
+        let chunks = Command::new("a", "X", vec![big; 6]).to_chunks();
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.concat().len() <= MAX_MESSAGE);
+    }
+
+    #[test]
+    fn brackets_open_sections_only_after_fetch_items() {
+        // astring takes `[`; only fetch-att and msg-att names open a
+        // section.
+        assert_eq!(cmd(b"a SELECT foo[\r\n").args, atoms(&["foo["]));
+        assert_eq!(cmd(b"a SELECT foo[bar baz]\r\n").args, atoms(&["foo[bar", "baz]"]));
+        assert_eq!(Command::new("a", "SELECT", vec![Value::atom("foo[")]).to_bytes(), b"a SELECT foo[\r\n");
+        assert_eq!(Command::new("a", "X", vec![Value::atom("BODY[")]).to_bytes(), b"a X \"BODY[\"\r\n");
+        // header-fld-name is an astring, so it may be quoted or a literal.
+        let b: &[u8] = b"a FETCH 1 BODY.PEEK[HEADER.FIELDS ({4}\r\nFrom \"a]b\")]\r\n";
+        let ev = events(b, true);
+        assert_eq!(ev[0], Ok(Event::Continue { tag: Some("a".into()), size: 4 }));
+        let want = Command::new(
+            "a",
+            "FETCH",
+            vec![Value::atom("1"), Value::atom("BODY.PEEK[HEADER.FIELDS (\"From\" \"a]b\")]")],
+        );
+        assert_eq!(ev[1], Ok(Event::Command(want.clone())));
+        assert_eq!(cmd(&want.to_bytes()), want);
+        assert_eq!(cmd(b"a FETCH 1 body[1]<0.10>\r\n").args[1], Value::atom("body[1]<0.10>"));
+        assert!(syntax(b"a FETCH 1 BODY[HEADER.FIELDS ({2}\r\na\nb)]\r\n"));
+        let r = Response::parse(b"* 1 FETCH (BODY[HEADER.FIELDS (\"X\")] NIL)\r\n").unwrap();
+        assert_eq!(r.to_bytes(), b"* 1 FETCH (BODY[HEADER.FIELDS (\"X\")] NIL)\r\n");
+    }
+
+    #[test]
+    fn tags_are_written_whole() {
+        // The tagged response repeats the tag (RFC 9051 section 2.2.2).
+        let mut b = "t".repeat(MAX_TEXT - 11).into_bytes();
+        b.extend_from_slice(b" NOOP\r\n");
+        let c = cmd(&b);
+        let r = Response::tagged(&c.tag, Status::Ok, "done");
+        let out = r.to_bytes();
+        assert!(out.len() <= MAX_TEXT);
+        assert_eq!(Response::parse(&out), Ok(r));
+        // The longest tag a command can carry, and the longest a status
+        // response can.
+        let mut b = "t".repeat(MAX_TEXT - 4).into_bytes();
+        b.extend_from_slice(b" X\r\n");
+        assert_eq!(cmd(&b).to_bytes(), b);
+        let mut b = "t".repeat(MAX_TEXT - 5).into_bytes();
+        b.extend_from_slice(b" OK\r\n");
+        let r = Response::parse(&b).unwrap();
+        assert_eq!(r.to_bytes(), b);
+        let r = Response::tagged(&"t".repeat(MAX_TEXT), Status::Bad, "x").with_code("C");
+        assert!(Response::parse(&r.to_bytes()).is_ok());
+    }
+
+    #[test]
+    fn continuations_share_one_tag() {
+        let tag = "t".repeat(32 * 1024);
+        let mut d = Decoder::new();
+        d.feed(format!("{tag} LOGIN").as_bytes());
+        let mut seen: Option<std::sync::Arc<str>> = None;
+        for _ in 0..100 {
+            d.feed(b" {0}\r\n");
+            let Some(Ok(Event::Continue { tag: Some(t), size: 0 })) = d.next_event() else { panic!() };
+            assert_eq!(&*t, tag);
+            if let Some(s) = &seen {
+                assert!(std::sync::Arc::ptr_eq(s, &t));
+            }
+            seen = Some(t);
+        }
+        d.feed(b"\r\n");
+        assert!(matches!(d.next_event(), Some(Ok(Event::Command(c))) if c.args.len() == 100));
+        d.feed(b"b X {0}\r\n");
+        assert_eq!(d.next_event(), Some(Ok(Event::Continue { tag: Some("b".into()), size: 0 })));
+    }
+
+    /// Feeds `stream` in chunks of `step`, refusing a literal whenever the
+    /// next byte of `choices` is odd.
+    fn events_refusing(stream: &[u8], step: usize, choices: &[u8]) -> Vec<Result<Event, Error>> {
+        let mut d = Decoder::new();
+        let mut out = Vec::new();
+        let mut k = 0;
+        for chunk in stream.chunks(step.max(1)) {
+            d.feed(chunk);
+            while let Some(e) = d.next_event() {
+                let fatal = matches!(&e, Err(e) if e.is_fatal());
+                let cont = matches!(e, Ok(Event::Continue { .. }));
+                out.push(e);
+                if fatal {
+                    return out;
+                }
+                if cont && choices.get(k).is_some_and(|c| c % 2 == 1) {
+                    assert!(d.refuse_literal());
+                    assert!(!d.refuse_literal());
+                }
+                k += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn refusals_in_a_stream() {
+        let stream = b"a APPEND X {3}\r\nabc\r\nb NOOP\r\n";
+        let ev = events_refusing(stream, stream.len(), &[1]);
+        // Refused: the client never sends the bytes, so they read as a
+        // line of their own.
+        assert_eq!(ev[0], Ok(Event::Continue { tag: Some("a".into()), size: 3 }));
+        assert!(matches!(ev[1], Err(Error::Syntax { .. })));
+        assert_eq!(ev[2], Ok(Event::Command(Command::new("b", "NOOP", vec![]))));
+        let mut rng = Lcg(7);
+        for _ in 0..5000 {
+            let b = random_stream(&mut rng);
+            let choices: Vec<u8> = (0..8).map(|_| rng.next() as u8).collect();
+            assert_eq!(events_refusing(&b, b.len(), &choices), events_refusing(&b, 1, &choices));
+        }
     }
 
     struct Lcg(u64);
@@ -2076,15 +2520,32 @@ mod tests {
     #[test]
     fn random_values_round_trip() {
         let mut rng = Lcg(42);
-        let words = ["INBOX", "a b", "", "\\Seen", "x[y]", "OK", "é", "{3}", "a\r\nb", "NIL", "q\"\\", "n\0", "\0"];
+        let words = [
+            "INBOX",
+            "a b",
+            "",
+            "\\Seen",
+            "x[y]",
+            "BODY[x y]",
+            "foo[",
+            "OK",
+            "é",
+            "{3}",
+            "a\r\nb",
+            "NIL",
+            "q\"\\",
+            "n\0",
+            "\0",
+        ];
         for _ in 0..3000 {
             let mut args = Vec::new();
             for _ in 0..rng.below(6) {
                 let w = words[rng.below(words.len())];
-                let mut v = match rng.below(4) {
+                let mut v = match rng.below(5) {
                     0 => Value::atom(w),
                     1 => Value::string(w.as_bytes()),
                     2 => Value::Literal { data: w.as_bytes().to_vec(), non_sync: rng.below(2) == 0 },
+                    3 => Value::Binary { data: w.as_bytes().to_vec(), non_sync: rng.below(2) == 0 },
                     _ => Value::List(vec![Value::atom(w), Value::string(w.as_bytes())]),
                 };
                 for _ in 0..rng.below(3) {

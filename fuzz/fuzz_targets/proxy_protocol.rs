@@ -2,7 +2,7 @@
 //! reads them at the start of a connection.
 #![no_main]
 
-use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Step, Transport, MAX_HEADER_LEN, V1, V2};
+use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Ssl, SslTlv, Step, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use libfuzzer_sys::fuzz_target;
 
@@ -77,5 +77,57 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(back, h);
             assert_eq!(n, bytes.len());
         }
+    }
+
+    // The raw TLV readers: what they accept a header can carry, and an SSL
+    // value they read writes back to the same bytes.
+    if let Some((&kind, value)) = data.split_first() {
+        if let Ok(tlv) = Tlv::from_raw(kind, value) {
+            assert!(value.len() <= MAX_TLV_VALUE);
+            assert_eq!(tlv.kind(), kind);
+        }
+    }
+    if let Ok(ssl) = Ssl::parse(data) {
+        assert_eq!(ssl.to_value(), data);
+        let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Ssl(ssl)] });
+        let bytes = h.to_bytes();
+        assert_eq!(Header::parse(&bytes), Ok(Some((h, bytes.len()))));
+    }
+
+    // Headers with TLVs of every variant built from the input, including
+    // ones a writer must cut or leave out. What is written reads back, and
+    // writing that again gives the same bytes.
+    let mut tlvs = Vec::new();
+    let mut rest = data;
+    while let [pick, len_hi, len_lo, tail @ ..] = rest {
+        // A length byte of 0xff stands for a value far too long to fit.
+        let n = if *len_hi == 0xff { usize::from(*len_lo) * 1024 } else { usize::from(u16::from_be_bytes([*len_hi & 0x0f, *len_lo])) };
+        let (v, next) = tail.split_at(n.min(tail.len()));
+        let mut v = v.to_vec();
+        v.resize(n, *pick);
+        rest = next;
+        let sub = |v: &[u8]| v.chunks(7).map(|c| SslTlv::from_raw(0x21 + c[0] % 6, &c[1..])).collect();
+        tlvs.push(match pick % 9 {
+            0 => Tlv::Alpn(v),
+            1 => Tlv::Authority(v),
+            2 => Tlv::Crc32c(u32::from(*len_lo)),
+            3 => Tlv::Noop(v),
+            4 => Tlv::UniqueId(v),
+            5 => Tlv::Ssl(Ssl { client: *len_lo, verify: u32::from(*len_hi), tlvs: sub(&v) }),
+            6 => Tlv::NetNs(v),
+            _ => Tlv::Other { kind: *len_hi, value: v },
+        });
+        if tlvs.len() == 64 {
+            break;
+        }
+    }
+    if !tlvs.is_empty() {
+        let command = if data[0] & 0x80 == 0 { Command::Local } else { Command::Proxy };
+        let h = Header::V2(V2 { command, addresses: Addresses::Unspec, tlvs });
+        let bytes = h.to_bytes();
+        assert!(bytes.len() <= MAX_HEADER_LEN);
+        let (back, n) = Header::parse(&bytes).unwrap().unwrap();
+        assert_eq!(n, bytes.len());
+        assert_eq!(back.to_bytes(), bytes);
     }
 });

@@ -53,11 +53,13 @@
 //! );
 //!
 //! // A world playing a collector reads it from a TCP stream, framed both
-//! // ways, and an old BSD-style message after it.
+//! // ways, and an old BSD-style message after it. A decoder takes what
+//! // it has room for and says how much; this stream fits at once.
+//! let mut stream = Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes();
+//! stream.extend(Frame::new(Framing::NonTransparent, bytes).to_bytes());
+//! stream.extend(b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n");
 //! let mut decoder = Decoder::new();
-//! decoder.feed(&Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes());
-//! decoder.feed(&Frame::new(Framing::NonTransparent, bytes).to_bytes());
-//! decoder.feed(b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n");
+//! assert_eq!(decoder.feed(&stream), stream.len());
 //! let mut got = Vec::new();
 //! while let Some(frame) = decoder.next_frame() {
 //!     got.push(Entry::parse(&frame.unwrap().message).unwrap());
@@ -84,6 +86,10 @@ pub const TLS_PORT: u16 = 6514;
 /// more. This allows the long messages real senders produce while keeping
 /// a decoder's buffer bounded.
 pub const MAX_MESSAGE_LEN: usize = 65_536;
+/// The most bytes a [`Decoder`] holds beyond those taken out: one message
+/// of [`MAX_MESSAGE_LEN`] bytes and the longest octet count before it, 20
+/// digits and a space. It also holds a message ended by CR LF.
+pub const MAX_BUFFERED: usize = MAX_MESSAGE_LEN + 21;
 /// The largest priority value: facility 23, severity 7.
 pub const MAX_PRIVAL: u8 = 191;
 /// The largest RFC 5424 version number: three digits.
@@ -346,9 +352,12 @@ impl Fraction {
 pub enum Offset {
     /// Written `Z`.
     Utc,
-    /// Written `+hh:mm` or `-hh:mm`, as minutes east of UTC. `-00:00`
-    /// reads as `Minutes(0)` and is written `+00:00`.
+    /// Written `+hh:mm` or `-hh:mm`, as minutes east of UTC. `Minutes(0)`
+    /// is written `+00:00`.
     Minutes(i16),
+    /// Written `-00:00`: the time is in UTC, and the local offset is not
+    /// known (RFC 3339 section 4.3).
+    Unknown,
 }
 
 /// The largest offset from UTC, in minutes: 23 hours 59 minutes.
@@ -417,7 +426,11 @@ impl Timestamp {
                 }
                 i += 6;
                 let m = (oh * 60 + om) as i16;
-                Offset::Minutes(if sign == b'-' { -m } else { m })
+                match (sign, m) {
+                    (b'-', 0) => Offset::Unknown,
+                    (b'-', m) => Offset::Minutes(-m),
+                    (_, m) => Offset::Minutes(m),
+                }
             }
             _ => return None,
         };
@@ -453,6 +466,7 @@ impl Timestamp {
         }
         match self.offset {
             Offset::Utc => s.push('Z'),
+            Offset::Unknown => s.push_str("-00:00"),
             Offset::Minutes(m) => {
                 let m = m.clamp(-MAX_OFFSET_MINUTES, MAX_OFFSET_MINUTES);
                 let sign = if m < 0 { '-' } else { '+' };
@@ -471,7 +485,10 @@ pub struct SdParam {
     /// characters other than `=`, space, `]` and `"`.
     pub name: String,
     /// The value, any UTF-8 text. On the wire `"`, `\` and `]` are
-    /// escaped with a backslash; this holds the text unescaped.
+    /// escaped with a backslash; this holds the text unescaped. A
+    /// backslash followed by any other character is an invalid escape,
+    /// which RFC 5424 section 6.3.3 reads as a plain backslash and says
+    /// must not be altered, so writers leave such a backslash as it is.
     pub value: String,
 }
 
@@ -671,7 +688,8 @@ impl Message {
     ///   left out, since a reader would take the first for one.
     /// - When the whole would pass [`MAX_MESSAGE_LEN`], elements are left
     ///   out from the end, then the text is cut, at a character boundary
-    ///   when it is UTF-8.
+    ///   when it is UTF-8. A message read with [`Message::parse`] is never
+    ///   longer written, so none of it is left out.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(format!("<{}>{}", self.priority.value(), self.version.clamp(1, MAX_VERSION)).as_bytes());
@@ -700,25 +718,14 @@ impl Message {
             if ids.contains(&id) {
                 continue;
             }
-            let mut el = format!("[{id}");
-            for p in e.params.iter().take(MAX_SD_PARAMS) {
-                el.push(' ');
-                el.push_str(&sd_name(&p.name));
-                el.push_str("=\"");
-                for c in p.value.chars() {
-                    if matches!(c, '"' | '\\' | ']') {
-                        el.push('\\');
-                    }
-                    el.push(c);
-                }
-                el.push('"');
-            }
-            el.push(']');
-            // Room is kept for a nil value if nothing else fits.
-            if out.len() + el.len() > MAX_MESSAGE_LEN {
+            // The element is written in place and taken back out if it
+            // does not fit, so no more than a few bytes past the limit are
+            // ever held. Room is kept for a nil value if nothing else fits.
+            let mark = out.len();
+            if !write_sd_element(&mut out, &id, &e.params) {
+                out.truncate(mark);
                 break;
             }
-            out.extend_from_slice(el.as_bytes());
             ids.push(id);
         }
         if ids.is_empty() {
@@ -896,7 +903,11 @@ impl BsdMessage {
     ///   allowed becomes `_` and the field is cut to its limit. An empty
     ///   host name is written `-`. An empty tag is left out, and so is a
     ///   process ID that is empty or comes without a tag.
-    /// - The content is cut so the whole fits in [`MAX_MESSAGE_LEN`].
+    /// - A space follows the tag's colon, unless the content is empty, or
+    ///   the space would make the whole pass [`MAX_MESSAGE_LEN`] and the
+    ///   content does not start with a space.
+    /// - The content is cut so the whole fits in [`MAX_MESSAGE_LEN`]. A
+    ///   message read with [`BsdMessage::parse`] is never cut.
     ///
     /// Content written without a tag that starts like one, or without a
     /// header that starts like one, reads back as one.
@@ -919,7 +930,12 @@ impl BsdMessage {
                 part.push(b']');
             }
             part.push(b':');
-            if !self.content.is_empty() {
+            // The space after the colon is a convention, and a reader skips
+            // one. It is left out when it would push content out, unless
+            // the content starts with a space a reader would skip instead.
+            let sep = usize::from(self.header.is_some());
+            let fits = out.len() + sep + part.len() + 1 + self.content.len() <= MAX_MESSAGE_LEN;
+            if !self.content.is_empty() && (fits || self.content[0] == b' ') {
                 part.push(b' ');
             }
         }
@@ -953,9 +969,12 @@ pub enum Entry {
 impl Entry {
     /// Reads a message in either format. It is RFC 5424 when the priority
     /// is followed by a version (1 to 3 digits, the first not 0) and a
-    /// space, and then any error in it is returned. Otherwise it is RFC
-    /// 3164. So a BSD message with no header whose text starts with a
-    /// short number and a space reads as a malformed RFC 5424 one.
+    /// space and the rest reads as RFC 5424. Otherwise it is RFC 3164,
+    /// which takes any bytes after a valid priority. So a BSD message with
+    /// no header whose text starts with a short number and a space still
+    /// reads, and the only errors are a bad priority and
+    /// [`ParseError::TooLong`]. To see why bytes are not RFC 5424, use
+    /// [`Message::parse`].
     pub fn parse(b: &[u8]) -> Result<Entry, ParseError> {
         if b.len() > MAX_MESSAGE_LEN {
             return Err(ParseError::TooLong(b.len()));
@@ -963,11 +982,14 @@ impl Entry {
         let (_, pos) = parse_pri(b).ok_or(ParseError::Priority)?;
         let rest = &b[pos..];
         let digits = rest.iter().take(4).take_while(|c| c.is_ascii_digit()).count();
-        if (1..=3).contains(&digits) && rest[0] != b'0' && rest.get(digits) == Some(&b' ') {
-            Message::parse(b).map(Entry::Rfc5424)
-        } else {
-            BsdMessage::parse(b).map(Entry::Bsd)
+        if (1..=3).contains(&digits)
+            && rest[0] != b'0'
+            && rest.get(digits) == Some(&b' ')
+            && let Ok(m) = Message::parse(b)
+        {
+            return Ok(Entry::Rfc5424(m));
         }
+        BsdMessage::parse(b).map(Entry::Bsd)
     }
 
     /// The message's priority.
@@ -978,7 +1000,9 @@ impl Entry {
         }
     }
 
-    /// The message's bytes, with no framing.
+    /// The message's bytes, with no framing, which [`Entry::parse`] always
+    /// reads. A BSD message whose content is itself an RFC 5424 message
+    /// after the priority reads back as that RFC 5424 message.
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
             Entry::Rfc5424(m) => m.to_bytes(),
@@ -993,7 +1017,8 @@ pub enum Framing {
     /// The message's length in decimal and a space come first. The
     /// message may hold any bytes.
     OctetCounting,
-    /// A newline ends the message, which cannot hold one.
+    /// A newline ends the message, which cannot hold one. A writer octet
+    /// counts a message that does.
     NonTransparent,
 }
 
@@ -1018,22 +1043,22 @@ impl Frame {
 
     /// The frame's bytes. A message is cut to [`MAX_MESSAGE_LEN`] bytes,
     /// and an empty one gives no bytes, since no frame can hold it. With
-    /// non-transparent framing, each newline in the message becomes a
-    /// space, and a message that ends with a carriage return gets a CR LF
-    /// trailer, since a reader takes one carriage return before the
-    /// newline for part of the trailer. A message that starts with a digit
-    /// from 1 to 9 is octet counted instead, since a reader would take the
-    /// digit for a length. Syslog messages start with `<`, so that never
-    /// happens to them.
+    /// non-transparent framing, a message that ends with a carriage return
+    /// gets a CR LF trailer, since a reader takes one carriage return
+    /// before the newline for part of the trailer. A message that holds a
+    /// newline is octet counted instead, since RFC 5424 section 5 forbids
+    /// a transport to alter a message, and so is one that starts with a
+    /// digit from 1 to 9, since a reader would take the digit for a
+    /// length.
     pub fn to_bytes(&self) -> Vec<u8> {
         let msg = &self.message[..self.message.len().min(MAX_MESSAGE_LEN)];
         let Some(&first) = msg.first() else { return Vec::new() };
-        if self.framing == Framing::OctetCounting || matches!(first, b'1'..=b'9') {
+        if self.framing == Framing::OctetCounting || matches!(first, b'1'..=b'9') || msg.contains(&b'\n') {
             let mut out = format!("{} ", msg.len()).into_bytes();
             out.extend_from_slice(msg);
             out
         } else {
-            let mut out: Vec<u8> = msg.iter().map(|&c| if c == b'\n' { b' ' } else { c }).collect();
+            let mut out = msg.to_vec();
             if out.last() == Some(&b'\r') {
                 out.push(b'\r');
             }
@@ -1078,7 +1103,8 @@ enum Skip {
 }
 
 /// Splits a syslog TCP stream into frames. Feed it the bytes a connection
-/// reads, in order, and take frames out until it has none. When the
+/// reads, in order, and take frames out until it has none, feeding again
+/// what it did not take. When the
 /// connection closes, [`Decoder::finish`] gives a last message that had no
 /// newline after it.
 ///
@@ -1111,26 +1137,35 @@ impl Decoder {
         Decoder::default()
     }
 
-    /// Adds bytes read from the connection. After a [`FrameError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            // Bytes taken out are dropped once they are at least as many
-            // as those held, so each byte is moved a bounded number of
-            // times on average.
-            if self.start > 0 && self.start >= self.buf.len() - self.start {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Takes bytes read from the connection, from the start of `bytes`,
+    /// and returns how many it took. It takes them all unless that would
+    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take frames out
+    /// with [`Decoder::next_frame`] and feed it the rest. Once it is full,
+    /// `next_frame` always gives a frame or an error, or drops bytes, so a
+    /// loop of feeding and taking out always ends. After a [`FrameError`]
+    /// the stream cannot be read any further, and every byte is taken and
+    /// dropped.
+    #[must_use = "bytes past the count returned were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        // Bytes taken out are dropped once they are at least as many as
+        // those held, so each byte is moved a bounded number of times on
+        // average, and the buffer stays under twice [`MAX_BUFFERED`].
+        if self.start > 0 && self.start >= self.buf.len() - self.start {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole frame, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. A decoder never holds more than one frame's
-    /// bytes, at most [`MAX_MESSAGE_LEN`], its count or trailer, beyond
-    /// what has been taken out, plus what one `feed` added.
+    /// stream has broken. A decoder never holds more than [`MAX_BUFFERED`]
+    /// bytes beyond what has been taken out.
     pub fn next_frame(&mut self) -> Option<Result<Frame, FrameError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -1332,6 +1367,42 @@ fn header_field(t: &[u8], max: usize, err: ParseError) -> Result<Option<String>,
         return Err(err);
     }
     Ok(Some(String::from_utf8_lossy(t).into_owned()))
+}
+
+/// Writes `[id name="value" ...]` at the end of `out`, and returns false,
+/// with `out` holding part of it, as soon as `out` passes
+/// [`MAX_MESSAGE_LEN`]. In values, `"`, `]` and a backslash are escaped,
+/// except a backslash followed by a character that is none of the three:
+/// that is an invalid escape, which reads back as the same backslash and
+/// is kept as it is (RFC 5424 section 6.3.3).
+fn write_sd_element(out: &mut Vec<u8>, id: &str, params: &[SdParam]) -> bool {
+    out.push(b'[');
+    out.extend_from_slice(id.as_bytes());
+    for p in params.iter().take(MAX_SD_PARAMS) {
+        out.push(b' ');
+        out.extend_from_slice(sd_name(&p.name).as_bytes());
+        out.extend_from_slice(b"=\"");
+        // Every byte that may be escaped is ASCII, which never appears
+        // inside a UTF-8 sequence, so the value is walked byte by byte.
+        let v = p.value.as_bytes();
+        for (i, &c) in v.iter().enumerate() {
+            let escape = match c {
+                b'"' | b']' => true,
+                b'\\' => matches!(v.get(i + 1), None | Some(b'"' | b'\\' | b']')),
+                _ => false,
+            };
+            if escape {
+                out.push(b'\\');
+            }
+            out.push(c);
+            if out.len() > MAX_MESSAGE_LEN {
+                return false;
+            }
+        }
+        out.push(b'"');
+    }
+    out.push(b']');
+    out.len() <= MAX_MESSAGE_LEN
 }
 
 /// Reads RFC 5424 structured data at `pos`: the nil value or one or more
@@ -1616,8 +1687,12 @@ mod tests {
         ] {
             assert_eq!(Timestamp::parse(bad.as_bytes()), None, "{bad}");
         }
-        // -00:00 reads as zero minutes.
+        // -00:00 is UTC with the local offset not known (RFC 3339 section
+        // 4.3), which +00:00 is not, so the two stay apart.
         let t = Timestamp::parse(b"2003-10-11T22:14:15-00:00").unwrap();
+        assert_eq!(t.offset, Offset::Unknown);
+        assert_eq!(t.to_bytes(), b"2003-10-11T22:14:15-00:00");
+        let t = Timestamp::parse(b"2003-10-11T22:14:15+00:00").unwrap();
         assert_eq!(t.offset, Offset::Minutes(0));
         assert_eq!(t.to_bytes(), b"2003-10-11T22:14:15+00:00");
     }
@@ -1794,7 +1869,17 @@ mod tests {
         assert_eq!(e.params.len(), 4);
         let again = m.to_bytes();
         assert_eq!(Message::parse(&again).unwrap(), m);
-        assert_eq!(again, br#"<34>1 - - - - - [x@1 a="q\"b\\s\]e" b="\\n" c="" a="2"]"#);
+        // The invalid escape `\n` is kept as it was (RFC 5424 section
+        // 6.3.3). A backslash before an ordinary character reads the same
+        // escaped or not, and is written as it.
+        assert_eq!(again, br#"<34>1 - - - - - [x@1 a="q\"b\s\]e" b="\n" c="" a="2"]"#);
+        // A backslash before a character that must be escaped, or at the
+        // end, is escaped itself.
+        let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+        m.structured_data.push(SdElement::new("x").param("a", r#"\"\\\]\"#).param("b", r"C:\path"));
+        let bytes = m.to_bytes();
+        assert_eq!(bytes, br#"<13>1 - - - - - [x a="\\\"\\\\\\\]\\" b="C:\path"]"#);
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
         // A trailing space means an empty text.
         let m = Message::parse(b"<34>1 - - - - - - ").unwrap();
         assert!(m.msg.is_empty());
@@ -1811,7 +1896,10 @@ mod tests {
         assert!(matches!(Entry::parse(b"<13>Oct  5 01:02:03 gw x"), Ok(Entry::Bsd(_))));
         assert!(matches!(Entry::parse(b"<13>0 x"), Ok(Entry::Bsd(_))));
         assert!(matches!(Entry::parse(b"<13>1234 x"), Ok(Entry::Bsd(_))));
-        assert_eq!(Entry::parse(b"<13>12 x"), Err(ParseError::Timestamp));
+        // Bytes that start like RFC 5424 but do not read as it are BSD.
+        assert_eq!(Message::parse(b"<13>12 x"), Err(ParseError::Timestamp));
+        let Ok(Entry::Bsd(m)) = Entry::parse(b"<13>12 x") else { panic!("not BSD") };
+        assert_eq!(m.content, b"12 x");
         let e = Entry::parse(EX2).unwrap();
         assert_eq!(e.priority().value(), 165);
         assert_eq!(e.to_bytes(), EX2);
@@ -1899,65 +1987,65 @@ mod tests {
     fn frames_both_ways() {
         // RFC 6587 section 3.4.1: octet counting.
         let mut d = Decoder::new();
-        d.feed(b"7 <34>1 x");
+        take(&mut d, b"7 <34>1 x");
         assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::OctetCounting, b"<34>1 x".to_vec()))));
         assert_eq!(d.next_frame(), None);
         // Section 3.4.2: a trailer ends the message.
-        d.feed(b"<13>a\r\n\n\n<13>b\n<13>c");
+        take(&mut d, b"<13>a\r\n\n\n<13>b\n<13>c");
         assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::NonTransparent, b"<13>a".to_vec()))));
         assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::NonTransparent, b"<13>b".to_vec()))));
         assert_eq!(d.next_frame(), None);
         assert_eq!(d.buffered(), 5);
         // Octet counted messages may hold newlines.
-        d.feed(b"\n5 a\nb\nc");
+        take(&mut d, b"\n5 a\nb\nc");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>c");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"a\nb\nc");
         assert_eq!(d.buffered(), 0);
 
         // Writers.
         assert_eq!(Frame::new(Framing::OctetCounting, b"<1>x".to_vec()).to_bytes(), b"4 <1>x");
-        assert_eq!(Frame::new(Framing::NonTransparent, b"<1>x\ny".to_vec()).to_bytes(), b"<1>x y\n");
+        assert_eq!(Frame::new(Framing::NonTransparent, b"<1>x\ny".to_vec()).to_bytes(), b"6 <1>x\ny");
         assert_eq!(Frame::new(Framing::NonTransparent, b"12".to_vec()).to_bytes(), b"2 12");
         assert_eq!(Frame::new(Framing::NonTransparent, Vec::new()).to_bytes(), b"");
         assert_eq!(Frame::new(Framing::OctetCounting, Vec::new()).to_bytes(), b"");
         let big = Frame::new(Framing::OctetCounting, vec![b'x'; MAX_MESSAGE_LEN + 10]).to_bytes();
         let mut d = Decoder::new();
-        d.feed(&big);
+        take(&mut d, &big);
         assert_eq!(d.next_frame().unwrap().unwrap().message.len(), MAX_MESSAGE_LEN);
     }
 
     #[test]
     fn frame_errors() {
         let mut d = Decoder::new();
-        d.feed(b"12x <34>1");
+        take(&mut d, b"12x <34>1");
         assert_eq!(d.next_frame(), Some(Err(FrameError::Length(b'x'))));
-        d.feed(b"<13>fine\n");
+        take(&mut d, b"<13>fine\n");
         assert_eq!(d.next_frame(), Some(Err(FrameError::Length(b'x'))));
         assert_eq!(d.buffered(), 0);
 
         // A count over the limit is fine; one past usize is not.
         let mut d = Decoder::new();
-        d.feed(format!("{} ", MAX_MESSAGE_LEN + 1).as_bytes());
+        take(&mut d, format!("{} ", MAX_MESSAGE_LEN + 1).as_bytes());
         assert_eq!(d.next_frame(), None);
         let mut d = Decoder::new();
-        d.feed(b"99999999999999999999999999");
+        take(&mut d, b"99999999999999999999999999");
         assert_eq!(d.next_frame(), Some(Err(FrameError::TooLong)));
 
         // A message without a newline may be MAX_MESSAGE_LEN bytes; past
         // that it is cut.
         let mut d = Decoder::new();
-        d.feed(&vec![b'<'; MAX_MESSAGE_LEN]);
+        take(&mut d, &vec![b'<'; MAX_MESSAGE_LEN]);
         assert_eq!(d.next_frame(), None);
-        d.feed(b"\n");
+        take(&mut d, b"\n");
         let f = d.next_frame().unwrap().unwrap();
         assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, false));
         let mut d = Decoder::new();
-        d.feed(&vec![b'<'; MAX_MESSAGE_LEN + 1]);
+        take(&mut d, &vec![b'<'; MAX_MESSAGE_LEN + 1]);
         assert_eq!(d.next_frame(), None);
-        d.feed(b"<");
+        take(&mut d, b"<");
         assert!(d.next_frame().unwrap().unwrap().truncated);
         assert_eq!(d.buffered(), 0);
-        d.feed(b"<<\n<13>x\n");
+        take(&mut d, b"<<\n<13>x\n");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>x");
         assert!(!FrameError::TooLong.to_string().is_empty());
         let kinds: std::collections::HashSet<FrameError> = [FrameError::TooLong, FrameError::Length(0)].into();
@@ -1995,11 +2083,11 @@ mod tests {
                 let framed = Frame::new(framing, raw.to_vec()).to_bytes();
                 for n in 0..framed.len() {
                     let mut d = Decoder::new();
-                    d.feed(&framed[..n]);
+                    take(&mut d, &framed[..n]);
                     assert_eq!(d.next_frame(), None, "{n} bytes");
                 }
                 let mut d = Decoder::new();
-                d.feed(&framed);
+                take(&mut d, &framed);
                 assert_eq!(d.next_frame().unwrap().unwrap().message, raw);
             }
         }
@@ -2040,7 +2128,7 @@ mod tests {
     fn crlf_trailers() {
         // RFC 6587 section 3.4.2: some senders end each message with CR LF.
         let mut d = Decoder::new();
-        d.feed(b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n");
+        take(&mut d, b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n");
         let f = d.next_frame().unwrap().unwrap();
         assert_eq!(f.message, b"<34>1 - - - - - -");
         assert!(Message::parse(&f.message).is_ok());
@@ -2050,7 +2138,7 @@ mod tests {
         // A message ending in CR keeps it when written.
         let f = Frame::new(Framing::NonTransparent, b"<13>b\r".to_vec());
         let mut d = Decoder::new();
-        d.feed(&f.to_bytes());
+        take(&mut d, &f.to_bytes());
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>b\r");
     }
 
@@ -2069,11 +2157,7 @@ mod tests {
                 let mut d = Decoder::new();
                 let mut got = Vec::new();
                 for piece in stream.chunks(chunk) {
-                    d.feed(piece);
-                    while let Some(f) = d.next_frame() {
-                        got.push(f.unwrap());
-                    }
-                    assert!(d.buffered() <= MAX_MESSAGE_LEN + chunk + 8);
+                    got.extend(run(&mut d, piece).into_iter().map(Result::unwrap));
                 }
                 assert_eq!(got.len(), 2, "chunk {chunk}");
                 assert_eq!(got[0].message, &long[..MAX_MESSAGE_LEN]);
@@ -2085,7 +2169,7 @@ mod tests {
         // A message of exactly the limit is whole.
         let exact = vec![b'<'; MAX_MESSAGE_LEN];
         let mut d = Decoder::new();
-        d.feed(&[exact.as_slice(), b"\r\n"].concat());
+        take(&mut d, &[exact.as_slice(), b"\r\n"].concat());
         let f = d.next_frame().unwrap().unwrap();
         assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, false));
     }
@@ -2099,32 +2183,29 @@ mod tests {
         let data = b"<13>x\n".repeat(n);
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&data);
-        let mut count = 0;
-        while let Some(f) = d.next_frame() {
-            assert_eq!(f.unwrap().message, b"<13>x");
-            count += 1;
-        }
-        assert_eq!((count, d.buffered()), (n, 0));
+        let got = run(&mut d, &data);
+        assert!(got.iter().all(|f| f.as_ref().unwrap().message == b"<13>x"));
+        assert_eq!((got.len(), d.buffered()), (n, 0));
         let mut d = Decoder::new();
-        d.feed(&vec![b'\n'; 6 * n]);
-        assert_eq!(d.next_frame(), None);
+        assert!(run(&mut d, &vec![b'\n'; 6 * n]).is_empty());
         assert_eq!(d.buffered(), 0);
-        // One frame taken out between feeds of a byte.
+        // One frame taken out between feeds that fill the decoder again.
         let mut d = Decoder::new();
-        d.feed(&data);
+        let mut at = d.feed(&data);
+        assert_eq!(at, MAX_BUFFERED);
         for _ in 0..n {
             assert!(d.next_frame().unwrap().is_ok());
-            d.feed(b"\n");
+            at += d.feed(&data[at..]);
+            assert!(d.buffered() <= MAX_BUFFERED);
         }
-        assert_eq!(d.next_frame(), None);
+        assert_eq!((at, d.next_frame()), (data.len(), None));
         assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
         // Bytes held after a frame is taken still count, and still frame.
         let mut d = Decoder::new();
-        d.feed(b"<13>a\n<13>b\n<13>");
+        take(&mut d, b"<13>a\n<13>b\n<13>");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>a");
         assert_eq!(d.buffered(), 10);
-        d.feed(b"c\n");
+        take(&mut d, b"c\n");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>b");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>c");
         assert_eq!(d.buffered(), 0);
@@ -2135,7 +2216,7 @@ mod tests {
         // A sender that closes the connection after a message with no
         // newline still sent that message.
         let mut d = Decoder::new();
-        d.feed(b"<13>a\n<13>last");
+        take(&mut d, b"<13>a\n<13>last");
         assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>a");
         assert_eq!(d.next_frame(), None);
         assert_eq!(d.finish(), Some(Frame::new(Framing::NonTransparent, b"<13>last".to_vec())));
@@ -2144,32 +2225,32 @@ mod tests {
         // A partial octet counted message, a broken stream and an empty
         // one give nothing.
         let mut d = Decoder::new();
-        d.feed(b"10 <13>");
+        take(&mut d, b"10 <13>");
         assert_eq!(d.next_frame(), None);
         assert_eq!(d.finish(), None);
         let mut d = Decoder::new();
-        d.feed(b"1x");
+        take(&mut d, b"1x");
         assert!(d.next_frame().unwrap().is_err());
         assert_eq!(d.finish(), None);
         assert_eq!(Decoder::new().finish(), None);
         // The rest of a message already cut gives nothing either, and an
         // unended message past the limit is cut.
         let mut d = Decoder::new();
-        d.feed(&vec![b'<'; MAX_MESSAGE_LEN + 2]);
+        take(&mut d, &vec![b'<'; MAX_MESSAGE_LEN + 2]);
         assert!(d.next_frame().unwrap().unwrap().truncated);
-        d.feed(b"more");
+        take(&mut d, b"more");
         assert_eq!(d.next_frame(), None);
         assert_eq!(d.finish(), None);
         let mut d = Decoder::new();
-        d.feed(&vec![b'<'; MAX_MESSAGE_LEN + 1]);
+        take(&mut d, &vec![b'<'; MAX_MESSAGE_LEN + 1]);
         assert_eq!(d.next_frame(), None);
         let f = d.finish().unwrap();
         assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, true));
         // A decoder can be copied mid-stream.
         let mut d = Decoder::new();
-        d.feed(b"<13>x");
+        take(&mut d, b"<13>x");
         let mut e = d.clone();
-        e.feed(b"\n");
+        take(&mut e, b"\n");
         assert_eq!(e.next_frame().unwrap().unwrap().message, b"<13>x");
         assert_eq!(d.next_frame(), None);
     }
@@ -2185,9 +2266,9 @@ mod tests {
         let bytes = message.to_bytes();
         assert_eq!(bytes, b"<34>1 - mymachine.example.com su - ID47 [origin ip=\"192.0.2.1\"] 'su root' failed");
         let mut decoder = Decoder::new();
-        decoder.feed(&Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes());
-        decoder.feed(&Frame::new(Framing::NonTransparent, bytes).to_bytes());
-        decoder.feed(b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n");
+        take(&mut decoder, &Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes());
+        take(&mut decoder, &Frame::new(Framing::NonTransparent, bytes).to_bytes());
+        take(&mut decoder, b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n");
         let mut got = Vec::new();
         while let Some(frame) = decoder.next_frame() {
             got.push(Entry::parse(&frame.unwrap().message).unwrap());
@@ -2200,6 +2281,126 @@ mod tests {
         assert_eq!(bsd.tag.as_deref(), Some("sshd"));
         assert_eq!(bsd.pid.as_deref(), Some("42"));
         assert_eq!(bsd.content, b"Accepted publickey");
+    }
+
+    #[test]
+    fn decoder_holds_a_bounded_number_of_bytes() {
+        // Feeding 4 MiB at once used to copy all of it into the decoder,
+        // and feeding without taking frames out grew it without end.
+        let big = vec![b'<'; 4 << 20];
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&big), MAX_BUFFERED);
+        assert_eq!(d.feed(&big), 0);
+        assert_eq!(d.buffered(), MAX_BUFFERED);
+        // Full, it always gives a frame, so feeding again makes progress.
+        let mut at = MAX_BUFFERED;
+        let mut frames = 0;
+        while at < big.len() {
+            while let Some(f) = d.next_frame() {
+                assert!(f.unwrap().message.len() <= MAX_MESSAGE_LEN);
+                frames += 1;
+            }
+            at += d.feed(&big[at..]);
+            assert!(d.buffered() <= MAX_BUFFERED);
+        }
+        assert_eq!(frames, 1);
+        assert_eq!(d.finish(), None);
+        // The longest count usize holds, then a message past the limit,
+        // just fits.
+        let mut d = Decoder::new();
+        let stream = [format!("{} ", usize::MAX).as_bytes(), &vec![b'x'; MAX_MESSAGE_LEN]].concat();
+        assert_eq!(d.feed(&stream), stream.len());
+        let f = d.next_frame().unwrap().unwrap();
+        assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, true));
+        // A broken stream takes and drops everything.
+        let mut d = Decoder::new();
+        take(&mut d, b"1x");
+        assert!(d.next_frame().unwrap().is_err());
+        assert_eq!((d.feed(&big), d.buffered()), (big.len(), 0));
+    }
+
+    #[test]
+    fn structured_data_writer_stops_at_the_limit() {
+        // Escaping a value used to build the whole element, twice the
+        // value's size, before checking it fit.
+        let mut out = b"<13>1 - - - - - ".to_vec();
+        let params = [SdParam { name: "p".into(), value: "\\".repeat(1 << 20) }];
+        assert!(!write_sd_element(&mut out, "x", &params));
+        assert!(out.len() <= MAX_MESSAGE_LEN + 2);
+        let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+        m.structured_data.push(SdElement::new("x").param("p", "\\".repeat(1 << 20)));
+        assert_eq!(m.to_bytes(), b"<13>1 - - - - - -");
+    }
+
+    #[test]
+    fn parsed_messages_near_the_limit_write_back_whole() {
+        // Each invalid escape used to be written as three bytes, so this
+        // 44 kB message grew past the limit and lost its element.
+        let raw = [&b"<13>1 - - - - - [x@32473 p=\""[..], &br"\n".repeat(22_000), b"\"]"].concat();
+        let m = Message::parse(&raw).unwrap();
+        assert_eq!(m.to_bytes(), raw);
+        assert_eq!(Message::parse(&m.to_bytes()).unwrap(), m);
+        // A BSD message at the limit with no space after the tag's colon
+        // used to lose its last byte to the space the writer added.
+        let raw = [&b"<13>app:"[..], &vec![b'x'; MAX_MESSAGE_LEN - 8]].concat();
+        let m = BsdMessage::parse(&raw).unwrap();
+        assert_eq!(m.to_bytes(), raw);
+        assert_eq!(BsdMessage::parse(&m.to_bytes()).unwrap(), m);
+        // Content that starts with a space keeps the separator, and is cut.
+        let mut m = BsdMessage::new(Priority::new(Facility::User, Severity::Notice), vec![b' '; MAX_MESSAGE_LEN]);
+        m.tag = Some("app".into());
+        let bytes = m.to_bytes();
+        assert_eq!(bytes.len(), MAX_MESSAGE_LEN);
+        assert!(bytes.starts_with(b"<13>app:  "));
+        assert_eq!(BsdMessage::parse(&bytes).unwrap().content.len(), MAX_MESSAGE_LEN - 9);
+    }
+
+    #[test]
+    fn entries_written_always_read() {
+        // A BSD message whose text starts with a short number and a space
+        // used to be written as bytes Entry::parse rejected.
+        for content in [&b"1 x"[..], b"12 - x", b"999 "] {
+            let e = Entry::Bsd(BsdMessage::new(Priority::new(Facility::User, Severity::Notice), content));
+            assert_eq!(Entry::parse(&e.to_bytes()), Ok(e));
+        }
+        // Content that is an RFC 5424 message reads as one.
+        let e = Entry::Bsd(BsdMessage::new(Priority::new(Facility::User, Severity::Notice), "1 - - - - - -"));
+        assert!(matches!(Entry::parse(&e.to_bytes()), Ok(Entry::Rfc5424(_))));
+    }
+
+    #[test]
+    fn non_transparent_frames_keep_newlines() {
+        // A newline in the message used to become a space.
+        let msg = b"<13>1 - - - - - - first\nsecond".to_vec();
+        let f = Frame::new(Framing::NonTransparent, msg.clone());
+        let mut d = Decoder::new();
+        take(&mut d, &f.to_bytes());
+        assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::OctetCounting, msg))));
+    }
+
+    /// Feeds all of `b`, which must fit, to `d`.
+    fn take(d: &mut Decoder, b: &[u8]) {
+        assert_eq!(d.feed(b), b.len());
+    }
+
+    /// Feeds all of `b` to `d`, taking frames out whenever it is full,
+    /// and gives every frame, up to and including the first error.
+    fn run(d: &mut Decoder, mut b: &[u8]) -> Vec<Result<Frame, FrameError>> {
+        let mut out = Vec::new();
+        loop {
+            b = &b[d.feed(b)..];
+            assert!(d.buffered() <= MAX_BUFFERED);
+            while let Some(r) = d.next_frame() {
+                let broken = r.is_err();
+                out.push(r);
+                if broken {
+                    return out;
+                }
+            }
+            if b.is_empty() {
+                return out;
+            }
+        }
     }
 
     /// A small deterministic generator, so the fuzz loop needs no crates.
@@ -2250,16 +2451,18 @@ mod tests {
         let mut rest = data;
         let mut broken = false;
         while !rest.is_empty() && !broken {
-            let (piece, after) = rest.split_at(sizes().clamp(1, rest.len()));
+            let (mut piece, after) = rest.split_at(sizes().clamp(1, rest.len()));
             rest = after;
-            d.feed(piece);
-            while let Some(r) = d.next_frame() {
-                broken = r.is_err();
-                out.push(r);
-                if broken {
-                    break;
+            while !piece.is_empty() && !broken {
+                piece = &piece[d.feed(piece)..];
+                assert!(d.buffered() <= MAX_BUFFERED);
+                while let Some(r) = d.next_frame() {
+                    broken = r.is_err();
+                    out.push(r);
+                    if broken {
+                        break;
+                    }
                 }
-                assert!(d.buffered() <= MAX_MESSAGE_LEN + piece.len() + 24);
             }
         }
         let last = d.finish();
@@ -2281,7 +2484,7 @@ mod tests {
             // A frame read can be written, and reads back the same. What is
             // written is whole, even when what was read had been cut.
             let mut d = Decoder::new();
-            d.feed(&f.to_bytes());
+            take(&mut d, &f.to_bytes());
             let whole = Frame { truncated: false, ..f.clone() };
             assert_eq!(d.next_frame().as_ref(), Some(&Ok(whole)));
             check_round_trip(&f.message);

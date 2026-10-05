@@ -50,7 +50,7 @@
 //! // The reply: headers, the same message back, then the status.
 //! let headers = response_headers(&request.content_type);
 //! assert_eq!(headers[0], (":status".to_string(), "200".to_string()));
-//! let reply = Message { compressed: false, data: message.data }.to_bytes();
+//! let reply = Message { compressed: false, data: message.data }.to_bytes().unwrap();
 //! assert_eq!(reply, data);
 //! let trailers = Status::new(Code::NotFound, "no user 'x'").to_trailers();
 //! assert_eq!(trailers[0], ("grpc-status".to_string(), "5".to_string()));
@@ -190,18 +190,23 @@ impl Message {
     }
 
     /// The message with its length prefix. A body longer than
-    /// [`MAX_MESSAGE`] is cut to that length. [`Message::parse`] reads
-    /// every message this writes. A [`Decoder`] reads it when the body is
+    /// [`MAX_MESSAGE`] is refused with [`FrameError::TooLarge`], whose
+    /// [`code`](FrameError::code) is the `RESOURCE_EXHAUSTED` a sender
+    /// ends the call with. Its `length` is the body's length, or
+    /// `u32::MAX` if that does not fit. [`Message::parse`] reads every
+    /// message this writes, and a [`Decoder`] reads it when the body is
     /// within the decoder's own limit.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let data = &self.data[..self.data.len().min(MAX_MESSAGE)];
-        // MAX_MESSAGE fits in a u32, so this never saturates.
-        let len = u32::try_from(data.len()).unwrap_or(u32::MAX);
-        let mut out = Vec::with_capacity(HEADER_LEN + data.len());
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameError> {
+        let len = match u32::try_from(self.data.len()) {
+            Ok(n) if self.data.len() <= MAX_MESSAGE => n,
+            Ok(n) => return Err(FrameError::TooLarge { length: n, limit: MAX_MESSAGE }),
+            Err(_) => return Err(FrameError::TooLarge { length: u32::MAX, limit: MAX_MESSAGE }),
+        };
+        let mut out = Vec::with_capacity(HEADER_LEN + self.data.len());
         out.push(u8::from(self.compressed));
         out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(data);
-        out
+        out.extend_from_slice(&self.data);
+        Ok(out)
     }
 
     /// Checks the compressed flag against the call's `grpc-encoding`. A
@@ -209,8 +214,9 @@ impl Message {
     /// breaks the protocol, and the server ends the call with `INTERNAL`.
     /// Whether the world can decompress a named encoding is up to it. If
     /// it cannot, it usually answers `UNIMPLEMENTED`.
+    /// An encoding that is empty or not a token names nothing.
     pub fn check_encoding(&self, encoding: Option<&str>) -> Result<(), Status> {
-        let named = matches!(encoding, Some(e) if !e.eq_ignore_ascii_case("identity"));
+        let named = matches!(encoding, Some(e) if is_coding(e) && !e.eq_ignore_ascii_case("identity"));
         if self.compressed && !named {
             return Err(Status::new(Code::Internal, "compressed message without a grpc-encoding"));
         }
@@ -500,10 +506,18 @@ pub struct Status {
 pub enum TrailerError {
     /// There was no `grpc-status`.
     MissingStatus,
-    /// `grpc-status` was not a decimal number, or came twice.
+    /// `grpc-status` was not a decimal number without leading zeros, or
+    /// came twice.
     BadStatus,
     /// `:status` was not 200. A `:status` that is not a number reads as 0.
     HttpStatus(u16),
+    /// The block has a `:status`, so it is a trailers-only response, but
+    /// its content-type is missing or not gRPC.
+    ContentType,
+    /// `grpc-status-details-bin` came with `grpc-status` 0, where the
+    /// specification does not allow it, or holds a status code that is
+    /// not the one `grpc-status` gives.
+    BadDetails,
 }
 
 impl fmt::Display for TrailerError {
@@ -512,6 +526,8 @@ impl fmt::Display for TrailerError {
             TrailerError::MissingStatus => f.write_str("no grpc-status"),
             TrailerError::BadStatus => f.write_str("malformed grpc-status"),
             TrailerError::HttpStatus(s) => write!(f, "HTTP status {s}, not 200"),
+            TrailerError::ContentType => f.write_str("content-type is not gRPC"),
+            TrailerError::BadDetails => f.write_str("grpc-status-details-bin contradicts grpc-status"),
         }
     }
 }
@@ -557,7 +573,11 @@ impl Status {
     }
 
     /// Reads a status from trailers, or from a trailers-only header block.
-    /// Header names match without regard to case. Other headers are
+    /// A block with a `:status` is read as trailers-only: the status must
+    /// be 200 and the content-type gRPC. Header names match without regard
+    /// to case. When `grpc-status-details-bin` holds a status code, it must
+    /// match `grpc-status`; details that are not base64 of a protobuf
+    /// message cannot be checked and are ignored. Other headers are
     /// ignored.
     pub fn parse_trailers<I, N, V>(headers: I) -> Result<Status, TrailerError>
     where
@@ -566,20 +586,31 @@ impl Status {
         V: AsRef<[u8]>,
     {
         let t = TrailerScan::new(headers);
-        if let Some(h) = t.http
-            && h != 200
-        {
-            return Err(TrailerError::HttpStatus(h));
+        if let Some(h) = t.http {
+            if h != 200 {
+                return Err(TrailerError::HttpStatus(h));
+            }
+            if !t.grpc_type {
+                return Err(TrailerError::ContentType);
+            }
         }
         t.status()
     }
 
     /// Reads a status the way a client must: as
-    /// [`parse_trailers`](Self::parse_trailers) does, but making one up from what is there
-    /// when the trailers are broken. A well-formed `grpc-status` is always
-    /// used, whatever the `:status`. Without one, a non-200 `:status` maps
-    /// through [`Code::from_http_status`], and anything else gives
-    /// `UNKNOWN`.
+    /// [`parse_trailers`](Self::parse_trailers) does, but making one up
+    /// from what is there when the trailers are broken. These rules follow
+    /// gRPC's HTTP mapping document and gRPC's Go client:
+    ///
+    /// - A trailers-only block whose content-type is missing or not gRPC
+    ///   is not a gRPC response. Its `:status` maps through
+    ///   [`Code::from_http_status`], whatever `grpc-status` says.
+    /// - Otherwise a well-formed `grpc-status` is used, whatever the
+    ///   `:status`, unless the status details contradict it, which gives
+    ///   `INTERNAL`.
+    /// - A malformed or repeated `grpc-status` gives `UNKNOWN`.
+    /// - With no `grpc-status`, a non-200 `:status` maps through
+    ///   [`Code::from_http_status`], and anything else gives `UNKNOWN`.
     pub fn from_trailers<I, N, V>(headers: I) -> Status
     where
         I: IntoIterator<Item = (N, V)>,
@@ -587,11 +618,13 @@ impl Status {
         V: AsRef<[u8]>,
     {
         let t = TrailerScan::new(headers);
+        let from_http = |h: u16| Status::new(Code::from_http_status(h), &format!("HTTP status {h}"));
         match (t.status(), t.http) {
+            (_, Some(h)) if !t.grpc_type && h != 200 => from_http(h),
+            (_, Some(_)) if !t.grpc_type => Status::new(Code::Unknown, &TrailerError::ContentType.to_string()),
             (Ok(s), _) => s,
-            (Err(_), Some(h)) if h != 200 => {
-                Status::new(Code::from_http_status(h), &format!("HTTP status {h}"))
-            }
+            (Err(TrailerError::MissingStatus), Some(h)) if h != 200 => from_http(h),
+            (Err(e @ TrailerError::BadDetails), _) => Status::new(Code::Internal, &e.to_string()),
             (Err(e), _) => Status::new(Code::Unknown, &e.to_string()),
         }
     }
@@ -600,10 +633,21 @@ impl Status {
 /// What a header block says about a call's status, before any rule about
 /// `:status` is applied.
 struct TrailerScan {
-    code: Option<Code>,
+    /// The `grpc-status` number as sent.
+    code: Option<u32>,
     bad: bool,
     message: Option<String>,
     http: Option<u16>,
+    /// Whether the first content-type was gRPC.
+    grpc_type: bool,
+    seen_type: bool,
+    /// Whether any `grpc-status-details-bin` came.
+    details: bool,
+    /// The status code the details hold, if they could be read and hold
+    /// one, as protobuf's int32 reads it.
+    details_code: Option<i32>,
+    /// Two details values held different codes.
+    details_mixed: bool,
 }
 
 impl TrailerScan {
@@ -613,16 +657,44 @@ impl TrailerScan {
         N: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        let mut t = TrailerScan { code: None, bad: false, message: None, http: None };
+        let mut t = TrailerScan {
+            code: None,
+            bad: false,
+            message: None,
+            http: None,
+            grpc_type: false,
+            seen_type: false,
+            details: false,
+            details_code: None,
+            details_mixed: false,
+        };
         for (name, value) in headers {
             let (name, value) = (name.as_ref(), value.as_ref());
             if name.eq_ignore_ascii_case(b"grpc-status") {
                 if t.code.is_some() {
                     t.bad = true;
                 }
+                // The specification writes the number without leading zeros.
+                let leading_zero = value.len() > 1 && value.first() == Some(&b'0');
                 match parse_decimal(value) {
-                    Some(n) => t.code = Some(Code::from_number(n).unwrap_or(Code::Unknown)),
-                    None => t.bad = true,
+                    Some(n) if !leading_zero => t.code = Some(n),
+                    _ => t.bad = true,
+                }
+            } else if name.eq_ignore_ascii_case(b"grpc-status-details-bin") {
+                t.details = true;
+                // Values joined with "," are read one by one.
+                for piece in value.split(|&c| c == b',') {
+                    if let Some(c) = details_code(trim(piece)) {
+                        if t.details_code.is_some_and(|d| d != c) {
+                            t.details_mixed = true;
+                        }
+                        t.details_code = Some(c);
+                    }
+                }
+            } else if name.eq_ignore_ascii_case(b"content-type") {
+                if !t.seen_type {
+                    t.seen_type = true;
+                    t.grpc_type = ContentType::parse(value).is_some();
                 }
             } else if name.eq_ignore_ascii_case(b"grpc-message") {
                 if t.message.is_none() {
@@ -641,7 +713,13 @@ impl TrailerScan {
         if self.bad {
             return Err(TrailerError::BadStatus);
         }
-        let code = self.code.ok_or(TrailerError::MissingStatus)?;
+        let n = self.code.ok_or(TrailerError::MissingStatus)?;
+        // protobuf's int32 keeps the low 32 bits of the varint, as here.
+        let contradicts = self.details_code.is_some_and(|d| d as u32 != n);
+        if self.details && (n == 0 || contradicts || self.details_mixed) {
+            return Err(TrailerError::BadDetails);
+        }
+        let code = Code::from_number(n).unwrap_or(Code::Unknown);
         Ok(Status { code, message: self.message.clone().unwrap_or_default() })
     }
 }
@@ -951,10 +1029,11 @@ pub struct MethodPath {
 
 impl MethodPath {
     /// The path for this service and method. It returns `None` unless
-    /// both are non-empty, hold only printable ASCII other than `/`, and
-    /// the path fits in [`MAX_PATH`] bytes.
+    /// both are non-empty URI path segments (RFC 3986, section 3.3:
+    /// letters, digits, `-._~!$&'()*+,;=:@`, and `%` with two hex digits)
+    /// and the path fits in [`MAX_PATH`] bytes.
     pub fn new(service: &str, method: &str) -> Option<MethodPath> {
-        let ok = |s: &str| !s.is_empty() && s.bytes().all(|c| c.is_ascii_graphic() && c != b'/');
+        let ok = |s: &str| is_segment(s.as_bytes());
         let len = service.len().checked_add(method.len())?.checked_add(2)?;
         if !ok(service) || !ok(method) || len > MAX_PATH {
             return None;
@@ -985,16 +1064,80 @@ impl MethodPath {
     }
 }
 
+/// A request's `:scheme`: gRPC allows `http` and `https`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Scheme {
+    /// `http`: the call runs without TLS.
+    #[default]
+    Http,
+    /// `https`: the call runs over TLS.
+    Https,
+}
+
+impl Scheme {
+    /// The header value, `http` or `https`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Http => "http",
+            Scheme::Https => "https",
+        }
+    }
+
+    /// Reads a `:scheme` value. Case does not matter.
+    pub fn parse(value: &[u8]) -> Option<Scheme> {
+        if value.eq_ignore_ascii_case(b"http") {
+            Some(Scheme::Http)
+        } else if value.eq_ignore_ascii_case(b"https") {
+            Some(Scheme::Https)
+        } else {
+            None
+        }
+    }
+}
+
+/// Why [`Request::to_headers`] cannot write a request. Each names the
+/// header at fault.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum HeaderError {
+    /// A metadata name is not one or more of `0-9 a-z _ - .`, or is one
+    /// the request writes itself (`te`, `content-type`, `grpc-timeout`,
+    /// `grpc-encoding`), or one HTTP/2 forbids, such as `connection`.
+    Name(String),
+    /// A value gRPC does not allow: an authority that is not one or more
+    /// visible ASCII characters, an encoding that is not a token, a
+    /// metadata value that is not printable ASCII or starts or ends with
+    /// a space, or a `-bin` value that is not base64.
+    Value(String),
+    /// The headers come to more than [`MAX_HEADER_LIST`] bytes, counted
+    /// as [`Request::parse`] counts them.
+    TooLarge(usize),
+}
+
+impl fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            HeaderError::Name(n) => write!(f, "header name {n:?} is not allowed in gRPC metadata"),
+            HeaderError::Value(n) => write!(f, "value of header {n:?} is not allowed"),
+            HeaderError::TooLarge(n) => write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}"),
+        }
+    }
+}
+
+impl std::error::Error for HeaderError {}
+
 /// A call's request headers, checked.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Request {
+    /// The `:scheme`. A request without one reads as `http`.
+    pub scheme: Scheme,
     /// The method called.
     pub path: MethodPath,
     /// The content-type. The response uses the same one.
     pub content_type: ContentType,
     /// The `grpc-timeout`, if the client sent one.
     pub timeout: Option<Timeout>,
-    /// The `grpc-encoding`: how compressed messages are compressed.
+    /// The `grpc-encoding`: how compressed messages are compressed. It is
+    /// always a token. An empty `grpc-encoding` reads as none.
     pub encoding: Option<String>,
     /// `:authority`, the virtual host, if sent.
     pub authority: Option<String>,
@@ -1011,17 +1154,24 @@ pub struct Request {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Rejection {
     /// Answer with this HTTP status and end the stream, with no gRPC
-    /// status. This is for requests that may not be gRPC at all.
+    /// status. This is for requests that may not be gRPC at all. The
+    /// status should be an error, 400 to 599.
     Http(u16),
     /// Answer with [`Status::trailers_only`].
     Status(Status),
 }
 
 impl Rejection {
-    /// The header block that answers the request and ends the stream.
+    /// The header block that answers the request and ends the stream. An
+    /// HTTP status outside 400 to 599 cannot end a stream as a refusal
+    /// (1xx needs a final response after it, and the rest are not
+    /// errors or not HTTP statuses), so it is written as 500.
     pub fn to_headers(&self) -> Vec<(String, String)> {
         match self {
-            Rejection::Http(s) => vec![(":status".to_string(), s.to_string())],
+            Rejection::Http(s) => {
+                let s = if (400..=599).contains(s) { *s } else { 500 };
+                vec![(":status".to_string(), s.to_string())]
+            }
             Rejection::Status(s) => s.trailers_only(&ContentType::plain()),
         }
     }
@@ -1039,10 +1189,11 @@ impl fmt::Display for Rejection {
 impl std::error::Error for Rejection {}
 
 impl Request {
-    /// A request for `path` with this content-type, `te: trailers`, and
-    /// no timeout, encoding, authority or metadata.
+    /// A request for `path` with this content-type, scheme `http`,
+    /// `te: trailers`, and no timeout, encoding, authority or metadata.
     pub fn new(path: MethodPath, content_type: ContentType) -> Request {
         Request {
+            scheme: Scheme::Http,
             path,
             content_type,
             timeout: None,
@@ -1065,20 +1216,22 @@ impl Request {
     ///
     /// - A header block over [`MAX_HEADER_LIST`] gets
     ///   `RESOURCE_EXHAUSTED`.
-    /// - `:method`, `:path`, `content-type`, `grpc-timeout` or
+    /// - `:method`, `:scheme`, `:path`, `content-type`, `grpc-timeout` or
     ///   `grpc-encoding` twice gets `INTERNAL`.
     /// - A content-type that is missing or not gRPC gets HTTP 415.
     /// - A method other than POST gets HTTP 405.
     /// - A path that is not `/service/method` gets `UNIMPLEMENTED`.
+    /// - A `:scheme` other than `http` or `https` gets `INTERNAL`.
     /// - A malformed `grpc-timeout` gets `INTERNAL`.
+    /// - A `grpc-encoding` that is not a token gets `INTERNAL`.
     pub fn parse<I, N, V>(headers: I) -> Result<Request, Rejection>
     where
         I: IntoIterator<Item = (N, V)>,
         N: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        const ONCE: [&[u8]; 5] = [b":method", b":path", b"content-type", b"grpc-timeout", b"grpc-encoding"];
-        let mut seen: [Option<Vec<u8>>; 5] = Default::default();
+        const ONCE: [&[u8]; 6] = [b":method", b":scheme", b":path", b"content-type", b"grpc-timeout", b"grpc-encoding"];
+        let mut seen: [Option<Vec<u8>>; 6] = Default::default();
         let mut size: usize = 0;
         let mut authority = None;
         let mut te_trailers = false;
@@ -1107,7 +1260,7 @@ impl Request {
                 metadata.push((name, value.to_vec()));
             }
         }
-        let [method, path, content_type, timeout, encoding] = seen;
+        let [method, scheme, path, content_type, timeout, encoding] = seen;
         let Some(content_type) = content_type.as_deref().and_then(ContentType::parse) else {
             return Err(Rejection::Http(UNSUPPORTED_MEDIA_TYPE));
         };
@@ -1119,6 +1272,16 @@ impl Request {
             let msg = format!("unknown method {}", String::from_utf8_lossy(&path_bytes));
             return Err(Rejection::Status(Status::new(Code::Unimplemented, &msg)));
         };
+        let scheme = match scheme {
+            None => Scheme::Http,
+            Some(s) => match Scheme::parse(&s) {
+                Some(s) => s,
+                None => {
+                    let msg = format!("unsupported scheme {}", String::from_utf8_lossy(&s));
+                    return Err(Rejection::Status(Status::new(Code::Internal, &msg)));
+                }
+            },
+        };
         let timeout = match timeout {
             None => None,
             Some(t) => match Timeout::parse(&t) {
@@ -1126,76 +1289,72 @@ impl Request {
                 Err(e) => return Err(Rejection::Status(Status::new(Code::Internal, &e.to_string()))),
             },
         };
-        let encoding = encoding.map(|e| String::from_utf8_lossy(trim(&e)).into_owned());
-        Ok(Request { path, content_type, timeout, encoding, authority, te_trailers, metadata })
+        let encoding = match encoding.as_deref().map(trim) {
+            None | Some([]) => None,
+            Some(e) => match std::str::from_utf8(e) {
+                Ok(e) if is_coding(e) => Some(e.to_string()),
+                _ => {
+                    let msg = format!("malformed grpc-encoding {}", String::from_utf8_lossy(e));
+                    return Err(Rejection::Status(Status::new(Code::Internal, &msg)));
+                }
+            },
+        };
+        Ok(Request { scheme, path, content_type, timeout, encoding, authority, te_trailers, metadata })
     }
 
     /// The request headers a client sends for this call: method, scheme,
-    /// path, `te`, content-type, and the authority, timeout and encoding
-    /// when set, then the metadata. [`Request::parse`] always accepts what
-    /// this writes. So the authority, the encoding and each metadata value
-    /// are written only if they are printable ASCII and fit in
-    /// [`MAX_HEADER_LIST`]. Metadata named like a pseudo-header, `te`,
-    /// or a header this struct already holds is left out.
-    pub fn to_headers(&self) -> Vec<(String, String)> {
-        fn size(name: &str, value: &str) -> usize {
-            name.len().saturating_add(value.len()).saturating_add(32)
-        }
-        fn printable(v: &[u8]) -> bool {
-            v.iter().all(|c| (0x20..=0x7e).contains(c))
-        }
-        let path = self.path.to_path();
-        let content_type = self.content_type.to_header();
-        let timeout = self.timeout.map(Timeout::to_header);
-        // The headers always written. With MAX_PATH and MAX_SUBTYPE they
-        // come to well under MAX_HEADER_LIST.
-        let mut used = size(":method", "POST")
-            + size(":scheme", "http")
-            + size(":path", &path)
-            + size("te", "trailers")
-            + size("content-type", &content_type)
-            + timeout.as_deref().map_or(0, |t| size("grpc-timeout", t));
-        let mut fits = |name: &str, value: &str| {
-            let n = size(name, value);
-            let ok = printable(value.as_bytes()) && used.saturating_add(n) <= MAX_HEADER_LIST;
-            if ok {
-                used += n;
-            }
-            ok
-        };
-        let authority = self.authority.as_deref().filter(|a| fits(":authority", a));
-        let encoding = self.encoding.as_deref().filter(|e| fits("grpc-encoding", e));
+    /// path, the authority when set, `te`, the timeout when set, the
+    /// content-type, the encoding when set, then the metadata in order.
+    /// [`Request::parse`] reads what this writes back as the same request,
+    /// with `te_trailers` set. It writes nothing it would have to change:
+    /// a header gRPC or HTTP/2 does not allow, or a block over
+    /// [`MAX_HEADER_LIST`], is a [`HeaderError`].
+    pub fn to_headers(&self) -> Result<Vec<(String, String)>, HeaderError> {
         let mut out = vec![
             (":method".to_string(), "POST".to_string()),
-            (":scheme".to_string(), "http".to_string()),
-            (":path".to_string(), path),
+            (":scheme".to_string(), self.scheme.as_str().to_string()),
+            (":path".to_string(), self.path.to_path()),
         ];
-        if let Some(a) = authority {
-            out.push((":authority".to_string(), a.to_string()));
+        if let Some(a) = &self.authority {
+            if a.is_empty() || !a.bytes().all(|c| c.is_ascii_graphic()) {
+                return Err(HeaderError::Value(":authority".to_string()));
+            }
+            out.push((":authority".to_string(), a.clone()));
         }
         out.push(("te".to_string(), "trailers".to_string()));
-        if let Some(t) = timeout {
-            out.push(("grpc-timeout".to_string(), t));
+        if let Some(t) = self.timeout {
+            out.push(("grpc-timeout".to_string(), t.to_header()));
         }
-        out.push(("content-type".to_string(), content_type));
-        if let Some(e) = encoding {
-            out.push(("grpc-encoding".to_string(), e.to_string()));
+        out.push(("content-type".to_string(), self.content_type.to_header()));
+        if let Some(e) = &self.encoding {
+            if !is_coding(e) {
+                return Err(HeaderError::Value("grpc-encoding".to_string()));
+            }
+            out.push(("grpc-encoding".to_string(), e.clone()));
         }
         for (name, value) in &self.metadata {
-            let reserved = name.starts_with(':')
-                || ["te", "content-type", "grpc-timeout", "grpc-encoding"]
-                    .iter()
-                    .any(|r| name.eq_ignore_ascii_case(r));
-            if reserved {
-                continue;
+            let reserved = ["te", "content-type", "grpc-timeout", "grpc-encoding"].contains(&name.as_str());
+            if !is_metadata_name(name) || reserved || is_connection_header(name) {
+                return Err(HeaderError::Name(name.clone()));
             }
-            if let Ok(v) = std::str::from_utf8(value)
-                && fits(name, v)
-            {
-                out.push((name.clone(), v.to_string()));
+            let ok = if name.ends_with("-bin") {
+                value.split(|&c| c == b',').all(is_base64)
+            } else {
+                value.iter().all(|c| (0x20..=0x7e).contains(c))
+                    && value.first() != Some(&b' ')
+                    && value.last() != Some(&b' ')
+            };
+            // Every byte checked above is ASCII.
+            match std::str::from_utf8(value) {
+                Ok(v) if ok => out.push((name.clone(), v.to_string())),
+                _ => return Err(HeaderError::Value(name.clone())),
             }
         }
-        out
+        let size = out.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(v.len()).saturating_add(32));
+        if size > MAX_HEADER_LIST {
+            return Err(HeaderError::TooLarge(size));
+        }
+        Ok(out)
     }
 }
 
@@ -1242,6 +1401,144 @@ fn hex(c: u8) -> Option<u8> {
 
 fn is_token(c: u8) -> bool {
     c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)
+}
+
+/// Whether `e` can be a content-coding: one or more token characters.
+fn is_coding(e: &str) -> bool {
+    !e.is_empty() && e.bytes().all(is_token)
+}
+
+/// Whether `s` is a non-empty URI path segment: RFC 3986 `pchar`s, with
+/// each `%` followed by two hex digits.
+fn is_segment(s: &[u8]) -> bool {
+    let mut i = 0;
+    while let Some(&c) = s.get(i) {
+        if c == b'%' {
+            let (Some(&h), Some(&l)) = (s.get(i + 1), s.get(i + 2)) else {
+                return false;
+            };
+            if hex(h).is_none() || hex(l).is_none() {
+                return false;
+            }
+            i += 3;
+            continue;
+        }
+        if !(c.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@".contains(&c)) {
+            return false;
+        }
+        i += 1;
+    }
+    !s.is_empty()
+}
+
+/// Whether `name` is a header HTTP/2 forbids: one tied to an HTTP/1
+/// connection (RFC 9113, section 8.2.2).
+fn is_connection_header(name: &str) -> bool {
+    ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"]
+        .iter()
+        .any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Whether `name` is a gRPC metadata name: one or more of `0-9 a-z _ - .`.
+fn is_metadata_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || b"_-.".contains(&c))
+}
+
+fn base64_digit(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Whether `v` is base64 (RFC 4648, section 4), padded or not.
+fn is_base64(v: &[u8]) -> bool {
+    let body = v.strip_suffix(b"==").or_else(|| v.strip_suffix(b"=")).unwrap_or(v);
+    let padded = body.len() != v.len();
+    body.iter().all(|&c| base64_digit(c).is_some())
+        && body.len() % 4 != 1
+        && (!padded || v.len().is_multiple_of(4))
+}
+
+/// The bytes base64 text decodes to, one at a time, with no buffer. The
+/// text must have passed [`is_base64`].
+struct Base64<'a> {
+    text: &'a [u8],
+    bits: u32,
+    nbits: u32,
+}
+
+impl Iterator for Base64<'_> {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        while self.nbits < 8 {
+            let (&c, rest) = self.text.split_first()?;
+            self.text = rest;
+            self.bits = ((self.bits << 6) | u32::from(base64_digit(c)?)) & 0xfff;
+            self.nbits += 6;
+        }
+        self.nbits -= 8;
+        Some((self.bits >> self.nbits) as u8)
+    }
+}
+
+/// Reads a protobuf varint. `Err` means the bytes ran out inside it, or it
+/// had more than 10 bytes.
+fn varint(b: &mut impl Iterator<Item = u8>) -> Result<u64, ()> {
+    let mut n: u64 = 0;
+    for i in 0..10 {
+        let c = b.next().ok_or(())?;
+        n |= u64::from(c & 0x7f) << (7 * i);
+        if c & 0x80 == 0 {
+            return Ok(n);
+        }
+    }
+    Err(())
+}
+
+/// The status code in a `grpc-status-details-bin` value: the `code` field
+/// (number 1) of a `google.rpc.Status`, the last one if it comes more than
+/// once, as protobuf reads it. It is `None` when the value has no code or
+/// is not base64 of a protobuf message. It reads the value once, holding
+/// nothing.
+fn details_code(v: &[u8]) -> Option<i32> {
+    if !is_base64(v) {
+        return None;
+    }
+    let body = v.strip_suffix(b"==").or_else(|| v.strip_suffix(b"=")).unwrap_or(v);
+    let mut b = Base64 { text: body, bits: 0, nbits: 0 }.peekable();
+    let mut code = None;
+    loop {
+        if b.peek().is_none() {
+            return code;
+        }
+        let tag = varint(&mut b).ok()?;
+        if tag >> 3 == 0 || tag >> 3 > 0x1fff_ffff {
+            return None;
+        }
+        let skip = match tag & 7 {
+            0 => {
+                let n = varint(&mut b).ok()?;
+                if tag >> 3 == 1 {
+                    // int32 keeps the low 32 bits.
+                    code = Some(n as u32 as i32);
+                }
+                0
+            }
+            1 => 8,
+            2 => varint(&mut b).ok()?,
+            5 => 4,
+            _ => return None,
+        };
+        for _ in 0..skip {
+            b.next()?;
+        }
+    }
 }
 
 fn trim(mut b: &[u8]) -> &[u8] {
@@ -1329,7 +1626,7 @@ mod tests {
         assert!(!r.te_trailers);
         assert_eq!(r.metadata, [("authorization".to_string(), b"Bearer y235.wef315yfh138vh31hv93hv8h3v".to_vec())]);
         // What it writes reads back the same, with te added.
-        let again = Request::parse(strings(&r.to_headers())).unwrap();
+        let again = Request::parse(strings(&r.to_headers().unwrap())).unwrap();
         assert!(again.te_trailers);
         assert_eq!(Request { te_trailers: false, ..again }, r);
     }
@@ -1349,11 +1646,11 @@ mod tests {
     #[test]
     fn message_framing() {
         let m = Message { compressed: false, data: vec![1, 2, 3] };
-        assert_eq!(m.to_bytes(), [0, 0, 0, 0, 3, 1, 2, 3]);
+        assert_eq!(m.to_bytes().unwrap(), [0, 0, 0, 0, 3, 1, 2, 3]);
         let c = Message { compressed: true, data: vec![] };
-        assert_eq!(c.to_bytes(), [1, 0, 0, 0, 0]);
-        let mut stream = m.to_bytes();
-        stream.extend(c.to_bytes());
+        assert_eq!(c.to_bytes().unwrap(), [1, 0, 0, 0, 0]);
+        let mut stream = m.to_bytes().unwrap();
+        stream.extend(c.to_bytes().unwrap());
         stream.push(0);
         let (a, used) = Message::parse(&stream).unwrap().unwrap();
         assert_eq!((a, used), (m.clone(), 8));
@@ -1365,7 +1662,7 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix_waits() {
-        let bytes = Message { compressed: true, data: (0..40).collect() }.to_bytes();
+        let bytes = Message { compressed: true, data: (0..40).collect() }.to_bytes().unwrap();
         for n in 0..bytes.len() {
             assert_eq!(Message::parse(&bytes[..n]), Ok(None), "{n} bytes");
             let mut d = Decoder::new();
@@ -1402,8 +1699,8 @@ mod tests {
     fn decoder_limit() {
         let mut d = Decoder::with_limit(3);
         assert_eq!(d.limit(), 3);
-        let ok = Message { compressed: false, data: vec![1, 2, 3] }.to_bytes();
-        let over = Message { compressed: false, data: vec![1, 2, 3, 4] }.to_bytes();
+        let ok = Message { compressed: false, data: vec![1, 2, 3] }.to_bytes().unwrap();
+        let over = Message { compressed: false, data: vec![1, 2, 3, 4] }.to_bytes().unwrap();
         let mut stream = ok.clone();
         stream.extend(&over);
         let got = decode(Decoder::with_limit(3), &stream, 1);
@@ -1437,7 +1734,7 @@ mod tests {
         let msgs: Vec<Message> = (0..5u8)
             .map(|i| Message { compressed: i % 2 == 1, data: vec![i; usize::from(i) * 3] })
             .collect();
-        let stream: Vec<u8> = msgs.iter().flat_map(Message::to_bytes).collect();
+        let stream: Vec<u8> = msgs.iter().flat_map(|m| m.to_bytes().unwrap()).collect();
         let want: Vec<_> = msgs.into_iter().map(Ok).collect();
         for chunk in [1, 2, 3, 5, 7, stream.len()] {
             assert_eq!(decode(Decoder::new(), &stream, chunk), want, "chunk {chunk}");
@@ -1446,11 +1743,15 @@ mod tests {
 
     #[test]
     fn writers_cap_what_they_write() {
-        let m = Message { compressed: false, data: vec![1; MAX_MESSAGE + 10] };
-        let bytes = m.to_bytes();
+        // A body over the limit is refused, not cut.
+        let m = Message { compressed: false, data: vec![7; MAX_MESSAGE + 1] };
+        let e = m.to_bytes().unwrap_err();
+        assert_eq!(e, FrameError::TooLarge { length: MAX_MESSAGE as u32 + 1, limit: MAX_MESSAGE });
+        assert_eq!(e.code(), Code::ResourceExhausted);
+        let m = Message { compressed: true, data: vec![1; MAX_MESSAGE] };
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), HEADER_LEN + MAX_MESSAGE);
-        let (back, _) = Message::parse(&bytes).unwrap().unwrap();
-        assert_eq!(back.data.len(), MAX_MESSAGE);
+        assert_eq!(Message::parse(&bytes), Ok(Some((m, bytes.len()))));
         let long = "é".repeat(MAX_STATUS_MESSAGE);
         let s = Status::new(Code::Internal, &long);
         assert!(s.message.len() <= MAX_STATUS_MESSAGE);
@@ -1653,7 +1954,13 @@ mod tests {
         assert_eq!(Status::parse_trailers([(":status", "x"), ("grpc-status", "0")]), Err(TrailerError::HttpStatus(0)));
         // Unknown numbers read as UNKNOWN; names match any case.
         assert_eq!(Status::parse_trailers([("GRPC-STATUS", "42")]).unwrap().code, Code::Unknown);
-        let s = Status::parse_trailers([(":status", "200"), ("grpc-status", "3"), ("grpc-message", "bad%20arg")]).unwrap();
+        let s = Status::parse_trailers([
+            (":status", "200"),
+            ("content-type", "application/grpc"),
+            ("grpc-status", "3"),
+            ("grpc-message", "bad%20arg"),
+        ])
+        .unwrap();
         assert_eq!(s, Status::new(Code::InvalidArgument, "bad arg"));
         assert_eq!(s.to_string(), "INVALID_ARGUMENT: bad arg");
         assert_eq!(Status::from_trailers([(":status", "503")]).code, Code::Unavailable);
@@ -1661,6 +1968,7 @@ mod tests {
         assert_eq!(Status::from_trailers([("a", "b")]).code, Code::Unknown);
         assert_eq!(Status::from_trailers([("grpc-status", "5")]).code, Code::NotFound);
         assert!(TrailerError::HttpStatus(1).to_string().contains('1'));
+        assert!(TrailerError::BadDetails.to_string().contains("details"));
     }
 
     #[test]
@@ -1678,9 +1986,11 @@ mod tests {
     #[test]
     fn grpc_status_wins_over_http_status() {
         // The HTTP mapping is only for responses with no grpc-status.
-        let s = Status::from_trailers([(":status", "503"), ("grpc-status", "5"), ("grpc-message", "gone")]);
+        let ct = ("content-type", "application/grpc");
+        let s = Status::from_trailers([(":status", "503"), ct, ("grpc-status", "5"), ("grpc-message", "gone")]);
         assert_eq!(s, Status::new(Code::NotFound, "gone"));
-        // With a malformed grpc-status, the HTTP status still maps.
+        // A response that is not gRPC maps its HTTP status, whatever it says.
+        assert_eq!(Status::from_trailers([(":status", "503"), ("grpc-status", "5")]).code, Code::Unavailable);
         assert_eq!(Status::from_trailers([(":status", "503"), ("grpc-status", "x")]).code, Code::Unavailable);
         // A 200 with no grpc-status is UNKNOWN.
         assert_eq!(Status::from_trailers([(":status", "200")]).code, Code::Unknown);
@@ -1704,7 +2014,7 @@ mod tests {
         let path = MethodPath::new("helloworld.Greeter", "SayHello").unwrap();
         let mut r = Request::new(path.clone(), ContentType::plain());
         r.metadata.push(("x-user".to_string(), b"ada".to_vec()));
-        let back = Request::parse(strings(&r.to_headers())).unwrap();
+        let back = Request::parse(strings(&r.to_headers().unwrap())).unwrap();
         assert_eq!(back, r);
         assert_eq!(back.metadata_value("X-User"), Some(&b"ada"[..]));
         assert_eq!(back.metadata_value("x-none"), None);
@@ -1721,32 +2031,183 @@ mod tests {
         assert_eq!(d.buffered(), 6);
         assert!(Status::ok().is_ok());
         assert!(!Status::new(Code::Aborted, "").is_ok());
-        assert_eq!(Message::default().to_bytes(), [0; HEADER_LEN]);
+        assert_eq!(Message::default().to_bytes().unwrap(), [0; HEADER_LEN]);
     }
 
     #[test]
     fn request_writer_output_parses() {
-        let mut r = Request::parse(good_request()).unwrap();
-        // Metadata the parser would read as something else, or refuse.
-        r.metadata.push(("grpc-timeout".to_string(), b"1S".to_vec()));
-        r.metadata.push(("Content-Type".to_string(), b"text/html".to_vec()));
-        r.metadata.push((":path".to_string(), b"/a/b".to_vec()));
-        r.metadata.push(("te".to_string(), b"gzip".to_vec()));
-        r.metadata.push(("x-ctl".to_string(), b"a\x01b".to_vec()));
-        r.metadata.push(("x-big".to_string(), vec![b'v'; MAX_HEADER_LIST]));
-        r.encoding = Some("x".repeat(MAX_HEADER_LIST));
-        r.authority = Some("a\nb".to_string());
-        let back = Request::parse(strings(&r.to_headers())).unwrap();
-        assert_eq!(back.metadata, r.metadata[..1]);
-        assert_eq!((back.encoding, back.authority), (None, None));
-        // A request near the limit, with no te or :scheme, still writes
-        // headers that read back.
+        let r = Request::parse(good_request()).unwrap();
+        let bad_name = |name: &str| {
+            let mut r = r.clone();
+            r.metadata.push((name.to_string(), b"x".to_vec()));
+            r.to_headers()
+        };
+        // Names the parser would read as something else, that are not
+        // gRPC metadata names, or that HTTP/2 forbids.
+        for name in ["grpc-timeout", "content-type", "te", "grpc-encoding", ":path", "Content-Type", "X-Test", "bad name", "", "connection", "upgrade", "transfer-encoding"] {
+            assert_eq!(bad_name(name), Err(HeaderError::Name(name.to_string())), "{name:?}");
+        }
+        let bad_value = |name: &str, value: &[u8]| {
+            let mut r = r.clone();
+            r.metadata.push((name.to_string(), value.to_vec()));
+            r.to_headers()
+        };
+        for (name, value) in [("x-ctl", &b"a\x01b"[..]), ("x-tab", b"a\tb"), ("x-lead", b" a"), ("x-trail", b"a "), ("x-bin", b"!"), ("x-bin", b"abcde"), ("x-bin", b"ab=c"), ("x-bin", b"YQ")] {
+            let got = bad_value(name, value);
+            if name == "x-bin" && value == b"YQ" {
+                // Unpadded base64 is what gRPC sends.
+                assert!(got.is_ok());
+            } else {
+                assert_eq!(got, Err(HeaderError::Value(name.to_string())), "{name} {value:?}");
+            }
+        }
+        assert!(bad_value("x-bin", b"YQ==,YWI=").is_ok());
+        assert!(bad_value("x-empty", b"").is_ok());
+        let mut a = r.clone();
+        a.authority = Some("a\nb".to_string());
+        assert_eq!(a.to_headers(), Err(HeaderError::Value(":authority".to_string())));
+        a.authority = Some(String::new());
+        assert_eq!(a.to_headers(), Err(HeaderError::Value(":authority".to_string())));
+        let mut e = r.clone();
+        e.encoding = Some(String::new());
+        assert_eq!(e.to_headers(), Err(HeaderError::Value("grpc-encoding".to_string())));
+        // Too many headers is an error, and nothing is left out.
+        let mut big = Request::new(MethodPath::new("s", "m").unwrap(), ContentType::plain());
+        big.metadata.push(("x-pad".to_string(), vec![b'v'; 7900]));
+        big.metadata.push(("authorization".to_string(), b"Bearer x".to_vec()));
+        assert!(matches!(big.to_headers(), Err(HeaderError::TooLarge(n)) if n > MAX_HEADER_LIST));
+        big.metadata[0].1.truncate(7000);
+        let back = Request::parse(strings(&big.to_headers().unwrap())).unwrap();
+        assert_eq!(back, big);
+        // A request that read in near the limit, with no te or :scheme,
+        // grows past it when they are written.
         let mut near = vec![(":method", "POST"), (":path", "/a/b"), ("content-type", "application/grpc")];
         let used: usize = near.iter().map(|(n, v)| n.len() + v.len() + 32).sum();
         let filler = "v".repeat(MAX_HEADER_LIST - used - 32 - "x-filler".len());
         near.push(("x-filler", Box::leak(filler.into_boxed_str())));
         let r = Request::parse(near).unwrap();
-        assert!(Request::parse(strings(&r.to_headers())).is_ok());
+        assert!(matches!(r.to_headers(), Err(HeaderError::TooLarge(_))));
+        assert!(HeaderError::TooLarge(9000).to_string().contains("9000"));
+    }
+
+    #[test]
+    fn scheme_is_kept() {
+        let r = Request::parse(good_request()).unwrap();
+        assert_eq!(r.scheme, Scheme::Https);
+        let h = r.to_headers().unwrap();
+        assert!(strings(&h).contains(&(":scheme", "https")));
+        assert_eq!(Request::parse(strings(&h)).unwrap().scheme, Scheme::Https);
+        let mut ftp = good_request();
+        ftp.retain(|(n, _)| *n != ":scheme");
+        assert_eq!(Request::parse(ftp.clone()).unwrap().scheme, Scheme::Http);
+        ftp.push((":scheme", "ftp"));
+        assert!(matches!(Request::parse(ftp), Err(Rejection::Status(s)) if s.code == Code::Internal));
+        let mut twice = good_request();
+        twice.push((":scheme", "https"));
+        assert!(matches!(Request::parse(twice), Err(Rejection::Status(s)) if s.code == Code::Internal));
+        assert_eq!(Scheme::parse(b"HTTPS"), Some(Scheme::Https));
+        assert_eq!(Scheme::default().as_str(), "http");
+    }
+
+    #[test]
+    fn status_details_must_agree_with_grpc_status() {
+        // "CA4" is base64 for 08 0e: a google.rpc.Status with code 14.
+        let t = [("grpc-status", "5"), ("grpc-status-details-bin", "CA4")];
+        assert_eq!(Status::parse_trailers(t), Err(TrailerError::BadDetails));
+        assert_eq!(Status::from_trailers(t).code, Code::Internal);
+        // Details are not allowed with OK.
+        let ok = [("grpc-status", "0"), ("grpc-status-details-bin", "")];
+        assert_eq!(Status::parse_trailers(ok), Err(TrailerError::BadDetails));
+        // Matching details, padded or not, and details with no code, pass.
+        for d in ["CA4", "CA4=", "CA4,CA4", "EgF4"] {
+            let t = [("grpc-status", "14"), ("grpc-status-details-bin", d)];
+            assert_eq!(Status::parse_trailers(t).unwrap().code, Code::Unavailable, "{d}");
+        }
+        // The last code field wins, as protobuf reads it: 08 05 08 0e.
+        let t = [("grpc-status", "5"), ("grpc-status-details-bin", "CAUIDg")];
+        assert_eq!(Status::parse_trailers(t), Err(TrailerError::BadDetails));
+        // Details that are not base64 or not protobuf cannot be checked.
+        for d in ["!!", "CA", "/w"] {
+            let t = [("grpc-status", "5"), ("grpc-status-details-bin", d)];
+            assert_eq!(Status::parse_trailers(t).unwrap().code, Code::NotFound, "{d}");
+        }
+        // A code over 31 bits compares as protobuf's int32 does.
+        let t = [("grpc-status", "5"), ("grpc-status-details-bin", "CIWAgIAQ")];
+        assert_eq!(Status::parse_trailers(t).unwrap().code, Code::NotFound);
+    }
+
+    #[test]
+    fn trailers_only_needs_a_grpc_content_type() {
+        let html = [(":status", "200"), ("content-type", "text/html"), ("grpc-status", "0")];
+        assert_eq!(Status::parse_trailers(html), Err(TrailerError::ContentType));
+        assert_eq!(Status::from_trailers(html).code, Code::Unknown);
+        let none = [(":status", "200"), ("grpc-status", "0")];
+        assert_eq!(Status::parse_trailers(none), Err(TrailerError::ContentType));
+        let html503 = [(":status", "503"), ("content-type", "text/html"), ("grpc-status", "0")];
+        assert_eq!(Status::from_trailers(html503).code, Code::Unavailable);
+        // Trailers after the response headers carry no :status or content-type.
+        assert_eq!(Status::parse_trailers([("grpc-status", "0")]), Ok(Status::ok()));
+    }
+
+    #[test]
+    fn malformed_grpc_status_is_unknown_whatever_the_http_status() {
+        let t = [(":status", "503"), ("content-type", "application/grpc"), ("grpc-status", "x")];
+        assert_eq!(Status::from_trailers(t).code, Code::Unknown);
+        let t = [(":status", "503"), ("content-type", "application/grpc"), ("grpc-status", "1"), ("grpc-status", "1")];
+        assert_eq!(Status::from_trailers(t).code, Code::Unknown);
+    }
+
+    #[test]
+    fn grpc_status_with_leading_zeros_is_malformed() {
+        for v in ["00", "05", "014"] {
+            assert_eq!(Status::parse_trailers([("grpc-status", v)]), Err(TrailerError::BadStatus), "{v}");
+            assert_eq!(Status::from_trailers([("grpc-status", v)]).code, Code::Unknown, "{v}");
+        }
+        assert_eq!(Status::parse_trailers([("grpc-status", "0")]), Ok(Status::ok()));
+        assert_eq!(Status::parse_trailers([("grpc-status", "10")]).unwrap().code, Code::Aborted);
+    }
+
+    #[test]
+    fn empty_or_malformed_encoding_names_nothing() {
+        let c = Message { compressed: true, data: vec![] };
+        for e in ["", " ", "gz ip", "gzip,br", "a\u{1}"] {
+            assert_eq!(c.check_encoding(Some(e)).unwrap_err().code, Code::Internal, "{e:?}");
+        }
+        let with = |v: &'static str| {
+            let mut h = good_request();
+            h.retain(|(n, _)| *n != "grpc-encoding");
+            h.push(("grpc-encoding", v));
+            Request::parse(h)
+        };
+        // An empty grpc-encoding is the same as none.
+        assert_eq!(with("").unwrap().encoding, None);
+        assert_eq!(with("  ").unwrap().encoding, None);
+        assert_eq!(with(" gzip ").unwrap().encoding.as_deref(), Some("gzip"));
+        for bad in ["gz ip", "gzip,br", "a/b"] {
+            match with(bad) {
+                Err(Rejection::Status(s)) => assert_eq!(s.code, Code::Internal, "{bad}"),
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn method_paths_hold_only_uri_path_characters() {
+        for bad in ["Call#frag", "Call?x=1", "a\\b", "50%", "%zz", "%4", "a\"b", "a{b}", "a|b", "a^b", "a`b", "a[0]", "<a>"] {
+            assert_eq!(MethodPath::new("svc", bad), None, "{bad}");
+            assert_eq!(MethodPath::new(bad, "m"), None, "{bad}");
+        }
+        for good in ["SayHello", "a.b_c-d~e", "x%2Fy", "a:b@c!$&'()*+,;="] {
+            let p = MethodPath::new("svc", good).unwrap();
+            assert_eq!(MethodPath::parse(p.to_path().as_bytes()), Some(p), "{good}");
+        }
+    }
+
+    #[test]
+    fn http_rejections_write_a_final_error_status() {
+        for (code, want) in [(0, "500"), (103, "500"), (200, "500"), (65535, "500"), (400, "400"), (599, "599")] {
+            assert_eq!(strings(&Rejection::Http(code).to_headers()), [(":status", want)], "{code}");
+        }
     }
 
     /// A small linear congruential generator, so the loop is the same on
@@ -1784,7 +2245,7 @@ mod tests {
             assert_eq!(whole, want);
             assert_eq!(bytewise, want);
             for m in want.iter().flatten() {
-                let b = m.to_bytes();
+                let b = m.to_bytes().unwrap();
                 assert_eq!(Message::parse(&b), Ok(Some((m.clone(), b.len()))));
             }
             for n in 0..data.len() {
@@ -1813,8 +2274,10 @@ mod tests {
                 assert_eq!(synthesized, s);
                 assert_eq!(Status::parse_trailers(strings(&s.to_trailers())), Ok(s));
             }
-            if let Ok(r) = Request::parse(headers.iter().copied()) {
-                assert!(Request::parse(strings(&r.to_headers())).is_ok());
+            if let Ok(r) = Request::parse(headers.iter().copied())
+                && let Ok(h) = r.to_headers()
+            {
+                assert_eq!(Request::parse(strings(&h)), Ok(Request { te_trailers: true, ..r }));
             }
         }
     }
@@ -1844,8 +2307,10 @@ mod tests {
             }
             match Request::parse(h.iter().map(|(n, v)| (n, v))) {
                 Ok(r) => {
-                    let again = Request::parse(strings(&r.to_headers())).unwrap();
-                    assert_eq!((&again.path, &again.content_type, again.timeout), (&r.path, &r.content_type, r.timeout));
+                    // What can be written reads back the same.
+                    if let Ok(h) = r.to_headers() {
+                        assert_eq!(Request::parse(strings(&h)), Ok(Request { te_trailers: true, ..r }));
+                    }
                 }
                 Err(rej) => {
                     let headers = rej.to_headers();

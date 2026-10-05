@@ -3,28 +3,69 @@
 #![no_main]
 
 use fictionet::stdlib::git_protocol::{
-    Advertisement, CapabilityAdvertisement, ClientLine, Command, Decoder, Demux, LsRef, Packet, ProtoRequest, ServerLine,
-    V2Request, parse_service_header, service_header, split_band,
+    Advertisement, Band, CapabilityAdvertisement, ClientLine, Command, Decoder, Demux, Demuxed, LsRef, MAX_BUFFERED,
+    Packet, PacketError, ParseError, ProtoRequest, ServerLine, V2Request, band_packets, parse_service_header,
+    service_header, split_band,
 };
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    whole.feed(data);
+/// The packets in `data`, fed `step` bytes at a time, and the error that
+/// stopped the stream, if one did.
+fn decode(mut data: &[u8], step: usize) -> (Vec<Packet>, Option<PacketError>) {
+    let mut d = Decoder::new();
     let mut packets = Vec::new();
-    while let Some(Ok(p)) = whole.next_packet() {
-        packets.push(p);
-    }
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(p)) = bytewise.next_packet() {
-            again.push(p);
+    loop {
+        let n = d.feed(&data[..data.len().min(step)]);
+        data = &data[n..];
+        while let Some(p) = d.next_packet() {
+            match p {
+                Ok(p) => packets.push(p),
+                Err(e) => return (packets, Some(e)),
+            }
+        }
+        assert!(d.buffered() <= MAX_BUFFERED);
+        if data.is_empty() {
+            return (packets, None);
         }
     }
-    assert_eq!(packets, again);
+}
+
+/// The same for a side-band demultiplexer.
+fn demux(mut data: &[u8], step: usize) -> (Vec<Demuxed>, Option<ParseError>) {
+    let mut d = Demux::new();
+    let mut items = Vec::new();
+    loop {
+        let n = d.feed(&data[..data.len().min(step)]);
+        data = &data[n..];
+        while let Some(i) = d.next_item() {
+            match i {
+                Ok(i) => items.push(i),
+                Err(e) => return (items, Some(e)),
+            }
+        }
+        assert!(d.buffered() <= MAX_BUFFERED);
+        if data.is_empty() {
+            return (items, None);
+        }
+    }
+}
+
+fuzz_target!(|data: &[u8]| {
+    // The stream, split two ways: all at once, and a byte at a time. Both
+    // find the same packets and stop at the same error.
+    let (packets, failed) = decode(data, usize::MAX);
+    assert_eq!(decode(data, 1), (packets.clone(), failed));
+
+    // What a decoder has not taken out is handed over as it came.
+    if failed.is_none() && data.len() <= MAX_BUFFERED {
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(data), data.len());
+        while let Some(p) = d.next_packet() {
+            p.unwrap();
+        }
+        let used: usize = packets.iter().map(|p| p.to_bytes().len()).sum();
+        assert_eq!(d.into_rest(), &data[used..]);
+    }
 
     for p in &packets {
         // A packet read can be written, and reads back the same.
@@ -79,19 +120,14 @@ fuzz_target!(|data: &[u8]| {
     let _ = ProtoRequest::parse(data);
 
     // The side-band demultiplexer, split both ways too.
-    let mut whole = Demux::new();
-    whole.feed(data);
-    let mut items = Vec::new();
-    while let Some(Ok(i)) = whole.next_item() {
-        items.push(i);
+    assert_eq!(demux(data, usize::MAX), demux(data, 1));
+
+    // Any bytes go out on a band and come back the same.
+    let max = data.first().map_or(0, |&b| usize::from(b) * 300);
+    let mut back = Vec::new();
+    for item in demux(&band_packets(Band::Pack, data, max), usize::MAX).0 {
+        let Demuxed::Data(Band::Pack, p) = item else { panic!("{item:?}") };
+        back.extend(p);
     }
-    let mut bytewise = Demux::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(i)) = bytewise.next_item() {
-            again.push(i);
-        }
-    }
-    assert_eq!(items, again);
+    assert_eq!(back, data);
 });

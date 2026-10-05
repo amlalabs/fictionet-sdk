@@ -257,9 +257,11 @@ pub enum Error {
     Range,
     /// A list is longer than its limit. It holds the field's name.
     TooMany(&'static str),
-    /// A list RFC 4120 marks "not empty" is empty: padata in a request or
-    /// reply, or additional-tickets. It holds the field's name. Leave the
-    /// field out (`None`) instead.
+    /// A writer was given an empty optional list: padata in a request or
+    /// reply, addresses, or additional-tickets. RFC 4120 section 5.1.3
+    /// says senders should not send one. It holds the field's name. Leave
+    /// the field out (`None`) instead. Readers take an empty one as
+    /// absent.
     Empty(&'static str),
     /// A KerberosString is not UTF-8, or a realm holds a NUL, which RFC
     /// 4120 section 5.2.2 forbids.
@@ -268,6 +270,12 @@ pub enum Error {
     Time,
     /// A message is longer than [`MAX_MESSAGE`].
     TooLong,
+    /// A HostAddress of a type RFC 4120 section 7.1 defines does not have
+    /// that type's form: an IPv4 address (type 2) is not 4 bytes, or an
+    /// IPv6 address (type 24) is not 16 bytes or is one the section
+    /// forbids (unspecified, loopback, link-local, or IPv4-mapped, which
+    /// must be type 2). Other types hold any bytes.
+    Address,
 }
 
 impl fmt::Display for Error {
@@ -283,6 +291,7 @@ impl fmt::Display for Error {
             Error::Text => f.write_str("KerberosString not UTF-8, or a realm with a NUL"),
             Error::Time => f.write_str("KerberosTime not YYYYMMDDhhmmssZ"),
             Error::TooLong => write!(f, "message longer than {MAX_MESSAGE} bytes"),
+            Error::Address => f.write_str("host address not of its type's form"),
         }
     }
 }
@@ -396,7 +405,9 @@ impl fmt::Display for PrincipalName {
 }
 
 /// A HostAddress: an address type (2 for IPv4, 24 for IPv6, 20 for a
-/// NetBIOS name) and its bytes.
+/// NetBIOS name) and its bytes. Readers and writers check IPv4 and IPv6
+/// addresses as RFC 4120 section 7.1 gives them (see [`Error::Address`]),
+/// and take the bytes of any other type as they are.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct HostAddress {
     /// The address type.
@@ -406,12 +417,36 @@ pub struct HostAddress {
 }
 
 impl HostAddress {
+    /// The type of an IPv4 address.
+    pub const IPV4: i32 = 2;
+    /// The type of an IPv6 address.
+    pub const IPV6: i32 = 24;
+
+    fn check(&self) -> Result<(), Error> {
+        let ok = match self.addr_type {
+            HostAddress::IPV4 => self.address.len() == 4,
+            HostAddress::IPV6 => match <[u8; 16]>::try_from(self.address.as_slice()) {
+                Ok(a) => {
+                    let unspecified_or_loopback = a[..15].iter().all(|&b| b == 0) && a[15] <= 1;
+                    let link_local = a[0] == 0xfe && a[1] & 0xc0 == 0x80;
+                    let v4_mapped = a[..10].iter().all(|&b| b == 0) && a[10] == 0xff && a[11] == 0xff;
+                    !(unspecified_or_loopback || link_local || v4_mapped)
+                }
+                Err(_) => false,
+            },
+            _ => true,
+        };
+        if ok { Ok(()) } else { Err(Error::Address) }
+    }
+
     fn read(r: &mut Reader<'_>) -> Result<HostAddress, Error> {
         let mut s = r.read_sequence()?;
         let addr_type = field(&mut s, 0, int32)?;
         let address = field(&mut s, 1, octets)?;
         s.finish()?;
-        Ok(HostAddress { addr_type, address })
+        let a = HostAddress { addr_type, address };
+        a.check()?;
+        Ok(a)
     }
 
     fn write(&self, w: &mut Writer) {
@@ -579,7 +614,7 @@ pub struct KdcReqBody {
     /// [`MAX_ETYPES`].
     pub etypes: Vec<i32>,
     /// The addresses the ticket may be used from. At most
-    /// [`MAX_ADDRESSES`].
+    /// [`MAX_ADDRESSES`], and when present, not empty.
     pub addresses: Option<Vec<HostAddress>>,
     /// Authorization data for the ticket, encrypted.
     pub enc_authorization_data: Option<EncryptedData>,
@@ -595,10 +630,11 @@ impl KdcReqBody {
         whole(der, Rules::Der, KdcReqBody::read)
     }
 
-    /// The DER of the body on its own. Checksums in a TGS-REQ's
-    /// authenticator cover the bytes the client sent. For a body read
-    /// from DER these are the same bytes, unless its options were not 32
-    /// bits long or its nonce was written as a negative number.
+    /// The DER of the body on its own. A body read and written again may
+    /// not be the bytes it was read from: options shorter than 32 bits, a
+    /// nonce or kvno written as a negative number, an empty optional list,
+    /// or BER all come out differently. To check a checksum over a body
+    /// that was received, take its bytes with [`Message::kdc_req_body`].
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
         finish(|w| self.write(w))
@@ -615,6 +651,8 @@ impl KdcReqBody {
         limit(self.etypes.len(), MAX_ETYPES, "etype")?;
         if let Some(a) = &self.addresses {
             limit(a.len(), MAX_ADDRESSES, "addresses")?;
+            not_empty(a.len(), "addresses")?;
+            a.iter().try_for_each(HostAddress::check)?;
         }
         if let Some(t) = &self.additional_tickets {
             limit(t.len(), MAX_TICKETS, "additional-tickets")?;
@@ -636,11 +674,9 @@ impl KdcReqBody {
             rtime: optional(&mut s, 6, ktime)?,
             nonce: field(&mut s, 7, uint32)?,
             etypes: field(&mut s, 8, |r| seq_of(r, MAX_ETYPES, "etype", int32))?,
-            addresses: optional(&mut s, 9, |r| seq_of(r, MAX_ADDRESSES, "addresses", HostAddress::read))?,
+            addresses: optional_list(&mut s, 9, MAX_ADDRESSES, "addresses", HostAddress::read)?,
             enc_authorization_data: optional(&mut s, 10, EncryptedData::read)?,
-            additional_tickets: optional(&mut s, 11, |r| {
-                nonempty_seq_of(r, MAX_TICKETS, "additional-tickets", Ticket::read)
-            })?,
+            additional_tickets: optional_list(&mut s, 11, MAX_TICKETS, "additional-tickets", Ticket::read)?,
         };
         s.finish()?;
         Ok(body)
@@ -686,6 +722,15 @@ impl KdcReqBody {
 
 /// An AS-REQ or TGS-REQ. Which one it is is the [`Message`] variant that
 /// holds it.
+///
+/// Readers and writers check the structure RFC 4120 section 5.4.1 gives,
+/// not the rules that tie one field to another: that a TGS-REQ carries a
+/// [`padata_type::TGS_REQ`], that `enc_authorization_data` appears only in
+/// a TGS-REQ, or that `sname` is left out only with
+/// [`kdc_options::ENC_TKT_IN_SKEY`]. A world playing a KDC checks those
+/// itself, so it can answer a request that breaks them with the KRB-ERROR
+/// a real KDC sends, and a world playing a client can send such a request
+/// on purpose.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct KdcReq {
     /// Pre-authentication data, at most [`MAX_PADATA`] entries. When
@@ -709,7 +754,7 @@ impl KdcReq {
         let mut s = r.read_sequence()?;
         field(&mut s, 1, version)?;
         field(&mut s, 2, |r| expect_type(r, msg_type))?;
-        let padata = optional(&mut s, 3, |r| nonempty_seq_of(r, MAX_PADATA, "padata", PaData::read))?;
+        let padata = optional_list(&mut s, 3, MAX_PADATA, "padata", PaData::read)?;
         let body = field(&mut s, 4, KdcReqBody::read)?;
         s.finish()?;
         Ok(KdcReq { padata, body })
@@ -762,7 +807,7 @@ impl KdcRep {
         field(&mut s, 0, version)?;
         field(&mut s, 1, |r| expect_type(r, msg_type))?;
         let rep = KdcRep {
-            padata: optional(&mut s, 2, |r| nonempty_seq_of(r, MAX_PADATA, "padata", PaData::read))?,
+            padata: optional_list(&mut s, 2, MAX_PADATA, "padata", PaData::read)?,
             crealm: field(&mut s, 3, realm)?,
             cname: field(&mut s, 4, PrincipalName::read)?,
             ticket: field(&mut s, 5, Ticket::read)?,
@@ -1012,6 +1057,32 @@ impl Message {
         })
     }
 
+    /// The KDC-REQ-BODY of the AS-REQ or TGS-REQ in `b`, exactly as the
+    /// client sent it. A checksum over the body, such as the one in a
+    /// TGS-REQ's authenticator (RFC 4120 section 5.2.7.1), covers these
+    /// bytes, which [`KdcReqBody::to_der`] does not always give back. The
+    /// message is read as [`Message::parse_with`] reads it, and any of its
+    /// errors is returned. Any other message is [`Error::UnknownMessage`]
+    /// with its tag number.
+    pub fn kdc_req_body(b: &[u8], rules: Rules) -> Result<&[u8], Error> {
+        let m = Message::parse_with(b, rules)?;
+        if !matches!(m, Message::AsReq(_) | Message::TgsReq(_)) {
+            return Err(Error::UnknownMessage(u32::try_from(m.msg_type()).unwrap_or(u32::MAX)));
+        }
+        // The message read, so each step below finds what it looks for.
+        let mut r = Reader::new(b, rules);
+        let outer = r.read()?;
+        let mut o = outer.reader()?;
+        let mut s = o.read_sequence()?;
+        s.read_explicit(1)?;
+        s.read_explicit(2)?;
+        if s.peek()?.tag().same_type(Tag::context(3)) {
+            s.read_explicit(3)?;
+        }
+        let body = s.read_explicit(4)?;
+        Ok(body.peek()?.raw())
+    }
+
     /// The message's msg-type, one of [`msg_type`].
     pub fn msg_type(&self) -> i64 {
         match self {
@@ -1098,12 +1169,26 @@ impl std::error::Error for FrameError {}
 
 /// Splits a Kerberos TCP byte stream into messages. Feed it the bytes a
 /// connection reads, in order, and take messages out until it has none.
+///
+/// Each length is checked as soon as its 4 bytes arrive. Once one is bad,
+/// the decoder keeps the whole messages before it, drops the bad length
+/// and everything after it, and drops whatever is fed later. So the most
+/// it holds is the whole messages not yet taken out, plus one unfinished
+/// message of at most [`MAX_MESSAGE`] bytes. A caller that takes messages
+/// out after each `feed` holds at most one message beyond what one `feed`
+/// added.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
     /// dropped in `feed` once they are half the buffer.
     start: usize,
+    /// Where the next length not yet checked starts in `buf`. Every
+    /// length before it is good.
+    checked: usize,
+    /// A bad length found by `feed`, reported once the whole messages
+    /// before it have been taken out.
+    pending: Option<FrameError>,
     failed: Option<FrameError>,
 }
 
@@ -1113,47 +1198,68 @@ impl Decoder {
         Decoder::default()
     }
 
-    /// Adds bytes read from the connection. After a [`FrameError`] the
-    /// stream cannot be read any further, and they are dropped.
+    /// Adds bytes read from the connection. After a bad length the stream
+    /// cannot be read any further, and they are dropped.
     pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
+        if self.failed.is_some() || self.pending.is_some() {
+            return;
+        }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.checked = self.checked.saturating_sub(self.start);
+            self.start = 0;
+        }
+        self.buf.extend_from_slice(bytes);
+        // Check each length that is now whole. `checked` only moves
+        // forward, so a stream is scanned once however it is split.
+        while let Some(head) = self.buf.get(self.checked..self.checked.saturating_add(TCP_HEADER_LEN)) {
+            let mut len = [0; TCP_HEADER_LEN];
+            len.copy_from_slice(head);
+            match frame_len(u32::from_be_bytes(len)) {
+                Ok(n) => self.checked = self.checked.saturating_add(TCP_HEADER_LEN + n),
+                Err(e) => {
+                    self.buf.truncate(self.checked);
+                    self.pending = Some(e);
+                    break;
+                }
             }
-            self.buf.extend_from_slice(bytes);
         }
     }
 
     /// The next whole message's bytes, without the length, ready for
     /// [`Message::parse`]. It returns `None` when it needs more bytes, and
-    /// keeps returning the same error once the stream has broken. A bad
-    /// length is known from the first 4 bytes, so a decoder never holds
-    /// more than one message's bytes beyond what has been taken out, plus
-    /// what one `feed` added.
+    /// keeps returning the same error once the stream has broken.
     pub fn next_message(&mut self) -> Option<Result<Vec<u8>, FrameError>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
         }
-        let rest = self.buf.get(self.start..)?;
-        let head: [u8; TCP_HEADER_LEN] = rest.get(..TCP_HEADER_LEN)?.try_into().ok()?;
-        let len = u32::from_be_bytes(head);
-        let err = if len & 0x8000_0000 != 0 {
-            Some(FrameError::Reserved(len))
-        } else if usize::try_from(len).map_or(true, |n| n > MAX_MESSAGE) {
-            Some(FrameError::TooLong(len))
-        } else {
-            None
-        };
-        if let Some(e) = err {
+        let rest = self.buf.get(self.start..).unwrap_or_default();
+        let Some(head) = rest.get(..TCP_HEADER_LEN) else {
+            // Only whole messages are kept before a bad length, so once
+            // they are out, the stream has broken.
+            let e = self.pending.take()?;
             self.failed = Some(e);
             self.buf = Vec::new();
             self.start = 0;
+            self.checked = 0;
             return Some(Err(e));
-        }
-        let n = usize::try_from(len).ok()?;
+        };
+        let mut len = [0; TCP_HEADER_LEN];
+        len.copy_from_slice(head);
+        // `feed` has checked every length it has seen.
+        let n = frame_len(u32::from_be_bytes(len)).ok()?;
         let body = rest.get(TCP_HEADER_LEN..TCP_HEADER_LEN + n)?.to_vec();
         self.start += TCP_HEADER_LEN + n;
+        if self.start == self.buf.len() && self.pending.is_none() {
+            // All taken out: let go of a buffer grown past one message.
+            if self.buf.capacity() > MAX_MESSAGE + TCP_HEADER_LEN {
+                self.buf = Vec::new();
+            } else {
+                self.buf.clear();
+            }
+            self.start = 0;
+            self.checked = 0;
+        }
         Some(Ok(body))
     }
 
@@ -1161,6 +1267,14 @@ impl Decoder {
     pub fn buffered(&self) -> usize {
         self.buf.len().saturating_sub(self.start)
     }
+}
+
+/// The body length a TCP length prefix gives, if it is allowed.
+fn frame_len(len: u32) -> Result<usize, FrameError> {
+    if len & 0x8000_0000 != 0 {
+        return Err(FrameError::Reserved(len));
+    }
+    usize::try_from(len).ok().filter(|&n| n <= MAX_MESSAGE).ok_or(FrameError::TooLong(len))
 }
 
 // Reading helpers. Each reads one value from `r` and leaves the rest.
@@ -1215,16 +1329,16 @@ fn seq_of<'a, T>(
     Ok(out)
 }
 
-/// Reads a SEQUENCE OF that RFC 4120 marks "not empty".
-fn nonempty_seq_of<'a, T>(
+/// Reads the OPTIONAL SEQUENCE OF `[n]`, if it comes next. An empty one
+/// reads as absent, as RFC 4120 section 5.1.3 asks of receivers.
+fn optional_list<'a, T>(
     r: &mut Reader<'a>,
+    n: u32,
     max: usize,
     what: &'static str,
     f: impl FnMut(&mut Reader<'a>) -> Result<T, Error>,
-) -> Result<Vec<T>, Error> {
-    let v = seq_of(r, max, what, f)?;
-    not_empty(v.len(), what)?;
-    Ok(v)
+) -> Result<Option<Vec<T>>, Error> {
+    Ok(optional(r, n, |r| seq_of(r, max, what, f))?.filter(|v| !v.is_empty()))
 }
 
 fn limit(len: usize, max: usize, what: &'static str) -> Result<(), Error> {
@@ -1619,7 +1733,7 @@ mod tests {
         r.body.etypes = vec![1; MAX_ETYPES + 1];
         assert_eq!(Message::AsReq(r).to_der(), Err(Error::TooMany("etype")));
         let mut r = as_req();
-        r.body.addresses = Some(vec![HostAddress { addr_type: 2, address: vec![] }; MAX_ADDRESSES + 1]);
+        r.body.addresses = Some(vec![HostAddress { addr_type: 2, address: vec![10, 0, 0, 1] }; MAX_ADDRESSES + 1]);
         assert_eq!(Message::AsReq(r).to_der(), Err(Error::TooMany("addresses")));
         let mut r = as_req();
         r.body.additional_tickets = Some(vec![tgt(); MAX_TICKETS + 1]);
@@ -1673,29 +1787,22 @@ mod tests {
     }
 
     #[test]
-    fn lists_marked_not_empty_are_refused() {
+    fn writers_refuse_empty_lists_marked_not_empty() {
         // RFC 4120 section 5.4.1: padata and additional-tickets in a
-        // KDC-REQ, and padata in a KDC-REP, are "not empty".
+        // KDC-REQ, and padata in a KDC-REP, are "not empty". Writers
+        // refuse them.
         let mut r = as_req();
         r.padata = Some(Vec::new());
         assert_eq!(Message::AsReq(r.clone()).to_der(), Err(Error::Empty("padata")));
-        let mut w = Writer::new();
-        w.constructed(Tag::application(10), |w| r.write(w, msg_type::AS_REQ));
-        assert_eq!(Message::parse(&w.finish().unwrap()), Err(Error::Empty("padata")));
 
         let mut r = as_req();
         r.body.additional_tickets = Some(Vec::new());
         assert_eq!(Message::TgsReq(r.clone()).to_der(), Err(Error::Empty("additional-tickets")));
-        let mut w = Writer::new();
-        w.constructed(Tag::application(12), |w| r.write(w, msg_type::TGS_REQ));
-        assert_eq!(Message::parse(&w.finish().unwrap()), Err(Error::Empty("additional-tickets")));
 
         let Message::AsRep(mut rep) = all_messages().swap_remove(1) else { panic!() };
         rep.padata = Some(Vec::new());
         assert_eq!(Message::AsRep(rep.clone()).to_der(), Err(Error::Empty("padata")));
-        let mut w = Writer::new();
-        w.constructed(Tag::application(11), |w| rep.write(w, msg_type::AS_REP));
-        assert_eq!(Message::parse(&w.finish().unwrap()), Err(Error::Empty("padata")));
+        // A reader takes them as absent; see empty_optional_lists_read_as_absent.
 
         // METHOD-DATA has no such note, so an empty one is fine.
         assert_eq!(KrbError::read_method_data(&KrbError::method_data(&[]).unwrap()), Ok(Vec::new()));
@@ -1834,6 +1941,167 @@ mod tests {
     }
 
     #[test]
+    fn decoder_drops_bytes_after_a_bad_header() {
+        // A bad length is caught as it is fed, so what follows it is not
+        // held even when the caller feeds without taking messages out.
+        let mut d = Decoder::new();
+        d.feed(&[0x80, 0, 0, 0]);
+        for _ in 0..16 {
+            d.feed(&[0; 64 * 1024]);
+        }
+        assert_eq!(d.buffered(), 0);
+        assert_eq!(d.next_message(), Some(Err(FrameError::Reserved(0x8000_0000))));
+        // Whole messages fed before the bad length still come out first,
+        // as they would had they been taken out one at a time.
+        let one = Message::ApRep(ApRep { enc_part: enc(18, None, &[]) }).to_tcp().unwrap();
+        let mut stream = one.clone();
+        stream.extend_from_slice(&one);
+        stream.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
+        stream.extend_from_slice(&[0; 1000]);
+        let mut d = Decoder::new();
+        d.feed(&stream);
+        assert_eq!(d.buffered(), 2 * one.len());
+        assert_eq!(d.next_message(), Some(Ok(one[4..].to_vec())));
+        assert_eq!(d.next_message(), Some(Ok(one[4..].to_vec())));
+        assert_eq!(d.next_message(), Some(Err(FrameError::TooLong(MAX_MESSAGE as u32 + 1))));
+        d.feed(&one);
+        assert_eq!(d.buffered(), 0);
+        // A header split across feeds is checked once its last byte comes.
+        let mut d = Decoder::new();
+        d.feed(&[0x80, 0]);
+        d.feed(&[0, 5]);
+        d.feed(&[0; 100]);
+        assert_eq!(d.buffered(), 0);
+        assert_eq!(d.next_message(), Some(Err(FrameError::Reserved(0x8000_0005))));
+    }
+
+    #[test]
+    fn a_drained_decoder_lets_go_of_a_large_buffer() {
+        let big = Message::ApRep(ApRep { enc_part: enc(18, None, &vec![0; MAX_MESSAGE - 100]) }).to_tcp().unwrap();
+        let mut d = Decoder::new();
+        d.feed(&big);
+        d.feed(&big);
+        assert!(d.next_message().unwrap().is_ok());
+        assert!(d.next_message().unwrap().is_ok());
+        assert_eq!(d.buffered(), 0);
+        assert!(d.buf.capacity() <= MAX_MESSAGE + TCP_HEADER_LEN);
+    }
+
+    #[test]
+    fn empty_optional_lists_read_as_absent() {
+        // RFC 4120 section 5.1.3: an empty optional SEQUENCE OF means the
+        // same as an absent one. Senders should not send one, and
+        // receivers should take it as absent.
+        let mut r = as_req();
+        r.padata = Some(Vec::new());
+        r.body.addresses = Some(Vec::new());
+        r.body.additional_tickets = Some(Vec::new());
+        let mut w = Writer::new();
+        w.constructed(Tag::application(12), |w| r.write(w, msg_type::TGS_REQ));
+        let Message::TgsReq(got) = Message::parse(&w.finish().unwrap()).unwrap() else { panic!() };
+        assert_eq!(got.padata, None);
+        assert_eq!(got.body.addresses, None);
+        assert_eq!(got.body.additional_tickets, None);
+
+        let Message::AsRep(mut rep) = all_messages().swap_remove(1) else { panic!() };
+        rep.padata = Some(Vec::new());
+        let mut w = Writer::new();
+        w.constructed(Tag::application(11), |w| rep.write(w, msg_type::AS_REP));
+        let Message::AsRep(got) = Message::parse(&w.finish().unwrap()).unwrap() else { panic!() };
+        assert_eq!(got.padata, None);
+
+        // Writers leave them out instead: an empty list is an error.
+        let mut r = as_req();
+        r.body.addresses = Some(Vec::new());
+        assert_eq!(Message::AsReq(r.clone()).to_der(), Err(Error::Empty("addresses")));
+        assert_eq!(r.body.to_der(), Err(Error::Empty("addresses")));
+    }
+
+    #[test]
+    fn a_request_body_comes_back_as_sent() {
+        // A checksum over a TGS-REQ's body covers the bytes the client
+        // sent. Here a ticket in it holds a kvno written as a signed -1,
+        // which DER writes back longer, so only the bytes as sent will do.
+        let mut r = as_req();
+        r.padata = Some(vec![PaData { padata_type: padata_type::TGS_REQ, value: vec![1, 2, 3] }]);
+        let der = Message::TgsReq(r).to_der().unwrap();
+        let sent = replace(&der, &[0xa1, 0x03, 0x02, 0x01, 0x02], &[0xa1, 0x03, 0x02, 0x01, 0xff]);
+        let Message::TgsReq(got) = Message::parse(&sent).unwrap() else { panic!() };
+        assert_eq!(got.body.additional_tickets.as_ref().unwrap()[0].enc_part.kvno, Some(u32::MAX));
+        let body = Message::kdc_req_body(&sent, Rules::Der).unwrap();
+        assert_ne!(body, got.body.to_der().unwrap());
+        assert_eq!(KdcReqBody::parse(body), Ok(got.body.clone()));
+        assert!(sent.windows(body.len()).any(|w| w == body));
+        assert_eq!(body[0], 0x30);
+        // The same under BER, with the body's indefinite length kept.
+        let ber = [0x6a, 0x80, 0x30, 0x80, 0xa1, 0x03, 0x02, 0x01, 0x05, 0xa2, 0x03, 0x02, 0x01, 0x0a, 0xa4, 0x80];
+        let mut ber = ber.to_vec();
+        let plain = as_req().body.to_der().unwrap();
+        let mut indef = vec![0x30, 0x80];
+        // The body is long enough for a 2-byte length: 0x30 0x82 hi lo.
+        assert_eq!(plain[1], 0x82);
+        indef.extend_from_slice(&plain[4..]);
+        indef.extend_from_slice(&[0, 0]);
+        ber.extend_from_slice(&indef);
+        ber.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        assert_eq!(Message::kdc_req_body(&ber, Rules::Ber), Ok(&indef[..]));
+        // Other messages, and bytes that are not a message, have none.
+        let rep = all_messages().swap_remove(1).to_der().unwrap();
+        assert_eq!(Message::kdc_req_body(&rep, Rules::Der), Err(Error::UnknownMessage(11)));
+        assert!(Message::kdc_req_body(&sent[..sent.len() - 1], Rules::Der).is_err());
+    }
+
+    #[test]
+    fn host_addresses_have_their_types_form() {
+        // RFC 4120 section 7.1.
+        let with = |a: HostAddress| {
+            let mut r = as_req();
+            r.body.addresses = Some(vec![a]);
+            r
+        };
+        let mut v6 = [0u8; 16];
+        v6[0] = 0x20;
+        v6[1] = 0x01;
+        v6[15] = 7;
+        let mut mapped = [0u8; 16];
+        mapped[10..].copy_from_slice(&[0xff, 0xff, 10, 0, 0, 1]);
+        let mut link_local = [0u8; 16];
+        link_local[..2].copy_from_slice(&[0xfe, 0x80]);
+        link_local[15] = 1;
+        let mut loopback = [0u8; 16];
+        loopback[15] = 1;
+        let good = [
+            HostAddress { addr_type: HostAddress::IPV4, address: vec![192, 0, 2, 1] },
+            HostAddress { addr_type: HostAddress::IPV6, address: v6.to_vec() },
+            // A NetBIOS name, and a local type, hold any bytes.
+            HostAddress { addr_type: 20, address: b"HOST            ".to_vec() },
+            HostAddress { addr_type: -1, address: vec![] },
+        ];
+        for a in good {
+            let m = Message::AsReq(with(a));
+            assert_eq!(Message::parse(&m.to_der().unwrap()), Ok(m));
+        }
+        let bad = [
+            HostAddress { addr_type: HostAddress::IPV4, address: vec![1] },
+            HostAddress { addr_type: HostAddress::IPV4, address: vec![1, 2, 3, 4, 5] },
+            HostAddress { addr_type: HostAddress::IPV6, address: vec![0x20; 4] },
+            HostAddress { addr_type: HostAddress::IPV6, address: vec![0; 16] },
+            HostAddress { addr_type: HostAddress::IPV6, address: loopback.to_vec() },
+            HostAddress { addr_type: HostAddress::IPV6, address: link_local.to_vec() },
+            HostAddress { addr_type: HostAddress::IPV6, address: mapped.to_vec() },
+        ];
+        for a in bad {
+            let r = with(a.clone());
+            assert_eq!(Message::AsReq(r.clone()).to_der(), Err(Error::Address), "{a:?}");
+            assert_eq!(r.body.to_der(), Err(Error::Address));
+            // The reader refuses the same address when it arrives.
+            let mut w = Writer::new();
+            w.constructed(Tag::application(10), |w| r.write(w, msg_type::AS_REQ));
+            assert_eq!(Message::parse(&w.finish().unwrap()), Err(Error::Address), "{a:?}");
+        }
+    }
+
+    #[test]
     fn errors_display() {
         for e in [
             Error::Asn1(asn1::Error::Truncated),
@@ -1846,6 +2114,7 @@ mod tests {
             Error::Text,
             Error::Time,
             Error::TooLong,
+            Error::Address,
         ] {
             assert!(!e.to_string().is_empty());
         }

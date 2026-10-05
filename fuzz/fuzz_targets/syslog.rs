@@ -2,7 +2,10 @@
 //! playing a log collector reads them.
 #![no_main]
 
-use fictionet::stdlib::syslog::{BsdMessage, Decoder, Entry, Frame, FrameError, MAX_MESSAGE_LEN, Message};
+use fictionet::stdlib::syslog::{
+    BsdMessage, Decoder, Entry, Frame, FrameError, Framing, MAX_BUFFERED, MAX_MESSAGE_LEN, Message, Priority,
+    SdElement,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -18,14 +21,42 @@ fuzz_target!(|data: &[u8]| {
         // A frame read can be written, and reads back the same. What is
         // written is whole, even when what was read had been cut.
         let mut d = Decoder::new();
-        d.feed(&f.to_bytes());
+        let bytes = f.to_bytes();
+        assert_eq!(d.feed(&bytes), bytes.len());
         let whole = Frame { truncated: false, ..f.clone() };
         assert_eq!(d.next_frame().as_ref(), Some(&Ok(whole)));
         round_trip(&f.message);
     }
     // Any bytes as a message on their own.
     round_trip(data);
+    constructed(data);
 });
+
+/// Values built from any bytes, not read: what is written reads back, and
+/// a frame holds the message as it was.
+fn constructed(data: &[u8]) {
+    let priority = Priority::from_value(data.first().map_or(13, |&b| b % 192)).unwrap();
+    let rest = data.get(1..).unwrap_or(&[]);
+    let e = Entry::Bsd(BsdMessage::new(priority, rest));
+    assert!(Entry::parse(&e.to_bytes()).is_ok());
+    let mut m = Message::new(priority);
+    // A long value of backslashes and quotes, near and past the limit.
+    let value: String = String::from_utf8_lossy(rest).repeat(1 + MAX_MESSAGE_LEN / (rest.len() + 1) / 2);
+    m.structured_data.push(SdElement::new("x@32473").param("p", value));
+    let bytes = m.to_bytes();
+    assert!(bytes.len() <= MAX_MESSAGE_LEN);
+    assert_eq!(Message::parse(&bytes).unwrap().to_bytes(), bytes);
+    if !rest.is_empty() {
+        for framing in [Framing::OctetCounting, Framing::NonTransparent] {
+            let msg = rest[..rest.len().min(MAX_MESSAGE_LEN)].to_vec();
+            let mut d = Decoder::new();
+            let framed = Frame::new(framing, msg.clone()).to_bytes();
+            assert_eq!(d.feed(&framed), framed.len());
+            let got = d.next_frame().and_then(Result::ok).or_else(|| d.finish());
+            assert_eq!(got.map(|f| f.message), Some(msg));
+        }
+    }
+}
 
 /// Every result a decoder gives for `data`, fed in pieces whose sizes
 /// `size` gives from where each starts, up to the first error, and then
@@ -36,13 +67,17 @@ fn decode(data: &[u8], size: impl Fn(usize) -> usize) -> (Vec<Result<Frame, Fram
     let mut at = 0;
     'feed: while at < data.len() {
         let end = at + size(at).clamp(1, data.len() - at);
-        d.feed(&data[at..end]);
-        at = end;
-        while let Some(r) = d.next_frame() {
-            let broken = r.is_err();
-            out.push(r);
-            if broken {
-                break 'feed;
+        while at < end {
+            // A decoder takes what it has room for; once full, taking
+            // frames out always makes room.
+            at += d.feed(&data[at..end]);
+            assert!(d.buffered() <= MAX_BUFFERED);
+            while let Some(r) = d.next_frame() {
+                let broken = r.is_err();
+                out.push(r);
+                if broken {
+                    break 'feed;
+                }
             }
         }
     }

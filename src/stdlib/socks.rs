@@ -128,6 +128,10 @@ pub enum Error {
     /// A decoder was fed more than [`MAX_BUFFERED`] bytes it could not
     /// take out.
     Overflow,
+    /// The proxy chose a login method, with this code, that the client did
+    /// not offer (RFC 1928 section 3). Only a [`ClientDecoder`] made with
+    /// [`ClientDecoder::socks5_offering`] checks this.
+    Method(u8),
 }
 
 impl Error {
@@ -153,6 +157,7 @@ impl std::fmt::Display for Error {
             Error::FieldTooLong => f.write_str("SOCKS4 field has no zero byte within its limit"),
             Error::Truncated => f.write_str("UDP datagram ends inside its header"),
             Error::Overflow => write!(f, "more than {MAX_BUFFERED} bytes held"),
+            Error::Method(m) => write!(f, "method {m} was not offered"),
         }
     }
 }
@@ -170,8 +175,34 @@ pub enum Method {
     UsernamePassword,
     /// 0xFF: the proxy takes none of the methods offered.
     NoAcceptable,
-    /// Any other code.
+    /// Any other code. An `Other` that holds one of the codes above is
+    /// written as that code, and decoders treat it as the named method;
+    /// readers never return one.
     Other(u8),
+}
+
+/// A set of method codes, such as the methods a greeting offered.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MethodSet([u64; 4]);
+
+impl MethodSet {
+    /// The set a greeting offering `methods` carries: the first
+    /// [`MAX_METHODS`], as [`Greeting::to_bytes`] writes them.
+    fn of(methods: &[Method]) -> MethodSet {
+        let mut set = MethodSet::default();
+        for m in methods.iter().take(MAX_METHODS) {
+            let c = m.code();
+            set.0[usize::from(c / 64)] |= 1 << (c % 64);
+        }
+        set
+    }
+
+    /// Whether `m` may answer a greeting that offered this set: one of
+    /// them, or [`Method::NoAcceptable`].
+    fn allows(&self, m: Method) -> bool {
+        let c = m.code();
+        c == Method::NoAcceptable.code() || self.0[usize::from(c / 64)] & (1 << (c % 64)) != 0
+    }
 }
 
 impl Method {
@@ -502,7 +533,8 @@ pub enum ReplyCode {
     CommandNotSupported,
     /// 0x08: the proxy does not support the address type.
     AddressTypeNotSupported,
-    /// Any other code.
+    /// Any other code. An `Other` that holds one of the codes above is
+    /// written as that code and reads back as the named variant.
     Other(u8),
 }
 
@@ -716,22 +748,16 @@ impl Socks4Request {
         let port = be16(b, 2);
         let ip = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
         let Some(nul) = find_nul(b, 8, MAX_USER_ID)? else { return Ok(None) };
-        let user_id = b[8..nul].to_vec();
-        let [0, 0, 0, x] = ip.octets() else {
-            return Ok(Some((
-                Socks4Request { command, port, destination: Socks4Destination::Ip(ip), user_id },
-                nul + 1,
-            )));
+        // Nothing is copied until the whole request has come.
+        let (destination, used) = match ip.octets() {
+            [0, 0, 0, x] if x != 0 => {
+                let Some(end) = find_nul(b, nul + 1, MAX_SOCKS4_DOMAIN)? else { return Ok(None) };
+                (Socks4Destination::Domain(b[nul + 1..end].to_vec()), end + 1)
+            }
+            _ => (Socks4Destination::Ip(ip), nul + 1),
         };
-        if x == 0 {
-            return Ok(Some((
-                Socks4Request { command, port, destination: Socks4Destination::Ip(ip), user_id },
-                nul + 1,
-            )));
-        }
-        let Some(end) = find_nul(b, nul + 1, MAX_SOCKS4_DOMAIN)? else { return Ok(None) };
-        let destination = Socks4Destination::Domain(b[nul + 1..end].to_vec());
-        Ok(Some((Socks4Request { command, port, destination, user_id }, end + 1)))
+        let user_id = b[8..nul].to_vec();
+        Ok(Some((Socks4Request { command, port, destination, user_id }, used)))
     }
 
     /// The request's bytes.
@@ -772,7 +798,8 @@ pub enum Socks4Code {
     NoIdentd,
     /// 93: rejected because identd reports a different user ID.
     IdentdMismatch,
-    /// Any other code.
+    /// Any other code. An `Other` that holds one of the codes above is
+    /// written as that code and reads back as the named variant.
     Other(u8),
 }
 
@@ -934,6 +961,8 @@ pub enum ServerStage {
 pub struct ServerDecoder {
     buf: Buffer,
     stage: ServerStage,
+    /// The methods the client's greeting offered.
+    offered: MethodSet,
     failed: Option<Error>,
 }
 
@@ -946,7 +975,7 @@ impl Default for ServerDecoder {
 impl ServerDecoder {
     /// A decoder waiting for a client's first message.
     pub fn new() -> ServerDecoder {
-        ServerDecoder { buf: Buffer::default(), stage: ServerStage::Greeting, failed: None }
+        ServerDecoder { buf: Buffer::default(), stage: ServerStage::Greeting, offered: MethodSet::default(), failed: None }
     }
 
     /// Where the decoder is in the handshake.
@@ -983,8 +1012,11 @@ impl ServerDecoder {
         match parsed {
             Ok(Some((message, used))) => {
                 self.buf.take(used);
-                self.stage = match message {
-                    ClientMessage::Greeting(_) => ServerStage::Selecting,
+                self.stage = match &message {
+                    ClientMessage::Greeting(g) => {
+                        self.offered = MethodSet::of(&g.methods);
+                        ServerStage::Selecting
+                    }
                     ClientMessage::Auth(_) => ServerStage::Verifying,
                     ClientMessage::Request(_) | ClientMessage::Socks4(_) => ServerStage::Done,
                 };
@@ -1008,20 +1040,28 @@ impl ServerDecoder {
     /// Tells the decoder which method the proxy chose after a greeting:
     /// a login comes next for [`Method::UsernamePassword`], a request for
     /// [`Method::NoAuth`], nothing for [`Method::NoAcceptable`], and for
-    /// any other method the stream is the world's. In any stage but
-    /// [`ServerStage::Selecting`] it does nothing.
-    pub fn select(&mut self, method: Method) {
-        if self.stage == ServerStage::Selecting {
-            self.stage = match method {
-                Method::NoAuth => ServerStage::Request,
-                Method::UsernamePassword => ServerStage::Auth,
-                Method::NoAcceptable => ServerStage::Closed,
-                Method::Gssapi | Method::Other(_) => ServerStage::Done,
-            };
-            if self.stage == ServerStage::Closed {
-                self.buf.clear();
-            }
+    /// any other method the stream is the world's. The method is judged by
+    /// its code, the byte a [`Selection`] writes, so `Method::Other(2)`
+    /// acts as [`Method::UsernamePassword`].
+    ///
+    /// It returns whether the decoder took the choice. RFC 1928 section 3
+    /// lets the proxy choose only a method the greeting offered, or
+    /// [`Method::NoAcceptable`]; for any other method, or in any stage but
+    /// [`ServerStage::Selecting`], it does nothing and returns false.
+    pub fn select(&mut self, method: Method) -> bool {
+        if self.stage != ServerStage::Selecting || !self.offered.allows(method) {
+            return false;
         }
+        self.stage = match Method::from_code(method.code()) {
+            Method::NoAuth => ServerStage::Request,
+            Method::UsernamePassword => ServerStage::Auth,
+            Method::NoAcceptable => ServerStage::Closed,
+            Method::Gssapi | Method::Other(_) => ServerStage::Done,
+        };
+        if self.stage == ServerStage::Closed {
+            self.buf.clear();
+        }
+        true
     }
 
     /// Tells the decoder whether a login was good: a request comes next if
@@ -1106,20 +1146,35 @@ pub struct ClientDecoder {
     stage: ClientStage,
     socks4: bool,
     bind: bool,
+    /// The methods the client offered, when the decoder checks the
+    /// proxy's choice against them.
+    offered: Option<MethodSet>,
     failed: Option<Error>,
 }
 
 impl ClientDecoder {
     /// A decoder for a SOCKS5 client that sent a greeting and will send a
-    /// request with `command`.
+    /// request with `command`. It takes whatever method the proxy chooses;
+    /// [`ClientDecoder::socks5_offering`] also checks it was offered.
     pub fn socks5(command: Command) -> ClientDecoder {
         ClientDecoder {
             buf: Buffer::default(),
             stage: ClientStage::Selection,
             socks4: false,
             bind: command == Command::Bind,
+            offered: None,
             failed: None,
         }
+    }
+
+    /// A decoder for a SOCKS5 client that sent a greeting offering
+    /// `methods` and will send a request with `command`. If the proxy
+    /// chooses a method not in `methods`, other than
+    /// [`Method::NoAcceptable`], the decoder fails with [`Error::Method`].
+    /// Only the first [`MAX_METHODS`] count, as a [`Greeting`] carries no
+    /// more.
+    pub fn socks5_offering(command: Command, methods: &[Method]) -> ClientDecoder {
+        ClientDecoder { offered: Some(MethodSet::of(methods)), ..ClientDecoder::socks5(command) }
     }
 
     /// A decoder for a SOCKS4 client that sent a request with `command`.
@@ -1129,6 +1184,7 @@ impl ClientDecoder {
             stage: ClientStage::Reply,
             socks4: true,
             bind: command == Socks4Command::Bind,
+            offered: None,
             failed: None,
         }
     }
@@ -1166,12 +1222,18 @@ impl ClientDecoder {
             }
             _ => Ok(None),
         };
+        if let Ok(Some((ServerMessage::Selection(s), _))) = &parsed
+            && let Some(offered) = self.offered
+            && !offered.allows(s.method)
+        {
+            return Some(Err(self.fail(Error::Method(s.method.code()))));
+        }
         match parsed {
             Ok(Some((message, used))) => {
                 self.buf.take(used);
                 let granted = match &message {
                     ServerMessage::Selection(s) => {
-                        self.stage = match s.method {
+                        self.stage = match Method::from_code(s.method.code()) {
                             Method::NoAuth => ClientStage::Reply,
                             Method::UsernamePassword => ClientStage::Auth,
                             Method::NoAcceptable => ClientStage::Closed,
@@ -1185,11 +1247,11 @@ impl ClientDecoder {
                     }
                     ServerMessage::Reply(r) => {
                         self.next_reply_stage();
-                        r.code == ReplyCode::Succeeded
+                        r.code.code() == ReplyCode::Succeeded.code()
                     }
                     ServerMessage::Socks4(r) => {
                         self.next_reply_stage();
-                        r.code == Socks4Code::Granted
+                        r.code.code() == Socks4Code::Granted.code()
                     }
                 };
                 if !granted || self.stage == ClientStage::Closed {
@@ -1472,6 +1534,7 @@ mod tests {
             Error::FieldTooLong,
             Error::Truncated,
             Error::Overflow,
+            Error::Method(1),
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -1714,10 +1777,12 @@ mod tests {
             if let Ok(ClientMessage::Greeting(g)) = &m {
                 let method = if g.methods.contains(&Method::UsernamePassword) {
                     Method::UsernamePassword
-                } else {
+                } else if g.methods.contains(&Method::NoAuth) {
                     Method::NoAuth
+                } else {
+                    Method::NoAcceptable
                 };
-                d.select(method);
+                assert!(d.select(method));
             }
             if let Ok(ClientMessage::Auth(a)) = &m {
                 d.verified(a.username != b"bad");
@@ -1930,6 +1995,147 @@ mod tests {
         }
         assert_eq!(total, 1_000_000);
         assert_eq!(c.next_message(), None);
+    }
+
+    #[test]
+    fn selection_must_be_one_offered() {
+        // RFC 1928 section 3: the proxy selects one of the methods offered.
+        let mut d = ServerDecoder::new();
+        d.feed(&[5, 1, 2]);
+        d.next_message().unwrap().unwrap();
+        assert!(!d.select(Method::NoAuth));
+        assert_eq!(d.stage(), ServerStage::Selecting);
+        assert!(d.select(Method::UsernamePassword));
+        assert_eq!(d.stage(), ServerStage::Auth);
+        assert!(!d.select(Method::UsernamePassword));
+        // Refusing every method is always allowed.
+        let mut d = ServerDecoder::new();
+        d.feed(&[5, 0]);
+        d.next_message().unwrap().unwrap();
+        assert!(!d.select(Method::NoAuth));
+        assert!(d.select(Method::NoAcceptable));
+        assert_eq!(d.stage(), ServerStage::Closed);
+
+        // A client that offered only a login.
+        let mut c = ClientDecoder::socks5_offering(Command::Connect, &[Method::UsernamePassword]);
+        c.feed(&[5, 0]);
+        assert_eq!(c.next_message(), Some(Err(Error::Method(0))));
+        assert_eq!(c.stage(), ClientStage::Failed);
+        let mut c = ClientDecoder::socks5_offering(Command::Connect, &[Method::UsernamePassword]);
+        c.feed(&[5, 2]);
+        assert!(matches!(c.next_message(), Some(Ok(ServerMessage::Selection(_)))));
+        assert_eq!(c.stage(), ClientStage::Auth);
+        let mut c = ClientDecoder::socks5_offering(Command::Connect, &[Method::UsernamePassword]);
+        c.feed(&[5, 0xff]);
+        assert!(matches!(c.next_message(), Some(Ok(ServerMessage::Selection(_)))));
+        assert_eq!(c.stage(), ClientStage::Closed);
+        // The plain constructor takes any method, as before.
+        let mut c = ClientDecoder::socks5(Command::Connect);
+        c.feed(&[5, 0]);
+        assert!(matches!(c.next_message(), Some(Ok(_))));
+        assert_eq!(c.stage(), ClientStage::Reply);
+    }
+
+    #[test]
+    fn an_offer_past_max_methods_is_cut_as_the_greeting_is() {
+        // The fuzz target's offer from crash-edfe37cd: 412 codes, as runs
+        // of (code, count). Code 4 comes only at index 277, past what a
+        // greeting carries, so neither side may take it.
+        let runs: &[(u8, usize)] = &[
+            (0xff, 73),
+            (0xcc, 12),
+            (0xff, 95),
+            (0xcc, 7),
+            (0x4d, 11),
+            (0xcc, 8),
+            (0x4d, 2),
+            (0x3a, 1),
+            (0x4d, 4),
+            (0xee, 45),
+            (0x4d, 11),
+            (0xcc, 1),
+            (0x4d, 1),
+            (0x01, 1),
+            (0x6c, 2),
+            (0x00, 1),
+            (0xff, 1),
+            (0x00, 1),
+            (0x04, 1),
+            (0xff, 24),
+            (0x01, 1),
+            (0x00, 1),
+            (0x2d, 12),
+            (0xff, 4),
+            (0x2d, 47),
+            (0xf9, 1),
+            (0xff, 1),
+            (0x00, 5),
+            (0x07, 1),
+            (0x00, 6),
+            (0xff, 26),
+            (0x00, 5),
+        ];
+        let codes: Vec<u8> = runs.iter().flat_map(|&(c, n)| std::iter::repeat_n(c, n)).collect();
+        assert_eq!(codes.len(), 412);
+        let offered: Vec<Method> = codes.iter().map(|&c| Method::from_code(c)).collect();
+        let chosen = Method::Other(4);
+
+        let mut server = ServerDecoder::new();
+        server.feed(&Greeting { methods: offered.clone() }.to_bytes());
+        assert!(matches!(server.next_message(), Some(Ok(ClientMessage::Greeting(_)))));
+        assert!(!server.select(chosen));
+
+        let mut client = ClientDecoder::socks5_offering(Command::Connect, &offered);
+        client.feed(&Selection { method: chosen }.to_bytes());
+        assert_eq!(client.next_message(), Some(Err(Error::Method(4))));
+    }
+
+    #[test]
+    fn other_codes_act_as_the_code_they_write() {
+        // Other(2) is written as 2, username and password, so a login
+        // comes next, not tunnel data.
+        let mut d = ServerDecoder::new();
+        d.feed(&[5, 1, 2]);
+        d.next_message().unwrap().unwrap();
+        assert_eq!(Selection { method: Method::Other(2) }.to_bytes(), [5, 2]);
+        assert!(d.select(Method::Other(2)));
+        assert_eq!(d.stage(), ServerStage::Auth);
+        // Other(255) is written as "no acceptable methods", so it closes.
+        let mut d = ServerDecoder::new();
+        d.feed(&[5, 1, 0]);
+        d.next_message().unwrap().unwrap();
+        assert!(d.select(Method::Other(0xff)));
+        assert_eq!(d.stage(), ServerStage::Closed);
+        let mut d = ServerDecoder::new();
+        d.feed(&[5, 1, 0]);
+        d.next_message().unwrap().unwrap();
+        assert!(d.select(Method::Other(0)));
+        assert_eq!(d.stage(), ServerStage::Request);
+    }
+
+    #[test]
+    fn socks4a_request_fed_a_byte_at_a_time() {
+        // The longest SOCKS4a request, fed a byte at a time, reads once.
+        let req = Socks4Request {
+            command: Socks4Command::Connect,
+            port: 80,
+            destination: Socks4Destination::Domain(vec![b'd'; MAX_SOCKS4_DOMAIN]),
+            user_id: vec![b'u'; MAX_USER_ID],
+        };
+        let bytes = req.to_bytes();
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+        let mut d = ServerDecoder::new();
+        for (i, b) in bytes.iter().enumerate() {
+            d.feed(std::slice::from_ref(b));
+            let m = d.next_message();
+            if i + 1 < bytes.len() {
+                assert_eq!(m, None, "byte {i}");
+            } else {
+                assert_eq!(m, Some(Ok(ClientMessage::Socks4(req.clone()))));
+            }
+        }
+        // A complete user ID and part of the domain is not yet a request.
+        assert_eq!(Socks4Request::parse(&bytes[..MAX_MESSAGE - 1]), Ok(None));
     }
 
     #[test]

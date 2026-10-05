@@ -23,6 +23,8 @@
 //! Every reader checks lengths, tags and ranges, because the agent can
 //! send any bytes it likes. Lengths are bounded by [`MAX_MESSAGE`],
 //! nesting by [`MAX_DEPTH`] and object identifiers by [`MAX_OID_ARCS`].
+//! A [`Decoder`] holds at most [`MAX_BUFFERED`] bytes. Writers refuse a
+//! message longer than [`MAX_MESSAGE`] rather than change it.
 //! [`Element`] reads and writes BER that is not SNMP, under the same
 //! limits.
 //!
@@ -48,7 +50,7 @@
 //!         false => VarBind::new(b.name.clone(), Value::NoSuchObject),
 //!     })
 //!     .collect();
-//! let reply = request.response(answers).unwrap().to_bytes();
+//! let reply = request.response(answers).unwrap().to_bytes().unwrap();
 //! assert_eq!(&reply[..4], [0x30, 0x38, 0x02, 0x01]);
 //! let back = Message::parse(&reply).unwrap();
 //! assert_eq!(back.pdu.request_id(), Some(0x12345678));
@@ -63,18 +65,19 @@ pub const PORT: u16 = 161;
 /// The UDP port managers listen on for traps and informs.
 pub const TRAP_PORT: u16 = 162;
 /// The longest message, in bytes, this module reads or writes, headers
-/// included. One UDP datagram cannot carry more. It also bounds the
-/// content of each [`Element`].
+/// included. It also bounds the content of each [`Element`] and each
+/// value. Over UDP the usable size is smaller: 65,507 bytes over IPv4 and
+/// 65,527 over IPv6. The size to send is the caller's to choose; see
+/// [`Message::encoded_len`].
 pub const MAX_MESSAGE: usize = 65_535;
+/// The most bytes a [`Decoder`] holds that have not been taken out.
+pub const MAX_BUFFERED: usize = 2 * MAX_MESSAGE;
 /// The deepest nesting of constructed elements [`Element`] reads or
 /// writes. An SNMP message nests 4 deep: the message, the PDU, the
 /// binding list and each binding.
 pub const MAX_DEPTH: usize = 16;
 /// The most arcs an object identifier may have (RFC 2578, section 3.5).
 pub const MAX_OID_ARCS: usize = 128;
-/// The longest community string read or written. Longer ones are refused
-/// when read and cut to this length when written.
-pub const MAX_COMMUNITY: usize = 255;
 
 /// The object identifier sysUpTime.0, the first binding of every version 2
 /// trap and inform.
@@ -125,7 +128,7 @@ pub enum Error {
     TrailingBytes,
     /// An element has a tag that does not belong where it is.
     UnexpectedTag(u8),
-    /// A length is indefinite or takes more than 4 bytes.
+    /// A length is indefinite, or uses the reserved first byte 0xff.
     Length,
     /// A length, or a whole message, is longer than [`MAX_MESSAGE`].
     TooLong(usize),
@@ -137,8 +140,6 @@ pub enum Error {
     Oid,
     /// The content of a value of the given tag is the wrong size.
     Value(u8),
-    /// The community string is longer than [`MAX_COMMUNITY`].
-    Community(usize),
     /// The version field names a version other than 1 or 2c. SNMPv3
     /// messages carry 3.
     Unsupported(i32),
@@ -150,13 +151,12 @@ impl fmt::Display for Error {
             Error::Truncated => f.write_str("the bytes end inside an element"),
             Error::TrailingBytes => f.write_str("bytes follow the last element"),
             Error::UnexpectedTag(t) => write!(f, "unexpected tag 0x{t:02x}"),
-            Error::Length => f.write_str("indefinite or overlong length"),
+            Error::Length => f.write_str("indefinite or reserved length"),
             Error::TooLong(n) => write!(f, "length {n}, over the limit of {MAX_MESSAGE}"),
             Error::TooDeep => write!(f, "elements nest deeper than {MAX_DEPTH}"),
             Error::Integer => f.write_str("integer empty or out of range"),
             Error::Oid => f.write_str("malformed object identifier"),
             Error::Value(t) => write!(f, "wrong size for a value of tag 0x{t:02x}"),
-            Error::Community(n) => write!(f, "community of {n} bytes, over the limit of {MAX_COMMUNITY}"),
             Error::Unsupported(v) => write!(f, "SNMP version field {v}, not 0 (v1) or 1 (v2c)"),
         }
     }
@@ -181,7 +181,8 @@ pub struct Header {
 impl Header {
     /// Reads the header at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one. Tags in the multi-byte form, indefinite
-    /// lengths and lengths over [`MAX_MESSAGE`] are errors.
+    /// lengths and lengths over [`MAX_MESSAGE`] are errors. A long-form
+    /// length may use more bytes than it needs (RFC 3417, section 8).
     pub fn parse(b: &[u8]) -> Result<Option<Header>, Error> {
         let Some(&tag) = b.first() else { return Ok(None) };
         if tag & tag::HIGH_NUMBER == tag::HIGH_NUMBER {
@@ -191,12 +192,13 @@ impl Header {
         let (content_len, header_len) = if first < 0x80 {
             (usize::from(first), 2)
         } else {
+            // 0x80 is the indefinite form, and X.690 (8.1.3.5) reserves 0xff.
             let n = usize::from(first & 0x7f);
-            if n == 0 || n > 4 {
+            if n == 0 || n == 0x7f {
                 return Err(Error::Length);
             }
             let Some(bytes) = b.get(2..2 + n) else { return Ok(None) };
-            let len = bytes.iter().fold(0usize, |acc, &x| (acc << 8) | usize::from(x));
+            let len = bytes.iter().fold(0usize, |acc, &x| acc.saturating_mul(256).saturating_add(usize::from(x)));
             (len, 2 + n)
         };
         if content_len > MAX_MESSAGE {
@@ -261,10 +263,11 @@ fn write_len(out: &mut Vec<u8>, len: usize) {
     }
 }
 
-/// How many bytes an element takes whose content is `len` bytes long.
+/// How many bytes an element takes whose content is `len` bytes long,
+/// or `usize::MAX` if that does not fit in a `usize`.
 fn tlv_len(len: usize) -> usize {
     let len_len = if len < 0x80 { 1 } else { 1 + (usize::BITS - len.leading_zeros()).div_ceil(8) as usize };
-    1 + len_len + len
+    len.saturating_add(1 + len_len)
 }
 
 fn write_tlv(out: &mut Vec<u8>, t: u8, content: &[u8]) {
@@ -443,7 +446,7 @@ pub enum OidError {
     /// More than [`MAX_OID_ARCS`] arcs.
     TooLong,
     /// The first arc is above 2, or the second is 40 or more under a
-    /// first arc of 0 or 1, or too large to encode under 2.
+    /// first arc of 0 or 1.
     FirstArcs,
     /// Text that is not a number from 0 to 4294967295 between the dots.
     Syntax,
@@ -473,7 +476,7 @@ impl Oid {
         }
         let ok = match arcs[0] {
             0 | 1 => arcs[1] < 40,
-            2 => arcs[1] <= u32::MAX - 80,
+            2 => true,
             _ => false,
         };
         if !ok {
@@ -505,28 +508,35 @@ impl Oid {
     }
 
     /// Reads an object identifier from the content of a BER element of tag
-    /// [`tag::OBJECT_IDENTIFIER`]. Sub-identifiers must be minimal and fit
-    /// in 32 bits.
+    /// [`tag::OBJECT_IDENTIFIER`]. Sub-identifiers must be minimal, and
+    /// every arc must fit in 32 bits. The first sub-identifier holds the
+    /// first two arcs, so under a first arc of 2 it may reach
+    /// 2^32 - 1 + 80.
     pub fn from_ber(content: &[u8]) -> Result<Oid, Error> {
         if content.is_empty() {
             return Err(Error::Oid);
         }
         let mut arcs = Vec::new();
-        let mut v: u32 = 0;
+        let mut v: u64 = 0;
         let mut fresh = true;
         for &b in content {
             if fresh && b == 0x80 {
                 return Err(Error::Oid);
             }
-            v = v.checked_mul(128).ok_or(Error::Oid)? | u32::from(b & 0x7f);
+            let limit = if arcs.is_empty() { u64::from(u32::MAX) + 80 } else { u64::from(u32::MAX) };
+            v = (v << 7) | u64::from(b & 0x7f);
+            if v > limit {
+                return Err(Error::Oid);
+            }
             fresh = b & 0x80 == 0;
             if fresh {
                 if arcs.is_empty() {
                     let first = (v / 40).min(2);
-                    arcs.push(first);
-                    arcs.push(v - 40 * first);
+                    arcs.push(first as u32);
+                    // At most u32::MAX by the limit above.
+                    arcs.push((v - 40 * first) as u32);
                 } else {
-                    arcs.push(v);
+                    arcs.push(v as u32);
                 }
                 if arcs.len() > MAX_OID_ARCS {
                     return Err(Error::Oid);
@@ -543,9 +553,10 @@ impl Oid {
     /// The content bytes of this identifier's BER element.
     pub fn to_ber(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        // The invariant on the first two arcs keeps this in range.
-        let first = self.0[0] * 40 + self.0[1];
-        for v in std::iter::once(first).chain(self.0[2..].iter().copied()) {
+        // The invariant on the first two arcs keeps this below 2^33, which
+        // five groups of 7 bits hold.
+        let first = u64::from(self.0[0]) * 40 + u64::from(self.0[1]);
+        for v in std::iter::once(first).chain(self.0[2..].iter().map(|&a| u64::from(a))) {
             let mut groups = [0u8; 5];
             let mut n = 0;
             let mut x = v;
@@ -692,8 +703,12 @@ impl Value {
         matches!(self, Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView)
     }
 
-    /// Reads a value from an element's tag and content.
+    /// Reads a value from an element's tag and content. Content longer
+    /// than [`MAX_MESSAGE`] is [`Error::TooLong`], so it is never copied.
     pub fn from_ber(t: u8, c: &[u8]) -> Result<Value, Error> {
+        if c.len() > MAX_MESSAGE {
+            return Err(Error::TooLong(c.len()));
+        }
         let unsigned = |max: i128| -> Result<i128, Error> {
             let v = read_int(c)?;
             if (0..=max).contains(&v) { Ok(v) } else { Err(Error::Integer) }
@@ -715,6 +730,19 @@ impl Value {
             tag::END_OF_MIB_VIEW => empty(Value::EndOfMibView)?,
             t => return Err(Error::UnexpectedTag(t)),
         })
+    }
+
+    /// How many bytes the value's content takes.
+    fn content_len(&self) -> usize {
+        match self {
+            Value::Integer(v) => int_content((*v).into()).len(),
+            Value::OctetString(b) | Value::Opaque(b) => b.len(),
+            Value::Null | Value::NoSuchObject | Value::NoSuchInstance | Value::EndOfMibView => 0,
+            Value::ObjectIdentifier(o) => o.to_ber().len(),
+            Value::IpAddress(_) => 4,
+            Value::Counter32(v) | Value::Gauge32(v) | Value::TimeTicks(v) => int_content((*v).into()).len(),
+            Value::Counter64(v) => int_content((*v).into()).len(),
+        }
     }
 
     /// Writes the value's whole element.
@@ -753,13 +781,18 @@ impl VarBind {
         VarBind { name, value: Value::Null }
     }
 
-    fn encode(&self) -> Vec<u8> {
-        let mut content = Vec::new();
-        write_tlv(&mut content, tag::OBJECT_IDENTIFIER, &self.name.to_ber());
-        self.value.write(&mut content);
-        let mut out = Vec::with_capacity(content.len() + 6);
-        write_tlv(&mut out, tag::SEQUENCE, &content);
-        out
+    /// How many bytes the binding's content takes: its name's element
+    /// and its value's.
+    fn content_len(&self) -> usize {
+        tlv_len(self.name.to_ber().len()).saturating_add(tlv_len(self.value.content_len()))
+    }
+
+    /// Writes the binding's whole element, straight into `out`.
+    fn write(&self, out: &mut Vec<u8>) {
+        out.push(tag::SEQUENCE);
+        write_len(out, self.content_len());
+        write_tlv(out, tag::OBJECT_IDENTIFIER, &self.name.to_ber());
+        self.value.write(out);
     }
 }
 
@@ -1203,8 +1236,8 @@ fn parse_bindings(c: &[u8]) -> Result<Vec<VarBind>, Error> {
 pub struct Message {
     /// The protocol version.
     pub version: Version,
-    /// The community string, which works as a password. At most
-    /// [`MAX_COMMUNITY`] bytes are written.
+    /// The community string, which works as a password. RFC 1157 sets no
+    /// limit on its length; only the message's size bounds it.
     pub community: Vec<u8>,
     /// What the message asks or says.
     pub pdu: Pdu,
@@ -1225,45 +1258,56 @@ impl Message {
         let mut r = Reader::new(outer.expect(tag::SEQUENCE)?);
         let version = Version::from_code(r.int()?)?;
         let community = r.expect(tag::OCTET_STRING)?;
-        if community.len() > MAX_COMMUNITY {
-            return Err(Error::Community(community.len()));
-        }
         let (t, content) = r.next()?;
         let pdu = Pdu::parse(t, content)?;
         r.end()?;
         Ok(Message { version, community: community.to_vec(), pdu })
     }
 
-    /// The message's bytes. The community is cut to [`MAX_COMMUNITY`]
-    /// bytes, and bindings are dropped from the end until the message
-    /// fits in [`MAX_MESSAGE`] bytes. A message read by
-    /// [`Message::parse`] always fits whole.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let community = &self.community[..self.community.len().min(MAX_COMMUNITY)];
+    /// How many bytes [`Message::to_bytes`] would write, or `usize::MAX`
+    /// if that does not fit in a `usize`. It allocates nothing in
+    /// proportion to the bindings' size. An agent answering GetBulk uses
+    /// it to drop rounds of bindings until the response fits the size it
+    /// sends.
+    pub fn encoded_len(&self) -> usize {
+        let list = self.pdu.bindings().iter().fold(0usize, |acc, b| acc.saturating_add(tlv_len(b.content_len())));
+        let pdu = self.pdu.head().len().saturating_add(tlv_len(list));
+        // The version field is always 3 bytes: tag, length and 0 or 1.
+        let content = tlv_len(self.community.len()).saturating_add(tlv_len(pdu)).saturating_add(3);
+        tlv_len(content)
+    }
+
+    /// The message's bytes, or [`Error::TooLong`] if they would be more
+    /// than [`MAX_MESSAGE`]. It never drops a binding or cuts the
+    /// community to make the message fit: a Response too large to send
+    /// is answered with tooBig ([`Message::error_response`]), and a
+    /// GetBulk response is cut by its builder (RFC 3416, sections 4.2.1
+    /// and 4.2.3). A message read by [`Message::parse`] always fits.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let total = self.encoded_len();
+        if total > MAX_MESSAGE {
+            return Err(Error::TooLong(total));
+        }
+        let bindings = self.pdu.bindings();
+        let list = bindings.iter().map(|b| tlv_len(b.content_len())).sum::<usize>();
         let head = self.pdu.head();
-        let bindings: Vec<Vec<u8>> = self.pdu.bindings().iter().map(VarBind::encode).collect();
-        // Total size with the first k bindings, for k from all down to 0.
-        let fixed = 3 + tlv_len(community.len());
-        let total = |list: usize| tlv_len(fixed + tlv_len(head.len() + tlv_len(list)));
-        let mut list: usize = bindings.iter().map(Vec::len).sum();
-        let mut k = bindings.len();
-        while k > 0 && total(list) > MAX_MESSAGE {
-            k -= 1;
-            list -= bindings[k].len();
+        let pdu = head.len() + tlv_len(list);
+        let content = 3 + tlv_len(self.community.len()) + tlv_len(pdu);
+        let mut out = Vec::with_capacity(total);
+        out.push(tag::SEQUENCE);
+        write_len(&mut out, content);
+        write_int(&mut out, tag::INTEGER, self.version.code().into());
+        write_tlv(&mut out, tag::OCTET_STRING, &self.community);
+        out.push(self.pdu.tag());
+        write_len(&mut out, pdu);
+        out.extend_from_slice(&head);
+        out.push(tag::SEQUENCE);
+        write_len(&mut out, list);
+        for b in bindings {
+            b.write(&mut out);
         }
-        let mut pdu = head;
-        pdu.push(tag::SEQUENCE);
-        write_len(&mut pdu, list);
-        for b in &bindings[..k] {
-            pdu.extend_from_slice(b);
-        }
-        let mut content = Vec::with_capacity(fixed + tlv_len(pdu.len()));
-        write_int(&mut content, tag::INTEGER, self.version.code().into());
-        write_tlv(&mut content, tag::OCTET_STRING, community);
-        write_tlv(&mut content, self.pdu.tag(), &pdu);
-        let mut out = Vec::with_capacity(tlv_len(content.len()));
-        write_tlv(&mut out, tag::SEQUENCE, &content);
-        out
+        debug_assert_eq!(out.len(), total);
+        Ok(out)
     }
 
     /// Whether the PDU and every value it carries are allowed in the
@@ -1276,7 +1320,10 @@ impl Message {
     /// The Response that answers this request with `bindings`, with the
     /// same version, community and request ID, and no error. It is `None`
     /// if this message is not a request that gets a response in its
-    /// version (see [`Pdu::is_confirmed`] and [`Pdu::allowed_in`]).
+    /// version (see [`Pdu::is_confirmed`]), or if it breaks its version
+    /// ([`Message::follows_version`]). RFC 3584 (section 4.2.2.1) says
+    /// to drop a version 1 request that carries a Counter64 unanswered,
+    /// since an answer would copy it.
     ///
     /// Version 1 cannot carry Counter64 or the exception values. If one
     /// is among `bindings` in a version 1 answer, the answer becomes a
@@ -1284,11 +1331,12 @@ impl Message {
     /// 4.2.2) answers a Get that way, and a GetNext that ends in
     /// endOfMibView. For a version 1 GetNext it says to skip Counter64
     /// objects and return the next object that is not one; that walk is
-    /// the world's to make, before it calls this. Whether all the answers fit in one
-    /// message is left to the caller, who may answer tooBig with
+    /// the world's to make, before it calls this. Whether all the answers
+    /// fit in one message is left to the caller (see
+    /// [`Message::encoded_len`]), who may answer tooBig with
     /// [`Message::error_response`].
     pub fn response(&self, bindings: Vec<VarBind>) -> Option<Message> {
-        if !self.pdu.is_confirmed() || !self.pdu.allowed_in(self.version) {
+        if !self.pdu.is_confirmed() || !self.follows_version() {
             return None;
         }
         if self.version == Version::V1
@@ -1314,7 +1362,7 @@ impl Message {
     /// 1 the status is mapped with [`ErrorStatus::to_v1`]. It is `None`
     /// when [`Message::response`] would be.
     pub fn error_response(&self, status: ErrorStatus, index: i32) -> Option<Message> {
-        if !self.pdu.is_confirmed() || !self.pdu.allowed_in(self.version) {
+        if !self.pdu.is_confirmed() || !self.follows_version() {
             return None;
         }
         let status = if self.version == Version::V1 { status.to_v1() } else { ErrorStatus::from_code(status.code()) };
@@ -1366,7 +1414,8 @@ impl Message {
 /// Splits an SNMP-over-TCP byte stream (RFC 3430) into messages. Feed it
 /// the bytes a connection reads, in order, and take messages out until it
 /// has none. Each comes out as bytes, for [`Message::parse`]; a message
-/// that does not parse leaves the stream intact.
+/// that does not parse leaves the stream intact. It holds at most
+/// [`MAX_BUFFERED`] bytes that have not been taken out.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -1383,11 +1432,17 @@ impl Decoder {
         Decoder::default()
     }
 
-    /// Adds bytes read from the connection. After an error the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Adds bytes read from the connection, and says how many it took.
+    /// It takes them all unless it would then hold more than
+    /// [`MAX_BUFFERED`] bytes. Take messages out with
+    /// [`next_message`](Self::next_message), then feed the rest again;
+    /// since a message is at most [`MAX_MESSAGE`] bytes, a decoder that
+    /// has been emptied always takes more. After an error the stream
+    /// cannot be read any further, and every byte is taken and dropped.
+    #[must_use = "a decoder may take only part of the bytes"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.failed.is_some() {
-            return;
+            return bytes.len();
         }
         // Drop the bytes already taken once they are at least half the
         // buffer, so each byte is moved a bounded number of times.
@@ -1395,17 +1450,17 @@ impl Decoder {
             self.buf.drain(..self.start);
             self.start = 0;
         }
-        self.buf.extend_from_slice(bytes);
+        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole message's bytes, if one has come. It returns `None`
     /// when it needs more bytes. Bytes that cannot start a message, or a
     /// length over [`MAX_MESSAGE`], break the stream; it then keeps
     /// returning the same error. Taking a message out is linear in its
-    /// size, however much is buffered behind it. The bytes waiting
-    /// ([`Decoder::buffered`]) are never more than one message's beyond
-    /// what one `feed` added, and the memory held is at most about twice
-    /// that.
+    /// size, however much is buffered behind it. The memory held is at
+    /// most about twice [`MAX_BUFFERED`].
     pub fn next_message(&mut self) -> Option<Result<Vec<u8>, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -1431,7 +1486,8 @@ impl Decoder {
         }
     }
 
-    /// How many bytes are held, waiting for the rest of a message.
+    /// How many bytes are held, waiting to be taken out. It is never more
+    /// than [`MAX_BUFFERED`].
     pub fn buffered(&self) -> usize {
         self.buf.len() - self.start
     }
@@ -1587,7 +1643,7 @@ mod tests {
         assert_eq!("1.3.4294967296".parse::<Oid>(), Err(OidError::Syntax));
         assert_eq!("3.1".parse::<Oid>(), Err(OidError::FirstArcs));
         assert_eq!("1.40".parse::<Oid>(), Err(OidError::FirstArcs));
-        assert_eq!("2.4294967216".parse::<Oid>(), Err(OidError::FirstArcs));
+        assert!("2.4294967295".parse::<Oid>().is_ok());
         let long = vec!["1"; MAX_OID_ARCS + 1].join(".");
         assert_eq!(long.parse::<Oid>(), Err(OidError::TooLong));
         let max = vec!["1"; MAX_OID_ARCS].join(".");
@@ -1608,7 +1664,7 @@ mod tests {
         let Pdu::Get(p) = &m.pdu else { panic!() };
         assert_eq!(p.request_id, 0x12345678);
         assert_eq!(p.bindings, [VarBind::null(oid("1.3.6.1.2.1.1.1.0"))]);
-        assert_eq!(m.to_bytes(), GET_SYS_DESCR);
+        assert_eq!(m.to_bytes().unwrap(), GET_SYS_DESCR);
         assert!(m.follows_version());
     }
 
@@ -1616,7 +1672,7 @@ mod tests {
     fn module_example_reply() {
         let request = Message::parse(&GET_SYS_DESCR).unwrap();
         let answers = vec![VarBind::new(oid("1.3.6.1.2.1.1.1.0"), Value::OctetString(b"pump controller".to_vec()))];
-        let reply = request.response(answers).unwrap().to_bytes();
+        let reply = request.response(answers).unwrap().to_bytes().unwrap();
         let mut want = vec![0x30, 0x38, 0x02, 0x01, 0x01, 0x04, 0x06];
         want.extend_from_slice(b"public");
         want.extend_from_slice(&[0xa2, 0x2b, 0x02, 0x04, 0x12, 0x34, 0x56, 0x78, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00]);
@@ -1667,7 +1723,7 @@ mod tests {
         assert_eq!(t.generic_trap, GenericTrap::ColdStart);
         assert_eq!(t.time_stamp, 4242);
         assert_eq!(m.pdu.request_id(), None);
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
         assert!(m.follows_version());
         assert_eq!(m.response(vec![]), None);
         for c in -2..10 {
@@ -1691,9 +1747,9 @@ mod tests {
         let (non, rep, m) = req.split();
         assert_eq!((non.len(), rep.len(), m), (1, 2, 2));
         let msg = Message { version: Version::V2c, community: b"public".to_vec(), pdu: Pdu::GetBulk(req.clone()) };
-        assert_eq!(Message::parse(&msg.to_bytes()), Ok(msg.clone()));
+        assert_eq!(Message::parse(&msg.to_bytes().unwrap()), Ok(msg.clone()));
         assert!(msg.follows_version());
-        assert_eq!(msg.to_bytes()[13], tag::GET_BULK_REQUEST);
+        assert_eq!(msg.to_bytes().unwrap()[13], tag::GET_BULK_REQUEST);
         // Out-of-range fields count as 0 or all.
         let odd = BulkPdu { non_repeaters: 9, max_repetitions: -4, ..req.clone() };
         assert_eq!(odd.split().0.len(), 3);
@@ -1703,7 +1759,7 @@ mod tests {
         // GetBulk in version 1 is read but breaks the version, and gets no response.
         let v1 = Message { version: Version::V1, ..msg };
         assert!(!v1.follows_version());
-        assert_eq!(Message::parse(&v1.to_bytes()), Ok(v1.clone()));
+        assert_eq!(Message::parse(&v1.to_bytes().unwrap()), Ok(v1.clone()));
         assert_eq!(v1.response(vec![]), None);
     }
 
@@ -1721,7 +1777,7 @@ mod tests {
         assert_eq!(b[0], VarBind::new(Oid::from_arcs(SYS_UP_TIME_0).unwrap(), Value::TimeTicks(900)));
         assert_eq!(b[1].name.arcs(), SNMP_TRAP_OID_0);
         assert_eq!(b.len(), 3);
-        assert_eq!(Message::parse(&m.to_bytes()), Ok(m.clone()));
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m.clone()));
         assert_eq!(m.response(vec![]), None);
         let inform = Message::trap_v2(b"public", 6, 900, oid("1.3.6.1.6.3.1.1.5.3"), vec![], true);
         let ack = inform.response(inform.pdu.bindings().to_vec()).unwrap();
@@ -1775,7 +1831,7 @@ mod tests {
     #[test]
     fn round_trips() {
         for m in samples() {
-            let b = m.to_bytes();
+            let b = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&b), Ok(m.clone()), "{m:?}");
             let (e, used) = Element::parse(&b).unwrap();
             assert_eq!(used, b.len());
@@ -1786,14 +1842,14 @@ mod tests {
     #[test]
     fn truncated_prefixes() {
         for m in samples() {
-            let b = m.to_bytes();
+            let b = m.to_bytes().unwrap();
             for n in 0..b.len() {
                 assert_eq!(Message::parse(&b[..n]), Err(Error::Truncated), "{n} of {}", b.len());
                 assert_eq!(Element::parse(&b[..n]), Err(Error::Truncated));
                 let len = message_len(&b[..n]).unwrap();
                 assert!(len.is_none() || len == Some(b.len()));
                 let mut d = Decoder::new();
-                d.feed(&b[..n]);
+                assert_eq!(d.feed(&b[..n]), n);
                 assert_eq!(d.next_message(), None);
             }
         }
@@ -1820,7 +1876,9 @@ mod tests {
         assert_eq!(Header::parse(&[0x1f]), Err(Error::UnexpectedTag(0x1f)));
         // Lengths.
         assert_eq!(p(&[0x30, 0x80, 0x00, 0x00]), Err(Error::Length));
-        assert_eq!(p(&[0x30, 0x85, 0, 0, 0, 0, 1]), Err(Error::Length));
+        assert_eq!(p(&[0x30, 0xff, 0, 0]), Err(Error::Length));
+        assert_eq!(p(&[0x30, 0x85, 0, 0, 0, 0, 1]), Err(Error::Truncated));
+        assert_eq!(p(&[0x30, 0x89, 1, 0, 0, 0, 0, 0, 0, 0, 0]), Err(Error::TooLong(usize::MAX)));
         assert_eq!(p(&[0x30, 0x83, 0x01, 0x00, 0x00]), Err(Error::TooLong(0x10000)));
         assert_eq!(p(&[0x30, 0x82, 0xff, 0xff]), Err(Error::TooLong(MAX_MESSAGE + 4)));
         assert_eq!(
@@ -1851,15 +1909,6 @@ mod tests {
         let mut sub = GET_SYS_DESCR;
         sub[40] = 0x80;
         assert_eq!(p(&sub), Err(Error::Oid));
-        // A community too long.
-        let m = Message { version: Version::V2c, community: vec![b'a'; 300], pdu: Pdu::Get(BasicPdu::new(1, vec![])) };
-        let b = m.to_bytes();
-        assert_eq!(Message::parse(&b).unwrap().community.len(), MAX_COMMUNITY);
-        let mut c = vec![0x30, 0x82, 0x01, 0x40, 0x02, 0x01, 0x01, 0x04, 0x82, 0x01, 0x2c];
-        c.extend_from_slice(&[b'a'; 300]);
-        c.extend_from_slice(&[0xa0, 0x0b, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]);
-        assert_eq!(c.len(), 4 + 0x140);
-        assert_eq!(p(&c), Err(Error::Community(300)));
         // A trap with a bad agent address and a negative time stamp.
         let mut bad = TRAP_COLD_START;
         bad[24] = 3;
@@ -1881,7 +1930,6 @@ mod tests {
             Error::Integer,
             Error::Oid,
             Error::Value(1),
-            Error::Community(1),
             Error::Unsupported(3),
         ];
         for e in all {
@@ -1974,16 +2022,16 @@ mod tests {
         assert_eq!(rs.hash_one(GenericTrap::Other(6)), rs.hash_one(GenericTrap::EnterpriseSpecific));
         let get = Message::parse(&GET_SYS_DESCR).unwrap();
         let mut m = get.error_response(ErrorStatus::Other(5), 1).unwrap();
-        assert_eq!(Message::parse(&m.to_bytes()), Ok(m.clone()));
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m.clone()));
         let Pdu::Response(p) = &mut m.pdu else { panic!() };
         p.error_status = ErrorStatus::Other(12);
-        assert_eq!(Message::parse(&m.to_bytes()), Ok(m.clone()));
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m.clone()));
         let trap = Message::parse(&TRAP_COLD_START).unwrap();
         let mut t = trap.clone();
         let Pdu::TrapV1(body) = &mut t.pdu else { panic!() };
         body.generic_trap = GenericTrap::Other(0);
         assert_eq!(t, trap);
-        assert_eq!(Message::parse(&t.to_bytes()), Ok(t.clone()));
+        assert_eq!(Message::parse(&t.to_bytes().unwrap()), Ok(t.clone()));
         // The version 1 mapping and the tooBig rules see the number, not the variant.
         assert_eq!(ErrorStatus::Other(1).to_v1(), ErrorStatus::TooBig);
         assert_eq!(ErrorStatus::Other(17).to_v1(), ErrorStatus::NoSuchName);
@@ -2013,9 +2061,9 @@ mod tests {
         let (e, _) = Element::parse(&GET_SYS_DESCR).unwrap();
         assert_eq!(e.tag(), tag::SEQUENCE);
         let mut d = Decoder::new();
-        d.feed(&GET_SYS_DESCR[..10]);
+        assert_eq!(d.feed(&GET_SYS_DESCR[..10]), 10);
         let mut copy = d.clone();
-        copy.feed(&GET_SYS_DESCR[10..]);
+        assert_eq!(copy.feed(&GET_SYS_DESCR[10..]), 33);
         assert_eq!(copy.next_message(), Some(Ok(GET_SYS_DESCR.to_vec())));
         assert_eq!(d.buffered(), 10);
     }
@@ -2028,52 +2076,190 @@ mod tests {
         let stream: Vec<u8> = [0x30, 0x00].repeat(n);
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
+        let mut rest = &stream[..];
         let mut count = 0;
-        while let Some(m) = d.next_message() {
-            assert_eq!(m.unwrap(), [0x30, 0x00]);
-            count += 1;
+        while !rest.is_empty() {
+            let took = d.feed(rest);
+            assert!(took > 0 && d.buffered() <= MAX_BUFFERED);
+            rest = &rest[took..];
+            while let Some(m) = d.next_message() {
+                assert_eq!(m.unwrap(), [0x30, 0x00]);
+                count += 1;
+            }
         }
         assert_eq!(count, n);
         assert_eq!(d.buffered(), 0);
         assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
         // Feeding after a partial take keeps the order.
-        d.feed(&GET_SYS_DESCR);
-        d.feed(&GET_SYS_DESCR[..5]);
+        assert_eq!(d.feed(&GET_SYS_DESCR), 43);
+        assert_eq!(d.feed(&GET_SYS_DESCR[..5]), 5);
         assert_eq!(d.next_message(), Some(Ok(GET_SYS_DESCR.to_vec())));
-        d.feed(&GET_SYS_DESCR[5..]);
+        assert_eq!(d.feed(&GET_SYS_DESCR[5..]), 38);
         assert_eq!(d.next_message(), Some(Ok(GET_SYS_DESCR.to_vec())));
         assert_eq!(d.next_message(), None);
     }
 
     #[test]
-    fn writer_drops_bindings_to_fit() {
-        let binds = (0..10)
-            .map(|i| VarBind::new(oid("1.3.6.1.2.1.1.5").child(i).unwrap(), Value::OctetString(vec![b'x'; 10_000])))
+    fn writer_refuses_rather_than_drops_bindings() {
+        // A Set of two 40,000-byte values does not fit, and is refused
+        // whole rather than sent as a Set of the first alone.
+        let binds: Vec<VarBind> = (0..2)
+            .map(|i| VarBind::new(oid("1.3.6.1.2.1.1.5").child(i).unwrap(), Value::OctetString(vec![b'x'; 40_000])))
             .collect();
+        let set =
+            Message { version: Version::V2c, community: b"private".to_vec(), pdu: Pdu::Set(BasicPdu::new(1, binds)) };
+        let len = set.encoded_len();
+        assert!(len > MAX_MESSAGE);
+        assert_eq!(set.to_bytes(), Err(Error::TooLong(len)));
+        // So is a Response, which the agent answers with tooBig instead.
         let get = Message::parse(&GET_SYS_DESCR).unwrap();
-        let reply = get.response(binds).unwrap();
-        let b = reply.to_bytes();
-        assert!(b.len() <= MAX_MESSAGE);
-        let back = Message::parse(&b).unwrap();
-        assert_eq!(back.pdu.bindings().len(), 6);
-        assert_eq!(back.pdu.bindings(), &reply.pdu.bindings()[..6]);
-        let one = get.response(vec![VarBind::new(oid("1.3.6"), Value::Opaque(vec![0; MAX_MESSAGE]))]).unwrap();
-        assert!(Message::parse(&one.to_bytes()).unwrap().pdu.bindings().is_empty());
+        let reply = get.response(set.pdu.bindings().to_vec()).unwrap();
+        assert!(matches!(reply.to_bytes(), Err(Error::TooLong(_))));
+        let big = get.error_response(ErrorStatus::TooBig, 0).unwrap();
+        assert_eq!(Message::parse(&big.to_bytes().unwrap()), Ok(big));
+        // A value far too large for any message is measured, not copied.
+        let huge = get.response(vec![VarBind::new(oid("1.3.6"), Value::Opaque(vec![0; 1 << 26]))]).unwrap();
+        assert_eq!(huge.to_bytes(), Err(Error::TooLong(huge.encoded_len())));
         // Right at the limit: with this request, a binding of 1.3.6 to n
         // bytes makes a message of n + 47 bytes.
         for extra in 0..40 {
             let n = MAX_MESSAGE - 40 - extra;
             let m = get.response(vec![VarBind::new(oid("1.3.6"), Value::OctetString(vec![1; n]))]).unwrap();
-            let b = m.to_bytes();
-            let back = Message::parse(&b).unwrap();
-            if extra >= 7 {
-                assert_eq!(b.len(), n + 47);
-                assert_eq!(back, m);
-            } else {
-                assert!(back.pdu.bindings().is_empty());
+            match m.to_bytes() {
+                Ok(b) => {
+                    assert!(extra >= 7);
+                    assert_eq!(b.len(), n + 47);
+                    assert_eq!(m.encoded_len(), b.len());
+                    assert_eq!(Message::parse(&b), Ok(m));
+                }
+                Err(e) => {
+                    // Past the limit some lengths take a byte more.
+                    assert!(extra < 7);
+                    assert!(m.encoded_len() > MAX_MESSAGE);
+                    assert_eq!(e, Error::TooLong(m.encoded_len()));
+                }
             }
         }
+    }
+
+    #[test]
+    fn long_communities_are_kept() {
+        // RFC 3584, snmpCommunityName: only the message size bounds a community.
+        let mut c = vec![0x30, 0x82, 0x01, 0x40, 0x02, 0x01, 0x01, 0x04, 0x82, 0x01, 0x2c];
+        c.extend_from_slice(&[b'a'; 300]);
+        c.extend_from_slice(&[0xa0, 0x0b, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x02, 0x01, 0x00, 0x30, 0x00]);
+        assert_eq!(c.len(), 4 + 0x140);
+        let m = Message::parse(&c).unwrap();
+        assert_eq!(m.community, [b'a'; 300]);
+        assert_eq!(m.to_bytes().unwrap(), c);
+        // Written whole, never cut, and refused only when the message is too long.
+        let m =
+            Message { version: Version::V2c, community: vec![b'b'; 60_000], pdu: Pdu::Get(BasicPdu::new(1, vec![])) };
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
+        let m = Message {
+            version: Version::V2c,
+            community: vec![b'b'; MAX_MESSAGE],
+            pdu: Pdu::Get(BasicPdu::new(1, vec![])),
+        };
+        assert!(matches!(m.to_bytes(), Err(Error::TooLong(_))));
+    }
+
+    #[test]
+    fn v1_request_with_counter64_gets_no_response() {
+        // RFC 3584, section 4.2.2.1: such a request is ill-formed and
+        // dropped, since an answer would copy the Counter64.
+        let mut v = GET_SYS_DESCR.to_vec();
+        v[4] = 0;
+        v.splice(41..43, [tag::COUNTER64, 0x01, 0x01]);
+        v[1] += 1;
+        v[14] += 1;
+        v[28] += 1;
+        v[30] += 1;
+        let m = Message::parse(&v).unwrap();
+        assert_eq!(m.pdu.bindings()[0].value, Value::Counter64(1));
+        assert!(!m.follows_version());
+        assert_eq!(m.error_response(ErrorStatus::GenErr, 1), None);
+        assert_eq!(m.response(m.pdu.bindings().to_vec()), None);
+        // The same request in version 2c is answered.
+        let v2 = Message { version: Version::V2c, ..m };
+        assert!(v2.error_response(ErrorStatus::GenErr, 1).unwrap().follows_version());
+    }
+
+    #[test]
+    fn value_content_is_bounded() {
+        let over = vec![0; MAX_MESSAGE + 1];
+        for t in [tag::OCTET_STRING, tag::OPAQUE, tag::INTEGER, tag::OBJECT_IDENTIFIER] {
+            assert_eq!(Value::from_ber(t, &over), Err(Error::TooLong(MAX_MESSAGE + 1)));
+        }
+        let most = vec![0; MAX_MESSAGE];
+        assert_eq!(Value::from_ber(tag::OCTET_STRING, &most), Ok(Value::OctetString(most.clone())));
+        assert_eq!(Value::from_ber(tag::OPAQUE, &most), Ok(Value::Opaque(most)));
+    }
+
+    #[test]
+    fn oid_second_arc_reaches_u32_max_under_2() {
+        // RFC 2578, section 3.5 bounds each arc, not the combined first
+        // sub-identifier: 2.4294967295 is 4294967375, 0x90 80 80 80 4f.
+        let o = Oid::from_arcs(&[2, u32::MAX]).unwrap();
+        assert_eq!(o.to_ber(), [0x90, 0x80, 0x80, 0x80, 0x4f]);
+        assert_eq!(Oid::from_ber(&[0x90, 0x80, 0x80, 0x80, 0x4f]), Ok(o.clone()));
+        assert_eq!("2.4294967295".parse::<Oid>(), Ok(o));
+        // One more is past the last arc.
+        assert_eq!(Oid::from_ber(&[0x90, 0x80, 0x80, 0x80, 0x50]), Err(Error::Oid));
+        assert_eq!(Oid::from_ber(&[0x80 | 0x7f, 0xff, 0xff, 0xff, 0xff, 0x7f]), Err(Error::Oid));
+        let m = Message::trap_v2(b"p", 1, 0, Oid::from_arcs(&[2, u32::MAX, u32::MAX]).unwrap(), vec![], false);
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()), Ok(m));
+    }
+
+    #[test]
+    fn long_form_lengths_with_extra_bytes() {
+        // RFC 3417, section 8 allows more length bytes than needed.
+        let mut long = vec![0x30, 0x85, 0, 0, 0, 0, 0x29];
+        long.extend_from_slice(&GET_SYS_DESCR[2..]);
+        assert_eq!(Message::parse(&long), Message::parse(&GET_SYS_DESCR));
+        let mut longest = vec![0x30, 0xfe];
+        longest.extend_from_slice(&[0; 125]);
+        longest.push(0x29);
+        longest.extend_from_slice(&GET_SYS_DESCR[2..]);
+        assert_eq!(Message::parse(&longest), Message::parse(&GET_SYS_DESCR));
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&longest), longest.len());
+        assert_eq!(d.next_message(), Some(Ok(longest.clone())));
+    }
+
+    #[test]
+    fn decoder_holds_at_most_max_buffered() {
+        // Feeding a large stream without taking messages out stops at the
+        // limit, and the rest is fed again once messages are taken.
+        let stream: Vec<u8> = GET_SYS_DESCR.repeat(10_000);
+        let mut d = Decoder::new();
+        let took = d.feed(&stream);
+        assert_eq!(took, MAX_BUFFERED);
+        assert_eq!(d.feed(&stream[took..]), 0);
+        assert_eq!(d.buffered(), MAX_BUFFERED);
+        let mut rest = &stream[took..];
+        let mut count = 0;
+        loop {
+            while let Some(m) = d.next_message() {
+                assert_eq!(m.unwrap(), GET_SYS_DESCR);
+                count += 1;
+            }
+            if rest.is_empty() {
+                break;
+            }
+            let n = d.feed(rest);
+            assert!(n > 0);
+            assert!(d.buffered() <= MAX_BUFFERED);
+            assert!(d.buf.capacity() <= 4 * MAX_BUFFERED);
+            rest = &rest[n..];
+        }
+        assert_eq!(count, 10_000);
+        assert_eq!(d.buffered(), 0);
+        // A broken stream takes and drops everything.
+        assert_eq!(d.feed(&[0x31]), 1);
+        assert!(d.next_message().unwrap().is_err());
+        assert_eq!(d.feed(&stream), stream.len());
+        assert_eq!(d.buffered(), 0);
     }
 
     #[test]
@@ -2087,12 +2273,12 @@ mod tests {
 
     #[test]
     fn decoder_splits_a_stream() {
-        let msgs: Vec<Vec<u8>> = samples().iter().map(Message::to_bytes).collect();
+        let msgs: Vec<Vec<u8>> = samples().iter().map(|m| m.to_bytes().unwrap()).collect();
         let stream = msgs.concat();
         let mut d = Decoder::new();
         let mut got = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
+            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
             while let Some(m) = d.next_message() {
                 got.push(m.unwrap());
             }
@@ -2100,13 +2286,13 @@ mod tests {
         assert_eq!(got, msgs);
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
-        d.feed(&[0x31, 0x00]);
+        assert_eq!(d.feed(&[0x31, 0x00]), 2);
         assert_eq!(d.next_message(), Some(Err(Error::UnexpectedTag(0x31))));
-        d.feed(&msgs[0]);
+        assert_eq!(d.feed(&msgs[0]), msgs[0].len());
         assert_eq!(d.next_message(), Some(Err(Error::UnexpectedTag(0x31))));
         assert_eq!(d.buffered(), 0);
         let mut d = Decoder::new();
-        d.feed(&[0x30, 0x83, 0x01, 0x00, 0x00]);
+        assert_eq!(d.feed(&[0x30, 0x83, 0x01, 0x00, 0x00]), 5);
         assert_eq!(d.next_message(), Some(Err(Error::TooLong(0x10000))));
     }
 
@@ -2123,14 +2309,18 @@ mod tests {
 
     fn check(data: &[u8]) {
         if let Ok(m) = Message::parse(data) {
-            let b = m.to_bytes();
+            let b = m.to_bytes().unwrap();
             assert!(b.len() <= data.len());
             assert_eq!(Message::parse(&b), Ok(m.clone()));
+            // Answers to it follow its version and are no longer than it,
+            // so they are written whole and read back the same.
             for r in
                 [m.response(m.pdu.bindings().to_vec()), m.error_response(ErrorStatus::GenErr, 1)].into_iter().flatten()
             {
-                let back = Message::parse(&r.to_bytes()).unwrap();
-                assert!(r.pdu.bindings().starts_with(back.pdu.bindings()));
+                assert!(m.follows_version() && r.follows_version());
+                let b = r.to_bytes().unwrap();
+                assert!(b.len() <= data.len());
+                assert_eq!(Message::parse(&b), Ok(r));
             }
         }
         if let Ok((e, used)) = Element::parse(data) {
@@ -2159,14 +2349,23 @@ mod tests {
             None
         }
         let mut whole = Decoder::new();
-        whole.feed(data);
         let mut messages = Vec::new();
-        let whole_err = take(&mut whole, &mut messages);
+        let mut whole_err = None;
+        let mut rest = data;
+        while whole_err.is_none() {
+            let n = whole.feed(rest);
+            rest = &rest[n..];
+            whole_err = take(&mut whole, &mut messages);
+            assert!(whole.buffered() <= MAX_BUFFERED);
+            if rest.is_empty() {
+                break;
+            }
+        }
         let mut bytewise = Decoder::new();
         let mut again = Vec::new();
         let mut bytewise_err = None;
         for b in data {
-            bytewise.feed(std::slice::from_ref(b));
+            assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
             if let Some(e) = take(&mut bytewise, &mut again) {
                 bytewise_err.get_or_insert(e);
             }
@@ -2188,7 +2387,7 @@ mod tests {
     #[test]
     fn fuzz_loop() {
         let mut rng = Lcg(0x5eed);
-        let seeds: Vec<Vec<u8>> = samples().iter().map(Message::to_bytes).collect();
+        let seeds: Vec<Vec<u8>> = samples().iter().map(|m| m.to_bytes().unwrap()).collect();
         for i in 0..6000 {
             let data: Vec<u8> = if i % 3 == 0 {
                 let n = (rng.next() % 96) as usize;

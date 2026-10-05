@@ -2,7 +2,9 @@
 //! writer given whatever text the agent sent.
 #![no_main]
 
-use fictionet::stdlib::xml::{Error, ErrorKind, Event, Parser, Writer, parse};
+use std::sync::Arc;
+
+use fictionet::stdlib::xml::{Attribute, Error, ErrorKind, Event, Name, Parser, Start, Writer, XMLNS_NAMESPACE, parse};
 use libfuzzer_sys::fuzz_target;
 
 /// Feeds `chunks` in order, then finishes: the events and the error, if
@@ -67,6 +69,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = w.text(&s);
     let _ = w.cdata(&s);
     let _ = w.pi(&s, &s);
+    // A writer keeps room for its end tags, so closing never fails.
     while w.depth() > 0 {
         w.end().unwrap();
     }
@@ -74,4 +77,72 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(out) = w.finish() {
         assert!(parse(out.as_bytes()).is_ok());
     }
+
+    // Events built from the input, names and namespaces chosen from small
+    // sets so they collide: what a writer accepts reads back with the same
+    // tags, namespaces included.
+    events(data);
 });
+
+fn events(data: &[u8]) {
+    let uris = [None, Some(Arc::<str>::from("urn:a")), Some(Arc::<str>::from("urn:b"))];
+    let prefixes = [None, Some("p"), Some("q")];
+    let name = |b: u8| Name {
+        prefix: prefixes[usize::from(b % 3)].map(String::from),
+        local: ["a", "b"][usize::from(b / 3 % 2)].to_string(),
+        namespace: uris[usize::from(b / 6 % 3)].clone(),
+    };
+    let xmlns = Some(Arc::<str>::from(XMLNS_NAMESPACE));
+    let mut w = Writer::new();
+    let mut tags = Vec::new();
+    let mut open: Vec<Name> = Vec::new();
+    for op in data.chunks(3) {
+        let [kind, a, b] = [op[0], *op.get(1).unwrap_or(&0), *op.get(2).unwrap_or(&0)];
+        let event = match kind % 4 {
+            0 | 1 => {
+                let mut attributes = Vec::new();
+                if a & 1 != 0 {
+                    // A declaration of a prefix, or of the default namespace.
+                    let local = ["xmlns", "p", "q"][usize::from(a / 2 % 3)];
+                    let prefix = (local != "xmlns").then(|| "xmlns".to_string());
+                    let value = ["", "urn:a", "urn:b"][usize::from(a / 6 % 3)].to_string();
+                    attributes.push(Attribute {
+                        name: Name { prefix, local: local.into(), namespace: xmlns.clone() },
+                        value,
+                    });
+                }
+                if a & 64 != 0 {
+                    attributes.push(Attribute { name: name(b / 2), value: "v".into() });
+                }
+                Event::Start(Start { name: name(b), attributes })
+            }
+            2 => match open.last() {
+                Some(n) if a % 4 != 0 => Event::End(n.clone()),
+                _ => Event::End(name(b)),
+            },
+            _ => Event::Text("t".into()),
+        };
+        if w.event(&event).is_ok() {
+            match &event {
+                Event::Start(s) => {
+                    open.push(s.name.clone());
+                    tags.push(event.clone());
+                }
+                Event::End(_) => {
+                    open.pop();
+                    tags.push(event.clone());
+                }
+                _ => {}
+            }
+        }
+    }
+    while let Some(n) = open.pop() {
+        w.event(&Event::End(n.clone())).unwrap();
+        tags.push(Event::End(n));
+    }
+    if let Ok(out) = w.finish() {
+        let read = parse(out.as_bytes()).unwrap();
+        let read: Vec<Event> = read.into_iter().filter(|e| matches!(e, Event::Start(_) | Event::End(_))).collect();
+        assert_eq!(read, tags, "{out}");
+    }
+}

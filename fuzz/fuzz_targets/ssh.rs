@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::ssh::{
-    Decoder, Event, Line, Message, Packet, Reader, StreamError, parse_line,
+    DECODER_CAPACITY, Decoder, Event, Line, Message, Packet, Reader, StreamError, parse_line,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -18,25 +18,38 @@ fn drain(d: &mut Decoder, out: &mut Vec<Result<Event, StreamError>>) {
     }
 }
 
-fuzz_target!(|data: &[u8]| {
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    whole.feed(data);
-    let mut events = Vec::new();
-    drain(&mut whole, &mut events);
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
+/// Every event of `data`, fed in pieces as large as the decoder takes,
+/// which it never holds more than its capacity of.
+fn whole(mut d: Decoder, mut data: &[u8]) -> Vec<Result<Event, StreamError>> {
+    let mut out = Vec::new();
+    loop {
+        let n = d.feed(data);
+        assert!(d.buffered() <= DECODER_CAPACITY);
+        data = &data[n..];
+        drain(&mut d, &mut out);
+        if data.is_empty() || out.last().is_some_and(Result::is_err) {
+            return out;
+        }
+    }
+}
+
+/// Every event of `data`, fed a byte at a time.
+fn bytewise(mut d: Decoder, data: &[u8]) -> Vec<Result<Event, StreamError>> {
+    let mut out = Vec::new();
     for b in data {
-        if again
-            .last()
-            .is_some_and(|e: &Result<Event, StreamError>| e.is_err())
-        {
+        if out.last().is_some_and(Result::is_err) {
             break;
         }
-        bytewise.feed(std::slice::from_ref(b));
-        drain(&mut bytewise, &mut again);
+        assert_eq!(d.feed(std::slice::from_ref(b)), 1);
+        drain(&mut d, &mut out);
     }
-    assert_eq!(events, again);
+    out
+}
+
+fuzz_target!(|data: &[u8]| {
+    // The stream, split two ways: all at once, and a byte at a time.
+    let events = whole(Decoder::new(), data);
+    assert_eq!(events, bytewise(Decoder::new(), data));
 
     for e in events.iter().flatten() {
         match e {
@@ -65,10 +78,8 @@ fuzz_target!(|data: &[u8]| {
 
     // The same bytes as a stream already past the version line, as a
     // payload, and through the data type reader.
-    let mut packets = Decoder::after_version();
-    packets.feed(data);
-    let mut rest = Vec::new();
-    drain(&mut packets, &mut rest);
+    let packets = whole(Decoder::after_version(), data);
+    assert_eq!(packets, bytewise(Decoder::after_version(), data));
     if let Ok(m) = Message::parse(data) {
         assert_eq!(Message::parse(&m.to_payload()), Ok(m));
     }

@@ -21,18 +21,25 @@ fuzz_target!(|data: &[u8]| {
     }
     assert_eq!(first, again);
 
-    // The stateless reader agrees with the decoder.
+    // The stateless reader, drained on its own, gives the same items, so
+    // neither side can drop a whole item the other reads.
+    let mut stateless = Vec::new();
     let mut rest = data;
-    for r in &first {
-        match (Item::parse(rest), r) {
-            (Ok(Some((item, used))), Ok(i)) => {
-                assert_eq!(&item, i);
+    loop {
+        match Item::parse(rest) {
+            Ok(Some((item, used))) => {
+                assert!(used > 0 && used <= rest.len());
+                stateless.push(Ok(item));
                 rest = &rest[used..];
             }
-            (Err(e), Err(f)) => assert_eq!(&e, f),
-            (x, y) => panic!("{x:?} vs {y:?}"),
+            Ok(None) => break,
+            Err(e) => {
+                stateless.push(Err(e));
+                break;
+            }
         }
     }
+    assert_eq!(first, stateless);
 
     for item in first.iter().flatten() {
         round_trip(item);
@@ -89,6 +96,7 @@ fn round_trip(item: &Item) {
         m.headers.iter().filter(|h| !h.name.eq_ignore_ascii_case("Content-Length")).cloned().collect::<Vec<_>>()
     };
     assert_eq!(others(back), others(m));
+    assert_eq!(back.cseq(), m.cseq());
     if let Ok(s) = m.session() {
         assert_eq!(Session::parse(&s.to_value().unwrap()).unwrap(), s);
     }

@@ -167,7 +167,9 @@ pub struct Connect {
     /// The client identifier. It may be empty. The standard says a broker
     /// answers an empty identifier without `clean_session` with
     /// [`ConnectReturnCode::IdentifierRejected`]; that choice is left to
-    /// the world, so the reader accepts it.
+    /// the world, so the reader accepts it, and the writer writes it, so
+    /// any CONNECT read can be written back. A world playing a client
+    /// sets `clean_session` with an empty identifier.
     pub client_id: String,
     /// The will message, if the client set one.
     pub will: Option<Will>,
@@ -225,8 +227,8 @@ impl ConnectReturnCode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConnAck {
     /// Whether the broker still holds a session for this client. The
-    /// standard allows it only when the connection is accepted, so a writer
-    /// writes it as false for any other code.
+    /// standard allows it only when the connection is accepted, so the
+    /// writer refuses it with any other code.
     pub session_present: bool,
     /// Whether the connection is accepted, and why not.
     pub code: ConnectReturnCode,
@@ -643,28 +645,62 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn put_u16(out: &mut Vec<u8>, n: u16) {
-    out.extend_from_slice(&n.to_be_bytes());
+/// Where a writer puts a packet's bytes: a buffer, or a counter that
+/// only adds up their length, so a size can be checked before anything is
+/// allocated.
+trait Sink {
+    fn put(&mut self, b: &[u8]);
 }
 
-fn put_binary(out: &mut Vec<u8>, b: &[u8]) -> Result<(), Error> {
+impl Sink for Vec<u8> {
+    fn put(&mut self, b: &[u8]) {
+        self.extend_from_slice(b);
+    }
+}
+
+/// Counts bytes. It saturates, so any total past the largest packet is
+/// still past it.
+struct Count(usize);
+
+impl Sink for Count {
+    fn put(&mut self, b: &[u8]) {
+        self.0 = self.0.saturating_add(b.len());
+    }
+}
+
+fn put_u16(out: &mut impl Sink, n: u16) {
+    out.put(&n.to_be_bytes());
+}
+
+fn put_binary(out: &mut impl Sink, b: &[u8]) -> Result<(), Error> {
     let n = u16::try_from(b.len()).map_err(|_| Error::TooLong(b.len()))?;
     put_u16(out, n);
-    out.extend_from_slice(b);
+    out.put(b);
     Ok(())
 }
 
-fn put_string(out: &mut Vec<u8>, s: &str) -> Result<(), Error> {
+fn put_string(out: &mut impl Sink, s: &str) -> Result<(), Error> {
     check_string(s)?;
     put_binary(out, s.as_bytes())
 }
 
-fn put_packet_id(out: &mut Vec<u8>, id: u16) -> Result<(), Error> {
+fn put_packet_id(out: &mut impl Sink, id: u16) -> Result<(), Error> {
     if id == 0 {
         return Err(Error::PacketIdZero);
     }
     put_u16(out, id);
     Ok(())
+}
+
+/// How many bytes the remaining length `n` takes, written as
+/// [`write_remaining_length`] writes it.
+fn remaining_length_len(n: usize) -> usize {
+    match n {
+        0..=127 => 1,
+        128..=16_383 => 2,
+        16_384..=2_097_151 => 3,
+        _ => 4,
+    }
 }
 
 impl Packet {
@@ -700,14 +736,44 @@ impl Packet {
     }
 
     /// The packet's bytes. Whatever this returns, [`Packet::parse`] reads
-    /// back as the same packet, with one exception: a [`ConnAck`] that
-    /// refuses the connection is written with no session present. A packet
-    /// that breaks a rule the reader checks, such as a topic name with a
-    /// wildcard, a packet identifier of 0, or a field or packet over its
-    /// size limit, is an error instead. A [`Decoder`] with a smaller limit
-    /// than [`MAX_PACKET`] may still refuse a large packet.
+    /// back as the same packet. A packet that breaks a rule the reader
+    /// checks, such as a topic name with a wildcard, a packet identifier of
+    /// 0, a [`ConnAck`] with a session present on a refused connection, or
+    /// a field or packet over its size limit, is an error instead. The
+    /// size is checked before anything is allocated. A [`Decoder`] with a
+    /// smaller limit than [`MAX_PACKET`] may still refuse a large packet.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut body = Vec::new();
+        let (flags, body) = self.measure()?;
+        let mut out = Vec::with_capacity(1 + remaining_length_len(body) + body);
+        out.push((self.packet_type() << 4) | flags);
+        write_remaining_length(body, &mut out)?;
+        self.write_body(&mut out)?;
+        Ok(out)
+    }
+
+    /// How many bytes [`Packet::to_bytes`] writes, header included, or the
+    /// error it returns. It allocates nothing, so a world can check a
+    /// packet against a peer's limit before writing it.
+    pub fn encoded_len(&self) -> Result<usize, Error> {
+        let (_, body) = self.measure()?;
+        Ok(1 + remaining_length_len(body) + body)
+    }
+
+    /// Checks the packet without writing it: its flag bits, and the length
+    /// of its body, which is at most [`MAX_REMAINING_LENGTH`].
+    fn measure(&self) -> Result<(u8, usize), Error> {
+        let mut count = Count(0);
+        let flags = self.write_body(&mut count)?;
+        if count.0 > MAX_REMAINING_LENGTH {
+            return Err(Error::TooLarge { size: count.0, max: MAX_REMAINING_LENGTH });
+        }
+        Ok((flags, count.0))
+    }
+
+    /// Checks the packet and puts its body, everything after the remaining
+    /// length, into `body`. It returns the four flag bits of the first
+    /// byte.
+    fn write_body(&self, body: &mut impl Sink) -> Result<u8, Error> {
         let mut flags = 0u8;
         match self {
             Packet::Connect(c) => {
@@ -730,27 +796,27 @@ impl Packet {
                         return Err(Error::ConnectFlags(connect_flags));
                     }
                 }
-                put_string(&mut body, PROTOCOL_NAME)?;
-                body.push(PROTOCOL_LEVEL);
-                body.push(connect_flags);
-                put_u16(&mut body, c.keep_alive);
-                put_string(&mut body, &c.client_id)?;
+                put_string(body, PROTOCOL_NAME)?;
+                body.put(&[PROTOCOL_LEVEL, connect_flags]);
+                put_u16(body, c.keep_alive);
+                put_string(body, &c.client_id)?;
                 if let Some(w) = &c.will {
                     check_topic_name(&w.topic)?;
-                    put_string(&mut body, &w.topic)?;
-                    put_binary(&mut body, &w.message)?;
+                    put_string(body, &w.topic)?;
+                    put_binary(body, &w.message)?;
                 }
                 if let Some(u) = &c.username {
-                    put_string(&mut body, u)?;
+                    put_string(body, u)?;
                 }
                 if let Some(p) = &c.password {
-                    put_binary(&mut body, p)?;
+                    put_binary(body, p)?;
                 }
             }
             Packet::ConnAck(a) => {
-                let present = a.session_present && a.code == ConnectReturnCode::Accepted;
-                body.push(u8::from(present));
-                body.push(a.code.code());
+                if a.session_present && a.code != ConnectReturnCode::Accepted {
+                    return Err(Error::ConnAckFlags(1));
+                }
+                body.put(&[u8::from(a.session_present), a.code.code()]);
             }
             Packet::Publish(p) => {
                 flags = (u8::from(p.dup) << 3) | (p.qos.level() << 1) | u8::from(p.retain);
@@ -758,58 +824,56 @@ impl Packet {
                     return Err(Error::Flags { packet_type: packet_type::PUBLISH, flags });
                 }
                 check_topic_name(&p.topic)?;
-                put_string(&mut body, &p.topic)?;
+                put_string(body, &p.topic)?;
                 match (p.qos, p.packet_id) {
                     (QoS::AtMostOnce, None) => {}
-                    (QoS::AtLeastOnce | QoS::ExactlyOnce, Some(id)) => put_packet_id(&mut body, id)?,
+                    (QoS::AtLeastOnce | QoS::ExactlyOnce, Some(id)) => put_packet_id(body, id)?,
                     _ => return Err(Error::PacketId),
                 }
-                body.extend_from_slice(&p.payload);
+                body.put(&p.payload);
             }
             Packet::PubAck(id) | Packet::PubRec(id) | Packet::PubComp(id) | Packet::UnsubAck(id) => {
-                put_packet_id(&mut body, *id)?;
+                put_packet_id(body, *id)?;
             }
             Packet::PubRel(id) => {
                 flags = 0x02;
-                put_packet_id(&mut body, *id)?;
+                put_packet_id(body, *id)?;
             }
             Packet::Subscribe(s) => {
                 flags = 0x02;
-                put_packet_id(&mut body, s.packet_id)?;
+                put_packet_id(body, s.packet_id)?;
                 if s.filters.is_empty() {
                     return Err(Error::EmptySubscription);
                 }
                 for (filter, qos) in &s.filters {
                     check_topic_filter(filter)?;
-                    put_string(&mut body, filter)?;
-                    body.push(qos.level());
+                    put_string(body, filter)?;
+                    body.put(&[qos.level()]);
                 }
             }
             Packet::SubAck(s) => {
-                put_packet_id(&mut body, s.packet_id)?;
+                put_packet_id(body, s.packet_id)?;
                 if s.codes.is_empty() {
                     return Err(Error::EmptySubscription);
                 }
-                body.extend(s.codes.iter().map(|c| c.code()));
+                for c in &s.codes {
+                    body.put(&[c.code()]);
+                }
             }
             Packet::Unsubscribe(u) => {
                 flags = 0x02;
-                put_packet_id(&mut body, u.packet_id)?;
+                put_packet_id(body, u.packet_id)?;
                 if u.filters.is_empty() {
                     return Err(Error::EmptySubscription);
                 }
                 for filter in &u.filters {
                     check_topic_filter(filter)?;
-                    put_string(&mut body, filter)?;
+                    put_string(body, filter)?;
                 }
             }
             Packet::PingReq | Packet::PingResp | Packet::Disconnect => {}
         }
-        let mut out = Vec::with_capacity(1 + MAX_REMAINING_LENGTH_BYTES + body.len());
-        out.push((self.packet_type() << 4) | flags);
-        write_remaining_length(body.len(), &mut out)?;
-        out.extend_from_slice(&body);
-        Ok(out)
+        Ok(flags)
     }
 }
 
@@ -974,25 +1038,38 @@ impl Decoder {
         self.max_packet
     }
 
-    /// Adds bytes read from the connection. After an [`Error`] the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Adds bytes read from the connection and returns how many it took.
+    /// It holds at most [`Decoder::capacity`] bytes not yet taken out, so
+    /// it may take fewer than it is given. Take packets out with
+    /// [`Decoder::next_packet`], then feed it the rest; once it is full,
+    /// `next_packet` always gives a packet or an error. After an [`Error`]
+    /// the stream cannot be read any further, and every byte is taken and
+    /// dropped.
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.failed.is_some() {
-            return;
+            return bytes.len();
         }
         if self.start > 0 && self.start * 2 >= self.buf.len() {
             self.buf.drain(..self.start);
             self.start = 0;
         }
-        self.buf.extend_from_slice(bytes);
+        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
+    }
+
+    /// The most bytes the decoder holds that have not been taken out: the
+    /// longest packet it takes, and never less than a first byte and the
+    /// longest remaining length, so a full decoder can always tell whether
+    /// the packet fits.
+    pub fn capacity(&self) -> usize {
+        self.max_packet.max(1 + MAX_REMAINING_LENGTH_BYTES)
     }
 
     /// The next whole packet, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the stream
     /// has broken. A packet over the limit is an error as soon as its
-    /// header arrives, so the bytes waiting ([`Decoder::buffered`]) never
-    /// exceed one packet's worth plus what was fed since the last call.
-    /// Taking packets out costs time in proportion to their bytes, however
+    /// header arrives. Taking packets out costs time in proportion to their bytes, however
     /// small they are.
     pub fn next_packet(&mut self) -> Option<Result<Packet, Error>> {
         if let Some(e) = self.failed {
@@ -1434,15 +1511,89 @@ mod tests {
     }
 
     #[test]
-    fn connack_writer_clamps_session_present() {
+    fn connack_writer_refuses_session_present_on_a_refusal() {
+        // The reader refuses these flags, so the writer does too, rather
+        // than write a different value than it was given.
         let refused =
             Packet::ConnAck(ConnAck { session_present: true, code: ConnectReturnCode::BadUsernameOrPassword });
-        let bytes = refused.to_bytes().unwrap();
-        assert_eq!(bytes, [0x20, 2, 0, 4]);
-        assert_eq!(
-            parse(&bytes),
-            Ok(Packet::ConnAck(ConnAck { session_present: false, code: ConnectReturnCode::BadUsernameOrPassword }))
-        );
+        assert_eq!(refused.to_bytes(), Err(Error::ConnAckFlags(1)));
+        assert_eq!(refused.encoded_len(), Err(Error::ConnAckFlags(1)));
+        let ok = Packet::ConnAck(ConnAck { session_present: false, code: ConnectReturnCode::BadUsernameOrPassword });
+        assert_eq!(parse(&ok.to_bytes().unwrap()), Ok(ok));
+    }
+
+    #[test]
+    fn encoded_len_matches_and_refuses_oversized_packets_before_writing() {
+        for (packet, bytes) in samples() {
+            assert_eq!(packet.encoded_len(), Ok(bytes.len()), "{packet:?}");
+        }
+        // The largest PUBLISH body fits; one byte more does not. The
+        // payload comes from zeroed pages, so it costs little until it is
+        // copied, and the oversized one never is.
+        let publish = |n: usize| {
+            Packet::Publish(Publish {
+                dup: false,
+                qos: QoS::AtMostOnce,
+                retain: false,
+                topic: "a".into(),
+                packet_id: None,
+                payload: vec![0; n],
+            })
+        };
+        let over = publish(MAX_REMAINING_LENGTH - 2);
+        let too_large = Error::TooLarge { size: MAX_REMAINING_LENGTH + 1, max: MAX_REMAINING_LENGTH };
+        assert_eq!(over.encoded_len(), Err(too_large));
+        assert_eq!(over.to_bytes(), Err(too_large));
+        drop(over);
+        assert_eq!(publish(MAX_REMAINING_LENGTH - 3).encoded_len(), Ok(MAX_PACKET));
+        // A field error comes before the size check, as in to_bytes.
+        let mut bad = Publish {
+            dup: false,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "#".into(),
+            packet_id: None,
+            payload: vec![],
+        };
+        assert_eq!(Packet::Publish(bad.clone()).encoded_len(), Err(Error::TopicName));
+        bad.topic = "t".into();
+        assert_eq!(Packet::Publish(bad).encoded_len(), Ok(5));
+    }
+
+    #[test]
+    fn decoder_holds_at_most_its_capacity() {
+        // Many valid packets fed without taking any out: the decoder takes
+        // what fits and leaves the rest with the caller.
+        let mut d = Decoder::with_max_packet(2);
+        assert_eq!(d.capacity(), 1 + MAX_REMAINING_LENGTH_BYTES);
+        let stream = [0xc0u8, 0].repeat(1000);
+        let mut fed = 0;
+        let mut got = 0;
+        while fed < stream.len() {
+            let n = d.feed(&stream[fed..]);
+            assert!(d.buffered() <= d.capacity());
+            fed += n;
+            let mut progressed = n > 0;
+            while let Some(p) = d.next_packet() {
+                assert_eq!(p, Ok(Packet::PingReq));
+                got += 1;
+                progressed = true;
+            }
+            assert!(progressed, "stuck at {fed}");
+        }
+        assert_eq!(got, 1000);
+        // A full decoder always has a packet or an error to give: here a
+        // length that cannot fit a limit of 2.
+        let mut d = Decoder::with_max_packet(2);
+        assert_eq!(d.feed(&[0x30, 0x80, 0x80, 0x80, 0x01, 0, 0]), 5);
+        assert_eq!(d.next_packet(), Some(Err(Error::TooLarge { size: 2_097_157, max: 2 })));
+        // A broken decoder takes and drops every byte.
+        assert_eq!(d.feed(&[0; 100]), 100);
+        assert_eq!(d.buffered(), 0);
+        // The default decoder holds one packet's worth.
+        assert_eq!(Decoder::new().capacity(), DEFAULT_MAX_PACKET);
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&vec![0xc0; 2 * DEFAULT_MAX_PACKET]), DEFAULT_MAX_PACKET);
     }
 
     #[test]
@@ -1618,33 +1769,50 @@ mod tests {
         }
     }
 
-    /// What every reader must hold for any bytes: no panic, a packet read
-    /// writes back to bytes that read the same, and a decoder fed in pieces
-    /// finds what one fed all at once finds.
-    fn check(data: &[u8], piece: usize) {
-        // The same limit as Packet::parse, so a large packet reads the same
-        // both ways.
-        let mut whole = Decoder::with_max_packet(MAX_PACKET);
-        whole.feed(data);
+    /// Feeds `data` to `d` in pieces of `piece` bytes, taking packets out as
+    /// they come, until it ends or the stream breaks. It returns the
+    /// packets, the error if there was one, and the bytes still held.
+    fn run(d: &mut Decoder, data: &[u8], piece: usize) -> (Vec<Packet>, Option<Error>, usize) {
         let mut packets = Vec::new();
-        while let Some(Ok(p)) = whole.next_packet() {
-            packets.push(p);
-        }
-        let mut pieces = Decoder::with_max_packet(MAX_PACKET);
-        let mut again = Vec::new();
         for chunk in data.chunks(piece.max(1)) {
-            pieces.feed(chunk);
-            while let Some(Ok(p)) = pieces.next_packet() {
-                again.push(p);
+            let mut rest = chunk;
+            loop {
+                let n = d.feed(rest);
+                assert!(d.buffered() <= d.capacity());
+                rest = &rest[n..];
+                let mut took = false;
+                while let Some(p) = d.next_packet() {
+                    match p {
+                        Ok(p) => packets.push(p),
+                        Err(e) => return (packets, Some(e), d.buffered()),
+                    }
+                    took = true;
+                }
+                if rest.is_empty() {
+                    break;
+                }
+                assert!(n > 0 || took, "a full decoder gave nothing");
             }
         }
-        assert_eq!(packets, again);
+        (packets, None, d.buffered())
+    }
+
+    /// What every reader must hold for any bytes: no panic, a packet read
+    /// writes back to bytes that read the same, and a decoder fed in pieces
+    /// finds the same packets, error and leftover bytes as one fed all at
+    /// once, at the full limit and at a small one.
+    fn check(data: &[u8], piece: usize, small: usize) {
+        let (packets, error, held) = run(&mut Decoder::with_max_packet(MAX_PACKET), data, data.len());
+        assert_eq!(run(&mut Decoder::with_max_packet(MAX_PACKET), data, piece), (packets.clone(), error, held));
+        let whole = run(&mut Decoder::with_max_packet(small), data, data.len());
+        assert_eq!(run(&mut Decoder::with_max_packet(small), data, piece), whole);
         if let Ok(Some((p, used))) = Packet::parse(data) {
             assert!(used <= data.len());
             assert_eq!(packets.first(), Some(&p));
         }
         for p in &packets {
             let bytes = p.to_bytes().expect("a packet read can be written");
+            assert_eq!(p.encoded_len(), Ok(bytes.len()));
             assert_eq!(parse(&bytes), Ok(p.clone()));
         }
     }
@@ -1689,7 +1857,7 @@ mod tests {
             if matches!(Packet::parse(&data), Ok(Some(_))) {
                 read += 1;
             }
-            check(&data, 1 + rng.below(5));
+            check(&data, 1 + rng.below(5), rng.below(24));
         }
         // The loop reaches real packets, not only errors.
         assert!(read > 200, "{read} packets read");

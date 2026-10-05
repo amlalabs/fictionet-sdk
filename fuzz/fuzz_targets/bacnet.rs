@@ -2,7 +2,10 @@
 //! a building controller reads them.
 #![no_main]
 
-use fictionet::stdlib::bacnet::{Apdu, Bvlc, IAm, Npdu, Tag, Value, WhoIs};
+use fictionet::stdlib::bacnet::{
+    Apdu, Bvlc, CharString, Destination, IAm, NetAddress, Npdu, NpduBody, ObjectId, Priority, Segmentation, Tag, Value,
+    WhoIs,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -41,6 +44,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
+    writers(data);
     // Values written once write the same bytes again: NaN payloads stay,
     // and leading zero bytes go on the first write.
     if let Ok(values) = Value::parse_all(data) {
@@ -73,4 +77,46 @@ fn write_all(values: &[Value]) -> Vec<u8> {
         v.write(&mut out);
     }
     out
+}
+
+/// Builds public values from `b`, including ones no reader returns, and
+/// checks that what the writers make reads back.
+fn writers(b: &[u8]) {
+    let byte = |i: usize| b.get(i).copied().unwrap_or(0);
+    let word = |i: usize| u16::from_be_bytes([byte(i), byte(i + 1)]);
+    // Any context tag number, 255 included, writes a tag that reads.
+    let mut out = Vec::new();
+    Value::Unsigned(u64::from(word(0))).write_context(byte(2), &mut out);
+    assert!(Tag::parse(&out).is_ok());
+    // Any network numbers write an NPDU that reads.
+    let npdu = Npdu {
+        destination: (byte(3) & 1 != 0).then(|| Destination {
+            address: NetAddress { network: word(4), mac: vec![byte(6); usize::from(byte(3) % 8)] },
+            hop_count: byte(7),
+        }),
+        source: (byte(3) & 2 != 0)
+            .then(|| NetAddress { network: word(8), mac: vec![byte(10); usize::from(byte(3) >> 5)] }),
+        expecting_reply: byte(3) & 4 != 0,
+        priority: Priority::from_bits(byte(3) >> 3),
+        body: NpduBody::Apdu(b.to_vec()),
+    };
+    assert!(Npdu::parse(&npdu.to_bytes()).is_ok());
+    assert!(Npdu::parse(&Npdu::local(b.to_vec()).to_bytes()).is_ok());
+    // Any I-Am writes one that reads.
+    let i_am = IAm {
+        device: ObjectId::from_u32(u32::from(word(0)) << 16 | u32::from(word(2))),
+        max_apdu: u32::from(word(4)),
+        segmentation: [Segmentation::Both, Segmentation::Transmit, Segmentation::Receive, Segmentation::NoSegmentation]
+            [usize::from(byte(6) % 4)],
+        vendor: word(7),
+    };
+    assert!(IAm::parse(&i_am.to_bytes()).is_ok());
+    // A string of any character set, cut or not, reads back. A UTF-8 one
+    // that was valid stays valid.
+    let s = CharString { charset: byte(0), bytes: b.to_vec() };
+    let written = Value::CharacterString(s.clone()).to_bytes();
+    let Ok((Value::CharacterString(back), _)) = Value::parse(&written) else { panic!("string did not read back") };
+    if s.as_str().is_some() {
+        assert!(back.as_str().is_some());
+    }
 }

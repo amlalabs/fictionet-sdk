@@ -1,0 +1,3182 @@
+//! OSPF: reading and writing OSPFv2 and OSPFv3 packets and LSAs, with no
+//! I/O.
+//!
+//! OSPF (Open Shortest Path First, IP protocol 89) is a link-state routing
+//! protocol that many enterprise and campus networks run inside. Routers on
+//! a link find each other with Hello packets and elect a designated router.
+//! Each router then describes its links in link state advertisements (LSAs).
+//! Neighbors swap summaries of the LSAs they hold (Database Description),
+//! ask for the ones they lack (Link State Request), send them (Link State
+//! Update) and confirm them (Link State Acknowledgment). Every router
+//! builds the same map from the LSAs and works out its routes from it.
+//!
+//! Two versions are in use. Version 2 (RFC 2328) runs over IPv4 and
+//! carries IPv4 routes. It has an authentication field in every header,
+//! and its checksum covers the packet without that field. Version 3 (RFC
+//! 5340) runs over IPv6 and carries IPv6 prefixes. It has no
+//! authentication field, and its checksum covers an IPv6 pseudo-header as
+//! well. Both versions have the same five packet types, and both protect
+//! each LSA with a Fletcher checksum (RFC 905, annex B) that every router
+//! checks before it accepts the LSA.
+//!
+//! Nothing here reads a socket. A world that plays a router hands each
+//! OSPF payload (the bytes after the IP header) to [`Packet::parse`] with
+//! the packet's [`Endpoints`], looks at the [`Packet`], and sends the bytes
+//! [`Packet::to_bytes`] returns in an IP packet with protocol [`PROTOCOL`],
+//! usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`]. A
+//! [`Decoder`] reads a payload that comes in pieces and reports a bad
+//! header as soon as the bytes show it. Which routers and links exist,
+//! when Hellos go out, and how routes are worked out are up to world code.
+//!
+//! Every reader checks the version, packet type, lengths, counts and both
+//! checksums, because the agent can send any bytes it likes. A payload
+//! must end where its length says, and an LSA body must fill its LSA
+//! exactly. Reserved fields are ignored when read and written as zero.
+//! Writers check the same rules as readers, so bytes they return always
+//! read back.
+//!
+//! ```
+//! use std::net::Ipv4Addr;
+//! use fictionet::stdlib::ospf::{ALL_SPF_ROUTERS_V4, Auth, Body, Endpoints, Header, HelloV2, Packet};
+//!
+//! /// A Hello from router `me` on a /24 link, listing the routers it has
+//! /// heard on the link.
+//! fn hello(me: Ipv4Addr, heard: Vec<Ipv4Addr>) -> Packet {
+//!     Packet {
+//!         router_id: me,
+//!         area_id: Ipv4Addr::UNSPECIFIED,
+//!         header: Header::V2 { auth: Auth::Null },
+//!         body: Body::HelloV2(HelloV2 {
+//!             network_mask: Ipv4Addr::new(255, 255, 255, 0),
+//!             hello_interval: 10,
+//!             options: 0x02,
+//!             priority: 1,
+//!             dead_interval: 40,
+//!             designated_router: Ipv4Addr::UNSPECIFIED,
+//!             backup_designated_router: Ipv4Addr::UNSPECIFIED,
+//!             neighbors: heard,
+//!         }),
+//!     }
+//! }
+//!
+//! // The agent's router, 1.1.1.1 at 10.0.0.1, says hello to the link. It
+//! // has heard no one yet.
+//! let link = Endpoints::V4 { source: Ipv4Addr::new(10, 0, 0, 1), destination: ALL_SPF_ROUTERS_V4 };
+//! let bytes = [
+//!     2, 1, 0, 44, 1, 1, 1, 1, 0, 0, 0, 0, 0xfa, 0x9c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // header
+//!     255, 255, 255, 0, 0, 10, 0x02, 1, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, // Hello
+//! ];
+//! let packet = Packet::parse(&bytes, &link).unwrap();
+//! assert_eq!(packet, hello(Ipv4Addr::new(1, 1, 1, 1), vec![]));
+//! assert_eq!(packet.to_bytes(&link).unwrap(), bytes);
+//!
+//! // The world's router, 2.2.2.2, answers. Listing 1.1.1.1 tells the
+//! // agent's router that the two can hear each other.
+//! let reply = hello(Ipv4Addr::new(2, 2, 2, 2), vec![packet.router_id]);
+//! let sent = reply.to_bytes(&link).unwrap();
+//! assert_eq!(sent.len(), 48);
+//! assert_eq!(Packet::parse(&sent, &link), Ok(reply));
+//!
+//! // One flipped bit and the checksum no longer holds.
+//! let mut bad = bytes;
+//! bad[30] ^= 1;
+//! assert!(Packet::parse(&bad, &link).is_err());
+//! ```
+
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+/// The IP protocol number of OSPF.
+pub const PROTOCOL: u8 = 89;
+/// The IPv4 group every OSPFv2 router on a link listens to.
+pub const ALL_SPF_ROUTERS_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 5);
+/// The IPv4 group the designated routers of a link listen to.
+pub const ALL_D_ROUTERS_V4: Ipv4Addr = Ipv4Addr::new(224, 0, 0, 6);
+/// The IPv6 group every OSPFv3 router on a link listens to.
+pub const ALL_SPF_ROUTERS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 5);
+/// The IPv6 group the designated routers of a link listen to.
+pub const ALL_D_ROUTERS_V6: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 6);
+/// The length of the OSPFv2 packet header.
+pub const HEADER_LEN_V2: usize = 24;
+/// The length of the OSPFv3 packet header.
+pub const HEADER_LEN_V3: usize = 16;
+/// The length of an LSA header, in either version.
+pub const LSA_HEADER_LEN: usize = 20;
+/// The longest packet: its 16-bit length field caps it.
+pub const MAX_PACKET: usize = 65535;
+/// The longest message digest an OSPFv2 packet with cryptographic
+/// authentication carries after the packet. Its length is one byte.
+pub const MAX_DIGEST: usize = 255;
+/// The longest payload a reader takes: the longest packet and the longest
+/// digest.
+pub const MAX_MESSAGE: usize = MAX_PACKET + MAX_DIGEST;
+/// The longest LSA: its 16-bit length field caps it.
+pub const MAX_LSA: usize = 65535;
+/// The longest IPv6 prefix, in bits.
+pub const MAX_PREFIX_LEN: u8 = 128;
+/// The largest value of a 24-bit field: OSPFv3 options and most metrics.
+pub const MAX_U24: u32 = 0x00ff_ffff;
+/// The age, in seconds, at which an LSA is flushed from every database.
+pub const MAX_AGE: u16 = 3600;
+/// The sequence number a router gives the first instance of an LSA.
+pub const INITIAL_SEQUENCE: u32 = 0x8000_0001;
+
+/// Packet type numbers.
+pub mod packet_type {
+    /// Hello: finds neighbors and elects the designated router.
+    pub const HELLO: u8 = 1;
+    /// Database Description: a summary of the LSAs a router holds.
+    pub const DATABASE_DESCRIPTION: u8 = 2;
+    /// Link State Request: asks a neighbor for LSAs.
+    pub const LINK_STATE_REQUEST: u8 = 3;
+    /// Link State Update: carries LSAs.
+    pub const LINK_STATE_UPDATE: u8 = 4;
+    /// Link State Acknowledgment: confirms LSAs arrived.
+    pub const LINK_STATE_ACK: u8 = 5;
+}
+
+/// OSPFv2 authentication types.
+pub mod auth_type {
+    /// No authentication.
+    pub const NULL: u16 = 0;
+    /// A plain-text password in the header.
+    pub const SIMPLE: u16 = 1;
+    /// A keyed digest after the packet (RFC 2328 appendix D, RFC 5709).
+    pub const CRYPTOGRAPHIC: u16 = 2;
+}
+
+/// Database Description flag bits.
+pub mod dd_flags {
+    /// Master/slave: set by the master of the exchange.
+    pub const MS: u8 = 0x01;
+    /// More: more Database Description packets follow.
+    pub const MORE: u8 = 0x02;
+    /// Init: the first packet of the exchange.
+    pub const INIT: u8 = 0x04;
+}
+
+/// OSPFv2 LS types.
+pub mod lsa_type_v2 {
+    /// Router-LSA: a router's links in one area.
+    pub const ROUTER: u16 = 1;
+    /// Network-LSA: the routers on a transit network.
+    pub const NETWORK: u16 = 2;
+    /// Summary-LSA for a network in another area.
+    pub const SUMMARY_NETWORK: u16 = 3;
+    /// Summary-LSA for an AS boundary router in another area.
+    pub const SUMMARY_ASBR: u16 = 4;
+    /// AS-external-LSA: a route from outside the OSPF domain.
+    pub const AS_EXTERNAL: u16 = 5;
+    /// NSSA-LSA (RFC 3101): an external route inside a not-so-stubby
+    /// area. It has the AS-external-LSA's format.
+    pub const NSSA: u16 = 7;
+}
+
+/// OSPFv3 LS types, scope bits included.
+pub mod lsa_type_v3 {
+    /// Router-LSA.
+    pub const ROUTER: u16 = 0x2001;
+    /// Network-LSA.
+    pub const NETWORK: u16 = 0x2002;
+    /// Inter-Area-Prefix-LSA: a prefix in another area.
+    pub const INTER_AREA_PREFIX: u16 = 0x2003;
+    /// Inter-Area-Router-LSA: an AS boundary router in another area.
+    pub const INTER_AREA_ROUTER: u16 = 0x2004;
+    /// AS-External-LSA.
+    pub const AS_EXTERNAL: u16 = 0x4005;
+    /// NSSA-LSA (RFC 3101). It has the AS-External-LSA's format.
+    pub const NSSA: u16 = 0x2007;
+    /// Link-LSA: a router's link-local address and prefixes on one link.
+    pub const LINK: u16 = 0x0008;
+    /// Intra-Area-Prefix-LSA: the prefixes of a router or transit network.
+    pub const INTRA_AREA_PREFIX: u16 = 0x2009;
+}
+
+/// The OSPF version: 2 for IPv4, 3 for IPv6.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Version {
+    /// OSPFv2, RFC 2328.
+    V2,
+    /// OSPFv3, RFC 5340.
+    V3,
+}
+
+impl Version {
+    /// The version number in the header.
+    pub fn number(self) -> u8 {
+        match self {
+            Version::V2 => 2,
+            Version::V3 => 3,
+        }
+    }
+
+    /// The length of this version's packet header.
+    pub fn header_len(self) -> usize {
+        match self {
+            Version::V2 => HEADER_LEN_V2,
+            Version::V3 => HEADER_LEN_V3,
+        }
+    }
+}
+
+/// The IP source and destination of the packet that carries an OSPF
+/// payload. An IPv4 packet carries OSPFv2 and an IPv6 packet carries
+/// OSPFv3. OSPFv3 checksums cover the IPv6 addresses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Endpoints {
+    /// An IPv4 packet.
+    V4 {
+        /// The sending router's address on the link.
+        source: Ipv4Addr,
+        /// A neighbor or one of the OSPF groups.
+        destination: Ipv4Addr,
+    },
+    /// An IPv6 packet.
+    V6 {
+        /// The sending router's link-local address.
+        source: Ipv6Addr,
+        /// A neighbor or one of the OSPF groups.
+        destination: Ipv6Addr,
+    },
+}
+
+impl Endpoints {
+    /// The OSPF version this IP family carries.
+    pub fn version(&self) -> Version {
+        match self {
+            Endpoints::V4 { .. } => Version::V2,
+            Endpoints::V6 { .. } => Version::V3,
+        }
+    }
+}
+
+/// OSPFv2 authentication, from the header's type and 8-byte field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Auth {
+    /// Type 0. The field is ignored when read and written as zero.
+    Null,
+    /// Type 1: an 8-byte password, padded with zeros.
+    Simple([u8; 8]),
+    /// Type 2. The packet checksum is not computed: it is written as zero
+    /// and not checked. The digest follows the packet, and its length is
+    /// in the field. This module does not compute or check the digest.
+    Cryptographic {
+        /// Which shared key made the digest.
+        key_id: u8,
+        /// A number the sender never lets go down, against replays.
+        sequence: u32,
+        /// The digest, at most [`MAX_DIGEST`] bytes.
+        digest: Vec<u8>,
+    },
+    /// Any other type, with its field kept as it was.
+    Other {
+        /// The type, not 0, 1 or 2.
+        kind: u16,
+        /// The 8-byte field.
+        data: [u8; 8],
+    },
+}
+
+impl Auth {
+    /// The authentication type number.
+    pub fn kind(&self) -> u16 {
+        match self {
+            Auth::Null => auth_type::NULL,
+            Auth::Simple(_) => auth_type::SIMPLE,
+            Auth::Cryptographic { .. } => auth_type::CRYPTOGRAPHIC,
+            Auth::Other { kind, .. } => *kind,
+        }
+    }
+}
+
+/// The header fields that differ between the versions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Header {
+    /// OSPFv2: the authentication.
+    V2 {
+        /// How the packet is authenticated.
+        auth: Auth,
+    },
+    /// OSPFv3: the instance ID, which lets several OSPF instances share a
+    /// link.
+    V3 {
+        /// The instance ID.
+        instance_id: u8,
+    },
+}
+
+/// One OSPF packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Packet {
+    /// The sending router's ID.
+    pub router_id: Ipv4Addr,
+    /// The area the packet belongs to. The backbone is 0.0.0.0.
+    pub area_id: Ipv4Addr,
+    /// The fields that differ between the versions.
+    pub header: Header,
+    /// What the packet carries. Its variant gives the packet type.
+    pub body: Body,
+}
+
+/// What a packet carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Body {
+    /// Type 1 in OSPFv2.
+    HelloV2(HelloV2),
+    /// Type 1 in OSPFv3.
+    HelloV3(HelloV3),
+    /// Type 2.
+    DatabaseDescription(DatabaseDescription),
+    /// Type 3: the LSAs asked for.
+    LinkStateRequest(Vec<LsaKey>),
+    /// Type 4: the LSAs sent.
+    LinkStateUpdate(Vec<Lsa>),
+    /// Type 5: the headers of the LSAs acknowledged.
+    LinkStateAck(Vec<LsaHeader>),
+}
+
+impl Body {
+    /// The packet type number.
+    pub fn packet_type(&self) -> u8 {
+        match self {
+            Body::HelloV2(_) | Body::HelloV3(_) => packet_type::HELLO,
+            Body::DatabaseDescription(_) => packet_type::DATABASE_DESCRIPTION,
+            Body::LinkStateRequest(_) => packet_type::LINK_STATE_REQUEST,
+            Body::LinkStateUpdate(_) => packet_type::LINK_STATE_UPDATE,
+            Body::LinkStateAck(_) => packet_type::LINK_STATE_ACK,
+        }
+    }
+}
+
+/// An OSPFv2 Hello.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelloV2 {
+    /// The network mask of the sending interface.
+    pub network_mask: Ipv4Addr,
+    /// Seconds between Hellos.
+    pub hello_interval: u16,
+    /// The options the router supports.
+    pub options: u8,
+    /// The router's priority in the designated router election. 0 means
+    /// it never stands.
+    pub priority: u8,
+    /// Seconds of silence after which a neighbor is taken as down.
+    pub dead_interval: u32,
+    /// The designated router's interface address, or 0.0.0.0.
+    pub designated_router: Ipv4Addr,
+    /// The backup designated router's interface address, or 0.0.0.0.
+    pub backup_designated_router: Ipv4Addr,
+    /// The router IDs heard on the link recently.
+    pub neighbors: Vec<Ipv4Addr>,
+}
+
+/// An OSPFv3 Hello.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelloV3 {
+    /// A number that names the sending interface within its router.
+    pub interface_id: u32,
+    /// The router's priority in the designated router election.
+    pub priority: u8,
+    /// The options the router supports, at most [`MAX_U24`].
+    pub options: u32,
+    /// Seconds between Hellos.
+    pub hello_interval: u16,
+    /// Seconds of silence after which a neighbor is taken as down.
+    pub dead_interval: u16,
+    /// The designated router's router ID, or 0.0.0.0.
+    pub designated_router: Ipv4Addr,
+    /// The backup designated router's router ID, or 0.0.0.0.
+    pub backup_designated_router: Ipv4Addr,
+    /// The router IDs heard on the link recently.
+    pub neighbors: Vec<Ipv4Addr>,
+}
+
+/// A Database Description packet, in either version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DatabaseDescription {
+    /// The largest IP packet the interface sends without fragmenting.
+    pub mtu: u16,
+    /// The options the router supports: at most 0xff in OSPFv2 and
+    /// [`MAX_U24`] in OSPFv3.
+    pub options: u32,
+    /// The flags byte; see [`dd_flags`].
+    pub flags: u8,
+    /// The exchange's sequence number, set by the master.
+    pub sequence: u32,
+    /// Headers of the LSAs the sender holds.
+    pub headers: Vec<LsaHeader>,
+}
+
+/// Which LSA a Link State Request asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LsaKey {
+    /// The LS type. It is 32 bits in OSPFv2 and at most 0xffff in OSPFv3.
+    pub ls_type: u32,
+    /// The Link State ID.
+    pub link_state_id: Ipv4Addr,
+    /// The router that made the LSA.
+    pub advertising_router: Ipv4Addr,
+}
+
+/// An LSA header, as Database Description and Link State Acknowledgment
+/// packets carry it. Its checksum and length describe an LSA and are kept
+/// as sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LsaHeader {
+    /// Seconds since the LSA was made.
+    pub age: u16,
+    /// OSPFv2 options. OSPFv3 headers have none, so this must be 0 there.
+    pub options: u8,
+    /// The LS type: at most 0xff in OSPFv2, which gives it one byte.
+    pub ls_type: u16,
+    /// The Link State ID.
+    pub link_state_id: Ipv4Addr,
+    /// The router that made the LSA.
+    pub advertising_router: Ipv4Addr,
+    /// The instance's sequence number.
+    pub sequence: u32,
+    /// The LSA's Fletcher checksum.
+    pub checksum: u16,
+    /// The LSA's length, header included.
+    pub length: u16,
+}
+
+impl LsaHeader {
+    /// Which LSA this header names, as a Link State Request asks for it.
+    pub fn key(&self) -> LsaKey {
+        LsaKey {
+            ls_type: u32::from(self.ls_type),
+            link_state_id: self.link_state_id,
+            advertising_router: self.advertising_router,
+        }
+    }
+}
+
+/// A whole LSA. Its checksum and length are worked out when it is written
+/// and checked when it is read, so they are not kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lsa {
+    /// Seconds since the LSA was made.
+    pub age: u16,
+    /// OSPFv2 options. OSPFv3 LSA headers have none, so this must be 0
+    /// there.
+    pub options: u8,
+    /// The LS type: at most 0xff in OSPFv2.
+    pub ls_type: u16,
+    /// The Link State ID.
+    pub link_state_id: Ipv4Addr,
+    /// The router that made the LSA.
+    pub advertising_router: Ipv4Addr,
+    /// The instance's sequence number.
+    pub sequence: u32,
+    /// The body. Its variant must be the one the version and LS type call
+    /// for, or [`LsaBody::Other`] for a type this module does not read.
+    pub body: LsaBody,
+}
+
+/// The body of an LSA, by type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LsaBody {
+    /// OSPFv2 type 1.
+    Router(RouterLsa),
+    /// OSPFv2 type 2.
+    Network(NetworkLsa),
+    /// OSPFv2 types 3 and 4.
+    Summary(SummaryLsa),
+    /// OSPFv2 types 5 and 7.
+    AsExternal(AsExternalLsa),
+    /// OSPFv3 type 0x2001.
+    RouterV3(RouterLsaV3),
+    /// OSPFv3 type 0x2002.
+    NetworkV3(NetworkLsaV3),
+    /// OSPFv3 type 0x2003.
+    InterAreaPrefix(InterAreaPrefixLsa),
+    /// OSPFv3 type 0x2004.
+    InterAreaRouter(InterAreaRouterLsa),
+    /// OSPFv3 types 0x4005 and 0x2007.
+    AsExternalV3(AsExternalLsaV3),
+    /// OSPFv3 type 0x0008.
+    Link(LinkLsa),
+    /// OSPFv3 type 0x2009.
+    IntraAreaPrefix(IntraAreaPrefixLsa),
+    /// Any other type, with its body unread.
+    Other(Vec<u8>),
+}
+
+/// An OSPFv2 Router-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterLsa {
+    /// The flags byte: 0x04 virtual link endpoint (V), 0x02 AS boundary
+    /// router (E), 0x01 area border router (B).
+    pub flags: u8,
+    /// The router's links, at most 65535.
+    pub links: Vec<RouterLink>,
+}
+
+/// One link of an OSPFv2 Router-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterLink {
+    /// What the link connects to; its meaning depends on `kind`.
+    pub id: Ipv4Addr,
+    /// More about the link; its meaning depends on `kind`.
+    pub data: Ipv4Addr,
+    /// 1 point-to-point, 2 transit network, 3 stub network, 4 virtual link.
+    pub kind: u8,
+    /// The cost of sending over the link.
+    pub metric: u16,
+    /// Costs for other types of service, at most 255. Most routers send
+    /// none.
+    pub tos: Vec<TosMetric>,
+}
+
+/// A cost for one type of service, in an OSPFv2 Router-LSA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TosMetric {
+    /// The type of service.
+    pub tos: u8,
+    /// Its cost.
+    pub metric: u16,
+}
+
+/// An OSPFv2 Network-LSA, made by a network's designated router.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkLsa {
+    /// The network's mask.
+    pub network_mask: Ipv4Addr,
+    /// The router IDs of the routers on the network.
+    pub attached_routers: Vec<Ipv4Addr>,
+}
+
+/// An OSPFv2 Summary-LSA, made by an area border router.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SummaryLsa {
+    /// The destination's mask. Type 4 LSAs set it to 0.0.0.0.
+    pub network_mask: Ipv4Addr,
+    /// The cost to the destination, at most [`MAX_U24`].
+    pub metric: u32,
+    /// Costs for other types of service, each at most [`MAX_U24`].
+    pub tos: Vec<(u8, u32)>,
+}
+
+/// An OSPFv2 AS-external-LSA or NSSA-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsExternalLsa {
+    /// The destination's mask.
+    pub network_mask: Ipv4Addr,
+    /// One route per type of service. There is at least one, and the
+    /// first is for type of service 0.
+    pub routes: Vec<ExternalRoute>,
+}
+
+/// One route of an OSPFv2 AS-external-LSA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ExternalRoute {
+    /// The E bit: the metric is of type 2, larger than any internal cost.
+    pub type2: bool,
+    /// The type of service, at most 127.
+    pub tos: u8,
+    /// The cost, at most [`MAX_U24`].
+    pub metric: u32,
+    /// Where to send the traffic, or 0.0.0.0 for the advertising router.
+    pub forwarding_address: Ipv4Addr,
+    /// A tag routers pass along unread.
+    pub route_tag: u32,
+}
+
+/// An OSPFv3 Router-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RouterLsaV3 {
+    /// The flags byte: 0x10 NSSA translator (Nt), 0x04 V, 0x02 E, 0x01 B.
+    pub flags: u8,
+    /// The options, at most [`MAX_U24`].
+    pub options: u32,
+    /// The router's interfaces.
+    pub interfaces: Vec<RouterInterface>,
+}
+
+/// One interface of an OSPFv3 Router-LSA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RouterInterface {
+    /// 1 point-to-point, 2 transit network, 4 virtual link.
+    pub kind: u8,
+    /// The cost of sending over the interface.
+    pub metric: u16,
+    /// The interface's ID.
+    pub interface_id: u32,
+    /// The neighbor's interface ID, or the designated router's on a
+    /// transit network.
+    pub neighbor_interface_id: u32,
+    /// The neighbor's router ID, or the designated router's.
+    pub neighbor_router_id: Ipv4Addr,
+}
+
+/// An OSPFv3 Network-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetworkLsaV3 {
+    /// The options, at most [`MAX_U24`].
+    pub options: u32,
+    /// The router IDs of the routers on the network.
+    pub attached_routers: Vec<Ipv4Addr>,
+}
+
+/// An IPv6 prefix as OSPFv3 carries it: only the 32-bit words the length
+/// needs are sent. Bits of `address` past those words are not written, and
+/// read as zero. Build one with [`Prefix::new`] to clear them, so the
+/// prefix reads back equal to the one written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Prefix {
+    /// The prefix length in bits, at most [`MAX_PREFIX_LEN`].
+    pub length: u8,
+    /// The prefix options: 0x01 NU, 0x02 LA, 0x08 P, 0x10 DN.
+    pub options: u8,
+    /// The prefix.
+    pub address: Ipv6Addr,
+}
+
+impl Prefix {
+    /// A prefix of `length` bits with every bit of `address` past the
+    /// length cleared. For example, 2001:db8::1 with length 64 gives
+    /// 2001:db8::. A length over [`MAX_PREFIX_LEN`] is kept as it is, and
+    /// writers reject it.
+    pub fn new(length: u8, options: u8, address: Ipv6Addr) -> Prefix {
+        let bits = u32::from(length.min(MAX_PREFIX_LEN));
+        let mask = if bits == 0 { 0 } else { u128::MAX << (128 - bits) };
+        Prefix { length, options, address: Ipv6Addr::from(u128::from(address) & mask) }
+    }
+}
+
+/// An OSPFv3 Inter-Area-Prefix-LSA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InterAreaPrefixLsa {
+    /// The cost to the prefix, at most [`MAX_U24`].
+    pub metric: u32,
+    /// The prefix.
+    pub prefix: Prefix,
+}
+
+/// An OSPFv3 Inter-Area-Router-LSA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct InterAreaRouterLsa {
+    /// The destination router's options, at most [`MAX_U24`].
+    pub options: u32,
+    /// The cost to it, at most [`MAX_U24`].
+    pub metric: u32,
+    /// Its router ID.
+    pub destination: Ipv4Addr,
+}
+
+/// An OSPFv3 AS-External-LSA or NSSA-LSA. Its F and T flags are set when
+/// the forwarding address and the tag are present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AsExternalLsaV3 {
+    /// The E flag: the metric is of type 2.
+    pub type2: bool,
+    /// The cost, at most [`MAX_U24`].
+    pub metric: u32,
+    /// The prefix.
+    pub prefix: Prefix,
+    /// Where to send the traffic, if not to the advertising router.
+    pub forwarding_address: Option<Ipv6Addr>,
+    /// A tag routers pass along unread.
+    pub route_tag: Option<u32>,
+    /// Another LSA with more about the route: its nonzero LS type and its
+    /// Link State ID.
+    pub referenced: Option<(u16, Ipv4Addr)>,
+}
+
+/// An OSPFv3 Link-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LinkLsa {
+    /// The router's priority on the link.
+    pub priority: u8,
+    /// The options, at most [`MAX_U24`].
+    pub options: u32,
+    /// The router's link-local address on the link.
+    pub link_local_address: Ipv6Addr,
+    /// The prefixes on the link.
+    pub prefixes: Vec<Prefix>,
+}
+
+/// An OSPFv3 Intra-Area-Prefix-LSA.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IntraAreaPrefixLsa {
+    /// The LS type of the Router-LSA or Network-LSA the prefixes belong to.
+    pub referenced_ls_type: u16,
+    /// Its Link State ID.
+    pub referenced_link_state_id: Ipv4Addr,
+    /// Its advertising router.
+    pub referenced_advertising_router: Ipv4Addr,
+    /// The prefixes and their costs, at most 65535.
+    pub prefixes: Vec<(Prefix, u16)>,
+}
+
+/// Why bytes are not an OSPF packet or LSA, or why a value cannot be
+/// written as one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OspfError {
+    /// The bytes end before the packet or LSA does.
+    Truncated,
+    /// Bytes follow the end the length gives.
+    Trailing,
+    /// The version is not 2 or 3.
+    Version(u8),
+    /// The version does not match the IP family: OSPFv2 over IPv6 or
+    /// OSPFv3 over IPv4.
+    Family,
+    /// The packet type is not 1 to 5.
+    Type(u8),
+    /// The packet length is shorter than the header.
+    Length(u16),
+    /// The packet checksum is wrong.
+    Checksum,
+    /// The packet body does not fit its type: fixed fields are missing or
+    /// a list does not divide evenly.
+    BodyLength,
+    /// An LSA's length is shorter than its header or longer than the bytes
+    /// left.
+    LsaLength(u16),
+    /// An LSA's Fletcher checksum is wrong.
+    LsaChecksum,
+    /// A Link State Update's LSA count does not match the LSAs it holds.
+    LsaCount,
+    /// An LSA body does not fit its type.
+    LsaBody,
+    /// A prefix length is over [`MAX_PREFIX_LEN`].
+    PrefixLength(u8),
+    /// The packet or LSA would be longer than its length field allows.
+    TooLong,
+    /// A field is out of range for what holds it, such as an OSPFv3
+    /// option above [`MAX_U24`].
+    Field,
+    /// The body does not match the version or LS type.
+    Mismatch,
+}
+
+impl std::fmt::Display for OspfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OspfError::Truncated => f.write_str("OSPF packet or LSA cut short"),
+            OspfError::Trailing => f.write_str("bytes after the end of the OSPF packet"),
+            OspfError::Version(v) => write!(f, "OSPF version {v}, not 2 or 3"),
+            OspfError::Family => f.write_str("OSPF version does not match the IP family"),
+            OspfError::Type(t) => write!(f, "OSPF packet type {t}, not 1 to 5"),
+            OspfError::Length(n) => write!(f, "OSPF packet length {n}, shorter than the header"),
+            OspfError::Checksum => f.write_str("wrong OSPF packet checksum"),
+            OspfError::BodyLength => f.write_str("OSPF packet body does not fit its type"),
+            OspfError::LsaLength(n) => write!(f, "LSA length {n} does not fit"),
+            OspfError::LsaChecksum => f.write_str("wrong LSA checksum"),
+            OspfError::LsaCount => f.write_str("LSA count does not match the LSAs sent"),
+            OspfError::LsaBody => f.write_str("LSA body does not fit its type"),
+            OspfError::PrefixLength(n) => write!(f, "prefix length {n}, over 128"),
+            OspfError::TooLong => f.write_str("too long for its length field"),
+            OspfError::Field => f.write_str("field out of range"),
+            OspfError::Mismatch => f.write_str("body does not match the version or LS type"),
+        }
+    }
+}
+
+impl std::error::Error for OspfError {}
+
+// Checksums.
+
+fn sum_words(mut sum: u64, b: &[u8]) -> u64 {
+    let mut chunks = b.chunks_exact(2);
+    for c in &mut chunks {
+        sum += u64::from(u16::from_be_bytes([c[0], c[1]]));
+    }
+    if let [last] = chunks.remainder() {
+        sum += u64::from(*last) << 8;
+    }
+    sum
+}
+
+fn fold(mut sum: u64) -> u16 {
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    sum as u16
+}
+
+/// The packet checksum the OSPF payload in `b` should carry, worked out
+/// with its checksum field (bytes 12 and 13) taken as zero, over the bytes
+/// the packet length gives. For OSPFv2 (IPv4 endpoints) it skips the
+/// 8-byte authentication field. For OSPFv3 (IPv6 endpoints) it includes
+/// the IPv6 pseudo-header of RFC 8200 section 8.1. It returns `None` if
+/// `b` is shorter than the header, or the length field is shorter than the
+/// header or longer than `b`. A packet with cryptographic authentication
+/// carries zero instead.
+pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
+    let hl = endpoints.version().header_len();
+    if b.len() < hl {
+        return None;
+    }
+    let len = usize::from(be16(b, 2));
+    if len < hl || len > b.len() {
+        return None;
+    }
+    let mut sum = sum_words(0, &b[..12]);
+    match endpoints {
+        Endpoints::V4 { .. } => {
+            sum = sum_words(sum, &b[14..16]);
+            sum = sum_words(sum, &b[HEADER_LEN_V2..len]);
+        }
+        Endpoints::V6 { source, destination } => {
+            sum = sum_words(sum, &b[14..len]);
+            sum = sum_words(sum, &source.octets());
+            sum = sum_words(sum, &destination.octets());
+            // At most MAX_PACKET, so it fits in 32 bits.
+            sum = sum_words(sum, &(len as u32).to_be_bytes());
+            sum = sum_words(sum, &[0, 0, 0, PROTOCOL]);
+        }
+    }
+    Some(!fold(sum))
+}
+
+/// Whether two ones' complement checksums are equal: 0x0000 and 0xffff
+/// are both zero.
+fn same_checksum(a: u16, b: u16) -> bool {
+    a == b || (a | b == 0xffff && (a == 0 || b == 0))
+}
+
+/// The Fletcher sums of `data` modulo 255, with the bytes at `skip` and
+/// `skip + 1` taken as zero.
+fn fletcher_sums(data: &[u8], skip: Option<usize>) -> (i64, i64) {
+    let (mut c0, mut c1) = (0i64, 0i64);
+    for (i, &byte) in data.iter().enumerate() {
+        let byte = match skip {
+            Some(s) if i == s || i == s + 1 => 0,
+            _ => byte,
+        };
+        c0 = (c0 + i64::from(byte)) % 255;
+        c1 = (c1 + c0) % 255;
+    }
+    (c0, c1)
+}
+
+/// The Fletcher checksum the LSA at the start of `lsa` should carry
+/// (RFC 2328 section 12.1.7, using RFC 905 annex B). It covers the LSA from
+/// the byte after the age to the end its length field gives, with the
+/// checksum field (bytes 16 and 17) taken as zero. Neither byte of the
+/// result is ever zero. It returns `None` if `lsa` is shorter than an LSA
+/// header, or the length field is shorter than the header or longer than
+/// `lsa`.
+pub fn lsa_checksum(lsa: &[u8]) -> Option<u16> {
+    let data = lsa_data(lsa)?;
+    // The checksum's first byte is at offset 14 of the data, position 15
+    // counting from 1.
+    let (c0, c1) = fletcher_sums(data, Some(14));
+    // At most MAX_LSA, so this cannot overflow.
+    let after = data.len() as i64 - 15;
+    let mut x = (after * c0 - c1).rem_euclid(255);
+    let mut y = (c1 - (after + 1) * c0).rem_euclid(255);
+    if x == 0 {
+        x = 255;
+    }
+    if y == 0 {
+        y = 255;
+    }
+    Some(((x as u16) << 8) | y as u16)
+}
+
+/// Whether the LSA at the start of `lsa` carries a right Fletcher
+/// checksum: both sums over the checked bytes are zero modulo 255, and the
+/// field is not zero, which means no checksum.
+pub fn lsa_checksum_ok(lsa: &[u8]) -> bool {
+    match lsa_data(lsa) {
+        Some(data) => be16(lsa, 16) != 0 && fletcher_sums(data, None) == (0, 0),
+        None => false,
+    }
+}
+
+fn lsa_data(lsa: &[u8]) -> Option<&[u8]> {
+    if lsa.len() < LSA_HEADER_LEN {
+        return None;
+    }
+    let len = usize::from(be16(lsa, 18));
+    if !(LSA_HEADER_LEN..=lsa.len()).contains(&len) {
+        return None;
+    }
+    Some(&lsa[2..len])
+}
+
+// Reading.
+
+/// A cursor over bytes that gives `err` when they run out.
+struct Rd<'a> {
+    b: &'a [u8],
+    pos: usize,
+    err: OspfError,
+}
+
+impl<'a> Rd<'a> {
+    fn new(b: &'a [u8], err: OspfError) -> Rd<'a> {
+        Rd { b, pos: 0, err }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], OspfError> {
+        let end = self.pos.checked_add(n).ok_or(self.err)?;
+        let s = self.b.get(self.pos..end).ok_or(self.err)?;
+        self.pos = end;
+        Ok(s)
+    }
+
+    fn u8(&mut self) -> Result<u8, OspfError> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, OspfError> {
+        let s = self.take(2)?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+
+    fn u24(&mut self) -> Result<u32, OspfError> {
+        let s = self.take(3)?;
+        Ok(u32::from_be_bytes([0, s[0], s[1], s[2]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, OspfError> {
+        let s = self.take(4)?;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn ip4(&mut self) -> Result<Ipv4Addr, OspfError> {
+        Ok(Ipv4Addr::from(self.u32()?))
+    }
+
+    fn ip6(&mut self) -> Result<Ipv6Addr, OspfError> {
+        let s = self.take(16)?;
+        let mut a = [0u8; 16];
+        a.copy_from_slice(s);
+        Ok(Ipv6Addr::from(a))
+    }
+
+    fn left(&self) -> usize {
+        self.b.len() - self.pos
+    }
+
+    fn end(&self) -> Result<(), OspfError> {
+        if self.left() == 0 { Ok(()) } else { Err(self.err) }
+    }
+
+    /// The rest as addresses, which must divide evenly.
+    fn ip4_list(&mut self) -> Result<Vec<Ipv4Addr>, OspfError> {
+        if !self.left().is_multiple_of(4) {
+            return Err(self.err);
+        }
+        let mut out = Vec::with_capacity(self.left() / 4);
+        while self.left() > 0 {
+            out.push(self.ip4()?);
+        }
+        Ok(out)
+    }
+
+    /// The rest as LSA headers, which must divide evenly.
+    fn header_list(&mut self, v: Version) -> Result<Vec<LsaHeader>, OspfError> {
+        if !self.left().is_multiple_of(LSA_HEADER_LEN) {
+            return Err(self.err);
+        }
+        let mut out = Vec::with_capacity(self.left() / LSA_HEADER_LEN);
+        while self.left() > 0 {
+            out.push(read_lsa_header(self, v)?);
+        }
+        Ok(out)
+    }
+}
+
+fn read_lsa_header(r: &mut Rd, v: Version) -> Result<LsaHeader, OspfError> {
+    let age = r.u16()?;
+    let (options, ls_type) = match v {
+        Version::V2 => (r.u8()?, u16::from(r.u8()?)),
+        Version::V3 => (0, r.u16()?),
+    };
+    Ok(LsaHeader {
+        age,
+        options,
+        ls_type,
+        link_state_id: r.ip4()?,
+        advertising_router: r.ip4()?,
+        sequence: r.u32()?,
+        checksum: r.u16()?,
+        length: r.u16()?,
+    })
+}
+
+fn prefix_bytes(length: u8) -> usize {
+    usize::from(length).div_ceil(32) * 4
+}
+
+/// A prefix and the 16-bit field between its options and its address.
+fn read_prefix(r: &mut Rd) -> Result<(Prefix, u16), OspfError> {
+    let length = r.u8()?;
+    let options = r.u8()?;
+    let middle = r.u16()?;
+    if length > MAX_PREFIX_LEN {
+        return Err(OspfError::PrefixLength(length));
+    }
+    let raw = r.take(prefix_bytes(length))?;
+    let mut a = [0u8; 16];
+    a[..raw.len()].copy_from_slice(raw);
+    Ok((Prefix { length, options, address: Ipv6Addr::from(a) }, middle))
+}
+
+/// Which body an LSA of a version and type has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Router,
+    Network,
+    Summary,
+    AsExternal,
+    RouterV3,
+    NetworkV3,
+    InterAreaPrefix,
+    InterAreaRouter,
+    AsExternalV3,
+    Link,
+    IntraAreaPrefix,
+    Other,
+}
+
+fn kind_for(v: Version, t: u16) -> Kind {
+    match (v, t) {
+        (Version::V2, lsa_type_v2::ROUTER) => Kind::Router,
+        (Version::V2, lsa_type_v2::NETWORK) => Kind::Network,
+        (Version::V2, lsa_type_v2::SUMMARY_NETWORK | lsa_type_v2::SUMMARY_ASBR) => Kind::Summary,
+        (Version::V2, lsa_type_v2::AS_EXTERNAL | lsa_type_v2::NSSA) => Kind::AsExternal,
+        (Version::V3, lsa_type_v3::ROUTER) => Kind::RouterV3,
+        (Version::V3, lsa_type_v3::NETWORK) => Kind::NetworkV3,
+        (Version::V3, lsa_type_v3::INTER_AREA_PREFIX) => Kind::InterAreaPrefix,
+        (Version::V3, lsa_type_v3::INTER_AREA_ROUTER) => Kind::InterAreaRouter,
+        (Version::V3, lsa_type_v3::AS_EXTERNAL | lsa_type_v3::NSSA) => Kind::AsExternalV3,
+        (Version::V3, lsa_type_v3::LINK) => Kind::Link,
+        (Version::V3, lsa_type_v3::INTRA_AREA_PREFIX) => Kind::IntraAreaPrefix,
+        _ => Kind::Other,
+    }
+}
+
+impl LsaBody {
+    fn kind(&self) -> Kind {
+        match self {
+            LsaBody::Router(_) => Kind::Router,
+            LsaBody::Network(_) => Kind::Network,
+            LsaBody::Summary(_) => Kind::Summary,
+            LsaBody::AsExternal(_) => Kind::AsExternal,
+            LsaBody::RouterV3(_) => Kind::RouterV3,
+            LsaBody::NetworkV3(_) => Kind::NetworkV3,
+            LsaBody::InterAreaPrefix(_) => Kind::InterAreaPrefix,
+            LsaBody::InterAreaRouter(_) => Kind::InterAreaRouter,
+            LsaBody::AsExternalV3(_) => Kind::AsExternalV3,
+            LsaBody::Link(_) => Kind::Link,
+            LsaBody::IntraAreaPrefix(_) => Kind::IntraAreaPrefix,
+            LsaBody::Other(_) => Kind::Other,
+        }
+    }
+
+    /// Reads the body of an LSA of version `v` and LS type `ls_type`. The
+    /// body must fill `b` exactly.
+    pub fn parse(b: &[u8], v: Version, ls_type: u16) -> Result<LsaBody, OspfError> {
+        let r = &mut Rd::new(b, OspfError::LsaBody);
+        let body = match kind_for(v, ls_type) {
+            Kind::Router => {
+                let flags = r.u8()?;
+                r.u8()?;
+                let count = r.u16()?;
+                let mut links = Vec::new();
+                for _ in 0..count {
+                    let id = r.ip4()?;
+                    let data = r.ip4()?;
+                    let kind = r.u8()?;
+                    let n = r.u8()?;
+                    let metric = r.u16()?;
+                    let mut tos = Vec::new();
+                    for _ in 0..n {
+                        let t = r.u8()?;
+                        r.u8()?;
+                        tos.push(TosMetric { tos: t, metric: r.u16()? });
+                    }
+                    links.push(RouterLink { id, data, kind, metric, tos });
+                }
+                LsaBody::Router(RouterLsa { flags, links })
+            }
+            Kind::Network => LsaBody::Network(NetworkLsa { network_mask: r.ip4()?, attached_routers: r.ip4_list()? }),
+            Kind::Summary => {
+                let network_mask = r.ip4()?;
+                r.u8()?;
+                let metric = r.u24()?;
+                if !r.left().is_multiple_of(4) {
+                    return Err(OspfError::LsaBody);
+                }
+                let mut tos = Vec::with_capacity(r.left() / 4);
+                while r.left() > 0 {
+                    tos.push((r.u8()?, r.u24()?));
+                }
+                LsaBody::Summary(SummaryLsa { network_mask, metric, tos })
+            }
+            Kind::AsExternal => {
+                let network_mask = r.ip4()?;
+                if !r.left().is_multiple_of(12) {
+                    return Err(OspfError::LsaBody);
+                }
+                let mut routes = Vec::with_capacity(r.left() / 12);
+                while r.left() > 0 {
+                    let e = r.u8()?;
+                    routes.push(ExternalRoute {
+                        type2: e & 0x80 != 0,
+                        tos: e & 0x7f,
+                        metric: r.u24()?,
+                        forwarding_address: r.ip4()?,
+                        route_tag: r.u32()?,
+                    });
+                }
+                // The TOS 0 route always comes first (RFC 2328 A.4.5).
+                if routes.first().map(|x| x.tos) != Some(0) {
+                    return Err(OspfError::LsaBody);
+                }
+                LsaBody::AsExternal(AsExternalLsa { network_mask, routes })
+            }
+            Kind::RouterV3 => {
+                let flags = r.u8()?;
+                let options = r.u24()?;
+                if !r.left().is_multiple_of(16) {
+                    return Err(OspfError::LsaBody);
+                }
+                let mut interfaces = Vec::with_capacity(r.left() / 16);
+                while r.left() > 0 {
+                    let kind = r.u8()?;
+                    r.u8()?;
+                    interfaces.push(RouterInterface {
+                        kind,
+                        metric: r.u16()?,
+                        interface_id: r.u32()?,
+                        neighbor_interface_id: r.u32()?,
+                        neighbor_router_id: r.ip4()?,
+                    });
+                }
+                LsaBody::RouterV3(RouterLsaV3 { flags, options, interfaces })
+            }
+            Kind::NetworkV3 => {
+                r.u8()?;
+                LsaBody::NetworkV3(NetworkLsaV3 { options: r.u24()?, attached_routers: r.ip4_list()? })
+            }
+            Kind::InterAreaPrefix => {
+                r.u8()?;
+                let metric = r.u24()?;
+                let (prefix, _) = read_prefix(r)?;
+                LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric, prefix })
+            }
+            Kind::InterAreaRouter => {
+                r.u8()?;
+                let options = r.u24()?;
+                r.u8()?;
+                let metric = r.u24()?;
+                LsaBody::InterAreaRouter(InterAreaRouterLsa { options, metric, destination: r.ip4()? })
+            }
+            Kind::AsExternalV3 => {
+                let flags = r.u8()?;
+                let metric = r.u24()?;
+                let (prefix, referenced_type) = read_prefix(r)?;
+                let forwarding_address = if flags & 0x02 != 0 { Some(r.ip6()?) } else { None };
+                let route_tag = if flags & 0x01 != 0 { Some(r.u32()?) } else { None };
+                let referenced = if referenced_type != 0 { Some((referenced_type, r.ip4()?)) } else { None };
+                LsaBody::AsExternalV3(AsExternalLsaV3 {
+                    type2: flags & 0x04 != 0,
+                    metric,
+                    prefix,
+                    forwarding_address,
+                    route_tag,
+                    referenced,
+                })
+            }
+            Kind::Link => {
+                let priority = r.u8()?;
+                let options = r.u24()?;
+                let link_local_address = r.ip6()?;
+                let count = r.u32()?;
+                // Each prefix takes at least 4 bytes, so this loop stops
+                // within the body's length.
+                let mut prefixes = Vec::new();
+                for _ in 0..count {
+                    prefixes.push(read_prefix(r)?.0);
+                }
+                LsaBody::Link(LinkLsa { priority, options, link_local_address, prefixes })
+            }
+            Kind::IntraAreaPrefix => {
+                let count = r.u16()?;
+                let referenced_ls_type = r.u16()?;
+                let referenced_link_state_id = r.ip4()?;
+                let referenced_advertising_router = r.ip4()?;
+                let mut prefixes = Vec::new();
+                for _ in 0..count {
+                    prefixes.push(read_prefix(r)?);
+                }
+                LsaBody::IntraAreaPrefix(IntraAreaPrefixLsa {
+                    referenced_ls_type,
+                    referenced_link_state_id,
+                    referenced_advertising_router,
+                    prefixes,
+                })
+            }
+            Kind::Other => {
+                r.pos = b.len();
+                LsaBody::Other(b.to_vec())
+            }
+        };
+        r.end()?;
+        Ok(body)
+    }
+
+    /// The body's bytes, for an LSA of version `v` and LS type `ls_type`.
+    /// It fails with [`OspfError::Mismatch`] if the variant is not the one
+    /// they call for, [`OspfError::Field`] if a value does not fit its
+    /// field, and [`OspfError::TooLong`] past what an LSA can hold.
+    pub fn to_bytes(&self, v: Version, ls_type: u16) -> Result<Vec<u8>, OspfError> {
+        if self.kind() != kind_for(v, ls_type) {
+            return Err(OspfError::Mismatch);
+        }
+        let room = MAX_LSA - LSA_HEADER_LEN;
+        let mut out = Vec::new();
+        match self {
+            LsaBody::Router(l) => {
+                let count = u16::try_from(l.links.len()).map_err(|_| OspfError::Field)?;
+                out.push(l.flags);
+                out.push(0);
+                out.extend_from_slice(&count.to_be_bytes());
+                for link in &l.links {
+                    let n = u8::try_from(link.tos.len()).map_err(|_| OspfError::Field)?;
+                    out.extend_from_slice(&link.id.octets());
+                    out.extend_from_slice(&link.data.octets());
+                    out.push(link.kind);
+                    out.push(n);
+                    out.extend_from_slice(&link.metric.to_be_bytes());
+                    for t in &link.tos {
+                        out.extend_from_slice(&[t.tos, 0]);
+                        out.extend_from_slice(&t.metric.to_be_bytes());
+                    }
+                    fits(&out, room)?;
+                }
+            }
+            LsaBody::Network(n) => {
+                out.extend_from_slice(&n.network_mask.octets());
+                put_ip4s(&mut out, &n.attached_routers, room)?;
+            }
+            LsaBody::Summary(s) => {
+                out.extend_from_slice(&s.network_mask.octets());
+                out.push(0);
+                put24(&mut out, s.metric)?;
+                for &(tos, metric) in &s.tos {
+                    out.push(tos);
+                    put24(&mut out, metric)?;
+                    fits(&out, room)?;
+                }
+            }
+            LsaBody::AsExternal(e) => {
+                if e.routes.first().map(|x| x.tos) != Some(0) {
+                    return Err(OspfError::Field);
+                }
+                out.extend_from_slice(&e.network_mask.octets());
+                for route in &e.routes {
+                    if route.tos > 0x7f {
+                        return Err(OspfError::Field);
+                    }
+                    out.push(route.tos | if route.type2 { 0x80 } else { 0 });
+                    put24(&mut out, route.metric)?;
+                    out.extend_from_slice(&route.forwarding_address.octets());
+                    out.extend_from_slice(&route.route_tag.to_be_bytes());
+                    fits(&out, room)?;
+                }
+            }
+            LsaBody::RouterV3(l) => {
+                out.push(l.flags);
+                put24(&mut out, l.options)?;
+                for i in &l.interfaces {
+                    out.extend_from_slice(&[i.kind, 0]);
+                    out.extend_from_slice(&i.metric.to_be_bytes());
+                    out.extend_from_slice(&i.interface_id.to_be_bytes());
+                    out.extend_from_slice(&i.neighbor_interface_id.to_be_bytes());
+                    out.extend_from_slice(&i.neighbor_router_id.octets());
+                    fits(&out, room)?;
+                }
+            }
+            LsaBody::NetworkV3(n) => {
+                out.push(0);
+                put24(&mut out, n.options)?;
+                put_ip4s(&mut out, &n.attached_routers, room)?;
+            }
+            LsaBody::InterAreaPrefix(p) => {
+                out.push(0);
+                put24(&mut out, p.metric)?;
+                put_prefix(&mut out, &p.prefix, 0)?;
+            }
+            LsaBody::InterAreaRouter(r) => {
+                out.push(0);
+                put24(&mut out, r.options)?;
+                out.push(0);
+                put24(&mut out, r.metric)?;
+                out.extend_from_slice(&r.destination.octets());
+            }
+            LsaBody::AsExternalV3(e) => {
+                let mut flags = 0;
+                if e.type2 {
+                    flags |= 0x04;
+                }
+                if e.forwarding_address.is_some() {
+                    flags |= 0x02;
+                }
+                if e.route_tag.is_some() {
+                    flags |= 0x01;
+                }
+                let referenced_type = match e.referenced {
+                    Some((0, _)) => return Err(OspfError::Field),
+                    Some((t, _)) => t,
+                    None => 0,
+                };
+                out.push(flags);
+                put24(&mut out, e.metric)?;
+                put_prefix(&mut out, &e.prefix, referenced_type)?;
+                if let Some(a) = e.forwarding_address {
+                    out.extend_from_slice(&a.octets());
+                }
+                if let Some(t) = e.route_tag {
+                    out.extend_from_slice(&t.to_be_bytes());
+                }
+                if let Some((_, id)) = e.referenced {
+                    out.extend_from_slice(&id.octets());
+                }
+            }
+            LsaBody::Link(l) => {
+                out.push(l.priority);
+                put24(&mut out, l.options)?;
+                out.extend_from_slice(&l.link_local_address.octets());
+                let count = u32::try_from(l.prefixes.len()).map_err(|_| OspfError::TooLong)?;
+                out.extend_from_slice(&count.to_be_bytes());
+                for p in &l.prefixes {
+                    put_prefix(&mut out, p, 0)?;
+                    fits(&out, room)?;
+                }
+            }
+            LsaBody::IntraAreaPrefix(l) => {
+                let count = u16::try_from(l.prefixes.len()).map_err(|_| OspfError::Field)?;
+                out.extend_from_slice(&count.to_be_bytes());
+                out.extend_from_slice(&l.referenced_ls_type.to_be_bytes());
+                out.extend_from_slice(&l.referenced_link_state_id.octets());
+                out.extend_from_slice(&l.referenced_advertising_router.octets());
+                for (p, metric) in &l.prefixes {
+                    put_prefix(&mut out, p, *metric)?;
+                    fits(&out, room)?;
+                }
+            }
+            LsaBody::Other(data) => {
+                fits(data, room)?;
+                out.extend_from_slice(data);
+            }
+        }
+        fits(&out, room)?;
+        Ok(out)
+    }
+}
+
+impl Lsa {
+    /// Reads the LSA at the start of `b`, and returns it with its length.
+    /// The length field must fit in `b`, the Fletcher checksum must be
+    /// right, and the body must fit its type exactly. Bytes after the LSA
+    /// are left alone.
+    pub fn parse(b: &[u8], v: Version) -> Result<(Lsa, usize), OspfError> {
+        if b.len() < LSA_HEADER_LEN {
+            return Err(OspfError::Truncated);
+        }
+        let length = be16(b, 18);
+        let n = usize::from(length);
+        if !(LSA_HEADER_LEN..=b.len()).contains(&n) {
+            return Err(OspfError::LsaLength(length));
+        }
+        let b = &b[..n];
+        if !lsa_checksum_ok(b) {
+            return Err(OspfError::LsaChecksum);
+        }
+        let h = read_lsa_header(&mut Rd::new(b, OspfError::Truncated), v)?;
+        let body = LsaBody::parse(&b[LSA_HEADER_LEN..], v, h.ls_type)?;
+        let lsa = Lsa {
+            age: h.age,
+            options: h.options,
+            ls_type: h.ls_type,
+            link_state_id: h.link_state_id,
+            advertising_router: h.advertising_router,
+            sequence: h.sequence,
+            body,
+        };
+        Ok((lsa, n))
+    }
+
+    /// The LSA's bytes in version `v`, with its length and Fletcher
+    /// checksum worked out.
+    pub fn to_bytes(&self, v: Version) -> Result<Vec<u8>, OspfError> {
+        let body = self.body.to_bytes(v, self.ls_type)?;
+        let mut out = Vec::with_capacity(LSA_HEADER_LEN + body.len());
+        let header = LsaHeader {
+            age: self.age,
+            options: self.options,
+            ls_type: self.ls_type,
+            link_state_id: self.link_state_id,
+            advertising_router: self.advertising_router,
+            sequence: self.sequence,
+            checksum: 0,
+            // The body is at most MAX_LSA - LSA_HEADER_LEN bytes.
+            length: (LSA_HEADER_LEN + body.len()) as u16,
+        };
+        put_lsa_header(&mut out, &header, v)?;
+        out.extend_from_slice(&body);
+        let c = lsa_checksum(&out).ok_or(OspfError::TooLong)?;
+        out[16..18].copy_from_slice(&c.to_be_bytes());
+        Ok(out)
+    }
+
+    /// The LSA's header in version `v`, with the checksum and length its
+    /// bytes have, as an acknowledgment or a database summary carries it.
+    pub fn header(&self, v: Version) -> Result<LsaHeader, OspfError> {
+        let bytes = self.to_bytes(v)?;
+        read_lsa_header(&mut Rd::new(&bytes, OspfError::Truncated), v)
+    }
+
+    /// Which LSA this is, as a Link State Request asks for it.
+    pub fn key(&self) -> LsaKey {
+        LsaKey {
+            ls_type: u32::from(self.ls_type),
+            link_state_id: self.link_state_id,
+            advertising_router: self.advertising_router,
+        }
+    }
+}
+
+/// Checks the header fields the bytes so far hold, in the order they come.
+/// Once the length is known it returns the payload's full length, digest
+/// included. Every error it gives holds for any bytes that could follow,
+/// which lets [`Decoder`] stop early and still agree with
+/// [`Packet::parse`].
+fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, OspfError> {
+    let Some(&version) = b.first() else { return Ok(None) };
+    if version != 2 && version != 3 {
+        return Err(OspfError::Version(version));
+    }
+    let v = endpoints.version();
+    if version != v.number() {
+        return Err(OspfError::Family);
+    }
+    let Some(&t) = b.get(1) else { return Ok(None) };
+    if !(packet_type::HELLO..=packet_type::LINK_STATE_ACK).contains(&t) {
+        return Err(OspfError::Type(t));
+    }
+    if b.len() < 4 {
+        return Ok(None);
+    }
+    let length = be16(b, 2);
+    if usize::from(length) < v.header_len() {
+        return Err(OspfError::Length(length));
+    }
+    if v == Version::V3 {
+        return Ok(Some(usize::from(length)));
+    }
+    if b.len() < 16 {
+        return Ok(None);
+    }
+    if be16(b, 14) != auth_type::CRYPTOGRAPHIC {
+        return Ok(Some(usize::from(length)));
+    }
+    match b.get(19) {
+        None => Ok(None),
+        Some(&n) => Ok(Some(usize::from(length) + usize::from(n))),
+    }
+}
+
+impl Packet {
+    /// Reads the packet in `b`, the whole OSPF payload of one IP packet
+    /// sent from and to `endpoints`. The version must match the IP family,
+    /// `b` must end where the length says (after the digest, with
+    /// cryptographic authentication), the checksum must be right, the body
+    /// must fit its type, and every LSA in an update must read. A checksum
+    /// of 0xffff is taken where 0x0000 is due, since the two are equal in
+    /// ones' complement.
+    pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Packet, OspfError> {
+        let total = check_header(b, endpoints)?.ok_or(OspfError::Truncated)?;
+        if b.len() < total {
+            return Err(OspfError::Truncated);
+        }
+        if b.len() > total {
+            return Err(OspfError::Trailing);
+        }
+        let v = endpoints.version();
+        let len = usize::from(be16(b, 2));
+        let auth_kind = if v == Version::V2 { be16(b, 14) } else { 0 };
+        if v == Version::V3 || auth_kind != auth_type::CRYPTOGRAPHIC {
+            // The header check made sure the length fits in `b`.
+            let want = checksum(b, endpoints).ok_or(OspfError::Truncated)?;
+            if !same_checksum(want, be16(b, 12)) {
+                return Err(OspfError::Checksum);
+            }
+        }
+        let header = match v {
+            Version::V2 => {
+                let mut data = [0u8; 8];
+                data.copy_from_slice(&b[16..24]);
+                let auth = match auth_kind {
+                    auth_type::NULL => Auth::Null,
+                    auth_type::SIMPLE => Auth::Simple(data),
+                    auth_type::CRYPTOGRAPHIC => {
+                        Auth::Cryptographic { key_id: b[18], sequence: be32(b, 20), digest: b[len..].to_vec() }
+                    }
+                    kind => Auth::Other { kind, data },
+                };
+                Header::V2 { auth }
+            }
+            Version::V3 => Header::V3 { instance_id: b[14] },
+        };
+        let body = parse_body(&b[v.header_len()..len], v, b[1])?;
+        Ok(Packet { router_id: Ipv4Addr::from(be32(b, 4)), area_id: Ipv4Addr::from(be32(b, 8)), header, body })
+    }
+
+    /// The packet's version, from its header.
+    pub fn version(&self) -> Version {
+        match self.header {
+            Header::V2 { .. } => Version::V2,
+            Header::V3 { .. } => Version::V3,
+        }
+    }
+
+    /// The packet's bytes, to send from and to `endpoints`, with the
+    /// length and checksum worked out. It fails with
+    /// [`OspfError::Family`] if the header's version does not match the
+    /// IP family, [`OspfError::Mismatch`] if the body is not for this
+    /// version, [`OspfError::Field`] if a value does not fit its field,
+    /// and [`OspfError::TooLong`] past [`MAX_PACKET`].
+    pub fn to_bytes(&self, endpoints: &Endpoints) -> Result<Vec<u8>, OspfError> {
+        let v = self.version();
+        if v != endpoints.version() {
+            return Err(OspfError::Family);
+        }
+        let mut out = vec![0u8; v.header_len()];
+        write_body(&mut out, &self.body, v)?;
+        let len = u16::try_from(out.len()).map_err(|_| OspfError::TooLong)?;
+        out[0] = v.number();
+        out[1] = self.body.packet_type();
+        out[2..4].copy_from_slice(&len.to_be_bytes());
+        out[4..8].copy_from_slice(&self.router_id.octets());
+        out[8..12].copy_from_slice(&self.area_id.octets());
+        let mut digest: &[u8] = &[];
+        match &self.header {
+            Header::V2 { auth } => {
+                out[14..16].copy_from_slice(&auth.kind().to_be_bytes());
+                match auth {
+                    Auth::Null => {}
+                    Auth::Simple(p) => out[16..24].copy_from_slice(p),
+                    Auth::Cryptographic { key_id, sequence, digest: d } => {
+                        let n = u8::try_from(d.len()).map_err(|_| OspfError::Field)?;
+                        out[18] = *key_id;
+                        out[19] = n;
+                        out[20..24].copy_from_slice(&sequence.to_be_bytes());
+                        digest = d;
+                    }
+                    Auth::Other { kind, data } => {
+                        if *kind <= auth_type::CRYPTOGRAPHIC {
+                            return Err(OspfError::Field);
+                        }
+                        out[16..24].copy_from_slice(data);
+                    }
+                }
+            }
+            Header::V3 { instance_id } => out[14] = *instance_id,
+        }
+        if !matches!(self.header, Header::V2 { auth: Auth::Cryptographic { .. } }) {
+            let c = checksum(&out, endpoints).ok_or(OspfError::TooLong)?;
+            out[12..14].copy_from_slice(&c.to_be_bytes());
+        }
+        out.extend_from_slice(digest);
+        Ok(out)
+    }
+}
+
+fn parse_body(b: &[u8], v: Version, t: u8) -> Result<Body, OspfError> {
+    let r = &mut Rd::new(b, OspfError::BodyLength);
+    let body = match (t, v) {
+        (packet_type::HELLO, Version::V2) => Body::HelloV2(HelloV2 {
+            network_mask: r.ip4()?,
+            hello_interval: r.u16()?,
+            options: r.u8()?,
+            priority: r.u8()?,
+            dead_interval: r.u32()?,
+            designated_router: r.ip4()?,
+            backup_designated_router: r.ip4()?,
+            neighbors: r.ip4_list()?,
+        }),
+        (packet_type::HELLO, Version::V3) => Body::HelloV3(HelloV3 {
+            interface_id: r.u32()?,
+            priority: r.u8()?,
+            options: r.u24()?,
+            hello_interval: r.u16()?,
+            dead_interval: r.u16()?,
+            designated_router: r.ip4()?,
+            backup_designated_router: r.ip4()?,
+            neighbors: r.ip4_list()?,
+        }),
+        (packet_type::DATABASE_DESCRIPTION, _) => {
+            let (mtu, options, flags) = match v {
+                Version::V2 => (r.u16()?, u32::from(r.u8()?), r.u8()?),
+                Version::V3 => {
+                    r.u8()?;
+                    let options = r.u24()?;
+                    let mtu = r.u16()?;
+                    r.u8()?;
+                    (mtu, options, r.u8()?)
+                }
+            };
+            let sequence = r.u32()?;
+            Body::DatabaseDescription(DatabaseDescription { mtu, options, flags, sequence, headers: r.header_list(v)? })
+        }
+        (packet_type::LINK_STATE_REQUEST, _) => {
+            if !r.left().is_multiple_of(12) {
+                return Err(OspfError::BodyLength);
+            }
+            let mut keys = Vec::with_capacity(r.left() / 12);
+            while r.left() > 0 {
+                let ls_type = match v {
+                    Version::V2 => r.u32()?,
+                    Version::V3 => {
+                        r.u16()?;
+                        u32::from(r.u16()?)
+                    }
+                };
+                keys.push(LsaKey { ls_type, link_state_id: r.ip4()?, advertising_router: r.ip4()? });
+            }
+            Body::LinkStateRequest(keys)
+        }
+        (packet_type::LINK_STATE_UPDATE, _) => {
+            let count = r.u32()?;
+            let mut lsas = Vec::new();
+            while r.left() > 0 {
+                if r.left() < LSA_HEADER_LEN {
+                    return Err(OspfError::BodyLength);
+                }
+                let (lsa, n) = Lsa::parse(&b[r.pos..], v)?;
+                r.pos += n;
+                lsas.push(lsa);
+            }
+            if u64::from(count) != lsas.len() as u64 {
+                return Err(OspfError::LsaCount);
+            }
+            Body::LinkStateUpdate(lsas)
+        }
+        (packet_type::LINK_STATE_ACK, _) => Body::LinkStateAck(r.header_list(v)?),
+        // The header check allows only types 1 to 5.
+        _ => return Err(OspfError::Type(t)),
+    };
+    r.end()?;
+    Ok(body)
+}
+
+fn write_body(out: &mut Vec<u8>, body: &Body, v: Version) -> Result<(), OspfError> {
+    match (body, v) {
+        (Body::HelloV2(h), Version::V2) => {
+            out.extend_from_slice(&h.network_mask.octets());
+            out.extend_from_slice(&h.hello_interval.to_be_bytes());
+            out.extend_from_slice(&[h.options, h.priority]);
+            out.extend_from_slice(&h.dead_interval.to_be_bytes());
+            out.extend_from_slice(&h.designated_router.octets());
+            out.extend_from_slice(&h.backup_designated_router.octets());
+            put_ip4s(out, &h.neighbors, MAX_PACKET)?;
+        }
+        (Body::HelloV3(h), Version::V3) => {
+            out.extend_from_slice(&h.interface_id.to_be_bytes());
+            out.push(h.priority);
+            put24(out, h.options)?;
+            out.extend_from_slice(&h.hello_interval.to_be_bytes());
+            out.extend_from_slice(&h.dead_interval.to_be_bytes());
+            out.extend_from_slice(&h.designated_router.octets());
+            out.extend_from_slice(&h.backup_designated_router.octets());
+            put_ip4s(out, &h.neighbors, MAX_PACKET)?;
+        }
+        (Body::HelloV2(_) | Body::HelloV3(_), _) => return Err(OspfError::Mismatch),
+        (Body::DatabaseDescription(d), _) => {
+            match v {
+                Version::V2 => {
+                    let options = u8::try_from(d.options).map_err(|_| OspfError::Field)?;
+                    out.extend_from_slice(&d.mtu.to_be_bytes());
+                    out.extend_from_slice(&[options, d.flags]);
+                }
+                Version::V3 => {
+                    out.push(0);
+                    put24(out, d.options)?;
+                    out.extend_from_slice(&d.mtu.to_be_bytes());
+                    out.extend_from_slice(&[0, d.flags]);
+                }
+            }
+            out.extend_from_slice(&d.sequence.to_be_bytes());
+            for h in &d.headers {
+                put_lsa_header(out, h, v)?;
+                fits(out, MAX_PACKET)?;
+            }
+        }
+        (Body::LinkStateRequest(keys), _) => {
+            for k in keys {
+                match v {
+                    Version::V2 => out.extend_from_slice(&k.ls_type.to_be_bytes()),
+                    Version::V3 => {
+                        let t = u16::try_from(k.ls_type).map_err(|_| OspfError::Field)?;
+                        out.extend_from_slice(&[0, 0]);
+                        out.extend_from_slice(&t.to_be_bytes());
+                    }
+                }
+                out.extend_from_slice(&k.link_state_id.octets());
+                out.extend_from_slice(&k.advertising_router.octets());
+                fits(out, MAX_PACKET)?;
+            }
+        }
+        (Body::LinkStateUpdate(lsas), _) => {
+            let count = u32::try_from(lsas.len()).map_err(|_| OspfError::TooLong)?;
+            out.extend_from_slice(&count.to_be_bytes());
+            for lsa in lsas {
+                out.extend_from_slice(&lsa.to_bytes(v)?);
+                fits(out, MAX_PACKET)?;
+            }
+        }
+        (Body::LinkStateAck(headers), _) => {
+            for h in headers {
+                put_lsa_header(out, h, v)?;
+                fits(out, MAX_PACKET)?;
+            }
+        }
+    }
+    fits(out, MAX_PACKET)
+}
+
+// Writing.
+
+fn fits(out: &[u8], max: usize) -> Result<(), OspfError> {
+    if out.len() > max { Err(OspfError::TooLong) } else { Ok(()) }
+}
+
+fn put24(out: &mut Vec<u8>, v: u32) -> Result<(), OspfError> {
+    if v > MAX_U24 {
+        return Err(OspfError::Field);
+    }
+    out.extend_from_slice(&v.to_be_bytes()[1..]);
+    Ok(())
+}
+
+fn put_ip4s(out: &mut Vec<u8>, list: &[Ipv4Addr], max: usize) -> Result<(), OspfError> {
+    for a in list {
+        out.extend_from_slice(&a.octets());
+        fits(out, max)?;
+    }
+    Ok(())
+}
+
+fn put_prefix(out: &mut Vec<u8>, p: &Prefix, middle: u16) -> Result<(), OspfError> {
+    if p.length > MAX_PREFIX_LEN {
+        return Err(OspfError::Field);
+    }
+    out.extend_from_slice(&[p.length, p.options]);
+    out.extend_from_slice(&middle.to_be_bytes());
+    out.extend_from_slice(&p.address.octets()[..prefix_bytes(p.length)]);
+    Ok(())
+}
+
+fn put_lsa_header(out: &mut Vec<u8>, h: &LsaHeader, v: Version) -> Result<(), OspfError> {
+    out.extend_from_slice(&h.age.to_be_bytes());
+    match v {
+        Version::V2 => {
+            let t = u8::try_from(h.ls_type).map_err(|_| OspfError::Field)?;
+            out.extend_from_slice(&[h.options, t]);
+        }
+        Version::V3 => {
+            if h.options != 0 {
+                return Err(OspfError::Field);
+            }
+            out.extend_from_slice(&h.ls_type.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&h.link_state_id.octets());
+    out.extend_from_slice(&h.advertising_router.octets());
+    out.extend_from_slice(&h.sequence.to_be_bytes());
+    out.extend_from_slice(&h.checksum.to_be_bytes());
+    out.extend_from_slice(&h.length.to_be_bytes());
+    Ok(())
+}
+
+/// Reads one packet that comes in pieces. Feed it the bytes in order, then
+/// call [`Decoder::finish`]. It fails as soon as the bytes show a bad
+/// version, type or length, or run past the length the header gives. It
+/// holds at most [`MAX_MESSAGE`] plus one bytes.
+#[derive(Clone, Debug)]
+pub struct Decoder {
+    endpoints: Endpoints,
+    buf: Vec<u8>,
+    failed: Option<OspfError>,
+}
+
+impl Decoder {
+    /// A decoder for a packet sent from and to `endpoints`, holding no
+    /// bytes.
+    pub fn new(endpoints: Endpoints) -> Decoder {
+        Decoder { endpoints, buf: Vec::new(), failed: None }
+    }
+
+    /// Adds the next bytes of the packet. It returns the error once the
+    /// bytes show one, and the same error on every later call; bytes fed
+    /// after that are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), OspfError> {
+        if let Some(e) = self.failed {
+            return Err(e);
+        }
+        // One byte past the longest payload is enough to know it is too
+        // long.
+        let room = (MAX_MESSAGE + 1).saturating_sub(self.buf.len());
+        self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        match check_header(&self.buf, &self.endpoints) {
+            Err(e) => Err(self.fail(e)),
+            Ok(Some(total)) if self.buf.len() > total => Err(self.fail(OspfError::Trailing)),
+            Ok(_) => Ok(()),
+        }
+    }
+
+    fn fail(&mut self, e: OspfError) -> OspfError {
+        self.failed = Some(e);
+        self.buf = Vec::new();
+        e
+    }
+
+    /// How many bytes are held.
+    pub fn buffered(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// The packet, when no more bytes will come. It gives the same result
+    /// as [`Packet::parse`] on all the bytes fed.
+    pub fn finish(self) -> Result<Packet, OspfError> {
+        match self.failed {
+            Some(e) => Err(e),
+            None => Packet::parse(&self.buf, &self.endpoints),
+        }
+    }
+}
+
+fn be16(b: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes([b[i], b[i + 1]])
+}
+
+fn be32(b: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
+        Ipv4Addr::new(a, b, c, d)
+    }
+
+    fn v4_ends() -> Endpoints {
+        Endpoints::V4 { source: ip4(10, 0, 0, 1), destination: ALL_SPF_ROUTERS_V4 }
+    }
+
+    fn v6_ends() -> Endpoints {
+        Endpoints::V6 { source: "fe80::1".parse().unwrap(), destination: ALL_SPF_ROUTERS_V6 }
+    }
+
+    /// `b` with its packet checksum set right.
+    fn fix(mut b: Vec<u8>, e: &Endpoints) -> Vec<u8> {
+        if let Some(c) = checksum(&b, e) {
+            b[12..14].copy_from_slice(&c.to_be_bytes());
+        }
+        b
+    }
+
+    /// `b` with its LSA checksum set right.
+    fn fix_lsa(mut b: Vec<u8>) -> Vec<u8> {
+        if let Some(c) = lsa_checksum(&b) {
+            b[16..18].copy_from_slice(&c.to_be_bytes());
+        }
+        b
+    }
+
+    fn decode_chunked(b: &[u8], e: &Endpoints, size: usize) -> Result<Packet, OspfError> {
+        let mut d = Decoder::new(*e);
+        for c in b.chunks(size.max(1)) {
+            let _ = d.feed(c);
+        }
+        d.finish()
+    }
+
+    fn hello_v2(me: Ipv4Addr, heard: Vec<Ipv4Addr>) -> Packet {
+        Packet {
+            router_id: me,
+            area_id: Ipv4Addr::UNSPECIFIED,
+            header: Header::V2 { auth: Auth::Null },
+            body: Body::HelloV2(HelloV2 {
+                network_mask: ip4(255, 255, 255, 0),
+                hello_interval: 10,
+                options: 0x02,
+                priority: 1,
+                dead_interval: 40,
+                designated_router: Ipv4Addr::UNSPECIFIED,
+                backup_designated_router: Ipv4Addr::UNSPECIFIED,
+                neighbors: heard,
+            }),
+        }
+    }
+
+    #[test]
+    fn module_example() {
+        let link = v4_ends();
+        let bytes = [
+            2, 1, 0, 44, 1, 1, 1, 1, 0, 0, 0, 0, 0xfa, 0x9c, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, //
+            255, 255, 255, 0, 0, 10, 0x02, 1, 0, 0, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let packet = Packet::parse(&bytes, &link).unwrap();
+        assert_eq!(packet, hello_v2(ip4(1, 1, 1, 1), vec![]));
+        assert_eq!(packet.to_bytes(&link).unwrap(), bytes);
+        let reply = hello_v2(ip4(2, 2, 2, 2), vec![packet.router_id]);
+        let sent = reply.to_bytes(&link).unwrap();
+        assert_eq!(sent.len(), 48);
+        assert_eq!(Packet::parse(&sent, &link), Ok(reply));
+        let mut bad = bytes;
+        bad[30] ^= 1;
+        assert_eq!(Packet::parse(&bad, &link), Err(OspfError::Checksum));
+    }
+
+    #[test]
+    fn v2_hello_with_neighbors_and_password() {
+        // A Hello from 192.168.1.1 in area 0.0.0.1, with password "secret",
+        // naming 192.168.1.2 as DR and listing two neighbors. The checksum
+        // skips the password.
+        let p = Packet {
+            router_id: ip4(192, 168, 1, 1),
+            area_id: ip4(0, 0, 0, 1),
+            header: Header::V2 { auth: Auth::Simple(*b"secret\0\0") },
+            body: Body::HelloV2(HelloV2 {
+                network_mask: ip4(255, 255, 255, 0),
+                hello_interval: 10,
+                options: 0x12,
+                priority: 1,
+                dead_interval: 40,
+                designated_router: ip4(192, 168, 1, 2),
+                backup_designated_router: ip4(192, 168, 1, 1),
+                neighbors: vec![ip4(2, 2, 2, 2), ip4(3, 3, 3, 3)],
+            }),
+        };
+        let b = p.to_bytes(&v4_ends()).unwrap();
+        assert_eq!(&b[..4], &[2, 1, 0, 52]);
+        assert_eq!(&b[14..24], b"\0\x01secret\0\0");
+        assert_eq!(&b[12..14], &[0x9d, 0x8c]);
+        assert_eq!(Packet::parse(&b, &v4_ends()), Ok(p));
+        // The password is outside the checksum.
+        let mut other = b.clone();
+        other[16] = b'S';
+        assert!(Packet::parse(&other, &v4_ends()).is_ok());
+    }
+
+    #[test]
+    fn v3_hello_example() {
+        // An OSPFv3 Hello from fe80::1, router 1.1.1.1, interface 5. The
+        // checksum covers the IPv6 pseudo-header.
+        let bytes = [
+            3, 1, 0, 36, 1, 1, 1, 1, 0, 0, 0, 0, 0xfb, 0x87, 0, 0, // header
+            0, 0, 0, 5, 1, 0, 0, 0x13, 0, 10, 0, 40, 0, 0, 0, 0, 0, 0, 0, 0, // Hello
+        ];
+        let p = Packet::parse(&bytes, &v6_ends()).unwrap();
+        assert_eq!(
+            p,
+            Packet {
+                router_id: ip4(1, 1, 1, 1),
+                area_id: Ipv4Addr::UNSPECIFIED,
+                header: Header::V3 { instance_id: 0 },
+                body: Body::HelloV3(HelloV3 {
+                    interface_id: 5,
+                    priority: 1,
+                    options: 0x13,
+                    hello_interval: 10,
+                    dead_interval: 40,
+                    designated_router: Ipv4Addr::UNSPECIFIED,
+                    backup_designated_router: Ipv4Addr::UNSPECIFIED,
+                    neighbors: vec![],
+                }),
+            }
+        );
+        assert_eq!(p.to_bytes(&v6_ends()).unwrap(), bytes);
+        // Another source address changes the pseudo-header.
+        let elsewhere = Endpoints::V6 { source: "fe80::2".parse().unwrap(), destination: ALL_SPF_ROUTERS_V6 };
+        assert_eq!(Packet::parse(&bytes, &elsewhere), Err(OspfError::Checksum));
+    }
+
+    #[test]
+    fn router_lsa_fletcher_example() {
+        // A Router-LSA from 1.1.1.1 with one stub link to 10.0.0.0/24 at
+        // cost 10. Its checksum was worked out separately, with the RFC
+        // 905 annex B formulas.
+        let bytes = [
+            0, 1, 0x22, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0x80, 0, 0, 1, 0x97, 0x7f, 0, 36, // header
+            0, 0, 0, 1, 10, 0, 0, 0, 255, 255, 255, 0, 3, 0, 0, 10,
+        ];
+        assert_eq!(lsa_checksum(&bytes), Some(0x977f));
+        assert!(lsa_checksum_ok(&bytes));
+        let (lsa, n) = Lsa::parse(&bytes, Version::V2).unwrap();
+        assert_eq!(n, 36);
+        assert_eq!(
+            lsa,
+            Lsa {
+                age: 1,
+                options: 0x22,
+                ls_type: 1,
+                link_state_id: ip4(1, 1, 1, 1),
+                advertising_router: ip4(1, 1, 1, 1),
+                sequence: INITIAL_SEQUENCE,
+                body: LsaBody::Router(RouterLsa {
+                    flags: 0,
+                    links: vec![RouterLink {
+                        id: ip4(10, 0, 0, 0),
+                        data: ip4(255, 255, 255, 0),
+                        kind: 3,
+                        metric: 10,
+                        tos: vec![],
+                    }],
+                }),
+            }
+        );
+        assert_eq!(lsa.to_bytes(Version::V2).unwrap(), bytes);
+        // The age is outside the checksum, so routers can age LSAs.
+        let mut older = bytes;
+        older[1] = 200;
+        assert!(lsa_checksum_ok(&older));
+        let mut bad = bytes;
+        bad[30] ^= 1;
+        assert_eq!(Lsa::parse(&bad, Version::V2), Err(OspfError::LsaChecksum));
+        let h = lsa.header(Version::V2).unwrap();
+        assert_eq!((h.checksum, h.length), (0x977f, 36));
+    }
+
+    #[test]
+    fn fletcher_holds_for_all_lengths() {
+        let mut rng = Lcg(7);
+        for len in LSA_HEADER_LEN..300 {
+            let mut b: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            b[18..20].copy_from_slice(&(len as u16).to_be_bytes());
+            let b = fix_lsa(b);
+            assert!(lsa_checksum_ok(&b), "{len}");
+            assert_ne!(b[16], 0);
+            assert_ne!(b[17], 0);
+        }
+        // A zero checksum is never right.
+        let mut zero = vec![0u8; 20];
+        zero[19] = 20;
+        assert!(!lsa_checksum_ok(&zero));
+        assert_eq!(lsa_checksum(&zero[..19]), None);
+        zero[19] = 19;
+        assert_eq!(lsa_checksum(&zero), None);
+        zero[19] = 21;
+        assert_eq!(lsa_checksum(&zero), None);
+    }
+
+    fn pfx(len: u8, a: &str) -> Prefix {
+        Prefix { length: len, options: 0, address: a.parse().unwrap() }
+    }
+
+    fn lsa(ls_type: u16, body: LsaBody) -> Lsa {
+        Lsa {
+            age: 3,
+            options: 0,
+            ls_type,
+            link_state_id: ip4(0, 0, 0, 1),
+            advertising_router: ip4(1, 1, 1, 1),
+            sequence: INITIAL_SEQUENCE + 4,
+            body,
+        }
+    }
+
+    fn v2_lsas() -> Vec<Lsa> {
+        let mut router = lsa(
+            lsa_type_v2::ROUTER,
+            LsaBody::Router(RouterLsa {
+                flags: 0x01,
+                links: vec![
+                    RouterLink {
+                        id: ip4(2, 2, 2, 2),
+                        data: ip4(10, 0, 0, 1),
+                        kind: 1,
+                        metric: 10,
+                        tos: vec![TosMetric { tos: 2, metric: 7 }],
+                    },
+                    RouterLink {
+                        id: ip4(10, 0, 0, 0),
+                        data: ip4(255, 255, 255, 252),
+                        kind: 3,
+                        metric: 10,
+                        tos: vec![],
+                    },
+                ],
+            }),
+        );
+        router.options = 0x22;
+        vec![
+            router,
+            lsa(
+                lsa_type_v2::NETWORK,
+                LsaBody::Network(NetworkLsa {
+                    network_mask: ip4(255, 255, 255, 0),
+                    attached_routers: vec![ip4(1, 1, 1, 1), ip4(2, 2, 2, 2)],
+                }),
+            ),
+            lsa(
+                lsa_type_v2::SUMMARY_NETWORK,
+                LsaBody::Summary(SummaryLsa {
+                    network_mask: ip4(255, 255, 0, 0),
+                    metric: 0x0f_0000,
+                    tos: vec![(4, 9)],
+                }),
+            ),
+            lsa(
+                lsa_type_v2::SUMMARY_ASBR,
+                LsaBody::Summary(SummaryLsa { network_mask: Ipv4Addr::UNSPECIFIED, metric: 20, tos: vec![] }),
+            ),
+            lsa(
+                lsa_type_v2::AS_EXTERNAL,
+                LsaBody::AsExternal(AsExternalLsa {
+                    network_mask: ip4(255, 255, 255, 0),
+                    routes: vec![ExternalRoute {
+                        type2: true,
+                        tos: 0,
+                        metric: 20,
+                        forwarding_address: Ipv4Addr::UNSPECIFIED,
+                        route_tag: 42,
+                    }],
+                }),
+            ),
+            lsa(
+                lsa_type_v2::NSSA,
+                LsaBody::AsExternal(AsExternalLsa {
+                    network_mask: ip4(255, 0, 0, 0),
+                    routes: vec![ExternalRoute {
+                        type2: false,
+                        tos: 0,
+                        metric: 1,
+                        forwarding_address: ip4(10, 0, 0, 9),
+                        route_tag: 0,
+                    }],
+                }),
+            ),
+            lsa(10, LsaBody::Other(vec![1, 2, 3, 4, 5])),
+        ]
+    }
+
+    fn v3_lsas() -> Vec<Lsa> {
+        vec![
+            lsa(
+                lsa_type_v3::ROUTER,
+                LsaBody::RouterV3(RouterLsaV3 {
+                    flags: 0x02,
+                    options: 0x13,
+                    interfaces: vec![RouterInterface {
+                        kind: 2,
+                        metric: 1,
+                        interface_id: 5,
+                        neighbor_interface_id: 6,
+                        neighbor_router_id: ip4(2, 2, 2, 2),
+                    }],
+                }),
+            ),
+            lsa(
+                lsa_type_v3::NETWORK,
+                LsaBody::NetworkV3(NetworkLsaV3 { options: 0x13, attached_routers: vec![ip4(1, 1, 1, 1)] }),
+            ),
+            lsa(
+                lsa_type_v3::INTER_AREA_PREFIX,
+                LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 30, prefix: pfx(64, "2001:db8:1::") }),
+            ),
+            lsa(
+                lsa_type_v3::INTER_AREA_ROUTER,
+                LsaBody::InterAreaRouter(InterAreaRouterLsa { options: 0x13, metric: 5, destination: ip4(9, 9, 9, 9) }),
+            ),
+            lsa(
+                lsa_type_v3::AS_EXTERNAL,
+                LsaBody::AsExternalV3(AsExternalLsaV3 {
+                    type2: true,
+                    metric: 20,
+                    prefix: pfx(48, "2001:db8:2::"),
+                    forwarding_address: Some("2001:db8::9".parse().unwrap()),
+                    route_tag: Some(7),
+                    referenced: Some((0x2001, ip4(0, 0, 0, 3))),
+                }),
+            ),
+            lsa(
+                lsa_type_v3::NSSA,
+                LsaBody::AsExternalV3(AsExternalLsaV3 {
+                    type2: false,
+                    metric: 1,
+                    prefix: pfx(0, "::"),
+                    forwarding_address: None,
+                    route_tag: None,
+                    referenced: None,
+                }),
+            ),
+            lsa(
+                lsa_type_v3::LINK,
+                LsaBody::Link(LinkLsa {
+                    priority: 1,
+                    options: 0x13,
+                    link_local_address: "fe80::1".parse().unwrap(),
+                    prefixes: vec![pfx(64, "2001:db8:3::"), pfx(128, "2001:db8::1")],
+                }),
+            ),
+            lsa(
+                lsa_type_v3::INTRA_AREA_PREFIX,
+                LsaBody::IntraAreaPrefix(IntraAreaPrefixLsa {
+                    referenced_ls_type: lsa_type_v3::ROUTER,
+                    referenced_link_state_id: Ipv4Addr::UNSPECIFIED,
+                    referenced_advertising_router: ip4(1, 1, 1, 1),
+                    prefixes: vec![(pfx(96, "2001:db8:4::"), 10), (pfx(33, "2001:db8:8000::"), 1)],
+                }),
+            ),
+            lsa(0x0010, LsaBody::Other(vec![])),
+        ]
+    }
+
+    fn header_of(l: &Lsa, v: Version) -> LsaHeader {
+        l.header(v).unwrap()
+    }
+
+    fn packets(v: Version) -> Vec<Packet> {
+        let lsas = match v {
+            Version::V2 => v2_lsas(),
+            Version::V3 => v3_lsas(),
+        };
+        let headers: Vec<LsaHeader> = lsas.iter().map(|l| header_of(l, v)).collect();
+        let header = match v {
+            Version::V2 => Header::V2 { auth: Auth::Null },
+            Version::V3 => Header::V3 { instance_id: 0 },
+        };
+        let hello = match v {
+            Version::V2 => hello_v2(ip4(1, 1, 1, 1), vec![ip4(2, 2, 2, 2)]).body,
+            Version::V3 => Body::HelloV3(HelloV3 {
+                interface_id: 1,
+                priority: 1,
+                options: 0x13,
+                hello_interval: 10,
+                dead_interval: 40,
+                designated_router: ip4(1, 1, 1, 1),
+                backup_designated_router: Ipv4Addr::UNSPECIFIED,
+                neighbors: vec![ip4(2, 2, 2, 2)],
+            }),
+        };
+        let bodies = vec![
+            hello,
+            Body::DatabaseDescription(DatabaseDescription {
+                mtu: 1500,
+                options: 0x02,
+                flags: dd_flags::INIT | dd_flags::MORE | dd_flags::MS,
+                sequence: 0x1234,
+                headers: vec![],
+            }),
+            Body::DatabaseDescription(DatabaseDescription {
+                mtu: 1500,
+                options: 0x02,
+                flags: dd_flags::MORE,
+                sequence: 0x1235,
+                headers: headers.clone(),
+            }),
+            Body::LinkStateRequest(lsas.iter().map(|l| l.key()).collect()),
+            Body::LinkStateUpdate(lsas.clone()),
+            Body::LinkStateUpdate(vec![]),
+            Body::LinkStateAck(headers),
+        ];
+        let mut out: Vec<Packet> = bodies
+            .into_iter()
+            .map(|body| Packet { router_id: ip4(1, 1, 1, 1), area_id: ip4(0, 0, 0, 0), header: header.clone(), body })
+            .collect();
+        if v == Version::V2 {
+            let mut auths = vec![
+                Auth::Simple(*b"password"),
+                Auth::Cryptographic { key_id: 1, sequence: 99, digest: vec![0xaa; 16] },
+                Auth::Cryptographic { key_id: 2, sequence: 1, digest: vec![] },
+                Auth::Other { kind: 9, data: [1; 8] },
+            ];
+            for a in auths.drain(..) {
+                let mut p = out[0].clone();
+                p.header = Header::V2 { auth: a };
+                out.push(p);
+            }
+        } else {
+            let mut p = out[0].clone();
+            p.header = Header::V3 { instance_id: 7 };
+            out.push(p);
+        }
+        out
+    }
+
+    fn samples() -> Vec<(Packet, Endpoints)> {
+        let mut out = Vec::new();
+        for p in packets(Version::V2) {
+            out.push((p, v4_ends()));
+        }
+        for p in packets(Version::V3) {
+            out.push((p, v6_ends()));
+        }
+        out
+    }
+
+    #[test]
+    fn round_trips() {
+        for (p, e) in samples() {
+            let b = p.to_bytes(&e).unwrap();
+            assert_eq!(Packet::parse(&b, &e).as_ref(), Ok(&p), "{p:?}");
+            assert_eq!(decode_chunked(&b, &e, 1).as_ref(), Ok(&p));
+            assert_eq!(Packet::parse(&b, &e).unwrap().to_bytes(&e).unwrap(), b);
+        }
+        for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
+            for l in lsas {
+                let b = l.to_bytes(v).unwrap();
+                assert!(lsa_checksum_ok(&b));
+                assert_eq!(Lsa::parse(&b, v), Ok((l, b.len())));
+            }
+        }
+    }
+
+    #[test]
+    fn prefixes_send_only_the_words_they_need() {
+        let l = &v3_lsas()[7];
+        let b = l.to_bytes(Version::V3).unwrap();
+        // Header, 12 fixed bytes, then 4 + 12 and 4 + 8 bytes of prefixes.
+        assert_eq!(b.len(), 20 + 12 + 16 + 12);
+        let p = Prefix { length: 1, options: 0, address: "ffff::1".parse().unwrap() };
+        let ia =
+            lsa(lsa_type_v3::INTER_AREA_PREFIX, LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 0, prefix: p }));
+        let b = ia.to_bytes(Version::V3).unwrap();
+        assert_eq!(b.len(), 20 + 4 + 4 + 4);
+        let (back, _) = Lsa::parse(&b, Version::V3).unwrap();
+        let LsaBody::InterAreaPrefix(back) = back.body else { panic!() };
+        assert_eq!(back.prefix.address, "ffff::".parse::<Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn prefix_new_clears_the_host_bits() {
+        let a: Ipv6Addr = "2001:db8:ffff:ffff:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(Prefix::new(64, 0, a), pfx(64, "2001:db8:ffff:ffff::"));
+        assert_eq!(Prefix::new(0, 0, a).address, Ipv6Addr::UNSPECIFIED);
+        assert_eq!(Prefix::new(128, 0, a).address, a);
+        assert_eq!(Prefix::new(33, 0, a).address, "2001:db8:8000::".parse::<Ipv6Addr>().unwrap());
+        // A length past 128 is kept, for the writer to reject.
+        assert_eq!(Prefix::new(200, 0, a), Prefix { length: 200, options: 0, address: a });
+        // A prefix made with new reads back equal for every length, even
+        // from an address with every bit set.
+        for length in 0..=MAX_PREFIX_LEN {
+            let p = Prefix::new(length, 0x10, Ipv6Addr::from(u128::MAX));
+            let l = lsa(
+                lsa_type_v3::INTER_AREA_PREFIX,
+                LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 1, prefix: p }),
+            );
+            let b = l.to_bytes(Version::V3).unwrap();
+            assert_eq!(Lsa::parse(&b, Version::V3), Ok((l, b.len())), "{length}");
+        }
+    }
+
+    #[test]
+    fn header_errors() {
+        let e4 = v4_ends();
+        let e6 = v6_ends();
+        let good = hello_v2(ip4(1, 1, 1, 1), vec![]).to_bytes(&e4).unwrap();
+        assert_eq!(Packet::parse(&[], &e4), Err(OspfError::Truncated));
+        let mut b = good.clone();
+        b[0] = 4;
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Version(4)));
+        assert_eq!(Packet::parse(&good, &e6), Err(OspfError::Family));
+        b = good.clone();
+        b[1] = 6;
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Type(6)));
+        b[1] = 0;
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Type(0)));
+        b = good.clone();
+        b[2..4].copy_from_slice(&23u16.to_be_bytes());
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Length(23)));
+        b[2..4].copy_from_slice(&45u16.to_be_bytes());
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Truncated));
+        b = good.clone();
+        b.push(0);
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Trailing));
+        b = good.clone();
+        b[12] ^= 0x10;
+        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Checksum));
+        // A v3 header shorter than 16.
+        let mut v3 = vec![3, 1, 0, 15];
+        v3.resize(15, 0);
+        assert_eq!(Packet::parse(&v3, &e6), Err(OspfError::Length(15)));
+        assert_eq!(Packet::parse(&[3], &e4), Err(OspfError::Family));
+    }
+
+    #[test]
+    fn negative_zero_checksum() {
+        // Search for a packet whose checksum is 0x0000 or 0xffff, and check
+        // the other form is taken too.
+        let e = v4_ends();
+        let mut found = 0;
+        for id in 0..=0xffffu32 {
+            let p = Packet { router_id: Ipv4Addr::from(id), ..hello_v2(ip4(0, 0, 0, 0), vec![]) };
+            let mut b = p.to_bytes(&e).unwrap();
+            let c = be16(&b, 12);
+            if c == 0 || c == 0xffff {
+                b[12..14].copy_from_slice(&(!c).to_be_bytes());
+                assert_eq!(Packet::parse(&b, &e), Ok(p));
+                found += 1;
+            }
+        }
+        assert!(found > 0);
+        assert!(same_checksum(0, 0xffff));
+        assert!(!same_checksum(0x00ff, 0xff00));
+    }
+
+    #[test]
+    fn crypto_auth_skips_the_checksum() {
+        let e = v4_ends();
+        let mut p = hello_v2(ip4(1, 1, 1, 1), vec![]);
+        p.header = Header::V2 { auth: Auth::Cryptographic { key_id: 3, sequence: 77, digest: vec![9; 16] } };
+        let b = p.to_bytes(&e).unwrap();
+        assert_eq!(b.len(), 44 + 16);
+        assert_eq!(&b[12..24], &[0, 0, 0, 2, 0, 0, 3, 16, 0, 0, 0, 77]);
+        assert_eq!(Packet::parse(&b, &e), Ok(p.clone()));
+        // The digest's length is in the header, so a short or long one fails.
+        assert_eq!(Packet::parse(&b[..b.len() - 1], &e), Err(OspfError::Truncated));
+        let mut long = b.clone();
+        long.push(0);
+        assert_eq!(Packet::parse(&long, &e), Err(OspfError::Trailing));
+        // A digest over 255 bytes cannot be written.
+        p.header = Header::V2 { auth: Auth::Cryptographic { key_id: 3, sequence: 77, digest: vec![9; 256] } };
+        assert_eq!(p.to_bytes(&e), Err(OspfError::Field));
+    }
+
+    #[test]
+    fn body_errors() {
+        let e4 = v4_ends();
+        let e6 = v6_ends();
+        let raw = |v: u8, t: u8, body: &[u8], e: &Endpoints| -> Result<Packet, OspfError> {
+            let hl = if v == 2 { HEADER_LEN_V2 } else { HEADER_LEN_V3 };
+            let mut b = vec![0u8; hl];
+            b[0] = v;
+            b[1] = t;
+            b.extend_from_slice(body);
+            let len = b.len() as u16;
+            b[2..4].copy_from_slice(&len.to_be_bytes());
+            Packet::parse(&fix(b, e), e)
+        };
+        // A Hello short of its fixed fields, and one with a partial neighbor.
+        assert_eq!(raw(2, 1, &[0; 19], &e4), Err(OspfError::BodyLength));
+        assert_eq!(raw(2, 1, &[0; 22], &e4), Err(OspfError::BodyLength));
+        assert!(raw(2, 1, &[0; 24], &e4).is_ok());
+        assert_eq!(raw(3, 1, &[0; 21], &e6), Err(OspfError::BodyLength));
+        // Database Description: fixed fields, then whole headers.
+        assert_eq!(raw(2, 2, &[0; 7], &e4), Err(OspfError::BodyLength));
+        assert_eq!(raw(2, 2, &[0; 9], &e4), Err(OspfError::BodyLength));
+        assert!(raw(2, 2, &[0; 28], &e4).is_ok());
+        assert_eq!(raw(3, 2, &[0; 11], &e6), Err(OspfError::BodyLength));
+        assert!(raw(3, 2, &[0; 12], &e6).is_ok());
+        // Requests come in 12s.
+        assert_eq!(raw(2, 3, &[0; 13], &e4), Err(OspfError::BodyLength));
+        assert!(raw(3, 3, &[0; 24], &e6).is_ok());
+        // Acknowledgments come in 20s.
+        assert_eq!(raw(2, 5, &[0; 19], &e4), Err(OspfError::BodyLength));
+        // Updates: the count, then LSAs that must match it.
+        assert_eq!(raw(2, 4, &[0; 3], &e4), Err(OspfError::BodyLength));
+        assert_eq!(raw(2, 4, &[0, 0, 0, 1], &e4), Err(OspfError::LsaCount));
+        let l = v2_lsas()[1].to_bytes(Version::V2).unwrap();
+        let mut body = vec![0, 0, 0, 2];
+        body.extend_from_slice(&l);
+        assert_eq!(raw(2, 4, &body, &e4), Err(OspfError::LsaCount));
+        body[3] = 1;
+        assert!(raw(2, 4, &body, &e4).is_ok());
+        body.extend_from_slice(&[0; 19]);
+        assert_eq!(raw(2, 4, &body, &e4), Err(OspfError::BodyLength));
+        // An LSA in an update with a bad checksum or length.
+        let mut body = vec![0, 0, 0, 1];
+        body.extend_from_slice(&l);
+        body[4 + 20] ^= 1;
+        assert_eq!(raw(2, 4, &body, &e4), Err(OspfError::LsaChecksum));
+        body[4 + 19] = 19;
+        assert_eq!(raw(2, 4, &body, &e4), Err(OspfError::LsaLength(19)));
+        body[4 + 19] = 200;
+        assert_eq!(raw(2, 4, &body, &e4), Err(OspfError::LsaLength(200)));
+    }
+
+    #[test]
+    fn lsa_errors() {
+        let v2 = Version::V2;
+        let v3 = Version::V3;
+        let raw = |v: Version, t: u16, body: &[u8]| -> Result<(Lsa, usize), OspfError> {
+            let mut b = vec![0u8; LSA_HEADER_LEN];
+            match v {
+                Version::V2 => b[3] = t as u8,
+                Version::V3 => b[2..4].copy_from_slice(&t.to_be_bytes()),
+            }
+            b.extend_from_slice(body);
+            let len = b.len() as u16;
+            b[18..20].copy_from_slice(&len.to_be_bytes());
+            Lsa::parse(&fix_lsa(b), v)
+        };
+        assert_eq!(Lsa::parse(&[0; 19], v2), Err(OspfError::Truncated));
+        // Router-LSA: a link count past the bytes, a TOS count past them,
+        // bytes after the links.
+        assert_eq!(raw(v2, 1, &[0, 0, 0, 1]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v2, 1, &[0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 3, 1, 0, 1]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v2, 1, &[0, 0, 0, 0, 9]), Err(OspfError::LsaBody));
+        assert!(raw(v2, 1, &[0, 0, 0, 0]).is_ok());
+        assert_eq!(raw(v2, 2, &[0; 6]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v2, 3, &[0; 9]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v2, 3, &[0; 7]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v2, 5, &[0; 10]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x2001, &[0; 5]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x2002, &[0; 6]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x2004, &[0; 11]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x2004, &[0; 13]), Err(OspfError::LsaBody));
+        // Prefixes: too long, or missing words.
+        assert_eq!(raw(v3, 0x2003, &[0, 0, 0, 0, 129, 0, 0, 0]), Err(OspfError::PrefixLength(129)));
+        assert_eq!(raw(v3, 0x2003, &[0, 0, 0, 0, 33, 0, 0, 0, 0, 0, 0, 0]), Err(OspfError::LsaBody));
+        assert!(raw(v3, 0x2003, &[0, 0, 0, 0, 0, 0, 0, 0]).is_ok());
+        // AS-External: F set without the forwarding address; a reference
+        // without its ID.
+        assert_eq!(raw(v3, 0x4005, &[0x02, 0, 0, 0, 0, 0, 0, 0]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x4005, &[0, 0, 0, 0, 0, 0, 0x20, 0x01]), Err(OspfError::LsaBody));
+        // Link-LSA and Intra-Area-Prefix-LSA counts past the prefixes.
+        let mut link = vec![0u8; 20];
+        link.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(raw(v3, 0x0008, &link), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x2009, &[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(OspfError::LsaBody));
+        assert_eq!(raw(v3, 0x2009, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Err(OspfError::LsaBody));
+        // Bytes past the LSA's length are left for the caller.
+        let mut b = v2_lsas()[1].to_bytes(v2).unwrap();
+        let n = b.len();
+        b.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(Lsa::parse(&b, v2).unwrap().1, n);
+    }
+
+    #[test]
+    fn as_external_needs_its_tos_0_route() {
+        // RFC 2328 A.4.5: the E bit, metric, forwarding address and tag of
+        // TOS 0 always follow the mask. A mask alone is not an LSA.
+        let raw = |t: u16, body: &[u8]| {
+            let mut b = vec![0u8; LSA_HEADER_LEN];
+            b[3] = t as u8;
+            b.extend_from_slice(body);
+            let len = b.len() as u16;
+            b[18..20].copy_from_slice(&len.to_be_bytes());
+            Lsa::parse(&fix_lsa(b), Version::V2)
+        };
+        for t in [lsa_type_v2::AS_EXTERNAL, lsa_type_v2::NSSA] {
+            assert_eq!(raw(t, &[255, 255, 255, 0]), Err(OspfError::LsaBody));
+            let mut one = vec![255, 255, 255, 0, 0x80, 0, 0, 20];
+            one.extend_from_slice(&[0; 8]);
+            assert!(raw(t, &one).is_ok());
+            // The first route's TOS field is 0.
+            one[4] = 0x81;
+            assert_eq!(raw(t, &one), Err(OspfError::LsaBody));
+        }
+        let route =
+            ExternalRoute { type2: false, tos: 0, metric: 1, forwarding_address: Ipv4Addr::UNSPECIFIED, route_tag: 0 };
+        let ext = |routes: Vec<ExternalRoute>| {
+            lsa(lsa_type_v2::AS_EXTERNAL, LsaBody::AsExternal(AsExternalLsa { network_mask: ip4(0, 0, 0, 0), routes }))
+        };
+        assert_eq!(ext(vec![]).to_bytes(Version::V2), Err(OspfError::Field));
+        assert_eq!(ext(vec![ExternalRoute { tos: 4, ..route }]).to_bytes(Version::V2), Err(OspfError::Field));
+        assert!(ext(vec![route, ExternalRoute { tos: 4, ..route }]).to_bytes(Version::V2).is_ok());
+    }
+
+    #[test]
+    fn writer_errors() {
+        let e4 = v4_ends();
+        let e6 = v6_ends();
+        let mut p = hello_v2(ip4(1, 1, 1, 1), vec![]);
+        assert_eq!(p.to_bytes(&e6), Err(OspfError::Family));
+        p.header = Header::V3 { instance_id: 0 };
+        assert_eq!(p.to_bytes(&e6), Err(OspfError::Mismatch));
+        p.header = Header::V2 { auth: Auth::Other { kind: 1, data: [0; 8] } };
+        assert_eq!(p.to_bytes(&e4), Err(OspfError::Field));
+        // Too many neighbors for a 16-bit length.
+        p.header = Header::V2 { auth: Auth::Null };
+        let Body::HelloV2(h) = &mut p.body else { panic!() };
+        h.neighbors = vec![ip4(1, 2, 3, 4); 20_000];
+        assert_eq!(p.to_bytes(&e4), Err(OspfError::TooLong));
+        let Body::HelloV2(h) = &mut p.body else { panic!() };
+        h.neighbors = vec![ip4(1, 2, 3, 4); (MAX_PACKET - 44) / 4];
+        let b = p.to_bytes(&e4).unwrap();
+        assert_eq!(Packet::parse(&b, &e4), Ok(p));
+        // Out-of-range fields.
+        let mut q = packets(Version::V3).remove(0);
+        let Body::HelloV3(h) = &mut q.body else { panic!() };
+        h.options = 0x0100_0000;
+        assert_eq!(q.to_bytes(&e6), Err(OspfError::Field));
+        let dd = |options: u32, headers: Vec<LsaHeader>| Packet {
+            router_id: ip4(1, 1, 1, 1),
+            area_id: ip4(0, 0, 0, 0),
+            header: Header::V2 { auth: Auth::Null },
+            body: Body::DatabaseDescription(DatabaseDescription { mtu: 1500, options, flags: 0, sequence: 1, headers }),
+        };
+        assert_eq!(dd(0x100, vec![]).to_bytes(&e4), Err(OspfError::Field));
+        let mut h = header_of(&v2_lsas()[0], Version::V2);
+        h.ls_type = 0x100;
+        assert_eq!(dd(0, vec![h]).to_bytes(&e4), Err(OspfError::Field));
+        let req = Packet {
+            router_id: ip4(1, 1, 1, 1),
+            area_id: ip4(0, 0, 0, 0),
+            header: Header::V3 { instance_id: 0 },
+            body: Body::LinkStateRequest(vec![LsaKey {
+                ls_type: 0x1_0000,
+                link_state_id: ip4(0, 0, 0, 0),
+                advertising_router: ip4(0, 0, 0, 0),
+            }]),
+        };
+        assert_eq!(req.to_bytes(&e6), Err(OspfError::Field));
+        // LSAs: a body for another type, a v2 type over 255, v3 options.
+        let mut l = v2_lsas().remove(0);
+        l.ls_type = 2;
+        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Mismatch));
+        assert_eq!(v2_lsas()[0].to_bytes(Version::V3), Err(OspfError::Mismatch));
+        let mut l = v2_lsas().remove(6);
+        l.ls_type = 0x100;
+        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Field));
+        let mut l = v3_lsas().remove(8);
+        l.options = 1;
+        assert_eq!(l.to_bytes(Version::V3), Err(OspfError::Field));
+        let summary =
+            lsa(3, LsaBody::Summary(SummaryLsa { network_mask: ip4(0, 0, 0, 0), metric: 1 << 24, tos: vec![] }));
+        assert_eq!(summary.to_bytes(Version::V2), Err(OspfError::Field));
+        let ext = lsa(
+            5,
+            LsaBody::AsExternal(AsExternalLsa {
+                network_mask: ip4(0, 0, 0, 0),
+                routes: vec![
+                    ExternalRoute {
+                        type2: false,
+                        tos: 0,
+                        metric: 0,
+                        forwarding_address: ip4(0, 0, 0, 0),
+                        route_tag: 0,
+                    },
+                    ExternalRoute {
+                        type2: false,
+                        tos: 128,
+                        metric: 0,
+                        forwarding_address: ip4(0, 0, 0, 0),
+                        route_tag: 0,
+                    },
+                ],
+            }),
+        );
+        assert_eq!(ext.to_bytes(Version::V2), Err(OspfError::Field));
+        let ia = lsa(0x2003, LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 0, prefix: pfx(0, "::") }));
+        let mut bad = ia.clone();
+        let LsaBody::InterAreaPrefix(x) = &mut bad.body else { panic!() };
+        x.prefix.length = 129;
+        assert_eq!(bad.to_bytes(Version::V3), Err(OspfError::Field));
+        let mut bad = v3_lsas().remove(4);
+        let LsaBody::AsExternalV3(x) = &mut bad.body else { panic!() };
+        x.referenced = Some((0, ip4(0, 0, 0, 1)));
+        assert_eq!(bad.to_bytes(Version::V3), Err(OspfError::Field));
+        let router = lsa(
+            1,
+            LsaBody::Router(RouterLsa {
+                flags: 0,
+                links: vec![RouterLink {
+                    id: ip4(0, 0, 0, 0),
+                    data: ip4(0, 0, 0, 0),
+                    kind: 1,
+                    metric: 1,
+                    tos: vec![TosMetric { tos: 0, metric: 0 }; 256],
+                }],
+            }),
+        );
+        assert_eq!(router.to_bytes(Version::V2), Err(OspfError::Field));
+        let big = lsa(10, LsaBody::Other(vec![0; MAX_LSA - LSA_HEADER_LEN + 1]));
+        assert_eq!(big.to_bytes(Version::V2), Err(OspfError::TooLong));
+        let fits = lsa(10, LsaBody::Other(vec![0; MAX_LSA - LSA_HEADER_LEN]));
+        let b = fits.to_bytes(Version::V2).unwrap();
+        assert_eq!(Lsa::parse(&b, Version::V2), Ok((fits, MAX_LSA)));
+    }
+
+    #[test]
+    fn checksum_bounds() {
+        assert_eq!(checksum(&[2; 23], &v4_ends()), None);
+        let mut b = vec![0u8; 24];
+        b[3] = 25;
+        assert_eq!(checksum(&b, &v4_ends()), None);
+        b[3] = 23;
+        assert_eq!(checksum(&b, &v4_ends()), None);
+        b[3] = 24;
+        assert!(checksum(&b, &v4_ends()).is_some());
+        assert_eq!(checksum(&b[..15], &v6_ends()), None);
+    }
+
+    #[test]
+    fn every_truncated_prefix_fails() {
+        for (p, e) in samples() {
+            let b = p.to_bytes(&e).unwrap();
+            for n in 0..b.len() {
+                assert!(Packet::parse(&b[..n], &e).is_err(), "{n} of {p:?}");
+                assert!(decode_chunked(&b[..n], &e, 1).is_err());
+            }
+        }
+        for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
+            for l in lsas {
+                let b = l.to_bytes(v).unwrap();
+                for n in 0..b.len() {
+                    assert!(Lsa::parse(&b[..n], v).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoder_matches_parse() {
+        for (p, e) in samples() {
+            let b = p.to_bytes(&e).unwrap();
+            for size in [1, 2, 3, 7, 64, b.len()] {
+                assert_eq!(decode_chunked(&b, &e, size).as_ref(), Ok(&p));
+            }
+        }
+        // Early errors, and the same error after.
+        let mut d = Decoder::new(v4_ends());
+        assert_eq!(d.feed(&[2]), Ok(()));
+        assert_eq!(d.feed(&[9]), Err(OspfError::Type(9)));
+        assert_eq!(d.feed(&[1]), Err(OspfError::Type(9)));
+        assert_eq!(d.buffered(), 0);
+        assert_eq!(d.finish(), Err(OspfError::Type(9)));
+        let mut d = Decoder::new(v6_ends());
+        assert_eq!(d.feed(&[2]), Err(OspfError::Family));
+        // Bytes past the length.
+        let b = hello_v2(ip4(1, 1, 1, 1), vec![]).to_bytes(&v4_ends()).unwrap();
+        let mut d = Decoder::new(v4_ends());
+        assert_eq!(d.feed(&b), Ok(()));
+        assert_eq!(d.buffered(), b.len());
+        assert_eq!(d.feed(&[0]), Err(OspfError::Trailing));
+        // A huge feed is cut at the cap and still reads as trailing.
+        let mut big = b.clone();
+        big.resize(MAX_MESSAGE + 100, 0);
+        let mut d = Decoder::new(v4_ends());
+        assert_eq!(d.feed(&big), Err(OspfError::Trailing));
+        assert_eq!(Packet::parse(&big, &v4_ends()), Err(OspfError::Trailing));
+        assert_eq!(Decoder::new(v4_ends()).finish(), Err(OspfError::Truncated));
+    }
+
+    #[test]
+    fn errors_display() {
+        for e in [OspfError::Version(9), OspfError::LsaLength(3), OspfError::PrefixLength(200), OspfError::Mismatch] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    // A small deterministic generator, so the fuzz loop runs the same way
+    // every time.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: usize) -> usize {
+            self.next() as usize % n.max(1)
+        }
+        fn ip4(&mut self) -> Ipv4Addr {
+            Ipv4Addr::from(self.next())
+        }
+        fn ip6(&mut self) -> Ipv6Addr {
+            let mut a = [0u8; 16];
+            for x in &mut a {
+                *x = self.next() as u8;
+            }
+            Ipv6Addr::from(a)
+        }
+        fn u24(&mut self) -> u32 {
+            self.next() & MAX_U24
+        }
+        fn prefix(&mut self) -> Prefix {
+            let length = self.below(129) as u8;
+            let mut a = self.ip6().octets();
+            for x in &mut a[prefix_bytes(length)..] {
+                *x = 0;
+            }
+            Prefix { length, options: self.next() as u8, address: Ipv6Addr::from(a) }
+        }
+    }
+
+    fn random_lsa(rng: &mut Lcg, v: Version) -> Lsa {
+        let n = rng.below(4);
+        let (ls_type, body) = match v {
+            Version::V2 => match rng.below(6) {
+                0 => (
+                    1,
+                    LsaBody::Router(RouterLsa {
+                        flags: rng.next() as u8,
+                        links: (0..n)
+                            .map(|_| RouterLink {
+                                id: rng.ip4(),
+                                data: rng.ip4(),
+                                kind: rng.next() as u8,
+                                metric: rng.next() as u16,
+                                tos: (0..rng.below(3))
+                                    .map(|_| TosMetric { tos: rng.next() as u8, metric: rng.next() as u16 })
+                                    .collect(),
+                            })
+                            .collect(),
+                    }),
+                ),
+                1 => (
+                    2,
+                    LsaBody::Network(NetworkLsa {
+                        network_mask: rng.ip4(),
+                        attached_routers: (0..n).map(|_| rng.ip4()).collect(),
+                    }),
+                ),
+                2 => (
+                    3 + rng.below(2) as u16,
+                    LsaBody::Summary(SummaryLsa {
+                        network_mask: rng.ip4(),
+                        metric: rng.u24(),
+                        tos: (0..n).map(|_| (rng.next() as u8, rng.u24())).collect(),
+                    }),
+                ),
+                3 => (
+                    if rng.below(2) == 0 { 5 } else { 7 },
+                    LsaBody::AsExternal(AsExternalLsa {
+                        network_mask: rng.ip4(),
+                        routes: (0..=n)
+                            .map(|i| ExternalRoute {
+                                type2: rng.below(2) == 0,
+                                tos: if i == 0 { 0 } else { rng.next() as u8 & 0x7f },
+                                metric: rng.u24(),
+                                forwarding_address: rng.ip4(),
+                                route_tag: rng.next(),
+                            })
+                            .collect(),
+                    }),
+                ),
+                _ => (
+                    100 + rng.below(100) as u16,
+                    LsaBody::Other((0..rng.below(12)).map(|_| rng.next() as u8).collect()),
+                ),
+            },
+            Version::V3 => match rng.below(9) {
+                0 => (
+                    lsa_type_v3::ROUTER,
+                    LsaBody::RouterV3(RouterLsaV3 {
+                        flags: rng.next() as u8,
+                        options: rng.u24(),
+                        interfaces: (0..n)
+                            .map(|_| RouterInterface {
+                                kind: rng.next() as u8,
+                                metric: rng.next() as u16,
+                                interface_id: rng.next(),
+                                neighbor_interface_id: rng.next(),
+                                neighbor_router_id: rng.ip4(),
+                            })
+                            .collect(),
+                    }),
+                ),
+                1 => (
+                    lsa_type_v3::NETWORK,
+                    LsaBody::NetworkV3(NetworkLsaV3 {
+                        options: rng.u24(),
+                        attached_routers: (0..n).map(|_| rng.ip4()).collect(),
+                    }),
+                ),
+                2 => (
+                    lsa_type_v3::INTER_AREA_PREFIX,
+                    LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: rng.u24(), prefix: rng.prefix() }),
+                ),
+                3 => (
+                    lsa_type_v3::INTER_AREA_ROUTER,
+                    LsaBody::InterAreaRouter(InterAreaRouterLsa {
+                        options: rng.u24(),
+                        metric: rng.u24(),
+                        destination: rng.ip4(),
+                    }),
+                ),
+                4 => (
+                    if rng.below(2) == 0 { lsa_type_v3::AS_EXTERNAL } else { lsa_type_v3::NSSA },
+                    LsaBody::AsExternalV3(AsExternalLsaV3 {
+                        type2: rng.below(2) == 0,
+                        metric: rng.u24(),
+                        prefix: rng.prefix(),
+                        forwarding_address: if rng.below(2) == 0 { Some(rng.ip6()) } else { None },
+                        route_tag: if rng.below(2) == 0 { Some(rng.next()) } else { None },
+                        referenced: if rng.below(2) == 0 {
+                            Some((1 + rng.below(0xfffe) as u16, rng.ip4()))
+                        } else {
+                            None
+                        },
+                    }),
+                ),
+                5 => (
+                    lsa_type_v3::LINK,
+                    LsaBody::Link(LinkLsa {
+                        priority: rng.next() as u8,
+                        options: rng.u24(),
+                        link_local_address: rng.ip6(),
+                        prefixes: (0..n).map(|_| rng.prefix()).collect(),
+                    }),
+                ),
+                6 => (
+                    lsa_type_v3::INTRA_AREA_PREFIX,
+                    LsaBody::IntraAreaPrefix(IntraAreaPrefixLsa {
+                        referenced_ls_type: rng.next() as u16,
+                        referenced_link_state_id: rng.ip4(),
+                        referenced_advertising_router: rng.ip4(),
+                        prefixes: (0..n).map(|_| (rng.prefix(), rng.next() as u16)).collect(),
+                    }),
+                ),
+                _ => (
+                    0x0100 + rng.below(100) as u16,
+                    LsaBody::Other((0..rng.below(12)).map(|_| rng.next() as u8).collect()),
+                ),
+            },
+        };
+        Lsa {
+            age: rng.next() as u16,
+            options: if v == Version::V2 { rng.next() as u8 } else { 0 },
+            ls_type,
+            link_state_id: rng.ip4(),
+            advertising_router: rng.ip4(),
+            sequence: rng.next(),
+            body,
+        }
+    }
+
+    fn random_header(rng: &mut Lcg, v: Version) -> LsaHeader {
+        LsaHeader {
+            age: rng.next() as u16,
+            options: if v == Version::V2 { rng.next() as u8 } else { 0 },
+            ls_type: if v == Version::V2 { rng.next() as u8 as u16 } else { rng.next() as u16 },
+            link_state_id: rng.ip4(),
+            advertising_router: rng.ip4(),
+            sequence: rng.next(),
+            checksum: rng.next() as u16,
+            length: rng.next() as u16,
+        }
+    }
+
+    fn random_packet(rng: &mut Lcg, v: Version) -> Packet {
+        let n = rng.below(4);
+        let body = match rng.below(5) {
+            0 => match v {
+                Version::V2 => Body::HelloV2(HelloV2 {
+                    network_mask: rng.ip4(),
+                    hello_interval: rng.next() as u16,
+                    options: rng.next() as u8,
+                    priority: rng.next() as u8,
+                    dead_interval: rng.next(),
+                    designated_router: rng.ip4(),
+                    backup_designated_router: rng.ip4(),
+                    neighbors: (0..n).map(|_| rng.ip4()).collect(),
+                }),
+                Version::V3 => Body::HelloV3(HelloV3 {
+                    interface_id: rng.next(),
+                    priority: rng.next() as u8,
+                    options: rng.u24(),
+                    hello_interval: rng.next() as u16,
+                    dead_interval: rng.next() as u16,
+                    designated_router: rng.ip4(),
+                    backup_designated_router: rng.ip4(),
+                    neighbors: (0..n).map(|_| rng.ip4()).collect(),
+                }),
+            },
+            1 => Body::DatabaseDescription(DatabaseDescription {
+                mtu: rng.next() as u16,
+                options: if v == Version::V2 { rng.next() & 0xff } else { rng.u24() },
+                flags: rng.next() as u8,
+                sequence: rng.next(),
+                headers: (0..n).map(|_| random_header(rng, v)).collect(),
+            }),
+            2 => Body::LinkStateRequest(
+                (0..n)
+                    .map(|_| LsaKey {
+                        ls_type: if v == Version::V2 { rng.next() } else { rng.next() & 0xffff },
+                        link_state_id: rng.ip4(),
+                        advertising_router: rng.ip4(),
+                    })
+                    .collect(),
+            ),
+            3 => Body::LinkStateUpdate((0..n).map(|_| random_lsa(rng, v)).collect()),
+            _ => Body::LinkStateAck((0..n).map(|_| random_header(rng, v)).collect()),
+        };
+        let header = match v {
+            Version::V2 => Header::V2 {
+                auth: match rng.below(4) {
+                    0 => Auth::Null,
+                    1 => Auth::Simple([rng.next() as u8; 8]),
+                    2 => Auth::Cryptographic {
+                        key_id: rng.next() as u8,
+                        sequence: rng.next(),
+                        digest: (0..rng.below(33)).map(|_| rng.next() as u8).collect(),
+                    },
+                    _ => Auth::Other { kind: 3 + rng.below(100) as u16, data: [rng.next() as u8; 8] },
+                },
+            },
+            Version::V3 => Header::V3 { instance_id: rng.next() as u8 },
+        };
+        Packet { router_id: rng.ip4(), area_id: rng.ip4(), header, body }
+    }
+
+    /// What the fuzz target checks, for one buffer.
+    fn check_bytes(data: &[u8], e: &Endpoints) {
+        let parsed = Packet::parse(data, e);
+        assert_eq!(decode_chunked(data, e, 1), parsed);
+        assert_eq!(decode_chunked(data, e, data.len()), parsed);
+        if let Ok(p) = &parsed {
+            let b = p.to_bytes(e).unwrap();
+            assert_eq!(b.len(), data.len());
+            assert_eq!(Packet::parse(&b, e).as_ref(), Ok(p));
+        }
+        for v in [Version::V2, Version::V3] {
+            if let Ok((l, n)) = Lsa::parse(data, v) {
+                assert!(n <= data.len());
+                let b = l.to_bytes(v).unwrap();
+                assert_eq!(b.len(), n);
+                assert_eq!(Lsa::parse(&b, v), Ok((l, n)));
+            }
+        }
+    }
+
+    /// A prefix with a length that may be out of range, built with
+    /// [`Prefix::new`].
+    fn wild_prefix(rng: &mut Lcg) -> Prefix {
+        Prefix::new(rng.next() as u8, rng.next() as u8, rng.ip6())
+    }
+
+    /// Sets one field of `l` to a value that may not fit, as a careless
+    /// world might.
+    fn perturb_lsa(rng: &mut Lcg, l: &mut Lsa) {
+        match rng.below(4) {
+            0 => l.ls_type = rng.next() as u16,
+            1 => l.options = rng.next() as u8,
+            2 => match &mut l.body {
+                LsaBody::Router(r) => {
+                    if let Some(link) = r.links.first_mut() {
+                        link.tos = vec![TosMetric { tos: 1, metric: 1 }; rng.below(300)];
+                    }
+                }
+                LsaBody::Summary(s) => s.metric = rng.next(),
+                LsaBody::AsExternal(e) => match rng.below(3) {
+                    0 => e.routes.clear(),
+                    1 => e.routes[0].tos = rng.next() as u8,
+                    _ => e.routes[0].metric = rng.next(),
+                },
+                LsaBody::RouterV3(r) => r.options = rng.next(),
+                LsaBody::NetworkV3(n) => n.options = rng.next(),
+                LsaBody::InterAreaPrefix(p) => p.prefix = wild_prefix(rng),
+                LsaBody::InterAreaRouter(r) => r.metric = rng.next(),
+                LsaBody::AsExternalV3(e) => {
+                    e.prefix = wild_prefix(rng);
+                    e.referenced = Some((rng.below(3) as u16, rng.ip4()));
+                }
+                LsaBody::Link(k) => k.prefixes.push(wild_prefix(rng)),
+                LsaBody::IntraAreaPrefix(k) => k.prefixes.push((wild_prefix(rng), 1)),
+                LsaBody::Network(_) | LsaBody::Other(_) => {}
+            },
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn writers_never_write_what_readers_reject() {
+        // Values with fields set out of range: each write either fails or
+        // gives bytes that read back as the same value.
+        let mut rng = Lcg(0x77);
+        let ends = [v4_ends(), v6_ends()];
+        let mut written = 0;
+        for round in 0..6000 {
+            let e = ends[round % 2];
+            let v = e.version();
+            let mut p = random_packet(&mut rng, v);
+            match &mut p.body {
+                Body::LinkStateUpdate(lsas) => {
+                    for l in lsas {
+                        perturb_lsa(&mut rng, l);
+                    }
+                }
+                Body::DatabaseDescription(d) => {
+                    d.options = rng.next() >> rng.below(32);
+                    if let Some(h) = d.headers.first_mut() {
+                        h.options = rng.next() as u8;
+                        h.ls_type = rng.next() as u16;
+                    }
+                }
+                Body::LinkStateAck(hs) => {
+                    if let Some(h) = hs.first_mut() {
+                        h.options = rng.next() as u8;
+                        h.ls_type = rng.next() as u16;
+                    }
+                }
+                Body::LinkStateRequest(keys) => {
+                    if let Some(k) = keys.first_mut() {
+                        k.ls_type = rng.next();
+                    }
+                }
+                Body::HelloV3(h) => h.options = rng.next() >> rng.below(32),
+                Body::HelloV2(_) => {}
+            }
+            match rng.below(4) {
+                0 => p.header = Header::V2 { auth: Auth::Other { kind: rng.below(5) as u16, data: [7; 8] } },
+                1 => p.header = Header::V3 { instance_id: 1 },
+                _ => {}
+            }
+            let end = if rng.below(8) == 0 { ends[(round + 1) % 2] } else { e };
+            if let Ok(b) = p.to_bytes(&end) {
+                assert_eq!(Packet::parse(&b, &end).as_ref(), Ok(&p), "round {round}");
+                written += 1;
+            }
+            let mut l = random_lsa(&mut rng, v);
+            perturb_lsa(&mut rng, &mut l);
+            if let Ok(b) = l.to_bytes(v) {
+                assert_eq!(Lsa::parse(&b, v), Ok((l, b.len())), "round {round}");
+            }
+        }
+        // Many values still fit, so the check has teeth.
+        assert!(written > 1000, "{written}");
+    }
+
+    #[test]
+    fn fuzz_loop() {
+        let mut rng = Lcg(0x05f5);
+        let ends = [v4_ends(), v6_ends()];
+        for round in 0..6000 {
+            let e = ends[round % 2];
+            let p = random_packet(&mut rng, e.version());
+            let good = p.to_bytes(&e).unwrap();
+            assert_eq!(Packet::parse(&good, &e).as_ref(), Ok(&p), "round {round}");
+            check_bytes(&good, &e);
+            // Mutations, with the checksums fixed again so the parser
+            // looks past them.
+            let mut bad = good.clone();
+            for _ in 0..1 + rng.below(4) {
+                if bad.is_empty() {
+                    break;
+                }
+                let i = rng.below(bad.len());
+                match rng.below(4) {
+                    0 => bad[i] = rng.next() as u8,
+                    1 => bad[i] ^= 1 << rng.below(8),
+                    2 => bad.truncate(i),
+                    _ => bad.insert(i, rng.next() as u8),
+                }
+            }
+            check_bytes(&bad, &e);
+            check_bytes(&fix(bad.clone(), &e), &e);
+            // An LSA, with its checksum set right after mutating it.
+            let l = random_lsa(&mut rng, e.version());
+            let mut lb = l.to_bytes(e.version()).unwrap();
+            if !lb.is_empty() {
+                let i = rng.below(lb.len());
+                lb[i] = rng.next() as u8;
+            }
+            check_bytes(&fix_lsa(lb), &e);
+            // Random bytes behind a plausible header.
+            let len = rng.below(80);
+            let mut raw: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            if raw.len() >= 4 {
+                raw[0] = e.version().number();
+                raw[1] = 1 + rng.below(5) as u8;
+                raw[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+            }
+            check_bytes(&fix(raw, &e), &e);
+        }
+    }
+}

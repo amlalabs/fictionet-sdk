@@ -20,8 +20,8 @@
 //! written by [`write_packets`]. RFC 3550 calls such a datagram a compound
 //! packet and sets rules for it: it starts with a sender or receiver report
 //! and it carries an SDES CNAME. [`parse_compound`] reads a datagram and
-//! checks those rules, and [`check_compound`] checks packets a world is
-//! about to send.
+//! checks those rules, [`check_compound`] checks packets a world is about
+//! to send, and [`write_compound`] writes them and checks the bytes.
 //!
 //! Nothing here reads a socket. A world that plays a media server takes
 //! each UDP datagram it receives, reads it with [`Packet::parse`], which
@@ -221,8 +221,9 @@ pub struct RtpPacket {
 pub enum HeaderExtension {
     /// The one-byte form of RFC 8285 (profile `0xBEDE`). Each element has
     /// an ID from 1 to 14 and 1 to 16 bytes of data. A reader skips zero
-    /// bytes as padding, stops at ID 15, and rejects ID 0 with a nonzero
-    /// length. A writer leaves out elements that break these limits.
+    /// bytes as padding, and stops at ID 15 or at ID 0 with a nonzero
+    /// length, keeping the elements before it. A writer leaves out
+    /// elements that break these limits.
     OneByte(Vec<Element>),
     /// The two-byte form of RFC 8285 (profile `0x100X`). Each element has
     /// an ID from 1 to 255 and 0 to 255 bytes of data. A writer leaves out
@@ -265,8 +266,7 @@ pub enum RtpError {
     /// The padding bit was set, and the count in the last byte was 0 or
     /// ran into the header.
     Padding,
-    /// An RFC 8285 element ran past the end of the extension, or a
-    /// one-byte element had the reserved ID 0 with a length.
+    /// An RFC 8285 element ran past the end of the extension.
     Extension,
 }
 
@@ -277,9 +277,7 @@ impl std::fmt::Display for RtpError {
             RtpError::Version(v) => write!(f, "RTP version {v}, not 2"),
             RtpError::TooLong(n) => write!(f, "RTP packet of {n} bytes, over {MAX_PACKET}"),
             RtpError::Padding => f.write_str("RTP padding count is 0 or runs into the header"),
-            RtpError::Extension => {
-                f.write_str("RTP header extension element is malformed or runs past its end")
-            }
+            RtpError::Extension => f.write_str("RTP header extension element runs past its end"),
         }
     }
 }
@@ -351,8 +349,19 @@ impl RtpPacket {
         if self.extension.is_some() {
             b0 |= 0x10;
         }
-        let mut out =
-            Vec::with_capacity(RTP_HEADER_LEN + 4 * csrcs.len() + self.payload.len() + padding);
+        let header = RTP_HEADER_LEN + 4 * csrcs.len();
+        // The header is at most 72 bytes, so this never underflows.
+        let extension = self
+            .extension
+            .as_ref()
+            .map(|ext| ext.encode((MAX_PACKET - header - padding - 4) / 4 * 4));
+        let ext_len = extension.as_ref().map_or(0, |(_, data)| 4 + data.len());
+        let payload = &self.payload[..self
+            .payload
+            .len()
+            .min(MAX_PACKET - header - ext_len - padding)];
+        // The exact length, so the buffer is never larger than MAX_PACKET.
+        let mut out = Vec::with_capacity(header + ext_len + payload.len() + padding);
         out.push(b0);
         out.push(u8::from(self.marker) << 7 | self.payload_type & 0x7f);
         out.extend_from_slice(&self.sequence.to_be_bytes());
@@ -361,16 +370,12 @@ impl RtpPacket {
         for c in csrcs {
             out.extend_from_slice(&c.to_be_bytes());
         }
-        if let Some(ext) = &self.extension {
-            // At most 72 bytes are written so far, so this never underflows.
-            let room = (MAX_PACKET - out.len() - padding - 4) / 4 * 4;
-            let (profile, data) = ext.encode(room);
+        if let Some((profile, data)) = &extension {
             out.extend_from_slice(&profile.to_be_bytes());
             out.extend_from_slice(&((data.len() / 4) as u16).to_be_bytes());
-            out.extend_from_slice(&data);
+            out.extend_from_slice(data);
         }
-        let room = MAX_PACKET - out.len() - padding;
-        out.extend_from_slice(&self.payload[..self.payload.len().min(room)]);
+        out.extend_from_slice(payload);
         if padding > 0 {
             out.resize(out.len() + padding - 1, 0);
             out.push(self.padding);
@@ -468,14 +473,10 @@ fn parse_extension(profile: u16, data: &[u8]) -> Result<HeaderExtension, RtpErro
                 i += 1;
                 continue;
             }
-            // ID 0 is reserved for padding, which is a zero byte, so ID 0
-            // with a length is neither padding nor an element.
-            if id == 0 {
-                return Err(RtpError::Extension);
-            }
-            // ID 15 ends processing of the whole extension (RFC 8285
+            // ID 0 with a length, and ID 15, end processing of the whole
+            // extension; the elements before them are kept (RFC 8285
             // section 4.2).
-            if id == 15 {
+            if id == 0 || id == 15 {
                 break;
             }
             (id, usize::from(first & 0x0f) + 1, i + 1)
@@ -604,7 +605,10 @@ pub struct SdesItem {
     /// out items of type 0, which would end the list.
     pub kind: u8,
     /// The item's text, UTF-8 by the specification but kept as bytes. A
-    /// writer keeps the first [`MAX_TEXT`] bytes.
+    /// writer keeps the first [`MAX_TEXT`] bytes, cutting UTF-8 text at a
+    /// character boundary. A PRIV item's text starts with the prefix
+    /// length, then the prefix and the value; a reader rejects, and a
+    /// writer leaves out, a PRIV item whose prefix length runs past it.
     pub text: Vec<u8>,
 }
 
@@ -615,7 +619,7 @@ pub struct Bye {
     /// [`MAX_COUNT`].
     pub sources: Vec<u32>,
     /// Why they are leaving, if a reason is given. A writer keeps the first
-    /// [`MAX_TEXT`] bytes.
+    /// [`MAX_TEXT`] bytes, cutting UTF-8 text at a character boundary.
     pub reason: Option<Vec<u8>>,
 }
 
@@ -717,7 +721,8 @@ pub struct Sli {
 /// A reference picture selection indication (RFC 4585 section 6.3.3).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rpsi {
-    /// How many bits at the end of `data` are padding.
+    /// How many bits at the end of `data` are padding. They are zero: a
+    /// reader rejects set padding bits, and a writer clears them.
     pub padding_bits: u8,
     /// The payload type the bit string is for. A writer keeps the low 7
     /// bits.
@@ -748,7 +753,8 @@ pub enum RtcpError {
     /// A compound packet started with this type, not a sender or receiver
     /// report.
     FirstNotReport(u8),
-    /// A compound packet had no SDES CNAME item.
+    /// A compound packet had no SDES CNAME item in an SDES packet right
+    /// after its reports.
     NoCname,
 }
 
@@ -764,7 +770,9 @@ impl std::fmt::Display for RtcpError {
             RtcpError::FirstNotReport(t) => {
                 write!(f, "compound RTCP packet starts with type {t}, not SR or RR")
             }
-            RtcpError::NoCname => f.write_str("compound RTCP packet has no SDES CNAME"),
+            RtcpError::NoCname => {
+                f.write_str("compound RTCP packet has no SDES CNAME after its reports")
+            }
         }
     }
 }
@@ -816,10 +824,14 @@ pub fn parse_compound(b: &[u8]) -> Result<Vec<RtcpPacket>, RtcpError> {
     Ok(packets)
 }
 
-/// Checks the rules RFC 3550 sets for a compound packet: it holds at least
-/// one packet, the first is a sender or receiver report, and an SDES
-/// packet in it has a CNAME item. ([`parse_packets`] checks the rest:
-/// versions, lengths and padding.)
+/// Checks the rules RFC 3550 section 6.1 sets for a compound packet, in
+/// the order it lists them: it holds at least one packet, the first is a
+/// sender or receiver report, and any further reports are followed by an
+/// SDES packet with a CNAME item, before any packet of another type. Of a
+/// run of SDES packets there, one CNAME is enough. Only the first
+/// [`MAX_COUNT`] chunks of an SDES packet count, since a writer keeps no
+/// more. ([`parse_packets`] checks the rest: versions, lengths and
+/// padding.)
 pub fn check_compound(packets: &[RtcpPacket]) -> Result<(), RtcpError> {
     let first = packets.first().ok_or(RtcpError::Empty)?;
     if !matches!(
@@ -828,12 +840,24 @@ pub fn check_compound(packets: &[RtcpPacket]) -> Result<(), RtcpError> {
     ) {
         return Err(RtcpError::FirstNotReport(first.packet_type()));
     }
-    let has_cname = packets.iter().any(|p| match p {
-        RtcpPacket::SourceDescription(chunks) => chunks
-            .iter()
-            .any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME)),
-        _ => false,
-    });
+    let has_cname = packets
+        .iter()
+        .skip_while(|p| {
+            matches!(
+                p,
+                RtcpPacket::SenderReport(_) | RtcpPacket::ReceiverReport(_)
+            )
+        })
+        .map_while(|p| match p {
+            RtcpPacket::SourceDescription(chunks) => Some(chunks),
+            _ => None,
+        })
+        .any(|chunks| {
+            chunks
+                .iter()
+                .take(MAX_COUNT)
+                .any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME))
+        });
     if has_cname {
         Ok(())
     } else {
@@ -842,8 +866,9 @@ pub fn check_compound(packets: &[RtcpPacket]) -> Result<(), RtcpError> {
 }
 
 /// The bytes of `packets`, back to back, with no padding. Writing stops
-/// before a packet that would take the total past [`MAX_PACKET`]. This
-/// does not check the compound rules; call [`check_compound`] for that.
+/// before a packet that would take the total past [`MAX_PACKET`], and a
+/// packet that writes no bytes is left out. This does not check the
+/// compound rules; [`write_compound`] does.
 pub fn write_packets(packets: &[RtcpPacket]) -> Vec<u8> {
     let mut out = Vec::new();
     for p in packets {
@@ -854,6 +879,31 @@ pub fn write_packets(packets: &[RtcpPacket]) -> Vec<u8> {
         out.extend_from_slice(&bytes);
     }
     out
+}
+
+/// The bytes of a compound packet, as [`write_packets`] makes them, if
+/// every packet is written and the bytes pass [`parse_compound`]. It fails
+/// with [`RtcpError::Body`] for a packet that writes no bytes, such as a
+/// NACK with no entries, with [`RtcpError::TooLong`] when the packets do
+/// not fit in [`MAX_PACKET`] bytes, and with the error of
+/// [`check_compound`] when what is written breaks a compound rule, as when
+/// a writer cut the SDES item with the CNAME.
+pub fn write_compound(packets: &[RtcpPacket]) -> Result<Vec<u8>, RtcpError> {
+    check_compound(packets)?;
+    let mut out = Vec::new();
+    for p in packets {
+        let bytes = p.to_bytes();
+        if bytes.is_empty() {
+            return Err(RtcpError::Body(p.packet_type()));
+        }
+        let total = out.len() + bytes.len();
+        if total > MAX_PACKET {
+            return Err(RtcpError::TooLong(total));
+        }
+        out.extend_from_slice(&bytes);
+    }
+    parse_compound(&out)?;
+    Ok(out)
 }
 
 impl RtcpPacket {
@@ -902,7 +952,7 @@ impl RtcpPacket {
                     body.extend_from_slice(&s.to_be_bytes());
                 }
                 if let Some(reason) = &bye.reason {
-                    let reason = &reason[..reason.len().min(MAX_TEXT)];
+                    let reason = cut_text(reason);
                     body.push(reason.len() as u8);
                     body.extend_from_slice(reason);
                     pad4(&mut body);
@@ -991,6 +1041,8 @@ impl FeedbackMessage {
                 let bits = (body.len() - start - 2) * 8;
                 let pb = (usize::from(r.padding_bits) + 8 * added).min(255).min(bits);
                 body[start] = pb as u8;
+                // Padding bits are zero (RFC 4585 section 6.3.3.2).
+                clear_low_bits(&mut body[start + 2..], pb);
             }
             FeedbackMessage::Afb(fci)
             | FeedbackMessage::TransportOther { fci, .. }
@@ -1059,6 +1111,9 @@ fn parse_body(pt: u8, count: u8, body: &[u8]) -> Result<RtcpPacket, RtcpError> {
                     }
                     let len = r.u8().ok_or(bad)?;
                     let text = r.take(usize::from(len)).ok_or(bad)?;
+                    if !sdes_text_ok(kind, text) {
+                        return Err(bad);
+                    }
                     items.push(SdesItem {
                         kind,
                         text: text.to_vec(),
@@ -1152,7 +1207,11 @@ fn parse_body(pt: u8, count: u8, body: &[u8]) -> Result<RtcpPacket, RtcpError> {
                     let [padding_bits, pt_byte, data @ ..] = fci else {
                         return Err(bad);
                     };
-                    if usize::from(*padding_bits) > data.len() * 8 {
+                    // The padding bits must fit and be zero (RFC 4585
+                    // section 6.3.3.2).
+                    if usize::from(*padding_bits) > data.len() * 8
+                        || low_bits_set(data, usize::from(*padding_bits))
+                    {
                         return Err(bad);
                     }
                     FeedbackMessage::Rpsi(Rpsi {
@@ -1226,10 +1285,10 @@ fn write_sdes(body: &mut Vec<u8>, chunks: &[SdesChunk], room: usize) -> u8 {
         }
         body.extend_from_slice(&c.ssrc.to_be_bytes());
         for item in &c.items {
-            if item.kind == sdes::END {
+            let text = cut_text(&item.text);
+            if item.kind == sdes::END || !sdes_text_ok(item.kind, text) {
                 continue;
             }
-            let text = &item.text[..item.text.len().min(MAX_TEXT)];
             if (body.len() + 2 + text.len() + 1).div_ceil(4) * 4 > room {
                 break;
             }
@@ -1250,6 +1309,55 @@ fn append_capped(body: &mut Vec<u8>, data: &[u8], room: usize) {
     let n = data.len().min(room.saturating_sub(body.len()));
     body.extend_from_slice(&data[..n]);
     pad4(body);
+}
+
+/// Whether any of the last `n` bits of `b` is set. `n` is at most
+/// `8 * b.len()`.
+fn low_bits_set(b: &[u8], n: usize) -> bool {
+    let (whole, part) = (n / 8, n % 8);
+    let tail = &b[b.len() - whole..];
+    let partial = b.len().checked_sub(whole + 1).map_or(0, |i| b[i]);
+    tail.iter().any(|&x| x != 0) || part > 0 && partial & ((1u8 << part) - 1) != 0
+}
+
+/// Clears the last `n` bits of `b`. `n` is at most `8 * b.len()`.
+fn clear_low_bits(b: &mut [u8], n: usize) {
+    let (whole, part) = (n / 8, n % 8);
+    let len = b.len();
+    b[len - whole..].fill(0);
+    if part > 0
+        && let Some(x) = len.checked_sub(whole + 1).and_then(|i| b.get_mut(i)) {
+            *x &= !((1u8 << part) - 1);
+        }
+}
+
+/// The first [`MAX_TEXT`] bytes of SDES or BYE text. Text that is UTF-8,
+/// as RFC 3550 says it is, is cut at a character boundary, so it stays
+/// UTF-8.
+fn cut_text(text: &[u8]) -> &[u8] {
+    if text.len() <= MAX_TEXT {
+        return text;
+    }
+    match std::str::from_utf8(text) {
+        Ok(s) => {
+            let mut end = MAX_TEXT;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            &text[..end]
+        }
+        Err(_) => &text[..MAX_TEXT],
+    }
+}
+
+/// Whether an SDES item's text reads as its type says: a PRIV item holds
+/// a prefix length, then at least that many bytes of prefix (RFC 3550
+/// section 6.5.8). Other types hold any text.
+fn sdes_text_ok(kind: u8, text: &[u8]) -> bool {
+    kind != sdes::PRIV
+        || text
+            .split_first()
+            .is_some_and(|(&n, rest)| usize::from(n) <= rest.len())
 }
 
 fn pad4(b: &mut Vec<u8>) {
@@ -1324,13 +1432,15 @@ pub fn frame(packet: &[u8]) -> Vec<u8> {
 
 /// Splits an RFC 4571 byte stream into packets. Feed it the bytes a
 /// connection reads, in order, and take packets out until it has none.
-/// Each packet's bytes then go to [`Packet::parse`]. It holds at most
-/// [`MAX_BUFFERED`] bytes that have not been taken out.
+/// A frame of length 0 is the null packet RFC 4571 section 2 allows, and
+/// comes out as no bytes: skip it. Each other packet's bytes then go to
+/// [`Packet::parse`]. It holds at most [`MAX_BUFFERED`] bytes that have
+/// not been taken out.
 ///
 /// ```
 /// use fictionet::stdlib::rtp::{Decoder, frame};
 ///
-/// let stream = [frame(&[1, 2]), frame(&[3])].concat();
+/// let stream = [frame(&[1, 2]), frame(&[]), frame(&[3])].concat();
 /// let mut d = Decoder::new();
 /// let mut packets = Vec::new();
 /// let mut rest = &stream[..];
@@ -1338,7 +1448,10 @@ pub fn frame(packet: &[u8]) -> Vec<u8> {
 ///     let used = d.feed(rest);
 ///     rest = &rest[used..];
 ///     while let Some(p) = d.next_packet() {
-///         packets.push(p);
+///         // A null packet carries nothing.
+///         if !p.is_empty() {
+///             packets.push(p);
+///         }
 ///     }
 /// }
 /// assert_eq!(packets, [vec![1, 2], vec![3]]);
@@ -1376,7 +1489,8 @@ impl Decoder {
     }
 
     /// The next whole packet, if one has come. Any 16-bit length is valid,
-    /// so the stream never breaks.
+    /// so the stream never breaks; a null packet, of length 0, comes out
+    /// empty.
     pub fn next_packet(&mut self) -> Option<Vec<u8>> {
         let rest = self.buf.get(self.start..)?;
         let [a, b, ..] = *rest else { return None };
@@ -2079,7 +2193,8 @@ mod tests {
             message: FeedbackMessage::Rpsi(rpsi),
         })
         .to_bytes();
-        assert_eq!(&b[12..], &[11, 0x60, 0xff, 0]);
+        // The three padding bits set in 0xff are cleared.
+        assert_eq!(&b[12..], &[11, 0x60, 0xf8, 0]);
         let [
             RtcpPacket::Feedback(Feedback {
                 message: FeedbackMessage::Rpsi(r),
@@ -2094,7 +2209,7 @@ mod tests {
             &Rpsi {
                 padding_bits: 11,
                 payload_type: 0x60,
-                data: vec![0xff, 0]
+                data: vec![0xf8, 0]
             }
         );
         // An FMT this module does not read keeps its FCI.
@@ -2545,7 +2660,13 @@ mod tests {
             for p in &ps {
                 assert_eq!(parse_packets(&p.to_bytes()), Ok(vec![p.clone()]));
             }
-            let _ = check_compound(&ps);
+            // Packets read from a datagram that pass the compound rules
+            // write as a compound packet, the same bytes as write_packets.
+            let ok = check_compound(&ps).is_ok();
+            assert_eq!(parse_compound(data).is_ok(), ok);
+            if ok {
+                assert_eq!(write_compound(&ps), Ok(out));
+            }
         }
         let _ = Packet::parse(data);
         // The bytes as an RFC 4571 stream, whole and a byte at a time.
@@ -2788,7 +2909,11 @@ mod tests {
                 csrcs: (0..rng.below(20)).map(|_| rng.next()).collect(),
                 extension,
                 payload: {
-                    let n = rng.below(40);
+                    let n = if rng.below(50) == 0 {
+                        MAX_PACKET + rng.below(MAX_PACKET)
+                    } else {
+                        rng.below(40)
+                    };
                     rng.bytes(n)
                 },
                 padding: if rng.below(2) == 0 {
@@ -2798,6 +2923,7 @@ mod tests {
                 },
             };
             let out = p.to_bytes();
+            assert!(out.len() <= MAX_PACKET && out.capacity() <= MAX_PACKET);
             // An Other in an RFC 8285 form reads as that form, so only
             // the second write is sure to match.
             let back = RtpPacket::parse(&out).unwrap();
@@ -2809,6 +2935,11 @@ mod tests {
             let out = write_packets(&packets);
             let back = parse_packets(&out).unwrap();
             assert_eq!(parse_packets(&write_packets(&back)), Ok(back));
+            // What write_compound gives always passes parse_compound.
+            if let Ok(b) = write_compound(&packets) {
+                assert_eq!(b, out);
+                assert!(parse_compound(&b).is_ok());
+            }
             check_bytes(&out);
         }
     }
@@ -2854,15 +2985,37 @@ mod tests {
     }
 
     #[test]
-    fn review_one_byte_id_0_with_a_length_is_rejected() {
-        // RFC 8285 section 4.2: padding bytes are 0, and ID 0 must not be
-        // used as an identifier, so 0x05 is neither padding nor an element.
+    fn review_one_byte_id_0_with_a_length_ends_the_extension() {
+        // RFC 8285 section 4.2: an element with ID 0 and a nonzero length
+        // ends processing of the extension; the elements before it stay.
         let mut b = vec![0x90, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1];
-        b.extend_from_slice(&[0xbe, 0xde, 0, 1, 0x05, 0x10, 0xaa, 0]);
-        assert_eq!(RtpPacket::parse(&b), Err(RtpError::Extension));
+        b.extend_from_slice(&[0xbe, 0xde, 0, 1, 0x10, 0xaa, 0x05, 0x00, 0x77]);
+        let p = RtpPacket::parse(&b).unwrap();
+        assert_eq!(
+            p.extension,
+            Some(HeaderExtension::OneByte(vec![Element {
+                id: 1,
+                data: vec![0xaa]
+            }]))
+        );
+        assert_eq!(p.payload, [0x77]);
+        assert_eq!(RtpPacket::parse(&p.to_bytes()), Ok(p));
+        // At the start, it leaves no elements; what follows is not read.
+        b[16..20].copy_from_slice(&[0x05, 0x1f, 0xff, 0xff]);
+        let p = RtpPacket::parse(&b).unwrap();
+        assert_eq!(p.extension, Some(HeaderExtension::OneByte(vec![])));
         // A zero byte is still padding.
-        b[16] = 0;
-        assert!(RtpPacket::parse(&b).is_ok());
+        b[16..20].copy_from_slice(&[0, 0x10, 0xaa, 0]);
+        assert_eq!(
+            RtpPacket::parse(&b)
+                .unwrap()
+                .extension
+                .unwrap()
+                .get(1)
+                .unwrap()
+                .data,
+            [0xaa]
+        );
     }
 
     #[test]
@@ -2920,5 +3073,256 @@ mod tests {
             p.marker = false;
             assert_eq!(Packet::parse(&p.to_bytes()), Ok(Packet::Rtp(p)));
         }
+    }
+
+    #[test]
+    fn review_rtp_writer_allocates_at_most_max_packet() {
+        // A caller's payload far past MAX_PACKET must not size the buffer.
+        let mut p = rtp(&vec![1; 4 * MAX_PACKET]);
+        p.padding = 8;
+        let out = p.to_bytes();
+        assert_eq!(out.len(), MAX_PACKET);
+        assert!(out.capacity() <= MAX_PACKET, "{}", out.capacity());
+        p.extension = Some(HeaderExtension::Other {
+            profile: 1,
+            data: vec![2; 2 * MAX_PACKET],
+        });
+        let out = p.to_bytes();
+        assert!(out.len() <= MAX_PACKET && out.capacity() <= MAX_PACKET);
+        assert!(RtpPacket::parse(&out).is_ok());
+    }
+
+    #[test]
+    fn review_compound_cname_comes_right_after_the_reports() {
+        // RFC 3550 section 6.1: SR or RR, any additional RRs, then an SDES
+        // packet with a CNAME, then other packet types.
+        let rr = |ssrc| {
+            RtcpPacket::ReceiverReport(ReceiverReport {
+                ssrc,
+                reports: vec![],
+                extension: vec![],
+            })
+        };
+        let pli = RtcpPacket::Feedback(Feedback {
+            sender_ssrc: 1,
+            media_ssrc: 2,
+            message: FeedbackMessage::Pli,
+        });
+        assert_eq!(
+            check_compound(&[rr(1), pli.clone(), cname(1)]),
+            Err(RtcpError::NoCname)
+        );
+        assert_eq!(
+            parse_compound(&write_packets(&[rr(1), pli.clone(), cname(1)])),
+            Err(RtcpError::NoCname)
+        );
+        assert_eq!(
+            check_compound(&[rr(1), rr(2), cname(1), pli.clone()]),
+            Ok(())
+        );
+        let no_cname = RtcpPacket::SourceDescription(vec![SdesChunk {
+            ssrc: 1,
+            items: vec![],
+        }]);
+        assert_eq!(check_compound(&[rr(1), no_cname, cname(1), pli]), Ok(()));
+        // A CNAME only in a chunk past MAX_COUNT is never written.
+        let mut chunks = vec![
+            SdesChunk {
+                ssrc: 9,
+                items: vec![],
+            };
+            MAX_COUNT
+        ];
+        chunks.push(SdesChunk {
+            ssrc: 1,
+            items: vec![SdesItem {
+                kind: sdes::CNAME,
+                text: b"a@b".to_vec(),
+            }],
+        });
+        let late = [rr(1), RtcpPacket::SourceDescription(chunks)];
+        assert_eq!(check_compound(&late), Err(RtcpError::NoCname));
+        assert_eq!(write_compound(&late), Err(RtcpError::NoCname));
+    }
+
+    #[test]
+    fn review_write_compound_checks_what_is_written() {
+        // A report that fills the datagram leaves no room for the SDES:
+        // write_packets drops it, write_compound says so.
+        let big = RtcpPacket::ReceiverReport(ReceiverReport {
+            ssrc: 1,
+            reports: vec![],
+            extension: vec![0; 65_524],
+        });
+        let packets = [big, cname(1)];
+        assert_eq!(check_compound(&packets), Ok(()));
+        assert_eq!(
+            parse_compound(&write_packets(&packets)),
+            Err(RtcpError::NoCname)
+        );
+        assert!(matches!(
+            write_compound(&packets),
+            Err(RtcpError::TooLong(_))
+        ));
+        // A packet that writes no bytes, such as an empty NACK.
+        let rr = RtcpPacket::ReceiverReport(ReceiverReport {
+            ssrc: 1,
+            reports: vec![],
+            extension: vec![],
+        });
+        let empty_nack = RtcpPacket::Feedback(Feedback {
+            sender_ssrc: 1,
+            media_ssrc: 2,
+            message: FeedbackMessage::Nack(vec![]),
+        });
+        assert_eq!(
+            write_compound(&[rr.clone(), cname(1), empty_nack]),
+            Err(RtcpError::Body(packet_type::RTPFB))
+        );
+        // Packets that follow the rules write as write_packets does.
+        let packets = every_kind();
+        let b = write_compound(&packets).unwrap();
+        assert_eq!(b, write_packets(&packets));
+        assert_eq!(parse_compound(&b), Ok(packets));
+        assert_eq!(write_compound(&[]), Err(RtcpError::Empty));
+        assert_eq!(
+            write_compound(&[cname(1), rr]),
+            Err(RtcpError::FirstNotReport(202))
+        );
+    }
+
+    #[test]
+    fn review_rpsi_padding_bits_are_zero() {
+        // RFC 4585 section 6.3.3.2: the padding bits are set to zero.
+        let fci = |pb: u8, data: [u8; 2]| {
+            let mut b = vec![0x83, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2, pb, 96];
+            b.extend_from_slice(&data);
+            parse_packets(&b)
+        };
+        assert_eq!(fci(3, [0xab, 0x07]), Err(RtcpError::Body(206)));
+        assert_eq!(fci(9, [0x01, 0x00]), Err(RtcpError::Body(206)));
+        assert!(fci(3, [0xab, 0x08]).is_ok());
+        assert!(fci(9, [0x02, 0x00]).is_ok());
+        assert!(fci(16, [0, 0]).is_ok());
+        assert!(fci(0, [0xff, 0xff]).is_ok());
+        for pb in 0..=40u8 {
+            let p = RtcpPacket::Feedback(Feedback {
+                sender_ssrc: 1,
+                media_ssrc: 2,
+                message: FeedbackMessage::Rpsi(Rpsi {
+                    padding_bits: pb,
+                    payload_type: 96,
+                    data: vec![0xff; 3],
+                }),
+            });
+            let b = p.to_bytes();
+            let [
+                RtcpPacket::Feedback(Feedback {
+                    message: FeedbackMessage::Rpsi(r),
+                    ..
+                }),
+            ] = &parse_packets(&b).unwrap()[..]
+            else {
+                panic!("{pb}")
+            };
+            assert!(!low_bits_set(&r.data, usize::from(r.padding_bits)), "{pb}");
+        }
+    }
+
+    #[test]
+    fn review_text_is_cut_at_a_character_boundary() {
+        // RFC 3550 sections 6.5 and 6.6: SDES text and BYE reasons are
+        // UTF-8, so a cut must not split a character.
+        let text = "\u{e9}".repeat(128).into_bytes();
+        let sdes = RtcpPacket::SourceDescription(vec![SdesChunk {
+            ssrc: 1,
+            items: vec![SdesItem {
+                kind: sdes::NOTE,
+                text: text.clone(),
+            }],
+        }]);
+        let [RtcpPacket::SourceDescription(back)] = &parse_packets(&sdes.to_bytes()).unwrap()[..]
+        else {
+            panic!()
+        };
+        assert_eq!(back[0].items[0].text.len(), 254);
+        assert!(std::str::from_utf8(&back[0].items[0].text).is_ok());
+        let bye = RtcpPacket::Bye(Bye {
+            sources: vec![1],
+            reason: Some(text),
+        });
+        let [RtcpPacket::Bye(back)] = &parse_packets(&bye.to_bytes()).unwrap()[..] else {
+            panic!()
+        };
+        let reason = back.reason.as_ref().unwrap();
+        assert_eq!(reason.len(), 254);
+        assert!(std::str::from_utf8(reason).is_ok());
+        // Bytes that are not UTF-8 are cut at MAX_TEXT.
+        assert_eq!(cut_text(&[0xff; 300]).len(), MAX_TEXT);
+        assert_eq!(cut_text(b"abc"), b"abc");
+    }
+
+    #[test]
+    fn review_priv_prefix_length_is_checked() {
+        // RFC 3550 section 6.5.8: a PRIV item holds a prefix length, the
+        // prefix, then the value.
+        let bad = [0x81, 202, 0, 2, 0, 0, 0, 1, 8, 1, 0xff, 0];
+        assert_eq!(parse_packets(&bad), Err(RtcpError::Body(202)));
+        let empty = [0x81, 202, 0, 2, 0, 0, 0, 1, 8, 0, 0, 0];
+        assert_eq!(parse_packets(&empty), Err(RtcpError::Body(202)));
+        // Prefix "ab", value "x"; and a prefix with no value.
+        let good = [0x81, 202, 0, 3, 0, 0, 0, 1, 8, 4, 2, b'a', b'b', b'x', 0, 0];
+        assert!(parse_packets(&good).is_ok());
+        let good = [0x81, 202, 0, 2, 0, 0, 0, 1, 8, 1, 0, 0];
+        assert!(parse_packets(&good).is_ok());
+        // The writer leaves out PRIV items that would not read.
+        let p = RtcpPacket::SourceDescription(vec![SdesChunk {
+            ssrc: 1,
+            items: vec![
+                SdesItem {
+                    kind: sdes::PRIV,
+                    text: vec![],
+                },
+                SdesItem {
+                    kind: sdes::PRIV,
+                    text: vec![5, b'a'],
+                },
+                SdesItem {
+                    kind: sdes::PRIV,
+                    text: [&[255][..], &[b'p'; 300][..]].concat(),
+                },
+                SdesItem {
+                    kind: sdes::PRIV,
+                    text: b"\x01ab".to_vec(),
+                },
+            ],
+        }]);
+        let [RtcpPacket::SourceDescription(back)] = &parse_packets(&p.to_bytes()).unwrap()[..]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            back[0].items,
+            [SdesItem {
+                kind: sdes::PRIV,
+                text: b"\x01ab".to_vec()
+            }]
+        );
+    }
+
+    #[test]
+    fn review_null_frames_are_empty_packets() {
+        // RFC 4571 section 2: a length of 0 is the null packet. It comes
+        // out empty, and the documented loop skips it.
+        let a = rtp(&[1]).to_bytes();
+        let stream = [frame(&[]), frame(&a), frame(&[])].concat();
+        let (packets, _) = split(&stream);
+        assert_eq!(packets, [vec![], a.clone(), vec![]]);
+        let parsed: Vec<Packet> = packets
+            .iter()
+            .filter(|p| !p.is_empty())
+            .map(|p| Packet::parse(p).unwrap())
+            .collect();
+        assert_eq!(parsed, [Packet::Rtp(rtp(&[1]))]);
     }
 }

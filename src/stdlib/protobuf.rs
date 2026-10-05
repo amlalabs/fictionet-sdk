@@ -25,8 +25,8 @@
 //! parses each [`Frame`]'s data as a [`Message`], and writes the reply's
 //! bytes back. Every reader checks lengths and limits, because the agent
 //! can send any bytes it likes. Messages are capped at [`MAX_MESSAGE`]
-//! bytes and [`MAX_FIELDS`] fields, and groups nest at most [`MAX_DEPTH`]
-//! deep. Writers keep to the same limits, so whatever they write, the
+//! bytes and [`MAX_FIELDS`] fields, and groups and embedded messages nest
+//! at most [`MAX_DEPTH`] deep. Writers keep to the same limits, so whatever they write, the
 //! parser reads back.
 //!
 //! ```
@@ -58,8 +58,10 @@ pub const MAX_MESSAGE: usize = 4 * 1024 * 1024;
 /// The most fields one message may hold, counting the fields inside its
 /// groups.
 pub const MAX_FIELDS: usize = 65_536;
-/// How deep groups may nest. It matches the default recursion limit of the
-/// protobuf libraries.
+/// How deep groups and embedded messages may nest. It matches the default
+/// recursion limit of the protobuf libraries. [`Message::parse_at`],
+/// [`Message::message_at`] and [`Message::repeated_messages_at`] take the
+/// depth reached so far, so a walk through embedded messages stops here.
 pub const MAX_DEPTH: usize = 100;
 /// The largest field number: 2^29 - 1.
 pub const MAX_FIELD_NUMBER: u32 = (1 << 29) - 1;
@@ -359,50 +361,69 @@ impl Message {
         self.all(number).filter_map(|v| if let Value::Bytes(b) = v { Some(&b[..]) } else { None }).last()
     }
 
-    /// The field as a `string`. It fails if the bytes are not UTF-8.
+    /// The field as a `string`: the last occurrence wins. It fails if the
+    /// bytes of any occurrence are not UTF-8, as protobuf parsers reject a
+    /// message with a bad string even when a later one replaces it.
     pub fn string(&self, number: u32) -> Result<Option<&str>, Error> {
-        match self.bytes(number) {
-            None => Ok(None),
-            Some(b) => std::str::from_utf8(b).map(Some).map_err(|_| Error::Utf8),
+        let mut last = None;
+        for v in self.all(number) {
+            if let Value::Bytes(b) = v {
+                last = Some(std::str::from_utf8(b).map_err(|_| Error::Utf8)?);
+            }
         }
+        Ok(last)
     }
 
     /// The field as an embedded message. When the field appears more than
-    /// once, the copies merge: their bytes are read as one message, as the
-    /// encoding rules say. For a `repeated` message field, use
-    /// [`Message::repeated_messages`] instead.
+    /// once, the copies merge, as the encoding rules say: each copy must
+    /// be a whole message on its own, and the merged message holds their
+    /// fields in order. For a `repeated` message field, use
+    /// [`Message::repeated_messages`] instead. The message read sits one
+    /// level below `self`; a world that walks a recursive schema uses
+    /// [`Message::message_at`], so that the walk stops at [`MAX_DEPTH`].
     pub fn message(&self, number: u32) -> Result<Option<Message>, Error> {
-        let mut joined = Vec::new();
-        let mut any = false;
+        self.message_at(number, 0)
+    }
+
+    /// Like [`Message::message`], for a message `self` that sits `depth`
+    /// levels inside others. The message read sits at `depth + 1`, and
+    /// groups inside it count toward [`MAX_DEPTH`] from there. It fails
+    /// with [`Error::TooDeep`] if the field is present and `depth + 1` is
+    /// above [`MAX_DEPTH`].
+    pub fn message_at(&self, number: u32, depth: usize) -> Result<Option<Message>, Error> {
+        // The merged message must fit in one, as its bytes joined would.
+        let len =
+            self.all(number).map(|v| if let Value::Bytes(b) = v { b.len() } else { 0 }).fold(0, usize::saturating_add);
+        if len > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
+        let mut merged: Option<Message> = None;
+        let mut count = 0;
         for v in self.all(number) {
             if let Value::Bytes(b) = v {
-                if joined.len().saturating_add(b.len()) > MAX_MESSAGE {
-                    return Err(Error::TooLong);
-                }
-                joined.extend_from_slice(b);
-                any = true;
+                let m = parse_entry(b, depth, &mut count)?;
+                merged.get_or_insert_with(Message::new).fields.extend(m.fields);
             }
         }
-        if !any {
-            return Ok(None);
-        }
-        Message::parse(&joined).map(Some)
+        Ok(merged)
     }
 
     /// Every entry of a `repeated` embedded message field, each read as its
     /// own message, in order. It fails if any entry is not a message, or if
-    /// the entries hold more than [`MAX_FIELDS`] fields between them.
+    /// the entries hold more than [`MAX_FIELDS`] fields between them,
+    /// counting the fields inside their groups.
     pub fn repeated_messages(&self, number: u32) -> Result<Vec<Message>, Error> {
+        self.repeated_messages_at(number, 0)
+    }
+
+    /// Like [`Message::repeated_messages`], for a message `self` that sits
+    /// `depth` levels inside others, as with [`Message::message_at`].
+    pub fn repeated_messages_at(&self, number: u32, depth: usize) -> Result<Vec<Message>, Error> {
         let mut out = Vec::new();
-        let mut count = 0usize;
+        let mut count = 0;
         for v in self.all(number) {
             if let Value::Bytes(b) = v {
-                let m = Message::parse(b)?;
-                count = count.saturating_add(m.fields.len());
-                if count > MAX_FIELDS {
-                    return Err(Error::TooManyFields);
-                }
-                out.push(m);
+                out.push(parse_entry(b, depth, &mut count)?);
             }
         }
         Ok(out)
@@ -420,9 +441,18 @@ impl Message {
         Ok(out)
     }
 
-    /// The last group with field number `number`.
-    pub fn group(&self, number: u32) -> Option<&Message> {
-        self.all(number).filter_map(|v| if let Value::Group(g) = v { Some(g) } else { None }).last()
+    /// The field as a singular group. Groups follow the rules of embedded
+    /// messages, so when the field appears more than once the copies merge:
+    /// the result holds their fields in order. For a `repeated` group
+    /// field, read each occurrence from [`Message::all`].
+    pub fn group(&self, number: u32) -> Option<Message> {
+        let mut merged: Option<Message> = None;
+        for v in self.all(number) {
+            if let Value::Group(g) = v {
+                merged.get_or_insert_with(Message::new).fields.extend(g.fields.iter().cloned());
+            }
+        }
+        merged
     }
 
     /// Every number in a repeated varint field, whether it came packed,
@@ -605,6 +635,17 @@ impl Message {
             self.push(number, Value::Bytes(vs.iter().flat_map(|v| v.to_le_bytes()).collect()));
         }
     }
+}
+
+/// Reads one occurrence of an embedded message field of a message at
+/// `depth`, adding its fields, group members included, to `count`.
+fn parse_entry(b: &[u8], depth: usize, count: &mut usize) -> Result<Message, Error> {
+    let depth = depth.checked_add(1).filter(|&d| d <= MAX_DEPTH).ok_or(Error::TooDeep)?;
+    if b.len() > MAX_MESSAGE {
+        return Err(Error::TooLong);
+    }
+    let mut pos = 0;
+    parse_fields(b, &mut pos, depth, None, count)
 }
 
 /// Reads fields from `b[*pos..]` until the end, or until the end tag of
@@ -1325,6 +1366,100 @@ mod tests {
         assert_eq!(d.buffered(), 0);
     }
 
+    // Counts fields as MAX_FIELDS does: group members included.
+    fn total_fields(m: &Message) -> usize {
+        m.fields.iter().map(|f| 1 + if let Value::Group(g) = &f.value { total_fields(g) } else { 0 }).sum()
+    }
+
+    #[test]
+    fn repeated_messages_count_group_members() {
+        // Two entries, each one group of 32,768 varints: 65,538 fields.
+        let mut entry = vec![0x0b];
+        entry.extend([0x10, 0x00].repeat(32_768));
+        entry.push(0x0c);
+        let mut b = Vec::new();
+        for _ in 0..2 {
+            b.push(0x1a);
+            encode_varint(entry.len() as u64, &mut b);
+            b.extend_from_slice(&entry);
+        }
+        let m = Message::parse(&b).unwrap();
+        assert_eq!(m.repeated_messages(3), Err(Error::TooManyFields));
+        assert_eq!(m.message(3), Err(Error::TooManyFields));
+        // One such entry is within the limit.
+        let one = Message::parse(&b[..b.len() / 2]).unwrap();
+        assert_eq!(total_fields(&one.repeated_messages(3).unwrap()[0]), 32_769);
+    }
+
+    #[test]
+    fn merged_messages_keep_their_boundaries() {
+        // [08] lacks its value and [01] has field number 0; joined they
+        // would read as { 1: 1 }.
+        let m = Message::parse(&[0x0a, 0x01, 0x08, 0x0a, 0x01, 0x01]).unwrap();
+        assert_eq!(m.message(1), Err(Error::Truncated));
+        // A group may not open in one copy and close in the next.
+        let m = Message::parse(&[0x0a, 0x01, 0x0b, 0x0a, 0x01, 0x0c]).unwrap();
+        assert_eq!(m.message(1), Err(Error::UnclosedGroup(1)));
+    }
+
+    #[test]
+    fn every_string_occurrence_is_utf8() {
+        let m = Message::parse(&[0x12, 0x01, 0xff, 0x12, 0x01, b'a']).unwrap();
+        assert_eq!(m.string(2), Err(Error::Utf8));
+        let m = Message::parse(&[0x12, 0x01, b'b', 0x10, 0x01, 0x12, 0x01, b'a']).unwrap();
+        assert_eq!(m.string(2), Ok(Some("a")));
+    }
+
+    #[test]
+    fn singular_groups_merge() {
+        // Group 1 twice: { 2: 1 }, then { 3: 2, 2: 5 }.
+        let m = Message::parse(&[0x0b, 0x10, 0x01, 0x0c, 0x0b, 0x18, 0x02, 0x10, 0x05, 0x0c]).unwrap();
+        let g = m.group(1).unwrap();
+        assert_eq!(g.uint64(3), Some(2));
+        assert_eq!(g.uint64(2), Some(5));
+        assert_eq!(g.all(2).count(), 2);
+        assert_eq!(m.all(1).count(), 2);
+    }
+
+    #[test]
+    fn embedded_message_walks_stop_at_max_depth() {
+        // message Node { Node child = 1; }, nested MAX_DEPTH + 1 deep.
+        let mut b = Vec::new();
+        for _ in 0..=MAX_DEPTH {
+            let mut outer = vec![0x0a];
+            encode_varint(b.len() as u64, &mut outer);
+            outer.extend_from_slice(&b);
+            b = outer;
+        }
+        let mut m = Message::parse(&b).unwrap();
+        let mut depth = 0;
+        loop {
+            match m.message_at(1, depth) {
+                Ok(Some(child)) => {
+                    m = child;
+                    depth += 1;
+                }
+                Ok(None) => panic!("the chain ended at {depth}"),
+                Err(e) => {
+                    assert_eq!(e, Error::TooDeep);
+                    break;
+                }
+            }
+        }
+        assert_eq!(depth, MAX_DEPTH);
+        assert_eq!(m.repeated_messages_at(1, MAX_DEPTH), Err(Error::TooDeep));
+        assert_eq!(m.message_at(2, MAX_DEPTH), Ok(None));
+        assert_eq!(m.message_at(1, usize::MAX), Err(Error::TooDeep));
+        // Groups inside an embedded message count from its depth.
+        let groups = |n: usize| [vec![0x0b; n], vec![0x0c; n]].concat();
+        let mut w = Message::new();
+        w.push_bytes(1, &groups(MAX_DEPTH - 1));
+        assert!(w.message(1).is_ok());
+        let mut w = Message::new();
+        w.push_bytes(1, &groups(MAX_DEPTH));
+        assert_eq!(w.message(1), Err(Error::TooDeep));
+    }
+
     struct Lcg(u64);
 
     impl Lcg {
@@ -1390,7 +1525,7 @@ mod tests {
                         let _ = p.repeated_fixed64(f.number);
                         let _ = p.repeated_strings(f.number);
                         if let Ok(rs) = p.repeated_messages(f.number) {
-                            assert!(rs.iter().map(|r| r.fields.len()).sum::<usize>() <= MAX_FIELDS);
+                            assert!(rs.iter().map(total_fields).sum::<usize>() <= MAX_FIELDS);
                         }
                     }
                 }

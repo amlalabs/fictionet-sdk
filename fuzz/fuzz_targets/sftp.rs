@@ -2,26 +2,44 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::sftp::{Decoder, Packet, Request, Response};
+use fictionet::stdlib::sftp::{Decoder, LENGTH_LEN, MAX_PACKET, MAX_TEXT, Packet, Request, Response, Status};
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    whole.feed(data);
+/// Feeds `data` in pieces of `step` bytes, taking packets out after each
+/// feed, and checks the decoder never holds more than one packet.
+fn decode(data: &[u8], step: usize) -> Vec<Packet> {
+    let mut decoder = Decoder::new();
     let mut packets = Vec::new();
-    while let Some(Ok(p)) = whole.next_packet() {
-        packets.push(p);
-    }
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(p)) = bytewise.next_packet() {
-            again.push(p);
+    let mut rest = data;
+    loop {
+        let piece = &rest[..rest.len().min(step)];
+        let used = decoder.feed(piece);
+        assert!(used <= piece.len());
+        assert!(decoder.buffered() <= LENGTH_LEN + MAX_PACKET);
+        rest = &rest[used..];
+        let mut took = false;
+        while let Some(p) = decoder.next_packet() {
+            match p {
+                Ok(p) => packets.push(p),
+                Err(_) => return packets,
+            }
+            took = true;
         }
+        if rest.is_empty() {
+            return packets;
+        }
+        // A decoder that takes no bytes always has a packet to give.
+        assert!(used > 0 || took);
     }
-    assert_eq!(packets, again);
+}
+
+fuzz_target!(|data: &[u8]| {
+    // The stream, split three ways: all at once, a byte at a time, and in
+    // pieces whose size the first byte picks.
+    let packets = decode(data, usize::MAX);
+    assert_eq!(packets, decode(data, 1));
+    let step = usize::from(data.first().copied().unwrap_or(0)) + 1;
+    assert_eq!(packets, decode(data, step));
 
     for p in &packets {
         // A packet read can be written, and reads back the same.
@@ -45,5 +63,16 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(resp) = Response::parse(&p) {
             assert_eq!(Response::parse(&resp.to_packet()), Ok(resp));
         }
+    }
+    // Any text as a STATUS message, written whole or cut, stays UTF-8.
+    let text = String::from_utf8_lossy(data);
+    for resp in [
+        Response::status(1, Status::Failure, &text),
+        Response::Status { id: 1, status: Status::Failure, message: text.as_bytes().to_vec(), language: vec![] },
+    ] {
+        let Ok(Response::Status { message, .. }) = Response::parse(&resp.to_packet()) else { panic!() };
+        assert!(message.len() <= MAX_TEXT);
+        assert!(std::str::from_utf8(&message).is_ok());
+        assert!(text.as_bytes().starts_with(&message));
     }
 });

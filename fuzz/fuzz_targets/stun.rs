@@ -2,7 +2,7 @@
 //! datagrams and TCP streams.
 #![no_main]
 
-use fictionet::stdlib::stun::{Decoder, Message, answer_binding};
+use fictionet::stdlib::stun::{Attribute, Decoder, MAX_BUFFERED, MAX_VALUE, Message, answer_binding};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -29,30 +29,48 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // The bytes as one attribute: a type from the first two bytes and the
+    // rest as the value. A value no message can hold is refused.
+    if let [hi, lo, value @ ..] = data {
+        let typ = u16::from_be_bytes([*hi, *lo]);
+        let r = Attribute::parse(typ, value, &[0x5a; 12]);
+        if value.len() > MAX_VALUE {
+            assert!(r.is_err());
+        }
+    }
+
     // The bytes as a stream, split two ways: all at once, and a byte at a
-    // time. Both give the same messages and errors.
+    // time. Both give the same messages and errors, and a loop that takes
+    // messages out until `None` ends, even after a framing error. Each
+    // frame is the bytes as they came, and reads as the message does.
     let mut whole = Decoder::new();
-    whole.feed(data);
     let mut messages = Vec::new();
-    while let Some(r) = whole.next_message() {
-        messages.push(r);
-        if whole.is_broken() {
+    let mut rest = data;
+    let mut at = 0;
+    loop {
+        let took = whole.feed(rest);
+        rest = &rest[took..];
+        while let Some(r) = whole.next_frame() {
+            let r = r.and_then(|frame| {
+                assert_eq!(frame, &data[at..at + frame.len()]);
+                at += frame.len();
+                Message::parse(frame)
+            });
+            messages.push(r);
+        }
+        assert!(whole.buffered() <= MAX_BUFFERED);
+        if rest.is_empty() {
             break;
         }
     }
     let mut bytewise = Decoder::new();
     let mut again = Vec::new();
     for b in data {
-        bytewise.feed(std::slice::from_ref(b));
+        assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
         while let Some(r) = bytewise.next_message() {
             again.push(r);
-            if bytewise.is_broken() {
-                break;
-            }
-        }
-        if bytewise.is_broken() {
-            break;
         }
     }
     assert_eq!(messages, again);
+    assert_eq!(whole.error(), bytewise.error());
 });

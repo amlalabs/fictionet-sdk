@@ -46,7 +46,8 @@
 //!
 //! // A masked text frame from the client, from section 5.7.
 //! let mut decoder = Decoder::new(Role::Server);
-//! decoder.feed(&[0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58]);
+//! let bytes = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
+//! assert_eq!(decoder.feed(&bytes), bytes.len());
 //! let message = decoder.next_message().unwrap().unwrap();
 //! assert_eq!(message, Message::Text("Hello".to_string()));
 //! assert!(decoder.next_message().is_none());
@@ -81,6 +82,10 @@ pub const MAX_HEADERS: usize = 256;
 pub const MAX_PROTOCOLS: usize = 32;
 /// The most extensions a request may offer.
 pub const MAX_EXTENSIONS: usize = 32;
+/// The longest value, in bytes, of a header field the handshake reads.
+/// RFC 9110 section 5.4 lets a server set such a limit; this one keeps
+/// what a check holds small whatever the fields hold.
+pub const MAX_FIELD_LEN: usize = 8192;
 
 /// Close codes, sent in the first two bytes of a close frame's payload.
 /// The numbers come from RFC 6455 section 7.4.1 and the IANA registry.
@@ -480,8 +485,9 @@ impl Message {
     }
 
     /// The message as frames of at most `max_fragment` payload bytes each,
-    /// all masked with `mask` if it is given. A client should pick a fresh
-    /// random key for each frame, and may set each frame's `mask` itself.
+    /// all masked with `mask` if it is given. RFC 6455 section 5.3 asks a
+    /// client for a fresh, unpredictable key for every frame, so a client
+    /// that splits a message should use [`Message::to_masked_frames`].
     ///
     /// So that a [`Decoder`] reads the frames back, `max_fragment` is
     /// clamped to 1 to [`MAX_PAYLOAD`], text and binary data are cut to
@@ -513,6 +519,17 @@ impl Message {
                 payload: chunk.to_vec(),
             })
             .collect()
+    }
+
+    /// The message as [`Message::to_frames`] splits it, with each frame
+    /// masked by its own key from `next_key`, which is called once per
+    /// frame, in order. It should return 4 fresh random bytes each time.
+    pub fn to_masked_frames(&self, max_fragment: usize, mut next_key: impl FnMut() -> [u8; 4]) -> Vec<Frame> {
+        let mut frames = self.to_frames(max_fragment, None);
+        for f in &mut frames {
+            f.mask = Some(next_key());
+        }
+        frames
     }
 
     /// The message as the bytes of one frame, masked with `mask` if it is
@@ -629,11 +646,19 @@ impl Decoder {
         }
     }
 
-    /// Adds bytes read from the connection. After an [`Error`] or a close
-    /// frame the stream holds nothing more to read, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
+    /// Takes bytes read from the connection, from the start of `bytes`,
+    /// and returns how many it took. It takes them all unless that would
+    /// make it hold more unread bytes than [`Decoder::capacity`], which is
+    /// one whole frame of the largest kind it accepts. Then take messages
+    /// out and feed it the rest. When it takes no bytes, the next call to
+    /// [`Decoder::next_message`] reads at least one frame or fails, so a
+    /// loop of feeding and taking out always ends. After an [`Error`] or a
+    /// close frame the stream holds nothing more to read, and it takes
+    /// every byte and drops it.
+    #[must_use = "bytes past the count returned were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
         if self.failed.is_some() || self.closed {
-            return;
+            return bytes.len();
         }
         // Drop the bytes already read once they are at least half the
         // buffer, so each byte is moved a bounded number of times.
@@ -641,18 +666,26 @@ impl Decoder {
             self.buf.drain(..self.pos);
             self.pos = 0;
         }
-        self.buf.extend_from_slice(bytes);
+        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
+    }
+
+    /// The most unread bytes the decoder holds: a frame header and the
+    /// longest payload it accepts, which is the message limit (at most
+    /// [`MAX_PAYLOAD`]) or a control frame's 125 bytes, whichever is more.
+    pub fn capacity(&self) -> usize {
+        MAX_HEADER_LEN + self.max_message.clamp(MAX_CONTROL_PAYLOAD, MAX_PAYLOAD)
     }
 
     /// The next whole message, if one has come. It returns `None` when it
     /// needs more bytes or after a close frame, and keeps returning the
     /// same error once the stream has broken. A frame too big for the
     /// limit is refused from its header, before its payload is held. A
-    /// decoder never holds more than one frame and one message beyond
-    /// what has been taken out, plus what one `feed` added. Bytes already
-    /// read are let go by a later `feed` once there are at least as many
-    /// of them as unread ones, so reading many frames from one large
-    /// `feed` takes time linear in its length.
+    /// decoder never holds more than [`Decoder::capacity`] unread bytes
+    /// and one message being put together. Bytes already read are let go
+    /// by a later `feed` once there are at least as many of them as unread
+    /// ones, so reading many frames takes time linear in their length.
     pub fn next_message(&mut self) -> Option<Result<Message, Error>> {
         loop {
             if let Some(e) = self.failed {
@@ -780,8 +813,16 @@ impl Decoder {
 pub enum HandshakeError {
     /// There were more than [`MAX_HEADERS`] header fields.
     TooManyHeaders,
-    /// The request had no `Host` field, more than one, or an empty one.
+    /// A field the handshake reads had a value longer than
+    /// [`MAX_FIELD_LEN`] bytes. A server answers `431 Request Header
+    /// Fields Too Large`.
+    FieldTooLong,
+    /// The request had no `Host` field, more than one, or one that is not
+    /// a host with an optional port (RFC 3986 section 3.2).
     MissingHost,
+    /// The request had more than one `Origin` field (RFC 6454 section
+    /// 7.3).
+    Origin,
     /// A request's `Upgrade` did not list `websocket`, or a response's
     /// `Upgrade` held anything other than `websocket` alone.
     Upgrade,
@@ -799,13 +840,13 @@ pub enum HandshakeError {
     Key,
     /// `Sec-WebSocket-Accept` was missing or did not match the key.
     Accept,
-    /// `Sec-WebSocket-Protocol` held something other than tokens, too many
-    /// of them, a name twice, or, in a response, one the client did not
-    /// offer.
+    /// `Sec-WebSocket-Protocol` held something other than tokens, no
+    /// name at all, too many of them, a name twice, or, in a response,
+    /// one the client did not offer.
     Protocol,
-    /// `Sec-WebSocket-Extensions` held a name that is not a token, too
-    /// many of them, or, in a response, any at all, since this module
-    /// offers none.
+    /// `Sec-WebSocket-Extensions` did not follow the grammar of RFC 6455
+    /// section 9.1, held no extension at all, or too many of them; or a
+    /// response held the field at all, since this module offers none.
     Extension,
 }
 
@@ -813,7 +854,9 @@ impl std::fmt::Display for HandshakeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             HandshakeError::TooManyHeaders => "too many header fields",
-            HandshakeError::MissingHost => "no single, non-empty Host field",
+            HandshakeError::FieldTooLong => "header field value too long",
+            HandshakeError::MissingHost => "no single, valid Host field",
+            HandshakeError::Origin => "more than one Origin field",
             HandshakeError::Upgrade => "Upgrade does not list websocket",
             HandshakeError::Connection => "Connection does not list Upgrade",
             HandshakeError::Version => "Sec-WebSocket-Version is not 13",
@@ -830,11 +873,12 @@ impl std::fmt::Display for HandshakeError {
 impl HandshakeError {
     /// The HTTP status a server answers a request it refuses with: 426
     /// (with `Sec-WebSocket-Version: 13`) for [`HandshakeError::Version`],
-    /// and 400 for the rest. The errors only [`check_response`] gives have
+    /// 431 for [`HandshakeError::FieldTooLong`], and 400 for the rest. The errors only [`check_response`] gives have
     /// no status, since a client answers nothing; they get 400 too.
     pub fn status_code(self) -> u16 {
         match self {
             HandshakeError::Version => 426,
+            HandshakeError::FieldTooLong => 431,
             _ => 400,
         }
     }
@@ -847,7 +891,8 @@ impl std::error::Error for HandshakeError {}
 pub struct Upgrade {
     /// The client's `Sec-WebSocket-Key`, trimmed.
     pub key: String,
-    /// The `Sec-WebSocket-Accept` value the server must answer with.
+    /// The `Sec-WebSocket-Accept` value the server must answer with, as
+    /// [`accept_key`] works it out from `key`.
     pub accept: String,
     /// The subprotocols the client offered, in its order of preference.
     pub protocols: Vec<String>,
@@ -861,15 +906,18 @@ pub struct Upgrade {
 impl Upgrade {
     /// The header fields of the server's `101 Switching Protocols` reply.
     /// `protocol` is the subprotocol the server picks. It is left out
-    /// unless the client offered it, so [`check_response`] accepts the
-    /// reply.
+    /// unless the client offered it and it is a token, so
+    /// [`check_response`] accepts the reply. The accept value is worked
+    /// out again from `key`, so the reply matches the key even if world
+    /// code changed `accept`.
     pub fn response_headers(&self, protocol: Option<&str>) -> Vec<(String, String)> {
         let mut out = vec![
             ("Upgrade".to_string(), "websocket".to_string()),
             ("Connection".to_string(), "Upgrade".to_string()),
-            ("Sec-WebSocket-Accept".to_string(), self.accept.clone()),
+            ("Sec-WebSocket-Accept".to_string(), accept_key(self.key.trim_matches(OWS))),
         ];
-        if let Some(p) = protocol.filter(|p| self.protocols.iter().any(|o| o == p)) {
+        let usable = |p: &&str| is_token(p) && p.len() <= MAX_FIELD_LEN && self.protocols.iter().any(|o| o == p);
+        if let Some(p) = protocol.filter(usable) {
             out.push(("Sec-WebSocket-Protocol".to_string(), p.to_string()));
         }
         out
@@ -898,9 +946,10 @@ pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result
     if headers.len() > MAX_HEADERS {
         return Err(HandshakeError::TooManyHeaders);
     }
+    check_lengths(headers)?;
     let mut hosts = fields(headers, "host");
     match (hosts.next(), hosts.next()) {
-        (Some(h), None) if !h.is_empty() => {}
+        (Some(h), None) if is_authority(h) => {}
         _ => return Err(HandshakeError::MissingHost),
     }
     if !field_list(headers, "upgrade").iter().any(|t| t.eq_ignore_ascii_case("websocket")) {
@@ -915,12 +964,17 @@ pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result
     }
     let mut keys = fields(headers, "sec-websocket-key");
     let key = match (keys.next(), keys.next()) {
-        (Some(k), None) if base64_decode(k).is_some_and(|b| b.len() == KEY_LEN) => k,
+        (Some(k), None) if k.len() == 24 && base64_decode(k).is_some_and(|b| b.len() == KEY_LEN) => k,
         _ => return Err(HandshakeError::Key),
     };
     let mut protocols = Vec::new();
     for value in fields(headers, "sec-websocket-protocol") {
-        for item in split_list(value) {
+        // Section 4.1: the field is 1#token, so it holds at least one.
+        let items = split_list(value);
+        if items.is_empty() {
+            return Err(HandshakeError::Protocol);
+        }
+        for item in items {
             if !is_token(item) || protocols.len() >= MAX_PROTOCOLS || protocols.iter().any(|p| p == item) {
                 return Err(HandshakeError::Protocol);
             }
@@ -929,51 +983,63 @@ pub fn check_request<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result
     }
     let mut extensions = Vec::new();
     for value in fields(headers, "sec-websocket-extensions") {
-        for item in split_list(value) {
-            let name = item.split(';').next().unwrap_or("").trim_matches(OWS);
-            if !is_token(name) || extensions.len() >= MAX_EXTENSIONS {
-                return Err(HandshakeError::Extension);
+        // Section 9.1: the field is 1#extension.
+        let items = split_list(value);
+        if items.is_empty() {
+            return Err(HandshakeError::Extension);
+        }
+        for item in items {
+            match extension_name(item) {
+                Some(name) if extensions.len() < MAX_EXTENSIONS => extensions.push(name.to_string()),
+                _ => return Err(HandshakeError::Extension),
             }
-            extensions.push(name.to_string());
         }
     }
-    Ok(Upgrade {
-        key: key.to_string(),
-        accept: accept_key(key),
-        protocols,
-        extensions,
-        origin: fields(headers, "origin").next().map(str::to_string),
-    })
+    let mut origins = fields(headers, "origin");
+    let origin = origins.next().map(str::to_string);
+    if origins.next().is_some() {
+        return Err(HandshakeError::Origin);
+    }
+    Ok(Upgrade { key: key.to_string(), accept: accept_key(key), protocols, extensions, origin })
 }
 
 /// The header fields of a client's opening request, for the caller to
 /// write after `GET <path> HTTP/1.1`. `nonce` should be 16 fresh random
-/// bytes. Control characters are taken out of `host`, and protocols that
-/// are not tokens, repeat an earlier one, or come past the first
-/// [`MAX_PROTOCOLS`], are left out, so [`check_request`] accepts the
-/// fields. `host` must hold the server's host, and optionally `:port`;
-/// [`check_request`] refuses an empty one.
-pub fn request_headers(host: &str, nonce: [u8; KEY_LEN], protocols: &[&str]) -> Vec<(String, String)> {
+/// bytes. `host` must hold the server's host, and optionally `:port`, as
+/// [`check_request`] accepts it; anything else gives
+/// [`HandshakeError::MissingHost`]. Protocols that are not tokens, repeat
+/// an earlier one, come past the first [`MAX_PROTOCOLS`], or would make
+/// the field longer than [`MAX_FIELD_LEN`], are left out, so
+/// [`check_request`] accepts the fields.
+pub fn request_headers(
+    host: &str,
+    nonce: [u8; KEY_LEN],
+    protocols: &[&str],
+) -> Result<Vec<(String, String)>, HandshakeError> {
+    if host.len() > MAX_FIELD_LEN || !is_authority(host) {
+        return Err(HandshakeError::MissingHost);
+    }
     let mut out = vec![
-        (
-            "Host".to_string(),
-            host.chars().filter(|c| !c.is_control()).collect::<String>().trim_matches(OWS).to_string(),
-        ),
+        ("Host".to_string(), host.to_string()),
         ("Upgrade".to_string(), "websocket".to_string()),
         ("Connection".to_string(), "Upgrade".to_string()),
         ("Sec-WebSocket-Key".to_string(), key_from_bytes(nonce)),
         ("Sec-WebSocket-Version".to_string(), VERSION.to_string()),
     ];
     let mut offered: Vec<&str> = Vec::new();
+    let mut len = 0;
     for &p in protocols {
-        if is_token(p) && !offered.contains(&p) && offered.len() < MAX_PROTOCOLS {
+        // Each name after the first adds ", " before it.
+        let add = p.len() + if offered.is_empty() { 0 } else { 2 };
+        if is_token(p) && !offered.contains(&p) && offered.len() < MAX_PROTOCOLS && len + add <= MAX_FIELD_LEN {
             offered.push(p);
+            len += add;
         }
     }
     if !offered.is_empty() {
         out.push(("Sec-WebSocket-Protocol".to_string(), offered.join(", ")));
     }
-    out
+    Ok(out)
 }
 
 /// Checks the header fields of a server's reply to the request a client
@@ -988,6 +1054,7 @@ pub fn check_response<N: AsRef<str>, V: AsRef<str>>(
     if headers.len() > MAX_HEADERS {
         return Err(HandshakeError::TooManyHeaders);
     }
+    check_lengths(headers)?;
     // Section 4.1: the reply's Upgrade field holds "websocket" and nothing
     // else.
     match field_list(headers, "upgrade")[..] {
@@ -1000,7 +1067,9 @@ pub fn check_response<N: AsRef<str>, V: AsRef<str>>(
         (Some(a), None) if a == accept_key(key.trim_matches(OWS)) => {}
         _ => return Err(HandshakeError::Accept),
     }
-    if fields(headers, "sec-websocket-extensions").any(|v| !split_list(v).is_empty()) {
+    // Section 4.1: the client offered no extensions, so the reply may
+    // name none, and an empty field is not valid either.
+    if fields(headers, "sec-websocket-extensions").next().is_some() {
         return Err(HandshakeError::Extension);
     }
     let mut protocols = fields(headers, "sec-websocket-protocol");
@@ -1037,9 +1106,31 @@ fn check_connection<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<
     }
 }
 
-/// Splits an HTTP list on commas outside quoted strings, trims each item
-/// and drops empty ones.
-fn split_list(value: &str) -> Vec<&str> {
+/// The header fields a handshake check reads.
+const READ_FIELDS: [&str; 9] = [
+    "host",
+    "upgrade",
+    "connection",
+    "sec-websocket-version",
+    "sec-websocket-key",
+    "sec-websocket-accept",
+    "sec-websocket-protocol",
+    "sec-websocket-extensions",
+    "origin",
+];
+
+/// Checks that no field a handshake check reads is longer than
+/// [`MAX_FIELD_LEN`], so what the check holds stays small.
+fn check_lengths<N: AsRef<str>, V: AsRef<str>>(headers: &[(N, V)]) -> Result<(), HandshakeError> {
+    let read = |n: &str| READ_FIELDS.iter().any(|r| n.eq_ignore_ascii_case(r));
+    if headers.iter().any(|(n, v)| v.as_ref().len() > MAX_FIELD_LEN && read(n.as_ref())) {
+        return Err(HandshakeError::FieldTooLong);
+    }
+    Ok(())
+}
+
+/// Splits `value` on `sep` where it falls outside a quoted string.
+fn split_unquoted(value: &str, sep: char) -> Vec<&str> {
     let mut out = Vec::new();
     let (mut start, mut quoted, mut escaped) = (0, false, false);
     for (i, c) in value.char_indices() {
@@ -1047,21 +1138,134 @@ fn split_list(value: &str) -> Vec<&str> {
             _ if escaped => escaped = false,
             '\\' if quoted => escaped = true,
             '"' => quoted = !quoted,
-            ',' if !quoted => {
+            c if c == sep && !quoted => {
                 out.push(&value[start..i]);
-                start = i + 1;
+                start = i + c.len_utf8();
             }
             _ => {}
         }
     }
     out.push(&value[start..]);
-    out.into_iter().map(|s| s.trim_matches(OWS)).filter(|s| !s.is_empty()).collect()
+    out
+}
+
+/// Splits an HTTP list on commas outside quoted strings, trims each item
+/// and drops empty ones.
+fn split_list(value: &str) -> Vec<&str> {
+    split_unquoted(value, ',').into_iter().map(|s| s.trim_matches(OWS)).filter(|s| !s.is_empty()).collect()
+}
+
+/// The name of one extension in `Sec-WebSocket-Extensions`, if the item
+/// follows RFC 6455 section 9.1: a token, then parameters, each
+/// `; name` or `; name=value`. A value is a token, or a quoted string
+/// that is a token once its escapes are undone.
+fn extension_name(item: &str) -> Option<&str> {
+    let mut parts = split_unquoted(item, ';').into_iter();
+    let name = parts.next()?.trim_matches(OWS);
+    if !is_token(name) {
+        return None;
+    }
+    for param in parts {
+        let param = param.trim_matches(OWS);
+        let (key, value) = match param.split_once('=') {
+            Some((k, v)) => (k.trim_matches(OWS), Some(v.trim_matches(OWS))),
+            None => (param, None),
+        };
+        if !is_token(key) || value.is_some_and(|v| !is_token(v) && !is_quoted_token(v)) {
+            return None;
+        }
+    }
+    Some(name)
+}
+
+/// Whether `s` is a quoted string (RFC 9110 section 5.6.4) whose value,
+/// with its escapes undone, is a token.
+fn is_quoted_token(s: &str) -> bool {
+    let Some(inner) = s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) else { return false };
+    let (mut any, mut escaped) = (false, false);
+    for b in inner.bytes() {
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if !is_tchar(b) {
+            return false;
+        }
+        any = true;
+    }
+    any && !escaped
+}
+
+/// Whether `s` is a host with an optional port, as the `Host` field
+/// holds it (RFC 9110 section 7.2, RFC 3986 section 3.2): a bracketed IP
+/// literal or a non-empty registered name or IPv4 address, then `:` and
+/// digits if there is a port.
+fn is_authority(s: &str) -> bool {
+    let (host_ok, port) = match s.strip_prefix('[') {
+        Some(rest) => match rest.split_once(']') {
+            Some((literal, after)) => (is_ip_literal(literal), after),
+            None => return false,
+        },
+        None => {
+            let (host, port) = s.split_at(s.find(':').unwrap_or(s.len()));
+            (!host.is_empty() && is_reg_name(host), port)
+        }
+    };
+    host_ok && (port.is_empty() || port.strip_prefix(':').is_some_and(|p| p.bytes().all(|b| b.is_ascii_digit())))
+}
+
+/// Whether `s` is the inside of an RFC 3986 IP literal: an IPv6 address,
+/// or `v`, hex digits, `.` and more characters for a future version.
+fn is_ip_literal(s: &str) -> bool {
+    if let Some(rest) = s.strip_prefix(['v', 'V']) {
+        let Some((version, body)) = rest.split_once('.') else { return false };
+        return !version.is_empty()
+            && version.bytes().all(|b| b.is_ascii_hexdigit())
+            && !body.is_empty()
+            && body.bytes().all(|b| is_unreserved(b) || is_sub_delim(b) || b == b':');
+    }
+    s.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
+/// Whether `s` is an RFC 3986 registered name: unreserved characters,
+/// sub-delimiters and `%` with two hex digits.
+fn is_reg_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        if c == b'%' {
+            match b.get(i + 1..i + 3) {
+                Some([x, y]) if x.is_ascii_hexdigit() && y.is_ascii_hexdigit() => i += 3,
+                _ => return false,
+            }
+        } else if is_unreserved(c) || is_sub_delim(c) {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~".contains(&b)
+}
+
+fn is_sub_delim(b: u8) -> bool {
+    b"!$&'()*+,;=".contains(&b)
 }
 
 /// Whether `s` is an HTTP token: one or more of the characters RFC 9110
 /// allows in names.
 fn is_token(s: &str) -> bool {
-    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+    !s.is_empty() && s.bytes().all(is_tchar)
+}
+
+/// Whether `b` may appear in an HTTP token.
+fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// The largest index no greater than `max` that falls on a character
@@ -1222,10 +1426,15 @@ mod tests {
         rfc_request().into_iter().filter(|(n, _)| *n != name).collect()
     }
 
-    fn with(name: &'static str, value: &'static str) -> Vec<(&'static str, &'static str)> {
+    fn with<'a>(name: &'static str, value: &'a str) -> Vec<(&'a str, &'a str)> {
         let mut h = without(name);
         h.push((name, value));
         h
+    }
+
+    /// Feeds `b`, which must all be taken.
+    fn feed(d: &mut Decoder, b: &[u8]) {
+        assert_eq!(d.feed(b), b.len());
     }
 
     fn hex(b: &[u8]) -> String {
@@ -1235,16 +1444,7 @@ mod tests {
     /// Every message a decoder gives for `bytes`, fed all at once, and the
     /// error it stopped on, if any.
     fn decode(role: Role, bytes: &[u8]) -> (Vec<Message>, Option<Error>) {
-        let mut d = Decoder::new(role);
-        d.feed(bytes);
-        let mut out = Vec::new();
-        while let Some(m) = d.next_message() {
-            match m {
-                Ok(m) => out.push(m),
-                Err(e) => return (out, Some(e)),
-            }
-        }
-        (out, None)
+        decode_chunked(role, bytes, &[usize::MAX])
     }
 
     fn decode_bytewise(role: Role, bytes: &[u8]) -> (Vec<Message>, Option<Error>) {
@@ -1259,14 +1459,23 @@ mod tests {
         let mut sizes = sizes.iter().cycle();
         while !bytes.is_empty() {
             let n = sizes.next().copied().unwrap_or(1).clamp(1, bytes.len());
-            let (piece, rest) = bytes.split_at(n);
+            let (mut piece, rest) = bytes.split_at(n);
             bytes = rest;
-            d.feed(piece);
-            while let Some(m) = d.next_message() {
-                match m {
-                    Ok(m) => out.push(m),
-                    Err(e) => return (out, Some(e)),
+            // Feed the piece, taking messages out whenever the decoder is
+            // full.
+            while !piece.is_empty() {
+                let took = d.feed(piece);
+                assert!(d.buffered() <= d.capacity());
+                piece = &piece[took..];
+                let mut any = false;
+                while let Some(m) = d.next_message() {
+                    any = true;
+                    match m {
+                        Ok(m) => out.push(m),
+                        Err(e) => return (out, Some(e)),
+                    }
                 }
+                assert!(took > 0 || any || d.buffered() < d.capacity(), "a full decoder read nothing");
             }
         }
         (out, None)
@@ -1343,7 +1552,7 @@ mod tests {
             ("Sec-WebSocket-Version", "13"),
             ("Sec-WebSocket-Protocol", "a,, b"),
             ("Sec-WebSocket-Protocol", "c"),
-            ("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits, x-foo; q=\"a,b\""),
+            ("Sec-WebSocket-Extensions", "permessage-deflate; client_max_window_bits, x-foo; q=\"a\\b\""),
         ];
         let u = check_request(&h).unwrap();
         assert_eq!(u.accept, "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
@@ -1397,7 +1606,7 @@ mod tests {
         // Names differing in case are different strings.
         assert!(check_request(&with("Sec-WebSocket-Protocol", "chat, Chat")).is_ok());
         // The writer offers each name once.
-        let h = request_headers("example.com", [1; KEY_LEN], &["a", "b", "a"]);
+        let h = request_headers("example.com", [1; KEY_LEN], &["a", "b", "a"]).unwrap();
         assert_eq!(check_request(&h).unwrap().protocols, ["a", "b"]);
     }
 
@@ -1473,14 +1682,18 @@ mod tests {
 
     #[test]
     fn request_headers_round_trip() {
-        let h = request_headers("example.com\r\nX-Evil: 1", *b"the sample nonce", &["chat", "bad token", "v2"]);
-        assert_eq!(h[0].1, "example.comX-Evil: 1");
+        // A host the request could not carry is refused, not cleaned up.
+        for bad in ["example.com\r\nX-Evil: 1", "", " example.com", "a/b"] {
+            assert_eq!(request_headers(bad, [0; KEY_LEN], &[]), Err(HandshakeError::MissingHost), "{bad:?}");
+        }
+        let h = request_headers("example.com:8080", *b"the sample nonce", &["chat", "bad token", "v2"]).unwrap();
+        assert_eq!(h[0].1, "example.com:8080");
         let u = check_request(&h).unwrap();
         assert_eq!(u.key, "dGhlIHNhbXBsZSBub25jZQ==");
         assert_eq!(u.protocols, ["chat", "v2"]);
         let reply = u.response_headers(Some("v2"));
         assert_eq!(check_response(&reply, &u.key, &["chat", "v2"]), Ok(Some("v2".to_string())));
-        let h = request_headers("x", [0; KEY_LEN], &[]);
+        let h = request_headers("[::1]:80", [0; KEY_LEN], &[]).unwrap();
         assert!(check_request(&h).unwrap().protocols.is_empty());
     }
 
@@ -1585,7 +1798,7 @@ mod tests {
         let stream: Vec<u8> = [&HELLO_MASKED[..], &long, &close].concat();
         for n in 0..stream.len() {
             let mut d = Decoder::new(Role::Server);
-            d.feed(&stream[..n]);
+            feed(&mut d, &stream[..n]);
             while let Some(m) = d.next_message() {
                 assert!(m.is_ok(), "{n} bytes");
             }
@@ -1619,7 +1832,7 @@ mod tests {
         assert_eq!(decode(Role::Client, &[0x81, 0x02, 0xc3, 0x28]).1, Some(Error::InvalidUtf8));
         // A bad byte fails at once, before the last frame.
         let mut d = Decoder::new(Role::Client);
-        d.feed(&[0x01, 0x02, 0x61, 0xff]);
+        feed(&mut d, &[0x01, 0x02, 0x61, 0xff]);
         assert_eq!(d.next_message(), Some(Err(Error::InvalidUtf8)));
         // A character cut off at the end of the message.
         assert_eq!(decode(Role::Client, &[0x01, 0x01, 0x61, 0x80, 0x01, 0xc3]).1, Some(Error::InvalidUtf8));
@@ -1641,9 +1854,9 @@ mod tests {
         assert_eq!(decode(Role::Client, &[0x88, 0x03, 0x03, 0xe8, 0xff]).1, Some(Error::Close(CloseError::Utf8)));
         // A broken stream stays broken and holds nothing.
         let mut d = Decoder::new(Role::Server);
-        d.feed(&HELLO);
+        feed(&mut d, &HELLO);
         assert_eq!(d.next_message(), Some(Err(Error::Unmasked)));
-        d.feed(&HELLO_MASKED);
+        feed(&mut d, &HELLO_MASKED);
         assert_eq!(d.next_message(), Some(Err(Error::Unmasked)));
         assert_eq!(d.buffered(), 0);
         // Close codes for each error.
@@ -1668,17 +1881,17 @@ mod tests {
     fn decoder_bounds_message_size() {
         // A frame over the limit is refused from its header alone.
         let mut d = Decoder::with_max_message(Role::Client, 10);
-        d.feed(&[0x82, 11]);
+        feed(&mut d, &[0x82, 11]);
         assert_eq!(d.next_message(), Some(Err(Error::TooBig)));
         // Fragments that add up to more than the limit.
         let mut d = Decoder::with_max_message(Role::Client, 10);
-        d.feed(&[0x02, 6, 0, 0, 0, 0, 0, 0]);
+        feed(&mut d, &[0x02, 6, 0, 0, 0, 0, 0, 0]);
         assert_eq!(d.next_message(), None);
-        d.feed(&[0x80, 5]);
+        feed(&mut d, &[0x80, 5]);
         assert_eq!(d.next_message(), Some(Err(Error::TooBig)));
         // Exactly the limit is fine, and control frames do not count.
         let mut d = Decoder::with_max_message(Role::Client, 3);
-        d.feed(&[0x02, 2, 1, 2, 0x89, 5, 1, 2, 3, 4, 5, 0x80, 1, 3]);
+        feed(&mut d, &[0x02, 2, 1, 2, 0x89, 5, 1, 2, 3, 4, 5, 0x80, 1, 3]);
         assert_eq!(d.next_message(), Some(Ok(Message::Ping(vec![1, 2, 3, 4, 5]))));
         assert_eq!(d.next_message(), Some(Ok(Message::Binary(vec![1, 2, 3]))));
         // The limit is clamped.
@@ -1695,7 +1908,7 @@ mod tests {
         let stream: Vec<u8> = [0x8a, 0x00].repeat(n);
         let start = std::time::Instant::now();
         let mut d = Decoder::new(Role::Client);
-        d.feed(&stream);
+        feed(&mut d, &stream);
         let mut count = 0;
         while let Some(m) = d.next_message() {
             assert_eq!(m, Ok(Message::Pong(vec![])));
@@ -1706,14 +1919,14 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
         // Feeding after some frames are taken out keeps the order.
         let mut d = Decoder::new(Role::Client);
-        d.feed(&[&PING[..], &HEL, &PING].concat());
+        feed(&mut d, &[&PING[..], &HEL, &PING].concat());
         assert_eq!(d.next_message(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
         assert_eq!(d.buffered(), HEL.len() + PING.len());
-        d.feed(&LO[..1]);
+        feed(&mut d, &LO[..1]);
         assert_eq!(d.next_message(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
         assert_eq!(d.buffered(), 1);
         assert_eq!(d.next_message(), None);
-        d.feed(&LO[1..]);
+        feed(&mut d, &LO[1..]);
         assert_eq!(d.next_message(), Some(Ok(Message::Text("Hello".into()))));
         assert_eq!(d.buffered(), 0);
     }
@@ -1722,13 +1935,13 @@ mod tests {
     fn decoder_has_accessors_and_clones() {
         let mut d = Decoder::with_max_message(Role::Server, 100);
         assert_eq!((d.role(), d.max_message(), d.error()), (Role::Server, 100, None));
-        d.feed(&HELLO_MASKED[..4]);
+        feed(&mut d, &HELLO_MASKED[..4]);
         // A copy picks up where the original stands.
         let mut copy = d.clone();
-        d.feed(&HELLO_MASKED[4..]);
-        copy.feed(&HELLO_MASKED[4..]);
+        feed(&mut d, &HELLO_MASKED[4..]);
+        feed(&mut copy, &HELLO_MASKED[4..]);
         assert_eq!(d.next_message(), copy.next_message());
-        d.feed(&HELLO);
+        feed(&mut d, &HELLO);
         assert_eq!(d.next_message(), Some(Err(Error::Unmasked)));
         assert_eq!(d.error(), Some(Error::Unmasked));
         assert_eq!(copy.error(), None);
@@ -1756,6 +1969,7 @@ mod tests {
         for e in [
             HandshakeError::TooManyHeaders,
             HandshakeError::MissingHost,
+            HandshakeError::Origin,
             HandshakeError::Upgrade,
             HandshakeError::Connection,
             HandshakeError::MissingVersion,
@@ -1770,12 +1984,12 @@ mod tests {
     #[test]
     fn decoder_stops_after_close() {
         let mut d = Decoder::new(Role::Client);
-        d.feed(&[0x88, 0x02, 0x03, 0xe8]);
-        d.feed(&HELLO);
+        feed(&mut d, &[0x88, 0x02, 0x03, 0xe8]);
+        feed(&mut d, &HELLO);
         assert_eq!(d.next_message(), Some(Ok(Message::Close(Some(Close::new(1000))))));
         assert!(d.is_closed());
         assert_eq!(d.next_message(), None);
-        d.feed(&HELLO);
+        feed(&mut d, &HELLO);
         assert_eq!(d.next_message(), None);
         assert_eq!(d.buffered(), 0);
         assert_eq!(decode(Role::Client, &[0x88, 0x00]).0, [Message::Close(None)]);
@@ -1883,9 +2097,11 @@ mod tests {
         for e in [
             HandshakeError::TooManyHeaders,
             HandshakeError::MissingHost,
+            HandshakeError::Origin,
             HandshakeError::Upgrade,
             HandshakeError::Connection,
             HandshakeError::Version,
+            HandshakeError::FieldTooLong,
             HandshakeError::MissingVersion,
             HandshakeError::Key,
             HandshakeError::Accept,
@@ -2041,5 +2257,164 @@ mod tests {
             }
             let _ = check_response(&h, "dGhlIHNhbXBsZSBub25jZQ==", &["chat"]);
         }
+    }
+
+    #[test]
+    fn review_feed_is_bounded() {
+        // One large feed with a tiny limit holds at most one control frame.
+        let mut d = Decoder::with_max_message(Role::Client, 1);
+        let _ = d.feed(&vec![0x82; 1 << 20]);
+        assert!(d.buffered() <= MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD, "{}", d.buffered());
+        // Repeated feeds without taking messages out stop growing.
+        let mut d = Decoder::new(Role::Client);
+        let chunk = [0x8a, 0x00].repeat(1 << 22);
+        for _ in 0..3 {
+            let _ = d.feed(&chunk);
+        }
+        assert!(d.buffered() <= MAX_HEADER_LEN + MAX_PAYLOAD, "{}", d.buffered());
+    }
+
+    #[test]
+    fn review_field_values_are_bounded() {
+        let commas = format!("Upgrade{}", ",".repeat(1 << 20));
+        let key = "A".repeat(1 << 20);
+        let origin = "o".repeat(MAX_FIELD_LEN + 1);
+        for (name, value) in [("Connection", &commas), ("Sec-WebSocket-Key", &key), ("Origin", &origin)] {
+            let mut h = without(name);
+            h.push((name, value));
+            assert_eq!(check_request(&h), Err(HandshakeError::FieldTooLong), "{name}");
+            assert_eq!(check_response(&h, "k", &[]), Err(HandshakeError::FieldTooLong), "{name}");
+        }
+        assert_eq!(HandshakeError::FieldTooLong.status_code(), 431);
+        // Exactly the limit is read, and fields the check does not read
+        // may be longer.
+        let origin = "o".repeat(MAX_FIELD_LEN);
+        let cookie = "c".repeat(4 * MAX_FIELD_LEN);
+        let mut h = with("Origin", &origin);
+        h.push(("Cookie", &cookie));
+        assert_eq!(check_request(&h).unwrap().origin.as_deref(), Some(&origin[..]));
+        // A key of the wrong length is refused before it is decoded.
+        assert_eq!(check_request(&with("Sec-WebSocket-Key", &key[..MAX_FIELD_LEN])), Err(HandshakeError::Key));
+        // The writer keeps its protocol list under the limit.
+        let long = "p".repeat(MAX_FIELD_LEN / 3);
+        let names: Vec<String> = (0..4).map(|i| format!("{long}{i}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let h = request_headers("example.com", [2; KEY_LEN], &names).unwrap();
+        assert_eq!(check_request(&h).unwrap().protocols.len(), 2);
+    }
+
+    #[test]
+    fn review_extension_grammar() {
+        for bad in [
+            "permessage-deflate; =bad",
+            "permessage-deflate;",
+            "permessage-deflate; a=\"b",
+            "x-foo; q=\"a,b\"",
+            "x; a=b=c",
+            "x; a=\"b c\"",
+            "x; a=\"\"",
+            "",
+            ",",
+            " , ,",
+        ] {
+            assert_eq!(check_request(&with("Sec-WebSocket-Extensions", bad)), Err(HandshakeError::Extension), "{bad:?}");
+        }
+        for good in ["x; a", "x;a=b", "x ; a = b", "x; a=\"b\"", "x; a=\"\\b\"", "a, b; c=1,, d"] {
+            assert!(check_request(&with("Sec-WebSocket-Extensions", good)).is_ok(), "{good:?}");
+        }
+        for bad in ["", ",", " , "] {
+            assert_eq!(check_request(&with("Sec-WebSocket-Protocol", bad)), Err(HandshakeError::Protocol), "{bad:?}");
+        }
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let h = [
+            ("Upgrade", "websocket"),
+            ("Connection", "Upgrade"),
+            ("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="),
+            ("Sec-WebSocket-Extensions", ""),
+        ];
+        assert_eq!(check_response(&h, key, &[]), Err(HandshakeError::Extension));
+    }
+
+    #[test]
+    fn review_host_is_an_authority() {
+        for bad in [
+            "example.com/path",
+            "example.com:abc",
+            "a b",
+            "example.comX-Evil: 1",
+            "[::1",
+            "[zz]",
+            "[::1]x",
+            "user@example.com",
+            "%4",
+            "a:1:2",
+        ] {
+            assert_eq!(check_request(&with("Host", bad)), Err(HandshakeError::MissingHost), "{bad:?}");
+        }
+        for good in ["example.com", "example.com:8080", "example.com:", "[::1]:443", "[::1]", "127.0.0.1", "%41b", "[v1.x:y]", "a-b_c~d!$&'()*+,;="] {
+            assert!(check_request(&with("Host", good)).is_ok(), "{good:?}");
+        }
+    }
+
+    #[test]
+    fn review_response_writer_ignores_bad_public_fields() {
+        let mut u = check_request(&rfc_request()).unwrap();
+        u.accept.clear();
+        assert_eq!(check_response(&u.response_headers(None), &u.key, &[]), Ok(None));
+        u.protocols.push("a\r\nb".to_string());
+        let reply = u.response_headers(Some("a\r\nb"));
+        assert!(!reply.iter().any(|(n, _)| n == "Sec-WebSocket-Protocol"));
+    }
+
+    #[test]
+    fn review_origin_appears_once() {
+        let mut h = rfc_request();
+        h.push(("Origin", "https://other.example"));
+        assert_eq!(check_request(&h), Err(HandshakeError::Origin));
+        assert_eq!(HandshakeError::Origin.status_code(), 400);
+    }
+
+    #[test]
+    fn review_split_messages_get_a_key_per_frame() {
+        let m = Message::Text("abcdé".into());
+        let mut n = 0u8;
+        let frames = m.to_masked_frames(2, || {
+            n += 1;
+            [n, n, n, n]
+        });
+        assert_eq!(frames.len(), 3);
+        let keys: Vec<_> = frames.iter().map(|f| f.mask).collect();
+        assert_eq!(keys, [Some([1; 4]), Some([2; 4]), Some([3; 4])]);
+        let stream: Vec<u8> = frames.iter().flat_map(Frame::to_bytes).collect();
+        assert_eq!(decode(Role::Server, &stream), (vec![m], None));
+        let close = Message::Close(None).to_masked_frames(1, || [9; 4]);
+        assert_eq!(close, [Frame { fin: true, opcode: Opcode::Close, mask: Some([9; 4]), payload: vec![] }]);
+    }
+
+    #[test]
+    fn review_feed_takes_what_fits_and_loops_end() {
+        let mut d = Decoder::with_max_message(Role::Client, 3);
+        assert_eq!(d.capacity(), MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD);
+        let stream = [0x8a, 0x00].repeat(200);
+        let took = d.feed(&stream);
+        assert_eq!(took, d.capacity());
+        assert_eq!(d.feed(&stream[took..]), 0);
+        assert_eq!(d.next_message(), Some(Ok(Message::Pong(vec![]))));
+        assert_eq!(d.feed(&stream[took..]), 2);
+        // A frame over the limit fails from its header, so a full decoder
+        // never waits for more.
+        let mut d = Decoder::with_max_message(Role::Client, 3);
+        let big = [&[0x82, 126, 0x01, 0x00][..], &[0; 256]].concat();
+        let took = d.feed(&big);
+        assert_eq!(took, d.capacity());
+        assert_eq!(d.next_message(), Some(Err(Error::TooBig)));
+        assert_eq!(d.feed(&big[took..]), big.len() - took);
+        assert_eq!(d.buffered(), 0);
+        // After a close, bytes are taken and dropped.
+        let mut d = Decoder::new(Role::Client);
+        feed(&mut d, &[0x88, 0x00]);
+        assert_eq!(d.next_message(), Some(Ok(Message::Close(None))));
+        assert_eq!(d.feed(&stream), stream.len());
+        assert_eq!(d.buffered(), 0);
     }
 }

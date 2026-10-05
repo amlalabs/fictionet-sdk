@@ -26,6 +26,8 @@
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Writers cut what does not fit, so their bytes always read back.
+//! A packet is written in at most [`MAX_DATAGRAM`] bytes, as RFC 1002
+//! asks, and a writer that has to leave anything out sets the TC flag.
 //!
 //! ```
 //! use fictionet::stdlib::nbns::{Name, NbEntry, NodeType, Packet, RData, Request};
@@ -62,13 +64,18 @@ use std::net::Ipv4Addr;
 pub const PORT: u16 = 137;
 /// The length of the header every packet starts with.
 pub const HEADER_LEN: usize = 12;
-/// The longest datagram this module reads or writes: the most bytes one
-/// UDP datagram over IPv4 can carry. Most packets are under 100 bytes. A
-/// longer datagram is refused.
+/// The longest datagram this module reads: the most bytes one UDP
+/// datagram over IPv4 can carry. Most packets are under 100 bytes. A
+/// longer datagram is refused. [`Packet::to_bytes_within`] writes up to
+/// this many bytes when asked.
 pub const MAX_PACKET: usize = 65_507;
+/// The longest packet [`Packet::to_bytes`] writes. RFC 1002 section
+/// 4.2.1.1 limits a name service datagram to 576 bytes, and sets TC on a
+/// packet cut to fit.
+pub const MAX_DATAGRAM: usize = 576;
 /// The most entries one section of a packet may hold here. Real packets
 /// hold one or none. A packet whose header counts more is refused, and a
-/// writer leaves out the rest.
+/// writer leaves out the rest and sets TC.
 pub const MAX_RECORDS: usize = 64;
 /// The length of a NetBIOS name: 15 characters and a suffix byte.
 pub const NAME_LEN: usize = 16;
@@ -210,8 +217,11 @@ impl Name {
     }
 
     /// This name with the scope `scope`, given with dots between labels.
+    /// It keeps what the wire holds, as a writer would write it: empty
+    /// labels are left out, labels are cut to [`MAX_LABEL`] bytes, and
+    /// labels stop once the name would pass [`MAX_NAME_LEN`].
     pub fn with_scope(mut self, scope: &str) -> Name {
-        self.scope = scope.split('.').filter(|l| !l.is_empty()).map(|l| l.as_bytes().to_vec()).collect();
+        self.scope = wire_labels(1 + ENCODED_LEN, scope.split('.').map(str::as_bytes));
         self
     }
 
@@ -233,21 +243,53 @@ impl Name {
         let mut out = Vec::with_capacity(ENCODED_LEN + 2);
         out.push(ENCODED_LEN as u8);
         out.extend_from_slice(&encode_first_level(&self.bytes));
-        for label in &self.scope {
-            let label = &label[..label.len().min(MAX_LABEL)];
-            if label.is_empty() {
-                continue;
-            }
-            // The label, its length byte, and the final zero must fit.
-            if out.len() + 1 + label.len() + 1 > MAX_NAME_LEN {
-                break;
-            }
-            out.push(label.len() as u8);
-            out.extend_from_slice(label);
-        }
-        out.push(0);
+        put_labels(&mut out, self.scope.iter().map(Vec::as_slice));
         out
     }
+}
+
+/// The labels a writer keeps of `labels`, in a name whose labels before
+/// them take `used` bytes: empty labels are left out, labels are cut to
+/// [`MAX_LABEL`] bytes, and labels stop once the name would pass
+/// [`MAX_NAME_LEN`]. It reads `labels` only as far as it keeps them.
+fn wire_labels<'a>(mut used: usize, labels: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for label in labels {
+        let label = &label[..label.len().min(MAX_LABEL)];
+        if label.is_empty() {
+            continue;
+        }
+        // The label, its length byte, and the final zero must fit.
+        if used + 1 + label.len() + 1 > MAX_NAME_LEN {
+            break;
+        }
+        used += 1 + label.len();
+        out.push(label.to_vec());
+    }
+    out
+}
+
+/// Appends `labels` and the final zero to `out`, the start of a name, by
+/// the rules of [`wire_labels`].
+fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) {
+    for label in wire_labels(out.len(), labels) {
+        out.push(label.len() as u8);
+        out.extend_from_slice(&label);
+    }
+    out.push(0);
+}
+
+/// Writes `bytes` as text, with bytes that are not printable ASCII, and
+/// backslashes, as `\xNN`.
+fn write_text(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    for &b in bytes {
+        if (0x20..0x7f).contains(&b) && b != b'\\' {
+            write!(f, "{}", b as char)?;
+        } else {
+            write!(f, "\\x{b:02x}")?;
+        }
+    }
+    Ok(())
 }
 
 impl std::fmt::Display for Name {
@@ -255,23 +297,94 @@ impl std::fmt::Display for Name {
     /// scope after a dot. Bytes that are not printable ASCII are written
     /// as `\xNN`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let text = |f: &mut std::fmt::Formatter<'_>, bytes: &[u8]| -> std::fmt::Result {
-            for &b in bytes {
-                if (0x20..0x7f).contains(&b) && b != b'\\' {
-                    write!(f, "{}", b as char)?;
-                } else {
-                    write!(f, "\\x{b:02x}")?;
-                }
-            }
-            Ok(())
-        };
-        text(f, self.name())?;
+        write_text(f, self.name())?;
         write!(f, "<{:02X}>", self.suffix())?;
         for label in &self.scope {
             f.write_str(".")?;
-            text(f, label)?;
+            write_text(f, label)?;
         }
         Ok(())
+    }
+}
+
+/// The name a resource record is about. Most records are about a NetBIOS
+/// name. RFC 1002 also has records about ordinary domain names: the
+/// authority and additional records of a redirect (section 4.2.15) name
+/// a domain and its name server, and a WACK about a request without a
+/// name carries the null name, a single zero byte (section 4.2.16).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum RrName {
+    /// A NetBIOS name, whose first label is first-level encoded.
+    NetBios(Name),
+    /// Any other name, as its labels, such as `["NETBIOS", "COM"]`. No
+    /// labels is the null name. A writer writes the labels by the rules
+    /// of [`Name::scope`]. If the first label is 32 letters from `A` to
+    /// `P`, the name reads back as [`RrName::NetBios`].
+    Domain(Vec<Vec<u8>>),
+}
+
+impl RrName {
+    /// The null name: a single zero byte.
+    pub fn null() -> RrName {
+        RrName::Domain(Vec::new())
+    }
+
+    /// The domain name `name`, given with dots between labels, kept by
+    /// the rules of [`Name::with_scope`].
+    pub fn domain(name: &str) -> RrName {
+        RrName::Domain(wire_labels(0, name.split('.').map(str::as_bytes)))
+    }
+
+    /// The NetBIOS name, if this is one.
+    pub fn netbios(&self) -> Option<&Name> {
+        match self {
+            RrName::NetBios(n) => Some(n),
+            RrName::Domain(_) => None,
+        }
+    }
+
+    /// The name on the wire. It is never longer than [`MAX_NAME_LEN`].
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            RrName::NetBios(n) => n.to_bytes(),
+            RrName::Domain(labels) => {
+                let mut out = Vec::new();
+                put_labels(&mut out, labels.iter().map(Vec::as_slice));
+                out
+            }
+        }
+    }
+}
+
+impl From<Name> for RrName {
+    fn from(name: Name) -> RrName {
+        RrName::NetBios(name)
+    }
+}
+
+impl PartialEq<Name> for RrName {
+    fn eq(&self, other: &Name) -> bool {
+        self.netbios() == Some(other)
+    }
+}
+
+impl std::fmt::Display for RrName {
+    /// A NetBIOS name as [`Name`] prints it. A domain name with dots
+    /// between its labels, and the null name as `.`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RrName::NetBios(n) => n.fmt(f),
+            RrName::Domain(labels) if labels.is_empty() => f.write_str("."),
+            RrName::Domain(labels) => {
+                for (i, label) in labels.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(".")?;
+                    }
+                    write_text(f, label)?;
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -448,16 +561,25 @@ impl NodeName {
 }
 
 /// The data of an NBSTAT record: the names a node holds, and its
-/// statistics.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+/// statistics. The default has no names and [`STATISTICS_LEN`] zero
+/// bytes of statistics.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeStatus {
-    /// The names. A writer lists at most [`MAX_NODE_NAMES`].
+    /// The names. A writer lists at most [`MAX_NODE_NAMES`], and fewer if
+    /// the packet would pass its size.
     pub names: Vec<NodeName>,
     /// The statistics block, unread. RFC 1002 makes it
     /// [`STATISTICS_LEN`] bytes, starting with the node's 6-byte unit ID
-    /// (its MAC address). Some senders write fewer or more. A writer cuts
-    /// it so the record stays under [`MAX_RDATA`].
+    /// (its MAC address). Some senders write fewer or more. A writer
+    /// keeps its first [`STATISTICS_LEN`] bytes before any name, and cuts
+    /// the rest to fit.
     pub statistics: Vec<u8>,
+}
+
+impl Default for NodeStatus {
+    fn default() -> NodeStatus {
+        NodeStatus { names: Vec::new(), statistics: vec![0; STATISTICS_LEN] }
+    }
 }
 
 impl NodeStatus {
@@ -475,11 +597,19 @@ pub enum RData {
     Nb(Vec<NbEntry>),
     /// Type NBSTAT whose names fit its length: a node's names.
     NodeStatus(NodeStatus),
+    /// Type NS: the name of a name server, in a redirect (RFC 1002
+    /// section 4.2.15), as its labels. A reader follows its pointers, so
+    /// it does not depend on where it sits in the packet. A packet whose
+    /// NS data is not one name is refused. A writer writes the labels by
+    /// the rules of [`Name::scope`].
+    Ns(Vec<Vec<u8>>),
     /// Any other type, or an NB or NBSTAT record whose data does not
     /// read as one (such as the 2 bytes of a WACK), unread. Names inside
-    /// it are not followed. A writer cuts it to [`MAX_RDATA`] bytes. If a
-    /// world builds one of type NB or NBSTAT whose data does read as one,
-    /// it reads back as [`RData::Nb`] or [`RData::NodeStatus`].
+    /// it are not followed. A writer leaves out a record whose data does
+    /// not fit, and one of type NS whose data is not one name without
+    /// pointers. If a world builds one of type NB, NBSTAT or NS whose
+    /// data does read as one, it reads back as [`RData::Nb`],
+    /// [`RData::NodeStatus`] or [`RData::Ns`].
     Other {
         /// The record type; see [`rr_type`].
         rr_type: u16,
@@ -494,6 +624,7 @@ impl RData {
         match self {
             RData::Nb(_) => rr_type::NB,
             RData::NodeStatus(_) => rr_type::NBSTAT,
+            RData::Ns(_) => rr_type::NS,
             RData::Other { rr_type, .. } => *rr_type,
         }
     }
@@ -520,28 +651,66 @@ impl RData {
         RData::Other { rr_type: rr, data: data.to_vec() }
     }
 
-    /// The data's bytes, never longer than [`MAX_RDATA`].
-    fn to_bytes(&self) -> Vec<u8> {
+    /// The data's bytes in at most `room` bytes, and never more than
+    /// [`MAX_RDATA`], and whether anything was left out to fit. It
+    /// returns `None` if the record cannot be written in that room.
+    fn write_within(&self, room: usize) -> Option<(Vec<u8>, bool)> {
+        let cap = room.min(MAX_RDATA);
         let mut out = Vec::new();
         match self {
             RData::Nb(entries) => {
-                for e in entries.iter().take(MAX_NB_ENTRIES) {
+                let n = entries.len().min(MAX_NB_ENTRIES).min(cap / NB_ENTRY_LEN);
+                for e in &entries[..n] {
                     e.write(&mut out);
                 }
+                Some((out, n < entries.len()))
             }
             RData::NodeStatus(s) => {
-                let names = &s.names[..s.names.len().min(MAX_NODE_NAMES)];
-                out.push(names.len() as u8);
-                for n in names {
-                    out.extend_from_slice(&n.bytes);
-                    out.extend_from_slice(&n.flags.to_be_bytes());
+                // The count byte, then the first STATISTICS_LEN bytes of
+                // statistics come before any name.
+                let keep = s.statistics.len().min(STATISTICS_LEN).min(cap.checked_sub(1)?);
+                let n = s.names.len().min(MAX_NODE_NAMES).min((cap - 1 - keep) / NODE_NAME_LEN);
+                out.push(n as u8);
+                for name in &s.names[..n] {
+                    out.extend_from_slice(&name.bytes);
+                    out.extend_from_slice(&name.flags.to_be_bytes());
                 }
-                let room = MAX_RDATA - out.len();
-                out.extend_from_slice(&s.statistics[..s.statistics.len().min(room)]);
+                let stats = s.statistics.len().min(cap - out.len());
+                out.extend_from_slice(&s.statistics[..stats]);
+                Some((out, n < s.names.len() || stats < s.statistics.len()))
             }
-            RData::Other { data, .. } => out.extend_from_slice(&data[..data.len().min(MAX_RDATA)]),
+            RData::Ns(labels) => {
+                put_labels(&mut out, labels.iter().map(Vec::as_slice));
+                (out.len() <= cap).then_some((out, false))
+            }
+            RData::Other { rr_type, data } => {
+                if *rr_type == rr_type::NS && !is_plain_name(data) {
+                    return None;
+                }
+                (data.len() <= cap).then(|| (data.clone(), false))
+            }
         }
-        out
+    }
+}
+
+/// Whether `data` is exactly one name with no pointers, as a reader
+/// would read it anywhere in a packet.
+fn is_plain_name(data: &[u8]) -> bool {
+    let mut pos = 0;
+    let mut total = 1;
+    loop {
+        let Some(&len) = data.get(pos) else { return false };
+        if len == 0 {
+            return pos + 1 == data.len();
+        }
+        if len & 0xc0 != 0 {
+            return false;
+        }
+        total += 1 + usize::from(len);
+        if total > MAX_NAME_LEN {
+            return false;
+        }
+        pos += 1 + usize::from(len);
     }
 }
 
@@ -560,8 +729,8 @@ pub struct Question {
 /// One resource record, in the answer, authority or additional section.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Record {
-    /// The name the record is about.
-    pub name: Name,
+    /// The name the record is about: almost always a NetBIOS name.
+    pub name: RrName,
     /// The class: [`CLASS_IN`].
     pub class: u16,
     /// How long, in seconds, the name holds.
@@ -571,27 +740,28 @@ pub struct Record {
 }
 
 impl Record {
-    /// Writes the record at the start of `out`, pointing to a name in
-    /// `written` when it can. It returns the name's bytes if it wrote the
-    /// name in full.
-    fn write(&self, out: &mut Vec<u8>, written: &[(Vec<u8>, u16)]) -> Option<Vec<u8>> {
-        let full = put_name(out, &self.name, written);
+    /// Writes the record to `out`, which is empty, in at most `room`
+    /// bytes, pointing to a name in `written` when it can. It returns the
+    /// name's bytes if it wrote the name in full, and whether it left
+    /// out data to fit, or `None` if the record does not fit.
+    fn write(&self, out: &mut Vec<u8>, written: &[(Vec<u8>, u16)], room: usize) -> Option<(Option<Vec<u8>>, bool)> {
+        let full = put_name(out, self.name.to_bytes(), written);
+        let fixed = out.len() + 10;
+        let (data, cut) = self.data.write_within(room.checked_sub(fixed)?)?;
         out.extend_from_slice(&self.data.rr_type().to_be_bytes());
         out.extend_from_slice(&self.class.to_be_bytes());
         out.extend_from_slice(&self.ttl.to_be_bytes());
-        let data = self.data.to_bytes();
         out.extend_from_slice(&(data.len() as u16).to_be_bytes());
         out.extend_from_slice(&data);
-        full
+        Some((full, cut))
     }
 }
 
-/// Writes `name` to `out`, the bytes of an entry that starts at the
-/// beginning of `out`. A name written in full earlier, as listed in
+/// Writes the name `wire` to `out`, the bytes of an entry that starts at
+/// the beginning of `out`. A name written in full earlier, as listed in
 /// `written`, becomes a two-byte pointer to it. It returns the name's
 /// bytes if it wrote the name in full.
-fn put_name(out: &mut Vec<u8>, name: &Name, written: &[(Vec<u8>, u16)]) -> Option<Vec<u8>> {
-    let wire = name.to_bytes();
+fn put_name(out: &mut Vec<u8>, wire: Vec<u8>, written: &[(Vec<u8>, u16)]) -> Option<Vec<u8>> {
     if let Some((_, at)) = written.iter().find(|(w, _)| *w == wire) {
         out.extend_from_slice(&(0xc000 | at).to_be_bytes());
         return None;
@@ -631,6 +801,8 @@ pub enum ParseError {
     BadFirstLevel,
     /// A name is longer than [`MAX_NAME_LEN`].
     NameTooLong,
+    /// The data of an NS record is not exactly one name.
+    BadNsData,
 }
 
 impl std::fmt::Display for ParseError {
@@ -643,6 +815,7 @@ impl std::fmt::Display for ParseError {
             ParseError::BadPointer(p) => write!(f, "pointer to offset {p} goes forward or loops"),
             ParseError::BadFirstLevel => f.write_str("first label is not a first-level encoded name"),
             ParseError::NameTooLong => write!(f, "name longer than {MAX_NAME_LEN} bytes"),
+            ParseError::BadNsData => f.write_str("NS record data is not one name"),
         }
     }
 }
@@ -665,7 +838,8 @@ pub struct Packet {
     pub rcode: u8,
     /// The question section. A writer writes at most [`MAX_RECORDS`] of
     /// each section, and stops a section early if the packet would pass
-    /// [`MAX_PACKET`].
+    /// its size. A record's NB owners or node status names may be cut to
+    /// fit. When anything is left out, the writer sets TC.
     pub questions: Vec<Question>,
     /// The answer section.
     pub answers: Vec<Record>,
@@ -689,13 +863,27 @@ pub enum Request {
         /// The name asked about.
         name: Name,
     },
-    /// Register `name` for the owner in `entry`, for `ttl` seconds.
+    /// Register `name` for the owner in `entry`, for `ttl` seconds. The
+    /// request has RD set (RFC 1002 section 4.2.2).
     Registration {
         /// The name to register.
         name: Name,
         /// How long the registration should last, in seconds.
         ttl: u32,
         /// The node claiming it.
+        entry: NbEntry,
+    },
+    /// A name overwrite request or demand (RFC 1002 section 4.2.3): a
+    /// registration with RD clear. A B node sends it once it has
+    /// registered `name` by broadcast without a challenge, to make the
+    /// name its own. A node that owns the name may answer it as a
+    /// conflicting registration.
+    Overwrite {
+        /// The name to take.
+        name: Name,
+        /// How long the registration should last, in seconds.
+        ttl: u32,
+        /// The node taking it.
         entry: NbEntry,
     },
     /// Refresh the registration of `name` for `ttl` seconds more. The
@@ -723,9 +911,10 @@ pub enum RequestError {
     /// The packet is a response. A server does not answer it.
     NotRequest,
     /// The packet lacks one question of the right type and class
-    /// [`CLASS_IN`], or a registration, refresh or release lacks the NB
-    /// record that says who asks. A server may answer
-    /// [`rcode::FMT_ERR`].
+    /// [`CLASS_IN`], or a registration, refresh or release lacks the one
+    /// additional record that says who asks: an NB record for the
+    /// question's name, of class [`CLASS_IN`], with one owner. A server
+    /// may answer [`rcode::FMT_ERR`].
     Malformed,
     /// The opcode is not one this module answers. A server may answer
     /// [`rcode::IMP_ERR`].
@@ -751,6 +940,7 @@ impl Request {
             Request::NameQuery { name }
             | Request::NodeStatus { name }
             | Request::Registration { name, .. }
+            | Request::Overwrite { name, .. }
             | Request::Refresh { name, .. }
             | Request::Release { name, .. } => name,
         }
@@ -788,16 +978,27 @@ impl Packet {
         for (section, &count) in sections.iter_mut().zip(&counts[1..]) {
             section.reserve(count);
             for _ in 0..count {
-                let (name, next) = read_name(b, pos)?;
+                let (name, next) = read_rr_name(b, pos)?;
                 let fixed = b.get(next..next + 10).ok_or(ParseError::Truncated)?;
                 let len = usize::from(be16(fixed, 8));
                 let start = next + 10;
                 let data = b.get(start..start + len).ok_or(ParseError::Truncated)?;
+                let rr = be16(fixed, 0);
+                let data = if rr == rr_type::NS {
+                    // The name server's name, whose pointers are followed
+                    // now, since a writer may move what they point to.
+                    match read_labels(b, start) {
+                        Ok((labels, end)) if end == start + len => RData::Ns(labels),
+                        _ => return Err(ParseError::BadNsData),
+                    }
+                } else {
+                    RData::parse(rr, data)
+                };
                 section.push(Record {
                     name,
                     class: be16(fixed, 2),
                     ttl: u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]),
-                    data: RData::parse(be16(fixed, 0), data),
+                    data,
                 });
                 pos = start + len;
             }
@@ -816,26 +1017,40 @@ impl Packet {
         })
     }
 
-    /// The packet's bytes. A name already written in full earlier in the
-    /// packet is written as a pointer to it. RFC 1002 asks for this in
-    /// registrations and releases, whose record repeats the question's
-    /// name. The result is never longer than [`MAX_PACKET`].
+    /// The packet's bytes, in at most [`MAX_DATAGRAM`] bytes. A name
+    /// already written in full earlier in the packet is written as a
+    /// pointer to it. RFC 1002 asks for this in registrations and
+    /// releases, whose record repeats the question's name. If anything is
+    /// left out to fit, TC is set.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.to_bytes_within(MAX_DATAGRAM)
+    }
+
+    /// The packet's bytes, as [`Packet::to_bytes`] writes them, in at most
+    /// `limit` bytes instead of [`MAX_DATAGRAM`]. `limit` is taken as at
+    /// least [`HEADER_LEN`] and at most [`MAX_PACKET`]. RFC 1002 sends a
+    /// longer answer over TCP, where a world adds the 2-byte length
+    /// itself.
+    pub fn to_bytes_within(&self, limit: usize) -> Vec<u8> {
+        let limit = limit.clamp(HEADER_LEN, MAX_PACKET);
         let mut out = Vec::with_capacity(64);
         out.extend_from_slice(&self.id.to_be_bytes());
         out.extend_from_slice(&self.header_word().to_be_bytes());
         out.extend_from_slice(&[0; 8]);
         let mut counts = [0u16; 4];
+        // Whether anything was left out, which sets TC.
+        let mut cut = self.questions.len() > MAX_RECORDS;
         // Each name written in full so far, and its offset. It holds at
         // most one per entry written, so 4 * MAX_RECORDS.
         let mut written: Vec<(Vec<u8>, u16)> = Vec::new();
         let mut entry = Vec::new();
         for q in self.questions.iter().take(MAX_RECORDS) {
             entry.clear();
-            let full = put_name(&mut entry, &q.name, &written);
+            let full = put_name(&mut entry, q.name.to_bytes(), &written);
             entry.extend_from_slice(&q.qtype.to_be_bytes());
             entry.extend_from_slice(&q.class.to_be_bytes());
-            if out.len() + entry.len() > MAX_PACKET {
+            if out.len() + entry.len() > limit {
+                cut = true;
                 break;
             }
             remember(&mut written, full, out.len());
@@ -843,12 +1058,14 @@ impl Packet {
             counts[0] += 1;
         }
         for (i, section) in [&self.answers, &self.authority, &self.additional].into_iter().enumerate() {
+            cut |= section.len() > MAX_RECORDS;
             for r in section.iter().take(MAX_RECORDS) {
                 entry.clear();
-                let full = r.write(&mut entry, &written);
-                if out.len() + entry.len() > MAX_PACKET {
+                let Some((full, short)) = r.write(&mut entry, &written, limit - out.len()) else {
+                    cut = true;
                     break;
-                }
+                };
+                cut |= short;
                 remember(&mut written, full, out.len());
                 out.extend_from_slice(&entry);
                 counts[i + 1] += 1;
@@ -856,6 +1073,10 @@ impl Packet {
         }
         for (i, c) in counts.iter().enumerate() {
             out[4 + 2 * i..6 + 2 * i].copy_from_slice(&c.to_be_bytes());
+        }
+        if cut {
+            // TC is bit 9 of the header's second word.
+            out[2] |= 0x02;
         }
         out
     }
@@ -879,17 +1100,17 @@ impl Packet {
             return Err(RequestError::Malformed);
         }
         let name = q.name.clone();
-        let nb = || {
-            if q.qtype != rr_type::NB {
-                return Err(RequestError::Malformed);
-            }
-            self.additional
-                .iter()
-                .find_map(|r| match &r.data {
-                    RData::Nb(e) => e.first().map(|e| (r.ttl, *e)),
-                    _ => None,
-                })
-                .ok_or(RequestError::Malformed)
+        // RFC 1002 sections 4.2.2 to 4.2.4 and 4.2.9: one additional
+        // record, for the question's name, of class IN, with one owner.
+        let nb = || match &self.additional[..] {
+            [r] if q.qtype == rr_type::NB && r.name == q.name && r.class == CLASS_IN => match &r.data {
+                RData::Nb(e) => match &e[..] {
+                    [e] => Ok((r.ttl, *e)),
+                    _ => Err(RequestError::Malformed),
+                },
+                _ => Err(RequestError::Malformed),
+            },
+            _ => Err(RequestError::Malformed),
         };
         match self.opcode {
             Opcode::Query => match q.qtype {
@@ -897,6 +1118,9 @@ impl Packet {
                 rr_type::NBSTAT => Ok(Request::NodeStatus { name }),
                 _ => Err(RequestError::Malformed),
             },
+            Opcode::Registration if !self.flags.recursion_desired => {
+                nb().map(|(ttl, entry)| Request::Overwrite { name, ttl, entry })
+            }
             Opcode::Registration => nb().map(|(ttl, entry)| Request::Registration { name, ttl, entry }),
             Opcode::Refresh | Opcode::Other(9) => nb().map(|(ttl, entry)| Request::Refresh { name, ttl, entry }),
             Opcode::Release => nb().map(|(_, entry)| Request::Release { name, entry }),
@@ -937,7 +1161,7 @@ impl Packet {
     pub fn registration(id: u16, name: Name, ttl: u32, entry: NbEntry, broadcast: bool) -> Packet {
         let flags = Flags { recursion_desired: true, broadcast, ..Flags::default() };
         let mut p = Packet::asking(id, Opcode::Registration, flags, name.clone(), rr_type::NB);
-        p.additional.push(Record { name, class: CLASS_IN, ttl, data: RData::Nb(vec![entry]) });
+        p.additional.push(Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(vec![entry]) });
         p
     }
 
@@ -945,7 +1169,7 @@ impl Packet {
     pub fn release(id: u16, name: Name, entry: NbEntry, broadcast: bool) -> Packet {
         let flags = Flags { broadcast, ..Flags::default() };
         let mut p = Packet::asking(id, Opcode::Release, flags, name.clone(), rr_type::NB);
-        p.additional.push(Record { name, class: CLASS_IN, ttl: 0, data: RData::Nb(vec![entry]) });
+        p.additional.push(Record { name: name.into(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![entry]) });
         p
     }
 
@@ -970,7 +1194,7 @@ impl Packet {
     /// for `ttl` seconds. AA and RD are set, whatever the query had
     /// (RFC 1002 section 4.2.13).
     pub fn query_response(&self, name: Name, ttl: u32, owners: Vec<NbEntry>) -> Packet {
-        let record = Record { name, class: CLASS_IN, ttl, data: RData::Nb(owners) };
+        let record = Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(owners) };
         self.reply(Opcode::Query, rcode::OK, record)
     }
 
@@ -979,8 +1203,8 @@ impl Packet {
     /// 4.2.14). An end node sends none for a broadcast query. It stays
     /// silent.
     pub fn negative_query_response(&self, name: Name, code: u8) -> Packet {
-        let record =
-            Record { name, class: CLASS_IN, ttl: 0, data: RData::Other { rr_type: rr_type::NULL, data: Vec::new() } };
+        let data = RData::Other { rr_type: rr_type::NULL, data: Vec::new() };
+        let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data };
         self.reply(Opcode::Query, code, record)
     }
 
@@ -990,8 +1214,8 @@ impl Packet {
     pub fn node_status_response(&self, name: Name, names: Vec<NodeName>, unit_id: [u8; 6]) -> Packet {
         let mut statistics = vec![0u8; STATISTICS_LEN];
         statistics[..6].copy_from_slice(&unit_id);
-        let record =
-            Record { name, class: CLASS_IN, ttl: 0, data: RData::NodeStatus(NodeStatus { names, statistics }) };
+        let data = RData::NodeStatus(NodeStatus { names, statistics });
+        let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data };
         let mut p = self.reply(Opcode::Query, rcode::OK, record);
         p.flags.recursion_desired = false;
         p
@@ -1003,7 +1227,7 @@ impl Packet {
     /// with a registration response too (section 5.1.4.1), so the opcode
     /// is always 5, with AA, RD and RA set (sections 4.2.5 and 4.2.6).
     pub fn registration_response(&self, name: Name, ttl: u32, entry: NbEntry, code: u8) -> Packet {
-        let record = Record { name, class: CLASS_IN, ttl, data: RData::Nb(vec![entry]) };
+        let record = Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(vec![entry]) };
         let mut p = self.reply(Opcode::Registration, code, record);
         p.flags.recursion_available = true;
         p
@@ -1012,7 +1236,7 @@ impl Packet {
     /// The answer to a release, with result code `code` and only AA set
     /// (RFC 1002 sections 4.2.10 and 4.2.11).
     pub fn release_response(&self, name: Name, entry: NbEntry, code: u8) -> Packet {
-        let record = Record { name, class: CLASS_IN, ttl: 0, data: RData::Nb(vec![entry]) };
+        let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![entry]) };
         let mut p = self.reply(Opcode::Release, code, record);
         p.flags.recursion_desired = false;
         p
@@ -1020,26 +1244,49 @@ impl Packet {
 
     /// A WACK: tells the requester to wait up to `ttl` seconds more for
     /// the answer to this request. Its data is this request's opcode and
-    /// flags (RFC 1002 section 4.2.16).
-    pub fn wack(&self, name: Name, ttl: u32) -> Packet {
+    /// flags (RFC 1002 section 4.2.16). `name` is the request's name, or
+    /// [`RrName::null`] if it has none.
+    pub fn wack(&self, name: impl Into<RrName>, ttl: u32) -> Packet {
         let data = (self.header_word() & 0xfff0).to_be_bytes().to_vec();
-        let record = Record { name, class: CLASS_IN, ttl, data: RData::Other { rr_type: rr_type::NB, data } };
+        let record =
+            Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Other { rr_type: rr_type::NB, data } };
         let mut p = self.reply(Opcode::Wack, rcode::OK, record);
         p.flags.recursion_desired = false;
         p
     }
 }
 
-/// Reads the name at `start` in the packet `msg`, following pointers. It
-/// returns the name and where the bytes after it begin.
+/// Reads the NetBIOS name at `start` in the packet `msg`, following
+/// pointers. It returns the name and where the bytes after it begin.
 fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), ParseError> {
+    let (mut labels, after) = read_labels(msg, start)?;
+    let bytes = labels.first().and_then(|l| decode_first_level(l)).ok_or(ParseError::BadFirstLevel)?;
+    labels.remove(0);
+    Ok((Name { bytes, scope: labels }, after))
+}
+
+/// Reads the name of a resource record at `start` in the packet `msg`:
+/// a NetBIOS name if its first label is one, and a domain name if not.
+fn read_rr_name(msg: &[u8], start: usize) -> Result<(RrName, usize), ParseError> {
+    let (mut labels, after) = read_labels(msg, start)?;
+    match labels.first().and_then(|l| decode_first_level(l)) {
+        Some(bytes) => {
+            labels.remove(0);
+            Ok((RrName::NetBios(Name { bytes, scope: labels }), after))
+        }
+        None => Ok((RrName::Domain(labels), after)),
+    }
+}
+
+/// Reads the labels of the name at `start` in the packet `msg`, following
+/// pointers. It returns them and where the bytes after the name begin.
+fn read_labels(msg: &[u8], start: usize) -> Result<(Vec<Vec<u8>>, usize), ParseError> {
     let mut pos = start;
     let mut after = None;
     let mut hops = 0;
     // The final zero byte counts toward the name's length.
     let mut total = 1usize;
-    let mut first = None;
-    let mut scope = Vec::new();
+    let mut labels = Vec::new();
     loop {
         let len = *msg.get(pos).ok_or(ParseError::Truncated)?;
         match len & 0xc0 {
@@ -1056,26 +1303,18 @@ fn read_name(msg: &[u8], start: usize) -> Result<(Name, usize), ParseError> {
             0x00 if len == 0 => break,
             0x00 => {
                 let len = usize::from(len);
-                if first.is_none() && len != ENCODED_LEN {
-                    return Err(ParseError::BadFirstLevel);
-                }
                 total += 1 + len;
                 if total > MAX_NAME_LEN {
                     return Err(ParseError::NameTooLong);
                 }
                 let label = msg.get(pos + 1..pos + 1 + len).ok_or(ParseError::Truncated)?;
-                if first.is_none() {
-                    first = Some(decode_first_level(label).ok_or(ParseError::BadFirstLevel)?);
-                } else {
-                    scope.push(label.to_vec());
-                }
+                labels.push(label.to_vec());
                 pos += 1 + len;
             }
             _ => return Err(ParseError::BadLabel(len)),
         }
     }
-    let bytes = first.ok_or(ParseError::BadFirstLevel)?;
-    Ok((Name { bytes, scope }, after.unwrap_or(pos + 1)))
+    Ok((labels, after.unwrap_or(pos + 1)))
 }
 
 fn be16(b: &[u8], i: usize) -> u16 {
@@ -1129,6 +1368,8 @@ mod tests {
                 .to_bytes(),
             Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false).to_bytes(),
             req.wack(Name::new("FRED", 0x20), 5).to_bytes(),
+            req.wack(RrName::null(), 5).to_bytes(),
+            redirect_bytes(),
         ]
     }
 
@@ -1249,7 +1490,8 @@ mod tests {
         short[at] = 200;
         let RData::Other { rr_type, data } = &Packet::parse(&short).unwrap().answers[0].data else { panic!() };
         assert_eq!((*rr_type, data.len()), (rr_type::NBSTAT, rdata.len()));
-        assert_eq!(NodeStatus::default().unit_id(), None);
+        assert_eq!(NodeStatus::default().unit_id(), Some([0; 6]));
+        assert_eq!(NodeStatus { names: vec![], statistics: vec![1, 2] }.unit_id(), None);
     }
 
     #[test]
@@ -1330,7 +1572,7 @@ mod tests {
         assert_eq!(rel[50..52], [0xc0, 0x0c]);
         // A different name is written in full.
         let mut p = built.clone();
-        p.additional[0].name = Name::new("FRED", 0x00);
+        p.additional[0].name = Name::new("FRED", 0x00).into();
         let b = p.to_bytes();
         assert_eq!(b[50], 0x20);
         assert_eq!(Packet::parse(&b), Ok(p));
@@ -1402,7 +1644,7 @@ mod tests {
         // Other data of type NB that holds whole entries reads back as Nb.
         let mut p = Packet::name_query(1, Name::new("FRED", 0x20), false);
         p.answers.push(Record {
-            name: Name::new("FRED", 0x20),
+            name: Name::new("FRED", 0x20).into(),
             class: CLASS_IN,
             ttl: 0,
             data: RData::Other { rr_type: rr_type::NB, data: vec![0, 0, 10, 0, 0, 1] },
@@ -1543,40 +1785,225 @@ mod tests {
         // Too many node names, and statistics too long for the record.
         let names = vec![NodeName::unique(&Name::new("X", 0)); 300];
         let status = RData::NodeStatus(NodeStatus { names, statistics: vec![7; 70_000] });
-        let data = status.to_bytes();
+        let (data, cut) = status.write_within(usize::MAX).unwrap();
+        assert!(cut);
         assert_eq!(data.len(), MAX_RDATA);
         let RData::NodeStatus(s) = RData::parse(rr_type::NBSTAT, &data) else { panic!() };
         assert_eq!(s.names.len(), MAX_NODE_NAMES);
         assert_eq!(1 + MAX_NODE_NAMES * NODE_NAME_LEN + s.statistics.len(), MAX_RDATA);
-        let nb = RData::Nb(vec![owner(1); 20_000]).to_bytes();
+        // In a small room, the statistics block comes before the names.
+        let (data, cut) = status.write_within(100).unwrap();
+        assert!(cut);
+        let RData::NodeStatus(s) = RData::parse(rr_type::NBSTAT, &data) else { panic!() };
+        assert_eq!((s.names.len(), s.statistics.len()), (2, 100 - 1 - 2 * NODE_NAME_LEN));
+        assert!(status.write_within(0).is_none());
+        let (nb, cut) = RData::Nb(vec![owner(1); 20_000]).write_within(usize::MAX).unwrap();
+        assert!(cut);
         assert_eq!(nb.len(), MAX_NB_ENTRIES * NB_ENTRY_LEN);
 
         // Too many questions, and answers past what a datagram holds.
         let mut p = Packet::name_query(1, name.clone(), false);
         p.questions = vec![p.questions[0].clone(); 100];
-        let rec = Record { name: name.clone(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![owner(1); 5000]) };
+        let rec = Record { name: name.clone().into(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![owner(1); 5000]) };
         p.answers = vec![rec; 3];
-        p.additional = vec![Record { name, class: CLASS_IN, ttl: 1, data: RData::Nb(vec![owner(2)]) }];
+        p.additional = vec![Record { name: name.into(), class: CLASS_IN, ttl: 1, data: RData::Nb(vec![owner(2)]) }];
         p.rcode = 0xff;
-        let bytes = p.to_bytes();
+        let bytes = p.to_bytes_within(MAX_PACKET);
         assert!(bytes.len() <= MAX_PACKET);
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back.questions.len(), MAX_RECORDS);
         assert_eq!(back.rcode, 0x0f);
+        assert!(back.flags.truncated);
         // Repeated names are pointers, so two answers of 30,012 bytes
-        // fit, and the third does not.
-        assert_eq!(back.answers.len(), 2);
-        assert_eq!(back.additional.len(), 1);
-        assert_eq!(back.additional[0].name, back.questions[0].name);
-        // An Other record cut to its length field.
-        let other = RData::Other { rr_type: 0x99, data: vec![1; 70_000] };
-        assert_eq!(other.to_bytes().len(), MAX_RDATA);
+        // fit, and the third is cut to what room is left.
+        assert_eq!(back.answers.len(), 3);
+        let RData::Nb(e) = &back.answers[2].data else { panic!() };
+        assert!(e.len() < 5000);
+        assert!(back.additional.is_empty());
+        // The same packet in one datagram.
+        let small = p.to_bytes();
+        assert!(small.len() <= MAX_DATAGRAM);
+        assert!(Packet::parse(&small).unwrap().flags.truncated);
         // A record too big for any datagram is left out.
+        let other = RData::Other { rr_type: 0x99, data: vec![1; 70_000] };
+        assert!(other.write_within(MAX_PACKET).is_none());
         let mut q = Packet::name_query(1, Name::new("Y", 0), false);
-        q.answers = vec![Record { name: Name::new("Y", 0), class: 1, ttl: 0, data: other }];
-        let back = Packet::parse(&q.to_bytes()).unwrap();
+        q.answers = vec![Record { name: Name::new("Y", 0).into(), class: 1, ttl: 0, data: other }];
+        let back = Packet::parse(&q.to_bytes_within(MAX_PACKET)).unwrap();
         assert!(back.answers.is_empty());
         assert_eq!(back.questions.len(), 1);
+        assert!(back.flags.truncated);
+        // Limits outside the range are taken as its ends.
+        assert_eq!(q.to_bytes_within(0).len(), HEADER_LEN);
+        assert_eq!(q.to_bytes_within(usize::MAX), q.to_bytes_within(MAX_PACKET));
+    }
+
+    #[test]
+    fn registration_needs_its_own_owner_record() {
+        // RFC 1002 sections 4.2.2 and 4.2.9: one additional record, for
+        // the question's name, of class IN, with one owner.
+        let good = Packet::registration(7, Name::new("FRED", 0x20), 60, owner(9), true);
+        assert!(good.request().is_ok());
+        let mut other = good.clone();
+        other.additional[0].name = Name::new("OTHER", 0x20).into();
+        assert_eq!(other.request(), Err(RequestError::Malformed));
+        let mut class = good.clone();
+        class.additional[0].class = 3;
+        assert_eq!(class.request(), Err(RequestError::Malformed));
+        let mut two = good.clone();
+        two.additional[0].data = RData::Nb(vec![owner(1), owner(2)]);
+        assert_eq!(two.request(), Err(RequestError::Malformed));
+        let mut rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false);
+        rel.additional[0].name = Name::new("FRED", 0x00).into();
+        assert_eq!(rel.request(), Err(RequestError::Malformed));
+    }
+
+    #[test]
+    fn writer_keeps_to_576_bytes_and_sets_tc() {
+        // RFC 1002 section 4.2.1.1: TC is set when the datagram would pass
+        // 576 bytes. Section 4.2.13: the owner list may be cut, with TC.
+        let req = Packet::parse(&query_bytes()).unwrap();
+        let resp = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 100]);
+        let b = resp.to_bytes();
+        assert!(b.len() <= MAX_DATAGRAM, "{} bytes", b.len());
+        let back = Packet::parse(&b).unwrap();
+        assert!(back.flags.truncated);
+        let RData::Nb(e) = &back.answers[0].data else { panic!() };
+        assert_eq!(e.len(), (MAX_DATAGRAM - 12 - 34 - 10) / NB_ENTRY_LEN);
+        // A packet that fits is not marked.
+        let small = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 3]);
+        assert!(!Packet::parse(&small.to_bytes()).unwrap().flags.truncated);
+        // A record left out entirely is marked too.
+        let huge = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 10_909]);
+        let back = Packet::parse(&huge.to_bytes_within(MAX_PACKET)).unwrap();
+        assert!(back.flags.truncated);
+        // So is a section over MAX_RECORDS.
+        let mut many = Packet::name_query(1, Name::new("FRED", 0x20), false);
+        many.questions = vec![many.questions[0].clone(); MAX_RECORDS + 1];
+        let back = Packet::parse(&many.to_bytes_within(MAX_PACKET)).unwrap();
+        assert_eq!(back.questions.len(), MAX_RECORDS);
+        assert!(back.flags.truncated);
+    }
+
+    #[test]
+    fn with_scope_keeps_what_the_wire_holds() {
+        let long = "a.".repeat(1_000_000);
+        let name = Name::new("FRED", 0x20).with_scope(&long);
+        assert!(name.scope.len() < 128);
+        let wire = name.to_bytes();
+        assert_eq!(read_name(&wire, 0).unwrap().0, name);
+        let label = "x".repeat(64);
+        let name = Name::new("FRED", 0x20).with_scope(&label);
+        assert_eq!(name.scope, vec![vec![b'x'; MAX_LABEL]]);
+        assert_eq!(read_name(&name.to_bytes(), 0).unwrap().0, name);
+    }
+
+    #[test]
+    fn default_node_status_has_a_statistics_block() {
+        // RFC 1002 section 4.2.18: the statistics follow the names.
+        assert_eq!(NodeStatus::default().statistics, vec![0; STATISTICS_LEN]);
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    /// A redirect name query response (RFC 1002 section 4.2.15): the
+    /// name server NS.NETBIOS.COM, at 10.0.0.1, has authority over
+    /// NETBIOS.COM. The additional record's name points into the NS data.
+    fn redirect_bytes() -> Vec<u8> {
+        let mut b = hex("0005 8100 0000 0000 0001 0001");
+        b.extend_from_slice(b"\x07NETBIOS\x03COM\x00");
+        b.extend_from_slice(&hex("0002 0001 00000e10 0005"));
+        b.extend_from_slice(b"\x02NS\xc0\x0c");
+        b.extend_from_slice(&hex("c023 0001 0001 00000e10 0004 0a000001"));
+        b
+    }
+
+    #[test]
+    fn wack_with_the_null_name() {
+        // RFC 1002 section 4.2.16: with no name from the request, the
+        // WACK's name is the null name, a single zero byte.
+        let b = hex("0001bc000000000100000000 00 00200001000000010002 2910");
+        let p = Packet::parse(&b).unwrap();
+        assert_eq!(p.answers[0].name, RrName::null());
+        assert_eq!(p.answers[0].name.to_string(), ".");
+        assert_eq!(p.to_bytes(), b);
+        let req = Packet::parse(&registration_bytes()).unwrap();
+        let w = req.wack(RrName::null(), 1);
+        assert_eq!(Packet::parse(&w.to_bytes()), Ok(w));
+        // Questions still need a NetBIOS name.
+        let mut q = hex("0001 0000 0001 0000 0000 0000 00 0020 0001");
+        assert_eq!(Packet::parse(&q), Err(ParseError::BadFirstLevel));
+        q[5] = 0;
+        assert!(Packet::parse(&q).is_ok());
+    }
+
+    #[test]
+    fn redirect_with_domain_names() {
+        let b = redirect_bytes();
+        let p = Packet::parse(&b).unwrap();
+        assert_eq!(p.authority[0].name, RrName::domain("netbios.com".to_uppercase().as_str()));
+        assert_eq!(p.authority[0].name.to_string(), "NETBIOS.COM");
+        let ns = vec![b"NS".to_vec(), b"NETBIOS".to_vec(), b"COM".to_vec()];
+        assert_eq!(p.authority[0].data, RData::Ns(ns.clone()));
+        assert_eq!(p.additional[0].name, RrName::Domain(ns));
+        assert_eq!(p.additional[0].data, RData::Other { rr_type: rr_type::A, data: vec![10, 0, 0, 1] });
+        assert!(p.authority[0].name.netbios().is_none());
+        let back = Packet::parse(&p.to_bytes()).unwrap();
+        assert_eq!(back, p);
+        // NS data that is more than one name is refused.
+        let mut bad = b.clone();
+        bad[34] = 6;
+        assert_eq!(Packet::parse(&bad), Err(ParseError::BadNsData));
+    }
+
+    #[test]
+    fn ns_data_survives_rewriting() {
+        // The authority record repeats the question's name in full, and
+        // its NS data points at the scope inside it, at offset 95. The
+        // writer turns the repeated name into a pointer, so the scope
+        // moves; the NS data must still name NETBIOS.COM.
+        let fred = Name::new("FRED", 0x20).with_scope("NETBIOS.COM");
+        let mut b = hex("0009 8100 0001 0000 0001 0000");
+        b.extend_from_slice(&fred.to_bytes());
+        b.extend_from_slice(&hex("0020 0001"));
+        assert_eq!(b.len(), 62);
+        b.extend_from_slice(&fred.to_bytes());
+        b.extend_from_slice(&hex("0002 0001 00000000 0002 c05f"));
+        assert_eq!(b.len(), 120);
+        let p = Packet::parse(&b).unwrap();
+        let scope = vec![b"NETBIOS".to_vec(), b"COM".to_vec()];
+        assert_eq!(p.authority[0].data, RData::Ns(scope.clone()));
+        let out = p.to_bytes();
+        assert!(out.len() < b.len());
+        let back = Packet::parse(&out).unwrap();
+        assert_eq!(back.authority[0].data, RData::Ns(scope));
+        assert_eq!(back, p);
+        // Built NS data with a pointer cannot be placed, so it is left out.
+        let mut built = p.clone();
+        built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: vec![0xc0, 0x5f] };
+        let back = Packet::parse(&built.to_bytes()).unwrap();
+        assert!(back.authority.is_empty() && back.flags.truncated);
+        // Built NS data that is one plain name reads back as Ns.
+        built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: b"\x03COM\x00".to_vec() };
+        let back = Packet::parse(&built.to_bytes()).unwrap();
+        assert_eq!(back.authority[0].data, RData::Ns(vec![b"COM".to_vec()]));
+    }
+
+    #[test]
+    fn overwrite_is_not_a_registration() {
+        // RFC 1002 sections 4.2.2 and 4.2.3: a registration has RD set,
+        // an overwrite request or demand has it clear.
+        let mut p = Packet::registration(7, Name::new("FRED", 0x20), 60, owner(9), true);
+        let reg = p.request().unwrap();
+        assert!(matches!(reg, Request::Registration { .. }));
+        p.flags.recursion_desired = false;
+        let back = Packet::parse(&p.to_bytes()).unwrap();
+        let want = Request::Overwrite { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(9) };
+        assert_eq!(back.request(), Ok(want.clone()));
+        assert_eq!(want.name(), reg.name());
     }
 
     /// A fixed linear congruential generator, so failures repeat.
@@ -1590,11 +2017,21 @@ mod tests {
     }
 
     fn check(data: &[u8]) {
-        if let Ok(p) = Packet::parse(data) {
+        if let Ok(mut p) = Packet::parse(data) {
+            // With TC clear, TC on the written packet says the writer
+            // left something out. Without it, the packet reads back the
+            // same.
+            p.flags.truncated = false;
             let bytes = p.to_bytes();
+            assert!(bytes.len() <= MAX_DATAGRAM);
             let back = Packet::parse(&bytes).unwrap();
-            assert_eq!(back, p);
-            assert_eq!(back.to_bytes(), bytes);
+            if !back.flags.truncated {
+                assert_eq!(back, p);
+                assert_eq!(back.to_bytes(), bytes);
+            }
+            for r in back.answers.iter().chain(&back.authority).chain(&back.additional) {
+                assert!(!r.name.to_string().is_empty());
+            }
             if p.request().is_ok() {
                 let name = Name::new("W", 0x20);
                 for r in [

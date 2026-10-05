@@ -78,7 +78,8 @@ pub const MAX_DEPTH: usize = 32;
 /// allows inline commands of the same length.
 pub const MAX_LINE_LEN: usize = 64 * 1024;
 /// The most bytes one whole value or command may take by default. A
-/// [`Decoder`] holds at most this many unread bytes, plus one `feed`.
+/// [`Decoder`] whose values or commands are taken until none is left
+/// after each `feed` holds at most this many unread bytes, plus one feed.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 /// The byte each type's encoding starts with.
@@ -120,9 +121,12 @@ pub mod marker {
     pub const END: u8 = b'.';
 }
 
-/// The longest header a writer puts before an aggregate's elements: a
-/// type byte, up to 20 digits and a line end.
-const HEADER_MAX: usize = 23;
+/// The deepest nesting the readers take, whatever [`Limits::max_depth`]
+/// says, since they recurse once per level.
+const DEPTH_CEILING: usize = 256;
+
+/// The most elements a reader reserves room for before they come.
+const PREALLOC: usize = 4096;
 
 /// Which version of the protocol a writer speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,7 +147,9 @@ pub struct Limits {
     pub max_bulk_len: usize,
     /// The most elements of one aggregate, or entries of one map.
     pub max_elements: usize,
-    /// How many aggregates may nest inside each other.
+    /// How many aggregates may nest inside each other. The readers
+    /// recurse once per level, so they take no more than 256 levels
+    /// whatever this says.
     pub max_depth: usize,
     /// The longest line, without its type byte and line end.
     pub max_line_len: usize,
@@ -334,9 +340,19 @@ impl Value {
     /// first [`MAX_ELEMENTS`] elements (half that many map entries in
     /// RESP2), and as many as fit in [`MAX_FRAME_LEN`] bytes in all. An
     /// aggregate nested [`MAX_DEPTH`] deep becomes null. A big number that
-    /// is not an optional sign and digits is written as 0.
+    /// is not an optional sign and digits is written as 0. An attribute
+    /// keeps its value whole and as many entries as fit beside it, or none,
+    /// when it is written as the value alone.
+    ///
+    /// A push in RESP3 must be at the top level, perhaps after attributes,
+    /// and start with a simple, bulk or verbatim string. Any other push is
+    /// written as an array, as in RESP2.
     pub fn write(&self, version: Version, out: &mut Vec<u8>) {
-        put(out, self, version, 0, &Limits::DEFAULT, MAX_FRAME_LEN);
+        if !put(out, self, version, 0, true, &Limits::DEFAULT, MAX_FRAME_LEN) {
+            // Every value fits in a frame, but a writer never writes
+            // nothing in place of a reply.
+            null_out(out, version);
+        }
     }
 
     /// The value's bytes in `version`, as [`Value::write`] makes them.
@@ -417,7 +433,9 @@ impl Command {
     /// ended by LF with an optional CR before it, split at spaces, where
     /// double quotes allow the escapes `\n`, `\r`, `\t`, `\b`, `\a`, `\xHH`
     /// and a backslash before any other byte, and single quotes allow
-    /// `\'`.
+    /// `\'`. As in Redis, a NUL hides any LF after it, so a line with a
+    /// NUL never ends and runs into the line limit. Counts and lengths are
+    /// read as Redis reads them: no `+`, no leading zero and no `-0`.
     ///
     /// It returns `Ok(None)` if `b` holds only part of a command, and
     /// otherwise the command and how many bytes of `b` it took. A blank
@@ -507,11 +525,18 @@ impl Decoder {
 
     /// Adds bytes read from the connection. After a [`ParseError`] the
     /// stream cannot be read any further, and they are dropped.
+    ///
+    /// The decoder holds what it is fed until it is taken out, so a
+    /// caller bounds its memory by taking values or commands until none
+    /// is left before feeding more.
     pub fn feed(&mut self, bytes: &[u8]) {
         if self.failed.is_some() {
             return;
         }
-        if self.start > 0 {
+        // Bytes already read are dropped only once they are at least as
+        // many as the unread ones, so moving the unread bytes down costs
+        // no more, over the whole stream, than the bytes read.
+        if self.start > 0 && self.start >= self.buf.len() - self.start {
             self.buf.drain(..self.start);
             self.start = 0;
         }
@@ -606,12 +631,30 @@ struct Scan {
     pos: usize,
     /// The aggregates still open, outermost first.
     open: Vec<Open>,
+    /// A line the last attempt found no end of, so the next one searches
+    /// only the bytes that came since.
+    quiet: Option<Quiet>,
+}
+
+/// A line with no end yet: where it starts, how far it holds no line end,
+/// and, for an inline command, whether a NUL came before any LF.
+#[derive(Debug, Clone, Copy)]
+struct Quiet {
+    start: usize,
+    to: usize,
+    stuck: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Open {
     /// This many elements are still to come.
     Left(usize),
+    /// An attribute, with this many keys, values and the value they
+    /// describe still to come.
+    Attr(usize),
+    /// A push, none of whose elements has come yet: its first must be a
+    /// string.
+    Push(usize),
     /// A streamed aggregate and how many elements it has had, keys and
     /// values each counting one.
     Streamed { pairs: bool, seen: usize },
@@ -632,21 +675,62 @@ impl Scan {
     fn ended(&mut self, pos: usize) -> Scanned {
         self.pos = pos;
         loop {
-            match self.open.last_mut() {
-                None => return Scanned::Whole,
-                Some(Open::Left(n)) => {
-                    *n -= 1;
-                    if *n > 0 {
-                        return Scanned::More;
-                    }
-                    self.open.pop();
+            let Some(slot) = self.open.last_mut() else { return Scanned::Whole };
+            let left = match *slot {
+                Open::Left(n) | Open::Push(n) => {
+                    *slot = Open::Left(n.saturating_sub(1));
+                    n.saturating_sub(1)
                 }
-                Some(Open::Streamed { seen, .. }) => {
-                    *seen += 1;
+                Open::Attr(n) => {
+                    *slot = Open::Attr(n.saturating_sub(1));
+                    n.saturating_sub(1)
+                }
+                Open::Streamed { pairs, seen } => {
+                    *slot = Open::Streamed { pairs, seen: seen.saturating_add(1) };
                     return Scanned::More;
                 }
-                Some(Open::Chunks(_)) => return Scanned::More,
+                Open::Chunks(_) => return Scanned::More,
+            };
+            if left > 0 {
+                return Scanned::More;
             }
+            self.open.pop();
+        }
+    }
+
+    /// Whether the value about to start is at the top level, perhaps
+    /// after attributes, where a push may be.
+    fn top(&self) -> bool {
+        self.open.iter().all(|o| matches!(o, Open::Attr(1)))
+    }
+
+    /// Whether the line from `start`, which the last attempt found no end
+    /// of, still has none and is not too long: then the same attempt
+    /// would need one more byte again. Only the new bytes are searched.
+    fn line_waits(&mut self, b: &[u8], start: usize, max: usize) -> bool {
+        let Some(q) = self.quiet else { return false };
+        if q.start != start || q.to > b.len() || b.len() - start > max {
+            return false;
+        }
+        if b[q.to..].iter().any(|&c| c == b'\r' || c == b'\n') {
+            self.quiet = None;
+            return false;
+        }
+        self.quiet = Some(Quiet { to: b.len(), ..q });
+        true
+    }
+
+    /// After an attempt that needs `need` bytes: if that is one more, and
+    /// the line from `start` holds no CR or LF, the line is what has no
+    /// end yet, since every element's first line starts one byte after
+    /// it, and every later line follows a line end.
+    fn note_line(&mut self, b: &[u8], start: usize, need: usize, max: usize) {
+        if need == b.len().saturating_add(1)
+            && start < b.len()
+            && b.len() - start <= max
+            && !b[start..].iter().any(|&c| c == b'\r' || c == b'\n')
+        {
+            self.quiet = Some(Quiet { start, to: b.len(), stuck: false });
         }
     }
 }
@@ -657,10 +741,17 @@ impl Scan {
 /// by step, so the two agree on what needs more bytes.
 fn scan_value(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     loop {
+        let start = s.pos.saturating_add(1);
+        if s.line_waits(b, start, lim.max_line_len) {
+            return Some(b.len().saturating_add(1));
+        }
         match scan_step(s, b, lim) {
             Ok(Scanned::More) => {}
             Ok(Scanned::Whole) | Err(Fail::Bad(_)) => return None,
-            Err(Fail::Need(n)) => return Some(n),
+            Err(Fail::Need(n)) => {
+                s.note_line(b, start, n, lim.max_line_len);
+                return Some(n);
+            }
         }
     }
 }
@@ -707,6 +798,11 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
     }
     let Some(&t) = b.get(pos) else { return Err(Fail::Need(pos.saturating_add(1))) };
     let depth = s.open.len();
+    // As list checks a push's first element.
+    let push_first = matches!(s.open.last(), Some(Open::Push(_)));
+    if push_first && !is_string_marker(t) {
+        return Err(ParseError::Malformed(marker::PUSH).into());
+    }
     match t {
         marker::ARRAY | marker::SET | marker::PUSH | marker::MAP | marker::ATTRIBUTE => {
             let (l, e) = line(b, pos + 1, lim)?;
@@ -714,15 +810,19 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
             if matches!(len, Len::Null) && t == marker::ARRAY {
                 return Ok(s.ended(e));
             }
-            if depth >= lim.max_depth {
+            if t == marker::PUSH && (!s.top() || matches!(len, Len::N(0))) {
+                return Err(ParseError::Malformed(marker::PUSH).into());
+            }
+            if depth >= depth_limit(lim) {
                 return Err(ParseError::TooDeep.into());
             }
             let pairs = matches!(t, marker::MAP | marker::ATTRIBUTE);
             let open = match len {
                 Len::N(n) if n > lim.max_elements => return Err(ParseError::TooManyElements.into()),
                 // An attribute's entries, then the value they describe.
-                Len::N(n) if t == marker::ATTRIBUTE => Open::Left(n.saturating_mul(2).saturating_add(1)),
+                Len::N(n) if t == marker::ATTRIBUTE => Open::Attr(n.saturating_mul(2).saturating_add(1)),
                 Len::N(n) if pairs => Open::Left(n.saturating_mul(2)),
+                Len::N(n) if t == marker::PUSH => Open::Push(n),
                 Len::N(n) => Open::Left(n),
                 Len::Streamed if t != marker::PUSH && t != marker::ATTRIBUTE => Open::Streamed { pairs, seen: 0 },
                 _ => return Err(ParseError::BadLength.into()),
@@ -745,7 +845,10 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
         }
         // Every other type holds no values, and value reads it whole.
         _ => {
-            let (_, e) = value(b, pos, depth, lim)?;
+            let (v, e) = value(b, pos, depth, false, lim)?;
+            if push_first && v == Value::Null {
+                return Err(ParseError::Malformed(marker::PUSH).into());
+            }
             Ok(s.ended(e))
         }
     }
@@ -758,53 +861,86 @@ fn scan_command(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
     match b.first() {
         None => return Some(1),
         Some(&marker::ARRAY) => {}
-        Some(_) => {
-            return match inline(b, lim) {
-                Err(Fail::Need(n)) => Some(n),
-                _ => None,
-            };
+        Some(_) => return scan_inline(s, b, lim),
+    }
+    loop {
+        let start = s.pos.saturating_add(1);
+        if s.line_waits(b, start, lim.max_line_len) {
+            return Some(b.len().saturating_add(1));
+        }
+        match command_step(s, b, lim) {
+            Ok(true) => {}
+            Ok(false) | Err(Fail::Bad(_)) => return None,
+            Err(Fail::Need(n)) => {
+                s.note_line(b, start, n, lim.max_line_len);
+                return Some(n);
+            }
         }
     }
-    if s.open.is_empty() {
+}
+
+/// Checks a command array's count, or one argument, at `s.pos`. It
+/// returns whether there is more to check, and changes `s` only when the
+/// part is whole.
+fn command_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<bool, Fail> {
+    let Some(&Open::Left(left)) = s.open.last() else {
         // The count, as multibulk reads it.
-        let (l, e) = match line(b, 1, lim) {
-            Ok(r) => r,
-            Err(Fail::Need(n)) => return Some(n),
-            Err(Fail::Bad(_)) => return None,
-        };
-        let n = if l.first() == Some(&b'+') { None } else { int(l) };
-        match n.and_then(|n| usize::try_from(n).ok()) {
+        let (l, e) = line(b, 1, lim)?;
+        return match redis_ll(l).and_then(|n| usize::try_from(n).ok()) {
             Some(n) if n > 0 && n <= lim.max_elements => {
                 s.open.push(Open::Left(n));
                 s.pos = e;
+                Ok(true)
             }
-            _ => return None,
-        }
-    }
-    while let Some(&Open::Left(left)) = s.open.last() {
-        if left == 0 {
-            return None;
-        }
-        let pos = s.pos;
-        // One argument, as multibulk reads it.
-        let step = match b.get(pos) {
-            None => Err(Fail::Need(pos.saturating_add(1))),
-            Some(&marker::BULK) => line(b, pos + 1, lim).and_then(|(l, e)| {
-                let n = digits(l).ok_or(ParseError::BulkTooLong)?;
-                data(b, e, n, lim)
-            }),
-            Some(_) => return None,
+            _ => Ok(false),
         };
-        match step {
-            Ok((_, e)) => {
-                s.open[0] = Open::Left(left - 1);
-                s.pos = e;
-            }
-            Err(Fail::Need(n)) => return Some(n),
-            Err(Fail::Bad(_)) => return None,
+    };
+    if left == 0 {
+        return Ok(false);
+    }
+    // One argument, as multibulk reads it.
+    let pos = s.pos;
+    match b.get(pos) {
+        None => return Err(Fail::Need(pos.saturating_add(1))),
+        Some(&marker::BULK) => {}
+        Some(_) => return Ok(false),
+    }
+    let (l, e) = line(b, pos + 1, lim)?;
+    let n = bulk_len(l).ok_or(ParseError::BulkTooLong)?;
+    let (_, e) = data(b, e, n, lim)?;
+    if let Some(slot) = s.open.last_mut() {
+        *slot = Open::Left(left - 1);
+    }
+    s.pos = e;
+    Ok(true)
+}
+
+/// Goes on checking an inline command, as [`inline`] reads it, searching
+/// only the bytes that came since the last attempt for the line's end.
+fn scan_inline(s: &mut Scan, b: &[u8], lim: &Limits) -> Option<usize> {
+    if let Some(q) = s.quiet
+        && q.start == 0
+        && q.to <= b.len()
+        && b.len() <= lim.max_line_len
+    {
+        let first = b[q.to..].iter().find(|&&c| c == b'\n' || c == 0);
+        let stuck = q.stuck || first == Some(&0);
+        if stuck || first.is_none() {
+            s.quiet = Some(Quiet { start: 0, to: b.len(), stuck });
+            return Some(b.len().saturating_add(1));
         }
     }
-    None
+    match inline(b, lim) {
+        Err(Fail::Need(n)) => {
+            // Needing more, a line no longer than the limit holds no LF,
+            // or a NUL before it.
+            if b.len() <= lim.max_line_len {
+                s.quiet = Some(Quiet { start: 0, to: b.len(), stuck: b.contains(&0) });
+            }
+            Some(n)
+        }
+        _ => None,
+    }
 }
 
 fn finish<T>(r: Step<T>) -> Result<Option<(T, usize)>, ParseError> {
@@ -834,7 +970,7 @@ fn bounded<T>(r: Step<T>, lim: &Limits) -> Step<T> {
 }
 
 fn value_top(b: &[u8], lim: &Limits) -> Step<Value> {
-    bounded(value(frame(b, lim), 0, 0, lim), lim)
+    bounded(value(frame(b, lim), 0, 0, true, lim), lim)
 }
 
 fn command_top(b: &[u8], lim: &Limits) -> Step<Command> {
@@ -903,6 +1039,31 @@ fn digits(l: &[u8]) -> Option<usize> {
         }
         n.checked_mul(10)?.checked_add(usize::from(c - b'0'))
     })
+}
+
+/// A number as Redis's `string2ll` reads a command's count or an
+/// argument's length: `0`, or an optional `-` and digits that do not
+/// start with 0, in 64 bits.
+fn redis_ll(l: &[u8]) -> Option<i64> {
+    if l == b"0" {
+        return Some(0);
+    }
+    let ds = l.strip_prefix(b"-").unwrap_or(l);
+    if !matches!(ds.first(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    int(l)
+}
+
+/// An argument's length in a command array, as Redis reads it.
+fn bulk_len(l: &[u8]) -> Option<usize> {
+    redis_ll(l).and_then(|n| usize::try_from(n).ok())
+}
+
+/// Whether a value with this marker can be a string: a simple, bulk or
+/// verbatim string, as a push's first element must be.
+fn is_string_marker(t: u8) -> bool {
+    matches!(t, marker::SIMPLE | marker::BULK | marker::VERBATIM)
 }
 
 /// A signed decimal 64-bit integer, with an optional `+` or `-`.
@@ -1001,7 +1162,9 @@ fn big_ok(l: &[u8]) -> bool {
     !ds.is_empty() && ds.iter().all(u8::is_ascii_digit)
 }
 
-fn value(b: &[u8], pos: usize, depth: usize, lim: &Limits) -> Step<Value> {
+/// The value at `pos`, nested `depth` deep. `top` says whether it is at
+/// the top level, perhaps after attributes, where a push may be.
+fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Value> {
     let Some(&t) = b.get(pos) else { return Err(Fail::Need(pos.saturating_add(1))) };
     let p = pos + 1;
     match t {
@@ -1070,11 +1233,15 @@ fn value(b: &[u8], pos: usize, depth: usize, lim: &Limits) -> Step<Value> {
             if matches!(len, Len::Null) {
                 return if t == marker::ARRAY { Ok((Value::NullArray, e)) } else { Err(ParseError::BadLength.into()) };
             }
-            if depth >= lim.max_depth {
+            // A push comes only at the top level, and starts with a string.
+            if t == marker::PUSH && (!top || matches!(len, Len::N(0))) {
+                return Err(ParseError::Malformed(t).into());
+            }
+            if depth >= depth_limit(lim) {
                 return Err(ParseError::TooDeep.into());
             }
             let (items, e) = match len {
-                Len::N(n) => list(b, e, n, depth, lim)?,
+                Len::N(n) => list(b, e, n, depth, t == marker::PUSH, lim)?,
                 Len::Streamed if t != marker::PUSH => streamed_list(b, e, depth, lim)?,
                 _ => return Err(ParseError::BadLength.into()),
             };
@@ -1088,7 +1255,7 @@ fn value(b: &[u8], pos: usize, depth: usize, lim: &Limits) -> Step<Value> {
         marker::MAP | marker::ATTRIBUTE => {
             let (l, e) = line(b, p, lim)?;
             let len = length(l)?;
-            if depth >= lim.max_depth {
+            if depth >= depth_limit(lim) {
                 return Err(ParseError::TooDeep.into());
             }
             let (entries, e) = match len {
@@ -1099,7 +1266,7 @@ fn value(b: &[u8], pos: usize, depth: usize, lim: &Limits) -> Step<Value> {
             if t == marker::MAP {
                 return Ok((Value::Map(entries), e));
             }
-            let (v, e) = value(b, e, depth + 1, lim)?;
+            let (v, e) = value(b, e, depth + 1, top, lim)?;
             Ok((Value::Attribute { attributes: entries, value: Box::new(v) }, e))
         }
         _ => Err(ParseError::UnknownType(t).into()),
@@ -1107,18 +1274,37 @@ fn value(b: &[u8], pos: usize, depth: usize, lim: &Limits) -> Step<Value> {
 }
 
 /// A capacity for `n` items of at least `min` bytes each, no more than
-/// the bytes left could hold.
+/// the bytes left could hold, nor [`PREALLOC`]. Nested aggregates share
+/// the bytes left, so each reserves little and grows as its elements
+/// come.
 fn capacity(b: &[u8], pos: usize, n: usize, min: usize) -> usize {
-    n.min(b.len().saturating_sub(pos) / min)
+    n.min(b.len().saturating_sub(pos) / min).min(PREALLOC)
 }
 
-fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, lim: &Limits) -> Step<Vec<Value>> {
+/// How deep the readers let aggregates nest under `lim`.
+fn depth_limit(lim: &Limits) -> usize {
+    lim.max_depth.min(DEPTH_CEILING)
+}
+
+/// `n` elements from `pos`. With `push`, the first must be a string.
+fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limits) -> Step<Vec<Value>> {
     if n > lim.max_elements {
         return Err(ParseError::TooManyElements.into());
     }
     let mut items = Vec::with_capacity(capacity(b, pos, n, 3));
-    for _ in 0..n {
-        let (v, e) = value(b, pos, depth + 1, lim)?;
+    for i in 0..n {
+        let first = push && i == 0;
+        if first {
+            match b.get(pos) {
+                None => return Err(Fail::Need(pos.saturating_add(1))),
+                Some(&t) if !is_string_marker(t) => return Err(ParseError::Malformed(marker::PUSH).into()),
+                Some(_) => {}
+            }
+        }
+        let (v, e) = value(b, pos, depth + 1, false, lim)?;
+        if first && v == Value::Null {
+            return Err(ParseError::Malformed(marker::PUSH).into());
+        }
         items.push(v);
         pos = e;
     }
@@ -1131,8 +1317,8 @@ fn pairs(b: &[u8], mut pos: usize, n: usize, depth: usize, lim: &Limits) -> Step
     }
     let mut entries = Vec::with_capacity(capacity(b, pos, n, 6));
     for _ in 0..n {
-        let (k, e) = value(b, pos, depth + 1, lim)?;
-        let (v, e) = value(b, e, depth + 1, lim)?;
+        let (k, e) = value(b, pos, depth + 1, false, lim)?;
+        let (v, e) = value(b, e, depth + 1, false, lim)?;
         entries.push((k, v));
         pos = e;
     }
@@ -1164,7 +1350,7 @@ fn streamed_list(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<V
         if items.len() >= lim.max_elements {
             return Err(ParseError::TooManyElements.into());
         }
-        let (v, e) = value(b, pos, depth + 1, lim)?;
+        let (v, e) = value(b, pos, depth + 1, false, lim)?;
         items.push(v);
         pos = e;
     }
@@ -1179,8 +1365,8 @@ fn streamed_pairs(b: &[u8], mut pos: usize, depth: usize, lim: &Limits) -> Step<
         if entries.len() >= lim.max_elements {
             return Err(ParseError::TooManyElements.into());
         }
-        let (k, e) = value(b, pos, depth + 1, lim)?;
-        let (v, e) = value(b, e, depth + 1, lim)?;
+        let (k, e) = value(b, pos, depth + 1, false, lim)?;
+        let (v, e) = value(b, e, depth + 1, false, lim)?;
         entries.push((k, v));
         pos = e;
     }
@@ -1218,9 +1404,7 @@ fn command(b: &[u8], lim: &Limits) -> Step<Command> {
 
 fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
     let (l, mut pos) = line(b, 1, lim)?;
-    // Redis reads the count with string2ll, which takes a `-` but no `+`.
-    let n = if l.first() == Some(&b'+') { None } else { int(l) };
-    let n = n.ok_or(ParseError::TooManyElements)?;
+    let n = redis_ll(l).ok_or(ParseError::TooManyElements)?;
     // Redis ignores an array of zero or fewer elements.
     let Ok(n) = usize::try_from(n) else { return Ok((Command::default(), pos)) };
     if n > lim.max_elements {
@@ -1234,7 +1418,7 @@ fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
             Some(&c) => return Err(ParseError::ExpectedBulk(c).into()),
         }
         let (l, e) = line(b, pos + 1, lim)?;
-        let n = digits(l).ok_or(ParseError::BulkTooLong)?;
+        let n = bulk_len(l).ok_or(ParseError::BulkTooLong)?;
         let (d, e) = data(b, e, n, lim)?;
         args.push(d.to_vec());
         pos = e;
@@ -1245,10 +1429,14 @@ fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
 fn inline(b: &[u8], lim: &Limits) -> Step<Command> {
     // The text may be max_line_len bytes, then CR LF.
     let window = &b[..b.len().min(lim.max_line_len.saturating_add(2))];
-    let Some(i) = window.iter().position(|&c| c == b'\n') else {
-        // Without an LF, the bytes past the longest text can only be a CR.
+    // Redis finds the LF with strchr, which stops at a NUL, so after a
+    // NUL the line never ends, and the bytes run into the limit.
+    let end = window.iter().position(|&c| c == b'\n' || c == 0);
+    let Some(i) = end.filter(|&i| window[i] == b'\n') else {
+        // Without an LF, the bytes past the longest text can only be a CR,
+        // and only before a LF that can still come.
         let over = window.len().saturating_sub(lim.max_line_len);
-        if over > 1 || (over == 1 && window.last() != Some(&b'\r')) {
+        if over > 1 || (over == 1 && (end.is_some() || window.last() != Some(&b'\r'))) {
             return Err(ParseError::LineTooLong.into());
         }
         return Err(Fail::Need(b.len().saturating_add(1)));
@@ -1283,9 +1471,9 @@ fn hex(c: Option<&u8>) -> Option<u8> {
 }
 
 /// Splits an inline command's line into arguments, as Redis's
-/// `sdssplitargs` does. Like that C code, it stops at a NUL byte.
+/// `sdssplitargs` does. The line holds no NUL: [`inline`] ends no line
+/// after one.
 fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
-    let text = text.iter().position(|&c| c == 0).map_or(text, |i| &text[..i]);
     let after_quote_ok = |i: usize| text.get(i + 1).is_none_or(|&c| is_space(c));
     let mut args = Vec::new();
     let mut i = 0;
@@ -1371,17 +1559,18 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
 // Writing.
 
 /// Appends `v` to `out` in at most `budget` bytes, or appends nothing and
-/// returns false if it cannot fit.
-fn put(out: &mut Vec<u8>, v: &Value, ver: Version, depth: usize, lim: &Limits, budget: usize) -> bool {
+/// returns false if it cannot fit. `top` says whether `v` is at the top
+/// level, perhaps after attributes, where a push may be.
+fn put(out: &mut Vec<u8>, v: &Value, ver: Version, depth: usize, top: bool, lim: &Limits, budget: usize) -> bool {
     let start = out.len();
-    if put_inner(out, v, ver, depth, lim, budget) && out.len() - start <= budget {
+    if put_inner(out, v, ver, depth, top, lim, budget) && out.len() - start <= budget {
         return true;
     }
     out.truncate(start);
     false
 }
 
-fn put_inner(out: &mut Vec<u8>, v: &Value, ver: Version, depth: usize, lim: &Limits, budget: usize) -> bool {
+fn put_inner(out: &mut Vec<u8>, v: &Value, ver: Version, depth: usize, top: bool, lim: &Limits, budget: usize) -> bool {
     let r3 = ver == Version::Resp3;
     match v {
         Value::Simple(s) => line_out(out, marker::SIMPLE, s, lim),
@@ -1422,7 +1611,9 @@ fn put_inner(out: &mut Vec<u8>, v: &Value, ver: Version, depth: usize, lim: &Lim
             return list_out(out, m, items, ver, depth, lim, budget);
         }
         Value::Push(items) => {
-            let m = if r3 { marker::PUSH } else { marker::ARRAY };
+            let string_first =
+                matches!(items.first(), Some(Value::Simple(_) | Value::Bulk(_) | Value::Verbatim { .. }));
+            let m = if r3 && top && string_first { marker::PUSH } else { marker::ARRAY };
             return list_out(out, m, items, ver, depth, lim, budget);
         }
         Value::Map(entries) => {
@@ -1430,19 +1621,36 @@ fn put_inner(out: &mut Vec<u8>, v: &Value, ver: Version, depth: usize, lim: &Lim
             return pairs_out(out, m, entries, ver, depth, lim, budget);
         }
         Value::Attribute { attributes, value } => {
-            if depth >= lim.max_depth {
+            if depth >= depth_limit(lim) {
                 null_out(out, ver);
                 return true;
             }
             if !r3 {
-                return put(out, value, ver, depth + 1, lim, budget);
+                return put(out, value, ver, depth + 1, top, lim, budget);
             }
             let start = out.len();
-            if !pairs_out(out, marker::ATTRIBUTE, attributes, ver, depth, lim, budget) {
+            if pairs_out(out, marker::ATTRIBUTE, attributes, ver, depth, lim, budget) {
+                let used = out.len() - start;
+                if put(out, value, ver, depth + 1, top, lim, budget.saturating_sub(used)) {
+                    return true;
+                }
+                out.truncate(start);
+            }
+            // The entries leave no room for the value. They only describe
+            // it, so the value goes first, then as many entries as fit go
+            // before it.
+            if !put(out, value, ver, depth + 1, top, lim, budget) {
                 return false;
             }
-            let used = out.len() - start;
-            return put(out, value, ver, depth + 1, lim, budget.saturating_sub(used));
+            let room = budget.saturating_sub(out.len() - start);
+            let mut head = Vec::new();
+            if pairs_out(&mut head, marker::ATTRIBUTE, attributes, ver, depth, lim, room)
+                && head.len() <= room
+                && head.len() > header_len(0)
+            {
+                out.splice(start..start, head);
+            }
+            return true;
         }
     }
     true
@@ -1474,6 +1682,18 @@ fn bulk_out(out: &mut Vec<u8>, m: u8, d: &[u8], lim: &Limits) {
     out.extend_from_slice(b"\r\n");
 }
 
+/// How many bytes an aggregate's header takes for `n` elements: a type
+/// byte, the digits and a line end.
+fn header_len(n: usize) -> usize {
+    let mut digits = 1;
+    let mut n = n / 10;
+    while n > 0 {
+        digits += 1;
+        n /= 10;
+    }
+    digits + 3
+}
+
 fn header_at(out: &mut Vec<u8>, at: usize, m: u8, n: usize) {
     let mut h = vec![m];
     h.extend_from_slice(n.to_string().as_bytes());
@@ -1490,20 +1710,22 @@ fn list_out(
     lim: &Limits,
     budget: usize,
 ) -> bool {
-    if depth >= lim.max_depth {
+    if depth >= depth_limit(lim) {
         null_out(out, ver);
         return true;
     }
     let start = out.len();
-    let room = budget.saturating_sub(HEADER_MAX);
     let mut n = 0;
     for item in items.iter().take(lim.max_elements) {
-        let left = room.saturating_sub(out.len() - start);
-        if !put(out, item, ver, depth + 1, lim, left) {
+        // Room for this element, the ones before it and the header.
+        let left = budget.saturating_sub(header_len(n + 1)).saturating_sub(out.len() - start);
+        if !put(out, item, ver, depth + 1, false, lim, left) {
             break;
         }
         n += 1;
     }
+    // A push with no element has no string first.
+    let m = if m == marker::PUSH && n == 0 { marker::ARRAY } else { m };
     header_at(out, start, m, n);
     true
 }
@@ -1519,19 +1741,19 @@ fn pairs_out(
     lim: &Limits,
     budget: usize,
 ) -> bool {
-    if depth >= lim.max_depth {
+    if depth >= depth_limit(lim) {
         null_out(out, ver);
         return true;
     }
     let flat = m == marker::ARRAY;
     let max = if flat { lim.max_elements / 2 } else { lim.max_elements };
     let start = out.len();
-    let room = budget.saturating_sub(HEADER_MAX);
     let mut n = 0;
     for (k, v) in entries.iter().take(max) {
         let mark = out.len();
-        let fits = put(out, k, ver, depth + 1, lim, room.saturating_sub(mark - start))
-            && put(out, v, ver, depth + 1, lim, room.saturating_sub(out.len() - start));
+        let room = budget.saturating_sub(header_len(if flat { (n + 1) * 2 } else { n + 1 }));
+        let fits = put(out, k, ver, depth + 1, false, lim, room.saturating_sub(mark - start))
+            && put(out, v, ver, depth + 1, false, lim, room.saturating_sub(out.len() - start));
         if !fits {
             out.truncate(mark);
             break;
@@ -1544,12 +1766,11 @@ fn pairs_out(
 
 fn put_command(out: &mut Vec<u8>, args: &[Vec<u8>], lim: &Limits) {
     let start = out.len();
-    let room = lim.max_frame_len.saturating_sub(HEADER_MAX);
     let mut n = 0;
     for a in args.iter().take(lim.max_elements) {
         let mark = out.len();
         bulk_out(out, marker::BULK, a, lim);
-        if out.len() - start > room {
+        if out.len() - start > lim.max_frame_len.saturating_sub(header_len(n + 1)) {
             out.truncate(mark);
             break;
         }
@@ -1716,7 +1937,7 @@ mod tests {
             (Value::Verbatim { format: *b"txt", text: b"Some string".to_vec() }, b"$11\r\nSome string\r\n", VALID[28]),
             (Value::Map(vec![(s("first"), Value::Integer(1))]), b"*2\r\n+first\r\n:1\r\n", b"%1\r\n+first\r\n:1\r\n"),
             (Value::Set(vec![Value::Integer(1)]), b"*1\r\n:1\r\n", b"~1\r\n:1\r\n"),
-            (Value::Push(vec![Value::Integer(1)]), b"*1\r\n:1\r\n", b">1\r\n:1\r\n"),
+            (Value::Push(vec![s("a"), Value::Integer(1)]), b"*2\r\n+a\r\n:1\r\n", b">2\r\n+a\r\n:1\r\n"),
             (
                 Value::Attribute { attributes: vec![(s("ttl"), Value::Integer(1))], value: Box::new(Value::ok()) },
                 b"+OK\r\n",
@@ -1753,8 +1974,8 @@ mod tests {
         assert_eq!(Command::parse(b" \r\n"), Ok(Some((Command::default(), 3))));
         assert_eq!(Command::parse(b"*0\r\n"), Ok(Some((Command::default(), 4))));
         assert_eq!(Command::parse(b"*-1\r\n"), Ok(Some((Command::default(), 5))));
-        // A NUL ends the line's text, as in C.
-        assert_eq!(Command::parse(b"GET a\0b\n").unwrap().unwrap().0, Command::new(["GET", "a"]));
+        // A NUL hides the line's end, as strchr in Redis does.
+        assert_eq!(Command::parse(b"GET a\0b\n"), Ok(None));
     }
 
     #[test]
@@ -1933,7 +2154,7 @@ mod tests {
 
     fn encode_with(v: &Value, ver: Version, lim: &Limits) -> Vec<u8> {
         let mut out = Vec::new();
-        put(&mut out, v, ver, 0, lim, lim.max_frame_len);
+        put(&mut out, v, ver, 0, true, lim, lim.max_frame_len);
         out
     }
 
@@ -1960,11 +2181,11 @@ mod tests {
             let out = encode_with(&Value::Array(ten.clone()), ver, &lim);
             let (v, _) = Value::parse_with(&out, &lim).unwrap().unwrap();
             assert_eq!(v, Value::Array(vec![bulk("0123456789"); 4]));
-            // The frame limit keeps fewer.
+            // The frame limit keeps fewer: two of 17 bytes and a header of 4.
             let small = Limits { max_frame_len: 50, ..lim };
             let out = encode_with(&Value::Array(ten.clone()), ver, &small);
-            assert!(out.len() <= 50);
-            assert_eq!(Value::parse_with(&out, &small).unwrap().unwrap().0, Value::Array(vec![bulk("0123456789")]));
+            assert_eq!(out.len(), 38);
+            assert_eq!(Value::parse_with(&out, &small).unwrap().unwrap().0, Value::Array(vec![bulk("0123456789"); 2]));
             // Maps keep whole entries, half as many in RESP2.
             let map = Value::Map((0..10).map(|i| (Value::Integer(i), Value::Integer(i))).collect());
             let (v, _) = Value::parse_with(&encode_with(&map, ver, &lim), &lim).unwrap().unwrap();
@@ -1982,13 +2203,14 @@ mod tests {
         let mut out = Vec::new();
         put_command(&mut out, &Command::new(["a"; 10]).args, &lim);
         assert_eq!(Command::parse_with(&out, &lim).unwrap().unwrap().0.args.len(), 4);
-        // An attribute whose value does not fit is left out whole.
+        // An attribute whose value does not fit beside its entries keeps
+        // the value alone.
         let tiny = Limits { max_frame_len: 30, ..lim };
         let attr = Value::Array(vec![
             Value::Integer(1),
             Value::Attribute { attributes: vec![(s("k"), s("v"))], value: Box::new(bulk("0123456789")) },
         ]);
-        assert_eq!(encode_with(&attr, Version::Resp3, &tiny), b"*1\r\n:1\r\n");
+        assert_eq!(encode_with(&attr, Version::Resp3, &tiny), b"*2\r\n:1\r\n$10\r\n0123456789\r\n");
     }
 
     struct Lcg(u64);
@@ -2030,7 +2252,11 @@ mod tests {
             9 => Value::Verbatim { format: *b"mkd", text: r.bytes(12) },
             10 => Value::Array((0..r.below(4)).map(|_| random(r, depth + 1, resp2)).collect()),
             11 => Value::Set((0..r.below(4)).map(|_| random(r, depth + 1, resp2)).collect()),
-            12 => Value::Push((0..r.below(4)).map(|_| random(r, depth + 1, resp2)).collect()),
+            // A push comes only at the top level, and starts with a string.
+            12 if depth == 0 => Value::Push(
+                std::iter::once(Value::Bulk(r.bytes(6))).chain((0..r.below(3)).map(|_| random(r, 1, resp2))).collect(),
+            ),
+            12 => Value::Array((0..r.below(4)).map(|_| random(r, depth + 1, resp2)).collect()),
             13 => Value::Map(
                 (0..r.below(3)).map(|_| (random(r, depth + 1, resp2), random(r, depth + 1, resp2))).collect(),
             ),
@@ -2067,7 +2293,7 @@ mod tests {
     /// A random input: random bytes from RESP's alphabet, or a valid
     /// encoding with a few bytes changed, added, removed or cut.
     fn fuzz_input(r: &mut Lcg) -> Vec<u8> {
-        const ALPHABET: &[u8] = b"+-:$*_#,(!=%~|>;.?\r\n\r\n0123456789-tfinax \"'\\";
+        const ALPHABET: &[u8] = b"+-:$*_#,(!=%~|>;.?\r\n\r\n0123456789-tfinax \"'\\\0";
         if r.below(3) == 0 {
             return (0..r.below(40)).map(|_| ALPHABET[r.below(ALPHABET.len())]).collect();
         }
@@ -2161,6 +2387,32 @@ mod tests {
             let (again, n) = Value::parse(&bytes).unwrap().unwrap();
             assert_eq!(n, bytes.len());
             assert_eq!(again.to_bytes(ver), bytes);
+            // RESP3 has every type, so a value read under the default
+            // limits comes back the same.
+            if ver == Version::Resp3 && *lim == Limits::DEFAULT {
+                assert!(same(&v, &again), "{v:?} {again:?}");
+            }
+        }
+    }
+
+    /// Whether two values are the same, as RESP3 can tell: NaN is NaN,
+    /// and the null array is null.
+    fn same(a: &Value, b: &Value) -> bool {
+        let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| same(x, y));
+        let pairs = |x: &[(Value, Value)], y: &[(Value, Value)]| {
+            x.len() == y.len() && x.iter().zip(y).all(|((a, b), (c, d))| same(a, c) && same(b, d))
+        };
+        match (a, b) {
+            (Value::Null | Value::NullArray, Value::Null | Value::NullArray) => true,
+            (Value::Double(x), Value::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
+            (Value::Array(x), Value::Array(y)) | (Value::Set(x), Value::Set(y)) | (Value::Push(x), Value::Push(y)) => {
+                all(x, y)
+            }
+            (Value::Map(x), Value::Map(y)) => pairs(x, y),
+            (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
+                pairs(x, y) && same(v, w)
+            }
+            _ => a == b,
         }
     }
 
@@ -2194,7 +2446,8 @@ mod tests {
             // A decoder fed in random pieces finds what one-shot parsing
             // finds, values and commands, under both limits.
             for lim in [Limits::DEFAULT, small] {
-                let pieces = random_pieces(&mut r, b.len());
+                // In random pieces, or a byte at a time.
+                let pieces = if r.below(4) == 0 { (0..=b.len()).collect() } else { random_pieces(&mut r, b.len()) };
                 let expect = one_shot(&b, |b| Value::parse_with(b, &lim), |v| v.to_bytes(Version::Resp3));
                 let mut d = Decoder::with_limits(lim);
                 let got = decode(&mut d, &b, &pieces, |d| d.next_value(), |v| v.to_bytes(Version::Resp3));
@@ -2364,6 +2617,17 @@ mod tests {
             b"*2\r\n$1\r\na\r\n+b\r\n",
             b"*4\r\n$1\r\na\r\n",
             b"\"a b\" 'c\r\n",
+            b"*1\r\n>1\r\n+a\r\n",
+            b">1\r\n$-1\r\n",
+            b">2\r\n$?\r\n;1\r\na\r\n;0\r\n:1\r\n",
+            b"|1\r\n+k\r\n+v\r\n>1\r\n+a\r\n",
+            b"|1\r\n>1\r\n+a\r\n+v\r\n:1\r\n",
+            b"GE\0b\nPI\n",
+            b"*01\r\n$1\r\na\r\n",
+            b"*1\r\n$01\r\na\r\n",
+            b"+abcdef\r\n",
+            b"+abcdefg\r\n",
+            b"*1\r\n$1234567\r\n",
         ];
         for b in inputs {
             for end in 0..=b.len() {
@@ -2441,5 +2705,218 @@ mod tests {
         }
         assert_eq!(n, 1);
         assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+    }
+
+    /// One long line fed a byte at a time takes linear time: the decoder
+    /// searches only the new bytes for the line's end.
+    #[test]
+    fn decoder_is_linear_in_one_long_line() {
+        let start = std::time::Instant::now();
+        let n = MAX_LINE_LEN - 2;
+        // Values: a simple string, and a bulk length that grows too long.
+        for (lead, byte) in [(&b"+"[..], b'a'), (b"$", b'1')] {
+            let mut d = Decoder::new();
+            d.feed(lead);
+            for _ in 0..n {
+                d.feed(&[byte]);
+                assert_eq!(d.next_value(), None);
+            }
+            d.feed(b"\r\n");
+            let got = d.next_value().unwrap();
+            assert!(if byte == b'a' { got.is_ok() } else { got.is_err() });
+        }
+        // Commands: an inline line, and an argument's length.
+        for (lead, byte, end) in [(&b"x"[..], b'a', &b"\n"[..]), (b"*1\r\n$", b'1', b"\r\n")] {
+            let mut d = Decoder::new();
+            d.feed(lead);
+            for _ in 0..n {
+                d.feed(&[byte]);
+                assert_eq!(d.next_command(), None);
+            }
+            d.feed(end);
+            let got = d.next_command().unwrap();
+            assert!(if byte == b'a' { got.is_ok() } else { got.is_err() });
+        }
+        assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
+    }
+
+    /// A top-level attribute whose value does not fit beside its entries
+    /// is written as the value alone, never as nothing.
+    #[test]
+    fn top_level_attribute_is_never_dropped() {
+        let attr = Value::Attribute { attributes: vec![(s("k"), s("v"))], value: Box::new(bulk("0123456789")) };
+        let fits = Limits { max_bulk_len: 10, max_elements: 4, max_depth: 3, max_line_len: 400, max_frame_len: 29 };
+        assert_eq!(encode_with(&attr, Version::Resp3, &fits), b"|1\r\n+k\r\n+v\r\n$10\r\n0123456789\r\n");
+        let tiny = Limits { max_frame_len: 28, ..fits };
+        assert_eq!(encode_with(&attr, Version::Resp3, &tiny), b"$10\r\n0123456789\r\n");
+        // Through the public writer, under the default limits.
+        let big = Value::Attribute {
+            attributes: (0..3).map(|_| (Value::Bulk(vec![0; MAX_BULK_LEN]), Value::Null)).collect(),
+            value: Box::new(Value::Bulk(vec![1; MAX_BULK_LEN])),
+        };
+        let out = big.to_bytes(Version::Resp3);
+        let (v, used) = Value::parse(&out).unwrap().unwrap();
+        assert_eq!(used, out.len());
+        // Two entries fit before the value.
+        let Value::Attribute { attributes, value } = v else { panic!() };
+        assert_eq!(attributes.len(), 2);
+        assert_eq!(*value, Value::Bulk(vec![1; MAX_BULK_LEN]));
+        // Entries that fit are kept before a value cut to fit.
+        let attr = Value::Attribute {
+            attributes: vec![(s("k"), s("v"))],
+            value: Box::new(Value::Array(vec![bulk("0123456789"); 3])),
+        };
+        let lim = Limits { max_frame_len: 40, ..tiny };
+        assert_eq!(encode_with(&attr, Version::Resp3, &lim), b"|1\r\n+k\r\n+v\r\n*1\r\n$10\r\n0123456789\r\n");
+    }
+
+    /// A depth limit set very high still cannot overflow the stack.
+    #[test]
+    fn depth_has_a_ceiling() {
+        let lim = Limits { max_depth: 100_000, ..Limits::DEFAULT };
+        let mut b = b"*1\r\n".repeat(100_000);
+        b.extend_from_slice(b"_\r\n");
+        assert_eq!(Value::parse_with(&b, &lim), Err(ParseError::TooDeep));
+        let mut d = Decoder::with_limits(lim);
+        d.feed(&b);
+        assert_eq!(d.next_value(), Some(Err(ParseError::TooDeep)));
+        let mut ok = b"*1\r\n".repeat(DEPTH_CEILING);
+        ok.extend_from_slice(b"_\r\n");
+        assert!(Value::parse_with(&ok, &lim).unwrap().is_some());
+    }
+
+    /// Nested aggregates that claim many elements reserve little before
+    /// their elements come.
+    #[test]
+    fn aggregates_reserve_little_up_front() {
+        let rest = vec![b'x'; 3 * MAX_ELEMENTS];
+        assert!(capacity(&rest, 0, MAX_ELEMENTS, 3) <= PREALLOC);
+        let mut b = b"*1048576\r\n".repeat(32);
+        b.extend_from_slice(&rest);
+        assert_eq!(Value::parse(&b), Err(ParseError::UnknownType(b'x')));
+    }
+
+    /// What exactly fills the frame limit is written whole.
+    #[test]
+    fn writers_fill_the_frame_exactly() {
+        let lim = Limits { max_bulk_len: 10, max_elements: 8, max_depth: 3, max_line_len: 400, max_frame_len: 25 };
+        let c = Command::new(["a"; 3]);
+        let mut out = Vec::new();
+        put_command(&mut out, &c.args, &lim);
+        assert_eq!(out.len(), 25);
+        assert_eq!(Command::parse_with(&out, &lim), Ok(Some((c, 25))));
+        let a = Value::Array(vec![bulk("a"); 3]);
+        assert_eq!(encode_with(&a, Version::Resp2, &lim).len(), 25);
+        let m = Value::Map(vec![(s("a"), s("b")); 2]);
+        let lim = Limits { max_frame_len: 20, ..lim };
+        assert_eq!(encode_with(&m, Version::Resp3, &lim), b"%2\r\n+a\r\n+b\r\n+a\r\n+b\r\n");
+        // At the default limits: four bulk strings that fill 64 MiB.
+        let b = MAX_BULK_LEN;
+        let c = Command { args: vec![b"MGET".to_vec(), vec![0; b], vec![1; b], vec![2; b], vec![3; b - 66]] };
+        let bytes = c.to_bytes();
+        assert_eq!(bytes.len(), MAX_FRAME_LEN);
+        assert_eq!(Command::parse(&bytes), Ok(Some((c, MAX_FRAME_LEN))));
+    }
+
+    /// Feeding while many values wait does not move them all each time.
+    #[test]
+    fn decoder_keeps_a_backlog_in_place() {
+        const N: usize = 1000;
+        let mut d = Decoder::new();
+        d.feed(&b"_\r\n".repeat(N));
+        let mut got = 0;
+        for _ in 0..N {
+            assert_eq!(d.next_value(), Some(Ok(Value::Null)));
+            got += 1;
+            let before = d.start;
+            d.feed(b"_\r\n");
+            assert!(d.start == 0 || d.start == before, "moved at {got}");
+            if got == 1 {
+                assert_eq!(d.start, 3, "a backlog of {} bytes moved for 3 consumed", d.buffered());
+            }
+        }
+        while let Some(v) = d.next_value() {
+            assert_eq!(v, Ok(Value::Null));
+            got += 1;
+        }
+        assert_eq!(got, 2 * N);
+        assert_eq!(d.buffered(), 0);
+    }
+
+    /// A push starts with a string and comes only at the top level,
+    /// perhaps after an attribute.
+    #[test]
+    fn pushes_follow_the_specification() {
+        for b in [
+            &b">0\r\n"[..],
+            b">1\r\n:1\r\n",
+            b">1\r\n$-1\r\n",
+            b">2\r\n*1\r\n+a\r\n+b\r\n",
+            b"*1\r\n>1\r\n+a\r\n",
+            b"%1\r\n+k\r\n>1\r\n+a\r\n",
+            b"|1\r\n+k\r\n>1\r\n+a\r\n+v\r\n",
+        ] {
+            assert_eq!(Value::parse(b), Err(ParseError::Malformed(b'>')), "{}", b.escape_ascii());
+            let mut d = Decoder::new();
+            for byte in b {
+                d.feed(std::slice::from_ref(byte));
+            }
+            assert_eq!(d.next_value(), Some(Err(ParseError::Malformed(b'>'))), "{}", b.escape_ascii());
+        }
+        for b in [
+            &b">1\r\n+a\r\n"[..],
+            b">2\r\n$?\r\n;1\r\na\r\n;0\r\n:1\r\n",
+            b">1\r\n=5\r\ntxt:a\r\n",
+            b"|1\r\n+k\r\n+v\r\n>2\r\n$1\r\na\r\n*0\r\n",
+        ] {
+            one(b);
+        }
+        // What a writer cannot send as a push it sends as an array.
+        assert_eq!(Value::Push(vec![Value::Integer(1)]).to_bytes(Version::Resp3), b"*1\r\n:1\r\n");
+        assert_eq!(Value::Push(vec![]).to_bytes(Version::Resp3), b"*0\r\n");
+        let nested = Value::Array(vec![Value::Push(vec![s("a")])]);
+        assert_eq!(nested.to_bytes(Version::Resp3), b"*1\r\n*1\r\n+a\r\n");
+        let attr = Value::Attribute { attributes: vec![], value: Box::new(Value::Push(vec![bulk("a")])) };
+        assert_eq!(attr.to_bytes(Version::Resp3), b"|0\r\n>1\r\n$1\r\na\r\n");
+    }
+
+    /// Redis looks for an inline command's LF with strchr, which stops at
+    /// a NUL: after a NUL the line never ends, and runs into the limit.
+    #[test]
+    fn inline_nul_hides_the_line_end() {
+        assert_eq!(Command::parse(b"GET a\0b\nPING\n"), Ok(None));
+        let lim = Limits { max_line_len: 12, ..Limits::DEFAULT };
+        assert_eq!(Command::parse_with(b"GET a\0b\nPING\n", &lim), Err(ParseError::LineTooLong));
+        assert_eq!(Command::parse_with(b"GET a\0b\nPIN\n", &lim), Ok(None));
+        let mut d = Decoder::with_limits(lim);
+        for byte in b"GET a\0b\nPING\n" {
+            d.feed(std::slice::from_ref(byte));
+            if let Some(r) = d.next_command() {
+                assert_eq!(r, Err(ParseError::LineTooLong));
+                return;
+            }
+        }
+        panic!("no error");
+    }
+
+    /// A command's counts and lengths are numbers as Redis's string2ll
+    /// reads them: no leading zero and no `-0`.
+    #[test]
+    fn command_numbers_follow_string2ll() {
+        assert_eq!(Command::parse(b"*01\r\n$4\r\nPING\r\n"), Err(ParseError::TooManyElements));
+        assert_eq!(Command::parse(b"*-0\r\n"), Err(ParseError::TooManyElements));
+        assert_eq!(Command::parse(b"*00\r\n"), Err(ParseError::TooManyElements));
+        assert_eq!(Command::parse(b"*1\r\n$04\r\nPING\r\n"), Err(ParseError::BulkTooLong));
+        assert_eq!(Command::parse(b"*1\r\n$-0\r\n"), Err(ParseError::BulkTooLong));
+        assert_eq!(Command::parse(b"*1\r\n$0\r\n\r\n"), Ok(Some((Command::new([""]), 10))));
+        assert_eq!(Command::parse(b"*0\r\n"), Ok(Some((Command::default(), 4))));
+        assert_eq!(Command::parse(b"*-12\r\n"), Ok(Some((Command::default(), 6))));
+        for b in [&b"*01\r\n$4\r\nPING\r\n"[..], b"*1\r\n$04\r\nPING\r\n"] {
+            let mut d = Decoder::new();
+            d.feed(&b[..5]);
+            assert!(matches!(d.next_command(), None | Some(Err(_))));
+            d.feed(&b[5..]);
+            assert!(matches!(d.next_command(), Some(Err(_))), "{}", b.escape_ascii());
+        }
     }
 }

@@ -65,7 +65,7 @@
 //! assert_eq!(reply[..8], [1, 6, 0, 1, 0, 33, 7, 0]);
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
 /// convention. The specification names no port.
@@ -269,14 +269,15 @@ impl Record {
     /// A GET_VALUES management record asking for `names`. Names that do
     /// not fit in one record are left out.
     pub fn get_values(names: &[&[u8]]) -> Record {
-        let pairs: Vec<Pair> = names.iter().map(|n| (n.to_vec(), Vec::new())).collect();
-        Record::new(kind::GET_VALUES, NULL_REQUEST_ID, &encode_pairs_within(&pairs, MAX_CONTENT))
+        let (bytes, _) = encode_pairs_within(names.iter().map(|n| (*n, &[][..])), MAX_CONTENT);
+        Record::new(kind::GET_VALUES, NULL_REQUEST_ID, &bytes)
     }
 
     /// A GET_VALUES_RESULT management record answering with `pairs`.
     /// Pairs that do not fit in one record are left out.
     pub fn get_values_result(pairs: &[Pair]) -> Record {
-        Record::new(kind::GET_VALUES_RESULT, NULL_REQUEST_ID, &encode_pairs_within(pairs, MAX_CONTENT))
+        let (bytes, _) = encode_pairs_within(borrowed(pairs), MAX_CONTENT);
+        Record::new(kind::GET_VALUES_RESULT, NULL_REQUEST_ID, &bytes)
     }
 }
 
@@ -359,8 +360,9 @@ impl std::fmt::Display for BodyError {
 
 impl std::error::Error for BodyError {}
 
-/// The role a request asks the application to play.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The role a request asks the application to play. Roles compare by
+/// number, so `Role::Other(1)` equals `Role::Responder`.
+#[derive(Clone, Copy, Debug)]
 pub enum Role {
     /// Role 1: answer an HTTP request, like a CGI program.
     Responder,
@@ -373,6 +375,14 @@ pub enum Role {
     /// Any other role.
     Other(u16),
 }
+
+impl PartialEq for Role {
+    fn eq(&self, other: &Role) -> bool {
+        self.code() == other.code()
+    }
+}
+
+impl Eq for Role {}
 
 impl Role {
     /// The role's number.
@@ -428,8 +438,10 @@ impl BeginRequest {
     }
 }
 
-/// How a request ended, as far as the protocol goes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a request ended, as far as the protocol goes. Statuses compare by
+/// number, so `ProtocolStatus::Other(0)` equals
+/// `ProtocolStatus::RequestComplete`.
+#[derive(Clone, Copy, Debug)]
 pub enum ProtocolStatus {
     /// Status 0: the request ran.
     RequestComplete,
@@ -443,6 +455,14 @@ pub enum ProtocolStatus {
     /// Any other status.
     Other(u8),
 }
+
+impl PartialEq for ProtocolStatus {
+    fn eq(&self, other: &ProtocolStatus) -> bool {
+        self.code() == other.code()
+    }
+}
+
+impl Eq for ProtocolStatus {}
 
 impl ProtocolStatus {
     /// The status's number.
@@ -548,13 +568,20 @@ pub fn parse_pairs(b: &[u8]) -> Result<Vec<Pair>, PairError> {
 /// out, and so is any pair with a name or value longer than
 /// [`MAX_PAIR_LEN`], so [`parse_pairs`] always reads the output.
 pub fn encode_pairs(pairs: &[Pair]) -> Vec<u8> {
-    encode_pairs_within(pairs, usize::MAX)
+    encode_pairs_within(borrowed(pairs), usize::MAX).0
+}
+
+/// The pairs as borrowed names and values.
+fn borrowed(pairs: &[Pair]) -> impl Iterator<Item = (&[u8], &[u8])> {
+    pairs.iter().map(|(n, v)| (n.as_slice(), v.as_slice()))
 }
 
 /// Like [`encode_pairs`], but also leaves out each pair that would take the
-/// output past `max` bytes.
-fn encode_pairs_within(pairs: &[Pair], max: usize) -> Vec<u8> {
+/// output past `max` bytes. It returns the bytes and where each pair in
+/// them ends. Nothing is copied but the pairs written.
+fn encode_pairs_within<'a>(pairs: impl Iterator<Item = (&'a [u8], &'a [u8])>, max: usize) -> (Vec<u8>, Vec<usize>) {
     let mut out = Vec::new();
+    let mut ends = Vec::new();
     let mut count = 0;
     for (name, value) in pairs {
         if count >= MAX_PAIRS {
@@ -576,9 +603,10 @@ fn encode_pairs_within(pairs: &[Pair], max: usize) -> Vec<u8> {
         write_len(&mut out, value.len());
         out.extend_from_slice(name);
         out.extend_from_slice(value);
+        ends.push(out.len());
         count += 1;
     }
-    out
+    (out, ends)
 }
 
 fn len_size(n: usize) -> usize {
@@ -614,12 +642,35 @@ fn write_stream(out: &mut Vec<u8>, kind: u8, id: u16, data: &[u8]) {
     out.extend(Record::new(kind, id, &[]).to_bytes());
 }
 
+/// Appends the records of a PARAMS stream holding `bytes`, whose pairs end
+/// at `ends`. Each record ends at the end of a pair when one fits, since
+/// some applications, PHP-FPM among them, read the pairs of each PARAMS
+/// record on their own. A pair too long for one record spans records.
+fn write_params(out: &mut Vec<u8>, id: u16, bytes: &[u8], ends: &[usize]) {
+    let mut start = 0;
+    while start < bytes.len() {
+        let limit = start.saturating_add(CHUNK).min(bytes.len());
+        // The last pair end that fits, or the limit if none does.
+        let at = ends.partition_point(|&e| e <= limit);
+        let cut = match at.checked_sub(1).map(|i| ends[i]) {
+            Some(e) if e > start => e,
+            _ => limit,
+        };
+        out.extend(Record::new(kind::PARAMS, id, &bytes[start..cut]).to_bytes());
+        start = cut;
+    }
+    out.extend(Record::new(kind::PARAMS, id, &[]).to_bytes());
+}
+
 /// The bytes of a whole stream of type `kind` for request `id`: the data
 /// in as many records as it needs, then the empty record that ends the
-/// stream.
+/// stream. The data is cut to the limit a [`Server`] or [`Client`] takes
+/// for the stream: [`MAX_PARAMS`] bytes for PARAMS and [`MAX_STREAM`] for
+/// the others.
 pub fn stream_bytes(kind: u8, id: u16, data: &[u8]) -> Vec<u8> {
+    let limit = if kind == kind::PARAMS { MAX_PARAMS } else { MAX_STREAM };
     let mut out = Vec::new();
-    write_stream(&mut out, kind, id, data);
+    write_stream(&mut out, kind, id, &data[..data.len().min(limit)]);
     out
 }
 
@@ -657,14 +708,16 @@ impl Request {
     /// [`StreamError::UnknownRole`]. Parameters that would take the PARAMS
     /// stream past [`MAX_PARAMS`] bytes are left out, and STDIN and DATA
     /// are cut to [`MAX_STREAM`] bytes, so a [`Server`] takes the whole of
-    /// what is written.
+    /// what is written. Each PARAMS record holds whole pairs, unless a pair
+    /// is too long for one record.
     pub fn to_bytes(&self) -> Vec<u8> {
         let id = self.id.max(1);
         // `Role::Other(3)` is the filter role too, and carries DATA.
         let role = Role::from_code(self.role.code());
         let begin = BeginRequest { role, flags: if self.keep_conn { KEEP_CONN } else { 0 } };
         let mut out = Record::begin_request(id, begin).to_bytes();
-        write_stream(&mut out, kind::PARAMS, id, &encode_pairs_within(&self.params, MAX_PARAMS));
+        let (params, ends) = encode_pairs_within(borrowed(&self.params), MAX_PARAMS);
+        write_params(&mut out, id, &params, &ends);
         if role != Role::Authorizer {
             write_stream(&mut out, kind::STDIN, id, &self.stdin[..self.stdin.len().min(MAX_STREAM)]);
         }
@@ -721,10 +774,19 @@ impl Response {
     }
 }
 
-/// Why a record cannot be taken into a request. Each error but
-/// [`StreamError::TooManyRequests`] drops the request it names if it is
-/// still coming in, and later records for that request are ignored. A
-/// request the application is answering stays open until [`Server::end`].
+/// Why a record cannot be taken into a request.
+///
+/// For a [`Server`], an error about a request whose streams were coming in
+/// drops what it held, and later records for it are ignored. The request
+/// stays open, as the specification keeps its ID active, until the
+/// application sends END_REQUEST and calls [`Server::end`]. A request
+/// refused at its BEGIN_REQUEST ([`StreamError::Body`],
+/// [`StreamError::UnknownRole`] or [`StreamError::TooManyRequests`]) is
+/// not opened.
+///
+/// For a [`Client`], an error drops the output gathered for the request,
+/// and its later STDOUT and STDERR records and its END_REQUEST are
+/// ignored. [`StreamError::TooManyRequests`] keeps nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
     /// A record's content is not what its type needs: a BEGIN_REQUEST or
@@ -759,15 +821,23 @@ pub enum StreamError {
         /// The record type.
         kind: u8,
     },
-    /// A BEGIN_REQUEST came for a request that was already open. If its
-    /// streams were still coming in, it is dropped. If the application was
-    /// answering it, it stays open and the new one is refused.
+    /// A BEGIN_REQUEST came for a request that was already open. The new
+    /// one is refused. If the first one's streams were still coming in,
+    /// they are dropped, and the first stays open until [`Server::end`].
     Duplicate {
         /// The request.
         id: u16,
     },
     /// A stream record came after the record that ended the stream.
     AfterEnd {
+        /// The request.
+        id: u16,
+        /// The record type.
+        kind: u8,
+    },
+    /// A stream record came before the streams that go ahead of it had
+    /// ended. A web server sends PARAMS, then STDIN, then DATA.
+    OutOfOrder {
         /// The request.
         id: u16,
         /// The record type.
@@ -784,7 +854,8 @@ impl StreamError {
             | StreamError::TooManyRequests { id }
             | StreamError::TooLarge { id, .. }
             | StreamError::Duplicate { id }
-            | StreamError::AfterEnd { id, .. } => id,
+            | StreamError::AfterEnd { id, .. }
+            | StreamError::OutOfOrder { id, .. } => id,
         }
     }
 }
@@ -800,6 +871,9 @@ impl std::fmt::Display for StreamError {
             StreamError::AfterEnd { id, kind } => {
                 write!(f, "request {id}: record type {kind} after its stream ended")
             }
+            StreamError::OutOfOrder { id, kind } => {
+                write!(f, "request {id}: record type {kind} before the streams ahead of it ended")
+            }
         }
     }
 }
@@ -814,8 +888,9 @@ pub enum ServerEvent {
     Request(Request),
     /// The web server aborted the open request with this ID, whether its
     /// streams had all come or not. The application answers with an
-    /// END_REQUEST record and calls [`Server::end`]. Records still coming
-    /// for the request are ignored.
+    /// END_REQUEST record and calls [`Server::end`], and
+    /// [`Server::keep_conn`] says whether to keep the connection open
+    /// afterward. Records still coming for the request are ignored.
     Abort(u16),
     /// A GET_VALUES record asked for these names. The application answers
     /// with [`Record::get_values_result`].
@@ -847,13 +922,16 @@ struct Incoming {
 /// world writes, so the world calls [`Server::end`] when it sends
 /// END_REQUEST. Until then the request counts toward [`MAX_REQUESTS`], an
 /// ABORT_REQUEST for it gives [`ServerEvent::Abort`], and a second
-/// BEGIN_REQUEST for it is refused.
+/// BEGIN_REQUEST for it is refused. This holds for a request whose streams
+/// failed with a [`StreamError`] too, so the world answers it with
+/// END_REQUEST and calls [`Server::end`] as well. The streams must come in
+/// the order the specification gives: PARAMS, then STDIN, then DATA.
 #[derive(Clone, Debug, Default)]
 pub struct Server {
     open: BTreeMap<u16, Incoming>,
-    /// Requests that are whole or aborted, which the application is
-    /// answering.
-    answering: BTreeSet<u16>,
+    /// Requests that are whole, aborted or failed, which the application
+    /// is answering, and whether each asked to keep the connection open.
+    answering: BTreeMap<u16, bool>,
 }
 
 impl Server {
@@ -874,6 +952,14 @@ impl Server {
         self.open.values().map(|r| r.params.len() + r.stdin.len() + r.data.len()).sum()
     }
 
+    /// Whether open request `id` asked to keep the connection open after
+    /// it, or `None` if it is not open. An application that answers an
+    /// abort or an error with END_REQUEST closes the connection when this
+    /// is false.
+    pub fn keep_conn(&self, id: u16) -> Option<bool> {
+        self.open.get(&id).map(|r| r.keep_conn).or_else(|| self.answering.get(&id).copied())
+    }
+
     /// Marks request `id` as ended, because the application has sent its
     /// END_REQUEST. The ID is free for a new request after this. It
     /// returns whether the request was open. An application may end a
@@ -881,8 +967,16 @@ impl Server {
     /// coming for it are then ignored.
     pub fn end(&mut self, id: u16) -> bool {
         let incoming = self.open.remove(&id).is_some();
-        let answering = self.answering.remove(&id);
+        let answering = self.answering.remove(&id).is_some();
         incoming || answering
+    }
+
+    /// Drops what request `id` held while its streams came in, and keeps
+    /// it open until [`Server::end`].
+    fn fail(&mut self, id: u16) {
+        if let Some(req) = self.open.remove(&id) {
+            self.answering.insert(id, req.keep_conn);
+        }
     }
 
     /// Takes in one record. It returns an event when the record completes
@@ -894,16 +988,20 @@ impl Server {
         let id = record.request_id;
         if record.is_management() {
             return match record.kind {
+                // The values of a GET_VALUES record are empty.
                 kind::GET_VALUES => match parse_pairs(&record.content) {
-                    Ok(pairs) => Ok(Some(ServerEvent::GetValues(pairs.into_iter().map(|(n, _)| n).collect()))),
-                    Err(_) => Err(StreamError::Body { id, kind: record.kind }),
+                    Ok(pairs) if pairs.iter().all(|(_, v)| v.is_empty()) => {
+                        Ok(Some(ServerEvent::GetValues(pairs.into_iter().map(|(n, _)| n).collect())))
+                    }
+                    _ => Err(StreamError::Body { id, kind: record.kind }),
                 },
                 k => Ok(Some(ServerEvent::UnknownType(k))),
             };
         }
         match record.kind {
             kind::BEGIN_REQUEST => {
-                if self.open.remove(&id).is_some() || self.answering.contains(&id) {
+                if self.open.contains_key(&id) || self.answering.contains_key(&id) {
+                    self.fail(id);
                     return Err(StreamError::Duplicate { id });
                 }
                 let body =
@@ -928,22 +1026,31 @@ impl Server {
                 Ok(None)
             }
             kind::ABORT_REQUEST => {
-                if self.open.remove(&id).is_some() {
-                    self.answering.insert(id);
-                }
-                Ok(self.answering.contains(&id).then_some(ServerEvent::Abort(id)))
+                self.fail(id);
+                Ok(self.answering.contains_key(&id).then_some(ServerEvent::Abort(id)))
             }
             kind::PARAMS | kind::STDIN | kind::DATA => {
                 let held = self.held();
                 let Some(req) = self.open.get_mut(&id) else { return Ok(None) };
-                let (buf, done, limit) = match record.kind {
-                    kind::PARAMS => (&mut req.params, &mut req.params_done, MAX_PARAMS),
-                    kind::STDIN if req.role != Role::Authorizer => (&mut req.stdin, &mut req.stdin_done, MAX_STREAM),
-                    kind::DATA if req.role == Role::Filter => (&mut req.data, &mut req.data_done, MAX_STREAM),
+                // The streams come one after another: PARAMS, then STDIN,
+                // then DATA. `ahead` is whether those before this one ended.
+                let (buf, done, limit, ahead) = match record.kind {
+                    kind::PARAMS => (&mut req.params, &mut req.params_done, MAX_PARAMS, true),
+                    kind::STDIN if req.role != Role::Authorizer => {
+                        (&mut req.stdin, &mut req.stdin_done, MAX_STREAM, req.params_done)
+                    }
+                    kind::DATA if req.role == Role::Filter => {
+                        (&mut req.data, &mut req.data_done, MAX_STREAM, req.params_done && req.stdin_done)
+                    }
                     _ => return Ok(None),
                 };
-                if let Err(e) = add_to_stream(buf, done, limit, held, id, record) {
-                    self.open.remove(&id);
+                let added = if ahead {
+                    add_to_stream(buf, done, limit, held, id, record)
+                } else {
+                    Err(StreamError::OutOfOrder { id, kind: record.kind })
+                };
+                if let Err(e) = added {
+                    self.fail(id);
                     return Err(e);
                 }
                 let complete = req.params_done
@@ -953,8 +1060,8 @@ impl Server {
                     return Ok(None);
                 }
                 let Some(req) = self.open.remove(&id) else { return Ok(None) };
+                self.answering.insert(id, req.keep_conn);
                 let params = parse_pairs(&req.params).map_err(|_| StreamError::Body { id, kind: kind::PARAMS })?;
-                self.answering.insert(id);
                 Ok(Some(ServerEvent::Request(Request {
                     id,
                     role: req.role,
@@ -1013,6 +1120,9 @@ struct Outgoing {
     stdout_done: bool,
     stderr: Vec<u8>,
     stderr_done: bool,
+    /// An error was reported for the response. It holds no output, and its
+    /// records are ignored until its END_REQUEST.
+    failed: bool,
 }
 
 /// Puts responses back together from the records an application sends,
@@ -1043,7 +1153,8 @@ impl Client {
     /// Takes in one record. It returns an event when the record ends a
     /// request or answers a management record, and `Ok(None)` otherwise.
     /// Records of types a web server does not read, such as STDIN, are
-    /// ignored.
+    /// ignored, and so are the records of a response after an error about
+    /// it, up to and including its END_REQUEST.
     pub fn receive(&mut self, record: &Record) -> Result<Option<ClientEvent>, StreamError> {
         let id = record.request_id;
         if record.is_management() {
@@ -1066,19 +1177,25 @@ impl Client {
                 }
                 let held = self.held();
                 let out = self.open.entry(id).or_default();
+                if out.failed {
+                    return Ok(None);
+                }
                 let (buf, done) = if record.kind == kind::STDOUT {
                     (&mut out.stdout, &mut out.stdout_done)
                 } else {
                     (&mut out.stderr, &mut out.stderr_done)
                 };
                 if let Err(e) = add_to_stream(buf, done, MAX_STREAM, held, id, record) {
-                    self.open.remove(&id);
+                    *out = Outgoing { failed: true, ..Outgoing::default() };
                     return Err(e);
                 }
                 Ok(None)
             }
             kind::END_REQUEST => {
                 let out = self.open.remove(&id).unwrap_or_default();
+                if out.failed {
+                    return Ok(None);
+                }
                 let end =
                     EndRequest::parse(&record.content).map_err(|_| StreamError::Body { id, kind: record.kind })?;
                 Ok(Some(ClientEvent::Response(Response {
@@ -1345,18 +1462,21 @@ mod tests {
         // An unknown role.
         assert_eq!(s.receive(&begin(1, Role::Other(9))), Err(StreamError::UnknownRole { id: 1, role: 9 }));
         assert_eq!(s.open(), 0);
-        // Begun twice.
+        // Begun twice: the first stays open until it is ended.
         assert_eq!(s.receive(&begin(1, Role::Responder)), Ok(None));
         assert_eq!(s.receive(&begin(1, Role::Responder)), Err(StreamError::Duplicate { id: 1 }));
-        assert_eq!(s.open(), 0);
+        assert_eq!(s.open(), 1);
+        // Records for a failed request are ignored.
+        assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, b"x")), Ok(None));
         // Records for requests that are not open are ignored.
-        assert_eq!(s.receive(&Record::new(kind::STDIN, 1, b"x")), Ok(None));
+        assert_eq!(s.receive(&Record::new(kind::STDIN, 9, b"x")), Ok(None));
         // A stream record after its end.
         s.receive(&begin(2, Role::Responder)).unwrap();
-        s.receive(&Record::new(kind::STDIN, 2, &[])).unwrap();
+        s.receive(&Record::new(kind::PARAMS, 2, &[1, 0, b'A'])).unwrap();
+        s.receive(&Record::new(kind::PARAMS, 2, &[])).unwrap();
         assert_eq!(
-            s.receive(&Record::new(kind::STDIN, 2, b"late")),
-            Err(StreamError::AfterEnd { id: 2, kind: kind::STDIN })
+            s.receive(&Record::new(kind::PARAMS, 2, b"late")),
+            Err(StreamError::AfterEnd { id: 2, kind: kind::PARAMS })
         );
         // Bad pairs in PARAMS, found once the stream ends.
         s.receive(&begin(3, Role::Authorizer)).unwrap();
@@ -1373,9 +1493,11 @@ mod tests {
             }
         }
         assert_eq!(result, Err(StreamError::TooLarge { id: 4, kind: kind::PARAMS }));
-        assert_eq!(s.open(), 0);
+        assert_eq!(s.open(), 4);
+        assert_eq!(s.held(), 0);
         // STDIN past its limit.
         s.receive(&begin(5, Role::Responder)).unwrap();
+        s.receive(&Record::new(kind::PARAMS, 5, &[])).unwrap();
         let mut result = Ok(None);
         for _ in 0..=MAX_STREAM / MAX_CONTENT {
             result = s.receive(&Record::new(kind::STDIN, 5, &chunk));
@@ -1384,6 +1506,11 @@ mod tests {
             }
         }
         assert_eq!(result, Err(StreamError::TooLarge { id: 5, kind: kind::STDIN }));
+        // Each failed request stays open until the application ends it.
+        assert_eq!(s.open(), 5);
+        for id in 1..=5 {
+            assert!(s.end(id));
+        }
         // Too many requests at once.
         for id in 1..=MAX_REQUESTS as u16 {
             assert_eq!(s.receive(&begin(id, Role::Responder)), Ok(None));
@@ -1649,6 +1776,7 @@ mod tests {
         let mut failed = None;
         'outer: for id in 1..=MAX_REQUESTS as u16 {
             s.receive(&Record::begin_request(id, BeginRequest { role: Role::Filter, flags: 0 })).unwrap();
+            s.receive(&Record::new(kind::PARAMS, id, &[])).unwrap();
             for k in [kind::STDIN, kind::DATA] {
                 for _ in 0..MAX_STREAM / MAX_CONTENT {
                     if let Err(e) = s.receive(&Record::new(k, id, &chunk)) {
@@ -1656,6 +1784,9 @@ mod tests {
                         break 'outer;
                     }
                     assert!(s.held() <= MAX_HELD);
+                }
+                if k == kind::STDIN {
+                    s.receive(&Record::new(k, id, &[])).unwrap();
                 }
             }
         }
@@ -1731,7 +1862,12 @@ mod tests {
                 again.push(r);
             }
         }
-        assert_eq!(recs, again);
+        // A feed past MAX_BUFFERED breaks the decoder fed all at once.
+        if data.len() <= MAX_BUFFERED {
+            assert_eq!(recs, again);
+        } else {
+            assert!(recs.is_empty());
+        }
         let mut server = Server::new();
         let mut client = Client::new();
         for r in &recs {
@@ -1766,9 +1902,10 @@ mod tests {
             let mut data = rng.bytes(len);
             // Mostly version 1, so records get read.
             if let Some(b) = data.first_mut()
-                && rng.below(8) != 0 {
-                    *b = 1;
-                }
+                && rng.below(8) != 0
+            {
+                *b = 1;
+            }
             check(&data);
         }
     }
@@ -1840,6 +1977,189 @@ mod tests {
                 assert!(!matches!(s.receive(&r), Ok(Some(ServerEvent::Request(_)))));
             }
         }
+    }
+
+    // A response that failed does not come back later as a successful one
+    // holding only the output sent after the failure.
+    #[test]
+    fn client_failed_response_stays_failed() {
+        let mut c = Client::new();
+        c.receive(&Record::new(kind::STDOUT, 1, b"a")).unwrap();
+        c.receive(&Record::new(kind::STDOUT, 1, &[])).unwrap();
+        assert_eq!(
+            c.receive(&Record::new(kind::STDOUT, 1, b"x")),
+            Err(StreamError::AfterEnd { id: 1, kind: kind::STDOUT })
+        );
+        assert_eq!(c.receive(&Record::new(kind::STDOUT, 1, b"b")), Ok(None));
+        assert_eq!(c.receive(&Record::new(kind::STDOUT, 1, &[])), Ok(None));
+        let end = EndRequest { app_status: 0, protocol_status: ProtocolStatus::RequestComplete };
+        assert_eq!(c.receive(&Record::end_request(1, end)), Ok(None));
+        assert_eq!(c.open(), 0);
+        // The ID can be used again after END_REQUEST.
+        c.receive(&Record::new(kind::STDOUT, 1, b"c")).unwrap();
+        let Ok(Some(ClientEvent::Response(r))) = c.receive(&Record::end_request(1, end)) else { panic!() };
+        assert_eq!(r.stdout, b"c");
+    }
+
+    // PARAMS records written for a request each hold whole pairs when the
+    // pairs fit, since PHP-FPM reads the pairs of each record on its own.
+    #[test]
+    fn params_records_hold_whole_pairs() {
+        let req = Request {
+            id: 1,
+            role: Role::Responder,
+            keep_conn: false,
+            params: (0..66).map(|i| (format!("P{i:02}").into_bytes(), vec![b'x'; 1000])).collect(),
+            stdin: Vec::new(),
+            data: Vec::new(),
+        };
+        let rs = records(&req.to_bytes());
+        let params: Vec<_> = rs.iter().filter(|r| r.kind == kind::PARAMS && !r.content.is_empty()).collect();
+        assert_eq!(params.len(), 2);
+        let mut n = 0;
+        for r in params {
+            assert!(r.content.len() <= MAX_CONTENT);
+            n += parse_pairs(&r.content).unwrap().len();
+        }
+        assert_eq!(n, 66);
+        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&req.to_bytes()).pop() else { panic!() };
+        assert_eq!(got, req);
+        // A pair too long for one record still spans records and comes back.
+        let big = Request { params: vec![pair("A", "1"), (b"B".to_vec(), vec![7; 100_000]), pair("C", "3")], ..req };
+        let Some(Ok(Some(ServerEvent::Request(got)))) = serve(&big.to_bytes()).pop() else { panic!() };
+        assert_eq!(got, big);
+    }
+
+    // stream_bytes cuts a stream to the limit a reader takes.
+    #[test]
+    fn stream_bytes_keeps_to_the_limit() {
+        let mut c = Client::new();
+        for r in records(&stream_bytes(kind::STDOUT, 1, &vec![1; MAX_STREAM + 1])) {
+            assert_eq!(c.receive(&r), Ok(None));
+        }
+        let end = EndRequest { app_status: 0, protocol_status: ProtocolStatus::RequestComplete };
+        let Ok(Some(ClientEvent::Response(r))) = c.receive(&Record::end_request(1, end)) else { panic!() };
+        assert_eq!(r.stdout.len(), MAX_STREAM);
+        let mut s = Server::new();
+        s.receive(&Record::begin_request(1, BeginRequest { role: Role::Authorizer, flags: 0 })).unwrap();
+        let mut last = Ok(None);
+        for r in records(&stream_bytes(kind::PARAMS, 1, &vec![0; MAX_PARAMS + 2])) {
+            last = s.receive(&r);
+        }
+        // The stream is cut to MAX_PARAMS, so it is not too large. Its
+        // 2-byte empty pairs are more than MAX_PAIRS.
+        assert_eq!(last, Err(StreamError::Body { id: 1, kind: kind::PARAMS }));
+    }
+
+    // A role or status given by number is the same value as the named one.
+    #[test]
+    fn numbered_roles_and_statuses_equal_named_ones() {
+        let b = BeginRequest { role: Role::Other(1), flags: 0 };
+        assert_eq!(BeginRequest::parse(&b.to_bytes()), Ok(b));
+        assert_eq!(Role::Other(3), Role::Filter);
+        assert_ne!(Role::Other(4), Role::Filter);
+        let e = EndRequest { app_status: 0, protocol_status: ProtocolStatus::Other(0) };
+        assert_eq!(EndRequest::parse(&e.to_bytes()), Ok(e));
+        assert_eq!(ProtocolStatus::Other(2), ProtocolStatus::Overloaded);
+    }
+
+    // PARAMS, then STDIN, then DATA, as the specification orders them.
+    #[test]
+    fn streams_come_in_order() {
+        let mut s = Server::new();
+        s.receive(&Record::begin_request(1, BeginRequest { role: Role::Responder, flags: 0 })).unwrap();
+        assert_eq!(
+            s.receive(&Record::new(kind::STDIN, 1, b"x")),
+            Err(StreamError::OutOfOrder { id: 1, kind: kind::STDIN })
+        );
+        assert_eq!(s.receive(&Record::new(kind::PARAMS, 1, &[])), Ok(None));
+        assert_eq!(s.receive(&Record::new(kind::STDIN, 1, &[])), Ok(None));
+        assert!(s.end(1));
+        s.receive(&Record::begin_request(2, BeginRequest { role: Role::Filter, flags: 0 })).unwrap();
+        s.receive(&Record::new(kind::PARAMS, 2, &[])).unwrap();
+        assert_eq!(
+            s.receive(&Record::new(kind::DATA, 2, &[])),
+            Err(StreamError::OutOfOrder { id: 2, kind: kind::DATA })
+        );
+        assert!(!StreamError::OutOfOrder { id: 2, kind: 8 }.to_string().is_empty());
+        assert_eq!(StreamError::OutOfOrder { id: 2, kind: 8 }.id(), 2);
+    }
+
+    // The world can learn whether to keep the connection open for a
+    // request it is answering, aborted ones included.
+    #[test]
+    fn keep_conn_survives_abort() {
+        let mut s = Server::new();
+        for (id, flags) in [(1, 0), (2, KEEP_CONN)] {
+            s.receive(&Record::begin_request(id, BeginRequest { role: Role::Responder, flags })).unwrap();
+            assert_eq!(s.receive(&Record::abort_request(id)), Ok(Some(ServerEvent::Abort(id))));
+        }
+        assert_eq!(s.keep_conn(1), Some(false));
+        assert_eq!(s.keep_conn(2), Some(true));
+        assert_eq!(s.keep_conn(3), None);
+        assert!(s.end(2));
+        assert_eq!(s.keep_conn(2), None);
+    }
+
+    // A request whose streams failed stays active until END_REQUEST.
+    #[test]
+    fn failed_request_stays_active_until_ended() {
+        let begin = Record::begin_request(1, BeginRequest { role: Role::Responder, flags: 0 });
+        let mut s = Server::new();
+        s.receive(&begin).unwrap();
+        s.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
+        s.receive(&Record::new(kind::STDIN, 1, b"a")).unwrap();
+        // A second BEGIN_REQUEST does not drop the first.
+        assert_eq!(s.receive(&begin), Err(StreamError::Duplicate { id: 1 }));
+        assert_eq!(s.open(), 1);
+        assert_eq!(s.receive(&begin), Err(StreamError::Duplicate { id: 1 }));
+        assert!(s.end(1));
+        assert_eq!(s.receive(&begin), Ok(None));
+        s.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
+        s.receive(&Record::new(kind::STDIN, 1, &[])).ok();
+        assert!(s.end(1));
+        s.receive(&begin).unwrap();
+        s.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
+        s.receive(&Record::new(kind::STDIN, 1, b"a")).unwrap();
+        // Bad PARAMS found at the end of the stream.
+        let mut s2 = Server::new();
+        s2.receive(&Record::begin_request(5, BeginRequest { role: Role::Authorizer, flags: 0 })).unwrap();
+        s2.receive(&Record::new(kind::PARAMS, 5, &[9])).unwrap();
+        assert!(s2.receive(&Record::new(kind::PARAMS, 5, &[])).is_err());
+        assert_eq!(
+            s2.receive(&Record::begin_request(5, BeginRequest { role: Role::Authorizer, flags: 0 })),
+            Err(StreamError::Duplicate { id: 5 })
+        );
+        // A stream record after its end.
+        let mut s3 = Server::new();
+        s3.receive(&begin).unwrap();
+        s3.receive(&Record::new(kind::PARAMS, 1, &[1, 0, b'A'])).unwrap();
+        s3.receive(&Record::new(kind::PARAMS, 1, &[])).unwrap();
+        assert!(s3.receive(&Record::new(kind::PARAMS, 1, b"x")).is_err());
+        assert_eq!(s3.receive(&begin), Err(StreamError::Duplicate { id: 1 }));
+        assert_eq!(s3.open(), 1);
+        assert_eq!(s3.held(), 0);
+    }
+
+    // GET_VALUES carries names with empty values.
+    #[test]
+    fn get_values_values_are_empty() {
+        let mut s = Server::new();
+        let bad = Record::new(kind::GET_VALUES, 0, &[1, 1, b'A', b'B']);
+        assert_eq!(s.receive(&bad), Err(StreamError::Body { id: 0, kind: kind::GET_VALUES }));
+        // Names too long for one record are left out.
+        let long = vec![b'n'; MAX_CONTENT];
+        let r = Record::get_values(&[b"A", &long, b"B"]);
+        assert_eq!(s.receive(&r), Ok(Some(ServerEvent::GetValues(vec![b"A".to_vec(), b"B".to_vec()]))));
+    }
+
+    // A feed past MAX_BUFFERED breaks a decoder fed all at once, but not
+    // one fed a byte at a time. The fuzz check allows for that.
+    #[test]
+    fn fuzz_check_allows_an_oversized_feed() {
+        let mut data = Record::abort_request(1).to_bytes();
+        data.resize(MAX_BUFFERED + 1, 0);
+        check(&data);
     }
 
     fn records_prefix(bytes: &[u8]) -> Vec<Record> {

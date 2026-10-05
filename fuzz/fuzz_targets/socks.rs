@@ -3,8 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::socks::{
-    AuthReply, AuthRequest, ClientDecoder, ClientMessage, Command, Error, Greeting, MAX_BUFFERED, MAX_DATAGRAM, Method,
-    Reply, Request, Selection, ServerDecoder, ServerMessage, Socks4Command, Socks4Reply, Socks4Request, UdpHeader,
+    Address, AuthReply, AuthRequest, ClientDecoder, ClientMessage, Command, Error, Greeting, MAX_BUFFERED,
+    MAX_DATAGRAM, MAX_METHODS, Method, Reply, Request, Selection, ServerDecoder, ServerMessage, Socks4Command,
+    Socks4Destination, Socks4Reply, Socks4Request, UdpHeader,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -17,9 +18,14 @@ fn drain_server(d: &mut ServerDecoder, out: &mut Vec<Result<ClientMessage, Error
     while let Some(m) = d.next_message() {
         let stop = m.is_err();
         if let Ok(ClientMessage::Greeting(g)) = &m {
-            let method =
-                if g.methods.contains(&Method::UsernamePassword) { Method::UsernamePassword } else { Method::NoAuth };
-            d.select(method);
+            let method = if g.methods.contains(&Method::UsernamePassword) {
+                Method::UsernamePassword
+            } else if g.methods.contains(&Method::NoAuth) {
+                Method::NoAuth
+            } else {
+                Method::NoAcceptable
+            };
+            assert!(d.select(method));
         }
         if let Ok(ClientMessage::Auth(a)) = &m {
             d.verified(a.username != b"bad");
@@ -114,6 +120,53 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(Some((m, n))) = Socks4Reply::parse(data) {
         assert_eq!(m.to_bytes(), data[..n]);
     }
+    // Values built from the bytes, including ones no reader returns
+    // (oversized fields, zero bytes in SOCKS4 fields, `Other` holding a
+    // named code): every writer's output reads back whole.
+    let first = data.first().copied().unwrap_or(0);
+    let half = data.len() / 2;
+    let (left, right) = data.split_at(half);
+    let methods: Vec<Method> = data.iter().map(|&c| Method::Other(c)).collect();
+    let bytes = Greeting { methods }.to_bytes();
+    assert_eq!(Greeting::parse(&bytes).map(|m| m.map(|(_, n)| n)), Ok(Some(bytes.len())));
+    let bytes = AuthRequest { username: left.to_vec(), password: right.to_vec() }.to_bytes();
+    assert_eq!(AuthRequest::parse(&bytes).map(|m| m.map(|(_, n)| n)), Ok(Some(bytes.len())));
+    let bytes = Request { command: Command::Connect, address: Address::Domain(left.to_vec()), port: 1 }.to_bytes();
+    assert_eq!(Request::parse(&bytes).map(|m| m.map(|(_, n)| n)), Ok(Some(bytes.len())));
+    let ip = std::net::Ipv4Addr::new(0, 0, 0, first);
+    for destination in [Socks4Destination::Ip(ip), Socks4Destination::Domain(right.to_vec())] {
+        let req = Socks4Request { command: Socks4Command::Connect, port: 1, destination, user_id: left.to_vec() };
+        let bytes = req.to_bytes();
+        assert_eq!(Socks4Request::parse(&bytes).map(|m| m.map(|(_, n)| n)), Ok(Some(bytes.len())));
+    }
+    let header = UdpHeader { fragment: first, address: Address::Domain(right.to_vec()), port: 1 };
+    let bytes = header.datagram(data);
+    assert!(bytes.len() <= MAX_DATAGRAM);
+    assert!(UdpHeader::parse(&bytes).is_ok());
+
+    // A selection a client did not offer fails a decoder that knows the
+    // offer, and a proxy's decoder acts on the code a selection writes.
+    let offered: Vec<Method> = right.iter().map(|&c| Method::from_code(c)).collect();
+    let chosen = Method::Other(first);
+    let mut client = ClientDecoder::socks5_offering(Command::Connect, &offered);
+    client.feed(&Selection { method: chosen }.to_bytes());
+    // A greeting carries only the first MAX_METHODS, so only those count.
+    let allowed = first == 0xff || right[..right.len().min(MAX_METHODS)].contains(&first);
+    match client.next_message() {
+        Some(Ok(ServerMessage::Selection(s))) => assert!(allowed && s.method.code() == first),
+        Some(Err(Error::Method(c))) => assert!(!allowed && c == first),
+        other => panic!("{other:?}"),
+    }
+    let mut server = ServerDecoder::new();
+    server.feed(&Greeting { methods: offered }.to_bytes());
+    assert!(matches!(server.next_message(), Some(Ok(ClientMessage::Greeting(_)))));
+    assert_eq!(server.select(chosen), allowed);
+    let mut named = ServerDecoder::new();
+    named.feed(&Greeting { methods: right.iter().map(|&c| Method::from_code(c)).collect() }.to_bytes());
+    named.next_message();
+    named.select(Method::from_code(first));
+    assert_eq!(server.stage(), named.stage());
+
     // The bytes as a UDP datagram.
     if let Ok((header, payload)) = UdpHeader::parse(data) {
         if data.len() <= MAX_DATAGRAM {

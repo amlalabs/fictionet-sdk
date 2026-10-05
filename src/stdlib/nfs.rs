@@ -21,8 +21,16 @@
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. File handles, names, paths, data and lists all have limits,
-//! given below as constants. The writers clip what they write to those
-//! limits, so the readers take back everything the writers write.
+//! given below as constants. The writers keep to those limits, so the
+//! readers take back everything the writers write. A writer never cuts a
+//! handle, name or path short, since the shorter one could name a
+//! different file: one past its limit is written empty, which names
+//! nothing, or, in a list, left out. Data past its limit is cut, and the
+//! count and end-of-file flag written with it say so.
+//!
+//! File names and paths are bytes, not text: RFC 1813 sets no character
+//! set for them, and servers such as Linux's take any bytes but NUL and
+//! `/` in a name. Host and group names in MOUNT results are text.
 //!
 //! ```
 //! use fictionet::stdlib::nfs::{procedure, DirOp, FileHandle, LookupOk, NfsError, Request, Response};
@@ -31,7 +39,7 @@
 //! /// A server whose root directory, handle [1], holds one file: notes.txt.
 //! fn answer(request: &Request) -> Response {
 //!     match request {
-//!         Request::Lookup(op) if op.dir.0 == [1] && op.name == "notes.txt" => Response::Lookup(Ok(LookupOk {
+//!         Request::Lookup(op) if op.dir.0 == [1] && op.name == b"notes.txt" => Response::Lookup(Ok(LookupOk {
 //!             object: FileHandle(vec![2]),
 //!             object_attributes: None,
 //!             dir_attributes: None,
@@ -91,16 +99,24 @@ pub const MAX_SYMLINK: usize = 4096;
 pub const MAX_MOUNT_NAME: usize = 255;
 /// The most bytes one READ result or WRITE call carries.
 pub const MAX_DATA: usize = 1 << 20;
-/// The most entries one READDIR or READDIRPLUS result holds.
-pub const MAX_DIR_ENTRIES: usize = 1024;
+/// The most entries one READDIR or READDIRPLUS result holds. The byte
+/// limit, [`MAX_DIR_BYTES`], is reached first unless names are short.
+pub const MAX_DIR_ENTRIES: usize = 1 << 16;
+/// The most bytes the entries of one READDIR or READDIRPLUS result take,
+/// each with the word before it that says an entry follows. A client asks
+/// for at most a count of bytes in all, and Linux servers answer at most
+/// 1 MiB. A writer stops before this and writes `eof` as false; a reader
+/// refuses a longer list.
+pub const MAX_DIR_BYTES: usize = 1 << 20;
 /// The most authentication flavors one MNT result lists.
 pub const MAX_AUTH_FLAVORS: usize = 16;
 /// The most exports one EXPORT result lists.
 pub const MAX_EXPORTS: usize = 1024;
-/// The most bytes a writer puts in one EXPORT result. Exports that would
-/// go past it are left out, so the reply fits in one record of
-/// [`MAX_RECORD`](super::onc_rpc::MAX_RECORD) bytes. Without it, the
-/// longest paths and group lists would make results of about 70 MB.
+/// The most bytes in one EXPORT result. A writer leaves out the exports
+/// that would go past it, so the reply fits in one record of
+/// [`MAX_RECORD`](super::onc_rpc::MAX_RECORD) bytes, and a reader refuses
+/// a longer result. Without it, the longest paths and group lists would
+/// make results of about 70 MB.
 pub const MAX_EXPORT_BYTES: usize = 1 << 20;
 /// The most groups one export lists.
 pub const MAX_GROUPS: usize = 256;
@@ -354,8 +370,9 @@ impl std::fmt::Display for NfsError {
 impl std::error::Error for NfsError {}
 
 /// A file handle: bytes the server chose to name a file. The client never
-/// looks inside. At most [`MAX_FH`] bytes. A writer leaves out any bytes
-/// past that.
+/// looks inside. At most [`MAX_FH`] bytes. A writer writes a longer one
+/// as an empty handle, which names no file, rather than cut it to the
+/// handle of another.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileHandle(pub Vec<u8>);
 
@@ -365,9 +382,16 @@ impl FileHandle {
         Ok(FileHandle(r.opaque(MAX_FH)?.to_vec()))
     }
 
-    /// Writes the handle, clipped to [`MAX_FH`] bytes.
+    /// Writes the handle, or an empty one if it is longer than
+    /// [`MAX_FH`] bytes.
     pub fn write(&self, w: &mut Writer) {
-        w.opaque(&self.0[..self.0.len().min(MAX_FH)]);
+        w.opaque(fit(&self.0, MAX_FH));
+    }
+
+    /// Whether it is at most [`MAX_FH`] bytes, so a writer writes it as it
+    /// is.
+    pub fn fits(&self) -> bool {
+        self.0.len() <= MAX_FH
     }
 }
 
@@ -692,9 +716,9 @@ impl Sattr {
 pub struct DirOp {
     /// The directory's handle.
     pub dir: FileHandle,
-    /// The name, at most [`MAX_NAME`] bytes. Names are read as UTF-8, so a
-    /// call with a name that is not is refused as garbage.
-    pub name: String,
+    /// The name, at most [`MAX_NAME`] bytes, in whatever character set
+    /// the client uses.
+    pub name: Vec<u8>,
 }
 
 impl DirOp {
@@ -703,10 +727,11 @@ impl DirOp {
         Ok(DirOp { dir: FileHandle::read(r)?, name: read_name(r)? })
     }
 
-    /// Writes the diropargs3, with the name clipped to [`MAX_NAME`] bytes.
+    /// Writes the diropargs3. A name longer than [`MAX_NAME`] bytes is
+    /// written empty.
     pub fn write(&self, w: &mut Writer) {
         self.dir.write(w);
-        w.string(clip(&self.name, MAX_NAME));
+        w.opaque(fit(&self.name, MAX_NAME));
     }
 }
 
@@ -900,11 +925,15 @@ pub enum Request {
         file: FileHandle,
         /// Where to start.
         offset: u64,
-        /// How many bytes to write. It should equal the data's length.
+        /// How many bytes to write. A reader refuses a call where it is
+        /// not the data's length, as Linux servers do, and a writer
+        /// writes the length of the data it writes in its place.
         count: u32,
         /// How the server must store it before it answers.
         stable: StableHow,
-        /// The data, at most [`MAX_DATA`] bytes.
+        /// The data, at most [`MAX_DATA`] bytes. A writer writes only the
+        /// first [`MAX_DATA`], a shorter write that the server's count
+        /// of bytes written then reports.
         data: Vec<u8>,
     },
     /// Procedure 8: make a regular file.
@@ -927,8 +956,9 @@ pub enum Request {
         location: DirOp,
         /// The attributes to set.
         attributes: Sattr,
-        /// The link's target, at most [`MAX_SYMLINK`] bytes.
-        target: String,
+        /// The link's target, at most [`MAX_SYMLINK`] bytes. A longer
+        /// one is written empty.
+        target: Vec<u8>,
     },
     /// Procedure 11: make a device, socket or named pipe.
     Mknod {
@@ -1032,13 +1062,13 @@ impl Request {
             procedure::ACCESS => Request::Access { object: FileHandle::read(r)?, access: r.uint()? },
             procedure::READLINK => Request::ReadLink(FileHandle::read(r)?),
             procedure::READ => Request::Read { file: FileHandle::read(r)?, offset: r.uhyper()?, count: r.uint()? },
-            procedure::WRITE => Request::Write {
-                file: FileHandle::read(r)?,
-                offset: r.uhyper()?,
-                count: r.uint()?,
-                stable: StableHow::read(r)?,
-                data: r.opaque(MAX_DATA)?.to_vec(),
-            },
+            procedure::WRITE => {
+                let file = FileHandle::read(r)?;
+                let offset = r.uhyper()?;
+                let count = r.uint()?;
+                let stable = StableHow::read(r)?;
+                Request::Write { file, offset, count, stable, data: read_data(r, count)? }
+            }
             procedure::CREATE => Request::Create { location: DirOp::read(r)?, how: CreateHow::read(r)? },
             procedure::MKDIR => Request::Mkdir { location: DirOp::read(r)?, attributes: Sattr::read(r)? },
             procedure::SYMLINK => {
@@ -1100,8 +1130,9 @@ impl Request {
         }
     }
 
-    /// The call's arguments. Handles, names, paths and data past their
-    /// limits are clipped, so [`Request::read`] always reads them back.
+    /// The call's arguments, which [`Request::read`] always reads back.
+    /// Handles, names and paths past their limits are written empty, and
+    /// WRITE data past [`MAX_DATA`] is cut, with the count it carries.
     pub fn to_args(&self) -> Vec<u8> {
         let w = &mut Writer::new();
         match self {
@@ -1125,11 +1156,12 @@ impl Request {
                 file.write(w);
                 w.uhyper(*offset).uint(*count);
             }
-            Request::Write { file, offset, count, stable, data } => {
+            Request::Write { file, offset, count: _, stable, data } => {
+                let data = &data[..data.len().min(MAX_DATA)];
                 file.write(w);
-                w.uhyper(*offset).uint(*count);
+                w.uhyper(*offset).uint(data.len() as u32);
                 stable.write(w);
-                w.opaque(&data[..data.len().min(MAX_DATA)]);
+                w.opaque(data);
             }
             Request::Create { location, how } => {
                 location.write(w);
@@ -1142,7 +1174,7 @@ impl Request {
             Request::Symlink { location, attributes, target } => {
                 location.write(w);
                 attributes.write(w);
-                w.string(clip(target, MAX_SYMLINK));
+                w.opaque(fit(target, MAX_SYMLINK));
             }
             Request::Mknod { location, what } => {
                 location.write(w);
@@ -1205,8 +1237,9 @@ pub struct AccessOk {
 pub struct ReadLinkOk {
     /// The link's attributes.
     pub attributes: Option<Fattr>,
-    /// The link's target, at most [`MAX_SYMLINK`] bytes.
-    pub target: String,
+    /// The link's target, at most [`MAX_SYMLINK`] bytes. A longer one is
+    /// written empty.
+    pub target: Vec<u8>,
 }
 
 /// The results of a successful READ.
@@ -1214,11 +1247,15 @@ pub struct ReadLinkOk {
 pub struct ReadOk {
     /// The file's attributes.
     pub attributes: Option<Fattr>,
-    /// How many bytes were read. It should equal the data's length.
+    /// How many bytes were read. A reader refuses results where it is not
+    /// the data's length, as Linux clients do, and a writer writes the
+    /// length of the data it writes in its place.
     pub count: u32,
-    /// Whether the read reached the end of the file.
+    /// Whether the read reached the end of the file. A writer that cuts
+    /// the data writes it as false.
     pub eof: bool,
-    /// The data, at most [`MAX_DATA`] bytes.
+    /// The data, at most [`MAX_DATA`] bytes. A writer writes only the
+    /// first [`MAX_DATA`], a short read the client goes on from.
     pub data: Vec<u8>,
 }
 
@@ -1239,7 +1276,8 @@ pub struct WriteOk {
 /// The results of a successful CREATE, MKDIR, SYMLINK or MKNOD.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreateOk {
-    /// The new object's handle, if the server gives it.
+    /// The new object's handle, if the server gives it. A writer leaves
+    /// out one longer than [`MAX_FH`].
     pub object: Option<FileHandle>,
     /// The new object's attributes.
     pub attributes: Option<Fattr>,
@@ -1270,8 +1308,9 @@ pub struct LinkWcc {
 pub struct Entry {
     /// The file's number within the file system.
     pub fileid: u64,
-    /// The name, at most [`MAX_NAME`] bytes.
-    pub name: String,
+    /// The name, at most [`MAX_NAME`] bytes. A writer leaves out an entry
+    /// with a longer one.
+    pub name: Vec<u8>,
     /// Where a later READDIR goes on from after this entry.
     pub cookie: u64,
 }
@@ -1283,9 +1322,9 @@ pub struct ReadDirOk {
     pub attributes: Option<Fattr>,
     /// The verifier to send with the next READDIR.
     pub cookieverf: [u8; VERIFIER_LEN],
-    /// The names, at most [`MAX_DIR_ENTRIES`]. A writer leaves out the
-    /// rest and writes `eof` as false, so the client asks again from the
-    /// last cookie written.
+    /// The names, at most [`MAX_DIR_ENTRIES`] and [`MAX_DIR_BYTES`]. A
+    /// writer leaves out the rest and writes `eof` as false, so the client
+    /// asks again from the last cookie written.
     pub entries: Vec<Entry>,
     /// Whether the list reaches the end of the directory.
     pub eof: bool,
@@ -1297,13 +1336,15 @@ pub struct ReadDirOk {
 pub struct EntryPlus {
     /// The file's number within the file system.
     pub fileid: u64,
-    /// The name, at most [`MAX_NAME`] bytes.
-    pub name: String,
+    /// The name, at most [`MAX_NAME`] bytes. A writer leaves out an entry
+    /// with a longer one.
+    pub name: Vec<u8>,
     /// Where a later READDIRPLUS goes on from after this entry.
     pub cookie: u64,
     /// The file's attributes.
     pub attributes: Option<Fattr>,
-    /// The file's handle.
+    /// The file's handle. A writer leaves out one longer than
+    /// [`MAX_FH`].
     pub handle: Option<FileHandle>,
 }
 
@@ -1314,8 +1355,9 @@ pub struct ReadDirPlusOk {
     pub attributes: Option<Fattr>,
     /// The verifier to send with the next READDIRPLUS.
     pub cookieverf: [u8; VERIFIER_LEN],
-    /// The entries, at most [`MAX_DIR_ENTRIES`]. A writer leaves out the
-    /// rest and writes `eof` as false, as for [`ReadDirOk`].
+    /// The entries, at most [`MAX_DIR_ENTRIES`] and [`MAX_DIR_BYTES`]. A
+    /// writer leaves out the rest and writes `eof` as false, as for
+    /// [`ReadDirOk`].
     pub entries: Vec<EntryPlus>,
     /// Whether the list reaches the end of the directory.
     pub eof: bool,
@@ -1519,12 +1561,10 @@ impl Response {
             procedure::READ => Response::Read(read_outcome(
                 r,
                 |r| {
-                    Ok(ReadOk {
-                        attributes: read_post_op(r)?,
-                        count: r.uint()?,
-                        eof: r.bool()?,
-                        data: r.opaque(MAX_DATA)?.to_vec(),
-                    })
+                    let attributes = read_post_op(r)?;
+                    let count = r.uint()?;
+                    let eof = r.bool()?;
+                    Ok(ReadOk { attributes, count, eof, data: read_data(r, count)? })
                 },
                 read_post_op,
             )?),
@@ -1554,7 +1594,7 @@ impl Response {
                     Ok(ReadDirOk {
                         attributes: read_post_op(r)?,
                         cookieverf: read_verifier(r)?,
-                        entries: read_list(r, MAX_DIR_ENTRIES, |r| {
+                        entries: read_list(r, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
                             Ok(Entry { fileid: r.uhyper()?, name: read_name(r)?, cookie: r.uhyper()? })
                         })?,
                         eof: r.bool()?,
@@ -1568,7 +1608,7 @@ impl Response {
                     Ok(ReadDirPlusOk {
                         attributes: read_post_op(r)?,
                         cookieverf: read_verifier(r)?,
-                        entries: read_list(r, MAX_DIR_ENTRIES, |r| {
+                        entries: read_list(r, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |r| {
                             Ok(EntryPlus {
                                 fileid: r.uhyper()?,
                                 name: read_name(r)?,
@@ -1671,9 +1711,11 @@ impl Response {
         }
     }
 
-    /// The results in XDR. Handles, names, paths, data and entries past
-    /// their limits are clipped, so [`Response::parse`] always reads them
-    /// back.
+    /// The results in XDR, which [`Response::parse`] always reads back.
+    /// Handles, names and paths past their limits are written empty, or
+    /// left out where they are optional or in a list. READ data and
+    /// directory lists past their limits are cut, with a count and `eof`
+    /// that say so.
     pub fn to_results(&self) -> Vec<u8> {
         let w = &mut Writer::new();
         match self {
@@ -1714,7 +1756,7 @@ impl Response {
                 res,
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
-                    w.string(clip(&ok.target, MAX_SYMLINK));
+                    w.opaque(fit(&ok.target, MAX_SYMLINK));
                 },
                 write_post_op,
             ),
@@ -1723,7 +1765,8 @@ impl Response {
                 res,
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
-                    w.uint(ok.count).bool(ok.eof).opaque(&ok.data[..ok.data.len().min(MAX_DATA)]);
+                    let data = &ok.data[..ok.data.len().min(MAX_DATA)];
+                    w.uint(data.len() as u32).bool(ok.eof && data.len() == ok.data.len()).opaque(data);
                 },
                 write_post_op,
             ),
@@ -1743,7 +1786,7 @@ impl Response {
                     w,
                     res,
                     |w, ok| {
-                        w.optional(ok.object.as_ref(), |w, fh| fh.write(w));
+                        w.optional(ok.object.as_ref().filter(|fh| fh.fits()), |w, fh| fh.write(w));
                         write_post_op(w, &ok.attributes);
                         ok.dir_wcc.write(w);
                     },
@@ -1770,10 +1813,11 @@ impl Response {
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
                     w.opaque_fixed(&ok.cookieverf);
-                    write_list(w, &ok.entries, MAX_DIR_ENTRIES, |w, e| {
-                        w.uhyper(e.fileid).string(clip(&e.name, MAX_NAME)).uhyper(e.cookie);
+                    let named = ok.entries.iter().filter(|e| e.name.len() <= MAX_NAME);
+                    let all = write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
+                        w.uhyper(e.fileid).opaque(&e.name).uhyper(e.cookie);
                     });
-                    w.bool(ok.eof && ok.entries.len() <= MAX_DIR_ENTRIES);
+                    w.bool(ok.eof && all);
                 },
                 write_post_op,
             ),
@@ -1783,12 +1827,13 @@ impl Response {
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
                     w.opaque_fixed(&ok.cookieverf);
-                    write_list(w, &ok.entries, MAX_DIR_ENTRIES, |w, e| {
-                        w.uhyper(e.fileid).string(clip(&e.name, MAX_NAME)).uhyper(e.cookie);
+                    let named = ok.entries.iter().filter(|e| e.name.len() <= MAX_NAME);
+                    let all = write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
+                        w.uhyper(e.fileid).opaque(&e.name).uhyper(e.cookie);
                         write_post_op(w, &e.attributes);
-                        w.optional(e.handle.as_ref(), |w, fh| fh.write(w));
+                        w.optional(e.handle.as_ref().filter(|fh| fh.fits()), |w, fh| fh.write(w));
                     });
-                    w.bool(ok.eof && ok.entries.len() <= MAX_DIR_ENTRIES);
+                    w.bool(ok.eof && all);
                 },
                 write_post_op,
             ),
@@ -1931,12 +1976,13 @@ pub enum MountRequest {
     /// Procedure 0: do nothing.
     Null,
     /// Procedure 1: get the handle of an exported directory, by its path
-    /// on the server, at most [`MAX_PATH`] bytes.
-    Mnt(String),
+    /// on the server, at most [`MAX_PATH`] bytes. A longer one is written
+    /// empty.
+    Mnt(Vec<u8>),
     /// Procedure 2: list which hosts have mounted what.
     Dump,
     /// Procedure 3: say the caller no longer uses this path.
-    Umnt(String),
+    Umnt(Vec<u8>),
     /// Procedure 4: say the caller no longer uses any path.
     UmntAll,
     /// Procedure 5: list the exported directories.
@@ -1988,11 +2034,12 @@ impl MountRequest {
         }
     }
 
-    /// The call's arguments, with a path clipped to [`MAX_PATH`] bytes.
+    /// The call's arguments, with a path longer than [`MAX_PATH`] bytes
+    /// written empty.
     pub fn to_args(&self) -> Vec<u8> {
         let mut w = Writer::new();
         if let MountRequest::Mnt(path) | MountRequest::Umnt(path) = self {
-            w.string(clip(path, MAX_PATH));
+            w.opaque(fit(path, MAX_PATH));
         }
         w.finish()
     }
@@ -2019,20 +2066,24 @@ pub struct Mounted {
 /// One mount in a DUMP result (mountbody).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MountEntry {
-    /// The client's host name, at most [`MAX_MOUNT_NAME`] bytes.
+    /// The client's host name, at most [`MAX_MOUNT_NAME`] bytes. A writer
+    /// leaves out an entry with a longer one.
     pub hostname: String,
-    /// The path it mounted, at most [`MAX_PATH`] bytes.
-    pub directory: String,
+    /// The path it mounted, at most [`MAX_PATH`] bytes. A writer leaves
+    /// out an entry with a longer one.
+    pub directory: Vec<u8>,
 }
 
 /// One exported directory in an EXPORT result (exportnode).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ExportEntry {
-    /// The path, at most [`MAX_PATH`] bytes.
-    pub directory: String,
+    /// The path, at most [`MAX_PATH`] bytes. A writer leaves out an export
+    /// with a longer one.
+    pub directory: Vec<u8>,
     /// The hosts or groups that may mount it, each at most
     /// [`MAX_MOUNT_NAME`] bytes, and at most [`MAX_GROUPS`] of them. An
-    /// empty list means any host may.
+    /// empty list means any host may, so a writer writes a longer name
+    /// empty rather than leave it out.
     pub groups: Vec<String>,
 }
 
@@ -2067,13 +2118,16 @@ impl MountResponse {
                 }
                 Some(e) => Err(e),
             }),
-            mount_procedure::DUMP => MountResponse::Dump(read_list(r, MAX_MOUNTS, |r| {
+            mount_procedure::DUMP => MountResponse::Dump(read_list(r, MAX_MOUNTS, usize::MAX, |r| {
                 Ok(MountEntry { hostname: read_mount_name(r)?, directory: read_path(r)? })
             })?),
             mount_procedure::UMNT => MountResponse::Umnt,
             mount_procedure::UMNTALL => MountResponse::UmntAll,
-            mount_procedure::EXPORT => MountResponse::Export(read_list(r, MAX_EXPORTS, |r| {
-                Ok(ExportEntry { directory: read_path(r)?, groups: read_list(r, MAX_GROUPS, read_mount_name)? })
+            mount_procedure::EXPORT => MountResponse::Export(read_list(r, MAX_EXPORTS, EXPORT_LIST_BYTES, |r| {
+                Ok(ExportEntry {
+                    directory: read_path(r)?,
+                    groups: read_list(r, MAX_GROUPS, usize::MAX, read_mount_name)?,
+                })
             })?),
             n => return Err(XdrError::Discriminant(n)),
         };
@@ -2093,9 +2147,10 @@ impl MountResponse {
         }
     }
 
-    /// The results in XDR. Handles, names, paths and lists past their
-    /// limits are clipped, so [`MountResponse::parse`] always reads them
-    /// back.
+    /// The results in XDR, which [`MountResponse::parse`] always reads
+    /// back. A handle past its limit is written empty, entries with a
+    /// host name or path past its limit are left out, and lists stop at
+    /// their limits.
     pub fn to_results(&self) -> Vec<u8> {
         let w = &mut Writer::new();
         match self {
@@ -2111,27 +2166,23 @@ impl MountResponse {
             MountResponse::Mnt(Err(e)) => {
                 w.uint(e.code());
             }
-            MountResponse::Dump(mounts) => write_list(w, mounts, MAX_MOUNTS, |w, m| {
-                w.string(clip(&m.hostname, MAX_MOUNT_NAME)).string(clip(&m.directory, MAX_PATH));
-            }),
+            MountResponse::Dump(mounts) => {
+                let kept =
+                    mounts.iter().filter(|m| m.hostname.len() <= MAX_MOUNT_NAME && m.directory.len() <= MAX_PATH);
+                write_list(w, kept, MAX_MOUNTS, usize::MAX, |w, m| {
+                    w.string(&m.hostname).opaque(&m.directory);
+                });
+            }
             MountResponse::Export(exports) => {
                 // One export is at most about 68 KB, so the first always
-                // fits in MAX_EXPORT_BYTES.
-                for e in exports.iter().take(MAX_EXPORTS) {
-                    let mut item = Writer::new();
-                    item.bool(true).string(clip(&e.directory, MAX_PATH));
-                    write_list(&mut item, &e.groups, MAX_GROUPS, |w, g| {
-                        w.string(clip(g, MAX_MOUNT_NAME));
+                // fits in EXPORT_LIST_BYTES.
+                let kept = exports.iter().filter(|e| e.directory.len() <= MAX_PATH);
+                write_list(w, kept, MAX_EXPORTS, EXPORT_LIST_BYTES, |w, e| {
+                    w.opaque(&e.directory);
+                    write_list(w, e.groups.iter(), MAX_GROUPS, usize::MAX, |w, g| {
+                        w.string(if g.len() <= MAX_MOUNT_NAME { g } else { "" });
                     });
-                    let item = item.finish();
-                    // The item, then the 4-byte end of the list.
-                    if w.as_bytes().len().saturating_add(item.len()).saturating_add(4) > MAX_EXPORT_BYTES {
-                        break;
-                    }
-                    // XDR items are whole words, so this adds no padding.
-                    w.opaque_fixed(&item);
-                }
-                w.bool(false);
+                });
             }
         }
         std::mem::take(w).finish()
@@ -2175,30 +2226,71 @@ fn write_outcome<T, F>(
     }
 }
 
+/// The most bytes the items of an EXPORT list take: all of
+/// [`MAX_EXPORT_BYTES`] but the word that ends the list.
+const EXPORT_LIST_BYTES: usize = MAX_EXPORT_BYTES - 4;
+
 /// Reads a linked list (a chain of optional items) of at most `max`
-/// items, in a loop, not by recursion.
+/// items, in a loop, not by recursion. The items, each with the word
+/// before it, take at most `max_bytes`.
 fn read_list<'a, T>(
     r: &mut Reader<'a>,
     max: usize,
+    max_bytes: usize,
     mut item: impl FnMut(&mut Reader<'a>) -> Result<T, XdrError>,
 ) -> Result<Vec<T>, XdrError> {
+    let start = r.position();
     let mut out = Vec::new();
     while r.bool()? {
         if out.len() >= max {
             return Err(XdrError::TooLong(u32::try_from(out.len()).unwrap_or(u32::MAX).saturating_add(1)));
         }
         out.push(item(r)?);
+        let used = r.position() - start;
+        if used > max_bytes {
+            return Err(XdrError::TooLong(u32::try_from(used).unwrap_or(u32::MAX)));
+        }
     }
     Ok(out)
 }
 
-/// Writes a linked list of at most `max` items.
-fn write_list<T>(w: &mut Writer, items: &[T], max: usize, mut item: impl FnMut(&mut Writer, &T)) {
-    for i in items.iter().take(max) {
-        w.bool(true);
-        item(w, i);
+/// Writes a linked list of at most `max` items, which with the word before
+/// each take at most `max_bytes`. It stops at the first item past either
+/// limit, and says whether it wrote them all.
+fn write_list<'a, T: 'a>(
+    w: &mut Writer,
+    items: impl IntoIterator<Item = &'a T>,
+    max: usize,
+    max_bytes: usize,
+    mut item: impl FnMut(&mut Writer, &T),
+) -> bool {
+    let mut used = 0usize;
+    let mut all = true;
+    for (written, i) in items.into_iter().enumerate() {
+        let mut one = Writer::new();
+        one.bool(true);
+        item(&mut one, i);
+        let one = one.finish();
+        if written == max || used.saturating_add(one.len()) > max_bytes {
+            all = false;
+            break;
+        }
+        // XDR items are whole words, so this adds no padding.
+        w.opaque_fixed(&one);
+        used += one.len();
     }
     w.bool(false);
+    all
+}
+
+/// Reads variable-length data of at most [`MAX_DATA`] bytes, which must be
+/// `count` bytes long.
+fn read_data(r: &mut Reader<'_>, count: u32) -> Result<Vec<u8>, XdrError> {
+    let data = r.opaque(MAX_DATA)?;
+    if data.len() != count as usize {
+        return Err(XdrError::TooLong(count.max(data.len() as u32)));
+    }
+    Ok(data.to_vec())
 }
 
 fn read_create_ok(r: &mut Reader<'_>) -> Result<CreateOk, XdrError> {
@@ -2220,30 +2312,27 @@ fn read_verifier(r: &mut Reader<'_>) -> Result<[u8; VERIFIER_LEN], XdrError> {
     Ok(v)
 }
 
-fn read_name(r: &mut Reader<'_>) -> Result<String, XdrError> {
-    Ok(r.string(MAX_NAME)?.to_owned())
+fn read_name(r: &mut Reader<'_>) -> Result<Vec<u8>, XdrError> {
+    Ok(r.opaque(MAX_NAME)?.to_vec())
 }
 
-fn read_path(r: &mut Reader<'_>) -> Result<String, XdrError> {
-    Ok(r.string(MAX_PATH)?.to_owned())
+fn read_path(r: &mut Reader<'_>) -> Result<Vec<u8>, XdrError> {
+    Ok(r.opaque(MAX_PATH)?.to_vec())
 }
 
-fn read_symlink(r: &mut Reader<'_>) -> Result<String, XdrError> {
-    Ok(r.string(MAX_SYMLINK)?.to_owned())
+fn read_symlink(r: &mut Reader<'_>) -> Result<Vec<u8>, XdrError> {
+    Ok(r.opaque(MAX_SYMLINK)?.to_vec())
 }
 
 fn read_mount_name(r: &mut Reader<'_>) -> Result<String, XdrError> {
     Ok(r.string(MAX_MOUNT_NAME)?.to_owned())
 }
 
-/// The longest prefix of `s` of at most `max` bytes that ends on a
-/// character boundary.
-fn clip(s: &str, max: usize) -> &str {
-    let mut n = s.len().min(max);
-    while !s.is_char_boundary(n) {
-        n -= 1;
-    }
-    &s[..n]
+/// `b` if it is at most `max` bytes long, else nothing. A writer never
+/// cuts a handle, name or path short, since the shorter one could name a
+/// different file.
+fn fit(b: &[u8], max: usize) -> &[u8] {
+    if b.len() <= max { b } else { &[] }
 }
 
 #[cfg(test)]
@@ -2708,10 +2797,6 @@ mod tests {
         let mut w = Writer::new();
         w.opaque(&[1]).string(&long);
         assert_eq!(Request::read(procedure::LOOKUP, w.as_bytes()), Err(XdrError::TooLong(256)));
-        // A name that is not UTF-8.
-        let mut w = Writer::new();
-        w.opaque(&[1]).opaque(&[0xff]);
-        assert_eq!(Request::read(procedure::LOOKUP, w.as_bytes()), Err(XdrError::Utf8));
         // Padding that is not zero.
         assert_eq!(Request::read(procedure::GETATTR, &[0, 0, 0, 1, 1, 0, 0, 1]), Err(XdrError::Padding));
         // stable_how 3.
@@ -2765,9 +2850,9 @@ mod tests {
         // nfspath3 is string<>, with no MNTPATHLEN bound. Linux servers
         // allow PATH_MAX (4096) bytes, so a 2000-byte target must read.
         let target = "t".repeat(2000);
-        let req = Request::Symlink { location: op(&[1], "l"), attributes: Sattr::default(), target: target.clone() };
+        let req = Request::Symlink { location: op(&[1], "l"), attributes: Sattr::default(), target: target.into() };
         assert_eq!(Request::read(procedure::SYMLINK, &req.to_args()), Ok(req));
-        let resp = Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: "x".repeat(MAX_SYMLINK) }));
+        let resp = Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: vec![b'x'; MAX_SYMLINK] }));
         assert_eq!(Response::parse(procedure::READLINK, &resp.to_results()), Ok(resp));
         let mut w = Writer::new();
         w.uint(0).bool(false).string(&"x".repeat(MAX_SYMLINK + 1));
@@ -2789,10 +2874,12 @@ mod tests {
             w.bool(false).bool(true);
             w.finish()
         };
-        assert!(Response::parse(procedure::READDIR, &entries(MAX_DIR_ENTRIES)).is_ok());
+        // Each entry takes 28 bytes with the word before it.
+        let most = MAX_DIR_BYTES / 28;
+        assert!(Response::parse(procedure::READDIR, &entries(most)).is_ok());
         assert_eq!(
-            Response::parse(procedure::READDIR, &entries(MAX_DIR_ENTRIES + 1)),
-            Err(XdrError::TooLong(MAX_DIR_ENTRIES as u32 + 1))
+            Response::parse(procedure::READDIR, &entries(most + 1)),
+            Err(XdrError::TooLong((28 * (most + 1)) as u32))
         );
         let groups = |n: usize| {
             let mut w = Writer::new();
@@ -2839,107 +2926,237 @@ mod tests {
     }
 
     #[test]
-    fn writers_clip_what_they_write() {
-        let long_fh = FileHandle(vec![1; 100]);
-        let long_name = "é".repeat(200); // 400 bytes
-        let req = Request::Rename { from: DirOp { dir: long_fh.clone(), name: long_name.clone() }, to: op(&[], "") };
-        let Request::Rename { from, .. } = Request::read(procedure::RENAME, &req.to_args()).unwrap() else { panic!() };
-        assert_eq!(from.dir.0.len(), MAX_FH);
-        assert_eq!(from.name.len(), 254); // the last whole character under 255 bytes
-        let req = Request::Write {
-            file: fh(&[1]),
-            offset: 0,
-            count: 0,
-            stable: StableHow::Unstable,
-            data: vec![1; MAX_DATA + 3],
+    fn writers_never_cut_a_name_to_another() {
+        // RFC 1813 has no truncation in the protocol: a REMOVE for a
+        // 256-byte name must not become a REMOVE of the 255-byte name that
+        // starts it.
+        let mut long = vec![b'a'; MAX_NAME];
+        long.push(b'b');
+        let req = Request::Remove(DirOp { dir: fh(&[1]), name: long });
+        let Ok(Request::Remove(back)) = Request::read(procedure::REMOVE, &req.to_args()) else { panic!() };
+        assert_eq!(back.name, b"");
+        // The same for handles, symlink targets and MOUNT paths.
+        let long_fh = FileHandle(vec![1; MAX_FH + 1]);
+        assert!(!long_fh.fits());
+        let req = Request::GetAttr(long_fh.clone());
+        assert_eq!(Request::read(procedure::GETATTR, &req.to_args()), Ok(Request::GetAttr(fh(&[]))));
+        let req = Request::Symlink {
+            location: op(&[1], "l"),
+            attributes: Sattr::default(),
+            target: vec![b't'; MAX_SYMLINK + 1],
         };
-        let Request::Write { data, .. } = Request::read(procedure::WRITE, &req.to_args()).unwrap() else { panic!() };
-        assert_eq!(data.len(), MAX_DATA);
-        let req = Request::Symlink { location: op(&[1], "l"), attributes: Sattr::default(), target: "t".repeat(9000) };
-        let Request::Symlink { target, .. } = Request::read(procedure::SYMLINK, &req.to_args()).unwrap() else {
+        let Ok(Request::Symlink { target, .. }) = Request::read(procedure::SYMLINK, &req.to_args()) else { panic!() };
+        assert_eq!(target, b"");
+        let resp = Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: vec![b'x'; MAX_SYMLINK + 1] }));
+        let Ok(Response::ReadLink(Ok(back))) = Response::parse(procedure::READLINK, &resp.to_results()) else {
             panic!()
         };
-        assert_eq!(target.len(), MAX_SYMLINK);
-
-        let entries: Vec<EntryPlus> = (0..MAX_DIR_ENTRIES as u64 + 10)
-            .map(|i| EntryPlus {
-                fileid: i,
-                name: long_name.clone(),
-                cookie: i,
-                attributes: Some(attrs()),
-                handle: Some(long_fh.clone()),
-            })
-            .collect();
-        let resp =
-            Response::ReadDirPlus(Ok(ReadDirPlusOk { attributes: None, cookieverf: [0; 8], entries, eof: true }));
-        let Response::ReadDirPlus(Ok(back)) = Response::parse(procedure::READDIRPLUS, &resp.to_results()).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(back.entries.len(), MAX_DIR_ENTRIES);
-        assert!(back.entries.iter().all(|e| e.name.len() <= MAX_NAME && e.handle.as_ref().unwrap().0.len() == MAX_FH));
-        let resp = Response::Read(Ok(ReadOk { attributes: None, count: 0, eof: false, data: vec![0; MAX_DATA + 1] }));
-        assert!(Response::parse(procedure::READ, &resp.to_results()).is_ok());
-        let resp = Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: "x".repeat(MAX_SYMLINK * 2) }));
-        assert!(Response::parse(procedure::READLINK, &resp.to_results()).is_ok());
-
+        assert_eq!(back.target, b"");
+        assert_eq!(
+            MountRequest::read(1, &MountRequest::Mnt(vec![b'p'; MAX_PATH + 1]).to_args()),
+            Ok(MountRequest::Mnt(vec![]))
+        );
+        // Optional handles too long to write are left out.
+        let resp = Response::Create(Ok(CreateOk { object: Some(long_fh.clone()), ..CreateOk::default() }));
+        let Ok(Response::Create(Ok(back))) = Response::parse(procedure::CREATE, &resp.to_results()) else { panic!() };
+        assert_eq!(back.object, None);
         let resp = MountResponse::Mnt(Ok(Mounted { handle: long_fh, auth_flavors: vec![1; 100] }));
         let MountResponse::Mnt(Ok(m)) = MountResponse::parse(mount_procedure::MNT, &resp.to_results()).unwrap() else {
             panic!()
         };
-        assert_eq!((m.handle.0.len(), m.auth_flavors.len()), (MAX_FH, MAX_AUTH_FLAVORS));
-        let resp = MountResponse::Export(
-            (0..MAX_EXPORTS + 5)
-                .map(|_| ExportEntry { directory: "d".repeat(2000), groups: vec!["g".repeat(300); MAX_GROUPS + 5] })
-                .collect(),
-        );
-        let MountResponse::Export(back) = MountResponse::parse(mount_procedure::EXPORT, &resp.to_results()).unwrap()
-        else {
+        assert_eq!((m.handle.0.len(), m.auth_flavors.len()), (0, MAX_AUTH_FLAVORS));
+    }
+
+    #[test]
+    fn list_items_too_long_to_write_are_left_out() {
+        let long = vec![b'n'; MAX_NAME + 1];
+        let resp = Response::ReadDir(Ok(ReadDirOk {
+            entries: vec![
+                Entry { fileid: 1, name: b"a".to_vec(), cookie: 1 },
+                Entry { fileid: 2, name: long.clone(), cookie: 2 },
+                Entry { fileid: 3, name: b"c".to_vec(), cookie: 3 },
+            ],
+            eof: true,
+            ..ReadDirOk::default()
+        }));
+        let Ok(Response::ReadDir(Ok(back))) = Response::parse(procedure::READDIR, &resp.to_results()) else { panic!() };
+        assert_eq!(back.entries.iter().map(|e| e.fileid).collect::<Vec<_>>(), [1, 3]);
+        assert!(back.eof);
+        let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk {
+            entries: vec![
+                EntryPlus { name: long, ..EntryPlus::default() },
+                EntryPlus { fileid: 4, handle: Some(FileHandle(vec![1; MAX_FH + 1])), ..EntryPlus::default() },
+            ],
+            ..ReadDirPlusOk::default()
+        }));
+        let Ok(Response::ReadDirPlus(Ok(back))) = Response::parse(procedure::READDIRPLUS, &resp.to_results()) else {
             panic!()
         };
-        // The byte limit stops these long exports first.
-        assert!(!back.is_empty() && back.len() < MAX_EXPORTS);
-        assert!(resp.to_results().len() <= MAX_EXPORT_BYTES);
-        assert_eq!(back[0].groups.len(), MAX_GROUPS);
-        assert!(back[0].directory.len() == MAX_PATH && back[0].groups[0].len() == MAX_MOUNT_NAME);
+        assert_eq!(back.entries, [EntryPlus { fileid: 4, ..EntryPlus::default() }]);
+        // MOUNT lists: entries with a long path or host are left out; a
+        // long group is written empty, so the list still limits who may
+        // mount.
+        let resp = MountResponse::Export(vec![
+            ExportEntry { directory: vec![b'd'; MAX_PATH + 1], groups: vec![] },
+            ExportEntry { directory: b"/x".to_vec(), groups: vec!["g".repeat(MAX_MOUNT_NAME + 1)] },
+        ]);
+        assert_eq!(
+            MountResponse::parse(mount_procedure::EXPORT, &resp.to_results()),
+            Ok(MountResponse::Export(vec![ExportEntry { directory: b"/x".to_vec(), groups: vec![String::new()] }]))
+        );
+        let resp = MountResponse::Dump(vec![
+            MountEntry { hostname: "h".repeat(MAX_MOUNT_NAME + 1), directory: b"/".to_vec() },
+            MountEntry { hostname: "h".into(), directory: b"/".to_vec() },
+        ]);
+        assert_eq!(
+            MountResponse::parse(mount_procedure::DUMP, &resp.to_results()),
+            Ok(MountResponse::Dump(vec![MountEntry { hostname: "h".into(), directory: b"/".to_vec() }]))
+        );
+        let resp =
+            MountResponse::Dump(vec![MountEntry { hostname: "h".into(), directory: b"/".to_vec() }; MAX_MOUNTS + 1]);
+        let MountResponse::Dump(back) = MountResponse::parse(mount_procedure::DUMP, &resp.to_results()).unwrap() else {
+            panic!()
+        };
+        assert_eq!(back.len(), MAX_MOUNTS);
+    }
+
+    #[test]
+    fn names_are_bytes() {
+        // RFC 1813 sets no character set; Linux servers take Latin-1 names.
+        let mut w = Writer::new();
+        w.opaque(&[1]).opaque(&[0xff]);
+        assert_eq!(
+            Request::read(procedure::LOOKUP, w.as_bytes()),
+            Ok(Request::Lookup(DirOp { dir: fh(&[1]), name: vec![0xff] }))
+        );
+        // A READDIR reply with one such name reads, and writes back the same.
+        let b = [
+            0, 0, 0, 0, // NFS3_OK
+            0, 0, 0, 0, // no directory attributes
+            0, 0, 0, 0, 0, 0, 0, 0, // cookie verifier
+            0, 0, 0, 1, // an entry follows
+            0, 0, 0, 0, 0, 0, 0, 5, // fileid
+            0, 0, 0, 2, b'\xe9', b't', 0, 0, // name: "et" with e-acute in Latin-1
+            0, 0, 0, 0, 0, 0, 0, 6, // cookie
+            0, 0, 0, 0, // no more entries
+            0, 0, 0, 1, // eof
+        ];
+        let resp = Response::parse(procedure::READDIR, &b).unwrap();
+        let Response::ReadDir(Ok(ok)) = &resp else { panic!() };
+        assert_eq!(ok.entries[0].name, [0xe9, b't']);
+        assert_eq!(resp.to_results(), b);
+        // And a MOUNT path.
+        let mut w = Writer::new();
+        w.opaque(b"/caf\xe9");
+        assert_eq!(MountRequest::read(1, w.as_bytes()), Ok(MountRequest::Mnt(b"/caf\xe9".to_vec())));
+    }
+
+    #[test]
+    fn read_and_write_counts_match_their_data() {
+        // RFC 1813, sections 3.3.6 and 3.3.7: count is the number of bytes
+        // of data. Linux refuses a mismatch on both sides.
+        let mut w = Writer::new();
+        w.uint(0).bool(false).uint(2).bool(true).opaque(b"x");
+        assert_eq!(Response::parse(procedure::READ, w.as_bytes()), Err(XdrError::TooLong(2)));
+        let mut w = Writer::new();
+        w.opaque(&[1]).uhyper(0).uint(2).uint(0).opaque(b"xyz");
+        assert_eq!(Request::read(procedure::WRITE, w.as_bytes()), Err(XdrError::TooLong(3)));
+        // A writer writes the count of the data it writes.
+        let req = Request::Write { file: fh(&[1]), offset: 0, count: 9, stable: StableHow::Unstable, data: vec![1; 4] };
+        let Ok(Request::Write { count, data, .. }) = Request::read(procedure::WRITE, &req.to_args()) else { panic!() };
+        assert_eq!((count, data.len()), (4, 4));
+        // Data past MAX_DATA is cut: a short write, with its count.
+        let req = Request::Write {
+            file: fh(&[1]),
+            offset: 0,
+            count: MAX_DATA as u32 + 3,
+            stable: StableHow::Unstable,
+            data: vec![1; MAX_DATA + 3],
+        };
+        let Ok(Request::Write { count, data, .. }) = Request::read(procedure::WRITE, &req.to_args()) else { panic!() };
+        assert_eq!((count as usize, data.len()), (MAX_DATA, MAX_DATA));
+        // A READ cut short is not the end of the file.
+        let resp = Response::Read(Ok(ReadOk {
+            attributes: None,
+            count: MAX_DATA as u32 + 1,
+            eof: true,
+            data: vec![0; MAX_DATA + 1],
+        }));
+        let Ok(Response::Read(Ok(back))) = Response::parse(procedure::READ, &resp.to_results()) else { panic!() };
+        assert_eq!((back.count as usize, back.data.len(), back.eof), (MAX_DATA, MAX_DATA, false));
+        let resp = Response::Read(Ok(ReadOk { attributes: None, count: 3, eof: true, data: vec![0; 3] }));
+        assert_eq!(Response::parse(procedure::READ, &resp.to_results()), Ok(resp));
+    }
+
+    #[test]
+    fn export_lists_read_only_what_writes_back() {
+        // 16 exports, each with 256 groups of 255 bytes: about 1.08 MB,
+        // past MAX_EXPORT_BYTES. A reader refuses it rather than take a
+        // list a writer would cut.
+        let exports: Vec<ExportEntry> = (0..16)
+            .map(|i| ExportEntry {
+                directory: format!("/e{i:02}").into_bytes(),
+                groups: (0..MAX_GROUPS).map(|g| format!("{g:03}{}", "g".repeat(252))).collect(),
+            })
+            .collect();
+        let mut w = Writer::new();
+        for e in &exports {
+            w.bool(true).opaque(&e.directory);
+            for g in &e.groups {
+                w.bool(true).string(g);
+            }
+            w.bool(false);
+        }
+        w.bool(false);
+        let b = w.finish();
+        assert!(b.len() > MAX_EXPORT_BYTES);
+        assert!(matches!(MountResponse::parse(mount_procedure::EXPORT, &b), Err(XdrError::TooLong(_))));
+        // The writer stops before the limit, and what it writes reads back.
+        let resp = MountResponse::Export(exports);
+        let out = resp.to_results();
+        assert!(out.len() <= MAX_EXPORT_BYTES);
+        let back = MountResponse::parse(mount_procedure::EXPORT, &out).unwrap();
+        let MountResponse::Export(list) = &back else { panic!() };
+        assert_eq!(list.len(), 15);
+        assert_eq!(back.to_results(), out);
         // Short exports stop at the count.
-        let resp = MountResponse::Export(vec![ExportEntry { directory: "/".into(), groups: vec![] }; MAX_EXPORTS + 5]);
+        let resp =
+            MountResponse::Export(vec![ExportEntry { directory: b"/".to_vec(), groups: vec![] }; MAX_EXPORTS + 5]);
         let MountResponse::Export(back) = MountResponse::parse(mount_procedure::EXPORT, &resp.to_results()).unwrap()
         else {
             panic!()
         };
         assert_eq!(back.len(), MAX_EXPORTS);
-        let resp =
-            MountResponse::Dump(vec![MountEntry { hostname: "h".repeat(300), directory: "/".into() }; MAX_MOUNTS + 1]);
-        let MountResponse::Dump(back) = MountResponse::parse(mount_procedure::DUMP, &resp.to_results()).unwrap() else {
-            panic!()
-        };
-        assert_eq!(back.len(), MAX_MOUNTS);
-        assert_eq!(
-            MountRequest::read(1, &MountRequest::Mnt("p".repeat(5000)).to_args()),
-            Ok(MountRequest::Mnt("p".repeat(MAX_PATH)))
-        );
     }
 
     #[test]
-    fn clipped_directory_lists_are_not_eof() {
+    fn directory_lists_follow_a_byte_limit() {
+        // A READDIR asked with count 65536 may carry 1025 short entries.
+        let entries: Vec<Entry> =
+            (0..1025).map(|i| Entry { fileid: i, name: format!("{i:04}").into_bytes(), cookie: i + 1 }).collect();
+        let resp = Response::ReadDir(Ok(ReadDirOk { entries, eof: true, ..ReadDirOk::default() }));
+        let b = resp.to_results();
+        assert!(b.len() < 65536);
+        assert_eq!(Response::parse(procedure::READDIR, &b), Ok(resp));
         // A writer that leaves entries out must not tell the client it saw
         // the whole directory.
-        let entries: Vec<Entry> =
-            (0..MAX_DIR_ENTRIES as u64 + 1).map(|i| Entry { fileid: i, name: "e".into(), cookie: i + 1 }).collect();
+        let entries: Vec<Entry> = (0..MAX_DIR_BYTES as u64 / 28 + 1)
+            .map(|i| Entry { fileid: i, name: b"e".to_vec(), cookie: i + 1 })
+            .collect();
         let resp = Response::ReadDir(Ok(ReadDirOk { entries, eof: true, ..ReadDirOk::default() }));
         let Ok(Response::ReadDir(Ok(back))) = Response::parse(procedure::READDIR, &resp.to_results()) else { panic!() };
-        assert_eq!(back.entries.len(), MAX_DIR_ENTRIES);
+        assert_eq!(back.entries.len(), MAX_DIR_BYTES / 28);
         assert!(!back.eof);
-        assert_eq!(back.entries.last().unwrap().cookie, MAX_DIR_ENTRIES as u64);
-        let entries = vec![EntryPlus::default(); MAX_DIR_ENTRIES + 1];
+        assert_eq!(back.entries.last().unwrap().cookie, (MAX_DIR_BYTES / 28) as u64);
+        let entries = vec![EntryPlus::default(); MAX_DIR_BYTES / 32 + 1];
         let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk { entries, eof: true, ..ReadDirPlusOk::default() }));
         let Ok(Response::ReadDirPlus(Ok(back))) = Response::parse(procedure::READDIRPLUS, &resp.to_results()) else {
             panic!()
         };
+        assert_eq!(back.entries.len(), MAX_DIR_BYTES / 32);
         assert!(!back.eof);
         // A list within the limit keeps its eof.
-        let entries = vec![EntryPlus::default(); MAX_DIR_ENTRIES];
+        let entries = vec![EntryPlus::default(); MAX_DIR_BYTES / 32];
         let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk { entries, eof: true, ..ReadDirPlusOk::default() }));
         assert_eq!(Response::parse(procedure::READDIRPLUS, &resp.to_results()), Ok(resp));
     }
@@ -2948,8 +3165,8 @@ mod tests {
     fn largest_messages_fit_in_a_record() {
         // Each writer at its limits makes a message a Decoder takes.
         let fat = FileHandle(vec![1; MAX_FH]);
-        let name = "n".repeat(MAX_NAME);
-        let path = "p".repeat(MAX_PATH);
+        let name = vec![b'n'; MAX_NAME];
+        let path = vec![b'p'; MAX_PATH];
         let group = "g".repeat(MAX_MOUNT_NAME);
         let plus = EntryPlus {
             fileid: 1,
@@ -2991,7 +3208,7 @@ mod tests {
             Request::Symlink {
                 location: DirOp { dir: fat, name },
                 attributes: sattr(),
-                target: "t".repeat(MAX_SYMLINK),
+                target: vec![b't'; MAX_SYMLINK],
             }
             .call(3),
         );
@@ -3116,7 +3333,7 @@ mod tests {
             let entries: Vec<EntryPlus> = (0..rng.below(5))
                 .map(|i| EntryPlus {
                     fileid: rng.u64(),
-                    name: "x".repeat(rng.below(300) as usize),
+                    name: (0..rng.below(300)).map(|_| rng.next() as u8).collect(),
                     cookie: u64::from(i),
                     attributes: rng.chance().then_some(a),
                     handle: rng.chance().then(|| FileHandle(vec![7; rng.below(80) as usize])),

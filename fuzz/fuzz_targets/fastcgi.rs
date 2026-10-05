@@ -4,8 +4,8 @@
 #![no_main]
 
 use fictionet::stdlib::fastcgi::{
-    BeginRequest, Client, ClientEvent, Decoder, EndRequest, MAX_BUFFERED, MAX_HELD, MAX_REQUESTS, Record, Server,
-    ServerEvent, encode_pairs, parse_pairs,
+    BeginRequest, Client, ClientEvent, Decoder, EndRequest, MAX_BUFFERED, MAX_CONTENT, MAX_HELD, MAX_REQUESTS, Record,
+    Server, ServerEvent, StreamError, encode_pairs, kind, parse_pairs, stream_bytes,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -32,10 +32,17 @@ fuzz_target!(|data: &[u8]| {
             again.push(r);
         }
     }
-    assert_eq!(whole, again);
+    // A feed past MAX_BUFFERED breaks the decoder fed all at once, while
+    // one drained a byte at a time reads the records before it.
+    if data.len() <= MAX_BUFFERED {
+        assert_eq!(whole, again);
+    } else {
+        assert!(whole.is_empty());
+    }
 
     let mut server = Server::new();
     let mut client = Client::new();
+    let mut client_failed = std::collections::BTreeSet::new();
     for r in &whole {
         // A record read can be written, and reads back the same.
         let bytes = r.to_bytes();
@@ -62,8 +69,23 @@ fuzz_target!(|data: &[u8]| {
             }
             assert_eq!(got, Some(req));
         }
-        // So can a response.
-        if let Ok(Some(ClientEvent::Response(resp))) = client.receive(r) {
+        // So can a response. One with an error reported is never given.
+        let failed_before = matches!(r.kind, kind::STDOUT | kind::STDERR) && client_failed.contains(&r.request_id);
+        let got = client.receive(r);
+        match &got {
+            Err(StreamError::AfterEnd { id, .. } | StreamError::TooLarge { id, .. }) => {
+                client_failed.insert(*id);
+            }
+            Ok(Some(ClientEvent::Response(resp))) => assert!(!client_failed.contains(&resp.id)),
+            _ => {}
+        }
+        if r.kind == kind::END_REQUEST {
+            client_failed.remove(&r.request_id);
+        }
+        if failed_before {
+            assert_eq!(got, Ok(None));
+        }
+        if let Ok(Some(ClientEvent::Response(resp))) = got {
             let mut c = Client::new();
             let mut got = None;
             for r in records(&resp.to_bytes()) {
@@ -86,5 +108,23 @@ fuzz_target!(|data: &[u8]| {
     }
     if let Ok(e) = EndRequest::parse(data) {
         assert_eq!(EndRequest::parse(&e.to_bytes()), Ok(e));
+    }
+
+    // Any bytes as a stream, written and read back whole.
+    let mut c = Client::new();
+    let mut got = Vec::new();
+    for r in records(&stream_bytes(kind::STDOUT, 1, data)) {
+        assert!(r.content.len() <= MAX_CONTENT);
+        assert_eq!(c.receive(&r), Ok(None));
+        got = r.content;
+    }
+    assert!(got.is_empty());
+    // Any bytes split into names for GET_VALUES, which a server reads back.
+    let names: Vec<&[u8]> = data.split(|&b| b == b',').collect();
+    let ask = Record::get_values(&names);
+    assert!(ask.content.len() <= MAX_CONTENT);
+    match Server::new().receive(&ask) {
+        Ok(Some(ServerEvent::GetValues(back))) => assert!(back.len() <= names.len()),
+        other => panic!("{other:?}"),
     }
 });

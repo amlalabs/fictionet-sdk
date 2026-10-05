@@ -398,7 +398,11 @@ impl Packet {
 
     /// A packet that answers this one with `payload`, on the same virtual
     /// network, with the same protocol type, the same O bit and no
-    /// options.
+    /// options. Some peers want options echoed back: AWS Gateway Load
+    /// Balancer, for one, drops returned traffic that lacks its flow
+    /// cookie. To keep every option, build the reply from a copy of the
+    /// header, `Packet { header: self.header.clone(), payload }`, which
+    /// writes whenever this packet does.
     pub fn reply(&self, payload: Vec<u8>) -> Packet {
         let header =
             Header { control: self.header.control, protocol: self.header.protocol, vni: self.header.vni, options: Vec::new() };
@@ -771,6 +775,63 @@ mod tests {
         let h = header(vec![opt(1, 1, false, &[1])]);
         assert_eq!(h.write(&mut out), Err(GeneveError::OptionData(1)));
         assert_eq!(out, [1, 2]);
+    }
+
+    #[test]
+    fn most_options_a_header_holds() {
+        // 63 empty options fill the 252 bytes; a 64th is one word over.
+        let mut h = header((0..63).map(|i| opt(i, 1, i % 2 == 0, &[])).collect());
+        let b = h.to_bytes().unwrap();
+        assert_eq!(b.len(), MAX_HEADER_LEN);
+        assert_eq!(Header::parse_prefix(&b), Ok(Some((h.clone(), MAX_HEADER_LEN))));
+        h.options.push(opt(63, 1, false, &[]));
+        let mut out = vec![1, 2];
+        assert_eq!(h.write(&mut out), Err(GeneveError::OptionsLength(256)));
+        assert_eq!(out, [1, 2]);
+    }
+
+    #[test]
+    fn reply_can_keep_the_options() {
+        // An AWS Gateway Load Balancer packet with its flow cookie (class
+        // 0x0108, type 3), answered with every option kept.
+        let p = Packet { header: header(vec![opt(0x0108, 3, false, &[1, 2, 3, 4])]), payload: vec![1] };
+        let r = Packet { header: p.header.clone(), payload: vec![2] };
+        assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap().header.option(0x0108, 3), p.header.option(0x0108, 3));
+    }
+
+    #[test]
+    fn fuzz_writer_on_any_values() {
+        // Headers built from any field values, valid or not: the writer
+        // either writes bytes that read back the same, or refuses and
+        // leaves the buffer alone.
+        let mut rng = Lcg(0xabcd);
+        for _ in 0..5_000 {
+            let mut options = Vec::new();
+            for _ in 0..rng.below(70) {
+                let n = if rng.below(4) == 0 { rng.below(140) } else { rng.below(8) * 4 };
+                let data = rng.bytes(n);
+                options.push(GeneveOption {
+                    class: rng.next() as u16,
+                    kind: rng.next() as u8,
+                    critical: rng.below(2) == 0,
+                    data,
+                });
+            }
+            let vni = if rng.below(4) == 0 { rng.next() } else { rng.next() & MAX_VNI };
+            let n = rng.below(64);
+            let p = Packet {
+                header: Header { control: rng.below(2) == 0, protocol: rng.next() as u16, vni, options },
+                payload: rng.bytes(n),
+            };
+            let mut out = vec![0xee];
+            match p.write(&mut out) {
+                Ok(()) => assert_eq!(Packet::parse(&out[1..]), Ok(p)),
+                Err(e) => {
+                    assert_eq!(out, [0xee]);
+                    assert_eq!(p.header.check().err().unwrap_or(GeneveError::TooLong), e);
+                }
+            }
+        }
     }
 
     #[test]

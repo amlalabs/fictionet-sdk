@@ -1,0 +1,1569 @@
+//! NTLMSSP: reading and writing the NEGOTIATE, CHALLENGE and AUTHENTICATE
+//! messages of NTLM authentication, with no I/O.
+//!
+//! NTLM is how Windows machines prove who a user is without a domain
+//! controller in the path of every request. A client opens with a
+//! NEGOTIATE message that lists what it supports. The server answers with
+//! a CHALLENGE message that carries 8 random bytes and a list of names
+//! (the target info). The client answers with an AUTHENTICATE message that
+//! names the user and carries responses computed from the challenge and
+//! the user's password. The three messages travel inside SMB, HTTP
+//! (`Authorization: NTLM`), RPC, LDAP and others, often wrapped in a
+//! [`spnego`](crate::stdlib::spnego) token. This module follows Microsoft's
+//! \[MS-NLMP\] section 2.2.
+//!
+//! Nothing here reads a socket, decodes base64 or computes a hash. A world
+//! that plays a file server takes the token its SMB or HTTP code hands it,
+//! reads it with [`Message::parse`], and writes its answer with
+//! [`Challenge::to_bytes`]. Names, responses and session keys are kept as
+//! bytes. [`AvPair::parse_list`], [`NtResponse::parse`] and
+//! [`LmV2Response::parse`] read the parts that have a layout of their own.
+//! Whether a response is correct, and whether to let the user in, is up to
+//! world code.
+//!
+//! Every reader checks lengths and offsets, because the agent can send any
+//! bytes it likes. A message is at most [`MAX_MESSAGE`] bytes, and a list
+//! of AV pairs holds at most [`MAX_AV_PAIRS`] pairs. Writers return an
+//! [`EncodeError`] rather than write bytes a reader would refuse or read
+//! back as something else.
+//!
+//! ```
+//! use fictionet::stdlib::ntlmssp::{
+//!     AvPair, Authenticate, Challenge, ClientChallenge, Message, Negotiate, NtResponse, NtlmV2Response,
+//!     av_id, decode_utf16le, encode_utf16le, flags,
+//! };
+//!
+//! // What a client sends first.
+//! let negotiate = Negotiate {
+//!     flags: flags::NEGOTIATE_UNICODE | flags::NEGOTIATE_NTLM | flags::REQUEST_TARGET,
+//!     domain: Vec::new(),
+//!     workstation: Vec::new(),
+//!     version: None,
+//! };
+//! let Ok(Message::Negotiate(n)) = Message::parse(&negotiate.to_bytes().unwrap()) else { panic!() };
+//!
+//! // The world, playing a server in domain CORP, answers with a challenge.
+//! let names = [AvPair { id: av_id::NB_DOMAIN_NAME, value: encode_utf16le("CORP") }];
+//! let challenge = Challenge {
+//!     flags: n.flags | flags::NEGOTIATE_TARGET_INFO | flags::TARGET_TYPE_DOMAIN,
+//!     target_name: encode_utf16le("CORP"),
+//!     server_challenge: [1, 2, 3, 4, 5, 6, 7, 8],
+//!     target_info: AvPair::write_list(&names).unwrap(),
+//!     version: None,
+//! };
+//! let reply = challenge.to_bytes().unwrap();
+//! assert_eq!(&reply[..12], b"NTLMSSP\0\x02\0\0\0");
+//!
+//! // The client's answer, built here to stand in for one the agent sends.
+//! let nt = NtResponse::V2(NtlmV2Response {
+//!     nt_proof: [0xaa; 16],
+//!     client: ClientChallenge {
+//!         resp_type: 1,
+//!         hi_resp_type: 1,
+//!         timestamp: 0,
+//!         challenge: [9; 8],
+//!         av_pairs: names.to_vec(),
+//!         trailing: Vec::new(),
+//!     },
+//! });
+//! let auth = Authenticate {
+//!     flags: n.flags,
+//!     lm_response: vec![0; 24],
+//!     nt_response: nt.to_bytes().unwrap(),
+//!     domain: encode_utf16le("CORP"),
+//!     user: encode_utf16le("alice"),
+//!     workstation: Vec::new(),
+//!     session_key: Vec::new(),
+//!     version: None,
+//!     mic: None,
+//! };
+//! let Ok(Message::Authenticate(a)) = Message::parse(&auth.to_bytes().unwrap()) else { panic!() };
+//! assert_eq!(decode_utf16le(&a.user).as_deref(), Some("alice"));
+//! let Ok(NtResponse::V2(v2)) = NtResponse::parse(&a.nt_response) else { panic!() };
+//! assert_eq!(v2.client.challenge, [9; 8]);
+//! ```
+
+/// The 8 bytes every NTLMSSP message starts with.
+pub const SIGNATURE: [u8; 8] = *b"NTLMSSP\0";
+/// The longest message a reader accepts and a writer writes.
+pub const MAX_MESSAGE: usize = 64 * 1024;
+/// The longest payload field: its length is a 16-bit number.
+pub const MAX_FIELD: usize = u16::MAX as usize;
+/// The most AV pairs one list may hold, not counting the end marker.
+pub const MAX_AV_PAIRS: usize = 1024;
+/// The length of a [`Version`] on the wire.
+pub const VERSION_LEN: usize = 8;
+/// The length of the message integrity code in an AUTHENTICATE message.
+pub const MIC_LEN: usize = 16;
+/// Where the MIC of an AUTHENTICATE message ends: after the 64-byte fixed
+/// part, the 8-byte version and the MIC itself.
+pub const MIC_END: usize = AUTHENTICATE_HEADER_LEN + VERSION_LEN + MIC_LEN;
+/// The fixed part of a NEGOTIATE message, before any version.
+pub const NEGOTIATE_HEADER_LEN: usize = 32;
+/// The fixed part of a CHALLENGE message, before any version.
+pub const CHALLENGE_HEADER_LEN: usize = 48;
+/// The fixed part of an AUTHENTICATE message, before any version and MIC.
+pub const AUTHENTICATE_HEADER_LEN: usize = 64;
+/// The length of an LMv1, LMv2 or NTLMv1 response.
+pub const V1_RESPONSE_LEN: usize = 24;
+/// The length of the NTProofStr at the start of an NTLMv2 response.
+pub const NT_PROOF_LEN: usize = 16;
+/// The fixed part of an NTLMv2 client challenge, before its AV pairs.
+pub const CLIENT_CHALLENGE_HEADER_LEN: usize = 28;
+
+/// The message type numbers, at bytes 8 to 11 of every message.
+pub mod message_type {
+    /// A NEGOTIATE message, sent by the client first.
+    pub const NEGOTIATE: u32 = 1;
+    /// A CHALLENGE message, the server's answer.
+    pub const CHALLENGE: u32 = 2;
+    /// An AUTHENTICATE message, the client's answer to the challenge.
+    pub const AUTHENTICATE: u32 = 3;
+}
+
+/// The negotiate flags, from \[MS-NLMP\] section 2.2.2.5. Each names one
+/// bit of the 32-bit flags field.
+pub mod flags {
+    /// Strings are UTF-16LE.
+    pub const NEGOTIATE_UNICODE: u32 = 0x0000_0001;
+    /// Strings are in the OEM code page.
+    pub const NEGOTIATE_OEM: u32 = 0x0000_0002;
+    /// The server should send its name in the CHALLENGE message.
+    pub const REQUEST_TARGET: u32 = 0x0000_0004;
+    /// Messages after authentication are signed.
+    pub const NEGOTIATE_SIGN: u32 = 0x0000_0010;
+    /// Messages after authentication are sealed (encrypted).
+    pub const NEGOTIATE_SEAL: u32 = 0x0000_0020;
+    /// Connectionless (datagram) authentication.
+    pub const NEGOTIATE_DATAGRAM: u32 = 0x0000_0040;
+    /// LAN Manager session key computation.
+    pub const NEGOTIATE_LM_KEY: u32 = 0x0000_0080;
+    /// NTLM v1 session security.
+    pub const NEGOTIATE_NTLM: u32 = 0x0000_0200;
+    /// An anonymous connection.
+    pub const ANONYMOUS: u32 = 0x0000_0800;
+    /// The NEGOTIATE message's domain field is set.
+    pub const NEGOTIATE_OEM_DOMAIN_SUPPLIED: u32 = 0x0000_1000;
+    /// The NEGOTIATE message's workstation field is set.
+    pub const NEGOTIATE_OEM_WORKSTATION_SUPPLIED: u32 = 0x0000_2000;
+    /// A signature block on every message, even unsigned ones.
+    pub const NEGOTIATE_ALWAYS_SIGN: u32 = 0x0000_8000;
+    /// The target name is a domain.
+    pub const TARGET_TYPE_DOMAIN: u32 = 0x0001_0000;
+    /// The target name is a server.
+    pub const TARGET_TYPE_SERVER: u32 = 0x0002_0000;
+    /// NTLM v2 session security (extended session security).
+    pub const NEGOTIATE_EXTENDED_SESSIONSECURITY: u32 = 0x0008_0000;
+    /// An identify-level token.
+    pub const NEGOTIATE_IDENTIFY: u32 = 0x0010_0000;
+    /// A session key that does not come from the NT hash.
+    pub const REQUEST_NON_NT_SESSION_KEY: u32 = 0x0040_0000;
+    /// The CHALLENGE message's target info field is set.
+    pub const NEGOTIATE_TARGET_INFO: u32 = 0x0080_0000;
+    /// The message carries a [`Version`](super::Version).
+    pub const NEGOTIATE_VERSION: u32 = 0x0200_0000;
+    /// 128-bit session keys.
+    pub const NEGOTIATE_128: u32 = 0x2000_0000;
+    /// An encrypted session key is exchanged.
+    pub const NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
+    /// 56-bit session keys.
+    pub const NEGOTIATE_56: u32 = 0x8000_0000;
+}
+
+/// AV pair IDs, from \[MS-NLMP\] section 2.2.2.1.
+pub mod av_id {
+    /// The end of the list. Writers add it; it is never a pair of its own.
+    pub const EOL: u16 = 0x0000;
+    /// The server's NetBIOS computer name, UTF-16LE.
+    pub const NB_COMPUTER_NAME: u16 = 0x0001;
+    /// The server's NetBIOS domain name, UTF-16LE.
+    pub const NB_DOMAIN_NAME: u16 = 0x0002;
+    /// The server's DNS computer name, UTF-16LE.
+    pub const DNS_COMPUTER_NAME: u16 = 0x0003;
+    /// The server's DNS domain name, UTF-16LE.
+    pub const DNS_DOMAIN_NAME: u16 = 0x0004;
+    /// The DNS name of the forest, UTF-16LE.
+    pub const DNS_TREE_NAME: u16 = 0x0005;
+    /// A 32-bit little-endian flags value. Bit 0x2 says the AUTHENTICATE
+    /// message carries a MIC.
+    pub const FLAGS: u16 = 0x0006;
+    /// The server's time as a 64-bit little-endian FILETIME.
+    pub const TIMESTAMP: u16 = 0x0007;
+    /// A Single_Host_Data structure.
+    pub const SINGLE_HOST: u16 = 0x0008;
+    /// The SPN of the target server, UTF-16LE.
+    pub const TARGET_NAME: u16 = 0x0009;
+    /// A 16-byte hash of the channel bindings.
+    pub const CHANNEL_BINDINGS: u16 = 0x000a;
+}
+
+/// The revision number current versions of NTLMSSP send in a [`Version`].
+pub const NTLMSSP_REVISION_W2K3: u8 = 0x0f;
+
+/// The operating system version a message may carry, for debugging. Its
+/// three reserved bytes are not kept and are written as zeros.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Version {
+    /// The major version, such as 10 for Windows 10.
+    pub major: u8,
+    /// The minor version.
+    pub minor: u8,
+    /// The build number.
+    pub build: u16,
+    /// The NTLMSSP revision, usually [`NTLMSSP_REVISION_W2K3`].
+    pub revision: u8,
+}
+
+impl Version {
+    /// Reads a version from its 8 bytes.
+    pub fn from_bytes(b: [u8; VERSION_LEN]) -> Version {
+        Version { major: b[0], minor: b[1], build: u16::from_le_bytes([b[2], b[3]]), revision: b[7] }
+    }
+
+    /// The version's 8 bytes.
+    pub fn to_bytes(self) -> [u8; VERSION_LEN] {
+        let [b0, b1] = self.build.to_le_bytes();
+        [self.major, self.minor, b0, b1, 0, 0, 0, self.revision]
+    }
+}
+
+/// Why bytes are not the message, or the part of one, a reader expected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParseError {
+    /// A message of more than [`MAX_MESSAGE`] bytes, a message whose
+    /// fields (which may overlap) would not fit in that when written
+    /// back, or an NT response of more than [`MAX_FIELD`].
+    TooLong,
+    /// Fewer bytes than the fixed part of the message, or of the
+    /// structure, needs.
+    Truncated,
+    /// The first 8 bytes are not [`SIGNATURE`].
+    Signature,
+    /// A message type other than the one expected, or not one of the three.
+    MessageType(u32),
+    /// A payload field, named here, runs past the end of the message or
+    /// starts inside its fixed part.
+    Field(&'static str),
+    /// An AV pair's value runs past the end of the list, or the list ends
+    /// with no end marker.
+    AvPairs,
+    /// The end marker of an AV pair list has a length other than 0.
+    AvEolLength(u16),
+    /// More than [`MAX_AV_PAIRS`] pairs.
+    TooManyAvPairs,
+    /// A response with a length no layout has.
+    ResponseLength(usize),
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::TooLong => write!(f, "longer than {MAX_MESSAGE} bytes, or a response longer than {MAX_FIELD}"),
+            ParseError::Truncated => f.write_str("too short for its fixed fields"),
+            ParseError::Signature => f.write_str("does not start with NTLMSSP\\0"),
+            ParseError::MessageType(t) => write!(f, "message type {t} where another was expected"),
+            ParseError::Field(name) => write!(f, "the {name} field lies outside the message payload"),
+            ParseError::AvPairs => f.write_str("an AV pair list that runs past its end or has no end marker"),
+            ParseError::AvEolLength(n) => write!(f, "an AV pair end marker of length {n}, not 0"),
+            ParseError::TooManyAvPairs => write!(f, "more than {MAX_AV_PAIRS} AV pairs"),
+            ParseError::ResponseLength(n) => write!(f, "a response of {n} bytes, which no layout has"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Why a writer refused a value: its bytes would break the specification,
+/// or a reader would read them back as something else.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EncodeError {
+    /// A payload field, named here, longer than [`MAX_FIELD`].
+    FieldTooLong(&'static str),
+    /// A message longer than [`MAX_MESSAGE`].
+    TooLong,
+    /// A version given without the [`flags::NEGOTIATE_VERSION`] flag, or
+    /// the flag without a version.
+    VersionFlag,
+    /// An AV pair with the end marker's ID, which would end the list early.
+    AvEol,
+    /// An AV pair value longer than 65535 bytes.
+    AvValueTooLong,
+    /// More than [`MAX_AV_PAIRS`] pairs.
+    TooManyAvPairs,
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::FieldTooLong(name) => write!(f, "the {name} field is longer than {MAX_FIELD} bytes"),
+            EncodeError::TooLong => write!(f, "a message longer than {MAX_MESSAGE} bytes"),
+            EncodeError::VersionFlag => f.write_str("a version and the NEGOTIATE_VERSION flag must come together"),
+            EncodeError::AvEol => f.write_str("an AV pair with the end marker's ID"),
+            EncodeError::AvValueTooLong => f.write_str("an AV pair value longer than 65535 bytes"),
+            EncodeError::TooManyAvPairs => write!(f, "more than {MAX_AV_PAIRS} AV pairs"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+/// One attribute-value pair of a target info list.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct AvPair {
+    /// What the value is: one of the [`av_id`] numbers, or any other.
+    pub id: u16,
+    /// The value's bytes, at most 65535.
+    pub value: Vec<u8>,
+}
+
+impl AvPair {
+    /// Reads a list of pairs from the start of `b`, up to and including
+    /// the end marker. It returns the pairs, without the marker, and how
+    /// many bytes of `b` the list took. Bytes after the marker are left.
+    pub fn parse_list(b: &[u8]) -> Result<(Vec<AvPair>, usize), ParseError> {
+        let mut pairs = Vec::new();
+        let mut at = 0usize;
+        loop {
+            let Some(head) = b.get(at..at.checked_add(4).ok_or(ParseError::AvPairs)?) else {
+                return Err(ParseError::AvPairs);
+            };
+            let id = u16::from_le_bytes([head[0], head[1]]);
+            let len = u16::from_le_bytes([head[2], head[3]]);
+            at += 4;
+            if id == av_id::EOL {
+                if len != 0 {
+                    return Err(ParseError::AvEolLength(len));
+                }
+                return Ok((pairs, at));
+            }
+            let end = at.checked_add(usize::from(len)).ok_or(ParseError::AvPairs)?;
+            let Some(value) = b.get(at..end) else {
+                return Err(ParseError::AvPairs);
+            };
+            if pairs.len() >= MAX_AV_PAIRS {
+                return Err(ParseError::TooManyAvPairs);
+            }
+            pairs.push(AvPair { id, value: value.to_vec() });
+            at = end;
+        }
+    }
+
+    /// The bytes of a list of pairs, with the end marker added.
+    pub fn write_list(pairs: &[AvPair]) -> Result<Vec<u8>, EncodeError> {
+        if pairs.len() > MAX_AV_PAIRS {
+            return Err(EncodeError::TooManyAvPairs);
+        }
+        let mut total = 4usize;
+        for p in pairs {
+            if p.id == av_id::EOL {
+                return Err(EncodeError::AvEol);
+            }
+            if p.value.len() > usize::from(u16::MAX) {
+                return Err(EncodeError::AvValueTooLong);
+            }
+            total = total.saturating_add(4 + p.value.len());
+        }
+        let mut out = Vec::with_capacity(total.min(MAX_MESSAGE));
+        for p in pairs {
+            out.extend_from_slice(&p.id.to_le_bytes());
+            out.extend_from_slice(&(p.value.len() as u16).to_le_bytes());
+            out.extend_from_slice(&p.value);
+        }
+        out.extend_from_slice(&[0, 0, 0, 0]);
+        Ok(out)
+    }
+
+    /// The first pair in `pairs` with ID `id`.
+    pub fn find(pairs: &[AvPair], id: u16) -> Option<&AvPair> {
+        pairs.iter().find(|p| p.id == id)
+    }
+}
+
+/// The NEGOTIATE message: what the client supports, and optionally its
+/// domain and workstation names. The default has no flags, no names and
+/// no version, and writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Negotiate {
+    /// The negotiate flags, from [`flags`].
+    pub flags: u32,
+    /// The client's domain name in the OEM code page. Usually empty.
+    pub domain: Vec<u8>,
+    /// The client's workstation name in the OEM code page. Usually empty.
+    pub workstation: Vec<u8>,
+    /// The client's version, present exactly when `flags` has
+    /// [`flags::NEGOTIATE_VERSION`].
+    pub version: Option<Version>,
+}
+
+/// The CHALLENGE message: the server's answer, with the random bytes the
+/// client's responses are computed from. The default is all zeros and
+/// empty fields, and writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Challenge {
+    /// The negotiate flags the server chose, from [`flags`].
+    pub flags: u32,
+    /// The server's name or domain, UTF-16LE or OEM as `flags` says.
+    pub target_name: Vec<u8>,
+    /// The 8 random bytes the client must answer.
+    pub server_challenge: [u8; 8],
+    /// The bytes of an AV pair list; read them with [`AvPair::parse_list`]
+    /// and write them with [`AvPair::write_list`]. Kept as bytes, since
+    /// the client copies them into its NTLMv2 response.
+    pub target_info: Vec<u8>,
+    /// The server's version, present exactly when `flags` has
+    /// [`flags::NEGOTIATE_VERSION`].
+    pub version: Option<Version>,
+}
+
+/// The AUTHENTICATE message: who the user is, and the responses that
+/// prove it. The default is an empty message with no version or MIC, and
+/// writes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Authenticate {
+    /// The negotiate flags, from [`flags`].
+    pub flags: u32,
+    /// The LM response; see [`LmV2Response`]. Often 24 zeros or empty.
+    pub lm_response: Vec<u8>,
+    /// The NT response; read it with [`NtResponse::parse`].
+    pub nt_response: Vec<u8>,
+    /// The user's domain, UTF-16LE or OEM as `flags` says.
+    pub domain: Vec<u8>,
+    /// The user name, UTF-16LE or OEM as `flags` says.
+    pub user: Vec<u8>,
+    /// The client's workstation name, UTF-16LE or OEM as `flags` says.
+    pub workstation: Vec<u8>,
+    /// The encrypted random session key, when keys are exchanged.
+    pub session_key: Vec<u8>,
+    /// The client's version, present exactly when `flags` has
+    /// [`flags::NEGOTIATE_VERSION`].
+    pub version: Option<Version>,
+    /// The message integrity code, at bytes 72 to 88. Readers find it when
+    /// the payload starts at byte 88 or later; nothing in the message says
+    /// more plainly whether one is there.
+    pub mic: Option<[u8; MIC_LEN]>,
+}
+
+/// Any of the three messages.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Message {
+    /// Message type 1.
+    Negotiate(Negotiate),
+    /// Message type 2.
+    Challenge(Challenge),
+    /// Message type 3.
+    Authenticate(Authenticate),
+}
+
+fn le16(b: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([b[at], b[at + 1]])
+}
+
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+/// Checks the signature and the message type, and that `b` holds `fixed`
+/// bytes. It returns the flags at `flags_at` and where the payload may
+/// start, past the version if the flags say there is one.
+fn header(b: &[u8], kind: u32, fixed: usize, flags_at: usize) -> Result<(u32, Option<Version>, usize), ParseError> {
+    if b.len() > MAX_MESSAGE {
+        return Err(ParseError::TooLong);
+    }
+    let n = b.len().min(SIGNATURE.len());
+    if b[..n] != SIGNATURE[..n] {
+        return Err(ParseError::Signature);
+    }
+    if b.len() < 12 {
+        return Err(ParseError::Truncated);
+    }
+    let t = le32(b, 8);
+    if t != kind {
+        return Err(ParseError::MessageType(t));
+    }
+    if b.len() < fixed {
+        return Err(ParseError::Truncated);
+    }
+    let flags = le32(b, flags_at);
+    if flags & flags::NEGOTIATE_VERSION == 0 {
+        return Ok((flags, None, fixed));
+    }
+    let end = fixed + VERSION_LEN;
+    let Some(v) = b.get(fixed..end) else {
+        return Err(ParseError::Truncated);
+    };
+    let mut bytes = [0u8; VERSION_LEN];
+    bytes.copy_from_slice(v);
+    Ok((flags, Some(Version::from_bytes(bytes)), end))
+}
+
+/// Where the payload field described at `at` starts, if it is not empty.
+fn field_offset(b: &[u8], at: usize) -> Option<usize> {
+    (le16(b, at) != 0).then(|| le32(b, at + 4) as usize)
+}
+
+/// The payload field described at `at`: a length, a maximum length (not
+/// read) and an offset. A field that is not empty must lie between `start`
+/// and the end of `b`.
+fn field(b: &[u8], at: usize, start: usize, name: &'static str) -> Result<Vec<u8>, ParseError> {
+    let len = usize::from(le16(b, at));
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = le32(b, at + 4) as usize;
+    if offset < start {
+        return Err(ParseError::Field(name));
+    }
+    let end = offset.checked_add(len).ok_or(ParseError::Field(name))?;
+    b.get(offset..end).map(<[u8]>::to_vec).ok_or(ParseError::Field(name))
+}
+
+/// Checks that the version matches the flags.
+fn check_version(flags: u32, version: Option<Version>) -> Result<(), EncodeError> {
+    if version.is_some() != (flags & flags::NEGOTIATE_VERSION != 0) {
+        return Err(EncodeError::VersionFlag);
+    }
+    Ok(())
+}
+
+/// How long a message is once written: `fixed` bytes, then each field
+/// that is not empty, from an even offset. \[MS-NLMP\] wants Unicode
+/// strings at even offsets, so writers pad one zero byte where needed.
+/// Readers use this too, so that whatever they accept can be written back.
+fn written_len(fixed: usize, lens: &[usize]) -> usize {
+    let mut n = fixed;
+    for &len in lens {
+        if len != 0 {
+            n = n.saturating_add(n % 2).saturating_add(len);
+        }
+    }
+    n
+}
+
+/// Appends the payload fields to `out`, which holds the fixed part, and
+/// fills in each field's length, maximum length and offset at its slot.
+/// Each field that is not empty starts at an even offset.
+fn put_fields(out: &mut Vec<u8>, fields: &[(usize, &[u8], &'static str)]) -> Result<(), EncodeError> {
+    let mut lens = [0usize; 6];
+    for (i, &(_, data, name)) in fields.iter().enumerate() {
+        if data.len() > MAX_FIELD {
+            return Err(EncodeError::FieldTooLong(name));
+        }
+        if let Some(l) = lens.get_mut(i) {
+            *l = data.len();
+        }
+    }
+    let total = written_len(out.len(), &lens[..fields.len().min(lens.len())]);
+    if total > MAX_MESSAGE {
+        return Err(EncodeError::TooLong);
+    }
+    out.reserve(total - out.len());
+    for &(slot, data, _) in fields {
+        if !data.is_empty() && out.len() % 2 == 1 {
+            out.push(0);
+        }
+        let len = (data.len() as u16).to_le_bytes();
+        let offset = (out.len() as u32).to_le_bytes();
+        out[slot..slot + 2].copy_from_slice(&len);
+        out[slot + 2..slot + 4].copy_from_slice(&len);
+        out[slot + 4..slot + 8].copy_from_slice(&offset);
+        out.extend_from_slice(data);
+    }
+    Ok(())
+}
+
+/// Checks that fields read from a message, after a fixed part of `fixed`
+/// bytes, would fit in [`MAX_MESSAGE`] when written back. Fields may
+/// overlap in what an agent sends, so their total can exceed the message.
+fn check_written(fixed: usize, fields: &[&[u8]]) -> Result<(), ParseError> {
+    let mut lens = [0usize; 6];
+    for (l, f) in lens.iter_mut().zip(fields) {
+        *l = f.len();
+    }
+    if written_len(fixed, &lens[..fields.len().min(lens.len())]) > MAX_MESSAGE {
+        return Err(ParseError::TooLong);
+    }
+    Ok(())
+}
+
+/// The first bytes of a message: signature and type, then zeros up to
+/// `fixed`, the flags at `flags_at`, and the version if there is one.
+fn start(kind: u32, fixed: usize, flags_at: usize, flags: u32, version: Option<Version>) -> Vec<u8> {
+    let mut out = vec![0u8; fixed];
+    out[..8].copy_from_slice(&SIGNATURE);
+    out[8..12].copy_from_slice(&kind.to_le_bytes());
+    out[flags_at..flags_at + 4].copy_from_slice(&flags.to_le_bytes());
+    if let Some(v) = version {
+        out.extend_from_slice(&v.to_bytes());
+    }
+    out
+}
+
+impl Negotiate {
+    /// Reads a NEGOTIATE message. Bytes past the payload are ignored.
+    pub fn parse(b: &[u8]) -> Result<Negotiate, ParseError> {
+        let (flags, version, start) = header(b, message_type::NEGOTIATE, NEGOTIATE_HEADER_LEN, 12)?;
+        let n = Negotiate {
+            flags,
+            domain: field(b, 16, start, "domain")?,
+            workstation: field(b, 24, start, "workstation")?,
+            version,
+        };
+        check_written(start, &[&n.domain, &n.workstation])?;
+        Ok(n)
+    }
+
+    /// The message's bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        check_version(self.flags, self.version)?;
+        let mut out = start(message_type::NEGOTIATE, NEGOTIATE_HEADER_LEN, 12, self.flags, self.version);
+        put_fields(&mut out, &[(16, &self.domain, "domain"), (24, &self.workstation, "workstation")])?;
+        Ok(out)
+    }
+}
+
+impl Challenge {
+    /// Reads a CHALLENGE message. Bytes past the payload are ignored, and
+    /// so are the 8 reserved bytes.
+    pub fn parse(b: &[u8]) -> Result<Challenge, ParseError> {
+        let (flags, version, start) = header(b, message_type::CHALLENGE, CHALLENGE_HEADER_LEN, 20)?;
+        let mut server_challenge = [0u8; 8];
+        server_challenge.copy_from_slice(&b[24..32]);
+        let c = Challenge {
+            flags,
+            target_name: field(b, 12, start, "target name")?,
+            server_challenge,
+            target_info: field(b, 40, start, "target info")?,
+            version,
+        };
+        check_written(start, &[&c.target_name, &c.target_info])?;
+        Ok(c)
+    }
+
+    /// The message's bytes. The reserved bytes are written as zeros.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        check_version(self.flags, self.version)?;
+        let mut out = start(message_type::CHALLENGE, CHALLENGE_HEADER_LEN, 20, self.flags, self.version);
+        out[24..32].copy_from_slice(&self.server_challenge);
+        put_fields(&mut out, &[(12, &self.target_name, "target name"), (40, &self.target_info, "target info")])?;
+        Ok(out)
+    }
+
+    /// The AV pairs of the target info, read with [`AvPair::parse_list`].
+    /// Bytes after the end marker are ignored.
+    pub fn target_info_pairs(&self) -> Result<Vec<AvPair>, ParseError> {
+        AvPair::parse_list(&self.target_info).map(|(pairs, _)| pairs)
+    }
+}
+
+/// Where each AUTHENTICATE payload field is described, and its name.
+const AUTH_FIELDS: [(usize, &str); 6] =
+    [(12, "LM response"), (20, "NT response"), (28, "domain"), (36, "user"), (44, "workstation"), (52, "session key")];
+
+impl Authenticate {
+    /// Reads an AUTHENTICATE message. Bytes past the payload are ignored.
+    /// The MIC sits at bytes 72 to 88, after the version, whose 8 bytes
+    /// are there (as zeros) even when the flags say there is none. It is
+    /// read when the payload (or, with every field empty, the message)
+    /// starts at byte 88 or later.
+    pub fn parse(b: &[u8]) -> Result<Authenticate, ParseError> {
+        let (flags, version, mut start) = header(b, message_type::AUTHENTICATE, AUTHENTICATE_HEADER_LEN, 60)?;
+        let mut mic = None;
+        let first = AUTH_FIELDS.iter().filter_map(|&(at, _)| field_offset(b, at)).min().unwrap_or(b.len());
+        if first >= MIC_END && b.len() >= MIC_END {
+            let mut m = [0u8; MIC_LEN];
+            m.copy_from_slice(&b[MIC_END - MIC_LEN..MIC_END]);
+            mic = Some(m);
+            start = MIC_END;
+        }
+        let [lm, nt, domain, user, workstation, key] = AUTH_FIELDS;
+        let a = Authenticate {
+            flags,
+            lm_response: field(b, lm.0, start, lm.1)?,
+            nt_response: field(b, nt.0, start, nt.1)?,
+            domain: field(b, domain.0, start, domain.1)?,
+            user: field(b, user.0, start, user.1)?,
+            workstation: field(b, workstation.0, start, workstation.1)?,
+            session_key: field(b, key.0, start, key.1)?,
+            version,
+            mic,
+        };
+        check_written(start, &a.fields())?;
+        Ok(a)
+    }
+
+    /// The NT response, read with [`NtResponse::parse`].
+    pub fn nt(&self) -> Result<NtResponse, ParseError> {
+        NtResponse::parse(&self.nt_response)
+    }
+
+    /// A copy of the AUTHENTICATE message `b` with its MIC set to zeros,
+    /// as the MIC is computed over it. `None` if `b` does not read as an
+    /// AUTHENTICATE message with a MIC.
+    pub fn zero_mic(b: &[u8]) -> Option<Vec<u8>> {
+        Authenticate::parse(b).ok()?.mic?;
+        let mut out = b.to_vec();
+        out.get_mut(MIC_END - MIC_LEN..MIC_END)?.fill(0);
+        Some(out)
+    }
+
+    /// The six payload fields, in the order the message describes them.
+    fn fields(&self) -> [&[u8]; 6] {
+        [&self.lm_response, &self.nt_response, &self.domain, &self.user, &self.workstation, &self.session_key]
+    }
+
+    /// The message's bytes. A MIC with no version gets 8 zero bytes in
+    /// the version's place before it.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        check_version(self.flags, self.version)?;
+        let mut out = start(message_type::AUTHENTICATE, AUTHENTICATE_HEADER_LEN, 60, self.flags, self.version);
+        if let Some(m) = self.mic {
+            out.resize(MIC_END - MIC_LEN, 0);
+            out.extend_from_slice(&m);
+        }
+        let data = self.fields();
+        let mut fields = [(0usize, &[][..], ""); 6];
+        for (i, f) in fields.iter_mut().enumerate() {
+            *f = (AUTH_FIELDS[i].0, data[i], AUTH_FIELDS[i].1);
+        }
+        put_fields(&mut out, &fields)?;
+        Ok(out)
+    }
+}
+
+impl Message {
+    /// Reads a message of any of the three types.
+    pub fn parse(b: &[u8]) -> Result<Message, ParseError> {
+        if b.len() > MAX_MESSAGE {
+            return Err(ParseError::TooLong);
+        }
+        let n = b.len().min(SIGNATURE.len());
+        if b[..n] != SIGNATURE[..n] {
+            return Err(ParseError::Signature);
+        }
+        if b.len() < 12 {
+            return Err(ParseError::Truncated);
+        }
+        match le32(b, 8) {
+            message_type::NEGOTIATE => Negotiate::parse(b).map(Message::Negotiate),
+            message_type::CHALLENGE => Challenge::parse(b).map(Message::Challenge),
+            message_type::AUTHENTICATE => Authenticate::parse(b).map(Message::Authenticate),
+            t => Err(ParseError::MessageType(t)),
+        }
+    }
+
+    /// The message's bytes.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        match self {
+            Message::Negotiate(m) => m.to_bytes(),
+            Message::Challenge(m) => m.to_bytes(),
+            Message::Authenticate(m) => m.to_bytes(),
+        }
+    }
+
+    /// The message's type number, from [`message_type`].
+    pub fn message_type(&self) -> u32 {
+        match self {
+            Message::Negotiate(_) => message_type::NEGOTIATE,
+            Message::Challenge(_) => message_type::CHALLENGE,
+            Message::Authenticate(_) => message_type::AUTHENTICATE,
+        }
+    }
+
+    /// The message's flags.
+    pub fn flags(&self) -> u32 {
+        match self {
+            Message::Negotiate(m) => m.flags,
+            Message::Challenge(m) => m.flags,
+            Message::Authenticate(m) => m.flags,
+        }
+    }
+}
+
+/// An LMv2 response: 16 bytes of HMAC, then the client's 8 random bytes.
+/// An LMv1 response has the same length, so which one a message carries
+/// is up to the flags and world code.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LmV2Response {
+    /// The HMAC-MD5 of the challenges.
+    pub response: [u8; 16],
+    /// The client's 8 random bytes.
+    pub client_challenge: [u8; 8],
+}
+
+impl LmV2Response {
+    /// Reads a 24-byte LMv2 response.
+    pub fn parse(b: &[u8]) -> Result<LmV2Response, ParseError> {
+        if b.len() != V1_RESPONSE_LEN {
+            return Err(ParseError::ResponseLength(b.len()));
+        }
+        let mut response = [0u8; 16];
+        response.copy_from_slice(&b[..16]);
+        let mut client_challenge = [0u8; 8];
+        client_challenge.copy_from_slice(&b[16..]);
+        Ok(LmV2Response { response, client_challenge })
+    }
+
+    /// The response's 24 bytes.
+    pub fn to_bytes(&self) -> [u8; V1_RESPONSE_LEN] {
+        let mut out = [0u8; V1_RESPONSE_LEN];
+        out[..16].copy_from_slice(&self.response);
+        out[16..].copy_from_slice(&self.client_challenge);
+        out
+    }
+}
+
+/// The client challenge blob of an NTLMv2 response (NTLMv2_CLIENT_CHALLENGE).
+/// Its reserved fields are not kept and are written as zeros.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ClientChallenge {
+    /// The response version, 1.
+    pub resp_type: u8,
+    /// The highest response version the client knows, 1.
+    pub hi_resp_type: u8,
+    /// The client's time, as a FILETIME: 100 ns units since 1601.
+    pub timestamp: u64,
+    /// The client's 8 random bytes.
+    pub challenge: [u8; 8],
+    /// The AV pairs, usually the server's target info with a few added.
+    pub av_pairs: Vec<AvPair>,
+    /// Bytes after the list's end marker. Windows sends 4 zeros.
+    pub trailing: Vec<u8>,
+}
+
+/// An NTLMv2 response: the NTProofStr, then the client challenge it was
+/// computed over.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NtlmV2Response {
+    /// The NTProofStr, an HMAC-MD5 of the challenges.
+    pub nt_proof: [u8; NT_PROOF_LEN],
+    /// The blob the proof covers.
+    pub client: ClientChallenge,
+}
+
+/// The NT response of an AUTHENTICATE message, by its layout.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum NtResponse {
+    /// No response: an anonymous login.
+    Empty,
+    /// An NTLMv1 response: 24 bytes.
+    V1([u8; V1_RESPONSE_LEN]),
+    /// An NTLMv2 response.
+    V2(NtlmV2Response),
+}
+
+impl NtResponse {
+    /// Reads an NT response: empty, 24 bytes for NTLMv1, or at least 48
+    /// for NTLMv2 (the proof, the fixed part of the blob and an end
+    /// marker).
+    pub fn parse(b: &[u8]) -> Result<NtResponse, ParseError> {
+        if b.is_empty() {
+            return Ok(NtResponse::Empty);
+        }
+        if b.len() == V1_RESPONSE_LEN {
+            let mut r = [0u8; V1_RESPONSE_LEN];
+            r.copy_from_slice(b);
+            return Ok(NtResponse::V1(r));
+        }
+        if b.len() > MAX_FIELD {
+            return Err(ParseError::TooLong);
+        }
+        let blob_at = NT_PROOF_LEN;
+        let pairs_at = blob_at + CLIENT_CHALLENGE_HEADER_LEN;
+        if b.len() < pairs_at + 4 {
+            return Err(ParseError::ResponseLength(b.len()));
+        }
+        let mut nt_proof = [0u8; NT_PROOF_LEN];
+        nt_proof.copy_from_slice(&b[..blob_at]);
+        let blob = &b[blob_at..];
+        let mut ts = [0u8; 8];
+        ts.copy_from_slice(&blob[8..16]);
+        let mut challenge = [0u8; 8];
+        challenge.copy_from_slice(&blob[16..24]);
+        let (av_pairs, used) = AvPair::parse_list(&b[pairs_at..])?;
+        Ok(NtResponse::V2(NtlmV2Response {
+            nt_proof,
+            client: ClientChallenge {
+                resp_type: blob[0],
+                hi_resp_type: blob[1],
+                timestamp: u64::from_le_bytes(ts),
+                challenge,
+                av_pairs,
+                trailing: b[pairs_at + used..].to_vec(),
+            },
+        }))
+    }
+
+    /// The response's bytes, at most [`MAX_FIELD`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        match self {
+            NtResponse::Empty => Ok(Vec::new()),
+            NtResponse::V1(r) => Ok(r.to_vec()),
+            NtResponse::V2(v2) => {
+                let c = &v2.client;
+                let pairs = AvPair::write_list(&c.av_pairs)?;
+                let len = NT_PROOF_LEN + CLIENT_CHALLENGE_HEADER_LEN;
+                let total = len.saturating_add(pairs.len()).saturating_add(c.trailing.len());
+                if total > MAX_FIELD {
+                    return Err(EncodeError::FieldTooLong("NT response"));
+                }
+                let mut out = Vec::with_capacity(total);
+                out.extend_from_slice(&v2.nt_proof);
+                out.extend_from_slice(&[c.resp_type, c.hi_resp_type, 0, 0, 0, 0, 0, 0]);
+                out.extend_from_slice(&c.timestamp.to_le_bytes());
+                out.extend_from_slice(&c.challenge);
+                out.extend_from_slice(&[0, 0, 0, 0]);
+                out.extend_from_slice(&pairs);
+                out.extend_from_slice(&c.trailing);
+                Ok(out)
+            }
+        }
+    }
+}
+
+/// A string's UTF-16LE bytes, as Unicode NTLM messages carry names.
+pub fn encode_utf16le(s: &str) -> Vec<u8> {
+    s.encode_utf16().flat_map(u16::to_le_bytes).collect()
+}
+
+/// The string UTF-16LE bytes spell, or `None` if their length is odd or
+/// they are not valid UTF-16.
+pub fn decode_utf16le(b: &[u8]) -> Option<String> {
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
+    let units = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
+    char::decode_utf16(units).collect::<Result<String, _>>().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CHALLENGE message from \[MS-NLMP\] section 4.2.4.3.
+    const SPEC_CHALLENGE: [u8; 104] = [
+        0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x0c, 0x00, //
+        0x38, 0x00, 0x00, 0x00, 0x33, 0x82, 0x8a, 0xe2, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, //
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x24, 0x00, 0x24, 0x00, 0x44, 0x00, 0x00, 0x00, //
+        0x06, 0x00, 0x70, 0x17, 0x00, 0x00, 0x00, 0x0f, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, //
+        0x65, 0x00, 0x72, 0x00, 0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, //
+        0x69, 0x00, 0x6e, 0x00, 0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, //
+        0x65, 0x00, 0x72, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    #[test]
+    fn spec_challenge() {
+        let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
+        assert_eq!(c.flags, 0xe28a_8233);
+        assert_ne!(c.flags & flags::NEGOTIATE_VERSION, 0);
+        assert_ne!(c.flags & flags::NEGOTIATE_TARGET_INFO, 0);
+        assert_eq!(c.server_challenge, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+        assert_eq!(c.version, Some(Version { major: 6, minor: 0, build: 6000, revision: NTLMSSP_REVISION_W2K3 }));
+        assert_eq!(decode_utf16le(&c.target_name).as_deref(), Some("Server"));
+        let (pairs, used) = AvPair::parse_list(&c.target_info).unwrap();
+        assert_eq!(used, c.target_info.len());
+        assert_eq!(
+            pairs,
+            vec![
+                AvPair { id: av_id::NB_DOMAIN_NAME, value: encode_utf16le("Domain") },
+                AvPair { id: av_id::NB_COMPUTER_NAME, value: encode_utf16le("Server") },
+            ]
+        );
+        assert_eq!(AvPair::write_list(&pairs).unwrap(), c.target_info);
+        // Written back, it is the same bytes.
+        assert_eq!(c.to_bytes().unwrap(), SPEC_CHALLENGE);
+        assert_eq!(Message::parse(&SPEC_CHALLENGE), Ok(Message::Challenge(c)));
+    }
+
+    /// The AUTHENTICATE message from \[MS-NLMP\] section 4.2.4.3.
+    const SPEC_AUTHENTICATE: [u8; 232] = [
+        0x4e, 0x54, 0x4c, 0x4d, 0x53, 0x53, 0x50, 0x00, 0x03, 0x00, 0x00, 0x00, 0x18, 0x00, 0x18, 0x00, //
+        0x6c, 0x00, 0x00, 0x00, 0x54, 0x00, 0x54, 0x00, 0x84, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x0c, 0x00, //
+        0x48, 0x00, 0x00, 0x00, 0x08, 0x00, 0x08, 0x00, 0x54, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, //
+        0x5c, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0xd8, 0x00, 0x00, 0x00, 0x35, 0x82, 0x88, 0xe2, //
+        0x05, 0x01, 0x28, 0x0a, 0x00, 0x00, 0x00, 0x0f, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, //
+        0x69, 0x00, 0x6e, 0x00, 0x55, 0x00, 0x73, 0x00, 0x65, 0x00, 0x72, 0x00, 0x43, 0x00, 0x4f, 0x00, //
+        0x4d, 0x00, 0x50, 0x00, 0x55, 0x00, 0x54, 0x00, 0x45, 0x00, 0x52, 0x00, 0x86, 0xc3, 0x50, 0x97, //
+        0xac, 0x9c, 0xec, 0x10, 0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc, 0xcc, 0x19, 0xaa, 0xaa, 0xaa, 0xaa, //
+        0xaa, 0xaa, 0xaa, 0xaa, 0x68, 0xcd, 0x0a, 0xb8, 0x51, 0xe5, 0x1c, 0x96, 0xaa, 0xbc, 0x92, 0x7b, //
+        0xeb, 0xef, 0x6a, 0x1c, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, //
+        0x00, 0x00, 0x00, 0x00, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0x00, 0x00, 0x00, 0x00, //
+        0x02, 0x00, 0x0c, 0x00, 0x44, 0x00, 0x6f, 0x00, 0x6d, 0x00, 0x61, 0x00, 0x69, 0x00, 0x6e, 0x00, //
+        0x01, 0x00, 0x0c, 0x00, 0x53, 0x00, 0x65, 0x00, 0x72, 0x00, 0x76, 0x00, 0x65, 0x00, 0x72, 0x00, //
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc5, 0xda, 0xd2, 0x54, 0x4f, 0xc9, 0x79, 0x90, //
+        0x94, 0xce, 0x1c, 0xe9, 0x0b, 0xc9, 0xd0, 0x3e, //
+    ];
+
+    #[test]
+    fn spec_authenticate() {
+        let a = Authenticate::parse(&SPEC_AUTHENTICATE).unwrap();
+        assert_eq!(a.flags, 0xe288_8235);
+        assert_eq!(a.version, Some(Version { major: 5, minor: 1, build: 2600, revision: NTLMSSP_REVISION_W2K3 }));
+        // The payload starts right after the version, so there is no MIC.
+        assert_eq!(a.mic, None);
+        assert_eq!(decode_utf16le(&a.domain).as_deref(), Some("Domain"));
+        assert_eq!(decode_utf16le(&a.user).as_deref(), Some("User"));
+        assert_eq!(decode_utf16le(&a.workstation).as_deref(), Some("COMPUTER"));
+        assert_eq!(a.session_key, SPEC_AUTHENTICATE[0xd8..].to_vec());
+        let lm = LmV2Response::parse(&a.lm_response).unwrap();
+        assert_eq!(lm.client_challenge, [0xaa; 8]);
+        let NtResponse::V2(v2) = NtResponse::parse(&a.nt_response).unwrap() else { panic!() };
+        assert_eq!(v2.nt_proof[..4], [0x68, 0xcd, 0x0a, 0xb8]);
+        assert_eq!((v2.client.resp_type, v2.client.hi_resp_type, v2.client.timestamp), (1, 1, 0));
+        assert_eq!(v2.client.challenge, [0xaa; 8]);
+        // The client copied the server's target info into its blob.
+        let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
+        assert_eq!(v2.client.av_pairs, AvPair::parse_list(&c.target_info).unwrap().0);
+        assert_eq!(v2.client.trailing, vec![0; 4]);
+        assert_eq!(NtResponse::V2(v2).to_bytes().unwrap(), a.nt_response);
+        // Written back, the fields are in another order, and read the same.
+        let b = a.to_bytes().unwrap();
+        assert_eq!(b.len(), SPEC_AUTHENTICATE.len());
+        assert_eq!(Message::parse(&b), Ok(Message::Authenticate(a)));
+    }
+
+    #[test]
+    fn spec_lmv2_response() {
+        // The LMv2 response from \[MS-NLMP\] section 4.2.4.2.1.
+        let b = [
+            0x86, 0xc3, 0x50, 0x97, 0xac, 0x9c, 0xec, 0x10, 0x25, 0x54, 0x76, 0x4a, 0x57, 0xcc, 0xcc, 0x19, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        ];
+        let r = LmV2Response::parse(&b).unwrap();
+        assert_eq!(r.client_challenge, [0xaa; 8]);
+        assert_eq!(r.response[0], 0x86);
+        assert_eq!(r.to_bytes(), b);
+        assert_eq!(LmV2Response::parse(&b[..23]), Err(ParseError::ResponseLength(23)));
+    }
+
+    #[test]
+    fn negotiate_layout() {
+        let n = Negotiate {
+            flags: flags::NEGOTIATE_UNICODE | flags::NEGOTIATE_OEM_DOMAIN_SUPPLIED | flags::NEGOTIATE_VERSION,
+            domain: b"CORP".to_vec(),
+            workstation: Vec::new(),
+            version: Some(Version { major: 10, minor: 0, build: 19041, revision: 15 }),
+        };
+        let b = n.to_bytes().unwrap();
+        assert_eq!(&b[..12], b"NTLMSSP\0\x01\0\0\0");
+        assert_eq!(le32(&b, 12), n.flags);
+        // Domain: length 4, maximum 4, at 40, after the version.
+        assert_eq!(&b[16..24], &[4, 0, 4, 0, 40, 0, 0, 0]);
+        assert_eq!(&b[32..40], &[10, 0, 0x61, 0x4a, 0, 0, 0, 15]);
+        assert_eq!(&b[40..], b"CORP");
+        assert_eq!(Negotiate::parse(&b), Ok(n));
+    }
+
+    #[test]
+    fn authenticate_layout_with_mic() {
+        let a = Authenticate {
+            flags: flags::NEGOTIATE_VERSION | flags::NEGOTIATE_UNICODE,
+            lm_response: vec![0; 24],
+            nt_response: vec![7; 24],
+            domain: encode_utf16le("D"),
+            user: encode_utf16le("u"),
+            workstation: Vec::new(),
+            session_key: vec![5; 16],
+            version: Some(Version { major: 6, minor: 1, build: 7601, revision: 15 }),
+            mic: Some([0x11; 16]),
+        };
+        let b = a.to_bytes().unwrap();
+        assert_eq!(le32(&b, 8), message_type::AUTHENTICATE);
+        assert_eq!(le32(&b, 60), a.flags);
+        assert_eq!(&b[72..88], &[0x11; 16]);
+        // The LM response is first, right after the MIC.
+        assert_eq!(&b[12..20], &[24, 0, 24, 0, 88, 0, 0, 0]);
+        assert_eq!(Authenticate::parse(&b), Ok(a.clone()));
+        // With no MIC, the payload starts at 72 and none is read.
+        let no_mic = Authenticate { mic: None, ..a.clone() };
+        let b = no_mic.to_bytes().unwrap();
+        assert_eq!(&b[12..20], &[24, 0, 24, 0, 72, 0, 0, 0]);
+        assert_eq!(Authenticate::parse(&b), Ok(no_mic));
+        // Every field empty: the message's length tells.
+        let empty = Authenticate {
+            lm_response: Vec::new(),
+            nt_response: Vec::new(),
+            domain: Vec::new(),
+            user: Vec::new(),
+            session_key: Vec::new(),
+            ..a
+        };
+        assert_eq!(Authenticate::parse(&empty.to_bytes().unwrap()), Ok(empty.clone()));
+        let empty = Authenticate { mic: None, ..empty };
+        assert_eq!(Authenticate::parse(&empty.to_bytes().unwrap()), Ok(empty));
+    }
+
+    #[test]
+    fn nt_responses() {
+        assert_eq!(NtResponse::parse(&[]), Ok(NtResponse::Empty));
+        assert_eq!(NtResponse::parse(&[3; 24]), Ok(NtResponse::V1([3; 24])));
+        assert_eq!(NtResponse::parse(&[3; 25]), Err(ParseError::ResponseLength(25)));
+        assert_eq!(NtResponse::parse(&[3; 47]), Err(ParseError::ResponseLength(47)));
+        // The layout of \[MS-NLMP\] section 2.2.2.7, with Windows' 4 zeros
+        // after the list.
+        let mut b = vec![0xee; 16];
+        b.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&0x01d0_0000_0000_0000u64.to_le_bytes());
+        b.extend_from_slice(&[0xaa; 8]);
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        b.extend_from_slice(&[6, 0, 4, 0, 2, 0, 0, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        let NtResponse::V2(v2) = NtResponse::parse(&b).unwrap() else { panic!() };
+        assert_eq!(v2.nt_proof, [0xee; 16]);
+        assert_eq!((v2.client.resp_type, v2.client.hi_resp_type), (1, 1));
+        assert_eq!(v2.client.timestamp, 0x01d0_0000_0000_0000);
+        assert_eq!(v2.client.challenge, [0xaa; 8]);
+        assert_eq!(v2.client.av_pairs, vec![AvPair { id: av_id::FLAGS, value: vec![2, 0, 0, 0] }]);
+        assert_eq!(v2.client.trailing, vec![0, 0, 0, 0]);
+        assert_eq!(NtResponse::V2(v2).to_bytes().unwrap(), b);
+        // A list with no end marker.
+        assert_eq!(NtResponse::parse(&b[..b.len() - 8]), Err(ParseError::AvPairs));
+        assert_eq!(NtResponse::parse(&vec![0; MAX_FIELD + 1]), Err(ParseError::TooLong));
+    }
+
+    #[test]
+    fn av_pair_errors() {
+        assert_eq!(AvPair::parse_list(&[]), Err(ParseError::AvPairs));
+        assert_eq!(AvPair::parse_list(&[0, 0, 0]), Err(ParseError::AvPairs));
+        assert_eq!(AvPair::parse_list(&[0, 0, 1, 0, 9]), Err(ParseError::AvEolLength(1)));
+        assert_eq!(AvPair::parse_list(&[1, 0, 2, 0, 9]), Err(ParseError::AvPairs));
+        assert_eq!(
+            AvPair::parse_list(&[1, 0, 1, 0, 9, 0, 0, 0, 0, 7]),
+            Ok((vec![AvPair { id: 1, value: vec![9] }], 9))
+        );
+        let many = vec![AvPair { id: 1, value: Vec::new() }; MAX_AV_PAIRS + 1];
+        assert_eq!(AvPair::write_list(&many), Err(EncodeError::TooManyAvPairs));
+        let mut b = Vec::new();
+        for _ in 0..=MAX_AV_PAIRS {
+            b.extend_from_slice(&[1, 0, 0, 0]);
+        }
+        b.extend_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(AvPair::parse_list(&b), Err(ParseError::TooManyAvPairs));
+        assert_eq!(AvPair::parse_list(&b[4..]).unwrap().0.len(), MAX_AV_PAIRS);
+        assert_eq!(AvPair::write_list(&[AvPair { id: 0, value: Vec::new() }]), Err(EncodeError::AvEol));
+        let big = AvPair { id: 1, value: vec![0; 65536] };
+        assert_eq!(AvPair::write_list(&[big]), Err(EncodeError::AvValueTooLong));
+        let pairs = [AvPair { id: 9, value: vec![1] }, AvPair { id: 9, value: vec![2] }];
+        assert_eq!(AvPair::find(&pairs, 9), Some(&pairs[0]));
+        assert_eq!(AvPair::find(&pairs, 3), None);
+    }
+
+    #[test]
+    fn parse_errors() {
+        let n = Negotiate { flags: 0, domain: b"AB".to_vec(), workstation: Vec::new(), version: None };
+        let good = n.to_bytes().unwrap();
+        assert_eq!(Message::parse(&vec![0; MAX_MESSAGE + 1]), Err(ParseError::TooLong));
+        assert_eq!(Negotiate::parse(&vec![0; MAX_MESSAGE + 1]), Err(ParseError::TooLong));
+        assert_eq!(Message::parse(b"NTLMSSX\0\x01\0\0\0"), Err(ParseError::Signature));
+        assert_eq!(Message::parse(b"X"), Err(ParseError::Signature));
+        assert_eq!(Message::parse(b"NTLM"), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(b"NTLMSSP\0\x04\0\0\0"), Err(ParseError::MessageType(4)));
+        assert_eq!(Challenge::parse(&good), Err(ParseError::MessageType(1)));
+        assert_eq!(Authenticate::parse(&good), Err(ParseError::MessageType(1)));
+        assert_eq!(Negotiate::parse(&good[..31]), Err(ParseError::Truncated));
+        // The version flag set with no room for the version.
+        let mut b = good[..32].to_vec();
+        b[12..16].copy_from_slice(&flags::NEGOTIATE_VERSION.to_le_bytes());
+        b[16..24].fill(0);
+        assert_eq!(Negotiate::parse(&b), Err(ParseError::Truncated));
+        // A field past the end, and one inside the fixed part.
+        assert_eq!(Negotiate::parse(&good[..33]), Err(ParseError::Field("domain")));
+        let mut b = good.clone();
+        b[20] = 8;
+        assert_eq!(Negotiate::parse(&b), Err(ParseError::Field("domain")));
+        // An offset so large the end overflows on 32-bit targets is still
+        // only out of bounds.
+        b[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(Negotiate::parse(&b), Err(ParseError::Field("domain")));
+        // An empty field's offset is not read.
+        let mut b = good.clone();
+        b[24..32].copy_from_slice(&[0, 0, 9, 9, 0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(Negotiate::parse(&b), Ok(n));
+        // A challenge whose target info is out of bounds.
+        let mut b = SPEC_CHALLENGE.to_vec();
+        b.pop();
+        assert_eq!(Challenge::parse(&b), Err(ParseError::Field("target info")));
+    }
+
+    #[test]
+    fn encode_errors() {
+        let n =
+            Negotiate { flags: flags::NEGOTIATE_VERSION, domain: Vec::new(), workstation: Vec::new(), version: None };
+        assert_eq!(n.to_bytes(), Err(EncodeError::VersionFlag));
+        let v = Version { major: 1, minor: 2, build: 3, revision: 4 };
+        let n = Negotiate { flags: 0, version: Some(v), ..n };
+        assert_eq!(n.to_bytes(), Err(EncodeError::VersionFlag));
+        let n = Negotiate { flags: 0, version: None, domain: vec![0; MAX_FIELD + 1], workstation: Vec::new() };
+        assert_eq!(n.to_bytes(), Err(EncodeError::FieldTooLong("domain")));
+        let a = Authenticate {
+            flags: 0,
+            lm_response: Vec::new(),
+            nt_response: Vec::new(),
+            domain: Vec::new(),
+            user: Vec::new(),
+            workstation: Vec::new(),
+            session_key: Vec::new(),
+            version: None,
+            mic: Some([0; 16]),
+        };
+        // A MIC with no version: 8 zero bytes stand in for the version.
+        let b = a.to_bytes().unwrap();
+        assert_eq!(b.len(), MIC_END);
+        assert_eq!(Authenticate::parse(&b), Ok(a.clone()));
+        // The padding byte that keeps a field at an even offset counts.
+        let n = Negotiate { flags: 0, version: None, domain: vec![1], workstation: vec![2; MAX_MESSAGE - 33] };
+        assert_eq!(n.to_bytes(), Err(EncodeError::TooLong));
+        let n = Negotiate { workstation: vec![2; MAX_MESSAGE - 34], ..n };
+        assert_eq!(n.to_bytes().unwrap().len(), MAX_MESSAGE);
+        let a = Authenticate { mic: None, user: vec![0; MAX_FIELD], domain: vec![0; MAX_FIELD], ..a };
+        assert_eq!(a.to_bytes(), Err(EncodeError::TooLong));
+        let c = Challenge {
+            flags: 0,
+            target_name: Vec::new(),
+            server_challenge: [0; 8],
+            target_info: vec![0; MAX_FIELD + 1],
+            version: None,
+        };
+        assert_eq!(c.to_bytes(), Err(EncodeError::FieldTooLong("target info")));
+        let big = NtResponse::V2(NtlmV2Response {
+            nt_proof: [0; 16],
+            client: ClientChallenge {
+                resp_type: 1,
+                hi_resp_type: 1,
+                timestamp: 0,
+                challenge: [0; 8],
+                av_pairs: Vec::new(),
+                trailing: vec![0; MAX_FIELD],
+            },
+        });
+        assert_eq!(big.to_bytes(), Err(EncodeError::FieldTooLong("NT response")));
+    }
+
+    #[test]
+    fn overlapping_fields_too_long_to_write() {
+        // Two fields of 40000 bytes over the same payload: the message
+        // fits, but written out the fields would not.
+        let mut b = vec![0u8; NEGOTIATE_HEADER_LEN + 40000];
+        b[..8].copy_from_slice(&SIGNATURE);
+        b[8..12].copy_from_slice(&message_type::NEGOTIATE.to_le_bytes());
+        for at in [16, 24] {
+            b[at..at + 2].copy_from_slice(&40000u16.to_le_bytes());
+            b[at + 4..at + 8].copy_from_slice(&32u32.to_le_bytes());
+        }
+        assert_eq!(Negotiate::parse(&b), Err(ParseError::TooLong));
+        assert_eq!(Message::parse(&b), Err(ParseError::TooLong));
+        // One of them alone reads and writes back.
+        b[24..32].fill(0);
+        let n = Negotiate::parse(&b).unwrap();
+        assert_eq!(Negotiate::parse(&n.to_bytes().unwrap()), Ok(n));
+    }
+
+    #[test]
+    fn mic_without_version_flag() {
+        // \[MS-NLMP\] 2.2.1.3: the Version field is all zeros when the flag
+        // is clear, and the MIC still follows it at byte 72.
+        let mut b = vec![0u8; 88];
+        b[..8].copy_from_slice(&SIGNATURE);
+        b[8..12].copy_from_slice(&message_type::AUTHENTICATE.to_le_bytes());
+        b[72..88].fill(0x5a);
+        // A user name of 2 bytes at 88.
+        b[36..38].copy_from_slice(&2u16.to_le_bytes());
+        b[38..40].copy_from_slice(&2u16.to_le_bytes());
+        b[40..44].copy_from_slice(&88u32.to_le_bytes());
+        b.extend_from_slice(b"u\0");
+        let a = Authenticate::parse(&b).unwrap();
+        assert_eq!(a.version, None);
+        assert_eq!(a.mic, Some([0x5a; 16]));
+        assert_eq!(a.user, b"u\0");
+        // Written back, the version is zeros, the MIC is in place and the
+        // user name follows it.
+        let w = a.to_bytes().unwrap();
+        assert_eq!(w[64..88], b[64..88]);
+        assert_eq!(w[88..], b[88..]);
+        assert_eq!(Authenticate::parse(&w), Ok(a));
+    }
+
+    #[test]
+    fn unicode_fields_start_at_even_offsets() {
+        // \[MS-NLMP\] 3.2.5.1.2: an anonymous LM response is one zero byte.
+        // Unicode names after it must still start at even offsets.
+        let a = Authenticate {
+            flags: flags::NEGOTIATE_UNICODE | flags::ANONYMOUS,
+            lm_response: vec![0],
+            nt_response: Vec::new(),
+            domain: encode_utf16le("D"),
+            user: Vec::new(),
+            workstation: encode_utf16le("W"),
+            session_key: Vec::new(),
+            version: None,
+            mic: None,
+        };
+        let b = a.to_bytes().unwrap();
+        for at in [28, 44] {
+            assert_eq!(le32(&b, at + 4) % 2, 0, "field at {at}");
+        }
+        assert_eq!(Authenticate::parse(&b), Ok(a));
+    }
+
+    #[test]
+    fn defaults_and_accessors() {
+        // Every default message writes, and reads back the same.
+        for m in [
+            Message::Negotiate(Negotiate::default()),
+            Message::Challenge(Challenge::default()),
+            Message::Authenticate(Authenticate::default()),
+        ] {
+            let b = m.to_bytes().unwrap();
+            assert_eq!(le32(&b, 8), m.message_type());
+            assert_eq!(Message::parse(&b), Ok(m));
+        }
+        let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
+        assert_eq!(c.target_info_pairs().unwrap().len(), 2);
+        assert_eq!(Challenge::default().target_info_pairs(), Err(ParseError::AvPairs));
+        let a = Authenticate::parse(&SPEC_AUTHENTICATE).unwrap();
+        assert!(matches!(a.nt(), Ok(NtResponse::V2(_))));
+        // The spec message has no MIC, so there is none to zero.
+        assert_eq!(Authenticate::zero_mic(&SPEC_AUTHENTICATE), None);
+        assert_eq!(Authenticate::zero_mic(&SPEC_CHALLENGE), None);
+        let with = Authenticate { mic: Some([7; MIC_LEN]), ..Authenticate::default() };
+        let b = with.to_bytes().unwrap();
+        let z = Authenticate::zero_mic(&b).unwrap();
+        assert_eq!(z[..MIC_END - MIC_LEN], b[..MIC_END - MIC_LEN]);
+        assert_eq!(z[MIC_END - MIC_LEN..MIC_END], [0; MIC_LEN]);
+        assert_eq!(Authenticate::parse(&z).unwrap().mic, Some([0; MIC_LEN]));
+        // Errors print without panicking.
+        assert!(!ParseError::TooLong.to_string().is_empty());
+        assert!(!EncodeError::AvEol.to_string().is_empty());
+    }
+
+    #[test]
+    fn utf16() {
+        assert_eq!(encode_utf16le("Ab"), [0x41, 0, 0x62, 0]);
+        assert_eq!(decode_utf16le(&[0x41, 0, 0x62, 0]).as_deref(), Some("Ab"));
+        assert_eq!(decode_utf16le(&[0x41]), None);
+        assert_eq!(decode_utf16le(&[0x00, 0xd8]), None);
+        assert_eq!(encode_utf16le("\u{1f600}").len(), 4);
+    }
+
+    #[test]
+    fn every_truncated_prefix_fails() {
+        let msgs = [
+            Message::Challenge(Challenge::parse(&SPEC_CHALLENGE).unwrap()),
+            Message::Negotiate(Negotiate {
+                flags: flags::NEGOTIATE_VERSION,
+                domain: b"D".to_vec(),
+                workstation: b"W".to_vec(),
+                version: Some(Version { major: 1, minor: 2, build: 3, revision: 15 }),
+            }),
+            Message::Authenticate(Authenticate {
+                flags: flags::NEGOTIATE_VERSION,
+                lm_response: vec![1; 24],
+                nt_response: vec![2; 24],
+                domain: vec![3; 2],
+                user: vec![4; 2],
+                workstation: vec![5; 2],
+                session_key: vec![6; 16],
+                version: Some(Version { major: 1, minor: 2, build: 3, revision: 15 }),
+                mic: Some([9; 16]),
+            }),
+        ];
+        for m in msgs {
+            let b = m.to_bytes().unwrap();
+            assert_eq!(Message::parse(&b), Ok(m.clone()));
+            for n in 0..b.len() {
+                assert!(Message::parse(&b[..n]).is_err(), "prefix {n} of {m:?}");
+            }
+        }
+        // An NTLMv2 response cut short.
+        let v2 = NtResponse::V2(NtlmV2Response {
+            nt_proof: [1; 16],
+            client: ClientChallenge {
+                resp_type: 1,
+                hi_resp_type: 1,
+                timestamp: 5,
+                challenge: [2; 8],
+                av_pairs: vec![AvPair { id: 1, value: vec![1, 2] }],
+                trailing: Vec::new(),
+            },
+        });
+        let b = v2.to_bytes().unwrap();
+        for n in 1..b.len() {
+            if n != V1_RESPONSE_LEN {
+                assert!(NtResponse::parse(&b[..n]).is_err(), "prefix {n}");
+            }
+        }
+        let list = AvPair::write_list(&[AvPair { id: 2, value: vec![1, 2, 3] }]).unwrap();
+        for n in 0..list.len() {
+            assert!(AvPair::parse_list(&list[..n]).is_err());
+        }
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            self.next() as usize % n.max(1)
+        }
+
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let n = self.below(max + 1);
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+
+        fn version(&mut self, flags: u32) -> Option<Version> {
+            (flags & flags::NEGOTIATE_VERSION != 0).then(|| Version {
+                major: self.next() as u8,
+                minor: self.next() as u8,
+                build: self.next() as u16,
+                revision: self.next() as u8,
+            })
+        }
+
+        fn pairs(&mut self) -> Vec<AvPair> {
+            (0..self.below(5)).map(|_| AvPair { id: 1 + self.below(12) as u16, value: self.bytes(20) }).collect()
+        }
+
+        fn message(&mut self) -> Message {
+            let flags = self.next() | (self.next() & flags::NEGOTIATE_VERSION);
+            let version = self.version(flags);
+            match self.below(3) {
+                0 => Message::Negotiate(Negotiate {
+                    flags,
+                    domain: self.bytes(10),
+                    workstation: self.bytes(10),
+                    version,
+                }),
+                1 => Message::Challenge(Challenge {
+                    flags,
+                    target_name: self.bytes(20),
+                    server_challenge: [self.next() as u8; 8],
+                    target_info: AvPair::write_list(&self.pairs()).unwrap(),
+                    version,
+                }),
+                _ => {
+                    let nt = match self.below(3) {
+                        0 => NtResponse::Empty,
+                        1 => NtResponse::V1([self.next() as u8; 24]),
+                        _ => NtResponse::V2(NtlmV2Response {
+                            nt_proof: [self.next() as u8; 16],
+                            client: ClientChallenge {
+                                resp_type: 1,
+                                hi_resp_type: 1,
+                                timestamp: u64::from(self.next()),
+                                challenge: [self.next() as u8; 8],
+                                av_pairs: self.pairs(),
+                                trailing: self.bytes(4),
+                            },
+                        }),
+                    };
+                    let mic = self.next().is_multiple_of(2).then(|| [self.next() as u8; 16]);
+                    Message::Authenticate(Authenticate {
+                        flags,
+                        lm_response: self.bytes(24),
+                        nt_response: nt.to_bytes().unwrap(),
+                        domain: self.bytes(10),
+                        user: self.bytes(10),
+                        workstation: self.bytes(10),
+                        session_key: self.bytes(16),
+                        version,
+                        mic,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Whatever reads is written back and reads back the same.
+    fn check(b: &[u8]) {
+        if let Ok(m) = Message::parse(b) {
+            let bytes = m.to_bytes().unwrap();
+            assert_eq!(Message::parse(&bytes), Ok(m.clone()));
+            assert_eq!(m.to_bytes(), Ok(bytes));
+            if let Message::Challenge(c) = &m
+                && let Ok((pairs, _)) = AvPair::parse_list(&c.target_info)
+            {
+                let list = AvPair::write_list(&pairs).unwrap();
+                assert_eq!(AvPair::parse_list(&list), Ok((pairs, list.len())));
+            }
+            if let Message::Authenticate(a) = &m
+                && let Ok(nt) = NtResponse::parse(&a.nt_response)
+            {
+                assert_eq!(NtResponse::parse(&nt.to_bytes().unwrap()), Ok(nt));
+            }
+        }
+        if let Ok(nt) = NtResponse::parse(b) {
+            assert_eq!(NtResponse::parse(&nt.to_bytes().unwrap()), Ok(nt));
+        }
+        if let Ok((pairs, used)) = AvPair::parse_list(b) {
+            assert!(used <= b.len());
+            let list = AvPair::write_list(&pairs).unwrap();
+            assert_eq!(AvPair::parse_list(&list), Ok((pairs, list.len())));
+        }
+        if let Ok(r) = LmV2Response::parse(b) {
+            assert_eq!(r.to_bytes(), b);
+        }
+    }
+
+    #[test]
+    fn lcg_fuzz() {
+        let mut rng = Lcg(0x0e7c_1a55_0001);
+        for _ in 0..4000 {
+            // A value written and read back.
+            let m = rng.message();
+            let bytes = m.to_bytes().unwrap();
+            assert_eq!(Message::parse(&bytes), Ok(m.clone()));
+            if let Message::Authenticate(a) = &m {
+                let nt = NtResponse::parse(&a.nt_response).unwrap();
+                assert_eq!(nt.to_bytes().unwrap(), a.nt_response);
+            }
+            // Every prefix, fed one byte longer at a time.
+            for n in 0..bytes.len() {
+                check(&bytes[..n]);
+            }
+            // Mutated bytes.
+            let mut b = bytes.clone();
+            for _ in 0..1 + rng.below(4) {
+                let i = rng.below(b.len());
+                b[i] = rng.next() as u8;
+            }
+            check(&b);
+            // Random bytes behind a valid signature and type.
+            let mut r = SIGNATURE.to_vec();
+            r.extend_from_slice(&(1 + rng.below(3) as u32).to_le_bytes());
+            r.extend_from_slice(&rng.bytes(120));
+            check(&r);
+            // Random bytes on their own.
+            check(&rng.bytes(64));
+        }
+        // Large messages whose field descriptors point anywhere, so that
+        // fields overlap and run near the size limits.
+        for _ in 0..200 {
+            let mut b = vec![0u8; 1 + rng.below(MAX_MESSAGE + 64)];
+            let kind = 1 + rng.below(3) as u32;
+            let head = [12usize, 16, 20, 24, 28, 36, 40, 44, 52, 60];
+            if b.len() >= 64 {
+                b[..8].copy_from_slice(&SIGNATURE);
+                b[8..12].copy_from_slice(&kind.to_le_bytes());
+                for at in head {
+                    if rng.below(2) == 0 {
+                        let len = rng.below(b.len()) as u16;
+                        let off = rng.below(b.len()) as u32;
+                        b[at..at + 2].copy_from_slice(&len.to_le_bytes());
+                        b[at + 4..at + 8].copy_from_slice(&off.to_le_bytes());
+                    }
+                }
+            }
+            check(&b);
+            if let Ok(m) = Message::parse(&b) {
+                assert!(m.to_bytes().unwrap().len() <= MAX_MESSAGE);
+            }
+            if let Some(z) = Authenticate::zero_mic(&b) {
+                assert_eq!(z.len(), b.len());
+            }
+        }
+    }
+}

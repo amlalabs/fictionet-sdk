@@ -125,6 +125,9 @@ pub const RAW_CHECK_DEPTH: usize = 8;
 pub const MAX_PEM_DATA: usize = asn1::MAX_INPUT;
 /// The longest line, in bytes, PEM text may have.
 pub const MAX_PEM_LINE: usize = 64 * 1024;
+/// The most bytes a [`PemDecoder`] holds that it has not yet read as
+/// lines. [`PemDecoder::feed`] takes no more than this.
+pub const MAX_PEM_BUFFER: usize = 2 * MAX_PEM_LINE;
 /// The longest PEM label, such as `CERTIFICATE`.
 pub const MAX_PEM_LABEL: usize = 64;
 /// The most blocks [`pem_decode`] returns from one text.
@@ -244,7 +247,10 @@ pub enum Error {
     Empty,
     /// A value outside what the field allows: an unknown general name
     /// tag, a named bit past the 16 this module keeps, a time outside the
-    /// years 1950 to 9999.
+    /// years 1950 to 9999, a value RFC 5280 or the algorithm's own RFC
+    /// forbids (such as a key usage with no bit set), a raw value a reader
+    /// would read as another variant, or a signed object whose `tbs` no
+    /// longer matches its `tbs_der`.
     Value,
     /// PEM text is malformed: a bad base64 line, a block with no end, or
     /// an end line whose label does not match.
@@ -378,6 +384,17 @@ fn read_alg(r: &mut Reader<'_>) -> Result<AlgorithmIdentifier, Error> {
         Some(e.raw().to_vec())
     };
     s.finish()?;
+    // The parameters the algorithms named in [`oid`] require: none for
+    // Ed25519 (RFC 8410 section 3) and ECDSA signatures (RFC 5758 section
+    // 3.2), and a curve for an EC public key (RFC 5480 section 2.1.1).
+    let needs = match oid.as_bytes() {
+        oid::ED25519 | oid::ECDSA_WITH_SHA256 => Some(false),
+        oid::EC_PUBLIC_KEY => Some(true),
+        _ => None,
+    };
+    if needs.is_some_and(|n| n != parameters.is_some()) {
+        return Err(Error::Value);
+    }
     Ok(AlgorithmIdentifier { oid, parameters })
 }
 
@@ -415,8 +432,11 @@ impl Value {
         }
     }
 
-    /// The value as one DER element.
+    /// The value as one DER element. A [`Value::Raw`] holding a string
+    /// type a reader decodes, such as a UTF8String, is [`Error::Value`]:
+    /// write it as [`Value::Text`].
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+        check_value(self)?;
         build(|w| write_value(w, self))
     }
 }
@@ -427,6 +447,28 @@ fn read_value(e: &Element<'_>) -> Result<Value, Error> {
     }
     check_raw(e.raw())?;
     Ok(Value::Raw(e.raw().to_vec()))
+}
+
+/// Checks a [`Value::Raw`] is not a string a reader would read as
+/// [`Value::Text`], so a written value reads back as itself.
+fn check_value(v: &Value) -> Result<(), Error> {
+    if let Value::Raw(raw) = v {
+        let e = single(raw)?;
+        if StringKind::from_tag(e.tag()).is_some_and(|k| k.is_decoded()) {
+            return Err(Error::Value);
+        }
+    }
+    Ok(())
+}
+
+/// [`check_value`] on every attribute of `attrs`.
+fn check_attributes(attrs: &[Attribute]) -> Result<(), Error> {
+    attrs.iter().try_for_each(|a| check_value(&a.value))
+}
+
+/// [`check_value`] on every attribute of `n`.
+fn check_name(n: &Name) -> Result<(), Error> {
+    n.rdns.iter().try_for_each(|rdn| check_attributes(rdn))
 }
 
 fn write_value(w: &mut Writer, v: &Value) {
@@ -470,14 +512,11 @@ impl Name {
         self.rdns.iter().flatten().find(|a| a.oid.as_bytes() == oid).map(|a| &a.value)
     }
 
-    /// The text of the last common name, the most specific one.
+    /// The text of the last common name, the most specific one. It is
+    /// `None` if that common name is a [`Value::Raw`], even when an
+    /// earlier one is text.
     pub fn common_name(&self) -> Option<&str> {
-        self.rdns
-            .iter()
-            .flatten()
-            .filter(|a| a.oid.as_bytes() == oid::COMMON_NAME)
-            .filter_map(|a| a.value.as_text())
-            .next_back()
+        self.rdns.iter().flatten().rfind(|a| a.oid.as_bytes() == oid::COMMON_NAME)?.value.as_text()
     }
 
     /// Reads a name from its DER.
@@ -488,8 +527,10 @@ impl Name {
         Ok(n)
     }
 
-    /// The name's DER, as an issuer or subject field holds it.
+    /// The name's DER, as an issuer or subject field holds it. A
+    /// [`Value::Raw`] a reader would read as text is [`Error::Value`].
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+        check_name(self)?;
         let der = build(|w| write_name(w, self))?;
         Name::from_der(&der)?;
         Ok(der)
@@ -717,6 +758,18 @@ impl Time {
     }
 }
 
+impl Time {
+    /// Whether the text has a fraction of a second other than zero.
+    fn has_fraction(&self) -> bool {
+        match self {
+            Time::Utc(_) => false,
+            Time::Generalized(s) => {
+                s.split_once('.').is_some_and(|(_, f)| f.bytes().any(|c| c.is_ascii_digit() && c != b'0'))
+            }
+        }
+    }
+}
+
 /// The number written in `b[i..i + n]`, if all of them are digits.
 fn digits(b: &[u8], i: usize, n: usize) -> Option<i64> {
     let s = b.get(i..i.checked_add(n)?)?;
@@ -789,10 +842,14 @@ pub struct Validity {
 
 impl Validity {
     /// Whether the time `secs` seconds after the Unix epoch falls in the
-    /// period. A time whose text cannot be read gives `false`.
+    /// period. A `not_before` with a fraction of a second starts at the
+    /// next whole second. A time whose text cannot be read gives `false`.
     pub fn contains(&self, secs: i64) -> bool {
         match (self.not_before.unix(), self.not_after.unix()) {
-            (Some(a), Some(b)) => a <= secs && secs <= b,
+            (Some(a), Some(b)) => {
+                let a = if self.not_before.has_fraction() { a.saturating_add(1) } else { a };
+                a <= secs && secs <= b
+            }
             _ => false,
         }
     }
@@ -957,12 +1014,14 @@ fn write_bits(w: &mut Writer, v: u16) {
 }
 
 /// The basic constraints extension (RFC 5280 4.2.1.9): whether the
-/// subject is a CA, and how many CAs may follow it in a chain.
+/// subject is a CA, and how many CAs may follow it in a chain. A path
+/// length without `ca` is [`Error::Value`], as section 4.2.1.9 forbids it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct BasicConstraints {
     /// Whether the subject is a certificate authority.
     pub ca: bool,
-    /// The most intermediate CA certificates that may follow this one.
+    /// The most intermediate CA certificates that may follow this one. A
+    /// reader refuses one past `u64::MAX`.
     pub path_len: Option<u64>,
 }
 
@@ -977,6 +1036,9 @@ impl ExtensionValue for BasicConstraints {
         };
         let path_len = if s.is_empty() { None } else { Some(s.read_u64()?) };
         s.finish()?;
+        if path_len.is_some() && !ca {
+            return Err(Error::Value);
+        }
         Ok(BasicConstraints { ca, path_len })
     }
 
@@ -997,7 +1059,8 @@ impl ExtensionValue for BasicConstraints {
 /// The key usage extension (RFC 5280 4.2.1.3): what the key may be used
 /// for. Bit `i` of the named bit string is `1 << i` here. A reader takes
 /// trailing zero bits, which DER leaves out (X.690 11.2.2), and a writer
-/// leaves them out.
+/// leaves them out. At least one bit must be set (section 4.2.1.3), so
+/// `KeyUsage(0)` is [`Error::Value`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct KeyUsage(pub u16);
 
@@ -1034,7 +1097,10 @@ impl ExtensionValue for KeyUsage {
         let mut r = Reader::new(der, Rules::Der);
         let b = r.read_bit_string()?;
         r.finish()?;
-        Ok(KeyUsage(read_bits(&b)?))
+        match read_bits(&b)? {
+            0 => Err(Error::Value),
+            v => Ok(KeyUsage(v)),
+        }
     }
 
     fn to_der(&self) -> Result<Vec<u8>, Error> {
@@ -1082,7 +1148,11 @@ impl ExtensionValue for ExtendedKeyUsage {
 }
 
 /// A general name (RFC 5280 4.2.1.6): one of the forms a subject or
-/// issuer may be named by besides its distinguished name.
+/// issuer may be named by besides its distinguished name. Readers and
+/// writers refuse with [`Error::Value`] the names section 4.2.1.6 forbids:
+/// an empty email address, DNS name, URI or directory name, the DNS name
+/// `" "`, a URI with no scheme or nothing after it, and an IP address that
+/// is not 4 or 16 bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GeneralName {
     /// `[0]` otherName: a type and a value as one DER element.
@@ -1101,12 +1171,12 @@ pub enum GeneralName {
     Directory(Name),
     /// `[6]` uniformResourceIdentifier: a URI.
     Uri(String),
-    /// `[7]` iPAddress: 4 bytes for IPv4, 16 for IPv6. Name constraints
-    /// use 8 and 32, an address and a mask, so any length is kept.
+    /// `[7]` iPAddress: 4 bytes for IPv4, 16 for IPv6.
     Ip(Vec<u8>),
     /// `[8]` registeredID: an object identifier.
     RegisteredId(Oid),
     /// `[3]` x400Address or `[5]` ediPartyName, kept as one DER element.
+    /// A writer refuses any other tag with [`Error::Value`].
     Unsupported(Vec<u8>),
 }
 
@@ -1121,7 +1191,50 @@ impl GeneralName {
     }
 }
 
+/// Whether `s` starts with a URI scheme and a colon, and has something
+/// after them (RFC 3986 section 3.1, RFC 5280 section 4.2.1.6).
+fn absolute_uri(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else { return false };
+    let mut b = scheme.bytes();
+    b.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && b.all(|c| c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.'))
+        && !rest.is_empty()
+}
+
+/// Checks `g` holds a name RFC 5280 section 4.2.1.6 allows, and, for a
+/// [`GeneralName::Unsupported`], a tag a reader reads back as that
+/// variant.
+fn check_general_name(g: &GeneralName) -> Result<(), Error> {
+    let ok = match g {
+        GeneralName::Email(s) => !s.is_empty(),
+        GeneralName::Dns(s) => !s.is_empty() && s != " ",
+        GeneralName::Uri(s) => absolute_uri(s),
+        GeneralName::Ip(b) => b.len() == 4 || b.len() == 16,
+        GeneralName::Directory(n) => {
+            check_name(n)?;
+            !n.rdns.is_empty()
+        }
+        GeneralName::Unsupported(raw) => {
+            let t = single(raw)?.tag();
+            t.class == Class::ContextSpecific && t.constructed && matches!(t.number, 3 | 5)
+        }
+        GeneralName::Other { .. } | GeneralName::RegisteredId(_) => true,
+    };
+    if ok { Ok(()) } else { Err(Error::Value) }
+}
+
+/// [`check_general_name`] on every name of `list`.
+fn check_general_names(list: &[GeneralName]) -> Result<(), Error> {
+    list.iter().try_for_each(check_general_name)
+}
+
 fn read_general_name(e: &Element<'_>) -> Result<GeneralName, Error> {
+    let g = read_general_name_unchecked(e)?;
+    check_general_name(&g)?;
+    Ok(g)
+}
+
+fn read_general_name_unchecked(e: &Element<'_>) -> Result<GeneralName, Error> {
     let t = e.tag();
     if t.class != Class::ContextSpecific {
         return Err(Error::Value);
@@ -1213,6 +1326,7 @@ impl ExtensionValue for SubjectAltName {
     }
 
     fn to_der(&self) -> Result<Vec<u8>, Error> {
+        check_general_names(&self.0)?;
         verified::<Self>(build(|w| w.sequence(|w| write_general_names(w, &self.0)))?)
     }
 }
@@ -1243,7 +1357,9 @@ impl ExtensionValue for SubjectKeyIdentifier {
 pub struct AuthorityKeyIdentifier {
     /// `[0]` the issuer's subject key identifier.
     pub key_id: Option<Vec<u8>>,
-    /// `[1]` the names of the issuer's issuer.
+    /// `[1]` the names of the issuer's issuer. It is present exactly when
+    /// `serial` is (RFC 5280 appendix A.2), or the value is
+    /// [`Error::Value`].
     pub issuer: Option<Vec<GeneralName>>,
     /// `[2]` the serial number of the issuer's certificate, as
     /// two's-complement bytes. A writer drops leading bytes that do not
@@ -1261,10 +1377,17 @@ impl ExtensionValue for AuthorityKeyIdentifier {
         let serial =
             s.read_optional(Tag::context(2))?.map(|e| e.integer().map(|i| i.as_bytes().to_vec())).transpose()?;
         s.finish()?;
+        // Both or neither (RFC 5280 appendix A.2).
+        if issuer.is_some() != serial.is_some() {
+            return Err(Error::Value);
+        }
         Ok(AuthorityKeyIdentifier { key_id, issuer, serial })
     }
 
     fn to_der(&self) -> Result<Vec<u8>, Error> {
+        if let Some(names) = &self.issuer {
+            check_general_names(names)?;
+        }
         verified::<Self>(build(|w| {
             w.sequence(|w| {
                 if let Some(id) = &self.key_id {
@@ -1316,7 +1439,9 @@ pub enum DistributionPointName {
     RelativeToIssuer(Vec<Attribute>),
 }
 
-/// One CRL distribution point (RFC 5280 4.2.1.13).
+/// One CRL distribution point (RFC 5280 4.2.1.13). It has a name, a CRL
+/// issuer or both. A CRL issuer lists only directory names, and a
+/// relative name goes with at most one. Other points are [`Error::Value`].
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct DistributionPoint {
     /// Where the CRL is.
@@ -1349,7 +1474,31 @@ fn read_distribution_point(mut s: Reader<'_>) -> Result<DistributionPoint, Error
         .map(ReasonFlags);
     let crl_issuer = s.read_optional(Tag::context(2))?.map(|e| read_general_names(e.reader()?)).transpose()?;
     s.finish()?;
-    Ok(DistributionPoint { name, reasons, crl_issuer })
+    let p = DistributionPoint { name, reasons, crl_issuer };
+    check_distribution_point(&p)?;
+    Ok(p)
+}
+
+/// Checks the rules RFC 5280 section 4.2.1.13 gives a point's fields, and
+/// the names it holds.
+fn check_distribution_point(p: &DistributionPoint) -> Result<(), Error> {
+    match &p.name {
+        Some(DistributionPointName::Full(names)) => check_general_names(names)?,
+        Some(DistributionPointName::RelativeToIssuer(attrs)) => check_attributes(attrs)?,
+        None => {}
+    }
+    if let Some(names) = &p.crl_issuer {
+        check_general_names(names)?;
+        if !names.iter().all(|g| matches!(g, GeneralName::Directory(_))) {
+            return Err(Error::Value);
+        }
+    }
+    let relative = matches!(p.name, Some(DistributionPointName::RelativeToIssuer(_)));
+    let issuers = p.crl_issuer.as_ref().map_or(0, Vec::len);
+    if (p.name.is_none() && p.crl_issuer.is_none()) || (relative && issuers > 1) {
+        return Err(Error::Value);
+    }
+    Ok(())
 }
 
 fn write_distribution_point(w: &mut Writer, p: &DistributionPoint) {
@@ -1393,6 +1542,7 @@ impl ExtensionValue for CrlDistributionPoints {
     }
 
     fn to_der(&self) -> Result<Vec<u8>, Error> {
+        self.0.iter().try_for_each(check_distribution_point)?;
         verified::<Self>(build(|w| {
             w.sequence(|w| {
                 for p in &self.0 {
@@ -1439,6 +1589,7 @@ impl ExtensionValue for AuthorityInfoAccess {
     }
 
     fn to_der(&self) -> Result<Vec<u8>, Error> {
+        self.0.iter().try_for_each(|d| check_general_name(&d.location))?;
         verified::<Self>(build(|w| {
             w.sequence(|w| {
                 for d in &self.0 {
@@ -1466,6 +1617,7 @@ impl ExtensionValue for IssuerAltName {
     }
 
     fn to_der(&self) -> Result<Vec<u8>, Error> {
+        check_general_names(&self.0)?;
         verified::<Self>(build(|w| w.sequence(|w| write_general_names(w, &self.0)))?)
     }
 }
@@ -1586,12 +1738,14 @@ pub struct TbsCertificate {
     /// The signature algorithm. It must match
     /// [`Certificate::signature_algorithm`].
     pub signature: AlgorithmIdentifier,
-    /// Who signed the certificate.
+    /// Who signed the certificate. It may not be empty (RFC 5280
+    /// 4.1.2.4), or the certificate is [`Error::Empty`].
     pub issuer: Name,
     /// When the certificate may be used.
     pub validity: Validity,
-    /// Who the certificate is for. It may be empty when a subject
-    /// alternative name says who.
+    /// Who the certificate is for. It may be empty only when a critical
+    /// subject alternative name extension says who (RFC 5280 4.1.2.6);
+    /// otherwise an empty subject is [`Error::Value`].
     pub subject: Name,
     /// The subject's public key.
     pub public_key: PublicKeyInfo,
@@ -1618,6 +1772,8 @@ impl TbsCertificate {
     /// The TBSCertificate's DER: the bytes to sign. The issuer signs them
     /// with its own code and passes them to [`Certificate::assemble`].
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+        check_name(&self.issuer)?;
+        check_name(&self.subject)?;
         let der = build(|w| self.write(w))?;
         TbsCertificate::parse(&der)?;
         Ok(der)
@@ -1703,6 +1859,12 @@ fn read_tbs(e: Element<'_>) -> Result<TbsCertificate, Error> {
     if (has_ids && version == Version::V1) || (!extensions.is_empty() && version != Version::V3) {
         return Err(Error::Version);
     }
+    if issuer.rdns.is_empty() {
+        return Err(Error::Empty);
+    }
+    if subject.rdns.is_empty() && !find_extension(&extensions, oid::SUBJECT_ALT_NAME).is_some_and(|x| x.critical) {
+        return Err(Error::Value);
+    }
     Ok(TbsCertificate {
         version,
         serial,
@@ -1723,7 +1885,10 @@ pub struct Certificate {
     /// The signed part, read.
     pub tbs: TbsCertificate,
     /// The signed part's DER, exactly as it came: the bytes the signature
-    /// covers. [`Certificate::to_der`] writes these, not `tbs`.
+    /// covers. [`Certificate::to_der`] writes these, not `tbs`, and
+    /// refuses with [`Error::Value`] when `tbs` is not what they read as.
+    /// To change a field, change a [`TbsCertificate`], sign its
+    /// [`TbsCertificate::to_der`] again and [`Certificate::assemble`].
     pub tbs_der: Vec<u8>,
     /// The signature algorithm, the same as `tbs.signature`.
     pub signature_algorithm: AlgorithmIdentifier,
@@ -1768,7 +1933,9 @@ impl Certificate {
 
     /// The certificate's DER: [`Certificate::tbs_der`], the algorithm and
     /// the signature. A certificate read by [`Certificate::parse`] gives
-    /// back the same bytes.
+    /// back the same bytes. If `tbs` was changed after it was read, so the
+    /// bytes would read back as another certificate, it is
+    /// [`Error::Value`].
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
         let der = build(|w| {
             w.sequence(|w| {
@@ -1777,7 +1944,9 @@ impl Certificate {
                 w.bit_string_value(&self.signature);
             })
         })?;
-        Certificate::parse(&der)?;
+        if Certificate::parse(&der)? != *self {
+            return Err(Error::Value);
+        }
         Ok(der)
     }
 
@@ -1828,7 +1997,8 @@ pub struct TbsCertList {
     /// The signature algorithm. It must match
     /// [`Crl::signature_algorithm`].
     pub signature: AlgorithmIdentifier,
-    /// Who signed the CRL.
+    /// Who signed the CRL. It may not be empty (RFC 5280 5.1.2.3), or the
+    /// CRL is [`Error::Empty`].
     pub issuer: Name,
     /// When the CRL was issued.
     pub this_update: Time,
@@ -1852,6 +2022,7 @@ impl TbsCertList {
 
     /// The TBSCertList's DER: the bytes to sign.
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+        check_name(&self.issuer)?;
         let der = build(|w| self.write(w))?;
         TbsCertList::parse(&der)?;
         Ok(der)
@@ -1942,6 +2113,9 @@ fn read_tbs_crl(e: Element<'_>) -> Result<TbsCertList, Error> {
     if any_extensions && version != Version::V2 {
         return Err(Error::Version);
     }
+    if issuer.rdns.is_empty() {
+        return Err(Error::Empty);
+    }
     Ok(TbsCertList { version, signature, issuer, this_update, next_update, revoked, extensions })
 }
 
@@ -1952,7 +2126,8 @@ pub struct Crl {
     /// The signed part, read.
     pub tbs: TbsCertList,
     /// The signed part's DER, exactly as it came. [`Crl::to_der`] writes
-    /// these, not `tbs`.
+    /// these, not `tbs`, and refuses with [`Error::Value`] when `tbs` is
+    /// not what they read as.
     pub tbs_der: Vec<u8>,
     /// The signature algorithm, the same as `tbs.signature`.
     pub signature_algorithm: AlgorithmIdentifier,
@@ -1995,7 +2170,8 @@ impl Crl {
     }
 
     /// The CRL's DER. A CRL read by [`Crl::parse`] gives back the same
-    /// bytes.
+    /// bytes. If `tbs` was changed after it was read, it is
+    /// [`Error::Value`].
     pub fn to_der(&self) -> Result<Vec<u8>, Error> {
         let der = build(|w| {
             w.sequence(|w| {
@@ -2004,13 +2180,16 @@ impl Crl {
                 w.bit_string_value(&self.signature);
             })
         })?;
-        Crl::parse(&der)?;
+        if Crl::parse(&der)? != *self {
+            return Err(Error::Value);
+        }
         Ok(der)
     }
 
     /// Whether the CRL lists the serial number `serial` (two's-complement
     /// bytes, as [`TbsCertificate::serial`] holds them). Numbers compare
-    /// by value, so `00 05` matches `05`.
+    /// by value, so `00 05` matches `05`. It reads `tbs`, so it is only as
+    /// good as `tbs` matching `tbs_der`, which [`Crl::to_der`] checks.
     pub fn is_revoked(&self, serial: &[u8]) -> bool {
         let serial = minimal_int(serial);
         self.tbs.revoked.iter().any(|r| minimal_int(&r.serial) == serial)
@@ -2283,7 +2462,8 @@ fn first_pem_block(text: &[u8], label: &str) -> Result<Vec<u8>, Error> {
 
 /// Splits a stream of PEM text into blocks, such as a bundle of
 /// certificates a world reads from a connection. Feed it the bytes in
-/// order, and take blocks out until it has none.
+/// order, and take blocks out until it has none. It holds at most
+/// [`MAX_PEM_BUFFER`] bytes it has not read, and one block's base64.
 #[derive(Debug, Default)]
 pub struct PemDecoder {
     buf: Vec<u8>,
@@ -2301,22 +2481,31 @@ impl PemDecoder {
         PemDecoder::default()
     }
 
-    /// Adds text read from the stream. After an error the stream cannot
-    /// be read any further, and it is dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Adds text read from the stream, from the start of `bytes`, and
+    /// returns how many bytes it took. It holds at most
+    /// [`MAX_PEM_BUFFER`] bytes not yet read, so it may take only part of
+    /// `bytes`: take blocks out with [`PemDecoder::next_block`], then feed
+    /// it the rest. Once it holds [`MAX_PEM_BUFFER`] bytes, `next_block`
+    /// always reads a line or gives an error, so a loop of the two never
+    /// stalls. After an error the stream cannot be read any further, and
+    /// every byte is taken and dropped.
+    #[must_use = "the bytes past the count it returns were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let n = bytes.len().min(MAX_PEM_BUFFER.saturating_sub(self.buffered()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole block, if one has come. It returns `None` when it
     /// needs more text, and keeps returning the same error once the
-    /// stream has broken. It holds at most one block's base64 and one
-    /// line beyond what has been read, plus what one `feed` added.
+    /// stream has broken.
     pub fn next_block(&mut self) -> Option<Result<Pem, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -2640,7 +2829,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let tbs = TbsCertList {
             version: Version::V1,
             signature: alg.clone(),
-            issuer: Name::default(),
+            issuer: sample_tbs().issuer,
             this_update: Time::from_unix(0).unwrap(),
             next_update: None,
             revoked: vec![RevokedCertificate {
@@ -2654,7 +2843,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(TbsCertList::parse(&der).unwrap(), tbs);
         let crl = Crl::assemble(&der, alg.clone(), BitString::new(vec![1; 64], 0).unwrap()).unwrap();
         assert_eq!(Crl::parse(&crl.to_der().unwrap()).unwrap(), crl);
-        assert_eq!(crl.tbs.issuer.to_string(), "");
+        assert_eq!(crl.tbs.issuer.to_string(), "CN=test");
         // An empty revoked list is left out, and reads back empty.
         let empty = TbsCertList { revoked: vec![], ..tbs.clone() };
         assert_eq!(TbsCertList::parse(&empty.to_der().unwrap()).unwrap(), empty);
@@ -3002,7 +3191,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             GeneralName::Directory(dir.clone()),
             GeneralName::Unsupported(vec![0xa5, 0x00]),
             uri("urn:x"),
-            GeneralName::Ip(vec![10, 0, 0, 0, 255, 0, 0, 0]),
+            GeneralName::Ip(vec![10, 0, 0, 1]),
             GeneralName::RegisteredId(oid(oid::OCSP)),
         ];
         let san = SubjectAltName(names.clone());
@@ -3020,7 +3209,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                 reasons: Some(ReasonFlags(ReasonFlags::KEY_COMPROMISE | ReasonFlags::AA_COMPROMISE)),
                 crl_issuer: Some(vec![GeneralName::Directory(dir.clone())]),
             },
-            DistributionPoint::default(),
+            DistributionPoint { crl_issuer: Some(vec![GeneralName::Directory(dir.clone())]), ..Default::default() },
             DistributionPoint {
                 name: Some(DistributionPointName::Full(names.clone())),
                 reasons: Some(ReasonFlags(0)),
@@ -3033,17 +3222,14 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             location: GeneralName::Directory(dir),
         }]);
         assert_eq!(AuthorityInfoAccess::from_der(&aia.to_der().unwrap()).unwrap(), aia);
-        for bits in [0u16, 1, 0x80, 0x100, 0x1ff, 0x8000, 0xffff] {
+        for bits in [1u16, 0x80, 0x100, 0x1ff, 0x8000, 0xffff] {
             let ku = KeyUsage(bits);
             let der = ku.to_der().unwrap();
             assert_eq!(KeyUsage::from_der(&der).unwrap(), ku);
             // No trailing zero bits (X.690 11.2.2).
-            if bits != 0 {
-                let unused = der[2];
-                assert_ne!(der[der.len() - 1] & (1 << unused), 0, "{bits:#x}");
-            }
+            let unused = der[2];
+            assert_ne!(der[der.len() - 1] & (1 << unused), 0, "{bits:#x}");
         }
-        assert_eq!(KeyUsage(0).to_der().unwrap(), [0x03, 0x01, 0x00]);
         assert_eq!(KeyUsage(KeyUsage::DIGITAL_SIGNATURE).to_der().unwrap(), [0x03, 0x02, 0x07, 0x80]);
         assert_eq!(KeyUsage(KeyUsage::DECIPHER_ONLY).to_der().unwrap(), [0x03, 0x03, 0x07, 0x00, 0x80]);
         // Trailing zero bits are read.
@@ -3079,11 +3265,10 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         );
         assert!(SubjectAltName(vec![GeneralName::Dns("a".into()); MAX_GENERAL_NAMES]).to_der().is_ok());
         assert_eq!(ExtendedKeyUsage(vec![oid(oid::SERVER_AUTH); MAX_KEY_PURPOSES + 1]).to_der(), Err(Error::TooMany));
-        assert_eq!(
-            CrlDistributionPoints(vec![DistributionPoint::default(); MAX_DISTRIBUTION_POINTS + 1]).to_der(),
-            Err(Error::TooMany)
-        );
-        let ad = AccessDescription { method: oid(oid::OCSP), location: uri("x") };
+        let point =
+            DistributionPoint { name: Some(DistributionPointName::Full(vec![uri("http://x/")])), ..Default::default() };
+        assert_eq!(CrlDistributionPoints(vec![point; MAX_DISTRIBUTION_POINTS + 1]).to_der(), Err(Error::TooMany));
+        let ad = AccessDescription { method: oid(oid::OCSP), location: uri("http://x/") };
         assert_eq!(AuthorityInfoAccess(vec![ad; MAX_ACCESS_DESCRIPTIONS + 1]).to_der(), Err(Error::TooMany));
         // Named bits past 15.
         assert_eq!(KeyUsage::from_der(&[0x03, 0x04, 0x07, 0x00, 0x00, 0x80]), Err(Error::Value));
@@ -3260,12 +3445,22 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let mut d = PemDecoder::new();
         let mut out = Vec::new();
         for c in text.chunks(chunk.max(1)) {
-            d.feed(c);
-            while let Some(r) = d.next_block() {
-                match r {
-                    Ok(p) => out.push(p),
-                    Err(_) => return (out, true),
+            let mut rest = c;
+            loop {
+                let n = d.feed(rest);
+                rest = &rest[n..];
+                assert!(d.buffered() <= MAX_PEM_BUFFER);
+                while let Some(r) = d.next_block() {
+                    match r {
+                        Ok(p) => out.push(p),
+                        Err(_) => return (out, true),
+                    }
                 }
+                if rest.is_empty() {
+                    break;
+                }
+                // A full buffer always reads at least a line.
+                assert!(d.buffered() < MAX_PEM_BUFFER);
             }
         }
         (out, false)
@@ -3282,7 +3477,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         }
         let mut d = PemDecoder::new();
         for b in text.as_bytes() {
-            d.feed(std::slice::from_ref(b));
+            assert_eq!(d.feed(std::slice::from_ref(b)), 1);
             while let Some(r) = d.next_block() {
                 r.unwrap();
             }
@@ -3291,23 +3486,50 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(d.buffered(), 0);
         // A block cut short.
         let mut d = PemDecoder::new();
-        d.feed(&CERT_PEM.as_bytes()[..100]);
+        assert_eq!(d.feed(&CERT_PEM.as_bytes()[..100]), 100);
         assert!(d.next_block().is_none());
         assert!(d.in_block());
-        // A broken stream stays broken.
-        d.feed(b"!!!\n");
+        // A broken stream stays broken, and takes and drops what it is fed.
+        assert_eq!(d.feed(b"!!!\n"), 4);
         assert_eq!(d.next_block(), Some(Err(Error::Pem)));
-        d.feed(CERT_PEM.as_bytes());
+        assert_eq!(d.feed(CERT_PEM.as_bytes()), CERT_PEM.len());
         assert_eq!(d.next_block(), Some(Err(Error::Pem)));
         assert_eq!(d.buffered(), 0);
         // A long line fed a byte at a time is refused once it is too long.
         let mut d = PemDecoder::new();
         for _ in 0..MAX_PEM_LINE {
-            d.feed(b"a");
+            assert_eq!(d.feed(b"a"), 1);
             assert_eq!(d.next_block(), None);
         }
-        d.feed(b"a");
+        assert_eq!(d.feed(b"a"), 1);
         assert_eq!(d.next_block(), Some(Err(Error::TooLong)));
+    }
+
+    #[test]
+    fn pem_decoder_takes_no_more_than_its_buffer() {
+        // One large feed is taken only up to MAX_PEM_BUFFER bytes.
+        let big = vec![b'a'; 8 * MAX_PEM_BUFFER];
+        let mut d = PemDecoder::new();
+        assert_eq!(d.feed(&big), MAX_PEM_BUFFER);
+        assert_eq!(d.buffered(), MAX_PEM_BUFFER);
+        assert_eq!(d.feed(&big), 0);
+        assert_eq!(d.buffered(), MAX_PEM_BUFFER);
+        assert_eq!(d.next_block(), Some(Err(Error::TooLong)));
+        // Many short lines, fed without taking blocks out, stay bounded.
+        let lines = b"text\n".repeat(MAX_PEM_BUFFER);
+        let mut d = PemDecoder::new();
+        let mut rest = &lines[..];
+        while !rest.is_empty() {
+            let n = d.feed(rest);
+            rest = &rest[n..];
+            assert!(d.buffered() <= MAX_PEM_BUFFER);
+            assert!(d.buf.capacity() <= 4 * MAX_PEM_BUFFER);
+            assert_eq!(d.next_block(), None);
+        }
+        // A bundle fed whole comes out whole.
+        let text = format!("{CERT_PEM}{CRL_PEM}").repeat(200);
+        assert!(text.len() > MAX_PEM_BUFFER);
+        assert_eq!(decode_stream(text.as_bytes(), text.len()).0.len(), 400);
     }
 
     #[test]
@@ -3317,7 +3539,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let mut d = PemDecoder::new();
         let mut n = 0;
         for b in big.as_bytes() {
-            d.feed(std::slice::from_ref(b));
+            assert_eq!(d.feed(std::slice::from_ref(b)), 1);
             while let Some(r) = d.next_block() {
                 assert_eq!(r.unwrap().data.len(), MAX_PEM_DATA);
                 n += 1;
@@ -3486,7 +3708,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                 // leaves a decoder waiting inside it.
                 Err(Error::Pem) if !whole.1 => {
                     let mut d = PemDecoder::new();
-                    d.feed(&text);
+                    assert_eq!(d.feed(&text), text.len());
                     while d.next_block().is_some() {}
                     assert!(d.in_block());
                 }
@@ -3524,7 +3746,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let crl = TbsCertList {
             version: Version::V2,
             signature: alg,
-            issuer: Name::default(),
+            issuer: sample_tbs().issuer,
             this_update: Time::from_unix(0).unwrap(),
             next_update: None,
             revoked: vec![],
@@ -3605,7 +3827,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let tbs = TbsCertList {
             version: Version::V1,
             signature: alg.clone(),
-            issuer: Name::default(),
+            issuer: sample_tbs().issuer,
             this_update: Time::from_unix(0).unwrap(),
             next_update: None,
             revoked: vec![RevokedCertificate {
@@ -3702,5 +3924,182 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                 assert!(IssuerAltName::from_der(&v[..n]).is_err());
             }
         }
+    }
+
+    #[test]
+    fn signed_objects_refuse_a_tbs_changed_after_reading() {
+        let mut cert = Certificate::parse(&cert_der()).unwrap();
+        assert_eq!(cert.to_der().unwrap(), cert_der());
+        cert.tbs.serial = vec![2];
+        assert_eq!(cert.to_der(), Err(Error::Value));
+        assert_eq!(cert.to_pem(), Err(Error::Value));
+        let mut crl = Crl::parse(&crl_der()).unwrap();
+        assert_eq!(crl.to_der().unwrap(), crl_der());
+        crl.tbs.revoked.clear();
+        assert_eq!(crl.to_der(), Err(Error::Value));
+    }
+
+    #[test]
+    fn raw_values_a_reader_reads_as_other_variants_are_refused() {
+        // [2] primitive is a dNSName, not an unsupported name.
+        let san = SubjectAltName(vec![GeneralName::Unsupported(vec![0x82, 0x01, b'a'])]);
+        assert_eq!(san.to_der(), Err(Error::Value));
+        // A UTF8String is read as text.
+        let utf8 = Value::Raw(vec![0x0c, 0x01, b'a']);
+        assert_eq!(utf8.to_der(), Err(Error::Value));
+        let mut name = Name::default();
+        name.push(oid(oid::COMMON_NAME), utf8);
+        assert_eq!(name.to_der(), Err(Error::Value));
+        assert_eq!(TbsCertificate { subject: name.clone(), ..sample_tbs() }.to_der(), Err(Error::Value));
+        assert_eq!(SubjectAltName(vec![GeneralName::Directory(name)]).to_der(), Err(Error::Value));
+        // A TeletexString stays raw.
+        let mut name = Name::default();
+        name.push(oid(oid::COMMON_NAME), Value::Raw(vec![0x14, 0x01, b'a']));
+        assert_eq!(Name::from_der(&name.to_der().unwrap()).unwrap(), name);
+    }
+
+    #[test]
+    fn known_algorithms_have_the_parameters_their_rfcs_give() {
+        let key = |oid_bytes: &[u8], parameters: Option<Vec<u8>>| PublicKeyInfo {
+            algorithm: AlgorithmIdentifier { oid: oid(oid_bytes), parameters },
+            key: BitString::new(vec![7; 32], 0).unwrap(),
+        };
+        // Ed25519 has none (RFC 8410 section 3).
+        assert!(key(oid::ED25519, None).to_der().is_ok());
+        assert_eq!(key(oid::ED25519, Some(vec![0x05, 0x00])).to_der(), Err(Error::Value));
+        // An EC key names its curve (RFC 5480 section 2.1.1).
+        assert_eq!(key(oid::EC_PUBLIC_KEY, None).to_der(), Err(Error::Value));
+        let curve = build(|w| w.oid(&oid(oid::PRIME256V1))).unwrap();
+        assert!(key(oid::EC_PUBLIC_KEY, Some(curve)).to_der().is_ok());
+        // An ECDSA signature has none.
+        let sig = AlgorithmIdentifier { oid: oid(oid::ECDSA_WITH_SHA256), parameters: Some(vec![0x05, 0x00]) };
+        assert_eq!(TbsCertificate { signature: sig, ..sample_tbs() }.to_der(), Err(Error::Value));
+    }
+
+    #[test]
+    fn general_names_rfc_5280_forbids_are_refused() {
+        for g in [
+            GeneralName::Dns(String::new()),
+            GeneralName::Dns(" ".into()),
+            GeneralName::Email(String::new()),
+            uri(""),
+            uri("relative/path"),
+            uri("http:"),
+            uri("1http://x/"),
+            GeneralName::Ip(vec![0; 8]),
+            GeneralName::Ip(vec![]),
+            GeneralName::Directory(Name::default()),
+        ] {
+            assert_eq!(SubjectAltName(vec![g.clone()]).to_der(), Err(Error::Value), "{g:?}");
+            assert_eq!(IssuerAltName(vec![g.clone()]).to_der(), Err(Error::Value), "{g:?}");
+            let ad = AccessDescription { method: oid(oid::OCSP), location: g.clone() };
+            assert_eq!(AuthorityInfoAccess(vec![ad]).to_der(), Err(Error::Value), "{g:?}");
+        }
+        // The same names, as DER.
+        assert_eq!(SubjectAltName::from_der(&[0x30, 0x02, 0x82, 0x00]), Err(Error::Value));
+        assert_eq!(SubjectAltName::from_der(&[0x30, 0x03, 0x82, 0x01, b' ']), Err(Error::Value));
+        assert_eq!(SubjectAltName::from_der(&[0x30, 0x04, 0x86, 0x02, b'a', b'b']), Err(Error::Value));
+        assert_eq!(SubjectAltName::from_der(&[0x30, 0x04, 0x87, 0x02, 1, 2]), Err(Error::Value));
+        assert_eq!(SubjectAltName::from_der(&[0x30, 0x04, 0xa4, 0x02, 0x30, 0x00]), Err(Error::Value));
+        let ok = SubjectAltName(vec![uri("urn:x"), uri("svn+ssh://h/"), GeneralName::Ip(vec![0; 16])]);
+        assert_eq!(SubjectAltName::from_der(&ok.to_der().unwrap()).unwrap(), ok);
+    }
+
+    #[test]
+    fn a_path_length_needs_ca() {
+        assert_eq!(BasicConstraints { ca: false, path_len: Some(0) }.to_der(), Err(Error::Value));
+        assert_eq!(BasicConstraints::from_der(&[0x30, 0x03, 0x02, 0x01, 0x00]), Err(Error::Value));
+        let ca = BasicConstraints { ca: true, path_len: Some(0) };
+        assert_eq!(BasicConstraints::from_der(&ca.to_der().unwrap()).unwrap(), ca);
+    }
+
+    #[test]
+    fn an_authority_issuer_and_serial_go_together() {
+        assert_eq!(AuthorityKeyIdentifier::from_der(&[0x30, 0x03, 0x82, 0x01, 0x01]), Err(Error::Value));
+        let serial_only = AuthorityKeyIdentifier { serial: Some(vec![1]), ..Default::default() };
+        assert_eq!(serial_only.to_der(), Err(Error::Value));
+        let issuer_only = AuthorityKeyIdentifier { issuer: Some(vec![uri("http://x/")]), ..Default::default() };
+        assert_eq!(issuer_only.to_der(), Err(Error::Value));
+        let both = AuthorityKeyIdentifier { issuer: Some(vec![uri("http://x/")]), ..serial_only };
+        assert_eq!(AuthorityKeyIdentifier::from_der(&both.to_der().unwrap()).unwrap(), both);
+    }
+
+    #[test]
+    fn distribution_points_follow_section_4_2_1_13() {
+        let dir = sample_tbs().issuer;
+        let dps = |p: DistributionPoint| CrlDistributionPoints(vec![p]).to_der();
+        // Nothing, or only reasons.
+        assert_eq!(dps(DistributionPoint::default()), Err(Error::Value));
+        assert_eq!(CrlDistributionPoints::from_der(&[0x30, 0x02, 0x30, 0x00]), Err(Error::Value));
+        let reasons =
+            DistributionPoint { reasons: Some(ReasonFlags(ReasonFlags::KEY_COMPROMISE)), ..Default::default() };
+        assert_eq!(dps(reasons), Err(Error::Value));
+        // A CRL issuer named other than by its distinguished name.
+        let dns_issuer = DistributionPoint {
+            name: Some(DistributionPointName::Full(vec![uri("http://x/")])),
+            crl_issuer: Some(vec![GeneralName::Dns("x".into())]),
+            ..Default::default()
+        };
+        assert_eq!(dps(dns_issuer), Err(Error::Value));
+        // A relative name with two CRL issuers.
+        let two = DistributionPoint {
+            name: Some(DistributionPointName::RelativeToIssuer(dir.rdns[0].clone())),
+            crl_issuer: Some(vec![GeneralName::Directory(dir.clone()), GeneralName::Directory(dir.clone())]),
+            ..Default::default()
+        };
+        assert_eq!(dps(two.clone()), Err(Error::Value));
+        let one = DistributionPoint { crl_issuer: Some(vec![GeneralName::Directory(dir)]), ..two };
+        assert!(dps(one).is_ok());
+    }
+
+    #[test]
+    fn issuers_are_not_empty_and_an_empty_subject_needs_a_critical_san() {
+        assert_eq!(TbsCertificate { issuer: Name::default(), ..sample_tbs() }.to_der(), Err(Error::Empty));
+        let crl = TbsCertList {
+            version: Version::V1,
+            signature: sample_tbs().signature,
+            issuer: Name::default(),
+            this_update: Time::from_unix(0).unwrap(),
+            next_update: None,
+            revoked: vec![],
+            extensions: vec![],
+        };
+        assert_eq!(crl.to_der(), Err(Error::Empty));
+        assert!(TbsCertList { issuer: sample_tbs().issuer, ..crl }.to_der().is_ok());
+        let no_subject = TbsCertificate { subject: Name::default(), ..sample_tbs() };
+        assert_eq!(no_subject.to_der(), Err(Error::Value));
+        let san = SubjectAltName(vec![GeneralName::Email("a@example.com".into())]);
+        let soft = TbsCertificate { extensions: vec![san.to_extension(false).unwrap()], ..no_subject.clone() };
+        assert_eq!(soft.to_der(), Err(Error::Value));
+        let hard = TbsCertificate { extensions: vec![san.to_extension(true).unwrap()], ..no_subject };
+        assert_eq!(TbsCertificate::parse(&hard.to_der().unwrap()).unwrap(), hard);
+    }
+
+    #[test]
+    fn a_key_usage_has_a_bit_set() {
+        assert_eq!(KeyUsage(0).to_der(), Err(Error::Value));
+        assert_eq!(KeyUsage::from_der(&[0x03, 0x01, 0x00]), Err(Error::Value));
+        assert_eq!(KeyUsage::from_der(&[0x03, 0x02, 0x07, 0x00]), Err(Error::Value));
+    }
+
+    #[test]
+    fn a_fractional_start_begins_at_the_next_second() {
+        let v = Validity {
+            not_before: Time::Generalized("19700101000000.5Z".into()),
+            not_after: Time::Generalized("19700101000010.5Z".into()),
+        };
+        assert!(!v.contains(0));
+        assert!(v.contains(1));
+        assert!(v.contains(10));
+        assert!(!v.contains(11));
+    }
+
+    #[test]
+    fn common_name_is_the_last_one_or_none() {
+        let mut name = Name::default();
+        name.push(oid(oid::COMMON_NAME), text(StringKind::Utf8, "first"));
+        assert_eq!(name.common_name(), Some("first"));
+        name.push(oid(oid::COMMON_NAME), Value::Raw(vec![0x14, 0x01, b'a']));
+        assert_eq!(name.common_name(), None);
     }
 }

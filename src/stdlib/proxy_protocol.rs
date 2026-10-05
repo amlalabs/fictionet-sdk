@@ -23,7 +23,8 @@
 //! its checksum. The specification says a receiver accepts a version 2
 //! LOCAL header and discards its address block, so a LOCAL header whose
 //! family, addresses or TLVs cannot be read gives no addresses and no TLVs
-//! instead of an error.
+//! instead of an error. A CRC32C TLV that the reader can find in a LOCAL
+//! header is still checked, even when a later TLV cannot be read.
 //!
 //! ```
 //! use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Step, Tlv, Transport, V2};
@@ -57,6 +58,7 @@
 //! assert_eq!(Header::parse(&bytes), Ok(Some((header, bytes.len()))));
 //! ```
 
+use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// What every version 1 header starts with.
@@ -91,6 +93,10 @@ pub const MAX_UNIQUE_ID: usize = 128;
 /// The length of the fixed part of an `SSL` TLV's value: the client flags
 /// and the verify result.
 pub const SSL_FIXED_LEN: usize = 5;
+/// The longest value any TLV can hold inside a header: the whole body less
+/// the TLV's own type and length. [`Tlv::from_raw`] and [`Ssl::parse`]
+/// refuse longer values.
+pub const MAX_TLV_VALUE: usize = V2_MAX_BODY - 3;
 
 /// The TLV types this module names. Others are kept as [`Tlv::Other`].
 pub mod tlv_type {
@@ -246,9 +252,13 @@ pub enum SslTlv {
     CommonName(Vec<u8>),
     /// `SSL_CIPHER`: the cipher, such as `ECDHE-RSA-AES128-GCM-SHA256`.
     Cipher(Vec<u8>),
-    /// `SSL_SIG_ALG`: the algorithm that signed the client certificate.
+    /// `SSL_SIG_ALG`: the algorithm that signed the certificate the proxy
+    /// itself presented to the client (the frontend's certificate, not the
+    /// client's), such as `SHA256`.
     SigAlg(Vec<u8>),
-    /// `SSL_KEY_ALG`: the algorithm of the client certificate's key.
+    /// `SSL_KEY_ALG`: the algorithm of the key of the certificate the proxy
+    /// itself presented to the client (the frontend's certificate, not the
+    /// client's), such as `RSA2048`.
     KeyAlg(Vec<u8>),
     /// Any other sub-type. One built by hand with a type named above reads
     /// back as that type's variant.
@@ -286,8 +296,9 @@ pub enum Error {
     /// A TLV or SSL sub-TLV ran past the end of what holds it.
     TlvTruncated,
     /// A TLV of this type had a value of the wrong length: a CRC32C not 4
-    /// bytes, a UNIQUE_ID over [`MAX_UNIQUE_ID`], or an SSL value shorter
-    /// than [`SSL_FIXED_LEN`].
+    /// bytes, a UNIQUE_ID over [`MAX_UNIQUE_ID`], an SSL value shorter
+    /// than [`SSL_FIXED_LEN`], or any value over [`MAX_TLV_VALUE`]. A LOCAL
+    /// header gives this error only for a CRC32C TLV.
     TlvLength(u8),
     /// The CRC32C TLV did not match the header, or there was more than one.
     Checksum,
@@ -582,9 +593,10 @@ fn parse_v2(b: &[u8]) -> Result<Option<(V2, usize)>, Error> {
     match parse_v2_body(b, fam, total) {
         Ok((addresses, tlvs)) => Ok(Some((V2 { command, addresses, tlvs }, total))),
         // The specification says a receiver accepts a LOCAL header and
-        // discards its address block, family included. A wrong checksum
-        // still makes the header invalid.
-        Err(e) if !proxy && e != Error::Checksum => {
+        // discards its address block, family included. A wrong checksum,
+        // or a CRC32C TLV that cannot be checked, still makes the header
+        // invalid.
+        Err(e) if !proxy && e != Error::Checksum && e != Error::TlvLength(tlv_type::CRC32C) => {
             Ok(Some((V2 { command, addresses: Addresses::Unspec, tlvs: Vec::new() }, total)))
         }
         Err(e) => Err(e),
@@ -630,20 +642,31 @@ fn parse_v2_body(b: &[u8], fam: u8, total: usize) -> Result<(Addresses, Vec<Tlv>
         }
         _ => Addresses::Unspec,
     };
-    let mut tlvs = Vec::new();
+    // First the framing and the checksum, so that a TLV that cannot be
+    // read never hides a wrong checksum before it.
+    let start = V2_HEADER_LEN + block;
     let mut crc_at = None;
-    let mut i = V2_HEADER_LEN + block;
+    let mut framing = Ok(());
+    let mut i = start;
     while i < total {
-        let (kind, value, value_at, next) = next_tlv(b, i, total)?;
-        let tlv = Tlv::from_raw(kind, value)?;
-        if kind == tlv_type::CRC32C {
-            if crc_at.is_some() {
-                return Err(Error::Checksum);
+        match next_tlv(b, i, total) {
+            Ok((kind, value, value_at, next)) => {
+                if kind == tlv_type::CRC32C {
+                    if value.len() != 4 {
+                        return Err(Error::TlvLength(kind));
+                    }
+                    if crc_at.is_some() {
+                        return Err(Error::Checksum);
+                    }
+                    crc_at = Some(value_at);
+                }
+                i = next;
             }
-            crc_at = Some(value_at);
+            Err(e) => {
+                framing = Err(e);
+                break;
+            }
         }
-        tlvs.push(tlv);
-        i = next;
     }
     if let Some(at) = crc_at {
         let expected = u32::from_be_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
@@ -653,6 +676,14 @@ fn parse_v2_body(b: &[u8], fam: u8, total: usize) -> Result<(Addresses, Vec<Tlv>
         if crc != expected {
             return Err(Error::Checksum);
         }
+    }
+    framing?;
+    let mut tlvs = Vec::new();
+    let mut i = start;
+    while i < total {
+        let (kind, value, _, next) = next_tlv(b, i, total)?;
+        tlvs.push(Tlv::from_raw(kind, value)?);
+        i = next;
     }
     Ok((addresses, tlvs))
 }
@@ -672,9 +703,39 @@ fn next_tlv(b: &[u8], i: usize, end: usize) -> Result<(u8, &[u8], usize, usize),
     Ok((kind, &b[value_at..next], value_at, next))
 }
 
+/// Checks that `value` is valid for a TLV of type `kind`, as
+/// [`Tlv::from_raw`] does, without copying it.
+fn check_raw(kind: u8, value: &[u8]) -> Result<(), Error> {
+    let ok = match kind {
+        _ if value.len() > MAX_TLV_VALUE => false,
+        tlv_type::CRC32C => value.len() == 4,
+        tlv_type::UNIQUE_ID => value.len() <= MAX_UNIQUE_ID,
+        tlv_type::SSL => {
+            check_ssl(value)?;
+            true
+        }
+        _ => true,
+    };
+    if ok { Ok(()) } else { Err(Error::TlvLength(kind)) }
+}
+
+/// Checks an `SSL` TLV's value, as [`Ssl::parse`] does, without copying it.
+fn check_ssl(value: &[u8]) -> Result<(), Error> {
+    if value.len() < SSL_FIXED_LEN || value.len() > MAX_TLV_VALUE {
+        return Err(Error::TlvLength(tlv_type::SSL));
+    }
+    let mut i = SSL_FIXED_LEN;
+    while i < value.len() {
+        i = next_tlv(value, i, value.len())?.3;
+    }
+    Ok(())
+}
+
 impl Tlv {
-    /// Reads a TLV of type `kind` from its value.
+    /// Reads a TLV of type `kind` from its value. A value longer than
+    /// [`MAX_TLV_VALUE`], which no header can hold, is refused.
     pub fn from_raw(kind: u8, value: &[u8]) -> Result<Tlv, Error> {
+        check_raw(kind, value)?;
         Ok(match kind {
             tlv_type::ALPN => Tlv::Alpn(value.to_vec()),
             tlv_type::AUTHORITY => Tlv::Authority(value.to_vec()),
@@ -683,7 +744,6 @@ impl Tlv {
                 Err(_) => return Err(Error::TlvLength(kind)),
             },
             tlv_type::NOOP => Tlv::Noop(value.to_vec()),
-            tlv_type::UNIQUE_ID if value.len() > MAX_UNIQUE_ID => return Err(Error::TlvLength(kind)),
             tlv_type::UNIQUE_ID => Tlv::UniqueId(value.to_vec()),
             tlv_type::SSL => Tlv::Ssl(Ssl::parse(value)?),
             tlv_type::NETNS => Tlv::NetNs(value.to_vec()),
@@ -707,27 +767,27 @@ impl Tlv {
 
     /// The TLV's value as a writer puts it out: a UNIQUE_ID is cut to
     /// [`MAX_UNIQUE_ID`] bytes, and an `Other` whose type this module
-    /// names but whose value it cannot read gives `None`.
-    fn value(&self) -> Option<Vec<u8>> {
+    /// names but whose value it cannot read gives `None`. Byte values are
+    /// borrowed, not copied.
+    fn value(&self) -> Option<Cow<'_, [u8]>> {
         Some(match self {
-            Tlv::Alpn(v) | Tlv::Authority(v) | Tlv::Noop(v) | Tlv::NetNs(v) => v.clone(),
-            Tlv::Crc32c(c) => c.to_be_bytes().to_vec(),
-            Tlv::UniqueId(v) => v[..v.len().min(MAX_UNIQUE_ID)].to_vec(),
-            Tlv::Ssl(s) => s.to_value(),
+            Tlv::Alpn(v) | Tlv::Authority(v) | Tlv::Noop(v) | Tlv::NetNs(v) => Cow::Borrowed(&v[..]),
+            Tlv::Crc32c(c) => Cow::Owned(c.to_be_bytes().to_vec()),
+            Tlv::UniqueId(v) => Cow::Borrowed(&v[..v.len().min(MAX_UNIQUE_ID)]),
+            Tlv::Ssl(s) => Cow::Owned(s.to_value()),
             Tlv::Other { kind, value } => {
-                Tlv::from_raw(*kind, value).ok()?;
-                value.clone()
+                check_raw(*kind, value).ok()?;
+                Cow::Borrowed(&value[..])
             }
         })
     }
 }
 
 impl Ssl {
-    /// Reads an `SSL` TLV's value.
+    /// Reads an `SSL` TLV's value. A value longer than [`MAX_TLV_VALUE`],
+    /// which no header can hold, is refused.
     pub fn parse(value: &[u8]) -> Result<Ssl, Error> {
-        if value.len() < SSL_FIXED_LEN {
-            return Err(Error::TlvLength(tlv_type::SSL));
-        }
+        check_ssl(value)?;
         let client = value[0];
         let verify = u32::from_be_bytes([value[1], value[2], value[3], value[4]]);
         let mut tlvs = Vec::new();
@@ -744,7 +804,7 @@ impl Ssl {
     /// TLV can hold are left out.
     pub fn to_value(&self) -> Vec<u8> {
         // The value must fit in a TLV inside a header body.
-        let limit = V2_MAX_BODY - 3;
+        let limit = MAX_TLV_VALUE;
         let mut out = vec![self.client];
         out.extend_from_slice(&self.verify.to_be_bytes());
         for t in &self.tlvs {
@@ -1252,6 +1312,62 @@ mod tests {
     }
 
     #[test]
+    fn a_later_bad_tlv_does_not_hide_a_wrong_checksum() {
+        // LOCAL: a wrong checksum followed by a truncated TLV. The checksum
+        // should be 0x5c5f83af.
+        let local = with_prefix(&[0x20, 0x00, 0x00, 0x08, 0x03, 0x00, 0x04, 0, 0, 0, 0, 0xff]);
+        assert_eq!(Header::parse(&local), Err(Error::Checksum));
+        // The same header with the right checksum is accepted, as LOCAL.
+        let mut right = local.clone();
+        right[19..23].copy_from_slice(&0x5c5f_83afu32.to_be_bytes());
+        let empty = Header::V2(V2 { command: Command::Local, addresses: Addresses::Unspec, tlvs: vec![] });
+        assert_eq!(Header::parse(&right), Ok(Some((empty, 24))));
+        // A checksum after a TLV whose value is bad is still checked.
+        let local = with_prefix(&[0x20, 0x00, 0x00, 0x0a, 0x20, 0x00, 0x00, 0x03, 0x00, 0x04, 0, 0, 0, 0]);
+        assert_eq!(Header::parse(&local), Err(Error::Checksum));
+        let mut proxy = local.clone();
+        proxy[12] = 0x21;
+        assert_eq!(Header::parse(&proxy), Err(Error::Checksum));
+        // A CRC32C TLV that cannot be checked is refused under LOCAL too.
+        let local = with_prefix(&[0x20, 0x00, 0x00, 0x05, 0x03, 0x00, 0x02, 0, 0]);
+        assert_eq!(Header::parse(&local), Err(Error::TlvLength(tlv_type::CRC32C)));
+    }
+
+    #[test]
+    fn raw_readers_refuse_values_no_header_can_hold() {
+        // An SSL value over 65,532 bytes cannot be in any header.
+        let mut ssl = vec![0, 0, 0, 0, 1];
+        for _ in 0..21_844 {
+            ssl.extend_from_slice(&[0xe0, 0, 0]);
+        }
+        assert_eq!(ssl.len(), 65_537);
+        assert_eq!(Ssl::parse(&ssl), Err(Error::TlvLength(tlv_type::SSL)));
+        assert_eq!(Tlv::from_raw(tlv_type::SSL, &ssl), Err(Error::TlvLength(tlv_type::SSL)));
+        assert_eq!(Tlv::from_raw(tlv_type::NOOP, &[0; MAX_TLV_VALUE + 1]), Err(Error::TlvLength(tlv_type::NOOP)));
+        assert_eq!(Tlv::from_raw(0xe0, &[0; MAX_TLV_VALUE + 1]), Err(Error::TlvLength(0xe0)));
+        // The longest that fits reads, and writes back whole.
+        ssl.truncate(MAX_TLV_VALUE - (MAX_TLV_VALUE - SSL_FIXED_LEN) % 3);
+        let s = Ssl::parse(&ssl).unwrap();
+        assert_eq!(s.to_value(), ssl);
+        let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Ssl(s)] });
+        assert_eq!(reparses(&h), h);
+    }
+
+    #[test]
+    fn writers_borrow_values_they_check() {
+        // Writing does not copy a byte value just to check or measure it.
+        let big = vec![0u8; 100_000];
+        for t in [
+            Tlv::Noop(big.clone()),
+            Tlv::UniqueId(big.clone()),
+            Tlv::Other { kind: 0xe0, value: big.clone() },
+            Tlv::Other { kind: tlv_type::SSL, value: big.clone() },
+        ] {
+            assert!(!matches!(t.value(), Some(std::borrow::Cow::Owned(_))), "{}", t.kind());
+        }
+    }
+
+    #[test]
     fn v1_unknown_is_a_word() {
         assert_eq!(Header::parse(b"PROXY UNKNOWNfoo\r\n"), Err(Error::V1Syntax));
         assert_eq!(Header::parse(b"PROXY UNKNOWN4 1.2.3.4 5.6.7.8 1 2\r\n"), Err(Error::V1Syntax));
@@ -1554,6 +1670,7 @@ mod tests {
             let (back, used) = Header::parse(&bytes).unwrap().unwrap();
             assert_eq!(used, bytes.len());
             assert_eq!(reparses(&back), back);
+            assert_eq!(back.to_bytes(), bytes);
             // Every part of a written header needs more.
             for n in 0..bytes.len().min(300) {
                 assert_eq!(Header::parse(&bytes[..n]), Ok(None), "{n} bytes of {bytes:?}");

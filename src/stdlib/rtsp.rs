@@ -81,6 +81,9 @@ pub const MAX_TRANSPORTS: usize = 16;
 pub const MAX_PARAMS: usize = 32;
 /// The longest session identifier, from RFC 7826.
 pub const MAX_SESSION_ID: usize = 256;
+/// The largest number of seconds in a Session timeout or a normal play
+/// time: 19 digits, as RFC 7826 section 20.2.3 allows.
+const MAX_SECONDS: u64 = 9_999_999_999_999_999_999;
 /// The byte that starts an interleaved frame.
 pub const INTERLEAVED_MARKER: u8 = b'$';
 /// The length of an interleaved frame's header: the marker, the channel
@@ -136,7 +139,8 @@ pub enum Error {
     /// More header fields than [`MAX_HEADERS`], more transports than
     /// [`MAX_TRANSPORTS`], or more parameters than [`MAX_PARAMS`].
     TooMany,
-    /// A CR or LF in the head that is not part of a CRLF pair.
+    /// A CR in the head that is not part of a CRLF pair, or, in RTSP 2.0,
+    /// an LF that is not.
     LineEnding,
     /// The head is not UTF-8.
     Utf8,
@@ -150,7 +154,8 @@ pub enum Error {
     HeaderLine,
     /// A header value holds a control character.
     HeaderValue,
-    /// A Content-Length is not a number, or two disagree.
+    /// A Content-Length is not a number, or two disagree, or a body is
+    /// written on an RTSP 1.0 response that may not carry one.
     ContentLength,
     /// Bytes read as an interleaved frame do not start with `$`.
     Marker,
@@ -176,7 +181,7 @@ impl std::fmt::Display for Error {
             Error::Version => f.write_str("version is not RTSP/1.0 or RTSP/2.0"),
             Error::HeaderLine => f.write_str("malformed header line"),
             Error::HeaderValue => f.write_str("control character in a header value"),
-            Error::ContentLength => f.write_str("bad Content-Length"),
+            Error::ContentLength => f.write_str("bad Content-Length or body"),
             Error::Marker => f.write_str("interleaved frame does not start with $"),
             Error::Missing(name) => write!(f, "no {name} header"),
             Error::Malformed(name) => write!(f, "malformed {name}"),
@@ -246,10 +251,14 @@ impl Message {
     }
 
     /// Reads the message at the start of `b`, a TCP byte stream. CRLFs
-    /// before it are skipped. It returns `Ok(None)` if `b` holds only part
-    /// of a message, and otherwise the message and how many bytes of `b` it
-    /// took. A message with no Content-Length has no body, as RFC 7826
-    /// section 18.17 says.
+    /// and LFs before it are skipped. It returns `Ok(None)` if `b` holds
+    /// only part of a message, and otherwise the message and how many
+    /// bytes of `b` it took. A message with no Content-Length has no body,
+    /// as RFC 7826 section 18.17 says. An RTSP 1.0 response with status
+    /// 1xx, 204 or 304 has no body whatever its Content-Length says, as
+    /// RFC 2326 section 4.4 says. RTSP 1.0 lines may also end with a bare
+    /// LF, as RFC 2326 section 4 asks receivers to allow; in RTSP 2.0 that
+    /// is [`Error::LineEnding`].
     pub fn parse(b: &[u8]) -> Result<Option<(Message, usize)>, Error> {
         let skip = skip_crlfs(b);
         let avail = &b[skip..];
@@ -269,7 +278,9 @@ impl Message {
     /// length is written last. Header values are written trimmed. A method
     /// that is not a token or starts with `$`, a request URI with spaces, a
     /// status outside 100 to 599, a bad header name, a control character,
-    /// too many headers, or a head or body over its limit is an error.
+    /// too many headers, or a head or body over its limit is an error. So
+    /// is a body on an RTSP 1.0 response with status 1xx, 204 or 304
+    /// ([`Error::ContentLength`]), since a reader would not take it.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         if self.body.len() > MAX_BODY {
             return Err(Error::TooLong);
@@ -289,6 +300,9 @@ impl Message {
             StartLine::Status { version, code, reason } => {
                 if !(100..=599).contains(code) || !valid_value(reason) {
                     return Err(Error::StartLine);
+                }
+                if !self.body.is_empty() && bodyless(*version, *code) {
+                    return Err(Error::ContentLength);
                 }
                 out.extend_from_slice(version.as_str().as_bytes());
                 out.extend_from_slice(format!(" {code} ").as_bytes());
@@ -411,10 +425,12 @@ impl Message {
     }
 
     /// The CSeq: the request's sequence number, which its response copies.
-    /// It is 1 to 9 digits, as RFC 7826 section 18.20 says.
+    /// In RTSP 2.0 it is 1 to 9 digits, as RFC 7826 section 20.2.3 says.
+    /// RTSP 1.0 sets no limit; a value over `u32::MAX` is
+    /// [`Error::Malformed`].
     pub fn cseq(&self) -> Result<u32, Error> {
         let v = self.single("CSeq")?;
-        if v.len() > 9 {
+        if self.version() == Version::Rtsp20 && v.len() > 9 {
             return Err(Error::Malformed("CSeq"));
         }
         let n = parse_u64(v).ok_or(Error::Malformed("CSeq"))?;
@@ -441,9 +457,15 @@ impl Message {
         Ok(out)
     }
 
-    /// The Range header: which part of a stream to play.
+    /// The Range header: which part of a stream to play. RTSP 2.0 has no
+    /// `time` parameter, so in an RTSP 2.0 message one is
+    /// [`Error::Malformed`].
     pub fn range(&self) -> Result<Range, Error> {
-        Range::parse(self.single("Range")?)
+        let range = Range::parse(self.single("Range")?)?;
+        if self.version() == Version::Rtsp20 && range.time.is_some() {
+            return Err(Error::Malformed("Range"));
+        }
+        Ok(range)
     }
 
     /// The Content-Length, if the message has one.
@@ -459,15 +481,16 @@ impl Message {
         Ok(length)
     }
 
-    /// A response to this request in the same version, with its CSeq and
-    /// Session headers copied in order. RFC 7826 section 18.20 has every
-    /// response copy the CSeq.
+    /// A response to this request in the same version, with its CSeq,
+    /// Session and Timestamp headers copied in order. RFC 7826 section
+    /// 18.20 has every response copy the CSeq, and RFC 2326 section 12.38
+    /// and RFC 7826 section 18.53 have it echo the Timestamp.
     pub fn reply(&self, code: u16, reason: &str) -> Message {
         let mut reply = Message::response(self.version(), code, reason);
         reply.headers = self
             .headers
             .iter()
-            .filter(|h| h.name.eq_ignore_ascii_case("CSeq") || h.name.eq_ignore_ascii_case("Session"))
+            .filter(|h| ["CSeq", "Session", "Timestamp"].iter().any(|n| h.name.eq_ignore_ascii_case(n)))
             .cloned()
             .collect();
         reply
@@ -540,7 +563,7 @@ pub enum Item {
 
 impl Item {
     /// Reads the message or frame at the start of `b`, a TCP byte stream.
-    /// CRLFs before it are skipped. A `$` starts a frame, and anything else
+    /// CRLFs and LFs before it are skipped. A `$` starts a frame, and anything else
     /// a message. It returns `Ok(None)` if `b` holds only part of one, and
     /// otherwise the item and how many bytes of `b` it took.
     pub fn parse(b: &[u8]) -> Result<Option<(Item, usize)>, Error> {
@@ -671,13 +694,14 @@ pub struct Session {
     /// The identifier: 1 to [`MAX_SESSION_ID`] letters, digits and
     /// `$ - _ . +`.
     pub id: String,
-    /// The `timeout` parameter, in seconds.
+    /// The `timeout` parameter, in seconds, at most 19 digits.
     pub timeout: Option<u64>,
 }
 
 impl Session {
     /// Reads a Session header's value, such as `47112344;timeout=60`.
-    /// Parameters other than `timeout` are [`Error::Malformed`].
+    /// Parameters other than `timeout`, and a timeout over 19 digits, are
+    /// [`Error::Malformed`].
     pub fn parse(v: &str) -> Result<Session, Error> {
         const BAD: Error = Error::Malformed("Session");
         let mut parts = v.split(';');
@@ -691,14 +715,15 @@ impl Session {
             if !trim_ws(name).eq_ignore_ascii_case("timeout") || timeout.is_some() {
                 return Err(BAD);
             }
-            timeout = Some(parse_u64(trim_ws(value)).ok_or(BAD)?);
+            timeout = Some(parse_u64(trim_ws(value)).filter(|&t| t <= MAX_SECONDS).ok_or(BAD)?);
         }
         Ok(Session { id: id.to_string(), timeout })
     }
 
-    /// The header value. A bad identifier is [`Error::Malformed`].
+    /// The header value. A bad identifier, or a timeout over 19 digits,
+    /// is [`Error::Malformed`].
     pub fn to_value(&self) -> Result<String, Error> {
-        if !valid_session_id(&self.id) {
+        if !valid_session_id(&self.id) || self.timeout.is_some_and(|t| t > MAX_SECONDS) {
             return Err(Error::Malformed("Session"));
         }
         Ok(match self.timeout {
@@ -716,7 +741,9 @@ pub enum Lower {
     /// TCP, usually the RTSP connection itself, with interleaved frames.
     Tcp,
     /// Any other token, which RFC 7826 allows, kept as written. It is
-    /// never `TCP` or `UDP` in any case.
+    /// never `TCP` or `UDP` in any case. For a transport identifier with
+    /// more than three parts, which RFC 7826's `other-trans` allows, it
+    /// holds every part after the profile, joined by `/`.
     Other(String),
 }
 
@@ -766,16 +793,21 @@ pub enum TransportParam {
     /// media comes from.
     SrcAddr(Vec<String>),
     /// `setup=active`, `passive` or `actpass` (RTSP 2.0): which side opens
-    /// a TCP media connection.
+    /// a TCP media connection. The value is one of those three in any
+    /// case, kept as written.
     Setup(String),
     /// `connection=new` or `existing` (RTSP 2.0): whether to reuse a TCP
-    /// media connection.
+    /// media connection. The value is one of those two in any case, kept
+    /// as written.
     Connection(String),
     /// `RTCP-mux` (RTSP 2.0): RTP and RTCP share one port.
     RtcpMux,
     /// Any other parameter, such as `MIKEY`. The value is kept as written:
-    /// empty, printable ASCII with no `"`, `;` or `,`, or a quoted string
-    /// with its quotes.
+    /// a run, possibly empty, of quoted strings (with their quotes) and
+    /// printable ASCII other than `"`, `;` and `,`, as RFC 7826's
+    /// `trn-par-value` has it. Printable bytes outside RFC 7826's
+    /// `rtsp-unreserved`, such as `:` and `/`, are kept for RTSP 1.0 peers
+    /// and base64 values.
     #[allow(missing_docs)]
     Other { name: String, value: Option<String> },
 }
@@ -808,7 +840,9 @@ const KNOWN_PARAMS: [&str; 18] = [
 pub struct Transport {
     /// The transport protocol, such as `RTP`.
     pub protocol: String,
-    /// The profile, such as `AVP`, `SAVP`, `AVPF` or `SAVPF`.
+    /// The profile, such as `AVP`, `SAVP`, `AVPF` or `SAVPF`. It is empty
+    /// when the transport identifier is one token, as RFC 7826's
+    /// `other-trans` allows, and then `lower` is `None`.
     pub profile: String,
     /// The lower transport, if named. With none, it is UDP.
     pub lower: Option<Lower>,
@@ -819,26 +853,30 @@ pub struct Transport {
 impl Transport {
     /// Reads one transport specification: `protocol/profile`, an
     /// optional `/lower`, and parameters after semicolons. RFC 7826 also
-    /// allows other transport names with one token or more than three.
-    /// Those are [`Error::Malformed`].
+    /// allows other transport names with one token or more than three:
+    /// one token leaves the profile empty, and the parts past the third
+    /// go into [`Lower::Other`]. A specification naming both `unicast`
+    /// and `multicast` is [`Error::Malformed`], since both RFCs make them
+    /// exclusive.
     pub fn parse(spec: &str) -> Result<Transport, Error> {
         const BAD: Error = Error::Malformed("Transport");
         let parts = split_unquoted(spec, b';', MAX_PARAMS + 1, "Transport")?;
         let mut parts = parts.into_iter();
         let id = trim_ws(parts.next().unwrap_or(""));
-        let mut names = id.split('/');
+        let mut names = id.splitn(3, '/');
         let protocol = names.next().filter(|p| is_token(p)).ok_or(BAD)?;
-        let profile = names.next().filter(|p| is_token(p)).ok_or(BAD)?;
+        let profile = match names.next() {
+            None => "",
+            Some(p) if is_token(p) => p,
+            Some(_) => return Err(BAD),
+        };
         let lower = match names.next() {
             None => None,
             Some(l) if l.eq_ignore_ascii_case("TCP") => Some(Lower::Tcp),
             Some(l) if l.eq_ignore_ascii_case("UDP") => Some(Lower::Udp),
-            Some(l) if is_token(l) => Some(Lower::Other(l.to_string())),
+            Some(l) if valid_other_lower(l) => Some(Lower::Other(l.to_string())),
             Some(_) => return Err(BAD),
         };
-        if names.next().is_some() {
-            return Err(BAD);
-        }
         let mut params = Vec::new();
         for p in parts {
             let p = trim_ws(p);
@@ -848,6 +886,9 @@ impl Transport {
         }
         if params.len() > MAX_PARAMS {
             return Err(Error::TooMany);
+        }
+        if both_deliveries(&params) {
+            return Err(BAD);
         }
         Ok(Transport { protocol: protocol.to_string(), profile: profile.to_string(), lower, params })
     }
@@ -862,23 +903,32 @@ impl Transport {
     }
 
     /// The specification as text. A protocol or profile that is not a
-    /// token, a parameter value that would not read back, an `Other` named
-    /// like a known parameter, or more than [`MAX_PARAMS`] parameters or
-    /// list items is an error.
+    /// token (the profile may be empty only with no lower transport), a
+    /// parameter value that would not read back, an `Other` named like a
+    /// known parameter, both `unicast` and `multicast`, or more than
+    /// [`MAX_PARAMS`] parameters or list items is an error.
     pub fn to_value(&self) -> Result<String, Error> {
         const BAD: Error = Error::Malformed("Transport");
-        if !is_token(&self.protocol) || !is_token(&self.profile) {
+        let profile_ok = is_token(&self.profile) || (self.profile.is_empty() && self.lower.is_none());
+        if !is_token(&self.protocol) || !profile_ok {
             return Err(BAD);
         }
         if self.params.len() > MAX_PARAMS {
             return Err(Error::TooMany);
         }
-        let mut out = format!("{}/{}", self.protocol, self.profile);
+        if both_deliveries(&self.params) {
+            return Err(BAD);
+        }
+        let mut out = self.protocol.clone();
+        if !self.profile.is_empty() {
+            out.push('/');
+            out.push_str(&self.profile);
+        }
         match &self.lower {
             Some(Lower::Tcp) => out.push_str("/TCP"),
             Some(Lower::Udp) => out.push_str("/UDP"),
             Some(Lower::Other(l)) => {
-                if !is_token(l) || l.eq_ignore_ascii_case("TCP") || l.eq_ignore_ascii_case("UDP") {
+                if !valid_other_lower(l) {
                     return Err(BAD);
                 }
                 out.push('/');
@@ -953,8 +1003,11 @@ impl Transport {
         })
     }
 
-    /// Whether the specification asks for multicast. Unicast is the
-    /// default.
+    /// Whether the specification names `multicast`. With neither
+    /// `unicast` nor `multicast` named, RFC 2326 section 12.39 makes
+    /// multicast the default, while RFC 7826 section 18.54 requires one of
+    /// them; many RTSP 1.0 servers take such a request as unicast, so world
+    /// code that cares checks for [`TransportParam::Unicast`] too.
     pub fn is_multicast(&self) -> bool {
         self.params.iter().any(|p| matches!(p, TransportParam::Multicast))
     }
@@ -1020,7 +1073,8 @@ impl SmpteRate {
 }
 
 /// A SMPTE time code: hours, minutes, seconds, and optionally frames and
-/// hundredths of a frame. Each is at most 99.
+/// hundredths of a frame. Hours and subframes are at most 99, minutes and
+/// seconds at most 59, and frames below the rate (30 or 25).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Smpte {
     /// Hours.
@@ -1040,7 +1094,10 @@ impl Range {
     /// `clock=19961108T142300Z-;time=19970123T153600Z`, or a format alone,
     /// such as `npt`. A list of spans, which RFC 2326 allows and RFC 7826
     /// does not, is [`Error::Malformed`]. So are SMPTE subframes with no
-    /// frames, which RFC 2326 allows and RFC 7826 does not.
+    /// frames, which RFC 2326 allows and RFC 7826 does not. Times must
+    /// exist: SMPTE minutes and seconds below 60 and frames below the
+    /// rate, a real UTC date and time with at most 9 fraction digits, and
+    /// normal play time below 10^19 seconds.
     pub fn parse(v: &str) -> Result<Range, Error> {
         const BAD: Error = Error::Malformed("Range");
         let mut parts = v.split(';');
@@ -1076,7 +1133,8 @@ impl Range {
                 .into_iter()
                 .find(|r| unit.eq_ignore_ascii_case(r.as_str()))
                 .ok_or(BAD)?;
-            Span::Smpte { rate, start: opt(a, parse_smpte).ok_or(BAD)?, end: opt(b, parse_smpte).ok_or(BAD)? }
+            let smpte = |s: &str| parse_smpte(s, rate);
+            Span::Smpte { rate, start: opt(a, smpte).ok_or(BAD)?, end: opt(b, smpte).ok_or(BAD)? }
         };
         Ok(Range { span, time })
     }
@@ -1089,7 +1147,8 @@ impl Range {
         let (unit, start, end) = match &self.span {
             Span::Npt { start, end } => ("npt", opt(start.as_ref(), write_npt), opt(end.as_ref(), write_npt)),
             Span::Smpte { rate, start, end } => {
-                (rate.as_str(), opt(start.as_ref(), write_smpte), opt(end.as_ref(), write_smpte))
+                let smpte = |t: &Smpte| write_smpte(t, *rate);
+                (rate.as_str(), opt(start.as_ref(), smpte), opt(end.as_ref(), smpte))
             }
             Span::Clock { start, end } => {
                 let utc = |s: &String| valid_utc(s).then(|| s.clone());
@@ -1152,12 +1211,16 @@ fn parse_npt(s: &str) -> Option<Npt> {
     } else {
         parse_u64(whole)?
     };
+    if seconds > MAX_SECONDS {
+        return None;
+    }
     Some(Npt::Time { seconds, nanos })
 }
 
 fn write_npt(t: &Npt) -> Option<String> {
     match *t {
         Npt::Now => Some("now".to_string()),
+        Npt::Time { seconds, .. } if seconds > MAX_SECONDS => None,
         Npt::Time { seconds, nanos: 0 } => Some(seconds.to_string()),
         Npt::Time { seconds, nanos } if nanos < 1_000_000_000 => {
             let f = format!("{nanos:09}");
@@ -1168,8 +1231,8 @@ fn write_npt(t: &Npt) -> Option<String> {
 }
 
 /// Reads `hh:mm:ss`, `hh:mm:ss:ff` or `hh:mm:ss:ff.ss`, each part one or
-/// two digits.
-fn parse_smpte(s: &str) -> Option<Smpte> {
+/// two digits, and checks the time exists at `rate`.
+fn parse_smpte(s: &str, rate: SmpteRate) -> Option<Smpte> {
     let two = |p: &str| if (1..=2).contains(&p.len()) { parse_u64(p).map(|n| n as u8) } else { None };
     let mut parts = s.split(':');
     let (h, m, sec) = (parts.next()?, parts.next()?, parts.next()?);
@@ -1184,12 +1247,28 @@ fn parse_smpte(s: &str) -> Option<Smpte> {
             None => (Some(two(f)?), None),
         },
     };
-    Some(Smpte { hours: two(h)?, minutes: two(m)?, seconds: two(sec)?, frames, subframes })
+    let t = Smpte { hours: two(h)?, minutes: two(m)?, seconds: two(sec)?, frames, subframes };
+    smpte_exists(&t, rate).then_some(t)
 }
 
-fn write_smpte(t: &Smpte) -> Option<String> {
+/// Whether `t` is a time at `rate`: RFC 2326 section 3.5 and RFC 7826
+/// section 4.4.1 count frames from 0 below the rate, and minutes and
+/// seconds are clock values.
+fn smpte_exists(t: &Smpte, rate: SmpteRate) -> bool {
+    let fps = match rate {
+        SmpteRate::Smpte30 | SmpteRate::Smpte30Drop => 30,
+        SmpteRate::Smpte25 => 25,
+    };
+    t.hours <= 99
+        && t.minutes <= 59
+        && t.seconds <= 59
+        && t.frames.is_none_or(|f| f < fps)
+        && t.subframes.is_none_or(|s| s <= 99)
+}
+
+fn write_smpte(t: &Smpte, rate: SmpteRate) -> Option<String> {
     let ok = |n: u8| n <= 99;
-    if !ok(t.hours) || !ok(t.minutes) || !ok(t.seconds) {
+    if !smpte_exists(t, rate) {
         return None;
     }
     let mut out = format!("{:02}:{:02}:{:02}", t.hours, t.minutes, t.seconds);
@@ -1203,18 +1282,48 @@ fn write_smpte(t: &Smpte) -> Option<String> {
 }
 
 /// Whether `s` is a UTC time: 8 digits, `T`, 6 digits, an optional
-/// fraction, and `Z`.
+/// fraction of 1 to 9 digits, and `Z`, as RFC 7826 section 20.2.3 has it,
+/// naming a date and time that exist. A second of 60 is allowed for leap
+/// seconds.
 fn valid_utc(s: &str) -> bool {
     let b = s.as_bytes();
     let digits = |r: &[u8]| !r.is_empty() && r.iter().all(u8::is_ascii_digit);
     if b.len() < 16 || b[8] != b'T' || b[b.len() - 1] != b'Z' || !digits(&b[..8]) || !digits(&b[9..15]) {
         return false;
     }
-    match &b[15..b.len() - 1] {
+    let fraction_ok = match &b[15..b.len() - 1] {
         [] => true,
-        [b'.', rest @ ..] => digits(rest),
+        [b'.', rest @ ..] => rest.len() <= 9 && digits(rest),
         _ => false,
-    }
+    };
+    let n = |r: &[u8]| r.iter().fold(0u32, |a, d| a * 10 + u32::from(d - b'0'));
+    let (year, month, day) = (n(&b[..4]), n(&b[4..6]), n(&b[6..8]));
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    fraction_ok && (1..=days).contains(&day) && n(&b[9..11]) <= 23 && n(&b[11..13]) <= 59 && n(&b[13..15]) <= 60
+}
+
+/// Whether `l` can be [`Lower::Other`]: tokens joined by `/`, and not
+/// `TCP` or `UDP`.
+fn valid_other_lower(l: &str) -> bool {
+    l.split('/').all(is_token) && !l.eq_ignore_ascii_case("TCP") && !l.eq_ignore_ascii_case("UDP")
+}
+
+/// Whether `params` names both `unicast` and `multicast`.
+fn both_deliveries(params: &[TransportParam]) -> bool {
+    params.contains(&TransportParam::Unicast) && params.contains(&TransportParam::Multicast)
+}
+
+/// Whether `v` is a `setup` value (`setup` true) or a `connection` value.
+fn valid_tcp_choice(v: &str, setup: bool) -> bool {
+    let allowed: &[&str] = if setup { &["active", "passive", "actpass"] } else { &["new", "existing"] };
+    allowed.iter().any(|a| v.eq_ignore_ascii_case(a))
 }
 
 /// Reads one transport parameter, `name` or `name=value`, trimmed.
@@ -1257,6 +1366,7 @@ fn parse_param(p: &str) -> Option<TransportParam> {
         "ssrc" => {
             let mut out = Vec::new();
             for h in value?.split('/') {
+                let h = trim_ws(h);
                 if out.len() >= MAX_PARAMS || h.len() != 8 || !h.bytes().all(|d| d.is_ascii_hexdigit()) {
                     return None;
                 }
@@ -1284,11 +1394,11 @@ fn parse_param(p: &str) -> Option<TransportParam> {
         }
         "dest_addr" => parse_addr_list(value?).map(P::DestAddr),
         "src_addr" => parse_addr_list(value?).map(P::SrcAddr),
-        "setup" => value.filter(|v| is_token(v)).map(|v| P::Setup(v.to_string())),
-        "connection" => value.filter(|v| is_token(v)).map(|v| P::Connection(v.to_string())),
+        "setup" => value.filter(|v| valid_tcp_choice(v, true)).map(|v| P::Setup(v.to_string())),
+        "connection" => value.filter(|v| valid_tcp_choice(v, false)).map(|v| P::Connection(v.to_string())),
         _ => match value {
             None => Some(P::Other { name: name.to_string(), value: None }),
-            Some(v) if v.is_empty() || valid_quoted(v) || is_plain_value(v) => {
+            Some(v) if valid_ext_value(v) => {
                 Some(P::Other { name: name.to_string(), value: Some(v.to_string()) })
             }
             Some(_) => None,
@@ -1357,7 +1467,7 @@ fn write_param(out: &mut String, p: &TransportParam) -> Result<(), Error> {
             out.push_str(&quoted.join("/"));
         }
         P::Setup(v) | P::Connection(v) => {
-            if !is_token(v) {
+            if !valid_tcp_choice(v, matches!(p, P::Setup(_))) {
                 return Err(BAD);
             }
             out.push_str(if matches!(p, P::Setup(_)) { "setup=" } else { "connection=" });
@@ -1369,7 +1479,7 @@ fn write_param(out: &mut String, p: &TransportParam) -> Result<(), Error> {
             }
             out.push_str(name);
             if let Some(v) = value {
-                if !(v.is_empty() || valid_quoted(v) || is_plain_value(v)) {
+                if !valid_ext_value(v) {
                     return Err(BAD);
                 }
                 out.push('=');
@@ -1396,9 +1506,16 @@ fn parse_digits(s: &str, max: usize) -> Option<u64> {
     parse_u64(s)
 }
 
-/// Reads quoted addresses joined by `/`.
+/// Reads quoted addresses joined by `/`, with spaces or tabs allowed
+/// around each `/`, as RFC 7826 section 20.1 defines SLASH.
 fn parse_addr_list(v: &str) -> Option<Vec<String>> {
     let b = v.as_bytes();
+    let skip_ws = |mut i: usize| {
+        while matches!(b.get(i), Some(b' ' | b'\t')) {
+            i += 1;
+        }
+        i
+    };
     let mut out = Vec::new();
     let mut i = 0;
     loop {
@@ -1411,10 +1528,10 @@ fn parse_addr_list(v: &str) -> Option<Vec<String>> {
             return None;
         }
         out.push(inner.to_string());
-        i = end;
+        i = skip_ws(end);
         match b.get(i) {
             None => return Some(out),
-            Some(b'/') => i += 1,
+            Some(b'/') => i = skip_ws(i + 1),
             Some(_) => return None,
         }
     }
@@ -1429,6 +1546,26 @@ fn valid_addr(s: &str) -> bool {
 /// `"`, `;` and `,`.
 fn is_plain_value(s: &str) -> bool {
     !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b';' | b','))
+}
+
+/// Whether `s` is an extension parameter's value: a run, possibly empty,
+/// of quoted strings and bytes [`is_plain_value`] allows.
+fn valid_ext_value(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'"' {
+            match quoted_end(b, i) {
+                Some(end) => i = end,
+                None => return false,
+            }
+        } else if b[i].is_ascii_graphic() && !matches!(b[i], b';' | b',') {
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
 }
 
 /// Whether `s` is exactly one quoted string.
@@ -1493,43 +1630,70 @@ fn valid_session_id(s: &str) -> bool {
         && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'$' | b'-' | b'_' | b'.' | b'+'))
 }
 
-/// How many bytes of CRLF pairs start `b`.
+/// How many bytes of CRLF pairs and bare LFs start `b`.
 fn skip_crlfs(b: &[u8]) -> usize {
     let mut skip = 0;
-    while b.get(skip..skip + 2) == Some(b"\r\n") {
-        skip += 2;
+    loop {
+        match b.get(skip..).unwrap_or_default() {
+            [b'\r', b'\n', ..] => skip += 2,
+            [b'\n', ..] => skip += 1,
+            _ => return skip,
+        }
     }
-    skip
 }
 
-/// Where the head ends, just past CRLF CRLF, searching from `from` within
-/// the first [`MAX_HEAD`] bytes.
+/// Where the head ends, just past the first empty line (LF LF, or LF CR
+/// LF, which CRLF CRLF ends with), searching from `from` within the first
+/// [`MAX_HEAD`] bytes.
 fn find_head_end(b: &[u8], from: usize) -> Option<usize> {
     let b = &b[..b.len().min(MAX_HEAD)];
     let mut i = from;
-    while i + 4 <= b.len() {
-        if &b[i..i + 4] == b"\r\n\r\n" {
-            return Some(i + 4);
+    while i + 1 < b.len() {
+        if b[i] == b'\n' {
+            if b[i + 1] == b'\n' {
+                return Some(i + 2);
+            }
+            if b[i + 1] == b'\r' && b.get(i + 2) == Some(&b'\n') {
+                return Some(i + 3);
+            }
         }
         i += 1;
     }
     None
 }
 
-/// Reads a head that ends with CRLF CRLF: the message with no body, and
-/// the body's length.
+/// Whether an RTSP 1.0 response with this status may not carry a body:
+/// 1xx, 204 and 304, from RFC 2326 section 4.4. RFC 7826 has no such rule.
+fn bodyless(version: Version, code: u16) -> bool {
+    version == Version::Rtsp10 && (code < 200 || code == 204 || code == 304)
+}
+
+/// Reads a head that ends with an empty line: the message with no body,
+/// and the body's length. Lines end with CRLF, or in RTSP 1.0 with a bare
+/// LF too.
 fn parse_head(head: &[u8]) -> Result<(Message, usize), Error> {
     let text = std::str::from_utf8(head).map_err(|_| Error::Utf8)?;
-    let text = text.strip_suffix("\r\n\r\n").ok_or(Error::LineEnding)?;
-    let mut lines = text.split("\r\n");
-    let first = lines.next().unwrap_or("");
-    if first.contains(['\r', '\n']) {
+    let text = text.strip_suffix('\n').ok_or(Error::LineEnding)?;
+    let mut bare_lf = !text.ends_with('\r');
+    let text = text.strip_suffix('\r').unwrap_or(text);
+    let text = text.strip_suffix('\n').ok_or(Error::LineEnding)?;
+    let mut lines = text.split('\n').map(|line| match line.strip_suffix('\r') {
+        Some(l) => (l, false),
+        None => (line, true),
+    });
+    let (first, bare) = lines.next().unwrap_or(("", false));
+    bare_lf |= bare;
+    if first.contains('\r') {
         return Err(Error::LineEnding);
     }
     let start = parse_start_line(first)?;
+    let version = match &start {
+        StartLine::Request { version, .. } | StartLine::Status { version, .. } => *version,
+    };
     let mut headers: Vec<Header> = Vec::new();
-    for line in lines {
-        if line.contains(['\r', '\n']) {
+    for (line, bare) in lines {
+        bare_lf |= bare;
+        if line.contains('\r') || (bare_lf && version == Version::Rtsp20) {
             return Err(Error::LineEnding);
         }
         if line.starts_with([' ', '\t']) {
@@ -1553,11 +1717,17 @@ fn parse_head(head: &[u8]) -> Result<(Message, usize), Error> {
         }
         headers.push(Header::new(name, trim_ws(&line[colon + 1..])));
     }
+    if bare_lf && version == Version::Rtsp20 {
+        return Err(Error::LineEnding);
+    }
     if !headers.iter().all(|h| valid_value(&h.value)) {
         return Err(Error::HeaderValue);
     }
     let message = Message { start, headers, body: Vec::new() };
-    let length = message.content_length()?.unwrap_or(0);
+    let length = match message.start {
+        StartLine::Status { version, code, .. } if bodyless(version, code) => 0,
+        _ => message.content_length()?.unwrap_or(0),
+    };
     Ok((message, length))
 }
 
@@ -1586,8 +1756,9 @@ fn parse_start_line(line: &str) -> Result<StartLine, Error> {
     Ok(StartLine::Request { method: method.to_string(), uri: uri.to_string(), version })
 }
 
-/// Reads `RTSP/1.0` or `RTSP/2.0`. Another well-formed version is
-/// [`Error::Version`].
+/// Reads `RTSP/1.0` or `RTSP/2.0`, ignoring leading zeros in each number
+/// as RFC 2068 section 3.1, which RFC 2326 section 3.1 adopts, says.
+/// Another well-formed version is [`Error::Version`].
 fn parse_version(s: &str) -> Result<Version, Error> {
     let rest = s.get(5..).filter(|_| s.as_bytes()[..5].eq_ignore_ascii_case(b"RTSP/")).ok_or(Error::StartLine)?;
     match rest {
@@ -1596,7 +1767,13 @@ fn parse_version(s: &str) -> Result<Version, Error> {
         _ => {
             let digits = |d: &str| !d.is_empty() && d.bytes().all(|c| c.is_ascii_digit());
             match rest.split_once('.') {
-                Some((major, minor)) if digits(major) && digits(minor) => Err(Error::Version),
+                Some((major, minor)) if digits(major) && digits(minor) => {
+                    match (major.trim_start_matches('0'), minor.trim_start_matches('0')) {
+                        ("1", "") => Ok(Version::Rtsp10),
+                        ("2", "") => Ok(Version::Rtsp20),
+                        _ => Err(Error::Version),
+                    }
+                }
                 _ => Err(Error::StartLine),
             }
         }
@@ -1833,9 +2010,9 @@ mod tests {
         let bad = Error::Malformed("Transport");
         for t in [
             "",
-            "RTP",
             "RTP/",
-            "RTP/AVP/TCP/X",
+            "RTP/AVP/TCP/",
+            "RTP//AVP",
             "RTP AVP",
             "RTP/AVP;unicast=1",
             "RTP/AVP;interleaved=256",
@@ -2001,7 +2178,7 @@ mod tests {
         let t = Transport::parse("RTP/AVP/SCTP;unicast").unwrap();
         assert_eq!(t.lower, Some(Lower::Other("SCTP".into())));
         assert_eq!(t.to_value().unwrap(), "RTP/AVP/SCTP;unicast");
-        for l in ["tcp", "UDP", "a/b", ""] {
+        for l in ["tcp", "UDP", "a/", "/a", "a//b", ""] {
             let t = Transport {
                 protocol: "RTP".into(),
                 profile: "AVP".into(),
@@ -2028,6 +2205,144 @@ mod tests {
         for v in ["npt=", "npt=-", " = 1-"] {
             assert_eq!(Range::parse(v), Err(Error::Malformed("Range")), "{v}");
         }
+    }
+
+    #[test]
+    fn bodyless_responses_in_rtsp_1_0() {
+        // RFC 2326 section 4.4: a 1xx, 204 or 304 response ends at the
+        // blank line, whatever its Content-Length says.
+        let stream = b"RTSP/1.0 304 Not Modified\r\nCSeq: 1\r\nContent-Length: 4\r\n\r\n\
+            RTSP/1.0 200 OK\r\nCSeq: 2\r\n\r\n";
+        let items = items_of(stream);
+        assert_eq!(items.len(), 2, "{items:?}");
+        let Ok(Item::Message(first)) = &items[0] else { panic!() };
+        assert!(first.body.is_empty());
+        let Ok(Item::Message(second)) = &items[1] else { panic!() };
+        assert_eq!(second.cseq(), Ok(2));
+        // RFC 7826 section 5.4: in RTSP 2.0 the Content-Length always counts.
+        let m = msg(b"RTSP/2.0 304 Not Modified\r\nCSeq: 1\r\nContent-Length: 2\r\n\r\nab");
+        assert_eq!(m.body, b"ab");
+        // The writer refuses a body there in RTSP 1.0.
+        for code in [100, 199, 204, 304] {
+            let mut m = Message::response(Version::Rtsp10, code, "x");
+            m.body = b"ab".to_vec();
+            assert_eq!(m.to_bytes(), Err(Error::ContentLength), "{code}");
+            m.start = StartLine::Status { version: Version::Rtsp20, code, reason: "x".into() };
+            assert!(m.to_bytes().is_ok());
+        }
+    }
+
+    #[test]
+    fn transport_review_fixes() {
+        use TransportParam as P;
+        let bad = Error::Malformed("Transport");
+        // RFC 2326 section 12.39, RFC 7826 section 18.54: mutually exclusive.
+        assert_eq!(Transport::parse("RTP/AVP;unicast;multicast"), Err(bad));
+        let both = Transport {
+            protocol: "RTP".into(),
+            profile: "AVP".into(),
+            lower: None,
+            params: vec![P::Multicast, P::Unicast],
+        };
+        assert_eq!(both.to_value(), Err(bad));
+        // RFC 7826 section 20.1: SLASH allows whitespace around it.
+        let t = Transport::parse("RTP/AVP;ssrc=00000001 / 00000002;dest_addr=\":5004\" / \":5005\"").unwrap();
+        assert_eq!(t.params, [P::Ssrc(vec![1, 2]), P::DestAddr(vec![":5004".into(), ":5005".into()])]);
+        // RFC 7826 section 20.2.3: other-trans is one token or more.
+        let list = Transport::parse_list("X;unicast,RTP/AVP/TCP;unicast;interleaved=0-1").unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].protocol.as_str(), list[0].profile.as_str(), &list[0].lower), ("X", "", &None));
+        assert_eq!(list[0].to_value().unwrap(), "X;unicast");
+        let t = Transport::parse("A/B/C/D;unicast").unwrap();
+        assert_eq!(t.lower, Some(Lower::Other("C/D".into())));
+        assert_eq!(t.to_value().unwrap(), "A/B/C/D;unicast");
+        let t = Transport::parse("RTP/AVP/TCP/X").unwrap();
+        assert_eq!(t.lower, Some(Lower::Other("TCP/X".into())));
+        assert_eq!(Transport::parse(&t.to_value().unwrap()).unwrap(), t);
+        let no_profile = Transport { protocol: "X".into(), profile: String::new(), lower: Some(Lower::Tcp), params: vec![] };
+        assert_eq!(no_profile.to_value(), Err(bad));
+        // RFC 7826 section 20.2.3: setup and connection take fixed values.
+        for v in ["RTP/AVP;setup=banana", "RTP/AVP;connection=banana"] {
+            assert_eq!(Transport::parse(v), Err(bad), "{v}");
+        }
+        let t = Transport::parse("RTP/AVP;setup=actpass;connection=existing").unwrap();
+        assert_eq!(t.params, [P::Setup("actpass".into()), P::Connection("existing".into())]);
+        for p in [P::Setup("banana".into()), P::Connection("old".into())] {
+            let t = Transport { protocol: "RTP".into(), profile: "AVP".into(), lower: None, params: vec![p] };
+            assert_eq!(t.to_value(), Err(bad));
+        }
+        // trn-par-value is a run of unreserved bytes and quoted strings.
+        let t = Transport::parse("RTP/AVP;unicast;x=a\"b\"c").unwrap();
+        assert_eq!(t.params[1], P::Other { name: "x".into(), value: Some("a\"b\"c".into()) });
+        assert_eq!(Transport::parse(&t.to_value().unwrap()).unwrap(), t);
+        assert_eq!(Transport::parse("RTP/AVP;x=a\"b"), Err(bad));
+    }
+
+    #[test]
+    fn value_review_fixes() {
+        let bad = Error::Malformed("Range");
+        // RFC 7826 section 4.4.1: frames below the rate, minutes and
+        // seconds below 60.
+        for v in ["smpte-25=00:00:00:25-", "smpte=00:00:00:30-", "smpte=00:60:00-", "smpte=00:00:60-"] {
+            assert_eq!(Range::parse(v), Err(bad), "{v}");
+        }
+        assert!(Range::parse("smpte-25=00:00:00:24-").is_ok());
+        let s = Smpte { hours: 0, minutes: 0, seconds: 0, frames: Some(25), subframes: None };
+        let r = Range { span: Span::Smpte { rate: SmpteRate::Smpte25, start: Some(s), end: None }, time: None };
+        assert_eq!(r.to_value(), Err(bad));
+        // RFC 7826 section 4.4.3: a real UTC date and time, and at most 9
+        // fraction digits.
+        for v in ["clock=20230230T000000Z-", "clock=20230101T250000Z-", "clock=20231301T000000Z-", "clock=20230229T000000Z-"] {
+            assert_eq!(Range::parse(v), Err(bad), "{v}");
+        }
+        assert!(Range::parse("clock=20240229T235960.123456789Z-").is_ok());
+        assert_eq!(Range::parse("clock=20240229T000000.1234567890Z-"), Err(bad));
+        // RFC 7826 section 20.2.3: 1*19DIGIT seconds.
+        assert_eq!(Range::parse("npt=10000000000000000000-"), Err(bad));
+        assert!(Range::parse("npt=9999999999999999999-").is_ok());
+        let r = Range { span: Span::Npt { start: Some(Npt::Time { seconds: u64::MAX, nanos: 0 }), end: None }, time: None };
+        assert_eq!(r.to_value(), Err(bad));
+        let s = Session { id: "a".into(), timeout: Some(u64::MAX) };
+        assert!(s.to_value().is_err());
+        assert!(Session::parse("a;timeout=10000000000000000000").is_err());
+        assert!(Session::parse("a;timeout=9999999999999999999").is_ok());
+        // RFC 7826 has no time parameter on Range.
+        let mut m = Message::request(Version::Rtsp20, "PLAY", "rtsp://h/a");
+        m.push_header("Range", "npt=0-;time=19970123T153600Z");
+        assert_eq!(m.range(), Err(bad));
+        m.start = StartLine::Request { method: "PLAY".into(), uri: "rtsp://h/a".into(), version: Version::Rtsp10 };
+        assert!(m.range().is_ok());
+    }
+
+    #[test]
+    fn message_review_fixes() {
+        // RFC 2326 section 12.17: any number of digits in RTSP 1.0.
+        let mut m = Message::request(Version::Rtsp10, "OPTIONS", "*");
+        m.push_header("CSeq", "1000000000");
+        assert_eq!(m.cseq(), Ok(1_000_000_000));
+        m.set_header("CSeq", "4294967296");
+        assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
+        let mut m = Message::request(Version::Rtsp20, "OPTIONS", "*");
+        m.push_header("CSeq", "1000000000");
+        assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")));
+        // RFC 2326 section 12.38: the response echoes the Timestamp.
+        let m = msg(b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\nTimestamp: 123.5\r\n\r\n");
+        assert_eq!(m.reply(200, "OK").header("Timestamp"), Some("123.5"));
+        // RFC 2326 section 4: bare LF ends lines in RTSP 1.0.
+        let m = msg(b"OPTIONS * RTSP/1.0\nCSeq: 1\n\n");
+        assert_eq!(m.cseq(), Ok(1));
+        let m = msg(b"\nOPTIONS * RTSP/1.0\r\nCSeq: 1\n\r\n");
+        assert_eq!(m.cseq(), Ok(1));
+        assert_eq!(Message::parse(b"OPTIONS * RTSP/2.0\nCSeq: 1\n\n"), Err(Error::LineEnding));
+        assert_eq!(Message::parse(b"OPTIONS * RTSP/2.0\r\nCSeq: 1\r\n\n"), Err(Error::LineEnding));
+        // RFC 2068 section 3.1, which RFC 2326 section 3.1 adopts: leading
+        // zeros in the version are ignored.
+        let m = msg(b"OPTIONS * RTSP/01.00\r\nCSeq: 1\r\n\r\n");
+        assert_eq!(m.version(), Version::Rtsp10);
+        assert_eq!(msg(b"RTSP/002.0 200 OK\r\n\r\n").version(), Version::Rtsp20);
+        let p = |b: &[u8]| Message::parse(b).map(|_| ());
+        assert_eq!(p(b"OPTIONS * RTSP/99999999999999999999991.0\r\n\r\n"), Err(Error::Version));
+        assert_eq!(p(b"OPTIONS * RTSP/1.01\r\n\r\n"), Err(Error::Version));
     }
 
     #[test]
@@ -2058,7 +2373,7 @@ mod tests {
         assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nX\r\n\r\n"), Err(Error::HeaderLine));
         assert_eq!(p(b"OPTIONS * RTSP/1.0\r\n Y: z\r\n\r\n"), Err(Error::HeaderLine));
         assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nA B: z\r\n\r\n"), Err(Error::HeaderLine));
-        assert_eq!(p(b"OPTIONS * RTSP/1.0\nX: y\r\n\r\n"), Err(Error::LineEnding));
+        assert_eq!(p(b"OPTIONS * RTSP/2.0\nX: y\r\n\r\n"), Err(Error::LineEnding));
         assert_eq!(p(b"OPTIONS * RTSP/1.0\r\nX: y\rz\r\n\r\n"), Err(Error::LineEnding));
         assert_eq!(p(b"OPTIONS \xff RTSP/1.0\r\n\r\n"), Err(Error::Utf8));
         assert_eq!(p(b"OPTIONS * RTSP/1.1\r\n\r\n"), Err(Error::Version));
@@ -2102,7 +2417,7 @@ mod tests {
         assert_eq!(m.range(), Err(Error::Missing("Range")));
         assert_eq!(m.transports(), Ok(vec![]));
         for bad in ["", "x", "-1", "+1", "1234567890", "1 2"] {
-            let mut m = Message::request(Version::Rtsp10, "OPTIONS", "*");
+            let mut m = Message::request(Version::Rtsp20, "OPTIONS", "*");
             m.push_header("CSeq", bad);
             assert_eq!(m.cseq(), Err(Error::Malformed("CSeq")), "{bad}");
         }
@@ -2368,7 +2683,10 @@ mod tests {
             Range: smpte=10:07:00-10:07:33:05.01;time=19970123T153600Z\r\n\r\n"
             .to_vec();
         setup.extend(&frame);
-        let seeds: Vec<Vec<u8>> = vec![OPTIONS.to_vec(), OPTIONS_OK.to_vec(), describe_ok(), PLAY2.to_vec(), setup];
+        let bare = b"OPTIONS * RTSP/1.0\nCSeq: 1\nX: a\n b\r\n\n".to_vec();
+        let not_modified = b"RTSP/1.0 304 Not Modified\r\nCSeq: 2\r\nContent-Length: 4\r\n\r\n".to_vec();
+        let seeds: Vec<Vec<u8>> =
+            vec![OPTIONS.to_vec(), OPTIONS_OK.to_vec(), describe_ok(), PLAY2.to_vec(), setup, bare, not_modified];
         let mut stream = Vec::new();
         for s in &seeds {
             stream.extend(s);

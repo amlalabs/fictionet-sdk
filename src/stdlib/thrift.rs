@@ -1,0 +1,2212 @@
+//! Apache Thrift: reading and writing messages and values in the binary
+//! and compact protocols, and the framed transport, with no I/O.
+//!
+//! Thrift is a remote procedure call system. A client calls a method on a
+//! service by sending a message: the method's name, a sequence number, and
+//! its arguments as a struct of numbered fields. The server answers with a
+//! message that carries the result, or an exception. Servers commonly
+//! listen on TCP port 9090. This module follows the Apache Thrift binary
+//! protocol and compact protocol specifications (`doc/specs` in the Apache
+//! Thrift source).
+//!
+//! There are two ways to put values into bytes. The binary protocol writes
+//! fixed-size big-endian numbers. Its messages come in a strict form, which
+//! starts with a version number, and an older form, which starts with the
+//! method name. The compact protocol writes numbers as variable-length
+//! integers and packs field numbers and types together. Both carry the same
+//! values: booleans, integers, doubles, byte strings, UUIDs, structs,
+//! lists, sets and maps. Many servers wrap each message in a frame, which
+//! is a 4-byte big-endian length followed by the message.
+//!
+//! Nothing here reads a socket. A world that plays a Thrift server feeds
+//! the bytes it reads from a TCP connection to a [`Decoder`], reads each
+//! frame's [`Message`], and writes the reply's bytes back. Values are read
+//! without a schema, into a tree of [`Value`]s, so world code decides what
+//! each field number means. On a connection without frames, a
+//! [`StreamDecoder`] takes the bytes and gives back whole messages.
+//!
+//! Every reader checks lengths, counts and nesting against the limits
+//! below, because the agent can send any bytes it likes. Every writer
+//! checks the same limits, so what it writes always reads back.
+//!
+//! ```
+//! use fictionet::stdlib::thrift::{exception_kind, field, Decoder, Field, Message, Protocol, Value};
+//!
+//! /// A calculator service with one method: i32 add(1: i32 a, 2: i32 b).
+//! fn answer(call: &Message) -> Message {
+//!     match (call.name.as_str(), field(&call.body, 1), field(&call.body, 2)) {
+//!         ("add", Some(Value::I32(a)), Some(Value::I32(b))) => {
+//!             // The result struct holds the return value in field 0.
+//!             call.reply(vec![Field { id: 0, value: Value::I32(a.wrapping_add(*b)) }])
+//!         }
+//!         _ => call.exception(exception_kind::UNKNOWN_METHOD, "no such method"),
+//!     }
+//! }
+//!
+//! let mut decoder = Decoder::new();
+//! // A framed call to add(2, 3), sequence number 1, in the strict binary form.
+//! decoder.feed(&[0, 0, 0, 30]);
+//! decoder.feed(&[0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1]);
+//! decoder.feed(&[0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00]);
+//! let payload = decoder.next_frame().unwrap().unwrap();
+//! let (call, protocol, used) = Message::parse(&payload).unwrap();
+//! assert_eq!((protocol, used), (Protocol::Binary, payload.len()));
+//! let reply = answer(&call).to_frame(protocol).unwrap();
+//! assert_eq!(
+//!     reply,
+//!     [
+//!         0, 0, 0, 23, // the frame's length
+//!         0x80, 0x01, 0x00, 0x02, // version 1, a reply
+//!         0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, // name and sequence number
+//!         0x08, 0, 0, 0, 0, 0, 5, // field 0, an i32: 5
+//!         0x00, // the end of the struct
+//!     ]
+//! );
+//! ```
+
+/// The TCP port Thrift servers commonly listen on.
+pub const PORT: u16 = 9090;
+/// The length of a frame's header: a 4-byte big-endian length.
+pub const FRAME_HEADER_LEN: usize = 4;
+/// The longest frame payload, the default in Apache Thrift.
+pub const MAX_FRAME: usize = 16_384_000;
+/// The longest byte string, including a message's name.
+pub const MAX_BINARY_LEN: usize = MAX_FRAME;
+/// The most elements one list or set may hold, or entries one map.
+pub const MAX_CONTAINER_LEN: usize = 1_000_000;
+/// The most values one read may hold, counting every field, element, key
+/// and container, at any depth. It bounds the memory a read takes.
+pub const MAX_VALUES: usize = 1 << 20;
+/// The deepest nesting of values. A message's body is at depth 1, its
+/// fields at depth 2, and so on. Apache Thrift uses the same default.
+pub const MAX_DEPTH: usize = 64;
+/// The longest message a [`StreamDecoder`] reads from a connection without
+/// frames. It is the same as [`MAX_FRAME`], so a message that fits in a
+/// frame also fits here.
+pub const MAX_MESSAGE: usize = MAX_FRAME;
+/// The most elements or entries a reader sets room aside for before it
+/// reads them. A list may claim more than it holds, and lists nest, so
+/// room past this grows only as elements arrive.
+pub const MAX_PREALLOC: usize = 1024;
+
+/// The kinds of exception a server reports in an application exception.
+pub mod exception_kind {
+    /// A failure of no other kind.
+    pub const UNKNOWN: i32 = 0;
+    /// The service has no method by the call's name.
+    pub const UNKNOWN_METHOD: i32 = 1;
+    /// The message's type was not one the server expected.
+    pub const INVALID_MESSAGE_TYPE: i32 = 2;
+    /// A reply's method name did not match the call's.
+    pub const WRONG_METHOD_NAME: i32 = 3;
+    /// A reply's sequence number did not match the call's.
+    pub const BAD_SEQUENCE_ID: i32 = 4;
+    /// A reply carried no result and no declared exception.
+    pub const MISSING_RESULT: i32 = 5;
+    /// The server failed while handling the call.
+    pub const INTERNAL_ERROR: i32 = 6;
+    /// The call's bytes could not be read.
+    pub const PROTOCOL_ERROR: i32 = 7;
+    /// A transform the call asked for is not supported.
+    pub const INVALID_TRANSFORM: i32 = 8;
+    /// The protocol the call used is not supported.
+    pub const INVALID_PROTOCOL: i32 = 9;
+    /// The kind of client is not supported.
+    pub const UNSUPPORTED_CLIENT_TYPE: i32 = 10;
+}
+
+/// How values are put into bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Protocol {
+    /// The binary protocol, with messages in the strict form.
+    Binary,
+    /// The binary protocol, with messages in the old form, which has no
+    /// version number. Values are the same as in [`Protocol::Binary`].
+    BinaryOld,
+    /// The compact protocol.
+    Compact,
+}
+
+impl Protocol {
+    fn compact(self) -> bool {
+        self == Protocol::Compact
+    }
+}
+
+/// The type of a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Type {
+    /// A boolean.
+    Bool,
+    /// A signed 8-bit integer (`i8`, also called `byte`).
+    Byte,
+    /// A signed 16-bit integer.
+    I16,
+    /// A signed 32-bit integer.
+    I32,
+    /// A signed 64-bit integer.
+    I64,
+    /// A 64-bit floating point number.
+    Double,
+    /// A byte string. Thrift's `string` and `binary` are both this.
+    Binary,
+    /// A 16-byte UUID.
+    Uuid,
+    /// A struct: numbered fields. Exceptions and unions are structs too.
+    Struct,
+    /// A list of values of one type.
+    List,
+    /// A set of values of one type.
+    Set,
+    /// A map from keys of one type to values of one type.
+    Map,
+}
+
+impl Type {
+    /// The type's code in the binary protocol.
+    pub fn binary_code(self) -> u8 {
+        match self {
+            Type::Bool => 2,
+            Type::Byte => 3,
+            Type::Double => 4,
+            Type::I16 => 6,
+            Type::I32 => 8,
+            Type::I64 => 10,
+            Type::Binary => 11,
+            Type::Struct => 12,
+            Type::Map => 13,
+            Type::Set => 14,
+            Type::List => 15,
+            Type::Uuid => 16,
+        }
+    }
+
+    /// The type for a code in the binary protocol, if there is one. Code 0
+    /// ends a struct and code 1 (void) never carries a value, so neither
+    /// is a type here.
+    pub fn from_binary_code(code: u8) -> Option<Type> {
+        Some(match code {
+            2 => Type::Bool,
+            3 => Type::Byte,
+            4 => Type::Double,
+            6 => Type::I16,
+            8 => Type::I32,
+            10 => Type::I64,
+            11 => Type::Binary,
+            12 => Type::Struct,
+            13 => Type::Map,
+            14 => Type::Set,
+            15 => Type::List,
+            16 => Type::Uuid,
+            _ => return None,
+        })
+    }
+
+    /// The type's code in the compact protocol. A boolean is 1 here. In a
+    /// field header, 1 means true and 2 means false.
+    pub fn compact_code(self) -> u8 {
+        match self {
+            Type::Bool => 1,
+            Type::Byte => 3,
+            Type::I16 => 4,
+            Type::I32 => 5,
+            Type::I64 => 6,
+            Type::Double => 7,
+            Type::Binary => 8,
+            Type::List => 9,
+            Type::Set => 10,
+            Type::Map => 11,
+            Type::Struct => 12,
+            Type::Uuid => 13,
+        }
+    }
+
+    /// The type for a code in the compact protocol, if there is one. Both
+    /// 1 and 2 are booleans, since writers differ on which they use for
+    /// the elements of a list, set or map.
+    pub fn from_compact_code(code: u8) -> Option<Type> {
+        Some(match code {
+            1 | 2 => Type::Bool,
+            3 => Type::Byte,
+            4 => Type::I16,
+            5 => Type::I32,
+            6 => Type::I64,
+            7 => Type::Double,
+            8 => Type::Binary,
+            9 => Type::List,
+            10 => Type::Set,
+            11 => Type::Map,
+            12 => Type::Struct,
+            13 => Type::Uuid,
+            _ => return None,
+        })
+    }
+}
+
+/// A value of any type, read without a schema. Two values are equal when
+/// they write the same bytes: a NaN double equals a NaN with the same bits,
+/// and 0.0 does not equal -0.0.
+#[derive(Clone, Debug)]
+pub enum Value {
+    /// A boolean.
+    Bool(bool),
+    /// A signed 8-bit integer.
+    Byte(i8),
+    /// A signed 16-bit integer.
+    I16(i16),
+    /// A signed 32-bit integer.
+    I32(i32),
+    /// A signed 64-bit integer.
+    I64(i64),
+    /// A 64-bit floating point number.
+    Double(f64),
+    /// A byte string. A Thrift `string` holds UTF-8, but nothing on the
+    /// wire says which byte strings are strings, so none is checked.
+    Binary(Vec<u8>),
+    /// A UUID's 16 bytes, in the order they are sent.
+    Uuid([u8; 16]),
+    /// A struct's fields, in the order they are sent.
+    Struct(Vec<Field>),
+    /// A list.
+    List(List),
+    /// A set. Its elements are kept in the order they are sent, duplicates
+    /// included.
+    Set(List),
+    /// A map.
+    Map(Map),
+}
+
+/// One field of a struct: its number and its value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    /// The field's number, from the schema.
+    pub id: i16,
+    /// The field's value. Its type is sent along with it.
+    pub value: Value,
+}
+
+/// The elements of a list or set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct List {
+    /// The type of every element.
+    pub elem: Type,
+    /// The elements. A writer refuses an element of another type.
+    pub items: Vec<Value>,
+}
+
+/// The entries of a map.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Map {
+    /// The type of every key.
+    pub key: Type,
+    /// The type of every value.
+    pub value: Type,
+    /// The keys and values, in the order they are sent, duplicates
+    /// included. An empty map in the compact protocol carries no types,
+    /// so reading one gives [`Type::Byte`] for both.
+    pub entries: Vec<(Value, Value)>,
+}
+
+impl PartialEq for Value {
+    fn eq(&self, other: &Value) -> bool {
+        match (self, other) {
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Byte(a), Value::Byte(b)) => a == b,
+            (Value::I16(a), Value::I16(b)) => a == b,
+            (Value::I32(a), Value::I32(b)) => a == b,
+            (Value::I64(a), Value::I64(b)) => a == b,
+            (Value::Double(a), Value::Double(b)) => a.to_bits() == b.to_bits(),
+            (Value::Binary(a), Value::Binary(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            (Value::Struct(a), Value::Struct(b)) => a == b,
+            (Value::List(a), Value::List(b)) | (Value::Set(a), Value::Set(b)) => a == b,
+            (Value::Map(a), Value::Map(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl Value {
+    /// The value's type.
+    pub fn ty(&self) -> Type {
+        match self {
+            Value::Bool(_) => Type::Bool,
+            Value::Byte(_) => Type::Byte,
+            Value::I16(_) => Type::I16,
+            Value::I32(_) => Type::I32,
+            Value::I64(_) => Type::I64,
+            Value::Double(_) => Type::Double,
+            Value::Binary(_) => Type::Binary,
+            Value::Uuid(_) => Type::Uuid,
+            Value::Struct(_) => Type::Struct,
+            Value::List(_) => Type::List,
+            Value::Set(_) => Type::Set,
+            Value::Map(_) => Type::Map,
+        }
+    }
+
+    /// Reads a value of type `ty` from the start of `b`, and returns it
+    /// with how many bytes of `b` it took. The value is at depth 1.
+    pub fn parse(protocol: Protocol, ty: Type, b: &[u8]) -> Result<(Value, usize), Error> {
+        let mut r = Reader::new(b, protocol.compact());
+        let v = r.value(ty, 1)?;
+        Ok((v, r.pos))
+    }
+
+    /// Appends the value's bytes to `out`, at depth 1. On an error `out`
+    /// is left as it was.
+    pub fn write(&self, protocol: Protocol, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let start = out.len();
+        let mut w = Writer::new(out, protocol.compact());
+        let result = w.value(self, 1);
+        if result.is_err() {
+            out.truncate(start);
+        }
+        result
+    }
+
+    /// The value's bytes, at depth 1.
+    pub fn to_bytes(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+        let mut out = Vec::new();
+        self.write(protocol, &mut out)?;
+        Ok(out)
+    }
+}
+
+/// The value of the first field numbered `id`, if there is one.
+pub fn field(fields: &[Field], id: i16) -> Option<&Value> {
+    fields.iter().find(|f| f.id == id).map(|f| &f.value)
+}
+
+/// What a message is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MessageType {
+    /// A call that expects a reply.
+    Call,
+    /// The answer to a call: a result struct whose field 0 is the return
+    /// value, or whose other fields are the exceptions the method
+    /// declares.
+    Reply,
+    /// A failure outside the method's declared exceptions, such as an
+    /// unknown method. The body is an application exception.
+    Exception,
+    /// A call that expects no reply.
+    Oneway,
+}
+
+impl MessageType {
+    /// The message type's code.
+    pub fn code(self) -> u8 {
+        match self {
+            MessageType::Call => 1,
+            MessageType::Reply => 2,
+            MessageType::Exception => 3,
+            MessageType::Oneway => 4,
+        }
+    }
+
+    /// The message type for a code, if there is one.
+    pub fn from_code(code: u8) -> Option<MessageType> {
+        Some(match code {
+            1 => MessageType::Call,
+            2 => MessageType::Reply,
+            3 => MessageType::Exception,
+            4 => MessageType::Oneway,
+            _ => return None,
+        })
+    }
+}
+
+/// One Thrift message: a call, a reply or an exception.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    /// The method's name.
+    pub name: String,
+    /// What the message is for.
+    pub kind: MessageType,
+    /// Chosen by the client and copied into the reply, so it can match
+    /// replies to calls.
+    pub seq: i32,
+    /// The fields of the message's struct: the arguments of a call, or
+    /// the result of a reply.
+    pub body: Vec<Field>,
+}
+
+impl Message {
+    /// Reads the message at the start of `b`, in whichever protocol its
+    /// first byte shows. It returns the message, the protocol it was in,
+    /// and how many bytes of `b` it took. A reply should use the same
+    /// protocol.
+    pub fn parse(b: &[u8]) -> Result<(Message, Protocol, usize), Error> {
+        let mut r = Reader::new(b, false);
+        let (name, kind, seq, protocol) = r.head()?;
+        r.enter(1)?;
+        let body = r.fields(1)?;
+        Ok((Message { name, kind, seq, body }, protocol, r.pos))
+    }
+
+    /// The message's bytes in `protocol`.
+    pub fn to_bytes(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+        let mut out = Vec::new();
+        let name = self.name.as_bytes();
+        let kind = self.kind.code();
+        let mut w = Writer::new(&mut out, protocol.compact());
+        match protocol {
+            Protocol::Binary => {
+                w.out.extend_from_slice(&[0x80, 0x01, 0x00, kind]);
+                w.binary(name)?;
+                w.out.extend_from_slice(&self.seq.to_be_bytes());
+            }
+            Protocol::BinaryOld => {
+                w.binary(name)?;
+                w.out.push(kind);
+                w.out.extend_from_slice(&self.seq.to_be_bytes());
+            }
+            Protocol::Compact => {
+                w.out.extend_from_slice(&[0x82, (kind << 5) | 1]);
+                w.varint(u64::from(self.seq as u32));
+                w.binary(name)?;
+            }
+        }
+        w.enter(1)?;
+        w.fields(&self.body, 1)?;
+        Ok(out)
+    }
+
+    /// The message's bytes in `protocol`, in a frame.
+    pub fn to_frame(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+        frame(&self.to_bytes(protocol)?)
+    }
+
+    /// A reply to this message, with the same name and sequence number,
+    /// carrying `body` as its result struct.
+    pub fn reply(&self, body: Vec<Field>) -> Message {
+        Message { name: self.name.clone(), kind: MessageType::Reply, seq: self.seq, body }
+    }
+
+    /// An exception answering this message, with the same name and
+    /// sequence number. Its body is an application exception: field 1 is
+    /// `text` and field 2 is `kind`, one of [`exception_kind`].
+    pub fn exception(&self, kind: i32, text: &str) -> Message {
+        let body = vec![
+            Field { id: 1, value: Value::Binary(text.as_bytes().to_vec()) },
+            Field { id: 2, value: Value::I32(kind) },
+        ];
+        Message { name: self.name.clone(), kind: MessageType::Exception, seq: self.seq, body }
+    }
+}
+
+/// Why bytes are not a Thrift message or value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// The bytes end before the message or value does. On a connection
+    /// without frames, more bytes may finish it.
+    Truncated,
+    /// A message's first byte is not that of any protocol here.
+    BadProtocol(u8),
+    /// A message's version is not 1. In the binary protocol this is the
+    /// whole first word, and in the compact protocol the version bits.
+    BadVersion(u32),
+    /// A message's type is not call, reply, exception or oneway.
+    BadMessageType(u8),
+    /// A message's name is not UTF-8.
+    BadUtf8,
+    /// A type code is not one of the protocol's types.
+    BadType(u8),
+    /// A boolean's byte is not one the protocol uses.
+    BadBool(u8),
+    /// A variable-length integer is too long, or too big for its type.
+    BadVarint,
+    /// A length or count is negative, or above its limit.
+    Length(i64),
+    /// Values are nested deeper than [`MAX_DEPTH`].
+    TooDeep,
+    /// There are more values than [`MAX_VALUES`].
+    TooMany,
+    /// A message read by a [`StreamDecoder`] is longer than [`MAX_MESSAGE`].
+    TooLong,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Truncated => write!(f, "the bytes end inside a message or value"),
+            Error::BadProtocol(b) => write!(f, "first byte {b:#04x} is not a Thrift message"),
+            Error::BadVersion(v) => write!(f, "version {v:#x}, not 1"),
+            Error::BadMessageType(t) => write!(f, "message type {t}, not 1 to 4"),
+            Error::BadUtf8 => write!(f, "the message name is not UTF-8"),
+            Error::BadType(t) => write!(f, "type code {t} is not a type"),
+            Error::BadBool(b) => write!(f, "boolean byte {b} is not true or false"),
+            Error::BadVarint => write!(f, "a variable-length integer is too long or too big"),
+            Error::Length(n) => write!(f, "length {n} is negative or over its limit"),
+            Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
+            Error::TooMany => write!(f, "more than {MAX_VALUES} values"),
+            Error::TooLong => write!(f, "a message longer than {MAX_MESSAGE} bytes"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Why a value or message cannot be written so that it reads back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// Values are nested deeper than [`MAX_DEPTH`].
+    TooDeep,
+    /// There are more values than [`MAX_VALUES`].
+    TooMany,
+    /// A byte string, container or frame is longer than its limit.
+    TooLong,
+    /// An element, key or value is not of its container's type.
+    Mismatch,
+}
+
+impl std::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WriteError::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
+            WriteError::TooMany => write!(f, "more than {MAX_VALUES} values"),
+            WriteError::TooLong => write!(f, "a byte string, container or frame is over its limit"),
+            WriteError::Mismatch => write!(f, "an element is not of its container's type"),
+        }
+    }
+}
+
+impl std::error::Error for WriteError {}
+
+/// Why bytes are not a frame. The connection holds no more frames a
+/// reader can find, and a real server closes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The length was negative or above [`MAX_FRAME`].
+    Length(i32),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Length(n) => write!(f, "frame length {n}, outside 0..={MAX_FRAME}"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// `payload` in a frame: its length, then its bytes.
+pub fn frame(payload: &[u8]) -> Result<Vec<u8>, WriteError> {
+    if payload.len() > MAX_FRAME {
+        return Err(WriteError::TooLong);
+    }
+    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
+    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// Reads the frame at the start of `b`. It returns `Ok(None)` if `b` holds
+/// only part of one, and otherwise the payload and how many bytes of `b`
+/// the frame took.
+pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
+    let Some(header) = b.get(..FRAME_HEADER_LEN) else {
+        return Ok(None);
+    };
+    let n = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+    if n < 0 || n as usize > MAX_FRAME {
+        return Err(FrameError::Length(n));
+    }
+    let end = FRAME_HEADER_LEN + n as usize;
+    match b.get(FRAME_HEADER_LEN..end) {
+        Some(payload) => Ok(Some((payload, end))),
+        None => Ok(None),
+    }
+}
+
+/// Splits a framed Thrift byte stream into frame payloads. Feed it the
+/// bytes a connection reads, in order, and take payloads out until it has
+/// none. Each payload is usually one [`Message`].
+#[derive(Clone, Debug, Default)]
+pub struct Decoder {
+    buf: Vec<u8>,
+    /// Where the bytes not yet taken out start. Bytes before it are
+    /// dropped in `feed` once they are half the buffer, so taking out many
+    /// small frames costs time in proportion to their bytes.
+    start: usize,
+    failed: Option<FrameError>,
+}
+
+impl Decoder {
+    /// A decoder holding no bytes.
+    pub fn new() -> Decoder {
+        Decoder::default()
+    }
+
+    /// Adds bytes read from the connection. After a [`FrameError`] the
+    /// stream cannot be read any further, and they are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.failed.is_none() {
+            if self.start > 0 && self.start >= self.buf.len() / 2 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// The next whole frame's payload, if one has come. It returns `None`
+    /// when it needs more bytes, and keeps returning the same error once
+    /// the stream has broken. If frames are taken out after each `feed`,
+    /// the decoder holds at most one frame's bytes plus what one `feed`
+    /// added.
+    pub fn next_frame(&mut self) -> Option<Result<Vec<u8>, FrameError>> {
+        if let Some(e) = self.failed {
+            return Some(Err(e));
+        }
+        match parse_frame(&self.buf[self.start..]) {
+            Ok(Some((payload, used))) => {
+                let payload = payload.to_vec();
+                self.start += used;
+                Some(Ok(payload))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.failed = Some(e);
+                self.buf = Vec::new();
+                self.start = 0;
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// How many bytes are held, waiting for the rest of a frame.
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+}
+
+/// Splits a Thrift byte stream without frames into messages. Feed it the
+/// bytes a connection reads, in order, and take messages out until it has
+/// none.
+///
+/// Calling [`Message::parse`] again on everything read so far would also
+/// work, but each call reads the message from its start, so a message that
+/// arrives a byte at a time would take time in proportion to the square of
+/// its length. This decoder remembers how far it has read and reads each
+/// byte once, apart from a few bytes of a header it must read again when
+/// the header was split. It reads a message with [`Message::parse`] once it
+/// has all of it, so it gives the same messages and errors.
+#[derive(Clone, Debug)]
+pub struct StreamDecoder {
+    buf: Vec<u8>,
+    /// Where the current message starts in `buf`. Bytes before it are
+    /// dropped in `feed` once they are half the buffer.
+    start: usize,
+    /// How far into `buf` the current message has been read.
+    pos: usize,
+    /// What is left to read of the current message, innermost last. It
+    /// holds at most two tasks for each level of nesting.
+    tasks: Vec<Task>,
+    /// Whether the current message is in the compact protocol.
+    compact: bool,
+    /// The values read so far in the current message.
+    values: usize,
+    failed: Option<Error>,
+}
+
+/// Something a [`StreamDecoder`] has still to read.
+#[derive(Clone, Copy, Debug)]
+enum Task {
+    /// A message's header, then its struct.
+    Head,
+    /// A value of type `ty` at `depth`.
+    Value { ty: Type, depth: usize },
+    /// The rest of a struct at `depth`, whose last field was numbered `last`.
+    Fields { depth: usize, last: i16 },
+    /// `left` more elements of a list or set at `depth`.
+    Items { elem: Type, left: usize, depth: usize },
+    /// `left` more keys and values of a map at `depth`, taking turns, with
+    /// a key when `left` is even.
+    Entries { key: Type, value: Type, left: usize, depth: usize },
+}
+
+impl Default for StreamDecoder {
+    fn default() -> StreamDecoder {
+        StreamDecoder::new()
+    }
+}
+
+impl StreamDecoder {
+    /// A decoder holding no bytes.
+    pub fn new() -> StreamDecoder {
+        StreamDecoder {
+            buf: Vec::new(),
+            start: 0,
+            pos: 0,
+            tasks: vec![Task::Head],
+            compact: false,
+            values: 0,
+            failed: None,
+        }
+    }
+
+    /// Adds bytes read from the connection. After an error the stream
+    /// cannot be read any further, and they are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.failed.is_none() {
+            if self.start > 0 && self.start >= self.buf.len() / 2 {
+                self.buf.drain(..self.start);
+                self.pos -= self.start;
+                self.start = 0;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// The next whole message and the protocol it is in, if one has come.
+    /// It returns `None` when it needs more bytes, and keeps returning the
+    /// same error once the stream has broken. A message longer than
+    /// [`MAX_MESSAGE`] is [`Error::TooLong`]. If messages are taken out
+    /// after each `feed`, the decoder holds at most one message's bytes
+    /// plus what one `feed` added.
+    pub fn next_message(&mut self) -> Option<Result<(Message, Protocol), Error>> {
+        if let Some(e) = self.failed {
+            return Some(Err(e));
+        }
+        match self.scan() {
+            Ok(false) => None,
+            Ok(true) => {
+                let got = Message::parse(&self.buf[self.start..self.pos]);
+                self.start = self.pos;
+                self.tasks.clear();
+                self.tasks.push(Task::Head);
+                self.values = 0;
+                match got {
+                    Ok((m, protocol, _)) => Some(Ok((m, protocol))),
+                    Err(e) => Some(Err(self.fail(e))),
+                }
+            }
+            Err(e) => {
+                // Report what reading the whole message reports, unless it
+                // stops early because a count is more than the bytes held.
+                let e = match Message::parse(&self.buf[self.start..]) {
+                    Err(first) if first != Error::Truncated => first,
+                    _ => e,
+                };
+                Some(Err(self.fail(e)))
+            }
+        }
+    }
+
+    /// How many bytes are held, waiting for the rest of a message.
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    fn fail(&mut self, e: Error) -> Error {
+        self.failed = Some(e);
+        self.buf = Vec::new();
+        self.tasks = Vec::new();
+        (self.start, self.pos) = (0, 0);
+        e
+    }
+
+    /// Reads as far as the bytes held allow. It returns whether the
+    /// current message is complete.
+    fn scan(&mut self) -> Result<bool, Error> {
+        while let Some(&task) = self.tasks.last() {
+            let mut r = Reader::new(&self.buf[self.pos..], self.compact);
+            r.values = self.values;
+            match step(task, &mut r, &mut self.tasks) {
+                Ok(()) => {
+                    self.pos += r.pos;
+                    self.values = r.values;
+                    self.compact = r.compact;
+                    if self.pos - self.start > MAX_MESSAGE {
+                        return Err(Error::TooLong);
+                    }
+                }
+                Err(Error::Truncated) => {
+                    // Every byte held belongs to this message, which is
+                    // not over yet.
+                    if self.buffered() > MAX_MESSAGE {
+                        return Err(Error::TooLong);
+                    }
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Reads one piece of a message for `task`, then updates `tasks`. The
+/// tasks are changed only after every read has succeeded, so a piece that
+/// is cut short can be read again from its start.
+fn step(task: Task, r: &mut Reader, tasks: &mut Vec<Task>) -> Result<(), Error> {
+    match task {
+        Task::Head => {
+            r.head()?;
+            r.enter(1)?;
+            tasks.pop();
+            tasks.push(Task::Fields { depth: 1, last: 0 });
+        }
+        Task::Fields { depth, last } => {
+            let header = r.field_header(last)?;
+            tasks.pop();
+            if let Some((id, head)) = header {
+                tasks.push(Task::Fields { depth, last: id });
+                match head {
+                    FieldHead::Bool(_) => r.enter(depth + 1)?,
+                    FieldHead::Typed(ty) => tasks.push(Task::Value { ty, depth: depth + 1 }),
+                }
+            }
+        }
+        Task::Value { ty, depth } => {
+            let next = match ty {
+                Type::Struct => {
+                    r.enter(depth)?;
+                    Some(Task::Fields { depth, last: 0 })
+                }
+                Type::List | Type::Set => {
+                    r.enter(depth)?;
+                    let (elem, left) = r.list_header()?;
+                    Some(Task::Items { elem, left, depth })
+                }
+                Type::Map => {
+                    r.enter(depth)?;
+                    let (key, value, n) = r.map_header()?;
+                    Some(Task::Entries { key, value, left: n * 2, depth })
+                }
+                Type::Binary => {
+                    // Skipped without a copy: it is copied once the whole
+                    // message is read.
+                    r.enter(depth)?;
+                    let n = r.len(MAX_BINARY_LEN)?;
+                    r.take(n)?;
+                    None
+                }
+                _ => {
+                    r.value(ty, depth)?;
+                    None
+                }
+            };
+            tasks.pop();
+            tasks.extend(next);
+        }
+        Task::Items { elem, left, depth } => {
+            tasks.pop();
+            if left > 0 {
+                tasks.push(Task::Items { elem, left: left - 1, depth });
+                tasks.push(Task::Value { ty: elem, depth: depth + 1 });
+            }
+        }
+        Task::Entries { key, value, left, depth } => {
+            tasks.pop();
+            if left > 0 {
+                let ty = if left % 2 == 0 { key } else { value };
+                tasks.push(Task::Entries { key, value, left: left - 1, depth });
+                tasks.push(Task::Value { ty, depth: depth + 1 });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads values from a byte slice, counting them against [`MAX_VALUES`].
+struct Reader<'a> {
+    b: &'a [u8],
+    pos: usize,
+    compact: bool,
+    values: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(b: &'a [u8], compact: bool) -> Reader<'a> {
+        Reader { b, pos: 0, compact, values: 0 }
+    }
+
+    fn remaining(&self) -> usize {
+        self.b.len() - self.pos
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        if n > self.remaining() {
+            return Err(Error::Truncated);
+        }
+        let s = &self.b[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(s)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], Error> {
+        let mut a = [0u8; N];
+        a.copy_from_slice(self.take(N)?);
+        Ok(a)
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        Ok(self.array::<1>()?[0])
+    }
+
+    /// A variable-length integer of at most `max_bytes` bytes, no bigger
+    /// than `max`.
+    fn varint(&mut self, max_bytes: usize, max: u64) -> Result<u64, Error> {
+        let mut v: u128 = 0;
+        for i in 0..max_bytes {
+            let byte = self.u8()?;
+            v |= u128::from(byte & 0x7f) << (7 * i);
+            if byte & 0x80 == 0 {
+                return if v > u128::from(max) { Err(Error::BadVarint) } else { Ok(v as u64) };
+            }
+        }
+        Err(Error::BadVarint)
+    }
+
+    fn varint32(&mut self) -> Result<u32, Error> {
+        Ok(self.varint(5, u64::from(u32::MAX))? as u32)
+    }
+
+    fn zigzag32(&mut self) -> Result<i32, Error> {
+        let n = self.varint32()?;
+        Ok(((n >> 1) as i32) ^ -((n & 1) as i32))
+    }
+
+    fn i16v(&mut self) -> Result<i16, Error> {
+        if self.compact {
+            i16::try_from(self.zigzag32()?).map_err(|_| Error::BadVarint)
+        } else {
+            Ok(i16::from_be_bytes(self.array()?))
+        }
+    }
+
+    fn i32v(&mut self) -> Result<i32, Error> {
+        if self.compact { self.zigzag32() } else { Ok(i32::from_be_bytes(self.array()?)) }
+    }
+
+    fn i64v(&mut self) -> Result<i64, Error> {
+        if self.compact {
+            let n = self.varint(10, u64::MAX)?;
+            Ok(((n >> 1) as i64) ^ -((n & 1) as i64))
+        } else {
+            Ok(i64::from_be_bytes(self.array()?))
+        }
+    }
+
+    /// A length or count, checked against `limit`.
+    fn len(&mut self, limit: usize) -> Result<usize, Error> {
+        let n = if self.compact { i64::from(self.varint32()?) } else { i64::from(i32::from_be_bytes(self.array()?)) };
+        if n < 0 || n as u64 > limit as u64 { Err(Error::Length(n)) } else { Ok(n as usize) }
+    }
+
+    fn name(&mut self) -> Result<String, Error> {
+        let n = self.len(MAX_BINARY_LEN)?;
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| Error::BadUtf8)
+    }
+
+    /// A message's header: everything before its struct. It picks the
+    /// protocol from the first byte and reads the rest in it.
+    fn head(&mut self) -> Result<(String, MessageType, i32, Protocol), Error> {
+        let first = *self.b.get(self.pos).ok_or(Error::Truncated)?;
+        let protocol = match first {
+            0x82 => Protocol::Compact,
+            0x80 => Protocol::Binary,
+            0x00..=0x7f => Protocol::BinaryOld,
+            _ => return Err(Error::BadProtocol(first)),
+        };
+        self.compact = protocol.compact();
+        let (name, kind, seq) = match protocol {
+            Protocol::Compact => {
+                self.u8()?;
+                let h = self.u8()?;
+                if h & 0x1f != 1 {
+                    return Err(Error::BadVersion(u32::from(h & 0x1f)));
+                }
+                let code = h >> 5;
+                let kind = MessageType::from_code(code).ok_or(Error::BadMessageType(code))?;
+                let seq = self.varint32()? as i32;
+                (self.name()?, kind, seq)
+            }
+            Protocol::Binary => {
+                let word = u32::from_be_bytes(self.array()?);
+                if word & 0xffff_0000 != 0x8001_0000 {
+                    return Err(Error::BadVersion(word));
+                }
+                let code = (word & 0xff) as u8;
+                let kind = MessageType::from_code(code).ok_or(Error::BadMessageType(code))?;
+                let name = self.name()?;
+                (name, kind, self.i32v()?)
+            }
+            Protocol::BinaryOld => {
+                let name = self.name()?;
+                let code = self.u8()?;
+                let kind = MessageType::from_code(code).ok_or(Error::BadMessageType(code))?;
+                (name, kind, self.i32v()?)
+            }
+        };
+        Ok((name, kind, seq, protocol))
+    }
+
+    /// Counts one value at `depth` against the limits.
+    fn enter(&mut self, depth: usize) -> Result<(), Error> {
+        if depth > MAX_DEPTH {
+            return Err(Error::TooDeep);
+        }
+        self.values += 1;
+        if self.values > MAX_VALUES {
+            return Err(Error::TooMany);
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, ty: Type, depth: usize) -> Result<Value, Error> {
+        self.enter(depth)?;
+        Ok(match ty {
+            Type::Bool => {
+                let b = self.u8()?;
+                match (self.compact, b) {
+                    (_, 1) => Value::Bool(true),
+                    (false, 0) | (true, 0 | 2) => Value::Bool(false),
+                    _ => return Err(Error::BadBool(b)),
+                }
+            }
+            Type::Byte => Value::Byte(self.u8()? as i8),
+            Type::I16 => Value::I16(self.i16v()?),
+            Type::I32 => Value::I32(self.i32v()?),
+            Type::I64 => Value::I64(self.i64v()?),
+            Type::Double => {
+                let a = self.array()?;
+                Value::Double(if self.compact { f64::from_le_bytes(a) } else { f64::from_be_bytes(a) })
+            }
+            Type::Binary => {
+                let n = self.len(MAX_BINARY_LEN)?;
+                Value::Binary(self.take(n)?.to_vec())
+            }
+            Type::Uuid => Value::Uuid(self.array()?),
+            Type::Struct => Value::Struct(self.fields(depth)?),
+            Type::List => Value::List(self.list(depth)?),
+            Type::Set => Value::Set(self.list(depth)?),
+            Type::Map => Value::Map(self.map(depth)?),
+        })
+    }
+
+    /// A struct's fields, up to and including its stop byte. The struct
+    /// itself is at `depth`.
+    fn fields(&mut self, depth: usize) -> Result<Vec<Field>, Error> {
+        let mut fields = Vec::new();
+        let mut last: i16 = 0;
+        while let Some((id, head)) = self.field_header(last)? {
+            last = id;
+            let value = match head {
+                FieldHead::Bool(b) => {
+                    self.enter(depth + 1)?;
+                    Value::Bool(b)
+                }
+                FieldHead::Typed(ty) => self.value(ty, depth + 1)?,
+            };
+            fields.push(Field { id, value });
+        }
+        Ok(fields)
+    }
+
+    /// A field's number and type, or `None` at a struct's stop byte.
+    /// `last` is the number of the field before it.
+    fn field_header(&mut self, last: i16) -> Result<Option<(i16, FieldHead)>, Error> {
+        let h = self.u8()?;
+        if h == 0 {
+            return Ok(None);
+        }
+        if self.compact {
+            let (delta, code) = (h >> 4, h & 0x0f);
+            let id = if delta == 0 { self.i16v()? } else { last.wrapping_add(i16::from(delta)) };
+            let head = if code == 1 || code == 2 {
+                // A boolean field's value is in its type code.
+                FieldHead::Bool(code == 1)
+            } else {
+                FieldHead::Typed(Type::from_compact_code(code).ok_or(Error::BadType(code))?)
+            };
+            Ok(Some((id, head)))
+        } else {
+            let ty = Type::from_binary_code(h).ok_or(Error::BadType(h))?;
+            Ok(Some((self.i16v()?, FieldHead::Typed(ty))))
+        }
+    }
+
+    /// A list or set's element type and count.
+    fn list_header(&mut self) -> Result<(Type, usize), Error> {
+        if self.compact {
+            let h = self.u8()?;
+            let code = h & 0x0f;
+            let elem = Type::from_compact_code(code).ok_or(Error::BadType(code))?;
+            let n = if h >> 4 == 15 { self.len(MAX_CONTAINER_LEN)? } else { usize::from(h >> 4) };
+            Ok((elem, n))
+        } else {
+            let code = self.u8()?;
+            let elem = Type::from_binary_code(code).ok_or(Error::BadType(code))?;
+            Ok((elem, self.len(MAX_CONTAINER_LEN)?))
+        }
+    }
+
+    /// A map's key type, value type and count.
+    fn map_header(&mut self) -> Result<(Type, Type, usize), Error> {
+        if self.compact {
+            let n = self.len(MAX_CONTAINER_LEN)?;
+            if n == 0 {
+                return Ok((Type::Byte, Type::Byte, 0));
+            }
+            let h = self.u8()?;
+            let key = Type::from_compact_code(h >> 4).ok_or(Error::BadType(h >> 4))?;
+            let value = Type::from_compact_code(h & 0x0f).ok_or(Error::BadType(h & 0x0f))?;
+            Ok((key, value, n))
+        } else {
+            let [k, v] = self.array()?;
+            let key = Type::from_binary_code(k).ok_or(Error::BadType(k))?;
+            let value = Type::from_binary_code(v).ok_or(Error::BadType(v))?;
+            Ok((key, value, self.len(MAX_CONTAINER_LEN)?))
+        }
+    }
+
+    fn list(&mut self, depth: usize) -> Result<List, Error> {
+        let (elem, n) = self.list_header()?;
+        // Every element takes at least one byte.
+        if n > self.remaining() {
+            return Err(Error::Truncated);
+        }
+        let mut items = Vec::with_capacity(n.min(MAX_PREALLOC));
+        for _ in 0..n {
+            items.push(self.value(elem, depth + 1)?);
+        }
+        Ok(List { elem, items })
+    }
+
+    fn map(&mut self, depth: usize) -> Result<Map, Error> {
+        let (key, value, n) = self.map_header()?;
+        // Every key and every value takes at least one byte.
+        if n.saturating_mul(2) > self.remaining() {
+            return Err(Error::Truncated);
+        }
+        let mut entries = Vec::with_capacity(n.min(MAX_PREALLOC));
+        for _ in 0..n {
+            let k = self.value(key, depth + 1)?;
+            let v = self.value(value, depth + 1)?;
+            entries.push((k, v));
+        }
+        Ok(Map { key, value, entries })
+    }
+}
+
+/// What a field's header says about its value.
+#[derive(Clone, Copy)]
+enum FieldHead {
+    /// A compact boolean field, whose value is in its header.
+    Bool(bool),
+    /// A value of this type follows.
+    Typed(Type),
+}
+
+/// Writes values, checking the same limits a [`Reader`] does.
+struct Writer<'o> {
+    out: &'o mut Vec<u8>,
+    compact: bool,
+    values: usize,
+}
+
+impl<'o> Writer<'o> {
+    fn new(out: &'o mut Vec<u8>, compact: bool) -> Writer<'o> {
+        Writer { out, compact, values: 0 }
+    }
+
+    fn enter(&mut self, depth: usize) -> Result<(), WriteError> {
+        if depth > MAX_DEPTH {
+            return Err(WriteError::TooDeep);
+        }
+        self.values += 1;
+        if self.values > MAX_VALUES {
+            return Err(WriteError::TooMany);
+        }
+        Ok(())
+    }
+
+    fn varint(&mut self, mut v: u64) {
+        while v >= 0x80 {
+            self.out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        self.out.push(v as u8);
+    }
+
+    fn i16w(&mut self, v: i16) {
+        if self.compact { self.i32w(i32::from(v)) } else { self.out.extend_from_slice(&v.to_be_bytes()) }
+    }
+
+    fn i32w(&mut self, v: i32) {
+        if self.compact {
+            self.varint(u64::from(((v << 1) ^ (v >> 31)) as u32));
+        } else {
+            self.out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    fn i64w(&mut self, v: i64) {
+        if self.compact {
+            self.varint(((v << 1) ^ (v >> 63)) as u64);
+        } else {
+            self.out.extend_from_slice(&v.to_be_bytes());
+        }
+    }
+
+    /// A length or count, after checking it against `limit`.
+    fn len(&mut self, n: usize, limit: usize) -> Result<(), WriteError> {
+        if n > limit {
+            return Err(WriteError::TooLong);
+        }
+        if self.compact {
+            self.varint(n as u64);
+        } else {
+            self.out.extend_from_slice(&(n as u32).to_be_bytes());
+        }
+        Ok(())
+    }
+
+    fn binary(&mut self, b: &[u8]) -> Result<(), WriteError> {
+        self.len(b.len(), MAX_BINARY_LEN)?;
+        self.out.extend_from_slice(b);
+        Ok(())
+    }
+
+    fn code(&self, ty: Type) -> u8 {
+        if self.compact { ty.compact_code() } else { ty.binary_code() }
+    }
+
+    fn value(&mut self, v: &Value, depth: usize) -> Result<(), WriteError> {
+        self.enter(depth)?;
+        match v {
+            Value::Bool(b) => self.out.push(match (self.compact, *b) {
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, b) => u8::from(b),
+            }),
+            Value::Byte(x) => self.out.push(*x as u8),
+            Value::I16(x) => self.i16w(*x),
+            Value::I32(x) => self.i32w(*x),
+            Value::I64(x) => self.i64w(*x),
+            Value::Double(x) => {
+                let a = if self.compact { x.to_le_bytes() } else { x.to_be_bytes() };
+                self.out.extend_from_slice(&a);
+            }
+            Value::Binary(b) => self.binary(b)?,
+            Value::Uuid(u) => self.out.extend_from_slice(u),
+            Value::Struct(fields) => self.fields(fields, depth)?,
+            Value::List(l) | Value::Set(l) => self.list(l, depth)?,
+            Value::Map(m) => self.map(m, depth)?,
+        }
+        Ok(())
+    }
+
+    /// A struct's fields and its stop byte. The struct itself is at
+    /// `depth`.
+    fn fields(&mut self, fields: &[Field], depth: usize) -> Result<(), WriteError> {
+        let mut last: i16 = 0;
+        for f in fields {
+            if self.compact {
+                let code = match f.value {
+                    Value::Bool(true) => 1,
+                    Value::Bool(false) => 2,
+                    ref v => v.ty().compact_code(),
+                };
+                let delta = i32::from(f.id) - i32::from(last);
+                if (1..=15).contains(&delta) {
+                    self.out.push(((delta as u8) << 4) | code);
+                } else {
+                    self.out.push(code);
+                    self.i16w(f.id);
+                }
+                last = f.id;
+                if let Value::Bool(_) = f.value {
+                    self.enter(depth + 1)?;
+                } else {
+                    self.value(&f.value, depth + 1)?;
+                }
+            } else {
+                self.out.push(f.value.ty().binary_code());
+                self.i16w(f.id);
+                self.value(&f.value, depth + 1)?;
+            }
+        }
+        self.out.push(0);
+        Ok(())
+    }
+
+    fn list(&mut self, l: &List, depth: usize) -> Result<(), WriteError> {
+        let n = l.items.len();
+        if n > MAX_CONTAINER_LEN {
+            return Err(WriteError::TooLong);
+        }
+        if l.items.iter().any(|v| v.ty() != l.elem) {
+            return Err(WriteError::Mismatch);
+        }
+        let code = self.code(l.elem);
+        if self.compact {
+            if n < 15 {
+                self.out.push(((n as u8) << 4) | code);
+            } else {
+                self.out.push(0xf0 | code);
+                self.varint(n as u64);
+            }
+        } else {
+            self.out.push(code);
+            self.out.extend_from_slice(&(n as u32).to_be_bytes());
+        }
+        for v in &l.items {
+            self.value(v, depth + 1)?;
+        }
+        Ok(())
+    }
+
+    fn map(&mut self, m: &Map, depth: usize) -> Result<(), WriteError> {
+        let n = m.entries.len();
+        if n > MAX_CONTAINER_LEN {
+            return Err(WriteError::TooLong);
+        }
+        if m.entries.iter().any(|(k, v)| k.ty() != m.key || v.ty() != m.value) {
+            return Err(WriteError::Mismatch);
+        }
+        let (k, v) = (self.code(m.key), self.code(m.value));
+        if self.compact {
+            self.varint(n as u64);
+            if n > 0 {
+                self.out.push((k << 4) | v);
+            }
+        } else {
+            self.out.extend_from_slice(&[k, v]);
+            self.out.extend_from_slice(&(n as u32).to_be_bytes());
+        }
+        for (key, value) in &m.entries {
+            self.value(key, depth + 1)?;
+            self.value(value, depth + 1)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_TYPES: [Type; 12] = [
+        Type::Bool,
+        Type::Byte,
+        Type::I16,
+        Type::I32,
+        Type::I64,
+        Type::Double,
+        Type::Binary,
+        Type::Uuid,
+        Type::Struct,
+        Type::List,
+        Type::Set,
+        Type::Map,
+    ];
+    const PROTOCOLS: [Protocol; 3] = [Protocol::Binary, Protocol::BinaryOld, Protocol::Compact];
+
+    fn add_call() -> Message {
+        Message {
+            name: "add".into(),
+            kind: MessageType::Call,
+            seq: 1,
+            body: vec![Field { id: 1, value: Value::I32(2) }, Field { id: 2, value: Value::I32(3) }],
+        }
+    }
+
+    // The examples below follow the binary and compact protocol
+    // specifications byte by byte.
+
+    #[test]
+    fn strict_binary_message() {
+        let bytes = [
+            0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, 0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0,
+            0, 3, 0x00,
+        ];
+        assert_eq!(Message::parse(&bytes), Ok((add_call(), Protocol::Binary, bytes.len())));
+        assert_eq!(add_call().to_bytes(Protocol::Binary).unwrap(), bytes);
+        // The unused third byte of the version word is ignored.
+        let mut other = bytes;
+        other[2] = 0x55;
+        assert_eq!(Message::parse(&other).unwrap().0, add_call());
+    }
+
+    #[test]
+    fn old_binary_message() {
+        let bytes =
+            [0, 0, 0, 3, b'a', b'd', b'd', 0x01, 0, 0, 0, 1, 0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00];
+        assert_eq!(Message::parse(&bytes), Ok((add_call(), Protocol::BinaryOld, bytes.len())));
+        assert_eq!(add_call().to_bytes(Protocol::BinaryOld).unwrap(), bytes);
+    }
+
+    #[test]
+    fn compact_message() {
+        // Protocol id, type 1 and version 1, sequence 1, name, two short
+        // field headers with zigzag values, stop.
+        let bytes = [0x82, 0x21, 0x01, 0x03, b'a', b'd', b'd', 0x15, 0x04, 0x15, 0x06, 0x00];
+        assert_eq!(Message::parse(&bytes), Ok((add_call(), Protocol::Compact, bytes.len())));
+        assert_eq!(add_call().to_bytes(Protocol::Compact).unwrap(), bytes);
+        // A negative sequence number is a 5-byte varint, not zigzag.
+        let m = Message { seq: -1, body: vec![], ..add_call() };
+        let b = m.to_bytes(Protocol::Compact).unwrap();
+        assert_eq!(b[2..7], [0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(Message::parse(&b).unwrap().0, m);
+    }
+
+    #[test]
+    fn doc_example() {
+        fn answer(call: &Message) -> Message {
+            match (call.name.as_str(), field(&call.body, 1), field(&call.body, 2)) {
+                ("add", Some(Value::I32(a)), Some(Value::I32(b))) => {
+                    call.reply(vec![Field { id: 0, value: Value::I32(a.wrapping_add(*b)) }])
+                }
+                _ => call.exception(exception_kind::UNKNOWN_METHOD, "no such method"),
+            }
+        }
+        let mut decoder = Decoder::new();
+        decoder.feed(&[0, 0, 0, 30]);
+        decoder.feed(&[0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1]);
+        decoder.feed(&[0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00]);
+        let payload = decoder.next_frame().unwrap().unwrap();
+        let (call, protocol, used) = Message::parse(&payload).unwrap();
+        assert_eq!((protocol, used), (Protocol::Binary, payload.len()));
+        let reply = answer(&call).to_frame(protocol).unwrap();
+        assert_eq!(
+            reply,
+            [
+                0, 0, 0, 23, 0x80, 0x01, 0x00, 0x02, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, 0x08, 0, 0, 0, 0, 0, 5,
+                0x00,
+            ]
+        );
+        let other = Message { name: "sub".into(), ..call };
+        let e = answer(&other);
+        assert_eq!(e.kind, MessageType::Exception);
+        assert_eq!(field(&e.body, 1), Some(&Value::Binary(b"no such method".to_vec())));
+        assert_eq!(field(&e.body, 2), Some(&Value::I32(exception_kind::UNKNOWN_METHOD)));
+        assert_eq!(field(&e.body, 3), None);
+    }
+
+    #[test]
+    fn compact_values() {
+        let c = Protocol::Compact;
+        // Zigzag: 0, -1, 1, -2 become 0, 1, 2, 3.
+        for (v, b) in [(0, 0u8), (-1, 1), (1, 2), (-2, 3)] {
+            assert_eq!(Value::I32(v).to_bytes(c).unwrap(), [b]);
+        }
+        assert_eq!(
+            Value::I64(i64::MIN).to_bytes(c).unwrap(),
+            [0xff; 9].iter().copied().chain([0x01]).collect::<Vec<_>>()
+        );
+        assert_eq!(Value::I16(300).to_bytes(c).unwrap(), [0xd8, 0x04]);
+        // Doubles are little-endian.
+        assert_eq!(Value::Double(1.0).to_bytes(c).unwrap(), [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
+        assert_eq!(Value::Double(1.0).to_bytes(Protocol::Binary).unwrap(), [0x3f, 0xf0, 0, 0, 0, 0, 0, 0]);
+        // A short list header: size 3, type i32.
+        let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I32(2), Value::I32(3)] });
+        assert_eq!(l.to_bytes(c).unwrap(), [0x35, 0x02, 0x04, 0x06]);
+        // A long list header: 0xf0 and the type, then the size. Booleans
+        // in lists are 1 for true and 2 for false.
+        let bools: Vec<Value> = (0..15).map(|i| Value::Bool(i % 2 == 0)).collect();
+        let l = Value::List(List { elem: Type::Bool, items: bools.clone() });
+        let b = l.to_bytes(c).unwrap();
+        assert_eq!(b[..4], [0xf1, 0x0f, 1, 2]);
+        assert_eq!(Value::parse(c, Type::List, &b), Ok((l, b.len())));
+        // Readers take 2 as the bool element type, and 0 as false.
+        assert_eq!(
+            Value::parse(c, Type::Set, &[0x22, 0, 1]),
+            Ok((Value::Set(List { elem: Type::Bool, items: vec![Value::Bool(false), Value::Bool(true)] }), 3))
+        );
+        // Maps: an empty one is one zero byte; otherwise size, then types.
+        let m = Map { key: Type::I32, value: Type::Binary, entries: vec![] };
+        assert_eq!(Value::Map(m).to_bytes(c).unwrap(), [0]);
+        assert_eq!(
+            Value::parse(c, Type::Map, &[0]),
+            Ok((Value::Map(Map { key: Type::Byte, value: Type::Byte, entries: vec![] }), 1))
+        );
+        let m =
+            Map { key: Type::I32, value: Type::Binary, entries: vec![(Value::I32(1), Value::Binary(b"a".to_vec()))] };
+        let b = Value::Map(m.clone()).to_bytes(c).unwrap();
+        assert_eq!(b, [0x01, 0x58, 0x02, 0x01, b'a']);
+        assert_eq!(Value::parse(c, Type::Map, &b), Ok((Value::Map(m), 5)));
+    }
+
+    #[test]
+    fn compact_field_headers() {
+        let c = Protocol::Compact;
+        let s = Value::Struct(vec![
+            Field { id: 1, value: Value::Bool(true) },
+            Field { id: 2, value: Value::Bool(false) },
+            // A jump of more than 15: the long form.
+            Field { id: 100, value: Value::Byte(7) },
+            // Going down: the long form too.
+            Field { id: 3, value: Value::Byte(-1) },
+            Field { id: 18, value: Value::Uuid([9; 16]) },
+        ]);
+        let b = s.to_bytes(c).unwrap();
+        let mut want = vec![0x11, 0x12, 0x03, 0xc8, 0x01, 7, 0x03, 0x06, 0xff, 0xfd];
+        want.extend_from_slice(&[9; 16]);
+        want.push(0);
+        assert_eq!(b, want);
+        assert_eq!(Value::parse(c, Type::Struct, &b), Ok((s, b.len())));
+        // Overlong but valid varints are read.
+        assert_eq!(Value::parse(c, Type::I32, &[0x82, 0x80, 0x00]), Ok((Value::I32(1), 3)));
+        // A delta that runs past 32767 wraps, as Apache Thrift does.
+        let b = [0x03, 0xfc, 0xff, 0x03, 0, 0x23, 0, 0];
+        let (v, _) = Value::parse(c, Type::Struct, &b).unwrap();
+        let Value::Struct(f) = &v else { panic!() };
+        assert_eq!(f[0].id, i16::MAX - 1);
+        assert_eq!(f[1].id, i16::MIN);
+        let again = v.to_bytes(c).unwrap();
+        assert_eq!(Value::parse(c, Type::Struct, &again), Ok((v, again.len())));
+    }
+
+    #[test]
+    fn binary_values() {
+        let b = Protocol::Binary;
+        let v = Value::Struct(vec![
+            Field { id: -1, value: Value::Bool(true) },
+            Field {
+                id: 5,
+                value: Value::Map(Map {
+                    key: Type::Binary,
+                    value: Type::I64,
+                    entries: vec![(Value::Binary(b"k".to_vec()), Value::I64(-2))],
+                }),
+            },
+        ]);
+        let bytes = v.to_bytes(b).unwrap();
+        let want = [
+            0x02, 0xff, 0xff, 1, 0x0d, 0, 5, 11, 10, 0, 0, 0, 1, 0, 0, 0, 1, b'k', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            0xff, 0xfe, 0,
+        ];
+        assert_eq!(bytes, want);
+        assert_eq!(Value::parse(b, Type::Struct, &bytes), Ok((v.clone(), want.len())));
+        assert_eq!(Value::parse(Protocol::BinaryOld, Type::Struct, &bytes), Ok((v, want.len())));
+        let s = Value::Set(List { elem: Type::I16, items: vec![Value::I16(1)] });
+        assert_eq!(s.to_bytes(b).unwrap(), [6, 0, 0, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn parse_errors() {
+        let (b, c) = (Protocol::Binary, Protocol::Compact);
+        assert_eq!(Message::parse(&[]), Err(Error::Truncated));
+        assert_eq!(Message::parse(&[0x81]), Err(Error::BadProtocol(0x81)));
+        assert_eq!(Message::parse(&[0x80, 0x02, 0, 1]), Err(Error::BadVersion(0x8002_0001)));
+        assert_eq!(Message::parse(&[0x82, 0x22]), Err(Error::BadVersion(2)));
+        assert_eq!(Message::parse(&[0x82, 0xa1]), Err(Error::BadMessageType(5)));
+        assert_eq!(Message::parse(&[0x80, 0x01, 0, 0]), Err(Error::BadMessageType(0)));
+        assert_eq!(Message::parse(&[0, 0, 0, 0, 9]), Err(Error::BadMessageType(9)));
+        assert_eq!(Message::parse(&[0x82, 0x21, 0, 1, 0xff]), Err(Error::BadUtf8));
+        assert_eq!(Message::parse(&[0x7f, 0xff, 0xff, 0xff]), Err(Error::Length(0x7fff_ffff)));
+        // Bad types in fields and containers.
+        assert_eq!(Value::parse(b, Type::Struct, &[1, 0, 1]), Err(Error::BadType(1)));
+        assert_eq!(Value::parse(b, Type::Struct, &[5, 0, 1]), Err(Error::BadType(5)));
+        assert_eq!(Value::parse(c, Type::Struct, &[0x10]), Err(Error::BadType(0)));
+        assert_eq!(Value::parse(c, Type::Struct, &[0x1e]), Err(Error::BadType(14)));
+        assert_eq!(Value::parse(b, Type::List, &[0, 0, 0, 0, 0]), Err(Error::BadType(0)));
+        assert_eq!(Value::parse(c, Type::List, &[0x10]), Err(Error::BadType(0)));
+        assert_eq!(Value::parse(b, Type::Map, &[8, 1, 0, 0, 0, 0]), Err(Error::BadType(1)));
+        assert_eq!(Value::parse(c, Type::Map, &[1, 0xe5]), Err(Error::BadType(14)));
+        assert_eq!(Value::parse(c, Type::Map, &[1, 0x5f]), Err(Error::BadType(15)));
+        // Booleans.
+        assert_eq!(Value::parse(b, Type::Bool, &[2]), Err(Error::BadBool(2)));
+        assert_eq!(Value::parse(c, Type::Bool, &[3]), Err(Error::BadBool(3)));
+        // Varints: too long, and too big.
+        assert_eq!(Value::parse(c, Type::I32, &[0x80, 0x80, 0x80, 0x80, 0x80, 0]), Err(Error::BadVarint));
+        assert_eq!(Value::parse(c, Type::I32, &[0xff, 0xff, 0xff, 0xff, 0x1f]), Err(Error::BadVarint));
+        assert_eq!(Value::parse(c, Type::I16, &[0x80, 0x80, 0x04]), Err(Error::BadVarint));
+        assert_eq!(
+            Value::parse(c, Type::I64, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02]),
+            Err(Error::BadVarint)
+        );
+        assert!(Value::parse(c, Type::I64, &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]).is_ok());
+        // Lengths: negative, and over the limits.
+        assert_eq!(Value::parse(b, Type::Binary, &[0xff, 0xff, 0xff, 0xff]), Err(Error::Length(-1)));
+        assert_eq!(Value::parse(b, Type::List, &[8, 0, 0x0f, 0x42, 0x41]), Err(Error::Length(1_000_001)));
+        assert_eq!(Value::parse(c, Type::List, &[0xf5, 0xc1, 0x84, 0x3d]), Err(Error::Length(1_000_001)));
+        assert_eq!(Value::parse(c, Type::Binary, &[0xff, 0xff, 0xff, 0xff, 0x0f]), Err(Error::Length(0xffff_ffff)));
+        // A count bigger than the bytes left.
+        assert_eq!(Value::parse(b, Type::List, &[8, 0, 0, 0, 3, 0, 0]), Err(Error::Truncated));
+        assert_eq!(Value::parse(c, Type::Map, &[3, 0x55, 0, 0, 0, 0]), Err(Error::Truncated));
+    }
+
+    /// `depth` lists, each holding the next, around an empty list.
+    fn nested(depth: usize) -> Value {
+        let mut v = Value::List(List { elem: Type::I32, items: vec![] });
+        for _ in 1..depth {
+            v = Value::List(List { elem: Type::List, items: vec![v] });
+        }
+        v
+    }
+
+    #[test]
+    fn depth_limit() {
+        for p in PROTOCOLS {
+            let ok = nested(MAX_DEPTH);
+            let b = ok.to_bytes(p).unwrap();
+            assert_eq!(Value::parse(p, Type::List, &b), Ok((ok, b.len())));
+            assert_eq!(nested(MAX_DEPTH + 1).to_bytes(p), Err(WriteError::TooDeep));
+            // One more level by hand.
+            let mut deeper = if p == Protocol::Compact { vec![0x19] } else { vec![15, 0, 0, 0, 1] };
+            deeper.extend_from_slice(&b);
+            assert_eq!(Value::parse(p, Type::List, &deeper), Err(Error::TooDeep));
+        }
+        // A message body counts as depth 1.
+        let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH - 1) }], ..add_call() };
+        assert!(m.to_bytes(Protocol::Compact).is_ok());
+        let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH) }], ..add_call() };
+        assert_eq!(m.to_bytes(Protocol::Compact), Err(WriteError::TooDeep));
+        // A boolean field counts too.
+        let mut v = Value::Struct(vec![Field { id: 1, value: Value::Bool(true) }]);
+        for _ in 2..MAX_DEPTH {
+            v = Value::Struct(vec![Field { id: 1, value: v }]);
+        }
+        let b = v.to_bytes(Protocol::Compact).unwrap();
+        assert!(Value::parse(Protocol::Compact, Type::Struct, &b).is_ok());
+        let v = Value::Struct(vec![Field { id: 1, value: v }]);
+        assert_eq!(v.to_bytes(Protocol::Compact), Err(WriteError::TooDeep));
+    }
+
+    #[test]
+    fn value_count_limit() {
+        let half = Value::List(List { elem: Type::Bool, items: vec![Value::Bool(true); MAX_VALUES / 2] });
+        let v = Value::Struct(vec![Field { id: 1, value: half.clone() }, Field { id: 2, value: half }]);
+        for p in PROTOCOLS {
+            let mut out = vec![7];
+            assert_eq!(v.write(p, &mut out), Err(WriteError::TooMany));
+            assert_eq!(out, [7]);
+        }
+        // Built by hand: two lists of half the limit each.
+        let n = (MAX_VALUES / 2) as u32;
+        let mut b = Vec::new();
+        for id in [1u8, 2] {
+            b.extend_from_slice(&[15, 0, id, 2]);
+            b.extend_from_slice(&n.to_be_bytes());
+            b.extend(std::iter::repeat_n(1u8, n as usize));
+        }
+        b.push(0);
+        assert_eq!(Value::parse(Protocol::Binary, Type::Struct, &b), Err(Error::TooMany));
+    }
+
+    /// The address space this process has ever reserved, in kB.
+    #[cfg(target_os = "linux")]
+    fn vm_peak_kb() -> u64 {
+        let s = std::fs::read_to_string("/proc/self/status").unwrap();
+        let line = s.lines().find(|l| l.starts_with("VmPeak:")).unwrap();
+        line.split_whitespace().nth(1).unwrap().parse().unwrap()
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn declared_counts_do_not_reserve_memory() {
+        // 62 nested lists that each claim a million elements, around a
+        // million bytes. Reserving every claimed count at once would take
+        // 62 million values' worth of memory for one megabyte of input.
+        let n = MAX_CONTAINER_LEN as u32;
+        let mut b = Vec::new();
+        for _ in 0..62 {
+            b.push(15);
+            b.extend_from_slice(&n.to_be_bytes());
+        }
+        b.push(3);
+        b.extend_from_slice(&n.to_be_bytes());
+        b.extend(std::iter::repeat_n(0u8, n as usize));
+        let before = vm_peak_kb();
+        assert_eq!(Value::parse(Protocol::Binary, Type::List, &b), Err(Error::Truncated));
+        let grew = vm_peak_kb() - before;
+        assert!(grew < 1 << 20, "reserved {grew} kB more");
+    }
+
+    #[test]
+    fn write_errors() {
+        for p in PROTOCOLS {
+            let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I64(1)] });
+            assert_eq!(l.to_bytes(p), Err(WriteError::Mismatch));
+            let m =
+                Value::Map(Map { key: Type::I32, value: Type::I32, entries: vec![(Value::I32(1), Value::Bool(true))] });
+            assert_eq!(m.to_bytes(p), Err(WriteError::Mismatch));
+            let long = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN + 1] });
+            assert_eq!(long.to_bytes(p), Err(WriteError::TooLong));
+            let at = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN] });
+            let b = at.to_bytes(p).unwrap();
+            assert_eq!(Value::parse(p, Type::List, &b), Ok((at, b.len())));
+            let entries = vec![(Value::Byte(0), Value::Byte(0)); MAX_CONTAINER_LEN + 1];
+            let long = Value::Map(Map { key: Type::Byte, value: Type::Byte, entries });
+            assert_eq!(long.to_bytes(p), Err(WriteError::TooLong));
+        }
+        let big = Value::Binary(vec![0; MAX_BINARY_LEN + 1]);
+        assert_eq!(big.to_bytes(Protocol::Binary), Err(WriteError::TooLong));
+        let at = Value::Binary(vec![0; MAX_BINARY_LEN]);
+        let b = at.to_bytes(Protocol::Compact).unwrap();
+        assert_eq!(Value::parse(Protocol::Compact, Type::Binary, &b), Ok((at, b.len())));
+        let m = Message { name: "x".repeat(MAX_BINARY_LEN + 1), ..add_call() };
+        assert_eq!(m.to_bytes(Protocol::BinaryOld), Err(WriteError::TooLong));
+        assert_eq!(frame(&vec![0; MAX_FRAME + 1]), Err(WriteError::TooLong));
+        let f = frame(&vec![0; MAX_FRAME]).unwrap();
+        assert_eq!(parse_frame(&f).unwrap().unwrap().1, f.len());
+    }
+
+    #[test]
+    fn frames() {
+        let payload = add_call().to_bytes(Protocol::Compact).unwrap();
+        let f = add_call().to_frame(Protocol::Compact).unwrap();
+        assert_eq!(f[..4], (payload.len() as u32).to_be_bytes());
+        assert_eq!(parse_frame(&f), Ok(Some((&payload[..], f.len()))));
+        for n in 0..f.len() {
+            assert_eq!(parse_frame(&f[..n]), Ok(None), "{n} bytes");
+        }
+        assert_eq!(parse_frame(&[0, 0, 0, 0]), Ok(Some((&[][..], 4))));
+        assert_eq!(parse_frame(&[0xff, 0xff, 0xff, 0xff]), Err(FrameError::Length(-1)));
+        assert_eq!(parse_frame(&[0x00, 0xfa, 0x00, 0x01]), Err(FrameError::Length(16_384_001)));
+    }
+
+    #[test]
+    fn decoder_splits_a_stream() {
+        let a = add_call().to_frame(Protocol::Binary).unwrap();
+        let b = Message { seq: 2, ..add_call() }.to_frame(Protocol::Compact).unwrap();
+        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
+        let mut d = Decoder::new();
+        let mut got = Vec::new();
+        for byte in &stream {
+            d.feed(std::slice::from_ref(byte));
+            while let Some(f) = d.next_frame() {
+                got.push(Message::parse(&f.unwrap()).unwrap().0.seq);
+            }
+        }
+        assert_eq!(got, [1, 2]);
+        assert_eq!(d.buffered(), 0);
+        // A broken stream stays broken.
+        d.feed(&[0x80, 0, 0, 0]);
+        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(i32::MIN))));
+        d.feed(&a);
+        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(i32::MIN))));
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn decoder_takes_many_small_frames_in_linear_time() {
+        let one = frame(&[1, 2, 3]).unwrap();
+        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+        let started = std::time::Instant::now();
+        let mut d = Decoder::new();
+        d.feed(&stream);
+        let mut n = 0;
+        while let Some(f) = d.next_frame() {
+            assert_eq!(f.unwrap(), [1, 2, 3]);
+            n += 1;
+        }
+        assert_eq!(n, 200_000);
+        assert_eq!(d.buffered(), 0);
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
+    /// Every message `Message::parse` finds in `b`, one after another, and
+    /// the error that ends them, if it is not [`Error::Truncated`].
+    fn parse_all(mut b: &[u8]) -> (Vec<(Message, Protocol)>, Option<Error>) {
+        let mut got = Vec::new();
+        loop {
+            match Message::parse(b) {
+                Ok((m, p, used)) => {
+                    got.push((m, p));
+                    b = &b[used..];
+                }
+                Err(Error::Truncated) => return (got, None),
+                Err(e) => return (got, Some(e)),
+            }
+        }
+    }
+
+    /// Feeds `b` to a stream decoder in pieces of the sizes `sizes` gives,
+    /// taking messages out after each.
+    fn stream_all(b: &[u8], mut sizes: impl FnMut() -> usize) -> (Vec<(Message, Protocol)>, Option<Error>) {
+        let mut d = StreamDecoder::new();
+        let mut got = Vec::new();
+        let mut at = 0;
+        while at < b.len() {
+            let end = (at + sizes().max(1)).min(b.len());
+            d.feed(&b[at..end]);
+            at = end;
+            while let Some(m) = d.next_message() {
+                match m {
+                    Ok(m) => got.push(m),
+                    Err(e) => {
+                        assert_eq!(d.next_message(), Some(Err(e)));
+                        assert_eq!(d.buffered(), 0);
+                        return (got, Some(e));
+                    }
+                }
+            }
+        }
+        (got, None)
+    }
+
+    /// The stream decoder agrees with reading the bytes whole. Where a
+    /// whole read stops early because a count is more than the bytes held,
+    /// the stream decoder may already see an error further on.
+    fn stream_agrees(b: &[u8], r: &mut Lcg) {
+        let want = parse_all(b);
+        for got in [stream_all(b, || 1), stream_all(b, || b.len()), stream_all(b, || r.below(9))] {
+            assert_eq!(got.0, want.0);
+            if want.1.is_some() {
+                assert_eq!(got.1, want.1);
+            }
+        }
+    }
+
+    /// A double that is NaN equals itself, so a message read twice from the
+    /// same bytes is equal both times. Values are equal when their bytes
+    /// are, which also tells 0.0 from -0.0.
+    #[test]
+    fn doubles_compare_by_their_bits() {
+        let b = [
+            0x82, 0x81, 0x10, 0x00, 0x27, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x2d, 0x00, 0x7a, 0x2d, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x40, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff,
+        ];
+        let (m, p, _) = Message::parse(&b).unwrap();
+        assert_eq!(p, Protocol::Compact);
+        assert!(matches!(m.body[0].value, Value::Double(x) if x.is_nan()));
+        assert_eq!(m, m.clone());
+        stream_agrees(&b, &mut Lcg(1));
+        assert_eq!(Value::Double(f64::NAN), Value::Double(f64::NAN));
+        assert_ne!(Value::Double(0.0), Value::Double(-0.0));
+    }
+
+    #[test]
+    fn stream_decoder_splits_a_stream() {
+        let a = add_call().to_bytes(Protocol::Binary).unwrap();
+        let b = Message { seq: 2, ..add_call() }.to_bytes(Protocol::Compact).unwrap();
+        let c = Message { seq: 3, ..add_call() }.to_bytes(Protocol::BinaryOld).unwrap();
+        let stream: Vec<u8> = [&a[..], &b, &c].concat();
+        let want = vec![
+            (add_call(), Protocol::Binary),
+            (Message { seq: 2, ..add_call() }, Protocol::Compact),
+            (Message { seq: 3, ..add_call() }, Protocol::BinaryOld),
+        ];
+        assert_eq!(stream_all(&stream, || 1), (want.clone(), None));
+        assert_eq!(stream_all(&stream, || stream.len()), (want, None));
+        let mut d = StreamDecoder::default();
+        d.feed(&a[..5]);
+        assert_eq!(d.next_message(), None);
+        assert_eq!(d.buffered(), 5);
+        d.feed(&a[5..]);
+        assert_eq!(d.next_message(), Some(Ok((add_call(), Protocol::Binary))));
+        assert_eq!((d.next_message(), d.buffered()), (None, 0));
+        // Errors, which stay.
+        d.feed(&[0x81]);
+        assert_eq!(d.next_message(), Some(Err(Error::BadProtocol(0x81))));
+        d.feed(&a);
+        assert_eq!(d.next_message(), Some(Err(Error::BadProtocol(0x81))));
+        assert_eq!(d.buffered(), 0);
+        // An error is found as soon as its byte comes.
+        let mut d = StreamDecoder::new();
+        d.feed(&[0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0x05]);
+        assert_eq!(d.next_message(), Some(Err(Error::BadType(5))));
+        let mut d = StreamDecoder::new();
+        d.feed(&[0x82, 0x21, 0, 1, 0xff]);
+        assert_eq!(d.next_message(), Some(Err(Error::BadUtf8)));
+        // A list that claims more elements than have come, with a bad
+        // element: a whole read says the bytes are cut short, while the
+        // stream decoder already sees the bad type.
+        let bad = [0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e];
+        assert_eq!(Message::parse(&bad), Err(Error::Truncated));
+        let mut d = StreamDecoder::new();
+        d.feed(&bad);
+        assert_eq!(d.next_message(), Some(Err(Error::BadType(14))));
+    }
+
+    #[test]
+    fn stream_decoder_reads_each_byte_once() {
+        // 400,000 boolean fields of one byte each, fed one byte at a time.
+        // Reading from the start on each byte would take about 10^11 steps.
+        let body = (0..400_000).map(|i| Field { id: (i % 15 + 1) as i16, value: Value::Bool(i % 3 == 0) }).collect();
+        let m = Message { body, ..add_call() };
+        let b = m.to_bytes(Protocol::Compact).unwrap();
+        let started = std::time::Instant::now();
+        let mut d = StreamDecoder::new();
+        let mut got = None;
+        for byte in &b {
+            d.feed(std::slice::from_ref(byte));
+            if let Some(r) = d.next_message() {
+                got = Some(r);
+            }
+        }
+        assert_eq!(got, Some(Ok((m, Protocol::Compact))));
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        // A long byte string, cut in many pieces, is not read again for each.
+        let m = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
+        let b = m.to_bytes(Protocol::Binary).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(stream_all(&b, || 16), (vec![(m, Protocol::Binary)], None));
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn stream_decoder_limits_a_message() {
+        // A message whose one field is a byte string as long as allowed,
+        // so the whole message is a few bytes over the limit.
+        let mut head = vec![0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 11, 0, 1];
+        head.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
+        let mut d = StreamDecoder::new();
+        d.feed(&head);
+        let chunk = vec![0u8; 1 << 20];
+        let mut fed = head.len();
+        let got = loop {
+            if let Some(r) = d.next_message() {
+                break r;
+            }
+            assert!(fed <= MAX_MESSAGE, "fed {fed} bytes");
+            d.feed(&chunk);
+            fed += chunk.len();
+        };
+        assert_eq!(got, Err(Error::TooLong));
+        assert_eq!(d.buffered(), 0);
+        // The longest message allowed is read.
+        let n = MAX_MESSAGE - head.len() - 1;
+        let m = Message {
+            body: vec![Field { id: 1, value: Value::Binary(vec![0; n]) }],
+            name: String::new(),
+            ..add_call()
+        };
+        let b = m.to_bytes(Protocol::Binary).unwrap();
+        assert_eq!(b.len(), MAX_MESSAGE);
+        assert_eq!(stream_all(&b, || 1 << 20), (vec![(m, Protocol::Binary)], None));
+    }
+
+    #[test]
+    fn replies() {
+        let call = add_call();
+        let r = call.reply(vec![]);
+        assert_eq!((r.name.as_str(), r.kind, r.seq), ("add", MessageType::Reply, 1));
+        let e = call.exception(exception_kind::INTERNAL_ERROR, "boom");
+        assert_eq!((e.kind, e.seq), (MessageType::Exception, 1));
+        for code in 0..=255u8 {
+            if let Some(t) = MessageType::from_code(code) {
+                assert_eq!(t.code(), code);
+            }
+            if let Some(t) = Type::from_binary_code(code) {
+                assert_eq!(t.binary_code(), code);
+            }
+            if let Some(t) = Type::from_compact_code(code) {
+                assert!(t.compact_code() == code || code == 2);
+            }
+        }
+        for t in ALL_TYPES {
+            assert_eq!(Type::from_binary_code(t.binary_code()), Some(t));
+            assert_eq!(Type::from_compact_code(t.compact_code()), Some(t));
+        }
+        assert!(!Error::TooDeep.to_string().is_empty());
+        assert!(!WriteError::Mismatch.to_string().is_empty());
+        assert!(!FrameError::Length(-1).to_string().is_empty());
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn random_type(r: &mut Lcg, depth: usize) -> Type {
+        let n = if depth >= 4 { 8 } else { ALL_TYPES.len() };
+        ALL_TYPES[r.below(n)]
+    }
+
+    fn random_value(r: &mut Lcg, ty: Type, depth: usize) -> Value {
+        let big = (r.next() << 31) ^ r.next();
+        match ty {
+            Type::Bool => Value::Bool(r.below(2) == 0),
+            Type::Byte => Value::Byte(big as i8),
+            Type::I16 => Value::I16(big as i16),
+            Type::I32 => Value::I32(if r.below(2) == 0 { big as i32 } else { r.below(20) as i32 - 10 }),
+            Type::I64 => Value::I64((big << r.below(40)) as i64),
+            Type::Double => Value::Double(big as i64 as f64 / 7.0),
+            Type::Binary => Value::Binary((0..r.below(6)).map(|_| r.next() as u8).collect()),
+            Type::Uuid => Value::Uuid([r.next() as u8; 16]),
+            Type::Struct => {
+                let mut id: i16 = 0;
+                let fields = (0..r.below(5))
+                    .map(|_| {
+                        id = match r.below(3) {
+                            0 => id.wrapping_add(1),
+                            1 => id.wrapping_add(r.below(20) as i16),
+                            _ => r.next() as i16,
+                        };
+                        let t = random_type(r, depth + 1);
+                        Field { id, value: random_value(r, t, depth + 1) }
+                    })
+                    .collect();
+                Value::Struct(fields)
+            }
+            Type::List | Type::Set => {
+                let elem = random_type(r, depth + 1);
+                let n = if r.below(8) == 0 { 15 + r.below(5) } else { r.below(4) };
+                let items = (0..n).map(|_| random_value(r, elem, depth + 1)).collect();
+                let l = List { elem, items };
+                if ty == Type::List { Value::List(l) } else { Value::Set(l) }
+            }
+            Type::Map => {
+                let n = r.below(4);
+                let (key, value) = if n == 0 {
+                    (Type::Byte, Type::Byte)
+                } else {
+                    (random_type(r, depth + 1), random_type(r, depth + 1))
+                };
+                let entries =
+                    (0..n).map(|_| (random_value(r, key, depth + 1), random_value(r, value, depth + 1))).collect();
+                Value::Map(Map { key, value, entries })
+            }
+        }
+    }
+
+    fn random_message(r: &mut Lcg) -> Message {
+        let Value::Struct(body) = random_value(r, Type::Struct, 1) else { unreachable!() };
+        Message {
+            name: ["", "ping", "getUser", "\u{e9}t\u{e9}"][r.below(4)].to_string(),
+            kind: MessageType::from_code(1 + r.below(4) as u8).unwrap(),
+            seq: r.next() as i32 - (1 << 30),
+            body,
+        }
+    }
+
+    /// Checks that a message read from damaged bytes writes and reads back
+    /// to the same bytes.
+    fn rewrites(m: &Message, p: Protocol) {
+        let b = m.to_bytes(p).unwrap();
+        let (again, q, used) = Message::parse(&b).unwrap();
+        assert_eq!((q, used), (p, b.len()));
+        assert_eq!(again.to_bytes(p).unwrap(), b);
+    }
+
+    #[test]
+    fn lcg_fuzz() {
+        let mut r = Lcg(9090);
+        for i in 0..4000 {
+            let m = random_message(&mut r);
+            let p = PROTOCOLS[i % 3];
+            let b = m.to_bytes(p).unwrap();
+            assert_eq!(Message::parse(&b), Ok((m.clone(), p, b.len())));
+            // Every proper prefix is truncated.
+            for n in 0..b.len() {
+                assert_eq!(Message::parse(&b[..n]), Err(Error::Truncated), "{n} of {}", b.len());
+            }
+            // Each value type alone round trips too.
+            let t = random_type(&mut r, 1);
+            let v = random_value(&mut r, t, 1);
+            let vb = v.to_bytes(p).unwrap();
+            assert_eq!(Value::parse(p, t, &vb), Ok((v, vb.len())));
+            for n in 0..vb.len() {
+                assert_eq!(Value::parse(p, t, &vb[..n]), Err(Error::Truncated));
+            }
+            // Damaged copies never panic, and what parses rewrites the same.
+            for _ in 0..4 {
+                let mut d = b.clone();
+                match r.below(3) {
+                    0 => {
+                        for _ in 0..1 + r.below(3) {
+                            let at = r.below(d.len());
+                            d[at] = r.next() as u8;
+                        }
+                    }
+                    1 => d.truncate(r.below(d.len() + 1)),
+                    _ => {
+                        let at = r.below(d.len() + 1);
+                        d.insert(at, r.next() as u8);
+                    }
+                }
+                if let Ok((m, q, used)) = Message::parse(&d) {
+                    assert!(used <= d.len());
+                    rewrites(&m, q);
+                }
+                stream_agrees(&d, &mut r);
+                for t in ALL_TYPES {
+                    for p in PROTOCOLS {
+                        if let Ok((v, used)) = Value::parse(p, t, &d) {
+                            assert!(used <= d.len());
+                            let vb = v.to_bytes(p).unwrap();
+                            let (back, n) = Value::parse(p, t, &vb).unwrap();
+                            assert_eq!(n, vb.len());
+                            assert_eq!(back.to_bytes(p).unwrap(), vb);
+                        }
+                    }
+                }
+            }
+            // Random bytes.
+            let junk: Vec<u8> = (0..r.below(40)).map(|_| r.next() as u8).collect();
+            if let Ok((m, q, _)) = Message::parse(&junk) {
+                rewrites(&m, q);
+            }
+            stream_agrees(&junk, &mut r);
+            for t in ALL_TYPES {
+                let _ = Value::parse(Protocol::Compact, t, &junk);
+                let _ = Value::parse(Protocol::Binary, t, &junk);
+            }
+        }
+    }
+
+    #[test]
+    fn lcg_fuzz_decoder() {
+        let mut r = Lcg(1);
+        for _ in 0..1000 {
+            // A few frames, sometimes damaged, fed whole and a byte at a time.
+            let mut stream = Vec::new();
+            for _ in 0..1 + r.below(3) {
+                let p = PROTOCOLS[r.below(3)];
+                stream.extend(random_message(&mut r).to_frame(p).unwrap());
+            }
+            if r.below(3) == 0 {
+                let at = r.below(stream.len());
+                stream[at] = r.next() as u8;
+            }
+            let mut whole = Decoder::new();
+            whole.feed(&stream);
+            let mut a = Vec::new();
+            while let Some(f) = whole.next_frame() {
+                let stop = f.is_err();
+                a.push(f);
+                if stop {
+                    break;
+                }
+            }
+            let mut bytewise = Decoder::new();
+            let mut b = Vec::new();
+            'outer: for byte in &stream {
+                bytewise.feed(std::slice::from_ref(byte));
+                while let Some(f) = bytewise.next_frame() {
+                    let stop = f.is_err();
+                    b.push(f);
+                    if stop {
+                        break 'outer;
+                    }
+                }
+            }
+            assert_eq!(a, b);
+            // The same messages without frames, sometimes damaged.
+            let mut bare = Vec::new();
+            for _ in 0..1 + r.below(3) {
+                let p = PROTOCOLS[r.below(3)];
+                bare.extend(random_message(&mut r).to_bytes(p).unwrap());
+            }
+            if r.below(2) == 0 {
+                let at = r.below(bare.len());
+                bare[at] = r.next() as u8;
+            }
+            stream_agrees(&bare, &mut r);
+            for f in a.into_iter().flatten() {
+                if let Ok((m, q, _)) = Message::parse(&f) {
+                    rewrites(&m, q);
+                }
+            }
+        }
+    }
+}

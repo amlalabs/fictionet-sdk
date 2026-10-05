@@ -236,7 +236,8 @@ pub enum Error {
     /// The APDU type is one of the reserved values 8 to 15.
     PduType(u8),
     /// An application tag number from 13 to 15, or an extended tag number
-    /// of 255 in any class. All are reserved.
+    /// of 255 in any class. All are reserved. Also an extended tag number
+    /// below 15, which Clause 20.2.1.2 says goes in the first byte.
     ReservedTag(u8),
     /// An application tag with length code 6 or 7. Only context tags open
     /// or close constructed data.
@@ -260,6 +261,11 @@ pub enum Error {
     ServiceBody,
     /// A field held a value outside the range its type allows.
     OutOfRange,
+    /// A network number Clause 6.2.2.1 does not allow: a destination
+    /// network of 0, or a source network of 0 or 0xFFFF.
+    Network(u16),
+    /// Input longer than [`MAX_MESSAGE`], which no datagram can carry.
+    TooLong,
 }
 
 impl std::fmt::Display for Error {
@@ -281,6 +287,8 @@ impl std::fmt::Display for Error {
             Error::BitString(u) => write!(f, "bit string with {u} unused bits"),
             Error::ServiceBody => f.write_str("service body does not match its definition"),
             Error::OutOfRange => f.write_str("value out of range"),
+            Error::Network(n) => write!(f, "network number {n} not allowed here"),
+            Error::TooLong => f.write_str("input longer than any datagram"),
         }
     }
 }
@@ -542,7 +550,8 @@ impl Priority {
 /// address and port).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NetAddress {
-    /// The network number. 0xFFFF in a destination means every network.
+    /// The network number: 1 to 65534, or 0xFFFF in a destination for
+    /// every network. 0 is not a network number.
     pub network: u16,
     /// The station's address. Empty in a destination means a broadcast on
     /// that network. Only the first [`MAX_MAC_LEN`] bytes are written.
@@ -598,12 +607,14 @@ pub struct Npdu {
 }
 
 impl Npdu {
-    /// An NPDU for the local network, carrying `apdu`.
+    /// An NPDU for the local network, carrying `apdu`. It expects a reply
+    /// when `apdu` is a confirmed request or a segment of a complex
+    /// acknowledgment (Clause 6.2.2, control bit 2).
     pub fn local(apdu: Vec<u8>) -> Npdu {
         Npdu {
             destination: None,
             source: None,
-            expecting_reply: false,
+            expecting_reply: apdu_expects_reply(&apdu),
             priority: Priority::Normal,
             body: NpduBody::Apdu(apdu),
         }
@@ -617,9 +628,20 @@ impl Npdu {
             return Err(Error::Version(version));
         }
         let control = r.u8()?;
-        let destination = if control & 0x20 != 0 { Some(net_address(&mut r)?) } else { None };
+        let destination = if control & 0x20 != 0 {
+            let a = net_address(&mut r)?;
+            if a.network == 0 {
+                return Err(Error::Network(0));
+            }
+            Some(a)
+        } else {
+            None
+        };
         let source = if control & 0x08 != 0 {
             let a = net_address(&mut r)?;
+            if !valid_source_network(a.network) {
+                return Err(Error::Network(a.network));
+            }
             if a.mac.is_empty() {
                 return Err(Error::SourceAddress);
             }
@@ -657,25 +679,31 @@ impl Npdu {
 
     /// An NPDU that answers this one with `apdu`: sent back to the
     /// original source through the router it came from, at the same
-    /// priority, not expecting a reply.
+    /// priority. It expects a reply only when `apdu` is a confirmed
+    /// request or a segment of a complex acknowledgment, as for
+    /// [`Npdu::local`].
     pub fn reply(&self, apdu: Vec<u8>) -> Npdu {
         Npdu {
             destination: self.source.clone().map(|address| Destination { address, hop_count: 255 }),
             source: None,
-            expecting_reply: false,
+            expecting_reply: apdu_expects_reply(&apdu),
             priority: self.priority,
             body: NpduBody::Apdu(apdu),
         }
     }
 
-    /// The NPDU's bytes. Addresses longer than [`MAX_MAC_LEN`] are cut.
+    /// The NPDU's bytes. Addresses longer than [`MAX_MAC_LEN`] are cut. A
+    /// source with an empty address or a network of 0 or 0xFFFF is left
+    /// out, and so is a destination on network 0, which Clause 6.2.2.1
+    /// does not allow: such an NPDU is written for the local network.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let source = self.source.as_ref().filter(|s| !s.mac.is_empty());
+        let source = self.source.as_ref().filter(|s| !s.mac.is_empty() && valid_source_network(s.network));
+        let destination = self.destination.as_ref().filter(|d| d.address.network != 0);
         let mut control = self.priority.bits();
         if matches!(self.body, NpduBody::Network { .. }) {
             control |= 0x80;
         }
-        if self.destination.is_some() {
+        if destination.is_some() {
             control |= 0x20;
         }
         if source.is_some() {
@@ -685,13 +713,13 @@ impl Npdu {
             control |= 0x04;
         }
         let mut out = vec![NPDU_VERSION, control];
-        if let Some(d) = &self.destination {
+        if let Some(d) = destination {
             put_net_address(&mut out, &d.address);
         }
         if let Some(s) = source {
             put_net_address(&mut out, s);
         }
-        if let Some(d) = &self.destination {
+        if let Some(d) = destination {
             out.push(d.hop_count);
         }
         match &self.body {
@@ -705,6 +733,21 @@ impl Npdu {
             }
         }
         out
+    }
+}
+
+/// Whether a source network number is allowed: 1 to 65534 (Clause
+/// 6.2.2.1).
+fn valid_source_network(network: u16) -> bool {
+    network != 0 && network != 0xffff
+}
+
+/// Whether an NPDU carrying `apdu` expects a reply: a confirmed request,
+/// or a segment of a complex acknowledgment (Clause 6.2.2).
+fn apdu_expects_reply(apdu: &[u8]) -> bool {
+    match apdu.first() {
+        Some(&first) => first >> 4 == 0 || (first >> 4 == 3 && first & 0x08 != 0),
+        None => false,
     }
 }
 
@@ -1054,7 +1097,8 @@ pub struct Tag {
 impl Tag {
     /// Reads the tag header at the start of `b`, and how many bytes it
     /// took. It does not check that the contents follow. An extended tag
-    /// number of 255, which Clause 20.2.1.2 reserves, is refused.
+    /// number of 255, which Clause 20.2.1.2 reserves, is refused, and so is
+    /// one below 15, which that clause puts in the first byte.
     pub fn parse(b: &[u8]) -> Result<(Tag, usize), Error> {
         let mut r = Reader::new(b);
         let first = r.u8()?;
@@ -1062,8 +1106,8 @@ impl Tag {
         let mut number = first >> 4;
         if number == 15 {
             number = r.u8()?;
-            if number == 255 {
-                return Err(Error::ReservedTag(255));
+            if number == 255 || number < 15 {
+                return Err(Error::ReservedTag(number));
             }
         }
         let content = match (class, first & 0x07) {
@@ -1233,8 +1277,10 @@ impl Value {
             return Err(Error::ContextTag(t.number));
         }
         if t.number == tag::BOOLEAN {
+            // Clause 20.2.3: the value is the length field itself, never an
+            // extended length.
             return match len {
-                0 | 1 => Ok((Value::Boolean(len == 1), header)),
+                0 | 1 if header == 1 => Ok((Value::Boolean(len == 1), header)),
                 _ => Err(Error::ValueLength { tag: tag::BOOLEAN, len }),
             };
         }
@@ -1314,8 +1360,13 @@ impl Value {
         })
     }
 
-    /// Reads values one after another until `b` ends.
+    /// Reads values one after another until `b` ends. Input longer than
+    /// [`MAX_MESSAGE`] is refused with [`Error::TooLong`], since each value
+    /// takes more memory than its bytes on the wire.
     pub fn parse_all(b: &[u8]) -> Result<Vec<Value>, Error> {
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
         let mut values = Vec::new();
         let mut at = 0;
         while at < b.len() {
@@ -1347,7 +1398,8 @@ impl Value {
 
     /// Appends the value, tag and all, to `out`, with integers in their
     /// shortest form. Strings whose contents would pass [`MAX_VALUE_LEN`]
-    /// lose their last bytes or bits.
+    /// lose their last bytes or bits. A UTF-8, UCS-2 or UCS-4 character
+    /// string is cut between characters, never inside one.
     pub fn write(&self, out: &mut Vec<u8>) {
         if let Value::Boolean(v) = self {
             let t = Tag { number: tag::BOOLEAN, class: Class::Application, content: TagContent::Length(u32::from(*v)) };
@@ -1385,7 +1437,7 @@ impl Value {
             Value::OctetString(v) => c.extend_from_slice(&v[..v.len().min(MAX_VALUE_LEN)]),
             Value::CharacterString(s) => {
                 c.push(s.charset);
-                c.extend_from_slice(&s.bytes[..s.bytes.len().min(MAX_VALUE_LEN - 1)]);
+                c.extend_from_slice(&s.bytes[..char_cut(s)]);
             }
             Value::BitString(bits) => {
                 let bits = &bits[..bits.len().min((MAX_VALUE_LEN - 1) * 8)];
@@ -1507,8 +1559,9 @@ impl WhoIs {
 /// The I-Am service (Clause 16.10): a device announces itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IAm {
-    /// The device's object identifier. Its type should be
-    /// [`object_type::DEVICE`].
+    /// The device's object identifier. Its type must be
+    /// [`object_type::DEVICE`]: [`IAm::parse`] refuses any other, and
+    /// [`IAm::to_bytes`] writes the type as Device whatever it holds.
     pub device: ObjectId,
     /// The longest APDU the device accepts, in bytes.
     pub max_apdu: u32,
@@ -1534,6 +1587,9 @@ impl IAm {
         }
         match values {
             [Value::ObjectId(device), Value::Unsigned(max_apdu), Value::Enumerated(seg), Value::Unsigned(vendor)] => {
+                if device.object_type != object_type::DEVICE {
+                    return Err(Error::OutOfRange);
+                }
                 Ok(IAm {
                     device,
                     max_apdu: u32::try_from(max_apdu).map_err(|_| Error::OutOfRange)?,
@@ -1548,7 +1604,7 @@ impl IAm {
     /// The service body.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        Value::ObjectId(self.device).write(&mut out);
+        Value::ObjectId(ObjectId::device(self.device.instance)).write(&mut out);
         Value::Unsigned(u64::from(self.max_apdu)).write(&mut out);
         Value::Enumerated(self.segmentation.code()).write(&mut out);
         Value::Unsigned(u64::from(self.vendor)).write(&mut out);
@@ -1558,6 +1614,22 @@ impl IAm {
     /// The unconfirmed request that carries this I-Am.
     pub fn to_apdu(&self) -> Apdu {
         Apdu::UnconfirmedRequest { service: unconfirmed::I_AM, data: self.to_bytes() }
+    }
+}
+
+/// How many of a character string's bytes fit in one value: all of them,
+/// or as many as fit without cutting a UTF-8, UCS-4 or UCS-2 character.
+fn char_cut(s: &CharString) -> usize {
+    let room = MAX_VALUE_LEN - 1;
+    if s.bytes.len() <= room {
+        return s.bytes.len();
+    }
+    match s.charset {
+        // Back up past continuation bytes to the start of a character.
+        0 => (0..=room).rev().find(|&i| s.bytes[i] & 0xc0 != 0x80).unwrap_or(0),
+        3 => room - room % 4,
+        4 => room - room % 2,
+        _ => room,
     }
 }
 
@@ -2136,6 +2208,8 @@ mod tests {
             Error::BitString(9),
             Error::ServiceBody,
             Error::OutOfRange,
+            Error::Network(0),
+            Error::TooLong,
         ];
         for e in all {
             let s = e.to_string();
@@ -2214,6 +2288,96 @@ mod tests {
         };
         let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().to_bytes()).to_bytes());
         assert_eq!(reply.to_bytes(), hex("810B0015 0100 1000 C4020004D2 2205C4 9103 220104"));
+    }
+
+    // Findings from review: each case below failed before its fix.
+
+    #[test]
+    fn value_lists_are_bounded() {
+        // 16 MiB of Null tags would have made 16 million values.
+        assert_eq!(Value::parse_all(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
+        assert_eq!(Value::parse_all(&vec![0; MAX_MESSAGE]).map(|v| v.len()), Ok(MAX_MESSAGE));
+    }
+
+    #[test]
+    fn expecting_reply_follows_the_apdu() {
+        // A confirmed GetAlarmSummary request expects a reply.
+        assert!(Npdu::local(hex("00 05 01 03")).expecting_reply);
+        assert_eq!(Npdu::local(hex("00 05 01 03")).to_bytes(), hex("01 04 00 05 01 03"));
+        // A segment of a complex acknowledgment does too; a whole one does not.
+        assert!(Npdu::local(hex("38 01 00 04 0C")).expecting_reply);
+        assert!(!Npdu::local(hex("30 01 0C")).expecting_reply);
+        assert!(!Npdu::local(hex("10 08")).expecting_reply);
+        assert!(!Npdu::local(vec![]).expecting_reply);
+        let request = Npdu::parse(&hex("01 0C 0002 01 05 00 05 01 0C")).unwrap();
+        assert!(request.reply(hex("38 01 00 04 0C")).expecting_reply);
+        assert!(!request.reply(hex("20 01 0C")).expecting_reply);
+    }
+
+    #[test]
+    fn network_numbers_follow_clause_6_2_2_1() {
+        // DNET 1 to 65535, SNET 1 to 65534.
+        assert_eq!(Npdu::parse(&hex("01 20 0000 00 FF 10 08")), Err(Error::Network(0)));
+        assert_eq!(Npdu::parse(&hex("01 08 FFFF 01 01 10 08")), Err(Error::Network(0xffff)));
+        assert_eq!(Npdu::parse(&hex("01 08 0000 01 01 10 08")), Err(Error::Network(0)));
+        assert!(Npdu::parse(&hex("01 08 FFFE 01 01 10 08")).is_ok());
+        assert!(Npdu::parse(&hex("01 20 FFFF 00 FF 10 08")).is_ok());
+        // Writers leave such addresses out, so a reply never turns a
+        // source of 0xFFFF into a global broadcast.
+        let n = Npdu { source: Some(NetAddress { network: 0xffff, mac: vec![1] }), ..Npdu::local(hex("10 08")) };
+        assert_eq!(n.to_bytes(), hex("01 00 10 08"));
+        let n = Npdu {
+            destination: Some(Destination { address: NetAddress { network: 0, mac: vec![] }, hop_count: 255 }),
+            ..Npdu::local(hex("10 08"))
+        };
+        assert_eq!(n.to_bytes(), hex("01 00 10 08"));
+        assert!(Npdu::parse(&n.to_bytes()).is_ok());
+    }
+
+    #[test]
+    fn strings_are_cut_between_characters() {
+        let s = "a".repeat(MAX_VALUE_LEN - 2) + "é";
+        let v = Value::CharacterString(CharString::utf8(&s));
+        let Value::CharacterString(back) = value(&v.to_bytes()) else { panic!() };
+        assert_eq!(back.as_str(), Some(&s[..MAX_VALUE_LEN - 2]));
+        // A four-byte character straddling the limit goes whole.
+        let s = "a".repeat(MAX_VALUE_LEN - 3) + "\u{1F600}";
+        let Value::CharacterString(back) = value(&Value::CharacterString(CharString::utf8(&s)).to_bytes()) else {
+            panic!()
+        };
+        assert_eq!(back.as_str(), Some(&s[..MAX_VALUE_LEN - 3]));
+        for (charset, unit) in [(3, 4), (4, 2)] {
+            let v = Value::CharacterString(CharString { charset, bytes: vec![0; MAX_VALUE_LEN + 8] });
+            let Value::CharacterString(back) = value(&v.to_bytes()) else { panic!() };
+            assert_eq!(back.bytes.len() % unit, 0, "charset {charset}");
+            assert!(back.bytes.len() > MAX_VALUE_LEN - 1 - unit);
+        }
+    }
+
+    #[test]
+    fn i_am_names_a_device() {
+        // Clause 16.10: the I-Am identifier is a Device object.
+        assert_eq!(IAm::parse(&hex("C4 00000001 22 05C4 91 03 21 0F")), Err(Error::OutOfRange));
+        let i_am = IAm {
+            device: ObjectId { object_type: object_type::ANALOG_INPUT, instance: 1 },
+            max_apdu: 1476,
+            segmentation: Segmentation::NoSegmentation,
+            vendor: 15,
+        };
+        assert_eq!(i_am.to_bytes(), hex("C4 02000001 22 05C4 91 03 21 0F"));
+        assert_eq!(IAm::parse(&i_am.to_bytes()).map(|i| i.device), Ok(ObjectId::device(1)));
+    }
+
+    #[test]
+    fn forbidden_tag_forms() {
+        // Clause 20.2.1.2: tag numbers 0 to 14 go in the first byte.
+        assert_eq!(Tag::parse(&hex("F9 01 00")), Err(Error::ReservedTag(1)));
+        assert_eq!(Tag::parse(&hex("F9 0E 00")), Err(Error::ReservedTag(14)));
+        assert!(Tag::parse(&hex("F9 0F 00")).is_ok());
+        // Clause 20.2.3: an application Boolean is its length field alone.
+        assert_eq!(Value::parse(&hex("15 00")), Err(Error::ValueLength { tag: tag::BOOLEAN, len: 0 }));
+        assert_eq!(Value::parse(&hex("15 01")), Err(Error::ValueLength { tag: tag::BOOLEAN, len: 1 }));
+        assert_eq!(Value::parse(&hex("10")), Ok((Value::Boolean(false), 1)));
     }
 
     // Random input.
@@ -2340,7 +2504,7 @@ mod tests {
                 service: rng.next(),
                 data: rng.bytes(20),
             };
-            let source = NetAddress { network: u16::from(rng.next()), mac: rng.bytes(6) };
+            let source = NetAddress { network: 1 + u16::from(rng.next()), mac: rng.bytes(6) };
             let npdu = Npdu {
                 destination: (r & 8 != 0).then(|| Destination {
                     address: NetAddress { network: 0xffff, mac: rng.bytes(3) },

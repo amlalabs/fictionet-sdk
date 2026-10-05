@@ -6,22 +6,25 @@
 //! in), then searches, adds, modifies, renames and deletes entries, each
 //! named by a distinguished name (DN) such as `uid=jdoe,dc=example,dc=com`.
 //! Every message is one BER-encoded `LDAPMessage` over TCP, usually on port
-//! 389 (636 inside TLS). Connectionless LDAP (CLDAP) sends the same message
-//! in one UDP datagram on port 389. This module follows RFC 4511 (the
-//! protocol), RFC 4515 (search filters as text) and RFC 4514 (DNs as text).
+//! 389 (636 inside TLS). Connectionless LDAP (CLDAP), as Active Directory
+//! uses it, sends the same messages in UDP datagrams on port 389. This
+//! module follows RFC 4511 (the protocol), RFC 4515 (search filters as
+//! text) and RFC 4514 (DNs as text).
 //!
 //! Nothing here reads a socket. A world that plays a directory server feeds
 //! the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
 //! [`Decoder`], gets [`Message`]s back, matches on each one's [`Op`], and
 //! writes the reply's bytes with [`Message::to_bytes`]. A CLDAP server reads
-//! each datagram with [`Message::parse`]. Which entries exist, and whether a
-//! password is right, is up to world code.
+//! each datagram with [`Message::parse`], and a client reads a reply that
+//! may hold several messages with [`Message::parse_datagram`]. Which entries
+//! exist, and whether a password is right, is up to world code.
 //!
 //! Every reader checks lengths, tags, ranges and nesting, because the agent
 //! can send any bytes it likes. A message is at most [`MAX_MESSAGE`] bytes,
 //! filters nest at most [`MAX_FILTER_DEPTH`] deep, and filter and DN text is
 //! at most [`MAX_TEXT`] bytes. LDAP forbids indefinite lengths and
-//! constructed strings, so they are refused. RFC 4511 says a server that
+//! constructed strings, so they are refused. Unknown fields at the end of a
+//! SEQUENCE are skipped, as RFC 4511 section 4 asks. RFC 4511 says a server that
 //! cannot read a message sends a notice of disconnection and closes the
 //! connection, so a [`Decoder`] stops at the first [`Error`]. The writers
 //! check what they are given and return an error instead of bytes a reader
@@ -34,7 +37,8 @@
 //!
 //! let mut decoder = Decoder::new();
 //! // An anonymous simple bind: message 1, LDAP version 3, no name, no password.
-//! decoder.feed(&[0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00]);
+//! let bind = [0x30, 0x0c, 0x02, 0x01, 0x01, 0x60, 0x07, 0x02, 0x01, 0x03, 0x04, 0x00, 0x80, 0x00];
+//! assert_eq!(decoder.feed(&bind), bind.len());
 //! let request = decoder.next_message().unwrap().unwrap();
 //! let Op::BindRequest(bind) = &request.op else { panic!("not a bind") };
 //! assert_eq!((bind.version, bind.name.as_str()), (3, ""));
@@ -160,7 +164,8 @@ pub enum Op {
     SearchResultEntry(SearchResultEntry),
     /// The end of a search's results.
     SearchResultDone(LdapResult),
-    /// URIs of other servers that may hold more results.
+    /// URIs of other servers that may hold more results. There must be at
+    /// least one.
     SearchResultReference(Vec<String>),
     /// Change an entry's attributes.
     ModifyRequest(ModifyRequest),
@@ -366,11 +371,13 @@ pub enum Authentication {
     },
     /// Another choice, by its context tag number (not 0 or 3), with its
     /// contents unread. A server answers it with
-    /// [`ResultCode::AUTH_METHOD_NOT_SUPPORTED`]. It is written in primitive
-    /// form.
+    /// [`ResultCode::AUTH_METHOD_NOT_SUPPORTED`]. It is written in the form
+    /// it came in.
     Other {
         /// The context tag number.
         number: u32,
+        /// Whether the tag is in constructed form.
+        constructed: bool,
         /// The contents, as they came.
         contents: Vec<u8>,
     },
@@ -394,7 +401,8 @@ pub enum Scope {
     OneLevel,
     /// The base entry and everything below it.
     Subtree,
-    /// Another value, from an extension.
+    /// Another value, from an extension. 0 to 2 are the named values, so
+    /// `Other` with one of them is not written.
     Other(u32),
 }
 
@@ -508,7 +516,8 @@ pub enum ModifyOperation {
     /// given.
     Replace,
     /// Another value, from an extension, such as 3 for increment (RFC
-    /// 4525).
+    /// 4525). 0 to 2 are the named values, so `Other` with one of them is
+    /// not written.
     Other(u32),
 }
 
@@ -557,7 +566,7 @@ pub struct ModifyRequest {
 pub struct AddRequest {
     /// The new entry's DN.
     pub dn: String,
-    /// Its attributes. Each should have at least one value.
+    /// Its attributes. Each must have at least one value.
     pub attributes: Vec<Attribute>,
 }
 
@@ -678,10 +687,12 @@ pub enum Filter {
     },
     /// A choice from an extension, by its context tag number (above 9),
     /// with its contents unread. A server takes it as Undefined. It is
-    /// written in primitive form, and has no text form.
+    /// written in the form it came in, and has no text form.
     Other {
         /// The context tag number.
         number: u32,
+        /// Whether the tag is in constructed form.
+        constructed: bool,
         /// The contents, as they came.
         contents: Vec<u8>,
     },
@@ -740,6 +751,27 @@ fn expect<'a>(r: &mut Reader<'a>, tag: Tag) -> Result<Element<'a>, Error> {
     Ok(e)
 }
 
+/// Ends a SEQUENCE. RFC 4511 section 4 has readers ignore trailing
+/// components whose tags they do not recognize, so each element left in
+/// `r` is skipped, unless `known` says its tag is one of the sequence's
+/// own fields.
+fn end(r: &mut Reader<'_>, known: impl Fn(Tag) -> bool) -> Result<(), Error> {
+    while !r.is_empty() {
+        if known(next(r)?.tag()) {
+            return Err(Error::Ber(asn1::Error::Trailing));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `t` has one of `tags`' class and number.
+fn one_of(tags: &[Tag]) -> impl Fn(Tag) -> bool + '_ {
+    move |t| tags.iter().any(|k| k.same_type(t))
+}
+
+/// The tags an LDAPResult's fields have.
+const RESULT_TAGS: &[Tag] = &[Tag::ENUMERATED, Tag::OCTET_STRING, Tag::context(3)];
+
 /// The next element if it has exactly `tag`, for an OPTIONAL field.
 fn optional<'a>(r: &mut Reader<'a>, tag: Tag) -> Result<Option<Element<'a>>, Error> {
     if r.is_empty() || r.peek()?.tag() != tag {
@@ -776,6 +808,14 @@ fn read_string(r: &mut Reader<'_>) -> Result<String, Error> {
 
 fn read_octets(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
     octets(&expect(r, Tag::OCTET_STRING)?)
+}
+
+/// A `SEQUENCE SIZE (1..MAX) OF URI`: a referral or a search reference.
+fn read_uris(r: Reader<'_>) -> Result<Vec<String>, Error> {
+    if r.is_empty() {
+        return Err(Error::Ber(asn1::Error::Empty));
+    }
+    read_strings(r)
 }
 
 fn read_bool(r: &mut Reader<'_>) -> Result<bool, Error> {
@@ -815,7 +855,7 @@ fn read_result(r: &mut Reader<'_>) -> Result<LdapResult, Error> {
     let matched_dn = read_string(r)?;
     let message = read_string(r)?;
     let referral = match optional(r, Tag::context(3).as_constructed())? {
-        Some(e) => read_strings(e.reader()?)?,
+        Some(e) => read_uris(e.reader()?)?,
         None => Vec::new(),
     };
     Ok(LdapResult {
@@ -830,15 +870,20 @@ fn read_result(r: &mut Reader<'_>) -> Result<LdapResult, Error> {
 fn result_only(e: &Element<'_>) -> Result<LdapResult, Error> {
     let mut r = e.reader()?;
     let result = read_result(&mut r)?;
-    r.finish()?;
+    end(&mut r, one_of(RESULT_TAGS))?;
     Ok(result)
 }
 
-fn read_attribute(e: &Element<'_>) -> Result<Attribute, Error> {
+/// A PartialAttribute, or with `nonempty` an Attribute, which must have a
+/// value.
+fn read_attribute(e: &Element<'_>, nonempty: bool) -> Result<Attribute, Error> {
     let mut r = e.reader()?;
     let name = read_string(&mut r)?;
     let mut set = expect(&mut r, Tag::SET)?.reader()?;
-    r.finish()?;
+    end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::SET]))?;
+    if nonempty && set.is_empty() {
+        return Err(Error::Ber(asn1::Error::Empty));
+    }
     let mut values = Vec::new();
     while !set.is_empty() {
         values.push(read_octets(&mut set)?);
@@ -846,12 +891,15 @@ fn read_attribute(e: &Element<'_>) -> Result<Attribute, Error> {
     Ok(Attribute { name, values })
 }
 
-/// A SEQUENCE OF attributes.
-fn read_attributes(r: &mut Reader<'_>) -> Result<Vec<Attribute>, Error> {
+/// A SEQUENCE OF attributes, each with a value if `nonempty`.
+fn read_attributes(r: &mut Reader<'_>, nonempty: bool) -> Result<Vec<Attribute>, Error> {
     let mut list = expect(r, Tag::SEQUENCE)?.reader()?;
     let mut out = Vec::new();
     while !list.is_empty() {
-        out.push(read_attribute(&expect(&mut list, Tag::SEQUENCE)?)?);
+        out.push(read_attribute(
+            &expect(&mut list, Tag::SEQUENCE)?,
+            nonempty,
+        )?);
     }
     Ok(out)
 }
@@ -866,7 +914,7 @@ fn read_control(e: &Element<'_>) -> Result<Control, Error> {
     let value = optional(&mut r, Tag::OCTET_STRING)?
         .map(|v| octets(&v))
         .transpose()?;
-    r.finish()?;
+    end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::BOOLEAN]))?;
     Ok(Control {
         oid,
         critical,
@@ -880,7 +928,7 @@ fn unexpected(expected: Tag, found: Tag) -> Error {
 
 impl Message {
     /// Reads one whole message: a TCP message the caller has framed, or a
-    /// CLDAP datagram. Bytes after it are an error.
+    /// CLDAP datagram that holds one message. Bytes after it are an error.
     pub fn parse(b: &[u8]) -> Result<Message, Error> {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLarge(b.len()));
@@ -888,6 +936,29 @@ impl Message {
         let mut top = Reader::new(b, Rules::Ber);
         let msg = expect(&mut top, Tag::SEQUENCE)?;
         top.finish()?;
+        Message::read(&msg)
+    }
+
+    /// Reads a CLDAP datagram: one or more whole messages, back to back.
+    /// A server answering a CLDAP search may send the entries and the
+    /// search's end in one datagram, as Active Directory does. RFC 1798's
+    /// older CLDAP messages, with their own envelope, are not read.
+    pub fn parse_datagram(b: &[u8]) -> Result<Vec<Message>, Error> {
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLarge(b.len()));
+        }
+        let mut top = Reader::new(b, Rules::Ber);
+        let mut out = Vec::new();
+        loop {
+            out.push(Message::read(&expect(&mut top, Tag::SEQUENCE)?)?);
+            if top.is_empty() {
+                return Ok(out);
+            }
+        }
+    }
+
+    /// Reads the message in a SEQUENCE element.
+    fn read(msg: &Element<'_>) -> Result<Message, Error> {
         let mut r = msg.reader()?;
         let id = number(&expect(&mut r, Tag::INTEGER)?, "messageID", 0, MAX_INT)?;
         let op = Op::read(&next(&mut r)?)?;
@@ -898,7 +969,10 @@ impl Message {
                 controls.push(read_control(&expect(&mut list, Tag::SEQUENCE)?)?);
             }
         }
-        r.finish()?;
+        // A second operation is not an extension.
+        end(&mut r, |t| {
+            t.class == Class::Application || one_of(&[Tag::INTEGER, Tag::context(0)])(t)
+        })?;
         Ok(Message { id, op, controls })
     }
 
@@ -913,12 +987,15 @@ impl Message {
     }
 
     /// The message's bytes. It refuses, rather than write bytes
-    /// [`Message::parse`] would refuse: an ID or limit over [`MAX_INT`], a
-    /// version outside 1 to 127, a filter [`Message::parse`] would not
-    /// take, an [`Authentication::Other`] or [`Filter::Other`] with a
-    /// number a known choice uses, or more than [`MAX_MESSAGE`] bytes. A
-    /// false criticality or `dnAttributes`, and an empty list of controls,
-    /// are left out, as their defaults.
+    /// [`Message::parse`] would refuse or read back as another value: an ID
+    /// or limit over [`MAX_INT`], a version outside 1 to 127, a filter
+    /// [`Message::parse`] would not take, an [`Authentication::Other`],
+    /// [`Filter::Other`], [`Scope::Other`] or [`ModifyOperation::Other`]
+    /// with a number a named choice uses, an added attribute with no
+    /// values, a search reference with no URIs, or more than
+    /// [`MAX_MESSAGE`] bytes. A false criticality or `dnAttributes`, and an
+    /// empty list of controls, are left out, as their defaults. An empty
+    /// referral is left out, as no referral.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         if self.id > MAX_INT {
             return Err(Error::Range("messageID"));
@@ -962,7 +1039,12 @@ impl Op {
                 let version = number(&expect(&mut r, Tag::INTEGER)?, "version", 1, 127)? as u8;
                 let name = read_string(&mut r)?;
                 let a = next(&mut r)?;
-                r.finish()?;
+                // Context tags 0 to 3 are authentication choices RFC 4511
+                // names or reserves.
+                end(&mut r, |t| {
+                    (t.class == Class::ContextSpecific && t.number <= 3)
+                        || one_of(&[Tag::INTEGER, Tag::OCTET_STRING])(t)
+                })?;
                 let at = a.tag();
                 let auth = match (at.class, at.number, at.constructed) {
                     (Class::ContextSpecific, 0, false) => Authentication::Simple(octets(&a)?),
@@ -972,16 +1054,19 @@ impl Op {
                         let credentials = optional(&mut s, Tag::OCTET_STRING)?
                             .map(|c| octets(&c))
                             .transpose()?;
-                        s.finish()?;
+                        end(&mut s, one_of(&[Tag::OCTET_STRING]))?;
                         Authentication::Sasl {
                             mechanism,
                             credentials,
                         }
                     }
-                    (Class::ContextSpecific, n, _) if n != 0 && n != 3 => Authentication::Other {
-                        number: n,
-                        contents: a.contents().to_vec(),
-                    },
+                    (Class::ContextSpecific, n, constructed) if n != 0 && n != 3 => {
+                        Authentication::Other {
+                            number: n,
+                            constructed,
+                            contents: a.contents().to_vec(),
+                        }
+                    }
                     _ => return Err(unexpected(Tag::context(0), at)),
                 };
                 Op::BindRequest(BindRequest {
@@ -994,7 +1079,9 @@ impl Op {
                 let mut r = e.reader()?;
                 let result = read_result(&mut r)?;
                 let server_sasl_creds = optional_octets(&mut r, 7)?;
-                r.finish()?;
+                end(&mut r, |t| {
+                    one_of(RESULT_TAGS)(t) || t.same_type(Tag::context(7))
+                })?;
                 Op::BindResponse(BindResponse {
                     result,
                     server_sasl_creds,
@@ -1022,7 +1109,17 @@ impl Op {
                 let types_only = read_bool(&mut r)?;
                 let filter = Filter::read(&next(&mut r)?, 1)?;
                 let attributes = read_strings(expect(&mut r, Tag::SEQUENCE)?.reader()?)?;
-                r.finish()?;
+                // Context tags 0 to 9 are filter choices.
+                end(&mut r, |t| {
+                    (t.class == Class::ContextSpecific && t.number <= 9)
+                        || one_of(&[
+                            Tag::OCTET_STRING,
+                            Tag::ENUMERATED,
+                            Tag::INTEGER,
+                            Tag::BOOLEAN,
+                            Tag::SEQUENCE,
+                        ])(t)
+                })?;
                 Op::SearchRequest(SearchRequest {
                     base,
                     scope,
@@ -1037,8 +1134,8 @@ impl Op {
             (4, true) => {
                 let mut r = e.reader()?;
                 let dn = read_string(&mut r)?;
-                let attributes = read_attributes(&mut r)?;
-                r.finish()?;
+                let attributes = read_attributes(&mut r, false)?;
+                end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::SEQUENCE]))?;
                 Op::SearchResultEntry(SearchResultEntry { dn, attributes })
             }
             (5, true) => Op::SearchResultDone(result_only(e)?),
@@ -1046,13 +1143,13 @@ impl Op {
                 let mut r = e.reader()?;
                 let dn = read_string(&mut r)?;
                 let mut list = expect(&mut r, Tag::SEQUENCE)?.reader()?;
-                r.finish()?;
+                end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::SEQUENCE]))?;
                 let mut changes = Vec::new();
                 while !list.is_empty() {
                     let mut c = expect(&mut list, Tag::SEQUENCE)?.reader()?;
                     let op = number(&expect(&mut c, Tag::ENUMERATED)?, "operation", 0, u32::MAX)?;
-                    let attribute = read_attribute(&expect(&mut c, Tag::SEQUENCE)?)?;
-                    c.finish()?;
+                    let attribute = read_attribute(&expect(&mut c, Tag::SEQUENCE)?, false)?;
+                    end(&mut c, one_of(&[Tag::ENUMERATED, Tag::SEQUENCE]))?;
                     changes.push(Change {
                         op: ModifyOperation::from_code(op),
                         attribute,
@@ -1064,8 +1161,8 @@ impl Op {
             (8, true) => {
                 let mut r = e.reader()?;
                 let dn = read_string(&mut r)?;
-                let attributes = read_attributes(&mut r)?;
-                r.finish()?;
+                let attributes = read_attributes(&mut r, true)?;
+                end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::SEQUENCE]))?;
                 Op::AddRequest(AddRequest { dn, attributes })
             }
             (9, true) => Op::AddResponse(result_only(e)?),
@@ -1077,7 +1174,10 @@ impl Op {
                 let new_rdn = read_string(&mut r)?;
                 let delete_old_rdn = read_bool(&mut r)?;
                 let new_superior = optional_text(&mut r, 0)?;
-                r.finish()?;
+                end(
+                    &mut r,
+                    one_of(&[Tag::OCTET_STRING, Tag::BOOLEAN, Tag::context(0)]),
+                )?;
                 Op::ModifyDnRequest(ModifyDnRequest {
                     dn,
                     new_rdn,
@@ -1090,10 +1190,10 @@ impl Op {
                 let mut r = e.reader()?;
                 let dn = read_string(&mut r)?;
                 let mut ava = expect(&mut r, Tag::SEQUENCE)?.reader()?;
-                r.finish()?;
+                end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::SEQUENCE]))?;
                 let attribute = read_string(&mut ava)?;
                 let value = read_octets(&mut ava)?;
-                ava.finish()?;
+                end(&mut ava, one_of(&[Tag::OCTET_STRING]))?;
                 Op::CompareRequest(CompareRequest {
                     dn,
                     attribute,
@@ -1102,12 +1202,12 @@ impl Op {
             }
             (15, true) => Op::CompareResponse(result_only(e)?),
             (16, false) => Op::AbandonRequest(number(e, "messageID", 0, MAX_INT)?),
-            (19, true) => Op::SearchResultReference(read_strings(e.reader()?)?),
+            (19, true) => Op::SearchResultReference(read_uris(e.reader()?)?),
             (23, true) => {
                 let mut r = e.reader()?;
                 let name = text(&expect(&mut r, Tag::context(0))?)?;
                 let value = optional_octets(&mut r, 1)?;
-                r.finish()?;
+                end(&mut r, one_of(&[Tag::context(0), Tag::context(1)]))?;
                 Op::ExtendedRequest(ExtendedRequest { name, value })
             }
             (24, true) => {
@@ -1115,7 +1215,11 @@ impl Op {
                 let result = read_result(&mut r)?;
                 let name = optional_text(&mut r, 10)?;
                 let value = optional_octets(&mut r, 11)?;
-                r.finish()?;
+                end(&mut r, |t| {
+                    one_of(RESULT_TAGS)(t)
+                        || t.same_type(Tag::context(10))
+                        || t.same_type(Tag::context(11))
+                })?;
                 Op::ExtendedResponse(ExtendedResponse {
                     result,
                     name,
@@ -1126,7 +1230,7 @@ impl Op {
                 let mut r = e.reader()?;
                 let name = optional_text(&mut r, 0)?;
                 let value = optional_octets(&mut r, 1)?;
-                r.finish()?;
+                end(&mut r, one_of(&[Tag::context(0), Tag::context(1)]))?;
                 Op::IntermediateResponse(IntermediateResponse { name, value })
             }
             _ => return Err(Error::Operation(t)),
@@ -1155,13 +1259,17 @@ impl Op {
                                 None => Ok(()),
                             }
                         }),
-                        Authentication::Other { number, contents } => {
+                        Authentication::Other {
+                            number,
+                            constructed,
+                            contents,
+                        } => {
                             if *number == 0 || *number == 3 {
                                 return Err(Error::Unwritable(
                                     "authentication choice 0 or 3 is simple or SASL",
                                 ));
                             }
-                            w.put(Tag::context(*number), contents)
+                            w.put(context(*number, *constructed), contents)
                         }
                     }
                 })
@@ -1180,6 +1288,11 @@ impl Op {
                 }
                 if s.time_limit > MAX_INT {
                     return Err(Error::Range("timeLimit"));
+                }
+                if matches!(s.scope, Scope::Other(0..=2)) {
+                    return Err(Error::Unwritable(
+                        "Scope::Other with a named scope's number",
+                    ));
                 }
                 w.nest(app(3), |w| {
                     w.octets(s.base.as_bytes())?;
@@ -1206,6 +1319,11 @@ impl Op {
                 w.octets(m.dn.as_bytes())?;
                 w.nest(Tag::SEQUENCE, |w| {
                     for c in &m.changes {
+                        if matches!(c.op, ModifyOperation::Other(0..=2)) {
+                            return Err(Error::Unwritable(
+                                "ModifyOperation::Other with a named operation's number",
+                            ));
+                        }
                         w.nest(Tag::SEQUENCE, |w| {
                             w.uint(Tag::ENUMERATED, c.op.code())?;
                             write_attribute(w, &c.attribute)
@@ -1215,10 +1333,15 @@ impl Op {
                 })
             }),
             Op::ModifyResponse(r) => w.nest(app(7), |w| write_result(w, r)),
-            Op::AddRequest(a) => w.nest(app(8), |w| {
-                w.octets(a.dn.as_bytes())?;
-                write_attributes(w, &a.attributes)
-            }),
+            Op::AddRequest(a) => {
+                if a.attributes.iter().any(|a| a.values.is_empty()) {
+                    return Err(Error::Unwritable("an added attribute with no values"));
+                }
+                w.nest(app(8), |w| {
+                    w.octets(a.dn.as_bytes())?;
+                    write_attributes(w, &a.attributes)
+                })
+            }
             Op::AddResponse(r) => w.nest(app(9), |w| write_result(w, r)),
             Op::DelRequest(dn) => w.put(app(10), dn.as_bytes()),
             Op::DelResponse(r) => w.nest(app(11), |w| write_result(w, r)),
@@ -1245,6 +1368,9 @@ impl Op {
                     return Err(Error::Range("messageID"));
                 }
                 w.uint(app(16), *id)
+            }
+            Op::SearchResultReference(uris) if uris.is_empty() => {
+                Err(Error::Unwritable("a search reference with no URIs"))
             }
             Op::SearchResultReference(uris) => w.nest(app(19), |w| {
                 for u in uris {
@@ -1337,6 +1463,12 @@ impl W {
     }
 }
 
+/// The context tag `number`, in constructed form if `constructed`.
+fn context(number: u32, constructed: bool) -> Tag {
+    let t = Tag::context(number);
+    if constructed { t.as_constructed() } else { t }
+}
+
 fn push_len(out: &mut Vec<u8>, n: usize) {
     if n < 0x80 {
         out.push(n as u8);
@@ -1401,7 +1533,7 @@ impl Filter {
             let mut r = e.reader()?;
             let attribute = read_string(&mut r)?;
             let value = read_octets(&mut r)?;
-            r.finish()?;
+            end(&mut r, one_of(&[Tag::OCTET_STRING]))?;
             Ok((attribute, value))
         };
         Ok(match (t.number, t.constructed) {
@@ -1431,7 +1563,7 @@ impl Filter {
                 let mut r = e.reader()?;
                 let attribute = read_string(&mut r)?;
                 let mut parts = expect(&mut r, Tag::SEQUENCE)?.reader()?;
-                r.finish()?;
+                end(&mut r, one_of(&[Tag::OCTET_STRING, Tag::SEQUENCE]))?;
                 let (mut initial, mut any, mut last) = (None, Vec::new(), None);
                 let mut first = true;
                 while !parts.is_empty() {
@@ -1484,7 +1616,9 @@ impl Filter {
                     Some(b) => b.boolean()?,
                     None => false,
                 };
-                r.finish()?;
+                end(&mut r, |t| {
+                    t.class == Class::ContextSpecific && (1..=4).contains(&t.number)
+                })?;
                 if rule.is_none() && attribute.is_none() {
                     return Err(Error::Filter("extensible match with neither type nor rule"));
                 }
@@ -1495,8 +1629,9 @@ impl Filter {
                     dn_attributes,
                 }
             }
-            (n, _) if n > 9 => Filter::Other {
+            (n, constructed) if n > 9 => Filter::Other {
                 number: n,
+                constructed,
                 contents: e.contents().to_vec(),
             },
             (n, c) => {
@@ -1584,13 +1719,17 @@ impl Filter {
                     Ok(())
                 })
             }
-            Filter::Other { number, contents } => {
+            Filter::Other {
+                number,
+                constructed,
+                contents,
+            } => {
                 if *number <= 9 {
                     return Err(Error::Unwritable(
                         "filter choices 0 to 9 have their own variants",
                     ));
                 }
-                w.put(Tag::context(*number), contents)
+                w.put(context(*number, *constructed), contents)
             }
         }
     }
@@ -1623,18 +1762,14 @@ impl Filter {
     pub fn to_text(&self) -> Result<String, Error> {
         let mut out = String::new();
         self.write_text(&mut out, 1)?;
-        if out.len() > MAX_TEXT {
-            return Err(Error::TextTooLong);
-        }
         Ok(out)
     }
 
+    /// Appends the filter's text to `out`, which never grows past
+    /// [`MAX_TEXT`].
     fn write_text(&self, out: &mut String, depth: usize) -> Result<(), Error> {
         if depth > MAX_FILTER_DEPTH {
             return Err(Error::Filter("nested too deep"));
-        }
-        if out.len() > MAX_TEXT {
-            return Err(Error::TextTooLong);
         }
         let name = |out: &mut String, a: &str| {
             if !is_attribute(a) {
@@ -1642,29 +1777,31 @@ impl Filter {
                     "attribute description is not a name or numeric OID",
                 ));
             }
-            out.push_str(a);
-            Ok(())
+            push_text(out, a)
         };
-        out.push('(');
+        push_text(out, "(")?;
         match self {
             Filter::And(list) | Filter::Or(list) => {
-                out.push(if matches!(self, Filter::And(_)) {
-                    '&'
-                } else {
-                    '|'
-                });
+                push_text(
+                    out,
+                    if matches!(self, Filter::And(_)) {
+                        "&"
+                    } else {
+                        "|"
+                    },
+                )?;
                 for f in list {
                     f.write_text(out, depth + 1)?;
                 }
             }
             Filter::Not(f) => {
-                out.push('!');
+                push_text(out, "!")?;
                 f.write_text(out, depth + 1)?;
             }
             Filter::Equal { attribute, value } => {
                 name(out, attribute)?;
-                out.push('=');
-                escape_value(out, value);
+                push_text(out, "=")?;
+                escape_value(out, value)?;
             }
             Filter::Substrings {
                 attribute,
@@ -1684,37 +1821,37 @@ impl Filter {
                     ));
                 }
                 name(out, attribute)?;
-                out.push('=');
+                push_text(out, "=")?;
                 if let Some(v) = initial {
-                    escape_value(out, v);
+                    escape_value(out, v)?;
                 }
-                out.push('*');
+                push_text(out, "*")?;
                 for v in any {
-                    escape_value(out, v);
-                    out.push('*');
+                    escape_value(out, v)?;
+                    push_text(out, "*")?;
                 }
                 if let Some(v) = last {
-                    escape_value(out, v);
+                    escape_value(out, v)?;
                 }
             }
             Filter::GreaterOrEqual { attribute, value } => {
                 name(out, attribute)?;
-                out.push_str(">=");
-                escape_value(out, value);
+                push_text(out, ">=")?;
+                escape_value(out, value)?;
             }
             Filter::LessOrEqual { attribute, value } => {
                 name(out, attribute)?;
-                out.push_str("<=");
-                escape_value(out, value);
+                push_text(out, "<=")?;
+                escape_value(out, value)?;
             }
             Filter::Present(attribute) => {
                 name(out, attribute)?;
-                out.push_str("=*");
+                push_text(out, "=*")?;
             }
             Filter::Approx { attribute, value } => {
                 name(out, attribute)?;
-                out.push_str("~=");
-                escape_value(out, value);
+                push_text(out, "~=")?;
+                escape_value(out, value)?;
             }
             Filter::Extensible {
                 rule,
@@ -1729,7 +1866,7 @@ impl Filter {
                     name(out, a)?;
                 }
                 if *dn_attributes {
-                    out.push_str(":dn");
+                    push_text(out, ":dn")?;
                 }
                 if let Some(r) = rule {
                     if !is_oid(r) {
@@ -1737,24 +1874,24 @@ impl Filter {
                             "matching rule is not a name or numeric OID",
                         ));
                     }
-                    // Text reads a lone `:dn` as the dnAttributes flag.
-                    if r.eq_ignore_ascii_case("dn") && !dn_attributes {
+                    // After a type, text reads a lone `:dn` as the
+                    // dnAttributes flag. With no type it can only be a rule.
+                    if r.eq_ignore_ascii_case("dn") && !dn_attributes && attribute.is_some() {
                         return Err(Error::Unwritable(
-                            "a matching rule named dn reads back as the dn flag",
+                            "a matching rule named dn after a type reads back as the dn flag",
                         ));
                     }
-                    out.push(':');
-                    out.push_str(r);
+                    push_text(out, ":")?;
+                    push_text(out, r)?;
                 }
-                out.push_str(":=");
-                escape_value(out, value);
+                push_text(out, ":=")?;
+                escape_value(out, value)?;
             }
             Filter::Other { .. } => {
                 return Err(Error::Unwritable("filter choice with no text form"));
             }
         }
-        out.push(')');
-        Ok(())
+        push_text(out, ")")
     }
 }
 
@@ -1766,26 +1903,50 @@ impl std::str::FromStr for Filter {
     }
 }
 
+/// Appends `s` to filter or DN text, unless the text would then be longer
+/// than [`MAX_TEXT`]. Text writers append only through it, so what they
+/// hold stays bounded whatever they are given.
+fn push_text(out: &mut String, s: &str) -> Result<(), Error> {
+    if out.len().saturating_add(s.len()) > MAX_TEXT {
+        return Err(Error::TextTooLong);
+    }
+    out.push_str(s);
+    Ok(())
+}
+
+/// Appends one character with [`push_text`].
+fn push_char(out: &mut String, c: char) -> Result<(), Error> {
+    push_text(out, c.encode_utf8(&mut [0; 4]))
+}
+
 /// Appends `v` as an RFC 4515 assertion value.
-fn escape_value(out: &mut String, v: &[u8]) {
+fn escape_value(out: &mut String, v: &[u8]) -> Result<(), Error> {
     for chunk in v.utf8_chunks() {
         for c in chunk.valid().chars() {
             match c {
-                '\0' | '(' | ')' | '*' | '\\' => push_hex_escape(out, c as u8),
-                c => out.push(c),
+                '\0' | '(' | ')' | '*' | '\\' => push_hex_escape(out, c as u8)?,
+                c => push_char(out, c)?,
             }
         }
         for &b in chunk.invalid() {
-            push_hex_escape(out, b);
+            push_hex_escape(out, b)?;
         }
     }
+    Ok(())
 }
 
-fn push_hex_escape(out: &mut String, b: u8) {
+/// The two lowercase hex digits of `b`.
+fn hex(b: u8) -> [u8; 2] {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    out.push('\\');
-    out.push(char::from(HEX[usize::from(b >> 4)]));
-    out.push(char::from(HEX[usize::from(b & 15)]));
+    [HEX[usize::from(b >> 4)], HEX[usize::from(b & 15)]]
+}
+
+/// Appends `\` and the two hex digits of `b`.
+fn push_hex_escape(out: &mut String, b: u8) -> Result<(), Error> {
+    let [h, l] = hex(b);
+    push_text(out, "\\")?;
+    push_char(out, char::from(h))?;
+    push_char(out, char::from(l))
 }
 
 fn hex_digit(c: u8) -> Option<u8> {
@@ -1984,15 +2145,17 @@ impl FilterText<'_> {
         let rest: Vec<&str> = parts.collect();
         let (dn_attributes, rule) = match rest.as_slice() {
             [] => (false, None),
-            [x] if x.eq_ignore_ascii_case("dn") => (true, None),
+            // With no type, `:dn:=` is a rule named dn (RFC 4515 section 3).
+            [x] if x.eq_ignore_ascii_case("dn") && attribute.is_some() => (true, None),
             [x] => (false, Some(*x)),
             [d, x] if d.eq_ignore_ascii_case("dn") => (true, Some(*x)),
             _ => return Err(Error::Syntax(start)),
         };
         if let Some(r) = rule
-            && !is_oid(r) {
-                return Err(Error::Syntax(start));
-            }
+            && !is_oid(r)
+        {
+            return Err(Error::Syntax(start));
+        }
         if attribute.is_none() && rule.is_none() {
             return Err(Error::Syntax(start));
         }
@@ -2076,44 +2239,47 @@ impl Dn {
     /// than [`MAX_TEXT`].
     pub fn to_text(&self) -> Result<String, Error> {
         let mut out = String::new();
+        self.write_text(&mut out)?;
+        Ok(out)
+    }
+
+    /// Appends the DN's text to `out`, which never grows past [`MAX_TEXT`].
+    fn write_text(&self, out: &mut String) -> Result<(), Error> {
         for (k, rdn) in self.0.iter().enumerate() {
             if k > 0 {
-                out.push(',');
+                push_text(out, ",")?;
             }
             if rdn.0.is_empty() {
                 return Err(Error::Unwritable("an RDN with no values"));
             }
             for (j, ava) in rdn.0.iter().enumerate() {
                 if j > 0 {
-                    out.push('+');
+                    push_text(out, "+")?;
                 }
                 if !is_oid(&ava.attribute) {
                     return Err(Error::Unwritable(
                         "attribute type is not a name or numeric OID",
                     ));
                 }
-                out.push_str(&ava.attribute);
-                out.push('=');
+                push_text(out, &ava.attribute)?;
+                push_text(out, "=")?;
                 match &ava.value {
-                    AttributeValue::Text(v) => escape_dn_value(&mut out, v),
+                    AttributeValue::Text(v) => escape_dn_value(out, v)?,
                     AttributeValue::Ber(b) => {
                         if b.is_empty() {
                             return Err(Error::Unwritable("an empty BER value"));
                         }
-                        out.push('#');
+                        push_text(out, "#")?;
                         for &x in b {
-                            let e = out.len();
-                            push_hex_escape(&mut out, x);
-                            out.remove(e);
+                            let [h, l] = hex(x);
+                            push_char(out, char::from(h))?;
+                            push_char(out, char::from(l))?;
                         }
                     }
                 }
-                if out.len() > MAX_TEXT {
-                    return Err(Error::TextTooLong);
-                }
             }
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -2125,20 +2291,21 @@ impl std::str::FromStr for Dn {
     }
 }
 
-fn escape_dn_value(out: &mut String, v: &str) {
+fn escape_dn_value(out: &mut String, v: &str) -> Result<(), Error> {
     let n = v.chars().count();
     for (k, c) in v.chars().enumerate() {
         match c {
             '"' | '+' | ',' | ';' | '<' | '>' | '\\' => {
-                out.push('\\');
-                out.push(c);
+                push_text(out, "\\")?;
+                push_char(out, c)?;
             }
-            '\0' => out.push_str("\\00"),
-            ' ' if k == 0 || k + 1 == n => out.push_str("\\ "),
-            '#' if k == 0 => out.push_str("\\#"),
-            c => out.push(c),
+            '\0' => push_text(out, "\\00")?,
+            ' ' if k == 0 || k + 1 == n => push_text(out, "\\ ")?,
+            '#' if k == 0 => push_text(out, "\\#")?,
+            c => push_char(out, c)?,
         }
     }
+    Ok(())
 }
 
 /// The attribute type and value at `s[start..]`, and where it ends.
@@ -2223,12 +2390,19 @@ fn parse_ava(s: &[u8], start: usize) -> Result<(Ava, usize), Error> {
 
 /// Splits an LDAP byte stream into messages. Feed it the bytes a connection
 /// reads, in order, and take messages out until it has none.
+///
+/// It holds at most its limit of bytes not yet taken out (or 16 bytes, if
+/// the limit is lower), so what an agent sends
+/// cannot make it grow without bound. [`Decoder::feed`] takes what fits
+/// and says how much that was; once the held bytes are a whole message,
+/// taking it out makes room for more.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are dropped
     /// in `feed` once they are half the buffer, so taking out many small
-    /// messages costs time in proportion to their bytes.
+    /// messages costs time in proportion to their bytes, and the buffer is
+    /// never more than about twice what a decoder may hold.
     start: usize,
     limit: usize,
     failed: Option<Error>,
@@ -2249,7 +2423,7 @@ impl Decoder {
 
     /// A decoder taking messages up to `limit` bytes, or [`MAX_MESSAGE`] if
     /// that is lower. A longer message is [`Error::TooLarge`] as soon as
-    /// its header comes, before its bytes are held.
+    /// its header comes, before more than `limit` of its bytes are held.
     pub fn with_limit(limit: usize) -> Decoder {
         Decoder {
             buf: Vec::new(),
@@ -2264,22 +2438,30 @@ impl Decoder {
         self.limit
     }
 
-    /// Adds bytes read from the connection. After an [`Error`] the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Adds bytes read from the connection, as many as fit, and returns how
+    /// many it took. Feed the rest again after taking messages out with
+    /// [`Decoder::next_message`]. It takes nothing only when it holds a
+    /// whole message or an error waiting to be taken out. After an
+    /// [`Error`] the stream cannot be read any further, and every byte is
+    /// taken and dropped.
+    #[must_use = "bytes it did not take must be fed again"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let room = self.limit.max(HEADER_ROOM).saturating_sub(self.buffered());
+        let n = bytes.len().min(room);
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole message, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the stream
-    /// has broken. A decoder holds every byte fed to it that has not been
-    /// taken out, so take messages out after each `feed`.
+    /// has broken.
     pub fn next_message(&mut self) -> Option<Result<Message, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -2331,6 +2513,12 @@ impl Decoder {
     }
 }
 
+/// The fewest bytes a [`Decoder`] will hold, whatever its limit: enough for
+/// any header [`asn1::Header::parse`] reads or refuses (at most 6 tag and 5
+/// length octets), so a decoder with a tiny limit can still see a message
+/// is too long.
+const HEADER_ROOM: usize = 16;
+
 /// The whole length a header at the start of `b` declares: the header and
 /// the contents. It is for a header [`asn1::Header::parse`] found too long,
 /// so its length octets are all in `b`.
@@ -2360,6 +2548,11 @@ mod tests {
             op,
             controls: Vec::new(),
         }
+    }
+
+    /// Feeds bytes that fit.
+    fn put(d: &mut Decoder, b: &[u8]) {
+        assert_eq!(d.feed(b), b.len());
     }
 
     fn round_trip(m: &Message) {
@@ -2487,6 +2680,7 @@ mod tests {
                 name: String::new(),
                 auth: Authentication::Other {
                     number: 9,
+                    constructed: false,
                     contents: vec![1, 2, 3],
                 },
             }),
@@ -2717,7 +2911,6 @@ mod tests {
             ("(cn>=a*)", 6),
             ("(cn~=*)", 5),
             ("(:=x)", 1),
-            ("(:dn:=x)", 1),
             ("(cn:x:y:=v)", 1),
             ("(cn:1.:=v)", 1),
             ("(cn:dn=v)", 1),
@@ -2781,19 +2974,21 @@ mod tests {
         assert!(matches!(bad_rule.to_text(), Err(Error::Unwritable(_))));
         let dn_rule = Filter::Extensible {
             rule: Some("dn".into()),
-            attribute: None,
+            attribute: Some("cn".into()),
             value: vec![],
             dn_attributes: false,
         };
         assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable(_))));
         let other = Filter::Other {
             number: 12,
+            constructed: false,
             contents: vec![1],
         };
         assert!(matches!(other.to_text(), Err(Error::Unwritable(_))));
         round_trip(&msg(1, Op::SearchRequest(search(other))));
         let other_low = Filter::Other {
             number: 7,
+            constructed: false,
             contents: vec![],
         };
         assert!(matches!(
@@ -2864,6 +3059,7 @@ mod tests {
             Filter::And(vec![]),
             Filter::Other {
                 number: 40,
+                constructed: true,
                 contents: vec![],
             },
         ];
@@ -2880,7 +3076,7 @@ mod tests {
             });
             round_trip(&m);
             let mut d = Decoder::new();
-            d.feed(&m.to_bytes().unwrap());
+            put(&mut d, &m.to_bytes().unwrap());
             assert_eq!(d.next_message(), Some(Ok(m)));
             if let Ok(t) = f.to_text() {
                 assert_eq!(t.parse::<Filter>(), Ok(f));
@@ -2891,13 +3087,13 @@ mod tests {
     #[test]
     fn decoder_names_lengths_over_the_maximum_too_large() {
         let mut d = Decoder::new();
-        d.feed(&[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]);
+        put(&mut d, &[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]);
         assert_eq!(
             d.next_message(),
             Some(Err(Error::TooLarge(0x7fff_ffff + 6)))
         );
         let mut d = Decoder::new();
-        d.feed(&[0x30, 0x83, 0x10, 0x00, 0x01]);
+        put(&mut d, &[0x30, 0x83, 0x10, 0x00, 0x01]);
         assert_eq!(d.next_message(), Some(Err(Error::TooLarge(0x10_0001 + 5))));
     }
 
@@ -3253,14 +3449,23 @@ mod tests {
             Err(Error::Ber(asn1::Error::Trailing))
         );
         assert_eq!(parse(&[0xa2, 0x00]), Err(Error::Ber(asn1::Error::Empty)));
-        // An extension choice, kept as it is.
-        assert_eq!(
-            parse(&[0xaa, 0x02, 0x05, 0x00]),
-            Ok(Filter::Other {
-                number: 10,
-                contents: vec![0x05, 0x00]
-            })
-        );
+        // An extension choice, kept as it is, and written in the same form.
+        for form in [0x8a, 0xaa] {
+            let b = search_with_filter_bytes(&[form, 0x02, 0x05, 0x00]);
+            let m = Message::parse(&b).unwrap();
+            let Op::SearchRequest(s) = &m.op else {
+                unreachable!()
+            };
+            assert_eq!(
+                s.filter,
+                Filter::Other {
+                    number: 10,
+                    constructed: form == 0xaa,
+                    contents: vec![0x05, 0x00]
+                }
+            );
+            assert_eq!(m.to_bytes().unwrap(), b);
+        }
         // Too deep.
         let mut f = vec![0x87, 0x00];
         for _ in 0..MAX_FILTER_DEPTH {
@@ -3309,6 +3514,7 @@ mod tests {
                 name: String::new(),
                 auth: Authentication::Other {
                     number,
+                    constructed: false,
                     contents: vec![],
                 },
             })
@@ -3376,7 +3582,7 @@ mod tests {
                     bytes.len()
                 );
                 let mut d = Decoder::new();
-                d.feed(&bytes[..n]);
+                put(&mut d, &bytes[..n]);
                 assert_eq!(d.next_message(), None, "{n} of {}", bytes.len());
                 assert_eq!(d.buffered(), n);
             }
@@ -3404,7 +3610,7 @@ mod tests {
         let mut d = Decoder::new();
         let mut got = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
+            put(&mut d, std::slice::from_ref(byte));
             while let Some(m) = d.next_message() {
                 got.push(m.unwrap().id);
             }
@@ -3412,35 +3618,35 @@ mod tests {
         assert_eq!(got, [1, 2]);
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
-        d.feed(&[0x31, 0x00]);
+        put(&mut d, &[0x31, 0x00]);
         let e = d.next_message();
         assert!(matches!(
             e,
             Some(Err(Error::Ber(asn1::Error::Unexpected { .. })))
         ));
-        d.feed(&a);
+        put(&mut d, &a);
         assert_eq!(d.next_message(), e);
         assert_eq!(d.buffered(), 0);
         // A bad message inside a good frame breaks it too.
         let mut d = Decoder::new();
-        d.feed(&[0x30, 0x03, 0x02, 0x01, 0x01]);
-        d.feed(&a);
+        put(&mut d, &[0x30, 0x03, 0x02, 0x01, 0x01]);
+        put(&mut d, &a);
         assert_eq!(d.next_message(), Some(Err(Error::Ber(asn1::Error::Empty))));
         assert_eq!(d.next_message(), Some(Err(Error::Ber(asn1::Error::Empty))));
         // Indefinite lengths, and lengths over the limit, are known from the header.
         let mut d = Decoder::new();
-        d.feed(&[0x30, 0x80]);
+        put(&mut d, &[0x30, 0x80]);
         assert_eq!(
             d.next_message(),
             Some(Err(Error::Ber(asn1::Error::Indefinite)))
         );
         let mut d = Decoder::with_limit(100);
         assert_eq!(d.limit(), 100);
-        d.feed(&[0x30, 0x81, 0x80]);
+        put(&mut d, &[0x30, 0x81, 0x80]);
         assert_eq!(d.next_message(), Some(Err(Error::TooLarge(131))));
         let mut d = Decoder::with_limit(usize::MAX);
         assert_eq!(d.limit(), MAX_MESSAGE);
-        d.feed(&[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]);
+        put(&mut d, &[0x30, 0x84, 0x7f, 0xff, 0xff, 0xff]);
         assert_eq!(
             d.next_message(),
             Some(Err(Error::TooLarge(0x7fff_ffff + 6)))
@@ -3458,11 +3664,14 @@ mod tests {
             .collect();
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
+        let mut rest = &stream[..];
         let mut n = 0;
-        while let Some(m) = d.next_message() {
-            m.unwrap();
-            n += 1;
+        while !rest.is_empty() {
+            rest = &rest[d.feed(rest)..];
+            while let Some(m) = d.next_message() {
+                m.unwrap();
+                n += 1;
+            }
         }
         assert_eq!(n, 200_000);
         assert_eq!(d.buffered(), 0);
@@ -3471,6 +3680,261 @@ mod tests {
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn decoder_holds_at_most_its_limit() {
+        // Noise is taken only up to the limit, and fails at its header.
+        let mut d = Decoder::with_limit(100);
+        assert_eq!(d.feed(&vec![0; 100_000]), 100);
+        assert!(d.buffered() <= 100);
+        assert!(matches!(d.next_message(), Some(Err(_))));
+        assert_eq!(d.feed(&[0; 10]), 10);
+        assert_eq!(d.buffered(), 0);
+        // Many whole messages: it takes what fits, and more once they are
+        // taken out.
+        let one = msg(1, Op::UnbindRequest).to_bytes().unwrap();
+        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 50).collect();
+        let mut d = Decoder::with_limit(20);
+        let (mut rest, mut n) = (&stream[..], 0);
+        while !rest.is_empty() {
+            let took = d.feed(rest);
+            assert!(d.buffered() <= 20);
+            rest = &rest[took..];
+            while let Some(m) = d.next_message() {
+                assert_eq!(m, Ok(msg(1, Op::UnbindRequest)));
+                n += 1;
+            }
+        }
+        assert_eq!(n, 50);
+        // A tiny limit still sees a header, and refuses the message.
+        let mut d = Decoder::with_limit(0);
+        assert_eq!(d.feed(&one), one.len());
+        assert_eq!(d.next_message(), Some(Err(Error::TooLarge(one.len()))));
+    }
+
+    #[test]
+    fn datagram_with_several_messages() {
+        let entry = msg(
+            3,
+            Op::SearchResultEntry(SearchResultEntry {
+                dn: String::new(),
+                attributes: vec![Attribute {
+                    name: "netlogon".into(),
+                    values: vec![vec![0x17, 0x00]],
+                }],
+            }),
+        );
+        let done = msg(
+            3,
+            Op::SearchResultDone(LdapResult::new(ResultCode::SUCCESS)),
+        );
+        let mut b = entry.to_bytes().unwrap();
+        b.extend_from_slice(&done.to_bytes().unwrap());
+        assert_eq!(Message::parse_datagram(&b), Ok(vec![entry.clone(), done]));
+        assert_eq!(Message::parse(&b), Err(Error::Ber(asn1::Error::Trailing)));
+        let one = entry.to_bytes().unwrap();
+        assert_eq!(Message::parse_datagram(&one), Ok(vec![entry]));
+        assert!(Message::parse_datagram(&[]).is_err());
+        b.push(0);
+        assert!(Message::parse_datagram(&b).is_err());
+    }
+
+    #[test]
+    fn unknown_trailing_components_are_ignored() {
+        // RFC 4511 section 4: a BindResponse with an unknown [9] after its
+        // fields reads, and is written without it.
+        let b = [
+            0x30, 0x0e, 0x02, 0x01, 0x01, 0x61, 0x09, 0x0a, 0x01, 0x00, 0x04, 0x00, 0x04, 0x00,
+            0x89, 0x00,
+        ];
+        let want = msg(
+            1,
+            Op::BindResponse(BindResponse {
+                result: LdapResult::new(ResultCode::SUCCESS),
+                server_sasl_creds: None,
+            }),
+        );
+        assert_eq!(Message::parse(&b), Ok(want));
+        // In the envelope, a control, a search and a filter's AVA too.
+        let mut m = msg(2, Op::SearchRequest(search(eq("cn", "x"))));
+        m.controls.push(Control {
+            oid: "1.2.3".into(),
+            critical: false,
+            value: None,
+        });
+        let plain = m.to_bytes().unwrap();
+        // Inserts `9f 64 00` ([100], empty) at the end of each element
+        // whose header starts at an offset in `add`, and fixes the lengths
+        // of every element in `fix`, which holds those and the ones around
+        // them. Every length here is one byte.
+        let grown = |add: &[usize], fix: &[usize]| {
+            let end = |o: usize| o + 2 + usize::from(plain[o + 1]);
+            let mut b = plain.clone();
+            let mut at: Vec<usize> = add.iter().map(|&o| end(o)).collect();
+            at.sort_unstable_by(|x, y| y.cmp(x));
+            for &p in &at {
+                b.splice(p..p, [0x9f, 0x64, 0x00]);
+            }
+            for &o in fix {
+                let inside = at.iter().filter(|&&p| p > o && p <= end(o)).count();
+                // Elements before `o` that grew move it along.
+                let shift = 3 * at.iter().filter(|&&p| p <= o).count();
+                b[o + shift + 1] += 3 * inside as u8;
+            }
+            b
+        };
+        // Offsets: 0 the envelope, 5 the search, 24 the AVA, 35 the
+        // controls and 37 the control.
+        assert_eq!(plain[24], 0xa3);
+        assert_eq!(plain[37], 0x30);
+        for (add, fix) in [
+            (&[0][..], &[0][..]),
+            (&[0, 5], &[0, 5]),
+            (&[0, 5, 24], &[0, 5, 24]),
+            (&[37], &[0, 35, 37]),
+        ] {
+            let b = grown(add, fix);
+            assert_eq!(Message::parse(&b).as_ref(), Ok(&m), "{add:?} {b:02x?}");
+        }
+        // In a list of controls it is not an extension.
+        assert!(Message::parse(&grown(&[35], &[0, 35])).is_err());
+        // A known tag after the last field is still an error.
+        let mut dup = plain.clone();
+        dup.extend_from_slice(&[0x02, 0x01, 0x01]);
+        dup[1] += 3;
+        assert_eq!(Message::parse(&dup), Err(Error::Ber(asn1::Error::Trailing)));
+    }
+
+    #[test]
+    fn size_one_or_more() {
+        // An added attribute needs a value; a reference and a referral need
+        // a URI (RFC 4511 sections 4.1.10, 4.5.3 and 4.7).
+        let add = msg(
+            1,
+            Op::AddRequest(AddRequest {
+                dn: "cn=x".into(),
+                attributes: vec![Attribute {
+                    name: "cn".into(),
+                    values: vec![],
+                }],
+            }),
+        );
+        assert!(matches!(add.to_bytes(), Err(Error::Unwritable(_))));
+        // 30 0e 02 01 01 68 09 04 01 x 30 04 30 02 04 00 ... built by hand.
+        let add_bytes = [
+            0x30, 0x13, 0x02, 0x01, 0x01, 0x68, 0x0e, 0x04, 0x04, b'c', b'n', b'=', b'x', 0x30,
+            0x06, 0x30, 0x04, 0x04, 0x00, 0x31, 0x00,
+        ];
+        assert!(Message::parse(&add_bytes).is_err());
+        let empty_ref = [0x30, 0x05, 0x02, 0x01, 0x01, 0x73, 0x00];
+        assert!(Message::parse(&empty_ref).is_err());
+        assert!(matches!(
+            msg(1, Op::SearchResultReference(vec![])).to_bytes(),
+            Err(Error::Unwritable(_))
+        ));
+        let empty_referral = [
+            0x30, 0x0e, 0x02, 0x01, 0x01, 0x65, 0x09, 0x0a, 0x01, 0x0a, 0x04, 0x00, 0x04, 0x00,
+            0xa3, 0x00,
+        ];
+        assert!(Message::parse(&empty_referral).is_err());
+        // A search result entry's attribute may have none.
+        round_trip(&msg(
+            1,
+            Op::SearchResultEntry(SearchResultEntry {
+                dn: "cn=x".into(),
+                attributes: vec![Attribute {
+                    name: "cn".into(),
+                    values: vec![],
+                }],
+            }),
+        ));
+    }
+
+    #[test]
+    fn other_codes_of_named_values_are_refused() {
+        let mut s = search(Filter::Present("a".into()));
+        for n in 0..=2 {
+            s.scope = Scope::Other(n);
+            assert!(matches!(
+                msg(1, Op::SearchRequest(s.clone())).to_bytes(),
+                Err(Error::Unwritable(_))
+            ));
+            let m = msg(
+                1,
+                Op::ModifyRequest(ModifyRequest {
+                    dn: String::new(),
+                    changes: vec![Change {
+                        op: ModifyOperation::Other(n),
+                        attribute: Attribute {
+                            name: "a".into(),
+                            values: vec![],
+                        },
+                    }],
+                }),
+            );
+            assert!(matches!(m.to_bytes(), Err(Error::Unwritable(_))));
+        }
+        s.scope = Scope::Other(3);
+        round_trip(&msg(1, Op::SearchRequest(s)));
+    }
+
+    #[test]
+    fn a_rule_named_dn_with_no_type() {
+        // RFC 4515: with no type, `:dn` before `:=` can only be the rule.
+        let f = Filter::Extensible {
+            rule: Some("dn".into()),
+            attribute: None,
+            value: b"x".to_vec(),
+            dn_attributes: false,
+        };
+        assert_eq!(Filter::parse_text("(:dn:=x)"), Ok(f.clone()));
+        assert_eq!(f.to_text().unwrap(), "(:dn:=x)");
+        // With a type, `(cn:dn:=x)` is the flag, so that form is refused.
+        let typed = Filter::Extensible {
+            rule: Some("dn".into()),
+            attribute: Some("cn".into()),
+            value: b"x".to_vec(),
+            dn_attributes: false,
+        };
+        assert!(matches!(typed.to_text(), Err(Error::Unwritable(_))));
+    }
+
+    #[test]
+    fn text_writers_stop_at_the_limit() {
+        // Each value is longer than MAX_TEXT once escaped; the writer stops
+        // before its text passes MAX_TEXT, not after.
+        let nul = vec![0u8; MAX_TEXT];
+        for f in [
+            Filter::Equal {
+                attribute: "cn".into(),
+                value: nul.clone(),
+            },
+            Filter::Substrings {
+                attribute: "cn".into(),
+                initial: None,
+                any: vec![nul[..MAX_TEXT / 4].to_vec(); 8],
+                last: None,
+            },
+        ] {
+            let mut out = String::new();
+            assert_eq!(f.write_text(&mut out, 1), Err(Error::TextTooLong));
+            assert!(out.len() <= MAX_TEXT, "{}", out.len());
+        }
+        let dn = |value| {
+            Dn(vec![Rdn(vec![Ava {
+                attribute: "cn".into(),
+                value,
+            }])])
+        };
+        for d in [
+            dn(AttributeValue::Text(",".repeat(MAX_TEXT))),
+            dn(AttributeValue::Ber(nul)),
+        ] {
+            let mut out = String::new();
+            assert_eq!(d.write_text(&mut out), Err(Error::TextTooLong));
+            assert!(out.len() <= MAX_TEXT, "{}", out.len());
+        }
     }
 
     // A deterministic generator, so failures repeat.
@@ -3643,6 +4107,7 @@ mod tests {
                     },
                     _ => Authentication::Other {
                         number: [1, 2, 4, 9, 40, 1000][g.below(6) as usize],
+                        constructed: g.coin(),
                         contents: g.bytes(4),
                     },
                 },
@@ -3662,6 +4127,7 @@ mod tests {
                 filter: if g.below(8) == 0 {
                     Filter::Other {
                         number: 10 + g.below(50) as u32,
+                        constructed: g.coin(),
                         contents: g.bytes(3),
                     }
                 } else {
@@ -3674,7 +4140,7 @@ mod tests {
                 attributes: (0..g.below(3)).map(|_| make_attribute(g)).collect(),
             }),
             5 => Op::SearchResultDone(make_result(g)),
-            6 => Op::SearchResultReference((0..g.below(3)).map(|_| g.text(6)).collect()),
+            6 => Op::SearchResultReference((0..1 + g.below(3)).map(|_| g.text(6)).collect()),
             7 => Op::ModifyRequest(ModifyRequest {
                 dn: g.text(6),
                 changes: (0..g.below(3))
@@ -3687,7 +4153,13 @@ mod tests {
             8 => Op::ModifyResponse(make_result(g)),
             9 => Op::AddRequest(AddRequest {
                 dn: g.text(6),
-                attributes: (0..g.below(3)).map(|_| make_attribute(g)).collect(),
+                attributes: (0..g.below(3))
+                    .map(|_| {
+                        let mut a = make_attribute(g);
+                        a.values.push(g.bytes(5));
+                        a
+                    })
+                    .collect(),
             }),
             10 => Op::AddResponse(make_result(g)),
             11 => Op::DelRequest(g.text(8)),
@@ -3763,13 +4235,22 @@ mod tests {
         } else {
             vec![data]
         };
-        for c in chunks {
-            d.feed(c);
-            while let Some(r) = d.next_message() {
-                match r {
-                    Ok(m) => out.push(m),
-                    Err(e) => return (out, Some(e)),
+        for mut c in chunks {
+            loop {
+                let n = d.feed(c);
+                c = &c[n..];
+                assert!(d.buffered() <= d.limit().max(HEADER_ROOM));
+                while let Some(r) = d.next_message() {
+                    match r {
+                        Ok(m) => out.push(m),
+                        Err(e) => return (out, Some(e)),
+                    }
                 }
+                if c.is_empty() {
+                    break;
+                }
+                // It takes nothing only while it holds a message to take out.
+                assert!(n > 0 || d.buffered() == 0);
             }
         }
         (out, None)
@@ -3781,9 +4262,10 @@ mod tests {
             assert!(b.len() <= data.len());
             assert_eq!(Message::parse(&b), Ok(m.clone()));
             if let Op::SearchRequest(s) = &m.op
-                && let Ok(t) = s.filter.to_text() {
-                    assert_eq!(Filter::parse_text(&t).as_ref(), Ok(&s.filter), "{t}");
-                }
+                && let Ok(t) = s.filter.to_text()
+            {
+                assert_eq!(Filter::parse_text(&t).as_ref(), Ok(&s.filter), "{t}");
+            }
         }
         let whole = decode_all(data, false);
         assert_eq!(whole, decode_all(data, true));

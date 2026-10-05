@@ -46,8 +46,9 @@
 //! ```
 
 /// The most bytes [`parse`] and a [`Decoder`] read, and the most
-/// [`serialize`] writes. The same cap applies to the input of
-/// [`percent_encode`] and [`percent_decode`].
+/// [`serialize`] writes. The same cap applies to the input and output of
+/// [`percent_encode`] and the input of [`percent_decode`] and
+/// [`decode_component`].
 pub const MAX_INPUT: usize = 1 << 20;
 /// The most pairs one form may hold. Empty pieces between two `&` are not
 /// pairs and do not count.
@@ -109,8 +110,8 @@ pub fn parse(input: &[u8]) -> Result<Vec<Pair>, FormError> {
 /// The name and value of one non-empty piece between `&`, decoded.
 fn split_pair(piece: &[u8]) -> Pair {
     match piece.iter().position(|&b| b == b'=') {
-        Some(i) => (decode_component(&piece[..i]), decode_component(&piece[i + 1..])),
-        None => (decode_component(piece), String::new()),
+        Some(i) => (decode_text(&piece[..i]), decode_text(&piece[i + 1..])),
+        None => (decode_text(piece), String::new()),
     }
 }
 
@@ -118,9 +119,18 @@ fn split_pair(piece: &[u8]) -> Pair {
 /// each `%` and two hex digits becomes that byte, then the bytes are read
 /// as UTF-8, with U+FFFD for any that are not. A byte order mark is kept.
 ///
-/// It does not check [`MAX_INPUT`]; its output is never longer than its
-/// input.
-pub fn decode_component(bytes: &[u8]) -> String {
+/// It fails when `bytes` is longer than [`MAX_INPUT`]. The output can be
+/// up to three times as long as the input, since each byte that is not
+/// UTF-8 becomes U+FFFD, three bytes long.
+pub fn decode_component(bytes: &[u8]) -> Result<String, FormError> {
+    if bytes.len() > MAX_INPUT {
+        return Err(FormError::TooLong);
+    }
+    Ok(decode_text(bytes))
+}
+
+/// [`decode_component`] for input already within [`MAX_INPUT`].
+fn decode_text(bytes: &[u8]) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     decode_into(bytes, true, &mut out);
     match String::from_utf8(out) {
@@ -243,13 +253,18 @@ impl EncodeSet {
 /// for UTF-8. With `space_as_plus`, a space becomes `+` instead, as in
 /// forms. Pass text as its UTF-8 bytes.
 ///
-/// The output is ASCII. It fails only when `bytes` is longer than
-/// [`MAX_INPUT`].
+/// The output is ASCII. It fails when `bytes` or the output would be
+/// longer than [`MAX_INPUT`], so [`percent_decode`] and [`parse`] can
+/// always read what it writes.
 pub fn percent_encode(bytes: &[u8], set: EncodeSet, space_as_plus: bool) -> Result<String, FormError> {
     if bytes.len() > MAX_INPUT {
         return Err(FormError::TooLong);
     }
-    let mut out = String::with_capacity(encoded_len(bytes, set, space_as_plus));
+    let len = encoded_len(bytes, set, space_as_plus);
+    if len > MAX_INPUT {
+        return Err(FormError::TooLong);
+    }
+    let mut out = String::with_capacity(len);
     encode_into(bytes, set, space_as_plus, &mut out);
     Ok(out)
 }
@@ -291,9 +306,11 @@ pub fn serialize<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Result<Strin
     if pairs.len() > MAX_PAIRS {
         return Err(FormError::TooManyPairs);
     }
+    // Each string is read once, so the bytes measured are the bytes written
+    // even if an `AsRef` gives a different string on each call.
+    let pairs: Vec<(&[u8], &[u8])> = pairs.iter().map(|(n, v)| (n.as_ref().as_bytes(), v.as_ref().as_bytes())).collect();
     let mut len = 0usize;
-    for (i, (n, v)) in pairs.iter().enumerate() {
-        let (n, v) = (n.as_ref().as_bytes(), v.as_ref().as_bytes());
+    for (i, &(n, v)) in pairs.iter().enumerate() {
         let piece = encoded_len(n, EncodeSet::Form, true).saturating_add(encoded_len(v, EncodeSet::Form, true)).saturating_add(1);
         len = len.saturating_add(piece).saturating_add(usize::from(i > 0));
         if len > MAX_INPUT {
@@ -301,13 +318,13 @@ pub fn serialize<N: AsRef<str>, V: AsRef<str>>(pairs: &[(N, V)]) -> Result<Strin
         }
     }
     let mut out = String::with_capacity(len);
-    for (i, (n, v)) in pairs.iter().enumerate() {
+    for (i, &(n, v)) in pairs.iter().enumerate() {
         if i > 0 {
             out.push('&');
         }
-        encode_into(n.as_ref().as_bytes(), EncodeSet::Form, true, &mut out);
+        encode_into(n, EncodeSet::Form, true, &mut out);
         out.push('=');
-        encode_into(v.as_ref().as_bytes(), EncodeSet::Form, true, &mut out);
+        encode_into(v, EncodeSet::Form, true, &mut out);
     }
     Ok(out)
 }
@@ -499,13 +516,13 @@ mod tests {
     #[test]
     fn utf8_replacement_matches_the_encoding_standard() {
         // One U+FFFD per maximal subpart, as the WHATWG UTF-8 decoder does.
-        assert_eq!(decode_component(b"%E2%80"), "\u{fffd}");
-        assert_eq!(decode_component(b"%E2%80a"), "\u{fffd}a");
-        assert_eq!(decode_component(b"%F0%80%80"), "\u{fffd}\u{fffd}\u{fffd}");
-        assert_eq!(decode_component(b"%ED%A0%80"), "\u{fffd}\u{fffd}\u{fffd}");
-        assert_eq!(decode_component(b"%C0%AF"), "\u{fffd}\u{fffd}");
-        assert_eq!(decode_component(b"%F4%90%80%80"), "\u{fffd}\u{fffd}\u{fffd}\u{fffd}");
-        assert_eq!(decode_component(b"%F0%9F%98"), "\u{fffd}");
+        assert_eq!(decode_component(b"%E2%80").unwrap(), "\u{fffd}");
+        assert_eq!(decode_component(b"%E2%80a").unwrap(), "\u{fffd}a");
+        assert_eq!(decode_component(b"%F0%80%80").unwrap(), "\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(decode_component(b"%ED%A0%80").unwrap(), "\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(decode_component(b"%C0%AF").unwrap(), "\u{fffd}\u{fffd}");
+        assert_eq!(decode_component(b"%F4%90%80%80").unwrap(), "\u{fffd}\u{fffd}\u{fffd}\u{fffd}");
+        assert_eq!(decode_component(b"%F0%9F%98").unwrap(), "\u{fffd}");
     }
 
     #[test]
@@ -536,7 +553,7 @@ mod tests {
         assert_eq!(percent_decode(b"%25%s%1G").unwrap(), b"%%s%1G");
         assert_eq!(percent_decode("\u{203d}%25%2E".as_bytes()).unwrap(), [0xe2, 0x80, 0xbd, 0x25, 0x2e]);
         assert_eq!(percent_decode(b"a+b").unwrap(), b"a+b");
-        assert_eq!(decode_component(b"a+b%20c"), "a b c");
+        assert_eq!(decode_component(b"a+b%20c").unwrap(), "a b c");
     }
 
     #[test]
@@ -648,6 +665,126 @@ mod tests {
     }
 
     #[test]
+    fn decode_component_is_bounded() {
+        // A byte that is not UTF-8 grows to three, so the output may be
+        // longer than the input, but the input is capped.
+        assert_eq!(decode_component(&[0xff]).unwrap(), "\u{fffd}");
+        assert_eq!(decode_component(&vec![0xff; MAX_INPUT + 1]), Err(FormError::TooLong));
+        assert_eq!(decode_component(&vec![b'a'; MAX_INPUT]).unwrap().len(), MAX_INPUT);
+    }
+
+    #[test]
+    fn percent_encode_never_writes_what_percent_decode_refuses() {
+        // Each % grows to three bytes with the component set.
+        let over = vec![b'%'; MAX_INPUT / 3 + 1];
+        assert_eq!(percent_encode(&over, EncodeSet::Component, false), Err(FormError::TooLong));
+        assert_eq!(percent_encode(&over, EncodeSet::Form, true), Err(FormError::TooLong));
+        let at = vec![b'%'; MAX_INPUT / 3];
+        let s = percent_encode(&at, EncodeSet::Component, false).unwrap();
+        assert!(s.len() <= MAX_INPUT);
+        assert_eq!(percent_decode(s.as_bytes()).unwrap(), at);
+        assert_eq!(parse(percent_encode(&at, EncodeSet::Form, true).unwrap().as_bytes()).unwrap().len(), 1);
+        // A space written as + stays one byte.
+        assert_eq!(percent_encode(&vec![b' '; MAX_INPUT], EncodeSet::Form, true).unwrap().len(), MAX_INPUT);
+    }
+
+    /// A name that reads as empty the first time and long after that.
+    struct Shifty {
+        seen: std::cell::Cell<bool>,
+        long: String,
+    }
+
+    impl AsRef<str> for Shifty {
+        fn as_ref(&self) -> &str {
+            if self.seen.replace(true) { &self.long } else { "" }
+        }
+    }
+
+    #[test]
+    fn serialize_reads_each_string_once() {
+        let v = Shifty { seen: std::cell::Cell::new(false), long: "a".repeat(MAX_INPUT + 1) };
+        let pairs = [("k", v)];
+        match serialize(&pairs) {
+            Ok(s) => {
+                assert!(s.len() <= MAX_INPUT);
+                assert!(parse(s.as_bytes()).is_ok());
+            }
+            Err(e) => assert_eq!(e, FormError::TooLong),
+        }
+    }
+
+    #[test]
+    fn decoder_fails_after_pairs_and_stays_failed() {
+        // Pairs handed out before the limit stay handed out; then the
+        // decoder fails, drops what it holds, and keeps failing.
+        let mut input = b"k=v&".to_vec();
+        input.extend(std::iter::repeat_n(b'a', MAX_INPUT - 3));
+        assert_eq!(parse(&input), Err(FormError::TooLong));
+        for step in [1usize, 4, 5, 4096, input.len()] {
+            let mut d = Decoder::new();
+            let mut got = Vec::new();
+            let mut err = None;
+            for (i, chunk) in input.chunks(step).enumerate() {
+                d.feed(chunk);
+                // Drain only now and then, so bytes pile up.
+                if i % 3 == 0 {
+                    while let Some(p) = d.next_pair() {
+                        match p {
+                            Ok(p) => got.push(p),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if err.is_some() {
+                    break;
+                }
+            }
+            d.finish();
+            if err.is_none() {
+                while let Some(p) = d.next_pair() {
+                    match p {
+                        Ok(p) => got.push(p),
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            assert_eq!(err, Some(FormError::TooLong), "step {step}");
+            assert!(got.len() <= 1 && got.iter().all(|p| p == &("k".to_string(), "v".to_string())), "step {step}");
+            assert_eq!(d.buffered(), 0);
+            d.feed(b"x=y&");
+            assert_eq!(d.next_pair(), Some(Err(FormError::TooLong)));
+        }
+        // Too many pairs, fed a byte at a time, fail the same way.
+        let over = b"a&".repeat(MAX_PAIRS + 1);
+        let mut d = Decoder::new();
+        let mut ok = 0;
+        let mut err = None;
+        for b in &over {
+            d.feed(std::slice::from_ref(b));
+            while let Some(p) = d.next_pair() {
+                match p {
+                    Ok(_) => ok += 1,
+                    Err(e) => {
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if err.is_some() {
+                break;
+            }
+        }
+        assert_eq!((ok, err), (MAX_PAIRS, Some(FormError::TooManyPairs)));
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
     fn too_many_pairs() {
         let at = b"a&".repeat(MAX_PAIRS);
         assert_eq!(parse(&at).unwrap().len(), MAX_PAIRS);
@@ -743,7 +880,7 @@ mod tests {
                 if set.contains(b'%') {
                     assert_eq!(percent_decode(plain.as_bytes()).unwrap(), buf, "{set:?}");
                     if set.contains(b'+') {
-                        assert_eq!(decode_component(plus.as_bytes()), String::from_utf8_lossy(&buf));
+                        assert_eq!(decode_component(plus.as_bytes()).unwrap(), String::from_utf8_lossy(&buf));
                     }
                 }
             }

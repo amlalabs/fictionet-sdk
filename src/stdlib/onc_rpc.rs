@@ -31,13 +31,14 @@
 //!
 //! ```
 //! use fictionet::stdlib::onc_rpc::{
-//!     encode_port, encode_record, Body, Call, Decoder, Mapping, Message, PortmapRequest, Reply,
-//!     IPPROTO_TCP,
+//!     encode_port, encode_record, silent_on_failure, Body, Call, Decoder, Mapping, Message,
+//!     PortmapRequest, Reply, IPPROTO_TCP,
 //! };
 //!
 //! /// A portmapper that knows one program: NFS version 3 on TCP port 2049.
-//! fn answer(call: &Call) -> Reply {
-//!     match PortmapRequest::parse(call) {
+//! /// `None` means it sends no reply.
+//! fn answer(call: &Call) -> Option<Reply> {
+//!     Some(match PortmapRequest::parse(call) {
 //!         Ok(PortmapRequest::GetPort(m)) => {
 //!             let nfs = m.program == 100_003 && m.version == 3 && m.protocol == IPPROTO_TCP;
 //!             Reply::success(encode_port(if nfs { 2049 } else { 0 }))
@@ -45,8 +46,10 @@
 //!         Ok(PortmapRequest::Null) => Reply::success(Vec::new()),
 //!         // Refuse to register or list anything.
 //!         Ok(_) => Reply::success(vec![0, 0, 0, 0]),
+//!         // It forwards no calls, and a CALLIT that fails gets no reply.
+//!         Err(_) if silent_on_failure(call) => return None,
 //!         Err(status) => Reply::accepted(status),
-//!     }
+//!     })
 //! }
 //!
 //! // A client asks, over TCP, which port NFS version 3 uses. Call 7.
@@ -57,7 +60,7 @@
 //! let record = decoder.next_record().unwrap().unwrap();
 //! let message = Message::parse(&record).unwrap();
 //! let Body::Call(call) = &message.body else { panic!("not a call") };
-//! let reply = message.reply(answer(call));
+//! let reply = message.reply(answer(call).unwrap());
 //! // Call 7, a reply, accepted, an AUTH_NONE verifier, success, port 2049.
 //! assert_eq!(
 //!     reply.to_bytes(),
@@ -95,8 +98,12 @@ pub const MAX_GIDS: usize = 16;
 pub const MAX_RPCB_STRING: usize = 255;
 /// The most items [`Reader::array`] makes room for before it reads them.
 /// A longer array grows as its items read, so a count alone never sizes
-/// an allocation.
+/// an allocation. It is also the most items an array may have when they
+/// take fewer than 4 bytes each, such as fixed opaque data of length 0.
 pub const MAX_ARRAY_RESERVE: usize = 1024;
+/// The most bytes [`Reader::array`] makes room for before it reads its
+/// items, however large each item is in memory.
+const MAX_RESERVE_BYTES: usize = 1 << 16;
 /// The most mappings [`parse_dump`] reads from a portmapper's list.
 pub const MAX_DUMP: usize = 1024;
 /// The longest record a [`Decoder`] puts together. A decoder may be given
@@ -279,9 +286,11 @@ impl<'a> Reader<'a> {
     }
 
     /// A variable-length array of at most `max` items, each read by
-    /// `item`. Every XDR item takes at least 4 bytes, so a count above a
-    /// quarter of the bytes left is refused before anything is read. Room
-    /// is made for at most [`MAX_ARRAY_RESERVE`] items up front.
+    /// `item`. Almost every XDR item takes at least 4 bytes, so a count
+    /// above both [`MAX_ARRAY_RESERVE`] and a quarter of the bytes left is
+    /// refused before anything is read. Up to [`MAX_ARRAY_RESERVE`] items
+    /// may take fewer bytes, even none. Room is made up front for at most
+    /// [`MAX_ARRAY_RESERVE`] items and at most 64 KiB.
     pub fn array<T>(
         &mut self,
         max: usize,
@@ -292,10 +301,10 @@ impl<'a> Reader<'a> {
         if n > max {
             return Err(XdrError::TooLong(count));
         }
-        if n > self.remaining().len() / 4 {
+        if n > MAX_ARRAY_RESERVE && n > self.remaining().len() / 4 {
             return Err(XdrError::Short);
         }
-        let mut out = Vec::with_capacity(n.min(MAX_ARRAY_RESERVE));
+        let mut out = Vec::with_capacity(reserve::<T>(n));
         for _ in 0..n {
             out.push(item(self)?);
         }
@@ -391,8 +400,9 @@ impl Writer {
     }
 
     /// A variable-length array: a count, then each item written by `item`.
-    /// Each item must write at least 4 bytes, as every XDR type but void
-    /// does, or [`Reader::array`] refuses the count.
+    /// An array of more than [`MAX_ARRAY_RESERVE`] items must have items of
+    /// at least 4 bytes, as almost every XDR type has, or
+    /// [`Reader::array`] refuses the count.
     pub fn array<T>(&mut self, items: &[T], mut item: impl FnMut(&mut Writer, &T)) -> &mut Writer {
         let items = &items[..items.len().min(u32::MAX as usize)];
         self.uint(items.len() as u32);
@@ -410,6 +420,11 @@ impl Writer {
         }
         self
     }
+}
+
+/// How many of `n` items of type `T` to make room for before reading them.
+fn reserve<T>(n: usize) -> usize {
+    n.min(MAX_ARRAY_RESERVE).min(MAX_RESERVE_BYTES / std::mem::size_of::<T>().max(1))
 }
 
 /// How many zero bytes pad `n` bytes to a multiple of 4.
@@ -475,9 +490,13 @@ pub enum Auth {
     None,
     /// AUTH_SYS with a body that reads as [`AuthSys`].
     Sys(AuthSys),
-    /// Any other flavor, or AUTH_NONE or AUTH_SYS with a body that does
-    /// not read as one. A server answers the last kind with
-    /// [`AuthStat::BadCred`]. The body is at most [`MAX_AUTH_BODY`] bytes.
+    /// Any other flavor, AUTH_NONE with a body, or AUTH_SYS with a body
+    /// that does not read as [`AuthSys`]. RFC 5531 (section 10.1) leaves
+    /// the body of AUTH_NONE undefined, so one with a body is still no
+    /// authentication and a server may take it. A server refuses an
+    /// AUTH_SYS body that does not read with [`AuthStat::BadCred`] for a
+    /// credential and [`AuthStat::BadVerf`] for a verifier. The body is at
+    /// most [`MAX_AUTH_BODY`] bytes.
     /// One built with flavor 0 and no body, or with flavor 1 and a body
     /// that reads as [`AuthSys`], writes the same bytes as [`Auth::None`]
     /// or [`Auth::Sys`] and reads back as that.
@@ -858,7 +877,9 @@ impl std::error::Error for RecordError {}
 /// together. Feed it the bytes a connection reads, in order, and take
 /// records out until it has none. It holds every byte fed until a call to
 /// [`Decoder::next_record`] takes it out, so a world calls that after each
-/// feed.
+/// feed. Then it holds at most the limit, plus 4 bytes, plus the bytes of
+/// the latest feed. A feed stops at a record mark that passes the limit
+/// and drops what follows, so bytes after a broken mark are never held.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -869,7 +890,28 @@ pub struct Decoder {
     record: Vec<u8>,
     limit: usize,
     failed: Option<RecordError>,
+    /// What `feed` has seen of the marks in the bytes it kept.
+    scan: Scan,
 }
+
+/// How far [`Decoder::feed`] has checked the record marks in the stream.
+#[derive(Clone, Debug, Default)]
+struct Scan {
+    /// Bytes of the current fragment's data still to come.
+    skip: usize,
+    /// The bytes of a record mark that has not all come.
+    mark: [u8; 4],
+    have: usize,
+    /// The bytes of the fragments of a record not yet whole.
+    record: usize,
+    /// Whether a fragment has come whose record has no last fragment yet.
+    open: bool,
+    /// Whether a mark has passed the limit. Later bytes are dropped.
+    stopped: bool,
+}
+
+/// The most spare room a [`Decoder`] keeps once it holds no bytes.
+const RETAIN: usize = 1 << 16;
 
 impl Default for Decoder {
     fn default() -> Decoder {
@@ -886,7 +928,14 @@ impl Decoder {
     /// A decoder that refuses records longer than `limit` bytes, or
     /// [`MAX_RECORD`] if that is lower.
     pub fn with_limit(limit: usize) -> Decoder {
-        Decoder { buf: Vec::new(), start: 0, record: Vec::new(), limit: limit.min(MAX_RECORD), failed: None }
+        Decoder {
+            buf: Vec::new(),
+            start: 0,
+            record: Vec::new(),
+            limit: limit.min(MAX_RECORD),
+            failed: None,
+            scan: Scan::default(),
+        }
     }
 
     /// The longest record this decoder accepts.
@@ -894,16 +943,44 @@ impl Decoder {
         self.limit
     }
 
-    /// Adds bytes read from the connection. After a [`RecordError`] the
-    /// stream cannot be read any further, and they are dropped.
+    /// Adds bytes read from the connection. Bytes after a record mark that
+    /// passes the limit are dropped, since the stream cannot be read past
+    /// it; [`Decoder::next_record`] reports the error when it reaches the
+    /// mark.
     pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+        if self.failed.is_some() || self.scan.stopped {
+            return;
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let s = &mut self.scan;
+        let mut i = 0;
+        while i < bytes.len() {
+            if s.skip > 0 {
+                let n = s.skip.min(bytes.len() - i);
+                s.skip -= n;
+                i += n;
+                continue;
+            }
+            s.mark[s.have] = bytes[i];
+            s.have += 1;
+            i += 1;
+            if s.have == 4 {
+                s.have = 0;
+                let mark = u32::from_be_bytes(s.mark);
+                let len = (mark & MAX_FRAGMENT) as usize;
+                if len > self.limit - s.record {
+                    s.stopped = true;
+                    break;
+                }
+                s.skip = len;
+                s.open = mark & LAST_FRAGMENT == 0;
+                s.record = if s.open { s.record + len } else { 0 };
+            }
+        }
+        self.buf.extend_from_slice(&bytes[..i]);
     }
 
     /// The next whole record, if one has come. It returns `None` when it
@@ -936,10 +1013,27 @@ impl Decoder {
             self.buf = Vec::new();
             self.start = 0;
             self.record = Vec::new();
+            self.scan = Scan::default();
+        } else if at == self.buf.len() {
+            // Every byte held has been read: start again, and give back
+            // the room a long record took.
+            self.buf.clear();
+            self.start = 0;
+            if self.buf.capacity() > RETAIN {
+                self.buf = Vec::new();
+            }
         } else {
             self.start = at;
         }
         result
+    }
+
+    /// Whether the stream stopped partway through a record: bytes are held,
+    /// or a fragment has come whose record has no last fragment yet. A
+    /// connection that closes while this is true closed in the middle of
+    /// a record. After a [`RecordError`] it is false.
+    pub fn mid_record(&self) -> bool {
+        self.failed.is_none() && (self.buffered() > 0 || self.scan.open)
     }
 
     /// How many bytes are held: fragments of a record not yet whole, and
@@ -949,20 +1043,22 @@ impl Decoder {
     }
 }
 
-/// A record's bytes for TCP: one fragment, or more if the record is longer
-/// than [`MAX_FRAGMENT`]. A [`Decoder`] whose limit is at least the
-/// record's length reads it back.
+/// A record's bytes for TCP, in one fragment. A record over [`MAX_RECORD`]
+/// bytes is cut to it, so a [`Decoder`] always reads the bytes back when
+/// its limit is at least the record's length.
 pub fn encode_record(record: &[u8]) -> Vec<u8> {
     encode_fragments(record, MAX_FRAGMENT as usize)
 }
 
 /// A record's bytes for TCP, split into fragments of at most
 /// `fragment_len` bytes. A length of 0 is taken as 1, and one above
-/// [`MAX_FRAGMENT`] as that. An empty record is one empty last fragment.
+/// [`MAX_FRAGMENT`] as that. An empty record is one empty last fragment. A
+/// record over [`MAX_RECORD`] bytes is cut to it, as no decoder reads more.
 pub fn encode_fragments(record: &[u8], fragment_len: usize) -> Vec<u8> {
+    let record = &record[..record.len().min(MAX_RECORD)];
     let size = fragment_len.clamp(1, MAX_FRAGMENT as usize);
     let count = record.len().div_ceil(size).max(1);
-    let mut out = Vec::with_capacity(record.len() + 4 * count);
+    let mut out = Vec::with_capacity(record.len().saturating_add(count.saturating_mul(4)));
     let mut chunks = record.chunks(size).peekable();
     if chunks.peek().is_none() {
         out.extend_from_slice(&LAST_FRAGMENT.to_be_bytes());
@@ -1061,10 +1157,12 @@ pub enum PortmapRequest {
 impl PortmapRequest {
     /// Reads the request a call makes. When the call is not one, the error
     /// is the status a portmapper replies with: the wrong program, a
-    /// version other than 2, a procedure this module does not read (such
-    /// as CALLIT), or arguments that do not read. A server that also plays
-    /// rpcbind checks the version first and sends calls for 3 and 4 to
-    /// [`RpcbRequest::parse`].
+    /// version other than 2, a procedure this module does not read, or
+    /// arguments that do not read. CALLIT is one this module does not
+    /// read, and a portmapper sends no reply at all when CALLIT fails, so
+    /// a server checks [`silent_on_failure`] before it replies. A server
+    /// that also plays rpcbind checks the version first and sends calls
+    /// for 3 and 4 to [`RpcbRequest::parse`].
     pub fn parse(call: &Call) -> Result<PortmapRequest, Accept> {
         if call.program != PMAP_PROGRAM {
             return Err(Accept::ProgUnavail);
@@ -1130,7 +1228,9 @@ impl RpcbRequest {
     /// Reads the request a call makes. When the call is not one, the error
     /// is the status rpcbind replies with: the wrong program, a version
     /// other than 3 or 4, a procedure this module does not read, or
-    /// arguments that do not read.
+    /// arguments that do not read. CALLIT and BCAST (procedure 5) are not
+    /// read, and rpcbind sends no reply at all when they fail, so a server
+    /// checks [`silent_on_failure`] before it replies.
     pub fn parse(call: &Call) -> Result<RpcbRequest, Accept> {
         if call.program != PMAP_PROGRAM {
             return Err(Accept::ProgUnavail);
@@ -1175,6 +1275,16 @@ impl RpcbRequest {
         let call = Call::new(PMAP_PROGRAM, version, self.procedure(), self.to_args());
         Message { xid, body: Body::Call(call) }
     }
+}
+
+/// Whether a call gets no reply when it fails: the portmapper's CALLIT and
+/// rpcbind's CALLIT and BCAST, all procedure 5 of program 100000 (RFC 1833,
+/// sections 2.2.1, 2.2.2 and 3.2). They reply only when the call they
+/// forward succeeds. rpcbind's INDIRECT replies with its errors.
+pub fn silent_on_failure(call: &Call) -> bool {
+    call.program == PMAP_PROGRAM
+        && (PMAP_VERSION..=RPCB_VERSION_HIGH).contains(&call.version)
+        && call.procedure == procedure::CALLIT
 }
 
 /// The results of SET and UNSET: a boolean.
@@ -1629,6 +1739,114 @@ mod tests {
         d.feed(&encode_fragments(&[1, 2, 3], 2));
         assert_eq!(d.next_record(), Some(Ok(vec![1, 2, 3])));
         assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn decoder_drops_bytes_after_a_broken_mark() {
+        // A mark that passes the limit, then a megabyte: only the mark is
+        // kept, and later feeds are dropped.
+        let mut d = Decoder::new();
+        let mut bytes = vec![0xff; 4];
+        bytes.extend_from_slice(&[0; 1 << 20]);
+        d.feed(&bytes);
+        assert_eq!(d.buffered(), 4);
+        d.feed(&[0; 1 << 10]);
+        assert_eq!(d.buffered(), 4);
+        assert_eq!(d.next_record(), Some(Err(RecordError::TooLong(MAX_RECORD))));
+        // Records before the broken mark in the same feed still come out.
+        let mut d = Decoder::with_limit(8);
+        let mut stream = encode_record(&[1, 2]);
+        stream.extend_from_slice(&[0, 0, 0, 4, 9, 9, 9, 9, 0x80, 0, 0, 5]);
+        stream.extend_from_slice(&[7; 100]);
+        d.feed(&stream);
+        assert_eq!(d.buffered(), stream.len() - 100);
+        assert_eq!(d.next_record(), Some(Ok(vec![1, 2])));
+        assert_eq!(d.next_record(), Some(Err(RecordError::TooLong(8))));
+    }
+
+    #[test]
+    fn decoder_gives_back_room_after_a_long_record() {
+        let mut d = Decoder::new();
+        d.feed(&encode_record(&vec![5; 1 << 20]));
+        assert_eq!(d.next_record().map(|r| r.map(|r| r.len())), Some(Ok(1 << 20)));
+        assert_eq!(d.buffered(), 0);
+        assert!(d.buf.capacity() <= RETAIN, "{} bytes kept", d.buf.capacity());
+        d.feed(&encode_record(&[1]));
+        assert_eq!(d.next_record(), Some(Ok(vec![1])));
+    }
+
+    #[test]
+    fn decoder_tells_a_cut_record_at_the_end() {
+        let mut d = Decoder::new();
+        assert!(!d.mid_record());
+        // An empty fragment that is not the last: nothing is held, but the
+        // record has begun.
+        d.feed(&[0, 0, 0, 0]);
+        assert_eq!(d.next_record(), None);
+        assert_eq!(d.buffered(), 0);
+        assert!(d.mid_record());
+        d.feed(&[0x80, 0, 0]);
+        assert!(d.mid_record());
+        d.feed(&[0]);
+        assert_eq!(d.next_record(), Some(Ok(vec![])));
+        assert!(!d.mid_record());
+        d.feed(&[0x80, 0, 0, 4, 1]);
+        assert_eq!(d.next_record(), None);
+        assert!(d.mid_record());
+    }
+
+    #[test]
+    fn long_records_encode_to_what_a_decoder_reads() {
+        for record in [vec![3; MAX_RECORD], vec![3; MAX_RECORD + 1]] {
+            for bytes in [encode_record(&record), encode_fragments(&record, 1 << 16)] {
+                let mut d = Decoder::new();
+                d.feed(&bytes);
+                assert_eq!(d.next_record(), Some(Ok(vec![3; MAX_RECORD])));
+            }
+        }
+    }
+
+    #[test]
+    fn arrays_of_items_with_no_bytes() {
+        // Fixed opaque data of length 0 takes no bytes (RFC 4506, 4.9).
+        let mut w = Writer::new();
+        w.array(&[(); 3], |w, _| {
+            w.opaque_fixed(&[]);
+        });
+        let bytes = w.finish();
+        assert_eq!(bytes, [0, 0, 0, 3]);
+        let mut r = Reader::new(&bytes);
+        assert_eq!(r.array(3, |r| r.opaque_fixed(0)), Ok(vec![&[][..]; 3]));
+        assert_eq!(r.finish(), Ok(()));
+        let full = (MAX_ARRAY_RESERVE as u32).to_be_bytes();
+        assert_eq!(Reader::new(&full).array(usize::MAX, |r| r.opaque_fixed(0)).map(|v| v.len()), Ok(MAX_ARRAY_RESERVE));
+        // Past that, a count still needs 4 bytes an item.
+        let over = (MAX_ARRAY_RESERVE as u32 + 1).to_be_bytes();
+        assert_eq!(Reader::new(&over).array(usize::MAX, |r| r.opaque_fixed(0)), Err(XdrError::Short));
+        // Items that need bytes still end early.
+        assert_eq!(Reader::new(&[0, 0, 0, 2, 0, 0, 0, 1]).array(9, Reader::uint), Err(XdrError::Short));
+    }
+
+    #[test]
+    fn array_room_is_bounded_in_bytes() {
+        assert!(reserve::<[u8; 1 << 16]>(1024) * (1 << 16) <= MAX_RESERVE_BYTES);
+        assert!(reserve::<[u8; 1 << 20]>(1024) <= 1);
+        assert_eq!(reserve::<u32>(5), 5);
+        assert_eq!(reserve::<u32>(1 << 20), MAX_ARRAY_RESERVE);
+        assert_eq!(reserve::<()>(1 << 20), MAX_ARRAY_RESERVE);
+    }
+
+    #[test]
+    fn callit_and_bcast_fail_without_a_reply() {
+        let call = |version, procedure| Call::new(PMAP_PROGRAM, version, procedure, vec![]);
+        for version in 2..=4 {
+            assert!(silent_on_failure(&call(version, procedure::CALLIT)));
+            for p in [0, 1, 2, 3, 4, 6, 10] {
+                assert!(!silent_on_failure(&call(version, p)));
+            }
+        }
+        assert!(!silent_on_failure(&call(5, procedure::CALLIT)));
+        assert!(!silent_on_failure(&Call::new(100_003, 3, procedure::CALLIT, vec![])));
     }
 
     #[test]

@@ -153,8 +153,23 @@ pub const MAX_VALUES: usize = 1 << 18;
 /// The most dimensions a Variant's array may name.
 pub const MAX_DIMENSIONS: usize = 32;
 /// How deeply Variants, DataValues and DiagnosticInfos may nest inside
-/// one another.
-pub const MAX_DEPTH: usize = 16;
+/// one another. Part 6 asks decoders to take at least 100 levels.
+pub const MAX_DEPTH: usize = 100;
+/// The most bytes a [`Decoder`] holds that it has not yet taken out as
+/// messages. [`Decoder::feed`] takes no more than fit.
+pub const MAX_BUFFERED: usize = 4 << 20;
+/// The longest String identifier of a NodeId, in characters, and the
+/// longest Opaque one, in bytes (Part 3, 8.2.4).
+pub const MAX_NODE_ID_LEN: usize = 4096;
+/// The longest name of a QualifiedName, in characters (Part 3, 8.3).
+pub const MAX_QUALIFIED_NAME_LEN: usize = 512;
+/// The latest DateTime a writer keeps: 9999-12-31 23:59:59 UTC. A writer
+/// writes this and anything later as `i64::MAX`, and anything at or before
+/// the 1601 epoch as 0, as Part 6 asks.
+pub const MAX_DATE_TIME: i64 = 2_650_467_743_990_000_000;
+/// The largest picoseconds field of a DataValue. Readers read a larger one
+/// as this, and writers write a larger one as this.
+pub const MAX_PICOSECONDS: u16 = 9999;
 /// The largest sequence number a legacy security policy may not wrap
 /// after. Once a number is above it, the next may wrap around to a number
 /// below 1024. A [`Decoder`] accepts that wrap inside a message, as well
@@ -263,6 +278,9 @@ pub enum DecodeError {
     Enum(i32),
     /// Bytes were left over after the value.
     Trailing(usize),
+    /// A NodeId's String identifier or a QualifiedName's name held a C0
+    /// or C1 control character, which Part 3 forbids.
+    ControlChar,
 }
 
 impl std::fmt::Display for DecodeError {
@@ -281,6 +299,7 @@ impl std::fmt::Display for DecodeError {
             DecodeError::TooManyValues => write!(f, "more than {MAX_VALUES} values"),
             DecodeError::Enum(n) => write!(f, "enumeration value {n} is not defined"),
             DecodeError::Trailing(n) => write!(f, "{n} bytes left over after the value"),
+            DecodeError::ControlChar => f.write_str("a name holds a control character"),
         }
     }
 }
@@ -299,7 +318,9 @@ pub enum EncodeError {
     TooManyValues,
     /// A Variant holds a value of the wrong type: an array element that
     /// does not match the array's type, a Variant directly inside a
-    /// Variant, or a type id that does not exist.
+    /// Variant, a DiagnosticInfo, a DataValue inside a DataValue, or a
+    /// type id that does not exist or is reserved (26 to 31), which only
+    /// readers take.
     VariantType,
     /// A Variant's array dimensions are fewer than 2, more than
     /// [`MAX_DIMENSIONS`], not all above 0, or do not multiply out to its
@@ -311,6 +332,13 @@ pub enum EncodeError {
     /// A [`Service::Other`] carries the type id of a service this module
     /// reads, so its body would be read as that service.
     KnownTypeId,
+    /// A NodeId's String identifier or a QualifiedName's name holds a C0
+    /// or C1 control character.
+    ControlChar,
+    /// An OPN's security header breaks its policy: a sender certificate or
+    /// receiver thumbprint under policy None, or a thumbprint that is not
+    /// 20 bytes.
+    SecurityHeader,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -323,6 +351,8 @@ impl std::fmt::Display for EncodeError {
             EncodeError::Dimensions => f.write_str("array dimensions do not match the array"),
             EncodeError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
             EncodeError::KnownTypeId => f.write_str("an unread service carries a known type id"),
+            EncodeError::ControlChar => f.write_str("a name holds a control character"),
+            EncodeError::SecurityHeader => f.write_str("the security header breaks its policy"),
         }
     }
 }
@@ -343,12 +373,14 @@ pub struct Reader<'a> {
     pos: usize,
     depth: usize,
     values: usize,
+    /// How many DataValues the value being read is inside.
+    data_values: usize,
 }
 
 impl<'a> Reader<'a> {
     /// A reader at the start of `bytes`.
     pub fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes, pos: 0, depth: 0, values: 0 }
+        Reader { bytes, pos: 0, depth: 0, values: 0, data_values: 0 }
     }
 
     /// How many bytes are left.
@@ -419,10 +451,17 @@ impl<'a> Reader<'a> {
     pub fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.array()?))
     }
-    /// An Int64. A DateTime is one too: 100-nanosecond intervals since
-    /// January 1, 1601 (UTC).
+    /// An Int64, read as it is. A DateTime goes through
+    /// [`Reader::date_time`].
     pub fn i64(&mut self) -> Result<i64, DecodeError> {
         Ok(i64::from_le_bytes(self.array()?))
+    }
+    /// A DateTime: 100-nanosecond intervals since January 1, 1601 (UTC).
+    /// It reads as [`Writer::date_time`] writes: anything at or before the
+    /// epoch as 0, and anything at or after [`MAX_DATE_TIME`] as
+    /// `i64::MAX`, so a value read writes back the same.
+    pub fn date_time(&mut self) -> Result<i64, DecodeError> {
+        Ok(clamp_date_time(self.i64()?))
     }
     /// A Float.
     pub fn f32(&mut self) -> Result<f32, DecodeError> {
@@ -529,6 +568,8 @@ pub struct Writer {
     out: Vec<u8>,
     depth: usize,
     values: usize,
+    /// How many DataValues the value being written is inside.
+    data_values: usize,
 }
 
 impl Writer {
@@ -588,16 +629,24 @@ impl Writer {
     pub fn u64(&mut self, v: u64) {
         self.bytes(&v.to_le_bytes());
     }
-    /// An Int64 or a DateTime.
+    /// An Int64, written as it is. A DateTime goes through
+    /// [`Writer::date_time`].
     pub fn i64(&mut self, v: i64) {
         self.bytes(&v.to_le_bytes());
     }
-    /// A Float.
+    /// A DateTime. One at or before the 1601 epoch is written as 0, and
+    /// one at or after [`MAX_DATE_TIME`] as `i64::MAX`, as Part 6 asks.
+    pub fn date_time(&mut self, v: i64) {
+        self.i64(clamp_date_time(v));
+    }
+    /// A Float. Any NaN is written as the quiet NaN Part 6 names.
     pub fn f32(&mut self, v: f32) {
+        let v = if v.is_nan() { f32::from_bits(0xffc0_0000) } else { v };
         self.bytes(&v.to_le_bytes());
     }
-    /// A Double.
+    /// A Double. Any NaN is written as the quiet NaN Part 6 names.
     pub fn f64(&mut self, v: f64) {
+        let v = if v.is_nan() { f64::from_bits(0xfff8_0000_0000_0000) } else { v };
         self.bytes(&v.to_le_bytes());
     }
 
@@ -678,6 +727,18 @@ impl Writer {
         let out = f(self);
         self.depth -= 1;
         out
+    }
+}
+
+/// A DateTime as Part 6 encodes it: 0 for any time at or before the
+/// epoch, and `i64::MAX` for any at or after [`MAX_DATE_TIME`].
+fn clamp_date_time(v: i64) -> i64 {
+    if v <= 0 {
+        0
+    } else if v >= MAX_DATE_TIME {
+        i64::MAX
+    } else {
+        v
     }
 }
 
@@ -786,11 +847,13 @@ impl Binary for Guid {
 pub enum Identifier {
     /// A number.
     Numeric(u32),
-    /// A string. A null string reads as empty.
+    /// A string of at most [`MAX_NODE_ID_LEN`] characters, with no
+    /// control characters. A null string reads as empty.
     String(String),
     /// A Guid.
     Guid(Guid),
-    /// Opaque bytes. A null ByteString reads as empty.
+    /// At most [`MAX_NODE_ID_LEN`] opaque bytes. A null ByteString reads
+    /// as empty.
     Opaque(Vec<u8>),
 }
 
@@ -823,9 +886,17 @@ impl NodeId {
         NodeId { namespace, identifier: Identifier::String(id.to_string()) }
     }
 
-    /// Whether this is the null NodeId.
+    /// Whether this is a null NodeId: in namespace 0, numeric 0, an empty
+    /// string, the all-zero Guid or empty opaque bytes. Part 3 counts all
+    /// four as null.
     pub fn is_null(&self) -> bool {
-        *self == NodeId::default()
+        self.namespace == 0
+            && match &self.identifier {
+                Identifier::Numeric(id) => *id == 0,
+                Identifier::String(s) => s.is_empty(),
+                Identifier::Guid(g) => *g == Guid::default(),
+                Identifier::Opaque(b) => b.is_empty(),
+            }
     }
 
     /// The numeric id, if this is a numeric NodeId in namespace 0.
@@ -851,7 +922,7 @@ impl NodeId {
             }
             3 => {
                 let namespace = r.u16()?;
-                NodeId { namespace, identifier: Identifier::String(r.string()?.unwrap_or_default()) }
+                NodeId { namespace, identifier: Identifier::String(read_name(r, MAX_NODE_ID_LEN)?) }
             }
             4 => {
                 let namespace = r.u16()?;
@@ -859,7 +930,10 @@ impl NodeId {
             }
             5 => {
                 let namespace = r.u16()?;
-                NodeId { namespace, identifier: Identifier::Opaque(r.byte_string()?.unwrap_or_default()) }
+                NodeId {
+                    namespace,
+                    identifier: Identifier::Opaque(r.byte_string_max(MAX_NODE_ID_LEN)?.unwrap_or_default()),
+                }
             }
             _ => return Err(DecodeError::NodeIdForm(form)),
         })
@@ -884,6 +958,7 @@ impl NodeId {
                 }
             }
             Identifier::String(s) => {
+                check_name(s, MAX_NODE_ID_LEN)?;
                 w.u8(flags | 3);
                 w.u16(ns);
                 w.string(Some(s))?;
@@ -894,6 +969,9 @@ impl NodeId {
                 g.encode(w)?;
             }
             Identifier::Opaque(b) => {
+                if b.len() > MAX_NODE_ID_LEN {
+                    return Err(EncodeError::TooLong);
+                }
                 w.u8(flags | 5);
                 w.u16(ns);
                 w.byte_string(Some(b))?;
@@ -901,6 +979,36 @@ impl NodeId {
         }
         Ok(())
     }
+}
+
+/// Whether `c` is a Unicode C0 or C1 control character.
+fn is_c0_c1(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1f}' | '\u{80}'..='\u{9f}')
+}
+
+/// Reads a NodeId String identifier or a QualifiedName's name: at most
+/// `max` characters, none a control character. A null one reads as empty.
+fn read_name(r: &mut Reader<'_>, max: usize) -> Result<String, DecodeError> {
+    let s = r.string_max(max * 4)?.unwrap_or_default();
+    let chars = s.chars().count();
+    if chars > max {
+        return Err(DecodeError::Length(i32::try_from(chars).unwrap_or(i32::MAX)));
+    }
+    if s.chars().any(is_c0_c1) {
+        return Err(DecodeError::ControlChar);
+    }
+    Ok(s)
+}
+
+/// Checks what [`read_name`] checks, before writing.
+fn check_name(s: &str, max: usize) -> Result<(), EncodeError> {
+    if s.chars().count() > max {
+        return Err(EncodeError::TooLong);
+    }
+    if s.chars().any(is_c0_c1) {
+        return Err(EncodeError::ControlChar);
+    }
+    Ok(())
 }
 
 impl Binary for NodeId {
@@ -921,9 +1029,10 @@ impl Binary for NodeId {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ExpandedNodeId {
     /// The NodeId. When a namespace URI is given, its namespace index is
-    /// ignored by the receiver.
+    /// written as 0, as Part 6 asks, and reads as 0.
     pub node_id: NodeId,
-    /// The namespace's URI, if given. A null URI reads as `None`.
+    /// The namespace's URI, if given. A null or empty URI reads as `None`,
+    /// and an empty one is left off the wire.
     pub namespace_uri: Option<String>,
     /// The index into the server table. 0 is the local server, and is
     /// left off the wire.
@@ -940,21 +1049,30 @@ impl From<NodeId> for ExpandedNodeId {
 impl Binary for ExpandedNodeId {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let form = r.u8()?;
-        let node_id = NodeId::decode_form(r, form)?;
-        let namespace_uri = if form & 0x80 != 0 { r.string()? } else { None };
+        let mut node_id = NodeId::decode_form(r, form)?;
+        let namespace_uri = if form & 0x80 != 0 { r.string()?.filter(|u| !u.is_empty()) } else { None };
+        if namespace_uri.is_some() {
+            node_id.namespace = 0;
+        }
         let server_index = if form & 0x40 != 0 { r.u32()? } else { 0 };
         Ok(ExpandedNodeId { node_id, namespace_uri, server_index })
     }
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        let uri = self.namespace_uri.as_deref().filter(|u| !u.is_empty());
         let mut flags = 0;
-        if self.namespace_uri.is_some() {
+        if uri.is_some() {
             flags |= 0x80;
         }
         if self.server_index != 0 {
             flags |= 0x40;
         }
-        self.node_id.encode_flags(w, flags)?;
-        if let Some(uri) = &self.namespace_uri {
+        if uri.is_some() && self.node_id.namespace != 0 {
+            let node_id = NodeId { namespace: 0, ..self.node_id.clone() };
+            node_id.encode_flags(w, flags)?;
+        } else {
+            self.node_id.encode_flags(w, flags)?;
+        }
+        if let Some(uri) = uri {
             w.string(Some(uri))?;
         }
         if self.server_index != 0 {
@@ -969,15 +1087,17 @@ impl Binary for ExpandedNodeId {
 pub struct QualifiedName {
     /// The namespace index.
     pub namespace: u16,
-    /// The name. A null name reads as empty.
+    /// The name: at most [`MAX_QUALIFIED_NAME_LEN`] characters, with no
+    /// control characters. A null name reads as empty.
     pub name: String,
 }
 
 impl Binary for QualifiedName {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Ok(QualifiedName { namespace: r.u16()?, name: r.string()?.unwrap_or_default() })
+        Ok(QualifiedName { namespace: r.u16()?, name: read_name(r, MAX_QUALIFIED_NAME_LEN)? })
     }
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        check_name(&self.name, MAX_QUALIFIED_NAME_LEN)?;
         w.u16(self.namespace);
         w.string(Some(&self.name))
     }
@@ -1174,7 +1294,8 @@ pub enum Value {
     Double(f64),
     /// A String. Null is `None`.
     String(Option<String>),
-    /// 100-nanosecond intervals since January 1, 1601 (UTC).
+    /// 100-nanosecond intervals since January 1, 1601 (UTC), bounded as
+    /// [`Writer::date_time`] and [`Reader::date_time`] bound it.
     DateTime(i64),
     Guid(Guid),
     /// A ByteString. Null is `None`.
@@ -1190,8 +1311,12 @@ pub enum Value {
     DataValue(Box<DataValue>),
     /// A Variant, which may only appear as an array element.
     Variant(Box<Variant>),
+    /// Part 6 forbids a DiagnosticInfo in a Variant: readers refuse one,
+    /// and writers refuse to write one.
     DiagnosticInfo(Box<DiagnosticInfo>),
-    /// A value of reserved type id 26 to 31, kept as a ByteString.
+    /// A value of reserved type id 26 to 31, kept as a ByteString. Readers
+    /// take one, as Part 6 asks, but writers refuse it, since encoders
+    /// shall not use these ids.
     Reserved {
         type_id: u8,
         bytes: Option<Vec<u8>>,
@@ -1232,9 +1357,29 @@ impl Value {
         }
     }
 
-    /// Reads a value of built-in type `t`, which is 1 to 31.
+    /// Whether a reader takes type `t` in a Variant, inside
+    /// `data_values` DataValues.
+    fn readable(t: u8, data_values: usize) -> bool {
+        match t {
+            type_id::DATA_VALUE => data_values == 0,
+            type_id::DIAGNOSTIC_INFO => false,
+            1..=type_id::RESERVED_LAST => true,
+            _ => false,
+        }
+    }
+
+    /// Whether a writer writes type `t` in a Variant, inside
+    /// `data_values` DataValues: what a reader takes, but no reserved ids.
+    fn writable(t: u8, data_values: usize) -> bool {
+        t < type_id::RESERVED_FIRST && Value::readable(t, data_values)
+    }
+
+    /// Reads a value of built-in type `t`, which [`Value::readable`] takes.
     fn decode(r: &mut Reader<'_>, t: u8) -> Result<Value, DecodeError> {
         use type_id as id;
+        if !Value::readable(t, r.data_values) {
+            return Err(DecodeError::VariantType(t));
+        }
         Ok(match t {
             id::BOOLEAN => Value::Boolean(r.bool()?),
             id::SBYTE => Value::SByte(r.i8()?),
@@ -1248,7 +1393,7 @@ impl Value {
             id::FLOAT => Value::Float(r.f32()?),
             id::DOUBLE => Value::Double(r.f64()?),
             id::STRING => Value::String(r.string()?),
-            id::DATE_TIME => Value::DateTime(r.i64()?),
+            id::DATE_TIME => Value::DateTime(r.date_time()?),
             id::GUID => Value::Guid(r.read()?),
             id::BYTE_STRING => Value::ByteString(r.byte_string()?),
             id::XML_ELEMENT => Value::XmlElement(r.byte_string()?),
@@ -1260,13 +1405,15 @@ impl Value {
             id::EXTENSION_OBJECT => Value::ExtensionObject(Box::new(r.read()?)),
             id::DATA_VALUE => Value::DataValue(Box::new(r.read()?)),
             id::VARIANT => Value::Variant(Box::new(r.read()?)),
-            id::DIAGNOSTIC_INFO => Value::DiagnosticInfo(Box::new(r.read()?)),
             id::RESERVED_FIRST..=id::RESERVED_LAST => Value::Reserved { type_id: t, bytes: r.byte_string()? },
             _ => return Err(DecodeError::VariantType(t)),
         })
     }
 
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        if !Value::writable(self.type_id(), w.data_values) {
+            return Err(EncodeError::VariantType);
+        }
         match self {
             Value::Boolean(v) => w.bool(*v),
             Value::SByte(v) => w.i8(*v),
@@ -1275,7 +1422,8 @@ impl Value {
             Value::UInt16(v) => w.u16(*v),
             Value::Int32(v) => w.i32(*v),
             Value::UInt32(v) => w.u32(*v),
-            Value::Int64(v) | Value::DateTime(v) => w.i64(*v),
+            Value::Int64(v) => w.i64(*v),
+            Value::DateTime(v) => w.date_time(*v),
             Value::UInt64(v) => w.u64(*v),
             Value::Float(v) => w.f32(*v),
             Value::Double(v) => w.f64(*v),
@@ -1290,13 +1438,7 @@ impl Value {
             Value::ExtensionObject(e) => e.encode(w)?,
             Value::DataValue(d) => d.encode(w)?,
             Value::Variant(v) => v.encode(w)?,
-            Value::DiagnosticInfo(d) => d.encode(w)?,
-            Value::Reserved { type_id, bytes } => {
-                if !(type_id::RESERVED_FIRST..=type_id::RESERVED_LAST).contains(type_id) {
-                    return Err(EncodeError::VariantType);
-                }
-                w.byte_string(bytes.as_deref())?;
-            }
+            Value::DiagnosticInfo(_) | Value::Reserved { .. } => return Err(EncodeError::VariantType),
         }
         Ok(())
     }
@@ -1310,12 +1452,13 @@ pub enum Variant {
     Null,
     /// One value. It may not be a [`Value::Variant`].
     Scalar(Value),
-    /// An array of values, all of built-in type `type_id`. A null array
-    /// reads as empty. With `dimensions`, the array is multi-dimensional:
+    /// An array of values, all of built-in type `type_id`, which is never
+    /// 0 or 25 (DiagnosticInfo). A null array reads as empty. With `dimensions`, the array is multi-dimensional:
     /// there are at least 2 dimensions, as Part 6 asks, every one is above
     /// 0, and they multiply out to its length.
     Array {
-        /// The built-in type of every element, 1 to 31.
+        /// The built-in type of every element, 1 to 31 but not 25.
+        /// Writers also refuse the reserved ids, 26 to 31.
         type_id: u8,
         /// The elements. A multi-dimensional array is flattened with the
         /// last index changing fastest. A 2 by 2 array holds (0, 0),
@@ -1362,6 +1505,11 @@ impl Variant {
             }
             Variant::Scalar(Value::decode(r, t)?)
         } else {
+            // The type is checked before the length, so an empty array
+            // of a type that cannot be there is refused too.
+            if !Value::readable(t, r.data_values) {
+                return Err(DecodeError::VariantType(t));
+            }
             let n = r.array_len()?;
             let mut values = Vec::with_capacity(n);
             for _ in 0..n {
@@ -1401,16 +1549,17 @@ impl Variant {
                 v.encode(w)?;
             }
             Variant::Array { type_id: t, values, dimensions } => {
-                if *t == type_id::NULL || *t > type_id::RESERVED_LAST {
+                if !Value::writable(*t, w.data_values) {
                     return Err(EncodeError::VariantType);
                 }
                 if values.iter().any(|v| v.type_id() != *t) {
                     return Err(EncodeError::VariantType);
                 }
                 if let Some(d) = dimensions
-                    && (d.len() < 2 || d.len() > MAX_DIMENSIONS || !dims_match(d, values.len())) {
-                        return Err(EncodeError::Dimensions);
-                    }
+                    && (d.len() < 2 || d.len() > MAX_DIMENSIONS || !dims_match(d, values.len()))
+                {
+                    return Err(EncodeError::Dimensions);
+                }
                 w.u8(t | 0x80 | if dimensions.is_some() { 0x40 } else { 0 });
                 w.array_len(values.len())?;
                 for v in values {
@@ -1457,20 +1606,35 @@ pub struct DataValue {
     pub status: Option<StatusCode>,
     /// When the source made the value, as a DateTime.
     pub source_timestamp: Option<i64>,
-    /// Picoseconds to add to the source timestamp.
+    /// What to add to the source timestamp, in units of 10 picoseconds,
+    /// up to [`MAX_PICOSECONDS`]. A reader reads a larger value as
+    /// [`MAX_PICOSECONDS`], and a writer writes one as it.
     pub source_picoseconds: Option<u16>,
     /// When the server saw the value, as a DateTime.
     pub server_timestamp: Option<i64>,
-    /// Picoseconds to add to the server timestamp.
+    /// What to add to the server timestamp, in units of 10 picoseconds,
+    /// up to [`MAX_PICOSECONDS`], as for the source.
     pub server_picoseconds: Option<u16>,
 }
 
 impl Binary for DataValue {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        r.nested(DataValue::decode_inner)
+        // The Variant in a DataValue may not hold another DataValue, at
+        // any depth.
+        r.nested(|r| {
+            r.data_values += 1;
+            let out = DataValue::decode_inner(r);
+            r.data_values -= 1;
+            out
+        })
     }
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.nested(|w| self.encode_inner(w))
+        w.nested(|w| {
+            w.data_values += 1;
+            let out = self.encode_inner(w);
+            w.data_values -= 1;
+            out
+        })
     }
 }
 
@@ -1488,16 +1652,16 @@ impl DataValue {
             d.status = Some(r.read()?);
         }
         if mask & 0x04 != 0 {
-            d.source_timestamp = Some(r.i64()?);
+            d.source_timestamp = Some(r.date_time()?);
         }
         if mask & 0x10 != 0 {
-            d.source_picoseconds = Some(r.u16()?);
+            d.source_picoseconds = Some(r.u16()?.min(MAX_PICOSECONDS));
         }
         if mask & 0x08 != 0 {
-            d.server_timestamp = Some(r.i64()?);
+            d.server_timestamp = Some(r.date_time()?);
         }
         if mask & 0x20 != 0 {
-            d.server_picoseconds = Some(r.u16()?);
+            d.server_picoseconds = Some(r.u16()?.min(MAX_PICOSECONDS));
         }
         Ok(d)
     }
@@ -1525,16 +1689,16 @@ impl DataValue {
             s.encode(w)?;
         }
         if let Some(t) = self.source_timestamp {
-            w.i64(t);
+            w.date_time(t);
         }
         if let Some(p) = self.source_picoseconds {
-            w.u16(p);
+            w.u16(p.min(MAX_PICOSECONDS));
         }
         if let Some(t) = self.server_timestamp {
-            w.i64(t);
+            w.date_time(t);
         }
         if let Some(p) = self.server_picoseconds {
-            w.u16(p);
+            w.u16(p.min(MAX_PICOSECONDS));
         }
         Ok(())
     }
@@ -1670,7 +1834,8 @@ pub enum ChunkError {
     /// A MSG chunk named a different channel or token from the chunks
     /// before it.
     Mismatch,
-    /// A MSG chunk's sequence number did not follow the one before it.
+    /// An OPN, CLO or MSG chunk's sequence number did not follow the one
+    /// before it on the connection.
     Sequence {
         /// The number that would have followed.
         expected: u32,
@@ -1787,6 +1952,9 @@ impl Chunk {
         let message_type = MessageType::from_code(code).ok_or(ChunkError::MessageType(code))?;
         let Some(&ct) = b.get(3) else { return Ok(None) };
         let chunk_type = match (ct, message_type) {
+            // For HEL, ACK, ERR and RHE the byte is reserved: senders write
+            // 'F' and receivers ignore it (Part 6, 7.1.2.2).
+            (_, t) if t.is_handshake() => ChunkType::Final,
             (b'F', _) => ChunkType::Final,
             (b'C', MessageType::Message) => ChunkType::Intermediate,
             (b'A', MessageType::Message) => ChunkType::Abort,
@@ -1987,15 +2155,21 @@ pub struct ReverseHello {
     pub endpoint_url: String,
 }
 
-/// The security header of an OPN chunk.
+/// The length of a receiver certificate thumbprint that is present.
+pub const THUMBPRINT_LEN: usize = 20;
+
+/// The security header of an OPN chunk. Readers and writers both check
+/// Part 6, 6.7.2.3: under policy None, where nothing is signed or
+/// encrypted, the certificate and thumbprint are null or empty, and under
+/// any policy a thumbprint is null, empty or [`THUMBPRINT_LEN`] bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AsymmetricHeader {
     /// The security policy's URI. A null one reads as empty.
     pub policy_uri: String,
-    /// The sender's certificate; `None` under policy None.
+    /// The sender's certificate; null or empty under policy None.
     pub sender_certificate: Option<Vec<u8>>,
-    /// The thumbprint of the receiver's certificate; `None` under policy
-    /// None.
+    /// The thumbprint of the receiver's certificate; null or empty under
+    /// policy None.
     pub receiver_thumbprint: Option<Vec<u8>>,
 }
 
@@ -2006,6 +2180,18 @@ impl AsymmetricHeader {
             policy_uri: SECURITY_POLICY_NONE.to_string(),
             sender_certificate: None,
             receiver_thumbprint: None,
+        }
+    }
+
+    /// The length of the first field that breaks Part 6's rules for this
+    /// policy, if any.
+    fn bad_length(&self) -> Option<usize> {
+        let len = |f: &Option<Vec<u8>>| f.as_ref().map_or(0, Vec::len);
+        let (cert, thumb) = (len(&self.sender_certificate), len(&self.receiver_thumbprint));
+        if self.policy_uri == SECURITY_POLICY_NONE {
+            [cert, thumb].into_iter().find(|&n| n != 0)
+        } else {
+            Some(thumb).filter(|&n| n != 0 && n != THUMBPRINT_LEN)
         }
     }
 }
@@ -2137,6 +2323,9 @@ impl SecureMessage {
         w.u32(self.channel_id);
         match &self.kind {
             SecureKind::Open(h) => {
+                if h.bad_length().is_some() {
+                    return Err(EncodeError::SecurityHeader);
+                }
                 w.string_max(Some(&h.policy_uri), MAX_POLICY_URI_LEN)?;
                 w.byte_string(h.sender_certificate.as_deref())?;
                 w.byte_string(h.receiver_thumbprint.as_deref())?;
@@ -2152,14 +2341,20 @@ impl SecureMessage {
         }
         let per_chunk = chunk_limit - overhead;
         let single = !matches!(self.kind, SecureKind::Message { .. });
-        let pieces: Vec<&[u8]> =
-            if self.body.is_empty() { vec![&[][..]] } else { self.body.chunks(per_chunk).collect() };
-        if (single && pieces.len() > 1) || pieces.len() > peer.chunk_count_limit() as usize {
+        // Count the chunks before making any, so a message that cannot be
+        // sent allocates nothing for them.
+        let count = if self.body.is_empty() { 1 } else { self.body.len().div_ceil(per_chunk) };
+        if (single && count > 1) || count > peer.chunk_count_limit() as usize {
             return Err(EncodeError::TooLong);
         }
-        let last = pieces.len() - 1;
-        let mut out = Vec::with_capacity(pieces.len());
-        for (i, piece) in pieces.iter().enumerate() {
+        let pieces: Box<dyn Iterator<Item = &[u8]>> = if self.body.is_empty() {
+            Box::new(std::iter::once(&[][..]))
+        } else {
+            Box::new(self.body.chunks(per_chunk))
+        };
+        let last = count - 1;
+        let mut out = Vec::with_capacity(count);
+        for (i, piece) in pieces.enumerate() {
             let mut body = Vec::with_capacity(security.len() + 8 + piece.len());
             body.extend_from_slice(&security);
             body.extend_from_slice(&self.sequence_number.wrapping_add(i as u32).to_le_bytes());
@@ -2178,7 +2373,6 @@ struct Partial {
     channel_id: u32,
     token_id: u32,
     first_sequence: u32,
-    last_sequence: u32,
     request_id: u32,
     body: Vec<u8>,
     chunks: u32,
@@ -2197,11 +2391,17 @@ fn decode_secure(message_type: MessageType, body: &[u8]) -> Result<SecureChunk, 
     let mut r = Reader::new(body);
     let channel_id = r.u32()?;
     let kind = match message_type {
-        MessageType::Open => SecureKind::Open(AsymmetricHeader {
-            policy_uri: r.string_max(MAX_POLICY_URI_LEN)?.unwrap_or_default(),
-            sender_certificate: r.byte_string()?,
-            receiver_thumbprint: r.byte_string()?,
-        }),
+        MessageType::Open => {
+            let h = AsymmetricHeader {
+                policy_uri: r.string_max(MAX_POLICY_URI_LEN)?.unwrap_or_default(),
+                sender_certificate: r.byte_string()?,
+                receiver_thumbprint: r.byte_string()?,
+            };
+            if let Some(n) = h.bad_length() {
+                return Err(DecodeError::Length(i32::try_from(n).unwrap_or(i32::MAX)));
+            }
+            SecureKind::Open(h)
+        }
         MessageType::Close => SecureKind::Close { token_id: r.u32()? },
         _ => SecureKind::Message { token_id: r.u32()? },
     };
@@ -2220,6 +2420,10 @@ fn follows(prev: u32, got: u32) -> bool {
 /// MSG back together. Feed it the bytes a connection reads, in order, and
 /// take messages out until it has none. After a Hello is answered, give it
 /// the negotiated [`Limits`] with [`Decoder::set_limits`].
+///
+/// One connection carries one secure channel, so the decoder checks that
+/// every OPN, CLO and MSG chunk's sequence number follows the one before
+/// it, across messages as well as within one (Part 6, 6.7.2.4).
 #[derive(Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -2228,6 +2432,8 @@ pub struct Decoder {
     start: usize,
     limits: Limits,
     partial: Option<Partial>,
+    /// The sequence number of the last secure chunk read.
+    last_sequence: Option<u32>,
     failed: Option<ChunkError>,
 }
 
@@ -2253,16 +2459,23 @@ impl Decoder {
         self.limits
     }
 
-    /// Adds bytes read from the connection. After a [`ChunkError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Adds bytes read from the connection, and returns how many it took.
+    /// It holds at most [`MAX_BUFFERED`] bytes not yet taken out, which is
+    /// room for any chunk, so it takes fewer than `bytes` only when that
+    /// much is waiting. Take messages out with [`Decoder::next_message`],
+    /// then feed it the rest. After a [`ChunkError`] the stream cannot be
+    /// read any further, and every byte is taken and dropped.
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
+        if self.start > 0 && (self.start >= self.buf.len() / 2 || self.buf.len() + n > MAX_BUFFERED) {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// How many bytes are held, waiting for the rest of a chunk.
@@ -2270,10 +2483,18 @@ impl Decoder {
         self.buf.len() - self.start
     }
 
+    /// Whether the stream so far ends where a message does: no bytes of a
+    /// chunk are held, and no MSG is waiting for its final chunk. A
+    /// connection that closes when this is false closed partway through a
+    /// message. It is false once the stream has broken.
+    pub fn is_between_messages(&self) -> bool {
+        self.failed.is_none() && self.partial.is_none() && self.buffered() == 0
+    }
+
     /// The next whole message, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. Besides what `feed` added, a decoder holds at
-    /// most one chunk and one message body, each within its limits.
+    /// stream has broken. A decoder holds at most [`MAX_BUFFERED`] bytes
+    /// fed but not taken out, and one message body within its limits.
     pub fn next_message(&mut self) -> Option<Result<Message, ChunkError>> {
         if let Some(e) = &self.failed {
             return Some(Err(e.clone()));
@@ -2306,6 +2527,11 @@ impl Decoder {
     fn take(&mut self, chunk: Chunk) -> Result<Option<Message>, ChunkError> {
         let t = chunk.message_type;
         let de = |e| ChunkError::Decode(t, e);
+        // An ERR may come at any time: the peer is closing the connection,
+        // and any MSG it was sending is dropped.
+        if t == MessageType::Error {
+            self.partial = None;
+        }
         if t != MessageType::Message && self.partial.is_some() {
             return Err(ChunkError::Interleaved);
         }
@@ -2352,6 +2578,12 @@ impl Decoder {
     }
 
     fn take_secure(&mut self, chunk_type: ChunkType, s: SecureChunk) -> Result<Option<Message>, ChunkError> {
+        if let Some(prev) = self.last_sequence
+            && !follows(prev, s.sequence_number)
+        {
+            return Err(ChunkError::Sequence { expected: prev.wrapping_add(1), got: s.sequence_number });
+        }
+        self.last_sequence = Some(s.sequence_number);
         let message_limit = self.limits.message_limit();
         let count_limit = self.limits.chunk_count_limit();
         let token_id = match s.kind {
@@ -2378,25 +2610,17 @@ impl Decoder {
                 if p.channel_id != s.channel_id || p.token_id != token_id {
                     return Err(ChunkError::Mismatch);
                 }
-                if !follows(p.last_sequence, s.sequence_number) {
-                    return Err(ChunkError::Sequence {
-                        expected: p.last_sequence.wrapping_add(1),
-                        got: s.sequence_number,
-                    });
-                }
                 p
             }
             None => Partial {
                 channel_id: s.channel_id,
                 token_id,
                 first_sequence: s.sequence_number,
-                last_sequence: s.sequence_number,
                 request_id: s.request_id,
                 body: Vec::new(),
                 chunks: 0,
             },
         };
-        partial.last_sequence = s.sequence_number;
         if chunk_type == ChunkType::Abort {
             let mut r = Reader::new(&s.rest);
             let de = |e| ChunkError::Decode(MessageType::Message, e);
@@ -2472,7 +2696,7 @@ impl Binary for RequestHeader {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(RequestHeader {
             authentication_token: r.read()?,
-            timestamp: r.i64()?,
+            timestamp: r.date_time()?,
             request_handle: r.u32()?,
             return_diagnostics: r.u32()?,
             audit_entry_id: r.string()?,
@@ -2482,7 +2706,7 @@ impl Binary for RequestHeader {
     }
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
         self.authentication_token.encode(w)?;
-        w.i64(self.timestamp);
+        w.date_time(self.timestamp);
         w.u32(self.request_handle);
         w.u32(self.return_diagnostics);
         w.string(self.audit_entry_id.as_deref())?;
@@ -2521,7 +2745,7 @@ impl Binary for Option<String> {
 impl Binary for ResponseHeader {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(ResponseHeader {
-            timestamp: r.i64()?,
+            timestamp: r.date_time()?,
             request_handle: r.u32()?,
             service_result: r.read()?,
             service_diagnostics: r.read()?,
@@ -2530,7 +2754,7 @@ impl Binary for ResponseHeader {
         })
     }
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.i64(self.timestamp);
+        w.date_time(self.timestamp);
         w.u32(self.request_handle);
         self.service_result.encode(w)?;
         self.service_diagnostics.encode(w)?;
@@ -2648,14 +2872,14 @@ impl Binary for ChannelSecurityToken {
         Ok(ChannelSecurityToken {
             channel_id: r.u32()?,
             token_id: r.u32()?,
-            created_at: r.i64()?,
+            created_at: r.date_time()?,
             revised_lifetime: r.u32()?,
         })
     }
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
         w.u32(self.channel_id);
         w.u32(self.token_id);
-        w.i64(self.created_at);
+        w.date_time(self.created_at);
         w.u32(self.revised_lifetime);
         Ok(())
     }
@@ -3023,16 +3247,10 @@ mod tests {
         }
         deep.extend_from_slice(&[6, 1, 0, 0, 0]);
         assert_eq!(decode::<Variant>(&deep), Err(DecodeError::Depth));
-        // DataValues count too.
-        let mut dv = Vec::new();
-        for _ in 0..MAX_DEPTH {
-            dv.extend_from_slice(&[23, 0x01]);
-        }
-        dv.push(0);
-        assert_eq!(decode::<Variant>(&dv), Err(DecodeError::Depth));
-        let mut diag = vec![0x40u8; 64];
+        let mut diag = vec![0x40u8; MAX_DEPTH];
         diag.push(0);
         assert_eq!(decode::<DiagnosticInfo>(&diag), Err(DecodeError::Depth));
+        assert!(decode::<DiagnosticInfo>(&diag[1..]).is_ok());
         // A failed read leaves the reader's depth where it was.
         let mut r = Reader::new(&deep);
         assert!(r.read::<Variant>().is_err());
@@ -3172,7 +3390,8 @@ mod tests {
         let l = Limits::default();
         assert_eq!(Chunk::parse(b"GET", &l), Err(ChunkError::MessageType(*b"GET")));
         assert_eq!(Chunk::parse(b"HE", &l), Ok(None));
-        assert_eq!(Chunk::parse(b"HELC", &l), Err(ChunkError::ChunkType(MessageType::Hello, b'C')));
+        // The fourth byte of a HEL, ACK, ERR or RHE is reserved and ignored.
+        assert_eq!(Chunk::parse(b"HELC", &l), Ok(None));
         assert_eq!(Chunk::parse(b"OPNC", &l), Err(ChunkError::ChunkType(MessageType::Open, b'C')));
         assert_eq!(Chunk::parse(b"CLOA", &l), Err(ChunkError::ChunkType(MessageType::Close, b'A')));
         assert_eq!(Chunk::parse(b"MSGX", &l), Err(ChunkError::ChunkType(MessageType::Message, b'X')));
@@ -3595,34 +3814,33 @@ mod tests {
     #[test]
     fn nested_values_count_toward_the_bound() {
         // A DiagnosticInfo nests one level per byte, and each level is a
-        // 72-byte box. An array of them, each 15 deep, once made a reader
-        // allocate far more than MAX_VALUES values from a short message.
+        // 72-byte box. An array of them, each deeply nested, once made a
+        // reader allocate far more than MAX_VALUES values from a short
+        // message.
         let per = MAX_DEPTH - 1;
         let n = MAX_VALUES / per + 1;
-        let mut bytes = vec![0x80 | type_id::DIAGNOSTIC_INFO];
-        bytes.extend_from_slice(&le32(n as u32));
+        let mut bytes = le32(n as u32).to_vec();
         for _ in 0..n {
-            bytes.extend_from_slice(&[0x40; MAX_DEPTH - 2]);
+            bytes.extend_from_slice(&vec![0x40; per - 1]);
             bytes.push(0);
         }
-        assert_eq!(decode::<Variant>(&bytes), Err(DecodeError::TooManyValues));
+        assert_eq!(Reader::new(&bytes).read_array::<DiagnosticInfo>(), Err(DecodeError::TooManyValues));
         // The writer stops at the same count as the reader.
         let mut deep = DiagnosticInfo::default();
         for _ in 1..per {
             deep = DiagnosticInfo { inner_diagnostic_info: Some(Box::new(deep)), ..Default::default() };
         }
-        let fill = |k: usize| Variant::Array {
-            type_id: type_id::DIAGNOSTIC_INFO,
-            values: vec![Value::DiagnosticInfo(Box::new(deep.clone())); k],
-            dimensions: None,
+        let fill = |k: usize| {
+            let mut w = Writer::new();
+            w.write_array(&vec![deep.clone(); k]).map(|()| w.into_bytes())
         };
-        // The outer Variant is one value, and each element is 1 + per.
-        let most = (MAX_VALUES - 1) / (1 + per);
-        let ok = encode(&fill(most)).unwrap();
-        assert!(decode::<Variant>(&ok).is_ok());
-        assert_eq!(encode(&fill(most + 1)), Err(EncodeError::TooManyValues));
-        // A DataValue chain counts each level too.
-        let mut r = Reader::new(&[23, 0x01, 23, 0x01, 0]);
+        // Each element is 1 + per values.
+        let most = MAX_VALUES / (1 + per);
+        let ok = fill(most).unwrap();
+        assert!(Reader::new(&ok).read_array::<DiagnosticInfo>().is_ok());
+        assert_eq!(fill(most + 1), Err(EncodeError::TooManyValues));
+        // A chain of Variant arrays counts each Variant and each element.
+        let mut r = Reader::new(&[0x98, 1, 0, 0, 0, 0x98, 1, 0, 0, 0, 0]);
         assert!(r.read::<Variant>().is_ok());
         assert_eq!(r.values, 5);
     }
@@ -3706,8 +3924,6 @@ mod tests {
                 body: ExtensionBody::Binary(vec![0]),
             })),
             Value::DataValue(Box::new(DataValue { status: Some(StatusCode(1)), ..Default::default() })),
-            Value::DiagnosticInfo(Box::new(DiagnosticInfo { symbolic_id: Some(1), ..Default::default() })),
-            Value::Reserved { type_id: 30, bytes: None },
         ]
     }
 
@@ -3715,7 +3931,7 @@ mod tests {
         Variant::Array {
             type_id: type_id::VARIANT,
             values: sample_values().into_iter().map(|v| Value::Variant(Box::new(Variant::Scalar(v)))).collect(),
-            dimensions: Some(vec![2, 13]),
+            dimensions: Some(vec![2, 12]),
         }
     }
 
@@ -3766,15 +3982,20 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_messages_in_linear_time() {
-        let one = msg(1, 1, 1, vec![1, 2, 3]).to_bytes(&Limits::default()).unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
+        let mut stream = Vec::new();
+        for seq in 0..100_000 {
+            stream.extend_from_slice(&msg(1, seq, 1, vec![1, 2, 3]).to_bytes(&Limits::default()).unwrap());
+        }
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
         let mut n = 0;
-        while let Some(m) = d.next_message() {
-            m.unwrap();
-            n += 1;
+        let mut rest = &stream[..];
+        while !rest.is_empty() {
+            rest = &rest[d.feed(rest)..];
+            while let Some(m) = d.next_message() {
+                m.unwrap();
+                n += 1;
+            }
         }
         assert_eq!(n, 100_000);
         assert_eq!(d.buffered(), 0);
@@ -3837,6 +4058,323 @@ mod tests {
         assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
     }
 
+    // Findings from review, each checked against Part 6 or Part 3.
+
+    #[test]
+    fn feed_holds_a_bounded_amount() {
+        let one = hel_bytes(8192, 8192, b"x");
+        let stream: Vec<u8> = one.iter().copied().cycle().take(MAX_BUFFERED + 1000 * one.len()).collect();
+        let mut d = Decoder::new();
+        let took = d.feed(&stream);
+        assert_eq!(took, MAX_BUFFERED);
+        assert_eq!(d.buffered(), MAX_BUFFERED);
+        assert_eq!(d.feed(&stream[took..]), 0);
+        // Taking a message out makes room again.
+        assert!(matches!(d.next_message(), Some(Ok(Message::Hello(_)))));
+        assert_eq!(d.feed(&stream[took..]), one.len());
+        assert!(d.buf.len() <= MAX_BUFFERED);
+    }
+
+    #[test]
+    fn single_chunk_messages_are_counted_before_they_are_split() {
+        // A header leaving one byte per chunk, and a 16 MiB body: refused
+        // without first making 16 million slices.
+        let policy = "urn:other".to_string();
+        let fixed = HEADER_LEN + 4 + (4 + policy.len()) + 4 + 4 + 8;
+        let header = AsymmetricHeader {
+            policy_uri: policy,
+            sender_certificate: Some(vec![0; MIN_BUFFER_SIZE as usize - fixed - 1]),
+            receiver_thumbprint: None,
+        };
+        let opn = SecureMessage {
+            kind: SecureKind::Open(header),
+            channel_id: 0,
+            sequence_number: 0,
+            request_id: 0,
+            body: vec![0; MAX_MESSAGE_SIZE as usize],
+        };
+        let started = std::time::Instant::now();
+        assert_eq!(opn.to_chunks(&Limits::default()), Err(EncodeError::TooLong));
+        assert!(started.elapsed().as_millis() < 500, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn sequence_numbers_follow_across_messages() {
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'F', 7, 1, 10, 1, b"a"));
+        d.feed(&msg_chunk(b'F', 7, 1, 10, 2, b"b"));
+        assert_eq!(
+            all(&mut d),
+            [Ok(msg(1, 10, 1, b"a".to_vec())), Err(ChunkError::Sequence { expected: 11, got: 10 })]
+        );
+        // OPN, then a MSG of two chunks, then a CLO, numbered in turn.
+        let mut d = Decoder::new();
+        let opn = Message::Secure(SecureMessage {
+            kind: SecureKind::Open(AsymmetricHeader::none()),
+            channel_id: 0,
+            sequence_number: 5,
+            request_id: 1,
+            body: vec![],
+        });
+        d.feed(&opn.to_bytes(&Limits::default()).unwrap());
+        d.feed(&msg(1, 6, 2, vec![0; 9000]).to_bytes(&Limits::default()).unwrap());
+        let clo = Message::Secure(SecureMessage {
+            kind: SecureKind::Close { token_id: 1 },
+            channel_id: 7,
+            sequence_number: 8,
+            request_id: 3,
+            body: vec![],
+        });
+        d.feed(&clo.to_bytes(&Limits::default()).unwrap());
+        assert!(all(&mut d).iter().all(Result::is_ok));
+        let mut d = Decoder::new();
+        d.feed(&opn.to_bytes(&Limits::default()).unwrap());
+        d.feed(&clo.to_bytes(&Limits::default()).unwrap());
+        assert_eq!(all(&mut d).last(), Some(&Err(ChunkError::Sequence { expected: 6, got: 8 })));
+    }
+
+    #[test]
+    fn a_decoder_says_whether_it_is_between_messages() {
+        let mut d = Decoder::new();
+        assert!(d.is_between_messages());
+        d.feed(&msg_chunk(b'C', 7, 1, 1, 5, b"part"));
+        assert_eq!(d.next_message(), None);
+        assert_eq!(d.buffered(), 0);
+        assert!(!d.is_between_messages());
+        d.feed(&msg_chunk(b'F', 7, 1, 2, 5, b"end"));
+        assert!(d.next_message().unwrap().is_ok());
+        assert!(d.is_between_messages());
+        d.feed(b"MSG");
+        assert!(!d.is_between_messages());
+    }
+
+    #[test]
+    fn an_error_message_ends_a_partial_message() {
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'C', 7, 1, 1, 5, b"part"));
+        let err = Message::Error(ErrorMessage { error: StatusCode::BAD_TCP_INTERNAL_ERROR, reason: "bye".into() });
+        d.feed(&err.to_bytes(&Limits::default()).unwrap());
+        assert_eq!(d.next_message(), Some(Ok(err)));
+        assert!(d.is_between_messages());
+    }
+
+    #[test]
+    fn variants_hold_no_diagnostic_infos_or_nested_data_values() {
+        // Part 6, 5.1.9.
+        assert_eq!(decode::<Variant>(&[0x19, 0]), Err(DecodeError::VariantType(25)));
+        assert_eq!(decode::<Variant>(&[0x99, 0, 0, 0, 0]), Err(DecodeError::VariantType(25)));
+        assert_eq!(decode::<Variant>(&[0x17, 0x01, 0x17, 0]), Err(DecodeError::VariantType(23)));
+        // Indirectly too: through an array of Variants.
+        assert_eq!(decode::<DataValue>(&[0x01, 0x98, 1, 0, 0, 0, 0x17, 0]), Err(DecodeError::VariantType(23)));
+        // A DataValue in a Variant that is not inside one is fine.
+        assert!(decode::<Variant>(&[0x17, 0x01, 0x06, 1, 0, 0, 0]).is_ok());
+        let diag = Variant::Scalar(Value::DiagnosticInfo(Box::default()));
+        assert_eq!(encode(&diag), Err(EncodeError::VariantType));
+        let inner = DataValue { value: Some(Variant::Null), ..Default::default() };
+        let outer = DataValue {
+            value: Some(Variant::Array {
+                type_id: type_id::VARIANT,
+                values: vec![Value::Variant(Box::new(Variant::Scalar(Value::DataValue(Box::new(inner.clone())))))],
+                dimensions: None,
+            }),
+            ..Default::default()
+        };
+        assert_eq!(encode(&outer), Err(EncodeError::VariantType));
+        assert!(encode(&Variant::Scalar(Value::DataValue(Box::new(inner)))).is_ok());
+    }
+
+    #[test]
+    fn variant_types_are_checked_before_the_array_length() {
+        // Part 6, 5.2.2.16: type 32 does not exist, even for an empty array.
+        assert_eq!(decode::<Variant>(&[0xa0, 0, 0, 0, 0]), Err(DecodeError::VariantType(32)));
+        // Encoders shall not use the reserved ids 26 to 31.
+        assert_eq!(
+            encode(&Variant::Scalar(Value::Reserved { type_id: 26, bytes: None })),
+            Err(EncodeError::VariantType)
+        );
+        let empty = Variant::Array { type_id: 27, values: vec![], dimensions: None };
+        assert_eq!(encode(&empty), Err(EncodeError::VariantType));
+        // Readers still take them.
+        assert!(decode::<Variant>(&[0x9b, 0, 0, 0, 0]).is_ok());
+    }
+
+    #[test]
+    fn a_hundred_levels_of_nesting_read() {
+        // Part 6, 5.1.9: decoders support at least 100 nesting levels.
+        const { assert!(MAX_DEPTH >= 100) };
+        let mut deep = Vec::new();
+        for _ in 0..99 {
+            deep.extend_from_slice(&[0x98, 1, 0, 0, 0]);
+        }
+        deep.extend_from_slice(&[6, 1, 0, 0, 0]);
+        let v = decode::<Variant>(&deep).unwrap();
+        assert_eq!(encode(&v).unwrap(), deep);
+    }
+
+    #[test]
+    fn node_id_and_qualified_name_limits() {
+        // Part 3, 8.2.4 and 8.3: lengths in characters, no C0 or C1.
+        let longest = NodeId::string(1, &"水".repeat(MAX_NODE_ID_LEN));
+        assert_eq!(decode::<NodeId>(&encode(&longest).unwrap()), Ok(longest));
+        assert_eq!(encode(&NodeId::string(1, &"a".repeat(MAX_NODE_ID_LEN + 1))), Err(EncodeError::TooLong));
+        let mut long = vec![0x03, 1, 0];
+        long.extend_from_slice(&le32(MAX_NODE_ID_LEN as u32 + 1));
+        long.extend_from_slice(&vec![b'a'; MAX_NODE_ID_LEN + 1]);
+        assert_eq!(decode::<NodeId>(&long), Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1)));
+        long[0] = 0x05;
+        assert_eq!(decode::<NodeId>(&long), Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1)));
+        let opaque = NodeId { namespace: 1, identifier: Identifier::Opaque(vec![0; MAX_NODE_ID_LEN + 1]) };
+        assert_eq!(encode(&opaque), Err(EncodeError::TooLong));
+        assert_eq!(encode(&NodeId::string(1, "a\nb")), Err(EncodeError::ControlChar));
+        assert_eq!(encode(&NodeId::string(1, "a\u{85}b")), Err(EncodeError::ControlChar));
+        assert_eq!(decode::<NodeId>(&[0x03, 1, 0, 3, 0, 0, 0, b'a', b'\n', b'b']), Err(DecodeError::ControlChar));
+        let q = QualifiedName { namespace: 0, name: "q".repeat(MAX_QUALIFIED_NAME_LEN + 1) };
+        assert_eq!(encode(&q), Err(EncodeError::TooLong));
+        let mut qb = vec![0, 0];
+        qb.extend_from_slice(&le32(MAX_QUALIFIED_NAME_LEN as u32 + 1));
+        qb.extend_from_slice(&vec![b'q'; MAX_QUALIFIED_NAME_LEN + 1]);
+        assert_eq!(decode::<QualifiedName>(&qb), Err(DecodeError::Length(MAX_QUALIFIED_NAME_LEN as i32 + 1)));
+        let ok = QualifiedName { namespace: 0, name: "q".repeat(MAX_QUALIFIED_NAME_LEN) };
+        assert_eq!(decode::<QualifiedName>(&encode(&ok).unwrap()), Ok(ok));
+        assert_eq!(encode(&QualifiedName { namespace: 0, name: "\t".into() }), Err(EncodeError::ControlChar));
+    }
+
+    #[test]
+    fn every_null_node_id_is_null() {
+        // Part 3, 8.2.4, Table 24.
+        assert!(NodeId::string(0, "").is_null());
+        assert!(NodeId { namespace: 0, identifier: Identifier::Guid(Guid::default()) }.is_null());
+        assert!(NodeId { namespace: 0, identifier: Identifier::Opaque(vec![]) }.is_null());
+        assert!(!NodeId::string(1, "").is_null());
+        assert!(!NodeId::numeric(0, 1).is_null());
+    }
+
+    #[test]
+    fn expanded_node_ids_with_a_uri_write_namespace_zero() {
+        // Part 6, 5.2.2.10.
+        let e =
+            ExpandedNodeId { node_id: NodeId::numeric(7, 42), namespace_uri: Some("urn:x".into()), server_index: 0 };
+        let bytes = encode(&e).unwrap();
+        assert_eq!(bytes[..2], [0x80, 42]);
+        let back = decode::<ExpandedNodeId>(&bytes).unwrap();
+        assert_eq!(back.node_id, NodeId::numeric(0, 42));
+        // A namespace index sent beside a URI reads as 0.
+        assert_eq!(
+            decode::<ExpandedNodeId>(&[0x81, 7, 42, 0, 1, 0, 0, 0, b'u']).unwrap().node_id,
+            NodeId::numeric(0, 42)
+        );
+        // An empty URI is left off.
+        let empty =
+            ExpandedNodeId { node_id: NodeId::numeric(0, 42), namespace_uri: Some(String::new()), server_index: 0 };
+        assert_eq!(encode(&empty).unwrap(), [0, 42]);
+        assert_eq!(decode::<ExpandedNodeId>(&[0x80, 42, 0, 0, 0, 0]).unwrap().namespace_uri, None);
+    }
+
+    #[test]
+    fn picoseconds_stay_below_ten_thousand() {
+        // Part 6, 5.2.2.17.
+        let bytes = [0x14, 1, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
+        assert_eq!(decode::<DataValue>(&bytes).unwrap().source_picoseconds, Some(MAX_PICOSECONDS));
+        let d = DataValue { server_timestamp: Some(1), server_picoseconds: Some(10_000), ..Default::default() };
+        let out = encode(&d).unwrap();
+        assert_eq!(out[out.len() - 2..], MAX_PICOSECONDS.to_le_bytes());
+    }
+
+    #[test]
+    fn policy_none_carries_no_certificate_or_thumbprint() {
+        // Part 6, 6.7.2.3: an unsigned message has no sender certificate,
+        // and a thumbprint is empty when nothing is encrypted.
+        let opn = |h: AsymmetricHeader| {
+            Message::Secure(SecureMessage {
+                kind: SecureKind::Open(h),
+                channel_id: 0,
+                sequence_number: 1,
+                request_id: 1,
+                body: vec![],
+            })
+        };
+        for h in [
+            AsymmetricHeader { sender_certificate: Some(vec![1]), ..AsymmetricHeader::none() },
+            AsymmetricHeader { receiver_thumbprint: Some(vec![1]), ..AsymmetricHeader::none() },
+            AsymmetricHeader {
+                policy_uri: "urn:p".into(),
+                receiver_thumbprint: Some(vec![1]),
+                sender_certificate: None,
+            },
+        ] {
+            assert_eq!(opn(h.clone()).to_bytes(&Limits::default()), Err(EncodeError::SecurityHeader));
+            // The same header, written by hand, does not read.
+            let good = opn(AsymmetricHeader { policy_uri: h.policy_uri.clone(), ..AsymmetricHeader::none() });
+            let mut bytes = good.to_bytes(&Limits::default()).unwrap();
+            let at = 12 + 4 + h.policy_uri.len();
+            let mut fields = Writer::new();
+            fields.byte_string(h.sender_certificate.as_deref()).unwrap();
+            fields.byte_string(h.receiver_thumbprint.as_deref()).unwrap();
+            bytes.splice(at..at + 8, fields.into_bytes());
+            let size = bytes.len() as u32;
+            bytes[4..8].copy_from_slice(&le32(size));
+            let mut d = Decoder::new();
+            d.feed(&bytes);
+            assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Open, DecodeError::Length(1)))));
+        }
+        // Empty fields, and a 20-byte thumbprint under another policy, are fine.
+        let empty = AsymmetricHeader {
+            sender_certificate: Some(vec![]),
+            receiver_thumbprint: Some(vec![]),
+            ..AsymmetricHeader::none()
+        };
+        let bytes = opn(empty.clone()).to_bytes(&Limits::default()).unwrap();
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        assert_eq!(d.next_message(), Some(Ok(opn(empty))));
+        let signed = AsymmetricHeader {
+            policy_uri: "urn:p".into(),
+            sender_certificate: Some(vec![1; 30]),
+            receiver_thumbprint: Some(vec![2; THUMBPRINT_LEN]),
+        };
+        assert!(opn(signed).to_bytes(&Limits::default()).is_ok());
+    }
+
+    #[test]
+    fn connection_messages_ignore_the_reserved_byte() {
+        // Part 6, 7.1.2.2: receivers ignore the fourth byte of a HEL.
+        let mut hel = hel_bytes(8192, 8192, b"x");
+        hel[3] = 0;
+        let mut d = Decoder::new();
+        d.feed(&hel);
+        let Some(Ok(m)) = d.next_message() else { panic!() };
+        // Writers still write 'F'.
+        assert_eq!(m.to_bytes(&Limits::default()).unwrap()[3], b'F');
+    }
+
+    #[test]
+    fn nans_are_written_quiet() {
+        // Part 6, 5.2.2.3.
+        let f = encode(&Variant::Scalar(Value::Float(f32::from_bits(0x7f80_0001)))).unwrap();
+        assert_eq!(f[1..], [0, 0, 0xc0, 0xff]);
+        let d = encode(&Variant::Scalar(Value::Double(f64::from_bits(0x7ff0_0000_0000_0001)))).unwrap();
+        assert_eq!(d[1..], [0, 0, 0, 0, 0, 0, 0xf8, 0xff]);
+        assert_eq!(encode(&Variant::Scalar(Value::Float(1.5))).unwrap()[1..], 1.5f32.to_le_bytes());
+    }
+
+    #[test]
+    fn date_times_are_bounded() {
+        // Part 6, 5.2.2.5.
+        assert_eq!(encode(&Variant::Scalar(Value::DateTime(-1))).unwrap()[1..], [0; 8]);
+        assert_eq!(encode(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME))).unwrap()[1..], i64::MAX.to_le_bytes());
+        assert_eq!(
+            encode(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME - 1))).unwrap()[1..],
+            (MAX_DATE_TIME - 1).to_le_bytes()
+        );
+        // An Int64 is written as it is.
+        assert_eq!(encode(&Variant::Scalar(Value::Int64(-1))).unwrap()[1..], [0xff; 8]);
+        let mut b = vec![13];
+        b.extend_from_slice(&(-5i64).to_le_bytes());
+        assert_eq!(decode::<Variant>(&b), Ok(Variant::Scalar(Value::DateTime(0))));
+        let h = RequestHeader { timestamp: -9, ..Default::default() };
+        assert_eq!(encode(&h).unwrap()[2..10], [0; 8]);
+    }
+
     struct Lcg(u64);
 
     impl Lcg {
@@ -3851,12 +4389,20 @@ mod tests {
 
     /// Reads a value, and if it reads and writes, checks that the bytes
     /// written read back and write the same.
+    /// Reads a value, and if it reads, checks that it writes, unless it
+    /// holds a reserved Variant type only readers take, and that the bytes
+    /// written read back and write the same.
     fn round_trip<T: Binary>(b: &[u8]) {
-        if let Ok(v) = decode::<T>(b)
-            && let Ok(out) = encode(&v) {
-                let back: T = decode(&out).expect("written bytes read back");
-                assert_eq!(encode(&back).unwrap(), out);
+        if let Ok(v) = decode::<T>(b) {
+            match encode(&v) {
+                Ok(out) => {
+                    let back: T = decode(&out).expect("written bytes read back");
+                    assert_eq!(encode(&back).unwrap(), out);
+                }
+                Err(EncodeError::VariantType) => {}
+                Err(e) => panic!("a value read does not write: {e}"),
             }
+        }
     }
 
     #[test]
@@ -3919,13 +4465,14 @@ mod tests {
                 d.feed(&out);
                 assert_eq!(d.next_message().as_ref(), Some(&Ok(m.clone())));
                 if let Message::Secure(s) = m
-                    && let Ok(service) = Service::parse(&s.body) {
-                        let body = service.to_bytes().expect("a service read can be written");
-                        assert_eq!(Service::parse(&body), Ok(service.clone()));
-                        if let Service::Other { body, .. } = service {
-                            round_trip::<Variant>(&body);
-                        }
+                    && let Ok(service) = Service::parse(&s.body)
+                {
+                    let body = service.to_bytes().expect("a service read can be written");
+                    assert_eq!(Service::parse(&body), Ok(service.clone()));
+                    if let Service::Other { body, .. } = service {
+                        round_trip::<Variant>(&body);
                     }
+                }
             }
 
             // The same bytes as values.
@@ -3937,10 +4484,10 @@ mod tests {
             round_trip::<LocalizedText>(&b);
             round_trip::<ExtensionObject>(&b);
             round_trip::<ResponseHeader>(&b);
-            if let Ok(s) = Service::parse(&b)
-                && let Ok(out) = s.to_bytes() {
-                    assert_eq!(Service::parse(&out), Ok(s));
-                }
+            if let Ok(s) = Service::parse(&b) {
+                let out = s.to_bytes().expect("a service read can be written");
+                assert_eq!(Service::parse(&out), Ok(s));
+            }
             // Every value at every offset, one byte at a time through a reader.
             let mut r = Reader::new(&b);
             while r.remaining() > 0 {

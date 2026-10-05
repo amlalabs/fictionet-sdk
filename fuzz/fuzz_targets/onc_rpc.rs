@@ -3,7 +3,8 @@
 #![no_main]
 
 use fictionet::stdlib::onc_rpc::{
-    AuthSys, Body, Decoder, Message, PortmapRequest, Reader, RpcbRequest, encode_fragments, parse_dump,
+    AuthSys, Body, Decoder, MAX_ARRAY_RESERVE, Message, PortmapRequest, Reader, RpcbRequest, encode_fragments,
+    parse_dump,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -25,16 +26,20 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     assert_eq!(records, again);
+    // A drained decoder holds at most one record's worth, and both agree
+    // on whether the stream stopped inside a record.
+    assert!(whole.buffered() <= limit + 4);
+    assert!(bytewise.buffered() <= limit + 4);
+    assert_eq!(whole.mid_record(), bytewise.mid_record());
     assert_eq!(whole.next_record(), bytewise.next_record());
 
     // Each record, and the bytes on their own as a UDP datagram.
     for bytes in records.iter().map(Vec::as_slice).chain([data]) {
         // A record written in fragments reads back the same.
-        if bytes.len() <= limit {
-            let mut d = Decoder::with_limit(limit);
-            d.feed(&encode_fragments(bytes, 7));
-            assert_eq!(d.next_record(), Some(Ok(bytes.to_vec())));
-        }
+        let mut d = if bytes.len() <= limit { Decoder::with_limit(limit) } else { Decoder::new() };
+        d.feed(&encode_fragments(bytes, 7));
+        assert_eq!(d.next_record(), Some(Ok(bytes.to_vec())));
+        assert!(!d.mid_record());
         let Ok(m) = Message::parse(bytes) else { continue };
         // A message read writes back as the same bytes.
         assert_eq!(m.to_bytes(), bytes);
@@ -54,4 +59,9 @@ fuzz_target!(|data: &[u8]| {
     let _ = parse_dump(data);
     let mut r = Reader::new(data);
     let _ = r.array(64, |r| r.optional(|r| r.opaque(256).map(<[u8]>::to_vec)));
+    // Items of no bytes: a count over MAX_ARRAY_RESERVE still needs 4 bytes
+    // an item.
+    if let Ok(v) = Reader::new(data).array(usize::MAX, |r| r.opaque_fixed(0)) {
+        assert!(v.len() <= MAX_ARRAY_RESERVE.max(data.len() / 4));
+    }
 });
