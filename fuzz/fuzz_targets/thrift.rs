@@ -1,8 +1,11 @@
 //! Thrift frames, messages and values in the binary and compact protocols,
 //! as a world playing a Thrift server reads them.
 #![no_main]
+#![allow(deprecated)] // Also exercise the compatibility decoder.
 
-use fictionet::stdlib::thrift::{Decoder, Error, Message, Protocol, StreamDecoder, Type, Value};
+use fictionet::stdlib::thrift::{Frame, Decoder, Error, Message, Protocol, StreamDecoder, Type, Value};
+use fictionet::stdlib::codec::{contract, Decode};
+use fictionet::stdlib::thrift::Frames;
 use libfuzzer_sys::fuzz_target;
 
 const TYPES: [Type; 12] = [
@@ -29,6 +32,11 @@ fn rewrites(m: &Message, protocol: Protocol) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Frame>(data);
+    contract::check_decode(|| Frames.map(|frame| Message::parse(&frame.0)), data);
+    contract::check_wire_value(&Frame(data.iter().take(fictionet::stdlib::thrift::MAX_FRAME + 1).copied().collect()));
+
     // The stream, split two ways: all at once, and a byte at a time.
     let mut whole = Decoder::new();
     whole.feed(data);

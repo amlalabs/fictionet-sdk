@@ -26,7 +26,12 @@
 //! bytes a decoder holds, the stream bytes held across all open requests,
 //! and the number of requests open at once.
 //!
+//! New streams use [`Frames`] with [`super::codec::Stream`] for bounded
+//! input and explicit EOF handling. The example below uses the compatibility
+//! decoder, which keeps its original feed behavior.
+//!
 //! ```
+//! # #![allow(deprecated)]
 //! use fictionet::stdlib::fastcgi::{Decoder, Request, Role, Server, ServerEvent};
 //!
 //! // What a web server sends for GET /hello: two parameters and no body.
@@ -65,7 +70,10 @@
 //! assert_eq!(reply[..8], [1, 6, 0, 1, 0, 33, 7, 0]);
 //! ```
 
-use std::collections::BTreeMap;
+extern crate alloc;
+
+use alloc::{collections::BTreeMap, vec::Vec};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port FastCGI applications such as PHP-FPM listen on by
 /// convention. The specification names no port.
@@ -178,8 +186,8 @@ pub enum RecordError {
     TooLong,
 }
 
-impl std::fmt::Display for RecordError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for RecordError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             RecordError::Version(v) => write!(f, "FastCGI version {v}, not 1"),
             RecordError::TooLong => write!(f, "more than {MAX_BUFFERED} bytes buffered"),
@@ -187,7 +195,7 @@ impl std::fmt::Display for RecordError {
     }
 }
 
-impl std::error::Error for RecordError {}
+impl core::error::Error for RecordError {}
 
 impl Record {
     /// A record carrying `content`, padded to a multiple of 8 bytes as the
@@ -281,10 +289,182 @@ impl Record {
     }
 }
 
+/// Why an exact [`Wire`] parse did not read one complete FastCGI record.
+/// [`Record::parse`] keeps its prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordParseError {
+    /// The record header is invalid.
+    Record(RecordError),
+    /// The input ended before a complete record, including empty input.
+    Truncated,
+    /// Bytes follow the first complete record.
+    Trailing,
+}
+
+impl core::fmt::Display for RecordParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Record(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete FastCGI record"),
+            Self::Trailing => f.write_str("bytes follow the FastCGI record"),
+        }
+    }
+}
+
+impl core::error::Error for RecordParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Record(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+/// Why a record cannot be written without losing content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecordWriteError {
+    /// The content exceeds [`MAX_CONTENT`] bytes.
+    TooLong,
+}
+
+impl core::fmt::Display for RecordWriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "record content exceeds {MAX_CONTENT} bytes")
+    }
+}
+
+impl core::error::Error for RecordWriteError {}
+
+impl Wire for Record {
+    type ParseError = RecordParseError;
+    type WriteError = RecordWriteError;
+
+    fn parse(b: &[u8]) -> Result<Self, RecordParseError> {
+        match Self::parse(b).map_err(RecordParseError::Record)? {
+            Some((record, used)) if used == b.len() => Ok(record),
+            Some(_) => Err(RecordParseError::Trailing),
+            None => Err(RecordParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_RECORD`] bytes. Leaves `out` unchanged on error.
+    /// Unlike [`Record::to_bytes`], this refuses content that would be clipped.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), RecordWriteError> {
+        if self.content.len() > MAX_CONTENT {
+            return Err(RecordWriteError::TooLong);
+        }
+        out.extend_from_slice(&self.to_bytes());
+        Ok(())
+    }
+}
+
+/// Why a bounded FastCGI frame stream cannot continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The record header is invalid.
+    Record(RecordError),
+    /// The record exceeds the configured limit, including padding.
+    TooLong {
+        /// The record length, including its header and padding.
+        length: usize,
+        /// The maximum accepted record length.
+        limit: usize,
+    },
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Record(e) => e.fmt(f),
+            Self::TooLong { length, limit } => write!(f, "record length {length} exceeds {limit}"),
+        }
+    }
+}
+
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Record(e) => Some(e),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
+
+/// Reads FastCGI records without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`Self::limit`].
+/// Partial records return [`Step::Need`], including at EOF. The stream reports
+/// truncation at EOF and framing errors once. Body parsing stays separate.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Accepts records up to [`MAX_RECORD`] bytes, including padding.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_RECORD)
+    }
+
+    /// Sets the record limit, including its header and padding.
+    /// Clamps it to [`HEADER_LEN`] through [`MAX_RECORD`]. The header alone
+    /// suffices to refuse an oversized record.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.clamp(HEADER_LEN, MAX_RECORD) }
+    }
+
+    /// The maximum record length, including its header and padding.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Record;
+    type Error = FrameError;
+    const NAME: &'static str = "FastCGI";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Record>, FrameError> {
+        if let Some(&version) = input.first()
+            && version != VERSION
+        {
+            return Err(FrameError::Record(RecordError::Version(version)));
+        }
+        if let Some(&[_, _, _, _, hi, lo, padding, _]) = input.get(..HEADER_LEN) {
+            // The two length fields bound this sum by MAX_RECORD.
+            let length = HEADER_LEN
+                .saturating_add(usize::from(u16::from_be_bytes([hi, lo])))
+                .saturating_add(usize::from(padding));
+            if length > self.limit {
+                return Err(FrameError::TooLong { length, limit: self.limit });
+            }
+        }
+        Ok(match Record::parse(input).map_err(FrameError::Record)? {
+            Some((record, used)) => Step::Item(record, used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a FastCGI byte stream into records. Feed it the bytes a
 /// connection reads, in order, and take records out until it has none.
 /// It holds at most [`MAX_BUFFERED`] bytes that have not been taken out.
+///
+/// This compatibility decoder keeps its original feed limits and repeated
+/// errors. Use [`Frames`] with [`super::codec::Stream`] for counted input
+/// and errors reported once.
 #[derive(Clone, Debug, Default)]
+#[deprecated(note = "use codec::Stream with fastcgi::Frames for bounded input")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -294,6 +474,7 @@ pub struct Decoder {
     failed: Option<RecordError>,
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -352,13 +533,13 @@ impl Decoder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyError;
 
-impl std::fmt::Display for BodyError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for BodyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("record body is not 8 bytes")
     }
 }
 
-impl std::error::Error for BodyError {}
+impl core::error::Error for BodyError {}
 
 /// The role a request asks the application to play. Roles compare by
 /// number, so `Role::Other(1)` equals `Role::Responder`.
@@ -532,8 +713,8 @@ pub enum PairError {
     TooMany,
 }
 
-impl std::fmt::Display for PairError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for PairError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             PairError::Truncated => f.write_str("name and value pair runs past the end"),
             PairError::TooMany => write!(f, "more than {MAX_PAIRS} name and value pairs"),
@@ -541,7 +722,7 @@ impl std::fmt::Display for PairError {
     }
 }
 
-impl std::error::Error for PairError {}
+impl core::error::Error for PairError {}
 
 /// Reads name and value pairs. Each pair is the name's length, the
 /// value's length, the name and the value. A length below 128 takes one
@@ -860,8 +1041,8 @@ impl StreamError {
     }
 }
 
-impl std::fmt::Display for StreamError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             StreamError::Body { id, kind } => write!(f, "request {id}: malformed body in record type {kind}"),
             StreamError::UnknownRole { id, role } => write!(f, "request {id}: unknown role {role}"),
@@ -878,7 +1059,7 @@ impl std::fmt::Display for StreamError {
     }
 }
 
-impl std::error::Error for StreamError {}
+impl core::error::Error for StreamError {}
 
 /// What a [`Server`] makes of a record, when it makes something of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1216,6 +1397,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
 

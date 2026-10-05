@@ -29,7 +29,12 @@
 //! below, because the agent can send any bytes it likes. Every writer
 //! checks the same limits, so what it writes always reads back.
 //!
+//! New streams use [`Frames`] with [`super::codec::Stream`] for bounded
+//! input and explicit EOF handling. The example below uses the compatibility
+//! decoder, which keeps its original feed behavior.
+//!
 //! ```
+//! # #![allow(deprecated)]
 //! use fictionet::stdlib::thrift::{exception_kind, field, Decoder, Field, Message, Protocol, Value};
 //!
 //! /// A calculator service with one method: i32 add(1: i32 a, 2: i32 b).
@@ -63,6 +68,11 @@
 //!     ]
 //! );
 //! ```
+
+extern crate alloc;
+
+use alloc::{string::String, vec, vec::Vec};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port Thrift servers commonly listen on.
 pub const PORT: u16 = 9090;
@@ -529,8 +539,8 @@ pub enum Error {
     TooLong,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Truncated => write!(f, "the bytes end inside a message or value"),
             Error::BadProtocol(b) => write!(f, "first byte {b:#04x} is not a Thrift message"),
@@ -548,7 +558,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Why a value or message cannot be written so that it reads back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,8 +573,8 @@ pub enum WriteError {
     Mismatch,
 }
 
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             WriteError::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
             WriteError::TooMany => write!(f, "more than {MAX_VALUES} values"),
@@ -574,7 +584,7 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-impl std::error::Error for WriteError {}
+impl core::error::Error for WriteError {}
 
 /// Why bytes are not a frame. The connection holds no more frames a
 /// reader can find, and a real server closes it.
@@ -584,15 +594,15 @@ pub enum FrameError {
     Length(i32),
 }
 
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             FrameError::Length(n) => write!(f, "frame length {n}, outside 0..={MAX_FRAME}"),
         }
     }
 }
 
-impl std::error::Error for FrameError {}
+impl core::error::Error for FrameError {}
 
 /// `payload` in a frame: its length, then its bytes.
 pub fn frame(payload: &[u8]) -> Result<Vec<u8>, WriteError> {
@@ -623,10 +633,110 @@ pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
     }
 }
 
+/// A framed Thrift payload, bounded by [`MAX_FRAME`].
+///
+/// [`Wire::parse`] reads exactly one length-prefixed frame. Use
+/// [`Message::parse`] to read its payload and identify the message protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// Payload bytes without the four-byte length prefix.
+    pub Vec<u8>,
+);
+
+/// Why an exact [`Wire`] parse did not read one complete Thrift frame.
+/// [`parse_frame`] keeps its prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame header is invalid.
+    Frame(FrameError),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete Thrift frame"),
+            Self::Trailing => f.write_str("bytes follow the Thrift frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = WriteError;
+
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match parse_frame(b).map_err(FrameParseError::Frame)? {
+            Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`FRAME_HEADER_LEN`] plus [`MAX_FRAME`] bytes.
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        out.extend_from_slice(&frame(&self.0)?);
+        Ok(())
+    }
+}
+
+/// Reads framed Thrift payloads without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
+/// plus [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// The stream reports truncation at EOF and framing errors once. Map frames
+/// through [`Message::parse`] to receive body errors as items.
+/// This reads framed transport; [`StreamDecoder`] reads unframed transport.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "Thrift framed transport";
+
+    fn capacity(&self) -> usize {
+        FRAME_HEADER_LEN.saturating_add(MAX_FRAME)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match parse_frame(input)? {
+            Some((payload, used)) => Step::Item(Frame(payload.to_vec()), used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a framed Thrift byte stream into frame payloads. Feed it the
 /// bytes a connection reads, in order, and take payloads out until it has
 /// none. Each payload is usually one [`Message`].
+///
+/// This compatibility decoder keeps every byte fed until it is taken out
+/// or a framing error clears the buffer. Use [`Frames`] with
+/// [`super::codec::Stream`] for bounded input and errors reported once.
 #[derive(Clone, Debug, Default)]
+#[deprecated(note = "use codec::Stream with thrift::Frames for bounded input")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -636,6 +746,7 @@ pub struct Decoder {
     failed: Option<FrameError>,
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -1391,6 +1502,7 @@ impl<'o> Writer<'o> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
 

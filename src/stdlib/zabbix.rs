@@ -25,7 +25,12 @@
 //! likes. A decoder takes a size limit and refuses a packet whose data
 //! would pass it, before the data comes.
 //!
+//! New streams use [`Frames`] with [`super::codec::Stream`] for bounded
+//! input and explicit EOF handling. The example below uses the compatibility
+//! decoder, which keeps its original feed behavior.
+//!
 //! ```
+//! # #![allow(deprecated)]
 //! use fictionet::stdlib::zabbix::{Decoder, Kind, Message};
 //!
 //! // What zabbix_sender sends for one value.
@@ -48,6 +53,11 @@
 //! assert_eq!(&bytes[..5], b"ZBXD\x01");
 //! assert_eq!(&bytes[13..], br#"{"response":"success","info":"processed: 1; failed: 0; total: 1"}"#);
 //! ```
+
+extern crate alloc;
+
+use alloc::{format, string::{String, ToString}, vec::Vec};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
 pub const AGENT_PORT: u16 = 10050;
@@ -106,8 +116,8 @@ pub enum PacketError {
     },
 }
 
-impl std::fmt::Display for PacketError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             PacketError::Magic => f.write_str("packet does not start with ZBXD"),
             PacketError::Flags(b) => write!(f, "flags byte {b:#04x} is not a Zabbix protocol packet"),
@@ -119,7 +129,7 @@ impl std::fmt::Display for PacketError {
     }
 }
 
-impl std::error::Error for PacketError {}
+impl core::error::Error for PacketError {}
 
 /// A packet header: the flags and the two lengths that follow `ZBXD`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,9 +277,135 @@ impl Packet {
     }
 }
 
+/// Why an exact [`Wire`] parse did not read one complete Zabbix packet.
+/// [`Packet::parse`] keeps its prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// The packet header is invalid.
+    Packet(PacketError),
+    /// The input ended before a complete packet, including empty input.
+    Truncated,
+    /// Bytes follow the first complete packet.
+    Trailing,
+}
+
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete Zabbix packet"),
+            Self::Trailing => f.write_str("bytes follow the Zabbix packet"),
+        }
+    }
+}
+
+impl core::error::Error for PacketParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Packet(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = PacketError;
+
+    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
+        match Self::parse(b).map_err(PacketParseError::Packet)? {
+            Some((packet, used)) if used == b.len() => Ok(packet),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Truncated),
+        }
+    }
+
+    /// Appends a header and at most [`MAX_DATA`] data bytes.
+    /// Refuses invalid flags and oversized data or reserved lengths before
+    /// changing `out`. Unlike [`Packet::to_bytes`], this never clips or
+    /// changes flags. Compressed data remains unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+        if self.flags & flags::PROTOCOL == 0 || self.flags & !flags::KNOWN != 0 {
+            return Err(PacketError::Flags(self.flags));
+        }
+        if self.data.len() > MAX_DATA {
+            return Err(PacketError::TooLarge {
+                len: u64::try_from(self.data.len()).unwrap_or(u64::MAX),
+                limit: MAX_DATA,
+            });
+        }
+        if self.reserved > MAX_DATA as u64 {
+            return Err(PacketError::ReservedTooLarge { len: self.reserved, limit: MAX_DATA });
+        }
+        // MAX_DATA fits in both header widths, so no flags change here.
+        let header = Header { flags: self.flags, data_len: self.data.len() as u64, reserved: self.reserved };
+        out.extend_from_slice(&header.to_bytes());
+        out.extend_from_slice(&self.data);
+        Ok(())
+    }
+}
+
+/// Reads Zabbix packets without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`LARGE_HEADER_LEN`]
+/// plus [`Self::limit`]. Partial packets return [`Step::Need`], including at
+/// EOF. The stream reports truncation at EOF and framing errors once.
+/// Compressed payloads remain bytes. Body parsing stays separate.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Accepts packets with data and reserved lengths up to [`DEFAULT_LIMIT`].
+    pub fn new() -> Self {
+        Self::with_limit(DEFAULT_LIMIT)
+    }
+
+    /// Sets the data and reserved length limit, clamped to [`MAX_DATA`].
+    /// Zero accepts only empty data and a zero reserved length. Oversized
+    /// lengths are refused from the header, before the data arrives.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_DATA) }
+    }
+
+    /// The maximum data and reserved length, excluding the header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = PacketError;
+    const NAME: &'static str = "Zabbix";
+
+    fn capacity(&self) -> usize {
+        LARGE_HEADER_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+        Ok(match Packet::parse_limited(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a Zabbix byte stream into packets. Feed it the bytes a
 /// connection reads, in order, and take packets out until it has none.
+///
+/// This compatibility decoder keeps every byte fed until it is taken out
+/// or a framing error clears the buffer. Use [`Frames`] with
+/// [`super::codec::Stream`] for bounded input and errors reported once.
 #[derive(Clone, Debug)]
+#[deprecated(note = "use codec::Stream with zabbix::Frames for bounded input")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -280,12 +416,14 @@ pub struct Decoder {
     failed: Option<PacketError>,
 }
 
+#[allow(deprecated)]
 impl Default for Decoder {
     fn default() -> Decoder {
         Decoder::new()
     }
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes, which refuses data over
     /// [`DEFAULT_LIMIT`] bytes.
@@ -382,8 +520,8 @@ pub enum MessageError {
     TooLong,
 }
 
-impl std::fmt::Display for MessageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for MessageError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             MessageError::Utf8 => f.write_str("message is not UTF-8"),
             MessageError::Syntax(at) => write!(f, "malformed JSON at byte {at}"),
@@ -395,7 +533,7 @@ impl std::fmt::Display for MessageError {
     }
 }
 
-impl std::error::Error for MessageError {}
+impl core::error::Error for MessageError {}
 
 /// One value `zabbix_sender` sends: which host and item it is for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -444,7 +582,7 @@ impl Message {
         if data.len() > MAX_DATA {
             return Err(MessageError::TooLong);
         }
-        let json = std::str::from_utf8(data).map_err(|_| MessageError::Utf8)?;
+        let json = core::str::from_utf8(data).map_err(|_| MessageError::Utf8)?;
         let (request, response) = scan(json.as_bytes())?;
         let kind = match (request, response) {
             (Some(r), _) => match r.as_str() {
@@ -704,7 +842,7 @@ fn claim(key: String, seen: &mut [bool; 2]) -> Option<String> {
         "response" => &mut seen[1],
         _ => return None,
     };
-    if std::mem::replace(slot, true) { None } else { Some(key) }
+    if core::mem::replace(slot, true) { None } else { Some(key) }
 }
 
 struct Scanner<'a> {
@@ -859,6 +997,7 @@ impl Scanner<'_> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
 
