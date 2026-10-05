@@ -553,7 +553,7 @@ pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
         packet.payload.get(..3) == Some(&[2, 0xf0, 0x80]),
         "RDP data TPDU",
     )?;
-    match packet.tpdu().map_err(Error::Cotp)? {
+    match cotp::over_tpkt::tpdu(packet).map_err(Error::Cotp)? {
         cotp::Tpdu::Data(d) => Ok(d.data),
         _ => Err(Error::Invalid("RDP data TPDU")),
     }
@@ -563,7 +563,7 @@ pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
 /// Checks size first because the sibling COTP writer can truncate large data.
 pub fn write_data(data: &[u8]) -> Result<tpkt::Packet, Error> {
     bound(data.len(), MAX_PDU, "RDP data")?;
-    Ok(tpkt::Packet::from_tpdu(&cotp::Tpdu::Data(cotp::Data {
+    Ok(cotp::over_tpkt::from_tpdu(&cotp::Tpdu::Data(cotp::Data {
         eot: true,
         number: 0,
         data: data.to_vec(),
@@ -727,7 +727,7 @@ impl Connection {
             cotp::MAX_HEADER + 1,
             "connection header",
         )?;
-        let (kind, c) = match packet.tpdu().map_err(Error::Cotp)? {
+        let (kind, c) = match cotp::over_tpkt::tpdu(packet).map_err(Error::Cotp)? {
             cotp::Tpdu::ConnectionRequest(c) => (ConnectionKind::Request, c),
             cotp::Tpdu::ConnectionConfirm(c) => (ConnectionKind::Confirm, c),
             _ => return Err(Error::Invalid("connection TPDU")),
@@ -836,7 +836,7 @@ impl Connection {
             ConnectionKind::Request => cotp::Tpdu::ConnectionRequest(c),
             ConnectionKind::Confirm => cotp::Tpdu::ConnectionConfirm(c),
         };
-        Ok(tpkt::Packet::from_tpdu(&t))
+        Ok(cotp::over_tpkt::from_tpdu(&t))
     }
 }
 
