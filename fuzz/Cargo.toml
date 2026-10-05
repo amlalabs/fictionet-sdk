@@ -739,3 +739,10 @@ path = "fuzz_targets/http3.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "rdp"
+path = "fuzz_targets/rdp.rs"
+test = false
+doc = false
+bench = false

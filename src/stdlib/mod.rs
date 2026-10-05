@@ -187,6 +187,7 @@ pub mod proxy_protocol;
 pub mod qpack;
 pub mod quic;
 pub mod radius;
+pub mod rdp;
 pub mod resp;
 pub mod rfb;
 pub mod rip;
