@@ -22,6 +22,11 @@
 //! exist, and what each operation does, is up to world code. Stub data,
 //! the NDR-encoded arguments and results, stays as bytes.
 //!
+//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. [`Pdu`] implements [`Wire`] for
+//! exact parsing of writable PDUs and transactional writing. Its inherent
+//! `parse` still reads one prefix, and [`Decoder`] keeps its original behavior.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header that cannot be read breaks the stream, since the next
 //! PDU cannot be found. A body that cannot be read is an [`Error`] for
@@ -88,6 +93,8 @@
 //! assert_eq!(reply[2], 12);
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -1010,6 +1017,171 @@ impl Pdu {
     }
 }
 
+/// Why a fragment stream cannot continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// A version, integer representation, or fragment length broke framing.
+    Header(Error),
+    /// The declared fragment length exceeded the configured limit.
+    TooLong {
+        /// Declared length, including the common header.
+        length: usize,
+        /// Largest accepted fragment.
+        limit: usize,
+    },
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Header(e) => e.fmt(f),
+            Self::TooLong { length, limit } => write!(f, "DCE/RPC fragment of {length} bytes exceeds {limit}"),
+        }
+    }
+}
+
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Header(error) => Some(error),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
+
+/// Why an exact [`Wire`] parse did not contain one writable PDU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The PDU header or body was invalid.
+    Pdu(Error),
+    /// The input ended before a complete fragment.
+    Incomplete,
+    /// Bytes followed the complete fragment.
+    Trailing {
+        /// Number of bytes after the fragment.
+        remaining: usize,
+    },
+    /// The writer's padding or reserved fields would exceed [`MAX_FRAG`].
+    Unrepresentable(EncodeError),
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Pdu(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete DCE/RPC fragment"),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after DCE/RPC fragment"),
+            Self::Unrepresentable(e) => write!(f, "DCE/RPC PDU cannot be re-encoded: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Pdu(error) => Some(error),
+            Self::Unrepresentable(error) => Some(error),
+            Self::Incomplete | Self::Trailing { .. } => None,
+        }
+    }
+}
+
+impl Wire for Pdu {
+    type ParseError = ParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one PDU whose re-encoding fits [`MAX_FRAG`].
+    ///
+    /// The writer adds padding and reserved fields some peers omit. A PDU
+    /// that would then exceed the fragment limit is refused. [`Pdu::parse`]
+    /// and [`Frames`] retain their broader receive behavior.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let (pdu, used) = Pdu::parse(bytes).map_err(ParseError::Pdu)?.ok_or(ParseError::Incomplete)?;
+        if used != bytes.len() {
+            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
+        }
+        Pdu::to_bytes(&pdu).map_err(ParseError::Unrepresentable)?;
+        Ok(pdu)
+    }
+
+    /// Appends one PDU with at most [`MAX_FRAG`] bytes of temporary storage.
+    /// Leaves `out` unchanged on error. Padding follows [`Pdu::to_bytes`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads DCE/RPC fragments without retaining input.
+///
+/// Items are `Result<Pdu, Error>`: body errors are recoverable items.
+/// Only [`FrameError`] ends the stream, for invalid headers or fragments above
+/// [`limit`](Self::limit). Lengths are checked as soon as their first ten
+/// header bytes arrive, before any body is needed.
+/// Partial fragments return [`Step::Need`], including at EOF, so
+/// [`super::codec::Stream`] reports truncation. [`super::codec::Stream::with_next`] gives
+/// the original fragment bytes for authentication, including discarded padding.
+/// Proxies should forward those bytes: a received PDU can fit the limit while
+/// canonical padding or reserved fields would make [`Wire::write`] refuse it.
+/// The legacy [`Decoder`] remains separate to preserve borrowed frames,
+/// repeated framing errors, and buffer clearing on failure.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Frames, Pdu}};
+/// let pdu = Pdu::new(7, Body::Shutdown);
+/// let bytes = Wire::to_bytes(&pdu)?;
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(Ok(pdu))));
+/// # Ok::<(), fictionet::stdlib::dcerpc::EncodeError>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting fragments up to [`MAX_FRAG`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_FRAG)
+    }
+
+    /// Sets the whole-fragment limit, clamped to [`HEADER_LEN`] through [`MAX_FRAG`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.clamp(HEADER_LEN, MAX_FRAG) }
+    }
+
+    /// The largest accepted fragment, including its common header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Result<Pdu, Error>;
+    type Error = FrameError;
+    const NAME: &'static str = "DCE/RPC";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, FrameError> {
+        let Some(used) = Pdu::frame_length(input).map_err(FrameError::Header)? else { return Ok(Step::Need) };
+        if used > self.limit {
+            return Err(FrameError::TooLong { length: used, limit: self.limit });
+        }
+        let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
+        Ok(Step::Item(parse_fragment(bytes), used))
+    }
+}
+
 /// How many items a list holds, as its 8-bit count.
 fn count(n: usize) -> Result<u8, EncodeError> {
     u8::try_from(n).map_err(|_| EncodeError::Count)
@@ -1591,6 +1763,36 @@ mod tests {
         assert_eq!(Uuid::parse("8a885d04-1ceb-11c9-9fe8-08002b10486g"), None);
         assert_eq!(Uuid::parse("8a885d04-1ceb-11c9-9fe8-08002b1048é"), None);
         assert_eq!(Uuid::parse(&Uuid::NIL.to_string()), Some(Uuid::NIL));
+    }
+
+    #[test]
+    fn codec_writes_each_body_in_both_byte_orders() {
+        use crate::stdlib::codec::contract;
+
+        for mut pdu in all_bodies() {
+            for drep in [DataRep::LITTLE_ENDIAN, DataRep::BIG_ENDIAN] {
+                pdu.drep = drep;
+                let bytes = Wire::to_bytes(&pdu).unwrap();
+                assert!(bytes.len() <= MAX_FRAG);
+                assert_eq!(bytes, pdu.to_bytes().unwrap());
+                contract::check_wire::<Pdu>(&bytes);
+                contract::check_wire_value(&pdu);
+                if matches!(pdu.body, Body::BindNak(_) | Body::Shutdown) {
+                    continue;
+                }
+                let mut authenticated = pdu.clone();
+                authenticated.auth = Some(Auth {
+                    kind: auth_type::WINNT,
+                    level: auth_level::PKT_PRIVACY,
+                    context_id: 3,
+                    value: vec![0xaa; 16],
+                });
+                let bytes = Wire::to_bytes(&authenticated).unwrap();
+                assert!(bytes.len() <= MAX_FRAG);
+                contract::check_wire::<Pdu>(&bytes);
+                contract::check_wire_value(&authenticated);
+            }
+        }
     }
 
     #[test]

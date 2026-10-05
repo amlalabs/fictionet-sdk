@@ -29,6 +29,11 @@
 //! values stay as the bytes on the wire. The docs of [`Packet::reply`]
 //! say which bytes each authenticator is taken over.
 //!
+//! New TCP or TLS readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. [`Packet`] implements [`Wire`] for
+//! exact parsing and transactional writing. The inherent [`Packet::parse`]
+//! still accepts datagram padding, and [`Decoder`] keeps its original behavior.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A packet whose attributes do not fit its length is refused
 //! whole, as RFC 2865 asks. A single attribute whose value does not fit
@@ -65,6 +70,8 @@
 //! ```
 
 use std::net::{Ipv4Addr, Ipv6Addr};
+
+use super::codec::{Decode, Step, Wire};
 
 /// The UDP port RADIUS servers take Access-Requests on.
 pub const AUTH_PORT: u16 = 1812;
@@ -583,6 +590,170 @@ impl Packet {
         }
         self.attributes.extend(attributes);
         Ok(())
+    }
+}
+
+/// Why an exact [`Wire`] parse did not contain one complete packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The packet was invalid or incomplete.
+    Packet(PacketError),
+    /// Bytes followed the packet's declared length, including datagram padding.
+    Trailing {
+        /// Number of bytes after the packet.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after RADIUS packet"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Packet(error) => Some(error),
+            Self::Trailing { .. } => None,
+        }
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = TooLong;
+
+    /// Reads exactly one packet. Datagram padding is refused.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let packet = Packet::parse(bytes).map_err(ParseError::Packet)?;
+        let used = packet.encoded_len();
+        if used != bytes.len() {
+            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
+        }
+        Ok(packet)
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), TooLong> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Why a [`Frames`] stream cannot continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameError {
+    /// The packet was invalid: a length field below [`HEADER_LEN`], or
+    /// attributes that do not fit the packet.
+    Packet(PacketError),
+    /// The length field exceeded the configured limit.
+    TooLong {
+        /// The length field.
+        length: usize,
+        /// The largest accepted packet, including its header.
+        limit: usize,
+    },
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::TooLong { length, limit } => write!(f, "length field {length}, outside {HEADER_LEN}..={limit}"),
+        }
+    }
+}
+
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Packet(error) => Some(error),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
+
+/// Reads RADIUS over TCP or TLS packets without retaining input.
+///
+/// Use with [`super::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
+/// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
+/// return [`Step::Need`], including at EOF, so the driver reports truncation.
+/// A [`FrameError`] ends the stream: [`FrameError::TooLong`] for a length above
+/// the limit, and [`FrameError::Packet`] for a length below the header or for
+/// attributes that do not fit, as in [`Decoder`].
+/// [RFC 6613 §2.6.4] requires closing the connection on malformed attributes.
+/// The legacy decoder remains separate to preserve repeated errors and buffer clearing.
+///
+/// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, radius::{Code, Frames, Packet}};
+/// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
+/// let bytes = Wire::to_bytes(&packet)?;
+/// let mut stream = Stream::new(Frames::with_limit(1024));
+/// let mut packets = Vec::new();
+/// for chunk in bytes.chunks(3) {
+///     pump(&mut stream, chunk, |item| packets.push(item))?;
+/// }
+/// finish(&mut stream, |item| packets.push(item))?;
+/// assert_eq!(packets, vec![packet]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting packets up to [`MAX_PACKET`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Sets the whole-packet limit, clamped to [`HEADER_LEN`] through [`MAX_PACKET`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.clamp(HEADER_LEN, MAX_PACKET),
+        }
+    }
+
+    /// The largest accepted packet, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = FrameError;
+    const NAME: &'static str = "RADIUS";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, FrameError> {
+        let Some(&[_, _, hi, lo]) = input.get(..4) else { return Ok(Step::Need) };
+        let length = u16::from_be_bytes([hi, lo]);
+        let used = usize::from(length);
+        if used < HEADER_LEN {
+            return Err(FrameError::Packet(PacketError::Length(length)));
+        }
+        if used > self.limit {
+            return Err(FrameError::TooLong { length: used, limit: self.limit });
+        }
+        let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
+        Ok(Step::Item(Packet::parse(bytes).map_err(FrameError::Packet)?, used))
     }
 }
 

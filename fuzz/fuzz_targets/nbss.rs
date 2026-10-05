@@ -2,9 +2,10 @@
 //! reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::nbss::{
-    Decoder, EncodeError, Error, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode, Packet,
-    decode_first_level,
+    Decoder, EncodeError, Error, Frames, HEADER_LEN, MAX_LABEL, MAX_LENGTH, MAX_NAME_LEN, NAME_LEN, Name, NegativeCode,
+    Packet, decode_first_level,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -37,6 +38,11 @@ fn read(d: &mut Decoder, data: &[u8], step: usize) -> (Vec<Packet>, Option<Error
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Packet>(data);
+    contract::check_decode(|| Frames::with_limit(0), data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces whose size the first byte picks.
     let (packets, end) = read(&mut Decoder::new(), data, data.len());
@@ -74,6 +80,7 @@ fuzz_target!(|data: &[u8]| {
         let fits = name.scope.iter().all(|l| (1..=MAX_LABEL).contains(&l.len()))
             && 2 + 2 * NAME_LEN + name.scope.iter().map(|l| 1 + l.len()).sum::<usize>() <= MAX_NAME_LEN;
         let req = Packet::Request { called: name.clone(), calling: name };
+        contract::check_wire_value(&req);
         match req.to_bytes() {
             Ok(bytes) => {
                 assert!(fits);
@@ -86,6 +93,7 @@ fuzz_target!(|data: &[u8]| {
         }
         let code = NegativeCode::Other(first);
         let neg = Packet::Negative(code);
+        contract::check_wire_value(&neg);
         match neg.to_bytes() {
             Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(Some((neg, bytes.len())))),
             Err(e) => {
@@ -96,6 +104,7 @@ fuzz_target!(|data: &[u8]| {
         // A message past the limit is refused, not cut.
         if first == 0xff {
             let long = Packet::Message(vec![0; MAX_LENGTH + 1]);
+            contract::check_wire_value(&long);
             assert_eq!(long.to_bytes(), Err(EncodeError::TooLong(MAX_LENGTH + 1)));
         }
     }

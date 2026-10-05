@@ -3,9 +3,10 @@
 //! world writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Decode, contract};
 use fictionet::stdlib::smb2::{
-    ChainedPayload, Compressed, Decoder, ErrorResponse, FrameError, HEADER_LEN, IoctlResponse, MAX_BUFFERED,
-    MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response, Transform,
+    ChainedPayload, Compressed, Decoder, ErrorResponse, Frame, FrameError, Frames, HEADER_LEN, IoctlResponse,
+    MAX_BUFFERED, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response, Transform,
     TreeConnectRequest, WriteRequest, command, frame, parse_chain, parse_frame, status,
 };
 use libfuzzer_sys::fuzz_target;
@@ -214,6 +215,18 @@ fn constructed(data: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Frame>(data);
+    contract::check_decode(|| Frames::new().map(|f| Packet::parse(&f.payload)), data);
+    contract::check_wire_value(&Frame {
+        payload: data.to_vec(),
+    });
+    if data.first() == Some(&0xff) {
+        contract::check_wire_value(&Frame {
+            payload: vec![0; MAX_MESSAGE + 1],
+        });
+    }
+
     // The stream, split two ways: all at once, and a byte at a time. Both
     // give the same payloads and the same error.
     let (payloads, err) = split(data, false);

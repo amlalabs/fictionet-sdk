@@ -19,6 +19,11 @@
 //! names it listens on, and what it says to a session request, is up to
 //! world code.
 //!
+//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. [`Packet`] implements [`Wire`] for
+//! exact parsing and transactional writing. Its inherent `parse` still
+//! reads one prefix, and [`Decoder`] keeps its original behavior.
+//!
 //! Names are carried in the first-level encoding: each of a name's 16
 //! bytes becomes two letters from `A` to `P`, so `F` (0x46) becomes `EG`.
 //! See [`encode_first_level`]. The encoded name is a 32-byte label, which
@@ -68,6 +73,8 @@
 //! let reply = answer(&packet).unwrap();
 //! assert_eq!(reply.to_bytes().unwrap(), [0x82, 0x00, 0x00, 0x00]);
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -440,6 +447,126 @@ impl Packet {
         out.extend_from_slice(&((body.len() & 0xffff) as u16).to_be_bytes());
         out.extend_from_slice(body);
         Ok(out)
+    }
+}
+
+/// Why an exact [`Wire`] parse did not contain one complete packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The packet was invalid.
+    Packet(Error),
+    /// The input ended before a complete packet.
+    Incomplete,
+    /// Bytes followed the complete packet.
+    Trailing {
+        /// Number of bytes after the packet.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete NBSS packet"),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after NBSS packet"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Packet(error) => Some(error),
+            Self::Incomplete | Self::Trailing { .. } => None,
+        }
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one packet of at most [`MAX_PACKET`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        match Packet::parse(bytes).map_err(ParseError::Packet)? {
+            Some((packet, used)) if used == bytes.len() => Ok(packet),
+            Some((_, used)) => Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) }),
+            None => Err(ParseError::Incomplete),
+        }
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads session packets without retaining input.
+///
+/// Use with [`super::codec::Stream`] for bounded buffering. The header
+/// suffices to refuse a body above [`limit`](Self::limit). Partial packets
+/// return [`Step::Need`], including at EOF. The driver reports truncation
+/// and reports errors once. All packet errors end this decoder.
+/// The legacy [`Decoder`] retains its repeated errors and clears its buffer
+/// on failure, so it remains a separate implementation.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, nbss::{Frames, Packet}};
+/// let packet = Packet::Message(b"hello".to_vec());
+/// let bytes = Wire::to_bytes(&packet)?;
+/// let mut stream = Stream::new(Frames::with_limit(1024));
+/// let mut packets = Vec::new();
+/// for chunk in bytes.chunks(3) {
+///     pump(&mut stream, chunk, |item| packets.push(item))?;
+/// }
+/// finish(&mut stream, |item| packets.push(item))?;
+/// assert_eq!(packets, vec![packet]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a decoder accepting bodies up to [`MAX_LENGTH`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_LENGTH)
+    }
+
+    /// Sets the body limit, clamped to [`MAX_LENGTH`]. Zero permits empty bodies.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_LENGTH) }
+    }
+
+    /// The largest accepted body, excluding its four-byte header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = Error;
+    const NAME: &'static str = "NBSS";
+
+    fn capacity(&self) -> usize {
+        HEADER_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
+        Ok(match parse_limited(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
     }
 }
 
