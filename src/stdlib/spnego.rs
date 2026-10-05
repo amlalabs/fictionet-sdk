@@ -1,0 +1,1335 @@
+//! SPNEGO: reading and writing the GSS-API negotiation tokens that HTTP
+//! Negotiate, SMB and LDAP carry, with no I/O.
+//!
+//! SPNEGO lets a client and a server agree on how to authenticate, usually
+//! Kerberos or NTLM, and carries the chosen mechanism's own tokens while
+//! they do. The client opens with a NegTokenInit that lists the mechanisms
+//! it supports, often with a first token for the one it likes best. The
+//! server answers with NegTokenResp messages until the exchange is done.
+//! The first token travels inside the GSS-API initial context token
+//! wrapper, which names the mechanism (SPNEGO) by its object identifier.
+//! Windows servers also send a NegTokenInit2 first, with hints, in the SMB
+//! negotiate response. This module follows RFC 4178, the wrapper of
+//! RFC 2743 section 3.1, and NegTokenInit2 from Microsoft's \[MS-SPNG\]
+//! section 2.2.1.
+//!
+//! Nothing here reads a socket or decodes base64. A world that plays a web
+//! server takes the bytes of an `Authorization: Negotiate` header, reads
+//! them with [`NegotiationToken::parse`], looks at the mechanisms offered,
+//! and writes its answer with [`NegotiationToken::to_bytes`]. The inner
+//! mechanism tokens (a Kerberos AP-REQ, an NTLM message) are kept as bytes.
+//! What they mean, and whether to accept them, is up to world code. HTTP,
+//! SMB and LDAP each give a token's length, so most worlds never need the
+//! [`Decoder`], which splits tokens sent back to back.
+//!
+//! Every reader checks lengths and nesting, because the agent can send any
+//! bytes it likes. Tokens are read as BER and written as DER. A token is at
+//! most [`MAX_TOKEN`] bytes and offers at most [`MAX_MECHS`] mechanisms.
+//!
+//! ```
+//! use fictionet::stdlib::spnego::{Mech, NegState, NegTokenInit, NegTokenResp, NegotiationToken};
+//!
+//! // What a client sends first: NTLM offered, with its NEGOTIATE message.
+//! let negotiate = b"NTLMSSP\0\x01\0\0\0".to_vec();
+//! let offer = NegotiationToken::Init(NegTokenInit {
+//!     mech_types: vec![Mech::Ntlm],
+//!     mech_token: Some(negotiate.clone()),
+//!     ..NegTokenInit::default()
+//! });
+//! let wire = offer.to_gss_bytes().unwrap();
+//! assert_eq!(wire[0], 0x60);
+//!
+//! // The world's server reads it and picks NTLM.
+//! let NegotiationToken::Init(init) = NegotiationToken::parse(&wire).unwrap() else { panic!() };
+//! assert_eq!(init.mech_types, [Mech::Ntlm]);
+//! assert_eq!(init.mech_token.as_deref(), Some(&negotiate[..]));
+//!
+//! let reply = NegotiationToken::Resp(NegTokenResp {
+//!     neg_state: Some(NegState::AcceptIncomplete),
+//!     supported_mech: Some(Mech::Ntlm),
+//!     response_token: Some(b"NTLMSSP\0\x02\0\0\0".to_vec()),
+//!     mech_list_mic: None,
+//! });
+//! let bytes = reply.to_bytes().unwrap();
+//! assert_eq!(bytes[..9], [0xa1, 0x25, 0x30, 0x23, 0xa0, 0x03, 0x0a, 0x01, 0x01]);
+//! assert_eq!(NegotiationToken::parse(&bytes).unwrap(), reply);
+//! ```
+
+use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer};
+use std::fmt;
+
+/// The longest token, wrapper included, a reader accepts and a writer
+/// writes. Windows caps its own tokens at 65,535 bytes (MaxTokenSize).
+pub const MAX_TOKEN: usize = 64 * 1024;
+/// The most mechanisms one NegTokenInit may offer.
+pub const MAX_MECHS: usize = 32;
+
+/// The first byte of a GSS-API initial context token: `[APPLICATION 0]`,
+/// constructed.
+pub const GSS_TAG: u8 = 0x60;
+/// The first byte of a negTokenInit (or NegTokenInit2): `[0]`,
+/// constructed.
+pub const INIT_TAG: u8 = 0xa0;
+/// The first byte of a negTokenResp: `[1]`, constructed.
+pub const RESP_TAG: u8 = 0xa1;
+
+/// Why bytes are not a SPNEGO token, or why a writer could not write one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// The bytes are not well-formed ASN.1, or a field has the wrong type.
+    Asn1(asn1::Error),
+    /// The token, or a value a writer was given, is longer than
+    /// [`MAX_TOKEN`].
+    TooLong,
+    /// A NegTokenInit offers more than [`MAX_MECHS`] mechanisms.
+    TooManyMechs,
+    /// The first element is not a GSS-API wrapper, a negTokenInit or a
+    /// negTokenResp.
+    NotToken,
+    /// A GSS-API wrapper, or a token given to the [`Decoder`], has an
+    /// indefinite length. RFC 2743 requires a definite one.
+    Indefinite,
+    /// A GSS-API wrapper names a mechanism other than SPNEGO.
+    WrongMech,
+    /// A field of a NegTokenInit or NegTokenResp is not context-specific,
+    /// or comes out of order or twice.
+    Field,
+    /// A negTokenResp inside a GSS-API wrapper. RFC 4178 section 4.1 wraps
+    /// only the first token, and a negTokenResp never comes first.
+    WrappedResp,
+    /// A NegTokenInit has no mechTypes.
+    MissingMechTypes,
+    /// A negState outside the four RFC 4178 defines.
+    NegState(i64),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Asn1(e) => write!(f, "ASN.1: {e}"),
+            Error::TooLong => write!(f, "token longer than {MAX_TOKEN} bytes"),
+            Error::TooManyMechs => write!(f, "more than {MAX_MECHS} mechanisms"),
+            Error::NotToken => f.write_str("not a GSS-API or SPNEGO token"),
+            Error::Indefinite => f.write_str("indefinite length on a token"),
+            Error::WrongMech => f.write_str("GSS-API wrapper for a mechanism other than SPNEGO"),
+            Error::Field => f.write_str("field out of order, repeated or not context-specific"),
+            Error::WrappedResp => f.write_str("negTokenResp inside a GSS-API wrapper"),
+            Error::MissingMechTypes => f.write_str("NegTokenInit without mechTypes"),
+            Error::NegState(v) => write!(f, "negState {v}, outside 0..=3"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+impl From<asn1::Error> for Error {
+    fn from(e: asn1::Error) -> Error {
+        Error::Asn1(e)
+    }
+}
+
+/// A GSS-API mechanism, named when this module knows its object
+/// identifier.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Mech {
+    /// SPNEGO itself, 1.3.6.1.5.5.2.
+    Spnego,
+    /// Kerberos 5, 1.2.840.113554.1.2.2 (RFC 1964).
+    Kerberos,
+    /// Kerberos 5 under the identifier early Windows wrote by mistake,
+    /// 1.2.840.48018.1.2.2. Windows still lists it first.
+    MsKerberos,
+    /// Kerberos 5 user-to-user, 1.2.840.113554.1.2.2.3.
+    KerberosUser2User,
+    /// IAKERB, Kerberos through the server, 1.3.6.1.5.2.5 (RFC 9762).
+    Iakerb,
+    /// NTLM, 1.3.6.1.4.1.311.2.2.10.
+    Ntlm,
+    /// NEGOEX, the extended negotiation of \[MS-NEGOEX\],
+    /// 1.3.6.1.4.1.311.2.2.30.
+    NegoEx,
+    /// Any other mechanism. A reader never gives this for an identifier
+    /// named above: `Other` holding one is written as given and read back
+    /// as the named variant.
+    Other(Oid),
+}
+
+/// Each named mechanism, its object identifier's contents, and its dotted
+/// form.
+static NAMED: [(Mech, &[u8], &str); 7] = [
+    (Mech::Spnego, &[0x2b, 0x06, 0x01, 0x05, 0x05, 0x02], "1.3.6.1.5.5.2"),
+    (Mech::Kerberos, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02], "1.2.840.113554.1.2.2"),
+    (Mech::MsKerberos, &[0x2a, 0x86, 0x48, 0x82, 0xf7, 0x12, 0x01, 0x02, 0x02], "1.2.840.48018.1.2.2"),
+    (Mech::KerberosUser2User, &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x12, 0x01, 0x02, 0x02, 0x03], "1.2.840.113554.1.2.2.3"),
+    (Mech::Iakerb, &[0x2b, 0x06, 0x01, 0x05, 0x02, 0x05], "1.3.6.1.5.2.5"),
+    (Mech::Ntlm, &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a], "1.3.6.1.4.1.311.2.2.10"),
+    (Mech::NegoEx, &[0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x1e], "1.3.6.1.4.1.311.2.2.30"),
+];
+
+impl Mech {
+    /// The mechanism an object identifier names.
+    pub fn from_oid(oid: &Oid) -> Mech {
+        match NAMED.iter().find(|(_, c, _)| *c == oid.as_bytes()) {
+            Some((m, _, _)) => m.clone(),
+            None => Mech::Other(oid.clone()),
+        }
+    }
+
+    /// The mechanism whose object identifier has these contents bytes.
+    pub fn from_contents(b: &[u8]) -> Result<Mech, Error> {
+        Ok(Mech::from_oid(&Oid::from_contents(b)?))
+    }
+
+    /// The object identifier's contents bytes, as X.690 encodes them.
+    pub fn contents(&self) -> &[u8] {
+        match self {
+            Mech::Other(oid) => oid.as_bytes(),
+            named => NAMED.iter().find(|(m, _, _)| m == named).map_or(&[][..], |(_, c, _)| *c),
+        }
+    }
+
+    /// The whole OBJECT IDENTIFIER element: tag, length and contents.
+    fn element(&self) -> Vec<u8> {
+        let c = self.contents();
+        let mut out = Vec::with_capacity(c.len() + 3);
+        out.push(0x06);
+        push_length(&mut out, c.len());
+        out.extend_from_slice(c);
+        out
+    }
+}
+
+impl fmt::Display for Mech {
+    /// Writes the dotted form, such as `1.3.6.1.4.1.311.2.2.10`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Mech::Other(oid) => write!(f, "{oid}"),
+            named => f.write_str(NAMED.iter().find(|(m, _, _)| m == named).map_or("", |(_, _, s)| *s)),
+        }
+    }
+}
+
+/// Appends a definite length in its shortest form.
+fn push_length(out: &mut Vec<u8>, n: usize) {
+    if n < 0x80 {
+        out.push(n as u8);
+    } else {
+        let bytes = (n as u64).to_be_bytes();
+        let skip = bytes.iter().take_while(|&&b| b == 0).count();
+        out.push(0x80 | (8 - skip) as u8);
+        out.extend_from_slice(&bytes[skip..]);
+    }
+}
+
+/// The GSS-API initial context token of RFC 2743 section 3.1: a
+/// mechanism's object identifier, then that mechanism's own token. For
+/// SPNEGO the inner token is a [`NegotiationToken`]; for Kerberos it is a
+/// two-byte token ID and an AP-REQ.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InitialContextToken {
+    /// The mechanism the token is for.
+    pub mech: Mech,
+    /// The mechanism's token, as bytes.
+    pub inner: Vec<u8>,
+}
+
+impl InitialContextToken {
+    /// Reads a whole wrapper from `b`, which must hold nothing else.
+    pub fn parse(b: &[u8]) -> Result<InitialContextToken, Error> {
+        if b.len() > MAX_TOKEN {
+            return Err(Error::TooLong);
+        }
+        let h = Header::parse(b, Rules::Ber)?;
+        if h.tag != Tag::application(0).as_constructed() {
+            return Err(Error::NotToken);
+        }
+        let Length::Definite(n) = h.length else { return Err(Error::Indefinite) };
+        let end = h.len.checked_add(n).ok_or(Error::TooLong)?;
+        if end > b.len() {
+            return Err(Error::Asn1(asn1::Error::Truncated));
+        }
+        if end < b.len() {
+            return Err(Error::Asn1(asn1::Error::Trailing));
+        }
+        let mut r = Reader::new(&b[h.len..end], Rules::Ber);
+        let oid = r.read_oid()?;
+        Ok(InitialContextToken { mech: Mech::from_oid(&oid), inner: r.remaining().to_vec() })
+    }
+
+    /// The wrapper's bytes, in DER. It fails with [`Error::TooLong`] if
+    /// they would be longer than [`MAX_TOKEN`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let oid = self.mech.element();
+        let body = oid.len().checked_add(self.inner.len()).ok_or(Error::TooLong)?;
+        if body > MAX_TOKEN {
+            return Err(Error::TooLong);
+        }
+        let mut out = Vec::with_capacity(body + 4);
+        out.push(GSS_TAG);
+        push_length(&mut out, body);
+        out.extend_from_slice(&oid);
+        out.extend_from_slice(&self.inner);
+        if out.len() > MAX_TOKEN {
+            return Err(Error::TooLong);
+        }
+        Ok(out)
+    }
+}
+
+/// The ContextFlags bit string of a NegTokenInit: the services the client
+/// asks for. It is held as the 32 bits RFC 4178 gives it, first bit
+/// highest, so named bit 0 (delegFlag) is `0x8000_0000`. Bits past the
+/// 32nd are dropped when read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ContextFlags(pub u32);
+
+impl ContextFlags {
+    /// delegFlag: the server may act as the client.
+    pub const DELEG: ContextFlags = ContextFlags(1 << 31);
+    /// mutualFlag: the server proves who it is too.
+    pub const MUTUAL: ContextFlags = ContextFlags(1 << 30);
+    /// replayFlag: replayed messages are detected.
+    pub const REPLAY: ContextFlags = ContextFlags(1 << 29);
+    /// sequenceFlag: messages out of order are detected.
+    pub const SEQUENCE: ContextFlags = ContextFlags(1 << 28);
+    /// anonFlag: the client stays anonymous.
+    pub const ANON: ContextFlags = ContextFlags(1 << 27);
+    /// confFlag: messages can be encrypted.
+    pub const CONF: ContextFlags = ContextFlags(1 << 26);
+    /// integFlag: messages can be signed.
+    pub const INTEG: ContextFlags = ContextFlags(1 << 25);
+
+    /// Whether every flag set in `other` is set here.
+    pub fn contains(self, other: ContextFlags) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    /// The flags from a bit string's bytes and unused-bit count.
+    fn from_bits(bytes: &[u8], unused: u8) -> ContextFlags {
+        let mut b = [0u8; 4];
+        let n = bytes.len().min(4);
+        b[..n].copy_from_slice(&bytes[..n]);
+        // BER lets unused bits hold anything; they are not flags.
+        if (1..=4).contains(&bytes.len()) && unused <= 7 {
+            b[bytes.len() - 1] &= 0xffu8 << unused;
+        }
+        ContextFlags(u32::from_be_bytes(b))
+    }
+}
+
+impl std::ops::BitOr for ContextFlags {
+    type Output = ContextFlags;
+
+    fn bitor(self, rhs: ContextFlags) -> ContextFlags {
+        ContextFlags(self.0 | rhs.0)
+    }
+}
+
+/// The hints of a NegTokenInit2 (\[MS-SPNG\] 2.2.1). Windows sends the
+/// name `not_defined_in_RFC4178@please_ignore` and no address.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NegHints {
+    /// hintName: a GeneralString, as bytes.
+    pub hint_name: Option<Vec<u8>>,
+    /// hintAddress, as bytes.
+    pub hint_address: Option<Vec<u8>>,
+}
+
+/// A NegTokenInit (RFC 4178 4.2.1), or a NegTokenInit2 when it has
+/// [`NegHints`]. The two share the `[0]` choice and their first three
+/// fields; field `[3]` is the mechListMIC in one and the hints in the
+/// other, and a reader tells them apart by its type.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NegTokenInit {
+    /// mechTypes: the mechanisms offered, most preferred first.
+    pub mech_types: Vec<Mech>,
+    /// reqFlags. RFC 4178 says to send none and ignore any received.
+    pub req_flags: Option<ContextFlags>,
+    /// mechToken: the first token of the first mechanism offered.
+    pub mech_token: Option<Vec<u8>>,
+    /// negHints: present only in a NegTokenInit2.
+    pub neg_hints: Option<NegHints>,
+    /// mechListMIC: the first mechanism's MIC over the encoded mechTypes.
+    pub mech_list_mic: Option<Vec<u8>>,
+}
+
+/// The state of the negotiation, as the server says in a NegTokenResp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum NegState {
+    /// accept-completed: authentication is done and succeeded.
+    AcceptCompleted = 0,
+    /// accept-incomplete: more tokens are needed.
+    AcceptIncomplete = 1,
+    /// reject: authentication failed.
+    Reject = 2,
+    /// request-mic: the client must send a mechListMIC.
+    RequestMic = 3,
+}
+
+impl NegState {
+    /// The state with this ENUMERATED value.
+    pub fn from_value(v: i64) -> Result<NegState, Error> {
+        Ok(match v {
+            0 => NegState::AcceptCompleted,
+            1 => NegState::AcceptIncomplete,
+            2 => NegState::Reject,
+            3 => NegState::RequestMic,
+            _ => return Err(Error::NegState(v)),
+        })
+    }
+}
+
+/// A NegTokenResp (RFC 4178 4.2.2). Every field is optional.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NegTokenResp {
+    /// negState.
+    pub neg_state: Option<NegState>,
+    /// supportedMech: the mechanism the server chose, in its first reply.
+    pub supported_mech: Option<Mech>,
+    /// responseToken: the chosen mechanism's token.
+    pub response_token: Option<Vec<u8>>,
+    /// mechListMIC.
+    pub mech_list_mic: Option<Vec<u8>>,
+}
+
+/// A SPNEGO token: the NegotiationToken choice of RFC 4178 4.2.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NegotiationToken {
+    /// negTokenInit, `[0]`: what a client sends first, or the hints a
+    /// Windows server sends before that.
+    Init(NegTokenInit),
+    /// negTokenResp, `[1]`: every later token.
+    Resp(NegTokenResp),
+}
+
+impl NegotiationToken {
+    /// Reads a whole token from `b`, which must hold nothing else. A
+    /// negTokenInit may be inside a GSS-API wrapper, as a first token is,
+    /// or not. A negTokenResp must not be wrapped (RFC 4178 section 4.1),
+    /// and gives [`Error::WrappedResp`] if it is. A wrapper must name
+    /// SPNEGO.
+    pub fn parse(b: &[u8]) -> Result<NegotiationToken, Error> {
+        if b.len() > MAX_TOKEN {
+            return Err(Error::TooLong);
+        }
+        if b.first() == Some(&GSS_TAG) {
+            let t = InitialContextToken::parse(b)?;
+            if t.mech != Mech::Spnego {
+                return Err(Error::WrongMech);
+            }
+            return match parse_bare(&t.inner)? {
+                NegotiationToken::Resp(_) => Err(Error::WrappedResp),
+                init => Ok(init),
+            };
+        }
+        parse_bare(b)
+    }
+
+    /// The token's bytes in DER, without a GSS-API wrapper, as every token
+    /// after the first is sent. It fails if they would be longer than
+    /// [`MAX_TOKEN`], if a NegTokenInit offers more than [`MAX_MECHS`]
+    /// mechanisms, or if a value cannot be written.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let mut total: usize = 0;
+        let mut add = |v: &Option<Vec<u8>>| {
+            total = total.saturating_add(v.as_ref().map_or(0, Vec::len));
+        };
+        match self {
+            NegotiationToken::Init(t) => {
+                if t.mech_types.len() > MAX_MECHS {
+                    return Err(Error::TooManyMechs);
+                }
+                add(&t.mech_token);
+                add(&t.mech_list_mic);
+                if let Some(h) = &t.neg_hints {
+                    add(&h.hint_name);
+                    add(&h.hint_address);
+                }
+            }
+            NegotiationToken::Resp(t) => {
+                add(&t.response_token);
+                add(&t.mech_list_mic);
+            }
+        }
+        if total > MAX_TOKEN {
+            return Err(Error::TooLong);
+        }
+        let mut w = Writer::new();
+        match self {
+            NegotiationToken::Init(t) => w.explicit(0, |w| write_init(w, t)),
+            NegotiationToken::Resp(t) => w.explicit(1, |w| write_resp(w, t)),
+        }
+        let out = w.finish()?;
+        if out.len() > MAX_TOKEN {
+            return Err(Error::TooLong);
+        }
+        Ok(out)
+    }
+
+    /// The token's bytes in DER inside a GSS-API wrapper naming SPNEGO, as
+    /// a first token is sent. Only a negTokenInit is wrapped; a
+    /// negTokenResp gives [`Error::WrappedResp`].
+    pub fn to_gss_bytes(&self) -> Result<Vec<u8>, Error> {
+        if let NegotiationToken::Resp(_) = self {
+            return Err(Error::WrappedResp);
+        }
+        InitialContextToken { mech: Mech::Spnego, inner: self.to_bytes()? }.to_bytes()
+    }
+}
+
+/// Reads a NegotiationToken with no wrapper.
+fn parse_bare(b: &[u8]) -> Result<NegotiationToken, Error> {
+    if b.len() > MAX_TOKEN {
+        return Err(Error::TooLong);
+    }
+    let mut r = Reader::new(b, Rules::Ber);
+    let e = r.read()?;
+    r.finish()?;
+    let t = e.tag();
+    if t.class != Class::ContextSpecific || t.number > 1 {
+        return Err(Error::NotToken);
+    }
+    let mut outer = e.reader()?;
+    let seq = outer.read_sequence()?;
+    outer.finish()?;
+    if t.number == 0 {
+        Ok(NegotiationToken::Init(parse_init(seq)?))
+    } else {
+        Ok(NegotiationToken::Resp(parse_resp(seq)?))
+    }
+}
+
+/// The one element inside an explicit tag.
+fn explicit_one<'a, T>(e: &Element<'a>, f: impl FnOnce(&mut Reader<'a>) -> Result<T, asn1::Error>) -> Result<T, Error> {
+    let mut r = e.reader()?;
+    let v = f(&mut r)?;
+    r.finish()?;
+    Ok(v)
+}
+
+/// The fields of a sequence whose fields all have context-specific tags
+/// in ascending order. Each is checked before it is handed to `f`.
+fn fields<'a>(seq: Reader<'a>, mut f: impl FnMut(u32, &Element<'a>) -> Result<(), Error>) -> Result<(), Error> {
+    let mut prev: Option<u32> = None;
+    for e in seq {
+        let e = e?;
+        let t = e.tag();
+        if t.class != Class::ContextSpecific || prev.is_some_and(|p| t.number <= p) {
+            return Err(Error::Field);
+        }
+        prev = Some(t.number);
+        f(t.number, &e)?;
+    }
+    Ok(())
+}
+
+fn parse_init(seq: Reader<'_>) -> Result<NegTokenInit, Error> {
+    let mut t = NegTokenInit::default();
+    let mut has_mechs = false;
+    fields(seq, |n, e| {
+        match n {
+            0 => {
+                has_mechs = true;
+                let mut list = explicit_one(e, |r| r.read_sequence())?;
+                while !list.is_empty() {
+                    if t.mech_types.len() >= MAX_MECHS {
+                        return Err(Error::TooManyMechs);
+                    }
+                    t.mech_types.push(Mech::from_oid(&list.read_oid()?));
+                }
+            }
+            1 => {
+                let bits = explicit_one(e, |r| r.read_bit_string())?;
+                t.req_flags = Some(ContextFlags::from_bits(bits.bytes(), bits.unused()));
+            }
+            2 => t.mech_token = Some(explicit_one(e, |r| r.read_octet_string())?.into_owned()),
+            3 => {
+                let mut r = e.reader()?;
+                if r.peek()?.tag().same_type(Tag::SEQUENCE) {
+                    t.neg_hints = Some(parse_hints(r.read_sequence()?)?);
+                } else {
+                    t.mech_list_mic = Some(r.read_octet_string()?.into_owned());
+                }
+                r.finish()?;
+            }
+            // After hints, [4] is the NegTokenInit2 mechListMIC. After a
+            // mechListMIC at [3], it is an unknown field, and RFC 4178 4.2
+            // says to ignore it. With no [3] it may be either, so it is the
+            // mechListMIC only if it holds an OCTET STRING.
+            4 if t.neg_hints.is_some() || (t.mech_list_mic.is_none() && holds_octet_string(e)) => {
+                t.mech_list_mic = Some(explicit_one(e, |r| r.read_octet_string())?.into_owned());
+            }
+            // Fields added after the extension marker are skipped.
+            _ => {}
+        }
+        Ok(())
+    })?;
+    if !has_mechs {
+        return Err(Error::MissingMechTypes);
+    }
+    Ok(t)
+}
+
+/// Whether an explicit tag holds an OCTET STRING, in either form, first.
+fn holds_octet_string(e: &Element<'_>) -> bool {
+    e.reader().and_then(|r| r.peek()).is_ok_and(|x| x.tag().same_type(Tag::OCTET_STRING))
+}
+
+fn parse_hints(mut s: Reader<'_>) -> Result<NegHints, Error> {
+    let mut h = NegHints::default();
+    if let Some(e) = s.read_optional(Tag::context(0))? {
+        h.hint_name = Some(explicit_one(&e, |r| r.read_string_bytes(StringKind::General))?.into_owned());
+    }
+    if let Some(e) = s.read_optional(Tag::context(1))? {
+        h.hint_address = Some(explicit_one(&e, |r| r.read_octet_string())?.into_owned());
+    }
+    s.finish()?;
+    Ok(h)
+}
+
+fn parse_resp(seq: Reader<'_>) -> Result<NegTokenResp, Error> {
+    let mut t = NegTokenResp::default();
+    fields(seq, |n, e| {
+        match n {
+            0 => {
+                let v = explicit_one(e, |r| r.read_enumerated())?;
+                let v = v.to_i64().ok_or(Error::Asn1(asn1::Error::Integer))?;
+                t.neg_state = Some(NegState::from_value(v)?);
+            }
+            1 => t.supported_mech = Some(Mech::from_oid(&explicit_one(e, |r| r.read_oid())?)),
+            2 => t.response_token = Some(explicit_one(e, |r| r.read_octet_string())?.into_owned()),
+            3 => t.mech_list_mic = Some(explicit_one(e, |r| r.read_octet_string())?.into_owned()),
+            // Fields added after the extension marker are skipped.
+            _ => {}
+        }
+        Ok(())
+    })?;
+    Ok(t)
+}
+
+fn write_init(w: &mut Writer, t: &NegTokenInit) {
+    w.sequence(|w| {
+        w.explicit(0, |w| {
+            w.sequence(|w| {
+                for m in &t.mech_types {
+                    w.encoded(&m.element());
+                }
+            })
+        });
+        if let Some(f) = t.req_flags {
+            w.explicit(1, |w| w.bit_string(&f.0.to_be_bytes(), 0));
+        }
+        if let Some(tok) = &t.mech_token {
+            w.explicit(2, |w| w.octet_string(tok));
+        }
+        match &t.neg_hints {
+            Some(h) => {
+                w.explicit(3, |w| {
+                    w.sequence(|w| {
+                        if let Some(name) = &h.hint_name {
+                            w.explicit(0, |w| w.string_bytes(StringKind::General, name));
+                        }
+                        if let Some(addr) = &h.hint_address {
+                            w.explicit(1, |w| w.octet_string(addr));
+                        }
+                    })
+                });
+                if let Some(mic) = &t.mech_list_mic {
+                    w.explicit(4, |w| w.octet_string(mic));
+                }
+            }
+            None => {
+                if let Some(mic) = &t.mech_list_mic {
+                    w.explicit(3, |w| w.octet_string(mic));
+                }
+            }
+        }
+    });
+}
+
+fn write_resp(w: &mut Writer, t: &NegTokenResp) {
+    w.sequence(|w| {
+        if let Some(s) = t.neg_state {
+            w.explicit(0, |w| w.enumerated(s as i64));
+        }
+        if let Some(m) = &t.supported_mech {
+            w.explicit(1, |w| w.encoded(&m.element()));
+        }
+        if let Some(tok) = &t.response_token {
+            w.explicit(2, |w| w.octet_string(tok));
+        }
+        if let Some(mic) = &t.mech_list_mic {
+            w.explicit(3, |w| w.octet_string(mic));
+        }
+    });
+}
+
+/// How long the token at the start of `b` is. It returns `Ok(None)` if `b`
+/// holds only part of one. The token must start with a GSS-API wrapper, a
+/// negTokenInit or a negTokenResp, with a definite length; only its outer
+/// header is checked.
+pub fn token_len(b: &[u8]) -> Result<Option<usize>, Error> {
+    let Some(&first) = b.first() else { return Ok(None) };
+    if !matches!(first, GSS_TAG | INIT_TAG | RESP_TAG) {
+        return Err(Error::NotToken);
+    }
+    let h = match Header::parse(b, Rules::Ber) {
+        Ok(h) => h,
+        Err(asn1::Error::Truncated) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Length::Definite(n) = h.length else { return Err(Error::Indefinite) };
+    let total = h.len.checked_add(n).ok_or(Error::TooLong)?;
+    if total > MAX_TOKEN {
+        return Err(Error::TooLong);
+    }
+    Ok(if b.len() >= total { Some(total) } else { None })
+}
+
+/// Splits a byte stream of tokens sent back to back into one token's bytes
+/// at a time, for a transport that does not frame them itself. Feed it the
+/// bytes in order, take tokens out until it has none, and read each with
+/// [`NegotiationToken::parse`] or [`InitialContextToken::parse`].
+#[derive(Debug, Default)]
+pub struct Decoder {
+    buf: Vec<u8>,
+    /// Where the bytes not yet taken out start. Bytes before it are
+    /// dropped in `feed` once they are half the buffer.
+    start: usize,
+    failed: Option<Error>,
+}
+
+impl Decoder {
+    /// A decoder holding no bytes.
+    pub fn new() -> Decoder {
+        Decoder::default()
+    }
+
+    /// Adds bytes from the stream. After an error the stream cannot be read
+    /// any further, and they are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.failed.is_none() {
+            if self.start > 0 && self.start >= self.buf.len() / 2 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// The next whole token's bytes, if one has come. It returns `None`
+    /// when it needs more bytes, and keeps returning the same error once
+    /// the stream has broken. A decoder holds at most [`MAX_TOKEN`] bytes
+    /// beyond what has been taken out, plus what one `feed` added.
+    pub fn next_token(&mut self) -> Option<Result<Vec<u8>, Error>> {
+        if let Some(e) = self.failed {
+            return Some(Err(e));
+        }
+        let held = &self.buf[self.start..];
+        match token_len(held) {
+            Ok(Some(n)) => {
+                let token = held[..n].to_vec();
+                self.start += n;
+                Some(Ok(token))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                self.failed = Some(e);
+                self.buf = Vec::new();
+                self.start = 0;
+                Some(Err(e))
+            }
+        }
+    }
+
+    /// How many bytes are held, waiting for the rest of a token.
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hint name Windows and Samba send in a NegTokenInit2.
+    const HINT: &[u8] = b"not_defined_in_RFC4178@please_ignore";
+
+    /// A NegTokenInit2 as Samba sends it in an SMB2 NEGOTIATE response:
+    /// NTLM offered, with the hint name of \[MS-SPNG\] 3.2.5.2.
+    fn samba_init2() -> Vec<u8> {
+        let mut b = vec![
+            0x60, 0x48, 0x06, 0x06, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x02, // wrapper, SPNEGO
+            0xa0, 0x3e, 0x30, 0x3c, // negTokenInit, SEQUENCE
+            0xa0, 0x0e, 0x30, 0x0c, 0x06, 0x0a, 0x2b, 0x06, 0x01, 0x04, 0x01, 0x82, 0x37, 0x02, 0x02, 0x0a, 0xa3, 0x2a,
+            0x30, 0x28, 0xa0, 0x26, 0x1b, 0x24, // negHints, hintName
+        ];
+        b.extend_from_slice(HINT);
+        b
+    }
+
+    /// The last token of a successful exchange: accept-completed and
+    /// nothing else.
+    const ACCEPT_COMPLETED: [u8; 9] = [0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x00];
+
+    fn sample_tokens() -> Vec<NegotiationToken> {
+        vec![
+            NegotiationToken::Init(NegTokenInit {
+                mech_types: vec![Mech::MsKerberos, Mech::Kerberos, Mech::NegoEx, Mech::Ntlm],
+                req_flags: Some(ContextFlags::MUTUAL | ContextFlags::INTEG),
+                mech_token: Some(vec![0x60, 0x82, 1, 2, 3]),
+                neg_hints: None,
+                mech_list_mic: Some(vec![9; 16]),
+            }),
+            NegotiationToken::Init(NegTokenInit {
+                mech_types: vec![Mech::Ntlm, Mech::Iakerb, Mech::KerberosUser2User, Mech::Spnego],
+                req_flags: None,
+                mech_token: None,
+                neg_hints: Some(NegHints { hint_name: Some(HINT.to_vec()), hint_address: Some(vec![1, 2]) }),
+                mech_list_mic: Some(vec![7; 3]),
+            }),
+            NegotiationToken::Init(NegTokenInit::default()),
+            NegotiationToken::Resp(NegTokenResp::default()),
+            NegotiationToken::Resp(NegTokenResp {
+                neg_state: Some(NegState::RequestMic),
+                supported_mech: Some(Mech::Other("1.2.3.4.5".parse().unwrap())),
+                response_token: Some(vec![0; 300]),
+                mech_list_mic: Some(Vec::new()),
+            }),
+        ]
+    }
+
+    #[test]
+    fn samba_negtokeninit2() {
+        let b = samba_init2();
+        let NegotiationToken::Init(t) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        assert_eq!(t.mech_types, [Mech::Ntlm]);
+        assert_eq!(t.req_flags, None);
+        assert_eq!(t.mech_token, None);
+        assert_eq!(t.neg_hints, Some(NegHints { hint_name: Some(HINT.to_vec()), hint_address: None }));
+        assert_eq!(t.mech_list_mic, None);
+        // Written back, byte for byte.
+        assert_eq!(NegotiationToken::Init(t).to_gss_bytes().unwrap(), b);
+        // The wrapper on its own.
+        let w = InitialContextToken::parse(&b).unwrap();
+        assert_eq!(w.mech, Mech::Spnego);
+        assert_eq!(w.inner, b[10..]);
+        assert_eq!(w.to_bytes().unwrap(), b);
+        assert_eq!(token_len(&b), Ok(Some(b.len())));
+    }
+
+    #[test]
+    fn accept_completed() {
+        let t = NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap();
+        let want = NegotiationToken::Resp(NegTokenResp {
+            neg_state: Some(NegState::AcceptCompleted),
+            ..NegTokenResp::default()
+        });
+        assert_eq!(t, want);
+        assert_eq!(want.to_bytes().unwrap(), ACCEPT_COMPLETED);
+    }
+
+    #[test]
+    fn rfc4178_init_with_mic_at_3() {
+        // RFC 4178 NegTokenInit: mechListMIC is [3] and an OCTET STRING.
+        let t = NegotiationToken::Init(NegTokenInit {
+            mech_types: vec![Mech::Kerberos],
+            mech_list_mic: Some(vec![0xaa, 0xbb]),
+            ..NegTokenInit::default()
+        });
+        let b = t.to_bytes().unwrap();
+        let tail = [0xa3, 0x04, 0x04, 0x02, 0xaa, 0xbb];
+        assert_eq!(b[b.len() - tail.len()..], tail);
+        assert_eq!(NegotiationToken::parse(&b).unwrap(), t);
+    }
+
+    #[test]
+    fn init2_mic_at_4() {
+        let t = NegotiationToken::Init(NegTokenInit {
+            mech_types: vec![Mech::Kerberos],
+            neg_hints: Some(NegHints::default()),
+            mech_list_mic: Some(vec![0xaa]),
+            ..NegTokenInit::default()
+        });
+        let b = t.to_bytes().unwrap();
+        let tail = [0xa3, 0x02, 0x30, 0x00, 0xa4, 0x03, 0x04, 0x01, 0xaa];
+        assert_eq!(b[b.len() - tail.len()..], tail);
+        assert_eq!(NegotiationToken::parse(&b).unwrap(), t);
+    }
+
+    #[test]
+    fn context_flags() {
+        let t = NegotiationToken::Init(NegTokenInit {
+            req_flags: Some(ContextFlags::DELEG | ContextFlags::CONF),
+            ..NegTokenInit::default()
+        });
+        let b = t.to_bytes().unwrap();
+        // [0] { [0] {} [1] { BIT STRING 0 unused, 84 00 00 00 } }
+        assert_eq!(b, [0xa0, 0x0f, 0x30, 0x0d, 0xa0, 0x02, 0x30, 0x00, 0xa1, 0x07, 0x03, 0x05, 0x00, 0x84, 0, 0, 0]);
+        // A short bit string, with garbage in its unused bits, as BER allows.
+        let short = [0xa0, 0x0c, 0x30, 0x0a, 0xa0, 0x02, 0x30, 0x00, 0xa1, 0x04, 0x03, 0x02, 0x01, 0x63];
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&short).unwrap() else { panic!() };
+        let f = i.req_flags.unwrap();
+        assert_eq!(f, ContextFlags(0x6200_0000));
+        assert!(f.contains(ContextFlags::MUTUAL | ContextFlags::REPLAY | ContextFlags::INTEG));
+        assert!(!f.contains(ContextFlags::DELEG));
+        // Bits past the 32nd are dropped.
+        let long = [0xa0, 0x0f, 0x30, 0x0d, 0xa0, 0x02, 0x30, 0x00, 0xa1, 0x07, 0x03, 0x05, 0x00, 1, 2, 3, 4];
+        let mut l = long.to_vec();
+        l[1] += 1;
+        l[3] += 1;
+        l[9] += 1;
+        l[11] += 1;
+        l.push(5);
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&l).unwrap() else { panic!() };
+        assert_eq!(i.req_flags, Some(ContextFlags(0x0102_0304)));
+    }
+
+    #[test]
+    fn mechs_named() {
+        for (m, c, s) in NAMED.iter() {
+            let oid = Oid::from_contents(c).unwrap();
+            assert_eq!(oid.to_string(), *s);
+            assert_eq!(&Mech::from_oid(&oid), m);
+            assert_eq!(m.contents(), *c);
+            assert_eq!(m.to_string(), *s);
+            assert_eq!(Mech::from_contents(c).unwrap(), *m);
+        }
+        let other: Oid = "1.2.3".parse().unwrap();
+        assert_eq!(Mech::from_oid(&other), Mech::Other(other.clone()));
+        assert_eq!(Mech::Other(other).to_string(), "1.2.3");
+        assert!(Mech::from_contents(&[]).is_err());
+        // A long identifier needs a long-form length.
+        let long = Mech::Other(
+            Oid::from_arcs(&[1, 2, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120, 1 << 120])
+                .unwrap(),
+        );
+        assert!(long.contents().len() >= 128);
+        let t = NegotiationToken::Resp(NegTokenResp { supported_mech: Some(long), ..NegTokenResp::default() });
+        assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
+    }
+
+    #[test]
+    fn round_trips() {
+        for t in sample_tokens() {
+            let bare = t.to_bytes().unwrap();
+            assert_eq!(NegotiationToken::parse(&bare).unwrap(), t);
+            assert_eq!(token_len(&bare), Ok(Some(bare.len())));
+            if let NegotiationToken::Init(_) = t {
+                let wrapped = t.to_gss_bytes().unwrap();
+                assert_eq!(NegotiationToken::parse(&wrapped).unwrap(), t);
+                assert_eq!(token_len(&wrapped), Ok(Some(wrapped.len())));
+            }
+        }
+        let k = InitialContextToken { mech: Mech::Kerberos, inner: vec![1, 0, 0x6e, 0x00] };
+        assert_eq!(InitialContextToken::parse(&k.to_bytes().unwrap()).unwrap(), k);
+        let empty = InitialContextToken { mech: Mech::Ntlm, inner: Vec::new() };
+        assert_eq!(InitialContextToken::parse(&empty.to_bytes().unwrap()).unwrap(), empty);
+    }
+
+    #[test]
+    fn ber_forms_are_read() {
+        // accept-completed with indefinite lengths and a long-form length.
+        let b = [0xa1, 0x80, 0x30, 0x80, 0xa0, 0x81, 0x03, 0x0a, 0x01, 0x00, 0, 0, 0, 0];
+        assert_eq!(NegotiationToken::parse(&b).unwrap(), NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap());
+        // A responseToken split into two segments.
+        let b = [0xa1, 0x0e, 0x30, 0x0c, 0xa2, 0x0a, 0x24, 0x08, 0x04, 0x02, 1, 2, 0x04, 0x02, 3, 4];
+        let NegotiationToken::Resp(r) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        assert_eq!(r.response_token, Some(vec![1, 2, 3, 4]));
+        // A wrapper with a long-form length that is not minimal.
+        let samba = samba_init2();
+        let mut w = vec![0x60, 0x82, 0x00, 0x48];
+        w.extend_from_slice(&samba[2..]);
+        assert_eq!(NegotiationToken::parse(&w).unwrap(), NegotiationToken::parse(&samba).unwrap());
+    }
+
+    #[test]
+    fn ber_values_are_read_and_written_as_der() {
+        // reqFlags as a constructed bit string, and as an empty one.
+        let b = [0xa0, 0x0e, 0x30, 0x0c, 0xa0, 0x02, 0x30, 0x00, 0xa1, 0x06, 0x23, 0x04, 0x03, 0x02, 0x00, 0xff];
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        assert_eq!(i.req_flags, Some(ContextFlags(0xff00_0000)));
+        let b = [0xa0, 0x0b, 0x30, 0x09, 0xa0, 0x02, 0x30, 0x00, 0xa1, 0x03, 0x03, 0x01, 0x00];
+        let t = NegotiationToken::parse(&b).unwrap();
+        let NegotiationToken::Init(i) = &t else { panic!() };
+        assert_eq!(i.req_flags, Some(ContextFlags(0)));
+        // Written as four bytes, which is longer, and read back the same.
+        assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
+        // A hint name in two OCTET STRING segments, as X.690 8.23.6 allows.
+        let b = [
+            0xa0, 0x14, 0x30, 0x12, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x0c, 0x30, 0x0a, 0xa0, 0x08, 0x3b, 0x06, 0x04, 0x01,
+            b'a', 0x04, 0x01, b'b',
+        ];
+        let t = NegotiationToken::parse(&b).unwrap();
+        let NegotiationToken::Init(i) = &t else { panic!() };
+        assert_eq!(i.neg_hints.as_ref().and_then(|h| h.hint_name.as_deref()), Some(&b"ab"[..]));
+        assert_eq!(NegotiationToken::parse(&t.to_bytes().unwrap()).unwrap(), t);
+        // An identifier with a padded arc is not read, so it is never
+        // written back.
+        let b = [0xa0, 0x0a, 0x30, 0x08, 0xa0, 0x06, 0x30, 0x04, 0x06, 0x02, 0x80, 0x01];
+        assert_eq!(NegotiationToken::parse(&b), Err(Error::Asn1(asn1::Error::Oid)));
+        assert_eq!(
+            InitialContextToken::parse(&[0x60, 0x04, 0x06, 0x02, 0x80, 0x01]),
+            Err(Error::Asn1(asn1::Error::Oid))
+        );
+    }
+
+    #[test]
+    fn wrapped_resp_is_rejected() {
+        // RFC 4178 4.1: tokens after the first are never wrapped, and a
+        // negTokenResp is never a first token.
+        let w = InitialContextToken { mech: Mech::Spnego, inner: ACCEPT_COMPLETED.to_vec() }.to_bytes().unwrap();
+        assert_eq!(NegotiationToken::parse(&w), Err(Error::WrappedResp));
+        let r = NegotiationToken::parse(&ACCEPT_COMPLETED).unwrap();
+        assert_eq!(r.to_gss_bytes(), Err(Error::WrappedResp));
+    }
+
+    #[test]
+    fn unknown_field_4_in_init_is_ignored() {
+        // RFC 4178 4.2: unknown fields are ignored. With no [3], a [4]
+        // that is not an OCTET STRING cannot be an Init2 mechListMIC.
+        let b = [0xa0, 0x0b, 0x30, 0x09, 0xa0, 0x02, 0x30, 0x00, 0xa4, 0x03, 0x02, 0x01, 0x07];
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        assert_eq!(i.mech_list_mic, None);
+        let b = [0xa0, 0x08, 0x30, 0x06, 0xa0, 0x02, 0x30, 0x00, 0x84, 0x00];
+        assert!(NegotiationToken::parse(&b).is_ok());
+        // After hints, [4] is the Init2 mechListMIC and must be one.
+        let b = [0xa0, 0x0f, 0x30, 0x0d, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x02, 0x30, 0x00, 0xa4, 0x03, 0x02, 0x01, 0x07];
+        assert!(matches!(NegotiationToken::parse(&b), Err(Error::Asn1(asn1::Error::Unexpected { .. }))));
+    }
+
+    #[test]
+    fn extensions_are_skipped() {
+        // A NegTokenResp with a [5] field after the known ones.
+        let b = [0xa1, 0x0c, 0x30, 0x0a, 0xa0, 0x03, 0x0a, 0x01, 0x02, 0xa5, 0x03, 0x02, 0x01, 0x07];
+        let NegotiationToken::Resp(r) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        assert_eq!(r.neg_state, Some(NegState::Reject));
+        // A NegTokenInit with a mechListMIC at [3] and an extension at [4].
+        let b = [
+            0xa0, 0x10, 0x30, 0x0e, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x03, 0x04, 0x01, 0xaa, 0xa4, 0x03, 0x04, 0x01, 0xbb,
+        ];
+        let NegotiationToken::Init(i) = NegotiationToken::parse(&b).unwrap() else { panic!() };
+        assert_eq!(i.mech_list_mic, Some(vec![0xaa]));
+    }
+
+    #[test]
+    fn error_paths() {
+        use asn1::Error as A;
+        let p = NegotiationToken::parse;
+        assert_eq!(p(&[]), Err(Error::Asn1(A::Empty)));
+        assert_eq!(p(&[0x30, 0x00]), Err(Error::NotToken));
+        assert_eq!(p(&[0xa2, 0x02, 0x30, 0x00]), Err(Error::NotToken));
+        assert_eq!(p(&[0x80, 0x00]), Err(Error::Asn1(A::Primitive)));
+        assert_eq!(p(&[0xa1, 0x00]), Err(Error::Asn1(A::Empty)));
+        assert_eq!(p(&[0xa1, 0x03, 0x30, 0x00]), Err(Error::Asn1(A::Truncated)));
+        assert_eq!(p(&[0xa1, 0x02, 0x30, 0x00, 0x30, 0x00]), Err(Error::Asn1(A::Trailing)));
+        assert_eq!(p(&[0xa1, 0x04, 0x30, 0x00, 0x30, 0x00]), Err(Error::Asn1(A::Trailing)));
+        // NegTokenInit without mechTypes.
+        assert_eq!(p(&[0xa0, 0x02, 0x30, 0x00]), Err(Error::MissingMechTypes));
+        // Fields out of order, repeated, or of another class.
+        assert_eq!(p(&[0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa0, 0x02, 0x04, 0x00]), Err(Error::Field));
+        assert_eq!(p(&[0xa1, 0x0a, 0x30, 0x08, 0xa2, 0x02, 0x04, 0x00, 0xa2, 0x02, 0x04, 0x00]), Err(Error::Field));
+        assert_eq!(p(&[0xa1, 0x04, 0x30, 0x02, 0x04, 0x00]), Err(Error::Field));
+        // A field holding the wrong type, or two values, or a primitive tag.
+        assert!(matches!(p(&[0xa1, 0x06, 0x30, 0x04, 0xa2, 0x02, 0x02, 0x00]), Err(Error::Asn1(A::Unexpected { .. }))));
+        assert_eq!(p(&[0xa1, 0x08, 0x30, 0x06, 0xa2, 0x04, 0x04, 0x00, 0x04, 0x00]), Err(Error::Asn1(A::Trailing)));
+        assert_eq!(p(&[0xa1, 0x04, 0x30, 0x02, 0x82, 0x00]), Err(Error::Asn1(A::Primitive)));
+        assert_eq!(p(&[0x81, 0x02, 0x30, 0x00]), Err(Error::Asn1(A::Primitive)));
+        // A negState outside 0..=3.
+        assert_eq!(p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0x04]), Err(Error::NegState(4)));
+        assert_eq!(p(&[0xa1, 0x07, 0x30, 0x05, 0xa0, 0x03, 0x0a, 0x01, 0xff]), Err(Error::NegState(-1)));
+        assert_eq!(NegState::from_value(9), Err(Error::NegState(9)));
+        // A negState too large for an i64.
+        let mut big = vec![0xa1, 0x10, 0x30, 0x0e, 0xa0, 0x0c, 0x0a, 0x0a, 0x01];
+        big.extend_from_slice(&[0; 9]);
+        assert_eq!(p(&big), Err(Error::Asn1(A::Integer)));
+        // Hints with an unknown field.
+        assert_eq!(
+            p(&[0xa0, 0x0c, 0x30, 0x0a, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x04, 0x30, 0x02, 0x85, 0x00]),
+            Err(Error::Asn1(A::Trailing))
+        );
+        // [3] holding neither an OCTET STRING nor a SEQUENCE.
+        assert!(matches!(
+            p(&[0xa0, 0x0b, 0x30, 0x09, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x03, 0x02, 0x01, 0x00]),
+            Err(Error::Asn1(A::Unexpected { .. }))
+        ));
+        // [3] empty.
+        assert_eq!(p(&[0xa0, 0x08, 0x30, 0x06, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x00]), Err(Error::Asn1(A::Empty)));
+        // Too many mechanisms, read and written.
+        let mut list = Vec::new();
+        for _ in 0..=MAX_MECHS {
+            list.extend_from_slice(&[0x06, 0x01, 0x2a]);
+        }
+        let mut b = vec![0xa0, 0x82, 0, 0, 0x30, 0x82, 0, 0, 0xa0, 0x82, 0, 0, 0x30, 0x82, 0, 0];
+        let n = list.len();
+        b[14..16].copy_from_slice(&(n as u16).to_be_bytes());
+        b[10..12].copy_from_slice(&(n as u16 + 4).to_be_bytes());
+        b[6..8].copy_from_slice(&(n as u16 + 8).to_be_bytes());
+        b[2..4].copy_from_slice(&(n as u16 + 12).to_be_bytes());
+        b.extend_from_slice(&list);
+        assert_eq!(p(&b), Err(Error::TooManyMechs));
+        let too_many = NegTokenInit { mech_types: vec![Mech::Ntlm; MAX_MECHS + 1], ..NegTokenInit::default() };
+        assert_eq!(NegotiationToken::Init(too_many).to_bytes(), Err(Error::TooManyMechs));
+        let most = NegTokenInit { mech_types: vec![Mech::Ntlm; MAX_MECHS], ..NegTokenInit::default() };
+        let most = NegotiationToken::Init(most);
+        assert_eq!(p(&most.to_bytes().unwrap()).unwrap(), most);
+        // Too long, read and written.
+        assert_eq!(p(&vec![0xa1; MAX_TOKEN + 1]), Err(Error::TooLong));
+        assert_eq!(InitialContextToken::parse(&vec![0x60; MAX_TOKEN + 1]), Err(Error::TooLong));
+        let huge = NegTokenResp { response_token: Some(vec![0; MAX_TOKEN]), ..NegTokenResp::default() };
+        assert_eq!(NegotiationToken::Resp(huge).to_bytes(), Err(Error::TooLong));
+        let near = NegTokenResp { response_token: Some(vec![0; MAX_TOKEN - 20]), ..NegTokenResp::default() };
+        let near = NegotiationToken::Resp(near);
+        let bytes = near.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_TOKEN);
+        assert_eq!(p(&bytes).unwrap(), near);
+        assert_eq!(near.to_gss_bytes(), Err(Error::WrappedResp));
+        let near = NegTokenInit { mech_token: Some(vec![0; MAX_TOKEN - 20]), ..NegTokenInit::default() };
+        let near = NegotiationToken::Init(near);
+        assert_eq!(p(&near.to_bytes().unwrap()).unwrap(), near);
+        assert_eq!(near.to_gss_bytes(), Err(Error::TooLong));
+        let big = InitialContextToken { mech: Mech::Ntlm, inner: vec![0; MAX_TOKEN] };
+        assert_eq!(big.to_bytes(), Err(Error::TooLong));
+        // Wrapper errors.
+        let ic = InitialContextToken::parse;
+        assert_eq!(ic(&[0x61, 0x00]), Err(Error::NotToken));
+        assert_eq!(ic(&[0x40, 0x00]), Err(Error::NotToken));
+        assert_eq!(ic(&[0x60, 0x80, 0x06, 0x01, 0x2a, 0, 0]), Err(Error::Indefinite));
+        assert_eq!(ic(&[0x60, 0x03, 0x06, 0x01]), Err(Error::Asn1(A::Truncated)));
+        assert_eq!(ic(&[0x60, 0x03, 0x06, 0x01, 0x2a, 0x00]), Err(Error::Asn1(A::Trailing)));
+        assert_eq!(ic(&[0x60, 0x00]), Err(Error::Asn1(A::Empty)));
+        assert_eq!(ic(&[0x60, 0x02, 0x06, 0x00]), Err(Error::Asn1(A::Oid)));
+        assert_eq!(ic(&[0x60]), Err(Error::Asn1(A::Truncated)));
+        assert_eq!(ic(&[0x60, 0xff]), Err(Error::Asn1(A::Length)));
+        // A wrapper for another mechanism.
+        let k = InitialContextToken { mech: Mech::Kerberos, inner: samba_init2()[10..].to_vec() }.to_bytes().unwrap();
+        assert_eq!(p(&k), Err(Error::WrongMech));
+        // A wrapper around nothing SPNEGO reads.
+        let w = InitialContextToken { mech: Mech::Spnego, inner: vec![0x30, 0x00] }.to_bytes().unwrap();
+        assert_eq!(p(&w), Err(Error::NotToken));
+        // A hint name the writer cannot write is impossible: GeneralString
+        // bytes are not checked. Every error has a message.
+        for e in [
+            Error::Asn1(A::Empty),
+            Error::TooLong,
+            Error::TooManyMechs,
+            Error::NotToken,
+            Error::Indefinite,
+            Error::WrongMech,
+            Error::Field,
+            Error::WrappedResp,
+            Error::MissingMechTypes,
+            Error::NegState(7),
+        ] {
+            assert!(!e.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn token_len_errors() {
+        assert_eq!(token_len(&[]), Ok(None));
+        assert_eq!(token_len(&[0x30]), Err(Error::NotToken));
+        assert_eq!(token_len(&[0xa1]), Ok(None));
+        assert_eq!(token_len(&[0xa1, 0x80]), Err(Error::Indefinite));
+        assert_eq!(token_len(&[0xa1, 0xff]), Err(Error::Asn1(asn1::Error::Length)));
+        assert_eq!(token_len(&[0xa1, 0x83, 0x01, 0x00, 0x00]), Err(Error::TooLong));
+        assert_eq!(token_len(&[0xa1, 0x82, 0xff]), Ok(None));
+        assert_eq!(token_len(&[0xa1, 0x82, 0xff, 0xfc]), Ok(None));
+        assert_eq!(token_len(&[0xa1, 0x82, 0xff, 0xfd]), Err(Error::TooLong));
+    }
+
+    #[test]
+    fn truncated_prefixes() {
+        let mut all = vec![samba_init2(), ACCEPT_COMPLETED.to_vec()];
+        for t in sample_tokens() {
+            all.push(t.to_bytes().unwrap());
+            if let Ok(w) = t.to_gss_bytes() {
+                all.push(w);
+            }
+        }
+        for b in &all {
+            for n in 0..b.len() {
+                assert!(NegotiationToken::parse(&b[..n]).is_err(), "prefix {n} of {b:02x?}");
+                assert_eq!(token_len(&b[..n]), Ok(None));
+                if b[0] == GSS_TAG {
+                    assert!(InitialContextToken::parse(&b[..n]).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decoder() {
+        let a = samba_init2();
+        let b = ACCEPT_COMPLETED.to_vec();
+        let mut stream = a.clone();
+        stream.extend_from_slice(&b);
+        stream.extend_from_slice(&a);
+        let mut d = Decoder::new();
+        for (i, byte) in stream.iter().enumerate() {
+            d.feed(std::slice::from_ref(byte));
+            match i + 1 {
+                n if n == a.len() => assert_eq!(d.next_token(), Some(Ok(a.clone()))),
+                n if n == a.len() + b.len() => assert_eq!(d.next_token(), Some(Ok(b.clone()))),
+                n if n == stream.len() => assert_eq!(d.next_token(), Some(Ok(a.clone()))),
+                _ => assert_eq!(d.next_token(), None),
+            }
+        }
+        assert_eq!(d.buffered(), 0);
+        d.feed(&[0x30, 0x00]);
+        assert_eq!(d.next_token(), Some(Err(Error::NotToken)));
+        d.feed(&b);
+        assert_eq!(d.next_token(), Some(Err(Error::NotToken)));
+        assert_eq!(d.buffered(), 0);
+    }
+
+    /// A linear congruential generator, so the fuzz loop is the same on
+    /// every run.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            self.next() as usize % n.max(1)
+        }
+
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let n = self.below(max + 1);
+            (0..n).map(|_| self.next() as u8).collect()
+        }
+
+        fn opt(&mut self, max: usize) -> Option<Vec<u8>> {
+            if self.next().is_multiple_of(2) { None } else { Some(self.bytes(max)) }
+        }
+
+        fn mech(&mut self) -> Mech {
+            match self.below(NAMED.len() + 1) {
+                i if i < NAMED.len() => NAMED[i].0.clone(),
+                _ => Mech::Other(Oid::from_arcs(&[2, u128::from(self.next()), u128::from(self.next())]).unwrap()),
+            }
+        }
+
+        fn token(&mut self) -> NegotiationToken {
+            if self.next().is_multiple_of(2) {
+                NegotiationToken::Init(NegTokenInit {
+                    mech_types: (0..self.below(5)).map(|_| self.mech()).collect(),
+                    req_flags: if self.next().is_multiple_of(2) { None } else { Some(ContextFlags(self.next())) },
+                    mech_token: self.opt(40),
+                    neg_hints: if self.next().is_multiple_of(2) {
+                        None
+                    } else {
+                        Some(NegHints { hint_name: self.opt(20), hint_address: self.opt(8) })
+                    },
+                    mech_list_mic: self.opt(20),
+                })
+            } else {
+                NegotiationToken::Resp(NegTokenResp {
+                    neg_state: match self.below(5) {
+                        4 => None,
+                        v => Some(NegState::from_value(v as i64).unwrap()),
+                    },
+                    supported_mech: if self.next().is_multiple_of(2) { None } else { Some(self.mech()) },
+                    response_token: self.opt(40),
+                    mech_list_mic: self.opt(20),
+                })
+            }
+        }
+    }
+
+    /// Whatever a parse gives, writing it and reading it back gives the
+    /// same value.
+    fn check(b: &[u8]) {
+        if let Ok(t) = NegotiationToken::parse(b) {
+            match t.to_bytes() {
+                Ok(again) => assert_eq!(NegotiationToken::parse(&again).as_ref(), Ok(&t)),
+                Err(e) => assert_eq!(e, Error::TooLong),
+            }
+        }
+        if let Ok(t) = InitialContextToken::parse(b) {
+            assert_eq!(InitialContextToken::parse(&t.to_bytes().unwrap()), Ok(t));
+        }
+        if let Ok(Some(n)) = token_len(b) {
+            assert!(n <= b.len());
+        }
+    }
+
+    #[test]
+    fn lcg_fuzz() {
+        let mut rng = Lcg(0x0005_eed5_ae90);
+        for _ in 0..4000 {
+            // A value written and read back.
+            let t = rng.token();
+            let wrap = matches!(t, NegotiationToken::Init(_)) && rng.next().is_multiple_of(2);
+            let bytes = if wrap { t.to_gss_bytes() } else { t.to_bytes() }.unwrap();
+            assert_eq!(NegotiationToken::parse(&bytes).as_ref(), Ok(&t));
+            assert_eq!(token_len(&bytes), Ok(Some(bytes.len())));
+
+            // The same bytes, damaged.
+            let mut m = bytes.clone();
+            for _ in 0..1 + rng.below(3) {
+                match rng.below(4) {
+                    0 if !m.is_empty() => {
+                        let i = rng.below(m.len());
+                        m[i] = rng.next() as u8;
+                    }
+                    1 if !m.is_empty() => {
+                        let i = rng.below(m.len());
+                        m.remove(i);
+                    }
+                    2 => {
+                        let i = rng.below(m.len() + 1);
+                        m.insert(i, rng.next() as u8);
+                    }
+                    _ => m.truncate(rng.below(m.len() + 1)),
+                }
+            }
+            check(&m);
+
+            // Random bytes, often after a plausible first byte.
+            let mut r = rng.bytes(64);
+            if let Some(first) = r.first_mut() {
+                *first = [GSS_TAG, INIT_TAG, RESP_TAG, *first][rng.below(4)];
+            }
+            check(&r);
+
+            // A stream of tokens, all at once and a byte at a time.
+            let mut stream = Vec::new();
+            for _ in 0..rng.below(4) {
+                stream.extend_from_slice(&rng.token().to_bytes().unwrap());
+            }
+            if rng.next().is_multiple_of(2) {
+                stream.extend_from_slice(&m);
+            }
+            let mut whole = Decoder::new();
+            whole.feed(&stream);
+            let mut a = Vec::new();
+            while let Some(x) = whole.next_token() {
+                let stop = x.is_err();
+                a.push(x);
+                if stop {
+                    break;
+                }
+            }
+            let mut bytewise = Decoder::new();
+            let mut b = Vec::new();
+            'outer: for byte in &stream {
+                bytewise.feed(std::slice::from_ref(byte));
+                while let Some(x) = bytewise.next_token() {
+                    let stop = x.is_err();
+                    b.push(x);
+                    if stop {
+                        break 'outer;
+                    }
+                }
+            }
+            assert_eq!(a, b);
+            for tok in a.iter().flatten() {
+                check(tok);
+            }
+        }
+    }
+}

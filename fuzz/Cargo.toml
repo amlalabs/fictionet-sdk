@@ -144,3 +144,346 @@ path = "fuzz_targets/tftp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "websocket"
+path = "fuzz_targets/websocket.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "syslog"
+path = "fuzz_targets/syslog.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "snmp"
+path = "fuzz_targets/snmp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "postgres"
+path = "fuzz_targets/postgres.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "stun"
+path = "fuzz_targets/stun.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bacnet"
+path = "fuzz_targets/bacnet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "asn1"
+path = "fuzz_targets/asn1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssh"
+path = "fuzz_targets/ssh.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dhcpv6"
+path = "fuzz_targets/dhcpv6.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nbns"
+path = "fuzz_targets/nbns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mysql"
+path = "fuzz_targets/mysql.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ftp"
+path = "fuzz_targets/ftp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "imap"
+path = "fuzz_targets/imap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "protobuf"
+path = "fuzz_targets/protobuf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "quic"
+path = "fuzz_targets/quic.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "grpc"
+path = "fuzz_targets/grpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mime_multipart"
+path = "fuzz_targets/mime_multipart.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "urlencoded_form"
+path = "fuzz_targets/urlencoded_form.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml"
+path = "fuzz_targets/xml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "imf"
+path = "fuzz_targets/imf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "onc_rpc"
+path = "fuzz_targets/onc_rpc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sip"
+path = "fuzz_targets/sip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sdp"
+path = "fuzz_targets/sdp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtp"
+path = "fuzz_targets/rtp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mongodb"
+path = "fuzz_targets/mongodb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kafka"
+path = "fuzz_targets/kafka.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_protocol"
+path = "fuzz_targets/proxy_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amqp"
+path = "fuzz_targets/amqp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "enip"
+path = "fuzz_targets/enip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opcua"
+path = "fuzz_targets/opcua.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rfb"
+path = "fuzz_targets/rfb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "git_protocol"
+path = "fuzz_targets/git_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "telnet"
+path = "fuzz_targets/telnet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "memcache"
+path = "fuzz_targets/memcache.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fastcgi"
+path = "fuzz_targets/fastcgi.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "nfs"
+path = "fuzz_targets/nfs.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "qpack"
+path = "fuzz_targets/qpack.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sftp"
+path = "fuzz_targets/sftp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "socks"
+path = "fuzz_targets/socks.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rtsp"
+path = "fuzz_targets/rtsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cotp"
+path = "fuzz_targets/cotp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vxlan"
+path = "fuzz_targets/vxlan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "geneve"
+path = "fuzz_targets/geneve.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ldap"
+path = "fuzz_targets/ldap.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "x509"
+path = "fuzz_targets/x509.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ocsp"
+path = "fuzz_targets/ocsp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "kerberos"
+path = "fuzz_targets/kerberos.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "spnego"
+path = "fuzz_targets/spnego.rs"
+test = false
+doc = false
+bench = false

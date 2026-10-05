@@ -1,0 +1,3955 @@
+//! OPC UA over TCP: reading and writing the binary transport, its built-in
+//! types and the OpenSecureChannel service, with no I/O.
+//!
+//! OPC UA is how much modern industrial equipment is read and controlled.
+//! A server (a PLC, a gateway, a SCADA host) exposes an address space of
+//! nodes, and a client reads, writes and subscribes to them. The binary
+//! transport runs over TCP, usually on port 4840. This module follows OPC
+//! UA Part 6 (Mappings), version 1.05: the UA TCP messages (HEL, ACK, ERR
+//! and RHE), the secure conversation chunks (OPN, CLO and MSG), the binary
+//! encoding of the built-in types, and the OpenSecureChannel and
+//! CloseSecureChannel services with security policy None.
+//!
+//! Nothing here reads a socket. A world that plays a server feeds the
+//! bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
+//! [`Decoder`] and gets [`Message`]s back. It answers a [`Hello`] with an
+//! [`Acknowledge`], gives the decoder the negotiated [`Limits`], reads each
+//! [`SecureMessage`]'s body as a [`Service`], and writes its answers with
+//! [`Message::to_bytes`]. Chunks of a long message are put back together
+//! before the world sees it. What the address space holds, and which
+//! requests succeed, is up to world code.
+//!
+//! There is no cryptography. A secure message's body is kept exactly as it
+//! came, which is the plain body under policy None. A world that is asked
+//! for another policy answers with an [`ErrorMessage`] carrying
+//! [`StatusCode::BAD_SECURITY_POLICY_REJECTED`]. Extension objects are kept
+//! as raw bytes, with their type id, for world code to read.
+//!
+//! Every reader checks lengths, limits and nesting, because the agent can
+//! send any bytes it likes. A stream that breaks the specification gives a
+//! [`ChunkError`], whose [`ChunkError::status`] is the code a real server
+//! sends back in an ERR message before it closes the connection. Every
+//! writer checks the same limits and returns an [`EncodeError`] rather than
+//! write bytes a reader would refuse.
+//!
+//! ```
+//! use fictionet::stdlib::opcua::{
+//!     AsymmetricHeader, ChannelSecurityToken, Decoder, Limits, Message, OpenSecureChannelRequest,
+//!     OpenSecureChannelResponse, RequestHeader, RequestType, ResponseHeader, SecureKind,
+//!     SecureMessage, SecurityMode, Service, SECURITY_POLICY_NONE,
+//! };
+//!
+//! let mut server = Decoder::new();
+//!
+//! // A client's Hello: version 0, 64 KiB buffers, no message or chunk
+//! // limits, and its endpoint URL.
+//! let url = b"opc.tcp://plc:4840";
+//! let mut hel = b"HELF".to_vec();
+//! hel.extend_from_slice(&(32 + url.len() as u32).to_le_bytes());
+//! for v in [0u32, 65536, 65536, 0, 0] {
+//!     hel.extend_from_slice(&v.to_le_bytes());
+//! }
+//! hel.extend_from_slice(&(url.len() as i32).to_le_bytes());
+//! hel.extend_from_slice(url);
+//! server.feed(&hel);
+//!
+//! let Some(Ok(Message::Hello(hello))) = server.next_message() else { panic!() };
+//! assert_eq!(hello.endpoint_url, "opc.tcp://plc:4840");
+//! // The server takes chunks of up to 8192 bytes, the smallest allowed.
+//! let ack = hello.acknowledge(&Limits::default());
+//! assert_eq!(ack.receive_buffer_size, 8192);
+//! server.set_limits(ack.limits());
+//! let reply = Message::Acknowledge(ack).to_bytes(&hello.limits()).unwrap();
+//! assert_eq!(&reply[..4], b"ACKF");
+//! assert_eq!(reply.len(), 28);
+//!
+//! // The client opens a secure channel with no security.
+//! let request = Service::OpenSecureChannelRequest(OpenSecureChannelRequest {
+//!     header: RequestHeader { request_handle: 1, ..RequestHeader::default() },
+//!     client_protocol_version: 0,
+//!     request_type: RequestType::Issue,
+//!     security_mode: SecurityMode::None,
+//!     client_nonce: None,
+//!     requested_lifetime: 600_000,
+//! });
+//! let opn = Message::Secure(SecureMessage {
+//!     kind: SecureKind::Open(AsymmetricHeader::none()),
+//!     channel_id: 0,
+//!     sequence_number: 1,
+//!     request_id: 1,
+//!     body: request.to_bytes().unwrap(),
+//! });
+//! server.feed(&opn.to_bytes(&ack.limits()).unwrap());
+//!
+//! let Some(Ok(Message::Secure(msg))) = server.next_message() else { panic!() };
+//! let SecureKind::Open(security) = &msg.kind else { panic!() };
+//! assert_eq!(security.policy_uri, SECURITY_POLICY_NONE);
+//! let Ok(Service::OpenSecureChannelRequest(req)) = Service::parse(&msg.body) else { panic!() };
+//!
+//! // The server issues channel 7, token 1.
+//! let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
+//!     header: ResponseHeader { request_handle: req.header.request_handle, ..ResponseHeader::default() },
+//!     server_protocol_version: 0,
+//!     security_token: ChannelSecurityToken {
+//!         channel_id: 7,
+//!         token_id: 1,
+//!         created_at: 0,
+//!         revised_lifetime: req.requested_lifetime,
+//!     },
+//!     server_nonce: None,
+//! });
+//! let answer = Message::Secure(SecureMessage {
+//!     kind: msg.kind.clone(),
+//!     channel_id: 7,
+//!     sequence_number: 1,
+//!     request_id: msg.request_id,
+//!     body: response.to_bytes().unwrap(),
+//! });
+//! let bytes = answer.to_bytes(&hello.limits()).unwrap();
+//! assert_eq!(&bytes[..4], b"OPNF");
+//! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
+//! ```
+
+/// The TCP port OPC UA servers listen on.
+pub const PORT: u16 = 4840;
+/// The length of every chunk's header: the message type, the chunk type
+/// and the size.
+pub const HEADER_LEN: usize = 8;
+/// The UA TCP protocol version this module speaks.
+pub const PROTOCOL_VERSION: u32 = 0;
+/// The smallest send or receive buffer a Hello or Acknowledge may name.
+/// It is also the largest chunk a [`Decoder`] takes before [`Limits`] are
+/// negotiated.
+pub const MIN_BUFFER_SIZE: u32 = 8192;
+/// The largest chunk a [`Decoder`] takes, whatever was negotiated.
+pub const MAX_BUFFER_SIZE: u32 = 1 << 20;
+/// The largest message body a [`Decoder`] puts together from chunks,
+/// whatever was negotiated.
+pub const MAX_MESSAGE_SIZE: u32 = 1 << 24;
+/// The most chunks one message may take, whatever was negotiated.
+pub const MAX_CHUNK_COUNT: u32 = 4096;
+/// The longest endpoint URL or server URI in a Hello or ReverseHello, in
+/// bytes. Part 6 says each shall be less than 4096 bytes.
+pub const MAX_URL_LEN: usize = 4095;
+/// The longest reason in an Error message or an abort chunk, in bytes.
+/// A reader drops a longer reason and reads it as empty, as Part 6 asks.
+pub const MAX_REASON_LEN: usize = 4096;
+/// The longest security policy URI in an OPN chunk, in bytes.
+pub const MAX_POLICY_URI_LEN: usize = 255;
+/// The largest HEL, ACK, ERR or RHE message a [`Decoder`] takes, even
+/// when the negotiated chunk size is smaller: a ReverseHello holding two
+/// URLs of the longest length.
+pub const MAX_HANDSHAKE_SIZE: u32 = (HEADER_LEN + 2 * (4 + MAX_URL_LEN)) as u32;
+/// The longest String, ByteString or XmlElement, in bytes.
+pub const MAX_STRING_LEN: usize = MAX_MESSAGE_SIZE as usize;
+/// The most elements in one array.
+pub const MAX_ARRAY_LEN: usize = 1 << 16;
+/// The most values one [`Reader`] reads, or one [`Writer`] writes: every
+/// array element, and every Variant, DataValue and DiagnosticInfo, counted
+/// together. A value in memory can be a hundred times larger than its one
+/// byte on the wire, so this bounds what a message can make a reader
+/// allocate, to about 50 MB.
+pub const MAX_VALUES: usize = 1 << 18;
+/// The most dimensions a Variant's array may name.
+pub const MAX_DIMENSIONS: usize = 32;
+/// How deeply Variants, DataValues and DiagnosticInfos may nest inside
+/// one another.
+pub const MAX_DEPTH: usize = 16;
+/// The largest sequence number a legacy security policy may not wrap
+/// after. Once a number is above it, the next may wrap around to a number
+/// below 1024. A [`Decoder`] accepts that wrap inside a message, as well
+/// as the plain one past `u32::MAX`.
+pub const LEGACY_WRAP: u32 = u32::MAX - 1024;
+/// The URI of security policy None, the only policy this module carries.
+pub const SECURITY_POLICY_NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+
+// ---------------------------------------------------------------------
+// Status codes and errors
+// ---------------------------------------------------------------------
+
+/// An OPC UA status code. The top two bits say whether it is good (00),
+/// uncertain (01) or bad (10).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StatusCode(pub u32);
+
+impl StatusCode {
+    /// Good: the operation succeeded.
+    pub const GOOD: StatusCode = StatusCode(0);
+    /// An unexpected error occurred.
+    pub const BAD_UNEXPECTED_ERROR: StatusCode = StatusCode(0x8001_0000);
+    /// A low level communication error occurred.
+    pub const BAD_COMMUNICATION_ERROR: StatusCode = StatusCode(0x8005_0000);
+    /// Encoding halted because of invalid data in the objects.
+    pub const BAD_ENCODING_ERROR: StatusCode = StatusCode(0x8006_0000);
+    /// Decoding halted because of invalid data in the stream.
+    pub const BAD_DECODING_ERROR: StatusCode = StatusCode(0x8007_0000);
+    /// The encoding or decoding limits of the stack were exceeded.
+    pub const BAD_ENCODING_LIMITS_EXCEEDED: StatusCode = StatusCode(0x8008_0000);
+    /// The server does not support the requested service.
+    pub const BAD_SERVICE_UNSUPPORTED: StatusCode = StatusCode(0x800B_0000);
+    /// An error occurred verifying security.
+    pub const BAD_SECURITY_CHECKS_FAILED: StatusCode = StatusCode(0x8013_0000);
+    /// The secure channel is no longer valid.
+    pub const BAD_SECURE_CHANNEL_ID_INVALID: StatusCode = StatusCode(0x8022_0000);
+    /// The security token request type is not valid.
+    pub const BAD_REQUEST_TYPE_INVALID: StatusCode = StatusCode(0x8053_0000);
+    /// The security mode does not meet the server's requirements.
+    pub const BAD_SECURITY_MODE_REJECTED: StatusCode = StatusCode(0x8054_0000);
+    /// The security policy does not meet the server's requirements.
+    pub const BAD_SECURITY_POLICY_REJECTED: StatusCode = StatusCode(0x8055_0000);
+    /// The server is too busy to process the request.
+    pub const BAD_TCP_SERVER_TOO_BUSY: StatusCode = StatusCode(0x807D_0000);
+    /// The message type in a chunk header is not valid.
+    pub const BAD_TCP_MESSAGE_TYPE_INVALID: StatusCode = StatusCode(0x807E_0000);
+    /// The secure channel id or token id is not in use.
+    pub const BAD_TCP_SECURE_CHANNEL_UNKNOWN: StatusCode = StatusCode(0x807F_0000);
+    /// The chunk size in a header is too large.
+    pub const BAD_TCP_MESSAGE_TOO_LARGE: StatusCode = StatusCode(0x8080_0000);
+    /// There are not enough resources to process the request.
+    pub const BAD_TCP_NOT_ENOUGH_RESOURCES: StatusCode = StatusCode(0x8081_0000);
+    /// An internal error occurred.
+    pub const BAD_TCP_INTERNAL_ERROR: StatusCode = StatusCode(0x8082_0000);
+    /// The server does not recognize the endpoint URL.
+    pub const BAD_TCP_ENDPOINT_URL_INVALID: StatusCode = StatusCode(0x8083_0000);
+    /// The secure channel has been closed.
+    pub const BAD_SECURE_CHANNEL_CLOSED: StatusCode = StatusCode(0x8086_0000);
+    /// The token has expired or is not recognized.
+    pub const BAD_SECURE_CHANNEL_TOKEN_UNKNOWN: StatusCode = StatusCode(0x8087_0000);
+    /// The sequence number is not valid.
+    pub const BAD_SEQUENCE_NUMBER_INVALID: StatusCode = StatusCode(0x8088_0000);
+    /// The request message is larger than the server allows.
+    pub const BAD_REQUEST_TOO_LARGE: StatusCode = StatusCode(0x80B8_0000);
+    /// The response message is larger than the client or server allows.
+    pub const BAD_RESPONSE_TOO_LARGE: StatusCode = StatusCode(0x80B9_0000);
+    /// The two sides do not share a protocol version.
+    pub const BAD_PROTOCOL_VERSION_UNSUPPORTED: StatusCode = StatusCode(0x80BE_0000);
+
+    /// Whether the code is bad: its top bit is set.
+    pub fn is_bad(self) -> bool {
+        self.0 & 0x8000_0000 != 0
+    }
+
+    /// Whether the code is good: its top two bits are clear.
+    pub fn is_good(self) -> bool {
+        self.0 & 0xC000_0000 == 0
+    }
+}
+
+/// Why bytes are not a value in the OPC UA binary encoding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// The bytes ended before the value did.
+    End,
+    /// A length was below -1, above its limit, or longer than the bytes
+    /// left.
+    Length(i32),
+    /// A String was not UTF-8.
+    Utf8,
+    /// A NodeId's encoding byte named no form, or set ExpandedNodeId flags
+    /// where a plain NodeId belongs.
+    NodeIdForm(u8),
+    /// An encoding mask set bits that mean nothing for its type.
+    Mask(u8),
+    /// A Variant named a type that cannot appear where it did.
+    VariantType(u8),
+    /// A Variant's array dimensions were fewer than 2, more than
+    /// [`MAX_DIMENSIONS`], not all above 0, or did not match its length.
+    Dimensions,
+    /// Values nested more than [`MAX_DEPTH`] deep.
+    Depth,
+    /// The bytes held more than [`MAX_VALUES`] values.
+    TooManyValues,
+    /// An enumeration held a value it does not define.
+    Enum(i32),
+    /// Bytes were left over after the value.
+    Trailing(usize),
+}
+
+impl std::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::End => f.write_str("the bytes ended inside a value"),
+            DecodeError::Length(n) => write!(f, "length {n} is out of range"),
+            DecodeError::Utf8 => f.write_str("a string is not UTF-8"),
+            DecodeError::NodeIdForm(b) => {
+                write!(f, "NodeId encoding byte {b:#04x} is not valid here")
+            }
+            DecodeError::Mask(b) => write!(f, "encoding mask {b:#04x} sets unknown bits"),
+            DecodeError::VariantType(t) => write!(f, "Variant type {t} is not allowed here"),
+            DecodeError::Dimensions => f.write_str("array dimensions do not match the array"),
+            DecodeError::Depth => write!(f, "values nest more than {MAX_DEPTH} deep"),
+            DecodeError::TooManyValues => write!(f, "more than {MAX_VALUES} values"),
+            DecodeError::Enum(n) => write!(f, "enumeration value {n} is not defined"),
+            DecodeError::Trailing(n) => write!(f, "{n} bytes left over after the value"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+/// Why a value cannot be written: the bytes would break a limit or a rule
+/// that a reader checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncodeError {
+    /// A string, array, chunk or message is longer than its limit allows.
+    TooLong,
+    /// Values nest more than [`MAX_DEPTH`] deep.
+    TooDeep,
+    /// There are more than [`MAX_VALUES`] values.
+    TooManyValues,
+    /// A Variant holds a value of the wrong type: an array element that
+    /// does not match the array's type, a Variant directly inside a
+    /// Variant, or a type id that does not exist.
+    VariantType,
+    /// A Variant's array dimensions are fewer than 2, more than
+    /// [`MAX_DIMENSIONS`], not all above 0, or do not multiply out to its
+    /// length.
+    Dimensions,
+    /// A Hello or Acknowledge names a buffer smaller than
+    /// [`MIN_BUFFER_SIZE`].
+    BufferSize(u32),
+    /// A [`Service::Other`] carries the type id of a service this module
+    /// reads, so its body would be read as that service.
+    KnownTypeId,
+}
+
+impl std::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EncodeError::TooLong => f.write_str("a value is longer than its limit"),
+            EncodeError::TooDeep => write!(f, "values nest more than {MAX_DEPTH} deep"),
+            EncodeError::TooManyValues => write!(f, "more than {MAX_VALUES} values"),
+            EncodeError::VariantType => f.write_str("a Variant holds a value of the wrong type"),
+            EncodeError::Dimensions => f.write_str("array dimensions do not match the array"),
+            EncodeError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
+            EncodeError::KnownTypeId => f.write_str("an unread service carries a known type id"),
+        }
+    }
+}
+
+impl std::error::Error for EncodeError {}
+
+// ---------------------------------------------------------------------
+// Reading and writing the binary encoding
+// ---------------------------------------------------------------------
+
+/// A cursor over bytes in the OPC UA binary encoding. All numbers are
+/// little-endian. It counts nesting, so no value can recurse past
+/// [`MAX_DEPTH`], and values, so it reads no more than [`MAX_VALUES`] in
+/// all, however many values are read through it.
+#[derive(Debug)]
+pub struct Reader<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+    depth: usize,
+    values: usize,
+}
+
+impl<'a> Reader<'a> {
+    /// A reader at the start of `bytes`.
+    pub fn new(bytes: &'a [u8]) -> Reader<'a> {
+        Reader { bytes, pos: 0, depth: 0, values: 0 }
+    }
+
+    /// How many bytes are left.
+    pub fn remaining(&self) -> usize {
+        self.bytes.len() - self.pos
+    }
+
+    /// The next `n` bytes.
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if n > self.remaining() {
+            return Err(DecodeError::End);
+        }
+        let out = &self.bytes[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(out)
+    }
+
+    /// Every byte left.
+    pub fn rest(&mut self) -> &'a [u8] {
+        let out = &self.bytes[self.pos..];
+        self.pos = self.bytes.len();
+        out
+    }
+
+    /// Fails with [`DecodeError::Trailing`] if any bytes are left.
+    pub fn finish(&self) -> Result<(), DecodeError> {
+        match self.remaining() {
+            0 => Ok(()),
+            n => Err(DecodeError::Trailing(n)),
+        }
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.take(N)?);
+        Ok(out)
+    }
+
+    /// A Byte.
+    pub fn u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.array::<1>()?[0])
+    }
+    /// An SByte.
+    pub fn i8(&mut self) -> Result<i8, DecodeError> {
+        Ok(i8::from_le_bytes(self.array()?))
+    }
+    /// A Boolean: any byte but 0 is true.
+    pub fn bool(&mut self) -> Result<bool, DecodeError> {
+        Ok(self.u8()? != 0)
+    }
+    /// A UInt16.
+    pub fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_le_bytes(self.array()?))
+    }
+    /// An Int16.
+    pub fn i16(&mut self) -> Result<i16, DecodeError> {
+        Ok(i16::from_le_bytes(self.array()?))
+    }
+    /// A UInt32.
+    pub fn u32(&mut self) -> Result<u32, DecodeError> {
+        Ok(u32::from_le_bytes(self.array()?))
+    }
+    /// An Int32.
+    pub fn i32(&mut self) -> Result<i32, DecodeError> {
+        Ok(i32::from_le_bytes(self.array()?))
+    }
+    /// A UInt64.
+    pub fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
+    /// An Int64. A DateTime is one too: 100-nanosecond intervals since
+    /// January 1, 1601 (UTC).
+    pub fn i64(&mut self) -> Result<i64, DecodeError> {
+        Ok(i64::from_le_bytes(self.array()?))
+    }
+    /// A Float.
+    pub fn f32(&mut self) -> Result<f32, DecodeError> {
+        Ok(f32::from_le_bytes(self.array()?))
+    }
+    /// A Double.
+    pub fn f64(&mut self) -> Result<f64, DecodeError> {
+        Ok(f64::from_le_bytes(self.array()?))
+    }
+
+    /// A length prefix: `None` for -1 (null), and otherwise a length no
+    /// larger than `max` or the bytes left.
+    fn length(&mut self, max: usize) -> Result<Option<usize>, DecodeError> {
+        let n = self.i32()?;
+        if n == -1 {
+            return Ok(None);
+        }
+        match usize::try_from(n) {
+            Ok(len) if len <= max && len <= self.remaining() => Ok(Some(len)),
+            _ => Err(DecodeError::Length(n)),
+        }
+    }
+
+    /// A ByteString of at most `max` bytes. Null is `None`.
+    pub fn byte_string_max(&mut self, max: usize) -> Result<Option<Vec<u8>>, DecodeError> {
+        match self.length(max)? {
+            None => Ok(None),
+            Some(n) => Ok(Some(self.take(n)?.to_vec())),
+        }
+    }
+
+    /// A ByteString of at most [`MAX_STRING_LEN`] bytes. Null is `None`.
+    pub fn byte_string(&mut self) -> Result<Option<Vec<u8>>, DecodeError> {
+        self.byte_string_max(MAX_STRING_LEN)
+    }
+
+    /// A UTF-8 String of at most `max` bytes. Null is `None`.
+    pub fn string_max(&mut self, max: usize) -> Result<Option<String>, DecodeError> {
+        match self.byte_string_max(max)? {
+            None => Ok(None),
+            Some(b) => String::from_utf8(b).map(Some).map_err(|_| DecodeError::Utf8),
+        }
+    }
+
+    /// A UTF-8 String of at most [`MAX_STRING_LEN`] bytes. Null is `None`.
+    pub fn string(&mut self) -> Result<Option<String>, DecodeError> {
+        self.string_max(MAX_STRING_LEN)
+    }
+
+    /// An array's length. A null array (-1) reads as empty. Every element
+    /// of every array takes at least one byte, so a length past the bytes
+    /// left is refused, as is one past [`MAX_ARRAY_LEN`]. Elements count
+    /// toward [`MAX_VALUES`], and one that takes this reader past it fails
+    /// with [`DecodeError::TooManyValues`].
+    pub fn array_len(&mut self) -> Result<usize, DecodeError> {
+        let n = self.length(MAX_ARRAY_LEN)?.unwrap_or(0);
+        self.count(n)?;
+        Ok(n)
+    }
+
+    /// Counts `n` more values toward [`MAX_VALUES`].
+    fn count(&mut self, n: usize) -> Result<(), DecodeError> {
+        match self.values.checked_add(n) {
+            Some(total) if total <= MAX_VALUES => self.values = total,
+            _ => return Err(DecodeError::TooManyValues),
+        }
+        Ok(())
+    }
+
+    /// A value of type `T`.
+    pub fn read<T: Binary>(&mut self) -> Result<T, DecodeError> {
+        T::decode(self)
+    }
+
+    /// An array of `T`: a length, then the elements.
+    pub fn read_array<T: Binary>(&mut self) -> Result<Vec<T>, DecodeError> {
+        let n = self.array_len()?;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            out.push(T::decode(self)?);
+        }
+        Ok(out)
+    }
+
+    /// Runs `f` one level deeper, failing past [`MAX_DEPTH`]. It counts
+    /// one value toward [`MAX_VALUES`]. The depth is restored whether `f`
+    /// succeeds or not.
+    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, DecodeError>) -> Result<T, DecodeError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(DecodeError::Depth);
+        }
+        self.count(1)?;
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
+    }
+}
+
+/// Builds bytes in the OPC UA binary encoding. It checks every limit a
+/// [`Reader`] checks, so what it writes reads back.
+#[derive(Debug, Default)]
+pub struct Writer {
+    out: Vec<u8>,
+    depth: usize,
+    values: usize,
+}
+
+impl Writer {
+    /// A writer holding no bytes.
+    pub fn new() -> Writer {
+        Writer::default()
+    }
+
+    /// The bytes written.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.out
+    }
+
+    /// How many bytes have been written.
+    pub fn len(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Whether nothing has been written.
+    pub fn is_empty(&self) -> bool {
+        self.out.is_empty()
+    }
+
+    /// Raw bytes, with no length.
+    pub fn bytes(&mut self, b: &[u8]) {
+        self.out.extend_from_slice(b);
+    }
+    /// A Byte.
+    pub fn u8(&mut self, v: u8) {
+        self.out.push(v);
+    }
+    /// An SByte.
+    pub fn i8(&mut self, v: i8) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// A Boolean, as 1 or 0.
+    pub fn bool(&mut self, v: bool) {
+        self.out.push(u8::from(v));
+    }
+    /// A UInt16.
+    pub fn u16(&mut self, v: u16) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// An Int16.
+    pub fn i16(&mut self, v: i16) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// A UInt32.
+    pub fn u32(&mut self, v: u32) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// An Int32.
+    pub fn i32(&mut self, v: i32) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// A UInt64.
+    pub fn u64(&mut self, v: u64) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// An Int64 or a DateTime.
+    pub fn i64(&mut self, v: i64) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// A Float.
+    pub fn f32(&mut self, v: f32) {
+        self.bytes(&v.to_le_bytes());
+    }
+    /// A Double.
+    pub fn f64(&mut self, v: f64) {
+        self.bytes(&v.to_le_bytes());
+    }
+
+    /// A ByteString of at most `max` bytes. `None` is written as null.
+    pub fn byte_string_max(&mut self, b: Option<&[u8]>, max: usize) -> Result<(), EncodeError> {
+        match b {
+            None => self.i32(-1),
+            Some(b) => {
+                let n = i32::try_from(b.len()).map_err(|_| EncodeError::TooLong)?;
+                if b.len() > max {
+                    return Err(EncodeError::TooLong);
+                }
+                self.i32(n);
+                self.bytes(b);
+            }
+        }
+        Ok(())
+    }
+
+    /// A ByteString of at most [`MAX_STRING_LEN`] bytes.
+    pub fn byte_string(&mut self, b: Option<&[u8]>) -> Result<(), EncodeError> {
+        self.byte_string_max(b, MAX_STRING_LEN)
+    }
+
+    /// A String of at most `max` bytes. `None` is written as null.
+    pub fn string_max(&mut self, s: Option<&str>, max: usize) -> Result<(), EncodeError> {
+        self.byte_string_max(s.map(str::as_bytes), max)
+    }
+
+    /// A String of at most [`MAX_STRING_LEN`] bytes.
+    pub fn string(&mut self, s: Option<&str>) -> Result<(), EncodeError> {
+        self.string_max(s, MAX_STRING_LEN)
+    }
+
+    /// An array's length, at most [`MAX_ARRAY_LEN`]. Its elements count
+    /// toward [`MAX_VALUES`], as a [`Reader`] counts them.
+    pub fn array_len(&mut self, n: usize) -> Result<(), EncodeError> {
+        if n > MAX_ARRAY_LEN {
+            return Err(EncodeError::TooLong);
+        }
+        self.count(n)?;
+        self.i32(n as i32);
+        Ok(())
+    }
+
+    /// Counts `n` more values toward [`MAX_VALUES`].
+    fn count(&mut self, n: usize) -> Result<(), EncodeError> {
+        match self.values.checked_add(n) {
+            Some(total) if total <= MAX_VALUES => self.values = total,
+            _ => return Err(EncodeError::TooManyValues),
+        }
+        Ok(())
+    }
+
+    /// A value of type `T`.
+    pub fn write<T: Binary>(&mut self, v: &T) -> Result<(), EncodeError> {
+        v.encode(self)
+    }
+
+    /// An array of `T`: a length, then the elements.
+    pub fn write_array<T: Binary>(&mut self, values: &[T]) -> Result<(), EncodeError> {
+        self.array_len(values.len())?;
+        for v in values {
+            v.encode(self)?;
+        }
+        Ok(())
+    }
+
+    /// Runs `f` one level deeper, failing past [`MAX_DEPTH`]. It counts
+    /// one value toward [`MAX_VALUES`], as a [`Reader`] does. The depth is
+    /// restored whether `f` succeeds or not.
+    fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<(), EncodeError>) -> Result<(), EncodeError> {
+        if self.depth >= MAX_DEPTH {
+            return Err(EncodeError::TooDeep);
+        }
+        self.count(1)?;
+        self.depth += 1;
+        let out = f(self);
+        self.depth -= 1;
+        out
+    }
+}
+
+/// A type with an OPC UA binary encoding.
+pub trait Binary: Sized {
+    /// Reads one value from `r`.
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
+    /// Writes the value to `w`.
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError>;
+}
+
+/// Reads one value of type `T` that fills all of `bytes`.
+pub fn decode<T: Binary>(bytes: &[u8]) -> Result<T, DecodeError> {
+    let mut r = Reader::new(bytes);
+    let v = T::decode(&mut r)?;
+    r.finish()?;
+    Ok(v)
+}
+
+/// The bytes of one value of type `T`.
+pub fn encode<T: Binary>(v: &T) -> Result<Vec<u8>, EncodeError> {
+    let mut w = Writer::new();
+    v.encode(&mut w)?;
+    Ok(w.into_bytes())
+}
+
+impl Binary for StatusCode {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(StatusCode(r.u32()?))
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.0);
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------
+// Built-in types
+// ---------------------------------------------------------------------
+
+/// Built-in type ids, as a Variant's encoding mask names them.
+pub mod type_id {
+    #![allow(missing_docs)]
+    pub const NULL: u8 = 0;
+    pub const BOOLEAN: u8 = 1;
+    pub const SBYTE: u8 = 2;
+    pub const BYTE: u8 = 3;
+    pub const INT16: u8 = 4;
+    pub const UINT16: u8 = 5;
+    pub const INT32: u8 = 6;
+    pub const UINT32: u8 = 7;
+    pub const INT64: u8 = 8;
+    pub const UINT64: u8 = 9;
+    pub const FLOAT: u8 = 10;
+    pub const DOUBLE: u8 = 11;
+    pub const STRING: u8 = 12;
+    pub const DATE_TIME: u8 = 13;
+    pub const GUID: u8 = 14;
+    pub const BYTE_STRING: u8 = 15;
+    pub const XML_ELEMENT: u8 = 16;
+    pub const NODE_ID: u8 = 17;
+    pub const EXPANDED_NODE_ID: u8 = 18;
+    pub const STATUS_CODE: u8 = 19;
+    pub const QUALIFIED_NAME: u8 = 20;
+    pub const LOCALIZED_TEXT: u8 = 21;
+    pub const EXTENSION_OBJECT: u8 = 22;
+    pub const DATA_VALUE: u8 = 23;
+    pub const VARIANT: u8 = 24;
+    pub const DIAGNOSTIC_INFO: u8 = 25;
+    /// Ids 26 to 31 are reserved. Readers keep their values as
+    /// ByteStrings, as the specification asks.
+    pub const RESERVED_FIRST: u8 = 26;
+    /// The last reserved id.
+    pub const RESERVED_LAST: u8 = 31;
+}
+
+/// A Guid, in its four fields. On the wire the first three are
+/// little-endian and the last eight bytes are in order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Guid {
+    /// The first 4 bytes.
+    pub data1: u32,
+    /// The next 2 bytes.
+    pub data2: u16,
+    /// The next 2 bytes.
+    pub data3: u16,
+    /// The last 8 bytes.
+    pub data4: [u8; 8],
+}
+
+impl Binary for Guid {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Guid { data1: r.u32()?, data2: r.u16()?, data3: r.u16()?, data4: r.array()? })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.data1);
+        w.u16(self.data2);
+        w.u16(self.data3);
+        w.bytes(&self.data4);
+        Ok(())
+    }
+}
+
+/// The identifier part of a [`NodeId`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Identifier {
+    /// A number.
+    Numeric(u32),
+    /// A string. A null string reads as empty.
+    String(String),
+    /// A Guid.
+    Guid(Guid),
+    /// Opaque bytes. A null ByteString reads as empty.
+    Opaque(Vec<u8>),
+}
+
+/// A NodeId: a namespace index and an identifier. The writer picks the
+/// shortest encoding form; the reader takes all six.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NodeId {
+    /// The index into the server's namespace table. 0 is the OPC UA
+    /// namespace.
+    pub namespace: u16,
+    /// The identifier within the namespace.
+    pub identifier: Identifier,
+}
+
+impl Default for NodeId {
+    /// The null NodeId: numeric 0 in namespace 0.
+    fn default() -> NodeId {
+        NodeId::numeric(0, 0)
+    }
+}
+
+impl NodeId {
+    /// A numeric NodeId.
+    pub fn numeric(namespace: u16, id: u32) -> NodeId {
+        NodeId { namespace, identifier: Identifier::Numeric(id) }
+    }
+
+    /// A string NodeId.
+    pub fn string(namespace: u16, id: &str) -> NodeId {
+        NodeId { namespace, identifier: Identifier::String(id.to_string()) }
+    }
+
+    /// Whether this is the null NodeId.
+    pub fn is_null(&self) -> bool {
+        *self == NodeId::default()
+    }
+
+    /// The numeric id, if this is a numeric NodeId in namespace 0.
+    pub fn ns0(&self) -> Option<u32> {
+        match self.identifier {
+            Identifier::Numeric(id) if self.namespace == 0 => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Reads the rest of a NodeId after its encoding byte, whose low six
+    /// bits name the form.
+    fn decode_form(r: &mut Reader<'_>, form: u8) -> Result<NodeId, DecodeError> {
+        Ok(match form & 0x3f {
+            0 => NodeId::numeric(0, u32::from(r.u8()?)),
+            1 => {
+                let namespace = u16::from(r.u8()?);
+                NodeId::numeric(namespace, u32::from(r.u16()?))
+            }
+            2 => {
+                let namespace = r.u16()?;
+                NodeId::numeric(namespace, r.u32()?)
+            }
+            3 => {
+                let namespace = r.u16()?;
+                NodeId { namespace, identifier: Identifier::String(r.string()?.unwrap_or_default()) }
+            }
+            4 => {
+                let namespace = r.u16()?;
+                NodeId { namespace, identifier: Identifier::Guid(r.read()?) }
+            }
+            5 => {
+                let namespace = r.u16()?;
+                NodeId { namespace, identifier: Identifier::Opaque(r.byte_string()?.unwrap_or_default()) }
+            }
+            _ => return Err(DecodeError::NodeIdForm(form)),
+        })
+    }
+
+    /// Writes the NodeId with `flags` set in its encoding byte.
+    fn encode_flags(&self, w: &mut Writer, flags: u8) -> Result<(), EncodeError> {
+        let ns = self.namespace;
+        match &self.identifier {
+            Identifier::Numeric(id) => {
+                if ns == 0 && *id <= 0xff {
+                    w.u8(flags);
+                    w.u8(*id as u8);
+                } else if ns <= 0xff && *id <= 0xffff {
+                    w.u8(flags | 1);
+                    w.u8(ns as u8);
+                    w.u16(*id as u16);
+                } else {
+                    w.u8(flags | 2);
+                    w.u16(ns);
+                    w.u32(*id);
+                }
+            }
+            Identifier::String(s) => {
+                w.u8(flags | 3);
+                w.u16(ns);
+                w.string(Some(s))?;
+            }
+            Identifier::Guid(g) => {
+                w.u8(flags | 4);
+                w.u16(ns);
+                g.encode(w)?;
+            }
+            Identifier::Opaque(b) => {
+                w.u8(flags | 5);
+                w.u16(ns);
+                w.byte_string(Some(b))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Binary for NodeId {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let form = r.u8()?;
+        if form & 0xc0 != 0 {
+            return Err(DecodeError::NodeIdForm(form));
+        }
+        NodeId::decode_form(r, form)
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.encode_flags(w, 0)
+    }
+}
+
+/// An ExpandedNodeId: a NodeId that may name its namespace by URI and a
+/// server by index.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExpandedNodeId {
+    /// The NodeId. When a namespace URI is given, its namespace index is
+    /// ignored by the receiver.
+    pub node_id: NodeId,
+    /// The namespace's URI, if given. A null URI reads as `None`.
+    pub namespace_uri: Option<String>,
+    /// The index into the server table. 0 is the local server, and is
+    /// left off the wire.
+    pub server_index: u32,
+}
+
+impl From<NodeId> for ExpandedNodeId {
+    /// The NodeId on the local server, with no namespace URI.
+    fn from(node_id: NodeId) -> ExpandedNodeId {
+        ExpandedNodeId { node_id, namespace_uri: None, server_index: 0 }
+    }
+}
+
+impl Binary for ExpandedNodeId {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let form = r.u8()?;
+        let node_id = NodeId::decode_form(r, form)?;
+        let namespace_uri = if form & 0x80 != 0 { r.string()? } else { None };
+        let server_index = if form & 0x40 != 0 { r.u32()? } else { 0 };
+        Ok(ExpandedNodeId { node_id, namespace_uri, server_index })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        let mut flags = 0;
+        if self.namespace_uri.is_some() {
+            flags |= 0x80;
+        }
+        if self.server_index != 0 {
+            flags |= 0x40;
+        }
+        self.node_id.encode_flags(w, flags)?;
+        if let Some(uri) = &self.namespace_uri {
+            w.string(Some(uri))?;
+        }
+        if self.server_index != 0 {
+            w.u32(self.server_index);
+        }
+        Ok(())
+    }
+}
+
+/// A QualifiedName: a name with a namespace index.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct QualifiedName {
+    /// The namespace index.
+    pub namespace: u16,
+    /// The name. A null name reads as empty.
+    pub name: String,
+}
+
+impl Binary for QualifiedName {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(QualifiedName { namespace: r.u16()?, name: r.string()?.unwrap_or_default() })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u16(self.namespace);
+        w.string(Some(&self.name))
+    }
+}
+
+/// A LocalizedText: text, and the locale it is in. Either may be absent.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LocalizedText {
+    /// The locale, such as "en-US". A null one reads as `None`.
+    pub locale: Option<String>,
+    /// The text. A null one reads as `None`.
+    pub text: Option<String>,
+}
+
+impl Binary for LocalizedText {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let mask = r.u8()?;
+        if mask & !0x03 != 0 {
+            return Err(DecodeError::Mask(mask));
+        }
+        let locale = if mask & 0x01 != 0 { r.string()? } else { None };
+        let text = if mask & 0x02 != 0 { r.string()? } else { None };
+        Ok(LocalizedText { locale, text })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u8(u8::from(self.locale.is_some()) | u8::from(self.text.is_some()) << 1);
+        if let Some(l) = &self.locale {
+            w.string(Some(l))?;
+        }
+        if let Some(t) = &self.text {
+            w.string(Some(t))?;
+        }
+        Ok(())
+    }
+}
+
+/// The body of an [`ExtensionObject`], kept as raw bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ExtensionBody {
+    /// No body.
+    #[default]
+    None,
+    /// A body in the binary encoding. A null ByteString reads as empty.
+    Binary(Vec<u8>),
+    /// A body in the XML encoding. A null one reads as empty.
+    Xml(Vec<u8>),
+}
+
+/// An ExtensionObject: a structure this module does not read, with the
+/// NodeId of its encoding and its bytes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExtensionObject {
+    /// The NodeId of the structure's encoding.
+    pub type_id: NodeId,
+    /// The structure's bytes.
+    pub body: ExtensionBody,
+}
+
+impl Binary for ExtensionObject {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let type_id = r.read()?;
+        let encoding = r.u8()?;
+        let body = match encoding {
+            0 => ExtensionBody::None,
+            1 => ExtensionBody::Binary(r.byte_string()?.unwrap_or_default()),
+            2 => ExtensionBody::Xml(r.byte_string()?.unwrap_or_default()),
+            m => return Err(DecodeError::Mask(m)),
+        };
+        Ok(ExtensionObject { type_id, body })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.type_id.encode(w)?;
+        match &self.body {
+            ExtensionBody::None => w.u8(0),
+            ExtensionBody::Binary(b) => {
+                w.u8(1);
+                w.byte_string(Some(b))?;
+            }
+            ExtensionBody::Xml(b) => {
+                w.u8(2);
+                w.byte_string(Some(b))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A DiagnosticInfo: where a status came from. Every field is optional.
+/// The indexes point into a response header's string table.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DiagnosticInfo {
+    /// The index of the symbolic id.
+    pub symbolic_id: Option<i32>,
+    /// The index of the namespace URI.
+    pub namespace_uri: Option<i32>,
+    /// The index of the locale.
+    pub locale: Option<i32>,
+    /// The index of the localized text.
+    pub localized_text: Option<i32>,
+    /// Details for a person to read. A null one reads as `None`.
+    pub additional_info: Option<String>,
+    /// The status code from a lower layer.
+    pub inner_status_code: Option<StatusCode>,
+    /// The diagnostics from a lower layer.
+    pub inner_diagnostic_info: Option<Box<DiagnosticInfo>>,
+}
+
+impl Binary for DiagnosticInfo {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        r.nested(DiagnosticInfo::decode_inner)
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.nested(|w| self.encode_inner(w))
+    }
+}
+
+impl DiagnosticInfo {
+    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let mask = r.u8()?;
+        if mask & 0x80 != 0 {
+            return Err(DecodeError::Mask(mask));
+        }
+        let mut d = DiagnosticInfo::default();
+        if mask & 0x01 != 0 {
+            d.symbolic_id = Some(r.i32()?);
+        }
+        if mask & 0x02 != 0 {
+            d.namespace_uri = Some(r.i32()?);
+        }
+        if mask & 0x08 != 0 {
+            d.locale = Some(r.i32()?);
+        }
+        if mask & 0x04 != 0 {
+            d.localized_text = Some(r.i32()?);
+        }
+        if mask & 0x10 != 0 {
+            d.additional_info = r.string()?;
+        }
+        if mask & 0x20 != 0 {
+            d.inner_status_code = Some(r.read()?);
+        }
+        if mask & 0x40 != 0 {
+            d.inner_diagnostic_info = Some(Box::new(r.read()?));
+        }
+        Ok(d)
+    }
+    fn encode_inner(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        let mut mask = 0;
+        let bits = [
+            (self.symbolic_id.is_some(), 0x01),
+            (self.namespace_uri.is_some(), 0x02),
+            (self.localized_text.is_some(), 0x04),
+            (self.locale.is_some(), 0x08),
+            (self.additional_info.is_some(), 0x10),
+            (self.inner_status_code.is_some(), 0x20),
+            (self.inner_diagnostic_info.is_some(), 0x40),
+        ];
+        for (set, bit) in bits {
+            if set {
+                mask |= bit;
+            }
+        }
+        w.u8(mask);
+        for v in [self.symbolic_id, self.namespace_uri, self.locale, self.localized_text].into_iter().flatten() {
+            w.i32(v);
+        }
+        if let Some(s) = &self.additional_info {
+            w.string(Some(s))?;
+        }
+        if let Some(s) = self.inner_status_code {
+            s.encode(w)?;
+        }
+        if let Some(inner) = &self.inner_diagnostic_info {
+            inner.encode(w)?;
+        }
+        Ok(())
+    }
+}
+
+/// One value of a built-in type, as a Variant holds it.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)] // each variant is the built-in type it names
+pub enum Value {
+    Boolean(bool),
+    SByte(i8),
+    Byte(u8),
+    Int16(i16),
+    UInt16(u16),
+    Int32(i32),
+    UInt32(u32),
+    Int64(i64),
+    UInt64(u64),
+    Float(f32),
+    Double(f64),
+    /// A String. Null is `None`.
+    String(Option<String>),
+    /// 100-nanosecond intervals since January 1, 1601 (UTC).
+    DateTime(i64),
+    Guid(Guid),
+    /// A ByteString. Null is `None`.
+    ByteString(Option<Vec<u8>>),
+    /// An XmlElement's bytes, unread. Null is `None`.
+    XmlElement(Option<Vec<u8>>),
+    NodeId(NodeId),
+    ExpandedNodeId(ExpandedNodeId),
+    StatusCode(StatusCode),
+    QualifiedName(QualifiedName),
+    LocalizedText(LocalizedText),
+    ExtensionObject(Box<ExtensionObject>),
+    DataValue(Box<DataValue>),
+    /// A Variant, which may only appear as an array element.
+    Variant(Box<Variant>),
+    DiagnosticInfo(Box<DiagnosticInfo>),
+    /// A value of reserved type id 26 to 31, kept as a ByteString.
+    Reserved {
+        type_id: u8,
+        bytes: Option<Vec<u8>>,
+    },
+}
+
+impl Value {
+    /// The built-in type id of the value.
+    pub fn type_id(&self) -> u8 {
+        use type_id as t;
+        match self {
+            Value::Boolean(_) => t::BOOLEAN,
+            Value::SByte(_) => t::SBYTE,
+            Value::Byte(_) => t::BYTE,
+            Value::Int16(_) => t::INT16,
+            Value::UInt16(_) => t::UINT16,
+            Value::Int32(_) => t::INT32,
+            Value::UInt32(_) => t::UINT32,
+            Value::Int64(_) => t::INT64,
+            Value::UInt64(_) => t::UINT64,
+            Value::Float(_) => t::FLOAT,
+            Value::Double(_) => t::DOUBLE,
+            Value::String(_) => t::STRING,
+            Value::DateTime(_) => t::DATE_TIME,
+            Value::Guid(_) => t::GUID,
+            Value::ByteString(_) => t::BYTE_STRING,
+            Value::XmlElement(_) => t::XML_ELEMENT,
+            Value::NodeId(_) => t::NODE_ID,
+            Value::ExpandedNodeId(_) => t::EXPANDED_NODE_ID,
+            Value::StatusCode(_) => t::STATUS_CODE,
+            Value::QualifiedName(_) => t::QUALIFIED_NAME,
+            Value::LocalizedText(_) => t::LOCALIZED_TEXT,
+            Value::ExtensionObject(_) => t::EXTENSION_OBJECT,
+            Value::DataValue(_) => t::DATA_VALUE,
+            Value::Variant(_) => t::VARIANT,
+            Value::DiagnosticInfo(_) => t::DIAGNOSTIC_INFO,
+            Value::Reserved { type_id, .. } => *type_id,
+        }
+    }
+
+    /// Reads a value of built-in type `t`, which is 1 to 31.
+    fn decode(r: &mut Reader<'_>, t: u8) -> Result<Value, DecodeError> {
+        use type_id as id;
+        Ok(match t {
+            id::BOOLEAN => Value::Boolean(r.bool()?),
+            id::SBYTE => Value::SByte(r.i8()?),
+            id::BYTE => Value::Byte(r.u8()?),
+            id::INT16 => Value::Int16(r.i16()?),
+            id::UINT16 => Value::UInt16(r.u16()?),
+            id::INT32 => Value::Int32(r.i32()?),
+            id::UINT32 => Value::UInt32(r.u32()?),
+            id::INT64 => Value::Int64(r.i64()?),
+            id::UINT64 => Value::UInt64(r.u64()?),
+            id::FLOAT => Value::Float(r.f32()?),
+            id::DOUBLE => Value::Double(r.f64()?),
+            id::STRING => Value::String(r.string()?),
+            id::DATE_TIME => Value::DateTime(r.i64()?),
+            id::GUID => Value::Guid(r.read()?),
+            id::BYTE_STRING => Value::ByteString(r.byte_string()?),
+            id::XML_ELEMENT => Value::XmlElement(r.byte_string()?),
+            id::NODE_ID => Value::NodeId(r.read()?),
+            id::EXPANDED_NODE_ID => Value::ExpandedNodeId(r.read()?),
+            id::STATUS_CODE => Value::StatusCode(r.read()?),
+            id::QUALIFIED_NAME => Value::QualifiedName(r.read()?),
+            id::LOCALIZED_TEXT => Value::LocalizedText(r.read()?),
+            id::EXTENSION_OBJECT => Value::ExtensionObject(Box::new(r.read()?)),
+            id::DATA_VALUE => Value::DataValue(Box::new(r.read()?)),
+            id::VARIANT => Value::Variant(Box::new(r.read()?)),
+            id::DIAGNOSTIC_INFO => Value::DiagnosticInfo(Box::new(r.read()?)),
+            id::RESERVED_FIRST..=id::RESERVED_LAST => Value::Reserved { type_id: t, bytes: r.byte_string()? },
+            _ => return Err(DecodeError::VariantType(t)),
+        })
+    }
+
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        match self {
+            Value::Boolean(v) => w.bool(*v),
+            Value::SByte(v) => w.i8(*v),
+            Value::Byte(v) => w.u8(*v),
+            Value::Int16(v) => w.i16(*v),
+            Value::UInt16(v) => w.u16(*v),
+            Value::Int32(v) => w.i32(*v),
+            Value::UInt32(v) => w.u32(*v),
+            Value::Int64(v) | Value::DateTime(v) => w.i64(*v),
+            Value::UInt64(v) => w.u64(*v),
+            Value::Float(v) => w.f32(*v),
+            Value::Double(v) => w.f64(*v),
+            Value::String(s) => w.string(s.as_deref())?,
+            Value::Guid(g) => g.encode(w)?,
+            Value::ByteString(b) | Value::XmlElement(b) => w.byte_string(b.as_deref())?,
+            Value::NodeId(n) => n.encode(w)?,
+            Value::ExpandedNodeId(n) => n.encode(w)?,
+            Value::StatusCode(s) => s.encode(w)?,
+            Value::QualifiedName(q) => q.encode(w)?,
+            Value::LocalizedText(l) => l.encode(w)?,
+            Value::ExtensionObject(e) => e.encode(w)?,
+            Value::DataValue(d) => d.encode(w)?,
+            Value::Variant(v) => v.encode(w)?,
+            Value::DiagnosticInfo(d) => d.encode(w)?,
+            Value::Reserved { type_id, bytes } => {
+                if !(type_id::RESERVED_FIRST..=type_id::RESERVED_LAST).contains(type_id) {
+                    return Err(EncodeError::VariantType);
+                }
+                w.byte_string(bytes.as_deref())?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A Variant: a value of any built-in type, an array of them, or nothing.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum Variant {
+    /// No value.
+    #[default]
+    Null,
+    /// One value. It may not be a [`Value::Variant`].
+    Scalar(Value),
+    /// An array of values, all of built-in type `type_id`. A null array
+    /// reads as empty. With `dimensions`, the array is multi-dimensional:
+    /// there are at least 2 dimensions, as Part 6 asks, every one is above
+    /// 0, and they multiply out to its length.
+    Array {
+        /// The built-in type of every element, 1 to 31.
+        type_id: u8,
+        /// The elements. A multi-dimensional array is flattened with the
+        /// last index changing fastest. A 2 by 2 array holds (0, 0),
+        /// (0, 1), (1, 0), then (1, 1).
+        values: Vec<Value>,
+        /// The length of each dimension, if given.
+        dimensions: Option<Vec<i32>>,
+    },
+}
+
+impl From<Value> for Variant {
+    /// The value as a scalar Variant.
+    fn from(value: Value) -> Variant {
+        Variant::Scalar(value)
+    }
+}
+
+impl Binary for Variant {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        r.nested(Variant::decode_inner)
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.nested(|w| self.encode_inner(w))
+    }
+}
+
+impl Variant {
+    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let mask = r.u8()?;
+        let t = mask & 0x3f;
+        let is_array = mask & 0x80 != 0;
+        let has_dims = mask & 0x40 != 0;
+        let v = if t == type_id::NULL {
+            if mask != 0 {
+                return Err(DecodeError::VariantType(t));
+            }
+            Variant::Null
+        } else if !is_array {
+            if has_dims {
+                return Err(DecodeError::Dimensions);
+            }
+            if t == type_id::VARIANT {
+                return Err(DecodeError::VariantType(t));
+            }
+            Variant::Scalar(Value::decode(r, t)?)
+        } else {
+            let n = r.array_len()?;
+            let mut values = Vec::with_capacity(n);
+            for _ in 0..n {
+                values.push(Value::decode(r, t)?);
+            }
+            let dimensions = if has_dims {
+                let count = r.i32()?;
+                let count = match usize::try_from(count) {
+                    Ok(c) if (2..=MAX_DIMENSIONS).contains(&c) => c,
+                    _ => return Err(DecodeError::Dimensions),
+                };
+                let mut dims = Vec::with_capacity(count);
+                for _ in 0..count {
+                    dims.push(r.i32()?);
+                }
+                if !dims_match(&dims, n) {
+                    return Err(DecodeError::Dimensions);
+                }
+                Some(dims)
+            } else {
+                None
+            };
+            Variant::Array { type_id: t, values, dimensions }
+        };
+        Ok(v)
+    }
+
+    fn encode_inner(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        match self {
+            Variant::Null => w.u8(0),
+            Variant::Scalar(v) => {
+                let t = v.type_id();
+                if t == type_id::VARIANT {
+                    return Err(EncodeError::VariantType);
+                }
+                w.u8(t);
+                v.encode(w)?;
+            }
+            Variant::Array { type_id: t, values, dimensions } => {
+                if *t == type_id::NULL || *t > type_id::RESERVED_LAST {
+                    return Err(EncodeError::VariantType);
+                }
+                if values.iter().any(|v| v.type_id() != *t) {
+                    return Err(EncodeError::VariantType);
+                }
+                if let Some(d) = dimensions
+                    && (d.len() < 2 || d.len() > MAX_DIMENSIONS || !dims_match(d, values.len())) {
+                        return Err(EncodeError::Dimensions);
+                    }
+                w.u8(t | 0x80 | if dimensions.is_some() { 0x40 } else { 0 });
+                w.array_len(values.len())?;
+                for v in values {
+                    v.encode(w)?;
+                }
+                if let Some(d) = dimensions {
+                    w.i32(d.len() as i32);
+                    for &n in d {
+                        w.i32(n);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether every dimension is above 0 and they multiply out to `len`.
+fn dims_match(dims: &[i32], len: usize) -> bool {
+    let mut product: usize = 1;
+    for &d in dims {
+        let Ok(d) = usize::try_from(d) else {
+            return false;
+        };
+        if d == 0 {
+            return false;
+        }
+        match product.checked_mul(d) {
+            Some(p) if p <= len => product = p,
+            _ => return false,
+        }
+    }
+    product == len
+}
+
+/// A DataValue: a value with its status and timestamps. Every field is
+/// optional. A missing status means Good, and a missing timestamp means
+/// none was given.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DataValue {
+    /// The value.
+    pub value: Option<Variant>,
+    /// The value's status.
+    pub status: Option<StatusCode>,
+    /// When the source made the value, as a DateTime.
+    pub source_timestamp: Option<i64>,
+    /// Picoseconds to add to the source timestamp.
+    pub source_picoseconds: Option<u16>,
+    /// When the server saw the value, as a DateTime.
+    pub server_timestamp: Option<i64>,
+    /// Picoseconds to add to the server timestamp.
+    pub server_picoseconds: Option<u16>,
+}
+
+impl Binary for DataValue {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        r.nested(DataValue::decode_inner)
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.nested(|w| self.encode_inner(w))
+    }
+}
+
+impl DataValue {
+    fn decode_inner(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let mask = r.u8()?;
+        if mask & 0xc0 != 0 {
+            return Err(DecodeError::Mask(mask));
+        }
+        let mut d = DataValue::default();
+        if mask & 0x01 != 0 {
+            d.value = Some(r.read()?);
+        }
+        if mask & 0x02 != 0 {
+            d.status = Some(r.read()?);
+        }
+        if mask & 0x04 != 0 {
+            d.source_timestamp = Some(r.i64()?);
+        }
+        if mask & 0x10 != 0 {
+            d.source_picoseconds = Some(r.u16()?);
+        }
+        if mask & 0x08 != 0 {
+            d.server_timestamp = Some(r.i64()?);
+        }
+        if mask & 0x20 != 0 {
+            d.server_picoseconds = Some(r.u16()?);
+        }
+        Ok(d)
+    }
+
+    fn encode_inner(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        let mut mask = 0;
+        let bits = [
+            (self.value.is_some(), 0x01),
+            (self.status.is_some(), 0x02),
+            (self.source_timestamp.is_some(), 0x04),
+            (self.server_timestamp.is_some(), 0x08),
+            (self.source_picoseconds.is_some(), 0x10),
+            (self.server_picoseconds.is_some(), 0x20),
+        ];
+        for (set, bit) in bits {
+            if set {
+                mask |= bit;
+            }
+        }
+        w.u8(mask);
+        if let Some(v) = &self.value {
+            v.encode(w)?;
+        }
+        if let Some(s) = self.status {
+            s.encode(w)?;
+        }
+        if let Some(t) = self.source_timestamp {
+            w.i64(t);
+        }
+        if let Some(p) = self.source_picoseconds {
+            w.u16(p);
+        }
+        if let Some(t) = self.server_timestamp {
+            w.i64(t);
+        }
+        if let Some(p) = self.server_picoseconds {
+            w.u16(p);
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------
+// Chunks and the connection protocol
+// ---------------------------------------------------------------------
+
+/// The message type in a chunk header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MessageType {
+    /// HEL: the client opens the connection.
+    Hello,
+    /// ACK: the server accepts it.
+    Acknowledge,
+    /// ERR: either side reports an error and closes.
+    Error,
+    /// RHE: a server opens a connection to a client, which then sends a
+    /// Hello.
+    ReverseHello,
+    /// OPN: opens or renews a secure channel.
+    Open,
+    /// CLO: closes a secure channel.
+    Close,
+    /// MSG: any other service request or response.
+    Message,
+}
+
+impl MessageType {
+    /// The three ASCII letters that name the type.
+    pub fn code(self) -> [u8; 3] {
+        *match self {
+            MessageType::Hello => b"HEL",
+            MessageType::Acknowledge => b"ACK",
+            MessageType::Error => b"ERR",
+            MessageType::ReverseHello => b"RHE",
+            MessageType::Open => b"OPN",
+            MessageType::Close => b"CLO",
+            MessageType::Message => b"MSG",
+        }
+    }
+
+    /// The type that `code` names, if any.
+    pub fn from_code(code: [u8; 3]) -> Option<MessageType> {
+        Some(match &code {
+            b"HEL" => MessageType::Hello,
+            b"ACK" => MessageType::Acknowledge,
+            b"ERR" => MessageType::Error,
+            b"RHE" => MessageType::ReverseHello,
+            b"OPN" => MessageType::Open,
+            b"CLO" => MessageType::Close,
+            b"MSG" => MessageType::Message,
+            _ => return None,
+        })
+    }
+
+    /// Whether this is one of the connection protocol's messages (HEL,
+    /// ACK, ERR, RHE) rather than a secure channel chunk.
+    pub fn is_handshake(self) -> bool {
+        matches!(self, MessageType::Hello | MessageType::Acknowledge | MessageType::Error | MessageType::ReverseHello)
+    }
+}
+
+/// The chunk type, the fourth byte of a chunk header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ChunkType {
+    /// `F`: the last chunk of a message, or its only one.
+    Final,
+    /// `C`: a chunk with more to follow. Only MSG chunks may be one.
+    Intermediate,
+    /// `A`: the sender gave up on the message. Only MSG chunks may be one.
+    Abort,
+}
+
+impl ChunkType {
+    /// The ASCII byte for the type.
+    pub fn byte(self) -> u8 {
+        match self {
+            ChunkType::Final => b'F',
+            ChunkType::Intermediate => b'C',
+            ChunkType::Abort => b'A',
+        }
+    }
+
+    /// The type that `byte` names, if any.
+    pub fn from_byte(byte: u8) -> Option<ChunkType> {
+        match byte {
+            b'F' => Some(ChunkType::Final),
+            b'C' => Some(ChunkType::Intermediate),
+            b'A' => Some(ChunkType::Abort),
+            _ => None,
+        }
+    }
+}
+
+/// One chunk: its header's types and the bytes after the header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chunk {
+    /// The message type.
+    pub message_type: MessageType,
+    /// The chunk type.
+    pub chunk_type: ChunkType,
+    /// Every byte after the 8-byte header.
+    pub body: Vec<u8>,
+}
+
+/// Why a byte stream is not OPC UA. Every one is fatal: the stream holds
+/// no more messages a reader can find, and a real server sends an ERR
+/// with [`ChunkError::status`] and closes the connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChunkError {
+    /// The first three bytes named no message type.
+    MessageType([u8; 3]),
+    /// The chunk type byte is not one this message type may have.
+    ChunkType(MessageType, u8),
+    /// The size in the header is smaller than the header.
+    TooSmall(u32),
+    /// The size in the header is larger than the receiver takes.
+    TooLarge {
+        /// The size in the header.
+        size: u32,
+        /// The largest size taken.
+        limit: u32,
+    },
+    /// The chunk's fields did not read.
+    Decode(MessageType, DecodeError),
+    /// A Hello or Acknowledge named a buffer smaller than
+    /// [`MIN_BUFFER_SIZE`].
+    BufferSize(u32),
+    /// A chunk of another message came before the last chunk of a MSG.
+    Interleaved,
+    /// A MSG chunk named a different channel or token from the chunks
+    /// before it.
+    Mismatch,
+    /// A MSG chunk's sequence number did not follow the one before it.
+    Sequence {
+        /// The number that would have followed.
+        expected: u32,
+        /// The number that came.
+        got: u32,
+    },
+    /// A message's body grew past the negotiated limit.
+    MessageTooLarge(u32),
+    /// A message took more chunks than the negotiated limit.
+    TooManyChunks(u32),
+}
+
+impl ChunkError {
+    /// The status code a server sends in an ERR message for this error.
+    pub fn status(&self) -> StatusCode {
+        match self {
+            ChunkError::MessageType(_) | ChunkError::ChunkType(..) => StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID,
+            // The endpoint URL is the only length a Hello holds.
+            ChunkError::Decode(MessageType::Hello, DecodeError::Length(_)) => StatusCode::BAD_TCP_ENDPOINT_URL_INVALID,
+            ChunkError::TooSmall(_) | ChunkError::Decode(..) | ChunkError::Interleaved => {
+                StatusCode::BAD_DECODING_ERROR
+            }
+            ChunkError::TooLarge { .. } => StatusCode::BAD_TCP_MESSAGE_TOO_LARGE,
+            ChunkError::BufferSize(_) => StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES,
+            ChunkError::Mismatch => StatusCode::BAD_TCP_SECURE_CHANNEL_UNKNOWN,
+            ChunkError::Sequence { .. } => StatusCode::BAD_SEQUENCE_NUMBER_INVALID,
+            ChunkError::MessageTooLarge(_) | ChunkError::TooManyChunks(_) => StatusCode::BAD_REQUEST_TOO_LARGE,
+        }
+    }
+}
+
+impl std::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChunkError::MessageType(c) => write!(f, "message type {:?} is not OPC UA", String::from_utf8_lossy(c)),
+            ChunkError::ChunkType(t, b) => write!(f, "chunk type {b:#04x} is not valid for {t:?}"),
+            ChunkError::TooSmall(n) => write!(f, "chunk size {n} is smaller than its header"),
+            ChunkError::TooLarge { size, limit } => {
+                write!(f, "chunk size {size} is over the limit of {limit}")
+            }
+            ChunkError::Decode(t, e) => write!(f, "{t:?} chunk: {e}"),
+            ChunkError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
+            ChunkError::Interleaved => f.write_str("chunks of two messages were interleaved"),
+            ChunkError::Mismatch => f.write_str("a chunk named another channel or token"),
+            ChunkError::Sequence { expected, got } => {
+                write!(f, "sequence number {got}, expected {expected}")
+            }
+            ChunkError::MessageTooLarge(n) => write!(f, "message body over the limit of {n} bytes"),
+            ChunkError::TooManyChunks(n) => write!(f, "message over the limit of {n} chunks"),
+        }
+    }
+}
+
+impl std::error::Error for ChunkError {}
+
+/// What one side of a connection takes in: the largest chunk, the largest
+/// message body and the most chunks in one message. A limit of 0 means
+/// none was set; the module's own caps apply either way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// The largest chunk, in bytes, with its header.
+    pub receive_buffer_size: u32,
+    /// The largest message body, put together from its chunks.
+    pub max_message_size: u32,
+    /// The most chunks in one message.
+    pub max_chunk_count: u32,
+}
+
+impl Default for Limits {
+    /// What a decoder takes before anything is negotiated: chunks of
+    /// [`MIN_BUFFER_SIZE`], and no message or chunk count limit.
+    fn default() -> Limits {
+        Limits { receive_buffer_size: MIN_BUFFER_SIZE, max_message_size: 0, max_chunk_count: 0 }
+    }
+}
+
+impl Limits {
+    /// The largest chunk taken: the receive buffer size, raised to
+    /// [`MIN_BUFFER_SIZE`] and capped at [`MAX_BUFFER_SIZE`].
+    pub fn chunk_limit(&self) -> u32 {
+        self.receive_buffer_size.clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE)
+    }
+
+    /// The largest message body taken, capped at [`MAX_MESSAGE_SIZE`].
+    pub fn message_limit(&self) -> u32 {
+        match self.max_message_size {
+            0 => MAX_MESSAGE_SIZE,
+            n => n.min(MAX_MESSAGE_SIZE),
+        }
+    }
+
+    /// The most chunks taken in one message, capped at
+    /// [`MAX_CHUNK_COUNT`].
+    pub fn chunk_count_limit(&self) -> u32 {
+        match self.max_chunk_count {
+            0 => MAX_CHUNK_COUNT,
+            n => n.min(MAX_CHUNK_COUNT),
+        }
+    }
+}
+
+impl Chunk {
+    /// Reads the chunk at the start of `b`, refusing one larger than
+    /// `limits` allow. A HEL, ACK, ERR or RHE may be as large as
+    /// [`MAX_HANDSHAKE_SIZE`] whatever the limits. It returns `Ok(None)` if
+    /// `b` holds only part of a chunk, and otherwise the chunk and how many
+    /// bytes it took. A bad type is found from the first bytes, and a bad
+    /// size from the header, before the rest comes.
+    pub fn parse(b: &[u8], limits: &Limits) -> Result<Option<(Chunk, usize)>, ChunkError> {
+        if b.len() < 3 {
+            return Ok(None);
+        }
+        let code = [b[0], b[1], b[2]];
+        let message_type = MessageType::from_code(code).ok_or(ChunkError::MessageType(code))?;
+        let Some(&ct) = b.get(3) else { return Ok(None) };
+        let chunk_type = match (ct, message_type) {
+            (b'F', _) => ChunkType::Final,
+            (b'C', MessageType::Message) => ChunkType::Intermediate,
+            (b'A', MessageType::Message) => ChunkType::Abort,
+            _ => return Err(ChunkError::ChunkType(message_type, ct)),
+        };
+        if b.len() < HEADER_LEN {
+            return Ok(None);
+        }
+        let size = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+        let limit = if message_type.is_handshake() {
+            limits.chunk_limit().max(MAX_HANDSHAKE_SIZE)
+        } else {
+            limits.chunk_limit()
+        };
+        if (size as usize) < HEADER_LEN {
+            return Err(ChunkError::TooSmall(size));
+        }
+        if size > limit {
+            return Err(ChunkError::TooLarge { size, limit });
+        }
+        let end = size as usize;
+        if b.len() < end {
+            return Ok(None);
+        }
+        Ok(Some((Chunk { message_type, chunk_type, body: b[HEADER_LEN..end].to_vec() }, end)))
+    }
+}
+
+/// Reads the reason of an Error message or abort chunk. One longer than
+/// [`MAX_REASON_LEN`] is dropped unread and comes back empty, as Part 6
+/// asks of receivers. A null one reads as empty.
+fn read_reason(r: &mut Reader<'_>) -> Result<String, DecodeError> {
+    match r.byte_string()? {
+        Some(b) if b.len() <= MAX_REASON_LEN => String::from_utf8(b).map_err(|_| DecodeError::Utf8),
+        _ => Ok(String::new()),
+    }
+}
+
+/// Wraps `body` in a chunk header.
+fn chunk_bytes(message_type: MessageType, chunk_type: ChunkType, body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    out.extend_from_slice(&message_type.code());
+    out.push(chunk_type.byte());
+    out.extend_from_slice(&((HEADER_LEN + body.len()) as u32).to_le_bytes());
+    out.extend_from_slice(body);
+    out
+}
+
+/// A Hello: the first message a client sends, naming what it can take.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hello {
+    /// The protocol version the client speaks; 0 today.
+    pub protocol_version: u32,
+    /// The largest chunk the client takes.
+    pub receive_buffer_size: u32,
+    /// The largest chunk the client will send.
+    pub send_buffer_size: u32,
+    /// The largest response body the client takes; 0 for no limit.
+    pub max_message_size: u32,
+    /// The most chunks in a response the client takes; 0 for no limit.
+    pub max_chunk_count: u32,
+    /// The URL the client is connecting to. A null one reads as empty.
+    pub endpoint_url: String,
+}
+
+impl Hello {
+    /// What the client takes in, for writing to it.
+    pub fn limits(&self) -> Limits {
+        Limits {
+            receive_buffer_size: self.receive_buffer_size,
+            max_message_size: self.max_message_size,
+            max_chunk_count: self.max_chunk_count,
+        }
+    }
+
+    /// The Acknowledge a server with receive limits `ours` answers with.
+    /// Its buffer sizes are what both sides can take, and never below
+    /// [`MIN_BUFFER_SIZE`]. Its message and chunk count limits are the
+    /// ones a [`Decoder`] with `ours` enforces, so they are never 0: the
+    /// module's own caps always apply.
+    pub fn acknowledge(&self, ours: &Limits) -> Acknowledge {
+        Acknowledge {
+            protocol_version: PROTOCOL_VERSION,
+            receive_buffer_size: ours.chunk_limit().min(self.send_buffer_size).max(MIN_BUFFER_SIZE),
+            send_buffer_size: self.receive_buffer_size.clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE),
+            max_message_size: ours.message_limit(),
+            max_chunk_count: ours.chunk_count_limit(),
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Hello, DecodeError> {
+        Ok(Hello {
+            protocol_version: r.u32()?,
+            receive_buffer_size: r.u32()?,
+            send_buffer_size: r.u32()?,
+            max_message_size: r.u32()?,
+            max_chunk_count: r.u32()?,
+            endpoint_url: r.string_max(MAX_URL_LEN)?.unwrap_or_default(),
+        })
+    }
+
+    fn body(&self) -> Result<Vec<u8>, EncodeError> {
+        check_buffers(self.receive_buffer_size, self.send_buffer_size)?;
+        let mut w = Writer::new();
+        for v in [
+            self.protocol_version,
+            self.receive_buffer_size,
+            self.send_buffer_size,
+            self.max_message_size,
+            self.max_chunk_count,
+        ] {
+            w.u32(v);
+        }
+        w.string_max(Some(&self.endpoint_url), MAX_URL_LEN)?;
+        Ok(w.into_bytes())
+    }
+}
+
+/// An Acknowledge: the server's answer to a Hello, naming what it takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Acknowledge {
+    /// The protocol version both sides speak.
+    pub protocol_version: u32,
+    /// The largest chunk the server takes. No larger than the client's
+    /// send buffer.
+    pub receive_buffer_size: u32,
+    /// The largest chunk the server will send. No larger than the client's
+    /// receive buffer.
+    pub send_buffer_size: u32,
+    /// The largest request body the server takes; 0 for no limit.
+    pub max_message_size: u32,
+    /// The most chunks in a request the server takes; 0 for no limit.
+    pub max_chunk_count: u32,
+}
+
+impl Acknowledge {
+    /// What the server takes in, for writing to it, and for its own
+    /// [`Decoder::set_limits`].
+    pub fn limits(&self) -> Limits {
+        Limits {
+            receive_buffer_size: self.receive_buffer_size,
+            max_message_size: self.max_message_size,
+            max_chunk_count: self.max_chunk_count,
+        }
+    }
+
+    fn decode(r: &mut Reader<'_>) -> Result<Acknowledge, DecodeError> {
+        Ok(Acknowledge {
+            protocol_version: r.u32()?,
+            receive_buffer_size: r.u32()?,
+            send_buffer_size: r.u32()?,
+            max_message_size: r.u32()?,
+            max_chunk_count: r.u32()?,
+        })
+    }
+
+    fn body(&self) -> Result<Vec<u8>, EncodeError> {
+        check_buffers(self.receive_buffer_size, self.send_buffer_size)?;
+        let mut w = Writer::new();
+        for v in [
+            self.protocol_version,
+            self.receive_buffer_size,
+            self.send_buffer_size,
+            self.max_message_size,
+            self.max_chunk_count,
+        ] {
+            w.u32(v);
+        }
+        Ok(w.into_bytes())
+    }
+}
+
+fn check_buffers(receive: u32, send: u32) -> Result<(), EncodeError> {
+    for n in [receive, send] {
+        if n < MIN_BUFFER_SIZE {
+            return Err(EncodeError::BufferSize(n));
+        }
+    }
+    Ok(())
+}
+
+/// An Error message: why the sender is closing the connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ErrorMessage {
+    /// The status code.
+    pub error: StatusCode,
+    /// Text for a person to read. A null one reads as empty.
+    pub reason: String,
+}
+
+/// A ReverseHello: a server behind a firewall opens a connection to a
+/// client, which answers with a Hello.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReverseHello {
+    /// The server's application URI. A null one reads as empty.
+    pub server_uri: String,
+    /// The URL the client uses in its Hello. A null one reads as empty.
+    pub endpoint_url: String,
+}
+
+/// The security header of an OPN chunk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AsymmetricHeader {
+    /// The security policy's URI. A null one reads as empty.
+    pub policy_uri: String,
+    /// The sender's certificate; `None` under policy None.
+    pub sender_certificate: Option<Vec<u8>>,
+    /// The thumbprint of the receiver's certificate; `None` under policy
+    /// None.
+    pub receiver_thumbprint: Option<Vec<u8>>,
+}
+
+impl AsymmetricHeader {
+    /// The header for security policy None.
+    pub fn none() -> AsymmetricHeader {
+        AsymmetricHeader {
+            policy_uri: SECURITY_POLICY_NONE.to_string(),
+            sender_certificate: None,
+            receiver_thumbprint: None,
+        }
+    }
+}
+
+/// What kind of secure message this is, with its security header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SecureKind {
+    /// OPN: always one chunk.
+    Open(AsymmetricHeader),
+    /// CLO: always one chunk.
+    Close {
+        /// The security token the channel is using.
+        token_id: u32,
+    },
+    /// MSG: one or more chunks.
+    Message {
+        /// The security token the channel is using.
+        token_id: u32,
+    },
+}
+
+impl SecureKind {
+    /// The message type its chunks carry.
+    pub fn message_type(&self) -> MessageType {
+        match self {
+            SecureKind::Open(_) => MessageType::Open,
+            SecureKind::Close { .. } => MessageType::Close,
+            SecureKind::Message { .. } => MessageType::Message,
+        }
+    }
+}
+
+/// A whole OPN, CLO or MSG message, its chunks put back together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecureMessage {
+    /// The kind and its security header.
+    pub kind: SecureKind,
+    /// The secure channel; 0 in a request to open a new one.
+    pub channel_id: u32,
+    /// The first chunk's sequence number. Each later chunk's is one more.
+    pub sequence_number: u32,
+    /// Chosen by the client and copied into the response.
+    pub request_id: u32,
+    /// The body. Under policy None it is a [`Service`] encoding.
+    pub body: Vec<u8>,
+}
+
+/// An abort chunk: the sender gave up on a MSG partway through. Any
+/// chunks of it already read are dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Abort {
+    /// The secure channel.
+    pub channel_id: u32,
+    /// The security token.
+    pub token_id: u32,
+    /// The abort chunk's sequence number.
+    pub sequence_number: u32,
+    /// The request given up on.
+    pub request_id: u32,
+    /// Why.
+    pub error: StatusCode,
+    /// Text for a person to read. A null one reads as empty.
+    pub reason: String,
+}
+
+/// A whole message read from a stream, or one to write to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Message {
+    /// HEL.
+    Hello(Hello),
+    /// ACK.
+    Acknowledge(Acknowledge),
+    /// ERR.
+    Error(ErrorMessage),
+    /// RHE.
+    ReverseHello(ReverseHello),
+    /// OPN, CLO or MSG.
+    Secure(SecureMessage),
+    /// An abort chunk of a MSG.
+    Abort(Abort),
+}
+
+impl Message {
+    /// The message's bytes, split into as few chunks as a peer that takes
+    /// `peer` allows. It fails if the message breaks a rule or limit the
+    /// peer's [`Decoder`] checks: an OPN or CLO too large for one chunk, a
+    /// MSG with too large a body or needing too many chunks, a buffer size
+    /// below [`MIN_BUFFER_SIZE`], or a string past its limit.
+    pub fn to_bytes(&self, peer: &Limits) -> Result<Vec<u8>, EncodeError> {
+        Ok(match self {
+            Message::Hello(h) => chunk_bytes(MessageType::Hello, ChunkType::Final, &h.body()?),
+            Message::Acknowledge(a) => chunk_bytes(MessageType::Acknowledge, ChunkType::Final, &a.body()?),
+            Message::Error(e) => {
+                let mut w = Writer::new();
+                e.error.encode(&mut w)?;
+                w.string_max(Some(&e.reason), MAX_REASON_LEN)?;
+                chunk_bytes(MessageType::Error, ChunkType::Final, &w.into_bytes())
+            }
+            Message::ReverseHello(rh) => {
+                let mut w = Writer::new();
+                w.string_max(Some(&rh.server_uri), MAX_URL_LEN)?;
+                w.string_max(Some(&rh.endpoint_url), MAX_URL_LEN)?;
+                chunk_bytes(MessageType::ReverseHello, ChunkType::Final, &w.into_bytes())
+            }
+            Message::Secure(m) => m.to_chunks(peer)?.concat(),
+            Message::Abort(a) => {
+                let mut w = Writer::new();
+                for v in [a.channel_id, a.token_id, a.sequence_number, a.request_id] {
+                    w.u32(v);
+                }
+                a.error.encode(&mut w)?;
+                w.string_max(Some(&a.reason), MAX_REASON_LEN)?;
+                // At most 4 * 5 + 4 + MAX_REASON_LEN bytes, under any chunk limit.
+                chunk_bytes(MessageType::Message, ChunkType::Abort, &w.into_bytes())
+            }
+        })
+    }
+}
+
+impl SecureMessage {
+    /// The message's chunks, each as large as a peer that takes `peer`
+    /// allows. See [`Message::to_bytes`] for when it fails.
+    pub fn to_chunks(&self, peer: &Limits) -> Result<Vec<Vec<u8>>, EncodeError> {
+        let chunk_limit = peer.chunk_limit() as usize;
+        if self.body.len() > peer.message_limit() as usize {
+            return Err(EncodeError::TooLong);
+        }
+        let mut w = Writer::new();
+        w.u32(self.channel_id);
+        match &self.kind {
+            SecureKind::Open(h) => {
+                w.string_max(Some(&h.policy_uri), MAX_POLICY_URI_LEN)?;
+                w.byte_string(h.sender_certificate.as_deref())?;
+                w.byte_string(h.receiver_thumbprint.as_deref())?;
+            }
+            SecureKind::Close { token_id } | SecureKind::Message { token_id } => w.u32(*token_id),
+        }
+        let security = w.into_bytes();
+        let message_type = self.kind.message_type();
+        // The header, the security header and the sequence header.
+        let overhead = HEADER_LEN + security.len() + 8;
+        if overhead > chunk_limit || (overhead == chunk_limit && !self.body.is_empty()) {
+            return Err(EncodeError::TooLong);
+        }
+        let per_chunk = chunk_limit - overhead;
+        let single = !matches!(self.kind, SecureKind::Message { .. });
+        let pieces: Vec<&[u8]> =
+            if self.body.is_empty() { vec![&[][..]] } else { self.body.chunks(per_chunk).collect() };
+        if (single && pieces.len() > 1) || pieces.len() > peer.chunk_count_limit() as usize {
+            return Err(EncodeError::TooLong);
+        }
+        let last = pieces.len() - 1;
+        let mut out = Vec::with_capacity(pieces.len());
+        for (i, piece) in pieces.iter().enumerate() {
+            let mut body = Vec::with_capacity(security.len() + 8 + piece.len());
+            body.extend_from_slice(&security);
+            body.extend_from_slice(&self.sequence_number.wrapping_add(i as u32).to_le_bytes());
+            body.extend_from_slice(&self.request_id.to_le_bytes());
+            body.extend_from_slice(piece);
+            let chunk_type = if i == last { ChunkType::Final } else { ChunkType::Intermediate };
+            out.push(chunk_bytes(message_type, chunk_type, &body));
+        }
+        Ok(out)
+    }
+}
+
+/// A MSG whose final chunk has not come yet.
+#[derive(Debug)]
+struct Partial {
+    channel_id: u32,
+    token_id: u32,
+    first_sequence: u32,
+    last_sequence: u32,
+    request_id: u32,
+    body: Vec<u8>,
+    chunks: u32,
+}
+
+/// The fields of one OPN, CLO or MSG chunk.
+struct SecureChunk {
+    kind: SecureKind,
+    channel_id: u32,
+    sequence_number: u32,
+    request_id: u32,
+    rest: Vec<u8>,
+}
+
+fn decode_secure(message_type: MessageType, body: &[u8]) -> Result<SecureChunk, DecodeError> {
+    let mut r = Reader::new(body);
+    let channel_id = r.u32()?;
+    let kind = match message_type {
+        MessageType::Open => SecureKind::Open(AsymmetricHeader {
+            policy_uri: r.string_max(MAX_POLICY_URI_LEN)?.unwrap_or_default(),
+            sender_certificate: r.byte_string()?,
+            receiver_thumbprint: r.byte_string()?,
+        }),
+        MessageType::Close => SecureKind::Close { token_id: r.u32()? },
+        _ => SecureKind::Message { token_id: r.u32()? },
+    };
+    let sequence_number = r.u32()?;
+    let request_id = r.u32()?;
+    Ok(SecureChunk { kind, channel_id, sequence_number, request_id, rest: r.rest().to_vec() })
+}
+
+/// Whether `got` follows `prev`: one more, or a wrap to below 1024 from a
+/// number above [`LEGACY_WRAP`].
+fn follows(prev: u32, got: u32) -> bool {
+    got == prev.wrapping_add(1) || (prev > LEGACY_WRAP && got < 1024)
+}
+
+/// Splits an OPC UA byte stream into messages, putting the chunks of each
+/// MSG back together. Feed it the bytes a connection reads, in order, and
+/// take messages out until it has none. After a Hello is answered, give it
+/// the negotiated [`Limits`] with [`Decoder::set_limits`].
+#[derive(Debug, Default)]
+pub struct Decoder {
+    buf: Vec<u8>,
+    /// Where the bytes not yet taken out start. Bytes before it are
+    /// dropped in `feed` once they are half the buffer.
+    start: usize,
+    limits: Limits,
+    partial: Option<Partial>,
+    failed: Option<ChunkError>,
+}
+
+impl Decoder {
+    /// A decoder holding no bytes, with [`Limits::default`].
+    pub fn new() -> Decoder {
+        Decoder::default()
+    }
+
+    /// A decoder holding no bytes, with `limits`.
+    pub fn with_limits(limits: Limits) -> Decoder {
+        Decoder { limits, ..Decoder::default() }
+    }
+
+    /// Sets what this side takes in. Chunks already taken out are not
+    /// checked again.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    /// What this side takes in.
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Adds bytes read from the connection. After a [`ChunkError`] the
+    /// stream cannot be read any further, and they are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.failed.is_none() {
+            if self.start > 0 && self.start >= self.buf.len() / 2 {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// How many bytes are held, waiting for the rest of a chunk.
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    /// The next whole message, if one has come. It returns `None` when it
+    /// needs more bytes, and keeps returning the same error once the
+    /// stream has broken. Besides what `feed` added, a decoder holds at
+    /// most one chunk and one message body, each within its limits.
+    pub fn next_message(&mut self) -> Option<Result<Message, ChunkError>> {
+        if let Some(e) = &self.failed {
+            return Some(Err(e.clone()));
+        }
+        loop {
+            match Chunk::parse(&self.buf[self.start..], &self.limits) {
+                Ok(None) => return None,
+                Ok(Some((chunk, used))) => {
+                    self.start += used;
+                    match self.take(chunk) {
+                        Ok(Some(m)) => return Some(Ok(m)),
+                        Ok(None) => continue,
+                        Err(e) => return Some(Err(self.fail(e))),
+                    }
+                }
+                Err(e) => return Some(Err(self.fail(e))),
+            }
+        }
+    }
+
+    fn fail(&mut self, e: ChunkError) -> ChunkError {
+        self.failed = Some(e.clone());
+        self.buf = Vec::new();
+        self.start = 0;
+        self.partial = None;
+        e
+    }
+
+    /// Handles one chunk: a whole message, or `None` for part of a MSG.
+    fn take(&mut self, chunk: Chunk) -> Result<Option<Message>, ChunkError> {
+        let t = chunk.message_type;
+        let de = |e| ChunkError::Decode(t, e);
+        if t != MessageType::Message && self.partial.is_some() {
+            return Err(ChunkError::Interleaved);
+        }
+        let mut r = Reader::new(&chunk.body);
+        let message = match t {
+            MessageType::Hello => {
+                let h = Hello::decode(&mut r).map_err(de)?;
+                r.finish().map_err(de)?;
+                for n in [h.receive_buffer_size, h.send_buffer_size] {
+                    if n < MIN_BUFFER_SIZE {
+                        return Err(ChunkError::BufferSize(n));
+                    }
+                }
+                Message::Hello(h)
+            }
+            MessageType::Acknowledge => {
+                let a = Acknowledge::decode(&mut r).map_err(de)?;
+                r.finish().map_err(de)?;
+                for n in [a.receive_buffer_size, a.send_buffer_size] {
+                    if n < MIN_BUFFER_SIZE {
+                        return Err(ChunkError::BufferSize(n));
+                    }
+                }
+                Message::Acknowledge(a)
+            }
+            MessageType::Error => {
+                let error = r.read().map_err(de)?;
+                let reason = read_reason(&mut r).map_err(de)?;
+                r.finish().map_err(de)?;
+                Message::Error(ErrorMessage { error, reason })
+            }
+            MessageType::ReverseHello => {
+                let server_uri = r.string_max(MAX_URL_LEN).map_err(de)?.unwrap_or_default();
+                let endpoint_url = r.string_max(MAX_URL_LEN).map_err(de)?.unwrap_or_default();
+                r.finish().map_err(de)?;
+                Message::ReverseHello(ReverseHello { server_uri, endpoint_url })
+            }
+            MessageType::Open | MessageType::Close | MessageType::Message => {
+                let s = decode_secure(t, &chunk.body).map_err(de)?;
+                return self.take_secure(chunk.chunk_type, s);
+            }
+        };
+        Ok(Some(message))
+    }
+
+    fn take_secure(&mut self, chunk_type: ChunkType, s: SecureChunk) -> Result<Option<Message>, ChunkError> {
+        let message_limit = self.limits.message_limit();
+        let count_limit = self.limits.chunk_count_limit();
+        let token_id = match s.kind {
+            SecureKind::Message { token_id } => token_id,
+            _ => {
+                // OPN and CLO are one chunk, and come between messages.
+                if s.rest.len() > message_limit as usize {
+                    return Err(ChunkError::MessageTooLarge(message_limit));
+                }
+                return Ok(Some(Message::Secure(SecureMessage {
+                    kind: s.kind,
+                    channel_id: s.channel_id,
+                    sequence_number: s.sequence_number,
+                    request_id: s.request_id,
+                    body: s.rest,
+                })));
+            }
+        };
+        let mut partial = match self.partial.take() {
+            Some(p) => {
+                if p.request_id != s.request_id {
+                    return Err(ChunkError::Interleaved);
+                }
+                if p.channel_id != s.channel_id || p.token_id != token_id {
+                    return Err(ChunkError::Mismatch);
+                }
+                if !follows(p.last_sequence, s.sequence_number) {
+                    return Err(ChunkError::Sequence {
+                        expected: p.last_sequence.wrapping_add(1),
+                        got: s.sequence_number,
+                    });
+                }
+                p
+            }
+            None => Partial {
+                channel_id: s.channel_id,
+                token_id,
+                first_sequence: s.sequence_number,
+                last_sequence: s.sequence_number,
+                request_id: s.request_id,
+                body: Vec::new(),
+                chunks: 0,
+            },
+        };
+        partial.last_sequence = s.sequence_number;
+        if chunk_type == ChunkType::Abort {
+            let mut r = Reader::new(&s.rest);
+            let de = |e| ChunkError::Decode(MessageType::Message, e);
+            let error = r.read().map_err(de)?;
+            let reason = read_reason(&mut r).map_err(de)?;
+            r.finish().map_err(de)?;
+            return Ok(Some(Message::Abort(Abort {
+                channel_id: s.channel_id,
+                token_id,
+                sequence_number: s.sequence_number,
+                request_id: s.request_id,
+                error,
+                reason,
+            })));
+        }
+        partial.chunks += 1;
+        if partial.chunks > count_limit {
+            return Err(ChunkError::TooManyChunks(count_limit));
+        }
+        if partial.body.len() + s.rest.len() > message_limit as usize {
+            return Err(ChunkError::MessageTooLarge(message_limit));
+        }
+        partial.body.extend_from_slice(&s.rest);
+        if chunk_type == ChunkType::Intermediate {
+            self.partial = Some(partial);
+            return Ok(None);
+        }
+        Ok(Some(Message::Secure(SecureMessage {
+            kind: SecureKind::Message { token_id },
+            channel_id: partial.channel_id,
+            sequence_number: partial.first_sequence,
+            request_id: partial.request_id,
+            body: partial.body,
+        })))
+    }
+}
+
+// ---------------------------------------------------------------------
+// Services
+// ---------------------------------------------------------------------
+
+/// The numeric ids, in namespace 0, of the binary encodings of the
+/// services this module reads. A message body starts with one.
+pub mod encoding_id {
+    #![allow(missing_docs)]
+    pub const SERVICE_FAULT: u32 = 397;
+    pub const OPEN_SECURE_CHANNEL_REQUEST: u32 = 446;
+    pub const OPEN_SECURE_CHANNEL_RESPONSE: u32 = 449;
+    pub const CLOSE_SECURE_CHANNEL_REQUEST: u32 = 452;
+    pub const CLOSE_SECURE_CHANNEL_RESPONSE: u32 = 455;
+}
+
+/// The header at the start of every request.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RequestHeader {
+    /// The session's authentication token; null outside a session.
+    pub authentication_token: NodeId,
+    /// When the client sent the request, as a DateTime.
+    pub timestamp: i64,
+    /// Chosen by the client and copied into the response header.
+    pub request_handle: u32,
+    /// Bits saying which diagnostics the client wants back.
+    pub return_diagnostics: u32,
+    /// An id for audit logs. A null one reads as `None`.
+    pub audit_entry_id: Option<String>,
+    /// How long, in milliseconds, the client will wait; 0 for no limit.
+    pub timeout_hint: u32,
+    /// Extra fields, kept raw.
+    pub additional_header: ExtensionObject,
+}
+
+impl Binary for RequestHeader {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(RequestHeader {
+            authentication_token: r.read()?,
+            timestamp: r.i64()?,
+            request_handle: r.u32()?,
+            return_diagnostics: r.u32()?,
+            audit_entry_id: r.string()?,
+            timeout_hint: r.u32()?,
+            additional_header: r.read()?,
+        })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.authentication_token.encode(w)?;
+        w.i64(self.timestamp);
+        w.u32(self.request_handle);
+        w.u32(self.return_diagnostics);
+        w.string(self.audit_entry_id.as_deref())?;
+        w.u32(self.timeout_hint);
+        self.additional_header.encode(w)
+    }
+}
+
+/// The header at the start of every response.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ResponseHeader {
+    /// When the server sent the response, as a DateTime.
+    pub timestamp: i64,
+    /// The request's handle.
+    pub request_handle: u32,
+    /// Whether the service succeeded.
+    pub service_result: StatusCode,
+    /// Diagnostics for the service result.
+    pub service_diagnostics: DiagnosticInfo,
+    /// The strings the diagnostics point into. A null array reads as
+    /// empty.
+    pub string_table: Vec<Option<String>>,
+    /// Extra fields, kept raw.
+    pub additional_header: ExtensionObject,
+}
+
+impl Binary for Option<String> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        r.string()
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.string(self.as_deref())
+    }
+}
+
+impl Binary for ResponseHeader {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(ResponseHeader {
+            timestamp: r.i64()?,
+            request_handle: r.u32()?,
+            service_result: r.read()?,
+            service_diagnostics: r.read()?,
+            string_table: r.read_array()?,
+            additional_header: r.read()?,
+        })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.i64(self.timestamp);
+        w.u32(self.request_handle);
+        self.service_result.encode(w)?;
+        self.service_diagnostics.encode(w)?;
+        w.write_array(&self.string_table)?;
+        self.additional_header.encode(w)
+    }
+}
+
+/// Whether an OpenSecureChannel request makes a new token or renews one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RequestType {
+    /// 0: open a new channel.
+    Issue,
+    /// 1: renew the token of an open channel.
+    Renew,
+}
+
+/// How messages on a secure channel are protected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SecurityMode {
+    /// 0: not valid.
+    Invalid,
+    /// 1: no protection. The only mode policy None allows.
+    None,
+    /// 2: signed.
+    Sign,
+    /// 3: signed and encrypted.
+    SignAndEncrypt,
+}
+
+impl Binary for RequestType {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        match r.i32()? {
+            0 => Ok(RequestType::Issue),
+            1 => Ok(RequestType::Renew),
+            n => Err(DecodeError::Enum(n)),
+        }
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.i32(*self as i32);
+        Ok(())
+    }
+}
+
+impl Binary for SecurityMode {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        match r.i32()? {
+            0 => Ok(SecurityMode::Invalid),
+            1 => Ok(SecurityMode::None),
+            2 => Ok(SecurityMode::Sign),
+            3 => Ok(SecurityMode::SignAndEncrypt),
+            n => Err(DecodeError::Enum(n)),
+        }
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.i32(*self as i32);
+        Ok(())
+    }
+}
+
+/// An OpenSecureChannel request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenSecureChannelRequest {
+    /// The request header.
+    pub header: RequestHeader,
+    /// The protocol version the client speaks.
+    pub client_protocol_version: u32,
+    /// Issue or renew.
+    pub request_type: RequestType,
+    /// The protection asked for.
+    pub security_mode: SecurityMode,
+    /// The client's nonce; null or empty under policy None.
+    pub client_nonce: Option<Vec<u8>>,
+    /// How long, in milliseconds, the client asks the token to last.
+    pub requested_lifetime: u32,
+}
+
+impl Binary for OpenSecureChannelRequest {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(OpenSecureChannelRequest {
+            header: r.read()?,
+            client_protocol_version: r.u32()?,
+            request_type: r.read()?,
+            security_mode: r.read()?,
+            client_nonce: r.byte_string()?,
+            requested_lifetime: r.u32()?,
+        })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.header.encode(w)?;
+        w.u32(self.client_protocol_version);
+        self.request_type.encode(w)?;
+        self.security_mode.encode(w)?;
+        w.byte_string(self.client_nonce.as_deref())?;
+        w.u32(self.requested_lifetime);
+        Ok(())
+    }
+}
+
+/// The token a secure channel uses, issued by the server.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChannelSecurityToken {
+    /// The channel's id, which every later chunk carries.
+    pub channel_id: u32,
+    /// The token's id, which every CLO and MSG chunk carries.
+    pub token_id: u32,
+    /// When the token was made, as a DateTime.
+    pub created_at: i64,
+    /// How long, in milliseconds, the token lasts.
+    pub revised_lifetime: u32,
+}
+
+impl Binary for ChannelSecurityToken {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(ChannelSecurityToken {
+            channel_id: r.u32()?,
+            token_id: r.u32()?,
+            created_at: r.i64()?,
+            revised_lifetime: r.u32()?,
+        })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.channel_id);
+        w.u32(self.token_id);
+        w.i64(self.created_at);
+        w.u32(self.revised_lifetime);
+        Ok(())
+    }
+}
+
+/// An OpenSecureChannel response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenSecureChannelResponse {
+    /// The response header.
+    pub header: ResponseHeader,
+    /// The protocol version the server speaks.
+    pub server_protocol_version: u32,
+    /// The token issued.
+    pub security_token: ChannelSecurityToken,
+    /// The server's nonce; null or empty under policy None.
+    pub server_nonce: Option<Vec<u8>>,
+}
+
+impl Binary for OpenSecureChannelResponse {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(OpenSecureChannelResponse {
+            header: r.read()?,
+            server_protocol_version: r.u32()?,
+            security_token: r.read()?,
+            server_nonce: r.byte_string()?,
+        })
+    }
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.header.encode(w)?;
+        w.u32(self.server_protocol_version);
+        self.security_token.encode(w)?;
+        w.byte_string(self.server_nonce.as_deref())
+    }
+}
+
+/// A secure message's body under policy None: the NodeId of its encoding,
+/// then the service's fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Service {
+    /// Encoding 446.
+    OpenSecureChannelRequest(OpenSecureChannelRequest),
+    /// Encoding 449.
+    OpenSecureChannelResponse(OpenSecureChannelResponse),
+    /// Encoding 452: just a request header.
+    CloseSecureChannelRequest(RequestHeader),
+    /// Encoding 455: just a response header.
+    CloseSecureChannelResponse(ResponseHeader),
+    /// Encoding 397: the response to any request that failed.
+    ServiceFault(ResponseHeader),
+    /// Any other service, with its fields unread.
+    Other {
+        /// The NodeId of its encoding.
+        type_id: NodeId,
+        /// Its fields.
+        body: Vec<u8>,
+    },
+}
+
+impl Service {
+    /// Reads a message body. A known service must fill the body exactly.
+    pub fn parse(body: &[u8]) -> Result<Service, DecodeError> {
+        let mut r = Reader::new(body);
+        let type_id: NodeId = r.read()?;
+        let service = match type_id.ns0() {
+            Some(encoding_id::OPEN_SECURE_CHANNEL_REQUEST) => Service::OpenSecureChannelRequest(r.read()?),
+            Some(encoding_id::OPEN_SECURE_CHANNEL_RESPONSE) => Service::OpenSecureChannelResponse(r.read()?),
+            Some(encoding_id::CLOSE_SECURE_CHANNEL_REQUEST) => Service::CloseSecureChannelRequest(r.read()?),
+            Some(encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE) => Service::CloseSecureChannelResponse(r.read()?),
+            Some(encoding_id::SERVICE_FAULT) => Service::ServiceFault(r.read()?),
+            _ => {
+                return Ok(Service::Other { type_id, body: r.rest().to_vec() });
+            }
+        };
+        r.finish()?;
+        Ok(service)
+    }
+
+    /// The NodeId of the service's encoding.
+    pub fn type_id(&self) -> NodeId {
+        let id = match self {
+            Service::OpenSecureChannelRequest(_) => encoding_id::OPEN_SECURE_CHANNEL_REQUEST,
+            Service::OpenSecureChannelResponse(_) => encoding_id::OPEN_SECURE_CHANNEL_RESPONSE,
+            Service::CloseSecureChannelRequest(_) => encoding_id::CLOSE_SECURE_CHANNEL_REQUEST,
+            Service::CloseSecureChannelResponse(_) => encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE,
+            Service::ServiceFault(_) => encoding_id::SERVICE_FAULT,
+            Service::Other { type_id, .. } => return type_id.clone(),
+        };
+        NodeId::numeric(0, id)
+    }
+
+    /// The message body. It fails if a field breaks a limit, or if
+    /// [`Service::Other`] carries the type id of a service this module
+    /// reads.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        let mut w = Writer::new();
+        self.type_id().encode(&mut w)?;
+        match self {
+            Service::OpenSecureChannelRequest(s) => s.encode(&mut w)?,
+            Service::OpenSecureChannelResponse(s) => s.encode(&mut w)?,
+            Service::CloseSecureChannelRequest(h) => h.encode(&mut w)?,
+            Service::CloseSecureChannelResponse(h) | Service::ServiceFault(h) => h.encode(&mut w)?,
+            Service::Other { type_id, body } => {
+                let known = [
+                    encoding_id::SERVICE_FAULT,
+                    encoding_id::OPEN_SECURE_CHANNEL_REQUEST,
+                    encoding_id::OPEN_SECURE_CHANNEL_RESPONSE,
+                    encoding_id::CLOSE_SECURE_CHANNEL_REQUEST,
+                    encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE,
+                ];
+                if type_id.ns0().is_some_and(|id| known.contains(&id)) {
+                    return Err(EncodeError::KnownTypeId);
+                }
+                w.bytes(body);
+            }
+        }
+        Ok(w.into_bytes())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn le32(v: u32) -> [u8; 4] {
+        v.to_le_bytes()
+    }
+
+    fn hel_bytes(receive: u32, send: u32, url: &[u8]) -> Vec<u8> {
+        let mut b = b"HELF".to_vec();
+        b.extend_from_slice(&le32(32 + url.len() as u32));
+        for v in [0, receive, send, 0, 0] {
+            b.extend_from_slice(&le32(v));
+        }
+        b.extend_from_slice(&(url.len() as i32).to_le_bytes());
+        b.extend_from_slice(url);
+        b
+    }
+
+    fn msg(token_id: u32, seq: u32, request_id: u32, body: Vec<u8>) -> Message {
+        Message::Secure(SecureMessage {
+            kind: SecureKind::Message { token_id },
+            channel_id: 7,
+            sequence_number: seq,
+            request_id,
+            body,
+        })
+    }
+
+    /// A raw MSG chunk.
+    fn msg_chunk(ct: u8, channel: u32, token: u32, seq: u32, req: u32, body: &[u8]) -> Vec<u8> {
+        let mut b = b"MSG".to_vec();
+        b.push(ct);
+        b.extend_from_slice(&le32(24 + body.len() as u32));
+        for v in [channel, token, seq, req] {
+            b.extend_from_slice(&le32(v));
+        }
+        b.extend_from_slice(body);
+        b
+    }
+
+    fn all(d: &mut Decoder) -> Vec<Result<Message, ChunkError>> {
+        let mut out = Vec::new();
+        while let Some(m) = d.next_message() {
+            let stop = m.is_err();
+            out.push(m);
+            if stop {
+                break;
+            }
+        }
+        out
+    }
+
+    // Examples from OPC UA Part 6, section 5.2.
+
+    #[test]
+    fn string_example() {
+        // "水Boy" is 6 bytes of UTF-8.
+        let mut w = Writer::new();
+        w.string(Some("水Boy")).unwrap();
+        assert_eq!(w.into_bytes(), [0x06, 0, 0, 0, 0xe6, 0xb0, 0xb4, 0x42, 0x6f, 0x79]);
+        let mut w = Writer::new();
+        w.string(None).unwrap();
+        assert_eq!(w.into_bytes(), [0xff; 4]);
+        let mut r = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
+        assert_eq!(r.string(), Ok(None));
+        assert_eq!(r.string(), Ok(Some(String::new())));
+        assert_eq!(Reader::new(&[0xfe, 0xff, 0xff, 0xff]).string(), Err(DecodeError::Length(-2)));
+        assert_eq!(Reader::new(&[5, 0, 0, 0, b'a']).string(), Err(DecodeError::Length(5)));
+        assert_eq!(Reader::new(&[1, 0, 0, 0, 0xff]).string(), Err(DecodeError::Utf8));
+    }
+
+    #[test]
+    fn guid_example() {
+        // 72962B91-FA75-4AE6-8D28-B404DC7DAF63
+        let g = Guid {
+            data1: 0x72962b91,
+            data2: 0xfa75,
+            data3: 0x4ae6,
+            data4: [0x8d, 0x28, 0xb4, 0x04, 0xdc, 0x7d, 0xaf, 0x63],
+        };
+        let bytes = [0x91, 0x2b, 0x96, 0x72, 0x75, 0xfa, 0xe6, 0x4a, 0x8d, 0x28, 0xb4, 0x04, 0xdc, 0x7d, 0xaf, 0x63];
+        assert_eq!(encode(&g).unwrap(), bytes);
+        assert_eq!(decode::<Guid>(&bytes), Ok(g));
+    }
+
+    #[test]
+    fn node_id_examples() {
+        // Two-byte form: 72 in namespace 0.
+        assert_eq!(encode(&NodeId::numeric(0, 72)).unwrap(), [0x00, 0x48]);
+        // Four-byte form: 1025 in namespace 5.
+        assert_eq!(encode(&NodeId::numeric(5, 1025)).unwrap(), [0x01, 0x05, 0x01, 0x04]);
+        // String form: "Hot水" in namespace 1.
+        let hot = [0x03, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x48, 0x6f, 0x74, 0xe6, 0xb0, 0xb4];
+        assert_eq!(encode(&NodeId::string(1, "Hot水")).unwrap(), hot);
+        assert_eq!(decode::<NodeId>(&hot), Ok(NodeId::string(1, "Hot水")));
+        // Numeric form when the short ones do not fit.
+        assert_eq!(encode(&NodeId::numeric(0, 70000)).unwrap(), [0x02, 0, 0, 0x70, 0x11, 0x01, 0x00]);
+        assert_eq!(encode(&NodeId::numeric(300, 1)).unwrap(), [0x02, 0x2c, 0x01, 1, 0, 0, 0]);
+        // Readers take any form, so a long form reads as the same NodeId.
+        assert_eq!(decode::<NodeId>(&[0x02, 0, 0, 72, 0, 0, 0]), Ok(NodeId::numeric(0, 72)));
+        // Guid and opaque forms.
+        let g = NodeId { namespace: 2, identifier: Identifier::Guid(Guid::default()) };
+        assert_eq!(decode::<NodeId>(&encode(&g).unwrap()), Ok(g));
+        let o = NodeId { namespace: 2, identifier: Identifier::Opaque(vec![1, 2, 3]) };
+        assert_eq!(decode::<NodeId>(&encode(&o).unwrap()), Ok(o));
+        // A null string identifier reads as empty.
+        assert_eq!(decode::<NodeId>(&[0x03, 1, 0, 0xff, 0xff, 0xff, 0xff]), Ok(NodeId::string(1, "")));
+        // Bad forms.
+        assert_eq!(decode::<NodeId>(&[0x06, 0]), Err(DecodeError::NodeIdForm(6)));
+        assert_eq!(decode::<NodeId>(&[0x80, 0]), Err(DecodeError::NodeIdForm(0x80)));
+        assert_eq!(decode::<NodeId>(&[0x00, 1, 2]), Err(DecodeError::Trailing(1)));
+        assert_eq!(decode::<NodeId>(&[0x01, 1]), Err(DecodeError::End));
+        assert!(NodeId::default().is_null());
+    }
+
+    #[test]
+    fn expanded_node_id() {
+        let e =
+            ExpandedNodeId { node_id: NodeId::numeric(0, 85), namespace_uri: Some("urn:x".into()), server_index: 3 };
+        let bytes = encode(&e).unwrap();
+        assert_eq!(bytes[..2], [0xc0, 85]);
+        assert_eq!(decode::<ExpandedNodeId>(&bytes), Ok(e));
+        let plain = ExpandedNodeId { node_id: NodeId::numeric(0, 85), ..Default::default() };
+        assert_eq!(encode(&plain).unwrap(), [0, 85]);
+        // A null URI with the flag set reads as no URI.
+        assert_eq!(decode::<ExpandedNodeId>(&[0x80, 85, 0xff, 0xff, 0xff, 0xff]), Ok(plain));
+        assert_eq!(decode::<ExpandedNodeId>(&[0x87, 85]), Err(DecodeError::NodeIdForm(0x87)));
+    }
+
+    #[test]
+    fn names_and_texts() {
+        let q = QualifiedName { namespace: 2, name: "Pump".into() };
+        assert_eq!(encode(&q).unwrap(), [2, 0, 4, 0, 0, 0, b'P', b'u', b'm', b'p']);
+        assert_eq!(decode::<QualifiedName>(&encode(&q).unwrap()), Ok(q));
+        let t = LocalizedText { locale: Some("en".into()), text: Some("Hi".into()) };
+        assert_eq!(encode(&t).unwrap(), [3, 2, 0, 0, 0, b'e', b'n', 2, 0, 0, 0, b'H', b'i']);
+        assert_eq!(decode::<LocalizedText>(&encode(&t).unwrap()), Ok(t));
+        assert_eq!(encode(&LocalizedText::default()).unwrap(), [0]);
+        assert_eq!(decode::<LocalizedText>(&[4]), Err(DecodeError::Mask(4)));
+    }
+
+    #[test]
+    fn extension_objects_stay_raw() {
+        let e = ExtensionObject { type_id: NodeId::numeric(0, 324), body: ExtensionBody::Binary(vec![9, 8, 7]) };
+        let bytes = encode(&e).unwrap();
+        assert_eq!(bytes, [0x01, 0, 0x44, 0x01, 1, 3, 0, 0, 0, 9, 8, 7]);
+        assert_eq!(decode::<ExtensionObject>(&bytes), Ok(e));
+        let x = ExtensionObject { type_id: NodeId::default(), body: ExtensionBody::Xml(b"<a/>".to_vec()) };
+        assert_eq!(decode::<ExtensionObject>(&encode(&x).unwrap()), Ok(x));
+        assert_eq!(encode(&ExtensionObject::default()).unwrap(), [0, 0, 0]);
+        assert_eq!(decode::<ExtensionObject>(&[0, 0, 3]), Err(DecodeError::Mask(3)));
+    }
+
+    #[test]
+    fn variants() {
+        // A scalar Int32.
+        let v = Variant::Scalar(Value::Int32(-2));
+        assert_eq!(encode(&v).unwrap(), [6, 0xfe, 0xff, 0xff, 0xff]);
+        assert_eq!(decode::<Variant>(&[6, 0xfe, 0xff, 0xff, 0xff]), Ok(v));
+        assert_eq!(encode(&Variant::Null).unwrap(), [0]);
+        // A 2 by 2 array of Bytes.
+        let a = Variant::Array {
+            type_id: type_id::BYTE,
+            values: (1..=4).map(Value::Byte).collect(),
+            dimensions: Some(vec![2, 2]),
+        };
+        let bytes = encode(&a).unwrap();
+        assert_eq!(bytes, [0xc3, 4, 0, 0, 0, 1, 2, 3, 4, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0]);
+        assert_eq!(decode::<Variant>(&bytes), Ok(a));
+        // A null array reads as empty.
+        let empty = Variant::Array { type_id: type_id::STRING, values: vec![], dimensions: None };
+        assert_eq!(decode::<Variant>(&[0x8c, 0xff, 0xff, 0xff, 0xff]), Ok(empty));
+        // An array of Variants, and every other type, round trip.
+        let every = Variant::Array {
+            type_id: type_id::VARIANT,
+            values: sample_values().into_iter().map(|v| Value::Variant(Box::new(Variant::Scalar(v)))).collect(),
+            dimensions: None,
+        };
+        let bytes = encode(&every).unwrap();
+        let back: Variant = decode(&bytes).unwrap();
+        assert_eq!(encode(&back).unwrap(), bytes);
+        // Reserved type ids are kept as ByteStrings.
+        assert_eq!(
+            decode::<Variant>(&[27, 1, 0, 0, 0, 5]),
+            Ok(Variant::Scalar(Value::Reserved { type_id: 27, bytes: Some(vec![5]) }))
+        );
+    }
+
+    #[test]
+    fn variant_errors() {
+        assert_eq!(decode::<Variant>(&[32]), Err(DecodeError::VariantType(32)));
+        assert_eq!(decode::<Variant>(&[0x80]), Err(DecodeError::VariantType(0)));
+        assert_eq!(decode::<Variant>(&[24, 0]), Err(DecodeError::VariantType(24)));
+        assert_eq!(decode::<Variant>(&[0x46, 0, 0, 0, 0]), Err(DecodeError::Dimensions));
+        // Dimensions that do not multiply out, a zero dimension, none, or too many.
+        let base = [0xc3u8, 2, 0, 0, 0, 1, 2];
+        for dims in [vec![1i32, 3], vec![0], vec![], vec![-1, -2], vec![1; 33]] {
+            let mut b = base.to_vec();
+            b.extend_from_slice(&(dims.len() as i32).to_le_bytes());
+            for d in &dims {
+                b.extend_from_slice(&d.to_le_bytes());
+            }
+            assert_eq!(decode::<Variant>(&b), Err(DecodeError::Dimensions), "{dims:?}");
+        }
+        // An array length past the bytes left.
+        assert_eq!(decode::<Variant>(&[0x83, 9, 0, 0, 0, 1]), Err(DecodeError::Length(9)));
+        assert_eq!(decode::<Variant>(&[0x83, 0xfe, 0xff, 0xff, 0xff]), Err(DecodeError::Length(-2)));
+        // Writers refuse what readers refuse.
+        let nested = Variant::Scalar(Value::Variant(Box::new(Variant::Null)));
+        assert_eq!(encode(&nested), Err(EncodeError::VariantType));
+        let mixed = Variant::Array { type_id: 3, values: vec![Value::Byte(1), Value::SByte(1)], dimensions: None };
+        assert_eq!(encode(&mixed), Err(EncodeError::VariantType));
+        let null = Variant::Array { type_id: 0, values: vec![], dimensions: None };
+        assert_eq!(encode(&null), Err(EncodeError::VariantType));
+        let dims = Variant::Array { type_id: 3, values: vec![Value::Byte(1)], dimensions: Some(vec![2]) };
+        assert_eq!(encode(&dims), Err(EncodeError::Dimensions));
+        let reserved = Variant::Scalar(Value::Reserved { type_id: 5, bytes: None });
+        assert_eq!(encode(&reserved), Err(EncodeError::VariantType));
+        let long = Variant::Array { type_id: 3, values: vec![Value::Byte(0); MAX_ARRAY_LEN + 1], dimensions: None };
+        assert_eq!(encode(&long), Err(EncodeError::TooLong));
+    }
+
+    /// `levels` Variants, each an array holding the next, around an Int32.
+    fn nest(levels: usize) -> Variant {
+        let mut v = Variant::Scalar(Value::Int32(1));
+        for _ in 1..levels {
+            v = Variant::Array {
+                type_id: type_id::VARIANT,
+                values: vec![Value::Variant(Box::new(v))],
+                dimensions: None,
+            };
+        }
+        v
+    }
+
+    #[test]
+    fn nesting_is_bounded() {
+        let bytes = encode(&nest(MAX_DEPTH)).unwrap();
+        assert_eq!(decode::<Variant>(&bytes), Ok(nest(MAX_DEPTH)));
+        assert_eq!(encode(&nest(MAX_DEPTH + 1)), Err(EncodeError::TooDeep));
+        // One level more, written by hand, does not read.
+        let mut deep = Vec::new();
+        for _ in 0..MAX_DEPTH {
+            deep.extend_from_slice(&[0x98, 1, 0, 0, 0]);
+        }
+        deep.extend_from_slice(&[6, 1, 0, 0, 0]);
+        assert_eq!(decode::<Variant>(&deep), Err(DecodeError::Depth));
+        // DataValues count too.
+        let mut dv = Vec::new();
+        for _ in 0..MAX_DEPTH {
+            dv.extend_from_slice(&[23, 0x01]);
+        }
+        dv.push(0);
+        assert_eq!(decode::<Variant>(&dv), Err(DecodeError::Depth));
+        let mut diag = vec![0x40u8; 64];
+        diag.push(0);
+        assert_eq!(decode::<DiagnosticInfo>(&diag), Err(DecodeError::Depth));
+        // A failed read leaves the reader's depth where it was.
+        let mut r = Reader::new(&deep);
+        assert!(r.read::<Variant>().is_err());
+        let mut r2 = Reader::new(&bytes);
+        assert!(r2.read::<Variant>().is_ok());
+    }
+
+    #[test]
+    fn data_values() {
+        let d = DataValue {
+            value: Some(Variant::Scalar(Value::Double(1.5))),
+            status: Some(StatusCode(0x4000_0000)),
+            source_timestamp: Some(1),
+            source_picoseconds: Some(2),
+            server_timestamp: Some(3),
+            server_picoseconds: Some(4),
+        };
+        let bytes = encode(&d).unwrap();
+        assert_eq!(bytes[0], 0x3f);
+        // Source picoseconds come before the server timestamp: after the
+        // mask (1), the Variant (9), the status (4) and the source timestamp (8).
+        assert_eq!(bytes[22..24], [2, 0]);
+        assert_eq!(decode::<DataValue>(&bytes), Ok(d));
+        assert_eq!(encode(&DataValue::default()).unwrap(), [0]);
+        assert_eq!(decode::<DataValue>(&[0x40]), Err(DecodeError::Mask(0x40)));
+    }
+
+    #[test]
+    fn diagnostic_infos() {
+        let d = DiagnosticInfo {
+            symbolic_id: Some(1),
+            namespace_uri: Some(2),
+            locale: Some(3),
+            localized_text: Some(4),
+            additional_info: Some("x".into()),
+            inner_status_code: Some(StatusCode::BAD_DECODING_ERROR),
+            inner_diagnostic_info: Some(Box::new(DiagnosticInfo { symbolic_id: Some(9), ..Default::default() })),
+        };
+        let bytes = encode(&d).unwrap();
+        // Locale comes before localized text on the wire.
+        assert_eq!(bytes[..17], [0x7f, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
+        assert_eq!(decode::<DiagnosticInfo>(&bytes), Ok(d));
+        assert_eq!(decode::<DiagnosticInfo>(&[0x80]), Err(DecodeError::Mask(0x80)));
+    }
+
+    #[test]
+    fn hello_and_acknowledge() {
+        let bytes = hel_bytes(65536, 65536, b"opc.tcp://a:4840");
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        let Some(Ok(Message::Hello(h))) = d.next_message() else { panic!() };
+        assert_eq!(h.endpoint_url, "opc.tcp://a:4840");
+        assert_eq!(Message::Hello(h.clone()).to_bytes(&Limits::default()).unwrap(), bytes);
+        let ours = Limits { receive_buffer_size: 32768, max_message_size: 1 << 20, max_chunk_count: 64 };
+        let ack = h.acknowledge(&ours);
+        assert_eq!(
+            ack,
+            Acknowledge {
+                protocol_version: 0,
+                receive_buffer_size: 32768,
+                send_buffer_size: 65536,
+                max_message_size: 1 << 20,
+                max_chunk_count: 64
+            }
+        );
+        let ack_bytes = Message::Acknowledge(ack).to_bytes(&h.limits()).unwrap();
+        assert_eq!(ack_bytes[..8], [b'A', b'C', b'K', b'F', 28, 0, 0, 0]);
+        let mut c = Decoder::new();
+        c.feed(&ack_bytes);
+        assert_eq!(c.next_message(), Some(Ok(Message::Acknowledge(ack))));
+        // The client's small send buffer caps what the server takes.
+        let small = Hello { send_buffer_size: 8192, ..h.clone() };
+        assert_eq!(small.acknowledge(&ours).receive_buffer_size, 8192);
+        // Buffers below the minimum are refused both ways.
+        let mut d = Decoder::new();
+        d.feed(&hel_bytes(1024, 65536, b""));
+        assert_eq!(d.next_message(), Some(Err(ChunkError::BufferSize(1024))));
+        assert_eq!(d.next_message().unwrap().unwrap_err().status(), StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES);
+        let low = Hello { receive_buffer_size: 100, ..h.clone() };
+        assert_eq!(Message::Hello(low).to_bytes(&Limits::default()), Err(EncodeError::BufferSize(100)));
+        let low = Acknowledge { send_buffer_size: 100, ..ack };
+        assert_eq!(Message::Acknowledge(low).to_bytes(&Limits::default()), Err(EncodeError::BufferSize(100)));
+        let mut c = Decoder::new();
+        let mut low_ack = ack_bytes.clone();
+        low_ack[12..16].copy_from_slice(&le32(10));
+        c.feed(&low_ack);
+        assert_eq!(c.next_message(), Some(Err(ChunkError::BufferSize(10))));
+        // A URL past the limit.
+        let long = Hello { endpoint_url: "a".repeat(MAX_URL_LEN + 1), ..h.clone() };
+        assert_eq!(Message::Hello(long).to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        let longest = Hello { endpoint_url: "a".repeat(MAX_URL_LEN), ..h };
+        let bytes = Message::Hello(longest.clone()).to_bytes(&Limits::default()).unwrap();
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        assert_eq!(d.next_message(), Some(Ok(Message::Hello(longest))));
+        let bad = hel_bytes(8192, 8192, &[b'a'; MAX_URL_LEN + 1]);
+        let mut d = Decoder::new();
+        d.feed(&bad);
+        assert_eq!(
+            d.next_message(),
+            Some(Err(ChunkError::Decode(MessageType::Hello, DecodeError::Length(MAX_URL_LEN as i32 + 1))))
+        );
+        // Bytes after the Hello's fields.
+        let mut trailing = hel_bytes(8192, 8192, b"x");
+        trailing.push(0);
+        trailing[4] += 1;
+        let mut d = Decoder::new();
+        d.feed(&trailing);
+        assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Hello, DecodeError::Trailing(1)))));
+    }
+
+    #[test]
+    fn error_and_reverse_hello() {
+        let e = Message::Error(ErrorMessage { error: StatusCode::BAD_TCP_ENDPOINT_URL_INVALID, reason: "no".into() });
+        let bytes = e.to_bytes(&Limits::default()).unwrap();
+        assert_eq!(bytes, [b'E', b'R', b'R', b'F', 18, 0, 0, 0, 0, 0, 0x83, 0x80, 2, 0, 0, 0, b'n', b'o']);
+        let rh = Message::ReverseHello(ReverseHello {
+            server_uri: "a".repeat(MAX_URL_LEN),
+            endpoint_url: "b".repeat(MAX_URL_LEN),
+        });
+        let rh_bytes = rh.to_bytes(&Limits::default()).unwrap();
+        assert_eq!(rh_bytes.len() as u32, MAX_HANDSHAKE_SIZE);
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        d.feed(&rh_bytes);
+        assert_eq!(all(&mut d), [Ok(e), Ok(rh)]);
+        let long = ErrorMessage { error: StatusCode::GOOD, reason: "r".repeat(MAX_REASON_LEN + 1) };
+        assert_eq!(Message::Error(long).to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        // An ERR missing its reason.
+        let mut d = Decoder::new();
+        d.feed(&[b'E', b'R', b'R', b'F', 12, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Error, DecodeError::End))));
+    }
+
+    #[test]
+    fn chunk_header_errors() {
+        let l = Limits::default();
+        assert_eq!(Chunk::parse(b"GET", &l), Err(ChunkError::MessageType(*b"GET")));
+        assert_eq!(Chunk::parse(b"HE", &l), Ok(None));
+        assert_eq!(Chunk::parse(b"HELC", &l), Err(ChunkError::ChunkType(MessageType::Hello, b'C')));
+        assert_eq!(Chunk::parse(b"OPNC", &l), Err(ChunkError::ChunkType(MessageType::Open, b'C')));
+        assert_eq!(Chunk::parse(b"CLOA", &l), Err(ChunkError::ChunkType(MessageType::Close, b'A')));
+        assert_eq!(Chunk::parse(b"MSGX", &l), Err(ChunkError::ChunkType(MessageType::Message, b'X')));
+        assert_eq!(Chunk::parse(b"MSGC\x07\0\0\0", &l), Err(ChunkError::TooSmall(7)));
+        assert_eq!(
+            Chunk::parse(b"MSGF\x01\x20\0\0", &l),
+            Err(ChunkError::TooLarge { size: 8193, limit: MIN_BUFFER_SIZE })
+        );
+        assert_eq!(
+            Chunk::parse(b"HELF\xff\xff\0\0", &l),
+            Err(ChunkError::TooLarge { size: 65535, limit: MAX_HANDSHAKE_SIZE })
+        );
+        let big = Limits { receive_buffer_size: 65536, ..l };
+        assert_eq!(Chunk::parse(b"MSGF\x01\x20\0\0", &big), Ok(None));
+        assert_eq!(
+            Chunk::parse(b"MSGF\0\0\0\x10", &Limits { receive_buffer_size: u32::MAX, ..l }),
+            Err(ChunkError::TooLarge { size: 1 << 28, limit: MAX_BUFFER_SIZE })
+        );
+        let (c, used) = Chunk::parse(b"MSGF\x08\0\0\0rest", &l).unwrap().unwrap();
+        assert_eq!((c.message_type, c.chunk_type, c.body.len(), used), (MessageType::Message, ChunkType::Final, 0, 8));
+        assert_eq!(ChunkError::MessageType(*b"GET").status(), StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID);
+        assert_eq!(ChunkError::TooLarge { size: 0, limit: 0 }.status(), StatusCode::BAD_TCP_MESSAGE_TOO_LARGE);
+    }
+
+    fn open_request() -> Service {
+        Service::OpenSecureChannelRequest(OpenSecureChannelRequest {
+            header: RequestHeader {
+                authentication_token: NodeId::default(),
+                timestamp: 133_000_000_000_000_000,
+                request_handle: 1,
+                return_diagnostics: 0,
+                audit_entry_id: None,
+                timeout_hint: 10_000,
+                additional_header: ExtensionObject::default(),
+            },
+            client_protocol_version: 0,
+            request_type: RequestType::Issue,
+            security_mode: SecurityMode::None,
+            client_nonce: Some(vec![]),
+            requested_lifetime: 3_600_000,
+        })
+    }
+
+    #[test]
+    fn open_secure_channel() {
+        let body = open_request().to_bytes().unwrap();
+        // Encoding id 446 in the four-byte form.
+        assert_eq!(body[..4], [0x01, 0x00, 0xbe, 0x01]);
+        assert_eq!(Service::parse(&body), Ok(open_request()));
+        let opn = Message::Secure(SecureMessage {
+            kind: SecureKind::Open(AsymmetricHeader::none()),
+            channel_id: 0,
+            sequence_number: 51,
+            request_id: 1,
+            body,
+        });
+        let bytes = opn.to_bytes(&Limits::default()).unwrap();
+        assert_eq!(bytes[..4], *b"OPNF");
+        assert_eq!(bytes[8..12], [0, 0, 0, 0]);
+        assert_eq!(bytes[12..16], le32(SECURITY_POLICY_NONE.len() as u32));
+        assert_eq!(bytes[16..16 + SECURITY_POLICY_NONE.len()], *SECURITY_POLICY_NONE.as_bytes());
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        assert_eq!(d.next_message(), Some(Ok(opn)));
+
+        let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
+            header: ResponseHeader {
+                request_handle: 1,
+                string_table: vec![Some("a".into()), None],
+                ..Default::default()
+            },
+            server_protocol_version: 0,
+            security_token: ChannelSecurityToken { channel_id: 9, token_id: 1, created_at: 5, revised_lifetime: 600 },
+            server_nonce: None,
+        });
+        let bytes = response.to_bytes().unwrap();
+        assert_eq!(bytes[..4], [0x01, 0x00, 0xc1, 0x01]);
+        assert_eq!(Service::parse(&bytes), Ok(response));
+
+        // Enumeration values out of range.
+        let mut bad = open_request().to_bytes().unwrap();
+        let at = bad.len() - 4 - 4 - 4 - 4;
+        bad[at..at + 4].copy_from_slice(&le32(2));
+        assert_eq!(Service::parse(&bad), Err(DecodeError::Enum(2)));
+        let mut bad = open_request().to_bytes().unwrap();
+        let at = bad.len() - 4 - 4 - 4;
+        bad[at..at + 4].copy_from_slice(&le32(4));
+        assert_eq!(Service::parse(&bad), Err(DecodeError::Enum(4)));
+        let mut trailing = open_request().to_bytes().unwrap();
+        trailing.push(0);
+        assert_eq!(Service::parse(&trailing), Err(DecodeError::Trailing(1)));
+    }
+
+    #[test]
+    fn other_services() {
+        for s in [
+            Service::CloseSecureChannelRequest(RequestHeader::default()),
+            Service::CloseSecureChannelResponse(ResponseHeader::default()),
+            Service::ServiceFault(ResponseHeader {
+                service_result: StatusCode::BAD_SERVICE_UNSUPPORTED,
+                ..Default::default()
+            }),
+            Service::Other { type_id: NodeId::numeric(0, 631), body: vec![1, 2, 3] },
+        ] {
+            assert_eq!(Service::parse(&s.to_bytes().unwrap()), Ok(s));
+        }
+        let fake = Service::Other { type_id: NodeId::numeric(0, 446), body: vec![] };
+        assert_eq!(fake.to_bytes(), Err(EncodeError::KnownTypeId));
+        assert_eq!(Service::parse(&[]), Err(DecodeError::End));
+    }
+
+    #[test]
+    fn close_secure_channel() {
+        let clo = Message::Secure(SecureMessage {
+            kind: SecureKind::Close { token_id: 1 },
+            channel_id: 9,
+            sequence_number: 60,
+            request_id: 8,
+            body: Service::CloseSecureChannelRequest(RequestHeader::default()).to_bytes().unwrap(),
+        });
+        let bytes = clo.to_bytes(&Limits::default()).unwrap();
+        assert_eq!(bytes[..4], *b"CLOF");
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        assert_eq!(d.next_message(), Some(Ok(clo)));
+        // A CLO too large for one chunk.
+        let big = Message::Secure(SecureMessage {
+            kind: SecureKind::Close { token_id: 1 },
+            channel_id: 9,
+            sequence_number: 0,
+            request_id: 0,
+            body: vec![0; MIN_BUFFER_SIZE as usize],
+        });
+        assert_eq!(big.to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        let opn = Message::Secure(SecureMessage {
+            kind: SecureKind::Open(AsymmetricHeader { policy_uri: "p".repeat(256), ..AsymmetricHeader::none() }),
+            channel_id: 0,
+            sequence_number: 0,
+            request_id: 0,
+            body: vec![],
+        });
+        assert_eq!(opn.to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+    }
+
+    #[test]
+    fn messages_are_chunked_and_put_back_together() {
+        let body: Vec<u8> = (0..30_000u32).map(|i| i as u8).collect();
+        let m = msg(1, u32::MAX - 1, 5, body);
+        let chunks = match &m {
+            Message::Secure(s) => s.to_chunks(&Limits::default()).unwrap(),
+            _ => unreachable!(),
+        };
+        assert_eq!(chunks.len(), 4);
+        assert!(chunks.iter().all(|c| c.len() <= MIN_BUFFER_SIZE as usize));
+        assert_eq!(chunks[0][3], b'C');
+        assert_eq!(chunks[3][3], b'F');
+        // The sequence numbers wrap past u32::MAX.
+        assert_eq!(chunks[2][16..20], le32(0));
+        let mut d = Decoder::new();
+        for c in &chunks {
+            for b in c {
+                d.feed(std::slice::from_ref(b));
+                if let Some(r) = d.next_message() {
+                    assert_eq!(r, Ok(m.clone()));
+                }
+            }
+        }
+        assert_eq!(d.buffered(), 0);
+        // An empty MSG is one chunk.
+        let e = msg(1, 1, 1, vec![]);
+        assert_eq!(e.to_bytes(&Limits::default()).unwrap().len(), 24);
+        // A legacy wrap below 1024 is accepted.
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP + 3, 5, b"ab"));
+        d.feed(&msg_chunk(b'F', 7, 1, 2, 5, b"cd"));
+        assert_eq!(d.next_message(), Some(Ok(msg(1, LEGACY_WRAP + 3, 5, b"abcd".to_vec()))));
+    }
+
+    #[test]
+    fn aborts() {
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'C', 7, 1, 10, 5, b"part"));
+        let mut tail = le32(StatusCode::BAD_RESPONSE_TOO_LARGE.0).to_vec();
+        tail.extend_from_slice(&[1, 0, 0, 0, b'x']);
+        d.feed(&msg_chunk(b'A', 7, 1, 11, 5, &tail));
+        let abort = Abort {
+            channel_id: 7,
+            token_id: 1,
+            sequence_number: 11,
+            request_id: 5,
+            error: StatusCode::BAD_RESPONSE_TOO_LARGE,
+            reason: "x".into(),
+        };
+        assert_eq!(d.next_message(), Some(Ok(Message::Abort(abort.clone()))));
+        // The next message starts afresh.
+        d.feed(&msg_chunk(b'F', 7, 1, 12, 6, b"z"));
+        assert_eq!(d.next_message(), Some(Ok(msg(1, 12, 6, b"z".to_vec()))));
+        let bytes = Message::Abort(abort.clone()).to_bytes(&Limits::default()).unwrap();
+        let mut d = Decoder::new();
+        d.feed(&bytes);
+        assert_eq!(d.next_message(), Some(Ok(Message::Abort(abort))));
+        // An abort with no status.
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'A', 7, 1, 1, 1, &[]));
+        assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Message, DecodeError::End))));
+    }
+
+    #[test]
+    fn stream_errors() {
+        let cases: Vec<(Vec<Vec<u8>>, Limits, ChunkError)> = vec![
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 1, 2, 6, b"")],
+                Limits::default(),
+                ChunkError::Interleaved,
+            ),
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), hel_bytes(8192, 8192, b"")],
+                Limits::default(),
+                ChunkError::Interleaved,
+            ),
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 8, 1, 2, 5, b"")],
+                Limits::default(),
+                ChunkError::Mismatch,
+            ),
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 2, 2, 5, b"")],
+                Limits::default(),
+                ChunkError::Mismatch,
+            ),
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 1, 3, 5, b"")],
+                Limits::default(),
+                ChunkError::Sequence { expected: 2, got: 3 },
+            ),
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 1, 2, 5, b"")],
+                Limits { max_chunk_count: 1, ..Limits::default() },
+                ChunkError::TooManyChunks(1),
+            ),
+            (
+                vec![msg_chunk(b'C', 7, 1, 1, 5, b"abc"), msg_chunk(b'F', 7, 1, 2, 5, b"abc")],
+                Limits { max_message_size: 5, ..Limits::default() },
+                ChunkError::MessageTooLarge(5),
+            ),
+            (
+                vec![b"MSGF\x0c\0\0\0\0\0\0\0".to_vec()],
+                Limits::default(),
+                ChunkError::Decode(MessageType::Message, DecodeError::End),
+            ),
+        ];
+        for (chunks, limits, want) in cases {
+            let mut d = Decoder::with_limits(limits);
+            for c in &chunks {
+                d.feed(c);
+            }
+            let got = all(&mut d);
+            assert_eq!(got.last(), Some(&Err(want.clone())), "{want}");
+            // It stays broken, and drops what comes next.
+            d.feed(&hel_bytes(8192, 8192, b""));
+            assert_eq!(d.next_message(), Some(Err(want)));
+            assert_eq!(d.buffered(), 0);
+        }
+        // An OPN body past the message limit.
+        let opn = Message::Secure(SecureMessage {
+            kind: SecureKind::Open(AsymmetricHeader::none()),
+            channel_id: 0,
+            sequence_number: 0,
+            request_id: 0,
+            body: vec![0; 10],
+        });
+        let small = Limits { max_message_size: 5, ..Limits::default() };
+        assert_eq!(opn.to_bytes(&small), Err(EncodeError::TooLong));
+        let mut d = Decoder::with_limits(small);
+        d.feed(&opn.to_bytes(&Limits::default()).unwrap());
+        assert_eq!(d.next_message(), Some(Err(ChunkError::MessageTooLarge(5))));
+    }
+
+    #[test]
+    fn writers_respect_limits() {
+        let peer = Limits { receive_buffer_size: 8192, max_message_size: 20_000, max_chunk_count: 2 };
+        assert_eq!(msg(1, 0, 0, vec![0; 20_001]).to_bytes(&peer), Err(EncodeError::TooLong));
+        // 20000 bytes need 3 chunks of 8192.
+        assert_eq!(msg(1, 0, 0, vec![0; 20_000]).to_bytes(&peer), Err(EncodeError::TooLong));
+        let ok = msg(1, 0, 0, vec![0; 16_000]);
+        let bytes = ok.to_bytes(&peer).unwrap();
+        let mut d = Decoder::with_limits(peer);
+        d.feed(&bytes);
+        assert_eq!(d.next_message(), Some(Ok(ok)));
+        // The module's caps apply over what a peer says.
+        let huge = Limits { receive_buffer_size: u32::MAX, max_message_size: u32::MAX, max_chunk_count: u32::MAX };
+        assert_eq!(huge.chunk_limit(), MAX_BUFFER_SIZE);
+        assert_eq!(huge.message_limit(), MAX_MESSAGE_SIZE);
+        assert_eq!(huge.chunk_count_limit(), MAX_CHUNK_COUNT);
+        let tiny = Limits { receive_buffer_size: 1, max_message_size: 0, max_chunk_count: 0 };
+        assert_eq!(tiny.chunk_limit(), MIN_BUFFER_SIZE);
+        let mut w = Writer::new();
+        assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(EncodeError::TooLong));
+        assert_eq!(w.string_max(Some("abc"), 2), Err(EncodeError::TooLong));
+        assert!(w.is_empty());
+    }
+
+    #[test]
+    fn acknowledge_names_the_limits_the_decoder_enforces() {
+        // A server with no message or chunk limit of its own still has the
+        // module's caps, and must not tell the client there is no limit.
+        let hello = Hello {
+            protocol_version: 0,
+            receive_buffer_size: 65536,
+            send_buffer_size: 65536,
+            max_message_size: 0,
+            max_chunk_count: 0,
+            endpoint_url: String::new(),
+        };
+        let ack = hello.acknowledge(&Limits::default());
+        assert_eq!(ack.max_message_size, MAX_MESSAGE_SIZE);
+        assert_eq!(ack.max_chunk_count, MAX_CHUNK_COUNT);
+        let ours = Limits { receive_buffer_size: 8192, max_message_size: 100, max_chunk_count: 2 };
+        let ack = hello.acknowledge(&ours);
+        assert_eq!((ack.max_message_size, ack.max_chunk_count), (100, 2));
+        let d = Decoder::with_limits(ack.limits());
+        assert_eq!(d.limits().message_limit(), ack.max_message_size);
+    }
+
+    #[test]
+    fn legacy_wrap_only_above_the_threshold() {
+        // Part 6: a legacy sequence number shall not wrap until it is
+        // greater than 4 294 966 271.
+        assert_eq!(LEGACY_WRAP, 4_294_966_271);
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP, 5, b"ab"));
+        d.feed(&msg_chunk(b'F', 7, 1, 2, 5, b"cd"));
+        assert_eq!(d.next_message(), Some(Err(ChunkError::Sequence { expected: LEGACY_WRAP + 1, got: 2 })));
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab"));
+        d.feed(&msg_chunk(b'F', 7, 1, 1023, 5, b"cd"));
+        assert_eq!(d.next_message(), Some(Ok(msg(1, LEGACY_WRAP + 1, 5, b"abcd".to_vec()))));
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab"));
+        d.feed(&msg_chunk(b'F', 7, 1, 1024, 5, b"cd"));
+        assert!(matches!(d.next_message(), Some(Err(ChunkError::Sequence { .. }))));
+    }
+
+    #[test]
+    fn long_reasons_are_dropped_not_fatal() {
+        // Part 6: a reason longer than 4096 bytes is ignored.
+        let long = vec![0xffu8; MAX_REASON_LEN + 1];
+        let mut err = b"ERRF".to_vec();
+        err.extend_from_slice(&le32(16 + long.len() as u32));
+        err.extend_from_slice(&le32(StatusCode::BAD_TCP_INTERNAL_ERROR.0));
+        err.extend_from_slice(&le32(long.len() as u32));
+        err.extend_from_slice(&long);
+        let mut d = Decoder::new();
+        d.feed(&err);
+        let want = ErrorMessage { error: StatusCode::BAD_TCP_INTERNAL_ERROR, reason: String::new() };
+        assert_eq!(d.next_message(), Some(Ok(Message::Error(want))));
+        let mut tail = le32(StatusCode::BAD_RESPONSE_TOO_LARGE.0).to_vec();
+        tail.extend_from_slice(&le32(long.len() as u32));
+        tail.extend_from_slice(&long);
+        let mut d = Decoder::new();
+        d.feed(&msg_chunk(b'A', 7, 1, 1, 5, &tail));
+        let Some(Ok(Message::Abort(a))) = d.next_message() else { panic!() };
+        assert_eq!(a.reason, "");
+        // A reason of the longest length is kept.
+        let ok = ErrorMessage { error: StatusCode::GOOD, reason: "r".repeat(MAX_REASON_LEN) };
+        let mut d = Decoder::new();
+        d.feed(&Message::Error(ok.clone()).to_bytes(&Limits::default()).unwrap());
+        assert_eq!(d.next_message(), Some(Ok(Message::Error(ok))));
+    }
+
+    #[test]
+    fn urls_are_less_than_4096_bytes() {
+        // Part 6: the endpoint URL shall be less than 4096 bytes, and a
+        // server answers a longer one with Bad_TcpEndpointUrlInvalid.
+        assert_eq!(MAX_URL_LEN, 4095);
+        let mut d = Decoder::new();
+        d.feed(&hel_bytes(8192, 8192, &[b'a'; 4096]));
+        let e = d.next_message().unwrap().unwrap_err();
+        assert_eq!(e, ChunkError::Decode(MessageType::Hello, DecodeError::Length(4096)));
+        assert_eq!(e.status(), StatusCode::BAD_TCP_ENDPOINT_URL_INVALID);
+        let rh = ReverseHello { server_uri: "a".repeat(4096), endpoint_url: String::new() };
+        assert_eq!(Message::ReverseHello(rh).to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+    }
+
+    #[test]
+    fn array_dimensions_need_two_or_more() {
+        // Part 6: ArrayDimensions are only present for 2 or more dimensions.
+        let one =
+            Variant::Array { type_id: 3, values: vec![Value::Byte(1), Value::Byte(2)], dimensions: Some(vec![2]) };
+        assert_eq!(encode(&one), Err(EncodeError::Dimensions));
+        let bytes = [0xc3u8, 2, 0, 0, 0, 1, 2, 1, 0, 0, 0, 2, 0, 0, 0];
+        assert_eq!(decode::<Variant>(&bytes), Err(DecodeError::Dimensions));
+    }
+
+    #[test]
+    fn total_values_are_bounded() {
+        // Arrays of 65536 Bytes, inside an array of Variants: each array
+        // is within MAX_ARRAY_LEN, but together they pass MAX_VALUES. The
+        // outer array's elements and each inner Variant count too.
+        let inner = Variant::Array { type_id: 3, values: vec![Value::Byte(0); MAX_ARRAY_LEN], dimensions: None };
+        let outer = |n: usize| Variant::Array {
+            type_id: type_id::VARIANT,
+            values: vec![Value::Variant(Box::new(inner.clone())); n],
+            dimensions: None,
+        };
+        let n = MAX_VALUES / MAX_ARRAY_LEN;
+        let fits = encode(&outer(n - 1)).unwrap();
+        assert!(decode::<Variant>(&fits).is_ok());
+        assert_eq!(encode(&outer(n)), Err(EncodeError::TooManyValues));
+        let mut bytes = vec![0x98];
+        bytes.extend_from_slice(&le32(n as u32));
+        for _ in 0..n {
+            bytes.push(0x83);
+            bytes.extend_from_slice(&le32(MAX_ARRAY_LEN as u32));
+            bytes.extend_from_slice(&vec![0; MAX_ARRAY_LEN]);
+        }
+        assert_eq!(decode::<Variant>(&bytes), Err(DecodeError::TooManyValues));
+    }
+
+    #[test]
+    fn nested_values_count_toward_the_bound() {
+        // A DiagnosticInfo nests one level per byte, and each level is a
+        // 72-byte box. An array of them, each 15 deep, once made a reader
+        // allocate far more than MAX_VALUES values from a short message.
+        let per = MAX_DEPTH - 1;
+        let n = MAX_VALUES / per + 1;
+        let mut bytes = vec![0x80 | type_id::DIAGNOSTIC_INFO];
+        bytes.extend_from_slice(&le32(n as u32));
+        for _ in 0..n {
+            bytes.extend_from_slice(&[0x40; MAX_DEPTH - 2]);
+            bytes.push(0);
+        }
+        assert_eq!(decode::<Variant>(&bytes), Err(DecodeError::TooManyValues));
+        // The writer stops at the same count as the reader.
+        let mut deep = DiagnosticInfo::default();
+        for _ in 1..per {
+            deep = DiagnosticInfo { inner_diagnostic_info: Some(Box::new(deep)), ..Default::default() };
+        }
+        let fill = |k: usize| Variant::Array {
+            type_id: type_id::DIAGNOSTIC_INFO,
+            values: vec![Value::DiagnosticInfo(Box::new(deep.clone())); k],
+            dimensions: None,
+        };
+        // The outer Variant is one value, and each element is 1 + per.
+        let most = (MAX_VALUES - 1) / (1 + per);
+        let ok = encode(&fill(most)).unwrap();
+        assert!(decode::<Variant>(&ok).is_ok());
+        assert_eq!(encode(&fill(most + 1)), Err(EncodeError::TooManyValues));
+        // A DataValue chain counts each level too.
+        let mut r = Reader::new(&[23, 0x01, 23, 0x01, 0]);
+        assert!(r.read::<Variant>().is_ok());
+        assert_eq!(r.values, 5);
+    }
+
+    #[test]
+    fn helpers_for_world_authors() {
+        for t in [ChunkType::Final, ChunkType::Intermediate, ChunkType::Abort] {
+            assert_eq!(ChunkType::from_byte(t.byte()), Some(t));
+        }
+        assert_eq!(ChunkType::from_byte(b'X'), None);
+        let e: ExpandedNodeId = NodeId::numeric(0, 85).into();
+        assert_eq!(encode(&e).unwrap(), [0, 85]);
+        assert_eq!(Variant::from(Value::Int32(-2)), Variant::Scalar(Value::Int32(-2)));
+        assert_eq!(DecodeError::TooManyValues.to_string(), format!("more than {MAX_VALUES} values"));
+        assert_eq!(EncodeError::TooManyValues.to_string(), format!("more than {MAX_VALUES} values"));
+    }
+
+    /// Byte streams that each hold one whole message.
+    fn samples() -> Vec<Vec<u8>> {
+        let mut out = vec![
+            hel_bytes(65536, 65536, b"opc.tcp://a"),
+            Message::Error(ErrorMessage { error: StatusCode::BAD_DECODING_ERROR, reason: "r".into() })
+                .to_bytes(&Limits::default())
+                .unwrap(),
+            Message::ReverseHello(ReverseHello { server_uri: "u".into(), endpoint_url: "e".into() })
+                .to_bytes(&Limits::default())
+                .unwrap(),
+            Message::Secure(SecureMessage {
+                kind: SecureKind::Open(AsymmetricHeader::none()),
+                channel_id: 0,
+                sequence_number: 1,
+                request_id: 1,
+                body: open_request().to_bytes().unwrap(),
+            })
+            .to_bytes(&Limits::default())
+            .unwrap(),
+            msg(1, 2, 3, vec![1; 9000]).to_bytes(&Limits::default()).unwrap(),
+        ];
+        let mut ack = b"ACKF".to_vec();
+        ack.extend_from_slice(&le32(28));
+        for v in [0, 8192, 8192, 0, 0] {
+            ack.extend_from_slice(&le32(v));
+        }
+        out.push(ack);
+        let mut abort = le32(1).to_vec();
+        abort.extend_from_slice(&[0xff; 4]);
+        out.push(msg_chunk(b'A', 1, 2, 3, 4, &abort));
+        // A MSG holding a Variant, so mutations reach the value readers.
+        let mut body = encode(&NodeId::numeric(1, 999)).unwrap();
+        body.extend_from_slice(&encode(&every_variant()).unwrap());
+        out.push(msg(1, 1, 1, body).to_bytes(&Limits::default()).unwrap());
+        out
+    }
+
+    fn sample_values() -> Vec<Value> {
+        vec![
+            Value::Boolean(true),
+            Value::SByte(-1),
+            Value::Byte(2),
+            Value::Int16(-3),
+            Value::UInt16(4),
+            Value::Int32(-5),
+            Value::UInt32(6),
+            Value::Int64(-7),
+            Value::UInt64(8),
+            Value::Float(9.5),
+            Value::Double(-10.25),
+            Value::String(Some("s".into())),
+            Value::String(None),
+            Value::DateTime(11),
+            Value::Guid(Guid { data1: 1, data2: 2, data3: 3, data4: [4; 8] }),
+            Value::ByteString(Some(vec![1, 2])),
+            Value::XmlElement(Some(b"<x/>".to_vec())),
+            Value::NodeId(NodeId::string(3, "n")),
+            Value::ExpandedNodeId(ExpandedNodeId { server_index: 1, ..Default::default() }),
+            Value::StatusCode(StatusCode::BAD_UNEXPECTED_ERROR),
+            Value::QualifiedName(QualifiedName { namespace: 1, name: "q".into() }),
+            Value::LocalizedText(LocalizedText { locale: None, text: Some("t".into()) }),
+            Value::ExtensionObject(Box::new(ExtensionObject {
+                type_id: NodeId::numeric(0, 1),
+                body: ExtensionBody::Binary(vec![0]),
+            })),
+            Value::DataValue(Box::new(DataValue { status: Some(StatusCode(1)), ..Default::default() })),
+            Value::DiagnosticInfo(Box::new(DiagnosticInfo { symbolic_id: Some(1), ..Default::default() })),
+            Value::Reserved { type_id: 30, bytes: None },
+        ]
+    }
+
+    fn every_variant() -> Variant {
+        Variant::Array {
+            type_id: type_id::VARIANT,
+            values: sample_values().into_iter().map(|v| Value::Variant(Box::new(Variant::Scalar(v)))).collect(),
+            dimensions: Some(vec![2, 13]),
+        }
+    }
+
+    #[test]
+    fn every_truncated_prefix_waits_or_fails() {
+        // As a stream, a prefix of a message is only waiting, fed whole or
+        // a byte at a time.
+        for s in samples() {
+            let mut d = Decoder::new();
+            for n in 0..s.len() {
+                let mut whole = Decoder::new();
+                whole.feed(&s[..n]);
+                assert_eq!(whole.next_message(), None, "{n} of {}", s.len());
+                d.feed(&s[n..n + 1]);
+                if n + 1 < s.len() {
+                    assert_eq!(d.next_message(), None, "{n} of {}", s.len());
+                }
+            }
+            assert!(matches!(d.next_message(), Some(Ok(_))));
+        }
+        // As values, prefixes end too soon.
+        let req = open_request().to_bytes().unwrap();
+        for n in 0..req.len() {
+            assert_eq!(Service::parse(&req[..n]), Err(DecodeError::End), "{n}");
+        }
+        let full = DataValue {
+            value: Some(Variant::Scalar(Value::Int32(1))),
+            status: Some(StatusCode(2)),
+            source_timestamp: Some(3),
+            source_picoseconds: Some(4),
+            server_timestamp: Some(5),
+            server_picoseconds: Some(6),
+        };
+        let dv = encode(&full).unwrap();
+        for n in 0..dv.len() {
+            assert_eq!(decode::<DataValue>(&dv[..n]), Err(DecodeError::End), "{n}");
+        }
+        // A string's length can outrun a prefix before its bytes do.
+        let v = encode(&every_variant()).unwrap();
+        for n in 0..v.len() {
+            assert!(matches!(decode::<Variant>(&v[..n]), Err(DecodeError::End | DecodeError::Length(_))), "{n}");
+        }
+        let d = encode(&DiagnosticInfo { additional_info: Some("abc".into()), ..Default::default() }).unwrap();
+        for n in 0..d.len() {
+            assert!(decode::<DiagnosticInfo>(&d[..n]).is_err());
+        }
+    }
+
+    #[test]
+    fn decoder_takes_many_small_messages_in_linear_time() {
+        let one = msg(1, 1, 1, vec![1, 2, 3]).to_bytes(&Limits::default()).unwrap();
+        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
+        let started = std::time::Instant::now();
+        let mut d = Decoder::new();
+        d.feed(&stream);
+        let mut n = 0;
+        while let Some(m) = d.next_message() {
+            m.unwrap();
+            n += 1;
+        }
+        assert_eq!(n, 100_000);
+        assert_eq!(d.buffered(), 0);
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn module_example() {
+        let mut server = Decoder::new();
+        let url = b"opc.tcp://plc:4840";
+        server.feed(&hel_bytes(65536, 65536, url));
+        let Some(Ok(Message::Hello(hello))) = server.next_message() else { panic!() };
+        let ack = hello.acknowledge(&Limits::default());
+        assert_eq!(ack.receive_buffer_size, 8192);
+        server.set_limits(ack.limits());
+        assert_eq!(server.limits(), ack.limits());
+        let reply = Message::Acknowledge(ack).to_bytes(&hello.limits()).unwrap();
+        assert_eq!(&reply[..4], b"ACKF");
+        assert_eq!(reply.len(), 28);
+        let request = Service::OpenSecureChannelRequest(OpenSecureChannelRequest {
+            header: RequestHeader { request_handle: 1, ..RequestHeader::default() },
+            client_protocol_version: 0,
+            request_type: RequestType::Issue,
+            security_mode: SecurityMode::None,
+            client_nonce: None,
+            requested_lifetime: 600_000,
+        });
+        let opn = Message::Secure(SecureMessage {
+            kind: SecureKind::Open(AsymmetricHeader::none()),
+            channel_id: 0,
+            sequence_number: 1,
+            request_id: 1,
+            body: request.to_bytes().unwrap(),
+        });
+        server.feed(&opn.to_bytes(&ack.limits()).unwrap());
+        let Some(Ok(Message::Secure(msg))) = server.next_message() else { panic!() };
+        let SecureKind::Open(security) = &msg.kind else { panic!() };
+        assert_eq!(security.policy_uri, SECURITY_POLICY_NONE);
+        let Ok(Service::OpenSecureChannelRequest(req)) = Service::parse(&msg.body) else { panic!() };
+        let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
+            header: ResponseHeader { request_handle: req.header.request_handle, ..ResponseHeader::default() },
+            server_protocol_version: 0,
+            security_token: ChannelSecurityToken {
+                channel_id: 7,
+                token_id: 1,
+                created_at: 0,
+                revised_lifetime: req.requested_lifetime,
+            },
+            server_nonce: None,
+        });
+        let answer = Message::Secure(SecureMessage {
+            kind: msg.kind.clone(),
+            channel_id: 7,
+            sequence_number: 1,
+            request_id: msg.request_id,
+            body: response.to_bytes().unwrap(),
+        });
+        let bytes = answer.to_bytes(&hello.limits()).unwrap();
+        assert_eq!(&bytes[..4], b"OPNF");
+        assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
+    }
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: u32) -> u32 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// Reads a value, and if it reads and writes, checks that the bytes
+    /// written read back and write the same.
+    fn round_trip<T: Binary>(b: &[u8]) {
+        if let Ok(v) = decode::<T>(b)
+            && let Ok(out) = encode(&v) {
+                let back: T = decode(&out).expect("written bytes read back");
+                assert_eq!(encode(&back).unwrap(), out);
+            }
+    }
+
+    #[test]
+    fn fuzz_loop() {
+        let mut rng = Lcg(0x5e_ed0f_0bca);
+        let seeds = samples();
+        let small = Limits { receive_buffer_size: 8192, max_message_size: 1 << 16, max_chunk_count: 8 };
+        for round in 0..4000 {
+            // Half random bytes, half a valid sample with a few bytes changed.
+            let mut b: Vec<u8> = if round % 2 == 0 {
+                let n = rng.below(300) as usize;
+                let mut v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+                // Start some with a real header so the parsers go deeper.
+                if n >= 8 && rng.below(2) == 0 {
+                    let types: [&[u8; 4]; 7] = [b"HELF", b"ACKF", b"ERRF", b"RHEF", b"OPNF", b"CLOF", b"MSGC"];
+                    v[..4].copy_from_slice(types[rng.below(7) as usize]);
+                    v[4..8].copy_from_slice(&le32(rng.below(n as u32 + 1)));
+                }
+                v
+            } else {
+                let mut v = seeds[rng.below(seeds.len() as u32) as usize].clone();
+                for _ in 0..1 + rng.below(4) {
+                    let i = rng.below(v.len() as u32) as usize;
+                    v[i] = rng.next() as u8;
+                }
+                if rng.below(4) == 0 {
+                    v.truncate(rng.below(v.len() as u32) as usize);
+                }
+                v
+            };
+            if round % 7 == 0 {
+                b.extend_from_slice(&seeds[0]);
+            }
+
+            // The stream, all at once and a byte at a time.
+            let limits = if round % 3 == 0 { small } else { Limits::default() };
+            let mut whole = Decoder::with_limits(limits);
+            whole.feed(&b);
+            let first = all(&mut whole);
+            let mut bytewise = Decoder::with_limits(limits);
+            let mut second = Vec::new();
+            for byte in &b {
+                bytewise.feed(std::slice::from_ref(byte));
+                while let Some(m) = bytewise.next_message() {
+                    let stop = m.is_err();
+                    second.push(m);
+                    if stop {
+                        break;
+                    }
+                }
+                if second.last().is_some_and(|m| m.is_err()) {
+                    break;
+                }
+            }
+            assert_eq!(first, second);
+            for m in first.iter().flatten() {
+                // A message read writes, and reads back the same.
+                let out = m.to_bytes(&limits).expect("a message read can be written");
+                let mut d = Decoder::with_limits(limits);
+                d.feed(&out);
+                assert_eq!(d.next_message().as_ref(), Some(&Ok(m.clone())));
+                if let Message::Secure(s) = m
+                    && let Ok(service) = Service::parse(&s.body) {
+                        let body = service.to_bytes().expect("a service read can be written");
+                        assert_eq!(Service::parse(&body), Ok(service.clone()));
+                        if let Service::Other { body, .. } = service {
+                            round_trip::<Variant>(&body);
+                        }
+                    }
+            }
+
+            // The same bytes as values.
+            round_trip::<Variant>(&b);
+            round_trip::<DataValue>(&b);
+            round_trip::<DiagnosticInfo>(&b);
+            round_trip::<ExpandedNodeId>(&b);
+            round_trip::<NodeId>(&b);
+            round_trip::<LocalizedText>(&b);
+            round_trip::<ExtensionObject>(&b);
+            round_trip::<ResponseHeader>(&b);
+            if let Ok(s) = Service::parse(&b)
+                && let Ok(out) = s.to_bytes() {
+                    assert_eq!(Service::parse(&out), Ok(s));
+                }
+            // Every value at every offset, one byte at a time through a reader.
+            let mut r = Reader::new(&b);
+            while r.remaining() > 0 {
+                let before = r.remaining();
+                if r.read::<Variant>().is_err() {
+                    let _ = r.take(1);
+                }
+                assert!(r.remaining() < before);
+            }
+        }
+    }
+}

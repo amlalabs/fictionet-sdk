@@ -1,0 +1,2435 @@
+//! BACnet/IP: reading and writing BVLC messages, NPDUs, APDUs and
+//! application-tagged values, with no I/O.
+//!
+//! BACnet is how building automation talks: thermostats, air handlers,
+//! chillers, lighting panels and door controllers report their readings and
+//! take commands over it. BACnet/IP carries each message in one UDP
+//! datagram, usually on port 47808 (0xBAC0). This module follows ASHRAE
+//! Standard 135, Clause 6 (the network layer), Clause 20 (encoding) and
+//! Annex J (BACnet/IP).
+//!
+//! A datagram has three layers, and each has a type here:
+//!
+//! - [`Bvlc`]: the BACnet Virtual Link Control header. It says whether the
+//!   datagram is a unicast, a broadcast, a broadcast forwarded by a BBMD, or
+//!   one of the BBMD's own table messages.
+//! - [`Npdu`]: the network layer. It holds the priority, whether a reply
+//!   is expected, and the source and destination networks when a router
+//!   carries the message between BACnet networks.
+//! - [`Apdu`]: the application layer. It is a request, an
+//!   acknowledgment, an error, a reject or an abort. Each carries a service
+//!   choice and that service's body.
+//!
+//! Service bodies are built from tagged values. [`Value`] reads and writes
+//! the application-tagged primitives, and [`Tag`] reads any tag header,
+//! including context tags and the opening and closing tags of constructed
+//! data. The Who-Is and I-Am services, which a client uses to find devices,
+//! are read and written in full by [`WhoIs`] and [`IAm`]. Every other
+//! service body is kept as raw bytes for world code to read with [`Tag`]
+//! and [`Value`].
+//!
+//! Nothing here reads a socket. A world that plays a BACnet device reads
+//! each datagram from its UDP socket, passes it to [`Bvlc::parse`], reads
+//! the NPDU and APDU inside, and sends back the bytes of its answer. Which
+//! objects and properties the device has, and what they hold, is up to
+//! world code. BACnet/IP runs over UDP, one message per datagram, so there
+//! is no stream decoder.
+//!
+//! Every reader checks lengths, because the agent can send any bytes it
+//! likes. Writers never write what the readers refuse; where a value does
+//! not fit, its doc comment says how it is cut.
+//!
+//! ```
+//! use fictionet::stdlib::bacnet::{Apdu, Bvlc, IAm, Npdu, ObjectId, Segmentation, WhoIs, unconfirmed};
+//!
+//! // A Who-Is with no range, broadcast by a workstation to port 47808.
+//! let datagram = [0x81, 0x0b, 0x00, 0x08, 0x01, 0x00, 0x10, 0x08];
+//! let bvlc = Bvlc::parse(&datagram).unwrap();
+//! let npdu = Npdu::parse(bvlc.npdu().unwrap()).unwrap();
+//! let apdu = Apdu::parse(npdu.apdu().unwrap()).unwrap();
+//! let Apdu::UnconfirmedRequest { service, data } = &apdu else { panic!("not unconfirmed") };
+//! assert_eq!(*service, unconfirmed::WHO_IS);
+//! let who_is = WhoIs::parse(data).unwrap();
+//!
+//! // Device 1234 answers, since a Who-Is with no range asks every device.
+//! assert!(who_is.matches(1234));
+//! let i_am = IAm {
+//!     device: ObjectId::device(1234),
+//!     max_apdu: 1476,
+//!     segmentation: Segmentation::NoSegmentation,
+//!     vendor: 260,
+//! };
+//! let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().to_bytes()).to_bytes());
+//! assert_eq!(
+//!     reply.to_bytes(),
+//!     [
+//!         0x81, 0x0b, 0x00, 0x15, // BVLC: broadcast, 21 bytes in all
+//!         0x01, 0x00, // NPDU: version 1, no addresses, normal priority
+//!         0x10, 0x00, // APDU: unconfirmed request, I-Am
+//!         0xc4, 0x02, 0x00, 0x04, 0xd2, // device 1234
+//!         0x22, 0x05, 0xc4, // max APDU 1476
+//!         0x91, 0x03, // no segmentation
+//!         0x22, 0x01, 0x04, // vendor 260
+//!     ]
+//! );
+//! ```
+
+use std::net::{Ipv4Addr, SocketAddrV4};
+
+/// The UDP port BACnet/IP devices listen on, 0xBAC0.
+pub const PORT: u16 = 47808;
+/// The first byte of every BVLC header: BACnet/IP (Annex J).
+pub const BVLC_TYPE: u8 = 0x81;
+/// The length of the BVLC header: type, function and a 2-byte length.
+pub const BVLC_HEADER_LEN: usize = 4;
+/// The longest datagram read or written here: the most a UDP datagram over
+/// IPv4 can carry. The BVLC length field could say more, but no datagram
+/// can hold it, so a longer length is refused and writers cut what they
+/// carry to fit.
+pub const MAX_MESSAGE: usize = 65_507;
+/// The NPDU protocol version: always 1.
+pub const NPDU_VERSION: u8 = 1;
+/// The longest station address an NPDU can carry. Its length is one byte.
+pub const MAX_MAC_LEN: usize = 255;
+/// The longest APDU a BACnet/IP device can accept (max-APDU code 5).
+pub const MAX_APDU: usize = 1476;
+/// The longest contents of one tagged value read or written here. Longer
+/// values are refused by [`Value::parse`] and cut by [`Value::write`].
+pub const MAX_VALUE_LEN: usize = MAX_MESSAGE;
+/// The highest object instance number: 22 bits. The value 4194303 also
+/// means "no instance" in some properties.
+pub const MAX_INSTANCE: u32 = 0x3f_ffff;
+/// The highest object type number: 10 bits.
+pub const MAX_OBJECT_TYPE: u16 = 0x3ff;
+
+/// BVLC function codes (Annex J.2).
+pub mod function {
+    #![allow(missing_docs)]
+    pub const RESULT: u8 = 0x00;
+    pub const WRITE_BROADCAST_DISTRIBUTION_TABLE: u8 = 0x01;
+    pub const READ_BROADCAST_DISTRIBUTION_TABLE: u8 = 0x02;
+    pub const READ_BROADCAST_DISTRIBUTION_TABLE_ACK: u8 = 0x03;
+    pub const FORWARDED_NPDU: u8 = 0x04;
+    pub const REGISTER_FOREIGN_DEVICE: u8 = 0x05;
+    pub const READ_FOREIGN_DEVICE_TABLE: u8 = 0x06;
+    pub const READ_FOREIGN_DEVICE_TABLE_ACK: u8 = 0x07;
+    pub const DELETE_FOREIGN_DEVICE_TABLE_ENTRY: u8 = 0x08;
+    pub const DISTRIBUTE_BROADCAST_TO_NETWORK: u8 = 0x09;
+    pub const ORIGINAL_UNICAST_NPDU: u8 = 0x0a;
+    pub const ORIGINAL_BROADCAST_NPDU: u8 = 0x0b;
+    pub const SECURE_BVLL: u8 = 0x0c;
+}
+
+/// BVLC-Result codes (Annex J.2.1): 0 for success, or which request a BBMD
+/// refused.
+pub mod result {
+    #![allow(missing_docs)]
+    pub const SUCCESSFUL_COMPLETION: u16 = 0x0000;
+    pub const WRITE_BROADCAST_DISTRIBUTION_TABLE_NAK: u16 = 0x0010;
+    pub const READ_BROADCAST_DISTRIBUTION_TABLE_NAK: u16 = 0x0020;
+    pub const REGISTER_FOREIGN_DEVICE_NAK: u16 = 0x0030;
+    pub const READ_FOREIGN_DEVICE_TABLE_NAK: u16 = 0x0040;
+    pub const DELETE_FOREIGN_DEVICE_TABLE_ENTRY_NAK: u16 = 0x0050;
+    pub const DISTRIBUTE_BROADCAST_TO_NETWORK_NAK: u16 = 0x0060;
+}
+
+/// Confirmed service choices (Clause 21, BACnetConfirmedServiceChoice).
+pub mod confirmed {
+    #![allow(missing_docs)]
+    pub const ACKNOWLEDGE_ALARM: u8 = 0;
+    pub const CONFIRMED_COV_NOTIFICATION: u8 = 1;
+    pub const CONFIRMED_EVENT_NOTIFICATION: u8 = 2;
+    pub const GET_ALARM_SUMMARY: u8 = 3;
+    pub const GET_ENROLLMENT_SUMMARY: u8 = 4;
+    pub const SUBSCRIBE_COV: u8 = 5;
+    pub const ATOMIC_READ_FILE: u8 = 6;
+    pub const ATOMIC_WRITE_FILE: u8 = 7;
+    pub const ADD_LIST_ELEMENT: u8 = 8;
+    pub const REMOVE_LIST_ELEMENT: u8 = 9;
+    pub const CREATE_OBJECT: u8 = 10;
+    pub const DELETE_OBJECT: u8 = 11;
+    pub const READ_PROPERTY: u8 = 12;
+    pub const READ_PROPERTY_MULTIPLE: u8 = 14;
+    pub const WRITE_PROPERTY: u8 = 15;
+    pub const WRITE_PROPERTY_MULTIPLE: u8 = 16;
+    pub const DEVICE_COMMUNICATION_CONTROL: u8 = 17;
+    pub const CONFIRMED_PRIVATE_TRANSFER: u8 = 18;
+    pub const CONFIRMED_TEXT_MESSAGE: u8 = 19;
+    pub const REINITIALIZE_DEVICE: u8 = 20;
+    pub const READ_RANGE: u8 = 26;
+    pub const SUBSCRIBE_COV_PROPERTY: u8 = 28;
+    pub const GET_EVENT_INFORMATION: u8 = 29;
+}
+
+/// Unconfirmed service choices (Clause 21,
+/// BACnetUnconfirmedServiceChoice).
+pub mod unconfirmed {
+    #![allow(missing_docs)]
+    pub const I_AM: u8 = 0;
+    pub const I_HAVE: u8 = 1;
+    pub const UNCONFIRMED_COV_NOTIFICATION: u8 = 2;
+    pub const UNCONFIRMED_EVENT_NOTIFICATION: u8 = 3;
+    pub const UNCONFIRMED_PRIVATE_TRANSFER: u8 = 4;
+    pub const UNCONFIRMED_TEXT_MESSAGE: u8 = 5;
+    pub const TIME_SYNCHRONIZATION: u8 = 6;
+    pub const WHO_HAS: u8 = 7;
+    pub const WHO_IS: u8 = 8;
+    pub const UTC_TIME_SYNCHRONIZATION: u8 = 9;
+    pub const WRITE_GROUP: u8 = 10;
+}
+
+/// Some object type numbers (Clause 21, BACnetObjectType).
+pub mod object_type {
+    #![allow(missing_docs)]
+    pub const ANALOG_INPUT: u16 = 0;
+    pub const ANALOG_OUTPUT: u16 = 1;
+    pub const ANALOG_VALUE: u16 = 2;
+    pub const BINARY_INPUT: u16 = 3;
+    pub const BINARY_OUTPUT: u16 = 4;
+    pub const BINARY_VALUE: u16 = 5;
+    pub const DEVICE: u16 = 8;
+    pub const FILE: u16 = 10;
+    pub const MULTI_STATE_INPUT: u16 = 13;
+    pub const MULTI_STATE_OUTPUT: u16 = 14;
+    pub const MULTI_STATE_VALUE: u16 = 19;
+}
+
+/// Application tag numbers (Clause 20.2.1.4).
+pub mod tag {
+    #![allow(missing_docs)]
+    pub const NULL: u8 = 0;
+    pub const BOOLEAN: u8 = 1;
+    pub const UNSIGNED: u8 = 2;
+    pub const SIGNED: u8 = 3;
+    pub const REAL: u8 = 4;
+    pub const DOUBLE: u8 = 5;
+    pub const OCTET_STRING: u8 = 6;
+    pub const CHARACTER_STRING: u8 = 7;
+    pub const BIT_STRING: u8 = 8;
+    pub const ENUMERATED: u8 = 9;
+    pub const DATE: u8 = 10;
+    pub const TIME: u8 = 11;
+    pub const OBJECT_IDENTIFIER: u8 = 12;
+}
+
+/// Why bytes are not the BACnet message a reader expected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// The bytes ended before the message did.
+    Truncated,
+    /// Bytes were left over after a message of fixed size.
+    TrailingBytes,
+    /// The BVLC type byte was not 0x81, so this is not BACnet/IP.
+    NotBacnetIp(u8),
+    /// The BVLC length field did not match the datagram's length, or was
+    /// below 4 or above [`MAX_MESSAGE`].
+    Length(u16),
+    /// The BVLC function code is not one Annex J defines.
+    Function(u8),
+    /// A BVLC function's data had the wrong length for that function.
+    FunctionData(u8),
+    /// The NPDU version was not 1.
+    Version(u8),
+    /// The NPDU had a source address of length 0, which Clause 6.2.2
+    /// forbids.
+    SourceAddress,
+    /// The APDU type is one of the reserved values 8 to 15.
+    PduType(u8),
+    /// An application tag number from 13 to 15, or an extended tag number
+    /// of 255 in any class. All are reserved.
+    ReservedTag(u8),
+    /// An application tag with length code 6 or 7. Only context tags open
+    /// or close constructed data.
+    ApplicationOpenClose,
+    /// A context tag, or an opening or closing tag, where an application
+    /// value was expected. It holds the tag number.
+    ContextTag(u8),
+    /// A value's length does not fit its type, or is above
+    /// [`MAX_VALUE_LEN`].
+    ValueLength {
+        /// The application tag number.
+        tag: u8,
+        /// The length the tag gave.
+        len: u32,
+    },
+    /// A bit string whose first byte gives more than 7 unused bits, or
+    /// unused bits with no bit bytes.
+    BitString(u8),
+    /// A service body did not hold the fields its service defines, in
+    /// order.
+    ServiceBody,
+    /// A field held a value outside the range its type allows.
+    OutOfRange,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Truncated => f.write_str("message ends early"),
+            Error::TrailingBytes => f.write_str("bytes left over after the message"),
+            Error::NotBacnetIp(t) => write!(f, "BVLC type {t:#04x}, not 0x81 (BACnet/IP)"),
+            Error::Length(n) => write!(f, "BVLC length {n} does not match the datagram"),
+            Error::Function(c) => write!(f, "unknown BVLC function {c:#04x}"),
+            Error::FunctionData(c) => write!(f, "wrong data length for BVLC function {c:#04x}"),
+            Error::Version(v) => write!(f, "NPDU version {v}, not 1"),
+            Error::SourceAddress => f.write_str("NPDU source address of length 0"),
+            Error::PduType(t) => write!(f, "reserved APDU type {t}"),
+            Error::ReservedTag(t) => write!(f, "reserved tag number {t}"),
+            Error::ApplicationOpenClose => f.write_str("application tag with an opening or closing length code"),
+            Error::ContextTag(t) => write!(f, "context tag {t} where an application value was expected"),
+            Error::ValueLength { tag, len } => write!(f, "length {len} does not fit application tag {tag}"),
+            Error::BitString(u) => write!(f, "bit string with {u} unused bits"),
+            Error::ServiceBody => f.write_str("service body does not match its definition"),
+            Error::OutOfRange => f.write_str("value out of range"),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// One entry of a BBMD's broadcast distribution table: a peer BBMD and the
+/// mask it broadcasts with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BdtEntry {
+    /// The peer BBMD's address and port.
+    pub address: SocketAddrV4,
+    /// The broadcast distribution mask. All ones means "send to the peer
+    /// directly".
+    pub mask: Ipv4Addr,
+}
+
+/// One entry of a BBMD's foreign device table: a device on another subnet
+/// that registered to receive broadcasts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FdtEntry {
+    /// The foreign device's address and port.
+    pub address: SocketAddrV4,
+    /// The time-to-live the device registered with, in seconds.
+    pub ttl: u16,
+    /// Seconds left before the entry expires. A BBMD adds a 30-second
+    /// grace period to the time-to-live.
+    pub remaining: u16,
+}
+
+/// One BACnet/IP datagram: the BVLC function and what it carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Bvlc {
+    /// 0x00: a BBMD's answer to a request, such as a foreign device
+    /// registration or a table write, with a code from [`result`].
+    Result(u16),
+    /// 0x01: replace a BBMD's broadcast distribution table.
+    WriteBdt(Vec<BdtEntry>),
+    /// 0x02: ask a BBMD for its broadcast distribution table.
+    ReadBdt,
+    /// 0x03: a BBMD's broadcast distribution table.
+    ReadBdtAck(Vec<BdtEntry>),
+    /// 0x04: a broadcast a BBMD passes on, with the address of the device
+    /// that first sent it.
+    ForwardedNpdu {
+        /// The device that sent the original broadcast.
+        origin: SocketAddrV4,
+        /// The NPDU it sent.
+        npdu: Vec<u8>,
+    },
+    /// 0x05: register with a BBMD as a foreign device, for `ttl` seconds.
+    RegisterForeignDevice {
+        /// How long the registration lasts, in seconds.
+        ttl: u16,
+    },
+    /// 0x06: ask a BBMD for its foreign device table.
+    ReadFdt,
+    /// 0x07: a BBMD's foreign device table.
+    ReadFdtAck(Vec<FdtEntry>),
+    /// 0x08: remove a device from a BBMD's foreign device table.
+    DeleteFdtEntry(SocketAddrV4),
+    /// 0x09: a foreign device asks its BBMD to broadcast this NPDU.
+    DistributeBroadcastToNetwork(Vec<u8>),
+    /// 0x0A: an NPDU sent to one device.
+    OriginalUnicastNpdu(Vec<u8>),
+    /// 0x0B: an NPDU broadcast on the local subnet.
+    OriginalBroadcastNpdu(Vec<u8>),
+    /// 0x0C: a message secured by BACnet network security (Clause 24),
+    /// kept as raw bytes. BACnet/SC (Annex AB) is a different data link
+    /// and does not use this header.
+    SecureBvll(Vec<u8>),
+}
+
+impl Bvlc {
+    /// Reads one datagram. The BVLC length field must match the datagram's
+    /// length, so `b` must be the whole datagram and nothing else.
+    pub fn parse(b: &[u8]) -> Result<Bvlc, Error> {
+        if b.len() < BVLC_HEADER_LEN {
+            return Err(Error::Truncated);
+        }
+        if b[0] != BVLC_TYPE {
+            return Err(Error::NotBacnetIp(b[0]));
+        }
+        let code = b[1];
+        let length = be16(b, 2);
+        let n = usize::from(length);
+        if !(BVLC_HEADER_LEN..=MAX_MESSAGE).contains(&n) || n != b.len() {
+            return Err(Error::Length(length));
+        }
+        let data = &b[BVLC_HEADER_LEN..];
+        let exact = |n: usize| if data.len() == n { Ok(()) } else { Err(Error::FunctionData(code)) };
+        let table = |size: usize| {
+            if data.len().is_multiple_of(size) { Ok(data.chunks_exact(size)) } else { Err(Error::FunctionData(code)) }
+        };
+        Ok(match code {
+            function::RESULT => {
+                exact(2)?;
+                Bvlc::Result(be16(data, 0))
+            }
+            function::WRITE_BROADCAST_DISTRIBUTION_TABLE => Bvlc::WriteBdt(table(10)?.map(bdt_entry).collect()),
+            function::READ_BROADCAST_DISTRIBUTION_TABLE => {
+                exact(0)?;
+                Bvlc::ReadBdt
+            }
+            function::READ_BROADCAST_DISTRIBUTION_TABLE_ACK => Bvlc::ReadBdtAck(table(10)?.map(bdt_entry).collect()),
+            function::FORWARDED_NPDU => {
+                if data.len() < 6 {
+                    return Err(Error::FunctionData(code));
+                }
+                Bvlc::ForwardedNpdu { origin: bip_address(data), npdu: data[6..].to_vec() }
+            }
+            function::REGISTER_FOREIGN_DEVICE => {
+                exact(2)?;
+                Bvlc::RegisterForeignDevice { ttl: be16(data, 0) }
+            }
+            function::READ_FOREIGN_DEVICE_TABLE => {
+                exact(0)?;
+                Bvlc::ReadFdt
+            }
+            function::READ_FOREIGN_DEVICE_TABLE_ACK => Bvlc::ReadFdtAck(
+                table(10)?
+                    .map(|e| FdtEntry { address: bip_address(e), ttl: be16(e, 6), remaining: be16(e, 8) })
+                    .collect(),
+            ),
+            function::DELETE_FOREIGN_DEVICE_TABLE_ENTRY => {
+                exact(6)?;
+                Bvlc::DeleteFdtEntry(bip_address(data))
+            }
+            function::DISTRIBUTE_BROADCAST_TO_NETWORK => Bvlc::DistributeBroadcastToNetwork(data.to_vec()),
+            function::ORIGINAL_UNICAST_NPDU => Bvlc::OriginalUnicastNpdu(data.to_vec()),
+            function::ORIGINAL_BROADCAST_NPDU => Bvlc::OriginalBroadcastNpdu(data.to_vec()),
+            function::SECURE_BVLL => Bvlc::SecureBvll(data.to_vec()),
+            c => return Err(Error::Function(c)),
+        })
+    }
+
+    /// The BVLC function code.
+    pub fn function(&self) -> u8 {
+        match self {
+            Bvlc::Result(_) => function::RESULT,
+            Bvlc::WriteBdt(_) => function::WRITE_BROADCAST_DISTRIBUTION_TABLE,
+            Bvlc::ReadBdt => function::READ_BROADCAST_DISTRIBUTION_TABLE,
+            Bvlc::ReadBdtAck(_) => function::READ_BROADCAST_DISTRIBUTION_TABLE_ACK,
+            Bvlc::ForwardedNpdu { .. } => function::FORWARDED_NPDU,
+            Bvlc::RegisterForeignDevice { .. } => function::REGISTER_FOREIGN_DEVICE,
+            Bvlc::ReadFdt => function::READ_FOREIGN_DEVICE_TABLE,
+            Bvlc::ReadFdtAck(_) => function::READ_FOREIGN_DEVICE_TABLE_ACK,
+            Bvlc::DeleteFdtEntry(_) => function::DELETE_FOREIGN_DEVICE_TABLE_ENTRY,
+            Bvlc::DistributeBroadcastToNetwork(_) => function::DISTRIBUTE_BROADCAST_TO_NETWORK,
+            Bvlc::OriginalUnicastNpdu(_) => function::ORIGINAL_UNICAST_NPDU,
+            Bvlc::OriginalBroadcastNpdu(_) => function::ORIGINAL_BROADCAST_NPDU,
+            Bvlc::SecureBvll(_) => function::SECURE_BVLL,
+        }
+    }
+
+    /// The NPDU this datagram carries, if its function carries one. Read
+    /// it with [`Npdu::parse`].
+    pub fn npdu(&self) -> Option<&[u8]> {
+        match self {
+            Bvlc::ForwardedNpdu { npdu, .. }
+            | Bvlc::DistributeBroadcastToNetwork(npdu)
+            | Bvlc::OriginalUnicastNpdu(npdu)
+            | Bvlc::OriginalBroadcastNpdu(npdu) => Some(npdu),
+            _ => None,
+        }
+    }
+
+    /// The datagram's bytes. Data past [`MAX_MESSAGE`] is cut: whole table
+    /// entries are dropped from the end, and NPDUs and secure messages lose
+    /// their last bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let room = MAX_MESSAGE - BVLC_HEADER_LEN;
+        let mut out = vec![BVLC_TYPE, self.function(), 0, 0];
+        match self {
+            Bvlc::Result(code) => out.extend_from_slice(&code.to_be_bytes()),
+            Bvlc::WriteBdt(entries) | Bvlc::ReadBdtAck(entries) => {
+                for e in entries.iter().take(room / 10) {
+                    put_bip_address(&mut out, e.address);
+                    out.extend_from_slice(&e.mask.octets());
+                }
+            }
+            Bvlc::ForwardedNpdu { origin, npdu } => {
+                put_bip_address(&mut out, *origin);
+                out.extend_from_slice(&npdu[..npdu.len().min(room - 6)]);
+            }
+            Bvlc::RegisterForeignDevice { ttl } => out.extend_from_slice(&ttl.to_be_bytes()),
+            Bvlc::ReadBdt | Bvlc::ReadFdt => {}
+            Bvlc::ReadFdtAck(entries) => {
+                for e in entries.iter().take(room / 10) {
+                    put_bip_address(&mut out, e.address);
+                    out.extend_from_slice(&e.ttl.to_be_bytes());
+                    out.extend_from_slice(&e.remaining.to_be_bytes());
+                }
+            }
+            Bvlc::DeleteFdtEntry(address) => put_bip_address(&mut out, *address),
+            Bvlc::DistributeBroadcastToNetwork(data)
+            | Bvlc::OriginalUnicastNpdu(data)
+            | Bvlc::OriginalBroadcastNpdu(data)
+            | Bvlc::SecureBvll(data) => out.extend_from_slice(&data[..data.len().min(room)]),
+        }
+        let len = out.len() as u16; // At most MAX_MESSAGE, which fits.
+        out[2..4].copy_from_slice(&len.to_be_bytes());
+        out
+    }
+}
+
+fn bip_address(b: &[u8]) -> SocketAddrV4 {
+    SocketAddrV4::new(Ipv4Addr::new(b[0], b[1], b[2], b[3]), be16(b, 4))
+}
+
+fn bdt_entry(e: &[u8]) -> BdtEntry {
+    BdtEntry { address: bip_address(e), mask: Ipv4Addr::new(e[6], e[7], e[8], e[9]) }
+}
+
+fn put_bip_address(out: &mut Vec<u8>, a: SocketAddrV4) {
+    out.extend_from_slice(&a.ip().octets());
+    out.extend_from_slice(&a.port().to_be_bytes());
+}
+
+/// A message's network priority (Clause 6.2.2). Routers pass higher
+/// priorities first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Priority {
+    /// 0: an ordinary message.
+    #[default]
+    Normal,
+    /// 1: an urgent message.
+    Urgent,
+    /// 2: a message about critical equipment.
+    CriticalEquipment,
+    /// 3: a life safety message.
+    LifeSafety,
+}
+
+impl Priority {
+    /// The priority in the low two bits of `bits`.
+    pub fn from_bits(bits: u8) -> Priority {
+        match bits & 3 {
+            0 => Priority::Normal,
+            1 => Priority::Urgent,
+            2 => Priority::CriticalEquipment,
+            _ => Priority::LifeSafety,
+        }
+    }
+
+    /// The priority's two-bit code.
+    pub fn bits(self) -> u8 {
+        match self {
+            Priority::Normal => 0,
+            Priority::Urgent => 1,
+            Priority::CriticalEquipment => 2,
+            Priority::LifeSafety => 3,
+        }
+    }
+}
+
+/// A station on a BACnet network: the network number and the station's
+/// address on that network (a MAC address, for BACnet/IP six bytes of IP
+/// address and port).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NetAddress {
+    /// The network number. 0xFFFF in a destination means every network.
+    pub network: u16,
+    /// The station's address. Empty in a destination means a broadcast on
+    /// that network. Only the first [`MAX_MAC_LEN`] bytes are written.
+    pub mac: Vec<u8>,
+}
+
+/// Where a routed NPDU is going, and how many more routers may pass it on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Destination {
+    /// The destination network and station.
+    pub address: NetAddress,
+    /// Decremented by each router. A router drops the message at 0. New
+    /// messages start at 255.
+    pub hop_count: u8,
+}
+
+/// An NPDU's body: an APDU, or a message for the network layer itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NpduBody {
+    /// An APDU, unread. Read it with [`Apdu::parse`].
+    Apdu(Vec<u8>),
+    /// A network layer message, such as Who-Is-Router-To-Network. Its data
+    /// is kept as raw bytes.
+    Network {
+        /// The message type (Clause 6.2.4).
+        message_type: u8,
+        /// The vendor, for proprietary message types 0x80 and up. It is
+        /// written only for those types, as 0 when absent.
+        vendor: Option<u16>,
+        /// The message's data.
+        data: Vec<u8>,
+    },
+}
+
+/// The network layer header and its body (Clause 6.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Npdu {
+    /// Where a router should send the message. `None` means the local
+    /// network.
+    pub destination: Option<Destination>,
+    /// The station that first sent the message, set by a router that
+    /// passed it on. `None` means a station on the local network. A source
+    /// with an empty address is not allowed, and is left out when written.
+    pub source: Option<NetAddress>,
+    /// Whether the sender expects a reply: set for confirmed requests,
+    /// segments of complex acknowledgments, and network layer messages
+    /// that expect a reply.
+    pub expecting_reply: bool,
+    /// The message's priority.
+    pub priority: Priority,
+    /// What the NPDU carries.
+    pub body: NpduBody,
+}
+
+impl Npdu {
+    /// An NPDU for the local network, carrying `apdu`.
+    pub fn local(apdu: Vec<u8>) -> Npdu {
+        Npdu {
+            destination: None,
+            source: None,
+            expecting_reply: false,
+            priority: Priority::Normal,
+            body: NpduBody::Apdu(apdu),
+        }
+    }
+
+    /// Reads an NPDU. The body runs to the end of `b`.
+    pub fn parse(b: &[u8]) -> Result<Npdu, Error> {
+        let mut r = Reader::new(b);
+        let version = r.u8()?;
+        if version != NPDU_VERSION {
+            return Err(Error::Version(version));
+        }
+        let control = r.u8()?;
+        let destination = if control & 0x20 != 0 { Some(net_address(&mut r)?) } else { None };
+        let source = if control & 0x08 != 0 {
+            let a = net_address(&mut r)?;
+            if a.mac.is_empty() {
+                return Err(Error::SourceAddress);
+            }
+            Some(a)
+        } else {
+            None
+        };
+        let destination = match destination {
+            Some(address) => Some(Destination { address, hop_count: r.u8()? }),
+            None => None,
+        };
+        let body = if control & 0x80 != 0 {
+            let message_type = r.u8()?;
+            let vendor = if message_type >= 0x80 { Some(r.u16()?) } else { None };
+            NpduBody::Network { message_type, vendor, data: r.rest().to_vec() }
+        } else {
+            NpduBody::Apdu(r.rest().to_vec())
+        };
+        Ok(Npdu {
+            destination,
+            source,
+            expecting_reply: control & 0x04 != 0,
+            priority: Priority::from_bits(control),
+            body,
+        })
+    }
+
+    /// The APDU this NPDU carries, if it carries one.
+    pub fn apdu(&self) -> Option<&[u8]> {
+        match &self.body {
+            NpduBody::Apdu(a) => Some(a),
+            NpduBody::Network { .. } => None,
+        }
+    }
+
+    /// An NPDU that answers this one with `apdu`: sent back to the
+    /// original source through the router it came from, at the same
+    /// priority, not expecting a reply.
+    pub fn reply(&self, apdu: Vec<u8>) -> Npdu {
+        Npdu {
+            destination: self.source.clone().map(|address| Destination { address, hop_count: 255 }),
+            source: None,
+            expecting_reply: false,
+            priority: self.priority,
+            body: NpduBody::Apdu(apdu),
+        }
+    }
+
+    /// The NPDU's bytes. Addresses longer than [`MAX_MAC_LEN`] are cut.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let source = self.source.as_ref().filter(|s| !s.mac.is_empty());
+        let mut control = self.priority.bits();
+        if matches!(self.body, NpduBody::Network { .. }) {
+            control |= 0x80;
+        }
+        if self.destination.is_some() {
+            control |= 0x20;
+        }
+        if source.is_some() {
+            control |= 0x08;
+        }
+        if self.expecting_reply {
+            control |= 0x04;
+        }
+        let mut out = vec![NPDU_VERSION, control];
+        if let Some(d) = &self.destination {
+            put_net_address(&mut out, &d.address);
+        }
+        if let Some(s) = source {
+            put_net_address(&mut out, s);
+        }
+        if let Some(d) = &self.destination {
+            out.push(d.hop_count);
+        }
+        match &self.body {
+            NpduBody::Apdu(a) => out.extend_from_slice(a),
+            NpduBody::Network { message_type, vendor, data } => {
+                out.push(*message_type);
+                if *message_type >= 0x80 {
+                    out.extend_from_slice(&vendor.unwrap_or(0).to_be_bytes());
+                }
+                out.extend_from_slice(data);
+            }
+        }
+        out
+    }
+}
+
+fn net_address(r: &mut Reader) -> Result<NetAddress, Error> {
+    let network = r.u16()?;
+    let len = r.u8()?;
+    Ok(NetAddress { network, mac: r.take(usize::from(len))?.to_vec() })
+}
+
+fn put_net_address(out: &mut Vec<u8>, a: &NetAddress) {
+    let mac = &a.mac[..a.mac.len().min(MAX_MAC_LEN)];
+    out.extend_from_slice(&a.network.to_be_bytes());
+    out.push(mac.len() as u8);
+    out.extend_from_slice(mac);
+}
+
+/// The segmentation fields of a segmented confirmed request or complex
+/// acknowledgment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Segment {
+    /// The segment's number, counting from 0 and wrapping at 256.
+    pub sequence: u8,
+    /// How many segments the sender proposes to send before waiting for a
+    /// segment acknowledgment: 1 to 127.
+    pub window: u8,
+    /// Whether more segments follow this one.
+    pub more_follows: bool,
+}
+
+/// An application layer message (Clause 20.1). Service bodies are kept as
+/// raw bytes; a segment's body is only part of the whole service body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Apdu {
+    /// Type 0: a request that expects an answer.
+    ConfirmedRequest {
+        /// Whether the client can take a segmented answer.
+        segmented_response_accepted: bool,
+        /// The most segments the client accepts, as a 3-bit code; see
+        /// [`max_segments`]. Only the low 3 bits are written.
+        max_segments: u8,
+        /// The longest APDU the client accepts, as a 4-bit code; see
+        /// [`max_apdu_octets`]. Only the low 4 bits are written.
+        max_apdu: u8,
+        /// Chosen by the client and copied into the answer.
+        invoke_id: u8,
+        /// Present when this is one segment of a segmented request.
+        segment: Option<Segment>,
+        /// The service, from [`confirmed`].
+        service: u8,
+        /// The service request's body.
+        data: Vec<u8>,
+    },
+    /// Type 1: a request that expects no answer.
+    UnconfirmedRequest {
+        /// The service, from [`unconfirmed`].
+        service: u8,
+        /// The service request's body.
+        data: Vec<u8>,
+    },
+    /// Type 2: a confirmed request succeeded, with nothing to return.
+    SimpleAck {
+        /// The request's invoke ID.
+        invoke_id: u8,
+        /// The request's service.
+        service: u8,
+    },
+    /// Type 3: a confirmed request succeeded, with data.
+    ComplexAck {
+        /// The request's invoke ID.
+        invoke_id: u8,
+        /// Present when this is one segment of a segmented answer.
+        segment: Option<Segment>,
+        /// The request's service.
+        service: u8,
+        /// The service acknowledgment's body.
+        data: Vec<u8>,
+    },
+    /// Type 4: acknowledges segments up to `sequence`.
+    SegmentAck {
+        /// Set when a segment came out of order.
+        negative: bool,
+        /// Set when the server sent this acknowledgment.
+        server: bool,
+        /// The invoke ID of the segmented message.
+        invoke_id: u8,
+        /// The last segment received in order.
+        sequence: u8,
+        /// How many segments the receiver will take before acknowledging.
+        window: u8,
+    },
+    /// Type 5: a confirmed request failed.
+    Error {
+        /// The request's invoke ID.
+        invoke_id: u8,
+        /// The request's service.
+        service: u8,
+        /// The error's body. For most services it is two enumerated
+        /// values, the error class and the error code; read them with
+        /// [`Value::parse`].
+        data: Vec<u8>,
+    },
+    /// Type 6: a request was refused because it was malformed.
+    Reject {
+        /// The request's invoke ID.
+        invoke_id: u8,
+        /// Why, as a BACnetRejectReason.
+        reason: u8,
+    },
+    /// Type 7: a transaction was stopped.
+    Abort {
+        /// Set when the server sent the abort.
+        server: bool,
+        /// The transaction's invoke ID.
+        invoke_id: u8,
+        /// Why, as a BACnetAbortReason.
+        reason: u8,
+    },
+}
+
+impl Apdu {
+    /// Reads an APDU. Service bodies run to the end of `b`. Simple
+    /// acknowledgments, segment acknowledgments, rejects and aborts have a
+    /// fixed size, and bytes after them are an error. Reserved bits are
+    /// ignored.
+    pub fn parse(b: &[u8]) -> Result<Apdu, Error> {
+        let mut r = Reader::new(b);
+        let first = r.u8()?;
+        let segment = |r: &mut Reader| -> Result<Option<Segment>, Error> {
+            if first & 0x08 == 0 {
+                return Ok(None);
+            }
+            Ok(Some(Segment { sequence: r.u8()?, window: r.u8()?, more_follows: first & 0x04 != 0 }))
+        };
+        let apdu = match first >> 4 {
+            0 => {
+                let limits = r.u8()?;
+                let invoke_id = r.u8()?;
+                let segment = segment(&mut r)?;
+                Apdu::ConfirmedRequest {
+                    segmented_response_accepted: first & 0x02 != 0,
+                    max_segments: (limits >> 4) & 0x07,
+                    max_apdu: limits & 0x0f,
+                    invoke_id,
+                    segment,
+                    service: r.u8()?,
+                    data: r.rest().to_vec(),
+                }
+            }
+            1 => Apdu::UnconfirmedRequest { service: r.u8()?, data: r.rest().to_vec() },
+            2 => Apdu::SimpleAck { invoke_id: r.u8()?, service: r.u8()? },
+            3 => {
+                let invoke_id = r.u8()?;
+                let segment = segment(&mut r)?;
+                Apdu::ComplexAck { invoke_id, segment, service: r.u8()?, data: r.rest().to_vec() }
+            }
+            4 => Apdu::SegmentAck {
+                negative: first & 0x02 != 0,
+                server: first & 0x01 != 0,
+                invoke_id: r.u8()?,
+                sequence: r.u8()?,
+                window: r.u8()?,
+            },
+            5 => Apdu::Error { invoke_id: r.u8()?, service: r.u8()?, data: r.rest().to_vec() },
+            6 => Apdu::Reject { invoke_id: r.u8()?, reason: r.u8()? },
+            7 => Apdu::Abort { server: first & 0x01 != 0, invoke_id: r.u8()?, reason: r.u8()? },
+            t => return Err(Error::PduType(t)),
+        };
+        r.end()?;
+        Ok(apdu)
+    }
+
+    /// The APDU type: the high four bits of its first byte.
+    pub fn pdu_type(&self) -> u8 {
+        match self {
+            Apdu::ConfirmedRequest { .. } => 0,
+            Apdu::UnconfirmedRequest { .. } => 1,
+            Apdu::SimpleAck { .. } => 2,
+            Apdu::ComplexAck { .. } => 3,
+            Apdu::SegmentAck { .. } => 4,
+            Apdu::Error { .. } => 5,
+            Apdu::Reject { .. } => 6,
+            Apdu::Abort { .. } => 7,
+        }
+    }
+
+    /// The invoke ID that ties a confirmed request to its answers. `None`
+    /// for an unconfirmed request, which has none.
+    pub fn invoke_id(&self) -> Option<u8> {
+        match self {
+            Apdu::UnconfirmedRequest { .. } => None,
+            Apdu::ConfirmedRequest { invoke_id, .. }
+            | Apdu::SimpleAck { invoke_id, .. }
+            | Apdu::ComplexAck { invoke_id, .. }
+            | Apdu::SegmentAck { invoke_id, .. }
+            | Apdu::Error { invoke_id, .. }
+            | Apdu::Reject { invoke_id, .. }
+            | Apdu::Abort { invoke_id, .. } => Some(*invoke_id),
+        }
+    }
+
+    /// The service choice, for the types that carry one. Confirmed
+    /// services are numbered from [`confirmed`] and unconfirmed ones from
+    /// [`unconfirmed`]. `None` for segment acknowledgments, rejects and
+    /// aborts.
+    pub fn service(&self) -> Option<u8> {
+        match self {
+            Apdu::ConfirmedRequest { service, .. }
+            | Apdu::UnconfirmedRequest { service, .. }
+            | Apdu::SimpleAck { service, .. }
+            | Apdu::ComplexAck { service, .. }
+            | Apdu::Error { service, .. } => Some(*service),
+            Apdu::SegmentAck { .. } | Apdu::Reject { .. } | Apdu::Abort { .. } => None,
+        }
+    }
+
+    /// The service body, for the types that carry one. `None` for simple
+    /// and segment acknowledgments, rejects and aborts.
+    pub fn data(&self) -> Option<&[u8]> {
+        match self {
+            Apdu::ConfirmedRequest { data, .. }
+            | Apdu::UnconfirmedRequest { data, .. }
+            | Apdu::ComplexAck { data, .. }
+            | Apdu::Error { data, .. } => Some(data),
+            _ => None,
+        }
+    }
+
+    /// The APDU's bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let head = self.pdu_type() << 4;
+        let seg_bits = |s: &Option<Segment>| match s {
+            Some(s) => 0x08 | if s.more_follows { 0x04 } else { 0 },
+            None => 0,
+        };
+        let put_segment = |out: &mut Vec<u8>, s: &Option<Segment>| {
+            if let Some(s) = s {
+                out.extend_from_slice(&[s.sequence, s.window]);
+            }
+        };
+        let mut out = Vec::new();
+        match self {
+            Apdu::ConfirmedRequest {
+                segmented_response_accepted,
+                max_segments,
+                max_apdu,
+                invoke_id,
+                segment,
+                service,
+                data,
+            } => {
+                let sa = if *segmented_response_accepted { 0x02 } else { 0 };
+                out.push(head | seg_bits(segment) | sa);
+                out.push((max_segments & 0x07) << 4 | (max_apdu & 0x0f));
+                out.push(*invoke_id);
+                put_segment(&mut out, segment);
+                out.push(*service);
+                out.extend_from_slice(data);
+            }
+            Apdu::UnconfirmedRequest { service, data } => {
+                out.extend_from_slice(&[head, *service]);
+                out.extend_from_slice(data);
+            }
+            Apdu::SimpleAck { invoke_id, service } => out.extend_from_slice(&[head, *invoke_id, *service]),
+            Apdu::ComplexAck { invoke_id, segment, service, data } => {
+                out.extend_from_slice(&[head | seg_bits(segment), *invoke_id]);
+                put_segment(&mut out, segment);
+                out.push(*service);
+                out.extend_from_slice(data);
+            }
+            Apdu::SegmentAck { negative, server, invoke_id, sequence, window } => {
+                let flags = if *negative { 0x02 } else { 0 } | if *server { 0x01 } else { 0 };
+                out.extend_from_slice(&[head | flags, *invoke_id, *sequence, *window]);
+            }
+            Apdu::Error { invoke_id, service, data } => {
+                out.extend_from_slice(&[head, *invoke_id, *service]);
+                out.extend_from_slice(data);
+            }
+            Apdu::Reject { invoke_id, reason } => out.extend_from_slice(&[head, *invoke_id, *reason]),
+            Apdu::Abort { server, invoke_id, reason } => {
+                out.extend_from_slice(&[head | if *server { 0x01 } else { 0 }, *invoke_id, *reason]);
+            }
+        }
+        out
+    }
+}
+
+/// The longest APDU, in bytes, that a 4-bit max-APDU code allows
+/// (Clause 20.1.2.5). Codes 6 to 15 are reserved.
+pub fn max_apdu_octets(code: u8) -> Option<u16> {
+    match code {
+        0 => Some(50),
+        1 => Some(128),
+        2 => Some(206),
+        3 => Some(480),
+        4 => Some(1024),
+        5 => Some(1476),
+        _ => None,
+    }
+}
+
+/// The most segments a 3-bit max-segments code allows (Clause
+/// 20.1.2.4). Code 0 leaves it unspecified and code 7 means more than 64,
+/// so both give `None`.
+pub fn max_segments(code: u8) -> Option<u8> {
+    match code {
+        1..=6 => Some(1 << code),
+        _ => None,
+    }
+}
+
+/// Whether a tag is an application tag or a context-specific one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// The tag number names the value's type, from [`tag`].
+    Application,
+    /// The tag number names a field of the enclosing service or
+    /// structure.
+    Context,
+}
+
+/// What follows a tag header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TagContent {
+    /// That many bytes of contents. For an application Boolean, the length
+    /// is the value itself (0 or 1) and no bytes follow.
+    Length(u32),
+    /// The start of constructed data, ended by a matching
+    /// [`TagContent::Closing`].
+    Opening,
+    /// The end of constructed data.
+    Closing,
+}
+
+/// A tag header (Clause 20.2.1): the tag number, its class and what
+/// follows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tag {
+    /// The tag number. Numbers 15 and up take an extra byte. 255 is
+    /// reserved: readers refuse it and [`Tag::write`] writes it as 254.
+    pub number: u8,
+    /// Application or context.
+    pub class: Class,
+    /// The contents' length, or an opening or closing mark.
+    pub content: TagContent,
+}
+
+impl Tag {
+    /// Reads the tag header at the start of `b`, and how many bytes it
+    /// took. It does not check that the contents follow. An extended tag
+    /// number of 255, which Clause 20.2.1.2 reserves, is refused.
+    pub fn parse(b: &[u8]) -> Result<(Tag, usize), Error> {
+        let mut r = Reader::new(b);
+        let first = r.u8()?;
+        let class = if first & 0x08 != 0 { Class::Context } else { Class::Application };
+        let mut number = first >> 4;
+        if number == 15 {
+            number = r.u8()?;
+            if number == 255 {
+                return Err(Error::ReservedTag(255));
+            }
+        }
+        let content = match (class, first & 0x07) {
+            (Class::Context, 6) => TagContent::Opening,
+            (Class::Context, 7) => TagContent::Closing,
+            (Class::Application, 6 | 7) => return Err(Error::ApplicationOpenClose),
+            (_, 5) => TagContent::Length(match r.u8()? {
+                254 => u32::from(r.u16()?),
+                255 => r.u32()?,
+                n => u32::from(n),
+            }),
+            (_, n) => TagContent::Length(u32::from(n)),
+        };
+        Ok((Tag { number, class, content }, r.at))
+    }
+
+    /// Appends the tag header to `out`, in its shortest form. Opening and
+    /// closing tags are always written as context tags. Tag number 255,
+    /// which is reserved, is written as 254.
+    pub fn write(&self, out: &mut Vec<u8>) {
+        let number = self.number.min(254);
+        let nibble = number.min(15);
+        let (class, lvt, extended) = match self.content {
+            TagContent::Opening => (0x08, 6, None),
+            TagContent::Closing => (0x08, 7, None),
+            TagContent::Length(n) => {
+                let class = if self.class == Class::Context { 0x08 } else { 0 };
+                if n <= 4 { (class, n as u8, None) } else { (class, 5, Some(n)) }
+            }
+        };
+        out.push(nibble << 4 | class | lvt);
+        if number >= 15 {
+            out.push(number);
+        }
+        match extended {
+            None => {}
+            Some(n) if n <= 253 => out.push(n as u8),
+            Some(n) if n <= 0xffff => {
+                out.push(254);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            Some(n) => {
+                out.push(255);
+                out.extend_from_slice(&n.to_be_bytes());
+            }
+        }
+    }
+}
+
+/// A date (Clause 20.2.12). Any field may be 255 for "unspecified", and
+/// newer revisions give the month and day a few more special values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Date {
+    /// Years since 1900.
+    pub year: u8,
+    /// 1 to 12; 13 is odd months and 14 even months.
+    pub month: u8,
+    /// 1 to 31; 32 is the last day of the month.
+    pub day: u8,
+    /// 1 is Monday and 7 is Sunday.
+    pub weekday: u8,
+}
+
+/// A time of day (Clause 20.2.13). Any field may be 255 for
+/// "unspecified".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Time {
+    /// 0 to 23.
+    pub hour: u8,
+    /// 0 to 59.
+    pub minute: u8,
+    /// 0 to 59.
+    pub second: u8,
+    /// 0 to 99.
+    pub hundredths: u8,
+}
+
+/// An object's identifier: its type and instance number (Clause 20.2.14).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ObjectId {
+    /// The object type, from [`object_type`]: 0 to [`MAX_OBJECT_TYPE`].
+    pub object_type: u16,
+    /// The instance number: 0 to [`MAX_INSTANCE`].
+    pub instance: u32,
+}
+
+impl ObjectId {
+    /// The device object with this instance number.
+    pub fn device(instance: u32) -> ObjectId {
+        ObjectId { object_type: object_type::DEVICE, instance }
+    }
+
+    /// The identifier packed in 32 bits: 10 of type, 22 of instance.
+    pub fn from_u32(v: u32) -> ObjectId {
+        ObjectId { object_type: (v >> 22) as u16, instance: v & MAX_INSTANCE }
+    }
+
+    /// The identifier packed in 32 bits. A type or instance past its
+    /// maximum is written as that maximum.
+    pub fn to_u32(self) -> u32 {
+        u32::from(self.object_type.min(MAX_OBJECT_TYPE)) << 22 | self.instance.min(MAX_INSTANCE)
+    }
+}
+
+/// A character string: its character set and its bytes in that set
+/// (Clause 20.2.9).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CharString {
+    /// The character set: 0 is UTF-8, 1 IBM/Microsoft DBCS, 2 JIS X 0208,
+    /// 3 UCS-4, 4 UCS-2 and 5 ISO 8859-1.
+    pub charset: u8,
+    /// The string's bytes in that character set.
+    pub bytes: Vec<u8>,
+}
+
+impl CharString {
+    /// A UTF-8 string.
+    pub fn utf8(s: &str) -> CharString {
+        CharString { charset: 0, bytes: s.as_bytes().to_vec() }
+    }
+
+    /// The string, if it is UTF-8 and valid.
+    pub fn as_str(&self) -> Option<&str> {
+        if self.charset == 0 { std::str::from_utf8(&self.bytes).ok() } else { None }
+    }
+}
+
+/// An application-tagged primitive value (Clause 20.2).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Value {
+    /// Tag 0.
+    Null,
+    /// Tag 1.
+    Boolean(bool),
+    /// Tag 2: up to 8 bytes.
+    Unsigned(u64),
+    /// Tag 3: up to 8 bytes, two's complement.
+    Signed(i64),
+    /// Tag 4: IEEE 754 single precision.
+    Real(f32),
+    /// Tag 5: IEEE 754 double precision.
+    Double(f64),
+    /// Tag 6.
+    OctetString(Vec<u8>),
+    /// Tag 7.
+    CharacterString(CharString),
+    /// Tag 8: bits in order, the first in the high bit of the first byte.
+    BitString(Vec<bool>),
+    /// Tag 9: up to 4 bytes.
+    Enumerated(u32),
+    /// Tag 10.
+    Date(Date),
+    /// Tag 11.
+    Time(Time),
+    /// Tag 12.
+    ObjectId(ObjectId),
+}
+
+impl Value {
+    /// Reads the application-tagged value at the start of `b`, and how
+    /// many bytes it took. Integers may carry leading zero bytes, as
+    /// some devices send them.
+    pub fn parse(b: &[u8]) -> Result<(Value, usize), Error> {
+        let (t, header) = Tag::parse(b)?;
+        let TagContent::Length(len) = t.content else { return Err(Error::ContextTag(t.number)) };
+        if t.class == Class::Context {
+            return Err(Error::ContextTag(t.number));
+        }
+        if t.number == tag::BOOLEAN {
+            return match len {
+                0 | 1 => Ok((Value::Boolean(len == 1), header)),
+                _ => Err(Error::ValueLength { tag: tag::BOOLEAN, len }),
+            };
+        }
+        let (c, end) = contents(b, header, t.number, len)?;
+        Ok((Value::from_contents(t.number, c)?, end))
+    }
+
+    /// Reads a context-tagged primitive at the start of `b`, and how many
+    /// bytes it took. The tag must be context tag `number`, and its
+    /// contents are read as the application type `as_tag`, from [`tag`].
+    /// A context-tagged Boolean holds one byte, 0 or 1 (Clause 20.2.3).
+    /// Any other tag is [`Error::ServiceBody`].
+    ///
+    /// ```
+    /// use fictionet::stdlib::bacnet::{Value, tag};
+    ///
+    /// // ReadProperty's property identifier: context tag 1, Present_Value.
+    /// assert_eq!(Value::parse_context(&[0x19, 0x55], 1, tag::ENUMERATED), Ok((Value::Enumerated(85), 2)));
+    /// ```
+    pub fn parse_context(b: &[u8], number: u8, as_tag: u8) -> Result<(Value, usize), Error> {
+        let (t, header) = Tag::parse(b)?;
+        let TagContent::Length(len) = t.content else { return Err(Error::ServiceBody) };
+        if t.class != Class::Context || t.number != number {
+            return Err(Error::ServiceBody);
+        }
+        if as_tag > tag::OBJECT_IDENTIFIER {
+            return Err(Error::ReservedTag(as_tag));
+        }
+        let (c, end) = contents(b, header, as_tag, len)?;
+        if as_tag == tag::BOOLEAN {
+            return match c {
+                [0] => Ok((Value::Boolean(false), end)),
+                [1] => Ok((Value::Boolean(true), end)),
+                [_] => Err(Error::OutOfRange),
+                _ => Err(Error::ValueLength { tag: tag::BOOLEAN, len }),
+            };
+        }
+        Ok((Value::from_contents(as_tag, c)?, end))
+    }
+
+    /// Reads a value's contents, `c`, as application type `number`. Not
+    /// for Booleans, whose encoding depends on the class.
+    fn from_contents(number: u8, c: &[u8]) -> Result<Value, Error> {
+        // c comes from a tag whose length passed MAX_VALUE_LEN, so it fits.
+        let bad = Error::ValueLength { tag: number, len: c.len() as u32 };
+        let four = || -> Result<[u8; 4], Error> { c.try_into().map_err(|_| bad) };
+        Ok(match number {
+            tag::NULL if c.is_empty() => Value::Null,
+            tag::UNSIGNED => Value::Unsigned(be_uint(c, 8).ok_or(bad)?),
+            tag::SIGNED => Value::Signed(be_int(c).ok_or(bad)?),
+            tag::REAL => Value::Real(f32::from_be_bytes(four()?)),
+            tag::DOUBLE => Value::Double(f64::from_be_bytes(c.try_into().map_err(|_| bad)?)),
+            tag::OCTET_STRING => Value::OctetString(c.to_vec()),
+            tag::CHARACTER_STRING => {
+                let (&charset, bytes) = c.split_first().ok_or(bad)?;
+                Value::CharacterString(CharString { charset, bytes: bytes.to_vec() })
+            }
+            tag::BIT_STRING => {
+                let (&unused, bytes) = c.split_first().ok_or(bad)?;
+                if unused > 7 || (bytes.is_empty() && unused != 0) {
+                    return Err(Error::BitString(unused));
+                }
+                let count = bytes.len() * 8 - usize::from(unused);
+                Value::BitString((0..count).map(|i| bytes[i / 8] & (0x80 >> (i % 8)) != 0).collect())
+            }
+            tag::ENUMERATED => Value::Enumerated(be_uint(c, 4).ok_or(bad)? as u32),
+            tag::DATE => {
+                let [year, month, day, weekday] = four()?;
+                Value::Date(Date { year, month, day, weekday })
+            }
+            tag::TIME => {
+                let [hour, minute, second, hundredths] = four()?;
+                Value::Time(Time { hour, minute, second, hundredths })
+            }
+            tag::OBJECT_IDENTIFIER => Value::ObjectId(ObjectId::from_u32(u32::from_be_bytes(four()?))),
+            _ => return Err(bad),
+        })
+    }
+
+    /// Reads values one after another until `b` ends.
+    pub fn parse_all(b: &[u8]) -> Result<Vec<Value>, Error> {
+        let mut values = Vec::new();
+        let mut at = 0;
+        while at < b.len() {
+            let (v, used) = Value::parse(&b[at..])?;
+            values.push(v);
+            at += used;
+        }
+        Ok(values)
+    }
+
+    /// The value's application tag number.
+    pub fn tag(&self) -> u8 {
+        match self {
+            Value::Null => tag::NULL,
+            Value::Boolean(_) => tag::BOOLEAN,
+            Value::Unsigned(_) => tag::UNSIGNED,
+            Value::Signed(_) => tag::SIGNED,
+            Value::Real(_) => tag::REAL,
+            Value::Double(_) => tag::DOUBLE,
+            Value::OctetString(_) => tag::OCTET_STRING,
+            Value::CharacterString(_) => tag::CHARACTER_STRING,
+            Value::BitString(_) => tag::BIT_STRING,
+            Value::Enumerated(_) => tag::ENUMERATED,
+            Value::Date(_) => tag::DATE,
+            Value::Time(_) => tag::TIME,
+            Value::ObjectId(_) => tag::OBJECT_IDENTIFIER,
+        }
+    }
+
+    /// Appends the value, tag and all, to `out`, with integers in their
+    /// shortest form. Strings whose contents would pass [`MAX_VALUE_LEN`]
+    /// lose their last bytes or bits.
+    pub fn write(&self, out: &mut Vec<u8>) {
+        if let Value::Boolean(v) = self {
+            let t = Tag { number: tag::BOOLEAN, class: Class::Application, content: TagContent::Length(u32::from(*v)) };
+            return t.write(out);
+        }
+        self.write_tagged(Class::Application, self.tag(), out);
+    }
+
+    /// Appends the value under context tag `number` to `out`, as service
+    /// bodies carry their fields. A Boolean takes one byte of contents,
+    /// and long strings are cut as [`Value::write`] cuts them. Read it
+    /// back with [`Value::parse_context`].
+    ///
+    /// ```
+    /// use fictionet::stdlib::bacnet::{ObjectId, Value, object_type};
+    ///
+    /// let mut out = Vec::new();
+    /// Value::ObjectId(ObjectId { object_type: object_type::ANALOG_INPUT, instance: 5 }).write_context(0, &mut out);
+    /// Value::Enumerated(85).write_context(1, &mut out);
+    /// assert_eq!(out, [0x0c, 0x00, 0x00, 0x00, 0x05, 0x19, 0x55]);
+    /// ```
+    pub fn write_context(&self, number: u8, out: &mut Vec<u8>) {
+        self.write_tagged(Class::Context, number, out);
+    }
+
+    fn write_tagged(&self, class: Class, number: u8, out: &mut Vec<u8>) {
+        let mut c = Vec::new();
+        match self {
+            Value::Null => {}
+            Value::Boolean(v) => c.push(u8::from(*v)),
+            Value::Unsigned(v) => c = uint_bytes(*v),
+            Value::Signed(v) => c = int_bytes(*v),
+            Value::Real(v) => c.extend_from_slice(&v.to_be_bytes()),
+            Value::Double(v) => c.extend_from_slice(&v.to_be_bytes()),
+            Value::OctetString(v) => c.extend_from_slice(&v[..v.len().min(MAX_VALUE_LEN)]),
+            Value::CharacterString(s) => {
+                c.push(s.charset);
+                c.extend_from_slice(&s.bytes[..s.bytes.len().min(MAX_VALUE_LEN - 1)]);
+            }
+            Value::BitString(bits) => {
+                let bits = &bits[..bits.len().min((MAX_VALUE_LEN - 1) * 8)];
+                c.push(((8 - bits.len() % 8) % 8) as u8);
+                let mut bytes = vec![0u8; bits.len().div_ceil(8)];
+                for (i, _) in bits.iter().enumerate().filter(|(_, b)| **b) {
+                    bytes[i / 8] |= 0x80 >> (i % 8);
+                }
+                c.extend_from_slice(&bytes);
+            }
+            Value::Enumerated(v) => c = uint_bytes(u64::from(*v)),
+            Value::Date(d) => c.extend_from_slice(&[d.year, d.month, d.day, d.weekday]),
+            Value::Time(t) => c.extend_from_slice(&[t.hour, t.minute, t.second, t.hundredths]),
+            Value::ObjectId(id) => c.extend_from_slice(&id.to_u32().to_be_bytes()),
+        }
+        // c is at most MAX_VALUE_LEN long, so it fits in a u32.
+        Tag { number, class, content: TagContent::Length(c.len() as u32) }.write(out);
+        out.extend_from_slice(&c);
+    }
+
+    /// The value's bytes, tag and all.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.write(&mut out);
+        out
+    }
+}
+
+/// BACnetSegmentation: which directions a device can segment messages in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Segmentation {
+    /// 0: sends and receives segmented messages.
+    Both,
+    /// 1: sends segmented messages only.
+    Transmit,
+    /// 2: receives segmented messages only.
+    Receive,
+    /// 3: neither.
+    NoSegmentation,
+}
+
+impl Segmentation {
+    /// The segmentation for an enumerated value, if it is one of the four.
+    pub fn from_code(c: u32) -> Option<Segmentation> {
+        match c {
+            0 => Some(Segmentation::Both),
+            1 => Some(Segmentation::Transmit),
+            2 => Some(Segmentation::Receive),
+            3 => Some(Segmentation::NoSegmentation),
+            _ => None,
+        }
+    }
+
+    /// The enumerated value.
+    pub fn code(self) -> u32 {
+        match self {
+            Segmentation::Both => 0,
+            Segmentation::Transmit => 1,
+            Segmentation::Receive => 2,
+            Segmentation::NoSegmentation => 3,
+        }
+    }
+}
+
+/// The Who-Is service (Clause 16.10): which devices should answer with an
+/// I-Am.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WhoIs {
+    /// The lowest and highest device instance that should answer, both
+    /// included. `None` asks every device. Limits above [`MAX_INSTANCE`]
+    /// are written as that maximum.
+    pub range: Option<(u32, u32)>,
+}
+
+impl WhoIs {
+    /// Reads a Who-Is body: empty, or context tags 0 and 1 each holding an
+    /// unsigned device instance.
+    pub fn parse(data: &[u8]) -> Result<WhoIs, Error> {
+        if data.is_empty() {
+            return Ok(WhoIs { range: None });
+        }
+        let (low, used) = context_unsigned(data, 0)?;
+        let rest = &data[used..];
+        let (high, used) = context_unsigned(rest, 1)?;
+        if used != rest.len() {
+            return Err(Error::TrailingBytes);
+        }
+        if low > u64::from(MAX_INSTANCE) || high > u64::from(MAX_INSTANCE) {
+            return Err(Error::OutOfRange);
+        }
+        Ok(WhoIs { range: Some((low as u32, high as u32)) })
+    }
+
+    /// Whether the device with this instance number should answer.
+    pub fn matches(&self, instance: u32) -> bool {
+        match self.range {
+            None => true,
+            Some((low, high)) => low <= instance && instance <= high,
+        }
+    }
+
+    /// The service body.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        if let Some((low, high)) = self.range {
+            for (number, v) in [(0, low), (1, high)] {
+                Value::Unsigned(u64::from(v.min(MAX_INSTANCE))).write_context(number, &mut out);
+            }
+        }
+        out
+    }
+
+    /// The unconfirmed request that carries this Who-Is.
+    pub fn to_apdu(&self) -> Apdu {
+        Apdu::UnconfirmedRequest { service: unconfirmed::WHO_IS, data: self.to_bytes() }
+    }
+}
+
+/// The I-Am service (Clause 16.10): a device announces itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IAm {
+    /// The device's object identifier. Its type should be
+    /// [`object_type::DEVICE`].
+    pub device: ObjectId,
+    /// The longest APDU the device accepts, in bytes.
+    pub max_apdu: u32,
+    /// Which directions the device can segment messages in.
+    pub segmentation: Segmentation,
+    /// The device's vendor identifier, assigned by ASHRAE.
+    pub vendor: u16,
+}
+
+impl IAm {
+    /// Reads an I-Am body: an object identifier, an unsigned, an
+    /// enumerated and an unsigned, all application-tagged.
+    pub fn parse(data: &[u8]) -> Result<IAm, Error> {
+        let mut values = [Value::Null, Value::Null, Value::Null, Value::Null];
+        let mut at = 0;
+        for v in &mut values {
+            let (value, used) = Value::parse(data.get(at..).unwrap_or(&[]))?;
+            *v = value;
+            at += used;
+        }
+        if at != data.len() {
+            return Err(Error::TrailingBytes);
+        }
+        match values {
+            [Value::ObjectId(device), Value::Unsigned(max_apdu), Value::Enumerated(seg), Value::Unsigned(vendor)] => {
+                Ok(IAm {
+                    device,
+                    max_apdu: u32::try_from(max_apdu).map_err(|_| Error::OutOfRange)?,
+                    segmentation: Segmentation::from_code(seg).ok_or(Error::OutOfRange)?,
+                    vendor: u16::try_from(vendor).map_err(|_| Error::OutOfRange)?,
+                })
+            }
+            _ => Err(Error::ServiceBody),
+        }
+    }
+
+    /// The service body.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        Value::ObjectId(self.device).write(&mut out);
+        Value::Unsigned(u64::from(self.max_apdu)).write(&mut out);
+        Value::Enumerated(self.segmentation.code()).write(&mut out);
+        Value::Unsigned(u64::from(self.vendor)).write(&mut out);
+        out
+    }
+
+    /// The unconfirmed request that carries this I-Am.
+    pub fn to_apdu(&self) -> Apdu {
+        Apdu::UnconfirmedRequest { service: unconfirmed::I_AM, data: self.to_bytes() }
+    }
+}
+
+/// The `len` bytes of contents after a tag header of `header` bytes, and
+/// where they end. `number` is the application type, checked for range.
+fn contents(b: &[u8], header: usize, number: u8, len: u32) -> Result<(&[u8], usize), Error> {
+    if number > tag::OBJECT_IDENTIFIER {
+        return Err(Error::ReservedTag(number));
+    }
+    let bad = Error::ValueLength { tag: number, len };
+    let n = usize::try_from(len).map_err(|_| bad)?;
+    if n > MAX_VALUE_LEN {
+        return Err(bad);
+    }
+    let end = header.checked_add(n).ok_or(bad)?;
+    Ok((b.get(header..end).ok_or(Error::Truncated)?, end))
+}
+
+/// Reads a context tag numbered `number` holding an unsigned integer.
+fn context_unsigned(b: &[u8], number: u8) -> Result<(u64, usize), Error> {
+    let (t, header) = Tag::parse(b)?;
+    let TagContent::Length(len) = t.content else { return Err(Error::ServiceBody) };
+    if t.class != Class::Context || t.number != number {
+        return Err(Error::ServiceBody);
+    }
+    let n = usize::try_from(len).map_err(|_| Error::ServiceBody)?;
+    let end = header.checked_add(n).ok_or(Error::Truncated)?;
+    let c = b.get(header..end).ok_or(Error::Truncated)?;
+    Ok((be_uint(c, 8).ok_or(Error::ServiceBody)?, end))
+}
+
+/// A big-endian unsigned integer of 1 to `max` bytes.
+fn be_uint(c: &[u8], max: usize) -> Option<u64> {
+    if c.is_empty() || c.len() > max {
+        return None;
+    }
+    Some(c.iter().fold(0u64, |v, &b| v << 8 | u64::from(b)))
+}
+
+/// A big-endian two's complement integer of 1 to 8 bytes.
+fn be_int(c: &[u8]) -> Option<i64> {
+    let (&first, _) = c.split_first()?;
+    if c.len() > 8 {
+        return None;
+    }
+    let start = if first & 0x80 != 0 { -1i64 } else { 0 };
+    Some(c.iter().fold(start, |v, &b| v << 8 | i64::from(b)))
+}
+
+/// The shortest big-endian bytes of `v`, at least one.
+fn uint_bytes(v: u64) -> Vec<u8> {
+    let n = (8 - v.leading_zeros() as usize / 8).max(1);
+    v.to_be_bytes()[8 - n..].to_vec()
+}
+
+/// The shortest two's complement bytes of `v`, at least one.
+fn int_bytes(v: i64) -> Vec<u8> {
+    let n = (1..=8).find(|&n| (v >> (8 * n - 1)) == 0 || (v >> (8 * n - 1)) == -1).unwrap_or(8);
+    v.to_be_bytes()[8 - n..].to_vec()
+}
+
+/// A cursor over bytes that reports running out as [`Error::Truncated`].
+struct Reader<'a> {
+    b: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Reader<'a> {
+    fn new(b: &'a [u8]) -> Reader<'a> {
+        Reader { b, at: 0 }
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8], Error> {
+        let end = self.at.checked_add(n).ok_or(Error::Truncated)?;
+        let s = self.b.get(self.at..end).ok_or(Error::Truncated)?;
+        self.at = end;
+        Ok(s)
+    }
+
+    fn u8(&mut self) -> Result<u8, Error> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u16(&mut self) -> Result<u16, Error> {
+        let s = self.take(2)?;
+        Ok(u16::from_be_bytes([s[0], s[1]]))
+    }
+
+    fn u32(&mut self) -> Result<u32, Error> {
+        let s = self.take(4)?;
+        Ok(u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    fn rest(&mut self) -> &'a [u8] {
+        let s = &self.b[self.at..];
+        self.at = self.b.len();
+        s
+    }
+
+    fn end(&self) -> Result<(), Error> {
+        if self.at == self.b.len() { Ok(()) } else { Err(Error::TrailingBytes) }
+    }
+}
+
+fn be16(b: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes([b[i], b[i + 1]])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(s: &str) -> Vec<u8> {
+        let s: String = s.split_whitespace().collect();
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn value(bytes: &[u8]) -> Value {
+        let (v, used) = Value::parse(bytes).unwrap();
+        assert_eq!(used, bytes.len());
+        v
+    }
+
+    // Encoding examples from ASHRAE 135, Clause 20.2.
+
+    #[test]
+    fn primitive_value_examples() {
+        let cases = [
+            ("00", Value::Null),
+            ("10", Value::Boolean(false)),
+            ("11", Value::Boolean(true)),
+            ("21 48", Value::Unsigned(72)),
+            ("31 48", Value::Signed(72)),
+            ("44 42900000", Value::Real(72.0)),
+            ("55 08 4052000000000000", Value::Double(72.0)),
+            ("63 1234FF", Value::OctetString(vec![0x12, 0x34, 0xff])),
+            ("82 03 A8", Value::BitString(vec![true, false, true, false, true])),
+            ("91 00", Value::Enumerated(0)),
+            ("A4 5B011804", Value::Date(Date { year: 91, month: 1, day: 24, weekday: 4 })),
+            ("B4 11232D11", Value::Time(Time { hour: 17, minute: 35, second: 45, hundredths: 17 })),
+            ("C4 00C0000F", Value::ObjectId(ObjectId { object_type: object_type::BINARY_INPUT, instance: 15 })),
+        ];
+        for (bytes, v) in cases {
+            let bytes = hex(bytes);
+            assert_eq!(value(&bytes), v, "{bytes:02x?}");
+            assert_eq!(v.to_bytes(), bytes, "{v:?}");
+        }
+        let s = hex("75 19 00 546869732069732061204241436E657420737472696E6721");
+        let v = value(&s);
+        let Value::CharacterString(cs) = &v else { panic!() };
+        assert_eq!(cs.as_str(), Some("This is a BACnet string!"));
+        assert_eq!(Value::CharacterString(CharString::utf8("This is a BACnet string!")).to_bytes(), s);
+    }
+
+    #[test]
+    fn integers_take_their_shortest_form() {
+        let cases: [(i64, &str); 8] = [
+            (0, "31 00"),
+            (-1, "31 FF"),
+            (127, "31 7F"),
+            (128, "32 0080"),
+            (-128, "31 80"),
+            (-129, "32 FF7F"),
+            (i64::MIN, "35 08 8000000000000000"),
+            (i64::MAX, "35 08 7FFFFFFFFFFFFFFF"),
+        ];
+        for (n, bytes) in cases {
+            assert_eq!(Value::Signed(n).to_bytes(), hex(bytes), "{n}");
+            assert_eq!(value(&hex(bytes)), Value::Signed(n));
+        }
+        assert_eq!(Value::Unsigned(0).to_bytes(), [0x21, 0]);
+        assert_eq!(Value::Unsigned(256).to_bytes(), [0x22, 1, 0]);
+        assert_eq!(Value::Unsigned(u64::MAX).to_bytes(), hex("25 08 FFFFFFFFFFFFFFFF"));
+        assert_eq!(Value::Enumerated(u32::MAX).to_bytes(), hex("94 FFFFFFFF"));
+        // Leading zero bytes are read.
+        assert_eq!(value(&[0x23, 0, 0, 5]), Value::Unsigned(5));
+    }
+
+    #[test]
+    fn tags() {
+        // Extended tag number and the three extended length forms.
+        let cases = [
+            (Tag { number: 20, class: Class::Context, content: TagContent::Length(2) }, "FA 14"),
+            (Tag { number: 6, class: Class::Application, content: TagContent::Length(5) }, "65 05"),
+            (Tag { number: 6, class: Class::Application, content: TagContent::Length(254) }, "65 FE 00FE"),
+            (Tag { number: 6, class: Class::Application, content: TagContent::Length(65_536) }, "65 FF 00010000"),
+            (Tag { number: 3, class: Class::Context, content: TagContent::Opening }, "3E"),
+            (Tag { number: 3, class: Class::Context, content: TagContent::Closing }, "3F"),
+        ];
+        for (t, bytes) in cases {
+            let bytes = hex(bytes);
+            let mut out = Vec::new();
+            t.write(&mut out);
+            assert_eq!(out, bytes, "{t:?}");
+            assert_eq!(Tag::parse(&bytes), Ok((t, bytes.len())));
+            for n in 0..bytes.len() {
+                assert_eq!(Tag::parse(&bytes[..n]), Err(Error::Truncated));
+            }
+        }
+        assert_eq!(Tag::parse(&[0x26]), Err(Error::ApplicationOpenClose));
+        assert_eq!(Tag::parse(&[0x27]), Err(Error::ApplicationOpenClose));
+    }
+
+    #[test]
+    fn extended_tag_number_255_is_reserved() {
+        // Clause 20.2.1.2: the extended tag number octet runs 15 to 254;
+        // B'11111111' is reserved by ASHRAE.
+        assert_eq!(Tag::parse(&[0xf9, 0xff, 0x00]), Err(Error::ReservedTag(255)));
+        assert_eq!(Tag::parse(&[0xfe, 0xff]), Err(Error::ReservedTag(255)));
+        assert_eq!(
+            Tag::parse(&[0xf9, 0xfe, 0x00]),
+            Ok((Tag { number: 254, class: Class::Context, content: TagContent::Length(1) }, 2))
+        );
+        // The writer never writes the reserved number.
+        let mut out = Vec::new();
+        Tag { number: 255, class: Class::Context, content: TagContent::Opening }.write(&mut out);
+        assert_eq!(out, [0xfe, 0xfe]);
+        assert!(Tag::parse(&out).is_ok());
+    }
+
+    #[test]
+    fn bad_values() {
+        assert_eq!(Value::parse(&[]), Err(Error::Truncated));
+        assert_eq!(Value::parse(&[0x09, 0]), Err(Error::ContextTag(0)));
+        assert_eq!(Value::parse(&[0x3e]), Err(Error::ContextTag(3)));
+        assert_eq!(Value::parse(&[0xd0]), Err(Error::ReservedTag(13)));
+        assert_eq!(Value::parse(&[0xf0, 40]), Err(Error::ReservedTag(40)));
+        assert_eq!(Value::parse(&[0x12]), Err(Error::ValueLength { tag: 1, len: 2 }));
+        assert_eq!(Value::parse(&[0x01, 0]), Err(Error::ValueLength { tag: 0, len: 1 }));
+        assert_eq!(Value::parse(&[0x20]), Err(Error::ValueLength { tag: 2, len: 0 }));
+        assert_eq!(Value::parse(&hex("25 09 000000000000000001")), Err(Error::ValueLength { tag: 2, len: 9 }));
+        assert_eq!(Value::parse(&hex("95 05 0000000001")), Err(Error::ValueLength { tag: 9, len: 5 }));
+        assert_eq!(Value::parse(&hex("43 000000")), Err(Error::ValueLength { tag: 4, len: 3 }));
+        assert_eq!(Value::parse(&hex("54 00000000")), Err(Error::ValueLength { tag: 5, len: 4 }));
+        assert_eq!(Value::parse(&hex("A3 000000")), Err(Error::ValueLength { tag: 10, len: 3 }));
+        assert_eq!(Value::parse(&[0x70]), Err(Error::ValueLength { tag: 7, len: 0 }));
+        assert_eq!(Value::parse(&[0x80]), Err(Error::ValueLength { tag: 8, len: 0 }));
+        assert_eq!(Value::parse(&[0x82, 8, 0]), Err(Error::BitString(8)));
+        assert_eq!(Value::parse(&[0x81, 1]), Err(Error::BitString(1)));
+        assert_eq!(Value::parse(&[0x81, 0]), Ok((Value::BitString(vec![]), 2)));
+        // A length past the limit, and one past the bytes.
+        assert_eq!(Value::parse(&hex("65 FF FFFFFFFF")), Err(Error::ValueLength { tag: 6, len: u32::MAX }));
+        assert_eq!(Value::parse(&hex("63 0102")), Err(Error::Truncated));
+        assert_eq!(Value::parse_all(&hex("21 01 21")), Err(Error::Truncated));
+        assert_eq!(Value::parse_all(&hex("21 01 10")), Ok(vec![Value::Unsigned(1), Value::Boolean(false)]));
+    }
+
+    #[test]
+    fn writers_cut_long_strings() {
+        let v = Value::OctetString(vec![7; MAX_VALUE_LEN + 10]);
+        let Value::OctetString(back) = value(&v.to_bytes()) else { panic!() };
+        assert_eq!(back.len(), MAX_VALUE_LEN);
+        let v = Value::BitString(vec![true; MAX_VALUE_LEN * 8]);
+        let Value::BitString(back) = value(&v.to_bytes()) else { panic!() };
+        assert_eq!(back.len(), (MAX_VALUE_LEN - 1) * 8);
+        let v = Value::CharacterString(CharString { charset: 5, bytes: vec![b'a'; MAX_VALUE_LEN] });
+        let Value::CharacterString(back) = value(&v.to_bytes()) else { panic!() };
+        assert_eq!(back.bytes.len(), MAX_VALUE_LEN - 1);
+        assert_eq!(back.as_str(), None);
+        // Object identifier fields are clamped to their widths.
+        let id = ObjectId { object_type: 5000, instance: u32::MAX };
+        assert_eq!(ObjectId::from_u32(id.to_u32()), ObjectId { object_type: MAX_OBJECT_TYPE, instance: MAX_INSTANCE });
+        // Bit strings of every length up to 17 round trip.
+        for n in 0..17 {
+            let bits: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
+            assert_eq!(value(&Value::BitString(bits.clone()).to_bytes()), Value::BitString(bits));
+        }
+    }
+
+    // Who-Is and I-Am.
+
+    #[test]
+    fn who_is() {
+        let all = WhoIs::parse(&[]).unwrap();
+        assert_eq!(all, WhoIs { range: None });
+        assert!(all.matches(0) && all.matches(MAX_INSTANCE));
+        assert_eq!(all.to_bytes(), []);
+        let some = WhoIs { range: Some((3, 300)) };
+        let bytes = some.to_bytes();
+        assert_eq!(bytes, [0x09, 3, 0x1a, 0x01, 0x2c]);
+        assert_eq!(WhoIs::parse(&bytes), Ok(some));
+        assert!(some.matches(3) && some.matches(300) && !some.matches(2) && !some.matches(301));
+        // Only one limit, the limits swapped, application tags, extra bytes.
+        assert_eq!(WhoIs::parse(&[0x09, 3]), Err(Error::Truncated));
+        assert_eq!(WhoIs::parse(&[0x19, 3, 0x09, 4]), Err(Error::ServiceBody));
+        assert_eq!(WhoIs::parse(&[0x21, 3, 0x29, 4]), Err(Error::ServiceBody));
+        assert_eq!(WhoIs::parse(&[0x09, 3, 0x19, 4, 0]), Err(Error::TrailingBytes));
+        assert_eq!(WhoIs::parse(&[0x0e]), Err(Error::ServiceBody));
+        assert_eq!(WhoIs::parse(&[0x08, 0x19, 1]), Err(Error::ServiceBody));
+        // An instance past 22 bits.
+        assert_eq!(WhoIs::parse(&[0x09, 0, 0x1b, 0x40, 0, 0]), Err(Error::OutOfRange));
+        let big = WhoIs { range: Some((0, u32::MAX)) };
+        assert_eq!(WhoIs::parse(&big.to_bytes()), Ok(WhoIs { range: Some((0, MAX_INSTANCE)) }));
+    }
+
+    #[test]
+    fn i_am() {
+        let bytes = hex("C4 02000001 22 05C4 91 00 21 0F");
+        let i_am = IAm::parse(&bytes).unwrap();
+        assert_eq!(
+            i_am,
+            IAm { device: ObjectId::device(1), max_apdu: 1476, segmentation: Segmentation::Both, vendor: 15 }
+        );
+        assert_eq!(i_am.to_bytes(), bytes);
+        for n in 0..bytes.len() {
+            assert!(IAm::parse(&bytes[..n]).is_err(), "{n} bytes");
+        }
+        let mut extra = bytes.clone();
+        extra.push(0);
+        assert_eq!(IAm::parse(&extra), Err(Error::TrailingBytes));
+        // Fields of the wrong type or out of range.
+        assert_eq!(IAm::parse(&hex("21 01 22 05C4 91 00 21 0F")), Err(Error::ServiceBody));
+        assert_eq!(IAm::parse(&hex("C4 02000001 22 05C4 91 04 21 0F")), Err(Error::OutOfRange));
+        assert_eq!(IAm::parse(&hex("C4 02000001 22 05C4 91 00 23 010000")), Err(Error::OutOfRange));
+        assert_eq!(IAm::parse(&hex("C4 02000001 25 05 0100000000 91 00 21 0F")), Err(Error::OutOfRange));
+        for s in [Segmentation::Both, Segmentation::Transmit, Segmentation::Receive, Segmentation::NoSegmentation] {
+            assert_eq!(Segmentation::from_code(s.code()), Some(s));
+        }
+    }
+
+    // APDUs, from ASHRAE 135 Annex F.
+
+    #[test]
+    fn read_property_example() {
+        // F.3.5: ReadProperty of Analog Input 5's Present_Value.
+        let req = hex("00 00 01 0C 0C 00000005 19 55");
+        let apdu = Apdu::parse(&req).unwrap();
+        let Apdu::ConfirmedRequest { max_apdu, invoke_id, service, data, segment, .. } = &apdu else { panic!() };
+        assert_eq!((*max_apdu, *invoke_id, *service, *segment), (0, 1, confirmed::READ_PROPERTY, None));
+        assert_eq!(max_apdu_octets(*max_apdu), Some(50));
+        assert_eq!(apdu.to_bytes(), req);
+        // The body: context 0 object identifier, context 1 property 85.
+        let (t, used) = Tag::parse(data).unwrap();
+        assert_eq!(t, Tag { number: 0, class: Class::Context, content: TagContent::Length(4) });
+        assert_eq!(ObjectId::from_u32(u32::from_be_bytes(data[used..used + 4].try_into().unwrap())).instance, 5);
+
+        // The answer: 72.3 between opening and closing tag 3.
+        let ack = hex("30 01 0C 0C 00000005 19 55 3E 44 4290999A 3F");
+        let apdu = Apdu::parse(&ack).unwrap();
+        let Apdu::ComplexAck { invoke_id: 1, segment: None, service: 12, data } = &apdu else { panic!() };
+        assert_eq!(Tag::parse(&data[7..]).unwrap().0.content, TagContent::Opening);
+        assert_eq!(Value::parse(&data[8..]).unwrap(), (Value::Real(72.3), 5));
+        assert_eq!(
+            Tag::parse(&data[13..]).unwrap(),
+            (Tag { number: 3, class: Class::Context, content: TagContent::Closing }, 1)
+        );
+        assert_eq!(apdu.to_bytes(), ack);
+    }
+
+    #[test]
+    fn every_apdu_type() {
+        let seg = Some(Segment { sequence: 2, window: 4, more_follows: true });
+        let cases = [
+            (
+                Apdu::ConfirmedRequest {
+                    segmented_response_accepted: true,
+                    max_segments: 4,
+                    max_apdu: 5,
+                    invoke_id: 9,
+                    segment: seg,
+                    service: confirmed::WRITE_PROPERTY,
+                    data: vec![1, 2],
+                },
+                "0E 45 09 02 04 0F 0102",
+            ),
+            (Apdu::UnconfirmedRequest { service: unconfirmed::WHO_IS, data: vec![] }, "10 08"),
+            (Apdu::SimpleAck { invoke_id: 9, service: 15 }, "20 09 0F"),
+            (Apdu::ComplexAck { invoke_id: 9, segment: seg, service: 12, data: vec![3] }, "3C 09 02 04 0C 03"),
+            (Apdu::SegmentAck { negative: true, server: true, invoke_id: 9, sequence: 2, window: 4 }, "43 09 02 04"),
+            (Apdu::Error { invoke_id: 9, service: 12, data: hex("91 01 91 1F") }, "50 09 0C 91 01 91 1F"),
+            (Apdu::Reject { invoke_id: 9, reason: 4 }, "60 09 04"),
+            (Apdu::Abort { server: true, invoke_id: 9, reason: 5 }, "71 09 05"),
+        ];
+        for (apdu, bytes) in cases {
+            let bytes = hex(bytes);
+            assert_eq!(apdu.to_bytes(), bytes, "{apdu:?}");
+            assert_eq!(Apdu::parse(&bytes), Ok(apdu.clone()));
+            // Every prefix short of the fixed header is refused.
+            let header = bytes.len() - apdu_data_len(&apdu);
+            for n in 0..header {
+                assert_eq!(Apdu::parse(&bytes[..n]), Err(Error::Truncated), "{apdu:?} {n}");
+            }
+        }
+        // Error class and code read as values.
+        let Apdu::Error { data, .. } = Apdu::parse(&hex("50 09 0C 91 01 91 1F")).unwrap() else { panic!() };
+        assert_eq!(Value::parse_all(&data), Ok(vec![Value::Enumerated(1), Value::Enumerated(31)]));
+        assert_eq!(Apdu::parse(&[0x80, 0]), Err(Error::PduType(8)));
+        assert_eq!(Apdu::parse(&[0xf0]), Err(Error::PduType(15)));
+        assert_eq!(Apdu::parse(&hex("20 09 0F 00")), Err(Error::TrailingBytes));
+        assert_eq!(Apdu::parse(&hex("71 09 05 00")), Err(Error::TrailingBytes));
+        assert_eq!(max_segments(0), None);
+        assert_eq!(max_segments(4), Some(16));
+        assert_eq!(max_segments(7), None);
+        assert_eq!(max_apdu_octets(5), Some(1476));
+        assert_eq!(max_apdu_octets(6), None);
+    }
+
+    fn apdu_data_len(a: &Apdu) -> usize {
+        match a {
+            Apdu::ConfirmedRequest { data, .. }
+            | Apdu::UnconfirmedRequest { data, .. }
+            | Apdu::ComplexAck { data, .. }
+            | Apdu::Error { data, .. } => data.len(),
+            _ => 0,
+        }
+    }
+
+    // NPDUs.
+
+    #[test]
+    fn npdu_examples() {
+        // A global broadcast I-Am: destination network 0xFFFF, no address,
+        // hop count 255.
+        let bytes = hex("01 20 FFFF 00 FF 10 00");
+        let npdu = Npdu::parse(&bytes).unwrap();
+        assert_eq!(
+            npdu.destination,
+            Some(Destination { address: NetAddress { network: 0xffff, mac: vec![] }, hop_count: 255 })
+        );
+        assert_eq!(npdu.source, None);
+        assert_eq!(npdu.apdu(), Some(&[0x10, 0x00][..]));
+        assert_eq!(npdu.to_bytes(), bytes);
+
+        // A routed request from MS/TP station 5 on network 2, expecting a
+        // reply at urgent priority.
+        let bytes = hex("01 0D 0002 01 05 00 05 01 0C");
+        let npdu = Npdu::parse(&bytes).unwrap();
+        assert_eq!(npdu.source, Some(NetAddress { network: 2, mac: vec![5] }));
+        assert!(npdu.expecting_reply);
+        assert_eq!(npdu.priority, Priority::Urgent);
+        assert_eq!(npdu.to_bytes(), bytes);
+        // The reply goes back to that station through the router.
+        let reply = npdu.reply(vec![0x20, 0x01, 0x0c]);
+        assert_eq!(reply.to_bytes(), hex("01 21 0002 01 05 FF 20 01 0C"));
+
+        // Both addresses: destination fields, source fields, then the hop
+        // count.
+        let bytes = hex("01 2B 0003 02 AABB 0002 01 05 07 10 08");
+        let npdu = Npdu::parse(&bytes).unwrap();
+        assert_eq!(npdu.destination.as_ref().unwrap().hop_count, 7);
+        assert_eq!(npdu.destination.as_ref().unwrap().address.mac, [0xaa, 0xbb]);
+        assert_eq!(npdu.priority, Priority::LifeSafety);
+        assert_eq!(npdu.to_bytes(), bytes);
+        for n in 0..bytes.len() - 2 {
+            assert!(Npdu::parse(&bytes[..n]).is_err(), "{n} bytes");
+        }
+
+        // A network layer message: Who-Is-Router-To-Network, and a
+        // proprietary one with its vendor.
+        let bytes = hex("01 80 00");
+        let npdu = Npdu::parse(&bytes).unwrap();
+        assert_eq!(npdu.body, NpduBody::Network { message_type: 0, vendor: None, data: vec![] });
+        assert_eq!(npdu.apdu(), None);
+        assert_eq!(npdu.to_bytes(), bytes);
+        let bytes = hex("01 80 80 0104 AA");
+        let npdu = Npdu::parse(&bytes).unwrap();
+        assert_eq!(npdu.body, NpduBody::Network { message_type: 0x80, vendor: Some(260), data: vec![0xaa] });
+        assert_eq!(npdu.to_bytes(), bytes);
+        assert_eq!(Npdu::parse(&hex("01 80 80 01")), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn bad_npdus() {
+        assert_eq!(Npdu::parse(&[]), Err(Error::Truncated));
+        assert_eq!(Npdu::parse(&[1]), Err(Error::Truncated));
+        assert_eq!(Npdu::parse(&[2, 0]), Err(Error::Version(2)));
+        assert_eq!(Npdu::parse(&hex("01 08 0002 00 10 08")), Err(Error::SourceAddress));
+        assert_eq!(Npdu::parse(&hex("01 20 0002 03 0102")), Err(Error::Truncated));
+        // An empty source is left out when written.
+        let n = Npdu { source: Some(NetAddress { network: 2, mac: vec![] }), ..Npdu::local(vec![0x10, 0x08]) };
+        assert_eq!(n.to_bytes(), [1, 0, 0x10, 0x08]);
+        // A long address is cut to 255 bytes.
+        let n = Npdu {
+            destination: Some(Destination { address: NetAddress { network: 1, mac: vec![9; 300] }, hop_count: 1 }),
+            ..Npdu::local(vec![])
+        };
+        let back = Npdu::parse(&n.to_bytes()).unwrap();
+        assert_eq!(back.destination.unwrap().address.mac.len(), MAX_MAC_LEN);
+        // A vendor on a standard message type is not written.
+        let n =
+            Npdu { body: NpduBody::Network { message_type: 1, vendor: Some(5), data: vec![] }, ..Npdu::local(vec![]) };
+        assert_eq!(n.to_bytes(), [1, 0x80, 1]);
+        for p in 0..4 {
+            assert_eq!(Priority::from_bits(p).bits(), p);
+        }
+    }
+
+    // BVLC, from ASHRAE 135 Annex J.
+
+    #[test]
+    fn bvlc_functions() {
+        let a = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 10), PORT);
+        let b = SocketAddrV4::new(Ipv4Addr::new(10, 0, 0, 1), 47809);
+        let cases = [
+            (Bvlc::Result(result::REGISTER_FOREIGN_DEVICE_NAK), "81 00 0006 0030"),
+            (
+                Bvlc::WriteBdt(vec![BdtEntry { address: a, mask: Ipv4Addr::new(255, 255, 255, 255) }]),
+                "81 01 000E C0A8010A BAC0 FFFFFFFF",
+            ),
+            (Bvlc::ReadBdt, "81 02 0004"),
+            (Bvlc::ReadBdtAck(vec![]), "81 03 0004"),
+            (Bvlc::ForwardedNpdu { origin: b, npdu: hex("01 00 10 08") }, "81 04 000E 0A000001 BAC1 01001008"),
+            (Bvlc::RegisterForeignDevice { ttl: 60 }, "81 05 0006 003C"),
+            (Bvlc::ReadFdt, "81 06 0004"),
+            (
+                Bvlc::ReadFdtAck(vec![FdtEntry { address: b, ttl: 60, remaining: 85 }]),
+                "81 07 000E 0A000001 BAC1 003C 0055",
+            ),
+            (Bvlc::DeleteFdtEntry(b), "81 08 000A 0A000001 BAC1"),
+            (Bvlc::DistributeBroadcastToNetwork(hex("01 00 10 08")), "81 09 0008 01001008"),
+            (Bvlc::OriginalUnicastNpdu(hex("01 04 00 05 01 0C")), "81 0A 000A 010400050 10C"),
+            (Bvlc::OriginalBroadcastNpdu(hex("01 00 10 08")), "81 0B 0008 01001008"),
+            (Bvlc::SecureBvll(vec![1, 2, 3]), "81 0C 0007 010203"),
+        ];
+        for (bvlc, bytes) in cases {
+            let bytes = hex(bytes);
+            assert_eq!(bvlc.to_bytes(), bytes, "{bvlc:?}");
+            assert_eq!(Bvlc::parse(&bytes), Ok(bvlc.clone()));
+            for n in 0..bytes.len() {
+                assert!(Bvlc::parse(&bytes[..n]).is_err(), "{bvlc:?} {n}");
+            }
+        }
+        assert_eq!(Bvlc::OriginalUnicastNpdu(vec![1]).npdu(), Some(&[1][..]));
+        assert_eq!(Bvlc::ForwardedNpdu { origin: a, npdu: vec![2] }.npdu(), Some(&[2][..]));
+        assert_eq!(Bvlc::ReadBdt.npdu(), None);
+    }
+
+    #[test]
+    fn bad_bvlc() {
+        assert_eq!(Bvlc::parse(&[0x81, 0x0b, 0]), Err(Error::Truncated));
+        assert_eq!(Bvlc::parse(&hex("82 0B 0004")), Err(Error::NotBacnetIp(0x82)));
+        assert_eq!(Bvlc::parse(&hex("81 0B 0005")), Err(Error::Length(5)));
+        assert_eq!(Bvlc::parse(&hex("81 0B 0003 00")), Err(Error::Length(3)));
+        assert_eq!(Bvlc::parse(&hex("81 0B 0004 00")), Err(Error::Length(4)));
+        assert_eq!(Bvlc::parse(&hex("81 0D 0004")), Err(Error::Function(0x0d)));
+        assert_eq!(Bvlc::parse(&hex("81 00 0005 00")), Err(Error::FunctionData(0)));
+        assert_eq!(Bvlc::parse(&hex("81 01 0005 00")), Err(Error::FunctionData(1)));
+        assert_eq!(Bvlc::parse(&hex("81 02 0005 00")), Err(Error::FunctionData(2)));
+        assert_eq!(Bvlc::parse(&hex("81 04 0009 0A00000 1BA")), Err(Error::FunctionData(4)));
+        assert_eq!(Bvlc::parse(&hex("81 07 0005 00")), Err(Error::FunctionData(7)));
+        assert_eq!(Bvlc::parse(&hex("81 08 0005 00")), Err(Error::FunctionData(8)));
+        let mut long = hex("81 0A FFFF");
+        long.resize(0xffff, 0);
+        assert_eq!(Bvlc::parse(&long), Err(Error::Length(0xffff)));
+        // Writers cut to MAX_MESSAGE, and the reader takes what they write.
+        let big = Bvlc::OriginalUnicastNpdu(vec![0; 70_000]).to_bytes();
+        assert_eq!(big.len(), MAX_MESSAGE);
+        assert!(Bvlc::parse(&big).is_ok());
+        let a = SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT);
+        let big = Bvlc::ForwardedNpdu { origin: a, npdu: vec![0; 70_000] }.to_bytes();
+        assert_eq!(big.len(), MAX_MESSAGE);
+        assert!(Bvlc::parse(&big).is_ok());
+        let entry = FdtEntry { address: a, ttl: 1, remaining: 2 };
+        let big = Bvlc::ReadFdtAck(vec![entry; 7000]).to_bytes();
+        assert!(big.len() <= MAX_MESSAGE);
+        let Ok(Bvlc::ReadFdtAck(back)) = Bvlc::parse(&big) else { panic!() };
+        assert_eq!(back.len(), (MAX_MESSAGE - 4) / 10);
+    }
+
+    #[test]
+    fn errors_display() {
+        let all = [
+            Error::Truncated,
+            Error::TrailingBytes,
+            Error::NotBacnetIp(1),
+            Error::Length(2),
+            Error::Function(3),
+            Error::FunctionData(4),
+            Error::Version(5),
+            Error::SourceAddress,
+            Error::PduType(8),
+            Error::ReservedTag(13),
+            Error::ApplicationOpenClose,
+            Error::ContextTag(2),
+            Error::ValueLength { tag: 4, len: 3 },
+            Error::BitString(9),
+            Error::ServiceBody,
+            Error::OutOfRange,
+        ];
+        for e in all {
+            let s = e.to_string();
+            assert!(!s.is_empty());
+            let _: &dyn std::error::Error = &e;
+        }
+    }
+
+    #[test]
+    fn context_tagged_values() {
+        // ReadProperty's request body, written and read field by field.
+        let ai5 = ObjectId { object_type: object_type::ANALOG_INPUT, instance: 5 };
+        let mut body = Vec::new();
+        Value::ObjectId(ai5).write_context(0, &mut body);
+        Value::Enumerated(85).write_context(1, &mut body);
+        assert_eq!(body, hex("0C 00000005 19 55"));
+        let (id, used) = Value::parse_context(&body, 0, tag::OBJECT_IDENTIFIER).unwrap();
+        assert_eq!(id, Value::ObjectId(ai5));
+        assert_eq!(Value::parse_context(&body[used..], 1, tag::ENUMERATED), Ok((Value::Enumerated(85), 2)));
+        // A context Boolean holds one byte (Clause 20.2.3).
+        assert_eq!(Value::Boolean(true).to_bytes(), [0x11]);
+        let mut out = Vec::new();
+        Value::Boolean(true).write_context(2, &mut out);
+        assert_eq!(out, [0x29, 0x01]);
+        assert_eq!(Value::parse_context(&out, 2, tag::BOOLEAN), Ok((Value::Boolean(true), 2)));
+        assert_eq!(Value::parse_context(&[0x29, 0x02], 2, tag::BOOLEAN), Err(Error::OutOfRange));
+        assert_eq!(Value::parse_context(&[0x28], 2, tag::BOOLEAN), Err(Error::ValueLength { tag: 1, len: 0 }));
+        // The wrong number, an application tag, an opening tag, a reserved type.
+        assert_eq!(Value::parse_context(&[0x19, 0x55], 0, tag::ENUMERATED), Err(Error::ServiceBody));
+        assert_eq!(Value::parse_context(&[0x91, 0x55], 9, tag::ENUMERATED), Err(Error::ServiceBody));
+        assert_eq!(Value::parse_context(&[0x3e], 3, tag::NULL), Err(Error::ServiceBody));
+        assert_eq!(Value::parse_context(&[0x19, 0x55], 1, 13), Err(Error::ReservedTag(13)));
+        assert_eq!(Value::parse_context(&[0x1a, 0x55], 1, tag::ENUMERATED), Err(Error::Truncated));
+        assert_eq!(Value::parse_context(&[], 1, tag::ENUMERATED), Err(Error::Truncated));
+        // Extended context tag numbers.
+        let mut out = Vec::new();
+        Value::Unsigned(300).write_context(40, &mut out);
+        assert_eq!(out, hex("FA 28 012C"));
+        assert_eq!(Value::parse_context(&out, 40, tag::UNSIGNED), Ok((Value::Unsigned(300), 4)));
+        // Who-Is writes its limits the same way.
+        assert_eq!(WhoIs { range: Some((3, 300)) }.to_bytes(), hex("09 03 1A 012C"));
+    }
+
+    #[test]
+    fn apdu_accessors() {
+        let req = Apdu::parse(&hex("00 05 07 0C 0C 00000005 19 55")).unwrap();
+        assert_eq!((req.invoke_id(), req.service()), (Some(7), Some(confirmed::READ_PROPERTY)));
+        assert_eq!(req.data(), Some(&hex("0C 00000005 19 55")[..]));
+        // Answer with the request's invoke ID and service.
+        let ack = Apdu::SimpleAck { invoke_id: req.invoke_id().unwrap(), service: req.service().unwrap() };
+        assert_eq!(ack.to_bytes(), [0x20, 7, 12]);
+        assert_eq!(ack.data(), None);
+        let who = WhoIs { range: None }.to_apdu();
+        assert_eq!((who.invoke_id(), who.service(), who.data()), (None, Some(unconfirmed::WHO_IS), Some(&[][..])));
+        let abort = Apdu::Abort { server: true, invoke_id: 3, reason: 4 };
+        assert_eq!((abort.invoke_id(), abort.service()), (Some(3), None));
+        let r = Apdu::Reject { invoke_id: 2, reason: 1 };
+        assert_eq!((r.invoke_id(), r.service(), r.data()), (Some(2), None, None));
+    }
+
+    #[test]
+    fn module_doc_example() {
+        // The example at the top of this file, run here as well.
+        let datagram = [0x81, 0x0b, 0x00, 0x08, 0x01, 0x00, 0x10, 0x08];
+        let bvlc = Bvlc::parse(&datagram).unwrap();
+        let npdu = Npdu::parse(bvlc.npdu().unwrap()).unwrap();
+        let apdu = Apdu::parse(npdu.apdu().unwrap()).unwrap();
+        let Apdu::UnconfirmedRequest { service, data } = &apdu else { panic!("not unconfirmed") };
+        assert_eq!(*service, unconfirmed::WHO_IS);
+        assert!(WhoIs::parse(data).unwrap().matches(1234));
+        let i_am = IAm {
+            device: ObjectId::device(1234),
+            max_apdu: 1476,
+            segmentation: Segmentation::NoSegmentation,
+            vendor: 260,
+        };
+        let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().to_bytes()).to_bytes());
+        assert_eq!(reply.to_bytes(), hex("810B0015 0100 1000 C4020004D2 2205C4 9103 220104"));
+    }
+
+    // Random input.
+
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u8 {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as u8
+        }
+
+        fn bytes(&mut self, max: usize) -> Vec<u8> {
+            let n = usize::from(self.next()) % (max + 1);
+            (0..n).map(|_| self.next()).collect()
+        }
+    }
+
+    /// Reads `b` every way this module can, checking that what reads also
+    /// writes and reads back the same.
+    fn check(b: &[u8]) {
+        if let Ok(v) = Bvlc::parse(b) {
+            assert_eq!(v.to_bytes(), b);
+        }
+        if let Ok(n) = Npdu::parse(b) {
+            assert_eq!(Npdu::parse(&n.to_bytes()), Ok(n));
+        }
+        if let Ok(a) = Apdu::parse(b) {
+            assert_eq!(Apdu::parse(&a.to_bytes()), Ok(a));
+        }
+        if let Ok(values) = Value::parse_all(b) {
+            let mut once = Vec::new();
+            values.iter().for_each(|v| v.write(&mut once));
+            let again = Value::parse_all(&once).unwrap();
+            let mut twice = Vec::new();
+            again.iter().for_each(|v| v.write(&mut twice));
+            assert_eq!(once, twice);
+        }
+        if let Ok((t, used)) = Tag::parse(b) {
+            assert!(used <= b.len());
+            let mut out = Vec::new();
+            t.write(&mut out);
+            assert_eq!(Tag::parse(&out), Ok((t, out.len())));
+        }
+        if let Ok(w) = WhoIs::parse(b) {
+            assert_eq!(WhoIs::parse(&w.to_bytes()), Ok(w));
+        }
+        if let Ok(i) = IAm::parse(b) {
+            assert_eq!(IAm::parse(&i.to_bytes()), Ok(i));
+        }
+        if let Ok((t, _)) = Tag::parse(b) {
+            for as_tag in 0..=tag::OBJECT_IDENTIFIER {
+                if let Ok((v, used)) = Value::parse_context(b, t.number, as_tag) {
+                    assert!(used <= b.len());
+                    let mut once = Vec::new();
+                    v.write_context(t.number, &mut once);
+                    let (again, n) = Value::parse_context(&once, t.number, as_tag).unwrap();
+                    assert_eq!(n, once.len());
+                    let mut twice = Vec::new();
+                    again.write_context(t.number, &mut twice);
+                    assert_eq!(once, twice);
+                }
+            }
+        }
+    }
+
+    /// Feeds `b` to every reader one byte at a time: each prefix in turn,
+    /// as a datagram arriving short would be.
+    fn check_prefixes(b: &[u8]) {
+        for n in 0..=b.len() {
+            check(&b[..n]);
+        }
+    }
+
+    #[test]
+    fn random_bytes_never_panic() {
+        let mut rng = Lcg(0x5eed);
+        for _ in 0..4000 {
+            let b = rng.bytes(64);
+            check(&b);
+            // The same bytes behind a valid BVLC and NPDU header.
+            let mut d = vec![0x81, 0x0a, 0, 0, 0x01, b.first().copied().unwrap_or(0) & 0x2f];
+            d.extend_from_slice(&b);
+            let len = d.len() as u16;
+            d[2..4].copy_from_slice(&len.to_be_bytes());
+            check(&d);
+            if let Ok(bvlc) = Bvlc::parse(&d) {
+                let _ = bvlc.npdu().map(Npdu::parse);
+            }
+        }
+        // Small values from a valid tag nibble, to reach every value type,
+        // and the same as context tags.
+        for _ in 0..4000 {
+            let mut b = rng.bytes(12);
+            if let Some(first) = b.first_mut() {
+                *first &= 0xc7;
+            }
+            check(&b);
+            if let Some(first) = b.first_mut() {
+                *first |= 0x08;
+            }
+            check(&b);
+        }
+    }
+
+    #[test]
+    fn decoders_fed_one_byte_at_a_time() {
+        let mut rng = Lcg(0xb4c0);
+        for _ in 0..300 {
+            // Random bytes, each prefix in turn.
+            check_prefixes(&rng.bytes(40));
+            // A valid datagram: BVLC, a routed NPDU, a confirmed request
+            // with a random body. No prefix is a whole datagram, and every
+            // prefix of the NPDU and APDU reads or fails without a panic.
+            let r = rng.next();
+            let segment =
+                (r & 1 != 0).then(|| Segment { sequence: rng.next(), window: rng.next(), more_follows: r & 2 != 0 });
+            let apdu = Apdu::ConfirmedRequest {
+                segmented_response_accepted: r & 4 != 0,
+                max_segments: r % 8,
+                max_apdu: r % 16,
+                invoke_id: rng.next(),
+                segment,
+                service: rng.next(),
+                data: rng.bytes(20),
+            };
+            let source = NetAddress { network: u16::from(rng.next()), mac: rng.bytes(6) };
+            let npdu = Npdu {
+                destination: (r & 8 != 0).then(|| Destination {
+                    address: NetAddress { network: 0xffff, mac: rng.bytes(3) },
+                    hop_count: rng.next(),
+                }),
+                source: (!source.mac.is_empty()).then_some(source),
+                expecting_reply: true,
+                priority: Priority::from_bits(r >> 4),
+                body: NpduBody::Apdu(apdu.to_bytes()),
+            };
+            let bvlc = Bvlc::OriginalUnicastNpdu(npdu.to_bytes());
+            let bytes = bvlc.to_bytes();
+            assert_eq!(Bvlc::parse(&bytes), Ok(bvlc));
+            check_prefixes(&bytes);
+            for n in 0..bytes.len() {
+                assert!(Bvlc::parse(&bytes[..n]).is_err(), "{n} of {bytes:02x?}");
+            }
+            let nb = npdu.to_bytes();
+            assert_eq!(Npdu::parse(&nb), Ok(npdu.clone()));
+            check_prefixes(&nb);
+            let ab = apdu.to_bytes();
+            assert_eq!(Apdu::parse(&ab), Ok(apdu));
+            check_prefixes(&ab);
+            // Values, application and context tagged, one byte at a time.
+            let i_am = IAm {
+                device: ObjectId::from_u32(u32::from_be_bytes([rng.next(), rng.next(), rng.next(), rng.next()])),
+                max_apdu: u32::from(rng.next()) << 4,
+                segmentation: Segmentation::from_code(u32::from(r % 4)).unwrap(),
+                vendor: u16::from(rng.next()),
+            };
+            let ib = i_am.to_bytes();
+            check_prefixes(&ib);
+            for n in 0..ib.len() {
+                assert!(IAm::parse(&ib[..n]).is_err());
+            }
+            let mut ctx = Vec::new();
+            Value::Unsigned(u64::from(rng.next()) << (r % 56)).write_context(r % 40, &mut ctx);
+            check_prefixes(&ctx);
+            for n in 0..ctx.len() {
+                assert!(Value::parse_context(&ctx[..n], r % 40, tag::UNSIGNED).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn random_values_round_trip() {
+        let mut rng = Lcg(42);
+        for _ in 0..3000 {
+            let r = rng.next();
+            let mut wide = [0u8; 8];
+            wide.iter_mut().for_each(|w| *w = rng.next());
+            let n = u64::from_be_bytes(wide) >> (r % 64);
+            let v = match r % 13 {
+                0 => Value::Null,
+                1 => Value::Boolean(r & 0x10 != 0),
+                2 => Value::Unsigned(n),
+                3 => Value::Signed(n as i64),
+                4 => Value::Real(f32::from_bits(n as u32)),
+                5 => Value::Double(f64::from_bits(n)),
+                6 => Value::OctetString(rng.bytes(300)),
+                7 => Value::CharacterString(CharString { charset: r % 6, bytes: rng.bytes(40) }),
+                8 => Value::BitString(rng.bytes(30).iter().map(|b| b & 1 == 1).collect()),
+                9 => Value::Enumerated(n as u32),
+                10 => Value::Date(Date { year: wide[0], month: wide[1], day: wide[2], weekday: wide[3] }),
+                11 => Value::Time(Time { hour: wide[0], minute: wide[1], second: wide[2], hundredths: wide[3] }),
+                _ => Value::ObjectId(ObjectId::from_u32(n as u32)),
+            };
+            let bytes = v.to_bytes();
+            let (back, used) = Value::parse(&bytes).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(back.to_bytes(), bytes);
+            if !matches!(v, Value::Real(_) | Value::Double(_)) {
+                assert_eq!(back, v);
+            }
+            for k in 0..bytes.len() {
+                assert!(Value::parse(&bytes[..k]).is_err(), "{v:?} {k}");
+            }
+            // The same value under a context tag.
+            let number = rng.next();
+            let mut ctx = Vec::new();
+            v.write_context(number, &mut ctx);
+            let (back, used) = Value::parse_context(&ctx, number.min(254), v.tag()).unwrap();
+            assert_eq!(used, ctx.len());
+            let mut again = Vec::new();
+            back.write_context(number, &mut again);
+            assert_eq!(again, ctx);
+            if !matches!(v, Value::Real(_) | Value::Double(_)) {
+                assert_eq!(back, v);
+            }
+        }
+    }
+}

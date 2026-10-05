@@ -1,0 +1,10 @@
+v=0
+o=1 0 00 7 - v
+s= f000
+e=0s$&:$= b000
+e=$+&:0$0 b$&:$= b000
+e=$&:0$0 b000
+e=$&80TTT$TTTTTTTTTTTTTTTT-0001
+e=TTTTTTTTTTTT-0001
+e=$&0uuuu5:5
+t=15 0

@@ -1,0 +1,2432 @@
+//! Syslog: reading and writing log messages in the formats of RFC 5424 and
+//! RFC 3164, and splitting a TCP stream of them per RFC 6587, with no I/O.
+//!
+//! Syslog is how Unix machines, routers, firewalls and most appliances send
+//! their logs to a collector. Every message starts with a priority in angle
+//! brackets, such as `<34>`, which packs two numbers: the facility (which
+//! part of the system logged it) and the severity (how bad it is). What
+//! follows comes in two formats:
+//!
+//! - RFC 5424, the current one: a version, an ISO 8601 timestamp, the host,
+//!   application, process and message type, then structured data (named
+//!   elements of name and value pairs), then free text. [`Message`] reads
+//!   and writes it.
+//! - RFC 3164, the older "BSD" format most devices still send: a timestamp
+//!   such as `Oct 11 22:14:15` with no year, the host, a tag naming the
+//!   program, and free text. [`BsdMessage`] reads and writes it.
+//!
+//! [`Entry::parse`] reads either, telling them apart by the version number
+//! that only RFC 5424 has.
+//!
+//! Over UDP, usually to port 514, each datagram holds one message. Over TCP
+//! (RFC 6587) messages are framed one of two ways: octet counting, where a
+//! decimal length and a space come before each message, or non-transparent
+//! framing, where a newline ends each one. A [`Decoder`] splits a stream
+//! framed either way, and tells them apart frame by frame, as RFC 6587
+//! suggests receivers do.
+//!
+//! Nothing here reads a socket. A world that plays a log collector feeds
+//! the bytes it reads from a TCP connection to a
+//! [`Decoder`], gets [`Frame`]s back, and reads each one with
+//! [`Entry::parse`]. Every reader checks lengths and characters, because
+//! the agent can send any bytes it likes, and no message may be longer
+//! than [`MAX_MESSAGE_LEN`]; a [`Decoder`] cuts longer ones. Every writer produces bytes its reader
+//! accepts. Fields it cannot write as given are changed in ways each
+//! writer's documentation lists.
+//!
+//! ```
+//! use fictionet::stdlib::syslog::{
+//!     Decoder, Entry, Facility, Frame, Framing, Message, Priority, SdElement, Severity,
+//! };
+//!
+//! // A world playing an application writes a message.
+//! let mut message = Message::new(Priority::new(Facility::Auth, Severity::Critical));
+//! message.hostname = Some("mymachine.example.com".into());
+//! message.app_name = Some("su".into());
+//! message.msg_id = Some("ID47".into());
+//! message.structured_data.push(SdElement::new("origin").param("ip", "192.0.2.1"));
+//! message.msg = b"'su root' failed".to_vec();
+//! let bytes = message.to_bytes();
+//! assert_eq!(
+//!     bytes,
+//!     b"<34>1 - mymachine.example.com su - ID47 [origin ip=\"192.0.2.1\"] 'su root' failed"
+//! );
+//!
+//! // A world playing a collector reads it from a TCP stream, framed both
+//! // ways, and an old BSD-style message after it.
+//! let mut decoder = Decoder::new();
+//! decoder.feed(&Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes());
+//! decoder.feed(&Frame::new(Framing::NonTransparent, bytes).to_bytes());
+//! decoder.feed(b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n");
+//! let mut got = Vec::new();
+//! while let Some(frame) = decoder.next_frame() {
+//!     got.push(Entry::parse(&frame.unwrap().message).unwrap());
+//! }
+//! assert_eq!(got.len(), 3);
+//! assert_eq!(got[0], Entry::Rfc5424(message));
+//! let Entry::Bsd(bsd) = &got[2] else { panic!("not a BSD message") };
+//! assert_eq!(bsd.priority.facility, Facility::User);
+//! assert_eq!(bsd.priority.severity, Severity::Notice);
+//! assert_eq!(bsd.tag.as_deref(), Some("sshd"));
+//! assert_eq!(bsd.pid.as_deref(), Some("42"));
+//! assert_eq!(bsd.content, b"Accepted publickey");
+//! ```
+
+use std::borrow::Cow;
+
+/// The UDP port syslog collectors listen on (RFC 5426). Plain TCP syslog
+/// has no assigned port and most collectors use 514 for it too.
+pub const UDP_PORT: u16 = 514;
+/// The TCP port for syslog over TLS (RFC 5425).
+pub const TLS_PORT: u16 = 6514;
+/// The longest message any reader here accepts, and any writer produces.
+/// RFC 5424 asks receivers to take at least 2048 bytes and lets them take
+/// more. This allows the long messages real senders produce while keeping
+/// a decoder's buffer bounded.
+pub const MAX_MESSAGE_LEN: usize = 65_536;
+/// The largest priority value: facility 23, severity 7.
+pub const MAX_PRIVAL: u8 = 191;
+/// The largest RFC 5424 version number: three digits.
+pub const MAX_VERSION: u16 = 999;
+/// The version of RFC 5424 itself, which writers use by default.
+pub const VERSION: u16 = 1;
+/// The longest RFC 5424 host name. RFC 3164 sets no limit, and its reader
+/// here uses the same one.
+pub const MAX_HOSTNAME: usize = 255;
+/// The longest RFC 5424 application name.
+pub const MAX_APP_NAME: usize = 48;
+/// The longest RFC 5424 process identifier.
+pub const MAX_PROCID: usize = 128;
+/// The longest RFC 5424 message type identifier.
+pub const MAX_MSGID: usize = 32;
+/// The longest structured data element ID or parameter name.
+pub const MAX_SD_NAME: usize = 32;
+/// The most structured data elements one message may hold here.
+pub const MAX_SD_ELEMENTS: usize = 256;
+/// The most parameters one structured data element may hold here.
+pub const MAX_SD_PARAMS: usize = 256;
+/// The longest RFC 3164 tag (the program name).
+pub const MAX_TAG: usize = 32;
+/// The longest RFC 3164 process ID, in the brackets after the tag.
+pub const MAX_PID: usize = 128;
+/// The byte order mark that starts an RFC 5424 message's text when it is
+/// UTF-8.
+pub const BOM: [u8; 3] = [0xef, 0xbb, 0xbf];
+/// The RFC 5424 nil value: a field that is not given is written as this.
+pub const NILVALUE: &str = "-";
+
+/// Which part of the system logged a message: the high bits of the
+/// priority value. The names are the ones syslog configuration files use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Facility {
+    /// 0, `kern`: kernel messages.
+    Kern,
+    /// 1, `user`: user-level messages.
+    User,
+    /// 2, `mail`: the mail system.
+    Mail,
+    /// 3, `daemon`: system daemons.
+    Daemon,
+    /// 4, `auth`: security and authorization messages.
+    Auth,
+    /// 5, `syslog`: messages the syslog daemon generates itself.
+    Syslog,
+    /// 6, `lpr`: the line printer subsystem.
+    Lpr,
+    /// 7, `news`: the network news subsystem.
+    News,
+    /// 8, `uucp`: the UUCP subsystem.
+    Uucp,
+    /// 9, `cron`: the clock daemon.
+    Cron,
+    /// 10, `authpriv`: private security and authorization messages.
+    Authpriv,
+    /// 11, `ftp`: the FTP daemon.
+    Ftp,
+    /// 12, `ntp`: the NTP subsystem.
+    Ntp,
+    /// 13, `audit`: log audit.
+    Audit,
+    /// 14, `alert`: log alert.
+    Alert,
+    /// 15, `clock`: the second clock daemon.
+    Clock,
+    /// 16, `local0`: local use.
+    Local0,
+    /// 17, `local1`: local use.
+    Local1,
+    /// 18, `local2`: local use.
+    Local2,
+    /// 19, `local3`: local use.
+    Local3,
+    /// 20, `local4`: local use.
+    Local4,
+    /// 21, `local5`: local use.
+    Local5,
+    /// 22, `local6`: local use.
+    Local6,
+    /// 23, `local7`: local use.
+    Local7,
+}
+
+const FACILITIES: [(Facility, &str); 24] = [
+    (Facility::Kern, "kern"),
+    (Facility::User, "user"),
+    (Facility::Mail, "mail"),
+    (Facility::Daemon, "daemon"),
+    (Facility::Auth, "auth"),
+    (Facility::Syslog, "syslog"),
+    (Facility::Lpr, "lpr"),
+    (Facility::News, "news"),
+    (Facility::Uucp, "uucp"),
+    (Facility::Cron, "cron"),
+    (Facility::Authpriv, "authpriv"),
+    (Facility::Ftp, "ftp"),
+    (Facility::Ntp, "ntp"),
+    (Facility::Audit, "audit"),
+    (Facility::Alert, "alert"),
+    (Facility::Clock, "clock"),
+    (Facility::Local0, "local0"),
+    (Facility::Local1, "local1"),
+    (Facility::Local2, "local2"),
+    (Facility::Local3, "local3"),
+    (Facility::Local4, "local4"),
+    (Facility::Local5, "local5"),
+    (Facility::Local6, "local6"),
+    (Facility::Local7, "local7"),
+];
+
+impl Facility {
+    /// The facility's number, 0 to 23.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The facility numbered `code`, if there is one.
+    pub fn from_code(code: u8) -> Option<Facility> {
+        FACILITIES.get(usize::from(code)).map(|&(f, _)| f)
+    }
+
+    /// The facility's name, such as `auth` or `local4`.
+    pub fn name(self) -> &'static str {
+        FACILITIES[usize::from(self.code())].1
+    }
+
+    /// The facility called `name`, ignoring case.
+    pub fn from_name(name: &str) -> Option<Facility> {
+        FACILITIES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|&(f, _)| f)
+    }
+}
+
+impl std::fmt::Display for Facility {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// How bad a message is: the low three bits of the priority value. Lower
+/// numbers are worse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Severity {
+    /// 0, `emerg`: the system is unusable.
+    Emergency,
+    /// 1, `alert`: action must be taken at once.
+    Alert,
+    /// 2, `crit`: critical conditions.
+    Critical,
+    /// 3, `err`: error conditions.
+    Error,
+    /// 4, `warning`: warning conditions.
+    Warning,
+    /// 5, `notice`: normal but significant conditions.
+    Notice,
+    /// 6, `info`: informational messages.
+    Informational,
+    /// 7, `debug`: debug-level messages.
+    Debug,
+}
+
+const SEVERITIES: [(Severity, &str); 8] = [
+    (Severity::Emergency, "emerg"),
+    (Severity::Alert, "alert"),
+    (Severity::Critical, "crit"),
+    (Severity::Error, "err"),
+    (Severity::Warning, "warning"),
+    (Severity::Notice, "notice"),
+    (Severity::Informational, "info"),
+    (Severity::Debug, "debug"),
+];
+
+impl Severity {
+    /// The severity's number, 0 to 7.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+
+    /// The severity numbered `code`, if there is one.
+    pub fn from_code(code: u8) -> Option<Severity> {
+        SEVERITIES.get(usize::from(code)).map(|&(s, _)| s)
+    }
+
+    /// The severity's name, such as `crit` or `info`.
+    pub fn name(self) -> &'static str {
+        SEVERITIES[usize::from(self.code())].1
+    }
+
+    /// The severity called `name`, ignoring case. The older spellings
+    /// `panic`, `error` and `warn` are read too.
+    pub fn from_name(name: &str) -> Option<Severity> {
+        let alias = [("panic", Severity::Emergency), ("error", Severity::Error), ("warn", Severity::Warning)];
+        if let Some(&(_, s)) = alias.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+            return Some(s);
+        }
+        SEVERITIES.iter().find(|(_, n)| n.eq_ignore_ascii_case(name)).map(|&(s, _)| s)
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A message's priority: its facility and severity. On the wire it is one
+/// number, the facility times 8 plus the severity, in angle brackets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Priority {
+    /// Which part of the system logged the message.
+    pub facility: Facility,
+    /// How bad it is.
+    pub severity: Severity,
+}
+
+impl Priority {
+    /// The priority with this facility and severity.
+    pub fn new(facility: Facility, severity: Severity) -> Priority {
+        Priority { facility, severity }
+    }
+
+    /// The priority value: the facility times 8 plus the severity.
+    pub fn value(self) -> u8 {
+        self.facility.code() * 8 + self.severity.code()
+    }
+
+    /// The priority with value `v`, if `v` is at most [`MAX_PRIVAL`].
+    pub fn from_value(v: u8) -> Option<Priority> {
+        Some(Priority { facility: Facility::from_code(v / 8)?, severity: Severity::from_code(v % 8)? })
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.facility, self.severity)
+    }
+}
+
+/// The fraction of a second in an RFC 5424 timestamp, kept as written so
+/// that `.5` and `.500` stay apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Fraction {
+    /// The digits after the point, as a number: 3 for `.003`.
+    pub value: u32,
+    /// How many digits there are, 1 to 6.
+    pub digits: u8,
+}
+
+impl Fraction {
+    /// The fraction in microseconds.
+    pub fn micros(self) -> u32 {
+        let digits = self.digits.clamp(1, 6);
+        self.value.min(10u32.pow(u32::from(digits)) - 1) * 10u32.pow(6 - u32::from(digits))
+    }
+}
+
+/// The offset of an RFC 5424 timestamp from UTC.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Offset {
+    /// Written `Z`.
+    Utc,
+    /// Written `+hh:mm` or `-hh:mm`, as minutes east of UTC. `-00:00`
+    /// reads as `Minutes(0)` and is written `+00:00`.
+    Minutes(i16),
+}
+
+/// The largest offset from UTC, in minutes: 23 hours 59 minutes.
+pub const MAX_OFFSET_MINUTES: i16 = 23 * 60 + 59;
+
+/// An RFC 5424 timestamp: an RFC 3339 date and time, such as
+/// `2003-10-11T22:14:15.003Z`. Readers check every field's range,
+/// including the day against the month and leap years. Leap seconds
+/// (second 60) are not allowed, as RFC 5424 says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Timestamp {
+    /// The year, 0 to 9999.
+    pub year: u16,
+    /// The month, 1 to 12.
+    pub month: u8,
+    /// The day of the month, from 1.
+    pub day: u8,
+    /// The hour, 0 to 23.
+    pub hour: u8,
+    /// The minute, 0 to 59.
+    pub minute: u8,
+    /// The second, 0 to 59.
+    pub second: u8,
+    /// The fraction of a second, if one is written.
+    pub fraction: Option<Fraction>,
+    /// The offset from UTC.
+    pub offset: Offset,
+}
+
+impl Timestamp {
+    /// Reads a timestamp such as `2003-08-24T05:14:15.000003-07:00`. The
+    /// `T` and `Z` must be upper case.
+    pub fn parse(t: &[u8]) -> Option<Timestamp> {
+        let year = num(t, 0, 4)? as u16;
+        expect(t, 4, b'-')?;
+        let month = num(t, 5, 2)? as u8;
+        expect(t, 7, b'-')?;
+        let day = num(t, 8, 2)? as u8;
+        expect(t, 10, b'T')?;
+        let hour = num(t, 11, 2)? as u8;
+        expect(t, 13, b':')?;
+        let minute = num(t, 14, 2)? as u8;
+        expect(t, 16, b':')?;
+        let second = num(t, 17, 2)? as u8;
+        let mut i = 19;
+        let mut fraction = None;
+        if t.get(i) == Some(&b'.') {
+            let digits = t.get(i + 1..)?.iter().take_while(|b| b.is_ascii_digit()).count();
+            if digits == 0 || digits > 6 {
+                return None;
+            }
+            fraction = Some(Fraction { value: num(t, i + 1, digits)?, digits: digits as u8 });
+            i += 1 + digits;
+        }
+        let offset = match t.get(i)? {
+            b'Z' => {
+                i += 1;
+                Offset::Utc
+            }
+            &sign @ (b'+' | b'-') => {
+                let oh = num(t, i + 1, 2)?;
+                expect(t, i + 3, b':')?;
+                let om = num(t, i + 4, 2)?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                i += 6;
+                let m = (oh * 60 + om) as i16;
+                Offset::Minutes(if sign == b'-' { -m } else { m })
+            }
+            _ => return None,
+        };
+        if i != t.len() {
+            return None;
+        }
+        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+            return None;
+        }
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(Timestamp { year, month, day, hour, minute, second, fraction, offset })
+    }
+
+    /// The timestamp as RFC 5424 writes it. A field out of range is
+    /// clamped to the nearest value in range, so the result always reads
+    /// back.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let year = self.year.min(9999);
+        let month = self.month.clamp(1, 12);
+        let day = self.day.clamp(1, days_in_month(year, month));
+        let mut s = format!(
+            "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}",
+            self.hour.min(23),
+            self.minute.min(59),
+            self.second.min(59)
+        );
+        if let Some(fr) = self.fraction {
+            let digits = fr.digits.clamp(1, 6);
+            let value = fr.value.min(10u32.pow(u32::from(digits)) - 1);
+            s.push_str(&format!(".{value:0width$}", width = usize::from(digits)));
+        }
+        match self.offset {
+            Offset::Utc => s.push('Z'),
+            Offset::Minutes(m) => {
+                let m = m.clamp(-MAX_OFFSET_MINUTES, MAX_OFFSET_MINUTES);
+                let sign = if m < 0 { '-' } else { '+' };
+                let a = m.unsigned_abs();
+                s.push_str(&format!("{sign}{:02}:{:02}", a / 60, a % 60));
+            }
+        }
+        s.into_bytes()
+    }
+}
+
+/// One parameter of a structured data element: a name and a value.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SdParam {
+    /// The parameter's name, 1 to [`MAX_SD_NAME`] printable ASCII
+    /// characters other than `=`, space, `]` and `"`.
+    pub name: String,
+    /// The value, any UTF-8 text. On the wire `"`, `\` and `]` are
+    /// escaped with a backslash; this holds the text unescaped.
+    pub value: String,
+}
+
+/// A structured data element: an ID, such as `timeQuality` or
+/// `exampleSDID@32473`, and its parameters. IDs without an `@` are the
+/// ones IANA registers. An ID with one is a name, an `@` and a private
+/// enterprise number, which is decimal and may have parts split by
+/// periods (`32473.1.2`). A parameter name may repeat within an element.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SdElement {
+    /// The element's ID. The same ID may appear only once in a message.
+    pub id: String,
+    /// The parameters, in the order written.
+    pub params: Vec<SdParam>,
+}
+
+impl SdElement {
+    /// An element with this ID and no parameters.
+    pub fn new(id: impl Into<String>) -> SdElement {
+        SdElement { id: id.into(), params: Vec::new() }
+    }
+
+    /// The element with one more parameter.
+    pub fn param(mut self, name: impl Into<String>, value: impl Into<String>) -> SdElement {
+        self.params.push(SdParam { name: name.into(), value: value.into() });
+        self
+    }
+
+    /// The value of the first parameter called `name`.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.params.iter().find(|p| p.name == name).map(|p| p.value.as_str())
+    }
+}
+
+/// An RFC 5424 message. Header fields that are `None` are the nil value,
+/// written `-`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Message {
+    /// The facility and severity.
+    pub priority: Priority,
+    /// The format version, 1 to [`MAX_VERSION`]. RFC 5424 is version 1.
+    pub version: u16,
+    /// When the message was made.
+    pub timestamp: Option<Timestamp>,
+    /// The machine that made it: a name or an address, up to
+    /// [`MAX_HOSTNAME`] printable ASCII characters.
+    pub hostname: Option<String>,
+    /// The program that made it, up to [`MAX_APP_NAME`] characters.
+    pub app_name: Option<String>,
+    /// The process that made it, up to [`MAX_PROCID`] characters.
+    pub proc_id: Option<String>,
+    /// The type of message, up to [`MAX_MSGID`] characters.
+    pub msg_id: Option<String>,
+    /// The structured data elements. Empty is the nil value.
+    pub structured_data: Vec<SdElement>,
+    /// Whether the text starts with a byte order mark, which says it is
+    /// UTF-8. When it does, `msg` holds the text after the mark and is
+    /// valid UTF-8.
+    pub bom: bool,
+    /// The free-form text, which may be any bytes when `bom` is false.
+    pub msg: Vec<u8>,
+}
+
+/// Why bytes are not a syslog message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ParseError {
+    /// The bytes are longer than [`MAX_MESSAGE_LEN`].
+    TooLong(usize),
+    /// The priority is missing, is not 1 to 3 digits in angle brackets,
+    /// has a leading zero, or is above [`MAX_PRIVAL`].
+    Priority,
+    /// The version is not 1 to 3 digits starting with a nonzero one.
+    Version,
+    /// The bytes end before the header does.
+    Truncated,
+    /// The timestamp is not a valid RFC 5424 timestamp.
+    Timestamp,
+    /// The host name is too long or holds a character other than
+    /// printable ASCII.
+    Hostname,
+    /// The application name is too long or holds a bad character.
+    AppName,
+    /// The process ID is too long or holds a bad character.
+    ProcId,
+    /// The message ID is too long or holds a bad character.
+    MsgId,
+    /// The structured data is malformed: a bad element ID or parameter
+    /// name (an ID with an `@` must be a name, one `@` and a private
+    /// enterprise number), a missing quote, `=` or `]`, an unescaped `]` in a value,
+    /// a value that is not UTF-8, too many elements or parameters, or
+    /// something other than a space after it.
+    StructuredData,
+    /// Two structured data elements have the same ID.
+    DuplicateSdId,
+    /// The text starts with a byte order mark but is not UTF-8.
+    Utf8,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseError::TooLong(n) => write!(f, "message of {n} bytes, over the limit of {MAX_MESSAGE_LEN}"),
+            ParseError::Priority => f.write_str("missing or malformed priority"),
+            ParseError::Version => f.write_str("malformed version"),
+            ParseError::Truncated => f.write_str("message ends inside its header"),
+            ParseError::Timestamp => f.write_str("malformed timestamp"),
+            ParseError::Hostname => f.write_str("malformed host name"),
+            ParseError::AppName => f.write_str("malformed application name"),
+            ParseError::ProcId => f.write_str("malformed process ID"),
+            ParseError::MsgId => f.write_str("malformed message ID"),
+            ParseError::StructuredData => f.write_str("malformed structured data"),
+            ParseError::DuplicateSdId => f.write_str("structured data element ID used twice"),
+            ParseError::Utf8 => f.write_str("text marked as UTF-8 is not UTF-8"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+impl Message {
+    /// A version 1 message with this priority, every header field nil, no
+    /// structured data and no text.
+    pub fn new(priority: Priority) -> Message {
+        Message {
+            priority,
+            version: VERSION,
+            timestamp: None,
+            hostname: None,
+            app_name: None,
+            proc_id: None,
+            msg_id: None,
+            structured_data: Vec::new(),
+            bom: false,
+            msg: Vec::new(),
+        }
+    }
+
+    /// Reads an RFC 5424 message: all of `b`, with no framing around it.
+    pub fn parse(b: &[u8]) -> Result<Message, ParseError> {
+        if b.len() > MAX_MESSAGE_LEN {
+            return Err(ParseError::TooLong(b.len()));
+        }
+        let (priority, mut pos) = parse_pri(b).ok_or(ParseError::Priority)?;
+        let digits = b[pos..].iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+        if digits == 0 || digits > 3 || b[pos] == b'0' {
+            return Err(ParseError::Version);
+        }
+        let version = num(b, pos, digits).ok_or(ParseError::Version)? as u16;
+        pos += digits;
+        space(b, &mut pos, ParseError::Version)?;
+
+        let t = token(b, &mut pos);
+        let timestamp = if t == b"-" { None } else { Some(Timestamp::parse(t).ok_or(ParseError::Timestamp)?) };
+        space(b, &mut pos, ParseError::Timestamp)?;
+        let hostname = header_field(token(b, &mut pos), MAX_HOSTNAME, ParseError::Hostname)?;
+        space(b, &mut pos, ParseError::Hostname)?;
+        let app_name = header_field(token(b, &mut pos), MAX_APP_NAME, ParseError::AppName)?;
+        space(b, &mut pos, ParseError::AppName)?;
+        let proc_id = header_field(token(b, &mut pos), MAX_PROCID, ParseError::ProcId)?;
+        space(b, &mut pos, ParseError::ProcId)?;
+        let msg_id = header_field(token(b, &mut pos), MAX_MSGID, ParseError::MsgId)?;
+        space(b, &mut pos, ParseError::MsgId)?;
+
+        let structured_data = parse_sd(b, &mut pos)?;
+        let (bom, msg) = match b.get(pos) {
+            None => (false, Vec::new()),
+            Some(b' ') => {
+                let rest = &b[pos + 1..];
+                match rest.strip_prefix(&BOM) {
+                    Some(text) => {
+                        std::str::from_utf8(text).map_err(|_| ParseError::Utf8)?;
+                        (true, text.to_vec())
+                    }
+                    None => (false, rest.to_vec()),
+                }
+            }
+            Some(_) => return Err(ParseError::StructuredData),
+        };
+        Ok(Message { priority, version, timestamp, hostname, app_name, proc_id, msg_id, structured_data, bom, msg })
+    }
+
+    /// The message's bytes, with no framing. What cannot be written as
+    /// given is changed so the result always reads back:
+    ///
+    /// - The version is clamped to 1 to [`MAX_VERSION`], and the timestamp
+    ///   as [`Timestamp::to_bytes`] says.
+    /// - In header fields, element IDs and parameter names, each character
+    ///   that is not allowed becomes `_` and the field is cut to its
+    ///   length limit. An empty header field is written as nil, and so is
+    ///   one that is just `-`, so both read back as `None`. An empty ID or
+    ///   name is written `_`. An ID with an `@` that is not a name, one
+    ///   `@` and an enterprise number has its `@`s made `_`.
+    /// - An element whose ID is already used, and elements and parameters
+    ///   past [`MAX_SD_ELEMENTS`] and [`MAX_SD_PARAMS`], are left out.
+    /// - With `bom` set but text that is not UTF-8, no mark is written.
+    ///   Without a mark, byte order marks at the start of the text are
+    ///   left out, since a reader would take the first for one.
+    /// - When the whole would pass [`MAX_MESSAGE_LEN`], elements are left
+    ///   out from the end, then the text is cut, at a character boundary
+    ///   when it is UTF-8.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(format!("<{}>{}", self.priority.value(), self.version.clamp(1, MAX_VERSION)).as_bytes());
+        out.push(b' ');
+        match &self.timestamp {
+            Some(t) => out.extend_from_slice(&t.to_bytes()),
+            None => out.push(b'-'),
+        }
+        for (field, max) in [
+            (&self.hostname, MAX_HOSTNAME),
+            (&self.app_name, MAX_APP_NAME),
+            (&self.proc_id, MAX_PROCID),
+            (&self.msg_id, MAX_MSGID),
+        ] {
+            out.push(b' ');
+            let v = field.as_deref().map(|s| clean(s, max, b"")).unwrap_or_default();
+            out.extend_from_slice(if v.is_empty() { b"-" } else { v.as_bytes() });
+        }
+        out.push(b' ');
+        let mut ids: Vec<String> = Vec::new();
+        for e in &self.structured_data {
+            if ids.len() == MAX_SD_ELEMENTS {
+                break;
+            }
+            let id = sd_id(&e.id);
+            if ids.contains(&id) {
+                continue;
+            }
+            let mut el = format!("[{id}");
+            for p in e.params.iter().take(MAX_SD_PARAMS) {
+                el.push(' ');
+                el.push_str(&sd_name(&p.name));
+                el.push_str("=\"");
+                for c in p.value.chars() {
+                    if matches!(c, '"' | '\\' | ']') {
+                        el.push('\\');
+                    }
+                    el.push(c);
+                }
+                el.push('"');
+            }
+            el.push(']');
+            // Room is kept for a nil value if nothing else fits.
+            if out.len() + el.len() > MAX_MESSAGE_LEN {
+                break;
+            }
+            out.extend_from_slice(el.as_bytes());
+            ids.push(id);
+        }
+        if ids.is_empty() {
+            out.push(b'-');
+        }
+        let bom = self.bom && std::str::from_utf8(&self.msg).is_ok();
+        let mut text: &[u8] = &self.msg;
+        if !bom {
+            while let Some(rest) = text.strip_prefix(&BOM) {
+                text = rest;
+            }
+        }
+        let head = 1 + if bom { BOM.len() } else { 0 };
+        if (bom || !text.is_empty()) && out.len() + head <= MAX_MESSAGE_LEN {
+            let mut room = (MAX_MESSAGE_LEN - out.len() - head).min(text.len());
+            if bom {
+                while room < text.len() && room > 0 && text[room] & 0xc0 == 0x80 {
+                    room -= 1;
+                }
+            }
+            let text = &text[..room];
+            if bom || !text.is_empty() {
+                out.push(b' ');
+                if bom {
+                    out.extend_from_slice(&BOM);
+                }
+                out.extend_from_slice(text);
+            }
+        }
+        out
+    }
+
+    /// The text, with bytes that are not UTF-8 replaced.
+    pub fn text(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.msg)
+    }
+
+    /// The structured data element with ID `id`.
+    pub fn element(&self, id: &str) -> Option<&SdElement> {
+        self.structured_data.iter().find(|e| e.id == id)
+    }
+}
+
+/// An RFC 3164 timestamp, such as `Oct 11 22:14:15`. It has no year and no
+/// time zone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BsdTimestamp {
+    /// The month, 1 to 12.
+    pub month: u8,
+    /// The day of the month, from 1. February may have 29 days, since the
+    /// year is not known.
+    pub day: u8,
+    /// The hour, 0 to 23.
+    pub hour: u8,
+    /// The minute, 0 to 59.
+    pub minute: u8,
+    /// The second, 0 to 59.
+    pub second: u8,
+}
+
+const MONTHS: [&[u8; 3]; 12] =
+    [b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov", b"Dec"];
+
+/// How many bytes an RFC 3164 timestamp takes.
+pub const BSD_TIMESTAMP_LEN: usize = 15;
+
+impl BsdTimestamp {
+    /// Reads the 15-byte timestamp at the start of `t`. The day is a space
+    /// and a digit or two digits; a leading zero is read too, though the
+    /// RFC asks for a space.
+    pub fn parse(t: &[u8]) -> Option<BsdTimestamp> {
+        let t = t.get(..BSD_TIMESTAMP_LEN)?;
+        let month = MONTHS.iter().position(|m| &t[..3] == *m)? as u8 + 1;
+        expect(t, 3, b' ')?;
+        let day = match (t[4], t[5]) {
+            (b' ', d @ b'1'..=b'9') => d - b'0',
+            _ => num(t, 4, 2)? as u8,
+        };
+        expect(t, 6, b' ')?;
+        let hour = num(t, 7, 2)? as u8;
+        expect(t, 9, b':')?;
+        let minute = num(t, 10, 2)? as u8;
+        expect(t, 12, b':')?;
+        let second = num(t, 13, 2)? as u8;
+        if day == 0 || day > days_in_month(2000, month) || hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        Some(BsdTimestamp { month, day, hour, minute, second })
+    }
+
+    /// The timestamp's 15 bytes, with fields out of range clamped.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let month = self.month.clamp(1, 12);
+        let day = self.day.clamp(1, days_in_month(2000, month));
+        let name = std::str::from_utf8(MONTHS[usize::from(month - 1)]).unwrap_or("Jan");
+        format!("{name} {day:>2} {:02}:{:02}:{:02}", self.hour.min(23), self.minute.min(59), self.second.min(59))
+            .into_bytes()
+    }
+}
+
+/// The timestamp and host of an RFC 3164 message, which come together or
+/// not at all.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BsdHeader {
+    /// When the message was made.
+    pub timestamp: BsdTimestamp,
+    /// The machine that made it, 1 to [`MAX_HOSTNAME`] printable ASCII
+    /// characters.
+    pub hostname: String,
+}
+
+/// An RFC 3164 ("BSD") message: `<PRI>TIMESTAMP HOSTNAME TAG[PID]: TEXT`.
+///
+/// RFC 3164 describes what senders were seen to do rather than a strict
+/// format, and this reader is as lenient as it asks. Only the priority is
+/// required. Without a valid timestamp and host after it, everything
+/// after the priority is the message part. The message part starts with a
+/// tag when it begins with up to [`MAX_TAG`] printable characters (not
+/// `[`, `]` or `:`) followed by `:` or by a process ID in brackets and
+/// `:`. One space after the colon is skipped. Otherwise all of it is
+/// content.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct BsdMessage {
+    /// The facility and severity.
+    pub priority: Priority,
+    /// The timestamp and host, if both were found.
+    pub header: Option<BsdHeader>,
+    /// The program's name.
+    pub tag: Option<String>,
+    /// The process ID in brackets after the tag, 1 to [`MAX_PID`]
+    /// printable characters other than `]`. Only written with a tag.
+    pub pid: Option<String>,
+    /// The rest of the message, any bytes.
+    pub content: Vec<u8>,
+}
+
+impl BsdMessage {
+    /// A message with this priority and content, and no header or tag.
+    pub fn new(priority: Priority, content: impl Into<Vec<u8>>) -> BsdMessage {
+        BsdMessage { priority, header: None, tag: None, pid: None, content: content.into() }
+    }
+
+    /// Reads an RFC 3164 message: all of `b`, with no framing around it.
+    pub fn parse(b: &[u8]) -> Result<BsdMessage, ParseError> {
+        if b.len() > MAX_MESSAGE_LEN {
+            return Err(ParseError::TooLong(b.len()));
+        }
+        let (priority, pos) = parse_pri(b).ok_or(ParseError::Priority)?;
+        let mut rest = &b[pos..];
+        let mut header = None;
+        if let Some(timestamp) = BsdTimestamp::parse(rest)
+            && rest.get(BSD_TIMESTAMP_LEN) == Some(&b' ')
+        {
+            let after = &rest[BSD_TIMESTAMP_LEN + 1..];
+            let host_len = after.iter().position(|&c| c == b' ').unwrap_or(after.len());
+            let host = &after[..host_len];
+            if !host.is_empty() && host.len() <= MAX_HOSTNAME && host.iter().all(|&c| is_print(c)) {
+                let hostname = String::from_utf8_lossy(host).into_owned();
+                header = Some(BsdHeader { timestamp, hostname });
+                rest = after.get(host_len + 1..).unwrap_or(&[]);
+            }
+        }
+        let (tag, pid, content) = match split_tag(rest) {
+            Some((tag, pid, content)) => (Some(tag), pid, content),
+            None => (None, None, rest),
+        };
+        Ok(BsdMessage { priority, header, tag, pid, content: content.to_vec() })
+    }
+
+    /// The message's bytes, with no framing. What cannot be written as
+    /// given is changed so the result always reads back:
+    ///
+    /// - The timestamp is clamped as [`BsdTimestamp::to_bytes`] says.
+    /// - In the host name, tag and process ID, each character that is not
+    ///   allowed becomes `_` and the field is cut to its limit. An empty
+    ///   host name is written `-`. An empty tag is left out, and so is a
+    ///   process ID that is empty or comes without a tag.
+    /// - The content is cut so the whole fits in [`MAX_MESSAGE_LEN`].
+    ///
+    /// Content written without a tag that starts like one, or without a
+    /// header that starts like one, reads back as one.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = format!("<{}>", self.priority.value()).into_bytes();
+        if let Some(h) = &self.header {
+            out.extend_from_slice(&h.timestamp.to_bytes());
+            out.push(b' ');
+            let host = clean(&h.hostname, MAX_HOSTNAME, b"");
+            out.extend_from_slice(if host.is_empty() { b"-" } else { host.as_bytes() });
+        }
+        let mut part = Vec::new();
+        let tag = self.tag.as_deref().map(|t| clean(t, MAX_TAG, b"[]:")).unwrap_or_default();
+        if !tag.is_empty() {
+            part.extend_from_slice(tag.as_bytes());
+            let pid = self.pid.as_deref().map(|p| clean(p, MAX_PID, b"]")).unwrap_or_default();
+            if !pid.is_empty() {
+                part.push(b'[');
+                part.extend_from_slice(pid.as_bytes());
+                part.push(b']');
+            }
+            part.push(b':');
+            if !self.content.is_empty() {
+                part.push(b' ');
+            }
+        }
+        let sep = usize::from(self.header.is_some());
+        let room = MAX_MESSAGE_LEN.saturating_sub(out.len() + sep + part.len());
+        part.extend_from_slice(&self.content[..self.content.len().min(room)]);
+        if !part.is_empty() {
+            if self.header.is_some() {
+                out.push(b' ');
+            }
+            out.extend_from_slice(&part);
+        }
+        out
+    }
+
+    /// The content, with bytes that are not UTF-8 replaced.
+    pub fn text(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.content)
+    }
+}
+
+/// A syslog message in either format.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Entry {
+    /// An RFC 5424 message.
+    Rfc5424(Message),
+    /// An RFC 3164 message.
+    Bsd(BsdMessage),
+}
+
+impl Entry {
+    /// Reads a message in either format. It is RFC 5424 when the priority
+    /// is followed by a version (1 to 3 digits, the first not 0) and a
+    /// space, and then any error in it is returned. Otherwise it is RFC
+    /// 3164. So a BSD message with no header whose text starts with a
+    /// short number and a space reads as a malformed RFC 5424 one.
+    pub fn parse(b: &[u8]) -> Result<Entry, ParseError> {
+        if b.len() > MAX_MESSAGE_LEN {
+            return Err(ParseError::TooLong(b.len()));
+        }
+        let (_, pos) = parse_pri(b).ok_or(ParseError::Priority)?;
+        let rest = &b[pos..];
+        let digits = rest.iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+        if (1..=3).contains(&digits) && rest[0] != b'0' && rest.get(digits) == Some(&b' ') {
+            Message::parse(b).map(Entry::Rfc5424)
+        } else {
+            BsdMessage::parse(b).map(Entry::Bsd)
+        }
+    }
+
+    /// The message's priority.
+    pub fn priority(&self) -> Priority {
+        match self {
+            Entry::Rfc5424(m) => m.priority,
+            Entry::Bsd(m) => m.priority,
+        }
+    }
+
+    /// The message's bytes, with no framing.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        match self {
+            Entry::Rfc5424(m) => m.to_bytes(),
+            Entry::Bsd(m) => m.to_bytes(),
+        }
+    }
+}
+
+/// How a message is framed on a TCP stream (RFC 6587).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Framing {
+    /// The message's length in decimal and a space come first. The
+    /// message may hold any bytes.
+    OctetCounting,
+    /// A newline ends the message, which cannot hold one.
+    NonTransparent,
+}
+
+/// One message taken from a TCP stream, and how it was framed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Frame {
+    /// How the message was framed.
+    pub framing: Framing,
+    /// The message, without its framing: 1 to [`MAX_MESSAGE_LEN`] bytes.
+    pub message: Vec<u8>,
+    /// Whether the message on the wire was longer than
+    /// [`MAX_MESSAGE_LEN`], so `message` holds only its first bytes. RFC
+    /// 5424 section 6.1 asks receivers to cut such messages at the end.
+    pub truncated: bool,
+}
+
+impl Frame {
+    /// A frame holding `message`, whole.
+    pub fn new(framing: Framing, message: Vec<u8>) -> Frame {
+        Frame { framing, message, truncated: false }
+    }
+
+    /// The frame's bytes. A message is cut to [`MAX_MESSAGE_LEN`] bytes,
+    /// and an empty one gives no bytes, since no frame can hold it. With
+    /// non-transparent framing, each newline in the message becomes a
+    /// space, and a message that ends with a carriage return gets a CR LF
+    /// trailer, since a reader takes one carriage return before the
+    /// newline for part of the trailer. A message that starts with a digit
+    /// from 1 to 9 is octet counted instead, since a reader would take the
+    /// digit for a length. Syslog messages start with `<`, so that never
+    /// happens to them.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let msg = &self.message[..self.message.len().min(MAX_MESSAGE_LEN)];
+        let Some(&first) = msg.first() else { return Vec::new() };
+        if self.framing == Framing::OctetCounting || matches!(first, b'1'..=b'9') {
+            let mut out = format!("{} ", msg.len()).into_bytes();
+            out.extend_from_slice(msg);
+            out
+        } else {
+            let mut out: Vec<u8> = msg.iter().map(|&c| if c == b'\n' { b' ' } else { c }).collect();
+            if out.last() == Some(&b'\r') {
+                out.push(b'\r');
+            }
+            out.push(b'\n');
+            out
+        }
+    }
+}
+
+/// Why a TCP stream cannot be split into syslog frames. A reader cannot
+/// find where the next message starts, and a real collector closes the
+/// connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FrameError {
+    /// An octet count's digits were followed by this byte, not a space.
+    Length(u8),
+    /// An octet count too large to hold in a `usize`.
+    TooLong,
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameError::Length(c) => write!(f, "octet count followed by byte {c:#04x}, not a space"),
+            FrameError::TooLong => f.write_str("octet count too large"),
+        }
+    }
+}
+
+impl std::error::Error for FrameError {}
+
+/// What a decoder throws away before the next frame: the rest of a
+/// message it has truncated.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Skip {
+    #[default]
+    Nothing,
+    /// This many more bytes of an octet counted message.
+    Bytes(usize),
+    /// Everything up to and including the next newline.
+    Line,
+}
+
+/// Splits a syslog TCP stream into frames. Feed it the bytes a connection
+/// reads, in order, and take frames out until it has none. When the
+/// connection closes, [`Decoder::finish`] gives a last message that had no
+/// newline after it.
+///
+/// Each frame's framing is worked out from its first byte: a digit from 1
+/// to 9 starts an octet count, and anything else starts a message ended
+/// by a newline. One carriage return before the newline is part of the
+/// trailer, since RFC 6587 has seen senders end messages with CR LF.
+/// A NUL, which some senders also use as a trailer, is not one here.
+/// Empty lines between frames are skipped. A message longer than
+/// [`MAX_MESSAGE_LEN`] is cut to that length and marked
+/// [`Frame::truncated`], and the rest of it is skipped, as RFC 5424
+/// section 6.1 asks. Taking out the frames of a feed takes time in
+/// proportion to its length, however many frames it holds.
+#[derive(Clone, Debug, Default)]
+pub struct Decoder {
+    /// Bytes fed and not yet thrown away. Those before `start` have been
+    /// taken out, and are dropped at a later feed.
+    buf: Vec<u8>,
+    /// Where in `buf` the next frame starts.
+    start: usize,
+    /// How far past `start` a newline has been looked for and not found.
+    scanned: usize,
+    skip: Skip,
+    failed: Option<FrameError>,
+}
+
+impl Decoder {
+    /// A decoder holding no bytes.
+    pub fn new() -> Decoder {
+        Decoder::default()
+    }
+
+    /// Adds bytes read from the connection. After a [`FrameError`] the
+    /// stream cannot be read any further, and they are dropped.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        if self.failed.is_none() {
+            // Bytes taken out are dropped once they are at least as many
+            // as those held, so each byte is moved a bounded number of
+            // times on average.
+            if self.start > 0 && self.start >= self.buf.len() - self.start {
+                self.buf.drain(..self.start);
+                self.start = 0;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+    }
+
+    /// The next whole frame, if one has come. It returns `None` when it
+    /// needs more bytes, and keeps returning the same error once the
+    /// stream has broken. A decoder never holds more than one frame's
+    /// bytes, at most [`MAX_MESSAGE_LEN`], its count or trailer, beyond
+    /// what has been taken out, plus what one `feed` added.
+    pub fn next_frame(&mut self) -> Option<Result<Frame, FrameError>> {
+        if let Some(e) = self.failed {
+            return Some(Err(e));
+        }
+        loop {
+            match self.skip {
+                Skip::Nothing => {}
+                Skip::Bytes(n) => {
+                    let k = n.min(self.held().len());
+                    self.consume(k);
+                    if k < n {
+                        self.skip = Skip::Bytes(n - k);
+                        return None;
+                    }
+                    self.skip = Skip::Nothing;
+                }
+                Skip::Line => match self.held().iter().position(|&c| c == b'\n') {
+                    Some(at) => {
+                        self.consume(at + 1);
+                        self.skip = Skip::Nothing;
+                    }
+                    None => {
+                        self.clear();
+                        return None;
+                    }
+                },
+            }
+            let first = *self.held().first()?;
+            let result = if matches!(first, b'1'..=b'9') { self.octet_counted() } else { self.non_transparent() };
+            match result {
+                Ok(Some(frame)) if frame.message.is_empty() => continue,
+                Ok(Some(frame)) => return Some(Ok(frame)),
+                Ok(None) => return None,
+                Err(e) => {
+                    self.failed = Some(e);
+                    self.buf = Vec::new();
+                    self.start = 0;
+                    self.scanned = 0;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+
+    /// Ends the stream: the message held, if one ended by a newline had
+    /// begun and its newline never came, cut to [`MAX_MESSAGE_LEN`] bytes
+    /// as [`Decoder::next_frame`] cuts them. Take out every whole frame
+    /// first. A partial octet counted message, the rest of a message
+    /// already cut, and a broken stream give `None`. Afterwards the
+    /// decoder holds no bytes.
+    pub fn finish(&mut self) -> Option<Frame> {
+        let held = self.held();
+        let frame = match (self.failed, self.skip, held.first()) {
+            (None, Skip::Nothing, Some(&first)) if !matches!(first, b'1'..=b'9') && !held.contains(&b'\n') => {
+                let keep = held.len().min(MAX_MESSAGE_LEN);
+                Some(Frame {
+                    framing: Framing::NonTransparent,
+                    message: held[..keep].to_vec(),
+                    truncated: held.len() > keep,
+                })
+            }
+            _ => None,
+        };
+        self.clear();
+        self.skip = Skip::Nothing;
+        frame
+    }
+
+    /// How many bytes are held, waiting for the rest of a frame.
+    pub fn buffered(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    /// The bytes not yet taken out.
+    fn held(&self) -> &[u8] {
+        &self.buf[self.start..]
+    }
+
+    /// Takes `n` held bytes out.
+    fn consume(&mut self, n: usize) {
+        self.start += n;
+        self.scanned = 0;
+        if self.start == self.buf.len() {
+            self.clear();
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buf.clear();
+        self.start = 0;
+        self.scanned = 0;
+    }
+
+    fn octet_counted(&mut self) -> Result<Option<Frame>, FrameError> {
+        let held = self.held();
+        let mut len = 0usize;
+        let mut i = 0;
+        loop {
+            let Some(&c) = held.get(i) else { return Ok(None) };
+            if c == b' ' {
+                break;
+            }
+            if !c.is_ascii_digit() {
+                return Err(FrameError::Length(c));
+            }
+            len = len.checked_mul(10).and_then(|l| l.checked_add(usize::from(c - b'0'))).ok_or(FrameError::TooLong)?;
+            i += 1;
+        }
+        let start = i + 1;
+        let keep = len.min(MAX_MESSAGE_LEN);
+        if held.len() - start < keep {
+            return Ok(None);
+        }
+        let message = held[start..start + keep].to_vec();
+        self.consume(start + keep);
+        if len > keep {
+            self.skip = Skip::Bytes(len - keep);
+        }
+        Ok(Some(Frame { framing: Framing::OctetCounting, message, truncated: len > keep }))
+    }
+
+    /// A newline-ended message. An empty one, a blank line, comes back as
+    /// a frame with no bytes, which the caller skips.
+    fn non_transparent(&mut self) -> Result<Option<Frame>, FrameError> {
+        let held = self.held();
+        match held[self.scanned..].iter().position(|&c| c == b'\n') {
+            Some(n) => {
+                let at = self.scanned + n;
+                let end = if at > 0 && held[at - 1] == b'\r' { at - 1 } else { at };
+                let keep = end.min(MAX_MESSAGE_LEN);
+                let message = held[..keep].to_vec();
+                self.consume(at + 1);
+                Ok(Some(Frame { framing: Framing::NonTransparent, message, truncated: end > keep }))
+            }
+            // With more than the limit and a byte that may be a carriage
+            // return held, the message is surely too long.
+            None if held.len() > MAX_MESSAGE_LEN + 1 => {
+                let message = held[..MAX_MESSAGE_LEN].to_vec();
+                self.clear();
+                self.skip = Skip::Line;
+                Ok(Some(Frame { framing: Framing::NonTransparent, message, truncated: true }))
+            }
+            None => {
+                self.scanned = held.len();
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Reads `<PRIVAL>` at the start of `b`: the priority and the bytes used.
+fn parse_pri(b: &[u8]) -> Option<(Priority, usize)> {
+    if b.first() != Some(&b'<') {
+        return None;
+    }
+    let digits = b[1..].iter().take(4).take_while(|c| c.is_ascii_digit()).count();
+    if digits == 0 || digits > 3 || (digits > 1 && b[1] == b'0') || b.get(1 + digits) != Some(&b'>') {
+        return None;
+    }
+    let v = num(b, 1, digits)?;
+    if v > u32::from(MAX_PRIVAL) {
+        return None;
+    }
+    Some((Priority::from_value(v as u8)?, digits + 2))
+}
+
+/// The bytes from `pos` up to the next space or the end, moving `pos` past
+/// them.
+fn token<'a>(b: &'a [u8], pos: &mut usize) -> &'a [u8] {
+    let rest = b.get(*pos..).unwrap_or(&[]);
+    let n = rest.iter().position(|&c| c == b' ').unwrap_or(rest.len());
+    *pos += n;
+    &rest[..n]
+}
+
+/// Moves past the space at `pos`. The end of the bytes is
+/// [`ParseError::Truncated`]; anything else is `err`.
+fn space(b: &[u8], pos: &mut usize, err: ParseError) -> Result<(), ParseError> {
+    match b.get(*pos) {
+        Some(b' ') => {
+            *pos += 1;
+            Ok(())
+        }
+        None => Err(ParseError::Truncated),
+        Some(_) => Err(err),
+    }
+}
+
+/// An RFC 5424 header field: nil, or 1 to `max` printable ASCII bytes.
+fn header_field(t: &[u8], max: usize, err: ParseError) -> Result<Option<String>, ParseError> {
+    if t.is_empty() {
+        // Two spaces in a row, or a space at the very end.
+        return Err(err);
+    }
+    if t == b"-" {
+        return Ok(None);
+    }
+    if t.len() > max || !t.iter().all(|&c| is_print(c)) {
+        return Err(err);
+    }
+    Ok(Some(String::from_utf8_lossy(t).into_owned()))
+}
+
+/// Reads RFC 5424 structured data at `pos`: the nil value or one or more
+/// elements.
+fn parse_sd(b: &[u8], pos: &mut usize) -> Result<Vec<SdElement>, ParseError> {
+    let err = ParseError::StructuredData;
+    let mut elements: Vec<SdElement> = Vec::new();
+    match b.get(*pos) {
+        None => return Err(ParseError::Truncated),
+        Some(b'-') => {
+            *pos += 1;
+            return Ok(elements);
+        }
+        Some(b'[') => {}
+        Some(_) => return Err(err),
+    }
+    while b.get(*pos) == Some(&b'[') {
+        if elements.len() == MAX_SD_ELEMENTS {
+            return Err(err);
+        }
+        *pos += 1;
+        let id = sd_name_at(b, pos)?;
+        if !is_sd_id(&id) {
+            return Err(err);
+        }
+        if elements.iter().any(|e| e.id == id) {
+            return Err(ParseError::DuplicateSdId);
+        }
+        let mut params = Vec::new();
+        loop {
+            match b.get(*pos) {
+                Some(b']') => {
+                    *pos += 1;
+                    break;
+                }
+                Some(b' ') => *pos += 1,
+                _ => return Err(err),
+            }
+            if params.len() == MAX_SD_PARAMS {
+                return Err(err);
+            }
+            let name = sd_name_at(b, pos)?;
+            if b.get(*pos) != Some(&b'=') || b.get(*pos + 1) != Some(&b'"') {
+                return Err(err);
+            }
+            *pos += 2;
+            let mut value = Vec::new();
+            loop {
+                match b.get(*pos) {
+                    None | Some(b']') => return Err(err),
+                    Some(b'"') => {
+                        *pos += 1;
+                        break;
+                    }
+                    Some(b'\\') => match b.get(*pos + 1) {
+                        Some(&c @ (b'"' | b'\\' | b']')) => {
+                            value.push(c);
+                            *pos += 2;
+                        }
+                        // Any other escape is a plain backslash.
+                        _ => {
+                            value.push(b'\\');
+                            *pos += 1;
+                        }
+                    },
+                    Some(&c) => {
+                        value.push(c);
+                        *pos += 1;
+                    }
+                }
+            }
+            let value = String::from_utf8(value).map_err(|_| err)?;
+            params.push(SdParam { name, value });
+        }
+        elements.push(SdElement { id, params });
+    }
+    Ok(elements)
+}
+
+/// An SD-NAME at `pos`: 1 to [`MAX_SD_NAME`] printable ASCII bytes other
+/// than `=`, space, `]` and `"`.
+fn sd_name_at(b: &[u8], pos: &mut usize) -> Result<String, ParseError> {
+    let rest = b.get(*pos..).unwrap_or(&[]);
+    let n = rest.iter().take(MAX_SD_NAME + 1).take_while(|&&c| is_sd_name(c)).count();
+    if n == 0 || n > MAX_SD_NAME {
+        return Err(ParseError::StructuredData);
+    }
+    *pos += n;
+    Ok(String::from_utf8_lossy(&rest[..n]).into_owned())
+}
+
+fn is_sd_name(c: u8) -> bool {
+    is_print(c) && !matches!(c, b'=' | b']' | b'"')
+}
+
+/// Whether an SD-NAME may be an SD-ID. RFC 5424 section 6.3.2: a name
+/// with an at-sign is `name@<private enterprise number>`, where the name
+/// holds no at-sign and the number is decimal, its parts split by periods,
+/// such as `32473` or `32473.1.2`.
+fn is_sd_id(id: &str) -> bool {
+    let Some((name, pen)) = id.split_once('@') else { return true };
+    !name.is_empty() && pen.split('.').all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// `s` as an SD-ID a reader accepts: as [`sd_name`] makes it, with its
+/// at-signs made `_` when it is not in the `name@number` form.
+fn sd_id(s: &str) -> String {
+    let id = sd_name(s);
+    if is_sd_id(&id) { id } else { id.replace('@', "_") }
+}
+
+/// `s` as an SD-NAME a reader accepts.
+fn sd_name(s: &str) -> String {
+    let n = clean(s, MAX_SD_NAME, b"=]\"");
+    if n.is_empty() { "_".to_string() } else { n }
+}
+
+/// `s` with each character that is not printable ASCII, or is in
+/// `forbidden`, replaced by `_`, cut to `max` bytes.
+fn clean(s: &str, max: usize, forbidden: &[u8]) -> String {
+    s.chars()
+        .take(max)
+        .map(|c| if c.is_ascii() && is_print(c as u8) && !forbidden.contains(&(c as u8)) { c } else { '_' })
+        .collect()
+}
+
+/// Printable US-ASCII, as RFC 5424 defines it: no spaces or controls.
+fn is_print(c: u8) -> bool {
+    (33..=126).contains(&c)
+}
+
+/// The tag, process ID and content of an RFC 3164 message part, if it
+/// starts with a tag.
+fn split_tag(m: &[u8]) -> Option<(String, Option<String>, &[u8])> {
+    let n = m.iter().take(MAX_TAG + 1).take_while(|&&c| is_print(c) && !matches!(c, b'[' | b']' | b':')).count();
+    if n == 0 || n > MAX_TAG {
+        return None;
+    }
+    let tag = String::from_utf8_lossy(&m[..n]).into_owned();
+    let mut i = n;
+    let mut pid = None;
+    if m.get(i) == Some(&b'[') {
+        let rest = &m[i + 1..];
+        let p = rest.iter().take(MAX_PID + 1).take_while(|&&c| is_print(c) && c != b']').count();
+        if p == 0 || p > MAX_PID || rest.get(p) != Some(&b']') {
+            return None;
+        }
+        pid = Some(String::from_utf8_lossy(&rest[..p]).into_owned());
+        i += p + 2;
+    }
+    if m.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    if m.get(i) == Some(&b' ') {
+        i += 1;
+    }
+    Some((tag, pid, &m[i..]))
+}
+
+/// The `n` decimal digits at `t[i..]` as a number, if they are all there
+/// and all digits. `n` is at most 9, so the number fits.
+fn num(t: &[u8], i: usize, n: usize) -> Option<u32> {
+    let d = t.get(i..i.checked_add(n)?)?;
+    if n == 0 || n > 9 || !d.iter().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(d.iter().fold(0, |v, &c| v * 10 + u32::from(c - b'0')))
+}
+
+fn expect(t: &[u8], i: usize, c: u8) -> Option<()> {
+    (t.get(i) == Some(&c)).then_some(())
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        2 if year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400)) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The four examples of RFC 5424 section 6.5, with the BOM bytes in
+    /// place of "BOM" and the third one's text shortened.
+    const EX1: &[u8] =
+        b"<34>1 2003-10-11T22:14:15.003Z mymachine.example.com su - ID47 - \xef\xbb\xbf'su root' failed for lonvick on /dev/pts/8";
+    const EX2: &[u8] =
+        b"<165>1 2003-08-24T05:14:15.000003-07:00 192.0.2.1 myproc 8710 - - %% It's time to make the do-nuts.";
+    const EX3: &[u8] = b"<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"] \xef\xbb\xbfAn application event log entry...";
+    const EX4: &[u8] = b"<165>1 2003-10-11T22:14:15.003Z mymachine.example.com evntslog - ID47 [exampleSDID@32473 iut=\"3\" eventSource=\"Application\" eventID=\"1011\"][examplePriority@32473 class=\"high\"]";
+
+    #[test]
+    fn rfc5424_example_1() {
+        let m = Message::parse(EX1).unwrap();
+        assert_eq!(m.priority, Priority::new(Facility::Auth, Severity::Critical));
+        assert_eq!(m.priority.to_string(), "auth.crit");
+        assert_eq!(m.version, 1);
+        let t = m.timestamp.unwrap();
+        assert_eq!((t.year, t.month, t.day, t.hour, t.minute, t.second), (2003, 10, 11, 22, 14, 15));
+        assert_eq!(t.fraction, Some(Fraction { value: 3, digits: 3 }));
+        assert_eq!(t.fraction.unwrap().micros(), 3000);
+        assert_eq!(t.offset, Offset::Utc);
+        assert_eq!(m.hostname.as_deref(), Some("mymachine.example.com"));
+        assert_eq!(m.app_name.as_deref(), Some("su"));
+        assert_eq!(m.proc_id, None);
+        assert_eq!(m.msg_id.as_deref(), Some("ID47"));
+        assert!(m.structured_data.is_empty());
+        assert!(m.bom);
+        assert_eq!(m.text(), "'su root' failed for lonvick on /dev/pts/8");
+        assert_eq!(m.to_bytes(), EX1);
+    }
+
+    #[test]
+    fn rfc5424_example_2() {
+        let m = Message::parse(EX2).unwrap();
+        assert_eq!(m.priority, Priority::new(Facility::Local4, Severity::Notice));
+        let t = m.timestamp.unwrap();
+        assert_eq!(t.fraction, Some(Fraction { value: 3, digits: 6 }));
+        assert_eq!(t.offset, Offset::Minutes(-7 * 60));
+        assert_eq!(m.hostname.as_deref(), Some("192.0.2.1"));
+        assert_eq!(m.proc_id.as_deref(), Some("8710"));
+        assert_eq!(m.msg_id, None);
+        assert!(!m.bom);
+        assert_eq!(m.msg, b"%% It's time to make the do-nuts.");
+        assert_eq!(m.to_bytes(), EX2);
+    }
+
+    #[test]
+    fn rfc5424_examples_3_and_4() {
+        let m = Message::parse(EX3).unwrap();
+        assert_eq!(m.structured_data.len(), 1);
+        let e = m.element("exampleSDID@32473").unwrap();
+        assert_eq!(e.get("iut"), Some("3"));
+        assert_eq!(e.get("eventSource"), Some("Application"));
+        assert_eq!(e.get("eventID"), Some("1011"));
+        assert_eq!(m.text(), "An application event log entry...");
+        assert_eq!(m.to_bytes(), EX3);
+
+        let m = Message::parse(EX4).unwrap();
+        assert_eq!(m.structured_data.len(), 2);
+        assert_eq!(m.element("examplePriority@32473").unwrap().get("class"), Some("high"));
+        assert!(m.msg.is_empty() && !m.bom);
+        assert_eq!(m.to_bytes(), EX4);
+    }
+
+    #[test]
+    fn rfc5424_timestamps() {
+        // RFC 5424 section 6.2.3.1.
+        for ok in [
+            "1985-04-12T23:20:50.52Z",
+            "1985-04-12T19:20:50.52-04:00",
+            "2003-10-11T22:14:15.003Z",
+            "2003-08-24T05:14:15.000003-07:00",
+            "2000-02-29T00:00:00+14:00",
+        ] {
+            let t = Timestamp::parse(ok.as_bytes()).unwrap_or_else(|| panic!("{ok}"));
+            assert_eq!(t.to_bytes(), ok.as_bytes());
+        }
+        for bad in [
+            "2003-08-24T05:14:15.000000003-07:00",
+            "1990-12-31T23:59:60Z",
+            "2003-10-11t22:14:15Z",
+            "2003-10-11T22:14:15z",
+            "2003-10-11T22:14:15",
+            "2003-10-11T22:14:15.Z",
+            "1900-02-29T00:00:00Z",
+            "2003-04-31T00:00:00Z",
+            "2003-13-01T00:00:00Z",
+            "2003-00-01T00:00:00Z",
+            "2003-10-11T24:00:00Z",
+            "2003-10-11T22:60:00Z",
+            "2003-10-11T22:14:15+24:00",
+            "2003-10-11T22:14:15+01:60",
+            "2003-10-11T22:14:15+0100",
+            "2003-10-11T22:14:15ZZ",
+            "2003-10-11 22:14:15Z",
+        ] {
+            assert_eq!(Timestamp::parse(bad.as_bytes()), None, "{bad}");
+        }
+        // -00:00 reads as zero minutes.
+        let t = Timestamp::parse(b"2003-10-11T22:14:15-00:00").unwrap();
+        assert_eq!(t.offset, Offset::Minutes(0));
+        assert_eq!(t.to_bytes(), b"2003-10-11T22:14:15+00:00");
+    }
+
+    #[test]
+    fn rfc3164_examples() {
+        // RFC 3164 section 5.4.
+        let m =
+            BsdMessage::parse(b"<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8").unwrap();
+        assert_eq!(m.priority, Priority::new(Facility::Auth, Severity::Critical));
+        let h = m.header.as_ref().unwrap();
+        assert_eq!(h.timestamp, BsdTimestamp { month: 10, day: 11, hour: 22, minute: 14, second: 15 });
+        assert_eq!(h.hostname, "mymachine");
+        assert_eq!(m.tag.as_deref(), Some("su"));
+        assert_eq!(m.pid, None);
+        assert_eq!(m.content, b"'su root' failed for lonvick on /dev/pts/8");
+        assert_eq!(m.to_bytes(), b"<34>Oct 11 22:14:15 mymachine su: 'su root' failed for lonvick on /dev/pts/8");
+
+        let raw = b"<13>Feb  5 17:32:18 10.0.0.99 Use the BFG!";
+        let m = BsdMessage::parse(raw).unwrap();
+        assert_eq!(m.header.as_ref().unwrap().timestamp.day, 5);
+        assert_eq!(m.header.as_ref().unwrap().hostname, "10.0.0.99");
+        assert_eq!(m.tag, None);
+        assert_eq!(m.content, b"Use the BFG!");
+        assert_eq!(m.to_bytes(), raw);
+
+        let m = BsdMessage::parse(b"<165>Aug 24 05:34:00 CST 1987 mymachine myproc[10]: %% It's time").unwrap();
+        assert_eq!(m.priority.facility, Facility::Local4);
+        assert_eq!(m.header.as_ref().unwrap().hostname, "CST");
+        assert_eq!(m.content, b"1987 mymachine myproc[10]: %% It's time");
+
+        let raw = b"<0>1990 Oct 22 10:52:01 TZ-6 scapegoat.dmz.example.org 10.1.2.3 sched[0]: That's All Folks!";
+        let m = BsdMessage::parse(raw).unwrap();
+        assert_eq!(m.priority, Priority::new(Facility::Kern, Severity::Emergency));
+        assert_eq!(m.header, None);
+        assert_eq!(m.content, &raw[3..]);
+        assert_eq!(Entry::parse(raw), Ok(Entry::Bsd(m)));
+    }
+
+    #[test]
+    fn rfc3164_tags() {
+        let m = BsdMessage::parse(b"<13>Oct  5 01:02:03 gw sshd[42]: hello").unwrap();
+        assert_eq!((m.tag.as_deref(), m.pid.as_deref()), (Some("sshd"), Some("42")));
+        assert_eq!(m.content, b"hello");
+        assert_eq!(m.to_bytes(), b"<13>Oct  5 01:02:03 gw sshd[42]: hello");
+        // No space after the colon, and no content.
+        let m = BsdMessage::parse(b"<13>app:x").unwrap();
+        assert_eq!((m.tag.as_deref(), &m.content[..]), (Some("app"), &b"x"[..]));
+        let m = BsdMessage::parse(b"<13>app:").unwrap();
+        assert_eq!((m.tag.as_deref(), &m.content[..]), (Some("app"), &b""[..]));
+        assert_eq!(m.to_bytes(), b"<13>app:");
+        // Not tags: an unclosed bracket, an empty process ID, a tag too long.
+        for raw in [&b"<13>app[12: x"[..], b"<13>app[]: x", b"<13>abcdefghijklmnopqrstuvwxyz0123456: x", b"<13>:x"] {
+            let m = BsdMessage::parse(raw).unwrap();
+            assert_eq!(m.tag, None);
+            assert_eq!(m.content, &raw[4..]);
+        }
+        // A leading zero in the day is read, and written with a space.
+        let m = BsdMessage::parse(b"<13>Oct 05 01:02:03 gw x").unwrap();
+        assert_eq!(m.to_bytes(), b"<13>Oct  5 01:02:03 gw x");
+        // A host name and nothing after it.
+        let m = BsdMessage::parse(b"<13>Oct  5 01:02:03 gw").unwrap();
+        assert_eq!(m.header.unwrap().hostname, "gw");
+        // A timestamp with no host is part of the content.
+        let m = BsdMessage::parse(b"<13>Oct  5 01:02:03  x").unwrap();
+        assert_eq!(m.header, None);
+        // Bad dates are not timestamps.
+        assert_eq!(BsdTimestamp::parse(b"Feb 30 01:02:03"), None);
+        assert_eq!(BsdTimestamp::parse(b"Feb 29 01:02:03").unwrap().day, 29);
+        assert_eq!(BsdTimestamp::parse(b"Oct  0 01:02:03"), None);
+        assert_eq!(BsdTimestamp::parse(b"oct  1 01:02:03"), None);
+        assert_eq!(BsdTimestamp::parse(b"Oct  1 24:02:03"), None);
+    }
+
+    #[test]
+    fn priorities_and_names() {
+        for v in 0..=255u8 {
+            match Priority::from_value(v) {
+                Some(p) => assert_eq!(p.value(), v),
+                None => assert!(v > MAX_PRIVAL),
+            }
+        }
+        for c in 0..24 {
+            let f = Facility::from_code(c).unwrap();
+            assert_eq!(f.code(), c);
+            assert_eq!(Facility::from_name(f.name()), Some(f));
+        }
+        assert_eq!(Facility::from_code(24), None);
+        for c in 0..8 {
+            let s = Severity::from_code(c).unwrap();
+            assert_eq!(s.code(), c);
+            assert_eq!(Severity::from_name(s.name()), Some(s));
+        }
+        assert_eq!(Severity::from_code(8), None);
+        assert_eq!(Severity::from_name("WARN"), Some(Severity::Warning));
+        assert_eq!(Facility::from_name("LOCAL7"), Some(Facility::Local7));
+        assert_eq!(Facility::from_name("nope"), None);
+        assert_eq!(Priority::from_value(165).unwrap().to_string(), "local4.notice");
+        // PRI forms.
+        assert!(parse_pri(b"<0>").is_some());
+        assert!(parse_pri(b"<191>").is_some());
+        for bad in [&b"<192>"[..], b"<00>", b"<01>", b"<1000>", b"<>", b"<1", b"1>", b"<a>", b""] {
+            assert_eq!(parse_pri(bad), None, "{:?}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    #[test]
+    fn rfc5424_error_paths() {
+        let cases: &[(&[u8], ParseError)] = &[
+            (b"34>1 - - - - - -", ParseError::Priority),
+            (b"<192>1 - - - - - -", ParseError::Priority),
+            (b"<34>0 - - - - - -", ParseError::Version),
+            (b"<34>1000 - - - - - -", ParseError::Version),
+            (b"<34>1x - - - - - -", ParseError::Version),
+            (b"<34>", ParseError::Version),
+            (b"<34>1", ParseError::Truncated),
+            (b"<34>1 - - - - -", ParseError::Truncated),
+            (b"<34>1 - - - - - ", ParseError::Truncated),
+            (b"<34>1 2003-10-11 - - - - -", ParseError::Timestamp),
+            (b"<34>1 - h\x01 - - - -", ParseError::Hostname),
+            (b"<34>1 -  - - - -", ParseError::Hostname),
+            (b"<34>1 - - \xc3\xa9 - - -", ParseError::AppName),
+            (b"<34>1 - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa - - -", ParseError::AppName),
+            (b"<34>1 - - - p\x7f - -", ParseError::ProcId),
+            (b"<34>1 - - - - aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -", ParseError::MsgId),
+            (b"<34>1 - - - - - x", ParseError::StructuredData),
+            (b"<34>1 - - - - - -x", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a", ParseError::StructuredData),
+            (b"<34>1 - - - - - []", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a b]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a b=c]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a b=\"c]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a b=\"c]\"]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a b=\"\xff\"]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a  b=\"c\"]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a][b]x", ParseError::StructuredData),
+            (b"<34>1 - - - - - [aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]", ParseError::StructuredData),
+            (b"<34>1 - - - - - [a][a]", ParseError::DuplicateSdId),
+            (b"<34>1 - - - - - - \xef\xbb\xbf\xff", ParseError::Utf8),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(Message::parse(raw), Err(*want), "{:?}", String::from_utf8_lossy(raw));
+            assert!(!want.to_string().is_empty());
+        }
+        let long = vec![b'<'; MAX_MESSAGE_LEN + 1];
+        assert_eq!(Message::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(BsdMessage::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(Entry::parse(&long), Err(ParseError::TooLong(MAX_MESSAGE_LEN + 1)));
+        assert_eq!(BsdMessage::parse(b"no priority"), Err(ParseError::Priority));
+        assert_eq!(Entry::parse(b""), Err(ParseError::Priority));
+        // Too many elements and parameters.
+        let mut many = b"<34>1 - - - - - ".to_vec();
+        for i in 0..=MAX_SD_ELEMENTS {
+            many.extend_from_slice(format!("[e{i}]").as_bytes());
+        }
+        assert_eq!(Message::parse(&many), Err(ParseError::StructuredData));
+        let mut many = b"<34>1 - - - - - [e".to_vec();
+        for _ in 0..=MAX_SD_PARAMS {
+            many.extend_from_slice(b" p=\"\"");
+        }
+        many.push(b']');
+        assert_eq!(Message::parse(&many), Err(ParseError::StructuredData));
+    }
+
+    #[test]
+    fn structured_data_escapes() {
+        let raw = br#"<34>1 - - - - - [x@1 a="q\"b\\s\]e" b="\n" c="" a="2"]"#;
+        let m = Message::parse(raw).unwrap();
+        let e = &m.structured_data[0];
+        assert_eq!(e.get("a"), Some(r#"q"b\s]e"#));
+        // Any other escape is a backslash and the character after it.
+        assert_eq!(e.get("b"), Some(r"\n"));
+        assert_eq!(e.get("c"), Some(""));
+        assert_eq!(e.params.len(), 4);
+        let again = m.to_bytes();
+        assert_eq!(Message::parse(&again).unwrap(), m);
+        assert_eq!(again, br#"<34>1 - - - - - [x@1 a="q\"b\\s\]e" b="\\n" c="" a="2"]"#);
+        // A trailing space means an empty text.
+        let m = Message::parse(b"<34>1 - - - - - - ").unwrap();
+        assert!(m.msg.is_empty());
+        assert_eq!(m.to_bytes(), b"<34>1 - - - - - -");
+        // A BOM with no text after it.
+        let m = Message::parse(b"<34>1 - - - - - - \xef\xbb\xbf").unwrap();
+        assert!(m.bom && m.msg.is_empty());
+        assert_eq!(m.to_bytes(), b"<34>1 - - - - - - \xef\xbb\xbf");
+    }
+
+    #[test]
+    fn entry_picks_the_format() {
+        assert!(matches!(Entry::parse(EX1), Ok(Entry::Rfc5424(_))));
+        assert!(matches!(Entry::parse(b"<13>Oct  5 01:02:03 gw x"), Ok(Entry::Bsd(_))));
+        assert!(matches!(Entry::parse(b"<13>0 x"), Ok(Entry::Bsd(_))));
+        assert!(matches!(Entry::parse(b"<13>1234 x"), Ok(Entry::Bsd(_))));
+        assert_eq!(Entry::parse(b"<13>12 x"), Err(ParseError::Timestamp));
+        let e = Entry::parse(EX2).unwrap();
+        assert_eq!(e.priority().value(), 165);
+        assert_eq!(e.to_bytes(), EX2);
+    }
+
+    #[test]
+    fn writers_clean_what_they_write() {
+        let mut m = Message::new(Priority::new(Facility::Kern, Severity::Debug));
+        m.version = 0;
+        m.timestamp = Some(Timestamp {
+            year: 20000,
+            month: 2,
+            day: 31,
+            hour: 99,
+            minute: 99,
+            second: 60,
+            fraction: Some(Fraction { value: 12345678, digits: 9 }),
+            offset: Offset::Minutes(-5000),
+        });
+        m.hostname = Some("host name\n".into());
+        m.app_name = Some("é".repeat(100));
+        m.proc_id = Some(String::new());
+        m.msg_id = Some("-".into());
+        m.structured_data =
+            vec![SdElement::new("a=b").param("x y", "v"), SdElement::new("a_b"), SdElement::new("").param("", "]")];
+        m.bom = true;
+        m.msg = vec![0xff, 0xfe];
+        let bytes = m.to_bytes();
+        let back = Message::parse(&bytes).unwrap();
+        assert_eq!(back.version, 1);
+        assert_eq!(back.timestamp.unwrap().to_bytes(), b"9999-02-28T23:59:59.999999-23:59");
+        assert_eq!(back.hostname.as_deref(), Some("host_name_"));
+        assert_eq!(back.app_name.unwrap().len(), MAX_APP_NAME);
+        assert_eq!((back.proc_id, back.msg_id), (None, None));
+        // The second element's ID is the first's once cleaned, so it is left out.
+        let ids: Vec<_> = back.structured_data.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["a_b", "_"]);
+        assert_eq!(back.structured_data[1].get("_"), Some("]"));
+        assert!(!back.bom);
+        assert_eq!(back.msg, [0xff, 0xfe]);
+
+        // Text without a BOM loses the marks it starts with.
+        let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+        m.msg = [&BOM[..], &BOM, b"x"].concat();
+        assert_eq!(Message::parse(&m.to_bytes()).unwrap().msg, b"x");
+
+        // Long text is cut at a character boundary.
+        let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+        m.bom = true;
+        m.msg = "é".repeat(MAX_MESSAGE_LEN).into_bytes();
+        let bytes = m.to_bytes();
+        assert!(bytes.len() <= MAX_MESSAGE_LEN);
+        let back = Message::parse(&bytes).unwrap();
+        assert!(back.bom && std::str::from_utf8(&back.msg).is_ok());
+
+        // Structured data that cannot fit is left out.
+        let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+        m.structured_data = (0..400).map(|i| SdElement::new(format!("e{i}")).param("v", "x".repeat(1000))).collect();
+        let bytes = m.to_bytes();
+        assert!(bytes.len() <= MAX_MESSAGE_LEN);
+        let back = Message::parse(&bytes).unwrap();
+        assert!(!back.structured_data.is_empty() && back.structured_data.len() < 100);
+
+        // BSD writers.
+        let mut b = BsdMessage::new(Priority::new(Facility::Mail, Severity::Error), vec![b'x'; 2 * MAX_MESSAGE_LEN]);
+        b.header = Some(BsdHeader {
+            timestamp: BsdTimestamp { month: 0, day: 40, hour: 30, minute: 70, second: 70 },
+            hostname: String::new(),
+        });
+        b.tag = Some("my app".into());
+        b.pid = Some("1]".into());
+        let bytes = b.to_bytes();
+        assert_eq!(bytes.len(), MAX_MESSAGE_LEN);
+        let back = BsdMessage::parse(&bytes).unwrap();
+        let h = back.header.unwrap();
+        assert_eq!(h.timestamp.to_bytes(), b"Jan 31 23:59:59");
+        assert_eq!(h.hostname, "-");
+        assert_eq!((back.tag.as_deref(), back.pid.as_deref()), (Some("my_app"), Some("1_")));
+        let mut b = BsdMessage::new(Priority::new(Facility::Mail, Severity::Error), "x");
+        b.pid = Some("7".into());
+        assert_eq!(b.to_bytes(), b"<19>x");
+    }
+
+    #[test]
+    fn frames_both_ways() {
+        // RFC 6587 section 3.4.1: octet counting.
+        let mut d = Decoder::new();
+        d.feed(b"7 <34>1 x");
+        assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::OctetCounting, b"<34>1 x".to_vec()))));
+        assert_eq!(d.next_frame(), None);
+        // Section 3.4.2: a trailer ends the message.
+        d.feed(b"<13>a\r\n\n\n<13>b\n<13>c");
+        assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::NonTransparent, b"<13>a".to_vec()))));
+        assert_eq!(d.next_frame(), Some(Ok(Frame::new(Framing::NonTransparent, b"<13>b".to_vec()))));
+        assert_eq!(d.next_frame(), None);
+        assert_eq!(d.buffered(), 5);
+        // Octet counted messages may hold newlines.
+        d.feed(b"\n5 a\nb\nc");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>c");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"a\nb\nc");
+        assert_eq!(d.buffered(), 0);
+
+        // Writers.
+        assert_eq!(Frame::new(Framing::OctetCounting, b"<1>x".to_vec()).to_bytes(), b"4 <1>x");
+        assert_eq!(Frame::new(Framing::NonTransparent, b"<1>x\ny".to_vec()).to_bytes(), b"<1>x y\n");
+        assert_eq!(Frame::new(Framing::NonTransparent, b"12".to_vec()).to_bytes(), b"2 12");
+        assert_eq!(Frame::new(Framing::NonTransparent, Vec::new()).to_bytes(), b"");
+        assert_eq!(Frame::new(Framing::OctetCounting, Vec::new()).to_bytes(), b"");
+        let big = Frame::new(Framing::OctetCounting, vec![b'x'; MAX_MESSAGE_LEN + 10]).to_bytes();
+        let mut d = Decoder::new();
+        d.feed(&big);
+        assert_eq!(d.next_frame().unwrap().unwrap().message.len(), MAX_MESSAGE_LEN);
+    }
+
+    #[test]
+    fn frame_errors() {
+        let mut d = Decoder::new();
+        d.feed(b"12x <34>1");
+        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(b'x'))));
+        d.feed(b"<13>fine\n");
+        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(b'x'))));
+        assert_eq!(d.buffered(), 0);
+
+        // A count over the limit is fine; one past usize is not.
+        let mut d = Decoder::new();
+        d.feed(format!("{} ", MAX_MESSAGE_LEN + 1).as_bytes());
+        assert_eq!(d.next_frame(), None);
+        let mut d = Decoder::new();
+        d.feed(b"99999999999999999999999999");
+        assert_eq!(d.next_frame(), Some(Err(FrameError::TooLong)));
+
+        // A message without a newline may be MAX_MESSAGE_LEN bytes; past
+        // that it is cut.
+        let mut d = Decoder::new();
+        d.feed(&vec![b'<'; MAX_MESSAGE_LEN]);
+        assert_eq!(d.next_frame(), None);
+        d.feed(b"\n");
+        let f = d.next_frame().unwrap().unwrap();
+        assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, false));
+        let mut d = Decoder::new();
+        d.feed(&vec![b'<'; MAX_MESSAGE_LEN + 1]);
+        assert_eq!(d.next_frame(), None);
+        d.feed(b"<");
+        assert!(d.next_frame().unwrap().unwrap().truncated);
+        assert_eq!(d.buffered(), 0);
+        d.feed(b"<<\n<13>x\n");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>x");
+        assert!(!FrameError::TooLong.to_string().is_empty());
+        let kinds: std::collections::HashSet<FrameError> = [FrameError::TooLong, FrameError::Length(0)].into();
+        assert_eq!(kinds.len(), 2);
+        let kinds: std::collections::HashSet<ParseError> = [ParseError::Priority, ParseError::Utf8].into();
+        assert_eq!(kinds.len(), 2);
+        assert!(!FrameError::Length(0).to_string().is_empty());
+    }
+
+    #[test]
+    fn truncated_prefixes() {
+        for raw in [EX1, EX2, EX3, EX4] {
+            // The header ends after the space following MSGID.
+            let header_end = {
+                let mut spaces = 0;
+                raw.iter()
+                    .position(|&c| {
+                        spaces += usize::from(c == b' ');
+                        spaces == 6
+                    })
+                    .unwrap()
+                    + 1
+            };
+            for n in 0..raw.len() {
+                let r = Message::parse(&raw[..n]);
+                if n <= header_end {
+                    assert!(r.is_err(), "{n} bytes");
+                }
+                let _ = Entry::parse(&raw[..n]);
+                let _ = BsdMessage::parse(&raw[..n]);
+            }
+            assert!(Message::parse(raw).is_ok());
+            // Framed, every prefix yields no frame and no error.
+            for framing in [Framing::OctetCounting, Framing::NonTransparent] {
+                let framed = Frame::new(framing, raw.to_vec()).to_bytes();
+                for n in 0..framed.len() {
+                    let mut d = Decoder::new();
+                    d.feed(&framed[..n]);
+                    assert_eq!(d.next_frame(), None, "{n} bytes");
+                }
+                let mut d = Decoder::new();
+                d.feed(&framed);
+                assert_eq!(d.next_frame().unwrap().unwrap().message, raw);
+            }
+        }
+        let bsd = b"<13>Oct  5 01:02:03 gw sshd[42]: hello";
+        for n in 0..bsd.len() {
+            let r = BsdMessage::parse(&bsd[..n]);
+            assert_eq!(r.is_err(), n < 4, "{n} bytes");
+        }
+    }
+
+    #[test]
+    fn sd_ids_with_an_at_sign() {
+        // RFC 5424 section 6.3.2: name@<private enterprise number>, the
+        // name without an at-sign, the number decimal with dotted parts.
+        for ok in ["[a@1]", "[exampleSDID@32473]", "[a@32473.1.2]", "[timeQuality]"] {
+            let raw = format!("<34>1 - - - - - {ok}");
+            assert!(Message::parse(raw.as_bytes()).is_ok(), "{ok}");
+        }
+        for bad in ["[a@b@1]", "[a@x]", "[@1]", "[a@]", "[a@1.]", "[a@.1]", "[a@1..2]", "[a@1@2]"] {
+            let raw = format!("<34>1 - - - - - {bad}");
+            assert_eq!(Message::parse(raw.as_bytes()), Err(ParseError::StructuredData), "{bad}");
+        }
+        // Parameter names may hold an at-sign.
+        assert!(Message::parse(b"<34>1 - - - - - [a@1 b@c=\"\"]").is_ok());
+        // The writer makes IDs the reader takes.
+        for id in ["a@b@1", "a@x", "@1", "a@", "a@1.", "x@32473", "abcdefghijklmnopqrstuvwxyz0123@1234"] {
+            let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+            m.structured_data.push(SdElement::new(id));
+            let back = Message::parse(&m.to_bytes()).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(back.to_bytes(), m.to_bytes());
+        }
+        let mut m = Message::new(Priority::new(Facility::User, Severity::Notice));
+        m.structured_data.push(SdElement::new("x@32473"));
+        assert_eq!(Message::parse(&m.to_bytes()).unwrap().structured_data[0].id, "x@32473");
+    }
+
+    #[test]
+    fn crlf_trailers() {
+        // RFC 6587 section 3.4.2: some senders end each message with CR LF.
+        let mut d = Decoder::new();
+        d.feed(b"<34>1 - - - - - -\r\n\r\n<13>b\r\r\n");
+        let f = d.next_frame().unwrap().unwrap();
+        assert_eq!(f.message, b"<34>1 - - - - - -");
+        assert!(Message::parse(&f.message).is_ok());
+        // A CR LF on its own is a blank line, and only one CR is a trailer.
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>b\r");
+        assert_eq!(d.next_frame(), None);
+        // A message ending in CR keeps it when written.
+        let f = Frame::new(Framing::NonTransparent, b"<13>b\r".to_vec());
+        let mut d = Decoder::new();
+        d.feed(&f.to_bytes());
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>b\r");
+    }
+
+    #[test]
+    fn long_frames_are_truncated() {
+        // RFC 5424 section 6.1: a receiver SHOULD truncate a message longer
+        // than it supports, or MAY discard it, and the stream goes on.
+        let long = [b"<13>".as_slice(), &vec![b'x'; MAX_MESSAGE_LEN + 100]].concat();
+        let mut counted = format!("{} ", long.len()).into_bytes();
+        counted.extend_from_slice(&long);
+        let nl = [long.as_slice(), b"\n"].concat();
+        let crlf = [long.as_slice(), b"\r\n"].concat();
+        for framed in [counted, nl, crlf] {
+            let stream = [framed.as_slice(), b"<13>next\n"].concat();
+            for chunk in [stream.len(), 1, 7, MAX_MESSAGE_LEN] {
+                let mut d = Decoder::new();
+                let mut got = Vec::new();
+                for piece in stream.chunks(chunk) {
+                    d.feed(piece);
+                    while let Some(f) = d.next_frame() {
+                        got.push(f.unwrap());
+                    }
+                    assert!(d.buffered() <= MAX_MESSAGE_LEN + chunk + 8);
+                }
+                assert_eq!(got.len(), 2, "chunk {chunk}");
+                assert_eq!(got[0].message, &long[..MAX_MESSAGE_LEN]);
+                assert!(got[0].truncated);
+                assert_eq!(got[1].message, b"<13>next");
+                assert!(!got[1].truncated);
+            }
+        }
+        // A message of exactly the limit is whole.
+        let exact = vec![b'<'; MAX_MESSAGE_LEN];
+        let mut d = Decoder::new();
+        d.feed(&[exact.as_slice(), b"\r\n"].concat());
+        let f = d.next_frame().unwrap().unwrap();
+        assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, false));
+    }
+
+    #[test]
+    fn many_frames_in_one_feed_take_linear_time() {
+        // Taking each frame out used to move every byte held after it, so
+        // a feed of n frames took time in n squared: 1.2 MB of short lines
+        // took seconds. Here 2.4 MB of frames and 2.4 MB of blank lines.
+        let n = 400_000;
+        let data = b"<13>x\n".repeat(n);
+        let started = std::time::Instant::now();
+        let mut d = Decoder::new();
+        d.feed(&data);
+        let mut count = 0;
+        while let Some(f) = d.next_frame() {
+            assert_eq!(f.unwrap().message, b"<13>x");
+            count += 1;
+        }
+        assert_eq!((count, d.buffered()), (n, 0));
+        let mut d = Decoder::new();
+        d.feed(&vec![b'\n'; 6 * n]);
+        assert_eq!(d.next_frame(), None);
+        assert_eq!(d.buffered(), 0);
+        // One frame taken out between feeds of a byte.
+        let mut d = Decoder::new();
+        d.feed(&data);
+        for _ in 0..n {
+            assert!(d.next_frame().unwrap().is_ok());
+            d.feed(b"\n");
+        }
+        assert_eq!(d.next_frame(), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+        // Bytes held after a frame is taken still count, and still frame.
+        let mut d = Decoder::new();
+        d.feed(b"<13>a\n<13>b\n<13>");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>a");
+        assert_eq!(d.buffered(), 10);
+        d.feed(b"c\n");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>b");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>c");
+        assert_eq!(d.buffered(), 0);
+    }
+
+    #[test]
+    fn finish_takes_the_last_unended_message() {
+        // A sender that closes the connection after a message with no
+        // newline still sent that message.
+        let mut d = Decoder::new();
+        d.feed(b"<13>a\n<13>last");
+        assert_eq!(d.next_frame().unwrap().unwrap().message, b"<13>a");
+        assert_eq!(d.next_frame(), None);
+        assert_eq!(d.finish(), Some(Frame::new(Framing::NonTransparent, b"<13>last".to_vec())));
+        assert_eq!(d.buffered(), 0);
+        assert_eq!(d.finish(), None);
+        // A partial octet counted message, a broken stream and an empty
+        // one give nothing.
+        let mut d = Decoder::new();
+        d.feed(b"10 <13>");
+        assert_eq!(d.next_frame(), None);
+        assert_eq!(d.finish(), None);
+        let mut d = Decoder::new();
+        d.feed(b"1x");
+        assert!(d.next_frame().unwrap().is_err());
+        assert_eq!(d.finish(), None);
+        assert_eq!(Decoder::new().finish(), None);
+        // The rest of a message already cut gives nothing either, and an
+        // unended message past the limit is cut.
+        let mut d = Decoder::new();
+        d.feed(&vec![b'<'; MAX_MESSAGE_LEN + 2]);
+        assert!(d.next_frame().unwrap().unwrap().truncated);
+        d.feed(b"more");
+        assert_eq!(d.next_frame(), None);
+        assert_eq!(d.finish(), None);
+        let mut d = Decoder::new();
+        d.feed(&vec![b'<'; MAX_MESSAGE_LEN + 1]);
+        assert_eq!(d.next_frame(), None);
+        let f = d.finish().unwrap();
+        assert_eq!((f.message.len(), f.truncated), (MAX_MESSAGE_LEN, true));
+        // A decoder can be copied mid-stream.
+        let mut d = Decoder::new();
+        d.feed(b"<13>x");
+        let mut e = d.clone();
+        e.feed(b"\n");
+        assert_eq!(e.next_frame().unwrap().unwrap().message, b"<13>x");
+        assert_eq!(d.next_frame(), None);
+    }
+
+    #[test]
+    fn module_example() {
+        let mut message = Message::new(Priority::new(Facility::Auth, Severity::Critical));
+        message.hostname = Some("mymachine.example.com".into());
+        message.app_name = Some("su".into());
+        message.msg_id = Some("ID47".into());
+        message.structured_data.push(SdElement::new("origin").param("ip", "192.0.2.1"));
+        message.msg = b"'su root' failed".to_vec();
+        let bytes = message.to_bytes();
+        assert_eq!(bytes, b"<34>1 - mymachine.example.com su - ID47 [origin ip=\"192.0.2.1\"] 'su root' failed");
+        let mut decoder = Decoder::new();
+        decoder.feed(&Frame::new(Framing::OctetCounting, bytes.clone()).to_bytes());
+        decoder.feed(&Frame::new(Framing::NonTransparent, bytes).to_bytes());
+        decoder.feed(b"<13>Oct  5 12:00:00 gw sshd[42]: Accepted publickey\n");
+        let mut got = Vec::new();
+        while let Some(frame) = decoder.next_frame() {
+            got.push(Entry::parse(&frame.unwrap().message).unwrap());
+        }
+        assert_eq!(got.len(), 3);
+        assert_eq!(got[0], Entry::Rfc5424(message));
+        let Entry::Bsd(bsd) = &got[2] else { panic!("not a BSD message") };
+        assert_eq!(bsd.priority.facility, Facility::User);
+        assert_eq!(bsd.priority.severity, Severity::Notice);
+        assert_eq!(bsd.tag.as_deref(), Some("sshd"));
+        assert_eq!(bsd.pid.as_deref(), Some("42"));
+        assert_eq!(bsd.content, b"Accepted publickey");
+    }
+
+    /// A small deterministic generator, so the fuzz loop needs no crates.
+    struct Lcg(u64);
+
+    impl Lcg {
+        fn next(&mut self) -> u32 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (self.0 >> 33) as u32
+        }
+        fn below(&mut self, n: usize) -> usize {
+            self.next() as usize % n.max(1)
+        }
+        fn pick<'a>(&mut self, items: &[&'a [u8]]) -> &'a [u8] {
+            items[self.below(items.len())]
+        }
+        fn string(&mut self, max: usize) -> String {
+            let alphabet = ["a", "Z", "0", "-", "=", " ", "]", "\"", "\\", "é", "[", ":", "\n", "_", "@"];
+            (0..self.below(max + 1)).map(|_| alphabet[self.below(alphabet.len())]).collect()
+        }
+    }
+
+    /// Reading, writing and reading again gives the same value, and the
+    /// written bytes are a fixed point.
+    fn check_round_trip(raw: &[u8]) {
+        if let Ok(m) = Message::parse(raw) {
+            let bytes = m.to_bytes();
+            assert_eq!(Message::parse(&bytes).as_ref(), Ok(&m), "{:?}", String::from_utf8_lossy(raw));
+        }
+        if let Ok(m) = BsdMessage::parse(raw) {
+            let bytes = m.to_bytes();
+            assert_eq!(BsdMessage::parse(&bytes).as_ref(), Ok(&m), "{:?}", String::from_utf8_lossy(raw));
+        }
+        if let Ok(e) = Entry::parse(raw) {
+            assert_eq!(Entry::parse(&e.to_bytes()), Ok(e));
+        }
+    }
+
+    /// Every result a decoder gives for `data` fed in pieces of the sizes
+    /// `sizes` gives, up to and including the first error, then what
+    /// [`Decoder::finish`] gives.
+    fn decode_in_pieces(
+        data: &[u8],
+        mut sizes: impl FnMut() -> usize,
+    ) -> (Vec<Result<Frame, FrameError>>, Option<Frame>) {
+        let mut d = Decoder::new();
+        let mut out = Vec::new();
+        let mut rest = data;
+        let mut broken = false;
+        while !rest.is_empty() && !broken {
+            let (piece, after) = rest.split_at(sizes().clamp(1, rest.len()));
+            rest = after;
+            d.feed(piece);
+            while let Some(r) = d.next_frame() {
+                broken = r.is_err();
+                out.push(r);
+                if broken {
+                    break;
+                }
+                assert!(d.buffered() <= MAX_MESSAGE_LEN + piece.len() + 24);
+            }
+        }
+        let last = d.finish();
+        assert_eq!(d.buffered(), 0);
+        (out, last)
+    }
+
+    fn check_stream(data: &[u8], rng: &mut Lcg) {
+        // The same results whether the bytes come all at once, one at a
+        // time, or in pieces of random sizes.
+        let whole = decode_in_pieces(data, || usize::MAX);
+        assert_eq!(decode_in_pieces(data, || 1), whole, "{:?}", String::from_utf8_lossy(data));
+        let max = rng.below(64) + 1;
+        let mut sizes = Lcg(rng.next().into());
+        assert_eq!(decode_in_pieces(data, || sizes.below(max) + 1), whole);
+        let (results, last) = whole;
+        for f in results.iter().filter_map(|r| r.as_ref().ok()).chain(&last) {
+            assert!(!f.message.is_empty() && f.message.len() <= MAX_MESSAGE_LEN);
+            // A frame read can be written, and reads back the same. What is
+            // written is whole, even when what was read had been cut.
+            let mut d = Decoder::new();
+            d.feed(&f.to_bytes());
+            let whole = Frame { truncated: false, ..f.clone() };
+            assert_eq!(d.next_frame().as_ref(), Some(&Ok(whole)));
+            check_round_trip(&f.message);
+        }
+    }
+
+    #[test]
+    fn lcg_fuzz() {
+        let mut rng = Lcg(0x5eed_5151_0601);
+        let pieces: &[&[u8]] = &[
+            b"<34>",
+            b"<165>",
+            b"<0>",
+            b"<192>",
+            b"<",
+            b">",
+            b"1",
+            b"12",
+            b" ",
+            b"-",
+            b"2003-10-11T22:14:15.003Z",
+            b"2003-08-24T05:14:15.000003-07:00",
+            b"host",
+            b"[",
+            b"]",
+            b"id@1",
+            b"=",
+            b"\"",
+            b"\\",
+            b"v",
+            b"\xef\xbb\xbf",
+            b"\xff",
+            b"Oct 11 22:14:15",
+            b"Feb  5 17:32:18",
+            b"tag",
+            b"[42]",
+            b":",
+            b"\n",
+            b"\r",
+            b"7 ",
+            b"\xc3\xa9",
+        ];
+        for _ in 0..4000 {
+            // Bytes built from pieces of real messages, and plain noise.
+            let mut buf = Vec::new();
+            for _ in 0..rng.below(24) {
+                if rng.below(4) == 0 {
+                    buf.push(rng.next() as u8);
+                } else {
+                    buf.extend_from_slice(rng.pick(pieces));
+                }
+            }
+            check_round_trip(&buf);
+            check_stream(&buf, &mut rng);
+            for n in 0..buf.len() {
+                let _ = Entry::parse(&buf[..n]);
+            }
+        }
+        for _ in 0..12 {
+            // Streams with messages near and past the length limit, framed
+            // both ways, some with CR LF trailers and some left unended.
+            let mut buf = Vec::new();
+            let count = rng.below(4) + 1;
+            for i in 0..count {
+                let len = MAX_MESSAGE_LEN - 2 + rng.below(5);
+                if rng.below(3) == 0 {
+                    buf.extend_from_slice(format!("{len} ").as_bytes());
+                    buf.extend_from_slice(&vec![b'<'; len]);
+                } else {
+                    buf.extend_from_slice(&vec![b'<'; len]);
+                    if i + 1 < count || rng.below(2) == 0 {
+                        buf.extend_from_slice(rng.pick(&[b"\n", b"\r\n", b"\r\r\n"]));
+                    }
+                }
+            }
+            check_stream(&buf, &mut rng);
+        }
+        for _ in 0..2000 {
+            // Messages built from random values: what is written reads back,
+            // and writing that again gives the same bytes.
+            let mut m = Message::new(Priority::from_value(rng.below(192) as u8).unwrap());
+            m.version = rng.below(1200) as u16;
+            if rng.below(2) == 0 {
+                m.timestamp = Some(Timestamp {
+                    year: rng.below(10500) as u16,
+                    month: rng.below(14) as u8,
+                    day: rng.below(33) as u8,
+                    hour: rng.below(26) as u8,
+                    minute: rng.below(62) as u8,
+                    second: rng.below(62) as u8,
+                    fraction: if rng.below(2) == 0 {
+                        None
+                    } else {
+                        Some(Fraction { value: rng.next(), digits: rng.below(9) as u8 })
+                    },
+                    offset: if rng.below(2) == 0 { Offset::Utc } else { Offset::Minutes(rng.next() as i16) },
+                });
+            }
+            m.hostname = (rng.below(3) > 0).then(|| rng.string(300));
+            m.app_name = (rng.below(3) > 0).then(|| rng.string(60));
+            m.proc_id = (rng.below(3) > 0).then(|| rng.string(10));
+            m.msg_id = (rng.below(3) > 0).then(|| rng.string(40));
+            for _ in 0..rng.below(4) {
+                let mut e = SdElement::new(rng.string(40));
+                for _ in 0..rng.below(4) {
+                    e = e.param(rng.string(5), rng.string(10));
+                }
+                m.structured_data.push(e);
+            }
+            m.bom = rng.below(2) == 0;
+            m.msg = if rng.below(2) == 0 {
+                rng.string(20).into_bytes()
+            } else {
+                (0..rng.below(20)).map(|_| rng.next() as u8).collect()
+            };
+            let bytes = m.to_bytes();
+            let back = Message::parse(&bytes).unwrap_or_else(|e| panic!("{e}: {:?}", String::from_utf8_lossy(&bytes)));
+            assert_eq!(back.to_bytes(), bytes);
+            check_stream(&Frame::new(Framing::NonTransparent, bytes.clone()).to_bytes(), &mut rng);
+
+            let mut b = BsdMessage::new(m.priority, m.msg.clone());
+            if rng.below(2) == 0 {
+                b.header = Some(BsdHeader {
+                    timestamp: BsdTimestamp {
+                        month: rng.below(14) as u8,
+                        day: rng.below(33) as u8,
+                        hour: rng.below(26) as u8,
+                        minute: rng.below(62) as u8,
+                        second: rng.below(62) as u8,
+                    },
+                    hostname: rng.string(10),
+                });
+            }
+            b.tag = (rng.below(2) == 0).then(|| rng.string(8));
+            b.pid = (rng.below(2) == 0).then(|| rng.string(4));
+            let bytes = b.to_bytes();
+            // Content without a tag may read back as one, so the value
+            // read is what must stay the same.
+            let back = BsdMessage::parse(&bytes).unwrap();
+            assert_eq!(
+                BsdMessage::parse(&back.to_bytes()).as_ref(),
+                Ok(&back),
+                "{:?}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    }
+}
