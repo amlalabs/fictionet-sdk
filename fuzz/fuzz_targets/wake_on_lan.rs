@@ -1,11 +1,13 @@
 //! Wake-on-LAN payloads, as a world playing a sleeping host or a tool reads
 //! them, and magic packets a world builds, as it writes them.
 #![no_main]
+#![allow(deprecated)] // Also check the unchanged compatibility scanner.
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::wake_on_lan::{
-    MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, PACKET_LEN, ParseError, Password, Scanner,
-    wakes,
+    MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, PACKET_LEN, Packets, ParseError, Password,
+    Scanner, wakes,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -32,7 +34,9 @@ fn wakes_slowly(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
     }
     let pw: &[u8] = password.map_or(&[][..], |p| p.as_bytes());
     (0..payload.len()).any(|i| {
-        let Some(rest) = payload.get(i..) else { return false };
+        let Some(rest) = payload.get(i..) else {
+            return false;
+        };
         rest.len() >= PACKET_LEN + pw.len()
             && rest[..6].iter().all(|&b| b == 0xff)
             && (0..16).all(|k| rest[6 + 6 * k..12 + 6 * k] == mac)
@@ -68,6 +72,7 @@ fn built(data: &[u8]) -> Result<()> {
         _ => Some(Password::Six(u.arbitrary()?)),
     };
     let packet = MagicPacket { mac, password };
+    contract::check_wire_value(&packet);
     let bytes = packet.to_bytes();
     assert_eq!(bytes.len(), packet.len());
     assert!(bytes.len() <= MAX_PACKET_LEN);
@@ -77,6 +82,8 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Packets::new, data);
+    contract::check_wire::<MagicPacket>(data);
     // The payload read three ways: whole, and by a scanner fed all at once
     // and a byte at a time. All give the same answer.
     let found = MagicPacket::find(data);

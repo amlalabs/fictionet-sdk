@@ -4,11 +4,43 @@
 //! pieces, a byte at a time, or while earlier values still wait, which
 //! must find what one-shot parsing finds.
 #![no_main]
+#![allow(deprecated)] // Also check the unchanged compatibility decoder.
 
-use fictionet::stdlib::resp::{Command, Decoder, Limits, ParseError, Value, Version};
+use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::resp::{
+    Command, Commands, Decoder, Limits, MAX_LINE_LEN, ParseError, Value, Values, Version, WireError, WriteError,
+};
 use libfuzzer_sys::fuzz_target;
 
+// Equality for the contract harness treats NaN as its RESP wire value.
+// Value's existing floating-point PartialEq remains unchanged.
+#[derive(Debug)]
+struct WireValue(Value);
+impl PartialEq for WireValue {
+    fn eq(&self, other: &Self) -> bool {
+        wire_same(&self.0, &other.0)
+    }
+}
+impl Wire for WireValue {
+    type ParseError = WireError;
+    type WriteError = WriteError;
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        <Value as Wire>::parse(bytes).map(Self)
+    }
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        Wire::write(&self.0, out)
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Values::new().map(WireValue), data);
+    contract::check_decode(Commands::new, data);
+    contract::check_wire::<WireValue>(data);
+    contract::check_wire::<Command>(data);
+    contract::check_wire_value(&WireValue(Value::simple(
+        data.iter().take(MAX_LINE_LEN + 1).copied().collect::<Vec<_>>(),
+    )));
+    contract::check_wire_value(&Command::new([data.get(..MAX_LINE_LEN).unwrap_or(data)]));
     if let Ok(Some((v, used))) = Value::parse(data) {
         assert!(used <= data.len());
         // What was read can be written in either version, that reads again
@@ -42,6 +74,8 @@ fuzz_target!(|data: &[u8]| {
         max_frame_len: rng.below(data.len() + 2),
     };
     for limits in [Limits::DEFAULT, small, drawn] {
+        contract::check_decode(|| Values::with_limits(limits).map(WireValue), data);
+        contract::check_decode(|| Commands::with_limits(limits), data);
         let values = one_shot(data, |b| Value::parse_with(b, &limits), |v| v.to_bytes(Version::Resp3));
         // The decoder skips commands with no arguments, as Redis does.
         let commands: Vec<_> = one_shot(data, |b| Command::parse_with(b, &limits), |c| c.args.clone())
@@ -107,6 +141,24 @@ fn same(a: &Value, b: &Value) -> bool {
         (Value::Map(x), Value::Map(y)) => pairs(x, y),
         (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
             pairs(x, y) && same(v, w)
+        }
+        _ => a == b,
+    }
+}
+
+fn wire_same(a: &Value, b: &Value) -> bool {
+    let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| wire_same(x, y));
+    let pairs = |x: &[(Value, Value)], y: &[(Value, Value)]| {
+        x.len() == y.len() && x.iter().zip(y).all(|((a, b), (c, d))| wire_same(a, c) && wire_same(b, d))
+    };
+    match (a, b) {
+        (Value::Double(x), Value::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
+        (Value::Array(x), Value::Array(y)) | (Value::Set(x), Value::Set(y)) | (Value::Push(x), Value::Push(y)) => {
+            all(x, y)
+        }
+        (Value::Map(x), Value::Map(y)) => pairs(x, y),
+        (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
+            pairs(x, y) && wire_same(v, w)
         }
         _ => a == b,
     }

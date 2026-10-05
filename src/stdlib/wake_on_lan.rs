@@ -27,6 +27,10 @@
 //! likes. A payload longer than [`MAX_PAYLOAD`] is refused. What the
 //! writer produces, the reader reads back the same.
 //!
+//! New stacks use [`Packets`] with [`codec::Stream`] for one datagram
+//! ending at EOF. [`Wire`] for [`MagicPacket`] reads exactly one packet
+//! at offset zero. The inherent parsers still search the payload.
+//!
 //! ```
 //! use fictionet::stdlib::wake_on_lan::{wakes, MagicPacket, Password, PACKET_LEN, PORT};
 //!
@@ -54,6 +58,11 @@
 //! assert!(wakes(&locked, mac, None));
 //! assert!(!wakes(&locked, [0x00, 0x11, 0x22, 0x33, 0x44, 0x56], None));
 //! ```
+
+extern crate alloc;
+
+use super::codec::{self, Decode, Wire};
+use alloc::vec::Vec;
 
 /// The UDP port senders use most often, the discard port.
 pub const PORT: u16 = 9;
@@ -133,8 +142,8 @@ pub enum ParseError {
     NotFound,
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ParseError::TooLong => write!(f, "payload longer than {MAX_PAYLOAD} bytes"),
             ParseError::NotFound => write!(f, "no magic packet in the payload"),
@@ -142,7 +151,7 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
 /// The address of the magic packet that starts at `bytes[0]`, if one does.
 /// The packet must be whole: `bytes` holds at least [`PACKET_LEN`] bytes.
@@ -245,6 +254,94 @@ impl MagicPacket {
     }
 }
 
+/// Why bytes are not exactly one magic packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketError {
+    /// The length is not 102, 106, or 108 bytes.
+    Length,
+    /// The sync bytes or repeated addresses do not match.
+    Malformed,
+}
+
+impl core::fmt::Display for PacketError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Length => "magic packet length must be 102, 106, or 108 bytes",
+            Self::Malformed => "invalid magic packet sync or address repeats",
+        })
+    }
+}
+
+impl core::error::Error for PacketError {}
+
+impl Wire for MagicPacket {
+    type ParseError = PacketError;
+    type WriteError = core::convert::Infallible;
+
+    /// Reads one packet at offset zero, with an optional 4 or 6 byte password.
+    /// The inherent parser still searches an entire payload.
+    fn parse(bytes: &[u8]) -> Result<Self, PacketError> {
+        let tail = bytes.get(PACKET_LEN..).ok_or(PacketError::Length)?;
+        let password = if tail.is_empty() {
+            None
+        } else {
+            Some(Password::from_bytes(tail).ok_or(PacketError::Length)?)
+        };
+        let mac = packet_at(bytes).ok_or(PacketError::Malformed)?;
+        Ok(Self { mac, password })
+    }
+
+    /// Appends at most [`MAX_PACKET_LEN`] bytes. Every packet is representable.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+        out.extend_from_slice(&self.to_bytes());
+        Ok(())
+    }
+}
+
+/// Finds the first magic packet in one payload ending at EOF.
+///
+/// Use a fresh [`codec::Stream`] for each datagram. The item contains its
+/// offset and packet, as [`MagicPacket::find`] returns them. Passwords are
+/// determined at EOF. Missing packets and oversized payloads are terminal
+/// [`ParseError`]s. No input is retained outside the stream's buffer.
+/// Capacity is [`MAX_PAYLOAD`] plus one byte to detect an oversized payload.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Packets {
+    done: bool,
+}
+
+impl Packets {
+    /// Creates a decoder for one datagram payload.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decode for Packets {
+    type Item = (usize, MagicPacket);
+    type Error = ParseError;
+    const NAME: &'static str = "Wake-on-LAN";
+
+    fn capacity(&self) -> usize {
+        MAX_PAYLOAD + 1
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, ParseError> {
+        if self.done {
+            return Ok(codec::Step::End);
+        }
+        if input.len() > MAX_PAYLOAD {
+            return Err(ParseError::TooLong);
+        }
+        if !eof {
+            return Ok(codec::Step::Need);
+        }
+        let packet = MagicPacket::find(input)?;
+        self.done = true;
+        Ok(codec::Step::Item(packet, input.len()))
+    }
+}
+
 /// Whether `payload` wakes a card with address `mac` and, if it has one
 /// set, SecureOn `password`, as the card itself decides.
 ///
@@ -277,7 +374,11 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
 /// it arrives. It holds at most [`PACKET_LEN`] bytes of the payload at a
 /// time, and gives the same answer as [`MagicPacket::find`] would on the
 /// whole payload.
+/// This compatibility type retains its early [`Scanner::found`] result
+/// and repeated [`Scanner::finish`] calls. Use [`Packets`] with
+/// [`codec::Stream`] for the EOF-driven interface.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[deprecated(note = "use codec::Stream with wake_on_lan::Packets for one payload ending at EOF")]
 pub struct Scanner {
     /// How many bytes of the payload have been fed, up to one past
     /// [`MAX_PAYLOAD`].
@@ -294,12 +395,14 @@ pub struct Scanner {
     tail_len: usize,
 }
 
+#[allow(deprecated)]
 impl Default for Scanner {
     fn default() -> Self {
         Scanner::new()
     }
 }
 
+#[allow(deprecated)]
 impl Scanner {
     /// A scanner at the start of a payload.
     pub fn new() -> Scanner {
@@ -377,6 +480,7 @@ impl Scanner {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 

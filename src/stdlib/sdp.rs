@@ -15,6 +15,10 @@
 //! Which codecs a world accepts, and what it does with the media, is up
 //! to world code.
 //!
+//! New stacks use [`Descriptions`] with [`codec::Stream`] for one body
+//! ending at EOF. [`SessionDescription`] implements [`Wire`] using the
+//! same parsing and writing rules as its inherent methods.
+//!
 //! Every reader checks the line order, each field's syntax and the size
 //! limits below, because the agent can send any bytes it likes. Lines may
 //! end with CRLF or a bare LF, as RFC 8866 asks parsers to accept. The
@@ -61,6 +65,15 @@
 //! assert!(bytes.ends_with(b"m=audio 3456 RTP/AVP 0 96\r\na=rtpmap:96 opus/48000/2\r\na=recvonly\r\n"));
 //! assert_eq!(SessionDescription::parse(&bytes), Ok(answer));
 //! ```
+
+extern crate alloc;
+
+use super::codec::{self, Decode, Wire};
+use alloc::{
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// The media type SDP bodies carry, in a `Content-Type` header.
 pub const MIME_TYPE: &str = "application/sdp";
@@ -302,13 +315,17 @@ pub enum Error {
     Missing(char),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::TooLong => write!(f, "description longer than {MAX_LEN} bytes"),
             Error::TooManyLines => write!(f, "description has more than {MAX_LINES} lines"),
-            Error::LineTooLong { line } => write!(f, "line {line} is longer than {MAX_LINE_LEN} bytes"),
-            Error::Malformed { line } => write!(f, "line {line} is not a type letter, '=' and a value"),
+            Error::LineTooLong { line } => {
+                write!(f, "line {line} is longer than {MAX_LINE_LEN} bytes")
+            }
+            Error::Malformed { line } => {
+                write!(f, "line {line} is not a type letter, '=' and a value")
+            }
             Error::UnknownType { line, kind } => write!(f, "line {line} has unknown type '{kind}'"),
             Error::Encoding { line } => write!(f, "line {line} is not UTF-8"),
             Error::Syntax { line, kind } => write!(f, "line {line} is a malformed '{kind}=' line"),
@@ -318,7 +335,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 // The order of lines. A stage is the rank of the last line read; a line
 // may follow if its rank is higher, or the same and its type repeats.
@@ -380,22 +397,118 @@ fn next_stage(cur: u8, kind: u8) -> Option<u8> {
     (cur >= floor && (cur < rank || (cur == rank && repeats))).then_some(rank)
 }
 
+/// Reads one session description and emits it at EOF.
+///
+/// Use a fresh [`codec::Stream`] for each body. Complete lines are consumed
+/// as they arrive. The input capacity is [`MAX_LINE_LEN`] plus CRLF.
+/// Parsed state is bounded by [`MAX_LEN`] and [`MAX_LINES`]. As in
+/// [`SessionDescription::parse`], bare LF and a final line without an
+/// ending are accepted. Each ending counts as CRLF toward [`MAX_LEN`].
+/// Syntax, limit, and missing-field errors end the body with [`Error`].
+#[derive(Debug)]
+pub struct Descriptions {
+    description: Option<Description>,
+    total: usize,
+    lines: usize,
+    scanned: usize,
+}
+
+impl Default for Descriptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Descriptions {
+    /// Creates a decoder for one body.
+    pub fn new() -> Self {
+        Self { description: Some(Description::default()), total: 0, lines: 0, scanned: 0 }
+    }
+
+    fn line(&mut self, bytes: &[u8], used: usize) -> Result<codec::Step<SessionDescription>, Error> {
+        let text = bytes.strip_suffix(b"\r").unwrap_or(bytes);
+        let total = self.total.checked_add(text.len()).and_then(|n| n.checked_add(2)).ok_or(Error::TooLong)?;
+        if total > MAX_LEN {
+            return Err(Error::TooLong);
+        }
+        self.total = total;
+        self.lines = self.lines.checked_add(1).ok_or(Error::TooManyLines)?;
+        if self.lines > MAX_LINES {
+            return Err(Error::TooManyLines);
+        }
+        if text.len() > MAX_LINE_LEN {
+            return Err(Error::LineTooLong { line: self.lines });
+        }
+        if let Some(description) = &mut self.description {
+            description.read_line(text, self.lines)?;
+        }
+        self.scanned = 0;
+        Ok(codec::Step::Skip(used))
+    }
+}
+
+impl Decode for Descriptions {
+    type Item = SessionDescription;
+    type Error = Error;
+    const NAME: &'static str = "SDP";
+
+    fn capacity(&self) -> usize {
+        MAX_LINE_LEN + 2
+    }
+
+    /// Counts consumed line bytes, including their canonical CRLF endings.
+    fn held(&self) -> usize {
+        if self.description.is_some() { self.total } else { 0 }
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<SessionDescription>, Error> {
+        if self.description.is_none() {
+            return Ok(codec::Step::End);
+        }
+        // Resume at the first new byte. No line is copied while waiting.
+        for (i, &byte) in input.iter().enumerate().skip(self.scanned) {
+            let used = i.checked_add(1).ok_or(Error::TooLong)?;
+            let bare_lf = byte == b'\n' && i.checked_sub(1).and_then(|n| input.get(n)) != Some(&b'\r');
+            if self.total.saturating_add(used).saturating_add(usize::from(bare_lf)) > MAX_LEN {
+                return Err(Error::TooLong);
+            }
+            if byte == b'\n' {
+                return self.line(input.get(..i).unwrap_or_default(), used);
+            }
+            if used > MAX_LINE_LEN + 1 {
+                return Err(Error::LineTooLong { line: self.lines.saturating_add(1) });
+            }
+        }
+        self.scanned = input.len();
+        if !eof {
+            return Ok(codec::Step::Need);
+        }
+        if !input.is_empty() {
+            return self.line(input, input.len());
+        }
+        let Some(description) = self.description.take() else {
+            return Ok(codec::Step::End);
+        };
+        Ok(codec::Step::Item(description.finish()?, 0))
+    }
+}
+
 /// Reads a session description as its bytes come, a chunk at a time.
 /// Feed it every byte of the body, then call [`Decoder::finish`]. It holds
 /// at most one partial line, and stops reading at the first error.
+/// This compatibility type retains its immediate [`Decoder::error`]
+/// reporting. New callers can use [`Descriptions`] with [`codec::Stream`].
 #[derive(Debug, Default)]
+#[deprecated(note = "use codec::Stream with sdp::Descriptions")]
 pub struct Decoder {
     line: Vec<u8>,
     total: usize,
     lines: usize,
-    stage: u8,
-    desc: SessionDescription,
-    /// The line of a session-level `a=charset` that names a character set
-    /// other than UTF-8.
-    charset: Option<usize>,
+    description: Description,
     failed: Option<Error>,
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder that has read nothing.
     pub fn new() -> Decoder {
@@ -448,6 +561,48 @@ impl Decoder {
         if let Some(e) = self.failed {
             return Err(e);
         }
+        self.description.finish()
+    }
+
+    fn fail(&mut self, e: Error) {
+        self.failed = Some(e);
+        self.line = Vec::new();
+    }
+
+    fn end_line(&mut self) {
+        let mut line = core::mem::take(&mut self.line);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        self.lines += 1;
+        let n = self.lines;
+        if n > MAX_LINES {
+            return self.fail(Error::TooManyLines);
+        }
+        if line.len() > MAX_LINE_LEN {
+            return self.fail(Error::LineTooLong { line: n });
+        }
+        if let Err(e) = self.description.read_line(&line, n) {
+            self.fail(e);
+        }
+        // Keep the buffer's room for the next line.
+        line.clear();
+        self.line = line;
+    }
+}
+
+/// Parsed lines shared by both input drivers.
+#[derive(Debug, Default)]
+struct Description {
+    stage: u8,
+    desc: SessionDescription,
+    /// The line of a session-level `a=charset` that names a character set
+    /// other than UTF-8.
+    charset: Option<usize>,
+}
+
+impl Description {
+    fn finish(self) -> Result<SessionDescription, Error> {
         match self.stage {
             0 => return Err(Error::Missing('v')),
             V => return Err(Error::Missing('o')),
@@ -467,32 +622,6 @@ impl Decoder {
         Ok(desc)
     }
 
-    fn fail(&mut self, e: Error) {
-        self.failed = Some(e);
-        self.line = Vec::new();
-    }
-
-    fn end_line(&mut self) {
-        let mut line = std::mem::take(&mut self.line);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        self.lines += 1;
-        let n = self.lines;
-        if n > MAX_LINES {
-            return self.fail(Error::TooManyLines);
-        }
-        if line.len() > MAX_LINE_LEN {
-            return self.fail(Error::LineTooLong { line: n });
-        }
-        if let Err(e) = self.read_line(&line, n) {
-            self.fail(e);
-        }
-        // Keep the buffer's room for the next line.
-        line.clear();
-        self.line = line;
-    }
-
     fn read_line(&mut self, line: &[u8], n: usize) -> Result<(), Error> {
         let (&kind, rest) = line.split_first().ok_or(Error::Malformed { line: n })?;
         if !kind.is_ascii_lowercase() || rest.first() != Some(&b'=') {
@@ -502,7 +631,7 @@ impl Decoder {
         if !b"vosiuepcbtrzkam".contains(&kind) {
             return Err(Error::UnknownType { line: n, kind: k });
         }
-        let value = std::str::from_utf8(&rest[1..]).map_err(|_| Error::Encoding { line: n })?;
+        let value = core::str::from_utf8(&rest[1..]).map_err(|_| Error::Encoding { line: n })?;
         let stage = next_stage(self.stage, kind).ok_or(Error::Order { line: n, kind: k })?;
         self.stage = stage;
         self.apply(stage, value).ok_or(Error::Syntax { line: n, kind: k })?;
@@ -729,8 +858,8 @@ fn is_fqdn(s: &str) -> bool {
 /// `non-ws-string`.
 fn is_origin_address(addr_type: &str, a: &str) -> bool {
     match addr_type {
-        "IP4" => a.parse::<std::net::Ipv4Addr>().is_ok() || is_fqdn(a),
-        "IP6" => a.parse::<std::net::Ipv6Addr>().is_ok() || is_fqdn(a),
+        "IP4" => a.parse::<core::net::Ipv4Addr>().is_ok() || is_fqdn(a),
+        "IP6" => a.parse::<core::net::Ipv6Addr>().is_ok() || is_fqdn(a),
         _ => is_non_ws(a),
     }
 }
@@ -753,13 +882,13 @@ fn is_connection(c: &Connection, session: bool) -> bool {
     // `numaddr`, which only the media level may give.
     let count = |n: Option<&str>| n.is_none() || (!session && n.and_then(integer).is_some());
     if v6 {
-        match base.parse::<std::net::Ipv6Addr>() {
+        match base.parse::<core::net::Ipv6Addr>() {
             Ok(ip) if ip.is_multicast() => second.is_none() && count(first),
             Ok(_) => first.is_none(),
             Err(_) => first.is_none() && is_fqdn(base),
         }
     } else {
-        match base.parse::<std::net::Ipv4Addr>() {
+        match base.parse::<core::net::Ipv4Addr>() {
             Ok(ip) if ip.is_multicast() => {
                 // `ttl`: "0", or up to three digits with no leading zero,
                 // and at most 255.
@@ -776,8 +905,8 @@ fn is_connection(c: &Connection, session: bool) -> bool {
 fn is_multicast(c: &Connection) -> bool {
     let base = c.address.split('/').next().unwrap_or("");
     match c.addr_type.as_str() {
-        "IP4" => base.parse::<std::net::Ipv4Addr>().is_ok_and(|ip| ip.is_multicast()),
-        "IP6" => base.parse::<std::net::Ipv6Addr>().is_ok_and(|ip| ip.is_multicast()),
+        "IP4" => base.parse::<core::net::Ipv4Addr>().is_ok_and(|ip| ip.is_multicast()),
+        "IP6" => base.parse::<core::net::Ipv6Addr>().is_ok_and(|ip| ip.is_multicast()),
         _ => false,
     }
 }
@@ -846,11 +975,15 @@ fn is_authority(a: &str) -> bool {
 /// The inside of an RFC 3986 `IP-literal`: an IPv6 address, or
 /// `IPvFuture`.
 fn is_ip_literal(s: &str) -> bool {
-    if s.parse::<std::net::Ipv6Addr>().is_ok() {
+    if s.parse::<core::net::Ipv6Addr>().is_ok() {
         return true;
     }
-    let Some(rest) = s.strip_prefix(['v', 'V']) else { return false };
-    let Some((version, addr)) = rest.split_once('.') else { return false };
+    let Some(rest) = s.strip_prefix(['v', 'V']) else {
+        return false;
+    };
+    let Some((version, addr)) = rest.split_once('.') else {
+        return false;
+    };
     !version.is_empty()
         && version.bytes().all(|b| b.is_ascii_hexdigit())
         && !addr.is_empty()
@@ -1055,8 +1188,8 @@ fn typed_time(s: &str) -> Option<u64> {
 /// longer than any other way of writing the same number of seconds.
 struct TypedTime(u64);
 
-impl std::fmt::Display for TypedTime {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TypedTime {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let s = self.0;
         for (unit, len) in [('d', 86_400), ('h', 3_600), ('m', 60)] {
             if s != 0 && s.is_multiple_of(len) {
@@ -1075,8 +1208,8 @@ struct LineBuf<'a> {
     over: bool,
 }
 
-impl std::fmt::Write for LineBuf<'_> {
-    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+impl core::fmt::Write for LineBuf<'_> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
         if self.over || self.out.len() - self.start + s.len() > MAX_LINE_LEN {
             self.over = true;
         } else {
@@ -1099,7 +1232,7 @@ impl Writer {
         &mut self,
         kind: char,
         ok: bool,
-        value: impl FnOnce(&mut LineBuf<'_>) -> std::fmt::Result,
+        value: impl FnOnce(&mut LineBuf<'_>) -> core::fmt::Result,
     ) -> Result<(), Error> {
         self.lines += 1;
         let line = self.lines;
@@ -1111,8 +1244,8 @@ impl Writer {
         }
         let start = self.out.len();
         let mut buf = LineBuf { out: &mut self.out, start, over: false };
-        let _ = std::fmt::Write::write_char(&mut buf, kind);
-        let _ = std::fmt::Write::write_char(&mut buf, '=');
+        let _ = core::fmt::Write::write_char(&mut buf, kind);
+        let _ = core::fmt::Write::write_char(&mut buf, '=');
         let _ = value(&mut buf);
         let over = buf.over;
         if over {
@@ -1128,21 +1261,21 @@ impl Writer {
     }
 
     fn line(&mut self, kind: char, ok: bool, value: &str) -> Result<(), Error> {
-        self.line_with(kind, ok, |b| std::fmt::Write::write_str(b, value))
+        self.line_with(kind, ok, |b| core::fmt::Write::write_str(b, value))
     }
 
     fn connection(&mut self, c: &Connection, ok: bool) -> Result<(), Error> {
-        use std::fmt::Write;
+        use core::fmt::Write;
         self.line_with('c', ok, |b| write!(b, "{} {} {}", c.net_type, c.addr_type, c.address))
     }
 
     fn bandwidth(&mut self, b: &Bandwidth) -> Result<(), Error> {
-        use std::fmt::Write;
+        use core::fmt::Write;
         self.line_with('b', is_token(&b.kind), |l| write!(l, "{}:{}", b.kind, b.value))
     }
 
     fn attributes(&mut self, attributes: &[Attribute]) -> Result<(), Error> {
-        use std::fmt::Write;
+        use core::fmt::Write;
         for (i, a) in attributes.iter().enumerate() {
             if conflicts(&attributes[..i], a) {
                 self.lines += 1;
@@ -1174,6 +1307,7 @@ impl SessionDescription {
     }
 
     /// Reads a whole description, such as the body of a SIP message.
+    #[allow(deprecated)] // Preserve the one-shot parser and its error order.
     pub fn parse(bytes: &[u8]) -> Result<SessionDescription, Error> {
         let mut d = Decoder::new();
         d.feed(bytes);
@@ -1198,7 +1332,7 @@ impl SessionDescription {
     ///
     /// [`parse`]: SessionDescription::parse
     pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        use std::fmt::Write;
+        use core::fmt::Write;
         if self.times.is_empty() {
             return Err(Error::Missing('t'));
         }
@@ -1321,6 +1455,21 @@ impl SessionDescription {
     }
 }
 
+impl Wire for SessionDescription {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        SessionDescription::parse(bytes)
+    }
+
+    /// Appends the existing CRLF encoding. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
 impl Media {
     /// The first attribute named `name`.
     pub fn attribute(&self, name: &str) -> Option<&Attribute> {
@@ -1360,13 +1509,13 @@ impl Media {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttributeError;
 
-impl std::fmt::Display for AttributeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for AttributeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str("malformed SDP attribute")
     }
 }
 
-impl std::error::Error for AttributeError {}
+impl core::error::Error for AttributeError {}
 
 /// The value of an attribute named `name`, or an error.
 fn value_of<'a>(a: &'a Attribute, name: &str) -> Result<&'a str, AttributeError> {
@@ -1783,6 +1932,7 @@ impl Candidate {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 
