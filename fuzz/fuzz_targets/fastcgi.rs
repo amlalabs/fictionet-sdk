@@ -2,14 +2,13 @@
 //! back together, as a world playing an application or a web server reads
 //! them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the compatibility decoder.
 
+use fictionet::stdlib::codec::{Decode, contract};
 use fictionet::stdlib::fastcgi::{
-    BeginRequest, Client, ClientEvent, Decoder, EndRequest, MAX_BUFFERED, MAX_CONTENT, MAX_HELD, MAX_REQUESTS, Record,
-    Server, ServerEvent, StreamError, encode_pairs, kind, parse_pairs, stream_bytes,
+    BeginRequest, Client, ClientEvent, Decoder, EndRequest, Frames, MAX_BUFFERED, MAX_CONTENT,
+    MAX_HELD, MAX_REQUESTS, Record, Server, ServerEvent, StreamError, encode_pairs, kind,
+    parse_pairs, stream_bytes,
 };
-use fictionet::stdlib::codec::{contract, Decode};
-use fictionet::stdlib::fastcgi::Frames;
 use libfuzzer_sys::fuzz_target;
 
 /// The records in `bytes`, up to the first error.
@@ -26,10 +25,20 @@ fn records(bytes: &[u8]) -> Vec<Record> {
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
     contract::check_wire::<Record>(data);
-    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
-    contract::check_decode(|| Frames::new().map(|record| BeginRequest::parse(&record.content)), data);
-    let built = Record { kind: data.first().copied().unwrap_or(0), request_id: 1,
-        content: data.iter().take(MAX_CONTENT + 1).copied().collect(), padding: data.last().copied().unwrap_or(0) };
+    contract::check_decode(
+        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        data,
+    );
+    contract::check_decode(
+        || Frames::new().map(|record| BeginRequest::parse(&record.content)),
+        data,
+    );
+    let built = Record {
+        kind: data.first().copied().unwrap_or(0),
+        request_id: 1,
+        content: data.iter().take(MAX_CONTENT + 1).copied().collect(),
+        padding: data.last().copied().unwrap_or(0),
+    };
     contract::check_wire_value(&built);
 
     // The stream, split two ways: all at once, and a byte at a time.
@@ -81,7 +90,8 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(got, Some(req));
         }
         // So can a response. One with an error reported is never given.
-        let failed_before = matches!(r.kind, kind::STDOUT | kind::STDERR) && client_failed.contains(&r.request_id);
+        let failed_before =
+            matches!(r.kind, kind::STDOUT | kind::STDERR) && client_failed.contains(&r.request_id);
         let got = client.receive(r);
         match &got {
             Err(StreamError::AfterEnd { id, .. } | StreamError::TooLarge { id, .. }) => {

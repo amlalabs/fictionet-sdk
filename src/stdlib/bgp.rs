@@ -15,9 +15,10 @@
 //! refresh errors) and RFC 9072 (long OPEN optional parameters).
 //!
 //! Nothing here reads a socket. A world that plays a router feeds the
-//! bytes it reads from a TCP connection to a [`Decoder`], gets [`Frame`]s
-//! back, and reads each one with [`Message::decode`]. It writes the bytes
-//! of [`Message::to_bytes`] back to the connection. Which routes exist,
+//! bytes it reads from a TCP connection to [`Frames`] with
+//! [`super::codec::Stream`], gets [`Frame`]s back, and reads each one
+//! with [`Message::decode`]. It writes the bytes of
+//! [`Message::to_bytes`] back to the connection. Which routes exist,
 //! which peers are welcome and when timers fire is up to world code.
 //!
 //! How an UPDATE reads depends on the session: once both speakers have
@@ -34,15 +35,14 @@
 //! Writers check the same rules and return an [`EncodeError`] instead of
 //! bytes a reader would refuse.
 //!
-//! New streams use [`Frames`] with [`super::codec::Stream`] for bounded
-//! input and explicit EOF handling. The example below uses the compatibility
-//! decoder, which keeps its original feed behavior.
+//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
+//! EOF handling and errors reported once.
 //!
 //! ```
-//! # #![allow(deprecated)]
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
 //! use core::net::Ipv4Addr;
 //! use fictionet::stdlib::bgp::{
-//!     afi, safi, Attribute, Capability, Context, Decoder, Message, Open, Origin, Prefix, Segment, SegmentKind,
+//!     afi, safi, Attribute, Capability, Context, Frames, Message, Open, Origin, Prefix, Segment, SegmentKind,
 //!     Update, AS_TRANS,
 //! };
 //!
@@ -51,10 +51,11 @@
 //!     afi: afi::IPV4,
 //!     safi: safi::UNICAST,
 //! }]);
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(Frames);
+//! let mut frames = Vec::new();
 //! let bytes = Message::Open(theirs).to_bytes(&Context::default()).unwrap();
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let frame = decoder.next_frame().unwrap().unwrap();
+//! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+//! let frame = frames.pop().unwrap();
 //! let Message::Open(open) = Message::decode(&frame, &Context::default()).unwrap() else {
 //!     panic!("not an OPEN");
 //! };
@@ -84,9 +85,10 @@
 //! // The prefix comes last: its length in bits, then 3 bytes.
 //! assert_eq!(bytes[43..], [24, 203, 0, 113]);
 //!
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let frame = decoder.next_frame().unwrap().unwrap();
+//! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+//! let frame = frames.pop().unwrap();
 //! assert_eq!(Message::decode(&frame, &ctx), Ok(Message::Update(update)));
+//! finish(&mut stream, |_| unreachable!()).unwrap();
 //! ```
 
 extern crate alloc;
@@ -583,15 +585,22 @@ impl Wire for Frame {
 /// Partial frames return [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once. Map frames through
 /// [`Message::decode`] with the session's [`Context`] to read their bodies.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+/// use fictionet::stdlib::bgp::{Context, Frames, Message};
+///
+/// let context = Context::default();
+/// let bytes = Message::Keepalive.to_bytes(&context)?;
+/// let mut stream = Stream::new(Frames.map(|frame| Message::decode(&frame, &context)));
+/// let mut messages = Vec::new();
+/// pump(&mut stream, &bytes, |message| messages.push(message))?;
+/// finish(&mut stream, |message| messages.push(message))?;
+/// assert_eq!(messages, [Ok(Message::Keepalive)]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
-
-impl Frames {
-    /// Creates a frame decoder with no retained state.
-    pub fn new() -> Self {
-        Self
-    }
-}
 
 impl Decode for Frames {
     type Item = Frame;
@@ -615,10 +624,9 @@ impl Decode for Frames {
 /// most [`MAX_BUFFERED`] bytes that have not been taken out.
 ///
 /// This compatibility decoder keeps its original feed limits and repeated
-/// errors. Use [`Frames`] with [`super::codec::Stream`] for counted input
+/// errors. Use [`Frames`] with [`super::codec::Stream`] for EOF handling
 /// and errors reported once.
 #[derive(Clone, Debug, Default)]
-#[deprecated(note = "use codec::Stream with bgp::Frames for bounded input")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -629,7 +637,6 @@ pub struct Decoder {
     failed: Option<Error>,
 }
 
-#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -2051,7 +2058,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
+#[deny(deprecated)] // This bounded compatibility API remains supported.
 mod tests {
     use super::*;
 

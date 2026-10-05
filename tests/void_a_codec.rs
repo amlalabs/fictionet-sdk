@@ -111,7 +111,7 @@ fn bgp_chunked_round_trip() {
         kind: bgp::kind::KEEPALIVE,
         body: vec![0],
     };
-    let bytes = round_trip(bgp::Frames::new, &[good.clone(), bad, good]);
+    let bytes = round_trip(|| bgp::Frames, &[good.clone(), bad, good]);
     stack(
         || bgp::Frames.map(|frame| bgp::Message::decode(&frame, &context)),
         &bytes,
@@ -188,7 +188,7 @@ fn thrift_chunked_round_trip() {
             &[good.clone(), thrift::Frame(vec![]), good],
         );
         stack(
-            || thrift::Frames.map(|frame| thrift::Message::parse(&frame.0)),
+            || thrift::Frames::new().map(|frame| thrift::Message::parse(&frame.0)),
             &bytes,
             &[
                 Ok((call.clone(), protocol, size)),
@@ -238,7 +238,7 @@ fn bgp_rejects_oversize_at_named_limit() {
     header.extend_from_slice(&length.to_be_bytes());
     header.push(bgp::kind::UPDATE);
     rejects(
-        bgp::Frames::new,
+        || bgp::Frames,
         &header,
         bgp::Error::BadMessageLength(length),
     );
@@ -299,7 +299,7 @@ fn kafka_rejects_oversize_at_named_limit() {
 #[test]
 fn thrift_rejects_oversize_at_named_limit() {
     assert_eq!(
-        thrift::Frames.capacity(),
+        thrift::Frames::new().capacity(),
         thrift::MAX_FRAME + thrift::FRAME_HEADER_LEN
     );
     let length = i32::try_from(thrift::MAX_FRAME + 1).unwrap();
@@ -403,6 +403,27 @@ fn strict_writers_are_transactional_and_old_writers_keep_their_meaning() {
 
 #[test]
 fn configurable_limits_clamp_and_accept_empty_frames() {
+    assert_eq!(thrift::Frames::new().limit(), thrift::MAX_FRAME);
+    assert_eq!(thrift::Frames::default().limit(), thrift::MAX_FRAME);
+    assert_eq!(
+        thrift::Frames::with_limit(usize::MAX).limit(),
+        thrift::MAX_FRAME
+    );
+    stack(
+        || thrift::Frames::with_limit(0),
+        &[0; thrift::FRAME_HEADER_LEN],
+        &[thrift::Frame(vec![])],
+    );
+    stack(
+        || thrift::Frames::with_limit(2),
+        &[0, 0, 0, 2, 7, 8],
+        &[thrift::Frame(vec![7, 8])],
+    );
+    rejects(
+        || thrift::Frames::with_limit(2),
+        &[0, 0, 0, 3],
+        thrift::FrameError::Length(3),
+    );
     assert_eq!(
         kafka::Frames::with_limit(usize::MAX).limit(),
         kafka::MAX_FRAME

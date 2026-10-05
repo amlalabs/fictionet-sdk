@@ -12,26 +12,26 @@
 //! the "Header and data length" and "Protocols" sections of the Zabbix
 //! manual.
 //!
-//! Nothing here reads a socket. A world that plays a Zabbix server feeds
-//! the bytes a [`tcp`](crate::stdlib::tcp) connection reads to a
-//! [`Decoder`], gets [`Packet`]s back, reads each one's [`Message`], and
-//! writes the reply's bytes back to the connection. Compressed data is
-//! reported with [`Packet::is_compressed`] and left as it came; it is not
+//! Nothing here reads a socket. A world that plays a Zabbix server
+//! feeds the bytes a [`tcp`](crate::stdlib::tcp) connection reads to a
+//! [`super::codec::Stream`] using [`Frames`], gets [`Packet`]s back,
+//! reads each one's [`Message`], and writes the reply's bytes back to
+//! the connection. Compressed data is reported with
+//! [`Packet::is_compressed`] and left as it came; it is not
 //! decompressed. A message keeps its JSON text as it was sent and names
-//! only its kind, so world code reads the rest with whatever JSON reader it
-//! likes.
+//! only its kind, so world code reads the rest with whatever JSON
+//! reader it likes.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A decoder takes a size limit and refuses a packet whose data
 //! would pass it, before the data comes.
 //!
-//! New streams use [`Frames`] with [`super::codec::Stream`] for bounded
-//! input and explicit EOF handling. The example below uses the compatibility
-//! decoder, which keeps its original feed behavior.
+//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
+//! EOF handling and errors reported once.
 //!
 //! ```
-//! # #![allow(deprecated)]
-//! use fictionet::stdlib::zabbix::{Decoder, Kind, Message};
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::zabbix::{Frames, Kind, Message};
 //!
 //! // What zabbix_sender sends for one value.
 //! let json = br#"{"request":"sender data","data":[{"host":"web1","key":"cpu","value":"0.5"}]}"#;
@@ -40,9 +40,11 @@
 //! sent.extend_from_slice(&[0, 0, 0, 0]);
 //! sent.extend_from_slice(json);
 //!
-//! let mut decoder = Decoder::new();
-//! decoder.feed(&sent);
-//! let packet = decoder.next_packet().unwrap().unwrap();
+//! let mut stream = Stream::new(Frames::new());
+//! let mut packets = Vec::new();
+//! pump(&mut stream, &sent, |packet| packets.push(packet)).unwrap();
+//! finish(&mut stream, |_| unreachable!()).unwrap();
+//! let packet = packets.pop().unwrap();
 //! assert!(!packet.is_compressed());
 //! let message = Message::parse(&packet.data).unwrap();
 //! assert_eq!(message.kind(), &Kind::SenderData);
@@ -73,7 +75,7 @@ pub const LARGE_HEADER_LEN: usize = 21;
 /// The most data one packet may carry: 1 GiB, the limit Zabbix itself
 /// sets on what it receives.
 pub const MAX_DATA: usize = 1 << 30;
-/// The size limit a [`Decoder`] made with [`Decoder::new`] uses.
+/// The size limit used by [`Frames::new`] and [`Decoder::new`].
 pub const DEFAULT_LIMIT: usize = 16 << 20;
 /// How deeply arrays and objects may nest in a message's JSON.
 pub const MAX_DEPTH: usize = 64;
@@ -351,6 +353,21 @@ impl Wire for Packet {
 /// plus [`Self::limit`]. Partial packets return [`Step::Need`], including at
 /// EOF. The stream reports truncation at EOF and framing errors once.
 /// Compressed payloads remain bytes. Body parsing stays separate.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+/// use fictionet::stdlib::zabbix::{Frames, Packet};
+///
+/// let packet = Packet::new(b"hello".to_vec());
+/// let bytes = Wire::to_bytes(&packet)?;
+/// let mut stream = Stream::new(Frames::with_limit(16));
+/// let mut packets = Vec::new();
+/// pump(&mut stream, &bytes[..3], |packet| packets.push(packet))?;
+/// pump(&mut stream, &bytes[3..], |packet| packets.push(packet))?;
+/// finish(&mut stream, |packet| packets.push(packet))?;
+/// assert_eq!(packets, [packet]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
     limit: usize,
@@ -401,11 +418,12 @@ impl Decode for Frames {
 /// Splits a Zabbix byte stream into packets. Feed it the bytes a
 /// connection reads, in order, and take packets out until it has none.
 ///
-/// This compatibility decoder keeps every byte fed until it is taken out
-/// or a framing error clears the buffer. Use [`Frames`] with
-/// [`super::codec::Stream`] for bounded input and errors reported once.
+/// This compatibility decoder buffers every byte fed without a limit until
+/// it is taken out or a framing error clears the buffer. Use [`Frames`] with
+/// [`super::codec::Stream`] for bounded input, EOF handling and errors
+/// reported once.
 #[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with zabbix::Frames for bounded input")]
+#[deprecated(note = "buffers without a limit; use codec::Stream with zabbix::Frames")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are

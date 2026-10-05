@@ -13,10 +13,11 @@
 //! Specification 1.0.
 //!
 //! Nothing here reads a socket. A world that plays an application feeds
-//! the bytes it reads from a connection to a [`Decoder`], gets [`Record`]s
-//! back, and hands each one to a [`Server`], which puts the streams of each
-//! request back together and gives a [`Request`] once all of it has come.
-//! The world writes the bytes of the [`Response`] it chooses back to the
+//! the bytes it reads from a connection to [`Frames`] with
+//! [`super::codec::Stream`], gets [`Record`]s back, and hands each one
+//! to a [`Server`], which puts the streams of each request back
+//! together and gives a [`Request`] once all of it has come. The world
+//! writes the bytes of the [`Response`] it chooses back to the
 //! connection and tells the server with [`Server::end`]. A world that
 //! plays a web server does the reverse with [`Request::to_bytes`] and a
 //! [`Client`].
@@ -26,13 +27,12 @@
 //! bytes a decoder holds, the stream bytes held across all open requests,
 //! and the number of requests open at once.
 //!
-//! New streams use [`Frames`] with [`super::codec::Stream`] for bounded
-//! input and explicit EOF handling. The example below uses the compatibility
-//! decoder, which keeps its original feed behavior.
+//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
+//! EOF handling and errors reported once.
 //!
 //! ```
-//! # #![allow(deprecated)]
-//! use fictionet::stdlib::fastcgi::{Decoder, Request, Role, Server, ServerEvent};
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::fastcgi::{Frames, Request, Role, Server, ServerEvent};
 //!
 //! // What a web server sends for GET /hello: two parameters and no body.
 //! let sent = Request {
@@ -48,12 +48,11 @@
 //! }
 //! .to_bytes();
 //!
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(Frames::new());
 //! let mut server = Server::new();
 //! let mut reply = Vec::new();
-//! decoder.feed(&sent);
-//! while let Some(record) = decoder.next_record() {
-//!     match server.receive(&record.unwrap()) {
+//! pump(&mut stream, &sent, |record| {
+//!     match server.receive(&record) {
 //!         Ok(Some(ServerEvent::Request(req))) => {
 //!             assert_eq!(req.param(b"SCRIPT_NAME"), Some(&b"/hello"[..]));
 //!             let page = b"Content-Type: text/plain\r\n\r\nhello".to_vec();
@@ -64,7 +63,8 @@
 //!         Ok(_) => {}
 //!         Err(e) => panic!("{e}"),
 //!     }
-//! }
+//! }).unwrap();
+//! finish(&mut stream, |_| unreachable!()).unwrap();
 //! // The reply starts with a STDOUT record for request 1: 33 bytes of
 //! // output and 7 of padding.
 //! assert_eq!(reply[..8], [1, 6, 0, 1, 0, 33, 7, 0]);
@@ -395,6 +395,21 @@ impl core::error::Error for FrameError {
 /// Use with [`super::codec::Stream`] for input bounded by [`Self::limit`].
 /// Partial records return [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once. Body parsing stays separate.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+/// use fictionet::stdlib::fastcgi::{Frames, Record, kind};
+///
+/// let record = Record { kind: kind::STDIN, request_id: 1, content: vec![7, 8], padding: 0 };
+/// let bytes = Wire::to_bytes(&record)?;
+/// let mut stream = Stream::new(Frames::new());
+/// let mut records = Vec::new();
+/// pump(&mut stream, &bytes[..3], |record| records.push(record))?;
+/// pump(&mut stream, &bytes[3..], |record| records.push(record))?;
+/// finish(&mut stream, |record| records.push(record))?;
+/// assert_eq!(records, [record]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
     limit: usize,
@@ -435,6 +450,7 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Record>, FrameError> {
+        // Preserve Record::parse error ordering: Version comes before TooLong.
         if let Some(&version) = input.first()
             && version != VERSION
         {
@@ -461,10 +477,9 @@ impl Decode for Frames {
 /// It holds at most [`MAX_BUFFERED`] bytes that have not been taken out.
 ///
 /// This compatibility decoder keeps its original feed limits and repeated
-/// errors. Use [`Frames`] with [`super::codec::Stream`] for counted input
-/// and errors reported once.
+/// errors. Use [`Frames`] with [`super::codec::Stream`] for counted input,
+/// EOF handling and errors reported once.
 #[derive(Clone, Debug, Default)]
-#[deprecated(note = "use codec::Stream with fastcgi::Frames for bounded input")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -474,7 +489,6 @@ pub struct Decoder {
     failed: Option<RecordError>,
 }
 
-#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -1397,7 +1411,6 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
 
