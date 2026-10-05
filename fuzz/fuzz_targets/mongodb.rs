@@ -3,8 +3,9 @@
 //! writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::mongodb::{
-    Body, Bson, Compressed, Decoder, Document, Message, MessageError, Msg, Query, Reply, Sequence,
+    Body, Bson, Compressed, Decoder, Document, Frames, Message, MessageError, Msg, Query, Reply, Sequence,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -113,6 +114,10 @@ fn message(b: &mut Bytes<'_>) -> Message {
 }
 
 fuzz_target!(|data: &[u8]| {
+    check_decode(Frames::new, data);
+    check_decode(|| Frames::with_limit(64), data);
+    check_wire::<Message>(data);
+
     // The stream, split three ways: all at once, a byte at a time, and
     // through a decoder with a small limit.
     let messages = decode(data, data.len(), usize::MAX);
@@ -124,6 +129,7 @@ fuzz_target!(|data: &[u8]| {
         // A message read can be written, and reads back the same. Inputs
         // here are far below the size limits, so writing cannot fail.
         let bytes = m.to_bytes().unwrap();
+        check_wire::<Message>(&bytes);
         let (back, used) = Message::parse(&bytes).unwrap().unwrap();
         assert_eq!(back, m);
         assert_eq!(used, bytes.len());
@@ -142,7 +148,9 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(Document::parse(&bytes).unwrap(), (doc, bytes.len()));
     }
     let m = message(&mut b);
+    check_wire_value(&m);
     if let Ok(bytes) = m.to_bytes() {
+        check_decode(Frames::new, &bytes);
         assert_eq!(Message::parse(&bytes).unwrap(), Some((m, bytes.len())));
     }
 });

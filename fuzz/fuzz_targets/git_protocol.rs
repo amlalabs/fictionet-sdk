@@ -2,10 +2,11 @@
 //! world playing a Git server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::git_protocol::{
-    Advertisement, Band, CapabilityAdvertisement, ClientLine, Command, Decoder, Demux, Demuxed, LsRef, MAX_BUFFERED,
-    Packet, PacketError, ParseError, ProtoRequest, ServerLine, V2Request, band_packets, parse_service_header,
-    service_header, split_band,
+    Advertisement, Band, CapabilityAdvertisement, ClientLine, Command, Decoder, Demux, Demuxed,
+    Frames, LsRef, MAX_BUFFERED, Packet, PacketError, ParseError, ProtoRequest, ServerLine,
+    V2Request, band_packets, parse_service_header, service_header, split_band,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -51,6 +52,15 @@ fn demux(mut data: &[u8], step: usize) -> (Vec<Demuxed>, Option<ParseError>) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Packet>(data);
+    let packet = Packet::Data(data.get(..fictionet::stdlib::git_protocol::MAX_DATA + 1).unwrap_or(data).to_vec());
+    contract::check_wire_value(&packet);
+    if let Ok(bytes) = Wire::to_bytes(&packet) {
+        contract::check_wire::<Packet>(&bytes);
+        contract::check_decode(Frames::new, &bytes);
+    }
+
     // The stream, split two ways: all at once, and a byte at a time. Both
     // find the same packets and stop at the same error.
     let (packets, failed) = decode(data, usize::MAX);
@@ -70,6 +80,7 @@ fuzz_target!(|data: &[u8]| {
     for p in &packets {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes();
+        contract::check_wire::<Packet>(&bytes);
         assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
         let Some(d) = p.data() else { continue };
         // So can each kind of line it may hold.

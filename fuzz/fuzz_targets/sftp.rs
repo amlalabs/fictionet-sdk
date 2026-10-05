@@ -2,7 +2,10 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::sftp::{Decoder, LENGTH_LEN, MAX_PACKET, MAX_TEXT, Packet, Request, Response, Status};
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::sftp::{
+    Decoder, Frames, LENGTH_LEN, MAX_PACKET, MAX_TEXT, Packet, Request, Response, Status,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Feeds `data` in pieces of `step` bytes, taking packets out after each
@@ -34,6 +37,10 @@ fn decode(data: &[u8], step: usize) -> Vec<Packet> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_wire::<Packet>(data);
+
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces whose size the first byte picks.
     let packets = decode(data, usize::MAX);
@@ -44,6 +51,7 @@ fuzz_target!(|data: &[u8]| {
     for p in &packets {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes();
+        contract::check_wire::<Packet>(&bytes);
         let (back, used) = Packet::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, p);
         assert_eq!(used, bytes.len());
@@ -57,6 +65,11 @@ fuzz_target!(|data: &[u8]| {
     // Any bytes as the body of a packet of the type the first byte names.
     if let Some((&kind, body)) = data.split_first() {
         let p = Packet { kind, body: body.to_vec() };
+        let bounded = Packet { kind, body: body.get(..MAX_PACKET).unwrap_or(body).to_vec() };
+        contract::check_wire_value(&bounded);
+        if let Ok(bytes) = Wire::to_bytes(&bounded) {
+            contract::check_decode(Frames::new, &bytes);
+        }
         if let Ok(req) = Request::parse(&p) {
             assert_eq!(Request::parse(&req.to_packet()), Ok(req));
         }
