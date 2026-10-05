@@ -1,12 +1,20 @@
 //! PROXY protocol headers, version 1 and 2, as a world behind a proxy
 //! reads them at the start of a connection.
 #![no_main]
+#![allow(deprecated)] // Also exercise the unchanged compatibility API.
 
-use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Ssl, SslTlv, Step, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use fictionet::stdlib::proxy_protocol::{
+    Addresses, Command, Decoder, Header, MAX_HEADER_LEN, MAX_TLV_VALUE, Ssl, SslTlv, Step, Tlv, Transport, V1, V2,
+};
+use fictionet::stdlib::{codec::contract, proxy_protocol::Headers};
 use libfuzzer_sys::fuzz_target;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Headers::new, data);
+    contract::check_decode(|| Headers::with_limit(32), data);
+    contract::check_wire::<Header>(data);
+    contract::check_wire_value(&Header::V1(V1::Unknown(data.iter().take(108).copied().collect())));
     let parsed = Header::parse(data);
 
     // The stream, split two ways: all at once, and a byte at a time.
@@ -69,9 +77,14 @@ fuzz_target!(|data: &[u8]| {
         let transport = if a[37] & 1 == 0 { Transport::Stream } else { Transport::Dgram };
         let headers = [
             Header::V1(V1::from_addrs(src, dst)),
-            Header::V2(V2 { command: Command::Proxy, addresses: Addresses::from_addrs(transport, src, dst), tlvs: vec![] }),
+            Header::V2(V2 {
+                command: Command::Proxy,
+                addresses: Addresses::from_addrs(transport, src, dst),
+                tlvs: vec![],
+            }),
         ];
         for h in headers {
+            contract::check_wire_value(&h);
             let bytes = h.to_bytes();
             let (back, n) = Header::parse(&bytes).unwrap().unwrap();
             assert_eq!(back, h);
@@ -101,7 +114,11 @@ fuzz_target!(|data: &[u8]| {
     let mut rest = data;
     while let [pick, len_hi, len_lo, tail @ ..] = rest {
         // A length byte of 0xff stands for a value far too long to fit.
-        let n = if *len_hi == 0xff { usize::from(*len_lo) * 1024 } else { usize::from(u16::from_be_bytes([*len_hi & 0x0f, *len_lo])) };
+        let n = if *len_hi == 0xff {
+            usize::from(*len_lo) * 1024
+        } else {
+            usize::from(u16::from_be_bytes([*len_hi & 0x0f, *len_lo]))
+        };
         let (v, next) = tail.split_at(n.min(tail.len()));
         let mut v = v.to_vec();
         v.resize(n, *pick);

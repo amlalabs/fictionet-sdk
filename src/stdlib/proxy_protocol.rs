@@ -26,7 +26,13 @@
 //! instead of an error. A CRC32C TLV that the reader can find in a LOCAL
 //! header is still checked, even when a later TLV cannot be read.
 //!
+//! New code uses [`Headers`] with [`codec::Stream`]. The decoder returns
+//! one header result and then `End`. `swap` or `into_parts` preserves the
+//! unread suffix. [`Wire`] adds exact parsing and strict writing for
+//! [`Header`]. The deprecated `Decoder` and `Step` keep their old behavior.
+//!
 //! ```
+//! # #![allow(deprecated)]
 //! use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Step, Tlv, Transport, V2};
 //! use std::net::Ipv4Addr;
 //!
@@ -60,6 +66,157 @@
 
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+
+use super::codec::{self, Decode, Wire};
+
+/// Why a header cannot be framed or read as an exact wire value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderError {
+    /// A signature or fixed header is invalid.
+    Protocol(Error),
+    /// The declared header exceeds the configured whole-header limit.
+    TooLong,
+    /// The input ends inside a header.
+    Truncated,
+    /// Bytes follow the header.
+    Trailing,
+    /// Re-encoding would change the value, including its checksum.
+    Unrepresentable,
+}
+
+impl core::fmt::Display for HeaderError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Protocol(e) => e.fmt(f),
+            Self::TooLong => f.write_str("PROXY header exceeds its limit"),
+            Self::Truncated => f.write_str("incomplete PROXY header"),
+            Self::Trailing => f.write_str("bytes after the PROXY header"),
+            Self::Unrepresentable => f.write_str("PROXY header cannot be written unchanged"),
+        }
+    }
+}
+impl core::error::Error for HeaderError {}
+
+impl Wire for Header {
+    type ParseError = HeaderError;
+    type WriteError = HeaderError;
+
+    /// Reads exactly one header. Refuses values whose canonical encoding
+    /// changes their checksum. The inherent prefix parser is unchanged.
+    fn parse(bytes: &[u8]) -> Result<Self, HeaderError> {
+        let (header, used) = Header::parse(bytes).map_err(HeaderError::Protocol)?.ok_or(HeaderError::Truncated)?;
+        if used != bytes.len() {
+            return Err(HeaderError::Trailing);
+        }
+        strict_header(&header)?;
+        Ok(header)
+    }
+
+    /// Appends at most [`MAX_HEADER_LEN`] bytes. Refuses clipping, variant
+    /// normalization and checksum changes without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), HeaderError> {
+        out.extend_from_slice(&strict_header(self)?);
+        Ok(())
+    }
+}
+
+fn strict_header(header: &Header) -> Result<Vec<u8>, HeaderError> {
+    let bytes = header.to_bytes();
+    match Header::parse(&bytes) {
+        Ok(Some((ref back, used))) if back == header && used == bytes.len() => Ok(bytes),
+        _ => Err(HeaderError::Unrepresentable),
+    }
+}
+
+/// Reads one PROXY header, then returns [`codec::Step::End`].
+///
+/// Use with [`codec::Stream`]. Items are `Result<Header, Error>`: a bad
+/// complete line or v2 body is one refused item, followed by `End`.
+/// Bad signatures, fixed headers and limits are terminal errors.
+/// In particular, [`Error::NotProxy`] is a terminal `Protocol` error with
+/// no consumption. Use [`codec::Stream::swap`] or
+/// [`codec::Stream::into_parts`] to give every unread byte to the plain
+/// protocol. After a header item, only its bytes have been consumed.
+/// Stop feeding at completion and give any unaccepted input to the next
+/// decoder too. Partial headers return `Need`, including at EOF.
+#[derive(Clone, Debug)]
+pub struct Headers {
+    limit: usize,
+    scanned: usize,
+    done: bool,
+}
+
+impl Headers {
+    /// Accepts headers up to [`MAX_HEADER_LEN`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_HEADER_LEN)
+    }
+
+    /// Sets the whole-header limit, clamped to [`V2_HEADER_LEN`] through
+    /// [`MAX_HEADER_LEN`]. A v2 length is checked before its body arrives.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.clamp(V2_HEADER_LEN, MAX_HEADER_LEN), scanned: 0, done: false }
+    }
+
+    /// The largest accepted header, including its fixed part.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Headers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Headers {
+    type Item = Result<Header, Error>;
+    type Error = HeaderError;
+    const NAME: &'static str = "PROXY protocol";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _: bool) -> Result<codec::Step<Self::Item>, HeaderError> {
+        if self.done {
+            return Ok(codec::Step::End);
+        }
+        let used = match detect(input) {
+            Detection::NeedMore => return Ok(codec::Step::Need),
+            Detection::NotProxy => return Err(HeaderError::Protocol(Error::NotProxy)),
+            Detection::V1 => {
+                let cap = self.limit.min(V1_MAX_LEN);
+                let end = input.len().min(cap);
+                let window = input.get(self.scanned..end).unwrap_or_default();
+                match window.iter().position(|&b| b == b'\n') {
+                    Some(n) => self.scanned + n + 1,
+                    None => {
+                        self.scanned = end;
+                        return if end == cap { Err(HeaderError::TooLong) } else { Ok(codec::Step::Need) };
+                    }
+                }
+            }
+            Detection::V2 => {
+                // Validate just the fixed prefix even when a whole body is
+                // available, so header faults always have the same priority.
+                let fixed = input.get(..input.len().min(V2_HEADER_LEN)).unwrap_or_default();
+                Header::parse(fixed).map_err(HeaderError::Protocol)?;
+                let Some(&[hi, lo]) = input.get(14..16) else { return Ok(codec::Step::Need) };
+                let used = V2_HEADER_LEN + usize::from(u16::from_be_bytes([hi, lo]));
+                if used > self.limit {
+                    return Err(HeaderError::TooLong);
+                }
+                used
+            }
+        };
+        let Some(bytes) = input.get(..used) else { return Ok(codec::Step::Need) };
+        let item = Header::parse(bytes).and_then(|m| m.map(|(h, _)| h).ok_or(Error::V1Syntax));
+        self.done = true;
+        Ok(codec::Step::Item(item, used))
+    }
+}
 
 /// What every version 1 header starts with.
 pub const V1_PREFIX: &[u8; 6] = b"PROXY ";
@@ -986,6 +1143,7 @@ fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
 /// What a [`Decoder`] has found after a feed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // one per connection, as with Header
+#[deprecated(note = "use codec::Step with proxy_protocol::Headers and codec::Stream")]
 pub enum Step {
     /// The bytes so far are part of a header. Feed more.
     NeedMore,
@@ -1014,11 +1172,13 @@ pub enum Step {
 /// the connection reads, in order, until it returns something other than
 /// [`Step::NeedMore`]. It never holds more than [`MAX_HEADER_LEN`] bytes.
 #[derive(Debug, Default)]
+#[deprecated(note = "use codec::Stream with proxy_protocol::Headers; hand off with into_parts or swap")]
 pub struct Decoder {
     buf: Vec<u8>,
     finished: bool,
 }
 
+#[allow(deprecated)] // Preserve the original feed and handoff behavior.
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -1059,6 +1219,7 @@ impl Decoder {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // Test the compatibility API unchanged.
 mod tests {
     use super::*;
 

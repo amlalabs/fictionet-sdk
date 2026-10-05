@@ -2,7 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::rfb::{
-    ClientMessage, ClientSession, Dialect, Error, PixelFormat, Phase, ServerInit, ServerMessage, ServerSession, Version,
+    ClientMessage, ClientSession, Dialect, Error, Phase, PixelFormat, ServerInit, ServerMessage, ServerSession, Version,
+};
+use fictionet::stdlib::{
+    codec::contract,
+    rfb::{ClientMessages, ServerMessages},
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -15,9 +19,12 @@ fn server_turn(s: &ServerSession, vnc: bool) -> Option<ServerMessage> {
         Phase::SecurityOffer => ServerMessage::SecurityTypes(vec![1, 2]),
         Phase::VncChallenge => ServerMessage::VncChallenge([7; 16]),
         Phase::SecurityResult => ServerMessage::SecurityOk,
-        Phase::ServerInit => {
-            ServerMessage::ServerInit(ServerInit { width: 4, height: 3, format: PixelFormat::TRUE_COLOR_32, name: vec![] })
-        }
+        Phase::ServerInit => ServerMessage::ServerInit(ServerInit {
+            width: 4,
+            height: 3,
+            format: PixelFormat::TRUE_COLOR_32,
+            name: vec![],
+        }),
         _ => return None,
     })
 }
@@ -114,9 +121,54 @@ fn as_client<'a>(
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Version>(data);
+    contract::check_wire::<PixelFormat>(data);
+    contract::check_wire::<ServerInit>(data);
+    contract::check_wire::<ClientMessage>(data);
+    contract::check_wire_value(&ClientMessage::ClientCutText(data.iter().take(4097).copied().collect()));
+    contract::check_decode(ClientMessages::new, data);
+    contract::check_decode(ServerMessages::new, data);
+    for phase in [
+        Phase::ClientVersion,
+        Phase::SecurityChoice,
+        Phase::VncResponse,
+        Phase::ClientInit,
+        Phase::Normal,
+        Phase::Closed,
+    ] {
+        contract::check_decode(
+            || {
+                let mut d = ClientMessages::with_limit(4096);
+                d.set_phase(phase).unwrap();
+                d
+            },
+            data,
+        );
+    }
+    for phase in [
+        Phase::ServerVersion,
+        Phase::SecurityOffer,
+        Phase::VncChallenge,
+        Phase::SecurityResult,
+        Phase::ServerInit,
+        Phase::Normal,
+        Phase::Unsupported(42),
+    ] {
+        for dialect in [Dialect::V3_3, Dialect::V3_7, Dialect::V3_8] {
+            contract::check_decode(
+                || {
+                    let mut d = ServerMessages::with_limit(4096);
+                    d.set_mode(phase, dialect, PixelFormat::TRUE_COLOR_32).unwrap();
+                    d
+                },
+                data,
+            );
+        }
+    }
     let Some((&choice, data)) = data.split_first() else { return };
     let vnc = choice & 1 == 1;
-    let version = [Version::V3_3, Version::V3_7, Version::V3_8, Version { major: 3, minor: 889 }][usize::from(choice >> 1) % 4];
+    let version =
+        [Version::V3_3, Version::V3_7, Version::V3_8, Version { major: 3, minor: 889 }][usize::from(choice >> 1) % 4];
 
     // The stream as a server reads it, split two ways: all at once, and a
     // byte at a time.
