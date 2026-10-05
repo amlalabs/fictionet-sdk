@@ -17,7 +17,7 @@
 //! may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
-//! [`Frames`] implements [`super::codec::Decode`] for a caller-owned input
+//! [`Packets`] implements [`super::codec::Decode`] for a caller-owned input
 //! buffer. Use [`super::codec::Stream`] to drive it with bounded storage
 //! and EOF handling. [`Packet`] implements [`Wire`] for exact parsing and
 //! transactional writing. Its inherent `parse` still reads one prefix.
@@ -50,14 +50,10 @@
 //! assert_eq!(Packet::parse(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
-extern crate alloc;
-
 use super::{
     codec::{Buffer, Decode, Step, Wire},
     cotp,
 };
-use alloc::vec::Vec;
-
 
 /// The TCP port ISO transport servers listen on.
 pub const PORT: u16 = 102;
@@ -111,7 +107,6 @@ pub enum EncodeError {
     Unrepresentable,
 }
 
-
 impl core::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -125,7 +120,6 @@ impl core::fmt::Display for EncodeError {
 }
 
 impl core::error::Error for EncodeError {}
-
 
 /// Why bytes are not a TPKT stream. Any of them means the connection holds
 /// no more packets a reader can find, and a real server closes it.
@@ -143,7 +137,6 @@ pub enum TpktError {
         limit: usize,
     },
 }
-
 
 impl core::fmt::Display for TpktError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -372,6 +365,7 @@ impl Wire for Packet {
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let header = self.header()?.to_bytes()?;
+        out.reserve(HEADER_LEN + self.payload.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(&self.payload);
         Ok(())
@@ -415,24 +409,26 @@ pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, Encode
     Ok(out)
 }
 
-
-/// Reads TPKT packets from a borrowed unread slice.
+/// Splits a TPKT byte stream into packets.
 ///
 /// Use with [`super::codec::Stream`] for bounded input buffering. A partial
 /// packet returns [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and reports framing errors once. No input is retained.
 #[derive(Clone, Copy, Debug)]
-pub struct Frames {
+pub struct Packets {
     limit: usize,
 }
 
-impl Default for Frames {
+/// Compatibility name for [`Packets`].
+pub type Frames = Packets;
+
+impl Default for Packets {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Frames {
+impl Packets {
     /// Reads packets up to [`MAX_PACKET`] bytes, including their headers.
     pub fn new() -> Self {
         Self::with_limit(MAX_PACKET)
@@ -453,7 +449,7 @@ impl Frames {
     }
 }
 
-impl Decode for Frames {
+impl Decode for Packets {
     type Item = Packet;
     type Error = TpktError;
     const NAME: &'static str = "TPKT";
@@ -475,7 +471,7 @@ impl Decode for Frames {
 #[derive(Clone, Debug)]
 pub struct Decoder {
     buf: Buffer,
-    frames: Frames,
+    frames: Packets,
     failed: Option<TpktError>,
 }
 
@@ -499,7 +495,7 @@ impl Decoder {
     pub fn with_limit(limit: usize) -> Decoder {
         Decoder {
             buf: Buffer::new(clamp_limit(limit)),
-            frames: Frames::with_limit(limit),
+            frames: Packets::with_limit(limit),
             failed: None,
         }
     }
@@ -605,7 +601,7 @@ mod codec_tests {
     #[test]
     fn frame_limits_eof_and_error_once() {
         for limit in [0, MIN_PACKET, 128, MAX_PACKET, usize::MAX] {
-            let frames = Frames::with_limit(limit);
+            let frames = Packets::with_limit(limit);
             assert_eq!(frames.capacity(), limit.clamp(MIN_PACKET, MAX_PACKET));
             assert_eq!(frames.held(), 0);
             for input in [
@@ -618,7 +614,7 @@ mod codec_tests {
                 contract::check_decode_with_held_limit(|| frames, input, 0);
             }
         }
-        let mut stream = Stream::new(Frames::with_limit(8));
+        let mut stream = Stream::new(Packets::with_limit(8));
         assert_eq!(stream.push(&[3, 0, 0, 9]), 4);
         let error = Fail::Protocol(TpktError::TooLong {
             length: 9,
@@ -630,7 +626,7 @@ mod codec_tests {
         assert_eq!(stream.push(&[1, 2]), 2);
         assert_eq!(stream.buffered(), 4);
 
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         assert_eq!(stream.push(&[3, 0, 0, 7, 2]), 5);
         assert_eq!(stream.next(), None);
         stream.end();
@@ -642,7 +638,7 @@ mod codec_tests {
     fn maximum_packet_in_byte_chunks() {
         let packet = Packet::new(vec![0x5a; MAX_PAYLOAD]);
         let bytes = packet.to_bytes().unwrap();
-        let mut stream = Stream::new(Frames::new());
+        let mut stream = Stream::new(Packets::new());
         for (i, byte) in bytes.chunks(1).enumerate() {
             assert_eq!(stream.push(byte), 1);
             assert!(stream.buffered() <= MAX_PACKET);
