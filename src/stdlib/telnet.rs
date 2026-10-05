@@ -11,14 +11,16 @@
 //! (terminal type) and RFC 1073 (window size), and negotiates options with
 //! the Q method of RFC 1143, which never loops.
 //!
-//! Nothing here reads a socket. A world that plays a Telnet server feeds
-//! the bytes a TCP connection reads to a [`Decoder`], gets [`Event`]s back,
-//! hands each negotiation to a [`Negotiation`], and writes the bytes it
-//! returns to the connection. What the server says, and which options it
-//! agrees to, is up to world code.
+//! Nothing here reads a socket. A world that plays a Telnet server pushes
+//! the bytes a TCP connection reads to a [`codec::Stream`] of [`Events`],
+//! gets [`Event`]s back, hands each negotiation to a [`Negotiation`], and
+//! writes the bytes it returns to the connection. What the server says,
+//! and which options it agrees to, is up to world code.
 //!
-//! New sessions use [`Decode`] with [`codec::Stream`]. It yields one
+//! New sessions use [`Events`] with [`codec::Stream`]. It yields one
 //! event per call so negotiation can change binary mode between items.
+//! The default delivers one data byte per event immediately; batch readers
+//! can use [`Events::with_data_limit`] to wait for larger runs.
 //! [`Wire`] for [`Event`] uses NVT mode; [`Event::write_with`] and
 //! [`Event::parse_with`] accept an explicit binary mode. The legacy
 //! [`Decoder`] keeps its original behavior.
@@ -28,8 +30,8 @@
 //! [`Event::Error`], and the stream goes on, as it does in real servers.
 //!
 //! ```
-//! # #![allow(deprecated)]
-//! use fictionet::stdlib::telnet::{option, Change, Decoder, Event, Negotiation, Side, Subnegotiation, Verb};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::telnet::{option, Change, Events, Event, Negotiation, Side, Subnegotiation, Verb};
 //!
 //! // The server agrees to let the client send its terminal type.
 //! let mut options = Negotiation::new();
@@ -39,10 +41,12 @@
 //! assert_eq!(ask.send, Some([255, 253, 24]));
 //!
 //! // The client agrees (IAC WILL TERMINAL-TYPE) and types "ls", CR LF.
-//! let mut decoder = Decoder::new();
-//! let events = decoder.feed(&[255, 251, 24, b'l', b's', 13, 10]);
-//! assert_eq!(events[0], Event::Negotiation { verb: Verb::Will, option: option::TERMINAL_TYPE });
-//! assert_eq!(events[1], Event::Data(b"ls\r\n".to_vec()));
+//! let mut stream = Stream::new(Events::new());
+//! assert_eq!(stream.push(&[255, 251, 24, b'l', b's', 13, 10]), 7);
+//! assert_eq!(stream.next(), Some(Ok(Event::Negotiation { verb: Verb::Will, option: option::TERMINAL_TYPE })));
+//! for &byte in b"ls\r\n" {
+//!     assert_eq!(stream.next(), Some(Ok(Event::Data(vec![byte]))));
+//! }
 //!
 //! // The WILL answers the DO, so nothing more is sent, and the option is on.
 //! let reaction = options.receive(Verb::Will, option::TERMINAL_TYPE);
@@ -50,14 +54,14 @@
 //! assert_eq!(reaction.change, Some(Change { side: Side::Remote, option: option::TERMINAL_TYPE, enabled: true }));
 //!
 //! // The server asks for the name, and the client sends it.
-//! assert_eq!(Subnegotiation::TerminalTypeSend.to_bytes(), [255, 250, 24, 1, 255, 240]);
-//! let events = decoder.feed(b"\xff\xfa\x18\x00VT100\xff\xf0");
-//! let Event::Subnegotiation { option, data } = &events[0] else { panic!() };
-//! let name = Subnegotiation::parse(*option, data).unwrap();
+//! assert_eq!(Wire::to_bytes(&Subnegotiation::TerminalTypeSend).unwrap(), [255, 250, 24, 1, 255, 240]);
+//! assert_eq!(stream.push(b"\xff\xfa\x18\x00VT100\xff\xf0"), 11);
+//! let Some(Ok(Event::Subnegotiation { option, data })) = stream.next() else { panic!() };
+//! let name = Subnegotiation::parse(option, &data).unwrap();
 //! assert_eq!(name, Subnegotiation::TerminalTypeIs("VT100".to_string()));
 //! ```
 
-use super::codec::{self, Step, Wire};
+use super::codec::{self, Decode, Step, Wire};
 
 /// The TCP port Telnet servers listen on.
 pub const PORT: u16 = 23;
@@ -273,7 +277,7 @@ impl Command {
     }
 }
 
-/// What a [`Decoder`] found in the stream.
+/// What [`Events`] or a legacy [`Decoder`] found in the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Data, with IAC escapes undone and, outside binary mode, each CR NUL
@@ -414,7 +418,6 @@ impl Decoder {
     /// [`Event::Data`], so data split across calls comes in several. A CR
     /// at the very end is held until the next byte shows whether a NUL
     /// follows it.
-    #[deprecated(note = "use codec::Stream with telnet::Decode for one event per call and EOF handling")]
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Event> {
         let mut out = Vec::new();
         let mut data = Vec::new();
@@ -435,7 +438,6 @@ impl Decoder {
     /// mode. A world that switches binary mode calls this in a loop,
     /// handles each negotiation, and calls [`Decoder::set_binary`] before
     /// it feeds the rest.
-    #[deprecated(note = "use codec::Stream with telnet::Decode for one event per call and EOF handling")]
     pub fn feed_next(&mut self, bytes: &[u8]) -> (Vec<Event>, usize) {
         let mut out = Vec::new();
         let mut data = Vec::new();
@@ -452,7 +454,6 @@ impl Decoder {
     /// Ends the stream: a held CR comes back as data, and a command or
     /// subnegotiation left open is a [`DecodeError::Truncated`]. The
     /// decoder is then ready for a new stream, still in the same mode.
-    #[deprecated(note = "use codec::Stream with telnet::Decode for one event per call and EOF handling")]
     pub fn finish(&mut self) -> Vec<Event> {
         let mut out = Vec::new();
         if std::mem::take(&mut self.pending_cr) {
@@ -782,17 +783,20 @@ fn terminal_type_is(name: impl Iterator<Item = u8>) -> Vec<u8> {
     out
 }
 
-/// The most decoded bytes in one data event from [`Decode`].
+/// The largest configurable data run from [`Events`], and the most data
+/// bytes in one [`Wire`] event. [`Events::new`] uses a limit of 1.
 pub const MAX_DATA: usize = 1024;
 /// The most encoded bytes needed for a data run or subnegotiation,
-/// including doubled IAC bytes and one byte beyond the payload limit.
-pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 7;
+/// including doubled IAC bytes, framing, or detection of an oversized payload.
+pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 5;
 
 /// Reads one Telnet event per call without retaining input bytes.
 ///
-/// Data runs end at a command, the configured data limit, or EOF. They
-/// wait across chunk boundaries so partitioning never changes the items.
-/// Use [`Self::with_data_limit`] with 1 for immediate character delivery.
+/// By default, each data byte is delivered as its own event, so interactive
+/// sessions receive input without waiting for a command or EOF. Batch readers
+/// can use [`Self::with_data_limit`]: data runs then end at a command, the
+/// configured limit, or EOF, waiting across chunk boundaries so partitioning
+/// never changes the items.
 /// A trailing NVT CR waits for its next byte or EOF. Scan cursors keep
 /// bytewise input linear. All payload storage belongs to returned items.
 ///
@@ -809,7 +813,7 @@ pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 7;
 ///
 /// ```
 /// use fictionet::stdlib::{codec::Stream, telnet::{self, Event, Negotiation, Side}};
-/// let mut stream = Stream::new(telnet::Decode::with_data_limit(1));
+/// let mut stream = Stream::new(telnet::Events::new());
 /// let mut options = Negotiation::new();
 /// options.allow_remote(telnet::option::BINARY, true);
 /// assert_eq!(stream.push(&[255, 251, 0, 13, 0]), 5);
@@ -826,7 +830,7 @@ pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 7;
 /// assert_eq!(stream.next(), Some(Ok(Event::Data(vec![0]))));
 /// ```
 #[derive(Clone, Debug)]
-pub struct Decode {
+pub struct Events {
     binary: bool,
     data_limit: usize,
     scanned: usize,
@@ -835,19 +839,20 @@ pub struct Decode {
     dropping: Option<u8>,
 }
 
-impl Default for Decode {
+impl Default for Events {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Decode {
-    /// Starts in NVT mode with data runs bounded by [`MAX_DATA`].
+impl Events {
+    /// Starts in NVT mode, delivering one data byte per event.
     pub fn new() -> Self {
-        Self::with_data_limit(MAX_DATA)
+        Self::with_data_limit(1)
     }
 
     /// Sets the decoded data run limit, clamped to 1 through [`MAX_DATA`].
+    /// Limits above 1 batch data until a command, the limit, or EOF.
     /// Subnegotiations keep their separate [`MAX_SUBNEGOTIATION`] limit.
     pub fn with_data_limit(limit: usize) -> Self {
         Self {
@@ -991,13 +996,13 @@ fn data_byte(input: &[u8], at: usize, binary: bool, eof: bool) -> Option<(u8, us
     }
 }
 
-impl codec::Decode for Decode {
+impl codec::Decode for Events {
     type Item = Event;
     type Error = DecodeError;
     const NAME: &'static str = "Telnet";
 
     fn capacity(&self) -> usize {
-        MAX_EVENT_WIRE.max(2 * self.data_limit + 2)
+        MAX_EVENT_WIRE.max(2 * self.data_limit)
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, DecodeError> {
@@ -1034,54 +1039,86 @@ impl codec::Decode for Decode {
     }
 }
 
-/// Why an exact event or typed subnegotiation cannot be read or written.
+/// Why a byte slice is not exactly one event or typed subnegotiation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireError {
+pub enum EventParseError {
     /// A malformed event was found.
     Decode(DecodeError),
     /// The slice has no complete event.
     Truncated,
     /// The slice contains bytes after the first event.
     Trailing,
-    /// The value exceeds [`MAX_DATA`], [`MAX_SUBNEGOTIATION`], or [`MAX_EVENT_WIRE`].
+    /// The input exceeds [`MAX_DATA`], [`MAX_SUBNEGOTIATION`], or [`MAX_EVENT_WIRE`].
     TooLong,
-    /// The value has no exact representation, such as empty data or an error item.
-    Unrepresentable,
+    /// An event of another kind was read where a typed subnegotiation was required.
+    UnexpectedEvent,
     /// A typed subnegotiation has invalid data.
     Subnegotiation(SubnegotiationError),
 }
 
-impl core::fmt::Display for WireError {
+impl core::fmt::Display for EventParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Decode(e) => e.fmt(f),
             Self::Truncated => f.write_str("incomplete Telnet event"),
             Self::Trailing => f.write_str("bytes after Telnet event"),
             Self::TooLong => f.write_str("Telnet event exceeds its wire limit"),
-            Self::Unrepresentable => f.write_str("Telnet value has no exact wire form"),
+            Self::UnexpectedEvent => f.write_str("expected a Telnet subnegotiation"),
             Self::Subnegotiation(e) => e.fmt(f),
         }
     }
 }
 
-impl core::error::Error for WireError {}
+impl core::error::Error for EventParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Decode(e) => Some(e),
+            Self::Subnegotiation(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Why an event or typed subnegotiation cannot be written exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The payload exceeds [`MAX_DATA`] or [`MAX_SUBNEGOTIATION`].
+    TooLong,
+    /// The value has no exact representation: empty data, a diagnostic,
+    /// an invalid terminal name, or a known option stored as `Other`.
+    Unrepresentable,
+}
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooLong => f.write_str("Telnet payload exceeds its wire limit"),
+            Self::Unrepresentable => f.write_str("Telnet value has no exact wire form"),
+        }
+    }
+}
+
+impl core::error::Error for WriteError {}
 
 impl Event {
     /// Reads exactly one event in the given binary mode. Diagnostic error
     /// items are refused because they have no exact wire representation.
-    /// Data is bounded by [`MAX_DATA`]; use [`Decode`] for longer streams.
-    pub fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, WireError> {
+    /// Data is bounded by [`MAX_DATA`]; use [`Events`] for longer streams.
+    pub fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, EventParseError> {
         if bytes.len() > MAX_EVENT_WIRE {
-            return Err(WireError::TooLong);
+            return Err(EventParseError::TooLong);
         }
-        let mut decoder = Decode::new();
+        let mut decoder = Events::with_data_limit(MAX_DATA);
         decoder.set_binary(binary);
-        match codec::Decode::decode(&mut decoder, bytes, true).map_err(WireError::Decode)? {
-            Step::Item(Event::Error(e), _) => Err(WireError::Decode(e)),
+        match decoder
+            .decode(bytes, true)
+            .map_err(EventParseError::Decode)?
+        {
+            Step::Item(Event::Error(e), _) => Err(EventParseError::Decode(e)),
             Step::Item(event, used) if used == bytes.len() => Ok(event),
-            Step::Item(_, _) => Err(WireError::Trailing),
-            Step::Skip(_) => Err(WireError::TooLong),
-            _ => Err(WireError::Truncated),
+            Step::Item(_, _) => Err(EventParseError::Trailing),
+            Step::Skip(_) => Err(EventParseError::TooLong),
+            _ => Err(EventParseError::Truncated),
         }
     }
 
@@ -1089,12 +1126,14 @@ impl Event {
     /// handling matches [`escape_data`]. Empty data, diagnostics, and
     /// oversized values are refused before changing `out`. Temporary
     /// encoded storage is bounded by [`MAX_EVENT_WIRE`].
-    pub fn write_with(&self, out: &mut Vec<u8>, binary: bool) -> Result<(), WireError> {
+    pub fn write_with(&self, out: &mut Vec<u8>, binary: bool) -> Result<(), WriteError> {
         match self {
-            Event::Data(data) if data.len() > MAX_DATA => return Err(WireError::TooLong),
-            Event::Data(data) if data.is_empty() => return Err(WireError::Unrepresentable),
-            Event::Subnegotiation { data, .. } if data.len() > MAX_SUBNEGOTIATION => return Err(WireError::TooLong),
-            Event::Error(_) => return Err(WireError::Unrepresentable),
+            Event::Data(data) if data.len() > MAX_DATA => return Err(WriteError::TooLong),
+            Event::Data(data) if data.is_empty() => return Err(WriteError::Unrepresentable),
+            Event::Subnegotiation { data, .. } if data.len() > MAX_SUBNEGOTIATION => {
+                return Err(WriteError::TooLong);
+            }
+            Event::Error(_) => return Err(WriteError::Unrepresentable),
             _ => {}
         }
         let bytes = self.to_bytes(binary);
@@ -1104,41 +1143,58 @@ impl Event {
 }
 
 impl Wire for Event {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = EventParseError;
+    type WriteError = WriteError;
 
     /// Reads exactly one NVT event. Use [`Event::parse_with`] for binary mode.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
         Self::parse_with(bytes, false)
     }
 
     /// Writes one NVT event transactionally. Use [`Event::write_with`] for binary mode.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         self.write_with(out, false)
     }
 }
 
 impl Wire for Subnegotiation {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = EventParseError;
+    type WriteError = WriteError;
 
     /// Reads exactly one complete IAC SB ... IAC SE unit, including its option.
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
         match <Event as Wire>::parse(bytes)? {
-            Event::Subnegotiation { option, data } => Self::parse(option, &data).map_err(WireError::Subnegotiation),
-            _ => Err(WireError::Unrepresentable),
+            Event::Subnegotiation { option, data } => {
+                Self::parse(option, &data).map_err(EventParseError::Subnegotiation)
+            }
+            _ => Err(EventParseError::UnexpectedEvent),
         }
     }
 
     /// Writes the typed value without normalizing or clipping it. Known
     /// options in `Other`, invalid names, and oversized payloads are refused.
     /// Temporary storage is bounded by [`MAX_EVENT_WIRE`].
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        let bytes = self.to_bytes();
-        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WireError::Unrepresentable);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        match self {
+            Self::TerminalTypeIs(name)
+                if name.is_empty()
+                    || name.len() > MAX_TERMINAL_TYPE
+                    || !name.as_bytes().iter().all(is_name_byte) =>
+            {
+                return Err(WriteError::Unrepresentable);
+            }
+            Self::Other {
+                option: option::TERMINAL_TYPE | option::NAWS,
+                ..
+            } => {
+                return Err(WriteError::Unrepresentable);
+            }
+            Self::Other { data, .. } if data.len() > MAX_SUBNEGOTIATION => {
+                return Err(WriteError::TooLong);
+            }
+            _ => {}
         }
-        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&self.to_bytes());
         Ok(())
     }
 }
@@ -1392,7 +1448,6 @@ fn asked(state: OptionState, on: bool) -> (OptionState, Option<bool>) {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the legacy API.
 mod tests {
     use super::*;
 

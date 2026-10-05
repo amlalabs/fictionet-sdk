@@ -15,13 +15,13 @@
 //! parses the request line and header fields itself, hands the fields to
 //! [`check_request`], and writes back the fields from
 //! [`Upgrade::response_headers`]. It then feeds the bytes it reads from the
-//! connection to a [`Decoder`], gets whole [`Message`]s back, and writes the
-//! bytes of its replies. Answering pings, and when to close, is up to world
-//! code.
+//! connection to a [`codec::Stream`] of [`Messages`], gets whole [`Message`]s
+//! back, and writes the bytes of its replies. Answering pings, and when to
+//! close, is up to world code.
 //!
-//! New sessions use [`Frames`] or [`Assemble`] with [`codec::Stream`].
+//! New sessions use [`Frames`] or [`Messages`] with [`codec::Stream`].
 //! [`Wire`] for [`Frame`] writes strictly and parses an exact frame.
-//! The deprecated [`Decoder`] retains its original behavior.
+//! The legacy [`Decoder`] retains its original behavior.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A frame or message that breaks the specification becomes an
@@ -29,8 +29,8 @@
 //! sends before it drops the connection.
 //!
 //! ```
-//! # #![allow(deprecated)]
-//! use fictionet::stdlib::websocket::{check_request, Decoder, Message, Role};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::websocket::{check_request, Frame, Message, Messages, Opcode, Role};
 //!
 //! // The client's opening request, from RFC 6455 section 1.3.
 //! let headers = [
@@ -50,14 +50,15 @@
 //! assert!(reply.contains(&("Sec-WebSocket-Accept".to_string(), upgrade.accept.clone())));
 //!
 //! // A masked text frame from the client, from section 5.7.
-//! let mut decoder = Decoder::new(Role::Server);
+//! let mut stream = Stream::new(Messages::new(Role::Server));
 //! let bytes = [0x81, 0x85, 0x37, 0xfa, 0x21, 0x3d, 0x7f, 0x9f, 0x4d, 0x51, 0x58];
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let message = decoder.next_message().unwrap().unwrap();
+//! assert_eq!(stream.push(&bytes), bytes.len());
+//! let message = stream.next().unwrap().unwrap();
 //! assert_eq!(message, Message::Text("Hello".to_string()));
-//! assert!(decoder.next_message().is_none());
+//! assert!(stream.next().is_none());
 //! // A server sends its frames unmasked.
-//! assert_eq!(message.to_bytes(None), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
+//! let frame = Frame::new(Opcode::Text, b"Hello".to_vec());
+//! assert_eq!(Wire::to_bytes(&frame).unwrap(), [0x81, 0x05, b'H', b'e', b'l', b'l', b'o']);
 //! ```
 
 use super::codec::{self, Step, Wire};
@@ -80,8 +81,8 @@ pub const MAX_CLOSE_REASON: usize = MAX_CONTROL_PAYLOAD - 2;
 /// 2^63 - 1 bytes. This module refuses more than 16 MiB, so a reader never
 /// holds more than that for one frame.
 pub const MAX_PAYLOAD: usize = 1 << 24;
-/// The longest message a [`Decoder`] reassembles, and the most a writer
-/// puts in one message.
+/// The longest message [`Messages`] or a legacy [`Decoder`] reassembles,
+/// and the most a writer puts in one message.
 pub const MAX_MESSAGE: usize = 1 << 24;
 /// The most header fields [`check_request`] and [`check_response`] read.
 pub const MAX_HEADERS: usize = 256;
@@ -620,7 +621,6 @@ struct Partial {
 /// It joins fragmented messages, passes on control frames that come in
 /// between, checks text is UTF-8 and bounds how much it holds. A clone
 /// carries on from where the original stands.
-#[deprecated(note = "use codec::Stream with websocket::Assemble, or websocket::Frames for individual frames")]
 #[derive(Clone, Debug)]
 pub struct Decoder {
     role: Role,
@@ -633,7 +633,6 @@ pub struct Decoder {
     closed: bool,
 }
 
-#[allow(deprecated)] // Preserve the legacy buffering and repeating errors.
 impl Decoder {
     /// A decoder for `role` holding no bytes, taking messages up to
     /// [`MAX_MESSAGE`] bytes.
@@ -822,6 +821,8 @@ impl Decoder {
 pub enum FrameParseError {
     /// The frame header is invalid.
     Frame(FrameError),
+    /// A close frame's payload is invalid.
+    Close(CloseError),
     /// The frame is incomplete.
     Truncated,
     /// Bytes follow the frame.
@@ -832,6 +833,7 @@ impl core::fmt::Display for FrameParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Frame(e) => e.fmt(f),
+            Self::Close(e) => e.fmt(f),
             Self::Truncated => f.write_str("incomplete WebSocket frame"),
             Self::Trailing => f.write_str("bytes after WebSocket frame"),
         }
@@ -842,32 +844,45 @@ impl core::error::Error for FrameParseError {}
 
 impl Wire for Frame {
     type ParseError = FrameParseError;
-    type WriteError = FrameError;
+    type WriteError = Error;
 
-    /// Reads exactly one frame. Mask direction, continuation order, and
-    /// message contents are checked by [`Frames`] and [`Assemble`].
+    /// Reads exactly one frame, validating close payloads. Mask direction,
+    /// continuation order, and text messages are checked by [`Frames`] and
+    /// [`Messages`].
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
         match Frame::parse(bytes).map_err(FrameParseError::Frame)? {
-            Some((frame, used)) if used == bytes.len() => Ok(frame),
+            Some((frame, used)) if used == bytes.len() => {
+                if frame.opcode == Opcode::Close {
+                    Close::parse(&frame.payload).map_err(FrameParseError::Close)?;
+                }
+                Ok(frame)
+            }
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
         }
     }
 
-    /// Writes without clipping payloads or changing FIN. All checks happen
-    /// before appending. Temporary storage is bounded by [`MAX_HEADER_LEN`]
-    /// plus [`MAX_PAYLOAD`]. The legacy [`Frame::to_bytes`] is unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+    /// Writes without clipping payloads or changing FIN. Invalid close
+    /// payloads are refused with [`Error::Close`]; other invalid frames with
+    /// [`Error::Frame`]. All checks happen before appending. Temporary storage
+    /// is bounded by [`MAX_HEADER_LEN`] plus [`MAX_PAYLOAD`].
+    /// The legacy [`Frame::to_bytes`] is unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.opcode.is_control() {
             if !self.fin {
-                return Err(FrameError::FragmentedControl);
+                return Err(Error::Frame(FrameError::FragmentedControl));
             }
             if self.payload.len() > MAX_CONTROL_PAYLOAD {
-                return Err(FrameError::ControlTooLong);
+                return Err(Error::Frame(FrameError::ControlTooLong));
             }
         }
         if self.payload.len() > MAX_PAYLOAD {
-            return Err(FrameError::TooLarge(self.payload.len() as u64));
+            return Err(Error::Frame(FrameError::TooLarge(
+                u64::try_from(self.payload.len()).unwrap_or(u64::MAX),
+            )));
+        }
+        if self.opcode == Opcode::Close {
+            Close::parse(&self.payload).map_err(Error::Close)?;
         }
         out.extend_from_slice(&self.to_bytes());
         Ok(())
@@ -883,7 +898,7 @@ impl Wire for Frame {
 /// A valid close payload yields its frame, then [`Step::End`]. Use
 /// [`codec::Stream::into_parts`] or [`codec::Stream::swap`] to retain the
 /// unread suffix. Keep any bytes not accepted by [`codec::pump`] as well.
-/// Use [`Assemble`] for continuation order and text validation.
+/// Use [`Messages`] for continuation order and text validation.
 #[derive(Clone, Debug)]
 pub struct Frames {
     role: Role,
@@ -966,9 +981,15 @@ impl codec::Decode for Frames {
 /// when the unfinished message is empty. Held bytes never exceed the
 /// configured message limit, which is clamped to [`MAX_MESSAGE`].
 ///
+/// Errors use [`codec::AssembleError::Inner`] for protocol failures and
+/// [`codec::AssembleError::Incomplete`] for EOF between fragments. A message
+/// over the limit, in one frame or several, gives `Inner(Error::TooBig)`,
+/// whose [`Error::close_code`] is [`close_code::MESSAGE_TOO_BIG`]. The
+/// `TooLong` and `Allocation` variants are not returned by this decoder.
+///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, Wire}, websocket::{Assemble, Frame, Opcode, Role}};
-/// let mut stream = Stream::new(Assemble::new(Role::Server));
+/// use fictionet::stdlib::{codec::{Stream, Wire}, websocket::{Messages, Frame, Opcode, Role}};
+/// let mut stream = Stream::new(Messages::new(Role::Server));
 /// let frame = Frame { fin: true, opcode: Opcode::Close, mask: Some([1; 4]), payload: vec![] };
 /// let mut bytes = Wire::to_bytes(&frame)?;
 /// bytes.extend_from_slice(b"next protocol");
@@ -980,13 +1001,13 @@ impl codec::Decode for Frames {
 /// # Ok::<(), Box<dyn core::error::Error>>(())
 /// ```
 #[derive(Clone, Debug)]
-pub struct Assemble {
+pub struct Messages {
     frames: Frames,
     limit: usize,
     partial: Option<Partial>,
 }
 
-impl Assemble {
+impl Messages {
     /// Reads messages up to [`MAX_MESSAGE`] for the receiving `role`.
     pub fn new(role: Role) -> Self {
         Self::with_limit(role, MAX_MESSAGE)
@@ -1011,7 +1032,7 @@ impl Assemble {
     }
 }
 
-impl codec::Decode for Assemble {
+impl codec::Decode for Messages {
     type Item = Message;
     type Error = codec::AssembleError<Error>;
     const NAME: &'static str = "WebSocket messages";
@@ -1025,18 +1046,21 @@ impl codec::Decode for Assemble {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Self::Error> {
-        use codec::AssembleError::{Incomplete, Inner, TooLong};
+        use codec::AssembleError::{Incomplete, Inner};
         if self.frames.closed {
             return Ok(Step::End);
         }
-        if let Some(h) = self.frames.header(input).map_err(Inner)? {
+        if let Some(h) = self.frames.header(input).map_err(|error| match error {
+            Error::Frame(FrameError::TooLarge(_)) => Inner(Error::TooBig),
+            other => Inner(other),
+        })? {
             match (&self.partial, h.opcode) {
                 (None, Opcode::Continuation) => return Err(Inner(Error::UnexpectedContinuation)),
                 (Some(_), Opcode::Text | Opcode::Binary) => return Err(Inner(Error::ExpectedContinuation)),
                 _ => {}
             }
             if !h.opcode.is_control() && self.held().saturating_add(h.len) > self.limit {
-                return Err(TooLong { limit: self.limit });
+                return Err(Inner(Error::TooBig));
             }
         }
         let (frame, used) = match self.frames.decode(input, eof).map_err(Inner)? {
@@ -1680,7 +1704,6 @@ fn base64_value(c: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the legacy API.
 mod tests {
     use super::*;
 

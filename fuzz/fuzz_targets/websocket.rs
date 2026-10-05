@@ -1,12 +1,11 @@
 //! WebSocket frames, messages, close payloads and handshake fields, as a
 //! world playing a WebSocket server or client reads them.
 #![no_main]
-#![allow(deprecated)] // Keep exercising the legacy decoder beside the codec API.
 
 use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::websocket::{
-    Assemble, Frames, Opcode,
-    Close, Decoder, Error, Frame, Header, Message, Role, check_request, check_response, request_headers,
+    Close, Decoder, Error, Frame, Frames, Header, Message, Messages, Opcode, Role, check_request,
+    check_response, request_headers,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -58,8 +57,8 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Frame>(data);
     for role in [Role::Server, Role::Client] {
         contract::check_decode(|| Frames::new(role), data);
-        contract::check_decode(|| Assemble::new(role), data);
-        contract::check_decode_with_held_limit(|| Assemble::with_limit(role, 125), data, 125);
+        contract::check_decode(|| Messages::new(role), data);
+        contract::check_decode_with_held_limit(|| Messages::with_limit(role, 125), data, 125);
     }
     for opcode in [Opcode::Text, Opcode::Binary, Opcode::Continuation, Opcode::Close, Opcode::Ping, Opcode::Pong] {
         let frame = Frame {

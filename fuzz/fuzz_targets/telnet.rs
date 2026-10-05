@@ -1,10 +1,11 @@
 //! Telnet streams, negotiations and subnegotiations, as a world playing a
 //! Telnet server reads them.
 #![no_main]
-#![allow(deprecated)] // Keep exercising the legacy decoder beside the codec API.
 
 use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::telnet::{self, Decode, Decoder, Event, Negotiation, Side, Subnegotiation, option};
+use fictionet::stdlib::telnet::{
+    self, Decoder, Event, Events, Negotiation, Side, Subnegotiation, option,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Adjacent data events joined, so streams split in different places
@@ -58,16 +59,19 @@ fn read_split(stream: &[u8], cut: usize, ask: bool, allow: bool) -> Vec<Event> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Decode::new, data);
-    contract::check_decode_with_held_limit(|| Decode::with_data_limit(1), data, 0);
+    contract::check_decode(Events::new, data);
+    contract::check_decode_with_held_limit(|| Events::with_data_limit(telnet::MAX_DATA), data, 0);
     contract::check_wire::<Event>(data);
     contract::check_wire::<Subnegotiation>(data);
     for binary in [false, true] {
-        contract::check_decode(|| {
-            let mut decoder = Decode::new();
-            decoder.set_binary(binary);
-            decoder
-        }, data);
+        contract::check_decode(
+            || {
+                let mut decoder = Events::new();
+                decoder.set_binary(binary);
+                decoder
+            },
+            data,
+        );
         let event = Event::Data(data.iter().take(telnet::MAX_DATA + 1).copied().collect());
         contract::check_wire_value(&event);
         let mut out = vec![1, 2, 3];
