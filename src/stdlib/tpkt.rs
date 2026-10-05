@@ -17,6 +17,11 @@
 //! may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
+//! [`Frames`] implements [`super::codec::Decode`] for a caller-owned input
+//! buffer. Use [`super::codec::Stream`] to drive it with bounded storage
+//! and EOF handling. [`Packet`] implements [`Wire`] for exact parsing and
+//! transactional writing. Its inherent `parse` still reads one prefix.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A stream that breaks the format gives a [`TpktError`], and a
 //! real server closes the connection. Writers return an [`EncodeError`]
@@ -45,7 +50,14 @@
 //! assert_eq!(Packet::parse(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
-use super::cotp;
+extern crate alloc;
+
+use super::{
+    codec::{Buffer, Decode, Step, Wire},
+    cotp,
+};
+use alloc::vec::Vec;
+
 
 /// The TCP port ISO transport servers listen on.
 pub const PORT: u16 = 102;
@@ -99,8 +111,9 @@ pub enum EncodeError {
     Unrepresentable,
 }
 
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             EncodeError::TooShort(n) => write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}"),
             EncodeError::TooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
@@ -111,7 +124,8 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
+
 
 /// Why bytes are not a TPKT stream. Any of them means the connection holds
 /// no more packets a reader can find, and a real server closes it.
@@ -130,8 +144,9 @@ pub enum TpktError {
     },
 }
 
-impl std::fmt::Display for TpktError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+
+impl core::fmt::Display for TpktError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TpktError::Version(v) => write!(f, "TPKT version {v}, not {VERSION}"),
             TpktError::Length(n) => write!(f, "TPKT length {n}, below {MIN_PACKET}"),
@@ -142,7 +157,33 @@ impl std::fmt::Display for TpktError {
     }
 }
 
-impl std::error::Error for TpktError {}
+impl core::error::Error for TpktError {}
+
+/// Why an exact [`Wire`] parse could not read one complete packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The TPKT header was invalid.
+    Header(TpktError),
+    /// The slice ended before the packet was complete.
+    Incomplete,
+    /// Bytes followed the complete packet.
+    Trailing {
+        /// Number of bytes after the packet.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Header(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete TPKT packet"),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after TPKT packet"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
 
 /// The fields of a TPKT header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,11 +305,7 @@ impl Packet {
     /// than [`MIN_PAYLOAD`] or longer than [`MAX_PAYLOAD`] is an error,
     /// since no packet a reader takes can hold it.
     pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
-        let header = self.header()?;
-        let mut out = Vec::with_capacity(HEADER_LEN + self.payload.len());
-        out.extend_from_slice(&header.to_bytes()?);
-        out.extend_from_slice(&self.payload);
-        Ok(out)
+        Wire::to_bytes(self)
     }
 
     /// The packet carrying `tpdu`, with the reserved byte 0. It always
@@ -317,6 +354,30 @@ impl Packet {
     }
 }
 
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let (packet, used) = Packet::parse(bytes)
+            .map_err(ParseError::Header)?
+            .ok_or(ParseError::Incomplete)?;
+        if used != bytes.len() {
+            return Err(ParseError::Trailing {
+                remaining: bytes.len().saturating_sub(used),
+            });
+        }
+        Ok(packet)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let header = self.header()?.to_bytes()?;
+        out.extend_from_slice(&header);
+        out.extend_from_slice(&self.payload);
+        Ok(())
+    }
+}
+
 /// The header's variable part, for the TPDUs that have one.
 fn variable_of(t: &cotp::Tpdu) -> Option<&cotp::Variable> {
     match t {
@@ -354,16 +415,67 @@ pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, Encode
     Ok(out)
 }
 
+
+/// Reads TPKT packets from a borrowed unread slice.
+///
+/// Use with [`super::codec::Stream`] for bounded input buffering. A partial
+/// packet returns [`Step::Need`], including at EOF. The stream reports
+/// truncation at EOF and reports framing errors once. No input is retained.
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Frames {
+    /// Reads packets up to [`MAX_PACKET`] bytes, including their headers.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Reads packets up to `limit` bytes, including their headers.
+    /// Clamps the limit to [`MIN_PACKET`] through [`MAX_PACKET`].
+    /// A larger declared packet is refused as soon as its header arrives.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: clamp_limit(limit),
+        }
+    }
+
+    /// The maximum packet size, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = TpktError;
+    const NAME: &'static str = "TPKT";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, TpktError> {
+        Ok(match Packet::parse_limited(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a TPKT byte stream into packets. Feed it the bytes a connection
 /// reads, in order, and take packets out until it has none.
 #[derive(Clone, Debug)]
 pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small packets costs time in proportion to their bytes.
-    start: usize,
-    limit: usize,
+    buf: Buffer,
+    frames: Frames,
     failed: Option<TpktError>,
 }
 
@@ -386,16 +498,15 @@ impl Decoder {
     /// the stream with [`TpktError::TooLong`].
     pub fn with_limit(limit: usize) -> Decoder {
         Decoder {
-            buf: Vec::new(),
-            start: 0,
-            limit: clamp_limit(limit),
+            buf: Buffer::new(clamp_limit(limit)),
+            frames: Frames::with_limit(limit),
             failed: None,
         }
     }
 
     /// The longest packet this decoder takes, header included.
     pub fn limit(&self) -> usize {
-        self.limit
+        self.frames.limit()
     }
 
     /// Takes bytes read from the connection, from the start of `bytes`,
@@ -411,13 +522,7 @@ impl Decoder {
         if self.failed.is_some() {
             return bytes.len();
         }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(self.limit.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
+        self.buf.push(bytes)
     }
 
     /// The next whole packet, if one has come. It returns `None` when it
@@ -427,20 +532,15 @@ impl Decoder {
         if let Some(e) = self.failed {
             return Some(Err(e));
         }
-        match Packet::parse_limited(&self.buf[self.start..], self.limit) {
-            Ok(Some((packet, used))) => {
-                self.start += used;
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
+        match self.frames.decode(self.buf.unread(), false) {
+            Ok(Step::Item(packet, used)) => {
+                self.buf.consume(used);
                 Some(Ok(packet))
             }
-            Ok(None) => None,
+            Ok(_) => None,
             Err(e) => {
                 self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
+                self.buf = Buffer::new(self.limit());
                 Some(Err(e))
             }
         }
@@ -448,7 +548,130 @@ impl Decoder {
 
     /// How many bytes are held, waiting for the rest of a packet.
     pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
+        self.buf.len()
+    }
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::super::codec::{Fail, Stream, contract};
+    use super::*;
+
+    #[test]
+    fn exact_wire_and_transactional_writes() {
+        let packet = Packet {
+            reserved: 0x91,
+            payload: vec![2, 0xf0, 0x80],
+        };
+        let bytes = Wire::to_bytes(&packet).unwrap();
+        assert_eq!(<Packet as Wire>::parse(&bytes), Ok(packet.clone()));
+        contract::check_wire::<Packet>(&bytes);
+        for cut in 0..bytes.len() {
+            assert_eq!(
+                <Packet as Wire>::parse(&bytes[..cut]),
+                Err(ParseError::Incomplete)
+            );
+        }
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert_eq!(
+            <Packet as Wire>::parse(&trailing),
+            Err(ParseError::Trailing { remaining: 1 })
+        );
+        assert_eq!(Packet::parse(&trailing), Ok(Some((packet, bytes.len()))));
+        assert_eq!(
+            <Packet as Wire>::parse(&[9]),
+            Err(ParseError::Header(TpktError::Version(9)))
+        );
+
+        for size in [
+            0,
+            MIN_PAYLOAD - 1,
+            MIN_PAYLOAD,
+            MAX_PAYLOAD,
+            MAX_PAYLOAD + 1,
+        ] {
+            let value = Packet::new(vec![0; size]);
+            contract::check_wire_value(&value);
+            let mut out = vec![0x55];
+            let result = value.write(&mut out);
+            assert_eq!(result.is_ok(), (MIN_PAYLOAD..=MAX_PAYLOAD).contains(&size));
+            if result.is_err() {
+                assert_eq!(out, [0x55]);
+            }
+        }
+    }
+
+    #[test]
+    fn frame_limits_eof_and_error_once() {
+        for limit in [0, MIN_PACKET, 128, MAX_PACKET, usize::MAX] {
+            let frames = Frames::with_limit(limit);
+            assert_eq!(frames.capacity(), limit.clamp(MIN_PACKET, MAX_PACKET));
+            assert_eq!(frames.held(), 0);
+            for input in [
+                &[][..],
+                &[3],
+                &[3, 0, 0, 6],
+                &[0],
+                &[3, 4, 0, 7, 2, 0xf0, 0x80],
+            ] {
+                contract::check_decode_with_held_limit(|| frames, input, 0);
+            }
+        }
+        let mut stream = Stream::new(Frames::with_limit(8));
+        assert_eq!(stream.push(&[3, 0, 0, 9]), 4);
+        let error = Fail::Protocol(TpktError::TooLong {
+            length: 9,
+            limit: 8,
+        });
+        assert_eq!(stream.next(), Some(Err(error.clone())));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&error));
+        assert_eq!(stream.push(&[1, 2]), 2);
+        assert_eq!(stream.buffered(), 4);
+
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[3, 0, 0, 7, 2]), 5);
+        assert_eq!(stream.next(), None);
+        stream.end();
+        assert_eq!(stream.next(), Some(Err(Fail::Truncated { unread: 5 })));
+        assert_eq!(stream.next(), None);
+    }
+
+    #[test]
+    fn maximum_packet_in_byte_chunks() {
+        let packet = Packet::new(vec![0x5a; MAX_PAYLOAD]);
+        let bytes = packet.to_bytes().unwrap();
+        let mut stream = Stream::new(Frames::new());
+        for (i, byte) in bytes.chunks(1).enumerate() {
+            assert_eq!(stream.push(byte), 1);
+            assert!(stream.buffered() <= MAX_PACKET);
+            let result = stream.next();
+            if i + 1 == bytes.len() {
+                assert_eq!(result, Some(Ok(packet.clone())));
+            } else {
+                assert_eq!(result, None);
+            }
+        }
+        stream.end();
+        assert_eq!(stream.next(), None);
+        assert!(stream.is_done());
+    }
+
+    #[test]
+    fn compatibility_wrapper_keeps_feed_and_failure_behavior() {
+        let bytes = Packet::new(vec![1, 2, 3]).to_bytes().unwrap();
+        let mut decoder = Decoder::with_limit(MIN_PACKET);
+        assert_eq!(decoder.feed(&bytes.repeat(3)), MIN_PACKET);
+        assert_eq!(decoder.feed(&bytes), 0);
+        assert_eq!(decoder.clone().next_packet(), decoder.next_packet());
+        assert_eq!(decoder.feed(&[9]), 1);
+        for _ in 0..2 {
+            assert_eq!(decoder.next_packet(), Some(Err(TpktError::Version(9))));
+        }
+        assert_eq!(decoder.buffered(), 0);
+        assert_eq!(decoder.feed(&bytes), bytes.len());
+        assert_eq!(decoder.buffered(), 0);
     }
 }
 
@@ -494,7 +717,7 @@ mod tests {
                 assert!(decoder.buffered() <= decoder.limit());
                 assert!(decoder.buffered() <= MAX_BUFFERED);
                 // Dropped bytes are let go before they pass the held ones.
-                assert!(decoder.buf.len() < 2 * decoder.limit());
+                assert!(decoder.buf.allocated() <= 2 * decoder.limit());
                 rest = &rest[took..];
                 let mut progress = took > 0;
                 while let Some(r) = decoder.next_packet() {

@@ -18,6 +18,25 @@
 //! into them. Which TSAPs exist, what TPDU size to accept, and what the
 //! data means are up to world code.
 //!
+//! New stream readers use [`tpdus`] for individual TPDUs or [`messages`]
+//! for EOT reassembly. Both compose the shared [`tpkt::Frames`] decoder.
+//! [`Tpdu`] implements [`Wire`] with a [`MAX_TPDU`] input limit and a
+//! strict, transactional writer. The inherent `parse` and lossy `to_bytes`
+//! retain their original behavior.
+//!
+//! ```
+//! use fictionet::stdlib::{codec::{Assembled, Stream, finish, pump}, cotp, tpkt};
+//!
+//! let bytes = tpkt::write_message(b"hello", 128).unwrap();
+//! let mut stream = Stream::new(cotp::messages(tpkt::MAX_PACKET, cotp::MAX_MESSAGE));
+//! let mut items = Vec::new();
+//! for byte in bytes.chunks(1) {
+//!     pump(&mut stream, byte, |item| items.push(item)).unwrap();
+//! }
+//! finish(&mut stream, |item| items.push(item)).unwrap();
+//! assert_eq!(items, vec![Assembled::Message(b"hello".to_vec())]);
+//! ```
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A TPDU this module cannot read gives a [`TpduError`] that
 //! [`ErrorTpdu::rejecting`] turns into the error TPDU a real stack sends.
@@ -49,20 +68,28 @@
 //! assert_eq!(messages.push(&data), Ok(Some(b"hi".to_vec())));
 //! ```
 
+extern crate alloc;
+
+use super::{
+    codec::{Assemble, Decode, Fragment, Map, Step, Wire},
+    tpkt,
+};
+use alloc::{vec, vec::Vec};
+
 /// The TCP port ISO transport servers listen on.
-pub const PORT: u16 = 102;
+pub const PORT: u16 = tpkt::PORT;
 /// The only TPKT version, the first byte of every packet.
-pub const TPKT_VERSION: u8 = 3;
+pub const TPKT_VERSION: u8 = tpkt::VERSION;
 /// The length of the TPKT header, before the TPDU.
-pub const TPKT_HEADER_LEN: usize = 4;
+pub const TPKT_HEADER_LEN: usize = tpkt::HEADER_LEN;
 /// The shortest TPDU: a data TPDU's 3-byte header with no data.
-pub const MIN_TPDU: usize = 3;
+pub const MIN_TPDU: usize = tpkt::MIN_PAYLOAD;
 /// The shortest packet: the header and the shortest TPDU.
-pub const MIN_PACKET: usize = TPKT_HEADER_LEN + MIN_TPDU;
+pub const MIN_PACKET: usize = tpkt::MIN_PACKET;
 /// The longest packet the 16-bit length field allows.
-pub const MAX_PACKET: usize = 65535;
+pub const MAX_PACKET: usize = tpkt::MAX_PACKET;
 /// The longest TPDU one packet can carry.
-pub const MAX_TPDU: usize = MAX_PACKET - TPKT_HEADER_LEN;
+pub const MAX_TPDU: usize = tpkt::MAX_PAYLOAD;
 /// The largest length indicator: the most header bytes after the first.
 /// The value 255 is reserved.
 pub const MAX_HEADER: usize = 254;
@@ -169,8 +196,8 @@ pub enum TpktError {
     Length(u16),
 }
 
-impl std::fmt::Display for TpktError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TpktError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TpktError::Version(v) => write!(f, "TPKT version {v}, not 3"),
             TpktError::Length(n) => write!(f, "TPKT length {n}, below {MIN_PACKET}"),
@@ -178,43 +205,41 @@ impl std::fmt::Display for TpktError {
     }
 }
 
-impl std::error::Error for TpktError {}
+impl core::error::Error for TpktError {}
+
+/// Converts errors from the shared framer for the unlimited legacy reader.
+fn legacy_error(error: tpkt::TpktError) -> TpktError {
+    match error {
+        tpkt::TpktError::Version(v) => TpktError::Version(v),
+        tpkt::TpktError::Length(n) => TpktError::Length(n),
+        // A 16-bit length cannot exceed MAX_PACKET. Legacy readers always
+        // use that limit, so this arm cannot be reached by input bytes.
+        tpkt::TpktError::TooLong { length, .. } => TpktError::Length(length),
+    }
+}
 
 /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
 /// holds only part of one, and otherwise the TPDU it carries and how many
 /// bytes of `b` the packet took. The reserved second byte is not checked.
 pub fn parse_packet(b: &[u8]) -> Result<Option<(&[u8], usize)>, TpktError> {
-    let Some(&version) = b.first() else { return Ok(None) };
-    if version != TPKT_VERSION {
-        return Err(TpktError::Version(version));
-    }
-    if b.len() < TPKT_HEADER_LEN {
+    let Some(header) = tpkt::Header::parse(b, MAX_PACKET).map_err(legacy_error)? else {
         return Ok(None);
-    }
-    let length = u16::from_be_bytes([b[2], b[3]]);
-    if usize::from(length) < MIN_PACKET {
-        return Err(TpktError::Length(length));
-    }
-    let end = usize::from(length);
-    match b.get(TPKT_HEADER_LEN..end) {
-        Some(tpdu) => Ok(Some((tpdu, end))),
-        None => Ok(None),
-    }
+    };
+    let end = usize::from(header.length);
+    Ok(b.get(TPKT_HEADER_LEN..end).map(|payload| (payload, end)))
 }
 
 /// The packet that carries `tpdu`. A TPDU longer than [`MAX_TPDU`] is cut
 /// to that length, and one shorter than [`MIN_TPDU`] is padded with zeros,
 /// so the packet always reads back.
 pub fn write_packet(tpdu: &[u8]) -> Vec<u8> {
-    let tpdu = &tpdu[..tpdu.len().min(MAX_TPDU)];
-    let len = TPKT_HEADER_LEN + tpdu.len().max(MIN_TPDU);
-    let mut out = Vec::with_capacity(len);
-    out.extend_from_slice(&[TPKT_VERSION, 0]);
-    // `len` is at most MAX_PACKET, so it fits in 16 bits.
-    out.extend_from_slice(&(len as u16).to_be_bytes());
-    out.extend_from_slice(tpdu);
-    out.resize(len, 0);
-    out
+    let mut payload = tpdu
+        .get(..tpdu.len().min(MAX_TPDU))
+        .unwrap_or_default()
+        .to_vec();
+    payload.resize(payload.len().max(MIN_TPDU), 0);
+    // Padding and clipping above put the payload within the writer's limits.
+    tpkt::Packet::new(payload).to_bytes().unwrap_or_default()
 }
 
 /// The most spare room a [`Decoder`] keeps once its bytes are taken out.
@@ -222,6 +247,11 @@ const DECODER_RETAINED: usize = 2 * MAX_PACKET;
 
 /// Splits a TPKT byte stream into TPDUs. Feed it the bytes a connection
 /// reads, in order, and take TPDUs out until it has none.
+///
+/// This compatibility wrapper uses [`tpkt::Frames`]. Its void `feed` keeps
+/// the legacy behavior of holding every byte until packets are taken out.
+/// Use [`tpdus`] or [`messages`] with [`super::codec::Stream`] for bounded
+/// input and explicit EOF handling.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -229,6 +259,7 @@ pub struct Decoder {
     /// dropped in `feed` once they are half the buffer, so taking out many
     /// small packets costs time in proportion to their bytes.
     start: usize,
+    frames: tpkt::Frames,
     failed: Option<TpktError>,
 }
 
@@ -264,10 +295,12 @@ impl Decoder {
         if let Some(e) = self.failed {
             return Some(Err(e));
         }
-        match parse_packet(&self.buf[self.start..]) {
-            Ok(Some((tpdu, used))) => {
-                let tpdu = tpdu.to_vec();
-                self.start += used;
+        match self
+            .frames
+            .decode(self.buf.get(self.start..).unwrap_or_default(), false)
+        {
+            Ok(Step::Item(packet, used)) => {
+                self.start = self.start.saturating_add(used);
                 if self.start == self.buf.len() {
                     // Everything fed has been taken out. Keep room for a
                     // couple of packets, not for the largest burst fed.
@@ -275,10 +308,11 @@ impl Decoder {
                     self.buf.shrink_to(DECODER_RETAINED);
                     self.start = 0;
                 }
-                Some(Ok(tpdu))
+                Some(Ok(packet.payload))
             }
-            Ok(None) => None,
+            Ok(_) => None,
             Err(e) => {
+                let e = legacy_error(e);
                 self.failed = Some(e);
                 self.buf = Vec::new();
                 self.start = 0;
@@ -289,7 +323,7 @@ impl Decoder {
 
     /// How many bytes are held, waiting for the rest of a packet.
     pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
+        self.buf.len().saturating_sub(self.start)
     }
 }
 
@@ -673,19 +707,130 @@ impl TpduError {
     }
 }
 
-impl std::fmt::Display for TpduError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for TpduError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TpduError::Empty => f.write_str("empty TPDU"),
-            TpduError::LengthIndicator(li) => write!(f, "length indicator {li} does not fit the TPDU"),
-            TpduError::Truncated { needed, have } => write!(f, "TPDU header needs {needed} bytes, has {have}"),
+            TpduError::LengthIndicator(li) => {
+                write!(f, "length indicator {li} does not fit the TPDU")
+            }
+            TpduError::Truncated { needed, have } => {
+                write!(f, "TPDU header needs {needed} bytes, has {have}")
+            }
             TpduError::Unsupported(c) => write!(f, "TPDU code {c:#04x} is not class 0"),
             TpduError::UnexpectedData => f.write_str("error TPDU with data after its header"),
         }
     }
 }
 
-impl std::error::Error for TpduError {}
+impl core::error::Error for TpduError {}
+
+/// Why an exact, bounded [`Wire`] parse refused a TPDU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The TPDU cannot fit in a TPKT payload.
+    TooLong {
+        /// Number of input bytes, greater than [`MAX_TPDU`].
+        length: usize,
+    },
+    /// The TPDU header or body was invalid.
+    Tpdu(TpduError),
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooLong { length } => write!(f, "TPDU of {length} bytes, above {MAX_TPDU}"),
+            Self::Tpdu(e) => e.fmt(f),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
+
+/// A TPDU cannot be written without changing its value.
+///
+/// A field, parameter, header, or payload exceeds its wire limit, or a
+/// [`Variable::Raw`] value would parse as [`Variable::Parameters`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodeError;
+
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("TPDU cannot be represented without changing its value")
+    }
+}
+
+impl core::error::Error for EncodeError {}
+
+impl Wire for Tpdu {
+    type ParseError = ParseError;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() > MAX_TPDU {
+            return Err(ParseError::TooLong {
+                length: bytes.len(),
+            });
+        }
+        Tpdu::parse(bytes).map_err(ParseError::Tpdu)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        // The legacy writer stages at most MAX_TPDU bytes. Compare before
+        // appending so clipping, masked fields, and raw normalization fail
+        // without changing the destination.
+        let bytes = self.to_bytes();
+        if Tpdu::parse(&bytes).as_ref() != Ok(self) {
+            return Err(EncodeError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// One bounded TPDU parse per TPKT packet, composed with [`Map`].
+///
+/// Items are `Result<Tpdu, ParseError>`. A malformed TPDU is an item error;
+/// it does not end framing. Framing errors are [`tpkt::TpktError`].
+pub type Tpdus = Map<tpkt::Frames, fn(tpkt::Packet) -> Result<Tpdu, ParseError>>;
+
+/// Creates a TPDU decoder with a TPKT packet limit, including its header.
+/// Clamps `packet_limit` to [`MIN_PACKET`] through [`MAX_PACKET`].
+pub fn tpdus(packet_limit: usize) -> Tpdus {
+    tpkt::Frames::with_limit(packet_limit).map(|packet| <Tpdu as Wire>::parse(&packet.payload))
+}
+
+/// Data TPDUs joined into messages by [`Assemble`].
+///
+/// Items are [`super::codec::Assembled`]. Control TPDUs and TPDU parse
+/// errors pass through as `Whole` items without clearing a pending message.
+/// DT payloads join in order until EOT. TPDU numbers are not checked.
+/// EOF before EOT reports [`super::codec::AssembleError::Incomplete`], even
+/// for an empty fragment. A torn TPKT reports [`super::codec::Fail::Truncated`].
+/// Framing errors and message overflow end the stream.
+pub type Messages =
+    Assemble<Tpdus, fn(Result<Tpdu, ParseError>) -> Fragment<Result<Tpdu, ParseError>>>;
+
+/// Creates a TPKT, TPDU, and message decoder with separate size limits.
+///
+/// `packet_limit` includes the TPKT header and is clamped by [`tpdus`].
+/// `message_limit` counts DT payload bytes and is capped at [`MAX_MESSAGE`].
+/// Zero permits empty messages. The decoder holds at most `message_limit`
+/// bytes outside its driver's input buffer.
+pub fn messages(packet_limit: usize, message_limit: usize) -> Messages {
+    Assemble::new(
+        tpdus(packet_limit),
+        message_limit.min(MAX_MESSAGE),
+        |tpdu| match tpdu {
+            Ok(Tpdu::Data(data)) => Fragment::Part {
+                data: data.data,
+                last: data.eot,
+            },
+            other => Fragment::Whole(other),
+        },
+    )
+}
 
 impl Tpdu {
     /// Reads the TPDU in `b`: all of it, as one packet carries.
@@ -695,22 +840,27 @@ impl Tpdu {
             return Err(TpduError::LengthIndicator(li));
         }
         let Some(header) = rest.get(..usize::from(li)) else {
-            return Err(TpduError::Truncated { needed: usize::from(li) + 1, have: b.len() });
+            return Err(TpduError::Truncated {
+                needed: usize::from(li) + 1,
+                have: b.len(),
+            });
         };
-        let data = &rest[usize::from(li)..];
-        let Some(&code_byte) = header.first() else { return Err(TpduError::Unsupported(0)) };
-        let fixed = |n: usize| if header.len() >= n { Ok(()) } else { Err(TpduError::LengthIndicator(li)) };
-        let be16 = |i: usize| u16::from_be_bytes([header[i], header[i + 1]]);
+        let data = rest.get(usize::from(li)..).unwrap_or_default();
+        let Some(&code_byte) = header.first() else {
+            return Err(TpduError::Unsupported(0));
+        };
         match code_byte & 0xf0 {
             code::CONNECTION_REQUEST | code::CONNECTION_CONFIRM => {
-                fixed(CONNECT_FIXED)?;
+                let [_, dst_hi, dst_lo, src_hi, src_lo, class, variable @ ..] = header else {
+                    return Err(TpduError::LengthIndicator(li));
+                };
                 let connect = Connect {
                     credit: code_byte & 0x0f,
-                    dst_ref: be16(1),
-                    src_ref: be16(3),
-                    class: header[5] >> 4,
-                    options: header[5] & 0x0f,
-                    variable: Variable::parse(&header[CONNECT_FIXED..]),
+                    dst_ref: u16::from_be_bytes([*dst_hi, *dst_lo]),
+                    src_ref: u16::from_be_bytes([*src_hi, *src_lo]),
+                    class: class >> 4,
+                    options: class & 0x0f,
+                    variable: Variable::parse(variable),
                     data: data.to_vec(),
                 };
                 Ok(if code_byte & 0xf0 == code::CONNECTION_REQUEST {
@@ -720,33 +870,41 @@ impl Tpdu {
                 })
             }
             _ if code_byte == code::DISCONNECT_REQUEST => {
-                fixed(DISCONNECT_FIXED)?;
+                let [_, dst_hi, dst_lo, src_hi, src_lo, reason, variable @ ..] = header else {
+                    return Err(TpduError::LengthIndicator(li));
+                };
                 Ok(Tpdu::DisconnectRequest(Disconnect {
-                    dst_ref: be16(1),
-                    src_ref: be16(3),
-                    reason: header[5],
-                    variable: Variable::parse(&header[DISCONNECT_FIXED..]),
+                    dst_ref: u16::from_be_bytes([*dst_hi, *dst_lo]),
+                    src_ref: u16::from_be_bytes([*src_hi, *src_lo]),
+                    reason: *reason,
+                    variable: Variable::parse(variable),
                     data: data.to_vec(),
                 }))
             }
             _ if code_byte == code::DATA => {
                 // Class 0 data has no variable part; a longer header is
                 // another class's format.
-                if header.len() != DATA_FIXED {
+                let [_, flags] = header else {
                     return Err(TpduError::LengthIndicator(li));
-                }
-                let eot = header[1] & code::EOT != 0;
-                Ok(Tpdu::Data(Data { eot, number: header[1] & 0x7f, data: data.to_vec() }))
+                };
+                let eot = flags & code::EOT != 0;
+                Ok(Tpdu::Data(Data {
+                    eot,
+                    number: flags & 0x7f,
+                    data: data.to_vec(),
+                }))
             }
             _ if code_byte == code::ERROR => {
-                fixed(ERROR_FIXED)?;
+                let [_, dst_hi, dst_lo, cause, variable @ ..] = header else {
+                    return Err(TpduError::LengthIndicator(li));
+                };
                 if !data.is_empty() {
                     return Err(TpduError::UnexpectedData);
                 }
                 Ok(Tpdu::Error(ErrorTpdu {
-                    dst_ref: be16(1),
-                    cause: header[3],
-                    variable: Variable::parse(&header[ERROR_FIXED..]),
+                    dst_ref: u16::from_be_bytes([*dst_hi, *dst_lo]),
+                    cause: *cause,
+                    variable: Variable::parse(variable),
                 }))
             }
             _ => Err(TpduError::Unsupported(code_byte)),
@@ -757,6 +915,8 @@ impl Tpdu {
     /// out, and data past what one packet can carry is cut, so the bytes
     /// always read back and always fit in a packet. Fields wider than the
     /// format allows, such as a credit over 15, keep only their low bits.
+    /// Use [`Wire::write`] or `Wire::to_bytes` for strict writing without
+    /// clipping or normalization.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = vec![0u8];
         let data: &[u8] = match self {
@@ -813,13 +973,13 @@ pub struct MessageTooLong {
     pub limit: usize,
 }
 
-impl std::fmt::Display for MessageTooLong {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for MessageTooLong {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "message longer than {} bytes", self.limit)
     }
 }
 
-impl std::error::Error for MessageTooLong {}
+impl core::error::Error for MessageTooLong {}
 
 /// Puts a message back together from the data TPDUs that carry it.
 #[derive(Clone, Debug)]
@@ -867,7 +1027,7 @@ impl Reassembler {
             return Err(MessageTooLong { limit: self.limit });
         }
         self.buf.extend_from_slice(&segment.data);
-        if segment.eot { Ok(Some(std::mem::take(&mut self.buf))) } else { Ok(None) }
+        if segment.eot { Ok(Some(core::mem::take(&mut self.buf))) } else { Ok(None) }
     }
 
     /// How many bytes of an unfinished message are held.
@@ -889,6 +1049,323 @@ pub fn segment(message: &[u8], tpdu_size: usize) -> Vec<Data> {
         None => out.push(Data { eot: true, number: 0, data: Vec::new() }),
     }
     out
+}
+
+#[cfg(test)]
+mod codec_tests {
+    use super::super::codec::{
+        AssembleError, Assembled, Fail, Stream, contract, finish, pump, test_support,
+    };
+    use super::*;
+
+    fn strict_packet(tpdu: &Tpdu) -> tpkt::Packet {
+        tpkt::Packet {
+            reserved: 0x31,
+            payload: Wire::to_bytes(tpdu).unwrap(),
+        }
+    }
+
+    fn drive<D: Decode>(decoder: D, chunks: &[&[u8]]) -> Vec<D::Item>
+    where
+        D::Error: Clone + core::fmt::Debug,
+    {
+        let capacity = decoder.capacity();
+        let mut stream = Stream::new(decoder);
+        let mut items = Vec::new();
+        for chunk in chunks {
+            assert_eq!(
+                pump(&mut stream, chunk, |item| items.push(item)).unwrap(),
+                chunk.len()
+            );
+            assert!(stream.buffered() <= capacity);
+            assert!(stream.held() <= MAX_MESSAGE);
+        }
+        finish(&mut stream, |item| items.push(item)).unwrap();
+        assert!(stream.is_done());
+        assert_eq!(stream.buffered(), 0);
+        assert_eq!(stream.held(), 0);
+        items
+    }
+
+    #[test]
+    fn stack_round_trip_under_arbitrary_chunking() {
+        let message: Vec<u8> = (0..513).map(|i| i as u8).collect();
+        let request = Tpdu::ConnectionRequest(Connect::request(17).with_tpdu_size(128));
+        let confirm = Tpdu::ConnectionConfirm(Connect {
+            dst_ref: 17,
+            src_ref: 29,
+            ..Connect::default()
+        });
+        let mut units = vec![request.clone()];
+        for (i, part) in segment(&message, 128).into_iter().enumerate() {
+            units.push(Tpdu::Data(part));
+            if i == 0 {
+                units.push(confirm.clone());
+            }
+        }
+        units.push(Tpdu::Data(Data {
+            eot: true,
+            number: 0,
+            data: Vec::new(),
+        }));
+        units.push(Tpdu::Data(Data {
+            eot: true,
+            number: 0,
+            data: b"next".to_vec(),
+        }));
+        let packets: Vec<_> = units.iter().map(strict_packet).collect();
+        let mut wire = Vec::new();
+        for packet in &packets {
+            packet.write(&mut wire).unwrap();
+        }
+        let expected = vec![
+            Assembled::Whole(Ok(request)),
+            Assembled::Whole(Ok(confirm)),
+            Assembled::Message(message.clone()),
+            Assembled::Message(Vec::new()),
+            Assembled::Message(b"next".to_vec()),
+        ];
+        let check = |chunks: Vec<&[u8]>| {
+            let read_packets = drive(tpkt::Frames::with_limit(132), &chunks);
+            assert_eq!(read_packets, packets);
+            let read_tpdus = drive(tpdus(132), &chunks);
+            assert_eq!(
+                read_tpdus,
+                units.iter().cloned().map(Ok).collect::<Vec<_>>()
+            );
+            let assembled = drive(messages(132, 1024), &chunks);
+            assert_eq!(assembled, expected);
+
+            // Run the layers separately as an oracle for the composed stack.
+            let mut reassembler = Reassembler::with_limit(1024);
+            let mut separate = Vec::new();
+            let mut rewritten = Vec::new();
+            for packet in read_packets {
+                let tpdu = <Tpdu as Wire>::parse(&packet.payload).unwrap();
+                assert_eq!(strict_packet(&tpdu), packet);
+                strict_packet(&tpdu).write(&mut rewritten).unwrap();
+                match tpdu {
+                    Tpdu::Data(data) => {
+                        if let Some(message) = reassembler.push(&data).unwrap() {
+                            separate.push(Assembled::Message(message));
+                        }
+                    }
+                    other => separate.push(Assembled::Whole(Ok(other))),
+                }
+            }
+            assert_eq!(rewritten, wire);
+            assert_eq!(separate, assembled);
+        };
+        for pattern in [&[][..], &[1], &[2], &[3, 1, 128, 4, 7], &[131, 2, 133]] {
+            check(test_support::chunks(&wire, pattern).collect());
+        }
+        for seed in 0..32 {
+            let mut rng = test_support::Lcg::new(seed);
+            check(test_support::random_chunks(&wire, &mut rng, 199).collect());
+        }
+        contract::check_decode_with_held_limit(|| messages(132, 1024), &wire, 1024);
+
+        // The existing message writer uses the same packet and TPDU layers.
+        let written = tpkt::write_message(&message, 128).unwrap();
+        let chunks: Vec<_> = written.chunks(1).collect();
+        assert_eq!(
+            drive(messages(132, 1024), &chunks),
+            vec![Assembled::Message(message)]
+        );
+    }
+
+    #[test]
+    fn malformed_tpdu_is_an_item_and_preserves_assembly() {
+        let first = strict_packet(&Tpdu::Data(Data {
+            eot: false,
+            number: 127,
+            data: b"a".to_vec(),
+        }));
+        let bad = tpkt::Packet::new(vec![2, 0x10, 0]);
+        let last = strict_packet(&Tpdu::Data(Data {
+            eot: true,
+            number: 23,
+            data: b"b".to_vec(),
+        }));
+        let mut wire = Vec::new();
+        for packet in [first, bad, last] {
+            packet.write(&mut wire).unwrap();
+        }
+        assert_eq!(
+            drive(messages(MAX_PACKET, 2), &[&wire]),
+            vec![
+                Assembled::Whole(Err(ParseError::Tpdu(TpduError::Unsupported(0x10)))),
+                Assembled::Message(b"ab".to_vec()),
+            ]
+        );
+        contract::check_decode(|| tpdus(MAX_PACKET), &wire);
+        contract::check_decode_with_held_limit(|| messages(MAX_PACKET, 2), &wire, 2);
+    }
+
+    #[test]
+    fn assembly_limits_and_incomplete_eof_are_terminal() {
+        for payload in [Vec::new(), b"abc".to_vec()] {
+            let packet = strict_packet(&Tpdu::Data(Data {
+                eot: false,
+                number: 0,
+                data: payload.clone(),
+            }));
+            let wire = packet.to_bytes().unwrap();
+            let mut stream = Stream::new(messages(MAX_PACKET, 3));
+            assert_eq!(stream.push(&wire), wire.len());
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.held(), payload.len());
+            stream.end();
+            let error = Fail::Protocol(AssembleError::Incomplete {
+                held: payload.len(),
+            });
+            assert_eq!(stream.next(), Some(Err(error.clone())));
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.failed(), Some(&error));
+            contract::check_decode_with_held_limit(|| messages(MAX_PACKET, 3), &wire, 3);
+        }
+        let mut wire = Vec::new();
+        for eot in [false, true] {
+            strict_packet(&Tpdu::Data(Data {
+                eot,
+                number: 0,
+                data: b"ab".to_vec(),
+            }))
+            .write(&mut wire)
+            .unwrap();
+        }
+        let mut stream = Stream::new(messages(MAX_PACKET, 3));
+        assert_eq!(stream.push(&wire), wire.len());
+        let error = Fail::Protocol(AssembleError::TooLong { limit: 3 });
+        assert_eq!(stream.next(), Some(Err(error.clone())));
+        assert_eq!(stream.held(), 2);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&error));
+        contract::check_decode_with_held_limit(|| messages(MAX_PACKET, 3), &wire, 3);
+
+        let empty = Tpdu::Data(Data {
+            eot: true,
+            ..Data::default()
+        })
+        .to_packet();
+        assert_eq!(
+            drive(messages(MAX_PACKET, 0), &[&empty]),
+            vec![Assembled::Message(Vec::new())]
+        );
+        let mut stream = Stream::new(messages(MAX_PACKET, 0));
+        assert_eq!(stream.push(&empty[..5]), 5);
+        stream.end();
+        assert_eq!(stream.next(), Some(Err(Fail::Truncated { unread: 5 })));
+        let mut stream = Stream::new(messages(MAX_PACKET, 0));
+        assert_eq!(stream.push(&[9]), 1);
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(AssembleError::Inner(
+                tpkt::TpktError::Version(9)
+            ))))
+        );
+        assert_eq!(stream.next(), None);
+    }
+
+    #[test]
+    fn wire_is_strict_bounded_and_transactional() {
+        let raw = Tpdu::ConnectionRequest(Connect {
+            variable: Variable::Raw(vec![0xc1, 0]),
+            ..Connect::default()
+        });
+        let oversized = Tpdu::Data(Data {
+            eot: true,
+            number: 0,
+            data: vec![1; MAX_TPDU - 2],
+        });
+        let invalid = [
+            raw.clone(),
+            oversized.clone(),
+            Tpdu::Data(Data {
+                number: 128,
+                ..Data::default()
+            }),
+            Tpdu::ConnectionRequest(Connect {
+                credit: 16,
+                ..Connect::default()
+            }),
+            Tpdu::ConnectionConfirm(Connect {
+                class: 16,
+                ..Connect::default()
+            }),
+            Tpdu::ConnectionRequest(Connect {
+                options: 16,
+                ..Connect::default()
+            }),
+            Tpdu::DisconnectRequest(Disconnect {
+                variable: Variable::Parameters(vec![Parameter {
+                    code: 0xe0,
+                    value: vec![1; MAX_PARAMETER + 1],
+                }]),
+                ..Disconnect::default()
+            }),
+            Tpdu::Error(ErrorTpdu {
+                variable: Variable::Raw(vec![1; MAX_HEADER]),
+                ..ErrorTpdu::default()
+            }),
+        ];
+        for value in invalid {
+            contract::check_wire_value(&value);
+            let mut out = vec![0x55, 0xaa];
+            assert_eq!(value.write(&mut out), Err(EncodeError));
+            assert_eq!(out, [0x55, 0xaa]);
+            assert!(Tpdu::parse(&value.to_bytes()).is_ok());
+        }
+        // Legacy conversion still accepts raw normalization and clipping.
+        assert!(tpkt::Packet::try_from_tpdu(&raw).is_ok());
+        assert_ne!(Tpdu::parse(&oversized.to_bytes()).unwrap(), oversized);
+        let oversized_wire = [vec![2, 0xf0, 0x80], vec![0; MAX_TPDU - 2]].concat();
+        assert!(Tpdu::parse(&oversized_wire).is_ok());
+        assert_eq!(
+            <Tpdu as Wire>::parse(&oversized_wire),
+            Err(ParseError::TooLong {
+                length: MAX_TPDU + 1
+            })
+        );
+
+        for value in [
+            Tpdu::ConnectionRequest(Connect::request(1).with_called_tsap(b"tsap")),
+            Tpdu::ConnectionConfirm(Connect {
+                variable: Variable::Raw(b"Cookie: test\r\n".to_vec()),
+                ..Connect::default()
+            }),
+            Tpdu::DisconnectRequest(Disconnect::default()),
+            Tpdu::Error(ErrorTpdu::default()),
+            Tpdu::Data(Data {
+                eot: true,
+                number: 127,
+                data: vec![1; MAX_TPDU - 3],
+            }),
+        ] {
+            let bytes = Wire::to_bytes(&value).unwrap();
+            contract::check_wire::<Tpdu>(&bytes);
+            assert_eq!(<Tpdu as Wire>::parse(&bytes), Ok(value));
+        }
+    }
+
+    #[test]
+    fn compatibility_wrapper_buffers_whole_batches_and_repeats_errors() {
+        let packet = Tpdu::Data(Data::default()).to_packet();
+        let batch = packet.repeat(MAX_PACKET / packet.len() + 1);
+        let mut decoder = Decoder::new();
+        decoder.feed(&batch);
+        assert_eq!(decoder.buffered(), batch.len());
+        assert!(decoder.buffered() > MAX_PACKET);
+        assert_eq!(decoder.clone().next_packet(), decoder.next_packet());
+        while decoder.next_packet().is_some() {}
+        decoder.feed(&[8]);
+        for _ in 0..2 {
+            assert_eq!(decoder.next_packet(), Some(Err(TpktError::Version(8))));
+        }
+        decoder.feed(&packet);
+        assert_eq!(decoder.buffered(), 0);
+        assert_eq!(decoder.next_packet(), Some(Err(TpktError::Version(8))));
+    }
 }
 
 #[cfg(test)]

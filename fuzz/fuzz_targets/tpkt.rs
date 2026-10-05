@@ -3,10 +3,11 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Reassembler, Tpdu, Variable};
 use fictionet::stdlib::tpkt::{
-    Decoder, EncodeError, HEADER_LEN, Header, MAX_BUFFERED, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET,
-    MIN_PAYLOAD, Packet, TpktError, write_message,
+    Decoder, EncodeError, Frames, HEADER_LEN, Header, MAX_BUFFERED, MAX_PACKET, MAX_PAYLOAD,
+    MIN_PACKET, MIN_PAYLOAD, Packet, TpktError, write_message,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -63,6 +64,7 @@ fn built(data: &[u8]) -> Result<()> {
         reserved: u.arbitrary()?,
         payload: u.bytes(n)?.to_vec(),
     };
+    check_wire_value(&packet);
     match packet.to_bytes() {
         Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(Some((packet, bytes.len())))),
         Err(e) => assert_eq!(e, EncodeError::TooShort(n)),
@@ -78,6 +80,7 @@ fn built(data: &[u8]) -> Result<()> {
         number,
         data: vec![0x41; n],
     });
+    check_wire_value(&data);
     let fits = n <= MAX_PAYLOAD - 3 && number < 0x80;
     match Packet::try_from_tpdu(&data) {
         Ok(p) => {
@@ -117,6 +120,7 @@ fn built(data: &[u8]) -> Result<()> {
         Variable::Parameters(params)
     };
     let t = Tpdu::ConnectionRequest(connect.clone());
+    check_wire_value(&t);
     if let Ok(p) = Packet::try_from_tpdu(&t) {
         assert!(connect.credit < 16 && connect.class < 16 && connect.options < 16);
         if let Variable::Raw(b) = &connect.variable {
@@ -148,6 +152,7 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    check_wire::<Packet>(data);
     // The size limit comes from the first two bytes.
     let limit = match data {
         [a, b, ..] => usize::from(u16::from_be_bytes([*a, *b])),
@@ -156,6 +161,7 @@ fuzz_target!(|data: &[u8]| {
     // The stream, split two ways: all at once, and a byte at a time. Both
     // give the same packets and the same error.
     for limit in [MAX_PACKET, limit] {
+        check_decode(|| Frames::with_limit(limit), data);
         let (packets, err) = split(data, limit, false);
         assert_eq!(split(data, limit, true), (packets.clone(), err));
         for p in &packets {
@@ -163,6 +169,8 @@ fuzz_target!(|data: &[u8]| {
             assert!(p.payload.len() + HEADER_LEN <= limit.max(HEADER_LEN + MIN_PAYLOAD));
             // A packet read can be written, and reads back the same.
             let bytes = p.to_bytes().unwrap();
+            check_wire::<Packet>(&bytes);
+            check_wire::<Tpdu>(&p.payload);
             assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
             // A TPDU read is written back whole, into a packet that reads
             // back as the same TPDU.

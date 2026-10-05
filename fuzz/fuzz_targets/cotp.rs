@@ -2,7 +2,14 @@
 //! transport server reads them.
 #![no_main]
 
-use fictionet::stdlib::cotp::{Decoder, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, TpktError, parse_packet, segment, write_packet};
+use fictionet::stdlib::codec::contract::{
+    check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
+};
+use fictionet::stdlib::cotp::{
+    Decoder, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, TpktError, parse_packet, segment,
+    write_packet,
+};
+use fictionet::stdlib::{cotp, tpkt};
 use libfuzzer_sys::fuzz_target;
 
 /// Every packet a decoder gives for `data` fed in pieces of `step` bytes,
@@ -23,6 +30,14 @@ fn decode(data: &[u8], step: usize) -> (Vec<Vec<u8>>, Option<TpktError>, usize) 
 }
 
 fuzz_target!(|data: &[u8]| {
+    const MESSAGE_LIMIT: usize = 4096;
+    check_decode(|| cotp::tpdus(tpkt::MAX_PACKET), data);
+    check_decode_with_held_limit(
+        || cotp::messages(tpkt::MAX_PACKET, MESSAGE_LIMIT),
+        data,
+        MESSAGE_LIMIT,
+    );
+    check_wire::<Tpdu>(data);
     // The stream, split several ways, gives the same packets, the same
     // error and the same bytes left over.
     let (packets, error, left) = decode(data, data.len());
@@ -30,15 +45,17 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(decode(data, step), (packets.clone(), error, left));
     }
 
-    let mut messages = Reassembler::with_limit(4096);
+    let mut messages = Reassembler::with_limit(MESSAGE_LIMIT);
     // Each packet's TPDU, and any bytes as a TPDU on their own.
     for tpdu in packets.iter().map(Vec::as_slice).chain([data]) {
+        check_wire::<Tpdu>(tpdu);
         // A packet written reads back whole.
         let packet = write_packet(tpdu);
         let (_, used) = parse_packet(&packet).unwrap().unwrap();
         assert_eq!(used, packet.len());
         match Tpdu::parse(tpdu) {
             Ok(t) => {
+                check_wire_value(&t);
                 // A TPDU read can be written, and reads back the same once
                 // the writer has cut what does not fit.
                 let back = Tpdu::parse(&t.to_bytes()).unwrap();
@@ -49,7 +66,7 @@ fuzz_target!(|data: &[u8]| {
                 match &t {
                     Tpdu::Data(d) => {
                         let _ = messages.push(d);
-                        assert!(messages.pending() <= 4096);
+                        assert!(messages.pending() <= MESSAGE_LIMIT);
                     }
                     Tpdu::ConnectionRequest(c) => match c.confirm(1) {
                         Some(cc) => {
@@ -76,7 +93,9 @@ fuzz_target!(|data: &[u8]| {
         let mut whole = Reassembler::new();
         let mut got = None;
         for s in segment(data, size) {
-            let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes()) else { panic!() };
+            let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes()) else {
+                panic!()
+            };
             assert_eq!(back, s);
             assert!(got.is_none());
             got = whole.push(&back).unwrap();
