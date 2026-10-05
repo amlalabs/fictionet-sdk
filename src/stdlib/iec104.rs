@@ -13,6 +13,11 @@
 //! form that sends only the first address. Type-specific value validation,
 //! timers, connection state and secure authentication belong to the caller.
 //!
+//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream).
+//! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
+//! Its inherent parser still reads a prefix. [`Decoder`] keeps its original
+//! repeating errors and releases buffered bytes on failure.
+//!
 //! ```
 //! use fictionet::stdlib::iec104::{Asdu, Frame, Object, UFunction};
 //!
@@ -27,6 +32,8 @@
 //! let bytes = frame.to_bytes().unwrap();
 //! assert_eq!(Frame::parse(&bytes).unwrap(), Some((frame, bytes.len())));
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port IEC 104 servers normally listen on.
 pub const PORT: u16 = 2404;
@@ -69,6 +76,37 @@ impl std::fmt::Display for FrameError {
     }
 }
 impl std::error::Error for FrameError {}
+
+/// Why an exact [`Wire`] parse did not read one complete frame.
+/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame is invalid.
+    Frame(FrameError),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete IEC 104 frame"),
+            Self::Trailing => f.write_str("bytes follow the IEC 104 frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
 
 /// The six U-format control functions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -218,6 +256,59 @@ impl Frame {
             Self::Unnumbered(function) => out.extend_from_slice(&[function.code(), 0, 0, 0]),
         }
         Ok(out)
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = FrameError;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(b).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads IEC 104 frames without holding input bytes.
+///
+/// Use with [`Stream`](super::codec::Stream) for a buffer limited to
+/// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// The stream reports truncation at EOF and framing errors once.
+/// The existing [`Decoder`] keeps repeating errors and clearing its buffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with a capacity of [`MAX_FRAME`] bytes.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "IEC 104";
+
+    fn capacity(&self) -> usize {
+        MAX_FRAME
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match Frame::parse(input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
     }
 }
 

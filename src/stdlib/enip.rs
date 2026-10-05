@@ -29,6 +29,11 @@
 //! an [`EncodeError`] instead of writing a value its reader would refuse
 //! or read back as something else, so nothing is cut short in silence.
 //!
+//! [`Frames`] works with [`Stream`] and preserves the prefix parser's
+//! permissive framing. [`Packet`] implements [`Wire`] for exact parsing
+//! of packets that pass [`Packet::check`] and transactional writing.
+//! [`Decoder`] wraps the same stream without exposing EOF.
+//!
 //! ```
 //! use fictionet::stdlib::enip::{
 //!     Command, Cpf, CpfItem, MessageRequest, Packet, PathSegment, SendData, item, service,
@@ -72,6 +77,9 @@
 //! assert_eq!(request.service, service::GET_ATTRIBUTE_SINGLE);
 //! assert_eq!(request.path[0], PathSegment::Class(1));
 //! ```
+
+use super::codec::{Decode, Step, Stream, Wire};
+use core::convert::Infallible;
 
 /// The TCP port EtherNet/IP devices listen on.
 pub const PORT: u16 = 44818;
@@ -280,16 +288,89 @@ impl Packet {
     }
 }
 
+impl Wire for Packet {
+    type ParseError = DecodeError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one packet that passes [`Packet::check`].
+    /// The inherent prefix parser still accepts nonzero options and every
+    /// length the header can name, so a receiver can apply its own policy.
+    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
+        let (packet, used) = Self::parse(b).ok_or(DecodeError::Truncated)?;
+        if used != b.len() {
+            return Err(DecodeError::Trailing);
+        }
+        packet.check()?;
+        Ok(packet)
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads encapsulation packets without holding input bytes.
+///
+/// Framing accepts every command, option word, and 16-bit data length.
+/// Use [`Packet::check`] to decide whether to act on each packet.
+/// [`Stream::new`] holds at most [`MAX_BUFFERED`] bytes, including room
+/// for lengths above [`MAX_DATA`]. Partial packets return [`Step::Need`],
+/// including at EOF, when the stream reports truncation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a packet decoder with a capacity of [`MAX_BUFFERED`] bytes.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = Infallible;
+    const NAME: &'static str = "EtherNet/IP";
+
+    fn capacity(&self) -> usize {
+        MAX_BUFFERED
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Infallible> {
+        Ok(match Packet::parse(input) {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits an EtherNet/IP byte stream into packets. Feed it the bytes a
 /// connection reads, in order, and take packets out until it has none.
 /// It never holds more than [`MAX_BUFFERED`] bytes.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are dropped
-    /// in `feed` once they are half the buffer, so taking out many small
-    /// packets costs time in proportion to their bytes.
-    start: usize,
+pub struct Decoder(Stream<Frames>);
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self(Stream::new(Frames))
+    }
+}
+
+impl Clone for Decoder {
+    fn clone(&self) -> Self {
+        let mut cloned = Self::new();
+        // Framing has no state. The unread suffix fits in MAX_BUFFERED.
+        let _ = cloned.feed(self.0.unread());
+        cloned
+    }
+}
+
+impl core::fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Decoder")
+            .field("buf", &self.0.unread())
+            .finish()
+    }
 }
 
 impl Decoder {
@@ -305,30 +386,19 @@ impl Decoder {
     /// whole packet, so a loop of feeding and taking out always ends.
     #[must_use = "bytes past the count returned were not taken"]
     pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
+        self.0.push(bytes)
     }
 
     /// The next whole packet, if one has come. It returns `None` when it
     /// needs more bytes.
     pub fn next_packet(&mut self) -> Option<Packet> {
-        let (packet, used) = Packet::parse(self.buf.get(self.start..)?)?;
-        self.start += used;
-        if self.start == self.buf.len() {
-            self.buf.clear();
-            self.start = 0;
-        }
-        Some(packet)
+        // Frames is infallible, and this wrapper never marks EOF.
+        self.0.next().and_then(Result::ok)
     }
 
     /// How many bytes are held, waiting for the rest of a packet.
     pub fn buffered(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
+        self.0.buffered()
     }
 }
 

@@ -29,8 +29,14 @@
 //! send any bytes it likes. A stream that breaks the specification gives a
 //! [`ChunkError`], whose [`ChunkError::status`] is the code a real server
 //! sends back in an ERR message before it closes the connection. Every
-//! writer checks the same limits and returns an [`EncodeError`] rather than
-//! write bytes a reader would refuse.
+//! message writer checks the same limits and returns an [`EncodeError`]
+//! rather than write bytes a reader would refuse.
+//!
+//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream) to read
+//! individual [`Chunk`]s under negotiated limits. [`Chunk`] implements
+//! [`Wire`] for exact parsing and transactional writing under the module's
+//! maximum chunk size. Message assembly and connection sequence checks
+//! remain in [`Decoder`]. Message writers still take explicit peer limits.
 //!
 //! ```
 //! use fictionet::stdlib::opcua::{
@@ -109,6 +115,8 @@
 //! assert_eq!(&bytes[..4], b"OPNF");
 //! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port OPC UA servers listen on.
 pub const PORT: u16 = 4840;
@@ -1980,6 +1988,143 @@ impl Chunk {
             return Ok(None);
         }
         Ok(Some((Chunk { message_type, chunk_type, body: b[HEADER_LEN..end].to_vec() }, end)))
+    }
+}
+
+/// Why an exact [`Wire`] parse did not read one complete chunk.
+/// [`Chunk::parse`] keeps its prefix parser and caller-supplied limits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChunkParseError {
+    /// The chunk header is invalid or exceeds [`MAX_BUFFER_SIZE`].
+    Chunk(ChunkError),
+    /// The input ended before a complete chunk, including empty input.
+    Truncated,
+    /// Bytes follow the first complete chunk.
+    Trailing,
+}
+
+impl core::fmt::Display for ChunkParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Chunk(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete OPC UA chunk"),
+            Self::Trailing => f.write_str("bytes follow the OPC UA chunk"),
+        }
+    }
+}
+
+impl core::error::Error for ChunkParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Chunk(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+impl Wire for Chunk {
+    type ParseError = ChunkParseError;
+    type WriteError = ChunkError;
+
+    /// Reads exactly one chunk bounded by [`MAX_BUFFER_SIZE`].
+    /// The body stays opaque. Negotiated limits belong to [`Frames`].
+    /// Handshake chunk type bytes read as [`ChunkType::Final`].
+    fn parse(b: &[u8]) -> Result<Self, ChunkParseError> {
+        let limits = Limits {
+            receive_buffer_size: MAX_BUFFER_SIZE,
+            ..Limits::default()
+        };
+        match Self::parse(b, &limits).map_err(ChunkParseError::Chunk)? {
+            Some((chunk, used)) if used == b.len() => Ok(chunk),
+            Some(_) => Err(ChunkParseError::Trailing),
+            None => Err(ChunkParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_BUFFER_SIZE`] bytes, leaving `out` unchanged
+    /// on error. Only MSG chunks may be intermediate or abort chunks.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), ChunkError> {
+        if self.message_type != MessageType::Message && self.chunk_type != ChunkType::Final {
+            return Err(ChunkError::ChunkType(
+                self.message_type,
+                self.chunk_type.byte(),
+            ));
+        }
+        let size = self
+            .body
+            .len()
+            .checked_add(HEADER_LEN)
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or(ChunkError::TooLarge {
+                size: u32::MAX,
+                limit: MAX_BUFFER_SIZE,
+            })?;
+        if size > MAX_BUFFER_SIZE {
+            return Err(ChunkError::TooLarge {
+                size,
+                limit: MAX_BUFFER_SIZE,
+            });
+        }
+        out.extend_from_slice(&self.message_type.code());
+        out.push(self.chunk_type.byte());
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&self.body);
+        Ok(())
+    }
+}
+
+/// Reads OPC UA TCP chunks without holding input bytes or joining messages.
+///
+/// Capacity is the larger of [`Limits::chunk_limit`] and
+/// [`MAX_HANDSHAKE_SIZE`]. Oversized chunks fail from their header.
+/// Partial chunks return [`Step::Need`], including at EOF, when
+/// [`Stream`](super::codec::Stream) reports truncation.
+/// Message bodies, chunk counts, and sequence numbers are not checked here.
+/// The existing [`Decoder`] keeps message assembly and connection checks.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames {
+    limits: Limits,
+}
+
+impl Frames {
+    /// Creates a chunk decoder with [`Limits::default`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a chunk decoder with the given receive buffer size.
+    /// [`Limits::chunk_limit`] clamps it to the module's bounds.
+    /// Message size and chunk count limits do not affect framing.
+    pub fn with_limits(limits: Limits) -> Self {
+        Self { limits }
+    }
+
+    /// Sets negotiated limits between calls to the stream's `next` method.
+    /// Chunks already returned are not checked again.
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    /// Returns the supplied limits before clamping the receive buffer size.
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+}
+
+impl Decode for Frames {
+    type Item = Chunk;
+    type Error = ChunkError;
+    const NAME: &'static str = "OPC UA TCP";
+
+    fn capacity(&self) -> usize {
+        self.limits.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, ChunkError> {
+        Ok(match Chunk::parse(input, &self.limits)? {
+            Some((chunk, used)) => Step::Item(chunk, used),
+            None => Step::Need,
+        })
     }
 }
 

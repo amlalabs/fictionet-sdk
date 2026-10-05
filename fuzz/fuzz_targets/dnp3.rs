@@ -1,6 +1,8 @@
 //! DNP3 framing, CRCs, transport and application fragments.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::dnp3::Frames;
 use fictionet::stdlib::dnp3::{
     Decoder, Fragment, Frame, FrameError, MAX_BUFFERED, MAX_FRAGMENT, Reassembler, Segment,
 };
@@ -40,11 +42,14 @@ fn split(data: &[u8], size: usize, drain_each: bool) -> Vec<Result<Frame, FrameE
 }
 
 fuzz_target!(|data: &[u8]| {
+    check_decode(Frames::new, data);
+    check_wire::<Frame>(data);
     let frames = split(data, data.len(), true);
     for (size, drain) in [(1, true), (7, false), (MAX_BUFFERED + 1, false)] {
         assert_eq!(split(data, size, drain), frames);
     }
     for frame in frames.iter().flatten() {
+        check_wire_value(frame);
         let bytes = frame.to_bytes().unwrap();
         assert_eq!(Frame::parse(&bytes), Ok(Some((frame.clone(), bytes.len()))));
         if let Ok(segment) = frame.segment() {
@@ -59,9 +64,19 @@ fuzz_target!(|data: &[u8]| {
             source: 1024,
             data: chunk.to_vec(),
         };
+        check_wire_value(&frame);
         let bytes = frame.to_bytes().unwrap();
         assert_eq!(split(&bytes, 1, true), vec![Ok(frame)]);
     }
+    check_wire_value(&Frame {
+        control: data.first().copied().unwrap_or(0),
+        destination: 1,
+        source: 1024,
+        data: data
+            .get(..data.len().min(fictionet::stdlib::dnp3::MAX_DATA + 1))
+            .unwrap_or_default()
+            .to_vec(),
+    });
     let _ = Frame::parse(data);
     if let Ok(segment) = Segment::parse(data) {
         assert_eq!(Segment::parse(&segment.to_bytes().unwrap()), Ok(segment));

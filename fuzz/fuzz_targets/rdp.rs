@@ -1,6 +1,8 @@
 //! RDP connection codecs, transport framing and bounded streaming.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::rdp::Frames;
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
     Connection, ConnectionKind, DataBlock, Decoder, Error, FailureCode, Frame, GccConference,
@@ -80,6 +82,7 @@ fn security(data: &[u8]) {
 }
 
 fn frame(value: &Frame) -> Vec<u8> {
+    check_wire_value(value);
     let bytes = value.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_FRAME);
     assert_eq!(Frame::parse(&bytes), Ok(Some((value.clone(), bytes.len()))));
@@ -178,6 +181,7 @@ fn built(data: &[u8]) {
         header: byte(0),
         payload: prefix(data, MAX_FAST_PATH).to_vec(),
     };
+    check_wire_value(&fast);
     if let Ok(bytes) = fast.to_bytes() {
         assert_eq!(Frame::parse(&bytes), Ok(Some((fast, bytes.len()))));
     }
@@ -306,6 +310,8 @@ fn built(data: &[u8]) {
 
 fuzz_target!(|data: &[u8]| {
     let data = prefix(data, MAX_FUZZ_INPUT);
+    check_decode(Frames::new, data);
+    check_wire::<Frame>(data);
     pdu(data);
     if let Ok(Some((value, used))) = Frame::parse(data) {
         assert!(used <= data.len());
