@@ -1,0 +1,13 @@
+=0
+RC0`
+RCPT > 7
+TE=0
+RCPT > 7
+=0
+RE=0
+RCPT > 7
+TE=0
+RCPT > 7
+=0*
+RCPT >  > 7
+t

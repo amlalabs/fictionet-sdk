@@ -1,0 +1,10 @@
+EH .Pos>!SI
+RPT TO
+MA .Pos>!SI
+RPkT TO TO
+MA s>!SI
+MI
+AL QNGT>!SI
+RPT TO
+MA .Pos>!SI
+RPT T:<"at

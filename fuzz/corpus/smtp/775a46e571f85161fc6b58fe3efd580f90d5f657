@@ -1,0 +1,17 @@
+EH .Pos>!SI
+RPT TO
+MA .Pos>!SI
+RPkT TO TO
+MPos>!SIÍ
+RPkT TO TO
+MA .Pos>!SI
+
+MAIL QNGT>!SI
+RPT TO
+MA .Pos>!SI
+RPTA .Pos>!SI
+
+MQNGT>!SI
+RPT TO
+MA .Pos>!SI
+RPT T:<"at

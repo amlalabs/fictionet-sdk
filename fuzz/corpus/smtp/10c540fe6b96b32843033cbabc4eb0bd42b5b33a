@@ -1,0 +1,4 @@
+s> SIE0
+RCPT TO:CPT TO:<Pos> SIE=0
+RCPT TO:<Posteasr>
+PostSE

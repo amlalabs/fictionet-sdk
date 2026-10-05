@@ -1,0 +1,6 @@
+=0
+RCPT LO:=0
+RCPT LO:E=0
+RCPT LO:=0
+RCPT LOT > 
+T

@@ -1,4 +1,0 @@
-EHLO client.test
-MAIL FROM:<> SIZE=0
-RCPT TO:<Postmaster>
-DATA

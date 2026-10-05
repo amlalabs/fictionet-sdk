@@ -1,0 +1,7 @@
+EHLO client
+MAIL FROM:<> SIZE=0
+RCPT TO:<Postmaster>
+DATAnt.test
+MAIL FROM:<> SIE=0
+RCPT TO:<Postmaster>
+D

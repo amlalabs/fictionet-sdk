@@ -1,0 +1,8 @@
+=0
+RC:E=0
+RCPT > 7
+E=0
+RCPT > 7
+=0
+RCPT > 6
+T
