@@ -3,10 +3,11 @@
 #![no_main]
 
 use fictionet::stdlib::mqtt::{
-    ConnAck, ConnectReturnCode, Decoder, Error, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
+    ConnAck, ConnectReturnCode, Decoder, Error, Frames, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
     topic_matches,
 };
 use libfuzzer_sys::fuzz_target;
+use fictionet::stdlib::codec::contract;
 
 /// Feeds `data` to `d` in pieces of `piece` bytes, taking packets out as
 /// they come, until it ends or the stream breaks. It returns the packets,
@@ -37,6 +38,9 @@ fn run(d: &mut Decoder, data: &[u8], piece: usize) -> (Vec<Packet>, Option<Error
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(MAX_PACKET), data);
+    contract::check_wire::<Packet>(data);
     // The stream, split two ways: all at once, and a byte at a time. The
     // packets, the error and the bytes left must agree, at the largest
     // limit, which Packet::parse uses, and at a small one taken from the
@@ -44,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
     let whole = run(&mut Decoder::with_max_packet(MAX_PACKET), data, data.len());
     assert_eq!(run(&mut Decoder::with_max_packet(MAX_PACKET), data, 1), whole);
     let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
+    contract::check_decode(|| Frames::with_limit(small), data);
     let small_whole = run(&mut Decoder::with_max_packet(small), data, data.len());
     assert_eq!(run(&mut Decoder::with_max_packet(small), data, 1), small_whole);
     let packets = whole.0;
@@ -51,6 +56,7 @@ fuzz_target!(|data: &[u8]| {
     for p in &packets {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes().unwrap();
+        contract::check_wire::<Packet>(&bytes);
         assert_eq!(p.encoded_len(), Ok(bytes.len()));
         let (back, used) = Packet::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, p);
@@ -80,6 +86,7 @@ fuzz_target!(|data: &[u8]| {
             }));
         }
         for p in built {
+            contract::check_wire_value(&p);
             let written = p.to_bytes();
             assert_eq!(p.encoded_len(), written.as_ref().map(Vec::len).map_err(|e| *e));
             if let Ok(bytes) = written {

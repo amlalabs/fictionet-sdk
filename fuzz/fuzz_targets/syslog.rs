@@ -3,12 +3,16 @@
 #![no_main]
 
 use fictionet::stdlib::syslog::{
-    BsdMessage, Decoder, Entry, Frame, FrameError, Framing, MAX_BUFFERED, MAX_MESSAGE_LEN, Message, Priority,
+    BsdMessage, Decoder, Entry, Frame, FrameError, Frames, Framing, MAX_BUFFERED, MAX_MESSAGE_LEN, Message, Priority,
     SdElement,
 };
 use libfuzzer_sys::fuzz_target;
+use fictionet::stdlib::codec::{Decode, contract};
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::new().map(|frame| Entry::parse(&frame.message)), data);
+    contract::check_wire::<Frame>(data);
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces whose sizes the data's own bytes pick.
     let whole = decode(data, |_| usize::MAX);
@@ -17,11 +21,13 @@ fuzz_target!(|data: &[u8]| {
 
     let (results, last) = whole;
     for f in results.iter().filter_map(|r| r.as_ref().ok()).chain(&last) {
+        contract::check_wire_value(f);
         assert!(!f.message.is_empty() && f.message.len() <= MAX_MESSAGE_LEN);
         // A frame read can be written, and reads back the same. What is
         // written is whole, even when what was read had been cut.
         let mut d = Decoder::new();
         let bytes = f.to_bytes();
+        contract::check_wire::<Frame>(&bytes);
         assert_eq!(d.feed(&bytes), bytes.len());
         let whole = Frame { truncated: false, ..f.clone() };
         assert_eq!(d.next_frame().as_ref(), Some(&Ok(whole)));
@@ -49,6 +55,10 @@ fn constructed(data: &[u8]) {
     if !rest.is_empty() {
         for framing in [Framing::OctetCounting, Framing::NonTransparent] {
             let msg = rest[..rest.len().min(MAX_MESSAGE_LEN)].to_vec();
+            let mut value = Frame::new(framing, msg.clone());
+            contract::check_wire_value(&value);
+            value.truncated = true;
+            contract::check_wire_value(&value);
             let mut d = Decoder::new();
             let framed = Frame::new(framing, msg.clone()).to_bytes();
             assert_eq!(d.feed(&framed), framed.len());

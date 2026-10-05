@@ -25,6 +25,11 @@
 //! framed either way, and tells them apart frame by frame, as RFC 6587
 //! suggests receivers do.
 //!
+//! New stacks use [`Frames`] with [`super::codec::Stream`], including the
+//! final unterminated frame at EOF. [`Wire`] on [`Frame`] parses exactly
+//! and writes without clipping or changing the framing. The old [`Decoder`]
+//! and [`Frame::to_bytes`] keep their original behavior.
+//!
 //! Nothing here reads a socket. A world that plays a log collector feeds
 //! the bytes it reads from a TCP connection to a
 //! [`Decoder`], gets [`Frame`]s back, and reads each one with
@@ -75,6 +80,8 @@
 //! ```
 
 use std::borrow::Cow;
+
+use super::codec::{Decode, Step, Wire};
 
 /// The UDP port syslog collectors listen on (RFC 5426). Plain TCP syslog
 /// has no assigned port and most collectors use 514 for it too.
@@ -1100,6 +1107,258 @@ enum Skip {
     Bytes(usize),
     /// Everything up to and including the next newline.
     Line,
+}
+
+/// Why the shared syslog decoder cannot continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// An octet count could not be read.
+    Framing(FrameError),
+    /// EOF interrupted the tail of an oversized octet-counted message.
+    Incomplete {
+        /// Bytes still required by its count after the retained prefix.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Framing(e) => e.fmt(f),
+            Self::Incomplete { remaining } => write!(f, "syslog message needs {remaining} more bytes"),
+        }
+    }
+}
+
+impl core::error::Error for DecodeError {}
+
+/// Reads syslog TCP frames without retaining input bytes.
+///
+/// Use with [`super::codec::Stream`] for at most [`MAX_BUFFERED`] unread
+/// bytes. Empty lines are skipped. Oversized messages yield a prefix of
+/// [`MAX_MESSAGE_LEN`] bytes with [`Frame::truncated`] set, then skip the
+/// remaining bytes. A scan cursor keeps bytewise line input linear.
+///
+/// At EOF, a final non-transparent frame needs no newline. A partial
+/// octet-counted frame returns [`Step::Need`] so the driver reports
+/// truncation. EOF in an oversized counted tail is [`DecodeError::Incomplete`].
+/// Invalid octet counts end the stream. Message parse errors can be kept
+/// as items by mapping each frame through [`Entry::parse`]. The legacy
+/// [`Decoder`] keeps its repeating errors and its original `finish` policy.
+///
+/// ```
+/// use fictionet::stdlib::{syslog::{Frame, Frames, Framing}, codec::Stream};
+///
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(b"last message"), 12);
+/// assert_eq!(stream.next(), None);
+/// stream.end();
+/// assert_eq!(stream.next(), Some(Ok(Frame::new(
+///     Framing::NonTransparent, b"last message".to_vec(),
+/// ))));
+/// assert_eq!(stream.next(), None);
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct Frames {
+    scanned: usize,
+    skip: Skip,
+}
+
+impl Frames {
+    /// Creates a decoder with no retained state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn octet_counted(&mut self, input: &[u8]) -> Result<Step<Frame>, FrameError> {
+        let mut length = 0usize;
+        let mut at = 0usize;
+        loop {
+            let Some(&byte) = input.get(at) else { return Ok(Step::Need) };
+            if byte == b' ' {
+                break;
+            }
+            if !byte.is_ascii_digit() {
+                return Err(FrameError::Length(byte));
+            }
+            length = length
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(usize::from(byte - b'0')))
+                .ok_or(FrameError::TooLong)?;
+            at = at.checked_add(1).ok_or(FrameError::TooLong)?;
+        }
+        let start = at.checked_add(1).ok_or(FrameError::TooLong)?;
+        let keep = length.min(MAX_MESSAGE_LEN);
+        let used = start.checked_add(keep).ok_or(FrameError::TooLong)?;
+        let Some(message) = input.get(start..used) else { return Ok(Step::Need) };
+        if length > keep {
+            self.skip = Skip::Bytes(length - keep);
+        }
+        self.scanned = 0;
+        Ok(Step::Item(
+            Frame { framing: Framing::OctetCounting, message: message.to_vec(), truncated: length > keep },
+            used,
+        ))
+    }
+
+    fn non_transparent(&mut self, input: &[u8], eof: bool) -> Step<Frame> {
+        let suffix = input.get(self.scanned..).unwrap_or_default();
+        if let Some(n) = suffix.iter().position(|&byte| byte == b'\n') {
+            let at = self.scanned.saturating_add(n);
+            let end =
+                if at.checked_sub(1).and_then(|i| input.get(i)) == Some(&b'\r') { at.saturating_sub(1) } else { at };
+            let keep = end.min(MAX_MESSAGE_LEN);
+            self.scanned = 0;
+            let used = at.saturating_add(1);
+            return if keep == 0 {
+                Step::Skip(used)
+            } else {
+                Step::Item(
+                    Frame {
+                        framing: Framing::NonTransparent,
+                        message: input.get(..keep).unwrap_or_default().to_vec(),
+                        truncated: end > keep,
+                    },
+                    used,
+                )
+            };
+        }
+        if input.len() > MAX_MESSAGE_LEN + 1 || eof {
+            let keep = input.len().min(MAX_MESSAGE_LEN);
+            self.scanned = 0;
+            if !eof {
+                self.skip = Skip::Line;
+            }
+            return Step::Item(
+                Frame {
+                    framing: Framing::NonTransparent,
+                    message: input.get(..keep).unwrap_or_default().to_vec(),
+                    truncated: input.len() > keep,
+                },
+                input.len(),
+            );
+        }
+        self.scanned = input.len();
+        Step::Need
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = DecodeError;
+    const NAME: &'static str = "syslog TCP";
+
+    fn capacity(&self) -> usize {
+        MAX_BUFFERED
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Frame>, DecodeError> {
+        match self.skip {
+            Skip::Bytes(remaining) => {
+                if input.is_empty() {
+                    return if eof { Err(DecodeError::Incomplete { remaining }) } else { Ok(Step::Need) };
+                }
+                let used = remaining.min(input.len());
+                self.skip = if used == remaining { Skip::Nothing } else { Skip::Bytes(remaining - used) };
+                return Ok(Step::Skip(used));
+            }
+            Skip::Line => {
+                if input.is_empty() {
+                    return Ok(Step::Need);
+                }
+                let used = match input.iter().position(|&byte| byte == b'\n') {
+                    Some(at) => {
+                        self.skip = Skip::Nothing;
+                        at.saturating_add(1)
+                    }
+                    None => input.len(),
+                };
+                return Ok(Step::Skip(used));
+            }
+            Skip::Nothing => {}
+        }
+        let Some(&first) = input.first() else { return Ok(Step::Need) };
+        if matches!(first, b'1'..=b'9') {
+            self.octet_counted(input).map_err(DecodeError::Framing)
+        } else {
+            Ok(self.non_transparent(input, eof))
+        }
+    }
+}
+
+/// Why bytes do not contain exactly one complete syslog frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame could not be decoded.
+    Frame(DecodeError),
+    /// No complete frame was present.
+    Truncated,
+    /// Bytes followed the frame.
+    Trailing,
+    /// The input exceeds [`MAX_BUFFERED`] or its message exceeds
+    /// [`MAX_MESSAGE_LEN`].
+    TooLong,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("no complete syslog frame"),
+            Self::Trailing => f.write_str("bytes after the syslog frame"),
+            Self::TooLong => f.write_str("syslog frame exceeds its wire limit"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+/// A syslog frame cannot be written without changing it.
+///
+/// Empty, oversized, or truncated frames are refused. Non-transparent
+/// frames must contain no newline and must not start with digits 1 to 9.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("syslog frame cannot be represented without changing it")
+    }
+}
+
+impl core::error::Error for WriteError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one frame. A final non-transparent frame may omit
+    /// its newline. Oversized frames are refused instead of clipped.
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        if bytes.len() > MAX_BUFFERED {
+            return Err(FrameParseError::TooLong);
+        }
+        match Frames::new().decode(bytes, true).map_err(FrameParseError::Frame)? {
+            Step::Item(frame, _) if frame.truncated => Err(FrameParseError::TooLong),
+            Step::Item(frame, used) if used == bytes.len() => Ok(frame),
+            Step::Item(_, _) => Err(FrameParseError::Trailing),
+            _ => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends a frame without clipping or changing its framing.
+    /// Leaves `out` unchanged on error. The legacy writer is unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if self.truncated || self.message.len() > MAX_MESSAGE_LEN {
+            return Err(WriteError);
+        }
+        let bytes = self.to_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 /// Splits a syslog TCP stream into frames. Feed it the bytes a connection

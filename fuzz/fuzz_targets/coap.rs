@@ -3,15 +3,33 @@
 #![no_main]
 
 use fictionet::stdlib::coap::{
-    Assembler, Block, BlockError, Code, Decoder, Frame, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option, peek_header,
+    Assembler, Block, BlockError, Code, Decoder, Frame, Frames, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option, peek_header,
 };
 use libfuzzer_sys::fuzz_target;
+use fictionet::stdlib::codec::contract;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Frame>(data);
+    let mut built = Message::new(Type::Reset, Code(data.first().copied().unwrap_or(0)), 1);
+    built.token = data.iter().take(9).copied().collect();
+    built.payload = data.iter().take(MAX_DATAGRAM + 1).copied().collect();
+    contract::check_wire_value(&built);
+    contract::check_wire_value(&Frame {
+        code: built.code,
+        token: built.token.clone(),
+        options: Options::new(),
+        payload: built.payload.clone(),
+    });
     // The bytes as one datagram. The encoding has one form for each
     // message, so a message read writes back as the same bytes.
     let _ = peek_header(data);
     if let Ok(m) = Message::parse(data) {
+        contract::check_wire_value(&m);
+        let mut reordered = m.clone();
+        reordered.options.0.reverse();
+        contract::check_wire_value(&reordered);
         assert_eq!(m.to_bytes(), data);
         // RFC 7252 sections 4.2 and 4.3: a reader keeps only the forms a
         // type allows.
@@ -135,7 +153,9 @@ fuzz_target!(|data: &[u8]| {
 
     // A frame read writes back as the same bytes, and reads back the same.
     for f in frames.iter().flatten() {
+        contract::check_wire_value(f);
         let bytes = f.to_bytes();
+        contract::check_wire::<Frame>(&bytes);
         assert_eq!(f.try_to_bytes().as_ref(), Some(&bytes));
         let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, f);

@@ -2,10 +2,23 @@
 //! datagrams and from TCP streams, and the answers it builds from them.
 #![no_main]
 
-use fictionet::stdlib::dhcpv6::{Decoder, Duid, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg};
+use fictionet::stdlib::dhcpv6::{Decoder, DhcpOption, Duid, Frame, Frames, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg};
 use libfuzzer_sys::fuzz_target;
+use fictionet::stdlib::codec::contract;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Frame>(data);
+    let mut built = Message::new(data.first().copied().unwrap_or(1), 7);
+    built.transaction = u32::MAX;
+    built.options.push(DhcpOption::Other {
+        code: u16::from(data.first().copied().unwrap_or(0)),
+        data: data.iter().take(MAX_MESSAGE + 1).copied().collect(),
+    });
+    contract::check_wire_value(&built);
+    built.transaction = 7;
+    contract::check_wire_value(&Frame(built));
     // The bytes as one datagram. A message read writes back the same
     // bytes, and so does any message it relays.
     if let Ok(m) = Message::parse(data) {
@@ -23,6 +36,7 @@ fuzz_target!(|data: &[u8]| {
         }
         // Answers built from it read back the same.
         let answer = m.answer(msg::REPLY, &Duid::en(32473, b"fuzz"));
+        contract::check_wire_value(&answer);
         assert_eq!(Message::parse(&answer.to_bytes()).as_ref(), Ok(&answer));
         assert_eq!(answer.try_to_bytes(), Some(answer.to_bytes()));
         // A long Interface-Id can leave no room for the answer, so the
@@ -68,8 +82,10 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(messages, again);
     assert_eq!(whole.buffered(), bytewise.buffered());
     for m in messages.into_iter().flatten() {
+        contract::check_wire_value(&Frame(m.clone()));
         let mut d = Decoder::new();
         let framed = m.to_tcp_bytes();
+        contract::check_wire::<Frame>(&framed);
         assert_eq!(d.feed(&framed), framed.len());
         assert_eq!(d.next_message(), Some(Ok(m)));
     }

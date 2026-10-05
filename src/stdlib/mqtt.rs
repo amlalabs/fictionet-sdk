@@ -17,6 +17,10 @@
 //! receives what is up to world code. [`topic_matches`] says whether a
 //! subscription's filter matches a topic name, as the standard defines it.
 //!
+//! New stacks use [`Frames`] with [`super::codec::Stream`]. [`Packet`]
+//! implements [`Wire`] for exact parsing and transactional writing.
+//! The legacy [`Decoder`] keeps its repeating errors.
+//!
 //! Every reader checks lengths, flags and strings, because the agent can
 //! send any bytes it likes. A packet that breaks the standard is an
 //! [`Error`]. The standard says a broker closes the connection then, except
@@ -52,6 +56,8 @@
 //! // Wildcards at the start never match topics that begin with '$'.
 //! assert!(!topic_matches("#", "$SYS/broker/uptime"));
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port MQTT brokers listen on, without TLS.
 pub const PORT: u16 = 1883;
@@ -998,6 +1004,90 @@ fn parse_connect(r: &mut Reader<'_>) -> Result<Connect, Error> {
     let username = if has_user { Some(r.string()?) } else { None };
     let password = if has_password { Some(r.binary()?.to_vec()) } else { None };
     Ok(Connect { clean_session: flags & 0x02 != 0, keep_alive, client_id, will, username, password })
+}
+
+impl Wire for Packet {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one packet, bounded by [`MAX_PACKET`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        match Self::parse(bytes)? {
+            Some((packet, used)) if used == bytes.len() => Ok(packet),
+            Some(_) => Err(Error::TrailingBytes),
+            None => Err(Error::Truncated),
+        }
+    }
+
+    /// Appends a packet. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads MQTT packets without retaining input bytes.
+///
+/// Use with [`super::codec::Stream`] for bounded input and one-time errors.
+/// Header and body errors end the stream, as in the legacy [`Decoder`].
+/// Partial packets return [`Step::Need`], including at EOF. The driver
+/// reports truncation. The legacy decoder keeps its repeating errors.
+///
+/// ```
+/// use fictionet::stdlib::{mqtt::{Frames, Packet}, codec::{Stream, Wire}};
+///
+/// let bytes = Wire::to_bytes(&Packet::PingReq)?;
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(Packet::PingReq)));
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// # Ok::<(), fictionet::stdlib::mqtt::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Reads packets up to [`DEFAULT_MAX_PACKET`] bytes, including headers.
+    pub fn new() -> Self {
+        Self::with_limit(DEFAULT_MAX_PACKET)
+    }
+
+    /// Sets the packet limit, including headers, clamped to 2 through
+    /// [`MAX_PACKET`]. Larger packets are refused from their headers.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.clamp(2, MAX_PACKET) }
+    }
+
+    /// The largest accepted packet, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = Error;
+    const NAME: &'static str = "MQTT 3.1.1";
+
+    fn capacity(&self) -> usize {
+        self.limit.max(1 + MAX_REMAINING_LENGTH_BYTES)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
+        let Some((first, body)) = frame(input, self.limit)? else { return Ok(Step::Need) };
+        let used = body.end;
+        let body = input.get(body).ok_or(Error::Truncated)?;
+        Ok(Step::Item(parse_body(first, body)?, used))
+    }
 }
 
 /// Splits an MQTT byte stream into packets. Feed it the bytes a connection

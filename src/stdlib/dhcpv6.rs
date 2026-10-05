@@ -26,6 +26,11 @@
 //! is up to world code. For DHCPv6 over TCP, as leasequery uses, a
 //! [`Decoder`] splits the stream into messages.
 //!
+//! New TCP stacks use [`Frames`] with [`Stream`]. [`Decoder`] wraps that
+//! stack and keeps message errors recoverable. [`Wire`] reads and writes
+//! UDP [`Message`] values and length-prefixed TCP [`Frame`] values exactly.
+//! The old `to_bytes` and `to_tcp_bytes` writers keep their clipping rules.
+//!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Options nest at most [`MAX_DEPTH`] deep; deeper ones are
 //! kept as raw bytes. Writers leave out what would not read back, so the
@@ -70,7 +75,10 @@
 //! assert_eq!(lease.valid, 7200);
 //! ```
 
+use core::convert::Infallible;
 use std::net::Ipv6Addr;
+
+use super::codec::{Decode, Fail, Step, Stream, Wire};
 
 /// The UDP port DHCPv6 clients listen on.
 pub const CLIENT_PORT: u16 = 546;
@@ -834,19 +842,168 @@ impl Message {
     }
 }
 
+/// A DHCPv6 value cannot be written without changing it.
+///
+/// A field or option exceeds its limit, an option changes form when read,
+/// or a field unused by the message type is nonzero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("DHCPv6 value cannot be represented without changing it")
+    }
+}
+
+impl core::error::Error for WriteError {}
+
+impl Wire for Message {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    /// Reads one UDP message of at most [`MAX_MESSAGE`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        Self::parse(bytes)
+    }
+
+    /// Appends one UDP message. Leaves `out` unchanged on error.
+    /// The legacy [`Message::to_bytes`] keeps its clipping behavior.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let bytes = self.try_to_bytes().ok_or(WriteError)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// One DHCPv6 TCP message with its two-byte length prefix.
+///
+/// [`Wire`] permits up to [`MAX_TCP_MESSAGE`] payload bytes. Use
+/// [`Message`]'s [`Wire`] implementation for the smaller UDP limit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// The message carried by this frame.
+    pub Message,
+);
+
+/// Why bytes do not contain exactly one DHCPv6 TCP message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The message body was refused.
+    Message(ParseError),
+    /// The length prefix or message ended early.
+    Truncated,
+    /// Bytes followed the message.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Message(e) => e.fmt(f),
+            Self::Truncated => f.write_str("DHCPv6 TCP message ended early"),
+            Self::Trailing => f.write_str("bytes after the DHCPv6 TCP message"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one length-prefixed TCP message.
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        let step = match Frames.decode(bytes, true) {
+            Ok(step) => step,
+            Err(never) => match never {},
+        };
+        match step {
+            Step::Item(message, used) if used == bytes.len() => message.map(Self).map_err(FrameParseError::Message),
+            Step::Item(_, _) => Err(FrameParseError::Trailing),
+            _ => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends a length-prefixed TCP message. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let bytes = self.0.to_tcp_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Reads DHCPv6 TCP messages without retaining input bytes.
+///
+/// Use with [`Stream`] for at most [`MAX_BUFFERED`] unread bytes. Each
+/// two-byte length delimits one item. Malformed messages are error items,
+/// so the next message can still be read. Framing has no protocol errors.
+/// Partial prefixes and bodies return [`Step::Need`], including at EOF;
+/// the driver reports [`Fail::Truncated`]. UDP uses [`Wire`] on [`Message`].
+///
+/// ```
+/// use fictionet::stdlib::{dhcpv6::{Frame, Frames, Message, msg}, codec::{Stream, Wire}};
+///
+/// let message = Message::new(msg::SOLICIT, 7);
+/// let bytes = Wire::to_bytes(&Frame(message.clone()))?;
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(Ok(message))));
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// # Ok::<(), fictionet::stdlib::dhcpv6::WriteError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a TCP message decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Result<Message, ParseError>;
+    type Error = Infallible;
+    const NAME: &'static str = "DHCPv6 over TCP";
+
+    fn capacity(&self) -> usize {
+        MAX_BUFFERED
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Infallible> {
+        let Some(&[a, b]) = input.get(..2) else { return Ok(Step::Need) };
+        // The two-byte length is at most MAX_TCP_MESSAGE.
+        let used = 2usize.saturating_add(usize::from(u16::from_be_bytes([a, b])));
+        let Some(body) = input.get(2..used) else { return Ok(Step::Need) };
+        Ok(Step::Item(Message::parse_within(body, MAX_TCP_MESSAGE), used))
+    }
+}
+
 /// Splits a stream of DHCPv6 over TCP into messages, as bulk leasequery
 /// (RFC 5460) and active leasequery (RFC 7653) send them: each message
 /// follows a 2-byte length. Feed it the bytes a connection reads, in order,
 /// and take messages out until it has none. A malformed message comes out
 /// as an error, and the messages after it still read, since the lengths
 /// keep the stream in step.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small messages costs time in proportion to their bytes.
-    start: usize,
+///
+/// This compatibility wrapper uses [`Stream`] with [`Frames`].
+pub struct Decoder(Stream<Frames>);
+
+impl core::fmt::Debug for Decoder {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Decoder").field("buffered", &self.buffered()).finish()
+    }
+}
+
+impl Default for Decoder {
+    fn default() -> Self {
+        Self(Stream::new(Frames))
+    }
 }
 
 impl Decoder {
@@ -862,33 +1019,25 @@ impl Decoder {
     /// one whole message, so a loop of feeding and taking out always ends.
     #[must_use = "bytes past the count returned were not taken"]
     pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
+        self.0.push(bytes)
     }
 
     /// The next whole message, if one has come. It returns `None` when it
     /// needs more bytes. Messages may be up to [`MAX_TCP_MESSAGE`] bytes
     /// long.
     pub fn next_message(&mut self) -> Option<Result<Message, ParseError>> {
-        let rest = self.buf.get(self.start..)?;
-        let len = match rest {
-            [a, b, ..] => usize::from(u16::from_be_bytes([*a, *b])),
-            _ => return None,
-        };
-        let end = 2 + len;
-        let result = Message::parse_within(rest.get(2..end)?, MAX_TCP_MESSAGE);
-        self.start += end;
-        Some(result)
+        self.0.next().map(|result| match result {
+            Ok(message) => message,
+            Err(Fail::Protocol(never)) => match never {},
+            // EOF is not exposed, and a complete length prefix guarantees
+            // progress at capacity. Keep driver faults non-panicking too.
+            Err(Fail::Truncated { .. } | Fail::Stuck { .. }) => Err(ParseError::Truncated),
+        })
     }
 
     /// How many bytes are held, waiting for the rest of a message.
     pub fn buffered(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
+        self.0.buffered()
     }
 }
 

@@ -16,6 +16,11 @@
 //! [`Frame`]s back. Which resources exist, and what they hold, is up to
 //! world code.
 //!
+//! New TCP stacks use [`Frames`] with [`super::codec::Stream`]. [`Wire`]
+//! reads and writes [`Message`] datagrams and [`Frame`] TCP units exactly.
+//! Its writers refuse clipping and reordering. The old `to_bytes` writers
+//! and [`Decoder`] keep their original behavior.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A datagram that breaks the message format is an [`Error`]; a
 //! real device answers a confirmable one with a Reset (see
@@ -51,6 +56,8 @@
 //! // Content-Format 0 (an empty value), then the payload.
 //! assert_eq!(reply.to_bytes(), [0x61, 0x45, 0x12, 0x34, 0x77, 0xc0, 0xff, b'2', b'1', b'.', b'5']);
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The UDP and TCP port CoAP servers listen on.
 pub const PORT: u16 = 5683;
@@ -1147,6 +1154,145 @@ impl Frame {
         } else {
             self.options.first_bad(option_format)
         }
+    }
+}
+
+/// Why bytes do not contain exactly one CoAP TCP frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame's header or body was refused.
+    Frame(Error),
+    /// The input ended before a complete frame arrived.
+    Truncated,
+    /// Bytes followed the frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("CoAP frame ended early"),
+            Self::Trailing => f.write_str("bytes after the CoAP frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+/// A CoAP value cannot be written without changing it.
+///
+/// A field exceeds its limit, options are out of order, or the message
+/// type does not allow its contents. The legacy writers remain available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("CoAP value cannot be represented without changing it")
+    }
+}
+
+impl core::error::Error for WriteError {}
+
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads one datagram of at most [`MAX_DATAGRAM`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse(bytes)
+    }
+
+    /// Appends a datagram without clipping or sorting its fields.
+    /// Leaves `out` unchanged on error. Options accepted by the parser
+    /// remain writable; [`Message::bad_block`] is a separate UDP check.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        // Bound the legacy writer's temporary option list before staging.
+        if self.options.0.len() > MAX_OPTIONS {
+            return Err(WriteError);
+        }
+        let bytes = self.to_bytes();
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one TCP frame, with at most [`MAX_FRAME_BODY`] body bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(bytes).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == bytes.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends a TCP frame without clipping or sorting its fields.
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if self.options.0.len() > MAX_OPTIONS {
+            return Err(WriteError);
+        }
+        let bytes = self.to_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Reads CoAP over TCP frames without retaining input bytes.
+///
+/// Use with [`super::codec::Stream`] for at most [`MAX_BUFFERED`] unread
+/// bytes. Header and body errors end the stream, as in [`Decoder`].
+/// Partial frames return [`Step::Need`], including at EOF. The driver
+/// reports truncation. UDP datagrams use [`Wire`] on [`Message`] directly.
+/// The legacy decoder keeps its repeating errors.
+///
+/// ```
+/// use fictionet::stdlib::{coap::{Frame, Frames}, codec::{Stream, Wire}};
+///
+/// let frame = Frame::csm(4096, true);
+/// let bytes = Wire::to_bytes(&frame)?;
+/// let mut stream = Stream::new(Frames::new());
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(frame)));
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// # Ok::<(), fictionet::stdlib::coap::WriteError>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a TCP frame decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = Error;
+    const NAME: &'static str = "CoAP over TCP";
+
+    fn capacity(&self) -> usize {
+        MAX_BUFFERED
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
+        Ok(match Frame::parse(input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
     }
 }
 
