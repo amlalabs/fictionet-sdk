@@ -2,12 +2,13 @@
 //! a world playing a cache server reads them.
 #![no_main]
 
-use fictionet::stdlib::codec::contract;
-use fictionet::stdlib::memcache::{Commands, Responses, Frames};
-
+use fictionet::stdlib::codec::contract::{
+    check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
+};
 use fictionet::stdlib::memcache::{
-    BinaryDecoder, BinaryError, Command, CommandDecoder, CounterExtras, Error, MAX_BINARY_BUFFERED, MAX_BUFFERED,
-    MetaFlag, MetaStatus, Packet, Response, ResponseDecoder, Status, StoreExtras, UDP_MAX_DATAGRAM, UdpFrame,
+    BinaryDecoder, BinaryError, Command, CommandDecoder, Commands, CounterExtras, Error, Frames,
+    MAX_BINARY_BUFFERED, MAX_BUFFERED, MAX_TEXT_HELD, MetaFlag, MetaStatus, Packet, Response,
+    ResponseDecoder, Responses, Status, StoreExtras, UDP_MAX_DATAGRAM, UdpFrame,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -81,29 +82,29 @@ fn packets(data: &[u8], step: usize) -> Vec<Result<Packet, BinaryError>> {
 /// A value a caller built, not one a reader made: if a writer takes it,
 /// a reader must read back the same.
 fn check_command(c: Command) {
-    contract::check_wire_value(&c);
+    check_wire_value(&c);
     if let Ok(bytes) = c.to_bytes() {
         assert_eq!(commands(&bytes, usize::MAX), [Ok(c)]);
     }
 }
 
 fn check_response(r: Response) {
-    contract::check_wire_value(&r);
+    check_wire_value(&r);
     if let Ok(bytes) = r.to_bytes() {
         assert_eq!(responses(&bytes, usize::MAX), [Ok(r)]);
     }
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Commands::new, data);
-    contract::check_decode(Responses::new, data);
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Commands::with_limit(17), data);
-    contract::check_decode(|| Responses::with_limit(17), data);
-    contract::check_decode(|| Frames::with_limit(17), data);
-    contract::check_wire::<Command>(data);
-    contract::check_wire::<Response>(data);
-    contract::check_wire::<Packet>(data);
+    check_decode_with_held_limit(Commands::new, data, MAX_TEXT_HELD);
+    check_decode_with_held_limit(Responses::new, data, MAX_TEXT_HELD);
+    check_decode(Frames::new, data);
+    check_decode_with_held_limit(|| Commands::with_limit(17), data, MAX_TEXT_HELD);
+    check_decode_with_held_limit(|| Responses::with_limit(17), data, MAX_TEXT_HELD);
+    check_decode(|| Frames::with_limit(17), data);
+    check_wire::<Command>(data);
+    check_wire::<Response>(data);
+    check_wire::<Packet>(data);
 
     // The stream, split two ways: all at once, and a byte at a time.
     let whole = commands(data, usize::MAX);
@@ -137,7 +138,7 @@ fuzz_target!(|data: &[u8]| {
     let whole = packets(data, usize::MAX);
     assert_eq!(whole, packets(data, 1));
     for p in whole.iter().flatten() {
-        contract::check_wire_value(p);
+        check_wire_value(p);
         let bytes = p.to_bytes().unwrap();
         assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
         assert_eq!(Status::from_code(p.status).code(), p.status);

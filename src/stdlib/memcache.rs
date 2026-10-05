@@ -1925,15 +1925,13 @@ impl core::fmt::Display for TextFrameError {
 }
 impl core::error::Error for TextFrameError {}
 
-/// Why bytes do not contain exactly one writable memcache unit.
+/// Why bytes do not contain exactly one complete memcache command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireError {
+pub enum CommandParseError {
     /// A text unit was refused.
     Text(Error),
     /// Text framing failed.
     Framing(TextFrameError),
-    /// A binary header was refused.
-    Binary(BinaryError),
     /// The unit ended early.
     Incomplete,
     /// Bytes followed the unit.
@@ -1941,20 +1939,68 @@ pub enum WireError {
     /// Re-encoding would change the value.
     Value,
 }
-impl core::fmt::Display for WireError {
+impl core::fmt::Display for CommandParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Text(e) => e.fmt(f),
             Self::Framing(e) => e.fmt(f),
-            Self::Binary(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete memcache wire unit"),
-            Self::Trailing => f.write_str("bytes after memcache wire unit"),
-            Self::Value => f.write_str("memcache value cannot be written unchanged"),
+            Self::Incomplete => f.write_str("incomplete memcache command"),
+            Self::Trailing => f.write_str("bytes after memcache command"),
+            Self::Value => f.write_str("memcache command cannot be written unchanged"),
         }
     }
 }
-impl core::error::Error for WireError {}
+impl core::error::Error for CommandParseError {}
 
+/// Why bytes do not contain exactly one complete memcache response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseParseError {
+    /// A text unit was refused.
+    Text(Error),
+    /// Text framing failed.
+    Framing(TextFrameError),
+    /// The unit ended early.
+    Incomplete,
+    /// Bytes followed the unit.
+    Trailing,
+    /// Re-encoding would change the value.
+    Value,
+}
+impl core::fmt::Display for ResponseParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Text(e) => e.fmt(f),
+            Self::Framing(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete memcache response"),
+            Self::Trailing => f.write_str("bytes after memcache response"),
+            Self::Value => f.write_str("memcache response cannot be written unchanged"),
+        }
+    }
+}
+impl core::error::Error for ResponseParseError {}
+
+/// Why bytes do not contain exactly one complete memcache packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// A binary header was refused.
+    Binary(BinaryError),
+    /// The unit ended early.
+    Incomplete,
+    /// Bytes followed the unit.
+    Trailing,
+}
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Binary(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete memcache packet"),
+            Self::Trailing => f.write_str("bytes after memcache packet"),
+        }
+    }
+}
+impl core::error::Error for PacketParseError {}
+
+#[derive(Clone, Debug)]
 struct TextUnits<T> {
     lines: codec::Lines,
     partial_line: Vec<u8>,
@@ -2076,11 +2122,17 @@ impl<T> TextUnits<T> {
                 // consumed bytes move into the line assembly.
                 // Leave a final CR unread so Lines can recognize CRLF
                 // when the LF arrives in the next input window.
-                let n = MAX_LINE.saturating_sub(usize::from(input.get(MAX_LINE - 1) == Some(&b'\r')));
+                let remaining = MAX_GET_LINE
+                    .saturating_sub(2)
+                    .saturating_sub(self.partial_line.len());
+                let n = input
+                    .len()
+                    .saturating_sub(usize::from(input.last() == Some(&b'\r')))
+                    .min(remaining);
                 let part = input.get(..n).ok_or(TextFrameError::LineTooLong)?;
                 self.partial_line.extend_from_slice(part);
-                let remaining = MAX_GET_LINE.saturating_sub(2).saturating_sub(self.partial_line.len());
-                self.lines = codec::Lines::new(remaining, codec::Ending::LfOrCrlf);
+                self.lines =
+                    codec::Lines::new(remaining.saturating_sub(n), codec::Ending::LfOrCrlf);
                 Ok(Step::Skip(n))
             }
             Step::Need if eof && !self.partial_line.is_empty() => Err(TextFrameError::Incomplete),
@@ -2109,6 +2161,7 @@ fn quiet_command(command: &Command) -> bool {
 /// [`CommandDecoder`]. Overlong lines and incomplete EOF end framing.
 /// Held state is bounded by [`MAX_TEXT_HELD`]. The legacy decoder stays
 /// separate for repeated fatal errors and its original `buffered()` count.
+#[derive(Clone, Debug)]
 pub struct Commands {
     inner: TextUnits<Command>,
 }
@@ -2158,6 +2211,7 @@ impl Decode for Commands {
 /// blocks are error items; overlong lines and incomplete EOF are terminal.
 /// Held state is bounded by [`MAX_TEXT_HELD`]. The legacy
 /// [`ResponseDecoder`] keeps its original buffering and repeating errors.
+#[derive(Clone, Debug)]
 pub struct Responses {
     inner: TextUnits<Response>,
 }
@@ -2195,58 +2249,95 @@ impl Decode for Responses {
     }
 }
 
-fn exact_text<T, D: Decode<Item = Result<T, Error>, Error = TextFrameError>>(
-    mut decoder: D,
-    mut bytes: &[u8],
-) -> Result<T, WireError> {
+fn exact_command(mut bytes: &[u8]) -> Result<Command, CommandParseError> {
+    let mut decoder = Commands::new();
     if bytes.len() > MAX_TEXT_UNIT {
-        return Err(WireError::Text(Error::LineTooLong));
+        return Err(CommandParseError::Text(Error::LineTooLong));
     }
     loop {
-        match decoder.decode(bytes, true).map_err(WireError::Framing)? {
-            Step::Item(item, used) if used == bytes.len() => return item.map_err(WireError::Text),
-            Step::Item(Err(e), _) => return Err(WireError::Text(e)),
-            Step::Item(_, _) => return Err(WireError::Trailing),
-            Step::Skip(used) => bytes = bytes.get(used..).ok_or(WireError::Incomplete)?,
-            Step::Need | Step::End => return Err(WireError::Incomplete),
+        match decoder
+            .decode(bytes, true)
+            .map_err(CommandParseError::Framing)?
+        {
+            Step::Item(item, used) if used == bytes.len() => {
+                return item.map_err(CommandParseError::Text);
+            }
+            Step::Item(Err(e), _) => return Err(CommandParseError::Text(e)),
+            Step::Item(_, _) => return Err(CommandParseError::Trailing),
+            Step::Skip(used) => bytes = bytes.get(used..).ok_or(CommandParseError::Incomplete)?,
+            Step::Need | Step::End => return Err(CommandParseError::Incomplete),
         }
     }
 }
 
 impl Wire for Command {
-    type ParseError = WireError;
+    type ParseError = CommandParseError;
     type WriteError = Error;
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        let item = exact_text(Commands::new(), bytes)?;
-        let encoded = item.to_bytes().map_err(WireError::Text)?;
-        if exact_text(Commands::new(), &encoded).as_ref() != Ok(&item) {
-            return Err(WireError::Value);
+
+    /// Reads exactly one command under the named line and body limits.
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(bytes: &[u8]) -> Result<Self, CommandParseError> {
+        let item = exact_command(bytes)?;
+        let encoded = item.to_bytes().map_err(CommandParseError::Text)?;
+        if exact_command(&encoded).as_ref() != Ok(&item) {
+            return Err(CommandParseError::Value);
         }
         Ok(item)
     }
+
+    /// Appends one command that reads back unchanged. Refused values
+    /// leave `out` unchanged; the legacy writer keeps its own behavior.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = self.to_bytes()?;
-        if exact_text(Commands::new(), &bytes).as_ref() != Ok(self) {
+        if exact_command(&bytes).as_ref() != Ok(self) {
             return Err(Error::Format);
         }
         out.extend_from_slice(&bytes);
         Ok(())
     }
 }
+
+fn exact_response(mut bytes: &[u8]) -> Result<Response, ResponseParseError> {
+    let mut decoder = Responses::new();
+    if bytes.len() > MAX_TEXT_UNIT {
+        return Err(ResponseParseError::Text(Error::LineTooLong));
+    }
+    loop {
+        match decoder
+            .decode(bytes, true)
+            .map_err(ResponseParseError::Framing)?
+        {
+            Step::Item(item, used) if used == bytes.len() => {
+                return item.map_err(ResponseParseError::Text);
+            }
+            Step::Item(Err(e), _) => return Err(ResponseParseError::Text(e)),
+            Step::Item(_, _) => return Err(ResponseParseError::Trailing),
+            Step::Skip(used) => bytes = bytes.get(used..).ok_or(ResponseParseError::Incomplete)?,
+            Step::Need | Step::End => return Err(ResponseParseError::Incomplete),
+        }
+    }
+}
+
 impl Wire for Response {
-    type ParseError = WireError;
+    type ParseError = ResponseParseError;
     type WriteError = Error;
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        let item = exact_text(Responses::new(), bytes)?;
-        let encoded = item.to_bytes().map_err(WireError::Text)?;
-        if exact_text(Responses::new(), &encoded).as_ref() != Ok(&item) {
-            return Err(WireError::Value);
+
+    /// Reads exactly one response under the named line and body limits.
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
+        let item = exact_response(bytes)?;
+        let encoded = item.to_bytes().map_err(ResponseParseError::Text)?;
+        if exact_response(&encoded).as_ref() != Ok(&item) {
+            return Err(ResponseParseError::Value);
         }
         Ok(item)
     }
+
+    /// Appends one response that reads back unchanged, leaving `out`
+    /// unchanged if the value cannot be represented.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let bytes = self.to_bytes()?;
-        if exact_text(Responses::new(), &bytes).as_ref() != Ok(self) {
+        if exact_response(&bytes).as_ref() != Ok(self) {
             return Err(Error::Format);
         }
         out.extend_from_slice(&bytes);
@@ -2296,6 +2387,10 @@ impl Decode for Frames {
             Magic::from_byte(m).ok_or(BinaryError::Magic(m))?;
         }
         if let Some(header) = input.get(..BINARY_HEADER_LEN) {
+            let key_len = usize::from(be16(header, 2));
+            if key_len > MAX_KEY {
+                return Err(BinaryError::KeyLength(key_len));
+            }
             let body = usize::try_from(be32(header, 8)).unwrap_or(usize::MAX);
             if body > self.limit {
                 return Err(BinaryError::BodyLength(body));
@@ -2308,13 +2403,13 @@ impl Decode for Frames {
     }
 }
 impl Wire for Packet {
-    type ParseError = WireError;
+    type ParseError = PacketParseError;
     type WriteError = BinaryError;
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        match Packet::parse(bytes).map_err(WireError::Binary)? {
+    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
+        match Packet::parse(bytes).map_err(PacketParseError::Binary)? {
             Some((packet, used)) if used == bytes.len() => Ok(packet),
-            Some(_) => Err(WireError::Trailing),
-            None => Err(WireError::Incomplete),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Incomplete),
         }
     }
     fn write(&self, out: &mut Vec<u8>) -> Result<(), BinaryError> {

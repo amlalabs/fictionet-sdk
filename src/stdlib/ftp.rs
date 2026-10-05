@@ -1668,35 +1668,65 @@ impl core::fmt::Display for DecodeError {
 }
 impl core::error::Error for DecodeError {}
 
-/// Why an exact FTP wire value could not be read or written.
+/// Why bytes do not contain exactly one complete FTP command.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WireError {
-    /// A command line was refused.
+pub enum CommandParseError {
+    /// The command was refused.
     Command(CommandError),
-    /// A reply was refused.
-    Reply(ReplyError),
-    /// The unit ended early.
+    /// The command ended early.
     Incomplete,
-    /// Bytes followed the unit.
+    /// Bytes followed the command.
     Trailing,
-    /// Strict writing would change the value.
-    Value,
 }
-impl core::fmt::Display for WireError {
+impl core::fmt::Display for CommandParseError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Command(e) => e.fmt(f),
-            Self::Reply(e) => e.fmt(f),
-            Self::Incomplete => f.write_str("incomplete FTP wire value"),
-            Self::Trailing => f.write_str("bytes after FTP wire value"),
-            Self::Value => f.write_str("FTP value cannot be written unchanged"),
+            Self::Incomplete => f.write_str("incomplete FTP command"),
+            Self::Trailing => f.write_str("bytes after FTP command"),
         }
     }
 }
-impl core::error::Error for WireError {}
+impl core::error::Error for CommandParseError {}
+
+/// Why bytes do not contain exactly one complete FTP reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReplyParseError {
+    /// The reply was refused.
+    Reply(ReplyError),
+    /// The reply ended early.
+    Incomplete,
+    /// Bytes followed the reply.
+    Trailing,
+}
+impl core::fmt::Display for ReplyParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Reply(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete FTP reply"),
+            Self::Trailing => f.write_str("bytes after FTP reply"),
+        }
+    }
+}
+impl core::error::Error for ReplyParseError {}
+
+/// A reply cannot be written without changing its value.
+///
+/// Refuses empty or oversized line lists, CR, LF or NUL, oversized text,
+/// and middle lines that would terminate the reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplyWriteError;
+
+impl core::fmt::Display for ReplyWriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FTP reply cannot be written unchanged")
+    }
+}
+impl core::error::Error for ReplyWriteError {}
 
 // Lines frames physical lines. RFC 2640's CR NUL LF is joined here into
 // one logical line. Only consumed pieces are retained, under MAX_CONTENT.
+#[derive(Clone, Debug)]
 struct ControlLines {
     lines: codec::Lines,
     partial: Vec<u8>,
@@ -1780,6 +1810,7 @@ impl ControlLines {
 /// Malformed and overlong commands are error items. EOF inside a command
 /// is terminal. The legacy [`CommandDecoder`] keeps its feed-time dropping
 /// and larger buffer; it is not a wrapper around this decoder.
+#[derive(Clone, Debug)]
 pub struct Commands {
     lines: ControlLines,
 }
@@ -1824,6 +1855,7 @@ impl Decode for Commands {
 /// one error item at the matching final line. EOF in an assembly is
 /// [`DecodeError::Incomplete`]. The legacy [`ReplyDecoder`] stays separate
 /// to preserve its repeated errors and fatal first-line syntax errors.
+#[derive(Clone, Debug)]
 pub struct Replies {
     lines: ControlLines,
     builder: Builder,
@@ -1877,34 +1909,31 @@ impl Decode for Replies {
     }
 }
 
-fn exact_control<D, T>(
-    mut decoder: D,
-    mut bytes: &[u8],
-    unit_error: fn(D::Item) -> Result<T, WireError>,
-) -> Result<T, WireError>
-where
-    D: Decode<Error = DecodeError>,
-{
-    loop {
-        match decoder.decode(bytes, true).map_err(|e| match e {
-            DecodeError::Incomplete => WireError::Incomplete,
-            DecodeError::Reply(e) => WireError::Reply(e),
-        })? {
-            Step::Item(item, used) if used == bytes.len() => return unit_error(item),
-            Step::Item(_, _) => return Err(WireError::Trailing),
-            Step::Skip(used) => bytes = bytes.get(used..).ok_or(WireError::Incomplete)?,
-            Step::Need | Step::End => return Err(WireError::Incomplete),
-        }
-    }
-}
-
 impl Wire for Command {
-    type ParseError = WireError;
+    type ParseError = CommandParseError;
     type WriteError = WriteError;
 
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        exact_control(Commands::new(), bytes, |item| item.map_err(WireError::Command))
+    /// Reads exactly one control command, accepting CRLF or bare LF.
+    /// Overlong lines are refused before checking for trailing bytes.
+    fn parse(mut bytes: &[u8]) -> Result<Self, CommandParseError> {
+        let mut decoder = Commands::new();
+        loop {
+            match decoder
+                .decode(bytes, true)
+                .map_err(|_| CommandParseError::Incomplete)?
+            {
+                Step::Item(Err(e), _) => return Err(CommandParseError::Command(e)),
+                Step::Item(Ok(command), used) if used == bytes.len() => return Ok(command),
+                Step::Item(_, _) => return Err(CommandParseError::Trailing),
+                Step::Skip(used) => {
+                    bytes = bytes.get(used..).ok_or(CommandParseError::Incomplete)?
+                }
+                Step::Need | Step::End => return Err(CommandParseError::Incomplete),
+            }
+        }
     }
+    /// Appends a command with CRLF, leaving `out` unchanged on error.
+    /// Refuses lowercase verbs that the parser would uppercase.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         if self.verb.bytes().any(|b| b.is_ascii_lowercase()) {
             return Err(WriteError::Verb);
@@ -1915,27 +1944,54 @@ impl Wire for Command {
     }
 }
 
-// The old writer clips and pads. Validate its bounded result before any
-// destination bytes change. Parsed values must also be writable unchanged.
-fn strict_reply(reply: &Reply) -> Result<Vec<u8>, WireError> {
-    let bytes = reply.to_bytes();
-    let back = exact_control(Replies::new(), &bytes, |item| item.map_err(WireError::Reply))?;
-    if &back != reply {
-        return Err(WireError::Value);
-    }
-    Ok(bytes)
-}
 impl Wire for Reply {
-    type ParseError = WireError;
-    type WriteError = WireError;
+    type ParseError = ReplyParseError;
+    type WriteError = ReplyWriteError;
 
-    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        let reply = exact_control(Replies::new(), bytes, |item| item.map_err(WireError::Reply))?;
-        strict_reply(&reply)?;
-        Ok(reply)
+    /// Reads exactly one reply accepted by [`Replies`]. CRLF and bare LF
+    /// are accepted; incomplete replies and trailing bytes are errors.
+    fn parse(mut bytes: &[u8]) -> Result<Self, ReplyParseError> {
+        let mut decoder = Replies::new();
+        loop {
+            match decoder.decode(bytes, true).map_err(|e| match e {
+                DecodeError::Incomplete => ReplyParseError::Incomplete,
+                DecodeError::Reply(e) => ReplyParseError::Reply(e),
+            })? {
+                Step::Item(Err(e), _) => return Err(ReplyParseError::Reply(e)),
+                Step::Item(Ok(reply), used) if used == bytes.len() => return Ok(reply),
+                Step::Item(_, _) => return Err(ReplyParseError::Trailing),
+                Step::Skip(used) => bytes = bytes.get(used..).ok_or(ReplyParseError::Incomplete)?,
+                Step::Need | Step::End => return Err(ReplyParseError::Incomplete),
+            }
+        }
     }
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        out.extend_from_slice(&strict_reply(self)?);
+
+    /// Appends the reply's text verbatim, with code prefixes and CRLF.
+    /// Refuses text that would not read back unchanged before touching
+    /// `out`. The legacy [`Reply::to_bytes`] still clips and pads text.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), ReplyWriteError> {
+        let count = self.lines.len();
+        if count == 0 || count > MAX_REPLY_LINES {
+            return Err(ReplyWriteError);
+        }
+        for (i, line) in self.lines.iter().enumerate() {
+            let middle = i != 0 && i != count - 1;
+            let limit = if middle { MAX_CONTENT } else { MAX_REPLY_TEXT };
+            if line.len() > limit
+                || line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
+                || (middle && ends(line, self.code))
+            {
+                return Err(ReplyWriteError);
+            }
+        }
+        let code = self.code.get().to_string();
+        for (i, line) in self.lines.iter().enumerate() {
+            if i == 0 || i == count - 1 {
+                out.extend_from_slice(code.as_bytes());
+                out.push(if i == 0 && count > 1 { b'-' } else { b' ' });
+            }
+            push_line(out, line);
+        }
         Ok(())
     }
 }

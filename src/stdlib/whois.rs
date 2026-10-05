@@ -974,6 +974,20 @@ impl core::fmt::Display for QueryParseError {
 }
 impl core::error::Error for QueryParseError {}
 
+/// Why bytes cannot be read as one WHOIS response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResponseParseError {
+    /// The response exceeds [`MAX_RESPONSE`].
+    TooLong,
+}
+
+impl core::fmt::Display for ResponseParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("WHOIS response exceeds its byte limit")
+    }
+}
+impl core::error::Error for ResponseParseError {}
+
 impl Wire for Query {
     type ParseError = QueryParseError;
     type WriteError = QueryError;
@@ -982,6 +996,7 @@ impl Wire for Query {
         let mut decoder = Queries::new();
         match decoder.decode(bytes, true).map_err(|_| QueryParseError::Incomplete)? {
             Step::Item(query, used) if used == bytes.len() => query.map_err(QueryParseError::Query),
+            Step::Item(Err(e), _) => Err(QueryParseError::Query(e)),
             Step::Item(_, _) => Err(QueryParseError::Trailing),
             _ => Err(QueryParseError::Incomplete),
         }
@@ -996,13 +1011,17 @@ impl Wire for Query {
 }
 
 impl Wire for Response {
-    type ParseError = EncodeError;
+    type ParseError = ResponseParseError;
     type WriteError = EncodeError;
 
-    fn parse(bytes: &[u8]) -> Result<Self, EncodeError> {
-        Self::new(bytes)
+    /// Reads a complete response of at most [`MAX_RESPONSE`] bytes.
+    /// All byte values are accepted; there is no line terminator to strip.
+    fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
+        Self::new(bytes).map_err(|_| ResponseParseError::TooLong)
     }
 
+    /// Appends response bytes unchanged, refusing an oversized response
+    /// before changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         if self.bytes.len() > MAX_RESPONSE {
             return Err(EncodeError::TooLong);
@@ -1019,6 +1038,7 @@ impl Wire for Response {
 /// unfinished line at EOF is a terminal [`codec::LineError::Unterminated`].
 /// Persistent connections may send several query lines. The legacy decoder
 /// stays separate because its feed-time skipping and buffering differ.
+#[derive(Clone, Debug)]
 pub struct Queries {
     lines: codec::Lines,
 }
@@ -1072,6 +1092,8 @@ pub struct CollectedResponse {
 /// [`ResponseDecoder::truncated`], including false at exactly the limit.
 /// The legacy collector stays separate because `finish` returns only a
 /// [`Response`] and its void feed owns input.
+/// Input capacity is 4096 bytes; retained state is bounded by the byte limit.
+#[derive(Clone, Debug)]
 pub struct Responses {
     limit: usize,
     bytes: Vec<u8>,
@@ -1107,7 +1129,7 @@ impl Decode for Responses {
     const NAME: &'static str = "WHOIS response";
 
     fn capacity(&self) -> usize {
-        self.limit.saturating_add(1)
+        4096
     }
     fn held(&self) -> usize {
         self.bytes.len()

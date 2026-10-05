@@ -79,6 +79,25 @@ fn ftp_commands_and_multiline_replies_round_trip() {
 }
 
 #[test]
+fn ftp_wire_preserves_numeric_middle_lines() {
+    for bytes in [
+        b"230-Welcome\r\n230-second line\r\n230 Login ok\r\n".as_slice(),
+        b"200-a\r\n123 b\r\n200 c\r\n",
+    ] {
+        let (items, failure) = drive(ftp::Replies::new(), bytes, &[1]);
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 1);
+        let reply = items[0].as_ref().unwrap();
+        assert_eq!(<ftp::Reply as Wire>::parse(bytes).as_ref(), Ok(reply));
+        let mut out = b"prefix".to_vec();
+        reply.write(&mut out).unwrap();
+        assert_eq!(&out[b"prefix".len()..], bytes);
+        contract::check_wire::<ftp::Reply>(bytes);
+        assert_ne!(reply.to_bytes(), bytes);
+    }
+}
+
+#[test]
 fn ftp_line_errors_recover_and_accept_bare_lf() {
     round_trip(
         ftp::Commands::new,
@@ -161,9 +180,37 @@ fn ftp_wire_is_exact_strict_and_transactional() {
     assert!(lower.write(&mut out).is_err());
     assert_eq!(out, b"prefix");
     for reply in [
-        ftp::Reply { code: ftp::code::OK, lines: vec![] },
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec![],
+        },
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec![String::new(); ftp::MAX_REPLY_LINES + 1],
+        },
         ftp::Reply::new(ftp::code::OK, "bad\ntext"),
-        ftp::Reply { code: ftp::code::OK, lines: vec!["first".into(), "123 text".into(), "last".into()] },
+        ftp::Reply::new(ftp::code::OK, "bad\rtext"),
+        ftp::Reply::new(ftp::code::OK, "bad\0text"),
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec!["first".into(), "200 text".into(), "last".into()],
+        },
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec!["first".into(), "200".into(), "last".into()],
+        },
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec!["x".repeat(ftp::MAX_LINE - 5), "last".into()],
+        },
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec!["first".into(), "x".repeat(ftp::MAX_LINE - 5)],
+        },
+        ftp::Reply {
+            code: ftp::code::OK,
+            lines: vec!["first".into(), "x".repeat(ftp::MAX_LINE - 1), "last".into()],
+        },
         ftp::Reply { code: ftp::code::OK, lines: vec!["x".repeat(ftp::MAX_LINE)] },
     ] {
         contract::check_wire_value(&reply);
@@ -172,9 +219,27 @@ fn ftp_wire_is_exact_strict_and_transactional() {
     }
     assert!(<ftp::Command as Wire>::parse(b"NOOP\r\nextra").is_err());
     assert!(<ftp::Reply as Wire>::parse(b"200 OK\r\nextra").is_err());
-    assert!(<ftp::Reply as Wire>::parse(b"200-first\r\n123 raw\r\n200 last\r\n").is_err());
+    contract::check_wire::<ftp::Reply>(b"200-first\r\n123 raw\r\n200 last\r\n");
     contract::check_wire::<ftp::Command>(b"\xff\xf4NOOP\n");
     contract::check_wire::<ftp::Reply>(b"200\n");
+}
+
+#[test]
+fn ftp_strict_reply_accepts_full_size_verbatim_text() {
+    let edge = "x".repeat(ftp::MAX_LINE - 6);
+    let middle = format!("123 {}", "x".repeat(ftp::MAX_LINE - 6));
+    for lines in [
+        vec![edge.clone()],
+        vec![edge.clone(), middle, edge],
+        vec![String::new(); ftp::MAX_REPLY_LINES],
+    ] {
+        let reply = ftp::Reply {
+            code: ftp::code::OK,
+            lines,
+        };
+        let bytes = written(std::slice::from_ref(&reply));
+        round_trip(ftp::Replies::new, &bytes, &[Ok(reply)]);
+    }
 }
 
 #[test]
@@ -469,6 +534,8 @@ fn decoder_capacity_and_empty_eof() {
     assert_eq!(ftp::Commands::new().capacity(), ftp::MAX_LINE);
     assert_eq!(ftp::Replies::new().capacity(), ftp::MAX_LINE);
     assert_eq!(whois::Queries::new().capacity(), whois::MAX_QUERY + 2);
+    assert_eq!(whois::Responses::new().capacity(), 4096);
+    assert_eq!(whois::Responses::with_limit(0).capacity(), 4096);
     assert_eq!(memcache::Frames::with_limit(usize::MAX).capacity(), memcache::MAX_BINARY_BUFFERED);
     assert_eq!(memcache::Responses::new().capacity(), memcache::MAX_LINE);
     assert_eq!(memcache::Commands::new().capacity(), memcache::MAX_LINE);
@@ -494,4 +561,87 @@ fn memcache_long_line_crlf_crosses_the_input_window() {
     assert_eq!(bytes[memcache::MAX_LINE - 1], b'\r');
     round_trip(memcache::Commands::new, &bytes, &[Ok(command)]);
     contract::check_decode_with_held_limit(memcache::Commands::new, &bytes, memcache::MAX_TEXT_HELD);
+}
+
+#[test]
+fn memcache_long_get_line_keeps_the_content_limit_after_a_cr() {
+    for content_len in [memcache::MAX_GET_LINE - 2, memcache::MAX_GET_LINE - 1] {
+        let mut bytes = b"get ".to_vec();
+        bytes.resize(content_len, b'x');
+        bytes[memcache::MAX_LINE - 1] = b'\r';
+        bytes.extend_from_slice(b"\r\n");
+        let mut legacy = memcache::CommandDecoder::new();
+        assert_eq!(legacy.feed(&bytes), bytes.len());
+        let old = legacy.next_command().unwrap();
+        for pattern in [&[][..], &[memcache::MAX_LINE], &[1, 8191, 3]] {
+            let (items, failure) = drive(memcache::Commands::new(), &bytes, pattern);
+            if content_len == memcache::MAX_GET_LINE - 2 {
+                assert_eq!(old, Err(memcache::Error::Key));
+                assert_eq!(failure, None);
+                assert_eq!(items.as_slice(), std::slice::from_ref(&old));
+            } else {
+                assert_eq!(old, Err(memcache::Error::LineTooLong));
+                assert!(items.is_empty());
+                assert_eq!(
+                    failure,
+                    Some(Fail::Protocol(memcache::TextFrameError::LineTooLong))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn memcache_long_get_consumes_the_scanned_window() {
+    for trailing_cr in [false, true] {
+        let mut bytes = b"get ".to_vec();
+        bytes.resize(4 * memcache::MAX_LINE, b'x');
+        if trailing_cr {
+            *bytes.last_mut().unwrap() = b'\r';
+        }
+        let mut decoder = memcache::Commands::new();
+        let used = bytes.len() - usize::from(trailing_cr);
+        assert_eq!(decoder.decode(&bytes, false), Ok(Step::Skip(used)));
+        assert_eq!(decoder.held(), used);
+    }
+}
+
+#[test]
+fn memcache_binary_key_length_precedes_body_length() {
+    let key_len = memcache::MAX_KEY + 1;
+    for body_len in [4, memcache::MAX_BODY + 1] {
+        let mut header = [0; memcache::BINARY_HEADER_LEN];
+        header[0] = memcache::REQUEST_MAGIC;
+        header[2..4].copy_from_slice(&(key_len as u16).to_be_bytes());
+        header[8..12].copy_from_slice(&(body_len as u32).to_be_bytes());
+        let error = memcache::BinaryError::KeyLength(key_len);
+        assert_eq!(memcache::Packet::parse(&header), Err(error));
+        assert_eq!(
+            <memcache::Packet as Wire>::parse(&header),
+            Err(memcache::PacketParseError::Binary(error))
+        );
+        assert_eq!(
+            memcache::Frames::with_limit(3).decode(&header, false),
+            Err(error)
+        );
+        assert_eq!(memcache::Frames::new().decode(&header, false), Err(error));
+    }
+}
+
+#[test]
+fn overlong_wire_lines_report_length_errors() {
+    for tail in [b"".as_slice(), b"\r\n"] {
+        let mut bytes = vec![b'a'; 5000];
+        bytes.extend_from_slice(tail);
+        assert_eq!(
+            <ftp::Command as Wire>::parse(&bytes),
+            Err(ftp::CommandParseError::Command(
+                ftp::CommandError::LineTooLong
+            ))
+        );
+        assert_eq!(
+            <whois::Query as Wire>::parse(&bytes),
+            Err(whois::QueryParseError::Query(whois::QueryError::TooLong))
+        );
+    }
 }

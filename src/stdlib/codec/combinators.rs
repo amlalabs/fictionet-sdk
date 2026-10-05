@@ -136,6 +136,7 @@ impl Error for LineError {}
 /// Incremental line framing with a content limit and an ending policy.
 /// Overlong lines produce one error item, then skips through their LF.
 /// The scan cursor visits each input byte only once.
+#[derive(Clone, Debug)]
 pub struct Lines {
     max: usize,
     ending: Ending,
