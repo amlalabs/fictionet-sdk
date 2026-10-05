@@ -155,14 +155,30 @@ fuzz_target!(|data: &[u8]| {
         Phase::Unsupported(42),
     ] {
         for dialect in [Dialect::V3_3, Dialect::V3_7, Dialect::V3_8] {
-            contract::check_decode(
-                || {
-                    let mut d = ServerMessages::with_limit(4096);
-                    d.set_mode(phase, dialect, PixelFormat::TRUE_COLOR_32).unwrap();
-                    d
+            for format in [
+                PixelFormat::TRUE_COLOR_32,
+                PixelFormat {
+                    bits_per_pixel: 8,
+                    depth: 8,
+                    true_color: false,
+                    ..PixelFormat::TRUE_COLOR_32
                 },
-                data,
-            );
+                PixelFormat {
+                    bits_per_pixel: 16,
+                    depth: 16,
+                    true_color: false,
+                    ..PixelFormat::TRUE_COLOR_32
+                },
+            ] {
+                contract::check_decode(
+                    || {
+                        let mut d = ServerMessages::with_limit(4096);
+                        d.set_mode(phase, dialect, format).unwrap();
+                        d
+                    },
+                    data,
+                );
+            }
         }
     }
     let Some((&choice, data)) = data.split_first() else { return };

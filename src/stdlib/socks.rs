@@ -29,11 +29,10 @@
 //! [`codec::Stream`]. Choose methods and verify authentication between
 //! items, then hand off unread bytes with `swap` or `into_parts` after
 //! `End`. Individual greeting, auth, request and reply types implement
-//! [`Wire`] with exact parsing and transactional writing. The deprecated
+//! [`Wire`] with exact parsing and transactional writing. The legacy
 //! decoders and their `take_data` methods retain their original behavior.
 //!
 //! ```
-//! # #![allow(deprecated)]
 //! use fictionet::stdlib::socks::{
 //!     Address, ClientMessage, Command, Method, Reply, ReplyCode, Selection, ServerDecoder, ServerStage,
 //! };
@@ -76,7 +75,7 @@ pub enum DecodeError {
     Protocol(Error),
     /// A unit exceeds the configured whole-message limit.
     TooLong,
-    /// Call `select` or `verified` after the last item before decoding again.
+    /// Bytes arrived before `select` or `verified` decided the next stage.
     DecisionRequired(ServerStage),
 }
 
@@ -143,16 +142,22 @@ macro_rules! socks_wire {
 }
 socks_wire!(Greeting, Selection, AuthRequest, AuthReply, Request, Reply, Socks4Request, Socks4Reply);
 
+fn sized_end(at: usize, len: usize) -> Result<usize, DecodeError> {
+    at.checked_add(len).ok_or(DecodeError::TooLong)
+}
+
 // Finds framing without interpreting command and reserved fields. Those
 // are per-unit failures once the endpoint establishes an exact boundary.
 fn endpoint_end(b: &[u8], at: usize) -> Result<Option<usize>, DecodeError> {
     let Some(&kind) = b.get(at) else { return Ok(None) };
     Ok(Some(match kind {
-        atyp::IPV4 => at + 7,
-        atyp::IPV6 => at + 19,
+        atyp::IPV4 => sized_end(at, 7)?,
+        atyp::IPV6 => sized_end(at, 19)?,
         atyp::DOMAIN => {
-            let Some(&n) = b.get(at + 1) else { return Ok(None) };
-            at + 4 + usize::from(n)
+            let Some(&n) = b.get(sized_end(at, 1)?) else {
+                return Ok(None);
+            };
+            sized_end(sized_end(at, 4)?, usize::from(n))?
         }
         other => return Err(DecodeError::Protocol(Error::AddressType(other))),
     }))
@@ -169,20 +174,25 @@ impl Scan4 {
         let domain = [a, c, d] == [0, 0, 0] && e != 0;
         self.pos = self.pos.max(8);
         loop {
-            let start = self.user_end.map_or(8, |n| n + 1);
+            let start = self.user_end.map_or(Ok(8), |n| sized_end(n, 1))?;
             let max = if self.user_end.is_some() { MAX_SOCKS4_DOMAIN } else { MAX_USER_ID };
-            let end = b.len().min(start + max + 1);
+            let field_end = sized_end(sized_end(start, max)?, 1)?;
+            let end = b.len().min(field_end);
             let bytes = b.get(self.pos..end).unwrap_or_default();
             if let Some(n) = bytes.iter().position(|&v| v == 0) {
-                let nul = self.pos + n;
-                self.pos = nul + 1;
+                let nul = sized_end(self.pos, n)?;
+                self.pos = sized_end(nul, 1)?;
                 if self.user_end.is_some() || !domain {
-                    return Ok(Some(nul + 1));
+                    return Ok(Some(self.pos));
                 }
                 self.user_end = Some(nul);
             } else {
                 self.pos = end;
-                return if end == start + max + 1 { Err(DecodeError::Protocol(Error::FieldTooLong)) } else { Ok(None) };
+                return if end == field_end {
+                    Err(DecodeError::Protocol(Error::FieldTooLong))
+                } else {
+                    Ok(None)
+                };
             }
         }
     }
@@ -192,11 +202,14 @@ impl Scan4 {
 ///
 /// Use with [`codec::Stream`]. Call [`select`](Self::select) immediately
 /// after a greeting item and [`verified`](Self::verified) after an auth
-/// item, before the next decode call. Missing decisions are terminal
-/// [`DecodeError::DecisionRequired`] errors, not byte backpressure.
+/// item. Until that decision, empty input returns [`Step::Need`], allowing
+/// [`codec::pump`] and [`codec::try_pump`] to return to the world. With bytes
+/// buffered, decoding instead fails with [`DecodeError::DecisionRequired`]
+/// so it never stalls at capacity. Decide before decoding those bytes.
 /// Complete malformed requests are `Err` items. Unknown framing and limits
-/// are terminal errors. A request is the last item; the next call returns
-/// [`Step::End`]. Unsupported selected methods and refusal also end.
+/// are terminal errors. Both leave [`ServerStage::Failed`]. A request is
+/// the last item; the next call returns [`Step::End`]. Unsupported selected
+/// methods and refusal also end.
 /// Use `Stream::swap` or `into_parts` for the unread tunnel bytes, and send
 /// any input not accepted by `push` to the next decoder. EOF inside a unit
 /// returns `Need` so the driver reports truncation.
@@ -271,9 +284,20 @@ impl codec::Decode for ClientMessages {
     }
 
     fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, DecodeError> {
+        self.decode_unit(b)
+            .inspect_err(|_| self.stage = ServerStage::Failed)
+    }
+}
+impl ClientMessages {
+    fn decode_unit(&mut self, b: &[u8]) -> Result<Step<Result<ClientMessage, Error>>, DecodeError> {
         match self.stage {
             ServerStage::Done | ServerStage::Closed | ServerStage::Failed => return Ok(Step::End),
-            ServerStage::Selecting | ServerStage::Verifying => return Err(DecodeError::DecisionRequired(self.stage)),
+            ServerStage::Selecting | ServerStage::Verifying if b.is_empty() => {
+                return Ok(Step::Need);
+            }
+            ServerStage::Selecting | ServerStage::Verifying => {
+                return Err(DecodeError::DecisionRequired(self.stage));
+            }
             _ => {}
         }
         let Some(&first) = b.first() else { return Ok(Step::Need) };
@@ -287,17 +311,23 @@ impl codec::Decode for ClientMessages {
         };
         check_version(b, version).map_err(DecodeError::Protocol)?;
         let end = if v4 {
-            self.scan4.length(b)?
+            self.scan4.length(b.get(..self.limit).unwrap_or(b))?
         } else {
             match self.stage {
-                ServerStage::Greeting => b.get(1).map(|&n| 2 + usize::from(n)),
+                ServerStage::Greeting => b
+                    .get(1)
+                    .map(|&n| sized_end(2, usize::from(n)))
+                    .transpose()?,
                 ServerStage::Auth => match b.get(1) {
                     Some(&n) => {
-                        let at = 2 + usize::from(n);
-                        if at + 1 > self.limit {
+                        let at = sized_end(2, usize::from(n))?;
+                        let header = sized_end(at, 1)?;
+                        if header > self.limit {
                             return Err(DecodeError::TooLong);
                         }
-                        b.get(at).map(|&p| at + 1 + usize::from(p))
+                        b.get(at)
+                            .map(|&p| sized_end(header, usize::from(p)))
+                            .transpose()?
                     }
                     None => None,
                 },
@@ -327,7 +357,8 @@ impl codec::Decode for ClientMessages {
                 ServerStage::Selecting
             }
             Ok(ClientMessage::Auth(_)) => ServerStage::Verifying,
-            _ => ServerStage::Done,
+            Ok(_) => ServerStage::Done,
+            Err(_) => ServerStage::Failed,
         };
         Ok(Step::Item(item, used))
     }
@@ -338,6 +369,7 @@ impl codec::Decode for ClientMessages {
 /// This is the input-free counterpart of [`ClientDecoder`]. BIND reads
 /// both replies. Refusal and unsupported methods yield their last item,
 /// then `End`. Bad complete units are items; framing and limits are errors.
+/// Both kinds of error leave [`ClientStage::Failed`], preserving unread bytes.
 #[derive(Clone, Debug)]
 pub struct ServerMessages {
     stage: ClientStage,
@@ -349,12 +381,18 @@ pub struct ServerMessages {
 impl ServerMessages {
     /// Reads a SOCKS5 selection, optional auth reply, and request replies.
     pub fn socks5(command: Command) -> Self {
+        Self::with_limit(command, MAX_MESSAGE)
+    }
+
+    /// Reads SOCKS5 replies with a whole-unit limit clamped to 8 through
+    /// [`MAX_MESSAGE`]. Declared endpoint lengths are checked before the body.
+    pub fn with_limit(command: Command, limit: usize) -> Self {
         Self {
             stage: ClientStage::Selection,
             socks4: false,
             bind: command == Command::Bind,
             offered: None,
-            limit: MAX_MESSAGE,
+            limit: limit.clamp(8, MAX_MESSAGE),
         }
     }
 
@@ -374,11 +412,9 @@ impl ServerMessages {
         }
     }
 
-    /// Sets the whole-unit limit before decoding, clamped to 8 through
-    /// [`MAX_MESSAGE`]. Declared endpoint lengths are checked first.
-    pub fn with_limit(mut self, limit: usize) -> Self {
-        self.limit = limit.clamp(8, MAX_MESSAGE);
-        self
+    /// The largest accepted unit, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
     }
 
     /// The current reply stage.
@@ -395,6 +431,12 @@ impl codec::Decode for ServerMessages {
     }
 
     fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, DecodeError> {
+        self.decode_unit(b)
+            .inspect_err(|_| self.stage = ClientStage::Failed)
+    }
+}
+impl ServerMessages {
+    fn decode_unit(&mut self, b: &[u8]) -> Result<Step<Result<ServerMessage, Error>>, DecodeError> {
         if matches!(self.stage, ClientStage::Done | ClientStage::Closed | ClientStage::Failed) {
             return Ok(Step::End);
         }
@@ -445,7 +487,8 @@ impl codec::Decode for ServerMessages {
             Ok(ServerMessage::Auth(a)) if a.success() => ClientStage::Reply,
             Ok(ServerMessage::Reply(r)) if r.code.code() == ReplyCode::Succeeded.code() => reply_stage,
             Ok(ServerMessage::Socks4(r)) if r.code.code() == Socks4Code::Granted.code() => reply_stage,
-            _ => ClientStage::Closed,
+            Ok(_) => ClientStage::Closed,
+            Err(_) => ClientStage::Failed,
         };
         Ok(Step::Item(item, used))
     }
@@ -1318,39 +1361,39 @@ pub enum ClientMessage {
     Socks4(Socks4Request),
 }
 
-/// Where a [`ServerDecoder`] is in the handshake.
+/// Where [`ClientMessages`] or a [`ServerDecoder`] is in the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerStage {
     /// Waiting for the client's first message: a SOCKS5 greeting or a
     /// SOCKS4 request.
     Greeting,
     /// Waiting for the world to choose a method with
-    /// [`ServerDecoder::select`].
+    /// [`ClientMessages::select`] or [`ServerDecoder::select`].
     Selecting,
     /// Waiting for a username and password.
     Auth,
     /// Waiting for the world to say whether the login is good with
-    /// [`ServerDecoder::verified`].
+    /// [`ClientMessages::verified`] or [`ServerDecoder::verified`].
     Verifying,
     /// Waiting for a SOCKS5 request.
     Request,
     /// The handshake is over, or went on with a method this module does
     /// not read. The bytes that follow are the world's, through
-    /// [`ServerDecoder::take_data`].
+    /// [`codec::Stream::into_parts`] or [`ServerDecoder::take_data`].
     Done,
-    /// The proxy refused the client and closes the connection. Bytes fed
-    /// now are dropped.
+    /// The proxy refused the client and closes the connection. The stream
+    /// decoder ends; the legacy decoder drops further fed bytes.
     Closed,
-    /// The client broke the protocol. The decoder keeps returning the
-    /// error.
+    /// The client broke the protocol, or decoding failed. No tunnel handoff
+    /// is allowed. The stream reports the error once; the legacy decoder repeats it.
     Failed,
 }
 
 /// Reads what a SOCKS client sends, for a world that plays a proxy. Feed
 /// it the bytes a connection reads, in order, and take messages out until
 /// it has none.
+/// New code uses [`ClientMessages`] with [`codec::Stream`].
 #[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with socks::ClientMessages; hand off with into_parts or swap")]
 pub struct ServerDecoder {
     buf: Buffer,
     stage: ServerStage,
@@ -1359,14 +1402,12 @@ pub struct ServerDecoder {
     failed: Option<Error>,
 }
 
-#[allow(deprecated)]
 impl Default for ServerDecoder {
     fn default() -> ServerDecoder {
         ServerDecoder::new()
     }
 }
 
-#[allow(deprecated)] // Preserve the compatibility API.
 impl ServerDecoder {
     /// A decoder waiting for a client's first message.
     pub fn new() -> ServerDecoder {
@@ -1478,7 +1519,7 @@ impl ServerDecoder {
     /// If bytes were dropped past [`MAX_BUFFERED`], it returns nothing and
     /// the decoder fails with [`Error::Overflow`], so the stream it hands
     /// out never has a gap.
-    #[deprecated(note = "use codec::Stream::into_parts or swap after the final item")]
+    /// New code uses [`ClientMessages`] and [`codec::Stream::into_parts`] or `swap`.
     pub fn take_data(&mut self) -> Vec<u8> {
         if self.stage != ServerStage::Done {
             return Vec::new();
@@ -1509,7 +1550,7 @@ pub enum ServerMessage {
     Socks4(Socks4Reply),
 }
 
-/// Where a [`ClientDecoder`] is in the handshake.
+/// Where [`ServerMessages`] or a [`ClientDecoder`] is in the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientStage {
     /// Waiting for the proxy's method selection.
@@ -1523,21 +1564,21 @@ pub enum ClientStage {
     SecondReply,
     /// The handshake is over, or went on with a method this module does
     /// not read. The bytes that follow are the world's, through
-    /// [`ClientDecoder::take_data`].
+    /// [`codec::Stream::into_parts`] or [`ClientDecoder::take_data`].
     Done,
-    /// The proxy refused, and closes the connection. Bytes fed now are
-    /// dropped.
+    /// The proxy refused, and closes the connection. The stream decoder
+    /// ends; the legacy decoder drops further fed bytes.
     Closed,
-    /// The proxy broke the protocol. The decoder keeps returning the
-    /// error.
+    /// The proxy broke the protocol, or decoding failed. No tunnel handoff
+    /// is allowed. The stream reports the error once; the legacy decoder repeats it.
     Failed,
 }
 
 /// Reads what a SOCKS proxy sends, for a world that plays a client. Feed
 /// it the bytes a connection reads, in order, and take messages out until
 /// it has none.
+/// New code uses [`ServerMessages`] with [`codec::Stream`].
 #[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with socks::ServerMessages; hand off with into_parts or swap")]
 pub struct ClientDecoder {
     buf: Buffer,
     stage: ClientStage,
@@ -1549,7 +1590,6 @@ pub struct ClientDecoder {
     failed: Option<Error>,
 }
 
-#[allow(deprecated)] // Preserve the compatibility API.
 impl ClientDecoder {
     /// A decoder for a SOCKS5 client that sent a greeting and will send a
     /// request with `command`. It takes whatever method the proxy chooses;
@@ -1680,7 +1720,7 @@ impl ClientDecoder {
 
     /// Takes out the bytes held after the handshake, as
     /// [`ServerDecoder::take_data`] does.
-    #[deprecated(note = "use codec::Stream::into_parts or swap after the final item")]
+    /// New code uses [`ServerMessages`] and [`codec::Stream::into_parts`] or `swap`.
     pub fn take_data(&mut self) -> Vec<u8> {
         if self.stage != ClientStage::Done {
             return Vec::new();
@@ -1703,7 +1743,6 @@ fn be16(b: &[u8], i: usize) -> u16 {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // Test the original API unchanged.
 mod tests {
     use super::*;
 

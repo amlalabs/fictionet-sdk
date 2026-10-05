@@ -1,7 +1,6 @@
 //! PROXY protocol headers, version 1 and 2, as a world behind a proxy
 //! reads them at the start of a connection.
 #![no_main]
-#![allow(deprecated)] // Also exercise the unchanged compatibility API.
 
 use fictionet::stdlib::proxy_protocol::{
     Addresses, Command, Decoder, Header, MAX_HEADER_LEN, MAX_TLV_VALUE, Ssl, SslTlv, Step, Tlv, Transport, V1, V2,

@@ -1,7 +1,6 @@
 //! SOCKS4, SOCKS4a and SOCKS5 handshakes and UDP headers, as a world
 //! playing a proxy or a client reads them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the unchanged compatibility API.
 
 use fictionet::stdlib::socks::{
     Address, AuthReply, AuthRequest, ClientDecoder, ClientMessage, Command, Error, Greeting, MAX_BUFFERED,
@@ -10,37 +9,9 @@ use fictionet::stdlib::socks::{
 };
 use fictionet::stdlib::{
     codec::{Decode, Step, contract},
-    socks::{ClientMessages, DecodeError, ServerMessages},
+    socks::{ClientMessages, ServerMessages},
 };
 use libfuzzer_sys::fuzz_target;
-
-struct Chosen(ClientMessages);
-impl Decode for Chosen {
-    type Item = Result<ClientMessage, Error>;
-    type Error = DecodeError;
-    const NAME: &'static str = "scripted SOCKS";
-    fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
-        let step = self.0.decode(input, eof)?;
-        match &step {
-            Step::Item(Ok(ClientMessage::Greeting(g)), _) => {
-                let method = if g.methods.contains(&Method::UsernamePassword) {
-                    Method::UsernamePassword
-                } else if g.methods.contains(&Method::NoAuth) {
-                    Method::NoAuth
-                } else {
-                    Method::NoAcceptable
-                };
-                assert!(self.0.select(method));
-            }
-            Step::Item(Ok(ClientMessage::Auth(a)), _) => self.0.verified(a.username != b"bad"),
-            _ => {}
-        }
-        Ok(step)
-    }
-}
 
 /// Takes messages out of a proxy's decoder, choosing a method and judging
 /// logins the same way every time. A broken stream gives its error once.
@@ -86,10 +57,23 @@ fn drain_client(d: &mut ClientDecoder, out: &mut Vec<Result<ServerMessage, Error
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(ClientMessages::new, data);
-    contract::check_decode(|| Chosen(ClientMessages::new()), data);
-    contract::check_decode(|| Chosen(ClientMessages::with_limit(16)), data);
+    contract::check_decode(|| ClientMessages::with_limit(16), data);
+    for method in [Method::NoAuth, Method::UsernamePassword] {
+        contract::check_decode(
+            || {
+                let mut d = ClientMessages::with_limit(16);
+                assert!(matches!(
+                    d.decode(&[5, 1, method.code()], false),
+                    Ok(Step::Item(_, 3))
+                ));
+                assert!(d.select(method));
+                d
+            },
+            data,
+        );
+    }
     contract::check_decode(|| ServerMessages::socks5(Command::Connect), data);
-    contract::check_decode(|| ServerMessages::socks5(Command::Bind).with_limit(16), data);
+    contract::check_decode(|| ServerMessages::with_limit(Command::Bind, 16), data);
     contract::check_decode(|| ServerMessages::socks4(Socks4Command::Bind), data);
     contract::check_wire::<Greeting>(data);
     contract::check_wire::<Selection>(data);

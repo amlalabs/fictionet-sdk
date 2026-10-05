@@ -29,10 +29,9 @@
 //! New code uses [`Headers`] with [`codec::Stream`]. The decoder returns
 //! one header result and then `End`. `swap` or `into_parts` preserves the
 //! unread suffix. [`Wire`] adds exact parsing and strict writing for
-//! [`Header`]. The deprecated `Decoder` and `Step` keep their old behavior.
+//! [`Header`]. The legacy `Decoder` and `Step` keep their old behavior.
 //!
 //! ```
-//! # #![allow(deprecated)]
 //! use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Step, Tlv, Transport, V2};
 //! use std::net::Ipv4Addr;
 //!
@@ -72,7 +71,7 @@ use super::codec::{self, Decode, Wire};
 /// Why a header cannot be framed or read as an exact wire value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeaderError {
-    /// A signature or fixed header is invalid.
+    /// A signature or fixed header is invalid, or a v1 line exceeds [`V1_MAX_LEN`].
     Protocol(Error),
     /// The declared header exceeds the configured whole-header limit.
     TooLong,
@@ -133,6 +132,8 @@ fn strict_header(header: &Header) -> Result<Vec<u8>, HeaderError> {
 /// Use with [`codec::Stream`]. Items are `Result<Header, Error>`: a bad
 /// complete line or v2 body is one refused item, followed by `End`.
 /// Bad signatures, fixed headers and limits are terminal errors.
+/// A v1 line without a newline within [`V1_MAX_LEN`] fails with
+/// [`Error::V1TooLong`]; a smaller configured limit gives [`HeaderError::TooLong`].
 /// In particular, [`Error::NotProxy`] is a terminal `Protocol` error with
 /// no consumption. Use [`codec::Stream::swap`] or
 /// [`codec::Stream::into_parts`] to give every unread byte to the plain
@@ -191,10 +192,20 @@ impl Decode for Headers {
                 let end = input.len().min(cap);
                 let window = input.get(self.scanned..end).unwrap_or_default();
                 match window.iter().position(|&b| b == b'\n') {
-                    Some(n) => self.scanned + n + 1,
+                    Some(n) => self
+                        .scanned
+                        .checked_add(n)
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or(HeaderError::TooLong)?,
                     None => {
                         self.scanned = end;
-                        return if end == cap { Err(HeaderError::TooLong) } else { Ok(codec::Step::Need) };
+                        return if end == V1_MAX_LEN {
+                            Err(HeaderError::Protocol(Error::V1TooLong))
+                        } else if end == cap {
+                            Err(HeaderError::TooLong)
+                        } else {
+                            Ok(codec::Step::Need)
+                        };
                     }
                 }
             }
@@ -203,8 +214,12 @@ impl Decode for Headers {
                 // available, so header faults always have the same priority.
                 let fixed = input.get(..input.len().min(V2_HEADER_LEN)).unwrap_or_default();
                 Header::parse(fixed).map_err(HeaderError::Protocol)?;
-                let Some(&[hi, lo]) = input.get(14..16) else { return Ok(codec::Step::Need) };
-                let used = V2_HEADER_LEN + usize::from(u16::from_be_bytes([hi, lo]));
+                let Some(&[hi, lo]) = input.get(14..16) else {
+                    return Ok(codec::Step::Need);
+                };
+                let used = V2_HEADER_LEN
+                    .checked_add(usize::from(u16::from_be_bytes([hi, lo])))
+                    .ok_or(HeaderError::TooLong)?;
                 if used > self.limit {
                     return Err(HeaderError::TooLong);
                 }
@@ -1141,9 +1156,9 @@ fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
 }
 
 /// What a [`Decoder`] has found after a feed.
+/// New code uses [`codec::Step`] with [`Headers`] and [`codec::Stream`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)] // one per connection, as with Header
-#[deprecated(note = "use codec::Step with proxy_protocol::Headers and codec::Stream")]
 pub enum Step {
     /// The bytes so far are part of a header. Feed more.
     NeedMore,
@@ -1171,14 +1186,13 @@ pub enum Step {
 /// Reads the PROXY header at the start of a connection. Feed it the bytes
 /// the connection reads, in order, until it returns something other than
 /// [`Step::NeedMore`]. It never holds more than [`MAX_HEADER_LEN`] bytes.
+/// New code uses [`Headers`] with [`codec::Stream`].
 #[derive(Debug, Default)]
-#[deprecated(note = "use codec::Stream with proxy_protocol::Headers; hand off with into_parts or swap")]
 pub struct Decoder {
     buf: Vec<u8>,
     finished: bool,
 }
 
-#[allow(deprecated)] // Preserve the original feed and handoff behavior.
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -1219,7 +1233,6 @@ impl Decoder {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // Test the compatibility API unchanged.
 mod tests {
     use super::*;
 
