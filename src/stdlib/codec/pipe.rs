@@ -8,7 +8,10 @@ use core::{error::Error, fmt, ops::Range};
 pub const DEFAULT_SPANS: usize = 256;
 
 /// Byte coordinates in an inner stream and its parent stream.
-/// Unequal lengths describe a coarse mapping of the entire payload.
+/// The mapping is coarse: the inner bytes came from somewhere in the
+/// outer range, which covers the whole outer unit that carried them,
+/// framing and earlier fragments included. Equal lengths do not mean a
+/// byte-for-byte copy.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Span {
     /// Bytes in the inner stream.
@@ -36,6 +39,8 @@ impl Spans {
         }
     }
     /// Records the next outer unit and the inner bytes it carries.
+    /// The unit starts at the current outer offset, so outer bytes not yet
+    /// recorded (earlier fragments of an assembled message) belong to it.
     /// Zero inner length only advances the outer offset.
     pub fn push(&mut self, outer_len: usize, inner_len: usize) {
         let outer_end = self
@@ -92,9 +97,9 @@ impl Spans {
     pub fn outer_offset(&self) -> u64 {
         self.outer_at
     }
-    /// Resolves a nonempty range when its parent bytes are contiguous.
-    /// An entire coarse span resolves to its whole outer range. A partial
-    /// coarse span, an evicted span, or a gap returns `None`.
+    /// Resolves a nonempty range that covers whole spans with contiguous
+    /// outer ranges, giving the union of those outer ranges. A partial
+    /// span, an evicted span, or a gap in either coordinate returns `None`.
     pub fn locate(&self, range: Range<u64>) -> Option<Range<u64>> {
         if range.start >= range.end {
             return None;
@@ -108,32 +113,15 @@ impl Spans {
             if span.inner.start > at {
                 return None;
             }
-            let end = range.end.min(span.inner.end);
-            let exact = span.inner.end.saturating_sub(span.inner.start)
-                == span.outer.end.saturating_sub(span.outer.start);
-            let part = if exact {
-                span.outer
-                    .start
-                    .saturating_add(at.saturating_sub(span.inner.start))
-                    ..span
-                        .outer
-                        .start
-                        .saturating_add(end.saturating_sub(span.inner.start))
-            } else if at == span.inner.start
-                && end == span.inner.end
-                && result.is_none()
-                && end == range.end
-            {
-                span.outer.clone()
-            } else {
+            if span.inner.start != at || span.inner.end > range.end {
                 return None;
-            };
+            }
             match &mut result {
-                Some(r) if r.end == part.start => r.end = part.end,
-                None => result = Some(part),
+                Some(r) if r.end == span.outer.start => r.end = span.outer.end,
+                None => result = Some(span.outer.clone()),
                 _ => return None,
             }
-            at = end;
+            at = span.inner.end;
             if at == range.end {
                 return result;
             }
@@ -202,6 +190,8 @@ pub struct Pipe<O: Decode, I: Decode, F> {
     outer_ended: bool,
     inner_ready: bool,
     spans: Spans,
+    // Outer bytes skipped since the last outer item; they belong to the next.
+    unit: usize,
     payload_limit: usize,
 }
 impl<O: Decode, I: Decode, F> Pipe<O, I, F> {
@@ -231,11 +221,14 @@ impl<O: Decode, I: Decode, F> Pipe<O, I, F> {
             outer_ended: false,
             inner_ready: true,
             spans: Spans::new(keep_spans),
+            unit: 0,
             payload_limit: payload_limit.min(Buffer::MAX_LIMIT),
         }
     }
     /// Coarse whole-unit provenance, relative to the pipe's first byte.
-    /// Through items, dropped items, and skips still advance outer offsets.
+    /// A unit is every outer byte since the previous outer item, so an
+    /// assembled message spans all its fragments. Through and dropped items
+    /// advance outer offsets. Skipped bytes are counted with the next item.
     pub fn spans(&self) -> &Spans {
         &self.spans
     }
@@ -260,6 +253,10 @@ impl<O: Decode, I: Decode, F> Pipe<O, I, F> {
     /// The inner stream, including its unread suffix after an early end.
     pub fn inner_stream(&self) -> &Stream<I> {
         &self.inner
+    }
+    // Ends the current outer unit with an item of `n` bytes; returns its length.
+    fn take_unit(&mut self, n: usize) -> usize {
+        core::mem::take(&mut self.unit).saturating_add(n)
     }
 }
 impl<O: Decode, I: Decode, F: FnMut(O::Item) -> Carry<O::Item>> Decode for Pipe<O, I, F>
@@ -331,11 +328,13 @@ where
             let step = match self.outer.decode(input, eof).map_err(PipeError::Outer)? {
                 Step::Item(item, n) => Ok(match (self.pick)(item) {
                     Carry::Through(item) => {
-                        self.spans.skip(n);
+                        let unit = self.take_unit(n);
+                        self.spans.skip(unit);
                         Step::Item(Layered::Outer(item), n)
                     }
                     Carry::Drop => {
-                        self.spans.skip(n);
+                        let unit = self.take_unit(n);
+                        self.spans.skip(unit);
                         Step::Skip(n)
                     }
                     Carry::Bytes(bytes) => {
@@ -344,17 +343,20 @@ where
                                 limit: self.payload_limit,
                             });
                         }
-                        self.spans.push(n, bytes.len());
+                        let unit = self.take_unit(n);
+                        self.spans.push(unit, bytes.len());
                         self.pending = bytes;
                         Step::Skip(n)
                     }
                 }),
                 Step::Skip(n) => {
-                    self.spans.skip(n);
+                    self.unit = self.unit.saturating_add(n);
                     Ok(Step::Skip(n))
                 }
                 Step::Need if !(eof && input.is_empty()) => Ok(Step::Need),
                 Step::Need | Step::End => {
+                    let unit = self.take_unit(0);
+                    self.spans.skip(unit);
                     self.outer_ended = true;
                     self.inner.end();
                     self.inner_ready = true;

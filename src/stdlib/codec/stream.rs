@@ -71,6 +71,7 @@ impl<D: Decode> Stream<D> {
         if self.done || self.eof {
             return bytes.len();
         }
+        self.sync_limit();
         self.buf.push(bytes)
     }
     /// Offers direct read space. Empty after EOF or completion.
@@ -78,6 +79,7 @@ impl<D: Decode> Stream<D> {
         if self.done || self.eof {
             &mut []
         } else {
+            self.sync_limit();
             self.buf.spare()
         }
     }
@@ -117,10 +119,18 @@ impl<D: Decode> Stream<D> {
     pub fn failed(&self) -> Option<&Fail<D::Error>> {
         self.failed.as_ref()
     }
-    /// Access to mode changes between items. Capacity changes must remain
-    /// within the existing buffer limit.
+    /// Access to mode changes between items. A raised capacity raises the
+    /// buffer limit before the next push, spare offer, or decode.
     pub fn decoder(&mut self) -> &mut D {
         &mut self.dec
+    }
+    /// Raises the buffer limit to the decoder's capacity. Never lowers it.
+    /// The buffer clamps to [`Buffer::MAX_LIMIT`] and allocates on demand.
+    fn sync_limit(&mut self) {
+        let cap = self.dec.capacity();
+        if cap > self.buf.limit() {
+            self.buf.set_limit(cap);
+        }
     }
     /// Hands the same unread bytes and offset to a new decoder. Preserves
     /// EOF and clears terminal status. The new capacity becomes the buffer
@@ -177,6 +187,7 @@ where
         if self.done {
             return None;
         }
+        self.sync_limit();
         let mut zero_budget = None;
         loop {
             let before = self.dec.held();

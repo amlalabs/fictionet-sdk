@@ -721,19 +721,25 @@ fn pipe_inner_skips_and_early_end() {
     ));
 }
 #[test]
-fn spans_exact_coarse_gaps_eviction_and_zero_retention() {
+fn spans_coarse_gaps_eviction_and_zero_retention() {
     let mut spans = Spans::new(3);
     spans.push(3, 3);
     spans.push(2, 2);
-    assert_eq!(spans.locate(1..4), Some(1..4));
+    // Equal lengths are still coarse: only whole spans resolve.
+    assert_eq!(spans.locate(1..4), None);
+    assert_eq!(spans.locate(0..3), Some(0..3));
+    assert_eq!(spans.locate(0..5), Some(0..5));
     spans.skip(2);
     spans.push(3, 3);
     assert_eq!(spans.locate(4..7), None);
-    assert_eq!(spans.locate(5..7), Some(7..9));
+    assert_eq!(spans.locate(5..7), None);
+    assert_eq!(spans.locate(5..8), Some(7..10));
+    assert_eq!(spans.locate(3..8), None);
     spans.push(5, 2);
     assert_eq!(spans.len(), 3);
     assert_eq!(spans.locate(0..1), None);
     assert_eq!(spans.locate(8..10), Some(10..15));
+    assert_eq!(spans.locate(5..10), Some(7..15));
     assert_eq!(spans.locate(8..9), None);
     assert_eq!(spans.locate(8..8), None);
     let mut disabled = Spans::new(0);
@@ -1864,4 +1870,90 @@ fn pipe_inner_mode_change_resumes_waiting_decoder() {
     s.decoder().inner().0 = true;
     assert_eq!(s.next(), Some(Ok(Layered::Inner(vec![b'a']))));
     finish(&mut s, |_| panic!("unexpected item")).unwrap();
+}
+
+// Header mode: capacity 4, one-byte items. Body mode: capacity 10, one 10-byte item.
+struct HeaderBody(bool);
+impl Decode for HeaderBody {
+    type Item = Vec<u8>;
+    type Error = TestError;
+    const NAME: &'static str = "header body";
+    fn capacity(&self) -> usize {
+        if self.0 { 10 } else { 4 }
+    }
+    fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Vec<u8>>, TestError> {
+        let n = if self.0 { 10 } else { 1 };
+        Ok(match input.get(..n) {
+            Some(b) => Step::Item(b.to_vec(), n),
+            None => Step::Need,
+        })
+    }
+}
+#[test]
+fn regression_buffer_limit_follows_raised_capacity() {
+    let mut s = Stream::new(HeaderBody(false));
+    let mut items = Vec::new();
+    assert_eq!(pump(&mut s, &[1], |i| items.push(i)), Ok(1));
+    s.decoder().0 = true;
+    assert_eq!(pump(&mut s, &[7; 10], |i| items.push(i)), Ok(10));
+    assert_eq!(items, vec![vec![1], vec![7; 10]]);
+    finish(&mut s, |_| panic!("unexpected item")).unwrap();
+
+    // Direct reads see the raised limit too.
+    let mut s = Stream::new(HeaderBody(false));
+    assert_eq!(s.push(&[1]), 1);
+    assert_eq!(s.next(), Some(Ok(vec![1])));
+    s.decoder().0 = true;
+    assert_eq!(s.spare().len(), 10);
+}
+#[test]
+fn regression_pipe_inner_limit_follows_raised_capacity() {
+    let mut s = Stream::new(Pipe::new(Frames, HeaderBody(false), Carry::Bytes));
+    let mut items = Vec::new();
+    assert_eq!(pump(&mut s, &[1, 0], |i| items.push(i)), Ok(2));
+    s.decoder().inner().0 = true;
+    let mut data = vec![7];
+    data.extend_from_slice(&[7; 7]);
+    data.push(3);
+    data.extend_from_slice(&[7; 3]);
+    assert_eq!(pump(&mut s, &data, |i| items.push(i)), Ok(data.len()));
+    finish(&mut s, |_| panic!("unexpected item")).unwrap();
+    assert_eq!(
+        items,
+        vec![Layered::Inner(vec![0]), Layered::Inner(vec![7; 10])]
+    );
+}
+#[test]
+fn regression_pipe_spans_cover_assembled_message() {
+    let mut s = Stream::new(Pipe::with_limits(
+        Assemble::new(Frames, 64, fragments),
+        Pairs,
+        |item: Assembled<Vec<u8>>| match item {
+            Assembled::Message(bytes) => Carry::Bytes(bytes),
+            Assembled::Whole(item) => Carry::Through(Assembled::Whole(item)),
+        },
+        64,
+        16,
+    ));
+    let mut items = Vec::new();
+    let data = [3, 0, b'a', b'b', 3, 1, b'c', b'd'];
+    assert_eq!(pump(&mut s, &data, |i| items.push(i)), Ok(8));
+    finish(&mut s, |_| panic!("unexpected item")).unwrap();
+    assert_eq!(
+        items,
+        vec![
+            Layered::Inner(b"ab".to_vec()),
+            Layered::Inner(b"cd".to_vec())
+        ]
+    );
+    let spans = s.decoder().spans();
+    assert_eq!(
+        spans.iter().cloned().collect::<Vec<_>>(),
+        vec![Span {
+            inner: 0..4,
+            outer: 0..8
+        }]
+    );
+    assert_eq!(spans.locate(0..1), None);
+    assert_eq!(spans.locate(0..4), Some(0..8));
 }
