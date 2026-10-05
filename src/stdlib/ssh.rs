@@ -30,6 +30,11 @@
 //! bytes it likes. Every buffer is bounded by a named limit, such as
 //! [`MAX_PACKET`], [`MAX_BANNER_LINES`] and [`DECODER_CAPACITY`].
 //!
+//! After the version exchange, [`Frames`] works with [`super::codec::Stream`]
+//! and [`Packet`] implements [`super::codec::Wire`] with exact padding.
+//! The legacy [`Decoder`] keeps its version exchange, sequence numbers,
+//! and repeating errors. Both APIs only parse cleartext packets.
+//!
 //! ```
 //! use fictionet::stdlib::ssh::{Decoder, Event, Identification, KexInit, Message, Packet};
 //!
@@ -61,6 +66,8 @@
 //! // Packets are padded to a multiple of 8 bytes.
 //! assert_eq!(Packet::new(vec![21]).to_bytes().len(), 16);
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port SSH servers listen on.
 pub const PORT: u16 = 22;
@@ -436,6 +443,146 @@ impl Packet {
         out.extend_from_slice(given);
         out.resize(4 + length, 0);
         out
+    }
+}
+
+/// Why an exact [`Wire`] parse did not read one cleartext binary packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// A binary packet header is invalid.
+    Packet(StreamError),
+    /// The input ended before a complete packet.
+    Truncated,
+    /// Bytes follow the first packet.
+    Trailing,
+}
+
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete SSH binary packet"),
+            Self::Trailing => f.write_str("bytes follow the SSH binary packet"),
+        }
+    }
+}
+
+impl core::error::Error for PacketParseError {}
+
+/// A cleartext packet cannot be written without changing its value.
+///
+/// Payloads must fit [`MAX_PAYLOAD`]. Padding must contain 4 to 255 bytes.
+/// The total, including the five header bytes, must be a multiple of
+/// [`BLOCK`] within [`MIN_PACKET`] through [`MAX_PACKET`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PacketWriteError;
+
+impl core::fmt::Display for PacketWriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("SSH packet payload or padding cannot be represented")
+    }
+}
+
+impl core::error::Error for PacketWriteError {}
+
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = PacketWriteError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
+        match Packet::parse(bytes).map_err(PacketParseError::Packet)? {
+            Some((packet, used)) if used == bytes.len() => Ok(packet),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Truncated),
+        }
+    }
+
+    /// Appends the packet with its exact padding. Unlike [`Packet::to_bytes`],
+    /// this refuses missing padding and oversized payloads. In particular,
+    /// [`Packet::new`] needs explicit padding before this writer accepts it.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketWriteError> {
+        let pad = u8::try_from(self.padding.len()).map_err(|_| PacketWriteError)?;
+        let total = 5usize
+            .checked_add(self.payload.len())
+            .and_then(|n| n.checked_add(self.padding.len()))
+            .ok_or(PacketWriteError)?;
+        if self.payload.len() > MAX_PAYLOAD
+            || pad < MIN_PADDING
+            || !(MIN_PACKET..=MAX_PACKET).contains(&total)
+            || !total.is_multiple_of(BLOCK)
+        {
+            return Err(PacketWriteError);
+        }
+        let length = u32::try_from(total.saturating_sub(4)).map_err(|_| PacketWriteError)?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.push(pad);
+        out.extend_from_slice(&self.payload);
+        out.extend_from_slice(&self.padding);
+        Ok(())
+    }
+}
+
+/// Reads cleartext binary packets after the SSH version exchange.
+///
+/// This decoder owns no input. Its capacity is the configured packet
+/// limit, including the length field. Oversized packets are refused from
+/// their four-byte length. Partial packets return [`Step::Need`], including
+/// at EOF, so [`super::codec::Stream`] reports truncation.
+/// Use [`parse_line`] or [`Decoder`] for the bounded version exchange.
+/// Stop using this framer when keys take effect. It performs no encryption
+/// or MAC processing. Payload messages are parsed separately by [`Message::parse`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a framer with [`MAX_PACKET`] as its total packet limit.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Sets the total packet limit, including the four-byte length field.
+    /// Clamps it to [`MIN_PACKET`] through [`MAX_PACKET`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.clamp(MIN_PACKET, MAX_PACKET),
+        }
+    }
+
+    /// The largest accepted packet, including its length field.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = StreamError;
+    const NAME: &'static str = "SSH cleartext packets";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, StreamError> {
+        if let Some(&[a, b, c, d]) = input.get(..4) {
+            let length = u32::from_be_bytes([a, b, c, d]);
+            let total = usize::try_from(length).ok().and_then(|n| n.checked_add(4));
+            if total.is_none_or(|n| n > self.limit) {
+                return Err(StreamError::PacketLength(length));
+            }
+        }
+        Ok(match Packet::parse(input)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
     }
 }
 

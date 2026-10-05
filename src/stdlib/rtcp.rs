@@ -36,6 +36,11 @@
 //! bytes it likes. Writers return an [`EncodeError`] rather than write
 //! bytes a reader would refuse or read back as something else.
 //!
+//! New stream stacks use [`Frames`] and [`super::codec::Stream`].
+//! [`Frame`] implements [`super::codec::Wire`] for RFC 4571 envelopes;
+//! [`Packet`] implements it for exact single RTCP packets. The legacy
+//! [`Decoder`] retains its infallible raw-frame API and cloneable state.
+//!
 //! ```
 //! use fictionet::stdlib::rtcp::{
 //!     Body, Demux, Nack, Packet, PayloadFeedback, PayloadMessage, ReceiverReport, SdesChunk, SdesItem,
@@ -190,6 +195,8 @@ pub mod xr {
     /// VoIP metrics.
     pub const VOIP_METRICS: u8 = 7;
 }
+
+use super::codec::{Decode, Step, Wire};
 
 /// One RTCP packet: what it carries, and how many bytes of padding follow.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1267,6 +1274,44 @@ impl Packet {
     }
 }
 
+/// Why an exact [`Wire`] parse did not read one RTCP packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// The packet header or body is invalid or incomplete.
+    Packet(ParseError),
+    /// Bytes follow the first packet.
+    Trailing,
+}
+
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Trailing => f.write_str("bytes follow the RTCP packet"),
+        }
+    }
+}
+
+impl core::error::Error for PacketParseError {}
+
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = EncodeError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, PacketParseError> {
+        let (packet, used) = Packet::parse(bytes).map_err(PacketParseError::Packet)?;
+        if used != bytes.len() {
+            return Err(PacketParseError::Trailing);
+        }
+        Ok(packet)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
 /// Reads every packet in an RTCP datagram, in order. It checks each
 /// packet's header, length, padding and contents, and that the lengths add
 /// up to the datagram's, but not the rules for compound packets; see
@@ -1399,6 +1444,155 @@ pub fn frame(datagram: &[u8]) -> Result<Vec<u8>, EncodeError> {
     out.extend_from_slice(&n.to_be_bytes());
     out.extend_from_slice(datagram);
     Ok(out)
+}
+
+/// One RFC 4571 envelope, with its two-byte length prefix omitted.
+///
+/// [`Wire`] includes the prefix. Payloads are opaque and bounded by
+/// [`MAX_FRAME`]. An empty payload is a null frame. For RTCP, map nonempty
+/// payloads through [`parse_packets`] or [`parse_compound`]. For RTP, use
+/// [`super::rtp::RtpPacket::parse`]. A payload parse error leaves framing intact.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Frame(
+    /// Datagram bytes, or an empty vector for a null frame.
+    pub Vec<u8>,
+);
+
+/// An RFC 4571 length prefix exceeds the configured payload limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FrameError {
+    /// The declared payload length.
+    pub length: usize,
+    /// The maximum accepted payload length.
+    pub limit: usize,
+}
+
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "RFC 4571 payload of {} bytes, over {}",
+            self.length, self.limit
+        )
+    }
+}
+
+impl core::error::Error for FrameError {}
+
+/// Why an exact RFC 4571 envelope parse failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The payload length exceeds its limit.
+    Frame(FrameError),
+    /// The input ended before a complete envelope.
+    Truncated,
+    /// Bytes follow the first envelope.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete RFC 4571 envelope"),
+            Self::Trailing => f.write_str("bytes follow the RFC 4571 envelope"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = FrameError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Frames::new()
+            .decode(bytes, true)
+            .map_err(FrameParseError::Frame)?
+        {
+            Step::Item(frame, used) if used == bytes.len() => Ok(frame),
+            Step::Item(_, _) => Err(FrameParseError::Trailing),
+            _ => Err(FrameParseError::Truncated),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+        let length = u16::try_from(self.0.len()).map_err(|_| FrameError {
+            length: self.0.len(),
+            limit: MAX_FRAME,
+        })?;
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+/// Reads RFC 4571 envelopes for RTP or RTCP without retaining input.
+///
+/// Each item is one opaque datagram, including empty null frames. Capacity
+/// is two bytes plus the payload limit. A length over that limit is refused
+/// from the prefix. Partial frames return [`Step::Need`], including at EOF,
+/// so [`super::codec::Stream`] reports truncation. RTCP body errors belong
+/// in a mapping through [`parse_packets`], where they do not end framing.
+/// This type is also exported as [`super::rtp::Frames`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Creates a framer accepting payloads up to [`MAX_FRAME`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_FRAME)
+    }
+
+    /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts
+    /// only null frames. The two-byte prefix is excluded from this limit.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_FRAME),
+        }
+    }
+
+    /// The largest accepted datagram, excluding its length prefix.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "RTP/RTCP RFC 4571";
+
+    fn capacity(&self) -> usize {
+        2usize.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        let Some(&[hi, lo]) = input.get(..2) else {
+            return Ok(Step::Need);
+        };
+        let length = usize::from(u16::from_be_bytes([hi, lo]));
+        if length > self.limit {
+            return Err(FrameError {
+                length,
+                limit: self.limit,
+            });
+        }
+        let used = 2usize.saturating_add(length);
+        Ok(match input.get(2..used) {
+            Some(bytes) => Step::Item(Frame(bytes.to_vec()), used),
+            None => Step::Need,
+        })
+    }
 }
 
 /// Splits an RFC 4571 byte stream into datagrams. Feed it the bytes a

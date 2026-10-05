@@ -2,6 +2,8 @@
 //! UDP datagrams and RFC 4571 streams.
 #![no_main]
 
+use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::rtp::{Frame, Frames};
 use fictionet::stdlib::rtp::{
     Decoder, MAX_BUFFERED, MAX_PACKET, Packet, RtpPacket, check_compound, parse_compound,
     parse_packets, write_compound, write_packets,
@@ -9,6 +11,28 @@ use fictionet::stdlib::rtp::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_decode(|| Frames::new().map(|frame| RtpPacket::parse(&frame.0)), data);
+    contract::check_wire::<Frame>(data);
+    contract::check_wire::<RtpPacket>(data);
+    let envelope = Frame(data.get(..MAX_PACKET + 1).unwrap_or(data).to_vec());
+    contract::check_wire_value(&envelope);
+    if let Ok(bytes) = Wire::to_bytes(&envelope) {
+        contract::check_wire::<Frame>(&bytes);
+    }
+    contract::check_wire_value(&RtpPacket {
+        marker: false,
+        payload_type: data.first().copied().unwrap_or(0),
+        sequence: 0,
+        timestamp: 0,
+        ssrc: 0,
+        csrcs: vec![],
+        extension: None,
+        payload: data.get(..MAX_PACKET).unwrap_or(data).to_vec(),
+        padding: data.get(1).copied().unwrap_or(0),
+    });
+
     // The bytes as one RTP datagram. A packet read can be written, never
     // longer, and reads back the same.
     if let Ok(mut p) = RtpPacket::parse(data) {
@@ -19,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
         // A payload far longer than any packet is cut, and never sizes
         // the writer's buffer.
         p.payload.resize(p.payload.len() + 2 * MAX_PACKET, 0x5a);
+        contract::check_wire_value(&p);
         let bytes = p.to_bytes();
         assert!(bytes.len() <= MAX_PACKET && bytes.capacity() <= MAX_PACKET);
         assert!(RtpPacket::parse(&bytes).is_ok());

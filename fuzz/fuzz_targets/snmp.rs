@@ -2,6 +2,8 @@
 //! world playing an agent reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::snmp::Frames;
 use fictionet::stdlib::snmp::{
     BasicPdu, Decoder, Element, Error, ErrorStatus, MAX_BUFFERED, MAX_MESSAGE, Message, Oid, Pdu, Value, VarBind,
     Version,
@@ -9,6 +11,10 @@ use fictionet::stdlib::snmp::{
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_wire::<Message>(data);
+
     // The bytes as one datagram.
     if let Ok(m) = Message::parse(data) {
         // A message read can be written, and reads back the same. Writing
@@ -42,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
             ],
         )),
     };
+    contract::check_wire_value(&built);
     match built.to_bytes() {
         Ok(b) => {
             assert_eq!(b.len(), built.encoded_len());
