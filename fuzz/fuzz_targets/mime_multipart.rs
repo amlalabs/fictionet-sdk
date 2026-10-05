@@ -3,9 +3,9 @@
 #![no_main]
 #![allow(deprecated)] // This target also checks the compatibility API.
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::mime_multipart::{Headers, Multipart, ParamValue, Parser, Part, boundary, valid_boundary};
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::contract;
 
 fuzz_target!(|data: &[u8]| {
     // The first byte picks how many of the next bytes are the boundary.
@@ -21,7 +21,10 @@ fuzz_target!(|data: &[u8]| {
         None => ("a".to_string(), data),
     };
 
-    contract::check_decode(|| fictionet::stdlib::mime_multipart::Frames::new(&bnd).unwrap(), data);
+    contract::check_decode(
+        || fictionet::stdlib::mime_multipart::Parts::new(&bnd).unwrap(),
+        data,
+    );
     contract::check_wire::<Part>(data);
     // The body, read all at once and a byte at a time.
     let whole = Multipart::parse(data, &bnd);
@@ -78,7 +81,9 @@ fuzz_target!(|data: &[u8]| {
             parts: vec![Part { headers: Headers { fields: vec![(name.into(), value.into())] }, body: Vec::new() }],
             ..Multipart::default()
         };
-        for p in &m.parts { contract::check_wire_value(p); }
+        for p in &m.parts {
+            contract::check_wire_value(p);
+        }
         if let Ok((b, bytes)) = m.write(&bnd) {
             assert_eq!(Multipart::parse(&bytes, &b).as_ref(), Ok(&m));
         }

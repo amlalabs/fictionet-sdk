@@ -6,9 +6,9 @@
 //! module follows W3C Extensible Markup Language (XML) 1.0, Fifth Edition,
 //! and Namespaces in XML 1.0, Third Edition.
 //!
-//! Nothing here reads a socket. A world feeds the bytes of a body to a
-//! [`Parser`], as they arrive, and takes [`Event`]s out: the declaration,
-//! start and end tags with their attributes, text, CDATA sections,
+//! Nothing here reads a socket. A world feeds the bytes of a body to
+//! [`Events`] through [`codec::Stream`], as they arrive, and takes [`Event`]s
+//! out: the declaration, start and end tags with their attributes, text, CDATA sections,
 //! comments and processing instructions. Names come back with their
 //! namespaces resolved. A [`Writer`] builds a document from the same
 //! pieces and escapes what needs escaping.
@@ -30,25 +30,24 @@
 //! from a DTD count toward the size cap too, so a short declaration used on
 //! many elements cannot grow the events past it.
 //!
-//! Use [`Frames`] with [`codec::Stream`] for bounded event decoding.
-//! [`Frame`] implements [`Wire`] for complete documents without losing bytes.
+//! Use [`Events`] with [`codec::Stream`] for bounded event decoding.
+//! [`Document`] implements [`Wire`] for complete documents without losing bytes.
 //! The deprecated [`Parser`] keeps its original buffering and errors.
 //!
 //! ```
-//! # #![allow(deprecated)]
-//! use fictionet::stdlib::xml::{Event, Parser, Writer};
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::xml::{Event, Events, Writer};
 //!
-//! let mut parser = Parser::new();
-//! parser.feed(br#"<?xml version="1.0"?>
+//! let mut stream = Stream::new(Events::new());
+//! let body = br#"<?xml version="1.0"?>
 //! <s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope">
 //!   <s:Body><price currency="EUR">3 &lt; 4</price></s:Body>
-//! </s:Envelope>"#);
-//! parser.finish();
+//! </s:Envelope>"#;
 //! let mut currency = None;
 //! let mut text = String::new();
 //! let mut inside_price = false;
-//! while let Some(event) = parser.next_event() {
-//!     match event.unwrap() {
+//! let mut on_event = |event| {
+//!     match event {
 //!         Event::Start(start) if start.name.local == "price" => {
 //!             currency = start.attribute(None, "currency").map(String::from);
 //!             inside_price = true;
@@ -60,8 +59,12 @@
 //!         Event::End(_) => inside_price = false,
 //!         _ => {}
 //!     }
+//! };
+//! for chunk in body.chunks(32) {
+//!     pump(&mut stream, chunk, &mut on_event).unwrap();
 //! }
-//! assert!(parser.is_done());
+//! finish(&mut stream, &mut on_event).unwrap();
+//! assert!(stream.is_done());
 //! assert_eq!(currency.as_deref(), Some("EUR"));
 //! assert_eq!(text, "3 < 4");
 //!
@@ -103,6 +106,7 @@ pub const XMLNS_NAMESPACE: &str = "http://www.w3.org/2000/xmlns/";
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
+use std::collections::HashMap;
 
 /// A name as written, split at its colon, with the namespace it resolves
 /// to.
@@ -262,8 +266,6 @@ pub enum ErrorKind {
     /// The input ended inside markup, with elements still open, or before
     /// any root element.
     UnexpectedEnd,
-    /// EOF arrived with an element still open in [`Frames`].
-    Incomplete,
     /// The document is longer than [`MAX_DOCUMENT`], or the attribute
     /// defaults it supplies add up to more than that. For a [`Writer`], the
     /// piece would not fit with the end tags of the open elements.
@@ -302,7 +304,6 @@ impl core::fmt::Display for ErrorKind {
             ErrorKind::UndeclaredPrefix => "an undeclared namespace prefix",
             ErrorKind::BadNamespace => "a forbidden namespace declaration",
             ErrorKind::UnexpectedEnd => "the input ended early",
-            ErrorKind::Incomplete => "the input ended with an open element",
             ErrorKind::TooLarge => "a document over the size limit",
             ErrorKind::TooDeep => "elements nested past the depth limit",
             ErrorKind::NameTooLong => "a name over the length limit",
@@ -339,12 +340,12 @@ impl core::error::Error for Error {}
 /// intentionally omits. [`Wire`] validates the complete document and
 /// refuses trailing content outside XML's document grammar.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Frame {
+pub struct Document {
     /// The document bytes, bounded by [`MAX_DOCUMENT`] when parsed or written.
     pub data: Vec<u8>,
 }
 
-impl Wire for Frame {
+impl Wire for Document {
     type ParseError = Error;
     type WriteError = Error;
 
@@ -367,13 +368,27 @@ impl Wire for Frame {
 /// The document and each token are bounded by [`MAX_DOCUMENT`]. Scanning
 /// resumes where it stopped when more bytes arrive. EOF completes final
 /// text. Partial markup returns [`codec::Step::Need`]; an open element
-/// returns [`ErrorKind::Incomplete`]. Syntax and limit errors are terminal.
+/// returns [`ErrorKind::UnexpectedEnd`]. Syntax and limit errors are terminal.
 /// Capacity is [`MAX_DOCUMENT`] plus one byte to detect overflow.
 /// Use [`codec::Stream`] for bounded buffering and one-time errors.
+/// An empty stream ends cleanly with no items, unlike [`parse`], while
+/// whitespace-only input is an error.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, xml::{Event, Events}};
+///
+/// let mut stream = Stream::new(Events::new());
+/// let mut events = Vec::new();
+/// pump(&mut stream, b"<r>hi", |event| events.push(event))?;
+/// pump(&mut stream, b"</r>", |event| events.push(event))?;
+/// finish(&mut stream, |event| events.push(event))?;
+/// assert!(matches!(events.as_slice(),
+///     [Event::Start(_), Event::Text(text), Event::End(_)] if text == "hi"));
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::xml::Error>>(())
+/// ```
 #[derive(Clone, Debug, Default)]
-pub struct Frames {
+pub struct Events {
     offset: usize,
-    state_held: usize,
     declarations_held: usize,
     bom_checked: bool,
     pending: Option<Event>,
@@ -381,7 +396,7 @@ pub struct Frames {
     doc: Doc,
 }
 
-impl Frames {
+impl Events {
     /// Starts a document within the module's named limits.
     pub fn new() -> Self {
         Self::default()
@@ -395,35 +410,23 @@ impl Frames {
     }
 
     fn consume(&mut self, n: usize) {
-        self.offset += n;
+        self.offset = self.offset.saturating_add(n);
         self.scan = Scan::default();
-        self.update_held();
     }
 
-    fn update_held(&mut self) {
-        // Shared namespace text is counted once in interned. Names and
-        // bindings are bounded by the document, depth, and namespace caps.
-        let names = self.doc.stack.iter().fold(0usize, |n, open| {
-            n.saturating_add(open.qname.len())
-                .saturating_add(open.name.local.len())
-                .saturating_add(open.name.prefix.as_ref().map_or(0, String::len))
-                .saturating_add(open.bound.iter().map(String::len).sum::<usize>())
-        });
-        let namespaces = self.doc.interned.keys().map(|s| s.len()).sum::<usize>();
-        let prefixes = self.doc.scope.keys().map(String::len).sum::<usize>();
+    fn state_held(&self) -> usize {
         let pending = match &self.pending {
-            Some(Event::End(n)) => {
-                n.local.len()
-                    + n.prefix.as_ref().map_or(0, String::len)
-                    + n.namespace.as_ref().map_or(0, |s| s.len())
-            }
+            Some(Event::End(n)) => n
+                .local
+                .len()
+                .saturating_add(n.prefix.as_ref().map_or(0, String::len))
+                .saturating_add(n.namespace.as_ref().map_or(0, |s| s.len())),
             _ => 0,
         };
-        self.state_held = names
-            .saturating_add(namespaces)
-            .saturating_add(prefixes)
+        self.doc
+            .state_held
             .saturating_add(self.declarations_held)
-            .saturating_add(pending);
+            .saturating_add(pending)
     }
 
     fn need(&self, input: &[u8], eof: bool) -> Result<codec::Step<Event>, Error> {
@@ -431,29 +434,29 @@ impl Frames {
             return Err(self.error(ErrorKind::TooLarge));
         }
         if eof && !self.doc.stack.is_empty() {
-            return Err(self.error(ErrorKind::Incomplete));
+            return Err(self.error(ErrorKind::UnexpectedEnd));
         }
         Ok(codec::Step::Need)
     }
 }
 
-impl Decode for Frames {
+impl Decode for Events {
     type Item = Event;
     type Error = Error;
     const NAME: &'static str = "XML";
 
     fn capacity(&self) -> usize {
-        MAX_DOCUMENT + 1
+        MAX_DOCUMENT.saturating_add(1)
     }
 
     fn held(&self) -> usize {
-        self.state_held
-            .saturating_add(XML_NAMESPACE.len() + XMLNS_NAMESPACE.len())
+        self.state_held()
+            .saturating_add(XML_NAMESPACE.len())
+            .saturating_add(XMLNS_NAMESPACE.len())
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Event>, Error> {
         if let Some(event) = self.pending.take() {
-            self.update_held();
             return Ok(codec::Step::Item(event, 0));
         }
         if input.is_empty() {
@@ -495,14 +498,16 @@ impl Decode for Frames {
         if kind == Kind::Doctype {
             // The DTD table is set once. Do not walk it on every token.
             self.declarations_held = self.doc.attlists.iter().fold(0usize, |n, (name, list)| {
+                let types = list
+                    .types
+                    .keys()
+                    .fold(0usize, |n, k| n.saturating_add(k.len()));
+                let defaults = list.defaults.iter().fold(0usize, |n, (k, v)| {
+                    n.saturating_add(k.len()).saturating_add(v.len())
+                });
                 n.saturating_add(name.len())
-                    .saturating_add(list.types.keys().map(String::len).sum::<usize>())
-                    .saturating_add(
-                        list.defaults
-                            .iter()
-                            .map(|(k, v)| k.len() + v.len())
-                            .sum::<usize>(),
-                    )
+                    .saturating_add(types)
+                    .saturating_add(defaults)
             });
         }
         if let Some(Event::Start(start)) = &event
@@ -530,7 +535,7 @@ impl Decode for Frames {
 /// parser holds at most [`MAX_DOCUMENT`] bytes, and scans each byte a
 /// bounded number of times, however the input arrives.
 #[derive(Clone, Debug, Default)]
-#[deprecated(note = "use codec::Stream with xml::Frames")]
+#[deprecated(note = "use codec::Stream with xml::Events")]
 pub struct Parser {
     buf: Vec<u8>,
     /// Where the next token starts in `buf`.
@@ -1656,6 +1661,8 @@ struct Open {
     /// The prefixes its own `xmlns` attributes bound, empty for the
     /// default namespace.
     bound: Vec<String>,
+    /// Bytes of owned names and prefixes, excluding shared namespace URIs.
+    held: usize,
 }
 
 /// The shape of a document so far: where in it we are, which elements are
@@ -1678,12 +1685,15 @@ struct Doc {
     doctype: bool,
     root_seen: bool,
     stack: Vec<Open>,
+    /// Owned stack names, bound prefixes, scope keys and interned URIs.
+    /// Updated only when the corresponding state is added or removed.
+    state_held: usize,
     scope: BTreeMap<String, Vec<Arc<str>>>,
     /// How many bindings are in scope, over all prefixes.
     bindings: usize,
     /// Each URI bound now, with the shared copy and how many bindings
     /// hold it.
-    interned: BTreeMap<Arc<str>, (Arc<str>, usize)>,
+    interned: HashMap<Arc<str>, (Arc<str>, usize)>,
     xml_ns: Arc<str>,
     xmlns_ns: Arc<str>,
     /// The attribute declarations of the internal subset, by element name.
@@ -1699,9 +1709,10 @@ impl Default for Doc {
             doctype: false,
             root_seen: false,
             stack: Vec::new(),
+            state_held: 0,
             scope: BTreeMap::new(),
             bindings: 0,
-            interned: BTreeMap::new(),
+            interned: HashMap::new(),
             xml_ns: Arc::from(XML_NAMESPACE),
             xmlns_ns: Arc::from(XMLNS_NAMESPACE),
             attlists: BTreeMap::new(),
@@ -1759,12 +1770,13 @@ impl Doc {
     /// a writer is given keep their copies.
     fn intern(&mut self, uri: &str, hints: &[Arc<str>]) -> Arc<str> {
         if let Some((shared, n)) = self.interned.get_mut(uri) {
-            *n += 1;
+            *n = n.saturating_add(1);
             return shared.clone();
         }
         let shared =
             hints.iter().find(|h| h.len() == uri.len() && ***h == *uri).cloned().unwrap_or_else(|| Arc::from(uri));
         self.interned.insert(shared.clone(), (shared.clone(), 1));
+        self.state_held = self.state_held.saturating_add(uri.len());
         shared
     }
 
@@ -1774,6 +1786,7 @@ impl Doc {
             *n = n.saturating_sub(1);
             if *n == 0 {
                 self.interned.remove(uri);
+                self.state_held = self.state_held.saturating_sub(uri.len());
             }
         }
     }
@@ -1787,6 +1800,7 @@ impl Doc {
                 self.bindings = self.bindings.saturating_sub(1);
                 if v.is_empty() {
                     self.scope.remove(p);
+                    self.state_held = self.state_held.saturating_sub(p.len());
                 }
             }
             if let Some(u) = gone {
@@ -1799,6 +1813,7 @@ impl Doc {
     /// they were before it.
     fn undo_start(&mut self, started: bool, root_seen: bool) {
         if let Some(open) = self.stack.pop() {
+            self.state_held = self.state_held.saturating_sub(open.held);
             self.unbind(&open.bound);
         }
         self.started = started;
@@ -1890,12 +1905,30 @@ impl Doc {
         let bound: Vec<String> = decls.iter().map(|(p, _)| p.clone()).collect();
         for (p, v) in decls {
             let u = self.intern(v, hints);
-            self.scope.entry(p).or_default().push(u);
-            self.bindings += 1;
+            let prefix_len = p.len();
+            let bindings = self.scope.entry(p).or_default();
+            if bindings.is_empty() {
+                self.state_held = self.state_held.saturating_add(prefix_len);
+            }
+            bindings.push(u);
+            self.bindings = self.bindings.saturating_add(1);
         }
         match self.resolve(prefix, local, &split, &attrs) {
             Ok(start) => {
-                self.stack.push(Open { qname: qname.to_string(), name: start.name.clone(), bound });
+                let held = bound.iter().fold(
+                    qname
+                        .len()
+                        .saturating_add(start.name.local.len())
+                        .saturating_add(start.name.prefix.as_ref().map_or(0, String::len)),
+                    |n, p| n.saturating_add(p.len()),
+                );
+                self.state_held = self.state_held.saturating_add(held);
+                self.stack.push(Open {
+                    qname: qname.to_string(),
+                    name: start.name.clone(),
+                    bound,
+                    held,
+                });
                 self.started = true;
                 self.root_seen = true;
                 self.defaulted = defaulted;
@@ -1952,6 +1985,7 @@ impl Doc {
             return Err(ErrorKind::MismatchedEnd);
         }
         let open = self.stack.pop().ok_or(ErrorKind::OutsideRoot)?;
+        self.state_held = self.state_held.saturating_sub(open.held);
         self.unbind(&open.bound);
         Ok(open.name)
     }
@@ -2308,6 +2342,134 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
 #[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_held_matches_state_fold() {
+        let input = br#"<!DOCTYPE r [<!ATTLIST r label CDATA "default">]><r xmlns="urn:default" xmlns:a="urn:shared" xmlns:b="urn:shared"><a:c xmlns:a="urn:inner" xmlns:c="urn:shared"><c:d xmlns="" xmlns:b="urn:other"/>text</a:c><b:e/></r>"#;
+        let mut decoder = Events::new();
+        let mut unread = input.as_slice();
+        let mut checkpoints = 0;
+        loop {
+            // The original accounting, independently folded from retained state.
+            let doc = &decoder.doc;
+            let names: usize = doc
+                .stack
+                .iter()
+                .map(|open| {
+                    open.qname.len()
+                        + open.name.local.len()
+                        + open.name.prefix.as_ref().map_or(0, String::len)
+                        + open.bound.iter().map(String::len).sum::<usize>()
+                })
+                .sum();
+            let declarations: usize = doc
+                .attlists
+                .iter()
+                .map(|(name, list)| {
+                    name.len()
+                        + list.types.keys().map(String::len).sum::<usize>()
+                        + list
+                            .defaults
+                            .iter()
+                            .map(|(k, v)| k.len() + v.len())
+                            .sum::<usize>()
+                })
+                .sum();
+            let pending = match &decoder.pending {
+                Some(Event::End(name)) => {
+                    name.local.len()
+                        + name.prefix.as_ref().map_or(0, String::len)
+                        + name.namespace.as_ref().map_or(0, |s| s.len())
+                }
+                _ => 0,
+            };
+            let expected = names
+                + declarations
+                + pending
+                + doc.interned.keys().map(|s| s.len()).sum::<usize>()
+                + doc.scope.keys().map(String::len).sum::<usize>()
+                + XML_NAMESPACE.len()
+                + XMLNS_NAMESPACE.len();
+            assert_eq!(decoder.held(), expected, "checkpoint {checkpoints}");
+            checkpoints += 1;
+            match decoder.decode(unread, true).unwrap() {
+                codec::Step::Item(_, used) | codec::Step::Skip(used) => unread = &unread[used..],
+                codec::Step::Need => break,
+                codec::Step::End => panic!("document ends with Need"),
+            }
+        }
+        assert!(checkpoints >= 10);
+        assert!(unread.is_empty());
+    }
+
+    #[test]
+    fn codec_held_restored_after_namespace_rollback() {
+        let mut doc = Doc::default();
+        doc.start("r", vec![("xmlns:a".into(), "urn:shared".into())], &[])
+            .unwrap();
+        let before = doc.state_held;
+        // The tag binds a shared URI and a new URI before resolution fails.
+        assert_eq!(
+            doc.start(
+                "missing:c",
+                vec![
+                    ("xmlns:b".into(), "urn:shared".into()),
+                    ("xmlns:a".into(), "urn:inner".into()),
+                ],
+                &[]
+            ),
+            Err(ErrorKind::UndeclaredPrefix)
+        );
+        assert_eq!(doc.state_held, before);
+        doc.start("a:c", vec![("xmlns:a".into(), "urn:inner".into())], &[])
+            .unwrap();
+        doc.undo_start(true, true);
+        assert_eq!(doc.state_held, before);
+        doc.end("r").unwrap();
+        assert_eq!(doc.state_held, 0);
+    }
+
+    #[test]
+    fn codec_namespace_heavy_decode_cost() {
+        use std::time::{Duration, Instant};
+
+        let mut document = String::new();
+        for level in 0..250 {
+            document.push_str("<a");
+            for prefix in 0..4 {
+                document.push_str(&format!(
+                    " xmlns:p{level}_{prefix}=\"urn:{level}:{prefix}\""
+                ));
+            }
+            document.push('>');
+        }
+        document.push_str(&"<b/>".repeat(40_000));
+        document.push_str(&"</a>".repeat(250));
+        let input = document.as_bytes();
+        let mut parsed = Duration::MAX;
+        let mut streamed = Duration::MAX;
+        for _ in 0..3 {
+            let start = Instant::now();
+            let events = parse(input).unwrap();
+            parsed = parsed.min(start.elapsed());
+            let expected = events.len();
+            drop(events);
+
+            let start = Instant::now();
+            let mut stream = codec::Stream::new(Events::new());
+            let mut events = Vec::new();
+            for chunk in input.chunks(64 * 1024) {
+                codec::pump(&mut stream, chunk, |event| events.push(event)).unwrap();
+            }
+            codec::finish(&mut stream, |event| events.push(event)).unwrap();
+            streamed = streamed.min(start.elapsed());
+            assert_eq!(events.len(), expected);
+        }
+        assert!(
+            streamed < parsed * 5,
+            "stream {streamed:?}, parse {parsed:?}"
+        );
+    }
 
     /// Feeds `chunks` in order, then finishes, taking events out after
     /// each piece. It returns the events and the error, if any.

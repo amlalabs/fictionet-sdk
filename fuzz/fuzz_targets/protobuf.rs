@@ -5,9 +5,9 @@
 
 use std::collections::BTreeMap;
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::protobuf::{Decoder, Frame, Framing, MAX_BUFFERED, MAX_FIELDS, Message, Value};
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::contract;
 
 // Counts fields as MAX_FIELDS does: group members included.
 fn total_fields(m: &Message) -> usize {

@@ -21,7 +21,8 @@
 //! come packed or one by one.
 //!
 //! Nothing here reads a socket. A world that plays a gRPC server takes
-//! the request body from its HTTP/2 stream, feeds it to a [`Decoder`],
+//! the request body from its HTTP/2 stream, feeds it to [`Frames`] through
+//! [`super::codec::Stream`],
 //! parses each [`Frame`]'s data as a [`Message`], and writes the reply's
 //! bytes back. Every reader checks lengths and limits, because the agent
 //! can send any bytes it likes. Messages are capped at [`MAX_MESSAGE`]
@@ -34,14 +35,17 @@
 //! The deprecated [`Decoder`] keeps its original buffering and errors.
 //!
 //! ```
-//! # #![allow(deprecated)]
-//! use fictionet::stdlib::protobuf::{Decoder, Frame, Framing, Message};
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::protobuf::{Frame, Frames, Framing, Message};
 //!
 //! // A gRPC request carrying `{ name: "tank-3", level: 150 }`, where
 //! // name is field 1 (a string) and level is field 2 (an int32).
-//! let mut decoder = Decoder::new(Framing::Grpc);
-//! decoder.feed(&[0, 0, 0, 0, 11, 0x0a, 6, b't', b'a', b'n', b'k', b'-', b'3', 0x10, 0x96, 0x01]);
-//! let frame = decoder.next_frame().unwrap().unwrap();
+//! let mut stream = Stream::new(Frames::new(Framing::Grpc));
+//! let bytes = [0, 0, 0, 0, 11, 0x0a, 6, b't', b'a', b'n', b'k', b'-', b'3', 0x10, 0x96, 0x01];
+//! let mut frames = Vec::new();
+//! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+//! finish(&mut stream, |frame| frames.push(frame)).unwrap();
+//! let frame = frames.pop().unwrap();
 //! assert!(!frame.compressed);
 //! let request = Message::parse(&frame.data).unwrap();
 //! assert_eq!(request.string(1), Ok(Some("tank-3")));
@@ -941,25 +945,33 @@ impl Wire for Message {
 
 /// Reads length-prefixed frames without retaining input bytes.
 ///
-/// The gRPC form delegates to [`super::grpc::Messages`]. Malformed headers
-/// and oversized lengths end the stream. Incomplete frames return
+/// Both framings use [`Frame::parse`]. Malformed headers and oversized
+/// lengths end the stream. Incomplete frames return
 /// [`Step::Need`], including at EOF. Capacity is [`MAX_MESSAGE`] plus
 /// [`GRPC_HEADER_LEN`] or [`MAX_VARINT_LEN`], according to the framing.
 /// Map items through [`Message::parse`]
 /// to handle payload errors per item. Use [`codec::Stream`](super::codec::Stream) for bounded input.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protobuf::{Frame, Frames, Framing}};
+///
+/// let mut stream = Stream::new(Frames::new(Framing::Delimited));
+/// let mut frames = Vec::new();
+/// pump(&mut stream, &[2, 0x08], |frame| frames.push(frame))?;
+/// pump(&mut stream, &[1], |frame| frames.push(frame))?;
+/// finish(&mut stream, |frame| frames.push(frame))?;
+/// assert_eq!(frames, vec![Frame { compressed: false, data: vec![0x08, 1] }]);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protobuf::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
     framing: Framing,
-    grpc: super::grpc::Messages,
 }
 
 impl Frames {
     /// Reads `framing` with bodies bounded by [`MAX_MESSAGE`].
     pub fn new(framing: Framing) -> Self {
-        Self {
-            framing,
-            grpc: super::grpc::Messages::with_limit(MAX_MESSAGE),
-        }
+        Self { framing }
     }
 
     /// The framing this decoder reads.
@@ -975,29 +987,12 @@ impl Decode for Frames {
 
     fn capacity(&self) -> usize {
         match self.framing {
-            Framing::Grpc => self.grpc.capacity(),
-            Framing::Delimited => MAX_VARINT_LEN + MAX_MESSAGE,
+            Framing::Grpc => GRPC_HEADER_LEN.saturating_add(MAX_MESSAGE),
+            Framing::Delimited => MAX_VARINT_LEN.saturating_add(MAX_MESSAGE),
         }
     }
 
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Frame>, Error> {
-        if self.framing == Framing::Grpc {
-            return match self.grpc.decode(input, eof) {
-                Ok(Step::Item(m, n)) => Ok(Step::Item(
-                    Frame {
-                        compressed: m.compressed,
-                        data: m.data,
-                    },
-                    n,
-                )),
-                Ok(Step::Skip(n)) => Ok(Step::Skip(n)),
-                Ok(Step::Need) => Ok(Step::Need),
-                Ok(Step::End) => Ok(Step::End),
-                Err(super::grpc::FrameError::Flag(b)) => Err(Error::Flag(b)),
-                Err(super::grpc::FrameError::TooLarge { .. }) => Err(Error::TooLong),
-                Err(super::grpc::FrameError::Truncated { .. }) => Err(Error::Truncated),
-            };
-        }
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
         Ok(match Frame::parse(self.framing, input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,

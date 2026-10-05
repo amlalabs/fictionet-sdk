@@ -21,7 +21,7 @@
 //! picks a boundary that appears nowhere in the parts, so what it writes
 //! always reads back the same.
 //!
-//! Use [`Frames`] with [`super::codec::Stream`] for bounded complete parts.
+//! Use [`Parts`] with [`super::codec::Stream`] for bounded complete parts.
 //! [`Part`] implements [`Wire`] for a header block and its body. Boundaries
 //! remain explicit configuration. The deprecated [`Parser`] keeps its
 //! original buffering and event behavior.
@@ -121,8 +121,6 @@ pub enum Error {
     Padding,
     /// A codec part or preamble is longer than [`MAX_PART`].
     TooLong,
-    /// EOF arrived before a multipart body was closed in [`Frames`].
-    Incomplete,
 }
 
 impl core::fmt::Display for Error {
@@ -136,7 +134,6 @@ impl core::fmt::Display for Error {
             Error::Header => "malformed multipart part header",
             Error::Padding => "multipart boundary line has too much padding",
             Error::TooLong => "multipart part or preamble is over the codec size limit",
-            Error::Incomplete => "multipart body is not closed",
         })
     }
 }
@@ -584,7 +581,7 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
         input
             .get(from..limit)
             .and_then(|r| find(r, b"\r\n\r\n"))
-            .map(|i| from + i + 4)
+            .map(|i| from.saturating_add(i).saturating_add(4))
     };
     if end.is_none() && input.len() >= MAX_HEADER_BYTES {
         return Err(Error::HeaderTooLong);
@@ -598,19 +595,35 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
 /// body, so chunking does not change items. Each part and the preamble are
 /// bounded by [`MAX_PART`]. EOF may finish a closing boundary without CR LF.
 /// A partial header returns [`Step::Need`]. An unclosed body returns
-/// [`Error::Incomplete`]. Other syntax and limit errors also end the stream.
+/// [`Error::Truncated`]. Other syntax and limit errors also end the stream.
 /// Capacity is [`MAX_PART`] plus [`MAX_BOUNDARY_LINE`] plus one overflow byte.
 /// Use [`codec::Stream`](super::codec::Stream) to hold the bounded input.
+/// An empty stream ends cleanly with no items, unlike [`Multipart::parse`],
+/// while a preamble-only body is an error.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, mime_multipart::Parts};
+///
+/// let mut stream = Stream::new(Parts::new("b").unwrap());
+/// let mut parts = Vec::new();
+/// pump(&mut stream, b"--b\r\n\r\nhello", |part| parts.push(part))?;
+/// pump(&mut stream, b"\r\n--b--\r\n", |part| parts.push(part))?;
+/// finish(&mut stream, |part| parts.push(part))?;
+/// assert_eq!(parts.len(), 1);
+/// assert_eq!(parts[0].body, b"hello");
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::mime_multipart::Error>>(())
+/// ```
 #[derive(Clone, Debug)]
-pub struct Frames {
+pub struct Parts {
     delim: Vec<u8>,
     state: State,
     scanned: usize,
+    preamble_bytes: usize,
     header_end: Option<usize>,
     parts: usize,
 }
 
-impl Frames {
+impl Parts {
     /// Starts a body with the supplied RFC 2046 boundary, without `--`.
     pub fn new(boundary: &str) -> Result<Self, Error> {
         if !valid_boundary(boundary) {
@@ -622,6 +635,7 @@ impl Frames {
             delim,
             state: State::Preamble,
             scanned: 0,
+            preamble_bytes: 0,
             header_end: None,
             parts: 0,
         })
@@ -663,13 +677,13 @@ impl Frames {
     }
 }
 
-impl Decode for Frames {
+impl Decode for Parts {
     type Item = Part;
     type Error = Error;
     const NAME: &'static str = "MIME multipart";
 
     fn capacity(&self) -> usize {
-        MAX_PART + MAX_BOUNDARY_LINE + 1
+        MAX_PART.saturating_add(MAX_BOUNDARY_LINE).saturating_add(1)
     }
 
     fn held(&self) -> usize {
@@ -692,16 +706,21 @@ impl Decode for Frames {
             let Some(end) = part_header_end(input, self.scanned)? else {
                 self.scanned = input.len();
                 if eof && input.is_empty() {
-                    return Err(Error::Incomplete);
+                    return Err(Error::Truncated);
                 }
                 return Ok(Step::Need);
             };
             self.header_end = Some(end);
             self.scanned = end.saturating_sub(2);
         }
-        let (at, found) = self.boundary(input, eof, preamble);
+        let (at, found) = self.boundary(input, eof, preamble && self.preamble_bytes == 0);
         let part_end = at.max(self.header_end.unwrap_or(0));
-        if part_end > MAX_PART {
+        let size = if preamble {
+            self.preamble_bytes.saturating_add(part_end)
+        } else {
+            part_end
+        };
+        if size > MAX_PART {
             return Err(Error::TooLong);
         }
         let (used, closed) = match found {
@@ -712,8 +731,13 @@ impl Decode for Frames {
                 if input.len() >= self.capacity() {
                     return Err(Error::TooLong);
                 }
-                if eof && (!preamble || (!input.is_empty() && at == input.len())) {
-                    return Err(Error::Incomplete);
+                if eof && (!preamble || (size > 0 && at == input.len())) {
+                    return Err(Error::Truncated);
+                }
+                if preamble && at > 0 {
+                    self.preamble_bytes = self.preamble_bytes.saturating_add(at);
+                    self.scanned = 0;
+                    return Ok(Step::Skip(at));
                 }
                 return Ok(Step::Need);
             }
@@ -734,7 +758,7 @@ impl Decode for Frames {
         self.header_end = None;
         Ok(match item {
             Some(part) => {
-                self.parts += 1;
+                self.parts = self.parts.saturating_add(1);
                 Step::Item(part, used)
             }
             None => Step::Skip(used),
@@ -983,7 +1007,7 @@ enum State {
 /// [`Error::Padding`]. A line that starts with `--` and the boundary but
 /// goes on in any other way is body data, as in RFC 2046's grammar.
 #[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with mime_multipart::Frames")]
+#[deprecated(note = "use codec::Stream with mime_multipart::Parts")]
 pub struct Parser {
     /// CR LF, `--` and the boundary.
     delim: Vec<u8>,

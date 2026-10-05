@@ -10,8 +10,8 @@
 //! body of a request, calls [`parse`], looks at the [`Value`] it gets,
 //! and writes its answer with [`Value::write`]. For a stream that carries
 //! one JSON text after another, such as JSON-RPC over a TCP connection,
-//! a [`Decoder`] takes the bytes as they come and hands back each value
-//! once it is whole.
+//! [`Values`] with [`super::codec::Stream`] takes the bytes as they come
+//! and hands back each value once it is whole.
 //!
 //! The agent can send any bytes it likes, so the parser checks
 //! everything RFC 8259 asks and nothing more. It refuses what the RFC
@@ -23,7 +23,7 @@
 //! keeps its members in order, duplicate keys included, since RFC 8259
 //! leaves their meaning to the reader.
 //!
-//! Use [`Frames`] with [`super::codec::Stream`] for bounded input and EOF
+//! Use [`Values`] with [`super::codec::Stream`] for bounded input and EOF
 //! handling. [`Value`] implements [`Wire`] for exact parsing and appending.
 //! The deprecated [`Decoder`] keeps its original buffering and errors.
 //!
@@ -860,15 +860,27 @@ impl Wire for Value {
 /// end the stream. Error offsets count from the start of the stream.
 /// Capacity is the clamped size limit plus one delimiter or overflow byte.
 /// Use [`codec::Stream`](super::codec::Stream) for bounded input and one-time errors.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, json::{Value, Values}};
+///
+/// let mut stream = Stream::new(Values::new());
+/// let mut values = Vec::new();
+/// pump(&mut stream, b"true ", |value| values.push(value))?;
+/// pump(&mut stream, b"null", |value| values.push(value))?;
+/// finish(&mut stream, |value| values.push(value))?;
+/// assert_eq!(values, vec![Value::Bool(true), Value::Null]);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::json::Error>>(())
+/// ```
 #[derive(Clone, Debug, Default)]
-pub struct Frames {
+pub struct Values {
     limits: Limits,
     pos: usize,
     scan: Scan,
     consumed: usize,
 }
 
-impl Frames {
+impl Values {
     /// Reads values within the default [`Limits`].
     pub fn new() -> Self {
         Self::default()
@@ -888,7 +900,17 @@ impl Frames {
 
     fn value(&mut self, input: &[u8], end: usize, eof: bool) -> Result<Step<Value>, Error> {
         let bytes = input.get(..end).unwrap_or_default();
-        let value = match parse_with(bytes, &self.limits) {
+        let mut result = parse_with(bytes, &self.limits);
+        if let Err(e) = result
+            && self.scan == Scan::Scalar
+            && e.kind == ErrorKind::UnexpectedEnd
+            && let Some(with_next) = input.get(..=end)
+            && let Err(e) = parse_with(with_next, &self.limits)
+        {
+            // A delimiter interrupted the scalar. Name it as Decoder does.
+            result = Err(e);
+        }
+        let value = match result {
             Ok(value) => value,
             Err(e) => {
                 if eof
@@ -924,13 +946,13 @@ fn scalar_prefix(bytes: &[u8]) -> bool {
     matches!(parse(&number), Ok(Value::Number(_)))
 }
 
-impl Decode for Frames {
+impl Decode for Values {
     type Item = Value;
     type Error = Error;
     const NAME: &'static str = "JSON";
 
     fn capacity(&self) -> usize {
-        self.limits.size() + 1
+        self.limits.size().saturating_add(1)
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Value>, Error> {
@@ -983,7 +1005,7 @@ impl Decode for Frames {
                         match c {
                             b'"' => *in_string = true,
                             b'{' | b'[' => {
-                                *depth += 1;
+                                *depth = depth.saturating_add(1);
                                 if *depth > self.limits.depth() {
                                     return Err(self.error(ErrorKind::TooDeep, self.pos));
                                 }
@@ -991,7 +1013,7 @@ impl Decode for Frames {
                             b'}' | b']' => {
                                 *depth = depth.saturating_sub(1);
                                 if *depth == 0 {
-                                    end = Some(self.pos + 1);
+                                    end = Some(self.pos.saturating_add(1));
                                 }
                             }
                             _ => {}
@@ -1004,7 +1026,7 @@ impl Decode for Frames {
                     } else if c == b'\\' {
                         *escape = true;
                     } else if c == b'"' {
-                        end = Some(self.pos + 1);
+                        end = Some(self.pos.saturating_add(1));
                     }
                 }
                 Scan::Scalar => {
@@ -1013,7 +1035,7 @@ impl Decode for Frames {
                     }
                 }
             }
-            self.pos += 1;
+            self.pos = self.pos.saturating_add(1);
             if let Some(end) = end {
                 return self.value(input, end, false);
             }
@@ -1041,7 +1063,7 @@ impl Decode for Frames {
 /// it, so one at the very end of what has come waits for one more byte,
 /// or for [`Decoder::finish`] to say the stream has ended.
 #[derive(Debug, Default)]
-#[deprecated(note = "use codec::Stream with json::Frames")]
+#[deprecated(note = "use codec::Stream with json::Values")]
 pub struct Decoder {
     limits: Limits,
     buf: Vec<u8>,

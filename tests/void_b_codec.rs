@@ -44,9 +44,9 @@ where
 #[test]
 fn json_chunked_round_trip_and_eof() {
     let bytes = br#" {"method":"echo","params":["hi",2]} [true,null] "last" 12.5"#;
-    contract::check_stack(json::Frames::new, bytes);
-    prefixes(json::Frames::new, bytes);
-    let (values, error) = run(json::Frames::new(), bytes, 1);
+    contract::check_stack(json::Values::new, bytes);
+    prefixes(json::Values::new, bytes);
+    let (values, error) = run(json::Values::new(), bytes, 1);
     assert_eq!(error, None);
     assert_eq!(values.len(), 4);
     let mut written = Vec::new();
@@ -57,15 +57,15 @@ fn json_chunked_round_trip_and_eof() {
         Wire::write(value, &mut written).unwrap();
         written.push(b' ');
     }
-    assert_eq!(run(json::Frames::new(), &written, 3), (values, None));
+    assert_eq!(run(json::Values::new(), &written, 3), (values, None));
     for partial in [b"tru".as_slice(), b"1e-", b"-", b"[1", b"\"abc"] {
         assert!(matches!(
-            run(json::Frames::new(), partial, 1).1,
+            run(json::Values::new(), partial, 1).1,
             Some(Fail::Truncated { .. })
         ));
     }
     assert!(matches!(
-        run(json::Frames::new(), b"{} [x]", 1).1,
+        run(json::Values::new(), b"{} [x]", 1).1,
         Some(Fail::Protocol(json::Error {
             kind: json::ErrorKind::UnexpectedByte(b'x'),
             ..
@@ -75,7 +75,7 @@ fn json_chunked_round_trip_and_eof() {
 
 #[test]
 fn json_rejects_oversize_at_named_capacity() {
-    let mut stream = Stream::new(json::Frames::new());
+    let mut stream = Stream::new(json::Values::new());
     assert_eq!(stream.decoder().capacity(), json::MAX_SIZE + 1);
     let mut bytes = vec![b'a'; json::MAX_SIZE + 2];
     bytes[0] = b'"';
@@ -91,7 +91,7 @@ fn json_rejects_oversize_at_named_capacity() {
     let exact = json::Value::String("a".repeat(json::MAX_SIZE - 2));
     let bytes = Wire::to_bytes(&exact).unwrap();
     assert_eq!(
-        run(json::Frames::new(), &bytes, bytes.len()),
+        run(json::Values::new(), &bytes, bytes.len()),
         (vec![exact], None)
     );
 }
@@ -104,7 +104,7 @@ fn json_eof_preserves_scalar_limit_errors() {
             ..json::Limits::default()
         };
         assert!(matches!(
-            run(json::Frames::with_limits(limits), bytes, 1).1,
+            run(json::Values::with_limits(limits), bytes, 1).1,
             Some(Fail::Protocol(json::Error {
                 kind: json::ErrorKind::TooManyElements,
                 ..
@@ -114,35 +114,174 @@ fn json_eof_preserves_scalar_limit_errors() {
 }
 
 #[test]
+#[allow(deprecated)]
+fn json_scalar_delimiter_errors_match_legacy() {
+    for input in [b"tru}".as_slice(), b"[0] fals]", b"nul,", b"tr "] {
+        let mut legacy = json::Decoder::new();
+        legacy.feed(input);
+        let expected = loop {
+            if let Err(error) = legacy.next_value().expect("delimiter completes the scalar") {
+                break error;
+            }
+        };
+        for chunk in [1, input.len()] {
+            assert_eq!(
+                run(json::Values::new(), input, chunk).1,
+                Some(Fail::Protocol(expected))
+            );
+        }
+    }
+}
+
+#[test]
+fn form_stream_accepts_expanding_replacement_text() {
+    let mut input = b"a=".to_vec();
+    input.extend(vec![0xff; 200_000]);
+    let expected: Vec<_> = form::parse(&input)
+        .unwrap()
+        .into_iter()
+        .map(form::Field)
+        .collect();
+    let (fields, error) = run(form::Fields::new(), &input, 4096);
+    assert_eq!(error, None);
+    assert!(fields == expected);
+    assert_eq!(
+        <form::Field as Wire>::parse(&input),
+        Err(form::FieldError::Form(form::FormError::TooLong))
+    );
+}
+
+#[test]
+fn multipart_skips_preamble_without_buffering_it() {
+    let mut stream = Stream::new(mime::Parts::new("b").unwrap());
+    for _ in 0..32 {
+        pump(&mut stream, &[b'x'; 4096], |_| panic!("no part yet")).unwrap();
+        assert_eq!(stream.buffered(), 0);
+    }
+    // A candidate boundary stays unread until its suffix arrives.
+    pump(&mut stream, b"\r\n--b", |_| panic!("no part yet")).unwrap();
+    assert_eq!(stream.unread(), b"\r\n--b");
+    pump(&mut stream, b"--\r\n", |_| panic!("no part yet")).unwrap();
+    finish(&mut stream, |_| panic!("no parts")).unwrap();
+}
+
+#[test]
+fn multipart_preamble_keeps_limits_and_line_boundaries() {
+    let make = || mime::Parts::new("b").unwrap();
+    // A delimiter may start the body or follow CR LF, never a skipped byte.
+    for input in [
+        b"x--b--\r\n".as_slice(),
+        b"x--b\r\n\r\nignored\r\n--b--\r\n",
+        b"x\r\n--bx\r\n--b\r\n\r\nbody\r\n--b--\r\n",
+        b"x\r\n--b-- \t",
+    ] {
+        prefixes(make, input);
+        contract::check_decode(make, input);
+        match mime::Multipart::parse(input, "b") {
+            Ok(body) => assert_eq!(run(make(), input, 1), (body.parts, None)),
+            Err(_) => assert!(run(make(), input, 1).1.is_some()),
+        }
+    }
+    for size in [mime::MAX_PART, mime::MAX_PART + 1] {
+        let mut input = vec![b'x'; size];
+        input.extend_from_slice(b"\r\n--b--\r\n");
+        let error = run(make(), &input, 4096).1;
+        if size == mime::MAX_PART {
+            assert_eq!(error, None);
+        } else {
+            assert_eq!(error, Some(Fail::Protocol(mime::Error::TooLong)));
+        }
+    }
+}
+
+#[test]
+fn document_streams_distinguish_empty_from_unfinished() {
+    assert_eq!(run(xml::Events::new(), b"", 1), (vec![], None));
+    assert_eq!(
+        xml::parse(b"").unwrap_err().kind,
+        xml::ErrorKind::UnexpectedEnd
+    );
+    for input in [b" ".as_slice(), b"<?xml version='1.0'?>", b"<r>"] {
+        assert!(matches!(
+            run(xml::Events::new(), input, 1).1,
+            Some(Fail::Protocol(xml::Error {
+                kind: xml::ErrorKind::UnexpectedEnd,
+                ..
+            }))
+        ));
+    }
+    let make = || mime::Parts::new("b").unwrap();
+    assert_eq!(run(make(), b"", 1), (vec![], None));
+    assert_eq!(
+        mime::Multipart::parse(b"", "b"),
+        Err(mime::Error::Truncated)
+    );
+    for input in [b"hello".as_slice(), b"--b\r\n"] {
+        assert_eq!(
+            run(make(), input, 1).1,
+            Some(Fail::Protocol(mime::Error::Truncated))
+        );
+    }
+}
+
+#[test]
+fn protobuf_grpc_matches_prefix_parser() {
+    use fictionet::stdlib::codec::Step;
+    let framing = protobuf::Framing::Grpc;
+    let mut cases = vec![
+        vec![],
+        vec![2],
+        vec![0xff],
+        vec![0, 0, 0, 0, 0],
+        vec![1, 0, 0, 0, 2, 8, 1],
+    ];
+    let mut oversize = vec![0];
+    oversize.extend_from_slice(&((protobuf::MAX_MESSAGE + 1) as u32).to_be_bytes());
+    cases.push(oversize);
+    for bytes in cases {
+        for cut in 0..=bytes.len() {
+            let input = &bytes[..cut];
+            let expected = protobuf::Frame::parse(framing, input).map(|parsed| match parsed {
+                Some((frame, used)) => Step::Item(frame, used),
+                None => Step::Need,
+            });
+            for eof in [false, true] {
+                assert_eq!(protobuf::Frames::new(framing).decode(input, eof), expected);
+            }
+        }
+    }
+}
+
+#[test]
 fn xml_chunked_round_trip_and_eof() {
     let bytes = br#"<?xml version="1.0"?><!DOCTYPE r [<!ATTLIST r n CDATA "v">]><r xmlns:p="urn:p"><p:c/>text&amp;more</r><!--tail--> "#;
-    contract::check_decode(xml::Frames::new, bytes);
-    contract::check_wire::<xml::Frame>(bytes);
-    prefixes(xml::Frames::new, bytes);
+    contract::check_decode(xml::Events::new, bytes);
+    contract::check_wire::<xml::Document>(bytes);
+    prefixes(xml::Events::new, bytes);
     let expected = xml::parse(bytes).unwrap();
-    assert_eq!(run(xml::Frames::new(), bytes, 1), (expected.clone(), None));
-    let frame = <xml::Frame as Wire>::parse(bytes).unwrap();
+    assert_eq!(run(xml::Events::new(), bytes, 1), (expected.clone(), None));
+    let frame = <xml::Document as Wire>::parse(bytes).unwrap();
     let encoded = Wire::to_bytes(&frame).unwrap();
     assert_eq!(encoded, bytes);
-    assert_eq!(run(xml::Frames::new(), &encoded, 7), (expected, None));
-    assert!(<xml::Frame as Wire>::parse(b"<r/><s/>").is_err());
+    assert_eq!(run(xml::Events::new(), &encoded, 7), (expected, None));
+    assert!(<xml::Document as Wire>::parse(b"<r/><s/>").is_err());
     assert!(matches!(
-        run(xml::Frames::new(), b"<!--unfinished", 1).1,
+        run(xml::Events::new(), b"<!--unfinished", 1).1,
         Some(Fail::Truncated { .. })
     ));
-    let (events, error) = run(xml::Frames::new(), b"<r>final text", 1);
+    let (events, error) = run(xml::Events::new(), b"<r>final text", 1);
     assert_eq!(events.last(), Some(&xml::Event::Text("final text".into())));
     assert!(matches!(
         error,
         Some(Fail::Protocol(xml::Error {
-            kind: xml::ErrorKind::Incomplete,
+            kind: xml::ErrorKind::UnexpectedEnd,
             ..
         }))
     ));
     assert!(matches!(
-        run(xml::Frames::new(), b"<r><", 1).1,
+        run(xml::Events::new(), b"<r><", 1).1,
         Some(Fail::Protocol(xml::Error {
-            kind: xml::ErrorKind::Incomplete,
+            kind: xml::ErrorKind::UnexpectedEnd,
             ..
         }))
     ));
@@ -150,7 +289,7 @@ fn xml_chunked_round_trip_and_eof() {
 
 #[test]
 fn xml_rejects_oversize_at_named_capacity() {
-    let mut stream = Stream::new(xml::Frames::new());
+    let mut stream = Stream::new(xml::Events::new());
     assert_eq!(stream.decoder().capacity(), xml::MAX_DOCUMENT + 1);
     let mut bytes = b"<!--".to_vec();
     bytes.resize(xml::MAX_DOCUMENT + 2, b'a');
@@ -168,43 +307,43 @@ fn xml_rejects_oversize_at_named_capacity() {
 #[test]
 fn form_chunked_round_trip_and_eof() {
     let bytes = b"&name=Alice+Smith&&x=%E2%82%AC&flag&last=%";
-    contract::check_decode(form::Frames::new, bytes);
-    prefixes(form::Frames::new, bytes);
+    contract::check_decode(form::Fields::new, bytes);
+    prefixes(form::Fields::new, bytes);
     let expected: Vec<_> = form::parse(bytes)
         .unwrap()
         .into_iter()
-        .map(form::Frame)
+        .map(form::Field)
         .collect();
-    assert_eq!(run(form::Frames::new(), bytes, 1), (expected.clone(), None));
+    assert_eq!(run(form::Fields::new(), bytes, 1), (expected.clone(), None));
     let mut written = Vec::new();
     for frame in &expected {
         let one = Wire::to_bytes(frame).unwrap();
-        contract::check_wire::<form::Frame>(&one);
-        assert_eq!(<form::Frame as Wire>::parse(&one).as_ref(), Ok(frame));
+        contract::check_wire::<form::Field>(&one);
+        assert_eq!(<form::Field as Wire>::parse(&one).as_ref(), Ok(frame));
         if !written.is_empty() {
             written.push(b'&');
         }
         frame.write(&mut written).unwrap();
     }
-    assert_eq!(run(form::Frames::new(), &written, 3), (expected, None));
+    assert_eq!(run(form::Fields::new(), &written, 3), (expected, None));
     assert_eq!(
-        <form::Frame as Wire>::parse(b"a=b&c=d"),
-        Err(form::FrameError::Trailing)
+        <form::Field as Wire>::parse(b"a=b&c=d"),
+        Err(form::FieldError::Trailing)
     );
     assert_eq!(
-        <form::Frame as Wire>::parse(b""),
-        Err(form::FrameError::Empty)
+        <form::Field as Wire>::parse(b""),
+        Err(form::FieldError::Empty)
     );
     // Malformed escapes are complete fields under the form grammar.
     assert_eq!(
-        run(form::Frames::new(), b"a=%A", 1),
-        (vec![form::Frame(("a".into(), "%A".into()))], None)
+        run(form::Fields::new(), b"a=%A", 1),
+        (vec![form::Field(("a".into(), "%A".into()))], None)
     );
 }
 
 #[test]
 fn form_rejects_oversize_at_named_capacity() {
-    let mut stream = Stream::new(form::Frames::new());
+    let mut stream = Stream::new(form::Fields::new());
     assert_eq!(stream.decoder().capacity(), form::MAX_INPUT + 1);
     assert_eq!(
         stream.push(&vec![b'a'; form::MAX_INPUT + 2]),
@@ -212,7 +351,7 @@ fn form_rejects_oversize_at_named_capacity() {
     );
     assert_eq!(
         stream.next(),
-        Some(Err(Fail::Protocol(form::FrameError::Form(
+        Some(Err(Fail::Protocol(form::FieldError::Form(
             form::FormError::TooLong
         ))))
     );
@@ -234,7 +373,7 @@ fn multipart() -> mime::Multipart {
 fn multipart_chunked_round_trip_and_eof() {
     let body = multipart();
     let bytes = body.to_bytes("boundary").unwrap();
-    let make = || mime::Frames::new("boundary").unwrap();
+    let make = || mime::Parts::new("boundary").unwrap();
     contract::check_decode(make, &bytes);
     prefixes(make, &bytes);
     assert_eq!(run(make(), &bytes, 1), (body.parts.clone(), None));
@@ -268,7 +407,7 @@ fn multipart_chunked_round_trip_and_eof() {
     );
     assert_eq!(
         run(make(), b"--boundary\r\n\r\nlast", 1).1,
-        Some(Fail::Protocol(mime::Error::Incomplete))
+        Some(Fail::Protocol(mime::Error::Truncated))
     );
     assert!(matches!(
         run(make(), b"--boundary\r\nX: value", 1).1,
@@ -278,7 +417,7 @@ fn multipart_chunked_round_trip_and_eof() {
 
 #[test]
 fn multipart_rejects_oversize_at_named_capacity() {
-    let mut stream = Stream::new(mime::Frames::new("b").unwrap());
+    let mut stream = Stream::new(mime::Parts::new("b").unwrap());
     let capacity = mime::MAX_PART + mime::MAX_BOUNDARY_LINE + 1;
     assert_eq!(stream.decoder().capacity(), capacity);
     pump(&mut stream, b"--b\r\n", |_| panic!("no part yet")).unwrap();
@@ -382,10 +521,10 @@ fn protobuf_rejects_oversize_at_named_capacity() {
 #[test]
 fn strict_writers_leave_existing_output_unchanged() {
     contract::check_wire_value(&json::Value::String("a".repeat(json::MAX_SIZE)));
-    contract::check_wire_value(&xml::Frame {
+    contract::check_wire_value(&xml::Document {
         data: b"<a>".to_vec(),
     });
-    contract::check_wire_value(&form::Frame((" ".repeat(form::MAX_INPUT), "x".into())));
+    contract::check_wire_value(&form::Field((" ".repeat(form::MAX_INPUT), "x".into())));
     contract::check_wire_value(&mime::Part {
         headers: mime::Headers {
             fields: vec![("bad:name".into(), "x".into())],
@@ -424,16 +563,16 @@ fn contracts_on_malformed_and_mutated_inputs() {
                 let at = rng.below(bytes.len() as u64) as usize;
                 bytes[at] = rng.next() as u8;
             }
-            contract::check_decode(json::Frames::new, &bytes);
-            contract::check_decode(xml::Frames::new, &bytes);
-            contract::check_decode(form::Frames::new, &bytes);
-            contract::check_decode(|| mime::Frames::new("b").unwrap(), &bytes);
+            contract::check_decode(json::Values::new, &bytes);
+            contract::check_decode(xml::Events::new, &bytes);
+            contract::check_decode(form::Fields::new, &bytes);
+            contract::check_decode(|| mime::Parts::new("b").unwrap(), &bytes);
             for framing in [protobuf::Framing::Grpc, protobuf::Framing::Delimited] {
                 contract::check_decode(|| protobuf::Frames::new(framing), &bytes);
             }
             contract::check_wire::<json::Value>(&bytes);
-            contract::check_wire::<xml::Frame>(&bytes);
-            contract::check_wire::<form::Frame>(&bytes);
+            contract::check_wire::<xml::Document>(&bytes);
+            contract::check_wire::<form::Field>(&bytes);
             contract::check_wire::<mime::Part>(&bytes);
             contract::check_wire::<protobuf::Frame>(&bytes);
             contract::check_wire::<protobuf::DelimitedFrame>(&bytes);
@@ -444,11 +583,11 @@ fn contracts_on_malformed_and_mutated_inputs() {
 
 #[test]
 fn content_limits_accept_complete_units_at_the_limit() {
-    let field = form::Frame(("a".repeat(form::MAX_INPUT - 1), String::new()));
+    let field = form::Field(("a".repeat(form::MAX_INPUT - 1), String::new()));
     let bytes = Wire::to_bytes(&field).unwrap();
     assert_eq!(bytes.len(), form::MAX_INPUT);
     assert_eq!(
-        run(form::Frames::new(), &bytes, bytes.len()),
+        run(form::Fields::new(), &bytes, bytes.len()),
         (vec![field], None)
     );
 
@@ -456,7 +595,7 @@ fn content_limits_accept_complete_units_at_the_limit() {
     bytes.resize(xml::MAX_DOCUMENT - 4, b'x');
     bytes.extend_from_slice(b"</r>");
     assert_eq!(bytes.len(), xml::MAX_DOCUMENT);
-    let (events, error) = run(xml::Frames::new(), &bytes, bytes.len());
+    let (events, error) = run(xml::Events::new(), &bytes, bytes.len());
     assert_eq!(events.len(), 3);
     assert_eq!(error, None);
 
@@ -472,7 +611,7 @@ fn content_limits_accept_complete_units_at_the_limit() {
     };
     let bytes = body.to_bytes(&boundary).unwrap();
     assert_eq!(
-        run(mime::Frames::new(&boundary).unwrap(), &bytes, bytes.len()),
+        run(mime::Parts::new(&boundary).unwrap(), &bytes, bytes.len()),
         (vec![part], None)
     );
 }

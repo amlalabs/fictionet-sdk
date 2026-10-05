@@ -5,9 +5,9 @@
 
 use std::sync::Arc;
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::xml::{Attribute, Error, ErrorKind, Event, Name, Parser, Start, Writer, XMLNS_NAMESPACE, parse};
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::contract;
 
 /// Feeds `chunks` in order, then finishes: the events and the error, if
 /// any.
@@ -36,9 +36,11 @@ fn run<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (Vec<Event>, Option<Er
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(fictionet::stdlib::xml::Frames::new, data);
-    contract::check_wire::<fictionet::stdlib::xml::Frame>(data);
-    contract::check_wire_value(&fictionet::stdlib::xml::Frame { data: data.to_vec() });
+    contract::check_decode(fictionet::stdlib::xml::Events::new, data);
+    contract::check_wire::<fictionet::stdlib::xml::Document>(data);
+    contract::check_wire_value(&fictionet::stdlib::xml::Document {
+        data: data.to_vec(),
+    });
     // The document, split two ways: all at once, and a byte at a time.
     let whole = run([data]);
     let bytewise = run(data.chunks(1));

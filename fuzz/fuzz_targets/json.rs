@@ -3,9 +3,9 @@
 #![no_main]
 #![allow(deprecated)] // This target also checks the compatibility API.
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::json::{self, Decoder, Limits, Value};
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::contract;
 
 /// How the bytes reach the decoder and how its values are taken.
 #[derive(Clone, Copy)]
@@ -76,7 +76,7 @@ fuzz_target!(|input: &[u8]| {
         [_, b, rest @ ..] => (Limits::default(), usize::from(b % 7) + 1, rest),
         _ => (Limits::default(), 1, input),
     };
-    contract::check_decode(|| json::Frames::with_limits(limits), data);
+    contract::check_decode(|| json::Values::with_limits(limits), data);
     contract::check_wire::<Value>(data);
     // The input as one JSON text.
     let parsed = json::parse_with(data, &limits);
