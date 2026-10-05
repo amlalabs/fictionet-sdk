@@ -10,11 +10,10 @@
 //! ISO transport over TCP on IPv6 and for transport classes other than 0.
 //!
 //! Nothing here reads a socket. A world feeds the bytes it reads from a
-//! TCP connection to a [`Decoder`], takes each [`Packet`] out, and reads
-//! its payload. Most payloads are COTP TPDUs, which
-//! [`Packet::tpdu`] reads with the [`cotp`] module.
-//! [`Packet::try_from_tpdu`] and [`write_message`] go the other way. A world
-//! may set a size limit lower than the 65535 bytes the header allows, as
+//! TCP connection to a [`super::codec::Stream`] of [`Packets`], takes each
+//! [`Packet`] out, and reads its payload. Most payloads are COTP TPDUs;
+//! [`super::cotp::over_tpkt`] provides conversions and a message writer.
+//! A world may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
 //! [`Packets`] implements [`super::codec::Decode`] for a caller-owned input
@@ -28,21 +27,22 @@
 //! rather than write a packet a reader would refuse.
 //!
 //! ```
-//! use fictionet::stdlib::cotp::{Reassembler, Tpdu};
-//! use fictionet::stdlib::tpkt::{Decoder, Packet, write_message};
+//! use fictionet::stdlib::codec::Stream;
+//! use fictionet::stdlib::cotp::{Reassembler, Tpdu, over_tpkt};
+//! use fictionet::stdlib::tpkt::{Packet, Packets};
 //!
-//! let mut decoder = Decoder::new();
+//! let mut decoder = Stream::new(Packets::new());
 //! // A COTP data TPDU marked as the last of its message, carrying "hi".
 //! let bytes = [3, 0, 0, 9, 2, 0xf0, 0x80, b'h', b'i'];
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let packet = decoder.next_packet().unwrap().unwrap();
+//! assert_eq!(decoder.push(&bytes), bytes.len());
+//! let packet = decoder.next().unwrap().unwrap();
 //! assert_eq!(packet.payload, [2, 0xf0, 0x80, b'h', b'i']);
-//! let Ok(Tpdu::Data(data)) = packet.tpdu() else { panic!() };
+//! let Ok(Tpdu::Data(data)) = over_tpkt::tpdu(&packet) else { panic!() };
 //! let mut messages = Reassembler::new();
 //! assert_eq!(messages.push(&data), Ok(Some(b"hi".to_vec())));
 //!
 //! // The answer, "ok", in packets of up to 1024-byte TPDUs: here just one.
-//! assert_eq!(write_message(b"ok", 1024).unwrap(), [3, 0, 0, 9, 2, 0xf0, 0x80, b'o', b'k']);
+//! assert_eq!(over_tpkt::write_message(b"ok", 1024).unwrap(), [3, 0, 0, 9, 2, 0xf0, 0x80, b'o', b'k']);
 //!
 //! // A packet holds any payload of 3 to 65531 bytes.
 //! let packet = Packet::new(vec![1, 2, 3]);
@@ -50,10 +50,7 @@
 //! assert_eq!(Packet::parse(&[3, 0, 0, 7, 1, 2, 3]), Ok(Some((packet, 7))));
 //! ```
 
-use super::{
-    codec::{Buffer, Decode, Step, Wire},
-    cotp,
-};
+use super::codec::{Buffer, Decode, Step, Wire};
 
 /// The TCP port ISO transport servers listen on.
 pub const PORT: u16 = 102;
@@ -76,8 +73,9 @@ pub const MAX_PAYLOAD: usize = MAX_PACKET - HEADER_LEN;
 /// longest packet. A decoder with a lower limit holds at most that.
 pub const MAX_BUFFERED: usize = MAX_PACKET;
 /// The longest message [`write_message`] cuts into packets, the same as
-/// the longest message a [`cotp::Reassembler`] takes.
-pub const MAX_MESSAGE: usize = cotp::MAX_MESSAGE;
+/// the longest message a [`super::cotp::Reassembler`] takes.
+#[deprecated(note = "use cotp::MAX_MESSAGE")]
+pub const MAX_MESSAGE: usize = super::cotp::MAX_MESSAGE;
 
 /// One TPKT packet: the header's reserved byte and the payload. The
 /// version is always [`VERSION`] and the length is worked out from the
@@ -251,7 +249,7 @@ impl Packet {
 
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
-    /// of `b` it took.
+    /// of `b` it took. Use [`Wire::parse`] to require exactly one packet.
     pub fn parse(b: &[u8]) -> Result<Option<(Packet, usize)>, TpktError> {
         Packet::parse_limited(b, MAX_PACKET)
     }
@@ -302,13 +300,14 @@ impl Packet {
     }
 
     /// The packet carrying `tpdu`, with the reserved byte 0. It always
-    /// gives a packet, since [`cotp::Tpdu::to_bytes`] writes 3 to
+    /// gives a packet, since [`super::cotp::Tpdu::to_bytes`] writes 3 to
     /// [`MAX_PAYLOAD`] bytes, but that writer cuts what does not fit: data
     /// past one packet, parameters past the header, and the high bits of
     /// narrow fields. [`Packet::try_from_tpdu`] refuses such a TPDU
     /// instead.
-    pub fn from_tpdu(tpdu: &cotp::Tpdu) -> Packet {
-        Packet::new(tpdu.to_bytes())
+    #[deprecated(note = "use cotp::over_tpkt::from_tpdu")]
+    pub fn from_tpdu(tpdu: &super::cotp::Tpdu) -> Packet {
+        super::cotp::over_tpkt::from_tpdu(tpdu)
     }
 
     /// The packet carrying `tpdu`, with the reserved byte 0, if its payload
@@ -318,32 +317,15 @@ impl Packet {
     /// field wider than its format. A raw variable part counts as the same
     /// when its bytes are written whole, even if they read back as
     /// parameters. To send a long message, cut it with [`write_message`].
-    pub fn try_from_tpdu(tpdu: &cotp::Tpdu) -> Result<Packet, EncodeError> {
-        let packet = Packet::from_tpdu(tpdu);
-        let mut back = packet.tpdu().map_err(|_| EncodeError::Unrepresentable)?;
-        // Compare raw header bytes as the reader would see them, then put
-        // the original back so the rest compares field by field.
-        if let (Some(want), Some(got)) = (variable_of(tpdu), variable_mut(&mut back)) {
-            let same = match want {
-                cotp::Variable::Raw(b) => *got == cotp::Variable::parse(b),
-                _ => got == want,
-            };
-            if !same {
-                return Err(EncodeError::Unrepresentable);
-            }
-            // The variable parts match, so this clone is at most a header.
-            *got = want.clone();
-        }
-        if back == *tpdu {
-            Ok(packet)
-        } else {
-            Err(EncodeError::Unrepresentable)
-        }
+    #[deprecated(note = "use cotp::over_tpkt::try_from_tpdu")]
+    pub fn try_from_tpdu(tpdu: &super::cotp::Tpdu) -> Result<Packet, EncodeError> {
+        super::cotp::over_tpkt::try_from_tpdu(tpdu)
     }
 
     /// Reads the payload as one COTP TPDU.
-    pub fn tpdu(&self) -> Result<cotp::Tpdu, cotp::TpduError> {
-        cotp::Tpdu::parse(&self.payload)
+    #[deprecated(note = "use cotp::over_tpkt::tpdu")]
+    pub fn tpdu(&self) -> Result<super::cotp::Tpdu, super::cotp::TpduError> {
+        super::cotp::over_tpkt::tpdu(self)
     }
 }
 
@@ -365,48 +347,19 @@ impl Wire for Packet {
 
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let header = self.header()?.to_bytes()?;
-        out.reserve(HEADER_LEN + self.payload.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(&self.payload);
         Ok(())
     }
 }
 
-/// The header's variable part, for the TPDUs that have one.
-fn variable_of(t: &cotp::Tpdu) -> Option<&cotp::Variable> {
-    match t {
-        cotp::Tpdu::ConnectionRequest(c) | cotp::Tpdu::ConnectionConfirm(c) => Some(&c.variable),
-        cotp::Tpdu::DisconnectRequest(d) => Some(&d.variable),
-        cotp::Tpdu::Error(e) => Some(&e.variable),
-        cotp::Tpdu::Data(_) => None,
-    }
-}
-
-/// [`variable_of`], to change it.
-fn variable_mut(t: &mut cotp::Tpdu) -> Option<&mut cotp::Variable> {
-    match t {
-        cotp::Tpdu::ConnectionRequest(c) | cotp::Tpdu::ConnectionConfirm(c) => {
-            Some(&mut c.variable)
-        }
-        cotp::Tpdu::DisconnectRequest(d) => Some(&mut d.variable),
-        cotp::Tpdu::Error(e) => Some(&mut e.variable),
-        cotp::Tpdu::Data(_) => None,
-    }
-}
-
 /// The bytes of the packets that carry `message` as COTP data TPDUs of no
 /// more than `tpdu_size` bytes each, header included, with EOT on the
-/// last. [`cotp::segment`] says how `tpdu_size` is taken. A message longer
+/// last. [`super::cotp::segment`] says how `tpdu_size` is taken. A message longer
 /// than [`MAX_MESSAGE`] is an error.
+#[deprecated(note = "use cotp::over_tpkt::write_message")]
 pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, EncodeError> {
-    if message.len() > MAX_MESSAGE {
-        return Err(EncodeError::TooLong(message.len()));
-    }
-    let mut out = Vec::new();
-    for data in cotp::segment(message, tpdu_size) {
-        out.extend_from_slice(&Packet::try_from_tpdu(&cotp::Tpdu::Data(data))?.to_bytes()?);
-    }
-    Ok(out)
+    super::cotp::over_tpkt::write_message(message, tpdu_size)
 }
 
 /// Splits a TPKT byte stream into packets.
@@ -414,13 +367,16 @@ pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, Encode
 /// Use with [`super::codec::Stream`] for bounded input buffering. A partial
 /// packet returns [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and reports framing errors once. No input is retained.
+///
+/// The framer is named `Packets`; there is no separate `Frames` API.
+///
+/// ```compile_fail
+/// use fictionet::stdlib::tpkt::Frames;
+/// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Packets {
     limit: usize,
 }
-
-/// Compatibility name for [`Packets`].
-pub type Frames = Packets;
 
 impl Default for Packets {
     fn default() -> Self {
@@ -468,19 +424,24 @@ impl Decode for Packets {
 
 /// Splits a TPKT byte stream into packets. Feed it the bytes a connection
 /// reads, in order, and take packets out until it has none.
+/// This compatibility wrapper preserves repeating errors. Use
+/// [`super::codec::Stream`] with [`Packets`] for EOF and one-time errors.
 #[derive(Clone, Debug)]
+#[deprecated(note = "use codec::Stream with tpkt::Packets")]
 pub struct Decoder {
     buf: Buffer,
     frames: Packets,
     failed: Option<TpktError>,
 }
 
+#[allow(deprecated)]
 impl Default for Decoder {
     fn default() -> Decoder {
         Decoder::new()
     }
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes, which takes packets of up to
     /// [`MAX_PACKET`] bytes.
@@ -655,6 +616,7 @@ mod codec_tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Check the original decoder contract.
     fn compatibility_wrapper_keeps_feed_and_failure_behavior() {
         let bytes = Packet::new(vec![1, 2, 3]).to_bytes().unwrap();
         let mut decoder = Decoder::with_limit(MIN_PACKET);
@@ -672,7 +634,9 @@ mod codec_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the legacy API.
 mod tests {
+    use super::super::cotp;
     use super::*;
     use cotp::{Data, Reassembler, Tpdu};
 

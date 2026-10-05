@@ -1,6 +1,7 @@
 //! TPKT packets and class 0 COTP TPDUs, as a world playing an ISO
 //! transport server reads them.
 #![no_main]
+#![allow(deprecated)] // Also exercise the legacy decoder and packet helpers.
 
 use fictionet::stdlib::codec::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,

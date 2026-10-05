@@ -1,13 +1,14 @@
 //! TPKT packets, as a world on port 102 or 3389 reads them, and packets a
 //! world builds, as it writes them.
 #![no_main]
+#![allow(deprecated)] // Also exercise the legacy decoder and COTP conversions.
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Reassembler, Tpdu, Variable};
 use fictionet::stdlib::tpkt::{
-    Decoder, EncodeError, Frames, HEADER_LEN, Header, MAX_BUFFERED, MAX_PACKET, MAX_PAYLOAD,
-    MIN_PACKET, MIN_PAYLOAD, Packet, TpktError, write_message,
+    Decoder, EncodeError, HEADER_LEN, Header, MAX_BUFFERED, MAX_PACKET, MAX_PAYLOAD,
+    MIN_PACKET, MIN_PAYLOAD, Packet, Packets, TpktError, write_message,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -161,7 +162,7 @@ fuzz_target!(|data: &[u8]| {
     // The stream, split two ways: all at once, and a byte at a time. Both
     // give the same packets and the same error.
     for limit in [MAX_PACKET, limit] {
-        check_decode(|| Frames::with_limit(limit), data);
+        check_decode(|| Packets::with_limit(limit), data);
         let (packets, err) = split(data, limit, false);
         assert_eq!(split(data, limit, true), (packets.clone(), err));
         for p in &packets {
