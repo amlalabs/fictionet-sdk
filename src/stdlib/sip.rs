@@ -41,10 +41,11 @@
 //!
 //! A malformed start line or unrelated header with a trusted message
 //! boundary is an error item. An over-limit line, head, or body, or an
-//! untrusted Content-Length is a stream error. Header-count errors are
-//! items. Truncated input is reported by the driver at EOF. Body framing
-//! follows the headers as before; no mode methods or expectation queues
-//! are needed. Bodies remain bytes; SDP belongs to [`super::sdp`].
+//! untrusted Content-Length is a stream error. Bare LF also ends the
+//! stream because it cannot establish a SIP message boundary. Header-count
+//! errors are items. The driver reports truncated input at EOF. Body
+//! framing follows the headers as before; no mode methods or expectation
+//! queues are needed. Bodies remain bytes; SDP belongs to [`super::sdp`].
 //!
 //! ```
 //! use fictionet::stdlib::sip::{Message, Uri};
@@ -77,7 +78,7 @@
 //! assert_eq!(Message::parse(&bytes).unwrap().status(), Some(200));
 //! ```
 
-use super::codec::{ Decode, Ending, LineError, Lines, Step, Wire};
+use super::codec::{Decode, Ending, LineError, Lines, Step, Wire};
 
 /// The port SIP servers listen on, for UDP and TCP.
 pub const PORT: u16 = 5060;
@@ -599,7 +600,6 @@ impl Message {
     }
 }
 
-
 /// Why an exact wire parse or a strict write failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireError {
@@ -631,11 +631,14 @@ impl core::error::Error for WireError {}
 /// Use with [`super::codec::Stream`]. Items are `Result<Message, Error>`.
 /// A bad start line or header is an error item once a trusted body length
 /// and the complete unit are available. Invalid lengths and byte limits
-/// end the stream. Partial units return [`Step::Need`], including at EOF.
-/// The driver reports truncation and returns stream errors once.
+/// end the stream. Bare LF is a stream error: only CRLF ends SIP lines,
+/// so framing cannot resume after it. Partial units return [`Step::Need`],
+/// including at EOF. The driver reports truncation and returns stream
+/// errors once.
 ///
-/// [`Lines`] scans each header byte once. The driver retains the whole
-/// unit, so [`super::codec::Stream::with_next`] includes its head and body.
+/// [`Lines`] scans incrementally; each head byte is scanned a fixed number
+/// of times. The driver retains the whole unit, so
+/// [`super::codec::Stream::with_next`] includes its head and body.
 /// Capacity is [`MAX_MESSAGE`]; no input bytes are held in decoder state.
 /// Body framing follows Content-Length automatically, as in [`Decoder`].
 /// There are no caller-selected modes or response expectation queues.
@@ -657,7 +660,12 @@ pub struct Frames {
     lines: Lines,
     scanned: usize,
     body: Option<(usize, usize)>,
-    bad_ending: bool,
+}
+
+impl core::fmt::Debug for Frames {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Frames").field("scanned", &self.scanned).field("body", &self.body).finish_non_exhaustive()
+    }
 }
 
 impl Default for Frames {
@@ -669,7 +677,7 @@ impl Default for Frames {
 impl Frames {
     /// Creates a decoder using [`MAX_LINE`], [`MAX_HEAD`], and [`MAX_BODY`].
     pub fn new() -> Self {
-        Self { lines: Lines::new(MAX_LINE, Ending::Crlf), scanned: 0, body: None, bad_ending: false }
+        Self { lines: Lines::new(MAX_LINE, Ending::Crlf), scanned: 0, body: None }
     }
 }
 
@@ -706,13 +714,13 @@ impl Decode for Frames {
                 Step::Item(line, used) => {
                     match line {
                         Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
-                        Err(LineError::BareLf) => self.bad_ending = true,
+                        Err(LineError::BareLf) => return Err(Error::LineEnding),
                         Err(LineError::Unterminated) => return Ok(Step::Need),
                         Ok(_) => {}
                     }
                     self.scanned = self.scanned.checked_add(used).ok_or(Error::TooLong)?;
                     let raw = window.get(..used).unwrap_or_default();
-                    if raw == b"\r\n" || raw == b"\n" {
+                    if raw == b"\r\n" {
                         let head = input.get(..self.scanned).ok_or(Error::TooLong)?;
                         self.body = Some((self.scanned, frame_body_length(head)?));
                     }
@@ -724,17 +732,12 @@ impl Decode for Frames {
         let Some((head, length)) = self.body else { return Ok(Step::Need) };
         let used = head.checked_add(length).ok_or(Error::TooLong)?;
         let Some(body) = input.get(head..used) else { return Ok(Step::Need) };
-        let message = if self.bad_ending {
-            Err(Error::LineEnding)
-        } else {
-            parse_head(input.get(..head).ok_or(Error::TooLong)?).map(|(mut message, _)| {
-                message.body = body.to_vec();
-                message
-            })
-        };
+        let message = parse_head(input.get(..head).ok_or(Error::TooLong)?).map(|(mut message, _)| {
+            message.body = body.to_vec();
+            message
+        });
         self.scanned = 0;
         self.body = None;
-        self.bad_ending = false;
         Ok(Step::Item(message, used))
     }
 }
@@ -840,6 +843,7 @@ impl Wire for Message {
     /// unchanged on error. Content-Length fields are preserved, including
     /// spelling, position, and digits. Set them to match the body before
     /// writing. Values that need trimming or header injection are refused.
+    /// A body length mismatch is [`WireError::Unrepresentable`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
         out.extend_from_slice(&encode_message(self)?);
         Ok(())
@@ -856,9 +860,12 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, WireError> {
     }
     // Count before formatting or copying caller-owned strings.
     let start = match &message.start {
-        StartLine::Request { method, uri } => {
-            method.len().checked_add(uri.len()).and_then(|n| n.checked_add(VERSION.len() + 2)).ok_or(too_long)?
-        }
+        StartLine::Request { method, uri } => method
+            .len()
+            .checked_add(uri.len())
+            .and_then(|n| n.checked_add(VERSION.len()))
+            .and_then(|n| n.checked_add(2))
+            .ok_or(too_long)?,
         StartLine::Status { code, reason } => {
             if !(100..=699).contains(code) {
                 return Err(WireError::Protocol(Error::StartLine));
@@ -908,10 +915,11 @@ fn encode_message(message: &Message) -> Result<Vec<u8>, WireError> {
     out.extend_from_slice(b"\r\n");
     out.extend_from_slice(&message.body);
     // Check the same framing and value rules as the receiver, before append.
-    if &read_wire(&out)? != message {
-        return Err(WireError::Unrepresentable);
+    match read_wire(&out) {
+        Ok(ref parsed) if parsed == message => Ok(out),
+        Err(error @ WireError::Protocol(_)) => Err(error),
+        _ => Err(WireError::Unrepresentable),
     }
-    Ok(out)
 }
 
 fn trim_frame_ws(mut bytes: &[u8]) -> &[u8] {

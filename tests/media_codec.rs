@@ -167,14 +167,44 @@ fn complete_raw_spans_and_one_item_per_call() {
 }
 
 #[test]
+fn sip_bare_lf_ends_the_stream_before_another_message() {
+    let bytes = b"INVITE sip:a@b SIP/2.0\r\nl: 0\r\nX: a\n\nINVITE sip:b@c SIP/2.0\r\nl: 0\r\n\r\n";
+    for pattern in [&[][..], &[1], &[3, 1, 37], &[64]] {
+        assert_eq!(decode(sip::Frames::new, bytes, pattern), (vec![], Some(Fail::Protocol(sip::Error::LineEnding))));
+    }
+    contract::check_decode(sip::Frames::new, bytes);
+}
+
+#[test]
+fn rtsp20_bare_lf_ends_the_stream_at_the_head() {
+    for head in [
+        &b"RTSP/2.0 200 OK\nContent-Length: 1\r\n\r\n"[..],
+        b"RTSP/2.0 200 OK\r\nContent-Length: 1\n\r\n",
+        b"RTSP/2.0 200 OK\r\nContent-Length: 1\r\n\n",
+        b"OPTIONS * RTSP/2.0\r\nContent-Length: 1\r\nX: a\n\r\n",
+    ] {
+        let bytes = [head, b"xRTSP/2.0 200 OK\r\n\r\n"].concat();
+        for input in [head, bytes.as_slice()] {
+            for pattern in [&[][..], &[1], &[3, 1, 37], &[64]] {
+                assert_eq!(
+                    decode(rtsp::Frames::new, input, pattern),
+                    (vec![], Some(Fail::Protocol(rtsp::Error::LineEnding)))
+                );
+            }
+            contract::check_decode(rtsp::Frames::new, input);
+        }
+    }
+}
+
+#[test]
 fn line_endings_and_status_body_rules() {
     let lf = b"RTSP/1.0 200 OK\nContent-Length: 1\n\nx";
     assert!(decode(rtsp::Frames::new, lf, &[1]).0[0].is_ok());
     contract::check_wire::<rtsp::Message>(lf);
     let new_lf = b"RTSP/2.0 200 OK\nContent-Length: 1\n\nx";
-    assert_eq!(decode(rtsp::Frames::new, new_lf, &[1]), (vec![Err(rtsp::Error::LineEnding)], None));
+    assert_eq!(decode(rtsp::Frames::new, new_lf, &[1]), (vec![], Some(Fail::Protocol(rtsp::Error::LineEnding))));
     let sip_lf = b"SIP/2.0 200 OK\nl: 1\n\nx";
-    assert_eq!(decode(sip::Frames::new, sip_lf, &[1]), (vec![Err(sip::Error::LineEnding)], None));
+    assert_eq!(decode(sip::Frames::new, sip_lf, &[1]), (vec![], Some(Fail::Protocol(sip::Error::LineEnding))));
     contract::check_decode(rtsp::Frames::new, new_lf);
     contract::check_decode(sip::Frames::new, sip_lf);
     for code in [100, 199, 204, 304] {
@@ -291,6 +321,43 @@ fn exact_parsers_and_transactional_writers_preserve_fields() {
     assert!(Wire::to_bytes(&s).is_err());
     assert!(r.to_bytes().is_ok());
     assert!(s.to_bytes().is_ok());
+}
+
+#[test]
+fn wire_body_length_mismatches_are_unrepresentable() {
+    for (length, body) in [("5", &b"ab"[..]), ("5", b"abcdefg"), ("0", b"x")] {
+        let mut r = rtsp::Message::request(rtsp::Version::Rtsp20, "ANNOUNCE", "rtsp://camera/media");
+        r.push_header("Content-Length", length);
+        r.body = body.to_vec();
+        let mut out = b"prefix".to_vec();
+        assert_eq!(Wire::write(&r, &mut out), Err(rtsp::WireError::Unrepresentable));
+        assert_eq!(out, b"prefix");
+        for name in ["Content-Length", "l"] {
+            let mut s = sip::Message::request("INVITE", "sip:a@b");
+            s.push_header(name, length);
+            s.body = body.to_vec();
+            assert_eq!(Wire::write(&s, &mut out), Err(sip::WireError::Unrepresentable));
+            assert_eq!(out, b"prefix");
+        }
+    }
+}
+
+#[test]
+fn wire_writers_preserve_syntax_and_limit_errors() {
+    for (length, rtsp_error, sip_error) in [
+        ("invalid".to_owned(), rtsp::Error::ContentLength, sip::Error::ContentLength),
+        ((rtsp::MAX_BODY + 1).to_string(), rtsp::Error::TooLong, sip::Error::TooLong),
+    ] {
+        let mut r = rtsp::Message::response(rtsp::Version::Rtsp20, 200, "OK");
+        r.push_header("Content-Length", &length);
+        let mut s = sip::Message::response(200, "OK");
+        s.push_header("l", &length);
+        let mut out = b"prefix".to_vec();
+        assert_eq!(Wire::write(&r, &mut out), Err(rtsp::WireError::Protocol(rtsp_error)));
+        assert_eq!(out, b"prefix");
+        assert_eq!(Wire::write(&s, &mut out), Err(sip::WireError::Protocol(sip_error)));
+        assert_eq!(out, b"prefix");
+    }
 }
 
 #[test]
