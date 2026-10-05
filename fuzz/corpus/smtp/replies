@@ -1,0 +1,4 @@
+220 server.test SMTP
+250-server.test
+250-PIPELINING
+250 SIZE 8388608

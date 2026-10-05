@@ -3003,12 +3003,10 @@ impl TokenWriter {
                     _ => Err(Error::Unwritable),
                 },
             );
-        let checked = checked.and_then(|()| {
-            if self.out.len() > MAX_MESSAGE {
-                Err(Error::Limit("response past MAX_MESSAGE"))
-            } else {
-                Ok(())
-            }
+        let checked = checked.and(if self.out.len() > MAX_MESSAGE {
+            Err(Error::Limit("response past MAX_MESSAGE"))
+        } else {
+            Ok(())
         });
         if let Err(e) = checked {
             self.out.truncate(start);

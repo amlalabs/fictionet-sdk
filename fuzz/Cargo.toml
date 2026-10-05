@@ -713,6 +713,27 @@ doc = false
 bench = false
 
 [[bin]]
+name = "smtp"
+path = "fuzz_targets/smtp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dnp3"
+path = "fuzz_targets/dnp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "iec104"
+path = "fuzz_targets/iec104.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "http3"
 path = "fuzz_targets/http3.rs"
 test = false
