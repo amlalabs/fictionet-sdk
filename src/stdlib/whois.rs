@@ -91,6 +91,8 @@ pub const MAX_BUFFERED: usize = MAX_QUERY + 2;
 /// The longest response a [`ResponseDecoder`] keeps, and a [`Response`]
 /// may hold.
 pub const MAX_RESPONSE: usize = 1 << 20;
+/// Input buffer capacity for [`Responses`], independent of its retained byte limit.
+pub const RESPONSE_WINDOW: usize = 4096;
 /// The most fields [`parse_fields`] reads and [`write_fields`] writes.
 pub const MAX_FIELDS: usize = 10_000;
 /// The longest key, in bytes, a line may have to be read as a field.
@@ -992,9 +994,14 @@ impl Wire for Query {
     type ParseError = QueryParseError;
     type WriteError = QueryError;
 
+    /// Reads exactly one query line, accepting CRLF or bare LF.
+    /// Incomplete input and trailing bytes are errors.
     fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
         let mut decoder = Queries::new();
-        match decoder.decode(bytes, true).map_err(|_| QueryParseError::Incomplete)? {
+        match decoder
+            .decode(bytes, true)
+            .map_err(|_| QueryParseError::Incomplete)?
+        {
             Step::Item(query, used) if used == bytes.len() => query.map_err(QueryParseError::Query),
             Step::Item(Err(e), _) => Err(QueryParseError::Query(e)),
             Step::Item(_, _) => Err(QueryParseError::Trailing),
@@ -1002,6 +1009,7 @@ impl Wire for Query {
         }
     }
 
+    /// Appends a query with CRLF, leaving `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), QueryError> {
         check_query(&self.text)?;
         out.extend_from_slice(self.text.as_bytes());
@@ -1036,17 +1044,22 @@ impl Wire for Response {
 /// CRLF and bare LF are accepted, as in [`QueryDecoder`]. Content is
 /// bounded by [`MAX_QUERY`]. Bad and overlong lines are error items; an
 /// unfinished line at EOF is a terminal [`codec::LineError::Unterminated`].
-/// Persistent connections may send several query lines. The legacy decoder
-/// stays separate because its feed-time skipping and buffering differ.
-#[derive(Clone, Debug)]
+/// Persistent connections may send several query lines.
 pub struct Queries {
     lines: codec::Lines,
 }
 
+impl core::fmt::Debug for Queries {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Queries").finish_non_exhaustive()
+    }
+}
 impl Queries {
     /// Creates a reader with a capacity of [`MAX_QUERY`] plus two bytes.
     pub fn new() -> Self {
-        Self { lines: codec::Lines::new(MAX_QUERY, codec::Ending::LfOrCrlf) }
+        Self {
+            lines: codec::Lines::new(MAX_QUERY, codec::Ending::LfOrCrlf),
+        }
     }
 }
 impl Default for Queries {
@@ -1064,10 +1077,15 @@ impl Decode for Queries {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
-        let step = self.lines.decode(input, eof).unwrap_or_else(|never| match never {});
+        let step = self
+            .lines
+            .decode(input, eof)
+            .unwrap_or_else(|never| match never {});
         Ok(match step {
             Step::Item(Ok(line), n) => Step::Item(Query::parse_line(&line), n),
-            Step::Item(Err(codec::LineError::TooLong { .. }), n) => Step::Item(Err(QueryError::TooLong), n),
+            Step::Item(Err(codec::LineError::TooLong { .. }), n) => {
+                Step::Item(Err(QueryError::TooLong), n)
+            }
             Step::Item(Err(e), _) => return Err(e),
             Step::Skip(n) => Step::Skip(n),
             Step::Need => Step::Need,
@@ -1090,9 +1108,7 @@ pub struct CollectedResponse {
 /// Free text has no line framing or terminator requirement. Excess bytes
 /// are consumed without retaining them. The truncation flag matches
 /// [`ResponseDecoder::truncated`], including false at exactly the limit.
-/// The legacy collector stays separate because `finish` returns only a
-/// [`Response`] and its void feed owns input.
-/// Input capacity is 4096 bytes; retained state is bounded by the byte limit.
+/// Input capacity is [`RESPONSE_WINDOW`]; retained state is bounded by the byte limit.
 #[derive(Clone, Debug)]
 pub struct Responses {
     limit: usize,
@@ -1110,7 +1126,12 @@ impl Responses {
     /// Sets the retained byte limit, clamped to [`MAX_RESPONSE`].
     /// Zero keeps no bytes and still produces a response at EOF.
     pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_RESPONSE), bytes: Vec::new(), truncated: false, taken: false }
+        Self {
+            limit: limit.min(MAX_RESPONSE),
+            bytes: Vec::new(),
+            truncated: false,
+            taken: false,
+        }
     }
 
     /// The maximum number of retained response bytes.
@@ -1129,7 +1150,7 @@ impl Decode for Responses {
     const NAME: &'static str = "WHOIS response";
 
     fn capacity(&self) -> usize {
-        4096
+        RESPONSE_WINDOW
     }
     fn held(&self) -> usize {
         self.bytes.len()
@@ -1140,19 +1161,26 @@ impl Decode for Responses {
             return Ok(Step::End);
         }
         let n = input.len().min(self.limit.saturating_sub(self.bytes.len()));
-        self.bytes.extend_from_slice(input.get(..n).unwrap_or_default());
+        self.bytes
+            .extend_from_slice(input.get(..n).unwrap_or_default());
         self.truncated |= n < input.len();
         if eof {
             self.taken = true;
             return Ok(Step::Item(
                 CollectedResponse {
-                    response: Response { bytes: core::mem::take(&mut self.bytes) },
+                    response: Response {
+                        bytes: core::mem::take(&mut self.bytes),
+                    },
                     truncated: self.truncated,
                 },
                 input.len(),
             ));
         }
-        Ok(if input.is_empty() { Step::Need } else { Step::Skip(input.len()) })
+        Ok(if input.is_empty() {
+            Step::Need
+        } else {
+            Step::Skip(input.len())
+        })
     }
 }
 

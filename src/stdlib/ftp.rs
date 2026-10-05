@@ -4,7 +4,6 @@
 //! New stacks use [`Commands`] and [`Replies`] with [`codec::Stream`].
 //! Both accept CRLF and bare LF. [`codec::Wire`] provides exact parsing
 //! and strict, transactional writing for [`Command`] and [`Reply`].
-//! The legacy decoders and writers retain their original behavior.
 //!
 //! FTP moves files between a client and a server. The client sends
 //! commands over a TCP connection, usually to port 21, one per line, such
@@ -944,9 +943,9 @@ pub struct Reply {
     pub lines: Vec<String>,
 }
 
-/// Why bytes are not an FTP reply. After any of these but
-/// [`ReplyError::TooManyLines`], the stream holds no more replies a reader
-/// can find, and a client closes the connection.
+/// Why bytes are not an FTP reply. [`ReplyDecoder`] stops after any error
+/// except [`ReplyError::TooManyLines`]. See [`Replies`] for recovery from
+/// malformed first lines and terminal framing errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyError {
     /// A line was longer than [`MAX_LINE`].
@@ -1650,7 +1649,7 @@ fn push_line(out: &mut Vec<u8>, line: &str) {
 /// Maximum text bytes retained while assembling one reply.
 pub const MAX_REPLY_BYTES: usize = MAX_REPLY_LINES * MAX_CONTENT;
 
-/// A terminal fault in the new control stream decoders.
+/// A terminal fault in [`Commands`] or [`Replies`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// EOF interrupted a line or a multi-line reply.
@@ -1726,12 +1725,20 @@ impl core::error::Error for ReplyWriteError {}
 
 // Lines frames physical lines. RFC 2640's CR NUL LF is joined here into
 // one logical line. Only consumed pieces are retained, under MAX_CONTENT.
-#[derive(Clone, Debug)]
 struct ControlLines {
     lines: codec::Lines,
     partial: Vec<u8>,
     dropping: bool,
     prev: [u8; 2],
+}
+impl core::fmt::Debug for ControlLines {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ControlLines")
+            .field("partial", &self.partial)
+            .field("dropping", &self.dropping)
+            .field("prev", &self.prev)
+            .finish_non_exhaustive()
+    }
 }
 impl ControlLines {
     fn new() -> Self {
@@ -1744,8 +1751,10 @@ impl ControlLines {
     }
 
     fn reset_line(&mut self) {
-        self.lines =
-            codec::Lines::new(MAX_CONTENT.saturating_sub(self.partial.len()), codec::Ending::LfOrCrlf);
+        self.lines = codec::Lines::new(
+            MAX_CONTENT.saturating_sub(self.partial.len()),
+            codec::Ending::LfOrCrlf,
+        );
     }
 
     fn decode(
@@ -1763,7 +1772,10 @@ impl ControlLines {
             self.prev = last_two(self.prev, raw);
             return Ok(Step::Skip(n));
         }
-        let step = self.lines.decode(input, eof).unwrap_or_else(|never| match never {});
+        let step = self
+            .lines
+            .decode(input, eof)
+            .unwrap_or_else(|never| match never {});
         match step {
             Step::Item(Ok(line), n) => {
                 let raw = input.get(..n).unwrap_or_default();
@@ -1808,16 +1820,21 @@ impl ControlLines {
 /// CRLF and bare LF are accepted. RFC 2640's CR NUL escaping stays in
 /// this module. Lines are bounded by [`MAX_LINE`], including CRLF.
 /// Malformed and overlong commands are error items. EOF inside a command
-/// is terminal. The legacy [`CommandDecoder`] keeps its feed-time dropping
-/// and larger buffer; it is not a wrapper around this decoder.
-#[derive(Clone, Debug)]
+/// is terminal.
 pub struct Commands {
     lines: ControlLines,
+}
+impl core::fmt::Debug for Commands {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Commands").finish_non_exhaustive()
+    }
 }
 impl Commands {
     /// Creates a command reader with a capacity of [`MAX_LINE`].
     pub fn new() -> Self {
-        Self { lines: ControlLines::new() }
+        Self {
+            lines: ControlLines::new(),
+        }
     }
 }
 impl Default for Commands {
@@ -1853,18 +1870,28 @@ impl Decode for Commands {
 /// A malformed first line is an error item. Invalid text inside an open
 /// reply or an overlong line ends framing. Too many reply lines produce
 /// one error item at the matching final line. EOF in an assembly is
-/// [`DecodeError::Incomplete`]. The legacy [`ReplyDecoder`] stays separate
-/// to preserve its repeated errors and fatal first-line syntax errors.
-#[derive(Clone, Debug)]
+/// [`DecodeError::Incomplete`].
 pub struct Replies {
     lines: ControlLines,
     builder: Builder,
     held: usize,
 }
+impl core::fmt::Debug for Replies {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Replies")
+            .field("builder", &self.builder)
+            .field("held", &self.held)
+            .finish_non_exhaustive()
+    }
+}
 impl Replies {
     /// Creates a reply reader with a capacity of [`MAX_LINE`].
     pub fn new() -> Self {
-        Self { lines: ControlLines::new(), builder: Builder::default(), held: 0 }
+        Self {
+            lines: ControlLines::new(),
+            builder: Builder::default(),
+            held: 0,
+        }
     }
 }
 impl Default for Replies {
@@ -1968,7 +1995,7 @@ impl Wire for Reply {
 
     /// Appends the reply's text verbatim, with code prefixes and CRLF.
     /// Refuses text that would not read back unchanged before touching
-    /// `out`. The legacy [`Reply::to_bytes`] still clips and pads text.
+    /// `out`. [`Reply::to_bytes`] clips and pads text.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), ReplyWriteError> {
         let count = self.lines.len();
         if count == 0 || count > MAX_REPLY_LINES {
