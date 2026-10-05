@@ -3,6 +3,9 @@
 //! world builds, as it writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::whois::{Queries, Responses};
+
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::whois::{
     Field, MAX_BUFFERED, MAX_RESPONSE, Query, QueryDecoder, QueryError, Referral, ReferralKind,
@@ -101,6 +104,12 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Queries::new, data);
+    contract::check_decode(Responses::new, data);
+    contract::check_decode(|| Responses::with_limit(17), data);
+    contract::check_wire::<Query>(data);
+    contract::check_wire::<Response>(data);
+
     // Queries, split three ways: all at once, a byte at a time, and in
     // chunks of a size the input picks. All give the same queries and the
     // same errors.
@@ -109,6 +118,7 @@ fuzz_target!(|data: &[u8]| {
     let size = 1 + usize::from(data.first().copied().unwrap_or(0)) * 7;
     assert_eq!(split(data, size), queries);
     for q in queries.iter().flatten() {
+        contract::check_wire_value(q);
         // A query read can be written, and reads back the same.
         let bytes = q.to_bytes();
         assert_eq!(Query::parse_line(&bytes[..bytes.len() - 2]).as_ref(), Ok(q));
@@ -117,6 +127,7 @@ fuzz_target!(|data: &[u8]| {
 
     // The response, read both ways, is the same.
     let (resp, truncated) = response(data, false);
+    contract::check_wire_value(&resp);
     assert_eq!(response(data, true), (resp.clone(), truncated));
     if let Ok(fields) = resp.fields() {
         // Fields read can be written back if the writer takes them, and

@@ -2,6 +2,9 @@
 //! reads and writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::ftp::{Commands, Replies};
+
 use fictionet::stdlib::ftp::{
     Command, CommandDecoder, Feature, MAX_BUFFERED, MAX_LINE, Reply, ReplyDecoder, ReplyError, Request, parse_eprt,
     parse_port, write_eprt, write_port,
@@ -81,6 +84,11 @@ fn one_reply(bytes: &[u8]) -> Reply {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Commands::new, data);
+    contract::check_decode(Replies::new, data);
+    contract::check_wire::<Command>(data);
+    contract::check_wire::<Reply>(data);
+
     // The stream as commands, fed on every schedule. A bad line spoils only
     // itself, so every result is kept, and every schedule agrees.
     let got = commands(data, SCHEDULES[0]);
@@ -105,6 +113,7 @@ fuzz_target!(|data: &[u8]| {
     let text = String::from_utf8_lossy(data);
     let (verb, arg) = text.split_once(' ').unwrap_or((&text, ""));
     let built = Command::new(verb, Some(arg));
+    contract::check_wire_value(&built);
     if let Ok(bytes) = built.to_bytes() {
         let mut want = built.clone();
         want.verb.make_ascii_uppercase();
@@ -123,6 +132,7 @@ fuzz_target!(|data: &[u8]| {
     let code = fictionet::stdlib::ftp::ReplyCode::new(100 + u16::from(data.first().copied().unwrap_or(0)) % 500);
     if let Some(code) = code {
         let built = Reply { code, lines: lines.clone() };
+        contract::check_wire_value(&built);
         let bytes = built.to_bytes();
         let back = one_reply(&bytes);
         assert_eq!(back.to_bytes(), bytes);
