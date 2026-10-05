@@ -15,6 +15,11 @@
 //! groups and variations as bytes. Secure authentication is not performed.
 //! Unknown link and application function codes are preserved.
 //!
+//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream).
+//! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
+//! Its inherent parser still reads a prefix. [`Decoder`] keeps its original
+//! repeating errors and releases buffered bytes on failure.
+//!
 //! ```
 //! use fictionet::stdlib::dnp3::{Decoder, Frame, Fragment, Segment};
 //!
@@ -30,6 +35,8 @@
 //! assert_eq!(decoder.feed(&bytes), bytes.len());
 //! assert_eq!(decoder.next_frame().unwrap().unwrap(), frame);
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The usual TCP and UDP port.
 pub const PORT: u16 = 20000;
@@ -65,6 +72,37 @@ impl std::fmt::Display for FrameError {
     }
 }
 impl std::error::Error for FrameError {}
+
+/// Why an exact [`Wire`] parse did not read one complete frame.
+/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame is invalid.
+    Frame(FrameError),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete DNP3 frame"),
+            Self::Trailing => f.write_str("bytes follow the DNP3 frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
 
 /// CRC-16/DNP: reflected polynomial `0xa6bc`, initial value zero, complemented
 /// result. A frame sends the result least significant byte first.
@@ -176,6 +214,59 @@ impl Frame {
             return Err(TransportError::NotData);
         }
         Segment::parse(&self.data)
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = FrameError;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(b).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads DNP3 frames without holding input bytes.
+///
+/// Use with [`Stream`](super::codec::Stream) for a buffer limited to
+/// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// The stream reports truncation at EOF and framing errors once.
+/// The existing [`Decoder`] keeps repeating errors and clearing its buffer.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with a capacity of [`MAX_FRAME`] bytes.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "DNP3";
+
+    fn capacity(&self) -> usize {
+        MAX_FRAME
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match Frame::parse(input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
     }
 }
 

@@ -22,6 +22,11 @@
 //! a round trip. Optional client core fields and extended client info are
 //! preserved as bytes. Writers use the same checks as readers.
 //!
+//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream).
+//! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
+//! The prefix parser and [`Decoder`] retain their existing behavior,
+//! including the decoder's repeating errors and fixed storage allocation.
+//!
 //! The wire definitions and examples are in [MS-RDPBCGR sections 2.2.1,
 //! 2.2.8 and 4.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/).
 //!
@@ -45,7 +50,10 @@
 
 #![deny(missing_docs)]
 
-use super::{cotp, tpkt};
+use super::{
+    codec::{Decode, Step, Wire},
+    cotp, tpkt,
+};
 
 /// The usual RDP TCP port.
 pub const PORT: u16 = 3389;
@@ -451,6 +459,60 @@ impl Frame {
                 Ok(w.b)
             }
         }
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one transport frame, refusing partial or trailing bytes.
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match Self::parse(b)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(Error::Invalid("trailing bytes")),
+            None => Err(Error::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads RDP slow-path and fast-path frames without holding input bytes.
+///
+/// Use with [`Stream`](super::codec::Stream) for a buffer limited to
+/// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
+/// The stream reports truncation at EOF and framing errors once.
+/// Slow-path framing uses the shared [`tpkt`] parser. The existing
+/// [`Decoder`] keeps repeating errors and its fixed storage allocation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with a capacity of [`MAX_FRAME`] bytes.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = Error;
+    const NAME: &'static str = "RDP";
+
+    fn capacity(&self) -> usize {
+        MAX_FRAME
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
+        Ok(match Frame::parse(input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
     }
 }
 

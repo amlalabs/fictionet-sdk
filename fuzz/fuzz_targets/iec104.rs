@@ -1,6 +1,8 @@
 //! IEC 104 APDUs, ASDUs and both information object address layouts.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::iec104::Frames;
 use fictionet::stdlib::iec104::{Asdu, Decoder, Frame, FrameError, MAX_BUFFERED, Object};
 use libfuzzer_sys::fuzz_target;
 
@@ -51,6 +53,8 @@ fn asdu(bytes: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    check_decode(Frames::new, data);
+    check_wire::<Frame>(data);
     let frames = split(data, data.len(), true);
     for (size, drain) in [(1, true), (7, false), (MAX_BUFFERED + 1, false)] {
         assert_eq!(split(data, size, drain), frames);
@@ -75,6 +79,7 @@ fuzz_target!(|data: &[u8]| {
             },
             Frame::Supervisory { receive },
         ] {
+            check_wire_value(&frame);
             if let Ok(bytes) = frame.to_bytes() {
                 assert_eq!(Frame::parse(&bytes), Ok(Some((frame, bytes.len()))));
             }

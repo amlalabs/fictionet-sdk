@@ -2,13 +2,18 @@
 //! playing a device reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::enip::Frames;
 use fictionet::stdlib::enip::{
-    Cpf, Decoder, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse, Identity,
-    MAX_BUFFERED, MessageRequest, MessageResponse, Packet, RegisterSession, SendData,
+    Cpf, Decoder, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest,
+    ForwardOpenResponse, Identity, MAX_BUFFERED, MessageRequest, MessageResponse, Packet,
+    RegisterSession, SendData,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    check_decode(Frames::new, data);
+    check_wire::<Packet>(data);
     // The stream, split two ways: as much as the decoder takes at once,
     // and a byte at a time.
     let mut whole = Decoder::new();
@@ -39,7 +44,22 @@ fuzz_target!(|data: &[u8]| {
     }
     assert_eq!(packets, again);
 
+    let built = Packet {
+        command: fictionet::stdlib::enip::Command::Other(u16::from(
+            data.first().copied().unwrap_or(0),
+        )),
+        session_handle: 1,
+        status: 0,
+        sender_context: [0; 8],
+        options: u32::from(data.get(1).copied().unwrap_or(0)),
+        data: data
+            .get(..data.len().min(MAX_BUFFERED))
+            .unwrap_or_default()
+            .to_vec(),
+    };
+    check_wire_value(&built);
     for p in &packets {
+        check_wire_value(p);
         // A packet that passes the check writes back to bytes that read the
         // same; one that fails it cannot be written.
         match (p.check(), p.to_bytes()) {

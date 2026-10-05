@@ -2,9 +2,12 @@
 //! playing a server reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::opcua::Frames;
 use fictionet::stdlib::opcua::{
-    DataValue, Decoder, DiagnosticInfo, EncodeError, ExpandedNodeId, ExtensionObject, Limits, LocalizedText, Message,
-    NodeId, QualifiedName, ResponseHeader, Service, Variant, decode, encode,
+    Chunk, ChunkType, DataValue, Decoder, DiagnosticInfo, EncodeError, ExpandedNodeId,
+    ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName,
+    ResponseHeader, Service, Variant, decode, encode,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -38,14 +41,37 @@ fn messages(d: &mut Decoder, out: &mut Vec<Result<Message, String>>) -> bool {
 fuzz_target!(|data: &[u8]| {
     // The first byte picks the limits, so small chunk and message limits
     // are reached too.
-    let Some((&pick, data)) = data.split_first() else {
-        return;
-    };
+    let (pick, data) = data.split_first().map_or((0, &[][..]), |(&pick, data)| (pick, data));
     let limits = match pick % 3 {
         0 => Limits::default(),
         1 => Limits { receive_buffer_size: 8192, max_message_size: 1 << 14, max_chunk_count: 4 },
         _ => Limits { receive_buffer_size: 1 << 16, max_message_size: 0, max_chunk_count: 0 },
     };
+
+    check_decode(|| Frames::with_limits(limits), data);
+    check_wire::<Chunk>(data);
+    let chunk = Chunk {
+        message_type: match pick % 4 {
+            0 => MessageType::Hello,
+            1 => MessageType::Open,
+            2 => MessageType::Close,
+            _ => MessageType::Message,
+        },
+        chunk_type: match pick % 3 {
+            0 => ChunkType::Final,
+            1 => ChunkType::Intermediate,
+            _ => ChunkType::Abort,
+        },
+        body: data
+            .get(
+                ..data
+                    .len()
+                    .min(fictionet::stdlib::opcua::MAX_BUFFER_SIZE as usize),
+            )
+            .unwrap_or_default()
+            .to_vec(),
+    };
+    check_wire_value(&chunk);
 
     // The stream, split two ways: all at once, and a byte at a time.
     // A decoder takes at most MAX_BUFFERED bytes at a time, so a long
@@ -76,11 +102,11 @@ fuzz_target!(|data: &[u8]| {
         let mut d = Decoder::with_limits(limits);
         d.feed(&bytes);
         assert_eq!(d.next_message(), Some(Ok(m.clone())));
-        if let Message::Secure(s) = m {
-            if let Ok(service) = Service::parse(&s.body) {
-                let body = service.to_bytes().unwrap();
-                assert_eq!(Service::parse(&body), Ok(service));
-            }
+        if let Message::Secure(s) = m
+            && let Ok(service) = Service::parse(&s.body)
+        {
+            let body = service.to_bytes().unwrap();
+            assert_eq!(Service::parse(&body), Ok(service));
         }
     }
 
