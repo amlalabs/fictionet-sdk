@@ -3,8 +3,9 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
+use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::modbus::{
-    Decoder, Exception, Frame, FrameError, MAX_BUFFERED, MAX_PDU, Request, Response, function,
+    Decoder, Exception, Frame, FrameError, Frames, MAX_BUFFERED, MAX_PDU, Request, Response, function,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -108,6 +109,7 @@ fn built(data: &[u8]) -> Result<()> {
     }
     let n = u.int_in_range(0..=300usize)?;
     let frame = Frame { transaction: u.arbitrary()?, unit: u.arbitrary()?, pdu: u.bytes(n)?.to_vec() };
+    check_wire_value(&frame);
     if let Ok(bytes) = frame.to_bytes() {
         assert_eq!(Frame::parse(&bytes), Ok(Some((frame, bytes.len()))));
     }
@@ -115,6 +117,9 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    check_decode(|| Frames, data);
+    check_wire::<Frame>(data);
+
     // The stream, split two ways: all at once, and a byte at a time. Both
     // give the same frames and the same error.
     let (frames, err) = split(data, false);
@@ -123,6 +128,7 @@ fuzz_target!(|data: &[u8]| {
     for f in &frames {
         // A frame read can be written, and reads back the same.
         let bytes = f.to_bytes().unwrap();
+        check_wire::<Frame>(&bytes);
         let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, f);
         assert_eq!(used, bytes.len());
