@@ -1,5 +1,5 @@
-//! Application protocols: DNS, DHCP, HTTP/1.1, HTTP/2, and TLS, which is
-//! decrypted when the world's TLS stack gave its session keys.
+//! Application protocols: DNS, DHCP, HTTP/1.1, HTTP/2, Modbus/TCP, and TLS,
+//! which is decrypted when the world's TLS stack gave its session keys.
 //!
 //! A [`Conversation`] is one TCP connection, both ways. It guesses the
 //! protocol from the ports and the first bytes, then decodes each
@@ -212,6 +212,7 @@ enum Proto {
     Tls(Box<Tls>),
     Http1,
     Http2,
+    Modbus,
     /// Not a protocol this decodes.
     Opaque,
 }
@@ -335,6 +336,8 @@ impl Conversation {
             let b = &self.dirs[i].buf;
             self.proto = if self.ports.0 == 53 || self.ports.1 == 53 {
                 Proto::Dns
+            } else if self.ports.0 == MODBUS_PORT || self.ports.1 == MODBUS_PORT {
+                Proto::Modbus
             } else if b.len() >= 2 && b[0] == 0x16 && b[1] == 0x03 {
                 Proto::Tls(Box::default())
             } else if b.starts_with(HTTP2_PREFACE) || (b.len() < HTTP2_PREFACE.len() && HTTP2_PREFACE.starts_with(b)) {
@@ -354,6 +357,13 @@ impl Conversation {
             Proto::Dns => dns_stream(&mut self.dirs[i], place, d),
             Proto::Http1 => http1(&mut self.dirs[i], &mut self.methods, place, d),
             Proto::Http2 => http2(&mut self.dirs[i], place, d),
+            Proto::Modbus => {
+                // Direction 0 is from the endpoint on `ports.0`.
+                let to = if i == 0 { self.ports.1 } else { self.ports.0 };
+                if !modbus_stream(&mut self.dirs[i], to == MODBUS_PORT, place, d) {
+                    self.proto = Proto::Opaque;
+                }
+            }
             Proto::Tls(tls) => tls.data(i, &mut self.dirs[i], place, d, keys),
             Proto::Opaque | Proto::Unknown => {
                 let n = self.dirs[i].buf.len();
@@ -385,6 +395,87 @@ fn dns_stream(dir: &mut Dir, place: Place, d: &mut Decoded) {
         let msg = dir.buf[2..2 + len].to_vec();
         dns(&msg, place, dir.start + 2, d);
         dir.consume(2 + len);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Modbus/TCP
+
+const MODBUS_PORT: u16 = crate::stdlib::modbus::PORT;
+
+/// Modbus/TCP: frames after their 7-byte header. `request` says whether
+/// this direction goes to the server. Returns false if the stream is not
+/// Modbus, so the conversation stops decoding it.
+fn modbus_stream(dir: &mut Dir, request: bool, place: Place, d: &mut Decoded) -> bool {
+    use crate::stdlib::modbus::{Frame, Request, Response};
+    loop {
+        let (frame, used) = match Frame::parse(&dir.buf) {
+            Ok(Some(f)) => f,
+            Ok(None) => return true,
+            Err(_) => return false,
+        };
+        let (buf, base) = place.locate(d, dir.start, &dir.buf[..used], "Modbus/TCP frame");
+        let mut l = Layer::new("Modbus/TCP", buf, (base, base + used));
+        l.field("Transaction identifier", frame.transaction.to_string(), (base, base + 2));
+        l.field("Protocol identifier", "0".to_owned(), (base + 2, base + 4));
+        l.field("Length", (used - 6).to_string(), (base + 4, base + 6));
+        l.field("Unit identifier", frame.unit.to_string(), (base + 6, base + 7));
+        let function = frame.function().unwrap_or(0);
+        l.field("Function code", format!("{} ({})", function & 0x7f, modbus_function(function & 0x7f)), (base + 7, base + 8));
+        let detail = if request {
+            match Request::parse(&frame.pdu) {
+                Ok(Request::ReadCoils { address, quantity })
+                | Ok(Request::ReadDiscreteInputs { address, quantity })
+                | Ok(Request::ReadHoldingRegisters { address, quantity })
+                | Ok(Request::ReadInputRegisters { address, quantity }) => format!("address {address}, quantity {quantity}"),
+                Ok(Request::WriteSingleCoil { address, value }) => format!("address {address}, {}", if value { "on" } else { "off" }),
+                Ok(Request::WriteSingleRegister { address, value }) => format!("address {address}, value {value}"),
+                Ok(Request::WriteMultipleCoils { address, values }) => format!("address {address}, {} coils", values.len()),
+                Ok(Request::WriteMultipleRegisters { address, values }) => {
+                    format!("address {address}, values {values:?}")
+                }
+                Ok(Request::Other { data, .. }) => format!("{} bytes of data", data.len()),
+                Err(e) => format!("malformed: a server answers {e}"),
+            }
+        } else {
+            match Response::parse(&frame.pdu) {
+                Ok((_, Response::Bits(bits))) => format!("{} bits", bits.len()),
+                Ok((_, Response::Registers(regs))) => format!("registers {regs:?}"),
+                Ok((_, Response::WriteSingleCoil { address, value })) => {
+                    format!("address {address}, {}", if value { "on" } else { "off" })
+                }
+                Ok((_, Response::WriteSingleRegister { address, value })) => format!("address {address}, value {value}"),
+                Ok((_, Response::WriteMultiple { address, quantity })) => format!("address {address}, quantity {quantity}"),
+                Ok((_, Response::Exception(e))) => format!("exception: {e}"),
+                Ok((_, Response::Other(data))) => format!("{} bytes of data", data.len()),
+                Err(_) => "malformed".to_owned(),
+            }
+        };
+        let kind = if request { "Query" } else { "Response" };
+        l.summary = format!("{kind}, transaction {}, unit {}: {detail}", frame.transaction, frame.unit);
+        l.note(if request { "Request" } else { "Response" }, detail.clone());
+        d.push(l);
+        info(
+            d,
+            2,
+            "Modbus/TCP",
+            &format!("{kind}: Trans: {}; Unit: {}, Func: {}: {}", frame.transaction, frame.unit, function & 0x7f, modbus_function(function & 0x7f)),
+        );
+        dir.consume(used);
+    }
+}
+
+fn modbus_function(f: u8) -> &'static str {
+    match f {
+        1 => "Read Coils",
+        2 => "Read Discrete Inputs",
+        3 => "Read Holding Registers",
+        4 => "Read Input Registers",
+        5 => "Write Single Coil",
+        6 => "Write Single Register",
+        15 => "Write Multiple Coils",
+        16 => "Write Multiple Registers",
+        _ => "Other",
     }
 }
 
@@ -1531,6 +1622,27 @@ mod tests {
         }
         assert_eq!(infos[0], "DNS message of 39959 bytes, not decoded");
         assert!(infos.last().unwrap().starts_with("Standard query response 0x1234"), "{infos:?}");
+    }
+
+    #[test]
+    fn modbus_requests_and_responses() {
+        // Port 40000 sorts first, so direction 0 (false) is the client's.
+        let mut f = Feeder::new((40000, 502));
+        let query = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
+        // Split across packets, it is decoded when the last byte comes.
+        let d = f.send(false, &query, 5);
+        assert_eq!(d.proto, "Modbus/TCP");
+        assert_eq!(d.info, "Query: Trans: 7; Unit: 1, Func: 3: Read Holding Registers");
+        assert!(has(&d, "Request", "address 2, quantity 1"));
+        let d = f.send(true, &[0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2], 1500);
+        assert!(has(&d, "Response", "registers [1234]"));
+        let d = f.send(true, &[0, 8, 0, 0, 0, 3, 1, 0x83, 2], 1500);
+        assert!(has(&d, "Response", "exception: illegal data address"));
+        // Bytes that are not Modbus stop the decoding.
+        let d = f.send(false, &[0, 9, 0, 5, 0, 6, 1, 3, 0, 0, 0, 1], 1500);
+        assert_ne!(d.proto, "Modbus/TCP");
+        let d = f.send(false, &query, 1500);
+        assert_ne!(d.proto, "Modbus/TCP");
     }
 
     /// Seals one TLS 1.3 record with the key from `secret`.

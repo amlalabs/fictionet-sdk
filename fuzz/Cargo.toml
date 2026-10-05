@@ -109,3 +109,38 @@ path = "fuzz_targets/web_http.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "modbus"
+path = "fuzz_targets/modbus.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mqtt"
+path = "fuzz_targets/mqtt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ntp"
+path = "fuzz_targets/ntp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resp"
+path = "fuzz_targets/resp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tftp"
+path = "fuzz_targets/tftp.rs"
+test = false
+doc = false
+bench = false

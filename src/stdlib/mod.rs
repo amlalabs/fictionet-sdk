@@ -129,8 +129,13 @@ pub mod dhcp;
 pub mod dns;
 pub mod icmp;
 pub mod ip;
+pub mod modbus;
+pub mod mqtt;
+pub mod ntp;
+pub mod resp;
 pub mod route;
 pub mod tcp;
+pub mod tftp;
 pub mod tls;
 #[doc(hidden)]
 pub mod transport;
