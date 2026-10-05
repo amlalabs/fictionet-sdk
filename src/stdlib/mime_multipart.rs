@@ -594,6 +594,8 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
 /// The preamble and epilogue are skipped. Parts include their headers and
 /// body, so chunking does not change items. Each part and the preamble are
 /// bounded by [`MAX_PART`]. EOF may finish a closing boundary without CR LF.
+/// Completed headers are validated and held as parsed state until the body
+/// ends.
 /// A partial header returns [`Step::Need`]. An unclosed body returns
 /// [`Error::Truncated`]. Other syntax and limit errors also end the stream.
 /// Capacity is [`MAX_PART`] plus [`MAX_BOUNDARY_LINE`] plus one overflow byte.
@@ -619,7 +621,8 @@ pub struct Parts {
     state: State,
     scanned: usize,
     preamble_bytes: usize,
-    header_end: Option<usize>,
+    header_bytes: usize,
+    headers: Headers,
     parts: usize,
 }
 
@@ -636,7 +639,8 @@ impl Parts {
             state: State::Preamble,
             scanned: 0,
             preamble_bytes: 0,
-            header_end: None,
+            header_bytes: 0,
+            headers: Headers::default(),
             parts: 0,
         })
     }
@@ -687,7 +691,10 @@ impl Decode for Parts {
     }
 
     fn held(&self) -> usize {
-        self.delim.len()
+        self.headers.fields.iter().fold(
+            self.delim.len(),
+            |n, (name, value)| n.saturating_add(name.len()).saturating_add(value.len()),
+        )
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Part>, Error> {
@@ -699,7 +706,7 @@ impl Decode for Parts {
             });
         }
         let preamble = self.state == State::Preamble;
-        if !preamble && self.header_end.is_none() {
+        if self.state == State::Headers {
             if self.parts >= MAX_PARTS {
                 return Err(Error::TooManyParts);
             }
@@ -710,15 +717,32 @@ impl Decode for Parts {
                 }
                 return Ok(Step::Need);
             };
-            self.header_end = Some(end);
-            self.scanned = end.saturating_sub(2);
+            self.headers = parse_headers(input.get(..end.saturating_sub(2)).unwrap_or_default())?;
+            self.header_bytes = end;
+            self.state = State::Body;
+            self.scanned = 0;
+            return Ok(Step::Skip(end));
         }
-        let (at, found) = self.boundary(input, eof, preamble && self.preamble_bytes == 0);
-        let part_end = at.max(self.header_end.unwrap_or(0));
+        // A consumed header block supplies the implicit CR LF before an
+        // empty body's boundary, just as at the start of the multipart.
+        let first = !preamble || self.preamble_bytes == 0;
+        let (at, found) = self.boundary(input, eof, first);
+        // Consume the same preamble prefix before any boundary or limit
+        // error, whether it arrived together with that error or earlier.
+        if preamble && at > 0 {
+            let room = MAX_PART.saturating_sub(self.preamble_bytes);
+            if room == 0 {
+                return Err(Error::TooLong);
+            }
+            let n = at.min(room);
+            self.preamble_bytes = self.preamble_bytes.saturating_add(n);
+            self.scanned = 0;
+            return Ok(Step::Skip(n));
+        }
         let size = if preamble {
-            self.preamble_bytes.saturating_add(part_end)
+            self.preamble_bytes.saturating_add(at)
         } else {
-            part_end
+            self.header_bytes.saturating_add(at)
         };
         if size > MAX_PART {
             return Err(Error::TooLong);
@@ -734,20 +758,16 @@ impl Decode for Parts {
                 if eof && (!preamble || (size > 0 && at == input.len())) {
                     return Err(Error::Truncated);
                 }
-                if preamble && at > 0 {
-                    self.preamble_bytes = self.preamble_bytes.saturating_add(at);
-                    self.scanned = 0;
-                    return Ok(Step::Skip(at));
-                }
                 return Ok(Step::Need);
             }
         };
         let item = if preamble {
             None
         } else {
-            Some(<Part as Wire>::parse(
-                input.get(..part_end).unwrap_or_default(),
-            )?)
+            Some(Part {
+                headers: core::mem::take(&mut self.headers),
+                body: input.get(..at).unwrap_or_default().to_vec(),
+            })
         };
         self.state = if closed {
             State::Epilogue
@@ -755,7 +775,7 @@ impl Decode for Parts {
             State::Headers
         };
         self.scanned = 0;
-        self.header_end = None;
+        self.header_bytes = 0;
         Ok(match item {
             Some(part) => {
                 self.parts = self.parts.saturating_add(1);

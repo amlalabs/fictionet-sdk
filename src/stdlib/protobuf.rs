@@ -792,6 +792,8 @@ pub enum Framing {
 }
 
 /// One message taken from a stream, still as bytes.
+/// Its [`Wire`] form uses gRPC framing to preserve the compression flag;
+/// [`DelimitedFrame`] fixes the wire form to a varint length instead.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
     /// Whether the sender compressed the message. This module does not

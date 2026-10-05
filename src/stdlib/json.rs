@@ -964,13 +964,6 @@ impl Decode for Values {
             }
         }
         while let Some(&c) = input.get(self.pos) {
-            if self.pos >= self.limits.size() {
-                // A scalar of exactly the limit may end before this byte.
-                if self.scan == Scan::Scalar && !is_scalar_byte(c) {
-                    return self.value(input, self.pos, false);
-                }
-                return Err(self.error(ErrorKind::TooLarge, self.limits.size()));
-            }
             let mut end = None;
             match &mut self.scan {
                 Scan::Idle => {
@@ -1007,7 +1000,12 @@ impl Decode for Values {
                             b'{' | b'[' => {
                                 *depth = depth.saturating_add(1);
                                 if *depth > self.limits.depth() {
-                                    return Err(self.error(ErrorKind::TooDeep, self.pos));
+                                    // Report an earlier syntax error, as Decoder does.
+                                    let prefix = input.get(..=self.pos).unwrap_or_default();
+                                    let e = parse_with(prefix, &self.limits)
+                                        .err()
+                                        .unwrap_or(Error::at(ErrorKind::TooDeep, self.pos));
+                                    return Err(self.error(e.kind, e.offset));
                                 }
                             }
                             b'}' | b']' => {
@@ -1034,6 +1032,11 @@ impl Decode for Values {
                         return self.value(input, self.pos, false);
                     }
                 }
+            }
+            // Container depth takes precedence, as in Decoder. A scalar
+            // at the size limit may already have ended before this byte.
+            if self.pos >= self.limits.size() {
+                return Err(self.error(ErrorKind::TooLarge, self.limits.size()));
             }
             self.pos = self.pos.saturating_add(1);
             if let Some(end) = end {

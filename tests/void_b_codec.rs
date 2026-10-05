@@ -134,6 +134,44 @@ fn json_scalar_delimiter_errors_match_legacy() {
 }
 
 #[test]
+#[allow(deprecated)]
+fn json_depth_errors_match_legacy() {
+    let mut nested = b"[1".to_vec();
+    nested.extend_from_slice(&[b'['; 128]);
+    for (input, limits) in [
+        (nested, json::Limits::default()),
+        (b"{{".to_vec(), json::Limits { depth: 1, ..json::Limits::default() }),
+    ] {
+        let expected = json::parse_with(&input, &limits).unwrap_err();
+        let mut legacy = json::Decoder::with_limits(limits);
+        legacy.feed(&input);
+        assert_eq!(legacy.next_value(), Some(Err(expected)));
+        for chunk in [1, input.len()] {
+            assert_eq!(
+                run(json::Values::with_limits(limits), &input, chunk).1,
+                Some(Fail::Protocol(expected))
+            );
+        }
+        contract::check_decode(|| json::Values::with_limits(limits), &input);
+    }
+}
+
+#[test]
+#[allow(deprecated)]
+fn json_zero_depth_precedes_zero_size_as_in_legacy_decoder() {
+    let limits = json::Limits { depth: 0, size: 0, ..json::Limits::default() };
+    let expected = json::Error { kind: json::ErrorKind::TooDeep, offset: 0 };
+    let mut legacy = json::Decoder::with_limits(limits);
+    legacy.feed(b"[");
+    assert_eq!(legacy.next_value(), Some(Err(expected)));
+    assert_eq!(
+        run(json::Values::with_limits(limits), b"[", 1).1,
+        Some(Fail::Protocol(expected))
+    );
+    contract::check_decode(|| json::Values::with_limits(limits), b"[");
+}
+
+#[test]
 fn form_stream_accepts_expanding_replacement_text() {
     let mut input = b"a=".to_vec();
     input.extend(vec![0xff; 200_000]);
@@ -163,6 +201,48 @@ fn multipart_skips_preamble_without_buffering_it() {
     assert_eq!(stream.unread(), b"\r\n--b");
     pump(&mut stream, b"--\r\n", |_| panic!("no part yet")).unwrap();
     finish(&mut stream, |_| panic!("no parts")).unwrap();
+}
+
+#[test]
+fn multipart_preamble_padding_with_crlf_contract() {
+    let mut input = b"x\r\n--a".to_vec();
+    input.extend_from_slice(&[b' '; 65]);
+    input.extend_from_slice(b"\r\n");
+    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input);
+}
+
+#[test]
+fn multipart_preamble_padding_without_crlf_contract() {
+    let mut input = b"x\r\n--a".to_vec();
+    input.extend_from_slice(&[b' '; 65]);
+    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input);
+}
+
+#[test]
+fn multipart_preamble_over_limit_with_boundary_contract() {
+    let mut input = vec![b'x'; mime::MAX_PART + 10];
+    input.extend_from_slice(b"\r\n--b--\r\n");
+    contract::check_decode(|| mime::Parts::new("b").unwrap(), &input);
+}
+
+#[test]
+fn multipart_preamble_over_limit_without_boundary_contract() {
+    let input = vec![b'p'; mime::MAX_PART + 10];
+    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input);
+}
+
+#[test]
+fn multipart_preamble_fuzz_crash_contract() {
+    let mut input = b"\r\n--=a  \r\n--a".to_vec();
+    input.extend_from_slice(&[b'\t'; 17]);
+    input.extend_from_slice(&[b' '; 27]);
+    input.extend_from_slice(&[b'\t'; 3]);
+    input.extend_from_slice(&[b' '; 20]);
+    input.extend_from_slice(&[b'\t'; 2]);
+    // The fuzz target uses 0x0d % 8 candidate bytes as the boundary.
+    // They start with LF, so it falls back to "a" and drops only 0x0d.
+    assert!(!mime::valid_boundary(std::str::from_utf8(&input[1..6]).unwrap()));
+    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input[1..]);
 }
 
 #[test]
@@ -413,6 +493,80 @@ fn multipart_chunked_round_trip_and_eof() {
         run(make(), b"--boundary\r\nX: value", 1).1,
         Some(Fail::Truncated { .. })
     ));
+}
+
+#[test]
+fn multipart_header_errors_match_legacy_before_body_ends() {
+    let mut too_many = b"--b\r\n".to_vec();
+    for _ in 0..=mime::MAX_HEADERS {
+        too_many.extend_from_slice(b"X: a\r\n");
+    }
+    too_many.extend_from_slice(b"\r\nunterminated");
+    for (input, expected) in [
+        (b"\r\n--b\r\n\r\r\n\r\n\xff a\r\n\xff\r\n\r".as_slice(), mime::Error::Header),
+        (too_many.as_slice(), mime::Error::TooManyHeaders),
+    ] {
+        assert_eq!(mime::Multipart::parse(input, "b"), Err(expected));
+        let make = || mime::Parts::new("b").unwrap();
+        let mut stream = Stream::new(make());
+        assert_eq!(
+            pump(&mut stream, input, |_| panic!("invalid headers")),
+            Err(Fail::Protocol(expected))
+        );
+        for chunk in [1, input.len()] {
+            assert_eq!(run(make(), input, chunk), (vec![], Some(Fail::Protocol(expected))));
+        }
+        contract::check_decode(make, input);
+    }
+}
+
+#[test]
+fn multipart_matches_legacy_on_generated_bodies() {
+    use fictionet::stdlib::codec::test_support::Lcg;
+    let starts: &[&[u8]] = &[
+        b"preamble",
+        b"--b\r\n",
+        b"x\r\n--b\r\n\r\n",
+        b"--b\r\nX: a\r\n folded\r\n\r\n",
+    ];
+    let tokens: &[&[u8]] = &[
+        b"X: a\r\n", b"\r\n", b"x", b"\r", b"\n", b"--b", b"--b--",
+        b"\t", b"\xff", b":", b" ", b"\r\n--b\r\n", b"\r\n--b--\r\n",
+    ];
+    let mut rng = Lcg::new(0x726f756e6432);
+    for _ in 0..2000 {
+        let mut input = starts[rng.below(starts.len() as u64) as usize].to_vec();
+        for _ in 0..rng.below(40) {
+            input.extend_from_slice(tokens[rng.below(tokens.len() as u64) as usize]);
+        }
+        let expected = mime::Multipart::parse(&input, "b").map(|body| body.parts);
+        for chunk in [1, input.len()] {
+            let (parts, error) = run(mime::Parts::new("b").unwrap(), &input, chunk);
+            let actual = match error {
+                None => Ok(parts),
+                Some(Fail::Protocol(e)) => Err(e),
+                Some(Fail::Truncated { .. }) => Err(mime::Error::Truncated),
+                Some(e) => panic!("{e:?}"),
+            };
+            assert_eq!(actual, expected, "input {input:?}, chunk {chunk}");
+        }
+    }
+}
+
+#[test]
+fn multipart_parsed_headers_are_held_until_the_part_ends() {
+    let mut stream = Stream::new(mime::Parts::new("b").unwrap());
+    let initial = stream.held();
+    pump(&mut stream, b"--b\r\nX: value\r\n\r\n", |_| panic!("no part yet")).unwrap();
+    assert_eq!(stream.held(), initial + "X".len() + "value".len());
+    pump(&mut stream, b"body", |_| panic!("no part yet")).unwrap();
+    let mut parts = Vec::new();
+    pump(&mut stream, b"\r\n--b--\r\n", |part| parts.push(part)).unwrap();
+    assert_eq!(parts.len(), 1);
+    assert_eq!(parts[0].headers.get("x"), Some("value"));
+    assert_eq!(parts[0].body, b"body");
+    assert_eq!(stream.held(), initial);
+    finish(&mut stream, |_| panic!("no more parts")).unwrap();
 }
 
 #[test]

@@ -380,7 +380,7 @@ pub enum FieldError {
     Form(FormError),
     /// No field was present.
     Empty,
-    /// A separator followed the field in an exact parse.
+    /// An exact field parse contained a separator.
     Trailing,
 }
 
@@ -389,7 +389,7 @@ impl core::fmt::Display for FieldError {
         match self {
             Self::Form(e) => e.fmt(f),
             Self::Empty => f.write_str("no form field"),
-            Self::Trailing => f.write_str("separator after the form field"),
+            Self::Trailing => f.write_str("separator in an exact form field"),
         }
     }
 }
@@ -428,7 +428,8 @@ impl Wire for Field {
 /// Limits apply to the entire input form, as in [`parse`]. Writing a field
 /// also checks that its canonical encoding fits [`MAX_INPUT`].
 /// Capacity is [`MAX_INPUT`] plus one byte to detect overflow.
-/// Errors end the stream. Use [`codec::Stream`](super::codec::Stream) to drive this decoder.
+/// Only [`FieldError::Form`] occurs from the stream, and ends it.
+/// Use [`codec::Stream`](super::codec::Stream) to drive this decoder.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, finish, pump}, urlencoded_form::{Field, Fields}};

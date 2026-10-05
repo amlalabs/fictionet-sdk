@@ -8,10 +8,10 @@
 //!
 //! Nothing here reads a socket. A world feeds the bytes of a body to
 //! [`Events`] through [`codec::Stream`], as they arrive, and takes [`Event`]s
-//! out: the declaration, start and end tags with their attributes, text, CDATA sections,
-//! comments and processing instructions. Names come back with their
-//! namespaces resolved. A [`Writer`] builds a document from the same
-//! pieces and escapes what needs escaping.
+//! out: the declaration, start and end tags with their attributes, text,
+//! CDATA sections, comments and processing instructions. Names come back
+//! with their namespaces resolved. A [`Writer`] builds a document from the
+//! same pieces and escapes what needs escaping.
 //!
 //! The parser does not validate. It checks that a document is well formed,
 //! resolves the five predefined entities (`&lt;` and the rest) and character
@@ -2430,6 +2430,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock performance comparison; run manually on an idle machine"]
     fn codec_namespace_heavy_decode_cost() {
         use std::time::{Duration, Instant};
 
