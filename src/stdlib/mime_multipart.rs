@@ -21,6 +21,11 @@
 //! picks a boundary that appears nowhere in the parts, so what it writes
 //! always reads back the same.
 //!
+//! Use [`Parts`] with [`super::codec::Stream`] for bounded complete parts.
+//! [`Part`] implements [`Wire`] for a header block and its body. Boundaries
+//! remain explicit configuration. The deprecated [`Parser`] keeps its
+//! original buffering and event behavior.
+//!
 //! ```
 //! use fictionet::stdlib::mime_multipart::{boundary, Multipart, Part};
 //!
@@ -53,6 +58,16 @@
 //! assert_eq!(Multipart::parse(&bytes, &chosen).unwrap(), reply);
 //! ```
 
+extern crate alloc;
+
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
+use super::codec::{Decode, Step, Wire};
+
 /// The longest boundary RFC 2046 allows.
 pub const MAX_BOUNDARY: usize = 70;
 /// The most parts one body may hold.
@@ -68,6 +83,13 @@ pub const MAX_PARAMETERS: usize = 16;
 /// The most spaces and tabs read after a boundary, before the line ends.
 /// A boundary followed by more is [`Error::Padding`].
 pub const MAX_PADDING: usize = 64;
+/// The codec API's cap on one part, including headers, or on the preamble.
+/// MIME has no part size maximum. This module caps new codec callers at
+/// 4 MiB. The compatibility [`Parser`] and [`Multipart`] keep their limits.
+pub const MAX_PART: usize = 4 * 1024 * 1024;
+/// The longest boundary line, including CR LF, dashes, padding, and CR LF.
+/// Derived from RFC 2046's [`MAX_BOUNDARY`] and this module's [`MAX_PADDING`].
+pub const MAX_BOUNDARY_LINE: usize = MAX_BOUNDARY + MAX_PADDING + 8;
 /// How many bytes [`Multipart::parse`] hands its [`Parser`] at a time.
 const PARSE_CHUNK: usize = 64 * 1024;
 /// The buffer capacity a [`Parser`] keeps when it holds few bytes. A
@@ -97,10 +119,12 @@ pub enum Error {
     /// any amount of padding, but a body part may not hold the boundary at
     /// all, so the parser refuses the body rather than guess.
     Padding,
+    /// A codec part or preamble is longer than [`MAX_PART`].
+    TooLong,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Error::Boundary => "not a valid multipart boundary",
             Error::Truncated => "multipart body ended before its closing boundary",
@@ -109,11 +133,12 @@ impl std::fmt::Display for Error {
             Error::TooManyHeaders => "multipart part has too many header fields",
             Error::Header => "malformed multipart part header",
             Error::Padding => "multipart boundary line has too much padding",
+            Error::TooLong => "multipart part or preamble is over the codec size limit",
         })
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Why a [`Multipart`] cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -133,10 +158,12 @@ pub enum WriteError {
     HeaderName,
     /// A header value holds CR or LF, or starts or ends with a space or tab.
     HeaderValue,
+    /// A codec part is longer than [`MAX_PART`], including its headers.
+    TooLong,
 }
 
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             WriteError::Boundary => "not a valid multipart boundary",
             WriteError::BoundaryInData => "the boundary appears in the data",
@@ -145,11 +172,12 @@ impl std::fmt::Display for WriteError {
             WriteError::HeaderTooLong => "a part's header block is too long",
             WriteError::HeaderName => "a header name is not valid",
             WriteError::HeaderValue => "a header value is not valid",
+            WriteError::TooLong => "multipart part is over the codec size limit",
         })
     }
 }
 
-impl std::error::Error for WriteError {}
+impl core::error::Error for WriteError {}
 
 /// Whether `b` is a boundary RFC 2046 allows: 1 to 70 characters from its
 /// set (letters, digits, space and `'()+_,-./:=?`), not ending in a space.
@@ -491,6 +519,273 @@ impl Part {
     }
 }
 
+impl Wire for Part {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads one header block and its complete body, without boundary lines.
+    /// Every byte after the empty header line belongs to the body.
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        if input.len() > MAX_PART {
+            return Err(Error::TooLong);
+        }
+        let end = part_header_end(input, 0)?.ok_or(Error::Truncated)?;
+        let headers = parse_headers(input.get(..end.saturating_sub(2)).unwrap_or_default())?;
+        Ok(Self {
+            headers,
+            body: input.get(end..).unwrap_or_default().to_vec(),
+        })
+    }
+
+    /// Appends one part without boundary lines. Header names, values, counts,
+    /// and lengths are checked before any bytes are appended.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if self.headers.fields.len() > MAX_HEADERS {
+            return Err(WriteError::TooManyHeaders);
+        }
+        for (name, value) in &self.headers.fields {
+            if name.is_empty() || !name.bytes().all(is_ftext) {
+                return Err(WriteError::HeaderName);
+            }
+            if !valid_value(value) {
+                return Err(WriteError::HeaderValue);
+            }
+        }
+        // Compact separators ensure a parsed header block can be written
+        // within the same size limit, including folded input headers.
+        let header = header_block_size(self, 1);
+        if header > MAX_HEADER_BYTES {
+            return Err(WriteError::HeaderTooLong);
+        }
+        if header.saturating_add(self.body.len()) > MAX_PART {
+            return Err(WriteError::TooLong);
+        }
+        for (name, value) in &self.headers.fields {
+            out.extend_from_slice(name.as_bytes());
+            out.push(b':');
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
+        }
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(&self.body);
+        Ok(())
+    }
+}
+
+fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error> {
+    let limit = input.len().min(MAX_HEADER_BYTES);
+    let from = scanned.saturating_sub(3).min(limit);
+    let end = if input.starts_with(b"\r\n") {
+        Some(2)
+    } else {
+        input
+            .get(from..limit)
+            .and_then(|r| find(r, b"\r\n\r\n"))
+            .map(|i| from.saturating_add(i).saturating_add(4))
+    };
+    if end.is_none() && input.len() >= MAX_HEADER_BYTES {
+        return Err(Error::HeaderTooLong);
+    }
+    Ok(end)
+}
+
+/// Reads complete multipart parts without retaining input bytes.
+///
+/// The preamble and epilogue are skipped. Parts include their headers and
+/// body, so chunking does not change items. Each part and the preamble are
+/// bounded by [`MAX_PART`]. EOF may finish a closing boundary without CR LF.
+/// Completed headers are validated and held as parsed state until the body
+/// ends.
+/// A partial header returns [`Step::Need`]. An unclosed body returns
+/// [`Error::Truncated`]. Other syntax and limit errors also end the stream.
+/// Capacity is [`MAX_PART`] plus [`MAX_BOUNDARY_LINE`] plus one overflow byte.
+/// Use [`codec::Stream`](super::codec::Stream) to hold the bounded input.
+/// An empty stream ends cleanly with no items, unlike [`Multipart::parse`],
+/// while a preamble-only body is an error.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, mime_multipart::Parts};
+///
+/// let mut stream = Stream::new(Parts::new("b").unwrap());
+/// let mut parts = Vec::new();
+/// pump(&mut stream, b"--b\r\n\r\nhello", |part| parts.push(part))?;
+/// pump(&mut stream, b"\r\n--b--\r\n", |part| parts.push(part))?;
+/// finish(&mut stream, |part| parts.push(part))?;
+/// assert_eq!(parts.len(), 1);
+/// assert_eq!(parts[0].body, b"hello");
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::mime_multipart::Error>>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct Parts {
+    delim: Vec<u8>,
+    state: State,
+    scanned: usize,
+    preamble_bytes: usize,
+    header_bytes: usize,
+    headers: Headers,
+    parts: usize,
+}
+
+impl Parts {
+    /// Starts a body with the supplied RFC 2046 boundary, without `--`.
+    pub fn new(boundary: &str) -> Result<Self, Error> {
+        if !valid_boundary(boundary) {
+            return Err(Error::Boundary);
+        }
+        let mut delim = b"\r\n--".to_vec();
+        delim.extend_from_slice(boundary.as_bytes());
+        Ok(Self {
+            delim,
+            state: State::Preamble,
+            scanned: 0,
+            preamble_bytes: 0,
+            header_bytes: 0,
+            headers: Headers::default(),
+            parts: 0,
+        })
+    }
+
+    fn boundary(&mut self, input: &[u8], eof: bool, first: bool) -> (usize, Found) {
+        // The first line has an implicit preceding CR LF. The temporary
+        // prefix is bounded by the maximum boundary line, never the body.
+        if first && self.scanned == 0 {
+            let head = input
+                .get(..input.len().min(MAX_BOUNDARY_LINE))
+                .unwrap_or_default();
+            let mut initial = b"\r\n".to_vec();
+            initial.extend_from_slice(head);
+            let (at, found) = scan(&initial, &self.delim, eof && head.len() == input.len());
+            if at == 0 {
+                return (
+                    0,
+                    match found {
+                        Found::Delim(n) => Found::Delim(n.saturating_sub(2)),
+                        Found::Close(n) => Found::Close(n.saturating_sub(2)),
+                        other => other,
+                    },
+                );
+            }
+        }
+        let from = self.scanned;
+        let (at, found) = scan(input.get(from..).unwrap_or_default(), &self.delim, eof);
+        let at = from.saturating_add(at);
+        self.scanned = at;
+        (
+            at,
+            match found {
+                Found::Delim(n) => Found::Delim(from.saturating_add(n)),
+                Found::Close(n) => Found::Close(from.saturating_add(n)),
+                other => other,
+            },
+        )
+    }
+}
+
+impl Decode for Parts {
+    type Item = Part;
+    type Error = Error;
+    const NAME: &'static str = "MIME multipart";
+
+    fn capacity(&self) -> usize {
+        MAX_PART.saturating_add(MAX_BOUNDARY_LINE).saturating_add(1)
+    }
+
+    fn held(&self) -> usize {
+        self.headers.fields.iter().fold(
+            self.delim.len(),
+            |n, (name, value)| n.saturating_add(name.len()).saturating_add(value.len()),
+        )
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Part>, Error> {
+        if self.state == State::Epilogue {
+            return Ok(if input.is_empty() {
+                Step::Need
+            } else {
+                Step::Skip(input.len())
+            });
+        }
+        let preamble = self.state == State::Preamble;
+        if self.state == State::Headers {
+            if self.parts >= MAX_PARTS {
+                return Err(Error::TooManyParts);
+            }
+            let Some(end) = part_header_end(input, self.scanned)? else {
+                self.scanned = input.len();
+                if eof && input.is_empty() {
+                    return Err(Error::Truncated);
+                }
+                return Ok(Step::Need);
+            };
+            self.headers = parse_headers(input.get(..end.saturating_sub(2)).unwrap_or_default())?;
+            self.header_bytes = end;
+            self.state = State::Body;
+            self.scanned = 0;
+            return Ok(Step::Skip(end));
+        }
+        // A consumed header block supplies the implicit CR LF before an
+        // empty body's boundary, just as at the start of the multipart.
+        let first = !preamble || self.preamble_bytes == 0;
+        let (at, found) = self.boundary(input, eof, first);
+        // Consume the same preamble prefix before any boundary or limit
+        // error, whether it arrived together with that error or earlier.
+        if preamble && at > 0 {
+            let room = MAX_PART.saturating_sub(self.preamble_bytes);
+            if room == 0 {
+                return Err(Error::TooLong);
+            }
+            let n = at.min(room);
+            self.preamble_bytes = self.preamble_bytes.saturating_add(n);
+            self.scanned = 0;
+            return Ok(Step::Skip(n));
+        }
+        let size = if preamble {
+            self.preamble_bytes.saturating_add(at)
+        } else {
+            self.header_bytes.saturating_add(at)
+        };
+        if size > MAX_PART {
+            return Err(Error::TooLong);
+        }
+        let (used, closed) = match found {
+            Found::Delim(n) => (n, false),
+            Found::Close(n) => (n, true),
+            Found::Padding => return Err(Error::Padding),
+            Found::Wait => {
+                if input.len() >= self.capacity() {
+                    return Err(Error::TooLong);
+                }
+                if eof && (!preamble || (size > 0 && at == input.len())) {
+                    return Err(Error::Truncated);
+                }
+                return Ok(Step::Need);
+            }
+        };
+        let item = if preamble {
+            None
+        } else {
+            Some(Part {
+                headers: core::mem::take(&mut self.headers),
+                body: input.get(..at).unwrap_or_default().to_vec(),
+            })
+        };
+        self.state = if closed {
+            State::Epilogue
+        } else {
+            State::Headers
+        };
+        self.scanned = 0;
+        self.header_bytes = 0;
+        Ok(match item {
+            Some(part) => {
+                self.parts = self.parts.saturating_add(1);
+                Step::Item(part, used)
+            }
+            None => Step::Skip(used),
+        })
+    }
+}
+
 /// A whole multipart body: the preamble, the parts and the epilogue.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Multipart {
@@ -506,6 +801,7 @@ pub struct Multipart {
 impl Multipart {
     /// Reads a whole multipart body whose parts are separated by
     /// `boundary` (without the leading `--`).
+    #[allow(deprecated)] // Preserve the one-shot parser behavior.
     pub fn parse(body: &[u8], boundary: &str) -> Result<Multipart, Error> {
         let mut p = Parser::new(boundary)?;
         let mut m = Multipart::default();
@@ -627,7 +923,7 @@ impl Multipart {
                 let start = at + i + needle.len();
                 if let Some(hex) = s.get(start..start + 8)
                     && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-                        let text = std::str::from_utf8(hex).unwrap_or("");
+                        let text = core::str::from_utf8(hex).unwrap_or("");
                         if let Ok(n) = u32::from_str_radix(text, 16) {
                             used.push(n);
                         }
@@ -658,8 +954,8 @@ impl Multipart {
     /// body. A boundary line can only start after a line break, and none
     /// of these hold one that the writer adds, so a boundary that is in
     /// none of them is nowhere in the output before the closing line.
-    fn slices(&self) -> Vec<std::borrow::Cow<'_, [u8]>> {
-        use std::borrow::Cow;
+    fn slices(&self) -> Vec<alloc::borrow::Cow<'_, [u8]>> {
+        use alloc::borrow::Cow;
         let mut out = vec![Cow::Borrowed(self.preamble.as_slice())];
         for p in &self.parts {
             let sep = header_separator(p);
@@ -731,6 +1027,7 @@ enum State {
 /// [`Error::Padding`]. A line that starts with `--` and the boundary but
 /// goes on in any other way is body data, as in RFC 2046's grammar.
 #[derive(Clone, Debug)]
+#[deprecated(note = "use codec::Stream with mime_multipart::Parts")]
 pub struct Parser {
     /// CR LF, `--` and the boundary.
     delim: Vec<u8>,
@@ -751,6 +1048,7 @@ pub struct Parser {
     finished: bool,
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Parser {
     /// A parser for a body whose parts are separated by `boundary`
     /// (without the leading `--`). It fails if the boundary is not valid.
@@ -1093,6 +1391,7 @@ fn valid_value(v: &str) -> bool {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 

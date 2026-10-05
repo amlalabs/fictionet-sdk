@@ -10,8 +10,8 @@
 //! body of a request, calls [`parse`], looks at the [`Value`] it gets,
 //! and writes its answer with [`Value::write`]. For a stream that carries
 //! one JSON text after another, such as JSON-RPC over a TCP connection,
-//! a [`Decoder`] takes the bytes as they come and hands back each value
-//! once it is whole.
+//! [`Values`] with [`super::codec::Stream`] takes the bytes as they come
+//! and hands back each value once it is whole.
 //!
 //! The agent can send any bytes it likes, so the parser checks
 //! everything RFC 8259 asks and nothing more. It refuses what the RFC
@@ -22,6 +22,10 @@
 //! and a 30-digit integer is not rounded on the way back out. An object
 //! keeps its members in order, duplicate keys included, since RFC 8259
 //! leaves their meaning to the reader.
+//!
+//! Use [`Values`] with [`super::codec::Stream`] for bounded input and EOF
+//! handling. [`Value`] implements [`Wire`] for exact parsing and appending.
+//! The deprecated [`Decoder`] keeps its original buffering and errors.
 //!
 //! ```
 //! use fictionet::stdlib::json::{self, Number, Value};
@@ -41,6 +45,15 @@
 //! ]);
 //! assert_eq!(reply.write().unwrap(), r#"{"ok":true,"balance":-3,"note":"line 1\nline 2"}"#);
 //! ```
+
+extern crate alloc;
+
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
+use super::codec::{Decode, Step, Wire};
 
 /// The deepest nesting of arrays and objects the parser and writer
 /// accept. `[[1]]` has depth 2. [`Limits`] can lower it but not raise it.
@@ -107,8 +120,8 @@ impl PartialEq for Number {
 
 impl Eq for Number {}
 
-impl std::hash::Hash for Number {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+impl core::hash::Hash for Number {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
         self.text.hash(state);
     }
 }
@@ -405,8 +418,8 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for ErrorKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ErrorKind::UnexpectedEnd => write!(f, "the text ended in the middle of a value"),
             ErrorKind::UnexpectedByte(b) => write!(f, "unexpected byte 0x{b:02x}"),
@@ -424,13 +437,13 @@ impl std::fmt::Display for ErrorKind {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{} at byte {}", self.kind, self.offset)
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Reads one JSON text, within the default [`Limits`].
 pub fn parse(input: &[u8]) -> Result<Value, Error> {
@@ -569,7 +582,7 @@ impl Parser<'_> {
         if end - start > MAX_NUMBER_LEN {
             return Err(Error::at(ErrorKind::NumberTooLong, start));
         }
-        let Ok(text) = std::str::from_utf8(&self.b[start..end]) else {
+        let Ok(text) = core::str::from_utf8(&self.b[start..end]) else {
             return Err(Error::at(ErrorKind::BadNumber, start));
         };
         self.i = end;
@@ -664,7 +677,7 @@ impl Parser<'_> {
     /// Adds the raw bytes from `run` to the current byte, which is ASCII,
     /// so a whole character never spans the cut.
     fn flush(&self, out: &mut String, run: usize) -> Result<(), Error> {
-        match std::str::from_utf8(&self.b[run..self.i]) {
+        match core::str::from_utf8(&self.b[run..self.i]) {
             Ok(s) => {
                 out.push_str(s);
                 Ok(())
@@ -826,6 +839,217 @@ impl Writer {
     }
 }
 
+impl Wire for Value {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        parse(input)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(self.write()?.as_bytes());
+        Ok(())
+    }
+}
+
+/// Reads consecutive JSON values without holding input bytes.
+///
+/// Whitespace is skipped. Scalars end at a delimiter or EOF. Partial
+/// values return [`Step::Need`], including at EOF. Syntax and limit errors
+/// end the stream. Error offsets count from the start of the stream.
+/// Capacity is the clamped size limit plus one delimiter or overflow byte.
+/// Use [`codec::Stream`](super::codec::Stream) for bounded input and one-time errors.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, json::{Value, Values}};
+///
+/// let mut stream = Stream::new(Values::new());
+/// let mut values = Vec::new();
+/// pump(&mut stream, b"true ", |value| values.push(value))?;
+/// pump(&mut stream, b"null", |value| values.push(value))?;
+/// finish(&mut stream, |value| values.push(value))?;
+/// assert_eq!(values, vec![Value::Bool(true), Value::Null]);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::json::Error>>(())
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct Values {
+    limits: Limits,
+    pos: usize,
+    scan: Scan,
+    consumed: usize,
+}
+
+impl Values {
+    /// Reads values within the default [`Limits`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Reads values within `limits`, clamped to the module's named caps.
+    pub fn with_limits(limits: Limits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
+    fn error(&self, kind: ErrorKind, offset: usize) -> Error {
+        Error::at(kind, self.consumed.saturating_add(offset))
+    }
+
+    fn value(&mut self, input: &[u8], end: usize, eof: bool) -> Result<Step<Value>, Error> {
+        let bytes = input.get(..end).unwrap_or_default();
+        let mut result = parse_with(bytes, &self.limits);
+        if let Err(e) = result
+            && self.scan == Scan::Scalar
+            && e.kind == ErrorKind::UnexpectedEnd
+            && let Some(with_next) = input.get(..=end)
+            && let Err(e) = parse_with(with_next, &self.limits)
+        {
+            // A delimiter interrupted the scalar. Name it as Decoder does.
+            result = Err(e);
+        }
+        let value = match result {
+            Ok(value) => value,
+            Err(e) => {
+                if eof
+                    && self.scan == Scan::Scalar
+                    && matches!(e.kind, ErrorKind::UnexpectedEnd | ErrorKind::BadNumber)
+                    && scalar_prefix(bytes)
+                {
+                    return Ok(Step::Need);
+                }
+                return Err(self.error(e.kind, e.offset));
+            }
+        };
+        self.pos = 0;
+        self.scan = Scan::Idle;
+        self.consumed = self.consumed.saturating_add(end);
+        Ok(Step::Item(value, end))
+    }
+}
+
+// A scalar prefix that could become valid with more input.
+fn scalar_prefix(bytes: &[u8]) -> bool {
+    if [b"true".as_slice(), b"false", b"null"]
+        .iter()
+        .any(|word| word.starts_with(bytes))
+    {
+        return true;
+    }
+    if bytes.len() >= MAX_NUMBER_LEN {
+        return false;
+    }
+    let mut number = bytes.to_vec();
+    number.push(b'0');
+    matches!(parse(&number), Ok(Value::Number(_)))
+}
+
+impl Decode for Values {
+    type Item = Value;
+    type Error = Error;
+    const NAME: &'static str = "JSON";
+
+    fn capacity(&self) -> usize {
+        self.limits.size().saturating_add(1)
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Value>, Error> {
+        if self.scan == Scan::Idle {
+            let whitespace = input.iter().take_while(|b| is_ws(**b)).count();
+            if whitespace > 0 {
+                self.consumed = self.consumed.saturating_add(whitespace);
+                return Ok(Step::Skip(whitespace));
+            }
+        }
+        while let Some(&c) = input.get(self.pos) {
+            let mut end = None;
+            match &mut self.scan {
+                Scan::Idle => {
+                    self.scan = match c {
+                        b'{' | b'[' => Scan::Container {
+                            depth: 1,
+                            in_string: false,
+                            escape: false,
+                        },
+                        b'"' => Scan::Str { escape: false },
+                        c if is_scalar_byte(c) => Scan::Scalar,
+                        _ => return self.value(input, 1, false),
+                    };
+                    if matches!(self.scan, Scan::Container { .. }) && self.limits.depth() == 0 {
+                        return Err(self.error(ErrorKind::TooDeep, 0));
+                    }
+                }
+                Scan::Container {
+                    depth,
+                    in_string,
+                    escape,
+                } => {
+                    if *in_string {
+                        if *escape {
+                            *escape = false;
+                        } else if c == b'\\' {
+                            *escape = true;
+                        } else if c == b'"' {
+                            *in_string = false;
+                        }
+                    } else {
+                        match c {
+                            b'"' => *in_string = true,
+                            b'{' | b'[' => {
+                                *depth = depth.saturating_add(1);
+                                if *depth > self.limits.depth() {
+                                    // Report an earlier syntax error, as Decoder does.
+                                    let prefix = input.get(..=self.pos).unwrap_or_default();
+                                    let e = parse_with(prefix, &self.limits)
+                                        .err()
+                                        .unwrap_or(Error::at(ErrorKind::TooDeep, self.pos));
+                                    return Err(self.error(e.kind, e.offset));
+                                }
+                            }
+                            b'}' | b']' => {
+                                *depth = depth.saturating_sub(1);
+                                if *depth == 0 {
+                                    end = Some(self.pos.saturating_add(1));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Scan::Str { escape } => {
+                    if *escape {
+                        *escape = false;
+                    } else if c == b'\\' {
+                        *escape = true;
+                    } else if c == b'"' {
+                        end = Some(self.pos.saturating_add(1));
+                    }
+                }
+                Scan::Scalar => {
+                    if !is_scalar_byte(c) {
+                        return self.value(input, self.pos, false);
+                    }
+                }
+            }
+            // Container depth takes precedence, as in Decoder. A scalar
+            // at the size limit may already have ended before this byte.
+            if self.pos >= self.limits.size() {
+                return Err(self.error(ErrorKind::TooLarge, self.limits.size()));
+            }
+            self.pos = self.pos.saturating_add(1);
+            if let Some(end) = end {
+                return self.value(input, end, false);
+            }
+        }
+        if eof && self.scan == Scan::Scalar {
+            return self.value(input, self.pos, true);
+        }
+        Ok(Step::Need)
+    }
+}
+
 /// Splits a byte stream into JSON values, for protocols that send one
 /// JSON text after another on a connection, such as JSON-RPC over TCP.
 /// Feed it the bytes in order and take values out until it has none.
@@ -842,6 +1066,7 @@ impl Writer {
 /// it, so one at the very end of what has come waits for one more byte,
 /// or for [`Decoder::finish`] to say the stream has ended.
 #[derive(Debug, Default)]
+#[deprecated(note = "use codec::Stream with json::Values")]
 pub struct Decoder {
     limits: Limits,
     buf: Vec<u8>,
@@ -876,6 +1101,7 @@ fn is_scalar_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Decoder {
     /// A decoder with the default [`Limits`].
     pub fn new() -> Decoder {
@@ -1086,6 +1312,7 @@ impl Decoder {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 

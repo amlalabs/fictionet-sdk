@@ -1,7 +1,9 @@
 //! JSON texts and streams of them, as a world playing a web API or a
 //! JSON-RPC server reads them.
 #![no_main]
+#![allow(deprecated)] // This target also checks the compatibility API.
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::json::{self, Decoder, Limits, Value};
 use libfuzzer_sys::fuzz_target;
 
@@ -74,9 +76,12 @@ fuzz_target!(|input: &[u8]| {
         [_, b, rest @ ..] => (Limits::default(), usize::from(b % 7) + 1, rest),
         _ => (Limits::default(), 1, input),
     };
+    contract::check_decode(|| json::Values::with_limits(limits), data);
+    contract::check_wire::<Value>(data);
     // The input as one JSON text.
     let parsed = json::parse_with(data, &limits);
     if let Ok(v) = &parsed {
+        contract::check_wire_value(v);
         round_trip(v, &limits);
     }
     // The input as a stream, split three ways. Each split gives the same
@@ -86,6 +91,7 @@ fuzz_target!(|input: &[u8]| {
         assert_eq!(whole, decode(data, limits, Schedule::Bytewise, end));
         assert_eq!(whole, decode(data, limits, Schedule::OnePerFeed(chunk), end));
         for v in whole.iter().flatten() {
+            contract::check_wire_value(v);
             round_trip(v, &limits);
         }
         // A whole JSON text, as a stream that then ends, gives just its

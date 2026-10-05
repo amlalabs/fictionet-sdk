@@ -10,8 +10,8 @@
 //! what browsers do, byte for byte:
 //!
 //! - [`parse`] runs the urlencoded parser on a whole body.
-//! - [`Decoder`] runs the same parser on a body that arrives in pieces,
-//!   and hands out each pair as soon as its `&` arrives.
+//! - [`Fields`] with [`super::codec::Stream`] reads a body that arrives in
+//!   pieces, and hands out each field as soon as its `&` arrives.
 //! - [`serialize`] runs the urlencoded serializer.
 //! - [`percent_encode`] and [`percent_decode`] encode and decode one
 //!   string with any of the percent-encode sets the standard defines
@@ -26,6 +26,10 @@
 //! the size limits [`MAX_INPUT`] and [`MAX_PAIRS`], because the agent can
 //! send as much as it likes. [`serialize`] checks the same limits, so it
 //! never writes a form the parser would refuse.
+//!
+//! Use [`Fields`] with [`super::codec::Stream`] for bounded field decoding.
+//! [`Field`] implements [`Wire`] for one complete field. The deprecated
+//! [`Decoder`] keeps its original buffering and errors.
 //!
 //! ```
 //! use fictionet::stdlib::urlencoded_form::{parse, percent_encode, serialize, EncodeSet};
@@ -44,6 +48,11 @@
 //! // One path segment for a URL.
 //! assert_eq!(percent_encode("a b/c".as_bytes(), EncodeSet::Path, false).unwrap(), "a%20b/c");
 //! ```
+
+extern crate alloc;
+
+use alloc::{string::String, vec::Vec};
+use super::codec::{Decode, Step, Wire};
 
 /// The most bytes [`parse`] and a [`Decoder`] read, and the most
 /// [`serialize`] writes. The same cap applies to the input and output of
@@ -68,8 +77,8 @@ pub enum FormError {
     TooManyPairs,
 }
 
-impl std::fmt::Display for FormError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for FormError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             FormError::TooLong => write!(f, "form is longer than {MAX_INPUT} bytes"),
             FormError::TooManyPairs => write!(f, "form has more than {MAX_PAIRS} pairs"),
@@ -77,7 +86,7 @@ impl std::fmt::Display for FormError {
     }
 }
 
-impl std::error::Error for FormError {}
+impl core::error::Error for FormError {}
 
 /// Reads a whole form body or query string into its pairs, in order, as
 /// the WHATWG urlencoded parser does. Give it the query without its
@@ -353,6 +362,150 @@ pub fn query_of(target: &[u8]) -> &[u8] {
     }
 }
 
+/// One form field, with its decoded name and value.
+///
+/// The wire form contains exactly one nonempty field, without `&`.
+/// Parsing also checks that its canonical encoding fits [`MAX_INPUT`].
+/// [`parse`] and [`Fields`] accept fields whose canonical encoding is larger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field(
+    /// The decoded name and value.
+    pub Pair,
+);
+
+/// Why one exact field or a stream of fields could not be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldError {
+    /// A form size or pair count limit was exceeded.
+    Form(FormError),
+    /// No field was present.
+    Empty,
+    /// An exact field parse contained a separator.
+    Trailing,
+}
+
+impl core::fmt::Display for FieldError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Form(e) => e.fmt(f),
+            Self::Empty => f.write_str("no form field"),
+            Self::Trailing => f.write_str("separator in an exact form field"),
+        }
+    }
+}
+
+impl core::error::Error for FieldError {}
+
+impl Wire for Field {
+    type ParseError = FieldError;
+    type WriteError = FormError;
+
+    fn parse(input: &[u8]) -> Result<Self, FieldError> {
+        if input.len() > MAX_INPUT {
+            return Err(FieldError::Form(FormError::TooLong));
+        }
+        if input.is_empty() {
+            return Err(FieldError::Empty);
+        }
+        if input.contains(&b'&') {
+            return Err(FieldError::Trailing);
+        }
+        let pair = split_pair(input);
+        serialize(core::slice::from_ref(&pair)).map_err(FieldError::Form)?;
+        Ok(Self(pair))
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FormError> {
+        out.extend_from_slice(serialize(core::slice::from_ref(&self.0))?.as_bytes());
+        Ok(())
+    }
+}
+
+/// Reads fields separated by `&` without holding input bytes.
+///
+/// Empty pieces are skipped. EOF completes the last nonempty field.
+/// Percent escapes and UTF-8 use the same replacement rules as [`parse`].
+/// Limits apply to the entire input form, as in [`parse`]. Writing a field
+/// also checks that its canonical encoding fits [`MAX_INPUT`].
+/// Capacity is [`MAX_INPUT`] plus one byte to detect overflow.
+/// Only [`FieldError::Form`] occurs from the stream, and ends it.
+/// Use [`codec::Stream`](super::codec::Stream) to drive this decoder.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, urlencoded_form::{Field, Fields}};
+///
+/// let mut stream = Stream::new(Fields::new());
+/// let mut fields = Vec::new();
+/// pump(&mut stream, b"name=Alice+", |field| fields.push(field))?;
+/// pump(&mut stream, b"Smith&flag", |field| fields.push(field))?;
+/// finish(&mut stream, |field| fields.push(field))?;
+/// assert_eq!(fields, vec![
+///     Field(("name".into(), "Alice Smith".into())),
+///     Field(("flag".into(), String::new())),
+/// ]);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::urlencoded_form::FieldError>>(())
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct Fields {
+    scan: usize,
+    consumed: usize,
+    pairs: usize,
+}
+
+impl Fields {
+    /// Starts a form bounded by [`MAX_INPUT`] and [`MAX_PAIRS`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decode for Fields {
+    type Item = Field;
+    type Error = FieldError;
+    const NAME: &'static str = "URL-encoded form";
+
+    fn capacity(&self) -> usize {
+        MAX_INPUT.saturating_add(1)
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Field>, FieldError> {
+        let room = MAX_INPUT.saturating_sub(self.consumed);
+        let visible = input
+            .get(..input.len().min(room.saturating_add(1)))
+            .unwrap_or_default();
+        let end = visible
+            .get(self.scan..)
+            .and_then(|r| r.iter().position(|b| *b == b'&'))
+            .map(|n| self.scan.saturating_add(n));
+        let (end, used) = match end {
+            Some(end) if end < room => (end, end.saturating_add(1)),
+            _ if visible.len() > room => return Err(FieldError::Form(FormError::TooLong)),
+            None if eof && !visible.is_empty() => (visible.len(), visible.len()),
+            _ => {
+                self.scan = visible.len();
+                return Ok(Step::Need);
+            }
+        };
+        if end > 0 && self.pairs >= MAX_PAIRS {
+            return Err(FieldError::Form(FormError::TooManyPairs));
+        }
+        let field = if end == 0 {
+            None
+        } else {
+            Some(Field(split_pair(visible.get(..end).unwrap_or_default())))
+        };
+        self.scan = 0;
+        self.consumed = self.consumed.saturating_add(used);
+        Ok(match field {
+            Some(field) => {
+                self.pairs = self.pairs.saturating_add(1);
+                Step::Item(field, used)
+            }
+            None => Step::Skip(used),
+        })
+    }
+}
+
 /// Reads a form that arrives in pieces, such as a request body read from
 /// a connection, and hands out each pair once the `&` after it arrives.
 /// Fed the same bytes, it gives the same pairs as [`parse`], however they
@@ -361,6 +514,7 @@ pub fn query_of(target: &[u8]) -> &[u8] {
 /// It holds at most [`MAX_INPUT`] bytes in all. Past that, or past
 /// [`MAX_PAIRS`] pairs, it fails and stays failed.
 #[derive(Clone, Debug, Default)]
+#[deprecated(note = "use codec::Stream with urlencoded_form::Fields")]
 pub struct Decoder {
     /// Bytes fed and not yet handed out, from `start`.
     buf: Vec<u8>,
@@ -378,6 +532,7 @@ pub struct Decoder {
     error: Option<FormError>,
 }
 
+#[allow(deprecated)] // Preserve the compatibility API.
 impl Decoder {
     /// A decoder at the start of a form.
     pub fn new() -> Decoder {
@@ -457,6 +612,7 @@ impl Decoder {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 

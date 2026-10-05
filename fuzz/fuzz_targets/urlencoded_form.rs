@@ -1,7 +1,9 @@
 //! application/x-www-form-urlencoded bodies and query strings, as a world
 //! playing a web server reads them.
 #![no_main]
+#![allow(deprecated)] // This target also checks the compatibility API.
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::urlencoded_form::{
     decode_component, parse, percent_decode, percent_encode, query_of, serialize, Decoder, EncodeSet, FormError, Pair,
     MAX_INPUT, MAX_PAIRS,
@@ -63,6 +65,13 @@ fn pairs_prefix(got: &[Pair], data: &[u8]) -> bool {
 }
 
 fuzz_target!(|data: &[u8]| {
+    use fictionet::stdlib::urlencoded_form::{Field, Fields};
+    contract::check_decode(Fields::new, data);
+    contract::check_wire::<Field>(data);
+    contract::check_wire_value(&Field((
+        String::from_utf8_lossy(data).into_owned(),
+        String::new(),
+    )));
     let whole = parse(data);
 
     // The body, split three ways: all at once, a byte at a time, and in
