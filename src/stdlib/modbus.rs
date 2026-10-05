@@ -16,6 +16,13 @@
 //! registers exist, and what they hold, is up to world code. So is whether
 //! a write succeeds.
 //!
+//! New stacks can use [`Frames`] with [`codec::Stream`](super::codec::Stream).
+//! It reports a framing error once and checks for partial frames at EOF.
+//! [`Decoder`] keeps its original behavior, including repeated errors.
+//! [`Wire`] reads exactly one frame and appends its bytes with a strict
+//! writer. Use `<Frame as Wire>::parse(bytes)` for exact parsing;
+//! [`Frame::parse`] still reads a prefix and allows trailing bytes.
+//!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. A request that breaks the specification becomes an
 //! [`Exception`] the world can send back, as a real device would. Writers
@@ -60,6 +67,8 @@
 //! let reply = answer(&mut registers, &frame);
 //! assert_eq!(reply.to_bytes().unwrap(), [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2]);
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port Modbus/TCP servers listen on.
 pub const PORT: u16 = 502;
@@ -170,6 +179,37 @@ impl std::fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
+/// Why an exact [`Wire`] parse did not read one complete frame.
+/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The MBAP header is invalid.
+    Frame(FrameError),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl std::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete Modbus frame"),
+            Self::Trailing => f.write_str("bytes follow the Modbus frame"),
+        }
+    }
+}
+
+impl std::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
 impl Frame {
     /// Reads the frame at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the frame and how many bytes
@@ -231,6 +271,68 @@ impl Frame {
     /// and unit.
     pub fn reply(&self, pdu: Vec<u8>) -> Frame {
         Frame { transaction: self.transaction, unit: self.unit, pdu }
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(b).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads Modbus/TCP frames without holding input bytes.
+///
+/// Use with [`codec::Stream`](super::codec::Stream) for a buffer limited
+/// to [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at
+/// EOF. The stream reports truncation at EOF and framing errors once.
+/// Each item's PDU is bounded by [`MAX_PDU`].
+///
+/// ```
+/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+/// use fictionet::stdlib::modbus::{Frames, Request};
+///
+/// let mut requests = Stream::new(Frames.map(|frame| Request::parse(&frame.pdu)));
+/// let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
+/// let mut count = 0;
+/// pump(&mut requests, &bytes, |request| {
+///     assert_eq!(request, Ok(Request::ReadHoldingRegisters { address: 2, quantity: 1 }));
+///     count += 1;
+/// })?;
+/// finish(&mut requests, |_| unreachable!())?;
+/// assert_eq!(count, 1);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::modbus::FrameError>>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "Modbus/TCP";
+
+    fn capacity(&self) -> usize {
+        MAX_FRAME
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match Frame::parse(input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
     }
 }
 
@@ -800,6 +902,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support, try_pump};
 
     // Examples from the Modbus Application Protocol Specification v1.1b3,
     // section 6.
@@ -907,6 +1010,227 @@ mod tests {
         assert_eq!(Frame::parse(&[0, 1, 0, 0, 0, 1, 1]), Err(FrameError::Length(1)));
         assert_eq!(Frame::parse(&[0, 1, 0, 0, 0, 255, 1]), Err(FrameError::Length(255)));
         assert!(matches!(Frame::parse(&[0, 1, 0, 0, 0, 254, 1]), Ok(None)));
+    }
+
+    #[test]
+    fn wire_requires_exactly_one_frame() {
+        for length in [1, MAX_PDU] {
+            let frame = Frame { transaction: u16::MAX, unit: u8::MAX, pdu: vec![0x41; length] };
+            let bytes = frame.to_bytes().unwrap();
+            assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame.clone()));
+            contract::check_wire::<Frame>(&bytes);
+            for cut in 0..bytes.len() {
+                let prefix = bytes.get(..cut).unwrap();
+                assert_eq!(<Frame as Wire>::parse(prefix), Err(FrameParseError::Truncated));
+                assert_eq!(Frame::parse(prefix), Ok(None));
+            }
+            for suffix in [&[0][..], bytes.as_slice()] {
+                let mut trailing = bytes.clone();
+                trailing.extend_from_slice(suffix);
+                assert_eq!(<Frame as Wire>::parse(&trailing), Err(FrameParseError::Trailing));
+                assert_eq!(Frame::parse(&trailing), Ok(Some((frame.clone(), bytes.len()))));
+            }
+        }
+        for (bytes, error) in [
+            (&[0, 1, 0, 5][..], FrameError::Protocol(5)),
+            (&[0, 1, 0, 0, 0, 1, 1][..], FrameError::Length(1)),
+            (&[0, 1, 0, 0, 0xff, 0xff, 1][..], FrameError::Length(u16::MAX)),
+        ] {
+            assert_eq!(<Frame as Wire>::parse(bytes), Err(FrameParseError::Frame(error)));
+        }
+    }
+
+    #[test]
+    fn wire_appends_or_leaves_the_destination_unchanged() {
+        for length in [0, 1, MAX_PDU, MAX_PDU + 1] {
+            let frame = Frame { transaction: 7, unit: 1, pdu: vec![0x41; length] };
+            contract::check_wire_value(&frame);
+            let prefix = [0x12, 0x34];
+            let mut out = prefix.to_vec();
+            let result = frame.write(&mut out);
+            match length {
+                0 => assert_eq!(result, Err(EncodeError::EmptyPdu)),
+                n if n > MAX_PDU => assert_eq!(result, Err(EncodeError::TooLong)),
+                _ => {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(out.get(..prefix.len()), Some(prefix.as_slice()));
+                    let bytes = out.get(prefix.len()..).unwrap();
+                    assert!(bytes.len() <= MAX_FRAME);
+                    assert_eq!(bytes, frame.to_bytes().unwrap());
+                    assert_eq!(bytes, <Frame as Wire>::to_bytes(&frame).unwrap());
+                    assert_eq!(<Frame as Wire>::parse(bytes), Ok(frame));
+                    continue;
+                }
+            }
+            assert_eq!(out, prefix);
+        }
+    }
+
+    #[test]
+    fn codec_frames_bound_input_and_preserve_ranges() {
+        let frames = [
+            Frame { transaction: 1, unit: 1, pdu: vec![0x41; MAX_PDU] },
+            Frame { transaction: 2, unit: 1, pdu: vec![0x41] },
+            Frame { transaction: 3, unit: 1, pdu: vec![0x42; MAX_PDU] },
+        ];
+        let mut bytes = Vec::new();
+        for frame in &frames {
+            frame.write(&mut bytes).unwrap();
+        }
+        assert_eq!(Frames.capacity(), MAX_FRAME);
+        assert_eq!(Frames.held(), 0);
+        contract::check_decode(|| Frames, &bytes);
+        for sizes in [&[][..], &[1][..], &[7, 1, MAX_FRAME][..]] {
+            let mut stream = Stream::new(Frames);
+            let mut expected = frames.iter();
+            let mut offset = 0;
+            for chunk in test_support::chunks(&bytes, sizes) {
+                let mut rest = chunk;
+                while !rest.is_empty() {
+                    let accepted = stream.push(rest);
+                    assert!(accepted > 0);
+                    rest = rest.get(accepted..).unwrap();
+                    assert!(stream.buffered() <= MAX_FRAME);
+                    while let Some(result) = stream.with_next(|frame, raw, range| {
+                        assert_eq!(Some(&frame), expected.next());
+                        assert_eq!(raw, frame.to_bytes().unwrap());
+                        assert_eq!(range, offset..offset + raw.len() as u64);
+                        offset = range.end;
+                    }) {
+                        result.unwrap();
+                    }
+                }
+            }
+            finish(&mut stream, |_| panic!("unexpected frame at EOF")).unwrap();
+            assert!(expected.next().is_none());
+            assert_eq!(stream.offset(), bytes.len() as u64);
+            assert_eq!(stream.buffered(), 0);
+            assert!(stream.is_done());
+            assert_eq!(stream.failed(), None);
+        }
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&bytes), MAX_FRAME);
+        assert_eq!(stream.push(&[0]), 0);
+        assert_eq!(stream.next(), Some(Ok(frames.first().unwrap().clone())));
+        assert_eq!(stream.buffered(), 0);
+        assert_eq!(stream.push(&[0]), 1);
+    }
+
+    #[test]
+    fn codec_frames_report_truncation_and_framing_errors_once() {
+        let frame = Frame { transaction: 1, unit: 1, pdu: vec![0x41; MAX_PDU] };
+        let bytes = frame.to_bytes().unwrap();
+        // Include every prefix of a maximum frame, beyond the harness's 256-byte cutoff.
+        for cut in 0..bytes.len() {
+            let prefix = bytes.get(..cut).unwrap();
+            assert_eq!(Frames.decode(prefix, false), Ok(Step::Need));
+            assert_eq!(Frames.decode(prefix, true), Ok(Step::Need));
+            let mut stream = Stream::new(Frames);
+            assert_eq!(stream.push(prefix), cut);
+            stream.end();
+            let failure = (cut > 0).then_some(Fail::Truncated { unread: cut });
+            assert_eq!(stream.next(), failure.clone().map(Err));
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.failed(), failure.as_ref());
+            assert!(stream.is_done());
+        }
+        assert_eq!(Frames.decode(&bytes, true), Ok(Step::Item(frame, bytes.len())));
+        for (bad, error) in [
+            (&[0, 1, 0, 5][..], FrameError::Protocol(5)),
+            (&[0, 1, 0, 0, 0, 0, 1][..], FrameError::Length(0)),
+            (&[0, 1, 0, 0, 0, 1, 1][..], FrameError::Length(1)),
+            (&[0, 1, 0, 0, 0, 255, 1][..], FrameError::Length(255)),
+        ] {
+            contract::check_decode(|| Frames, bad);
+            let mut stream = Stream::new(Frames);
+            assert_eq!(stream.push(bad), bad.len());
+            assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.failed(), Some(&Fail::Protocol(error)));
+            assert_eq!(stream.unread(), bad);
+            assert_eq!(stream.push(&bytes), bytes.len());
+            assert_eq!(stream.unread(), bad);
+            assert_eq!(stream.next(), None);
+        }
+    }
+
+    #[test]
+    fn codec_stack_serves_registers_and_exceptions_end_to_end() {
+        const MAX_TEST_FRAMES: usize = 5;
+        const MAX_TEST_BYTES: usize = MAX_TEST_FRAMES * MAX_FRAME;
+        let requests = [
+            (7, Request::WriteSingleRegister { address: 2, value: 1234 }.to_pdu().unwrap()),
+            (8, Request::ReadHoldingRegisters { address: 2, quantity: 1 }.to_pdu().unwrap()),
+            (9, vec![3, 0, 2, 0, 0]), // Zero quantity gets a wire exception.
+            (10, Request::ReadHoldingRegisters { address: 10, quantity: 1 }.to_pdu().unwrap()),
+            (11, Request::ReadHoldingRegisters { address: 2, quantity: 1 }.to_pdu().unwrap()),
+        ];
+        let mut input = Vec::new();
+        for (transaction, pdu) in requests {
+            Frame { transaction, unit: 17, pdu }.write(&mut input).unwrap();
+        }
+        let expected = [
+            (7, 17, Ok((6, Response::WriteSingleRegister { address: 2, value: 1234 }))),
+            (8, 17, Ok((3, Response::Registers(vec![1234])))),
+            (9, 17, Ok((3, Response::Exception(Exception::IllegalDataValue)))),
+            (10, 17, Ok((3, Response::Exception(Exception::IllegalDataAddress)))),
+            (11, 17, Ok((3, Response::Registers(vec![1234])))),
+        ];
+        let make_requests = || Frames.map(|frame| {
+            let request = Request::parse(&frame.pdu);
+            (frame, request)
+        });
+        contract::check_stack(make_requests, &input);
+        for sizes in [&[][..], &[1][..], &[7, 1, 13][..]] {
+            let mut registers = [0u16; 10];
+            let mut server = Stream::new(make_requests());
+            let mut output = Vec::new();
+            for chunk in test_support::chunks(&input, sizes) {
+                let accepted = try_pump(&mut server, chunk, |(frame, request)| {
+                    let response = match request {
+                        Ok(Request::WriteSingleRegister { address, value }) => {
+                            match registers.get_mut(usize::from(address)) {
+                                Some(register) => {
+                                    *register = value;
+                                    Response::WriteSingleRegister { address, value }
+                                }
+                                None => Response::Exception(Exception::IllegalDataAddress),
+                            }
+                        }
+                        Ok(Request::ReadHoldingRegisters { address, quantity }) => {
+                            let start = usize::from(address);
+                            match start.checked_add(usize::from(quantity)).and_then(|end| registers.get(start..end)) {
+                                Some(values) => Response::Registers(values.to_vec()),
+                                None => Response::Exception(Exception::IllegalDataAddress),
+                            }
+                        }
+                        Ok(_) => Response::Exception(Exception::IllegalFunction),
+                        Err(e) => Response::Exception(e),
+                    };
+                    let pdu = response.to_pdu(frame.function().unwrap_or(0))?;
+                    assert!(output.len() <= MAX_TEST_BYTES - MAX_FRAME);
+                    frame.reply(pdu).write(&mut output)
+                }).unwrap();
+                assert_eq!(accepted, chunk.len());
+            }
+            finish(&mut server, |_| panic!("unexpected request at EOF")).unwrap();
+            assert_eq!(registers.get(2), Some(&1234));
+            let mut client = Stream::new(Frames.map(|frame| {
+                (frame.transaction, frame.unit, Response::parse(&frame.pdu))
+            }));
+            let mut got = Vec::new();
+            for chunk in test_support::chunks(&output, sizes) {
+                assert_eq!(pump(&mut client, chunk, |response| {
+                    assert!(got.len() < MAX_TEST_FRAMES);
+                    got.push(response);
+                }).unwrap(), chunk.len());
+            }
+            finish(&mut client, |_| panic!("unexpected response at EOF")).unwrap();
+            assert_eq!(got, expected);
+            assert!(server.is_done() && client.is_done());
+            assert_eq!(server.failed(), None);
+            assert_eq!(client.failed(), None);
+        }
     }
 
     #[test]
