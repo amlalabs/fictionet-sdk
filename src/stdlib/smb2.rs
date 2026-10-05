@@ -267,22 +267,15 @@ pub mod share_type {
 pub enum FrameError {
     /// The first byte was not 0.
     Type(u8),
-    /// The payload length exceeded the configured limit, at most [`MAX_MESSAGE`].
-    Length {
-        /// The payload length from the transport header.
-        length: usize,
-        /// The largest accepted payload, excluding its transport header.
-        limit: usize,
-    },
+    /// The length was more than [`MAX_MESSAGE`].
+    Length(usize),
 }
 
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Type(t) => write!(f, "frame type {t:#04x}, not 0"),
-            FrameError::Length { length, limit } => {
-                write!(f, "frame length {length}, more than {limit}")
-            }
+            FrameError::Length(n) => write!(f, "frame length {n}, more than {MAX_MESSAGE}"),
         }
     }
 }
@@ -457,10 +450,6 @@ impl std::error::Error for EncodeError {}
 /// `b` holds only part of one, and otherwise the frame's payload and how
 /// many bytes of `b` it took.
 pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
-    parse_frame_limited(b, MAX_MESSAGE)
-}
-
-fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, FrameError> {
     let Some(&first) = b.first() else { return Ok(None) };
     if first != 0 {
         return Err(FrameError::Type(first));
@@ -469,8 +458,8 @@ fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>,
         return Ok(None);
     }
     let length = (usize::from(b[1]) << 16) | (usize::from(b[2]) << 8) | usize::from(b[3]);
-    if length > limit {
-        return Err(FrameError::Length { length, limit });
+    if length > MAX_MESSAGE {
+        return Err(FrameError::Length(length));
     }
     let end = FRAME_HEADER_LEN + length;
     match b.get(FRAME_HEADER_LEN..end) {
@@ -557,13 +546,47 @@ impl Wire for Frame {
     }
 }
 
+/// Why a [`Frames`] stream cannot continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamError {
+    /// The transport header was invalid.
+    Frame(FrameError),
+    /// The payload length exceeded the configured limit.
+    TooLong {
+        /// The payload length from the transport header.
+        length: usize,
+        /// The largest accepted payload, excluding its transport header.
+        limit: usize,
+    },
+}
+
+impl core::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::TooLong { length, limit } => write!(f, "frame length {length}, more than {limit}"),
+        }
+    }
+}
+
+impl core::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(error) => Some(error),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
+
 /// Reads direct TCP frames without retaining input.
 ///
 /// Use with [`super::codec::Stream`] for a buffer bounded by the four-byte
 /// header plus [`limit`](Self::limit), at most [`MAX_BUFFERED`]. The header
 /// suffices to refuse a payload above the configured limit.
 /// Partial frames return [`Step::Need`], including at EOF, so the driver
-/// reports truncation. Framing errors end the stream and are reported once.
+/// reports truncation. A [`StreamError`] ends the stream and is reported once:
+/// [`StreamError::Frame`] for a bad frame type, [`StreamError::TooLong`] for a
+/// payload above the limit.
 /// Map items through [`Packet::parse`] to receive payload errors as items.
 /// The legacy [`Decoder`] remains separate to preserve repeated errors and
 /// buffer clearing on failure.
@@ -608,16 +631,26 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Frame;
-    type Error = FrameError;
+    type Error = StreamError;
     const NAME: &'static str = "SMB direct TCP";
 
     fn capacity(&self) -> usize {
         FRAME_HEADER_LEN.saturating_add(self.limit)
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
-        Ok(match parse_frame_limited(input, self.limit)? {
-            Some((payload, used)) => Step::Item(Frame { payload: payload.to_vec() }, used),
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, StreamError> {
+        let Some(&first) = input.first() else { return Ok(Step::Need) };
+        if first != 0 {
+            return Err(StreamError::Frame(FrameError::Type(first)));
+        }
+        let Some(&[_, a, b, c]) = input.get(..FRAME_HEADER_LEN) else { return Ok(Step::Need) };
+        let length = (usize::from(a) << 16) | (usize::from(b) << 8) | usize::from(c);
+        if length > self.limit {
+            return Err(StreamError::TooLong { length, limit: self.limit });
+        }
+        let end = FRAME_HEADER_LEN + length;
+        Ok(match input.get(FRAME_HEADER_LEN..end) {
+            Some(payload) => Step::Item(Frame { payload: payload.to_vec() }, end),
             None => Step::Need,
         })
     }
@@ -3768,25 +3801,13 @@ mod tests {
         }
         assert_eq!(parse_frame(&f), Ok(Some((&payload[..], 8))));
         assert_eq!(parse_frame(&[0x85]), Err(FrameError::Type(0x85)));
-        assert_eq!(
-            parse_frame(&[0, 0xff, 0xff, 0xff]),
-            Err(FrameError::Length {
-                length: 0xff_ffff,
-                limit: MAX_MESSAGE
-            })
-        );
+        assert_eq!(parse_frame(&[0, 0xff, 0xff, 0xff]), Err(FrameError::Length(0xff_ffff)));
         assert_eq!(frame(&vec![0; MAX_MESSAGE + 1]), Err(EncodeError::TooLong));
         let longest = frame(&vec![7; MAX_MESSAGE]).unwrap();
         assert_eq!(parse_frame(&longest).unwrap().unwrap().1, MAX_BUFFERED);
         // An empty frame is a frame.
         assert_eq!(parse_frame(&[0, 0, 0, 0]), Ok(Some((&[][..], 4))));
-        for e in [
-            FrameError::Type(1),
-            FrameError::Length {
-                length: 2,
-                limit: MAX_MESSAGE,
-            },
-        ] {
+        for e in [FrameError::Type(1), FrameError::Length(2)] {
             assert!(!e.to_string().is_empty());
         }
     }

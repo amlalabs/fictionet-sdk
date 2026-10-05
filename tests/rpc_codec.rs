@@ -312,40 +312,41 @@ fn smb2_length_errors_report_bounds() {
 }
 
 #[test]
+fn old_length_errors_keep_their_shape() {
+    // The old APIs return the old variants, with the old text.
+    let n = smb2::MAX_MESSAGE + 1;
+    let header = (n as u32).to_be_bytes();
+    let err = smb2::parse_frame(&header).unwrap_err();
+    assert!(matches!(err, smb2::FrameError::Length(m) if m == n));
+    assert_eq!(err.to_string(), format!("frame length {n}, more than {}", smb2::MAX_MESSAGE));
+    let mut legacy = smb2::Decoder::new();
+    assert_eq!(legacy.feed(&header), header.len());
+    assert_eq!(legacy.next_frame(), Some(Err(smb2::FrameError::Length(n))));
+
+    let mut short = vec![1, 0, 0, 19];
+    short.extend_from_slice(&[0; 16]);
+    let err = radius::Packet::parse(&short).unwrap_err();
+    assert!(matches!(err, radius::PacketError::Length(19u16)));
+    assert_eq!(err.to_string(), "length field 19, outside 20..=4096");
+    let mut legacy = radius::Decoder::new();
+    assert_eq!(legacy.feed(&[1, 0, 0x10, 1]), 4);
+    assert_eq!(legacy.next_packet(), Some(Err(radius::PacketError::Length(4097))));
+}
+
+#[test]
 fn smb2_refuses_length_from_header_and_writer_rolls_back() {
     let length = smb2::MAX_MESSAGE + 1;
     let bytes = (length as u32).to_be_bytes();
-    terminal(
-        smb2::Frames::new,
-        &bytes,
-        smb2::FrameError::Length {
-            length,
-            limit: smb2::MAX_MESSAGE,
-        },
-    );
-    terminal(smb2::Frames::new, &[0x81], smb2::FrameError::Type(0x81));
-    terminal(
-        || smb2::Frames::with_limit(7),
-        &[0, 0, 0, 8],
-        smb2::FrameError::Length {
-            length: 8,
-            limit: 7,
-        },
-    );
+    terminal(smb2::Frames::new, &bytes, smb2::StreamError::TooLong { length, limit: smb2::MAX_MESSAGE });
+    terminal(smb2::Frames::new, &[0x81], smb2::StreamError::Frame(smb2::FrameError::Type(0x81)));
+    terminal(|| smb2::Frames::with_limit(7), &[0, 0, 0, 8], smb2::StreamError::TooLong { length: 8, limit: 7 });
     let mut empty_only = smb2::Frames::with_limit(0);
     assert_eq!(empty_only.capacity(), smb2::FRAME_HEADER_LEN);
     assert_eq!(
         empty_only.decode(&[0, 0, 0, 0], false),
         Ok(Step::Item(smb2::Frame { payload: vec![] }, 4))
     );
-    terminal(
-        || smb2::Frames::with_limit(0),
-        &[0, 0, 0, 1],
-        smb2::FrameError::Length {
-            length: 1,
-            limit: 0,
-        },
-    );
+    terminal(|| smb2::Frames::with_limit(0), &[0, 0, 0, 1], smb2::StreamError::TooLong { length: 1, limit: 0 });
     refused(&smb2::Frame {
         payload: vec![0; length],
     });
@@ -447,30 +448,9 @@ fn radius_length_errors_report_bounds() {
 
 #[test]
 fn radius_refuses_lengths_and_attributes_without_recovery() {
-    terminal(
-        radius::Frames::new,
-        &[1, 0, 0x10, 1],
-        radius::PacketError::Length {
-            length: 4097,
-            limit: radius::MAX_PACKET,
-        },
-    );
-    terminal(
-        radius::Frames::new,
-        &[1, 0, 0, 19],
-        radius::PacketError::Length {
-            length: 19,
-            limit: radius::MAX_PACKET,
-        },
-    );
-    terminal(
-        || radius::Frames::with_limit(20),
-        &[1, 0, 0, 21],
-        radius::PacketError::Length {
-            length: 21,
-            limit: 20,
-        },
-    );
+    terminal(radius::Frames::new, &[1, 0, 0x10, 1], radius::FrameError::TooLong { length: 4097, limit: radius::MAX_PACKET });
+    terminal(radius::Frames::new, &[1, 0, 0, 19], radius::FrameError::Packet(radius::PacketError::Length(19)));
+    terminal(|| radius::Frames::with_limit(20), &[1, 0, 0, 21], radius::FrameError::TooLong { length: 21, limit: 20 });
     let empty = radius::Packet::new(radius::Code::AccessRequest, 0, [0; 16]);
     let bytes = Wire::to_bytes(&empty).unwrap();
     assert_eq!(
@@ -479,7 +459,7 @@ fn radius_refuses_lengths_and_attributes_without_recovery() {
     );
     let mut bad = radius_request().to_bytes().unwrap();
     bad[21] = 1;
-    terminal(radius::Frames::new, &bad, radius::PacketError::Attribute(20));
+    terminal(radius::Frames::new, &bad, radius::FrameError::Packet(radius::PacketError::Attribute(20)));
 }
 
 #[test]
