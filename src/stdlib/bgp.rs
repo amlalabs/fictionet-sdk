@@ -10,7 +10,9 @@
 //! 19-byte header: 16 bytes of 0xFF, a length and a type. This module
 //! follows RFC 4271 (BGP-4), RFC 4760 (multiprotocol routes), RFC 6793
 //! (four-octet AS numbers), RFC 5492 (capabilities), RFC 2918 (route
-//! refresh) and RFC 4724 (the graceful restart capability).
+//! refresh), RFC 4724 (the graceful restart capability), RFC 7606 (revised
+//! UPDATE error handling), RFC 7607 (AS 0), RFC 7313 (enhanced route
+//! refresh errors) and RFC 9072 (long OPEN optional parameters).
 //!
 //! Nothing here reads a socket. A world that plays a router feeds the
 //! bytes it reads from a TCP connection to a [`Decoder`], gets [`Frame`]s
@@ -25,9 +27,12 @@
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A message that breaks the specification gives an [`Error`]
-//! whose [`Error::notification`] is the NOTIFICATION a real router would
-//! send before it closes the connection. Writers check the same rules and
-//! return an [`EncodeError`] instead of bytes a reader would refuse.
+//! whose [`Error::notification`] is the NOTIFICATION RFC 4271 sends before
+//! it closes the connection. RFC 7606 closes the connection for fewer
+//! UPDATE errors: most of them withdraw the UPDATE's routes or drop one
+//! attribute instead. [`Update::receive`] reads an UPDATE that way.
+//! Writers check the same rules and return an [`EncodeError`] instead of
+//! bytes a reader would refuse.
 //!
 //! ```
 //! use std::net::Ipv4Addr;
@@ -42,7 +47,8 @@
 //!     safi: safi::UNICAST,
 //! }]);
 //! let mut decoder = Decoder::new();
-//! decoder.feed(&Message::Open(theirs).to_bytes(&Context::default()).unwrap());
+//! let bytes = Message::Open(theirs).to_bytes(&Context::default()).unwrap();
+//! assert_eq!(decoder.feed(&bytes), bytes.len());
 //! let frame = decoder.next_frame().unwrap().unwrap();
 //! let Message::Open(open) = Message::decode(&frame, &Context::default()).unwrap() else {
 //!     panic!("not an OPEN");
@@ -73,7 +79,7 @@
 //! // The prefix comes last: its length in bits, then 3 bytes.
 //! assert_eq!(bytes[43..], [24, 203, 0, 113]);
 //!
-//! decoder.feed(&bytes);
+//! assert_eq!(decoder.feed(&bytes), bytes.len());
 //! let frame = decoder.next_frame().unwrap().unwrap();
 //! assert_eq!(Message::decode(&frame, &ctx), Ok(Message::Update(update)));
 //! ```
@@ -93,10 +99,15 @@ pub const HEADER_LEN: usize = 19;
 pub const MAX_MESSAGE_LEN: usize = 4096;
 /// The longest body a message may carry after its header.
 pub const MAX_BODY_LEN: usize = MAX_MESSAGE_LEN - HEADER_LEN;
-/// The most bytes of optional parameters an OPEN may carry, and the most
-/// bytes one parameter or one capability may hold: each length is one
-/// byte.
+/// The most bytes of optional parameters an OPEN carries in the format of
+/// RFC 4271, and the most bytes one capability may hold: each length is
+/// one byte. Longer parameters are written in the extended format of RFC
+/// 9072, with two-byte lengths.
 pub const MAX_PARAMETERS_LEN: usize = 255;
+/// The most bytes a [`Decoder`] holds that have not been taken out: one
+/// message of the longest length. A decoder this full always has a frame
+/// or an error to give.
+pub const MAX_BUFFERED: usize = MAX_MESSAGE_LEN;
 /// The most AS numbers one AS_PATH segment may hold: its count is one
 /// byte.
 pub const MAX_SEGMENT_ASNS: usize = 255;
@@ -160,10 +171,12 @@ pub mod attr {
     /// Withdrawn routes of other address families (RFC 4760).
     pub const MP_UNREACH_NLRI: u8 = 15;
     /// The four-octet AS path a two-octet session carries (RFC 6793).
-    /// This module keeps it as an `Attribute::Unknown`.
+    /// This module keeps it as an `Attribute::Unknown`, and checks it: it
+    /// is dropped in a four-octet session or when it is malformed, as RFC
+    /// 6793 section 6 says.
     pub const AS4_PATH: u8 = 17;
     /// The four-octet aggregator a two-octet session carries (RFC 6793).
-    /// This module keeps it as an `Attribute::Unknown`.
+    /// It is kept and checked like `AS4_PATH`.
     pub const AS4_AGGREGATOR: u8 = 18;
 }
 
@@ -190,10 +203,16 @@ pub mod capability {
     pub const GRACEFUL_RESTART: u8 = 64;
     /// Four-octet AS numbers (RFC 6793).
     pub const FOUR_OCTET_AS: u8 = 65;
+    /// Enhanced route refresh (RFC 7313). This module keeps it as a
+    /// `Capability::Other` with no value.
+    pub const ENHANCED_ROUTE_REFRESH: u8 = 70;
 }
 
 /// The optional parameter type that holds capabilities (RFC 5492).
 pub const PARAMETER_CAPABILITIES: u8 = 2;
+/// The optional parameter type RFC 9072 reserves to mark the extended
+/// format. No parameter has it.
+pub const PARAMETER_EXTENDED: u8 = 255;
 
 /// NOTIFICATION error codes.
 pub mod code {
@@ -269,6 +288,13 @@ pub mod subcode {
         /// The AS_PATH cannot be read.
         pub const MALFORMED_AS_PATH: u8 = 11;
     }
+
+    /// Subcodes for `code::ROUTE_REFRESH_MESSAGE` (RFC 7313).
+    pub mod route_refresh {
+        /// A ROUTE-REFRESH that starts or ends a refresh is not 4 bytes
+        /// after its header.
+        pub const INVALID_MESSAGE_LENGTH: u8 = 1;
+    }
 }
 
 /// What the two speakers agreed in their OPEN messages that changes how an
@@ -278,12 +304,22 @@ pub struct Context {
     /// Both sent the four-octet AS capability, so AS numbers in AS_PATH and
     /// AGGREGATOR take four bytes.
     pub four_octet_as: bool,
+    /// The peer sent the enhanced route refresh capability (RFC 7313), so
+    /// a ROUTE-REFRESH that starts or ends a refresh with the wrong length
+    /// is a ROUTE-REFRESH Message Error, not a header error.
+    pub enhanced_route_refresh: bool,
 }
 
 impl Context {
     /// The context once `local` and `remote` have been exchanged.
     pub fn negotiated(local: &Open, remote: &Open) -> Context {
-        Context { four_octet_as: local.four_octet_as().is_some() && remote.four_octet_as().is_some() }
+        let enhanced = |o: &Open| {
+            o.capabilities().any(|c| matches!(c, Capability::Other { code: capability::ENHANCED_ROUTE_REFRESH, .. }))
+        };
+        Context {
+            four_octet_as: local.four_octet_as().is_some() && remote.four_octet_as().is_some(),
+            enhanced_route_refresh: enhanced(local) && enhanced(remote),
+        }
     }
 }
 
@@ -302,6 +338,9 @@ pub enum Error {
     MalformedOpen,
     /// The OPEN's version, given here, is not 4.
     UnsupportedVersion(u8),
+    /// The OPEN's AS number, or its four-octet AS capability, is 0, which
+    /// RFC 7607 forbids.
+    BadPeerAs,
     /// The OPEN's BGP identifier is 0. RFC 6286 allows any other value.
     BadBgpIdentifier,
     /// The OPEN's hold time is 1 or 2 seconds.
@@ -326,13 +365,19 @@ pub enum Error {
     /// 127.0.0.0/8, 224.0.0.0/4 or 240.0.0.0/4. It holds the whole
     /// attribute.
     InvalidNextHop(Vec<u8>),
-    /// An MP_REACH_NLRI or MP_UNREACH_NLRI cannot be read. It holds the
-    /// whole attribute.
+    /// An optional attribute's value is wrong: an MP_REACH_NLRI or
+    /// MP_UNREACH_NLRI cannot be read or has a next hop of the wrong
+    /// length, an AGGREGATOR names AS 0, or an AS4_PATH or AS4_AGGREGATOR
+    /// is malformed. It holds the whole attribute.
     OptionalAttribute(Vec<u8>),
     /// A withdrawn route or NLRI prefix cannot be read.
     InvalidNetworkField,
-    /// The AS_PATH cannot be read.
+    /// The AS_PATH cannot be read, or holds AS 0.
     MalformedAsPath,
+    /// With enhanced route refresh, a ROUTE-REFRESH of subtype 1 or 2 is
+    /// not 4 bytes after its header (RFC 7313 section 5). It holds the
+    /// whole message, header included, cut to what a NOTIFICATION holds.
+    RouteRefreshLength(Vec<u8>),
 }
 
 impl Error {
@@ -347,6 +392,7 @@ impl Error {
             Error::MalformedOpen => (code::OPEN_MESSAGE, subcode::UNSPECIFIC, vec![]),
             // The data is the largest version the speaker supports.
             Error::UnsupportedVersion(_) => (code::OPEN_MESSAGE, o::UNSUPPORTED_VERSION_NUMBER, vec![0, VERSION]),
+            Error::BadPeerAs => (code::OPEN_MESSAGE, o::BAD_PEER_AS, vec![]),
             Error::BadBgpIdentifier => (code::OPEN_MESSAGE, o::BAD_BGP_IDENTIFIER, vec![]),
             Error::UnacceptableHoldTime => (code::OPEN_MESSAGE, o::UNACCEPTABLE_HOLD_TIME, vec![]),
             Error::MalformedAttributeList => (code::UPDATE_MESSAGE, u::MALFORMED_ATTRIBUTE_LIST, vec![]),
@@ -361,6 +407,11 @@ impl Error {
             Error::OptionalAttribute(a) => (code::UPDATE_MESSAGE, u::OPTIONAL_ATTRIBUTE_ERROR, a.clone()),
             Error::InvalidNetworkField => (code::UPDATE_MESSAGE, u::INVALID_NETWORK_FIELD, vec![]),
             Error::MalformedAsPath => (code::UPDATE_MESSAGE, u::MALFORMED_AS_PATH, vec![]),
+            Error::RouteRefreshLength(m) => (
+                code::ROUTE_REFRESH_MESSAGE,
+                subcode::route_refresh::INVALID_MESSAGE_LENGTH,
+                m[..m.len().min(MAX_BODY_LEN - 2)].to_vec(),
+            ),
         };
         Notification { code, subcode, data }
     }
@@ -374,6 +425,7 @@ impl std::fmt::Display for Error {
             Error::BadMessageType(t) => write!(f, "bad message type {t}"),
             Error::MalformedOpen => f.write_str("malformed OPEN optional parameters"),
             Error::UnsupportedVersion(v) => write!(f, "unsupported BGP version {v}"),
+            Error::BadPeerAs => f.write_str("peer AS is 0"),
             Error::BadBgpIdentifier => f.write_str("BGP identifier is 0"),
             Error::UnacceptableHoldTime => f.write_str("hold time of 1 or 2 seconds"),
             Error::MalformedAttributeList => f.write_str("malformed attribute list"),
@@ -388,6 +440,7 @@ impl std::fmt::Display for Error {
             Error::OptionalAttribute(a) => write!(f, "cannot read attribute {}", a.get(1).copied().unwrap_or(0)),
             Error::InvalidNetworkField => f.write_str("invalid prefix"),
             Error::MalformedAsPath => f.write_str("malformed AS_PATH"),
+            Error::RouteRefreshLength(_) => f.write_str("ROUTE-REFRESH of the wrong length"),
         }
     }
 }
@@ -466,13 +519,15 @@ impl Frame {
 }
 
 /// Splits a BGP byte stream into frames. Feed it the bytes a connection
-/// reads, in order, and take frames out until it has none.
+/// reads, in order, and take frames out until it has none. It holds at
+/// most [`MAX_BUFFERED`] bytes that have not been taken out.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
     /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small frames costs time in proportion to their bytes.
+    /// small frames costs time in proportion to their bytes, and the
+    /// buffer never grows past twice [`MAX_BUFFERED`].
     start: usize,
     failed: Option<Error>,
 }
@@ -483,22 +538,28 @@ impl Decoder {
         Decoder::default()
     }
 
-    /// Adds bytes read from the connection. After an [`Error`] the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Adds bytes read from the connection, as many as fit in
+    /// [`MAX_BUFFERED`], and returns how many it took. Take frames out and
+    /// feed the rest again. After an [`Error`] the stream cannot be read
+    /// any further: it takes every byte and drops them.
+    #[must_use = "bytes past the returned count were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole frame, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. A decoder never holds more than one message's
-    /// bytes beyond what has been taken out, plus what one `feed` added.
+    /// stream has broken. A full decoder always returns a frame or an
+    /// error.
     pub fn next_frame(&mut self) -> Option<Result<Frame, Error>> {
         if let Some(e) = &self.failed {
             return Some(Err(e.clone()));
@@ -541,10 +602,28 @@ pub enum Message {
 
 impl Message {
     /// Reads the message in `frame`. `ctx` says how AS numbers in an
-    /// UPDATE read; the other messages ignore it.
+    /// UPDATE read and how a ROUTE-REFRESH of the wrong length is
+    /// reported. An UPDATE is read as [`Update::parse`] reads it: every
+    /// error is one that closes the connection. Pass the body of an UPDATE
+    /// frame to [`Update::receive`] for the error handling of RFC 7606.
     pub fn decode(frame: &Frame, ctx: &Context) -> Result<Message, Error> {
         let len = frame.body.len().saturating_add(HEADER_LEN);
         let field = length_field(&frame.body);
+        // RFC 7313 section 5: with enhanced route refresh, a refresh start
+        // or end of the wrong length has its own error, with the message.
+        if frame.kind == kind::ROUTE_REFRESH
+            && ctx.enhanced_route_refresh
+            && len <= MAX_MESSAGE_LEN
+            && frame.body.len() != 4
+            && matches!(frame.body.get(2), Some(1 | 2))
+        {
+            let mut whole = vec![0xff; MARKER_LEN];
+            whole.extend_from_slice(&field.to_be_bytes());
+            whole.push(frame.kind);
+            whole.extend_from_slice(&frame.body);
+            whole.truncate(MAX_BODY_LEN - 2);
+            return Err(Error::RouteRefreshLength(whole));
+        }
         let (min, exact) = match frame.kind {
             kind::OPEN => (29, false),
             kind::UPDATE => (23, false),
@@ -587,6 +666,7 @@ impl Message {
             Message::Keepalive => Vec::new(),
             Message::RouteRefresh(r) => r.to_body(),
         };
+        bound(&body)?;
         Ok(Frame { kind: self.kind(), body })
     }
 
@@ -616,11 +696,13 @@ pub struct Open {
 pub enum Parameter {
     /// Type 2: capabilities the sender supports (RFC 5492).
     Capabilities(Vec<Capability>),
-    /// Any other type, with its value unread. Its kind is never 2.
+    /// Any other type, with its value unread. Its kind is never 2 or
+    /// [`PARAMETER_EXTENDED`].
     Other {
         /// The parameter type.
         kind: u8,
-        /// The parameter value, at most 255 bytes.
+        /// The parameter value. More than 255 bytes needs the extended
+        /// format, which the writer picks when it must.
         value: Vec<u8>,
     },
 }
@@ -678,9 +760,11 @@ pub struct RestartFamily {
 
 impl Open {
     /// An OPEN for AS `asn` that advertises `capabilities` and then the
-    /// four-octet AS capability for `asn`. If `asn` does not fit in two
-    /// octets, `my_as` is [`AS_TRANS`].
+    /// four-octet AS capability for `asn`. A four-octet AS capability in
+    /// `capabilities` is left out, so the OPEN names one AS. If `asn` does
+    /// not fit in two octets, `my_as` is [`AS_TRANS`].
     pub fn new(asn: u32, hold_time: u16, bgp_id: Ipv4Addr, mut capabilities: Vec<Capability>) -> Open {
+        capabilities.retain(|c| !matches!(c, Capability::FourOctetAs(_)));
         capabilities.push(Capability::FourOctetAs(asn));
         Open {
             my_as: u16::try_from(asn).unwrap_or(AS_TRANS),
@@ -727,29 +811,49 @@ impl Open {
         if version != VERSION {
             return Err(Error::UnsupportedVersion(version));
         }
+        if my_as == 0 {
+            return Err(Error::BadPeerAs);
+        }
         if hold_time == 1 || hold_time == 2 {
             return Err(Error::UnacceptableHoldTime);
         }
         if id == 0 {
             return Err(Error::BadBgpIdentifier);
         }
-        if r.len() != usize::from(params_len) {
+        // RFC 9072: a nonzero length followed by type 255 marks the
+        // extended format, with two-byte lengths.
+        let extended = params_len != 0 && r.first() == Some(&PARAMETER_EXTENDED);
+        let total = if extended {
+            r = &r[1..];
+            usize::from(take_u16(&mut r).ok_or(Error::MalformedOpen)?)
+        } else {
+            usize::from(params_len)
+        };
+        if r.len() != total {
             return Err(Error::MalformedOpen);
         }
         let mut parameters = Vec::new();
         while !r.is_empty() {
-            let (Some(kind), Some(n)) = (take_u8(&mut r), take_u8(&mut r)) else { return Err(Error::MalformedOpen) };
-            let value = take(&mut r, usize::from(n)).ok_or(Error::MalformedOpen)?;
-            parameters.push(if kind == PARAMETER_CAPABILITIES {
-                Parameter::Capabilities(parse_capabilities(value)?)
-            } else {
-                Parameter::Other { kind, value: value.to_vec() }
+            let kind = take_u8(&mut r).ok_or(Error::MalformedOpen)?;
+            let n = if extended { take_u16(&mut r).map(usize::from) } else { take_u8(&mut r).map(usize::from) };
+            let value = take(&mut r, n.ok_or(Error::MalformedOpen)?).ok_or(Error::MalformedOpen)?;
+            parameters.push(match kind {
+                PARAMETER_CAPABILITIES => Parameter::Capabilities(parse_capabilities(value)?),
+                PARAMETER_EXTENDED => return Err(Error::MalformedOpen),
+                _ => Parameter::Other { kind, value: value.to_vec() },
             });
         }
-        Ok(Open { my_as, hold_time, bgp_id: Ipv4Addr::from(id), parameters })
+        let open = Open { my_as, hold_time, bgp_id: Ipv4Addr::from(id), parameters };
+        if open.capabilities().any(|c| *c == Capability::FourOctetAs(0)) {
+            return Err(Error::BadPeerAs);
+        }
+        Ok(open)
     }
 
     fn to_body(&self) -> Result<Vec<u8>, EncodeError> {
+        if self.my_as == 0 || self.capabilities().any(|c| *c == Capability::FourOctetAs(0)) {
+            return Err(EncodeError::Invalid("AS number is 0"));
+        }
         if self.hold_time == 1 || self.hold_time == 2 {
             return Err(EncodeError::Invalid("hold time is 1 or 2 seconds"));
         }
@@ -757,6 +861,7 @@ impl Open {
             return Err(EncodeError::Invalid("BGP identifier is 0"));
         }
         let mut params = Vec::new();
+        let mut size = 0;
         for p in &self.parameters {
             let (kind, value) = match p {
                 Parameter::Capabilities(caps) => (PARAMETER_CAPABILITIES, capabilities_bytes(caps)?),
@@ -764,28 +869,43 @@ impl Open {
                     if *kind == PARAMETER_CAPABILITIES {
                         return Err(EncodeError::Invalid("other parameter with the capabilities type"));
                     }
-                    if value.len() > MAX_PARAMETERS_LEN {
-                        return Err(EncodeError::Invalid("optional parameter longer than 255 bytes"));
+                    if *kind == PARAMETER_EXTENDED {
+                        return Err(EncodeError::Invalid("parameter type 255 marks the extended format"));
                     }
+                    bound(value)?;
                     (*kind, value.clone())
                 }
             };
-            if value.len() > MAX_PARAMETERS_LEN {
-                return Err(EncodeError::Invalid("optional parameter longer than 255 bytes"));
+            size += 3 + value.len();
+            if size > MAX_BODY_LEN {
+                return Err(EncodeError::TooLong);
             }
-            params.push(kind);
-            params.push(value.len() as u8);
-            params.extend_from_slice(&value);
-            if params.len() > MAX_PARAMETERS_LEN {
-                return Err(EncodeError::Invalid("optional parameters longer than 255 bytes"));
-            }
+            params.push((kind, value));
         }
         let mut out = vec![VERSION];
         out.extend_from_slice(&self.my_as.to_be_bytes());
         out.extend_from_slice(&self.hold_time.to_be_bytes());
         out.extend_from_slice(&self.bgp_id.octets());
-        out.push(params.len() as u8);
-        out.extend_from_slice(&params);
+        let legacy: usize = params.iter().map(|(_, v)| 2 + v.len()).sum();
+        if legacy <= MAX_PARAMETERS_LEN && params.iter().all(|(_, v)| v.len() <= 255) {
+            out.push(legacy as u8);
+            for (kind, value) in &params {
+                out.push(*kind);
+                out.push(value.len() as u8);
+                out.extend_from_slice(value);
+            }
+        } else {
+            // RFC 9072: the extended format, needed when the parameters do
+            // not fit in 255 bytes or one of them is longer than 255.
+            out.extend_from_slice(&[0xff, PARAMETER_EXTENDED]);
+            out.extend_from_slice(&(size as u16).to_be_bytes());
+            for (kind, value) in &params {
+                out.push(*kind);
+                out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+                out.extend_from_slice(value);
+            }
+        }
+        bound(&out)?;
         Ok(out)
     }
 }
@@ -824,7 +944,7 @@ fn parse_capabilities(mut r: &[u8]) -> Result<Vec<Capability>, Error> {
 }
 
 fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
-    let too_long = EncodeError::Invalid("optional parameter longer than 255 bytes");
+    let too_long = EncodeError::Invalid("capability longer than 255 bytes");
     let mut out = Vec::new();
     for c in caps {
         let (code, value) = match c {
@@ -871,16 +991,15 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
         out.push(code);
         out.push(value.len() as u8);
         out.extend_from_slice(&value);
-        if out.len() > MAX_PARAMETERS_LEN {
-            return Err(too_long);
-        }
+        bound(&out)?;
     }
     Ok(out)
 }
 
 /// An IP prefix: an address and how many of its leading bits count.
-/// Bits past the length are kept as they arrived, though they mean
-/// nothing; [`Prefix::new`] clears them.
+/// The bits past the length are always 0: readers clear them, since they
+/// mean nothing on the wire, and writers refuse a prefix that has any set.
+/// [`Prefix::new`] clears them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Prefix {
     /// The address.
@@ -931,7 +1050,7 @@ fn read_prefixes(mut r: &[u8], v6: bool) -> Option<Vec<Prefix>> {
         } else {
             IpAddr::V4(Ipv4Addr::new(octets[0], octets[1], octets[2], octets[3]))
         };
-        out.push(Prefix { addr, length });
+        out.push(Prefix::new(addr, length)?);
     }
     Some(out)
 }
@@ -943,6 +1062,9 @@ fn write_prefixes(out: &mut Vec<u8>, prefixes: &[Prefix], v6: bool) -> Result<()
             (IpAddr::V6(a), true) if p.length <= 128 => a.octets().to_vec(),
             _ => return Err(EncodeError::Invalid("prefix of the wrong family, or too long")),
         };
+        if Prefix::new(p.addr, p.length) != Some(*p) {
+            return Err(EncodeError::Invalid("prefix with bits set past its length"));
+        }
         out.push(p.length);
         out.extend_from_slice(&octets[..usize::from(p.length).div_ceil(8)]);
         bound(out)?;
@@ -951,6 +1073,12 @@ fn write_prefixes(out: &mut Vec<u8>, prefixes: &[Prefix], v6: bool) -> Result<()
 }
 
 /// An UPDATE message.
+///
+/// Readers take any layout, but writers follow RFC 7606 section 5.1: an
+/// UPDATE carries only one of withdrawn routes, NLRI, an MP_REACH_NLRI and
+/// an MP_UNREACH_NLRI, and an MP attribute comes first. An UPDATE read
+/// from an older speaker that mixes them is refused by the writer; send
+/// its parts as separate UPDATEs.
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct Update {
     /// IPv4 prefixes the sender no longer reaches.
@@ -1060,8 +1188,10 @@ pub struct MpReach {
     pub afi: u16,
     /// The subsequent address family.
     pub safi: u8,
-    /// The next hop's bytes: 4 for IPv4, and 16 or 32 for IPv6 (a global
-    /// address, then maybe a link-local one). At most 255 bytes.
+    /// The next hop's bytes: 16 or 32 for IPv6 (a global address, then
+    /// maybe a link-local one, RFC 2545), and 4, 16 or 32 for IPv4 (RFC
+    /// 4760, and RFC 8950 for an IPv6 next hop). For families read as
+    /// [`Nlri::Raw`] any length up to 255 bytes.
     pub next_hop: Vec<u8>,
     /// The routes. [`Nlri::Prefixes`] for IPv4 and IPv6 unicast and
     /// multicast, [`Nlri::Raw`] otherwise.
@@ -1080,7 +1210,9 @@ pub struct MpUnreach {
 }
 
 /// A path attribute. Known attributes are written with the flags RFC 4271
-/// gives their type, so a PARTIAL bit read on one is not kept.
+/// gives their type. The two optional transitive ones, AGGREGATOR and
+/// COMMUNITIES, keep a PARTIAL bit: RFC 4271 section 5 forbids clearing it
+/// when the route is passed on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Attribute {
     /// Type 1: where the route came from.
@@ -1103,19 +1235,31 @@ pub enum Attribute {
         asn: u32,
         /// The aggregating router's address.
         address: Ipv4Addr,
+        /// The PARTIAL flag: a router on the way did not know the
+        /// attribute.
+        partial: bool,
     },
-    /// Type 8: community tags, each the AS in the top 16 bits and a value
-    /// in the bottom 16 (RFC 1997).
-    Communities(Vec<u32>),
+    /// Type 8: community tags (RFC 1997).
+    Communities {
+        /// The tags, at least one, each the AS in the top 16 bits and a
+        /// value in the bottom 16.
+        values: Vec<u32>,
+        /// The PARTIAL flag: a router on the way did not know the
+        /// attribute.
+        partial: bool,
+    },
     /// Type 14: routes of another address family.
     MpReach(MpReach),
     /// Type 15: withdrawn routes of another address family.
     MpUnreach(MpUnreach),
-    /// Any other type, with its value unread.
+    /// Any other type, with its value unread, except that an AS4_PATH or
+    /// AS4_AGGREGATOR is checked against RFC 6793.
     Unknown {
-        /// The flags, with only the optional, transitive and partial bits
-        /// kept. The optional bit is always set: an unknown attribute
-        /// without it is an error.
+        /// The flags: only the optional, transitive and partial bits, which
+        /// is all a reader keeps and all a writer takes. The optional bit
+        /// is always set: an unknown attribute without it is an error. The
+        /// partial bit is set only with the transitive bit (RFC 4271
+        /// section 4.3); a reader clears it on a non-transitive attribute.
         flags: u8,
         /// The type code. It is never one of the types above.
         kind: u8,
@@ -1147,7 +1291,7 @@ impl Attribute {
             Attribute::LocalPref(_) => attr::LOCAL_PREF,
             Attribute::AtomicAggregate => attr::ATOMIC_AGGREGATE,
             Attribute::Aggregator { .. } => attr::AGGREGATOR,
-            Attribute::Communities(_) => attr::COMMUNITIES,
+            Attribute::Communities { .. } => attr::COMMUNITIES,
             Attribute::MpReach(_) => attr::MP_REACH_NLRI,
             Attribute::MpUnreach(_) => attr::MP_UNREACH_NLRI,
             Attribute::Unknown { kind, .. } => *kind,
@@ -1155,25 +1299,37 @@ impl Attribute {
     }
 
     /// Reads one attribute's value. `raw` is the whole attribute, for the
-    /// error.
-    fn parse(flags: u8, kind: u8, v: &[u8], raw: &[u8], ctx: &Context) -> Result<Attribute, Error> {
+    /// error. It returns `None` for an attribute RFC 6793 drops without an
+    /// error: an AS4_PATH or AS4_AGGREGATOR in a four-octet session, or an
+    /// AS4_PATH with no segments left once its confederation segments are
+    /// dropped.
+    fn parse(flags: u8, kind: u8, v: &[u8], raw: &[u8], ctx: &Context) -> Result<Option<Attribute>, Error> {
+        if kind == attr::AS4_PATH || kind == attr::AS4_AGGREGATOR {
+            return parse_as4(flags, kind, v, raw, ctx);
+        }
         let Some(expected) = known_flags(kind) else {
             if flags & flag::OPTIONAL == 0 {
                 return Err(Error::UnrecognizedWellKnownAttribute(raw.to_vec()));
             }
-            let flags = flags & (flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL);
-            return Ok(Attribute::Unknown { flags, kind, value: v.to_vec() });
+            let mut flags = flags & (flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL);
+            // RFC 4271 section 4.3: PARTIAL is 0 on a non-transitive
+            // attribute.
+            if flags & flag::TRANSITIVE == 0 {
+                flags &= !flag::PARTIAL;
+            }
+            return Ok(Some(Attribute::Unknown { flags, kind, value: v.to_vec() }));
         };
         let partial_ok = expected == flag::OPTIONAL | flag::TRANSITIVE;
         if flags & (flag::OPTIONAL | flag::TRANSITIVE) != expected || (flags & flag::PARTIAL != 0 && !partial_ok) {
             return Err(Error::AttributeFlags(raw.to_vec()));
         }
+        let partial = flags & flag::PARTIAL != 0;
         let length = || Error::AttributeLength(raw.to_vec());
         let u32_value = || -> Result<u32, Error> {
             let [a, b, c, d] = v else { return Err(length()) };
             Ok(u32::from_be_bytes([*a, *b, *c, *d]))
         };
-        Ok(match kind {
+        Ok(Some(match kind {
             attr::ORIGIN => match v {
                 [c] => Attribute::Origin(Origin::from_code(*c).ok_or_else(|| Error::InvalidOrigin(raw.to_vec()))?),
                 _ => return Err(length()),
@@ -1196,38 +1352,34 @@ impl Attribute {
                     ([a, b, c, d, x @ ..], true) if x.len() == 4 => (u32::from_be_bytes([*a, *b, *c, *d]), x),
                     _ => return Err(length()),
                 };
-                Attribute::Aggregator { asn, address: Ipv4Addr::new(address[0], address[1], address[2], address[3]) }
+                // RFC 7607: AS 0 makes the attribute malformed.
+                if asn == 0 {
+                    return Err(Error::OptionalAttribute(raw.to_vec()));
+                }
+                let address = Ipv4Addr::new(address[0], address[1], address[2], address[3]);
+                Attribute::Aggregator { asn, address, partial }
             }
-            attr::COMMUNITIES if v.len().is_multiple_of(4) => Attribute::Communities(
-                v.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect(),
-            ),
+            // RFC 7606 section 7.8: a nonzero multiple of 4 bytes.
+            attr::COMMUNITIES if !v.is_empty() && v.len().is_multiple_of(4) => Attribute::Communities {
+                values: v.chunks_exact(4).map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])).collect(),
+                partial,
+            },
             attr::COMMUNITIES => return Err(length()),
             attr::MP_REACH_NLRI => {
                 Attribute::MpReach(parse_mp_reach(v).ok_or_else(|| Error::OptionalAttribute(raw.to_vec()))?)
             }
             _ => Attribute::MpUnreach(parse_mp_unreach(v).ok_or_else(|| Error::OptionalAttribute(raw.to_vec()))?),
-        })
+        }))
     }
 
     /// Writes the attribute, header and value, onto `out`.
     fn write(&self, out: &mut Vec<u8>, ctx: &Context) -> Result<(), EncodeError> {
         let kind = self.kind();
         let mut v = Vec::new();
+        let mut partial = false;
         match self {
             Attribute::Origin(o) => v.push(o.code()),
-            Attribute::AsPath(segments) => {
-                for s in segments {
-                    if s.asns.is_empty() || s.asns.len() > MAX_SEGMENT_ASNS {
-                        return Err(EncodeError::Invalid("AS_PATH segment with no AS numbers or more than 255"));
-                    }
-                    v.push(s.kind.code());
-                    v.push(s.asns.len() as u8);
-                    for &a in &s.asns {
-                        put_asn(&mut v, a, ctx)?;
-                    }
-                    bound(&v)?;
-                }
-            }
+            Attribute::AsPath(segments) => put_segments(&mut v, segments, ctx.four_octet_as)?,
             Attribute::NextHop(a) => {
                 if !host_address(*a) {
                     return Err(EncodeError::Invalid("NEXT_HOP is not a host address"));
@@ -1236,19 +1388,30 @@ impl Attribute {
             }
             Attribute::Med(n) | Attribute::LocalPref(n) => v.extend_from_slice(&n.to_be_bytes()),
             Attribute::AtomicAggregate => {}
-            Attribute::Aggregator { asn, address } => {
-                put_asn(&mut v, *asn, ctx)?;
+            Attribute::Aggregator { asn, address, partial: p } => {
+                if *asn == 0 {
+                    return Err(EncodeError::Invalid("AGGREGATOR with AS 0"));
+                }
+                put_asn(&mut v, *asn, ctx.four_octet_as)?;
                 v.extend_from_slice(&address.octets());
+                partial = *p;
             }
-            Attribute::Communities(c) => {
-                for n in c {
+            Attribute::Communities { values, partial: p } => {
+                if values.is_empty() {
+                    return Err(EncodeError::Invalid("COMMUNITIES with no communities"));
+                }
+                for n in values {
                     v.extend_from_slice(&n.to_be_bytes());
                     bound(&v)?;
                 }
+                partial = *p;
             }
             Attribute::MpReach(m) => {
                 if m.next_hop.len() > 255 {
                     return Err(EncodeError::Invalid("MP_REACH_NLRI next hop longer than 255 bytes"));
+                }
+                if !next_hop_length(m.afi, m.safi, m.next_hop.len()) {
+                    return Err(EncodeError::Invalid("MP_REACH_NLRI next hop of the wrong length for its family"));
                 }
                 v.extend_from_slice(&m.afi.to_be_bytes());
                 v.push(m.safi);
@@ -1269,16 +1432,99 @@ impl Attribute {
                 if flags & flag::OPTIONAL == 0 {
                     return Err(EncodeError::Invalid("unknown attribute without the optional bit"));
                 }
+                if flags & !(flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL) != 0 {
+                    return Err(EncodeError::Invalid(
+                        "unknown attribute flags other than optional, transitive, partial",
+                    ));
+                }
+                if flags & flag::PARTIAL != 0 && flags & flag::TRANSITIVE == 0 {
+                    return Err(EncodeError::Invalid("partial bit on a non-transitive attribute"));
+                }
                 if value.len() > MAX_BODY_LEN {
                     return Err(EncodeError::TooLong);
                 }
-                let flags = flags & (flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL);
+                let flags = *flags;
+                if *kind == attr::AS4_PATH || *kind == attr::AS4_AGGREGATOR {
+                    if ctx.four_octet_as {
+                        return Err(EncodeError::Invalid("AS4_PATH or AS4_AGGREGATOR in a four-octet session"));
+                    }
+                    // A reader keeps the attribute as it is only if it is
+                    // well formed.
+                    match parse_as4(flags, *kind, value, &[], ctx) {
+                        Ok(Some(Attribute::Unknown { value: read, .. })) if read == *value => {}
+                        _ => return Err(EncodeError::Invalid("malformed AS4_PATH or AS4_AGGREGATOR")),
+                    }
+                }
                 return put_attribute(out, flags, *kind, value);
             }
         }
         // Every known type has flags; the match above returned for the rest.
-        put_attribute(out, known_flags(kind).unwrap_or(flag::OPTIONAL), kind, &v)
+        let flags = known_flags(kind).unwrap_or(flag::OPTIONAL) | if partial { flag::PARTIAL } else { 0 };
+        put_attribute(out, flags, kind, &v)
     }
+}
+
+/// Reads an AS4_PATH or AS4_AGGREGATOR (RFC 6793 section 6). Between two
+/// four-octet speakers it is dropped. One that is not optional transitive
+/// is an `AttributeFlags` error, and a malformed one, or one naming AS 0
+/// (RFC 7607), an `OptionalAttribute` error; RFC 6793 drops the attribute
+/// for both. Confederation segments in an AS4_PATH are dropped.
+fn parse_as4(flags: u8, kind: u8, v: &[u8], raw: &[u8], ctx: &Context) -> Result<Option<Attribute>, Error> {
+    if ctx.four_octet_as {
+        return Ok(None);
+    }
+    if flags & (flag::OPTIONAL | flag::TRANSITIVE) != flag::OPTIONAL | flag::TRANSITIVE {
+        return Err(Error::AttributeFlags(raw.to_vec()));
+    }
+    let malformed = || Error::OptionalAttribute(raw.to_vec());
+    let value = if kind == attr::AS4_PATH {
+        let segments = parse_as_path(v, true).filter(|s| !s.is_empty()).ok_or_else(malformed)?;
+        let kept: Vec<Segment> =
+            segments.into_iter().filter(|s| matches!(s.kind, SegmentKind::Set | SegmentKind::Sequence)).collect();
+        if kept.is_empty() {
+            return Ok(None);
+        }
+        let mut value = Vec::new();
+        put_segments(&mut value, &kept, true).map_err(|_| malformed())?;
+        value
+    } else {
+        let [a, b, c, d, _, _, _, _] = v else { return Err(malformed()) };
+        if u32::from_be_bytes([*a, *b, *c, *d]) == 0 {
+            return Err(malformed());
+        }
+        v.to_vec()
+    };
+    Ok(Some(Attribute::Unknown { flags: flags & (flag::OPTIONAL | flag::TRANSITIVE | flag::PARTIAL), kind, value }))
+}
+
+/// Whether an MP_REACH_NLRI next hop of `len` bytes fits the family: RFC
+/// 2545 for IPv6, RFC 4760 and RFC 8950 for IPv4. Families this module
+/// does not read as prefixes are not checked.
+fn next_hop_length(afi: u16, safi: u8, len: usize) -> bool {
+    match afi {
+        _ if !prefix_family(afi, safi) => true,
+        afi::IPV4 => matches!(len, 4 | 16 | 32),
+        _ => matches!(len, 16 | 32),
+    }
+}
+
+/// Writes AS_PATH segments: each 1 to 255 AS numbers, none of them 0.
+fn put_segments(v: &mut Vec<u8>, segments: &[Segment], four: bool) -> Result<(), EncodeError> {
+    for s in segments {
+        if s.asns.is_empty() || s.asns.len() > MAX_SEGMENT_ASNS {
+            return Err(EncodeError::Invalid("AS_PATH segment with no AS numbers or more than 255"));
+        }
+        if s.asns.contains(&0) {
+            return Err(EncodeError::Invalid("AS_PATH with AS 0"));
+        }
+        v.push(s.kind.code());
+        v.push(s.asns.len() as u8);
+        for &a in &s.asns {
+            put_asn(v, a, four)?;
+        }
+        bound(v)?;
+    }
+    Ok(())
 }
 
 /// Whether `a` can be a NEXT_HOP: RFC 4271 section 6.3 asks for a valid
@@ -1289,8 +1535,8 @@ fn host_address(a: Ipv4Addr) -> bool {
     !matches!(a.octets()[0], 0 | 127 | 224..=255)
 }
 
-fn put_asn(v: &mut Vec<u8>, asn: u32, ctx: &Context) -> Result<(), EncodeError> {
-    if ctx.four_octet_as {
+fn put_asn(v: &mut Vec<u8>, asn: u32, four: bool) -> Result<(), EncodeError> {
+    if four {
         v.extend_from_slice(&asn.to_be_bytes());
     } else {
         let a = u16::try_from(asn).map_err(|_| EncodeError::Invalid("AS number needs four octets"))?;
@@ -1330,6 +1576,8 @@ fn write_nlri(v: &mut Vec<u8>, afi: u16, safi: u8, nlri: &Nlri) -> Result<(), En
     }
 }
 
+/// Reads AS_PATH segments. A segment with no AS numbers, or with AS 0
+/// (RFC 7607), makes the path malformed.
 fn parse_as_path(mut r: &[u8], four: bool) -> Option<Vec<Segment>> {
     let size = if four { 4 } else { 2 };
     let mut out = Vec::new();
@@ -1340,10 +1588,13 @@ fn parse_as_path(mut r: &[u8], four: bool) -> Option<Vec<Segment>> {
             return None;
         }
         let bytes = take(&mut r, count * size)?;
-        let asns = bytes
+        let asns: Vec<u32> = bytes
             .chunks_exact(size)
             .map(|c| if four { u32::from_be_bytes([c[0], c[1], c[2], c[3]]) } else { u32::from(be16(c, 0)) })
             .collect();
+        if asns.contains(&0) {
+            return None;
+        }
         out.push(Segment { kind, asns });
     }
     Some(out)
@@ -1361,6 +1612,9 @@ fn parse_mp_reach(mut r: &[u8]) -> Option<MpReach> {
     let afi = take_u16(&mut r)?;
     let safi = take_u8(&mut r)?;
     let n = take_u8(&mut r)?;
+    if !next_hop_length(afi, safi, usize::from(n)) {
+        return None;
+    }
     let next_hop = take(&mut r, usize::from(n))?.to_vec();
     let _reserved = take_u8(&mut r)?;
     Some(MpReach { afi, safi, next_hop, nlri: parse_nlri(r, afi, safi)? })
@@ -1386,45 +1640,26 @@ fn missing(seen: &[bool; 256], nlri: bool) -> Option<u8> {
 }
 
 impl Update {
-    /// Reads an UPDATE's body, the bytes after the header. `ctx` says how
+    /// Reads an UPDATE's body, the bytes after the header, as RFC 4271
+    /// does: every error is one that closes the connection. `ctx` says how
     /// many octets an AS number takes. A body longer than
-    /// [`MAX_BODY_LEN`] is a bad length.
+    /// [`MAX_BODY_LEN`] is a bad length. Two things RFC 6793 drops without
+    /// an error are dropped here too: AS4_PATH and AS4_AGGREGATOR in a
+    /// four-octet session, and malformed ones in a two-octet session.
+    /// MP_REACH_NLRI and MP_UNREACH_NLRI come first in the attributes
+    /// read, wherever they were in the message.
     pub fn parse(b: &[u8], ctx: &Context) -> Result<Update, Error> {
-        if b.len() > MAX_BODY_LEN {
-            return Err(Error::BadMessageLength(length_field(b)));
-        }
-        let mut r = b;
-        let wlen = take_u16(&mut r).ok_or(Error::MalformedAttributeList)?;
-        let withdrawn = take(&mut r, usize::from(wlen)).ok_or(Error::MalformedAttributeList)?;
-        let alen = take_u16(&mut r).ok_or(Error::MalformedAttributeList)?;
-        let mut attrs = take(&mut r, usize::from(alen)).ok_or(Error::MalformedAttributeList)?;
-        let withdrawn = read_prefixes(withdrawn, false).ok_or(Error::InvalidNetworkField)?;
+        read_update(b, ctx, true).map(|r| r.update)
+    }
 
-        let mut seen = [false; 256];
-        let mut attributes = Vec::new();
-        while !attrs.is_empty() {
-            let all = attrs;
-            let (Some(flags), Some(kind)) = (take_u8(&mut attrs), take_u8(&mut attrs)) else {
-                return Err(Error::MalformedAttributeList);
-            };
-            let n = if flags & flag::EXTENDED_LENGTH != 0 {
-                take_u16(&mut attrs).map(usize::from)
-            } else {
-                take_u8(&mut attrs).map(usize::from)
-            };
-            let n = n.ok_or(Error::MalformedAttributeList)?;
-            let value = take(&mut attrs, n).ok_or(Error::MalformedAttributeList)?;
-            let raw = &all[..all.len() - attrs.len()];
-            if std::mem::replace(&mut seen[usize::from(kind)], true) {
-                return Err(Error::MalformedAttributeList);
-            }
-            attributes.push(Attribute::parse(flags, kind, value, raw, ctx)?);
-        }
-        let nlri = read_prefixes(r, false).ok_or(Error::InvalidNetworkField)?;
-        if let Some(k) = missing(&seen, !nlri.is_empty()) {
-            return Err(Error::MissingWellKnownAttribute(k));
-        }
-        Ok(Update { withdrawn, attributes, nlri })
+    /// Reads an UPDATE's body with the error handling of RFC 7606, which
+    /// closes the connection only when the routes cannot be told apart.
+    /// The error it returns is one of those, and its NOTIFICATION is sent.
+    /// For other errors it returns what it read and says what to do with
+    /// it. LOCAL_PREF is handled as from an internal peer; a world peering
+    /// with an external one drops it itself.
+    pub fn receive(b: &[u8], ctx: &Context) -> Result<Received, Error> {
+        read_update(b, ctx, false)
     }
 
     /// The attribute of type `kind`, if the UPDATE has one.
@@ -1433,6 +1668,18 @@ impl Update {
     }
 
     fn to_body(&self, ctx: &Context) -> Result<Vec<u8>, EncodeError> {
+        // RFC 7606 section 5.1: one kind of routes per UPDATE, and an
+        // MP_REACH_NLRI or MP_UNREACH_NLRI first.
+        let is_mp = |a: &Attribute| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_));
+        let mp = self.attributes.iter().filter(|a| is_mp(a)).count();
+        if usize::from(!self.withdrawn.is_empty()) + usize::from(!self.nlri.is_empty()) + mp > 1 {
+            return Err(EncodeError::Invalid(
+                "UPDATE with more than one of withdrawn routes, NLRI, MP_REACH_NLRI and MP_UNREACH_NLRI",
+            ));
+        }
+        if mp == 1 && !self.attributes.first().is_some_and(is_mp) {
+            return Err(EncodeError::Invalid("MP_REACH_NLRI or MP_UNREACH_NLRI not the first attribute"));
+        }
         let mut out = vec![0, 0];
         write_prefixes(&mut out, &self.withdrawn, false)?;
         let wlen = (out.len() - 2) as u16;
@@ -1452,8 +1699,152 @@ impl Update {
         if missing(&seen, !self.nlri.is_empty()).is_some() {
             return Err(EncodeError::Invalid("routes without ORIGIN, AS_PATH or NEXT_HOP"));
         }
+        bound(&out)?;
         Ok(out)
     }
+}
+
+/// An UPDATE read with the error handling of RFC 7606, by
+/// [`Update::receive`].
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct Received {
+    /// What was read. Attributes dropped are left out. The routes are kept
+    /// even when `withdraw` is set, so the caller knows which to withdraw.
+    pub update: Update,
+    /// Set when the routes the UPDATE announces, in `nlri` and in an
+    /// MP_REACH_NLRI, are to be handled as withdrawn ("treat-as-withdraw").
+    /// It holds the first error that asked for it, for the log; no
+    /// NOTIFICATION is sent.
+    pub withdraw: Option<Error>,
+    /// Attributes dropped, one error each, and the UPDATE read on without
+    /// them: a malformed ATOMIC_AGGREGATE, AGGREGATOR, AS4_PATH or
+    /// AS4_AGGREGATOR, and `MalformedAttributeList` for each attribute of a
+    /// type already read.
+    pub discarded: Vec<Error>,
+}
+
+/// What RFC 7606 does about an error in an UPDATE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Handling {
+    /// Drop the attribute and read on.
+    AttributeDiscard,
+    /// Handle the UPDATE's routes as withdrawn.
+    TreatAsWithdraw,
+    /// Send the NOTIFICATION and close the connection.
+    SessionReset,
+}
+
+/// How RFC 7606 sections 3 and 7, and RFC 6793 section 6, handle an error
+/// in an attribute of type `kind`.
+fn handling(kind: u8, e: &Error) -> Handling {
+    match (kind, e) {
+        (_, Error::UnrecognizedWellKnownAttribute(_)) => Handling::SessionReset,
+        (attr::MP_REACH_NLRI | attr::MP_UNREACH_NLRI, _) => Handling::SessionReset,
+        (attr::ATOMIC_AGGREGATE | attr::AGGREGATOR | attr::AS4_PATH | attr::AS4_AGGREGATOR, _) => {
+            Handling::AttributeDiscard
+        }
+        _ => Handling::TreatAsWithdraw,
+    }
+}
+
+/// Reads an UPDATE's body. `strict` returns the first error, as RFC 4271
+/// does; otherwise errors are handled as RFC 7606 says.
+fn read_update(b: &[u8], ctx: &Context, strict: bool) -> Result<Received, Error> {
+    if b.len() > MAX_BODY_LEN {
+        return Err(Error::BadMessageLength(length_field(b)));
+    }
+    let mut r = b;
+    let wlen = take_u16(&mut r).ok_or(Error::MalformedAttributeList)?;
+    let withdrawn = take(&mut r, usize::from(wlen)).ok_or(Error::MalformedAttributeList)?;
+    let alen = take_u16(&mut r).ok_or(Error::MalformedAttributeList)?;
+    let mut attrs = take(&mut r, usize::from(alen)).ok_or(Error::MalformedAttributeList)?;
+    let withdrawn = read_prefixes(withdrawn, false).ok_or(Error::InvalidNetworkField)?;
+    // RFC 7606 reads the NLRI first: an error in it closes the connection
+    // whatever the attributes hold.
+    let early = if strict { None } else { Some(read_prefixes(r, false).ok_or(Error::InvalidNetworkField)?) };
+
+    // Types met, whether read or not, and types read and kept.
+    let mut seen = [false; 256];
+    let mut have = [false; 256];
+    let mut broken = false;
+    let mut attributes = Vec::new();
+    let mut withdraw = None;
+    let mut discarded = Vec::new();
+    while !attrs.is_empty() {
+        let all = attrs;
+        let header = (|| {
+            let (flags, kind) = (take_u8(&mut attrs)?, take_u8(&mut attrs)?);
+            let n = if flags & flag::EXTENDED_LENGTH != 0 {
+                usize::from(take_u16(&mut attrs)?)
+            } else {
+                usize::from(take_u8(&mut attrs)?)
+            };
+            Some((flags, kind, take(&mut attrs, n)?))
+        })();
+        let Some((flags, kind, value)) = header else {
+            // RFC 7606 section 4: an attribute that runs past the total
+            // attribute length, which still says where the NLRI starts.
+            if strict {
+                return Err(Error::MalformedAttributeList);
+            }
+            withdraw.get_or_insert(Error::MalformedAttributeList);
+            broken = true;
+            break;
+        };
+        let raw = &all[..all.len() - attrs.len()];
+        if std::mem::replace(&mut seen[usize::from(kind)], true) {
+            // RFC 7606 section 3 (g): a repeated MP attribute closes the
+            // connection; other repeats are dropped.
+            if strict || kind == attr::MP_REACH_NLRI || kind == attr::MP_UNREACH_NLRI {
+                return Err(Error::MalformedAttributeList);
+            }
+            discarded.push(Error::MalformedAttributeList);
+            continue;
+        }
+        match Attribute::parse(flags, kind, value, raw, ctx) {
+            Ok(Some(a)) => {
+                have[usize::from(kind)] = true;
+                attributes.push(a);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                let h = handling(kind, &e);
+                let as4 = kind == attr::AS4_PATH || kind == attr::AS4_AGGREGATOR;
+                if h == Handling::SessionReset || (strict && !as4) {
+                    return Err(e);
+                }
+                if h == Handling::TreatAsWithdraw {
+                    withdraw.get_or_insert(e);
+                } else if !strict {
+                    discarded.push(e);
+                }
+            }
+        }
+    }
+    let nlri = match early {
+        Some(n) => n,
+        None => read_prefixes(r, false).ok_or(Error::InvalidNetworkField)?,
+    };
+    if let Some(k) = missing(&have, !nlri.is_empty()) {
+        // RFC 7606 section 3 (d).
+        if strict {
+            return Err(Error::MissingWellKnownAttribute(k));
+        }
+        withdraw.get_or_insert(Error::MissingWellKnownAttribute(k));
+    }
+    // RFC 7606 section 5.2: an UPDATE that announces nothing but carries
+    // attributes other than MP_UNREACH_NLRI cannot be trusted to have been
+    // read, so an error stronger than a discard closes the connection.
+    if let Some(e) = &withdraw {
+        let announces = !nlri.is_empty() || have[usize::from(attr::MP_REACH_NLRI)];
+        let others = broken || seen.iter().enumerate().any(|(k, &s)| s && k != usize::from(attr::MP_UNREACH_NLRI));
+        if !announces && others {
+            return Err(e.clone());
+        }
+    }
+    // RFC 7606 section 5.1 puts MP_REACH_NLRI and MP_UNREACH_NLRI first.
+    attributes.sort_by_key(|a| !matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_)));
+    Ok(Received { update: Update { withdrawn, attributes, nlri }, withdraw, discarded })
 }
 
 /// A NOTIFICATION message: an error code, a subcode and data that depends
@@ -1565,8 +1956,8 @@ fn be16(b: &[u8], i: usize) -> u16 {
 mod tests {
     use super::*;
 
-    const TWO: Context = Context { four_octet_as: false };
-    const FOUR: Context = Context { four_octet_as: true };
+    const TWO: Context = Context { four_octet_as: false, enhanced_route_refresh: false };
+    const FOUR: Context = Context { four_octet_as: true, enhanced_route_refresh: false };
 
     fn header(len: u16, kind: u8) -> Vec<u8> {
         let mut out = vec![0xff; 16];
@@ -1579,6 +1970,28 @@ mod tests {
         let (frame, used) = Frame::parse(bytes)?.expect("a whole frame");
         assert_eq!(used, bytes.len());
         Message::decode(&frame, ctx)
+    }
+
+    /// Feeds all of `bytes`, taking frames out whenever the decoder is
+    /// full, and returns every frame and the first error.
+    fn split(d: &mut Decoder, mut bytes: &[u8]) -> Vec<Result<Frame, Error>> {
+        let mut out = Vec::new();
+        loop {
+            let n = d.feed(bytes);
+            bytes = &bytes[n..];
+            assert!(d.buffered() <= MAX_BUFFERED);
+            while let Some(f) = d.next_frame() {
+                let stop = f.is_err();
+                out.push(f);
+                if stop {
+                    return out;
+                }
+            }
+            if bytes.is_empty() {
+                return out;
+            }
+            assert!(n > 0, "a full decoder gave no frame");
+        }
     }
 
     fn update_body(body: &[u8], ctx: &Context) -> Result<Message, Error> {
@@ -1622,8 +2035,14 @@ mod tests {
         let mut note = header(23, 3);
         note.extend_from_slice(&[6, 2, 0xaa, 0xbb]);
         let mp = Message::Update(Update {
-            withdrawn: vec![v4(10, 1, 0, 0, 16)],
+            withdrawn: vec![],
             attributes: vec![
+                Attribute::MpReach(MpReach {
+                    afi: afi::IPV6,
+                    safi: safi::UNICAST,
+                    next_hop: vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                    nlri: Nlri::Prefixes(vec![Prefix::new("2001:db8:1::".parse().unwrap(), 48).unwrap()]),
+                }),
                 Attribute::Origin(Origin::Egp),
                 Attribute::AsPath(vec![
                     Segment { kind: SegmentKind::Sequence, asns: vec![4_200_000_000, 65001] },
@@ -1632,22 +2051,61 @@ mod tests {
                 Attribute::Med(7),
                 Attribute::LocalPref(100),
                 Attribute::AtomicAggregate,
-                Attribute::Aggregator { asn: 4_200_000_000, address: Ipv4Addr::new(10, 0, 0, 1) },
-                Attribute::Communities(vec![0xfde9_0001, 0xffff_ff01]),
-                Attribute::MpReach(MpReach {
-                    afi: afi::IPV6,
-                    safi: safi::UNICAST,
-                    next_hop: vec![0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-                    nlri: Nlri::Prefixes(vec![Prefix::new("2001:db8:1::".parse().unwrap(), 48).unwrap()]),
-                }),
-                Attribute::MpUnreach(MpUnreach { afi: 25, safi: 65, withdrawn: Nlri::Raw(vec![1, 2, 3]) }),
+                Attribute::Aggregator { asn: 4_200_000_000, address: Ipv4Addr::new(10, 0, 0, 1), partial: false },
+                Attribute::Communities { values: vec![0xfde9_0001, 0xffff_ff01], partial: true },
                 Attribute::Unknown { flags: 0xc0, kind: 32, value: vec![0; 300] },
             ],
             nlri: vec![],
         })
         .to_bytes(&FOUR)
         .unwrap();
-        vec![(open_bytes(), TWO), (update_bytes(), TWO), (keep, TWO), (refresh, TWO), (note, TWO), (mp, FOUR)]
+        let unreach = Message::Update(Update {
+            attributes: vec![Attribute::MpUnreach(MpUnreach {
+                afi: 25,
+                safi: 65,
+                withdrawn: Nlri::Raw(vec![1, 2, 3]),
+            })],
+            ..Update::default()
+        })
+        .to_bytes(&FOUR)
+        .unwrap();
+        // A two-octet session that carries the four-octet path and
+        // aggregator beside AS_TRANS.
+        let as4 = Message::Update(Update {
+            withdrawn: vec![],
+            attributes: vec![
+                Attribute::Origin(Origin::Igp),
+                Attribute::AsPath(vec![Segment {
+                    kind: SegmentKind::Sequence,
+                    asns: vec![u32::from(AS_TRANS), 65001],
+                }]),
+                Attribute::NextHop(Ipv4Addr::new(192, 0, 2, 1)),
+                Attribute::Aggregator { asn: u32::from(AS_TRANS), address: Ipv4Addr::new(10, 0, 0, 1), partial: true },
+                Attribute::Unknown {
+                    flags: 0xe0,
+                    kind: attr::AS4_PATH,
+                    value: vec![2, 2, 0xfa, 0x56, 0xea, 0, 0, 0, 0xfd, 0xe9],
+                },
+                Attribute::Unknown {
+                    flags: 0xc0,
+                    kind: attr::AS4_AGGREGATOR,
+                    value: vec![0xfa, 0x56, 0xea, 0, 10, 0, 0, 1],
+                },
+            ],
+            nlri: vec![v4(198, 51, 100, 0, 24)],
+        })
+        .to_bytes(&TWO)
+        .unwrap();
+        vec![
+            (open_bytes(), TWO),
+            (update_bytes(), TWO),
+            (keep, TWO),
+            (refresh, TWO),
+            (note, TWO),
+            (mp, FOUR),
+            (unreach, FOUR),
+            (as4, TWO),
+        ]
     }
 
     #[test]
@@ -1718,7 +2176,8 @@ mod tests {
         let plain = Open { parameters: vec![], ..open.clone() };
         assert_eq!(plain.asn(), u32::from(AS_TRANS));
         assert_eq!(Context::negotiated(&open, &plain), TWO);
-        assert_eq!(Context::negotiated(&open, &open), FOUR);
+        // Both sent capability 70, enhanced route refresh, too.
+        assert_eq!(Context::negotiated(&open, &open), Context { enhanced_route_refresh: true, ..FOUR });
     }
 
     #[test]
@@ -1774,7 +2233,13 @@ mod tests {
         assert_eq!(m.next_hop.len(), 16);
         assert_eq!(m.nlri, Nlri::Prefixes(vec![Prefix::new("2001:db8::".parse().unwrap(), 32).unwrap()]));
         assert_eq!(u.attribute(attr::AS_PATH), Some(&Attribute::AsPath(vec![])));
-        assert_eq!(Message::Update(u).to_frame(&TWO).unwrap().body, body);
+        // The reader puts MP_REACH_NLRI first, where RFC 7606 section 5.1
+        // has a writer put it.
+        assert_eq!(u.attributes[0].kind(), attr::MP_REACH_NLRI);
+        let mut moved = body[..4].to_vec();
+        moved.extend_from_slice(&body[11..]);
+        moved.extend_from_slice(&body[4..11]);
+        assert_eq!(Message::Update(u).to_frame(&TWO).unwrap().body, moved);
         // Without ORIGIN the routes are refused.
         let mut b = vec![0, 0, 0, 32];
         b.extend_from_slice(&body[8..]);
@@ -1804,11 +2269,11 @@ mod tests {
         assert_eq!(Prefix::new(Ipv4Addr::new(1, 2, 3, 4).into(), 33), None);
         assert!(Prefix::new(Ipv6Addr::LOCALHOST.into(), 128).is_some());
         assert_eq!(Prefix::new(Ipv6Addr::LOCALHOST.into(), 129), None);
-        // Bits past the length are kept as they came, and written back.
+        // Bits past the length are cleared, and written as 0.
         let b = vec![0, 2, 7, 0xff, 0, 0];
         let Message::Update(u) = update_body(&b, &TWO).unwrap() else { panic!() };
-        assert_eq!(u.withdrawn, [v4(255, 0, 0, 0, 7)]);
-        assert_eq!(Message::Update(u).to_frame(&TWO).unwrap().body, b);
+        assert_eq!(u.withdrawn, [v4(254, 0, 0, 0, 7)]);
+        assert_eq!(Message::Update(u).to_frame(&TWO).unwrap().body, [0, 2, 7, 0xfe, 0, 0]);
     }
 
     #[test]
@@ -2110,12 +2575,18 @@ mod tests {
         assert!(invalid(Message::Open(Open { hold_time: 2, ..Open::new(1, 0, id, vec![]) }), &TWO));
         assert!(invalid(Message::Open(Open::new(1, 0, Ipv4Addr::UNSPECIFIED, vec![])), &TWO));
         assert!(invalid(open(vec![Parameter::Other { kind: 2, value: vec![] }]), &TWO));
-        assert!(invalid(open(vec![Parameter::Other { kind: 1, value: vec![0; 256] }]), &TWO));
-        assert!(invalid(open(vec![Parameter::Other { kind: 1, value: vec![0; 200] }; 2]), &TWO));
+        assert!(invalid(open(vec![Parameter::Other { kind: 255, value: vec![] }]), &TWO));
+        assert!(invalid(Message::Open(Open { my_as: 0, ..Open::new(1, 0, id, vec![]) }), &TWO));
+        assert!(invalid(Message::Open(Open::new(0, 0, id, vec![])), &TWO));
+        assert_eq!(
+            bad(open(vec![Parameter::Other { kind: 1, value: vec![0; MAX_BODY_LEN] }]), &TWO),
+            EncodeError::TooLong
+        );
         let caps = |c: Vec<Capability>| open(vec![Parameter::Capabilities(c)]);
         assert!(invalid(caps(vec![Capability::Other { code: 65, value: vec![0; 4] }]), &TWO));
         assert!(invalid(caps(vec![Capability::Other { code: 9, value: vec![0; 256] }]), &TWO));
-        assert!(invalid(caps(vec![Capability::RouteRefresh; 128]), &TWO));
+        // More than 255 bytes of capabilities take the extended format.
+        assert!(caps(vec![Capability::RouteRefresh; 128]).to_bytes(&TWO).is_ok());
         let gr = |flags, time, n| {
             caps(vec![Capability::GracefulRestart(GracefulRestart {
                 flags,
@@ -2152,7 +2623,7 @@ mod tests {
         assert!(invalid(with(path(vec![70000])), &TWO));
         assert!(with(path(vec![70000])).to_bytes(&FOUR).is_ok());
         let mut agg = well_known();
-        agg.push(Attribute::Aggregator { asn: 70000, address: id });
+        agg.push(Attribute::Aggregator { asn: 70000, address: id, partial: false });
         assert!(invalid(route(agg.clone()), &TWO));
         assert!(route(agg).to_bytes(&FOUR).is_ok());
         // Unknown attributes that would read as something else.
@@ -2175,9 +2646,9 @@ mod tests {
         let reach = |next_hop: Vec<u8>, afi: u16, nlri: Nlri| {
             Message::Update(Update {
                 attributes: vec![
+                    Attribute::MpReach(MpReach { afi, safi: 1, next_hop, nlri }),
                     Attribute::Origin(Origin::Igp),
                     path(vec![1]),
-                    Attribute::MpReach(MpReach { afi, safi: 1, next_hop, nlri }),
                 ],
                 ..Update::default()
             })
@@ -2189,10 +2660,10 @@ mod tests {
         assert!(reach(vec![0; 4], 9, Nlri::Raw(vec![1, 2, 3])).to_bytes(&TWO).is_ok());
         // Too much for one message.
         let mut many = well_known();
-        many.push(Attribute::Communities(vec![1; 1100]));
+        many.push(Attribute::Communities { values: vec![1; 1100], partial: false });
         assert_eq!(bad(route(many), &TWO), EncodeError::TooLong);
         let mut huge = well_known();
-        huge.push(Attribute::Communities(vec![1; 10_000_000]));
+        huge.push(Attribute::Communities { values: vec![1; 10_000_000], partial: false });
         assert_eq!(bad(route(huge), &TWO), EncodeError::TooLong);
         let mut unknown = well_known();
         unknown.push(Attribute::Unknown { flags: 0x80, kind: 99, value: vec![0; 5000] });
@@ -2241,17 +2712,16 @@ mod tests {
         let mut d = Decoder::new();
         let mut kinds = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
-            while let Some(f) = d.next_frame() {
+            for f in split(&mut d, std::slice::from_ref(byte)) {
                 kinds.push(f.unwrap().kind);
             }
         }
-        assert_eq!(kinds, [1, 2, 4, 5, 3]);
+        assert_eq!(kinds, [1, 2, 4, 5, 3, 2]);
         assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken.
-        d.feed(&[0xff, 0xff, 0]);
+        // A broken stream stays broken, and takes every byte.
+        assert_eq!(d.feed(&[0xff, 0xff, 0]), 3);
         assert_eq!(d.next_frame(), Some(Err(Error::ConnectionNotSynchronized)));
-        d.feed(&stream);
+        assert_eq!(d.feed(&stream), stream.len());
         assert_eq!(d.next_frame(), Some(Err(Error::ConnectionNotSynchronized)));
         assert_eq!(d.buffered(), 0);
     }
@@ -2262,22 +2732,49 @@ mod tests {
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(f) = d.next_frame() {
-            f.unwrap();
-            n += 1;
-        }
-        assert_eq!(n, 200_000);
+        let frames = split(&mut d, &stream);
+        assert!(frames.iter().all(Result::is_ok));
+        assert_eq!(frames.len(), 200_000);
         assert_eq!(d.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
+    /// Whether an UPDATE mixes kinds of routes, which a reader takes from
+    /// older speakers but a writer refuses (RFC 7606 section 5.1).
+    fn mixes(m: &Message) -> bool {
+        let Message::Update(u) = m else { return false };
+        let mp = u.attributes.iter().filter(|a| matches!(a, Attribute::MpReach(_) | Attribute::MpUnreach(_))).count();
+        usize::from(!u.withdrawn.is_empty()) + usize::from(!u.nlri.is_empty()) + mp > 1
+    }
+
     /// Checks what the fuzz target checks: a message read can be written,
-    /// and reads back the same.
+    /// unless it mixes kinds of routes, and reads back the same. The
+    /// error handling of RFC 7606 closes the connection only for errors
+    /// the strict reader has too.
     fn check_frame(frame: &Frame) {
         for ctx in [TWO, FOUR] {
+            if frame.kind == kind::UPDATE {
+                let strict = Message::decode(frame, &ctx);
+                match Update::receive(&frame.body, &ctx) {
+                    Ok(r) => {
+                        if r.withdraw.is_some() {
+                            assert!(strict.is_err());
+                        }
+                        if let Ok(m) = strict {
+                            assert_eq!(m, Message::Update(r.update));
+                        }
+                    }
+                    Err(e) => {
+                        assert!(strict.is_err());
+                        assert!(Message::Notification(e.notification()).to_bytes(&ctx).is_ok());
+                    }
+                }
+            }
             if let Ok(m) = Message::decode(frame, &ctx) {
+                if mixes(&m) {
+                    assert!(matches!(m.to_bytes(&ctx), Err(EncodeError::Invalid(_))));
+                    continue;
+                }
                 let bytes = m.to_bytes(&ctx).unwrap_or_else(|e| panic!("{m:?} cannot be written: {e}"));
                 assert!(bytes.len() <= MAX_MESSAGE_LEN);
                 let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
@@ -2325,22 +2822,17 @@ mod tests {
                     }
                 }
             }
-            let mut whole = Decoder::new();
-            whole.feed(&b);
-            let mut frames = Vec::new();
-            while let Some(Ok(f)) = whole.next_frame() {
-                frames.push(f);
-            }
+            let frames = split(&mut Decoder::new(), &b);
             let mut bytewise = Decoder::new();
             let mut again = Vec::new();
             for byte in &b {
-                bytewise.feed(std::slice::from_ref(byte));
-                while let Some(Ok(f)) = bytewise.next_frame() {
-                    again.push(f);
+                again.extend(split(&mut bytewise, std::slice::from_ref(byte)));
+                if again.last().is_some_and(Result::is_err) {
+                    break;
                 }
             }
             assert_eq!(frames, again);
-            for f in &frames {
+            for f in frames.iter().flatten() {
                 check_frame(f);
             }
             // The body alone, as each message type.
@@ -2397,5 +2889,416 @@ mod tests {
             check_frame(&frame);
         }
         assert!(read > 100, "only {read} read");
+    }
+
+    #[test]
+    fn review_to_frame_checks_the_whole_body() {
+        // 4074 withdrawn /0 routes: 4076 bytes of withdrawn routes, then
+        // the attribute length makes the body 4078, too long.
+        let u = Update { withdrawn: vec![v4(0, 0, 0, 0, 0); 4074], ..Update::default() };
+        assert_eq!(Message::Update(u).to_frame(&TWO), Err(EncodeError::TooLong));
+        let u = Update { withdrawn: vec![v4(0, 0, 0, 0, 0); 4073], ..Update::default() };
+        let f = Message::Update(u).to_frame(&TWO).unwrap();
+        assert_eq!(f.body.len(), MAX_BODY_LEN);
+        assert!(Message::decode(&f, &TWO).is_ok());
+    }
+
+    #[test]
+    fn review_open_new_carries_one_four_octet_as() {
+        let o = Open::new(65001, 90, Ipv4Addr::new(192, 0, 2, 1), vec![Capability::FourOctetAs(65002)]);
+        assert_eq!(o.asn(), 65001);
+        assert_eq!(o.capabilities().filter(|c| matches!(c, Capability::FourOctetAs(_))).count(), 1);
+    }
+
+    #[test]
+    fn review_empty_communities_are_malformed() {
+        assert_eq!(update_body(&[0, 0, 0, 3, 0xc0, 8, 0], &TWO), Err(Error::AttributeLength(vec![0xc0, 8, 0])));
+    }
+
+    #[test]
+    fn review_unknown_non_transitive_attributes_drop_partial() {
+        let Ok(Message::Update(u)) = update_body(&[0, 0, 0, 3, 0xa0, 99, 0], &TWO) else { panic!() };
+        assert_eq!(u.attributes, [Attribute::Unknown { flags: 0x80, kind: 99, value: vec![] }]);
+        let bad = Update {
+            attributes: vec![Attribute::Unknown { flags: 0xa0, kind: 99, value: vec![] }],
+            ..Update::default()
+        };
+        assert!(matches!(Message::Update(bad).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+    }
+
+    #[test]
+    fn review_prefixes_are_canonical() {
+        // 10.128.0.0/9 with the padding bit clear and set reads the same.
+        let a = update_body(&[0, 3, 9, 10, 0x80, 0, 0], &TWO).unwrap();
+        let b = update_body(&[0, 3, 9, 10, 0xff, 0, 0], &TWO).unwrap();
+        assert_eq!(a, b);
+        let Message::Update(u) = a else { panic!() };
+        assert_eq!(u.withdrawn, [v4(10, 128, 0, 0, 9)]);
+        // A prefix with bits set past its length is not written.
+        let u = Update { withdrawn: vec![v4(192, 0, 2, 9, 24)], ..Update::default() };
+        assert!(matches!(Message::Update(u).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+    }
+
+    #[test]
+    fn review_mp_reach_next_hop_lengths() {
+        let reach = |afi: u16, next_hop: Vec<u8>| {
+            let mut v = afi.to_be_bytes().to_vec();
+            v.push(1);
+            v.push(next_hop.len() as u8);
+            v.extend_from_slice(&next_hop);
+            v.push(0);
+            let mut raw = vec![0x80, 14, v.len() as u8];
+            raw.extend_from_slice(&v);
+            let mut b = vec![0, 0, 0, 7 + raw.len() as u8, 0x40, 1, 1, 0, 0x40, 2, 0];
+            b.extend_from_slice(&raw);
+            (b, raw)
+        };
+        for (afi, n) in [(2, 0), (2, 4), (2, 15), (1, 0), (1, 8)] {
+            let (b, raw) = reach(afi, vec![1; n]);
+            assert_eq!(update_body(&b, &TWO), Err(Error::OptionalAttribute(raw)), "{afi} {n}");
+        }
+        for (afi, n) in [(2, 16), (2, 32), (1, 4), (1, 16), (1, 32), (25, 0)] {
+            let (b, _) = reach(afi, vec![1; n]);
+            assert!(update_body(&b, &TWO).is_ok(), "{afi} {n}");
+        }
+        let u = Update {
+            attributes: vec![
+                Attribute::MpReach(MpReach {
+                    afi: afi::IPV6,
+                    safi: safi::UNICAST,
+                    next_hop: vec![],
+                    nlri: Nlri::Prefixes(vec![Prefix::new(Ipv6Addr::UNSPECIFIED.into(), 0).unwrap()]),
+                }),
+                Attribute::Origin(Origin::Igp),
+                Attribute::AsPath(vec![]),
+            ],
+            ..Update::default()
+        };
+        assert!(matches!(Message::Update(u).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+    }
+
+    #[test]
+    fn review_as_zero_is_refused() {
+        // RFC 7607: an OPEN from AS 0 is Bad Peer AS.
+        let mut b = open_bytes();
+        b[20..22].copy_from_slice(&[0, 0]);
+        assert_eq!(decode(&b, &TWO), Err(Error::BadPeerAs));
+        let mut b = open_bytes();
+        let n = b.len();
+        b[n - 4..].copy_from_slice(&[0, 0, 0, 0]);
+        assert_eq!(decode(&b, &TWO), Err(Error::BadPeerAs));
+        let n = Error::BadPeerAs.notification();
+        assert_eq!((n.code, n.subcode), (2, 2));
+        let id = Ipv4Addr::new(10, 0, 0, 1);
+        assert!(matches!(Message::Open(Open::new(0, 90, id, vec![])).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        // An AS_PATH or AGGREGATOR with AS 0 is malformed.
+        assert_eq!(update_body(&[0, 0, 0, 7, 0x40, 2, 4, 2, 1, 0, 0], &TWO), Err(Error::MalformedAsPath));
+        let raw = vec![0xc0, 7, 6, 0, 0, 10, 0, 0, 1];
+        let mut b = vec![0, 0, 0, raw.len() as u8];
+        b.extend_from_slice(&raw);
+        assert_eq!(update_body(&b, &TWO), Err(Error::OptionalAttribute(raw)));
+    }
+
+    #[test]
+    fn review_extended_open_parameters() {
+        // RFC 9072: an OPEN in the extended format, with no parameters.
+        let body = [4, 0xfd, 0xe9, 0, 0x5a, 0xc0, 0, 2, 1, 0xff, 0xff, 0, 0];
+        let Message::Open(o) = Message::decode(&Frame { kind: kind::OPEN, body: body.to_vec() }, &TWO).unwrap() else {
+            panic!()
+        };
+        assert_eq!((o.my_as, o.hold_time, o.parameters.len()), (65001, 90, 0));
+        // With a capabilities parameter of two capabilities.
+        let mut body = vec![4, 0xfd, 0xe9, 0, 0x5a, 0xc0, 0, 2, 1, 0xff, 0xff, 0, 11];
+        body.extend_from_slice(&[2, 0, 8, 2, 0, 65, 4, 0, 0, 0xfd, 0xe9]);
+        let Message::Open(o) = Message::decode(&Frame { kind: kind::OPEN, body }, &TWO).unwrap() else { panic!() };
+        assert_eq!(o.capabilities().count(), 2);
+        assert_eq!(o.asn(), 65001);
+    }
+
+    #[test]
+    fn review_update_writer_follows_rfc_7606_layout() {
+        let path = Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: vec![1] }]);
+        let reach = Attribute::MpReach(MpReach {
+            afi: afi::IPV6,
+            safi: safi::UNICAST,
+            next_hop: vec![0x20; 16],
+            nlri: Nlri::Prefixes(vec![]),
+        });
+        // MP_REACH_NLRI after other attributes is not written.
+        let late = Update {
+            attributes: vec![Attribute::Origin(Origin::Igp), path.clone(), reach.clone()],
+            ..Update::default()
+        };
+        assert!(matches!(Message::Update(late).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        // Withdrawn routes with MP_REACH_NLRI are not written.
+        let mixed = Update {
+            withdrawn: vec![v4(10, 0, 0, 0, 8)],
+            attributes: vec![reach.clone(), Attribute::Origin(Origin::Igp), path.clone()],
+            ..Update::default()
+        };
+        assert!(matches!(Message::Update(mixed).to_bytes(&TWO), Err(EncodeError::Invalid(_))));
+        // A reader still takes the old layout, and puts MP_REACH_NLRI first.
+        let mut body = vec![0, 0, 0, 31, 0x40, 1, 1, 0, 0x40, 2, 0, 0x80, 14, 21, 0, 2, 1, 16];
+        body.extend_from_slice(&[0x20; 16]);
+        body.push(0);
+        let Message::Update(u) = update_body(&body, &TWO).unwrap() else { panic!() };
+        assert_eq!(u.attributes[0].kind(), attr::MP_REACH_NLRI);
+        assert!(Message::Update(u).to_bytes(&TWO).is_ok());
+    }
+
+    #[test]
+    fn review_decoder_holds_at_most_one_message() {
+        let mut d = Decoder::new();
+        // One large feed, even of bytes that will fail, is taken only in
+        // part.
+        assert_eq!(d.feed(&vec![0xff; 1 << 20]), MAX_BUFFERED);
+        assert_eq!(d.buffered(), MAX_BUFFERED);
+        assert_eq!(d.feed(&[0xff]), 0);
+        // A whole message of the longest length fits.
+        let note = Message::Notification(Notification { code: 6, subcode: 0, data: vec![0; MAX_BODY_LEN - 2] });
+        let b = note.to_bytes(&TWO).unwrap();
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&b), b.len());
+        assert!(d.next_frame().unwrap().is_ok());
+        // Many messages in one stream go through a full decoder.
+        let stream: Vec<u8> = b.iter().copied().cycle().take(b.len() * 50).collect();
+        let frames = split(&mut Decoder::new(), &stream);
+        assert_eq!(frames.len(), 50);
+        assert!(frames.iter().all(Result::is_ok));
+    }
+
+    /// An UPDATE body announcing 10.0.0.0/8, with `extra` added to the
+    /// attributes after ORIGIN, AS_PATH (AS 1) and NEXT_HOP.
+    fn route_with(extra: &[u8]) -> Vec<u8> {
+        let mut attrs = vec![0x40, 1, 1, 0, 0x40, 2, 4, 2, 1, 0, 1, 0x40, 3, 4, 192, 0, 2, 1];
+        attrs.extend_from_slice(extra);
+        let mut b = vec![0, 0];
+        b.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        b.extend_from_slice(&attrs);
+        b.extend_from_slice(&[8, 10]);
+        b
+    }
+
+    #[test]
+    fn review_receive_follows_rfc_7606() {
+        // A good UPDATE reads the same both ways.
+        let good = route_with(&[]);
+        let r = Update::receive(&good, &TWO).unwrap();
+        assert_eq!((r.withdraw.as_ref(), r.discarded.len()), (None, 0));
+        assert_eq!(r.update, Update::parse(&good, &TWO).unwrap());
+        // An ORIGIN of 3 withdraws the route instead of closing.
+        let mut b = good.clone();
+        b[7] = 3;
+        assert_eq!(Update::parse(&b, &TWO), Err(Error::InvalidOrigin(vec![0x40, 1, 1, 3])));
+        let r = Update::receive(&b, &TWO).unwrap();
+        assert_eq!(r.withdraw, Some(Error::InvalidOrigin(vec![0x40, 1, 1, 3])));
+        assert_eq!(r.update.nlri, [v4(10, 0, 0, 0, 8)]);
+        // A second MED is dropped and the first kept.
+        let b = route_with(&[0x80, 4, 4, 0, 0, 0, 1, 0x80, 4, 4, 0, 0, 0, 2]);
+        assert_eq!(Update::parse(&b, &TWO), Err(Error::MalformedAttributeList));
+        let r = Update::receive(&b, &TWO).unwrap();
+        assert_eq!(r.withdraw, None);
+        assert_eq!(r.discarded, [Error::MalformedAttributeList]);
+        assert_eq!(r.update.attribute(attr::MED), Some(&Attribute::Med(1)));
+        // A malformed AGGREGATOR or ATOMIC_AGGREGATE is dropped.
+        let b = route_with(&[0xc0, 7, 5, 0, 1, 10, 0, 0, 0x40, 6, 1, 0]);
+        let r = Update::receive(&b, &TWO).unwrap();
+        assert_eq!(r.withdraw, None);
+        assert_eq!(r.discarded.len(), 2);
+        assert_eq!(r.update.attributes.len(), 3);
+        // Empty COMMUNITIES, a NEXT_HOP that is no host, AS 0 in the path
+        // and a missing NEXT_HOP each withdraw.
+        for b in [
+            route_with(&[0xc0, 8, 0]),
+            {
+                let mut b = route_with(&[]);
+                b[18] = 127;
+                b
+            },
+            {
+                let mut b = route_with(&[]);
+                b[14] = 0;
+                b
+            },
+            vec![0, 0, 0, 11, 0x40, 1, 1, 0, 0x40, 2, 4, 2, 1, 0, 1, 8, 10],
+        ] {
+            let r = Update::receive(&b, &TWO).unwrap();
+            assert!(r.withdraw.is_some(), "{b:?}");
+            assert_eq!(r.update.nlri, [v4(10, 0, 0, 0, 8)]);
+        }
+        // An attribute running past the attribute length withdraws; the
+        // NLRI is found from the length.
+        let mut b = vec![0, 0, 0, 7, 0x40, 1, 1, 0, 0x80, 4, 9, 8, 10];
+        let r = Update::receive(&b, &TWO).unwrap();
+        assert_eq!(r.withdraw, Some(Error::MalformedAttributeList));
+        assert_eq!(r.update.nlri, [v4(10, 0, 0, 0, 8)]);
+        // The same with no routes announced closes (section 5.2).
+        b.truncate(11);
+        assert_eq!(Update::receive(&b, &TWO), Err(Error::MalformedAttributeList));
+        // Errors that still close: NLRI that cannot be read, a repeated
+        // MP_REACH_NLRI, an unknown well-known attribute.
+        let mut b = route_with(&[]);
+        b.push(33);
+        assert_eq!(Update::receive(&b, &TWO), Err(Error::InvalidNetworkField));
+        let mp = [0x80, 15, 3, 0, 1, 1];
+        let b = [&[0, 0, 0, 12][..], &mp, &mp].concat();
+        assert_eq!(Update::receive(&b, &TWO), Err(Error::MalformedAttributeList));
+        let b = route_with(&[0x40, 99, 0]);
+        assert_eq!(Update::receive(&b, &TWO), Err(Error::UnrecognizedWellKnownAttribute(vec![0x40, 99, 0])));
+        // Withdrawn routes with a bad ORIGIN and nothing announced close.
+        let b = [0, 2, 8, 10, 0, 4, 0x40, 1, 1, 3];
+        assert_eq!(Update::receive(&b, &TWO), Err(Error::InvalidOrigin(vec![0x40, 1, 1, 3])));
+    }
+
+    #[test]
+    fn review_partial_is_kept_on_known_attributes() {
+        let b = [0, 0, 0, 7, 0xe0, 8, 4, 0xfd, 0xe9, 0, 1];
+        let Message::Update(u) = update_body(&b, &TWO).unwrap() else { panic!() };
+        assert_eq!(u.attributes, [Attribute::Communities { values: vec![0xfde9_0001], partial: true }]);
+        assert_eq!(Message::Update(u).to_frame(&TWO).unwrap().body, b);
+        let b = [0, 0, 0, 9, 0xe0, 7, 6, 0, 1, 10, 0, 0, 1];
+        let Message::Update(u) = update_body(&b, &TWO).unwrap() else { panic!() };
+        assert_eq!(Message::Update(u).to_frame(&TWO).unwrap().body, b);
+    }
+
+    #[test]
+    fn review_as4_attributes_are_checked() {
+        let with = |raw: &[u8], ctx: &Context| {
+            let Ok(Message::Update(u)) = update_body(&route_with(raw), ctx) else { panic!("{raw:?}") };
+            u.attributes.len()
+        };
+        let path = [0xc0, 17, 6, 2, 1, 0, 1, 0, 0];
+        let agg = [0xc0, 18, 8, 0, 1, 0, 0, 10, 0, 0, 1];
+        // Kept in a two-octet session, dropped between four-octet ones.
+        assert_eq!(with(&path, &TWO), 4);
+        assert_eq!(with(&agg, &TWO), 4);
+        let four = |raw: &[u8]| {
+            let mut b = vec![0x40, 1, 1, 0, 0x40, 2, 6, 2, 1, 0, 0, 0, 1, 0x40, 3, 4, 192, 0, 2, 1];
+            b.extend_from_slice(raw);
+            let mut body = vec![0, 0, 0, b.len() as u8];
+            body.extend_from_slice(&b);
+            body.extend_from_slice(&[8, 10]);
+            let Ok(Message::Update(u)) = update_body(&body, &FOUR) else { panic!() };
+            u.attributes.len()
+        };
+        assert_eq!(four(&path), 3);
+        assert_eq!(four(&agg), 3);
+        // Malformed ones are dropped: empty, AS 0, the wrong length, not
+        // transitive.
+        for raw in [
+            &[0xc0, 17, 0][..],
+            &[0xc0, 17, 6, 2, 1, 0, 0, 0, 0],
+            &[0xc0, 17, 4, 2, 1, 0, 1],
+            &[0x80, 17, 6, 2, 1, 0, 1, 0, 0],
+            &[0xc0, 18, 6, 0, 1, 10, 0, 0, 1],
+            &[0xc0, 18, 8, 0, 0, 0, 0, 10, 0, 0, 1],
+        ] {
+            assert_eq!(with(raw, &TWO), 3, "{raw:?}");
+            assert_eq!(Update::receive(&route_with(raw), &TWO).unwrap().discarded.len(), 1, "{raw:?}");
+        }
+        // Confederation segments are dropped from an AS4_PATH.
+        let Ok(Message::Update(u)) =
+            update_body(&route_with(&[0xc0, 17, 12, 3, 1, 0, 0, 0, 9, 2, 1, 0, 1, 0, 0]), &TWO)
+        else {
+            panic!()
+        };
+        assert_eq!(u.attributes[3], Attribute::Unknown { flags: 0xc0, kind: 17, value: vec![2, 1, 0, 1, 0, 0] });
+        // Writers refuse what readers drop.
+        let route = |a: Attribute, ctx: &Context| {
+            let mut u = Update::parse(&route_with(&[]), &TWO).unwrap();
+            u.attributes.push(a);
+            Message::Update(u).to_bytes(ctx)
+        };
+        let unknown = |flags, kind, value: &[u8]| Attribute::Unknown { flags, kind, value: value.to_vec() };
+        assert!(route(unknown(0xc0, 17, &path[3..]), &TWO).is_ok());
+        assert!(route(unknown(0xc0, 17, &path[3..]), &FOUR).is_err());
+        assert!(route(unknown(0xc0, 17, &[]), &TWO).is_err());
+        assert!(route(unknown(0x80, 17, &path[3..]), &TWO).is_err());
+        assert!(route(unknown(0xc0, 17, &[3, 1, 0, 0, 0, 9]), &TWO).is_err());
+        assert!(route(unknown(0xc0, 18, &[0, 0, 0, 0, 10, 0, 0, 1]), &TWO).is_err());
+        assert!(route(unknown(0xc0, 18, &agg[3..]), &TWO).is_ok());
+    }
+
+    #[test]
+    fn review_enhanced_route_refresh_length() {
+        let ctx = Context { enhanced_route_refresh: true, ..TWO };
+        let frame = Frame { kind: kind::ROUTE_REFRESH, body: vec![0, 2, 1, 1, 0] };
+        let Err(e) = Message::decode(&frame, &ctx) else { panic!() };
+        let mut whole = header(24, 5);
+        whole.extend_from_slice(&frame.body);
+        assert_eq!(e, Error::RouteRefreshLength(whole.clone()));
+        let n = e.notification();
+        assert_eq!((n.code, n.subcode, n.data), (7, 1, whole));
+        // Without the capability, or for a plain request, it is a header
+        // error.
+        assert_eq!(Message::decode(&frame, &TWO), Err(Error::BadMessageLength(24)));
+        let plain = Frame { kind: kind::ROUTE_REFRESH, body: vec![0, 2, 0, 1, 0] };
+        assert_eq!(Message::decode(&plain, &ctx), Err(Error::BadMessageLength(24)));
+        // The longest such message still fits in a NOTIFICATION.
+        let long = Frame { kind: kind::ROUTE_REFRESH, body: [&[0, 2, 2, 1][..], &[0; MAX_BODY_LEN - 4]].concat() };
+        let e = Message::decode(&long, &ctx).unwrap_err();
+        assert!(Message::Notification(e.notification()).to_bytes(&ctx).is_ok());
+        // The capability is negotiated when both sides send it.
+        let id = Ipv4Addr::new(10, 0, 0, 1);
+        let err =
+            Open::new(1, 90, id, vec![Capability::Other { code: capability::ENHANCED_ROUTE_REFRESH, value: vec![] }]);
+        let plain = Open::new(2, 90, id, vec![]);
+        assert!(Context::negotiated(&err, &err).enhanced_route_refresh);
+        assert!(!Context::negotiated(&err, &plain).enhanced_route_refresh);
+    }
+
+    #[test]
+    fn lcg_public_values_round_trip() {
+        // Updates built from public fields, the way world code builds
+        // them: whatever a writer takes reads back the same.
+        let mut seed: u64 = 99;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as u32
+        };
+        let mut written = 0;
+        for _ in 0..3000 {
+            let prefix = |next: &mut dyn FnMut() -> u32| {
+                let addr = Ipv4Addr::from(if next().is_multiple_of(2) { next() } else { next() & 0xffff_0000 });
+                let length = (next() % 34) as u8;
+                if next().is_multiple_of(3) {
+                    Prefix::new(addr.into(), length.min(32)).unwrap()
+                } else {
+                    Prefix { addr: addr.into(), length }
+                }
+            };
+            let count = [0, 1, 3, 4073, 4074, 5000][next() as usize % 6];
+            let withdrawn: Vec<Prefix> = (0..count).map(|_| prefix(&mut next)).collect();
+            let mut attributes = vec![];
+            if next() % 2 == 0 {
+                attributes.push(Attribute::Origin(Origin::Igp));
+                attributes
+                    .push(Attribute::AsPath(vec![Segment { kind: SegmentKind::Sequence, asns: vec![next() % 3] }]));
+                attributes.push(Attribute::NextHop(Ipv4Addr::from(next())));
+            }
+            if next() % 2 == 0 {
+                let values = (0..next() % 3).map(|_| next()).collect();
+                attributes.push(Attribute::Communities { values, partial: next() % 2 == 0 });
+            }
+            if next() % 4 == 0 {
+                attributes.push(Attribute::Unknown {
+                    flags: next() as u8,
+                    kind: 17 + (next() % 3) as u8,
+                    value: vec![2, 1, 0, 0, 0, next() as u8 % 2],
+                });
+            }
+            let nlri = if next() % 2 == 0 { vec![prefix(&mut next)] } else { vec![] };
+            let u = Update { withdrawn, attributes, nlri };
+            for ctx in [TWO, FOUR] {
+                let m = Message::Update(u.clone());
+                if let Ok(frame) = m.to_frame(&ctx) {
+                    written += 1;
+                    assert!(frame.body.len() <= MAX_BODY_LEN);
+                    assert_eq!(Message::decode(&frame, &ctx).as_ref(), Ok(&m));
+                    assert_eq!(frame.to_bytes().map(|b| b.len()), Ok(HEADER_LEN + frame.body.len()));
+                }
+            }
+        }
+        assert!(written > 100, "only {written} written");
     }
 }

@@ -87,6 +87,13 @@ pub const TRANSFORM_HEADER_LEN: usize = 52;
 pub const COMPRESSION_HEADER_LEN: usize = 16;
 /// The most messages one compound chain may hold.
 pub const MAX_CHAIN: usize = 512;
+/// The TREE_CONNECT request flag that says a request extension starts the
+/// Buffer, SMB 3.1.1 only.
+pub const TREE_CONNECT_EXTENSION_PRESENT: u16 = 0x0004;
+/// The length of a TREE_CONNECT request extension's header, before its
+/// PathName: TreeConnectContextOffset, TreeConnectContextCount and 10
+/// reserved bytes.
+pub const TREE_CONNECT_EXTENSION_LEN: usize = 16;
 
 /// The protocol IDs that start a payload.
 pub mod protocol {
@@ -286,15 +293,24 @@ pub enum Error {
     /// A compound chain of more than [`MAX_CHAIN`] messages.
     TooMany,
     /// An offset and length that point outside the message, into its
-    /// header or into the body's fixed part.
+    /// header or into the body's fixed part. Also a list that claims more
+    /// than its bytes hold: a create context's Next that points at no
+    /// further context, error contexts past the error data, or a chained
+    /// compression payload too short for its OriginalPayloadSize. Also an
+    /// IOCTL request whose OutputCount is not 0, or an extended
+    /// TREE_CONNECT request whose path is not after the extension's
+    /// 16-byte header.
     Buffer,
     /// Two buffers of one body that share bytes, or contexts that start
     /// before the end of the buffer they follow: the dialect list, the
-    /// security buffer or the file name. A create context's data that
-    /// starts before the end of its name counts too.
+    /// security buffer or the file name. A create context's name and data
+    /// over the same bytes count too, as does IOCTL response output that
+    /// starts before the end of the input.
     Overlap,
-    /// Negotiate contexts, create contexts, or a create context's Next or
-    /// DataOffset that are not 8-byte aligned. The value is the offset.
+    /// Negotiate contexts, create contexts, or a create context's Next,
+    /// NameOffset or DataOffset that are not 8-byte aligned, and the same
+    /// for a CREATE request's file name and an IOCTL response's output.
+    /// The value is the offset.
     Align(u32),
     /// A UTF-16 string with an odd number of bytes.
     OddString,
@@ -307,6 +323,14 @@ pub enum Error {
     CompressionFlags(u16),
     /// An unchained compression header whose algorithm is NONE.
     CompressionAlgorithm,
+    /// A transform header whose Flags (EncryptionAlgorithm in SMB 3.0) is
+    /// not 0x0001. The value is the field.
+    TransformFlags(u16),
+    /// An SMB 3.1.1 NEGOTIATE response whose contexts break MS-SMB2
+    /// section 3.2.5.2: not exactly one preauthentication integrity
+    /// context, or more than one encryption, compression, RDMA transform,
+    /// signing or transport context.
+    NegotiateContexts,
 }
 
 impl std::fmt::Display for Error {
@@ -327,6 +351,10 @@ impl std::fmt::Display for Error {
             Error::NoDialects => f.write_str("a NEGOTIATE request with no dialects"),
             Error::CompressionFlags(x) => write!(f, "compression flags {x:#06x} are not allowed here"),
             Error::CompressionAlgorithm => f.write_str("an unchained compression header with algorithm NONE"),
+            Error::TransformFlags(x) => write!(f, "transform header flags {x:#06x}, not 0x0001"),
+            Error::NegotiateContexts => {
+                f.write_str("an SMB 3.1.1 NEGOTIATE response with missing or repeated contexts")
+            }
         }
     }
 }
@@ -352,12 +380,15 @@ pub enum EncodeError {
     /// An empty compound chain, or a chained compression header with no
     /// payloads.
     Empty,
-    /// Negotiate contexts without SMB 3.1.1, or a client start time with it.
+    /// Negotiate contexts without SMB 3.1.1, or a client start time with
+    /// it. Also an SMB 3.1.1 NEGOTIATE response whose contexts a client
+    /// must refuse (see [`Error::NegotiateContexts`]).
     Dialect,
     /// A compression header whose flags break the rules: an unchained
     /// header with algorithm NONE, or chained payloads whose first flags
     /// are not exactly [`COMPRESSION_FLAG_CHAINED`] or whose later flags
-    /// are not 0.
+    /// are not 0. Also a chained payload of LZNT1, LZ77, LZ77+Huffman or
+    /// LZ4 with fewer than the 4 bytes of its OriginalPayloadSize.
     Chained,
     /// SMB1 bytes that do not start with the SMB1 protocol ID.
     Protocol,
@@ -367,6 +398,17 @@ pub enum EncodeError {
     NoDialects,
     /// An unchained compression offset past the end of its data.
     Offset,
+    /// A transform header whose flags are not 0x0001, or with no
+    /// encrypted message after it.
+    Transform,
+    /// READ or WRITE channel information with channel 0, NONE, which
+    /// carries none.
+    Channel,
+    /// Error data that does not hold the error contexts its count claims,
+    /// each 8-byte aligned.
+    ErrorContexts,
+    /// An IOCTL request with output bytes: its OutputCount must be 0.
+    IoctlOutput,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -383,6 +425,10 @@ impl std::fmt::Display for EncodeError {
             EncodeError::NoLocks => f.write_str("a LOCK request needs at least one lock"),
             EncodeError::NoDialects => f.write_str("a NEGOTIATE request needs at least one dialect"),
             EncodeError::Offset => f.write_str("an offset past the end of the data"),
+            EncodeError::Transform => f.write_str("a transform header needs flags 0x0001 and an encrypted message"),
+            EncodeError::Channel => f.write_str("channel information needs a channel other than NONE"),
+            EncodeError::ErrorContexts => f.write_str("the error data does not hold the error contexts counted"),
+            EncodeError::IoctlOutput => f.write_str("an IOCTL request carries no output bytes"),
         }
     }
 }
@@ -534,12 +580,13 @@ impl Packet {
     pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let out = match self {
             Packet::Smb2(messages) => write_chain(messages)?,
-            Packet::Transform(t) => t.to_bytes(),
+            Packet::Transform(t) => t.to_bytes()?,
             Packet::Compressed(c) => c.to_bytes()?,
             Packet::Smb1(b) => {
                 if !b.starts_with(&protocol::SMB1) {
                     return Err(EncodeError::Protocol);
                 }
+                too_long(b.len())?;
                 b.clone()
             }
         };
@@ -565,36 +612,51 @@ pub struct Transform {
     pub nonce: [u8; 16],
     /// The length of the message once decrypted.
     pub original_size: u32,
-    /// 0x0001 when the message is encrypted. (Called EncryptionAlgorithm
-    /// in SMB 3.0.)
+    /// Always 0x0001: Encrypted in SMB 3.1.1, AES-128-CCM in SMB 3.0 and
+    /// 3.0.2, where the field is called EncryptionAlgorithm. Readers and
+    /// writers refuse any other value.
     pub flags: u16,
     /// The session whose keys encrypted the message.
     pub session_id: u64,
-    /// The encrypted message.
+    /// The encrypted message, at least one byte.
     pub data: Vec<u8>,
 }
 
 impl Transform {
-    /// Reads a transform header and what follows it.
+    /// Reads a transform header and what follows it. Following MS-SMB2
+    /// section 3.3.5.2.1.1, flags other than 0x0001 are an error, and so is
+    /// a header with no message after it ([`Error::Truncated`]).
     pub fn parse(b: &[u8]) -> Result<Transform, Error> {
         if arr::<4>(b, 0)? != protocol::TRANSFORM {
             return Err(Error::Protocol(arr(b, 0)?));
         }
-        if b.len() < TRANSFORM_HEADER_LEN {
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
+        if b.len() <= TRANSFORM_HEADER_LEN {
             return Err(Error::Truncated);
+        }
+        let flags = le16(b, 42)?;
+        if flags != 1 {
+            return Err(Error::TransformFlags(flags));
         }
         Ok(Transform {
             signature: arr(b, 4)?,
             nonce: arr(b, 20)?,
             original_size: le32(b, 36)?,
-            flags: le16(b, 42)?,
+            flags,
             session_id: le64(b, 44)?,
             data: b[TRANSFORM_HEADER_LEN..].to_vec(),
         })
     }
 
-    /// The header's bytes, then the data.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The header's bytes, then the data. Flags other than 0x0001, empty
+    /// data, or a payload longer than [`MAX_MESSAGE`] are an error.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+        if self.flags != 1 || self.data.is_empty() {
+            return Err(EncodeError::Transform);
+        }
+        too_long(TRANSFORM_HEADER_LEN.saturating_add(self.data.len()))?;
         let mut out = Vec::with_capacity(TRANSFORM_HEADER_LEN + self.data.len());
         out.extend_from_slice(&protocol::TRANSFORM);
         out.extend_from_slice(&self.signature);
@@ -604,7 +666,7 @@ impl Transform {
         out.extend_from_slice(&self.flags.to_le_bytes());
         out.extend_from_slice(&self.session_id.to_le_bytes());
         out.extend_from_slice(&self.data);
-        out
+        Ok(out)
     }
 }
 
@@ -648,8 +710,18 @@ pub struct ChainedPayload {
     /// payload of a chain, 0 for the rest.
     pub flags: u16,
     /// The payload's bytes, with its OriginalPayloadSize first when the
-    /// algorithm has one.
+    /// algorithm has one: LZNT1 1, LZ77 2, LZ77+Huffman 3 and LZ4 5, whose
+    /// data is therefore at least 4 bytes.
     pub data: Vec<u8>,
+}
+
+impl ChainedPayload {
+    /// The fewest bytes the payload's data holds: the 4 bytes of
+    /// OriginalPayloadSize for the algorithms that have it (MS-SMB2
+    /// section 2.2.42.2.1), and none for the rest.
+    fn min_len(&self) -> usize {
+        if matches!(self.algorithm, 1 | 2 | 3 | 5) { 4 } else { 0 }
+    }
 }
 
 impl Compressed {
@@ -657,6 +729,9 @@ impl Compressed {
     pub fn parse(b: &[u8]) -> Result<Compressed, Error> {
         if arr::<4>(b, 0)? != protocol::COMPRESSION {
             return Err(Error::Protocol(arr(b, 0)?));
+        }
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
         }
         let original_size = le32(b, 4)?;
         let flags = le16(b, 10)?;
@@ -690,7 +765,11 @@ impl Compressed {
             let start = at + 8;
             let end = start.checked_add(len).ok_or(Error::Buffer)?;
             let data = b.get(start..end).ok_or(Error::Buffer)?.to_vec();
-            payloads.push(ChainedPayload { algorithm, flags, data });
+            let payload = ChainedPayload { algorithm, flags, data };
+            if payload.data.len() < payload.min_len() {
+                return Err(Error::Buffer);
+            }
+            payloads.push(payload);
             at = end;
         }
         Ok(Compressed::Chained { original_size, payloads })
@@ -708,7 +787,7 @@ impl Compressed {
                 if *offset as usize > data.len() {
                     return Err(EncodeError::Offset);
                 }
-                too_long(data.len())?;
+                too_long(COMPRESSION_HEADER_LEN.saturating_add(data.len()))?;
                 out.extend_from_slice(&original_size.to_le_bytes());
                 out.extend_from_slice(&algorithm.to_le_bytes());
                 out.extend_from_slice(&0u16.to_le_bytes());
@@ -717,7 +796,10 @@ impl Compressed {
             }
             Compressed::Chained { original_size, payloads } => {
                 let Some(first) = payloads.first() else { return Err(EncodeError::Empty) };
-                if first.flags != COMPRESSION_FLAG_CHAINED || payloads[1..].iter().any(|p| p.flags != 0) {
+                if first.flags != COMPRESSION_FLAG_CHAINED
+                    || payloads[1..].iter().any(|p| p.flags != 0)
+                    || payloads.iter().any(|p| p.data.len() < p.min_len())
+                {
                     return Err(EncodeError::Chained);
                 }
                 out.extend_from_slice(&original_size.to_le_bytes());
@@ -925,8 +1007,12 @@ impl Message {
 
 /// Reads an SMB2 payload: one message, or a compound chain of them linked
 /// by NextCommand. Each NextCommand must be a multiple of 8, at least 64,
-/// and inside the payload.
+/// and inside the payload. A payload longer than [`MAX_MESSAGE`] is
+/// refused.
 pub fn parse_chain(b: &[u8]) -> Result<Vec<Message>, Error> {
+    if b.len() > MAX_MESSAGE {
+        return Err(Error::TooLong);
+    }
     let mut out = Vec::new();
     let mut rest = b;
     loop {
@@ -1182,8 +1268,12 @@ pub struct SessionSetupRequest {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TreeConnectRequest {
     /// SMB 3.1.1 flags: CLUSTER_RECONNECT 1, REDIRECT_TO_OWNER 2,
-    /// EXTENSION_PRESENT 4. With an extension, `path` is read from the
-    /// offset and length as given and the extension is not read.
+    /// EXTENSION_PRESENT 4. With EXTENSION_PRESENT, the Buffer starts with
+    /// the request extension of MS-SMB2 section 2.2.9.1: `path` is read
+    /// from the offset and length as given, after the extension's 16-byte
+    /// header, and the extension's tree connect contexts are not read. The
+    /// writer then writes an extension with no contexts and the path at
+    /// its PathName.
     pub flags: u16,
     /// The share's path, such as `\\server\share`, in UTF-16.
     pub path: Vec<u16>,
@@ -1233,7 +1323,10 @@ pub struct ReadRequest {
     pub channel: u32,
     /// How many more bytes the client plans to read.
     pub remaining_bytes: u32,
-    /// RDMA channel information, as bytes.
+    /// RDMA channel information, as bytes. With channel 0, NONE, the
+    /// reader ignores ReadChannelInfoOffset and ReadChannelInfoLength, as
+    /// MS-SMB2 section 2.2.19 says a server must, so this is empty, and
+    /// the writer refuses anything else.
     pub channel_info: Vec<u8>,
 }
 
@@ -1252,7 +1345,10 @@ pub struct WriteRequest {
     pub flags: u32,
     /// The bytes to write.
     pub data: Vec<u8>,
-    /// RDMA channel information, as bytes.
+    /// RDMA channel information, as bytes. With channel 0, NONE, the
+    /// reader ignores WriteChannelInfoOffset and WriteChannelInfoLength,
+    /// as MS-SMB2 section 2.2.21 says a server must, so this is empty, and
+    /// the writer refuses anything else.
     pub channel_info: Vec<u8>,
 }
 
@@ -1278,7 +1374,9 @@ pub struct IoctlRequest {
     pub input: Vec<u8>,
     /// The most input bytes the response may echo.
     pub max_input_response: u32,
-    /// The output buffer the client sends, usually empty.
+    /// Always empty: MS-SMB2 section 2.2.31 says a client must set
+    /// OutputCount to 0. Readers refuse a nonzero OutputCount and writers
+    /// refuse output bytes.
     pub output: Vec<u8>,
     /// The most output bytes the response may carry.
     pub max_output_response: u32,
@@ -1442,8 +1540,15 @@ impl Request {
     /// part, and the buffers of one body must not overlap. Negotiate and
     /// create contexts must be 8-byte aligned and come after the dialect
     /// list or the file name. So the writer, which puts buffers right after
-    /// the fixed part, never writes a body longer than the one it read.
+    /// the fixed part, never writes a body longer than the one it read,
+    /// with one exception: a create context may put its data before its
+    /// name, and the writer puts the name first, so a CREATE whose last
+    /// create context came that way can write back up to 7 bytes longer.
+    /// A body longer than [`MAX_MESSAGE`] is refused.
     pub fn parse(command: u16, b: &[u8]) -> Result<Request, Error> {
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
         Ok(match command {
             command::NEGOTIATE => {
                 fixed(b, 36)?;
@@ -1485,10 +1590,17 @@ impl Request {
             }
             command::TREE_CONNECT => {
                 fixed(b, 9)?;
-                Request::TreeConnect(TreeConnectRequest {
-                    flags: le16(b, 2)?,
-                    path: string(buffer(b, le16(b, 4)?.into(), le16(b, 6)?.into())?)?,
-                })
+                let flags = le16(b, 2)?;
+                let path = (u32::from(le16(b, 4)?), u32::from(le16(b, 6)?));
+                if flags & TREE_CONNECT_EXTENSION_PRESENT != 0 {
+                    // The extension's 16-byte header comes first, at 72.
+                    if b.len() < 8 + TREE_CONNECT_EXTENSION_LEN
+                        || (path.1 != 0 && path.0 < (HEADER_LEN + 8 + TREE_CONNECT_EXTENSION_LEN) as u32)
+                    {
+                        return Err(Error::Buffer);
+                    }
+                }
+                Request::TreeConnect(TreeConnectRequest { flags, path: string(buffer(b, path.0, path.1)?)? })
             }
             command::TREE_DISCONNECT => {
                 fixed(b, 4)?;
@@ -1496,7 +1608,14 @@ impl Request {
             }
             command::CREATE => {
                 fixed(b, 57)?;
+                // 2.2.13: the request's Buffer is at least one byte.
+                if b.len() < 57 {
+                    return Err(Error::Truncated);
+                }
                 let name = (u32::from(le16(b, 44)?), u32::from(le16(b, 46)?));
+                if name.1 != 0 && !name.0.is_multiple_of(8) {
+                    return Err(Error::Align(name.0));
+                }
                 let region = (le32(b, 48)?, le32(b, 52)?);
                 let name_bytes = buffer(b, name.0, name.1)?;
                 let region_bytes = buffer(b, region.0, region.1)?;
@@ -1525,6 +1644,13 @@ impl Request {
             }
             command::READ => {
                 fixed(b, 49)?;
+                let channel = le32(b, 36)?;
+                // With channel NONE the server ignores the channel info.
+                let channel_info = if channel == 0 {
+                    Vec::new()
+                } else {
+                    buffer(b, le16(b, 44)?.into(), le16(b, 46)?.into())?.to_vec()
+                };
                 Request::Read(ReadRequest {
                     padding: b[2],
                     flags: b[3],
@@ -1532,21 +1658,23 @@ impl Request {
                     offset: le64(b, 8)?,
                     file_id: FileId::read(b, 16)?,
                     minimum_count: le32(b, 32)?,
-                    channel: le32(b, 36)?,
+                    channel,
                     remaining_bytes: le32(b, 40)?,
-                    channel_info: buffer(b, le16(b, 44)?.into(), le16(b, 46)?.into())?.to_vec(),
+                    channel_info,
                 })
             }
             command::WRITE => {
                 fixed(b, 49)?;
                 let data = (u32::from(le16(b, 2)?), le32(b, 4)?);
-                let info = (u32::from(le16(b, 40)?), u32::from(le16(b, 42)?));
+                let channel = le32(b, 32)?;
+                // With channel NONE the server ignores the channel info.
+                let info = if channel == 0 { (0, 0) } else { (u32::from(le16(b, 40)?), u32::from(le16(b, 42)?)) };
                 let (data_bytes, info_bytes) = (buffer(b, data.0, data.1)?, buffer(b, info.0, info.1)?);
                 apart(data, info)?;
                 Request::Write(WriteRequest {
                     offset: le64(b, 8)?,
                     file_id: FileId::read(b, 16)?,
-                    channel: le32(b, 32)?,
+                    channel,
                     remaining_bytes: le32(b, 36)?,
                     flags: le32(b, 44)?,
                     data: data_bytes.to_vec(),
@@ -1573,16 +1701,17 @@ impl Request {
             }
             command::IOCTL => {
                 fixed(b, 57)?;
-                let input = (le32(b, 24)?, le32(b, 28)?);
-                let output = (le32(b, 36)?, le32(b, 40)?);
-                let (input_bytes, output_bytes) = (buffer(b, input.0, input.1)?, buffer(b, output.0, output.1)?);
-                apart(input, output)?;
+                // 2.2.31: the client MUST set OutputCount to 0.
+                if le32(b, 40)? != 0 {
+                    return Err(Error::Buffer);
+                }
+                let input = buffer(b, le32(b, 24)?, le32(b, 28)?)?;
                 Request::Ioctl(IoctlRequest {
                     ctl_code: le32(b, 4)?,
                     file_id: FileId::read(b, 8)?,
-                    input: input_bytes.to_vec(),
+                    input: input.to_vec(),
                     max_input_response: le32(b, 32)?,
-                    output: output_bytes.to_vec(),
+                    output: Vec::new(),
                     max_output_response: le32(b, 44)?,
                     flags: le32(b, 48)?,
                 })
@@ -1688,15 +1817,21 @@ impl Request {
             }
             Request::Logoff | Request::TreeDisconnect | Request::Cancel | Request::Echo => put32(&mut w, 4),
             Request::TreeConnect(r) => {
-                let path = unstring(&r.path);
+                let path = string16(&r.path)?;
+                let extended = r.flags & TREE_CONNECT_EXTENSION_PRESENT != 0;
                 put16(&mut w, 9);
                 put16(&mut w, r.flags);
-                put16(&mut w, 72);
+                put16(&mut w, if extended { (HEADER_LEN + 8 + TREE_CONNECT_EXTENSION_LEN) as u16 } else { 72 });
                 put16(&mut w, fit16(path.len())?);
+                if extended {
+                    // An extension with no tree connect contexts: offset
+                    // 0, count 0 and the reserved bytes, all zeros.
+                    w.resize(w.len() + TREE_CONNECT_EXTENSION_LEN, 0);
+                }
                 w.extend_from_slice(&path);
             }
             Request::Create(r) => {
-                let name = unstring(&r.name);
+                let name = string16(&r.name)?;
                 put16(&mut w, 57);
                 w.push(0);
                 w.push(r.oplock_level);
@@ -1735,11 +1870,17 @@ impl Request {
                 put32(&mut w, r.channel);
                 put32(&mut w, r.remaining_bytes);
                 let info = !r.channel_info.is_empty();
+                if info && r.channel == 0 {
+                    return Err(EncodeError::Channel);
+                }
                 put16(&mut w, if info { 112 } else { 0 });
                 put16(&mut w, fit16(r.channel_info.len())?);
                 w.extend_from_slice(&r.channel_info);
             }
             Request::Write(r) => {
+                if r.channel == 0 && !r.channel_info.is_empty() {
+                    return Err(EncodeError::Channel);
+                }
                 // Both offsets are 16 bits. The data goes first unless that
                 // pushes the channel info's offset past 65535.
                 let info_len = fit16(r.channel_info.len())?;
@@ -1784,6 +1925,9 @@ impl Request {
                 }
             }
             Request::Ioctl(r) => {
+                if !r.output.is_empty() {
+                    return Err(EncodeError::IoctlOutput);
+                }
                 put16(&mut w, 57);
                 put16(&mut w, 0);
                 put32(&mut w, r.ctl_code);
@@ -1791,17 +1935,15 @@ impl Request {
                 put32(&mut w, 120);
                 put32(&mut w, fit32(r.input.len())?);
                 put32(&mut w, r.max_input_response);
-                let out_at = if r.output.is_empty() { 0 } else { fit32(120 + r.input.len())? };
-                put32(&mut w, out_at);
-                put32(&mut w, fit32(r.output.len())?);
+                put32(&mut w, 0);
+                put32(&mut w, 0);
                 put32(&mut w, r.max_output_response);
                 put32(&mut w, r.flags);
                 put32(&mut w, 0);
                 w.extend_from_slice(&r.input);
-                w.extend_from_slice(&r.output);
             }
             Request::QueryDirectory(r) => {
-                let pattern = unstring(&r.pattern);
+                let pattern = string16(&r.pattern)?;
                 put16(&mut w, 33);
                 w.push(r.file_information_class);
                 w.push(r.flags);
@@ -1848,6 +1990,7 @@ impl Request {
                 if known(*command) {
                     return Err(EncodeError::Command(*command));
                 }
+                too_long(body.len())?;
                 return Ok(body.clone());
             }
         }
@@ -1883,7 +2026,11 @@ pub struct NegotiateResponse {
     /// The first authentication token, usually SPNEGO with the mechanisms
     /// the server offers.
     pub security_buffer: Vec<u8>,
-    /// Negotiate contexts, only when `dialect` is SMB 3.1.1.
+    /// Negotiate contexts, only when `dialect` is SMB 3.1.1. Then, as
+    /// MS-SMB2 section 3.2.5.2 has a client check, exactly one
+    /// preauthentication integrity context, and at most one each of the
+    /// encryption, compression, RDMA transform, signing and transport
+    /// contexts.
     pub contexts: Vec<NegotiateContext>,
 }
 
@@ -1939,7 +2086,11 @@ pub struct ErrorResponse {
     /// In SMB 3.1.1, how many error contexts `data` holds.
     pub context_count: u8,
     /// The error data, as bytes: error contexts, or symbolic link or
-    /// buffer size details, or nothing.
+    /// buffer size details, or nothing. With a nonzero `context_count`,
+    /// it starts with that many error contexts (MS-SMB2 section 2.2.2.1),
+    /// each an ErrorDataLength, an ErrorId and that many bytes, each
+    /// starting 8-byte aligned. Readers and writers check that they fit;
+    /// their contents are not read.
     pub data: Vec<u8>,
 }
 
@@ -2026,24 +2177,32 @@ impl Response {
     /// Reads the body of a response to `command` sent with `status`.
     ///
     /// Whether the body is an [`ErrorResponse`] depends on both, following
-    /// MS-SMB2 section 3.3.4.4. With status 0 it never is. Otherwise, for a
-    /// command whose own body has a StructureSize other than 9, it is an
-    /// error body unless its StructureSize is the command's own (as with
-    /// READ and IOCTL sending [`status::BUFFER_OVERFLOW`] with data, or an
-    /// IOCTL server-side copy sending [`status::INVALID_PARAMETER`]). For
-    /// SESSION_SETUP, QUERY_INFO, QUERY_DIRECTORY and CHANGE_NOTIFY, whose
-    /// bodies also have StructureSize 9, it is an error body unless the
-    /// status is [`status::MORE_PROCESSING_REQUIRED`] for SESSION_SETUP,
-    /// [`status::BUFFER_OVERFLOW`] for QUERY_INFO, or
-    /// [`status::NOTIFY_ENUM_DIR`] for CHANGE_NOTIFY. For a command this
-    /// module does not read, it is one when its StructureSize is 9.
+    /// MS-SMB2 section 3.3.4.4. With status 0 it never is. For a command
+    /// this module reads, any other status is a failure and gets an error
+    /// body, except for the ones that section lists. Those are
+    /// [`status::MORE_PROCESSING_REQUIRED`] for SESSION_SETUP,
+    /// [`status::BUFFER_OVERFLOW`] for QUERY_INFO and
+    /// [`status::NOTIFY_ENUM_DIR`] for CHANGE_NOTIFY, which always get the
+    /// command's own body, and [`status::BUFFER_OVERFLOW`] for READ and
+    /// IOCTL and [`status::INVALID_PARAMETER`] for IOCTL (a server-side
+    /// copy), which get it when its StructureSize is the command's own:
+    /// these statuses also come as plain failures. For a command this
+    /// module does not read, the body is an error body when its
+    /// StructureSize is 9.
     ///
-    /// Buffers follow the same rules as in [`Request::parse`].
+    /// Buffers follow the same rules as in [`Request::parse`]. A body
+    /// longer than [`MAX_MESSAGE`] is refused.
     pub fn parse(command: u16, status: u32, b: &[u8]) -> Result<Response, Error> {
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
         if error_body(command, status, le16(b, 0).ok()) {
             fixed(b, 9)?;
             let n = le32(b, 4)? as usize;
             let data = b.get(8..8usize.checked_add(n).ok_or(Error::Buffer)?).ok_or(Error::Buffer)?;
+            if !error_contexts_fit(b[2], data) {
+                return Err(Error::Buffer);
+            }
             return Ok(Response::Error(ErrorResponse { context_count: b[2], data: data.to_vec() }));
         }
         Ok(match command {
@@ -2053,7 +2212,11 @@ impl Response {
                 let security = (u32::from(le16(b, 56)?), u32::from(le16(b, 58)?));
                 let security_buffer = buffer(b, security.0, security.1)?.to_vec();
                 let contexts = if dialect == dialect::SMB_3_1_1 {
-                    negotiate_contexts(b, le32(b, 60)?, le16(b, 6)?, security)?
+                    let contexts = negotiate_contexts(b, le32(b, 60)?, le16(b, 6)?, security)?;
+                    if !response_contexts_ok(&contexts) {
+                        return Err(Error::NegotiateContexts);
+                    }
+                    contexts
                 } else {
                     Vec::new()
                 };
@@ -2132,7 +2295,16 @@ impl Response {
                 let input = (le32(b, 24)?, le32(b, 28)?);
                 let output = (le32(b, 32)?, le32(b, 36)?);
                 let (input_bytes, output_bytes) = (buffer(b, input.0, input.1)?, buffer(b, output.0, output.1)?);
-                apart(input, output)?;
+                // 2.2.32: output starts at the end of the input rounded up
+                // to a multiple of 8. Padding past that is allowed.
+                if output.1 != 0 {
+                    if !output.0.is_multiple_of(8) {
+                        return Err(Error::Align(output.0));
+                    }
+                    if input.1 != 0 && u64::from(output.0) < u64::from(input.0) + u64::from(input.1) {
+                        return Err(Error::Overlap);
+                    }
+                }
                 Response::Ioctl(IoctlResponse {
                     ctl_code: le32(b, 4)?,
                     file_id: FileId::read(b, 8)?,
@@ -2200,7 +2372,8 @@ impl Response {
         let mut w = Vec::new();
         match self {
             Response::Negotiate(r) => {
-                if r.dialect != dialect::SMB_3_1_1 && !r.contexts.is_empty() {
+                let is_311 = r.dialect == dialect::SMB_3_1_1;
+                if (!is_311 && !r.contexts.is_empty()) || (is_311 && !response_contexts_ok(&r.contexts)) {
                     return Err(EncodeError::Dialect);
                 }
                 put16(&mut w, 65);
@@ -2282,14 +2455,22 @@ impl Response {
                 put16(&mut w, 0);
                 put32(&mut w, r.ctl_code);
                 r.file_id.write(&mut w);
+                // The output starts 8-byte aligned after the input, and
+                // its offset is 0 when there is none.
+                let input_end = fit32(112 + r.input.len())?;
+                let out_at = if r.output.is_empty() { 0 } else { input_end.next_multiple_of(8) };
                 put32(&mut w, 112);
                 put32(&mut w, fit32(r.input.len())?);
-                put32(&mut w, fit32(112 + r.input.len())?);
+                put32(&mut w, out_at);
                 put32(&mut w, fit32(r.output.len())?);
                 put32(&mut w, r.flags);
                 put32(&mut w, 0);
                 w.extend_from_slice(&r.input);
-                w.extend_from_slice(&r.output);
+                if !r.output.is_empty() {
+                    too_long(HEADER_LEN.saturating_add(out_at as usize).saturating_add(r.output.len()))?;
+                    w.resize(out_at as usize - HEADER_LEN, 0);
+                    w.extend_from_slice(&r.output);
+                }
             }
             Response::QueryDirectory { data } | Response::ChangeNotify { data } | Response::QueryInfo { data } => {
                 put16(&mut w, 9);
@@ -2299,13 +2480,19 @@ impl Response {
             }
             Response::SetInfo => put16(&mut w, 2),
             Response::Error(e) => {
+                if !error_contexts_fit(e.context_count, &e.data) {
+                    return Err(EncodeError::ErrorContexts);
+                }
                 put16(&mut w, 9);
                 w.push(e.context_count);
                 w.push(0);
                 put32(&mut w, fit32(e.data.len())?);
                 w.extend_from_slice(&e.data);
             }
-            Response::Other { body } => return Ok(body.clone()),
+            Response::Other { body } => {
+                too_long(body.len())?;
+                return Ok(body.clone());
+            }
         }
         finish(&mut w);
         Ok(w)
@@ -2318,16 +2505,57 @@ fn error_body(command: u16, status: u32, size: Option<u16>) -> bool {
     if status == status::SUCCESS {
         return false;
     }
-    match own_size(command) {
-        Some(9) => !matches!(
-            (command, status),
-            (command::SESSION_SETUP, status::MORE_PROCESSING_REQUIRED)
-                | (command::QUERY_INFO, status::BUFFER_OVERFLOW)
-                | (command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR)
-        ),
-        Some(own) => size != Some(own),
-        None => size == Some(9),
+    let Some(own) = own_size(command) else { return size == Some(9) };
+    match (command, status) {
+        (command::SESSION_SETUP, status::MORE_PROCESSING_REQUIRED)
+        | (command::QUERY_INFO, status::BUFFER_OVERFLOW)
+        | (command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR) => false,
+        (command::READ, status::BUFFER_OVERFLOW)
+        | (command::IOCTL, status::BUFFER_OVERFLOW | status::INVALID_PARAMETER) => size != Some(own),
+        _ => true,
     }
+}
+
+/// Whether `data` starts with `count` SMB2 ERROR Context structures, each
+/// 8-byte aligned from the start of the error data, which is itself
+/// 8-byte aligned from the start of the ERROR response (MS-SMB2 section
+/// 2.2.2). Bytes after the last context are not read.
+fn error_contexts_fit(count: u8, data: &[u8]) -> bool {
+    let mut at = 0usize;
+    for i in 0..count {
+        if i > 0 {
+            at = at.next_multiple_of(8);
+        }
+        let Ok(len) = le32(data, at) else { return false };
+        if le32(data, at + 4).is_err() {
+            return false;
+        }
+        let Some(end) = (at + 8).checked_add(len as usize) else { return false };
+        if end > data.len() {
+            return false;
+        }
+        at = end;
+    }
+    true
+}
+
+/// Whether an SMB 3.1.1 NEGOTIATE response's contexts pass the checks of
+/// MS-SMB2 section 3.2.5.2: exactly one preauthentication integrity
+/// context, and at most one each of the encryption, compression, RDMA
+/// transform, signing and transport contexts.
+fn response_contexts_ok(contexts: &[NegotiateContext]) -> bool {
+    use negotiate_context::*;
+    let count = |kind: u16| contexts.iter().filter(|c| c.kind == kind).count();
+    count(PREAUTH_INTEGRITY_CAPABILITIES) == 1
+        && [
+            ENCRYPTION_CAPABILITIES,
+            COMPRESSION_CAPABILITIES,
+            RDMA_TRANSFORM_CAPABILITIES,
+            SIGNING_CAPABILITIES,
+            TRANSPORT_CAPABILITIES,
+        ]
+        .iter()
+        .all(|&kind| count(kind) <= 1)
 }
 
 /// The StructureSize of the typed response body for `command`, if this
@@ -2424,6 +2652,13 @@ fn string(b: &[u8]) -> Result<Vec<u16>, Error> {
     Ok(b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
 }
 
+/// Code units as UTF-16LE bytes for a 16-bit length field, checked
+/// before any bytes are made.
+fn string16(units: &[u16]) -> Result<Vec<u8>, EncodeError> {
+    fit16(units.len().saturating_mul(2))?;
+    Ok(unstring(units))
+}
+
 /// Code units as UTF-16LE bytes.
 fn unstring(units: &[u16]) -> Vec<u8> {
     units.iter().flat_map(|u| u.to_le_bytes()).collect()
@@ -2473,13 +2708,19 @@ fn write_negotiate_contexts(w: &mut Vec<u8>, contexts: &[NegotiateContext]) -> R
 }
 
 /// Create contexts in `region`, each linked to the next by its Next field,
-/// a multiple of 8. A context's name and data must lie inside it, so the
-/// bytes copied out are never more than the region holds.
+/// a multiple of 8. A Next that is not 0 must point at another context
+/// inside the region. A context's name and data must lie inside it, each
+/// 8-byte aligned and after its 16-byte header, in either order and apart,
+/// as MS-SMB2 section 2.2.13.2 lays them out. So the bytes copied out are
+/// never more than the region holds.
 fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
     let mut out = Vec::new();
+    if region.is_empty() {
+        return Ok(out);
+    }
     let mut at = 0;
-    while at < region.len() {
-        let rest = &region[at..];
+    loop {
+        let rest = region.get(at..).ok_or(Error::Buffer)?;
         if rest.len() < 16 {
             return Err(Error::Buffer);
         }
@@ -2502,31 +2743,32 @@ fn create_contexts(region: &[u8]) -> Result<Vec<CreateContext>, Error> {
         };
         let (name_at, name_len) = (le16(rest, 4)?, le16(rest, 6)?);
         let (data_at, data_len) = (le16(rest, 10)?, le32(rest, 12)?);
-        // The name after the 16-byte header, the data 8-byte aligned after
-        // the name, as 2.2.13.2 lays them out.
-        if name_len != 0 && name_at < 16 {
-            return Err(Error::Buffer);
-        }
-        if data_len != 0 {
-            if data_at % 8 != 0 {
-                return Err(Error::Align(data_at.into()));
+        if name_len != 0 {
+            if name_at < 16 {
+                return Err(Error::Buffer);
             }
+            if name_at % 8 != 0 {
+                return Err(Error::Align(name_at.into()));
+            }
+        }
+        // DataOffset is ignored when DataLength is 0.
+        if data_len != 0 {
             if data_at < 16 {
                 return Err(Error::Buffer);
             }
-            if name_len != 0 && u32::from(data_at) < u32::from(name_at) + u32::from(name_len) {
-                return Err(Error::Overlap);
+            if data_at % 8 != 0 {
+                return Err(Error::Align(data_at.into()));
             }
+            apart((name_at.into(), name_len.into()), (data_at.into(), data_len))?;
         }
         let name = field(usize::from(name_at), usize::from(name_len))?;
         let data = field(usize::from(data_at), data_len as usize)?;
         out.push(CreateContext { name, data });
         if next == 0 {
-            break;
+            return Ok(out);
         }
         at += next;
     }
-    Ok(out)
 }
 
 /// Writes create contexts after the bytes already in `w`, 8-byte aligned,
@@ -2571,9 +2813,11 @@ fn write_create_contexts(w: &mut Vec<u8>, contexts: &[CreateContext], field: usi
 /// buffer, so a body with an empty buffer gets a zero byte.
 fn finish(w: &mut Vec<u8>) {
     if let Ok(size) = le16(w, 0)
-        && size % 2 == 1 && w.len() < usize::from(size) {
-            w.push(0);
-        }
+        && size % 2 == 1
+        && w.len() < usize::from(size)
+    {
+        w.push(0);
+    }
 }
 
 /// Where the next byte of a body goes, counted from the header's start.
@@ -3026,7 +3270,7 @@ mod tests {
         };
         assert_eq!(req, Request::Write(want.clone()));
         assert_eq!(req.to_body().unwrap(), body);
-        let with_info = Request::Write(WriteRequest { channel_info: vec![1, 2, 3, 4], ..want });
+        let with_info = Request::Write(WriteRequest { channel: 1, channel_info: vec![1, 2, 3, 4], ..want });
         assert_eq!(Request::parse(command::WRITE, &with_info.to_body().unwrap()), Ok(with_info));
         let body = le(&[17, 0, 3, 0, 0, 0], &[2, 2, 4, 4, 2, 2]);
         let resp = Response::parse(command::WRITE, 0, &body).unwrap();
@@ -3239,13 +3483,15 @@ mod tests {
             session_id: 9,
             data: vec![3; 100],
         };
-        let b = t.to_bytes();
+        let b = t.to_bytes().unwrap();
         assert_eq!(b[..4], protocol::TRANSFORM);
         assert_eq!(le32(&b, 36), Ok(100));
         assert_eq!(le16(&b, 42), Ok(1));
         assert_eq!(le64(&b, 44), Ok(9));
         assert_eq!(Packet::parse(&b), Ok(Packet::Transform(t)));
         assert_eq!(Packet::parse(&b[..51]), Err(Error::Truncated));
+        // 3.3.5.2.1.1: a header with no message after it.
+        assert_eq!(Packet::parse(&b[..52]), Err(Error::Truncated));
 
         let c = Compressed::Unchained { original_size: 400, algorithm: 1, offset: 2, data: vec![9; 10] };
         let b = c.to_bytes().unwrap();
@@ -3352,8 +3598,12 @@ mod tests {
         assert_eq!(long.to_body(), Err(EncodeError::TooLong));
         let long = Request::TreeConnect(TreeConnectRequest { flags: 0, path: vec![0x41; 40000] });
         assert_eq!(long.to_body(), Err(EncodeError::TooLong));
-        let long =
-            Request::Write(WriteRequest { data: vec![0; 70000], channel_info: vec![1; 65500], ..Default::default() });
+        let long = Request::Write(WriteRequest {
+            data: vec![0; 70000],
+            channel: 1,
+            channel_info: vec![1; 65500],
+            ..Default::default()
+        });
         assert_eq!(long.to_body(), Err(EncodeError::TooLong));
         let long = Response::Read { data: vec![0; MAX_MESSAGE + 1], data_remaining: 0, flags: 0 };
         assert_eq!(long.to_body(command::READ, 0), Err(EncodeError::TooLong));
@@ -3456,6 +3706,8 @@ mod tests {
             Error::NoDialects,
             Error::CompressionFlags(2),
             Error::CompressionAlgorithm,
+            Error::TransformFlags(0),
+            Error::NegotiateContexts,
         ];
         for e in errors {
             assert!(!e.to_string().is_empty());
@@ -3472,6 +3724,10 @@ mod tests {
             EncodeError::NoLocks,
             EncodeError::NoDialects,
             EncodeError::Offset,
+            EncodeError::Transform,
+            EncodeError::Channel,
+            EncodeError::ErrorContexts,
+            EncodeError::IoctlOutput,
         ];
         for e in encode {
             assert!(!e.to_string().is_empty());
@@ -3495,8 +3751,9 @@ mod tests {
             error.to_body(command::CHANGE_NOTIFY, status::NOTIFY_ENUM_DIR),
             Err(EncodeError::Status(status::NOTIFY_ENUM_DIR))
         );
-        // Under any other failure it is still an error body.
-        assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::ACCESS_DENIED, &b).map(|r| r.command()), Ok(None));
+        // Under any other failure it is read as an error body, and these
+        // bytes, read that way, claim 72 error contexts in no data.
+        assert_eq!(Response::parse(command::CHANGE_NOTIFY, status::ACCESS_DENIED, &b), Err(Error::Buffer));
     }
 
     #[test]
@@ -3540,13 +3797,13 @@ mod tests {
     fn write_puts_channel_info_first_when_data_is_long() {
         // Channel info at 112, then 70000 bytes of data at 116: both
         // offsets fit their 16-bit fields, so the writer must find a layout.
-        let mut body = le(&[49, 116, 70000, 0, 0, 0, 0, 0, 112, 4, 0], &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4]);
+        let mut body = le(&[49, 116, 70000, 0, 0, 0, 1, 0, 112, 4, 0], &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4]);
         body.extend_from_slice(&[1, 2, 3, 4]);
         body.extend_from_slice(&vec![9; 70000]);
         let req = Request::parse(command::WRITE, &body).unwrap();
         assert_eq!(req.to_body().unwrap(), body);
         // Both too long for any layout: refused.
-        let w = WriteRequest { data: vec![0; 70000], channel_info: vec![1; 65500], ..Default::default() };
+        let w = WriteRequest { data: vec![0; 70000], channel: 1, channel_info: vec![1; 65500], ..Default::default() };
         assert_eq!(Request::Write(w).to_body(), Err(EncodeError::TooLong));
     }
 
@@ -3564,22 +3821,19 @@ mod tests {
         r.push(0);
         assert_eq!(Response::parse(command::READ, 0, &r), Err(Error::Buffer));
         // IOCTL input and output over the same bytes would write back twice
-        // as long; they are refused.
-        let req = Request::Ioctl(IoctlRequest { input: vec![1; 8], ..Default::default() });
-        let mut body = req.to_body().unwrap();
-        body[36..40].copy_from_slice(&120u32.to_le_bytes());
-        body[40..44].copy_from_slice(&8u32.to_le_bytes());
-        assert_eq!(Request::parse(command::IOCTL, &body), Err(Error::Overlap));
-        body[36..40].copy_from_slice(&124u32.to_le_bytes());
-        body[40..44].copy_from_slice(&4u32.to_le_bytes());
-        assert_eq!(Request::parse(command::IOCTL, &body), Err(Error::Overlap));
+        // as long; they are refused. (A request has no output at all.)
         let resp = Response::Ioctl(IoctlResponse { output: vec![1; 8], ..Default::default() });
         let mut body = resp.to_body(command::IOCTL, 0).unwrap();
         body[24..28].copy_from_slice(&112u32.to_le_bytes());
         body[28..32].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(Response::parse(command::IOCTL, 0, &body), Err(Error::Overlap));
         // WRITE data and channel info over the same bytes.
-        let req = Request::Write(WriteRequest { data: vec![1; 8], channel_info: vec![2; 4], ..Default::default() });
+        let req = Request::Write(WriteRequest {
+            data: vec![1; 8],
+            channel: 1,
+            channel_info: vec![2; 4],
+            ..Default::default()
+        });
         let mut body = req.to_body().unwrap();
         body[40..42].copy_from_slice(&116u16.to_le_bytes());
         assert_eq!(Request::parse(command::WRITE, &body), Err(Error::Overlap));
@@ -3591,7 +3845,7 @@ mod tests {
         let resp = Response::Negotiate(NegotiateResponse {
             dialect: dialect::SMB_3_1_1,
             security_buffer: vec![0x60; 16],
-            contexts: vec![NegotiateContext::algorithms(8, &[1]).unwrap()],
+            contexts: vec![NegotiateContext::preauth_integrity(&[1], &[2; 8]).unwrap()],
             ..Default::default()
         });
         let mut body = resp.to_body(command::NEGOTIATE, 0).unwrap();
@@ -3659,6 +3913,292 @@ mod tests {
         assert_eq!(again.to_bytes().unwrap(), bytes);
     }
 
+    // Each test below follows one finding of a review against MS-SMB2.
+
+    #[test]
+    fn every_entry_point_refuses_a_payload_past_max_message() {
+        let mut chain = header_bytes(command::ECHO, 0, 0, 0, 1, 0, 0);
+        chain.extend_from_slice(&[4, 0, 0, 0]);
+        chain.resize(MAX_MESSAGE + 1, 0);
+        assert_eq!(parse_chain(&chain), Err(Error::TooLong));
+        let mut t = protocol::TRANSFORM.to_vec();
+        t.resize(MAX_MESSAGE + 1, 0);
+        assert_eq!(Transform::parse(&t), Err(Error::TooLong));
+        let mut c = protocol::COMPRESSION.to_vec();
+        c.resize(MAX_MESSAGE + 1, 0);
+        assert_eq!(Compressed::parse(&c), Err(Error::TooLong));
+        let mut body = vec![4, 0, 0, 0];
+        body.resize(MAX_MESSAGE + 1, 0);
+        assert_eq!(Request::parse(command::ECHO, &body), Err(Error::TooLong));
+        assert_eq!(Response::parse(command::ECHO, 0, &body), Err(Error::TooLong));
+        // Writers refuse before they copy or convert.
+        let long = Request::Create(CreateRequest { name: vec![0x41; 40000], ..Default::default() });
+        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        let long = Request::QueryDirectory(QueryDirectoryRequest { pattern: vec![0x41; 40000], ..Default::default() });
+        assert_eq!(long.to_body(), Err(EncodeError::TooLong));
+        let long = Response::Other { body: vec![0; MAX_MESSAGE + 1] };
+        assert_eq!(long.to_body(0x99, 0), Err(EncodeError::TooLong));
+    }
+
+    #[test]
+    fn tree_connect_extension_is_written_at_the_buffer() {
+        // 2.2.9.1: with EXTENSION_PRESENT the Buffer starts with the
+        // extension's 16-byte header, then the path.
+        let req = Request::TreeConnect(TreeConnectRequest { flags: 4, path: utf16("\\\\server\\share") });
+        let body = req.to_body().unwrap();
+        let path = u16s("\\\\server\\share");
+        assert_eq!(le16(&body, 2), Ok(4));
+        assert_eq!(le16(&body, 4), Ok(88));
+        assert_eq!(le16(&body, 6), Ok(path.len() as u16));
+        assert_eq!(body[8..24], [0; 16]);
+        assert_eq!(body[24..], path[..]);
+        assert_eq!(Request::parse(command::TREE_CONNECT, &body), Ok(req));
+        // A request with contexts after the path reads, without them.
+        let mut ext = le(&[9, 4, 88, path.len() as u64], &[2, 2, 2, 2]);
+        ext.extend_from_slice(&le(&[112, 1, 0, 0], &[4, 2, 8, 2]));
+        ext.extend_from_slice(&path);
+        ext.resize(48, 0);
+        ext.extend_from_slice(&le(&[1, 4, 0], &[2, 2, 4]));
+        ext.extend_from_slice(&[1, 2, 3, 4]);
+        let read = Request::parse(command::TREE_CONNECT, &ext).unwrap();
+        let back = read.to_body().unwrap();
+        assert!(back.len() <= ext.len());
+        assert_eq!(Request::parse(command::TREE_CONNECT, &back), Ok(read));
+        // The path over the extension's header is refused.
+        let mut bad = le(&[9, 4, 72, path.len() as u64], &[2, 2, 2, 2]);
+        bad.extend_from_slice(&path);
+        assert_eq!(Request::parse(command::TREE_CONNECT, &bad), Err(Error::Buffer));
+    }
+
+    #[test]
+    fn ioctl_response_output_is_eight_byte_aligned() {
+        // 2.2.32: OutputOffset is InputOffset + InputCount rounded up to 8.
+        let resp = Response::Ioctl(IoctlResponse { input: vec![1], output: vec![2], ..Default::default() });
+        let body = resp.to_body(command::IOCTL, 0).unwrap();
+        assert_eq!((le32(&body, 24), le32(&body, 28)), (Ok(112), Ok(1)));
+        assert_eq!((le32(&body, 32), le32(&body, 36)), (Ok(120), Ok(1)));
+        assert_eq!(body[56], 2);
+        assert_eq!(Response::parse(command::IOCTL, 0, &body), Ok(resp));
+        // Output right after the input, unaligned, is refused.
+        let mut bad = le(&[49, 0, 0, 0, 0, 112, 1, 113, 1, 0, 0], &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4]);
+        bad.extend_from_slice(&[1, 2]);
+        assert_eq!(Response::parse(command::IOCTL, 0, &bad), Err(Error::Align(113)));
+        // Aligned output before the end of the input is refused.
+        let mut bad = le(&[49, 0, 0, 0, 0, 112, 9, 112, 1, 0, 0], &[2, 2, 4, 8, 8, 4, 4, 4, 4, 4, 4]);
+        bad.resize(48 + 9, 0);
+        assert_eq!(Response::parse(command::IOCTL, 0, &bad), Err(Error::Overlap));
+        // No output: OutputOffset 0.
+        let none = Response::Ioctl(IoctlResponse { input: vec![1], ..Default::default() });
+        assert_eq!(le32(&none.to_body(command::IOCTL, 0).unwrap(), 32), Ok(0));
+    }
+
+    #[test]
+    fn failures_get_error_bodies_but_for_the_listed_exceptions() {
+        // 3.3.4.4: ACCESS_DENIED is a failure for ECHO, which has no
+        // exception, so its body is an error body.
+        assert_eq!(Response::Echo.to_body(command::ECHO, status::ACCESS_DENIED), Err(EncodeError::Status(0xc000_0022)));
+        assert_eq!(Response::parse(command::ECHO, status::ACCESS_DENIED, &[4, 0, 0, 0]), Err(Error::StructureSize(4)));
+        let read = Response::Read { data: vec![1], data_remaining: 0, flags: 0 };
+        assert_eq!(read.to_body(command::READ, status::END_OF_FILE), Err(EncodeError::Status(status::END_OF_FILE)));
+        let create = Response::Create(CreateResponse::default());
+        assert_eq!(create.to_body(command::CREATE, status::BUFFER_OVERFLOW), Err(EncodeError::Status(0x8000_0005)));
+        // The exceptions keep their own bodies.
+        assert!(read.to_body(command::READ, status::BUFFER_OVERFLOW).is_ok());
+        let ioctl = Response::Ioctl(IoctlResponse::default());
+        assert!(ioctl.to_body(command::IOCTL, status::BUFFER_OVERFLOW).is_ok());
+        assert!(ioctl.to_body(command::IOCTL, status::INVALID_PARAMETER).is_ok());
+        assert_eq!(ioctl.to_body(command::IOCTL, status::ACCESS_DENIED), Err(EncodeError::Status(0xc000_0022)));
+    }
+
+    #[test]
+    fn smb_311_negotiate_responses_carry_one_preauth_context() {
+        let preauth = NegotiateContext::preauth_integrity(&[1], &[7; 32]).unwrap();
+        let signing = NegotiateContext::algorithms(negotiate_context::SIGNING_CAPABILITIES, &[1]).unwrap();
+        let response = |contexts: Vec<NegotiateContext>| {
+            Response::Negotiate(NegotiateResponse { dialect: dialect::SMB_3_1_1, contexts, ..Default::default() })
+        };
+        // 3.2.5.2: a client refuses none, two, or two of one other kind.
+        assert_eq!(response(vec![]).to_body(0, 0), Err(EncodeError::Dialect));
+        assert_eq!(response(vec![preauth.clone(), preauth.clone()]).to_body(0, 0), Err(EncodeError::Dialect));
+        let two_signing = response(vec![preauth.clone(), signing.clone(), signing.clone()]);
+        assert_eq!(two_signing.to_body(0, 0), Err(EncodeError::Dialect));
+        let good = response(vec![preauth, signing]);
+        let mut body = good.to_body(0, 0).unwrap();
+        assert_eq!(Response::parse(0, 0, &body), Ok(good));
+        // The same bytes with the preauth context made a signing one.
+        let first = le32(&body, 60).unwrap() as usize - HEADER_LEN;
+        body[first..first + 2].copy_from_slice(&8u16.to_le_bytes());
+        assert_eq!(Response::parse(0, 0, &body), Err(Error::NegotiateContexts));
+        // A 3.1.1 response with a count of 0.
+        body[6..8].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(Response::parse(0, 0, &body), Err(Error::NegotiateContexts));
+    }
+
+    #[test]
+    fn channel_none_ignores_channel_info() {
+        // 2.2.19: with SMB2_CHANNEL_NONE the server ignores
+        // ReadChannelInfoOffset and ReadChannelInfoLength.
+        let mut read = le(&[49, 0, 0, 10, 0, 1, 2, 0, 0, 0, 0xffff, 1], &[2, 1, 1, 4, 8, 8, 8, 4, 4, 4, 2, 2]);
+        read.push(0);
+        let Ok(Request::Read(r)) = Request::parse(command::READ, &read) else { panic!() };
+        assert!(r.channel_info.is_empty());
+        // With RDMA_V1 the same fields are read, and point nowhere.
+        read[36] = 1;
+        assert_eq!(Request::parse(command::READ, &read), Err(Error::Buffer));
+        // 2.2.21: the same for WRITE.
+        let mut write = le(&[49, 112, 3, 0, 1, 2, 0, 0, 0xffff, 1, 0], &[2, 2, 4, 8, 8, 8, 4, 4, 2, 2, 4]);
+        write.extend_from_slice(b"abc");
+        let Ok(Request::Write(w)) = Request::parse(command::WRITE, &write) else { panic!() };
+        assert_eq!((w.data, w.channel_info), (b"abc".to_vec(), vec![]));
+        // Writers refuse channel info with channel NONE.
+        let r = Request::Read(ReadRequest { channel_info: vec![1], ..Default::default() });
+        assert_eq!(r.to_body(), Err(EncodeError::Channel));
+        let w = Request::Write(WriteRequest { channel_info: vec![1], ..Default::default() });
+        assert_eq!(w.to_body(), Err(EncodeError::Channel));
+    }
+
+    /// A CREATE request body, with its file name at `name_at` and its
+    /// context region at 120 + 8.
+    fn create_with(name_at: u64, name: &[u8], region: &[u8]) -> Vec<u8> {
+        let mut b = le(
+            &[57, 0, 0, 0, 0, 0, 0, 0, 7, 1, 0, name_at, name.len() as u64],
+            &[2, 1, 1, 4, 8, 8, 4, 4, 4, 4, 4, 2, 2],
+        );
+        let ctx_at = if region.is_empty() { 0 } else { 128 };
+        b.extend_from_slice(&le(&[ctx_at, region.len() as u64], &[4, 4]));
+        b.resize(name_at as usize - HEADER_LEN, 0);
+        b.extend_from_slice(name);
+        if !region.is_empty() {
+            b.resize(128 - HEADER_LEN, 0);
+            b.extend_from_slice(region);
+        }
+        b.resize(b.len().max(57), 0);
+        b
+    }
+
+    #[test]
+    fn create_context_data_may_come_before_its_name() {
+        // 2.2.13.2: name and data have their own offsets, in no set order.
+        let mut ctx = le(&[0, 24, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
+        ctx.extend_from_slice(&4096u64.to_le_bytes());
+        ctx.extend_from_slice(b"AlSi");
+        let body = create_with(120, &[], &ctx);
+        let Ok(Request::Create(c)) = Request::parse(command::CREATE, &body) else { panic!() };
+        let want = CreateContext { name: b"AlSi".to_vec(), data: 4096u64.to_le_bytes().to_vec() };
+        assert_eq!(c.contexts, [want]);
+        // Written back with the name first: at most 7 bytes longer.
+        let back = Request::Create(c.clone()).to_body().unwrap();
+        assert!(back.len() <= body.len() + 7);
+        assert_eq!(Request::parse(command::CREATE, &back), Ok(Request::Create(c)));
+        // Name and data over the same bytes are still refused.
+        let mut ctx = le(&[0, 16, 4, 0, 16, 8], &[4, 2, 2, 2, 2, 4]);
+        ctx.extend_from_slice(&[0; 8]);
+        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)), Err(Error::Overlap));
+    }
+
+    #[test]
+    fn create_names_are_aligned_and_next_points_at_a_context() {
+        // 2.2.13: the file name is 8-byte aligned.
+        let body = create_with(122, &u16s("a"), &[]);
+        assert_eq!(Request::parse(command::CREATE, &body), Err(Error::Align(122)));
+        assert!(Request::parse(command::CREATE, &create_with(128, &u16s("a"), &[])).is_ok());
+        // 2.2.13.2: a create context's name is 8-byte aligned.
+        let mut ctx = le(&[0, 17, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
+        ctx.extend_from_slice(b"\0MxAc");
+        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)), Err(Error::Align(17)));
+        // A Next of 24 that reaches the end of the region, with no context
+        // there.
+        let mut ctx = le(&[24, 16, 4, 0, 0, 0], &[4, 2, 2, 2, 2, 4]);
+        ctx.extend_from_slice(b"MxAc");
+        ctx.resize(24, 0);
+        assert_eq!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)), Err(Error::Buffer));
+        ctx[0] = 0;
+        assert!(Request::parse(command::CREATE, &create_with(120, &[], &ctx)).is_ok());
+    }
+
+    #[test]
+    fn create_request_buffer_is_at_least_one_byte() {
+        // 2.2.13: "the Buffer field MUST be at least one byte in length".
+        let body = create_with(120, &[], &[]);
+        assert_eq!(body.len(), 57);
+        assert!(Request::parse(command::CREATE, &body).is_ok());
+        assert_eq!(Request::parse(command::CREATE, &body[..56]), Err(Error::Truncated));
+    }
+
+    #[test]
+    fn transform_headers_need_flags_one_and_a_message() {
+        // 2.2.41 and 3.3.5.2.1.1.
+        assert_eq!(Transform::default().to_bytes(), Err(EncodeError::Transform));
+        assert_eq!(Transform { flags: 1, ..Default::default() }.to_bytes(), Err(EncodeError::Transform));
+        assert_eq!(Transform { flags: 2, data: vec![1], ..Default::default() }.to_bytes(), Err(EncodeError::Transform));
+        let good = Transform { flags: 1, data: vec![1], ..Default::default() };
+        let mut b = good.to_bytes().unwrap();
+        assert_eq!(Packet::parse(&b), Ok(Packet::Transform(good)));
+        b[42] = 0;
+        assert_eq!(Packet::parse(&b), Err(Error::TransformFlags(0)));
+        b[42] = 2;
+        assert_eq!(Packet::parse(&b), Err(Error::TransformFlags(2)));
+    }
+
+    #[test]
+    fn chained_payloads_hold_their_original_payload_size() {
+        // 2.2.42.2.1: LZNT1, LZ77, LZ77+Huffman and LZ4 carry a 4-byte
+        // OriginalPayloadSize inside Length.
+        for algorithm in [1, 2, 3, 5] {
+            let short = ChainedPayload { algorithm, flags: 1, data: vec![0; 3] };
+            let c = Compressed::Chained { original_size: 9, payloads: vec![short] };
+            assert_eq!(c.to_bytes(), Err(EncodeError::Chained), "{algorithm}");
+            let ok = ChainedPayload { algorithm, flags: 1, data: vec![9, 0, 0, 0] };
+            let c = Compressed::Chained { original_size: 9, payloads: vec![ok] };
+            let mut b = c.to_bytes().unwrap();
+            assert_eq!(Compressed::parse(&b), Ok(c));
+            b[12] = 3;
+            b.pop();
+            assert_eq!(Compressed::parse(&b), Err(Error::Buffer), "{algorithm}");
+        }
+        // NONE and Pattern_V1 have no such field.
+        let none = Compressed::Chained {
+            original_size: 0,
+            payloads: vec![ChainedPayload { algorithm: 0, flags: 1, data: vec![] }],
+        };
+        assert_eq!(Compressed::parse(&none.to_bytes().unwrap()), Ok(none));
+    }
+
+    #[test]
+    fn error_contexts_fit_their_count() {
+        // 2.2.2: ErrorContextCount contexts, each 8-byte aligned.
+        let missing = Response::Error(ErrorResponse { context_count: 1, data: vec![] });
+        assert_eq!(missing.to_body(command::CREATE, status::ACCESS_DENIED), Err(EncodeError::ErrorContexts));
+        assert_eq!(
+            Response::parse(command::CREATE, status::ACCESS_DENIED, &[9, 0, 1, 0, 0, 0, 0, 0, 0]),
+            Err(Error::Buffer)
+        );
+        // Two contexts: 3 bytes of data, padding to 16, then an empty one.
+        let mut data = le(&[3, 0], &[4, 4]);
+        data.extend_from_slice(&[1, 2, 3, 0, 0, 0, 0, 0]);
+        data.extend_from_slice(&le(&[0, 0x7264_5253], &[4, 4]));
+        let two = Response::Error(ErrorResponse { context_count: 2, data: data.clone() });
+        let body = two.to_body(command::TREE_CONNECT, status::BAD_NETWORK_NAME).unwrap();
+        assert_eq!(Response::parse(command::TREE_CONNECT, status::BAD_NETWORK_NAME, &body), Ok(two));
+        // Without the padding the second context does not fit.
+        data.drain(11..16);
+        let unpadded = Response::Error(ErrorResponse { context_count: 2, data });
+        assert_eq!(unpadded.to_body(command::TREE_CONNECT, status::BAD_NETWORK_NAME), Err(EncodeError::ErrorContexts));
+    }
+
+    #[test]
+    fn ioctl_requests_carry_no_output() {
+        // 2.2.31: "OutputCount: The client MUST set this to 0."
+        let req = Request::Ioctl(IoctlRequest { output: vec![1], ..Default::default() });
+        assert_eq!(req.to_body(), Err(EncodeError::IoctlOutput));
+        let mut body = Request::Ioctl(IoctlRequest { input: vec![1; 8], ..Default::default() }).to_body().unwrap();
+        assert_eq!((le32(&body, 36), le32(&body, 40)), (Ok(0), Ok(0)));
+        body[36..40].copy_from_slice(&128u32.to_le_bytes());
+        assert!(Request::parse(command::IOCTL, &body).is_ok());
+        body[40..44].copy_from_slice(&1u32.to_le_bytes());
+        assert_eq!(Request::parse(command::IOCTL, &body), Err(Error::Buffer));
+    }
+
     /// One request of each kind, with buffers filled.
     fn requests() -> Vec<Request> {
         let fid = FileId { persistent: 3, volatile: 4 };
@@ -3690,11 +4230,18 @@ mod tests {
             Request::Create(CreateRequest::default()),
             Request::Close { flags: 1, file_id: fid },
             Request::Flush { file_id: fid },
-            Request::Read(ReadRequest { length: 10, file_id: fid, channel_info: vec![1, 2], ..Default::default() }),
+            Request::Read(ReadRequest {
+                length: 10,
+                file_id: fid,
+                channel: 1,
+                channel_info: vec![1, 2],
+                ..Default::default()
+            }),
             Request::Write(WriteRequest {
                 offset: 5,
                 file_id: fid,
                 data: b"data".to_vec(),
+                channel: 1,
                 channel_info: vec![9],
                 ..Default::default()
             }),
@@ -3707,7 +4254,6 @@ mod tests {
                 ctl_code: 0x0011_c017,
                 file_id: fid,
                 input: vec![1; 5],
-                output: vec![2; 3],
                 flags: 1,
                 ..Default::default()
             }),
@@ -3753,7 +4299,10 @@ mod tests {
                 Response::Negotiate(NegotiateResponse {
                     dialect: 0x311,
                     security_buffer: vec![0x60; 10],
-                    contexts: vec![NegotiateContext::algorithms(8, &[1]).unwrap()],
+                    contexts: vec![
+                        NegotiateContext::preauth_integrity(&[1], &[3; 32]).unwrap(),
+                        NegotiateContext::algorithms(8, &[1]).unwrap(),
+                    ],
                     ..Default::default()
                 }),
             ),
@@ -3805,7 +4354,11 @@ mod tests {
             (16, status::BUFFER_OVERFLOW, Response::QueryInfo { data: vec![1; 3] }),
             (17, 0, Response::SetInfo),
             (5, status::OBJECT_NAME_NOT_FOUND, Response::Error(ErrorResponse::default())),
-            (15, status::PENDING, Response::Error(ErrorResponse { context_count: 1, data: vec![1; 12] })),
+            (
+                15,
+                status::PENDING,
+                Response::Error(ErrorResponse { context_count: 1, data: le(&[4, 0, 0x0101_0101], &[4, 4, 4]) }),
+            ),
             (0x12, 0, Response::Other { body: vec![24, 0, 1, 0] }),
         ]
     }
@@ -3834,7 +4387,7 @@ mod tests {
             out.push(m.to_bytes().unwrap());
         }
         out.push(write_chain(&chain()).unwrap());
-        out.push(Transform { data: vec![1; 20], ..Default::default() }.to_bytes());
+        out.push(Transform { flags: 1, data: vec![1; 20], ..Default::default() }.to_bytes().unwrap());
         out.push(
             Compressed::Unchained { original_size: 9, algorithm: 2, offset: 1, data: vec![3; 9] }.to_bytes().unwrap(),
         );
@@ -3851,9 +4404,12 @@ mod tests {
 
     /// Whether a body written back is no longer than the one read, or no
     /// longer than its own fixed part and one byte. Then a message read
-    /// whole always fits [`MAX_MESSAGE`] when written back.
-    fn no_longer(new: &[u8], old: &[u8]) -> bool {
-        new.len() <= old.len() || le16(new, 0).is_ok_and(|size| new.len() <= usize::from(size))
+    /// whole always fits [`MAX_MESSAGE`] when written back. A CREATE may
+    /// grow by 7 bytes when its last create context put data before name
+    /// (see [`Request::parse`]).
+    fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
+        let slack = if command == command::CREATE { 7 } else { 0 };
+        new.len() <= old.len() + slack || le16(new, 0).is_ok_and(|size| new.len() <= usize::from(size))
     }
 
     /// Reads a payload every way there is, checks that what reads writes
@@ -3868,13 +4424,13 @@ mod tests {
         for m in &messages {
             if let Ok(req) = m.request() {
                 let body = req.to_body().unwrap();
-                assert!(no_longer(&body, &m.body), "{req:?}");
+                assert!(no_longer(m.header.command, &body, &m.body), "{req:?}");
                 assert_eq!(Request::parse(m.header.command, &body), Ok(req));
             }
             for s in [m.header.status, status] {
                 if let Ok(resp) = Response::parse(m.header.command, s, &m.body) {
                     let body = resp.to_body(m.header.command, s).unwrap();
-                    assert!(no_longer(&body, &m.body), "{resp:?}");
+                    assert!(no_longer(m.header.command, &body, &m.body), "{resp:?}");
                     assert_eq!(Response::parse(m.header.command, s, &body), Ok(resp));
                 }
             }
@@ -3970,8 +4526,8 @@ mod tests {
     fn split(data: &[u8], bytewise: bool) -> (Vec<Vec<u8>>, Option<FrameError>) {
         let mut d = Decoder::new();
         let mut out = Vec::new();
-        let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-        for chunk in chunks {
+        // A chunk at a time, without collecting the chunks.
+        for chunk in data.chunks(if bytewise { 1 } else { data.len().max(1) }) {
             let mut rest = chunk;
             while !rest.is_empty() {
                 let took = d.feed(rest);
@@ -4010,12 +4566,12 @@ mod tests {
             let body = &payload[payload.len().min(HEADER_LEN)..];
             if let Ok(req) = Request::parse(command, body) {
                 let back = req.to_body().unwrap();
-                assert!(no_longer(&back, body), "{req:?}");
+                assert!(no_longer(command, &back, body), "{req:?}");
                 assert_eq!(Request::parse(command, &back), Ok(req));
             }
             if let Ok(resp) = Response::parse(command, status, body) {
                 let back = resp.to_body(command, status).unwrap();
-                assert!(no_longer(&back, body), "{resp:?}");
+                assert!(no_longer(command, &back, body), "{resp:?}");
                 assert_eq!(Response::parse(command, status, &back), Ok(resp));
             }
             // The stream: framed payloads and raw bytes, whole and a byte at a time.

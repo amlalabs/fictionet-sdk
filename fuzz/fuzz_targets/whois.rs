@@ -75,6 +75,7 @@ fn built(data: &[u8]) -> Result<()> {
         fields.push(Field { block, key: u.arbitrary()?, value: u.arbitrary()? });
     }
     if let Ok(text) = write_fields(&fields) {
+        assert!(text.len() <= MAX_RESPONSE);
         assert_eq!(parse_fields(&text).unwrap(), fields);
         let resp = Response::from_fields(&fields).unwrap();
         assert_eq!(resp.fields().unwrap(), fields);
@@ -87,6 +88,14 @@ fn built(data: &[u8]) -> Result<()> {
     let referral = Referral { kind, host: u.arbitrary()?, port: u.arbitrary()? };
     if let Ok(f) = referral.to_field(0) {
         assert_eq!(Referral::from_field(&f), Some(referral));
+    }
+    // An IPv6 address, written in brackets, reads back the same.
+    let ip: std::net::Ipv6Addr = u.arbitrary()?;
+    let referral = Referral { kind, host: ip.to_string(), port: u.arbitrary()? };
+    if let Ok(f) = referral.to_field(0) {
+        assert_eq!(Referral::from_field(&f), Some(referral));
+    } else {
+        assert_eq!(referral.port, 0);
     }
     Ok(())
 }
@@ -113,6 +122,7 @@ fuzz_target!(|data: &[u8]| {
         // Fields read can be written back if the writer takes them, and
         // read back the same.
         if let Ok(text) = write_fields(&fields) {
+            assert!(text.len() <= MAX_RESPONSE);
             assert_eq!(parse_fields(&text).unwrap(), fields);
         }
         for f in &fields {
@@ -121,6 +131,13 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         assert_eq!(resp.referral(), find_referral(&fields));
+    }
+    // Text read directly, with no decoder to cap it, gives the same
+    // fields when it fits in one response.
+    if let Ok(text) = std::str::from_utf8(data)
+        && !truncated
+    {
+        assert_eq!(parse_fields(text), resp.fields());
     }
     let _ = built(data);
 });

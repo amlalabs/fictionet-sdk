@@ -35,8 +35,10 @@
 //! world code.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Reserved header bits are ignored on receipt and written as zero,
-//! as both RFCs say.
+//! likes. Reserved header and AVP bits are written as zero, as both RFCs
+//! say. A reader ignores reserved header bits, and keeps an AVP's reserved
+//! bits so that an L2TPv2 peer can treat such an AVP as one it does not
+//! know (RFC 2661 section 4.1).
 //!
 //! ```
 //! use fictionet::stdlib::l2tp::{attribute, Avp, ControlMessage, MessageType, Packet, V2Packet};
@@ -375,9 +377,10 @@ pub struct Avp {
     /// The H bit: the value is hidden, scrambled with the shared secret
     /// and the last Random Vector AVP. It is kept as the bytes that came.
     pub hidden: bool,
-    /// The 4 reserved bits, in the low bits. RFC 2661 says an AVP with
-    /// any of them set is treated as one the peer does not know. Only the
-    /// low 4 bits are written.
+    /// The 4 reserved bits as read, in the low bits. RFC 2661 says an
+    /// AVP with any of them set is treated as one the peer does not know,
+    /// and RFC 3931 says they are ignored on receipt. Both say they are
+    /// sent as zero, so a writer always writes zeros, whatever this holds.
     pub reserved: u8,
     /// The vendor ID: 0 for the attributes the IETF defines, otherwise
     /// the vendor's SMI Network Management Private Enterprise Code.
@@ -452,9 +455,9 @@ impl Avp {
         AVP_HEADER_LEN + self.value.len().min(MAX_AVP_VALUE)
     }
 
-    /// Adds the AVP's bytes to `out`. A value longer than
-    /// [`MAX_AVP_VALUE`] is cut to that length, since the length field
-    /// can say no more.
+    /// Adds the AVP's bytes to `out`, with the reserved bits zero. A
+    /// value longer than [`MAX_AVP_VALUE`] is cut to that length, since
+    /// the length field can say no more.
     pub fn write_to(&self, out: &mut Vec<u8>) {
         let value = &self.value[..self.value.len().min(MAX_AVP_VALUE)];
         let mut word = (AVP_HEADER_LEN + value.len()) as u16 & avp_bits::LENGTH;
@@ -464,7 +467,6 @@ impl Avp {
         if self.hidden {
             word |= avp_bits::H;
         }
-        word |= (u16::from(self.reserved) << 10) & avp_bits::RESERVED;
         out.extend_from_slice(&word.to_be_bytes());
         out.extend_from_slice(&self.vendor.to_be_bytes());
         out.extend_from_slice(&self.attribute.to_be_bytes());
@@ -496,6 +498,11 @@ pub struct ControlMessage {
     /// defines, otherwise the vendor of a vendor-specific message (RFC
     /// 3931 section 5.4.1).
     pub vendor: u16,
+    /// The reserved bits of the message type AVP as read, like
+    /// [`Avp::reserved`]. An L2TPv2 peer treats a message type AVP with
+    /// any of them set as one it does not know (RFC 2661 section 4.1),
+    /// and an L2TPv3 peer ignores them. A writer always writes zeros.
+    pub reserved: u8,
     /// The AVPs after the message type AVP, in order.
     pub avps: Vec<Avp>,
 }
@@ -504,7 +511,7 @@ impl ControlMessage {
     /// A message of IETF type `message_type` with the M bit set, then
     /// `avps`.
     pub fn new(message_type: MessageType, avps: Vec<Avp>) -> ControlMessage {
-        ControlMessage { message_type: Some(message_type), mandatory: true, vendor: 0, avps }
+        ControlMessage { message_type: Some(message_type), mandatory: true, vendor: 0, reserved: 0, avps }
     }
 
     /// A ZLB acknowledgement: a control header with no body.
@@ -520,8 +527,7 @@ impl ControlMessage {
     /// Reads a control message body: the bytes after the control header.
     /// Empty bytes are a ZLB acknowledgement. Otherwise the body must be
     /// whole AVPs, at most [`MAX_AVPS`] of them, and the first one a
-    /// message type AVP. Its M bit and vendor ID are kept, and its
-    /// reserved bits are not.
+    /// message type AVP. Its M bit, vendor ID and reserved bits are kept.
     pub fn parse(body: &[u8]) -> Result<ControlMessage, Error> {
         if body.len() > MAX_MESSAGE {
             return Err(Error::TooLong(body.len()));
@@ -547,11 +553,17 @@ impl ControlMessage {
             avps.push(avp);
             at += used;
         }
-        Ok(ControlMessage { message_type: Some(message_type), mandatory: first.mandatory, vendor: first.vendor, avps })
+        Ok(ControlMessage {
+            message_type: Some(message_type),
+            mandatory: first.mandatory,
+            vendor: first.vendor,
+            reserved: first.reserved,
+            avps,
+        })
     }
 
     /// The message body's bytes: the message type AVP, with the M bit and
-    /// vendor ID this holds, then the AVPs. A ZLB acknowledgement is
+    /// vendor ID this holds and the reserved bits zero, then the AVPs. A ZLB acknowledgement is
     /// empty, so its AVPs are not written.
     /// AVPs past [`MAX_AVPS`], or past [`MAX_MESSAGE`] bytes, are left
     /// out, so the body always fits in a datagram. The type is written as
@@ -709,7 +721,9 @@ impl V2Packet {
 
     /// The datagram's bytes. A control message gets the L and S bits and
     /// no offset or P bit, as RFC 2661 says. Offset padding and payload
-    /// past what one datagram can hold are cut, padding first kept.
+    /// past what one datagram can hold are cut, padding first kept. A
+    /// control body is cut between AVPs, so that it does not end inside
+    /// one.
     pub fn to_bytes(&self) -> Vec<u8> {
         let l = self.control || self.has_length;
         let sequence = if self.control { Some(self.sequence.unwrap_or((0, 0))) } else { self.sequence };
@@ -722,7 +736,7 @@ impl V2Packet {
         let room = MAX_DATAGRAM - header;
         let pad = pad.map(|p| &p[..p.len().min(room)]);
         let room = room - pad.map_or(0, <[u8]>::len);
-        let payload = &self.payload[..self.payload.len().min(room)];
+        let payload = if self.control { fit_body(&self.payload, room) } else { fit(&self.payload, room) };
         let total = header + pad.map_or(0, <[u8]>::len) + payload.len();
 
         let mut word = u16::from(VERSION_2);
@@ -812,9 +826,10 @@ impl V3Control {
     }
 
     /// The datagram's bytes: the header with T, L and S set, then the
-    /// body. A body longer than [`MAX_MESSAGE`] is cut to that length.
+    /// body. A body longer than [`MAX_MESSAGE`] is cut to fit, between
+    /// AVPs, so that it does not end inside one.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let payload = &self.payload[..self.payload.len().min(MAX_MESSAGE)];
+        let payload = fit_body(&self.payload, MAX_MESSAGE);
         let total = CONTROL_HEADER_LEN + payload.len();
         let word = bits::T | bits::L | bits::S | u16::from(VERSION_3);
         let mut out = Vec::with_capacity(total);
@@ -841,8 +856,7 @@ pub struct V3Data {
     /// The session ID the receiver assigned.
     pub session: u32,
     /// The cookie: 0, 4 or 8 bytes, a length the peers agree on when they
-    /// set up the session. A writer writes a cookie of another length as
-    /// the next shorter allowed one, cutting it.
+    /// set up the session. A writer refuses a cookie of another length.
     pub cookie: Vec<u8>,
     /// The bytes after the cookie.
     pub payload: Vec<u8>,
@@ -870,28 +884,23 @@ impl V3Data {
     }
 
     /// The datagram's bytes: the header with only the version set, the
-    /// cookie, then the payload, cut to fit in a datagram.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let cookie = &self.cookie[..self.cookie_len()];
+    /// cookie, then the payload, cut to fit in a datagram. A cookie that
+    /// is not 0, 4 or 8 bytes long is [`Error::Cookie`], since the peer
+    /// reads a cookie of the length the session agreed on.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let cookie = self.cookie.as_slice();
+        if !matches!(cookie.len(), 0 | 4 | 8) {
+            return Err(Error::Cookie(cookie.len()));
+        }
         let room = MAX_DATAGRAM - V3_DATA_HEADER_LEN - cookie.len();
-        let payload = &self.payload[..self.payload.len().min(room)];
+        let payload = fit(&self.payload, room);
         let mut out = Vec::with_capacity(V3_DATA_HEADER_LEN + cookie.len() + payload.len());
         out.extend_from_slice(&u16::from(VERSION_3).to_be_bytes());
         out.extend_from_slice(&[0, 0]);
         out.extend_from_slice(&self.session.to_be_bytes());
         out.extend_from_slice(cookie);
         out.extend_from_slice(payload);
-        out
-    }
-
-    /// How long a cookie [`V3Data::to_bytes`] writes: 8 or 4 if the
-    /// cookie is at least that long, otherwise 0.
-    pub fn cookie_len(&self) -> usize {
-        match self.cookie.len() {
-            n if n >= 8 => 8,
-            n if n >= 4 => 4,
-            _ => 0,
-        }
+        Ok(out)
     }
 }
 
@@ -926,11 +935,12 @@ impl Packet {
         }
     }
 
-    /// The datagram's bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The datagram's bytes. Only an L2TPv3 data message can fail, with
+    /// [`Error::Cookie`], as [`V3Data::to_bytes`] says.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         match self {
-            Packet::V2(p) => p.to_bytes(),
-            Packet::V3Control(p) => p.to_bytes(),
+            Packet::V2(p) => Ok(p.to_bytes()),
+            Packet::V3Control(p) => Ok(p.to_bytes()),
             Packet::V3Data(p) => p.to_bytes(),
         }
     }
@@ -963,6 +973,33 @@ fn v3_word(b: &[u8]) -> Result<u16, Error> {
         return Err(Error::Truncated);
     }
     Ok(word)
+}
+
+/// The first `room` bytes of `b`, or all of them if there are fewer.
+fn fit(b: &[u8], room: usize) -> &[u8] {
+    &b[..b.len().min(room)]
+}
+
+/// The longest start of control body `b` that fits in `room` bytes and
+/// does not end inside an AVP. If the AVPs stop making sense before
+/// `room`, the body cannot be read as a message anyway, and it is cut at
+/// `room`.
+fn fit_body(b: &[u8], room: usize) -> &[u8] {
+    if b.len() <= room {
+        return b;
+    }
+    let mut at = 0;
+    while let Some(&[h0, h1]) = b.get(at..).and_then(<[u8]>::first_chunk::<2>) {
+        let len = usize::from(u16::from_be_bytes([h0, h1]) & avp_bits::LENGTH);
+        if len < AVP_HEADER_LEN {
+            break;
+        }
+        if at + len > room {
+            return &b[..at];
+        }
+        at += len;
+    }
+    fit(b, room)
 }
 
 /// The big-endian 16-bit number at `i`. Callers check the length first.
@@ -1081,7 +1118,12 @@ mod tests {
             Avp { mandatory: true, hidden: true, reserved: 5, vendor: 9, attribute: 0x1234, value: vec![1, 2, 3, 4] }
         );
         assert_eq!(a.as_u32(), None, "hidden values are not read");
-        assert_eq!(a.to_bytes(), bytes);
+        // RFC 2661 4.1 and RFC 3931 5.1: reserved bits are sent as zero.
+        let mut zeroed = bytes;
+        zeroed[0] &= 0xc3;
+        assert_eq!(a.to_bytes(), zeroed);
+        let r = Avp { reserved: 1, ..Avp::from_u16(attribute::ASSIGNED_TUNNEL_ID, 7) };
+        assert_eq!(r.to_bytes(), [0x80, 8, 0, 0, 0, 9, 0, 7]);
         assert_eq!(Avp::parse(&bytes[..9]), Err(Error::Truncated));
         assert_eq!(Avp::parse(&[0x80, 5, 0, 0, 0, 0]), Err(Error::AvpLength(5)));
         // An oversized value is cut to what the length field can say.
@@ -1138,6 +1180,18 @@ mod tests {
         let required = ControlMessage::parse(&[0x80, 8, 0, 0, 0, 0, 0x7f, 0x00]).unwrap();
         assert!(required.mandatory);
         assert!(ControlMessage::new(MessageType::Hello, vec![]).mandatory);
+    }
+
+    #[test]
+    fn message_type_reserved_bits_are_kept() {
+        // RFC 2661 4.1: a v2 peer treats an AVP with reserved bits set as
+        // one it does not know, so the reader keeps them on the message
+        // type AVP too. The writer writes them as zero.
+        let m = ControlMessage::parse(&[0x84, 8, 0, 0, 0, 0, 0, 6]).unwrap();
+        assert_eq!(m.message_type, Some(MessageType::Hello));
+        assert_eq!(m.reserved, 1);
+        assert_eq!(m.to_bytes(), [0x80, 8, 0, 0, 0, 0, 0, 6]);
+        assert_eq!(ControlMessage::parse(&[0x80, 8, 0, 0, 0, 0, 0, 6]).unwrap().reserved, 0);
     }
 
     #[test]
@@ -1214,7 +1268,8 @@ mod tests {
         assert_eq!(plain.payload.len(), 6);
         let v = V3Data::parse(&d, 4).unwrap();
         assert_eq!(v, V3Data { session: 0x1122_3344, cookie: vec![0xc0, 0x0c, 0x1e, 0x00], payload: vec![0xde, 0xad] });
-        assert_eq!(v.to_bytes(), d);
+        assert_eq!(v.to_bytes(), Ok(d.to_vec()));
+        assert_eq!(Packet::V3Data(v.clone()).to_bytes(), Ok(d.to_vec()));
         assert_eq!(V3Data::parse(&d, 8), Err(Error::Truncated));
         assert_eq!(V3Data::parse(&d[..12], 4).unwrap().payload, []);
         // Reserved bits in the data header are ignored and written as zero.
@@ -1222,11 +1277,13 @@ mod tests {
         r[0] = 0x7f;
         r[1] = 0xf3;
         r[2] = 0xff;
-        assert_eq!(V3Data::parse(&r, 4).unwrap().to_bytes(), d);
-        // A cookie of an odd length is written at the next shorter one.
-        let odd = V3Data { session: 1, cookie: vec![1, 2, 3, 4, 5, 6], payload: vec![] };
-        assert_eq!(odd.cookie_len(), 4);
-        assert_eq!(V3Data::parse(&odd.to_bytes(), 4).unwrap().cookie, [1, 2, 3, 4]);
+        assert_eq!(V3Data::parse(&r, 4).unwrap().to_bytes(), Ok(d.to_vec()));
+        // A cookie of a length other than 0, 4 or 8 is refused, not cut.
+        for n in [1, 3, 5, 6, 7, 9, 12] {
+            let odd = V3Data { session: 1, cookie: vec![1; n], payload: vec![] };
+            assert_eq!(odd.to_bytes(), Err(Error::Cookie(n)));
+            assert_eq!(Packet::V3Data(odd).to_bytes(), Err(Error::Cookie(n)));
+        }
     }
 
     #[test]
@@ -1271,11 +1328,12 @@ mod tests {
         let back = V2Packet::parse(&b).unwrap();
         assert_eq!(back.payload, []);
         assert_eq!(back.offset_pad.unwrap().len(), MAX_DATAGRAM - 14);
+        // Bytes of 1 read as AVPs of 257 bytes, so the cut is between two.
         let c = V3Control { connection: 1, ns: 0, nr: 0, payload: huge.clone() };
-        assert_eq!(c.to_bytes().len(), MAX_DATAGRAM);
+        assert_eq!(c.to_bytes().len(), CONTROL_HEADER_LEN + MAX_MESSAGE / 257 * 257);
         assert!(V3Control::parse(&c.to_bytes()).is_ok());
         let d = V3Data { session: 1, cookie: vec![0; 8], payload: huge };
-        assert_eq!(V3Data::parse(&d.to_bytes(), 8).unwrap().payload.len(), MAX_DATAGRAM - 16);
+        assert_eq!(V3Data::parse(&d.to_bytes().unwrap(), 8).unwrap().payload.len(), MAX_DATAGRAM - 16);
         // A message with too many AVPs, and with too many bytes.
         let many = ControlMessage::new(MessageType::Hello, vec![Avp::from_u16(50, 1); MAX_AVPS + 10]);
         let m = ControlMessage::parse(&many.to_bytes()).unwrap();
@@ -1286,6 +1344,34 @@ mod tests {
         assert!(ControlMessage::parse(&body).is_ok());
         let packet = V2Packet::control(1, 0, 0, 0, &fat).to_bytes();
         assert!(V2Packet::parse(&packet).unwrap().message().is_ok());
+    }
+
+    #[test]
+    fn oversized_control_bodies_are_cut_between_avps() {
+        // A message type AVP, 64 AVPs of 1023 bytes and one of 42: 65522
+        // bytes, 7 more than a body can be. Cutting at MAX_MESSAGE would
+        // end inside the last AVP, so it is left out whole.
+        let mut body = ControlMessage::new(MessageType::Hello, vec![]).to_bytes();
+        for _ in 0..64 {
+            Avp::new(50, vec![0; MAX_AVP_VALUE]).write_to(&mut body);
+        }
+        Avp::new(51, vec![0; 36]).write_to(&mut body);
+        assert_eq!(body.len(), 65_522);
+        assert_eq!(ControlMessage::parse(&body), Err(Error::TooLong(65_522)));
+        let kept = ControlMessage::parse(&body[..65_522 - 42]).unwrap();
+        assert_eq!(kept.avps.len(), 64);
+        let c = V3Control { connection: 1, ns: 0, nr: 0, payload: body.clone() };
+        let read = V3Control::parse(&c.to_bytes()).unwrap();
+        assert_eq!(read.payload.len(), 65_522 - 42);
+        assert_eq!(read.message(), Ok(kept.clone()));
+        let v2 = V2Packet { payload: body.clone(), ..V2Packet::control(1, 0, 0, 0, &ControlMessage::zlb()) };
+        assert_eq!(V2Packet::parse(&v2.to_bytes()).unwrap().message(), Ok(kept));
+        // A body that is not AVPs is cut at the limit; it never read.
+        let junk = V3Control { connection: 1, ns: 0, nr: 0, payload: vec![0; 70_000] };
+        assert_eq!(junk.to_bytes().len(), MAX_DATAGRAM);
+        // A data payload is not AVPs, and is cut at the limit.
+        let data = V2Packet::data(1, 2, body);
+        assert_eq!(data.to_bytes().len(), MAX_DATAGRAM);
     }
 
     #[test]
@@ -1346,10 +1432,12 @@ mod tests {
                 },
                 mandatory: rng.next().is_multiple_of(2),
                 vendor: if rng.next().is_multiple_of(2) { 0 } else { u16r(&mut rng) },
+                reserved: rng.next(),
                 avps,
             };
             let body = message.to_bytes();
             let read = ControlMessage::parse(&body).unwrap();
+            assert_eq!(read, written(&message));
             assert_eq!(read.to_bytes(), body);
             let v2 = V2Packet {
                 control: rng.next().is_multiple_of(2),
@@ -1370,10 +1458,43 @@ mod tests {
             let c = V3Control::new(u32::from(u16r(&mut rng)) << 16, u16r(&mut rng), u16r(&mut rng), &message);
             assert_eq!(V3Control::parse(&c.to_bytes()), Ok(c.clone()));
             assert_eq!(c.message().unwrap().to_bytes(), body);
-            let d = V3Data { session: u32::from(u16r(&mut rng)), cookie: bytes(&mut rng, 10), payload: body };
-            let read = V3Data::parse(&d.to_bytes(), d.cookie_len()).unwrap();
-            assert_eq!(read.to_bytes(), d.to_bytes());
+            let cookie = match rng.next() % 4 {
+                0 => bytes(&mut rng, 10),
+                n => vec![rng.next(); [0, 4, 8][usize::from(n - 1)]],
+            };
+            let d = V3Data { session: u32::from(u16r(&mut rng)), cookie, payload: body };
+            match d.to_bytes() {
+                Ok(b) => assert_eq!(V3Data::parse(&b, d.cookie.len()), Ok(d)),
+                Err(e) => {
+                    assert_eq!(e, Error::Cookie(d.cookie.len()));
+                    assert!(!matches!(d.cookie.len(), 0 | 4 | 8));
+                }
+            }
         }
+    }
+
+    /// What `m` reads back as once written, by the rules the writers
+    /// document: reserved bits zero, values cut to [`MAX_AVP_VALUE`],
+    /// AVPs past the limits left out, the type read from its number, and
+    /// a ZLB holding nothing.
+    fn written(m: &ControlMessage) -> ControlMessage {
+        let Some(t) = m.message_type else {
+            return ControlMessage::zlb();
+        };
+        let message_type =
+            if m.vendor == 0 { MessageType::from_code(t.code()) } else { MessageType::Other(t.code()) };
+        let mut used = AVP_HEADER_LEN + 2;
+        let mut avps = Vec::new();
+        for a in &m.avps {
+            if avps.len() + 1 >= MAX_AVPS || used + a.encoded_len() > MAX_MESSAGE {
+                break;
+            }
+            used += a.encoded_len();
+            let mut value = a.value.clone();
+            value.truncate(MAX_AVP_VALUE);
+            avps.push(Avp { reserved: 0, value, ..a.clone() });
+        }
+        ControlMessage { message_type: Some(message_type), mandatory: m.mandatory, vendor: m.vendor, reserved: 0, avps }
     }
 
     /// A deterministic linear congruential generator, so the fuzz loop
@@ -1391,7 +1512,7 @@ mod tests {
     /// the same.
     fn check(data: &[u8]) {
         if let Ok(p) = Packet::parse(data) {
-            let bytes = p.to_bytes();
+            let bytes = p.to_bytes().unwrap();
             assert!(bytes.len() <= data.len());
             assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
             let body = match &p {
@@ -1400,22 +1521,33 @@ mod tests {
                 _ => None,
             };
             if let Some(Ok(m)) = body.map(|b| ControlMessage::parse(b)) {
-                assert_eq!(ControlMessage::parse(&m.to_bytes()), Ok(m));
+                assert_eq!(ControlMessage::parse(&m.to_bytes()), Ok(written(&m)));
             }
         }
         for cookie in [4, 8] {
             if let Ok(d) = V3Data::parse(data, cookie) {
-                let bytes = d.to_bytes();
+                let bytes = d.to_bytes().unwrap();
                 assert_eq!(bytes.len(), data.len());
                 assert_eq!(bytes[4..], data[4..]);
                 assert_eq!(V3Data::parse(&bytes, cookie), Ok(d));
             }
         }
         if let Ok(m) = ControlMessage::parse(data) {
-            assert_eq!(ControlMessage::parse(&m.to_bytes()), Ok(m));
+            let body = m.to_bytes();
+            assert_eq!(ControlMessage::parse(&body), Ok(written(&m)));
+            // The body repeated past what a datagram holds: the writer
+            // cuts it between AVPs, so its message still reads.
+            if !body.is_empty() {
+                let long = body.repeat(MAX_MESSAGE / body.len() + 1);
+                let c = V3Control { connection: 1, ns: 0, nr: 0, payload: long };
+                let read = V3Control::parse(&c.to_bytes()).unwrap().message();
+                assert!(matches!(read, Ok(_) | Err(Error::TooManyAvps)), "{read:?}");
+            }
         }
         if let Ok((a, used)) = Avp::parse(data) {
-            assert_eq!(a.to_bytes(), data[..used]);
+            let mut zeroed = data[..used].to_vec();
+            zeroed[0] &= 0xc3;
+            assert_eq!(a.to_bytes(), zeroed);
         }
     }
 

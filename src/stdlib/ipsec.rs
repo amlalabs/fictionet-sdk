@@ -28,7 +28,10 @@
 //! it on the wire. So is an AH payload length too short for the fixed
 //! fields, and a pad length longer than the plaintext. The AH reserved
 //! field is kept as read, since RFC 4302 has it count in the ICV, and is
-//! zero in every header a world builds with [`AhHeader::new`].
+//! zero in every header a world builds with [`AhHeader::new`]. The AH
+//! ICV field can end in padding after the algorithm's tag, which also
+//! counts in the ICV as sent, so [`AhHeader::to_bytes_for_icv`] takes the
+//! tag's length and zeroes only the tag.
 //! Writers refuse what a reader would refuse, so bytes they return always
 //! read back.
 //!
@@ -84,12 +87,19 @@ pub const MAX_ICV: usize = MAX_AH_LEN - AH_FIXED_LEN;
 /// The most padding bytes an ESP trailer can hold, since the pad length
 /// is one byte.
 pub const MAX_PADDING: usize = 255;
-/// The largest block size [`Plaintext::padded`] pads to. Padding to it
-/// never needs more than [`MAX_PADDING`] bytes.
+/// The largest block size [`Plaintext::padded`] pads to.
 pub const MAX_BLOCK_SIZE: usize = 256;
-/// The longest packet, datagram or plaintext this module reads or writes:
-/// the most an IPv4 total length or an IPv6 payload length field allows.
+/// The longest ESP or AH packet, or plaintext, this module reads or
+/// writes: the most an IPv4 total length or an IPv6 payload length field
+/// allows.
 pub const MAX_PACKET: usize = 65535;
+/// The longest UDP payload, and so the longest [`Datagram`], this module
+/// reads or writes: 65535 bytes less the 8-byte UDP header. Over IPv6 a
+/// datagram this long can be sent.
+pub const MAX_DATAGRAM: usize = MAX_PACKET - 8;
+/// The longest UDP payload that fits in one IPv4 packet: [`MAX_DATAGRAM`]
+/// less the 20-byte IPv4 header. [`Datagram::fits_ipv4`] checks it.
+pub const MAX_DATAGRAM_IPV4: usize = MAX_DATAGRAM - 20;
 /// The one byte of a NAT keepalive datagram, from RFC 3948, section 2.3.
 pub const KEEPALIVE: u8 = 0xff;
 /// The four zero bytes that start an IKE message on port 4500, where an
@@ -125,7 +135,8 @@ pub enum IpsecError {
     /// The bytes end before the packet does. Writers return it for an ESP
     /// payload shorter than the trailer's two bytes.
     Truncated,
-    /// The bytes are longer than [`MAX_PACKET`].
+    /// The bytes are longer than [`MAX_PACKET`], or a datagram is longer
+    /// than [`MAX_DATAGRAM`].
     TooLong,
     /// The SPI is zero, which RFC 4303 and RFC 4302 reserve for local use
     /// and forbid on the wire.
@@ -139,7 +150,8 @@ pub enum IpsecError {
     /// plaintext holds.
     PadLength(u8),
     /// An ESP trailer with this many padding bytes cannot be written: the
-    /// most is [`MAX_PADDING`].
+    /// most is [`MAX_PADDING`]. [`Plaintext::padded`] returns it for a
+    /// block size that would need more.
     Padding(usize),
     /// [`Plaintext::padded`] was asked for a block size of zero, or above
     /// [`MAX_BLOCK_SIZE`].
@@ -272,11 +284,18 @@ impl Plaintext {
 
     /// The plaintext for `data`, with the default padding of RFC 4303,
     /// section 2.4 (the bytes 1, 2, 3, and so on), just long enough that
-    /// the whole is a multiple of `block_size` bytes. RFC 4303 asks for a
-    /// multiple of 4 at least, and of the cipher's block size if it has
-    /// one. It fails with [`IpsecError::BlockSize`] for a block size of 0
-    /// or above [`MAX_BLOCK_SIZE`], and with [`IpsecError::TooLong`] if the
-    /// whole would be longer than [`MAX_PACKET`].
+    /// the whole is a multiple of `block_size` bytes and of 4 bytes. RFC
+    /// 4303 asks for both: a multiple of the cipher's block size, and a
+    /// multiple of 4 whatever the cipher, so that an ICV after it starts
+    /// on a 4-byte boundary. For NULL encryption, pass a block size of 1.
+    /// Any IV the algorithm puts before the ciphertext must keep that
+    /// boundary too; the usual ones, of 8 or 16 bytes, do.
+    ///
+    /// It fails with [`IpsecError::BlockSize`] for a block size of 0 or
+    /// above [`MAX_BLOCK_SIZE`], with [`IpsecError::Padding`] if the
+    /// padding would be longer than [`MAX_PADDING`] (only a block size
+    /// above 64 that is not a multiple of 4 can need that), and with [`IpsecError::TooLong`] if
+    /// the whole would be longer than [`MAX_PACKET`].
     pub fn padded(data: Vec<u8>, next_header: u8, block_size: usize) -> Result<Plaintext, IpsecError> {
         if block_size == 0 || block_size > MAX_BLOCK_SIZE {
             return Err(IpsecError::BlockSize(block_size));
@@ -284,8 +303,17 @@ impl Plaintext {
         if data.len() > MAX_PACKET {
             return Err(IpsecError::TooLong);
         }
-        let used = (data.len() + ESP_TRAILER_LEN) % block_size;
-        let pad = (block_size - used) % block_size;
+        // The least common multiple of the block size and 4.
+        let align = match block_size % 4 {
+            0 => block_size,
+            2 => block_size * 2,
+            _ => block_size * 4,
+        };
+        let used = (data.len() + ESP_TRAILER_LEN) % align;
+        let pad = (align - used) % align;
+        if pad > MAX_PADDING {
+            return Err(IpsecError::Padding(pad));
+        }
         let padding = (1..=pad).map(|i| i as u8).collect();
         let p = Plaintext { data, padding, next_header };
         if p.len() > MAX_PACKET {
@@ -347,8 +375,11 @@ pub struct AhHeader {
     pub spi: u32,
     /// The low 32 bits of the sender's packet counter, as in ESP.
     pub sequence: u32,
-    /// The integrity check value, whose length the algorithm fixes. A
-    /// multiple of 4 bytes, at most [`MAX_ICV`].
+    /// The whole ICV field: the integrity check value (the tag), whose
+    /// length the algorithm fixes, then any padding the sender added to
+    /// keep the header a multiple of 4 bytes (8 in IPv6). A multiple of 4
+    /// bytes, at most [`MAX_ICV`]. [`AhHeader::split_icv`] tells the tag
+    /// from the padding.
     pub icv: Vec<u8>,
 }
 
@@ -408,17 +439,27 @@ impl AhHeader {
         Ok(())
     }
 
-    fn write(&self, icv: bool, out: &mut Vec<u8>) {
+    /// Writes the header, with the first `zeroed` bytes of the ICV field
+    /// set to zero.
+    fn write(&self, zeroed: usize, out: &mut Vec<u8>) {
         out.push(self.next_header);
         out.push((self.len() / 4 - 2) as u8);
         out.extend_from_slice(&self.reserved.to_be_bytes());
         out.extend_from_slice(&self.spi.to_be_bytes());
         out.extend_from_slice(&self.sequence.to_be_bytes());
-        if icv {
-            out.extend_from_slice(&self.icv);
-        } else {
-            out.resize(out.len() + self.icv.len(), 0);
+        let zeroed = zeroed.min(self.icv.len());
+        out.resize(out.len() + zeroed, 0);
+        out.extend_from_slice(&self.icv[zeroed..]);
+    }
+
+    /// Splits the ICV field into the tag of `tag_len` bytes, which the
+    /// algorithm fixes, and the padding after it. It fails with
+    /// [`IpsecError::Truncated`] if the field is shorter than the tag.
+    pub fn split_icv(&self, tag_len: usize) -> Result<(&[u8], &[u8]), IpsecError> {
+        if tag_len > self.icv.len() {
+            return Err(IpsecError::Truncated);
         }
+        Ok(self.icv.split_at(tag_len))
     }
 
     /// The header's bytes. It fails with [`IpsecError::ZeroSpi`] for an
@@ -427,18 +468,22 @@ impl AhHeader {
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpsecError> {
         self.check()?;
         let mut out = Vec::with_capacity(self.len());
-        self.write(true, &mut out);
+        self.write(0, &mut out);
         Ok(out)
     }
 
-    /// The header's bytes with the ICV set to zero, as they go into the
-    /// ICV's own computation (RFC 4302, section 3.3.3.1). The reserved
-    /// field keeps its value. It fails as
-    /// [`AhHeader::to_bytes`] does.
-    pub fn to_bytes_for_icv(&self) -> Result<Vec<u8>, IpsecError> {
+    /// The header's bytes as they go into the ICV's own computation (RFC
+    /// 4302, section 3.3.3): the first `tag_len` bytes of the ICV field,
+    /// the algorithm's tag, set to zero. The reserved field and any
+    /// padding after the tag keep their values, since section 3.3.3.2.1
+    /// counts the padding as sent. It fails as [`AhHeader::to_bytes`]
+    /// does, and with [`IpsecError::Truncated`] if the ICV field is
+    /// shorter than `tag_len`.
+    pub fn to_bytes_for_icv(&self, tag_len: usize) -> Result<Vec<u8>, IpsecError> {
         self.check()?;
+        self.split_icv(tag_len)?;
         let mut out = Vec::with_capacity(self.len());
-        self.write(false, &mut out);
+        self.write(tag_len, &mut out);
         Ok(out)
     }
 }
@@ -492,7 +537,7 @@ impl AhPacket {
             return Err(IpsecError::TooLong);
         }
         let mut out = Vec::with_capacity(total);
-        self.header.write(true, &mut out);
+        self.header.write(0, &mut out);
         out.extend_from_slice(&self.payload);
         Ok(out)
     }
@@ -512,12 +557,13 @@ pub enum Datagram {
 }
 
 impl Datagram {
-    /// Reads the datagram whose UDP payload is `b`.
+    /// Reads the datagram whose UDP payload is `b`. It fails with
+    /// [`IpsecError::TooLong`] for more than [`MAX_DATAGRAM`] bytes.
     pub fn parse(b: &[u8]) -> Result<Datagram, IpsecError> {
         if b == [KEEPALIVE] {
             return Ok(Datagram::Keepalive);
         }
-        if b.len() > MAX_PACKET {
+        if b.len() > MAX_DATAGRAM {
             return Err(IpsecError::TooLong);
         }
         if b.len() < NON_ESP_MARKER.len() {
@@ -530,13 +576,18 @@ impl Datagram {
     }
 
     /// The datagram's UDP payload. It fails as [`EspPacket::to_bytes`]
-    /// does for ESP, and with [`IpsecError::TooLong`] for an IKE message
-    /// that would make it longer than [`MAX_PACKET`].
+    /// does for ESP, and with [`IpsecError::TooLong`] if the payload would
+    /// be longer than [`MAX_DATAGRAM`]. Over IPv4 a payload longer than
+    /// [`MAX_DATAGRAM_IPV4`] cannot be sent; [`Datagram::fits_ipv4`] says
+    /// whether it is.
     pub fn to_bytes(&self) -> Result<Vec<u8>, IpsecError> {
+        if self.wire_len() > MAX_DATAGRAM {
+            return Err(IpsecError::TooLong);
+        }
         match self {
             Datagram::Keepalive => Ok(vec![KEEPALIVE]),
             Datagram::Ike(message) => {
-                if message.len() > MAX_PACKET - NON_ESP_MARKER.len() {
+                if message.len() > MAX_DATAGRAM - NON_ESP_MARKER.len() {
                     return Err(IpsecError::TooLong);
                 }
                 let mut out = Vec::with_capacity(NON_ESP_MARKER.len() + message.len());
@@ -545,6 +596,21 @@ impl Datagram {
                 Ok(out)
             }
             Datagram::Esp(p) => p.to_bytes(),
+        }
+    }
+
+    /// Whether the datagram's UDP payload fits in one IPv4 packet: at most
+    /// [`MAX_DATAGRAM_IPV4`] bytes.
+    pub fn fits_ipv4(&self) -> bool {
+        self.wire_len() <= MAX_DATAGRAM_IPV4
+    }
+
+    /// How many bytes the UDP payload takes.
+    fn wire_len(&self) -> usize {
+        match self {
+            Datagram::Keepalive => 1,
+            Datagram::Ike(m) => NON_ESP_MARKER.len().saturating_add(m.len()),
+            Datagram::Esp(p) => ESP_HEADER_LEN.saturating_add(p.payload.len()),
         }
     }
 }
@@ -600,6 +666,14 @@ impl Packet {
     }
 }
 
+/// The longest packet of the given kind.
+fn max_len(kind: Kind) -> usize {
+    match kind {
+        Kind::Esp | Kind::Ah => MAX_PACKET,
+        Kind::Udp => MAX_DATAGRAM,
+    }
+}
+
 /// The error the first [`PREFIX_LEN`] bytes of a packet already show.
 fn prefix_error(kind: Kind, b: &[u8]) -> Option<IpsecError> {
     match kind {
@@ -635,14 +709,15 @@ impl Decoder {
             return Err(e);
         }
         let checked = self.buf.len() >= PREFIX_LEN;
+        let max = max_len(self.kind);
         // One byte past the limit is enough to know the packet is too long.
-        let room = (MAX_PACKET + 1).saturating_sub(self.buf.len());
+        let room = (max + 1).saturating_sub(self.buf.len());
         self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
         if !checked
             && let Some(e) = prefix_error(self.kind, &self.buf) {
                 return Err(self.fail(e));
             }
-        if self.buf.len() > MAX_PACKET {
+        if self.buf.len() > max {
             return Err(self.fail(IpsecError::TooLong));
         }
         Ok(())
@@ -797,14 +872,36 @@ mod tests {
     fn padding_to_each_block_size() {
         for block in 1..=MAX_BLOCK_SIZE {
             for n in 0..40 {
-                let p = Plaintext::padded(vec![0x55; n], next_header::UDP, block).unwrap();
+                let p = match Plaintext::padded(vec![0x55; n], next_header::UDP, block) {
+                    Ok(p) => p,
+                    Err(IpsecError::Padding(pad)) => {
+                        // Only a block size above 64 that is not a multiple
+                        // of 4 can need more than 255 bytes to reach a
+                        // multiple of both it and 4.
+                        assert!(pad > MAX_PADDING && block > 64 && block % 4 != 0, "block {block}, {n} bytes");
+                        continue;
+                    }
+                    Err(e) => panic!("block {block}, {n} bytes: {e}"),
+                };
+                // RFC 4303, section 2.4: a multiple of the block size and
+                // of 4, with no more padding than that needs.
                 assert_eq!(p.len() % block, 0, "block {block}, {n} bytes");
-                assert!(p.padding.len() < block && p.padding.len() <= MAX_PADDING);
+                assert_eq!(p.len() % 4, 0, "block {block}, {n} bytes");
+                let align = (1..).map(|k| k * block).find(|m| m % 4 == 0).unwrap();
+                assert!(p.padding.len() < align && p.padding.len() <= MAX_PADDING);
                 assert!(p.has_default_padding());
                 let b = p.to_bytes().unwrap();
                 assert_eq!(Plaintext::parse(&b), Ok(p));
             }
         }
+        // Block sizes up to 64 never need too much padding.
+        for block in 1..=64 {
+            for n in 0..300 {
+                assert!(Plaintext::padded(vec![0; n], 4, block).is_ok(), "block {block}, {n} bytes");
+            }
+        }
+        // A block of 255 bytes aligns to 1020, which can need too much.
+        assert_eq!(Plaintext::padded(vec![], 4, 255), Err(IpsecError::Padding(1018)));
         // AES-CBC's 16-byte blocks: 10 + 2 bytes need 4 of padding.
         let p = Plaintext::padded(vec![0; 10], 4, 16).unwrap();
         assert_eq!(p.padding, [1, 2, 3, 4]);
@@ -812,6 +909,73 @@ mod tests {
         let p = Plaintext::padded(vec![0; 255], 4, 256).unwrap();
         assert_eq!(p.padding.len(), 255);
         assert_eq!(p.padding[254], 255);
+    }
+
+    #[test]
+    fn null_encryption_pads_to_four_bytes() {
+        // RFC 4303, section 2.4, with RFC 2410's block size of 1: "ping"
+        // and the trailer take 6 bytes, so 2 bytes of padding make 8.
+        let p = Plaintext::padded(b"ping".to_vec(), next_header::IPV4, 1).unwrap();
+        assert_eq!(p.to_bytes().unwrap(), [b'p', b'i', b'n', b'g', 1, 2, 2, 4]);
+        // Block sizes of 2 and 6 align to 4 and 12.
+        let p = Plaintext::padded(vec![0; 3], 4, 2).unwrap();
+        assert_eq!(p.padding, [1, 2, 3]);
+        let p = Plaintext::padded(vec![0; 3], 4, 6).unwrap();
+        assert_eq!(p.len(), 12);
+        // Already aligned: no padding.
+        let p = Plaintext::padded(vec![0; 6], 4, 1).unwrap();
+        assert!(p.padding.is_empty());
+    }
+
+    #[test]
+    fn ah_icv_padding_goes_into_the_icv() {
+        // RFC 4302, section 3.3.3.2.1: in IPv6, a 16-byte tag needs 4 bytes
+        // of padding to keep the header a multiple of 8 bytes. The padding
+        // counts in the ICV as sent; only the tag is zeroed.
+        let mut b = vec![next_header::TCP, 6, 0, 0, 0, 0, 0x10, 0, 0, 0, 0, 7];
+        b.extend_from_slice(&[0x77; 16]);
+        b.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        let p = AhPacket::parse(&b).unwrap();
+        assert!(p.header.is_ipv6_aligned());
+        assert_eq!(p.header.split_icv(16), Ok((&[0x77; 16][..], &[0xaa, 0xbb, 0xcc, 0xdd][..])));
+        let mut want = b[..12].to_vec();
+        want.extend_from_slice(&[0; 16]);
+        want.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert_eq!(p.header.to_bytes_for_icv(16).unwrap(), want);
+        // A tag that fills the field zeroes all of it.
+        assert_eq!(&p.header.to_bytes_for_icv(20).unwrap()[12..], [0; 20]);
+        assert_eq!(p.header.split_icv(21), Err(IpsecError::Truncated));
+        // The bytes as sent are unchanged.
+        assert_eq!(p.to_bytes().unwrap(), b);
+    }
+
+    #[test]
+    fn udp_payload_limits() {
+        // RFC 768: a UDP payload is at most 65535 - 8 bytes, and over IPv4
+        // 20 more go to the IP header. Longer datagrams cannot be sent.
+        assert_eq!(MAX_DATAGRAM, 65527);
+        assert_eq!(MAX_DATAGRAM_IPV4, 65507);
+        assert_eq!(Datagram::Ike(vec![0; 65_531]).to_bytes(), Err(IpsecError::TooLong));
+        let ike = Datagram::Ike(vec![0; MAX_DATAGRAM - 4]);
+        assert_eq!(ike.to_bytes().unwrap().len(), MAX_DATAGRAM);
+        assert!(!ike.fits_ipv4());
+        assert!(Datagram::Ike(vec![0; MAX_DATAGRAM_IPV4 - 4]).fits_ipv4());
+        assert!(!Datagram::Ike(vec![0; MAX_DATAGRAM_IPV4 - 3]).fits_ipv4());
+        assert!(Datagram::Keepalive.fits_ipv4());
+        // ESP inside UDP has the same limit, though ESP alone has more.
+        let big = esp(1, 1, &vec![0; MAX_DATAGRAM - 7]);
+        assert!(big.to_bytes().is_ok());
+        assert_eq!(Datagram::Esp(big).to_bytes(), Err(IpsecError::TooLong));
+        let fits = Datagram::Esp(esp(1, 1, &vec![0; MAX_DATAGRAM - 8]));
+        let bytes = fits.to_bytes().unwrap();
+        assert_eq!(check(Kind::Udp, &bytes), Ok(Packet::Udp(fits)));
+        // The reader holds to the same limit, all at once or in pieces.
+        let mut long = bytes;
+        long.push(0);
+        assert_eq!(check(Kind::Udp, &long), Err(IpsecError::TooLong));
+        let mut d = Decoder::new(Kind::Udp);
+        assert_eq!(d.feed(&long), Err(IpsecError::TooLong));
+        assert_eq!(d.buffered(), 0);
     }
 
     #[test]
@@ -830,7 +994,7 @@ mod tests {
         assert!(h.is_ipv6_aligned() && !h.is_empty());
         assert_eq!(AhPacket::split(&b).unwrap(), (h.clone(), &b"segment"[..]));
         // For the ICV's own computation, the ICV is zero.
-        let zeroed = h.to_bytes_for_icv().unwrap();
+        let zeroed = h.to_bytes_for_icv(12).unwrap();
         assert_eq!(&zeroed[..12], &b[..12]);
         assert_eq!(&zeroed[12..], [0; 12]);
         // A 16-byte ICV makes a 28-byte header: fine in IPv4, not in IPv6.
@@ -869,7 +1033,7 @@ mod tests {
         // must keep the bytes that came in.
         let b = [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0xee, 0xee, 0xee, 0xee];
         let p = AhPacket::parse(&b).unwrap();
-        assert_eq!(p.header.to_bytes_for_icv().unwrap(), [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(p.header.to_bytes_for_icv(4).unwrap(), [4, 2, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 0]);
         assert_eq!(p.to_bytes().unwrap(), b);
     }
 
@@ -933,11 +1097,13 @@ mod tests {
         assert_eq!(esp(1, 1, &vec![0; MAX_PACKET - 7]).to_bytes(), Err(IpsecError::TooLong));
         assert!(esp(1, 1, &vec![0; MAX_PACKET - 8]).to_bytes().is_ok());
         assert_eq!(Datagram::Esp(esp(0, 1, &[0, 4])).to_bytes(), Err(IpsecError::ZeroSpi));
-        assert_eq!(Datagram::Ike(vec![0; MAX_PACKET - 3]).to_bytes(), Err(IpsecError::TooLong));
-        assert!(Datagram::Ike(vec![0; MAX_PACKET - 4]).to_bytes().is_ok());
+        assert_eq!(Datagram::Ike(vec![0; MAX_DATAGRAM - 3]).to_bytes(), Err(IpsecError::TooLong));
+        assert!(Datagram::Ike(vec![0; MAX_DATAGRAM - 4]).to_bytes().is_ok());
 
         assert_eq!(ah(4, 0, 1, &[]).to_bytes(), Err(IpsecError::ZeroSpi));
-        assert_eq!(ah(4, 0, 1, &[]).to_bytes_for_icv(), Err(IpsecError::ZeroSpi));
+        assert_eq!(ah(4, 0, 1, &[]).to_bytes_for_icv(0), Err(IpsecError::ZeroSpi));
+        assert_eq!(ah(4, 1, 1, &[0; 12]).to_bytes_for_icv(16), Err(IpsecError::Truncated));
+        assert_eq!(ah(4, 1, 1, &[0; 12]).to_bytes_for_icv(usize::MAX), Err(IpsecError::Truncated));
         assert_eq!(ah(4, 1, 1, &[0; 3]).to_bytes(), Err(IpsecError::IcvLength(3)));
         assert_eq!(ah(4, 1, 1, &[0; MAX_ICV + 4]).to_bytes(), Err(IpsecError::IcvLength(MAX_ICV + 4)));
         let p = AhPacket { header: ah(4, 1, 1, &[0; 3]), payload: vec![] };
@@ -959,7 +1125,9 @@ mod tests {
         assert_eq!(Plaintext::padded(vec![], 4, 257), Err(IpsecError::BlockSize(257)));
         assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 1], 4, 1), Err(IpsecError::TooLong));
         assert_eq!(Plaintext::padded(vec![0; MAX_PACKET + 1], 4, 1), Err(IpsecError::TooLong));
-        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 2], 4, 1).unwrap().len(), MAX_PACKET);
+        // 65535 is not a multiple of 4, so padding to it overflows.
+        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 2], 4, 1), Err(IpsecError::TooLong));
+        assert_eq!(Plaintext::padded(vec![0; MAX_PACKET - 5], 4, 1).unwrap().len(), MAX_PACKET - 3);
     }
 
     #[test]
@@ -1155,8 +1323,14 @@ mod tests {
             let n = rng.below(64);
             let data = rng.bytes(n);
             let block = rng.below(MAX_BLOCK_SIZE) + 1;
-            let plain = Plaintext::padded(data, rng.next() as u8, block).unwrap();
-            assert_eq!(Plaintext::parse(&plain.to_bytes().unwrap()), Ok(plain));
+            match Plaintext::padded(data, rng.next() as u8, block) {
+                Ok(plain) => {
+                    assert_eq!(plain.len() % 4, 0);
+                    assert_eq!(plain.len() % block, 0);
+                    assert_eq!(Plaintext::parse(&plain.to_bytes().unwrap()), Ok(plain));
+                }
+                Err(e) => assert!(matches!(e, IpsecError::Padding(n) if n > MAX_PADDING), "{e}"),
+            }
         }
     }
 

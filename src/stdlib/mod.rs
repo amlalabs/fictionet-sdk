@@ -144,6 +144,7 @@ pub mod geneve;
 pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
+pub mod http3;
 pub mod icmp;
 pub mod igmp;
 pub mod ike;

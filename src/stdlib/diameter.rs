@@ -85,8 +85,9 @@ pub const VENDOR_AVP_HEADER_LEN: usize = 12;
 pub const MAX_MESSAGE: usize = 0x00ff_fffc;
 /// The longest message a [`Decoder`] made by [`Decoder::new`] accepts.
 pub const DEFAULT_LIMIT: usize = 65_536;
-/// The most data one AVP may carry, so that it fits in a message with a
-/// vendor ID. Writers cut longer data to this length.
+/// The most data one AVP with a vendor ID can carry in a message. One
+/// without a vendor ID can carry 4 bytes more. [`Value::to_bytes`] cuts
+/// longer data to this length, so a value fits either way.
 pub const MAX_AVP_DATA: usize = MAX_MESSAGE - HEADER_LEN - VENDOR_AVP_HEADER_LEN;
 /// The most AVPs in one list: a message's, or one grouped AVP's.
 pub const MAX_AVPS: usize = 4096;
@@ -278,8 +279,9 @@ pub enum Error {
     MessageLength(u32),
     /// The message length was above the reader's limit.
     TooBig(u32),
-    /// An AVP's length was shorter than its header or ran past the bytes
-    /// that hold it.
+    /// An AVP's length was shorter than its header, ran past the bytes
+    /// that hold it, left out the padding an AVP in a list needs, or did
+    /// not match its format's fixed size.
     AvpLength {
         /// The AVP's code, or 0 if fewer than 4 bytes were left.
         code: u32,
@@ -299,12 +301,24 @@ pub enum Error {
         /// The format its data was read as.
         format: Format,
     },
+    /// The header's flags were a combination RFC 6733 forbids: the E flag
+    /// on a request, or the T flag on an answer. It holds the flags byte.
+    /// [`Message::check_header`] reports it.
+    HeaderBits(u8),
+    /// An AVP's flags were a combination RFC 6733 forbids: the V flag with
+    /// vendor ID 0. [`check`] reports it.
+    AvpBits {
+        /// The AVP's code.
+        code: u32,
+    },
 }
 
 impl Error {
     /// The Result-Code a server answers this error with.
     pub fn result_code(self) -> u32 {
         match self {
+            Error::HeaderBits(_) => result::INVALID_HDR_BITS,
+            Error::AvpBits { .. } => result::INVALID_AVP_BITS,
             Error::Version(_) => result::UNSUPPORTED_VERSION,
             Error::MessageLength(_) => result::INVALID_MESSAGE_LENGTH,
             Error::TooBig(_) | Error::TooManyAvps | Error::TooDeep(_) => result::RESOURCES_EXCEEDED,
@@ -324,6 +338,8 @@ impl std::fmt::Display for Error {
             Error::TooManyAvps => write!(f, "more than {MAX_AVPS} AVPs in one list"),
             Error::TooDeep(code) => write!(f, "grouped AVP {code} nests deeper than {MAX_DEPTH} levels"),
             Error::Value { code, format } => write!(f, "AVP {code} is not a valid {}", format.name()),
+            Error::HeaderBits(flags) => write!(f, "header flags {flags:#04x} are a forbidden combination"),
+            Error::AvpBits { code } => write!(f, "AVP {code} has the vendor flag with vendor ID 0"),
         }
     }
 }
@@ -341,11 +357,14 @@ pub struct Message {
     /// The P flag: agents may proxy, relay or redirect it.
     pub proxiable: bool,
     /// The E flag: an answer that reports a protocol error. RFC 6733
-    /// forbids it in a request, and leaves that check to the receiver.
+    /// forbids it in a request. Readers accept it there, and
+    /// [`Message::check_header`] reports it.
     pub error: bool,
-    /// The T flag: a request sent again after a link failed.
+    /// The T flag: a request sent again after a link failed. RFC 6733
+    /// forbids it in an answer, which [`Message::check_header`] reports.
     pub retransmit: bool,
-    /// The command code. Only its low 24 bits go on the wire.
+    /// The command code. Only its low 24 bits go on the wire, so
+    /// [`Message::try_to_bytes`] refuses a larger one.
     pub command: u32,
     /// The application the message belongs to, 0 for the base protocol.
     pub application: u32,
@@ -453,24 +472,67 @@ impl Message {
             return Err(Error::TooBig(length));
         }
         let Some(whole) = b.get(..len) else { return Ok(None) };
-        let f = whole[4];
-        let message = Message {
+        let message = Message { avps: Avp::parse_list(&whole[HEADER_LEN..])?, ..Message::header(whole) };
+        Ok(Some((message, len)))
+    }
+
+    /// The header fields of the at least [`HEADER_LEN`] bytes `h`, with
+    /// no AVPs.
+    fn header(h: &[u8]) -> Message {
+        let f = h[4];
+        Message {
             request: f & flags::REQUEST != 0,
             proxiable: f & flags::PROXIABLE != 0,
             error: f & flags::ERROR != 0,
             retransmit: f & flags::RETRANSMIT != 0,
-            command: be24(whole, 5),
-            application: be32(whole, 8),
-            hop_by_hop: be32(whole, 12),
-            end_to_end: be32(whole, 16),
-            avps: Avp::parse_list(&whole[HEADER_LEN..])?,
-        };
-        Ok(Some((message, len)))
+            command: be24(h, 5),
+            application: be32(h, 8),
+            hop_by_hop: be32(h, 12),
+            end_to_end: be32(h, 16),
+            avps: Vec::new(),
+        }
+    }
+
+    /// Checks the header's flags against RFC 6733, section 3: the E flag
+    /// is never set in a request, and the T flag never in an answer.
+    /// Readers accept either, since the answer to them is
+    /// [`result::INVALID_HDR_BITS`] and the connection stays up.
+    pub fn check_header(&self) -> Result<(), Error> {
+        if (self.request && self.error) || (!self.request && self.retransmit) {
+            return Err(Error::HeaderBits(self.flags()));
+        }
+        Ok(())
+    }
+
+    /// The message's bytes, as [`Message::to_bytes`] writes them, or
+    /// `None` if writing would change the message or RFC 6733 forbids
+    /// sending it: a command above 24 bits, more than [`MAX_AVPS`] AVPs,
+    /// more than [`MAX_MESSAGE`] bytes, an AVP with vendor ID 0, or flags
+    /// that [`Message::check_header`] refuses.
+    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
+        if self.command > 0xff_ffff
+            || self.avps.len() > MAX_AVPS
+            || self.check_header().is_err()
+            || self.avps.iter().any(|a| a.vendor == Some(0))
+        {
+            return None;
+        }
+        let mut len = HEADER_LEN;
+        for a in &self.avps {
+            // Both terms are at most MAX_MESSAGE + 3, so neither overflows.
+            let n = a.header_len().saturating_add(a.data.len()).min(MAX_MESSAGE + 1);
+            len += padded(n);
+            if len > MAX_MESSAGE {
+                return None;
+            }
+        }
+        Some(self.to_bytes())
     }
 
     /// The message's bytes. AVPs past [`MAX_AVPS`], or past what fits in
     /// [`MAX_MESSAGE`] bytes, are left out, so the result always reads
-    /// back with [`Message::parse`].
+    /// back with [`Message::parse`]. [`Message::try_to_bytes`] refuses
+    /// instead.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER_LEN);
         out.push(VERSION);
@@ -508,7 +570,8 @@ pub struct Avp {
     /// The AVP code. With no vendor ID, codes are assigned by IANA.
     pub code: u32,
     /// The vendor ID, which puts the code in that vendor's space. Its
-    /// presence sets the V flag.
+    /// presence sets the V flag. RFC 6733 forbids vendor ID 0, which
+    /// [`check`] reports and [`Message::try_to_bytes`] refuses.
     pub vendor: Option<u32>,
     /// The M flag: the receiver must understand this AVP, or reject the
     /// message with [`result::AVP_UNSUPPORTED`].
@@ -520,15 +583,27 @@ pub struct Avp {
 }
 
 impl Avp {
-    /// An AVP with code `code` holding `value`, with no vendor ID and the
-    /// mandatory flag set, as the base protocol's AVPs have.
+    /// An AVP with code `code` holding `value`, with no vendor ID. The
+    /// mandatory flag follows RFC 6733, section 4.5: clear for
+    /// Product-Name, Firmware-Revision, Error-Message and
+    /// Error-Reporting-Host, and set for every other code.
     pub fn new(code: u32, value: &Value) -> Avp {
-        Avp { code, vendor: None, mandatory: true, protected: false, data: value.to_bytes() }
+        let mandatory = !matches!(
+            code,
+            avp::PRODUCT_NAME | avp::FIRMWARE_REVISION | avp::ERROR_MESSAGE | avp::ERROR_REPORTING_HOST
+        );
+        Avp { code, vendor: None, mandatory, protected: false, data: value.to_bytes() }
+    }
+
+    /// The length of this AVP's header: 12 with a vendor ID, 8 without.
+    fn header_len(&self) -> usize {
+        if self.vendor.is_some() { VENDOR_AVP_HEADER_LEN } else { AVP_HEADER_LEN }
     }
 
     /// Reads the AVP at the start of `b`. It returns the AVP and how many
-    /// bytes it took, padding included. The last AVP in `b` may leave out
-    /// its padding, as some peers do.
+    /// bytes it took, padding included. An AVP that ends `b` may leave out
+    /// its padding, as some peers do; [`Avp::parse_list`] does not allow
+    /// that.
     pub fn parse(b: &[u8]) -> Result<(Avp, usize), Error> {
         if b.len() < AVP_HEADER_LEN {
             let code = if b.len() >= 4 { be32(b, 0) } else { 0 };
@@ -554,7 +629,8 @@ impl Avp {
     }
 
     /// Reads a list of AVPs that fills `b`: a message's body, or a
-    /// grouped AVP's data.
+    /// grouped AVP's data. Each AVP, the last included, must have its
+    /// padding, since RFC 6733 (section 4.2) counts it in the list.
     pub fn parse_list(b: &[u8]) -> Result<Vec<Avp>, Error> {
         let mut avps = Vec::new();
         let mut at = 0;
@@ -563,14 +639,19 @@ impl Avp {
                 return Err(Error::TooManyAvps);
             }
             let (avp, used) = Avp::parse(rest)?;
+            let len = avp.header_len() + avp.data.len();
+            if used < padded(len) {
+                return Err(Error::AvpLength { code: avp.code, length: len as u32 });
+            }
             avps.push(avp);
             at += used;
         }
         Ok(avps)
     }
 
-    /// The AVP's bytes, padded to a multiple of 4. Data past
-    /// [`MAX_AVP_DATA`] is left out.
+    /// The AVP's bytes, padded to a multiple of 4. Data past what fits in
+    /// a message of [`MAX_MESSAGE`] bytes is left out: past
+    /// [`MAX_AVP_DATA`] with a vendor ID, and 4 bytes more without one.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.write(&mut out);
@@ -578,15 +659,12 @@ impl Avp {
     }
 
     fn write(&self, out: &mut Vec<u8>) {
-        let data = &self.data[..self.data.len().min(MAX_AVP_DATA)];
+        let header = self.header_len();
+        let data = &self.data[..self.data.len().min(MAX_MESSAGE - HEADER_LEN - header)];
         let mut f = 0;
-        let header = match self.vendor {
-            Some(_) => {
-                f |= avp_flags::VENDOR;
-                VENDOR_AVP_HEADER_LEN
-            }
-            None => AVP_HEADER_LEN,
-        };
+        if self.vendor.is_some() {
+            f |= avp_flags::VENDOR;
+        }
         if self.mandatory {
             f |= avp_flags::MANDATORY;
         }
@@ -604,20 +682,24 @@ impl Avp {
         out.resize(out.len() + (padded(len) - len), 0);
     }
 
-    /// Reads the data as `format`.
+    /// Reads the data as `format`. Data of the wrong size for a
+    /// fixed-size format, such as 3 bytes for an Unsigned32, is an
+    /// [`Error::AvpLength`], as RFC 6733 (section 7.1.5) answers it.
     pub fn value(&self, format: Format) -> Result<Value, Error> {
         let bad = Error::Value { code: self.code, format };
         let d = &self.data[..];
+        let length = (self.header_len() + d.len()).min(u32::MAX as usize) as u32;
+        let size = Error::AvpLength { code: self.code, length };
         Ok(match format {
             Format::OctetString => Value::OctetString(d.to_vec()),
-            Format::Integer32 => Value::Integer32(i32::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Integer64 => Value::Integer64(i64::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Unsigned32 => Value::Unsigned32(u32::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Unsigned64 => Value::Unsigned64(u64::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Float32 => Value::Float32(f32::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Float64 => Value::Float64(f64::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Enumerated => Value::Enumerated(i32::from_be_bytes(d.try_into().map_err(|_| bad)?)),
-            Format::Time => Value::Time(u32::from_be_bytes(d.try_into().map_err(|_| bad)?)),
+            Format::Integer32 => Value::Integer32(i32::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Integer64 => Value::Integer64(i64::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Unsigned32 => Value::Unsigned32(u32::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Unsigned64 => Value::Unsigned64(u64::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Float32 => Value::Float32(f32::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Float64 => Value::Float64(f64::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Enumerated => Value::Enumerated(i32::from_be_bytes(d.try_into().map_err(|_| size)?)),
+            Format::Time => Value::Time(u32::from_be_bytes(d.try_into().map_err(|_| size)?)),
             Format::Grouped => Value::Grouped(Avp::parse_list(d)?),
             Format::Address => Value::Address(Address::parse(d).ok_or(bad)?),
             Format::Utf8String => {
@@ -767,7 +849,9 @@ pub fn base_format(code: u32) -> Option<Format> {
 
 /// Reads every AVP in `avps` as the format `dictionary` gives for its code
 /// and vendor ID, and reads into grouped AVPs down to [`MAX_DEPTH`]
-/// levels. AVPs the dictionary does not know are skipped. Whether one
+/// levels. An AVP with vendor ID 0, which RFC 6733 (section 4.1.1)
+/// forbids, is an [`Error::AvpBits`]. AVPs the dictionary does not know
+/// are otherwise skipped. Whether one
 /// with the mandatory flag is an error is the caller's call. The data of a
 /// base Failed-AVP is not read at all: it holds the AVP that failed, which
 /// RFC 6733 (section 7.5) lets be malformed. For the base
@@ -780,6 +864,9 @@ pub fn check(avps: &[Avp], dictionary: impl Fn(u32, Option<u32>) -> Option<Forma
 /// [`MAX_DEPTH`], which bounds the recursion.
 fn check_at(avps: &[Avp], dictionary: &dyn Fn(u32, Option<u32>) -> Option<Format>, depth: usize) -> Result<(), Error> {
     for a in avps {
+        if a.vendor == Some(0) {
+            return Err(Error::AvpBits { code: a.code });
+        }
         if a.code == avp::FAILED_AVP && a.vendor.is_none() {
             continue;
         }
@@ -1009,7 +1096,7 @@ pub enum Transport {
     Tcp,
     /// SCTP.
     Sctp,
-    /// UDP, which RFC 6733 allows only for RADIUS.
+    /// UDP, which RFC 6733 forbids for Diameter.
     Udp,
 }
 
@@ -1027,7 +1114,9 @@ pub enum AaaProtocol {
 /// A DiameterURI, such as `aaa://host.example.com:6666;transport=tcp`.
 /// Its parts come in this order: the scheme, the FQDN, then an optional
 /// port, transport and protocol. Scheme and parameter names are read
-/// without regard to case and written in lower case.
+/// without regard to case and written in lower case. RFC 6733 forbids UDP
+/// with Diameter, the default protocol, so the reader refuses that pair
+/// and the writer leaves such a transport out.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Uri {
     /// The `aaas` scheme: the connection uses TLS or DTLS.
@@ -1066,25 +1155,39 @@ impl Uri {
         let mut transport = None;
         if let Some(r) = strip_prefix_ci(rest, ";transport=") {
             let e = r.find(';').unwrap_or(r.len());
-            transport = Some(match r[..e].to_ascii_lowercase().as_str() {
-                "tcp" => Transport::Tcp,
-                "sctp" => Transport::Sctp,
-                "udp" => Transport::Udp,
-                _ => return None,
+            let t = &r[..e];
+            transport = Some(if t.eq_ignore_ascii_case("tcp") {
+                Transport::Tcp
+            } else if t.eq_ignore_ascii_case("sctp") {
+                Transport::Sctp
+            } else if t.eq_ignore_ascii_case("udp") {
+                Transport::Udp
+            } else {
+                return None;
             });
             rest = &r[e..];
         }
         let mut protocol = None;
         if let Some(r) = strip_prefix_ci(rest, ";protocol=") {
-            protocol = Some(match r.to_ascii_lowercase().as_str() {
-                "diameter" => AaaProtocol::Diameter,
-                "radius" => AaaProtocol::Radius,
-                "tacacs+" => AaaProtocol::TacacsPlus,
-                _ => return None,
+            protocol = Some(if r.eq_ignore_ascii_case("diameter") {
+                AaaProtocol::Diameter
+            } else if r.eq_ignore_ascii_case("radius") {
+                AaaProtocol::Radius
+            } else if r.eq_ignore_ascii_case("tacacs+") {
+                AaaProtocol::TacacsPlus
+            } else {
+                return None;
             });
             rest = "";
         }
-        rest.is_empty().then_some(Uri { secure, fqdn, port, transport, protocol })
+        let uri = Uri { secure, fqdn, port, transport, protocol };
+        (rest.is_empty() && !uri.udp_diameter()).then_some(uri)
+    }
+
+    /// Whether the URI names UDP for Diameter, given or by default, which
+    /// RFC 6733 (section 4.3.1) forbids.
+    fn udp_diameter(&self) -> bool {
+        self.transport == Some(Transport::Udp) && matches!(self.protocol, None | Some(AaaProtocol::Diameter))
     }
 
     /// The port, or the default when none is given: [`PORT`], or
@@ -1100,7 +1203,7 @@ impl std::fmt::Display for Uri {
         if let Some(p) = self.port {
             write!(f, ":{p}")?;
         }
-        if let Some(t) = self.transport {
+        if let Some(t) = self.transport.filter(|_| !self.udp_diameter()) {
             let t = match t {
                 Transport::Tcp => "tcp",
                 Transport::Sctp => "sctp",
@@ -1137,6 +1240,8 @@ pub struct Decoder {
     start: usize,
     limit: usize,
     failed: Option<Error>,
+    /// The header of the message that broke the stream, when it came whole.
+    failed_header: Option<Message>,
 }
 
 impl Default for Decoder {
@@ -1156,7 +1261,13 @@ impl Decoder {
     /// raised to [`HEADER_LEN`] or lowered to [`MAX_MESSAGE`] if it is
     /// outside them.
     pub fn with_limit(limit: usize) -> Decoder {
-        Decoder { buf: Vec::new(), start: 0, limit: limit.clamp(HEADER_LEN, MAX_MESSAGE), failed: None }
+        Decoder {
+            buf: Vec::new(),
+            start: 0,
+            limit: limit.clamp(HEADER_LEN, MAX_MESSAGE),
+            failed: None,
+            failed_header: None,
+        }
     }
 
     /// Takes bytes read from the connection, from the start of `bytes`,
@@ -1197,11 +1308,26 @@ impl Decoder {
             Ok(None) => None,
             Err(e) => {
                 self.failed = Some(e);
+                // Errors in the AVPs come after a whole header was read.
+                if matches!(e, Error::AvpLength { .. } | Error::TooManyAvps) {
+                    self.failed_header =
+                        self.buf.get(self.start..).filter(|b| b.len() >= HEADER_LEN).map(Message::header);
+                }
                 self.buf = Vec::new();
                 self.start = 0;
                 Some(Err(e))
             }
         }
+    }
+
+    /// The header of the message that broke the stream, with no AVPs, if
+    /// the error was in its AVPs. A server answers with its
+    /// [`Message::answer`], with [`Message::error`] set and the error's
+    /// Result-Code, since RFC 6733 (section 7.2) matches an answer to its
+    /// request by the identifiers. It is `None` while the stream is
+    /// whole, and when the error came before the header did.
+    pub fn failed_header(&self) -> Option<&Message> {
+        self.failed_header.as_ref()
     }
 
     /// How many bytes are held, waiting for the rest of a message.
@@ -1326,9 +1452,11 @@ mod tests {
             assert_eq!(b.len(), (8 + n).div_ceil(4) * 4);
             assert_eq!(u32::from_be_bytes([0, b[5], b[6], b[7]]) as usize, 8 + n);
             assert_eq!(Avp::parse(&b), Ok((a.clone(), b.len())));
-            // The last AVP may leave its padding out.
+            // An AVP on its own may leave its padding out, one in a list
+            // may not.
             assert_eq!(Avp::parse(&b[..8 + n]), Ok((a.clone(), 8 + n)));
-            assert_eq!(Avp::parse_list(&b[..8 + n]), Ok(vec![a]));
+            let listed = if n % 4 == 0 { Ok(vec![a]) } else { Err(Error::AvpLength { code: 7, length: 8 + n as u32 }) };
+            assert_eq!(Avp::parse_list(&b[..8 + n]), listed);
         }
     }
 
@@ -1463,6 +1591,7 @@ mod tests {
     #[test]
     fn value_errors() {
         let raw = |data: &[u8]| Avp { code: 9, vendor: None, mandatory: false, protected: false, data: data.to_vec() };
+        // Fixed-size formats given the wrong size: a length error.
         for (format, bad) in [
             (Format::Integer32, &[0u8; 3][..]),
             (Format::Integer64, &[0; 7]),
@@ -1472,7 +1601,13 @@ mod tests {
             (Format::Float64, &[0; 4]),
             (Format::Time, &[]),
             (Format::Enumerated, &[1]),
-            (Format::Address, &[1]),
+        ] {
+            let e = raw(bad).value(format).unwrap_err();
+            assert_eq!(e, Error::AvpLength { code: 9, length: 8 + bad.len() as u32 });
+            assert_eq!(e.result_code(), result::INVALID_AVP_LENGTH);
+        }
+        for (format, bad) in [
+            (Format::Address, &[1u8][..]),
             (Format::Utf8String, &[0xff]),
             (Format::DiameterIdentity, &[]),
             (Format::DiameterIdentity, &[0xff]),
@@ -1565,7 +1700,7 @@ mod tests {
         for _ in 0..3 {
             b = Avp::new(NEST, &Value::Grouped(vec![b]));
         }
-        assert_eq!(check(&[b], dict), Err(Error::Value { code: avp::RESULT_CODE, format: Format::Unsigned32 }));
+        assert_eq!(check(&[b], dict), Err(Error::AvpLength { code: avp::RESULT_CODE, length: 9 }));
         // Unknown AVPs are skipped, whatever they hold.
         let unknown = Avp { code: 77, vendor: Some(1), mandatory: true, protected: false, data: vec![9] };
         check(&[unknown], dict).unwrap();
@@ -1815,6 +1950,173 @@ mod tests {
         assert_eq!(d.buffered(), 0);
     }
 
+    #[test]
+    fn largest_base_avp_writes_back_whole() {
+        // An AVP with no vendor ID has a 4-byte shorter header, so it can
+        // carry 4 more bytes than one with. A message holding the largest
+        // such AVP reads and writes back unchanged.
+        let data = vec![0x5a; MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN];
+        let mut m = Message::request(1, 0, 0, 0);
+        m.avps.push(Avp { code: 1, vendor: None, mandatory: false, protected: false, data });
+        let b = m.to_bytes();
+        assert_eq!(b.len(), MAX_MESSAGE);
+        assert_eq!(Message::parse(&b), Ok(Some((m, MAX_MESSAGE))));
+    }
+
+    #[test]
+    fn new_avps_follow_the_base_flag_rules() {
+        // RFC 6733, section 4.5: these four must not have the M flag.
+        for code in [avp::PRODUCT_NAME, avp::FIRMWARE_REVISION, avp::ERROR_MESSAGE, avp::ERROR_REPORTING_HOST] {
+            assert!(!Avp::new(code, &Value::Unsigned32(1)).mandatory, "{code}");
+        }
+        for code in [avp::ORIGIN_HOST, avp::RESULT_CODE, avp::FAILED_AVP, 9999] {
+            assert!(Avp::new(code, &Value::Unsigned32(1)).mandatory, "{code}");
+        }
+    }
+
+    #[test]
+    fn diameter_uris_never_name_udp() {
+        // RFC 6733, section 4.3.1: UDP must not be used with Diameter,
+        // which is the default protocol.
+        for bad in ["aaa://h.example;transport=udp", "aaa://h.example;transport=udp;protocol=diameter"] {
+            assert_eq!(Uri::parse(bad), None, "{bad}");
+        }
+        assert!(Uri::parse("aaa://h.example;transport=udp;protocol=radius").is_some());
+        // The writer leaves such a transport out, so what it writes reads.
+        let u = Uri {
+            secure: false,
+            fqdn: id("h.example"),
+            port: None,
+            transport: Some(Transport::Udp),
+            protocol: Some(AaaProtocol::Diameter),
+        };
+        assert_eq!(u.to_string(), "aaa://h.example;protocol=diameter");
+        let a = Avp::new(avp::REDIRECT_HOST, &Value::DiameterUri(u));
+        check(&[a], base).unwrap();
+    }
+
+    #[test]
+    fn grouped_children_need_their_padding() {
+        // RFC 6733, section 4.2: a grouped AVP's data holds its AVPs with
+        // their padding. Proxy-State "x" with its 3 padding bytes left out:
+        let short = [0, 0, 0, 0x21, 0x40, 0, 0, 9, b'x'];
+        let g = Avp { code: avp::PROXY_INFO, vendor: None, mandatory: true, protected: false, data: short.to_vec() };
+        let e = Error::AvpLength { code: avp::PROXY_STATE, length: 9 };
+        assert_eq!(g.value(Format::Grouped), Err(e));
+        assert_eq!(check(&[g], base), Err(e));
+        assert_eq!(Avp::parse_list(&short), Err(e));
+        let mut padded = short.to_vec();
+        padded.extend_from_slice(&[0, 0, 0]);
+        assert_eq!(Avp::parse_list(&padded).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fixed_width_values_of_the_wrong_size_are_length_errors() {
+        // RFC 6733, section 7.1.5: DIAMETER_INVALID_AVP_LENGTH.
+        let a = Avp { code: avp::SESSION_TIMEOUT, vendor: None, mandatory: true, protected: false, data: vec![0; 3] };
+        let e = check(std::slice::from_ref(&a), base).unwrap_err();
+        assert_eq!(e, Error::AvpLength { code: avp::SESSION_TIMEOUT, length: 11 });
+        assert_eq!(e.result_code(), result::INVALID_AVP_LENGTH);
+        let v = Avp { vendor: Some(10415), ..a };
+        assert_eq!(v.value(Format::Unsigned32), Err(Error::AvpLength { code: avp::SESSION_TIMEOUT, length: 15 }));
+    }
+
+    #[test]
+    fn forbidden_header_flags_are_reported() {
+        // RFC 6733, section 3: no E flag on a request, no T flag on an
+        // answer. Both read, and check_header reports them.
+        let mut b = dwr_bytes();
+        b[4] |= flags::ERROR;
+        let (m, _) = Message::parse(&b).unwrap().unwrap();
+        let e = m.check_header().unwrap_err();
+        assert_eq!(e, Error::HeaderBits(flags::REQUEST | flags::ERROR));
+        assert_eq!(e.result_code(), result::INVALID_HDR_BITS);
+        assert!(!e.to_string().is_empty());
+        assert_eq!(m.try_to_bytes(), None);
+        assert_eq!(m.to_bytes(), b);
+        let mut a = dwr().answer();
+        a.retransmit = true;
+        assert_eq!(a.check_header(), Err(Error::HeaderBits(flags::RETRANSMIT)));
+        assert_eq!(a.try_to_bytes(), None);
+        // An error answer and a retransmitted request are fine.
+        let mut a = dwr().answer();
+        a.error = true;
+        a.check_header().unwrap();
+        let mut r = dwr();
+        r.retransmit = true;
+        r.check_header().unwrap();
+        assert_eq!(r.try_to_bytes(), Some(r.to_bytes()));
+    }
+
+    #[test]
+    fn vendor_id_zero_is_reported() {
+        // RFC 6733, section 4.1.1: implementations must not use vendor
+        // ID 0. Origin-Host with V set and vendor 0:
+        let b = [0, 0, 1, 8, 0xc0, 0, 0, 0x0d, 0, 0, 0, 0, b'h', 0, 0, 0];
+        let (a, _) = Avp::parse(&b).unwrap();
+        assert_eq!(a.vendor, Some(0));
+        let e = check(std::slice::from_ref(&a), base).unwrap_err();
+        assert_eq!(e, Error::AvpBits { code: avp::ORIGIN_HOST });
+        assert_eq!(e.result_code(), result::INVALID_AVP_BITS);
+        assert!(!e.to_string().is_empty());
+        // Inside a grouped AVP too.
+        let g = Avp::new(avp::PROXY_INFO, &Value::Grouped(vec![a.clone()]));
+        assert_eq!(check(&[g], base), Err(e));
+        let mut m = dwr();
+        m.avps.push(a);
+        assert_eq!(m.try_to_bytes(), None);
+    }
+
+    #[test]
+    fn checked_writer_refuses_what_it_would_change() {
+        assert_eq!(dwr().try_to_bytes(), Some(dwr_bytes()));
+        assert_eq!(Message::request(0x0100_0101, 0, 0, 0).try_to_bytes(), None);
+        let one = Avp { code: 1, vendor: None, mandatory: false, protected: false, data: vec![] };
+        let mut m = Message::request(1, 0, 0, 0);
+        m.avps = vec![one; MAX_AVPS];
+        assert_eq!(m.try_to_bytes(), Some(m.to_bytes()));
+        m.avps.push(m.avps[0].clone());
+        assert_eq!(m.try_to_bytes(), None);
+        // The largest AVP fits on its own, but not with another after it.
+        let big = vec![0; MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN];
+        let mut m = Message::request(1, 0, 0, 0);
+        m.avps.push(Avp { code: 1, vendor: None, mandatory: false, protected: false, data: big.clone() });
+        assert!(m.try_to_bytes().is_some());
+        m.avps.push(Avp::new(avp::RESULT_CODE, &Value::Unsigned32(2001)));
+        assert_eq!(m.try_to_bytes(), None);
+        // With a vendor ID the same data is 4 bytes too long.
+        let mut m = Message::request(1, 0, 0, 0);
+        m.avps.push(Avp { code: 1, vendor: Some(1), mandatory: false, protected: false, data: big });
+        assert_eq!(m.try_to_bytes(), None);
+    }
+
+    #[test]
+    fn decoder_keeps_the_header_of_a_message_it_refuses() {
+        // A DWR whose first AVP length is below its header: the server
+        // answers with the request's identifiers (RFC 6733, section 7.2).
+        let mut b = dwr_bytes();
+        b[27] = 7;
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&b), b.len());
+        assert_eq!(d.failed_header(), None);
+        let e = d.next_message().unwrap().unwrap_err();
+        assert_eq!(e, Error::AvpLength { code: avp::ORIGIN_HOST, length: 7 });
+        let h = d.failed_header().unwrap();
+        assert_eq!(h, &Message { avps: vec![], ..dwr() });
+        let mut reply = h.answer();
+        reply.error = true;
+        assert_eq!((reply.hop_by_hop, reply.end_to_end), (0x1234_5678, 0x9abc_def0));
+        // A stream broken before a header came has none.
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&[2]), 1);
+        assert!(d.next_message().unwrap().is_err());
+        assert_eq!(d.failed_header(), None);
+        let mut d = Decoder::with_limit(63);
+        assert_eq!(d.feed(&dwr_bytes()), 63);
+        assert!(d.next_message().unwrap().is_err());
+        assert_eq!(d.failed_header(), None);
+    }
+
     struct Lcg(u64);
 
     impl Lcg {
@@ -1943,10 +2245,19 @@ mod tests {
             assert_eq!(&back, m);
             assert_eq!(used, bytes.len());
             let _ = check(&m.avps, base);
+            // A message read is written back unchanged by the checked
+            // writer too, unless RFC 6733 forbids sending it.
+            let allowed = m.check_header().is_ok() && m.avps.iter().all(|a| a.vendor != Some(0));
+            assert_eq!(m.try_to_bytes(), allowed.then(|| bytes.clone()));
             for avp in &m.avps {
                 for f in FORMATS {
                     if let Ok(v) = avp.value(f) {
                         let again = Avp { data: v.to_bytes(), ..avp.clone() };
+                        // Only URIs (case) and grouped AVPs (reserved bits,
+                        // padding bytes) may come out as other bytes.
+                        if !matches!(f, Format::Grouped | Format::DiameterUri) && avp.data.len() <= MAX_AVP_DATA {
+                            assert_eq!(again.data, avp.data, "{f:?}");
+                        }
                         let v2 = again.value(f).unwrap();
                         assert_eq!(v2.to_bytes(), again.data);
                     }
@@ -1962,12 +2273,23 @@ mod tests {
             let reply = m.answer();
             assert_eq!(Message::parse(&reply.to_bytes()).unwrap().unwrap().0, reply);
         }
-        let _ = Avp::parse_list(data);
-        let _ = Address::parse(data);
-        if let Ok(s) = std::str::from_utf8(data)
-            && let Some(u) = Uri::parse(s)
+        if let Ok(list) = Avp::parse_list(data)
+            && data.len() <= MAX_AVP_DATA
         {
-            assert_eq!(Uri::parse(&u.to_string()), Some(u));
+            assert_eq!(Avp::parse_list(&Value::Grouped(list.clone()).to_bytes()), Ok(list));
+        }
+        if let Some(a) = Address::parse(data)
+            && data.len() <= MAX_AVP_DATA
+        {
+            assert_eq!(a.to_bytes(), data);
+        }
+        if let Ok(s) = std::str::from_utf8(data) {
+            if let Some(u) = Uri::parse(s) {
+                assert_eq!(Uri::parse(&u.to_string()), Some(u));
+            }
+            if let Some(i) = Identity::new(s) {
+                assert_eq!(i.as_str(), s);
+            }
         }
     }
 

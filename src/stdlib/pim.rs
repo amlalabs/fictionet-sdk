@@ -36,10 +36,20 @@
 //! any bytes it likes. Every encoded address in a message must have the
 //! family of the IP packet that carries it, so IPv4 and IPv6 never mix in
 //! one message. Reserved bits, and the deprecated Border bit of a
-//! Register, are ignored when read and written as zero. Types this module
-//! does not read, such as the Graft messages of PIM Dense Mode, are kept
-//! as bytes. Writers check the same rules as readers, so bytes they return
-//! always read back.
+//! Register, are ignored when read and written as zero. The Z (admin
+//! scope zone) bit of a group is read only where RFC 5059 gives it a
+//! meaning: in a Candidate-RP-Advertisement and in the first group of a
+//! Bootstrap. Elsewhere it is ignored when read, and a writer refuses it.
+//! Readers also check the rules RFC 7761 and RFC 5059 set on the parts of
+//! a message: a Join/Prune names single multicast groups and never joins
+//! and prunes one entry at once, a Register carries an IP header of the
+//! packet's family, a Bootstrap fragment lists no more RPs for a range
+//! than its RP count. Types this module does not read, such as the Graft
+//! messages of PIM Dense Mode, are kept as bytes. Writers check the same
+//! rules as readers, so bytes they return always read back. The one
+//! exception goes the other way: a Candidate-RP-Advertisement with no
+//! groups is read, since a BSR treats one from an older router as every
+//! group, but RFC 5059 forbids sending one, so it is not written.
 //!
 //! ```
 //! use std::net::Ipv4Addr;
@@ -80,9 +90,12 @@ pub const HEADER_LEN: usize = 4;
 /// The bytes of a Register message its checksum covers: the header and
 /// the flags word.
 pub const REGISTER_HEADER_LEN: usize = 8;
-/// The longest message read or written: the most an IP packet without
+/// The longest message read or written: the most an IPv6 packet without
 /// jumbograms can carry.
 pub const MAX_MESSAGE: usize = 65535;
+/// The longest message read or written over IPv4: the 65535 bytes of an
+/// IPv4 packet less its 20-byte header.
+pub const MAX_MESSAGE_V4: usize = 65515;
 /// The Hello holdtime RFC 7761 suggests, in seconds: 3.5 times the
 /// 30-second Hello period.
 pub const DEFAULT_HELLO_HOLDTIME: u16 = 105;
@@ -273,14 +286,22 @@ pub struct Register {
     /// The N bit: a Null-Register, which carries only the inner IP header
     /// and asks whether to start registering again.
     pub null: bool,
-    /// The multicast data packet, from its IP header on, unread.
+    /// The multicast data packet, from its IP header on. Only the start of
+    /// the header is checked: it must be an IP header of the packet's
+    /// family, at least 20 bytes with a header length that fits for IPv4,
+    /// or at least 40 bytes for IPv6. The rest is unread.
     pub packet: Vec<u8>,
 }
 
 /// One group of a Join/Prune message, with the sources joined and pruned.
+/// RFC 7761 section 4.9.5.1 sets the rules both readers and writers
+/// check: the group is one multicast group with a full mask, there is at
+/// most one (*,G) entry across both lists, and no (S,G) or (S,G,rpt)
+/// entry is both joined and pruned.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct JoinPruneGroup {
-    /// The group.
+    /// The group: a multicast address with a mask of 32 or 128 bits, and
+    /// no Z bit.
     pub group: Group,
     /// The sources joined. At most 65535.
     pub joins: Vec<Source>,
@@ -314,20 +335,30 @@ pub struct BootstrapRp {
 /// One group range of a Bootstrap message and its RPs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BootstrapGroup {
-    /// The group range.
+    /// The group range. Only the first group of a fragment may have the
+    /// Z bit; in later groups it is ignored when read.
     pub group: Group,
     /// How many RPs the range has in all the fragments of the message.
     pub rp_count: u8,
-    /// The RPs in this fragment. At most 255.
+    /// The RPs in this fragment. At most `rp_count`.
     pub rps: Vec<BootstrapRp>,
 }
 
-/// A Bootstrap message, or one fragment of one.
+/// A Bootstrap message, or one fragment of one. When the first group has
+/// the Z bit, the fragment is for an admin scope zone, and over IPv6 every
+/// group must then have a mask of at least 16 bits and the first group's
+/// scope (the low 4 bits of its second byte), as RFC 5059 section 4.1
+/// requires.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Bootstrap {
+    /// The N (No-Forward) bit of the header: routers that get the
+    /// fragment do not forward it. RFC 5059 section 3.5.1 uses it for the
+    /// Bootstrap a router sends a new neighbor.
+    pub no_forward: bool,
     /// A number shared by all fragments of one message.
     pub fragment_tag: u16,
-    /// The hash mask length, for spreading groups across RPs.
+    /// The hash mask length, for spreading groups across RPs: at most 32
+    /// for IPv4 and 128 for IPv6.
     pub hash_mask_len: u8,
     /// The BSR's priority. The highest wins.
     pub priority: u8,
@@ -363,8 +394,9 @@ pub struct CandidateRp {
     /// The candidate RP's address.
     pub rp: IpAddr,
     /// The group ranges it offers to serve. At most 255. RFC 5059 says not
-    /// to send an empty list, but a BSR reads one from an older router as
-    /// every group: 224.0.0.0/4 or ff00::/8.
+    /// to send an empty list, so writing one is a [`PimError::Count`], but
+    /// one is read, since a BSR treats one from an older router as every
+    /// group: 224.0.0.0/4 or ff00::/8.
     pub groups: Vec<Group>,
 }
 
@@ -406,7 +438,8 @@ pub enum PimError {
     Truncated,
     /// Bytes follow the end of the message.
     Trailing,
-    /// The message is longer than [`MAX_MESSAGE`].
+    /// The message is longer than [`MAX_MESSAGE`], or than
+    /// [`MAX_MESSAGE_V4`] over IPv4.
     TooLong,
     /// The version was not 2.
     Version(u8),
@@ -419,11 +452,24 @@ pub enum PimError {
     /// An encoded address had a family other than the IP packet's. The
     /// value is the family it had.
     FamilyMismatch(u8),
-    /// A group's mask length was longer than its address, or a source's
-    /// was not the full length of its address.
+    /// A group's mask length was longer than its address, a source's was
+    /// not the full length of its address, or a Bootstrap's hash mask
+    /// length was longer than its BSR's address.
     MaskLen(u8),
     /// A source had the W bit set without the R bit.
     SourceFlags,
+    /// A Join/Prune group was not one multicast group with a full mask.
+    JoinPruneGroup,
+    /// A Join/Prune group listed more than one (*,G) entry, or joined and
+    /// pruned the same (S,G) or (S,G,rpt) entry.
+    SourceList,
+    /// A Register's packet did not start with an IP header of the
+    /// packet's family.
+    Inner,
+    /// A group to be written had the Z bit where it has no meaning, or a
+    /// scoped IPv6 Bootstrap had a group with a mask under 16 bits or a
+    /// scope other than the first group's.
+    Zone,
     /// A Hello option this module knows had a value of the wrong length.
     OptionLength {
         /// The option type.
@@ -438,7 +484,9 @@ pub enum PimError {
     /// this module reads.
     OptionKind(u16),
     /// A list to be written had more entries than its count field holds,
-    /// or a Hello option value was longer than 65535 bytes.
+    /// a Hello option value was longer than 65535 bytes, a Bootstrap
+    /// fragment listed more RPs for a range than its RP count, or a
+    /// Candidate-RP-Advertisement to be written had no groups.
     Count,
     /// A field to be written was above its largest value.
     Value,
@@ -480,6 +528,15 @@ impl Endpoints {
         }
     }
 
+    /// The longest message the packet can carry: [`MAX_MESSAGE_V4`] for
+    /// IPv4 and [`MAX_MESSAGE`] for IPv6.
+    pub fn max_message(&self) -> usize {
+        match self {
+            Endpoints::V4 { .. } => MAX_MESSAGE_V4,
+            Endpoints::V6 { .. } => MAX_MESSAGE,
+        }
+    }
+
     /// The length of an address in the packet's family: 4 or 16.
     fn address_len(&self) -> usize {
         match self {
@@ -494,7 +551,7 @@ impl std::fmt::Display for PimError {
         match self {
             PimError::Truncated => write!(f, "the message is cut short"),
             PimError::Trailing => write!(f, "bytes follow the end of the message"),
-            PimError::TooLong => write!(f, "the message is longer than {MAX_MESSAGE} bytes"),
+            PimError::TooLong => write!(f, "the message is longer than its IP packet can carry"),
             PimError::Version(v) => write!(f, "version {v}, not 2"),
             PimError::Checksum => write!(f, "the checksum is wrong"),
             PimError::Family(a) => write!(f, "address family {a}, not 1 (IPv4) or 2 (IPv6)"),
@@ -502,10 +559,16 @@ impl std::fmt::Display for PimError {
             PimError::FamilyMismatch(a) => write!(f, "address family {a}, not the family of the packet"),
             PimError::MaskLen(m) => write!(f, "mask length {m} does not fit the address"),
             PimError::SourceFlags => write!(f, "a source with the W bit but not the R bit"),
+            PimError::JoinPruneGroup => write!(f, "a Join/Prune group that is not one multicast group"),
+            PimError::SourceList => {
+                write!(f, "a Join/Prune group with two (*,G) entries or a source joined and pruned")
+            }
+            PimError::Inner => write!(f, "a Register packet without an IP header of the packet's family"),
+            PimError::Zone => write!(f, "an admin scope zone bit or scoped range that breaks RFC 5059"),
             PimError::OptionLength { kind, len } => write!(f, "Hello option {kind} with a {len}-byte value"),
             PimError::Type(t) => write!(f, "message type {t} cannot be written as other bytes"),
             PimError::OptionKind(k) => write!(f, "Hello option {k} cannot be written as other bytes"),
-            PimError::Count => write!(f, "a list is longer than its count field holds"),
+            PimError::Count => write!(f, "a list is longer than its count allows, or empty where it must not be"),
             PimError::Value => write!(f, "a field is above its largest value"),
         }
     }
@@ -582,16 +645,84 @@ fn checksum_matches(got: u16, want: u16) -> bool {
 
 /// Checks what the bytes so far show about the header. Every error it
 /// gives holds for any bytes that could follow, which lets [`Decoder`]
-/// stop early and still agree with [`Message::parse`].
-fn check_header(b: &[u8]) -> Result<(), PimError> {
+/// stop early and still agree with [`Message::parse`]. `max` is the
+/// longest message the packet can carry.
+fn check_header(b: &[u8], max: usize) -> Result<(), PimError> {
     if let Some(&first) = b.first() {
         let version = first >> 4;
         if version != VERSION {
             return Err(PimError::Version(version));
         }
     }
-    if b.len() > MAX_MESSAGE {
+    if b.len() > max {
         return Err(PimError::TooLong);
+    }
+    Ok(())
+}
+
+/// Checks that a Register's packet starts with an IP header of the
+/// family whose addresses are `addr_len` bytes: version 4, at least 20
+/// bytes and a header length from 5 words to the packet's length, or
+/// version 6 and at least 40 bytes.
+fn check_inner(p: &[u8], addr_len: usize) -> Result<(), PimError> {
+    let ok = match (p.first(), addr_len) {
+        (Some(&b), 4) => b >> 4 == 4 && p.len() >= 20 && (5..=p.len() / 4).contains(&usize::from(b & 0x0f)),
+        (Some(&b), _) => b >> 4 == 6 && p.len() >= 40,
+        (None, _) => false,
+    };
+    if ok { Ok(()) } else { Err(PimError::Inner) }
+}
+
+/// Checks a Join/Prune group set: one multicast group with a full mask,
+/// at most one (*,G) entry across both lists, and no (S,G) or (S,G,rpt)
+/// entry both joined and pruned. It sorts a copy of the entries, so it
+/// takes time in proportion to n log n, not n squared.
+fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), PimError> {
+    if !g.group.address.is_multicast() || g.group.mask_len != full_mask(g.group.address) {
+        return Err(PimError::JoinPruneGroup);
+    }
+    let mut wildcards = 0usize;
+    let mut entries = Vec::with_capacity(g.joins.len() + g.prunes.len());
+    for (pruned, list) in [(false, &g.joins), (true, &g.prunes)] {
+        for s in list {
+            if s.wildcard {
+                wildcards += 1;
+            } else {
+                entries.push((s.address, s.rpt, pruned));
+            }
+        }
+    }
+    if wildcards > 1 {
+        return Err(PimError::SourceList);
+    }
+    // Sorted by address, then tree, then list: a joined entry and a pruned
+    // one for the same address and tree end up next to each other.
+    entries.sort_unstable();
+    if entries.windows(2).any(|w| w[0].0 == w[1].0 && w[0].1 == w[1].1 && w[0].2 != w[1].2) {
+        return Err(PimError::SourceList);
+    }
+    Ok(())
+}
+
+/// Checks the admin scope rules of RFC 5059 section 4.1 on a Bootstrap's
+/// groups. Only the first group may have the Z bit. If it does and it is
+/// IPv6, every group needs a mask of at least 16 bits and the first
+/// group's scope, the low 4 bits of the address's second byte.
+fn check_scope(groups: &[BootstrapGroup]) -> Result<(), PimError> {
+    if groups.iter().skip(1).any(|g| g.group.zone) {
+        return Err(PimError::Zone);
+    }
+    if let Some(first) = groups.first()
+        && first.group.zone
+        && let IpAddr::V6(a) = first.group.address
+    {
+        let scope = a.octets()[1] & 0x0f;
+        for g in groups {
+            match g.group.address {
+                IpAddr::V6(b) if g.group.mask_len >= 16 && b.octets()[1] & 0x0f == scope => {}
+                _ => return Err(PimError::Zone),
+            }
+        }
     }
     Ok(())
 }
@@ -768,8 +899,11 @@ impl Message {
     /// the W bit only with the R bit. Every count must match the bytes
     /// that follow, and `b` must end where the message does, except for a
     /// Register or a type kept as [`Message::Other`], which run to the end.
+    /// The rules on Join/Prune groups, Register packets and Bootstrap
+    /// fragments in the module docs are checked too, and a Z bit where it
+    /// has no meaning is read as clear.
     pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Message, PimError> {
-        check_header(b)?;
+        check_header(b, endpoints.max_message())?;
         if b.len() < HEADER_LEN {
             return Err(PimError::Truncated);
         }
@@ -802,10 +936,12 @@ impl Message {
             }
             kind::REGISTER => {
                 let flags = r.u32()?;
-                Message::Register(Register { null: flags & 0x4000_0000 != 0, packet: r.take(r.b.len())?.to_vec() })
+                let packet = r.take(r.b.len())?;
+                check_inner(packet, r.addr_len)?;
+                Message::Register(Register { null: flags & 0x4000_0000 != 0, packet: packet.to_vec() })
             }
             kind::REGISTER_STOP => {
-                let group = r.group()?;
+                let group = Group { zone: false, ..r.group()? };
                 let source = r.unicast()?;
                 Message::RegisterStop { group, source }
             }
@@ -816,7 +952,7 @@ impl Message {
                 let holdtime = r.u16()?;
                 let mut groups = Vec::new();
                 for _ in 0..count {
-                    let group = r.group()?;
+                    let group = Group { zone: false, ..r.group()? };
                     let joined = r.u16()?;
                     let pruned = r.u16()?;
                     // Each source takes at least 8 bytes, so the lists
@@ -829,7 +965,9 @@ impl Message {
                     for _ in 0..pruned {
                         prunes.push(r.source()?);
                     }
-                    groups.push(JoinPruneGroup { group, joins, prunes });
+                    let g = JoinPruneGroup { group, joins, prunes };
+                    check_join_prune_group(&g)?;
+                    groups.push(g);
                 }
                 Message::JoinPrune(JoinPrune { upstream, holdtime, groups })
             }
@@ -838,12 +976,21 @@ impl Message {
                 let hash_mask_len = r.u8()?;
                 let priority = r.u8()?;
                 let bsr = r.unicast()?;
-                let mut groups = Vec::new();
+                if hash_mask_len > full_mask(bsr) {
+                    return Err(PimError::MaskLen(hash_mask_len));
+                }
+                let mut groups: Vec<BootstrapGroup> = Vec::new();
                 while !r.is_empty() {
-                    let group = r.group()?;
+                    let mut group = r.group()?;
+                    // RFC 5059 section 4.1: the Z bit of every group but
+                    // the first is ignored on receipt.
+                    group.zone &= groups.is_empty();
                     let rp_count = r.u8()?;
                     let fragment_count = r.u8()?;
                     let _reserved = r.u16()?;
+                    if fragment_count > rp_count {
+                        return Err(PimError::Count);
+                    }
                     let mut rps = Vec::new();
                     for _ in 0..fragment_count {
                         let address = r.unicast()?;
@@ -854,10 +1001,12 @@ impl Message {
                     }
                     groups.push(BootstrapGroup { group, rp_count, rps });
                 }
-                Message::Bootstrap(Bootstrap { fragment_tag, hash_mask_len, priority, bsr, groups })
+                check_scope(&groups)?;
+                let no_forward = b[1] & 0x80 != 0;
+                Message::Bootstrap(Bootstrap { no_forward, fragment_tag, hash_mask_len, priority, bsr, groups })
             }
             kind::ASSERT => {
-                let group = r.group()?;
+                let group = Group { zone: false, ..r.group()? };
                 let source = r.unicast()?;
                 let pref = r.u32()?;
                 let metric = r.u32()?;
@@ -909,7 +1058,8 @@ impl Message {
 
     /// How many bytes [`Message::to_bytes`] writes, or why it cannot write
     /// the message. It does not know the packet, so it does not check
-    /// address families; [`Message::to_bytes`] does.
+    /// address families, a Register's packet or the IPv4 length limit;
+    /// [`Message::to_bytes`] does.
     pub fn encoded_len(&self) -> Result<usize, PimError> {
         let mut n = Len(HEADER_LEN);
         match self {
@@ -951,6 +1101,7 @@ impl Message {
             }
             Message::RegisterStop { group, source } => {
                 n.add(group_len(group)?)?;
+                no_zone(group)?;
                 n.add(unicast_len(*source))?;
             }
             Message::JoinPrune(jp) => {
@@ -964,17 +1115,22 @@ impl Message {
                         return Err(PimError::Count);
                     }
                     n.add(group_len(&g.group)?)?;
+                    no_zone(&g.group)?;
                     n.add(4)?;
                     for s in g.joins.iter().chain(&g.prunes) {
                         n.add(source_len(s)?)?;
                     }
+                    check_join_prune_group(g)?;
                 }
             }
             Message::Bootstrap(bs) => {
+                if bs.hash_mask_len > full_mask(bs.bsr) {
+                    return Err(PimError::MaskLen(bs.hash_mask_len));
+                }
                 n.add(4)?;
                 n.add(unicast_len(bs.bsr))?;
                 for g in &bs.groups {
-                    if g.rps.len() > usize::from(u8::MAX) {
+                    if g.rps.len() > usize::from(g.rp_count) {
                         return Err(PimError::Count);
                     }
                     n.add(group_len(&g.group)?)?;
@@ -984,17 +1140,21 @@ impl Message {
                         n.add(4)?;
                     }
                 }
+                check_scope(&bs.groups)?;
             }
             Message::Assert(a) => {
                 if a.metric_preference > MAX_METRIC_PREFERENCE {
                     return Err(PimError::Value);
                 }
                 n.add(group_len(&a.group)?)?;
+                no_zone(&a.group)?;
                 n.add(unicast_len(a.source))?;
                 n.add(8)?;
             }
             Message::CandidateRp(c) => {
-                if c.groups.len() > usize::from(u8::MAX) {
+                // RFC 5059 section 4.2: a C-RP-Adv is never sent with no
+                // groups.
+                if c.groups.is_empty() || c.groups.len() > usize::from(u8::MAX) {
                     return Err(PimError::Count);
                 }
                 n.add(4)?;
@@ -1014,10 +1174,12 @@ impl Message {
     }
 
     /// Checks that every encoded address in the message has the family of
-    /// the packet, whose addresses are `addr_len` bytes.
+    /// the packet, whose addresses are `addr_len` bytes, and that a
+    /// Register carries a packet of that family.
     fn check_families(&self, addr_len: usize) -> Result<(), PimError> {
         let f = |a: IpAddr| check_family(a, addr_len);
         match self {
+            Message::Register(reg) => check_inner(&reg.packet, addr_len)?,
             Message::Hello(options) => {
                 for o in options {
                     if let HelloOption::AddressList(list) = o {
@@ -1025,7 +1187,7 @@ impl Message {
                     }
                 }
             }
-            Message::Register(_) | Message::Other { .. } => {}
+            Message::Other { .. } => {}
             Message::RegisterStop { group, source } => {
                 f(group.address)?;
                 f(*source)?;
@@ -1062,14 +1224,21 @@ impl Message {
     /// address, a source's is not the full length, a source has the W bit
     /// without the R bit, an address is not in the family of `endpoints`,
     /// a field is above its largest value, an [`Message::Other`] or
-    /// [`HelloOption::Other`] has a type this module reads, or the message
-    /// would be longer than [`MAX_MESSAGE`]. Nothing is allocated before
+    /// [`HelloOption::Other`] has a type this module reads, a rule of the
+    /// module docs on Join/Prune groups, Register packets, Bootstrap
+    /// fragments or Z bits is broken, a Candidate-RP-Advertisement has no
+    /// groups, or the message would be longer than
+    /// [`Endpoints::max_message`]. The output is not allocated before
     /// those checks pass.
     pub fn to_bytes(&self, endpoints: &Endpoints) -> Result<Vec<u8>, PimError> {
         let len = self.encoded_len()?;
+        if len > endpoints.max_message() {
+            return Err(PimError::TooLong);
+        }
         self.check_families(endpoints.address_len())?;
         let mut out = Vec::with_capacity(len);
-        out.extend_from_slice(&[(VERSION << 4) | self.kind(), 0, 0, 0]);
+        let no_forward = matches!(self, Message::Bootstrap(Bootstrap { no_forward: true, .. }));
+        out.extend_from_slice(&[(VERSION << 4) | self.kind(), if no_forward { 0x80 } else { 0 }, 0, 0]);
         match self {
             Message::Hello(options) => {
                 for o in options {
@@ -1186,6 +1355,12 @@ fn group_len(g: &Group) -> Result<usize, PimError> {
     check_mask(g.address, g.mask_len)
 }
 
+/// Checks that a group outside the Bootstrap mechanism has no Z bit: RFC
+/// 7761 section 4.9.1 says to send it as zero there.
+fn no_zone(g: &Group) -> Result<(), PimError> {
+    if g.zone { Err(PimError::Zone) } else { Ok(()) }
+}
+
 fn source_len(s: &Source) -> Result<usize, PimError> {
     if s.mask_len != full_mask(s.address) {
         return Err(PimError::MaskLen(s.mask_len));
@@ -1240,8 +1415,8 @@ fn put_source(out: &mut Vec<u8>, s: &Source) {
 
 /// Reads one message that comes in pieces. Feed it the bytes in order,
 /// then call [`Decoder::finish`]. It fails as soon as the bytes show a
-/// version other than 2 or run past [`MAX_MESSAGE`]. It holds at most
-/// [`MAX_MESSAGE`] plus one bytes.
+/// version other than 2 or run past [`Endpoints::max_message`]. It holds
+/// at most [`MAX_MESSAGE`] plus one bytes.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     endpoints: Endpoints,
@@ -1265,9 +1440,10 @@ impl Decoder {
         }
         // One byte past the longest message is enough to know it is too
         // long.
-        let room = (MAX_MESSAGE + 1).saturating_sub(self.buf.len());
+        let max = self.endpoints.max_message();
+        let room = (max + 1).saturating_sub(self.buf.len());
         self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        check_header(&self.buf).inspect_err(|&e| {
+        check_header(&self.buf, max).inspect_err(|&e| {
             self.failed = Some(e);
             self.buf = Vec::new();
         })
@@ -1457,11 +1633,11 @@ mod tests {
         let mut border = b.clone();
         border[4] |= 0x80;
         assert_eq!(Message::parse(&fix(border, &v4_ends()), &v4_ends()), Ok(m.clone()));
-        round_trip(&Message::Register(Register { null: false, packet: vec![] }), &v4_ends());
         // Over IPv6 a checksum of the whole message uses a pseudo-header
         // length of 8, as RFC 7761 section 4.9.3 says. The whole length is
         // accepted too.
         let e6 = v6_ends();
+        let m = Message::Register(Register { null: true, packet: inner_header(true) });
         let b6 = round_trip(&m, &e6);
         for len in [REGISTER_HEADER_LEN, b6.len()] {
             let mut w = b6.clone();
@@ -1525,6 +1701,7 @@ mod tests {
     #[test]
     fn bootstrap_bytes() {
         let m = Message::Bootstrap(Bootstrap {
+            no_forward: false,
             fragment_tag: 0x1234,
             hash_mask_len: 30,
             priority: 64,
@@ -1575,11 +1752,12 @@ mod tests {
         });
         let b = round_trip(&m, &v4_ends());
         assert_eq!(&b[4..], &[1, 192, 0, 150, 1, 0, 10, 0, 0, 7, 1, 0, 0x81, 8, 239, 0, 0, 0]);
-        // No groups means every group.
-        round_trip(
-            &Message::CandidateRp(CandidateRp { priority: 0, holdtime: 0, rp: v4(1, 2, 3, 4), groups: vec![] }),
-            &v4_ends(),
-        );
+        // RFC 5059 section 4.2: no groups is never sent, but is read, as
+        // a BSR reads one from an older router as every group.
+        let empty = Message::CandidateRp(CandidateRp { priority: 0, holdtime: 0, rp: v4(1, 2, 3, 4), groups: vec![] });
+        assert_eq!(empty.to_bytes(&v4_ends()), Err(PimError::Count));
+        let b = fix(vec![0x28, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 2, 3, 4], &v4_ends());
+        assert_eq!(Message::parse(&b, &v4_ends()), Ok(empty));
     }
 
     #[test]
@@ -1600,7 +1778,7 @@ mod tests {
             upstream: v4(10, 0, 0, 1),
             holdtime: 210,
             groups: vec![JoinPruneGroup {
-                group: g,
+                group: Group::single(v4(239, 0, 0, 1)),
                 joins: vec![Source::shared_tree(v4(10, 9, 9, 9))],
                 prunes: vec![],
             }],
@@ -1616,7 +1794,7 @@ mod tests {
     fn largest_messages() {
         // The longest Hello: 16382 options with empty values fill the
         // message, and read back in one linear pass.
-        let e = v4_ends();
+        let e = v6_ends();
         let n = (MAX_MESSAGE - HEADER_LEN) / 4;
         let m = Message::Hello(vec![HelloOption::Other { kind: 9999, value: vec![] }; n]);
         let b = round_trip(&m, &e);
@@ -1777,11 +1955,12 @@ mod tests {
         assert_eq!(Message::Hello(vec![big]).to_bytes(&e), Err(PimError::Count));
         assert_eq!(Message::Other { kind: kind::ASSERT, body: vec![] }.to_bytes(&e), Err(PimError::Type(5)));
         assert_eq!(Message::Other { kind: 16, body: vec![] }.to_bytes(&e), Err(PimError::Type(16)));
-        let reg = Message::Register(Register { null: false, packet: vec![0; MAX_MESSAGE] });
+        let reg = Message::Register(Register { null: false, packet: vec![0x45; MAX_MESSAGE] });
         assert_eq!(reg.to_bytes(&e), Err(PimError::TooLong));
-        let reg = Message::Register(Register { null: false, packet: vec![0; MAX_MESSAGE - 8] });
-        assert_eq!(reg.to_bytes(&e).unwrap().len(), MAX_MESSAGE);
+        let reg = Message::Register(Register { null: false, packet: vec![0x45; MAX_MESSAGE_V4 - 8] });
+        assert_eq!(reg.to_bytes(&e).unwrap().len(), MAX_MESSAGE_V4);
         let bs = |rps| Bootstrap {
+            no_forward: false,
             fragment_tag: 0,
             hash_mask_len: 0,
             priority: 0,
@@ -1804,6 +1983,310 @@ mod tests {
         }
     }
 
+    /// Bytes written as hex pairs separated by spaces.
+    fn hex(s: &str) -> Vec<u8> {
+        s.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()
+    }
+
+    #[test]
+    fn bootstrap_no_forward_bit() {
+        // RFC 5059 section 4.1: the N bit is the top bit of header byte 1.
+        // A No-Forward Bootstrap from 10.0.0.5 with no groups, checksum
+        // worked out by hand.
+        let e = v4_ends();
+        let b = hex("24 80 b2 39 00 01 1e 40 01 00 0a 00 00 05");
+        let m = Message::Bootstrap(Bootstrap {
+            no_forward: true,
+            fragment_tag: 1,
+            hash_mask_len: 30,
+            priority: 64,
+            bsr: v4(10, 0, 0, 5),
+            groups: vec![],
+        });
+        assert_eq!(Message::parse(&b, &e), Ok(m.clone()));
+        assert_eq!(m.to_bytes(&e).unwrap(), b);
+        // Without the bit; the other reserved bits are still ignored.
+        let mut clear = b.clone();
+        clear[1] = 0x7f;
+        let Message::Bootstrap(inner) = m else { unreachable!() };
+        let forward = Message::Bootstrap(Bootstrap { no_forward: false, ..inner });
+        assert_eq!(Message::parse(&fix(clear, &e), &e), Ok(forward.clone()));
+        assert_eq!(forward.to_bytes(&e).unwrap()[1], 0);
+        // The bit means nothing in other types, so it is not read there.
+        let mut hello = Message::Hello(vec![]).to_bytes(&e).unwrap();
+        hello[1] = 0x80;
+        assert_eq!(Message::parse(&fix(hello, &e), &e), Ok(Message::Hello(vec![])));
+    }
+
+    #[test]
+    fn join_prune_groups_are_single_multicast_groups() {
+        // RFC 7761 section 4.9.5.1: the one valid group set is a multicast
+        // group with a full mask. This one is 239.0.0.0/8.
+        let e = v4_ends();
+        let b = hex(
+            "23 00 d0 ff 01 00 0a 00 00 01 00 01 00 d2 01 00 00 08 ef 00 00 00 00 01 00 00 01 00 04 20 0a 01 01 01",
+        );
+        assert_eq!(Message::parse(&b, &e), Err(PimError::JoinPruneGroup));
+        let jp = |group: Group| {
+            Message::JoinPrune(JoinPrune {
+                upstream: v4(10, 0, 0, 1),
+                holdtime: 210,
+                groups: vec![JoinPruneGroup { group, joins: vec![Source::single(v4(10, 1, 1, 1))], prunes: vec![] }],
+            })
+        };
+        assert_eq!(jp(Group::range(v4(239, 0, 0, 0), 8)).to_bytes(&e), Err(PimError::JoinPruneGroup));
+        assert_eq!(jp(Group::single(v4(10, 0, 0, 1))).to_bytes(&e), Err(PimError::JoinPruneGroup));
+        let b = round_trip(&jp(Group::single(v4(239, 0, 0, 1))), &e);
+        // The unicast group 10.0.0.1, written by hand.
+        let mut unicast = b.clone();
+        unicast[18] = 10;
+        assert_eq!(Message::parse(&fix(unicast, &e), &e), Err(PimError::JoinPruneGroup));
+        let e6 = v6_ends();
+        let jp6 = |group: Group| {
+            Message::JoinPrune(JoinPrune {
+                upstream: v6("fe80::1"),
+                holdtime: 210,
+                groups: vec![JoinPruneGroup { group, joins: vec![Source::single(v6("2001:db8::1"))], prunes: vec![] }],
+            })
+        };
+        assert_eq!(jp6(Group::range(v6("ff3e::"), 64)).to_bytes(&e6), Err(PimError::JoinPruneGroup));
+        round_trip(&jp6(Group::single(v6("ff3e::1"))), &e6);
+    }
+
+    #[test]
+    fn join_prune_source_lists() {
+        // RFC 7761 section 4.9.5.1: one (*,G) entry at most, and no (S,G)
+        // or (S,G,rpt) entry both joined and pruned. These bytes join and
+        // prune (10.1.1.1, 239.1.1.1).
+        let e = v4_ends();
+        let b = hex(
+            "23 00 bf c2 01 00 0a 00 00 01 00 01 00 d2 01 00 00 20 ef 01 01 01 00 01 00 01 01 00 04 20 0a 01 01 01 01 00 04 20 0a 01 01 01",
+        );
+        assert_eq!(Message::parse(&b, &e), Err(PimError::SourceList));
+        let jp = |joins: Vec<Source>, prunes: Vec<Source>| {
+            Message::JoinPrune(JoinPrune {
+                upstream: v4(10, 0, 0, 1),
+                holdtime: 210,
+                groups: vec![JoinPruneGroup { group: Group::single(v4(239, 1, 1, 1)), joins, prunes }],
+            })
+        };
+        let s = Source::single(v4(10, 1, 1, 1));
+        let rpt = Source { rpt: true, ..s };
+        let star = Source::shared_tree(v4(10, 9, 9, 9));
+        assert_eq!(jp(vec![s], vec![s]).to_bytes(&e), Err(PimError::SourceList));
+        assert_eq!(jp(vec![rpt], vec![rpt]).to_bytes(&e), Err(PimError::SourceList));
+        assert_eq!(jp(vec![star], vec![star]).to_bytes(&e), Err(PimError::SourceList));
+        assert_eq!(jp(vec![star, star], vec![]).to_bytes(&e), Err(PimError::SourceList));
+        // Allowed: an (S,G) join with an (S,G,rpt) prune of the same
+        // source, a (*,G) join with an (S,G,rpt) prune, and the same entry
+        // twice in one list.
+        round_trip(&jp(vec![s], vec![rpt]), &e);
+        round_trip(&jp(vec![star], vec![rpt, s]), &e);
+        round_trip(&jp(vec![s, s], vec![]), &e);
+        // A conflict among many entries is still found.
+        let many: Vec<Source> =
+            (0..500u32).map(|i| Source::single(IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + i)))).collect();
+        round_trip(&jp(many.clone(), vec![]), &e);
+        assert_eq!(jp(many, vec![Source::single(v4(10, 0, 1, 0))]).to_bytes(&e), Err(PimError::SourceList));
+    }
+
+    #[test]
+    fn register_packet_is_an_ip_header_of_the_family() {
+        // RFC 7761 section 4.9.3: the packet has the family of the PIM
+        // packet. An empty Register, checksum worked out by hand.
+        let e = v4_ends();
+        assert_eq!(Message::parse(&hex("21 00 de ff 00 00 00 00"), &e), Err(PimError::Inner));
+        let reg = |packet: Vec<u8>| Message::Register(Register { null: false, packet });
+        assert_eq!(reg(vec![]).to_bytes(&e), Err(PimError::Inner));
+        let v4h = inner_header(false);
+        let v6h = inner_header(true);
+        round_trip(&reg(v4h.clone()), &e);
+        round_trip(&reg(v6h.clone()), &v6_ends());
+        // The wrong family, both ways.
+        assert_eq!(reg(v4h.clone()).to_bytes(&v6_ends()), Err(PimError::Inner));
+        assert_eq!(reg(v6h.clone()).to_bytes(&e), Err(PimError::Inner));
+        let wrong = fix([&[0x21u8, 0, 0, 0, 0, 0, 0, 0][..], &v6h].concat(), &e);
+        assert_eq!(Message::parse(&wrong, &e), Err(PimError::Inner));
+        // Too short, or an IPv4 header length out of range.
+        assert_eq!(reg(v4h[..19].to_vec()).to_bytes(&e), Err(PimError::Inner));
+        assert_eq!(reg(v6h[..39].to_vec()).to_bytes(&v6_ends()), Err(PimError::Inner));
+        let ihl = |b: u8| {
+            let mut p = v4h.clone();
+            p[0] = b;
+            reg(p).to_bytes(&e)
+        };
+        assert_eq!(ihl(0x44), Err(PimError::Inner));
+        assert_eq!(ihl(0x46), Err(PimError::Inner));
+        let mut options = v4h.clone();
+        options[0] = 0x46;
+        options.extend_from_slice(&[1, 1, 1, 0]);
+        round_trip(&reg(options), &e);
+    }
+
+    #[test]
+    fn bootstrap_counts_and_hash_mask() {
+        let e = v4_ends();
+        // RFC 5059 section 4.1: a fragment holds no more RPs for a range
+        // than the range has in all. RP count 0 with one RP here.
+        let b = hex(
+            "24 00 f5 f7 00 01 1e 40 01 00 0a 00 00 05 01 00 00 20 ef 01 01 01 00 01 00 00 01 00 0a 00 00 07 00 96 c0 00",
+        );
+        assert_eq!(Message::parse(&b, &e), Err(PimError::Count));
+        let rp = BootstrapRp { address: v4(10, 0, 0, 7), holdtime: 150, priority: 192 };
+        let bs = |hash_mask_len: u8, bsr: IpAddr, groups: Vec<BootstrapGroup>| {
+            Message::Bootstrap(Bootstrap {
+                no_forward: false,
+                fragment_tag: 1,
+                hash_mask_len,
+                priority: 64,
+                bsr,
+                groups,
+            })
+        };
+        let g = |rp_count: u8, rps: Vec<BootstrapRp>| BootstrapGroup {
+            group: Group::range(v4(239, 0, 0, 0), 8),
+            rp_count,
+            rps,
+        };
+        assert_eq!(bs(30, v4(10, 0, 0, 5), vec![g(0, vec![rp])]).to_bytes(&e), Err(PimError::Count));
+        assert_eq!(bs(30, v4(10, 0, 0, 5), vec![g(1, vec![rp, rp])]).to_bytes(&e), Err(PimError::Count));
+        round_trip(&bs(30, v4(10, 0, 0, 5), vec![g(2, vec![rp, rp]), g(0, vec![])]), &e);
+        // RFC 5059 section 4.1 and RFC 7761 section 4.7.2: the hash mask
+        // is a mask of the family, so at most 32 or 128 bits.
+        round_trip(&bs(32, v4(10, 0, 0, 5), vec![]), &e);
+        assert_eq!(bs(33, v4(10, 0, 0, 5), vec![]).to_bytes(&e), Err(PimError::MaskLen(33)));
+        assert_eq!(bs(255, v4(10, 0, 0, 5), vec![]).to_bytes(&e), Err(PimError::MaskLen(255)));
+        let b = fix(hex("24 00 00 00 00 01 21 40 01 00 0a 00 00 05"), &e);
+        assert_eq!(Message::parse(&b, &e), Err(PimError::MaskLen(33)));
+        let e6 = v6_ends();
+        round_trip(&bs(128, v6("2001:db8::5"), vec![]), &e6);
+        assert_eq!(bs(129, v6("2001:db8::5"), vec![]).to_bytes(&e6), Err(PimError::MaskLen(129)));
+    }
+
+    #[test]
+    fn scoped_bootstrap_fragments() {
+        // RFC 5059 section 4.1: only the first group may have the Z bit.
+        // In a scoped IPv6 fragment every group has a mask of at least 16
+        // bits and the first group's scope.
+        let e6 = v6_ends();
+        let group = |a: &str, mask_len: u8, zone: bool| BootstrapGroup {
+            group: Group { address: v6(a), mask_len, bidirectional: false, zone },
+            rp_count: 0,
+            rps: vec![],
+        };
+        let bs = |groups| {
+            Message::Bootstrap(Bootstrap {
+                no_forward: false,
+                fragment_tag: 1,
+                hash_mask_len: 126,
+                priority: 64,
+                bsr: v6("2001:db8::5"),
+                groups,
+            })
+        };
+        let scoped = bs(vec![group("ff05::", 16, true), group("ff15:1::", 32, false)]);
+        let b = round_trip(&scoped, &e6);
+        assert_eq!(bs(vec![group("ff05::", 8, true)]).to_bytes(&e6), Err(PimError::Zone));
+        assert_eq!(bs(vec![group("ff05::", 16, true), group("ff08::", 16, false)]).to_bytes(&e6), Err(PimError::Zone));
+        assert_eq!(bs(vec![group("ff05::", 16, true), group("ff05::", 12, false)]).to_bytes(&e6), Err(PimError::Zone));
+        // Unscoped fragments have no such rule.
+        round_trip(&bs(vec![group("ff00::", 8, false), group("ff05::", 12, false)]), &e6);
+        // The first group's mask, cut to 8 bits by hand.
+        let mut short = b.clone();
+        short[4 + 4 + 18 + 3] = 8;
+        assert_eq!(Message::parse(&fix(short, &e6), &e6), Err(PimError::Zone));
+        // A Z bit on a later group is refused when written and ignored
+        // when read.
+        assert_eq!(bs(vec![group("ff00::", 8, false), group("ff05::", 16, true)]).to_bytes(&e6), Err(PimError::Zone));
+        let plain = bs(vec![group("ff00::", 8, false), group("ff05::", 16, false)]);
+        let mut b = plain.to_bytes(&e6).unwrap();
+        let second = 4 + 4 + 18 + 20 + 4;
+        b[second + 2] |= 0x01;
+        assert_eq!(Message::parse(&fix(b, &e6), &e6), Ok(plain));
+    }
+
+    #[test]
+    fn candidate_rp_with_no_groups() {
+        // RFC 5059 section 4.2: a C-RP-Adv is never sent with Prefix Count
+        // 0, but one from an older router is read. Checksum worked out by
+        // hand.
+        let e = v4_ends();
+        let m = Message::CandidateRp(CandidateRp { priority: 192, holdtime: 150, rp: v4(10, 0, 0, 7), groups: vec![] });
+        assert_eq!(Message::parse(&hex("28 00 cb a2 00 c0 00 96 01 00 0a 00 00 07"), &e), Ok(m.clone()));
+        assert_eq!(m.to_bytes(&e), Err(PimError::Count));
+        assert_eq!(m.encoded_len(), Err(PimError::Count));
+    }
+
+    #[test]
+    fn zone_bit_only_in_the_bootstrap_mechanism() {
+        // RFC 7761 section 4.9.1: outside the BSR mechanism the Z bit is
+        // sent as zero and ignored on receipt.
+        let e = v4_ends();
+        let zoned = Group { zone: true, ..Group::single(v4(239, 1, 2, 3)) };
+        let stop = Message::RegisterStop { group: zoned, source: v4(10, 1, 1, 1) };
+        assert_eq!(stop.to_bytes(&e), Err(PimError::Zone));
+        let plain = Message::RegisterStop { group: Group::single(v4(239, 1, 2, 3)), source: v4(10, 1, 1, 1) };
+        let mut b = plain.to_bytes(&e).unwrap();
+        b[6] |= 0x01;
+        assert_eq!(Message::parse(&fix(b, &e), &e), Ok(plain));
+        let assert = Assert { group: zoned, source: v4(10, 1, 1, 1), rpt: false, metric_preference: 1, metric: 1 };
+        assert_eq!(Message::Assert(assert).to_bytes(&e), Err(PimError::Zone));
+        let plain = Message::Assert(Assert { group: Group::single(v4(239, 1, 2, 3)), ..assert });
+        let mut b = plain.to_bytes(&e).unwrap();
+        b[6] |= 0x01;
+        assert_eq!(Message::parse(&fix(b, &e), &e), Ok(plain));
+        let jp = |group| {
+            Message::JoinPrune(JoinPrune {
+                upstream: v4(10, 0, 0, 1),
+                holdtime: 210,
+                groups: vec![JoinPruneGroup { group, joins: vec![Source::single(v4(10, 1, 1, 1))], prunes: vec![] }],
+            })
+        };
+        assert_eq!(jp(zoned).to_bytes(&e), Err(PimError::Zone));
+        let plain = jp(Group::single(v4(239, 1, 2, 3)));
+        let mut b = plain.to_bytes(&e).unwrap();
+        b[16] |= 0x01;
+        assert_eq!(Message::parse(&fix(b, &e), &e), Ok(plain));
+        // A C-RP-Adv keeps it: a ZBR sets it there.
+        round_trip(
+            &Message::CandidateRp(CandidateRp { priority: 0, holdtime: 150, rp: v4(10, 0, 0, 7), groups: vec![zoned] }),
+            &e,
+        );
+    }
+
+    #[test]
+    fn ipv4_length_limit() {
+        // RFC 791: an IPv4 packet is at most 65535 bytes with its 20-byte
+        // header, so the PIM payload is at most 65515.
+        let e = v4_ends();
+        let hello = |n: usize| Message::Hello(vec![HelloOption::Other { kind: 9999, value: vec![0; n] }]);
+        assert_eq!(hello(MAX_MESSAGE - 8).encoded_len(), Ok(MAX_MESSAGE));
+        assert_eq!(hello(MAX_MESSAGE - 8).to_bytes(&e), Err(PimError::TooLong));
+        round_trip(&hello(MAX_MESSAGE - 8), &v6_ends());
+        let b = round_trip(&hello(MAX_MESSAGE_V4 - 8), &e);
+        assert_eq!(b.len(), MAX_MESSAGE_V4);
+        let mut long = vec![0x26, 0, 0, 0];
+        long.resize(MAX_MESSAGE_V4 + 1, 0);
+        let long = fix(long, &e);
+        assert_eq!(Message::parse(&long, &e), Err(PimError::TooLong));
+        assert_eq!(decode_chunked(&long, &e, 1000), Err(PimError::TooLong));
+        assert!(Message::parse(&fix(long, &v6_ends()), &v6_ends()).is_ok());
+        assert_eq!(e.max_message(), MAX_MESSAGE_V4);
+        assert_eq!(v6_ends().max_message(), MAX_MESSAGE);
+    }
+
+    /// The smallest IP header a Register can carry: IPv4 or IPv6.
+    fn inner_header(six: bool) -> Vec<u8> {
+        if six {
+            let mut h = vec![0x60, 0, 0, 0, 0, 4, 103, 1];
+            h.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            h.extend_from_slice(&[0xff, 0x3e, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            h
+        } else {
+            vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 103, 0, 0, 10, 0, 0, 1, 239, 1, 1, 1]
+        }
+    }
+
     /// One message of each type, with addresses in the family of `e`.
     fn samples(e: &Endpoints) -> Vec<Message> {
         let six = matches!(e, Endpoints::V6 { .. });
@@ -1815,7 +2298,7 @@ mod tests {
                 HelloOption::DrPriority(7),
                 HelloOption::AddressList(vec![a(9)]),
             ]),
-            Message::Register(Register { null: false, packet: vec![0x45, 0, 0, 20] }),
+            Message::Register(Register { null: false, packet: inner_header(six) }),
             Message::RegisterStop { group: g, source: a(0) },
             Message::JoinPrune(JoinPrune {
                 upstream: a(1),
@@ -1827,6 +2310,7 @@ mod tests {
                 }],
             }),
             Message::Bootstrap(Bootstrap {
+                no_forward: false,
                 fragment_tag: 1,
                 hash_mask_len: 30,
                 priority: 1,
@@ -1884,13 +2368,15 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         assert_eq!(d.finish(), Err(PimError::Version(3)));
         // Too many bytes fail once past the limit, and the buffer stays
-        // bounded.
-        let mut d = Decoder::new(e);
-        assert!(d.feed(&[0x26]).is_ok());
-        assert!(d.feed(&vec![0; MAX_MESSAGE - 1]).is_ok());
-        assert_eq!(d.buffered(), MAX_MESSAGE);
-        assert_eq!(d.feed(&[0, 0]), Err(PimError::TooLong));
-        assert_eq!(d.buffered(), 0);
+        // bounded. The limit is the packet's: smaller over IPv4.
+        for (e, max) in [(e, MAX_MESSAGE_V4), (v6_ends(), MAX_MESSAGE)] {
+            let mut d = Decoder::new(e);
+            assert!(d.feed(&[0x26]).is_ok());
+            assert!(d.feed(&vec![0; max - 1]).is_ok());
+            assert_eq!(d.buffered(), max);
+            assert_eq!(d.feed(&[0, 0]), Err(PimError::TooLong));
+            assert_eq!(d.buffered(), 0);
+        }
     }
 
     /// A random number source that also knows the packet's family.
@@ -1926,6 +2412,57 @@ mod tests {
             Group { address, mask_len, bidirectional: self.coin(), zone: self.coin() }
         }
 
+        /// A group with no Z bit, for messages outside the Bootstrap
+        /// mechanism.
+        fn plain_group(&mut self) -> Group {
+            Group { zone: false, ..self.group() }
+        }
+
+        /// One multicast group with a full mask, for a Join/Prune.
+        fn multicast_group(&mut self) -> Group {
+            let address = match self.addr() {
+                IpAddr::V4(a) => IpAddr::V4(Ipv4Addr::from(u32::from(a) & 0x0fff_ffff | 0xe000_0000)),
+                IpAddr::V6(a) => {
+                    let mut o = a.octets();
+                    o[0] = 0xff;
+                    IpAddr::V6(Ipv6Addr::from(o))
+                }
+            };
+            Group { address, mask_len: full_mask(address), bidirectional: self.coin(), zone: false }
+        }
+
+        /// A Bootstrap's groups: the first may have the Z bit, and in a
+        /// scoped IPv6 fragment every group has a mask of at least 16 bits
+        /// and the first group's scope.
+        fn bootstrap_groups(&mut self) -> Vec<BootstrapGroup> {
+            let mut groups: Vec<BootstrapGroup> = Vec::new();
+            for i in 0..self.below(3) {
+                let mut group = self.group();
+                group.zone &= i == 0;
+                if let Some(first) = groups.first()
+                    && first.group.zone
+                    && let (IpAddr::V6(f), IpAddr::V6(a)) = (first.group.address, group.address)
+                {
+                    let mut o = a.octets();
+                    o[1] = (o[1] & 0xf0) | (f.octets()[1] & 0x0f);
+                    group.address = IpAddr::V6(Ipv6Addr::from(o));
+                }
+                if group.address.is_ipv6() && (group.zone || groups.first().is_some_and(|f| f.group.zone)) {
+                    group.mask_len = group.mask_len.max(16);
+                }
+                let rps: Vec<BootstrapRp> = (0..self.below(3))
+                    .map(|_| BootstrapRp {
+                        address: self.addr(),
+                        holdtime: self.next() as u16,
+                        priority: self.next() as u8,
+                    })
+                    .collect();
+                let rp_count = (rps.len() + self.below(250)) as u8;
+                groups.push(BootstrapGroup { group, rp_count, rps });
+            }
+            groups
+        }
+
         fn source(&mut self) -> Source {
             let address = self.addr();
             let f = self.next();
@@ -1955,41 +2492,44 @@ mod tests {
             }
             1 => Message::Register(Register {
                 null: rng.coin(),
-                packet: (0..rng.below(40)).map(|_| rng.next() as u8).collect(),
+                packet: {
+                    let mut p = inner_header(rng.1);
+                    p.extend((0..rng.below(40)).map(|_| rng.next() as u8));
+                    p
+                },
             }),
-            2 => Message::RegisterStop { group: rng.group(), source: rng.addr() },
+            2 => Message::RegisterStop { group: rng.plain_group(), source: rng.addr() },
             3 => Message::JoinPrune(JoinPrune {
                 upstream: rng.addr(),
                 holdtime: rng.next() as u16,
                 groups: (0..rng.below(4))
-                    .map(|_| JoinPruneGroup {
-                        group: rng.group(),
-                        joins: (0..rng.below(3)).map(|_| rng.source()).collect(),
-                        prunes: (0..rng.below(3)).map(|_| rng.source()).collect(),
+                    .map(|_| {
+                        let group = rng.multicast_group();
+                        let mut joins: Vec<Source> = (0..rng.below(3)).map(|_| rng.source()).collect();
+                        let mut prunes: Vec<Source> = (0..rng.below(3)).map(|_| rng.source()).collect();
+                        // At most one (*,G) entry across both lists.
+                        let mut seen = false;
+                        for s in joins.iter_mut().chain(prunes.iter_mut()) {
+                            s.wildcard &= !seen;
+                            seen |= s.wildcard;
+                        }
+                        JoinPruneGroup { group, joins, prunes }
                     })
                     .collect(),
             }),
-            4 => Message::Bootstrap(Bootstrap {
-                fragment_tag: rng.next() as u16,
-                hash_mask_len: rng.next() as u8,
-                priority: rng.next() as u8,
-                bsr: rng.addr(),
-                groups: (0..rng.below(3))
-                    .map(|_| BootstrapGroup {
-                        group: rng.group(),
-                        rp_count: rng.next() as u8,
-                        rps: (0..rng.below(3))
-                            .map(|_| BootstrapRp {
-                                address: rng.addr(),
-                                holdtime: rng.next() as u16,
-                                priority: rng.next() as u8,
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-            }),
+            4 => {
+                let bsr = rng.addr();
+                Message::Bootstrap(Bootstrap {
+                    no_forward: rng.coin(),
+                    fragment_tag: rng.next() as u16,
+                    hash_mask_len: rng.below(usize::from(full_mask(bsr)) + 1) as u8,
+                    priority: rng.next() as u8,
+                    bsr,
+                    groups: rng.bootstrap_groups(),
+                })
+            }
             5 => Message::Assert(Assert {
-                group: rng.group(),
+                group: rng.plain_group(),
                 source: rng.addr(),
                 rpt: rng.coin(),
                 metric_preference: rng.next() & MAX_METRIC_PREFERENCE,
@@ -1999,20 +2539,31 @@ mod tests {
                 priority: rng.next() as u8,
                 holdtime: rng.next() as u16,
                 rp: rng.addr(),
-                groups: (0..rng.below(4)).map(|_| rng.group()).collect(),
+                groups: (0..1 + rng.below(4)).map(|_| rng.group()).collect(),
             }),
             _ => Message::Other { kind: [6, 7, 9, 15][rng.below(4)], body: vec![1; rng.below(10)] },
         }
     }
 
     /// What the fuzz target checks: parse and the decoder agree, whole and
-    /// a byte at a time, and whatever parses writes back to bytes that
-    /// read the same.
+    /// a byte at a time, and whatever parses, except a C-RP-Adv with no
+    /// groups, writes back to bytes that read the same.
     fn check_bytes(data: &[u8], e: &Endpoints) {
         let parsed = Message::parse(data, e);
         assert_eq!(decode_chunked(data, e, data.len()), parsed);
         assert_eq!(decode_chunked(data, e, 1), parsed);
         if let Ok(m) = &parsed {
+            assert!(data.len() <= e.max_message());
+            if let Message::Bootstrap(b) = m {
+                assert_eq!(b.no_forward, data[1] & 0x80 != 0);
+            }
+            // A C-RP-Adv with no groups is read but never written.
+            if let Message::CandidateRp(CandidateRp { groups, .. }) = m
+                && groups.is_empty()
+            {
+                assert_eq!(m.to_bytes(e), Err(PimError::Count));
+                return;
+            }
             let b = m.to_bytes(e).unwrap();
             assert_eq!(b.len(), data.len());
             assert_eq!(Message::parse(&b, e).as_ref(), Ok(m));

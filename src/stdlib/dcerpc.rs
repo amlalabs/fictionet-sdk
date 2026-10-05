@@ -166,6 +166,13 @@ pub mod flags {
     pub const OBJECT_UUID: u8 = 0x80;
 }
 
+/// Bits of a fault's flags byte, the byte after its cancel count, which
+/// C706 reserves and MS-RPCE 2.2.2.8 gives a meaning.
+pub mod fault_flags {
+    /// The stub data is RPC extended error information (MS-EERR).
+    pub const EXTENDED_ERROR: u8 = 0x01;
+}
+
 /// Answers to one presentation context in a bind_ack.
 pub mod result {
     /// The context is accepted.
@@ -436,7 +443,12 @@ impl Default for DataRep {
 
 /// An authentication verifier: the trailer at the end of a PDU and the
 /// security provider's token. The padding before it and the reserved
-/// byte are not kept; the writer works the padding out.
+/// byte are not kept; the writer works the padding out, as zeros.
+/// [`Decoder::next_frame`] gives a PDU's bytes as they came, padding
+/// included, for a world that checks or decrypts a verifier. To sign one
+/// it writes, a world writes the PDU with a token of the right length,
+/// then fills the token in over the last bytes (and, for privacy,
+/// encrypts the stub data and padding in place).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Auth {
     /// The authentication type, one of [`auth_type`].
@@ -534,22 +546,26 @@ pub enum Body {
     Request { alloc_hint: u32, context_id: u16, opnum: u16, object: Option<Uuid>, stub: Vec<u8> },
     /// Type 2: a call's results.
     Response { alloc_hint: u32, context_id: u16, cancel_count: u8, stub: Vec<u8> },
-    /// Type 3: a call failed with `status`, one of [`status`]. Any stub
-    /// data is extended error information.
-    Fault { alloc_hint: u32, context_id: u16, cancel_count: u8, status: u32, stub: Vec<u8> },
+    /// Type 3: a call failed with `status`, one of [`status`].
+    /// `fault_flags` holds bits of [`fault_flags`]: with
+    /// [`fault_flags::EXTENDED_ERROR`] set the stub data is extended error
+    /// information (MS-RPCE 2.2.2.8), and otherwise it is C706's fault
+    /// stub data, which MS-RPCE peers ignore.
+    Fault { alloc_hint: u32, context_id: u16, cancel_count: u8, fault_flags: u8, status: u32, stub: Vec<u8> },
     /// Type 11.
     Bind(Bind),
     /// Type 12.
     BindAck(BindAck),
-    /// Type 13.
+    /// Type 13. It never has an auth verifier.
     BindNak(BindNak),
     /// Type 14.
     AlterContext(Bind),
     /// Type 15.
     AlterContextResp(BindAck),
-    /// Type 16. Its body is 4 bytes of padding, which are not kept.
+    /// Type 16. Its body is 4 bytes of padding, which are not kept, and
+    /// it always has an auth verifier.
     Auth3,
-    /// Type 17.
+    /// Type 17. It never has an auth verifier.
     Shutdown,
     /// Type 18.
     Cancel,
@@ -600,10 +616,11 @@ impl Body {
                 cancel_count: *cancel_count,
                 stub: Vec::new(),
             },
-            Body::Fault { alloc_hint, context_id, cancel_count, status, .. } => Body::Fault {
+            Body::Fault { alloc_hint, context_id, cancel_count, fault_flags, status, .. } => Body::Fault {
                 alloc_hint: *alloc_hint,
                 context_id: *context_id,
                 cancel_count: *cancel_count,
+                fault_flags: *fault_flags,
                 status: *status,
                 stub: Vec::new(),
             },
@@ -659,12 +676,18 @@ pub enum Error {
     FragLength(u16),
     /// A packet type this module does not read: connectionless or unknown.
     Type(u8),
-    /// The auth length leaves no room for the trailer before it.
+    /// The auth length leaves no room for the trailer before it, or the
+    /// packet type cannot have it: an auth3 needs a verifier (MS-RPCE
+    /// 2.2.2.10), and a bind_nak or shutdown has none (C706 12.6.4).
     AuthLength(u16),
-    /// The padding before the trailer runs back into the header.
+    /// The padding before the trailer runs back into the header, or the
+    /// trailer does not start on a 4-byte boundary (C706 13.2.6.1).
     AuthPad(u8),
     /// The body is shorter than its fields, or its counts run past it.
     Truncated,
+    /// A bind_ack's secondary address does not end with its terminating
+    /// zero (C706 12.6.3.1).
+    Address,
 }
 
 impl Error {
@@ -681,9 +704,10 @@ impl std::fmt::Display for Error {
             Error::IntegerRep(r) => write!(f, "integer representation {r}, not 0 or 1"),
             Error::FragLength(n) => write!(f, "fragment length {n}, shorter than the header"),
             Error::Type(t) => write!(f, "packet type {t} is not a connection-oriented PDU"),
-            Error::AuthLength(n) => write!(f, "auth length {n} does not fit in the fragment"),
-            Error::AuthPad(n) => write!(f, "auth padding of {n} bytes runs into the header"),
+            Error::AuthLength(n) => write!(f, "auth length {n} does not fit in the fragment or the packet type"),
+            Error::AuthPad(n) => write!(f, "auth padding of {n} bytes runs into the header or misaligns the trailer"),
             Error::Truncated => f.write_str("the PDU body is shorter than its fields"),
+            Error::Address => f.write_str("the secondary address does not end with a zero byte"),
         }
     }
 }
@@ -712,6 +736,10 @@ pub enum EncodeError {
     /// Splitting a PDU that has an auth verifier, which each fragment
     /// needs its own of.
     FragmentAuth,
+    /// An auth3 with no auth verifier, or a bind_nak or shutdown with one.
+    Auth,
+    /// A nonempty secondary address without its terminating zero.
+    Address,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -725,6 +753,8 @@ impl std::fmt::Display for EncodeError {
             EncodeError::TooLong => f.write_str("longer than one fragment may be"),
             EncodeError::FragSize => f.write_str("fragments too small for the header or too many"),
             EncodeError::FragmentAuth => f.write_str("a PDU with an auth verifier cannot be split"),
+            EncodeError::Auth => f.write_str("this packet type cannot have, or must have, an auth verifier"),
+            EncodeError::Address => f.write_str("the secondary address does not end with a zero byte"),
         }
     }
 }
@@ -794,6 +824,10 @@ impl Pdu {
         {
             return Err(EncodeError::ObjectFlag);
         }
+        match (&self.body, &self.auth) {
+            (Body::Auth3, None) | (Body::BindNak(_) | Body::Shutdown, Some(_)) => return Err(EncodeError::Auth),
+            _ => {}
+        }
         let mut w = W { out: Vec::with_capacity(64), le };
         w.out.extend_from_slice(&[VERSION, self.version_minor, self.body.ptype(), self.flags]);
         w.out.extend_from_slice(&self.drep.0);
@@ -819,10 +853,10 @@ impl Pdu {
                 stub_start = Some(w.out.len());
                 w.bytes(stub)?;
             }
-            Body::Fault { alloc_hint, context_id, cancel_count, status, stub } => {
+            Body::Fault { alloc_hint, context_id, cancel_count, fault_flags, status, stub } => {
                 w.u32(*alloc_hint);
                 w.u16(*context_id);
-                w.out.extend_from_slice(&[*cancel_count, 0]);
+                w.out.extend_from_slice(&[*cancel_count, *fault_flags]);
                 w.u32(*status);
                 w.u32(0);
                 stub_start = Some(w.out.len());
@@ -847,6 +881,9 @@ impl Pdu {
                 w.u16(a.max_xmit_frag);
                 w.u16(a.max_recv_frag);
                 w.u32(a.assoc_group);
+                if a.secondary_address.last().is_some_and(|&b| b != 0) {
+                    return Err(EncodeError::Address);
+                }
                 let n = u16::try_from(a.secondary_address.len()).map_err(|_| EncodeError::TooLong)?;
                 w.u16(n);
                 w.bytes(&a.secondary_address)?;
@@ -903,10 +940,14 @@ impl Pdu {
     /// Splits a request or response into fragments of at most `max_frag`
     /// bytes each, such as the `max_recv_frag` the peer bound with. The
     /// first has [`flags::FIRST_FRAG`], the last [`flags::LAST_FRAG`],
-    /// and each keeps the PDU's other flags and fields. Any other PDU
-    /// comes back whole. A PDU with an auth verifier is an error, since
-    /// each fragment's verifier is the security provider's to make, and so
-    /// is a split into more than [`MAX_FRAGMENTS`] fragments.
+    /// and each keeps the PDU's other flags and fields, except that a
+    /// nonzero `alloc_hint` counts down by the stub data already sent, as
+    /// MS-RPCE 2.2.2.6 asks. Any other PDU comes back whole if it writes
+    /// in at most `max_frag` bytes, and is [`EncodeError::FragSize`] if
+    /// it is longer. A PDU with an auth verifier is an error, since each
+    /// fragment's verifier is the security provider's to make, and so is
+    /// a split into more than [`MAX_FRAGMENTS`] fragments. Every other
+    /// error [`Pdu::to_bytes`] gives is checked before anything is copied.
     pub fn fragments(&self, max_frag: u16) -> Result<Vec<Pdu>, EncodeError> {
         if self.auth.is_some() {
             return Err(EncodeError::FragmentAuth);
@@ -914,8 +955,20 @@ impl Pdu {
         let header = match &self.body {
             Body::Request { object: Some(_), .. } => HEADER_LEN + 24,
             Body::Request { .. } | Body::Response { .. } => HEADER_LEN + 8,
-            _ => return Ok(vec![self.clone()]),
+            _ => {
+                // The writer stops at MAX_FRAG bytes, so this copies at
+                // most one fragment's worth.
+                if self.to_bytes()?.len() > usize::from(max_frag) {
+                    return Err(EncodeError::FragSize);
+                }
+                return Ok(vec![self.clone()]);
+            }
         };
+        // The body without its stub, cloned once per fragment, so the
+        // stub is copied once in all rather than once per fragment.
+        let template = self.body.clone_without_stub();
+        // The header the fragments share, written once to check it.
+        Pdu { auth: None, body: template.clone(), ..*self }.to_bytes()?;
         let room = usize::from(max_frag).checked_sub(header).filter(|&r| r > 0).ok_or(EncodeError::FragSize)?;
         let stub = self.body.stub().unwrap_or(&[]);
         let n = stub.len().div_ceil(room).max(1);
@@ -923,9 +976,6 @@ impl Pdu {
             return Err(EncodeError::FragSize);
         }
         let base = self.flags & !(flags::FIRST_FRAG | flags::LAST_FRAG);
-        // The body without its stub, cloned once per fragment, so the
-        // stub is copied once in all rather than once per fragment.
-        let template = self.body.clone_without_stub();
         let pieces: Vec<&[u8]> = if stub.is_empty() { vec![&[]] } else { stub.chunks(room).collect() };
         let last = n - 1;
         let mut out = Vec::with_capacity(n);
@@ -938,6 +988,12 @@ impl Pdu {
                 f |= flags::LAST_FRAG;
             }
             let mut body = template.clone();
+            let sent = u32::try_from(i * room).unwrap_or(u32::MAX);
+            if let Body::Request { alloc_hint, .. } | Body::Response { alloc_hint, .. } = &mut body
+                && *alloc_hint != 0
+            {
+                *alloc_hint = alloc_hint.saturating_sub(sent);
+            }
             if let Some(s) = body.stub_mut() {
                 *s = piece.to_vec();
             }
@@ -970,6 +1026,11 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
     if !matches!(kind, 0 | 2 | 3 | 11..=19) {
         return Err(Error::Type(kind));
     }
+    match kind {
+        ptype::AUTH3 if auth_len == 0 => return Err(Error::AuthLength(0)),
+        ptype::BIND_NAK | ptype::SHUTDOWN if auth_len > 0 => return Err(Error::AuthLength(auth_len)),
+        _ => {}
+    }
     let mut end = f.len();
     let mut auth = None;
     if auth_len > 0 {
@@ -979,7 +1040,7 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
             .filter(|&t| t >= HEADER_LEN)
             .ok_or(Error::AuthLength(auth_len))?;
         let pad = f[t + 2];
-        end = t.checked_sub(usize::from(pad)).filter(|&e| e >= HEADER_LEN).ok_or(Error::AuthPad(pad))?;
+        end = t.checked_sub(usize::from(pad)).filter(|&e| e >= HEADER_LEN && t % 4 == 0).ok_or(Error::AuthPad(pad))?;
         auth = Some(Auth {
             kind: f[t],
             level: f[t + 1],
@@ -1000,13 +1061,12 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
             Body::Response { alloc_hint, context_id, cancel_count, stub: r.rest() }
         }
         ptype::FAULT => {
-            let (alloc_hint, context_id, cancel_count) = (r.u32()?, r.u16()?, r.u8()?);
-            r.take(1)?;
+            let (alloc_hint, context_id, cancel_count, fault_flags) = (r.u32()?, r.u16()?, r.u8()?, r.u8()?);
             let status = r.u32()?;
             // The reserved word after the status; some senders leave it
             // out of a fault with no stub data.
             let stub = if r.take(4).is_ok() { r.rest() } else { Vec::new() };
-            Body::Fault { alloc_hint, context_id, cancel_count, status, stub }
+            Body::Fault { alloc_hint, context_id, cancel_count, fault_flags, status, stub }
         }
         ptype::BIND | ptype::ALTER_CONTEXT => {
             let b = read_bind(&mut r)?;
@@ -1028,7 +1088,10 @@ fn parse_fragment(f: &[u8]) -> Result<Pdu, Error> {
             }
             Body::BindNak(BindNak { reason, versions })
         }
-        ptype::AUTH3 => Body::Auth3,
+        ptype::AUTH3 => {
+            r.take(4)?;
+            Body::Auth3
+        }
         ptype::SHUTDOWN => Body::Shutdown,
         ptype::CO_CANCEL => Body::Cancel,
         _ => Body::Orphaned,
@@ -1059,6 +1122,9 @@ fn read_bind_ack(r: &mut R) -> Result<BindAck, Error> {
     let (max_xmit_frag, max_recv_frag, assoc_group) = (r.u16()?, r.u16()?, r.u32()?);
     let n = r.u16()?;
     let secondary_address = r.take(usize::from(n))?.to_vec();
+    if secondary_address.last().is_some_and(|&b| b != 0) {
+        return Err(Error::Address);
+    }
     r.take((4 - r.pos % 4) % 4)?;
     let k = r.u8()?;
     r.take(3)?;
@@ -1170,6 +1236,11 @@ impl W {
     }
 }
 
+/// The auth type, level and context ID of a PDU's verifier, if it has one.
+fn security(p: &Pdu) -> Option<(u8, u8, u32)> {
+    p.auth.as_ref().map(|a| (a.kind, a.level, a.context_id))
+}
+
 fn rd16(le: bool, b: &[u8], i: usize) -> u16 {
     let v = [b[i], b[i + 1]];
     if le { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
@@ -1223,22 +1294,33 @@ impl Decoder {
     /// once, and the stream goes on after it. An error that breaks the
     /// stream ([`Error::breaks_stream`]) comes back on every call.
     pub fn next_pdu(&mut self) -> Option<Result<Pdu, Error>> {
+        self.next_frame().map(|(r, _)| r)
+    }
+
+    /// Like [`Decoder::next_pdu`], with the PDU's bytes as they came. A
+    /// world that checks or decrypts auth verifiers needs them: the
+    /// security provider covers the header, the stub data and the padding
+    /// before the trailer, and at [`auth_level::PKT_PRIVACY`] that padding
+    /// is ciphertext, which a [`Pdu`] does not keep. After an error that
+    /// breaks the stream the bytes are empty.
+    pub fn next_frame(&mut self) -> Option<(Result<Pdu, Error>, &[u8])> {
         if let Some(e) = self.failed {
-            return Some(Err(e));
+            return Some((Err(e), &[]));
         }
         let b = &self.buf[self.start..];
         match Pdu::frame_length(b) {
             Ok(Some(n)) if b.len() >= n => {
                 let r = parse_fragment(&b[..n]);
+                let at = self.start;
                 self.start += n;
-                Some(r)
+                Some((r, &self.buf[at..at + n]))
             }
             Ok(_) => None,
             Err(e) => {
                 self.failed = Some(e);
                 self.buf = Vec::new();
                 self.start = 0;
-                Some(Err(e))
+                Some((Err(e), &[]))
             }
         }
     }
@@ -1259,7 +1341,9 @@ pub enum ReassemblyError {
         call_id: u32,
     },
     /// A later fragment came with no call being joined, or for another
-    /// call ID, type, context or operation.
+    /// call ID, type, context or operation, or with another auth type,
+    /// level or context ID than the first fragment, or with a verifier
+    /// when the first had none or the other way round (MS-RPCE 2.2.2.11).
     Unexpected {
         /// The fragment's call ID.
         call_id: u32,
@@ -1289,13 +1373,19 @@ impl std::error::Error for ReassemblyError {}
 /// orphaned PDU for the call being joined drops it.
 ///
 /// A joined call keeps the first fragment's fields and flags, with
-/// [`flags::LAST_FRAG`] added, and has no auth verifier: each fragment's
-/// verifier is checked, if the world checks it, before the fragment is
-/// pushed.
+/// [`flags::LAST_FRAG`] added. A cancel that came on any fragment stays:
+/// [`flags::PENDING_CANCEL`] is set if any fragment had it, and a
+/// response's `cancel_count` is the highest any fragment gave. The joined
+/// call has no auth verifier: each fragment's verifier is checked, if the
+/// world checks it, before the fragment is pushed. Every fragment must
+/// use the first one's auth type, level and context ID.
 #[derive(Debug)]
 pub struct Reassembler {
     limit: usize,
     partial: Option<Pdu>,
+    /// The first fragment's auth type, level and context ID, if it had a
+    /// verifier.
+    security: Option<(u8, u8, u32)>,
 }
 
 impl Default for Reassembler {
@@ -1308,7 +1398,7 @@ impl Reassembler {
     /// A reassembler that joins calls of up to `limit` bytes of stub data,
     /// or [`MAX_STUB`] if that is less.
     pub fn new(limit: usize) -> Reassembler {
-        Reassembler { limit: limit.min(MAX_STUB), partial: None }
+        Reassembler { limit: limit.min(MAX_STUB), partial: None, security: None }
     }
 
     /// How many bytes of stub data are held for the call being joined.
@@ -1344,11 +1434,13 @@ impl Reassembler {
             if last {
                 return Ok(Some(pdu));
             }
+            self.security = security(&pdu);
             self.partial = Some(Pdu { auth: None, ..pdu });
             return Ok(None);
         }
         let Some(mut p) = self.partial.take() else { return Err(ReassemblyError::Unexpected { call_id }) };
         let same = p.call_id == call_id
+            && self.security == security(&pdu)
             && match (&p.body, &pdu.body) {
                 (
                     Body::Request { context_id: a, opnum: b, object: c, .. },
@@ -1365,6 +1457,12 @@ impl Reassembler {
             return Err(ReassemblyError::TooLong { call_id });
         }
         stub.extend_from_slice(pdu.body.stub().unwrap_or(&[]));
+        p.flags |= pdu.flags & flags::PENDING_CANCEL;
+        if let (Body::Response { cancel_count: a, .. }, Body::Response { cancel_count: b, .. }) =
+            (&mut p.body, &pdu.body)
+        {
+            *a = (*a).max(*b);
+        }
         if last {
             p.flags |= flags::LAST_FRAG;
             Ok(Some(p))
@@ -1437,6 +1535,7 @@ mod tests {
                     alloc_hint: 0,
                     context_id: 0,
                     cancel_count: 1,
+                    fault_flags: 0,
                     status: status::OP_RNG_ERROR,
                     stub: vec![],
                 },
@@ -1450,7 +1549,15 @@ mod tests {
                 Body::BindNak(BindNak { reason: reject::PROTOCOL_VERSION_NOT_SUPPORTED, versions: vec![(5, 0)] }),
             ),
             Pdu::new(1, Body::BindNak(BindNak { reason: 0, versions: vec![] })),
-            Pdu::new(1, Body::Auth3),
+            Pdu {
+                auth: Some(Auth {
+                    kind: auth_type::WINNT,
+                    level: auth_level::CONNECT,
+                    context_id: 0,
+                    value: vec![1; 9],
+                }),
+                ..Pdu::new(1, Body::Auth3)
+            },
             Pdu::new(1, Body::Shutdown),
             Pdu::new(1, Body::Cancel),
             Pdu::new(1, Body::Orphaned),
@@ -1495,6 +1602,9 @@ mod tests {
             let bytes = round_trip(&p);
             for n in 0..bytes.len() {
                 assert_eq!(Pdu::parse(&bytes[..n]), Ok(None));
+            }
+            if matches!(p.body, Body::BindNak(_) | Body::Shutdown) {
+                continue;
             }
             p.auth = Some(Auth {
                 kind: auth_type::WINNT,
@@ -1572,7 +1682,14 @@ mod tests {
         assert_eq!(b[24..40], [4, 3, 2, 1, 6, 5, 8, 7, 9, 10, 11, 12, 13, 14, 15, 16]);
         let fault = Pdu::new(
             7,
-            Body::Fault { alloc_hint: 0, context_id: 0, cancel_count: 0, status: status::UNK_IF, stub: vec![] },
+            Body::Fault {
+                alloc_hint: 0,
+                context_id: 0,
+                cancel_count: 0,
+                fault_flags: 0,
+                status: status::UNK_IF,
+                stub: vec![],
+            },
         );
         let b = round_trip(&fault);
         assert_eq!(b.len(), 32);
@@ -1603,12 +1720,6 @@ mod tests {
         let b = round_trip(&p);
         assert_eq!(b.len(), 72 + 8 + 40);
         assert_eq!(b[74], 0);
-        // A bind_nak with one version ends at 21, so 3 bytes of padding.
-        let mut p = Pdu::new(2, Body::BindNak(BindNak { reason: 1, versions: vec![(5, 0)] }));
-        p.auth = Some(Auth { kind: 0x0a, level: 2, context_id: 0, value: vec![1] });
-        let b = round_trip(&p);
-        assert_eq!(b.len(), 24 + 8 + 1);
-        assert_eq!(b[21..27], [0, 0, 0, 0x0a, 2, 3]);
         // Auth3 carries 4 bytes of padding before the trailer.
         let mut p = Pdu::new(3, Body::Auth3);
         p.auth = Some(Auth { kind: 0x0a, level: 2, context_id: 0, value: vec![1, 2] });
@@ -1642,10 +1753,10 @@ mod tests {
             assert_eq!(Pdu::parse(&header(t, 16, 0)), Err(Error::Type(t)));
         }
         // An auth length the fragment cannot hold.
-        assert_eq!(Pdu::parse(&header(17, 24, 1)), Err(Error::AuthLength(1)));
-        assert_eq!(Pdu::parse(&header(17, 25, 1)).unwrap().unwrap().0.auth.unwrap().value, [0]);
+        assert_eq!(Pdu::parse(&header(18, 24, 1)), Err(Error::AuthLength(1)));
+        assert_eq!(Pdu::parse(&header(18, 25, 1)).unwrap().unwrap().0.auth.unwrap().value, [0]);
         // Padding that runs into the header.
-        let mut b = header(17, 25, 1);
+        let mut b = header(18, 25, 1);
         b[18] = 1;
         assert_eq!(Pdu::parse(&b), Err(Error::AuthPad(1)));
         // Bodies shorter than their fields.
@@ -1680,7 +1791,7 @@ mod tests {
             Pdu::parse(&header(13, 18, 0)).unwrap().unwrap().0.body,
             Body::BindNak(BindNak { reason: 0, versions: vec![] })
         );
-        for e in [Error::Type(1), Error::AuthLength(1), Error::AuthPad(1), Error::Truncated] {
+        for e in [Error::Type(1), Error::AuthLength(1), Error::AuthPad(1), Error::Truncated, Error::Address] {
             assert!(!e.breaks_stream());
             assert!(!e.to_string().is_empty());
         }
@@ -1723,7 +1834,7 @@ mod tests {
             max_xmit_frag: 0,
             max_recv_frag: 0,
             assoc_group: 0,
-            secondary_address: vec![1; 70000],
+            secondary_address: vec![0; 70000],
             results: vec![],
         };
         assert_eq!(Pdu::new(1, Body::BindAck(ack.clone())).to_bytes(), Err(EncodeError::TooLong));
@@ -1738,6 +1849,8 @@ mod tests {
             EncodeError::TooLong,
             EncodeError::FragSize,
             EncodeError::FragmentAuth,
+            EncodeError::Auth,
+            EncodeError::Address,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -1766,7 +1879,7 @@ mod tests {
         assert_eq!(r.pending(), 0);
         // An empty stub is one fragment; other PDUs come back whole.
         assert_eq!(request(vec![]).fragments(25).unwrap(), [request(vec![])]);
-        assert_eq!(bind().fragments(16).unwrap(), [bind()]);
+        assert_eq!(bind().fragments(72).unwrap(), [bind()]);
         // Too small for the header, and a PDU with a verifier.
         assert_eq!(request(vec![1]).fragments(24), Err(EncodeError::FragSize));
         let mut p = request(vec![1]);
@@ -1852,6 +1965,235 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
+    }
+
+    fn auth(context_id: u32) -> Auth {
+        Auth { kind: auth_type::WINNT, level: auth_level::PKT_INTEGRITY, context_id, value: vec![7; 16] }
+    }
+
+    #[test]
+    fn fragments_of_other_pdus_are_checked_first() {
+        // A bind_ack too long to write is refused, not copied.
+        let ack = BindAck {
+            max_xmit_frag: 0,
+            max_recv_frag: 0,
+            assoc_group: 0,
+            secondary_address: vec![0; 1 << 20],
+            results: vec![],
+        };
+        assert_eq!(Pdu::new(1, Body::BindAck(ack)).fragments(4096), Err(EncodeError::TooLong));
+        let fault = Body::Fault {
+            alloc_hint: 0,
+            context_id: 0,
+            cancel_count: 0,
+            fault_flags: 0,
+            status: 0,
+            stub: vec![0; 1 << 20],
+        };
+        assert_eq!(Pdu::new(1, fault).fragments(4096), Err(EncodeError::TooLong));
+        // A PDU that writes but is longer than the fragments asked for.
+        assert_eq!(bind().fragments(71), Err(EncodeError::FragSize));
+        assert_eq!(bind().fragments(72).unwrap(), [bind()]);
+        // A request the writer would refuse is refused before it is split.
+        let mut p = request(vec![1; 300]);
+        p.flags |= flags::OBJECT_UUID;
+        assert_eq!(p.fragments(100), Err(EncodeError::ObjectFlag));
+        let mut p = request(vec![1; 300]);
+        p.version_minor = 2;
+        assert_eq!(p.fragments(100), Err(EncodeError::Version(2)));
+    }
+
+    #[test]
+    fn fragments_count_alloc_hint_down() {
+        // MS-RPCE 2.2.2.6: each fragment's hint is the stub data left.
+        let parts = request(vec![0; 1000]).fragments(124).unwrap();
+        let hints: Vec<u32> = parts
+            .iter()
+            .map(|p| match p.body {
+                Body::Request { alloc_hint, .. } => alloc_hint,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(hints, [1000, 900, 800, 700, 600, 500, 400, 300, 200, 100]);
+        // A zero hint stays zero.
+        let mut p = request(vec![0; 300]);
+        if let Body::Request { alloc_hint, .. } = &mut p.body {
+            *alloc_hint = 0;
+        }
+        for f in p.fragments(124).unwrap() {
+            assert!(matches!(f.body, Body::Request { alloc_hint: 0, .. }));
+        }
+    }
+
+    #[test]
+    fn reassembly_keeps_one_security_context() {
+        // MS-RPCE 2.2.2.11: every fragment of a call has the same auth
+        // type, level and context ID.
+        let parts = request(vec![1; 30]).fragments(34).unwrap();
+        let with = |i: usize, a: Option<Auth>| Pdu { auth: a, ..parts[i].clone() };
+        let mut r = Reassembler::default();
+        assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
+        assert_eq!(r.push(with(1, Some(auth(2)))), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
+        let other = Auth { level: auth_level::PKT_PRIVACY, ..auth(1) };
+        assert_eq!(r.push(with(1, Some(other))), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
+        assert_eq!(r.push(with(1, None)), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        assert_eq!(r.push(with(0, None)), Ok(None));
+        assert_eq!(r.push(with(1, Some(auth(1)))), Err(ReassemblyError::Unexpected { call_id: 7 }));
+        // The same context throughout joins, with a different token each.
+        assert_eq!(r.push(with(0, Some(auth(1)))), Ok(None));
+        assert_eq!(r.push(with(1, Some(Auth { value: vec![9; 16], ..auth(1) }))), Ok(None));
+        let got = r.push(with(2, Some(auth(1)))).unwrap().unwrap();
+        assert_eq!(got.body.stub(), Some(&[1; 30][..]));
+        assert_eq!(got.auth, None);
+    }
+
+    #[test]
+    fn reassembly_keeps_a_later_cancel() {
+        let resp = Pdu::new(4, Body::Response { alloc_hint: 0, context_id: 1, cancel_count: 0, stub: vec![5; 9] });
+        let mut parts = resp.fragments(28).unwrap();
+        assert_eq!(parts.len(), 3);
+        parts[2].flags |= flags::PENDING_CANCEL;
+        if let Body::Response { cancel_count, .. } = &mut parts[2].body {
+            *cancel_count = 1;
+        }
+        let mut r = Reassembler::default();
+        let mut got = None;
+        for p in parts {
+            got = r.push(p).unwrap();
+        }
+        let got = got.unwrap();
+        assert_eq!(got.flags & flags::PENDING_CANCEL, flags::PENDING_CANCEL);
+        assert!(matches!(got.body, Body::Response { cancel_count: 1, .. }));
+        // A cancel pending on a middle fragment of a request stays too.
+        let mut parts = request(vec![1; 30]).fragments(34).unwrap();
+        parts[1].flags |= flags::PENDING_CANCEL;
+        let mut r = Reassembler::default();
+        let mut got = None;
+        for p in parts {
+            got = r.push(p).unwrap();
+        }
+        assert_eq!(got.unwrap().flags & flags::PENDING_CANCEL, flags::PENDING_CANCEL);
+    }
+
+    #[test]
+    fn auth_rules_by_packet_type() {
+        // MS-RPCE 2.2.2.10: an auth3 has a verifier and 4 bytes of pad.
+        assert_eq!(Pdu::new(1, Body::Auth3).to_bytes(), Err(EncodeError::Auth));
+        let bare = [5, 0, 16, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0];
+        assert_eq!(Pdu::parse(&bare), Err(Error::AuthLength(0)));
+        // A trailer straight after the header, with no pad.
+        let mut b = bare.to_vec();
+        b.extend_from_slice(&[0x0a, 2, 0, 0, 0, 0, 0, 0, 1]);
+        b[8] = b.len() as u8;
+        b[10] = 1;
+        assert_eq!(Pdu::parse(&b), Err(Error::Truncated));
+        // C706 12.6.4.5 and 12.6.4.11: a bind_nak or shutdown has none.
+        for body in [Body::Shutdown, Body::BindNak(BindNak { reason: 0, versions: vec![] })] {
+            let mut p = Pdu::new(1, body);
+            let plain = p.to_bytes().unwrap();
+            p.auth = Some(auth(0));
+            assert_eq!(p.to_bytes(), Err(EncodeError::Auth));
+            let mut b = plain.clone();
+            b.resize(b.len().next_multiple_of(4), 0);
+            b.extend_from_slice(&[0x0a, 5, (b.len() - plain.len()) as u8, 0, 0, 0, 0, 0]);
+            b.extend_from_slice(&[7; 16]);
+            b[8] = b.len() as u8;
+            b[10] = 16;
+            assert_eq!(Pdu::parse(&b), Err(Error::AuthLength(16)));
+        }
+    }
+
+    #[test]
+    fn auth_trailer_is_aligned() {
+        // C706 13.2.6.1: the trailer starts on a 4-byte boundary. A request
+        // with one byte of stub and no padding puts it at 25.
+        let mut b = request(vec![9]).to_bytes().unwrap();
+        b.extend_from_slice(&[0x0a, 5, 0, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&[7; 16]);
+        b[8] = b.len() as u8;
+        b[10] = 16;
+        assert_eq!(b.len(), 49);
+        assert_eq!(Pdu::parse(&b), Err(Error::AuthPad(0)));
+        // With 3 bytes of padding it reads.
+        let mut b = request(vec![9]).to_bytes().unwrap();
+        b.extend_from_slice(&[0, 0, 0, 0x0a, 5, 3, 0, 0, 0, 0, 0]);
+        b.extend_from_slice(&[7; 16]);
+        b[8] = b.len() as u8;
+        b[10] = 16;
+        let p = Pdu::parse(&b).unwrap().unwrap().0;
+        assert_eq!(p.body.stub(), Some(&[9][..]));
+    }
+
+    #[test]
+    fn secondary_address_ends_with_zero() {
+        // C706 12.6.3.1: port_any_t's length counts its terminating zero.
+        let ack = |a: &[u8]| {
+            Pdu::new(
+                1,
+                Body::BindAck(BindAck {
+                    max_xmit_frag: 0,
+                    max_recv_frag: 0,
+                    assoc_group: 0,
+                    secondary_address: a.to_vec(),
+                    results: vec![],
+                }),
+            )
+        };
+        assert_eq!(ack(b"135").to_bytes(), Err(EncodeError::Address));
+        round_trip(&ack(b"135\0"));
+        round_trip(&ack(b""));
+        let mut b = ack(b"135\0").to_bytes().unwrap();
+        b[29] = b'6';
+        assert_eq!(Pdu::parse(&b), Err(Error::Address));
+    }
+
+    #[test]
+    fn fault_flags_round_trip() {
+        // MS-RPCE 2.2.2.8: the low bit of the byte after cancel_count says
+        // extended error information follows.
+        let p = Pdu::new(
+            3,
+            Body::Fault {
+                alloc_hint: 0x24,
+                context_id: 0,
+                cancel_count: 0,
+                fault_flags: fault_flags::EXTENDED_ERROR,
+                status: status::ACCESS_DENIED,
+                stub: vec![1, 2, 3, 4],
+            },
+        );
+        let b = round_trip(&p);
+        assert_eq!(b[23], 1);
+    }
+
+    #[test]
+    fn decoder_gives_each_frame_as_it_came() {
+        // A privacy-protected request: 3 bytes of stub and 13 bytes of
+        // padding that are ciphertext too, so not zeros.
+        let mut b = request(vec![1, 2, 3]).to_bytes().unwrap();
+        b.extend_from_slice(&[0xee; 13]);
+        b.extend_from_slice(&[0x0a, 6, 13, 0, 1, 0, 0, 0]);
+        b.extend_from_slice(&[7; 16]);
+        b[8] = b.len() as u8;
+        b[10] = 16;
+        let mut stream = b.clone();
+        stream.extend(BIND);
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&stream), stream.len());
+        let (p, frame) = d.next_frame().unwrap();
+        assert_eq!(frame, &b[..]);
+        let p = p.unwrap();
+        assert_eq!(p.body.stub(), Some(&[1, 2, 3][..]));
+        assert_eq!(p.auth.unwrap().context_id, 1);
+        let (p, frame) = d.next_frame().unwrap();
+        assert_eq!((p, frame), (Ok(bind()), &BIND[..]));
+        assert!(d.next_frame().is_none());
+        // A body that cannot be read still gives its bytes.
+        let bad = [5, 0, 9, 3, 0x10, 0, 0, 0, 16, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(d.feed(&bad), 16);
+        assert_eq!(d.next_frame(), Some((Err(Error::Type(9)), &bad[..])));
     }
 
     /// Feeds `data` in chunks of `chunk` bytes, taking PDUs out after each
@@ -1986,6 +2328,9 @@ mod tests {
         let mut samples = Vec::new();
         for mut p in all_bodies() {
             samples.push(p.to_bytes().unwrap());
+            if matches!(p.body, Body::BindNak(_) | Body::Shutdown) {
+                continue;
+            }
             p.auth = Some(Auth { kind: 9, level: 6, context_id: 1, value: vec![1, 2, 3] });
             samples.push(p.to_bytes().unwrap());
             p.drep = DataRep::BIG_ENDIAN;

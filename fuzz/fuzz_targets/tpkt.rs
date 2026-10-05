@@ -3,7 +3,7 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::cotp::{Reassembler, Tpdu};
+use fictionet::stdlib::cotp::{Connect, Data, Parameter, Reassembler, Tpdu, Variable};
 use fictionet::stdlib::tpkt::{
     Decoder, EncodeError, HEADER_LEN, Header, MAX_BUFFERED, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET,
     MIN_PAYLOAD, Packet, TpktError, write_message,
@@ -67,6 +67,64 @@ fn built(data: &[u8]) -> Result<()> {
         Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(Some((packet, bytes.len())))),
         Err(e) => assert_eq!(e, EncodeError::TooShort(n)),
     }
+    // A data TPDU a world builds, up to and past what one packet holds: the
+    // checked writer takes it exactly when it fits, and then it reads back
+    // the same.
+    let n = u.int_in_range(MAX_PAYLOAD - 300..=MAX_PAYLOAD + 10)?;
+    let n = if u.arbitrary()? { n } else { n % 300 };
+    let number: u8 = u.arbitrary()?;
+    let data = Tpdu::Data(Data {
+        eot: u.arbitrary()?,
+        number,
+        data: vec![0x41; n],
+    });
+    let fits = n <= MAX_PAYLOAD - 3 && number < 0x80;
+    match Packet::try_from_tpdu(&data) {
+        Ok(p) => {
+            assert!(fits);
+            assert_eq!(p.tpdu(), Ok(data));
+        }
+        Err(e) => {
+            assert!(!fits);
+            assert_eq!(e, EncodeError::Unrepresentable);
+        }
+    }
+    // A connection request a world builds, with any fields, parameters,
+    // raw header bytes and data. Whatever the checked writer takes reads
+    // back the same, with raw bytes read as the reader reads them.
+    let mut connect = Connect {
+        credit: u.arbitrary()?,
+        dst_ref: u.arbitrary()?,
+        src_ref: u.arbitrary()?,
+        class: u.arbitrary()?,
+        options: u.arbitrary()?,
+        variable: Variable::default(),
+        data: vec![0x42; u.int_in_range(0..=MAX_PAYLOAD)?],
+    };
+    let raw = u.arbitrary()?;
+    connect.variable = if raw {
+        let n = u.int_in_range(0..=300usize)?;
+        Variable::Raw(u.bytes(n)?.to_vec())
+    } else {
+        let mut params = Vec::new();
+        for _ in 0..u.int_in_range(0..=4)? {
+            let n = u.int_in_range(0..=260usize)?;
+            params.push(Parameter {
+                code: u.arbitrary()?,
+                value: u.bytes(n)?.to_vec(),
+            });
+        }
+        Variable::Parameters(params)
+    };
+    let t = Tpdu::ConnectionRequest(connect.clone());
+    if let Ok(p) = Packet::try_from_tpdu(&t) {
+        assert!(connect.credit < 16 && connect.class < 16 && connect.options < 16);
+        if let Variable::Raw(b) = &connect.variable {
+            connect.variable = Variable::parse(b);
+        }
+        assert_eq!(p.tpdu(), Ok(Tpdu::ConnectionRequest(connect)));
+        assert!(p.to_bytes().is_ok());
+    }
     // A message cut into data TPDUs reads back whole.
     let tpdu_size = u.int_in_range(0..=MAX_PACKET)?;
     let n = u.int_in_range(0..=4000usize)?;
@@ -106,14 +164,13 @@ fuzz_target!(|data: &[u8]| {
             // A packet read can be written, and reads back the same.
             let bytes = p.to_bytes().unwrap();
             assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
-            // A TPDU read is written back into a packet that reads back.
+            // A TPDU read is written back whole, into a packet that reads
+            // back as the same TPDU.
             if let Ok(t) = p.tpdu() {
-                let back = Packet::from_tpdu(&t);
+                let back = Packet::try_from_tpdu(&t).unwrap();
                 assert!(back.to_bytes().is_ok());
-                // The TPDU may read back tidied, such as with bad parameters
-                // dropped, but once tidied it stays the same.
-                let again = back.tpdu().unwrap();
-                assert_eq!(Packet::from_tpdu(&again).tpdu(), Ok(again));
+                assert_eq!(back.tpdu(), Ok(t.clone()));
+                assert_eq!(Packet::from_tpdu(&t), back);
             }
         }
     }

@@ -4,17 +4,22 @@
 //! several routers on a link share one gateway address. The routers form a
 //! virtual router, named by a number from 1 to 255 (the VRID). The one with
 //! the highest priority is the master: it answers for the shared addresses
-//! and sends an advertisement every interval. The others are backups. A
-//! backup that stops hearing advertisements takes over, and one with a
-//! higher priority than the master may take over at once. A master that
-//! shuts down sends one last advertisement with priority 0.
+//! and sends an advertisement every interval. The others are backups. Each
+//! backup runs a timer, Master_Down_Timer, that each advertisement it heeds
+//! restarts. When the timer runs out, the backup takes over. A backup set to
+//! preempt ignores advertisements of a lower priority than its own, so its
+//! timer runs out and it takes over. A master that shuts down sends one last
+//! advertisement with priority 0, which cuts the backups' timers short.
 //!
 //! VRRP has two versions in use. Version 2 (RFC 3768) is for IPv4 only. It
 //! gives the interval in seconds and carries an authentication type and 8
-//! bytes of authentication data. Version 3 (RFC 5798) works over IPv4 and
-//! IPv6. It gives the interval in centiseconds and has no authentication.
-//! Its checksum also covers a pseudo-header made from the IP header, so the
-//! source and destination addresses must be known to read or write one.
+//! bytes of authentication data. Version 3 (RFC 9568, which replaced RFC
+//! 5798) works over IPv4 and IPv6. It gives the interval in centiseconds and
+//! has no authentication. Over IPv6 its checksum also covers the IPv6
+//! pseudo-header, so the source and destination addresses must be known to
+//! read or write one. Over IPv4 the checksum covers the message alone, as in
+//! version 2. Many routers built to RFC 5798 add an IPv4 pseudo-header
+//! instead: see [`legacy_checksum`].
 //!
 //! Nothing here reads a socket. A world that plays a router hands each
 //! VRRP payload (the bytes after the IP header) to [`Advertisement::parse`]
@@ -23,11 +28,13 @@
 //! protocol [`PROTOCOL`] and a TTL or hop limit of [`HOP_LIMIT`], to the
 //! address [`Advertisement::destination`] gives. A [`Decoder`] reads a
 //! payload that comes in pieces and reports a bad header as soon as the
-//! bytes show it. Which virtual routers exist, their priorities, and when
-//! a backup takes over are up to world code.
+//! bytes show it. Which virtual routers exist, their priorities, and the
+//! timers that decide when a backup takes over are up to world code.
 //!
 //! Every reader checks the version, type, VRID, address count, length and
-//! checksum, because the agent can send any bytes it likes. The payload
+//! checksum, because the agent can send any bytes it likes. A version 2
+//! advertisement must have a known authentication type (see [`auth`]). Over
+//! IPv6, the source and the first address must be link-local. The payload
 //! must be exactly as long as its address count says. The reserved bits of
 //! a version 3 advertisement are ignored when read and written as zero.
 //! Writers check the same rules as readers, so bytes they return always
@@ -35,18 +42,41 @@
 //!
 //! ```
 //! use std::net::{IpAddr, Ipv4Addr};
-//! use fictionet::stdlib::vrrp::{Addresses, Advertisement, AdvertisementV3, Endpoints, GROUP_V4};
+//! use fictionet::stdlib::vrrp::{
+//!     Addresses, Advertisement, AdvertisementV3, Endpoints, GROUP_V4, PRIORITY_STOP,
+//! };
 //!
-//! /// Whether a backup router with priority `mine` takes over when it
-//! /// hears `ad` for its virtual router `vrid`.
-//! fn take_over(vrid: u8, mine: u8, ad: &Advertisement) -> bool {
-//!     ad.vrid() == vrid && (ad.priority() == 0 || ad.priority() < mine)
+//! /// What a backup router does with its Master_Down_Timer when it hears
+//! /// an advertisement (RFC 9568 section 6.4.2). It takes over only when
+//! /// that timer runs out, which the world's clock reports.
+//! #[derive(Debug, PartialEq)]
+//! enum Timer {
+//!     /// Leave the timer running: the advertisement is not heeded.
+//!     Keep,
+//!     /// Restart it at Master_Down_Interval, from the advertised interval.
+//!     Restart,
+//!     /// Set it to Skew_Time: the master has stopped.
+//!     Skew,
+//! }
+//!
+//! /// The timer change for a backup with priority `mine` on virtual router
+//! /// `vrid`, which preempts lower priorities if `preempt` is set.
+//! fn on_advertisement(vrid: u8, mine: u8, preempt: bool, ad: &Advertisement) -> Timer {
+//!     if ad.vrid() != vrid {
+//!         Timer::Keep
+//!     } else if ad.priority() == PRIORITY_STOP {
+//!         Timer::Skew
+//!     } else if !preempt || ad.priority() >= mine {
+//!         Timer::Restart
+//!     } else {
+//!         Timer::Keep
+//!     }
 //! }
 //!
 //! // The master, 192.168.1.2, advertises 192.168.1.1 for virtual router 1
 //! // at priority 100, once a second (100 centiseconds).
 //! let master = Endpoints::V4 { source: Ipv4Addr::new(192, 168, 1, 2), destination: GROUP_V4 };
-//! let bytes = [0x31, 1, 100, 1, 0, 100, 0x06, 0xb6, 192, 168, 1, 1];
+//! let bytes = [0x31, 1, 100, 1, 0, 100, 0xa8, 0xef, 192, 168, 1, 1];
 //! let ad = Advertisement::parse(&bytes, &master).unwrap();
 //! assert_eq!(
 //!     ad,
@@ -58,8 +88,10 @@
 //!     })
 //! );
 //! assert_eq!(ad.destination(), IpAddr::V4(GROUP_V4));
-//! assert!(!take_over(1, 90, &ad));
-//! assert!(take_over(1, 110, &ad));
+//! assert_eq!(on_advertisement(1, 90, true, &ad), Timer::Restart);
+//! assert_eq!(on_advertisement(1, 110, true, &ad), Timer::Keep);
+//! assert_eq!(on_advertisement(1, 110, false, &ad), Timer::Restart);
+//! assert_eq!(on_advertisement(2, 90, true, &ad), Timer::Keep);
 //! // Written back, the advertisement is the same bytes.
 //! assert_eq!(ad.to_bytes(&master).unwrap(), bytes);
 //! ```
@@ -97,7 +129,9 @@ pub const PRIORITY_STOP: u8 = 0;
 /// The priority a backup router has unless set otherwise.
 pub const PRIORITY_DEFAULT: u8 = 100;
 
-/// Version 2 authentication types.
+/// Version 2 authentication types. These three are the only ones VRRP has
+/// defined. Readers and writers reject any other, since no router can be
+/// set up to use it (RFC 3768 section 7.1).
 pub mod auth {
     /// No authentication. The authentication data is zero.
     pub const NONE: u8 = 0;
@@ -110,8 +144,8 @@ pub mod auth {
 }
 
 /// The IP source and destination of the packet that carries an
-/// advertisement. Version 3 checksums cover them, and they say whether a
-/// version 3 advertisement's addresses are IPv4 or IPv6.
+/// advertisement. Version 3 checksums over IPv6 cover them, and they say
+/// whether a version 3 advertisement's addresses are IPv4 or IPv6.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Endpoints {
     /// An IPv4 packet.
@@ -175,12 +209,12 @@ pub struct AdvertisementV2 {
     /// The sender's priority. See [`PRIORITY_OWNER`], [`PRIORITY_STOP`]
     /// and [`PRIORITY_DEFAULT`].
     pub priority: u8,
-    /// The authentication type, one of the values in [`auth`] or another.
-    /// A receiver drops an advertisement whose type differs from its own.
+    /// The authentication type: one of the values in [`auth`]. A receiver
+    /// drops an advertisement whose type differs from its own.
     pub auth_type: u8,
     /// How often the master advertises, in seconds.
     pub interval: u8,
-    /// The virtual router's addresses. At most [`MAX_ADDRESSES`].
+    /// The virtual router's addresses: 1 to [`MAX_ADDRESSES`] of them.
     pub addresses: Vec<Ipv4Addr>,
     /// The authentication data. RFC 3768 sends zeros and ignores what
     /// comes, and RFC 2338 put a plain-text password here.
@@ -194,8 +228,43 @@ pub enum Addresses {
     /// IPv4 addresses.
     V4(Vec<Ipv4Addr>),
     /// IPv6 addresses. The first is the virtual router's link-local
-    /// address.
+    /// address (in fe80::/10), and readers and writers check that it is.
     V6(Vec<Ipv6Addr>),
+}
+
+/// The addresses of an advertisement as [`IpAddr`] values, borrowed one at
+/// a time, from [`Addresses::iter`] or [`Advertisement::addresses`].
+#[derive(Clone, Debug)]
+pub enum IpAddrs<'a> {
+    /// IPv4 addresses.
+    V4(std::slice::Iter<'a, Ipv4Addr>),
+    /// IPv6 addresses.
+    V6(std::slice::Iter<'a, Ipv6Addr>),
+}
+
+impl Iterator for IpAddrs<'_> {
+    type Item = IpAddr;
+
+    fn next(&mut self) -> Option<IpAddr> {
+        match self {
+            IpAddrs::V4(i) => i.next().map(|x| IpAddr::V4(*x)),
+            IpAddrs::V6(i) => i.next().map(|x| IpAddr::V6(*x)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            IpAddrs::V4(i) => i.size_hint(),
+            IpAddrs::V6(i) => i.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for IpAddrs<'_> {}
+
+/// Whether `a` is a unicast link-local IPv6 address: in fe80::/10.
+fn is_link_local(a: &Ipv6Addr) -> bool {
+    a.segments()[0] & 0xffc0 == 0xfe80
 }
 
 impl Addresses {
@@ -212,11 +281,12 @@ impl Addresses {
         self.len() == 0
     }
 
-    /// The addresses, as [`IpAddr`] values.
-    pub fn to_ip_addrs(&self) -> Vec<IpAddr> {
+    /// The addresses, as [`IpAddr`] values. It borrows them and allocates
+    /// nothing.
+    pub fn iter(&self) -> IpAddrs<'_> {
         match self {
-            Addresses::V4(a) => a.iter().map(|x| IpAddr::V4(*x)).collect(),
-            Addresses::V6(a) => a.iter().map(|x| IpAddr::V6(*x)).collect(),
+            Addresses::V4(a) => IpAddrs::V4(a.iter()),
+            Addresses::V6(a) => IpAddrs::V6(a.iter()),
         }
     }
 }
@@ -259,9 +329,15 @@ pub enum VrrpError {
     Type(u8),
     /// The VRID was 0. Virtual routers are numbered from 1.
     Vrid,
-    /// A version 3 advertisement had no addresses. RFC 5798 asks for at
-    /// least one.
+    /// An advertisement had no addresses. Both versions ask for at least
+    /// one.
     NoAddresses,
+    /// A version 2 advertisement had an authentication type other than
+    /// those in [`auth`].
+    AuthType(u8),
+    /// A version 3 advertisement over IPv6 came from a source that is not
+    /// link-local, or its first address was not link-local.
+    LinkLocal,
     /// An advertisement to be written had more than [`MAX_ADDRESSES`].
     TooManyAddresses(usize),
     /// A version 3 interval to be written was above [`MAX_INTERVAL_V3`].
@@ -293,7 +369,9 @@ impl std::fmt::Display for VrrpError {
             VrrpError::Version(v) => write!(f, "version {v}, not 2 or 3"),
             VrrpError::Type(t) => write!(f, "type {t}, not 1 (advertisement)"),
             VrrpError::Vrid => write!(f, "VRID 0, outside 1..=255"),
-            VrrpError::NoAddresses => write!(f, "a version 3 advertisement with no addresses"),
+            VrrpError::NoAddresses => write!(f, "an advertisement with no addresses"),
+            VrrpError::AuthType(t) => write!(f, "authentication type {t}, not 0, 1 or 2"),
+            VrrpError::LinkLocal => write!(f, "an IPv6 source or first address that is not link-local"),
             VrrpError::TooManyAddresses(n) => write!(f, "{n} addresses, more than {MAX_ADDRESSES}"),
             VrrpError::Interval(i) => write!(f, "interval {i}, above {MAX_INTERVAL_V3}"),
             VrrpError::Family => write!(f, "the addresses and the IP packet are of different families"),
@@ -324,15 +402,34 @@ fn fold(mut sum: u64) -> u16 {
     sum as u16
 }
 
-/// The checksum the advertisement in `b` should carry, worked out with its
-/// checksum field (bytes 6 and 7) taken as zero. A version 3 advertisement
-/// (a first byte whose high four bits are 3) includes the pseudo-header of
-/// RFC 2460 section 8.1 for IPv6, or its IPv4 equivalent (source,
-/// destination, a zero byte, the protocol and a 16-bit length), with
-/// protocol [`PROTOCOL`]. Any other version covers the message alone. It
-/// returns `None` if `b` is shorter than [`HEADER_LEN`] or longer than
+/// The checksum the advertisement in `b` should carry (RFC 9568 section
+/// 5.2.8), worked out with its checksum field (bytes 6 and 7) taken as
+/// zero. A version 3 advertisement (a first byte whose high four bits are
+/// 3) over IPv6 includes the pseudo-header of RFC 8200 section 8.1, with
+/// next header [`PROTOCOL`]. Over IPv4, and for any other version, the sum
+/// covers the message alone. Writers always use this checksum. It returns
+/// `None` if `b` is shorter than [`HEADER_LEN`] or longer than
 /// [`MAX_MESSAGE`].
 pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
+    sum_with(b, endpoints, false)
+}
+
+/// The checksum many routers built to RFC 5798 put on a version 3
+/// advertisement over IPv4: the sum also covers an IPv4 pseudo-header
+/// (source, destination, a zero byte, [`PROTOCOL`] and a 16-bit length).
+/// Keepalived does this unless set to `v3_checksum_as_v2`. RFC 9568 left
+/// the pseudo-header out. For anything other than version 3 over IPv4 it
+/// is the same as [`checksum`].
+///
+/// [`Advertisement::parse`] takes either checksum on a version 3
+/// advertisement over IPv4. To send to a router that wants this one,
+/// write the bytes with [`Advertisement::to_bytes`] and put this checksum
+/// in bytes 6 and 7.
+pub fn legacy_checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
+    sum_with(b, endpoints, true)
+}
+
+fn sum_with(b: &[u8], endpoints: &Endpoints, v4_pseudo_header: bool) -> Option<u16> {
     if b.len() < HEADER_LEN || b.len() > MAX_MESSAGE {
         return None;
     }
@@ -343,10 +440,12 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
         let len = b.len() as u16;
         match endpoints {
             Endpoints::V4 { source, destination } => {
-                sum = sum_words(sum, &source.octets());
-                sum = sum_words(sum, &destination.octets());
-                sum = sum_words(sum, &[0, PROTOCOL]);
-                sum = sum_words(sum, &len.to_be_bytes());
+                if v4_pseudo_header {
+                    sum = sum_words(sum, &source.octets());
+                    sum = sum_words(sum, &destination.octets());
+                    sum = sum_words(sum, &[0, PROTOCOL]);
+                    sum = sum_words(sum, &len.to_be_bytes());
+                }
             }
             Endpoints::V6 { source, destination } => {
                 sum = sum_words(sum, &source.octets());
@@ -357,6 +456,16 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
         }
     }
     Some(!fold(sum))
+}
+
+/// Whether the checksum field `got` matches `want`. In ones' complement
+/// 0xffff and 0x0000 are both zero, so a sum of the whole message passes
+/// with either.
+fn checksum_matches(got: u16, want: Option<u16>) -> bool {
+    match want {
+        Some(w) => got == w || (w == 0 && got == 0xffff),
+        None => false,
+    }
 }
 
 /// Checks the header fields the bytes so far hold, in the order they come.
@@ -372,8 +481,10 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, VrrpEr
     if first & 0x0f != TYPE_ADVERTISEMENT {
         return Err(VrrpError::Type(first & 0x0f));
     }
-    if version == 2 && matches!(endpoints, Endpoints::V6 { .. }) {
-        return Err(VrrpError::Family);
+    match endpoints {
+        Endpoints::V6 { .. } if version == 2 => return Err(VrrpError::Family),
+        Endpoints::V6 { source, .. } if !is_link_local(source) => return Err(VrrpError::LinkLocal),
+        _ => {}
     }
     match b.get(1) {
         None => return Ok(None),
@@ -381,8 +492,14 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, VrrpEr
         Some(_) => {}
     }
     let Some(&count) = b.get(3) else { return Ok(None) };
-    if version == 3 && count == 0 {
+    if count == 0 {
         return Err(VrrpError::NoAddresses);
+    }
+    if version == 2
+        && let Some(&t) = b.get(4)
+        && t > auth::IP_AH
+    {
+        return Err(VrrpError::AuthType(t));
     }
     // At most 8 + 255 * 16, so this cannot overflow.
     let auth = if version == 2 { AUTH_DATA_LEN } else { 0 };
@@ -392,9 +509,10 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, VrrpEr
 impl Advertisement {
     /// Reads the advertisement in `b`, the whole VRRP payload of one IP
     /// packet, sent from and to `endpoints`. The checksum must be right,
-    /// and `b` must end where the address count says. A checksum of 0xffff
-    /// is taken where 0x0000 is due, since the two are equal in ones'
-    /// complement.
+    /// and `b` must end where the address count says. A version 3
+    /// advertisement over IPv4 may carry either [`checksum`] or
+    /// [`legacy_checksum`]. A checksum of 0xffff is taken where 0x0000 is
+    /// due, since the two are equal in ones' complement.
     pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Advertisement, VrrpError> {
         let len = check_header(b, endpoints)?.ok_or(VrrpError::Truncated)?;
         if b.len() < len {
@@ -403,11 +521,8 @@ impl Advertisement {
         if b.len() > len {
             return Err(VrrpError::Trailing);
         }
-        let want = checksum(b, endpoints).ok_or(VrrpError::Truncated)?;
         let got = u16::from_be_bytes([b[6], b[7]]);
-        // In ones' complement 0xffff and 0x0000 are both zero, so a sum of
-        // the whole message passes with either.
-        if got != want && !(want == 0 && got == 0xffff) {
+        if !checksum_matches(got, checksum(b, endpoints)) && !checksum_matches(got, legacy_checksum(b, endpoints)) {
             return Err(VrrpError::Checksum);
         }
         let (vrid, priority, count) = (b[1], b[2], usize::from(b[3]));
@@ -428,15 +543,22 @@ impl Advertisement {
         let interval = u16::from_be_bytes([b[4] & 0x0f, b[5]]);
         let addresses = match endpoints {
             Endpoints::V4 { .. } => Addresses::V4(v4_addresses(body)),
-            Endpoints::V6 { .. } => Addresses::V6(
-                body.chunks_exact(16)
+            Endpoints::V6 { .. } => {
+                let v6: Vec<Ipv6Addr> = body
+                    .chunks_exact(16)
                     .map(|c| {
                         let mut o = [0u8; 16];
                         o.copy_from_slice(c);
                         Ipv6Addr::from(o)
                     })
-                    .collect(),
-            ),
+                    .collect();
+                // RFC 9568 section 5.2.9: the first address MUST be the
+                // virtual router's link-local address.
+                if !v6.first().is_some_and(is_link_local) {
+                    return Err(VrrpError::LinkLocal);
+                }
+                Addresses::V6(v6)
+            }
         };
         Ok(Advertisement::V3(AdvertisementV3 { vrid, priority, interval, addresses }))
     }
@@ -482,11 +604,12 @@ impl Advertisement {
         }
     }
 
-    /// The virtual router's addresses, as [`IpAddr`] values.
-    pub fn addresses(&self) -> Vec<IpAddr> {
+    /// The virtual router's addresses, as [`IpAddr`] values. It borrows
+    /// them and allocates nothing.
+    pub fn addresses(&self) -> IpAddrs<'_> {
         match self {
-            Advertisement::V2(a) => a.addresses.iter().map(|x| IpAddr::V4(*x)).collect(),
-            Advertisement::V3(a) => a.addresses.to_ip_addrs(),
+            Advertisement::V2(a) => IpAddrs::V4(a.addresses.iter()),
+            Advertisement::V3(a) => a.addresses.iter(),
         }
     }
 
@@ -507,6 +630,9 @@ impl Advertisement {
                 if matches!(endpoints, Endpoints::V6 { .. }) {
                     return Err(VrrpError::Family);
                 }
+                if a.auth_type > auth::IP_AH {
+                    return Err(VrrpError::AuthType(a.auth_type));
+                }
                 (a.vrid, a.addresses.len(), AUTH_DATA_LEN)
             }
             Advertisement::V3(a) => {
@@ -520,14 +646,19 @@ impl Advertisement {
                 if a.interval > MAX_INTERVAL_V3 {
                     return Err(VrrpError::Interval(a.interval));
                 }
-                if a.addresses.is_empty() {
-                    return Err(VrrpError::NoAddresses);
+                if let (Addresses::V6(v6), Endpoints::V6 { source, .. }) = (&a.addresses, endpoints)
+                    && v6.first().is_some_and(|first| !is_link_local(first) || !is_link_local(source))
+                {
+                    return Err(VrrpError::LinkLocal);
                 }
                 (a.vrid, a.addresses.len(), 0)
             }
         };
         if vrid == 0 {
             return Err(VrrpError::Vrid);
+        }
+        if count == 0 {
+            return Err(VrrpError::NoAddresses);
         }
         if count > MAX_ADDRESSES {
             return Err(VrrpError::TooManyAddresses(count));
@@ -536,10 +667,12 @@ impl Advertisement {
     }
 
     /// The advertisement's bytes, to go from and to `endpoints`, with the
-    /// checksum filled in. It fails if the VRID is 0, there are more than
-    /// [`MAX_ADDRESSES`] addresses, a version 3 advertisement has none or
-    /// an interval above [`MAX_INTERVAL_V3`], or the addresses are not of
-    /// the packet's family. Nothing is allocated before those checks pass.
+    /// checksum filled in (see [`checksum`]). It fails if the VRID is 0,
+    /// there are no addresses or more than [`MAX_ADDRESSES`], a version 2
+    /// authentication type is not in [`auth`], a version 3 interval is
+    /// above [`MAX_INTERVAL_V3`], the addresses are not of the packet's
+    /// family, or over IPv6 the source or first address is not link-local.
+    /// Nothing is allocated before those checks pass.
     pub fn to_bytes(&self, endpoints: &Endpoints) -> Result<Vec<u8>, VrrpError> {
         let len = self.encoded_len(endpoints)?;
         let mut out = Vec::with_capacity(len);
@@ -575,8 +708,10 @@ fn v4_addresses(b: &[u8]) -> Vec<Ipv4Addr> {
 
 /// Reads one advertisement that comes in pieces. Feed it the bytes in
 /// order, then call [`Decoder::finish`]. It fails as soon as the bytes show
-/// a bad version, type, VRID or address count, or run past the length the
-/// count gives. It holds at most [`MAX_MESSAGE`] plus one bytes.
+/// a bad version, type, VRID, address count or authentication type, or run
+/// past the length the count gives. An IPv6 source that is not link-local
+/// fails on the first byte. It holds at most [`MAX_MESSAGE`] plus one
+/// bytes.
 #[derive(Clone, Debug)]
 pub struct Decoder {
     endpoints: Endpoints,
@@ -689,12 +824,11 @@ mod tests {
 
     #[test]
     fn module_example() {
-        // The doctest's bytes, checked here too. The message words are
-        // 0x3101 + 0x6401 + 0x0064 + 0xc0a8 + 0x0101 = 0x1570f. The
-        // pseudo-header words are 0xc0a8 + 0x0102 + 0xe000 + 0x0012 +
-        // 0x0070 + 0x000c = 0x1a238. Together 0x2f947, folded 0xf949, and
-        // its complement 0x06b6.
-        let bytes = [0x31, 1, 100, 1, 0, 100, 0x06, 0xb6, 192, 168, 1, 1];
+        // The doctest's bytes, checked here too. Over IPv4 the checksum
+        // covers the message alone (RFC 9568 section 5.2.8). The words are
+        // 0x3101 + 0x6401 + 0x0064 + 0xc0a8 + 0x0101 = 0x1570f, folded
+        // 0x5710, and its complement 0xa8ef.
+        let bytes = [0x31, 1, 100, 1, 0, 100, 0xa8, 0xef, 192, 168, 1, 1];
         let ad = Advertisement::parse(&bytes, &v4_ends()).unwrap();
         let want = Advertisement::V3(AdvertisementV3 {
             vrid: 1,
@@ -818,7 +952,7 @@ mod tests {
         b[7] ^= 1;
         assert_eq!(Advertisement::parse(&b, &e), Err(VrrpError::Checksum));
         // Version 2 over IPv6.
-        let mut v2 = vec![0x21, 1, 100, 0, 0, 1, 0, 0];
+        let mut v2 = vec![0x21, 1, 100, 1, 0, 1, 0, 0, 10, 0, 0, 1];
         v2.extend_from_slice(&[0; 8]);
         let v2 = fix(v2, &e);
         assert!(Advertisement::parse(&v2, &e).is_ok());
@@ -837,7 +971,9 @@ mod tests {
             Err(VrrpError::TooManyAddresses(256))
         );
         assert!(v3(1, MAX_INTERVAL_V3, Addresses::V4(vec![ip4(1, 1, 1, 1); 255])).to_bytes(&e).is_ok());
-        let max6 = v3(255, 1, Addresses::V6(vec![Ipv6Addr::LOCALHOST; MAX_ADDRESSES]));
+        let mut most = vec![Ipv6Addr::LOCALHOST; MAX_ADDRESSES];
+        most[0] = "fe80::1".parse().unwrap();
+        let max6 = v3(255, 1, Addresses::V6(most));
         assert_eq!(round_trip(&max6, &v6_ends()).len(), MAX_MESSAGE);
         let v2 = |vrid, n| {
             Advertisement::V2(AdvertisementV2 {
@@ -852,8 +988,9 @@ mod tests {
         assert_eq!(v2(0, 1).to_bytes(&e), Err(VrrpError::Vrid));
         assert_eq!(v2(1, 256).to_bytes(&e), Err(VrrpError::TooManyAddresses(256)));
         assert_eq!(v2(1, 1).to_bytes(&v6_ends()), Err(VrrpError::Family));
-        // A version 2 advertisement may carry no addresses.
-        round_trip(&v2(1, 0), &e);
+        // A version 2 advertisement needs an address too (RFC 3768
+        // section 5.3.9).
+        assert_eq!(v2(1, 0).to_bytes(&e), Err(VrrpError::NoAddresses));
         // Every error has a message.
         for err in [VrrpError::Truncated, VrrpError::Family, VrrpError::Checksum, VrrpError::Version(9)] {
             assert!(!err.to_string().is_empty());
@@ -980,6 +1117,7 @@ mod tests {
         assert_eq!(Endpoints::new(IpAddr::V4(GROUP_V4), IpAddr::V6(GROUP_V6)), None);
         for (a, e) in samples() {
             assert_eq!(a.address_count(), a.addresses().len());
+            assert_eq!(a.address_count(), a.addresses().count());
             let b = a.to_bytes(&e).unwrap();
             assert_eq!(usize::from(b[3]), a.address_count());
             let mut d = Decoder::new(e);
@@ -994,10 +1132,10 @@ mod tests {
         }
         let v3 =
             AdvertisementV3 { vrid: 1, priority: 1, interval: 1, addresses: Addresses::V6(vec![Ipv6Addr::LOCALHOST]) };
-        assert_eq!(v3.addresses.to_ip_addrs(), vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        assert_eq!(v3.addresses.iter().collect::<Vec<_>>(), vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
         let a: Advertisement = v3.clone().into();
         assert_eq!(a, Advertisement::V3(v3));
-        assert_eq!(a.addresses(), vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
+        assert_eq!(a.addresses().collect::<Vec<_>>(), vec![IpAddr::V6(Ipv6Addr::LOCALHOST)]);
         let v2 = AdvertisementV2 {
             vrid: 1,
             priority: 1,
@@ -1008,7 +1146,12 @@ mod tests {
         };
         let a: Advertisement = v2.clone().into();
         assert_eq!(a, Advertisement::V2(v2));
-        assert_eq!(a.addresses(), vec![IpAddr::V4(ip4(1, 2, 3, 4))]);
+        assert_eq!(a.addresses().collect::<Vec<_>>(), vec![IpAddr::V4(ip4(1, 2, 3, 4))]);
+        // The accessors borrow: a huge caller-made list is walked, not
+        // copied.
+        let huge = Addresses::V4(vec![Ipv4Addr::LOCALHOST; 100_000]);
+        assert_eq!(huge.iter().len(), 100_000);
+        assert_eq!(huge.iter().nth(99_999), Some(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         // Every error has a message.
         for err in [
             VrrpError::Truncated,
@@ -1017,12 +1160,117 @@ mod tests {
             VrrpError::Type(2),
             VrrpError::Vrid,
             VrrpError::NoAddresses,
+            VrrpError::AuthType(3),
+            VrrpError::LinkLocal,
             VrrpError::TooManyAddresses(256),
             VrrpError::Interval(5000),
             VrrpError::Family,
             VrrpError::Checksum,
         ] {
             assert!(!err.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn v4_v3_checksum_is_message_only() {
+        // RFC 9568 section 5.2.8: over IPv4 the sum covers the message
+        // alone, so the endpoints do not change it.
+        let bytes = [0x31, 1, 100, 1, 0, 100, 0xa8, 0xef, 192, 168, 1, 1];
+        let e = v4_ends();
+        assert_eq!(checksum(&bytes, &e), Some(0xa8ef));
+        let ad = Advertisement::parse(&bytes, &e).unwrap();
+        let other = Endpoints::V4 { source: ip4(10, 0, 0, 9), destination: ip4(10, 0, 0, 255) };
+        assert_eq!(Advertisement::parse(&bytes, &other), Ok(ad.clone()));
+        assert_eq!(ad.to_bytes(&other).unwrap(), bytes);
+    }
+
+    #[test]
+    fn v4_v3_legacy_checksum() {
+        // RFC 5798 routers such as Keepalived add an IPv4 pseudo-header.
+        // The pseudo-header words are 0xc0a8 + 0x0102 + 0xe000 + 0x0012 +
+        // 0x0070 + 0x000c = 0x1a238. With the message's 0x1570f that is
+        // 0x2f947, folded 0xf949, and its complement 0x06b6.
+        let e = v4_ends();
+        let legacy = [0x31, 1, 100, 1, 0, 100, 0x06, 0xb6, 192, 168, 1, 1];
+        assert_eq!(legacy_checksum(&legacy, &e), Some(0x06b6));
+        let ad = Advertisement::parse(&legacy, &e).unwrap();
+        assert_eq!(decode_chunked(&legacy, &e, 1), Ok(ad.clone()));
+        // Written, it carries the RFC 9568 checksum.
+        assert_eq!(&ad.to_bytes(&e).unwrap()[6..8], &[0xa8, 0xef]);
+        // The legacy sum depends on the endpoints.
+        let other = Endpoints::V4 { source: ip4(10, 0, 0, 9), destination: GROUP_V4 };
+        assert_eq!(Advertisement::parse(&legacy, &other), Err(VrrpError::Checksum));
+        // Version 2 and IPv6 have one checksum each: the legacy one is
+        // the same.
+        let mut v2 = vec![0x21, 1, 100, 1, 0, 1, 0, 0, 192, 168, 0, 1];
+        v2.extend_from_slice(&[0; 8]);
+        assert_eq!(legacy_checksum(&v2, &e), checksum(&v2, &e));
+        let v6 = samples()[2].0.to_bytes(&v6_ends()).unwrap();
+        assert_eq!(legacy_checksum(&v6, &v6_ends()), checksum(&v6, &v6_ends()));
+    }
+
+    #[test]
+    fn v2_needs_an_address() {
+        // RFC 3768 section 5.3.9: one or more addresses.
+        let mut v2 = vec![0x21, 1, 100, 0, 0, 1, 0, 0];
+        v2.extend_from_slice(&[0; 8]);
+        let v2 = fix(v2, &v4_ends());
+        assert_eq!(Advertisement::parse(&v2, &v4_ends()), Err(VrrpError::NoAddresses));
+        let mut d = Decoder::new(v4_ends());
+        assert_eq!(d.feed(&v2[..4]), Err(VrrpError::NoAddresses));
+    }
+
+    #[test]
+    fn v6_link_local() {
+        let ad = |first: &str| {
+            Advertisement::V3(AdvertisementV3 {
+                vrid: 1,
+                priority: 100,
+                interval: 100,
+                addresses: Addresses::V6(vec![first.parse().unwrap(), "2001:db8::9".parse().unwrap()]),
+            })
+        };
+        let global = Endpoints::V6 { source: "2001:db8::2".parse().unwrap(), destination: GROUP_V6 };
+        // The writer checks the first address and the source.
+        assert_eq!(ad("2001:db8::1").to_bytes(&v6_ends()), Err(VrrpError::LinkLocal));
+        assert_eq!(ad("fe80::1").to_bytes(&global), Err(VrrpError::LinkLocal));
+        // Later addresses may be global; fe80::/10 runs to febf.
+        round_trip(&ad("febf::1"), &v6_ends());
+        assert_eq!(ad("fec0::1").to_bytes(&v6_ends()), Err(VrrpError::LinkLocal));
+        // The reader checks both too, with a right checksum.
+        let mut b = vec![0x31, 1, 100, 1, 0, 100, 0, 0];
+        b.extend_from_slice(&"2001:db8::1".parse::<Ipv6Addr>().unwrap().octets());
+        assert_eq!(Advertisement::parse(&fix(b.clone(), &v6_ends()), &v6_ends()), Err(VrrpError::LinkLocal));
+        assert_eq!(decode_chunked(&fix(b, &v6_ends()), &v6_ends(), 3), Err(VrrpError::LinkLocal));
+        let good = ad("fe80::1").to_bytes(&v6_ends()).unwrap();
+        assert_eq!(Advertisement::parse(&fix(good.clone(), &global), &global), Err(VrrpError::LinkLocal));
+        // A source that is not link-local fails on the first byte.
+        let mut d = Decoder::new(global);
+        assert_eq!(d.feed(&good[..1]), Err(VrrpError::LinkLocal));
+    }
+
+    #[test]
+    fn v2_unknown_auth_type() {
+        // RFC 3768 section 5.3.6 defines types 0, 1 and 2 only.
+        let mut b = vec![0x21, 1, 100, 1, 0xff, 1, 0, 0, 192, 168, 1, 1];
+        b.extend_from_slice(&[0; 8]);
+        let b = fix(b, &v4_ends());
+        assert_eq!(Advertisement::parse(&b, &v4_ends()), Err(VrrpError::AuthType(255)));
+        let mut d = Decoder::new(v4_ends());
+        assert_eq!(d.feed(&b[..5]), Err(VrrpError::AuthType(255)));
+        let ad = |auth_type| {
+            Advertisement::V2(AdvertisementV2 {
+                vrid: 1,
+                priority: 100,
+                auth_type,
+                interval: 1,
+                addresses: vec![ip4(192, 168, 1, 1)],
+                auth_data: [0; 8],
+            })
+        };
+        assert_eq!(ad(3).to_bytes(&v4_ends()), Err(VrrpError::AuthType(3)));
+        for t in [auth::NONE, auth::SIMPLE_TEXT, auth::IP_AH] {
+            round_trip(&ad(t), &v4_ends());
         }
     }
 
@@ -1041,11 +1289,25 @@ mod tests {
             let lo = u64::from(self.next()) << 32 | u64::from(self.next());
             Ipv6Addr::from(u128::from(hi) << 64 | u128::from(lo))
         }
+        /// A random IPv6 address in fe80::/10.
+        fn link_local(&mut self) -> Ipv6Addr {
+            let mut s = self.v6().segments();
+            s[0] = 0xfe80 | (s[0] & 0x003f);
+            Ipv6Addr::from(s)
+        }
+        /// Endpoints a writer accepts: an IPv6 source is link-local.
         fn endpoints(&mut self) -> Endpoints {
             if self.below(2) == 0 {
                 Endpoints::V4 { source: Ipv4Addr::from(self.next()), destination: GROUP_V4 }
             } else {
-                Endpoints::V6 { source: self.v6(), destination: GROUP_V6 }
+                Endpoints::V6 { source: self.link_local(), destination: GROUP_V6 }
+            }
+        }
+        /// Endpoints of any kind, an IPv6 source of any address included.
+        fn any_endpoints(&mut self) -> Endpoints {
+            match self.below(3) {
+                0 => Endpoints::V6 { source: self.v6(), destination: GROUP_V6 },
+                _ => self.endpoints(),
             }
         }
     }
@@ -1060,16 +1322,18 @@ mod tests {
             return Advertisement::V2(AdvertisementV2 {
                 vrid,
                 priority,
-                auth_type: rng.next() as u8,
+                auth_type: rng.below(3) as u8,
                 interval: rng.next() as u8,
-                addresses: (0..rng.below(6)).map(|_| Ipv4Addr::from(rng.next())).collect(),
+                addresses: (0..rng.below(5) + 1).map(|_| Ipv4Addr::from(rng.next())).collect(),
                 auth_data,
             });
         }
         let n = rng.below(5) + 1;
         let addresses = match e {
             Endpoints::V4 { .. } => Addresses::V4((0..n).map(|_| Ipv4Addr::from(rng.next())).collect()),
-            Endpoints::V6 { .. } => Addresses::V6((0..n).map(|_| rng.v6()).collect()),
+            Endpoints::V6 { .. } => {
+                Addresses::V6((0..n).map(|i| if i == 0 { rng.link_local() } else { rng.v6() }).collect())
+            }
         };
         let interval = rng.below(usize::from(MAX_INTERVAL_V3) + 1) as u16;
         Advertisement::V3(AdvertisementV3 { vrid, priority, interval, addresses })
@@ -1112,8 +1376,9 @@ mod tests {
                 mutated = fix(mutated, &e);
             }
             check_bytes(&mutated, &e);
-            // The same bytes read with the other family.
-            let other = rng.endpoints();
+            // The same bytes read with other endpoints, maybe another
+            // family or a source that is not link-local.
+            let other = rng.any_endpoints();
             check_bytes(&mutated, &other);
             // Plain random bytes, with a likely first byte and a right
             // checksum.

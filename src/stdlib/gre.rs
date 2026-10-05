@@ -20,9 +20,11 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header with an unknown version, with the routing bits or the
 //! top recursion bit set, or with a checksum that does not match is
-//! refused. A PPTP header must also clear the C bit and all of the
-//! recursion control, and carry the K bit. The bits RFC 2784 reserves for
-//! later use are ignored when read and written as zero, as the RFC asks.
+//! refused. A PPTP header must also clear the C bit, all of the recursion
+//! control and the flags bits 9 to 12, and carry the K bit. It carries a
+//! sequence number exactly when it carries a payload. The bits RFC 2784
+//! reserves for later use are ignored when read and written as zero, as
+//! the RFC asks.
 //! So is the reserved field after the checksum. Writers
 //! compute the checksum and the PPTP payload length themselves, so bytes
 //! they return always read back.
@@ -90,8 +92,10 @@ const VERSION_BITS: u16 = 0x0007;
 // RFC 2784: a receiver discards a packet with any of bits 1 to 5 set,
 // other than the key and sequence bits of RFC 2890.
 const GRE_MUST_BE_ZERO: u16 = ROUTING_BIT | STRICT_ROUTE_BIT | 0x0400;
-// RFC 2637: C, R, s and the recursion control are always zero.
-const PPTP_MUST_BE_ZERO: u16 = CHECKSUM_BIT | ROUTING_BIT | STRICT_ROUTE_BIT | RECURSION_BITS;
+// RFC 2637: C, R, s, the recursion control and the flags (bits 9 to 12)
+// are always zero.
+const PPTP_FLAGS_BITS: u16 = 0x0078;
+const PPTP_MUST_BE_ZERO: u16 = CHECKSUM_BIT | ROUTING_BIT | STRICT_ROUTE_BIT | RECURSION_BITS | PPTP_FLAGS_BITS;
 
 /// A plain GRE header, version 0. The flag bits are worked out from which
 /// fields are present, so none of them is kept.
@@ -118,8 +122,10 @@ pub struct PptpHeader {
     /// The peer's call ID for the session the packet belongs to. It sits
     /// in the low half of the key field.
     pub call_id: u16,
-    /// The sequence number, if the S bit is set. A packet carries one when
-    /// it carries data.
+    /// The sequence number, if the S bit is set. A packet carries one
+    /// exactly when it carries data: a reader refuses, and a writer will
+    /// not write, a sequence number without a payload or a payload without
+    /// one.
     pub sequence: Option<u32>,
     /// The highest sequence number received from the peer, if the A bit is
     /// set.
@@ -151,13 +157,18 @@ pub enum GreError {
     Version(u8),
     /// Flag bits that must be zero were set: these are the ones. In
     /// version 0 they are the routing bits and the top recursion bit; in
-    /// version 1 they are also the C bit and all of the recursion control.
+    /// version 1 they are also the C bit, all of the recursion control and
+    /// the flags bits 9 to 12.
     Reserved(u16),
     /// A version 1 header without the K bit. PPTP always carries a key.
     MissingKey,
     /// A version 1 header whose protocol type, given here, was not
     /// [`protocol::PPP`].
     PptpProtocol(u16),
+    /// A version 1 header with a sequence number and no payload, or with a
+    /// payload and no sequence number. RFC 2637 sets the S bit exactly
+    /// when a payload is present.
+    PptpSequence,
     /// The checksum did not match the header and the payload.
     Checksum,
     /// The packet is longer than [`MAX_PACKET`].
@@ -172,6 +183,7 @@ impl std::fmt::Display for GreError {
             GreError::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
             GreError::MissingKey => f.write_str("PPTP GRE header without the K bit"),
             GreError::PptpProtocol(p) => write!(f, "PPTP GRE protocol type {p:#06x}, not 0x880b"),
+            GreError::PptpSequence => f.write_str("PPTP GRE sequence number without a payload, or payload without one"),
             GreError::Checksum => f.write_str("GRE checksum does not match"),
             GreError::TooLong => write!(f, "GRE packet longer than {MAX_PACKET} bytes"),
         }
@@ -337,6 +349,11 @@ impl Header {
                 Header::Gre(h)
             }
             Header::Pptp(mut h) => {
+                // The payload length is the high half of the key field.
+                let has_payload = be16(b, BASE_HEADER_LEN) != 0;
+                if h.sequence.is_some() != has_payload {
+                    return Err(GreError::PptpSequence);
+                }
                 h.call_id = next() as u16;
                 h.sequence = h.sequence.map(|_| next());
                 h.ack = h.ack.map(|_| next());
@@ -373,11 +390,18 @@ impl Header {
     /// Appends the header's bytes to `out`, for a payload of
     /// `payload_len` bytes, with the checksum field zero. It fails with
     /// [`GreError::TooLong`] if the header and the payload together would
-    /// be longer than [`MAX_PACKET`]; then `out` is left as it was.
+    /// be longer than [`MAX_PACKET`], and with [`GreError::PptpSequence`] if
+    /// a PPTP header's sequence number does not match the payload; then
+    /// `out` is left as it was.
     fn write(&self, payload_len: usize, out: &mut Vec<u8>) -> Result<(), GreError> {
         let total = self.len().saturating_add(payload_len);
         if total > MAX_PACKET {
             return Err(GreError::TooLong);
+        }
+        if let Header::Pptp(h) = self
+            && h.sequence.is_some() != (payload_len > 0)
+        {
+            return Err(GreError::PptpSequence);
         }
         let bit = |present: bool, bit: u16| if present { bit } else { 0 };
         match self {
@@ -435,7 +459,9 @@ impl Packet {
 
     /// The packet's bytes, with the checksum and the PPTP payload length
     /// filled in. It fails with [`GreError::TooLong`] if the whole would be
-    /// longer than [`MAX_PACKET`].
+    /// longer than [`MAX_PACKET`], and with [`GreError::PptpSequence`] if a
+    /// PPTP header has a sequence number and no payload, or a payload and
+    /// no sequence number.
     pub fn to_bytes(&self) -> Result<Vec<u8>, GreError> {
         let mut out = Vec::new();
         self.write(&mut out)?;
@@ -683,11 +709,42 @@ mod tests {
         let p = check(&b).unwrap();
         assert_eq!(p.header, gre(protocol::IPV4, false, None, None));
         assert_eq!(p.to_bytes().unwrap(), [0x00, 0x00, 0x08, 0x00, 0x45]);
-        // So are the flags bits 9 to 12 of version 1.
-        let b = [0x20, 0x79, 0x88, 0x0b, 0, 0, 0, 1];
-        let p = check(&b).unwrap();
-        assert_eq!(p.header, pptp(1, None, None));
-        assert_eq!(p.to_bytes().unwrap(), [0x20, 0x01, 0x88, 0x0b, 0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn pptp_flags_bits_must_be_zero() {
+        // RFC 2637 section 4.1: the Flags field, bits 9 to 12, must be zero.
+        for bit in [0x40u8, 0x20, 0x10, 0x08] {
+            let b = [0x30, 0x01 | bit, 0x88, 0x0b, 0, 1, 0, 1, 0, 0, 0, 1, 0x42];
+            assert_eq!(check(&b), Err(GreError::Reserved(u16::from(bit))), "{bit:#04x}");
+            let mut d = Decoder::new();
+            assert_eq!(d.feed(&b[..2]), Err(GreError::Reserved(u16::from(bit))));
+        }
+    }
+
+    #[test]
+    fn pptp_sequence_matches_payload() {
+        // RFC 2637 section 4.1: S is set when a payload is present and
+        // clear when none is. Data without a sequence number:
+        let b = [0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1, 0x42];
+        assert_eq!(check(&b), Err(GreError::PptpSequence));
+        // A sequence number without data:
+        let b = [0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 1, 0, 0, 0, 1];
+        assert_eq!(check(&b), Err(GreError::PptpSequence));
+        // The decoder sees it as soon as the header is in.
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]), Ok(()));
+        assert_eq!(d.feed(&[1]), Err(GreError::PptpSequence));
+        assert!(!GreError::PptpSequence.to_string().is_empty());
+
+        // Writers refuse both, and leave `out` as it was.
+        for (sequence, payload) in [(None, vec![0x42]), (Some(1), vec![])] {
+            let p = Packet { header: pptp(1, sequence, Some(2)), payload };
+            let mut out = vec![9];
+            assert_eq!(p.write(&mut out), Err(GreError::PptpSequence));
+            assert_eq!(out, [9]);
+            assert_eq!(p.to_bytes(), Err(GreError::PptpSequence));
+        }
     }
 
     #[test]
@@ -748,7 +805,13 @@ mod tests {
             // PPTP carrying something other than PPP.
             (&[0x20, 0x01, 0x08, 0x00, 0, 0, 0, 0], GreError::PptpProtocol(0x0800)),
             // PPTP whose payload length runs past the bytes.
-            (&[0x20, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0xff], GreError::Truncated),
+            (&[0x30, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0, 0, 0, 1, 0xff], GreError::Truncated),
+            // PPTP data without a sequence number, and a sequence number
+            // without data.
+            (&[0x20, 0x01, 0x88, 0x0b, 0, 2, 0, 0, 0xff], GreError::PptpSequence),
+            (&[0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 0, 0, 0, 0, 1], GreError::PptpSequence),
+            // PPTP with a flags bit set.
+            (&[0x20, 0x09, 0x88, 0x0b], GreError::Reserved(0x0008)),
             // A checksum off by one.
             (&[0x80, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00], GreError::Checksum),
             (&[0x80, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00], GreError::Checksum),
@@ -849,8 +912,11 @@ mod tests {
             out.push(Packet { header, payload: b"abcdefg".to_vec() });
         }
         for flags in 0..4u8 {
-            let header = pptp(0x0102, (flags & 1 != 0).then_some(7), (flags & 2 != 0).then_some(6));
-            out.push(Packet { header, payload: b"\xff\x03payload".to_vec() });
+            // A payload goes with a sequence number, and none without.
+            let data = flags & 1 != 0;
+            let header = pptp(0x0102, data.then_some(7), (flags & 2 != 0).then_some(6));
+            let payload = if data { b"\xff\x03payload".to_vec() } else { Vec::new() };
+            out.push(Packet { header, payload });
         }
         out
     }
@@ -918,14 +984,16 @@ mod tests {
 
     /// A random packet the writer accepts.
     fn random_packet(rng: &mut Lcg) -> Packet {
-        let header = if rng.below(3) == 0 {
-            pptp(rng.next() as u16, rng.maybe(), rng.maybe())
-        } else {
-            let protocols =
-                [protocol::IPV4, protocol::IPV6, protocol::TRANSPARENT_ETHERNET_BRIDGING, rng.next() as u16];
-            let proto = protocols[rng.below(protocols.len())];
-            gre(proto, rng.below(2) == 0, rng.maybe(), rng.maybe())
-        };
+        if rng.below(3) == 0 {
+            // PPTP carries a sequence number exactly when it carries data.
+            let sequence = rng.maybe();
+            let n = if sequence.is_some() { rng.below(47) + 1 } else { 0 };
+            let header = pptp(rng.next() as u16, sequence, rng.maybe());
+            return Packet { header, payload: rng.bytes(n) };
+        }
+        let protocols = [protocol::IPV4, protocol::IPV6, protocol::TRANSPARENT_ETHERNET_BRIDGING, rng.next() as u16];
+        let proto = protocols[rng.below(protocols.len())];
+        let header = gre(proto, rng.below(2) == 0, rng.maybe(), rng.maybe());
         let n = rng.below(48);
         Packet { header, payload: rng.bytes(n) }
     }

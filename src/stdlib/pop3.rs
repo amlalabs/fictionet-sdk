@@ -25,7 +25,19 @@
 //! the decoder skips it and goes on to the next line. A reply decoder
 //! stops at its first error, since a client that has lost its place in a
 //! reply cannot find it again. Bodies are held to [`MAX_BODY`] bytes and
-//! their lines to [`MAX_DATA_LINE`].
+//! their lines to [`MAX_DATA_LINE`]. Readers accept a bare LF as a line
+//! end, as many servers do.
+//!
+//! Writers never write what the readers refuse. The `to_bytes` writers
+//! always give bytes, and make what does not fit fit: they drop characters
+//! a field may not hold and cut text to its line. A reply whose body does
+//! not fit is written as `-ERR [SYS/PERM]` rather than cut, so a client
+//! never takes part of a message for all of it. The `try_to_bytes`
+//! writers write a value only if it reads back the same.
+//!
+//! During an `AUTH` exchange (RFC 5034) the lines between the command and
+//! the final `+OK` or `-ERR` are neither commands nor replies. Read them
+//! with [`CommandDecoder::next_line`] and [`ReplyDecoder::next_line`].
 //!
 //! ```
 //! use fictionet::stdlib::pop3::{
@@ -106,8 +118,16 @@ pub const MAX_DATA_LINE: usize = 4096;
 /// The most bytes a reply's body may hold, after the dots added in front
 /// of lines are taken off, counting the CRLF of every line.
 pub const MAX_BODY: usize = 8 << 20;
-/// The longest response code, the text between the brackets.
-pub const MAX_CODE: usize = 128;
+/// The longest response code, the text between the brackets: what fits in
+/// a `+OK` status line with no text. RFC 2449 sets no limit of its own, so
+/// a code is held only by the length of its line. A `-ERR` line has room
+/// for one byte less.
+pub const MAX_CODE: usize = MAX_REPLY_LINE - 8;
+/// The longest line [`CommandDecoder::next_line`] and
+/// [`ReplyDecoder::next_line`] read, counting its line end. The base64
+/// lines of an `AUTH` exchange have no limit of their own (RFC 5034,
+/// section 4), and this is well above what common mechanisms send.
+pub const MAX_AUTH_LINE: usize = 16 << 10;
 /// The longest unique-id a `UIDL` listing may give (RFC 1939, section 7).
 pub const MAX_UID: usize = 70;
 
@@ -188,12 +208,13 @@ impl Command {
 
     /// The command as a line, with its CRLF. Characters a keyword may not
     /// hold are dropped from it, and a keyword that is then not three or
-    /// four characters long is written as `NOOP`. A longer keyword is never
-    /// cut, since `RETRY` cut to `RETR` would be another command. Control
-    /// characters are dropped from the argument, and it is cut to fit in
-    /// [`MAX_COMMAND_LINE`].
+    /// four characters long is written as `NOOP` with no argument. A longer
+    /// keyword is never cut, since `RETRY` cut to `RETR` would be another
+    /// command. Control characters are dropped from the argument, and it is
+    /// cut to fit in [`MAX_COMMAND_LINE`]. [`Command::try_to_bytes`] does
+    /// none of this.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut keyword: String = self
+        let keyword: String = self
             .keyword
             .chars()
             .filter(char::is_ascii_graphic)
@@ -201,7 +222,7 @@ impl Command {
             .map(|c| c.to_ascii_uppercase())
             .collect();
         if !(MIN_KEYWORD..=MAX_KEYWORD).contains(&keyword.len()) {
-            keyword = "NOOP".to_string();
+            return b"NOOP\r\n".to_vec();
         }
         let mut out = keyword.into_bytes();
         if let Some(arg) = &self.argument {
@@ -214,6 +235,34 @@ impl Command {
         }
         out.extend_from_slice(b"\r\n");
         out
+    }
+
+    /// The command as a line, with its CRLF, or why it cannot be written
+    /// as it is. The line reads back as this command, with its keyword in
+    /// upper case and an empty argument read as none.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, CommandError> {
+        let arg = self.argument.as_deref().unwrap_or("");
+        if self.keyword.len().saturating_add(arg.len()) > MAX_COMMAND_LINE {
+            return Err(CommandError::LineTooLong);
+        }
+        if !(MIN_KEYWORD..=MAX_KEYWORD).contains(&self.keyword.len())
+            || !self.keyword.bytes().all(|c| c.is_ascii_graphic())
+        {
+            return Err(CommandError::BadKeyword);
+        }
+        if arg.chars().any(char::is_control) {
+            return Err(CommandError::BadCharacter);
+        }
+        let mut out = self.keyword.to_ascii_uppercase().into_bytes();
+        if !arg.is_empty() {
+            out.push(b' ');
+            out.extend_from_slice(arg.as_bytes());
+        }
+        out.extend_from_slice(b"\r\n");
+        if out.len() > MAX_COMMAND_LINE {
+            return Err(CommandError::LineTooLong);
+        }
+        Ok(out)
     }
 }
 
@@ -263,7 +312,9 @@ pub enum Request {
     /// still holds after this command came in the clear, so a server
     /// starts a new [`CommandDecoder`] once TLS is up.
     Stls,
-    /// Any other keyword, such as `AUTH`, left as it came.
+    /// Any other keyword, such as `AUTH`, left as it came. A command with
+    /// a keyword this module knows is written as it is, so it reads back
+    /// as that request or as an [`ArgumentError`].
     Other(Command),
 }
 
@@ -304,14 +355,7 @@ impl Request {
     pub fn from_command(c: &Command) -> Result<Request, ArgumentError> {
         let keyword = c.keyword.to_ascii_uppercase();
         let arg = c.argument.as_deref().filter(|a| !a.is_empty());
-        let args = || -> Result<Vec<&str>, ArgumentError> {
-            let Some(a) = arg else { return Ok(Vec::new()) };
-            let args: Vec<&str> = a.split(' ').collect();
-            if args.iter().any(|a| a.is_empty()) {
-                return Err(ArgumentError::Spacing);
-            }
-            Ok(args)
-        };
+        let args = || split_args(arg);
         let none = || match arg {
             None => Ok(()),
             Some(_) => Err(ArgumentError::Extra),
@@ -361,8 +405,10 @@ impl Request {
 
     /// The request as a command. Names have spaces and control characters
     /// dropped, and a password has its control characters dropped. Names
-    /// and passwords are cut so the line fits in [`MAX_COMMAND_LINE`]. An empty name or password is written as
-    /// `_`, so the line still reads back as the same kind of request.
+    /// and passwords are cut so the line fits in [`MAX_COMMAND_LINE`]. An
+    /// empty name or password is written as `_`, so the line still reads
+    /// back as the same kind of request. [`Request::try_to_bytes`] refuses
+    /// instead.
     pub fn to_command(&self) -> Command {
         let with = |keyword: &str, argument: Option<String>| Command {
             keyword: keyword.to_string(),
@@ -399,6 +445,46 @@ impl Request {
     /// The request as a line, with its CRLF.
     pub fn to_bytes(&self) -> Vec<u8> {
         self.to_command().to_bytes()
+    }
+
+    /// The request as a line, with its CRLF, or `None` if
+    /// [`Request::to_bytes`] would have to change it to write it: a name
+    /// with a space, an empty name or password, a control character, or a
+    /// line longer than [`MAX_COMMAND_LINE`]. A client uses this for
+    /// credentials, which must go as they are or not at all. The line
+    /// reads back as this request. [`Request::Other`] is written if its
+    /// keyword is not one this module knows.
+    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
+        let short = |s: &str| (s.len() <= MAX_COMMAND_LINE).then(|| s.to_string());
+        let bytes = match self {
+            Request::User(name) => Command {
+                keyword: "USER".into(),
+                argument: Some(short(name)?),
+            }
+            .try_to_bytes(),
+            Request::Pass(p) => Command {
+                keyword: "PASS".into(),
+                argument: Some(short(p)?),
+            }
+            .try_to_bytes(),
+            Request::Apop { name, digest } => {
+                let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+                Command {
+                    keyword: "APOP".into(),
+                    argument: Some(format!("{} {hex}", short(name)?)),
+                }
+                .try_to_bytes()
+            }
+            Request::Other(c) => c.try_to_bytes(),
+            _ => Ok(self.to_bytes()),
+        }
+        .ok()?;
+        let back = Request::from_command(&Command::parse(bytes.strip_suffix(b"\r\n")?).ok()?).ok()?;
+        let same = match (self, &back) {
+            (Request::Other(_), Request::Other(_)) => true,
+            _ => back == *self,
+        };
+        same.then_some(bytes)
     }
 
     /// Whether a `+OK` answer to this request carries a body: `LIST` and
@@ -499,7 +585,7 @@ impl Reply {
 
     /// Reads a status line, without its CRLF. Text in brackets right after
     /// the status is a response code if it fits the grammar of RFC 2449,
-    /// section 3, and is no longer than [`MAX_CODE`]. The text may follow
+    /// section 3. The text may follow
     /// the `]` straight away or after one space. Text in brackets that is
     /// not a code is read as plain text, since a server without
     /// `RESP-CODES` may write any text there.
@@ -542,25 +628,59 @@ impl Reply {
     /// `Ok(None)` if `b` holds only part of a reply, and otherwise the
     /// reply and how many bytes of `b` it took.
     pub fn parse(b: &[u8], multi_line: bool) -> Result<Option<(Reply, usize)>, ReplyError> {
+        // Fed a piece at a time, so only the bytes up to the reply's end,
+        // and one piece more, are copied.
         let mut d = ReplyDecoder::new();
-        d.feed(b);
-        match d.next_reply(multi_line) {
-            None => Ok(None),
-            Some(Ok(r)) => Ok(Some((r, d.lines.consumed))),
-            Some(Err(e)) => Err(e),
+        for piece in b.chunks(PARSE_PIECE) {
+            d.feed(piece);
+            match d.next_reply(multi_line) {
+                None => {}
+                Some(Ok(r)) => return Ok(Some((r, d.lines.consumed))),
+                Some(Err(e)) => return Err(e),
+            }
         }
+        Ok(None)
     }
 
     /// The reply as bytes. A body is written only for a `+OK` reply, with a
     /// dot added in front of lines that start with one, and the closing
     /// line. LFs are dropped from the text, and the status line is cut to
-    /// fit in [`MAX_REPLY_LINE`]. A reply with no code whose text would be
-    /// read as one, such as `[AUTH] x`, gets a space in front of its text. Characters a response code may not hold
-    /// are dropped from it, and levels that do not fit in [`MAX_CODE`]
-    /// with it. Body lines longer than [`MAX_DATA_LINE`] are split, and
-    /// lines that do not fit in [`MAX_BODY`] are left out.
+    /// fit in [`MAX_REPLY_LINE`]. The code comes first: characters it may
+    /// not hold are dropped from it, and levels that do not fit on the line
+    /// with it. Text that would not fit after the code and a space follows
+    /// the `]` with no space, as RFC 2449, section 3 allows. A reply with
+    /// no code whose text would be read as one, such as `[AUTH] x`, gets a
+    /// space in front of its text.
+    ///
+    /// A body is never cut or changed, since a client would take part of a
+    /// message for all of it. A `+OK` reply whose body has a line longer
+    /// than [`MAX_DATA_LINE`], or is longer than [`MAX_BODY`], is written
+    /// as `-ERR [SYS/PERM]` with the error as its text.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut line = String::from(if self.ok { "+OK" } else { "-ERR" });
+        match self.write(false) {
+            Ok(bytes) => bytes,
+            Err(e) => Reply::err(&e.to_string())
+                .with_code(code::SYS_PERM)
+                .write(false)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The reply as bytes, or why it cannot be written as it is. The bytes
+    /// read back as this reply, given whether it has a body, with each
+    /// body line ending in CRLF, as [`Reply::with_body`] says. It fails with
+    /// [`ReplyError::LineTooLong`] if the status line would be cut or a
+    /// body line is too long, [`ReplyError::BodyTooLong`] if the body is,
+    /// and [`ReplyError::BadStatus`] if the text holds an LF, the code is
+    /// not a response code, a reply with no code has text that would be
+    /// read as one, or a `-ERR` reply has a body.
+    pub fn try_to_bytes(&self) -> Result<Vec<u8>, ReplyError> {
+        self.write(true)
+    }
+
+    fn write(&self, strict: bool) -> Result<Vec<u8>, ReplyError> {
+        let status = if self.ok { "+OK" } else { "-ERR" };
+        let max_line = MAX_REPLY_LINE - 2;
         // Each character is a byte or more, so this is enough to fill a line.
         let text: String = self
             .text
@@ -568,17 +688,57 @@ impl Reply {
             .filter(|&c| c != '\n')
             .take(MAX_REPLY_LINE)
             .collect();
-        let code = self.code.as_deref().and_then(clean_code);
+        if strict && text.len() != self.text.len() {
+            return Err(if self.text.len() > max_line {
+                ReplyError::LineTooLong
+            } else {
+                ReplyError::BadStatus
+            });
+        }
+        // " [" and "]" take 3 bytes.
+        let code_room = max_line - status.len() - 3;
+        let code = self
+            .code
+            .as_deref()
+            .and_then(|c| clean_code(c, code_room));
+        if let (true, Some(want)) = (strict, &self.code)
+            && code.as_deref() != Some(want.as_str())
+        {
+            return Err(if want.len() > code_room {
+                ReplyError::LineTooLong
+            } else {
+                ReplyError::BadStatus
+            });
+        }
+        if strict && !self.ok && self.body.is_some() {
+            return Err(ReplyError::BadStatus);
+        }
         let has_code = code.is_some();
+        let mut line = String::from(status);
+        let mut was_cut = false;
         match code {
             Some(code) => {
                 line.push_str(" [");
                 line.push_str(&code);
                 line.push(']');
-                if !text.is_empty() {
-                    line.push(' ');
-                    line.push_str(&text);
-                }
+                // The text is cut here, so the choice of a space before it
+                // is made on what is written, and writing what is read back
+                // gives the same line. Text that starts with a space needs
+                // the space before it, since a reader takes one off.
+                // Otherwise the space goes only if the text fits after it.
+                let room = max_line.saturating_sub(line.len());
+                let bare = cut(&text, room);
+                let spaced = cut(&text, room.saturating_sub(1));
+                let written = if text.starts_with(' ') || bare.len() < room {
+                    if !spaced.is_empty() {
+                        line.push(' ');
+                    }
+                    spaced
+                } else {
+                    bare
+                };
+                line.push_str(written);
+                was_cut = written.len() < text.len();
             }
             None if !text.is_empty() => {
                 line.push(' ');
@@ -586,51 +746,48 @@ impl Reply {
             }
             None => {}
         }
-        let mut line = cut(&line, MAX_REPLY_LINE - 2).to_string();
-        let status = if self.ok { 3 } else { 4 };
+        was_cut |= line.len() > max_line;
+        let mut line = cut(&line, max_line).to_string();
         // Text that would be read as a code gets a space in front of it.
         if !has_code
             && line
                 .as_bytes()
-                .get(status + 1..)
+                .get(status.len() + 1..)
                 .and_then(split_code)
                 .is_some()
         {
-            line.insert(status, ' ');
-            line = cut(&line, MAX_REPLY_LINE - 2).to_string();
+            if strict {
+                return Err(ReplyError::BadStatus);
+            }
+            line.insert(status.len(), ' ');
+            was_cut |= line.len() > max_line;
+            line = cut(&line, max_line).to_string();
+        }
+        if strict && was_cut {
+            return Err(ReplyError::LineTooLong);
         }
         let mut out = line.into_bytes();
         out.extend_from_slice(b"\r\n");
         if let (true, Some(body)) = (self.ok, &self.body) {
             let mut size = 0usize;
-            'lines: for content in body_lines(body) {
-                let mut rest = content;
-                loop {
-                    let room = if rest.first() == Some(&b'.') {
-                        MAX_DATA_LINE - 3
-                    } else {
-                        MAX_DATA_LINE - 2
-                    };
-                    let (piece, tail) = rest.split_at(rest.len().min(room));
-                    let Some(next) = size.checked_add(piece.len() + 2).filter(|&n| n <= MAX_BODY)
-                    else {
-                        break 'lines;
-                    };
-                    size = next;
-                    if piece.first() == Some(&b'.') {
-                        out.push(b'.');
-                    }
-                    out.extend_from_slice(piece);
-                    out.extend_from_slice(b"\r\n");
-                    if tail.is_empty() {
-                        break;
-                    }
-                    rest = tail;
+            for content in body_lines(body) {
+                let stuffed = content.first() == Some(&b'.');
+                if content.len() + usize::from(stuffed) + 2 > MAX_DATA_LINE {
+                    return Err(ReplyError::LineTooLong);
                 }
+                size = size
+                    .checked_add(content.len() + 2)
+                    .filter(|&n| n <= MAX_BODY)
+                    .ok_or(ReplyError::BodyTooLong)?;
+                if stuffed {
+                    out.push(b'.');
+                }
+                out.extend_from_slice(content);
+                out.extend_from_slice(b"\r\n");
             }
             out.extend_from_slice(b".\r\n");
         }
-        out
+        Ok(out)
     }
 
     /// Whether the reply's response code is `code` or a more detailed form
@@ -650,13 +807,10 @@ impl Reply {
             && matches!(own.get(want.len()), None | Some(b'/'))
     }
 
-    /// The body's lines, without their line ends. A reply with no body
-    /// has none.
-    pub fn lines(&self) -> Vec<&[u8]> {
-        self.body
-            .as_deref()
-            .map(|b| body_lines(b).collect())
-            .unwrap_or_default()
+    /// The body's lines, without their line ends, one at a time. A reply
+    /// with no body has none.
+    pub fn lines(&self) -> impl Iterator<Item = &[u8]> {
+        self.body.as_deref().into_iter().flat_map(body_lines)
     }
 
     /// The timestamp a server's greeting offers for `APOP`, such as
@@ -670,22 +824,22 @@ impl Reply {
         stamp.bytes().all(|c| c.is_ascii_graphic()).then_some(stamp)
     }
 
-    /// The count and size an answer to `STAT` gives.
+    /// The count and size an answer to `STAT` gives. Text after the size's
+    /// digits is allowed and ignored (RFC 1939, section 5).
     pub fn drop_listing(&self) -> Option<(u32, u64)> {
-        let mut parts = self.text.splitn(3, ' ');
+        let mut parts = self.text.splitn(2, ' ');
         let count = u32::try_from(decimal(parts.next()?)?).ok()?;
-        Some((count, decimal(parts.next()?)?))
+        Some((count, leading_decimal(parts.next()?)?))
     }
 }
 
 /// Reads a scan listing, `msg octets`: one line of the answer to `LIST`,
-/// or the text of the answer to `LIST msg`. Text after the size is
-/// allowed and ignored.
+/// or the text of the answer to `LIST msg`. Text after the size's digits
+/// is allowed and ignored (RFC 1939, section 5).
 pub fn parse_scan_listing(line: &[u8]) -> Option<(NonZeroU32, u64)> {
     let s = std::str::from_utf8(line).ok()?;
-    let mut parts = s.splitn(3, ' ');
-    let msg = message(parts.next()?).ok()?;
-    Some((msg, decimal(parts.next()?)?))
+    let (msg, rest) = s.split_once(' ')?;
+    Some((message(msg).ok()?, leading_decimal(rest)?))
 }
 
 /// Writes a scan listing, `msg octets`, without a line end.
@@ -705,22 +859,23 @@ pub fn parse_unique_id_listing(line: &[u8]) -> Option<(NonZeroU32, String)> {
     Some((message(msg).ok()?, uid.to_string()))
 }
 
-/// Writes a unique-id listing, `msg uid`, without a line end. Characters a
-/// unique-id may not hold are dropped, it is cut to [`MAX_UID`], and an
-/// empty one is written as `_`.
-pub fn write_unique_id_listing(msg: NonZeroU32, uid: &str) -> String {
-    let mut uid: String = uid
-        .chars()
-        .filter(char::is_ascii_graphic)
-        .take(MAX_UID)
-        .collect();
-    if uid.is_empty() {
-        uid.push('_');
-    }
-    format!("{msg} {uid}")
+/// Writes a unique-id listing, `msg uid`, without a line end, or gives
+/// `None` if `uid` is not 1 to [`MAX_UID`] printable ASCII characters other
+/// than space. A unique-id must differ from every other message's and stay
+/// the same across sessions (RFC 1939, section 7), so one that does not fit
+/// is not changed to fit: two could become one.
+pub fn write_unique_id_listing(msg: NonZeroU32, uid: &str) -> Option<String> {
+    let fits = !uid.is_empty() && uid.len() <= MAX_UID && uid.bytes().all(|c| c.is_ascii_graphic());
+    fits.then(|| format!("{msg} {uid}"))
 }
 
+/// How many bytes of its input [`Reply::parse`] feeds its decoder at once.
+const PARSE_PIECE: usize = 64 << 10;
+
 /// Splits a byte stream into lines, and skips lines that are too long.
+/// No line longer than [`MAX_AUTH_LINE`], the longest any reader takes, is
+/// kept whole: only its first `MAX_AUTH_LINE` bytes and its LF are, which
+/// is still too long for every reader.
 #[derive(Clone, Debug, Default)]
 struct Lines {
     buf: Vec<u8>,
@@ -730,10 +885,14 @@ struct Lines {
     start: usize,
     /// How many bytes after `start` are known to hold no LF.
     scanned: usize,
+    /// How many bytes at the end of `buf` follow its last LF.
+    tail: usize,
     /// Whether the bytes up to the next LF belong to a line too long to
     /// keep.
     skipping: bool,
-    /// How many bytes have been taken out or skipped, in all.
+    /// How many bytes have been taken out or skipped, in all. Bytes of a
+    /// long line dropped as it is fed are not counted: a reader that meets
+    /// that line fails, so it never asks how far it got past it.
     consumed: usize,
 }
 
@@ -752,11 +911,22 @@ impl Lines {
                 }
             }
         }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
+        while !bytes.is_empty() {
+            let (content, lf, rest) = match bytes.iter().position(|&c| c == b'\n') {
+                Some(i) => (&bytes[..i], true, &bytes[i + 1..]),
+                None => (bytes, false, &[][..]),
+            };
+            let room = MAX_AUTH_LINE.saturating_sub(self.tail);
+            let kept = content.get(..room).unwrap_or(content);
+            self.buf.extend_from_slice(kept);
+            if lf {
+                self.buf.push(b'\n');
+                self.tail = 0;
+            } else {
+                self.tail += kept.len();
+            }
+            bytes = rest;
         }
-        self.buf.extend_from_slice(bytes);
     }
 
     fn held(&self) -> &[u8] {
@@ -768,6 +938,7 @@ impl Lines {
         self.buf = Vec::new();
         self.start = 0;
         self.scanned = 0;
+        self.tail = 0;
     }
 
     fn take(&mut self, n: usize) {
@@ -775,9 +946,14 @@ impl Lines {
         self.start += n;
         self.consumed = self.consumed.saturating_add(n);
         self.scanned = 0;
-        if self.start == self.buf.len() {
-            self.buf.clear();
+        if self.start >= self.buf.len() - self.start {
+            self.buf.drain(..self.start);
             self.start = 0;
+            // A large feed taken out leaves no large buffer behind.
+            self.buf.shrink_to(MAX_AUTH_LINE);
+        }
+        if self.buf.is_empty() {
+            self.tail = 0;
         }
     }
 
@@ -835,12 +1011,26 @@ impl CommandDecoder {
     /// needs more bytes. An error covers one line only, and the next call
     /// reads the line after it. Once this returns `None`, the decoder holds
     /// less than one line, so it holds at most that plus what was fed
-    /// since.
+    /// since, and never more than [`MAX_AUTH_LINE`] bytes and an LF of any
+    /// one line.
     pub fn next_command(&mut self) -> Option<Result<Command, CommandError>> {
         Some(match self.lines.next_line(MAX_COMMAND_LINE)? {
             Ok(line) => Command::parse(&line),
             Err(()) => Err(CommandError::LineTooLong),
         })
+    }
+
+    /// The next whole line as it came, without its CRLF, for what is not a
+    /// command: the client's base64 answers during `AUTH`, and `*` to
+    /// cancel it (RFC 5034, section 4). A line longer than
+    /// [`MAX_AUTH_LINE`] is [`CommandError::LineTooLong`], and the next
+    /// call reads the line after it.
+    pub fn next_line(&mut self) -> Option<Result<Vec<u8>, CommandError>> {
+        Some(
+            self.lines
+                .next_line(MAX_AUTH_LINE)?
+                .map_err(|()| CommandError::LineTooLong),
+        )
     }
 
     /// How many bytes are held, waiting for the rest of a line.
@@ -923,6 +1113,25 @@ impl ReplyDecoder {
         }
     }
 
+    /// The next whole line as it came, without its CRLF, for what is not a
+    /// reply: the server's `+ ` challenges during `AUTH` (RFC 5034, section
+    /// 4). The exchange ends with a reply, read with
+    /// [`ReplyDecoder::next_reply`]. It returns `None` while the body of a
+    /// reply is still coming, or until a whole line has come. A line longer
+    /// than [`MAX_AUTH_LINE`] breaks the stream, as other errors do.
+    pub fn next_line(&mut self) -> Option<Result<Vec<u8>, ReplyError>> {
+        if let Some(e) = self.failed {
+            return Some(Err(e));
+        }
+        if self.pending.is_some() {
+            return None;
+        }
+        Some(match self.lines.next_line(MAX_AUTH_LINE)? {
+            Ok(line) => Ok(line),
+            Err(()) => Err(self.fail(ReplyError::LineTooLong)),
+        })
+    }
+
     /// How many bytes are held, waiting for the rest of a line, not
     /// counting the body of a reply still coming.
     pub fn buffered(&self) -> usize {
@@ -937,20 +1146,50 @@ impl ReplyDecoder {
     }
 }
 
+/// A command's arguments: how many there are, and the first few. No
+/// command takes more than two, so the rest are only counted.
+struct Args<'a> {
+    first: [&'a str; 3],
+    count: usize,
+}
+
+/// Splits an argument at single spaces, without keeping more than three
+/// pieces, however many spaces it holds.
+fn split_args(arg: Option<&str>) -> Result<Args<'_>, ArgumentError> {
+    let mut out = Args {
+        first: [""; 3],
+        count: 0,
+    };
+    for piece in arg.into_iter().flat_map(|a| a.split(' ')) {
+        if piece.is_empty() {
+            return Err(ArgumentError::Spacing);
+        }
+        if let Some(slot) = out.first.get_mut(out.count) {
+            *slot = piece;
+        }
+        out.count = out.count.saturating_add(1);
+    }
+    Ok(out)
+}
+
 /// Exactly `N` arguments.
-fn exact<const N: usize>(args: Vec<&str>) -> Result<[&str; N], ArgumentError> {
-    match args.len().cmp(&N) {
+fn exact<const N: usize>(args: Args<'_>) -> Result<[&str; N], ArgumentError> {
+    match args.count.cmp(&N) {
         std::cmp::Ordering::Less => Err(ArgumentError::Missing),
         std::cmp::Ordering::Greater => Err(ArgumentError::Extra),
-        std::cmp::Ordering::Equal => args.try_into().map_err(|_| ArgumentError::Missing),
+        std::cmp::Ordering::Equal => args
+            .first
+            .get(..N)
+            .and_then(|a| a.try_into().ok())
+            .ok_or(ArgumentError::Missing),
     }
 }
 
 /// No arguments or one.
-fn optional(args: Vec<&str>) -> Result<Option<&str>, ArgumentError> {
-    match args.as_slice() {
-        [] => Ok(None),
-        [a] => Ok(Some(a)),
+fn optional(args: Args<'_>) -> Result<Option<&str>, ArgumentError> {
+    match args.count {
+        0 => Ok(None),
+        1 => Ok(Some(args.first[0])),
         _ => Err(ArgumentError::Extra),
     }
 }
@@ -975,6 +1214,13 @@ fn decimal(s: &str) -> Option<u64> {
     })
 }
 
+/// The decimal digits `s` starts with, one or more, read as by `decimal`.
+/// What follows them is ignored.
+fn leading_decimal(s: &str) -> Option<u64> {
+    let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+    decimal(s.get(..digits)?)
+}
+
 fn parse_digest(s: &str) -> Result<[u8; 16], ArgumentError> {
     let b = s.as_bytes();
     if b.len() != 32 {
@@ -997,16 +1243,15 @@ fn hex(c: u8) -> Option<u8> {
 
 /// Splits a response code off the start of status text: the code without
 /// its brackets, and the text after it with one space taken off. It gives
-/// `None` if the text does not start with a code no longer than
-/// [`MAX_CODE`].
+/// `None` if the text does not start with a code. The status line holds
+/// the code to [`MAX_CODE`] bytes.
 fn split_code(rest: &[u8]) -> Option<(&[u8], &[u8])> {
     let after = rest.strip_prefix(b"[")?;
     let end = after.iter().position(|&c| c == b']')?;
     let (inner, tail) = (after.get(..end)?, after.get(end + 1..)?);
-    if inner.len() > MAX_CODE
-        || !inner
-            .split(|&c| c == b'/')
-            .all(|l| !l.is_empty() && l.iter().all(|&c| rchar(c)))
+    if !inner
+        .split(|&c| c == b'/')
+        .all(|l| !l.is_empty() && l.iter().all(|&c| rchar(c)))
     {
         return None;
     }
@@ -1019,22 +1264,24 @@ fn rchar(c: u8) -> bool {
     (0x21..=0x7f).contains(&c) && c != b'/' && c != b']'
 }
 
-/// A response code with what it may not hold dropped, cut to
-/// [`MAX_CODE`], or `None` if nothing is left.
-fn clean_code(code: &str) -> Option<String> {
+/// A response code with what it may not hold dropped, cut to `max` bytes,
+/// or `None` if nothing is left. No more than `max` bytes of a level are
+/// copied, however long it is.
+fn clean_code(code: &str, max: usize) -> Option<String> {
     let mut out = String::new();
     for level in code.split('/') {
         let level: String = level
             .chars()
             .filter(|&c| u8::try_from(c).is_ok_and(rchar))
+            .take(max.saturating_add(1))
             .collect();
         if level.is_empty() {
             continue;
         }
         if out.is_empty() {
             out = level;
-            out.truncate(MAX_CODE);
-        } else if out.len() + 1 + level.len() <= MAX_CODE {
+            out.truncate(max);
+        } else if out.len() + 1 + level.len() <= max {
             out.push('/');
             out.push_str(&level);
         } else {
@@ -1140,12 +1387,8 @@ mod tests {
     fn replies(stream: &[u8], bytewise: bool) -> Vec<Result<Reply, ReplyError>> {
         let mut d = ReplyDecoder::new();
         let mut out = Vec::new();
-        let chunks: Vec<&[u8]> = if bytewise {
-            stream.chunks(1).collect()
-        } else {
-            vec![stream]
-        };
-        for chunk in chunks {
+        let size = if bytewise { 1 } else { stream.len().max(1) };
+        for chunk in stream.chunks(size) {
             d.feed(chunk);
             while let Some(r) = d.next_reply(flag(out.len())) {
                 let stop = r.is_err();
@@ -1197,7 +1440,6 @@ mod tests {
         assert_eq!(list.text, "2 messages (320 octets)");
         let listing: Vec<_> = list
             .lines()
-            .into_iter()
             .filter_map(parse_scan_listing)
             .collect();
         assert_eq!(listing, [(n(1), 120), (n(2), 200)]);
@@ -1245,7 +1487,6 @@ mod tests {
         .0;
         let ids: Vec<_> = uidl
             .lines()
-            .into_iter()
             .filter_map(parse_unique_id_listing)
             .collect();
         assert_eq!(
@@ -1256,8 +1497,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            write_unique_id_listing(n(2), "QhdPYR:00WBw1Ph7x7"),
-            "2 QhdPYR:00WBw1Ph7x7"
+            write_unique_id_listing(n(2), "QhdPYR:00WBw1Ph7x7").as_deref(),
+            Some("2 QhdPYR:00WBw1Ph7x7")
         );
     }
 
@@ -1271,8 +1512,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(used, stream.len());
-        assert_eq!(capa.lines().len(), 9);
-        assert_eq!(capa.lines()[2], b"SASL CRAM-MD5 KERBEROS_V4");
+        assert_eq!(capa.lines().count(), 9);
+        assert_eq!(capa.lines().nth(2), Some(&b"SASL CRAM-MD5 KERBEROS_V4"[..]));
         assert_eq!(capa.to_bytes(), stream);
 
         let in_use =
@@ -1611,12 +1852,17 @@ mod tests {
         let pass = Request::Pass("p".repeat(1000)).to_bytes();
         assert_eq!(pass.len(), MAX_COMMAND_LINE);
         assert!(matches!(commands(&pass)[..], [Ok(_)]));
-        // Bad keywords are written as NOOP.
+        // Bad keywords are written as NOOP, with no argument.
         let c = Command {
             keyword: "R\r\n".into(),
             argument: Some("x\ny".into()),
         };
-        assert_eq!(c.to_bytes(), b"NOOP xy\r\n");
+        assert_eq!(c.to_bytes(), b"NOOP\r\n");
+        let c = Command {
+            keyword: "RETR".into(),
+            argument: Some("x\ny".into()),
+        };
+        assert_eq!(c.to_bytes(), b"RETR xy\r\n");
         // Status text loses LFs, is cut, and does not start a code by mistake.
         let r = Reply::ok(&format!("[x\n{}", "é".repeat(400)));
         let b = r.to_bytes();
@@ -1630,49 +1876,25 @@ mod tests {
         let back = Reply::parse(&b, false).unwrap().unwrap().0;
         assert_eq!(back.code, None);
         assert_eq!(Reply::err("[A] x").to_bytes(), b"-ERR  [A] x\r\n");
+        assert_eq!(Reply::err("[A] x").try_to_bytes(), Err(ReplyError::BadStatus));
         // Codes lose what they may not hold.
         let r = Reply::err("t").with_code("SYS/ /T]EMP/");
         assert_eq!(r.to_bytes(), b"-ERR [SYS/TEMP] t\r\n");
         let r = Reply::err("t").with_code("] /");
         assert_eq!(r.to_bytes(), b"-ERR t\r\n");
-        let r = Reply::err("t").with_code(&"A".repeat(500));
-        assert_eq!(
-            Reply::parse(&r.to_bytes(), false)
-                .unwrap()
-                .unwrap()
-                .0
-                .code
-                .unwrap()
-                .len(),
-            MAX_CODE
-        );
-        let r = Reply::err("t").with_code(&format!("{}/{}", "A".repeat(100), "B".repeat(100)));
-        assert_eq!(
-            Reply::parse(&r.to_bytes(), false)
-                .unwrap()
-                .unwrap()
-                .0
-                .code
-                .unwrap(),
-            "A".repeat(100)
-        );
-        // Long body lines are split, and a body too big is cut.
-        let mut body = vec![b'.'; MAX_DATA_LINE * 2];
-        body.extend_from_slice(b"\r\nend\r\n");
-        let r = Reply::ok("").with_body(body);
-        let back = Reply::parse(&r.to_bytes(), true).unwrap().unwrap().0;
-        let lines = back.lines();
-        assert_eq!(lines.len(), 4);
-        assert_eq!(
-            lines.iter().map(|l| l.len()).sum::<usize>(),
-            MAX_DATA_LINE * 2 + 3
-        );
-        let r = Reply::ok("").with_body(vec![b'z'; MAX_BODY + 10]);
-        let back = Reply::parse(&r.to_bytes(), true).unwrap().unwrap().0;
-        assert!(back.body.unwrap().len() <= MAX_BODY);
-        // A unique-id loses what it may not hold.
-        assert_eq!(write_unique_id_listing(n(1), " "), "1 _");
-        let w = write_unique_id_listing(n(1), &"u v".repeat(50));
+        // A code is cut to fit the line, a level at a time, before text.
+        let r = Reply::err("t").with_code(&"A".repeat(600));
+        let back = Reply::parse(&r.to_bytes(), false).unwrap().unwrap().0;
+        assert_eq!(back.code.unwrap().len(), MAX_CODE - 1);
+        assert_eq!(back.text, "");
+        let r = Reply::err("t").with_code(&format!("{}/{}", "A".repeat(300), "B".repeat(300)));
+        let back = Reply::parse(&r.to_bytes(), false).unwrap().unwrap().0;
+        assert_eq!(back.code.unwrap(), "A".repeat(300));
+        // A unique-id that does not fit is not written.
+        assert_eq!(write_unique_id_listing(n(1), " "), None);
+        assert_eq!(write_unique_id_listing(n(1), ""), None);
+        assert_eq!(write_unique_id_listing(n(1), &"u".repeat(MAX_UID + 1)), None);
+        let w = write_unique_id_listing(n(1), &"u".repeat(MAX_UID)).unwrap();
         assert_eq!(
             parse_unique_id_listing(w.as_bytes()).unwrap().1.len(),
             MAX_UID
@@ -1759,8 +1981,12 @@ mod tests {
             );
             assert_eq!(r.to_bytes(), [line, b"\r\n"].concat());
         }
-        let long_code = [b"-ERR [".as_slice(), &[b'A'; MAX_CODE + 1], b"]"].concat();
-        assert_eq!(Reply::parse_line(&long_code).unwrap().code, None);
+        // A code may fill the line (RFC 2449 sets no limit of its own).
+        let long_code = [b"+OK [".as_slice(), &[b'A'; MAX_CODE], b"]"].concat();
+        assert_eq!(long_code.len(), MAX_REPLY_LINE - 2);
+        let r = Reply::parse_line(&long_code).unwrap();
+        assert_eq!(r.code.as_deref().map(str::len), Some(MAX_CODE));
+        assert_eq!(r.try_to_bytes().unwrap(), [&long_code[..], b"\r\n"].concat());
     }
 
     #[test]
@@ -1800,12 +2026,12 @@ mod tests {
             keyword: "RETRY".into(),
             argument: Some("1".into()),
         };
-        assert_eq!(c.to_bytes(), b"NOOP 1\r\n");
+        assert_eq!(c.to_bytes(), b"NOOP\r\n");
         let r = Request::Other(Command {
             keyword: "DELETE".into(),
             argument: Some("1".into()),
         });
-        assert_eq!(r.to_bytes(), b"NOOP 1\r\n");
+        assert_eq!(r.to_bytes(), b"NOOP\r\n");
         // Dropped characters still count only once they are gone.
         let c = Command {
             keyword: "R E\tT R".into(),
@@ -1816,13 +2042,13 @@ mod tests {
 
     #[test]
     fn writers_stop_reading_input_past_their_limits() {
-        // A body of many empty lines, far past MAX_BODY, is written as
-        // MAX_BODY bytes and in about the time that takes.
+        // A body of many empty lines, far past MAX_BODY, is refused in
+        // about the time it takes to write MAX_BODY bytes.
         let started = std::time::Instant::now();
         let r = Reply::ok("").with_body(vec![b'\n'; MAX_BODY * 8]);
-        let bytes = r.to_bytes();
-        let back = Reply::parse(&bytes, true).unwrap().unwrap().0;
-        assert_eq!(back.body.unwrap().len(), MAX_BODY);
+        assert_eq!(r.try_to_bytes(), Err(ReplyError::BodyTooLong));
+        let back = Reply::parse(&r.to_bytes(), true).unwrap().unwrap().0;
+        assert!(!back.ok);
         // Long text and arguments are cut too.
         let text = "t".repeat(MAX_BODY);
         assert_eq!(Reply::ok(&text).to_bytes().len(), MAX_REPLY_LINE);
@@ -1875,12 +2101,317 @@ mod tests {
         body.extend(b"a\r\n".iter().copied().cycle().take(3 * 200_000));
         body.extend_from_slice(b".\r\n");
         let r = Reply::parse(&body, true).unwrap().unwrap().0;
-        assert_eq!(r.lines().len(), 200_000);
+        assert_eq!(r.lines().count(), 200_000);
         assert!(
             started.elapsed().as_secs() < 5,
             "took {:?}",
             started.elapsed()
         );
+    }
+
+    // Problems found in the third review.
+
+    #[test]
+    fn decoders_keep_no_long_line_or_large_buffer() {
+        // A long line fed at once is not kept past MAX_AUTH_LINE, with or
+        // without its line end in the same feed.
+        let long = vec![b'x'; 1 << 20];
+        let mut d = CommandDecoder::new();
+        d.feed(&[long.as_slice(), b"\r\nQUIT\r\n"].concat());
+        assert!(d.buffered() <= MAX_AUTH_LINE + 9, "{}", d.buffered());
+        let got: Vec<_> = std::iter::from_fn(|| d.next_command()).collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Err(CommandError::LineTooLong));
+        assert_eq!(got[1].as_ref().unwrap().keyword, "QUIT");
+        let mut d = CommandDecoder::new();
+        d.feed(&long);
+        d.feed(&long);
+        assert!(d.buffered() <= MAX_AUTH_LINE, "{}", d.buffered());
+        d.feed(b"\r\nQUIT\r\n");
+        let got: Vec<_> = std::iter::from_fn(|| d.next_command()).collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0], Err(CommandError::LineTooLong));
+        // The same for replies, as a status line and as a body line.
+        for multi in [false, true] {
+            let mut d = ReplyDecoder::new();
+            d.feed(&[b"+OK\r\n".as_slice(), &long, b"\r\n"].concat());
+            assert!(d.buffered() <= MAX_AUTH_LINE + 6, "{}", d.buffered());
+            let first = d.next_reply(multi);
+            if !multi {
+                assert_eq!(first, Some(Ok(Reply::ok(""))));
+            }
+            let mut last = first;
+            while let Some(Ok(_)) = last {
+                last = d.next_reply(multi);
+            }
+            assert_eq!(last, Some(Err(ReplyError::LineTooLong)));
+        }
+        // A reply read from the front of a large input says how far it
+        // went.
+        let stream = [b"+OK hi\r\n".as_slice(), &long, b"\r\n"].concat();
+        assert_eq!(
+            Reply::parse(&stream, false),
+            Ok(Some((Reply::ok("hi"), 8)))
+        );
+        // Many short lines fed at once leave no large buffer once read.
+        let mut d = CommandDecoder::new();
+        let many: Vec<u8> = b"NOOP\r\n".iter().copied().cycle().take(6 << 17).collect();
+        d.feed(&many);
+        d.feed(b"NO");
+        assert_eq!(std::iter::from_fn(|| d.next_command()).count(), 1 << 17);
+        assert_eq!(d.buffered(), 2);
+        assert!(d.lines.buf.capacity() <= MAX_AUTH_LINE, "{}", d.lines.buf.capacity());
+    }
+
+    #[test]
+    fn bodies_that_do_not_fit_are_refused_not_cut() {
+        // RFC 1939, section 5: RETR sends the whole message. A body that
+        // cannot be sent whole gives -ERR, so a client never deletes a
+        // message it got only part of.
+        let mut body = vec![b'a'; MAX_DATA_LINE];
+        body.extend_from_slice(b"\r\n");
+        let r = Reply::ok("1 message").with_body(body);
+        assert_eq!(r.try_to_bytes(), Err(ReplyError::LineTooLong));
+        assert_eq!(r.to_bytes(), b"-ERR [SYS/PERM] reply line too long\r\n");
+        let line = [vec![b'b'; MAX_DATA_LINE - 2], b"\r\n".to_vec()].concat();
+        let r = Reply::ok("").with_body(line.repeat(MAX_BODY / line.len() + 1));
+        assert_eq!(r.try_to_bytes(), Err(ReplyError::BodyTooLong));
+        assert_eq!(r.to_bytes(), b"-ERR [SYS/PERM] reply body too long\r\n");
+        // The longest lines fit, dot or not, and read back the same.
+        let dotted = [b".".as_slice(), &[b'c'; MAX_DATA_LINE - 4], b"\r\n"].concat();
+        let r = Reply::ok("").with_body([line.clone(), dotted].concat());
+        let bytes = r.try_to_bytes().unwrap();
+        assert_eq!(bytes, r.to_bytes());
+        assert_eq!(Reply::parse(&bytes, true).unwrap().unwrap().0, r);
+        // A body exactly MAX_BODY long fits.
+        let lines = MAX_BODY / line.len() - 1;
+        let last = vec![b'd'; MAX_BODY - lines * line.len() - 2];
+        let body = [line.repeat(lines), last, b"\r\n".to_vec()].concat();
+        assert_eq!(body.len(), MAX_BODY);
+        let r = Reply::ok("").with_body(body);
+        assert_eq!(Reply::parse(&r.try_to_bytes().unwrap(), true).unwrap().unwrap().0, r);
+    }
+
+    #[test]
+    fn arguments_are_counted_not_collected() {
+        // A public Command may hold far more than a line.
+        let spaces = Command {
+            keyword: "USER".into(),
+            argument: Some(" ".repeat(8 << 20)),
+        };
+        assert_eq!(Request::from_command(&spaces), Err(ArgumentError::Spacing));
+        let many = Command {
+            keyword: "LIST".into(),
+            argument: Some("1 ".repeat(1 << 20) + "1"),
+        };
+        assert_eq!(Request::from_command(&many), Err(ArgumentError::Extra));
+        assert_eq!(request(b"TOP 1 2 3 "), Err(ArgumentError::Spacing));
+        assert_eq!(request(b"USER a b c d"), Err(ArgumentError::Extra));
+        // A huge code is cut to the line.
+        let r = Reply::err("").with_code(&"A".repeat(16 << 20));
+        assert_eq!(r.to_bytes().len(), MAX_REPLY_LINE);
+        // Lines are found one at a time.
+        let r = Reply::ok("").with_body(b"a\nb\r\nc".to_vec());
+        let mut lines = r.lines();
+        assert_eq!(lines.next(), Some(&b"a"[..]));
+        assert_eq!(lines.count(), 2);
+        assert_eq!(Reply::ok("").lines().count(), 0);
+    }
+
+    #[test]
+    fn writers_can_refuse_rather_than_change() {
+        // A password one byte too long for the line is refused, not cut.
+        let p = Request::Pass("p".repeat(249));
+        assert_eq!(p.try_to_bytes(), None);
+        assert_eq!(p.to_bytes().len(), MAX_COMMAND_LINE);
+        let p = Request::Pass("p".repeat(248));
+        assert_eq!(p.try_to_bytes(), Some(p.to_bytes()));
+        for bad in [
+            Request::User("a b".into()),
+            Request::User(String::new()),
+            Request::User("a\r".into()),
+            Request::Pass(String::new()),
+            Request::Pass("a\nb".into()),
+            Request::Apop {
+                name: "a b".into(),
+                digest: [0; 16],
+            },
+            Request::Apop {
+                name: "u".repeat(216),
+                digest: [0; 16],
+            },
+            // A keyword this module knows is not Other, and RETRY is not
+            // a keyword.
+            Request::Other(Command {
+                keyword: "user".into(),
+                argument: Some("x".into()),
+            }),
+            Request::Other(Command {
+                keyword: "RETRY".into(),
+                argument: Some("1".into()),
+            }),
+        ] {
+            assert_eq!(bad.try_to_bytes(), None, "{bad:?}");
+            // to_bytes still writes something the parsers take.
+            let line = bad.to_bytes();
+            let c = Command::parse(line.strip_suffix(b"\r\n").unwrap()).unwrap();
+            assert!(Request::from_command(&c).is_ok(), "{bad:?}");
+        }
+        for good in [
+            Request::Pass("open sesame ".into()),
+            Request::User("é".into()),
+            Request::Apop {
+                name: "u".repeat(215),
+                digest: [7; 16],
+            },
+            Request::Other(Command {
+                keyword: "auth".into(),
+                argument: Some("PLAIN".into()),
+            }),
+            Request::Quit,
+        ] {
+            let bytes = good.try_to_bytes().unwrap();
+            let c = Command::parse(bytes.strip_suffix(b"\r\n").unwrap()).unwrap();
+            match (&good, Request::from_command(&c).unwrap()) {
+                (Request::Other(_), Request::Other(back)) => assert_eq!(back.keyword, "AUTH"),
+                (_, back) => assert_eq!(back, good),
+            }
+        }
+        // A bad keyword becomes a bare NOOP, which reads as Noop.
+        let c = Command {
+            keyword: "RETRY".into(),
+            argument: Some("1".into()),
+        };
+        let line = c.to_bytes();
+        let back = Command::parse(line.strip_suffix(b"\r\n").unwrap()).unwrap();
+        assert_eq!(Request::from_command(&back), Ok(Request::Noop));
+        assert_eq!(c.try_to_bytes(), Err(CommandError::BadKeyword));
+        let c = |k: &str, a: Option<&str>| Command {
+            keyword: k.into(),
+            argument: a.map(String::from),
+        };
+        assert_eq!(c("NOOP", Some("a\tb")).try_to_bytes(), Err(CommandError::BadCharacter));
+        assert_eq!(
+            c("PASS", Some(&"p".repeat(249))).try_to_bytes(),
+            Err(CommandError::LineTooLong)
+        );
+        assert_eq!(c("x-ab", Some("")).try_to_bytes(), Ok(b"X-AB\r\n".to_vec()));
+    }
+
+    #[test]
+    fn unique_ids_are_never_merged() {
+        // RFC 1939, section 7: unique-ids differ between messages.
+        let a = format!("{}X", "a".repeat(70));
+        let b = format!("{}Y", "a".repeat(70));
+        assert_eq!(write_unique_id_listing(n(1), &a), None);
+        assert_eq!(write_unique_id_listing(n(2), &b), None);
+        assert_eq!(write_unique_id_listing(n(1), "a b"), None);
+        assert_eq!(write_unique_id_listing(n(1), "aé"), None);
+    }
+
+    #[test]
+    fn full_status_lines_round_trip() {
+        // RFC 2449, section 3: text may follow the code with no space.
+        let line = [b"-ERR [AUTH]".as_slice(), &[b'x'; 499]].concat();
+        assert_eq!(line.len(), MAX_REPLY_LINE - 2);
+        let r = Reply::parse_line(&line).unwrap();
+        assert_eq!(r.text.len(), 499);
+        let want = [&line[..], b"\r\n"].concat();
+        assert_eq!(r.to_bytes(), want);
+        assert_eq!(r.try_to_bytes(), Ok(want));
+        // Text that starts with a space keeps the space before it.
+        let r = Reply::err(&format!(" {}", "y".repeat(498))).with_code("AUTH");
+        assert_eq!(r.try_to_bytes(), Err(ReplyError::LineTooLong));
+        let back = Reply::parse(&r.to_bytes(), false).unwrap().unwrap().0;
+        assert!(back.text.starts_with(" y"));
+        // Text cut away whole leaves no space after the code, and what is
+        // written reads back and writes the same.
+        for text in [" more", "more", "é"] {
+            let r = Reply::ok(text).with_code(&"A".repeat(MAX_CODE - 1));
+            let bytes = r.to_bytes();
+            assert_eq!(bytes.len(), MAX_REPLY_LINE - 1 + usize::from(text == "more"));
+            let back = Reply::parse(&bytes, false).unwrap().unwrap().0;
+            assert_eq!(back.to_bytes(), bytes, "{text:?}");
+        }
+        // try_to_bytes refuses what to_bytes would change.
+        assert_eq!(Reply::ok("a\nb").try_to_bytes(), Err(ReplyError::BadStatus));
+        assert_eq!(
+            Reply::ok("t").with_code("SYS/").try_to_bytes(),
+            Err(ReplyError::BadStatus)
+        );
+        assert_eq!(
+            Reply::ok(&"t".repeat(508)).try_to_bytes(),
+            Err(ReplyError::LineTooLong)
+        );
+        assert_eq!(
+            Reply::err("x").with_body(Vec::new()).try_to_bytes(),
+            Err(ReplyError::BadStatus)
+        );
+        assert_eq!(
+            Reply::ok(&"t".repeat(506)).try_to_bytes().map(|b| b.len()),
+            Ok(MAX_REPLY_LINE)
+        );
+    }
+
+    #[test]
+    fn long_codes_keep_their_meaning() {
+        // RFC 2449, section 8: clients ignore detail they do not know.
+        let line = [b"-ERR [SYS/TEMP/".as_slice(), &[b'x'; 120], b"] retry"].concat();
+        let r = Reply::parse_line(&line).unwrap();
+        assert!(r.has_code(code::SYS_TEMP));
+        assert_eq!(r.text, "retry");
+        assert_eq!(r.to_bytes(), [&line[..], b"\r\n"].concat());
+    }
+
+    #[test]
+    fn auth_exchanges_read_as_lines() {
+        // RFC 5034, section 4: the server sends "+ " challenges, and the
+        // client base64 answers or "*".
+        let mut d = CommandDecoder::new();
+        let answer = "QUFB".repeat(1000);
+        d.feed(format!("AUTH PLAIN\r\n{answer}\r\n*\r\nQUIT\r\n").as_bytes());
+        let auth = d.next_command().unwrap().unwrap();
+        assert!(matches!(Request::from_command(&auth), Ok(Request::Other(_))));
+        assert_eq!(d.next_line(), Some(Ok(answer.into_bytes())));
+        assert_eq!(d.next_line(), Some(Ok(b"*".to_vec())));
+        assert_eq!(d.next_command().unwrap().unwrap().keyword, "QUIT");
+        assert_eq!(d.next_line(), None);
+        let mut d = CommandDecoder::new();
+        d.feed(&[&[b'Q'; MAX_AUTH_LINE][..], b"\r\n=\r\n"].concat());
+        assert_eq!(d.next_line(), Some(Err(CommandError::LineTooLong)));
+        assert_eq!(d.next_line(), Some(Ok(b"=".to_vec())));
+
+        let mut d = ReplyDecoder::new();
+        d.feed(b"+ \r\n+ PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2U+\r\n+OK done\r\n");
+        assert_eq!(d.next_line(), Some(Ok(b"+ ".to_vec())));
+        assert_eq!(
+            d.next_line(),
+            Some(Ok(b"+ PDE4OTYuNjk3MTcwOTUyQHBvc3RvZmZpY2U+".to_vec()))
+        );
+        assert_eq!(d.next_reply(false), Some(Ok(Reply::ok("done"))));
+        // No line is taken out of a body still coming.
+        let mut d = ReplyDecoder::new();
+        d.feed(b"+OK\r\nx\r\n");
+        assert_eq!(d.next_reply(true), None);
+        assert_eq!(d.next_line(), None);
+        d.feed(b".\r\n");
+        assert!(d.next_reply(true).unwrap().is_ok());
+        let mut d = ReplyDecoder::new();
+        d.feed(&[b'+'; MAX_AUTH_LINE + 1]);
+        assert_eq!(d.next_line(), Some(Err(ReplyError::LineTooLong)));
+        assert_eq!(d.next_reply(false), Some(Err(ReplyError::LineTooLong)));
+    }
+
+    #[test]
+    fn sizes_may_have_text_right_after_them() {
+        // RFC 1939, section 5 sets no rule on what follows the size.
+        assert_eq!(Reply::ok("2 320(octets)").drop_listing(), Some((2, 320)));
+        assert_eq!(Reply::ok("2 320 octets").drop_listing(), Some((2, 320)));
+        assert_eq!(parse_scan_listing(b"1 120(octets)"), Some((n(1), 120)));
+        assert_eq!(Reply::ok("2 (320)").drop_listing(), None);
+        assert_eq!(Reply::ok("2x 320").drop_listing(), None);
+        assert_eq!(parse_scan_listing(b"1x 120"), None);
+        assert_eq!(parse_scan_listing(b"1  120"), None);
     }
 
     /// A small deterministic generator, so the fuzz loop needs no crates.
@@ -1967,25 +2498,29 @@ mod tests {
                 let (chunk, tail) =
                     rest.split_at(1 + rng.below(rest.len().min(MAX_COMMAND_LINE + 9)));
                 d.feed(chunk);
+                assert!(d.buffered() <= chunk.len() + MAX_COMMAND_LINE);
                 chunked.extend(std::iter::from_fn(|| d.next_command()));
+                assert!(d.buffered() < MAX_COMMAND_LINE);
                 rest = tail;
             }
             assert_eq!(chunked, whole);
             for c in whole.iter().flatten() {
                 assert_eq!(commands(&c.to_bytes()), [Ok(c.clone())]);
+                assert_eq!(c.try_to_bytes(), Ok(c.to_bytes()));
                 if let Ok(r) = Request::from_command(c) {
-                    let again = commands(&r.to_bytes());
+                    let bytes = r.try_to_bytes().unwrap();
+                    assert_eq!(bytes, r.to_bytes());
+                    let again = commands(&bytes);
                     assert_eq!(again.len(), 1);
                     let back = Request::from_command(again[0].as_ref().unwrap()).unwrap();
-                    if !matches!(r, Request::Other(_)) {
-                        assert_eq!(back, r);
-                    }
+                    assert_eq!(back, r);
                 }
             }
             let got = replies(&data, false);
             assert_eq!(got, replies(&data, true));
             for r in got.iter().flatten() {
                 let bytes = r.to_bytes();
+                assert_eq!(r.try_to_bytes().as_ref(), Ok(&bytes));
                 let (back, used) = Reply::parse(&bytes, r.body.is_some()).unwrap().unwrap();
                 assert_eq!(&back, r);
                 assert_eq!(used, bytes.len());
@@ -2003,7 +2538,7 @@ mod tests {
                         );
                     }
                     if let Some((m, u)) = parse_unique_id_listing(line) {
-                        let w = write_unique_id_listing(m, &u);
+                        let w = write_unique_id_listing(m, &u).unwrap();
                         assert_eq!(parse_unique_id_listing(w.as_bytes()), Some((m, u)));
                     }
                 }
@@ -2013,15 +2548,53 @@ mod tests {
             let _ = Reply::parse_line(&data);
             let _ = Reply::parse(&data, true);
             let _ = Reply::parse(&data, false);
-            // Writers never write what readers refuse.
+            // Writers never write what readers refuse, whatever the fields
+            // hold, each chosen on its own.
             let s = String::from_utf8_lossy(&data);
+            let other = rng.buffer();
+            let t = String::from_utf8_lossy(&other);
+            let pick = rng.next();
             let reply = Reply {
-                ok: true,
-                code: Some(s.to_string()),
-                text: s.to_string(),
-                body: Some(data.clone()),
+                ok: pick & 1 == 0,
+                code: [None, Some(s.to_string()), Some(t.to_string())][(pick as usize >> 1) % 3].clone(),
+                text: if pick & 8 == 0 { t.to_string() } else { s.to_string() },
+                body: [None, Some(data.clone()), Some(other.clone())][(pick as usize >> 4) % 3].clone(),
             };
-            assert!(Reply::parse(&reply.to_bytes(), true).unwrap().is_some());
+            let has_body = reply.ok && reply.body.is_some();
+            let bytes = reply.to_bytes();
+            let (back, used) = Reply::parse(&bytes, has_body).unwrap().unwrap();
+            assert_eq!(used, bytes.len());
+            // What the writer wrote, read and written again, is the same.
+            assert_eq!(back.to_bytes(), bytes);
+            if let Ok(strict) = reply.try_to_bytes() {
+                assert_eq!(strict, bytes);
+                assert_eq!(
+                    (back.ok, &back.code, &back.text),
+                    (reply.ok, &reply.code, &reply.text)
+                );
+            }
+            // Any keyword and argument, as a request of its own.
+            let req = Request::Other(Command {
+                keyword: t.to_string(),
+                argument: Some(s.to_string()),
+            });
+            let line = req.to_bytes();
+            let c = Command::parse(line.strip_suffix(b"\r\n").unwrap()).unwrap();
+            let bare = Command {
+                keyword: c.keyword.clone(),
+                argument: None,
+            };
+            match Request::from_command(&bare) {
+                Ok(Request::Other(_)) => {
+                    assert!(matches!(Request::from_command(&c), Ok(Request::Other(_))))
+                }
+                Ok(Request::Noop) if c.argument.is_none() => {}
+                // A keyword this module knows, put in Other by hand.
+                _ => assert_eq!(c.keyword, t.chars().filter(char::is_ascii_graphic).collect::<String>().to_ascii_uppercase()),
+            }
+            if let Some(bytes) = req.try_to_bytes() {
+                assert_eq!(commands(&bytes).len(), 1);
+            }
             let c = Command {
                 keyword: s.to_string(),
                 argument: Some(s.to_string()),

@@ -8,9 +8,9 @@ use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::ospf::{
     ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body, DatabaseDescription, Decoder,
     Endpoints, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa, InterAreaRouterLsa, IntraAreaPrefixLsa,
-    LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_MESSAGE, MAX_PACKET, NetworkLsa, NetworkLsaV3, Packet, Prefix,
-    RouterInterface, RouterLink, RouterLsa, RouterLsaV3, SummaryLsa, TosMetric, Version, checksum, lsa_checksum,
-    lsa_type_v2, lsa_type_v3,
+    LSA_HEADER_LEN, LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa,
+    NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, OspfError, Packet, Prefix, RouterInterface, RouterLink, RouterLsa,
+    RouterLsaV3, SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -37,20 +37,37 @@ fn check(data: &[u8], e: &Endpoints) {
     assert_eq!(bytewise.finish(), parsed);
 
     if let Ok(p) = &parsed {
-        // A packet read can be written, and reads back the same.
+        // A packet read can be written, and reads back the same. LSAs an
+        // update drops and a signaling block with a wrong checksum make it
+        // shorter.
         let bytes = p.to_bytes(e).unwrap();
-        assert_eq!(bytes.len(), data.len());
+        assert!(bytes.len() <= data.len());
         assert_eq!(Packet::parse(&bytes, e).as_ref(), Ok(p));
     }
 }
 
 fn check_lsa(data: &[u8], v: Version) {
     if let Ok((lsa, n)) = Lsa::parse(data, v) {
-        // An LSA read can be written, and reads back the same.
+        // An LSA read writes back to the same bytes, so its header is the
+        // one received (RFC 2328 sections 13.1 and 13.7).
         assert!(n <= data.len());
         let bytes = lsa.to_bytes(v).unwrap();
-        assert_eq!(bytes.len(), n);
-        assert_eq!(Lsa::parse(&bytes, v), Ok((lsa, n)));
+        assert_eq!(bytes, data[..n]);
+        let h = lsa.header(v).unwrap();
+        assert_eq!((h.checksum, usize::from(h.length)), (u16::from_be_bytes([data[16], data[17]]), n));
+    }
+    // The bytes after a header as a body, read directly: it is capped at
+    // what an LSA holds, and a body read writes back to the same bytes.
+    if data.len() >= LSA_HEADER_LEN {
+        let body = &data[LSA_HEADER_LEN..];
+        let t = match v {
+            Version::V2 => u16::from(data[3]),
+            Version::V3 => u16::from_be_bytes([data[2], data[3]]),
+        };
+        match LsaBody::parse(body, v, t) {
+            Ok(b) => assert_eq!(b.to_bytes(v, t).as_deref(), Ok(body)),
+            Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == OspfError::TooLong),
+        }
     }
 }
 
@@ -68,9 +85,14 @@ fn list<T>(u: &mut Unstructured, max: usize, mut f: impl FnMut(&mut Unstructured
     (0..n).map(|_| f(u)).collect()
 }
 
-/// A prefix built with `Prefix::new`, its length possibly out of range.
+/// A prefix built with `Prefix::new` or directly, so its address may have
+/// bits past its length, and its length may be out of range.
 fn prefix(u: &mut Unstructured) -> Result<Prefix> {
-    Ok(Prefix::new(u.arbitrary()?, u.arbitrary()?, ip6(u)?))
+    if u.arbitrary()? {
+        Ok(Prefix::new(u.arbitrary()?, u.arbitrary()?, ip6(u)?))
+    } else {
+        Ok(Prefix { length: u.arbitrary()?, options: u.arbitrary()?, address: ip6(u)? })
+    }
 }
 
 /// An LSA body built from fuzz bytes, valid or not, with an LS type that
@@ -222,7 +244,7 @@ fn lsa_header(u: &mut Unstructured) -> Result<LsaHeader> {
 
 /// A packet built from fuzz bytes, valid or not.
 fn packet(u: &mut Unstructured, v: Version) -> Result<Packet> {
-    let body = match u.int_in_range(0..=5u8)? {
+    let mut body = match u.int_in_range(0..=5u8)? {
         0 => Body::HelloV2(HelloV2 {
             network_mask: ip4(u)?,
             hello_interval: u.arbitrary()?,
@@ -274,7 +296,25 @@ fn packet(u: &mut Unstructured, v: Version) -> Result<Packet> {
         },
         Version::V3 => Header::V3 { instance_id: u.arbitrary()? },
     };
-    Ok(Packet { router_id: ip4(u)?, area_id: ip4(u)?, header, body })
+    // Sometimes a signaling block, usually with the L bit set to go with
+    // it.
+    let lls = if u.ratio(1, 4)? {
+        if u.arbitrary()? {
+            match &mut body {
+                Body::HelloV2(h) => h.options |= OPTION_L_V2,
+                Body::HelloV3(h) => h.options |= OPTION_L_V3,
+                Body::DatabaseDescription(d) => {
+                    d.options |= if v == Version::V2 { u32::from(OPTION_L_V2) } else { OPTION_L_V3 }
+                }
+                _ => {}
+            }
+        }
+        let n = u.int_in_range(0..=64usize)?;
+        Some(u.bytes(n)?.to_vec())
+    } else {
+        None
+    };
+    Ok(Packet { router_id: ip4(u)?, area_id: ip4(u)?, header, lls, body })
 }
 
 /// Values a world builds: whatever a writer accepts reads back the same.

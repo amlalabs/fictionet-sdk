@@ -68,14 +68,19 @@ pub const MAX_OPTIONS: usize = 64;
 /// The longest option value read or written: the longest registered
 /// option, Proxy-Uri.
 pub const MAX_OPTION_VALUE: usize = 1034;
-/// The longest UDP datagram read or written.
-pub const MAX_DATAGRAM: usize = 65_535;
+/// The longest UDP datagram read or written: the largest UDP payload
+/// over IPv4, so a message written fits a datagram over either IP
+/// version (RFC 7252 section 4.6).
+pub const MAX_DATAGRAM: usize = 65_507;
 /// The longest TCP frame body (options, payload marker and payload) read
 /// or written.
 pub const MAX_FRAME_BODY: usize = 1 << 20;
 /// The longest TCP frame header: the length and token-length byte, a
 /// 4-byte extended length, and the code.
 pub const MAX_FRAME_HEADER: usize = 6;
+/// The most bytes a [`Decoder`] holds: one whole frame of the largest
+/// size.
+pub const MAX_BUFFERED: usize = MAX_FRAME_HEADER + MAX_TOKEN + MAX_FRAME_BODY;
 /// The longest body an [`Assembler`] collects.
 pub const MAX_BODY: usize = 1 << 24;
 /// The byte that ends the options and starts the payload.
@@ -562,7 +567,8 @@ impl Options {
     /// `/` if there are none. As in RFC 7252 section 6.5, each byte of a
     /// segment that may not appear in a URI path segment is
     /// percent-encoded, so a segment holding `a/b` reads as `/a%2Fb`.
-    /// `None` if a segment is not UTF-8.
+    /// `None` if a segment is not UTF-8, or is `.` or `..`, which RFC 7252
+    /// section 5.10.1 forbids.
     pub fn uri_path(&self) -> Option<String> {
         self.path(option::URI_PATH)
     }
@@ -571,7 +577,10 @@ impl Options {
     /// does: `/` or an empty path gives none, and otherwise each segment
     /// between slashes, empty ones included, gives one option, with
     /// percent-encodings turned back into bytes. A `%` not followed by
-    /// two hex digits is kept as it is. A segment over 255 bytes is
+    /// two hex digits is kept as it is. Segments `.` and `..`, written
+    /// plainly or as `%2E`, are resolved as RFC 3986 section 5.2.4 does,
+    /// since RFC 7252 section 5.10.1 forbids them as option values: so
+    /// `/a/../b` gives one option, `b`. A segment over 255 bytes is
     /// written as it is, and [`Message::bad_option`] then reports it.
     pub fn set_uri_path(&mut self, path: &str) {
         self.set_path(option::URI_PATH, path);
@@ -592,6 +601,9 @@ impl Options {
     /// The path that the options numbered `number` spell.
     fn path(&self, number: u16) -> Option<String> {
         let segments = self.strings(number)?;
+        if segments.iter().any(|s| is_dot_segment(s.as_bytes())) {
+            return None;
+        }
         if segments.is_empty() {
             return Some("/".to_string());
         }
@@ -618,8 +630,29 @@ impl Options {
         if path.is_empty() {
             return;
         }
-        for segment in path.split('/') {
-            self.add(number, percent_decode(segment.as_bytes()));
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut segments: Vec<Vec<u8>> = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            let segment = percent_decode(part.as_bytes());
+            let last = i + 1 == parts.len();
+            if is_dot_segment(&segment) {
+                if segment.len() == 2 {
+                    segments.pop();
+                }
+                // A path ending in a dot segment ends in a slash.
+                if last {
+                    segments.push(Vec::new());
+                }
+            } else {
+                segments.push(segment);
+            }
+        }
+        // Only dot segments can leave the path `/`, which has no options.
+        if segments.len() == 1 && segments[0].is_empty() {
+            return;
+        }
+        for segment in segments {
+            self.add(number, segment);
         }
     }
 
@@ -735,17 +768,24 @@ impl Options {
     }
 
     /// The first critical option that `format` does not know, whose value
-    /// has a length outside its range, or that repeats when it may not.
+    /// has a length outside its range or a string value that is not
+    /// UTF-8, that repeats when it may not, or that is a Uri-Path of `.`
+    /// or `..`. It takes time in proportion to the number of options.
     fn first_bad(&self, format: impl Fn(u16) -> Option<OptionFormat>) -> Option<u16> {
-        for (i, o) in self.0.iter().enumerate() {
+        let mut seen = std::collections::HashSet::new();
+        for o in &self.0 {
             if !option::is_critical(o.number) {
                 continue;
             }
+            let repeated = !seen.insert(o.number);
             let bad = match format(o.number) {
                 None => true,
                 Some(f) => {
-                    let repeated = self.0[..i].iter().any(|p| p.number == o.number);
-                    o.value.len() < f.min || o.value.len() > f.max || (repeated && !f.repeatable)
+                    o.value.len() < f.min
+                        || o.value.len() > f.max
+                        || (repeated && !f.repeatable)
+                        || (f.value == ValueFormat::String && std::str::from_utf8(&o.value).is_err())
+                        || (o.number == option::URI_PATH && is_dot_segment(&o.value))
                 }
             };
             if bad {
@@ -777,6 +817,10 @@ pub enum Error {
     /// A UDP message with code 0.00 carried a token or bytes after its
     /// header.
     EmptyWithContent,
+    /// A UDP message's type does not allow its code: an ACK with a code
+    /// that is not 0.00 or a response, a Reset that is not empty, or an
+    /// empty NON (RFC 7252 sections 4.2 and 4.3). A receiver ignores it.
+    TypeAndCode(Type, Code),
     /// An option's delta or length field was 15, which is reserved.
     ReservedNibble,
     /// An option number went past 65535.
@@ -799,6 +843,7 @@ impl std::fmt::Display for Error {
             Error::Version(v) => write!(f, "version {v}, not 1"),
             Error::TokenLength(n) => write!(f, "token length {n}, over 8"),
             Error::EmptyWithContent => f.write_str("empty message (0.00) with a token or more bytes"),
+            Error::TypeAndCode(t, c) => write!(f, "a {t:?} message may not carry code {c}"),
             Error::ReservedNibble => f.write_str("option delta or length 15"),
             Error::OptionNumber => f.write_str("option number past 65535"),
             Error::OptionTooLong(n) => write!(f, "option value of {n} bytes, over {MAX_OPTION_VALUE}"),
@@ -886,10 +931,13 @@ impl Message {
         if usize::from(tkl) > MAX_TOKEN {
             return Err(Error::TokenLength(tkl));
         }
+        if code.is_empty() && (tkl != 0 || b.len() != HEADER_LEN) {
+            return Err(Error::EmptyWithContent);
+        }
+        if written_form(kind, code) != (kind, code) {
+            return Err(Error::TypeAndCode(kind, code));
+        }
         if code.is_empty() {
-            if tkl != 0 || b.len() != HEADER_LEN {
-                return Err(Error::EmptyWithContent);
-            }
             return Ok(Message::new(kind, code, message_id));
         }
         let end = HEADER_LEN + usize::from(tkl);
@@ -898,27 +946,62 @@ impl Message {
         Ok(Message { kind, code, message_id, token, options, payload })
     }
 
-    /// The datagram's bytes. An empty message (code 0.00) is the header
-    /// alone. Otherwise a token over 8 bytes is cut to 8 and option
-    /// values to [`MAX_OPTION_VALUE`]; past [`MAX_OPTIONS`] options, or
-    /// [`MAX_DATAGRAM`] bytes, the rest of the options and payload are
-    /// left out. So [`Message::parse`] reads back every datagram written.
+    /// The datagram's bytes. A type that does not allow the code is
+    /// written as RFC 7252 sections 4.2 and 4.3 allow: a Reset, or an ACK
+    /// whose code is not a response, as an empty message of its type, and
+    /// an empty NON as an empty CON (a ping). An empty message (code 0.00)
+    /// is the header alone. Otherwise a token over 8 bytes is cut to 8 and
+    /// option values to [`MAX_OPTION_VALUE`]; the options are sorted, and
+    /// past [`MAX_OPTIONS`] options, or [`MAX_DATAGRAM`] bytes, the rest
+    /// of the options and payload are left out. So [`Message::parse`]
+    /// reads back every datagram written. [`Message::try_to_bytes`] says
+    /// when something was changed or left out.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let token: &[u8] = if self.code.is_empty() { &[] } else { &self.token[..self.token.len().min(MAX_TOKEN)] };
+        self.write().0
+    }
+
+    /// The datagram's bytes, or `None` if [`Message::to_bytes`] would
+    /// change or leave out part of the message, or if it carries a Block1
+    /// or Block2 option with SZX 7, which RFC 7959 section 2.2 forbids
+    /// sending over UDP.
+    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
+        let (bytes, whole) = self.write();
+        (whole && self.bad_block().is_none()).then_some(bytes)
+    }
+
+    /// The bytes, and whether they hold the whole message unchanged.
+    fn write(&self) -> (Vec<u8>, bool) {
+        let (kind, code) = written_form(self.kind, self.code);
+        let mut whole = (kind, code) == (self.kind, self.code) && self.token.len() <= MAX_TOKEN;
+        let token: &[u8] = if code.is_empty() { &[] } else { &self.token[..self.token.len().min(MAX_TOKEN)] };
         let mut out = Vec::with_capacity(HEADER_LEN + token.len());
-        out.push(VERSION << 6 | self.kind.bits() << 4 | token.len() as u8);
-        out.push(self.code.0);
+        out.push(VERSION << 6 | kind.bits() << 4 | token.len() as u8);
+        out.push(code.0);
         out.extend_from_slice(&self.message_id.to_be_bytes());
         out.extend_from_slice(token);
-        if !self.code.is_empty() {
-            write_body(&mut out, &self.options, &self.payload, MAX_DATAGRAM - HEADER_LEN - token.len());
+        if code.is_empty() {
+            whole &= self.token.is_empty() && self.options.is_empty() && self.payload.is_empty();
+        } else {
+            whole &= write_body(&mut out, &self.options, &self.payload, MAX_DATAGRAM - HEADER_LEN - token.len());
         }
-        out
+        (out, whole)
+    }
+
+    /// The Block1 or Block2 option, if either has SZX 7. RFC 7959 section
+    /// 2.2 reserves that size over UDP: a server answers a request that
+    /// carries one with 4.00 Bad Request.
+    pub fn bad_block(&self) -> Option<u16> {
+        [option::BLOCK1, option::BLOCK2].into_iter().find(|&n| {
+            let block = self.options.registered_uint(n).and_then(Block::from_uint);
+            block.is_some_and(Block::is_bert)
+        })
     }
 
     /// The first critical option this message carries that the registry
     /// does not list, whose value has a length outside the registry's
-    /// range, or that repeats when it may not. A server answers a request
+    /// range or is a string that is not UTF-8, that repeats when it may
+    /// not, or that is a Uri-Path of `.` or `..` (RFC 7252 section
+    /// 5.10.1). A server answers a request
     /// that has one with 4.02 Bad Option, and a client rejects such a
     /// response. Elective options with these faults are ignored, so they
     /// are not reported. A world that does not act on a critical option
@@ -1018,11 +1101,23 @@ impl Frame {
     /// values to [`MAX_OPTION_VALUE`]; past [`MAX_OPTIONS`] options, or
     /// [`MAX_FRAME_BODY`] bytes of body, the rest of the options and
     /// payload are left out. So [`Frame::parse`] reads back every frame
-    /// written.
+    /// written. [`Frame::try_to_bytes`] says when something was left out.
     pub fn to_bytes(&self) -> Vec<u8> {
+        self.write().0
+    }
+
+    /// The frame's bytes, or `None` if [`Frame::to_bytes`] would cut or
+    /// leave out part of the frame.
+    pub fn try_to_bytes(&self) -> Option<Vec<u8>> {
+        let (bytes, whole) = self.write();
+        whole.then_some(bytes)
+    }
+
+    /// The bytes, and whether they hold the whole frame unchanged.
+    fn write(&self) -> (Vec<u8>, bool) {
         let token = &self.token[..self.token.len().min(MAX_TOKEN)];
         let mut body = Vec::new();
-        write_body(&mut body, &self.options, &self.payload, MAX_FRAME_BODY);
+        let whole = write_body(&mut body, &self.options, &self.payload, MAX_FRAME_BODY) && self.token.len() <= MAX_TOKEN;
         let len = body.len();
         let tkl = token.len() as u8;
         let mut out = Vec::with_capacity(MAX_FRAME_HEADER + token.len() + len);
@@ -1041,7 +1136,7 @@ impl Frame {
         out.push(self.code.0);
         out.extend_from_slice(token);
         out.extend_from_slice(&body);
-        out
+        (out, whole)
     }
 
     /// Like [`Message::bad_option`]. In a signal frame, options are
@@ -1073,24 +1168,31 @@ impl Decoder {
         Decoder::default()
     }
 
-    /// Adds bytes read from the connection. After an [`Error`] the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
+    /// Takes bytes read from the connection, from the start of `bytes`,
+    /// and returns how many it took. It takes them all unless that would
+    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take frames out
+    /// with [`Decoder::next_frame`] and feed it the rest. Once it is full,
+    /// `next_frame` always gives a frame or an error, so a loop of feeding
+    /// and taking out always ends. After an [`Error`] the stream cannot be
+    /// read any further, and every byte is taken and dropped.
+    #[must_use = "bytes past the count returned were not taken"]
+    pub fn feed(&mut self, bytes: &[u8]) -> usize {
+        if self.failed.is_some() {
+            return bytes.len();
         }
+        if self.start > 0 && self.start >= self.buf.len() / 2 {
+            self.buf.drain(..self.start);
+            self.start = 0;
+        }
+        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
+        self.buf.extend_from_slice(&bytes[..n]);
+        n
     }
 
     /// The next whole frame, if one has come. It returns `None` when it
     /// needs more bytes, and keeps returning the same error once the
     /// stream has broken; a real peer then sends an Abort and closes the
-    /// connection. If the world takes out every whole frame after each
-    /// `feed`, a decoder never holds more than part of one frame plus
-    /// what the last `feed` added.
+    /// connection.
     pub fn next_frame(&mut self) -> Option<Result<Frame, Error>> {
         if let Some(e) = self.failed {
             return Some(Err(e));
@@ -1205,8 +1307,8 @@ pub enum BlockError {
         /// Where this one starts.
         got: usize,
     },
-    /// A block with more after it was not the full block size, or the
-    /// last block was longer than it.
+    /// A block with more after it was not the full block size, or a BERT
+    /// block came to an assembler that does not take them.
     Size,
     /// The body would grow past the assembler's limit.
     TooLarge,
@@ -1243,19 +1345,29 @@ impl std::error::Error for BlockError {}
 /// server uses it for a Block1 request body, a client for a Block2
 /// response. The block size may shrink partway, as RFC 7959 allows.
 /// There is no default: the largest body is always chosen with
-/// [`Assembler::new`].
+/// [`Assembler::new`] or [`Assembler::with_bert`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Assembler {
     body: Vec<u8>,
     max: usize,
     done: bool,
+    bert: bool,
 }
 
 impl Assembler {
     /// An assembler that takes bodies of up to `max` bytes, and never more
-    /// than [`MAX_BODY`].
+    /// than [`MAX_BODY`]. It refuses BERT blocks (SZX 7) with
+    /// [`BlockError::Size`], whose code is 4.00 Bad Request, as RFC 7959
+    /// section 2.2 asks over UDP.
     pub fn new(max: usize) -> Assembler {
-        Assembler { body: Vec::new(), max: max.min(MAX_BODY), done: false }
+        Assembler { body: Vec::new(), max: max.min(MAX_BODY), done: false, bert: false }
+    }
+
+    /// Like [`Assembler::new`], but it also takes BERT blocks, for CoAP
+    /// over TCP once the peer's CSM offered Block-Wise-Transfer (RFC 8323
+    /// section 6).
+    pub fn with_bert(max: usize) -> Assembler {
+        Assembler { bert: true, ..Assembler::new(max) }
     }
 
     /// Adds the next block and its payload. It returns whether the body
@@ -1268,11 +1380,13 @@ impl Assembler {
         if got != self.body.len() {
             return Err(BlockError::OutOfOrder { expected: self.body.len(), got });
         }
+        // RFC 7959 section 2.3: SZX does not govern the payload size of
+        // the last block.
         let size_ok = match (block.is_bert(), block.more) {
+            (true, _) if !self.bert => false,
             (false, true) => payload.len() == block.size(),
-            (false, false) => payload.len() <= block.size(),
             (true, true) => !payload.is_empty() && payload.len().is_multiple_of(1024),
-            (true, false) => true,
+            (_, false) => true,
         };
         if !size_ok {
             return Err(BlockError::Size);
@@ -1309,6 +1423,24 @@ pub fn observe_is_newer(old: u32, new: u32, seconds_between: u64) -> bool {
     let (v1, v2) = (old & observe::MAX, new & observe::MAX);
     let half = 1 << 23;
     (v1 < v2 && v2 - v1 < half) || (v1 > v2 && v1 - v2 > half) || seconds_between > 128
+}
+
+/// The type and code a UDP message is written with: its own, unless RFC
+/// 7252 sections 4.2 and 4.3 forbid them together. A Reset, or an ACK
+/// whose code is not a response, becomes empty; an empty NON becomes an
+/// empty CON.
+fn written_form(kind: Type, code: Code) -> (Type, Code) {
+    match kind {
+        Type::Reset => (kind, Code::EMPTY),
+        Type::Acknowledgement if !code.is_response() => (kind, Code::EMPTY),
+        Type::NonConfirmable if code.is_empty() => (Type::Confirmable, code),
+        _ => (kind, code),
+    }
+}
+
+/// Whether a path segment is `.` or `..`.
+fn is_dot_segment(s: &[u8]) -> bool {
+    s == b"." || s == b".."
 }
 
 /// The digits of a percent-encoding.
@@ -1406,18 +1538,25 @@ fn ext(v: usize) -> (u8, Vec<u8>) {
 }
 
 /// Writes options, sorted by number, and the payload, in at most
-/// `budget` bytes. What does not fit is left out.
-fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usize) {
-    let mut sorted: Vec<&CoapOption> = options.0.iter().take(MAX_OPTIONS).collect();
+/// `budget` bytes. The first [`MAX_OPTIONS`] options in sorted order are
+/// kept, so lower numbers, such as the conditions If-Match and
+/// If-None-Match, go before higher ones. What does not fit is left out,
+/// and it returns whether everything was written in full.
+fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usize) -> bool {
+    let mut sorted: Vec<&CoapOption> = options.0.iter().collect();
     sorted.sort_by_key(|o| o.number);
+    let mut whole = sorted.len() <= MAX_OPTIONS;
+    sorted.truncate(MAX_OPTIONS);
     let mut used = 0;
     let mut prev = 0u16;
     for o in sorted {
+        whole &= o.value.len() <= MAX_OPTION_VALUE;
         let value = &o.value[..o.value.len().min(MAX_OPTION_VALUE)];
         let (dn, dx) = ext(usize::from(o.number - prev));
         let (ln, lx) = ext(value.len());
         let size = 1 + dx.len() + lx.len() + value.len();
         if size > budget - used {
+            whole = false;
             break;
         }
         out.push(dn << 4 | ln);
@@ -1427,11 +1566,22 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
         used += size;
         prev = o.number;
     }
-    let room = budget - used;
-    if !payload.is_empty() && room >= 2 {
-        out.push(PAYLOAD_MARKER);
-        out.extend_from_slice(&payload[..payload.len().min(room - 1)]);
+    whole & write_payload(out, payload, budget - used)
+}
+
+/// Writes the payload marker and as much of the payload as fits in `room`
+/// bytes, and returns whether all of it did.
+fn write_payload(out: &mut Vec<u8>, payload: &[u8], room: usize) -> bool {
+    if payload.is_empty() {
+        return true;
     }
+    if room < 2 {
+        return false;
+    }
+    let n = payload.len().min(room - 1);
+    out.push(PAYLOAD_MARKER);
+    out.extend_from_slice(&payload[..n]);
+    n == payload.len()
 }
 
 #[cfg(test)]
@@ -1763,11 +1913,220 @@ mod tests {
         assert_eq!((&o).into_iter().count(), o.len());
         // A decoder can be copied mid-stream.
         let mut d = Decoder::new();
-        d.feed(&[0x01, 0xe2]);
+        assert_eq!(d.feed(&[0x01, 0xe2]), 2);
         let mut e = d.clone();
-        e.feed(&[0x42]);
+        assert_eq!(e.feed(&[0x42]), 1);
         assert_eq!(d.next_frame(), None);
         assert!(matches!(e.next_frame(), Some(Ok(_))));
+    }
+
+    #[test]
+    fn writers_keep_conditions_and_say_when_they_cut() {
+        // RFC 7252 section 5.10.8: If-None-Match makes a PUT conditional.
+        // Past MAX_OPTIONS options, the lowest numbers are kept, so the
+        // condition is not the one left out, and try_to_bytes refuses.
+        let mut m = Message::new(Type::Confirmable, Code::PUT, 1);
+        for i in 0..MAX_OPTIONS {
+            m.options.add(option::URI_QUERY, format!("k{i}").into_bytes());
+        }
+        m.options.add(option::IF_NONE_MATCH, Vec::new());
+        m.payload = b"new".to_vec();
+        let back = Message::parse(&m.to_bytes()).unwrap();
+        assert!(back.options.has(option::IF_NONE_MATCH));
+        assert_eq!(m.try_to_bytes(), None);
+        m.options.remove(option::URI_QUERY);
+        m.options.add(option::URI_QUERY, b"k".to_vec());
+        assert_eq!(m.try_to_bytes(), Some(m.to_bytes()));
+        // A long token, a long value or a payload that does not fit.
+        let mut t = m.clone();
+        t.token = vec![1; 9];
+        assert_eq!(t.try_to_bytes(), None);
+        let mut v = m.clone();
+        v.options.add(option::PROXY_URI, vec![b'u'; MAX_OPTION_VALUE + 1]);
+        assert_eq!(v.try_to_bytes(), None);
+        let mut p = m.clone();
+        p.payload = vec![0; MAX_DATAGRAM];
+        assert_eq!(p.try_to_bytes(), None);
+        // An empty message carrying a token or payload.
+        let mut e = Message::reset(1);
+        e.payload = vec![1];
+        assert_eq!(e.try_to_bytes(), None);
+        assert_eq!(Message::reset(1).try_to_bytes(), Some(vec![0x70, 0, 0, 1]));
+        // Frames too.
+        let f = Frame { code: Code::PUT, token: vec![1; 9], options: Options::new(), payload: Vec::new() };
+        assert_eq!(f.try_to_bytes(), None);
+        let f = Frame { token: vec![1; 8], ..f };
+        assert_eq!(f.try_to_bytes(), Some(f.to_bytes()));
+        let f = Frame { payload: vec![0; MAX_FRAME_BODY], ..f };
+        assert_eq!(f.try_to_bytes(), None);
+    }
+
+    #[test]
+    fn decoder_holds_at_most_max_buffered() {
+        // A bad first byte, then far more bytes than one frame.
+        let mut d = Decoder::new();
+        let mut junk = vec![0u8; MAX_BUFFERED + 100];
+        junk[0] = 0x09;
+        assert_eq!(d.feed(&junk), MAX_BUFFERED);
+        assert!(d.buffered() <= MAX_BUFFERED);
+        assert_eq!(d.next_frame(), Some(Err(Error::TokenLength(9))));
+        assert_eq!(d.feed(&junk), junk.len());
+        assert_eq!(d.buffered(), 0);
+        // Many largest frames at once: feeding and taking out ends, and
+        // gives every frame.
+        let big = Frame { code: Code::CONTENT, token: vec![1; MAX_TOKEN], options: Options::new(), payload: vec![7; MAX_FRAME_BODY - 1] };
+        let one = big.to_bytes();
+        assert_eq!(one.len(), MAX_BUFFERED);
+        let stream = [&one[..], &one, &one].concat();
+        let mut d = Decoder::new();
+        let (mut at, mut got) = (0, 0);
+        while at < stream.len() || d.buffered() > 0 {
+            at += d.feed(&stream[at..]);
+            assert!(d.buffered() <= MAX_BUFFERED);
+            match d.next_frame() {
+                Some(f) => {
+                    assert_eq!(f.unwrap(), big);
+                    got += 1;
+                }
+                None => assert!(at == stream.len() && d.buffered() == 0),
+            }
+        }
+        assert_eq!(got, 3);
+    }
+
+    #[test]
+    fn datagrams_fit_either_ip_version() {
+        // RFC 7252 section 4.6: a message fits one datagram. The largest
+        // UDP payload is 65,507 bytes over IPv4 and 65,527 over IPv6.
+        assert_eq!(MAX_DATAGRAM, 65_507);
+        let mut m = Message::new(Type::NonConfirmable, Code::POST, 1);
+        m.payload = vec![0; 65_530];
+        assert!(m.to_bytes().len() <= 65_507);
+        assert_eq!(m.try_to_bytes(), None);
+        m.payload.truncate(65_507 - HEADER_LEN - 1);
+        assert_eq!(m.try_to_bytes().map(|b| b.len()), Some(65_507));
+    }
+
+    #[test]
+    fn types_and_codes_go_together() {
+        // RFC 7252 section 4.2: an ACK carries a response or is empty, and
+        // a Reset is empty. Section 4.3: a NON is never empty.
+        assert_eq!(Message::parse(&[0x60, 0x01, 0, 1]), Err(Error::TypeAndCode(Type::Acknowledgement, Code::GET)));
+        assert_eq!(Message::parse(&[0x60, 0xe1, 0, 1]), Err(Error::TypeAndCode(Type::Acknowledgement, Code::CSM)));
+        assert_eq!(Message::parse(&[0x70, 0x45, 0, 1]), Err(Error::TypeAndCode(Type::Reset, Code::CONTENT)));
+        assert_eq!(Message::parse(&[0x50, 0x00, 0, 1]), Err(Error::TypeAndCode(Type::NonConfirmable, Code::EMPTY)));
+        assert_eq!(peek_header(&[0x50, 0x00, 0, 1]), Some((Type::NonConfirmable, Code::EMPTY, 1)));
+        for ok in [[0x60, 0x45, 0, 1], [0x60, 0, 0, 1], [0x70, 0, 0, 1], [0x40, 0, 0, 1], [0x50, 0x01, 0, 1], [0x40, 0xe1, 0, 1]] {
+            assert!(Message::parse(&ok).is_ok(), "{ok:?}");
+        }
+        // Writers never send these forms, and try_to_bytes refuses them.
+        let ack_get = Message::new(Type::Acknowledgement, Code::GET, 1);
+        assert_eq!(ack_get.to_bytes(), [0x60, 0, 0, 1]);
+        assert_eq!(ack_get.try_to_bytes(), None);
+        let mut rst = Message::new(Type::Reset, Code::CONTENT, 1);
+        rst.payload = vec![1];
+        assert_eq!(rst.to_bytes(), [0x70, 0, 0, 1]);
+        assert_eq!(rst.try_to_bytes(), None);
+        let non = Message::new(Type::NonConfirmable, Code::EMPTY, 1);
+        assert_eq!(non.to_bytes(), [0x40, 0, 0, 1]);
+        assert_eq!(non.try_to_bytes(), None);
+        for m in [ack_get, rst, non] {
+            assert!(Message::parse(&m.to_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn path_setters_resolve_dot_segments() {
+        // RFC 7252 sections 5.10.1 and 5.10.7: Uri-Path and Location-Path
+        // are never `.` or `..`. Setters resolve them as RFC 3986 does.
+        let segments = |path: &str| {
+            let mut o = Options::new();
+            o.set_uri_path(path);
+            let uri: Vec<Vec<u8>> = o.get_all(option::URI_PATH).map(<[u8]>::to_vec).collect();
+            o.set_location_path(path);
+            let location: Vec<Vec<u8>> = o.get_all(option::LOCATION_PATH).map(<[u8]>::to_vec).collect();
+            assert_eq!(uri, location);
+            uri
+        };
+        let v = |s: &[&str]| s.iter().map(|x| x.as_bytes().to_vec()).collect::<Vec<_>>();
+        assert_eq!(segments("/a/../b"), v(&["b"]));
+        assert_eq!(segments("/%2e"), v(&[]));
+        assert_eq!(segments("/%2E%2E/x"), v(&["x"]));
+        assert_eq!(segments("/.."), v(&[]));
+        assert_eq!(segments("/../../x"), v(&["x"]));
+        assert_eq!(segments("/a/./b/."), v(&["a", "b", ""]));
+        assert_eq!(segments("/a/b/.."), v(&["a", ""]));
+        assert_eq!(segments("/a/.b/..c"), v(&["a", ".b", "..c"]));
+        // Received dot segments: no path reads, and a Uri-Path is bad.
+        let mut m = get("/x", 1, &[]);
+        m.options.add(option::URI_PATH, b"..".to_vec());
+        assert_eq!(m.options.uri_path(), None);
+        assert_eq!(m.bad_option(), Some(option::URI_PATH));
+        let mut o = Options::new();
+        o.add(option::LOCATION_PATH, b".".to_vec());
+        assert_eq!(o.location_path(), None);
+    }
+
+    #[test]
+    fn string_options_must_be_utf8() {
+        // RFC 7252 section 3.2: a string value is UTF-8. A critical one
+        // that is not is reported like a value of the wrong length.
+        let m = Message::parse(&[0x40, 0x01, 0x00, 0x01, 0x31, 0xff]).unwrap();
+        assert_eq!(m.bad_option(), Some(option::URI_HOST));
+        let mut ok = get("/caf\u{e9}", 1, &[]);
+        assert_eq!(ok.bad_option(), None);
+        ok.options.add(option::PROXY_SCHEME, vec![0xc3]);
+        assert_eq!(ok.bad_option(), Some(option::PROXY_SCHEME));
+    }
+
+    #[test]
+    fn bad_option_takes_linear_time() {
+        // Many elective options, then many repeatable critical ones.
+        let mut o = Options::new();
+        for i in 0..60_000u16 {
+            o.add(2 + 2 * (i % 2000) + 2000, Vec::new());
+        }
+        for _ in 0..60_000 {
+            o.add(option::URI_PATH, b"p".to_vec());
+        }
+        let m = Message { options: o, ..Message::new(Type::Confirmable, Code::GET, 1) };
+        let started = std::time::Instant::now();
+        assert_eq!(m.bad_option(), None);
+        assert!(started.elapsed().as_secs() < 2, "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn szx_7_is_reserved_over_udp() {
+        // RFC 7959 section 2.2: SZX 7 is never sent, and a request with it
+        // gets 4.00 Bad Request.
+        let m = Message::parse(&[0x40, 0x03, 0x00, 0x01, 0xd1, 0x0e, 0x07, 0xff, b'x']).unwrap();
+        let block = m.options.block1().unwrap();
+        assert!(block.is_bert());
+        assert_eq!(m.bad_block(), Some(option::BLOCK1));
+        assert_eq!(m.try_to_bytes(), None);
+        let err = Assembler::new(100).push(block, &m.payload).unwrap_err();
+        assert_eq!((err, err.code()), (BlockError::Size, Code::BAD_REQUEST));
+        // Over TCP, after a CSM offering it, BERT is fine.
+        assert_eq!(Assembler::with_bert(100).push(block, &m.payload), Ok(true));
+        assert_eq!(get("/x", 1, &[]).bad_block(), None);
+        let mut b2 = get("/x", 1, &[]);
+        b2.options.set_block2(Block { num: 1, more: false, szx: 7 });
+        assert_eq!(b2.bad_block(), Some(option::BLOCK2));
+    }
+
+    #[test]
+    fn last_block_may_be_any_size() {
+        // RFC 7959 section 2.3: SZX does not govern the payload size of a
+        // block whose M bit is unset.
+        let mut a = Assembler::new(100);
+        assert_eq!(a.push(Block { num: 0, more: false, szx: 0 }, &[0; 17]), Ok(true));
+        let mut a = Assembler::new(100);
+        assert_eq!(a.push(Block { num: 0, more: true, szx: 0 }, &[0; 16]), Ok(false));
+        assert_eq!(a.push(Block { num: 1, more: false, szx: 0 }, &[1; 40]), Ok(true));
+        assert_eq!(a.body().len(), 56);
+        // The body limit still holds.
+        let mut a = Assembler::new(10);
+        assert_eq!(a.push(Block { num: 0, more: false, szx: 0 }, &[0; 11]), Err(BlockError::TooLarge));
     }
 
     // RFC 7959: Block options and transfers.
@@ -1837,7 +2196,6 @@ mod tests {
             Err(BlockError::OutOfOrder { expected: 0, got: 16 })
         );
         assert_eq!(a.push(Block { num: 0, more: true, szx: 0 }, &[0; 15]), Err(BlockError::Size));
-        assert_eq!(a.push(Block { num: 0, more: false, szx: 0 }, &[0; 17]), Err(BlockError::Size));
         // A smaller block size partway: 64 bytes, then 32-byte block 2.
         assert_eq!(a.push(Block { num: 0, more: true, szx: 2 }, &[1; 64]), Ok(false));
         assert_eq!(a.push(Block { num: 2, more: true, szx: 1 }, &[2; 32]), Ok(false));
@@ -1848,7 +2206,7 @@ mod tests {
         assert_eq!(BlockError::TooLarge.code(), Code::REQUEST_ENTITY_TOO_LARGE);
         assert_eq!(BlockError::Size.code(), Code::BAD_REQUEST);
         // BERT: whole 1024-byte units while more follow.
-        let mut a = Assembler::new(MAX_BODY + 1);
+        let mut a = Assembler::with_bert(MAX_BODY + 1);
         assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[0; 1000]), Err(BlockError::Size));
         assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[]), Err(BlockError::Size));
         assert_eq!(a.push(Block { num: 0, more: true, szx: 7 }, &[0; 2048]), Ok(false));
@@ -1928,7 +2286,7 @@ mod tests {
         let mut d = Decoder::new();
         let mut got = Vec::new();
         for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
+            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
             while let Some(f) = d.next_frame() {
                 got.push(f.unwrap());
             }
@@ -1936,10 +2294,10 @@ mod tests {
         assert_eq!(got, [Frame::csm(1152, true), b, Frame::csm(1152, true)]);
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
-        d.feed(&[0x0c, 0xe2]);
+        assert_eq!(d.feed(&[0x0c, 0xe2]), 2);
         assert_eq!(d.next_frame(), Some(Err(Error::TokenLength(12))));
         assert!(d.is_broken());
-        d.feed(&a);
+        assert_eq!(d.feed(&a), a.len());
         assert_eq!(d.next_frame(), Some(Err(Error::TokenLength(12))));
         assert_eq!(d.buffered(), 0);
     }
@@ -1950,7 +2308,7 @@ mod tests {
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
         let started = std::time::Instant::now();
         let mut d = Decoder::new();
-        d.feed(&stream);
+        assert_eq!(d.feed(&stream), stream.len());
         let mut n = 0;
         while let Some(f) = d.next_frame() {
             f.unwrap();
@@ -2003,6 +2361,7 @@ mod tests {
             Error::Version(0),
             Error::TokenLength(9),
             Error::EmptyWithContent,
+            Error::TypeAndCode(Type::Reset, Code::GET),
             Error::ReservedNibble,
             Error::OptionNumber,
             Error::OptionTooLong(2000),
@@ -2060,7 +2419,7 @@ mod tests {
         }
         let _ = peek_header(b);
         let mut whole = Decoder::new();
-        whole.feed(b);
+        assert_eq!(whole.feed(b), b.len());
         let mut frames = Vec::new();
         while let Some(r) = whole.next_frame() {
             frames.push(r);
@@ -2071,7 +2430,7 @@ mod tests {
         let mut bytewise = Decoder::new();
         let mut again = Vec::new();
         for byte in b {
-            bytewise.feed(std::slice::from_ref(byte));
+            assert_eq!(bytewise.feed(std::slice::from_ref(byte)), 1);
             while let Some(r) = bytewise.next_frame() {
                 again.push(r);
                 if bytewise.is_broken() {
@@ -2137,6 +2496,13 @@ mod tests {
             m.payload = (0..rng.below(40)).map(|_| rng.next() as u8).collect();
             let bytes = m.to_bytes();
             let back = Message::parse(&bytes).unwrap();
+            if m.try_to_bytes().is_none() {
+                // A type that does not go with the code: written as RFC
+                // 7252 allows, and still read back.
+                assert_ne!(written_form(m.kind, m.code), (m.kind, m.code));
+                continue;
+            }
+            assert_eq!(m.try_to_bytes(), Some(bytes.clone()));
             let mut sorted = m.options.0.clone();
             sorted.sort_by_key(|o| o.number);
             assert_eq!(back.options.0, sorted);

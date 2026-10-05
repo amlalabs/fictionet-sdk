@@ -3,15 +3,15 @@
 #![no_main]
 
 use fictionet::stdlib::wireguard::{
-    CookieReply, Data, Initiation, MAX_ENCRYPTED, Message, REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, pad,
-    padding,
+    CookieReply, DATA_HEADER_LEN, Data, Error, Initiation, MAX_ENCRYPTED, MAX_PLAINTEXT, Message,
+    REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, message_type, pad, padding,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // A message read can be written, and gives back the same bytes.
     if let Ok(m) = Message::parse(data) {
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes, data);
         assert_eq!(Message::parse(&bytes), Ok(m));
     }
@@ -22,6 +22,26 @@ fuzz_target!(|data: &[u8]| {
     let _ = Data::parse(data);
     for n in 0..data.len().min(200) {
         let _ = Message::parse(&data[..n]);
+    }
+
+    // A transport data message built from the bytes, not read from them:
+    // written unchanged when its length is one a peer takes, refused
+    // otherwise, and never anything the reader rejects.
+    if data.len() >= 12 {
+        let receiver = u32::from_le_bytes(data[..4].try_into().unwrap());
+        let counter = u64::from_le_bytes(data[4..12].try_into().unwrap());
+        let d = Data { receiver, counter, encrypted: data[12..].to_vec() };
+        let n = d.encrypted.len();
+        match d.to_bytes() {
+            Ok(b) => {
+                assert!((TAG_LEN..=MAX_ENCRYPTED).contains(&n));
+                assert_eq!(Data::parse(&b), Ok(d));
+            }
+            Err(e) => {
+                assert!(!(TAG_LEN..=MAX_ENCRYPTED).contains(&n));
+                assert_eq!(e, Error::Length { kind: message_type::DATA, len: DATA_HEADER_LEN + n });
+            }
+        }
     }
 
     // The bytes as counters, one at a time, into a replay window.
@@ -37,13 +57,23 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // Padding stays in range, and a padded plaintext fits in a message.
+    // Padding stays in range. A padded plaintext keeps every byte, adds
+    // only zeros and fits in a message, or is refused for being too long.
     if data.len() >= 4 {
         let mtu = usize::from(u16::from_le_bytes([data[0], data[1]]));
         let len = usize::from(u16::from_le_bytes([data[2], data[3]]));
         let n = padding(len, mtu);
         assert!(n < 16);
-        let padded = pad(&data[4..], mtu);
-        assert!(padded.len() + TAG_LEN <= MAX_ENCRYPTED);
+        let plaintext = &data[4..];
+        let n = padding(plaintext.len(), mtu);
+        match pad(plaintext, mtu) {
+            Ok(padded) => {
+                assert_eq!(padded.len(), plaintext.len() + n);
+                assert_eq!(&padded[..plaintext.len()], plaintext);
+                assert!(padded[plaintext.len()..].iter().all(|&x| x == 0));
+                assert!(padded.len() + TAG_LEN <= MAX_ENCRYPTED);
+            }
+            Err(_) => assert!(plaintext.len() + n > MAX_PLAINTEXT),
+        }
     }
 });

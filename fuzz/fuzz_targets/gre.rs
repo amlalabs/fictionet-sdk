@@ -26,6 +26,12 @@ fuzz_target!(|data: &[u8]| {
         let (header, payload) = Header::split(data).unwrap();
         assert_eq!(&header, &p.header);
         assert_eq!(payload, &p.payload[..]);
+        if let Header::Pptp(h) = &p.header {
+            // RFC 2637 section 4.1: the flags bits 9 to 12 are zero, and
+            // the S bit is set exactly when a payload is present.
+            assert_eq!(data[1] & 0x78, 0);
+            assert_eq!(h.sequence.is_some(), !p.payload.is_empty());
+        }
     }
     // Any bytes as the start of a header on their own. An error there is
     // the error of the whole.

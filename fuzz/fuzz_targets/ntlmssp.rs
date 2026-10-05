@@ -4,8 +4,8 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::ntlmssp::{
-    Authenticate, AvPair, Challenge, ClientChallenge, LmV2Response, MAX_AV_PAIRS, MAX_MESSAGE, MIC_END, MIC_LEN,
-    Message, Negotiate, NtResponse, NtlmV2Response, Version, flags,
+    Authenticate, AvPair, Challenge, ClientChallenge, LmV2Response, MAX_AV_PAIRS, MAX_FIELD, MAX_MESSAGE, MIC_END,
+    MIC_LEN, Message, Negotiate, NtResponse, NtlmV2Response, Version, av_id, flags,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -16,6 +16,8 @@ fn read(b: &[u8]) {
         let bytes = m.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_MESSAGE);
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
+        // What a message holds reads with its own reader.
+        nested(&m);
         if let Message::Challenge(c) = &m {
             pairs(&c.target_info);
         }
@@ -39,11 +41,49 @@ fn read(b: &[u8]) {
     }
 }
 
+/// Checks, apart from the module's own rules, what \[MS-NLMP\] wants of a
+/// message's fields: a target info that is exactly one AV pair list, an
+/// NT response that reads, and Unicode names of even length.
+fn nested(m: &Message) {
+    let even = |b: &[u8]| b.len().is_multiple_of(2);
+    match m {
+        Message::Negotiate(_) => {}
+        Message::Challenge(c) => {
+            if !c.target_info.is_empty() {
+                let list = c.target_info_pairs().unwrap();
+                assert_eq!(AvPair::write_list(&list).unwrap(), c.target_info);
+            }
+            if c.flags & flags::NEGOTIATE_UNICODE != 0 {
+                assert!(even(&c.target_name));
+            }
+        }
+        Message::Authenticate(a) => {
+            a.nt().unwrap();
+            if a.flags & flags::NEGOTIATE_UNICODE != 0 {
+                assert!(even(&a.domain) && even(&a.user) && even(&a.workstation));
+            }
+        }
+    }
+}
+
+/// Whether a pair's value has the length \[MS-NLMP\] 2.2.2.1 gives its ID,
+/// written out here apart from the module's own check.
+fn shaped(p: &AvPair) -> bool {
+    match p.id {
+        av_id::FLAGS => p.value.len() == 4,
+        av_id::TIMESTAMP => p.value.len() == 8,
+        av_id::CHANNEL_BINDINGS => p.value.len() == 16,
+        1..=5 | 9 => p.value.len().is_multiple_of(2),
+        _ => true,
+    }
+}
+
 /// An AV pair list read, written and read again.
 fn pairs(b: &[u8]) {
     if let Ok((list, used)) = AvPair::parse_list(b) {
-        assert!(used <= b.len());
+        assert!(used <= b.len() && used <= MAX_FIELD);
         assert!(list.len() <= MAX_AV_PAIRS);
+        assert!(list.iter().all(shaped));
         let bytes = AvPair::write_list(&list).unwrap();
         assert_eq!(AvPair::parse_list(&bytes), Ok((list, bytes.len())));
     }
@@ -52,6 +92,10 @@ fn pairs(b: &[u8]) {
 /// An NT response read, written and read again.
 fn response(b: &[u8]) {
     if let Ok(nt) = NtResponse::parse(b) {
+        if let NtResponse::V2(v2) = &nt {
+            assert_eq!((v2.client.resp_type, v2.client.hi_resp_type), (1, 1));
+            assert!(v2.client.av_pairs.iter().all(shaped));
+        }
         let bytes = nt.to_bytes().unwrap();
         assert_eq!(NtResponse::parse(&bytes), Ok(nt));
     }
@@ -72,10 +116,12 @@ fn bytes(u: &mut Unstructured, max: usize) -> Result<Vec<u8>> {
     Ok(u.bytes(n)?.to_vec())
 }
 
-/// AV pairs built from fuzz bytes, valid or not.
+/// AV pairs built from fuzz bytes, valid or not. Some lists are long
+/// enough together to pass [`MAX_FIELD`].
 fn av_pairs(u: &mut Unstructured) -> Result<Vec<AvPair>> {
-    let n = u.int_in_range(0..=8usize)?;
-    (0..n).map(|_| Ok(AvPair { id: u.arbitrary()?, value: bytes(u, 300)? })).collect()
+    let n = u.int_in_range(0..=24usize)?;
+    let max = if u.arbitrary()? { 4096 } else { 300 };
+    (0..n).map(|_| Ok(AvPair { id: u.arbitrary()?, value: bytes(u, max)? })).collect()
 }
 
 /// A message built from fuzz bytes, valid or not.
@@ -119,10 +165,22 @@ fn built(data: &[u8]) -> Result<()> {
             Message::Authenticate(a) => a.version.is_some(),
         };
         assert_eq!(with_version, m.flags() & flags::NEGOTIATE_VERSION != 0);
+        nested(&m);
     }
     let list = av_pairs(&mut u)?;
-    if let Ok(bytes) = AvPair::write_list(&list) {
-        assert_eq!(AvPair::parse_list(&bytes), Ok((list.clone(), bytes.len())));
+    match AvPair::write_list(&list) {
+        Ok(bytes) => {
+            assert!(bytes.len() <= MAX_FIELD);
+            assert!(list.iter().all(shaped));
+            assert_eq!(AvPair::parse_list(&bytes), Ok((list.clone(), bytes.len())));
+        }
+        // A list a writer refuses breaks a rule written out here.
+        Err(_) => assert!(
+            list.len() > MAX_AV_PAIRS
+                || !list.iter().all(shaped)
+                || list.iter().any(|p| p.id == av_id::EOL || p.value.len() > MAX_FIELD)
+                || 4 + list.iter().map(|p| 4 + p.value.len()).sum::<usize>() > MAX_FIELD
+        ),
     }
     let nt = match u.int_in_range(0..=2u8)? {
         0 => NtResponse::Empty,
@@ -140,6 +198,10 @@ fn built(data: &[u8]) -> Result<()> {
         }),
     };
     if let Ok(bytes) = nt.to_bytes() {
+        assert!(bytes.len() <= MAX_FIELD);
+        if let NtResponse::V2(v2) = &nt {
+            assert_eq!((v2.client.resp_type, v2.client.hi_resp_type), (1, 1));
+        }
         assert_eq!(NtResponse::parse(&bytes), Ok(nt));
     }
     Ok(())
@@ -150,7 +212,7 @@ fuzz_target!(|data: &[u8]| {
     // Every prefix of a message that reads is read too, as a world sees a
     // token cut short.
     if Message::parse(data).is_ok() {
-        for n in 0..data.len().min(256) {
+        for n in 0..data.len().min(1024) {
             read(&data[..n]);
         }
     }

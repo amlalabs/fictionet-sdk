@@ -2,7 +2,9 @@
 //! server reads them.
 #![no_main]
 
-use fictionet::stdlib::diameter::{Address, Avp, Decoder, Format, Identity, Message, Uri, base_format, check};
+use fictionet::stdlib::diameter::{
+    Address, Avp, Decoder, Format, Identity, MAX_AVP_DATA, Message, Uri, Value, base_format, check,
+};
 use libfuzzer_sys::fuzz_target;
 
 const FORMATS: [Format; 14] = [
@@ -32,7 +34,11 @@ fn take_all(d: &mut Decoder, data: &[u8]) -> Vec<Message> {
         while let Some(m) = d.next_message() {
             match m {
                 Ok(m) => out.push(m),
-                Err(_) => return out,
+                Err(_) => {
+                    // The header kept for an error answer has no AVPs.
+                    assert!(d.failed_header().is_none_or(|h| h.avps.is_empty()));
+                    return out;
+                }
             }
         }
         if fed == data.len() {
@@ -64,17 +70,25 @@ fuzz_target!(|data: &[u8]| {
         let (back, used) = Message::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, m);
         assert_eq!(used, bytes.len());
+        // The checked writer writes the same bytes, unless RFC 6733
+        // forbids sending the message.
+        let allowed = m.check_header().is_ok() && m.avps.iter().all(|a| a.vendor != Some(0));
+        assert_eq!(m.try_to_bytes(), allowed.then(|| bytes.clone()));
         let _ = check(&m.avps, |code, vendor| if vendor.is_none() { base_format(code) } else { None });
         // Every AVP read as grouped goes down to the depth limit.
         let _ = check(&m.avps, |_, _| Some(Format::Grouped));
         let reply = m.answer();
         assert_eq!(Message::parse(&reply.to_bytes()).unwrap().unwrap().0, reply);
         // Each AVP in every format: a value read writes bytes that read
-        // back to the same bytes.
+        // back to the same bytes. Only URIs (case) and grouped AVPs
+        // (reserved bits, padding bytes) may first come out as other bytes.
         for avp in &m.avps {
             for f in FORMATS {
                 if let Ok(v) = avp.value(f) {
                     let written = Avp { data: v.to_bytes(), ..avp.clone() };
+                    if !matches!(f, Format::Grouped | Format::DiameterUri) && avp.data.len() <= MAX_AVP_DATA {
+                        assert_eq!(written.data, avp.data, "{f:?}");
+                    }
                     let v2 = written.value(f).unwrap();
                     assert_eq!(v2.to_bytes(), written.data);
                 }
@@ -88,10 +102,19 @@ fuzz_target!(|data: &[u8]| {
         let bytes = m.to_bytes();
         assert_eq!(Message::parse(&bytes), Ok(Some((m, bytes.len()))));
     }
-    let _ = Avp::parse_list(data);
-    let _ = Address::parse(data);
+    if let Ok(list) = Avp::parse_list(data)
+        && data.len() <= MAX_AVP_DATA
+    {
+        assert_eq!(Avp::parse_list(&Value::Grouped(list.clone()).to_bytes()), Ok(list));
+    }
+    if let Some(a) = Address::parse(data)
+        && data.len() <= MAX_AVP_DATA
+    {
+        assert_eq!(a.to_bytes(), data);
+    }
     if let Ok(s) = std::str::from_utf8(data) {
         if let Some(id) = Identity::new(s) {
+            assert_eq!(id.as_str(), s);
             assert_eq!(Identity::new(id.as_str()), Some(id));
         }
         if let Some(u) = Uri::parse(s) {

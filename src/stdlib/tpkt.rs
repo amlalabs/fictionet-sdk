@@ -13,7 +13,7 @@
 //! TCP connection to a [`Decoder`], takes each [`Packet`] out, and reads
 //! its payload. Most payloads are COTP TPDUs, which
 //! [`Packet::tpdu`] reads with the [`cotp`] module.
-//! [`Packet::from_tpdu`] and [`write_message`] go the other way. A world
+//! [`Packet::try_from_tpdu`] and [`write_message`] go the other way. A world
 //! may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
 //!
@@ -92,6 +92,11 @@ pub enum EncodeError {
     /// A payload longer than [`MAX_PAYLOAD`], or a message longer than
     /// [`MAX_MESSAGE`], with its length.
     TooLong(usize),
+    /// A TPDU whose bytes would read back as a different TPDU: its data
+    /// or a parameter does not fit in one packet, or a field is wider than
+    /// its format, such as a credit over 15. [`Packet::try_from_tpdu`]
+    /// gives it.
+    Unrepresentable,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -99,6 +104,9 @@ impl std::fmt::Display for EncodeError {
         match self {
             EncodeError::TooShort(n) => write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}"),
             EncodeError::TooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
+            EncodeError::Unrepresentable => {
+                f.write_str("TPDU that one TPKT packet cannot carry as it is")
+            }
         }
     }
 }
@@ -263,15 +271,71 @@ impl Packet {
         Ok(out)
     }
 
-    /// The packet carrying `tpdu`, with the reserved byte 0. A TPDU always
-    /// fits: [`cotp::Tpdu::to_bytes`] writes 3 to [`MAX_PAYLOAD`] bytes.
+    /// The packet carrying `tpdu`, with the reserved byte 0. It always
+    /// gives a packet, since [`cotp::Tpdu::to_bytes`] writes 3 to
+    /// [`MAX_PAYLOAD`] bytes, but that writer cuts what does not fit: data
+    /// past one packet, parameters past the header, and the high bits of
+    /// narrow fields. [`Packet::try_from_tpdu`] refuses such a TPDU
+    /// instead.
     pub fn from_tpdu(tpdu: &cotp::Tpdu) -> Packet {
         Packet::new(tpdu.to_bytes())
+    }
+
+    /// The packet carrying `tpdu`, with the reserved byte 0, if its payload
+    /// reads back as the same TPDU. Otherwise it is
+    /// [`EncodeError::Unrepresentable`]: data longer than one packet holds,
+    /// a parameter or raw header bytes that do not fit the header, or a
+    /// field wider than its format. A raw variable part counts as the same
+    /// when its bytes are written whole, even if they read back as
+    /// parameters. To send a long message, cut it with [`write_message`].
+    pub fn try_from_tpdu(tpdu: &cotp::Tpdu) -> Result<Packet, EncodeError> {
+        let packet = Packet::from_tpdu(tpdu);
+        let mut back = packet.tpdu().map_err(|_| EncodeError::Unrepresentable)?;
+        // Compare raw header bytes as the reader would see them, then put
+        // the original back so the rest compares field by field.
+        if let (Some(want), Some(got)) = (variable_of(tpdu), variable_mut(&mut back)) {
+            let same = match want {
+                cotp::Variable::Raw(b) => *got == cotp::Variable::parse(b),
+                _ => got == want,
+            };
+            if !same {
+                return Err(EncodeError::Unrepresentable);
+            }
+            // The variable parts match, so this clone is at most a header.
+            *got = want.clone();
+        }
+        if back == *tpdu {
+            Ok(packet)
+        } else {
+            Err(EncodeError::Unrepresentable)
+        }
     }
 
     /// Reads the payload as one COTP TPDU.
     pub fn tpdu(&self) -> Result<cotp::Tpdu, cotp::TpduError> {
         cotp::Tpdu::parse(&self.payload)
+    }
+}
+
+/// The header's variable part, for the TPDUs that have one.
+fn variable_of(t: &cotp::Tpdu) -> Option<&cotp::Variable> {
+    match t {
+        cotp::Tpdu::ConnectionRequest(c) | cotp::Tpdu::ConnectionConfirm(c) => Some(&c.variable),
+        cotp::Tpdu::DisconnectRequest(d) => Some(&d.variable),
+        cotp::Tpdu::Error(e) => Some(&e.variable),
+        cotp::Tpdu::Data(_) => None,
+    }
+}
+
+/// [`variable_of`], to change it.
+fn variable_mut(t: &mut cotp::Tpdu) -> Option<&mut cotp::Variable> {
+    match t {
+        cotp::Tpdu::ConnectionRequest(c) | cotp::Tpdu::ConnectionConfirm(c) => {
+            Some(&mut c.variable)
+        }
+        cotp::Tpdu::DisconnectRequest(d) => Some(&mut d.variable),
+        cotp::Tpdu::Error(e) => Some(&mut e.variable),
+        cotp::Tpdu::Data(_) => None,
     }
 }
 
@@ -285,7 +349,7 @@ pub fn write_message(message: &[u8], tpdu_size: usize) -> Result<Vec<u8>, Encode
     }
     let mut out = Vec::new();
     for data in cotp::segment(message, tpdu_size) {
-        out.extend_from_slice(&Packet::from_tpdu(&cotp::Tpdu::Data(data)).to_bytes()?);
+        out.extend_from_slice(&Packet::try_from_tpdu(&cotp::Tpdu::Data(data))?.to_bytes()?);
     }
     Ok(out)
 }
@@ -471,6 +535,7 @@ mod tests {
             }))
         );
         assert_eq!(Packet::from_tpdu(&packet.tpdu().unwrap()), packet);
+        assert_eq!(Packet::try_from_tpdu(&packet.tpdu().unwrap()), Ok(packet));
     }
 
     // An RDP connection request (MS-RDPBCGR 4.1.1) starts with a TPKT
@@ -492,6 +557,10 @@ mod tests {
         assert_eq!((cr.dst_ref, cr.src_ref), (0, 0));
         assert!(cr.data.is_empty());
         assert_eq!(packet.to_bytes().unwrap(), bytes);
+        // RDP's negotiation request sits in the header as raw bytes, and is
+        // written back whole.
+        let t = Tpdu::ConnectionRequest(cr);
+        assert_eq!(Packet::try_from_tpdu(&t), Ok(packet));
     }
 
     #[test]
@@ -615,9 +684,86 @@ mod tests {
             write_message(&vec![0; MAX_MESSAGE + 1], 1024),
             Err(EncodeError::TooLong(MAX_MESSAGE + 1))
         );
-        for e in [EncodeError::TooShort(1), EncodeError::TooLong(1)] {
+        for e in [
+            EncodeError::TooShort(1),
+            EncodeError::TooLong(1),
+            EncodeError::Unrepresentable,
+        ] {
             assert!(!e.to_string().is_empty());
         }
+    }
+
+    // A TPDU too big for one packet, or with a field wider than its format,
+    // is refused rather than cut or masked into a different TPDU.
+    #[test]
+    fn try_from_tpdu_refuses_lossy_tpdus() {
+        let data = |n: usize, number: u8| {
+            Tpdu::Data(Data {
+                eot: true,
+                number,
+                data: vec![0x41; n],
+            })
+        };
+        // The longest data a data TPDU in one packet carries: 3 header bytes.
+        let fits = data(MAX_PAYLOAD - 3, 0);
+        let p = Packet::try_from_tpdu(&fits).unwrap();
+        assert_eq!(p.payload.len(), MAX_PAYLOAD);
+        assert_eq!(p.tpdu(), Ok(fits));
+        assert_eq!(
+            Packet::try_from_tpdu(&data(MAX_PAYLOAD - 2, 0)),
+            Err(EncodeError::Unrepresentable)
+        );
+        assert_eq!(
+            Packet::try_from_tpdu(&data(65529, 0)),
+            Err(EncodeError::Unrepresentable)
+        );
+        assert_eq!(
+            Packet::try_from_tpdu(&data(0, 0x80)),
+            Err(EncodeError::Unrepresentable)
+        );
+        let connect = |f: &dyn Fn(&mut cotp::Connect)| {
+            let mut c = cotp::Connect::request(7);
+            f(&mut c);
+            Packet::try_from_tpdu(&Tpdu::ConnectionRequest(c))
+        };
+        assert!(connect(&|_| ()).is_ok());
+        assert!(connect(&|c| c.credit = 15).is_ok());
+        assert_eq!(
+            connect(&|c| c.credit = 16),
+            Err(EncodeError::Unrepresentable)
+        );
+        assert_eq!(
+            connect(&|c| c.class = 16),
+            Err(EncodeError::Unrepresentable)
+        );
+        assert_eq!(
+            connect(&|c| c.options = 16),
+            Err(EncodeError::Unrepresentable)
+        );
+        // A parameter longer than its length byte, or more than a header holds.
+        assert_eq!(
+            connect(&|c| c.variable.set(0xc1, vec![0; 256])),
+            Err(EncodeError::Unrepresentable)
+        );
+        assert_eq!(
+            connect(&|c| {
+                c.variable.set(0xc1, vec![0; 200]);
+                c.variable.set(0xc2, vec![0; 200]);
+            }),
+            Err(EncodeError::Unrepresentable)
+        );
+        assert_eq!(
+            connect(&|c| c.variable = cotp::Variable::Raw(vec![0; 249])),
+            Err(EncodeError::Unrepresentable)
+        );
+        // Raw bytes that happen to split into parameters, as RDP writes, are
+        // the same bytes on the wire, so they are fine.
+        assert!(connect(&|c| c.variable = cotp::Variable::Raw(vec![0xc1, 1, 9])).is_ok());
+        assert!(connect(&|c| c.variable = cotp::Variable::Raw(vec![1; 248])).is_ok());
+        assert!(connect(&|c| c.variable = cotp::Variable::Raw(vec![])).is_ok());
+        // The unchecked writer still cuts, as it says.
+        let cut = Packet::from_tpdu(&data(65529, 0));
+        assert_eq!(cut.payload.len(), MAX_PAYLOAD);
     }
 
     #[test]
@@ -739,13 +885,13 @@ mod tests {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
                 let bytes = p.to_bytes().unwrap();
                 assert_eq!(Packet::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
+                // A TPDU read from a packet is written back whole, and reads
+                // back the same.
                 if let Ok(t) = p.tpdu() {
-                    let back = Packet::from_tpdu(&t);
+                    let back = Packet::try_from_tpdu(&t).unwrap();
                     assert!(back.to_bytes().is_ok());
-                    // The TPDU may read back tidied, such as with bad parameters
-                    // dropped, but once tidied it stays the same.
-                    let again = back.tpdu().unwrap();
-                    assert_eq!(Packet::from_tpdu(&again).tpdu(), Ok(again));
+                    assert_eq!(back.tpdu(), Ok(t.clone()));
+                    assert_eq!(Packet::from_tpdu(&t), back);
                 }
             }
             // Any header a writer takes reads back the same.
@@ -759,6 +905,15 @@ mod tests {
                     assert!(usize::from(h.length) < MIN_PACKET);
                     assert_eq!(e, EncodeError::TooShort(h.payload_len()));
                 }
+            }
+            // Payloads shaped like TPDUs: whatever reads as one is written
+            // back whole.
+            let n = rng.below(40) as usize;
+            let mut b = rng.bytes(n + 2);
+            b[0] = rng.below(n as u64 + 2) as u8;
+            b[1] = [0xe0, 0xd3, 0x80, 0xf0, 0x70][rng.below(5) as usize];
+            if let Ok(t) = Packet::new(b.clone()).tpdu() {
+                assert_eq!(Packet::try_from_tpdu(&t), Ok(Packet::new(b)));
             }
             // Raw bytes, never panicking.
             let n = rng.below(20) as usize;

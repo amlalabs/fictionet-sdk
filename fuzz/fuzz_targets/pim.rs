@@ -4,7 +4,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use fictionet::stdlib::pim::{ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, Decoder, Endpoints, Message, checksum};
+use fictionet::stdlib::pim::{
+    ALL_PIM_ROUTERS_V4, ALL_PIM_ROUTERS_V6, CandidateRp, Decoder, Endpoints, Message, PimError, checksum,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -38,7 +40,21 @@ fn check(data: &[u8], e: &Endpoints) {
     assert_eq!(bytewise.finish(), parsed);
 
     if let Ok(m) = &parsed {
-        // A message read can be written, and reads back the same.
+        assert!(data.len() <= e.max_message());
+        // Checked against the input bytes, not the parsed value: a
+        // Bootstrap keeps its No-Forward bit.
+        if let Message::Bootstrap(b) = m {
+            assert_eq!(b.no_forward, data[1] & 0x80 != 0);
+        }
+        // A C-RP-Adv with no groups is read, as RFC 5059 asks of a BSR,
+        // but never written.
+        if let Message::CandidateRp(CandidateRp { groups, .. }) = m
+            && groups.is_empty()
+        {
+            assert_eq!(m.to_bytes(e), Err(PimError::Count));
+            return;
+        }
+        // Any other message read can be written, and reads back the same.
         let bytes = m.to_bytes(e).unwrap();
         assert_eq!(bytes.len(), data.len());
         assert_eq!(m.encoded_len(), Ok(bytes.len()));

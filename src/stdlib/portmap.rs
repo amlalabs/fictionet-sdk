@@ -32,8 +32,8 @@
 //! ```
 //! use fictionet::stdlib::onc_rpc::{Accept, Body, Call, Message, Reply, silent_on_failure};
 //! use fictionet::stdlib::portmap::{
-//!     format_uaddr, parse_uaddr, procedure, PmapRequest, PmapResult, Request, Rpcb, RpcbRequest,
-//!     RpcbResult, IPPROTO_TCP,
+//!     format_uaddr, parse_uaddr, procedure, ParseError, PmapRequest, PmapResult, Request, Rpcb,
+//!     RpcbRequest, RpcbResult, IPPROTO_TCP,
 //! };
 //! use std::net::SocketAddr;
 //!
@@ -55,11 +55,13 @@
 //!         Ok(Request::Pmap(PmapRequest::Null) | Request::Rpcb { request: RpcbRequest::Null, .. }) => {
 //!             Ok(Vec::new())
 //!         }
+//!         // The wrong RPC version is refused, even for CALLIT.
+//!         Err(e @ ParseError::RpcVersion(_)) => return Some(e.reply()),
 //!         // Forward nothing: a CALLIT that fails gets no reply.
 //!         _ if silent_on_failure(call) => return None,
 //!         // Register nothing and list nothing.
 //!         Ok(_) => return Some(Reply::accepted(Accept::ProcUnavail)),
-//!         Err(e) => return Some(Reply::accepted(e.status())),
+//!         Err(e) => return Some(e.reply()),
 //!     };
 //!     // A GETPORT result and a short address always fit.
 //!     Some(Reply::success(results.unwrap()))
@@ -95,8 +97,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use super::onc_rpc::{
-    Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPCB_VERSION_HIGH,
-    RPCB_VERSION_LOW, Reader, Writer, XdrError,
+    Accept, Body, Call, MAX_RPCB_STRING, Message, PMAP_PROGRAM, PMAP_VERSION, RPC_VERSION,
+    RPCB_VERSION_HIGH, RPCB_VERSION_LOW, Reader, Reject, Reply, Writer, XdrError,
 };
 pub use super::onc_rpc::{IPPROTO_TCP, IPPROTO_UDP, Mapping, PORT, Rpcb};
 
@@ -110,6 +112,9 @@ pub const MAX_UADDR: usize = MAX_STRING;
 pub const MAX_CALL_DATA: usize = 65_536;
 /// The most bytes of a transport address in a [`Netbuf`].
 pub const MAX_NETBUF: usize = 255;
+/// The largest `maxlen` of a [`Netbuf`]: RPC_MAXDATASIZE, 9000. TI-RPC's
+/// xdr_netbuf refuses a larger one, so this module reads and writes none.
+pub const MAX_NETBUF_MAXLEN: u32 = 9000;
 /// The most entries in any list this module reads or writes: a DUMP, an
 /// address list, or the address and call lists of one [`RpcbStat`].
 pub const MAX_LIST: usize = 1024;
@@ -210,6 +215,9 @@ impl std::error::Error for EncodeError {}
 /// the procedure returns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// The call's RPC version is not 2. A server refuses it with
+    /// RPC_MISMATCH: see [`ParseError::reply`].
+    RpcVersion(u32),
     /// The call is for another program than 100000.
     Program(u32),
     /// The call is for a version other than 2, 3 or 4.
@@ -222,8 +230,12 @@ pub enum ParseError {
 
 impl ParseError {
     /// The status a portmapper replies with when a call fails this way.
+    /// A call with the wrong RPC version is not accepted at all, so for
+    /// [`ParseError::RpcVersion`] this is GARBAGE_ARGS, and the reply to
+    /// send is [`ParseError::reply`].
     pub fn status(&self) -> Accept {
         match self {
+            ParseError::RpcVersion(_) => Accept::GarbageArgs,
             ParseError::Program(_) => Accept::ProgUnavail,
             ParseError::Version(_) => Accept::ProgMismatch {
                 low: PMAP_VERSION,
@@ -231,6 +243,19 @@ impl ParseError {
             },
             ParseError::Procedure(_) => Accept::ProcUnavail,
             ParseError::Xdr(_) => Accept::GarbageArgs,
+        }
+    }
+
+    /// The reply a portmapper sends when a call fails this way: RPC_MISMATCH
+    /// for the wrong RPC version (RFC 5531, section 9), and otherwise
+    /// [`ParseError::status`].
+    pub fn reply(&self) -> Reply {
+        match self {
+            ParseError::RpcVersion(_) => Reply::Denied(Reject::RpcMismatch {
+                low: RPC_VERSION,
+                high: RPC_VERSION,
+            }),
+            e => Reply::accepted(e.status()),
         }
     }
 }
@@ -244,6 +269,7 @@ impl From<XdrError> for ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ParseError::RpcVersion(v) => write!(f, "RPC version {v}, not 2"),
             ParseError::Program(p) => write!(f, "program {p}, not the portmapper (100000)"),
             ParseError::Version(v) => write!(f, "portmapper version {v}, not 2, 3 or 4"),
             ParseError::Procedure(p) => write!(f, "no portmapper procedure {p} in this version"),
@@ -312,12 +338,12 @@ pub struct RmtCallResult {
 /// A transport address in its binary form, such as a sockaddr (netbuf).
 /// UADDR2TADDR returns one, and TADDR2UADDR takes one. Its bytes are as
 /// the host lays them out, which this module does not read. As in TI-RPC,
-/// a netbuf with more bytes than `maxlen` is refused when read and when
-/// written.
+/// a netbuf with more bytes than `maxlen`, or a `maxlen` over
+/// [`MAX_NETBUF_MAXLEN`], is refused when read and when written.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Netbuf {
     /// The size of the buffer the bytes came from. It must be at least
-    /// their length.
+    /// their length, and at most [`MAX_NETBUF_MAXLEN`].
     pub maxlen: u32,
     /// The address, at most [`MAX_NETBUF`] bytes.
     pub buf: Vec<u8>,
@@ -326,6 +352,9 @@ pub struct Netbuf {
 impl Netbuf {
     fn read(r: &mut Reader<'_>) -> Result<Netbuf, XdrError> {
         let maxlen = r.uint()?;
+        if maxlen > MAX_NETBUF_MAXLEN {
+            return Err(XdrError::TooLong(maxlen));
+        }
         let max = usize::try_from(maxlen)
             .unwrap_or(usize::MAX)
             .min(MAX_NETBUF);
@@ -336,7 +365,9 @@ impl Netbuf {
     }
 
     fn write(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        if !u32::try_from(self.buf.len()).is_ok_and(|n| n <= self.maxlen) {
+        if self.maxlen > MAX_NETBUF_MAXLEN
+            || !u32::try_from(self.buf.len()).is_ok_and(|n| n <= self.maxlen)
+        {
             return Err(EncodeError::TooLong);
         }
         w.uint(self.maxlen);
@@ -870,8 +901,13 @@ impl Request {
     /// Reads the request a call makes. When the call is not one, the
     /// error's [`ParseError::status`] is what a portmapper replies with,
     /// unless [`silent_on_failure`](crate::stdlib::onc_rpc::silent_on_failure)
-    /// says it sends no reply. The credentials are not checked.
+    /// says it sends no reply. A call whose RPC version is not 2 is
+    /// [`ParseError::RpcVersion`], whose reply is
+    /// [`ParseError::reply`]. The credentials are not checked.
     pub fn from_call(call: &Call) -> Result<Request, ParseError> {
+        if call.rpc_version != RPC_VERSION {
+            return Err(ParseError::RpcVersion(call.rpc_version));
+        }
         if call.program != PMAP_PROGRAM {
             return Err(ParseError::Program(call.program));
         }
@@ -945,8 +981,8 @@ pub fn format_uaddr(addr: SocketAddr) -> String {
 
 /// Reads a universal address of an IPv4 or IPv6 address and a port. It
 /// returns `None` for anything else, including the paths of local
-/// transports, a port byte over 255 or with a leading zero, and strings
-/// over [`MAX_UADDR`] bytes.
+/// transports, a port byte over 255, and strings over [`MAX_UADDR`]
+/// bytes. As in TI-RPC, a port byte may have leading zeros ("08").
 pub fn parse_uaddr(s: &str) -> Option<SocketAddr> {
     if s.len() > MAX_UADDR {
         return None;
@@ -958,14 +994,10 @@ pub fn parse_uaddr(s: &str) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, u16::from_be_bytes([hi, lo])))
 }
 
-/// A byte in decimal: 1 to 3 digits, with no leading zero but in "0".
+/// A byte in decimal: one or more digits, leading zeros allowed, with a
+/// value of at most 255.
 fn port_byte(s: &str) -> Option<u8> {
-    let b = s.as_bytes();
-    if b.is_empty()
-        || b.len() > 3
-        || !b.iter().all(u8::is_ascii_digit)
-        || (b.len() > 1 && b[0] == b'0')
-    {
+    if s.is_empty() || !s.bytes().all(|c| c.is_ascii_digit()) {
         return None;
     }
     s.parse().ok()
@@ -1038,7 +1070,7 @@ fn write_list<T>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::onc_rpc::{Decoder, Reply, encode_record};
+    use super::super::onc_rpc::{Decoder, encode_record};
     use super::*;
 
     /// A small deterministic generator for the fuzz loop.
@@ -1369,7 +1401,6 @@ mod tests {
             "10.0.0.5",
             "10.0.0.5.8",
             "10.0.0.5.8.256",
-            "10.0.0.5.08.1",
             "10.0.0.5.8.-1",
             "10.0.0.5.8.1 ",
             "10.0.0.5..1",
@@ -1490,6 +1521,7 @@ mod tests {
             Err(ParseError::Xdr(XdrError::Trailing(1)))
         );
         for e in [
+            ParseError::RpcVersion(3),
             ParseError::Program(1),
             ParseError::Version(1),
             ParseError::Procedure(1),
@@ -1624,6 +1656,243 @@ mod tests {
             Err(EncodeError::TooLong)
         );
         assert_eq!(RpcbResult::Netbuf(n).to_bytes(), Err(EncodeError::TooLong));
+    }
+
+    /// RFC 5531, section 9: a call whose RPC version is not 2 is refused
+    /// with RPC_MISMATCH before its program or procedure is looked at.
+    #[test]
+    fn wrong_rpc_version_is_refused() {
+        for v in [0, 1, 3, u32::MAX] {
+            let call = Call {
+                rpc_version: v,
+                ..Call::new(PMAP_PROGRAM, 2, procedure::NULL, vec![])
+            };
+            let e = Request::from_call(&call).unwrap_err();
+            assert_eq!(e, ParseError::RpcVersion(v));
+            assert_eq!(
+                e.reply(),
+                Reply::Denied(super::super::onc_rpc::Reject::RpcMismatch { low: 2, high: 2 })
+            );
+            assert!(!e.to_string().is_empty());
+            // Before the program is checked.
+            let call = Call { program: 7, ..call };
+            assert_eq!(Request::from_call(&call), Err(ParseError::RpcVersion(v)));
+        }
+        let e = ParseError::Procedure(99);
+        assert_eq!(e.reply(), Reply::accepted(Accept::ProcUnavail));
+    }
+
+    /// libtirpc's xdr_netbuf refuses a maxlen over RPC_MAXDATASIZE (9000),
+    /// even with no bytes, so neither side here reads or writes one.
+    #[test]
+    fn netbuf_maxlen_within_tirpc_limit() {
+        let ok = Netbuf {
+            maxlen: MAX_NETBUF_MAXLEN,
+            buf: vec![],
+        };
+        check_rpcb_result(&RpcbResult::Netbuf(ok));
+        let over = Netbuf {
+            maxlen: MAX_NETBUF_MAXLEN + 1,
+            buf: vec![],
+        };
+        assert_eq!(
+            RpcbResult::Netbuf(over.clone()).to_bytes(),
+            Err(EncodeError::TooLong)
+        );
+        assert_eq!(
+            RpcbRequest::Taddr2Uaddr(over).to_args(),
+            Err(EncodeError::TooLong)
+        );
+        let bytes = [0, 0, 0x23, 0x29, 0, 0, 0, 0];
+        assert_eq!(
+            RpcbResult::parse(procedure::UADDR2TADDR, &bytes),
+            Err(ParseError::Xdr(XdrError::TooLong(9001)))
+        );
+        assert_eq!(
+            RpcbRequest::parse(4, procedure::TADDR2UADDR, &bytes),
+            Err(ParseError::Xdr(XdrError::TooLong(9001)))
+        );
+    }
+
+    /// Port bytes with leading zeros read as libtirpc and FreeBSD read
+    /// them; the address written is still the shortest spelling.
+    #[test]
+    fn uaddr_port_bytes_with_leading_zeros() {
+        let a = SocketAddr::from(([10, 0, 0, 5], 2049));
+        assert_eq!(parse_uaddr("10.0.0.5.08.1"), Some(a));
+        assert_eq!(parse_uaddr("10.0.0.5.008.001"), Some(a));
+        assert_eq!(format_uaddr(a), "10.0.0.5.8.1");
+        let v6: SocketAddr = "[::1]:111".parse().unwrap();
+        assert_eq!(parse_uaddr("::1.00.111"), Some(v6));
+        assert_eq!(parse_uaddr("10.0.0.5.0256.1"), None);
+        assert_eq!(parse_uaddr("10.0.0.5.+8.1"), None);
+    }
+
+    /// GETSTAT with nonzero counters and one entry in each list, laid out
+    /// by hand from RFC 1833's rpcb_stat, rpcbs_addrlist and
+    /// rpcbs_rmtcalllist.
+    #[test]
+    fn rpcb_getstat_nonzero_bytes() {
+        let mut s = RpcbStat {
+            setinfo: 20,
+            unsetinfo: -21,
+            addrinfo: vec![AddrStat {
+                program: 100_003,
+                version: 3,
+                success: 5,
+                failure: -6,
+                netid: "tcp".into(),
+            }],
+            rmtinfo: vec![RmtCallStat {
+                program: 100_005,
+                version: 1,
+                procedure: 2,
+                success: 7,
+                failure: 8,
+                indirect: 9,
+                netid: "udp6".into(),
+            }],
+            ..RpcbStat::default()
+        };
+        for (i, n) in s.info.iter_mut().enumerate() {
+            *n = i as i32 + 1;
+        }
+        let mut one = Vec::new();
+        for i in 1..=13u32 {
+            one.extend_from_slice(&i.to_be_bytes());
+        }
+        one.extend_from_slice(&20u32.to_be_bytes());
+        one.extend_from_slice(&(-21i32).to_be_bytes());
+        // addrinfo: one entry, then the end.
+        one.extend_from_slice(&[0, 0, 0, 1, 0, 1, 0x86, 0xa3, 0, 0, 0, 3, 0, 0, 0, 5]);
+        one.extend_from_slice(&(-6i32).to_be_bytes());
+        one.extend_from_slice(&[0, 0, 0, 3, b't', b'c', b'p', 0, 0, 0, 0, 0]);
+        // rmtinfo: one entry, then the end.
+        one.extend_from_slice(&[0, 0, 0, 1, 0, 1, 0x86, 0xa5, 0, 0, 0, 1, 0, 0, 0, 2]);
+        one.extend_from_slice(&[0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0, 9]);
+        one.extend_from_slice(&[0, 0, 0, 4, b'u', b'd', b'p', b'6', 0, 0, 0, 0]);
+        let zero = RpcbStat::default();
+        let stats = Box::new([s, zero.clone(), zero]);
+        let bytes = RpcbResult::Stat(stats.clone()).to_bytes().unwrap();
+        assert_eq!(bytes[..one.len()], one[..]);
+        assert_eq!(bytes.len(), one.len() + 2 * 17 * 4);
+        assert_eq!(
+            RpcbResult::parse(procedure::GETSTAT, &bytes),
+            Ok(RpcbResult::Stat(stats))
+        );
+    }
+
+    /// Lists of exactly MAX_LIST entries write and read; one more is
+    /// refused by the writer.
+    #[test]
+    fn lists_at_the_limit() {
+        let rpcb = Rpcb {
+            netid: "n".repeat(MAX_STRING),
+            ..nfs_rpcb()
+        };
+        for n in [MAX_LIST - 1, MAX_LIST] {
+            check_list_result(&RpcbResult::Dump(vec![rpcb.clone(); n]));
+            check_list_result(&RpcbResult::AddrList(vec![RpcbEntry::default(); n]));
+            let s = RpcbStat {
+                addrinfo: vec![AddrStat::default(); n],
+                rmtinfo: vec![RmtCallStat::default(); n],
+                ..RpcbStat::default()
+            };
+            check_list_result(&RpcbResult::Stat(Box::new([s.clone(), s.clone(), s])));
+        }
+        assert_eq!(
+            RpcbResult::Dump(vec![rpcb; MAX_LIST + 1]).to_bytes(),
+            Err(EncodeError::TooMany)
+        );
+        let s = RpcbStat {
+            addrinfo: vec![AddrStat::default(); MAX_LIST + 1],
+            ..RpcbStat::default()
+        };
+        assert_eq!(
+            RpcbResult::Stat(Box::new([RpcbStat::default(), s, RpcbStat::default()])).to_bytes(),
+            Err(EncodeError::TooMany)
+        );
+    }
+
+    fn check_list_result(res: &RpcbResult) {
+        let bytes = res.to_bytes().unwrap();
+        assert_eq!(RpcbResult::parse(res.procedure(), &bytes).as_ref(), Ok(res));
+        // Cut short, it does not read.
+        assert!(RpcbResult::parse(res.procedure(), &bytes[..bytes.len() - 4]).is_err());
+    }
+
+    /// The largest GETSTAT reply, every list full and every netid at its
+    /// limit, crosses TCP in fragments and a byte at a time.
+    #[test]
+    fn largest_getstat_reply_over_tcp() {
+        use super::super::onc_rpc::encode_fragments;
+        let netid = "z".repeat(MAX_STRING);
+        let s = RpcbStat {
+            info: [i32::MAX; STAT_PROCEDURES],
+            setinfo: -1,
+            unsetinfo: i32::MIN,
+            addrinfo: vec![
+                AddrStat {
+                    program: 1,
+                    version: 2,
+                    success: 3,
+                    failure: 4,
+                    netid: netid.clone(),
+                };
+                MAX_LIST
+            ],
+            rmtinfo: vec![
+                RmtCallStat {
+                    program: 5,
+                    version: 6,
+                    procedure: 7,
+                    success: 8,
+                    failure: 9,
+                    indirect: 10,
+                    netid,
+                };
+                MAX_LIST
+            ],
+        };
+        let res = RpcbResult::Stat(Box::new([s.clone(), s.clone(), s]));
+        let results = res.to_bytes().unwrap();
+        assert_eq!(results.len(), 1_745_100);
+        let call = Request::Rpcb {
+            version: 4,
+            request: RpcbRequest::GetStat,
+        }
+        .call(5)
+        .unwrap();
+        let msg = call.reply(Reply::success(results)).to_bytes();
+        for stream in [encode_record(&msg), encode_fragments(&msg, 4096)] {
+            for bytewise in [false, true] {
+                let mut d = Decoder::new();
+                let mut got = None;
+                if bytewise {
+                    for b in stream.chunks(1) {
+                        d.feed(b);
+                        if let Some(r) = d.next_record() {
+                            got = Some(r.unwrap());
+                        }
+                    }
+                } else {
+                    d.feed(&stream);
+                    got = d.next_record().map(|r| r.unwrap());
+                }
+                let rec = got.unwrap();
+                let Body::Reply(Reply::Accepted {
+                    status: Accept::Success(bytes),
+                    ..
+                }) = Message::parse(&rec).unwrap().body
+                else {
+                    panic!("not a success")
+                };
+                assert_eq!(
+                    RpcbResult::parse(procedure::GETSTAT, &bytes).as_ref(),
+                    Ok(&res)
+                );
+            }
+        }
     }
 
     /// CALLIT and BCAST, in every version, are the calls that get no reply

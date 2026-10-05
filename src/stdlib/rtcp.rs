@@ -197,8 +197,9 @@ pub struct Packet {
     /// The packet's type and contents.
     pub body: Body,
     /// Bytes of padding after the contents, the last of which holds their
-    /// number. 0 means no padding and a clear padding flag. The contents
-    /// and padding together must fill whole 32-bit words.
+    /// number. 0 means no padding and a clear padding flag. It is a
+    /// multiple of 4 (RFC 3550 section 6.4.1), and the contents fill whole
+    /// 32-bit words. A REMB never carries padding.
     pub padding: u8,
 }
 
@@ -233,7 +234,8 @@ pub enum Body {
         packet_type: u8,
         /// The 5-bit count field.
         count: u8,
-        /// The contents after the header, padding left out.
+        /// The contents after the header, padding left out: whole 32-bit
+        /// words.
         data: Vec<u8>,
     },
 }
@@ -304,11 +306,18 @@ pub struct SdesItem {
     /// The item type, from [`sdes`] or any other number but 0.
     pub kind: u8,
     /// The item's text, at most [`MAX_TEXT`] bytes. RFC 3550 says UTF-8,
-    /// but any bytes are kept.
+    /// but any bytes are kept. A [`sdes::PRIV`] item's text is a prefix
+    /// length, the prefix and the value, and the prefix must fit.
     pub text: Vec<u8>,
 }
 
 impl SdesItem {
+    /// Whether the item's text fits its type: a [`sdes::PRIV`] item needs
+    /// a prefix length that fits. Any text fits other types.
+    fn layout_ok(&self) -> bool {
+        self.kind != sdes::PRIV || self.priv_parts().is_some()
+    }
+
     /// A [`sdes::PRIV`] item's prefix and value. `None` for any other
     /// type, or when the prefix length runs past the text.
     pub fn priv_parts(&self) -> Option<(&[u8], &[u8])> {
@@ -352,8 +361,10 @@ pub struct App {
 pub struct TransportFeedback {
     /// The SSRC of the source sending the feedback.
     pub sender_ssrc: u32,
-    /// The SSRC of the media source it is about. TMMBR and TMMBN set it
-    /// to 0 and name sources in their entries.
+    /// The SSRC of the media source it is about. TMMBR and TMMBN do not
+    /// use it: they name sources in their entries, writers refuse any
+    /// value but 0, and readers read it as 0 (RFC 5104 sections 4.2.1.2
+    /// and 4.2.2.2).
     pub media_ssrc: u32,
     /// The message.
     pub message: TransportMessage,
@@ -417,11 +428,13 @@ impl Nack {
     }
 }
 
-/// One TMMBR or TMMBN entry: a bitrate limit for one source. The bitrate
-/// is `mantissa * 2^exponent` bits per second.
+/// One TMMBR or TMMBN entry: a bitrate limit. The bitrate is
+/// `mantissa * 2^exponent` bits per second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tmmb {
-    /// The media source the limit is for.
+    /// In a TMMBR, the media sender the limit is for. In a TMMBN, the
+    /// limit's owner: the participant that asked for it, usually a
+    /// receiver (RFC 5104 sections 4.2.1.1 and 4.2.2.1).
     pub ssrc: u32,
     /// The bitrate's exponent, 0 to 63.
     pub exponent: u8,
@@ -437,8 +450,9 @@ impl Tmmb {
         bitrate(self.mantissa, self.exponent)
     }
 
-    /// An entry for `ssrc` limiting it to `bps`, rounded down to what 17
-    /// bits of mantissa hold.
+    /// An entry with `ssrc` and a limit of `bps`, rounded down to what 17
+    /// bits of mantissa hold. For a TMMBR, `ssrc` is the media sender to
+    /// limit. For a TMMBN, it is the limit's owner.
     pub fn with_bitrate(ssrc: u32, bps: u64, overhead: u16) -> Tmmb {
         let (exponent, mantissa) = split_bitrate(bps, 17);
         Tmmb { ssrc, exponent, mantissa, overhead }
@@ -450,7 +464,9 @@ impl Tmmb {
 pub struct PayloadFeedback {
     /// The SSRC of the source sending the feedback.
     pub sender_ssrc: u32,
-    /// The SSRC of the media source it is about. FIR and REMB set it to 0.
+    /// The SSRC of the media source it is about. FIR and REMB do not use
+    /// it: writers refuse any value but 0, and readers read it as 0 (RFC
+    /// 5104 section 4.3.1.2, draft-alvestrand-rmcat-remb section 2.2).
     pub media_ssrc: u32,
     /// The message.
     pub message: PayloadMessage,
@@ -468,9 +484,10 @@ pub enum PayloadMessage {
     /// FMT 4: a request for a full intra picture. At least one entry.
     Fir(Vec<Fir>),
     /// FMT 15 with `REMB` first: a receiver's estimated maximum bitrate.
+    /// FMT 15 that starts with `REMB` but does not fit one is malformed.
     Remb(Remb),
     /// FMT 15 with anything else: application layer feedback, unread.
-    /// Whole 32-bit words that do not read as a REMB.
+    /// Whole 32-bit words that do not start with `REMB`.
     Afb(Vec<u8>),
     /// Any other FMT, with its feedback control information unread.
     Other {
@@ -498,7 +515,8 @@ pub struct Rpsi {
     /// The RTP payload type the bit string is for, below 128.
     pub payload_type: u8,
     /// How many bits at the end of `data` are padding, not part of the
-    /// bit string. At most `8 * data.len()`.
+    /// bit string: below 32, at most `8 * data.len()`, and all zero (RFC
+    /// 4585 section 6.3.3.2).
     pub padding_bits: u8,
     /// The codec's bit string and its padding. With the 2 bytes before
     /// it, whole 32-bit words.
@@ -523,7 +541,8 @@ pub struct Remb {
     pub exponent: u8,
     /// The bitrate's mantissa, below 2^18.
     pub mantissa: u32,
-    /// The sources the estimate is for, at most [`MAX_REMB_SSRCS`].
+    /// The sources the estimate is for: at least one, at most
+    /// [`MAX_REMB_SSRCS`].
     pub ssrcs: Vec<u32>,
 }
 
@@ -555,9 +574,15 @@ pub struct ExtendedReport {
 pub struct XrBlock {
     /// The block type, from [`xr`] or any other number.
     pub block_type: u8,
-    /// The byte after the type, whose meaning depends on it.
+    /// The byte after the type, whose meaning depends on it. It is
+    /// reserved in receiver reference time, DLRR and VoIP metrics blocks:
+    /// writers refuse any value but 0, and readers read it as 0.
     pub type_specific: u8,
     /// The block's contents after its 4-byte header: whole 32-bit words.
+    /// RFC 3611 sets the length of the types in [`xr`]: at least 8 bytes
+    /// for types 1 to 3, 8 for a receiver reference time, a multiple of
+    /// 12 for a DLRR, 36 for a statistics summary and 32 for VoIP
+    /// metrics. Other types may hold any number of words.
     pub data: Vec<u8>,
 }
 
@@ -630,8 +655,9 @@ pub enum ParseError {
     Truncated,
     /// The version was not 2; holds what it was.
     Version(u8),
-    /// The padding flag was set, but the last byte said 0 bytes of padding
-    /// or more than the packet holds.
+    /// The padding flag was set, but the last byte said 0 bytes of
+    /// padding, a number that is not a multiple of 4, or more than the
+    /// packet holds.
     Padding,
     /// A packet's contents do not fit its type; holds the packet type.
     Malformed(u8),
@@ -700,13 +726,18 @@ pub enum EncodeError {
     /// A field outside the bits it is written in: a cumulative loss, an
     /// exponent, mantissa or overhead, an SLI field, an RPSI payload type
     /// or padding bit count, a subtype or FMT over 31, or an SDES item of
-    /// type 0.
+    /// type 0. Also a value the specification rules out: RPSI padding bits
+    /// that are not zero, a PRIV item whose prefix does not fit, a media
+    /// SSRC other than 0 in a TMMBR, TMMBN, FIR or REMB, a REMB with
+    /// padding, or a known XR block of the wrong length or with a reserved
+    /// byte set.
     Range,
     /// Contents and padding that do not fill whole 32-bit words.
     Alignment,
-    /// No packets, or a NACK, TMMBR, SLI or FIR with no entries.
+    /// No packets, or a NACK, TMMBR, SLI, FIR or REMB with no entries.
     Empty,
-    /// An `Other` or `Afb` value a reader would read back as a typed one.
+    /// An `Other` value a reader would read back as a typed one, or an
+    /// `Afb` that starts with `REMB`.
     Alias,
     /// The packets break a rule for compound packets.
     Compound(CompoundError),
@@ -742,6 +773,11 @@ impl Body {
             Body::ExtendedReport(_) => packet_type::XR,
             Body::Other { packet_type, .. } => *packet_type,
         }
+    }
+
+    /// Whether this is a REMB, which never carries padding.
+    fn is_remb(&self) -> bool {
+        matches!(self, Body::PayloadFeedback(PayloadFeedback { message: PayloadMessage::Remb(_), .. }))
     }
 
     /// Reads contents `c`, padding left out, of a packet of type `pt` with
@@ -817,6 +853,7 @@ impl Body {
                     return Err(bad);
                 }
                 let fci = &c[8..];
+                let mut media_ssrc = be32(c, 4);
                 let message = match count {
                     rtpfb::NACK => {
                         if fci.is_empty() {
@@ -842,6 +879,8 @@ impl Body {
                                 }
                             })
                             .collect();
+                        // The media SSRC is unused, and ignored on reading.
+                        media_ssrc = 0;
                         if count == rtpfb::TMMBR {
                             TransportMessage::Tmmbr(items)
                         } else {
@@ -850,13 +889,14 @@ impl Body {
                     }
                     fmt => TransportMessage::Other { fmt, fci: fci.to_vec() },
                 };
-                Body::TransportFeedback(TransportFeedback { sender_ssrc: be32(c, 0), media_ssrc: be32(c, 4), message })
+                Body::TransportFeedback(TransportFeedback { sender_ssrc: be32(c, 0), media_ssrc, message })
             }
             packet_type::PSFB => {
                 if c.len() < 8 {
                     return Err(bad);
                 }
                 let fci = &c[8..];
+                let mut media_ssrc = be32(c, 4);
                 let message = match count {
                     psfb::PLI => {
                         if !fci.is_empty() {
@@ -883,7 +923,7 @@ impl Body {
                     }
                     psfb::RPSI => {
                         let [pb, pt, data @ ..] = fci else { return Err(bad) };
-                        if usize::from(*pb) > 8 * data.len() {
+                        if !rpsi_padding_ok(*pb, data) {
                             return Err(bad);
                         }
                         // The bit above the payload type is ignored on reading.
@@ -893,17 +933,21 @@ impl Body {
                         if fci.is_empty() || !fci.len().is_multiple_of(8) {
                             return Err(bad);
                         }
+                        // The media SSRC is unused, and ignored on reading.
+                        media_ssrc = 0;
                         PayloadMessage::Fir(
                             fci.chunks_exact(8).map(|e| Fir { ssrc: be32(e, 0), sequence: e[4] }).collect(),
                         )
                     }
-                    psfb::AFB => match parse_remb(fci) {
-                        Some(remb) => PayloadMessage::Remb(remb),
-                        None => PayloadMessage::Afb(fci.to_vec()),
-                    },
+                    psfb::AFB if fci.starts_with(REMB_ID) => {
+                        // The media SSRC is unused, and ignored on reading.
+                        media_ssrc = 0;
+                        PayloadMessage::Remb(parse_remb(fci).ok_or(bad)?)
+                    }
+                    psfb::AFB => PayloadMessage::Afb(fci.to_vec()),
                     fmt => PayloadMessage::Other { fmt, fci: fci.to_vec() },
                 };
-                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: be32(c, 0), media_ssrc: be32(c, 4), message })
+                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: be32(c, 0), media_ssrc, message })
             }
             packet_type::XR => {
                 if c.len() < 4 {
@@ -916,7 +960,13 @@ impl Body {
                     let header = c.get(pos..pos + 4).ok_or(bad)?;
                     let len = 4 * (usize::from(be16(header, 2)) + 1);
                     let block = c.get(pos..pos + len).ok_or(bad)?;
-                    blocks.push(XrBlock { block_type: header[0], type_specific: header[1], data: block[4..].to_vec() });
+                    let (block_type, data) = (header[0], &block[4..]);
+                    if !xr_layout_ok(block_type, data.len()) {
+                        return Err(bad);
+                    }
+                    // A reserved byte after the type is ignored on reading.
+                    let type_specific = if xr_reserved(block_type) { 0 } else { header[1] };
+                    blocks.push(XrBlock { block_type, type_specific, data: data.to_vec() });
                     pos += len;
                 }
                 Body::ExtendedReport(ExtendedReport { ssrc: be32(c, 0), blocks })
@@ -954,6 +1004,9 @@ impl Body {
                         if item.text.len() > MAX_TEXT {
                             return Err(EncodeError::TooLong);
                         }
+                        if !item.layout_ok() {
+                            return Err(EncodeError::Range);
+                        }
                         check_size(out.len() + 2 + item.text.len())?;
                         out.push(item.kind);
                         out.push(item.text.len() as u8);
@@ -986,6 +1039,7 @@ impl Body {
                     return Err(EncodeError::Range);
                 }
                 words(&app.data)?;
+                check_size(8usize.saturating_add(app.data.len()))?;
                 out.extend_from_slice(&app.ssrc.to_be_bytes());
                 out.extend_from_slice(&app.name);
                 out.extend_from_slice(&app.data);
@@ -1005,6 +1059,7 @@ impl Body {
                         rtpfb::NACK
                     }
                     TransportMessage::Tmmbr(items) | TransportMessage::Tmmbn(items) => {
+                        unused_media_ssrc(fb.media_ssrc)?;
                         let request = matches!(fb.message, TransportMessage::Tmmbr(_));
                         if request {
                             nonempty(items)?;
@@ -1028,6 +1083,7 @@ impl Body {
                             return Err(EncodeError::Alias);
                         }
                         words(fci)?;
+                        check_size(out.len().saturating_add(fci.len()))?;
                         out.extend_from_slice(fci);
                         *fmt
                     }
@@ -1051,7 +1107,8 @@ impl Body {
                         psfb::SLI
                     }
                     PayloadMessage::Rpsi(r) => {
-                        if r.payload_type > 127 || usize::from(r.padding_bits) > 8 * r.data.len() {
+                        check_size(out.len().saturating_add(2).saturating_add(r.data.len()))?;
+                        if r.payload_type > 127 || !rpsi_padding_ok(r.padding_bits, &r.data) {
                             return Err(EncodeError::Range);
                         }
                         if (2 + r.data.len()) % 4 != 0 {
@@ -1063,6 +1120,7 @@ impl Body {
                         psfb::RPSI
                     }
                     PayloadMessage::Fir(entries) => {
+                        unused_media_ssrc(fb.media_ssrc)?;
                         nonempty(entries)?;
                         check_size(out.len() + 8 * entries.len())?;
                         for e in entries {
@@ -1072,13 +1130,15 @@ impl Body {
                         psfb::FIR
                     }
                     PayloadMessage::Remb(remb) => {
+                        unused_media_ssrc(fb.media_ssrc)?;
+                        nonempty(&remb.ssrcs)?;
                         if remb.ssrcs.len() > MAX_REMB_SSRCS {
                             return Err(EncodeError::TooMany);
                         }
                         if remb.exponent > 63 || remb.mantissa >= 1 << 18 {
                             return Err(EncodeError::Range);
                         }
-                        out.extend_from_slice(b"REMB");
+                        out.extend_from_slice(REMB_ID);
                         let v = (remb.ssrcs.len() as u32) << 24 | u32::from(remb.exponent) << 18 | remb.mantissa;
                         out.extend_from_slice(&v.to_be_bytes());
                         for s in &remb.ssrcs {
@@ -1088,9 +1148,10 @@ impl Body {
                     }
                     PayloadMessage::Afb(data) => {
                         words(data)?;
-                        if parse_remb(data).is_some() {
+                        if data.starts_with(REMB_ID) {
                             return Err(EncodeError::Alias);
                         }
+                        check_size(out.len().saturating_add(data.len()))?;
                         out.extend_from_slice(data);
                         psfb::AFB
                     }
@@ -1102,6 +1163,7 @@ impl Body {
                             return Err(EncodeError::Alias);
                         }
                         words(fci)?;
+                        check_size(out.len().saturating_add(fci.len()))?;
                         out.extend_from_slice(fci);
                         *fmt
                     }
@@ -1111,6 +1173,10 @@ impl Body {
                 out.extend_from_slice(&report.ssrc.to_be_bytes());
                 for b in &report.blocks {
                     words(&b.data)?;
+                    if !xr_layout_ok(b.block_type, b.data.len()) || (xr_reserved(b.block_type) && b.type_specific != 0)
+                    {
+                        return Err(EncodeError::Range);
+                    }
                     let n = u16::try_from(b.data.len() / 4).map_err(|_| EncodeError::TooLong)?;
                     check_size(out.len() + 4 + b.data.len())?;
                     out.extend_from_slice(&[b.block_type, b.type_specific]);
@@ -1126,6 +1192,8 @@ impl Body {
                 if usize::from(*count) > MAX_COUNT {
                     return Err(EncodeError::Range);
                 }
+                words(data)?;
+                check_size(data.len())?;
                 out.extend_from_slice(data);
                 *count
             }
@@ -1156,14 +1224,18 @@ impl Packet {
         let body = b.get(HEADER_LEN..len).ok_or(ParseError::Truncated)?;
         let padding = if padded {
             match body.last() {
-                Some(&n) if n != 0 && usize::from(n) <= body.len() => n,
+                Some(&n) if n != 0 && n % 4 == 0 && usize::from(n) <= body.len() => n,
                 _ => return Err(ParseError::Padding),
             }
         } else {
             0
         };
         let content = &body[..body.len() - usize::from(padding)];
-        Ok((Packet { body: Body::parse(pt, count, content)?, padding }, len))
+        let body = Body::parse(pt, count, content)?;
+        if padding != 0 && body.is_remb() {
+            return Err(ParseError::Malformed(pt));
+        }
+        Ok((Packet { body, padding }, len))
     }
 
     /// The packet's bytes. A packet [`Packet::parse`] would refuse, or read
@@ -1171,8 +1243,11 @@ impl Packet {
     pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
         let (count, content) = self.body.encode()?;
         let pad = usize::from(self.padding);
-        if (content.len() + pad) % 4 != 0 {
+        if !pad.is_multiple_of(4) || !content.len().is_multiple_of(4) {
             return Err(EncodeError::Alignment);
+        }
+        if pad > 0 && self.body.is_remb() {
+            return Err(EncodeError::Range);
         }
         let total = HEADER_LEN + content.len() + pad;
         if total > MAX_PACKET {
@@ -1444,7 +1519,11 @@ fn parse_sdes(c: &[u8], n: usize) -> Option<Vec<SdesChunk>> {
             }
             let len = usize::from(*c.get(pos + 1)?);
             let text = c.get(pos + 2..pos + 2 + len)?;
-            items.push(SdesItem { kind, text: text.to_vec() });
+            let item = SdesItem { kind, text: text.to_vec() };
+            if !item.layout_ok() {
+                return None;
+            }
+            items.push(item);
             pos += 2 + len;
         }
         chunks.push(SdesChunk { ssrc, items });
@@ -1455,16 +1534,20 @@ fn parse_sdes(c: &[u8], n: usize) -> Option<Vec<SdesChunk>> {
     Some(chunks)
 }
 
-/// Reads a REMB from application layer feedback, if it is one: `REMB`,
-/// the number of SSRCs, the bitrate, then exactly that many SSRCs.
+/// The four bytes that start a REMB's feedback control information.
+const REMB_ID: &[u8] = b"REMB";
+
+/// Reads a REMB from application layer feedback that starts with
+/// [`REMB_ID`]: the number of SSRCs, at least one, the bitrate, then
+/// exactly that many SSRCs. `None` if it does not fit.
 fn parse_remb(fci: &[u8]) -> Option<Remb> {
     let (head, rest) = (fci.get(..8)?, fci.get(8..)?);
-    if &head[..4] != b"REMB" {
+    if !head.starts_with(REMB_ID) {
         return None;
     }
     let v = be32(head, 4);
     let n = (v >> 24) as usize;
-    if rest.len() != 4 * n {
+    if n == 0 || rest.len() != 4 * n {
         return None;
     }
     Some(Remb {
@@ -1490,6 +1573,53 @@ fn split_bitrate(bps: u64, bits: u32) -> (u8, u32) {
         e += 1;
     }
     (e, m as u32)
+}
+
+/// Checks the media SSRC of a message that does not use it, which RFC
+/// 5104 and the REMB draft set to 0.
+fn unused_media_ssrc(ssrc: u32) -> Result<(), EncodeError> {
+    if ssrc == 0 { Ok(()) } else { Err(EncodeError::Range) }
+}
+
+/// Whether `pb` padding bits fit RFC 4585 section 6.3.3.2: fewer than 32,
+/// within `data`, and all zero.
+fn rpsi_padding_ok(pb: u8, data: &[u8]) -> bool {
+    if pb >= 32 || usize::from(pb).div_ceil(8) > data.len() {
+        return false;
+    }
+    let mut bits = u32::from(pb);
+    for &b in data.iter().rev() {
+        if bits == 0 {
+            break;
+        }
+        let k = bits.min(8);
+        let mask = ((1u16 << k) - 1) as u8;
+        if b & mask != 0 {
+            return false;
+        }
+        bits -= k;
+    }
+    true
+}
+
+/// Whether an XR block of type `block_type` may hold `len` bytes after its
+/// header (RFC 3611 sections 4.1 to 4.7). Other types may hold any length.
+fn xr_layout_ok(block_type: u8, len: usize) -> bool {
+    match block_type {
+        // The source's SSRC and the first and last sequence numbers.
+        xr::LOSS_RLE | xr::DUPLICATE_RLE | xr::PACKET_RECEIPT_TIMES => len >= 8,
+        xr::RECEIVER_REFERENCE_TIME => len == 8,
+        xr::DLRR => len.is_multiple_of(12),
+        xr::STATISTICS_SUMMARY => len == 36,
+        xr::VOIP_METRICS => len == 32,
+        _ => true,
+    }
+}
+
+/// Whether the byte after an XR block's type is reserved: written as 0
+/// and ignored on reading (RFC 3611 sections 4.4, 4.5 and 4.7).
+fn xr_reserved(block_type: u8) -> bool {
+    matches!(block_type, xr::RECEIVER_REFERENCE_TIME | xr::DLRR | xr::VOIP_METRICS)
 }
 
 /// Pads `out` with zeros to a whole number of 32-bit words.
@@ -1718,13 +1848,18 @@ mod tests {
         let b = round_trip(&fb(PayloadMessage::Rpsi(Rpsi { payload_type: 96, padding_bits: 4, data: vec![0xa0, 0] })));
         assert_eq!(&b[..4], &[0x83, 206, 0, 3]);
         assert_eq!(&b[12..], &[4, 96, 0xa0, 0]);
-        let b = round_trip(&fb(PayloadMessage::Fir(vec![Fir { ssrc: 5, sequence: 9 }])));
+        let fir = Packet::from(Body::PayloadFeedback(PayloadFeedback {
+            sender_ssrc: 1,
+            media_ssrc: 0,
+            message: PayloadMessage::Fir(vec![Fir { ssrc: 5, sequence: 9 }]),
+        }));
+        let b = round_trip(&fir);
         assert_eq!(&b[..4], &[0x84, 206, 0, 4]);
         assert_eq!(&b[12..], &[0, 0, 0, 5, 9, 0, 0, 0]);
         // A FIR's reserved bytes are ignored.
         let mut r = b.clone();
         r[17] = 0xff;
-        assert_eq!(Packet::parse(&r).unwrap().0, fb(PayloadMessage::Fir(vec![Fir { ssrc: 5, sequence: 9 }])));
+        assert_eq!(Packet::parse(&r).unwrap().0, fir);
         // PLI with FCI, empty SLI and FIR, RPSI with too many padding bits
         // or no room for its two leading bytes.
         let head = [0, 0, 0, 1, 0, 0, 0, 2];
@@ -1758,12 +1893,10 @@ mod tests {
         assert_eq!(p.to_bytes().unwrap(), bytes);
         let w = Remb::with_bitrate(2_500_000, vec![]);
         assert!(w.mantissa < 1 << 18 && w.bitrate() <= 2_500_000 && w.bitrate() > 2_490_000);
-        // A count that does not match makes it plain AFB.
+        // A count that does not match is a bad REMB.
         let mut afb = bytes;
         afb[16] = 2;
-        let (p, _) = Packet::parse(&afb).unwrap();
-        assert!(matches!(&p.body, Body::PayloadFeedback(PayloadFeedback { message: PayloadMessage::Afb(_), .. })));
-        assert_eq!(p.to_bytes().unwrap(), afb);
+        assert_eq!(Packet::parse(&afb), Err(ParseError::Malformed(206)));
     }
 
     // RFC 3611 sections 4.4 and 4.5.
@@ -1795,9 +1928,9 @@ mod tests {
 
     #[test]
     fn other_types_and_aliases() {
-        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 1 };
+        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3, 4] }, padding: 4 };
         let b = round_trip(&p);
-        assert_eq!(b, [0xa4, 210, 0, 1, 1, 2, 3, 1]);
+        assert_eq!(b, [0xa4, 210, 0, 2, 1, 2, 3, 4, 0, 0, 0, 4]);
         let other = |packet_type| Packet::from(Body::Other { packet_type, count: 0, data: vec![] });
         for t in 200..=207 {
             assert_eq!(other(t).to_bytes(), Err(EncodeError::Alias));
@@ -1840,8 +1973,8 @@ mod tests {
         assert_eq!(Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 0]), Err(ParseError::Padding));
         assert_eq!(Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 5]), Err(ParseError::Padding));
         assert_eq!(Packet::parse(&[0xa0, 210, 0, 0]), Err(ParseError::Padding));
-        // Padding that leaves part of a word to a typed packet.
-        assert_eq!(Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 3]), Err(ParseError::Malformed(201)));
+        // A count that is not a multiple of four.
+        assert_eq!(Packet::parse(&[0xa0, 201, 0, 1, 0, 0, 0, 3]), Err(ParseError::Padding));
     }
 
     #[test]
@@ -1858,7 +1991,7 @@ mod tests {
         assert_eq!(parse_packets(&[0x80, 205, 0, 1, 0, 0, 0, 0]), Err(ParseError::Malformed(205)));
         assert_eq!(parse_packets(&[0x81, 206, 0, 1, 0, 0, 0, 0]), Err(ParseError::Malformed(206)));
         // A typed packet whose contents are not whole words.
-        assert_eq!(parse_packets(&[0xa0, 204, 0, 2, 0, 0, 0, 1, 0, 0, 0, 1]), Err(ParseError::Malformed(204)));
+        assert_eq!(parse_packets(&[0x80, 204, 0, 1, 0, 0, 0, 1]), Err(ParseError::Malformed(204)));
         for e in [ParseError::Empty, ParseError::Compound(CompoundError::NoCname), ParseError::Version(0)] {
             assert!(!e.to_string().is_empty());
         }
@@ -2041,8 +2174,8 @@ mod tests {
         assert_eq!(pf(rp(0, 17, 2)).to_bytes(), Err(EncodeError::Range));
         assert_eq!(pf(rp(0, 0, 3)).to_bytes(), Err(EncodeError::Alignment));
         let remb = |exponent, mantissa, n| PayloadMessage::Remb(Remb { exponent, mantissa, ssrcs: vec![0; n] });
-        assert_eq!(pf(remb(64, 0, 0)).to_bytes(), Err(EncodeError::Range));
-        assert_eq!(pf(remb(0, 1 << 18, 0)).to_bytes(), Err(EncodeError::Range));
+        assert_eq!(pf(remb(64, 0, 1)).to_bytes(), Err(EncodeError::Range));
+        assert_eq!(pf(remb(0, 1 << 18, 1)).to_bytes(), Err(EncodeError::Range));
         assert_eq!(pf(remb(0, 0, 256)).to_bytes(), Err(EncodeError::TooMany));
         assert_eq!(pf(PayloadMessage::Afb(vec![0; 5])).to_bytes(), Err(EncodeError::Alignment));
         assert_eq!(pf(PayloadMessage::Other { fmt: 32, fci: vec![] }).to_bytes(), Err(EncodeError::Range));
@@ -2165,6 +2298,198 @@ mod tests {
         }
     }
 
+    fn psfb(media_ssrc: u32, message: PayloadMessage) -> Packet {
+        Packet::from(Body::PayloadFeedback(PayloadFeedback { sender_ssrc: 1, media_ssrc, message }))
+    }
+
+    // Writers check the size of caller data before they copy it.
+    #[test]
+    fn writers_check_size_before_copying() {
+        let big = vec![0u8; MAX_PACKET];
+        let bodies = [
+            Body::App(App { subtype: 0, ssrc: 0, name: *b"TEST", data: big.clone() }),
+            Body::TransportFeedback(TransportFeedback {
+                sender_ssrc: 0,
+                media_ssrc: 0,
+                message: TransportMessage::Other { fmt: 9, fci: big.clone() },
+            }),
+            Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: 0,
+                media_ssrc: 0,
+                message: PayloadMessage::Other { fmt: 9, fci: big.clone() },
+            }),
+            Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: 0,
+                media_ssrc: 0,
+                message: PayloadMessage::Afb(big.clone()),
+            }),
+            Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: 0,
+                media_ssrc: 0,
+                message: PayloadMessage::Rpsi(Rpsi {
+                    payload_type: 96,
+                    padding_bits: 0,
+                    data: vec![0; MAX_PACKET + 2],
+                }),
+            }),
+            Body::Other { packet_type: 210, count: 0, data: big },
+        ];
+        for b in bodies {
+            assert_eq!(b.encode(), Err(EncodeError::TooLong), "{}", b.packet_type());
+        }
+    }
+
+    // RFC 5104 sections 4.2.1.2, 4.2.2.2 and 4.3.1.2, and
+    // draft-alvestrand-rmcat-remb section 2.2: the media SSRC is 0.
+    #[test]
+    fn media_ssrc_zero_where_unused() {
+        let tmmb = Tmmb { ssrc: 9, exponent: 1, mantissa: 2, overhead: 3 };
+        let tf = |media_ssrc, message| {
+            Packet::from(Body::TransportFeedback(TransportFeedback { sender_ssrc: 1, media_ssrc, message }))
+        };
+        let remb = || PayloadMessage::Remb(Remb { exponent: 1, mantissa: 2, ssrcs: vec![9] });
+        let fir = || PayloadMessage::Fir(vec![Fir { ssrc: 9, sequence: 1 }]);
+        for p in [
+            tf(2, TransportMessage::Tmmbr(vec![tmmb])),
+            tf(2, TransportMessage::Tmmbn(vec![tmmb])),
+            psfb(2, remb()),
+            psfb(2, fir()),
+        ] {
+            assert_eq!(p.to_bytes(), Err(EncodeError::Range), "{p:?}");
+        }
+        // Read, a nonzero media SSRC is ignored.
+        for p in [tf(0, TransportMessage::Tmmbr(vec![tmmb])), psfb(0, remb()), psfb(0, fir())] {
+            let mut b = round_trip(&p);
+            b[11] = 2;
+            assert_eq!(Packet::parse(&b), Ok((p, b.len())));
+        }
+        // PLI keeps its media SSRC.
+        round_trip(&psfb(2, PayloadMessage::Pli));
+    }
+
+    // RFC 3611 sections 4.1 to 4.7: the lengths of known blocks, and
+    // reserved bytes set to 0 and ignored.
+    #[test]
+    fn known_xr_block_layouts() {
+        let xr = |block_type, type_specific, n| {
+            Packet::from(Body::ExtendedReport(ExtendedReport {
+                ssrc: 1,
+                blocks: vec![XrBlock { block_type, type_specific, data: vec![0; n] }],
+            }))
+        };
+        for (t, good, bad) in [
+            (xr::LOSS_RLE, &[8, 12][..], &[0, 4][..]),
+            (xr::DUPLICATE_RLE, &[8], &[4]),
+            (xr::PACKET_RECEIPT_TIMES, &[8, 16], &[0]),
+            (xr::RECEIVER_REFERENCE_TIME, &[8], &[0, 4, 12]),
+            (xr::DLRR, &[0, 12, 24], &[4, 8, 16]),
+            (xr::STATISTICS_SUMMARY, &[36], &[32, 40]),
+            (xr::VOIP_METRICS, &[32], &[28, 36]),
+        ] {
+            for &n in good {
+                round_trip(&xr(t, 0, n));
+            }
+            for &n in bad {
+                let p = xr(t, 0, n);
+                assert_eq!(p.to_bytes(), Err(EncodeError::Range), "{t} {n}");
+                let words = (2 + n / 4) as u8;
+                let b = [&[0x80, 207, 0, words, 0, 0, 0, 1, t, 0, 0, (n / 4) as u8][..], &vec![0; n]].concat();
+                assert_eq!(Packet::parse(&b), Err(ParseError::Malformed(207)), "{t} {n}");
+            }
+        }
+        for t in [xr::RECEIVER_REFERENCE_TIME, xr::DLRR, xr::VOIP_METRICS] {
+            let n = if t == xr::VOIP_METRICS {
+                32
+            } else {
+                12 * usize::from(t == xr::DLRR) + 8 * usize::from(t != xr::DLRR)
+            };
+            assert_eq!(xr(t, 1, n).to_bytes(), Err(EncodeError::Range));
+            let mut b = round_trip(&xr(t, 0, n));
+            b[9] = 0xff;
+            assert_eq!(Packet::parse(&b), Ok((xr(t, 0, n), b.len())));
+        }
+        // Other types keep the byte after the type.
+        round_trip(&xr(xr::STATISTICS_SUMMARY, 0xe8, 36));
+        round_trip(&xr(99, 7, 0));
+    }
+
+    // RFC 4585 section 6.3.3.2: PB counts the zero bits up to the next
+    // 32-bit boundary.
+    #[test]
+    fn rpsi_padding() {
+        let rp =
+            |padding_bits, data: Vec<u8>| psfb(2, PayloadMessage::Rpsi(Rpsi { payload_type: 96, padding_bits, data }));
+        round_trip(&rp(4, vec![0xf0, 0]));
+        round_trip(&rp(31, vec![0x80, 0, 0, 0, 0, 0]));
+        assert_eq!(rp(4, vec![0, 0xff]).to_bytes(), Err(EncodeError::Range));
+        assert_eq!(rp(9, vec![0xff, 0x01]).to_bytes(), Err(EncodeError::Range));
+        assert_eq!(rp(32, vec![0; 6]).to_bytes(), Err(EncodeError::Range));
+        let head = [0x83, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 2];
+        for bad in [[4, 96, 0, 0x0f], [32, 96, 0, 0]] {
+            let b = [&head[..], &bad].concat();
+            assert_eq!(Packet::parse(&b), Err(ParseError::Malformed(206)), "{bad:?}");
+        }
+    }
+
+    // draft-alvestrand-rmcat-remb section 2.2: the padding bit is always
+    // 0, and there is at least one SSRC.
+    #[test]
+    fn remb_rules() {
+        let remb = |ssrcs| PayloadMessage::Remb(Remb { exponent: 1, mantissa: 2, ssrcs });
+        assert_eq!(Packet { padding: 4, ..psfb(0, remb(vec![9])) }.to_bytes(), Err(EncodeError::Range));
+        let b = [0xaf, 206, 0, 5, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B', 1, 0, 0, 0, 0, 0, 0, 4];
+        assert_eq!(Packet::parse(&b), Err(ParseError::Malformed(206)));
+        assert_eq!(psfb(0, remb(vec![])).to_bytes(), Err(EncodeError::Empty));
+        // `REMB` with a count that does not match, or no SSRCs, is a bad
+        // REMB, not other application layer feedback.
+        let head = [0x8f, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 0];
+        for fci in [[b'R', b'E', b'M', b'B', 1, 0, 0, 0], [b'R', b'E', b'M', b'B', 0, 0, 0, 0]] {
+            let b = [&head[..], &fci].concat();
+            assert_eq!(Packet::parse(&b), Err(ParseError::Malformed(206)), "{fci:?}");
+        }
+        let b = [0x8f, 206, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, b'R', b'E', b'M', b'B'];
+        assert_eq!(Packet::parse(&b), Err(ParseError::Malformed(206)));
+        assert_eq!(psfb(0, PayloadMessage::Afb(b"REMB".to_vec())).to_bytes(), Err(EncodeError::Alias));
+        assert_eq!(
+            psfb(0, PayloadMessage::Afb(b"REMB\x02\0\0\0\0\0\0\x01".to_vec())).to_bytes(),
+            Err(EncodeError::Alias)
+        );
+        round_trip(&psfb(0, PayloadMessage::Afb(b"REMX\x02\0\0\0".to_vec())));
+    }
+
+    // RFC 3550 section 6.5.8: a PRIV item holds a prefix length, the
+    // prefix, then the value.
+    #[test]
+    fn sdes_priv_layout() {
+        let sd = |text: &[u8]| {
+            Packet::from(Body::SourceDescription(vec![SdesChunk {
+                ssrc: 1,
+                items: vec![SdesItem { kind: sdes::PRIV, text: text.to_vec() }],
+            }]))
+        };
+        round_trip(&sd(b"\x01ab"));
+        round_trip(&sd(b"\x00"));
+        assert_eq!(sd(b"\x03a").to_bytes(), Err(EncodeError::Range));
+        assert_eq!(sd(b"").to_bytes(), Err(EncodeError::Range));
+        for item in [[8, 2, 3, b'a'], [8, 0, 0, 0]] {
+            let b = [&[0x81, 202, 0, 3, 0, 0, 0, 1][..], &item, &[0, 0, 0, 0]].concat();
+            assert_eq!(Packet::parse(&b), Err(ParseError::Malformed(202)), "{item:?}");
+        }
+    }
+
+    // RFC 3550 section 6.4.1: the padding count is a multiple of four,
+    // for every packet type.
+    #[test]
+    fn padding_is_whole_words() {
+        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 1]), Err(ParseError::Padding));
+        assert_eq!(Packet::parse(&[0xa4, 210, 0, 1, 1, 2, 3, 3]), Err(ParseError::Padding));
+        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 1 };
+        assert_eq!(p.to_bytes(), Err(EncodeError::Alignment));
+        let p = Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3] }, padding: 0 };
+        assert_eq!(p.to_bytes(), Err(EncodeError::Alignment));
+        round_trip(&Packet { body: Body::Other { packet_type: 210, count: 4, data: vec![1, 2, 3, 4] }, padding: 4 });
+    }
+
     struct Lcg(u64);
 
     impl Lcg {
@@ -2265,7 +2590,8 @@ mod tests {
                         }
                     }
                 };
-                Body::TransportFeedback(TransportFeedback { sender_ssrc: r.next(), media_ssrc: r.next(), message })
+                let media_ssrc = if r.below(2) == 0 { 0 } else { r.next() };
+                Body::TransportFeedback(TransportFeedback { sender_ssrc: r.next(), media_ssrc, message })
             }
             8..=11 => {
                 let entries = n(r, 4);
@@ -2306,12 +2632,20 @@ mod tests {
                     }
                     _ => PayloadMessage::Other { fmt: fmt(r), fci: r.some(9) },
                 };
-                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: r.next(), media_ssrc: r.next(), message })
+                let media_ssrc = if r.below(2) == 0 { 0 } else { r.next() };
+                Body::PayloadFeedback(PayloadFeedback { sender_ssrc: r.next(), media_ssrc, message })
             }
             12 | 13 => Body::ExtendedReport(ExtendedReport {
                 ssrc: r.next(),
                 blocks: (0..n(r, 3))
-                    .map(|_| XrBlock { block_type: r.next() as u8, type_specific: r.next() as u8, data: r.some(13) })
+                    .map(|_| {
+                        let words = n(r, 10);
+                        XrBlock {
+                            block_type: r.below(9) as u8,
+                            type_specific: if r.below(2) == 0 { 0 } else { r.next() as u8 },
+                            data: r.bytes(4 * words),
+                        }
+                    })
                     .collect(),
             }),
             _ => Body::Other { packet_type: r.next() as u8, count: fmt(r), data: r.some(9) },
@@ -2342,9 +2676,10 @@ mod tests {
                 // Random bytes, often with a version-2 header in front.
                 let mut d = r.some(79);
                 if let Some(b) = d.first_mut()
-                    && r.below(4) != 0 {
-                        *b = 0x80 | (*b & 0x3f);
-                    }
+                    && r.below(4) != 0
+                {
+                    *b = 0x80 | (*b & 0x3f);
+                }
                 if d.len() > 1 && r.below(2) == 0 {
                     d[1] = 200 + r.below(8) as u8;
                 }
@@ -2372,10 +2707,12 @@ mod tests {
     fn lcg_fuzz_writers() {
         let mut r = Lcg(0x7772_6974);
         let mut written = 0;
+        let mut kinds = std::collections::BTreeSet::new();
         for _ in 0..20000 {
             let p = random_packet(&mut r);
             if let Ok(bytes) = p.to_bytes() {
                 written += 1;
+                kinds.insert((bytes[1], bytes[0] & 0x1f));
                 assert!(bytes.len() <= MAX_PACKET && bytes.len() % 4 == 0);
                 assert_eq!(Packet::parse(&bytes), Ok((p.clone(), bytes.len())));
                 assert_eq!(parse_packets(&bytes), Ok(vec![p.clone()]));
@@ -2387,5 +2724,9 @@ mod tests {
         }
         // Enough values are valid that the loop tests the writers.
         assert!(written > 5000, "{written}");
+        // Including the messages with an unused media SSRC.
+        for k in [(205, 3), (205, 4), (206, 4), (206, 15), (206, 3), (207, 0)] {
+            assert!(kinds.contains(&k), "{k:?}");
+        }
     }
 }

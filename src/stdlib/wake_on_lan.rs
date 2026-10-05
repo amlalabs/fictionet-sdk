@@ -252,8 +252,9 @@ impl MagicPacket {
 /// when the card has a password, the password's bytes follow that packet
 /// directly. Bytes after those do not matter. A payload longer than
 /// [`MAX_PAYLOAD`] never wakes a card. A card also checks that the frame
-/// is sent to its own address or to a broadcast address. That check is
-/// left to the world, since only the payload is passed here.
+/// is one it would receive: sent to its own address, to a broadcast
+/// address or to a multicast address. That check is left to the world,
+/// since only the payload is passed here.
 pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
     if payload.len() > MAX_PAYLOAD {
         return false;
@@ -582,6 +583,23 @@ mod tests {
         assert!(!wakes(&p, MAC, Some(&Password::Four([9, 9, 9, 8]))));
         assert!(!wakes(&p, MAC, Some(&Password::Six([9, 9, 9, 9, 0, 1]))));
         assert!(wakes(&p, other, Some(&Password::Six([1, 2, 3, 4, 5, 6]))));
+    }
+
+    #[test]
+    fn every_password_byte_is_checked() {
+        for sent in [
+            Password::Four([1, 2, 3, 4]),
+            Password::Six([1, 2, 3, 4, 5, 6]),
+        ] {
+            let bytes = MagicPacket::with_password(MAC, sent).to_bytes();
+            assert!(wakes(&bytes, MAC, Some(&sent)));
+            for i in 0..sent.as_bytes().len() {
+                let mut wrong = sent.as_bytes().to_vec();
+                wrong[i] ^= 0x80;
+                let wrong = Password::from_bytes(&wrong).unwrap();
+                assert!(!wakes(&bytes, MAC, Some(&wrong)), "byte {i} of {sent:?}");
+            }
+        }
     }
 
     #[test]

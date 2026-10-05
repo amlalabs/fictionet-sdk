@@ -28,6 +28,11 @@
 //! what their metrics are, and whether a password or a digest is right are
 //! up to world code. The authentication data is kept as bytes.
 //!
+//! [`Message::parse`] and [`NgMessage::parse`] fail on the first bad entry.
+//! A router does not: it skips the entry and reads the rest (RFC 2453
+//! 3.9.2, RFC 2080 2.4.2). [`Message::receive`] and [`NgMessage::receive`]
+//! read that way, and say which entries they skipped.
+//!
 //! Every reader checks the command, version, family, metric, mask, prefix
 //! length, entry count and lengths, because the agent can send any bytes it
 //! likes. A version 1 message whose must-be-zero fields are not zero is
@@ -35,8 +40,10 @@
 //! field and the reserved fields of the authentication and next hop entries
 //! are ignored when read and written as zero. So are the fields of a
 //! whole-table entry other than its family (or prefix and prefix length)
-//! and metric. Writers check the same rules as readers, so bytes they
-//! return always read back.
+//! and metric. A RIPng next hop that is not link-local is read as `::`, as
+//! RFC 2080 says. Writers check the same rules as readers, so bytes they
+//! return always read back, and keep a RIP message within
+//! [`MAX_DATAGRAM`] bytes.
 //!
 //! ```
 //! use std::net::Ipv4Addr;
@@ -99,6 +106,12 @@ pub const MAX_AUTH_DATA: usize = 255;
 pub const TRAILER_HEADER_LEN: usize = 4;
 /// The longest RIP message: the most entries, then the longest trailer.
 pub const MAX_MESSAGE: usize = HEADER_LEN + MAX_ENTRIES * ENTRY_LEN + TRAILER_HEADER_LEN + MAX_AUTH_DATA;
+/// The longest RIP message a writer returns: RFC 1058 3.1 limits a
+/// datagram to 512 bytes. RFC 4822 does not say whether its trailer counts.
+/// FRRouting counts it, and drops longer datagrams, so with a 16-byte
+/// digest a message holds at most 23 routes. Readers accept up to
+/// [`MAX_MESSAGE`].
+pub const MAX_DATAGRAM: usize = 512;
 /// The longest UDP payload, which bounds a RIPng message.
 pub const MAX_UDP_PAYLOAD: usize = 65527;
 /// The most entries a RIPng message holds: as many as fit in the longest
@@ -218,7 +231,9 @@ pub struct Crypto {
     /// A number the sender never lets go down, to stop replays.
     pub sequence: u32,
     /// The authentication data from the trailer, at most
-    /// [`MAX_AUTH_DATA`] bytes.
+    /// [`MAX_AUTH_DATA`] bytes. The digest covers the message as received,
+    /// so check it against the payload (or [`Decoder::bytes`]), not
+    /// against [`Message::to_bytes`], which writes ignored fields as zero.
     pub data: Vec<u8>,
 }
 
@@ -338,7 +353,8 @@ pub enum RipError {
     /// The message has no entries.
     NoEntries,
     /// The message has more than [`MAX_ENTRIES`] (RIP) or
-    /// [`MAX_NG_ENTRIES`] (RIPng) entries.
+    /// [`MAX_NG_ENTRIES`] (RIPng) entries. A writer also gives it for a RIP
+    /// message, trailer included, longer than [`MAX_DATAGRAM`].
     TooManyEntries,
     /// A message that would read back as a different message, such as an
     /// [`Auth::Other`] with a type this module reads as another variant.
@@ -381,16 +397,29 @@ impl Message {
 
     /// Reads a message: a whole UDP payload.
     pub fn parse(b: &[u8]) -> Result<Message, RipError> {
-        match scan_rip(b, true)? {
-            Some(m) => Ok(m),
-            // A complete scan always gives a message.
-            None => Err(RipError::Truncated),
-        }
+        Scan::default().finish(b).map(|(m, _)| m)
+    }
+
+    /// Reads a message as a receiving router does. An entry with an
+    /// address family this module does not know, a mask that is not
+    /// contiguous, or a metric out of range is skipped, and the rest of the
+    /// message is read (RFC 1058 3.4 and 3.4.2, RFC 2453 3.9.2). A version
+    /// above 2 is read as version 2, its unused fields ignored (RFC 1058
+    /// 3.4, RFC 2453 5.1). Any other broken rule fails the whole message, as
+    /// in [`Message::parse`], which this matches on every message that
+    /// passes it. Whether a destination is one a router should accept
+    /// (not 127/8 or multicast, say) is left to world code.
+    pub fn receive(b: &[u8]) -> Result<Received<Message>, RipError> {
+        let scan = Scan { receive: true, ..Scan::default() };
+        scan.finish(b).map(|(message, skipped)| Received { message, skipped })
     }
 
     /// The message's bytes. It fails if the message breaks a rule the
-    /// reader checks, with the error the reader would give, or if it would
-    /// read back as a different message.
+    /// reader checks, with the error the reader would give, if it would
+    /// read back as a different message, or with
+    /// [`RipError::TooManyEntries`] if it is longer than [`MAX_DATAGRAM`].
+    /// Only a message with a cryptographic trailer can be: one with a
+    /// 16-byte digest holds at most 23 routes.
     pub fn to_bytes(&self) -> Result<Vec<u8>, RipError> {
         let routes = match &self.entries {
             Entries::WholeTable => 1,
@@ -456,6 +485,9 @@ impl Message {
         if Message::parse(&out)? != *self {
             return Err(RipError::Unrepresentable);
         }
+        if out.len() > MAX_DATAGRAM {
+            return Err(RipError::TooManyEntries);
+        }
         Ok(out)
     }
 }
@@ -466,45 +498,96 @@ fn contiguous(mask: u32) -> bool {
     inv & inv.wrapping_add(1) == 0
 }
 
-/// Reads a RIP message in byte order. With `complete` false, `b` may be
-/// the start of a message: it returns `Ok(None)` unless the bytes so far
-/// break a rule. Every check that fails on a prefix fails the same way on
-/// any longer message, so a decoder can stop early.
-fn scan_rip(b: &[u8], complete: bool) -> Result<Option<Message>, RipError> {
-    let short = |complete: bool| if complete { Err(RipError::Truncated) } else { Ok(None) };
-    let Some(&c) = b.first() else { return short(complete) };
-    let command = Command::from_code(c)?;
-    let Some(&v) = b.get(1) else { return short(complete) };
-    let version = match v {
-        1 => Version::V1,
-        2 => Version::V2,
-        _ => return Err(RipError::Version(v)),
-    };
-    if b.len() < HEADER_LEN {
-        // Version 1's must-be-zero bytes are checked one at a time.
-        if version == Version::V1 && b.get(2).is_some_and(|&x| x != 0) {
-            return Err(RipError::MustBeZero { offset: 2 });
+/// The state of a RIP scan: how far the bytes have been checked, and what
+/// they hold so far. Each byte is checked once, however the bytes come.
+#[derive(Clone, Debug, Default)]
+struct Scan {
+    /// Whether to read as a receiving router does: skip bad entries and
+    /// read a version above 2 as version 2.
+    receive: bool,
+    /// The command and version, once the header is read.
+    head: Option<(Command, Version)>,
+    auth: Option<Auth>,
+    routes: Vec<RouteEntry>,
+    /// The entries skipped, in receive mode.
+    skipped: Vec<RipError>,
+    whole: bool,
+    /// Where the entries end, when a cryptographic entry says so.
+    entries_end: Option<usize>,
+    /// How many entries have been read.
+    entry: usize,
+}
+
+impl Scan {
+    /// Reads `b`, the bytes so far, from where the last call stopped. It
+    /// fails only on a rule the bytes so far break. Every check that fails
+    /// on a prefix fails the same way on any longer message, so a decoder
+    /// can stop early.
+    fn advance(&mut self, b: &[u8]) -> Result<(), RipError> {
+        let (command, version) = match self.head {
+            Some(h) => h,
+            None => {
+                let Some(&c) = b.first() else { return Ok(()) };
+                let command = Command::from_code(c)?;
+                let Some(&v) = b.get(1) else { return Ok(()) };
+                let version = match v {
+                    1 => Version::V1,
+                    2 => Version::V2,
+                    // RFC 1058 3.4: a version above 1 is read for the
+                    // fields this module knows.
+                    3.. if self.receive => Version::V2,
+                    _ => return Err(RipError::Version(v)),
+                };
+                if b.len() < HEADER_LEN {
+                    // Version 1's must-be-zero bytes are checked one at a
+                    // time.
+                    if version == Version::V1 && b.get(2).is_some_and(|&x| x != 0) {
+                        return Err(RipError::MustBeZero { offset: 2 });
+                    }
+                    return Ok(());
+                }
+                if version == Version::V1 && (b[2] != 0 || b[3] != 0) {
+                    return Err(RipError::MustBeZero { offset: 2 });
+                }
+                self.head = Some((command, version));
+                (command, version)
+            }
+        };
+        loop {
+            let at = HEADER_LEN + self.entry * ENTRY_LEN;
+            if self.entries_end.is_some_and(|end| at >= end) {
+                break;
+            }
+            let Some(e) = b.get(at..at + ENTRY_LEN) else { break };
+            if self.entry >= MAX_ENTRIES {
+                return Err(RipError::TooManyEntries);
+            }
+            if let Err(err) = self.entry_at(command, version, at, e) {
+                let skippable =
+                    matches!(err, RipError::Family { .. } | RipError::Mask { .. } | RipError::Metric { .. });
+                if !(self.receive && skippable) {
+                    return Err(err);
+                }
+                self.skipped.push(err);
+            }
+            self.entry += 1;
         }
-        return short(complete);
+        if let Some(end) = self.entries_end {
+            if let Some(h) = b.get(end..end + TRAILER_HEADER_LEN)
+                && h != [0xff, 0xff, 0, 1]
+            {
+                return Err(RipError::Trailer);
+            }
+            if b.len().saturating_sub(end + TRAILER_HEADER_LEN) > MAX_AUTH_DATA {
+                return Err(RipError::AuthDataTooLong);
+            }
+        }
+        Ok(())
     }
-    if version == Version::V1 && (b[2] != 0 || b[3] != 0) {
-        return Err(RipError::MustBeZero { offset: 2 });
-    }
-    let mut auth: Option<Auth> = None;
-    let mut routes = Vec::new();
-    let mut whole = false;
-    // Where the entries end, when a cryptographic entry says so.
-    let mut entries_end: Option<usize> = None;
-    let mut entry = 0;
-    let mut at = HEADER_LEN;
-    loop {
-        if entries_end.is_some_and(|end| at >= end) {
-            break;
-        }
-        let Some(e) = b.get(at..at + ENTRY_LEN) else { break };
-        if entry >= MAX_ENTRIES {
-            return Err(RipError::TooManyEntries);
-        }
+
+    /// Reads entry number `self.entry`, the 20 bytes `e` at offset `at`.
+    fn entry_at(&mut self, command: Command, version: Version, at: usize, e: &[u8]) -> Result<(), RipError> {
+        let entry = self.entry;
         let fam = be16(e, 0);
         if version == Version::V1 && (fam == family::WHOLE_TABLE || fam == family::INET) {
             for (off, len) in [(2, 2), (8, 4), (12, 4)] {
@@ -521,7 +604,7 @@ fn scan_rip(b: &[u8], complete: bool) -> Result<Option<Message>, RipError> {
                 let kind = be16(e, 2);
                 let mut data = [0u8; 16];
                 data.copy_from_slice(&e[4..20]);
-                auth = Some(match kind {
+                self.auth = Some(match kind {
                     auth_type::PASSWORD => Auth::Password(data),
                     auth_type::CRYPTO => {
                         let packet_len = be16(e, 4);
@@ -532,7 +615,7 @@ fn scan_rip(b: &[u8], complete: bool) -> Result<Option<Message>, RipError> {
                         if !ok {
                             return Err(RipError::PacketLength(packet_len));
                         }
-                        entries_end = Some(n);
+                        self.entries_end = Some(n);
                         Auth::Crypto(Crypto { key_id: e[6], data_len: e[7], sequence: be32(e, 8), data: Vec::new() })
                     }
                     _ => Auth::Other { kind, data },
@@ -540,19 +623,19 @@ fn scan_rip(b: &[u8], complete: bool) -> Result<Option<Message>, RipError> {
             }
             family::WHOLE_TABLE => {
                 // RFC 2453 names only the family and the metric, so the
-                // other fields are ignored.
-                if command != Command::Request || whole || !routes.is_empty() || be32(e, 16) != u32::from(INFINITY) {
+                // other fields are ignored. It must be the first entry
+                // after any authentication entry.
+                let first = entry == usize::from(self.auth.is_some());
+                if command != Command::Request || self.whole || !first || be32(e, 16) != u32::from(INFINITY) {
                     return Err(RipError::WholeTable { entry });
                 }
-                whole = true;
+                self.whole = true;
             }
             family::INET => {
-                if whole {
+                if self.whole {
                     return Err(RipError::WholeTable { entry });
                 }
-                let tag = be16(e, 2);
                 let mask = be32(e, 8);
-                let next_hop = be32(e, 12);
                 if !contiguous(mask) {
                     return Err(RipError::Mask { entry });
                 }
@@ -560,64 +643,70 @@ fn scan_rip(b: &[u8], complete: bool) -> Result<Option<Message>, RipError> {
                 if !command.allows_metric(metric) {
                     return Err(RipError::Metric { entry, metric });
                 }
-                routes.push(RouteEntry {
-                    tag,
+                self.routes.push(RouteEntry {
+                    tag: be16(e, 2),
                     address: Ipv4Addr::from(be32(e, 4)),
                     mask: Ipv4Addr::from(mask),
-                    next_hop: Ipv4Addr::from(next_hop),
+                    next_hop: Ipv4Addr::from(be32(e, 12)),
                     // Checked above to be at most 16.
                     metric: metric as u8,
                 });
             }
             _ => return Err(RipError::Family { entry, family: fam }),
         }
-        entry += 1;
-        at += ENTRY_LEN;
+        Ok(())
     }
-    if let Some(end) = entries_end {
-        if let Some(h) = b.get(end..end + TRAILER_HEADER_LEN)
-            && h != [0xff, 0xff, 0, 1] {
-                return Err(RipError::Trailer);
+
+    /// The message, once `b` holds all its bytes. `b` starts with the bytes
+    /// already given to [`Scan::advance`].
+    fn finish(mut self, b: &[u8]) -> Result<(Message, Vec<RipError>), RipError> {
+        self.advance(b)?;
+        let Some((command, version)) = self.head else { return Err(RipError::Truncated) };
+        let mut auth = self.auth;
+        if let Some(end) = self.entries_end {
+            if b.len() < end + TRAILER_HEADER_LEN {
+                return Err(RipError::Truncated);
             }
-        let data = b.get(end + TRAILER_HEADER_LEN..).unwrap_or(&[]);
-        if data.len() > MAX_AUTH_DATA {
-            return Err(RipError::AuthDataTooLong);
-        }
-        if !complete {
-            return Ok(None);
-        }
-        if b.len() < end + TRAILER_HEADER_LEN {
+            let data = &b[end + TRAILER_HEADER_LEN..];
+            if let Some(Auth::Crypto(c)) = &mut auth {
+                let declared = usize::from(c.data_len);
+                if declared != data.len() && declared != data.len() + TRAILER_HEADER_LEN {
+                    return Err(RipError::AuthDataLen { declared: c.data_len, actual: data.len() });
+                }
+                c.data = data.to_vec();
+            }
+        } else if HEADER_LEN + self.entry * ENTRY_LEN != b.len() {
             return Err(RipError::Truncated);
         }
-        if let Some(Auth::Crypto(c)) = &mut auth {
-            let declared = usize::from(c.data_len);
-            if declared != data.len() && declared != data.len() + TRAILER_HEADER_LEN {
-                return Err(RipError::AuthDataLen { declared: c.data_len, actual: data.len() });
-            }
-            c.data = data.to_vec();
+        if self.entry == 0 {
+            return Err(RipError::NoEntries);
         }
-    } else {
-        if !complete {
-            return Ok(None);
-        }
-        if at != b.len() {
-            return Err(RipError::Truncated);
-        }
+        let entries = if self.whole { Entries::WholeTable } else { Entries::Routes(self.routes) };
+        Ok((Message { command, version, auth, entries }, self.skipped))
     }
-    if entry == 0 {
-        return Err(RipError::NoEntries);
-    }
-    let entries = if whole { Entries::WholeTable } else { Entries::Routes(routes) };
-    Ok(Some(Message { command, version, auth, entries }))
+}
+
+/// A message read as a receiving router reads it, with the entries it
+/// skipped. See [`Message::receive`] and [`NgMessage::receive`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Received<M> {
+    /// The message, without the entries skipped. Its routes may be empty
+    /// even with no authentication entry, so [`Message::to_bytes`] or
+    /// [`NgMessage::to_bytes`] may fail on it with [`RipError::NoEntries`].
+    pub message: M,
+    /// Why each skipped entry was skipped, in order. Each error names its
+    /// entry, counted as on the wire.
+    pub skipped: Vec<RipError>,
 }
 
 /// Reads one RIP message that comes in pieces. Feed it the bytes in order,
 /// then call [`Decoder::finish`]. It fails as soon as the bytes show a bad
 /// field or run past the longest message. It holds at most
-/// [`MAX_MESSAGE`] plus one bytes.
+/// [`MAX_MESSAGE`] plus one bytes, and checks each byte once.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
+    scan: Scan,
     failed: Option<RipError>,
 }
 
@@ -638,13 +727,13 @@ impl Decoder {
         // past that are never needed.
         let room = (MAX_MESSAGE + 1).saturating_sub(self.buf.len());
         self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        match scan_rip(&self.buf, false) {
+        match self.scan.advance(&self.buf) {
             Err(e) => {
                 self.failed = Some(e);
                 self.buf = Vec::new();
                 Err(e)
             }
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
         }
     }
 
@@ -653,12 +742,19 @@ impl Decoder {
         self.buf.len()
     }
 
+    /// The bytes held, as fed. A digest or password is checked against
+    /// these, not against [`Message::to_bytes`], which writes ignored
+    /// fields as zero. They are empty once the decoder has failed.
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
     /// The message, when no more bytes will come. It gives the same result
     /// as [`Message::parse`] on all the bytes fed.
     pub fn finish(self) -> Result<Message, RipError> {
         match self.failed {
             Some(e) => Err(e),
-            None => Message::parse(&self.buf),
+            None => self.scan.finish(&self.buf).map(|(m, _)| m),
         }
     }
 }
@@ -683,8 +779,12 @@ pub enum NgEntry {
     /// A route.
     Route(NgRoute),
     /// A next hop for the routes after it, up to the next next hop entry.
-    /// `::` means the router that sent the message. On the wire its metric
-    /// is [`NEXT_HOP_METRIC`] and its tag and prefix length are zero.
+    /// `::` means the router that sent the message. It is always `::` or a
+    /// link-local address (`fe80::/10`): RFC 2080 2.1.1 says a received
+    /// next hop that is not link-local is read as `::`, and readers do so.
+    /// A writer fails with [`RipError::Unrepresentable`] on any other
+    /// address. On the wire its metric is [`NEXT_HOP_METRIC`] and its tag
+    /// and prefix length are zero.
     NextHop(Ipv6Addr),
 }
 
@@ -721,7 +821,20 @@ impl NgMessage {
 
     /// Reads a message: a whole UDP payload.
     pub fn parse(b: &[u8]) -> Result<NgMessage, RipError> {
-        scan_ng(b)
+        scan_ng(b, None)
+    }
+
+    /// Reads a message as a receiving router does: a route with a prefix
+    /// length above 128 or a metric out of range is skipped, and the rest
+    /// of the message is read (RFC 2080 2.4.2). Any other broken rule fails
+    /// the whole message, as in [`NgMessage::parse`], which this matches on
+    /// every message that passes it. Whether a prefix is one a router
+    /// should accept (not multicast or link-local, say) is left to world
+    /// code.
+    pub fn receive(b: &[u8]) -> Result<Received<NgMessage>, RipError> {
+        let mut skipped = Vec::new();
+        let message = scan_ng(b, Some(&mut skipped))?;
+        Ok(Received { message, skipped })
     }
 
     /// The message's bytes. It fails if the message breaks a rule the
@@ -785,7 +898,10 @@ fn ng_entry(command: Command, entry: usize, e: &[u8]) -> Result<NgEntry, RipErro
     let prefix = Ipv6Addr::from(a);
     let metric = e[19];
     if metric == NEXT_HOP_METRIC {
-        return Ok(NgEntry::NextHop(prefix));
+        // RFC 2080 2.1.1: a next hop that is not link-local means the
+        // sender, as :: does.
+        let link_local = prefix.segments()[0] & 0xffc0 == 0xfe80;
+        return Ok(NgEntry::NextHop(if link_local { prefix } else { Ipv6Addr::UNSPECIFIED }));
     }
     let prefix_len = e[18];
     if prefix_len > MAX_PREFIX_LEN {
@@ -804,22 +920,35 @@ fn is_whole_table_ng(r: NgRoute) -> bool {
 }
 
 /// Reads a whole RIPng message, checking it in byte order, so the first
-/// rule a prefix breaks is the first rule the whole message breaks.
-fn scan_ng(b: &[u8]) -> Result<NgMessage, RipError> {
+/// rule a prefix breaks is the first rule the whole message breaks. With
+/// `skip`, a route with a bad prefix length or metric is left out and its
+/// error added there instead.
+fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<RipError>>) -> Result<NgMessage, RipError> {
     let Some(command) = ng_header(b)? else { return Err(RipError::Truncated) };
     let mut entries = Vec::new();
+    let mut count = 0;
     let mut at = HEADER_LEN;
     while let Some(e) = b.get(at..at + ENTRY_LEN) {
-        entries.push(ng_entry(command, entries.len(), e)?);
+        match ng_entry(command, count, e) {
+            Ok(entry) => entries.push(entry),
+            Err(err @ (RipError::PrefixLength { .. } | RipError::Metric { .. })) if skip.is_some() => {
+                if let Some(s) = skip.as_mut() {
+                    s.push(err);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+        count += 1;
         at += ENTRY_LEN;
     }
     if at != b.len() {
         return Err(RipError::Truncated);
     }
-    if entries.is_empty() {
+    if count == 0 {
         return Err(RipError::NoEntries);
     }
-    let whole = command == Command::Request && matches!(entries[..], [NgEntry::Route(r)] if is_whole_table_ng(r));
+    let whole =
+        command == Command::Request && count == 1 && matches!(entries[..], [NgEntry::Route(r)] if is_whole_table_ng(r));
     let entries = if whole { NgEntries::WholeTable } else { NgEntries::Entries(entries) };
     Ok(NgMessage { command, entries })
 }
@@ -966,8 +1095,23 @@ mod tests {
         assert_eq!(decode_chunked(b, 1), p);
         assert_eq!(decode_chunked(b, 7), p);
         if let Ok(m) = &p {
-            let out = m.to_bytes().unwrap();
-            assert_eq!(Message::parse(&out).as_ref(), Ok(m));
+            // Reading as a router does agrees on every message parse takes.
+            assert_eq!(Message::receive(b), Ok(Received { message: m.clone(), skipped: vec![] }));
+            if b.len() > MAX_DATAGRAM {
+                assert_eq!(m.to_bytes(), Err(RipError::TooManyEntries));
+            } else {
+                let out = m.to_bytes().unwrap();
+                assert_eq!(out.len(), b.len());
+                assert_eq!(Message::parse(&out).as_ref(), Ok(m));
+            }
+        }
+        if let Ok(r) = Message::receive(b) {
+            assert!(r.skipped.len() <= MAX_ENTRIES);
+            if let Entries::Routes(routes) = &r.message.entries {
+                for x in routes {
+                    assert!(r.message.command.allows_metric(u32::from(x.metric)) && contiguous(u32::from(x.mask)));
+                }
+            }
         }
         p
     }
@@ -978,9 +1122,24 @@ mod tests {
         assert_eq!(ng_decode_chunked(b, 1), p);
         assert_eq!(ng_decode_chunked(b, 13), p);
         if let Ok(m) = &p {
+            assert_eq!(NgMessage::receive(b), Ok(Received { message: m.clone(), skipped: vec![] }));
             let out = m.to_bytes().unwrap();
+            assert_eq!(out.len(), b.len());
             assert_eq!(NgMessage::parse(&out).as_ref(), Ok(m));
         }
+        if let Ok(r) = NgMessage::receive(b)
+            && let NgEntries::Entries(es) = &r.message.entries {
+                for e in es {
+                    match e {
+                        NgEntry::NextHop(a) => assert!(a.is_unspecified() || a.segments()[0] & 0xffc0 == 0xfe80),
+                        NgEntry::Route(x) => {
+                            assert!(
+                                x.prefix_len <= MAX_PREFIX_LEN && r.message.command.allows_metric(u32::from(x.metric))
+                            )
+                        }
+                    }
+                }
+            }
         p
     }
 
@@ -1460,6 +1619,171 @@ mod tests {
         assert_eq!(MAX_NG_ENTRIES, 3276);
     }
 
+    fn route_bytes(metric: u32) -> Vec<u8> {
+        v2_entry(0, [10, 0, 0, 0], [255, 0, 0, 0], [0; 4], metric)
+    }
+
+    #[test]
+    fn receive_skips_bad_entries() {
+        // RFC 2453 3.9.2: a bad entry is skipped, and the rest are read.
+        let a = route_bytes(1);
+        let bad_metric = route_bytes(17);
+        let bad_family = [vec![0, 7], a[2..].to_vec()].concat();
+        let bad_mask = v2_entry(0, [10, 0, 0, 0], [255, 0, 255, 0], [0; 4], 1);
+        let b2 = v2_entry(0, [10, 2, 0, 0], [255, 255, 0, 0], [0; 4], 2);
+        let b = msg(2, 2, &[a.clone(), bad_metric, bad_family, bad_mask, b2.clone()]);
+        assert_eq!(check(&b), Err(RipError::Metric { entry: 1, metric: 17 }));
+        let r = Message::receive(&b).unwrap();
+        assert_eq!(
+            r.skipped,
+            vec![
+                RipError::Metric { entry: 1, metric: 17 },
+                RipError::Family { entry: 2, family: 7 },
+                RipError::Mask { entry: 3 },
+            ]
+        );
+        let good = Message::parse(&msg(2, 2, &[a.clone(), b2])).unwrap();
+        assert_eq!(r.message, good);
+        // A version 1 message skips an authentication entry, a family it
+        // does not know.
+        let v1 = v2_entry(0, [10, 0, 0, 0], [0; 4], [0; 4], 1);
+        let mut pw = vec![0xff, 0xff, 0, 2];
+        pw.extend_from_slice(&[0; 16]);
+        let r = Message::receive(&msg(2, 1, &[pw, v1.clone()])).unwrap();
+        assert_eq!(r.skipped, vec![RipError::Family { entry: 0, family: 0xffff }]);
+        assert_eq!(r.message, Message::parse(&msg(2, 1, &[v1])).unwrap());
+        // Every entry skipped leaves no routes.
+        let r = Message::receive(&msg(2, 2, &[route_bytes(0)])).unwrap();
+        assert_eq!(r.message.entries, Entries::Routes(vec![]));
+        assert_eq!(r.message.to_bytes(), Err(RipError::NoEntries));
+        // Rules about the message as a whole still fail it.
+        assert_eq!(Message::receive(&msg(2, 2, &[a.clone(), a[..10].to_vec()])), Err(RipError::Truncated));
+        assert_eq!(Message::receive(&msg(2, 2, &[whole_table_entry()])), Err(RipError::WholeTable { entry: 0 }));
+        assert_eq!(Message::receive(&msg(2, 1, &[route_bytes(1)])), Err(RipError::MustBeZero { offset: 12 }));
+        // RFC 2080 2.4.2: the same for RIPng.
+        let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
+        let ok = ng_entry_bytes(doc, 0, 32, 1);
+        let b = msg(2, 1, &[ok.clone(), ng_entry_bytes(doc, 0, 129, 1), ng_entry_bytes(doc, 0, 32, 17), ok.clone()]);
+        assert_eq!(ng_check(&b), Err(RipError::PrefixLength { entry: 1, len: 129 }));
+        let r = NgMessage::receive(&b).unwrap();
+        assert_eq!(
+            r.skipped,
+            vec![RipError::PrefixLength { entry: 1, len: 129 }, RipError::Metric { entry: 2, metric: 17 }]
+        );
+        assert_eq!(r.message, NgMessage::parse(&msg(2, 1, &[ok.clone(), ok])).unwrap());
+        // A request whose only good entry is ::/0 with metric 16, after one
+        // that was skipped, is not a whole-table request.
+        let wt = ng_entry_bytes(Ipv6Addr::UNSPECIFIED, 0, 0, 16);
+        let r = NgMessage::receive(&msg(1, 1, &[ng_entry_bytes(doc, 0, 200, 1), wt])).unwrap();
+        assert!(matches!(r.message.entries, NgEntries::Entries(_)));
+    }
+
+    #[test]
+    fn receive_reads_later_versions_as_2() {
+        // RFC 1058 3.4 and RFC 2453 5.1: a version above 1 is read for the
+        // fields known; version 0 is not.
+        let mut b = samples()[4].clone();
+        b[1] = 3;
+        b[2] = 9;
+        assert_eq!(check(&b), Err(RipError::Version(3)));
+        let r = Message::receive(&b).unwrap();
+        assert_eq!(r.message, Message::parse(&samples()[4]).unwrap());
+        b[1] = 0;
+        assert_eq!(Message::receive(&b), Err(RipError::Version(0)));
+    }
+
+    #[test]
+    fn ripng_next_hop_must_be_link_local() {
+        // RFC 2080 2.1.1: a next hop that is not link-local is read as ::.
+        let doc: Ipv6Addr = "2001:db8::".parse().unwrap();
+        let global: Ipv6Addr = "2001:db8::1".parse().unwrap();
+        let route = NgRoute { prefix: doc, tag: 0, prefix_len: 32, metric: 1 };
+        let b = msg(2, 1, &[ng_entry_bytes(global, 0, 0, 0xff), ng_entry_bytes(doc, 0, 32, 1)]);
+        let m = ng_check(&b).unwrap();
+        assert_eq!(m.entries, NgEntries::Entries(vec![NgEntry::NextHop(Ipv6Addr::UNSPECIFIED), NgEntry::Route(route)]));
+        // A writer does not send one.
+        let w = NgMessage {
+            command: Command::Response,
+            entries: NgEntries::Entries(vec![NgEntry::NextHop(global), NgEntry::Route(route)]),
+        };
+        assert_eq!(w.to_bytes(), Err(RipError::Unrepresentable));
+        // The edges of fe80::/10.
+        for (a, kept) in [("fe80::1", true), ("febf:ffff::1", true), ("fec0::1", false), ("ff02::9", false)] {
+            let a: Ipv6Addr = a.parse().unwrap();
+            let m = ng_check(&msg(2, 1, &[ng_entry_bytes(a, 0, 0, 0xff), ng_entry_bytes(doc, 0, 32, 1)])).unwrap();
+            let want = if kept { a } else { Ipv6Addr::UNSPECIFIED };
+            assert_eq!(m.entries, NgEntries::Entries(vec![NgEntry::NextHop(want), NgEntry::Route(route)]), "{a}");
+        }
+    }
+
+    #[test]
+    fn writers_stay_within_512_bytes() {
+        // FRRouting drops a RIP datagram over 512 bytes. With a 16-byte
+        // digest, 23 routes fit and 24 do not.
+        let route = RouteEntry {
+            tag: 0,
+            address: ip4(10, 0, 0, 0),
+            mask: ip4(255, 0, 0, 0),
+            next_hop: Ipv4Addr::UNSPECIFIED,
+            metric: 1,
+        };
+        let crypto = |n: usize| Message {
+            command: Command::Response,
+            version: Version::V2,
+            auth: Some(Auth::Crypto(Crypto { key_id: 1, data_len: 16, sequence: 1, data: vec![9; 16] })),
+            entries: Entries::Routes(vec![route; n]),
+        };
+        let b = crypto(23).to_bytes().unwrap();
+        assert_eq!(b.len(), 504);
+        assert_eq!(check(&b), Ok(crypto(23)));
+        assert_eq!(crypto(24).to_bytes(), Err(RipError::TooManyEntries));
+        // A 524-byte message still reads, but is not written back.
+        let mut wire = vec![2, 2, 0, 0, 0xff, 0xff, 0, 3];
+        wire.extend_from_slice(&504u16.to_be_bytes());
+        wire.extend_from_slice(&[1, 16, 0, 0, 0, 1]);
+        wire.extend_from_slice(&[0; 8]);
+        for _ in 0..24 {
+            wire.extend_from_slice(&route_bytes(1));
+        }
+        wire.extend_from_slice(&[0xff, 0xff, 0, 1]);
+        wire.extend_from_slice(&[9; 16]);
+        assert_eq!(wire.len(), 524);
+        assert_eq!(check(&wire), Ok(crypto(24)));
+        // Without a trailer, 25 entries are 504 bytes.
+        let plain = Message { auth: Some(Auth::Password([0; 16])), ..crypto(24) };
+        assert_eq!(plain.to_bytes().unwrap().len(), 504);
+    }
+
+    #[test]
+    fn decoder_keeps_the_bytes_as_received() {
+        // A digest covers the bytes as sent, ignored fields included.
+        let mut b = crypto_message(16, &[0xab; 16]);
+        b[2] = 0x55;
+        b[16] = 1;
+        let mut d = Decoder::new();
+        for x in &b {
+            d.feed(std::slice::from_ref(x)).unwrap();
+        }
+        assert_eq!(d.bytes(), &b[..]);
+        let m = d.finish().unwrap();
+        assert_ne!(m.to_bytes().unwrap(), b);
+    }
+
+    #[test]
+    fn decoder_reads_each_entry_once() {
+        // Fed a byte at a time, the decoder checks each entry once, so the
+        // routes it holds grow one at a time.
+        let b = msg(2, 2, &vec![route_bytes(1); MAX_ENTRIES]);
+        let mut d = Decoder::new();
+        for (i, x) in b.iter().enumerate() {
+            d.feed(std::slice::from_ref(x)).unwrap();
+            let done = (i + 1).saturating_sub(HEADER_LEN) / ENTRY_LEN;
+            assert_eq!(d.scan.entry, done);
+            assert_eq!(d.scan.routes.len(), done);
+        }
+        assert_eq!(d.finish(), Message::parse(&b));
+    }
+
     struct Lcg(u64);
 
     impl Lcg {
@@ -1587,6 +1911,7 @@ mod tests {
             };
             let m = Message { command, version, auth, entries };
             if let Ok(b) = m.to_bytes() {
+                assert!(b.len() <= MAX_DATAGRAM);
                 assert_eq!(check(&b), Ok(m));
             }
             let ng_entries = if rng.below(6) == 0 {

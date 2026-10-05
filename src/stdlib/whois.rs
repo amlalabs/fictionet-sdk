@@ -96,28 +96,63 @@ pub const MAX_HOST: usize = 253;
 pub const CONTINUATION_INDENT: &str = "        ";
 
 /// Flags in the style of the RIPE database that take the word after them
-/// as an argument, such as `-T inetnum`, and DENIC's `-C`, which names a
-/// character set, as in `-T dn,ace -C UTF-8 example.de`. [`Query::flags`]
-/// uses this list.
+/// as an argument, such as `-T inetnum`. [`Query::flags`] uses this list.
+///
+/// `-C` is not in it. The RIPE database reads `-C` (`--no-irt`) on its
+/// own, while DENIC reads `-C` with a character set, as in
+/// `-T dn,ace -C UTF-8 example.de`. So `-C` takes the next word only when
+/// that word is one of DENIC's character sets: `UTF-8`, `ISO-8859-1` or
+/// `US-ASCII`, in any case.
 pub const FLAGS_WITH_ARGUMENT: &[&str] = &[
-    "-C",
     "-i",
     "-T",
     "-s",
+    "-S",
     "-t",
     "-v",
     "-q",
     "-V",
     "-g",
+    "-Z",
     "--inverse",
     "--select-types",
     "--sources",
+    "--resources",
     "--template",
     "--verbose",
     "--client",
     "--show-version",
     "--diff-versions",
+    "--charset",
 ];
+
+/// The character sets DENIC's `-C` takes. See [`FLAGS_WITH_ARGUMENT`].
+const DENIC_CHARSETS: &[&str] = &["UTF-8", "ISO-8859-1", "US-ASCII"];
+
+/// Whether flag word `w` takes the next word as its argument. A word of
+/// short flags grouped together, such as `-Bi`, reads as getopt reads it:
+/// the first flag in it that takes an argument takes the rest of the word,
+/// or the next word if it is last.
+fn takes_next_word(w: &str, next: &str) -> bool {
+    if FLAGS_WITH_ARGUMENT.contains(&w) {
+        return true;
+    }
+    if w == "-C" {
+        return DENIC_CHARSETS.iter().any(|c| c.eq_ignore_ascii_case(next));
+    }
+    let Some(group) = w.strip_prefix('-') else { return false };
+    if group.starts_with('-') {
+        return false;
+    }
+    let mut chars = group.chars();
+    while let Some(c) = chars.next() {
+        let wants = FLAGS_WITH_ARGUMENT.iter().any(|f| f.strip_prefix('-').is_some_and(|r| r.chars().eq([c])));
+        if wants {
+            return chars.as_str().is_empty();
+        }
+    }
+    false
+}
 
 /// Why a query line was refused, by a reader or a writer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -167,9 +202,10 @@ pub enum EncodeError {
     /// More than [`MAX_FIELDS`] fields, or more than [`MAX_RESPONSE`]
     /// bytes.
     TooLong,
-    /// A referral host that is empty, longer than [`MAX_HOST`], or holds
-    /// anything but lowercase ASCII letters, digits, `.`, `-` and `_`, or
-    /// starts with `.` or `-`.
+    /// A referral host that is empty, longer than [`MAX_HOST`], or neither
+    /// an IPv6 address in lowercase nor a name of lowercase ASCII letters,
+    /// digits, `.`, `-` and `_` that does not start with `-` and whose
+    /// labels are 1 to 63 bytes, with an optional `.` at the end.
     Host,
     /// A referral to port 0.
     Port,
@@ -216,7 +252,8 @@ pub struct Query {
 pub struct Flag<'a> {
     /// The flag itself, with its dashes.
     pub name: &'a str,
-    /// The word after the flag, for flags in [`FLAGS_WITH_ARGUMENT`].
+    /// The word after the flag, for flags that take one. See
+    /// [`Query::flags`].
     pub argument: Option<&'a str>,
 }
 
@@ -284,7 +321,11 @@ impl Query {
 
     /// The flags at the start of the query: each word that starts with a
     /// dash and has more after it, up to the first word that does not.
-    /// A flag in [`FLAGS_WITH_ARGUMENT`] takes the next word with it.
+    /// A flag in [`FLAGS_WITH_ARGUMENT`] takes the next word with it, and
+    /// so does a group of short flags in one word, such as `-Bi`, that
+    /// ends with one. A group with such a flag inside, such as `-Tinetnum`,
+    /// holds its argument and stays one [`Flag`] with no `argument`. Flags
+    /// after the first term are part of the terms.
     pub fn flags(&self) -> Vec<Flag<'_>> {
         self.split().0
     }
@@ -305,8 +346,8 @@ impl Query {
             }
             i += 1;
             let mut argument = None;
-            if FLAGS_WITH_ARGUMENT.contains(&w)
-                && let Some(&(_, a)) = words.get(i)
+            if let Some(&(_, a)) = words.get(i)
+                && takes_next_word(w, a)
             {
                 argument = Some(a);
                 i += 1;
@@ -548,9 +589,12 @@ impl Field {
 ///   spaces, so a line indented as deep as the key is a new line.
 /// - A line that starts with `%`, `#` or `>>>`, after its indent, is a
 ///   comment.
-/// - A line with a colon followed by a space, a tab or the line's end is
-///   a field, if the text before that colon is a key: at most [`MAX_KEY`]
-///   bytes, no control characters but tabs, and not starting with `+`.
+/// - A line is a field if the text before its first colon is a key: at
+///   most [`MAX_KEY`] bytes, no control characters but tabs, and not
+///   starting with `+`. The colon must be followed by a space, a tab or
+///   the line's end, unless the key is an RPSL name (RFC 2622, section
+///   2), such as `origin` in `origin:AS3333`, and the colon is not
+///   followed by `//`, as in a URL.
 /// - Any other line is free text and is skipped.
 #[derive(Clone, Debug)]
 pub struct FieldReader<'a> {
@@ -625,19 +669,33 @@ fn is_comment(body: &str) -> bool {
 }
 
 /// The key and value of a line with its indent taken off, if it is a
-/// field.
+/// field. The key is the text before the first colon.
 fn key_line(body: &str) -> Option<(&str, &str)> {
-    let b = body.as_bytes();
-    let colon = (0..b.len()).find(|&i| b[i] == b':' && matches!(b.get(i + 1), None | Some(b' ' | b'\t')))?;
+    let colon = body.find(':')?;
     let key = trim(&body[..colon]);
+    let rest = &body[colon + 1..];
     let ok = !key.is_empty()
         && key.len() <= MAX_KEY
         && !key.starts_with('+')
         && !key.chars().any(|c| c.is_control() && c != '\t');
-    if !ok {
+    // A colon followed by a space, a tab or the end ends any key. Any
+    // other colon ends only an RPSL name, and not before `//`, so a URL
+    // at the start of a line stays free text.
+    let delimited = rest.is_empty() || rest.starts_with([' ', '\t']) || (is_rpsl_name(key) && !rest.starts_with("//"));
+    if !ok || !delimited {
         return None;
     }
-    Some((key, trim(&body[colon + 1..])))
+    Some((key, trim(rest)))
+}
+
+/// Whether `s` is an RPSL name (RFC 2622, section 2): ASCII letters,
+/// digits, `_` and `-`, starting with a letter and ending with a letter or
+/// a digit.
+fn is_rpsl_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    matches!(b.first(), Some(c) if c.is_ascii_alphabetic())
+        && matches!(b.last(), Some(c) if c.is_ascii_alphanumeric())
+        && b.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
 }
 
 /// Takes spaces and tabs off both ends.
@@ -678,23 +736,28 @@ pub fn write_fields(fields: &[Field]) -> Result<String, EncodeError> {
         if f.value.len() > MAX_RESPONSE {
             return Err(EncodeError::TooLong);
         }
-        let lines: Vec<&str> = f.value.split('\n').collect();
-        if lines.len() > 1 && lines[0].is_empty() {
+        let mut lines = f.value.split('\n');
+        let first = lines.next().unwrap_or("");
+        if first.is_empty() && f.value.contains('\n') {
             return Err(EncodeError::Value);
         }
-        for line in &lines {
-            if trim(line) != *line || line.chars().any(|c| c.is_control() && c != '\t') {
+        // The exact bytes this field adds: a blank line before a new
+        // block, the key line, and each further line.
+        let mut need = f.key.len() + 3;
+        if f.block != block {
+            need += 2;
+        }
+        if !first.is_empty() {
+            need += first.len() + 1;
+        }
+        for (i, line) in f.value.split('\n').enumerate() {
+            if trim(line) != line || line.chars().any(|c| c.is_control() && c != '\t') {
                 return Err(EncodeError::Value);
             }
+            if i > 0 {
+                need += if line.is_empty() { 3 } else { CONTINUATION_INDENT.len() + line.len() + 2 };
+            }
         }
-        // The most this field adds: a blank line, the key line, and each
-        // further line with its indent.
-        let need = lines
-            .len()
-            .saturating_mul(CONTINUATION_INDENT.len() + 2)
-            .saturating_add(f.key.len())
-            .saturating_add(f.value.len())
-            .saturating_add(6);
         if out.len().saturating_add(need) > MAX_RESPONSE {
             return Err(EncodeError::TooLong);
         }
@@ -704,12 +767,12 @@ pub fn write_fields(fields: &[Field]) -> Result<String, EncodeError> {
         }
         out.push_str(&f.key);
         out.push(':');
-        if !lines[0].is_empty() {
+        if !first.is_empty() {
             out.push(' ');
-            out.push_str(lines[0]);
+            out.push_str(first);
         }
         out.push_str("\r\n");
-        for line in &lines[1..] {
+        for line in lines {
             if line.is_empty() {
                 out.push('+');
             } else {
@@ -768,7 +831,8 @@ impl ReferralKind {
 pub struct Referral {
     /// The field it came from.
     pub kind: ReferralKind,
-    /// The server's host name or address, in lowercase.
+    /// The server's host name or address, in lowercase. An IPv6 address
+    /// is held without its brackets.
     pub host: String,
     /// The server's port: [`PORT`] unless the referral names another.
     pub port: u16,
@@ -777,6 +841,8 @@ pub struct Referral {
 impl Referral {
     /// The referral in a field, if the field is one. The value may be a
     /// host, a host and port (`host:4343`), or either after `whois://`.
+    /// An IPv6 address is written in brackets, as in `[2001:db8::1]:4343`,
+    /// or bare with no port.
     /// A trailing `/` is dropped. Values with another scheme, such as
     /// ARIN's `rwhois://` or a web address, are not WHOIS referrals and
     /// give `None`. So does an empty value, which some registries send
@@ -792,25 +858,36 @@ impl Referral {
             _ => v,
         };
         let v = v.strip_suffix('/').unwrap_or(v);
-        let (host, port) = match v.split_once(':') {
-            Some((h, p)) => {
-                if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
-                    return None;
-                }
-                match p.parse::<u16>() {
-                    Ok(n) if n != 0 => (h, n),
-                    _ => return None,
-                }
+        let (host, port) = if let Some(rest) = v.strip_prefix('[') {
+            // An IPv6 address in brackets (RFC 3986, section 3.2.2).
+            let (h, after) = rest.split_once(']')?;
+            if !h.contains(':') {
+                return None;
             }
-            None => (v, PORT),
+            match after {
+                "" => (h, PORT),
+                _ => (h, parse_port(after.strip_prefix(':')?)?),
+            }
+        } else if v.matches(':').count() > 1 {
+            // An IPv6 address without brackets, which has no port.
+            (v, PORT)
+        } else {
+            match v.split_once(':') {
+                Some((h, p)) => (h, parse_port(p)?),
+                None => (v, PORT),
+            }
         };
+        if host.len() > MAX_HOST {
+            return None;
+        }
         let host = host.to_ascii_lowercase();
         check_host(&host).ok()?;
         Some(Referral { kind, host, port })
     }
 
-    /// The field that names this referral, in block `block`: the host, or
-    /// the host and port when the port is not [`PORT`], after `whois://`
+    /// The field that names this referral, in block `block`: the host, in
+    /// brackets if it is an IPv6 address, or the host and port when the
+    /// port is not [`PORT`], after `whois://`
     /// for [`ReferralKind::ReferralServer`] as ARIN writes it.
     /// [`Referral::from_field`] reads it back as the same referral.
     pub fn to_field(&self, block: usize) -> Result<Field, EncodeError> {
@@ -822,7 +899,13 @@ impl Referral {
         if self.kind == ReferralKind::ReferralServer {
             value.push_str("whois://");
         }
-        value.push_str(&self.host);
+        if self.host.contains(':') {
+            value.push('[');
+            value.push_str(&self.host);
+            value.push(']');
+        } else {
+            value.push_str(&self.host);
+        }
         if self.port != PORT {
             value.push(':');
             value.push_str(&self.port.to_string());
@@ -836,10 +919,29 @@ pub fn find_referral(fields: &[Field]) -> Option<Referral> {
     fields.iter().find_map(Referral::from_field)
 }
 
+/// A port of 1 to 65535, written in at most five digits.
+fn parse_port(p: &str) -> Option<u16> {
+    if p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    p.parse::<u16>().ok().filter(|&n| n != 0)
+}
+
 fn check_host(host: &str) -> Result<(), EncodeError> {
-    let ok = !host.is_empty()
-        && host.len() <= MAX_HOST
-        && !host.starts_with(['.', '-'])
+    if host.is_empty() || host.len() > MAX_HOST || host.bytes().any(|b| b.is_ascii_uppercase()) {
+        return Err(EncodeError::Host);
+    }
+    if host.contains(':') {
+        return match host.parse::<std::net::Ipv6Addr>() {
+            Ok(_) => Ok(()),
+            Err(_) => Err(EncodeError::Host),
+        };
+    }
+    // Labels of 1 to 63 bytes (RFC 1035, section 2.3.4), and a dot at the
+    // end for the root.
+    let name = host.strip_suffix('.').unwrap_or(host);
+    let ok = !host.starts_with('-')
+        && name.split('.').all(|l| !l.is_empty() && l.len() <= 63)
         && host.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'_'));
     if ok { Ok(()) } else { Err(EncodeError::Host) }
 }
@@ -1113,7 +1215,8 @@ mod tests {
         assert_eq!(read("refer", "-host"), None);
         assert_eq!(read("refer", &"a".repeat(MAX_HOST + 1)), None);
         assert_eq!(read("whois", "whois.x"), None);
-        assert!(read("refer", &"a".repeat(MAX_HOST)).is_some());
+        // A single label longer than 63 bytes is not a host name.
+        assert_eq!(read("refer", &"a".repeat(MAX_HOST)), None);
     }
 
     #[test]
@@ -1143,9 +1246,13 @@ mod tests {
         // Comments end a field, and so does free text.
         let text = "a: 1\n% c\n  more\nb: 2\nfree text\n  more\n";
         assert_eq!(parse_fields(text).unwrap(), [Field::new(0, "a", "1"), Field::new(0, "b", "2")]);
-        // A colon must be followed by a space, a tab or the end.
+        // A colon must be followed by a space, a tab or the end, unless
+        // the key is an RPSL name.
         let text = "http://x\nk:v\ntime 12:30\nk:\nj:\tv \r\n";
-        assert_eq!(parse_fields(text).unwrap(), [Field::new(0, "k", ""), Field::new(0, "j", "v")]);
+        assert_eq!(
+            parse_fields(text).unwrap(),
+            [Field::new(0, "k", "v"), Field::new(0, "k", ""), Field::new(0, "j", "v")]
+        );
         // A value on the lines after an empty one.
         let text = "    Registrant:\n        Example Ltd\n        London\n    Status: ok\n";
         assert_eq!(
@@ -1432,6 +1539,106 @@ mod tests {
             }
             assert_eq!(got, want);
         }
+    }
+
+    #[test]
+    fn ripe_flags_read_as_ripe_documents_them() {
+        // RIPE's `-C` (`--no-irt`) takes no argument, so the address is the
+        // term. DENIC's `-C` takes a character set name.
+        let q = Query::new("-C 193.0.0.1").unwrap();
+        assert_eq!(q.flags(), [Flag { name: "-C", argument: None }]);
+        assert_eq!(q.terms(), "193.0.0.1");
+        assert_eq!(Query::new("-C AS3333 x").unwrap().terms(), "AS3333 x");
+        assert_eq!(Query::new("-C utf-8 example.de").unwrap().flags()[0].argument, Some("utf-8"));
+        assert_eq!(Query::build(&["-C"], "193.0.0.1").unwrap().terms(), "193.0.0.1");
+        // `-Z` (`--charset`) and `-S` (`--resources`) take an argument.
+        let q = Query::new("-Z UTF-8 AS3333").unwrap();
+        assert_eq!(q.flags(), [Flag { name: "-Z", argument: Some("UTF-8") }]);
+        assert_eq!(q.terms(), "AS3333");
+        assert_eq!(Query::new("-S ARIN-GRS 193.201.1.1").unwrap().terms(), "193.201.1.1");
+        assert_eq!(Query::new("--charset UTF-8 AS3333").unwrap().terms(), "AS3333");
+        // Short flags grouped in one word: the last one may take the
+        // next word, and one inside the group takes the rest of the word.
+        let q = Query::new("-Bi tech-c DW-RIPE").unwrap();
+        assert_eq!(q.flags(), [Flag { name: "-Bi", argument: Some("tech-c") }]);
+        assert_eq!(q.terms(), "DW-RIPE");
+        let q = Query::new("-Tas-set AS-FOO").unwrap();
+        assert_eq!(q.flags(), [Flag { name: "-Tas-set", argument: None }]);
+        assert_eq!(q.terms(), "AS-FOO");
+        assert_eq!(Query::new("-rB AS3333").unwrap().terms(), "AS3333");
+        assert_eq!(Query::build(&["-Bi", "origin"], "AS3333").unwrap().terms(), "AS3333");
+        assert_eq!(Query::build(&["-Bi"], "origin AS3333"), Err(QueryError::Flags));
+    }
+
+    #[test]
+    fn rpsl_values_right_after_the_colon() {
+        // RFC 2622, section 2: the name, a colon, then the value.
+        assert_eq!(parse_fields("origin:AS3333\n").unwrap(), [Field::new(0, "origin", "AS3333")]);
+        assert_eq!(parse_fields("remarks:a: b\n").unwrap(), [Field::new(0, "remarks", "a: b")]);
+        assert_eq!(parse_fields("descr: a: b\n").unwrap(), [Field::new(0, "descr", "a: b")]);
+        // A key is never read with a colon in it.
+        assert_eq!(parse_fields("time 12:30: x\n").unwrap(), []);
+        // Free text that is not an RPSL name, or a URL, is not a field.
+        assert_eq!(parse_fields("see https://icann.org/epp\nhttp://x\nab-:c\n1a:b\n").unwrap(), []);
+    }
+
+    #[test]
+    fn ipv6_referrals() {
+        let read = |v: &str| Referral::from_field(&Field::new(0, "ReferralServer", v));
+        let r = read("whois://[2001:DB8::1]:4343").unwrap();
+        assert_eq!((r.host.as_str(), r.port), ("2001:db8::1", 4343));
+        assert_eq!(read("whois://[2001:db8::1]/").unwrap().port, 43);
+        assert_eq!(read("2001:db8::1").unwrap().host, "2001:db8::1");
+        assert_eq!(read("[2001:db8::1]").unwrap().host, "2001:db8::1");
+        assert_eq!(read("[2001:db8::1]:0"), None);
+        assert_eq!(read("[2001:db8::1]x"), None);
+        assert_eq!(read("[2001:db8::1"), None);
+        assert_eq!(read("[example.net]"), None);
+        assert_eq!(read("[fe80::1%eth0]"), None);
+        for kind in [ReferralKind::Refer, ReferralKind::RegistrarWhoisServer, ReferralKind::ReferralServer] {
+            for port in [43, 4343] {
+                let r = Referral { kind, host: "2001:db8::1".into(), port };
+                let f = r.to_field(0).unwrap();
+                assert_eq!(Referral::from_field(&f), Some(r));
+            }
+        }
+        let r = Referral { kind: ReferralKind::Refer, host: "2001:db8::1".into(), port: 4343 };
+        assert_eq!(r.to_field(0).unwrap().value, "[2001:db8::1]:4343");
+        let bad = Referral { kind: ReferralKind::Refer, host: "2001:DB8::1".into(), port: 43 };
+        assert_eq!(bad.to_field(0), Err(EncodeError::Host));
+    }
+
+    #[test]
+    fn host_labels() {
+        // RFC 1035, section 2.3.4: labels are 1 to 63 bytes.
+        let read = |v: &str| Referral::from_field(&Field::new(0, "refer", v));
+        assert_eq!(read(&format!("{}.example", "a".repeat(64))), None);
+        assert!(read(&format!("{}.example", "a".repeat(63))).is_some());
+        assert_eq!(read("a..example"), None);
+        assert!(read("whois.example.").is_some());
+        assert_eq!(read("whois.example.."), None);
+        let longest = ["a".repeat(63), "b".repeat(63), "c".repeat(63), "d".repeat(61)].join(".");
+        assert_eq!(longest.len(), MAX_HOST);
+        assert!(read(&longest).is_some());
+        assert_eq!(read(&format!("{longest}e")), None);
+        let bad = Referral { kind: ReferralKind::Refer, host: "a..b".into(), port: 43 };
+        assert_eq!(bad.to_field(0), Err(EncodeError::Host));
+    }
+
+    #[test]
+    fn writer_takes_what_fits() {
+        // "k: " and CR LF around a value make exactly MAX_RESPONSE bytes.
+        let text = write_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 5))]).unwrap();
+        assert_eq!(text.len(), MAX_RESPONSE);
+        assert_eq!(write_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 4))]), Err(EncodeError::TooLong));
+        // Empty further lines are written as "+" and CR LF.
+        let value = format!("a{}", "\n".repeat(100_000));
+        assert_eq!(write_fields(&[Field::new(0, "k", &value)]).unwrap().len(), 300_006);
+        // A blank line between blocks counts too.
+        let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 11))];
+        assert_eq!(write_fields(&fields).unwrap().len(), MAX_RESPONSE);
+        let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 10))];
+        assert_eq!(write_fields(&fields), Err(EncodeError::TooLong));
     }
 
     #[test]

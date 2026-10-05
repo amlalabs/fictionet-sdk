@@ -5,9 +5,9 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::onc_rpc::{Body, Call, Message, PMAP_PROGRAM};
 use fictionet::stdlib::portmap::{
-    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, PmapRequest, PmapResult, Request,
-    RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat, format_uaddr,
-    parse_uaddr,
+    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, ParseError, PmapRequest,
+    PmapResult, Request, RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult,
+    RpcbStat, format_uaddr, parse_uaddr,
 };
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, SocketAddr};
@@ -82,7 +82,8 @@ fn call_args(u: &mut Unstructured) -> Result<CallArgs> {
     })
 }
 
-/// A netbuf, usually with `maxlen` at least its length, sometimes not.
+/// A netbuf, usually with `maxlen` at least its length and at most 9000,
+/// sometimes not.
 fn netbuf(u: &mut Unstructured) -> Result<Netbuf> {
     let buf = bytes(u, 300)?;
     let maxlen = if u.arbitrary()? {
@@ -100,7 +101,7 @@ fn stat(u: &mut Unstructured) -> Result<RpcbStat> {
         ..RpcbStat::default()
     };
     s.info = u.arbitrary()?;
-    for _ in 0..u.int_in_range(0..=4)? {
+    for _ in 0..u.int_in_range(0..=1100)? {
         s.addrinfo.push(AddrStat {
             program: u.arbitrary()?,
             version: u.arbitrary()?,
@@ -109,7 +110,7 @@ fn stat(u: &mut Unstructured) -> Result<RpcbStat> {
             netid: text(u)?,
         });
     }
-    for _ in 0..u.int_in_range(0..=4)? {
+    for _ in 0..u.int_in_range(0..=1100)? {
         s.rmtinfo.push(RmtCallStat {
             program: u.arbitrary()?,
             version: u.arbitrary()?,
@@ -178,7 +179,7 @@ fn rpcb_result(u: &mut Unstructured) -> Result<RpcbResult> {
         1 => RpcbResult::Bool(u.arbitrary()?),
         2 => RpcbResult::Addr(text(u)?),
         3 => {
-            let n = u.int_in_range(0..=20usize)?;
+            let n = u.int_in_range(0..=1100usize)?;
             RpcbResult::Dump((0..n).map(|_| rpcb(u)).collect::<Result<_>>()?)
         }
         4 => RpcbResult::CallIt(RmtCallResult {
@@ -188,7 +189,7 @@ fn rpcb_result(u: &mut Unstructured) -> Result<RpcbResult> {
         5 => RpcbResult::Time(u.arbitrary()?),
         6 => RpcbResult::Netbuf(netbuf(u)?),
         7 => {
-            let n = u.int_in_range(0..=20usize)?;
+            let n = u.int_in_range(0..=1100usize)?;
             let entry = |u: &mut Unstructured| -> Result<RpcbEntry> {
                 Ok(RpcbEntry {
                     maddr: text(u)?,
@@ -244,11 +245,14 @@ fuzz_target!(|data: &[u8]| {
                     let mut back = req.to_call().unwrap();
                     back.cred = call.cred.clone();
                     back.verf = call.verf.clone();
-                    back.rpc_version = call.rpc_version;
                     assert_eq!(&back, call);
                 }
                 Err(e) => {
-                    let _ = e.status();
+                    // Only RPC version 2 is read; any other is refused.
+                    if call.rpc_version != 2 {
+                        assert_eq!(e, ParseError::RpcVersion(call.rpc_version));
+                    }
+                    let _ = msg.reply(e.reply()).to_bytes();
                 }
             }
         }

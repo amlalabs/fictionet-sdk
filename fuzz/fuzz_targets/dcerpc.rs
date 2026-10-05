@@ -5,7 +5,7 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::dcerpc::{
     Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Decoder, EncodeError, Error, MAX_BUFFERED,
-    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, SyntaxId, Uuid, flags,
+    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SyntaxId, Uuid, flags,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -23,8 +23,15 @@ fn split(data: &[u8], bytewise: bool) -> Vec<std::result::Result<Pdu, Error>> {
             assert!(decoder.buffered() <= MAX_BUFFERED);
             rest = &rest[took..];
             let mut progress = took > 0;
-            while let Some(r) = decoder.next_pdu() {
+            while let Some((r, frame)) = decoder.next_frame() {
                 let fatal = matches!(r, Err(e) if e.breaks_stream());
+                // The frame is the PDU's bytes as they came.
+                if fatal {
+                    assert!(frame.is_empty());
+                } else {
+                    let frame = frame.to_vec();
+                    assert_eq!(Pdu::parse(&frame).map(|o| o.map(|(p, _)| p)), r.clone().map(Some));
+                }
                 out.push(r);
                 if fatal {
                     return out;
@@ -107,6 +114,7 @@ fn pdu(u: &mut Unstructured) -> Result<Pdu> {
             alloc_hint: u.arbitrary()?,
             context_id: u.arbitrary()?,
             cancel_count: u.arbitrary()?,
+            fault_flags: u.arbitrary()?,
             status: u.arbitrary()?,
             stub: bytes(u, 300)?,
         },
@@ -135,8 +143,16 @@ fn pdu(u: &mut Unstructured) -> Result<Pdu> {
     })
 }
 
+fn alloc_hint(p: &Pdu) -> Option<u32> {
+    match p.body {
+        Body::Request { alloc_hint, .. } | Body::Response { alloc_hint, .. } => Some(alloc_hint),
+        _ => None,
+    }
+}
+
 /// Values a world builds: whatever a writer accepts reads back the same,
-/// and whatever is split joins back into the same call.
+/// and whatever is split joins back into the same call, including calls
+/// longer than one fragment.
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     let p = pdu(&mut u)?;
@@ -145,25 +161,80 @@ fn built(data: &[u8]) -> Result<()> {
         assert_eq!(Pdu::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
     }
     let max: u16 = u.arbitrary()?;
-    if let Ok(parts) = p.fragments(max)
-        && p.to_bytes().is_ok()
-    {
-        assert!(parts.len() <= MAX_FRAGMENTS);
-        let mut r = Reassembler::default();
-        let mut got = None;
-        for f in parts {
-            let bytes = f.to_bytes().unwrap();
-            if matches!(p.body, Body::Request { .. } | Body::Response { .. }) {
-                assert!(bytes.len() <= usize::from(max));
+    let call = matches!(p.body, Body::Request { .. } | Body::Response { .. });
+    let Ok(parts) = p.fragments(max) else { return Ok(()) };
+    assert!(parts.len() <= MAX_FRAGMENTS);
+    let mut r = Reassembler::default();
+    let mut got = None;
+    let mut sent = 0usize;
+    for f in &parts {
+        // Every fragment writes, within the size asked for.
+        let bytes = f.to_bytes().unwrap();
+        assert!(bytes.len() <= usize::from(max));
+        assert_eq!(Pdu::parse(&bytes), Ok(Some((f.clone(), bytes.len()))));
+        // A nonzero hint counts down by the stub data already sent.
+        if let (Some(whole), Some(hint)) = (alloc_hint(&p), alloc_hint(f)) {
+            let left = if whole == 0 { 0 } else { whole.saturating_sub(u32::try_from(sent).unwrap_or(u32::MAX)) };
+            assert_eq!(hint, left);
+        }
+        sent += f.body.stub().map_or(0, <[u8]>::len);
+        got = r.push(f.clone()).unwrap();
+    }
+    let mut want = p.clone();
+    if call {
+        want.flags |= flags::FIRST_FRAG | flags::LAST_FRAG;
+    }
+    assert_eq!(got, Some(want.clone()));
+    if call && parts.len() > 1 {
+        related(&mut u, parts, want)?;
+    }
+    Ok(())
+}
+
+/// The fragments of one call, each given a verifier and maybe a cancel:
+/// they join only if every verifier has the first one's type, level and
+/// context ID, and the joined call keeps any cancel.
+fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<()> {
+    let first: Option<(u8, u8, u32)> = u.arbitrary()?;
+    let mut fail = None;
+    for (i, f) in parts.iter_mut().enumerate() {
+        let s = if i == 0 || u.ratio(3, 4)? { first } else { u.arbitrary()? };
+        f.auth = s.map(|(kind, level, context_id)| Auth { kind, level, context_id, value: vec![1] });
+        if i > 0 && s != first && fail.is_none() {
+            fail = Some(i);
+        }
+        if u.ratio(1, 8)? {
+            f.flags |= flags::PENDING_CANCEL;
+            want.flags |= flags::PENDING_CANCEL;
+        }
+        if let Body::Response { cancel_count, .. } = &mut f.body
+            && u.ratio(1, 8)?
+        {
+            *cancel_count = u.arbitrary()?;
+        }
+    }
+    // A response's cancel count is the highest any fragment gave.
+    if let Body::Response { cancel_count: w, .. } = &mut want.body {
+        *w = parts
+            .iter()
+            .filter_map(|f| match f.body {
+                Body::Response { cancel_count, .. } => Some(cancel_count),
+                _ => None,
+            })
+            .fold(0, u8::max);
+    }
+    let mut r = Reassembler::default();
+    let n = parts.len();
+    for (i, f) in parts.into_iter().enumerate() {
+        let got = r.push(f);
+        match fail {
+            Some(at) if i == at => {
+                assert_eq!(got, Err(ReassemblyError::Unexpected { call_id: want.call_id }));
+                return Ok(());
             }
-            assert_eq!(Pdu::parse(&bytes), Ok(Some((f.clone(), bytes.len()))));
-            got = r.push(f).unwrap();
+            _ if i + 1 == n => assert_eq!(got, Ok(Some(want.clone()))),
+            _ => assert_eq!(got, Ok(None)),
         }
-        let mut want = p.clone();
-        if matches!(want.body, Body::Request { .. } | Body::Response { .. }) {
-            want.flags |= flags::FIRST_FRAG | flags::LAST_FRAG;
-        }
-        assert_eq!(got, Some(want));
     }
     Ok(())
 }

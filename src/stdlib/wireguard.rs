@@ -39,14 +39,14 @@
 //!     mac1: [4; 16],
 //!     mac2: [0; 16],
 //! };
-//! let bytes = Message::Initiation(init.clone()).to_bytes();
+//! let bytes = Message::Initiation(init.clone()).to_bytes().unwrap();
 //! assert_eq!(bytes.len(), INITIATION_LEN);
 //! assert_eq!(bytes[..8], [1, 0, 0, 0, 7, 0, 0, 0]);
 //! assert_eq!(Message::parse(&bytes), Ok(Message::Initiation(init)));
 //!
 //! // A keepalive: counter 0 and only a tag.
 //! let keepalive = Data { receiver: 9, counter: 0, encrypted: vec![0xaa; 16] };
-//! let bytes = Message::Data(keepalive.clone()).to_bytes();
+//! let bytes = Message::Data(keepalive.clone()).to_bytes().unwrap();
 //! assert_eq!(bytes.len(), 32);
 //! assert_eq!(Message::parse(&bytes), Ok(Message::Data(keepalive)));
 //!
@@ -108,9 +108,9 @@ pub const MAX_MESSAGE: usize = 65_535 - 8;
 pub const MAX_ENCRYPTED: usize = MAX_MESSAGE - DATA_HEADER_LEN;
 /// Plaintexts are padded with zeros to a multiple of this many bytes.
 pub const PADDING_MULTIPLE: usize = 16;
-/// The longest plaintext [`pad`] takes. It leaves room for padding and a
-/// tag within [`MAX_ENCRYPTED`].
-pub const MAX_PLAINTEXT: usize = MAX_ENCRYPTED - TAG_LEN - PADDING_MULTIPLE;
+/// The longest padded plaintext that fits in one message once its tag is
+/// added. [`pad`] refuses a plaintext whose padded length would pass it.
+pub const MAX_PLAINTEXT: usize = MAX_ENCRYPTED - TAG_LEN;
 /// A key pair may send counters below this, and no more: 2^64 - 2^13 - 1
 /// (the paper's Reject-After-Messages).
 pub const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
@@ -249,12 +249,13 @@ impl Message {
         })
     }
 
-    /// The message's bytes, ready to send as one UDP payload.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// The message's bytes, ready to send as one UDP payload. Only a
+    /// transport data message can fail, as [`Data::to_bytes`] says.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
         match self {
-            Message::Initiation(m) => m.to_bytes(),
-            Message::Response(m) => m.to_bytes(),
-            Message::CookieReply(m) => m.to_bytes(),
+            Message::Initiation(m) => Ok(m.to_bytes()),
+            Message::Response(m) => Ok(m.to_bytes()),
+            Message::CookieReply(m) => Ok(m.to_bytes()),
             Message::Data(m) => m.to_bytes(),
         }
     }
@@ -404,17 +405,20 @@ impl Data {
         Ok(Data { receiver, counter, encrypted })
     }
 
-    /// The message's bytes. An encrypted part longer than
-    /// [`MAX_ENCRYPTED`] is cut to that length, and one shorter than a tag
-    /// is filled out with zeros, since no message can be shorter.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let enc = &self.encrypted[..self.encrypted.len().min(MAX_ENCRYPTED)];
-        let mut out = header(message_type::DATA, DATA_HEADER_LEN + enc.len().max(TAG_LEN));
+    /// The message's bytes, with the encrypted part exactly as given. An
+    /// encrypted part shorter than a tag ([`TAG_LEN`]) or longer than
+    /// [`MAX_ENCRYPTED`] gives the [`Error::Length`] that [`Data::parse`]
+    /// would give for the message it makes, since no peer could take it.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+        let len = DATA_HEADER_LEN.saturating_add(self.encrypted.len());
+        if !(TAG_LEN..=MAX_ENCRYPTED).contains(&self.encrypted.len()) {
+            return Err(Error::Length { kind: message_type::DATA, len });
+        }
+        let mut out = header(message_type::DATA, len);
         out.extend_from_slice(&self.receiver.to_le_bytes());
         out.extend_from_slice(&self.counter.to_le_bytes());
-        out.extend_from_slice(enc);
-        out.resize(out.len().max(MIN_DATA_LEN), 0);
-        out
+        out.extend_from_slice(&self.encrypted);
+        Ok(out)
     }
 
     /// Whether this is a keepalive: an empty plaintext, so only a tag.
@@ -441,16 +445,20 @@ pub fn padding(len: usize, mtu: usize) -> usize {
     }
 }
 
-/// A plaintext with its padding added, ready for encryption. A plaintext
-/// longer than [`MAX_PLAINTEXT`] is cut to that length first, so the
-/// encrypted result always fits in one message.
-pub fn pad(plaintext: &[u8], mtu: usize) -> Vec<u8> {
-    let p = &plaintext[..plaintext.len().min(MAX_PLAINTEXT)];
-    let n = padding(p.len(), mtu);
-    let mut out = Vec::with_capacity(p.len() + n);
-    out.extend_from_slice(p);
-    out.resize(p.len() + n, 0);
-    out
+/// A plaintext with its padding added, ready for encryption: every byte
+/// of `plaintext`, then [`padding`] zeros. If the padded plaintext would
+/// be longer than [`MAX_PLAINTEXT`], so that its encryption could not fit
+/// in one message, it gives the [`Error::Length`] of that message instead.
+pub fn pad(plaintext: &[u8], mtu: usize) -> Result<Vec<u8>, Error> {
+    let padded = plaintext.len().saturating_add(padding(plaintext.len(), mtu));
+    if padded > MAX_PLAINTEXT {
+        let len = padded.saturating_add(DATA_HEADER_LEN + TAG_LEN);
+        return Err(Error::Length { kind: message_type::DATA, len });
+    }
+    let mut out = Vec::with_capacity(padded);
+    out.extend_from_slice(plaintext);
+    out.resize(padded, 0);
+    Ok(out)
 }
 
 /// Remembers which transport data counters a receiver has taken, so it
@@ -688,7 +696,7 @@ mod tests {
 
     #[test]
     fn data_layout() {
-        let b = data().to_bytes();
+        let b = data().to_bytes().unwrap();
         assert_eq!(b.len(), 16 + 48);
         assert_eq!(b[..8], [4, 0, 0, 0, 0xef, 0xbe, 0xad, 0xde]);
         assert_eq!(b[8..16], [8, 7, 6, 5, 4, 3, 2, 1]);
@@ -696,20 +704,20 @@ mod tests {
         assert!(!data().is_keepalive());
         let k = Data { receiver: 1, counter: 0, encrypted: vec![0; 16] };
         assert!(k.is_keepalive());
-        assert_eq!(k.to_bytes().len(), 32);
+        assert_eq!(k.to_bytes().unwrap().len(), 32);
     }
 
     #[test]
     fn round_trips() {
         for m in all() {
-            let b = m.to_bytes();
+            let b = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&b), Ok(m.clone()));
-            assert_eq!(Message::parse(&b).unwrap().to_bytes(), b);
+            assert_eq!(Message::parse(&b).unwrap().to_bytes(), Ok(b));
         }
         assert_eq!(Initiation::parse(&init().to_bytes()), Ok(init()));
         assert_eq!(Response::parse(&resp().to_bytes()), Ok(resp()));
         assert_eq!(CookieReply::parse(&cookie().to_bytes()), Ok(cookie()));
-        assert_eq!(Data::parse(&data().to_bytes()), Ok(data()));
+        assert_eq!(Data::parse(&data().to_bytes().unwrap()), Ok(data()));
     }
 
     #[test]
@@ -723,7 +731,7 @@ mod tests {
     #[test]
     fn every_truncated_prefix_is_an_error() {
         for m in all() {
-            let b = m.to_bytes();
+            let b = m.to_bytes().unwrap();
             for n in 0..b.len() {
                 let e = Message::parse(&b[..n]);
                 if n < 4 {
@@ -765,7 +773,7 @@ mod tests {
         // one a reader wants is its own error, not an unknown type.
         assert_eq!(Initiation::parse(&resp().to_bytes()), Err(Error::Unexpected { want: 1, found: 2 }));
         assert_eq!(Response::parse(&init().to_bytes()), Err(Error::Unexpected { want: 2, found: 1 }));
-        assert_eq!(CookieReply::parse(&data().to_bytes()), Err(Error::Unexpected { want: 3, found: 4 }));
+        assert_eq!(CookieReply::parse(&data().to_bytes().unwrap()), Err(Error::Unexpected { want: 3, found: 4 }));
         assert_eq!(Data::parse(&cookie().to_bytes()), Err(Error::Unexpected { want: 4, found: 3 }));
         assert_eq!(Data::parse(&[9, 0, 0, 0]), Err(Error::Type(9)));
         assert!(!Error::Unexpected { want: 1, found: 2 }.to_string().contains("not 1 to 4"));
@@ -785,7 +793,7 @@ mod tests {
     fn reserved_bytes_for_every_type_and_position() {
         for m in all() {
             for i in 1..4 {
-                let mut b = m.to_bytes();
+                let mut b = m.to_bytes().unwrap();
                 b[i] = 0x80;
                 let mut r = [0; 3];
                 r[i - 1] = 0x80;
@@ -818,7 +826,7 @@ mod tests {
             let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 3, len: n } };
             assert_eq!(CookieReply::parse(&b[..n]), Err(want));
         }
-        let b = data().to_bytes();
+        let b = data().to_bytes().unwrap();
         for n in 0..=b.len() {
             let got = Data::parse(&b[..n]);
             if n < 4 {
@@ -833,37 +841,48 @@ mod tests {
 
     #[test]
     fn data_writer_output_always_parses() {
+        // The writer takes exactly the encrypted lengths the reader takes,
+        // writes them unchanged, and refuses the rest with the reader's error.
         let mut s = Lcg(0xda7a);
         let edges = [0, 1, 15, 16, 17, MAX_ENCRYPTED - 1, MAX_ENCRYPTED, MAX_ENCRYPTED + 1, MAX_MESSAGE];
         for i in 0..400 {
             let n = if i < edges.len() { edges[i] } else { (s.next() % 2000) as usize };
-            let d = Data { receiver: s.next() as u32, counter: s.next() << 20, encrypted: vec![0x5a; n] };
-            let b = d.to_bytes();
-            assert!(b.len() >= MIN_DATA_LEN && b.len() <= MAX_MESSAGE, "{n}");
-            let back = Data::parse(&b).unwrap();
-            assert_eq!(back.receiver, d.receiver);
-            assert_eq!(back.counter, d.counter);
-            if (TAG_LEN..=MAX_ENCRYPTED).contains(&n) {
-                assert_eq!(back, d);
+            let encrypted: Vec<u8> = (0..n).map(|_| s.next() as u8).collect();
+            let d = Data { receiver: s.next() as u32, counter: s.next() << 20, encrypted };
+            match d.to_bytes() {
+                Ok(b) => {
+                    assert!((TAG_LEN..=MAX_ENCRYPTED).contains(&n), "{n}");
+                    assert_eq!(b.len(), DATA_HEADER_LEN + n);
+                    assert_eq!(Data::parse(&b), Ok(d.clone()));
+                    assert_eq!(Message::parse(&b), Ok(Message::Data(d.clone())));
+                }
+                Err(e) => {
+                    assert!(!(TAG_LEN..=MAX_ENCRYPTED).contains(&n), "{n}");
+                    assert_eq!(e, Error::Length { kind: message_type::DATA, len: DATA_HEADER_LEN + n });
+                    assert_eq!(Message::Data(d.clone()).to_bytes(), Err(e));
+                }
             }
-            assert_eq!(back.to_bytes(), b);
         }
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
-        let short = Data { receiver: 1, counter: 2, encrypted: vec![7; 3] };
-        let b = short.to_bytes();
-        assert_eq!(b.len(), MIN_DATA_LEN);
-        let back = Data::parse(&b).unwrap();
-        assert_eq!(back.encrypted[..3], [7; 3]);
-        assert_eq!(back.encrypted[3..], [0; 13]);
-        let long = Data { receiver: 1, counter: 2, encrypted: vec![7; MAX_MESSAGE * 2] };
-        let b = long.to_bytes();
-        assert_eq!(b.len(), MAX_MESSAGE);
-        assert!(Message::parse(&b).is_ok());
+    fn data_writer_never_changes_the_ciphertext() {
+        // A short or long encrypted part is refused, not padded or cut.
+        for n in [0, 1, 3, 15, MAX_ENCRYPTED + 1, MAX_MESSAGE * 2] {
+            let d = Data { receiver: 1, counter: 2, encrypted: vec![7; n] };
+            assert_eq!(d.to_bytes(), Err(Error::Length { kind: 4, len: DATA_HEADER_LEN + n }), "{n}");
+        }
+        // An empty encrypted part is not a keepalive, and does not become one.
         let empty = Data { receiver: 0, counter: 0, encrypted: Vec::new() };
-        assert!(Message::parse(&empty.to_bytes()).is_ok());
+        assert!(!empty.is_keepalive());
+        assert!(empty.to_bytes().is_err());
+        // The longest one is written whole, its last byte (the tag's) kept.
+        let mut long = vec![7; MAX_ENCRYPTED];
+        long[MAX_ENCRYPTED - 1] = 0xee;
+        let d = Data { receiver: 1, counter: 2, encrypted: long };
+        let b = d.to_bytes().unwrap();
+        assert_eq!(b.len(), MAX_MESSAGE);
+        assert_eq!(Data::parse(&b), Ok(d));
     }
 
     #[test]
@@ -882,11 +901,55 @@ mod tests {
         assert_eq!(padding(usize::MAX, 0), 1);
         assert_eq!(padding(usize::MAX, usize::MAX), 0);
         assert_eq!(padding(usize::MAX - 3, usize::MAX), 3);
-        assert_eq!(pad(&[1, 2, 3], 0), [1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(pad(&[], 1420), Vec::<u8>::new());
-        let big = pad(&vec![1; MAX_MESSAGE], 0);
-        assert!(big.len() + TAG_LEN <= MAX_ENCRYPTED);
-        assert_eq!(big.len() % 16, 0);
+        assert_eq!(pad(&[1, 2, 3], 0), Ok(vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(pad(&[], 1420), Ok(Vec::new()));
+        // Too long for one message: refused, not cut.
+        assert_eq!(pad(&vec![1; MAX_MESSAGE], 0), Err(Error::Length { kind: 4, len: MAX_MESSAGE + 9 + 32 }));
+    }
+
+    #[test]
+    fn pad_keeps_every_plaintext_byte() {
+        assert_eq!(MAX_PLAINTEXT, 65_495);
+        // 65,480 bytes pad to 65,488, a 65,520-byte message: it fits, whole.
+        let mut p = vec![0x5a; 65_480];
+        p[65_479] = 0xee;
+        let out = pad(&p, 0).unwrap();
+        assert_eq!(out.len(), 65_488);
+        assert_eq!(out[..p.len()], p[..]);
+        assert!(out[p.len()..].iter().all(|&x| x == 0));
+        // The limits with no MTU: 65,488 is the longest padded length.
+        assert_eq!(pad(&vec![1; 65_488], 0).map(|v| v.len()), Ok(65_488));
+        assert_eq!(pad(&vec![1; 65_489], 0), Err(Error::Length { kind: 4, len: 65_504 + 32 }));
+        // With an MTU the padding can stop short of 16, so a longer one fits.
+        assert_eq!(pad(&vec![1; MAX_PLAINTEXT], MAX_PLAINTEXT).map(|v| v.len()), Ok(MAX_PLAINTEXT));
+        assert!(pad(&vec![1; MAX_PLAINTEXT + 1], MAX_PLAINTEXT + 1).is_err());
+        // Any length and MTU: either every byte and zeros after, or refused
+        // because the padded length passes the limit. Whatever it gives can
+        // be sent once encrypted.
+        let mut s = Lcg(0x9ad);
+        for i in 0..3_000 {
+            let len = if i % 2 == 0 { 65_400 + (s.next() % 200) as usize } else { (s.next() % 3000) as usize };
+            let mtu = match s.next() % 3 {
+                0 => 0,
+                1 => 1 + (s.next() % 70_000) as usize,
+                _ => 1280 + (s.next() % 200) as usize,
+            };
+            let p: Vec<u8> = (0..len).map(|_| s.next() as u8 | 1).collect();
+            let n = padding(len, mtu);
+            match pad(&p, mtu) {
+                Ok(out) => {
+                    assert_eq!(out.len(), len + n);
+                    assert_eq!(out[..len], p[..]);
+                    assert!(out[len..].iter().all(|&x| x == 0));
+                    let d = Data { receiver: 1, counter: 0, encrypted: vec![0; out.len() + TAG_LEN] };
+                    assert!(d.to_bytes().is_ok(), "{len} {mtu}");
+                }
+                Err(e) => {
+                    assert!(len + n > MAX_PLAINTEXT, "{len} {mtu}");
+                    assert_eq!(e, Error::Length { kind: 4, len: len + n + MIN_DATA_LEN });
+                }
+            }
+        }
     }
 
     #[test]
@@ -1018,7 +1081,7 @@ mod tests {
                     })
                 }
             };
-            let b = m.to_bytes();
+            let b = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&b), Ok(m));
         }
     }
@@ -1026,7 +1089,7 @@ mod tests {
     /// Any bytes: no panic, and what parses writes back the same.
     fn check(b: &[u8]) {
         if let Ok(m) = Message::parse(b) {
-            assert_eq!(m.to_bytes(), b);
+            assert_eq!(m.to_bytes().as_deref(), Ok(b));
         }
         let _ = Initiation::parse(b);
         let _ = Response::parse(b);

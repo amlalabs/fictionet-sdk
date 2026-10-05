@@ -93,9 +93,12 @@ pub const VPN_PORT: u16 = 443;
 pub const RECORD_HEADER_LEN: usize = 13;
 /// The length of a handshake message's header.
 pub const HANDSHAKE_HEADER_LEN: usize = 12;
-/// The most bytes a record with the 13-byte header may carry: 2^14 plus
-/// 2048, the DTLS 1.2 limit for protected records.
+/// The most bytes a record with the 13-byte header may carry past epoch 0:
+/// 2^14 plus 2048, the DTLS 1.2 limit for protected records.
 pub const MAX_PLAIN_FRAGMENT: usize = 16384 + 2048;
+/// The most bytes a record in epoch 0, which is not protected, may carry:
+/// 2^14 (RFC 6347, section 4.1).
+pub const MAX_PLAINTEXT: usize = 16384;
 /// The most bytes a record with the unified header may carry: 2^14 plus
 /// 256, the DTLS 1.3 limit.
 pub const MAX_UNIFIED_PAYLOAD: usize = 16384 + 256;
@@ -305,7 +308,8 @@ pub struct PlainRecord {
     /// back only with the `cid_len` it chose.
     pub connection_id: Vec<u8>,
     /// The record's payload: plaintext in epoch 0, and protected bytes
-    /// after that. At most [`MAX_PLAIN_FRAGMENT`] bytes are written.
+    /// after that. At most [`MAX_PLAINTEXT`] bytes are written in epoch 0,
+    /// and at most [`MAX_PLAIN_FRAGMENT`] after it.
     pub fragment: Vec<u8>,
 }
 
@@ -373,7 +377,8 @@ pub enum RecordError {
     /// The bytes end inside the record.
     Truncated,
     /// The record's length is more than its header allows: more than
-    /// [`MAX_PLAIN_FRAGMENT`] or [`MAX_UNIFIED_PAYLOAD`].
+    /// [`MAX_PLAINTEXT`] in epoch 0, [`MAX_PLAIN_FRAGMENT`] in a later
+    /// epoch, or [`MAX_UNIFIED_PAYLOAD`] behind the unified header.
     Length(usize),
     /// The datagram holds more than [`MAX_RECORDS_PER_DATAGRAM`] records.
     TooManyRecords,
@@ -438,7 +443,7 @@ impl Record {
         let connection_id =
             if content_type == ContentType::TLS12_CID { r.take(usize::from(cid_len))?.to_vec() } else { Vec::new() };
         let len = usize::from(r.u16()?);
-        if len > MAX_PLAIN_FRAGMENT {
+        if len > plain_limit(epoch) {
             return Err(RecordError::Length(len));
         }
         let fragment = r.take(len)?.to_vec();
@@ -450,13 +455,23 @@ impl Record {
     /// field's documentation says.
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        self.write(&mut out, false);
+        self.write(&mut out);
         out
     }
 
-    /// Appends the record's bytes to `out`. With `force_length`, a unified
-    /// header gets a length even if the record has none.
-    fn write(&self, out: &mut Vec<u8>, force_length: bool) {
+    /// The length of the connection ID the record writes, if it writes one.
+    fn written_cid_len(&self) -> Option<usize> {
+        match self {
+            Record::Plain(p) if p.content_type == ContentType::TLS12_CID => {
+                Some(p.connection_id.len().min(MAX_CID_LEN))
+            }
+            Record::Plain(_) => None,
+            Record::Unified(u) => u.connection_id.as_ref().map(|c| c.len().min(MAX_CID_LEN)),
+        }
+    }
+
+    /// Appends the record's bytes to `out`.
+    fn write(&self, out: &mut Vec<u8>) {
         match self {
             Record::Plain(p) => {
                 out.push(p.content_type.get());
@@ -466,12 +481,12 @@ impl Record {
                 if p.content_type == ContentType::TLS12_CID {
                     out.extend_from_slice(clamp(&p.connection_id, MAX_CID_LEN));
                 }
-                let fragment = clamp(&p.fragment, MAX_PLAIN_FRAGMENT);
+                let fragment = clamp(&p.fragment, plain_limit(p.epoch));
                 out.extend_from_slice(&(fragment.len() as u16).to_be_bytes());
                 out.extend_from_slice(fragment);
             }
             Record::Unified(u) => {
-                let has_length = u.has_length || force_length;
+                let has_length = u.has_length;
                 let mut first = unified_bits::FIXED | (u.epoch_bits & unified_bits::EPOCH_MASK);
                 if u.connection_id.is_some() {
                     first |= unified_bits::CID;
@@ -517,16 +532,42 @@ pub fn parse_datagram(b: &[u8], cid_len: u8) -> Result<Vec<Record>, RecordError>
     Ok(records)
 }
 
-/// A datagram holding `records`, in order. Unified records other than the
-/// last get a length, since a record without one would take the rest of
-/// the datagram. Records past [`MAX_RECORDS_PER_DATAGRAM`] are left out.
+/// A datagram holding `records`, in order, so that [`parse_datagram`] reads
+/// them back. Some records are left out:
+///
+/// - Every record after a unified record without a length, since that
+///   record runs to the end of the datagram. The writer does not add a
+///   length to it, because the unified header is part of what the record's
+///   protection covers (RFC 9147, section 4): give records that are not
+///   last a length before protecting them.
+/// - Records whose connection ID length differs from the first connection
+///   ID written, since the receiver reads every connection ID with the one
+///   length it chose (RFC 9146).
+/// - Records past [`MAX_RECORDS_PER_DATAGRAM`].
 pub fn write_datagram(records: &[Record]) -> Vec<u8> {
-    let records = clamp(records, MAX_RECORDS_PER_DATAGRAM);
     let mut out = Vec::new();
-    for (i, record) in records.iter().enumerate() {
-        record.write(&mut out, i + 1 < records.len());
+    let mut cid_len = None;
+    let mut written = 0;
+    for record in records {
+        if written == MAX_RECORDS_PER_DATAGRAM {
+            break;
+        }
+        if let Some(n) = record.written_cid_len()
+            && *cid_len.get_or_insert(n) != n {
+                continue;
+            }
+        record.write(&mut out);
+        written += 1;
+        if matches!(record, Record::Unified(u) if !u.has_length) {
+            break;
+        }
     }
     out
+}
+
+/// The most bytes a record with the 13-byte header carries in `epoch`.
+fn plain_limit(epoch: u16) -> usize {
+    if epoch == 0 { MAX_PLAINTEXT } else { MAX_PLAIN_FRAGMENT }
 }
 
 /// Why bytes are not a handshake fragment or the body of a message.
@@ -544,10 +585,14 @@ pub enum HandshakeError {
     Trailing,
     /// The session ID is longer than [`MAX_SESSION_ID`] bytes.
     SessionId(usize),
-    /// The cipher suite list has an odd number of bytes.
+    /// The cipher suite list is empty or has an odd number of bytes.
     CipherSuites,
+    /// The compression method list is empty.
+    CompressionMethods,
     /// An extension runs past the end of the extension block.
     Extensions,
+    /// Two extensions in one hello have this type.
+    DuplicateExtension(u16),
 }
 
 impl std::fmt::Display for HandshakeError {
@@ -559,8 +604,10 @@ impl std::fmt::Display for HandshakeError {
             HandshakeError::TooManyFragments => write!(f, "more than {MAX_FRAGMENTS_PER_RECORD} fragments in a record"),
             HandshakeError::Trailing => write!(f, "bytes left after the body"),
             HandshakeError::SessionId(n) => write!(f, "session ID of {n} bytes, over {MAX_SESSION_ID}"),
-            HandshakeError::CipherSuites => write!(f, "cipher suite list of an odd length"),
+            HandshakeError::CipherSuites => write!(f, "cipher suite list empty or of an odd length"),
+            HandshakeError::CompressionMethods => write!(f, "compression method list empty"),
             HandshakeError::Extensions => write!(f, "an extension runs past the extension block"),
+            HandshakeError::DuplicateExtension(t) => write!(f, "two extensions of type {t}"),
         }
     }
 }
@@ -668,8 +715,9 @@ impl Handshake {
     }
 
     /// The message's bytes as one fragment, ready for a record. A record
-    /// carries at most [`MAX_PLAIN_FRAGMENT`] bytes and cuts the rest, so a
-    /// bigger message goes out through [`Handshake::fragments`].
+    /// carries at most [`MAX_PLAINTEXT`] bytes in epoch 0 and
+    /// [`MAX_PLAIN_FRAGMENT`] after it, and cuts the rest, so a bigger
+    /// message goes out through [`Handshake::fragments`].
     pub fn to_bytes(&self) -> Vec<u8> {
         self.to_fragment().to_bytes()
     }
@@ -731,8 +779,13 @@ pub struct Extension {
 
 /// A ClientHello body, in the DTLS 1.2 form. DTLS 1.3 keeps the same
 /// layout and offers its own version in the supported_versions extension.
-/// Readers do not insist on at least one cipher suite or compression
-/// method; world code can check.
+///
+/// Readers insist on what the format does: at least one cipher suite and
+/// one compression method, and no two extensions of one type. What
+/// depends on the version the server picks is up to world code: RFC 5246
+/// has the compression methods include 0, and a server that picks DTLS
+/// 1.3 aborts on a cookie that is not empty (RFC 9147, section 5.3) or
+/// compression methods other than exactly 0 (RFC 8446, section 4.1.2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClientHello {
     /// The highest version the client offers, or [`version::DTLS_1_2`] in
@@ -746,14 +799,18 @@ pub struct ClientHello {
     /// [`MAX_COOKIE`] bytes are written.
     pub cookie: Vec<u8>,
     /// The cipher suites offered, by number, in order of preference. At
-    /// most [`MAX_CIPHER_SUITES`] are written.
+    /// most [`MAX_CIPHER_SUITES`] are written. The format needs one at
+    /// least, so an empty list is written as the one suite 0
+    /// (TLS_NULL_WITH_NULL_NULL), which no server may choose.
     pub cipher_suites: Vec<u16>,
     /// The compression methods offered. 0 is none. At most
-    /// [`MAX_COMPRESSION_METHODS`] are written.
+    /// [`MAX_COMPRESSION_METHODS`] are written. The format needs one at
+    /// least, so an empty list is written as the one method 0.
     pub compression_methods: Vec<u8>,
     /// The extensions, or `None` when the hello has no extension block.
     /// An extension that would take the block past [`MAX_EXTENSIONS_LEN`]
-    /// bytes is left out, and the ones after it still go in.
+    /// bytes is left out, and the ones after it still go in. Only the
+    /// first extension of each type is written.
     pub extensions: Option<Vec<Extension>>,
 }
 
@@ -766,11 +823,14 @@ impl ClientHello {
         let session_id = session_id(&mut r)?;
         let cookie = r.vec8()?.to_vec();
         let suites = r.vec16()?;
-        if !suites.len().is_multiple_of(2) {
+        if suites.is_empty() || !suites.len().is_multiple_of(2) {
             return Err(HandshakeError::CipherSuites);
         }
         let cipher_suites = suites.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
         let compression_methods = r.vec8()?.to_vec();
+        if compression_methods.is_empty() {
+            return Err(HandshakeError::CompressionMethods);
+        }
         let extensions = extensions(&mut r)?;
         Ok(ClientHello { version, random, session_id, cookie, cipher_suites, compression_methods, extensions })
     }
@@ -782,12 +842,19 @@ impl ClientHello {
         out.extend_from_slice(&self.random);
         put_vec8(&mut out, clamp(&self.session_id, MAX_SESSION_ID));
         put_vec8(&mut out, clamp(&self.cookie, MAX_COOKIE));
-        let suites = clamp(&self.cipher_suites, MAX_CIPHER_SUITES);
+        let suites = match clamp(&self.cipher_suites, MAX_CIPHER_SUITES) {
+            [] => &[0][..],
+            s => s,
+        };
         out.extend_from_slice(&((suites.len() * 2) as u16).to_be_bytes());
         for s in suites {
             out.extend_from_slice(&s.to_be_bytes());
         }
-        put_vec8(&mut out, clamp(&self.compression_methods, MAX_COMPRESSION_METHODS));
+        let methods = match clamp(&self.compression_methods, MAX_COMPRESSION_METHODS) {
+            [] => &[0][..],
+            m => m,
+        };
+        put_vec8(&mut out, methods);
         put_extensions(&mut out, self.extensions.as_deref());
         out
     }
@@ -818,7 +885,8 @@ pub struct ServerHello {
     pub version: u16,
     /// The server's random value.
     pub random: [u8; RANDOM_LEN],
-    /// The session ID, or in DTLS 1.3 the client's echoed back. At most
+    /// The session ID. In DTLS 1.3 it is empty: unlike TLS 1.3, a DTLS 1.3
+    /// server must not echo the client's (RFC 9147, section 5). At most
     /// [`MAX_SESSION_ID`] bytes are written.
     pub session_id: Vec<u8>,
     /// The cipher suite chosen.
@@ -827,7 +895,9 @@ pub struct ServerHello {
     pub compression_method: u8,
     /// The extensions, or `None` when the hello has no extension block.
     /// An extension that would take the block past [`MAX_EXTENSIONS_LEN`]
-    /// bytes is left out, and the ones after it still go in.
+    /// bytes is left out, and the ones after it still go in. Only the
+    /// first extension of each type is written. Readers reject two of one
+    /// type.
     pub extensions: Option<Vec<Extension>>,
 }
 
@@ -925,6 +995,9 @@ pub enum ReassemblyError {
     /// pieces.
     TooManyRanges,
     /// Holding the message would take more than [`MAX_REASSEMBLY_BYTES`].
+    /// The next message expected never gets this: messages after it are
+    /// dropped to make room, and the peer sends them again when it
+    /// retransmits its flight.
     Memory,
 }
 
@@ -1007,7 +1080,8 @@ impl Reassembler {
     /// message that is not empty. Where a fragment
     /// overlaps bytes already held, the bytes held stay and the fragment's
     /// copy of them is dropped, so a repeat with other bytes changes
-    /// nothing.
+    /// nothing. Messages past the next one expected give way to it when
+    /// the bytes held would go over [`MAX_REASSEMBLY_BYTES`].
     pub fn add(&mut self, f: &Fragment) -> Result<Added, ReassemblyError> {
         let length = f.length as usize;
         if length > MAX_MESSAGE_LEN {
@@ -1041,7 +1115,10 @@ impl Reassembler {
             None if start == end && length > 0 => return Ok(Added::Repeat),
             None => {
                 if self.held.saturating_add(length) > MAX_REASSEMBLY_BYTES {
-                    return Err(ReassemblyError::Memory);
+                    if ahead != 0 {
+                        return Err(ReassemblyError::Memory);
+                    }
+                    self.make_room(length);
                 }
                 if start == end { Vec::new() } else { vec![(start, end)] }
             }
@@ -1081,6 +1158,21 @@ impl Reassembler {
         }
         p.ranges = ranges;
         Ok(Added::New)
+    }
+
+    /// Drops the messages furthest ahead until `length` more bytes fit.
+    /// One message always fits once the others are gone, since
+    /// [`MAX_MESSAGE_LEN`] is no more than [`MAX_REASSEMBLY_BYTES`].
+    fn make_room(&mut self, length: usize) {
+        while self.held.saturating_add(length) > MAX_REASSEMBLY_BYTES {
+            let next = self.next_seq;
+            let Some(i) = (0..self.pending.len()).max_by_key(|&i| self.pending[i].message_seq.wrapping_sub(next))
+            else {
+                return;
+            };
+            let p = self.pending.swap_remove(i);
+            self.held -= p.data.len();
+        }
     }
 
     /// The next message in sequence, if all of it has come.
@@ -1148,19 +1240,41 @@ fn extensions(r: &mut Reader<'_>) -> Result<Option<Vec<Extension>>, HandshakeErr
     }
     let mut e = Reader::new(block);
     let mut out = Vec::new();
+    let mut seen = TypeSet::new();
     while e.remaining() > 0 {
         let typ = e.u16().map_err(|_| HandshakeError::Extensions)?;
         let data = e.vec16().map_err(|_| HandshakeError::Extensions)?;
+        if !seen.insert(typ) {
+            return Err(HandshakeError::DuplicateExtension(typ));
+        }
         out.push(Extension { typ, data: data.to_vec() });
     }
     Ok(Some(out))
 }
 
+/// A set of extension types: one bit for each of the 65536.
+struct TypeSet(Vec<u64>);
+
+impl TypeSet {
+    fn new() -> TypeSet {
+        TypeSet(vec![0; 1024])
+    }
+
+    /// Adds `typ`, and says whether it was not there before.
+    fn insert(&mut self, typ: u16) -> bool {
+        let (word, bit) = (usize::from(typ >> 6), 1u64 << (typ & 63));
+        let new = self.0[word] & bit == 0;
+        self.0[word] |= bit;
+        new
+    }
+}
+
 fn put_extensions(out: &mut Vec<u8>, extensions: Option<&[Extension]>) {
     let Some(extensions) = extensions else { return };
     let mut block = Vec::new();
+    let mut seen = TypeSet::new();
     for e in extensions {
-        if block.len() + 4 + e.data.len() > MAX_EXTENSIONS_LEN {
+        if block.len() + 4 + e.data.len() > MAX_EXTENSIONS_LEN || !seen.insert(e.typ) {
             continue;
         }
         block.extend_from_slice(&e.typ.to_be_bytes());
@@ -1280,7 +1394,7 @@ mod tests {
     fn server_hello_bytes() -> Vec<u8> {
         let mut b = vec![0xfe, 0xfd];
         b.extend_from_slice(&HELLO_RETRY_REQUEST_RANDOM);
-        b.extend_from_slice(&[1, 9]);
+        b.push(0);
         b.extend_from_slice(&[0x13, 0x01, 0]);
         b.extend_from_slice(&[0, 6, 0, 43, 0, 2, 0xfe, 0xfc]);
         b
@@ -1404,14 +1518,13 @@ mod tests {
             has_length: false,
             payload: vec![9; 5],
         });
-        let records = vec![plain.clone(), tail.clone(), plain.clone(), tail.clone()];
+        let Record::Unified(mut framed) = tail.clone() else { panic!() };
+        framed.has_length = true;
+        let framed = Record::Unified(framed);
+        let records = vec![plain.clone(), framed.clone(), plain.clone(), tail.clone()];
         let bytes = write_datagram(&records);
         let back = parse_datagram(&bytes, 0).unwrap();
-        // Unified records before the last get a length.
-        let Record::Unified(u) = &back[1] else { panic!() };
-        assert!(u.has_length);
-        assert_eq!(back[3], tail);
-        assert_eq!(back[0], plain);
+        assert_eq!(back, records);
         assert_eq!(write_datagram(&back), bytes);
         assert_eq!(parse_datagram(&[], 0), Ok(vec![]));
         // An error anywhere fails the datagram.
@@ -1623,7 +1736,7 @@ mod tests {
         let b = server_hello_bytes();
         let sh = ServerHello::parse(&b).unwrap();
         assert!(sh.is_hello_retry_request());
-        assert_eq!(sh.session_id, [9]);
+        assert!(sh.session_id.is_empty());
         assert_eq!((sh.cipher_suite, sh.compression_method), (0x1301, 0));
         assert_eq!(sh.selected_version(), Some(version::DTLS_1_3));
         assert_eq!(sh.to_bytes(), b);
@@ -1693,7 +1806,7 @@ mod tests {
         // that reassemble.
         let m = Handshake { msg_type: 1, message_seq: 0, body: ch.to_bytes() };
         let mut r = Reassembler::new();
-        for f in m.fragments(MAX_PLAIN_FRAGMENT - HANDSHAKE_HEADER_LEN) {
+        for f in m.fragments(MAX_PLAINTEXT - HANDSHAKE_HEADER_LEN) {
             let rec = Record::Plain(PlainRecord {
                 content_type: ContentType::HANDSHAKE,
                 version: version::DTLS_1_2,
@@ -1732,7 +1845,7 @@ mod tests {
         let Record::Plain(back) = Record::parse(&p.to_bytes(), 255).unwrap().0 else { panic!() };
         assert_eq!(back.sequence, MAX_SEQUENCE);
         assert_eq!(back.connection_id.len(), MAX_CID_LEN);
-        assert_eq!(back.fragment.len(), MAX_PLAIN_FRAGMENT);
+        assert_eq!(back.fragment.len(), MAX_PLAINTEXT);
         let u = Record::Unified(UnifiedRecord {
             epoch_bits: 0xff,
             connection_id: Some(vec![1; 300]),
@@ -1867,6 +1980,154 @@ mod tests {
         }
         assert_eq!(r.add(&f(seq, big, 0, vec![0])), Err(ReassemblyError::Memory));
         assert_eq!(r.buffered(), MAX_REASSEMBLY_BYTES);
+        const { assert!(MAX_MESSAGE_LEN <= MAX_REASSEMBLY_BYTES) };
+    }
+
+    fn unified(cid: Option<Vec<u8>>, has_length: bool, payload: Vec<u8>) -> Record {
+        Record::Unified(UnifiedRecord {
+            epoch_bits: 3,
+            connection_id: cid,
+            sequence: Sequence::Short(4),
+            has_length,
+            payload,
+        })
+    }
+
+    fn cid_record(cid: Vec<u8>) -> Record {
+        Record::Plain(PlainRecord {
+            content_type: ContentType::TLS12_CID,
+            version: version::DTLS_1_2,
+            epoch: 1,
+            sequence: 2,
+            connection_id: cid,
+            fragment: vec![0x55],
+        })
+    }
+
+    #[test]
+    fn datagrams_keep_protected_headers() {
+        // RFC 9147, section 4: the unified header is the AEAD's additional
+        // data, so a writer must not add a length to it. A record without
+        // one ends the datagram, and records after it are left out.
+        let open = unified(None, false, vec![9; 20]);
+        let plain = Record::parse(&PLAIN, 0).unwrap().0;
+        let bytes = write_datagram(&[plain.clone(), open.clone(), plain.clone()]);
+        let mut want = PLAIN.to_vec();
+        want.extend_from_slice(&open.to_bytes());
+        assert_eq!(bytes, want);
+        assert_eq!(parse_datagram(&bytes, 0).unwrap(), [plain, open]);
+    }
+
+    #[test]
+    fn datagrams_keep_one_cid_length() {
+        // RFC 9146, section 4: the receiver reads every connection ID with
+        // the one length it chose, so a datagram holds only that length.
+        let records = [
+            cid_record(vec![0xaa]),
+            cid_record(vec![0xbb, 0xcc]),
+            unified(Some(vec![1, 2]), true, vec![0; 16]),
+            unified(Some(vec![3]), true, vec![0; 16]),
+            unified(None, true, vec![0; 16]),
+        ];
+        let bytes = write_datagram(&records);
+        let back = parse_datagram(&bytes, 1).unwrap();
+        assert_eq!(back, [records[0].clone(), records[3].clone(), records[4].clone()]);
+    }
+
+    #[test]
+    fn plaintext_records_hold_two_to_the_fourteen() {
+        // RFC 6347, section 4.1: an epoch-0 record is plaintext, at most
+        // 2^14 bytes; protected records may carry 2048 more.
+        let record = |epoch: u16, n: usize| {
+            let mut b = vec![22, 0xfe, 0xfd];
+            b.extend_from_slice(&epoch.to_be_bytes());
+            b.extend_from_slice(&[0; 6]);
+            b.extend_from_slice(&(n as u16).to_be_bytes());
+            b.extend(std::iter::repeat_n(0, n));
+            b
+        };
+        assert!(Record::parse(&record(0, MAX_PLAINTEXT), 0).is_ok());
+        assert_eq!(Record::parse(&record(0, MAX_PLAINTEXT + 1), 0), Err(RecordError::Length(MAX_PLAINTEXT + 1)));
+        assert!(Record::parse(&record(1, MAX_PLAIN_FRAGMENT), 0).is_ok());
+        let Ok((Record::Plain(mut p), _)) = Record::parse(&record(1, MAX_PLAIN_FRAGMENT), 0) else { panic!() };
+        p.epoch = 0;
+        let Record::Plain(back) = Record::parse(&Record::Plain(p).to_bytes(), 0).unwrap().0 else { panic!() };
+        assert_eq!(back.fragment.len(), MAX_PLAINTEXT);
+    }
+
+    #[test]
+    fn later_messages_do_not_starve_the_next() {
+        // Messages 1 to 4 each claim a quarter of the budget with one byte.
+        // Message 0 still goes in, and later messages make way for it.
+        let mut r = Reassembler::new();
+        let quarter = (MAX_REASSEMBLY_BYTES / 4) as u32;
+        for seq in 1..=4 {
+            let f = Fragment { msg_type: 1, length: quarter, message_seq: seq, offset: 0, body: vec![1] };
+            assert_eq!(r.add(&f), Ok(Added::New));
+        }
+        let first = Handshake { msg_type: 1, message_seq: 0, body: vec![7] };
+        assert_eq!(r.add(&first.to_fragment()), Ok(Added::New));
+        assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
+        assert_eq!(r.next_message(), Some(first));
+        // The furthest message made way; the nearer ones stay.
+        assert_eq!(r.buffered(), 3 * quarter as usize);
+        let second = Handshake { msg_type: 1, message_seq: 1, body: vec![1; quarter as usize] };
+        assert_eq!(r.add(&second.to_fragment()), Ok(Added::New));
+        assert_eq!(r.next_message(), Some(second));
+        // A message for the next place always fits, whatever is held.
+        let mut r = Reassembler::new();
+        for seq in 1..=4 {
+            let f = Fragment { msg_type: 1, length: quarter, message_seq: seq, offset: 0, body: vec![1] };
+            r.add(&f).unwrap();
+        }
+        let big = Handshake { msg_type: 1, message_seq: 0, body: vec![5; MAX_MESSAGE_LEN] };
+        assert_eq!(r.add(&big.to_fragment()), Ok(Added::New));
+        assert!(r.buffered() <= MAX_REASSEMBLY_BYTES);
+        assert_eq!(r.next_message(), Some(big));
+    }
+
+    #[test]
+    fn client_hello_needs_suites_and_compression() {
+        // RFC 6347, section 4.2.1 (as RFC 5246): cipher_suites<2..2^16-2>
+        // and compression_methods<1..2^8-1>.
+        let mut b = vec![0xfe, 0xfd];
+        b.extend_from_slice(&[7; 32]);
+        b.extend_from_slice(&[0, 0]);
+        let mut empty_suites = b.clone();
+        empty_suites.extend_from_slice(&[0, 0, 1, 0]);
+        assert_eq!(ClientHello::parse(&empty_suites), Err(HandshakeError::CipherSuites));
+        let mut empty_compression = b.clone();
+        empty_compression.extend_from_slice(&[0, 2, 0xc0, 0x2b, 0]);
+        assert_eq!(ClientHello::parse(&empty_compression), Err(HandshakeError::CompressionMethods));
+        // Writers put in the least the format allows.
+        let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
+        ch.cipher_suites.clear();
+        ch.compression_methods.clear();
+        let back = ClientHello::parse(&ch.to_bytes()).unwrap();
+        assert_eq!(back.cipher_suites, [0]);
+        assert_eq!(back.compression_methods, [0]);
+    }
+
+    #[test]
+    fn extensions_are_unique() {
+        // RFC 5246, section 7.4.1.4, and RFC 8446, section 4.2: one
+        // extension of each type at most.
+        let mut b = client_hello_bytes();
+        let at = b.len() - 11;
+        b.truncate(at);
+        b.extend_from_slice(&[0, 14, 0, 43, 0, 3, 2, 0xfe, 0xfd, 0, 43, 0, 3, 2, 0xfe, 0xfc]);
+        assert_eq!(ClientHello::parse(&b), Err(HandshakeError::DuplicateExtension(43)));
+        let mut sh = ServerHello::parse(&server_hello_bytes()).unwrap();
+        let mut bytes = sh.to_bytes();
+        let n = bytes.len();
+        bytes[n - 7] = 12;
+        bytes.extend_from_slice(&[0, 43, 0, 2, 0xfe, 0xfc]);
+        assert_eq!(ServerHello::parse(&bytes), Err(HandshakeError::DuplicateExtension(43)));
+        // Writers keep the first of each type.
+        let svs = |v: u8| Extension { typ: extension_type::SUPPORTED_VERSIONS, data: vec![0xfe, v] };
+        sh.extensions = Some(vec![svs(0xfc), Extension { typ: 1, data: vec![] }, svs(0xfd)]);
+        let back = ServerHello::parse(&sh.to_bytes()).unwrap();
+        assert_eq!(back.extensions, Some(vec![svs(0xfc), Extension { typ: 1, data: vec![] }]));
     }
 
     /// A deterministic generator for the fuzz loop.
@@ -1902,9 +2163,16 @@ mod tests {
                     let _ = m.parse_body();
                 }
             }
+            // The next message expected still goes in.
+            let next = Handshake { msg_type: 1, message_seq: r.next_seq(), body: b.to_vec() };
+            match r.add(&next.to_fragment()) {
+                Ok(_) => assert!(r.next_message().is_some()),
+                Err(e) => assert_eq!(e, ReassemblyError::Conflict),
+            }
         }
         if let Ok(ch) = ClientHello::parse(b) {
             assert_eq!(ch.to_bytes(), b);
+            assert!(!ch.cipher_suites.is_empty() && !ch.compression_methods.is_empty());
             let _ = ch.supported_versions();
         }
         if let Ok(sh) = ServerHello::parse(b) {

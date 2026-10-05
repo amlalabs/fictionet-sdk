@@ -2,7 +2,9 @@
 //! reads them.
 #![no_main]
 
-use fictionet::stdlib::coap::{Assembler, Block, Code, Decoder, Frame, MAX_DATAGRAM, Message, Options, option, peek_header};
+use fictionet::stdlib::coap::{
+    Assembler, Block, BlockError, Code, Decoder, Frame, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option, peek_header,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -11,9 +13,29 @@ fuzz_target!(|data: &[u8]| {
     let _ = peek_header(data);
     if let Ok(m) = Message::parse(data) {
         assert_eq!(m.to_bytes(), data);
+        // RFC 7252 sections 4.2 and 4.3: a reader keeps only the forms a
+        // type allows.
+        match m.kind {
+            Type::Acknowledgement => assert!(m.code.is_empty() || m.code.is_response()),
+            Type::Reset => assert!(m.code.is_empty()),
+            Type::NonConfirmable => assert!(!m.code.is_empty()),
+            Type::Confirmable => {}
+        }
+        // A message read writes back whole, unless it carries SZX 7.
+        assert_eq!(m.try_to_bytes().is_some(), m.bad_block().is_none());
         let o = &m.options;
         let _ = (m.bad_option(), o.uri_path(), o.uri_query(), o.content_format(), o.accept(), o.max_age());
         let _ = (o.observe(), o.size1(), o.size2(), o.uri_host(), o.uri_port());
+        // A Uri-Path of `.` or `..` is a bad critical option, and no path
+        // reads from it.
+        if o.get_all(option::URI_PATH).any(|s| s == b"." || s == b"..") {
+            assert!(m.bad_option().is_some());
+            assert_eq!(o.uri_path(), None);
+        }
+        // A critical string option that is not UTF-8 is a bad option.
+        if o.get(option::URI_HOST).is_some_and(|v| std::str::from_utf8(v).is_err()) {
+            assert!(m.bad_option().is_some());
+        }
         // A path read writes back as the same segments, except one empty
         // segment, which reads as `/` like no segment at all.
         if let Some(path) = o.uri_path() {
@@ -34,11 +56,20 @@ fuzz_target!(|data: &[u8]| {
         let reply = m.reply(Code::CONTENT, 1).to_bytes();
         assert!(reply.len() <= MAX_DATAGRAM);
         assert!(Message::parse(&reply).is_ok());
-        // A Block1 block the message carries goes into an assembler
-        // without trouble, and its payload stays in bounds.
+        // A Block1 block the message carries: SZX 7 is refused with 4.00
+        // over UDP, any last block within the limit is taken, and the
+        // body stays in bounds.
         if let Some(block) = o.block1() {
             let mut a = Assembler::new(1 << 16);
-            let _ = a.push(block, &m.payload);
+            let r = a.push(block, &m.payload);
+            if block.is_bert() {
+                assert_eq!(m.bad_block(), Some(option::BLOCK1));
+                if block.num == 0 {
+                    assert_eq!(r, Err(BlockError::Size));
+                }
+            } else if block.num == 0 && !block.more {
+                assert_eq!(r, Ok(true));
+            }
             assert!(a.body().len() <= 1 << 16);
         }
         if let Some(Block { num, szx, .. }) = o.block2() {
@@ -46,13 +77,42 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // The bytes as a series of blocks: a body cut with Block::take goes
+    // back together whatever the block size, and a cut that is out of
+    // order or the wrong size is refused without changing the body.
+    if let [szx, rest @ ..] = data {
+        let szx = szx % 7;
+        let mut a = Assembler::new(rest.len());
+        let mut num = 0;
+        while let Some((block, chunk)) = Block::take(rest, num, szx) {
+            let before = a.body().len();
+            if num > 0 {
+                let skipped = Block { num: num + 1, ..block };
+                assert!(matches!(a.push(skipped, chunk), Err(BlockError::OutOfOrder { .. })));
+                assert_eq!(a.body().len(), before);
+            }
+            if a.push(block, chunk).unwrap() {
+                break;
+            }
+            num += 1;
+        }
+        assert!(a.is_done());
+        assert_eq!(a.body(), rest);
+    }
+
     // The bytes as a TCP stream, split two ways: all at once, and a byte
-    // at a time. Both give the same frames and errors.
+    // at a time. Both give the same frames and errors, and a decoder
+    // never holds more than MAX_BUFFERED bytes.
     let mut whole = Decoder::new();
-    whole.feed(data);
     let mut frames = Vec::new();
-    while let Some(r) = whole.next_frame() {
-        frames.push(r);
+    let mut at = 0;
+    loop {
+        at += whole.feed(&data[at..]);
+        assert!(whole.buffered() <= MAX_BUFFERED);
+        match whole.next_frame() {
+            Some(r) => frames.push(r),
+            None => break,
+        }
         if whole.is_broken() {
             break;
         }
@@ -60,7 +120,7 @@ fuzz_target!(|data: &[u8]| {
     let mut bytewise = Decoder::new();
     let mut again = Vec::new();
     for b in data {
-        bytewise.feed(std::slice::from_ref(b));
+        assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
         while let Some(r) = bytewise.next_frame() {
             again.push(r);
             if bytewise.is_broken() {
@@ -76,6 +136,7 @@ fuzz_target!(|data: &[u8]| {
     // A frame read writes back as the same bytes, and reads back the same.
     for f in frames.iter().flatten() {
         let bytes = f.to_bytes();
+        assert_eq!(f.try_to_bytes().as_ref(), Some(&bytes));
         let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
         assert_eq!(&back, f);
         assert_eq!(used, bytes.len());
