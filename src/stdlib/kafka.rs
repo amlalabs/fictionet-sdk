@@ -12,10 +12,11 @@
 //! definitions in Kafka's source.
 //!
 //! Nothing here reads a socket. A world that plays a broker feeds the
-//! bytes it reads from a TCP connection to a [`Decoder`], gets each
-//! frame's payload back, reads it with [`Request::parse`], and writes the
-//! reply from [`Response::to_frame`] back to the connection. Which topics
-//! exist, and what the broker says about them, is up to world code.
+//! bytes it reads from a TCP connection to [`Frames`] with
+//! [`super::codec::Stream`], gets each frame's payload back, reads it
+//! with [`Request::parse`], and writes the reply from
+//! [`Response::to_frame`] back to the connection. Which topics exist,
+//! and what the broker says about them, is up to world code.
 //!
 //! Requests carry their key and version, so [`Request::parse`] reads them
 //! on its own. Responses do not: a client matches each response to its
@@ -30,7 +31,7 @@
 //! and by the bytes that are there. A parsed body can take a few dozen
 //! times its size in memory, since each field of a few bytes becomes a
 //! struct. A world that wants less sets a lower frame limit with
-//! [`Decoder::with_limit`].
+//! [`Frames::with_limit`].
 //!
 //! Writers cut strings and arrays that are too long to read back, and
 //! refuse with [`Error::Invalid`] the values Kafka's own client refuses to
@@ -38,17 +39,23 @@
 //! for by ID before Metadata version 12, and the like. Readers refuse the
 //! same values, so whatever one reads, the other writes.
 //!
+//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
+//! EOF handling and errors reported once.
+//!
 //! ```
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
 //! use fictionet::stdlib::kafka::{
-//!     api_key, ApiVersion, ApiVersionsResponse, Decoder, Request, RequestBody, Response, ResponseBody,
+//!     api_key, ApiVersion, ApiVersionsResponse, Frames, Request, RequestBody, Response, ResponseBody,
 //!     ResponseHeader,
 //! };
 //!
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(Frames::new());
+//! let mut frames = Vec::new();
 //! // ApiVersions version 0, correlation ID 1, client ID "x".
-//! decoder.feed(&[0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x']);
-//! let payload = decoder.next_frame().unwrap().unwrap();
-//! let request = Request::parse(&payload).unwrap();
+//! let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
+//! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+//! finish(&mut stream, |_| unreachable!()).unwrap();
+//! let request = Request::parse(&frames.pop().unwrap().0).unwrap();
 //! assert_eq!(request.header.client_id.as_deref(), Some("x"));
 //! assert!(matches!(request.body, RequestBody::ApiVersions(_)));
 //!
@@ -63,6 +70,11 @@
 //! assert_eq!(bytes, [0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 18, 0, 0, 0, 4]);
 //! assert_eq!(Response::parse(&bytes[4..], api_key::API_VERSIONS, 0).unwrap(), response);
 //! ```
+
+extern crate alloc;
+
+use super::codec::{Decode, Step, Wire};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
 pub const PORT: u16 = 9092;
@@ -219,8 +231,8 @@ pub enum Error {
     Invalid(&'static str),
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Truncated => f.write_str("bytes end in the middle of a field"),
             Error::FrameSize(n) => write!(f, "frame size {n} is negative or over the limit"),
@@ -241,7 +253,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// One tagged field: a tag number and its value's bytes, unread. Flexible
 /// versions end each structure with a list of these, so new fields can be
@@ -405,7 +417,7 @@ impl<'a> Reader<'a> {
 
     fn utf8(&mut self, n: usize) -> Result<String, Error> {
         let b = self.take(n)?;
-        std::str::from_utf8(b).map(str::to_owned).map_err(|_| Error::Utf8)
+        core::str::from_utf8(b).map(str::to_owned).map_err(|_| Error::Utf8)
     }
 
     /// A STRING: an INT16 length, then that many bytes of UTF-8.
@@ -845,11 +857,115 @@ pub fn correlation_id(payload: &[u8]) -> Option<i32> {
     Some(i32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
+/// A Kafka frame payload, bounded by [`MAX_FRAME`].
+///
+/// [`Wire::parse`] reads exactly one size-prefixed frame. Request and response
+/// parsing stays separate because responses need the request's key and version.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// Payload bytes without the four-byte size prefix.
+    pub Vec<u8>,
+);
+
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        match parse_frame(b, MAX_FRAME)? {
+            Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
+            Some((_, used)) => Err(Error::Trailing(b.len().saturating_sub(used))),
+            None => Err(Error::Truncated),
+        }
+    }
+
+    /// Appends at most [`SIZE_LEN`] plus [`MAX_FRAME`] bytes.
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&frame(&self.0)?);
+        Ok(())
+    }
+}
+
+/// Reads Kafka frames without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`SIZE_LEN`] plus
+/// [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
+/// The stream reports truncation at EOF and framing errors once. Map frames
+/// through [`Request::parse`] to receive body errors as items.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+/// use fictionet::stdlib::kafka::{Frames, Request};
+///
+/// let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
+/// let mut stream = Stream::new(Frames::new().map(|frame| Request::parse(&frame.0)));
+/// let mut requests = Vec::new();
+/// pump(&mut stream, &bytes[..2], |request| requests.push(request))?;
+/// pump(&mut stream, &bytes[2..], |request| requests.push(request))?;
+/// finish(&mut stream, |request| requests.push(request))?;
+/// assert_eq!(requests.len(), 1);
+/// assert_eq!(requests[0].as_ref().unwrap().header.client_id.as_deref(), Some("x"));
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::kafka::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Accepts frames with up to [`MAX_FRAME`] payload bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_FRAME)
+    }
+
+    /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts empty
+    /// payloads. An oversized frame is refused from its four-byte header.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_FRAME) }
+    }
+
+    /// The maximum payload length, excluding the size prefix.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = Error;
+    const NAME: &'static str = "Kafka";
+
+    fn capacity(&self) -> usize {
+        SIZE_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
+        Ok(match parse_frame(input, self.limit)? {
+            Some((payload, used)) => Step::Item(Frame(payload.to_vec()), used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a Kafka byte stream into frame payloads. Feed it the bytes a
 /// connection reads, in order, and take payloads out until it has none.
 /// A frame size that is negative or over the limit breaks the stream as
 /// soon as its 4 bytes are fed, and the bytes after it are not kept.
+///
+/// This compatibility decoder buffers every byte fed without a limit until
+/// it is taken out or a framing error clears the buffer. Use [`Frames`] with
+/// [`super::codec::Stream`] for bounded input, EOF handling and errors
+/// reported once.
 #[derive(Clone, Debug)]
+#[deprecated(note = "use codec::Stream with kafka::Frames")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -860,12 +976,14 @@ pub struct Decoder {
     failed: Option<Error>,
 }
 
+#[allow(deprecated)]
 impl Default for Decoder {
     fn default() -> Decoder {
         Decoder::new()
     }
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes, which takes frames up to [`MAX_FRAME`].
     pub fn new() -> Decoder {
@@ -1842,6 +1960,7 @@ impl Response {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
 

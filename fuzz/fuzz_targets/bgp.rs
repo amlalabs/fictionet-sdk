@@ -6,9 +6,10 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::bgp::{
-    Attribute, Context, Decoder, EncodeError, Error, Frame, MAX_BODY_LEN, MAX_BUFFERED, Message, MpReach, Nlri, Open,
-    Origin, Prefix, Segment, SegmentKind, Update, afi, kind, safi,
+    Attribute, Context, Decoder, EncodeError, Error, Frame, Frames, MAX_BODY_LEN, MAX_BUFFERED, Message, MpReach,
+    Nlri, Open, Origin, Prefix, Segment, SegmentKind, Update, afi, kind, safi,
 };
+use fictionet::stdlib::codec::{Decode, contract};
 use libfuzzer_sys::fuzz_target;
 
 /// Every combination of the session settings.
@@ -97,6 +98,15 @@ fn update_from(data: &[u8]) -> Update {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Frames, data);
+    contract::check_wire::<Frame>(data);
+    contract::check_decode(|| Frames.map(|frame| Message::decode(&frame, &Context::default())), data);
+    let built = Frame {
+        kind: data.first().copied().unwrap_or(0),
+        body: data.iter().take(MAX_BODY_LEN + 1).copied().collect(),
+    };
+    contract::check_wire_value(&built);
+
     // The stream, split two ways: all at once, and a byte at a time, up to
     // and with the first error.
     let frames = split(&mut Decoder::new(), data);

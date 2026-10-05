@@ -15,9 +15,10 @@
 //! refresh errors) and RFC 9072 (long OPEN optional parameters).
 //!
 //! Nothing here reads a socket. A world that plays a router feeds the
-//! bytes it reads from a TCP connection to a [`Decoder`], gets [`Frame`]s
-//! back, and reads each one with [`Message::decode`]. It writes the bytes
-//! of [`Message::to_bytes`] back to the connection. Which routes exist,
+//! bytes it reads from a TCP connection to [`Frames`] with
+//! [`super::codec::Stream`], gets [`Frame`]s back, and reads each one
+//! with [`Message::decode`]. It writes the bytes of
+//! [`Message::to_bytes`] back to the connection. Which routes exist,
 //! which peers are welcome and when timers fire is up to world code.
 //!
 //! How an UPDATE reads depends on the session: once both speakers have
@@ -34,10 +35,14 @@
 //! Writers check the same rules and return an [`EncodeError`] instead of
 //! bytes a reader would refuse.
 //!
+//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
+//! EOF handling and errors reported once.
+//!
 //! ```
-//! use std::net::Ipv4Addr;
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use core::net::Ipv4Addr;
 //! use fictionet::stdlib::bgp::{
-//!     afi, safi, Attribute, Capability, Context, Decoder, Message, Open, Origin, Prefix, Segment, SegmentKind,
+//!     afi, safi, Attribute, Capability, Context, Frames, Message, Open, Origin, Prefix, Segment, SegmentKind,
 //!     Update, AS_TRANS,
 //! };
 //!
@@ -46,10 +51,11 @@
 //!     afi: afi::IPV4,
 //!     safi: safi::UNICAST,
 //! }]);
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(Frames);
+//! let mut frames = Vec::new();
 //! let bytes = Message::Open(theirs).to_bytes(&Context::default()).unwrap();
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let frame = decoder.next_frame().unwrap().unwrap();
+//! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+//! let frame = frames.pop().unwrap();
 //! let Message::Open(open) = Message::decode(&frame, &Context::default()).unwrap() else {
 //!     panic!("not an OPEN");
 //! };
@@ -79,12 +85,17 @@
 //! // The prefix comes last: its length in bits, then 3 bytes.
 //! assert_eq!(bytes[43..], [24, 203, 0, 113]);
 //!
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let frame = decoder.next_frame().unwrap().unwrap();
+//! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+//! let frame = frames.pop().unwrap();
 //! assert_eq!(Message::decode(&frame, &ctx), Ok(Message::Update(update)));
+//! finish(&mut stream, |_| unreachable!()).unwrap();
 //! ```
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+extern crate alloc;
+
+use super::codec::{Decode, Step, Wire};
+use alloc::{vec, vec::Vec};
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// The TCP port BGP speakers listen on.
 pub const PORT: u16 = 179;
@@ -417,8 +428,8 @@ impl Error {
     }
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::ConnectionNotSynchronized => f.write_str("marker is not all ones"),
             Error::BadMessageLength(n) => write!(f, "bad message length {n}"),
@@ -445,7 +456,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Why a message cannot be written: its fields break a rule the reader
 /// checks, or it does not fit in [`MAX_MESSAGE_LEN`] bytes.
@@ -457,8 +468,8 @@ pub enum EncodeError {
     Invalid(&'static str),
 }
 
-impl std::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for EncodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             EncodeError::TooLong => write!(f, "message longer than {MAX_MESSAGE_LEN} bytes"),
             EncodeError::Invalid(why) => f.write_str(why),
@@ -466,7 +477,7 @@ impl std::fmt::Display for EncodeError {
     }
 }
 
-impl std::error::Error for EncodeError {}
+impl core::error::Error for EncodeError {}
 
 /// One BGP message as the header splits it: its type and the bytes after
 /// the header. The marker is always all ones and the length is worked out
@@ -518,9 +529,104 @@ impl Frame {
     }
 }
 
+/// Why an exact [`Wire`] parse did not read one complete BGP frame.
+/// [`Frame::parse`] keeps its prefix parsing behavior.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame header is invalid.
+    Frame(Error),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete BGP frame"),
+            Self::Trailing => f.write_str("bytes follow the BGP frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = EncodeError;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(b).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_MESSAGE_LEN`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads BGP frames without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`MAX_MESSAGE_LEN`].
+/// Partial frames return [`Step::Need`], including at EOF. The stream reports
+/// truncation at EOF and framing errors once. Map frames through
+/// [`Message::decode`] with the session's [`Context`] to read their bodies.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+/// use fictionet::stdlib::bgp::{Context, Frames, Message};
+///
+/// let context = Context::default();
+/// let bytes = Message::Keepalive.to_bytes(&context)?;
+/// let mut stream = Stream::new(Frames.map(|frame| Message::decode(&frame, &context)));
+/// let mut messages = Vec::new();
+/// pump(&mut stream, &bytes, |message| messages.push(message))?;
+/// finish(&mut stream, |message| messages.push(message))?;
+/// assert_eq!(messages, [Ok(Message::Keepalive)]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = Error;
+    const NAME: &'static str = "BGP";
+
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE_LEN
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
+        Ok(match Frame::parse(input)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a BGP byte stream into frames. Feed it the bytes a connection
 /// reads, in order, and take frames out until it has none. It holds at
 /// most [`MAX_BUFFERED`] bytes that have not been taken out.
+///
+/// This compatibility decoder keeps its original feed limits and repeated
+/// errors. Use [`Frames`] with [`super::codec::Stream`] for EOF handling
+/// and errors reported once.
 #[derive(Clone, Debug, Default)]
 pub struct Decoder {
     buf: Vec<u8>,
@@ -1026,8 +1132,8 @@ impl Prefix {
     }
 }
 
-impl std::fmt::Display for Prefix {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Prefix {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}/{}", self.addr, self.length)
     }
 }
@@ -1688,7 +1794,7 @@ impl Update {
         out.extend_from_slice(&[0, 0]);
         let mut seen = [false; 256];
         for a in &self.attributes {
-            if std::mem::replace(&mut seen[usize::from(a.kind())], true) {
+            if core::mem::replace(&mut seen[usize::from(a.kind())], true) {
                 return Err(EncodeError::Invalid("attribute type appears twice"));
             }
             a.write(&mut out, ctx)?;
@@ -1792,7 +1898,7 @@ fn read_update(b: &[u8], ctx: &Context, strict: bool) -> Result<Received, Error>
             break;
         };
         let raw = &all[..all.len() - attrs.len()];
-        if std::mem::replace(&mut seen[usize::from(kind)], true) {
+        if core::mem::replace(&mut seen[usize::from(kind)], true) {
             // RFC 7606 section 3 (g): a repeated MP attribute closes the
             // connection; other repeats are dropped.
             if strict || kind == attr::MP_REACH_NLRI || kind == attr::MP_UNREACH_NLRI {
@@ -1875,8 +1981,8 @@ impl Notification {
     }
 }
 
-impl std::fmt::Display for Notification {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Notification {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let name = match self.code {
             code::MESSAGE_HEADER => "message header error",
             code::OPEN_MESSAGE => "OPEN message error",

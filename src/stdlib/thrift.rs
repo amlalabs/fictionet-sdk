@@ -18,19 +18,25 @@
 //! lists, sets and maps. Many servers wrap each message in a frame, which
 //! is a 4-byte big-endian length followed by the message.
 //!
-//! Nothing here reads a socket. A world that plays a Thrift server feeds
-//! the bytes it reads from a TCP connection to a [`Decoder`], reads each
-//! frame's [`Message`], and writes the reply's bytes back. Values are read
-//! without a schema, into a tree of [`Value`]s, so world code decides what
-//! each field number means. On a connection without frames, a
-//! [`StreamDecoder`] takes the bytes and gives back whole messages.
+//! Nothing here reads a socket. A world that plays a Thrift server
+//! feeds the bytes it reads from a TCP connection to [`Frames`] with
+//! [`super::codec::Stream`], reads each frame's [`Message`], and writes
+//! the reply's bytes back. Values are read without a schema, into a
+//! tree of [`Value`]s, so world code decides what each field number
+//! means. On a connection without frames, a [`Messages`] decoder takes
+//! the bytes and gives back whole messages.
 //!
 //! Every reader checks lengths, counts and nesting against the limits
 //! below, because the agent can send any bytes it likes. Every writer
 //! checks the same limits, so what it writes always reads back.
 //!
+//! Use [`Frames`] for framed transport or [`Messages`] for unframed transport
+//! with [`super::codec::Stream`] for bounded input, explicit EOF handling and
+//! errors reported once.
+//!
 //! ```
-//! use fictionet::stdlib::thrift::{exception_kind, field, Decoder, Field, Message, Protocol, Value};
+//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::thrift::{exception_kind, field, Frames, Field, Message, Protocol, Value};
 //!
 //! /// A calculator service with one method: i32 add(1: i32 a, 2: i32 b).
 //! fn answer(call: &Message) -> Message {
@@ -43,12 +49,16 @@
 //!     }
 //! }
 //!
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(Frames::new());
+//! let mut frames = Vec::new();
 //! // A framed call to add(2, 3), sequence number 1, in the strict binary form.
-//! decoder.feed(&[0, 0, 0, 30]);
-//! decoder.feed(&[0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1]);
-//! decoder.feed(&[0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00]);
-//! let payload = decoder.next_frame().unwrap().unwrap();
+//! pump(&mut stream, &[0, 0, 0, 30], |frame| frames.push(frame)).unwrap();
+//! let header = [0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1];
+//! pump(&mut stream, &header, |frame| frames.push(frame)).unwrap();
+//! let body = [0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00];
+//! pump(&mut stream, &body, |frame| frames.push(frame)).unwrap();
+//! finish(&mut stream, |_| unreachable!()).unwrap();
+//! let payload = frames.pop().unwrap().0;
 //! let (call, protocol, used) = Message::parse(&payload).unwrap();
 //! assert_eq!((protocol, used), (Protocol::Binary, payload.len()));
 //! let reply = answer(&call).to_frame(protocol).unwrap();
@@ -63,6 +73,11 @@
 //!     ]
 //! );
 //! ```
+
+extern crate alloc;
+
+use super::codec::{Decode, Step, Wire};
+use alloc::{string::String, vec, vec::Vec};
 
 /// The TCP port Thrift servers commonly listen on.
 pub const PORT: u16 = 9090;
@@ -80,7 +95,7 @@ pub const MAX_VALUES: usize = 1 << 20;
 /// The deepest nesting of values. A message's body is at depth 1, its
 /// fields at depth 2, and so on. Apache Thrift uses the same default.
 pub const MAX_DEPTH: usize = 64;
-/// The longest message a [`StreamDecoder`] reads from a connection without
+/// The longest message [`Messages`] or [`StreamDecoder`] reads without
 /// frames. It is the same as [`MAX_FRAME`], so a message that fits in a
 /// frame also fits here.
 pub const MAX_MESSAGE: usize = MAX_FRAME;
@@ -525,12 +540,12 @@ pub enum Error {
     TooDeep,
     /// There are more values than [`MAX_VALUES`].
     TooMany,
-    /// A message read by a [`StreamDecoder`] is longer than [`MAX_MESSAGE`].
+    /// A message read by [`Messages`] or [`StreamDecoder`] is longer than [`MAX_MESSAGE`].
     TooLong,
 }
 
-impl std::fmt::Display for Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Error::Truncated => write!(f, "the bytes end inside a message or value"),
             Error::BadProtocol(b) => write!(f, "first byte {b:#04x} is not a Thrift message"),
@@ -548,7 +563,7 @@ impl std::fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
 /// Why a value or message cannot be written so that it reads back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -563,8 +578,8 @@ pub enum WriteError {
     Mismatch,
 }
 
-impl std::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             WriteError::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
             WriteError::TooMany => write!(f, "more than {MAX_VALUES} values"),
@@ -574,25 +589,25 @@ impl std::fmt::Display for WriteError {
     }
 }
 
-impl std::error::Error for WriteError {}
+impl core::error::Error for WriteError {}
 
 /// Why bytes are not a frame. The connection holds no more frames a
 /// reader can find, and a real server closes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameError {
-    /// The length was negative or above [`MAX_FRAME`].
+    /// The length was negative or above the configured limit.
     Length(i32),
 }
 
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FrameError::Length(n) => write!(f, "frame length {n}, outside 0..={MAX_FRAME}"),
+            FrameError::Length(n) => write!(f, "frame length {n} is negative or over the limit"),
         }
     }
 }
 
-impl std::error::Error for FrameError {}
+impl core::error::Error for FrameError {}
 
 /// `payload` in a frame: its length, then its bytes.
 pub fn frame(payload: &[u8]) -> Result<Vec<u8>, WriteError> {
@@ -609,11 +624,15 @@ pub fn frame(payload: &[u8]) -> Result<Vec<u8>, WriteError> {
 /// only part of one, and otherwise the payload and how many bytes of `b`
 /// the frame took.
 pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
+    parse_frame_limited(b, MAX_FRAME)
+}
+
+fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, FrameError> {
     let Some(header) = b.get(..FRAME_HEADER_LEN) else {
         return Ok(None);
     };
     let n = i32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-    if n < 0 || n as usize > MAX_FRAME {
+    if n < 0 || n as usize > limit {
         return Err(FrameError::Length(n));
     }
     let end = FRAME_HEADER_LEN + n as usize;
@@ -623,10 +642,144 @@ pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
     }
 }
 
+/// A framed Thrift payload, bounded by [`MAX_FRAME`].
+///
+/// [`Wire::parse`] reads exactly one length-prefixed frame. Use
+/// [`Message::parse`] to read its payload and identify the message protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Frame(
+    /// Payload bytes without the four-byte length prefix.
+    pub Vec<u8>,
+);
+
+/// Why an exact [`Wire`] parse did not read one complete Thrift frame.
+/// [`parse_frame`] keeps its prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame header is invalid.
+    Frame(FrameError),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete Thrift frame"),
+            Self::Trailing => f.write_str("bytes follow the Thrift frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match parse_frame(b).map_err(FrameParseError::Frame)? {
+            Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`FRAME_HEADER_LEN`] plus [`MAX_FRAME`] bytes.
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        out.extend_from_slice(&frame(&self.0)?);
+        Ok(())
+    }
+}
+
+/// Reads framed Thrift payloads without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
+/// plus [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
+/// The stream reports truncation at EOF and framing errors once. Map frames
+/// through [`Message::parse`] to receive body errors as items.
+/// This reads framed transport; [`Messages`] reads unframed transport.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Stream, finish, pump};
+/// use fictionet::stdlib::thrift::{Frame, Frames};
+///
+/// let mut stream = Stream::new(Frames::with_limit(16));
+/// let mut frames = Vec::new();
+/// pump(&mut stream, &[0, 0], |frame| frames.push(frame))?;
+/// pump(&mut stream, &[0, 2, 7, 8], |frame| frames.push(frame))?;
+/// finish(&mut stream, |frame| frames.push(frame))?;
+/// assert_eq!(frames, [Frame(vec![7, 8])]);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::thrift::FrameError>>(())
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Accepts frames with up to [`MAX_FRAME`] payload bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_FRAME)
+    }
+
+    /// Sets the payload limit, clamped to [`MAX_FRAME`]. Zero accepts empty
+    /// payloads. An oversized frame is refused from its four-byte header.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_FRAME) }
+    }
+
+    /// The maximum payload length, excluding the size prefix.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "Thrift framed transport";
+
+    fn capacity(&self) -> usize {
+        FRAME_HEADER_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match parse_frame_limited(input, self.limit)? {
+            Some((payload, used)) => Step::Item(Frame(payload.to_vec()), used),
+            None => Step::Need,
+        })
+    }
+}
+
 /// Splits a framed Thrift byte stream into frame payloads. Feed it the
 /// bytes a connection reads, in order, and take payloads out until it has
 /// none. Each payload is usually one [`Message`].
+///
+/// This compatibility decoder buffers every byte fed without a limit until
+/// it is taken out or a framing error clears the buffer. Use [`Frames`] with
+/// [`super::codec::Stream`] for bounded input, EOF handling and errors
+/// reported once.
 #[derive(Clone, Debug, Default)]
+#[deprecated(note = "use codec::Stream with thrift::Frames")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the bytes not yet taken out start. Bytes before it are
@@ -636,6 +789,7 @@ pub struct Decoder {
     failed: Option<FrameError>,
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes.
     pub fn new() -> Decoder {
@@ -685,6 +839,130 @@ impl Decoder {
     }
 }
 
+/// Reads unframed Thrift messages without holding input bytes.
+///
+/// Use with [`super::codec::Stream`] for input bounded by [`MAX_MESSAGE`]
+/// plus one byte, which lets the scanner refuse an oversized message.
+/// The scan cursor is relative to the unread start and resets after each
+/// item. The task stack reserves two slots per level of [`MAX_DEPTH`];
+/// [`Decode::held`] reports that storage, which cannot grow on [`Step::Need`].
+/// Partial messages return [`Step::Need`], including at EOF, so the stream
+/// reports truncation at EOF and protocol errors once.
+///
+/// ```
+/// use fictionet::stdlib::codec::{Stream, finish, pump};
+/// use fictionet::stdlib::thrift::{Message, MessageType, Messages, Protocol};
+///
+/// let call = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
+/// let bytes = call.to_bytes(Protocol::Compact)?;
+/// let mut stream = Stream::new(Messages::new());
+/// let mut messages = Vec::new();
+/// pump(&mut stream, &bytes[..2], |item| messages.push(item))?;
+/// pump(&mut stream, &bytes[2..], |item| messages.push(item))?;
+/// finish(&mut stream, |item| messages.push(item))?;
+/// assert_eq!(messages, [(call, Protocol::Compact)]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug)]
+pub struct Messages {
+    pos: usize,
+    tasks: Vec<Task>,
+    compact: bool,
+    values: usize,
+}
+
+impl Messages {
+    /// Creates an unframed decoder with a scan stack bounded by [`MAX_DEPTH`].
+    pub fn new() -> Self {
+        // Reserve the whole stack now: Need may advance a scan but must not
+        // grow held storage. Each nesting level needs at most two tasks.
+        let mut tasks = Vec::with_capacity(2 * MAX_DEPTH);
+        tasks.push(Task::Head);
+        Self { pos: 0, tasks, compact: false, values: 0 }
+    }
+
+    fn scan(&mut self, input: &[u8]) -> Result<bool, Error> {
+        if self.pos > input.len() {
+            self.pos = 0;
+            self.tasks.clear();
+            self.tasks.push(Task::Head);
+            self.compact = false;
+            self.values = 0;
+        }
+        while let Some(&task) = self.tasks.last() {
+            let mut r = Reader::new(input.get(self.pos..).ok_or(Error::Truncated)?, self.compact);
+            r.values = self.values;
+            match step(task, &mut r, &mut self.tasks) {
+                Ok(()) => {
+                    self.pos += r.pos;
+                    self.values = r.values;
+                    self.compact = r.compact;
+                    debug_assert!(self.tasks.len() <= 2 * MAX_DEPTH);
+                    if self.pos > MAX_MESSAGE {
+                        return Err(Error::TooLong);
+                    }
+                }
+                Err(Error::Truncated) => {
+                    if input.len() > MAX_MESSAGE {
+                        return Err(Error::TooLong);
+                    }
+                    return Ok(false);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(true)
+    }
+}
+
+impl Clone for Messages {
+    fn clone(&self) -> Self {
+        // Vec::clone drops spare capacity, which would let held storage grow on Need.
+        let mut tasks = Vec::with_capacity(self.tasks.capacity());
+        tasks.extend_from_slice(&self.tasks);
+        Self { pos: self.pos, tasks, compact: self.compact, values: self.values }
+    }
+}
+
+impl Default for Messages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Messages {
+    type Item = (Message, Protocol);
+    type Error = Error;
+    const NAME: &'static str = "Thrift unframed transport";
+
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE + 1
+    }
+
+    fn held(&self) -> usize {
+        self.tasks.capacity() * core::mem::size_of::<Task>()
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        match self.scan(input) {
+            Ok(false) => Ok(Step::Need),
+            Ok(true) => {
+                let (message, protocol, used) = Message::parse(input.get(..self.pos).ok_or(Error::Truncated)?)?;
+                self.pos = 0;
+                self.tasks.clear();
+                self.tasks.push(Task::Head);
+                self.compact = false;
+                self.values = 0;
+                Ok(Step::Item((message, protocol), used))
+            }
+            Err(e) => Err(match Message::parse(input) {
+                Err(first) if first != Error::Truncated => first,
+                _ => e,
+            }),
+        }
+    }
+}
+
 /// Splits a Thrift byte stream without frames into messages. Feed it the
 /// bytes a connection reads, in order, and take messages out until it has
 /// none.
@@ -696,7 +974,12 @@ impl Decoder {
 /// byte once, apart from a few bytes of a header it must read again when
 /// the header was split. It reads a message with [`Message::parse`] once it
 /// has all of it, so it gives the same messages and errors.
+///
+/// This compatibility decoder buffers every byte fed without a limit.
+/// Use [`Messages`] with [`super::codec::Stream`] for bounded input,
+/// EOF handling and errors reported once.
 #[derive(Clone, Debug)]
+#[deprecated(note = "use codec::Stream with thrift::Messages")]
 pub struct StreamDecoder {
     buf: Vec<u8>,
     /// Where the current message starts in `buf`. Bytes before it are
@@ -714,7 +997,7 @@ pub struct StreamDecoder {
     failed: Option<Error>,
 }
 
-/// Something a [`StreamDecoder`] has still to read.
+/// Something an unframed reader has still to read.
 #[derive(Clone, Copy, Debug)]
 enum Task {
     /// A message's header, then its struct.
@@ -730,12 +1013,14 @@ enum Task {
     Entries { key: Type, value: Type, left: usize, depth: usize },
 }
 
+#[allow(deprecated)]
 impl Default for StreamDecoder {
     fn default() -> StreamDecoder {
         StreamDecoder::new()
     }
 }
 
+#[allow(deprecated)]
 impl StreamDecoder {
     /// A decoder holding no bytes.
     pub fn new() -> StreamDecoder {
@@ -1391,6 +1676,7 @@ impl<'o> Writer<'o> {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
 
@@ -1976,6 +2262,156 @@ mod tests {
         let b = m.to_bytes(Protocol::Binary).unwrap();
         assert_eq!(b.len(), MAX_MESSAGE);
         assert_eq!(stream_all(&b, || 1 << 20), (vec![(m, Protocol::Binary)], None));
+    }
+
+    #[test]
+    fn messages_refuse_oversize_within_capacity() {
+        use super::super::codec::{Fail, Stream};
+
+        // The binary value fits its own limit, but the whole message does not.
+        let message = Message {
+            body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_BINARY_LEN]) }],
+            ..add_call()
+        };
+        let bytes = message.to_bytes(Protocol::Binary).unwrap();
+        let mut stream = Stream::new(Messages::new());
+        let capacity = stream.decoder().capacity();
+        assert_eq!(capacity, MAX_MESSAGE + 1);
+        assert!(bytes.len() > capacity);
+        assert_eq!(stream.push(&bytes), capacity);
+        assert_eq!(stream.buffered(), capacity);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::TooLong)));
+        assert!(stream.buffered() <= capacity);
+        assert!(stream.next().is_none());
+
+        // A message exactly at the limit still succeeds.
+        let overhead = bytes.len() - MAX_BINARY_LEN;
+        let message = Message {
+            body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_MESSAGE - overhead]) }],
+            ..add_call()
+        };
+        let bytes = message.to_bytes(Protocol::Binary).unwrap();
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+        let mut stream = Stream::new(Messages::new());
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Ok((message, Protocol::Binary))));
+        assert_eq!(stream.buffered(), 0);
+    }
+
+    #[test]
+    fn messages_clone_preserves_scan_storage() {
+        let message = add_call();
+        for protocol in PROTOCOLS {
+            let bytes = message.to_bytes(protocol).unwrap();
+            let mut decoder = Messages::new();
+            let held = decoder.held();
+            for end in 0..bytes.len() {
+                assert_eq!(decoder.decode(&bytes[..end], false), Ok(Step::Need));
+                let mut cloned = decoder.clone();
+                assert_eq!(cloned.held(), held);
+                assert_eq!(cloned.decode(&bytes[..end], false), Ok(Step::Need));
+                assert_eq!(cloned.held(), held);
+                assert_eq!(cloned.decode(&bytes, false), Ok(Step::Item((message.clone(), protocol), bytes.len())));
+            }
+        }
+    }
+
+    #[test]
+    fn messages_rescan_after_shorter_input() {
+        let message = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
+        for protocol in PROTOCOLS {
+            let bytes = message.to_bytes(protocol).unwrap();
+            for (len, eof) in [(0, true), (2, false)] {
+                let mut decoder = Messages::new();
+                assert_eq!(decoder.decode(&bytes[..bytes.len() - 1], false), Ok(Step::Need));
+                assert_eq!(decoder.decode(&bytes[..len], eof), Ok(Step::Need));
+                assert_eq!(decoder.decode(&bytes, false), Ok(Step::Item((message.clone(), protocol), bytes.len())));
+            }
+        }
+    }
+
+    #[test]
+    fn messages_match_compat_at_every_split() {
+        use super::super::codec::{Stream, contract, finish, pump};
+
+        let mut bytes = Vec::new();
+        for (seq, protocol) in PROTOCOLS.into_iter().enumerate() {
+            let message = Message {
+                seq: seq as i32,
+                body: vec![Field {
+                    id: 1,
+                    value: Value::Struct(vec![Field { id: 2, value: Value::I64(-123) }]),
+                }],
+                ..add_call()
+            };
+            bytes.extend(message.to_bytes(protocol).unwrap());
+        }
+        let (want, error) = stream_all(&bytes, || bytes.len());
+        assert_eq!(error, None);
+        assert_eq!(want.len(), PROTOCOLS.len());
+        for cut in 0..=bytes.len() {
+            let mut stream = Stream::new(Messages::new());
+            let mut legacy = StreamDecoder::new();
+            let mut got = Vec::new();
+            let mut compat = Vec::new();
+            for part in [&bytes[..cut], &bytes[cut..]] {
+                pump(&mut stream, part, |item| got.push(item)).unwrap();
+                legacy.feed(part);
+                while let Some(item) = legacy.next_message() {
+                    compat.push(item.unwrap());
+                }
+            }
+            finish(&mut stream, |item| got.push(item)).unwrap();
+            assert_eq!(got, want, "cut {cut}");
+            assert_eq!(got, compat, "cut {cut}");
+            assert_eq!(stream.offset(), bytes.len() as u64);
+        }
+        assert_eq!(stream_all(&bytes, || 1), (want, None));
+        contract::check_decode(Messages::new, &bytes);
+        contract::check_decode_with_held_limit(Messages::new, &bytes, 2 * MAX_DEPTH * core::mem::size_of::<Task>());
+    }
+
+    #[test]
+    fn messages_bound_scan_state_and_check_contract() {
+        use super::super::codec::contract;
+
+        // A chain of structs reaches the nesting limit, then exceeds it.
+        for depth in [MAX_DEPTH, MAX_DEPTH + 1] {
+            let mut bytes = vec![0x82, 0x21, 0, 0];
+            bytes.extend(core::iter::repeat_n(0x1c, depth - 1));
+            bytes.extend(core::iter::repeat_n(0, depth));
+            let mut decoder = Messages::new();
+            let held = decoder.held();
+            assert!(held > 0 && held <= 2 * MAX_DEPTH * core::mem::size_of::<Task>());
+            for end in 0..bytes.len() {
+                let step = decoder.decode(&bytes[..end], false);
+                assert_eq!(decoder.held(), held);
+                if depth <= MAX_DEPTH {
+                    assert_eq!(step, Ok(Step::Need));
+                } else if step == Err(Error::TooDeep) {
+                    break;
+                }
+            }
+            if depth <= MAX_DEPTH {
+                assert!(matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
+                // State is relative to the new unread start after an item.
+                assert_eq!(decoder.decode(&[], false), Ok(Step::Need));
+                assert!(matches!(decoder.decode(&bytes, false), Ok(Step::Item(_, n)) if n == bytes.len()));
+            } else {
+                assert_eq!(Messages::new().decode(&bytes, false), Err(Error::TooDeep));
+            }
+            contract::check_decode_with_held_limit(Messages::new, &bytes, held);
+        }
+        for protocol in PROTOCOLS {
+            let bytes = add_call().to_bytes(protocol).unwrap();
+            for at in 0..bytes.len() {
+                let mut malformed = bytes.clone();
+                malformed[at] = 0xff;
+                contract::check_decode(Messages::new, &malformed);
+            }
+        }
+        contract::check_decode(Messages::new, &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e]);
     }
 
     #[test]
