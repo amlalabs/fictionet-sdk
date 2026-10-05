@@ -18,6 +18,9 @@
 //! Mail headers can be read separately with [`imf`](crate::stdlib::imf).
 //! New stacks use [`Server`] or [`Replies`] with [`codec::Stream`]. Their
 //! [`Wire`] implementations require exact CRLF framing and write transactionally.
+//! Overlong commands yield one error item and skip to the next line. DATA
+//! returns to command mode at its terminator. Overlong DATA or reply lines,
+//! and malformed lines within a multiline reply, end the stream.
 //! Legacy parsers, decoders, and `to_bytes` methods keep their original behavior.
 //!
 //! ```
@@ -852,8 +855,8 @@ pub enum DecodeError {
     Allocation,
     /// EOF interrupted DATA or a multiline reply.
     Incomplete,
-    /// The caller must select command mode after the DATA item.
-    State,
+    /// A malformed line interrupted a multiline reply.
+    Reply(Error),
 }
 
 impl core::fmt::Display for DecodeError {
@@ -863,7 +866,7 @@ impl core::fmt::Display for DecodeError {
             Self::Limit(e) => e.fmt(f),
             Self::Allocation => f.write_str("SMTP assembly allocation failed"),
             Self::Incomplete => f.write_str("incomplete SMTP assembly"),
-            Self::State => f.write_str("select SMTP command mode after DATA"),
+            Self::Reply(e) => e.fmt(f),
         }
     }
 }
@@ -912,7 +915,7 @@ impl Wire for Command {
     /// Reads exactly one command, including its required CRLF.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let mut lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
-        match smtp_line(&mut lines, bytes, true).map_err(ParseError::Framing)? {
+        match smtp_line(&mut lines, bytes, true, false).map_err(ParseError::Framing)? {
             codec::Step::Item(line, used) if used == bytes.len() => {
                 Command::parse(&line.map_err(ParseError::Invalid)?).map_err(ParseError::Invalid)
             }
@@ -942,10 +945,11 @@ impl Wire for Reply {
         loop {
             match replies.decode(bytes, true).map_err(ParseError::Framing)? {
                 codec::Step::Item(reply, used) => {
+                    let reply = reply.map_err(ParseError::Invalid)?;
                     if used != bytes.len() {
                         return Err(ParseError::Trailing);
                     }
-                    return reply.map_err(ParseError::Invalid);
+                    return Ok(reply);
                 }
                 codec::Step::Skip(used) => {
                     bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
@@ -970,6 +974,7 @@ fn smtp_line(
     lines: &mut codec::Lines,
     input: &[u8],
     eof: bool,
+    recover_long: bool,
 ) -> Result<codec::Step<Result<Vec<u8>, Error>>, DecodeError> {
     let step = match lines.decode(input, eof) {
         Ok(step) => step,
@@ -979,6 +984,9 @@ fn smtp_line(
         codec::Step::Item(Ok(line), used) => codec::Step::Item(Ok(line), used),
         codec::Step::Item(Err(codec::LineError::BareLf), used) => {
             codec::Step::Item(Err(Error::LineEnding), used)
+        }
+        codec::Step::Item(Err(codec::LineError::TooLong { .. }), used) if recover_long => {
+            codec::Step::Item(Err(Error::LineTooLong), used)
         }
         codec::Step::Item(Err(e), _) => return Err(DecodeError::Line(e)),
         codec::Step::Skip(used) => codec::Step::Skip(used),
@@ -1000,7 +1008,6 @@ pub enum Input {
 enum Mode {
     Command,
     Data,
-    DataDone,
     End,
 }
 
@@ -1011,14 +1018,16 @@ enum Mode {
 /// is always `MAX_DATA_LINE + 1`, so mode changes never need a larger buffer.
 /// DATA assembly holds at most [`MAX_DATA`] bytes. Scanning is linear.
 ///
-/// Complete malformed commands are error items. Bad DATA content rejects
-/// the message at its dot terminator. Line overflow, unterminated lines,
-/// assembly overflow, and EOF before the dot terminate the stream.
+/// Malformed or overlong commands are error items; the rest of an overlong
+/// line is skipped through LF. Bad DATA content rejects the message at its
+/// dot terminator. DATA line overflow, unterminated lines, assembly overflow,
+/// and EOF before the dot terminate the stream.
 /// The legacy [`CommandDecoder`] retains its original behavior.
 ///
-/// Call [`start_data`](Self::start_data) only after accepting DATA. After
-/// the message item, call [`start_commands`](Self::start_commands). For an
-/// accepted STARTTLS, call [`handoff`](Self::handoff), then use
+/// Call [`start_data`](Self::start_data) between items after accepting DATA.
+/// The terminator returns to command mode, including for rejected messages.
+/// Mode changes are refused while a command line is partial or being skipped.
+/// For an accepted STARTTLS, call [`handoff`](Self::handoff), then use
 /// [`codec::Stream::into_parts`] to obtain unread TLS bytes.
 ///
 /// ```
@@ -1028,13 +1037,13 @@ enum Mode {
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
 /// stream.decoder().start_data().unwrap();
 /// assert_eq!(stream.next(), Some(Ok(Ok(Input::Message(b".x\r\n".to_vec())))));
-/// stream.decoder().start_commands().unwrap();
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
 /// ```
 pub struct Server {
     lines: codec::Lines,
     mode: Mode,
     partial: bool,
+    skipping: bool,
     data: Vec<u8>,
     data_size: usize,
     rejected: Option<Error>,
@@ -1053,6 +1062,7 @@ impl Server {
             lines: codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf),
             mode: Mode::Command,
             partial: false,
+            skipping: false,
             data: Vec::new(),
             data_size: 0,
             rejected: None,
@@ -1061,7 +1071,7 @@ impl Server {
 
     /// Starts DATA at a command boundary after the world accepts it.
     pub fn start_data(&mut self) -> Result<(), Error> {
-        if self.mode != Mode::Command || self.partial {
+        if self.mode != Mode::Command || self.partial || self.skipping {
             return Err(Error::State);
         }
         self.mode = Mode::Data;
@@ -1069,19 +1079,9 @@ impl Server {
         Ok(())
     }
 
-    /// Resumes commands after the complete DATA item, including a rejected one.
-    pub fn start_commands(&mut self) -> Result<(), Error> {
-        if self.mode != Mode::DataDone {
-            return Err(Error::State);
-        }
-        self.mode = Mode::Command;
-        self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
-        Ok(())
-    }
-
     /// Ends SMTP decoding at a command boundary for an accepted protocol switch.
     pub fn handoff(&mut self) -> Result<(), Error> {
-        if self.mode != Mode::Command || self.partial {
+        if self.mode != Mode::Command || self.partial || self.skipping {
             return Err(Error::State);
         }
         self.mode = Mode::End;
@@ -1106,10 +1106,7 @@ impl Decode for Server {
         if self.mode == Mode::End {
             return Ok(codec::Step::End);
         }
-        if self.mode == Mode::DataDone {
-            return Err(DecodeError::State);
-        }
-        let (line, used) = match smtp_line(&mut self.lines, input, eof)? {
+        let (line, used) = match smtp_line(&mut self.lines, input, eof, true)? {
             codec::Step::Item(line, used) => (line, used),
             codec::Step::Need => {
                 self.partial = !input.is_empty();
@@ -1119,18 +1116,24 @@ impl Decode for Server {
                     Ok(codec::Step::Need)
                 };
             }
-            codec::Step::Skip(used) => return Ok(codec::Step::Skip(used)),
+            codec::Step::Skip(used) => {
+                self.skipping = input.get(used.saturating_sub(1)) != Some(&b'\n');
+                return Ok(codec::Step::Skip(used));
+            }
             codec::Step::End => return Ok(codec::Step::End),
         };
         self.partial = false;
         if self.mode == Mode::Command {
+            self.skipping = matches!(line, Err(Error::LineTooLong))
+                && input.get(used.saturating_sub(1)) != Some(&b'\n');
             return Ok(codec::Step::Item(
                 line.and_then(|b| Command::parse(&b)).map(Input::Command),
                 used,
             ));
         }
         if line.as_deref() == Ok(b".".as_slice()) {
-            self.mode = Mode::DataDone;
+            self.mode = Mode::Command;
+            self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
             self.data_size = 0;
             let data = core::mem::take(&mut self.data);
             return Ok(codec::Step::Item(
@@ -1139,6 +1142,9 @@ impl Decode for Server {
                     .map_or_else(|| Ok(Input::Message(data)), Err),
                 used,
             ));
+        }
+        if matches!(line, Err(Error::LineTooLong)) {
+            return Err(DecodeError::Limit(Error::LineTooLong));
         }
         self.data_size = self
             .data_size
@@ -1184,9 +1190,10 @@ impl Decode for Server {
 /// Reads SMTP replies over CRLF lines bounded by [`MAX_LINE`].
 ///
 /// Hyphen continuations are assembled under [`MAX_REPLY_LINES`] and
-/// [`MAX_REPLY_TEXT`]. A malformed complete line yields an error item
-/// and discards the pending reply. The next line starts a new reply.
-/// Oversized lines and assemblies, or EOF in a continuation, end the stream.
+/// [`MAX_REPLY_TEXT`]. A malformed line outside an assembly yields an error
+/// item. A malformed line within a multiline reply ends the stream so its
+/// remaining lines cannot be mistaken for another reply. Oversized lines and
+/// assemblies, or EOF in a continuation, also end the stream.
 /// The legacy [`ReplyDecoder`] keeps its repeating errors.
 pub struct Replies {
     lines: codec::Lines,
@@ -1225,7 +1232,7 @@ impl Decode for Replies {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
-        let (line, used) = match smtp_line(&mut self.lines, input, eof)? {
+        let (line, used) = match smtp_line(&mut self.lines, input, eof, false)? {
             codec::Step::Item(line, used) => (line, used),
             codec::Step::Need if eof && self.pending.is_some() => {
                 return Err(DecodeError::Incomplete);
@@ -1234,6 +1241,7 @@ impl Decode for Replies {
             codec::Step::Skip(used) => return Ok(codec::Step::Skip(used)),
             codec::Step::End => return Ok(codec::Step::End),
         };
+        let pending = self.pending.is_some();
         let result = line.and_then(|line| {
             let (code, more, text) = reply_line(&line)?;
             let reply = self.pending.get_or_insert_with(|| Reply {
@@ -1246,8 +1254,12 @@ impl Decode for Replies {
             if reply.lines.len() >= MAX_REPLY_LINES {
                 return Err(Error::ReplyLines);
             }
+            self.text_size = self
+                .text_size
+                .checked_add(text.len())
+                .filter(|&size| size <= MAX_REPLY_TEXT)
+                .ok_or(Error::ReplyLines)?;
             reply.lines.push(text.to_string());
-            self.text_size = self.text_size.saturating_add(text.len());
             if more && reply.lines.len() >= MAX_REPLY_LINES {
                 return Err(Error::ReplyLines);
             }
@@ -1263,6 +1275,7 @@ impl Decode for Replies {
                 ))
             }
             Err(Error::ReplyLines) => Err(DecodeError::Limit(Error::ReplyLines)),
+            Err(e) if pending => Err(DecodeError::Reply(e)),
             Err(e) => {
                 self.pending = None;
                 self.text_size = 0;

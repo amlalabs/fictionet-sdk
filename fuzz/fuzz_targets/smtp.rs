@@ -3,8 +3,8 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::smtp::{
-    Command, CommandDecoder, Error, MAX_BUFFERED, MAX_DATA, Reply, ReplyDecoder, Request,
-    Replies, Server, write_data,
+    Command, CommandDecoder, Error, MAX_BUFFERED, MAX_DATA, MAX_REPLY_TEXT, Replies, Reply,
+    ReplyDecoder, Request, Server, write_data,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -68,15 +68,16 @@ fn message(data: &[u8], size: usize) -> Option<Result<Vec<u8>, Error>> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Server::new, data);
-    contract::check_decode(Replies::new, data);
-    contract::check_decode(
+    contract::check_decode_with_held_limit(Server::new, data, MAX_DATA);
+    contract::check_decode_with_held_limit(Replies::new, data, MAX_REPLY_TEXT);
+    contract::check_decode_with_held_limit(
         || {
             let mut server = Server::new();
             server.start_data().unwrap();
             server
         },
         data,
+        MAX_DATA,
     );
     contract::check_wire::<Command>(data);
     contract::check_wire::<Reply>(data);
@@ -126,7 +127,7 @@ fuzz_target!(|data: &[u8]| {
     };
     contract::check_wire_value(&reply);
     if let Ok(bytes) = Wire::to_bytes(&reply) {
-        contract::check_decode(Replies::new, &bytes);
+        contract::check_decode_with_held_limit(Replies::new, &bytes, MAX_REPLY_TEXT);
     }
     if let Ok(bytes) = reply.to_bytes() {
         assert_eq!(Reply::parse(&bytes), Ok(Some((reply, bytes.len()))));

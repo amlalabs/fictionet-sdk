@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::pop3::{
-    Command, CommandDecoder, MAX_AUTH_LINE, MAX_COMMAND_LINE, Reply, ReplyDecoder, Request,
-    Commands, Replies, MAX_EXPECTATIONS, parse_scan_listing, parse_unique_id_listing,
-    write_scan_listing, write_unique_id_listing,
+    Command, CommandDecoder, Commands, MAX_AUTH_LINE, MAX_COMMAND_LINE, MAX_EXPECTATIONS,
+    MAX_REPLY_HELD, Replies, Reply, ReplyDecoder, Request, parse_scan_listing,
+    parse_unique_id_listing, write_scan_listing, write_unique_id_listing,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -16,9 +16,28 @@ fn multi_line(i: usize) -> bool {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Commands::new, data);
+    contract::check_decode_with_held_limit(Commands::new, data, 0);
+    contract::check_decode_with_held_limit(
+        || {
+            let mut commands = Commands::new();
+            commands.expect_line().unwrap();
+            commands
+        },
+        data,
+        0,
+    );
+    contract::check_decode_with_held_limit(
+        || {
+            let mut replies = Replies::new();
+            replies.expect(false).unwrap();
+            replies.expect_line().unwrap();
+            replies
+        },
+        data,
+        MAX_REPLY_HELD,
+    );
     for multi in [false, true] {
-        contract::check_decode(
+        contract::check_decode_with_held_limit(
             || {
                 let mut replies = Replies::new();
                 for _ in 0..MAX_EXPECTATIONS {
@@ -27,6 +46,7 @@ fuzz_target!(|data: &[u8]| {
                 replies
             },
             data,
+            MAX_REPLY_HELD,
         );
     }
     contract::check_wire::<Command>(data);
@@ -155,13 +175,14 @@ fuzz_target!(|data: &[u8]| {
         argument: Some(sb.to_string()),
     });
     if let Ok(bytes) = Wire::to_bytes(&reply) {
-        contract::check_decode(
+        contract::check_decode_with_held_limit(
             || {
                 let mut replies = Replies::new();
                 replies.expect(has_body).unwrap();
                 replies
             },
             &bytes,
+            MAX_REPLY_HELD,
         );
     }
     let bytes = reply.to_bytes();

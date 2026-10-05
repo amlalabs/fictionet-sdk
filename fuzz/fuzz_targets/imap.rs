@@ -4,8 +4,8 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::imap::{
-    Command, Commands, Decoder, Error, Event, MAX_LITERAL, MAX_TEXT,
-    Response, ResponseDecoder, Responses, Value,
+    Command, Commands, Decoder, Error, Event, MAX_HELD, MAX_LITERAL, MAX_TEXT, Response,
+    ResponseDecoder, Responses, Value,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -70,8 +70,17 @@ fn responses(data: &[u8], step: usize) -> Vec<Result<Response, Error>> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Commands::new, data);
-    contract::check_decode(Responses::new, data);
+    contract::check_decode_with_held_limit(Commands::new, data, MAX_HELD);
+    contract::check_decode_with_held_limit(
+        || {
+            let mut commands = Commands::new();
+            commands.expect_line().unwrap();
+            commands
+        },
+        data,
+        MAX_HELD,
+    );
+    contract::check_decode_with_held_limit(Responses::new, data, MAX_HELD);
     contract::check_wire::<Command>(data);
     contract::check_wire::<Response>(data);
     contract::check_wire_value(&Command::new(
@@ -92,7 +101,7 @@ fuzz_target!(|data: &[u8]| {
         if let Event::Command(c) = e {
             contract::check_wire_value(c);
             if let Ok(bytes) = Wire::to_bytes(c) {
-                contract::check_decode(Commands::new, &bytes);
+                contract::check_decode_with_held_limit(Commands::new, &bytes, MAX_HELD);
             }
             // A command read can be written, and reads back the same.
             let bytes = c.to_bytes();

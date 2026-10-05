@@ -32,7 +32,10 @@
 //! ([`Error::is_fatal`]), and a real server sends `* BYE` and closes it.
 //! New stacks use [`Commands`] or [`Responses`] with [`codec::Stream`].
 //! [`Wire`] adds exact parsing and strict, transactional writing. These APIs
-//! require CRLF and apply RFC 9051's non-synchronizing literal limit.
+//! require CRLF and apply RFC 9051's non-synchronizing literal limit to
+//! commands. Server responses cannot use non-synchronizing literals.
+//! [`Commands::expect_line`] selects one raw AUTHENTICATE answer or IDLE
+//! `DONE` line between items, without interpreting command or literal syntax.
 //! Legacy parsers, decoders, and `to_bytes` methods keep their original behavior.
 //!
 //! ```
@@ -616,11 +619,13 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// What a [`Decoder`] has for the world.
+/// What [`Commands`] or the legacy [`Decoder`] has for the world.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// A whole command.
     Command(Command),
+    /// A raw line without CRLF, selected by [`Commands::expect_line`].
+    Line(Vec<u8>),
     /// The client sent `{size}` and waits for a continuation request. The
     /// world sends one, such as [`Response::continue_req`], and keeps
     /// calling [`Decoder::next_event`]. Or it refuses with
@@ -1498,6 +1503,8 @@ pub enum DecodeError {
     Allocation,
     /// EOF interrupted a literal or the command or response containing it.
     Incomplete,
+    /// A raw line was requested while a command or literal was in progress.
+    State,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -1507,6 +1514,7 @@ impl core::fmt::Display for DecodeError {
             Self::Limit(e) => e.fmt(f),
             Self::Allocation => f.write_str("IMAP assembly allocation failed"),
             Self::Incomplete => f.write_str("incomplete IMAP literal or message"),
+            Self::State => f.write_str("IMAP raw line requires a command boundary"),
         }
     }
 }
@@ -1566,7 +1574,7 @@ impl Wire for Command {
                     }
                     return match command.map_err(ParseError::Invalid)? {
                         Event::Command(command) => Ok(command),
-                        Event::Continue { .. } => Err(ParseError::Incomplete),
+                        Event::Continue { .. } | Event::Line(_) => Err(ParseError::Incomplete),
                     };
                 }
                 _ => return Err(ParseError::Incomplete),
@@ -1659,6 +1667,7 @@ struct MessageLines {
     text: usize,
     remaining: usize,
     response: bool,
+    partial: bool,
     kind: Option<Kind>,
     tag: Option<Arc<str>>,
     waiting: bool,
@@ -1672,6 +1681,7 @@ impl MessageLines {
             text: 0,
             remaining: 0,
             response,
+            partial: false,
             kind: None,
             tag: None,
             waiting: false,
@@ -1683,6 +1693,7 @@ impl MessageLines {
         self.message = Vec::new();
         self.text = 0;
         self.remaining = 0;
+        self.partial = false;
         self.kind = None;
         self.tag = None;
         self.waiting = false;
@@ -1747,7 +1758,7 @@ impl MessageLines {
                 candidate.extend_from_slice(b"\r\n");
                 let literals = !self.response
                     || self.kind.unwrap_or_else(|| classify(content(&candidate))) == Kind::Data;
-                if literals && marker(&candidate, true).is_some() {
+                if literals && marker(&candidate, !self.response).is_some() {
                     return Err(DecodeError::Line(codec::LineError::BareLf));
                 }
                 let error = Error::Syntax {
@@ -1765,10 +1776,14 @@ impl MessageLines {
             codec::Step::Need if eof && !self.message.is_empty() => {
                 return Err(DecodeError::Incomplete);
             }
-            codec::Step::Need => return Ok(codec::Step::Need),
+            codec::Step::Need => {
+                self.partial = !input.is_empty();
+                return Ok(codec::Step::Need);
+            }
             codec::Step::Skip(used) => return Ok(codec::Step::Skip(used)),
             codec::Step::End => return Ok(codec::Step::End),
         };
+        self.partial = false;
         self.waiting = false;
         if self.message.is_empty() {
             self.kind = Some(classify(&line));
@@ -1787,7 +1802,7 @@ impl MessageLines {
             .filter(|&n| n <= MAX_MESSAGE)
             .ok_or(DecodeError::Limit(Error::TooLong))?;
         let literal = (!self.response || self.kind == Some(Kind::Data))
-            .then(|| marker(&line, true))
+            .then(|| marker(&line, !self.response))
             .flatten();
         if let Some((size, non_sync)) = literal {
             let limit = if non_sync {
@@ -1847,6 +1862,9 @@ impl MessageLines {
 /// literals, and EOF during an assembly end the stream. After a continuation
 /// event, send the continuation and read on, or call
 /// [`refuse_literal`](Self::refuse_literal) between items.
+/// For AUTHENTICATE answers and IDLE's `DONE`, call
+/// [`expect_line`](Self::expect_line) between items. It returns one
+/// [`Event::Line`] under the same [`MAX_LINE`] limit, then resumes commands.
 /// The legacy [`Decoder`] keeps its void feed and original limits.
 ///
 /// ```
@@ -1859,6 +1877,7 @@ impl MessageLines {
 /// ```
 pub struct Commands {
     framing: MessageLines,
+    raw_line: bool,
 }
 
 impl Default for Commands {
@@ -1872,7 +1891,25 @@ impl Commands {
     pub fn new() -> Self {
         Self {
             framing: MessageLines::new(false),
+            raw_line: false,
         }
+    }
+
+    /// Selects one raw AUTHENTICATE answer or IDLE `DONE` line.
+    /// Call between items. Refuses a partial command, a pending literal, or
+    /// an already selected raw line without changing the mode. Literal-looking
+    /// text in this line is returned unchanged, without a continuation event.
+    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+        if self.raw_line
+            || self.framing.partial
+            || !self.framing.message.is_empty()
+            || self.framing.waiting
+            || self.framing.remaining != 0
+        {
+            return Err(DecodeError::State);
+        }
+        self.raw_line = true;
+        Ok(())
     }
 
     /// Drops the command at its synchronizing literal boundary.
@@ -1901,6 +1938,33 @@ impl Decode for Commands {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+        if self.raw_line {
+            let step = match self.framing.lines.decode(input, eof) {
+                Ok(step) => step,
+                Err(never) => match never {},
+            };
+            return Ok(match step {
+                codec::Step::Item(line, used) => {
+                    self.raw_line = false;
+                    self.framing.reset();
+                    let line = match line {
+                        Ok(line) => Ok(Event::Line(line)),
+                        Err(codec::LineError::BareLf) => Err(Error::Syntax {
+                            tag: None,
+                            reason: "a line must end with CRLF",
+                        }),
+                        Err(e) => return Err(DecodeError::Line(e)),
+                    };
+                    codec::Step::Item(line, used)
+                }
+                codec::Step::Need => {
+                    self.framing.partial = !input.is_empty();
+                    codec::Step::Need
+                }
+                codec::Step::Skip(used) => codec::Step::Skip(used),
+                codec::Step::End => codec::Step::End,
+            });
+        }
         Ok(match self.framing.decode(input, eof)? {
             codec::Step::Item(frame, used) => codec::Step::Item(
                 frame.and_then(|frame| match frame {
@@ -1919,7 +1983,9 @@ impl Decode for Commands {
 /// Reads responses over CRLF lines and counted literals.
 ///
 /// Uses the same line, literal, assembly, and retained-state limits as
-/// [`Commands`]. Server literals never generate continuation events.
+/// [`Commands`]. Server literals must use `{n}`, never `{n+}`, and do not
+/// generate continuation events. A data response ending in `{n+}` is a
+/// syntax error item; the following line remains a separate response.
 /// A status or continuation response ending in `{n}` is ordinary text.
 /// Malformed complete responses are error items. Line overflow, oversized
 /// literals, and incomplete assemblies end the stream.

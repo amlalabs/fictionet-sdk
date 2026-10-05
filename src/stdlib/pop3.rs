@@ -28,8 +28,10 @@
 //! their lines to [`MAX_DATA_LINE`]. Legacy readers accept a bare LF as a line
 //! end, as many servers do.
 //! New stacks use [`Commands`] or [`Replies`] with [`codec::Stream`]. They
-//! require CRLF and report malformed complete lines as error items. The
-//! [`Wire`] implementations parse exact values and write transactionally.
+//! require CRLF. Bad or overlong commands are error items, and decoding
+//! resumes at the next line. Bad status lines end the stream when a body
+//! was expected; other bad status lines are error items. The [`Wire`]
+//! implementations parse exact values and write transactionally.
 //! Legacy decoders and `to_bytes` methods keep their original behavior.
 //!
 //! Writers never write what the readers refuse. The `to_bytes` writers
@@ -41,7 +43,10 @@
 //!
 //! During an `AUTH` exchange (RFC 5034) the lines between the command and
 //! the final `+OK` or `-ERR` are neither commands nor replies. Read them
-//! with [`CommandDecoder::next_line`] and [`ReplyDecoder::next_line`].
+//! with [`Commands::expect_line`] and [`Replies::expect_line`], called
+//! between items. Each selects one raw line, without consuming a reply
+//! expectation. Legacy callers use [`CommandDecoder::next_line`] and
+//! [`ReplyDecoder::next_line`].
 //!
 //! ```
 //! use fictionet::stdlib::pop3::{
@@ -131,8 +136,9 @@ pub const MAX_BODY: usize = 8 << 20;
 /// a code is held only by the length of its line. A `-ERR` line has room
 /// for one byte less.
 pub const MAX_CODE: usize = MAX_REPLY_LINE - 8;
-/// The longest line [`CommandDecoder::next_line`] and
-/// [`ReplyDecoder::next_line`] read, counting its line end. The base64
+/// The longest raw line [`Commands::expect_line`] and [`Replies::expect_line`]
+/// select, excluding CRLF. Legacy [`CommandDecoder::next_line`] and
+/// [`ReplyDecoder::next_line`] count the line end in this limit. The base64
 /// lines of an `AUTH` exchange have no limit of their own (RFC 5034,
 /// section 4), and this is well above what common mechanisms send.
 pub const MAX_AUTH_LINE: usize = 16 << 10;
@@ -169,7 +175,7 @@ pub struct Command {
 /// next line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CommandError {
-    /// The line was longer than [`MAX_COMMAND_LINE`].
+    /// The line exceeded [`MAX_COMMAND_LINE`], or [`MAX_AUTH_LINE`] in raw mode.
     LineTooLong,
     /// The line was not UTF-8, or held a control character.
     BadCharacter,
@@ -527,8 +533,9 @@ pub struct Reply {
     pub body: Option<Vec<u8>>,
 }
 
-/// Why bytes are not a reply. The client has lost its place in the
-/// stream, and a real one closes the connection.
+/// Why bytes are not a reply. [`Replies`] distinguishes recoverable items
+/// from errors that lose the reply boundary. The legacy [`ReplyDecoder`]
+/// stops at every error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReplyError {
     /// A status line was longer than [`MAX_REPLY_LINE`], or a body line
@@ -537,6 +544,8 @@ pub enum ReplyError {
     /// The status line did not start with `+OK` or `-ERR` followed by a
     /// space or the end of the line.
     BadStatus,
+    /// A body line used bare LF or contained an embedded CR.
+    BadBodyLine,
     /// The body was longer than [`MAX_BODY`].
     BodyTooLong,
 }
@@ -547,6 +556,7 @@ impl std::fmt::Display for ReplyError {
             ReplyError::LineTooLong => "reply line too long",
             ReplyError::BadStatus => "status is not +OK or -ERR",
             ReplyError::BodyTooLong => "reply body too long",
+            ReplyError::BadBodyLine => "body line requires CRLF without embedded CR",
         })
     }
 }
@@ -1376,6 +1386,10 @@ pub enum DecodeError {
     MissingExpectation,
     /// The expectation queue reached [`MAX_EXPECTATIONS`].
     ExpectationsFull,
+    /// A malformed status line made a multiline reply's boundary uncertain.
+    Reply(ReplyError),
+    /// A raw line was requested while a line or body was in progress.
+    State,
 }
 
 impl core::fmt::Display for DecodeError {
@@ -1387,6 +1401,8 @@ impl core::fmt::Display for DecodeError {
             Self::Incomplete => f.write_str("incomplete POP3 body"),
             Self::MissingExpectation => f.write_str("POP3 reply needs an expectation"),
             Self::ExpectationsFull => f.write_str("POP3 expectation queue is full"),
+            Self::Reply(e) => e.fmt(f),
+            Self::State => f.write_str("POP3 raw line requires a line boundary"),
         }
     }
 }
@@ -1437,12 +1453,11 @@ impl Wire for Command {
 
     /// Reads exactly one command with its required CRLF.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match Commands::new()
-            .decode(bytes, true)
-            .map_err(ParseError::Framing)?
-        {
-            codec::Step::Item(command, used) if used == bytes.len() => {
-                command.map_err(ParseError::Command)
+        let mut lines = codec::Lines::new(MAX_COMMAND_LINE - 2, codec::Ending::Crlf);
+        match pop_line(&mut lines, bytes, true, false).map_err(ParseError::Framing)? {
+            codec::Step::Item(line, used) if used == bytes.len() => {
+                let line = line.map_err(|_| ParseError::Command(CommandError::BadCharacter))?;
+                Command::parse(&line).map_err(ParseError::Command)
             }
             codec::Step::Item(_, _) => Err(ParseError::Trailing),
             _ => Err(ParseError::Incomplete),
@@ -1478,12 +1493,18 @@ impl Wire for Reply {
         let mut replies = Replies::new();
         replies.expect(body).map_err(ParseError::Framing)?;
         loop {
-            match replies.decode(bytes, true).map_err(ParseError::Framing)? {
+            match replies.decode(bytes, true).map_err(|e| match e {
+                DecodeError::Reply(e) => ParseError::Reply(e),
+                e => ParseError::Framing(e),
+            })? {
                 codec::Step::Item(reply, used) => {
+                    let Output::Reply(reply) = reply.map_err(ParseError::Reply)? else {
+                        return Err(ParseError::Incomplete);
+                    };
                     if used != bytes.len() {
                         return Err(ParseError::Trailing);
                     }
-                    return reply.map_err(ParseError::Reply);
+                    return Ok(reply);
                 }
                 codec::Step::Skip(used) => {
                     bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
@@ -1512,28 +1533,54 @@ fn pop_line(
     lines: &mut codec::Lines,
     input: &[u8],
     eof: bool,
+    recover_long: bool,
 ) -> Result<codec::Step<Result<Vec<u8>, codec::LineError>>, DecodeError> {
     let step = match lines.decode(input, eof) {
         Ok(step) => step,
         Err(never) => match never {},
     };
     match step {
-        codec::Step::Item(
-            Err(e @ (codec::LineError::TooLong { .. } | codec::LineError::Unterminated)),
-            _,
-        ) => Err(DecodeError::Line(e)),
+        codec::Step::Item(Err(e @ codec::LineError::Unterminated), _) => Err(DecodeError::Line(e)),
+        codec::Step::Item(Err(e @ codec::LineError::TooLong { .. }), _) if !recover_long => {
+            Err(DecodeError::Line(e))
+        }
         step => Ok(step),
     }
+}
+
+/// One client command or raw AUTH answer from [`Commands`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// A parsed command.
+    Command(Command),
+    /// A raw line without CRLF, selected by [`Commands::expect_line`].
+    Line(Vec<u8>),
+}
+
+/// One server reply or raw AUTH challenge from [`Replies`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Output {
+    /// A complete reply, including its body when expected.
+    Reply(Reply),
+    /// A raw line without CRLF, selected by [`Replies::expect_line`].
+    Line(Vec<u8>),
 }
 
 /// Reads POP3 commands over CRLF lines bounded by [`MAX_COMMAND_LINE`].
 ///
 /// This retains RFC 2449's command limit, which extends RFC 1939.
-/// Syntax errors and bare LF are error items; the next line remains readable.
-/// Overlong and unterminated lines end the stream. No input is retained.
+/// Syntax errors, bare LF, and overlong lines are error items; the decoder
+/// skips the rest of an overlong line through LF, then reads the next line.
+/// Unterminated lines end the stream. No input is retained.
+/// Call [`expect_line`](Self::expect_line) between items for one raw AUTH
+/// answer, bounded by [`MAX_AUTH_LINE`] bytes excluding CRLF. Input capacity
+/// is always `MAX_AUTH_LINE + 2`, so mode changes fit the same buffer.
 /// The legacy [`CommandDecoder`] keeps its void feed and LF tolerance.
 pub struct Commands {
     lines: codec::Lines,
+    raw_line: bool,
+    partial: bool,
+    skipping: bool,
 }
 
 impl Default for Commands {
@@ -1547,28 +1594,70 @@ impl Commands {
     pub fn new() -> Self {
         Self {
             lines: codec::Lines::new(MAX_COMMAND_LINE - 2, codec::Ending::Crlf),
+            raw_line: false,
+            partial: false,
+            skipping: false,
         }
+    }
+
+    /// Selects one raw AUTH answer or cancellation line, without parsing it.
+    /// Call between items. Refuses a partial line, a line still being skipped,
+    /// or an already selected raw line, without changing the mode.
+    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+        if self.partial || self.skipping || self.raw_line {
+            return Err(DecodeError::State);
+        }
+        self.raw_line = true;
+        self.lines = codec::Lines::new(MAX_AUTH_LINE, codec::Ending::Crlf);
+        Ok(())
     }
 }
 
 impl Decode for Commands {
-    type Item = Result<Command, CommandError>;
+    type Item = Result<Input, CommandError>;
     type Error = DecodeError;
     const NAME: &'static str = "POP3 commands";
 
     fn capacity(&self) -> usize {
-        MAX_COMMAND_LINE
+        MAX_AUTH_LINE + 2
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
-        Ok(match pop_line(&mut self.lines, input, eof)? {
-            codec::Step::Item(line, used) => codec::Step::Item(
-                line.map_err(|_| CommandError::BadCharacter)
-                    .and_then(|b| Command::parse(&b)),
-                used,
-            ),
-            codec::Step::Skip(used) => codec::Step::Skip(used),
-            codec::Step::Need => codec::Step::Need,
+        Ok(match pop_line(&mut self.lines, input, eof, true)? {
+            codec::Step::Item(line, used) => {
+                self.partial = false;
+                self.skipping = matches!(line, Err(codec::LineError::TooLong { .. }))
+                    && input.get(used.saturating_sub(1)) != Some(&b'\n');
+                let raw = core::mem::take(&mut self.raw_line);
+                if !self.skipping {
+                    self.lines = codec::Lines::new(MAX_COMMAND_LINE - 2, codec::Ending::Crlf);
+                }
+                codec::Step::Item(
+                    line.map_err(|e| match e {
+                        codec::LineError::TooLong { .. } => CommandError::LineTooLong,
+                        _ => CommandError::BadCharacter,
+                    })
+                    .and_then(|b| {
+                        if raw {
+                            Ok(Input::Line(b))
+                        } else {
+                            Command::parse(&b).map(Input::Command)
+                        }
+                    }),
+                    used,
+                )
+            }
+            codec::Step::Skip(used) => {
+                self.skipping = input.get(used.saturating_sub(1)) != Some(&b'\n');
+                if !self.skipping {
+                    self.lines = codec::Lines::new(MAX_COMMAND_LINE - 2, codec::Ending::Crlf);
+                }
+                codec::Step::Skip(used)
+            }
+            codec::Step::Need => {
+                self.partial = !input.is_empty();
+                codec::Step::Need
+            }
             codec::Step::End => codec::Step::End,
         })
     }
@@ -1580,28 +1669,37 @@ impl Decode for Commands {
 /// for the greeting. A `-ERR` consumes an expectation without reading a body.
 /// An empty queue never implies a reply mode. Queue changes happen between
 /// items. The active response keeps the expectation consumed at its status.
+/// For an AUTH challenge, call [`expect_line`](Self::expect_line) between
+/// items. It reads one raw line without consuming an expectation, then
+/// returns to status mode. The queued expectation remains for AUTH's final
+/// `+OK` or `-ERR`. Raw lines use [`MAX_AUTH_LINE`] excluding CRLF; input
+/// capacity is always `MAX_AUTH_LINE + 2`.
 ///
 /// CRLF is required. Status lines use RFC 1939's [`MAX_REPLY_LINE`]. Body
 /// lines use the local [`MAX_DATA_LINE`], including stuffing and CRLF;
 /// RFC 1939 supplies no body-line maximum. Dot-stuffing is removed and
 /// [`MAX_BODY`] bounds the assembled body. Scanning is linear.
-/// Malformed complete status lines are error items. A bad body line rejects
-/// its whole reply at the terminator with [`ReplyError::BadStatus`]. This
-/// also covers bare LF, embedded CR, and invalid status text. Line overflow
-/// and incomplete bodies end the stream. Retained state is bounded by [`MAX_REPLY_HELD`].
+/// A malformed status line is an error item for a single-line expectation,
+/// and ends the stream for a multiline expectation. A bad body line rejects
+/// its whole reply at the terminator with [`ReplyError::BadBodyLine`]. This
+/// covers bare LF and embedded CR. Line overflow and incomplete bodies end
+/// the stream. Retained state is bounded by [`MAX_REPLY_HELD`].
 /// The legacy [`ReplyDecoder`] keeps its per-call expectation and void feed.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::Stream, pop3::Replies};
+/// use fictionet::stdlib::{codec::Stream, pop3::{Replies, Output}};
 /// let mut replies = Stream::new(Replies::new());
 /// replies.decoder().expect(true).unwrap();
 /// let bytes = b"+OK message\r\n..x\r\n.\r\n";
 /// assert_eq!(replies.push(bytes), bytes.len());
-/// assert_eq!(replies.next().unwrap().unwrap().unwrap().body, Some(b".x\r\n".to_vec()));
+/// let Output::Reply(reply) = replies.next().unwrap().unwrap().unwrap() else { panic!() };
+/// assert_eq!(reply.body, Some(b".x\r\n".to_vec()));
 /// ```
 pub struct Replies {
     lines: codec::Lines,
     expected: VecDeque<bool>,
+    raw_line: bool,
+    partial: bool,
     pending: Option<Reply>,
     body_size: usize,
     rejected: bool,
@@ -1619,6 +1717,8 @@ impl Replies {
         Self {
             lines: codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf),
             expected: VecDeque::new(),
+            raw_line: false,
+            partial: false,
             pending: None,
             body_size: 0,
             rejected: false,
@@ -1635,6 +1735,18 @@ impl Replies {
         Ok(())
     }
 
+    /// Selects one raw AUTH challenge line without consuming a reply expectation.
+    /// Call between items, before reading the challenge. Refuses an active body,
+    /// a partial line, or an already selected raw line without changing state.
+    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+        if self.pending.is_some() || self.partial || self.raw_line {
+            return Err(DecodeError::State);
+        }
+        self.raw_line = true;
+        self.lines = codec::Lines::new(MAX_AUTH_LINE, codec::Ending::Crlf);
+        Ok(())
+    }
+
     /// Number of queued expectations, excluding the active body.
     pub fn expected(&self) -> usize {
         self.expected.len()
@@ -1642,12 +1754,12 @@ impl Replies {
 }
 
 impl Decode for Replies {
-    type Item = Result<Reply, ReplyError>;
+    type Item = Result<Output, ReplyError>;
     type Error = DecodeError;
     const NAME: &'static str = "POP3 replies";
 
     fn capacity(&self) -> usize {
-        MAX_DATA_LINE
+        MAX_AUTH_LINE + 2
     }
 
     fn held(&self) -> usize {
@@ -1660,18 +1772,30 @@ impl Decode for Replies {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
-        if self.pending.is_none() && self.expected.is_empty() && !input.is_empty() {
+        if !self.raw_line && self.pending.is_none() && self.expected.is_empty() && !input.is_empty()
+        {
             return Err(DecodeError::MissingExpectation);
         }
-        let (line, used) = match pop_line(&mut self.lines, input, eof)? {
+        let (line, used) = match pop_line(&mut self.lines, input, eof, false)? {
             codec::Step::Item(line, used) => (line, used),
             codec::Step::Need if eof && self.pending.is_some() => {
                 return Err(DecodeError::Incomplete);
             }
-            codec::Step::Need => return Ok(codec::Step::Need),
+            codec::Step::Need => {
+                self.partial = !input.is_empty();
+                return Ok(codec::Step::Need);
+            }
             codec::Step::Skip(used) => return Ok(codec::Step::Skip(used)),
             codec::Step::End => return Ok(codec::Step::End),
         };
+        self.partial = false;
+        if core::mem::take(&mut self.raw_line) {
+            self.lines = codec::Lines::new(MAX_REPLY_LINE - 2, codec::Ending::Crlf);
+            return Ok(codec::Step::Item(
+                Ok(Output::Line(line.map_err(DecodeError::Line)?)),
+                used,
+            ));
+        }
         if self.pending.is_none() {
             let multi = self
                 .expected
@@ -1690,7 +1814,8 @@ impl Decode for Replies {
                     self.lines = codec::Lines::new(MAX_DATA_LINE - 2, codec::Ending::Crlf);
                     return Ok(codec::Step::Skip(used));
                 }
-                reply => return Ok(codec::Step::Item(reply, used)),
+                Err(e) if multi => return Err(DecodeError::Reply(e)),
+                reply => return Ok(codec::Step::Item(reply.map(Output::Reply), used)),
             }
         }
         if line.as_deref() == Ok(b".".as_slice()) {
@@ -1699,9 +1824,9 @@ impl Decode for Replies {
             self.body_size = 0;
             return Ok(codec::Step::Item(
                 if core::mem::take(&mut self.rejected) {
-                    Err(ReplyError::BadStatus)
+                    Err(ReplyError::BadBodyLine)
                 } else {
-                    reply
+                    reply.map(Output::Reply)
                 },
                 used,
             ));
