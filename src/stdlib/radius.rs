@@ -353,7 +353,12 @@ pub enum PacketError {
     /// Fewer bytes than the 20-byte header. The value is how many came.
     Short(usize),
     /// The length field was below [`HEADER_LEN`] or above the accepted packet limit.
-    Length(u16),
+    Length {
+        /// The length field.
+        length: u16,
+        /// The largest accepted packet, including its header.
+        limit: usize,
+    },
     /// The datagram was shorter than its length field says.
     Truncated {
         /// The length field.
@@ -370,8 +375,8 @@ impl std::fmt::Display for PacketError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PacketError::Short(n) => write!(f, "{n} bytes, fewer than the 20-byte RADIUS header"),
-            PacketError::Length(n) => {
-                write!(f, "length field {n}, outside the accepted packet range")
+            PacketError::Length { length, limit } => {
+                write!(f, "length field {length}, outside {HEADER_LEN}..={limit}")
             }
             PacketError::Truncated { length, got } => {
                 write!(f, "length field {length}, but only {got} bytes came")
@@ -413,7 +418,10 @@ impl Packet {
         let length = u16::from_be_bytes([b[2], b[3]]);
         let end = usize::from(length);
         if !(HEADER_LEN..=MAX_PACKET).contains(&end) {
-            return Err(PacketError::Length(length));
+            return Err(PacketError::Length {
+                length,
+                limit: MAX_PACKET,
+            });
         }
         if b.len() < end {
             return Err(PacketError::Truncated { length, got: b.len() });
@@ -655,8 +663,11 @@ impl Wire for Packet {
 /// Use with [`super::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
 /// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
 /// return [`Step::Need`], including at EOF, so the driver reports truncation.
-/// Attribute errors end the stream, as they do in [`Decoder`]. The legacy
-/// decoder remains separate to preserve repeated errors and buffer clearing.
+/// Attribute errors end the stream, as they do in [`Decoder`].
+/// [RFC 6613 §2.6.4] requires closing the connection on malformed attributes.
+/// The legacy decoder remains separate to preserve repeated errors and buffer clearing.
+///
+/// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, radius::{Code, Frames, Packet}};
@@ -715,7 +726,10 @@ impl Decode for Frames {
         let length = u16::from_be_bytes([hi, lo]);
         let used = usize::from(length);
         if !(HEADER_LEN..=self.limit).contains(&used) {
-            return Err(PacketError::Length(length));
+            return Err(PacketError::Length {
+                length,
+                limit: self.limit,
+            });
         }
         let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
         Ok(Step::Item(Packet::parse(bytes)?, used))
@@ -831,7 +845,10 @@ impl Decoder {
         }
         let length = u16::from_be_bytes([b[2], b[3]]);
         let result = if !(HEADER_LEN..=MAX_PACKET).contains(&usize::from(length)) {
-            Err(PacketError::Length(length))
+            Err(PacketError::Length {
+                length,
+                limit: MAX_PACKET,
+            })
         } else if b.len() < usize::from(length) {
             return None;
         } else {
@@ -1882,9 +1899,21 @@ mod tests {
         assert_eq!(Packet::parse(&[1, 0, 0]), Err(PacketError::Short(3)));
         let mut b = vec![1, 0, 0, 19];
         b.extend_from_slice(&[0; 16]);
-        assert_eq!(Packet::parse(&b), Err(PacketError::Length(19)));
+        assert_eq!(
+            Packet::parse(&b),
+            Err(PacketError::Length {
+                length: 19,
+                limit: MAX_PACKET
+            })
+        );
         b[2..4].copy_from_slice(&4097u16.to_be_bytes());
-        assert_eq!(Packet::parse(&b), Err(PacketError::Length(4097)));
+        assert_eq!(
+            Packet::parse(&b),
+            Err(PacketError::Length {
+                length: 4097,
+                limit: MAX_PACKET
+            })
+        );
         b[2..4].copy_from_slice(&22u16.to_be_bytes());
         assert_eq!(Packet::parse(&b), Err(PacketError::Truncated { length: 22, got: 20 }));
         // An attribute of length 1, then one that runs past the length.
@@ -1903,7 +1932,14 @@ mod tests {
         let p = Packet::parse(&b).unwrap();
         assert_eq!(p.attributes, [Attribute { kind: 1, value: vec![] }]);
         assert_eq!(p.to_bytes().unwrap(), b[..22]);
-        for e in [PacketError::Short(1), PacketError::Length(1), PacketError::Attribute(20)] {
+        for e in [
+            PacketError::Short(1),
+            PacketError::Length {
+                length: 1,
+                limit: MAX_PACKET,
+            },
+            PacketError::Attribute(20),
+        ] {
             assert!(!e.to_string().is_empty());
         }
         assert!(!PacketError::Truncated { length: 1, got: 0 }.to_string().is_empty());
@@ -2400,9 +2436,21 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         // A bad length breaks the stream for good.
         assert_eq!(d.feed(&[1, 0, 0, 5]), 4);
-        assert_eq!(d.next_packet(), Some(Err(PacketError::Length(5))));
+        assert_eq!(
+            d.next_packet(),
+            Some(Err(PacketError::Length {
+                length: 5,
+                limit: MAX_PACKET
+            }))
+        );
         assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_packet(), Some(Err(PacketError::Length(5))));
+        assert_eq!(
+            d.next_packet(),
+            Some(Err(PacketError::Length {
+                length: 5,
+                limit: MAX_PACKET
+            }))
+        );
         assert_eq!(d.buffered(), 0);
         // So does a packet whose attributes do not fit.
         let mut d = Decoder::new();

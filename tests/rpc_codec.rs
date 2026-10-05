@@ -7,6 +7,32 @@ use fictionet::stdlib::codec::{
 };
 use fictionet::stdlib::{dcerpc, diameter, nbss, radius, smb2};
 
+#[test]
+fn migrated_public_docs_do_not_reference_internal_design_sections() {
+    for (module, source) in [
+        ("dcerpc", include_str!("../src/stdlib/dcerpc.rs")),
+        ("smb2", include_str!("../src/stdlib/smb2.rs")),
+        ("nbss", include_str!("../src/stdlib/nbss.rs")),
+        ("radius", include_str!("../src/stdlib/radius.rs")),
+        ("diameter", include_str!("../src/stdlib/diameter.rs")),
+    ] {
+        let docs = source
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim_start();
+                line.strip_prefix("///")
+                    .or_else(|| line.strip_prefix("//!"))
+            })
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            !docs.to_ascii_lowercase().contains("design section"),
+            "{module} public docs refer to an internal design section"
+        );
+    }
+}
+
 fn round_trip<M, D>(make: impl Fn() -> D, values: &[M], expected: &[D::Item]) -> Vec<u8>
 where
     M: Wire + PartialEq + Debug,
@@ -264,15 +290,47 @@ fn smb2_chunked_round_trip() {
 }
 
 #[test]
+fn smb2_length_errors_report_bounds() {
+    let length = smb2::MAX_MESSAGE + 1;
+    let bytes = (length as u32).to_be_bytes();
+    let mut legacy = smb2::Decoder::new();
+    assert_eq!(legacy.feed(&bytes), bytes.len());
+    assert_eq!(
+        legacy.next_frame().unwrap().unwrap_err().to_string(),
+        format!("frame length {length}, more than {}", smb2::MAX_MESSAGE)
+    );
+    for limit in [0, 7, smb2::MAX_MESSAGE, usize::MAX] {
+        let mut frames = smb2::Frames::with_limit(limit);
+        let limit = frames.limit();
+        let length = limit + 1;
+        let bytes = (length as u32).to_be_bytes();
+        assert_eq!(
+            frames.decode(&bytes, false).unwrap_err().to_string(),
+            format!("frame length {length}, more than {limit}")
+        );
+    }
+}
+
+#[test]
 fn smb2_refuses_length_from_header_and_writer_rolls_back() {
     let length = smb2::MAX_MESSAGE + 1;
     let bytes = (length as u32).to_be_bytes();
-    terminal(smb2::Frames::new, &bytes, smb2::FrameError::Length(length));
+    terminal(
+        smb2::Frames::new,
+        &bytes,
+        smb2::FrameError::Length {
+            length,
+            limit: smb2::MAX_MESSAGE,
+        },
+    );
     terminal(smb2::Frames::new, &[0x81], smb2::FrameError::Type(0x81));
     terminal(
         || smb2::Frames::with_limit(7),
         &[0, 0, 0, 8],
-        smb2::FrameError::Length(8),
+        smb2::FrameError::Length {
+            length: 8,
+            limit: 7,
+        },
     );
     let mut empty_only = smb2::Frames::with_limit(0);
     assert_eq!(empty_only.capacity(), smb2::FRAME_HEADER_LEN);
@@ -283,7 +341,10 @@ fn smb2_refuses_length_from_header_and_writer_rolls_back() {
     terminal(
         || smb2::Frames::with_limit(0),
         &[0, 0, 0, 1],
-        smb2::FrameError::Length(1),
+        smb2::FrameError::Length {
+            length: 1,
+            limit: 0,
+        },
     );
     refused(&smb2::Frame {
         payload: vec![0; length],
@@ -359,21 +420,56 @@ fn radius_chunked_round_trip() {
 }
 
 #[test]
+fn radius_length_errors_report_bounds() {
+    for length in [19u16, 4097] {
+        let [hi, lo] = length.to_be_bytes();
+        let mut legacy = radius::Decoder::new();
+        assert_eq!(legacy.feed(&[1, 0, hi, lo]), 4);
+        assert_eq!(
+            legacy.next_packet().unwrap().unwrap_err().to_string(),
+            format!("length field {length}, outside 20..=4096")
+        );
+    }
+    for limit in [0, 20, 64, radius::MAX_PACKET, usize::MAX] {
+        let mut frames = radius::Frames::with_limit(limit);
+        let limit = frames.limit();
+        let length = limit as u16 + 1;
+        let [hi, lo] = length.to_be_bytes();
+        assert_eq!(
+            frames
+                .decode(&[1, 0, hi, lo], false)
+                .unwrap_err()
+                .to_string(),
+            format!("length field {length}, outside 20..={limit}")
+        );
+    }
+}
+
+#[test]
 fn radius_refuses_lengths_and_attributes_without_recovery() {
     terminal(
         radius::Frames::new,
         &[1, 0, 0x10, 1],
-        radius::PacketError::Length(4097),
+        radius::PacketError::Length {
+            length: 4097,
+            limit: radius::MAX_PACKET,
+        },
     );
     terminal(
         radius::Frames::new,
         &[1, 0, 0, 19],
-        radius::PacketError::Length(19),
+        radius::PacketError::Length {
+            length: 19,
+            limit: radius::MAX_PACKET,
+        },
     );
     terminal(
         || radius::Frames::with_limit(20),
         &[1, 0, 0, 21],
-        radius::PacketError::Length(21),
+        radius::PacketError::Length {
+            length: 21,
+            limit: 20,
+        },
     );
     let empty = radius::Packet::new(radius::Code::AccessRequest, 0, [0; 16]);
     let bytes = Wire::to_bytes(&empty).unwrap();

@@ -268,14 +268,21 @@ pub enum FrameError {
     /// The first byte was not 0.
     Type(u8),
     /// The payload length exceeded the configured limit, at most [`MAX_MESSAGE`].
-    Length(usize),
+    Length {
+        /// The payload length from the transport header.
+        length: usize,
+        /// The largest accepted payload, excluding its transport header.
+        limit: usize,
+    },
 }
 
 impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Type(t) => write!(f, "frame type {t:#04x}, not 0"),
-            FrameError::Length(n) => write!(f, "frame length {n} exceeds the payload limit"),
+            FrameError::Length { length, limit } => {
+                write!(f, "frame length {length}, more than {limit}")
+            }
         }
     }
 }
@@ -463,7 +470,7 @@ fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>,
     }
     let length = (usize::from(b[1]) << 16) | (usize::from(b[2]) << 8) | usize::from(b[3]);
     if length > limit {
-        return Err(FrameError::Length(length));
+        return Err(FrameError::Length { length, limit });
     }
     let end = FRAME_HEADER_LEN + length;
     match b.get(FRAME_HEADER_LEN..end) {
@@ -3761,13 +3768,25 @@ mod tests {
         }
         assert_eq!(parse_frame(&f), Ok(Some((&payload[..], 8))));
         assert_eq!(parse_frame(&[0x85]), Err(FrameError::Type(0x85)));
-        assert_eq!(parse_frame(&[0, 0xff, 0xff, 0xff]), Err(FrameError::Length(0xff_ffff)));
+        assert_eq!(
+            parse_frame(&[0, 0xff, 0xff, 0xff]),
+            Err(FrameError::Length {
+                length: 0xff_ffff,
+                limit: MAX_MESSAGE
+            })
+        );
         assert_eq!(frame(&vec![0; MAX_MESSAGE + 1]), Err(EncodeError::TooLong));
         let longest = frame(&vec![7; MAX_MESSAGE]).unwrap();
         assert_eq!(parse_frame(&longest).unwrap().unwrap().1, MAX_BUFFERED);
         // An empty frame is a frame.
         assert_eq!(parse_frame(&[0, 0, 0, 0]), Ok(Some((&[][..], 4))));
-        for e in [FrameError::Type(1), FrameError::Length(2)] {
+        for e in [
+            FrameError::Type(1),
+            FrameError::Length {
+                length: 2,
+                limit: MAX_MESSAGE,
+            },
+        ] {
             assert!(!e.to_string().is_empty());
         }
     }

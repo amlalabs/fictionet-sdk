@@ -60,9 +60,15 @@ fuzz_target!(|data: &[u8]| {
         vendor: Some(0),
         mandatory: true,
         protected: false,
-        data: data.get(..MAX_AVP_DATA + 1).unwrap_or(data).to_vec(),
+        data: data.to_vec(),
     });
     contract::check_wire_value(&built);
+    if data.first() == Some(&0xff) {
+        // Keep the command valid so the oversized AVP reaches the length check.
+        built.command = 1;
+        built.avps[0].data = vec![0; MAX_AVP_DATA + 1];
+        contract::check_wire_value(&built);
+    }
 
     // The stream, split two ways: as much at a time as the decoder takes,
     // and a byte at a time.

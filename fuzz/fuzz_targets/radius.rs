@@ -165,6 +165,8 @@ fn construct(data: &[u8]) -> Option<()> {
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(0), data);
+    contract::check_decode(|| Frames::with_limit(64), data);
     contract::check_wire::<Packet>(data);
 
     // The bytes as one datagram.

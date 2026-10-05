@@ -1114,23 +1114,17 @@ impl Wire for Pdu {
 
 /// Reads DCE/RPC fragments without retaining input.
 ///
-/// Each item is a PDU or a recoverable body error. Only header errors and
-/// fragments above [`limit`](Self::limit) end the stream. Lengths are checked
-/// as soon as their first ten header bytes arrive, before any body is needed.
+/// Items are `Result<Pdu, Error>`: body errors are recoverable items.
+/// Only [`FrameError`] ends the stream, for invalid headers or fragments above
+/// [`limit`](Self::limit). Lengths are checked as soon as their first ten
+/// header bytes arrive, before any body is needed.
 /// Partial fragments return [`Step::Need`], including at EOF, so
-/// [`super::codec::Stream`] reports truncation. Its `with_next` method gives
+/// [`super::codec::Stream`] reports truncation. [`super::codec::Stream::with_next`] gives
 /// the original fragment bytes for authentication, including discarded padding.
 /// Proxies should forward those bytes: a received PDU can fit the limit while
 /// canonical padding or reserved fields would make [`Wire::write`] refuse it.
 /// The legacy [`Decoder`] remains separate to preserve borrowed frames,
 /// repeated framing errors, and buffer clearing on failure.
-///
-/// This deliberately differs from codec design section 3.6: framing and body
-/// parsing are combined into `Result<Pdu, Error>` items instead of returning
-/// `Vec<u8>` items and mapping a fragment parser over them. Raw bytes remain
-/// available through [`super::codec::Stream::with_next`] without a second copy.
-/// [`FrameError::Header`] wraps [`Error`], but this decoder only emits its
-/// [`Error::Version`], [`Error::IntegerRep`] and [`Error::FragLength`] variants.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Frames, Pdu}};

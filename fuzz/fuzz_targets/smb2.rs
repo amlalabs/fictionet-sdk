@@ -219,8 +219,13 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Frame>(data);
     contract::check_decode(|| Frames::new().map(|f| Packet::parse(&f.payload)), data);
     contract::check_wire_value(&Frame {
-        payload: data.get(..MAX_MESSAGE + 1).unwrap_or(data).to_vec(),
+        payload: data.to_vec(),
     });
+    if data.first() == Some(&0xff) {
+        contract::check_wire_value(&Frame {
+            payload: vec![0; MAX_MESSAGE + 1],
+        });
+    }
 
     // The stream, split two ways: all at once, and a byte at a time. Both
     // give the same payloads and the same error.
