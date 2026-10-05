@@ -129,6 +129,7 @@ pub mod asn1;
 pub mod bacnet;
 pub mod bgp;
 pub mod coap;
+pub mod codec;
 pub mod cotp;
 pub mod dcerpc;
 #[doc(hidden)]
