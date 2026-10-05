@@ -24,6 +24,26 @@
 //! fails; [`silent_on_failure`](crate::stdlib::onc_rpc::silent_on_failure)
 //! says which calls those are.
 //!
+//! Over TCP, map [`onc_rpc::messages`](super::onc_rpc::messages) with a
+//! closure. [`Request::read`] also accepts version, procedure, and arguments
+//! directly when the caller has already checked the RPC header.
+//!
+//! ```
+//! use fictionet::stdlib::{codec::{Decode, Stream}, onc_rpc, portmap};
+//!
+//! let requests = onc_rpc::messages(onc_rpc::MAX_RECORD).map(|message| {
+//!     message.map(|message| match message.body {
+//!         onc_rpc::Body::Call(call) => {
+//!             let request = portmap::Request::from_call(&call);
+//!             Some((message.xid, call, request))
+//!         }
+//!         onc_rpc::Body::Reply(_) => None,
+//!     })
+//! });
+//! let mut stream = Stream::new(requests);
+//! assert!(stream.next().is_none());
+//! ```
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Strings, opaque data and lists have limits, given below as
 //! constants. Lists are read in a loop, never by recursion. Writers return
@@ -911,15 +931,19 @@ impl Request {
         if call.program != PMAP_PROGRAM {
             return Err(ParseError::Program(call.program));
         }
-        if call.version == PMAP_VERSION {
-            return Ok(Request::Pmap(PmapRequest::parse(
-                call.procedure,
-                &call.args,
-            )?));
+        Self::read(call.version, call.procedure, &call.args)
+    }
+
+    /// Reads the complete arguments for a procedure of version 2, 3, or 4.
+    /// The caller checks the RPC version, program, and credentials. Use
+    /// [`Self::from_call`] to check the RPC version and program as well.
+    pub fn read(version: u32, procedure: u32, args: &[u8]) -> Result<Request, ParseError> {
+        if version == PMAP_VERSION {
+            return Ok(Request::Pmap(PmapRequest::parse(procedure, args)?));
         }
-        let request = RpcbRequest::parse(call.version, call.procedure, &call.args)?;
+        let request = RpcbRequest::parse(version, procedure, args)?;
         Ok(Request::Rpcb {
-            version: call.version,
+            version,
             request,
         })
     }
@@ -1950,6 +1974,7 @@ mod tests {
     fn check_request(req: &Request) {
         let call = req.to_call().unwrap();
         assert_eq!(Request::from_call(&call).as_ref(), Ok(req));
+        assert_eq!(Request::read(call.version, call.procedure, &call.args).as_ref(), Ok(req));
         let msg = req.call(42).unwrap();
         let Body::Call(back) = Message::parse(&msg.to_bytes()).unwrap().body else {
             panic!()
@@ -1962,6 +1987,18 @@ mod tests {
             };
             assert!(Request::from_call(&short).is_err(), "{req:?} prefix {n}");
         }
+    }
+
+    #[test]
+    fn arguments_keep_version_and_procedure_errors() {
+        assert_eq!(Request::read(1, procedure::NULL, &[]), Err(ParseError::Version(1)));
+        assert_eq!(Request::read(3, procedure::GETSTAT, &[]), Err(ParseError::Procedure(procedure::GETSTAT)));
+        assert_eq!(Request::read(2, procedure::GETTIME, &[]), Err(ParseError::Procedure(procedure::GETTIME)));
+        assert_eq!(
+            Request::read(4, procedure::GETSTAT, &[]),
+            Ok(Request::Rpcb { version: 4, request: RpcbRequest::GetStat })
+        );
+        assert_eq!(Request::read(2, procedure::NULL, &[1]), Err(ParseError::Xdr(XdrError::Trailing(1))));
     }
 
     fn check_pmap_result(res: &PmapResult) {

@@ -5,9 +5,13 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::onc_rpc::{Body, Call, Message, PMAP_PROGRAM};
 use fictionet::stdlib::portmap::{
-    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, ParseError, PmapRequest,
-    PmapResult, Request, RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult,
-    RpcbStat, format_uaddr, parse_uaddr,
+    AddrStat, CallArgs, CallResult, MAX_UADDR, Mapping, Netbuf, ParseError, PmapRequest, PmapResult, Request,
+    RmtCallResult, RmtCallStat, Rpcb, RpcbEntry, RpcbRequest, RpcbResult, RpcbStat, format_uaddr,
+    parse_uaddr,
+};
+use fictionet::stdlib::{
+    codec::{Decode, contract},
+    onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;
 use std::net::{IpAddr, SocketAddr};
@@ -29,6 +33,7 @@ fn read(data: &[u8]) {
         }
         for version in 1..=5 {
             let call = Call::new(PMAP_PROGRAM, version, procedure, data.to_vec());
+            assert_eq!(Request::read(version, procedure, data), Request::from_call(&call));
             if let Ok(req) = Request::from_call(&call) {
                 assert_eq!(req.to_call().unwrap(), call);
             }
@@ -237,6 +242,23 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    const RECORD_LIMIT: usize = 1 << 16;
+    contract::check_decode(|| onc_rpc::Fragments::with_limit(RECORD_LIMIT), data);
+    contract::check_decode(|| onc_rpc::records(RECORD_LIMIT), data);
+    contract::check_decode(
+        || {
+            onc_rpc::messages(RECORD_LIMIT).map(|message| {
+                message.map(|message| match message.body {
+                    Body::Call(call) => Some((message.xid, Request::from_call(&call))),
+                    Body::Reply(_) => None,
+                })
+            })
+        },
+        data,
+    );
+    // Portmap arguments need version and procedure; Wire is the envelope.
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<onc_rpc::Record>(data);
     // Any bytes as a whole message: a call a portmapper reads.
     if let Ok(msg) = Message::parse(data) {
         if let Body::Call(call) = &msg.body {

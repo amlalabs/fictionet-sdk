@@ -29,6 +29,11 @@
 //! below as constants or by the caller, and the writers clip what they
 //! write to the limits the readers apply.
 //!
+//! New stream users can use [`Fragments`], [`records`], or [`messages`]
+//! with [`codec::Stream`]. [`Record::write`] and [`Wire`] for [`Message`]
+//! are strict. Existing `feed`, `to_bytes`, and encoding functions retain
+//! their original behavior, including clipping and repeated errors.
+//!
 //! ```
 //! use fictionet::stdlib::onc_rpc::{
 //!     encode_port, encode_record, silent_on_failure, Body, Call, Decoder, Mapping, Message,
@@ -69,6 +74,9 @@
 //! ```
 
 use std::net::{IpAddr, SocketAddr};
+
+use super::codec::{self, Assemble, AssembleError, Assembled, Decode, Step, Wire};
+use core::convert::Infallible;
 
 /// The port the portmapper and rpcbind listen on, over TCP and UDP.
 pub const PORT: u16 = 111;
@@ -113,6 +121,8 @@ pub const MAX_RECORD: usize = 1 << 21;
 pub const MAX_FRAGMENT: u32 = 0x7fff_ffff;
 /// The record mark's high bit, set on a record's last fragment.
 pub const LAST_FRAGMENT: u32 = 0x8000_0000;
+/// The length of a TCP record mark, in bytes.
+pub const RECORD_MARK_LEN: usize = 4;
 
 /// Authentication flavors (RFC 5531, section 8.2, and the IANA registry).
 pub mod flavor {
@@ -852,6 +862,113 @@ impl Message {
     pub fn reply(&self, reply: Reply) -> Message {
         Message { xid: self.xid, body: Body::Reply(reply) }
     }
+
+    /// Appends this message without clipping or normalizing its fields.
+    ///
+    /// Refuses messages over [`MAX_RECORD`], authentication fields over
+    /// their named limits, and aliases that parse as another enum variant.
+    /// An error leaves `out` unchanged. [`Self::to_bytes`] keeps its original
+    /// clipping behavior. This is also the writer used by [`Wire`].
+    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageWriteError> {
+        let size = match &self.body {
+            Body::Call(call) => 24usize
+                .saturating_add(auth_wire_len(&call.cred)?)
+                .saturating_add(auth_wire_len(&call.verf)?)
+                .saturating_add(call.args.len()),
+            Body::Reply(Reply::Accepted { verf, status }) => {
+                16usize.saturating_add(auth_wire_len(verf)?).saturating_add(match status {
+                    Accept::Success(results) => results.len(),
+                    Accept::ProgMismatch { .. } => 8,
+                    _ => 0,
+                })
+            }
+            Body::Reply(Reply::Denied(Reject::RpcMismatch { .. })) => 24,
+            Body::Reply(Reply::Denied(Reject::AuthError(status))) => {
+                if AuthStat::from_code(status.code()) != *status {
+                    return Err(MessageWriteError::NonCanonical);
+                }
+                20
+            }
+        };
+        if size > MAX_RECORD {
+            return Err(MessageWriteError::TooLong { limit: MAX_RECORD });
+        }
+        // Validation bounds this temporary by MAX_RECORD and makes the
+        // legacy serializer exact for this value.
+        out.extend_from_slice(&self.to_bytes());
+        Ok(())
+    }
+}
+
+/// Why a strict RPC message writer refused a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageWriteError {
+    /// A message or authentication field exceeds its named limit.
+    TooLong {
+        /// The maximum bytes or entries for that field.
+        limit: usize,
+    },
+    /// An authentication variant would parse as another variant.
+    NonCanonical,
+}
+
+impl core::fmt::Display for MessageWriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooLong { limit } => write!(f, "RPC message field exceeds {limit}"),
+            Self::NonCanonical => f.write_str("RPC authentication variant would change on parsing"),
+        }
+    }
+}
+
+impl core::error::Error for MessageWriteError {}
+
+fn auth_wire_len(auth: &Auth) -> Result<usize, MessageWriteError> {
+    let body_len = match auth {
+        Auth::None => 0,
+        Auth::Sys(sys) => {
+            if sys.machine_name.len() > MAX_MACHINE_NAME {
+                return Err(MessageWriteError::TooLong { limit: MAX_MACHINE_NAME });
+            }
+            if sys.gids.len() > MAX_GIDS {
+                return Err(MessageWriteError::TooLong { limit: MAX_GIDS });
+            }
+            20usize
+                .saturating_add(sys.machine_name.len())
+                .saturating_add(padding(sys.machine_name.len()))
+                .saturating_add(sys.gids.len().saturating_mul(4))
+        }
+        Auth::Other { flavor, body } => {
+            if body.len() > MAX_AUTH_BODY {
+                return Err(MessageWriteError::TooLong { limit: MAX_AUTH_BODY });
+            }
+            if (*flavor == flavor::NONE && body.is_empty())
+                || (*flavor == flavor::SYS && AuthSys::parse(body).is_ok())
+            {
+                return Err(MessageWriteError::NonCanonical);
+            }
+            body.len()
+        }
+    };
+    Ok(8usize.saturating_add(body_len).saturating_add(padding(body_len)))
+}
+
+impl Wire for Message {
+    type ParseError = XdrError;
+    type WriteError = MessageWriteError;
+
+    /// Reads one RPC message of at most [`MAX_RECORD`] bytes.
+    /// The inherent [`Message::parse`] retains its original size policy.
+    fn parse(bytes: &[u8]) -> Result<Self, XdrError> {
+        if bytes.len() > MAX_RECORD {
+            return Err(XdrError::TooLong(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+        }
+        Message::parse(bytes)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageWriteError> {
+        self.write(out)
+    }
 }
 
 /// Why a TCP stream holds no more records a reader can find. A real
@@ -872,6 +989,184 @@ impl std::fmt::Display for RecordError {
 }
 
 impl std::error::Error for RecordError {}
+
+/// One TCP record fragment, without its record mark.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Fragment {
+    /// Whether this fragment ends the current record.
+    pub last: bool,
+    /// Payload bytes, bounded by the decoder's record limit.
+    pub data: Vec<u8>,
+}
+
+/// Reads TCP record marks and their payloads without retaining input.
+///
+/// The record limit bounds both each fragment and their sum. An oversized
+/// record is refused from its mark, before its payload arrives. Only a
+/// byte count is retained; [`records`] joins the payloads with [`Assemble`].
+#[derive(Clone, Debug)]
+pub struct Fragments {
+    limit: usize,
+    record_len: usize,
+}
+
+impl Fragments {
+    /// Creates a fragment decoder with a record limit of [`MAX_RECORD`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_RECORD)
+    }
+
+    /// Sets the record limit, clamped to [`MAX_RECORD`]. Zero permits only
+    /// empty fragments. Input capacity also includes [`RECORD_MARK_LEN`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_RECORD), record_len: 0 }
+    }
+
+    /// The maximum sum of payload bytes in one record.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Fragments {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Fragments {
+    type Item = Fragment;
+    type Error = RecordError;
+    const NAME: &'static str = "ONC RPC record marking";
+
+    fn capacity(&self) -> usize {
+        self.limit.saturating_add(RECORD_MARK_LEN)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Fragment>, RecordError> {
+        let Some(mark) = input.get(..RECORD_MARK_LEN) else { return Ok(Step::Need) };
+        let mut bytes = [0; RECORD_MARK_LEN];
+        bytes.copy_from_slice(mark);
+        let mark = u32::from_be_bytes(bytes);
+        let len = usize::try_from(mark & MAX_FRAGMENT).map_err(|_| RecordError::TooLong(self.limit))?;
+        let total = self.record_len.checked_add(len).ok_or(RecordError::TooLong(self.limit))?;
+        if total > self.limit {
+            return Err(RecordError::TooLong(self.limit));
+        }
+        let used = RECORD_MARK_LEN.checked_add(len).ok_or(RecordError::TooLong(self.limit))?;
+        let Some(data) = input.get(RECORD_MARK_LEN..used) else { return Ok(Step::Need) };
+        let last = mark & LAST_FRAGMENT != 0;
+        self.record_len = if last { 0 } else { total };
+        Ok(Step::Item(Fragment { last, data: data.to_vec() }, used))
+    }
+}
+
+/// TCP records assembled by the shared codec stage.
+///
+/// Items are [`Assembled::Message`]. The `Whole` variant is uninhabited.
+/// Use [`records`] to apply the same limit to fragments and assembly.
+pub type Records = Assemble<Fragments, fn(Fragment) -> codec::Fragment<Infallible>>;
+
+/// Joins TCP fragments into records under `limit`, clamped to [`MAX_RECORD`].
+///
+/// Unread input is bounded by `limit + RECORD_MARK_LEN`. Assembly holds
+/// at most `limit` payload bytes. EOF inside a fragment is reported by
+/// [`codec::Stream`] as [`codec::Fail::Truncated`]. EOF after a nonfinal
+/// fragment is [`AssembleError::Incomplete`], including empty fragments.
+pub fn records(limit: usize) -> Records {
+    let fragments = Fragments::with_limit(limit);
+    let limit = fragments.limit();
+    Assemble::new(fragments, limit, |f| codec::Fragment::Part { data: f.data, last: f.last })
+}
+
+/// Decodes TCP records and parses each as an RPC message.
+///
+/// Invalid messages are error items, so the next record can still be read.
+/// Record marking errors end the stream. Use [`Decode::map`] with a closure
+/// to read program arguments from each [`Body::Call`].
+pub fn messages(
+    limit: usize,
+) -> impl Decode<Item = Result<Message, XdrError>, Error = AssembleError<RecordError>> {
+    records(limit).map(|record| match record {
+        Assembled::Message(bytes) => <Message as Wire>::parse(&bytes),
+        Assembled::Whole(never) => match never {},
+    })
+}
+
+/// A complete TCP record's payload, bounded by [`MAX_RECORD`].
+///
+/// [`Wire::parse`] accepts exactly one record, with any number of fragments.
+/// [`Record::write`] emits one final fragment and refuses oversized payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record(
+    /// Payload bytes without TCP record marks.
+    pub Vec<u8>,
+);
+
+/// Why bytes do not contain exactly one complete TCP record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RecordParseError {
+    /// A record mark or unfinished assembly was refused.
+    Framing(AssembleError<RecordError>),
+    /// The input ended before a complete record arrived.
+    Truncated,
+    /// Bytes followed the record's final fragment.
+    Trailing(usize),
+}
+
+impl core::fmt::Display for RecordParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Framing(e) => e.fmt(f),
+            Self::Truncated => f.write_str("RPC record ended early"),
+            Self::Trailing(n) => write!(f, "{n} bytes after the RPC record"),
+        }
+    }
+}
+
+impl core::error::Error for RecordParseError {}
+
+impl Record {
+    /// Appends one final fragment. Refuses payloads over [`MAX_RECORD`]
+    /// without changing `out`. Unlike [`encode_record`], this never clips.
+    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
+        if self.0.len() > MAX_RECORD {
+            return Err(RecordError::TooLong(MAX_RECORD));
+        }
+        let len = u32::try_from(self.0.len()).map_err(|_| RecordError::TooLong(MAX_RECORD))?;
+        out.extend_from_slice(&(LAST_FRAGMENT | len).to_be_bytes());
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
+
+impl Wire for Record {
+    type ParseError = RecordParseError;
+    type WriteError = RecordError;
+
+    fn parse(mut input: &[u8]) -> Result<Self, RecordParseError> {
+        let mut decoder = records(MAX_RECORD);
+        loop {
+            match decoder.decode(input, true).map_err(RecordParseError::Framing)? {
+                Step::Item(Assembled::Message(data), used) => {
+                    let trailing = input.len().saturating_sub(used);
+                    return if trailing == 0 {
+                        Ok(Self(data))
+                    } else {
+                        Err(RecordParseError::Trailing(trailing))
+                    };
+                }
+                Step::Item(Assembled::Whole(never), _) => match never {},
+                Step::Skip(used) => input = input.get(used..).ok_or(RecordParseError::Truncated)?,
+                Step::Need | Step::End => return Err(RecordParseError::Truncated),
+            }
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
+        self.write(out)
+    }
+}
 
 /// Splits a TCP byte stream into records, putting each record's fragments
 /// together. Feed it the bytes a connection reads, in order, and take
@@ -1384,6 +1679,214 @@ fn byte(s: &str) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump};
+
+    #[test]
+    fn codec_fragments_and_records() {
+        let payload = b"fragmented RPC payload";
+        let mut wire = vec![0; RECORD_MARK_LEN]; // Empty nonfinal fragment.
+        wire.extend(encode_fragments(payload, 3));
+        wire.extend(encode_record(b""));
+        contract::check_decode(|| Fragments::with_limit(payload.len()), &wire);
+        contract::check_decode_with_held_limit(|| super::records(payload.len()), &wire, payload.len());
+
+        let mut stream = Stream::new(super::records(payload.len()));
+        let mut items = Vec::new();
+        for byte in &wire {
+            assert_eq!(pump(&mut stream, core::slice::from_ref(byte), |item| items.push(item)), Ok(1));
+            assert!(stream.buffered() <= payload.len() + RECORD_MARK_LEN);
+            assert!(stream.held() <= payload.len());
+        }
+        assert_eq!(finish(&mut stream, |item| items.push(item)), Ok(()));
+        assert_eq!(items, vec![Assembled::Message(payload.to_vec()), Assembled::Message(Vec::new())]);
+    }
+
+    #[test]
+    fn codec_record_limits_are_checked_from_marks() {
+        let mut fragments = Fragments::with_limit(3);
+        assert_eq!(
+            fragments.decode(&[0, 0, 0, 2, 1, 2], false),
+            Ok(Step::Item(Fragment { last: false, data: vec![1, 2] }, 6))
+        );
+        assert_eq!(fragments.decode(&[0x80, 0, 0, 2], false), Err(RecordError::TooLong(3)));
+        assert_eq!(Fragments::with_limit(usize::MAX).capacity(), MAX_RECORD + RECORD_MARK_LEN);
+
+        let wire = [0, 0, 0, 2, 1, 2, 0x80, 0, 0, 2];
+        contract::check_decode(|| super::records(3), &wire);
+        let mut stream = Stream::new(super::records(3));
+        let error = Fail::Protocol(AssembleError::Inner(RecordError::TooLong(3)));
+        assert_eq!(pump(&mut stream, &wire, |_| {}), Err(error.clone()));
+        assert_eq!(stream.failed(), Some(&error));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.push(b"ignored"), 7);
+
+        // The generic stage still enforces its own limit independently.
+        let mut smaller =
+            Assemble::new(Fragments::with_limit(8), 1, |f: Fragment| codec::Fragment::<Infallible>::Part {
+                data: f.data,
+                last: f.last,
+            });
+        assert_eq!(smaller.decode(&encode_record(b"ab"), false), Err(AssembleError::TooLong { limit: 1 }));
+    }
+
+    #[test]
+    fn codec_record_eof_and_zero_limit() {
+        for payload in [b"".as_slice(), b"a".as_slice()] {
+            let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
+            wire.extend_from_slice(payload);
+            let mut stream = Stream::new(super::records(8));
+            assert_eq!(pump(&mut stream, &wire, |_| panic!("nonfinal fragment")), Ok(wire.len()));
+            assert_eq!(
+                finish(&mut stream, |_| panic!("unfinished record")),
+                Err(Fail::Protocol(AssembleError::Incomplete { held: payload.len() }))
+            );
+        }
+        for partial in [b"\x80".as_slice(), b"\x80\0\0\x02x".as_slice()] {
+            let mut stream = Stream::new(super::records(8));
+            assert_eq!(pump(&mut stream, partial, |_| panic!("partial fragment")), Ok(partial.len()));
+            assert_eq!(
+                finish(&mut stream, |_| panic!("partial fragment")),
+                Err(Fail::Truncated { unread: partial.len() })
+            );
+        }
+        contract::check_decode(|| super::records(0), &[0, 0, 0, 0, 0x80, 0, 0, 0]);
+        contract::check_decode(|| super::records(0), &[0, 0, 0, 1]);
+        let mut empty = Stream::new(super::records(0));
+        assert_eq!(finish(&mut empty, |_| panic!("empty stream")), Ok(()));
+    }
+
+    #[test]
+    fn codec_record_wire_is_exact_and_strict() {
+        for data in [Vec::new(), b"record".to_vec(), vec![7; MAX_RECORD]] {
+            let record = Record(data.clone());
+            contract::check_wire_value(&record);
+            let segmented = encode_fragments(&data, 127);
+            assert_eq!(Record::parse(&segmented), Ok(record));
+            contract::check_wire::<Record>(&segmented);
+        }
+        let oversized = Record(vec![3; MAX_RECORD + 1]);
+        let mut out = vec![1, 2, 3];
+        assert_eq!(oversized.write(&mut out), Err(RecordError::TooLong(MAX_RECORD)));
+        assert_eq!(out, [1, 2, 3]);
+        // The old encoder still clips at its original limit.
+        assert_eq!(Record::parse(&encode_record(&oversized.0)), Ok(Record(vec![3; MAX_RECORD])));
+        let mut trailing = encode_record(b"a");
+        trailing.extend(encode_record(b"b"));
+        assert_eq!(Record::parse(&trailing), Err(RecordParseError::Trailing(5)));
+        assert_eq!(Record::parse(&[]), Err(RecordParseError::Truncated));
+        assert_eq!(
+            Record::parse(&[0, 0, 0, 0]),
+            Err(RecordParseError::Framing(AssembleError::Incomplete { held: 0 }))
+        );
+    }
+
+    #[test]
+    fn codec_message_wire_round_trips() {
+        let call = Message::parse(&nfs_call_bytes()).unwrap();
+        contract::check_wire::<Message>(&nfs_call_bytes());
+        let mut messages = vec![call.clone()];
+        for status in [
+            Accept::Success(vec![1, 2, 3]),
+            Accept::ProgUnavail,
+            Accept::ProgMismatch { low: 3, high: 4 },
+            Accept::ProcUnavail,
+            Accept::GarbageArgs,
+            Accept::SystemErr,
+        ] {
+            messages.push(call.reply(Reply::accepted(status)));
+        }
+        messages.push(call.reply(Reply::Denied(Reject::RpcMismatch { low: 2, high: 2 })));
+        for code in 0..=15 {
+            messages.push(call.reply(Reply::Denied(Reject::AuthError(AuthStat::from_code(code)))));
+        }
+        let max_auth = Auth::Sys(AuthSys {
+            stamp: 1,
+            machine_name: "a".repeat(MAX_MACHINE_NAME),
+            uid: 2,
+            gid: 3,
+            gids: vec![4; MAX_GIDS],
+        });
+        for auth in [
+            max_auth,
+            Auth::Other { flavor: 99, body: vec![5; MAX_AUTH_BODY] },
+            Auth::Other { flavor: flavor::NONE, body: vec![1] },
+            Auth::Other { flavor: flavor::SYS, body: vec![1] },
+        ] {
+            let mut c = Call::new(1, 2, 3, vec![4]);
+            c.cred = auth.clone();
+            c.verf = auth.clone();
+            messages.push(Message { xid: 7, body: Body::Call(c) });
+            messages.push(call.reply(Reply::Accepted { verf: auth, status: Accept::Success(vec![9]) }));
+        }
+        for message in messages {
+            contract::check_wire_value(&message);
+            assert_eq!(<Message as Wire>::to_bytes(&message), Ok(message.to_bytes()));
+        }
+    }
+
+    #[test]
+    fn codec_message_writer_refuses_loss_and_rolls_back() {
+        let sys = AuthSys { stamp: 1, machine_name: "host".into(), uid: 2, gid: 3, gids: vec![] };
+        let mut long_name = sys.clone();
+        long_name.machine_name = "x".repeat(MAX_MACHINE_NAME + 1);
+        let mut long_groups = sys.clone();
+        long_groups.gids = vec![0; MAX_GIDS + 1];
+        for (auth, error) in [
+            (Auth::Sys(long_name), MessageWriteError::TooLong { limit: MAX_MACHINE_NAME }),
+            (Auth::Sys(long_groups), MessageWriteError::TooLong { limit: MAX_GIDS }),
+            (
+                Auth::Other { flavor: 99, body: vec![0; MAX_AUTH_BODY + 1] },
+                MessageWriteError::TooLong { limit: MAX_AUTH_BODY },
+            ),
+            (Auth::Other { flavor: flavor::NONE, body: vec![] }, MessageWriteError::NonCanonical),
+            (Auth::Other { flavor: flavor::SYS, body: sys.to_bytes() }, MessageWriteError::NonCanonical),
+        ] {
+            let mut call = Call::new(1, 2, 3, Vec::new());
+            call.cred = auth.clone();
+            for message in [
+                Message { xid: 1, body: Body::Call(call.clone()) },
+                Message { xid: 1, body: Body::Call(Call { cred: Auth::None, verf: auth.clone(), ..call }) },
+                Message {
+                    xid: 1,
+                    body: Body::Reply(Reply::Accepted { verf: auth, status: Accept::ProgUnavail }),
+                },
+            ] {
+                let mut out = vec![1, 2, 3];
+                assert_eq!(message.write(&mut out), Err(error));
+                assert_eq!(out, [1, 2, 3]);
+                contract::check_wire_value(&message);
+                // The legacy writer still emits its original normalized value.
+                assert!(Message::parse(&message.to_bytes()).is_ok());
+            }
+        }
+        let alias =
+            Message { xid: 1, body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))) };
+        assert_eq!(alias.write(&mut Vec::new()), Err(MessageWriteError::NonCanonical));
+        contract::check_wire_value(&alias);
+    }
+
+    #[test]
+    fn codec_message_size_includes_the_header() {
+        for message in [
+            Message { xid: 1, body: Body::Call(Call::new(1, 2, 3, vec![0; MAX_RECORD - 40])) },
+            Message { xid: 2, body: Body::Reply(Reply::success(vec![0; MAX_RECORD - 24])) },
+        ] {
+            assert_eq!(<Message as Wire>::to_bytes(&message).unwrap().len(), MAX_RECORD);
+            contract::check_wire_value(&message);
+            let mut too_long = message.clone();
+            match &mut too_long.body {
+                Body::Call(call) => call.args.push(1),
+                Body::Reply(Reply::Accepted { status: Accept::Success(data), .. }) => data.push(1),
+                _ => unreachable!(),
+            }
+            let mut out = vec![42];
+            assert_eq!(too_long.write(&mut out), Err(MessageWriteError::TooLong { limit: MAX_RECORD }));
+            assert_eq!(out, [42]);
+            let bytes = too_long.to_bytes();
+            assert!(Message::parse(&bytes).is_ok());
+            assert_eq!(<Message as Wire>::parse(&bytes), Err(XdrError::TooLong((MAX_RECORD + 1) as u32)));
+        }
+    }
 
     /// A small deterministic generator for the fuzz loop.
     struct Lcg(u64);

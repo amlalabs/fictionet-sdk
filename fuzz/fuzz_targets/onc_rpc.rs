@@ -3,14 +3,20 @@
 #![no_main]
 
 use fictionet::stdlib::onc_rpc::{
-    AuthSys, Body, Decoder, MAX_ARRAY_RESERVE, Message, PortmapRequest, Reader, RpcbRequest, encode_fragments,
-    parse_dump,
+    AuthSys, Body, Decoder, MAX_ARRAY_RESERVE, Message, PortmapRequest, Reader, RpcbRequest,
+    encode_fragments, parse_dump,
 };
+use fictionet::stdlib::{codec::contract, onc_rpc};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     // The stream, split two ways: all at once, and a byte at a time.
     let limit = 4096;
+    contract::check_decode(|| onc_rpc::Fragments::with_limit(limit), data);
+    contract::check_decode(|| onc_rpc::records(limit), data);
+    contract::check_decode_with_held_limit(|| onc_rpc::messages(limit), data, limit);
+    contract::check_wire::<onc_rpc::Record>(data);
+    contract::check_wire::<Message>(data);
     let mut whole = Decoder::with_limit(limit);
     whole.feed(data);
     let mut records = Vec::new();
@@ -35,12 +41,14 @@ fuzz_target!(|data: &[u8]| {
 
     // Each record, and the bytes on their own as a UDP datagram.
     for bytes in records.iter().map(Vec::as_slice).chain([data]) {
+        contract::check_wire::<Message>(bytes);
         // A record written in fragments reads back the same.
         let mut d = if bytes.len() <= limit { Decoder::with_limit(limit) } else { Decoder::new() };
         d.feed(&encode_fragments(bytes, 7));
         assert_eq!(d.next_record(), Some(Ok(bytes.to_vec())));
         assert!(!d.mid_record());
         let Ok(m) = Message::parse(bytes) else { continue };
+        contract::check_wire_value(&m);
         // A message read writes back as the same bytes.
         assert_eq!(m.to_bytes(), bytes);
         if let Body::Call(call) = &m.body {
