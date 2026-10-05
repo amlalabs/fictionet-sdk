@@ -3,8 +3,9 @@
 //! the writers write them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::tds::{
-    Column, Decoder, Error, Login7, MAX_LOGIN_NAME, MAX_PACKET, Message, Packet, Prelogin,
+    Column, Decoder, Error, Frames, Login7, MAX_LOGIN_NAME, MAX_PACKET, Message, Packet, Prelogin,
     PreloginOption, SqlBatch, StreamHeader, Token, TokenReader, TokenWriter, TypeInfo, Value,
     data_type,
 };
@@ -69,6 +70,23 @@ fn value_for(ty: u8, b: &[u8]) -> Value {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_wire::<Packet>(data);
+    let packet = Packet {
+        packet_type: data.first().copied().unwrap_or(0),
+        status: data.get(1).copied().unwrap_or(0),
+        spid: u16::from(data.get(2).copied().unwrap_or(0)),
+        id: data.get(3).copied().unwrap_or(0),
+        window: data.get(4).copied().unwrap_or(0),
+        data: data.get(..MAX_PACKET).unwrap_or(data).to_vec(),
+    };
+    contract::check_wire_value(&packet);
+    if let Ok(bytes) = Wire::to_bytes(&packet) {
+        contract::check_wire::<Packet>(&bytes);
+        contract::check_decode(Frames::new, &bytes);
+    }
+
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces. A message read can be written, and reads back the same.
     let messages = run(data, 0);

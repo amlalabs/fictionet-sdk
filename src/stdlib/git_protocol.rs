@@ -25,6 +25,12 @@
 //! characters a field cannot carry and cut what does not fit, so what they
 //! write always reads back.
 //!
+//! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream)
+//! for bounded input and EOF checks. [`Packet`] implements [`Wire`] for
+//! exact parsing and transactional writing. [`Packet::to_bytes`] and
+//! [`Packet::write_to`] keep their clipping behavior. [`Decoder`] keeps
+//! its larger read-ahead limit, handoff bytes, and repeated errors.
+//!
 //! ```
 //! use fictionet::stdlib::git_protocol::{
 //!     Capability, CapabilityAdvertisement, LsRef, LsRefsArg, ObjectId, Packet, V2Request,
@@ -58,6 +64,8 @@
 //! assert_eq!(&reply[..4], b"0050");
 //! assert!(reply.ends_with(b" HEAD symref-target:refs/heads/main\n0000"));
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port `git://` servers listen on.
 pub const PORT: u16 = 9418;
@@ -123,6 +131,37 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
+/// Why an exact [`Wire`] parse did not read one complete packet.
+/// [`Packet::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// The pkt-line header is invalid.
+    Frame(PacketError),
+    /// The input ended before a complete packet, including empty input.
+    Truncated,
+    /// Bytes follow the first complete packet.
+    Trailing,
+}
+
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete Git packet"),
+            Self::Trailing => f.write_str("bytes follow the Git packet"),
+        }
+    }
+}
+
+impl core::error::Error for PacketParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
 impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
     /// holds only part of one, and otherwise the packet and how many bytes
@@ -167,6 +206,66 @@ impl Packet {
         let mut out = Vec::new();
         self.write_to(&mut out);
         out
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = PacketError;
+
+    /// Reads exactly one pkt-line. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
+        match Packet::parse(b).map_err(PacketParseError::Frame)? {
+            Some((packet, used)) if used == b.len() => Ok(packet),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on
+    /// error. Data is never clipped; control packets keep their wire form.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+        if let Self::Data(data) = self
+            && data.len() > MAX_DATA
+        {
+            return Err(PacketError::TooLong(HEADER_LEN.saturating_add(data.len())));
+        }
+        self.write_to(out);
+        Ok(())
+    }
+}
+
+/// Reads Git pkt-lines without holding input bytes.
+///
+/// Use with [`codec::Stream`](super::codec::Stream) for a buffer limited
+/// to [`MAX_PACKET`]. Oversized packets are refused from the header.
+/// Partial packets return [`Step::Need`], including at EOF, so the stream
+/// reports truncation. Flush, delimiter, response-end, and empty data
+/// packets are separate items. Control packets do not end the stream.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates a frame decoder with no retained state.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = PacketError;
+    const NAME: &'static str = "Git pkt-line";
+
+    fn capacity(&self) -> usize {
+        MAX_PACKET
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+        Ok(match Packet::parse(input)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
     }
 }
 

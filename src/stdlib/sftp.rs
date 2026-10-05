@@ -21,6 +21,12 @@
 //! message or language tag is cut where a UTF-8 character starts, so
 //! valid text stays valid.
 //!
+//! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream)
+//! for bounded input and EOF checks. [`Packet`] implements [`Wire`] for
+//! exact parsing and transactional writing. [`Packet::to_bytes`] still
+//! clips oversized bodies. [`Decoder`] keeps its repeated errors and
+//! discards buffered bytes on failure.
+//!
 //! ```
 //! use fictionet::stdlib::sftp::{Attrs, Decoder, Packet, Request, Response, Status, VERSION};
 //!
@@ -65,6 +71,8 @@
 //!     ]
 //! );
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The SSH subsystem name a client asks for to start SFTP.
 pub const SUBSYSTEM: &str = "sftp";
@@ -192,6 +200,37 @@ impl std::fmt::Display for PacketError {
 
 impl std::error::Error for PacketError {}
 
+/// Why an exact [`Wire`] parse did not read one complete packet.
+/// [`Packet::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// The packet length is invalid.
+    Frame(PacketError),
+    /// The input ended before a complete packet, including empty input.
+    Truncated,
+    /// Bytes follow the first complete packet.
+    Trailing,
+}
+
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete SFTP packet"),
+            Self::Trailing => f.write_str("bytes follow the SFTP packet"),
+        }
+    }
+}
+
+impl core::error::Error for PacketParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
 impl Packet {
     /// Reads the packet at the start of `b`, with a length of at most
     /// [`MAX_PACKET`]. It returns `Ok(None)` if `b` holds only part of
@@ -238,6 +277,89 @@ impl Packet {
         }
         let b = self.body.get(..4)?;
         Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = PacketError;
+
+    /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
+        match Packet::parse(b).map_err(PacketParseError::Frame)? {
+            Some((packet, used)) if used == b.len() => Ok(packet),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`LENGTH_LEN`] plus [`MAX_PACKET`] bytes. Refuses
+    /// oversized bodies before changing `out`. An unrepresentable length
+    /// is reported as [`PacketError::TooLong`] with `u32::MAX`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
+        let len = self.body.len().saturating_add(1);
+        let length = u32::try_from(len).map_err(|_| PacketError::TooLong(u32::MAX))?;
+        if len > MAX_PACKET {
+            return Err(PacketError::TooLong(length));
+        }
+        out.extend_from_slice(&length.to_be_bytes());
+        out.push(self.kind);
+        out.extend_from_slice(&self.body);
+        Ok(())
+    }
+}
+
+/// Reads SFTP packets without holding input bytes.
+///
+/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// by [`LENGTH_LEN`] plus [`limit`](Self::limit). Oversized packets are
+/// refused from the length field. Partial packets return [`Step::Need`],
+/// including at EOF, so the stream reports truncation. Packet bodies
+/// remain bytes for [`Request::parse`] or [`Response::parse`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Reads packets whose type and body occupy at most [`MAX_PACKET`] bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Sets the length-field limit, counting the type byte and body.
+    /// Clamps it to [`MAX_PACKET`]. Zero refuses every packet from its
+    /// length field; capacity still includes [`LENGTH_LEN`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_PACKET) }
+    }
+
+    /// The maximum type and body size, excluding the length field.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = PacketError;
+    const NAME: &'static str = "SFTP";
+
+    fn capacity(&self) -> usize {
+        LENGTH_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
+        Ok(match Packet::parse_limited(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
     }
 }
 

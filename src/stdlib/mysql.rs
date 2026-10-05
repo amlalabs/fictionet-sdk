@@ -25,6 +25,11 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Bad bytes give an [`Error`] or a [`FrameError`], never a panic.
 //!
+//! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream)
+//! to read individual wire packets. [`Frame`] implements [`Wire`] for
+//! exact parsing and transactional writing. [`Decoder`] still joins split
+//! packets into [`Message`]s, checks sequence IDs, and repeats errors.
+//!
 //! ```
 //! use fictionet::stdlib::mysql::{
 //!     capability, column_type, status, write_messages, Column, Command, Decoder, Handshake, Message,
@@ -80,6 +85,8 @@
 //! assert!(reader.is_done());
 //! ```
 
+use super::codec::{Decode, Step, Wire};
+
 /// The TCP port MySQL servers listen on.
 pub const PORT: u16 = 3306;
 /// The length of a packet header: a 3-byte length and a sequence ID.
@@ -88,6 +95,9 @@ pub const HEADER_LEN: usize = 4;
 /// goes on in the next packet, and a message whose length is a multiple
 /// of it ends with an empty packet.
 pub const MAX_PACKET_PAYLOAD: usize = 0xff_ffff;
+/// The longest wire packet, including its four-byte header.
+/// This is the default input capacity of [`Frames`].
+pub const MAX_FRAME: usize = HEADER_LEN + MAX_PACKET_PAYLOAD;
 /// The longest message a [`Decoder`] puts together, and the longest
 /// [`Message::to_bytes`] writes: 1 GiB, the largest `max_allowed_packet`
 /// a MySQL server accepts.
@@ -290,6 +300,7 @@ pub enum FrameError {
     /// The message would be longer than the decoder's limit. The value is
     /// the length it had reached, counting the packet that broke the
     /// limit.
+    /// [`Frames`] and [`Frame`] writers use the individual payload length.
     TooLong(usize),
 }
 
@@ -303,6 +314,157 @@ impl std::fmt::Display for FrameError {
 }
 
 impl std::error::Error for FrameError {}
+
+/// Why an exact [`Wire`] parse did not read one complete frame.
+/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The packet length exceeds the frame limit.
+    Frame(FrameError),
+    /// The input ended before a complete frame, including empty input.
+    Truncated,
+    /// Bytes follow the first complete frame.
+    Trailing,
+}
+
+impl core::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete MySQL frame"),
+            Self::Trailing => f.write_str("bytes follow the MySQL frame"),
+        }
+    }
+}
+
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+/// One wire packet, before split messages are assembled.
+///
+/// A full [`MAX_PACKET_PAYLOAD`] payload continues in the next packet.
+/// An empty packet can terminate such a message. This type preserves both
+/// forms and does not check sequence IDs across packets.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Frame {
+    /// This packet's sequence ID.
+    pub seq: u8,
+    /// Payload bytes, without the four-byte header.
+    pub payload: Vec<u8>,
+}
+
+impl Frame {
+    /// Reads one packet prefix, with at most [`MAX_PACKET_PAYLOAD`] bytes
+    /// of payload. Returns `None` until the whole packet arrives.
+    pub fn parse(b: &[u8]) -> Result<Option<(Self, usize)>, FrameError> {
+        Self::parse_limited(b, MAX_PACKET_PAYLOAD)
+    }
+
+    /// Reads one packet prefix with at most `limit` payload bytes.
+    /// Clamps the limit to [`MAX_PACKET_PAYLOAD`]. A larger declared
+    /// payload is refused from the header, before its bytes arrive.
+    pub fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Self, usize)>, FrameError> {
+        let Some(&[a, b0, c, seq]) = b.get(..HEADER_LEN) else { return Ok(None) };
+        let length = u32::from_le_bytes([a, b0, c, 0]);
+        let len = usize::try_from(length).map_err(|_| FrameError::TooLong(usize::MAX))?;
+        if len > limit.min(MAX_PACKET_PAYLOAD) {
+            return Err(FrameError::TooLong(len));
+        }
+        let end = HEADER_LEN.checked_add(len).ok_or(FrameError::TooLong(len))?;
+        Ok(b.get(HEADER_LEN..end).map(|payload| (Self { seq, payload: payload.to_vec() }, end)))
+    }
+
+    /// Writes this packet without adding a message terminator.
+    /// Refuses payloads longer than [`MAX_PACKET_PAYLOAD`].
+    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameError> {
+        Wire::to_bytes(self)
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = FrameError;
+
+    /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match Frame::parse(b).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+        let len = self.payload.len();
+        if len > MAX_PACKET_PAYLOAD {
+            return Err(FrameError::TooLong(len));
+        }
+        let [a, b, c, _] = u32::try_from(len).map_err(|_| FrameError::TooLong(len))?.to_le_bytes();
+        out.extend_from_slice(&[a, b, c, self.seq]);
+        out.extend_from_slice(&self.payload);
+        Ok(())
+    }
+}
+
+/// Reads individual MySQL packets without holding input bytes.
+///
+/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// by [`HEADER_LEN`] plus [`limit`](Self::limit). Oversized payloads are
+/// refused from the header. Partial packets return [`Step::Need`], including
+/// at EOF, so the stream reports truncation. Sequence IDs are preserved;
+/// message assembly and sequence checks remain in [`Decoder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Reads packets with up to [`MAX_PACKET_PAYLOAD`] payload bytes.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET_PAYLOAD)
+    }
+
+    /// Sets the payload limit, excluding the header. Clamps it to
+    /// [`MAX_PACKET_PAYLOAD`]. Zero permits empty packets.
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.min(MAX_PACKET_PAYLOAD) }
+    }
+
+    /// The maximum payload size, excluding its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Frame;
+    type Error = FrameError;
+    const NAME: &'static str = "MySQL";
+
+    fn capacity(&self) -> usize {
+        HEADER_LEN.saturating_add(self.limit)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
+        Ok(match Frame::parse_limited(input, self.limit)? {
+            Some((frame, used)) => Step::Item(frame, used),
+            None => Step::Need,
+        })
+    }
+}
 
 /// Why a payload is not the packet a reader expected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

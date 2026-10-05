@@ -27,6 +27,12 @@
 //! compressor and bytes, not decompressed. Every writer checks the same
 //! limits, so what it writes always reads back.
 //!
+//! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream).
+//! It reports any message error once and checks for partial frames at EOF.
+//! [`Decoder`] keeps its recoverable body errors and repeated terminal errors.
+//! [`Wire`] parses exactly one [`Message`] and writes it transactionally.
+//! The inherent [`Message::parse`] still accepts a prefix.
+//!
 //! ```
 //! use fictionet::stdlib::mongodb::{Body, Bson, Decoder, Document, Message, Msg, Reply};
 //!
@@ -70,6 +76,8 @@
 //! let Body::Msg(m) = back.body else { panic!("not an OP_MSG") };
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port MongoDB servers listen on.
 pub const PORT: u16 = 27017;
@@ -1189,10 +1197,7 @@ impl Message {
     /// holds only part of one, and otherwise the message and how many bytes
     /// of `b` it took.
     pub fn parse(b: &[u8]) -> Result<Option<(Message, usize)>, MessageError> {
-        match frame_len(b, MAX_MESSAGE_SIZE)? {
-            None => Ok(None),
-            Some(len) => Ok(Some((Message::from_frame(&b[..len])?, len))),
-        }
+        parse_message(b, MAX_MESSAGE_SIZE)
     }
 
     /// Reads one whole message, whose length field is already checked.
@@ -1292,6 +1297,95 @@ impl Message {
     /// its own ID.
     pub fn reply(&self, request_id: i32, body: Body) -> Message {
         Message { request_id, response_to: self.request_id, body }
+    }
+}
+
+// Only complete, bounded messages reach the body parser.
+fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, MessageError> {
+    let Some(len) = frame_len(b, limit)? else { return Ok(None) };
+    let frame = b.get(..len).ok_or(MessageError::Truncated)?;
+    Ok(Some((Message::from_frame(frame)?, len)))
+}
+
+impl Wire for Message {
+    type ParseError = MessageError;
+    type WriteError = MessageError;
+
+    /// Reads exactly one message, bounded by [`MAX_MESSAGE_SIZE`].
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, MessageError> {
+        match Message::parse(b)? {
+            Some((message, used)) if used == b.len() => Ok(message),
+            Some(_) => Err(MessageError::Trailing),
+            None => Err(MessageError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_MESSAGE_SIZE`] bytes. Leaves `out` unchanged
+    /// on error. The existing writer validates BSON, flags, and checksums.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageError> {
+        // Bound the field-name table before the existing writer builds it.
+        if let Body::Msg(message) = &self.body
+            && message.body.len() > MAX_ELEMENTS
+        {
+            return Err(MessageError::Bson(BsonError::TooManyElements));
+        }
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+/// Reads MongoDB messages without holding input bytes.
+///
+/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// by [`limit`](Self::limit), including the header. Oversized messages
+/// are refused from the first four bytes. Partial messages return
+/// [`Step::Need`], including at EOF, so the stream reports truncation.
+/// Every message error ends this stream. Use [`Decoder`] for the legacy
+/// behavior that continues after recoverable body errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Reads messages up to [`MAX_MESSAGE_SIZE`] bytes, header included.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE_SIZE)
+    }
+
+    /// Sets the message limit, including the header. Clamps it to
+    /// [`HEADER_LEN`] through [`MAX_MESSAGE_SIZE`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.clamp(HEADER_LEN, MAX_MESSAGE_SIZE) }
+    }
+
+    /// The maximum message size, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Message;
+    type Error = MessageError;
+    const NAME: &'static str = "MongoDB";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, MessageError> {
+        Ok(match parse_message(input, self.limit)? {
+            Some((message, used)) => Step::Item(message, used),
+            None => Step::Need,
+        })
     }
 }
 

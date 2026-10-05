@@ -2,8 +2,9 @@
 //! a database server or client reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::mysql::{
-    Column, Command, Decoder, Eof, ErrPacket, FrameError, Handshake, HandshakeResponse, Message, OkPacket, ResultEvent,
+    Column, Command, Decoder, Eof, ErrPacket, Frame, FrameError, Frames, Handshake, HandshakeResponse, Message, OkPacket, ResultEvent,
     ResultReader, ResultSet, SslRequest, capability, parse_row, read_lenenc_int, write_lenenc_int, write_messages,
     write_row,
 };
@@ -198,6 +199,19 @@ fn read_stream(d: &mut Decoder, bytes: &[u8], chunk: usize) -> (Vec<Message>, Op
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Frames::new, data);
+    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_wire::<Frame>(data);
+    let frame = Frame {
+        seq: data.first().copied().unwrap_or(0),
+        payload: data.get(..fictionet::stdlib::mysql::MAX_PACKET_PAYLOAD + 1).unwrap_or(data).to_vec(),
+    };
+    contract::check_wire_value(&frame);
+    if let Ok(bytes) = Wire::to_bytes(&frame) {
+        contract::check_wire::<Frame>(&bytes);
+        contract::check_decode(Frames::new, &bytes);
+    }
+
     // The stream, split three ways: all at once, a byte at a time, and in
     // chunks, under a limit the first byte picks. Each must give the same
     // messages, the same error and leave the same bytes.

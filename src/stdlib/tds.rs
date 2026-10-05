@@ -26,6 +26,12 @@
 //! likes. Bad bytes give an [`Error`] or a [`FrameError`], never a panic.
 //! Every buffer is bounded by a named limit, such as [`MAX_MESSAGE`].
 //!
+//! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream)
+//! to read individual packets. [`Packet`] implements [`Wire`] for exact
+//! parsing and transactional writing. [`Packet::to_bytes`] still clips
+//! oversized data. [`Decoder`] keeps its message assembly, status handling,
+//! buffer limits, and repeated errors.
+//!
 //! [MS-TDS]: https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-tds/
 //!
 //! ```
@@ -85,6 +91,8 @@
 //! assert_eq!(tokens[1], Token::Row(vec![Value::Text("alice".to_string())]));
 //! assert_eq!(tokens[2], Token::Done(Done::new(done_status::COUNT, 1)));
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port SQL Server listens on.
 pub const PORT: u16 = 1433;
@@ -366,6 +374,7 @@ pub enum FrameError {
     },
     /// The message would grow past the decoder's limit, to this many
     /// bytes.
+    /// [`Frames`] and [`Wire`] writers use the total packet length.
     TooLong(usize),
 }
 
@@ -385,6 +394,37 @@ impl std::fmt::Display for FrameError {
 }
 
 impl std::error::Error for FrameError {}
+
+/// Why an exact [`Wire`] parse did not read one complete packet.
+/// [`Packet::parse`] keeps its separate prefix parsing behavior.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PacketParseError {
+    /// The packet header is invalid.
+    Frame(FrameError),
+    /// The input ended before a complete packet, including empty input.
+    Truncated,
+    /// Bytes follow the first complete packet.
+    Trailing,
+}
+
+impl core::fmt::Display for PacketParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete TDS packet"),
+            Self::Trailing => f.write_str("bytes follow the TDS packet"),
+        }
+    }
+}
+
+impl core::error::Error for PacketParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
 
 impl Packet {
     /// Reads the packet at the start of `b`. It returns `Ok(None)` if `b`
@@ -413,6 +453,20 @@ impl Packet {
         Ok(Some((packet, end)))
     }
 
+    /// Reads one packet prefix with at most `limit` bytes, header included.
+    /// Clamps the limit to [`HEADER_LEN`] through [`MAX_PACKET`]. Refuses
+    /// larger packets with [`FrameError::TooLong`] and their total length
+    /// as soon as the first four header bytes arrive.
+    pub fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, FrameError> {
+        if let Some(&[_, _, hi, lo]) = b.get(..4) {
+            let length = usize::from(u16::from_be_bytes([hi, lo]));
+            if length > limit.clamp(HEADER_LEN, MAX_PACKET) {
+                return Err(FrameError::TooLong(length));
+            }
+        }
+        Packet::parse(b)
+    }
+
     /// The packet's bytes: the header, then the data. Data longer than a
     /// packet can hold is cut to fit.
     pub fn to_bytes(&self) -> Vec<u8> {
@@ -426,6 +480,90 @@ impl Packet {
         out.push(self.window);
         out.extend_from_slice(data);
         out
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = PacketParseError;
+    type WriteError = FrameError;
+
+    /// Reads exactly one packet. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, PacketParseError> {
+        match Packet::parse(b).map_err(PacketParseError::Frame)? {
+            Some((packet, used)) if used == b.len() => Ok(packet),
+            Some(_) => Err(PacketParseError::Trailing),
+            None => Err(PacketParseError::Truncated),
+        }
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Refuses oversized data with
+    /// [`FrameError::TooLong`] and the total packet length. Leaves `out`
+    /// unchanged on error. All header fields are preserved.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
+        let length = HEADER_LEN.saturating_add(self.data.len());
+        if length > MAX_PACKET {
+            return Err(FrameError::TooLong(length));
+        }
+        let length = u16::try_from(length).map_err(|_| FrameError::TooLong(length))?;
+        out.extend_from_slice(&[self.packet_type, self.status]);
+        out.extend_from_slice(&length.to_be_bytes());
+        out.extend_from_slice(&self.spid.to_be_bytes());
+        out.extend_from_slice(&[self.id, self.window]);
+        out.extend_from_slice(&self.data);
+        Ok(())
+    }
+}
+
+/// Reads individual TDS packets without holding input bytes.
+///
+/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// by [`limit`](Self::limit), including the header. Oversized packets are
+/// refused from the first four bytes. Partial packets return [`Step::Need`],
+/// including at EOF, so the stream reports truncation. Message assembly
+/// and status handling remain in [`Decoder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
+
+impl Frames {
+    /// Reads packets up to [`MAX_PACKET`] bytes, header included.
+    pub fn new() -> Self {
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Sets the packet limit, including the header. Clamps it to
+    /// [`HEADER_LEN`] through [`MAX_PACKET`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self { limit: limit.clamp(HEADER_LEN, MAX_PACKET) }
+    }
+
+    /// The maximum packet size, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Frames {
+    type Item = Packet;
+    type Error = FrameError;
+    const NAME: &'static str = "TDS";
+
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, FrameError> {
+        Ok(match Packet::parse_limited(input, self.limit)? {
+            Some((packet, used)) => Step::Item(packet, used),
+            None => Step::Need,
+        })
     }
 }
 
