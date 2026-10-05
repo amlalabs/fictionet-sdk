@@ -26,7 +26,12 @@
 //! A [`ParseError`] means the stream cannot be read any further. A real
 //! server answers it with [`ParseError::reply`] and closes the connection.
 //!
+//! New stacks use [`Values`] or [`Commands`] with [`codec::Stream`].
+//! [`Wire`] parses exact frames and writes without clipping. The existing
+//! versioned writers and deprecated [`Decoder`] retain their behavior.
+//!
 //! ```
+//! # #![allow(deprecated)] // This example covers the compatibility API.
 //! use std::collections::HashMap;
 //! use fictionet::stdlib::resp::{Decoder, Value, Version};
 //!
@@ -59,6 +64,17 @@
 //! // Part of a value: the parser waits for the rest.
 //! assert_eq!(Value::parse(b"$5\r\nhel"), Ok(None));
 //! ```
+
+extern crate alloc;
+
+use super::codec::{self, Decode, Wire};
+use alloc::{
+    boxed::Box,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 
 /// The TCP port Redis servers listen on.
 pub const PORT: u16 = 6379;
@@ -266,8 +282,8 @@ pub enum ParseError {
     FrameTooLarge,
 }
 
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ParseError::UnknownType(c) => write!(f, "unknown type byte '{}'", c.escape_ascii()),
             ParseError::BadLineEnd => f.write_str("a line ends with a lone CR or LF"),
@@ -285,7 +301,7 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-impl std::error::Error for ParseError {}
+impl core::error::Error for ParseError {}
 
 impl ParseError {
     /// The error reply a Redis server sends before it closes the
@@ -495,10 +511,157 @@ impl Command {
     }
 }
 
+/// Reads RESP reply values without retaining input bytes.
+///
+/// Use with [`codec::Stream`] for bounded input. Scanning resumes across
+/// calls, so feeding one byte at a time takes linear time. Parse errors
+/// end the stream. Partial values return [`codec::Step::Need`] at EOF,
+/// which the driver reports as [`codec::Fail::Truncated`].
+#[derive(Debug)]
+pub struct Values {
+    limits: Limits,
+    need: usize,
+    scan: Scan,
+}
+
+impl Default for Values {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Values {
+    /// Creates a decoder using [`Limits::DEFAULT`].
+    pub fn new() -> Self {
+        Self::with_limits(Limits::DEFAULT)
+    }
+
+    /// Creates a decoder with custom limits.
+    /// The frame limit is clamped to [`MAX_FRAME_LEN`]. Zero refuses all
+    /// nonempty input and uses one byte of input capacity.
+    pub fn with_limits(mut limits: Limits) -> Self {
+        limits.max_frame_len = limits.max_frame_len.min(MAX_FRAME_LEN);
+        // Fixed room for nesting counters, including a streamed string
+        // inside the deepest aggregate. No input bytes are stored here.
+        let scan = Scan { open: Vec::with_capacity(depth_limit(&limits) + 1), ..Scan::default() };
+        Self { limits, need: 0, scan }
+    }
+
+    /// The effective limits, including the clamped frame limit.
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    fn read<T>(
+        &mut self,
+        input: &[u8],
+        scan: fn(&mut Scan, &[u8], &Limits) -> Option<usize>,
+        parse: fn(&[u8], &Limits) -> Step<T>,
+    ) -> Result<codec::Step<T>, ParseError> {
+        if input.is_empty() {
+            return Ok(codec::Step::Need);
+        }
+        let bytes = frame(input, &self.limits);
+        if bytes.len() < self.need {
+            return Ok(codec::Step::Need);
+        }
+        if let Some(need) = scan(&mut self.scan, bytes, &self.limits)
+            && need <= self.limits.max_frame_len
+        {
+            self.need = need;
+            return Ok(codec::Step::Need);
+        }
+        match parse(bytes, &self.limits) {
+            Ok((item, used)) => {
+                self.need = 0;
+                self.scan.pos = 0;
+                self.scan.open.clear();
+                self.scan.quiet = None;
+                Ok(codec::Step::Item(item, used))
+            }
+            Err(Fail::Need(need)) => {
+                self.need = need;
+                Ok(codec::Step::Need)
+            }
+            Err(Fail::Bad(error)) => Err(error),
+        }
+    }
+}
+
+impl Decode for Values {
+    type Item = Value;
+    type Error = ParseError;
+    const NAME: &'static str = "RESP values";
+
+    fn capacity(&self) -> usize {
+        self.limits.max_frame_len.max(1)
+    }
+
+    /// Reserved nesting counters, bounded by the 256-level depth ceiling
+    /// plus one streamed string. This allocation stays fixed across `Need`.
+    fn held(&self) -> usize {
+        self.scan.open.capacity().saturating_mul(core::mem::size_of::<Open>())
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Value>, ParseError> {
+        self.read(input, scan_value, value_top)
+    }
+}
+
+/// Reads RESP requests as a server does, including inline commands.
+///
+/// Use with [`codec::Stream`]. Commands with no arguments are skipped.
+/// Limits, scanning, terminal parse errors, and EOF follow [`Values`].
+#[derive(Debug, Default)]
+pub struct Commands {
+    values: Values,
+}
+
+impl Commands {
+    /// Creates a decoder using [`Limits::DEFAULT`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Creates a decoder with the same limit policy as [`Values::with_limits`].
+    pub fn with_limits(limits: Limits) -> Self {
+        Self { values: Values::with_limits(limits) }
+    }
+
+    /// The effective limits, including the clamped frame limit.
+    pub fn limits(&self) -> Limits {
+        self.values.limits()
+    }
+}
+
+impl Decode for Commands {
+    type Item = Command;
+    type Error = ParseError;
+    const NAME: &'static str = "RESP commands";
+
+    fn capacity(&self) -> usize {
+        self.values.capacity()
+    }
+
+    fn held(&self) -> usize {
+        self.values.held()
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<codec::Step<Command>, ParseError> {
+        Ok(match self.values.read(input, scan_command, command_top)? {
+            codec::Step::Item(command, used) if command.args.is_empty() => codec::Step::Skip(used),
+            step => step,
+        })
+    }
+}
+
 /// Splits a RESP byte stream into values or commands. Feed it the bytes a
 /// connection reads, in order, and take values or commands out until it
-/// has none.
+/// has none. This compatibility type keeps its unbounded input buffer and
+/// repeating errors. Use [`Values`] or [`Commands`] with [`codec::Stream`]
+/// for bounded input and explicit EOF handling.
 #[derive(Debug, Default)]
+#[deprecated(note = "use codec::Stream with resp::Values or resp::Commands for bounded input")]
 pub struct Decoder {
     buf: Vec<u8>,
     /// Where the unread bytes in `buf` start.
@@ -512,6 +675,7 @@ pub struct Decoder {
     scan: Scan,
 }
 
+#[allow(deprecated)]
 impl Decoder {
     /// A decoder holding no bytes, with the default limits.
     pub fn new() -> Decoder {
@@ -675,7 +839,9 @@ impl Scan {
     fn ended(&mut self, pos: usize) -> Scanned {
         self.pos = pos;
         loop {
-            let Some(slot) = self.open.last_mut() else { return Scanned::Whole };
+            let Some(slot) = self.open.last_mut() else {
+                return Scanned::Whole;
+            };
             let left = match *slot {
                 Open::Left(n) | Open::Push(n) => {
                     *slot = Open::Left(n.saturating_sub(1));
@@ -796,7 +962,9 @@ fn scan_step(s: &mut Scan, b: &[u8], lim: &Limits) -> Result<Scanned, Fail> {
         }
         _ => {}
     }
-    let Some(&t) = b.get(pos) else { return Err(Fail::Need(pos.saturating_add(1))) };
+    let Some(&t) = b.get(pos) else {
+        return Err(Fail::Need(pos.saturating_add(1)));
+    };
     let depth = s.open.len();
     // As list checks a push's first element.
     let push_first = matches!(s.open.last(), Some(Open::Push(_)));
@@ -1131,7 +1299,7 @@ fn double(l: &[u8]) -> Option<f64> {
     if i != l.len() {
         return None;
     }
-    std::str::from_utf8(l).ok()?.parse().ok()
+    core::str::from_utf8(l).ok()?.parse().ok()
 }
 
 /// Whether `l` is NaN as C's `printf` writes it: an optional sign, `nan`
@@ -1142,7 +1310,9 @@ fn legacy_nan(l: &[u8]) -> bool {
         Some(b'+' | b'-') => &l[1..],
         _ => l,
     };
-    let Some((nan, rest)) = l.split_at_checked(3) else { return false };
+    let Some((nan, rest)) = l.split_at_checked(3) else {
+        return false;
+    };
     if !nan.eq_ignore_ascii_case(b"nan") {
         return false;
     }
@@ -1165,7 +1335,9 @@ fn big_ok(l: &[u8]) -> bool {
 /// The value at `pos`, nested `depth` deep. `top` says whether it is at
 /// the top level, perhaps after attributes, where a push may be.
 fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Value> {
-    let Some(&t) = b.get(pos) else { return Err(Fail::Need(pos.saturating_add(1))) };
+    let Some(&t) = b.get(pos) else {
+        return Err(Fail::Need(pos.saturating_add(1)));
+    };
     let p = pos + 1;
     match t {
         marker::SIMPLE | marker::ERROR => {
@@ -1217,7 +1389,9 @@ fn value(b: &[u8], pos: usize, depth: usize, top: bool, lim: &Limits) -> Step<Va
         }
         marker::BULK_ERROR | marker::VERBATIM => {
             let (l, e) = line(b, p, lim)?;
-            let Len::N(n) = length(l)? else { return Err(ParseError::BadLength.into()) };
+            let Len::N(n) = length(l)? else {
+                return Err(ParseError::BadLength.into());
+            };
             let (d, e) = data(b, e, n, lim)?;
             if t == marker::BULK_ERROR {
                 return Ok((Value::BulkError(d.to_vec()), e));
@@ -1297,7 +1471,9 @@ fn list(b: &[u8], mut pos: usize, n: usize, depth: usize, push: bool, lim: &Limi
         if first {
             match b.get(pos) {
                 None => return Err(Fail::Need(pos.saturating_add(1))),
-                Some(&t) if !is_string_marker(t) => return Err(ParseError::Malformed(marker::PUSH).into()),
+                Some(&t) if !is_string_marker(t) => {
+                    return Err(ParseError::Malformed(marker::PUSH).into());
+                }
                 Some(_) => {}
             }
         }
@@ -1406,7 +1582,9 @@ fn multibulk(b: &[u8], lim: &Limits) -> Step<Command> {
     let (l, mut pos) = line(b, 1, lim)?;
     let n = redis_ll(l).ok_or(ParseError::TooManyElements)?;
     // Redis ignores an array of zero or fewer elements.
-    let Ok(n) = usize::try_from(n) else { return Ok((Command::default(), pos)) };
+    let Ok(n) = usize::try_from(n) else {
+        return Ok((Command::default(), pos));
+    };
     if n > lim.max_elements {
         return Err(ParseError::TooManyElements.into());
     }
@@ -1556,7 +1734,204 @@ fn split_args(text: &[u8]) -> Result<Vec<Vec<u8>>, ParseError> {
     }
 }
 
-// Writing.
+/// Why an exact RESP wire value or command cannot be read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireError {
+    /// The existing parser rejected the frame.
+    Parse(ParseError),
+    /// The input ended inside a frame.
+    Incomplete,
+    /// Bytes follow the first complete frame.
+    Trailing,
+    /// The value's strict encoding would exceed the default limits.
+    Unrepresentable,
+}
+
+impl core::fmt::Display for WireError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Parse(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete RESP frame"),
+            Self::Trailing => f.write_str("bytes follow the RESP frame"),
+            Self::Unrepresentable => f.write_str("strict RESP encoding exceeds the default limits"),
+        }
+    }
+}
+
+impl core::error::Error for WireError {}
+
+/// A value cannot be written unchanged under [`Limits::DEFAULT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("RESP value cannot be written unchanged under the default limits")
+    }
+}
+
+impl core::error::Error for WriteError {}
+
+impl Value {
+    /// Appends a strict encoding under [`Limits::DEFAULT`].
+    ///
+    /// Uses RESP3 types and preserves [`Value::NullArray`] as RESP2 `*-1`.
+    /// NaN is written as `nan`; its sign and payload are not wire fields.
+    /// Invalid fields, nesting, and sizes fail without changing `out`.
+    /// The existing versioned [`Value::write`] keeps its clipping behavior.
+    pub fn write_strict(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let mut bytes = Vec::new();
+        strict_value(&mut bytes, self, 0, true)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Command {
+    /// Appends an array of bulk strings under [`Limits::DEFAULT`].
+    /// Refuses any clipping and leaves `out` unchanged on error.
+    /// The existing [`Command::to_bytes`] keeps its clipping behavior.
+    pub fn write_strict(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let mut bytes = Vec::new();
+        strict_header(&mut bytes, marker::ARRAY, self.args.len(), 0)?;
+        for arg in &self.args {
+            strict_bulk(&mut bytes, marker::BULK, &[], arg)?;
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+fn exact<T>(parsed: Result<Option<(T, usize)>, ParseError>, len: usize) -> Result<T, WireError> {
+    match parsed.map_err(WireError::Parse)? {
+        Some((item, used)) if used == len => Ok(item),
+        Some(_) => Err(WireError::Trailing),
+        None => Err(WireError::Incomplete),
+    }
+}
+
+impl Wire for Value {
+    type ParseError = WireError;
+    type WriteError = WriteError;
+
+    /// Reads one complete value that can be written under the default limits.
+    /// A compact input, such as an exponential double, can expand on writing.
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let value = exact(Value::parse(bytes), bytes.len())?;
+        value.write_strict(&mut Vec::new()).map_err(|_| WireError::Unrepresentable)?;
+        Ok(value)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        self.write_strict(out)
+    }
+}
+
+impl Wire for Command {
+    type ParseError = WireError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one command, including commands with no arguments.
+    /// Refuses commands whose array encoding exceeds the default limits.
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let command = exact(Command::parse(bytes), bytes.len())?;
+        command.write_strict(&mut Vec::new()).map_err(|_| WireError::Unrepresentable)?;
+        Ok(command)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        self.write_strict(out)
+    }
+}
+
+fn strict_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WriteError> {
+    if out.len().checked_add(bytes.len()).is_none_or(|n| n > MAX_FRAME_LEN) {
+        return Err(WriteError);
+    }
+    out.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn strict_line(out: &mut Vec<u8>, marker: u8, text: &[u8]) -> Result<(), WriteError> {
+    if text.len() > MAX_LINE_LEN || text.iter().any(|b| matches!(b, b'\r' | b'\n')) {
+        return Err(WriteError);
+    }
+    strict_bytes(out, &[marker])?;
+    strict_bytes(out, text)?;
+    strict_bytes(out, b"\r\n")
+}
+
+fn strict_bulk(out: &mut Vec<u8>, marker: u8, prefix: &[u8], bytes: &[u8]) -> Result<(), WriteError> {
+    let len = prefix.len().checked_add(bytes.len()).filter(|&n| n <= MAX_BULK_LEN).ok_or(WriteError)?;
+    strict_line(out, marker, len.to_string().as_bytes())?;
+    strict_bytes(out, prefix)?;
+    strict_bytes(out, bytes)?;
+    strict_bytes(out, b"\r\n")
+}
+
+fn strict_header(out: &mut Vec<u8>, marker: u8, count: usize, depth: usize) -> Result<(), WriteError> {
+    if count > MAX_ELEMENTS || depth >= MAX_DEPTH {
+        return Err(WriteError);
+    }
+    strict_line(out, marker, count.to_string().as_bytes())
+}
+
+// Recursion stops at MAX_DEPTH before inspecting deeper children.
+fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool) -> Result<(), WriteError> {
+    match value {
+        Value::Simple(bytes) => strict_line(out, marker::SIMPLE, bytes),
+        Value::Error(bytes) => strict_line(out, marker::ERROR, bytes),
+        Value::Integer(n) => strict_line(out, marker::INTEGER, n.to_string().as_bytes()),
+        Value::Bulk(bytes) => strict_bulk(out, marker::BULK, &[], bytes),
+        Value::Null => strict_bytes(out, b"_\r\n"),
+        Value::NullArray => strict_bytes(out, b"*-1\r\n"),
+        Value::Boolean(b) => strict_bytes(out, if *b { b"#t\r\n" } else { b"#f\r\n" }),
+        Value::Double(n) => strict_line(out, marker::DOUBLE, fmt_double(*n).as_bytes()),
+        Value::BigNumber(text) => {
+            if text.len() > MAX_LINE_LEN || !big_ok(text.as_bytes()) {
+                return Err(WriteError);
+            }
+            strict_line(out, marker::BIG_NUMBER, text.as_bytes())
+        }
+        Value::BulkError(bytes) => strict_bulk(out, marker::BULK_ERROR, &[], bytes),
+        Value::Verbatim { format, text } => {
+            let &[a, b, c] = format;
+            let prefix = [a, b, c, b':'];
+            strict_bulk(out, marker::VERBATIM, &prefix, text)
+        }
+        Value::Array(items) | Value::Set(items) | Value::Push(items) => {
+            let marker = match value {
+                Value::Array(_) => marker::ARRAY,
+                Value::Set(_) => marker::SET,
+                _ => {
+                    if !top || items.first().and_then(Value::as_bytes).is_none() {
+                        return Err(WriteError);
+                    }
+                    marker::PUSH
+                }
+            };
+            strict_header(out, marker, items.len(), depth)?;
+            for item in items {
+                strict_value(out, item, depth + 1, false)?;
+            }
+            Ok(())
+        }
+        Value::Map(entries) | Value::Attribute { attributes: entries, .. } => {
+            let marker = if matches!(value, Value::Map(_)) { marker::MAP } else { marker::ATTRIBUTE };
+            strict_header(out, marker, entries.len(), depth)?;
+            for (key, value) in entries {
+                strict_value(out, key, depth + 1, false)?;
+                strict_value(out, value, depth + 1, false)?;
+            }
+            if let Value::Attribute { value, .. } = value {
+                strict_value(out, value, depth + 1, top)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+// Writing with the compatibility clipping policy.
 
 /// Appends `v` to `out` in at most `budget` bytes, or appends nothing and
 /// returns false if it cannot fit. `top` says whether `v` is at the top
@@ -1792,6 +2167,7 @@ fn fmt_double(f: f64) -> String {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
 
@@ -2380,7 +2756,9 @@ mod tests {
     }
 
     fn check_value(b: &[u8], lim: &Limits) {
-        let Ok(Some((v, used))) = Value::parse_with(b, lim) else { return };
+        let Ok(Some((v, used))) = Value::parse_with(b, lim) else {
+            return;
+        };
         assert!(used <= b.len());
         for ver in [Version::Resp2, Version::Resp3] {
             let bytes = v.to_bytes(ver);
