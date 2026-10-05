@@ -22,6 +22,11 @@
 //! exist, and what each operation does, is up to world code. Stub data,
 //! the NDR-encoded arguments and results, stays as bytes.
 //!
+//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. [`Pdu`] implements [`Wire`] for
+//! exact parsing of writable PDUs and transactional writing. Its inherent
+//! `parse` still reads one prefix, and [`Decoder`] keeps its original behavior.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header that cannot be read breaks the stream, since the next
 //! PDU cannot be found. A body that cannot be read is an [`Error`] for
@@ -1035,7 +1040,14 @@ impl core::fmt::Display for FrameError {
     }
 }
 
-impl core::error::Error for FrameError {}
+impl core::error::Error for FrameError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Header(error) => Some(error),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
 
 /// Why an exact [`Wire`] parse did not contain one writable PDU.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1064,7 +1076,15 @@ impl core::fmt::Display for ParseError {
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Pdu(error) => Some(error),
+            Self::Unrepresentable(error) => Some(error),
+            Self::Incomplete | Self::Trailing { .. } => None,
+        }
+    }
+}
 
 impl Wire for Pdu {
     type ParseError = ParseError;
@@ -1080,68 +1100,15 @@ impl Wire for Pdu {
         if used != bytes.len() {
             return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
         }
-        pdu.wire_len().map_err(ParseError::Unrepresentable)?;
+        Pdu::to_bytes(&pdu).map_err(ParseError::Unrepresentable)?;
         Ok(pdu)
     }
 
     /// Appends one PDU with at most [`MAX_FRAG`] bytes of temporary storage.
     /// Leaves `out` unchanged on error. Padding follows [`Pdu::to_bytes`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        self.wire_len()?;
         out.extend_from_slice(&self.to_bytes()?);
         Ok(())
-    }
-}
-
-impl Pdu {
-    // Check the canonical length before the legacy writer allocates its body.
-    fn wire_len(&self) -> Result<usize, EncodeError> {
-        let add = |a: usize, b: usize| a.checked_add(b).filter(|&n| n <= MAX_FRAG).ok_or(EncodeError::TooLong);
-        let mut length = HEADER_LEN;
-        match &self.body {
-            Body::Request { object, stub, .. } => {
-                length = add(length, if object.is_some() { 24 } else { 8 })?;
-                length = add(length, stub.len())?;
-            }
-            Body::Response { stub, .. } | Body::Fault { stub, .. } => {
-                length = add(length, if matches!(self.body, Body::Fault { .. }) { 16 } else { 8 })?;
-                length = add(length, stub.len())?;
-            }
-            Body::Bind(bind) | Body::AlterContext(bind) => {
-                count(bind.contexts.len())?;
-                length = add(length, 12)?;
-                for context in &bind.contexts {
-                    let syntaxes = usize::from(count(context.transfer_syntaxes.len())?);
-                    length = add(length, 24)?;
-                    length = add(length, syntaxes.checked_mul(20).ok_or(EncodeError::TooLong)?)?;
-                }
-            }
-            Body::BindAck(ack) | Body::AlterContextResp(ack) => {
-                let results = usize::from(count(ack.results.len())?);
-                length = add(length, 10)?;
-                length = add(length, ack.secondary_address.len())?;
-                length = add(length, (4 - length % 4) % 4)?;
-                length = add(length, 4)?;
-                length = add(length, results.checked_mul(24).ok_or(EncodeError::TooLong)?)?;
-            }
-            Body::BindNak(nak) => {
-                let versions = usize::from(count(nak.versions.len())?);
-                length = add(length, 3)?;
-                length = add(length, versions.checked_mul(2).ok_or(EncodeError::TooLong)?)?;
-            }
-            Body::Auth3 => length = add(length, 4)?,
-            Body::Shutdown | Body::Cancel | Body::Orphaned => {}
-        }
-        if let Some(auth) = &self.auth {
-            let padding = match self.body.stub() {
-                Some(stub) => (AUTH_PAD_ALIGN - stub.len() % AUTH_PAD_ALIGN) % AUTH_PAD_ALIGN,
-                None => (4 - length % 4) % 4,
-            };
-            length = add(length, padding)?;
-            length = add(length, SEC_TRAILER_LEN)?;
-            length = add(length, auth.value.len())?;
-        }
-        Ok(length)
     }
 }
 
@@ -1153,8 +1120,17 @@ impl Pdu {
 /// Partial fragments return [`Step::Need`], including at EOF, so
 /// [`super::codec::Stream`] reports truncation. Its `with_next` method gives
 /// the original fragment bytes for authentication, including discarded padding.
+/// Proxies should forward those bytes: a received PDU can fit the limit while
+/// canonical padding or reserved fields would make [`Wire::write`] refuse it.
 /// The legacy [`Decoder`] remains separate to preserve borrowed frames,
 /// repeated framing errors, and buffer clearing on failure.
+///
+/// This deliberately differs from codec design section 3.6: framing and body
+/// parsing are combined into `Result<Pdu, Error>` items instead of returning
+/// `Vec<u8>` items and mapping a fragment parser over them. Raw bytes remain
+/// available through [`super::codec::Stream::with_next`] without a second copy.
+/// [`FrameError::Header`] wraps [`Error`], but this decoder only emits its
+/// [`Error::Version`], [`Error::IntegerRep`] and [`Error::FragLength`] variants.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire}, dcerpc::{Body, Frames, Pdu}};
@@ -1803,7 +1779,7 @@ mod tests {
             for drep in [DataRep::LITTLE_ENDIAN, DataRep::BIG_ENDIAN] {
                 pdu.drep = drep;
                 let bytes = Wire::to_bytes(&pdu).unwrap();
-                assert_eq!(pdu.wire_len(), Ok(bytes.len()));
+                assert!(bytes.len() <= MAX_FRAG);
                 assert_eq!(bytes, pdu.to_bytes().unwrap());
                 contract::check_wire::<Pdu>(&bytes);
                 contract::check_wire_value(&pdu);
@@ -1818,7 +1794,7 @@ mod tests {
                     value: vec![0xaa; 16],
                 });
                 let bytes = Wire::to_bytes(&authenticated).unwrap();
-                assert_eq!(authenticated.wire_len(), Ok(bytes.len()));
+                assert!(bytes.len() <= MAX_FRAG);
                 contract::check_wire::<Pdu>(&bytes);
                 contract::check_wire_value(&authenticated);
             }

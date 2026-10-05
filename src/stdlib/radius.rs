@@ -29,6 +29,11 @@
 //! values stay as the bytes on the wire. The docs of [`Packet::reply`]
 //! say which bytes each authenticator is taken over.
 //!
+//! New TCP or TLS readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. [`Packet`] implements [`Wire`] for
+//! exact parsing and transactional writing. The inherent [`Packet::parse`]
+//! still accepts datagram padding, and [`Decoder`] keeps its original behavior.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A packet whose attributes do not fit its length is refused
 //! whole, as RFC 2865 asks. A single attribute whose value does not fit
@@ -347,7 +352,7 @@ pub struct Packet {
 pub enum PacketError {
     /// Fewer bytes than the 20-byte header. The value is how many came.
     Short(usize),
-    /// The length field was below 20 or above 4096.
+    /// The length field was below [`HEADER_LEN`] or above the accepted packet limit.
     Length(u16),
     /// The datagram was shorter than its length field says.
     Truncated {
@@ -365,9 +370,15 @@ impl std::fmt::Display for PacketError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PacketError::Short(n) => write!(f, "{n} bytes, fewer than the 20-byte RADIUS header"),
-            PacketError::Length(n) => write!(f, "length field {n}, outside 20..=4096"),
-            PacketError::Truncated { length, got } => write!(f, "length field {length}, but only {got} bytes came"),
-            PacketError::Attribute(at) => write!(f, "the attribute at offset {at} does not fit the packet"),
+            PacketError::Length(n) => {
+                write!(f, "length field {n}, outside the accepted packet range")
+            }
+            PacketError::Truncated { length, got } => {
+                write!(f, "length field {length}, but only {got} bytes came")
+            }
+            PacketError::Attribute(at) => {
+                write!(f, "the attribute at offset {at} does not fit the packet")
+            }
         }
     }
 }
@@ -609,7 +620,14 @@ impl core::fmt::Display for ParseError {
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Packet(error) => Some(error),
+            Self::Trailing { .. } => None,
+        }
+    }
+}
 
 impl Wire for Packet {
     type ParseError = ParseError;
@@ -634,18 +652,52 @@ impl Wire for Packet {
 
 /// Reads RADIUS over TCP or TLS packets without retaining input.
 ///
-/// Use with [`super::codec::Stream`] for a buffer bounded by [`MAX_PACKET`].
-/// The first four bytes suffice to refuse an invalid length. Partial packets
+/// Use with [`super::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
+/// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
 /// return [`Step::Need`], including at EOF, so the driver reports truncation.
 /// Attribute errors end the stream, as they do in [`Decoder`]. The legacy
 /// decoder remains separate to preserve repeated errors and buffer clearing.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, radius::{Code, Frames, Packet}};
+/// let packet = Packet::new(Code::AccessRequest, 7, [0; 16]);
+/// let bytes = Wire::to_bytes(&packet)?;
+/// let mut stream = Stream::new(Frames::with_limit(1024));
+/// let mut packets = Vec::new();
+/// for chunk in bytes.chunks(3) {
+///     pump(&mut stream, chunk, |item| packets.push(item))?;
+/// }
+/// finish(&mut stream, |item| packets.push(item))?;
+/// assert_eq!(packets, vec![packet]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
 
 impl Frames {
-    /// Creates a packet decoder with no retained state.
+    /// Creates a decoder accepting packets up to [`MAX_PACKET`] bytes.
     pub fn new() -> Self {
-        Self
+        Self::with_limit(MAX_PACKET)
+    }
+
+    /// Sets the whole-packet limit, clamped to [`HEADER_LEN`] through [`MAX_PACKET`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.clamp(HEADER_LEN, MAX_PACKET),
+        }
+    }
+
+    /// The largest accepted packet, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -655,14 +707,14 @@ impl Decode for Frames {
     const NAME: &'static str = "RADIUS";
 
     fn capacity(&self) -> usize {
-        MAX_PACKET
+        self.limit
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, PacketError> {
         let Some(&[_, _, hi, lo]) = input.get(..4) else { return Ok(Step::Need) };
         let length = u16::from_be_bytes([hi, lo]);
         let used = usize::from(length);
-        if !(HEADER_LEN..=MAX_PACKET).contains(&used) {
+        if !(HEADER_LEN..=self.limit).contains(&used) {
             return Err(PacketError::Length(length));
         }
         let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };

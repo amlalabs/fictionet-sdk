@@ -24,6 +24,13 @@
 //! and writes each answer's bytes to the connection. Which applications,
 //! subscribers and sessions exist is up to world code.
 //!
+//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. AVP errors are [`Malformed`] items
+//! carrying the message header, so the next message can still be read.
+//! [`Message`] implements [`Wire`] for exact parsing and strict, transactional
+//! writing. [`Decoder`] and the inherent `parse` and `to_bytes` keep their
+//! original behavior, including prefix parsing and clipping when writing.
+//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Each [`Error`] names the Result-Code a real server answers it
 //! with.
@@ -457,6 +464,21 @@ impl Message {
     /// but refuses one longer than `limit` bytes. A bad version is known
     /// from the first byte, and a bad length from the first four.
     pub fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Error> {
+        let Some(len) = Self::frame_length(b, limit)? else {
+            return Ok(None);
+        };
+        let Some(body) = b.get(HEADER_LEN..len) else {
+            return Ok(None);
+        };
+        let message = Message {
+            avps: Avp::parse_list(body)?,
+            ..Message::header(b)
+        };
+        Ok(Some((message, len)))
+    }
+
+    // Validate framing before either parser interprets the AVPs.
+    fn frame_length(b: &[u8], limit: usize) -> Result<Option<usize>, Error> {
         let limit = limit.clamp(HEADER_LEN, MAX_MESSAGE);
         let Some(&version) = b.first() else { return Ok(None) };
         if version != VERSION {
@@ -473,9 +495,7 @@ impl Message {
         if len > limit {
             return Err(Error::TooBig(length));
         }
-        let Some(whole) = b.get(..len) else { return Ok(None) };
-        let message = Message { avps: Avp::parse_list(&whole[HEADER_LEN..])?, ..Message::header(whole) };
-        Ok(Some((message, len)))
+        Ok(Some(len))
     }
 
     /// The header fields of the at least [`HEADER_LEN`] bytes `h`, with
@@ -575,7 +595,14 @@ impl core::fmt::Display for ParseError {
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Message(error) => Some(error),
+            Self::Incomplete | Self::Trailing { .. } => None,
+        }
+    }
+}
 
 /// Why a value cannot be written without losing fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -639,14 +666,55 @@ impl Wire for Message {
     }
 }
 
+/// A framed message whose AVPs could not be read.
+///
+/// [`Frames`] consumes the complete message and returns this as an item,
+/// so the caller can answer using the header and then read the next message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Malformed {
+    /// The command, application, flags and identifiers, with no AVPs.
+    pub header: Message,
+    /// The AVP error that caused this message to be refused.
+    pub error: Error,
+}
+
+impl core::fmt::Display for Malformed {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl core::error::Error for Malformed {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
 /// Reads Diameter messages without retaining input.
 ///
 /// Use with [`super::codec::Stream`] for bounded buffering. The first four
 /// bytes suffice to refuse a message above [`limit`](Self::limit). Partial
 /// messages return [`Step::Need`], including at EOF. The driver reports
-/// truncation and reports errors once. AVP framing errors end the stream.
+/// truncation and reports header errors once. Only [`Error::Version`],
+/// [`Error::MessageLength`] and [`Error::TooBig`] end the stream. AVP errors
+/// yield [`Malformed`] items with the header and no AVPs, then decoding
+/// continues at the next message. Use that header to construct an answer.
 /// The legacy [`Decoder`] remains separate to preserve repeated errors,
 /// buffer clearing, and [`Decoder::failed_header`].
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, diameter::{command, Frames, Message}};
+/// let message = Message::request(command::DEVICE_WATCHDOG, 0, 7, 9);
+/// let bytes = Wire::to_bytes(&message)?;
+/// let mut stream = Stream::new(Frames::new());
+/// let mut messages = Vec::new();
+/// for chunk in bytes.chunks(3) {
+///     pump(&mut stream, chunk, |item| messages.push(item))?;
+/// }
+/// finish(&mut stream, |item| messages.push(item))?;
+/// assert_eq!(messages, vec![Ok(message)]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
     limit: usize,
@@ -676,7 +744,7 @@ impl Default for Frames {
 }
 
 impl Decode for Frames {
-    type Item = Message;
+    type Item = Result<Message, Malformed>;
     type Error = Error;
     const NAME: &'static str = "Diameter";
 
@@ -684,11 +752,19 @@ impl Decode for Frames {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
-        Ok(match Message::parse_limited(input, self.limit)? {
-            Some((message, used)) => Step::Item(message, used),
-            None => Step::Need,
-        })
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        let Some(used) = Message::frame_length(input, self.limit)? else {
+            return Ok(Step::Need);
+        };
+        let Some(body) = input.get(HEADER_LEN..used) else {
+            return Ok(Step::Need);
+        };
+        let header = Message::header(input);
+        let message = match Avp::parse_list(body) {
+            Ok(avps) => Ok(Message { avps, ..header }),
+            Err(error) => Err(Malformed { header, error }),
+        };
+        Ok(Step::Item(message, used))
     }
 }
 

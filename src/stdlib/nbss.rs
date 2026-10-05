@@ -19,6 +19,11 @@
 //! names it listens on, and what it says to a session request, is up to
 //! world code.
 //!
+//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling. [`Packet`] implements [`Wire`] for
+//! exact parsing and transactional writing. Its inherent `parse` still
+//! reads one prefix, and [`Decoder`] keeps its original behavior.
+//!
 //! Names are carried in the first-level encoding: each of a name's 16
 //! bytes becomes two letters from `A` to `P`, so `F` (0x46) becomes `EG`.
 //! See [`encode_first_level`]. The encoded name is a 32-byte label, which
@@ -469,7 +474,14 @@ impl core::fmt::Display for ParseError {
     }
 }
 
-impl core::error::Error for ParseError {}
+impl core::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Packet(error) => Some(error),
+            Self::Incomplete | Self::Trailing { .. } => None,
+        }
+    }
+}
 
 impl Wire for Packet {
     type ParseError = ParseError;
@@ -499,6 +511,20 @@ impl Wire for Packet {
 /// and reports errors once. All packet errors end this decoder.
 /// The legacy [`Decoder`] retains its repeated errors and clears its buffer
 /// on failure, so it remains a separate implementation.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire, finish, pump}, nbss::{Frames, Packet}};
+/// let packet = Packet::Message(b"hello".to_vec());
+/// let bytes = Wire::to_bytes(&packet)?;
+/// let mut stream = Stream::new(Frames::with_limit(1024));
+/// let mut packets = Vec::new();
+/// for chunk in bytes.chunks(3) {
+///     pump(&mut stream, chunk, |item| packets.push(item))?;
+/// }
+/// finish(&mut stream, |item| packets.push(item))?;
+/// assert_eq!(packets, vec![packet]);
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
     limit: usize,

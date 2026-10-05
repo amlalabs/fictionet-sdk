@@ -20,6 +20,12 @@
 //! the connection. Which dialects, users, shares and files exist, and what
 //! each request does to them, is up to world code.
 //!
+//! New stream readers use [`Frames`] with [`super::codec::Stream`] for
+//! bounded buffering and EOF handling, mapping each payload through
+//! [`Packet::parse`]. [`Frame`] implements [`Wire`] for exact transport-frame
+//! parsing and transactional writing. [`Decoder`] keeps its original behavior,
+//! and [`parse_frame`] remains a prefix parser.
+//!
 //! Signing and encryption are not done here. A message's signature is kept
 //! as 16 bytes, and encrypted and compressed messages are read as their
 //! headers with the rest kept as bytes. Security blobs (SPNEGO, NTLM,
@@ -261,7 +267,7 @@ pub mod share_type {
 pub enum FrameError {
     /// The first byte was not 0.
     Type(u8),
-    /// The length was more than [`MAX_MESSAGE`].
+    /// The payload length exceeded the configured limit, at most [`MAX_MESSAGE`].
     Length(usize),
 }
 
@@ -269,7 +275,7 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Type(t) => write!(f, "frame type {t:#04x}, not 0"),
-            FrameError::Length(n) => write!(f, "frame length {n}, more than {MAX_MESSAGE}"),
+            FrameError::Length(n) => write!(f, "frame length {n} exceeds the payload limit"),
         }
     }
 }
@@ -444,6 +450,10 @@ impl std::error::Error for EncodeError {}
 /// `b` holds only part of one, and otherwise the frame's payload and how
 /// many bytes of `b` it took.
 pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
+    parse_frame_limited(b, MAX_MESSAGE)
+}
+
+fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, FrameError> {
     let Some(&first) = b.first() else { return Ok(None) };
     if first != 0 {
         return Err(FrameError::Type(first));
@@ -452,7 +462,7 @@ pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
         return Ok(None);
     }
     let length = (usize::from(b[1]) << 16) | (usize::from(b[2]) << 8) | usize::from(b[3]);
-    if length > MAX_MESSAGE {
+    if length > limit {
         return Err(FrameError::Length(length));
     }
     let end = FRAME_HEADER_LEN + length;
@@ -511,7 +521,14 @@ impl core::fmt::Display for FrameParseError {
     }
 }
 
-impl core::error::Error for FrameParseError {}
+impl core::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Frame(error) => Some(error),
+            Self::Incomplete | Self::Trailing { .. } => None,
+        }
+    }
+}
 
 impl Wire for Frame {
     type ParseError = FrameParseError;
@@ -535,8 +552,9 @@ impl Wire for Frame {
 
 /// Reads direct TCP frames without retaining input.
 ///
-/// Use with [`super::codec::Stream`] for a buffer bounded by [`MAX_BUFFERED`].
-/// The four-byte header suffices to refuse a payload above [`MAX_MESSAGE`].
+/// Use with [`super::codec::Stream`] for a buffer bounded by the four-byte
+/// header plus [`limit`](Self::limit), at most [`MAX_BUFFERED`]. The header
+/// suffices to refuse a payload above the configured limit.
 /// Partial frames return [`Step::Need`], including at EOF, so the driver
 /// reports truncation. Framing errors end the stream and are reported once.
 /// Map items through [`Packet::parse`] to receive payload errors as items.
@@ -551,13 +569,33 @@ impl Wire for Frame {
 /// assert!(matches!(stream.next(), Some(Ok(Ok(Packet::Smb1(_))))));
 /// # Ok::<(), fictionet::stdlib::smb2::EncodeError>(())
 /// ```
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    limit: usize,
+}
 
 impl Frames {
-    /// Creates a frame decoder with no retained state.
+    /// Creates a decoder accepting payloads up to [`MAX_MESSAGE`] bytes.
     pub fn new() -> Self {
-        Self
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the payload limit, clamped to [`MAX_MESSAGE`]. Zero permits empty frames.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.min(MAX_MESSAGE),
+        }
+    }
+
+    /// The largest accepted payload, excluding its four-byte transport header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -567,11 +605,11 @@ impl Decode for Frames {
     const NAME: &'static str = "SMB direct TCP";
 
     fn capacity(&self) -> usize {
-        MAX_BUFFERED
+        FRAME_HEADER_LEN.saturating_add(self.limit)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
-        Ok(match parse_frame(input)? {
+        Ok(match parse_frame_limited(input, self.limit)? {
             Some((payload, used)) => Step::Item(Frame { payload: payload.to_vec() }, used),
             None => Step::Need,
         })
