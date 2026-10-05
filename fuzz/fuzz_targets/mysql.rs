@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::mysql::{
-    Column, Command, Decoder, Eof, ErrPacket, Frame, FrameError, Frames, Handshake, HandshakeResponse, Message, OkPacket, ResultEvent,
-    ResultReader, ResultSet, SslRequest, capability, parse_row, read_lenenc_int, write_lenenc_int, write_messages,
-    write_row,
+    Column, Command, Decoder, Eof, ErrPacket, Frame, FrameError, Frames, Handshake,
+    HandshakeResponse, Message, OkPacket, ResultEvent, ResultReader, ResultSet, SslRequest,
+    capability, parse_row, read_lenenc_int, write_lenenc_int, write_messages, write_row,
 };
 use libfuzzer_sys::fuzz_target;
 

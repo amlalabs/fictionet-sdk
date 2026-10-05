@@ -4,9 +4,9 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::git_protocol::{
-    Advertisement, Band, CapabilityAdvertisement, ClientLine, Command, Decoder, Demux, Demuxed, Frames, LsRef, MAX_BUFFERED,
-    Packet, PacketError, ParseError, ProtoRequest, ServerLine, V2Request, band_packets, parse_service_header,
-    service_header, split_band,
+    Advertisement, Band, CapabilityAdvertisement, ClientLine, Command, Decoder, Demux, Demuxed,
+    Frames, LsRef, MAX_BUFFERED, Packet, PacketError, ParseError, ProtoRequest, ServerLine,
+    V2Request, band_packets, parse_service_header, service_header, split_band,
 };
 use libfuzzer_sys::fuzz_target;
 

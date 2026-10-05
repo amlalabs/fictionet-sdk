@@ -297,10 +297,13 @@ pub enum FrameError {
         /// The ID it had.
         got: u8,
     },
-    /// The message would be longer than the decoder's limit. The value is
-    /// the length it had reached, counting the packet that broke the
-    /// limit.
-    /// [`Frames`] and [`Frame`] writers use the individual payload length.
+    /// A message or packet payload would exceed its size limit.
+    ///
+    /// From [`Decoder`], [`Message::to_bytes`] or [`write_messages`], the
+    /// value is the message's payload length, including the packet that
+    /// broke the decoder's limit. From [`Frames`], [`Frame::parse_limited`]
+    /// or [`Frame`]'s writers, it is one packet's payload length. Both
+    /// lengths exclude packet headers.
     TooLong(usize),
 }
 

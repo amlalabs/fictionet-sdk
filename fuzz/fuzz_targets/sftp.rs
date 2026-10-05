@@ -3,7 +3,9 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::sftp::{Decoder, Frames, LENGTH_LEN, MAX_PACKET, MAX_TEXT, Packet, Request, Response, Status};
+use fictionet::stdlib::sftp::{
+    Decoder, Frames, LENGTH_LEN, MAX_PACKET, MAX_TEXT, Packet, Request, Response, Status,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Feeds `data` in pieces of `step` bytes, taking packets out after each

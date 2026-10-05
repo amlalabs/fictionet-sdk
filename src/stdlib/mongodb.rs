@@ -28,8 +28,10 @@
 //! limits, so what it writes always reads back.
 //!
 //! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream).
-//! It reports any message error once and checks for partial frames at EOF.
-//! [`Decoder`] keeps its recoverable body errors and repeated terminal errors.
+//! Body errors are per-message items; the frame is consumed and reading
+//! continues. Only invalid lengths and unknown OP_MSG section kinds end
+//! the stream, with the error reported once. Partial frames at EOF are
+//! reported as truncation. [`Decoder`] keeps its repeated terminal errors.
 //! [`Wire`] parses exactly one [`Message`] and writes it transactionally.
 //! The inherent [`Message::parse`] still accepts a prefix.
 //!
@@ -1108,8 +1110,8 @@ pub enum MessageError {
     /// An OP_MSG section kind other than 0 or 1. This includes kind 2,
     /// which only servers use among themselves, and kind 3, telemetry a
     /// client sends only to a server that says it takes it. The OP_MSG
-    /// specification says the connection must then be closed, so a
-    /// [`Decoder`] stops here for good.
+    /// specification says the connection must then be closed, so both
+    /// [`Frames`] and [`Decoder`] stop here for good.
     SectionKind(u8),
     /// An OP_MSG has this many body sections, not exactly one.
     BodyCount(usize),
@@ -1324,12 +1326,6 @@ impl Wire for Message {
     /// Appends at most [`MAX_MESSAGE_SIZE`] bytes. Leaves `out` unchanged
     /// on error. The existing writer validates BSON, flags, and checksums.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageError> {
-        // Bound the field-name table before the existing writer builds it.
-        if let Body::Msg(message) = &self.body
-            && message.body.len() > MAX_ELEMENTS
-        {
-            return Err(MessageError::Bson(BsonError::TooManyElements));
-        }
         out.extend_from_slice(&self.to_bytes()?);
         Ok(())
     }
@@ -1341,8 +1337,11 @@ impl Wire for Message {
 /// by [`limit`](Self::limit), including the header. Oversized messages
 /// are refused from the first four bytes. Partial messages return
 /// [`Step::Need`], including at EOF, so the stream reports truncation.
-/// Every message error ends this stream. Use [`Decoder`] for the legacy
-/// behavior that continues after recoverable body errors.
+///
+/// Items are `Result<Message, MessageError>`. A body error consumes its
+/// frame and is returned as an error item, so the next message can still
+/// be read. Only [`MessageError::Length`] from the length field and
+/// [`MessageError::SectionKind`] end the stream, as with [`Decoder`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
     limit: usize,
@@ -1373,7 +1372,7 @@ impl Default for Frames {
 }
 
 impl Decode for Frames {
-    type Item = Message;
+    type Item = Result<Message, MessageError>;
     type Error = MessageError;
     const NAME: &'static str = "MongoDB";
 
@@ -1381,11 +1380,15 @@ impl Decode for Frames {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, MessageError> {
-        Ok(match parse_message(input, self.limit)? {
-            Some((message, used)) => Step::Item(message, used),
-            None => Step::Need,
-        })
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, MessageError> {
+        let Some(len) = frame_len(input, self.limit)? else {
+            return Ok(Step::Need);
+        };
+        let message = Message::from_frame(&input[..len]);
+        if let Err(e @ MessageError::SectionKind(_)) = message {
+            return Err(e);
+        }
+        Ok(Step::Item(message, len))
     }
 }
 
@@ -1407,7 +1410,8 @@ fn check_uncompressed(size: i32, compressor: u8, data: &[u8]) -> Result<(), Mess
 /// and the body's top-level names are all different. A dotted identifier
 /// such as `a.b` names field `b` of the document in field `a`.
 fn check_fields(body: &Document, sequences: &[Sequence]) -> Result<(), MessageError> {
-    let mut names = std::collections::HashSet::with_capacity(body.len());
+    // Grow as fields are checked, without reserving for an unchecked body.
+    let mut names = std::collections::HashSet::with_capacity(body.len().min(1024));
     for (key, _) in body.iter() {
         if !names.insert(key) {
             return Err(MessageError::DuplicateField);

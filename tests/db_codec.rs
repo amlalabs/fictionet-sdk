@@ -187,7 +187,10 @@ fn mongodb_chunked_round_trip() {
             },
         },
     ];
-    round_trip(|| mongodb::Frames::with_limit(128), &values);
+    round_trip(
+        || mongodb::Frames::with_limit(128).map(Result::unwrap),
+        &values,
+    );
 }
 
 #[test]
@@ -207,7 +210,7 @@ fn mongodb_refuses_length_from_header() {
 
 #[test]
 fn mongodb_truncated_frame_at_eof() {
-    eof_at_every_prefix(mongodb::Frames::new, mongo_ping());
+    eof_at_every_prefix(|| mongodb::Frames::new().map(Result::unwrap), mongo_ping());
 }
 
 #[test]
@@ -253,7 +256,7 @@ fn mongodb_wire_is_exact_and_transactional() {
 }
 
 #[test]
-fn mongodb_legacy_body_recovery_and_repeated_failure() {
+fn mongodb_body_recovery_and_legacy_repeated_failure() {
     let good = mongo_ping();
     let mut bad = 20i32.to_le_bytes().to_vec();
     bad.extend_from_slice(&[0; 8]);
@@ -261,6 +264,22 @@ fn mongodb_legacy_body_recovery_and_repeated_failure() {
     bad.extend_from_slice(&[0; 4]); // No body section.
     let mut input = bad.clone();
     Wire::write(&good, &mut input).unwrap();
+    contract::check_decode(mongodb::Frames::new, &input);
+
+    let mut stream = Stream::new(mongodb::Frames::new());
+    assert_eq!(stream.push(&input), input.len());
+    assert_eq!(
+        stream.next(),
+        Some(Ok(Err(mongodb::MessageError::BodyCount(0))))
+    );
+    assert!(stream.failed().is_none());
+    assert_eq!(stream.offset(), bad.len() as u64);
+    assert_eq!(stream.unread(), &input[bad.len()..]);
+    assert_eq!(stream.next(), Some(Ok(Ok(good.clone()))));
+    assert_eq!(stream.next(), None);
+    assert_eq!(stream.buffered(), 0);
+    assert_eq!(stream.offset(), input.len() as u64);
+
     let mut old = mongodb::Decoder::new();
     assert_eq!(old.feed(&input), input.len());
     assert_eq!(
@@ -270,13 +289,6 @@ fn mongodb_legacy_body_recovery_and_repeated_failure() {
     assert_eq!(old.failed(), None);
     assert_eq!(old.next_message(), Some(Ok(good)));
     assert_eq!(old.next_message(), None);
-    // The new decoder follows Decode's terminal-error rule.
-    header_refusal(
-        mongodb::Frames::new,
-        &bad,
-        mongodb::MessageError::BodyCount(0),
-    );
-
     assert_eq!(old.feed(&0i32.to_le_bytes()), 4);
     for _ in 0..2 {
         assert_eq!(
@@ -288,6 +300,20 @@ fn mongodb_legacy_body_recovery_and_repeated_failure() {
     assert_eq!(old.buffered(), 0);
     assert_eq!(old.feed(&input), input.len());
     assert_eq!(old.buffered(), 0);
+}
+
+#[test]
+fn mongodb_unknown_section_kind_ends_stream() {
+    let mut bad = 21i32.to_le_bytes().to_vec();
+    bad.extend_from_slice(&[0; 8]);
+    bad.extend_from_slice(&mongodb::op_code::MSG.to_le_bytes());
+    bad.extend_from_slice(&[0; 4]);
+    bad.push(2);
+    header_refusal(
+        mongodb::Frames::new,
+        &bad,
+        mongodb::MessageError::SectionKind(2),
+    );
 }
 
 #[test]
@@ -690,7 +716,7 @@ fn sftp_wire_is_exact_and_transactional() {
         body: vec![0; sftp::MAX_PACKET],
     };
     refused_write(&large);
-    assert_eq!(large.to_bytes().len(), sftp::LENGTH_LEN + sftp::MAX_PACKET);
+    assert_eq!(large.to_bytes().len(), sftp::MAX_FRAME);
     contract::check_wire_value(&sftp::Packet {
         kind: 0xff,
         body: vec![0; sftp::MAX_PACKET - 1],
@@ -725,6 +751,7 @@ fn capacities_are_named_and_clamped() {
         git_protocol::MAX_PACKET
     );
     assert_eq!(mysql::Frames::new().capacity(), mysql::MAX_FRAME);
+    assert_eq!(sftp::Frames::new().capacity(), sftp::MAX_FRAME);
     for limit in [0, 1, 16, 4096, usize::MAX] {
         let mongo = mongodb::Frames::with_limit(limit);
         assert_eq!(
@@ -795,7 +822,7 @@ where
 fn large_frames_arrive_one_byte_at_a_time() {
     const PAYLOAD: usize = 64 * 1024;
     bytewise_frame(
-        mongodb::Frames::with_limit(mongodb::HEADER_LEN + PAYLOAD),
+        mongodb::Frames::with_limit(mongodb::HEADER_LEN + PAYLOAD).map(Result::unwrap),
         mongodb::Message {
             request_id: 1,
             response_to: 0,
@@ -853,10 +880,10 @@ fn mongodb_wire_size_limit() {
 }
 
 #[test]
-fn mongodb_wire_bounds_field_names_before_validation() {
-    // Distinct keys would require an oversized table. Duplicate keys must
-    // not make the strict writer allocate it before applying the count limit.
-    let value = mongodb::Message {
+fn mongodb_writers_preserve_validation_order_for_large_bodies() {
+    // Duplicate keys need no full-size field table. Both writers report
+    // the same validation error, even when the body exceeds MAX_ELEMENTS.
+    let mut value = mongodb::Message {
         request_id: 0,
         response_to: 0,
         body: mongodb::Body::Msg(mongodb::Msg::new(mongodb::Document(vec![
@@ -868,12 +895,17 @@ fn mongodb_wire_bounds_field_names_before_validation() {
                 + 1
         ]))),
     };
-    let mut out = vec![0x55];
-    assert_eq!(
-        value.write(&mut out),
-        Err(mongodb::MessageError::Bson(
-            mongodb::BsonError::TooManyElements
-        ))
-    );
-    assert_eq!(out, [0x55]);
+    for (flags, error) in [
+        (0, mongodb::MessageError::DuplicateField),
+        (1 << 20, mongodb::MessageError::Flags(1 << 20)),
+    ] {
+        let mongodb::Body::Msg(msg) = &mut value.body else {
+            panic!("expected OP_MSG")
+        };
+        msg.flags = flags;
+        let mut out = vec![0x55];
+        assert_eq!(value.to_bytes(), Err(error));
+        assert_eq!(value.write(&mut out), Err(error));
+        assert_eq!(out, [0x55]);
+    }
 }

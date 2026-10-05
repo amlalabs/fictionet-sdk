@@ -372,9 +372,13 @@ pub enum FrameError {
         /// The type of this packet.
         got: u8,
     },
-    /// The message would grow past the decoder's limit, to this many
-    /// bytes.
-    /// [`Frames`] and [`Wire`] writers use the total packet length.
+    /// A message or packet would exceed its size limit.
+    ///
+    /// From [`Decoder`], the value is the assembled data length, including
+    /// the packet that broke the limit. From [`Message::to_packets`], it is
+    /// the message's data length. From [`Frames`], [`Packet::parse_limited`]
+    /// or [`Packet`]'s [`Wire::write`], it is one packet's total length,
+    /// including the header. Message lengths exclude packet headers.
     TooLong(usize),
 }
 

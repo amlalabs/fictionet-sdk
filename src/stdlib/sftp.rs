@@ -84,6 +84,9 @@ pub const VERSION: u32 = 3;
 pub const MAX_PACKET: usize = 256 * 1024;
 /// The length field before each packet.
 pub const LENGTH_LEN: usize = 4;
+/// The longest wire packet, including its four-byte length field.
+/// This is the default input capacity of [`Frames`].
+pub const MAX_FRAME: usize = LENGTH_LEN + MAX_PACKET;
 /// The most bytes of file data one WRITE, DATA or EXTENDED packet may
 /// carry. A server should not answer a READ with more.
 pub const MAX_DATA: usize = 255 * 1024;
@@ -293,8 +296,8 @@ impl Wire for Packet {
         }
     }
 
-    /// Appends at most [`LENGTH_LEN`] plus [`MAX_PACKET`] bytes. Refuses
-    /// oversized bodies before changing `out`. An unrepresentable length
+    /// Appends at most [`MAX_FRAME`] bytes. Refuses oversized bodies
+    /// before changing `out`. An unrepresentable length
     /// is reported as [`PacketError::TooLong`] with `u32::MAX`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), PacketError> {
         let len = self.body.len().saturating_add(1);

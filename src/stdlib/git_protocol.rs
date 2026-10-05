@@ -242,6 +242,12 @@ impl Wire for Packet {
 /// Partial packets return [`Step::Need`], including at EOF, so the stream
 /// reports truncation. Flush, delimiter, response-end, and empty data
 /// packets are separate items. Control packets do not end the stream.
+///
+/// After the flush that ends a receive-pack command list, raw PACK bytes
+/// may follow. Before reading another item, the world must hand off with
+/// [`Stream::into_parts`](super::codec::Stream::into_parts), or
+/// [`Stream::swap`](super::codec::Stream::swap) to a pack decoder. Both
+/// preserve unread bytes; [`Frames`] cannot parse raw PACK data.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
 
