@@ -5,6 +5,7 @@
 use std::net::Ipv4Addr;
 
 use fictionet::stdlib::igmp::{Decoder, Message, RecordType, checksum};
+use fictionet::stdlib::{codec::{Collect, contract}, igmp};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -22,6 +23,18 @@ fuzz_target!(|data: &[u8]| {
 });
 
 fn check(data: &[u8]) {
+    contract::check_decode(|| Collect::<igmp::Message>::new(igmp::MAX_MESSAGE), data);
+    contract::check_wire::<igmp::Message>(data);
+
+    let query = Message::QueryV3(igmp::QueryV3 {
+        max_resp_code: 100,
+        group: Ipv4Addr::UNSPECIFIED,
+        suppress: false,
+        qrv: data.first().copied().unwrap_or(0),
+        qqic: 125,
+        sources: vec![],
+    });
+    contract::check_wire_value(&query);
     let parsed = Message::parse(data);
 
     // The message, fed two ways: all at once, and a byte at a time.

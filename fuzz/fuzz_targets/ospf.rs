@@ -12,6 +12,7 @@ use fictionet::stdlib::ospf::{
     NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, OspfError, Packet, Prefix, RouterInterface, RouterLink, RouterLsa,
     RouterLsaV3, SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
+use fictionet::stdlib::{codec::{Collect, Decode, contract}, ospf};
 use libfuzzer_sys::fuzz_target;
 
 fn ends() -> [Endpoints; 2] {
@@ -22,6 +23,17 @@ fn ends() -> [Endpoints; 2] {
 }
 
 fn check(data: &[u8], e: &Endpoints) {
+    contract::check_decode(|| Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE), data);
+    contract::check_decode(
+        || Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
+            .map(|datagram| Packet::parse(&datagram.0, e)),
+        data,
+    );
+    contract::check_wire::<ospf::Datagram>(data);
+    contract::check_wire_value(&ospf::Datagram(
+        data.iter().take(ospf::MAX_MESSAGE + 1).copied().collect(),
+    ));
+
     let parsed = Packet::parse(data, e);
 
     // The packet, fed two ways: all at once, and a byte at a time.

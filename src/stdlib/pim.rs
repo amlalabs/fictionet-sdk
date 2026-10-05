@@ -74,6 +74,14 @@
 //! // Written back, the Hello is the same bytes.
 //! assert_eq!(hello.to_bytes(&ends).unwrap(), bytes);
 //! ```
+//!
+//! [`Datagram`] implements [`Wire`](super::codec::Wire) for a bounded,
+//! byte-preserving payload. Collect chunks with `Collect<Datagram>` and
+//! map each payload through [`Message::parse`] with [`Endpoints`]. End the
+//! stream at the IP packet boundary. Collection errors end the stream;
+//! message and checksum failures are mapped item errors. [`Message`] stays
+//! outside `Wire` because the payload does not carry its endpoints.
+//! [`Decoder`] keeps its context, constructor, early checks, and feed errors.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -1411,6 +1419,56 @@ fn put_source(out: &mut Vec<u8>, s: &Source) {
     let flags = if s.sparse { 0x04 } else { 0 } | if s.wildcard { 0x02 } else { 0 } | if s.rpt { 0x01 } else { 0 };
     out.extend_from_slice(&[flags, s.mask_len]);
     put_address(out, s.address);
+}
+
+/// One bounded IP payload, with every received byte preserved.
+///
+/// [`Wire`](super::codec::Wire) reads the entire payload and checks only
+/// [`MAX_MESSAGE`]. It does not validate a PIM message or its checksum.
+/// Use [`Message::parse`] with the packet's [`Endpoints`] for that check.
+/// The endpoints are not encoded in this payload.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Collect, Decode, Stream}, pim};
+/// # let endpoints = pim::Endpoints::V4 {
+/// #     source: "192.0.2.1".parse().unwrap(),
+/// #     destination: "224.0.0.1".parse().unwrap(),
+/// # };
+/// let messages = Collect::<pim::Datagram>::new(pim::MAX_MESSAGE)
+///     .map(move |datagram| pim::Message::parse(&datagram.0, &endpoints));
+/// let mut stream = Stream::new(messages);
+/// // Push chunks of one IP payload, then call stream.end().
+/// # stream.end();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Datagram(
+    /// Complete payload bytes, including the received checksum.
+    /// Parsing and writing refuse more than [`MAX_MESSAGE`] bytes.
+    pub Vec<u8>,
+);
+
+impl super::codec::Wire for Datagram {
+    type ParseError = PimError;
+    type WriteError = PimError;
+
+    /// Copies the entire payload after checking [`MAX_MESSAGE`].
+    /// Message and checksum validation need [`Endpoints`] separately.
+    fn parse(bytes: &[u8]) -> Result<Self, PimError> {
+        if bytes.len() > MAX_MESSAGE {
+            return Err(PimError::TooLong);
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Appends the original payload. Leaves `out` unchanged on error.
+    /// No checksum is computed or validated.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), PimError> {
+        if self.0.len() > MAX_MESSAGE {
+            return Err(PimError::TooLong);
+        }
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
 }
 
 /// Reads one message that comes in pieces. Feed it the bytes in order,

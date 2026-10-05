@@ -45,6 +45,13 @@
 //! assert_eq!(back, packet);
 //! assert_eq!(back.header.key(), Some(7));
 //! ```
+//!
+//! [`Packet`] implements [`Wire`](super::codec::Wire) for exact parsing and
+//! transactional writing. Its trait parser refuses trailing PPTP padding;
+//! [`Packet::parse`] keeps accepting it. For chunks of one packet, use
+//! `Stream::new(Collect::<Packet>::new(MAX_PACKET))` and end the stream at
+//! the packet boundary. [`Decoder`] keeps its early header checks, header
+//! access, constructor, and repeated feed errors.
 
 /// The IP protocol number that marks a GRE packet.
 pub const IP_PROTOCOL: u8 = 47;
@@ -481,6 +488,49 @@ impl Packet {
             out[at..at + 2].copy_from_slice(&sum.to_be_bytes());
         }
         Ok(())
+    }
+}
+
+/// Why an exact [`Wire`](super::codec::Wire) parse refused a packet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The packet's header, length, or checksum is invalid.
+    Packet(GreError),
+    /// Bytes follow the declared PPTP payload.
+    Trailing {
+        /// Number of bytes after the payload.
+        remaining: usize,
+    },
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Packet(e) => e.fmt(f),
+            Self::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
+        }
+    }
+}
+
+impl core::error::Error for ParseError {}
+
+impl super::codec::Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = GreError;
+
+    /// Reads exactly one packet. Refuses padding after a PPTP payload.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let packet = Packet::parse(bytes).map_err(ParseError::Packet)?;
+        let used = packet.header.len().saturating_add(packet.payload.len());
+        if used != bytes.len() {
+            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
+        }
+        Ok(packet)
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), GreError> {
+        Packet::write(self, out)
     }
 }
 

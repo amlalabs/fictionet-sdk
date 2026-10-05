@@ -5,9 +5,25 @@ use fictionet::stdlib::rip::{
     Decoder, Entries, MAX_DATAGRAM, MAX_PREFIX_LEN, Message, NgDecoder, NgEntries, NgEntry, NgMessage, Received,
     RipError,
 };
+use fictionet::stdlib::{codec::{Collect, contract}, rip};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| Collect::<rip::Message>::new(rip::MAX_MESSAGE), data);
+    contract::check_wire::<rip::Message>(data);
+    contract::check_decode(|| Collect::<rip::NgMessage>::new(rip::MAX_NG_MESSAGE), data);
+    contract::check_wire::<rip::NgMessage>(data);
+
+    let message = Message {
+        command: rip::Command::Request,
+        version: rip::Version::V2,
+        auth: Some(rip::Auth::Other {
+            kind: data.first().copied().map_or(0, u16::from),
+            data: [0; 16],
+        }),
+        entries: Entries::WholeTable,
+    };
+    contract::check_wire_value(&message);
     // As a RIP message, fed two ways: all at once, and a byte at a time.
     let parsed = Message::parse(data);
     let mut whole = Decoder::new();

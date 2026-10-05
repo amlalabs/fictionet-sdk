@@ -91,6 +91,14 @@
 //! bad[30] ^= 1;
 //! assert!(Packet::parse(&bad, &link).is_err());
 //! ```
+//!
+//! [`Datagram`] implements [`Wire`](super::codec::Wire) for a bounded,
+//! byte-preserving payload. Collect chunks with `Collect<Datagram>` and
+//! map each payload through [`Packet::parse`] with [`Endpoints`]. End the
+//! stream at the IP packet boundary. Collection errors end the stream;
+//! message and checksum failures are mapped item errors. [`Packet`] stays
+//! outside `Wire` because the payload does not carry its endpoints.
+//! [`Decoder`] keeps its context, constructor, early checks, and feed errors.
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -2087,6 +2095,56 @@ fn put_lsa_header(out: &mut Vec<u8>, h: &LsaHeader, v: Version) -> Result<(), Os
     out.extend_from_slice(&h.checksum.to_be_bytes());
     out.extend_from_slice(&h.length.to_be_bytes());
     Ok(())
+}
+
+/// One bounded IP payload, with every received byte preserved.
+///
+/// [`Wire`](super::codec::Wire) reads the entire payload and checks only
+/// [`MAX_MESSAGE`]. It does not validate a OSPF message or its checksum.
+/// Use [`Packet::parse`] with the packet's [`Endpoints`] for that check.
+/// The endpoints are not encoded in this payload.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Collect, Decode, Stream}, ospf};
+/// # let endpoints = ospf::Endpoints::V4 {
+/// #     source: "192.0.2.1".parse().unwrap(),
+/// #     destination: "224.0.0.1".parse().unwrap(),
+/// # };
+/// let messages = Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
+///     .map(move |datagram| ospf::Packet::parse(&datagram.0, &endpoints));
+/// let mut stream = Stream::new(messages);
+/// // Push chunks of one IP payload, then call stream.end().
+/// # stream.end();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Datagram(
+    /// Complete payload bytes, including the received checksum.
+    /// Parsing and writing refuse more than [`MAX_MESSAGE`] bytes.
+    pub Vec<u8>,
+);
+
+impl super::codec::Wire for Datagram {
+    type ParseError = OspfError;
+    type WriteError = OspfError;
+
+    /// Copies the entire payload after checking [`MAX_MESSAGE`].
+    /// Message and checksum validation need [`Endpoints`] separately.
+    fn parse(bytes: &[u8]) -> Result<Self, OspfError> {
+        if bytes.len() > MAX_MESSAGE {
+            return Err(OspfError::TooLong);
+        }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Appends the original payload. Leaves `out` unchanged on error.
+    /// No checksum is computed or validated.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), OspfError> {
+        if self.0.len() > MAX_MESSAGE {
+            return Err(OspfError::TooLong);
+        }
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
 }
 
 /// Reads one packet that comes in pieces. Feed it the bytes in order, then

@@ -62,6 +62,14 @@
 //! assert_eq!(Datagram::parse(&[0xff]), Ok(Datagram::Keepalive));
 //! assert_eq!(Datagram::parse(&[0, 0, 0, 0, 1]), Ok(Datagram::Ike(vec![1])));
 //! ```
+//!
+//! [`EspPacket`], [`AhPacket`], and [`Datagram`] implement
+//! [`Wire`](super::codec::Wire) for exact parsing and transactional writing.
+//! Collect chunks with `Stream::new(Collect::<EspPacket>::new(MAX_PACKET))`,
+//! or `AhPacket` with [`MAX_PACKET`], or `Datagram` with [`MAX_DATAGRAM`].
+//! End the stream at the packet boundary. [`Packet::parse`] still needs a
+//! [`Kind`], which is not encoded in the payload. [`Packet`] stays outside
+//! `Wire`. [`Decoder`] keeps that context, early checks, and feed errors.
 
 /// The IP protocol number that marks an ESP packet.
 pub const ESP_PROTOCOL: u8 = 50;
@@ -612,6 +620,54 @@ impl Datagram {
             Datagram::Ike(m) => NON_ESP_MARKER.len().saturating_add(m.len()),
             Datagram::Esp(p) => ESP_HEADER_LEN.saturating_add(p.payload.len()),
         }
+    }
+}
+
+impl super::codec::Wire for EspPacket {
+    type ParseError = IpsecError;
+    type WriteError = IpsecError;
+
+    /// Reads exactly one unit of at most [`MAX_PACKET`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, IpsecError> {
+        EspPacket::parse(bytes)
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), IpsecError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+impl super::codec::Wire for AhPacket {
+    type ParseError = IpsecError;
+    type WriteError = IpsecError;
+
+    /// Reads exactly one unit of at most [`MAX_PACKET`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, IpsecError> {
+        AhPacket::parse(bytes)
+    }
+
+    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), IpsecError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+impl super::codec::Wire for Datagram {
+    type ParseError = IpsecError;
+    type WriteError = IpsecError;
+
+    /// Reads exactly one unit of at most [`MAX_DATAGRAM`] bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, IpsecError> {
+        Datagram::parse(bytes)
+    }
+
+    /// Appends at most [`MAX_DATAGRAM`] bytes. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), IpsecError> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
     }
 }
 
