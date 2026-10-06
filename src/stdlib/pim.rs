@@ -25,7 +25,7 @@
 //! Nothing here reads a socket. A world that plays a router hands each PIM
 //! payload (the bytes after the IP header) to [`Message::parse`] with the
 //! packet's [`Endpoints`], and prepares a reply with [`Message::frame`].
-//! Write that frame with [`Wire::write`](super::codec::Wire::write) in an IP packet with protocol
+//! Write that frame with [`Wire::write`] in an IP packet with protocol
 //! [`PROTOCOL`]. Hello, Join/Prune, Assert and Bootstrap messages go to
 //! [`ALL_PIM_ROUTERS_V4`] or [`ALL_PIM_ROUTERS_V6`] with a TTL of 1. A
 //! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Datagram>`,
@@ -1427,7 +1427,7 @@ fn put_source(out: &mut Vec<u8>, s: &Source) {
 
 /// One bounded IP payload, with every received byte preserved.
 ///
-/// [`Wire`](super::codec::Wire) reads the entire payload and checks only
+/// [`Wire`] reads the entire payload and checks only
 /// [`MAX_MESSAGE`]. It does not validate a PIM message or its checksum.
 /// Use [`Message::parse`] with the packet's [`Endpoints`] for that check.
 /// The endpoints are not encoded in this payload.

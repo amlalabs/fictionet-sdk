@@ -437,7 +437,7 @@ pub fn checksum(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
 /// [`Advertisement::parse`] takes either checksum on a version 3
 /// advertisement over IPv4. To send to a router that wants this one,
 /// prepare an [`Advertisement::frame`], serialize it with
-/// [`Wire::write`](super::codec::Wire::write), and put this checksum
+/// [`Wire::write`], and put this checksum
 /// in bytes 6 and 7.
 pub fn checksum_rfc5798(b: &[u8], endpoints: &Endpoints) -> Option<u16> {
     sum_with(b, endpoints, true)
@@ -725,7 +725,7 @@ fn v4_addresses(b: &[u8]) -> Vec<Ipv4Addr> {
 
 /// One bounded IP payload, with every received byte preserved.
 ///
-/// [`Wire`](super::codec::Wire) reads the entire payload and checks only
+/// [`Wire`] reads the entire payload and checks only
 /// [`MAX_MESSAGE`]. It does not validate a VRRP message or its checksum.
 /// Use [`Advertisement::parse`] with the packet's [`Endpoints`] for that check.
 /// The endpoints are not encoded in this payload.
