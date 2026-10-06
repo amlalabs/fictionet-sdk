@@ -155,3 +155,54 @@ fn openapi_document_entries_only_compile_reachable_schemas() {
         contract::check_wire_value(&example);
     }
 }
+
+// Peak resident memory in KiB, from the kernel's high-water mark.
+#[cfg(target_os = "linux")]
+fn peak_kib() -> usize {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let line = status.lines().find(|l| l.starts_with("VmHWM:")).unwrap();
+    line.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn instance_paths_are_not_copied_per_child() {
+    let key = "a".repeat(4000);
+    let zeros = vec![Value::from(0); 99_000];
+    let members = (0..99_000)
+        .map(|i| (i.to_string(), Value::Null))
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            Value::Object(vec![(
+                "properties".into(),
+                Value::Object(vec![(
+                    key.clone(),
+                    parse(br#"{"items":{"type":"integer"}}"#),
+                )]),
+            )]),
+            Value::Object(vec![(key.clone(), Value::Array(zeros))]),
+        ),
+        (
+            Value::Object(vec![(
+                "properties".into(),
+                Value::Object(vec![(
+                    key.clone(),
+                    parse(br#"{"additionalProperties":true}"#),
+                )]),
+            )]),
+            Value::Object(vec![(key.clone(), Value::Object(members))]),
+        ),
+    ];
+    for (source, instance) in cases {
+        let schema = Schema::compile(&source).unwrap();
+        let before = peak_kib();
+        let report = schema.validate(&instance);
+        assert!(report.is_valid(), "{:?}", report.errors);
+        let grown = peak_kib().saturating_sub(before);
+        assert!(
+            grown < 64 * 1024,
+            "validation raised peak memory by {grown} KiB"
+        );
+    }
+}

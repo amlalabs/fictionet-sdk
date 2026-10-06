@@ -28,8 +28,10 @@
 //!
 //! [`Schema::compile_at`] selects a schema within a document, such as an OpenAPI
 //! component or request body. Only its reachable schemas are compiled.
-//! References stay in that document. Pointers and simple anchors are supported;
-//! `$id` does not establish another resource or change the reference base.
+//! References stay in that document. Pointers and simple anchors are supported.
+//! `$id` is accepted only on the document root, where it does not change
+//! same-document references; a reached schema with a nested `$id` (an embedded
+//! resource) fails compilation, since its references would resolve elsewhere.
 //! Recursive schemas may descend through instances. Revisiting a schema at the
 //! same instance is a reference-cycle error, even inside `not` or `anyOf`.
 //! All evaluation, including speculative branches, shares one work budget.
@@ -496,6 +498,75 @@ fn pointer(base: &str, token: &str, max: usize) -> Result<String, &'static str> 
     Ok(out)
 }
 
+// An instance location as a parent-linked list of borrowed tokens. Clones
+// share the parent, and the pointer text is made only for a report, so a
+// pending child costs one small node, not a copy of its parent's pointer.
+#[derive(Clone, Copy)]
+enum Token<'v> {
+    Index(usize),
+    Name(&'v str),
+}
+struct Step<'v> {
+    parent: InstancePath<'v>,
+    token: Token<'v>,
+}
+#[derive(Clone, Default)]
+struct InstancePath<'v> {
+    last: Option<std::rc::Rc<Step<'v>>>,
+    bytes: usize,
+}
+impl<'v> InstancePath<'v> {
+    fn child(&self, token: Token<'v>, max: usize) -> Result<Self, &'static str> {
+        let size = match token {
+            Token::Index(i) => i.checked_ilog10().unwrap_or(0) as usize + 1,
+            Token::Name(name) => name
+                .bytes()
+                .try_fold(0usize, |n, b| {
+                    n.checked_add(if matches!(b, b'~' | b'/') { 2 } else { 1 })
+                })
+                .ok_or("max_pointer_bytes")?,
+        };
+        let bytes = self
+            .bytes
+            .checked_add(1)
+            .and_then(|n| n.checked_add(size))
+            .filter(|&n| n <= max)
+            .ok_or("max_pointer_bytes")?;
+        Ok(Self {
+            last: Some(std::rc::Rc::new(Step {
+                parent: self.clone(),
+                token,
+            })),
+            bytes,
+        })
+    }
+    fn render(&self) -> String {
+        let mut tokens = Vec::new();
+        let mut at = self;
+        while let Some(step) = &at.last {
+            tokens.push(step.token);
+            at = &step.parent;
+        }
+        let mut out = String::with_capacity(self.bytes);
+        for token in tokens.into_iter().rev() {
+            out.push('/');
+            match token {
+                Token::Index(i) => out.push_str(&i.to_string()),
+                Token::Name(name) => {
+                    for ch in name.chars() {
+                        match ch {
+                            '~' => out.push_str("~0"),
+                            '/' => out.push_str("~1"),
+                            _ => out.push(ch),
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
 #[derive(Debug)]
 struct InputError {
     path: String,
@@ -504,7 +575,7 @@ struct InputError {
 fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, InputError> {
     fn visit(
         v: &Value,
-        path: &str,
+        path: &InstancePath<'_>,
         depth: usize,
         nodes: &mut usize,
         bytes: &mut usize,
@@ -512,7 +583,7 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
         cap: usize,
     ) -> Result<(), InputError> {
         let err = |limit| InputError {
-            path: path.into(),
+            path: path.render(),
             limit,
         };
         if depth > l.max_depth {
@@ -534,7 +605,8 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
                     return Err(err(Some("max_nodes")));
                 }
                 for (i, child) in a.iter().enumerate() {
-                    let p = pointer(path, &i.to_string(), l.max_pointer_bytes)
+                    let p = path
+                        .child(Token::Index(i), l.max_pointer_bytes)
                         .map_err(|s| err(Some(s)))?;
                     visit(child, &p, depth + 1, nodes, bytes, l, cap)?;
                 }
@@ -549,10 +621,12 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
                     if *bytes > l.max_bytes {
                         return Err(err(Some("max_bytes")));
                     }
-                    let p = pointer(path, key, l.max_pointer_bytes).map_err(|s| err(Some(s)))?;
+                    let p = path
+                        .child(Token::Name(key), l.max_pointer_bytes)
+                        .map_err(|s| err(Some(s)))?;
                     if !names.insert(key) {
                         return Err(InputError {
-                            path: p,
+                            path: p.render(),
                             limit: None,
                         });
                     }
@@ -567,7 +641,8 @@ fn inspect(value: &Value, limits: &Limits, max_nodes: usize) -> Result<usize, In
         Ok(())
     }
     let (mut nodes, mut bytes) = (0, 0);
-    visit(value, "", 0, &mut nodes, &mut bytes, limits, max_nodes)?;
+    let root = InstancePath::default();
+    visit(value, &root, 0, &mut nodes, &mut bytes, limits, max_nodes)?;
     Ok(bytes)
 }
 
@@ -674,6 +749,8 @@ impl Decimal {
         }
         Some(n)
     }
+    // The coefficient remainder is exact. Trailing zeros of the dividend use
+    // square-and-multiply, so the cost grows with log(shift), not shift.
     fn multiple(&self, divisor: &Self, work: &mut Work) -> Result<bool, &'static str> {
         if self.digits.is_empty() {
             return Ok(true);
@@ -682,44 +759,21 @@ impl Decimal {
         if shift < 0 {
             return Ok(false);
         }
-        let mut remainder = Vec::<u8>::new();
-        for (index, digit) in self
-            .digits
-            .iter()
-            .copied()
-            .chain(std::iter::repeat_n(0, shift as usize))
-            .enumerate()
-        {
-            if index >= self.digits.len() && remainder.is_empty() {
-                return Ok(true);
-            }
-            work.spend(divisor.digits.len().saturating_mul(12).saturating_add(1))?;
-            if !remainder.is_empty() || digit != 0 {
-                remainder.push(digit);
-            }
-            while remainder.len() > divisor.digits.len()
-                || (remainder.len() == divisor.digits.len() && remainder >= divisor.digits)
-            {
-                let mut borrow = 0i16;
-                for i in 0..remainder.len() {
-                    let r = remainder.len() - 1 - i;
-                    let d = divisor
-                        .digits
-                        .len()
-                        .checked_sub(i + 1)
-                        .map_or(0, |j| divisor.digits[j]);
-                    let n = i16::from(remainder[r]) - i16::from(d) - borrow;
-                    remainder[r] = n.rem_euclid(10) as u8;
-                    borrow = i16::from(n < 0);
-                }
-                let first = remainder
-                    .iter()
-                    .position(|&d| d != 0)
-                    .unwrap_or(remainder.len());
-                remainder.drain(..first);
+        let d = &divisor.digits;
+        let r = remainder(&self.digits, d, work)?;
+        if r.is_empty() || shift == 0 {
+            return Ok(r.is_empty());
+        }
+        // power = 10^shift mod d, built from the most significant bit down.
+        let ten = remainder(&[1, 0], d, work)?;
+        let mut power = remainder(&[1], d, work)?;
+        for bit in (0..u64::BITS - (shift as u64).leading_zeros()).rev() {
+            power = remainder(&product(&power, &power, work)?, d, work)?;
+            if (shift as u64 >> bit) & 1 == 1 {
+                power = remainder(&product(&power, &ten, work)?, d, work)?;
             }
         }
-        Ok(remainder.is_empty())
+        Ok(remainder(&product(&r, &power, work)?, d, work)?.is_empty())
     }
     fn number(&self) -> Option<Value> {
         let mut text = if self.negative {
@@ -738,6 +792,47 @@ impl Decimal {
         }
         Number::from_text(&text).map(Value::Number)
     }
+}
+// Big-endian decimal digits without leading zeros; zero is empty.
+fn remainder(dividend: &[u8], divisor: &[u8], work: &mut Work) -> Result<Vec<u8>, &'static str> {
+    let mut r = Vec::<u8>::with_capacity(divisor.len().saturating_add(1));
+    for &digit in dividend {
+        work.spend(divisor.len().saturating_mul(12).saturating_add(1))?;
+        if !r.is_empty() || digit != 0 {
+            r.push(digit);
+        }
+        while r.len() > divisor.len() || (r.len() == divisor.len() && r.as_slice() >= divisor) {
+            let mut borrow = 0i16;
+            for i in 0..r.len() {
+                let at = r.len() - 1 - i;
+                let d = divisor.len().checked_sub(i + 1).map_or(0, |j| divisor[j]);
+                let n = i16::from(r[at]) - i16::from(d) - borrow;
+                r[at] = n.rem_euclid(10) as u8;
+                borrow = i16::from(n < 0);
+            }
+            let first = r.iter().position(|&d| d != 0).unwrap_or(r.len());
+            r.drain(..first);
+        }
+    }
+    Ok(r)
+}
+fn product(a: &[u8], b: &[u8], work: &mut Work) -> Result<Vec<u8>, &'static str> {
+    if a.is_empty() || b.is_empty() {
+        return Ok(Vec::new());
+    }
+    work.spend(a.len().saturating_mul(b.len()).saturating_add(1))?;
+    let mut sum = vec![0u32; a.len() + b.len()];
+    for (i, &x) in a.iter().enumerate().rev() {
+        let mut carry = 0u32;
+        for (j, &y) in b.iter().enumerate().rev() {
+            let t = sum[i + j + 1] + u32::from(x) * u32::from(y) + carry;
+            sum[i + j + 1] = t % 10;
+            carry = t / 10;
+        }
+        sum[i] += carry;
+    }
+    let first = sum.iter().position(|&d| d != 0).unwrap_or(sum.len());
+    Ok(sum[first..].iter().map(|&d| d as u8).collect())
 }
 struct Work {
     left: usize,
@@ -874,6 +969,7 @@ struct Compiler<'a> {
     size: usize,
     anchors: BTreeMap<String, usize>,
     refs: Vec<(usize, String)>,
+    entry: Option<(&'a Value, String)>,
     nodes: Vec<Node>,
     annotations: Vec<StoredAnnotation>,
     work: Work,
@@ -1076,45 +1172,84 @@ impl<'a> Compiler<'a> {
         Ok((value, path))
     }
     // Anchor lookup is lazy. Pointer-only entry points never scan the document.
+    // The search follows schema positions only, from the document root and from
+    // the compile_at entry, so `$anchor` inside keyword data such as `examples`,
+    // `const`, or extensions is never a target.
     fn anchor_pointer(&mut self, anchor: &str) -> Result<String, CompileErrorKind> {
         use CompileErrorKind::{InvalidAnchor, InvalidReference, Limit};
-        let mut found = None;
-        let mut stack = vec![(self.root, 0usize)];
-        let mut tokens: Vec<String> = Vec::new();
-        while let Some((v, next)) = stack.last_mut() {
-            self.work.spend(1).map_err(Limit)?;
-            if *next == 0
-                && let Some(name) = v.get("$anchor").and_then(Value::as_str)
-            {
-                self.work.spend(name.len()).map_err(Limit)?;
-                if name == anchor {
-                    if found.is_some() {
-                        return Err(InvalidAnchor);
+        let max = self.options.limits.max_pointer_bytes;
+        let mut found: Option<(*const Value, String)> = None;
+        let mut starts = vec![(self.root, String::new())];
+        if let Some((value, pointer)) = &self.entry {
+            starts.push((*value, pointer.clone()));
+        }
+        for (start, prefix) in starts {
+            // Each frame holds a schema-position value, its pointer, and the
+            // next member to visit with that member's source kind.
+            let mut stack = vec![(start, prefix, 0usize, SourceKind::Schema)];
+            while let Some((v, path, next, kind)) = stack.last_mut() {
+                self.work.spend(1).map_err(Limit)?;
+                let schema = matches!(kind, SourceKind::Schema);
+                // A nested `$id` starts another resource; its anchors are not ours.
+                let hidden = schema
+                    && match self.options.dialect {
+                        Dialect::OpenApi30 => v.get("$ref").is_some(),
+                        Dialect::Draft202012 => {
+                            !std::ptr::eq(*v, self.root) && v.get("$id").is_some()
+                        }
+                    };
+                if *next == 0
+                    && schema
+                    && !hidden
+                    && let Some(name) = v.get("$anchor").and_then(Value::as_str)
+                {
+                    self.work.spend(name.len()).map_err(Limit)?;
+                    if name == anchor {
+                        let at = *v as *const Value;
+                        match &found {
+                            Some((seen, _)) if *seen == at => {}
+                            Some(_) => return Err(InvalidAnchor),
+                            None => found = Some((at, path.clone())),
+                        }
                     }
-                    let mut p = String::new();
-                    for token in &tokens {
-                        p = pointer(&p, token, self.options.limits.max_pointer_bytes)
-                            .map_err(Limit)?;
-                    }
-                    found = Some(p);
                 }
-            }
-            let child = match v {
-                Value::Object(o) => o.get(*next).map(|(k, v)| (k.clone(), v)),
-                Value::Array(a) => a.get(*next).map(|v| (next.to_string(), v)),
-                _ => None,
-            };
-            if let Some((token, child)) = child {
+                let child = match (&**v, *kind) {
+                    (Value::Object(_), SourceKind::Schema) if hidden => None,
+                    (Value::Object(o), SourceKind::Schema) => {
+                        o.get(*next).map(|(k, c)| (k.as_str(), c, kind.child(k)))
+                    }
+                    (Value::Object(o), SourceKind::Map | SourceKind::Definitions) => o
+                        .get(*next)
+                        .map(|(k, c)| (k.as_str(), c, SourceKind::Schema)),
+                    (Value::Array(a), SourceKind::Array) => {
+                        a.get(*next).map(|c| ("", c, SourceKind::Schema))
+                    }
+                    _ => None,
+                };
+                let Some((key, child, child_kind)) = child else {
+                    stack.pop();
+                    continue;
+                };
+                let index = *next;
                 *next += 1;
-                self.work.spend(token.len()).map_err(Limit)?;
-                tokens.push(token);
-                stack.push((child, 0));
-            } else {
-                stack.pop();
-                tokens.pop();
+                if matches!(child_kind, SourceKind::Data)
+                    || !matches!(child, Value::Object(_) | Value::Array(_))
+                {
+                    continue;
+                }
+                let token = if matches!(kind, SourceKind::Array) {
+                    index.to_string()
+                } else {
+                    key.to_string()
+                };
+                self.work
+                    .spend(token.len().saturating_add(1))
+                    .map_err(Limit)?;
+                let p = pointer(path, &token, max).map_err(Limit)?;
+                stack.push((child, p, 0, child_kind));
             }
         }
-        found.ok_or(InvalidReference)
+        found.map(|(_, p)| p).ok_or(InvalidReference)
     }
     fn names(&self, v: &Value, p: usize) -> Result<Vec<String>, CompileError> {
         let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
@@ -1315,6 +1450,16 @@ impl<'a> Compiler<'a> {
                     }
                     self.refs.push((id, s.into()));
                 }
+                // Only the document root may name a resource. A nested `$id`
+                // would change the base for references and anchors below it.
+                "$id" if self.options.dialect == Dialect::Draft202012 => {
+                    v.as_str().ok_or_else(invalid)?;
+                    if path != 0 {
+                        return Err(
+                            self.error(p, CompileErrorKind::UnsupportedKeyword(key.clone()))
+                        );
+                    }
+                }
                 "default" | "example" => node.hints.push(v.clone()),
                 "examples" => {
                     if let Some(a) = v.as_array() {
@@ -1360,6 +1505,9 @@ impl<'a> Compiler<'a> {
             },
             kind,
         })?;
+        if !entry.is_empty() {
+            self.entry = Some((value, entry.into()));
+        }
         self.enqueue(value, path)?;
         let mut resolved = 0;
         loop {
@@ -1458,6 +1606,7 @@ impl Schema {
             size: 0,
             anchors: BTreeMap::new(),
             refs: Vec::new(),
+            entry: None,
             nodes: Vec::new(),
             annotations: Vec::new(),
             work: Work {
@@ -1526,7 +1675,7 @@ impl Schema {
             },
             truncated: false,
         };
-        if let Err(e) = eval.run(0, instance, "", 0, 0, true) {
+        if let Err(e) = eval.run(0, instance, 0, 0, true) {
             if eval.errors.len() >= eval.cap {
                 eval.errors.pop();
             }
@@ -2127,7 +2276,7 @@ impl Instance<'_> {
 struct Context<'a> {
     id: usize,
     value: Instance<'a>,
-    path: String,
+    path: InstancePath<'a>,
     depth: usize,
     refs: usize,
     collect: bool,
@@ -2136,7 +2285,7 @@ enum Check<'s, 'v> {
     Enter,
     Leaf,
     Prepare,
-    Child(usize, Instance<'v>, String, usize),
+    Child(usize, Instance<'v>, InstancePath<'v>, usize),
     Group {
         keyword: &'static str,
         ids: &'s [usize],
@@ -2178,10 +2327,16 @@ struct Eval<'a, 'w> {
     truncated: bool,
 }
 impl<'s> Eval<'s, '_> {
-    fn error(&self, id: usize, path: &str, keyword: &str, kind: ValidationKind) -> ValidationError {
+    fn error(
+        &self,
+        id: usize,
+        path: &InstancePath<'_>,
+        keyword: &str,
+        kind: ValidationKind,
+    ) -> ValidationError {
         let base = self.schema.paths.render(self.schema.nodes[id].path);
         ValidationError {
-            instance_path: path.into(),
+            instance_path: path.render(),
             schema_path: if keyword.is_empty() {
                 base.clone()
             } else {
@@ -2195,15 +2350,20 @@ impl<'s> Eval<'s, '_> {
         &mut self,
         n: usize,
         id: usize,
-        p: &str,
+        p: &InstancePath<'_>,
         keyword: &str,
     ) -> Result<(), ValidationError> {
         self.work
             .spend(n)
             .map_err(|s| self.error(id, p, keyword, ValidationKind::Limit(s)))
     }
-    fn child_path(&self, id: usize, p: &str, token: &str) -> Result<String, ValidationError> {
-        pointer(p, token, self.schema.options.limits.max_pointer_bytes)
+    fn child_path<'v>(
+        &self,
+        id: usize,
+        p: &InstancePath<'v>,
+        token: Token<'v>,
+    ) -> Result<InstancePath<'v>, ValidationError> {
+        p.child(token, self.schema.options.limits.max_pointer_bytes)
             .map_err(|s| self.error(id, p, "", ValidationKind::Limit(s)))
     }
     fn assertion(
@@ -2223,7 +2383,6 @@ impl<'s> Eval<'s, '_> {
         &mut self,
         id: usize,
         value: &Value,
-        p: &str,
         depth: usize,
         refs: usize,
         collect: bool,
@@ -2231,7 +2390,7 @@ impl<'s> Eval<'s, '_> {
         let result = self.evaluate(Context {
             id,
             value: Instance::Value(value),
-            path: p.into(),
+            path: InstancePath::default(),
             depth,
             refs,
             collect,
@@ -2441,7 +2600,7 @@ impl<'s> Eval<'s, '_> {
                             );
                         }
                     } else {
-                        let path = self.child_path(c.id, &c.path, &next.to_string())?;
+                        let path = self.child_path(c.id, &c.path, Token::Index(next))?;
                         child = Some(Context {
                             id: schema,
                             value: Instance::Value(&items[next]),
@@ -2504,7 +2663,7 @@ impl<'s> Eval<'s, '_> {
                     checks.push(Check::Child(
                         id,
                         Instance::Value(v),
-                        self.child_path(c.id, &c.path, &i.to_string())?,
+                        self.child_path(c.id, &c.path, Token::Index(i))?,
                         0,
                     ));
                 }
@@ -2592,7 +2751,7 @@ impl<'s> Eval<'s, '_> {
                     checks.push(Check::Child(
                         id,
                         Instance::Value(v),
-                        self.child_path(c.id, &c.path, name)?,
+                        self.child_path(c.id, &c.path, Token::Name(name))?,
                         0,
                     ));
                 }
@@ -2627,7 +2786,7 @@ impl<'s> Eval<'s, '_> {
         &mut self,
         id: usize,
         value: &Value,
-        p: &str,
+        p: &InstancePath<'_>,
         collect: bool,
     ) -> Result<bool, ValidationError> {
         let node = &self.schema.nodes[id];
@@ -2832,7 +2991,7 @@ impl Schema {
                 cap: 1,
                 truncated: false,
             }
-            .run(0, &value, "", 0, 0, false);
+            .run(0, &value, 0, 0, false);
             generator
                 .work
                 .spend(budget - work.left)
@@ -4483,5 +4642,140 @@ mod tests {
             assert_eq!(generated.get("b"), Some(&Value::from(7)));
             assert_eq!(generated.get("c"), Some(&Value::from("yes")));
         }
+    }
+
+    #[test]
+    fn review_multiple_of_large_exponents_is_exact() {
+        let kind = |source: &str, instance: &str| {
+            schema(source)
+                .validate(&value(instance))
+                .errors
+                .first()
+                .map(|e| e.kind.clone())
+        };
+        let fail = Some(ValidationKind::Assertion("multipleOf"));
+        assert_eq!(kind(r#"{"multipleOf":3}"#, "1e1000"), fail);
+        assert_eq!(kind(r#"{"multipleOf":3}"#, "1e10000"), fail);
+        assert_eq!(kind(r#"{"multipleOf":7}"#, "-1e9999"), fail);
+        assert_eq!(kind(r#"{"multipleOf":3}"#, "3e10000"), None);
+        assert_eq!(kind(r#"{"multipleOf":8}"#, "1e3"), None);
+        assert_eq!(kind(r#"{"multipleOf":8}"#, "1e2"), fail);
+        assert_eq!(kind(r#"{"multipleOf":1024}"#, "1e10000"), None);
+        assert_eq!(kind(r#"{"multipleOf":0.0625}"#, "1e-4"), fail);
+        assert_eq!(kind(r#"{"multipleOf":1e-10000}"#, "7e10000"), None);
+        // A long divisor costs O(len^2 log shift) work, beyond the per-pair budget of a tiny input.
+        let big = "123456789012345678901234567890123456789";
+        let wide = Options {
+            limits: Limits {
+                work_per_pair: 1 << 20,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        let s = Schema::compile_with(&value(&format!(r#"{{"multipleOf":{big}}}"#)), wide).unwrap();
+        let kind = |instance: String| {
+            s.validate(&value(&instance))
+                .errors
+                .first()
+                .map(|e| e.kind.clone())
+        };
+        assert_eq!(kind(format!("{big}e9000")), None);
+        assert_eq!(kind("1e9000".into()), fail);
+        assert_eq!(kind(format!("2{big}e9000")), fail);
+        assert_eq!(kind(format!("-{big}{big}e1")), None);
+        for exponent in 0..40 {
+            for divisor in [3u64, 6, 7, 12, 16, 25, 40, 625, 999_983] {
+                let s = schema(&format!(r#"{{"multipleOf":{divisor}}}"#));
+                let n = value(&format!("13e{exponent}"));
+                let expected = (0..exponent).fold(13u128 % u128::from(divisor), |r, _| {
+                    r * 10 % u128::from(divisor)
+                }) == 0;
+                assert_eq!(
+                    s.validate(&n).is_valid(),
+                    expected,
+                    "13e{exponent} / {divisor}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_anchors_are_found_only_in_schema_positions() {
+        for source in [
+            r##"{"examples":[{"$anchor":"foo","type":"integer"}],"$ref":"#foo"}"##,
+            r##"{"default":{"$anchor":"foo"},"$ref":"#foo"}"##,
+            r##"{"const":{"$anchor":"foo"},"$ref":"#foo"}"##,
+            r##"{"enum":[{"$anchor":"foo"}],"$ref":"#foo"}"##,
+            r##"{"x-data":{"$anchor":"foo"},"$ref":"#foo"}"##,
+            r##"{"properties":{"p":{"default":{"$anchor":"foo"}}},"$ref":"#foo"}"##,
+        ] {
+            assert_eq!(
+                Schema::compile(&value(source)).unwrap_err().kind,
+                CompileErrorKind::InvalidReference,
+                "{source}"
+            );
+        }
+        cases(
+            r##"{"$defs":{"a":{"$anchor":"foo","type":"string"}},"examples":[{"$anchor":"foo"}],"$ref":"#foo"}"##,
+            &[r#""a""#],
+            &["1"],
+        );
+        cases(
+            r##"{"properties":{"p":{"$anchor":"foo","type":"string"}},"items":{"$ref":"#foo"}}"##,
+            &[r#"["a"]"#, r#"{"p":"b"}"#],
+            &["[1]", r#"{"p":2}"#],
+        );
+        // An OpenAPI 3.0 Reference Object hides its siblings, anchors included.
+        let oas = value(
+            r##"{"allOf":[{"$ref":"#/$defs/s","$anchor":"foo"}],"$defs":{"s":{}},"not":{"$ref":"#foo"}}"##,
+        );
+        let options = Options {
+            dialect: Dialect::OpenApi30,
+            ..Options::default()
+        };
+        assert_eq!(
+            Schema::compile_with(&oas, options).unwrap_err().kind,
+            CompileErrorKind::InvalidReference
+        );
+        // compile_at searches the entry schema even when the document root is not a schema.
+        let document = value(
+            r##"{"info":{"x":{"$anchor":"n","type":"string"}},"components":{"schemas":{"Pet":{"$defs":{"n":{"$anchor":"n","type":"integer"}},"properties":{"id":{"$ref":"#n"}}}}}}"##,
+        );
+        let s =
+            Schema::compile_at(&document, "/components/schemas/Pet", Options::default()).unwrap();
+        assert!(s.validate(&value(r#"{"id":1}"#)).is_valid());
+        assert!(!s.validate(&value(r#"{"id":"x"}"#)).is_valid());
+    }
+
+    #[test]
+    fn review_nested_ids_fail_closed() {
+        // In 2020-12 the inner reference resolves to /$defs/a/$defs/b, a string.
+        let nested = r##"{"$defs":{"a":{"$id":"https://example.test/a","$defs":{"b":{"type":"string"}},"$ref":"#/$defs/b"},"b":{"type":"integer"}},"$ref":"#/$defs/a"}"##;
+        assert_eq!(
+            Schema::compile(&value(nested)).unwrap_err(),
+            CompileError {
+                schema_path: "/$defs/a/$id".into(),
+                kind: CompileErrorKind::UnsupportedKeyword("$id".into()),
+            }
+        );
+        // Anchors inside an embedded resource belong to it, not to the root.
+        let anchored = r##"{"$defs":{"a":{"$id":"https://example.test/a","$defs":{"b":{"$anchor":"x"}}}},"$ref":"#x"}"##;
+        assert_eq!(
+            Schema::compile(&value(anchored)).unwrap_err().kind,
+            CompileErrorKind::InvalidReference
+        );
+        cases(
+            r##"{"$id":"https://example.test/root","$defs":{"i":{"type":"integer"}},"$ref":"#/$defs/i"}"##,
+            &["1"],
+            &["\"1\""],
+        );
+        assert_eq!(
+            Schema::compile(&value(r#"{"$id":7}"#)).unwrap_err().kind,
+            CompileErrorKind::InvalidKeyword
+        );
+        let document = value(r#"{"components":{"schemas":{"Pet":{"$id":"pet"}}}}"#);
+        assert!(
+            Schema::compile_at(&document, "/components/schemas/Pet", Options::default()).is_err()
+        );
     }
 }
