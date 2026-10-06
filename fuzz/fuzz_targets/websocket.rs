@@ -1,25 +1,60 @@
 //! WebSocket frames, messages, close payloads, and handshake fields.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::websocket::{
     Close, Frame, Frames, Header, MAX_HEADERS, MAX_MESSAGE, Message, Messages, Opcode, Role, WriteError, check_request,
     check_response, request_headers,
 };
 use libfuzzer_sys::fuzz_target;
 
+fn bounded<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
+where
+    D::Item: PartialEq + core::fmt::Debug,
+    D::Error: Clone + PartialEq + core::fmt::Debug,
+{
+    let limit = make().capacity().checked_mul(2).unwrap();
+    contract::check_decode_with_alloc_limit(make, bytes, limit);
+}
+
+fn check_clone(mut decoder: Messages, data: &[u8]) {
+    let middle = data.len() / 2;
+    let mut at = 0;
+    loop {
+        match decoder.decode(&data[at..middle], false) {
+            Ok(Step::Item(_, used) | Step::Skip(used)) => at += used,
+            Ok(Step::Need | Step::End) => break,
+            Err(_) => return,
+        }
+    }
+    let mut cloned = decoder.clone();
+    loop {
+        let step = decoder.decode(&data[at..], true);
+        assert_eq!(cloned.decode(&data[at..], true), step);
+        assert_eq!(cloned.held(), decoder.held());
+        match step {
+            Ok(Step::Item(_, used) | Step::Skip(used)) => at += used,
+            _ => break,
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Close>(data);
+    if let Ok(close) = Close::parse(data) {
+        assert_eq!(close.to_bytes().unwrap(), data);
+    }
     let limit = data
         .first()
         .map_or(MAX_MESSAGE, |&b| if b & 1 == 0 { MAX_MESSAGE } else { usize::from(b) });
     for role in [Role::Server, Role::Client] {
         let frames = || Frames::with_limit(role, limit);
         let messages = || Messages::with_limit(role, limit);
-        contract::check_decode_with_alloc_limit(frames, data, 2 * frames().capacity());
-        contract::check_decode_with_alloc_limit(messages, data, 2 * messages().capacity());
+        bounded(frames, data);
+        bounded(messages, data);
         contract::check_decode_with_held_limit(messages, data, limit);
+        check_clone(messages(), data);
         let mask = if role == Role::Server { Some([1, 2, 3, 4]) } else { None };
         for message in decode_all(messages, data).0 {
             let frame = message.to_frame(mask).unwrap();
@@ -46,9 +81,12 @@ fuzz_target!(|data: &[u8]| {
             }
             assert_eq!(decode_all(messages, &bytes), (vec![message], None));
         }
-        for frame in decode_all(frames, data).0 {
+        let mut written = Vec::new();
+        for frame in decode_all(|| Frames::new(role), data).0 {
             contract::check_wire_value(&frame);
+            frame.write(&mut written).unwrap();
         }
+        assert!(data.starts_with(&written));
     }
     let payload: Vec<_> = data.iter().take(4096).copied().collect();
     for opcode in [Opcode::Text, Opcode::Binary, Opcode::Continuation, Opcode::Close, Opcode::Ping, Opcode::Pong] {

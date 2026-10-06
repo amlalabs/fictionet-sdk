@@ -467,8 +467,9 @@ pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 5;
 /// A trailing NVT CR waits for its next byte or EOF. Scan cursors keep
 /// bytewise input linear. All payload storage belongs to returned items.
 ///
-/// Recoverable failures remain [`Event::Error`] items. An oversized subnegotiation is discarded through IAC SE and reported
-/// as [`DecodeError::SubnegotiationTooLong`]. An interrupting command yields
+/// Recoverable failures are [`Event::Error`] items. An oversized subnegotiation
+/// is discarded through IAC SE and reported as
+/// [`DecodeError::SubnegotiationTooLong`]. An interrupting command yields
 /// [`DecodeError::SubnegotiationInterrupted`] first, then the command on
 /// the next call. Discarding holds only an option code, with no byte buffer.
 /// Partial commands and subnegotiations return [`Step::Need`] at EOF for
@@ -766,16 +767,16 @@ impl core::fmt::Display for WriteError {
 impl core::error::Error for WriteError {}
 
 impl Event {
-    /// Reads exactly one event in the given binary mode. Refuses diagnostic
-    /// items, partial units, trailing bytes, and input over [`MAX_EVENT_WIRE`].
-    /// Data is bounded by [`MAX_DATA`]; use [`Events`] for longer streams.
-    pub fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, EventParseError> {
+    fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, EventParseError> {
         if bytes.len() > MAX_EVENT_WIRE {
             return Err(EventParseError::TooLong);
         }
         let mut decoder = Events::with_data_limit(MAX_DATA);
         decoder.set_binary(binary);
-        match decoder.decode(bytes, true).map_err(EventParseError::Decode)? {
+        match decoder
+            .decode(bytes, true)
+            .map_err(EventParseError::Decode)?
+        {
             Step::Item(Event::Error(e), _) => Err(EventParseError::Decode(e)),
             Step::Item(event, used) if used == bytes.len() => Ok(event),
             Step::Item(_, _) => Err(EventParseError::Trailing),
@@ -831,6 +832,7 @@ impl Wire for Event {
 
     /// Reads exactly one NVT event. Refuses diagnostics, partial units,
     /// trailing bytes, and values over [`MAX_DATA`] or [`MAX_SUBNEGOTIATION`].
+    /// Input is bounded by [`MAX_EVENT_WIRE`]; use [`Events`] for longer streams.
     /// IAC escapes are undone. CR NUL becomes CR; CR LF stays unchanged.
     fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
         Self::parse_with(bytes, false)
@@ -858,6 +860,7 @@ impl Wire for BinaryEvent {
 
     /// Reads one binary event. Refuses diagnostics, partial units, trailing
     /// bytes, and values over [`MAX_DATA`] or [`MAX_SUBNEGOTIATION`].
+    /// Input is bounded by [`MAX_EVENT_WIRE`]; use [`Events`] for longer streams.
     fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
         Event::parse_with(bytes, true).map(Self)
     }
@@ -1904,21 +1907,27 @@ mod tests {
             contract::check_wire::<BinaryEvent>(&bytes);
             contract::check_wire::<Subnegotiation>(&bytes);
             let (events, _) = decode_all(make, &bytes);
-            for event in events {
-                if !matches!(event, Event::Error(_)) {
-                    if binary {
-                        contract::check_wire_value(&BinaryEvent(event.clone()));
-                    } else {
-                        contract::check_wire_value(&event);
-                    }
+            let kept: Vec<_> = events.into_iter().filter(|event| !matches!(event, Event::Error(_))).collect();
+            let mut written = Vec::new();
+            for event in &kept {
+                if binary {
+                    let event = BinaryEvent(event.clone());
+                    contract::check_wire_value(&event);
+                    event.write(&mut written).unwrap();
+                } else {
+                    contract::check_wire_value(event);
+                    event.write(&mut written).unwrap();
                 }
                 if let Event::Subnegotiation { option, data } = event
-                    && let Ok(sub) = Subnegotiation::parse_data(option, &data)
+                    && let Ok(sub) = Subnegotiation::parse_data(*option, data)
                 {
-                    assert_eq!(sub.to_event().unwrap(), Event::Subnegotiation { option, data });
+                    assert_eq!(sub.to_event().unwrap(), *event);
                     contract::check_wire_value(&sub);
                 }
             }
+            let (back, failure) = decode_all(make, &written);
+            assert_eq!(failure, None);
+            assert_eq!(merged(back), merged(kept));
             for option in [option::TERMINAL_TYPE, option::NAWS, option::LINEMODE] {
                 if let Ok(sub) = Subnegotiation::parse_data(option, &bytes) {
                     contract::check_wire_value(&sub);

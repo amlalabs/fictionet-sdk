@@ -53,6 +53,18 @@ impl Decode for Session {
     }
 }
 
+fn merged(events: Vec<Event>) -> Vec<Event> {
+    let mut out: Vec<Event> = Vec::new();
+    for event in events {
+        if let (Event::Data(data), Some(Event::Data(last))) = (&event, out.last_mut()) {
+            last.extend_from_slice(data);
+        } else {
+            out.push(event);
+        }
+    }
+    out
+}
+
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Event>(data);
     contract::check_wire::<BinaryEvent>(data);
@@ -66,21 +78,28 @@ fuzz_target!(|data: &[u8]| {
             };
             contract::check_decode_with_alloc_limit(make, data, 2 * telnet::MAX_EVENT_WIRE);
             contract::check_decode_with_held_limit(make, data, 0);
-            for event in decode_all(make, data).0 {
-                if !matches!(event, Event::Error(_)) {
-                    if binary {
-                        contract::check_wire_value(&BinaryEvent(event.clone()));
-                    } else {
-                        contract::check_wire_value(&event);
-                    }
+            let (events, _) = decode_all(make, data);
+            let kept: Vec<_> = events.into_iter().filter(|event| !matches!(event, Event::Error(_))).collect();
+            let mut written = Vec::new();
+            for event in &kept {
+                if binary {
+                    let event = BinaryEvent(event.clone());
+                    contract::check_wire_value(&event);
+                    event.write(&mut written).unwrap();
+                } else {
+                    contract::check_wire_value(event);
+                    event.write(&mut written).unwrap();
                 }
                 if let Event::Subnegotiation { option, data } = event
-                    && let Ok(sub) = Subnegotiation::parse_data(option, &data)
+                    && let Ok(sub) = Subnegotiation::parse_data(*option, data)
                 {
-                    assert_eq!(sub.to_event().unwrap(), Event::Subnegotiation { option, data });
+                    assert_eq!(sub.to_event().unwrap(), *event);
                     contract::check_wire_value(&sub);
                 }
             }
+            let (back, failure) = decode_all(make, &written);
+            assert_eq!(failure, None);
+            assert_eq!(merged(back), merged(kept));
         }
     }
     let mode = data.first().copied().unwrap_or_default();

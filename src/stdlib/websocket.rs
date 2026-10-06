@@ -325,17 +325,18 @@ impl Frame {
         Frame { fin: true, opcode, mask: None, payload }
     }
 
-    fn parse_prefix(b: &[u8]) -> Result<Option<(Frame, usize)>, FrameError> {
-        let Some(h) = Header::parse(b)? else { return Ok(None) };
-        let end = h.frame_len();
-        let Some(body) = b.get(h.header_len..end) else {
-            return Ok(None);
-        };
+    fn from_header(b: &[u8], h: Header) -> Option<Frame> {
+        let body = b.get(h.header_len..h.frame_len())?;
         let mut payload = body.to_vec();
         if let Some(key) = h.mask {
             apply_mask(&mut payload, key, 0);
         }
-        Ok(Some((Frame { fin: h.fin, opcode: h.opcode, mask: h.mask, payload }, end)))
+        Some(Frame {
+            fin: h.fin,
+            opcode: h.opcode,
+            mask: h.mask,
+            payload,
+        })
     }
 }
 
@@ -674,8 +675,11 @@ impl Wire for Frame {
     /// [`Frames`] checks mask direction; [`Messages`] also checks continuation
     /// order and text. A fragment may end inside a UTF-8 character.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(bytes).map_err(FrameParseError::Frame)? {
-            Some((frame, used)) if used == bytes.len() => {
+        let header = Header::parse(bytes)
+            .map_err(FrameParseError::Frame)?
+            .ok_or(FrameParseError::Truncated)?;
+        match Self::from_header(bytes, header) {
+            Some(frame) if header.frame_len() == bytes.len() => {
                 if frame.opcode == Opcode::Close {
                     parse_close(&frame.payload).map_err(FrameParseError::Close)?;
                 }
@@ -795,16 +799,14 @@ impl codec::Decode for Frames {
             return Ok(Step::End);
         }
         let Some(h) = self.header(input)? else { return Ok(Step::Need) };
-        let Some(body) = input.get(h.header_len..h.frame_len()) else { return Ok(Step::Need) };
-        let mut payload = body.to_vec();
-        if let Some(key) = h.mask {
-            apply_mask(&mut payload, key, 0);
-        }
+        let Some(frame) = Frame::from_header(input, h) else {
+            return Ok(Step::Need);
+        };
         if h.opcode == Opcode::Close {
-            parse_close(&payload).map_err(Error::Close)?;
+            parse_close(&frame.payload).map_err(Error::Close)?;
             self.closed = true;
         }
-        Ok(Step::Item(Frame { fin: h.fin, opcode: h.opcode, mask: h.mask, payload }, h.frame_len()))
+        Ok(Step::Item(frame, h.frame_len()))
     }
 }
 
@@ -2091,7 +2093,7 @@ mod tests {
         assert_eq!(count, n);
         assert_eq!(d.buffered(), 0);
         assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
-        // Feeding after some frames are taken out keeps the order.
+        // Pushing after some frames are taken out keeps the order.
         let mut d = Stream::new(Messages::new(Role::Client));
         push(&mut d, &[&PING[..], &HEL, &PING].concat());
         assert_eq!(d.next(), Some(Ok(Message::Ping(b"Hello".to_vec()))));
@@ -2335,12 +2337,18 @@ mod tests {
                 let frame = message.to_frame(mask).unwrap();
                 assert_eq!(decode(role, &frame.to_bytes().unwrap()), (vec![message], None));
             }
+            let mut written = Vec::new();
             for frame in decode_all(|| Frames::new(role), data).0 {
                 contract::check_wire_value(&frame);
+                frame.write(&mut written).unwrap();
             }
+            assert!(data.starts_with(&written));
         }
         contract::check_wire::<Frame>(data);
         contract::check_wire::<Close>(data);
+        if let Ok(close) = Close::parse(data) {
+            assert_eq!(close.to_bytes().unwrap(), data);
+        }
         let _ = Header::parse(data);
     }
 
@@ -2441,7 +2449,7 @@ mod tests {
         let mut d = Stream::new(Messages::with_limit(Role::Client, 1));
         let _ = d.push(&vec![0x82; 1 << 20]);
         assert!(d.buffered() <= MAX_HEADER_LEN + MAX_CONTROL_PAYLOAD, "{}", d.buffered());
-        // Repeated pushs without taking messages out stop growing.
+        // Repeated pushes without taking messages out stop growing.
         let mut d = Stream::new(Messages::new(Role::Client));
         let chunk = [0x8a, 0x00].repeat(1 << 22);
         for _ in 0..3 {
