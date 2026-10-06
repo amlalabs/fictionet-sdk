@@ -97,6 +97,8 @@ pub const MAX_PACKET: usize = u16::MAX as usize;
 pub const MAX_DATA: usize = MAX_PACKET - HEADER_LEN;
 /// The input capacity of [`Frames`]: 65559 bytes, including the header
 /// and every data length the 16-bit length field can name.
+/// This exceeds [`MAX_PACKET`] so framing can consume an oversized packet.
+/// [`Packet::check`] then reports the protocol length error.
 pub const FRAMES_CAPACITY: usize = HEADER_LEN + u16::MAX as usize;
 /// The most items one [`Cpf`] may hold.
 pub const MAX_CPF_ITEMS: usize = 64;
@@ -569,7 +571,9 @@ impl Cpf {
 /// reply. It fills a [`CpfItem`] of type
 /// [`LIST_IDENTITY_RESPONSE`](item::LIST_IDENTITY_RESPONSE), the one item
 /// of the reply's [`Cpf`]. The socket address fields are big-endian on the
-/// wire, unlike everything else here.
+/// wire, unlike everything else here. Parsing ignores the eight reserved
+/// socket-address bytes. Writing always emits zeros for them, so a
+/// non-canonical input may re-encode to different bytes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Identity {
     /// The encapsulation protocol version; [`PROTOCOL_VERSION`] today.
@@ -2810,6 +2814,13 @@ mod tests {
         .concat();
         assert_eq!(bytes, want);
         assert_eq!(Identity::parse(&bytes), Ok(id.clone()));
+        // Reserved socket-address bytes are ignored and written as zeros.
+        let mut noncanonical = bytes.clone();
+        noncanonical[10..18].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        let parsed = <Identity as Wire>::parse(&noncanonical).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(parsed.to_bytes().unwrap(), bytes);
+        contract::check_wire::<Identity>(&noncanonical);
         for n in 0..bytes.len() {
             assert_eq!(
                 Identity::parse(&bytes[..n]),
@@ -3041,6 +3052,10 @@ mod tests {
     /// writes back to bytes that read the same, and a stream fed in pieces
     /// finds what one fed all at once finds.
     fn check(data: &[u8]) {
+        assert_eq!(
+            Stream::new(Frames).push(data),
+            data.len().min(FRAMES_CAPACITY)
+        );
         contract::check_decode(Frames::new, data);
         let mut stream = Stream::new(Frames);
         let mut packets = Vec::new();
@@ -3138,20 +3153,18 @@ mod tests {
                 read += 1;
             }
             check(&data);
-            // The CIP readers must not panic on any bytes either.
-            let _ = Cpf::parse(&data);
-            let _ = SendData::parse(&data);
-            let _ = MessageRequest::parse(&data);
-            let _ = MessageResponse::parse(&data);
+            // Every parsed CIP value must write and read back unchanged.
+            contract::check_wire::<Cpf>(&data);
+            contract::check_wire::<SendData>(&data);
+            contract::check_wire::<MessageRequest>(&data);
+            contract::check_wire::<MessageResponse>(&data);
             let _ = parse_path(&data);
-            let _ = ForwardOpenRequest::parse(&data);
-            let _ = ForwardOpenResponse::parse(&data);
-            let _ = ForwardCloseRequest::parse(&data);
-            let _ = ForwardCloseResponse::parse(&data);
-            let _ = RegisterSession::parse(&data);
-            if let Ok(id) = Identity::parse(&data) {
-                assert_eq!(Identity::parse(&id.to_bytes().unwrap()), Ok(id));
-            }
+            contract::check_wire::<ForwardOpenRequest>(&data);
+            contract::check_wire::<ForwardOpenResponse>(&data);
+            contract::check_wire::<ForwardCloseRequest>(&data);
+            contract::check_wire::<ForwardCloseResponse>(&data);
+            contract::check_wire::<RegisterSession>(&data);
+            contract::check_wire::<Identity>(&data);
         }
         assert!(read > 500, "{read} packets read");
     }

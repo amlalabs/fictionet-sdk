@@ -6,10 +6,11 @@ use fictionet::stdlib::codec::{Stream, Wire, pump};
 use fictionet::stdlib::rdp::Frames;
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
-    Connection, ConnectionKind, DataBlock, FailureCode, Frame, GccConference, INFO_RESERVED,
-    INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA, MAX_EXTRA_INFO,
-    MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING, MAX_PDU, MAX_PER_LENGTH, McsConnect,
-    McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload, read_data, write_data,
+    Connection, ConnectionKind, DataBlock, DataBlocks, FailureCode, Frame, GccConference,
+    INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA,
+    MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING, MAX_PDU,
+    MAX_PER_LENGTH, McsConnect, McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload,
+    read_data, write_data,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -51,10 +52,11 @@ fn pdu(data: &[u8]) {
     roundtrip!(DataBlock);
     roundtrip!(GccConference);
     roundtrip!(McsConnect);
-    if let Ok(blocks) = <Vec<DataBlock> as Wire>::parse(data) {
+    check_wire::<DataBlocks>(data);
+    if let Ok(blocks) = DataBlocks::parse(data) {
         let bytes = blocks.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_GCC_DATA);
-        assert_eq!(<Vec<DataBlock> as Wire>::parse(&bytes), Ok(blocks));
+        assert_eq!(DataBlocks::parse(&bytes), Ok(blocks));
     }
     if let Ok(value) = <McsPdu as Wire>::parse(data) {
         let bytes = value.to_bytes().unwrap();
@@ -175,7 +177,7 @@ fn built(data: &[u8]) {
     check!(DataBlock, block);
     check!(
         GccConference,
-        GccConference::Request(vec![DataBlock::ClientMultitransport(word(0))])
+        GccConference::Request(DataBlocks(vec![DataBlock::ClientMultitransport(word(0))]))
     );
     check!(
         GccConference,
@@ -183,7 +185,7 @@ fn built(data: &[u8]) {
             node_id: word(0),
             tag: word(4) as i32,
             result: byte(8),
-            blocks: vec![DataBlock::ServerMultitransport(word(9))],
+            blocks: DataBlocks(vec![DataBlock::ServerMultitransport(word(9))]),
         }
     );
     let mcs = McsPdu::SendData {

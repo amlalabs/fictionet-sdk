@@ -155,6 +155,7 @@ served.
 The `dnp3`, `iec104`, `enip`, `opcua`, and `rdp` targets drive `Frames`
 through `codec::Stream` and `codec::contract`. OPC UA also checks `Messages`
 with its assembly limit. Typed values use `Wire` writer contracts.
+RDP uses `DataBlocks` for bounded GCC block sequences.
 The module docs describe the APIs:
 [DNP3](../src/stdlib/dnp3.rs), [IEC 104](../src/stdlib/iec104.rs),
 [EtherNet/IP](../src/stdlib/enip.rs), [OPC UA](../src/stdlib/opcua.rs), and

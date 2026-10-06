@@ -2730,7 +2730,8 @@ fn follows(prev: u32, got: u32) -> bool {
 /// Input stays in the stream. Only an unfinished message body is held here.
 /// EOF during an assembly returns [`ChunkError::Incomplete`], including when
 /// its body is empty. [`Decode::held`] counts body bytes, so zero held bytes
-/// does not imply a complete message. Set receive limits between messages
+/// does not imply a complete message. Use [`Messages::is_between_messages`]
+/// to check for an unfinished assembly. Set receive limits between messages
 /// through [`Stream::decoder`](super::codec::Stream::decoder).
 #[derive(Debug, Default)]
 pub struct Messages {
@@ -2753,10 +2754,19 @@ impl Messages {
         }
     }
 
-    /// Sets receive limits between messages. Already consumed chunks are
-    /// not checked again. A smaller limit applies to the next chunk.
+    /// Sets receive limits. Use [`Self::is_between_messages`] to check for
+    /// an unfinished assembly first. Already consumed chunks are not checked
+    /// again. A smaller limit applies to the next chunk.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
+    }
+
+    /// Returns true when no partial message assembly is held.
+    ///
+    /// Empty intermediate MSG chunks still start an assembly, even when
+    /// [`Decode::held`] is zero. This does not inspect unread stream bytes.
+    pub fn is_between_messages(&self) -> bool {
+        self.partial.is_none()
     }
 
     /// Returns the supplied receive limits.
@@ -4041,11 +4051,8 @@ mod tests {
     #[test]
     fn hello_and_acknowledge() {
         let bytes = hel_bytes(65536, 65536, b"opc.tcp://a:4840");
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
         let Some(Ok(Message::Hello(h))) = d.next() else {
             panic!()
         };
@@ -4078,11 +4085,8 @@ mod tests {
             .map(wire_chunks)
             .unwrap();
         assert_eq!(ack_bytes[..8], [b'A', b'C', b'K', b'F', 28, 0, 0, 0]);
-        let mut c = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &ack_bytes;
-            assert_eq!(c.push(input), input.len());
-        }
+        let mut c = Stream::new(Messages::new());
+        assert_eq!(c.push(&ack_bytes), ack_bytes.len());
         assert_eq!(c.next(), Some(Ok(Message::Acknowledge(ack))));
         // The client's small send buffer caps what the server takes.
         let small = Hello {
@@ -4091,11 +4095,9 @@ mod tests {
         };
         assert_eq!(small.acknowledge(&ours).receive_buffer_size, 8192);
         // Buffers below the minimum are refused both ways.
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &hel_bytes(1024, 65536, b"");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &hel_bytes(1024, 65536, b"");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::BufferSize(1024))))
@@ -4124,13 +4126,10 @@ mod tests {
                 .map(wire_chunks),
             Err(EncodeError::BufferSize(100))
         );
-        let mut c = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
+        let mut c = Stream::new(Messages::new());
         let mut low_ack = ack_bytes.clone();
         low_ack[12..16].copy_from_slice(&le32(10));
-        {
-            let input = &low_ack;
-            assert_eq!(c.push(input), input.len());
-        }
+        assert_eq!(c.push(&low_ack), low_ack.len());
         assert_eq!(
             c.next(),
             Some(Err(Fail::Protocol(ChunkError::BufferSize(10))))
@@ -4154,18 +4153,12 @@ mod tests {
             .chunks(&Limits::default())
             .map(wire_chunks)
             .unwrap();
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(Message::Hello(longest))));
         let bad = hel_bytes(8192, 8192, &[b'a'; MAX_URL_LEN + 1]);
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bad;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bad), bad.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::Decode(
@@ -4177,11 +4170,8 @@ mod tests {
         let mut trailing = hel_bytes(8192, 8192, b"x");
         trailing.push(0);
         trailing[4] += 1;
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &trailing;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&trailing), trailing.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::Decode(
@@ -4211,14 +4201,8 @@ mod tests {
         let rh_bytes = rh.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(rh_bytes.len() as u32, MAX_HANDSHAKE_SIZE);
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &rh_bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.push(&rh_bytes), rh_bytes.len());
         assert_eq!(all(&mut d), [Ok(e), Ok(rh)]);
         let long = ErrorMessage {
             error: StatusCode::GOOD,
@@ -4231,11 +4215,9 @@ mod tests {
             Err(EncodeError::TooLong)
         );
         // An ERR missing its reason.
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &[b'E', b'R', b'R', b'F', 12, 0, 0, 0, 0, 0, 0, 0];
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &[b'E', b'R', b'R', b'F', 12, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::Decode(
@@ -4358,11 +4340,8 @@ mod tests {
             bytes[16..16 + SECURITY_POLICY_NONE.len()],
             *SECURITY_POLICY_NONE.as_bytes()
         );
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(opn)));
 
         let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
@@ -4435,11 +4414,8 @@ mod tests {
         });
         let bytes = clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(bytes[..4], *b"CLOF");
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(clo)));
         // A CLO too large for one chunk.
         let big = Message::Secure(SecureMessage {
@@ -4501,15 +4477,11 @@ mod tests {
             24
         );
         // A legacy wrap below 1024 is accepted.
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 3, 5, b"ab");
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &msg_chunk(b'F', 7, 1, 2, 5, b"cd");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 3, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 2, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Ok(msg(1, LEGACY_WRAP + 3, 5, b"abcd".to_vec())))
@@ -4518,17 +4490,13 @@ mod tests {
 
     #[test]
     fn aborts() {
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'C', 7, 1, 10, 5, b"part");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, 10, 5, b"part");
+        assert_eq!(d.push(input), input.len());
         let mut tail = le32(StatusCode::BAD_RESPONSE_TOO_LARGE.0).to_vec();
         tail.extend_from_slice(&[1, 0, 0, 0, b'x']);
-        {
-            let input = &msg_chunk(b'A', 7, 1, 11, 5, &tail);
-            assert_eq!(d.push(input), input.len());
-        }
+        let input = &msg_chunk(b'A', 7, 1, 11, 5, &tail);
+        assert_eq!(d.push(input), input.len());
         let abort = Abort {
             channel_id: 7,
             token_id: 1,
@@ -4539,27 +4507,20 @@ mod tests {
         };
         assert_eq!(d.next(), Some(Ok(Message::Abort(abort.clone()))));
         // The next message starts afresh.
-        {
-            let input = &msg_chunk(b'F', 7, 1, 12, 6, b"z");
-            assert_eq!(d.push(input), input.len());
-        }
+        let input = &msg_chunk(b'F', 7, 1, 12, 6, b"z");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(d.next(), Some(Ok(msg(1, 12, 6, b"z".to_vec()))));
         let bytes = Message::Abort(abort.clone())
             .chunks(&Limits::default())
             .map(wire_chunks)
             .unwrap();
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(Message::Abort(abort))));
         // An abort with no status.
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'A', 7, 1, 1, 1, &[]);
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'A', 7, 1, 1, 1, &[]);
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::Decode(
@@ -4641,13 +4602,9 @@ mod tests {
             ),
         ];
         for (chunks, limits, want) in cases {
-            let mut d =
-                Stream::with_buffer(Messages::with_limits(limits), MAX_BUFFER_SIZE as usize);
+            let mut d = Stream::new(Messages::with_limits(limits));
             for c in &chunks {
-                {
-                    let input = c;
-                    assert_eq!(d.push(input), input.len());
-                }
+                assert_eq!(d.push(c), c.len());
             }
             let got = all(&mut d);
             assert_eq!(
@@ -4678,11 +4635,9 @@ mod tests {
             opn.chunks(&small).map(wire_chunks),
             Err(EncodeError::TooLong)
         );
-        let mut d = Stream::with_buffer(Messages::with_limits(small), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::with_limits(small));
+        let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::MessageTooLarge(5))))
@@ -4708,10 +4663,7 @@ mod tests {
         let ok = msg(1, 0, 0, vec![0; 16_000]);
         let bytes = ok.chunks(&peer).map(wire_chunks).unwrap();
         let mut d = Stream::with_buffer(Messages::with_limits(peer), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(ok)));
         // The module's caps apply over what a peer says.
         let huge = Limits {
@@ -4755,10 +4707,7 @@ mod tests {
         };
         let ack = hello.acknowledge(&ours);
         assert_eq!((ack.max_message_size, ack.max_chunk_count), (100, 2));
-        let mut d = Stream::with_buffer(
-            Messages::with_limits(ack.limits()),
-            MAX_BUFFER_SIZE as usize,
-        );
+        let mut d = Stream::new(Messages::with_limits(ack.limits()));
         assert_eq!(d.decoder().limits().message_limit(), ack.max_message_size);
     }
 
@@ -4767,15 +4716,11 @@ mod tests {
         // Part 6: a legacy sequence number shall not wrap until it is
         // greater than 4 294 966 271.
         assert_eq!(LEGACY_WRAP, 4_294_966_271);
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP, 5, b"ab");
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &msg_chunk(b'F', 7, 1, 2, 5, b"cd");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 2, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::Sequence {
@@ -4783,28 +4728,20 @@ mod tests {
                 got: 2
             })))
         );
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab");
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &msg_chunk(b'F', 7, 1, 1023, 5, b"cd");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 1023, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             d.next(),
             Some(Ok(msg(1, LEGACY_WRAP + 1, 5, b"abcd".to_vec())))
         );
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab");
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &msg_chunk(b'F', 7, 1, 1024, 5, b"cd");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 1024, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
         assert!(matches!(
             d.next(),
             Some(Err(Fail::Protocol(ChunkError::Sequence { .. })))
@@ -4820,11 +4757,8 @@ mod tests {
         err.extend_from_slice(&le32(StatusCode::BAD_TCP_INTERNAL_ERROR.0));
         err.extend_from_slice(&le32(long.len() as u32));
         err.extend_from_slice(&long);
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &err;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&err), err.len());
         let want = ErrorMessage {
             error: StatusCode::BAD_TCP_INTERNAL_ERROR,
             reason: String::new(),
@@ -4833,11 +4767,9 @@ mod tests {
         let mut tail = le32(StatusCode::BAD_RESPONSE_TOO_LARGE.0).to_vec();
         tail.extend_from_slice(&le32(long.len() as u32));
         tail.extend_from_slice(&long);
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'A', 7, 1, 1, 5, &tail);
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'A', 7, 1, 1, 5, &tail);
+        assert_eq!(d.push(input), input.len());
         let Some(Ok(Message::Abort(a))) = d.next() else {
             panic!()
         };
@@ -4847,14 +4779,12 @@ mod tests {
             error: StatusCode::GOOD,
             reason: "r".repeat(MAX_REASON_LEN),
         };
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &Message::Error(ok.clone())
-                .chunks(&Limits::default())
-                .map(wire_chunks)
-                .unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &Message::Error(ok.clone())
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        assert_eq!(d.push(input), input.len());
         assert_eq!(d.next(), Some(Ok(Message::Error(ok))));
     }
 
@@ -4863,11 +4793,9 @@ mod tests {
         // Part 6: the endpoint URL shall be less than 4096 bytes, and a
         // server answers a longer one with Bad_TcpEndpointUrlInvalid.
         assert_eq!(MAX_URL_LEN, 4095);
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &hel_bytes(8192, 8192, &[b'a'; 4096]);
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &hel_bytes(8192, 8192, &[b'a'; 4096]);
+        assert_eq!(d.push(input), input.len());
         let Fail::Protocol(e) = d.next().unwrap().unwrap_err() else {
             panic!("expected protocol error")
         };
@@ -5134,6 +5062,12 @@ mod tests {
                     assert!(stream.next().unwrap().is_err());
                 }
             }
+            let mut stream = Stream::new(Messages::new());
+            let mut got = Vec::new();
+            pump(&mut stream, &bytes, |message| got.push(message)).unwrap();
+            stream.end();
+            assert!(stream.next().is_none());
+            assert_eq!(got.len(), 1);
         }
         // As values, prefixes end too soon.
         let req = open_request().to_bytes().unwrap();
@@ -5189,7 +5123,7 @@ mod tests {
             );
         }
         let started = std::time::Instant::now();
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
+        let mut d = Stream::new(Messages::new());
         let mut n = 0;
         pump(&mut d, &stream, |_| n += 1).unwrap();
         assert_eq!(n, 100_000);
@@ -5203,12 +5137,10 @@ mod tests {
 
     #[test]
     fn module_example() {
-        let mut server = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
+        let mut server = Stream::new(Messages::new());
         let url = b"opc.tcp://plc:4840";
-        {
-            let input = &hel_bytes(65536, 65536, url);
-            assert_eq!(server.push(input), input.len());
-        }
+        let input = &hel_bytes(65536, 65536, url);
+        assert_eq!(server.push(input), input.len());
         let Some(Ok(Message::Hello(hello))) = server.next() else {
             panic!()
         };
@@ -5240,10 +5172,8 @@ mod tests {
             request_id: 1,
             body: request.to_bytes().unwrap(),
         });
-        {
-            let input = &opn.chunks(&ack.limits()).map(wire_chunks).unwrap();
-            assert_eq!(server.push(input), input.len());
-        }
+        let input = &opn.chunks(&ack.limits()).map(wire_chunks).unwrap();
+        assert_eq!(server.push(input), input.len());
         let Some(Ok(Message::Secure(msg))) = server.next() else {
             panic!()
         };
@@ -5331,15 +5261,11 @@ mod tests {
 
     #[test]
     fn sequence_numbers_follow_across_messages() {
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'F', 7, 1, 10, 1, b"a");
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &msg_chunk(b'F', 7, 1, 10, 2, b"b");
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'F', 7, 1, 10, 1, b"a");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 10, 2, b"b");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             all(&mut d),
             [
@@ -5359,17 +5285,13 @@ mod tests {
             request_id: 1,
             body: vec![],
         });
-        {
-            let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &msg(1, 6, 2, vec![0; 9000])
-                .chunks(&Limits::default())
-                .map(wire_chunks)
-                .unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
+        let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        let input = &msg(1, 6, 2, vec![0; 9000])
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        assert_eq!(d.push(input), input.len());
         let clo = Message::Secure(SecureMessage {
             kind: SecureKind::Close { token_id: 1 },
             channel_id: 7,
@@ -5377,20 +5299,14 @@ mod tests {
             request_id: 3,
             body: vec![],
         });
-        {
-            let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
+        let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
         assert!(all(&mut d).iter().all(Result::is_ok));
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
-        {
-            let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
             all(&mut d).last(),
             Some(&Err(Fail::Protocol(ChunkError::Sequence {
@@ -5398,6 +5314,26 @@ mod tests {
                 got: 8
             })))
         );
+    }
+
+    #[test]
+    fn messages_report_empty_partial_assemblies() {
+        let mut stream = Stream::new(Messages::new());
+        assert!(stream.decoder().is_between_messages());
+        for sequence in [1, 2] {
+            let chunk = msg_chunk(b'C', 7, 1, sequence, 5, b"");
+            assert_eq!(stream.push(&chunk), chunk.len());
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.buffered(), 0);
+            assert_eq!(stream.held(), 0);
+            assert!(!stream.decoder().is_between_messages());
+        }
+        let chunk = msg_chunk(b'F', 7, 1, 3, 5, b"");
+        assert_eq!(stream.push(&chunk), chunk.len());
+        assert_eq!(stream.next(), Some(Ok(msg(1, 1, 5, vec![]))));
+        assert!(stream.decoder().is_between_messages());
+        stream.end();
+        assert_eq!(stream.next(), None);
     }
 
     #[test]
@@ -5757,11 +5693,8 @@ mod tests {
             bytes.splice(at..at + 8, fields.into_bytes().unwrap());
             let size = bytes.len() as u32;
             bytes[4..8].copy_from_slice(&le32(size));
-            let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-            {
-                let input = &bytes;
-                assert_eq!(d.push(input), input.len());
-            }
+            let mut d = Stream::new(Messages::new());
+            assert_eq!(d.push(&bytes), bytes.len());
             assert_eq!(
                 d.next(),
                 Some(Err(Fail::Protocol(ChunkError::Decode(
@@ -5780,11 +5713,8 @@ mod tests {
             .chunks(&Limits::default())
             .map(wire_chunks)
             .unwrap();
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &bytes;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.next(), Some(Ok(opn(empty))));
         let signed = AsymmetricHeader {
             policy_uri: "urn:p".into(),
@@ -5804,11 +5734,8 @@ mod tests {
         // Part 6, 7.1.2.2: receivers ignore the fourth byte of a HEL.
         let mut hel = hel_bytes(8192, 8192, b"x");
         hel[3] = 0;
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &hel;
-            assert_eq!(d.push(input), input.len());
-        }
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&hel), hel.len());
         let Some(Ok(m)) = d.next() else { panic!() };
         // Writers use 'F'.
         assert_eq!(
@@ -5944,10 +5871,7 @@ mod tests {
                     .expect("a message read can be written");
                 let mut d =
                     Stream::with_buffer(Messages::with_limits(limits), MAX_BUFFER_SIZE as usize);
-                {
-                    let input = &out;
-                    assert_eq!(d.push(input), input.len());
-                }
+                assert_eq!(d.push(&out), out.len());
                 assert_eq!(d.next().as_ref(), Some(&Ok(m.clone())));
                 if let Message::Secure(s) = m {
                     contract::check_wire::<Service>(&s.body);

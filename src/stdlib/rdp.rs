@@ -26,7 +26,7 @@
 //! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
 //! The inherent parser reads a prefix.
 //! [`Connection::to_packet`] and [`write_data`] construct typed TPKT packets.
-//! `Vec<DataBlock>` implements [`Wire`] for a bounded GCC block sequence.
+//! [`DataBlocks`] implements [`Wire`] for a bounded GCC block sequence.
 //!
 //! The wire definitions and examples are in [MS-RDPBCGR sections 2.2.1,
 //! 2.2.8 and 4.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/).
@@ -888,6 +888,7 @@ pub struct Monitor {
 /// A GCC client or server user-data block. Known blocks have typed fields;
 /// unknown blocks remain bytes. Session-level requirements, such as one
 /// primary monitor and matching channel counts, belong to the caller.
+/// Use [`DataBlocks`] to parse or write a sequence of blocks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DataBlock {
     /// CS_CORE (0xc001).
@@ -1118,29 +1119,35 @@ impl DataBlock {
     }
 }
 
-/// Reads a complete sequence of GCC blocks, up to [`MAX_BLOCKS`] blocks
-/// and [`MAX_GCC_DATA`] aggregate bytes. Order and duplicates are preserved.
-fn read_blocks(b: &[u8]) -> Result<Vec<DataBlock>, Error> {
-    bound(b.len(), MAX_GCC_DATA, "GCC blocks")?;
-    let mut r = Read::new(b);
-    let mut blocks = Vec::with_capacity(MAX_BLOCKS);
-    while !r.rest().is_empty() {
-        bound(blocks.len() + 1, MAX_BLOCKS, "GCC block count")?;
-        let mut h = Read::new(r.rest());
-        h.le16()?;
-        let n = usize::from(h.le16()?);
-        check(n >= 4, "GCC block length")?;
-        blocks.push(DataBlock::parse(r.take(n)?)?);
-    }
-    Ok(blocks)
-}
+/// A GCC block sequence that preserves order and duplicates.
+///
+/// [`Wire`] reads and writes at most [`MAX_BLOCKS`] blocks and
+/// [`MAX_GCC_DATA`] aggregate bytes.
+///
+/// ```
+/// use fictionet::stdlib::codec::Wire;
+/// use fictionet::stdlib::rdp::{DataBlock, DataBlocks};
+///
+/// let bytes = [0x06, 0xc0, 0x08, 0x00, 0, 0, 0, 0];
+/// let blocks = DataBlocks::parse(&bytes)?;
+/// assert_eq!(blocks.0, vec![DataBlock::ClientMessageChannel]);
+/// let mut out = Vec::new();
+/// blocks.write(&mut out)?;
+/// assert_eq!(out, bytes);
+/// # Ok::<(), fictionet::stdlib::rdp::Error>(())
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DataBlocks(
+    /// The blocks in wire order.
+    pub Vec<DataBlock>,
+);
 
 /// An RDP GCC Conference Create request or response, including ConnectData.
 /// RDP's fixed conference name, OID and H.221 key are encoded automatically.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GccConference {
     /// Client request; the whole encoding is at most [`MAX_GCC_REQUEST`].
-    Request(Vec<DataBlock>),
+    Request(DataBlocks),
     /// Server response, with at most [`MAX_GCC_DATA`] bytes of blocks.
     Response {
         /// GCC node identifier, 1001 through 65536 inclusive.
@@ -1150,7 +1157,7 @@ pub enum GccConference {
         /// GCC result enumeration, 0 through 4; zero means success.
         result: u8,
         /// Server data blocks, up to [`MAX_BLOCKS`].
-        blocks: Vec<DataBlock>,
+        blocks: DataBlocks,
     },
 }
 impl GccConference {
@@ -1184,9 +1191,9 @@ impl GccConference {
         r.expect(&[1, 0xc0, 0])?;
         r.expect(if kind == 0 { b"Duca" } else { b"McDn" })?;
         let length = r.per_len()?;
-        let blocks = read_blocks(r.take(length)?)?;
+        let blocks = DataBlocks::parse(r.take(length)?)?;
         r.finish()?;
-        check_block_direction(&blocks, kind == 0)?;
+        check_block_direction(&blocks.0, kind == 0)?;
         if kind == 0 {
             Ok(Self::Request(blocks))
         } else {
@@ -1870,21 +1877,32 @@ impl ActivePdu {
     }
 }
 
-impl Wire for Vec<DataBlock> {
+impl Wire for DataBlocks {
     type ParseError = Error;
     type WriteError = Error;
 
     /// Reads a complete GCC block sequence, preserving order and duplicates.
     /// Accepts at most [`MAX_BLOCKS`] blocks and [`MAX_GCC_DATA`] bytes.
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        read_blocks(b)
+        bound(b.len(), MAX_GCC_DATA, "GCC blocks")?;
+        let mut r = Read::new(b);
+        let mut blocks = Vec::with_capacity(MAX_BLOCKS);
+        while !r.rest().is_empty() {
+            bound(blocks.len() + 1, MAX_BLOCKS, "GCC block count")?;
+            let mut h = Read::new(r.rest());
+            h.le16()?;
+            let n = usize::from(h.le16()?);
+            check(n >= 4, "GCC block length")?;
+            blocks.push(DataBlock::parse(r.take(n)?)?);
+        }
+        Ok(Self(blocks))
     }
 
     /// Appends a bounded block sequence. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        bound(self.len(), MAX_BLOCKS, "GCC block count")?;
+        bound(self.0.len(), MAX_BLOCKS, "GCC block count")?;
         let mut bytes = Vec::new();
-        for block in self {
+        for block in &self.0 {
             block.write(&mut bytes)?;
             bound(bytes.len(), MAX_GCC_DATA, "GCC blocks")?;
         }
@@ -2078,7 +2096,7 @@ impl Wire for GccConference {
             Self::Request(b) => (b, true),
             Self::Response { blocks, .. } => (blocks, false),
         };
-        check_block_direction(blocks, request)?;
+        check_block_direction(&blocks.0, request)?;
         let blocks = blocks.to_bytes()?;
         let mut body = Write::new(MAX_GCC_RESPONSE);
         match self {
@@ -2577,7 +2595,7 @@ mod tests {
             target: params(),
             minimum: params(),
             maximum: params(),
-            conference: GccConference::Request(client_blocks()),
+            conference: GccConference::Request(DataBlocks(client_blocks())),
         }
     }
     fn response() -> McsConnect {
@@ -2589,7 +2607,7 @@ mod tests {
                 node_id: 1002,
                 tag: 1,
                 result: 0,
-                blocks: server_blocks(),
+                blocks: DataBlocks(server_blocks()),
             },
         }
     }
@@ -2694,11 +2712,8 @@ mod tests {
         roundtrip!(LicenseError);
         roundtrip!(CapabilitySet);
         roundtrip!(ActivePdu);
-        if let Ok(blocks) = <Vec<DataBlock> as Wire>::parse(b) {
-            assert_eq!(
-                <Vec<DataBlock> as Wire>::parse(&blocks.to_bytes().unwrap()),
-                Ok(blocks)
-            );
+        if let Ok(blocks) = DataBlocks::parse(b) {
+            assert_eq!(DataBlocks::parse(&blocks.to_bytes().unwrap()), Ok(blocks));
         }
         if let Ok(Some((f, n))) = Frame::parse(b) {
             assert!(n <= b.len());
@@ -2878,13 +2893,13 @@ mod tests {
         };
         assert_eq!(target.max_pdu_size, 65535);
         assert_eq!(maximum.max_user_ids, 64535);
-        assert_eq!(blocks.len(), 4);
-        let DataBlock::ClientCore(c) = &blocks[0] else {
+        assert_eq!(blocks.0.len(), 4);
+        let DataBlock::ClientCore(c) = &blocks.0[0] else {
             panic!()
         };
         assert_eq!((c.desktop_width, c.desktop_height), (1280, 1024));
         assert_eq!(c.optional.len(), 84);
-        let DataBlock::ClientNetwork(channels) = &blocks[3] else {
+        let DataBlock::ClientNetwork(channels) = &blocks.0[3] else {
             panic!()
         };
         assert_eq!(channels[1].name, *b"cliprdr\0");
@@ -2920,7 +2935,7 @@ mod tests {
             random,
             certificate,
             ..
-        } = &blocks[2]
+        } = &blocks.0[2]
         else {
             panic!()
         };
@@ -2973,7 +2988,7 @@ mod tests {
                         node_id: n,
                         tag,
                         result,
-                        blocks: server_blocks(),
+                        blocks: DataBlocks(server_blocks()),
                     };
                     assert_eq!(GccConference::parse(&c.to_bytes().unwrap()), Ok(c));
                 }
@@ -2987,29 +3002,37 @@ mod tests {
             node_id: 1001,
             tag: 1,
             result: 0,
-            blocks: server_blocks(),
+            blocks: DataBlocks(server_blocks()),
         };
         let mut b = response.to_bytes().unwrap();
         b[7] = 1;
         assert_eq!(GccConference::parse(&b), Ok(response));
-        let mut b = GccConference::Request(vec![]).to_bytes().unwrap();
+        let mut b = GccConference::Request(DataBlocks(vec![]))
+            .to_bytes()
+            .unwrap();
         b[7] -= 1;
         assert!(GccConference::parse(&b).is_err());
-        let mut b = GccConference::Request(vec![]).to_bytes().unwrap();
+        let mut b = GccConference::Request(DataBlocks(vec![]))
+            .to_bytes()
+            .unwrap();
         b[16] = b'X';
         assert!(GccConference::parse(&b).is_err());
     }
 
     #[test]
     fn gcc_refusals_and_limits() {
-        assert!(GccConference::Request(server_blocks()).to_bytes().is_err());
+        assert!(
+            GccConference::Request(DataBlocks(server_blocks()))
+                .to_bytes()
+                .is_err()
+        );
         for node_id in [0, 1000, 65537, u32::MAX] {
             assert!(
                 GccConference::Response {
                     node_id,
                     tag: 1,
                     result: 0,
-                    blocks: vec![]
+                    blocks: DataBlocks(vec![])
                 }
                 .to_bytes()
                 .is_err()
@@ -3020,16 +3043,16 @@ mod tests {
                 node_id: 1001,
                 tag: 1,
                 result: 5,
-                blocks: vec![]
+                blocks: DataBlocks(vec![])
             }
             .to_bytes()
             .is_err()
         );
         assert!(
-            GccConference::Request(vec![DataBlock::Other {
+            GccConference::Request(DataBlocks(vec![DataBlock::Other {
                 kind: 0xf001,
                 data: vec![0; MAX_GCC_REQUEST]
-            }])
+            }]))
             .to_bytes()
             .is_err()
         );
@@ -3040,10 +3063,12 @@ mod tests {
         assert!(c.to_bytes().is_err());
         let mut c = response();
         if let McsConnect::Response { conference, .. } = &mut c {
-            *conference = GccConference::Request(vec![]);
+            *conference = GccConference::Request(DataBlocks(vec![]));
         }
         assert!(c.to_bytes().is_err());
-        let mut b = GccConference::Request(vec![]).to_bytes().unwrap();
+        let mut b = GccConference::Request(DataBlocks(vec![]))
+            .to_bytes()
+            .unwrap();
         b[7] = 0xc0;
         assert!(matches!(
             GccConference::parse(&b),
@@ -3095,11 +3120,8 @@ mod tests {
         for b in client_blocks().into_iter().chain(server_blocks()) {
             assert_eq!(DataBlock::parse(&b.to_bytes().unwrap()), Ok(b));
         }
-        let b = client_blocks();
-        assert_eq!(
-            <Vec<DataBlock> as Wire>::parse(&b.to_bytes().unwrap()),
-            Ok(b)
-        );
+        let b = DataBlocks(client_blocks());
+        assert_eq!(DataBlocks::parse(&b.to_bytes().unwrap()), Ok(b));
     }
 
     #[test]
@@ -3261,15 +3283,15 @@ mod tests {
             .is_err()
         );
         assert!(
-            vec![DataBlock::ClientMessageChannel; MAX_BLOCKS + 1]
+            DataBlocks(vec![DataBlock::ClientMessageChannel; MAX_BLOCKS + 1])
                 .to_bytes()
                 .is_err()
         );
         let bytes = hex("06 c0 08 00 00 00 00 00").repeat(MAX_BLOCKS + 1);
-        assert!(<Vec<DataBlock> as Wire>::parse(&bytes).is_err());
-        assert!(<Vec<DataBlock> as Wire>::parse(&vec![0; MAX_GCC_DATA + 1]).is_err());
+        assert!(DataBlocks::parse(&bytes).is_err());
+        assert!(DataBlocks::parse(&vec![0; MAX_GCC_DATA + 1]).is_err());
         assert!(
-            Wire::to_bytes(&vec![
+            Wire::to_bytes(&DataBlocks(vec![
                 DataBlock::Other {
                     kind: 0xff00,
                     data: vec![0; MAX_GCC_DATA / 2]
@@ -3278,7 +3300,7 @@ mod tests {
                     kind: 0xff01,
                     data: vec![0; MAX_GCC_DATA / 2]
                 }
-            ])
+            ]))
             .is_err()
         );
     }
@@ -3862,7 +3884,10 @@ mod tests {
         prefixes!(Negotiation, Negotiation::Failure(FailureCode(1)));
         prefixes!(McsConnect, initial());
         prefixes!(McsConnect, response());
-        prefixes!(GccConference, GccConference::Request(client_blocks()));
+        prefixes!(
+            GccConference,
+            GccConference::Request(DataBlocks(client_blocks()))
+        );
         for b in client_blocks().into_iter().chain(server_blocks()) {
             prefixes!(DataBlock, b);
         }
@@ -4035,17 +4060,17 @@ mod tests {
 
     #[test]
     fn exact_gcc_aggregate_limits() {
-        let p = GccConference::Request(vec![DataBlock::Other {
+        let p = GccConference::Request(DataBlocks(vec![DataBlock::Other {
             kind: 0xf001,
             data: vec![0; MAX_GCC_REQUEST - 27],
-        }]);
+        }]));
         let b = p.to_bytes().unwrap();
         assert_eq!(b.len(), MAX_GCC_REQUEST);
         assert_eq!(GccConference::parse(&b), Ok(p));
-        let p = GccConference::Request(vec![DataBlock::Other {
+        let p = GccConference::Request(DataBlocks(vec![DataBlock::Other {
             kind: 0xf001,
             data: vec![0; MAX_GCC_REQUEST - 26],
-        }]);
+        }]));
         assert!(p.to_bytes().is_err());
         let block = DataBlock::Other {
             kind: 0xf001,
@@ -4055,7 +4080,7 @@ mod tests {
             node_id: 65536,
             tag: i32::MAX,
             result: 4,
-            blocks: vec![block],
+            blocks: DataBlocks(vec![block]),
         };
         let b = p.to_bytes().unwrap();
         assert!(b.len() <= MAX_GCC_RESPONSE);
@@ -4068,7 +4093,7 @@ mod tests {
             node_id: 1001,
             tag: 1,
             result: 0,
-            blocks: vec![],
+            blocks: DataBlocks(vec![]),
         }
         .to_bytes()
         .unwrap();
@@ -4126,7 +4151,7 @@ mod tests {
     }
 
     #[test]
-    fn lcg_fuzz_roundtrips_and_streaming() {
+    fn random_inputs_and_mutations_check_codec_contracts() {
         let mut rng = Lcg::new(0x726470);
         let mut seeds = vec![
             initial_example(),
@@ -4143,7 +4168,9 @@ mod tests {
             })
             .to_bytes()
             .unwrap(),
-            GccConference::Request(client_blocks()).to_bytes().unwrap(),
+            GccConference::Request(DataBlocks(client_blocks()))
+                .to_bytes()
+                .unwrap(),
             connection().to_packet().unwrap().to_bytes().unwrap(),
         ];
         for b in client_blocks().into_iter().chain(server_blocks()) {

@@ -699,10 +699,10 @@ fn industrial_body_writers_are_transactional() {
         flags: 0,
         protocol: rdp::Protocols(3),
     });
-    rollback(&vec![
+    rollback(&rdp::DataBlocks(vec![
         rdp::DataBlock::ClientMessageChannel;
         rdp::MAX_BLOCKS + 1
-    ]);
+    ]));
     rollback(&opcua::ExpandedNodeId {
         node_id: opcua::NodeId::numeric(1, 1),
         namespace_uri: Some("urn:test".into()),
