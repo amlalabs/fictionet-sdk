@@ -46,12 +46,12 @@ cargo +nightly fuzz list
 | `grpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::grpc`: gRPC |
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
-| `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
+| `json` | wire values and streams checked with bounded codec contracts | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kafka`: Apache Kafka |
 | `kerberos` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kerberos`: Kerberos V5 |
 | `ldap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ldap`: LDAP |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
-| `mime_multipart` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mime_multipart`: MIME multipart bodies |
+| `mime_multipart` | wire values and streams checked with bounded codec contracts | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mongodb`: MongoDB |
 | `mqtt` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mysql`: MySQL |
@@ -62,7 +62,7 @@ cargo +nightly fuzz list
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
-| `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
+| `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |
 | `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
 | `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
@@ -81,11 +81,11 @@ cargo +nightly fuzz list
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
-| `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
+| `urlencoded_form` | wire values and streams checked with bounded codec contracts | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::x509`: X.509 certificates and CRLs |
-| `xml` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::xml`: XML 1.0 |
+| `xml` | wire values and streams checked with bounded codec contracts | `stdlib::xml`: XML 1.0 |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules

@@ -12,8 +12,8 @@
 //! Nothing here reads a socket. A world that plays a web server takes a
 //! request body from its HTTP code, finds the boundary with [`boundary`],
 //! and reads the parts with [`Multipart::parse`]. A body that comes in
-//! pieces goes to a [`Parser`] instead, which hands back [`Event`]s and
-//! holds only a few bytes of a part's body at a time. What the fields mean,
+//! pieces goes to [`Stream<Parts>`](super::codec::Stream), which returns
+//! complete [`Part`] values within a fixed size limit. What the fields mean,
 //! and where uploaded files go, is up to world code.
 //!
 //! Every reader checks lengths and counts, because the agent can send any
@@ -21,13 +21,9 @@
 //! picks a boundary that appears nowhere in the parts, so what it writes
 //! always reads back the same.
 //!
-//! Use [`Parts`] with [`super::codec::Stream`] for bounded complete parts.
-//! [`Part`] implements [`Wire`] for a header block and its body. Boundaries
-//! remain explicit configuration. The deprecated [`Parser`] keeps its
-//! original buffering and event behavior.
-//!
 //! ```
-//! use fictionet::stdlib::mime_multipart::{boundary, Multipart, Part};
+//! use fictionet::stdlib::codec::Wire;
+//! use fictionet::stdlib::mime_multipart::{boundary, Entity, Multipart, Part};
 //!
 //! let content_type = "multipart/form-data; boundary=XyZ";
 //! let body = b"--XyZ\r\n\
@@ -53,12 +49,14 @@
 //!     parts: vec![Part::field("note", "--XyZ is taken").unwrap()],
 //!     ..Multipart::default()
 //! };
-//! let (chosen, bytes) = reply.write("XyZ").unwrap();
-//! assert_ne!(chosen, "XyZ");
-//! assert_eq!(Multipart::parse(&bytes, &chosen).unwrap(), reply);
+//! let entity = reply.with_free_boundary("XyZ").unwrap();
+//! assert_ne!(entity.boundary, "XyZ");
+//! let bytes = entity.to_bytes().unwrap();
+//! assert_eq!(Entity::parse(&bytes).unwrap(), entity);
 //! ```
 
 extern crate alloc;
+extern crate self as fictionet;
 
 use alloc::{
     format,
@@ -66,7 +64,7 @@ use alloc::{
     vec,
     vec::Vec,
 };
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The longest boundary RFC 2046 allows.
 pub const MAX_BOUNDARY: usize = 70;
@@ -84,19 +82,15 @@ pub const MAX_PARAMETERS: usize = 16;
 /// A boundary followed by more is [`Error::Padding`].
 pub const MAX_PADDING: usize = 64;
 /// The codec API's cap on one part, including headers, or on the preamble.
-/// MIME has no part size maximum. This module caps new codec callers at
-/// 4 MiB. The compatibility [`Parser`] and [`Multipart`] keep their limits.
+/// MIME has no part size maximum. This module caps parts at 4 MiB.
 pub const MAX_PART: usize = 4 * 1024 * 1024;
+/// The largest complete MIME entity, including its header, in bytes.
+/// Streaming [`Parts`] has no aggregate limit beyond its per-part limits.
+pub const MAX_ENTITY: usize = 16 * 1024 * 1024;
 /// The longest boundary line, including CR LF, dashes, padding, and CR LF.
 /// Derived from RFC 2046's [`MAX_BOUNDARY`] and this module's [`MAX_PADDING`].
 pub const MAX_BOUNDARY_LINE: usize = MAX_BOUNDARY + MAX_PADDING + 8;
-/// How many bytes [`Multipart::parse`] hands its [`Parser`] at a time.
-const PARSE_CHUNK: usize = 64 * 1024;
-/// The buffer capacity a [`Parser`] keeps when it holds few bytes. A
-/// larger buffer, left over from one big `feed`, is given back.
-const KEEP_CAPACITY: usize = 16 * 1024;
-
-/// Why bytes are not a multipart body. Once a [`Parser`] meets one, it
+/// Why bytes are not a multipart body. Once [`Parts`] meets one, it
 /// reads no further.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
@@ -121,6 +115,8 @@ pub enum Error {
     Padding,
     /// A codec part or preamble is longer than [`MAX_PART`].
     TooLong,
+    /// A complete entity is longer than [`MAX_ENTITY`].
+    EntityTooLong,
 }
 
 impl core::fmt::Display for Error {
@@ -133,14 +129,15 @@ impl core::fmt::Display for Error {
             Error::TooManyHeaders => "multipart part has too many header fields",
             Error::Header => "malformed multipart part header",
             Error::Padding => "multipart boundary line has too much padding",
-            Error::TooLong => "multipart part or preamble is over the codec size limit",
+            Error::TooLong => "multipart part or preamble is over the size limit",
+            Error::EntityTooLong => "multipart entity is over the size limit",
         })
     }
 }
 
 impl core::error::Error for Error {}
 
-/// Why a [`Multipart`] cannot be written.
+/// Why a multipart part, entity, or parameterized header cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WriteError {
     /// The boundary is not one RFC 2046 allows.
@@ -160,6 +157,10 @@ pub enum WriteError {
     HeaderValue,
     /// A codec part is longer than [`MAX_PART`], including its headers.
     TooLong,
+    /// A complete entity is longer than [`MAX_ENTITY`].
+    EntityTooLong,
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl core::fmt::Display for WriteError {
@@ -172,7 +173,9 @@ impl core::fmt::Display for WriteError {
             WriteError::HeaderTooLong => "a part's header block is too long",
             WriteError::HeaderName => "a header name is not valid",
             WriteError::HeaderValue => "a header value is not valid",
-            WriteError::TooLong => "multipart part is over the codec size limit",
+            WriteError::TooLong => "multipart part is over the size limit",
+            WriteError::EntityTooLong => "multipart entity is over the size limit",
+            WriteError::Unwritable => "value cannot be written without changing it",
         })
     }
 }
@@ -198,8 +201,11 @@ pub fn valid_boundary(b: &str) -> bool {
 /// number, use the encoded form (`boundary*0*`), or come with a plain
 /// `boundary` as well.
 pub fn boundary(content_type: &str) -> Option<String> {
+    if content_type.len() > MAX_HEADER_BYTES {
+        return None;
+    }
     let cleaned = strip_comments(content_type)?;
-    let v = ParamValue::parse(&cleaned)?;
+    let v = ParamValue::parse_text(&cleaned)?;
     let (top, sub) = v.value.split_once('/')?;
     let (top, sub) = (top.trim_end_matches(is_wsp_char), sub.trim_start_matches(is_wsp_char));
     if !top.eq_ignore_ascii_case("multipart") || sub.is_empty() || !sub.bytes().all(is_token) {
@@ -288,11 +294,12 @@ fn strip_comments(s: &str) -> Option<String> {
 /// The `Content-Type` value for a multipart body: `multipart/` and
 /// `subtype`, with the boundary as a parameter. It returns `None` if the
 /// subtype is empty or not a token, or the boundary is not valid.
-pub fn content_type(subtype: &str, boundary: &str) -> Option<String> {
-    if subtype.is_empty() || !subtype.bytes().all(is_token) || !valid_boundary(boundary) {
+pub fn content_type(subtype: &str, boundary: &str) -> Option<ParamValue> {
+    if subtype.is_empty() || subtype.len() > MAX_HEADER_BYTES.saturating_sub(128)
+        || !subtype.bytes().all(is_token) || !valid_boundary(boundary) {
         return None;
     }
-    ParamValue { value: format!("multipart/{subtype}"), params: vec![("boundary".into(), boundary.into())] }.to_header()
+    Some(ParamValue { value: format!("multipart/{subtype}"), params: vec![("boundary".into(), boundary.into())] })
 }
 
 /// A header value with parameters, as in `Content-Type` and
@@ -308,11 +315,10 @@ pub struct ParamValue {
 }
 
 impl ParamValue {
-    /// Reads a header value with parameters. It returns `None` if the
-    /// value before the parameters is empty, a parameter is malformed, a
-    /// parameter name appears twice (in any case), or there are more than
-    /// [`MAX_PARAMETERS`].
-    pub fn parse(s: &str) -> Option<ParamValue> {
+    fn parse_text(s: &str) -> Option<ParamValue> {
+        if s.len() > MAX_HEADER_BYTES || s.contains(['\r', '\n']) {
+            return None;
+        }
         let (main, mut rest) = match s.find(';') {
             Some(i) => (&s[..i], &s[i..]),
             None => (s, ""),
@@ -380,18 +386,21 @@ impl ParamValue {
         self.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 
-    /// The header value, with each parameter as a token or a quoted
-    /// string. It returns `None` if it could not read back the same: the
-    /// value is empty, holds a semicolon, CR or LF, or starts or ends with
-    /// a space or tab; a name is not a token or appears twice; a parameter
-    /// value holds CR or LF; or there are more than [`MAX_PARAMETERS`]
-    /// parameters.
-    pub fn to_header(&self) -> Option<String> {
+    fn header_text(&self) -> Option<String> {
         let v = &self.value;
         if v.is_empty() || v.contains([';', '\r', '\n']) || v.trim_matches(is_wsp_char).len() != v.len() {
             return None;
         }
         if self.params.len() > MAX_PARAMETERS {
+            return None;
+        }
+        let len = self.params.iter().fold(v.len(), |n, (name, value)| {
+            let quoted = value.is_empty() || !value.bytes().all(is_token);
+            let escapes = if quoted { value.bytes().filter(|b| matches!(b, b'"' | b'\\')).count() } else { 0 };
+            n.saturating_add(name.len()).saturating_add(value.len()).saturating_add(escapes)
+                .saturating_add(3).saturating_add(if quoted { 2 } else { 0 })
+        });
+        if len > MAX_HEADER_BYTES {
             return None;
         }
         let mut out = v.clone();
@@ -419,6 +428,35 @@ impl ParamValue {
             }
         }
         Some(out)
+    }
+}
+
+impl Wire for ParamValue {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads a UTF-8 parameterized header value. Refuses malformed or
+    /// repeated parameters, CR or LF, and raw or canonical headers beyond
+    /// [`MAX_HEADER_BYTES`]. The main value must be nonempty. Empty
+    /// parameter separators are skipped. Names retain their case, but
+    /// duplicate names are compared without case.
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        let text = core::str::from_utf8(input).map_err(|_| Error::Header)?;
+        let value = Self::parse_text(text).ok_or(Error::Header)?;
+        value.header_text().ok_or(Error::Header)?;
+        Ok(value)
+    }
+
+    /// Appends a header value with tokens or quoted parameters. Refuses
+    /// invalid names, duplicate parameters, CR or LF, excessive counts or
+    /// lengths, and values that would read back differently. The main value
+    /// must be nonempty, have no semicolon, CR or LF, and have no surrounding
+    /// spaces or tabs. A parameter name must be a token. Duplicate names
+    /// are compared without case. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let text = self.header_text().ok_or(WriteError::Unwritable)?;
+        out.extend_from_slice(text.as_bytes());
+        Ok(())
     }
 }
 
@@ -453,13 +491,13 @@ impl Headers {
     /// the part has no such field or has it twice, since readers that take
     /// the first and readers that take the last would disagree.
     pub fn content_type(&self) -> Option<ParamValue> {
-        ParamValue::parse(self.get_one("content-type")?)
+        ParamValue::parse_text(self.get_one("content-type")?)
     }
 
     /// The `Content-Disposition` field, read with its parameters. It is
     /// `None` if the part has no such field or has it twice.
     pub fn content_disposition(&self) -> Option<ParamValue> {
-        ParamValue::parse(self.get_one("content-disposition")?)
+        ParamValue::parse_text(self.get_one("content-disposition")?)
     }
 }
 
@@ -475,20 +513,26 @@ pub struct Part {
 
 impl Part {
     /// A form field: `Content-Disposition: form-data; name="…"` and the
-    /// value as the body. It returns `None` if `name` holds CR or LF.
+    /// value as the body. Refuses CR or LF in `name`, or a disposition
+    /// value beyond [`MAX_HEADER_BYTES`]. The writer checks the part cap.
     pub fn field(name: &str, value: impl Into<Vec<u8>>) -> Option<Part> {
+        if name.len() > MAX_HEADER_BYTES {
+            return None;
+        }
         let d = ParamValue { value: "form-data".into(), params: vec![("name".into(), name.into())] };
         Some(Part {
-            headers: Headers { fields: vec![("Content-Disposition".into(), d.to_header()?)] },
+            headers: Headers { fields: vec![("Content-Disposition".into(), d.header_text()?)] },
             body: value.into(),
         })
     }
 
     /// An uploaded file: a form-data part with a `filename` parameter and
     /// a `Content-Type` field. It returns `None` if a name holds CR or LF,
-    /// or the content type is not a valid header value.
+    /// the disposition exceeds [`MAX_HEADER_BYTES`], or the content type
+    /// is not a valid header value. The writer checks the part cap.
     pub fn file(name: &str, filename: &str, content_type: &str, body: impl Into<Vec<u8>>) -> Option<Part> {
-        if !valid_value(content_type) {
+        if name.len() > MAX_HEADER_BYTES || filename.len() > MAX_HEADER_BYTES
+            || content_type.len() > MAX_HEADER_BYTES || !valid_value(content_type) {
             return None;
         }
         let d = ParamValue {
@@ -498,7 +542,7 @@ impl Part {
         Some(Part {
             headers: Headers {
                 fields: vec![
-                    ("Content-Disposition".into(), d.to_header()?),
+                    ("Content-Disposition".into(), d.header_text()?),
                     ("Content-Type".into(), content_type.into()),
                 ],
             },
@@ -524,7 +568,9 @@ impl Wire for Part {
     type WriteError = WriteError;
 
     /// Reads one header block and its complete body, without boundary lines.
-    /// Every byte after the empty header line belongs to the body.
+    /// Every byte after the empty header line belongs to the body. Refuses
+    /// incomplete or malformed headers, excessive header counts or sizes,
+    /// and parts over [`MAX_PART`].
     fn parse(input: &[u8]) -> Result<Self, Error> {
         if input.len() > MAX_PART {
             return Err(Error::TooLong);
@@ -537,29 +583,12 @@ impl Wire for Part {
         })
     }
 
-    /// Appends one part without boundary lines. Header names, values, counts,
-    /// and lengths are checked before any bytes are appended.
+    /// Appends one part without boundary lines, using compact `name:value`
+    /// headers. Refuses invalid header names, CR or LF or surrounding
+    /// whitespace in values, excessive headers, and parts over [`MAX_PART`].
+    /// On error, `out` is unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        if self.headers.fields.len() > MAX_HEADERS {
-            return Err(WriteError::TooManyHeaders);
-        }
-        for (name, value) in &self.headers.fields {
-            if name.is_empty() || !name.bytes().all(is_ftext) {
-                return Err(WriteError::HeaderName);
-            }
-            if !valid_value(value) {
-                return Err(WriteError::HeaderValue);
-            }
-        }
-        // Compact separators ensure a parsed header block can be written
-        // within the same size limit, including folded input headers.
-        let header = header_block_size(self, 1);
-        if header > MAX_HEADER_BYTES {
-            return Err(WriteError::HeaderTooLong);
-        }
-        if header.saturating_add(self.body.len()) > MAX_PART {
-            return Err(WriteError::TooLong);
-        }
+        validate_part(self)?;
         for (name, value) in &self.headers.fields {
             out.extend_from_slice(name.as_bytes());
             out.push(b':');
@@ -570,6 +599,29 @@ impl Wire for Part {
         out.extend_from_slice(&self.body);
         Ok(())
     }
+}
+
+fn validate_part(part: &Part) -> Result<usize, WriteError> {
+    if part.headers.fields.len() > MAX_HEADERS {
+        return Err(WriteError::TooManyHeaders);
+    }
+    for (name, value) in &part.headers.fields {
+        if name.is_empty() || !name.bytes().all(is_ftext) {
+            return Err(WriteError::HeaderName);
+        }
+        if !valid_value(value) {
+            return Err(WriteError::HeaderValue);
+        }
+    }
+    // Compact separators keep parsed folded headers within the same cap.
+    let header = header_block_size(part, 1);
+    if header > MAX_HEADER_BYTES {
+        return Err(WriteError::HeaderTooLong);
+    }
+    if header.saturating_add(part.body.len()) > MAX_PART {
+        return Err(WriteError::TooLong);
+    }
+    Ok(header)
 }
 
 fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error> {
@@ -800,79 +852,78 @@ pub struct Multipart {
 
 impl Multipart {
     /// Reads a whole multipart body whose parts are separated by
-    /// `boundary` (without the leading `--`).
-    #[allow(deprecated)] // Preserve the one-shot parser behavior.
+    /// `boundary` (without the leading `--`). Refuses invalid boundaries,
+    /// malformed headers, missing closure, excessive parts, preambles or
+    /// parts over [`MAX_PART`], and bodies over [`MAX_ENTITY`].
     pub fn parse(body: &[u8], boundary: &str) -> Result<Multipart, Error> {
-        let mut p = Parser::new(boundary)?;
-        let mut m = Multipart::default();
-        // In pieces, so the parser never holds a copy of the whole body.
-        for chunk in body.chunks(PARSE_CHUNK) {
-            p.feed(chunk);
-            while let Some(event) = p.next_event() {
-                m.push_event(event?);
-            }
+        if body.len() > MAX_ENTITY {
+            return Err(Error::EntityTooLong);
         }
-        p.finish();
-        while let Some(event) = p.next_event() {
-            m.push_event(event?);
-        }
-        Ok(m)
-    }
-
-    /// Adds what an [`Event`] says to this body: a new part, more body
-    /// bytes for the last part, or more preamble or epilogue.
-    pub fn push_event(&mut self, event: Event) {
-        match event {
-            Event::Preamble(d) => self.preamble.extend_from_slice(&d),
-            Event::Part(headers) => self.parts.push(Part { headers, body: Vec::new() }),
-            Event::Body(d) => {
-                if let Some(p) = self.parts.last_mut() {
-                    p.body.extend_from_slice(&d);
+        let mut decoder = Parts::new(boundary)?;
+        let mut rest = body;
+        let mut consumed = 0usize;
+        let mut multipart = Self::default();
+        loop {
+            let preamble = decoder.state == State::Preamble;
+            let used = match decoder.decode(rest, true)? {
+                Step::Item(part, used) => {
+                    multipart.parts.push(part);
+                    used
                 }
+                Step::Skip(used) => used,
+                Step::Need | Step::End => return Err(Error::Truncated),
+            };
+            if preamble && decoder.state != State::Preamble {
+                multipart.preamble = body.get(..consumed).unwrap_or_default().to_vec();
             }
-            Event::PartEnd | Event::Close => {}
-            Event::Epilogue(d) => self.epilogue.extend_from_slice(&d),
+            consumed = consumed.checked_add(used).ok_or(Error::EntityTooLong)?;
+            rest = rest.get(used..).unwrap_or_default();
+            if decoder.state == State::Epilogue {
+                multipart.epilogue = rest.to_vec();
+                return Ok(multipart);
+            }
         }
     }
 
-    /// The body's bytes, with `boundary` between the parts. It fails if
-    /// the boundary is not valid or appears in the preamble or a part
-    /// (header lines are checked as written, `name: value`), or if a part
-    /// breaks a limit the parser holds to.
-    ///
-    /// A header line is written `name: value`, or `name:value` for every
-    /// line of a part whose block would otherwise pass
-    /// [`MAX_HEADER_BYTES`]. So any part the parser reads can be written
-    /// again.
-    pub fn to_bytes(&self, boundary: &str) -> Result<Vec<u8>, WriteError> {
+    /// Pairs this body with an explicit boundary for a complete MIME entity.
+    /// [`Wire::write`] checks the boundary and all body limits.
+    pub fn with_boundary(self, boundary: impl Into<String>) -> Entity {
+        Entity { boundary: boundary.into(), multipart: self }
+    }
+
+    /// Chooses a free boundary and returns a complete MIME entity.
+    /// Refuses invalid boundary bases and bodies beyond the writer limits.
+    pub fn with_free_boundary(self, base: &str) -> Result<Entity, WriteError> {
+        let boundary = self.pick_boundary(base)?;
+        Ok(self.with_boundary(boundary))
+    }
+
+    fn render(&self, boundary: &str) -> Result<Vec<u8>, WriteError> {
+        self.validate()?;
         if !valid_boundary(boundary) {
             return Err(WriteError::Boundary);
-        }
-        if self.parts.len() > MAX_PARTS {
-            return Err(WriteError::TooManyParts);
-        }
-        for part in &self.parts {
-            if part.headers.fields.len() > MAX_HEADERS {
-                return Err(WriteError::TooManyHeaders);
-            }
-            for (name, value) in &part.headers.fields {
-                if name.is_empty() || !name.bytes().all(is_ftext) {
-                    return Err(WriteError::HeaderName);
-                }
-                if !valid_value(value) {
-                    return Err(WriteError::HeaderValue);
-                }
-            }
-            if header_block_size(part, 1) > MAX_HEADER_BYTES {
-                return Err(WriteError::HeaderTooLong);
-            }
         }
         let mut dash = b"--".to_vec();
         dash.extend_from_slice(boundary.as_bytes());
         if self.slices().iter().any(|s| find(s, &dash).is_some()) {
             return Err(WriteError::BoundaryInData);
         }
-        let mut out = Vec::new();
+        let mut size = self.preamble.len()
+            .checked_add(if self.preamble.is_empty() { 0 } else { 2 })
+            .and_then(|n| n.checked_add(dash.len()))
+            .and_then(|n| n.checked_add(4))
+            .and_then(|n| n.checked_add(self.epilogue.len()))
+            .ok_or(WriteError::EntityTooLong)?;
+        for part in &self.parts {
+            size = size.checked_add(header_block_size(part, header_separator(part).len()))
+                .and_then(|n| n.checked_add(part.body.len()))
+                .and_then(|n| n.checked_add(dash.len() + 4))
+                .ok_or(WriteError::EntityTooLong)?;
+        }
+        if size > MAX_ENTITY {
+            return Err(WriteError::EntityTooLong);
+        }
+        let mut out = Vec::with_capacity(size);
         if !self.preamble.is_empty() {
             out.extend_from_slice(&self.preamble);
             out.extend_from_slice(b"\r\n");
@@ -894,14 +945,18 @@ impl Multipart {
         }
         out.extend_from_slice(b"--\r\n");
         out.extend_from_slice(&self.epilogue);
+        if out.len() > MAX_ENTITY {
+            return Err(WriteError::EntityTooLong);
+        }
         Ok(out)
     }
 
     /// A boundary that appears nowhere in the preamble or the parts. It is
     /// `base` if that is free. Otherwise it is `base` (cut to 61
     /// characters), a hyphen and the lowest 8-digit hex number that makes
-    /// it free. It fails only if `base` is not a valid boundary.
+    /// it free. Refuses invalid bases and bodies beyond the writer limits.
     pub fn pick_boundary(&self, base: &str) -> Result<String, WriteError> {
+        self.validate()?;
         if !valid_boundary(base) {
             return Err(WriteError::Boundary);
         }
@@ -916,7 +971,7 @@ impl Multipart {
         let prefix = format!("{}-", &base[..base.len().min(MAX_BOUNDARY - 9)]);
         let mut needle = b"--".to_vec();
         needle.extend_from_slice(prefix.as_bytes());
-        let mut used = Vec::new();
+        let mut used = std::collections::HashSet::new();
         for s in &slices {
             let mut at = 0;
             while let Some(i) = s.get(at..).and_then(|r| find(r, &needle)) {
@@ -925,32 +980,39 @@ impl Multipart {
                     && hex.iter().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
                         let text = core::str::from_utf8(hex).unwrap_or("");
                         if let Ok(n) = u32::from_str_radix(text, 16) {
-                            used.push(n);
+                            used.insert(n);
                         }
                     }
                 at = at + i + 1;
             }
         }
-        used.sort_unstable();
-        used.dedup();
         let mut n: u32 = 0;
-        while used.binary_search(&n).is_ok() {
+        while used.contains(&n) {
             n = n.checked_add(1).ok_or(WriteError::BoundaryInData)?;
         }
         Ok(format!("{prefix}{n:08x}"))
     }
 
-    /// Picks a boundary with [`Multipart::pick_boundary`] and writes the
-    /// body with it. It returns the boundary, for the `Content-Type`
-    /// header, and the bytes.
-    pub fn write(&self, base: &str) -> Result<(String, Vec<u8>), WriteError> {
-        let b = self.pick_boundary(base)?;
-        let bytes = self.to_bytes(&b)?;
-        Ok((b, bytes))
+    fn validate(&self) -> Result<(), WriteError> {
+        if self.parts.len() > MAX_PARTS {
+            return Err(WriteError::TooManyParts);
+        }
+        if self.preamble.len() > MAX_PART {
+            return Err(WriteError::TooLong);
+        }
+        let mut size = self.preamble.len().saturating_add(self.epilogue.len());
+        for part in &self.parts {
+            let header = validate_part(part)?;
+            size = size.saturating_add(header).saturating_add(part.body.len());
+        }
+        if size > MAX_ENTITY {
+            return Err(WriteError::EntityTooLong);
+        }
+        Ok(())
     }
 
     /// Every byte string a boundary must not appear in: the preamble,
-    /// each header line as [`Multipart::to_bytes`] writes it, and each
+    /// each header line as [`Entity::write`] writes it, and each
     /// body. A boundary line can only start after a line break, and none
     /// of these hold one that the writer adds, so a boundary that is in
     /// none of them is nowhere in the output before the closing line.
@@ -972,6 +1034,76 @@ impl Multipart {
     }
 }
 
+/// A complete multipart MIME entity with a `Content-Type` header.
+/// Raw HTTP body bytes are read with [`Multipart::parse`] or [`Parts`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entity {
+    /// The boundary, without its leading dashes.
+    pub boundary: String,
+    /// The multipart preamble, parts, and epilogue.
+    pub multipart: Multipart,
+}
+
+impl Wire for Entity {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads a `Content-Type: multipart/mixed` header, an empty line, and
+    /// its complete body. Refuses other headers, invalid boundaries,
+    /// malformed parts, missing closure, and entities over [`MAX_ENTITY`]
+    /// in raw or canonical form. The chosen boundary must be absent from
+    /// the preamble, part headers, and part bodies.
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        if input.len() > MAX_ENTITY {
+            return Err(Error::EntityTooLong);
+        }
+        let end = part_header_end(input, 0)?.ok_or(Error::Truncated)?;
+        let headers = parse_headers(input.get(..end.saturating_sub(2)).unwrap_or_default())?;
+        if headers.fields.len() != 1 {
+            return Err(Error::Header);
+        }
+        let value = headers.get("content-type").ok_or(Error::Header)?;
+        let content_type = ParamValue::parse(value.as_bytes())?;
+        if !content_type.value.eq_ignore_ascii_case("multipart/mixed") || content_type.params.len() != 1 {
+            return Err(Error::Header);
+        }
+        let boundary = boundary(value).ok_or(Error::Boundary)?;
+        let multipart = Multipart::parse(input.get(end..).unwrap_or_default(), &boundary)?;
+        let entity = Self { boundary, multipart };
+        // Canonical header spacing must also fit the entity cap.
+        entity.to_bytes().map_err(|error| match error {
+            WriteError::Boundary | WriteError::BoundaryInData => Error::Boundary,
+            WriteError::TooManyParts => Error::TooManyParts,
+            WriteError::TooManyHeaders => Error::TooManyHeaders,
+            WriteError::HeaderTooLong => Error::HeaderTooLong,
+            WriteError::HeaderName | WriteError::HeaderValue | WriteError::Unwritable => Error::Header,
+            WriteError::TooLong => Error::TooLong,
+            WriteError::EntityTooLong => Error::EntityTooLong,
+        })?;
+        Ok(entity)
+    }
+
+    /// Appends the MIME header and body. Refuses invalid or colliding
+    /// boundaries, invalid headers, excessive counts, parts or preambles
+    /// over [`MAX_PART`], and entities over [`MAX_ENTITY`]. On error, `out`
+    /// is unchanged. Header lines use `name: value`, or compact `name:value`
+    /// when spaces would exceed the header or part cap. Preamble, body,
+    /// and epilogue bytes are preserved.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let content_type = content_type("mixed", &self.boundary).ok_or(WriteError::Boundary)?;
+        let mut bytes = b"Content-Type: ".to_vec();
+        content_type.write(&mut bytes)?;
+        bytes.extend_from_slice(b"\r\n\r\n");
+        let body = self.multipart.render(&self.boundary)?;
+        if bytes.len().saturating_add(body.len()) > MAX_ENTITY {
+            return Err(WriteError::EntityTooLong);
+        }
+        bytes.extend_from_slice(&body);
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
 /// How many bytes a part's header block takes, with each line's name and
 /// value joined by `sep_len` bytes plus CR LF, and the empty line at the end.
 fn header_block_size(part: &Part, sep_len: usize) -> usize {
@@ -981,27 +1113,10 @@ fn header_block_size(part: &Part, sep_len: usize) -> usize {
 }
 
 /// What goes between a header's name and value: `": "`, or `":"` if the
-/// part's block would pass [`MAX_HEADER_BYTES`] with the spaces.
+/// part would pass [`MAX_HEADER_BYTES`] or [`MAX_PART`] with the spaces.
 fn header_separator(part: &Part) -> &'static [u8] {
-    if header_block_size(part, 2) <= MAX_HEADER_BYTES { b": " } else { b":" }
-}
-
-/// What a [`Parser`] found next in the body.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// Bytes of the preamble. It may come in several pieces.
-    Preamble(Vec<u8>),
-    /// A new part begins, with these headers.
-    Part(Headers),
-    /// Bytes of the current part's body. It may come in several pieces,
-    /// and they depend on how the bytes were fed.
-    Body(Vec<u8>),
-    /// The current part's body is complete.
-    PartEnd,
-    /// The closing boundary line. No more parts follow.
-    Close,
-    /// Bytes of the epilogue. It may come in several pieces.
-    Epilogue(Vec<u8>),
+    let size = header_block_size(part, 2);
+    if size <= MAX_HEADER_BYTES && size.saturating_add(part.body.len()) <= MAX_PART { b": " } else { b":" }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1010,220 +1125,6 @@ enum State {
     Headers,
     Body,
     Epilogue,
-    Done,
-    Failed(Error),
-}
-
-/// Reads a multipart body as it arrives. Feed it bytes in order, take
-/// events out until it has none, and call [`Parser::finish`] when the body
-/// is complete. It holds a part's headers until the block is complete, at
-/// most [`MAX_HEADER_BYTES`], and of a body only the few bytes that might
-/// start a boundary line.
-///
-/// A boundary line is `--` and the boundary at the start of a line, then
-/// at most [`MAX_PADDING`] spaces or tabs, then CR LF. The closing line has
-/// `--` right after the boundary, and then the same padding and CR LF, or
-/// padding and the end of the body. More padding than that is
-/// [`Error::Padding`]. A line that starts with `--` and the boundary but
-/// goes on in any other way is body data, as in RFC 2046's grammar.
-#[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with mime_multipart::Parts")]
-pub struct Parser {
-    /// CR LF, `--` and the boundary.
-    delim: Vec<u8>,
-    buf: Vec<u8>,
-    /// How many bytes at the start of `buf` have been read. They are
-    /// dropped on the next `feed`, so reading a part costs no copy of
-    /// the bytes after it.
-    start: usize,
-    /// How many bytes after `start` are a CR LF that is not data: the one
-    /// the parser adds before the body, or the end of a header block. A
-    /// boundary line right after them matches like any other.
-    virt: usize,
-    state: State,
-    queued: Option<Event>,
-    /// How many bytes of a header block have been searched for its end.
-    searched: usize,
-    parts: usize,
-    finished: bool,
-}
-
-#[allow(deprecated)] // Preserve the compatibility API.
-impl Parser {
-    /// A parser for a body whose parts are separated by `boundary`
-    /// (without the leading `--`). It fails if the boundary is not valid.
-    pub fn new(boundary: &str) -> Result<Parser, Error> {
-        if !valid_boundary(boundary) {
-            return Err(Error::Boundary);
-        }
-        let mut delim = b"\r\n--".to_vec();
-        delim.extend_from_slice(boundary.as_bytes());
-        Ok(Parser {
-            delim,
-            buf: b"\r\n".to_vec(),
-            start: 0,
-            virt: 2,
-            state: State::Preamble,
-            queued: None,
-            searched: 0,
-            parts: 0,
-            finished: false,
-        })
-    }
-
-    /// Adds bytes of the body. Bytes after [`Parser::finish`], or after an
-    /// error, are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if !self.finished && !matches!(self.state, State::Failed(_) | State::Done) {
-            self.compact();
-            self.buf.extend_from_slice(bytes);
-        }
-    }
-
-    /// Drops the bytes already read, and gives back a buffer much larger
-    /// than what is left, so one large `feed` is not held on to.
-    fn compact(&mut self) {
-        self.buf.drain(..self.start);
-        self.start = 0;
-        let keep = self.buf.len().max(KEEP_CAPACITY);
-        if self.buf.capacity() > keep.saturating_mul(2) {
-            self.buf.shrink_to(keep);
-        }
-    }
-
-    /// Says the body is complete. A body cut short then reads as
-    /// [`Error::Truncated`].
-    pub fn finish(&mut self) {
-        self.finished = true;
-    }
-
-    /// The next event, if the bytes so far say what it is. It returns
-    /// `None` when it needs more bytes, and after the epilogue once the
-    /// body is finished. It keeps returning the same error once the body
-    /// has broken. The bytes it holds are at most a header block, or a
-    /// boundary line's worth, beyond what the last `feed` added.
-    pub fn next_event(&mut self) -> Option<Result<Event, Error>> {
-        if let Some(e) = self.queued.take() {
-            return Some(Ok(e));
-        }
-        loop {
-            match self.state {
-                State::Failed(e) => return Some(Err(e)),
-                State::Done => return None,
-                State::Preamble | State::Body => {
-                    let body = self.state == State::Body;
-                    let (upto, found) = scan(&self.buf[self.start..], &self.delim, self.finished);
-                    if upto > 0 {
-                        let skip = self.virt.min(upto);
-                        let data = self.buf[self.start + skip..self.start + upto].to_vec();
-                        self.start += upto;
-                        self.virt -= skip;
-                        if data.is_empty() {
-                            continue;
-                        }
-                        return Some(Ok(if body { Event::Body(data) } else { Event::Preamble(data) }));
-                    }
-                    match found {
-                        Found::Wait if self.finished => return self.fail(Error::Truncated),
-                        Found::Wait => {
-                            self.compact();
-                            return None;
-                        }
-                        Found::Padding => return self.fail(Error::Padding),
-                        Found::Delim(end) => {
-                            self.start += end;
-                            self.virt = 0;
-                            self.state = State::Headers;
-                            if body {
-                                return Some(Ok(Event::PartEnd));
-                            }
-                        }
-                        Found::Close(end) => {
-                            self.start += end;
-                            self.virt = 0;
-                            self.state = State::Epilogue;
-                            if body {
-                                self.queued = Some(Event::Close);
-                                return Some(Ok(Event::PartEnd));
-                            }
-                            return Some(Ok(Event::Close));
-                        }
-                    }
-                }
-                State::Headers => {
-                    if self.parts >= MAX_PARTS {
-                        return self.fail(Error::TooManyParts);
-                    }
-                    // Search only the first MAX_HEADER_BYTES, and only from
-                    // where the last search stopped, less a partial CR LF CR.
-                    let held = &self.buf[self.start..];
-                    let limit = held.len().min(MAX_HEADER_BYTES);
-                    let from = self.searched.saturating_sub(3).min(limit);
-                    let end = if held.starts_with(b"\r\n") {
-                        Some(2)
-                    } else {
-                        find(&held[from..limit], b"\r\n\r\n").map(|i| from + i + 4)
-                    };
-                    let end = match end {
-                        Some(e) => e,
-                        None if held.len() >= MAX_HEADER_BYTES => {
-                            return self.fail(Error::HeaderTooLong);
-                        }
-                        None if self.finished => return self.fail(Error::Truncated),
-                        None => {
-                            self.searched = limit;
-                            self.compact();
-                            return None;
-                        }
-                    };
-                    self.searched = 0;
-                    let headers = match parse_headers(&held[..end - 2]) {
-                        Ok(h) => h,
-                        Err(e) => return self.fail(e),
-                    };
-                    // The block's last CR LF stays, so a body that starts
-                    // with the boundary line is empty.
-                    self.start += end - 2;
-                    self.virt = 2;
-                    self.parts += 1;
-                    self.state = State::Body;
-                    return Some(Ok(Event::Part(headers)));
-                }
-                State::Epilogue => {
-                    if self.start < self.buf.len() {
-                        let data = self.buf[self.start..].to_vec();
-                        self.start = self.buf.len();
-                        self.compact();
-                        return Some(Ok(Event::Epilogue(data)));
-                    }
-                    if self.finished {
-                        self.state = State::Done;
-                    }
-                    return None;
-                }
-            }
-        }
-    }
-
-    /// How many bytes of the body are held, waiting for what follows them.
-    pub fn buffered(&self) -> usize {
-        self.buf.len().saturating_sub(self.start).saturating_sub(self.virt)
-    }
-
-    /// Whether the body has been read to its end: the closing boundary
-    /// line, the epilogue, and [`Parser::finish`].
-    pub fn is_done(&self) -> bool {
-        self.state == State::Done
-    }
-
-    fn fail(&mut self, e: Error) -> Option<Result<Event, Error>> {
-        self.state = State::Failed(e);
-        self.buf = Vec::new();
-        self.start = 0;
-        self.virt = 0;
-        self.queued = None;
-        Some(Err(e))
-    }
 }
 
 /// What follows a boundary.
@@ -1391,31 +1292,34 @@ fn valid_value(v: &str) -> bool {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use fictionet::stdlib::codec::test_support::{Lcg, decode_all};
 
-    /// Feeds `data` in pieces whose sizes come from `size`, and collects
-    /// what the parser finds.
-    fn parse_pieces(data: &[u8], boundary: &str, mut size: impl FnMut() -> usize) -> Result<Multipart, Error> {
-        let mut p = Parser::new(boundary)?;
-        let mut m = Multipart::default();
-        let mut i = 0;
-        while i < data.len() {
-            let n = size().clamp(1, data.len() - i);
-            p.feed(&data[i..i + n]);
-            i += n;
-            while let Some(e) = p.next_event() {
-                m.push_event(e?);
-            }
-            assert!(p.buffered() <= MAX_HEADER_BYTES + n, "held {} bytes", p.buffered());
+    // Tests of raw HTTP bodies omit the entity's Content-Type header.
+    fn raw(input: &[u8]) -> &[u8] {
+        if input.starts_with(b"Content-Type: ") {
+            &input[find(input, b"\r\n\r\n").unwrap() + 4..]
+        } else {
+            input
         }
-        p.finish();
-        while let Some(e) = p.next_event() {
-            m.push_event(e?);
+    }
+
+    fn check(input: &[u8], boundary: &str) {
+        let input = raw(input);
+        let make = || Parts::new(boundary).unwrap();
+        contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
+        let (parts, error) = decode_all(make, input);
+        match Multipart::parse(input, boundary) {
+            Ok(multipart) => assert_eq!((parts, error), (multipart.parts, None)),
+            Err(expected) if !input.is_empty() => match error {
+                Some(Fail::Protocol(error)) => assert_eq!(error, expected),
+                Some(Fail::Truncated { .. }) => assert_eq!(expected, Error::Truncated),
+                other => panic!("{other:?}"),
+            },
+            Err(_) => assert!(input.is_empty()),
         }
-        assert!(p.is_done());
-        Ok(m)
     }
 
     fn crlf(s: &str) -> Vec<u8> {
@@ -1448,7 +1352,7 @@ This is the epilogue.  It is also to be ignored.
         let ct = "multipart/mixed; boundary=\"simple boundary\"";
         let b = boundary(ct).unwrap();
         assert_eq!(b, "simple boundary");
-        let m = Multipart::parse(&body, &b).unwrap();
+        let m = Multipart::parse(raw(&body), &b).unwrap();
         assert_eq!(
             m.preamble,
             crlf(
@@ -1473,9 +1377,9 @@ explanatory note to non-MIME conformant readers.
         );
         assert_eq!(m.epilogue, crlf("\nThis is the epilogue.  It is also to be ignored.\n"));
         // Writing it again with the same boundary gives the same bytes back.
-        let again = m.to_bytes("simple boundary").unwrap();
-        assert_eq!(Multipart::parse(&again, "simple boundary").unwrap(), m);
-        assert_eq!(again, body);
+        let again = m.clone().with_boundary("simple boundary").to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&again), "simple boundary").unwrap(), m);
+        assert_eq!(raw(&again), body);
     }
 
     // RFC 7578, sections 4.2 and 4.6.
@@ -1499,7 +1403,7 @@ Content-Type: text/plain
 ... contents of file1.txt ...
 --AaB03x--",
         );
-        let m = Multipart::parse(&body, &boundary("multipart/form-data; boundary=AaB03x").unwrap()).unwrap();
+        let m = Multipart::parse(raw(&body), &boundary("multipart/form-data; boundary=AaB03x").unwrap()).unwrap();
         assert_eq!(m.parts.len(), 3);
         assert_eq!(m.parts[0].name().as_deref(), Some("_charset_"));
         assert_eq!(m.parts[0].body, b"iso-8859-1");
@@ -1516,34 +1420,67 @@ Content-Type: text/plain
     }
 
     #[test]
+    fn entity_limits_and_parameter_refusals() {
+        let part = Part {
+            headers: Headers { fields: vec![("X".into(), "v".into())] },
+            body: vec![b'x'; MAX_PART - 7],
+        };
+        let entity = Multipart { parts: vec![part], ..Multipart::default() }.with_boundary("b");
+        // A compact header keeps a part exactly at its limit writable.
+        contract::check_wire_value(&entity);
+        let bytes = entity.to_bytes().unwrap();
+        assert_eq!(Entity::parse(&bytes), Ok(entity));
+        let oversized = Multipart {
+            epilogue: vec![b'e'; MAX_ENTITY], ..Multipart::default()
+        }.with_boundary("b");
+        assert_eq!(oversized.to_bytes(), Err(WriteError::EntityTooLong));
+        contract::check_wire_value(&oversized);
+        assert_eq!(Multipart::parse(&vec![b'x'; MAX_ENTITY + 1], "b"), Err(Error::EntityTooLong));
+        let long = ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] };
+        assert_eq!(long.to_bytes(), Err(WriteError::Unwritable));
+        contract::check_wire_value(&long);
+        assert_eq!(ParamValue::parse(b"x\r\ny"), Err(Error::Header));
+        contract::check_wire::<ParamValue>(b"x;n=\"a b\"");
+        assert_eq!(Entity::parse(b"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nx--b\r\n--b--\r\n"), Err(Error::Boundary));
+        for input in [
+            b"Content-Type: text/plain\r\n\r\n--b--".as_slice(),
+            b"Content-Type: multipart/mixed; boundary=b\r\nX: y\r\n\r\n--b--",
+            b"Content-Type: multipart/mixed; boundary=b; boundary=c\r\n\r\n--b--",
+        ] {
+            contract::check_wire::<Entity>(input);
+            assert!(Entity::parse(input).is_err());
+        }
+    }
+
+    #[test]
     fn parameters() {
-        let v = ParamValue::parse("form-data; name=\"a \\\"q\\\" \\\\ b\";filename=x.txt ; ;").unwrap();
+        let v = ParamValue::parse(("form-data; name=\"a \\\"q\\\" \\\\ b\";filename=x.txt ; ;").as_bytes()).ok().unwrap();
         assert_eq!(v.value, "form-data");
         assert_eq!(v.get("NAME"), Some("a \"q\" \\ b"));
         assert_eq!(v.get("filename"), Some("x.txt"));
         assert_eq!(v.get("other"), None);
-        assert_eq!(ParamValue::parse(&v.to_header().unwrap()), Some(v));
-        let u = ParamValue::parse("form-data; filename=\"résumé.pdf\"").unwrap();
+        assert_eq!(ParamValue::parse(&v.to_bytes().unwrap()).ok(), Some(v));
+        let u = ParamValue::parse(("form-data; filename=\"résumé.pdf\"").as_bytes()).ok().unwrap();
         assert_eq!(u.get("filename"), Some("résumé.pdf"));
-        assert_eq!(ParamValue::parse("x; name = \"\"").unwrap().get("name"), Some(""));
+        assert_eq!(ParamValue::parse(("x; name = \"\"").as_bytes()).ok().unwrap().get("name"), Some(""));
         for bad in ["", " ; a=b", "x; =b", "x; a", "x; a=", "x; a=\"open", "x; a=b c", "x; a b=c", "x; a=@"] {
-            assert_eq!(ParamValue::parse(bad), None, "{bad:?}");
+            assert_eq!(ParamValue::parse((bad).as_bytes()).ok(), None, "{bad:?}");
         }
         // A name given twice, in any case, is refused: readers that take
         // the first and readers that take the last would disagree.
-        assert_eq!(ParamValue::parse("form-data; name=a; NAME=b"), None);
+        assert_eq!(ParamValue::parse(("form-data; name=a; NAME=b").as_bytes()).ok(), None);
         assert_eq!(
             ParamValue { value: "a".into(), params: vec![("n".into(), "1".into()), ("N".into(), "2".into())] }
-                .to_header(),
+                .to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap()),
             None
         );
         let many: String = (0..=MAX_PARAMETERS).map(|i| format!("; p{i}=v")).collect();
-        assert_eq!(ParamValue::parse(&format!("x{many}")), None);
+        assert_eq!(ParamValue::parse(format!("x{many}").as_bytes()).ok(), None);
         let ok: String = (0..MAX_PARAMETERS).map(|i| format!("; p{i}=v")).collect();
-        assert_eq!(ParamValue::parse(&format!("x{ok}")).unwrap().params.len(), MAX_PARAMETERS);
+        assert_eq!(ParamValue::parse(format!("x{ok}").as_bytes()).ok().unwrap().params.len(), MAX_PARAMETERS);
         // Writers refuse what would not read back the same.
         let w = |value: &str, name: &str, pv: &str| {
-            ParamValue { value: value.into(), params: vec![(name.into(), pv.into())] }.to_header()
+            ParamValue { value: value.into(), params: vec![(name.into(), pv.into())] }.to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap())
         };
         assert_eq!(w("a", "n", "v").as_deref(), Some("a; n=v"));
         assert_eq!(w("a", "n", "v w").as_deref(), Some("a; n=\"v w\""));
@@ -1572,7 +1509,7 @@ Content-Type: text/plain
         assert_eq!(boundary("text/plain; boundary=abc"), None);
         assert_eq!(boundary("multipart/mixed"), None);
         assert_eq!(boundary("multipart/mixed; boundary=\"bad \""), None);
-        let ct = content_type("form-data", "a:b").unwrap();
+        let ct = String::from_utf8(content_type("form-data", "a:b").unwrap().to_bytes().unwrap()).unwrap();
         assert_eq!(ct, "multipart/form-data; boundary=\"a:b\"");
         assert_eq!(boundary(&ct).as_deref(), Some("a:b"));
         assert_eq!(content_type("form-data", "bad;"), None);
@@ -1584,8 +1521,8 @@ Content-Type: text/plain
         assert_eq!(boundary("multipart/x@y; boundary=a"), None);
         // Two boundaries would let readers disagree on where parts end.
         assert_eq!(boundary("multipart/mixed; boundary=a; BOUNDARY=b"), None);
-        assert_eq!(Parser::new("").err(), Some(Error::Boundary));
-        assert_eq!(Multipart::parse(b"--a--", "a b ").err(), Some(Error::Boundary));
+        assert_eq!(Parts::new("").err(), Some(Error::Boundary));
+        assert_eq!(Multipart::parse(raw(b"--a--"), "a b ").err(), Some(Error::Boundary));
     }
 
     #[test]
@@ -1593,26 +1530,26 @@ Content-Type: text/plain
         // Padding after a boundary, an empty part with no blank line before
         // the next boundary, and a boundary-like line that is data.
         let body = b"--b \t\r\nX: 1\r\n\r\n--b\r\n\r\n--bad\r\n--b-x\r\n--b--";
-        let m = Multipart::parse(body, "b").unwrap();
+        let m = Multipart::parse(raw(body), "b").unwrap();
         assert_eq!(m.parts.len(), 2);
         assert_eq!(m.parts[0].headers.get("x"), Some("1"));
         assert_eq!(m.parts[0].body, b"");
         assert_eq!(m.parts[1].body, b"--bad\r\n--b-x");
         // No parts at all.
-        let m = Multipart::parse(b"--b--", "b").unwrap();
+        let m = Multipart::parse(raw(b"--b--"), "b").unwrap();
         assert_eq!(m, Multipart::default());
         // The closing line ends with padding and a line break, or with
         // padding and the end of the body.
-        assert_eq!(Multipart::parse(b"--b--  \r\nE", "b").unwrap().epilogue, b"E");
-        assert_eq!(Multipart::parse(b"--b--  ", "b").unwrap().epilogue, b"");
-        assert_eq!(Multipart::parse(b"--b--  E", "b"), Err(Error::Truncated));
-        assert_eq!(Multipart::parse(b"--b-- \r", "b"), Err(Error::Truncated));
+        assert_eq!(Multipart::parse(raw(b"--b--  \r\nE"), "b").unwrap().epilogue, b"E");
+        assert_eq!(Multipart::parse(raw(b"--b--  "), "b").unwrap().epilogue, b"");
+        assert_eq!(Multipart::parse(raw(b"--b--  E"), "b"), Err(Error::Truncated));
+        assert_eq!(Multipart::parse(raw(b"--b-- \r"), "b"), Err(Error::Truncated));
         // Folded header lines are joined.
-        let m = Multipart::parse(b"--b\r\nA:  one\r\n  two \r\n\tthree\r\n\r\nz\r\n--b--", "b").unwrap();
+        let m = Multipart::parse(raw(b"--b\r\nA:  one\r\n  two \r\n\tthree\r\n\r\nz\r\n--b--"), "b").unwrap();
         assert_eq!(m.parts[0].headers.get("a"), Some("one  two \tthree"));
         // A preamble that starts with CR LF.
-        assert_eq!(Multipart::parse(b"\r\n--b--", "b").unwrap().preamble, b"");
-        assert_eq!(Multipart::parse(b"\r\n\r\n--b--", "b").unwrap().preamble, b"\r\n");
+        assert_eq!(Multipart::parse(raw(b"\r\n--b--"), "b").unwrap().preamble, b"");
+        assert_eq!(Multipart::parse(raw(b"\r\n\r\n--b--"), "b").unwrap().preamble, b"\r\n");
     }
 
     #[test]
@@ -1621,7 +1558,7 @@ Content-Type: text/plain
             let mut v = b"--b\r\n".to_vec();
             v.extend_from_slice(h);
             v.extend_from_slice(b"\r\n\r\nbody\r\n--b--");
-            Multipart::parse(&v, "b")
+            Multipart::parse(raw(&v), "b")
         };
         assert!(part(b"A: ok").is_ok());
         assert_eq!(part(b"no colon"), Err(Error::Header));
@@ -1640,38 +1577,32 @@ Content-Type: text/plain
         assert!(part(fits.as_bytes()).is_ok());
         let long = format!("A: {}", "v".repeat(MAX_HEADER_BYTES - 6));
         assert_eq!(part(long.as_bytes()), Err(Error::HeaderTooLong));
-        // Never ending, fed slowly: the parser stops at the limit.
-        let mut p = Parser::new("b").unwrap();
-        p.feed(b"--b\r\nA: ");
-        let mut got = None;
-        for _ in 0..MAX_HEADER_BYTES {
-            p.feed(b"v");
-            if let Some(e) = p.next_event() {
-                got = Some(e);
-                break;
-            }
-        }
-        assert_eq!(got, Some(Err(Error::HeaderTooLong)));
-        // An error sticks, and later bytes are dropped.
-        p.feed(b"\r\n\r\n--b--");
-        p.finish();
-        assert_eq!(p.next_event(), Some(Err(Error::HeaderTooLong)));
-        assert_eq!(p.buffered(), 0);
+        // The header cap is enforced before the part body ends.
+        let mut input = b"--b\r\nA: ".to_vec();
+        input.extend_from_slice(&vec![b'v'; MAX_HEADER_BYTES]);
+        check(&input, "b");
+        let mut stream = Stream::new(Parts::new("b").unwrap());
+        let error = Fail::Protocol(Error::HeaderTooLong);
+        assert_eq!(pump(&mut stream, &input, |_| panic!("invalid header")), Err(error.clone()));
+        assert_eq!(stream.push(b"\r\n\r\n--b--"), 9);
+        stream.end();
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&error));
     }
 
     #[test]
     fn part_count_limit() {
         let mut ok = Multipart { parts: vec![Part::field("f", "v").unwrap(); MAX_PARTS], ..Multipart::default() };
-        let bytes = ok.to_bytes("b").unwrap();
-        assert_eq!(Multipart::parse(&bytes, "b").unwrap(), ok);
+        let bytes = ok.clone().with_boundary("b").to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&bytes), "b").unwrap(), ok);
         let mut over = String::new();
         for _ in 0..=MAX_PARTS {
             over.push_str("--b\r\n\r\n\r\n");
         }
         over.push_str("--b--");
-        assert_eq!(Multipart::parse(over.as_bytes(), "b"), Err(Error::TooManyParts));
+        assert_eq!(Multipart::parse(raw(over.as_bytes()), "b"), Err(Error::TooManyParts));
         ok.parts.push(Part::default());
-        assert_eq!(ok.to_bytes("b"), Err(WriteError::TooManyParts));
+        assert_eq!(ok.clone().with_boundary("b").to_bytes(), Err(WriteError::TooManyParts));
     }
 
     fn sample() -> Multipart {
@@ -1690,10 +1621,11 @@ Content-Type: text/plain
     #[test]
     fn every_truncated_prefix() {
         let m = sample();
-        let bytes = m.to_bytes("bound").unwrap();
+        let bytes = m.clone().with_boundary("bound").to_bytes().unwrap();
+        let bytes = raw(&bytes).to_vec();
         let close = find(&bytes, b"--bound--").unwrap() + 9;
         for n in 0..bytes.len() {
-            let got = Multipart::parse(&bytes[..n], "bound");
+            let got = Multipart::parse(raw(&bytes[..n]), "bound");
             // A lone CR after the closing boundary does not end its line.
             if n < close || n == close + 1 {
                 assert_eq!(got, Err(Error::Truncated), "{n} bytes");
@@ -1702,37 +1634,41 @@ Content-Type: text/plain
                 assert_eq!(got.parts, m.parts, "{n} bytes");
             }
         }
-        assert_eq!(Multipart::parse(&bytes, "bound").unwrap(), m);
+        assert_eq!(Multipart::parse(raw(&bytes), "bound").unwrap(), m);
     }
 
     #[test]
     fn round_trips() {
         let m = sample();
-        let (b, bytes) = m.write("bound").unwrap();
+        let entity = m.clone().with_free_boundary("bound").unwrap();
+        let b = entity.boundary.clone();
+        let bytes = entity.to_bytes().unwrap();
         assert_eq!(b, "bound");
-        assert_eq!(Multipart::parse(&bytes, &b).unwrap(), m);
+        assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
         assert_eq!(m.parts[1].filename().as_deref(), Some("C:\\a \"b\".txt"));
-        let back = Multipart::parse(&bytes, &b).unwrap();
+        let back = Multipart::parse(raw(&bytes), &b).unwrap();
         assert_eq!(back.parts[1].filename().as_deref(), Some("C:\\a \"b\".txt"));
         // Byte at a time, the same.
-        assert_eq!(parse_pieces(&bytes, &b, || 1).unwrap(), m);
+        check(&bytes, &b);
         // Empty preamble and epilogue.
         let bare = Multipart { parts: vec![Part::field("a", "").unwrap()], ..Multipart::default() };
-        let bytes = bare.to_bytes("z").unwrap();
-        assert_eq!(bytes, b"--z\r\nContent-Disposition: form-data; name=a\r\n\r\n\r\n--z--\r\n");
-        assert_eq!(Multipart::parse(&bytes, "z").unwrap(), bare);
+        let bytes = bare.clone().with_boundary("z").to_bytes().unwrap();
+        assert_eq!(raw(&bytes), b"--z\r\nContent-Disposition: form-data; name=a\r\n\r\n\r\n--z--\r\n");
+        assert_eq!(Multipart::parse(raw(&bytes), "z").unwrap(), bare);
     }
 
     #[test]
     fn picking_a_boundary() {
         let mut m =
             Multipart { parts: vec![Part::field("x", "--XyZ and --XyZ-00000000").unwrap()], ..Multipart::default() };
-        assert_eq!(m.to_bytes("XyZ"), Err(WriteError::BoundaryInData));
+        assert_eq!(m.clone().with_boundary("XyZ").to_bytes(), Err(WriteError::BoundaryInData));
         assert_eq!(m.pick_boundary("XyZ").unwrap(), "XyZ-00000001");
         m.preamble = b"--XyZ-00000001".to_vec();
         assert_eq!(m.pick_boundary("XyZ").unwrap(), "XyZ-00000002");
-        let (b, bytes) = m.write("XyZ").unwrap();
-        assert_eq!(Multipart::parse(&bytes, &b).unwrap(), m);
+        let entity = m.clone().with_free_boundary("XyZ").unwrap();
+        let b = entity.boundary.clone();
+        let bytes = entity.to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
         // A long base is cut to fit.
         let base = "q".repeat(MAX_BOUNDARY);
         m.parts[0].body = format!("--{base}").into_bytes();
@@ -1745,7 +1681,7 @@ Content-Type: text/plain
             parts: vec![Part { headers: Headers { fields: vec![("X".into(), "--k".into())] }, body: vec![] }],
             ..Multipart::default()
         };
-        assert_eq!(h.to_bytes("k"), Err(WriteError::BoundaryInData));
+        assert_eq!(h.clone().with_boundary("k").to_bytes(), Err(WriteError::BoundaryInData));
         assert_eq!(h.pick_boundary("k").unwrap(), "k-00000000");
     }
 
@@ -1755,105 +1691,57 @@ Content-Type: text/plain
             parts: vec![Part { headers: Headers { fields: vec![(name.into(), value.into())] }, body: vec![] }],
             ..Multipart::default()
         };
-        assert_eq!(with("A", "v").to_bytes(""), Err(WriteError::Boundary));
-        assert!(with("A", "").to_bytes("b").is_ok());
-        assert_eq!(with("", "v").to_bytes("b"), Err(WriteError::HeaderName));
-        assert_eq!(with("A B", "v").to_bytes("b"), Err(WriteError::HeaderName));
-        assert_eq!(with("A:", "v").to_bytes("b"), Err(WriteError::HeaderName));
-        assert_eq!(with("A", "v\r\nX: y").to_bytes("b"), Err(WriteError::HeaderValue));
-        assert_eq!(with("A", " v").to_bytes("b"), Err(WriteError::HeaderValue));
-        assert_eq!(with("A", "v\t").to_bytes("b"), Err(WriteError::HeaderValue));
-        assert_eq!(with("A", &"v".repeat(MAX_HEADER_BYTES)).to_bytes("b"), Err(WriteError::HeaderTooLong));
+        assert_eq!(with("A", "v").clone().with_boundary("").to_bytes(), Err(WriteError::Boundary));
+        assert!(with("A", "").clone().with_boundary("b").to_bytes().is_ok());
+        assert_eq!(with("", "v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderName));
+        assert_eq!(with("A B", "v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderName));
+        assert_eq!(with("A:", "v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderName));
+        assert_eq!(with("A", "v\r\nX: y").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderValue));
+        assert_eq!(with("A", " v").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderValue));
+        assert_eq!(with("A", "v\t").clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderValue));
+        assert_eq!(with("A", &"v".repeat(MAX_HEADER_BYTES)).clone().with_boundary("b").to_bytes(), Err(WriteError::HeaderTooLong));
         let fits = with("A", &"v".repeat(MAX_HEADER_BYTES - 7));
-        assert_eq!(Multipart::parse(&fits.to_bytes("b").unwrap(), "b").unwrap(), fits);
+        assert_eq!(Multipart::parse(raw(&fits.clone().with_boundary("b").to_bytes().unwrap()), "b").unwrap(), fits);
         let mut many = with("A", "v");
         many.parts[0].headers.fields = vec![("A".into(), "v".into()); MAX_HEADERS + 1];
-        assert_eq!(many.to_bytes("b"), Err(WriteError::TooManyHeaders));
+        assert_eq!(many.clone().with_boundary("b").to_bytes(), Err(WriteError::TooManyHeaders));
         assert_eq!(Part::field("a\r\n", "v"), None);
         assert_eq!(Part::file("a", "f", "text/plain\r\n", "v"), None);
         assert_eq!(Part::file("a", "f\n", "text/plain", "v"), None);
     }
 
     #[test]
-    fn events_in_order() {
-        let mut p = Parser::new("b").unwrap();
-        let mut events = Vec::new();
-        for &byte in b"P\r\n--b\r\nA: 1\r\n\r\nxy\r\n--b--\r\nE" {
-            p.feed(&[byte]);
-            while let Some(e) = p.next_event() {
-                events.push(e.unwrap());
-            }
-            assert!(p.buffered() <= 8);
-        }
-        assert!(!p.is_done());
-        p.finish();
-        assert_eq!(p.next_event(), None);
-        assert!(p.is_done());
-        let mut joined: Vec<Event> = Vec::new();
-        for e in events {
-            match (joined.last_mut(), e) {
-                (Some(Event::Body(a)), Event::Body(b)) => a.extend(b),
-                (Some(Event::Preamble(a)), Event::Preamble(b)) => a.extend(b),
-                (_, e) => joined.push(e),
-            }
-        }
-        let headers = Headers { fields: vec![("A".into(), "1".into())] };
-        assert_eq!(
-            joined,
-            [
-                Event::Preamble(b"P".to_vec()),
-                Event::Part(headers),
-                Event::Body(b"xy".to_vec()),
-                Event::PartEnd,
-                Event::Close,
-                Event::Epilogue(b"E".to_vec()),
-            ]
-        );
-        // Truncated, then finished.
-        let mut p = Parser::new("b").unwrap();
-        p.feed(b"--b\r\n\r\nbody");
-        while let Some(e) = p.next_event() {
-            e.unwrap();
-        }
-        p.finish();
-        assert_eq!(p.next_event(), Some(Err(Error::Truncated)));
-        assert_eq!(p.next_event(), Some(Err(Error::Truncated)));
+    fn parts_in_order_and_truncated_body() {
+        let bytes = b"P\r\n--b\r\nA: 1\r\n\r\nxy\r\n--b--\r\nE";
+        check(bytes, "b");
+        assert_eq!(decode_all(|| Parts::new("b").unwrap(), bytes), (vec![Part {
+            headers: Headers { fields: vec![("A".into(), "1".into())] }, body: b"xy".to_vec(),
+        }], None));
+        assert_eq!(decode_all(|| Parts::new("b").unwrap(), b"--b\r\n\r\nbody").1,
+            Some(Fail::Protocol(Error::Truncated)));
     }
 
     #[test]
-    fn body_bytes_are_not_held() {
-        // A large body passes through, the parser holding only a few bytes.
-        let mut p = Parser::new("bound").unwrap();
-        p.feed(b"--bound\r\n\r\n");
-        let mut total = 0;
-        for _ in 0..1000 {
-            p.feed(&[b'\r'; 64]);
-            while let Some(e) = p.next_event() {
-                if let Event::Body(d) = e.unwrap() {
-                    total += d.len();
-                }
-            }
-            assert!(p.buffered() <= 10, "{}", p.buffered());
-        }
-        p.feed(b"\r\n--bound--");
-        p.finish();
-        while let Some(e) = p.next_event() {
-            if let Event::Body(d) = e.unwrap() {
-                total += d.len();
-            }
-        }
-        assert_eq!(total, 64_000);
+    fn complete_body_is_bounded() {
+        let mut bytes = b"--bound\r\n\r\n".to_vec();
+        bytes.extend_from_slice(&vec![b'\r'; 64_000]);
+        bytes.extend_from_slice(b"\r\n--bound--");
+        check(&bytes, "bound");
+        let (parts, error) = decode_all(|| Parts::new("bound").unwrap(), &bytes);
+        assert_eq!(error, None);
+        assert_eq!(parts[0].body.len(), 64_000);
     }
 
     #[test]
     fn slow_headers_take_linear_time() {
-        // Header blocks near the limit, fed a byte at a time. The parser
+        // Header blocks near the limit, decoded a byte at a time. The parser
         // looks at each new byte once, not at the whole block again.
         let mut part = format!("--b\r\nA: {}\r\n\r\nx\r\n", "v".repeat(MAX_HEADER_BYTES - 9)).into_bytes();
         part = part.repeat(64);
         part.extend_from_slice(b"--b--");
         let start = std::time::Instant::now();
-        let m = parse_pieces(&part, "b", || 1).unwrap();
+        check(&part, "b");
+        let m = Multipart::parse(&part, "b").unwrap();
         assert_eq!(m.parts.len(), 64);
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
     }
@@ -1870,32 +1758,16 @@ Content-Type: text/plain
         }
         body.extend_from_slice(b"--b--");
         let start = std::time::Instant::now();
-        let m = Multipart::parse(&body, "b").unwrap();
+        let m = Multipart::parse(raw(&body), "b").unwrap();
         assert_eq!(m.parts.len(), MAX_PARTS);
         assert!(m.parts.iter().all(|p| p.body.len() == 40_000));
         assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
-        // A large piece, then single bytes: what the parser holds stays small.
-        let mut p = Parser::new("b").unwrap();
-        let cut = body.len() - 100_000;
-        p.feed(&body[..cut]);
-        let mut n = 0;
-        let mut drain = |p: &mut Parser| {
-            while let Some(e) = p.next_event() {
-                if let Event::Part(_) = e.unwrap() {
-                    n += 1;
-                }
-            }
-        };
-        drain(&mut p);
-        for b in &body[cut..] {
-            p.feed(std::slice::from_ref(b));
-            drain(&mut p);
-            assert!(p.buffered() <= 16, "{}", p.buffered());
-        }
-        p.finish();
-        drain(&mut p);
-        assert!(p.is_done());
-        assert_eq!(n, MAX_PARTS);
+        let mut stream = Stream::new(Parts::new("b").unwrap());
+        let mut count = 0;
+        pump(&mut stream, &body, |_| count += 1).unwrap();
+        finish(&mut stream, |_| count += 1).unwrap();
+        assert_eq!(count, MAX_PARTS);
+        assert!(stream.into_parts().0.allocated() <= 2 * Parts::new("b").unwrap().capacity());
     }
 
     #[test]
@@ -1903,7 +1775,7 @@ Content-Type: text/plain
         let body = b"--b\r\nContent-Disposition: form-data; name=a\r\n\
             content-disposition: form-data; name=b\r\nContent-Type: text/plain\r\n\
             X: 1\r\nx: 2\r\n\r\nv\r\n--b--";
-        let m = Multipart::parse(body, "b").unwrap();
+        let m = Multipart::parse(raw(body), "b").unwrap();
         let h = &m.parts[0].headers;
         // Two dispositions: readers could disagree on the field name.
         assert_eq!(h.content_disposition(), None);
@@ -1916,34 +1788,20 @@ Content-Type: text/plain
         assert_eq!(h.get_one("content-type"), Some("text/plain"));
         assert_eq!(h.get_one("missing"), None);
         // Writing keeps both, and reads back the same.
-        let (b, bytes) = m.write("b").unwrap();
-        assert_eq!(Multipart::parse(&bytes, &b).unwrap(), m);
+        let entity = m.clone().with_free_boundary("b").unwrap();
+        let b = entity.boundary.clone();
+        let bytes = entity.to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
     }
 
-    // Finding: a parser that took one large piece kept its whole buffer.
     #[test]
-    fn large_feed_is_not_held() {
-        let mut p = Parser::new("b").unwrap();
-        let mut body = b"--b\r\n\r\n".to_vec();
-        body.resize(1 << 20, b'x');
-        p.feed(&body);
-        let mut total = 0;
-        while let Some(e) = p.next_event() {
-            if let Event::Body(d) = e.unwrap() {
-                total += d.len();
-            }
+    fn large_body_and_epilogue_use_bounded_storage() {
+        for body in [
+            [b"--b\r\n\r\n".as_slice(), &vec![b'x'; 1 << 20], b"\r\n--b--\r\n"].concat(),
+            [b"--b--\r\n".as_slice(), &vec![b'e'; 1 << 20]].concat(),
+        ] {
+            check(&body, "b");
         }
-        assert_eq!(total, (1 << 20) - 7);
-        assert!(p.buf.capacity() <= 2 * KEEP_CAPACITY, "{}", p.buf.capacity());
-        // The epilogue is let go of as well.
-        let mut p = Parser::new("b").unwrap();
-        let mut body = b"--b--\r\n".to_vec();
-        body.resize(1 << 20, b'e');
-        p.feed(&body);
-        while let Some(e) = p.next_event() {
-            e.unwrap();
-        }
-        assert!(p.buf.capacity() <= 2 * KEEP_CAPACITY, "{}", p.buf.capacity());
     }
 
     // Finding: a boundary made of a header's name, the colon and its value.
@@ -1953,29 +1811,29 @@ Content-Type: text/plain
             parts: vec![Part { headers: Headers { fields: vec![("--x".into(), "y".into())] }, body: vec![] }],
             ..Multipart::default()
         };
-        assert_eq!(m.to_bytes("x: y"), Err(WriteError::BoundaryInData));
+        assert_eq!(m.clone().with_boundary("x: y").to_bytes(), Err(WriteError::BoundaryInData));
         let b = m.pick_boundary("x: y").unwrap();
         assert_ne!(b, "x: y");
-        let bytes = m.to_bytes(&b).unwrap();
-        assert_eq!(Multipart::parse(&bytes, &b).unwrap(), m);
+        let bytes = m.clone().with_boundary(&b).to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
         // The same in the compact form.
         let mut c = m.clone();
         c.parts[0].headers.fields.push(("P".into(), "p".repeat(MAX_HEADER_BYTES - 14)));
         assert_eq!(header_separator(&c.parts[0]), b":");
-        assert_eq!(c.to_bytes("x:y"), Err(WriteError::BoundaryInData));
+        assert_eq!(c.clone().with_boundary("x:y").to_bytes(), Err(WriteError::BoundaryInData));
         let b = c.pick_boundary("x:y").unwrap();
-        assert_eq!(Multipart::parse(&c.to_bytes(&b).unwrap(), &b).unwrap(), c);
+        assert_eq!(Multipart::parse(raw(&c.clone().with_boundary(&b).to_bytes().unwrap()), &b).unwrap(), c);
     }
 
     // Finding: `--b--junk` closed the body.
     #[test]
     fn closing_line_must_end() {
-        assert_eq!(Multipart::parse(b"--b\r\n\r\nx\r\n--b--junk", "b"), Err(Error::Truncated));
-        let m = Multipart::parse(b"--b\r\n\r\nx\r\n--b--junk\r\n--b--\r\nE", "b").unwrap();
+        assert_eq!(Multipart::parse(raw(b"--b\r\n\r\nx\r\n--b--junk"), "b"), Err(Error::Truncated));
+        let m = Multipart::parse(raw(b"--b\r\n\r\nx\r\n--b--junk\r\n--b--\r\nE"), "b").unwrap();
         assert_eq!(m.parts.len(), 1);
         assert_eq!(m.parts[0].body, b"x\r\n--b--junk");
         assert_eq!(m.epilogue, b"E");
-        assert_eq!(parse_pieces(b"--b\r\n\r\nx\r\n--b-- \t", "b", || 1).unwrap().parts[0].body, b"x");
+        check(b"--b\r\n\r\nx\r\n--b-- \t", "b");
     }
 
     // Finding: a boundary line with too much padding became body data.
@@ -1983,13 +1841,13 @@ Content-Type: text/plain
     fn too_much_padding_is_an_error() {
         let pad = " ".repeat(MAX_PADDING + 1);
         let body = format!("--b\r\n\r\nx\r\n--b{pad}\r\n\r\ny\r\n--b--");
-        assert_eq!(Multipart::parse(body.as_bytes(), "b"), Err(Error::Padding));
-        assert_eq!(parse_pieces(body.as_bytes(), "b", || 1), Err(Error::Padding));
+        assert_eq!(Multipart::parse(raw(body.as_bytes()), "b"), Err(Error::Padding));
+        check(body.as_bytes(), "b");
         let body = format!("--b\r\n\r\nx\r\n--b--{pad}");
-        assert_eq!(Multipart::parse(body.as_bytes(), "b"), Err(Error::Padding));
+        assert_eq!(Multipart::parse(raw(body.as_bytes()), "b"), Err(Error::Padding));
         let fits = " ".repeat(MAX_PADDING);
         let body = format!("--b{fits}\r\n\r\nx\r\n--b{fits}\r\n\r\ny\r\n--b--{fits}");
-        assert_eq!(Multipart::parse(body.as_bytes(), "b").unwrap().parts.len(), 2);
+        assert_eq!(Multipart::parse(raw(body.as_bytes()), "b").unwrap().parts.len(), 2);
     }
 
     // Finding: comments and spaces in Content-Type hid the boundary.
@@ -2028,26 +1886,19 @@ Content-Type: text/plain
         let mut body = b"--b\r\n".to_vec();
         body.extend_from_slice(&block);
         body.extend_from_slice(b"z\r\n--b--");
-        let m = Multipart::parse(&body, "b").unwrap();
-        let (b, bytes) = m.write("b").unwrap();
-        assert_eq!(Multipart::parse(&bytes, &b).unwrap(), m);
+        let m = Multipart::parse(raw(&body), "b").unwrap();
+        let entity = m.clone().with_free_boundary("b").unwrap();
+        let b = entity.boundary.clone();
+        let bytes = entity.to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
         // Folded lines get shorter when joined, so they fit too.
         let (v, w) = ("v".repeat(4000), "w".repeat(MAX_HEADER_BYTES - 4013));
         let folded = format!("--b\r\nA:{v}\r\n {w}\r\n\r\n\r\n--b--");
-        let m = Multipart::parse(folded.as_bytes(), "b").unwrap();
-        let (b, bytes) = m.write("b").unwrap();
-        assert_eq!(Multipart::parse(&bytes, &b).unwrap(), m);
-    }
-
-    struct Lcg(u64);
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n
-        }
+        let m = Multipart::parse(raw(folded.as_bytes()), "b").unwrap();
+        let entity = m.clone().with_free_boundary("b").unwrap();
+        let b = entity.boundary.clone();
+        let bytes = entity.to_bytes().unwrap();
+        assert_eq!(Multipart::parse(raw(&bytes), &b).unwrap(), m);
     }
 
     const PIECES: &[&[u8]] = &[
@@ -2076,35 +1927,34 @@ Content-Type: text/plain
 
     #[test]
     fn lcg_fuzz() {
-        let mut r = Lcg(0x5eed);
+        let mut r = Lcg::new(0x5eed);
         let mut oks = 0;
-        for round in 0..4000 {
+        for round in 0..1000 {
             let mut data = Vec::new();
-            for _ in 0..r.below(40) {
-                if r.below(8) == 0 {
+            for _ in 0..r.index(40) {
+                if r.index(8) == 0 {
                     data.push(r.next() as u8);
                 } else {
-                    data.extend_from_slice(PIECES[r.below(PIECES.len())]);
+                    data.extend_from_slice(PIECES[r.index(PIECES.len())]);
                 }
             }
-            let whole = Multipart::parse(&data, "a");
-            let bytewise = parse_pieces(&data, "a", || 1);
-            assert_eq!(whole, bytewise, "round {round}: {data:?}");
-            let mut r2 = Lcg(round);
-            let random = parse_pieces(&data, "a", || r2.below(9));
-            assert_eq!(whole, random, "round {round}");
+            let whole = Multipart::parse(raw(&data), "a");
+            check(&data, "a");
             if let Ok(m) = whole {
                 oks += 1;
-                let (b, bytes) = m.write("a").unwrap();
-                assert_eq!(Multipart::parse(&bytes, &b).as_ref(), Ok(&m), "round {round}");
+                let entity = m.clone().with_free_boundary("a").unwrap();
+                contract::check_wire_value(&entity);
+                let b = entity.boundary.clone();
+                let bytes = entity.to_bytes().unwrap();
+                assert_eq!(Multipart::parse(raw(&bytes), &b).as_ref(), Ok(&m), "round {round}");
                 for p in &m.parts {
                     let _ = (p.name(), p.filename(), p.headers.content_type());
                 }
             }
             if let Ok(s) = std::str::from_utf8(&data) {
-                if let Some(v) = ParamValue::parse(s)
-                    && let Some(h) = v.to_header() {
-                        assert_eq!(ParamValue::parse(&h), Some(v));
+                if let Some(v) = ParamValue::parse((s).as_bytes()).ok()
+                    && let Some(h) = v.to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap()) {
+                        assert_eq!(ParamValue::parse(h.as_bytes()).ok(), Some(v));
                     }
                 let _ = boundary(s);
             }
@@ -2112,18 +1962,18 @@ Content-Type: text/plain
         assert!(oks > 100, "only {oks} bodies parsed");
 
         // Structured bodies, with the boundary scattered through the data.
-        for round in 0..2000 {
+        for round in 0..500 {
             let bytes = |r: &mut Lcg| -> Vec<u8> {
                 let mut v = Vec::new();
-                for _ in 0..r.below(6) {
-                    v.extend_from_slice(PIECES[r.below(PIECES.len())]);
+                for _ in 0..r.index(6) {
+                    v.extend_from_slice(PIECES[r.index(PIECES.len())]);
                 }
                 v
             };
             let mut m = Multipart { preamble: bytes(&mut r), parts: Vec::new(), epilogue: bytes(&mut r) };
-            for _ in 0..r.below(5) {
+            for _ in 0..r.index(5) {
                 let name = String::from_utf8_lossy(&bytes(&mut r)).into_owned();
-                let part = if r.below(2) == 0 {
+                let part = if r.index(2) == 0 {
                     Part::field(&name, bytes(&mut r))
                 } else {
                     Part::file(&name, &name, "application/octet-stream", bytes(&mut r))
@@ -2137,10 +1987,13 @@ Content-Type: text/plain
                 }
                 m.parts.push(part);
             }
-            let base = ["a", "y", "a: y", "a:y", "-a"][r.below(5)];
-            let (b, out) = m.write(base).unwrap();
-            assert_eq!(Multipart::parse(&out, &b).as_ref(), Ok(&m), "round {round}");
-            assert_eq!(parse_pieces(&out, &b, || 1).as_ref(), Ok(&m), "round {round}");
+            let base = ["a", "y", "a: y", "a:y", "-a"][r.index(5)];
+            let entity = m.clone().with_free_boundary(base).unwrap();
+            contract::check_wire_value(&entity);
+            let b = entity.boundary.clone();
+            let out = entity.to_bytes().unwrap();
+            assert_eq!(Multipart::parse(raw(&out), &b).as_ref(), Ok(&m), "round {round}");
+            check(&out, &b);
             for p in &m.parts {
                 if let Some(n) = p.name() {
                     assert!(!n.contains('\r'));

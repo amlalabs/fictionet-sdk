@@ -1,52 +1,22 @@
 use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::{json, mime_multipart as mime, protobuf, urlencoded_form as form, xml};
 use std::fmt::Debug;
+use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
 
-fn run<D: Decode>(decoder: D, input: &[u8], chunk: usize) -> (Vec<D::Item>, Option<Fail<D::Error>>)
-where
-    D::Error: Clone + Debug + PartialEq,
-{
-    let capacity = decoder.capacity();
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    let mut failure = None;
-    for bytes in input.chunks(chunk.max(1)) {
-        if let Err(e) = pump(&mut stream, bytes, |item| items.push(item)) {
-            failure = Some(e);
-            break;
-        }
-        assert!(stream.buffered() <= capacity);
-    }
-    if failure.is_none() {
-        failure = finish(&mut stream, |item| items.push(item)).err();
-    }
-    assert!(stream.is_done());
-    assert_eq!(stream.failed(), failure.as_ref());
-    assert!(stream.next().is_none());
-    (items, failure)
-}
-
-fn prefixes<D: Decode>(make: impl Fn() -> D, input: &[u8])
+fn check<D: Decode>(make: impl Fn() -> D, input: &[u8])
 where
     D::Item: PartialEq + Debug,
     D::Error: Clone + Debug + PartialEq,
 {
-    for cut in 0..=input.len() {
-        let prefix = &input[..cut];
-        assert_eq!(
-            run(make(), prefix, input.len()),
-            run(make(), prefix, 1),
-            "prefix {cut}"
-        );
-    }
+    let allocation = 2 * make().capacity();
+    contract::check_decode_with_alloc_limit(make, input, allocation);
 }
 
 #[test]
 fn json_chunked_round_trip_and_eof() {
     let bytes = br#" {"method":"echo","params":["hi",2]} [true,null] "last" 12.5"#;
-    contract::check_stack(json::Values::new, bytes);
-    prefixes(json::Values::new, bytes);
-    let (values, error) = run(json::Values::new(), bytes, 1);
+    check(json::Values::new, bytes);
+    let (values, error) = decode_all(json::Values::new, bytes);
     assert_eq!(error, None);
     assert_eq!(values.len(), 4);
     let mut written = Vec::new();
@@ -57,15 +27,15 @@ fn json_chunked_round_trip_and_eof() {
         Wire::write(value, &mut written).unwrap();
         written.push(b' ');
     }
-    assert_eq!(run(json::Values::new(), &written, 3), (values, None));
+    assert_eq!(decode_all(json::Values::new, &written), (values, None));
     for partial in [b"tru".as_slice(), b"1e-", b"-", b"[1", b"\"abc"] {
         assert!(matches!(
-            run(json::Values::new(), partial, 1).1,
+            decode_all(json::Values::new, partial).1,
             Some(Fail::Truncated { .. })
         ));
     }
     assert!(matches!(
-        run(json::Values::new(), b"{} [x]", 1).1,
+        decode_all(json::Values::new, b"{} [x]").1,
         Some(Fail::Protocol(json::Error {
             kind: json::ErrorKind::UnexpectedByte(b'x'),
             ..
@@ -91,7 +61,7 @@ fn json_rejects_oversize_at_named_capacity() {
     let exact = json::Value::String("a".repeat(json::MAX_SIZE - 2));
     let bytes = Wire::to_bytes(&exact).unwrap();
     assert_eq!(
-        run(json::Values::new(), &bytes, bytes.len()),
+        decode_all(json::Values::new, &bytes),
         (vec![exact], None)
     );
 }
@@ -104,7 +74,7 @@ fn json_eof_preserves_scalar_limit_errors() {
             ..json::Limits::default()
         };
         assert!(matches!(
-            run(json::Values::with_limits(limits), bytes, 1).1,
+            decode_all(|| json::Values::with_limits(limits), bytes).1,
             Some(Fail::Protocol(json::Error {
                 kind: json::ErrorKind::TooManyElements,
                 ..
@@ -114,28 +84,21 @@ fn json_eof_preserves_scalar_limit_errors() {
 }
 
 #[test]
-#[allow(deprecated)]
-fn json_scalar_delimiter_errors_match_legacy() {
-    for input in [b"tru}".as_slice(), b"[0] fals]", b"nul,", b"tr "] {
-        let mut legacy = json::Decoder::new();
-        legacy.feed(input);
-        let expected = loop {
-            if let Err(error) = legacy.next_value().expect("delimiter completes the scalar") {
-                break error;
-            }
-        };
-        for chunk in [1, input.len()] {
-            assert_eq!(
-                run(json::Values::new(), input, chunk).1,
-                Some(Fail::Protocol(expected))
-            );
-        }
+fn json_scalar_delimiter_errors() {
+    for (input, byte, offset) in [
+        (b"tru}".as_slice(), b'}', 3),
+        (b"[0] fals]", b']', 8),
+        (b"nul,", b',', 3),
+        (b"tr ", b' ', 2),
+    ] {
+        check(json::Values::new, input);
+        assert_eq!(decode_all(json::Values::new, input).1,
+            Some(Fail::Protocol(json::Error { kind: json::ErrorKind::UnexpectedByte(byte), offset })));
     }
 }
 
 #[test]
-#[allow(deprecated)]
-fn json_depth_errors_match_legacy() {
+fn json_depth_errors() {
     let mut nested = b"[1".to_vec();
     nested.extend_from_slice(&[b'['; 128]);
     for (input, limits) in [
@@ -143,44 +106,31 @@ fn json_depth_errors_match_legacy() {
         (b"{{".to_vec(), json::Limits { depth: 1, ..json::Limits::default() }),
     ] {
         let expected = json::parse_with(&input, &limits).unwrap_err();
-        let mut legacy = json::Decoder::with_limits(limits);
-        legacy.feed(&input);
-        assert_eq!(legacy.next_value(), Some(Err(expected)));
-        for chunk in [1, input.len()] {
             assert_eq!(
-                run(json::Values::with_limits(limits), &input, chunk).1,
-                Some(Fail::Protocol(expected))
-            );
-        }
-        contract::check_decode(|| json::Values::with_limits(limits), &input);
+            decode_all(|| json::Values::with_limits(limits), &input).1,
+            Some(Fail::Protocol(expected))
+        );
+        check(|| json::Values::with_limits(limits), &input);
     }
 }
 
 #[test]
-#[allow(deprecated)]
-fn json_zero_depth_precedes_zero_size_as_in_legacy_decoder() {
+fn json_zero_depth_precedes_zero_size() {
     let limits = json::Limits { depth: 0, size: 0, ..json::Limits::default() };
     let expected = json::Error { kind: json::ErrorKind::TooDeep, offset: 0 };
-    let mut legacy = json::Decoder::with_limits(limits);
-    legacy.feed(b"[");
-    assert_eq!(legacy.next_value(), Some(Err(expected)));
     assert_eq!(
-        run(json::Values::with_limits(limits), b"[", 1).1,
+        decode_all(|| json::Values::with_limits(limits), b"[").1,
         Some(Fail::Protocol(expected))
     );
-    contract::check_decode(|| json::Values::with_limits(limits), b"[");
+    check(|| json::Values::with_limits(limits), b"[");
 }
 
 #[test]
 fn form_stream_accepts_expanding_replacement_text() {
     let mut input = b"a=".to_vec();
     input.extend(vec![0xff; 200_000]);
-    let expected: Vec<_> = form::parse(&input)
-        .unwrap()
-        .into_iter()
-        .map(form::Field)
-        .collect();
-    let (fields, error) = run(form::Fields::new(), &input, 4096);
+    let expected = vec![form::Field(("a".into(), "�".repeat(200_000)))];
+    let (fields, error) = decode_all(form::Fields::new, &input);
     assert_eq!(error, None);
     assert!(fields == expected);
     assert_eq!(
@@ -208,27 +158,27 @@ fn multipart_preamble_padding_with_crlf_contract() {
     let mut input = b"x\r\n--a".to_vec();
     input.extend_from_slice(&[b' '; 65]);
     input.extend_from_slice(b"\r\n");
-    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input);
+    check(|| mime::Parts::new("a").unwrap(), &input);
 }
 
 #[test]
 fn multipart_preamble_padding_without_crlf_contract() {
     let mut input = b"x\r\n--a".to_vec();
     input.extend_from_slice(&[b' '; 65]);
-    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input);
+    check(|| mime::Parts::new("a").unwrap(), &input);
 }
 
 #[test]
 fn multipart_preamble_over_limit_with_boundary_contract() {
     let mut input = vec![b'x'; mime::MAX_PART + 10];
     input.extend_from_slice(b"\r\n--b--\r\n");
-    contract::check_decode(|| mime::Parts::new("b").unwrap(), &input);
+    check(|| mime::Parts::new("b").unwrap(), &input);
 }
 
 #[test]
 fn multipart_preamble_over_limit_without_boundary_contract() {
     let input = vec![b'p'; mime::MAX_PART + 10];
-    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input);
+    check(|| mime::Parts::new("a").unwrap(), &input);
 }
 
 #[test]
@@ -242,7 +192,7 @@ fn multipart_preamble_fuzz_crash_contract() {
     // The fuzz target uses 0x0d % 8 candidate bytes as the boundary.
     // They start with LF, so it falls back to "a" and drops only 0x0d.
     assert!(!mime::valid_boundary(std::str::from_utf8(&input[1..6]).unwrap()));
-    contract::check_decode(|| mime::Parts::new("a").unwrap(), &input[1..]);
+    check(|| mime::Parts::new("a").unwrap(), &input[1..]);
 }
 
 #[test]
@@ -255,17 +205,16 @@ fn multipart_preamble_keeps_limits_and_line_boundaries() {
         b"x\r\n--bx\r\n--b\r\n\r\nbody\r\n--b--\r\n",
         b"x\r\n--b-- \t",
     ] {
-        prefixes(make, input);
-        contract::check_decode(make, input);
+            check(make, input);
         match mime::Multipart::parse(input, "b") {
-            Ok(body) => assert_eq!(run(make(), input, 1), (body.parts, None)),
-            Err(_) => assert!(run(make(), input, 1).1.is_some()),
+            Ok(body) => assert_eq!(decode_all(make, input), (body.parts, None)),
+            Err(_) => assert!(decode_all(make, input).1.is_some()),
         }
     }
     for size in [mime::MAX_PART, mime::MAX_PART + 1] {
         let mut input = vec![b'x'; size];
         input.extend_from_slice(b"\r\n--b--\r\n");
-        let error = run(make(), &input, 4096).1;
+        let error = decode_all(make, &input).1;
         if size == mime::MAX_PART {
             assert_eq!(error, None);
         } else {
@@ -276,14 +225,14 @@ fn multipart_preamble_keeps_limits_and_line_boundaries() {
 
 #[test]
 fn document_streams_distinguish_empty_from_unfinished() {
-    assert_eq!(run(xml::Events::new(), b"", 1), (vec![], None));
+    assert_eq!(decode_all(xml::Events::new, b""), (vec![], None));
     assert_eq!(
-        xml::parse(b"").unwrap_err().kind,
+        xml::Document::parse(b"").unwrap_err().kind,
         xml::ErrorKind::UnexpectedEnd
     );
     for input in [b" ".as_slice(), b"<?xml version='1.0'?>", b"<r>"] {
         assert!(matches!(
-            run(xml::Events::new(), input, 1).1,
+            decode_all(xml::Events::new, input).1,
             Some(Fail::Protocol(xml::Error {
                 kind: xml::ErrorKind::UnexpectedEnd,
                 ..
@@ -291,65 +240,50 @@ fn document_streams_distinguish_empty_from_unfinished() {
         ));
     }
     let make = || mime::Parts::new("b").unwrap();
-    assert_eq!(run(make(), b"", 1), (vec![], None));
+    assert_eq!(decode_all(make, b""), (vec![], None));
     assert_eq!(
         mime::Multipart::parse(b"", "b"),
         Err(mime::Error::Truncated)
     );
     for input in [b"hello".as_slice(), b"--b\r\n"] {
         assert_eq!(
-            run(make(), input, 1).1,
+            decode_all(make, input).1,
             Some(Fail::Protocol(mime::Error::Truncated))
         );
     }
 }
 
 #[test]
-fn protobuf_grpc_matches_prefix_parser() {
-    use fictionet::stdlib::codec::Step;
-    let framing = protobuf::Framing::Grpc;
-    let mut cases = vec![
-        vec![],
-        vec![2],
-        vec![0xff],
-        vec![0, 0, 0, 0, 0],
-        vec![1, 0, 0, 0, 2, 8, 1],
-    ];
-    let mut oversize = vec![0];
-    oversize.extend_from_slice(&((protobuf::MAX_MESSAGE + 1) as u32).to_be_bytes());
-    cases.push(oversize);
-    for bytes in cases {
-        for cut in 0..=bytes.len() {
-            let input = &bytes[..cut];
-            let expected = protobuf::Frame::parse(framing, input).map(|parsed| match parsed {
-                Some((frame, used)) => Step::Item(frame, used),
-                None => Step::Need,
-            });
-            for eof in [false, true] {
-                assert_eq!(protobuf::Frames::new(framing).decode(input, eof), expected);
-            }
-        }
-    }
+fn grpc_composes_with_protobuf_messages() {
+    use fictionet::stdlib::grpc;
+    let message = protobuf::Message {
+        fields: vec![protobuf::Field { number: 1, value: protobuf::Value::Varint(1) }],
+    };
+    let frame = grpc::Message { compressed: false, data: message.to_bytes().unwrap() };
+    let bytes = Wire::to_bytes(&frame).unwrap();
+    check(grpc::Messages::new, &bytes);
+    let (items, error) = decode_all(|| grpc::Messages::new().map(|frame| protobuf::Message::parse(&frame.data)), &bytes);
+    assert_eq!(items, [Ok(message)]);
+    assert_eq!(error, None);
 }
 
 #[test]
 fn xml_chunked_round_trip_and_eof() {
     let bytes = br#"<?xml version="1.0"?><!DOCTYPE r [<!ATTLIST r n CDATA "v">]><r xmlns:p="urn:p"><p:c/>text&amp;more</r><!--tail--> "#;
-    contract::check_decode(xml::Events::new, bytes);
+    check(xml::Events::new, bytes);
     contract::check_wire::<xml::Document>(bytes);
-    prefixes(xml::Events::new, bytes);
-    let expected = xml::parse(bytes).unwrap();
-    assert_eq!(run(xml::Events::new(), bytes, 1), (expected.clone(), None));
+    let expected = xml::Document::parse(bytes).unwrap().events().unwrap();
+    assert_eq!(decode_all(xml::Events::new, bytes), (expected.clone(), None));
     let frame = <xml::Document as Wire>::parse(bytes).unwrap();
     let encoded = Wire::to_bytes(&frame).unwrap();
     assert_eq!(encoded, bytes);
-    assert_eq!(run(xml::Events::new(), &encoded, 7), (expected, None));
+    assert_eq!(decode_all(xml::Events::new, &encoded), (expected, None));
     assert!(<xml::Document as Wire>::parse(b"<r/><s/>").is_err());
     assert!(matches!(
-        run(xml::Events::new(), b"<!--unfinished", 1).1,
+        decode_all(xml::Events::new, b"<!--unfinished").1,
         Some(Fail::Truncated { .. })
     ));
-    let (events, error) = run(xml::Events::new(), b"<r>final text", 1);
+    let (events, error) = decode_all(xml::Events::new, b"<r>final text");
     assert_eq!(events.last(), Some(&xml::Event::Text("final text".into())));
     assert!(matches!(
         error,
@@ -359,7 +293,7 @@ fn xml_chunked_round_trip_and_eof() {
         }))
     ));
     assert!(matches!(
-        run(xml::Events::new(), b"<r><", 1).1,
+        decode_all(xml::Events::new, b"<r><").1,
         Some(Fail::Protocol(xml::Error {
             kind: xml::ErrorKind::UnexpectedEnd,
             ..
@@ -387,14 +321,13 @@ fn xml_rejects_oversize_at_named_capacity() {
 #[test]
 fn form_chunked_round_trip_and_eof() {
     let bytes = b"&name=Alice+Smith&&x=%E2%82%AC&flag&last=%";
-    contract::check_decode(form::Fields::new, bytes);
-    prefixes(form::Fields::new, bytes);
-    let expected: Vec<_> = form::parse(bytes)
-        .unwrap()
+    check(form::Fields::new, bytes);
+    let expected: Vec<_> = form::Form::parse(bytes)
+        .unwrap().pairs
         .into_iter()
         .map(form::Field)
         .collect();
-    assert_eq!(run(form::Fields::new(), bytes, 1), (expected.clone(), None));
+    assert_eq!(decode_all(form::Fields::new, bytes), (expected.clone(), None));
     let mut written = Vec::new();
     for frame in &expected {
         let one = Wire::to_bytes(frame).unwrap();
@@ -405,7 +338,7 @@ fn form_chunked_round_trip_and_eof() {
         }
         frame.write(&mut written).unwrap();
     }
-    assert_eq!(run(form::Fields::new(), &written, 3), (expected, None));
+    assert_eq!(decode_all(form::Fields::new, &written), (expected, None));
     assert_eq!(
         <form::Field as Wire>::parse(b"a=b&c=d"),
         Err(form::FieldError::Trailing)
@@ -416,7 +349,7 @@ fn form_chunked_round_trip_and_eof() {
     );
     // Malformed escapes are complete fields under the form grammar.
     assert_eq!(
-        run(form::Fields::new(), b"a=%A", 1),
+        decode_all(form::Fields::new, b"a=%A"),
         (vec![form::Field(("a".into(), "%A".into()))], None)
     );
 }
@@ -452,11 +385,11 @@ fn multipart() -> mime::Multipart {
 #[test]
 fn multipart_chunked_round_trip_and_eof() {
     let body = multipart();
-    let bytes = body.to_bytes("boundary").unwrap();
+    let entity = body.clone().with_boundary("boundary").to_bytes().unwrap();
+    let bytes = entity_body(&entity);
     let make = || mime::Parts::new("boundary").unwrap();
-    contract::check_decode(make, &bytes);
-    prefixes(make, &bytes);
-    assert_eq!(run(make(), &bytes, 1), (body.parts.clone(), None));
+    check(make, bytes);
+    assert_eq!(decode_all(make, bytes), (body.parts.clone(), None));
     let mut parts = Vec::new();
     for part in &body.parts {
         let one = Wire::to_bytes(part).unwrap();
@@ -467,16 +400,15 @@ fn multipart_chunked_round_trip_and_eof() {
         parts,
         ..mime::Multipart::default()
     }
-    .to_bytes("boundary")
+    .with_boundary("boundary").to_bytes()
     .unwrap();
-    assert_eq!(run(make(), &rewritten, 7), (body.parts, None));
+    assert_eq!(decode_all(make, entity_body(&rewritten)), (body.parts, None));
     for bytes in [b"--boundary--".as_slice(), b"--boundary-- \t"] {
-        assert_eq!(run(make(), bytes, 1), (vec![], None));
+        assert_eq!(decode_all(make, bytes), (vec![], None));
     }
     let bytes = b"--boundary\r\n\r\nlast\r\n--boundary--";
-    prefixes(make, bytes);
     assert_eq!(
-        run(make(), bytes, 1),
+        decode_all(make, bytes),
         (
             vec![mime::Part {
                 body: b"last".to_vec(),
@@ -486,17 +418,17 @@ fn multipart_chunked_round_trip_and_eof() {
         )
     );
     assert_eq!(
-        run(make(), b"--boundary\r\n\r\nlast", 1).1,
+        decode_all(make, b"--boundary\r\n\r\nlast").1,
         Some(Fail::Protocol(mime::Error::Truncated))
     );
     assert!(matches!(
-        run(make(), b"--boundary\r\nX: value", 1).1,
+        decode_all(make, b"--boundary\r\nX: value").1,
         Some(Fail::Truncated { .. })
     ));
 }
 
 #[test]
-fn multipart_header_errors_match_legacy_before_body_ends() {
+fn multipart_header_errors_before_body_ends() {
     let mut too_many = b"--b\r\n".to_vec();
     for _ in 0..=mime::MAX_HEADERS {
         too_many.extend_from_slice(b"X: a\r\n");
@@ -513,16 +445,13 @@ fn multipart_header_errors_match_legacy_before_body_ends() {
             pump(&mut stream, input, |_| panic!("invalid headers")),
             Err(Fail::Protocol(expected))
         );
-        for chunk in [1, input.len()] {
-            assert_eq!(run(make(), input, chunk), (vec![], Some(Fail::Protocol(expected))));
-        }
-        contract::check_decode(make, input);
+        assert_eq!(decode_all(make, input), (vec![], Some(Fail::Protocol(expected))));
+        check(make, input);
     }
 }
 
 #[test]
-fn multipart_matches_legacy_on_generated_bodies() {
-    use fictionet::stdlib::codec::test_support::Lcg;
+fn multipart_generated_bodies() {
     let starts: &[&[u8]] = &[
         b"preamble",
         b"--b\r\n",
@@ -535,21 +464,20 @@ fn multipart_matches_legacy_on_generated_bodies() {
     ];
     let mut rng = Lcg::new(0x726f756e6432);
     for _ in 0..2000 {
-        let mut input = starts[rng.below(starts.len() as u64) as usize].to_vec();
-        for _ in 0..rng.below(40) {
-            input.extend_from_slice(tokens[rng.below(tokens.len() as u64) as usize]);
+        let mut input = starts[rng.index(starts.len())].to_vec();
+        for _ in 0..rng.index(40) {
+            input.extend_from_slice(tokens[rng.index(tokens.len())]);
         }
+        check(|| mime::Parts::new("b").unwrap(), &input);
         let expected = mime::Multipart::parse(&input, "b").map(|body| body.parts);
-        for chunk in [1, input.len()] {
-            let (parts, error) = run(mime::Parts::new("b").unwrap(), &input, chunk);
-            let actual = match error {
-                None => Ok(parts),
-                Some(Fail::Protocol(e)) => Err(e),
-                Some(Fail::Truncated { .. }) => Err(mime::Error::Truncated),
-                Some(e) => panic!("{e:?}"),
-            };
-            assert_eq!(actual, expected, "input {input:?}, chunk {chunk}");
-        }
+        let (parts, error) = decode_all(|| mime::Parts::new("b").unwrap(), &input);
+        let actual = match error {
+            None => Ok(parts),
+            Some(Fail::Protocol(e)) => Err(e),
+            Some(Fail::Truncated { .. }) => Err(mime::Error::Truncated),
+            Some(e) => panic!("{e:?}"),
+        };
+        assert_eq!(actual, expected, "input {input:?}");
     }
 }
 
@@ -586,90 +514,38 @@ fn multipart_rejects_oversize_at_named_capacity() {
 }
 
 #[test]
-fn protobuf_chunked_round_trip_and_eof() {
-    let mut message = protobuf::Message::new();
-    message.fields.push(protobuf::Field {
-        number: 1,
-        value: protobuf::Value::Varint(150),
-    });
-    let frame = protobuf::Frame {
-        compressed: false,
-        data: Wire::to_bytes(&message).unwrap(),
+fn protobuf_round_trip_and_eof() {
+    let message = protobuf::Message {
+        fields: vec![protobuf::Field { number: 1, value: protobuf::Value::Varint(150) }],
     };
+    let frame = protobuf::Frame::from_message(&message).unwrap();
     contract::check_wire_value(&message);
     contract::check_wire_value(&frame);
-    contract::check_wire_value(&protobuf::DelimitedFrame(frame.clone()));
-    for framing in [protobuf::Framing::Grpc, protobuf::Framing::Delimited] {
-        let bytes = frame.to_bytes(framing).unwrap();
-        let make = || protobuf::Frames::new(framing);
-        contract::check_decode(make, &bytes);
-        contract::check_stack(|| make().map(|f| protobuf::Message::parse(&f.data)), &bytes);
-        prefixes(make, &bytes);
-        for cut in 1..bytes.len() {
-            assert!(matches!(
-                run(make(), &bytes[..cut], 1).1,
-                Some(Fail::Truncated { .. })
-            ));
-        }
-        assert_eq!(run(make(), &bytes, 1), (vec![frame.clone()], None));
-        let mut batch = bytes.clone();
-        // A bad message body is a per-item error, while framing continues.
-        batch.extend_from_slice(
-            &protobuf::Frame {
-                compressed: false,
-                data: vec![0],
-            }
-            .to_bytes(framing)
-            .unwrap(),
-        );
-        batch.extend_from_slice(&bytes);
-        let (items, error) = run(make().map(|f| protobuf::Message::parse(&f.data)), &batch, 1);
-        assert_eq!(
-            items,
-            vec![
-                Ok(message.clone()),
-                Err(protobuf::Error::FieldNumber(0)),
-                Ok(message.clone())
-            ]
-        );
-        assert_eq!(error, None);
-        contract::check_stack(|| make().map(|f| protobuf::Message::parse(&f.data)), &batch);
+    let bytes = Wire::to_bytes(&frame).unwrap();
+    check(protobuf::Frames::new, &bytes);
+    for cut in 1..bytes.len() {
+        assert!(matches!(decode_all(protobuf::Frames::new, &bytes[..cut]).1,
+            Some(Fail::Truncated { .. })));
     }
-    let mut extra = Wire::to_bytes(&frame).unwrap();
-    extra.push(0);
-    assert!(matches!(
-        <protobuf::Frame as Wire>::parse(&extra),
-        Err(protobuf::FrameParseError::Trailing { remaining: 1 })
-    ));
+    assert_eq!(decode_all(protobuf::Frames::new, &bytes), (vec![frame], None));
+    let mut batch = bytes.clone();
+    protobuf::Frame { data: vec![0] }.write(&mut batch).unwrap();
+    batch.extend_from_slice(&bytes);
+    let make = || protobuf::Frames::new().map(|f| protobuf::Message::parse(&f.data));
+    check(make, &batch);
+    assert_eq!(decode_all(make, &batch), (vec![Ok(message.clone()),
+        Err(protobuf::Error::FieldNumber(0)), Ok(message)], None));
+    assert_eq!(protobuf::Frame::parse(&batch), Err(protobuf::Error::Trailing { remaining: batch.len() - bytes.len() }));
 }
 
 #[test]
 fn protobuf_rejects_oversize_at_named_capacity() {
-    for framing in [protobuf::Framing::Grpc, protobuf::Framing::Delimited] {
-        let header = match framing {
-            protobuf::Framing::Grpc => protobuf::GRPC_HEADER_LEN,
-            protobuf::Framing::Delimited => protobuf::MAX_VARINT_LEN,
-        };
-        let mut stream = Stream::new(protobuf::Frames::new(framing));
-        assert_eq!(stream.decoder().capacity(), protobuf::MAX_MESSAGE + header);
-        let mut bytes = Vec::new();
-        match framing {
-            protobuf::Framing::Grpc => {
-                bytes.push(0);
-                bytes.extend_from_slice(&((protobuf::MAX_MESSAGE + 1) as u32).to_be_bytes());
-            }
-            protobuf::Framing::Delimited => {
-                protobuf::encode_varint((protobuf::MAX_MESSAGE + 1) as u64, &mut bytes)
-            }
-        }
-        // The header alone is enough to reject the declared oversized frame.
-        assert_eq!(stream.push(&bytes), bytes.len());
-        assert_eq!(
-            stream.next(),
-            Some(Err(Fail::Protocol(protobuf::Error::TooLong)))
-        );
-        assert!(stream.next().is_none());
-    }
+    let mut stream = Stream::new(protobuf::Frames::new());
+    assert_eq!(stream.decoder().capacity(), protobuf::MAX_MESSAGE + protobuf::MAX_VARINT_LEN);
+    let bytes = protobuf::Varint((protobuf::MAX_MESSAGE + 1) as u64).to_bytes().unwrap();
+    assert_eq!(stream.push(&bytes), bytes.len());
+    assert_eq!(stream.next(), Some(Err(Fail::Protocol(protobuf::Error::TooLong))));
+    assert!(stream.next().is_none());
 }
 
 #[test]
@@ -685,10 +561,7 @@ fn strict_writers_leave_existing_output_unchanged() {
         },
         body: vec![],
     });
-    contract::check_wire_value(&protobuf::DelimitedFrame(protobuf::Frame {
-        compressed: true,
-        data: vec![],
-    }));
+    contract::check_wire_value(&protobuf::Frame { data: vec![0; protobuf::MAX_MESSAGE + 1] });
     contract::check_wire_value(&protobuf::Message {
         fields: vec![protobuf::Field {
             number: 0,
@@ -699,7 +572,6 @@ fn strict_writers_leave_existing_output_unchanged() {
 
 #[test]
 fn contracts_on_malformed_and_mutated_inputs() {
-    use fictionet::stdlib::codec::test_support::Lcg;
     let seeds: &[&[u8]] = &[
         b"",
         b"{} [1,2] false",
@@ -713,23 +585,22 @@ fn contracts_on_malformed_and_mutated_inputs() {
     for seed in seeds {
         for _ in 0..16 {
             let mut bytes = seed.to_vec();
-            if !bytes.is_empty() {
-                let at = rng.below(bytes.len() as u64) as usize;
-                bytes[at] = rng.next() as u8;
-            }
-            contract::check_decode(json::Values::new, &bytes);
-            contract::check_decode(xml::Events::new, &bytes);
-            contract::check_decode(form::Fields::new, &bytes);
-            contract::check_decode(|| mime::Parts::new("b").unwrap(), &bytes);
-            for framing in [protobuf::Framing::Grpc, protobuf::Framing::Delimited] {
-                contract::check_decode(|| protobuf::Frames::new(framing), &bytes);
-            }
+            mutate(&mut rng, &mut bytes);
+            check(json::Values::new, &bytes);
+            check(xml::Events::new, &bytes);
+            check(form::Fields::new, &bytes);
+            check(|| mime::Parts::new("b").unwrap(), &bytes);
+            check(protobuf::Frames::new, &bytes);
             contract::check_wire::<json::Value>(&bytes);
             contract::check_wire::<xml::Document>(&bytes);
             contract::check_wire::<form::Field>(&bytes);
             contract::check_wire::<mime::Part>(&bytes);
             contract::check_wire::<protobuf::Frame>(&bytes);
-            contract::check_wire::<protobuf::DelimitedFrame>(&bytes);
+            contract::check_wire::<protobuf::Varint>(&bytes);
+            contract::check_wire::<form::Form>(&bytes);
+            contract::check_wire::<form::PercentEncoded>(&bytes);
+            contract::check_wire::<mime::Entity>(&bytes);
+            contract::check_wire::<mime::ParamValue>(&bytes);
             contract::check_wire::<protobuf::Message>(&bytes);
         }
     }
@@ -741,7 +612,7 @@ fn content_limits_accept_complete_units_at_the_limit() {
     let bytes = Wire::to_bytes(&field).unwrap();
     assert_eq!(bytes.len(), form::MAX_INPUT);
     assert_eq!(
-        run(form::Fields::new(), &bytes, bytes.len()),
+        decode_all(form::Fields::new, &bytes),
         (vec![field], None)
     );
 
@@ -749,7 +620,7 @@ fn content_limits_accept_complete_units_at_the_limit() {
     bytes.resize(xml::MAX_DOCUMENT - 4, b'x');
     bytes.extend_from_slice(b"</r>");
     assert_eq!(bytes.len(), xml::MAX_DOCUMENT);
-    let (events, error) = run(xml::Events::new(), &bytes, bytes.len());
+    let (events, error) = decode_all(xml::Events::new, &bytes);
     assert_eq!(events.len(), 3);
     assert_eq!(error, None);
 
@@ -763,46 +634,15 @@ fn content_limits_accept_complete_units_at_the_limit() {
         parts: vec![part.clone()],
         ..mime::Multipart::default()
     };
-    let bytes = body.to_bytes(&boundary).unwrap();
+    let entity = body.with_boundary(boundary.clone()).to_bytes().unwrap();
+    let bytes = entity_body(&entity);
     assert_eq!(
-        run(mime::Parts::new(&boundary).unwrap(), &bytes, bytes.len()),
+        decode_all(|| mime::Parts::new(&boundary).unwrap(), bytes),
         (vec![part], None)
     );
 }
 
-#[test]
-#[allow(deprecated)] // Verify unchanged void feeds and repeating errors.
-fn compatibility_decoders_keep_their_buffering_and_errors() {
-    let mut json = json::Decoder::new();
-    let json_batch = b"{}".repeat(json::MAX_SIZE);
-    json.feed(&json_batch);
-    assert_eq!(json.buffered(), json_batch.len());
-    assert!(json.next_value().unwrap().is_ok());
-
-    let mut multipart = mime::Parser::new("b").unwrap();
-    let batch = vec![b'x'; mime::MAX_PART + mime::MAX_BOUNDARY_LINE + 2];
-    multipart.feed(&batch);
-    assert_eq!(multipart.buffered(), batch.len());
-
-    let mut decoder = protobuf::Decoder::new(protobuf::Framing::Grpc);
-    decoder.feed(&[2]);
-    assert_eq!(decoder.next_frame(), Some(Err(protobuf::Error::Flag(2))));
-    assert_eq!(decoder.next_frame(), Some(Err(protobuf::Error::Flag(2))));
-    let mut decoder = form::Decoder::new();
-    decoder.feed(&vec![b'a'; form::MAX_INPUT + 1]);
-    assert_eq!(decoder.next_pair(), Some(Err(form::FormError::TooLong)));
-    assert_eq!(decoder.next_pair(), Some(Err(form::FormError::TooLong)));
-    let mut parser = xml::Parser::new();
-    parser.feed(b"<r>");
-    parser.finish();
-    assert!(parser.next_event().unwrap().is_ok());
-    let error = parser.next_event();
-    assert!(matches!(
-        error,
-        Some(Err(xml::Error {
-            kind: xml::ErrorKind::UnexpectedEnd,
-            ..
-        }))
-    ));
-    assert_eq!(parser.next_event(), error);
+fn entity_body(bytes: &[u8]) -> &[u8] {
+    let end = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+    &bytes[end..]
 }
