@@ -69,10 +69,10 @@ cargo +nightly fuzz list
 | `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
 | `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
-| `rtsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtsp`: RTSP |
+| `rtsp` | codec stream and bounded-allocation contracts; exact messages and header values; strict writer checks | `stdlib::rtsp`: RTSP |
 | `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
 | `sftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sftp`: SFTP version 3 |
-| `sip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sip`: SIP |
+| `sip` | codec stream and bounded-allocation contracts; exact messages and header values; strict writer checks | `stdlib::sip`: SIP |
 | `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
 | `socks` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
 | `spnego` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::spnego`: SPNEGO |
