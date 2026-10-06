@@ -15,7 +15,8 @@
 //!
 //! Nothing here reads a socket. A world that plays a Redis server uses
 //! [`Stream<Commands>`](super::codec::Stream) to read requests and
-//! [`Value::write`] to send replies. A client uses
+//! [`Resp2::write`] to send replies until `HELLO 3` selects [`Value::write`].
+//! The former writes null as `$-1\r\n`; the latter writes `_\r\n`. A client uses
 //! [`Stream<Values>`](super::codec::Stream) to read replies. Which commands
 //! exist and what they do is up to world code.
 //!
@@ -27,7 +28,7 @@
 //! ```
 //! use std::collections::HashMap;
 //! use fictionet::stdlib::codec::{Stream, Wire, pump, finish};
-//! use fictionet::stdlib::resp::{Commands, Value};
+//! use fictionet::stdlib::resp::{Commands, Resp2, Value};
 //!
 //! let mut store: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 //! let mut stream = Stream::new(Commands::new());
@@ -46,7 +47,7 @@
 //!         (Some("GET"), [_, k]) => store.get(k).map_or(Value::Null, |v| Value::Bulk(v.clone())),
 //!         _ => Value::error("ERR unknown command"),
 //!     };
-//!     reply.write(&mut out).unwrap();
+//!     Resp2(reply).write(&mut out).unwrap();
 //! }
 //! assert_eq!(out, b"+OK\r\n$5\r\nhello\r\n");
 //!
@@ -188,7 +189,8 @@ pub enum Value {
     Bulk(Vec<u8>),
     /// An array of values.
     Array(Vec<Value>),
-    /// No value: RESP3 null, or the RESP2 null bulk string (`$-1`).
+    /// No value. [`Value::write`] emits RESP3 `_\r\n`.
+    /// [`Resp2::write`] emits the RESP2 null bulk string, `$-1\r\n`.
     Null,
     /// The RESP2 null array (`*-1`), which Redis sends when, for example,
     /// BLPOP times out. The writer preserves its `*-1` form.
@@ -225,12 +227,39 @@ pub enum Value {
     },
 }
 
+/// A reply in Redis's RESP2 form, used before a client selects `HELLO 3`.
+///
+/// Writing maps null to `$-1`, booleans to integers, and doubles, big
+/// numbers and verbatim text to bulk strings. Bulk errors become simple
+/// errors. Maps become flat arrays of keys and values. Sets and pushes
+/// become arrays. Attributes contribute only their value.
+///
+/// Parsing accepts only RESP2 types, including both null forms. It never
+/// produces RESP3 variants. A parsed value round trips through this writer.
+/// A constructed RESP3 variant reads back as its mapped RESP2 value.
+/// Both methods use [`Limits::DEFAULT`]. Writing never clips fields.
+///
+/// ```
+/// use fictionet::stdlib::codec::Wire;
+/// use fictionet::stdlib::resp::{Resp2, Value};
+///
+/// let missing = Resp2(Value::Null);
+/// assert_eq!(missing.to_bytes().unwrap(), b"$-1\r\n");
+/// assert_eq!(Resp2::parse(b"$-1\r\n").unwrap(), missing);
+/// assert_eq!(Resp2(Value::Boolean(true)).to_bytes().unwrap(), b":1\r\n");
+/// ```
+#[derive(Clone, Debug, PartialEq)]
+pub struct Resp2(
+    /// The value to encode using Redis's RESP2 mapping.
+    pub Value,
+);
+
 /// Why bytes are not RESP. Either way, the stream holds no more values a
 /// reader can find, and a server answers with [`ParseError::reply`] and
 /// closes the connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// A value started with a byte that is no type's marker.
+    /// A value started with a type marker this reader does not accept.
     UnknownType(u8),
     /// A line held a CR not followed by LF, or an LF with no CR before it.
     BadLineEnd,
@@ -1508,7 +1537,7 @@ impl core::fmt::Display for WireError {
             Self::Parse(e) => e.fmt(f),
             Self::Incomplete => f.write_str("incomplete RESP frame"),
             Self::Trailing => f.write_str("bytes follow the RESP frame"),
-            Self::Unwritable => f.write_str("RESP value cannot be written unchanged under the default limits"),
+            Self::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -1535,7 +1564,9 @@ impl Wire for Value {
     /// can expand when written.
     fn parse(bytes: &[u8]) -> Result<Self, WireError> {
         let value = exact(value_top(bytes, &Limits::DEFAULT), bytes.len())?;
-        value.write(&mut Vec::new())?;
+        value
+            .write(&mut Vec::new())
+            .map_err(|_| WireError::Parse(ParseError::FrameTooLarge))?;
         Ok(value)
     }
 
@@ -1550,6 +1581,127 @@ impl Wire for Value {
         strict_value(&mut bytes, self, 0, true)?;
         out.extend_from_slice(&bytes);
         Ok(())
+    }
+}
+
+impl Wire for Resp2 {
+    type ParseError = WireError;
+    type WriteError = WireError;
+
+    /// Reads one complete RESP2 value under [`Limits::DEFAULT`].
+    /// Refuses RESP3 markers and streamed forms, including inside arrays,
+    /// and malformed, incomplete, oversized, or trailing input.
+    fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let limits = &Limits::DEFAULT;
+        exact(
+            bounded(resp2_value(frame(bytes, limits), 0, 0), limits),
+            bytes.len(),
+        )
+        .map(Self)
+    }
+
+    /// Appends this value using the RESP2 mapping described by [`Resp2`].
+    /// Refuses CR or LF in simple strings or errors, malformed big numbers,
+    /// and size, count, or nesting violations. Big numbers must fit
+    /// [`MAX_LINE_LEN`]. Flattened maps must fit [`MAX_ELEMENTS`] elements.
+    /// Attributes count toward [`MAX_DEPTH`], but their entries are omitted.
+    /// Pushes become arrays at any position. No field is clipped, and an
+    /// error leaves `out` unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+        let mut bytes = Vec::new();
+        strict_resp2(&mut bytes, &self.0, 0)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+// Share line scalars with RESP3, but reject streamed lengths at every level.
+fn resp2_value(bytes: &[u8], pos: usize, depth: usize) -> Step<Value> {
+    let limits = &Limits::DEFAULT;
+    let Some(&kind) = bytes.get(pos) else {
+        return Err(Fail::Need(pos.saturating_add(1)));
+    };
+    match kind {
+        marker::SIMPLE | marker::ERROR | marker::INTEGER => value(bytes, pos, depth, false, limits),
+        marker::BULK | marker::ARRAY => {
+            let (text, mut end) = line(bytes, pos + 1, limits)?;
+            let count = match length(text)? {
+                Len::Streamed => return Err(ParseError::BadLength.into()),
+                Len::Null => {
+                    return Ok((
+                        if kind == marker::BULK {
+                            Value::Null
+                        } else {
+                            Value::NullArray
+                        },
+                        end,
+                    ));
+                }
+                Len::N(count) => count,
+            };
+            if kind == marker::BULK {
+                let (body, end) = data(bytes, end, count, limits)?;
+                return Ok((Value::Bulk(body.to_vec()), end));
+            }
+            if depth >= MAX_DEPTH {
+                return Err(ParseError::TooDeep.into());
+            }
+            if count > MAX_ELEMENTS {
+                return Err(ParseError::TooManyElements.into());
+            }
+            let mut items = Vec::with_capacity(capacity(bytes, end, count, 3));
+            for _ in 0..count {
+                let (item, next) = resp2_value(bytes, end, depth + 1)?;
+                items.push(item);
+                end = next;
+            }
+            Ok((Value::Array(items), end))
+        }
+        _ => Err(ParseError::UnknownType(kind).into()),
+    }
+}
+
+// Recursion includes omitted attributes and stops before their children.
+fn strict_resp2(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<(), WireError> {
+    match value {
+        Value::Null => strict_bytes(out, b"$-1\r\n"),
+        Value::Boolean(b) => strict_bytes(out, if *b { b":1\r\n" } else { b":0\r\n" }),
+        Value::Double(n) => strict_bulk(out, marker::BULK, &[], fmt_double(*n).as_bytes()),
+        Value::BigNumber(text) => {
+            if text.len() > MAX_LINE_LEN || !big_ok(text.as_bytes()) {
+                return Err(WireError::Unwritable);
+            }
+            strict_bulk(out, marker::BULK, &[], text.as_bytes())
+        }
+        Value::BulkError(bytes) => strict_line(out, marker::ERROR, bytes),
+        Value::Verbatim { text, .. } => strict_bulk(out, marker::BULK, &[], text),
+        Value::Array(items) | Value::Set(items) | Value::Push(items) => {
+            strict_header(out, marker::ARRAY, items.len(), depth)?;
+            for item in items {
+                strict_resp2(out, item, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Map(entries) => {
+            let count = entries.len().checked_mul(2).ok_or(WireError::Unwritable)?;
+            strict_header(out, marker::ARRAY, count, depth)?;
+            for (key, value) in entries {
+                strict_resp2(out, key, depth + 1)?;
+                strict_resp2(out, value, depth + 1)?;
+            }
+            Ok(())
+        }
+        Value::Attribute { value, .. } => {
+            if depth >= MAX_DEPTH {
+                return Err(WireError::Unwritable);
+            }
+            strict_resp2(out, value, depth + 1)
+        }
+        Value::Simple(_)
+        | Value::Error(_)
+        | Value::Integer(_)
+        | Value::Bulk(_)
+        | Value::NullArray => strict_value(out, value, depth, false),
     }
 }
 
@@ -1568,7 +1720,9 @@ impl Wire for Command {
     /// commands whose array encoding exceeds the default limits.
     fn parse(bytes: &[u8]) -> Result<Self, WireError> {
         let command = exact(command_top(bytes, &Limits::DEFAULT), bytes.len())?;
-        command.write(&mut Vec::new())?;
+        command
+            .write(&mut Vec::new())
+            .map_err(|_| WireError::Parse(ParseError::FrameTooLarge))?;
         Ok(command)
     }
 
@@ -1769,6 +1923,35 @@ mod tests {
     ];
 
     #[test]
+    fn resp2_get_missing_without_hello() {
+        let (commands, error) = decode_all(Commands::new, b"GET missing\r\n");
+        assert_eq!(error, None);
+        assert_eq!(commands, [Command::new(["GET", "missing"])]);
+        let reply = Value::Null;
+        assert_eq!(Resp2(reply).to_bytes().unwrap(), b"$-1\r\n");
+    }
+
+    #[test]
+    fn unwritable_display_is_uniform() {
+        assert_eq!(
+            WireError::Unwritable.to_string(),
+            "value cannot be written without changing it"
+        );
+    }
+
+    #[test]
+    fn expanded_frame_is_a_read_refusal() {
+        // Short exponent spellings expand past the frame limit when written.
+        let count = MAX_FRAME_LEN / 300;
+        let mut bytes = format!("*{count}\r\n").into_bytes();
+        bytes.extend_from_slice(&b",1e300\r\n".repeat(count));
+        assert_eq!(
+            Value::parse(&bytes),
+            Err(WireError::Parse(ParseError::FrameTooLarge))
+        );
+    }
+
+    #[test]
     fn resp2_examples() {
         assert_eq!(one(b"+OK\r\n"), Value::ok());
         assert_eq!(one(b"-Error message\r\n"), Value::error("Error message"));
@@ -1785,11 +1968,11 @@ mod tests {
             Value::Array(vec![s("Hello"), Value::error("World")]),
         ]);
         assert_eq!(one(VALID[15]), nested);
-        assert_eq!(nested.to_bytes().unwrap(), VALID[15]);
+        assert_eq!(Resp2(nested).to_bytes().unwrap(), VALID[15]);
         let with_null = one(VALID[16]);
         assert_eq!(with_null, Value::Array(vec![bulk("hello"), Value::Null, bulk("world")]));
-        assert_eq!(Value::parse(&with_null.to_bytes().unwrap()), Ok(with_null));
-        assert_eq!(Value::NullArray.to_bytes().unwrap(), b"*-1\r\n");
+        assert_eq!(Resp2(with_null).to_bytes().unwrap(), VALID[16]);
+        assert_eq!(Resp2(Value::NullArray).to_bytes().unwrap(), b"*-1\r\n");
         // Extremes of a 64-bit integer.
         assert_eq!(one(b":-9223372036854775808\r\n"), Value::Integer(i64::MIN));
         assert_eq!(one(b":9223372036854775807\r\n"), Value::Integer(i64::MAX));
@@ -1842,26 +2025,170 @@ mod tests {
 
     #[test]
     fn writers_match_the_specification() {
-        for (value, bytes) in [
-            (Value::Null, &b"_\r\n"[..]),
-            (Value::NullArray, b"*-1\r\n"),
-            (Value::Boolean(true), b"#t\r\n"),
-            (Value::Double(1.23), b",1.23\r\n"),
-            (Value::Double(f64::NEG_INFINITY), b",-inf\r\n"),
-            (Value::Double(f64::NAN), b",nan\r\n"),
-            (Value::BigNumber("-12".into()), b"(-12\r\n"),
-            (Value::BulkError(b"SYNTAX invalid syntax".to_vec()), VALID[27]),
-            (Value::Verbatim { format: *b"txt", text: b"Some string".to_vec() }, VALID[28]),
-            (Value::Map(vec![(s("first"), Value::Integer(1))]), b"%1\r\n+first\r\n:1\r\n"),
-            (Value::Set(vec![Value::Integer(1)]), b"~1\r\n:1\r\n"),
-            (Value::Push(vec![s("a"), Value::Integer(1)]), b">2\r\n+a\r\n:1\r\n"),
+        for (v, r2, r3) in [
+            (Value::Null, &b"$-1\r\n"[..], &b"_\r\n"[..]),
+            (Value::NullArray, b"*-1\r\n", b"*-1\r\n"),
+            (Value::Boolean(false), b":0\r\n", b"#f\r\n"),
+            (Value::Boolean(true), b":1\r\n", b"#t\r\n"),
+            (Value::Double(1.23), b"$4\r\n1.23\r\n", b",1.23\r\n"),
             (
-                Value::Attribute { attributes: vec![(s("ttl"), Value::Integer(1))], value: Box::new(Value::ok()) },
+                Value::Double(f64::NEG_INFINITY),
+                b"$4\r\n-inf\r\n",
+                b",-inf\r\n",
+            ),
+            (Value::Double(f64::NAN), b"$3\r\nnan\r\n", b",nan\r\n"),
+            (
+                Value::BigNumber("-12".into()),
+                b"$3\r\n-12\r\n",
+                b"(-12\r\n",
+            ),
+            (
+                Value::BulkError(b"SYNTAX invalid syntax".to_vec()),
+                b"-SYNTAX invalid syntax\r\n",
+                VALID[27],
+            ),
+            (
+                Value::Verbatim {
+                    format: *b"txt",
+                    text: b"Some string".to_vec(),
+                },
+                b"$11\r\nSome string\r\n",
+                VALID[28],
+            ),
+            (
+                Value::Map(vec![(s("first"), Value::Integer(1))]),
+                b"*2\r\n+first\r\n:1\r\n",
+                b"%1\r\n+first\r\n:1\r\n",
+            ),
+            (
+                Value::Set(vec![Value::Integer(1)]),
+                b"*1\r\n:1\r\n",
+                b"~1\r\n:1\r\n",
+            ),
+            (
+                Value::Push(vec![s("a"), Value::Integer(1)]),
+                b"*2\r\n+a\r\n:1\r\n",
+                b">2\r\n+a\r\n:1\r\n",
+            ),
+            (
+                Value::Attribute {
+                    attributes: vec![(s("ttl"), Value::Integer(1))],
+                    value: Box::new(Value::ok()),
+                },
+                b"+OK\r\n",
                 b"|1\r\n+ttl\r\n:1\r\n+OK\r\n",
             ),
         ] {
-            assert_eq!(value.to_bytes().unwrap(), bytes, "{value:?}");
+            assert_eq!(Resp2(v.clone()).to_bytes().unwrap(), r2, "{v:?}");
+            assert_eq!(v.to_bytes().unwrap(), r3, "{v:?}");
+            contract::check_wire::<Resp2>(r2);
+            assert_eq!(Resp2::parse(r2).unwrap().to_bytes().unwrap(), r2);
         }
+    }
+
+    #[test]
+    fn resp2_parse_accepts_only_resp2_forms() {
+        for bytes in &VALID[..17] {
+            assert_eq!(Resp2::parse(bytes), Ok(Resp2(one(bytes))));
+            contract::check_wire::<Resp2>(bytes);
+        }
+        for bytes in &VALID[17..] {
+            assert!(Resp2::parse(bytes).is_err(), "{}", bytes.escape_ascii());
+            let mut nested = b"*1\r\n".to_vec();
+            nested.extend_from_slice(bytes);
+            assert!(Resp2::parse(&nested).is_err(), "{}", nested.escape_ascii());
+        }
+        let binary = Resp2(Value::bulk(b"_\r\n$?\r\n*?\r\n\0\xff"));
+        contract::check_wire_value(&binary);
+        for bytes in [&b""[..], b"$3\r\nab", b"*1\r\n"] {
+            assert_eq!(Resp2::parse(bytes), Err(WireError::Incomplete));
+        }
+        assert_eq!(Resp2::parse(b"$-1\r\n+OK\r\n"), Err(WireError::Trailing));
+        assert_eq!(
+            Resp2::parse(b"+a\n"),
+            Err(WireError::Parse(ParseError::BadLineEnd))
+        );
+        assert_eq!(
+            Resp2::parse(b":x\r\n"),
+            Err(WireError::Parse(ParseError::Malformed(b':')))
+        );
+        let mut deep = b"*1\r\n".repeat(MAX_DEPTH);
+        deep.extend_from_slice(b"$-1\r\n");
+        contract::check_wire::<Resp2>(&deep);
+        assert_eq!(Resp2::parse(&deep).unwrap().to_bytes().unwrap(), deep);
+        deep.splice(..0, b"*1\r\n".iter().copied());
+        assert_eq!(
+            Resp2::parse(&deep),
+            Err(WireError::Parse(ParseError::TooDeep))
+        );
+        for (header, error) in [
+            (
+                format!("*{}\r\n", MAX_ELEMENTS + 1),
+                ParseError::TooManyElements,
+            ),
+            (
+                format!("${}\r\n", MAX_BULK_LEN + 1),
+                ParseError::BulkTooLong,
+            ),
+        ] {
+            assert_eq!(
+                Resp2::parse(header.as_bytes()),
+                Err(WireError::Parse(error))
+            );
+        }
+    }
+
+    #[test]
+    fn resp2_mapping_refuses_clipping_and_rolls_back() {
+        let mut deep = Value::Null;
+        for _ in 0..MAX_DEPTH {
+            deep = Value::Attribute {
+                attributes: vec![],
+                value: Box::new(deep),
+            };
+        }
+        assert_eq!(Resp2(deep.clone()).to_bytes().unwrap(), b"$-1\r\n");
+        let deep = Value::Attribute {
+            attributes: vec![],
+            value: Box::new(deep),
+        };
+        for value in [
+            Value::Array(vec![Value::ok(), Value::BulkError(b"x\ny".to_vec())]),
+            Value::BulkError(vec![b'x'; MAX_LINE_LEN + 1]),
+            Value::error("x\ry"),
+            Value::BigNumber("1".repeat(MAX_LINE_LEN + 1)),
+            Value::BigNumber("".into()),
+            Value::Verbatim {
+                format: *b"txt",
+                text: vec![0; MAX_BULK_LEN + 1],
+            },
+            deep,
+            Value::Map(vec![(Value::Null, Value::Null); MAX_ELEMENTS / 2 + 1]),
+            Value::Push(vec![Value::Null; MAX_ELEMENTS + 1]),
+        ] {
+            let reply = Resp2(value);
+            let mut out = b"prefix".to_vec();
+            assert_eq!(reply.write(&mut out), Err(WireError::Unwritable));
+            assert_eq!(out, b"prefix");
+        }
+        // RESP2 drops attributes and maps every push to an array.
+        let value = Value::Attribute {
+            attributes: vec![(s("invalid\nattribute"), Value::BigNumber("invalid".into()))],
+            value: Box::new(Value::Array(vec![
+                Value::Push(vec![]),
+                Value::Push(vec![Value::Integer(1)]),
+            ])),
+        };
+        let bytes = Resp2(value).to_bytes().unwrap();
+        assert_eq!(bytes, b"*2\r\n*0\r\n*1\r\n:1\r\n");
+        contract::check_wire::<Resp2>(&bytes);
+        assert_eq!(
+            Resp2(Value::BulkError(vec![b'x'; MAX_LINE_LEN]))
+                .to_bytes()
+                .unwrap()
+                .len(),
+            MAX_LINE_LEN + 3
+        );
     }
 
     #[test]
@@ -2075,6 +2402,15 @@ mod tests {
         ] {
             contract::check_wire_value(&value);
             assert_eq!(value.to_bytes(), Err(WireError::Unwritable));
+            if let Value::Verbatim { text, .. } = &value {
+                // Its format prefix is omitted in RESP2, so this text fits.
+                let bytes = Resp2(value.clone()).to_bytes().unwrap();
+                assert_eq!(Resp2::parse(&bytes), Ok(Resp2(Value::Bulk(text.clone()))));
+            } else {
+                let reply = Resp2(value);
+                contract::check_wire_value(&reply);
+                assert_eq!(reply.to_bytes(), Err(WireError::Unwritable));
+            }
         }
         for command in [
             Command { args: vec![vec![0; MAX_BULK_LEN + 1]] },
@@ -2135,7 +2471,14 @@ mod tests {
                 let value = random(&mut r, 0, resp2);
                 contract::check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
-                assert_eq!(Value::parse(&bytes), Ok(value));
+                assert_eq!(Value::parse(&bytes), Ok(value.clone()));
+                let reply = Resp2(value);
+                if resp2 {
+                    contract::check_wire_value(&reply);
+                }
+                if let Ok(bytes) = reply.to_bytes() {
+                    assert_eq!(Resp2::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+                }
             }
             let command = Command { args: (0..r.index(5)).map(|_| r.bytes(10)).collect() };
             contract::check_wire_value(&command);
@@ -2241,7 +2584,20 @@ mod tests {
             for limits in [Limits::DEFAULT, small] {
                 check_values(&b, limits);
                 check_commands(&b, limits);
+                for command in decode_all(|| Commands::with_limits(limits), &b).0 {
+                    contract::check_wire_value(&command);
+                }
+                for value in decode_all(|| Values::with_limits(limits), &b).0 {
+                    // NaN compares through its canonical wire bytes.
+                    if let Ok(bytes) = value.to_bytes() {
+                        assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+                    }
+                    if let Ok(bytes) = Resp2(value).to_bytes() {
+                        assert_eq!(Resp2::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+                    }
+                }
             }
+            contract::check_wire::<Resp2>(&b);
             // NaN compares through its canonical wire bytes.
             if let Ok(value) = Value::parse(&b) {
                 let bytes = value.to_bytes().unwrap();
@@ -2351,8 +2707,10 @@ mod tests {
             b"*1\r\n$1234567\r\n",
         ];
         for b in inputs {
-            check_values(b, lim);
-            check_commands(b, lim);
+            for end in 0..=b.len() {
+                check_values(&b[..end], lim);
+                check_commands(&b[..end], lim);
+            }
         }
     }
 
@@ -2396,18 +2754,19 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
     }
 
-    /// One long line receiving a byte at a time takes linear time: the decoder
-    /// searches only the new bytes for the line's end.
+    /// Long lines keep the stream contract and complete within a tight time bound.
     #[test]
     fn stream_is_linear_in_one_long_line() {
-        let start = std::time::Instant::now();
+        let mut elapsed = std::time::Duration::ZERO;
         let n = MAX_LINE_LEN - 2;
         for (lead, byte) in [(&b"+"[..], b'a'), (b"$", b'1')] {
             let mut bytes = lead.to_vec();
             bytes.extend(std::iter::repeat_n(byte, n));
             bytes.extend_from_slice(b"\r\n");
             check_values(&bytes, Limits::DEFAULT);
+            let start = std::time::Instant::now();
             let (items, error) = decode_all(Values::new, &bytes);
+            elapsed += start.elapsed();
             assert_eq!(items.len(), usize::from(byte == b'a'));
             assert_eq!(error.is_none(), byte == b'a');
         }
@@ -2416,11 +2775,13 @@ mod tests {
             bytes.extend(std::iter::repeat_n(byte, n));
             bytes.extend_from_slice(end);
             check_commands(&bytes, Limits::DEFAULT);
+            let start = std::time::Instant::now();
             let (items, error) = decode_all(Commands::new, &bytes);
+            elapsed += start.elapsed();
             assert_eq!(items.len(), usize::from(byte == b'a'));
             assert_eq!(error.is_none(), byte == b'a');
         }
-        assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
+        assert!(elapsed < std::time::Duration::from_secs(3), "{elapsed:?}");
     }
 
     /// Attributes retain every entry and their value, or writing fails.
@@ -2481,10 +2842,14 @@ mod tests {
         let bytes = command.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_FRAME_LEN);
         assert_eq!(Command::parse(&bytes), Ok(command.clone()));
+        assert!(Resp2::parse(&bytes).is_ok());
         command.args[4].push(3);
         assert_eq!(command.to_bytes(), Err(WireError::Unwritable));
         let value = command.to_value();
         assert_eq!(value.to_bytes(), Err(WireError::Unwritable));
+        let mut out = b"prefix".to_vec();
+        assert_eq!(Resp2(value).write(&mut out), Err(WireError::Unwritable));
+        assert_eq!(out, b"prefix");
     }
 
     /// Pushing while values wait preserves the complete backlog.

@@ -1,9 +1,12 @@
 //! RESP values, commands, custom limits, and strict writer contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::Lcg};
+use fictionet::stdlib::codec::{
+    Decode, Wire, contract,
+    test_support::{Lcg, decode_all},
+};
 use fictionet::stdlib::resp::{
-    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Value, Values, WireError,
+    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values, WireError,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -31,6 +34,7 @@ impl Wire for WireValue {
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<WireValue>(data);
     contract::check_wire::<Command>(data);
+    contract::check_wire::<Resp2>(data);
     contract::check_wire_value(&WireValue(Value::simple(
         data.iter().take(MAX_LINE_LEN + 1).copied().collect::<Vec<_>>(),
     )));
@@ -50,6 +54,17 @@ fuzz_target!(|data: &[u8]| {
         let allocation = 2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN);
         contract::check_decode_with_alloc_limit(|| Values::with_limits(limits).map(WireValue), data, allocation);
         contract::check_decode_with_alloc_limit(|| Commands::with_limits(limits), data, allocation);
+        for command in decode_all(|| Commands::with_limits(limits), data).0 {
+            contract::check_wire_value(&command);
+        }
+        for value in decode_all(|| Values::with_limits(limits), data).0 {
+            if let Ok(bytes) = value.to_bytes() {
+                assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+            }
+            if let Ok(bytes) = Resp2(value).to_bytes() {
+                assert_eq!(Resp2::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
+            }
+        }
     }
 });
 

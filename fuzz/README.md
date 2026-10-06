@@ -1,7 +1,7 @@
 # Fuzzing Fictionet
 
 The agent in the sandbox is the one adversary in Fictionet's trust model.
-Every byte it sends reaches world-side code. The targets here exercise the
+Every byte it sends reaches world-side code. The targets here feed the
 parsers and state machines on that path. A panic, a hang or memory that
 grows without end in one of them is a denial of service against the
 world.
@@ -16,7 +16,7 @@ cargo +nightly fuzz list
 
 ## The targets
 
-| Target | Input | Code it reaches |
+| Target | What it feeds | Code it reaches |
 |---|---|---|
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |

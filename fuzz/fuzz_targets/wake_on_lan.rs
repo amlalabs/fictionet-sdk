@@ -5,8 +5,7 @@
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::wake_on_lan::{
-    MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, PACKET_LEN, Packets, ParseError, Password,
-    wakes,
+    MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, PACKET_LEN, Packets, ParseError, Password, wakes,
 };
 use libfuzzer_sys::fuzz_target;
 

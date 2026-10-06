@@ -357,7 +357,10 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{Stream, contract, test_support::{Lcg, decode_all, mutate}};
+    use codec::{
+        Stream, contract,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
@@ -500,10 +503,16 @@ mod tests {
         assert!(!wakes(&p, MAC, None));
         let mut s = Stream::new(Packets::new());
         assert_eq!(s.push(&p), MAX_PAYLOAD + 1);
-        assert_eq!(s.next(), Some(Err(codec::Fail::Protocol(ParseError::TooLong))));
+        assert_eq!(
+            s.next(),
+            Some(Err(codec::Fail::Protocol(ParseError::TooLong)))
+        );
         assert_eq!(s.push(&p), p.len());
         assert_eq!(s.next(), None);
-        assert_eq!(s.failed(), Some(&codec::Fail::Protocol(ParseError::TooLong)));
+        assert_eq!(
+            s.failed(),
+            Some(&codec::Fail::Protocol(ParseError::TooLong))
+        );
         assert!(ParseError::TooLong.to_string().contains("65535"));
     }
 
@@ -544,7 +553,9 @@ mod tests {
         let mut p = MagicPacket::new(other).to_bytes().unwrap();
         p.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
         p.extend_from_slice(
-            &MagicPacket::with_password(MAC, Password::Four([9, 9, 9, 9])).to_bytes().unwrap(),
+            &MagicPacket::with_password(MAC, Password::Four([9, 9, 9, 9]))
+                .to_bytes()
+                .unwrap(),
         );
         p.extend_from_slice(&[0, 0, 0]);
         assert_eq!(check_payload(&p), Ok((0, MagicPacket::new(other))));

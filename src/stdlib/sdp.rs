@@ -1213,22 +1213,6 @@ impl SessionDescription {
             && self.information.as_deref().is_none_or(str::is_ascii)
             && self.media.iter().all(|m| m.information.as_deref().is_none_or(str::is_ascii))
     }
-
-    /// The first session-level attribute named `name`.
-    pub fn attribute(&self, name: &str) -> Option<&Attribute> {
-        self.attributes.iter().find(|a| a.name == name)
-    }
-
-    /// Every session-level attribute named `name`, in order.
-    pub fn attributes_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Attribute> + 'a {
-        self.attributes.iter().filter(move |a| a.name == name)
-    }
-
-    /// The direction a stream flows: its own direction attribute, else
-    /// the session's, else [`Direction::SendRecv`], as RFC 8866 says.
-    pub fn direction(&self, media: &Media) -> Direction {
-        media.direction().or_else(|| self.attributes.iter().find_map(Direction::from_attribute)).unwrap_or_default()
-    }
 }
 
 impl Wire for SessionDescription {
@@ -1367,6 +1351,24 @@ impl Wire for SessionDescription {
         }
         out.extend_from_slice(w.out.as_bytes());
         Ok(())
+    }
+}
+
+impl SessionDescription {
+    /// The first session-level attribute named `name`.
+    pub fn attribute(&self, name: &str) -> Option<&Attribute> {
+        self.attributes.iter().find(|a| a.name == name)
+    }
+
+    /// Every session-level attribute named `name`, in order.
+    pub fn attributes_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Attribute> + 'a {
+        self.attributes.iter().filter(move |a| a.name == name)
+    }
+
+    /// The direction a stream flows: its own direction attribute, else
+    /// the session's, else [`Direction::SendRecv`], as RFC 8866 says.
+    pub fn direction(&self, media: &Media) -> Direction {
+        media.direction().or_else(|| self.attributes.iter().find_map(Direction::from_attribute)).unwrap_or_default()
     }
 }
 
