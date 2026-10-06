@@ -41,6 +41,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "sse_lines"
+path = "fuzz_targets/sse_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse_events"
+path = "fuzz_targets/sse_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "relay"
 path = "fuzz_targets/relay.rs"
 test = false

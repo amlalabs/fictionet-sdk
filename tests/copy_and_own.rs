@@ -177,6 +177,8 @@ macro_rules! protocols {
         pub mod spnego;
         #[path = "../src/stdlib/ssh.rs"]
         pub mod ssh;
+        #[path = "../src/stdlib/sse.rs"]
+        pub mod sse;
         #[path = "../src/stdlib/stun.rs"]
         pub mod stun;
         #[path = "../src/stdlib/syslog.rs"]
@@ -388,4 +390,17 @@ fn copied_tls_and_selection_driver_use_the_public_registry() {
     assert!(!conversation.waiting(false));
     conversation.lost(false);
     assert!(format!("{packet:?}").contains("Finished"));
+}
+
+#[test]
+fn copied_sse_uses_public_lines_and_wire() {
+    let event = sse::Event::new("first\nsecond");
+    let bytes = event.to_bytes().unwrap();
+    let mut stream = Stream::new(sse::Events::default());
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(1) {
+        pump(&mut stream, chunk, |event| events.push(event)).unwrap();
+    }
+    finish(&mut stream, |event| events.push(event)).unwrap();
+    assert_eq!(events, [event]);
 }

@@ -182,6 +182,10 @@ first bytes, or select a name explicitly. Use `Dissector::with_registry` for
 capture packets, or `cx.observe_protocols` for live world watches. See
 [adding an observe protocol](docs/observe-protocols.md).
 
+[`stdlib::sse`](src/stdlib/sse.rs) reads server-sent events from streaming
+HTTP response bodies. It exposes raw fields and comments for proxies, joins
+dispatched events, and writes edited events for API mocks and MCP transports.
+
 ## Where sandboxes can run
 
 | Where the sandbox runs | How it attaches | Tested by |
