@@ -1316,7 +1316,7 @@ pub enum WriteError {
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("syslog value cannot be represented without changing it")
+        f.write_str("syslog value cannot be written without changing it")
     }
 }
 
@@ -1420,9 +1420,10 @@ fn header_field(t: &[u8], max: usize, err: ParseError) -> Result<Option<String>,
     Ok(Some(String::from_utf8_lossy(t).into_owned()))
 }
 
-/// Writes `[id name="value" ...]` at the end of `out`, and returns false,
-/// with `out` holding part of it, as soon as `out` passes
-/// [`MAX_MESSAGE_LEN`]. In values, `"`, `]` and a backslash are escaped,
+/// Writes `[id name="value" ...]` at the end of `out`. Returns
+/// [`WriteError::Unwritable`] once the message would pass [`MAX_MESSAGE_LEN`].
+/// The caller stages `out` so a refused message leaves its output unchanged.
+/// In values, `"`, `]` and a backslash are escaped,
 /// except a backslash followed by a character that is none of the three:
 /// that is an invalid escape, which reads back as the same backslash and
 /// is kept as it is (RFC 5424 section 6.3.3).
@@ -1630,8 +1631,8 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 mod tests {
     use super::*;
     use crate::stdlib::codec::{
-        Stream, Fail, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Fail, Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
     };
 
     /// The four examples of RFC 5424 section 6.5, with the BOM bytes in
@@ -2490,7 +2491,7 @@ mod tests {
             }
             check_stream(&buf);
         }
-        for _ in 0..2000 {
+        for round in 0..2000 {
             // Messages built from random values: what is written reads back,
             // and writing that again gives the same bytes.
             let mut m = Message::new(Priority::from_value(rng.index(192) as u8).unwrap());
@@ -2528,6 +2529,37 @@ mod tests {
             } else {
                 rng.bytes(19)
             };
+            if round % 2 == 0 {
+                m.version = 1 + rng.index(usize::from(MAX_VERSION)) as u16;
+                if let Some(t) = &mut m.timestamp {
+                    t.year %= 10000;
+                    t.month = 1 + t.month % 12;
+                    t.day = 1 + t.day % 28;
+                    t.hour %= 24;
+                    t.minute %= 60;
+                    t.second %= 60;
+                    if let Some(f) = &mut t.fraction {
+                        f.digits = 6;
+                        f.value %= 1_000_000;
+                    }
+                    if let Offset::Minutes(m) = &mut t.offset {
+                        *m %= MAX_OFFSET_MINUTES + 1;
+                    }
+                }
+                for field in [&mut m.hostname, &mut m.app_name, &mut m.proc_id, &mut m.msg_id] {
+                    if field.is_some() {
+                        *field = Some(format!("field{}", rng.index(10000)));
+                    }
+                }
+                for (i, element) in m.structured_data.iter_mut().enumerate() {
+                    element.id = format!("id{i}@32473");
+                    for (j, param) in element.params.iter_mut().enumerate() {
+                        param.name = format!("p{j}");
+                    }
+                }
+                m.msg = rng.text(20).into_bytes();
+                assert!(m.to_bytes().is_ok());
+            }
             contract::check_wire_value(&m);
             if let Ok(bytes) = m.to_bytes() {
                 check_stream(&Frame::new(Framing::OctetCounting, bytes).to_bytes().unwrap());

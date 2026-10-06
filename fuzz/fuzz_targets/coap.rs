@@ -41,8 +41,14 @@ fuzz_target!(|data: &[u8]| {
             Type::NonConfirmable => assert!(!m.code.is_empty()),
             Type::Confirmable => {}
         }
-        // A message read writes back whole, unless it carries SZX 7.
-        let _ = m.bad_block();
+        let bad_block = if m.options.block1().is_some_and(|b| b.szx == 7) {
+            Some(option::BLOCK1)
+        } else if m.options.block2().is_some_and(|b| b.szx == 7) {
+            Some(option::BLOCK2)
+        } else {
+            None
+        };
+        assert_eq!(m.bad_block(), bad_block);
         let o = &m.options;
         let _ = (m.bad_option(), o.uri_path(), o.uri_query(), o.content_format(), o.accept(), o.max_age());
         let _ = (o.observe(), o.size1(), o.size2(), o.uri_host(), o.uri_port());
@@ -123,6 +129,7 @@ fuzz_target!(|data: &[u8]| {
     for frame in decode_all(Frames::new, data).0 {
         contract::check_wire_value(&frame);
         let _ = (frame.bad_option(), frame.max_message_size());
+        assert!(frame.pong().to_bytes().is_ok());
         contract::check_wire_value(&frame.pong());
     }
 });

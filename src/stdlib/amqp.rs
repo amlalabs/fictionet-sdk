@@ -419,23 +419,20 @@ impl Wire for Frame {
     /// Leaves `out` unchanged on error. The caller enforces the negotiated
     /// frame limit; [`content_frames`] splits bodies to fit it.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = (|| -> Result<Vec<u8>, EncodeError> {
-            let size = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
-            if self.payload.len() > MAX_PAYLOAD {
-                return Err(EncodeError::Unwritable);
-            }
-            if self.kind == FrameKind::Heartbeat && (self.channel != 0 || size != 0) {
-                return Err(EncodeError::Unwritable);
-            }
-            channel_rules(self.kind, self.channel, &self.payload).map_err(|_| EncodeError::Unwritable)?;
-            let mut out = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len() + 1);
-            out.push(self.kind.code());
-            out.extend_from_slice(&self.channel.to_be_bytes());
-            out.extend_from_slice(&size.to_be_bytes());
-            out.extend_from_slice(&self.payload);
-            out.push(FRAME_END);
-            Ok(out)
-        })()?;
+        let size = u32::try_from(self.payload.len()).unwrap_or(u32::MAX);
+        if self.payload.len() > MAX_PAYLOAD {
+            return Err(EncodeError::Unwritable);
+        }
+        if self.kind == FrameKind::Heartbeat && (self.channel != 0 || size != 0) {
+            return Err(EncodeError::Unwritable);
+        }
+        channel_rules(self.kind, self.channel, &self.payload).map_err(|_| EncodeError::Unwritable)?;
+        let mut bytes = Vec::with_capacity(FRAME_HEADER_LEN + self.payload.len() + 1);
+        bytes.push(self.kind.code());
+        bytes.extend_from_slice(&self.channel.to_be_bytes());
+        bytes.extend_from_slice(&size.to_be_bytes());
+        bytes.extend_from_slice(&self.payload);
+        bytes.push(FRAME_END);
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -447,7 +444,6 @@ impl Wire for Frame {
 /// Partial frames return [`Step::Need`], including at EOF. Frame faults
 /// end the stream. Parse method and content payloads separately to receive
 /// their [`DecodeError`] values as items with [`Decode::map`].
-///
 ///
 /// ```
 /// use fictionet::stdlib::{amqp::{Frame, Frames}, codec::{Stream, Wire}};
@@ -678,7 +674,7 @@ pub enum EncodeError {
 
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AMQP value cannot be represented without changing it")
+        f.write_str("AMQP value cannot be written without changing it")
     }
 }
 
@@ -732,11 +728,9 @@ impl Wire for Table {
     /// Appends the complete value. Refuses invalid fields, excess nesting,
     /// or size limits. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = (|| -> Result<Vec<u8>, EncodeError> {
-            let mut w = Writer::new();
-            w.table(self, 1)?;
-            Ok(w.out)
-        })()?;
+        let mut w = Writer::new();
+        w.table(self, 1)?;
+        let bytes = w.out;
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -744,9 +738,10 @@ impl Wire for Table {
 
 /// A value in a field table or array. The type tags are the ones RabbitMQ
 /// and most clients use, which differ from the 0-9-1 specification's own
-/// table for a few types. Float equality compares the wire bits, including NaNs.
-/// In the specification `s` is a short string and
+/// table for a few types. In the specification `s` is a short string and
 /// `l` is unsigned; here, as in RabbitMQ, both are signed integers.
+///
+/// Float equality compares the wire bits, including NaNs.
 #[derive(Clone, Debug)]
 pub enum FieldValue {
     /// `t`: a boolean, one byte. Any byte but 0 is true.
@@ -1112,63 +1107,63 @@ pub enum Method {
     /// properties, and the SASL mechanisms and locales it offers, each
     /// list separated by spaces.
     ConnectionStart {
-        #[doc = "The protocol major version."]
+        /// The protocol major version.
         version_major: u8,
-        #[doc = "The protocol minor version."]
+        /// The protocol minor version.
         version_minor: u8,
-        #[doc = "The broker properties."]
+        /// The broker properties.
         server_properties: Table,
-        #[doc = "The space-separated SASL mechanism names."]
+        /// The space-separated SASL mechanism names.
         mechanisms: Vec<u8>,
-        #[doc = "The space-separated locale names."]
+        /// The space-separated locale names.
         locales: Vec<u8>,
     },
     /// 10.11: the client's properties, its chosen mechanism and locale,
     /// and its SASL response (for PLAIN, a zero byte, the user, a zero
     /// byte and the password).
     ConnectionStartOk {
-        #[doc = "The client properties."]
+        /// The client properties.
         client_properties: Table,
-        #[doc = "The chosen SASL mechanism."]
+        /// The chosen SASL mechanism.
         mechanism: String,
-        #[doc = "The SASL response bytes."]
+        /// The SASL response bytes.
         response: Vec<u8>,
-        #[doc = "The chosen locale."]
+        /// The chosen locale.
         locale: String,
     },
     /// 10.20: a SASL challenge.
     ConnectionSecure {
-        #[doc = "The SASL challenge bytes."]
+        /// The SASL challenge bytes.
         challenge: Vec<u8>,
     },
     /// 10.21: the client's answer to a challenge.
     ConnectionSecureOk {
-        #[doc = "The SASL response bytes."]
+        /// The SASL response bytes.
         response: Vec<u8>,
     },
     /// 10.30, broker to client: the most channels, the largest frame and
     /// the heartbeat interval in seconds the broker proposes. 0 means no
     /// limit, or no heartbeats.
     ConnectionTune {
-        #[doc = "The highest channel number; zero means no limit."]
+        /// The highest channel number; zero means no limit.
         channel_max: u16,
-        #[doc = "The largest frame in bytes; zero means no limit."]
+        /// The largest frame in bytes; zero means no limit.
         frame_max: u32,
-        #[doc = "The heartbeat interval in seconds; zero disables it."]
+        /// The heartbeat interval in seconds; zero disables it.
         heartbeat: u16,
     },
     /// 10.31: what the client settles on.
     ConnectionTuneOk {
-        #[doc = "The highest channel number; zero means no limit."]
+        /// The highest channel number; zero means no limit.
         channel_max: u16,
-        #[doc = "The largest frame in bytes; zero means no limit."]
+        /// The largest frame in bytes; zero means no limit.
         frame_max: u32,
-        #[doc = "The heartbeat interval in seconds; zero disables it."]
+        /// The heartbeat interval in seconds; zero disables it.
         heartbeat: u16,
     },
     /// 10.40: open the virtual host named.
     ConnectionOpen {
-        #[doc = "The virtual host name."]
+        /// The virtual host name.
         virtual_host: String,
     },
     /// 10.41.
@@ -1176,13 +1171,13 @@ pub enum Method {
     /// 10.50: close the connection, with a reply code and text, and the
     /// class and method that caused it, or zeros.
     ConnectionClose {
-        #[doc = "The protocol reply code."]
+        /// The protocol reply code.
         reply_code: u16,
-        #[doc = "The reply description."]
+        /// The reply description.
         reply_text: String,
-        #[doc = "The class that caused the reply, or zero."]
+        /// The class that caused the reply, or zero.
         class_id: u16,
-        #[doc = "The method that caused the reply, or zero."]
+        /// The method that caused the reply, or zero.
         method_id: u16,
     },
     /// 10.51.
@@ -1190,7 +1185,7 @@ pub enum Method {
     /// 10.60, a RabbitMQ extension: the broker has stopped reading
     /// publishes, for the reason given.
     ConnectionBlocked {
-        #[doc = "The reason for this change."]
+        /// The reason for this change.
         reason: String,
     },
     /// 10.61, a RabbitMQ extension: the broker reads publishes again.
@@ -1198,9 +1193,9 @@ pub enum Method {
     /// 10.70, a RabbitMQ extension: a new secret, such as a refreshed
     /// OAuth token.
     ConnectionUpdateSecret {
-        #[doc = "The replacement authentication secret."]
+        /// The replacement authentication secret.
         new_secret: Vec<u8>,
-        #[doc = "The reason for this change."]
+        /// The reason for this change.
         reason: String,
     },
     /// 10.71.
@@ -1211,24 +1206,24 @@ pub enum Method {
     ChannelOpenOk,
     /// 20.20: pause (`active` false) or resume content on the channel.
     ChannelFlow {
-        #[doc = "Whether content delivery is enabled."]
+        /// Whether content delivery is enabled.
         active: bool,
     },
     /// 20.21.
     ChannelFlowOk {
-        #[doc = "Whether content delivery is enabled."]
+        /// Whether content delivery is enabled.
         active: bool,
     },
     /// 20.40: close the channel, as [`Method::ConnectionClose`] does the
     /// connection.
     ChannelClose {
-        #[doc = "The protocol reply code."]
+        /// The protocol reply code.
         reply_code: u16,
-        #[doc = "The reply description."]
+        /// The reply description.
         reply_text: String,
-        #[doc = "The class that caused the reply, or zero."]
+        /// The class that caused the reply, or zero.
         class_id: u16,
-        #[doc = "The method that caused the reply, or zero."]
+        /// The method that caused the reply, or zero.
         method_id: u16,
     },
     /// 20.41.
@@ -1236,32 +1231,32 @@ pub enum Method {
     /// 40.10: create an exchange of type `kind` (`direct`, `fanout`,
     /// `topic`, `headers`), or with `passive`, check that it exists.
     ExchangeDeclare {
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The exchange type."]
+        /// The exchange type.
         kind: String,
-        #[doc = "Checks existence without creating the resource."]
+        /// Checks existence without creating the resource.
         passive: bool,
-        #[doc = "Keeps the resource across broker restarts."]
+        /// Keeps the resource across broker restarts.
         durable: bool,
-        #[doc = "Deletes the resource when its last user leaves."]
+        /// Deletes the resource when its last user leaves.
         auto_delete: bool,
-        #[doc = "Restricts publishing to other exchanges."]
+        /// Restricts publishing to other exchanges.
         internal: bool,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 40.11.
     ExchangeDeclareOk,
     /// 40.20: delete an exchange.
     ExchangeDelete {
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "Requires that no consumers or bindings use the resource."]
+        /// Requires that no consumers or bindings use the resource.
         if_unused: bool,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
     },
     /// 40.21.
@@ -1269,30 +1264,30 @@ pub enum Method {
     /// 40.30, a RabbitMQ extension: route from exchange `source` to
     /// exchange `destination`.
     ExchangeBind {
-        #[doc = "The destination exchange."]
+        /// The destination exchange.
         destination: String,
-        #[doc = "The source exchange."]
+        /// The source exchange.
         source: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 40.31.
     ExchangeBindOk,
     /// 40.40, a RabbitMQ extension: undo an exchange binding.
     ExchangeUnbind {
-        #[doc = "The destination exchange."]
+        /// The destination exchange.
         destination: String,
-        #[doc = "The source exchange."]
+        /// The source exchange.
         source: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 40.51.
@@ -1300,82 +1295,82 @@ pub enum Method {
     /// 50.10: create a queue, or with `passive`, check that it exists. An
     /// empty name asks the broker to choose one.
     QueueDeclare {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "Checks existence without creating the resource."]
+        /// Checks existence without creating the resource.
         passive: bool,
-        #[doc = "Keeps the resource across broker restarts."]
+        /// Keeps the resource across broker restarts.
         durable: bool,
-        #[doc = "Restricts the resource to this connection or consumer."]
+        /// Restricts the resource to this connection or consumer.
         exclusive: bool,
-        #[doc = "Deletes the resource when its last user leaves."]
+        /// Deletes the resource when its last user leaves.
         auto_delete: bool,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 50.11: the queue's name and how many messages and consumers it has.
     QueueDeclareOk {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "The number of messages in the queue or affected by the operation."]
+        /// The number of messages in the queue or affected by the operation.
         message_count: u32,
-        #[doc = "The number of consumers on the queue."]
+        /// The number of consumers on the queue.
         consumer_count: u32,
     },
     /// 50.20: route messages from `exchange` with `routing_key` to `queue`.
     QueueBind {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 50.21.
     QueueBindOk,
     /// 50.30: drop every message in a queue.
     QueuePurge {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
     },
     /// 50.31: how many messages were dropped.
     QueuePurgeOk {
-        #[doc = "The number of messages in the queue or affected by the operation."]
+        /// The number of messages in the queue or affected by the operation.
         message_count: u32,
     },
     /// 50.40: delete a queue.
     QueueDelete {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "Requires that no consumers or bindings use the resource."]
+        /// Requires that no consumers or bindings use the resource.
         if_unused: bool,
-        #[doc = "Requires an empty queue."]
+        /// Requires an empty queue.
         if_empty: bool,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
     },
     /// 50.41: how many messages were dropped with it.
     QueueDeleteOk {
-        #[doc = "The number of messages in the queue or affected by the operation."]
+        /// The number of messages in the queue or affected by the operation.
         message_count: u32,
     },
     /// 50.50: undo a queue binding.
     QueueUnbind {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 50.51.
@@ -1384,11 +1379,11 @@ pub enum Method {
     /// they acknowledge, on this channel or, with `global`, the
     /// connection.
     BasicQos {
-        #[doc = "The unacknowledged content limit in bytes; zero disables it."]
+        /// The unacknowledged content limit in bytes; zero disables it.
         prefetch_size: u32,
-        #[doc = "The unacknowledged message limit; zero disables it."]
+        /// The unacknowledged message limit; zero disables it.
         prefetch_count: u16,
-        #[doc = "Applies the limit to the connection."]
+        /// Applies the limit to the connection.
         global: bool,
     },
     /// 60.11.
@@ -1396,93 +1391,93 @@ pub enum Method {
     /// 60.20: start a consumer on `queue`. An empty tag asks the broker to
     /// choose one.
     BasicConsume {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "The consumer identifier."]
+        /// The consumer identifier.
         consumer_tag: String,
-        #[doc = "Suppresses messages from the same connection."]
+        /// Suppresses messages from the same connection.
         no_local: bool,
-        #[doc = "Disables explicit delivery acknowledgements."]
+        /// Disables explicit delivery acknowledgements.
         no_ack: bool,
-        #[doc = "Restricts the resource to this connection or consumer."]
+        /// Restricts the resource to this connection or consumer.
         exclusive: bool,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        #[doc = "The extension arguments."]
+        /// The extension arguments.
         arguments: Table,
     },
     /// 60.21: the consumer's tag.
     BasicConsumeOk {
-        #[doc = "The consumer identifier."]
+        /// The consumer identifier.
         consumer_tag: String,
     },
     /// 60.30: stop a consumer.
     BasicCancel {
-        #[doc = "The consumer identifier."]
+        /// The consumer identifier.
         consumer_tag: String,
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
     },
     /// 60.31.
     BasicCancelOk {
-        #[doc = "The consumer identifier."]
+        /// The consumer identifier.
         consumer_tag: String,
     },
     /// 60.40: publish the message that follows to `exchange` with
     /// `routing_key`. Content follows.
     BasicPublish {
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
-        #[doc = "Returns messages that cannot be routed."]
+        /// Returns messages that cannot be routed.
         mandatory: bool,
-        #[doc = "Requires immediate delivery to a consumer."]
+        /// Requires immediate delivery to a consumer.
         immediate: bool,
     },
     /// 60.50: a mandatory message could not be routed, and comes back.
     /// Content follows.
     BasicReturn {
-        #[doc = "The protocol reply code."]
+        /// The protocol reply code.
         reply_code: u16,
-        #[doc = "The reply description."]
+        /// The reply description.
         reply_text: String,
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
     },
     /// 60.60: a message for a consumer. Content follows.
     BasicDeliver {
-        #[doc = "The consumer identifier."]
+        /// The consumer identifier.
         consumer_tag: String,
-        #[doc = "The channel delivery sequence number."]
+        /// The channel delivery sequence number.
         delivery_tag: u64,
-        #[doc = "Marks a delivery attempted before."]
+        /// Marks a delivery attempted before.
         redelivered: bool,
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
     },
     /// 60.70: take one message from `queue`.
     BasicGet {
-        #[doc = "The queue name."]
+        /// The queue name.
         queue: String,
-        #[doc = "Disables explicit delivery acknowledgements."]
+        /// Disables explicit delivery acknowledgements.
         no_ack: bool,
     },
     /// 60.71: the message taken, and how many are left. Content follows.
     BasicGetOk {
-        #[doc = "The channel delivery sequence number."]
+        /// The channel delivery sequence number.
         delivery_tag: u64,
-        #[doc = "Marks a delivery attempted before."]
+        /// Marks a delivery attempted before.
         redelivered: bool,
-        #[doc = "The exchange name."]
+        /// The exchange name.
         exchange: String,
-        #[doc = "The routing key used by the binding or message."]
+        /// The routing key used by the binding or message.
         routing_key: String,
-        #[doc = "The number of messages in the queue or affected by the operation."]
+        /// The number of messages in the queue or affected by the operation.
         message_count: u32,
     },
     /// 60.72: the queue was empty.
@@ -1490,26 +1485,26 @@ pub enum Method {
     /// 60.80: acknowledge a delivery, or with `multiple`, every one up to
     /// it. In confirm mode the broker sends it for publishes.
     BasicAck {
-        #[doc = "The channel delivery sequence number."]
+        /// The channel delivery sequence number.
         delivery_tag: u64,
-        #[doc = "Includes every outstanding delivery through this tag."]
+        /// Includes every outstanding delivery through this tag.
         multiple: bool,
     },
     /// 60.90: refuse one delivery.
     BasicReject {
-        #[doc = "The channel delivery sequence number."]
+        /// The channel delivery sequence number.
         delivery_tag: u64,
-        #[doc = "Returns refused deliveries to their queues."]
+        /// Returns refused deliveries to their queues.
         requeue: bool,
     },
     /// 60.100: redeliver unacknowledged messages, with no reply.
     BasicRecoverAsync {
-        #[doc = "Returns refused deliveries to their queues."]
+        /// Returns refused deliveries to their queues.
         requeue: bool,
     },
     /// 60.110: redeliver unacknowledged messages.
     BasicRecover {
-        #[doc = "Returns refused deliveries to their queues."]
+        /// Returns refused deliveries to their queues.
         requeue: bool,
     },
     /// 60.111.
@@ -1517,16 +1512,16 @@ pub enum Method {
     /// 60.120, a RabbitMQ extension: refuse a delivery, or with
     /// `multiple`, every one up to it.
     BasicNack {
-        #[doc = "The channel delivery sequence number."]
+        /// The channel delivery sequence number.
         delivery_tag: u64,
-        #[doc = "Includes every outstanding delivery through this tag."]
+        /// Includes every outstanding delivery through this tag.
         multiple: bool,
-        #[doc = "Returns refused deliveries to their queues."]
+        /// Returns refused deliveries to their queues.
         requeue: bool,
     },
     /// 85.10, a RabbitMQ extension: put the channel in confirm mode.
     ConfirmSelect {
-        #[doc = "Suppresses the method acknowledgement."]
+        /// Suppresses the method acknowledgement.
         no_wait: bool,
     },
     /// 85.11.
@@ -1857,202 +1852,200 @@ impl Wire for Method {
     /// Appends the complete value. Refuses invalid fields, excess nesting,
     /// or size limits. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = (|| -> Result<Vec<u8>, EncodeError> {
-            use Method::*;
-            let mut w = Writer::new();
-            let (class_id, method_id) = self.ids();
-            w.u16(class_id);
-            w.u16(method_id);
-            match self {
-                ConnectionStart { version_major, version_minor, server_properties, mechanisms, locales } => {
-                    w.u8(*version_major);
-                    w.u8(*version_minor);
-                    w.table(server_properties, 1)?;
-                    w.longstr(mechanisms)?;
-                    w.longstr(locales)?;
-                }
-                ConnectionStartOk { client_properties, mechanism, response, locale } => {
-                    w.table(client_properties, 1)?;
-                    w.shortstr(mechanism)?;
-                    w.longstr(response)?;
-                    w.shortstr(locale)?;
-                }
-                ConnectionSecure { challenge: b } | ConnectionSecureOk { response: b } => w.longstr(b)?,
-                ConnectionTune { channel_max, frame_max, heartbeat }
-                | ConnectionTuneOk { channel_max, frame_max, heartbeat } => {
-                    w.u16(*channel_max);
-                    w.u32(*frame_max);
-                    w.u16(*heartbeat);
-                }
-                ConnectionOpen { virtual_host } => {
-                    w.shortstr(virtual_host)?;
-                    w.shortstr("")?;
-                    w.bit(false);
-                }
-                ConnectionOpenOk | ChannelOpen | BasicGetEmpty => w.shortstr("")?,
-                ConnectionClose { reply_code, reply_text, class_id, method_id }
-                | ChannelClose { reply_code, reply_text, class_id, method_id } => {
-                    w.u16(*reply_code);
-                    w.shortstr(reply_text)?;
-                    w.u16(*class_id);
-                    w.u16(*method_id);
-                }
-                ConnectionBlocked { reason } => w.shortstr(reason)?,
-                ConnectionUpdateSecret { new_secret, reason } => {
-                    w.longstr(new_secret)?;
-                    w.shortstr(reason)?;
-                }
-                ChannelOpenOk => w.longstr(&[])?,
-                ChannelFlow { active } | ChannelFlowOk { active } => w.bit(*active),
-                ExchangeDeclare { exchange, kind, passive, durable, auto_delete, internal, no_wait, arguments } => {
-                    w.u16(0);
-                    w.shortstr(exchange)?;
-                    w.shortstr(kind)?;
-                    for b in [passive, durable, auto_delete, internal, no_wait] {
-                        w.bit(*b);
-                    }
-                    w.table(arguments, 1)?;
-                }
-                ExchangeDelete { exchange, if_unused, no_wait } => {
-                    w.u16(0);
-                    w.shortstr(exchange)?;
-                    w.bit(*if_unused);
-                    w.bit(*no_wait);
-                }
-                ExchangeBind { destination, source, routing_key, no_wait, arguments }
-                | ExchangeUnbind { destination, source, routing_key, no_wait, arguments } => {
-                    w.u16(0);
-                    w.shortstr(destination)?;
-                    w.shortstr(source)?;
-                    w.shortstr(routing_key)?;
-                    w.bit(*no_wait);
-                    w.table(arguments, 1)?;
-                }
-                QueueDeclare { queue, passive, durable, exclusive, auto_delete, no_wait, arguments } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    for b in [passive, durable, exclusive, auto_delete, no_wait] {
-                        w.bit(*b);
-                    }
-                    w.table(arguments, 1)?;
-                }
-                QueueDeclareOk { queue, message_count, consumer_count } => {
-                    w.shortstr(queue)?;
-                    w.u32(*message_count);
-                    w.u32(*consumer_count);
-                }
-                QueueBind { queue, exchange, routing_key, no_wait, arguments } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    w.shortstr(exchange)?;
-                    w.shortstr(routing_key)?;
-                    w.bit(*no_wait);
-                    w.table(arguments, 1)?;
-                }
-                QueuePurge { queue, no_wait } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    w.bit(*no_wait);
-                }
-                QueuePurgeOk { message_count } | QueueDeleteOk { message_count } => w.u32(*message_count),
-                QueueDelete { queue, if_unused, if_empty, no_wait } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    w.bit(*if_unused);
-                    w.bit(*if_empty);
-                    w.bit(*no_wait);
-                }
-                QueueUnbind { queue, exchange, routing_key, arguments } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    w.shortstr(exchange)?;
-                    w.shortstr(routing_key)?;
-                    w.table(arguments, 1)?;
-                }
-                BasicQos { prefetch_size, prefetch_count, global } => {
-                    w.u32(*prefetch_size);
-                    w.u16(*prefetch_count);
-                    w.bit(*global);
-                }
-                BasicConsume { queue, consumer_tag, no_local, no_ack, exclusive, no_wait, arguments } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    w.shortstr(consumer_tag)?;
-                    for b in [no_local, no_ack, exclusive, no_wait] {
-                        w.bit(*b);
-                    }
-                    w.table(arguments, 1)?;
-                }
-                BasicConsumeOk { consumer_tag } | BasicCancelOk { consumer_tag } => w.shortstr(consumer_tag)?,
-                BasicCancel { consumer_tag, no_wait } => {
-                    w.shortstr(consumer_tag)?;
-                    w.bit(*no_wait);
-                }
-                BasicPublish { exchange, routing_key, mandatory, immediate } => {
-                    w.u16(0);
-                    w.shortstr(exchange)?;
-                    w.shortstr(routing_key)?;
-                    w.bit(*mandatory);
-                    w.bit(*immediate);
-                }
-                BasicReturn { reply_code, reply_text, exchange, routing_key } => {
-                    w.u16(*reply_code);
-                    w.shortstr(reply_text)?;
-                    w.shortstr(exchange)?;
-                    w.shortstr(routing_key)?;
-                }
-                BasicDeliver { consumer_tag, delivery_tag, redelivered, exchange, routing_key } => {
-                    w.shortstr(consumer_tag)?;
-                    w.u64(*delivery_tag);
-                    w.bit(*redelivered);
-                    w.shortstr(exchange)?;
-                    w.shortstr(routing_key)?;
-                }
-                BasicGet { queue, no_ack } => {
-                    w.u16(0);
-                    w.shortstr(queue)?;
-                    w.bit(*no_ack);
-                }
-                BasicGetOk { delivery_tag, redelivered, exchange, routing_key, message_count } => {
-                    w.u64(*delivery_tag);
-                    w.bit(*redelivered);
-                    w.shortstr(exchange)?;
-                    w.shortstr(routing_key)?;
-                    w.u32(*message_count);
-                }
-                BasicAck { delivery_tag, multiple: flag } | BasicReject { delivery_tag, requeue: flag } => {
-                    w.u64(*delivery_tag);
-                    w.bit(*flag);
-                }
-                BasicRecoverAsync { requeue } | BasicRecover { requeue } => w.bit(*requeue),
-                BasicNack { delivery_tag, multiple, requeue } => {
-                    w.u64(*delivery_tag);
-                    w.bit(*multiple);
-                    w.bit(*requeue);
-                }
-                ConfirmSelect { no_wait } => w.bit(*no_wait),
-                ConnectionCloseOk
-                | ConnectionUnblocked
-                | ConnectionUpdateSecretOk
-                | ChannelCloseOk
-                | ExchangeDeclareOk
-                | ExchangeDeleteOk
-                | ExchangeBindOk
-                | ExchangeUnbindOk
-                | QueueBindOk
-                | QueueUnbindOk
-                | BasicQosOk
-                | BasicRecoverOk
-                | ConfirmSelectOk
-                | TxSelect
-                | TxSelectOk
-                | TxCommit
-                | TxCommitOk
-                | TxRollback
-                | TxRollbackOk => {}
+        use Method::*;
+        let mut w = Writer::new();
+        let (class_id, method_id) = self.ids();
+        w.u16(class_id);
+        w.u16(method_id);
+        match self {
+            ConnectionStart { version_major, version_minor, server_properties, mechanisms, locales } => {
+                w.u8(*version_major);
+                w.u8(*version_minor);
+                w.table(server_properties, 1)?;
+                w.longstr(mechanisms)?;
+                w.longstr(locales)?;
             }
-            w.finish()
-        })()?;
+            ConnectionStartOk { client_properties, mechanism, response, locale } => {
+                w.table(client_properties, 1)?;
+                w.shortstr(mechanism)?;
+                w.longstr(response)?;
+                w.shortstr(locale)?;
+            }
+            ConnectionSecure { challenge: b } | ConnectionSecureOk { response: b } => w.longstr(b)?,
+            ConnectionTune { channel_max, frame_max, heartbeat }
+            | ConnectionTuneOk { channel_max, frame_max, heartbeat } => {
+                w.u16(*channel_max);
+                w.u32(*frame_max);
+                w.u16(*heartbeat);
+            }
+            ConnectionOpen { virtual_host } => {
+                w.shortstr(virtual_host)?;
+                w.shortstr("")?;
+                w.bit(false);
+            }
+            ConnectionOpenOk | ChannelOpen | BasicGetEmpty => w.shortstr("")?,
+            ConnectionClose { reply_code, reply_text, class_id, method_id }
+            | ChannelClose { reply_code, reply_text, class_id, method_id } => {
+                w.u16(*reply_code);
+                w.shortstr(reply_text)?;
+                w.u16(*class_id);
+                w.u16(*method_id);
+            }
+            ConnectionBlocked { reason } => w.shortstr(reason)?,
+            ConnectionUpdateSecret { new_secret, reason } => {
+                w.longstr(new_secret)?;
+                w.shortstr(reason)?;
+            }
+            ChannelOpenOk => w.longstr(&[])?,
+            ChannelFlow { active } | ChannelFlowOk { active } => w.bit(*active),
+            ExchangeDeclare { exchange, kind, passive, durable, auto_delete, internal, no_wait, arguments } => {
+                w.u16(0);
+                w.shortstr(exchange)?;
+                w.shortstr(kind)?;
+                for b in [passive, durable, auto_delete, internal, no_wait] {
+                    w.bit(*b);
+                }
+                w.table(arguments, 1)?;
+            }
+            ExchangeDelete { exchange, if_unused, no_wait } => {
+                w.u16(0);
+                w.shortstr(exchange)?;
+                w.bit(*if_unused);
+                w.bit(*no_wait);
+            }
+            ExchangeBind { destination, source, routing_key, no_wait, arguments }
+            | ExchangeUnbind { destination, source, routing_key, no_wait, arguments } => {
+                w.u16(0);
+                w.shortstr(destination)?;
+                w.shortstr(source)?;
+                w.shortstr(routing_key)?;
+                w.bit(*no_wait);
+                w.table(arguments, 1)?;
+            }
+            QueueDeclare { queue, passive, durable, exclusive, auto_delete, no_wait, arguments } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                for b in [passive, durable, exclusive, auto_delete, no_wait] {
+                    w.bit(*b);
+                }
+                w.table(arguments, 1)?;
+            }
+            QueueDeclareOk { queue, message_count, consumer_count } => {
+                w.shortstr(queue)?;
+                w.u32(*message_count);
+                w.u32(*consumer_count);
+            }
+            QueueBind { queue, exchange, routing_key, no_wait, arguments } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                w.shortstr(exchange)?;
+                w.shortstr(routing_key)?;
+                w.bit(*no_wait);
+                w.table(arguments, 1)?;
+            }
+            QueuePurge { queue, no_wait } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                w.bit(*no_wait);
+            }
+            QueuePurgeOk { message_count } | QueueDeleteOk { message_count } => w.u32(*message_count),
+            QueueDelete { queue, if_unused, if_empty, no_wait } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                w.bit(*if_unused);
+                w.bit(*if_empty);
+                w.bit(*no_wait);
+            }
+            QueueUnbind { queue, exchange, routing_key, arguments } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                w.shortstr(exchange)?;
+                w.shortstr(routing_key)?;
+                w.table(arguments, 1)?;
+            }
+            BasicQos { prefetch_size, prefetch_count, global } => {
+                w.u32(*prefetch_size);
+                w.u16(*prefetch_count);
+                w.bit(*global);
+            }
+            BasicConsume { queue, consumer_tag, no_local, no_ack, exclusive, no_wait, arguments } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                w.shortstr(consumer_tag)?;
+                for b in [no_local, no_ack, exclusive, no_wait] {
+                    w.bit(*b);
+                }
+                w.table(arguments, 1)?;
+            }
+            BasicConsumeOk { consumer_tag } | BasicCancelOk { consumer_tag } => w.shortstr(consumer_tag)?,
+            BasicCancel { consumer_tag, no_wait } => {
+                w.shortstr(consumer_tag)?;
+                w.bit(*no_wait);
+            }
+            BasicPublish { exchange, routing_key, mandatory, immediate } => {
+                w.u16(0);
+                w.shortstr(exchange)?;
+                w.shortstr(routing_key)?;
+                w.bit(*mandatory);
+                w.bit(*immediate);
+            }
+            BasicReturn { reply_code, reply_text, exchange, routing_key } => {
+                w.u16(*reply_code);
+                w.shortstr(reply_text)?;
+                w.shortstr(exchange)?;
+                w.shortstr(routing_key)?;
+            }
+            BasicDeliver { consumer_tag, delivery_tag, redelivered, exchange, routing_key } => {
+                w.shortstr(consumer_tag)?;
+                w.u64(*delivery_tag);
+                w.bit(*redelivered);
+                w.shortstr(exchange)?;
+                w.shortstr(routing_key)?;
+            }
+            BasicGet { queue, no_ack } => {
+                w.u16(0);
+                w.shortstr(queue)?;
+                w.bit(*no_ack);
+            }
+            BasicGetOk { delivery_tag, redelivered, exchange, routing_key, message_count } => {
+                w.u64(*delivery_tag);
+                w.bit(*redelivered);
+                w.shortstr(exchange)?;
+                w.shortstr(routing_key)?;
+                w.u32(*message_count);
+            }
+            BasicAck { delivery_tag, multiple: flag } | BasicReject { delivery_tag, requeue: flag } => {
+                w.u64(*delivery_tag);
+                w.bit(*flag);
+            }
+            BasicRecoverAsync { requeue } | BasicRecover { requeue } => w.bit(*requeue),
+            BasicNack { delivery_tag, multiple, requeue } => {
+                w.u64(*delivery_tag);
+                w.bit(*multiple);
+                w.bit(*requeue);
+            }
+            ConfirmSelect { no_wait } => w.bit(*no_wait),
+            ConnectionCloseOk
+            | ConnectionUnblocked
+            | ConnectionUpdateSecretOk
+            | ChannelCloseOk
+            | ExchangeDeclareOk
+            | ExchangeDeleteOk
+            | ExchangeBindOk
+            | ExchangeUnbindOk
+            | QueueBindOk
+            | QueueUnbindOk
+            | BasicQosOk
+            | BasicRecoverOk
+            | ConfirmSelectOk
+            | TxSelect
+            | TxSelectOk
+            | TxCommit
+            | TxCommitOk
+            | TxRollback
+            | TxRollbackOk => {}
+        }
+        let bytes = w.finish()?;
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -2199,10 +2192,12 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Whether two entries share a name.
+/// Whether two entries share a name, found by sorting references to the
+/// names, so a large table costs n log n time and no copies.
 fn has_duplicates(entries: &[(String, FieldValue)]) -> bool {
-    let mut names = std::collections::HashSet::new();
-    entries.iter().any(|(name, _)| !names.insert(name.as_str()))
+    let mut names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    names.windows(2).any(|w| w[0] == w[1])
 }
 
 /// Writes fields into a payload, packing bits as [`Reader`] reads them.
@@ -2392,8 +2387,8 @@ impl Writer {
 mod tests {
     use super::*;
     use crate::stdlib::codec::{
-        Stream, Fail, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Fail, Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
     };
 
     fn s(v: &str) -> String {
@@ -2602,8 +2597,6 @@ mod tests {
         // frame-max 131072, heartbeat 60.
         let bytes = [1, 0, 0, 0, 0, 0, 12, 0, 10, 0, 30, 0x07, 0xff, 0, 2, 0, 0, 0, 60, 0xce];
         let frame = Frame::parse(&bytes).unwrap();
-        let used = bytes.len();
-        assert_eq!(used, bytes.len());
         assert_eq!((frame.kind, frame.channel), (FrameKind::Method, 0));
         let m = Method::parse(&frame.payload).unwrap();
         assert_eq!(m, Method::ConnectionTune { channel_max: 2047, frame_max: 131072, heartbeat: 60 });
@@ -3114,17 +3107,7 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
-        for e in [
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-        ] {
-            assert!(!e.to_string().is_empty());
-        }
+        assert_eq!(EncodeError::Unwritable.to_string(), "AMQP value cannot be written without changing it");
     }
 
     fn publish() -> Method {

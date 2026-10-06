@@ -492,9 +492,9 @@ pub struct CoapOption {
     pub value: Vec<u8>,
 }
 
-/// A message's options, in order. A reader gives them sorted by number,
-/// with repeats in the order they came. Writers refuse decreasing numbers.
-/// Callers that reorder options must sort them before writing.
+/// A message's options, sorted by number, with repeats in insertion order.
+/// Readers and setters preserve this order. Writers refuse decreasing numbers.
+/// Callers that change the public list must keep it sorted before writing.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Options(
     /// The options in wire order, including repeated numbers.
@@ -549,9 +549,11 @@ impl Options {
         self.get(number).is_some()
     }
 
-    /// Adds option `number` with `value`, after any already there.
+    /// Inserts option `number` with `value` after all options with the same
+    /// or a lower number. Keeps repeated values in insertion order.
     pub fn add(&mut self, number: u16, value: impl Into<Vec<u8>>) {
-        self.0.push(CoapOption { number, value: value.into() });
+        let at = self.0.partition_point(|o| o.number <= number);
+        self.0.insert(at, CoapOption { number, value: value.into() });
     }
 
     /// Removes every option `number`.
@@ -587,7 +589,8 @@ impl Options {
     /// Sets option `number` to the shortest bytes for `n`.
     pub fn set_uint(&mut self, number: u16, n: u32) {
         self.remove(number);
-        self.0.push(CoapOption::uint(number, n));
+        let at = self.0.partition_point(|o| o.number <= number);
+        self.0.insert(at, CoapOption::uint(number, n));
     }
 
     /// Every value of option `number` as text, or `None` if one is not
@@ -1106,7 +1109,7 @@ pub enum WriteError {
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("CoAP value cannot be represented without changing it")
+        f.write_str("CoAP value cannot be written without changing it")
     }
 }
 
@@ -1600,8 +1603,8 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
 mod tests {
     use super::*;
     use crate::stdlib::codec::{
-        Stream, Fail, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Fail, Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
     };
 
     fn get(path: &str, id: u16, token: &[u8]) -> Message {
@@ -1755,6 +1758,30 @@ mod tests {
     }
 
     #[test]
+    fn setters_keep_options_in_number_order() {
+        let mut observe = get("/temp", 1, &[]);
+        observe.options.set_observe(0);
+        let mut block = Message::new(Type::Confirmable, Code::GET, 2);
+        block.options.set_block2(Block { num: 0, more: false, szx: 4 });
+        block.options.set_uri_path("/a/b");
+        let mut reply = observe.reply(Code::CONTENT, 3);
+        reply.options.set_max_age(10);
+        reply.options.set_content_format(0);
+        for message in [observe, block, reply] {
+            let bytes = message.to_bytes().unwrap();
+            assert_eq!(Message::parse(&bytes), Ok(message.clone()));
+            contract::check_wire_value(&message);
+        }
+        let mut options = Options::new();
+        options.add(option::URI_PATH, b"a".to_vec());
+        options.add(option::URI_QUERY, b"q=1".to_vec());
+        options.add(option::URI_PATH, b"b".to_vec());
+        options.set_uint(option::OBSERVE, 1);
+        assert_eq!(options.iter().map(|o| o.number).collect::<Vec<_>>(), [6, 11, 11, 15]);
+        assert_eq!(options.get_all(option::URI_PATH).collect::<Vec<_>>(), [b"a", b"b"]);
+    }
+
+    #[test]
     fn options_sort_and_typed_values() {
         let mut m = Message::new(Type::Confirmable, Code::PUT, 1);
         m.options.set_content_format(content_format::JSON);
@@ -1763,7 +1790,6 @@ mod tests {
         m.options.set_uri_path("/x//y/");
         m.options.set_observe(0x0100_0005);
         m.options.set_uint(option::MAX_AGE, 0);
-        m.options.0.sort_by_key(|o| o.number);
         let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
         let numbers: Vec<u16> = back.options.iter().map(|o| o.number).collect();
         assert_eq!(numbers, [6, 11, 11, 11, 11, 12, 14, 15]);
@@ -1924,7 +1950,6 @@ mod tests {
         // Through a message and back.
         let mut m = Message::new(Type::Confirmable, Code::CREATED, 1);
         m.options = o.clone();
-        m.options.0.sort_by_key(|o| o.number);
         let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
         assert_eq!(back.options.location_path().as_deref(), Some("/logs/17"));
         assert_eq!(back.options.accept(), Some(60));
@@ -2026,14 +2051,7 @@ mod tests {
         assert_eq!(Message::parse(&[0x70, 0x45, 0, 1]), Err(Error::TypeAndCode(Type::Reset, Code::CONTENT)));
         assert_eq!(Message::parse(&[0x50, 0x00, 0, 1]), Err(Error::TypeAndCode(Type::NonConfirmable, Code::EMPTY)));
         assert_eq!(peek_header(&[0x50, 0x00, 0, 1]), Some((Type::NonConfirmable, Code::EMPTY, 1)));
-        for ok in [
-            [0x60, 0x45, 0, 1],
-            [0x60, 0, 0, 1],
-            [0x70, 0, 0, 1],
-            [0x40, 0, 0, 1],
-            [0x50, 0x01, 0, 1],
-            [0x40, 0xe1, 0, 1],
-        ] {
+        for ok in [[0x60, 0x45, 0, 1], [0x60, 0, 0, 1], [0x70, 0, 0, 1], [0x40, 0, 0, 1], [0x50, 0x01, 0, 1], [0x40, 0xe1, 0, 1]] {
             assert!(Message::parse(&ok).is_ok(), "{ok:?}");
         }
         for (kind, code) in
@@ -2180,7 +2198,6 @@ mod tests {
                 m.options.set_block1(block);
                 m.options.set_size1(body.len() as u32);
                 m.payload = chunk.to_vec();
-                m.options.0.sort_by_key(|o| o.number);
                 let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
                 let done = a.push(back.options.block1().unwrap(), &back.payload).unwrap();
                 if done {
@@ -2240,7 +2257,6 @@ mod tests {
         assert!(observe_is_newer(2, 1, 129));
         let mut m = get("/temp", 1, &[1]);
         m.options.set_uint(option::OBSERVE, observe::REGISTER);
-        m.options.0.sort_by_key(|o| o.number);
         let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
         assert_eq!(back.options.observe(), Some(observe::REGISTER));
         m.options.set(option::OBSERVE, vec![1, 0, 0, 0]);
@@ -2252,14 +2268,9 @@ mod tests {
     #[test]
     fn tcp_length_forms() {
         // Body lengths at each boundary of the Len field.
-        for (payload, first, ext_len) in [
-            (11usize, 0xc0u8, 0usize),
-            (12, 0xd0, 1),
-            (267, 0xd0, 1),
-            (268, 0xe0, 2),
-            (65_803, 0xe0, 2),
-            (65_804, 0xf0, 4),
-        ] {
+        for (payload, first, ext_len) in
+            [(11usize, 0xc0u8, 0usize), (12, 0xd0, 1), (267, 0xd0, 1), (268, 0xe0, 2), (65_803, 0xe0, 2), (65_804, 0xf0, 4)]
+        {
             let f = Frame { code: Code::POST, token: Vec::new(), options: Options::new(), payload: vec![1; payload] };
             let bytes = f.to_bytes().unwrap();
             assert_eq!(bytes[0], first, "{payload}");
@@ -2426,7 +2437,6 @@ mod tests {
         m.options.set_observe(7);
         m.options.add(option::PROXY_URI, vec![b'p'; 300]);
         m.payload = b"payload".to_vec();
-        m.options.0.sort_by_key(|o| o.number);
         seeds.push(m.to_bytes().unwrap());
         seeds.push(Message::reset(9).to_bytes().unwrap());
         let mut f = Frame { token: vec![4; 4], ..Frame::new(Code::PUT) };
@@ -2456,6 +2466,9 @@ mod tests {
         for _ in 0..3000 {
             let mut m =
                 Message::new(Type::from_bits(rng.next() as u8), Code(1 + rng.index(255) as u8), rng.next() as u16);
+            if !valid_type_code(m.kind, m.code) {
+                m.kind = Type::Confirmable;
+            }
             m.token = rng.bytes(8);
             for _ in 0..rng.index(8) {
                 let len = [0, 1, 12, 13, 268, 269, 400][rng.index(7)];
@@ -2463,11 +2476,15 @@ mod tests {
             }
             m.payload = rng.bytes(39);
             contract::check_wire_value(&m);
+            let bytes = m.to_bytes().unwrap();
+            let back = Message::parse(&bytes).unwrap();
+            assert_eq!((back.kind, back.code, back.message_id), (m.kind, m.code, m.message_id));
+            assert_eq!((&back.token, &back.options, &back.payload), (&m.token, &m.options, &m.payload));
             let f = Frame { code: m.code, token: m.token, options: m.options, payload: m.payload };
             contract::check_wire_value(&f);
-            if let Ok(bytes) = f.to_bytes() {
-                check_bytes(&bytes);
-            }
+            let bytes = f.to_bytes().unwrap();
+            assert_eq!(Frame::parse(&bytes), Ok(f));
+            check_bytes(&bytes);
         }
     }
 }

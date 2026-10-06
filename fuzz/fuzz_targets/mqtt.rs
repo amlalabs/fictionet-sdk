@@ -17,7 +17,16 @@ fuzz_target!(|data: &[u8]| {
         let make = || Frames::with_limit(limit);
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     }
-    for packet in decode_all(Frames::new, data).0 {
+    let packets = decode_all(Frames::new, data).0;
+    if let Ok(packet) = Packet::parse(data) {
+        if data.len() <= fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET {
+            assert_eq!(packets.first(), Some(&packet));
+        } else {
+            // Exact parsing allows packets above the default stream limit.
+            assert_eq!(decode_all(|| Frames::with_limit(MAX_PACKET), data).0.first(), Some(&packet));
+        }
+    }
+    for packet in packets {
         contract::check_wire_value(&packet);
         assert_eq!(packet.encoded_len(), Ok(packet.to_bytes().unwrap().len()));
     }
@@ -43,7 +52,7 @@ fuzz_target!(|data: &[u8]| {
         for p in built {
             contract::check_wire_value(&p);
             let written = p.to_bytes();
-            assert_eq!(p.encoded_len().is_ok(), written.is_ok());
+            assert_eq!(p.encoded_len(), written.as_ref().map(Vec::len).map_err(|e| *e));
             if let Ok(bytes) = written {
                 assert_eq!(Packet::parse(&bytes), Ok(p));
             }

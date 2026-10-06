@@ -369,10 +369,9 @@ pub enum Error {
     },
     /// The remaining length ran past four bytes.
     RemainingLength,
-    /// The packet is longer than the reader or writer allows.
+    /// The packet is longer than the reader allows.
     TooLarge {
-        /// The packet's length in bytes: the whole packet for a reader, the
-        /// remaining length for a writer.
+        /// The whole packet's length in bytes.
         size: usize,
         /// The most allowed.
         max: usize,
@@ -385,7 +384,7 @@ pub enum Error {
     Utf8,
     /// A string held the character U+0000, which MQTT forbids.
     NullChar,
-    /// A string or binary field to write was longer than [`MAX_STRING`]
+    /// A string or binary field was longer than [`MAX_STRING`]
     /// bytes. It holds the length.
     TooLong(usize),
     /// A CONNECT named a protocol other than MQTT.
@@ -422,7 +421,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Unwritable => f.write_str("MQTT value cannot be represented without changing it"),
+            Error::Unwritable => f.write_str("MQTT value cannot be written without changing it"),
             Error::ReservedType(t) => write!(f, "reserved packet type {t}"),
             Error::Flags { packet_type, flags } => {
                 write!(f, "flags {flags:#06b} not allowed on packet type {packet_type}")
@@ -1024,16 +1023,14 @@ impl Wire for Packet {
 
     /// Appends a packet. Refuses invalid topics, flags, identifiers, strings,
     /// and size limits. Leaves `out` unchanged on error.
+    /// A [`Stream<Frames>`](super::codec::Stream) with a smaller limit may
+    /// still refuse a large packet. The size is checked before anything is allocated.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = (|| -> Result<Vec<u8>, Error> {
-            let (flags, body) = self.measure()?;
-            let mut out = Vec::with_capacity(1 + remaining_length_len(body) + body);
-            out.push((self.packet_type() << 4) | flags);
-            RemainingLength(body).write(&mut out)?;
-            self.write_body(&mut out)?;
-            Ok(out)
-        })()
-        .map_err(|_| Error::Unwritable)?;
+        let (flags, body) = self.measure().map_err(|_| Error::Unwritable)?;
+        let mut bytes = Vec::with_capacity(1 + remaining_length_len(body) + body);
+        bytes.push((self.packet_type() << 4) | flags);
+        RemainingLength(body).write(&mut bytes)?;
+        self.write_body(&mut bytes).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -1107,8 +1104,8 @@ impl Decode for Frames {
 mod tests {
     use super::*;
     use crate::stdlib::codec::{
-        Stream, Fail, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Fail, Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
     };
 
     fn connect_bytes() -> Vec<u8> {
@@ -1531,7 +1528,7 @@ mod tests {
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         drop(over);
         assert_eq!(publish(MAX_REMAINING_LENGTH - 3).encoded_len(), Ok(MAX_PACKET));
-        // A field error comes before the size check, as in to_bytes.
+        // Invalid fields are refused even when the packet fits the size limit.
         let mut bad = Publish {
             dup: false,
             qos: QoS::AtMostOnce,

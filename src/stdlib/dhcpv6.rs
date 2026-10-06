@@ -306,13 +306,13 @@ impl Duid {
 }
 
 impl Wire for Duid {
-    type ParseError = WriteError;
+    type ParseError = ParseError;
     type WriteError = WriteError;
 
     /// Reads a DUID. Refuses lengths outside [`MIN_DUID`] through [`MAX_DUID`].
-    fn parse(bytes: &[u8]) -> Result<Self, WriteError> {
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         if !(MIN_DUID..=MAX_DUID).contains(&bytes.len()) {
-            return Err(WriteError::Unwritable);
+            return Err(ParseError::BadOption(opt::CLIENTID));
         }
         Ok(Self(bytes.to_vec()))
     }
@@ -828,7 +828,7 @@ pub enum WriteError {
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("DHCPv6 value cannot be represented without changing it")
+        f.write_str("DHCPv6 value cannot be written without changing it")
     }
 }
 
@@ -1385,8 +1385,8 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 mod tests {
     use super::*;
     use crate::stdlib::codec::{
-        Stream, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Stream, contract, pump,
+        test_support::{Lcg, decode_all, mutate},
     };
 
     fn a(s: &str) -> Ipv6Addr {
@@ -1414,7 +1414,8 @@ mod tests {
         for len in [0, MIN_DUID - 1, MIN_DUID, MAX_DUID, MAX_DUID + 1] {
             let bytes = vec![0; len];
             let valid = (MIN_DUID..=MAX_DUID).contains(&len);
-            assert_eq!(Duid::parse(&bytes).is_ok(), valid);
+            let expected = if valid { Ok(Duid(bytes.clone())) } else { Err(ParseError::BadOption(opt::CLIENTID)) };
+            assert_eq!(Duid::parse(&bytes), expected);
             assert_eq!(Duid(bytes.clone()).to_bytes().is_ok(), valid);
             contract::check_wire::<Duid>(&bytes);
             contract::check_wire_value(&Duid(bytes));
@@ -2021,10 +2022,30 @@ mod tests {
     #[test]
     fn fuzz_random_bytes() {
         let mut r = Lcg::new(42);
+        let mut seeds = vec![SOLICIT.to_vec()];
+        for _ in 0..100 {
+            let mut message = random_message(&mut r);
+            if message.is_relay() {
+                message.transaction = 0;
+            } else {
+                message.transaction &= 0xffffff;
+                message.hop_count = 0;
+                message.link_address = Ipv6Addr::UNSPECIFIED;
+                message.peer_address = Ipv6Addr::UNSPECIFIED;
+            }
+            if let Ok(bytes) = message.to_bytes() {
+                seeds.push(bytes);
+                if seeds.len() == 21 {
+                    break;
+                }
+            }
+        }
+        assert_eq!(seeds.len(), 21);
+        assert!(seeds.iter().any(|bytes| Message::parse(bytes).unwrap().is_relay()));
         let mut accepted = 0;
         for round in 0..6000 {
-            let mut data = if round % 4 == 0 { r.bytes(80) } else { SOLICIT.to_vec() };
-            if round % 4 != 1 {
+            let mut data = if round % 4 == 0 { r.bytes(80) } else { seeds[r.index(seeds.len())].clone() };
+            for _ in 0..1 + r.index(4) {
                 mutate(&mut r, &mut data);
             }
             contract::check_wire::<Message>(&data);
