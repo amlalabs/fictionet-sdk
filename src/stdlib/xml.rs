@@ -2500,7 +2500,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_whitespace_outside_root() {
+    fn builder_whitespace_outside_root() {
         // A carriage return outside the root must stay a literal, since a
         // character reference there is not whitespace.
         let mut w = Builder::new();
@@ -2638,7 +2638,7 @@ mod tests {
     }
 
     #[test]
-    fn writer() {
+    fn builder() {
         let mut w = Builder::new();
         w.declaration().unwrap();
         assert_eq!(w.declaration(), Err(ErrorKind::BadDeclaration));
@@ -2758,7 +2758,7 @@ mod tests {
     }
 
     #[test]
-    fn fuzz() {
+    fn generated_and_mutated_values() {
         let mut rng = Lcg::new(7);
         let mut good = 0;
         for _ in 0..5000 {
@@ -2830,7 +2830,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_escapes_within_the_limit() {
+    fn builder_escapes_within_the_limit() {
         // Escaping stops once the piece passes the room left, rather than
         // building all of it first.
         let mut out = String::new();
@@ -2971,17 +2971,19 @@ mod tests {
                 doc.resize(MAX_DOCUMENT - 1 + extra, b'x');
                 check(&doc);
                 let (_, error) = decode_all(Events::new, &doc);
-                if extra > 1 {
-                    assert!(matches!(error, Some(Fail::Protocol(Error { kind: ErrorKind::TooLarge, .. }))));
+                let expected = if extra > 1 {
+                    Error { kind: ErrorKind::TooLarge, offset: 3 }
                 } else {
-                    assert!(error.is_some());
-                }
+                    let offset = if tail.is_empty() { doc.len() } else { 3 };
+                    Error { kind: ErrorKind::UnexpectedEnd, offset }
+                };
+                assert_eq!(error, Some(Fail::Protocol(expected)));
             }
         }
     }
 
     #[test]
-    fn writer_keeps_namespaces() {
+    fn builder_keeps_namespaces() {
         // An event's names carry namespaces; a writer that cannot give a name
         // the same namespace refuses it rather than change it.
         let ns = |u: &str| Some(Arc::<str>::from(u));
@@ -3014,7 +3016,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_reserves_end_tags() {
+    fn builder_reserves_end_tags() {
         // Every element a writer opened can be closed: room for the end
         // tags is kept back.
         let mut w = Builder::new();

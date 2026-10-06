@@ -35,6 +35,7 @@ fuzz_target!(|data: &[u8]| {
                 Some(Fail::Protocol(FieldError::Form(FormError::TooManyPairs)))
             );
         }
+        Err(FormError::TooLong) if data.len() > MAX_INPUT => assert!(error.is_some()),
         Err(_) => {}
     }
     if error.is_none() {
@@ -44,6 +45,9 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     assert_eq!(percent_decode(data).is_err(), data.len() > MAX_INPUT);
+    if let Ok(raw) = percent_decode(data) {
+        assert!(raw.len() <= data.len());
+    }
     for set in EncodeSet::ALL {
         let encoded = match PercentEncoded::new(data, set, set == EncodeSet::Form) {
             Ok(value) => value,

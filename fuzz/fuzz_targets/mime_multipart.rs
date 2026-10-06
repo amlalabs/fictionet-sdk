@@ -1,7 +1,7 @@
 //! Multipart body framing, MIME entities, parts, and parameterized headers.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Fail, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::mime_multipart::{
     Body, Entity, Error, Headers, MAX_ENTITY, Multipart, ParamValue, Part, Parts, boundary,
     valid_boundary,
@@ -35,7 +35,11 @@ fuzz_target!(|input: &[u8]| {
         Ok(multipart) => {
             assert_eq!(error, None);
             assert_eq!(parts, multipart.parts);
-            if let Ok(entity) = multipart.with_free_boundary(&bnd) {
+            // Leave room for a longer free boundary, header spaces, and the MIME header.
+            if data.len() < MAX_ENTITY / 2 {
+                let entity = multipart.with_free_boundary(&bnd).expect("a parsed body picks a boundary");
+                let bytes = entity.to_bytes().expect("a parsed body writes again");
+                assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
                 contract::check_wire_value(&entity);
                 contract::check_wire_value(&Body {
                     boundary: entity.boundary,

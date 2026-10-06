@@ -882,6 +882,7 @@ mod tests {
         let mut input = b"k=v&".to_vec();
         input.extend(std::iter::repeat_n(b'a', MAX_INPUT - 3));
         check(&input);
+        assert_eq!(Form::parse(&input), Err(FormError::TooLong));
         assert_eq!(decode_all(Fields::new, &input),
             (vec![Field(("k".into(), "v".into()))], Some(Fail::Protocol(FieldError::Form(FormError::TooLong)))));
         let over = b"a&".repeat(MAX_PAIRS + 1);
@@ -961,10 +962,10 @@ mod tests {
     }
 
     #[test]
-    fn fuzz_loop() {
+    fn generated_and_mutated_values() {
         const ALPHABET: &[u8] = b"%%%&&==++aA0fF9gz \x00\x7f\x80\xbf\xc3\xa9\xe2\xff#?~!'";
         let mut rng = Lcg::new(0x5eed);
-        for round in 0..1000 {
+        for round in 0..5000 {
             let len = rng.index(48);
             let buf: Vec<u8> = (0..len)
                 .map(|_| if rng.index(4) == 0 { rng.index(256) as u8 } else { ALPHABET[rng.index(ALPHABET.len())] })

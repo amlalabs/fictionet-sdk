@@ -83,9 +83,9 @@ pub mod wire_type {
     /// A varint length, then that many bytes: strings, bytes, embedded
     /// messages and packed repeated fields.
     pub const LEN: u8 = 2;
-    /// The start of a group.
+    /// The start of a group, which the protobuf encoding marks as deprecated.
     pub const SGROUP: u8 = 3;
-    /// The end of a group.
+    /// The end of a group, which the protobuf encoding marks as deprecated.
     pub const EGROUP: u8 = 4;
     /// Four bytes: `fixed32`, `sfixed32` and `float`.
     pub const I32: u8 = 5;
@@ -1309,7 +1309,7 @@ mod tests {
         finish(&mut stream, |_| panic!("no pending frame")).unwrap();
         assert_eq!(count, MAX_MESSAGE);
         assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     // Counts fields as MAX_FIELDS does: group members included.
@@ -1428,9 +1428,9 @@ mod tests {
     }
 
     #[test]
-    fn lcg_fuzz() {
+    fn generated_and_mutated_values() {
         let mut r = Lcg::new(11);
-        for _ in 0..1000 {
+        for _ in 0..3000 {
             // Built messages round trip.
             let m = random(&mut r, 0);
             let b = m.to_bytes().unwrap();

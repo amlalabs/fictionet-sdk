@@ -1386,14 +1386,12 @@ mod tests {
             check(doc);
             for cut in 0..doc.len() {
                 let error = Value::parse(&doc[..cut]).unwrap_err();
-                assert_eq!(error.kind, ErrorKind::UnexpectedEnd);
-                assert!(error.offset <= cut);
+                assert_eq!(error, Error::at(ErrorKind::UnexpectedEnd, cut));
                 let (items, error) = decode_all(Values::new, &doc[..cut]);
                 assert!(items.is_empty());
-                assert_eq!(error.is_none(), doc[..cut].iter().all(|c| is_ws(*c)));
-                if let Some(error) = error {
-                    assert!(matches!(error, Fail::Truncated { .. }));
-                }
+                let whitespace = doc[..cut].iter().take_while(|c| is_ws(**c)).count();
+                let expected = (cut > whitespace).then_some(Fail::Truncated { unread: cut - whitespace });
+                assert_eq!(error, expected);
             }
         }
     }
@@ -1443,9 +1441,9 @@ mod tests {
                 (vec![], Some(Fail::Protocol(error)))
             );
         }
-        for input in [b"{\"a\":".as_slice(), b"[1] [2,", b" \"abc", b"tru", b"1e"] {
+        for (input, unread) in [(b"{\"a\":".as_slice(), 5), (b"[1] [2,", 3), (b" \"abc", 4), (b"tru", 3), (b"1e", 2)] {
             check(input);
-            assert!(matches!(decode_all(Values::new, input).1, Some(Fail::Truncated { .. })));
+            assert_eq!(decode_all(Values::new, input).1, Some(Fail::Truncated { unread }));
         }
         let mut stream = Stream::new(Values::new());
         assert_eq!(stream.push(b" "), 1);
@@ -1573,7 +1571,7 @@ mod tests {
         assert_eq!(count, MAX_SIZE);
         assert_eq!(stream.buffered(), 0);
         assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
-        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     const PIECES: [&str; 32] = [

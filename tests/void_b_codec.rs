@@ -96,10 +96,10 @@ fn json_chunked_round_trip_and_eof() {
     }
     assert_eq!(decode_all(json::Values::new, &written), (values, None));
     for partial in [b"tru".as_slice(), b"1e-", b"-", b"[1", b"\"abc"] {
-        assert!(matches!(
+        assert_eq!(
             decode_all(json::Values::new, partial).1,
-            Some(Fail::Truncated { .. })
-        ));
+            Some(Fail::Truncated { unread: partial.len() })
+        );
     }
     assert!(matches!(
         decode_all(json::Values::new, b"{} [x]").1,

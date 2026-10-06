@@ -61,6 +61,7 @@ extern crate alloc;
 extern crate self as fictionet;
 
 use alloc::{
+    collections::BTreeSet,
     format,
     string::{String, ToString},
     vec,
@@ -83,7 +84,7 @@ pub const MAX_PARAMETERS: usize = 16;
 /// The most spaces and tabs read after a boundary, before the line ends.
 /// A boundary followed by more is [`Error::Padding`].
 pub const MAX_PADDING: usize = 64;
-/// The codec API's cap on one part, including headers, or on the preamble.
+/// The cap on one part, including headers, or on the preamble.
 /// MIME has no part size maximum. This module caps parts at 4 MiB.
 pub const MAX_PART: usize = 4 * 1024 * 1024;
 /// The largest complete MIME entity, including its header, in bytes.
@@ -115,7 +116,7 @@ pub enum Error {
     /// any amount of padding, but a body part may not hold the boundary at
     /// all, so the parser refuses the body rather than guess.
     Padding,
-    /// A codec part or preamble is longer than [`MAX_PART`].
+    /// A part or preamble is longer than [`MAX_PART`].
     TooLong,
     /// A complete entity is longer than [`MAX_ENTITY`].
     EntityTooLong,
@@ -150,14 +151,15 @@ pub enum WriteError {
     TooManyParts,
     /// A part has more than [`MAX_HEADERS`] header fields.
     TooManyHeaders,
-    /// A part's header block would be longer than [`MAX_HEADER_BYTES`].
+    /// A part's header block or a parameterized value would be longer than
+    /// [`MAX_HEADER_BYTES`].
     HeaderTooLong,
     /// A header name is empty or holds a character other than visible
-    /// ASCII, or a colon.
+    /// ASCII, or a colon. A parameter name is empty or is not a token.
     HeaderName,
     /// A header value holds CR or LF, or starts or ends with a space or tab.
     HeaderValue,
-    /// A codec part is longer than [`MAX_PART`], including its headers.
+    /// A part is longer than [`MAX_PART`], including its headers.
     TooLong,
     /// A complete entity is longer than [`MAX_ENTITY`].
     EntityTooLong,
@@ -194,7 +196,7 @@ pub fn valid_boundary(b: &str) -> bool {
 /// The boundary named in a `Content-Type` value such as
 /// `multipart/form-data; boundary=XyZ`. It returns `None` if the type is
 /// not `multipart/` and a subtype token, or the boundary is missing or
-/// not valid.
+/// not valid, or the Content-Type exceeds [`MAX_HEADER_BYTES`].
 ///
 /// As RFC 2045 allows, comments in parentheses and spaces around the `/`
 /// are skipped: `multipart / mixed; boundary=b (note)` names `b`. A
@@ -295,7 +297,8 @@ fn strip_comments(s: &str) -> Option<String> {
 
 /// The `Content-Type` value for a multipart body: `multipart/` and
 /// `subtype`, with the boundary as a parameter. It returns `None` if the
-/// subtype is empty or not a token, or the boundary is not valid.
+/// subtype is empty, is not a token, or exceeds [`MAX_HEADER_BYTES`] minus
+/// 128 bytes, or the boundary is not valid.
 pub fn content_type(subtype: &str, boundary: &str) -> Option<ParamValue> {
     if subtype.is_empty() || subtype.len() > MAX_HEADER_BYTES.saturating_sub(128)
         || !subtype.bytes().all(is_token) || !valid_boundary(boundary) {
@@ -388,13 +391,16 @@ impl ParamValue {
         self.params.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)).map(|(_, v)| v.as_str())
     }
 
-    fn header_text(&self) -> Option<String> {
+    fn header_text(&self) -> Result<String, WriteError> {
         let v = &self.value;
-        if v.is_empty() || v.contains([';', '\r', '\n']) || v.trim_matches(is_wsp_char).len() != v.len() {
-            return None;
+        if v.contains(['\r', '\n']) || v.trim_matches(is_wsp_char).len() != v.len() {
+            return Err(WriteError::HeaderValue);
+        }
+        if v.is_empty() || v.contains(';') {
+            return Err(WriteError::Unwritable);
         }
         if self.params.len() > MAX_PARAMETERS {
-            return None;
+            return Err(WriteError::Unwritable);
         }
         let len = self.params.iter().fold(v.len(), |n, (name, value)| {
             let quoted = value.is_empty() || !value.bytes().all(is_token);
@@ -403,15 +409,18 @@ impl ParamValue {
                 .saturating_add(3).saturating_add(if quoted { 2 } else { 0 })
         });
         if len > MAX_HEADER_BYTES {
-            return None;
+            return Err(WriteError::HeaderTooLong);
         }
         let mut out = v.clone();
         for (i, (name, value)) in self.params.iter().enumerate() {
-            if name.is_empty() || !name.bytes().all(is_token) || value.contains(['\r', '\n']) {
-                return None;
+            if name.is_empty() || !name.bytes().all(is_token) {
+                return Err(WriteError::HeaderName);
+            }
+            if value.contains(['\r', '\n']) {
+                return Err(WriteError::HeaderValue);
             }
             if self.params[..i].iter().any(|(n, _)| n.eq_ignore_ascii_case(name)) {
-                return None;
+                return Err(WriteError::Unwritable);
             }
             out.push_str("; ");
             out.push_str(name);
@@ -429,7 +438,7 @@ impl ParamValue {
                 out.push('"');
             }
         }
-        Some(out)
+        Ok(out)
     }
 }
 
@@ -445,7 +454,7 @@ impl Wire for ParamValue {
     fn parse(input: &[u8]) -> Result<Self, Error> {
         let text = core::str::from_utf8(input).map_err(|_| Error::Header)?;
         let value = Self::parse_text(text).ok_or(Error::Header)?;
-        value.header_text().ok_or(Error::Header)?;
+        value.header_text().map_err(|_| Error::Header)?;
         Ok(value)
     }
 
@@ -454,9 +463,13 @@ impl Wire for ParamValue {
     /// lengths, and values that would read back differently. The main value
     /// must be nonempty, have no semicolon, CR or LF, and have no surrounding
     /// spaces or tabs. A parameter name must be a token. Duplicate names
-    /// are compared without case. Leaves `out` unchanged on error.
+    /// are compared without case. Invalid names return [`WriteError::HeaderName`],
+    /// CR, LF, or surrounding spaces or tabs in the main value return
+    /// [`WriteError::HeaderValue`]. Oversized headers return
+    /// [`WriteError::HeaderTooLong`]. Other refusals return
+    /// [`WriteError::Unwritable`]. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let text = self.header_text().ok_or(WriteError::Unwritable)?;
+        let text = self.header_text()?;
         out.extend_from_slice(text.as_bytes());
         Ok(())
     }
@@ -523,7 +536,7 @@ impl Part {
         }
         let d = ParamValue { value: "form-data".into(), params: vec![("name".into(), name.into())] };
         Some(Part {
-            headers: Headers { fields: vec![("Content-Disposition".into(), d.header_text()?)] },
+            headers: Headers { fields: vec![("Content-Disposition".into(), d.header_text().ok()?)] },
             body: value.into(),
         })
     }
@@ -531,7 +544,8 @@ impl Part {
     /// An uploaded file: a form-data part with a `filename` parameter and
     /// a `Content-Type` field. It returns `None` if a name holds CR or LF,
     /// the disposition exceeds [`MAX_HEADER_BYTES`], or the content type
-    /// is not a valid header value. The writer checks the part cap.
+    /// is not a valid header value or exceeds [`MAX_HEADER_BYTES`]. The
+    /// writer checks the part cap.
     pub fn file(name: &str, filename: &str, content_type: &str, body: impl Into<Vec<u8>>) -> Option<Part> {
         if name.len() > MAX_HEADER_BYTES || filename.len() > MAX_HEADER_BYTES
             || content_type.len() > MAX_HEADER_BYTES || !valid_value(content_type) {
@@ -544,7 +558,7 @@ impl Part {
         Some(Part {
             headers: Headers {
                 fields: vec![
-                    ("Content-Disposition".into(), d.header_text()?),
+                    ("Content-Disposition".into(), d.header_text().ok()?),
                     ("Content-Type".into(), content_type.into()),
                 ],
             },
@@ -973,7 +987,7 @@ impl Multipart {
         let prefix = format!("{}-", &base[..base.len().min(MAX_BOUNDARY - 9)]);
         let mut needle = b"--".to_vec();
         needle.extend_from_slice(prefix.as_bytes());
-        let mut used = std::collections::HashSet::new();
+        let mut used = BTreeSet::new();
         for s in &slices {
             let mut at = 0;
             while let Some(i) = s.get(at..).and_then(|r| find(r, &needle)) {
@@ -1123,10 +1137,11 @@ impl Wire for Entity {
     type WriteError = WriteError;
 
     /// Reads a `Content-Type: multipart/mixed` header, an empty line, and
-    /// its complete body. Refuses other headers, invalid boundaries,
-    /// malformed parts, missing closure, and entities over [`MAX_ENTITY`]
+    /// its complete body. Refuses other headers, extra parameters, invalid
+    /// boundaries, malformed parts, missing closure, and entities over [`MAX_ENTITY`]
     /// in raw or canonical form. The chosen boundary must be absent from
-    /// the preamble, part headers, and part bodies.
+    /// the preamble, part headers, and part bodies. Comments and spaces
+    /// around the media type's slash are skipped as in [`boundary`].
     fn parse(input: &[u8]) -> Result<Self, Error> {
         if input.len() > MAX_ENTITY {
             return Err(Error::EntityTooLong);
@@ -1137,8 +1152,12 @@ impl Wire for Entity {
             return Err(Error::Header);
         }
         let value = headers.get("content-type").ok_or(Error::Header)?;
-        let content_type = ParamValue::parse(value.as_bytes())?;
-        if !content_type.value.eq_ignore_ascii_case("multipart/mixed") || content_type.params.len() != 1 {
+        let cleaned = strip_comments(value).ok_or(Error::Header)?;
+        let content_type = ParamValue::parse(cleaned.as_bytes())?;
+        let (top, sub) = content_type.value.split_once('/').ok_or(Error::Header)?;
+        if !top.trim_end_matches(is_wsp_char).eq_ignore_ascii_case("multipart")
+            || !sub.trim_start_matches(is_wsp_char).eq_ignore_ascii_case("mixed")
+            || content_type.params.len() != 1 {
             return Err(Error::Header);
         }
         let boundary = boundary(value).ok_or(Error::Boundary)?;
@@ -1486,6 +1505,43 @@ Content-Type: text/plain
     }
 
     #[test]
+    fn parsed_bodies_write_as_entities() {
+        for input in [
+            b"--b--".as_slice(),
+            b"preamble\r\n--b\r\nX:v\r\n\r\nbody\r\n--b--\r\nepilogue",
+            b"--b\r\nX:v\r\n\r\nx--b and --b-00000000\r\n--b--",
+        ] {
+            let multipart = Multipart::parse(input, "b").unwrap();
+            let entity = multipart.with_free_boundary("b").expect("a parsed body picks a boundary");
+            let bytes = entity.to_bytes().expect("a parsed body writes again");
+            assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
+            contract::check_wire_value(&Body {
+                boundary: entity.boundary,
+                multipart: entity.multipart,
+            });
+        }
+    }
+
+    #[test]
+    fn parameter_write_errors_are_specific() {
+        for (value, expected) in [
+            (ParamValue { value: "x".into(), params: vec![("bad name".into(), "v".into())] }, WriteError::HeaderName),
+            (ParamValue { value: "x\r\ny".into(), params: vec![] }, WriteError::HeaderValue),
+            (ParamValue { value: "x".into(), params: vec![("n".into(), "v\n".into())] }, WriteError::HeaderValue),
+            (ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] }, WriteError::HeaderTooLong),
+            (ParamValue { value: "x".into(), params: vec![("n".into(), "\"".repeat(MAX_HEADER_BYTES / 2))] }, WriteError::HeaderTooLong),
+            (ParamValue { value: " x".into(), params: vec![] }, WriteError::HeaderValue),
+            (ParamValue { value: "x;y".into(), params: vec![] }, WriteError::Unwritable),
+            (ParamValue { value: "x".into(), params: vec![("n".into(), "v".into()), ("N".into(), "v".into())] }, WriteError::Unwritable),
+        ] {
+            let mut out = b"keep".to_vec();
+            assert_eq!(value.write(&mut out), Err(expected));
+            assert_eq!(out, b"keep");
+            contract::check_wire_value(&value);
+        }
+    }
+
+    #[test]
     fn entity_limits_and_parameter_refusals() {
         let part = Part {
             headers: Headers { fields: vec![("X".into(), "v".into())] },
@@ -1503,7 +1559,7 @@ Content-Type: text/plain
         contract::check_wire_value(&oversized);
         assert_eq!(Multipart::parse(&vec![b'x'; MAX_ENTITY + 1], "b"), Err(Error::EntityTooLong));
         let long = ParamValue { value: "x".repeat(MAX_HEADER_BYTES + 1), params: vec![] };
-        assert_eq!(long.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(long.to_bytes(), Err(WriteError::HeaderTooLong));
         contract::check_wire_value(&long);
         assert_eq!(ParamValue::parse(b"x\r\ny"), Err(Error::Header));
         contract::check_wire::<ParamValue>(b"x;n=\"a b\"");
@@ -1926,6 +1982,30 @@ Content-Type: text/plain
         assert_eq!(boundary("multi(x)part/mixed; boundary=b"), None);
     }
 
+    #[test]
+    fn entity_content_type_comments() {
+        for value in [
+            "multipart/mixed; boundary=b (comment)",
+            "multipart / mixed; boundary=b",
+            "(a (nested) \\) one) MULTIPART (x) / MIXED; boundary=\"(q)\"",
+        ] {
+            let boundary = boundary(value).unwrap();
+            let input = format!("Content-Type: {value}\r\n\r\n--{boundary}--");
+            let entity = Multipart::default().with_boundary(boundary);
+            assert_eq!(Entity::parse(input.as_bytes()), Ok(entity.clone()));
+            contract::check_wire_value(&entity);
+        }
+        for value in [
+            "multipart/mixed; boundary=b (open",
+            "multi(x)part/mixed; boundary=b",
+            "multipart/form-data; boundary=b (comment)",
+            "multipart/mixed; boundary=b; x=y (comment)",
+        ] {
+            let input = format!("Content-Type: {value}\r\n\r\n--b--");
+            assert_eq!(Entity::parse(input.as_bytes()), Err(Error::Header));
+        }
+    }
+
     // Finding: RFC 2231 continuations of the boundary were not joined.
     #[test]
     fn boundary_continuations() {
@@ -1992,10 +2072,10 @@ Content-Type: text/plain
     ];
 
     #[test]
-    fn lcg_fuzz() {
+    fn generated_and_mutated_values() {
         let mut r = Lcg::new(0x5eed);
         let mut oks = 0;
-        for round in 0..1000 {
+        for round in 0..4000 {
             let mut data = Vec::new();
             for _ in 0..r.index(40) {
                 if r.index(8) == 0 {
@@ -2012,13 +2092,14 @@ Content-Type: text/plain
                 contract::check_wire_value(&entity);
                 let b = entity.boundary.clone();
                 let bytes = entity.to_bytes().unwrap();
+                assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
                 assert_eq!(Multipart::parse(raw(&bytes), &b).as_ref(), Ok(&m), "round {round}");
                 for p in &m.parts {
                     let _ = (p.name(), p.filename(), p.headers.content_type());
                 }
             }
             if let Ok(s) = std::str::from_utf8(&data) {
-                if let Some(v) = ParamValue::parse((s).as_bytes()).ok()
+                if let Ok(v) = ParamValue::parse(s.as_bytes())
                     && let Some(h) = v.to_bytes().ok().map(|bytes| String::from_utf8(bytes).unwrap()) {
                         assert_eq!(ParamValue::parse(h.as_bytes()).ok(), Some(v));
                     }
@@ -2028,7 +2109,7 @@ Content-Type: text/plain
         assert!(oks > 100, "only {oks} bodies parsed");
 
         // Structured bodies, with the boundary scattered through the data.
-        for round in 0..500 {
+        for round in 0..2000 {
             let bytes = |r: &mut Lcg| -> Vec<u8> {
                 let mut v = Vec::new();
                 for _ in 0..r.index(6) {
@@ -2058,6 +2139,7 @@ Content-Type: text/plain
             contract::check_wire_value(&entity);
             let b = entity.boundary.clone();
             let out = entity.to_bytes().unwrap();
+            assert_eq!(Entity::parse(&out).as_ref(), Ok(&entity));
             assert_eq!(Multipart::parse(raw(&out), &b).as_ref(), Ok(&m), "round {round}");
             check(&out, &b);
             for p in &m.parts {
