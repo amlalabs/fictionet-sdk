@@ -1,0 +1,22 @@
+{
+  "types": [
+    {
+      "name": "A",
+      "kind": "enum",
+      "repr": "u8",
+      "variants": [
+        {
+          "name": "b",
+          "value": 1
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "name": "S",
+      "item": "A",
+      "prefix": "u8"
+    }
+  ]
+}

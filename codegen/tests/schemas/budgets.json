@@ -1,0 +1,42 @@
+{
+  "types": [
+    {
+      "name": "Empty",
+      "kind": "struct",
+      "fields": []
+    },
+    {
+      "name": "Bag",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "items",
+          "type": {
+            "kind": "group",
+            "count": "u8",
+            "limit": 8,
+            "item": {
+              "kind": "ref",
+              "name": "Empty"
+            }
+          }
+        },
+        {
+          "name": "data",
+          "type": {
+            "kind": "bytes",
+            "prefix": "u8",
+            "limit": 64
+          }
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "name": "BagFrames",
+      "item": "Bag",
+      "prefix": "u8"
+    }
+  ]
+}

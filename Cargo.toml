@@ -1,3 +1,8 @@
+[workspace]
+members = [".", "codegen"]
+exclude = ["fuzz"]
+resolver = "3"
+
 [package]
 name = "fictionet"
 version = "0.0.0"
@@ -64,6 +69,7 @@ wasm-bindgen = "0.2"
 web-time = "1"
 
 [dev-dependencies]
+fictionet-codegen = { path = "codegen" }
 fictionet-copy-modules = { path = "tests/copy_and_own" }
 axum = { version = "0.8", default-features = false }
 hyper = { version = "1.11.1", features = ["client"] }

@@ -1,0 +1,15 @@
+{
+  "types": [
+    {
+      "name": "Point",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "x",
+          "type": "u8",
+          "byte_order": "big"
+        }
+      ]
+    }
+  ]
+}

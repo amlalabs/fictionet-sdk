@@ -1,0 +1,50 @@
+{
+  "types": [
+    {
+      "name": "Floats",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "small",
+          "type": {
+            "kind": "optional",
+            "item": "f32",
+            "null": 3.4028235e+38
+          }
+        },
+        {
+          "name": "large",
+          "type": {
+            "kind": "optional",
+            "item": "f64",
+            "null": 1.7976931348623157e+308
+          }
+        },
+        {
+          "name": "decimal",
+          "type": {
+            "kind": "optional",
+            "item": "f32",
+            "null": 0.1
+          }
+        },
+        {
+          "name": "negative_zero",
+          "type": {
+            "kind": "optional",
+            "item": "f32",
+            "null": -0.0
+          }
+        },
+        {
+          "name": "flag",
+          "type": {
+            "kind": "optional",
+            "item": "u8",
+            "flag": "u64"
+          }
+        }
+      ]
+    }
+  ]
+}

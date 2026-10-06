@@ -1,0 +1,50 @@
+{
+  "types": [
+    {
+      "name": "Mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+          "type": {
+            "kind": "ref",
+            "name": "Eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "kind": "enum",
+      "repr": "i64",
+      "variants": [
+        {
+          "name": "vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv",
+          "value": -9223372036854775808
+        },
+        {
+          "name": "wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww",
+          "value": 9223372036854775807
+        }
+      ]
+    },
+    {
+      "name": "Bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "kind": "set",
+      "repr": "u64",
+      "bits": [
+        {
+          "name": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "bit": 63
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "name": "Ssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss",
+      "item": "Mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm",
+      "prefix": "u32"
+    }
+  ]
+}
