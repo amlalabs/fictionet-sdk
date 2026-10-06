@@ -1,6 +1,10 @@
 //! ASN.1 BER and DER: reading and writing tags, lengths and values, with no
 //! I/O.
 //!
+//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
+//! Writing appends to the destination only after validation succeeds.
+//! `Stream<Elements>` frames BER or DER elements.
+//!
 //! ASN.1 describes data structures, and its encoding rules turn them into
 //! bytes. The Basic Encoding Rules (BER) allow several encodings of one
 //! value. The Distinguished Encoding Rules (DER) allow exactly one. LDAP,
@@ -11,7 +15,7 @@
 //! specification, and the character sets and time formats of ITU-T X.680.
 //!
 //! Nothing here reads a socket. A world that plays an LDAP server feeds the
-//! bytes it reads from a connection to a [`Decoder`], gets one message's
+//! bytes it reads from a connection to a [`super::codec::Stream`], gets one message's
 //! bytes at a time, and walks each one with a [`Reader`]. A world that
 //! checks a certificate reads it with [`Rules::Der`], so any encoding DER
 //! does not allow is refused. Replies are built with a [`Writer`], which
@@ -54,6 +58,8 @@
 //! assert_eq!(Reader::new(&ber, Rules::Der).read_sequence().err(), Some(Error::Indefinite));
 //! ```
 
+#![deny(missing_docs)]
+
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
@@ -61,7 +67,7 @@ use std::fmt;
 use super::codec::{Decode, Step, Wire};
 
 /// The longest element, header and contents together, a reader accepts and
-/// a writer writes. A [`Decoder`] never holds much more than this.
+/// a writer writes. A [`super::codec::Stream`] never holds much more than this.
 pub const MAX_INPUT: usize = 1 << 20;
 /// How deep constructed values may nest. Elements read straight from the
 /// input are at depth 0, their children at depth 1, and so on. A
@@ -175,7 +181,9 @@ impl fmt::Display for Error {
             Error::NonMinimalLength => f.write_str("length not in its shortest form (DER)"),
             Error::Indefinite => f.write_str("indefinite length not allowed here"),
             Error::Eoc => f.write_str("misplaced or malformed end-of-contents"),
-            Error::Unexpected { expected, found } => write!(f, "expected {expected}, found {found}"),
+            Error::Unexpected { expected, found } => {
+                write!(f, "expected {expected}, found {found}")
+            }
             Error::Empty => f.write_str("no more elements"),
             Error::Trailing => f.write_str("bytes after the last element"),
             Error::Primitive => f.write_str("primitive element where a constructed one was expected"),
@@ -236,30 +244,50 @@ pub struct Tag {
     /// The tag number.
     pub number: u32,
 }
-
-#[allow(missing_docs)] // each constant is the universal type it names
 impl Tag {
+    /// Boolean.
     pub const BOOLEAN: Tag = Tag::universal(1);
+    /// Integer.
     pub const INTEGER: Tag = Tag::universal(2);
+    /// Bit string.
     pub const BIT_STRING: Tag = Tag::universal(3);
+    /// Octet string.
     pub const OCTET_STRING: Tag = Tag::universal(4);
+    /// Null.
     pub const NULL: Tag = Tag::universal(5);
+    /// Oid.
     pub const OID: Tag = Tag::universal(6);
+    /// Enumerated.
     pub const ENUMERATED: Tag = Tag::universal(10);
+    /// Utf8 string.
     pub const UTF8_STRING: Tag = Tag::universal(12);
+    /// Sequence.
     pub const SEQUENCE: Tag = Tag::universal(16).as_constructed();
+    /// Set.
     pub const SET: Tag = Tag::universal(17).as_constructed();
+    /// Numeric string.
     pub const NUMERIC_STRING: Tag = Tag::universal(18);
+    /// Printable string.
     pub const PRINTABLE_STRING: Tag = Tag::universal(19);
+    /// Teletex string.
     pub const TELETEX_STRING: Tag = Tag::universal(20);
+    /// Videotex string.
     pub const VIDEOTEX_STRING: Tag = Tag::universal(21);
+    /// Ia5 string.
     pub const IA5_STRING: Tag = Tag::universal(22);
+    /// Utc time.
     pub const UTC_TIME: Tag = Tag::universal(23);
+    /// Generalized time.
     pub const GENERALIZED_TIME: Tag = Tag::universal(24);
+    /// Graphic string.
     pub const GRAPHIC_STRING: Tag = Tag::universal(25);
+    /// Visible string.
     pub const VISIBLE_STRING: Tag = Tag::universal(26);
+    /// General string.
     pub const GENERAL_STRING: Tag = Tag::universal(27);
+    /// Universal string.
     pub const UNIVERSAL_STRING: Tag = Tag::universal(28);
+    /// Bmp string.
     pub const BMP_STRING: Tag = Tag::universal(30);
 }
 
@@ -302,7 +330,7 @@ impl Tag {
 
     /// Appends the identifier octets to `out`: one byte for numbers below
     /// 31, and otherwise 0x1F-style long form in as few bytes as it takes.
-    pub fn encode(self, out: &mut Vec<u8>) {
+    pub(crate) fn encode(self, out: &mut Vec<u8>) {
         let first = self.class.bits() | if self.constructed { 0x20 } else { 0 };
         if self.number < 31 {
             out.push(first | self.number as u8);
@@ -310,13 +338,6 @@ impl Tag {
             out.push(first | 0x1f);
             push_base128(out, u128::from(self.number));
         }
-    }
-
-    /// The identifier octets.
-    pub fn to_bytes(self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.encode(&mut out);
-        out
     }
 }
 
@@ -613,7 +634,7 @@ fn check_frame(bytes: &[u8]) -> Result<(), Error> {
 /// ```
 /// use fictionet::stdlib::{asn1::{Elements, Frame, Rules}, codec::{Stream, Wire, finish, pump}};
 ///
-/// let bytes = <Frame as Wire>::to_bytes(&Frame(vec![5, 0]))?;
+/// let bytes = Frame(vec![5, 0]).to_bytes()?;
 /// let mut stream = Stream::new(Elements::new(Rules::Der));
 /// let mut elements = Vec::new();
 /// for byte in &bytes {
@@ -668,129 +689,12 @@ impl Decode for Elements {
             },
             None => element_len(input, self.rules)?,
         };
-        let Some(total) = total else { return Ok(Step::Need) };
+        let Some(total) = total else {
+            return Ok(Step::Need);
+        };
         let bytes = input.get(..total).ok_or(Error::Truncated)?;
         self.resume = None;
         Ok(Step::Item(bytes.to_vec(), total))
-    }
-}
-
-/// Splits a byte stream of ASN.1 elements, such as an LDAP connection,
-/// into one element at a time. Feed it the bytes a connection reads, in
-/// order, and take elements out until it has none.
-///
-/// Errors repeat and there is no EOF handling.
-/// Use [`super::codec::Stream`] with [`Elements`] for EOF and one-time errors.
-#[derive(Debug)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start in `buf`. Taken bytes are
-    /// dropped only once they are at least half of `buf`, so taking many
-    /// small elements does not copy the rest each time.
-    start: usize,
-    rules: Rules,
-    failed: Option<Error>,
-    /// How far the scan of an unfinished indefinite length has come, so
-    /// each call goes on from there instead of starting over.
-    resume: Option<Scan>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes, reading under `rules`.
-    pub fn new(rules: Rules) -> Decoder {
-        Decoder { buf: Vec::new(), start: 0, rules, failed: None, resume: None }
-    }
-
-    /// Adds bytes read from the connection, from the start of `bytes`, and
-    /// returns how many it took. It holds at most [`MAX_INPUT`] bytes not
-    /// yet taken out, so it may take only part of `bytes`: take elements
-    /// out with [`Decoder::next_element`], then feed it the rest. Once it
-    /// holds [`MAX_INPUT`] bytes, `next_element` always gives an element or
-    /// an error, so a loop of the two never stalls. After an error the
-    /// stream cannot be read any further, and every byte is taken and
-    /// dropped.
-    #[must_use = "the bytes past the count it returns were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        self.compact();
-        let n = bytes.len().min(MAX_INPUT - self.buffered().min(MAX_INPUT));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole element's bytes, if one has come. Read them with
-    /// [`Reader::new`]. It returns `None` when it needs more bytes, and
-    /// keeps returning the same error once the stream has broken. Taken
-    /// bytes are freed on a later `feed`, so the buffer is never much more
-    /// than twice [`MAX_INPUT`].
-    pub fn next_element(&mut self) -> Option<Result<Vec<u8>, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match self.frame() {
-            Ok(Some(n)) => {
-                self.resume = None;
-                let end = self.start + n;
-                let element = self.buf[self.start..end].to_vec();
-                self.start = end;
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
-                Some(Ok(element))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.resume = None;
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// What [`element_len`] gives for the held bytes, with an unfinished
-    /// indefinite length picked up where the last call left it.
-    fn frame(&mut self) -> Result<Option<usize>, Error> {
-        let buf = &self.buf[self.start..];
-        let at = match self.resume {
-            Some(at) => at,
-            None => match read_header(buf, 0, self.rules) {
-                // An indefinite length is scanned here, so the scan can be
-                // picked up again. Everything else is as `element_len` does.
-                Ok(h) if h.length == Length::Indefinite && !is_eoc_tag(h.tag) => Scan { pos: h.len, open: 1 },
-                _ => return element_len(buf, self.rules),
-            },
-        };
-        match scan(buf, self.rules, 0, at)? {
-            Ok((_, end)) => Ok(Some(end)),
-            Err(at) => {
-                self.resume = Some(at);
-                Ok(None)
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting to be taken out.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    /// The rules the decoder holds the stream to.
-    pub fn rules(&self) -> Rules {
-        self.rules
-    }
-
-    /// Drops the bytes already taken out, once they are at least half of
-    /// the buffer. Each byte is moved a bounded number of times on average.
-    fn compact(&mut self) {
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
     }
 }
 
@@ -1431,7 +1335,9 @@ impl Oid {
     /// The identifier with these arcs. There must be at least two, the
     /// first at most 2, and the second below 40 unless the first is 2.
     pub fn from_arcs(arcs: &[u128]) -> Result<Oid, Error> {
-        let [first, second, rest @ ..] = arcs else { return Err(Error::Oid) };
+        let [first, second, rest @ ..] = arcs else {
+            return Err(Error::Oid);
+        };
         if *first > 2 || (*first < 2 && *second >= 40) {
             return Err(Error::Oid);
         }
@@ -1644,7 +1550,7 @@ impl StringKind {
     /// Encodes `s` as the type's bytes, if every character is allowed.
     /// An encoding of more than [`MAX_INPUT`] bytes is [`Error::TooLong`],
     /// so whatever [`StringKind::decode`] gives, this takes back.
-    pub fn encode(self, s: &str) -> Result<Vec<u8>, Error> {
+    fn encode(self, s: &str) -> Result<Vec<u8>, Error> {
         if !self.is_decoded() {
             return Err(Error::Charset);
         }
@@ -2263,6 +2169,10 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::codec::{
+        Fail, Stream, contract,
+        test_support::{Lcg, chunks},
+    };
     use super::*;
 
     /// Writes `e` again with a [`Writer`], if every value in it is one the
@@ -2390,38 +2300,9 @@ mod tests {
     /// What the fuzz target checks, on one input.
     fn check(data: &[u8]) {
         for rules in [Rules::Ber, Rules::Der] {
-            // The stream, split two ways: all at once, and a byte at a time.
-            let mut whole = Decoder::new(rules);
-            assert_eq!(whole.feed(data), data.len());
-            let mut all = Vec::new();
-            let mut end = None;
-            while let Some(r) = whole.next_element() {
-                match r {
-                    Ok(e) => all.push(e),
-                    Err(e) => {
-                        end = Some(e);
-                        break;
-                    }
-                }
-            }
-            let mut bytewise = Decoder::new(rules);
-            let mut again = Vec::new();
-            let mut end_again = None;
-            'outer: for b in data {
-                assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
-                while let Some(r) = bytewise.next_element() {
-                    match r {
-                        Ok(e) => again.push(e),
-                        Err(e) => {
-                            end_again = Some(e);
-                            break 'outer;
-                        }
-                    }
-                }
-            }
-            assert_eq!(all, again);
-            assert_eq!(end, end_again);
+            contract::check_decode(|| Elements::new(rules), data);
         }
+        contract::check_wire::<Frame>(data);
         // DER is BER: what DER frames, BER frames the same.
         if let Ok(Some(n)) = element_len(data, Rules::Der) {
             assert_eq!(element_len(data, Rules::Ber), Ok(Some(n)));
@@ -2482,6 +2363,12 @@ mod tests {
     }
 
     // Examples from ITU-T X.690 (02/2021), section 8 and annex A.
+
+    fn tag_bytes(tag: Tag) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        tag.encode(&mut bytes);
+        bytes
+    }
 
     #[test]
     fn boolean_example() {
@@ -2637,9 +2524,11 @@ mod tests {
 
     #[test]
     fn integer_round_trips() {
-        let mut x: u64 = 1;
+        let mut rng = Lcg::new(1);
         for _ in 0..2000 {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut bytes = [0; 8];
+            rng.fill(&mut bytes);
+            let x = u64::from_le_bytes(bytes);
             let shift = (x >> 58) as u32;
             let v = (x as i64) >> shift;
             let b = der(|w| w.integer_i64(v));
@@ -2660,12 +2549,12 @@ mod tests {
     fn tags() {
         // 8.1.2.4: [APPLICATION 201], constructed, in the long form.
         let t = Tag::application(201).as_constructed();
-        assert_eq!(t.to_bytes(), [0x7f, 0x81, 0x49]);
+        assert_eq!(tag_bytes(t), [0x7f, 0x81, 0x49]);
         assert_eq!(Tag::parse(&[0x7f, 0x81, 0x49]), Ok((t, 3)));
-        assert_eq!(Tag::context(30).to_bytes(), [0x9e]);
-        assert_eq!(Tag::context(31).to_bytes(), [0x9f, 0x1f]);
-        assert_eq!(Tag::private(u32::MAX).to_bytes(), [0xdf, 0x8f, 0xff, 0xff, 0xff, 0x7f]);
-        assert_eq!(Tag::parse(&Tag::private(u32::MAX).to_bytes()), Ok((Tag::private(u32::MAX), 6)));
+        assert_eq!(tag_bytes(Tag::context(30)), [0x9e]);
+        assert_eq!(tag_bytes(Tag::context(31)), [0x9f, 0x1f]);
+        assert_eq!(tag_bytes(Tag::private(u32::MAX)), [0xdf, 0x8f, 0xff, 0xff, 0xff, 0x7f]);
+        assert_eq!(Tag::parse(&tag_bytes(Tag::private(u32::MAX))), Ok((Tag::private(u32::MAX), 6)));
         // A long form for a number below 31, a leading zero group, and a
         // number past 32 bits.
         assert_eq!(Tag::parse(&[0x1f, 0x1e]), Err(Error::Tag));
@@ -3054,18 +2943,19 @@ mod tests {
         }
         assert_eq!(element_len(&endless, Rules::Ber), Err(Error::TooLong));
         assert_eq!(element_len(&endless[..1000], Rules::Ber), Ok(None));
-        let mut d = Decoder::new(Rules::Ber);
+        let mut d = Stream::new(Elements::new(Rules::Ber));
         let mut result = None;
-        for chunk in endless.chunks(1 << 16) {
-            assert_eq!(d.feed(chunk), chunk.len());
-            assert!(d.buffered() <= MAX_INPUT + (1 << 16));
-            if let Some(r) = d.next_element() {
+        for chunk in chunks(&endless, &[1 << 16]) {
+            assert_eq!(d.push(chunk), chunk.len());
+            assert!(d.buffered() <= MAX_INPUT);
+            if let Some(r) = d.next() {
                 result = Some(r);
                 break;
             }
         }
-        assert_eq!(result, Some(Err(Error::TooLong)));
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(result, Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(d.buffered(), MAX_INPUT);
+        assert_eq!(d.next(), None);
     }
 
     fn samples() -> Vec<Vec<u8>> {
@@ -3138,24 +3028,24 @@ mod tests {
         let a = der(|w| w.sequence(|w| w.integer_i64(1)));
         let b = vec![0x30, 0x80, 0x02, 0x01, 0x02, 0x00, 0x00];
         let stream: Vec<u8> = a.iter().chain(&b).chain(&a).copied().collect();
-        let mut d = Decoder::new(Rules::Ber);
+        let mut d = Stream::new(Elements::new(Rules::Ber));
         let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(e) = d.next_element() {
+        for byte in chunks(&stream, &[1]) {
+            assert_eq!(d.push(byte), 1);
+            while let Some(e) = d.next() {
                 got.push(e.unwrap());
             }
         }
         assert_eq!(got, [a.clone(), b.clone(), a.clone()]);
         assert_eq!(d.buffered(), 0);
         // DER refuses the indefinite one, and the stream stays broken.
-        let mut d = Decoder::new(Rules::Der);
-        assert_eq!(d.feed(&stream), stream.len());
-        assert_eq!(d.next_element(), Some(Ok(a.clone())));
-        assert_eq!(d.next_element(), Some(Err(Error::Indefinite)));
-        assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_element(), Some(Err(Error::Indefinite)));
-        assert_eq!(d.buffered(), 0);
+        let mut d = Stream::new(Elements::new(Rules::Der));
+        assert_eq!(d.push(&stream), stream.len());
+        assert_eq!(d.next(), Some(Ok(a.clone())));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::Indefinite))));
+        assert_eq!(d.push(&a), a.len());
+        assert_eq!(d.next(), None);
+        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::Indefinite)));
     }
 
     #[test]
@@ -3179,11 +3069,11 @@ mod tests {
             b.extend_from_slice(&[0x04, 0x00]);
         }
         b.extend_from_slice(&[0x00, 0x00]);
-        let mut d = Decoder::new(Rules::Ber);
+        let mut d = Stream::new(Elements::new(Rules::Ber));
         let mut got = Vec::new();
-        for byte in &b {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(e) = d.next_element() {
+        for byte in chunks(&b, &[1]) {
+            assert_eq!(d.push(byte), 1);
+            while let Some(e) = d.next() {
                 got.push(e.unwrap());
             }
         }
@@ -3197,10 +3087,10 @@ mod tests {
         // copy the bytes still waiting behind it.
         let n = MAX_INPUT / 2;
         let stream = [0x05, 0x00].repeat(n);
-        let mut d = Decoder::new(Rules::Der);
-        assert_eq!(d.feed(&stream), stream.len());
+        let mut d = Stream::new(Elements::new(Rules::Der));
+        assert_eq!(d.push(&stream), stream.len());
         let mut count = 0;
-        while let Some(e) = d.next_element() {
+        while let Some(e) = d.next() {
             assert_eq!(e.unwrap(), [0x05, 0x00]);
             count += 1;
         }
@@ -3210,11 +3100,11 @@ mod tests {
         let a = [0x30, 0x03, 0x02, 0x01, 0x01];
         let b = [0x30, 0x80, 0x05, 0x00, 0x00, 0x00];
         let stream = [&a[..], &b[..]].concat().repeat(1000);
-        let mut d = Decoder::new(Rules::Ber);
+        let mut d = Stream::new(Elements::new(Rules::Ber));
         let mut got = Vec::new();
-        for chunk in stream.chunks(7) {
-            assert_eq!(d.feed(chunk), chunk.len());
-            while let Some(e) = d.next_element() {
+        for chunk in chunks(&stream, &[7]) {
+            assert_eq!(d.push(chunk), chunk.len());
+            while let Some(e) = d.next() {
                 got.push(e.unwrap());
             }
         }
@@ -3280,20 +3170,17 @@ mod tests {
             Reader::new(&t, Rules::Der).read_string_bytes(StringKind::Ia5),
             Err(Error::Unexpected { expected: Tag::IA5_STRING, found: Tag::GENERAL_STRING })
         );
-        let mut d = Decoder::new(Rules::Der);
-        assert_eq!(d.rules(), Rules::Der);
-        assert_eq!(d.feed(&t[..1]), 1);
-        assert_eq!((d.next_element(), d.buffered()), (None, 1));
+        let mut d = Stream::new(Elements::new(Rules::Der));
+        assert_eq!(d.decoder().rules(), Rules::Der);
+        assert_eq!(d.push(&t[..1]), 1);
+        assert_eq!((d.next(), d.buffered()), (None, 1));
         assert_eq!(BitString::new(vec![0; MAX_INPUT + 1], 0), Err(Error::TooLong));
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
-        let mut next = move || {
-            x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (x >> 33) as u32
-        };
+        let mut rng = Lcg::new(0x2545_f491_4f6c_dd1d);
+        let mut next = || rng.next() as u32;
         let seeds = samples();
         // Bytes that make up most headers, so random input gets past them.
         const COMMON: [u8; 16] =
@@ -3511,45 +3398,47 @@ mod tests {
     fn decoder_holds_a_bounded_number_of_bytes() {
         // One large feed is taken only up to MAX_INPUT bytes.
         let stream = [0x05, 0x00].repeat(MAX_INPUT);
-        let mut d = Decoder::new(Rules::Der);
-        assert_eq!(d.feed(&stream), MAX_INPUT);
+        let mut d = Stream::new(Elements::new(Rules::Der));
+        assert_eq!(d.push(&stream), MAX_INPUT);
         assert_eq!(d.buffered(), MAX_INPUT);
         // Feeding again without taking anything out takes nothing.
-        assert_eq!(d.feed(&stream[MAX_INPUT..]), 0);
+        assert_eq!(d.push(&stream[MAX_INPUT..]), 0);
         assert_eq!(d.buffered(), MAX_INPUT);
         // A loop of feeding and taking out gets every element.
-        let mut d = Decoder::new(Rules::Der);
+        let mut d = Stream::new(Elements::new(Rules::Der));
         let mut rest = &stream[..];
         let mut count = 0;
         while !rest.is_empty() {
-            let n = d.feed(rest);
+            let n = d.push(rest);
             rest = &rest[n..];
-            while let Some(e) = d.next_element() {
+            while let Some(e) = d.next() {
                 assert_eq!(e.unwrap(), [0x05, 0x00]);
                 count += 1;
             }
-            assert!(d.buf.capacity() <= 4 * MAX_INPUT);
+            assert!(d.buffered() <= MAX_INPUT);
         }
         assert_eq!(count, MAX_INPUT);
         // An element that never ends gives an error at the limit instead
         // of stalling the loop.
-        let mut d = Decoder::new(Rules::Ber);
+        let mut d = Stream::new(Elements::new(Rules::Ber));
         let mut endless = vec![0x30, 0x80];
         endless.resize(MAX_INPUT + 100, 0x05);
-        assert_eq!(d.feed(&[0x24, 0x80]), 2);
+        assert_eq!(d.push(&[0x24, 0x80]), 2);
         let mut rest = &[0x04, 0x01, 0x00].repeat(MAX_INPUT)[..];
         let result = loop {
-            let n = d.feed(rest);
+            let n = d.push(rest);
             rest = &rest[n..];
-            if let Some(r) = d.next_element() {
+            if let Some(r) = d.next() {
                 break r;
             }
             assert!(n > 0);
         };
-        assert_eq!(result, Err(Error::TooLong));
+        assert_eq!(result, Err(Fail::Protocol(Error::TooLong)));
         // After an error every byte is taken and dropped.
-        assert_eq!(d.feed(&endless), endless.len());
-        assert_eq!(d.buffered(), 0);
+        let held = d.buffered();
+        assert_eq!(d.push(&endless), endless.len());
+        assert_eq!(d.buffered(), held);
+        assert_eq!(d.next(), None);
     }
 
     #[test]

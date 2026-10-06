@@ -247,13 +247,13 @@ fn x509_pem_blocks_round_trip() -> Result<(), Box<dyn core::error::Error>> {
         extensions: Vec::new(),
     };
     let certificate = x509::Certificate::assemble(
-        &tbs.to_der()?,
+        &tbs.to_bytes()?,
         algorithm,
         asn1::BitString::new(vec![8; 64], 0)?,
     )?;
     let block = x509::Pem {
         label: x509::PEM_CERTIFICATE.into(),
-        data: certificate.to_der()?,
+        data: certificate.to_bytes()?,
     };
     let bytes = <x509::Pem as Wire>::to_bytes(&block)?;
     let mut both = bytes.clone();
@@ -284,7 +284,8 @@ fn x509_pem_trailing_text_at_eof() -> Result<(), Box<dyn core::error::Error>> {
         label: "TEST".into(),
         data: vec![1, 2, 3],
     }
-    .encode()?;
+    .to_bytes()?;
+    let text = String::from_utf8(text)?;
     for input in [
         format!("{text}# trailing comment"),
         format!("{}  ", text.trim_end_matches('\n')),
@@ -304,7 +305,8 @@ fn x509_pem_text_lines_have_their_own_limit() -> Result<(), Box<dyn core::error:
         label: "TEST".into(),
         data: vec![1, 2, 3],
     }
-    .encode()?;
+    .to_bytes()?;
+    let text = String::from_utf8(text)?;
     let limit = text.len() - 1;
     let comment = "#".repeat(128);
     let input = format!("{comment}\n{text}{comment}\n{text}{comment}");
@@ -397,14 +399,6 @@ fn frame_limits_refuse_lengths_before_bodies() {
     assert_eq!(ocsp::Frames::default().limit(), ocsp::MAX_MESSAGE);
     assert_eq!(spnego::Frames::default().limit(), spnego::MAX_TOKEN);
     assert_eq!(kerberos::Frames::default().limit(), kerberos::MAX_MESSAGE);
-}
-
-#[test]
-#[deny(deprecated)]
-fn kerberos_legacy_feed_remains_available() {
-    let mut decoder = kerberos::Decoder::new();
-    decoder.feed(&[0, 0, 0, 1, 42]);
-    assert_eq!(decoder.next_message(), Some(Ok(vec![42])));
 }
 
 #[test]

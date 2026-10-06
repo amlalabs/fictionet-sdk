@@ -1,6 +1,10 @@
 //! OCSP: reading and writing certificate status requests and responses,
 //! with no I/O.
 //!
+//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
+//! Writing appends to the destination only after validation succeeds.
+//! `Stream<Frames>` frames DER messages.
+//!
 //! The Online Certificate Status Protocol is how a client asks a
 //! certificate authority whether a certificate is still good. The client
 //! names each certificate by a [`CertId`]: hashes of its issuer's name and
@@ -17,8 +21,8 @@
 //! of the reply. Which certificates exist and whether they are revoked is
 //! up to world code. So is the signature: this module keeps signatures as
 //! bytes and never checks or makes one. A world that signs its answers
-//! signs the bytes [`ResponseData::to_der`] gives, and a client that signs
-//! its request signs the bytes [`OcspRequest::tbs_der`] gives.
+//! signs the bytes [`ResponseData::write`] gives, and a client that signs
+//! its request signs the bytes [`OcspRequest::tbs_request`] gives.
 //!
 //! Every reader checks lengths, tags and the DER rules, because the agent
 //! can send any bytes it likes. Messages are at most [`MAX_MESSAGE`]
@@ -27,6 +31,7 @@
 //! kept as the DER bytes of one element, checked as DER.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::ocsp::{
 //!     AlgorithmIdentifier, BasicResponse, CertId, CertStatus, Extension, OcspRequest, OcspResponse, Request,
 //!     ResponderId, ResponseData, SingleResponse,
@@ -41,7 +46,7 @@
 //! };
 //! let mut request = OcspRequest::new(vec![Request { cert_id: id, extensions: vec![] }]);
 //! request.extensions.push(Extension::nonce(b"0123456789abcdef").unwrap());
-//! let body = request.to_der().unwrap();
+//! let body = request.to_bytes().unwrap();
 //!
 //! // The responder's side: read the request and say every certificate is good.
 //! let request = OcspRequest::parse(&body).unwrap();
@@ -62,14 +67,14 @@
 //!         .collect(),
 //!     extensions: request.nonce().and_then(|n| Extension::nonce(n).ok()).into_iter().collect(),
 //! };
-//! // A real responder signs `data.to_der()`; these bytes stand in for it.
+//! // A real responder signs `data.to_bytes()`; these bytes stand in for it.
 //! let basic = BasicResponse {
 //!     data,
 //!     signature_algorithm: AlgorithmIdentifier::sha1(),
 //!     signature: vec![0; 64],
 //!     certs: vec![],
 //! };
-//! let reply = OcspResponse::basic(basic).to_der().unwrap();
+//! let reply = OcspResponse::basic(basic).to_bytes().unwrap();
 //!
 //! // The client reads the answer, with the nonce it sent.
 //! let response = OcspResponse::parse(&reply).unwrap();
@@ -78,6 +83,8 @@
 //! assert_eq!(basic.data.responses[0].status, CertStatus::Good);
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
+
+#![deny(missing_docs)]
 
 use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
 use super::codec::{Decode, Step, Wire};
@@ -125,6 +132,8 @@ pub mod oid {
 /// could not write one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// Encoding would change the value when parsed.
+    Unwritable,
     /// The bytes are not the DER the structure needs: a wrong tag, a
     /// missing field, a bad length, bytes left over, and so on.
     Asn1(asn1::Error),
@@ -174,6 +183,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value changes when encoded"),
             Error::Asn1(e) => write!(f, "OCSP DER: {e}"),
             Error::TooLong => write!(f, "OCSP message longer than {MAX_MESSAGE} bytes"),
             Error::TooMany => f.write_str("OCSP list longer than its limit"),
@@ -335,7 +345,7 @@ impl OcspRequest {
     }
 
     /// Reads a request from its DER, such as a POST body.
-    pub fn parse(b: &[u8]) -> Result<OcspRequest, Error> {
+    fn read_der(b: &[u8]) -> Result<OcspRequest, Error> {
         let mut top = outer(b)?;
         let mut req = top.read_sequence()?;
         top.finish()?;
@@ -391,7 +401,7 @@ impl OcspRequest {
     /// DER part is not one well-formed element, the requestor name is not
     /// a GeneralName, the request is signed but names no requestor, or the
     /// whole is over [`MAX_MESSAGE`].
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode_der(&self) -> Result<Vec<u8>, Error> {
         self.check_tbs()?;
         if let Some(s) = &self.signature {
             if self.requestor_name.is_none() {
@@ -415,15 +425,13 @@ impl OcspRequest {
         finish(w)
     }
 
-    /// The DER of the request's TBSRequest: the bytes a client signs, and a
-    /// responder checks the signature over, as they appear inside the
-    /// whole request. It fails where [`OcspRequest::to_der`] does, except
-    /// that `signature` is not looked at.
-    pub fn tbs_der(&self) -> Result<Vec<u8>, Error> {
-        self.check_tbs()?;
-        let mut w = Writer::new();
-        self.write_tbs(&mut w);
-        finish(w)
+    /// Returns the signed TBSRequest bytes from one complete DER request.
+    /// The returned slice preserves the received encoding.
+    pub fn tbs_request(der: &[u8]) -> Result<&[u8], Error> {
+        Self::parse(der)?;
+        let mut top = outer(der)?;
+        let mut request = top.read_sequence()?;
+        Ok(request.read()?.raw())
     }
 
     /// The nonce the request carries, if any. See [`find_nonce`].
@@ -470,12 +478,6 @@ impl OcspRequest {
     /// responder's URL and its slash. See [`decode_get_path`].
     pub fn from_get_path(segment: &str) -> Result<OcspRequest, Error> {
         OcspRequest::parse(&decode_get_path(segment)?)
-    }
-
-    /// The path segment that sends this request with HTTP GET, to put
-    /// after the responder's URL and a slash. See [`encode_get_path`].
-    pub fn to_get_path(&self) -> Result<String, Error> {
-        encode_get_path(&self.to_der()?)
     }
 }
 
@@ -574,7 +576,7 @@ impl OcspResponse {
 
     /// Reads a response from its DER, such as an HTTP reply's body. A basic
     /// response inside is read too, and an error in it is an error here.
-    pub fn parse(b: &[u8]) -> Result<OcspResponse, Error> {
+    fn read_der(b: &[u8]) -> Result<OcspResponse, Error> {
         let mut top = outer(b)?;
         let mut resp = top.read_sequence()?;
         top.finish()?;
@@ -600,17 +602,17 @@ impl OcspResponse {
     }
 
     /// The response's DER, for a world that plays a responder. It fails
-    /// where [`BasicResponse::to_der`] does, if the status and the bytes
+    /// where [`BasicResponse::write`] does, if the status and the bytes
     /// disagree or [`ResponseBytes::Other`] has the basic type's
     /// identifier ([`Error::ResponseBytes`]), or if the whole is over
     /// [`MAX_MESSAGE`].
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode_der(&self) -> Result<Vec<u8>, Error> {
         check_status(self.status, &self.bytes)?;
         let basic;
         let (response_type, response): (Option<&Oid>, &[u8]) = match &self.bytes {
             None => (None, &[]),
             Some(ResponseBytes::Basic(b)) => {
-                basic = (known_oid(oid::BASIC), b.to_der()?);
+                basic = (known_oid(oid::BASIC), b.encode_der()?);
                 (Some(&basic.0), &basic.1)
             }
             Some(ResponseBytes::Other { response_type, response }) => {
@@ -657,7 +659,7 @@ pub struct BasicResponse {
 impl BasicResponse {
     /// Reads a basic response from its DER: the contents of a response's
     /// OCTET STRING.
-    pub fn parse(b: &[u8]) -> Result<BasicResponse, Error> {
+    fn read_der(b: &[u8]) -> Result<BasicResponse, Error> {
         let mut top = outer(b)?;
         let mut s = top.read_sequence()?;
         top.finish()?;
@@ -672,7 +674,7 @@ impl BasicResponse {
     /// The basic response's DER. It fails if a list is over its limit, a
     /// time is not in the form RFC 5280 allows, a raw DER part is not one
     /// well-formed element, or the whole is over [`MAX_MESSAGE`].
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode_der(&self) -> Result<Vec<u8>, Error> {
         self.data.check()?;
         check_certs(&self.certs)?;
         let mut w = Writer::new();
@@ -717,7 +719,7 @@ pub struct ResponseData {
 impl ResponseData {
     /// The DER the responder signs, as it appears inside a
     /// [`BasicResponse`].
-    pub fn to_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode_der(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
         let mut w = Writer::new();
         write_response_data(&mut w, self);
@@ -747,7 +749,9 @@ impl ResponseData {
             }
         }
         match &self.responder_id {
-            ResponderId::ByName(name) if name.first() != Some(&0x30) => return Err(Error::ResponderId),
+            ResponderId::ByName(name) if name.first() != Some(&0x30) => {
+                return Err(Error::ResponderId);
+            }
             ResponderId::ByKey(hash) if hash.len() != 20 => return Err(Error::HashLength),
             _ => {}
         }
@@ -760,17 +764,26 @@ impl ResponseData {
 
 /// Why a certificate was revoked: the CRLReason codes of RFC 5280.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant is the reason it names
 pub enum CrlReason {
+    /// Unspecified.
     Unspecified,
+    /// Key compromise.
     KeyCompromise,
+    /// Ca compromise.
     CaCompromise,
+    /// Affiliation changed.
     AffiliationChanged,
+    /// Superseded.
     Superseded,
+    /// Cessation of operation.
     CessationOfOperation,
+    /// Certificate hold.
     CertificateHold,
+    /// Remove from crl.
     RemoveFromCrl,
+    /// Privilege withdrawn.
     PrivilegeWithdrawn,
+    /// Aa compromise.
     AaCompromise,
 }
 
@@ -937,17 +950,17 @@ fn hex_digit(c: u8) -> Result<u8, Error> {
 
 impl Wire for OcspRequest {
     type ParseError = Error;
-    type WriteError = EncodeError;
+    type WriteError = Error;
 
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::parse(bytes)
+        Self::read_der(bytes)
     }
 
     /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = self.to_der().map_err(|_| EncodeError)?;
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(EncodeError);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.encode_der()?;
+        if Self::read_der(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&bytes);
         Ok(())
@@ -956,17 +969,17 @@ impl Wire for OcspRequest {
 
 impl Wire for OcspResponse {
     type ParseError = Error;
-    type WriteError = EncodeError;
+    type WriteError = Error;
 
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::parse(bytes)
+        Self::read_der(bytes)
     }
 
     /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = self.to_der().map_err(|_| EncodeError)?;
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(EncodeError);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.encode_der()?;
+        if Self::read_der(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&bytes);
         Ok(())
@@ -975,37 +988,22 @@ impl Wire for OcspResponse {
 
 impl Wire for BasicResponse {
     type ParseError = Error;
-    type WriteError = EncodeError;
+    type WriteError = Error;
 
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::parse(bytes)
+        Self::read_der(bytes)
     }
 
     /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let bytes = self.to_der().map_err(|_| EncodeError)?;
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(EncodeError);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.encode_der()?;
+        if Self::read_der(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Unwritable);
         }
         out.extend_from_slice(&bytes);
         Ok(())
     }
 }
-
-/// An OCSP value cannot be written without changing its value.
-///
-/// The value exceeds a named limit, contains an invalid field, or would
-/// parse differently after encoding.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct EncodeError;
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("OCSP value cannot be represented without changing its value")
-    }
-}
-
-impl core::error::Error for EncodeError {}
 
 /// Reads whole DER messages without holding input bytes.
 ///
@@ -1030,9 +1028,7 @@ impl Frames {
     /// Zero refuses every message. Oversized messages are refused from
     /// their headers, before their contents arrive.
     pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
+        Self { limit: limit.min(MAX_MESSAGE) }
     }
 
     /// The maximum message size, including its ASN.1 header.
@@ -1073,95 +1069,6 @@ impl Decode for Frames {
             Some(bytes) => Step::Item(bytes.to_vec(), total),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits a byte stream into whole DER messages, such as an HTTP body that
-/// comes in pieces. Feed it the bytes in order, and take messages out until
-/// it has none. Read each one with [`OcspRequest::parse`] or
-/// [`OcspResponse::parse`]. It holds at most [`MAX_MESSAGE`] bytes not yet
-/// taken out.
-///
-/// Errors repeat and there is no EOF handling.
-/// Use [`super::codec::Stream`] with [`Frames`] for EOF and one-time errors.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are dropped
-    /// in `feed` once they are half the buffer.
-    start: usize,
-    failed: Option<Error>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes from the start of `bytes`, and returns how many it took.
-    /// It holds at most [`MAX_MESSAGE`] bytes not yet taken out, so it may
-    /// take only part of `bytes`: take messages out with
-    /// [`Decoder::next_message`], then feed it the rest. Once it holds
-    /// [`MAX_MESSAGE`] bytes, `next_message` always gives a message or an
-    /// error, so a loop of the two never stalls. After an error the stream
-    /// cannot be read any further, and every byte is taken and dropped.
-    #[must_use = "the bytes past the count it returns were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_MESSAGE - self.buffered().min(MAX_MESSAGE));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole message's bytes, if one has come. It returns `None`
-    /// when it needs more bytes, and keeps returning the same error once
-    /// the stream has broken. A header that is not DER, or that announces
-    /// more than [`MAX_MESSAGE`] bytes, breaks it at once.
-    pub fn next_message(&mut self) -> Option<Result<Vec<u8>, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let held = &self.buf[self.start..];
-        if held.is_empty() {
-            return None;
-        }
-        let total = match Header::parse(held, Rules::Der) {
-            Err(asn1::Error::Truncated) => return None,
-            Err(e) => return Some(Err(self.fail(Error::Asn1(e)))),
-            Ok(Header { length: Length::Indefinite, .. }) => {
-                return Some(Err(self.fail(Error::Asn1(asn1::Error::Indefinite))));
-            }
-            Ok(Header { length: Length::Definite(n), len, .. }) => len.checked_add(n),
-        };
-        let total = match total {
-            Some(t) if t <= MAX_MESSAGE => t,
-            _ => return Some(Err(self.fail(Error::TooLong))),
-        };
-        if held.len() < total {
-            return None;
-        }
-        let message = held[..total].to_vec();
-        self.start += total;
-        Some(Ok(message))
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    fn fail(&mut self, e: Error) -> Error {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.start = 0;
-        e
     }
 }
 
@@ -1366,7 +1273,9 @@ fn write_cert_id(w: &mut Writer, c: &CertId) {
 
 /// `[n] EXPLICIT Extensions OPTIONAL`, read as an empty list when absent.
 fn read_extensions(r: &mut Reader<'_>, n: u32) -> Result<Vec<Extension>, Error> {
-    let Some(mut inner) = explicit(r, n)? else { return Ok(Vec::new()) };
+    let Some(mut inner) = explicit(r, n)? else {
+        return Ok(Vec::new());
+    };
     let mut list = inner.read_sequence()?;
     inner.finish()?;
     let mut out = Vec::new();
@@ -1422,7 +1331,9 @@ fn read_signature_bits(r: &mut Reader<'_>) -> Result<Vec<u8>, Error> {
 /// `[0] EXPLICIT SEQUENCE OF Certificate OPTIONAL`, read as an empty list
 /// when absent.
 fn read_certs(r: &mut Reader<'_>) -> Result<Vec<Vec<u8>>, Error> {
-    let Some(mut inner) = explicit(r, 0)? else { return Ok(Vec::new()) };
+    let Some(mut inner) = explicit(r, 0)? else {
+        return Ok(Vec::new());
+    };
     let list = inner.read_sequence()?;
     inner.finish()?;
     let mut out = Vec::new();
@@ -1578,8 +1489,33 @@ fn write_single_response(w: &mut Writer, r: &SingleResponse) {
     });
 }
 
+impl Wire for ResponseData {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = outer(bytes)?;
+        let data = read_response_data(&mut r)?;
+        r.finish()?;
+        Ok(data)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let bytes = self.encode_der()?;
+        if Self::parse(&bytes).as_ref() != Ok(self) {
+            return Err(Error::Unwritable);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::codec::{
+        Fail, Stream, contract,
+        test_support::{Lcg, chunks},
+    };
     use super::*;
 
     fn cert_id(serial: &[u8]) -> CertId {
@@ -1675,7 +1611,7 @@ mod tests {
         let req = OcspRequest::parse(&der).unwrap();
         assert_eq!(req, OcspRequest::new(vec![Request { cert_id: cert_id(&[1]), extensions: vec![] }]));
         assert_eq!(req.nonce(), None);
-        assert_eq!(req.to_der().unwrap(), der);
+        assert_eq!(req.to_bytes().unwrap(), der);
     }
 
     #[test]
@@ -1689,7 +1625,7 @@ mod tests {
             (ResponseStatus::Unauthorized, 6),
         ];
         for (status, code) in cases {
-            let der = OcspResponse::error(status).to_der().unwrap();
+            let der = OcspResponse::error(status).to_bytes().unwrap();
             assert_eq!(der, [0x30, 0x03, 0x0a, 0x01, code]);
             assert_eq!(OcspResponse::parse(&der).unwrap(), OcspResponse::error(status));
         }
@@ -1727,28 +1663,28 @@ mod tests {
     #[test]
     fn full_request_round_trips() {
         let req = full_request();
-        let der = req.to_der().unwrap();
+        let der = req.to_bytes().unwrap();
         let back = OcspRequest::parse(&der).unwrap();
         assert_eq!(back, req);
-        assert_eq!(back.to_der().unwrap(), der);
+        assert_eq!(back.to_bytes().unwrap(), der);
         assert_eq!(back.nonce(), Some(&[0xab; 16][..]));
         // A version other than v1 is written out and read back.
         let mut v2 = req.clone();
         v2.version = 1;
-        assert_eq!(OcspRequest::parse(&v2.to_der().unwrap()).unwrap(), v2);
+        assert_eq!(OcspRequest::parse(&v2.to_bytes().unwrap()).unwrap(), v2);
     }
 
     #[test]
     fn full_response_round_trips() {
         let resp = full_response();
-        let der = resp.to_der().unwrap();
+        let der = resp.to_bytes().unwrap();
         let back = OcspResponse::parse(&der).unwrap();
         assert_eq!(back, resp);
-        assert_eq!(back.to_der().unwrap(), der);
+        assert_eq!(back.to_bytes().unwrap(), der);
         let basic = back.basic_response().unwrap();
         assert_eq!(basic.data.nonce(), Some(&[0xab; 16][..]));
         // The signed bytes appear as they are inside the response.
-        let tbs = basic.data.to_der().unwrap();
+        let tbs = basic.data.to_bytes().unwrap();
         assert!(der.windows(tbs.len()).any(|w| w == tbs));
         // The statuses' encodings: [0] and [2] IMPLICIT NULL, [1] constructed.
         assert!(tbs.windows(2).any(|w| w == [0x80, 0x00]));
@@ -1760,7 +1696,7 @@ mod tests {
         b.certs.clear();
         b.data.extensions.clear();
         let r = OcspResponse::basic(b);
-        assert_eq!(OcspResponse::parse(&r.to_der().unwrap()).unwrap(), r);
+        assert_eq!(OcspResponse::parse(&r.to_bytes().unwrap()).unwrap(), r);
     }
 
     #[test]
@@ -1769,20 +1705,20 @@ mod tests {
             status: ResponseStatus::Successful,
             bytes: Some(ResponseBytes::Other { response_type: "1.2.3.4".parse().unwrap(), response: vec![1, 2, 3] }),
         };
-        assert_eq!(OcspResponse::parse(&r.to_der().unwrap()).unwrap(), r);
+        assert_eq!(OcspResponse::parse(&r.to_bytes().unwrap()).unwrap(), r);
         // With the basic type's identifier the bytes must be a basic response.
         let bad = OcspResponse {
             status: ResponseStatus::Successful,
             bytes: Some(ResponseBytes::Other { response_type: known_oid(oid::BASIC), response: vec![1, 2, 3] }),
         };
-        assert_eq!(bad.to_der(), Err(Error::ResponseBytes));
+        assert_eq!(bad.to_bytes(), Err(Error::ResponseBytes));
         // Even when they are one: it would read back as Basic, not as it was.
-        let basic = full_response().basic_response().unwrap().to_der().unwrap();
+        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
         let as_other = OcspResponse {
             status: ResponseStatus::Successful,
             bytes: Some(ResponseBytes::Other { response_type: known_oid(oid::BASIC), response: basic }),
         };
-        assert_eq!(as_other.to_der(), Err(Error::ResponseBytes));
+        assert_eq!(as_other.to_bytes(), Err(Error::ResponseBytes));
         // Bytes over a message are refused before they are copied.
         let huge = OcspResponse {
             status: ResponseStatus::Successful,
@@ -1791,7 +1727,7 @@ mod tests {
                 response: vec![0; MAX_MESSAGE + 1],
             }),
         };
-        assert_eq!(huge.to_der(), Err(Error::TooLong));
+        assert_eq!(huge.to_bytes(), Err(Error::TooLong));
     }
 
     #[test]
@@ -1801,7 +1737,7 @@ mod tests {
         // 30 42 30 40 30 3e ... is "MEIwQDA+..." in base64, with + escaped.
         assert!(path.starts_with("MEIwQDA%2BMDwwOjAJ"), "{path}");
         assert_eq!(decode_get_path(&path).unwrap(), der);
-        assert_eq!(OcspRequest::from_get_path(&path).unwrap().to_der().unwrap(), der);
+        assert_eq!(OcspRequest::from_get_path(&path).unwrap().to_bytes().unwrap(), der);
         // Unescaped, lowercase escapes and no padding all read.
         let plain = path.replace("%2B", "+").replace("%2F", "/").replace("%3D", "=");
         assert_eq!(decode_get_path(&plain).unwrap(), der);
@@ -1814,7 +1750,7 @@ mod tests {
         }
         assert_eq!(encode_get_path(b"\xfb\xff").unwrap(), "%2B%2F8%3D");
         let full = full_request();
-        assert_eq!(OcspRequest::from_get_path(&full.to_get_path().unwrap()).unwrap(), full);
+        assert_eq!(OcspRequest::from_get_path(&encode_get_path(&full.to_bytes().unwrap()).unwrap()).unwrap(), full);
     }
 
     #[test]
@@ -1908,7 +1844,7 @@ mod tests {
     #[test]
     fn signature_errors() {
         let req = full_request();
-        let der = req.to_der().unwrap();
+        let der = req.to_bytes().unwrap();
         // The signature BIT STRING is 03 21 00 5a...; give it 1 unused bit.
         let at = der.windows(3).position(|w| w == [0x03, 0x21, 0x00]).unwrap();
         let mut odd = der.clone();
@@ -1923,7 +1859,7 @@ mod tests {
         // Too many certificates, either way.
         let mut many = req.clone();
         many.signature.as_mut().unwrap().certs = vec![vec![0x30, 0x00]; MAX_CERTS + 1];
-        assert_eq!(many.to_der(), Err(Error::TooMany));
+        assert_eq!(many.to_bytes(), Err(Error::TooMany));
         let mut sig = Writer::new();
         sig.explicit(0, |w| {
             w.sequence(|w| {
@@ -1946,44 +1882,44 @@ mod tests {
     fn writer_errors() {
         let mut r = full_request();
         r.requests = vec![Request { cert_id: cert_id(&[1]), extensions: vec![] }; MAX_REQUESTS + 1];
-        assert_eq!(r.to_der(), Err(Error::TooMany));
+        assert_eq!(r.to_bytes(), Err(Error::TooMany));
         let mut r = full_request();
         r.extensions = vec![Extension::nonce(b"x").unwrap(); MAX_EXTENSIONS + 1];
-        assert_eq!(r.to_der(), Err(Error::TooMany));
+        assert_eq!(r.to_bytes(), Err(Error::TooMany));
         let mut r = full_request();
         r.requestor_name = Some(vec![0x01, 0x01, 0x01]);
-        assert_eq!(r.to_der(), Err(Error::RequestorName));
+        assert_eq!(r.to_bytes(), Err(Error::RequestorName));
         r.requestor_name = Some(vec![0xa4, 0x05, 0x30, 0x03, 0x01, 0x01, 0x01]);
-        assert_eq!(r.to_der(), Err(Error::Asn1(asn1::Error::Boolean)));
+        assert_eq!(r.to_bytes(), Err(Error::Asn1(asn1::Error::Boolean)));
         let mut r = full_request();
         r.signature.as_mut().unwrap().certs = vec![vec![0x02, 0x01, 0x00]];
-        assert_eq!(r.to_der(), Err(Error::Certificate));
+        assert_eq!(r.to_bytes(), Err(Error::Certificate));
         let mut r = full_request();
         r.extensions = vec![Extension { id: known_oid(oid::NONCE), critical: false, value: vec![0; MAX_MESSAGE] }];
-        assert_eq!(r.to_der(), Err(Error::TooLong));
+        assert_eq!(r.to_bytes(), Err(Error::TooLong));
 
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.data.produced_at = "2026-10-05".to_string();
-        assert_eq!(resp.to_der(), Err(Error::Asn1(asn1::Error::Time)));
+        assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Time)));
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.data.responder_id = ResponderId::ByName(vec![0x04, 0x00]);
-        assert_eq!(resp.to_der(), Err(Error::ResponderId));
+        assert_eq!(resp.to_bytes(), Err(Error::ResponderId));
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.data.responses = vec![b.data.responses[0].clone(); MAX_RESPONSES + 1];
-        assert_eq!(resp.to_der(), Err(Error::TooMany));
+        assert_eq!(resp.to_bytes(), Err(Error::TooMany));
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.signature_algorithm.parameters = Some(vec![0x05, 0x00, 0x05, 0x00]);
-        assert_eq!(resp.to_der(), Err(Error::Asn1(asn1::Error::Trailing)));
+        assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Trailing)));
     }
 
     #[test]
     fn response_errors() {
-        let der = full_response().to_der().unwrap();
-        let basic = full_response().basic_response().unwrap().to_der().unwrap();
+        let der = full_response().to_bytes().unwrap();
+        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
         let wrap = |basic: &[u8]| {
             let mut w = Writer::new();
             w.sequence(|w| {
@@ -2034,21 +1970,21 @@ mod tests {
 
     #[test]
     fn every_truncated_prefix_fails() {
-        for der in [minimal_request_der(), full_request().to_der().unwrap()] {
+        for der in [minimal_request_der(), full_request().to_bytes().unwrap()] {
             for n in 0..der.len() {
                 assert!(OcspRequest::parse(&der[..n]).is_err(), "{n}");
-                let mut d = Decoder::new();
+                let mut d = Stream::new(Frames::new());
                 let fed = &der[..n];
-                assert_eq!(d.feed(fed), fed.len());
-                assert_eq!(d.next_message(), None, "{n}");
+                assert_eq!(d.push(fed), fed.len());
+                assert_eq!(d.next(), None, "{n}");
                 assert_eq!(d.buffered(), n);
             }
         }
-        let der = full_response().to_der().unwrap();
+        let der = full_response().to_bytes().unwrap();
         for n in 0..der.len() {
             assert!(OcspResponse::parse(&der[..n]).is_err(), "{n}");
         }
-        let basic = full_response().basic_response().unwrap().to_der().unwrap();
+        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
         for n in 0..basic.len() {
             assert!(BasicResponse::parse(&basic[..n]).is_err(), "{n}");
         }
@@ -2057,14 +1993,14 @@ mod tests {
     #[test]
     fn decoder_splits_messages() {
         let a = minimal_request_der();
-        let b = full_response().to_der().unwrap();
+        let b = full_response().to_bytes().unwrap();
         let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames::new());
         let mut got = Vec::new();
-        for byte in &stream {
-            let fed = std::slice::from_ref(byte);
-            assert_eq!(d.feed(fed), fed.len());
-            while let Some(m) = d.next_message() {
+        for byte in chunks(&stream, &[1]) {
+            let fed = byte;
+            assert_eq!(d.push(fed), fed.len());
+            while let Some(m) = d.next() {
                 got.push(m.unwrap());
             }
         }
@@ -2072,24 +2008,26 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         // A header announcing too much breaks the stream at once.
         let fed = &[0x30, 0x83, 0x01, 0x00, 0x01];
-        assert_eq!(d.feed(fed), fed.len());
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
+        assert_eq!(d.push(fed), fed.len());
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         let fed = &a;
-        assert_eq!(d.feed(fed), fed.len());
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
-        assert_eq!(d.buffered(), 0);
+        let held = d.buffered();
+        assert_eq!(d.push(fed), fed.len());
+        assert_eq!(d.next(), None);
+        assert_eq!(d.failed(), Some(&Fail::Protocol(Error::TooLong)));
+        assert_eq!(d.buffered(), held);
         // Indefinite lengths are not DER.
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames::new());
         let fed = &[0x30, 0x80];
-        assert_eq!(d.feed(fed), fed.len());
-        assert!(matches!(d.next_message(), Some(Err(Error::Asn1(_)))));
+        assert_eq!(d.push(fed), fed.len());
+        assert!(matches!(d.next(), Some(Err(Fail::Protocol(Error::Asn1(_))))));
         // A message just at the limit is fine.
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames::new());
         let fed = &[0x04, 0x82, 0xff, 0xfc];
-        assert_eq!(d.feed(fed), fed.len());
+        assert_eq!(d.push(fed), fed.len());
         let fed = &vec![0; MAX_MESSAGE - 4];
-        assert_eq!(d.feed(fed), fed.len());
-        assert_eq!(d.next_message().unwrap().unwrap().len(), MAX_MESSAGE);
+        assert_eq!(d.push(fed), fed.len());
+        assert_eq!(d.next().unwrap().unwrap().len(), MAX_MESSAGE);
     }
 
     #[test]
@@ -2099,7 +2037,7 @@ mod tests {
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.data.responses[0].this_update = "20261005000000.5Z".to_string();
-        assert_eq!(resp.to_der(), Err(Error::Asn1(asn1::Error::Time)));
+        assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Time)));
         for set in [
             |d: &mut ResponseData| d.produced_at = "20261005120000.25Z".to_string(),
             |d: &mut ResponseData| d.responses[0].next_update = Some("20261012000000.1Z".to_string()),
@@ -2109,7 +2047,7 @@ mod tests {
         ] {
             let mut d = full_response().basic_response().unwrap().data.clone();
             set(&mut d);
-            assert_eq!(d.to_der(), Err(Error::Asn1(asn1::Error::Time)));
+            assert_eq!(d.to_bytes(), Err(Error::Asn1(asn1::Error::Time)));
         }
         // The reader refuses the same bytes. The internal writer skips the
         // check, so it can make them.
@@ -2131,11 +2069,11 @@ mod tests {
         // successful one answers.
         let mut bad = full_response();
         bad.status = ResponseStatus::TryLater;
-        assert_eq!(bad.to_der(), Err(Error::ResponseBytes));
+        assert_eq!(bad.to_bytes(), Err(Error::ResponseBytes));
         let empty = OcspResponse::error(ResponseStatus::Successful);
-        assert_eq!(empty.to_der(), Err(Error::ResponseBytes));
+        assert_eq!(empty.to_bytes(), Err(Error::ResponseBytes));
         assert_eq!(OcspResponse::parse(&[0x30, 0x03, 0x0a, 0x01, 0x00]), Err(Error::ResponseBytes));
-        let mut der = full_response().to_der().unwrap();
+        let mut der = full_response().to_bytes().unwrap();
         let at = der.windows(3).position(|w| w == [0x0a, 0x01, 0x00]).unwrap();
         der[at + 2] = 3;
         assert_eq!(OcspResponse::parse(&der), Err(Error::ResponseBytes));
@@ -2146,7 +2084,7 @@ mod tests {
         // RFC 6960 4.1.2: a signed request SHALL name its requestor.
         let mut req = full_request();
         req.requestor_name = None;
-        assert_eq!(req.to_der(), Err(Error::RequestorName));
+        assert_eq!(req.to_bytes(), Err(Error::RequestorName));
         let mut w = Writer::new();
         w.sequence(|w| {
             w.encoded(&minimal_request_der()[2..]);
@@ -2161,7 +2099,7 @@ mod tests {
         // Unsigned with a name is fine.
         let mut req = full_request();
         req.signature = None;
-        assert_eq!(OcspRequest::parse(&req.to_der().unwrap()).unwrap(), req);
+        assert_eq!(OcspRequest::parse(&req.to_bytes().unwrap()).unwrap(), req);
     }
 
     #[test]
@@ -2172,7 +2110,7 @@ mod tests {
         assert_eq!(CrlReason::from_code(7), None);
         assert_eq!(OcspResponse::parse(&[0x30, 0x03, 0x0a, 0x01, 0x07]), Err(Error::Enumerated));
         assert_eq!(OcspResponse::parse(&[0x30, 0x03, 0x0a, 0x01, 0xff]), Err(Error::Enumerated));
-        let basic = full_response().basic_response().unwrap().to_der().unwrap();
+        let basic = full_response().basic_response().unwrap().to_bytes().unwrap();
         // The KeyCompromise reason is [0] { ENUMERATED 1 }; make it 7.
         let at = basic.windows(5).position(|w| w == [0xa0, 0x03, 0x0a, 0x01, 0x01]).unwrap();
         let mut bad = basic.clone();
@@ -2187,22 +2125,22 @@ mod tests {
         // One large feed takes only what fits, and the rest waits.
         let mut big = vec![0; 1 << 20];
         big[..5].copy_from_slice(&[0x04, 0x83, 0x0f, 0xff, 0xfb]);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&big), MAX_MESSAGE);
+        let mut d = Stream::new(Frames::new());
+        assert_eq!(d.push(&big), MAX_MESSAGE);
         assert_eq!(d.buffered(), MAX_MESSAGE);
-        assert_eq!(d.feed(&big), 0);
+        assert_eq!(d.push(&big), 0);
         // Full, it always answers: here the header announces too much.
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         // A stream of many messages goes through in pieces of any size.
         let a = minimal_request_der();
         let stream: Vec<u8> = (0..3000).flat_map(|_| a.iter().copied()).collect();
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames::new());
         let (mut rest, mut got) = (&stream[..], 0);
         while !rest.is_empty() {
-            let n = d.feed(rest);
+            let n = d.push(rest);
             rest = &rest[n..];
             assert!(d.buffered() <= MAX_MESSAGE);
-            while let Some(m) = d.next_message() {
+            while let Some(m) = d.next() {
                 assert_eq!(m.unwrap(), a);
                 got += 1;
             }
@@ -2226,7 +2164,7 @@ mod tests {
             vec![0xa5, 0x00],
         ] {
             r.requestor_name = Some(good.clone());
-            let der = r.to_der().unwrap();
+            let der = r.to_bytes().unwrap();
             assert_eq!(OcspRequest::parse(&der).unwrap(), r, "{good:02x?}");
         }
         for bad in [
@@ -2243,7 +2181,7 @@ mod tests {
             vec![0x89, 0x00],
         ] {
             r.requestor_name = Some(bad.clone());
-            assert_eq!(r.to_der(), Err(Error::RequestorName), "{bad:02x?}");
+            assert_eq!(r.to_bytes(), Err(Error::RequestorName), "{bad:02x?}");
             let der = request_with(&tlv(0xa1, &bad), &[]);
             assert_eq!(OcspRequest::parse(&der), Err(Error::RequestorName), "{bad:02x?}");
         }
@@ -2264,7 +2202,7 @@ mod tests {
         // A request with an empty nonce reads, but carries no nonce.
         let mut r = OcspRequest::new(vec![Request { cert_id: cert_id(&[1]), extensions: vec![] }]);
         r.extensions.push(ext(vec![0x04, 0x00]));
-        assert_eq!(OcspRequest::parse(&r.to_der().unwrap()).unwrap().nonce(), None);
+        assert_eq!(OcspRequest::parse(&r.to_bytes().unwrap()).unwrap().nonce(), None);
     }
 
     #[test]
@@ -2274,20 +2212,20 @@ mod tests {
         let one = |c: CertId| OcspRequest::new(vec![Request { cert_id: c, extensions: vec![] }]);
         let mut c = cert_id(&[1]);
         c.issuer_name_hash.clear();
-        assert_eq!(one(c).to_der(), Err(Error::HashLength));
+        assert_eq!(one(c).to_bytes(), Err(Error::HashLength));
         let mut c = cert_id(&[1]);
         c.hash_algorithm = AlgorithmIdentifier::sha256();
-        assert_eq!(one(c.clone()).to_der(), Err(Error::HashLength));
+        assert_eq!(one(c.clone()).to_bytes(), Err(Error::HashLength));
         c.issuer_name_hash = vec![1; 32];
         c.issuer_key_hash = vec![2; 32];
-        assert!(one(c).to_der().is_ok());
+        assert!(one(c).to_bytes().is_ok());
         // An unknown algorithm's hashes only need to be there.
         let mut c = cert_id(&[1]);
         c.hash_algorithm.algorithm = "1.2.3.4".parse().unwrap();
         c.issuer_key_hash = vec![1];
-        assert!(one(c.clone()).to_der().is_ok());
+        assert!(one(c.clone()).to_bytes().is_ok());
         c.issuer_key_hash.clear();
-        assert_eq!(one(c).to_der(), Err(Error::HashLength));
+        assert_eq!(one(c).to_bytes(), Err(Error::HashLength));
         // The reader refuses a 19-byte SHA-1 hash.
         let mut der = minimal_request_der();
         let at = der.windows(2).position(|w| w == [0x04, 0x14]).unwrap();
@@ -2301,7 +2239,7 @@ mod tests {
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.data.responder_id = ResponderId::ByKey(vec![]);
-        assert_eq!(resp.to_der(), Err(Error::HashLength));
+        assert_eq!(resp.to_bytes(), Err(Error::HashLength));
         let mut w = Writer::new();
         w.sequence(|w| {
             w.sequence(|w| {
@@ -2321,23 +2259,23 @@ mod tests {
         // shorter, so a writer refuses it.
         let one = |serial: &[u8]| OcspRequest::new(vec![Request { cert_id: cert_id(serial), extensions: vec![] }]);
         for bad in [&[][..], &[0x00, 0x01], &[0xff, 0x80]] {
-            assert_eq!(one(bad).to_der(), Err(Error::Asn1(asn1::Error::Integer)), "{bad:02x?}");
+            assert_eq!(one(bad).to_bytes(), Err(Error::Asn1(asn1::Error::Integer)), "{bad:02x?}");
         }
         for good in [&[0x00][..], &[0x00, 0x80], &[0x7f], &[0x01, 0x00]] {
             let r = one(good);
-            assert_eq!(OcspRequest::parse(&r.to_der().unwrap()).unwrap(), r, "{good:02x?}");
+            assert_eq!(OcspRequest::parse(&r.to_bytes().unwrap()).unwrap(), r, "{good:02x?}");
         }
         let mut resp = full_response();
         let Some(ResponseBytes::Basic(b)) = &mut resp.bytes else { panic!() };
         b.data.responses[0].cert_id.serial_number = vec![0, 1];
-        assert_eq!(resp.to_der(), Err(Error::Asn1(asn1::Error::Integer)));
+        assert_eq!(resp.to_bytes(), Err(Error::Asn1(asn1::Error::Integer)));
     }
 
     #[test]
     fn requests_ask_about_at_least_one_certificate() {
         // RFC 6960 4.1.2: requestList contains one or more requests.
-        assert_eq!(OcspRequest::new(vec![]).to_der(), Err(Error::NoRequests));
-        assert_eq!(OcspRequest::new(vec![]).tbs_der(), Err(Error::NoRequests));
+        assert_eq!(OcspRequest::new(vec![]).to_bytes(), Err(Error::NoRequests));
+        assert_eq!(OcspRequest::new(vec![]).to_bytes(), Err(Error::NoRequests));
         assert_eq!(OcspRequest::parse(&[0x30, 0x04, 0x30, 0x02, 0x30, 0x00]), Err(Error::NoRequests));
     }
 
@@ -2345,15 +2283,15 @@ mod tests {
     fn tbs_der_is_the_signed_part() {
         // RFC 6960 4.1.2: the signature covers tbsRequest.
         let req = full_request();
-        let der = req.to_der().unwrap();
-        let tbs = req.tbs_der().unwrap();
+        let der = req.to_bytes().unwrap();
+        let tbs = OcspRequest::tbs_request(&req.to_bytes().unwrap()).unwrap().to_vec();
         let mut outer = Reader::new(&der, Rules::Der);
         let mut inner = outer.read_sequence().unwrap();
         assert_eq!(inner.read().unwrap().raw(), &tbs[..]);
         let mut unsigned = req.clone();
         unsigned.signature = None;
-        assert_eq!(unsigned.tbs_der().unwrap(), tbs);
-        assert_eq!(unsigned.to_der().unwrap(), tlv(0x30, &tbs));
+        assert_eq!(OcspRequest::tbs_request(&unsigned.to_bytes().unwrap()).unwrap(), tbs);
+        assert_eq!(unsigned.to_bytes().unwrap(), tlv(0x30, &tbs));
     }
 
     /// `levels` explicit [0] tags around an empty SEQUENCE.
@@ -2376,7 +2314,7 @@ mod tests {
             req.requestor_name = Some(tlv(0xa4, &tlv(0x30, &name)));
             req.signature.as_mut().unwrap().certs = vec![tlv(0x30, &name)];
             req.requests[0].cert_id.hash_algorithm.parameters = Some(name.clone());
-            match req.to_der() {
+            match req.to_bytes() {
                 Ok(der) => {
                     assert_eq!(OcspRequest::parse(&der).unwrap(), req, "{levels}");
                     wrote += 1;
@@ -2389,7 +2327,7 @@ mod tests {
             b.data.responses[0].cert_id.hash_algorithm.parameters = Some(name.clone());
             b.certs = vec![tlv(0x30, &name)];
             b.signature_algorithm.parameters = Some(name.clone());
-            if let Ok(der) = resp.to_der() {
+            if let Ok(der) = resp.to_bytes() {
                 assert_eq!(OcspResponse::parse(&der).unwrap(), resp, "{levels}");
             }
         }
@@ -2400,20 +2338,8 @@ mod tests {
             let name = nested_name(levels);
             let der = request_with(&tlv(0xa1, &tlv(0xa4, &tlv(0x30, &name))), &[]);
             if let Ok(r) = OcspRequest::parse(&der) {
-                assert_eq!(r.to_der().unwrap(), der, "{levels}");
+                assert_eq!(r.to_bytes().unwrap(), der, "{levels}");
             }
-        }
-    }
-
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
         }
     }
 
@@ -2422,40 +2348,26 @@ mod tests {
     fn exercise(b: &[u8]) -> usize {
         let mut ok = 0;
         if let Ok(r) = OcspRequest::parse(b) {
-            let der = r.to_der().unwrap();
+            let der = r.to_bytes().unwrap();
             assert_eq!(OcspRequest::parse(&der).unwrap(), r);
-            assert_eq!(OcspRequest::from_get_path(&r.to_get_path().unwrap()).unwrap(), r);
+            assert_eq!(OcspRequest::from_get_path(&encode_get_path(&r.to_bytes().unwrap()).unwrap()).unwrap(), r);
             ok += 1;
         }
         if let Ok(r) = OcspResponse::parse(b) {
-            let der = r.to_der().unwrap();
+            let der = r.to_bytes().unwrap();
             assert_eq!(OcspResponse::parse(&der).unwrap(), r);
             ok += 1;
         }
         if let Ok(r) = BasicResponse::parse(b) {
-            let der = r.to_der().unwrap();
+            let der = r.to_bytes().unwrap();
             assert_eq!(BasicResponse::parse(&der).unwrap(), r);
             ok += 1;
         }
         let _ = decode_get_path(&String::from_utf8_lossy(b));
-        // Whole and byte by byte, the decoder finds the same messages.
-        let mut whole = Decoder::new();
-        let fed = b;
-        assert_eq!(whole.feed(fed), fed.len());
-        let mut all = Vec::new();
-        while let Some(Ok(m)) = whole.next_message() {
-            all.push(m);
-        }
-        let mut bytewise = Decoder::new();
-        let mut again = Vec::new();
-        for byte in b {
-            let fed = std::slice::from_ref(byte);
-            assert_eq!(bytewise.feed(fed), fed.len());
-            while let Some(Ok(m)) = bytewise.next_message() {
-                again.push(m);
-            }
-        }
-        assert_eq!(all, again);
+        contract::check_decode(Frames::new, b);
+        contract::check_wire::<OcspRequest>(b);
+        contract::check_wire::<OcspResponse>(b);
+        contract::check_wire::<BasicResponse>(b);
         ok
     }
 
@@ -2463,33 +2375,33 @@ mod tests {
     fn lcg_fuzz() {
         let seeds = [
             minimal_request_der(),
-            full_request().to_der().unwrap(),
-            full_response().to_der().unwrap(),
-            full_response().basic_response().unwrap().to_der().unwrap(),
-            OcspResponse::error(ResponseStatus::TryLater).to_der().unwrap(),
+            full_request().to_bytes().unwrap(),
+            full_response().to_bytes().unwrap(),
+            full_response().basic_response().unwrap().to_bytes().unwrap(),
+            OcspResponse::error(ResponseStatus::TryLater).to_bytes().unwrap(),
         ];
-        let mut rng = Lcg(0x6f63_7370);
+        let mut rng = Lcg::new(0x6f63_7370);
         let mut parsed = 0;
         for round in 0..6000 {
             let seed = &seeds[round % seeds.len()];
             let mut b = seed.clone();
-            match rng.below(4) {
+            match rng.below(4) as usize {
                 0 => {
-                    for _ in 0..1 + rng.below(4) {
-                        let i = rng.below(b.len());
+                    for _ in 0..1 + (rng.below(4) as usize) {
+                        let i = rng.below(b.len() as u64) as usize;
                         b[i] = rng.next() as u8;
                     }
                 }
                 1 => {
-                    let i = rng.below(b.len());
-                    b[i] ^= 1 << rng.below(8);
+                    let i = rng.below(b.len() as u64) as usize;
+                    b[i] ^= 1 << (rng.below(8) as usize);
                 }
                 2 => {
-                    let n = rng.below(b.len());
+                    let n = rng.below(b.len() as u64) as usize;
                     b.truncate(n);
-                    b.extend((0..rng.below(8)).map(|_| rng.next() as u8));
+                    b.extend((0..(rng.below(8) as usize)).map(|_| rng.next() as u8));
                 }
-                _ => b = (0..rng.below(200)).map(|_| rng.next() as u8).collect(),
+                _ => b = (0..(rng.below(200) as usize)).map(|_| rng.next() as u8).collect(),
             }
             parsed += exercise(&b);
         }
@@ -2504,7 +2416,7 @@ mod tests {
         let id = cert_id(&[0x12, 0x34]);
         let mut request = OcspRequest::new(vec![Request { cert_id: id, extensions: vec![] }]);
         request.extensions.push(Extension::nonce(b"0123456789abcdef").unwrap());
-        let body = request.to_der().unwrap();
+        let body = request.to_bytes().unwrap();
         let request = OcspRequest::parse(&body).unwrap();
         let data = ResponseData {
             version: 0,
@@ -2529,7 +2441,7 @@ mod tests {
             signature: vec![0; 64],
             certs: vec![],
         };
-        let reply = OcspResponse::basic(basic).to_der().unwrap();
+        let reply = OcspResponse::basic(basic).to_bytes().unwrap();
         let response = OcspResponse::parse(&reply).unwrap();
         let basic = response.basic_response().unwrap();
         assert_eq!(basic.data.nonce(), Some(&b"0123456789abcdef"[..]));

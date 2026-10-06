@@ -2,55 +2,30 @@
 //! playing a directory server reads them.
 #![no_main]
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::ldap::{
-    Decoder, DerefAliases, Dn, Error, Filter, Frames, MAX_TEXT, Message, Op, Scope, SearchRequest,
+    DerefAliases, Dn, Error, Filter, Frames, MAX_TEXT, Message, Op, Scope, SearchRequest,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Every message a decoder with `limit` gives, and the error it stops at.
-/// Each chunk is fed until the decoder has taken all of it.
-fn decode(chunks: &mut dyn Iterator<Item = &[u8]>, limit: usize) -> (Vec<Message>, Option<Error>) {
-    let mut d = Decoder::with_limit(limit);
-    let mut out = Vec::new();
-    for mut c in chunks {
-        loop {
-            let n = d.feed(c);
-            c = &c[n..];
-            // It never holds more than its limit, or 16 bytes for a header.
-            assert!(d.buffered() <= d.limit().max(16));
-            while let Some(r) = d.next_message() {
-                match r {
-                    Ok(m) => out.push(m),
-                    Err(e) => return (out, Some(e)),
-                }
-            }
-            if c.is_empty() {
-                break;
-            }
-            // It takes nothing only while it holds a message to take out.
-            assert!(n > 0 || d.buffered() == 0);
-        }
-    }
-    (out, None)
-}
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
     contract::check_decode(|| Frames::with_limit(64), data);
     contract::check_wire::<Message>(data);
 
-    // The stream, split two ways: all at once, and a byte at a time.
-    let whole = decode(&mut std::iter::once(data), usize::MAX);
-    let bytewise = decode(&mut data.chunks(1), usize::MAX);
-    assert_eq!(whole, bytewise);
-    // A low limit gives the same messages up to the first too long.
-    let low = decode(&mut std::iter::once(data), 64);
-    assert!(whole.0.starts_with(&low.0));
+    let mut stream = Stream::new(Frames::new());
+    let mut messages = Vec::new();
+    let _ = pump(&mut stream, data, |m| messages.push(m));
+    let _ = finish(&mut stream, |m| messages.push(m));
+    let mut low = Stream::new(Frames::with_limit(64));
+    let mut smaller = Vec::new();
+    let _ = pump(&mut low, data, |m| smaller.push(m));
+    let _ = finish(&mut low, |m| smaller.push(m));
+    assert!(messages.starts_with(&smaller));
 
     // A message read can be written, reads back the same, and is written
     // the same again.
-    for m in &whole.0 {
+    for m in &messages {
         let bytes = m.to_bytes().unwrap();
         assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
         assert_eq!(Message::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
