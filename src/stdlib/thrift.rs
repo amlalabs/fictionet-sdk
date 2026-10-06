@@ -310,6 +310,8 @@ pub struct List {
 }
 
 /// The entries of a map.
+/// Compact writers refuse empty maps with key or value types other than
+/// [`Type::Byte`], since the encoding cannot preserve those types.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Map {
     /// The type of every key.
@@ -373,17 +375,6 @@ impl Value {
             return Err(Error::TooLong);
         }
         Ok((result?, r.pos))
-    }
-
-    /// Wraps this value's encoding in a transport frame. Refuses excess
-    /// depth, counts, lengths, mismatched element types, and compact empty
-    /// maps whose key and value types are not [`Type::Byte`].
-    pub fn to_frame(&self, protocol: Protocol) -> Result<Frame, WriteError> {
-        let mut bytes = Vec::new();
-        let mut writer = Writer::new(&mut bytes, protocol.compact());
-        writer.limit = MAX_FRAME;
-        writer.value(self, 1)?;
-        Ok(Frame(bytes))
     }
 }
 
@@ -825,10 +816,10 @@ impl Decode for Frames {
 ///
 /// ```
 /// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
-/// use fictionet::stdlib::thrift::{Message, MessageType, Messages, Protocol};
+/// use fictionet::stdlib::thrift::{EncodedMessage, Message, MessageType, Messages, Protocol};
 ///
 /// let call = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
-/// let bytes = call.to_frame(Protocol::Compact)?.0;
+/// let bytes = EncodedMessage { message: call.clone(), protocol: Protocol::Compact }.to_bytes()?;
 /// let mut stream = Stream::new(Messages::new());
 /// let mut messages = Vec::new();
 /// pump(&mut stream, &bytes[..2], |item| messages.push(item))?;
@@ -1545,6 +1536,12 @@ mod tests {
     ];
     const PROTOCOLS: [Protocol; 3] = [Protocol::Binary, Protocol::BinaryOld, Protocol::Compact];
 
+    fn value_bytes(value: &Value, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+        let mut out = Vec::new();
+        Writer::new(&mut out, protocol.compact()).value(value, 1)?;
+        Ok(out)
+    }
+
     fn add_call() -> Message {
         Message {
             name: "add".into(),
@@ -1564,7 +1561,7 @@ mod tests {
             0, 3, 0x00,
         ];
         assert_eq!(EncodedMessage::parse(&bytes), Ok(EncodedMessage { message: add_call(), protocol: Protocol::Binary }));
-        assert_eq!(add_call().to_frame(Protocol::Binary).map(|frame| frame.0).unwrap(), bytes);
+        assert_eq!(EncodedMessage { message: add_call(), protocol: Protocol::Binary }.to_bytes().unwrap(), bytes);
         // The unused third byte of the version word is ignored.
         let mut other = bytes;
         other[2] = 0x55;
@@ -1576,7 +1573,7 @@ mod tests {
         let bytes =
             [0, 0, 0, 3, b'a', b'd', b'd', 0x01, 0, 0, 0, 1, 0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00];
         assert_eq!(EncodedMessage::parse(&bytes), Ok(EncodedMessage { message: add_call(), protocol: Protocol::BinaryOld }));
-        assert_eq!(add_call().to_frame(Protocol::BinaryOld).map(|frame| frame.0).unwrap(), bytes);
+        assert_eq!(EncodedMessage { message: add_call(), protocol: Protocol::BinaryOld }.to_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -1585,10 +1582,10 @@ mod tests {
         // field headers with zigzag values, stop.
         let bytes = [0x82, 0x21, 0x01, 0x03, b'a', b'd', b'd', 0x15, 0x04, 0x15, 0x06, 0x00];
         assert_eq!(EncodedMessage::parse(&bytes), Ok(EncodedMessage { message: add_call(), protocol: Protocol::Compact }));
-        assert_eq!(add_call().to_frame(Protocol::Compact).map(|frame| frame.0).unwrap(), bytes);
+        assert_eq!(EncodedMessage { message: add_call(), protocol: Protocol::Compact }.to_bytes().unwrap(), bytes);
         // A negative sequence number is a 5-byte varint, not zigzag.
         let m = Message { seq: -1, body: vec![], ..add_call() };
-        let b = m.to_frame(Protocol::Compact).map(|frame| frame.0).unwrap();
+        let b = EncodedMessage { message: m.clone(), protocol: Protocol::Compact }.to_bytes().unwrap();
         assert_eq!(b[2..7], [0xff, 0xff, 0xff, 0xff, 0x0f]);
         assert_eq!(EncodedMessage::parse(&b).unwrap().message, m);
     }
@@ -1631,24 +1628,24 @@ mod tests {
         let c = Protocol::Compact;
         // Zigzag: 0, -1, 1, -2 become 0, 1, 2, 3.
         for (v, b) in [(0, 0u8), (-1, 1), (1, 2), (-2, 3)] {
-            assert_eq!(Value::I32(v).to_frame(c).map(|frame| frame.0).unwrap(), [b]);
+            assert_eq!(value_bytes(&Value::I32(v), c).unwrap(), [b]);
         }
         assert_eq!(
-            Value::I64(i64::MIN).to_frame(c).map(|frame| frame.0).unwrap(),
+            value_bytes(&Value::I64(i64::MIN), c).unwrap(),
             [0xff; 9].iter().copied().chain([0x01]).collect::<Vec<_>>()
         );
-        assert_eq!(Value::I16(300).to_frame(c).map(|frame| frame.0).unwrap(), [0xd8, 0x04]);
+        assert_eq!(value_bytes(&Value::I16(300), c).unwrap(), [0xd8, 0x04]);
         // Doubles are little-endian.
-        assert_eq!(Value::Double(1.0).to_frame(c).map(|frame| frame.0).unwrap(), [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
-        assert_eq!(Value::Double(1.0).to_frame(Protocol::Binary).map(|frame| frame.0).unwrap(), [0x3f, 0xf0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(value_bytes(&Value::Double(1.0), c).unwrap(), [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
+        assert_eq!(value_bytes(&Value::Double(1.0), Protocol::Binary).unwrap(), [0x3f, 0xf0, 0, 0, 0, 0, 0, 0]);
         // A short list header: size 3, type i32.
         let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I32(2), Value::I32(3)] });
-        assert_eq!(l.to_frame(c).map(|frame| frame.0).unwrap(), [0x35, 0x02, 0x04, 0x06]);
+        assert_eq!(value_bytes(&l, c).unwrap(), [0x35, 0x02, 0x04, 0x06]);
         // A long list header: 0xf0 and the type, then the size. Booleans
         // in lists are 1 for true and 2 for false.
         let bools: Vec<Value> = (0..15).map(|i| Value::Bool(i % 2 == 0)).collect();
         let l = Value::List(List { elem: Type::Bool, items: bools.clone() });
-        let b = l.to_frame(c).map(|frame| frame.0).unwrap();
+        let b = value_bytes(&l, c).unwrap();
         assert_eq!(b[..4], [0xf1, 0x0f, 1, 2]);
         assert_eq!(Value::parse(c, Type::List, &b), Ok((l, b.len())));
         // Readers take 2 as the bool element type, and 0 as false.
@@ -1670,7 +1667,7 @@ mod tests {
         );
         let m =
             Map { key: Type::I32, value: Type::Binary, entries: vec![(Value::I32(1), Value::Binary(b"a".to_vec()))] };
-        let b = Value::Map(m.clone()).to_frame(c).map(|frame| frame.0).unwrap();
+        let b = value_bytes(&Value::Map(m.clone()), c).unwrap();
         assert_eq!(b, [0x01, 0x58, 0x02, 0x01, b'a']);
         assert_eq!(Value::parse(c, Type::Map, &b), Ok((Value::Map(m), 5)));
     }
@@ -1687,7 +1684,7 @@ mod tests {
             Field { id: 3, value: Value::Byte(-1) },
             Field { id: 18, value: Value::Uuid([9; 16]) },
         ]);
-        let b = s.to_frame(c).map(|frame| frame.0).unwrap();
+        let b = value_bytes(&s, c).unwrap();
         let mut want = vec![0x11, 0x12, 0x03, 0xc8, 0x01, 7, 0x03, 0x06, 0xff, 0xfd];
         want.extend_from_slice(&[9; 16]);
         want.push(0);
@@ -1701,7 +1698,7 @@ mod tests {
         let Value::Struct(f) = &v else { panic!() };
         assert_eq!(f[0].id, i16::MAX - 1);
         assert_eq!(f[1].id, i16::MIN);
-        let again = v.to_frame(c).map(|frame| frame.0).unwrap();
+        let again = value_bytes(&v, c).unwrap();
         assert_eq!(Value::parse(c, Type::Struct, &again), Ok((v, again.len())));
     }
 
@@ -1719,7 +1716,7 @@ mod tests {
                 }),
             },
         ]);
-        let bytes = v.to_frame(b).map(|frame| frame.0).unwrap();
+        let bytes = value_bytes(&v, b).unwrap();
         let want = [
             0x02, 0xff, 0xff, 1, 0x0d, 0, 5, 11, 10, 0, 0, 0, 1, 0, 0, 0, 1, b'k', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xfe, 0,
@@ -1728,7 +1725,7 @@ mod tests {
         assert_eq!(Value::parse(b, Type::Struct, &bytes), Ok((v.clone(), want.len())));
         assert_eq!(Value::parse(Protocol::BinaryOld, Type::Struct, &bytes), Ok((v, want.len())));
         let s = Value::Set(List { elem: Type::I16, items: vec![Value::I16(1)] });
-        assert_eq!(s.to_frame(b).map(|frame| frame.0).unwrap(), [6, 0, 0, 0, 1, 0, 1]);
+        assert_eq!(value_bytes(&s, b).unwrap(), [6, 0, 0, 0, 1, 0, 1]);
     }
 
     #[test]
@@ -1788,9 +1785,9 @@ mod tests {
     fn depth_limit() {
         for p in PROTOCOLS {
             let ok = nested(MAX_DEPTH);
-            let b = ok.to_frame(p).map(|frame| frame.0).unwrap();
+            let b = value_bytes(&ok, p).unwrap();
             assert_eq!(Value::parse(p, Type::List, &b), Ok((ok, b.len())));
-            assert_eq!(nested(MAX_DEPTH + 1).to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&nested(MAX_DEPTH + 1), p), Err(WriteError::Unwritable));
             // One more level by hand.
             let mut deeper = if p == Protocol::Compact { vec![0x19] } else { vec![15, 0, 0, 0, 1] };
             deeper.extend_from_slice(&b);
@@ -1798,18 +1795,18 @@ mod tests {
         }
         // A message body counts as depth 1.
         let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH - 1) }], ..add_call() };
-        assert!(m.to_frame(Protocol::Compact).map(|frame| frame.0).is_ok());
+        assert!(EncodedMessage { message: m.clone(), protocol: Protocol::Compact }.to_bytes().is_ok());
         let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH) }], ..add_call() };
-        assert_eq!(m.to_frame(Protocol::Compact).map(|frame| frame.0), Err(WriteError::Unwritable));
+        assert_eq!(EncodedMessage { message: m.clone(), protocol: Protocol::Compact }.to_bytes(), Err(WriteError::Unwritable));
         // A boolean field counts too.
         let mut v = Value::Struct(vec![Field { id: 1, value: Value::Bool(true) }]);
         for _ in 2..MAX_DEPTH {
             v = Value::Struct(vec![Field { id: 1, value: v }]);
         }
-        let b = v.to_frame(Protocol::Compact).map(|frame| frame.0).unwrap();
+        let b = value_bytes(&v, Protocol::Compact).unwrap();
         assert!(Value::parse(Protocol::Compact, Type::Struct, &b).is_ok());
         let v = Value::Struct(vec![Field { id: 1, value: v }]);
-        assert_eq!(v.to_frame(Protocol::Compact).map(|frame| frame.0), Err(WriteError::Unwritable));
+        assert_eq!(value_bytes(&v, Protocol::Compact), Err(WriteError::Unwritable));
     }
 
     #[test]
@@ -1871,26 +1868,26 @@ mod tests {
     fn write_errors() {
         for p in PROTOCOLS {
             let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I64(1)] });
-            assert_eq!(l.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&l, p), Err(WriteError::Unwritable));
             let m =
                 Value::Map(Map { key: Type::I32, value: Type::I32, entries: vec![(Value::I32(1), Value::Bool(true))] });
-            assert_eq!(m.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&m, p), Err(WriteError::Unwritable));
             let long = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN + 1] });
-            assert_eq!(long.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&long, p), Err(WriteError::Unwritable));
             let at = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN] });
-            let b = at.to_frame(p).map(|frame| frame.0).unwrap();
+            let b = value_bytes(&at, p).unwrap();
             assert_eq!(Value::parse(p, Type::List, &b), Ok((at, b.len())));
             let entries = vec![(Value::Byte(0), Value::Byte(0)); MAX_CONTAINER_LEN + 1];
             let long = Value::Map(Map { key: Type::Byte, value: Type::Byte, entries });
-            assert_eq!(long.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
+            assert_eq!(value_bytes(&long, p), Err(WriteError::Unwritable));
         }
         let big = Value::Binary(vec![0; MAX_BINARY_LEN + 1]);
-        assert_eq!(big.to_frame(Protocol::Binary).map(|frame| frame.0), Err(WriteError::Unwritable));
+        assert_eq!(value_bytes(&big, Protocol::Binary), Err(WriteError::Unwritable));
         let at = Value::Binary(vec![0; MAX_BINARY_LEN]);
         let b = ValueBody::<true, 11>(at.clone()).to_bytes().unwrap();
         assert_eq!(Value::parse(Protocol::Compact, Type::Binary, &b), Ok((at, b.len())));
         let m = Message { name: "x".repeat(MAX_BINARY_LEN + 1), ..add_call() };
-        assert_eq!(m.to_frame(Protocol::BinaryOld).map(|frame| frame.0), Err(WriteError::Unwritable));
+        assert_eq!(EncodedMessage { message: m.clone(), protocol: Protocol::BinaryOld }.to_bytes(), Err(WriteError::Unwritable));
         assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(WriteError::Unwritable));
         let f = Frame(vec![0; MAX_FRAME]).to_bytes().unwrap();
         assert_eq!(Frame::parse(&f).unwrap().0.len(), MAX_FRAME);
@@ -1945,7 +1942,26 @@ mod tests {
         contract::check_decode_with_alloc_limit(Messages::new, bytes, 2 * Messages::new().capacity());
         contract::check_decode_with_held_limit(Messages::new, bytes, Messages::new().held());
         contract::check_wire::<EncodedMessage>(bytes);
-        for (message, protocol) in decode_all(Messages::new, bytes).0 {
+        let mut rest = bytes;
+        let mut want = Vec::new();
+        let end = loop {
+            match Message::parse_prefix(rest) {
+                Ok((message, protocol, used)) => {
+                    assert!(used > 0 && used <= rest.len());
+                    want.push((message, protocol));
+                    rest = &rest[used..];
+                }
+                Err(error) => break error,
+            }
+        };
+        let (items, failure) = decode_all(Messages::new, bytes);
+        assert_eq!(items, want);
+        if end != Error::Truncated {
+            assert_eq!(failure, Some(Fail::Protocol(end)));
+        } else if rest.is_empty() {
+            assert_eq!(failure, None);
+        }
+        for (message, protocol) in items {
             contract::check_wire_value(&EncodedMessage { message, protocol });
         }
     }
@@ -1982,7 +1998,7 @@ mod tests {
         }
         check_messages(&bytes);
         assert_eq!(decode_all(Messages::new, &bytes), (want, None));
-        let a = add_call().to_frame(Protocol::Binary).unwrap().0;
+        let a = EncodedMessage { message: add_call(), protocol: Protocol::Binary }.to_bytes().unwrap();
         let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&a[..5]), 5);
         assert!(stream.next().is_none());
@@ -2007,6 +2023,27 @@ mod tests {
     }
 
     #[test]
+    fn messages_match_reference_after_complete_prefix() {
+        let mut prefix = Vec::new();
+        let mut want = Vec::new();
+        for protocol in PROTOCOLS {
+            let message = add_call();
+            EncodedMessage { message: message.clone(), protocol }.write(&mut prefix).unwrap();
+            want.push((message, protocol));
+        }
+        for (tail, failure) in [
+            (&[0x81][..], Fail::Protocol(Error::BadProtocol(0x81))),
+            (&[0x82, 0x21, 0, 1, 0xff][..], Fail::Protocol(Error::BadUtf8)),
+            (&[0x82, 0x21][..], Fail::Truncated { unread: 2 }),
+        ] {
+            let mut bytes = prefix.clone();
+            bytes.extend_from_slice(tail);
+            check_messages(&bytes);
+            assert_eq!(decode_all(Messages::new, &bytes), (want.clone(), Some(failure)));
+        }
+    }
+
+    #[test]
     fn messages_scan_in_linear_time() {
         // Scanning 400,000 boolean fields from the start for every byte
         // would require about 10^11 steps.
@@ -2014,7 +2051,7 @@ mod tests {
         let dense = Message { body, ..add_call() };
         let binary = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
         for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
-            let bytes = message.to_frame(protocol).unwrap().0;
+            let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
             let started = std::time::Instant::now();
             let mut stream = Stream::new(Messages::new());
             let mut got = Vec::new();
@@ -2041,7 +2078,7 @@ mod tests {
             body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_MESSAGE - overhead]) }],
             name: String::new(), ..add_call()
         };
-        let bytes = message.to_frame(Protocol::Binary).unwrap().0;
+        let bytes = EncodedMessage { message: message.clone(), protocol: Protocol::Binary }.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         assert_eq!(decode_all(Messages::new, &bytes), (vec![(message, Protocol::Binary)], None));
     }
@@ -2076,7 +2113,7 @@ mod tests {
             body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_MESSAGE - overhead]) }],
             ..add_call()
         };
-        let bytes = message.to_frame(Protocol::Binary).map(|frame| frame.0).unwrap();
+        let bytes = EncodedMessage { message: message.clone(), protocol: Protocol::Binary }.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -2088,7 +2125,7 @@ mod tests {
     fn messages_clone_preserves_scan_storage() {
         let message = add_call();
         for protocol in PROTOCOLS {
-            let bytes = message.to_frame(protocol).map(|frame| frame.0).unwrap();
+            let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
             let mut decoder = Messages::new();
             let held = decoder.held();
             for end in 0..bytes.len() {
@@ -2106,7 +2143,7 @@ mod tests {
     fn messages_rescan_after_shorter_input() {
         let message = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
         for protocol in PROTOCOLS {
-            let bytes = message.to_frame(protocol).map(|frame| frame.0).unwrap();
+            let bytes = EncodedMessage { message: message.clone(), protocol }.to_bytes().unwrap();
             for (len, eof) in [(0, true), (2, false)] {
                 let mut decoder = Messages::new();
                 assert_eq!(decoder.decode(&bytes[..bytes.len() - 1], false), Ok(Step::Need));
@@ -2162,7 +2199,7 @@ mod tests {
             contract::check_decode_with_held_limit(Messages::new, &bytes, held);
         }
         for protocol in PROTOCOLS {
-            let bytes = add_call().to_frame(protocol).map(|frame| frame.0).unwrap();
+            let bytes = EncodedMessage { message: add_call(), protocol }.to_bytes().unwrap();
             for at in 0..bytes.len() {
                 let mut malformed = bytes.clone();
                 malformed[at] = 0xff;
@@ -2266,10 +2303,10 @@ mod tests {
     /// Checks that a message read from damaged bytes writes and reads back
     /// to the same bytes.
     fn rewrites(m: &Message, p: Protocol) {
-        let b = m.to_frame(p).map(|frame| frame.0).unwrap();
+        let b = EncodedMessage { message: m.clone(), protocol: p }.to_bytes().unwrap();
         let EncodedMessage { message: again, protocol: q } = EncodedMessage::parse(&b).unwrap();
         assert_eq!(q, p);
-        assert_eq!(again.to_frame(p).map(|frame| frame.0).unwrap(), b);
+        assert_eq!(EncodedMessage { message: again.clone(), protocol: p }.to_bytes().unwrap(), b);
     }
 
     #[test]
@@ -2278,7 +2315,7 @@ mod tests {
         for i in 0..4000 {
             let m = random_message(&mut r);
             let p = PROTOCOLS[i % 3];
-            let b = m.to_frame(p).map(|frame| frame.0).unwrap();
+            let b = EncodedMessage { message: m.clone(), protocol: p }.to_bytes().unwrap();
             assert_eq!(EncodedMessage::parse(&b), Ok(EncodedMessage { message: m.clone(), protocol: p }));
             // Every proper prefix is truncated.
             for n in 0..b.len() {
@@ -2287,7 +2324,7 @@ mod tests {
             // Each value type alone round trips too.
             let t = random_type(&mut r, 1);
             let v = random_value(&mut r, t, 1);
-            let vb = v.to_frame(p).map(|frame| frame.0).unwrap();
+            let vb = value_bytes(&v, p).unwrap();
             assert_eq!(Value::parse(p, t, &vb), Ok((v, vb.len())));
             for n in 0..vb.len() {
                 assert_eq!(Value::parse(p, t, &vb[..n]), Err(Error::Truncated));
@@ -2304,10 +2341,10 @@ mod tests {
                     for p in PROTOCOLS {
                         if let Ok((v, used)) = Value::parse(p, t, &d) {
                             assert!(used <= d.len());
-                            let vb = v.to_frame(p).map(|frame| frame.0).unwrap();
+                            let vb = value_bytes(&v, p).unwrap();
                             let (back, n) = Value::parse(p, t, &vb).unwrap();
                             assert_eq!(n, vb.len());
-                            assert_eq!(back.to_frame(p).map(|frame| frame.0).unwrap(), vb);
+                            assert_eq!(value_bytes(&back, p).unwrap(), vb);
                         }
                     }
                 }
@@ -2345,7 +2382,7 @@ mod tests {
             let mut bare = Vec::new();
             for _ in 0..1 + r.index(3) {
                 let p = PROTOCOLS[r.index(3)];
-                bare.extend(random_message(&mut r).to_frame(p).map(|frame| frame.0).unwrap());
+                bare.extend(EncodedMessage { message: random_message(&mut r), protocol: p }.to_bytes().unwrap());
             }
             if r.coin() {
                 let at = r.index(bare.len());

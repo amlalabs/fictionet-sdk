@@ -42,15 +42,12 @@ fuzz_target!(|data: &[u8]| {
     }
     // Constructed messages within their limits read back unchanged.
     let text = String::from_utf8_lossy(data);
-    if let Ok(m) = Message::active_checks(&text) {
-        contract::check_wire_value(&m);
-    }
-    if let Ok(m) = Message::response(false, Some(&text)) {
-        contract::check_wire_value(&m);
-        assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
-    }
+    let m = Message::active_checks(&text).unwrap();
+    contract::check_wire_value(&m);
+    let m = Message::response(false, Some(&text)).unwrap();
+    contract::check_wire_value(&m);
+    assert_eq!(Message::parse(&m.to_packet().data), Ok(m));
     let v = SenderValue { host: text.to_string(), key: text.to_string(), value: text.to_string() };
-    if let Ok(m) = Message::sender_data(&[v]) {
-        contract::check_wire_value(&m);
-    }
+    let m = Message::sender_data(&[v]).unwrap();
+    contract::check_wire_value(&m);
 });

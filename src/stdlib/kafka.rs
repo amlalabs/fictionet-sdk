@@ -250,9 +250,8 @@ pub enum Error {
     Unwritable,
     /// This many bytes were left after the last field.
     Trailing(usize),
-    /// A value Kafka does not allow here: a field set to something other
-    /// than its default in a version that lacks it, a topic named and
-    /// identified in a way that version does not support, a tagged field
+    /// A value Kafka does not allow here: a topic named and identified in
+    /// a way that version does not support, a tagged field
     /// whose bytes do not match its defined type, or a tag over 31 bits.
     /// The text names which.
     Invalid(&'static str),
@@ -1373,6 +1372,20 @@ fn check_version(api_key: i16, api_version: i16) -> Result<(), Error> {
     if has_body(api_key, api_version) { Ok(()) } else { Err(Error::UnsupportedVersion { api_key, api_version }) }
 }
 
+/// Finishes a body only if its versioned reader preserves the value.
+fn finish_body<T: PartialEq>(
+    writer: Writer,
+    value: &T,
+    version: i16,
+    parse: impl FnOnce(&[u8], i16) -> Result<T, Error>,
+) -> Result<Vec<u8>, Error> {
+    let bytes = writer.finish()?;
+    if parse(&bytes, version).as_ref() != Ok(value) {
+        return Err(Error::Unwritable);
+    }
+    Ok(bytes)
+}
+
 /// An ApiVersions request: a client asking which versions of each API the
 /// broker speaks. Versions 0 to 2 have no fields.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1455,9 +1468,7 @@ impl ApiVersionsRequest {
             }
             w.tagged_fields(&self.tagged_fields);
         }
-        let bytes = w.finish()?;
-        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        Ok(bytes)
+        finish_body(w, self, version, Self::parse)
     }
 }
 
@@ -1552,9 +1563,7 @@ impl ApiVersionsResponse {
             w.i32(self.throttle_time_ms);
         }
         w.tags_f(flex, &self.tagged_fields);
-        let bytes = w.finish()?;
-        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        Ok(bytes)
+        finish_body(w, self, version, Self::parse)
     }
 }
 
@@ -1722,9 +1731,7 @@ impl MetadataRequest {
             w.bool(self.include_topic_authorized_operations);
         }
         w.tags_f(flex, &self.tagged_fields);
-        let bytes = w.finish()?;
-        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        Ok(bytes)
+        finish_body(w, self, version, Self::parse)
     }
 }
 
@@ -2032,9 +2039,7 @@ impl MetadataResponse {
             w.i16(self.error_code);
         }
         w.tags_f(flex, &self.tagged_fields);
-        let bytes = w.finish()?;
-        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        Ok(bytes)
+        finish_body(w, self, version, Self::parse)
     }
 }
 
@@ -2291,14 +2296,14 @@ mod tests {
         Int64(-1 << 40).write(&mut w).unwrap();
         Float64(1.5).write(&mut w).unwrap();
         Uuid(id).write(&mut w).unwrap();
-        String16(("héllo").to_owned()).write(&mut w).unwrap();
-        NullableString((None).map(str::to_owned)).write(&mut w).unwrap();
-        CompactString(("kafka").to_owned()).write(&mut w).unwrap();
-        CompactNullableString((None).map(str::to_owned)).write(&mut w).unwrap();
-        BytesValue((b"abc").to_vec()).write(&mut w).unwrap();
-        NullableBytes((None).map(<[u8]>::to_vec)).write(&mut w).unwrap();
-        CompactBytes((b"").to_vec()).write(&mut w).unwrap();
-        CompactNullableBytes((None).map(<[u8]>::to_vec)).write(&mut w).unwrap();
+        String16("héllo".to_owned()).write(&mut w).unwrap();
+        NullableString(None.map(str::to_owned)).write(&mut w).unwrap();
+        CompactString("kafka".to_owned()).write(&mut w).unwrap();
+        CompactNullableString(None.map(str::to_owned)).write(&mut w).unwrap();
+        BytesValue(b"abc".to_vec()).write(&mut w).unwrap();
+        NullableBytes(None.map(<[u8]>::to_vec)).write(&mut w).unwrap();
+        CompactBytes(b"".to_vec()).write(&mut w).unwrap();
+        CompactNullableBytes(None.map(<[u8]>::to_vec)).write(&mut w).unwrap();
         ArrayLength(Some(0)).write(&mut w).unwrap();
         ArrayLength(None).write(&mut w).unwrap();
         CompactArrayLength(Some(0)).write(&mut w).unwrap();
@@ -2337,10 +2342,10 @@ mod tests {
     #[test]
     fn primitive_layouts() {
         let mut w = Vec::new();
-        String16(("ab").to_owned()).write(&mut w).unwrap();
-        CompactString(("ab").to_owned()).write(&mut w).unwrap();
-        CompactNullableString((None).map(str::to_owned)).write(&mut w).unwrap();
-        NullableString((None).map(str::to_owned)).write(&mut w).unwrap();
+        String16("ab".to_owned()).write(&mut w).unwrap();
+        CompactString("ab".to_owned()).write(&mut w).unwrap();
+        CompactNullableString(None.map(str::to_owned)).write(&mut w).unwrap();
+        NullableString(None.map(str::to_owned)).write(&mut w).unwrap();
         CompactArrayLength(Some(2)).write(&mut w).unwrap();
         TaggedFields(vec![tag(0, &[9])]).write(&mut w).unwrap();
         assert_eq!(w, [0, 2, b'a', b'b', 3, b'a', b'b', 0, 0xff, 0xff, 3, 1, 0, 1, 9]);
@@ -2400,6 +2405,7 @@ mod tests {
         refuses(&CompactArrayLength(Some(usize::MAX)));
         refuses(&TaggedFields((0..2000).map(|tag| TaggedField { tag, data: vec![] }).collect()));
         refuses(&TaggedFields(vec![tag(5, b"x"), tag(1, b"yz"), tag(5, b"dup")]));
+        refuses(&TaggedFields(vec![tag(1, b"x"), tag(1, b"dup")]));
         for value in [ArrayLength(None), ArrayLength(Some(MAX_ARRAY))] { contract::check_wire_value(&value); }
         contract::check_wire_value(&CompactArrayLength(Some(MAX_ARRAY)));
         contract::check_wire_value(&String16("x".repeat(MAX_STRING)));
@@ -2960,8 +2966,8 @@ mod tests {
     fn any_string(rng: &mut Lcg) -> String {
         match rng.index(6) {
             0 => String::new(),
-            // Over the limit, with a two-byte character at the cut.
-            1 => "\u{e9}".repeat(MAX_STRING / 2 + 1 + rng.index(3)),
+            // Multibyte text near the length limit.
+            1 => "\u{e9}".repeat(MAX_STRING / 2 - rng.index(3)),
             _ => rng.text(7),
         }
     }
@@ -2971,8 +2977,12 @@ mod tests {
     }
 
     fn any_tags(rng: &mut Lcg) -> Vec<TaggedField> {
-        // Out of order and repeated tags too.
-        (0..rng.index(4)).map(|_| tag(rng.index(5) as u32, &vec![rng.next() as u8; rng.index(3)])).collect()
+        let mut tags: Vec<_> = (0..rng.index(4))
+            .map(|_| tag(rng.index(5) as u32, &vec![rng.next() as u8; rng.index(3)]))
+            .collect();
+        tags.sort_by_key(|field| field.tag);
+        tags.dedup_by_key(|field| field.tag);
+        tags
     }
 
     fn any_i32s(rng: &mut Lcg) -> Vec<i32> {
@@ -3022,39 +3032,86 @@ mod tests {
     }
 
     fn fit_request(mut req: MetadataRequest, v: i16) -> MetadataRequest {
-        if v < 4 { req.allow_auto_topic_creation = true; }
-        if !(8..=10).contains(&v) { req.include_cluster_authorized_operations = false; }
-        if v < 8 { req.include_topic_authorized_operations = false; }
-        if v < 9 { req.tagged_fields.clear(); }
-        if v == 0 && req.topics.is_none() { req.topics = Some(vec![]); }
+        if v < 4 {
+            req.allow_auto_topic_creation = true;
+        }
+        if !(8..=10).contains(&v) {
+            req.include_cluster_authorized_operations = false;
+        }
+        if v < 8 {
+            req.include_topic_authorized_operations = false;
+        }
+        if v < 9 {
+            req.tagged_fields.clear();
+        }
+        if v == 0 && req.topics.is_none() {
+            req.topics = Some(vec![]);
+        }
         for topic in req.topics.iter_mut().flatten() {
-            if v < 12 { topic.topic_id = [0; 16]; topic.name.get_or_insert_with(String::new); }
-            if v < 9 { topic.tagged_fields.clear(); }
+            if v < 12 {
+                topic.topic_id = [0; 16];
+                topic.name.get_or_insert_with(String::new);
+            }
+            if v < 9 {
+                topic.tagged_fields.clear();
+            }
         }
         req
     }
 
     fn fit_response(mut resp: MetadataResponse, v: i16) -> MetadataResponse {
-        if v < 3 { resp.throttle_time_ms = 0; }
-        if v < 2 { resp.cluster_id = None; }
-        if v < 1 { resp.controller_id = -1; }
-        if !(8..=10).contains(&v) { resp.cluster_authorized_operations = i32::MIN; }
-        if v < 13 { resp.error_code = 0; }
-        if v < 9 { resp.tagged_fields.clear(); }
+        if v < 3 {
+            resp.throttle_time_ms = 0;
+        }
+        if v < 2 {
+            resp.cluster_id = None;
+        }
+        if v < 1 {
+            resp.controller_id = -1;
+        }
+        if !(8..=10).contains(&v) {
+            resp.cluster_authorized_operations = i32::MIN;
+        }
+        if v < 13 {
+            resp.error_code = 0;
+        }
+        if v < 9 {
+            resp.tagged_fields.clear();
+        }
         for broker in &mut resp.brokers {
-            if v < 1 { broker.rack = None; }
-            if v < 9 { broker.tagged_fields.clear(); }
+            if v < 1 {
+                broker.rack = None;
+            }
+            if v < 9 {
+                broker.tagged_fields.clear();
+            }
         }
         for topic in &mut resp.topics {
-            if v < 12 || topic.error_code == 0 || topic.topic_id == [0; 16] { topic.name.get_or_insert_with(String::new); }
-            if v < 10 { topic.topic_id = [0; 16]; }
-            if v < 1 { topic.is_internal = false; }
-            if v < 8 { topic.topic_authorized_operations = i32::MIN; }
-            if v < 9 { topic.tagged_fields.clear(); }
+            if v < 12 || topic.error_code == 0 || topic.topic_id == [0; 16] {
+                topic.name.get_or_insert_with(String::new);
+            }
+            if v < 10 {
+                topic.topic_id = [0; 16];
+            }
+            if v < 1 {
+                topic.is_internal = false;
+            }
+            if v < 8 {
+                topic.topic_authorized_operations = i32::MIN;
+            }
+            if v < 9 {
+                topic.tagged_fields.clear();
+            }
             for part in &mut topic.partitions {
-                if v < 7 { part.leader_epoch = -1; }
-                if v < 5 { part.offline_replicas.clear(); }
-                if v < 9 { part.tagged_fields.clear(); }
+                if v < 7 {
+                    part.leader_epoch = -1;
+                }
+                if v < 5 {
+                    part.offline_replicas.clear();
+                }
+                if v < 9 {
+                    part.tagged_fields.clear();
+                }
             }
         }
         resp
@@ -3096,7 +3153,7 @@ mod tests {
     fn writers_always_make_what_readers_take() {
         let mut rng = Lcg::new(0x77_7269_7465);
         for _ in 0..300 {
-            let header = RequestHeader {
+            let mut header = RequestHeader {
                 api_key: [api_key::API_VERSIONS, api_key::METADATA, api_key::CONTROLLED_SHUTDOWN, 500]
                     [rng.index(4)],
                 api_version: rng.index(16) as i16 - 1,
@@ -3105,7 +3162,13 @@ mod tests {
                 tagged_fields: any_tags(&mut rng),
             };
             let (key, version) = (header.api_key, header.api_version);
-            let body = if !has_body(key, version) {
+            if header.version() == 0 {
+                header.client_id = None;
+            }
+            if header.version() < 2 {
+                header.tagged_fields.clear();
+            }
+            let mut body = if !has_body(key, version) {
                 RequestBody::Other(rng.bytes(4))
             } else if key == api_key::API_VERSIONS {
                 RequestBody::ApiVersions(ApiVersionsRequest {
@@ -3118,15 +3181,25 @@ mod tests {
             } else {
                 RequestBody::Metadata(fit_request(any_metadata_request(&mut rng), version))
             };
+            if let RequestBody::ApiVersions(body) = &mut body {
+                if version < 3 {
+                    body.client_software_name.clear();
+                    body.client_software_version.clear();
+                    body.tagged_fields.clear();
+                }
+                if version < 5 {
+                    body.cluster_id = None;
+                    body.node_id = -1;
+                }
+            }
             let req = Request { header, body };
             contract::check_wire_value(&req);
-            if let Ok(bytes) = req.to_bytes() {
-                assert_eq!(Request::parse(&bytes), Ok(req.clone()));
-                let frame = req.to_frame().unwrap();
-                assert_eq!(decode_all(Frames::new, &frame.to_bytes().unwrap()), (vec![Frame(bytes)], None));
-            }
+            let bytes = req.to_bytes().unwrap();
+            assert_eq!(Request::parse(&bytes), Ok(req.clone()));
+            let frame = req.to_frame().unwrap();
+            assert_eq!(decode_all(Frames::new, &frame.to_bytes().unwrap()), (vec![Frame(bytes)], None));
 
-            let rbody = if !has_body(key, version) {
+            let mut rbody = if !has_body(key, version) {
                 ResponseBody::Other(rng.bytes(4))
             } else if key == api_key::API_VERSIONS {
                 ResponseBody::ApiVersions(ApiVersionsResponse {
@@ -3145,14 +3218,28 @@ mod tests {
             } else {
                 ResponseBody::Metadata(fit_response(any_metadata_response(&mut rng), version))
             };
+            if let ResponseBody::ApiVersions(body) = &mut rbody {
+                if version < 1 {
+                    body.throttle_time_ms = 0;
+                }
+                if version < 3 {
+                    body.tagged_fields.clear();
+                    for key in &mut body.api_keys {
+                        key.tagged_fields.clear();
+                    }
+                }
+            }
+            let mut header = ResponseHeader { correlation_id: 1, tagged_fields: any_tags(&mut rng) };
+            if response_header_version(key, version) == 0 {
+                header.tagged_fields.clear();
+            }
             let resp = Response {
-                header: ResponseHeader { correlation_id: 1, tagged_fields: any_tags(&mut rng) },
+                header,
                 body: rbody,
             };
-            if let Ok(frame) = resp.to_frame(key, version) {
-                contract::check_wire_value(&frame);
-                assert_eq!(Response::parse(&frame.0, key, version), Ok(resp));
-            }
+            let frame = resp.to_frame(key, version).unwrap();
+            contract::check_wire_value(&frame);
+            assert_eq!(Response::parse(&frame.0, key, version), Ok(resp));
 
         }
     }

@@ -850,9 +850,9 @@ impl Open {
         out.extend_from_slice(&self.my_as.to_be_bytes());
         out.extend_from_slice(&self.hold_time.to_be_bytes());
         out.extend_from_slice(&self.bgp_id.octets());
-        let legacy: usize = params.iter().map(|(_, v)| 2 + v.len()).sum();
-        if legacy <= MAX_PARAMETERS_LEN && params.iter().all(|(_, v)| v.len() <= 255) {
-            out.push(legacy as u8);
+        let short: usize = params.iter().map(|(_, v)| 2 + v.len()).sum();
+        if short <= MAX_PARAMETERS_LEN && params.iter().all(|(_, v)| v.len() <= 255) {
+            out.push(short as u8);
             for (kind, value) in &params {
                 out.push(*kind);
                 out.push(value.len() as u8);
@@ -975,7 +975,6 @@ fn parse_capabilities(mut r: &[u8]) -> Result<Vec<Capability>, Error> {
 }
 
 fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
-    let too_long = EncodeError::Unwritable;
     let mut out = Vec::new();
     for c in caps {
         let (code, value) = match c {
@@ -993,7 +992,7 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
                     return Err(EncodeError::Unwritable);
                 }
                 if g.families.len() > (MAX_PARAMETERS_LEN - 2) / 4 {
-                    return Err(too_long);
+                    return Err(EncodeError::Unwritable);
                 }
                 let mut v = vec![(g.flags << 4) | (g.time >> 8) as u8, g.time as u8];
                 for f in &g.families {
@@ -1014,7 +1013,7 @@ fn capabilities_bytes(caps: &[Capability]) -> Result<Vec<u8>, EncodeError> {
                     return Err(EncodeError::Unwritable);
                 }
                 if value.len() > MAX_PARAMETERS_LEN {
-                    return Err(too_long);
+                    return Err(EncodeError::Unwritable);
                 }
                 (*code, value.clone())
             }
@@ -2796,8 +2795,14 @@ mod tests {
         for round in 0..6000 {
             let mut b = bases[r.index(bases.len())].clone();
             match round % 4 {
-                // Flip a few bytes after the marker.
-                0 | 1 => mutate(&mut r, &mut b),
+                // Mutate only the body, preserving the header and fixing its length.
+                0 | 1 => {
+                    let mut body = b.split_off(HEADER_LEN);
+                    mutate(&mut r, &mut body);
+                    b.extend_from_slice(&body);
+                    let length = u16::try_from(b.len()).unwrap();
+                    b[16..18].copy_from_slice(&length.to_be_bytes());
+                }
                 // Cut the body short or grow it, and fix the length field.
                 2 => {
                     let n = HEADER_LEN + r.index(b.len() + 8 - HEADER_LEN);
@@ -3230,7 +3235,7 @@ mod tests {
         for _ in 0..3000 {
             let prefix = |r: &mut Lcg| {
                 let addr = Ipv4Addr::from(if r.coin() { r.next() as u32 } else { (r.next() as u32) & 0xffff_0000 });
-                let length = (r.index(34)) as u8;
+                let length = r.index(34) as u8;
                 if r.index(3) == 0 {
                     Prefix::new(addr.into(), length.min(32)).unwrap()
                 } else {
@@ -3253,7 +3258,7 @@ mod tests {
             if r.index(4) == 0 {
                 attributes.push(Attribute::Unknown {
                     flags: r.next() as u8,
-                    kind: 17 + (r.index(3)) as u8,
+                    kind: 17 + r.index(3) as u8,
                     value: vec![2, 1, 0, 0, 0, r.index(2) as u8],
                 });
             }

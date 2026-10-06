@@ -1,7 +1,7 @@
 //! Thrift frames, messages, and values in the binary and compact protocols.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Stream, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::thrift::{
     EncodedMessage, Frame, Frames, MAX_FRAME, Messages, Protocol, Type, Value, ValueBody,
 };
@@ -32,8 +32,22 @@ fuzz_target!(|data: &[u8]| {
         contract::check_wire_value(&frame);
         contract::check_wire::<EncodedMessage>(&frame.0);
     }
-    for (message, protocol) in decode_all(Messages::new, data).0 {
-        contract::check_wire_value(&EncodedMessage { message, protocol });
+    let mut stream = Stream::new(Messages::new());
+    let mut pushed = 0;
+    let mut start = 0;
+    while !stream.is_done() {
+        pushed += stream.push(&data[pushed..]);
+        if pushed == data.len() {
+            stream.end();
+        }
+        while let Some(item) = stream.next() {
+            let Ok((message, protocol)) = item else { break };
+            let end = usize::try_from(stream.offset()).unwrap();
+            let value = EncodedMessage { message, protocol };
+            assert_eq!(EncodedMessage::parse(&data[start..end]), Ok(value.clone()));
+            contract::check_wire_value(&value);
+            start = end;
+        }
     }
     macro_rules! values {
         ($($code:literal),*) => { $(

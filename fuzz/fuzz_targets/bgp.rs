@@ -77,6 +77,7 @@ fn update_from(data: &[u8]) -> Update {
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(|| Frames, data, 2 * Frames.capacity());
     contract::check_wire::<Frame>(data);
+    contract::check_wire::<Open>(data);
     contract::check_decode_with_alloc_limit(|| Frames.map(|frame| Message::decode(&frame, &Context::default())), data, 2 * Frames.capacity());
     let built = Frame {
         kind: data.first().copied().unwrap_or(0),

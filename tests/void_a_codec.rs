@@ -13,6 +13,7 @@ where
     D::Error: Clone + PartialEq + Debug,
 {
     contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    contract::check_decode_with_held_limit(&make, bytes, 0);
     let (items, error) = decode_all(&make, bytes);
     assert_eq!(error, None);
     assert_eq!(items, expected);
@@ -164,7 +165,7 @@ fn thrift_chunked_round_trip() {
         thrift::Protocol::BinaryOld,
         thrift::Protocol::Compact,
     ] {
-        let payload = call.to_frame(protocol).unwrap().0;
+        let payload = thrift::EncodedMessage { message: call.clone(), protocol }.to_bytes().unwrap();
         let good = thrift::Frame(payload);
         let bytes = round_trip(
             thrift::Frames::new,
