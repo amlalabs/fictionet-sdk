@@ -4,6 +4,8 @@
 //! Route SETTINGS and WINDOW_UPDATE to the opposite direction's
 //! [`Connection::peer_settings`] and [`Connection::peer_window_update`].
 //! Route RST_STREAM through [`Connection::peer_reset`], then retire both halves.
+//! In-flight DATA on a peer-reset stream still consumes connection credit.
+//! Its headers still update HPACK. Neither produces an event, even after retire.
 //! For GOAWAY, the caller identifies abandoned streams above `last_stream`,
 //! closes both halves with `peer_reset`, and retires their DATA decoders.
 //! Idle-stream checks and stream ownership belong to the caller.
@@ -14,7 +16,7 @@ use fictionet::stdlib::{
     codec::{Decode, Fail, Step, Stream, Wire},
     hpack,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// The client's connection preface from RFC 9113, Section 3.4.
@@ -378,7 +380,7 @@ fn unpad(payload: &[u8], flags: u8) -> Result<(&[u8], Option<Vec<u8>>), Error> {
     }
     let (&pad, rest) = payload
         .split_first()
-        .ok_or_else(|| protocol("missing pad length"))?;
+        .ok_or_else(|| size("missing pad length"))?;
     let end = rest
         .len()
         .checked_sub(usize::from(pad))
@@ -387,6 +389,18 @@ fn unpad(payload: &[u8], flags: u8) -> Result<(&[u8], Option<Vec<u8>>), Error> {
         rest.get(..end).ok_or_else(|| size("padding"))?,
         Some(rest.get(end..).ok_or_else(|| size("padding"))?.to_vec()),
     ))
+}
+// A payload too short for its fields is a FRAME_SIZE_ERROR (RFC 9113 4.2).
+// Padding that leaves too few bytes for them is a PROTOCOL_ERROR (6.2, 6.6).
+fn unpad_fields(payload: &[u8], flags: u8, need: usize) -> Result<(&[u8], Option<Vec<u8>>), Error> {
+    if payload.len() < need.saturating_add(usize::from(flags & 8 != 0)) {
+        return Err(size("frame too short for its fields"));
+    }
+    let (b, padding) = unpad(payload, flags)?;
+    if b.len() < need {
+        return Err(protocol("padding covers required fields"));
+    }
+    Ok((b, padding))
 }
 fn dependency(b: &[u8]) -> Result<Dependency, Error> {
     let stream = u32_at(b, 0)?;
@@ -440,7 +454,7 @@ impl Wire for Frame {
                 })
             }
             1 => {
-                let (b, padding) = unpad(b, flags)?;
+                let (b, padding) = unpad_fields(b, flags, if flags & 0x20 != 0 { 5 } else { 0 })?;
                 let (priority, fragment) = if flags & 0x20 != 0 {
                     let p = dependency(b)?;
                     if p.stream == stream {
@@ -494,7 +508,7 @@ impl Wire for Frame {
                 Self::Settings(Settings { flags, entries })
             }
             5 => {
-                let (b, padding) = unpad(b, flags)?;
+                let (b, padding) = unpad_fields(b, flags, 4)?;
                 let promised = u32_at(b, 0)? & MAX_WINDOW;
                 if promised == 0 {
                     return Err(protocol("promised stream is zero"));
@@ -771,6 +785,8 @@ impl Frames {
     }
     /// Enables capture policy: accepts an optional preface, reports bad
     /// frames as items, and skips incomplete oversized payloads.
+    /// `check_decode` does not apply above the chosen limit (normally
+    /// [`CAPTURE_FRAME_LIMIT`]); complete frames in read-ahead are retained.
     pub fn for_observation(limit: usize) -> Self {
         Self {
             preface: 2,
@@ -873,6 +889,7 @@ pub struct Limits {
     /// Maximum encoded bytes in one assembled header block.
     pub max_header_block: usize,
     /// Maximum retained decoded name and value bytes in a block.
+    /// Indexed references can expand a few encoded bytes up to this limit.
     pub max_header_list: usize,
     /// Maximum tracked stream states, including ended streams until retired.
     pub max_streams: usize,
@@ -1215,6 +1232,7 @@ struct StreamState {
     window: i64,
     headers: bool,
     closed: bool,
+    reset_by_peer: bool,
 }
 
 struct SettingsUpdate {
@@ -1251,6 +1269,8 @@ pub struct Connection {
     settings: SettingsState,
     peer: SettingsState,
     streams: BTreeMap<u32, StreamState>,
+    peer_resets: BTreeSet<u32>,
+    reset_before: [u32; 2],
     window: i64,
     first: bool,
     client: bool,
@@ -1283,6 +1303,8 @@ impl Connection {
             settings: SettingsState::default(),
             peer: SettingsState::default(),
             streams: BTreeMap::new(),
+            peer_resets: BTreeSet::new(),
+            reset_before: [0; 2],
             window: 65_535,
             first: true,
             client,
@@ -1317,6 +1339,8 @@ impl Connection {
         ));
         self.blocks.forget();
         self.streams.clear();
+        self.peer_resets.clear();
+        self.reset_before = [0; 2];
         self.settings_updates.clear();
         self.initial_window = 65_535;
         self.frame_size = DEFAULT_FRAME_SIZE as u32;
@@ -1338,7 +1362,8 @@ impl Connection {
         self.frames.buffered()
     }
     /// Encoded header bytes and HPACK table bytes retained between frames.
-    /// Stream metadata is separately bounded by `limits.max_streams`.
+    /// Stream metadata and recent peer-reset IDs are each separately bounded
+    /// by `limits.max_streams`.
     pub fn held(&self) -> usize {
         self.blocks.held()
     }
@@ -1361,6 +1386,7 @@ impl Connection {
     }
     /// Releases an ended stream's metadata once the caller has retired its
     /// DATA decoder. Returns false for an unknown or still-open stream.
+    /// Peer-reset tracking survives retirement.
     pub fn retire(&mut self, stream: u32) -> bool {
         if self.streams.get(&stream).is_some_and(|s| s.closed) {
             self.streams.remove(&stream);
@@ -1371,11 +1397,40 @@ impl Connection {
     }
     /// Marks a stream closed after a peer reset or abandonment by GOAWAY.
     /// The caller can then release it with [`retire`](Self::retire).
-    /// Unknown streams are ignored. This does not allocate state.
+    /// In-flight DATA is charged to the connection window, then dropped.
+    /// Headers still update HPACK, then are dropped. The caller validates
+    /// idle-stream rules, including resets before this direction's headers.
+    ///
+    /// Keeps at most `limits.max_streams` recent reset IDs. Older IDs fall
+    /// below a per-parity watermark. Untracked streams at or below that
+    /// watermark are also dropped. Tracked streams keep their own state.
     pub fn peer_reset(&mut self, stream: u32) {
+        if stream == 0 || stream > MAX_WINDOW {
+            return;
+        }
         if let Some(state) = self.streams.get_mut(&stream) {
             state.closed = true;
+            state.reset_by_peer = true;
         }
+        let parity = (stream % 2) as usize;
+        if stream > self.reset_before[parity] {
+            self.peer_resets.insert(stream);
+        }
+        if self.peer_resets.len() > self.limits.max_streams
+            && let Some(oldest) = self.peer_resets.pop_first()
+        {
+            let before = &mut self.reset_before[(oldest % 2) as usize];
+            *before = (*before).max(oldest);
+        }
+    }
+    fn reset_by_peer(&self, stream: u32) -> bool {
+        self.streams.get(&stream).map_or_else(
+            || {
+                self.peer_resets.contains(&stream)
+                    || stream <= self.reset_before[(stream % 2) as usize]
+            },
+            |state| state.reset_by_peer,
+        )
     }
     /// Applies SETTINGS announced in the other direction. Increases can
     /// apply at once. HPACK, window, and frame-size reductions wait for this
@@ -1524,6 +1579,7 @@ impl Connection {
             window: i64::from(self.initial_window),
             headers: false,
             closed: false,
+            reset_by_peer: false,
         }))
     }
     /// Returns the next event, or the direction's error once. `None` means
@@ -1576,6 +1632,13 @@ impl Connection {
                 .ok_or_else(|| size("missing frame header"))?,
         )?;
         let block = self.blocks.read(h, bytes.get(HEADER_LEN..))?;
+        if matches!(
+            frame,
+            Frame::Headers(_) | Frame::PushPromise(_) | Frame::Continuation(_)
+        ) && self.reset_by_peer(h.stream)
+        {
+            return Ok(None);
+        }
         if let Some(block_fields) = block.block {
             let fields = block_fields
                 .headers
@@ -1641,6 +1704,10 @@ impl Connection {
                         "connection window exhausted",
                     ));
                 }
+                if self.reset_by_peer(d.stream) {
+                    self.window -= cost;
+                    return Ok(None);
+                }
                 let s = self
                     .streams
                     .get_mut(&d.stream)
@@ -1677,7 +1744,9 @@ impl Connection {
             }
             Frame::Priority(p) => Some(Event::Priority(p)),
             Frame::Reset(r) => {
-                self.peer_reset(r.stream);
+                if let Some(state) = self.streams.get_mut(&r.stream) {
+                    state.closed = true;
+                }
                 Some(Event::Reset {
                     stream: r.stream,
                     code: r.code,
@@ -1765,6 +1834,7 @@ struct CaptureCalls {
     state: BTreeMap<(bool, u32), Call>,
     budget: CaptureBudget,
     charged: usize,
+    client: Option<bool>,
 }
 impl CaptureCalls {
     fn new(budget: CaptureBudget) -> Self {
@@ -1775,6 +1845,7 @@ impl CaptureCalls {
             state: BTreeMap::new(),
             budget,
             charged: 0,
+            client: None,
         }
     }
     fn total(&self) -> usize {
@@ -1867,7 +1938,10 @@ impl core::error::Error for CaptureError {}
 ///
 /// Recognized gRPC streams use [`Demux`] of [`grpc::Messages`]. Both directions
 /// share at most 256 call entries, each with at most 256 provenance spans.
-/// RST_STREAM and GOAWAY release abandoned calls in both directions.
+/// Consumed spans are pruned after each message. RST_STREAM releases both
+/// halves. GOAWAY releases only streams started by its receiver, above
+/// `last_stream`. The preface or request and response headers identify roles.
+/// Calls are kept when the sender's role is unknown.
 /// Share a [`CaptureBudget`] across connections, including nested TLS streams.
 /// Register a copied version exactly like the built-in:
 /// ```
@@ -1980,6 +2054,7 @@ impl Capture {
         call.spans.push_exact(data.len());
         call.outer = start.saturating_add(data.len() as u64);
         let mut rest = data;
+        let mut more = 0usize;
         loop {
             let n = calls.push(&key, rest);
             rest = rest.get(n..).unwrap_or_default();
@@ -1990,7 +2065,7 @@ impl Capture {
             let CaptureCalls {
                 state, messages, ..
             } = &mut *calls;
-            if let Some(call) = state.get(&key)
+            if let Some(call) = state.get_mut(&key)
                 && let Some(inner) = messages.get_mut(&key)
             {
                 while let Some(result) = inner.with_next(|message, bytes, range| {
@@ -2003,12 +2078,13 @@ impl Capture {
                 }) {
                     match result {
                         Ok(message) if item.messages.len() < 256 => item.messages.push(message),
-                        Ok(_) => {}
+                        Ok(_) => more = more.saturating_add(1),
                         Err(_) => {
                             item.malformed = true;
                             failed = true;
                         }
                     }
+                    call.spans.discard_before(inner.offset());
                 }
             }
             calls.account();
@@ -2025,6 +2101,10 @@ impl Capture {
                 }
                 break;
             }
+        }
+        if more != 0 {
+            item.layer
+                .note("gRPC", format!("{more} more messages, not shown"));
         }
     }
 }
@@ -2202,6 +2282,9 @@ impl Decode for Capture {
         let start = self.offset;
         self.offset = self.offset.saturating_add(n as u64);
         if frame == FrameItem::Preface {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.client = Some(self.reverse);
+            }
             let mut layer = Layer::new("HyperText Transfer Protocol 2", 0, (0, PREFACE.len()));
             layer.summary = "Connection preface".into();
             return Ok(Step::Item(
@@ -2231,6 +2314,15 @@ impl Decode for Capture {
         );
         let mut item = capture_layer(h, raw);
         item.offset = start;
+        if let FrameItem::Refused {
+            oversized: false,
+            error,
+            ..
+        } = &frame
+        {
+            item.malformed = true;
+            item.layer.note("Frame", error.reason);
+        }
         let payload = if oversized {
             None
         } else {
@@ -2293,6 +2385,23 @@ impl Decode for Capture {
                 }
                 if let Some(b) = &block.block {
                     present_block(&mut item, b);
+                    if block.promised.is_none()
+                        && let Ok(mut calls) = self.calls.lock()
+                        && calls.client.is_none()
+                    {
+                        if b.headers
+                            .iter()
+                            .any(|f| f.name.as_deref() == Some(b":method"))
+                        {
+                            calls.client = Some(self.reverse);
+                        } else if b
+                            .headers
+                            .iter()
+                            .any(|f| f.name.as_deref() == Some(b":status"))
+                        {
+                            calls.client = Some(!self.reverse);
+                        }
+                    }
                     let grpc = b.headers.iter().any(|f| {
                         f.name.as_deref() == Some(b"content-type")
                             && f.value
@@ -2376,8 +2485,13 @@ impl Decode for Capture {
                     .field("Last stream", last_stream.to_string(), (9, 13));
                 item.layer.field("Error", e.clone(), (13, 17));
                 item.info = format!("GOAWAY {e}");
-                if let Ok(mut calls) = self.calls.lock() {
-                    calls.remove_where(|key| key.1 > last_stream);
+                if let Ok(mut calls) = self.calls.lock()
+                    && let Some(client) = calls.client
+                {
+                    let receiver_is_client = self.reverse != client;
+                    calls.remove_where(|key| {
+                        key.1 > last_stream && (key.1 % 2 == 1) == receiver_is_client
+                    });
                 }
             }
             8 if body.len() >= 4 => {
@@ -2454,6 +2568,7 @@ impl Present for Capture {
         packet.tag("malformed");
         packet.info = match error {
             Fail::Protocol(error @ CaptureError::GrpcTruncated { .. }) => error.to_string(),
+            Fail::Protocol(CaptureError::Http2(error)) => error.to_string(),
             _ => format!("HTTP/2: {error}"),
         };
     }
@@ -2602,6 +2717,28 @@ mod tests {
         assert!(Frame::parse(&raw(1, 8, 1, &[])).is_err());
     }
     #[test]
+    fn padding_over_mandatory_fields_is_a_protocol_error() {
+        // RFC 9113 4.2 and 6.2: a payload too short for its fields is a
+        // FRAME_SIZE_ERROR; padding that covers them is a PROTOCOL_ERROR.
+        for (kind, flags, body, code) in [
+            (0, 8, vec![], ErrorCode::FrameSizeError),
+            (1, 8, vec![], ErrorCode::FrameSizeError),
+            (1, 0x28, vec![0, 0, 0, 0], ErrorCode::FrameSizeError),
+            (1, 0x20, vec![0, 0, 0, 0], ErrorCode::FrameSizeError),
+            (1, 0x28, vec![2, 0, 0, 0, 3, 0], ErrorCode::ProtocolError),
+            (5, 8, vec![0, 0, 0], ErrorCode::FrameSizeError),
+            (5, 0, vec![0, 0, 0], ErrorCode::FrameSizeError),
+            (5, 8, vec![2, 0, 0, 0, 2], ErrorCode::ProtocolError),
+            (0, 8, vec![3, 1, 2], ErrorCode::ProtocolError),
+        ] {
+            assert_eq!(
+                Frame::parse(&raw(kind, flags, 1, &body)).unwrap_err().code,
+                code,
+                "kind {kind}, flags {flags:#x}, body {body:?}"
+            );
+        }
+    }
+    #[test]
     fn rejects_bad_lengths_zero_streams_and_invalid_values() {
         for (kind, stream, body) in [
             (2, 1, vec![0; 4]),
@@ -2713,6 +2850,104 @@ mod tests {
         assert!(c.retire(1));
         c.peer_window_update(&update).unwrap();
         assert!(c.failed().is_none());
+    }
+
+    #[test]
+    fn peer_reset_drops_in_flight_data_before_and_after_retire() {
+        for retired in [false, true] {
+            let mut c = Connection::client_side(Limits::default());
+            accept(&mut c, PREFACE);
+            accept(&mut c, &settings());
+            accept(&mut c, &raw(1, 4, 1, &[0x82]));
+            accept(&mut c, &raw(0, 0, 1, b"abc"));
+            c.peer_reset(1);
+            if retired {
+                assert!(c.retire(1));
+            }
+            // Padding also consumes connection credit on a reset stream.
+            assert!(accept(&mut c, &raw(0, 9, 1, b"\x02def\0\0")).is_empty());
+            assert_eq!(c.connection_window(), 65_535 - 9);
+            assert!(c.failed().is_none());
+            assert!(matches!(
+                accept(&mut c, &raw(6, 0, 0, &[0; 8]))[..],
+                [Event::Ping(_)]
+            ));
+        }
+    }
+
+    #[test]
+    fn peer_reset_trailers_keep_hpack_in_sync_after_retire() {
+        for retired in [false, true] {
+            let mut c = Connection::client_side(Limits::default());
+            accept(&mut c, PREFACE);
+            accept(&mut c, &settings());
+            accept(&mut c, &raw(1, 4, 1, &[0x82]));
+            c.peer_reset(1);
+            if retired {
+                assert!(c.retire(1));
+            }
+            // Incrementally indexed x: y, split over HEADERS and CONTINUATION.
+            assert!(accept(&mut c, &raw(1, 1, 1, &[0x40, 1, b'x'])).is_empty());
+            assert!(accept(&mut c, &raw(9, 4, 1, &[1, b'y'])).is_empty());
+            let events = accept(&mut c, &raw(1, 4, 3, &[0x82, 0xbe]));
+            assert!(matches!(&events[..], [Event::Headers { fields, .. }]
+                if fields[1] == hpack::Field::new("x", "y")));
+            assert!(c.failed().is_none());
+        }
+    }
+
+    #[test]
+    fn peer_reset_records_stay_bounded_and_preserve_other_streams() {
+        let mut c = Connection::server_side(Limits {
+            max_streams: 2,
+            ..Limits::default()
+        });
+        accept(&mut c, &settings());
+        accept(&mut c, &raw(1, 4, 3, &[0x88]));
+        for stream in [1, 2, 4, 5, 6, 7] {
+            accept(&mut c, &raw(1, 4, stream, &[0x88]));
+            c.peer_reset(stream);
+            assert!(c.retire(stream));
+            assert!(c.peer_resets.len() <= 2);
+        }
+        for stream in [1, 2, 4, 5, 6, 7] {
+            assert!(accept(&mut c, &raw(0, 1, stream, b"late")).is_empty());
+            assert!(accept(&mut c, &raw(1, 5, stream, &[])).is_empty());
+        }
+        assert_eq!(c.connection_window(), 65_535 - 24);
+        assert!(matches!(
+            accept(&mut c, &raw(0, 1, 3, b"done"))[..],
+            [Event::Data { stream: 3, .. }]
+        ));
+        assert!(c.failed().is_none());
+        // A tracked stream ended normally still rejects further DATA.
+        assert_eq!(c.push(&raw(0, 0, 3, b"late")), 13);
+        assert_eq!(c.next().unwrap().unwrap_err().code, ErrorCode::StreamClosed);
+    }
+
+    #[test]
+    fn peer_reset_before_headers_keeps_connection_checks() {
+        let mut c = Connection::server_side(Limits::default());
+        accept(&mut c, &settings());
+        c.peer_reset(1);
+        assert!(accept(&mut c, &raw(1, 4, 1, &[0x88])).is_empty());
+        assert!(accept(&mut c, &raw(0, 0, 1, b"late")).is_empty());
+        assert_eq!(c.stream_window(1), None);
+        c.window = 3;
+        assert_eq!(c.push(&raw(0, 1, 1, b"late")), 13);
+        assert_eq!(
+            c.next().unwrap().unwrap_err().code,
+            ErrorCode::FlowControlError
+        );
+
+        let mut c = Connection::server_side(Limits::default());
+        accept(&mut c, &settings());
+        c.peer_reset(1);
+        assert_eq!(c.push(&raw(1, 5, 1, &[0xff])), 10);
+        assert_eq!(
+            c.next().unwrap().unwrap_err().code,
+            ErrorCode::CompressionError
+        );
     }
 
     #[test]
@@ -2837,6 +3072,7 @@ mod tests {
         let [a, b] = Capture::pair(32);
         let mut a = Stream::new(a);
         let mut b = Stream::new(b);
+        pump(&mut b, PREFACE, |_| {}).unwrap();
         let mut block = Vec::new();
         hpack::Encoder::new(0)
             .encode_block(
@@ -3083,6 +3319,43 @@ mod tests {
         assert_eq!(budget.held(), 2560);
         drop(connections);
         assert_eq!(budget.held(), 0);
+    }
+
+    #[test]
+    fn completed_grpc_messages_prune_spans_but_keep_partial_messages() {
+        let mut capture = Stream::new(Capture::default());
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("content-type", "application/grpc")],
+                &mut block,
+            )
+            .unwrap();
+        pump(&mut capture, &raw(1, 4, 1, &block), |_| {}).unwrap();
+        for _ in 0..300 {
+            // One whole empty message and the start of the next message.
+            pump(&mut capture, &raw(0, 0, 1, &[0; 7]), |item| {
+                assert_eq!(item.messages.len(), 1);
+                assert!(item.messages[0].start.is_some());
+            })
+            .unwrap();
+            assert_eq!(
+                capture.decoder().calls.lock().unwrap().state[&(false, 1)]
+                    .spans
+                    .len(),
+                1
+            );
+            pump(&mut capture, &raw(0, 0, 1, &[0; 3]), |item| {
+                assert_eq!(item.messages.len(), 1);
+                assert!(item.messages[0].start.is_none());
+            })
+            .unwrap();
+            assert!(
+                capture.decoder().calls.lock().unwrap().state[&(false, 1)]
+                    .spans
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

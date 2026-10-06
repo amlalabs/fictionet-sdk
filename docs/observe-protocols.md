@@ -77,8 +77,9 @@ can retain a terminal error while reporting it once.
 
 HTTP/2 uses `stdlib::http2::Capture` through `register_with_buffer`, with
 `http2::CAPTURE_READ_AHEAD`. Copy `src/stdlib/http2.rs` to customize both
-framing and presentation. The file uses only public SDK APIs. Strict
-`Frames` and `Connection` check RFC 9113 framing and directional state.
+framing and presentation. The file uses only public SDK APIs.
+The presenter lives here to share the module's private header assembly.
+Strict `Frames` and `Connection` check RFC 9113 framing and directional state.
 `Connection::peer_settings` and `peer_window_update` apply control frames
 from the other direction. `lost` clears state and stops decoding because
 a TCP gap does not identify the next frame boundary.
@@ -87,6 +88,10 @@ Capture policy keeps complete frames already present in bounded read-ahead.
 An incomplete oversized frame becomes a header-only item, followed by `Skip`
 for its payload. Header blocks share the stdlib HPACK decoder. Recognized
 gRPC calls use `grpc::Messages` through `codec::Demux`, with an 8 MiB aggregate
-DATA budget across both directions created by `http2::Capture::pair`. Message layers point at payload bytes when one
+DATA budget shared by every connection from the built-in registry and its
+clones, including nested TLS streams, through `http2::Capture::pair_in`.
+Message layers point at payload bytes when one
 contiguous range is available; otherwise they use a reassembly buffer.
 Copy `src/stdlib/grpc.rs` to customize message decoding and its `Present` impl.
+To use that copy in HTTP/2 display, also copy `http2.rs` and change its
+`grpc` import to the copied module.

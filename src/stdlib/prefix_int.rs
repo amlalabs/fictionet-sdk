@@ -1,6 +1,6 @@
 //! RFC 7541 prefix integers shared by HPACK and QPACK.
 //!
-//! Use [`Integer`] for a complete wire value. [`read`] and [`write`] handle
+//! Use [`Integer`] for a complete wire value. [`read`] and [`write`](fn@write) handle
 //! integers inside a larger header block while preserving its prefix bits.
 
 use fictionet::stdlib::codec::Wire;

@@ -84,6 +84,17 @@ impl Spans {
     pub fn skip(&mut self, outer_len: usize) {
         self.push(outer_len, 0);
     }
+    /// Drops mappings whose inner end is at or below `offset`.
+    /// Keeps partial mappings and both next-byte offsets unchanged.
+    pub fn discard_before(&mut self, offset: u64) {
+        while self
+            .ring
+            .front()
+            .is_some_and(|span| span.inner.end <= offset)
+        {
+            self.ring.pop_front();
+        }
+    }
     /// Retained mappings, oldest first.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Span> {
         self.ring.iter()
