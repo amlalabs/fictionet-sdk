@@ -11,9 +11,9 @@
 //! Kafka protocol guide (kafka.apache.org/protocol) and the message
 //! definitions in Kafka's source.
 //!
-//! Nothing here reads a socket. A world that plays a broker feeds the
-//! bytes it reads from a TCP connection to [`Frames`] with
-//! [`super::codec::Stream`], gets each frame's payload back, reads it
+//! Nothing here reads a socket. A world that plays a broker passes TCP
+//! bytes to [`Stream<Frames>`](super::codec::Stream), gets each frame's
+//! payload back, reads it
 //! with [`Request::parse`], and writes the reply from
 //! [`Response::to_frame`] back to the connection. Which topics exist,
 //! and what the broker says about them, is up to world code.
@@ -33,17 +33,13 @@
 //! struct. A world that wants less sets a lower frame limit with
 //! [`Frames::with_limit`].
 //!
-//! Writers cut strings and arrays that are too long to read back, and
-//! refuse with [`Error::Invalid`] the values Kafka's own client refuses to
-//! write: a non-default value in a field the version lacks, a topic asked
-//! for by ID before Metadata version 12, and the like. Readers refuse the
-//! same values, so whatever one reads, the other writes.
-//!
-//! Use [`Frames`] with [`super::codec::Stream`] for bounded input, explicit
-//! EOF handling and errors reported once.
+//! Writers refuse with [`Error::Unwritable`] any value that cannot be
+//! preserved in its version, including excess lengths, invalid tags, and
+//! non-default fields that version lacks. Primitive fields have named
+//! wire values, such as [`Int32`], [`CompactString`], and [`TaggedFields`].
 //!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, finish, pump};
+//! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 //! use fictionet::stdlib::kafka::{
 //!     api_key, ApiVersion, ApiVersionsResponse, Frames, Request, RequestBody, Response, ResponseBody,
 //!     ResponseHeader,
@@ -66,14 +62,16 @@
 //!     header: ResponseHeader { correlation_id: request.header.correlation_id, tagged_fields: vec![] },
 //!     body: ResponseBody::ApiVersions(versions),
 //! };
-//! let bytes = response.to_frame(request.header.api_key, request.header.api_version).unwrap();
+//! let bytes = response.to_frame(request.header.api_key, request.header.api_version).unwrap().to_bytes().unwrap();
 //! assert_eq!(bytes, [0, 0, 0, 16, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 18, 0, 0, 0, 4]);
 //! assert_eq!(Response::parse(&bytes[4..], api_key::API_VERSIONS, 0).unwrap(), response);
 //! ```
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+extern crate self as fictionet;
+
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
@@ -99,44 +97,74 @@ pub const METADATA_MAX_VERSION: i16 = 13;
 
 /// API keys: the numbers that name each request type.
 pub mod api_key {
-    #![allow(missing_docs)]
+    /// Produce (0).
     pub const PRODUCE: i16 = 0;
+    /// Fetch (1).
     pub const FETCH: i16 = 1;
+    /// List offsets (2).
     pub const LIST_OFFSETS: i16 = 2;
+    /// Metadata (3).
     pub const METADATA: i16 = 3;
+    /// Controlled shutdown (7).
     pub const CONTROLLED_SHUTDOWN: i16 = 7;
+    /// Offset commit (8).
     pub const OFFSET_COMMIT: i16 = 8;
+    /// Offset fetch (9).
     pub const OFFSET_FETCH: i16 = 9;
+    /// Find coordinator (10).
     pub const FIND_COORDINATOR: i16 = 10;
+    /// Join group (11).
     pub const JOIN_GROUP: i16 = 11;
+    /// Heartbeat (12).
     pub const HEARTBEAT: i16 = 12;
+    /// Leave group (13).
     pub const LEAVE_GROUP: i16 = 13;
+    /// Sync group (14).
     pub const SYNC_GROUP: i16 = 14;
+    /// Describe groups (15).
     pub const DESCRIBE_GROUPS: i16 = 15;
+    /// List groups (16).
     pub const LIST_GROUPS: i16 = 16;
+    /// Sasl handshake (17).
     pub const SASL_HANDSHAKE: i16 = 17;
+    /// Api versions (18).
     pub const API_VERSIONS: i16 = 18;
+    /// Create topics (19).
     pub const CREATE_TOPICS: i16 = 19;
+    /// Delete topics (20).
     pub const DELETE_TOPICS: i16 = 20;
+    /// Init producer id (22).
     pub const INIT_PRODUCER_ID: i16 = 22;
+    /// Sasl authenticate (36).
     pub const SASL_AUTHENTICATE: i16 = 36;
 }
 
 /// Error codes a broker puts in responses. These are the ones a world
 /// playing a broker needs most. Kafka defines many more.
 pub mod error_code {
-    #![allow(missing_docs)]
+    /// None (0).
     pub const NONE: i16 = 0;
+    /// Unknown server error (-1).
     pub const UNKNOWN_SERVER_ERROR: i16 = -1;
+    /// Corrupt message (2).
     pub const CORRUPT_MESSAGE: i16 = 2;
+    /// Unknown topic or partition (3).
     pub const UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+    /// Leader not available (5).
     pub const LEADER_NOT_AVAILABLE: i16 = 5;
+    /// Not leader or follower (6).
     pub const NOT_LEADER_OR_FOLLOWER: i16 = 6;
+    /// Invalid topic exception (17).
     pub const INVALID_TOPIC_EXCEPTION: i16 = 17;
+    /// Topic authorization failed (29).
     pub const TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+    /// Cluster authorization failed (31).
     pub const CLUSTER_AUTHORIZATION_FAILED: i16 = 31;
+    /// Unsupported version (35).
     pub const UNSUPPORTED_VERSION: i16 = 35;
+    /// Invalid request (42).
     pub const INVALID_REQUEST: i16 = 42;
+    /// Unknown topic id (100).
     pub const UNKNOWN_TOPIC_ID: i16 = 100;
 }
 
@@ -195,7 +223,7 @@ pub enum Error {
     /// A frame's size was negative or over the limit. The stream cannot be
     /// read any further, and a broker closes the connection.
     FrameSize(i32),
-    /// A frame payload to write is longer than [`MAX_FRAME`].
+    /// An input payload is longer than [`MAX_FRAME`].
     TooLarge(usize),
     /// A varint ran past its last allowed byte.
     Varint,
@@ -218,9 +246,8 @@ pub enum Error {
         /// The version asked for.
         api_version: i16,
     },
-    /// A body that does not match the API key and version it is written
-    /// for.
-    Mismatch,
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// This many bytes were left after the last field.
     Trailing(usize),
     /// A value Kafka does not allow here: a field set to something other
@@ -246,7 +273,7 @@ impl core::fmt::Display for Error {
             Error::UnsupportedVersion { api_key, api_version } => {
                 write!(f, "no full body for API {api_key} version {api_version}")
             }
-            Error::Mismatch => f.write_str("body does not match the API key and version"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Trailing(n) => write!(f, "{n} bytes left after the last field"),
             Error::Invalid(what) => write!(f, "not allowed: {what}"),
         }
@@ -569,126 +596,375 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Writes Kafka's primitive types to a growing buffer. Strings longer than
-/// [`MAX_STRING`] are cut at a character boundary, and byte strings and
-/// tagged-field values longer than [`MAX_FRAME`] are cut, so what a
-/// [`Reader`] reads back is what was written. An array count over
-/// [`MAX_ARRAY`] is written as [`MAX_ARRAY`], so write at most that many
-/// elements after one.
+// Scalar and field units share exact parsing and transactional writing.
+macro_rules! wire_field {
+    ($name:ident, $read:expr, $write:expr) => {
+        impl Wire for $name {
+            type ParseError = Error;
+            type WriteError = Error;
+
+            /// Reads exactly one field. Refuses invalid encodings, excess
+            /// lengths or counts, incomplete input, and trailing bytes.
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                if bytes.len() > MAX_FRAME + 5 { return Err(Error::TooLarge(bytes.len())); }
+                let mut reader = Reader::new(bytes);
+                let value = ($read)(&mut reader)?;
+                reader.finish()?;
+                Ok(Self(value))
+            }
+
+            /// Appends the field. Refuses excess lengths or counts and
+            /// invalid tagged fields without changing `out`.
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+                let mut writer = Writer::new();
+                writer.limit = MAX_FRAME + 5;
+                ($write)(&mut writer, &self.0);
+                out.extend_from_slice(&writer.finish()?);
+                Ok(())
+            }
+        }
+    };
+}
+
+/// A BOOLEAN; zero reads as false and every other byte as true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Boolean(
+    /// The field value.
+    pub bool,
+);
+
+wire_field!(Boolean, |r: &mut Reader<'_>| r.bool(), |w: &mut Writer, v: &bool| w.bool(*v));
+
+/// An INT8.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Int8(
+    /// The field value.
+    pub i8,
+);
+
+wire_field!(Int8, |r: &mut Reader<'_>| r.i8(), |w: &mut Writer, v: &i8| w.i8(*v));
+
+/// An unsigned byte.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uint8(
+    /// The field value.
+    pub u8,
+);
+
+wire_field!(Uint8, |r: &mut Reader<'_>| r.u8(), |w: &mut Writer, v: &u8| w.u8(*v));
+
+/// An INT16.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Int16(
+    /// The field value.
+    pub i16,
+);
+
+wire_field!(Int16, |r: &mut Reader<'_>| r.i16(), |w: &mut Writer, v: &i16| w.i16(*v));
+
+/// A UINT16.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uint16(
+    /// The field value.
+    pub u16,
+);
+
+wire_field!(Uint16, |r: &mut Reader<'_>| r.u16(), |w: &mut Writer, v: &u16| w.u16(*v));
+
+/// An INT32.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Int32(
+    /// The field value.
+    pub i32,
+);
+
+wire_field!(Int32, |r: &mut Reader<'_>| r.i32(), |w: &mut Writer, v: &i32| w.i32(*v));
+
+/// A UINT32.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uint32(
+    /// The field value.
+    pub u32,
+);
+
+wire_field!(Uint32, |r: &mut Reader<'_>| r.u32(), |w: &mut Writer, v: &u32| w.u32(*v));
+
+/// An INT64.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Int64(
+    /// The field value.
+    pub i64,
+);
+
+wire_field!(Int64, |r: &mut Reader<'_>| r.i64(), |w: &mut Writer, v: &i64| w.i64(*v));
+
+/// A FLOAT64, compared by its bits.
+#[derive(Clone, Debug)]
+pub struct Float64(
+    /// The field value.
+    pub f64,
+);
+
+wire_field!(Float64, |r: &mut Reader<'_>| r.f64(), |w: &mut Writer, v: &f64| w.f64(*v));
+
+/// A UUID.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Uuid(
+    /// The field value.
+    pub [u8; 16],
+);
+
+wire_field!(Uuid, |r: &mut Reader<'_>| r.uuid(), |w: &mut Writer, v: &[u8; 16]| w.uuid(v));
+
+/// An UNSIGNED_VARINT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsignedVarint(
+    /// The field value.
+    pub u32,
+);
+
+wire_field!(UnsignedVarint, |r: &mut Reader<'_>| r.uvarint(), |w: &mut Writer, v: &u32| w.uvarint(*v));
+
+/// A zigzag VARINT.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Varint(
+    /// The field value.
+    pub i32,
+);
+
+wire_field!(Varint, |r: &mut Reader<'_>| r.varint(), |w: &mut Writer, v: &i32| w.varint(*v));
+
+/// A zigzag VARLONG.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Varlong(
+    /// The field value.
+    pub i64,
+);
+
+wire_field!(Varlong, |r: &mut Reader<'_>| r.varlong(), |w: &mut Writer, v: &i64| w.varlong(*v));
+
+/// A STRING with a signed 16-bit length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct String16(
+    /// The field value.
+    pub String,
+);
+
+wire_field!(String16, |r: &mut Reader<'_>| r.string(), |w: &mut Writer, v: &String| w.string(v));
+
+/// A NULLABLE_STRING.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NullableString(
+    /// The field value.
+    pub Option<String>,
+);
+
+wire_field!(NullableString, |r: &mut Reader<'_>| r.nullable_string(), |w: &mut Writer, v: &Option<String>| w.nullable_string(v.as_deref()));
+
+/// A COMPACT_STRING.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactString(
+    /// The field value.
+    pub String,
+);
+
+wire_field!(CompactString, |r: &mut Reader<'_>| r.compact_string(), |w: &mut Writer, v: &String| w.compact_string(v));
+
+/// A COMPACT_NULLABLE_STRING.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactNullableString(
+    /// The field value.
+    pub Option<String>,
+);
+
+wire_field!(CompactNullableString, |r: &mut Reader<'_>| r.compact_nullable_string(), |w: &mut Writer, v: &Option<String>| w.compact_nullable_string(v.as_deref()));
+
+/// A BYTES field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BytesValue(
+    /// The field value.
+    pub Vec<u8>,
+);
+
+wire_field!(BytesValue, |r: &mut Reader<'_>| r.bytes().map(|bytes| bytes.to_vec()), |w: &mut Writer, v: &Vec<u8>| w.bytes(v));
+
+/// A NULLABLE_BYTES field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NullableBytes(
+    /// The field value.
+    pub Option<Vec<u8>>,
+);
+
+wire_field!(NullableBytes, |r: &mut Reader<'_>| r.nullable_bytes().map(|value| value.map(|bytes| bytes.to_vec())), |w: &mut Writer, v: &Option<Vec<u8>>| w.nullable_bytes(v.as_deref()));
+
+/// A COMPACT_BYTES field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactBytes(
+    /// The field value.
+    pub Vec<u8>,
+);
+
+wire_field!(CompactBytes, |r: &mut Reader<'_>| r.compact_bytes().map(|bytes| bytes.to_vec()), |w: &mut Writer, v: &Vec<u8>| w.compact_bytes(v));
+
+/// A COMPACT_NULLABLE_BYTES field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactNullableBytes(
+    /// The field value.
+    pub Option<Vec<u8>>,
+);
+
+wire_field!(CompactNullableBytes, |r: &mut Reader<'_>| r.compact_nullable_bytes().map(|value| value.map(|bytes| bytes.to_vec())), |w: &mut Writer, v: &Option<Vec<u8>>| w.compact_nullable_bytes(v.as_deref()));
+
+/// A ARRAY count alone; elements are separate wire values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArrayLength(
+    /// The field value.
+    pub Option<usize>,
+);
+
+wire_field!(ArrayLength, |r: &mut Reader<'_>| read_array_count(r, false), |w: &mut Writer, v: &Option<usize>| w.array_len(*v));
+
+/// A COMPACT_ARRAY count alone; elements are separate wire values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactArrayLength(
+    /// The field value.
+    pub Option<usize>,
+);
+
+wire_field!(CompactArrayLength, |r: &mut Reader<'_>| read_array_count(r, true), |w: &mut Writer, v: &Option<usize>| w.compact_array_len(*v));
+
+/// A tagged-field section in strictly increasing tag order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaggedFields(
+    /// The field value.
+    pub Vec<TaggedField>,
+);
+
+wire_field!(TaggedFields, |r: &mut Reader<'_>| r.tagged_fields(), |w: &mut Writer, v: &Vec<TaggedField>| w.tagged_fields(v));
+
+impl PartialEq for Float64 {
+    fn eq(&self, other: &Self) -> bool { self.0.to_bits() == other.0.to_bits() }
+}
+
+impl Eq for Float64 {}
+
+fn read_array_count(reader: &mut Reader<'_>, compact: bool) -> Result<Option<usize>, Error> {
+    let count = if compact { i64::from(reader.uvarint()?) - 1 } else { i64::from(reader.i32()?) };
+    match count {
+        -1 => Ok(None),
+        n if n >= 0 && n <= MAX_ARRAY as i64 => Ok(Some(n as usize)),
+        n => Err(Error::Length(n)),
+    }
+}
+
+/// Builds a bounded encoding for a Wire value.
 #[derive(Clone, Debug, Default)]
-pub struct Writer {
+struct Writer {
     out: Vec<u8>,
+    failed: bool,
+    limit: usize,
 }
 
 impl Writer {
     /// A writer with nothing written.
-    pub fn new() -> Writer {
-        Writer::default()
+    fn new() -> Writer {
+        Writer { out: Vec::new(), failed: false, limit: MAX_FRAME }
     }
 
-    /// The bytes written.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.out
+    fn finish(self) -> Result<Vec<u8>, Error> {
+        if self.failed { Err(Error::Unwritable) } else { Ok(self.out) }
     }
 
-    /// How many bytes have been written.
-    pub fn len(&self) -> usize {
-        self.out.len()
-    }
-
-    /// Whether nothing has been written.
-    pub fn is_empty(&self) -> bool {
-        self.out.is_empty()
-    }
-
-    /// Bytes as they are, with no length.
-    pub fn raw(&mut self, b: &[u8]) {
-        self.out.extend_from_slice(b);
+    fn raw(&mut self, bytes: &[u8]) {
+        if self.failed || bytes.len() > self.limit.saturating_sub(self.out.len()) {
+            self.failed = true;
+        } else {
+            self.out.extend_from_slice(bytes);
+        }
     }
 
     /// A BOOLEAN.
-    pub fn bool(&mut self, v: bool) {
-        self.out.push(u8::from(v));
+    fn bool(&mut self, v: bool) {
+        self.u8(u8::from(v));
     }
 
-    /// One unsigned byte.
-    pub fn u8(&mut self, v: u8) {
-        self.out.push(v);
+    fn u8(&mut self, value: u8) {
+        self.raw(&[value]);
     }
 
     /// An INT8.
-    pub fn i8(&mut self, v: i8) {
+    fn i8(&mut self, v: i8) {
         self.raw(&v.to_be_bytes());
     }
 
     /// An INT16.
-    pub fn i16(&mut self, v: i16) {
+    fn i16(&mut self, v: i16) {
         self.raw(&v.to_be_bytes());
     }
 
     /// A UINT16.
-    pub fn u16(&mut self, v: u16) {
+    fn u16(&mut self, v: u16) {
         self.raw(&v.to_be_bytes());
     }
 
     /// An INT32.
-    pub fn i32(&mut self, v: i32) {
+    fn i32(&mut self, v: i32) {
         self.raw(&v.to_be_bytes());
     }
 
     /// A UINT32.
-    pub fn u32(&mut self, v: u32) {
+    fn u32(&mut self, v: u32) {
         self.raw(&v.to_be_bytes());
     }
 
     /// An INT64.
-    pub fn i64(&mut self, v: i64) {
+    fn i64(&mut self, v: i64) {
         self.raw(&v.to_be_bytes());
     }
 
     /// A FLOAT64.
-    pub fn f64(&mut self, v: f64) {
+    fn f64(&mut self, v: f64) {
         self.raw(&v.to_be_bytes());
     }
 
     /// A UUID.
-    pub fn uuid(&mut self, v: &[u8; 16]) {
+    fn uuid(&mut self, v: &[u8; 16]) {
         self.raw(v);
     }
 
     /// An UNSIGNED_VARINT, in the fewest bytes.
-    pub fn uvarint(&mut self, mut v: u32) {
+    fn uvarint(&mut self, mut v: u32) {
         while v >= 0x80 {
-            self.out.push((v as u8 & 0x7f) | 0x80);
+            self.u8((v as u8 & 0x7f) | 0x80);
             v >>= 7;
         }
-        self.out.push(v as u8);
+        self.u8(v as u8);
     }
 
     /// A VARINT.
-    pub fn varint(&mut self, v: i32) {
+    fn varint(&mut self, v: i32) {
         self.uvarint(((v << 1) ^ (v >> 31)) as u32);
     }
 
     /// A VARLONG.
-    pub fn varlong(&mut self, v: i64) {
+    fn varlong(&mut self, v: i64) {
         let mut u = ((v << 1) ^ (v >> 63)) as u64;
         while u >= 0x80 {
-            self.out.push((u as u8 & 0x7f) | 0x80);
+            self.u8((u as u8 & 0x7f) | 0x80);
             u >>= 7;
         }
-        self.out.push(u as u8);
+        self.u8(u as u8);
     }
 
     /// A STRING.
-    pub fn string(&mut self, s: &str) {
-        let s = cut(s);
+    fn string(&mut self, s: &str) {
+        if s.len() > MAX_STRING { self.failed = true; return; }
         self.i16(s.len() as i16);
         self.raw(s.as_bytes());
     }
 
     /// A NULLABLE_STRING.
-    pub fn nullable_string(&mut self, s: Option<&str>) {
+    fn nullable_string(&mut self, s: Option<&str>) {
         match s {
             Some(s) => self.string(s),
             None => self.i16(-1),
@@ -696,14 +972,14 @@ impl Writer {
     }
 
     /// A COMPACT_STRING.
-    pub fn compact_string(&mut self, s: &str) {
-        let s = cut(s);
+    fn compact_string(&mut self, s: &str) {
+        if s.len() > MAX_STRING { self.failed = true; return; }
         self.uvarint(s.len() as u32 + 1);
         self.raw(s.as_bytes());
     }
 
     /// A COMPACT_NULLABLE_STRING.
-    pub fn compact_nullable_string(&mut self, s: Option<&str>) {
+    fn compact_nullable_string(&mut self, s: Option<&str>) {
         match s {
             Some(s) => self.compact_string(s),
             None => self.uvarint(0),
@@ -711,14 +987,14 @@ impl Writer {
     }
 
     /// BYTES.
-    pub fn bytes(&mut self, b: &[u8]) {
-        let b = &b[..b.len().min(MAX_FRAME)];
+    fn bytes(&mut self, b: &[u8]) {
+        if b.len() > MAX_FRAME { self.failed = true; return; }
         self.i32(b.len() as i32);
         self.raw(b);
     }
 
     /// NULLABLE_BYTES.
-    pub fn nullable_bytes(&mut self, b: Option<&[u8]>) {
+    fn nullable_bytes(&mut self, b: Option<&[u8]>) {
         match b {
             Some(b) => self.bytes(b),
             None => self.i32(-1),
@@ -726,52 +1002,48 @@ impl Writer {
     }
 
     /// COMPACT_BYTES.
-    pub fn compact_bytes(&mut self, b: &[u8]) {
-        let b = &b[..b.len().min(MAX_FRAME)];
+    fn compact_bytes(&mut self, b: &[u8]) {
+        if b.len() > MAX_FRAME { self.failed = true; return; }
         self.uvarint(b.len() as u32 + 1);
         self.raw(b);
     }
 
     /// COMPACT_NULLABLE_BYTES.
-    pub fn compact_nullable_bytes(&mut self, b: Option<&[u8]>) {
+    fn compact_nullable_bytes(&mut self, b: Option<&[u8]>) {
         match b {
             Some(b) => self.compact_bytes(b),
             None => self.uvarint(0),
         }
     }
 
-    /// An ARRAY's element count, or `None` for a null array. A count over
-    /// [`MAX_ARRAY`] is written as [`MAX_ARRAY`].
-    pub fn array_len(&mut self, n: Option<usize>) {
+    /// An ARRAY count, refusing counts over MAX_ARRAY.
+    fn array_len(&mut self, n: Option<usize>) {
         match n {
-            Some(n) => self.i32(n.min(MAX_ARRAY) as i32),
+            Some(n) if n <= MAX_ARRAY => self.i32(n as i32),
+            Some(_) => self.failed = true,
             None => self.i32(-1),
         }
     }
 
-    /// A COMPACT_ARRAY's element count, or `None` for a null array. A
-    /// count over [`MAX_ARRAY`] is written as [`MAX_ARRAY`].
-    pub fn compact_array_len(&mut self, n: Option<usize>) {
+    /// A COMPACT_ARRAY count, refusing counts over MAX_ARRAY.
+    fn compact_array_len(&mut self, n: Option<usize>) {
         match n {
-            Some(n) => self.uvarint(n.min(MAX_ARRAY) as u32 + 1),
+            Some(n) if n <= MAX_ARRAY => self.uvarint(n as u32 + 1),
+            Some(_) => self.failed = true,
             None => self.uvarint(0),
         }
     }
 
-    /// A tagged-field section. Fields are written in rising tag order, a
-    /// repeated tag keeps only its first field, and fields with a tag over
-    /// [`MAX_TAG`] or past [`MAX_TAGGED_FIELDS`] are left out.
-    pub fn tagged_fields(&mut self, fields: &[TaggedField]) {
-        let mut sorted: Vec<&TaggedField> = fields.iter().filter(|f| f.tag <= MAX_TAG).collect();
-        sorted.sort_by_key(|f| f.tag);
-        sorted.dedup_by_key(|f| f.tag);
-        sorted.truncate(MAX_TAGGED_FIELDS);
-        self.uvarint(sorted.len() as u32);
-        for f in sorted {
-            let data = &f.data[..f.data.len().min(MAX_FRAME)];
-            self.uvarint(f.tag);
-            self.uvarint(data.len() as u32);
-            self.raw(data);
+    fn tagged_fields(&mut self, fields: &[TaggedField]) {
+        if fields.len() > MAX_TAGGED_FIELDS
+            || fields.windows(2).any(|pair| pair[0].tag >= pair[1].tag)
+            || fields.iter().any(|field| field.tag > MAX_TAG || field.data.len() > MAX_FRAME)
+        { self.failed = true; return; }
+        self.uvarint(fields.len() as u32);
+        for field in fields {
+            self.uvarint(field.tag);
+            self.uvarint(field.data.len() as u32);
+            self.raw(&field.data);
         }
     }
 
@@ -792,11 +1064,13 @@ impl Writer {
     fn tags_f(&mut self, flex: bool, fields: &[TaggedField]) {
         if flex {
             self.tagged_fields(fields);
+        } else if !fields.is_empty() {
+            self.failed = true;
         }
     }
 
     fn i32s(&mut self, flex: bool, v: &[i32]) {
-        let v = capped(v);
+        if v.len() > MAX_ARRAY { self.failed = true; return; }
         self.arr_f(flex, Some(v.len()));
         for &x in v {
             self.i32(x);
@@ -804,31 +1078,19 @@ impl Writer {
     }
 }
 
-/// `s`, cut to at most [`MAX_STRING`] bytes at a character boundary.
-fn cut(s: &str) -> &str {
-    if s.len() <= MAX_STRING {
-        return s;
-    }
-    let mut end = MAX_STRING;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// `v`, cut to at most [`MAX_ARRAY`] elements.
-fn capped<T>(v: &[T]) -> &[T] {
-    &v[..v.len().min(MAX_ARRAY)]
+/// Checks a container count before walking or copying its elements.
+fn bounded<T>(values: &[T]) -> Result<&[T], Error> {
+    if values.len() > MAX_ARRAY { Err(Error::Unwritable) } else { Ok(values) }
 }
 
 /// Reads the frame at the start of `b`: a 4-byte size, then the payload.
 /// It returns `Ok(None)` if `b` holds only part of one, and otherwise the
 /// payload and how many bytes of `b` the frame took. A size that is
 /// negative or over `limit` is an error, known from the first 4 bytes.
-pub fn parse_frame(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Error> {
+fn parse_frame(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Error> {
     let Some(head) = b.get(..SIZE_LEN) else { return Ok(None) };
     let size = i32::from_be_bytes([head[0], head[1], head[2], head[3]]);
-    if size < 0 || size as usize > limit {
+    if size < 0 || size as usize > limit.min(MAX_FRAME) {
         return Err(Error::FrameSize(size));
     }
     let end = SIZE_LEN + size as usize;
@@ -836,18 +1098,6 @@ pub fn parse_frame(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, Err
         Some(payload) => Ok(Some((payload, end))),
         None => Ok(None),
     }
-}
-
-/// A frame holding `payload`: its size, then its bytes. A payload longer
-/// than [`MAX_FRAME`] is an error.
-pub fn frame(payload: &[u8]) -> Result<Vec<u8>, Error> {
-    if payload.len() > MAX_FRAME {
-        return Err(Error::TooLarge(payload.len()));
-    }
-    let mut out = Vec::with_capacity(SIZE_LEN + payload.len());
-    out.extend_from_slice(&(payload.len() as i32).to_be_bytes());
-    out.extend_from_slice(payload);
-    Ok(out)
 }
 
 /// The correlation ID at the start of a response payload, so a client can
@@ -871,7 +1121,8 @@ impl Wire for Frame {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    /// Reads exactly one frame. Refuses negative or excess sizes,
+    /// incomplete input, and trailing bytes.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         match parse_frame(b, MAX_FRAME)? {
             Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
@@ -880,10 +1131,12 @@ impl Wire for Frame {
         }
     }
 
-    /// Appends at most [`SIZE_LEN`] plus [`MAX_FRAME`] bytes.
-    /// Leaves `out` unchanged on error.
+    /// Appends a length prefix and payload. Refuses payloads over
+    /// [`MAX_FRAME`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&frame(&self.0)?);
+        if self.0.len() > MAX_FRAME { return Err(Error::Unwritable); }
+        out.extend_from_slice(&(self.0.len() as i32).to_be_bytes());
+        out.extend_from_slice(&self.0);
         Ok(())
     }
 }
@@ -896,7 +1149,7 @@ impl Wire for Frame {
 /// through [`Request::parse`] to receive body errors as items.
 ///
 /// ```
-/// use fictionet::stdlib::codec::{Decode, Stream, finish, pump};
+/// use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
 /// use fictionet::stdlib::kafka::{Frames, Request};
 ///
 /// let bytes = [0, 0, 0, 11, 0, 18, 0, 0, 0, 0, 0, 1, 0, 1, b'x'];
@@ -955,98 +1208,6 @@ impl Decode for Frames {
     }
 }
 
-/// Splits a Kafka byte stream into frame payloads. Feed it the bytes a
-/// connection reads, in order, and take payloads out until it has none.
-/// A frame size that is negative or over the limit breaks the stream as
-/// soon as its 4 bytes are fed, and the bytes after it are not kept.
-///
-/// This compatibility decoder buffers every byte fed without a limit until
-/// it is taken out or a framing error clears the buffer. Use [`Frames`] with
-/// [`super::codec::Stream`] for bounded input, EOF handling and errors
-/// reported once.
-#[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with kafka::Frames")]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small frames costs time in proportion to their bytes.
-    start: usize,
-    limit: usize,
-    failed: Option<Error>,
-}
-
-#[allow(deprecated)]
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder::new()
-    }
-}
-
-#[allow(deprecated)]
-impl Decoder {
-    /// A decoder holding no bytes, which takes frames up to [`MAX_FRAME`].
-    pub fn new() -> Decoder {
-        Decoder::with_limit(MAX_FRAME)
-    }
-
-    /// A decoder that takes frames up to `limit` bytes, or [`MAX_FRAME`]
-    /// if `limit` is higher.
-    pub fn with_limit(limit: usize) -> Decoder {
-        Decoder { buf: Vec::new(), start: 0, limit: limit.min(MAX_FRAME), failed: None }
-    }
-
-    /// Adds bytes read from the connection. After an error the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
-            if let Err(e) = parse_frame(&self.buf[self.start..], self.limit) {
-                self.fail(e);
-            }
-        }
-    }
-
-    fn fail(&mut self, e: Error) {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.start = 0;
-    }
-
-    /// The next whole frame's payload, if one has come. It returns `None`
-    /// when it needs more bytes, and keeps returning the same error once
-    /// the stream has broken. A decoder holds every byte fed and not yet
-    /// taken out, so at most one frame and its size beyond what has been
-    /// taken out, plus what one `feed` added. Bytes already taken out are
-    /// dropped by the next `feed` once they make up half the buffer.
-    pub fn next_frame(&mut self) -> Option<Result<Vec<u8>, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match parse_frame(&self.buf[self.start..], self.limit) {
-            Ok(Some((payload, used))) => {
-                let payload = payload.to_vec();
-                self.start += used;
-                Some(Ok(payload))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.fail(e);
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a frame.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-}
-
 /// A request header. Version 0 has the first three fields, version 1 adds
 /// the client ID, and version 2 adds tagged fields. The version follows
 /// from the API key and version: see [`request_header_version`].
@@ -1093,10 +1254,12 @@ impl RequestHeader {
         Ok(RequestHeader { api_key, api_version, correlation_id, client_id, tagged_fields })
     }
 
-    /// Writes the header in the version its API key and version call for.
-    /// Fields that version does not have are left out.
-    pub fn write(&self, w: &mut Writer) {
+    fn encode(&self, w: &mut Writer) {
         let version = self.version();
+        if (version == 0 && self.client_id.is_some()) || (version < 2 && !self.tagged_fields.is_empty()) {
+            w.failed = true;
+            return;
+        }
         w.i16(self.api_key);
         w.i16(self.api_version);
         w.i32(self.correlation_id);
@@ -1131,13 +1294,68 @@ impl ResponseHeader {
         Ok(ResponseHeader { correlation_id, tagged_fields })
     }
 
-    /// Writes the header in header version `version`, which is 0 or 1.
-    /// Any other version is written as 1.
-    pub fn write(&self, w: &mut Writer, version: u8) {
+    fn encode(&self, w: &mut Writer, version: u8) {
+        if version > 1 || (version == 0 && !self.tagged_fields.is_empty()) { w.failed = true; return; }
         w.i32(self.correlation_id);
         if version >= 1 {
             w.tagged_fields(&self.tagged_fields);
         }
+    }
+}
+
+impl Wire for RequestHeader {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one request header. Refuses malformed fields,
+    /// excess lengths, input over [`MAX_FRAME`], incomplete input, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_FRAME { return Err(Error::TooLarge(bytes.len())); }
+        let mut reader = Reader::new(bytes);
+        let header = Self::read(&mut reader)?;
+        reader.finish()?;
+        Ok(header)
+    }
+
+    /// Appends a header in the version selected by its API key and version.
+    /// Refuses excess lengths, invalid tags, and fields absent in that
+    /// version without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let mut writer = Writer::new();
+        self.encode(&mut writer);
+        out.extend_from_slice(&writer.finish()?);
+        Ok(())
+    }
+}
+
+/// A response header with the version supplied by the request's schema.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResponseHead<const VERSION: u8>(
+    /// The correlation ID and tagged fields.
+    pub ResponseHeader,
+);
+
+impl<const VERSION: u8> Wire for ResponseHead<VERSION> {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one response header. Refuses versions above 1,
+    /// malformed fields, input over [`MAX_FRAME`], incomplete input, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_FRAME { return Err(Error::TooLarge(bytes.len())); }
+        let mut reader = Reader::new(bytes);
+        let header = ResponseHeader::read_version(&mut reader, VERSION)?;
+        reader.finish()?;
+        Ok(Self(header))
+    }
+
+    /// Appends the header. Refuses versions above 1, excess lengths,
+    /// invalid tags, or tags in version 0 without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let mut writer = Writer::new();
+        self.0.encode(&mut writer, VERSION);
+        out.extend_from_slice(&writer.finish()?);
+        Ok(())
     }
 }
 
@@ -1225,10 +1443,8 @@ impl ApiVersionsRequest {
         Ok(out)
     }
 
-    /// The body's bytes in version `version`. Fields the version does not
-    /// have are left out.
-    pub fn to_bytes(&self, version: i16) -> Result<Vec<u8>, Error> {
-        check_version(api_key::API_VERSIONS, version)?;
+    fn encode(&self, version: i16) -> Result<Vec<u8>, Error> {
+        check_version(api_key::API_VERSIONS, version).map_err(|_| Error::Unwritable)?;
         let mut w = Writer::new();
         if version >= 3 {
             w.compact_string(&self.client_software_name);
@@ -1239,7 +1455,9 @@ impl ApiVersionsRequest {
             }
             w.tagged_fields(&self.tagged_fields);
         }
-        Ok(w.into_bytes())
+        let bytes = w.finish()?;
+        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        Ok(bytes)
     }
 }
 
@@ -1314,19 +1532,15 @@ impl ApiVersionsResponse {
         Ok(ApiVersionsResponse { error_code, api_keys, throttle_time_ms, tagged_fields })
     }
 
-    /// The body's bytes in version `version`. The body's tagged fields 0
-    /// to 3 must hold what Kafka defines for them, or it is
-    /// [`Error::Invalid`]. A broker that does not speak the version asked
-    /// for writes its answer in version 0.
-    pub fn to_bytes(&self, version: i16) -> Result<Vec<u8>, Error> {
-        check_version(api_key::API_VERSIONS, version)?;
+    fn encode(&self, version: i16) -> Result<Vec<u8>, Error> {
+        check_version(api_key::API_VERSIONS, version).map_err(|_| Error::Unwritable)?;
         if version >= 3 {
-            check_feature_tags(&self.tagged_fields)?;
+            check_feature_tags(&self.tagged_fields).map_err(|_| Error::Unwritable)?;
         }
         let flex = version >= 3;
         let mut w = Writer::new();
         w.i16(self.error_code);
-        let keys = capped(&self.api_keys);
+        let keys = bounded(&self.api_keys)?;
         w.arr_f(flex, Some(keys.len()));
         for k in keys {
             w.i16(k.api_key);
@@ -1338,7 +1552,9 @@ impl ApiVersionsResponse {
             w.i32(self.throttle_time_ms);
         }
         w.tags_f(flex, &self.tagged_fields);
-        Ok(w.into_bytes())
+        let bytes = w.finish()?;
+        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        Ok(bytes)
     }
 }
 
@@ -1463,33 +1679,27 @@ impl MetadataRequest {
         Ok(out)
     }
 
-    /// The body's bytes in version `version`. A field the version does not
-    /// have must hold its default, as Kafka requires: auto creation
-    /// allowed before version 4, and no authorized operations asked for
-    /// outside the versions that carry them. A topic asked for by ID, or
-    /// with a null name, needs version 12. Anything else is
-    /// [`Error::Invalid`].
-    pub fn to_bytes(&self, version: i16) -> Result<Vec<u8>, Error> {
-        check_version(api_key::METADATA, version)?;
+    fn encode(&self, version: i16) -> Result<Vec<u8>, Error> {
+        check_version(api_key::METADATA, version).map_err(|_| Error::Unwritable)?;
         if version < 4 && !self.allow_auto_topic_creation {
-            return Err(Error::Invalid("allow_auto_topic_creation false needs version 4"));
+            return Err(Error::Unwritable);
         }
         if !(8..=10).contains(&version) && self.include_cluster_authorized_operations {
-            return Err(Error::Invalid("include_cluster_authorized_operations needs version 8 to 10"));
+            return Err(Error::Unwritable);
         }
         if version < 8 && self.include_topic_authorized_operations {
-            return Err(Error::Invalid("include_topic_authorized_operations needs version 8"));
+            return Err(Error::Unwritable);
         }
         if let Some(topics) = &self.topics {
-            check_request_topics(capped(topics), version)?;
+            check_request_topics(bounded(topics)?, version).map_err(|_| Error::Unwritable)?;
         }
         let flex = version >= 9;
         let mut w = Writer::new();
         match &self.topics {
-            None if version == 0 => w.arr_f(flex, Some(0)),
+            None if version == 0 => return Err(Error::Unwritable),
             None => w.arr_f(flex, None),
             Some(topics) => {
-                let topics = capped(topics);
+                let topics = bounded(topics)?;
                 w.arr_f(flex, Some(topics.len()));
                 for t in topics {
                     if version >= 10 {
@@ -1512,7 +1722,9 @@ impl MetadataRequest {
             w.bool(self.include_topic_authorized_operations);
         }
         w.tags_f(flex, &self.tagged_fields);
-        Ok(w.into_bytes())
+        let bytes = w.finish()?;
+        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        Ok(bytes)
     }
 }
 
@@ -1752,18 +1964,15 @@ impl MetadataResponse {
         Ok(out)
     }
 
-    /// The body's bytes in version `version`. Fields the version does not
-    /// have are left out. A topic with a null name where the version or
-    /// its error code does not allow one is [`Error::Invalid`].
-    pub fn to_bytes(&self, version: i16) -> Result<Vec<u8>, Error> {
-        check_version(api_key::METADATA, version)?;
-        check_response_topics(capped(&self.topics), version)?;
+    fn encode(&self, version: i16) -> Result<Vec<u8>, Error> {
+        check_version(api_key::METADATA, version).map_err(|_| Error::Unwritable)?;
+        check_response_topics(bounded(&self.topics)?, version).map_err(|_| Error::Unwritable)?;
         let flex = version >= 9;
         let mut w = Writer::new();
         if version >= 3 {
             w.i32(self.throttle_time_ms);
         }
-        let brokers = capped(&self.brokers);
+        let brokers = bounded(&self.brokers)?;
         w.arr_f(flex, Some(brokers.len()));
         for b in brokers {
             w.i32(b.node_id);
@@ -1780,7 +1989,7 @@ impl MetadataResponse {
         if version >= 1 {
             w.i32(self.controller_id);
         }
-        let topics = capped(&self.topics);
+        let topics = bounded(&self.topics)?;
         w.arr_f(flex, Some(topics.len()));
         for t in topics {
             w.i16(t.error_code);
@@ -1795,7 +2004,7 @@ impl MetadataResponse {
             if version >= 1 {
                 w.bool(t.is_internal);
             }
-            let partitions = capped(&t.partitions);
+            let partitions = bounded(&t.partitions)?;
             w.arr_f(flex, Some(partitions.len()));
             for p in partitions {
                 w.i16(p.error_code);
@@ -1823,7 +2032,9 @@ impl MetadataResponse {
             w.i16(self.error_code);
         }
         w.tags_f(flex, &self.tagged_fields);
-        Ok(w.into_bytes())
+        let bytes = w.finish()?;
+        if Self::parse(&bytes, version).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        Ok(bytes)
     }
 }
 
@@ -1847,11 +2058,15 @@ pub struct Request {
     pub body: RequestBody,
 }
 
-impl Request {
-    /// Reads a frame's payload as a request. The header says which body
+impl Wire for Request {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a frame's payload as a request. Refuses malformed fields,
+    /// incomplete input, and trailing bytes after known bodies. The header says which body
     /// follows. A body this module reads in full must use every byte, and
     /// a payload longer than [`MAX_FRAME`] is [`Error::TooLarge`].
-    pub fn parse(payload: &[u8]) -> Result<Request, Error> {
+    fn parse(payload: &[u8]) -> Result<Request, Error> {
         if payload.len() > MAX_FRAME {
             return Err(Error::TooLarge(payload.len()));
         }
@@ -1869,27 +2084,30 @@ impl Request {
         Ok(Request { header, body })
     }
 
-    /// The request's payload: header, then body. The body must match the
-    /// header's API key and version: an [`RequestBody::Other`] for a key
-    /// and version with a full body here, or a typed body for another, is
-    /// [`Error::Mismatch`].
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+    /// Appends the request payload. Refuses mismatched bodies, invalid
+    /// fields or tags, excess lengths, and values a version would change
+    /// or omit. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (key, version) = (self.header.api_key, self.header.api_version);
         let body = match &self.body {
-            RequestBody::ApiVersions(b) if key == api_key::API_VERSIONS => b.to_bytes(version)?,
-            RequestBody::Metadata(b) if key == api_key::METADATA => b.to_bytes(version)?,
-            RequestBody::Other(b) if !has_body(key, version) => b.clone(),
-            _ => return Err(Error::Mismatch),
+            RequestBody::ApiVersions(b) if key == api_key::API_VERSIONS => b.encode(version)?,
+            RequestBody::Metadata(b) if key == api_key::METADATA => b.encode(version)?,
+            RequestBody::Other(b) if !has_body(key, version) && b.len() <= MAX_FRAME => b.clone(),
+            _ => return Err(Error::Unwritable),
         };
         let mut w = Writer::new();
-        self.header.write(&mut w);
+        self.header.encode(&mut w);
         w.raw(&body);
-        Ok(w.into_bytes())
+        out.extend_from_slice(&w.finish()?);
+        Ok(())
     }
+}
 
-    /// The request as a whole frame, size first.
-    pub fn to_frame(&self) -> Result<Vec<u8>, Error> {
-        frame(&self.to_bytes()?)
+impl Request {
+    /// Wraps this request's payload in a frame. Refuses values that the
+    /// header's version cannot preserve or that exceed their limits.
+    pub fn to_frame(&self) -> Result<Frame, Error> {
+        Ok(Frame(self.to_bytes()?))
     }
 }
 
@@ -1938,40 +2156,77 @@ impl Response {
         Ok(Response { header, body })
     }
 
-    /// The response's payload, as the answer to version `api_version` of
-    /// `api_key`. The body must match, as for [`Request::to_bytes`].
-    pub fn to_bytes(&self, api_key: i16, api_version: i16) -> Result<Vec<u8>, Error> {
+    /// Wraps the response payload in a frame for the request's API key
+    /// and version. Refuses mismatched bodies, invalid fields or tags,
+    /// excess lengths, and values that version would change or omit.
+    /// ApiVersions errors for unsupported versions should use version 0.
+    pub fn to_frame(&self, api_key: i16, api_version: i16) -> Result<Frame, Error> {
         let body = match &self.body {
-            ResponseBody::ApiVersions(b) if api_key == api_key::API_VERSIONS => b.to_bytes(api_version)?,
-            ResponseBody::Metadata(b) if api_key == api_key::METADATA => b.to_bytes(api_version)?,
-            ResponseBody::Other(b) if !has_body(api_key, api_version) => b.clone(),
-            _ => return Err(Error::Mismatch),
+            ResponseBody::ApiVersions(b) if api_key == api_key::API_VERSIONS => b.encode(api_version)?,
+            ResponseBody::Metadata(b) if api_key == api_key::METADATA => b.encode(api_version)?,
+            ResponseBody::Other(b) if !has_body(api_key, api_version) && b.len() <= MAX_FRAME => b.clone(),
+            _ => return Err(Error::Unwritable),
         };
-        let mut w = Writer::new();
-        self.header.write(&mut w, response_header_version(api_key, api_version));
-        w.raw(&body);
-        Ok(w.into_bytes())
-    }
-
-    /// The response as a whole frame, size first.
-    pub fn to_frame(&self, api_key: i16, api_version: i16) -> Result<Vec<u8>, Error> {
-        frame(&self.to_bytes(api_key, api_version)?)
+        let mut writer = Writer::new();
+        self.header.encode(&mut writer, response_header_version(api_key, api_version));
+        writer.raw(&body);
+        Ok(Frame(writer.finish()?))
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+
+    enum BodyCase {
+        Request(Request),
+        Response(Response, i16),
+    }
+
+    trait BodyFixture {
+        fn case(&self, version: i16) -> BodyCase;
+    }
+
+    macro_rules! body_fixture {
+        (request, $ty:ident, $key:expr, $variant:ident) => {
+            impl BodyFixture for $ty {
+                fn case(&self, version: i16) -> BodyCase {
+                    BodyCase::Request(Request {
+                        header: RequestHeader { api_key: $key, api_version: version, ..Default::default() },
+                        body: RequestBody::$variant(self.clone()),
+                    })
+                }
+            }
+        };
+        (response, $ty:ident, $key:expr, $variant:ident) => {
+            impl BodyFixture for $ty {
+                fn case(&self, _version: i16) -> BodyCase {
+                    BodyCase::Response(Response {
+                        header: ResponseHeader::default(), body: ResponseBody::$variant(self.clone()),
+                    }, $key)
+                }
+            }
+        };
+    }
+    body_fixture!(request, ApiVersionsRequest, api_key::API_VERSIONS, ApiVersions);
+    body_fixture!(request, MetadataRequest, api_key::METADATA, Metadata);
+    body_fixture!(response, ApiVersionsResponse, api_key::API_VERSIONS, ApiVersions);
+    body_fixture!(response, MetadataResponse, api_key::METADATA, Metadata);
+
+    fn body_bytes(value: &impl BodyFixture, version: i16) -> Result<Vec<u8>, Error> {
+        let (bytes, response_version) = match value.case(version) {
+            BodyCase::Request(request) => (request.to_bytes()?, None),
+            BodyCase::Response(response, key) => (response.to_frame(key, version)?.0, Some(response_header_version(key, version))),
+        };
+        let mut reader = Reader::new(&bytes);
+        if let Some(version) = response_version { ResponseHeader::read_version(&mut reader, version)?; }
+        else { RequestHeader::read(&mut reader)?; }
+        Ok(reader.rest().to_vec())
+    }
 
     fn tag(tag: u32, data: &[u8]) -> TaggedField {
         TaggedField { tag, data: data.to_vec() }
-    }
-
-    fn uvarint_bytes(v: u32) -> Vec<u8> {
-        let mut w = Writer::new();
-        w.uvarint(v);
-        w.into_bytes()
     }
 
     // Varint examples from the protocol guide, which follows Protocol
@@ -1979,31 +2234,31 @@ mod tests {
 
     #[test]
     fn varint_examples() {
-        assert_eq!(uvarint_bytes(0), [0]);
-        assert_eq!(uvarint_bytes(1), [1]);
-        assert_eq!(uvarint_bytes(127), [0x7f]);
-        assert_eq!(uvarint_bytes(128), [0x80, 0x01]);
-        assert_eq!(uvarint_bytes(300), [0xac, 0x02]);
-        assert_eq!(uvarint_bytes(u32::MAX), [0xff, 0xff, 0xff, 0xff, 0x0f]);
+        assert_eq!(UnsignedVarint(0).to_bytes().unwrap(), [0]);
+        assert_eq!(UnsignedVarint(1).to_bytes().unwrap(), [1]);
+        assert_eq!(UnsignedVarint(127).to_bytes().unwrap(), [0x7f]);
+        assert_eq!(UnsignedVarint(128).to_bytes().unwrap(), [0x80, 0x01]);
+        assert_eq!(UnsignedVarint(300).to_bytes().unwrap(), [0xac, 0x02]);
+        assert_eq!(UnsignedVarint(u32::MAX).to_bytes().unwrap(), [0xff, 0xff, 0xff, 0xff, 0x0f]);
         // Zigzag: 0, -1, 1, -2 are 0, 1, 2, 3.
         for (v, z) in [(0, 0u8), (-1, 1), (1, 2), (-2, 3), (2147483647, 0xfe), (-2147483648, 0xff)] {
-            let mut w = Writer::new();
-            w.varint(v);
-            let b = w.into_bytes();
+            let mut w = Vec::new();
+            Varint(v).write(&mut w).unwrap();
+            let b = w;
             assert_eq!(b[0], z, "{v}");
             assert_eq!(Reader::new(&b).varint(), Ok(v));
         }
         for v in [0i64, -1, 1, i64::MAX, i64::MIN, 1 << 40, -(1 << 50)] {
-            let mut w = Writer::new();
-            w.varlong(v);
-            let b = w.into_bytes();
+            let mut w = Vec::new();
+            Varlong(v).write(&mut w).unwrap();
+            let b = w;
             assert!(b.len() <= 10);
             let mut r = Reader::new(&b);
             assert_eq!(r.varlong(), Ok(v));
             assert_eq!(r.finish(), Ok(()));
         }
         for v in [0u32, 1, 127, 128, 16383, 16384, 1 << 21, 1 << 28, u32::MAX] {
-            let b = uvarint_bytes(v);
+            let b = UnsignedVarint(v).to_bytes().unwrap();
             assert_eq!(Reader::new(&b).uvarint(), Ok(v));
         }
         // A longer encoding of the same value reads too.
@@ -2026,31 +2281,31 @@ mod tests {
     #[test]
     fn primitives_round_trip() {
         let id = [7u8; 16];
-        let mut w = Writer::new();
-        w.bool(true);
-        w.i8(-3);
-        w.i16(-300);
-        w.u16(65000);
-        w.i32(-70000);
-        w.u32(4_000_000_000);
-        w.i64(-1 << 40);
-        w.f64(1.5);
-        w.uuid(&id);
-        w.string("héllo");
-        w.nullable_string(None);
-        w.compact_string("kafka");
-        w.compact_nullable_string(None);
-        w.bytes(b"abc");
-        w.nullable_bytes(None);
-        w.compact_bytes(b"");
-        w.compact_nullable_bytes(None);
-        w.array_len(Some(0));
-        w.array_len(None);
-        w.compact_array_len(Some(0));
-        w.compact_array_len(None);
-        w.tagged_fields(&[tag(5, b"x"), tag(1, b"yz"), tag(5, b"dup")]);
+        let mut w = Vec::new();
+        Boolean(true).write(&mut w).unwrap();
+        Int8(-3).write(&mut w).unwrap();
+        Int16(-300).write(&mut w).unwrap();
+        Uint16(65000).write(&mut w).unwrap();
+        Int32(-70000).write(&mut w).unwrap();
+        Uint32(4_000_000_000).write(&mut w).unwrap();
+        Int64(-1 << 40).write(&mut w).unwrap();
+        Float64(1.5).write(&mut w).unwrap();
+        Uuid(id).write(&mut w).unwrap();
+        String16(("héllo").to_owned()).write(&mut w).unwrap();
+        NullableString((None).map(str::to_owned)).write(&mut w).unwrap();
+        CompactString(("kafka").to_owned()).write(&mut w).unwrap();
+        CompactNullableString((None).map(str::to_owned)).write(&mut w).unwrap();
+        BytesValue((b"abc").to_vec()).write(&mut w).unwrap();
+        NullableBytes((None).map(<[u8]>::to_vec)).write(&mut w).unwrap();
+        CompactBytes((b"").to_vec()).write(&mut w).unwrap();
+        CompactNullableBytes((None).map(<[u8]>::to_vec)).write(&mut w).unwrap();
+        ArrayLength(Some(0)).write(&mut w).unwrap();
+        ArrayLength(None).write(&mut w).unwrap();
+        CompactArrayLength(Some(0)).write(&mut w).unwrap();
+        CompactArrayLength(None).write(&mut w).unwrap();
+        TaggedFields(vec![tag(1, b"yz"), tag(5, b"x")]).write(&mut w).unwrap();
         assert!(!w.is_empty());
-        let b = w.into_bytes();
+        let b = w;
         let mut r = Reader::new(&b);
         assert_eq!(r.bool(), Ok(true));
         assert_eq!(r.i8(), Ok(-3));
@@ -2073,7 +2328,7 @@ mod tests {
         assert_eq!(r.array_len(), Ok(None));
         assert_eq!(r.compact_array_len(), Ok(Some(0)));
         assert_eq!(r.compact_array_len(), Ok(None));
-        // Sorted, and the repeated tag keeps its first field.
+        // Tagged fields retain their order and contents.
         assert_eq!(r.tagged_fields(), Ok(vec![tag(1, b"yz"), tag(5, b"x")]));
         assert_eq!(r.finish(), Ok(()));
         assert_eq!(r.position(), b.len());
@@ -2081,14 +2336,14 @@ mod tests {
 
     #[test]
     fn primitive_layouts() {
-        let mut w = Writer::new();
-        w.string("ab");
-        w.compact_string("ab");
-        w.compact_nullable_string(None);
-        w.nullable_string(None);
-        w.compact_array_len(Some(2));
-        w.tagged_fields(&[tag(0, &[9])]);
-        assert_eq!(w.into_bytes(), [0, 2, b'a', b'b', 3, b'a', b'b', 0, 0xff, 0xff, 3, 1, 0, 1, 9]);
+        let mut w = Vec::new();
+        String16(("ab").to_owned()).write(&mut w).unwrap();
+        CompactString(("ab").to_owned()).write(&mut w).unwrap();
+        CompactNullableString((None).map(str::to_owned)).write(&mut w).unwrap();
+        NullableString((None).map(str::to_owned)).write(&mut w).unwrap();
+        CompactArrayLength(Some(2)).write(&mut w).unwrap();
+        TaggedFields(vec![tag(0, &[9])]).write(&mut w).unwrap();
+        assert_eq!(w, [0, 2, b'a', b'b', 3, b'a', b'b', 0, 0xff, 0xff, 3, 1, 0, 1, 9]);
     }
 
     #[test]
@@ -2100,9 +2355,9 @@ mod tests {
         assert_eq!(Reader::new(&[0]).compact_string(), Err(Error::Null));
         assert_eq!(Reader::new(&[2, 0xc3]).compact_string(), Err(Error::Utf8));
         // A compact string over the limit.
-        let mut w = Writer::new();
-        w.uvarint(MAX_STRING as u32 + 2);
-        assert_eq!(Reader::new(&w.into_bytes()).compact_string(), Err(Error::Length(MAX_STRING as i64 + 1)));
+        let mut w = Vec::new();
+        UnsignedVarint(MAX_STRING as u32 + 2).write(&mut w).unwrap();
+        assert_eq!(Reader::new(&w).compact_string(), Err(Error::Length(MAX_STRING as i64 + 1)));
         assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xff]).bytes(), Err(Error::Null));
         assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xfe]).nullable_bytes(), Err(Error::Length(-2)));
         assert_eq!(Reader::new(&[0, 0, 0, 5, 1]).bytes(), Err(Error::Truncated));
@@ -2121,7 +2376,7 @@ mod tests {
         assert_eq!(Reader::new(&[2, 3, 0, 3, 0]).tagged_fields(), Err(Error::TagOrder(3)));
         assert_eq!(Reader::new(&[3, 3, 0]).tagged_fields(), Err(Error::Length(3)));
         assert_eq!(Reader::new(&[1, 3, 4, 1]).tagged_fields(), Err(Error::Truncated));
-        let mut many = uvarint_bytes(MAX_TAGGED_FIELDS as u32 + 1);
+        let mut many = UnsignedVarint(MAX_TAGGED_FIELDS as u32 + 1).to_bytes().unwrap();
         many.resize(5000, 0);
         assert_eq!(Reader::new(&many).tagged_fields(), Err(Error::Length(MAX_TAGGED_FIELDS as i64 + 1)));
         // Trailing bytes.
@@ -2131,30 +2386,24 @@ mod tests {
     }
 
     #[test]
-    fn writers_cut_long_values() {
-        // A long string is cut at a character boundary.
+    fn writers_refuse_values_that_would_change() {
+        fn refuses(value: &(impl Wire + PartialEq + core::fmt::Debug)) {
+            contract::check_wire_value(value);
+            let mut bytes = vec![7];
+            assert!(value.write(&mut bytes).is_err());
+            assert_eq!(bytes, [7]);
+        }
         let long = "é".repeat(MAX_STRING);
-        let mut w = Writer::new();
-        w.string(&long);
-        w.compact_string(&long);
-        let b = w.into_bytes();
-        let mut r = Reader::new(&b);
-        let s = r.string().unwrap();
-        assert!(s.len() <= MAX_STRING && s.len() >= MAX_STRING - 1);
-        assert_eq!(r.compact_string().unwrap(), s);
-        assert_eq!(r.finish(), Ok(()));
-        // Too many tagged fields.
-        let fields: Vec<TaggedField> = (0..2000).map(|t| tag(t, b"")).collect();
-        let mut w = Writer::new();
-        w.tagged_fields(&fields);
-        assert_eq!(Reader::new(&w.into_bytes()).tagged_fields().unwrap().len(), MAX_TAGGED_FIELDS);
-        // An oversized array count.
-        let mut w = Writer::new();
-        w.array_len(Some(usize::MAX));
-        assert_eq!(w.into_bytes(), (MAX_ARRAY as i32).to_be_bytes());
-        let mut w = Writer::new();
-        w.compact_array_len(Some(usize::MAX));
-        assert_eq!(Reader::new(&w.into_bytes()).uvarint(), Ok(MAX_ARRAY as u32 + 1));
+        refuses(&String16(long.clone()));
+        refuses(&CompactString(long));
+        refuses(&ArrayLength(Some(usize::MAX)));
+        refuses(&CompactArrayLength(Some(usize::MAX)));
+        refuses(&TaggedFields((0..2000).map(|tag| TaggedField { tag, data: vec![] }).collect()));
+        refuses(&TaggedFields(vec![tag(5, b"x"), tag(1, b"yz"), tag(5, b"dup")]));
+        for value in [ArrayLength(None), ArrayLength(Some(MAX_ARRAY))] { contract::check_wire_value(&value); }
+        contract::check_wire_value(&CompactArrayLength(Some(MAX_ARRAY)));
+        contract::check_wire_value(&String16("x".repeat(MAX_STRING)));
+        contract::check_wire_value(&Float64(f64::NAN));
     }
 
     #[test]
@@ -2191,17 +2440,17 @@ mod tests {
         let b0 = [0, 7, 0, 0, 0, 0, 0, 9];
         let h0 = RequestHeader::read(&mut Reader::new(&b0)).unwrap();
         assert_eq!(h0, RequestHeader { api_key: 7, api_version: 0, correlation_id: 9, ..Default::default() });
-        let mut w = Writer::new();
-        h0.write(&mut w);
-        assert_eq!(w.into_bytes(), b0);
+        let mut w = Vec::new();
+        h0.write(&mut w).unwrap();
+        assert_eq!(w, b0);
         // Version 2: a null client ID, then one tagged field.
         let b2 = [0, 3, 0, 12, 0, 0, 0, 2, 0xff, 0xff, 1, 0, 2, 0xaa, 0xbb];
         let h2 = RequestHeader::read(&mut Reader::new(&b2)).unwrap();
         assert_eq!(h2.client_id, None);
         assert_eq!(h2.tagged_fields, vec![tag(0, &[0xaa, 0xbb])]);
-        let mut w = Writer::new();
-        h2.write(&mut w);
-        assert_eq!(w.into_bytes(), b2);
+        let mut w = Vec::new();
+        h2.write(&mut w).unwrap();
+        assert_eq!(w, b2);
         assert_eq!(RequestHeader::read_version(&mut Reader::new(&b2), 3), Err(Error::HeaderVersion(3)));
         assert_eq!(ResponseHeader::read_version(&mut Reader::new(&b2), 2), Err(Error::HeaderVersion(2)));
         // Every prefix is cut short.
@@ -2236,7 +2485,7 @@ mod tests {
         assert_eq!(body.client_software_version, "3.7.0");
         assert_eq!(body.node_id, -1);
         assert_eq!(req.to_bytes().unwrap(), p);
-        let framed = req.to_frame().unwrap();
+        let framed = req.to_frame().unwrap().to_bytes().unwrap();
         assert_eq!(&framed[..4], &(p.len() as i32).to_be_bytes());
         // Every truncated prefix of the payload is an error, not a panic.
         for n in 0..p.len() {
@@ -2263,7 +2512,7 @@ mod tests {
                 tagged_fields: vec![tag(1, &[0, 0, 0, 0, 0, 0, 0, 7])],
             }),
         };
-        let p = resp.to_bytes(18, 3).unwrap();
+        let p = resp.to_frame(18, 3).map(|frame| frame.0).unwrap();
         let mut want = vec![0, 0, 0, 5, 0, 0, 3, 0, 3, 0, 0, 0, 12, 0, 0, 18, 0, 0, 0, 3, 0, 0, 0, 0, 0];
         want.extend_from_slice(&[1, 1, 8, 0, 0, 0, 0, 0, 0, 0, 7]);
         assert_eq!(p, want);
@@ -2296,9 +2545,16 @@ mod tests {
             tagged_fields: vec![tag(3, &[1])],
         };
         for v in 0..=API_VERSIONS_MAX_VERSION {
-            let b = req.to_bytes(v).unwrap();
+            let req = if v < 3 { ApiVersionsRequest::default() }
+                else if v < 5 { ApiVersionsRequest { cluster_id: None, node_id: -1, ..req.clone() } }
+                else { req.clone() };
+            let mut resp = resp.clone();
+            if v == 0 { resp.throttle_time_ms = 0; }
+            if v < 3 { resp.tagged_fields.clear(); for key in &mut resp.api_keys { key.tagged_fields.clear(); } }
+
+            let b = body_bytes(&req, v).unwrap();
             let back = ApiVersionsRequest::parse(&b, v).unwrap();
-            assert_eq!(back.to_bytes(v).unwrap(), b);
+            assert_eq!(body_bytes(&back, v).unwrap(), b);
             if v == 0 {
                 assert!(b.is_empty());
                 assert_eq!(back, ApiVersionsRequest::default());
@@ -2306,9 +2562,9 @@ mod tests {
             if v == 5 {
                 assert_eq!(back, req);
             }
-            let b = resp.to_bytes(v).unwrap();
+            let b = body_bytes(&resp, v).unwrap();
             let back = ApiVersionsResponse::parse(&b, v).unwrap();
-            assert_eq!(back.to_bytes(v).unwrap(), b);
+            assert_eq!(body_bytes(&back, v).unwrap(), b);
             if v >= 3 {
                 assert_eq!(back, resp);
             }
@@ -2321,7 +2577,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(req.to_bytes(6), Err(Error::UnsupportedVersion { api_key: 18, api_version: 6 }));
+        assert_eq!(body_bytes(&req, 6), Err(Error::Unwritable));
         assert_eq!(
             ApiVersionsResponse::parse(&[], -1),
             Err(Error::UnsupportedVersion { api_key: 18, api_version: -1 })
@@ -2342,9 +2598,11 @@ mod tests {
         assert_eq!(topics.len(), 1);
         assert_eq!(topics[0].name.as_deref(), Some("test"));
         assert_eq!(req.to_bytes().unwrap(), p);
-        // Version 0 has no null array, and writes None as every topic.
+        // Version 0 requires an explicit empty array for every topic.
         assert_eq!(MetadataRequest::parse(&[0xff, 0xff, 0xff, 0xff], 0), Err(Error::Null));
-        assert_eq!(MetadataRequest::default().to_bytes(0).unwrap(), [0, 0, 0, 0]);
+        assert_eq!(body_bytes(&MetadataRequest::default(), 0), Err(Error::Unwritable));
+        let all = MetadataRequest { topics: Some(vec![]), ..Default::default() };
+        assert_eq!(body_bytes(&all, 0).unwrap(), [0, 0, 0, 0]);
         // Version 1, every topic: a null array.
         assert_eq!(MetadataRequest::parse(&[0xff, 0xff, 0xff, 0xff], 1).unwrap().topics, None);
         // Version 4 adds allow_auto_topic_creation.
@@ -2356,7 +2614,7 @@ mod tests {
         assert!(!m9.allow_auto_topic_creation);
         assert!(m9.include_cluster_authorized_operations);
         assert!(!m9.include_topic_authorized_operations);
-        assert_eq!(m9.to_bytes(9).unwrap(), b9);
+        assert_eq!(body_bytes(&m9, 9).unwrap(), b9);
         // Version 12 asks by ID with a null name.
         let mut b12 = vec![2];
         b12.extend_from_slice(&[0x11; 16]);
@@ -2364,7 +2622,7 @@ mod tests {
         let m12 = MetadataRequest::parse(&b12, 12).unwrap();
         let t = &m12.topics.as_ref().unwrap()[0];
         assert_eq!((t.topic_id, t.name.clone()), ([0x11; 16], None));
-        assert_eq!(m12.to_bytes(12).unwrap(), b12);
+        assert_eq!(body_bytes(&m12, 12).unwrap(), b12);
         // A null name before version 10 is refused.
         assert_eq!(MetadataRequest::parse(&[2, 0, 0, 1, 0, 0, 0], 9), Err(Error::Null));
         // Version 11 drops include_cluster_authorized_operations.
@@ -2423,7 +2681,7 @@ mod tests {
     #[test]
     fn metadata_response_v0_bytes() {
         let m = sample_metadata();
-        let b = m.to_bytes(0).unwrap();
+        let b = body_bytes(&fit_response(m.clone(), 0), 0).unwrap();
         #[rustfmt::skip]
         let want = [
             0, 0, 0, 2, // two brokers
@@ -2440,7 +2698,7 @@ mod tests {
         let back = MetadataResponse::parse(&b, 0).unwrap();
         assert_eq!(back.controller_id, -1);
         assert_eq!(back.topics[0].partitions[0].leader_epoch, -1);
-        assert_eq!(back.to_bytes(0).unwrap(), b);
+        assert_eq!(body_bytes(&back, 0).unwrap(), b);
     }
 
     #[test]
@@ -2458,10 +2716,11 @@ mod tests {
             tagged_fields: vec![tag(0, b"z")],
         };
         for v in 0..=METADATA_MAX_VERSION {
-            let b = m.to_bytes(v).unwrap();
+            let m = fit_response(m.clone(), v);
+            let b = body_bytes(&m, v).unwrap();
             let back = MetadataResponse::parse(&b, v).unwrap();
-            assert_eq!(back.to_bytes(v).unwrap(), b, "{v}");
-            assert_eq!(MetadataResponse::parse(&back.to_bytes(v).unwrap(), v).unwrap(), back);
+            assert_eq!(body_bytes(&back, v).unwrap(), b, "{v}");
+            assert_eq!(MetadataResponse::parse(&body_bytes(&back, v).unwrap(), v).unwrap(), back);
             if v == 10 {
                 assert_eq!(back, m, "{v}");
             }
@@ -2469,9 +2728,9 @@ mod tests {
                 assert!(MetadataResponse::parse(&b[..n], v).is_err(), "{v} {n}");
             }
             let req = fit_request(req.clone(), v);
-            let b = req.to_bytes(v).unwrap();
+            let b = body_bytes(&req, v).unwrap();
             let back = MetadataRequest::parse(&b, v).unwrap();
-            assert_eq!(back.to_bytes(v).unwrap(), b, "{v}");
+            assert_eq!(body_bytes(&back, v).unwrap(), b, "{v}");
             if v >= 9 {
                 assert_eq!(back, req, "{v}");
             }
@@ -2495,112 +2754,100 @@ mod tests {
                     correlation_id: 1,
                     tagged_fields: if v >= 9 { vec![tag(0, b"h")] } else { vec![] },
                 },
-                body: ResponseBody::Metadata(MetadataResponse::parse(&m.to_bytes(v).unwrap(), v).unwrap()),
+                body: ResponseBody::Metadata(MetadataResponse::parse(&body_bytes(&m, v).unwrap(), v).unwrap()),
             };
-            assert_eq!(Response::parse(&resp.to_bytes(3, v).unwrap(), 3, v).unwrap(), resp);
+            assert_eq!(Response::parse(&resp.to_frame(3, v).map(|frame| frame.0).unwrap(), 3, v).unwrap(), resp);
         }
         // Version 12 and later carry a null topic name, for a topic with
         // an error; earlier versions have none.
         let mut nameless = m.clone();
         nameless.topics[0].name = None;
         nameless.topics[0].error_code = error_code::UNKNOWN_TOPIC_ID;
-        let b = nameless.to_bytes(12).unwrap();
+        let b = body_bytes(&fit_response(nameless.clone(), 12), 12).unwrap();
         assert_eq!(MetadataResponse::parse(&b, 12).unwrap().topics[0].name, None);
-        assert!(matches!(nameless.to_bytes(11), Err(Error::Invalid(_))));
-        assert_eq!(m.to_bytes(14), Err(Error::UnsupportedVersion { api_key: 3, api_version: 14 }));
+        assert!(matches!(body_bytes(&nameless, 11), Err(Error::Unwritable)));
+        assert_eq!(body_bytes(&m, 14), Err(Error::Unwritable));
         // Version 13's top-level error code is last, after the topics.
         let mut failed = MetadataResponse { error_code: 29, ..MetadataResponse::default() };
         failed.tagged_fields.clear();
-        assert_eq!(failed.to_bytes(13).unwrap(), [0, 0, 0, 0, 1, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 29, 0]);
+        assert_eq!(body_bytes(&failed, 13).unwrap(), [0, 0, 0, 0, 1, 0, 0xff, 0xff, 0xff, 0xff, 1, 0, 29, 0]);
     }
 
     #[test]
     fn mismatched_bodies() {
         let header = RequestHeader { api_key: 3, api_version: 1, ..Default::default() };
         let req = Request { header: header.clone(), body: RequestBody::ApiVersions(ApiVersionsRequest::default()) };
-        assert_eq!(req.to_bytes(), Err(Error::Mismatch));
+        assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         let req = Request { header: header.clone(), body: RequestBody::Other(vec![]) };
-        assert_eq!(req.to_bytes(), Err(Error::Mismatch));
+        assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         // A version with no full body is an Other.
         let header = RequestHeader { api_key: 3, api_version: 99, ..Default::default() };
         let req = Request { header: header.clone(), body: RequestBody::Metadata(MetadataRequest::default()) };
-        assert_eq!(req.to_bytes(), Err(Error::UnsupportedVersion { api_key: 3, api_version: 99 }));
+        assert_eq!(req.to_bytes(), Err(Error::Unwritable));
         let req = Request { header, body: RequestBody::Other(vec![1, 2, 3]) };
         let back = Request::parse(&req.to_bytes().unwrap()).unwrap();
         assert_eq!(back, req);
         let resp = Response { header: ResponseHeader::default(), body: ResponseBody::Other(vec![]) };
-        assert_eq!(resp.to_bytes(18, 0), Err(Error::Mismatch));
-        assert_eq!(Response::parse(&resp.to_bytes(0, 9).unwrap(), 0, 9).unwrap(), resp);
+        assert_eq!(resp.to_frame(18, 0).map(|frame| frame.0), Err(Error::Unwritable));
+        assert_eq!(Response::parse(&resp.to_frame(0, 9).map(|frame| frame.0).unwrap(), 0, 9).unwrap(), resp);
         let resp =
             Response { header: ResponseHeader::default(), body: ResponseBody::Metadata(MetadataResponse::default()) };
-        assert_eq!(resp.to_bytes(18, 0), Err(Error::Mismatch));
+        assert_eq!(resp.to_frame(18, 0).map(|frame| frame.0), Err(Error::Unwritable));
     }
 
     #[test]
     fn frames() {
-        let f = frame(&[1, 2, 3]).unwrap();
-        assert_eq!(f, [0, 0, 0, 3, 1, 2, 3]);
-        assert_eq!(parse_frame(&f, MAX_FRAME), Ok(Some((&[1u8, 2, 3][..], 7))));
-        for n in 0..f.len() {
-            assert_eq!(parse_frame(&f[..n], MAX_FRAME), Ok(None), "{n}");
+        let value = Frame(vec![1, 2, 3]);
+        let bytes = value.to_bytes().unwrap();
+        assert_eq!(bytes, [0, 0, 0, 3, 1, 2, 3]);
+        assert_eq!(Frame::parse(&bytes), Ok(value));
+        for n in 0..bytes.len() {
+            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n}");
+            assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Truncated));
         }
-        assert_eq!(parse_frame(&[0, 0, 0, 0], MAX_FRAME), Ok(Some((&[][..], 4))));
-        assert_eq!(parse_frame(&[0xff, 0xff, 0xff, 0xff], MAX_FRAME), Err(Error::FrameSize(-1)));
-        assert_eq!(parse_frame(&[0, 0, 0, 4], 3), Err(Error::FrameSize(4)));
-        assert_eq!(parse_frame(&[0x7f, 0xff, 0xff, 0xff], MAX_FRAME), Err(Error::FrameSize(i32::MAX)));
-        assert_eq!(frame(&vec![0; MAX_FRAME + 1]), Err(Error::TooLarge(MAX_FRAME + 1)));
+        assert_eq!(Frame::parse(&[0; 4]), Ok(Frame(vec![])));
+        assert_eq!(Frame::parse(&[0xff; 4]), Err(Error::FrameSize(-1)));
+        assert_eq!(Frames::with_limit(3).decode(&[0, 0, 0, 4], false), Err(Error::FrameSize(4)));
+        assert_eq!(Frame::parse(&[0x7f, 0xff, 0xff, 0xff]), Err(Error::FrameSize(i32::MAX)));
+        assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let a = frame(&api_versions_v3_request()).unwrap();
-        let b = frame(&[0, 18, 0, 0, 0, 0, 0, 2, 0xff, 0xff]).unwrap();
-        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
-            while let Some(p) = d.next_frame() {
-                got.push(Request::parse(&p.unwrap()).unwrap().header.correlation_id);
-            }
+    fn stream_splits_frames() {
+        let a = Frame(api_versions_v3_request());
+        let b = Frame(vec![0, 18, 0, 0, 0, 0, 0, 2, 0xff, 0xff]);
+        let mut bytes = a.to_bytes().unwrap();
+        b.write(&mut bytes).unwrap();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * Frames::new().capacity());
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
+        for (limit, header, error) in [
+            (MAX_FRAME, [0x80, 0, 0, 0], Error::FrameSize(i32::MIN)),
+            (4, [0, 0, 0, 5], Error::FrameSize(5)),
+            (usize::MAX, [0x7f, 0xff, 0xff, 0xff], Error::FrameSize(i32::MAX)),
+        ] {
+            let mut stream = Stream::new(Frames::with_limit(limit));
+            assert_eq!(stream.push(&header), 4);
+            assert_eq!(stream.next(), Some(Err(Fail::Protocol(error))));
+            assert_eq!(stream.push(&bytes), bytes.len());
+            assert!(stream.next().is_none());
         }
-        assert_eq!(got, [5, 2]);
-        assert_eq!(d.buffered(), 0);
-        // A copy taken in the middle of a frame goes on the same way.
-        d.feed(&b[..3]);
-        let mut copy = d.clone();
-        d.feed(&b[3..]);
-        copy.feed(&b[3..]);
-        assert_eq!(d.next_frame(), copy.next_frame());
-        // A broken stream stays broken.
-        d.feed(&[0x80, 0, 0, 0]);
-        assert_eq!(d.next_frame(), Some(Err(Error::FrameSize(i32::MIN))));
-        d.feed(&a);
-        assert_eq!(d.next_frame(), Some(Err(Error::FrameSize(i32::MIN))));
-        assert_eq!(d.buffered(), 0);
-        // A lower limit.
-        let mut d = Decoder::with_limit(4);
-        d.feed(&[0, 0, 0, 5]);
-        assert_eq!(d.next_frame(), Some(Err(Error::FrameSize(5))));
-        let mut d = Decoder::with_limit(usize::MAX);
-        d.feed(&[0x7f, 0xff, 0xff, 0xff]);
-        assert_eq!(d.next_frame(), Some(Err(Error::FrameSize(i32::MAX))));
+        // A cloned stateless decoder can read the same pending frame.
+        let mut decoder = Frames::new();
+        assert_eq!(decoder.decode(&bytes[..3], false), Ok(Step::Need));
+        let mut copy = decoder;
+        assert_eq!(decoder.decode(&bytes, false), copy.decode(&bytes, false));
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        let one = frame(&[0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff]).unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_reads_many_small_frames_in_linear_time() {
+        let one = Frame(vec![0, 18, 0, 0, 0, 0, 0, 1, 0xff, 0xff]).to_bytes().unwrap();
         let started = std::time::Instant::now();
-        let mut d = Decoder::default();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(p) = d.next_frame() {
-            p.unwrap();
-            n += 1;
-        }
-        assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
+        let mut stream = Stream::new(Frames::new());
+        let mut count = 0;
+        pump(&mut stream, &one.repeat(200_000), |_| count += 1).unwrap();
+        finish(&mut stream, |_| count += 1).unwrap();
+        assert_eq!(count, 200_000);
+        assert_eq!(stream.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
@@ -2617,7 +2864,7 @@ mod tests {
             Error::TagOrder(1),
             Error::HeaderVersion(3),
             Error::UnsupportedVersion { api_key: 1, api_version: 2 },
-            Error::Mismatch,
+            Error::Unwritable,
             Error::Trailing(1),
             Error::Invalid("x"),
         ];
@@ -2631,44 +2878,15 @@ mod tests {
         assert!(!e.to_string().contains("0, 1 or 2"), "{e}");
     }
 
-    /// A deterministic generator, so a failure repeats.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: u32) -> u32 {
-            self.next() % n
-        }
-    }
-
-    /// What the fuzz target checks, for one buffer.
+    /// Exercises framing, exact requests, and contextual responses.
     fn check(data: &[u8]) {
-        let mut whole = Decoder::new();
-        whole.feed(data);
-        let mut frames = Vec::new();
-        while let Some(f) = whole.next_frame() {
-            match f {
-                Ok(f) => frames.push(f),
-                // A broken stream keeps nothing.
-                Err(_) => {
-                    assert_eq!(whole.buffered(), 0);
-                    break;
-                }
-            }
-        }
-        let mut bytewise = Decoder::new();
-        let mut again = Vec::new();
-        for b in data {
-            bytewise.feed(std::slice::from_ref(b));
-            while let Some(Ok(f)) = bytewise.next_frame() {
-                again.push(f);
-            }
-        }
-        assert_eq!(frames, again);
-        let mut payloads: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
+        contract::check_wire::<Frame>(data);
+        contract::check_wire::<Request>(data);
+        contract::check_wire::<RequestHeader>(data);
+        contract::check_wire::<TaggedFields>(data);
+        let frames = decode_all(Frames::new, data).0;
+        let mut payloads: Vec<&[u8]> = frames.iter().map(|frame| frame.0.as_slice()).collect();
         payloads.push(data);
         for p in payloads {
             if let Ok(req) = Request::parse(p) {
@@ -2678,7 +2896,7 @@ mod tests {
             for key in [api_key::API_VERSIONS, api_key::METADATA, api_key::PRODUCE] {
                 for version in [0, 1, 3, 5, 8, 9, 10, 12, 13] {
                     if let Ok(resp) = Response::parse(p, key, version) {
-                        let bytes = resp.to_bytes(key, version).unwrap();
+                        let bytes = resp.to_frame(key, version).map(|frame| frame.0).unwrap();
                         assert_eq!(Response::parse(&bytes, key, version), Ok(resp));
                     }
                 }
@@ -2692,13 +2910,13 @@ mod tests {
 
     #[test]
     fn lcg_fuzz() {
-        let mut rng = Lcg(0x6b_6166_6b61);
+        let mut rng = Lcg::new(0x6b_6166_6b61);
         // Valid encodings to mutate, so the fuzz reaches deep fields.
         let m = sample_metadata();
-        let mut seeds: Vec<Vec<u8>> = vec![frame(&api_versions_v3_request()).unwrap()];
+        let mut seeds: Vec<Vec<u8>> = vec![Frame(api_versions_v3_request()).to_bytes().unwrap()];
         for v in 0..=METADATA_MAX_VERSION {
-            let resp = Response { header: ResponseHeader::default(), body: ResponseBody::Metadata(m.clone()) };
-            seeds.push(frame(&resp.to_bytes(3, v).unwrap()).unwrap());
+            let resp = Response { header: ResponseHeader::default(), body: ResponseBody::Metadata(fit_response(m.clone(), v)) };
+            seeds.push(resp.to_frame(3, v).unwrap().to_bytes().unwrap());
             let req = Request {
                 header: RequestHeader {
                     api_key: 3,
@@ -2712,27 +2930,20 @@ mod tests {
                     ..Default::default()
                 }),
             };
-            seeds.push(frame(&req.to_bytes().unwrap()).unwrap());
+            seeds.push(req.to_frame().unwrap().to_bytes().unwrap());
         }
         for _ in 0..4000 {
-            let data: Vec<u8> = if rng.below(2) == 0 {
-                let len = rng.below(64) as usize;
+            let data: Vec<u8> = if rng.coin() {
+                let len = rng.index(64);
                 let mut d: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
                 // Often a frame size that fits.
-                if len >= 4 && rng.below(2) == 0 {
+                if len >= 4 && rng.coin() {
                     d[..4].copy_from_slice(&((len - 4) as i32).to_be_bytes());
                 }
                 d
             } else {
-                let mut d = seeds[rng.below(seeds.len() as u32) as usize].clone();
-                for _ in 0..1 + rng.below(4) {
-                    let i = rng.below(d.len() as u32) as usize;
-                    match rng.below(3) {
-                        0 => d[i] = rng.next() as u8,
-                        1 => d[i] ^= 1 << rng.below(8),
-                        _ => d.truncate(i.max(4)),
-                    }
-                }
+                let mut d = seeds[rng.index(seeds.len())].clone();
+                mutate(&mut rng, &mut d);
                 d
             };
             check(&data);
@@ -2747,31 +2958,31 @@ mod tests {
     // always read back.
 
     fn any_string(rng: &mut Lcg) -> String {
-        match rng.below(6) {
+        match rng.index(6) {
             0 => String::new(),
             // Over the limit, with a two-byte character at the cut.
-            1 => "\u{e9}".repeat(MAX_STRING / 2 + 1 + rng.below(3) as usize),
-            _ => (0..rng.below(8)).map(|_| char::from(b'a' + rng.below(26) as u8)).collect(),
+            1 => "\u{e9}".repeat(MAX_STRING / 2 + 1 + rng.index(3)),
+            _ => rng.text(7),
         }
     }
 
     fn any_option(rng: &mut Lcg) -> Option<String> {
-        if rng.below(3) == 0 { None } else { Some(any_string(rng)) }
+        if rng.index(3) == 0 { None } else { Some(any_string(rng)) }
     }
 
     fn any_tags(rng: &mut Lcg) -> Vec<TaggedField> {
         // Out of order and repeated tags too.
-        (0..rng.below(4)).map(|_| tag(rng.below(5), &vec![rng.next() as u8; rng.below(3) as usize])).collect()
+        (0..rng.index(4)).map(|_| tag(rng.index(5) as u32, &vec![rng.next() as u8; rng.index(3)])).collect()
     }
 
     fn any_i32s(rng: &mut Lcg) -> Vec<i32> {
-        (0..rng.below(4)).map(|_| rng.next() as i32).collect()
+        (0..rng.index(4)).map(|_| rng.next() as i32).collect()
     }
 
     fn any_metadata_response(rng: &mut Lcg) -> MetadataResponse {
         MetadataResponse {
             throttle_time_ms: rng.next() as i32,
-            brokers: (0..rng.below(3))
+            brokers: (0..rng.index(3))
                 .map(|_| MetadataBroker {
                     node_id: rng.next() as i32,
                     host: any_string(rng),
@@ -2782,13 +2993,13 @@ mod tests {
                 .collect(),
             cluster_id: any_option(rng),
             controller_id: rng.next() as i32,
-            topics: (0..rng.below(3))
+            topics: (0..rng.index(3))
                 .map(|_| MetadataTopic {
                     error_code: rng.next() as i16,
                     name: any_option(rng),
                     topic_id: [rng.next() as u8; 16],
-                    is_internal: rng.below(2) == 0,
-                    partitions: (0..rng.below(3))
+                    is_internal: rng.coin(),
+                    partitions: (0..rng.index(3))
                         .map(|_| MetadataPartition {
                             error_code: rng.next() as i16,
                             partition_index: rng.next() as i32,
@@ -2810,32 +3021,40 @@ mod tests {
         }
     }
 
-    /// `req` with the fields version `v` lacks set to their defaults, and
-    /// its topics asked for by name if `v` cannot ask by ID.
     fn fit_request(mut req: MetadataRequest, v: i16) -> MetadataRequest {
-        if v < 4 {
-            req.allow_auto_topic_creation = true;
-        }
-        if !(8..=10).contains(&v) {
-            req.include_cluster_authorized_operations = false;
-        }
-        if v < 8 {
-            req.include_topic_authorized_operations = false;
-        }
-        if v < 12 {
-            for t in req.topics.iter_mut().flatten() {
-                t.topic_id = [0; 16];
-                t.name.get_or_insert_with(String::new);
-            }
+        if v < 4 { req.allow_auto_topic_creation = true; }
+        if !(8..=10).contains(&v) { req.include_cluster_authorized_operations = false; }
+        if v < 8 { req.include_topic_authorized_operations = false; }
+        if v < 9 { req.tagged_fields.clear(); }
+        if v == 0 && req.topics.is_none() { req.topics = Some(vec![]); }
+        for topic in req.topics.iter_mut().flatten() {
+            if v < 12 { topic.topic_id = [0; 16]; topic.name.get_or_insert_with(String::new); }
+            if v < 9 { topic.tagged_fields.clear(); }
         }
         req
     }
 
-    /// `resp` with every topic that may not have a null name given one.
     fn fit_response(mut resp: MetadataResponse, v: i16) -> MetadataResponse {
-        for t in &mut resp.topics {
-            if v < 12 || t.error_code == 0 || t.topic_id == [0; 16] {
-                t.name.get_or_insert_with(String::new);
+        if v < 3 { resp.throttle_time_ms = 0; }
+        if v < 2 { resp.cluster_id = None; }
+        if v < 1 { resp.controller_id = -1; }
+        if !(8..=10).contains(&v) { resp.cluster_authorized_operations = i32::MIN; }
+        if v < 13 { resp.error_code = 0; }
+        if v < 9 { resp.tagged_fields.clear(); }
+        for broker in &mut resp.brokers {
+            if v < 1 { broker.rack = None; }
+            if v < 9 { broker.tagged_fields.clear(); }
+        }
+        for topic in &mut resp.topics {
+            if v < 12 || topic.error_code == 0 || topic.topic_id == [0; 16] { topic.name.get_or_insert_with(String::new); }
+            if v < 10 { topic.topic_id = [0; 16]; }
+            if v < 1 { topic.is_internal = false; }
+            if v < 8 { topic.topic_authorized_operations = i32::MIN; }
+            if v < 9 { topic.tagged_fields.clear(); }
+            for part in &mut topic.partitions {
+                if v < 7 { part.leader_epoch = -1; }
+                if v < 5 { part.offline_replicas.clear(); }
+                if v < 9 { part.tagged_fields.clear(); }
             }
         }
         resp
@@ -2853,11 +3072,11 @@ mod tests {
 
     fn any_metadata_request(rng: &mut Lcg) -> MetadataRequest {
         MetadataRequest {
-            topics: if rng.below(3) == 0 {
+            topics: if rng.index(3) == 0 {
                 None
             } else {
                 Some(
-                    (0..rng.below(3))
+                    (0..rng.index(3))
                         .map(|_| MetadataRequestTopic {
                             topic_id: [rng.next() as u8; 16],
                             name: any_option(rng),
@@ -2866,28 +3085,28 @@ mod tests {
                         .collect(),
                 )
             },
-            allow_auto_topic_creation: rng.below(2) == 0,
-            include_cluster_authorized_operations: rng.below(2) == 0,
-            include_topic_authorized_operations: rng.below(2) == 0,
+            allow_auto_topic_creation: rng.coin(),
+            include_cluster_authorized_operations: rng.coin(),
+            include_topic_authorized_operations: rng.coin(),
             tagged_fields: any_tags(rng),
         }
     }
 
     #[test]
     fn writers_always_make_what_readers_take() {
-        let mut rng = Lcg(0x77_7269_7465);
+        let mut rng = Lcg::new(0x77_7269_7465);
         for _ in 0..300 {
             let header = RequestHeader {
                 api_key: [api_key::API_VERSIONS, api_key::METADATA, api_key::CONTROLLED_SHUTDOWN, 500]
-                    [rng.below(4) as usize],
-                api_version: rng.below(16) as i16 - 1,
+                    [rng.index(4)],
+                api_version: rng.index(16) as i16 - 1,
                 correlation_id: rng.next() as i32,
                 client_id: any_option(&mut rng),
                 tagged_fields: any_tags(&mut rng),
             };
             let (key, version) = (header.api_key, header.api_version);
             let body = if !has_body(key, version) {
-                RequestBody::Other((0..rng.below(5)).map(|_| rng.next() as u8).collect())
+                RequestBody::Other(rng.bytes(4))
             } else if key == api_key::API_VERSIONS {
                 RequestBody::ApiVersions(ApiVersionsRequest {
                     client_software_name: any_string(&mut rng),
@@ -2900,19 +3119,19 @@ mod tests {
                 RequestBody::Metadata(fit_request(any_metadata_request(&mut rng), version))
             };
             let req = Request { header, body };
-            let bytes = req.to_bytes().unwrap();
-            let back = Request::parse(&bytes).unwrap();
-            assert_eq!(back.to_bytes().unwrap(), bytes);
-            let mut d = Decoder::new();
-            d.feed(&req.to_frame().unwrap());
-            assert_eq!(d.next_frame(), Some(Ok(bytes)));
+            contract::check_wire_value(&req);
+            if let Ok(bytes) = req.to_bytes() {
+                assert_eq!(Request::parse(&bytes), Ok(req.clone()));
+                let frame = req.to_frame().unwrap();
+                assert_eq!(decode_all(Frames::new, &frame.to_bytes().unwrap()), (vec![Frame(bytes)], None));
+            }
 
             let rbody = if !has_body(key, version) {
-                ResponseBody::Other((0..rng.below(5)).map(|_| rng.next() as u8).collect())
+                ResponseBody::Other(rng.bytes(4))
             } else if key == api_key::API_VERSIONS {
                 ResponseBody::ApiVersions(ApiVersionsResponse {
                     error_code: rng.next() as i16,
-                    api_keys: (0..rng.below(4))
+                    api_keys: (0..rng.index(4))
                         .map(|_| ApiVersion {
                             api_key: rng.next() as i16,
                             min_version: rng.next() as i16,
@@ -2930,38 +3149,36 @@ mod tests {
                 header: ResponseHeader { correlation_id: 1, tagged_fields: any_tags(&mut rng) },
                 body: rbody,
             };
-            let bytes = resp.to_bytes(key, version).unwrap();
-            let back = Response::parse(&bytes, key, version).unwrap();
-            assert_eq!(back.to_bytes(key, version).unwrap(), bytes);
-            assert_eq!(Response::parse(&bytes, key, version), Ok(back));
+            if let Ok(frame) = resp.to_frame(key, version) {
+                contract::check_wire_value(&frame);
+                assert_eq!(Response::parse(&frame.0, key, version), Ok(resp));
+            }
+
         }
     }
 
     // Regressions from review.
 
     #[test]
-    fn decoder_drops_a_stream_whose_size_is_bad_as_it_is_fed() {
-        // A bad size prefix is known from its first 4 bytes, so the bytes
-        // after it are never held.
-        let mut d = Decoder::with_limit(16);
+    fn stream_refuses_bad_sizes_with_bounded_input() {
+        let mut stream = Stream::new(Frames::with_limit(16));
         let mut junk = vec![0, 0, 0, 17];
         junk.resize(100_000, 0xaa);
-        d.feed(&junk);
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.next_frame(), Some(Err(Error::FrameSize(17))));
-        // The same after a good frame has been taken out.
-        let mut d = Decoder::with_limit(16);
-        d.feed(&[0, 0, 0, 1, 7, 0xff]);
-        assert_eq!(d.next_frame(), Some(Ok(vec![7])));
-        d.feed(&[0xff, 0xff, 0xff, 1, 2, 3]);
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.next_frame(), Some(Err(Error::FrameSize(-1))));
-        // A size cut across feeds is checked once it is whole.
-        let mut d = Decoder::with_limit(16);
-        d.feed(&[0, 0]);
-        assert_eq!(d.buffered(), 2);
-        d.feed(&[1, 0, 9, 9]);
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(stream.push(&junk), 20);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(17)))));
+        assert_eq!(stream.buffered(), 20);
+        assert!(stream.next().is_none());
+        let mut stream = Stream::new(Frames::with_limit(16));
+        assert_eq!(stream.push(&[0, 0, 0, 1, 7, 0xff]), 6);
+        assert_eq!(stream.next(), Some(Ok(Frame(vec![7]))));
+        assert_eq!(stream.push(&[0xff, 0xff, 0xff, 1, 2, 3]), 6);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(-1)))));
+        let mut stream = Stream::new(Frames::with_limit(16));
+        assert_eq!(stream.push(&[0, 0]), 2);
+        assert!(stream.next().is_none());
+        assert_eq!(stream.buffered(), 2);
+        assert_eq!(stream.push(&[1, 0, 9, 9]), 4);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::FrameSize(256)))));
     }
 
     #[test]
@@ -2970,19 +3187,21 @@ mod tests {
         let mut p = vec![0, 0, 0, 0, 0, 0, 0, 1, 0xff, 0xff];
         p.resize(MAX_FRAME + 1, 0);
         assert_eq!(Request::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
+        assert_eq!(RequestHeader::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
+        assert_eq!(ResponseHead::<1>::parse(&p), Err(Error::TooLarge(MAX_FRAME + 1)));
         assert_eq!(Response::parse(&p, api_key::PRODUCE, 0), Err(Error::TooLarge(MAX_FRAME + 1)));
         p.truncate(MAX_FRAME);
         let req = Request::parse(&p).unwrap();
-        assert_eq!(req.to_frame().unwrap().len(), MAX_FRAME + SIZE_LEN);
+        assert_eq!(req.to_frame().unwrap().to_bytes().unwrap().len(), MAX_FRAME + SIZE_LEN);
         // Byte strings and tagged-field values longer than a writer makes.
         let mut big = ((MAX_FRAME + 1) as i32).to_be_bytes().to_vec();
         big.resize(MAX_FRAME + 5, 0);
         assert_eq!(Reader::new(&big).bytes(), Err(Error::Length(MAX_FRAME as i64 + 1)));
-        let mut big = uvarint_bytes(MAX_FRAME as u32 + 2);
+        let mut big = UnsignedVarint(MAX_FRAME as u32 + 2).to_bytes().unwrap();
         big.resize(MAX_FRAME + 5, 0);
         assert_eq!(Reader::new(&big).compact_bytes(), Err(Error::Length(MAX_FRAME as i64 + 1)));
         let mut big = vec![1, 0];
-        big.extend(uvarint_bytes(MAX_FRAME as u32 + 1));
+        big.extend(UnsignedVarint(MAX_FRAME as u32 + 1).to_bytes().unwrap());
         big.resize(MAX_FRAME + 10, 0);
         assert_eq!(Reader::new(&big).tagged_fields(), Err(Error::Length(MAX_FRAME as i64 + 1)));
     }
@@ -3014,16 +3233,16 @@ mod tests {
             ..Default::default()
         };
         for v in 0..4 {
-            assert!(matches!(no_auto.to_bytes(v), Err(Error::Invalid(_))), "{v}");
+            assert!(matches!(body_bytes(&no_auto, v), Err(Error::Unwritable)), "{v}");
         }
-        assert!(!MetadataRequest::parse(&no_auto.to_bytes(4).unwrap(), 4).unwrap().allow_auto_topic_creation);
+        assert!(!MetadataRequest::parse(&body_bytes(&no_auto, 4).unwrap(), 4).unwrap().allow_auto_topic_creation);
         let cluster_ops = MetadataRequest { include_cluster_authorized_operations: true, ..Default::default() };
         for v in 0..=METADATA_MAX_VERSION {
-            assert_eq!(cluster_ops.to_bytes(v).is_ok(), (8..=10).contains(&v), "{v}");
+            assert_eq!(body_bytes(&cluster_ops, v).is_ok(), (8..=10).contains(&v), "{v}");
         }
         let topic_ops = MetadataRequest { include_topic_authorized_operations: true, ..Default::default() };
         for v in 0..=METADATA_MAX_VERSION {
-            assert_eq!(topic_ops.to_bytes(v).is_ok(), v >= 8, "{v}");
+            assert_eq!(body_bytes(&topic_ops, v).is_ok(), v >= 8, "{v}");
         }
     }
 
@@ -3034,22 +3253,22 @@ mod tests {
             ..Default::default()
         };
         for v in 0..12 {
-            assert!(matches!(by_id.to_bytes(v), Err(Error::Invalid(_))), "{v}");
+            assert!(matches!(body_bytes(&by_id, v), Err(Error::Unwritable)), "{v}");
         }
-        let b = by_id.to_bytes(12).unwrap();
+        let b = body_bytes(&by_id, 12).unwrap();
         assert_eq!(MetadataRequest::parse(&b, 12).unwrap(), by_id);
         // Versions 10 and 11 have the fields, but Kafka refuses them there.
         assert!(matches!(MetadataRequest::parse(&b, 11), Err(Error::Invalid(_))));
         let mut named_id = by_id.clone();
         named_id.topics.as_mut().unwrap()[0].name = Some("t".into());
-        assert!(matches!(named_id.to_bytes(11), Err(Error::Invalid(_))));
+        assert!(matches!(body_bytes(&named_id, 11), Err(Error::Unwritable)));
         let mut b10 = vec![2];
         b10.extend_from_slice(&[0x11; 16]);
         b10.extend_from_slice(&[2, b't', 0, 1, 0, 0, 0]);
         assert!(matches!(MetadataRequest::parse(&b10, 10), Err(Error::Invalid(_))));
         // A null name with no ID is refused before version 12 too.
         let nameless = MetadataRequest { topics: Some(vec![MetadataRequestTopic::default()]), ..Default::default() };
-        assert!(matches!(nameless.to_bytes(3), Err(Error::Invalid(_))));
+        assert!(matches!(body_bytes(&nameless, 3), Err(Error::Unwritable)));
     }
 
     #[test]
@@ -3085,7 +3304,7 @@ mod tests {
         // FinalizedFeaturesEpoch is an INT64, and ZkMigrationReady a BOOLEAN.
         for t in [tag(1, b""), tag(1, &[0; 7]), tag(3, b""), tag(3, &[1, 1])] {
             let r = with(t.clone());
-            assert!(matches!(r.to_bytes(3), Err(Error::Invalid(_))), "{t:?}");
+            assert!(matches!(body_bytes(&r, 3), Err(Error::Unwritable)), "{t:?}");
             let mut b = vec![0, 0, 1, 0, 0, 0, 0, 1];
             b.push(t.tag as u8);
             b.push(t.data.len() as u8);
@@ -3098,11 +3317,11 @@ mod tests {
         features.extend_from_slice(&[0, 1, 0, 2, 0]);
         for good in [tag(0, &features), tag(2, &features), tag(0, &[1]), tag(1, &[0; 8]), tag(3, &[1]), tag(9, b"")] {
             let r = with(good.clone());
-            assert_eq!(ApiVersionsResponse::parse(&r.to_bytes(3).unwrap(), 3), Ok(r), "{good:?}");
+            assert_eq!(ApiVersionsResponse::parse(&body_bytes(&r, 3).unwrap(), 3), Ok(r), "{good:?}");
         }
         for bad in [&features[..features.len() - 1], &[0], &[2, 1, 0], &[]] {
-            assert!(matches!(with(tag(0, bad)).to_bytes(4), Err(Error::Invalid(_))), "{bad:?}");
-            assert!(matches!(with(tag(2, bad)).to_bytes(4), Err(Error::Invalid(_))), "{bad:?}");
+            assert!(matches!(body_bytes(&with(tag(0, bad)), 4), Err(Error::Unwritable)), "{bad:?}");
+            assert!(matches!(body_bytes(&with(tag(2, bad)), 4), Err(Error::Unwritable)), "{bad:?}");
         }
         // Tagged fields with tags of the same numbers inside the API entries
         // are not these fields, and stay opaque.
@@ -3110,25 +3329,24 @@ mod tests {
             api_keys: vec![ApiVersion { tagged_fields: vec![tag(1, b"")], ..Default::default() }],
             ..Default::default()
         };
-        assert_eq!(ApiVersionsResponse::parse(&r.to_bytes(3).unwrap(), 3), Ok(r));
+        assert_eq!(ApiVersionsResponse::parse(&body_bytes(&r, 3).unwrap(), 3), Ok(r));
     }
 
     #[test]
     fn tags_are_31_bits() {
         let max = i32::MAX as u32;
         let mut ok = vec![1];
-        ok.extend(uvarint_bytes(max));
+        ok.extend(UnsignedVarint(max).to_bytes().unwrap());
         ok.push(0);
         assert_eq!(Reader::new(&ok).tagged_fields(), Ok(vec![tag(max, b"")]));
         for t in [max + 1, u32::MAX] {
             let mut b = vec![1];
-            b.extend(uvarint_bytes(t));
+            b.extend(UnsignedVarint(t).to_bytes().unwrap());
             b.push(0);
             assert!(matches!(Reader::new(&b).tagged_fields(), Err(Error::Invalid(_))), "{t}");
-            // A writer leaves such a field out.
-            let mut w = Writer::new();
-            w.tagged_fields(&[tag(t, b"x"), tag(3, b"y")]);
-            assert_eq!(Reader::new(&w.into_bytes()).tagged_fields(), Ok(vec![tag(3, b"y")]));
+            let fields = TaggedFields(vec![tag(t, b"x"), tag(3, b"y")]);
+            contract::check_wire_value(&fields);
+            assert_eq!(fields.to_bytes(), Err(Error::Unwritable));
         }
     }
 
@@ -3140,16 +3358,16 @@ mod tests {
         };
         // A topic asked for by an unknown ID: no name, an error.
         let unknown = topic(error_code::UNKNOWN_TOPIC_ID, None, [5; 16]);
-        assert_eq!(MetadataResponse::parse(&unknown.to_bytes(12).unwrap(), 12), Ok(unknown.clone()));
+        assert_eq!(MetadataResponse::parse(&body_bytes(&unknown, 12).unwrap(), 12), Ok(unknown.clone()));
         // Before version 12 a name is never null.
-        assert!(matches!(unknown.to_bytes(11), Err(Error::Invalid(_))));
+        assert!(matches!(body_bytes(&unknown, 11), Err(Error::Unwritable)));
         // A topic with no error always has a name, and one of name and ID
         // is always there.
         for (bad, v) in [(topic(0, None, [5; 16]), 12), (topic(error_code::UNKNOWN_TOPIC_ID, None, [0; 16]), 13)] {
-            assert!(matches!(bad.to_bytes(v), Err(Error::Invalid(_))));
+            assert!(matches!(body_bytes(&bad, v), Err(Error::Unwritable)));
             let mut ok = bad.clone();
             ok.topics[0].name = Some("t".into());
-            let b = ok.to_bytes(v).unwrap();
+            let b = body_bytes(&ok, v).unwrap();
             // The same bytes with the name made null.
             let at = b.windows(2).position(|x| x == [2, b't']).unwrap();
             let mut nulled = b.clone();

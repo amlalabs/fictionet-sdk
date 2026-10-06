@@ -19,8 +19,8 @@
 //! is a 4-byte big-endian length followed by the message.
 //!
 //! Nothing here reads a socket. A world that plays a Thrift server
-//! feeds the bytes it reads from a TCP connection to [`Frames`] with
-//! [`super::codec::Stream`], reads each frame's [`Message`], and writes
+//! passes TCP bytes to [`Stream<Frames>`](super::codec::Stream), reads
+//! each frame's [`EncodedMessage`], and writes
 //! the reply's bytes back. Values are read without a schema, into a
 //! tree of [`Value`]s, so world code decides what each field number
 //! means. On a connection without frames, a [`Messages`] decoder takes
@@ -30,13 +30,9 @@
 //! below, because the agent can send any bytes it likes. Every writer
 //! checks the same limits, so what it writes always reads back.
 //!
-//! Use [`Frames`] for framed transport or [`Messages`] for unframed transport
-//! with [`super::codec::Stream`] for bounded input, explicit EOF handling and
-//! errors reported once.
-//!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, finish, pump};
-//! use fictionet::stdlib::thrift::{exception_kind, field, Frames, Field, Message, Protocol, Value};
+//! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+//! use fictionet::stdlib::thrift::{exception_kind, field, Frames, Field, EncodedMessage, Message, Protocol, Value};
 //!
 //! /// A calculator service with one method: i32 add(1: i32 a, 2: i32 b).
 //! fn answer(call: &Message) -> Message {
@@ -59,9 +55,9 @@
 //! pump(&mut stream, &body, |frame| frames.push(frame)).unwrap();
 //! finish(&mut stream, |_| unreachable!()).unwrap();
 //! let payload = frames.pop().unwrap().0;
-//! let (call, protocol, used) = Message::parse(&payload).unwrap();
-//! assert_eq!((protocol, used), (Protocol::Binary, payload.len()));
-//! let reply = answer(&call).to_frame(protocol).unwrap();
+//! let EncodedMessage { message: call, protocol } = EncodedMessage::parse(&payload).unwrap();
+//! assert_eq!(protocol, Protocol::Binary);
+//! let reply = answer(&call).to_frame(protocol).unwrap().to_bytes().unwrap();
 //! assert_eq!(
 //!     reply,
 //!     [
@@ -76,7 +72,9 @@
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+extern crate self as fictionet;
+
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{string::String, vec, vec::Vec};
 
 /// The TCP port Thrift servers commonly listen on.
@@ -87,6 +85,8 @@ pub const FRAME_HEADER_LEN: usize = 4;
 pub const MAX_FRAME: usize = 16_384_000;
 /// The longest byte string, including a message's name.
 pub const MAX_BINARY_LEN: usize = MAX_FRAME;
+/// The longest standalone value, allowing a byte string and its length prefix.
+pub const MAX_VALUE_LEN: usize = MAX_BINARY_LEN + 10;
 /// The most elements one list or set may hold, or entries one map.
 pub const MAX_CONTAINER_LEN: usize = 1_000_000;
 /// The most values one read may hold, counting every field, element, key
@@ -95,7 +95,7 @@ pub const MAX_VALUES: usize = 1 << 20;
 /// The deepest nesting of values. A message's body is at depth 1, its
 /// fields at depth 2, and so on. Apache Thrift uses the same default.
 pub const MAX_DEPTH: usize = 64;
-/// The longest message [`Messages`] or [`StreamDecoder`] reads without
+/// The longest message [`Messages`] reads without
 /// frames. It is the same as [`MAX_FRAME`], so a message that fits in a
 /// frame also fits here.
 pub const MAX_MESSAGE: usize = MAX_FRAME;
@@ -364,29 +364,63 @@ impl Value {
 
     /// Reads a value of type `ty` from the start of `b`, and returns it
     /// with how many bytes of `b` it took. The value is at depth 1.
+    /// Refuses invalid encodings and values over [`MAX_VALUE_LEN`],
+    /// [`MAX_DEPTH`], or [`MAX_VALUES`].
     pub fn parse(protocol: Protocol, ty: Type, b: &[u8]) -> Result<(Value, usize), Error> {
-        let mut r = Reader::new(b, protocol.compact());
-        let v = r.value(ty, 1)?;
-        Ok((v, r.pos))
-    }
-
-    /// Appends the value's bytes to `out`, at depth 1. On an error `out`
-    /// is left as it was.
-    pub fn write(&self, protocol: Protocol, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let start = out.len();
-        let mut w = Writer::new(out, protocol.compact());
-        let result = w.value(self, 1);
-        if result.is_err() {
-            out.truncate(start);
+        let mut r = Reader::new(&b[..b.len().min(MAX_VALUE_LEN + 1)], protocol.compact());
+        let result = r.value(ty, 1);
+        if r.pos > MAX_VALUE_LEN || (result == Err(Error::Truncated) && b.len() > MAX_VALUE_LEN) {
+            return Err(Error::TooLong);
         }
-        result
+        Ok((result?, r.pos))
     }
 
-    /// The value's bytes, at depth 1.
-    pub fn to_bytes(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
-        let mut out = Vec::new();
-        self.write(protocol, &mut out)?;
-        Ok(out)
+    /// Wraps this value's encoding in a transport frame. Refuses excess
+    /// depth, counts, lengths, mismatched element types, and compact empty
+    /// maps whose key and value types are not [`Type::Byte`].
+    pub fn to_frame(&self, protocol: Protocol) -> Result<Frame, WriteError> {
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(&mut bytes, protocol.compact());
+        writer.limit = MAX_FRAME;
+        writer.value(self, 1)?;
+        Ok(Frame(bytes))
+    }
+}
+
+/// A standalone value with its protocol and type supplied by the caller.
+/// `COMPACT` selects compact encoding; otherwise the binary encoding is used.
+/// `TYPE` is always a binary type code from [`Type::binary_code`].
+/// For example, `ValueBody<true, 8>` carries a compact i32 without a type prefix.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValueBody<const COMPACT: bool, const TYPE: u8>(
+    /// The value. Its type must match `TYPE` when written.
+    pub Value,
+);
+
+impl<const COMPACT: bool, const TYPE: u8> Wire for ValueBody<COMPACT, TYPE> {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads exactly one value. Refuses invalid types or encodings, excess
+    /// depth, counts, or lengths, incomplete input, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_VALUE_LEN { return Err(Error::TooLong); }
+        let ty = Type::from_binary_code(TYPE).ok_or(Error::BadType(TYPE))?;
+        let protocol = if COMPACT { Protocol::Compact } else { Protocol::Binary };
+        let (value, used) = Value::parse(protocol, ty, bytes)?;
+        if used != bytes.len() { return Err(Error::Trailing); }
+        Ok(Self(value))
+    }
+
+    /// Appends the value. Refuses a type mismatch, excess depth, counts or
+    /// lengths, and compact empty maps with types other than [`Type::Byte`].
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if Some(self.0.ty()) != Type::from_binary_code(TYPE) { return Err(WriteError::Unwritable); }
+        let mut bytes = Vec::new();
+        Writer::new(&mut bytes, COMPACT).value(&self.0, 1)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
 }
 
@@ -454,7 +488,7 @@ impl Message {
     /// first byte shows. It returns the message, the protocol it was in,
     /// and how many bytes of `b` it took. A reply should use the same
     /// protocol.
-    pub fn parse(b: &[u8]) -> Result<(Message, Protocol, usize), Error> {
+    fn parse_prefix(b: &[u8]) -> Result<(Message, Protocol, usize), Error> {
         let mut r = Reader::new(b, false);
         let (name, kind, seq, protocol) = r.head()?;
         r.enter(1)?;
@@ -462,25 +496,25 @@ impl Message {
         Ok((Message { name, kind, seq, body }, protocol, r.pos))
     }
 
-    /// The message's bytes in `protocol`.
-    pub fn to_bytes(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
+    fn encode(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
         let mut out = Vec::new();
         let name = self.name.as_bytes();
         let kind = self.kind.code();
         let mut w = Writer::new(&mut out, protocol.compact());
+        w.limit = MAX_MESSAGE;
         match protocol {
             Protocol::Binary => {
-                w.out.extend_from_slice(&[0x80, 0x01, 0x00, kind]);
+                w.raw(&[0x80, 0x01, 0x00, kind]);
                 w.binary(name)?;
-                w.out.extend_from_slice(&self.seq.to_be_bytes());
+                w.raw(&self.seq.to_be_bytes());
             }
             Protocol::BinaryOld => {
                 w.binary(name)?;
-                w.out.push(kind);
-                w.out.extend_from_slice(&self.seq.to_be_bytes());
+                w.byte(kind);
+                w.raw(&self.seq.to_be_bytes());
             }
             Protocol::Compact => {
-                w.out.extend_from_slice(&[0x82, (kind << 5) | 1]);
+                w.raw(&[0x82, (kind << 5) | 1]);
                 w.varint(u64::from(self.seq as u32));
                 w.binary(name)?;
             }
@@ -490,9 +524,10 @@ impl Message {
         Ok(out)
     }
 
-    /// The message's bytes in `protocol`, in a frame.
-    pub fn to_frame(&self, protocol: Protocol) -> Result<Vec<u8>, WriteError> {
-        frame(&self.to_bytes(protocol)?)
+    /// Wraps this message in a transport frame using `protocol`. Refuses
+    /// invalid values and messages longer than [`MAX_MESSAGE`].
+    pub fn to_frame(&self, protocol: Protocol) -> Result<Frame, WriteError> {
+        Ok(Frame(self.encode(protocol)?))
     }
 
     /// A reply to this message, with the same name and sequence number,
@@ -513,9 +548,43 @@ impl Message {
     }
 }
 
+/// One complete message and the protocol carried in its header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedMessage {
+    /// The call, reply, or exception.
+    pub message: Message,
+    /// The protocol used by its header and values.
+    pub protocol: Protocol,
+}
+
+impl Wire for EncodedMessage {
+    type ParseError = Error;
+    type WriteError = WriteError;
+
+    /// Reads exactly one message, identifying its protocol from the first
+    /// byte. Replies should use that protocol. Refuses invalid headers or
+    /// values, excess depth, counts or lengths, incomplete input, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_MESSAGE { return Err(Error::TooLong); }
+        let (message, protocol, used) = Message::parse_prefix(bytes)?;
+        if used != bytes.len() { return Err(Error::Trailing); }
+        Ok(Self { message, protocol })
+    }
+
+    /// Appends a message. Refuses invalid values, compact empty maps with
+    /// types other than [`Type::Byte`], and messages over [`MAX_MESSAGE`].
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        out.extend_from_slice(&self.message.encode(self.protocol)?);
+        Ok(())
+    }
+}
+
 /// Why bytes are not a Thrift message or value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// Bytes follow the complete wire value.
+    Trailing,
     /// The bytes end before the message or value does. On a connection
     /// without frames, more bytes may finish it.
     Truncated,
@@ -540,13 +609,14 @@ pub enum Error {
     TooDeep,
     /// There are more values than [`MAX_VALUES`].
     TooMany,
-    /// A message read by [`Messages`] or [`StreamDecoder`] is longer than [`MAX_MESSAGE`].
+    /// A message exceeds [`MAX_MESSAGE`] or a value exceeds [`MAX_VALUE_LEN`].
     TooLong,
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Error::Trailing => f.write_str("bytes follow the wire value"),
             Error::Truncated => write!(f, "the bytes end inside a message or value"),
             Error::BadProtocol(b) => write!(f, "first byte {b:#04x} is not a Thrift message"),
             Error::BadVersion(v) => write!(f, "version {v:#x}, not 1"),
@@ -558,7 +628,7 @@ impl core::fmt::Display for Error {
             Error::Length(n) => write!(f, "length {n} is negative or over its limit"),
             Error::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
             Error::TooMany => write!(f, "more than {MAX_VALUES} values"),
-            Error::TooLong => write!(f, "a message longer than {MAX_MESSAGE} bytes"),
+            Error::TooLong => f.write_str("message or value exceeds its size limit"),
         }
     }
 }
@@ -568,24 +638,13 @@ impl core::error::Error for Error {}
 /// Why a value or message cannot be written so that it reads back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// Values are nested deeper than [`MAX_DEPTH`].
-    TooDeep,
-    /// There are more values than [`MAX_VALUES`].
-    TooMany,
-    /// A byte string, container or frame is longer than its limit.
-    TooLong,
-    /// An element, key or value is not of its container's type.
-    Mismatch,
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            WriteError::TooDeep => write!(f, "values nested deeper than {MAX_DEPTH}"),
-            WriteError::TooMany => write!(f, "more than {MAX_VALUES} values"),
-            WriteError::TooLong => write!(f, "a byte string, container or frame is over its limit"),
-            WriteError::Mismatch => write!(f, "an element is not of its container's type"),
-        }
+        f.write_str("value cannot be written without changing it")
     }
 }
 
@@ -609,24 +668,6 @@ impl core::fmt::Display for FrameError {
 
 impl core::error::Error for FrameError {}
 
-/// `payload` in a frame: its length, then its bytes.
-pub fn frame(payload: &[u8]) -> Result<Vec<u8>, WriteError> {
-    if payload.len() > MAX_FRAME {
-        return Err(WriteError::TooLong);
-    }
-    let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    out.extend_from_slice(payload);
-    Ok(out)
-}
-
-/// Reads the frame at the start of `b`. It returns `Ok(None)` if `b` holds
-/// only part of one, and otherwise the payload and how many bytes of `b`
-/// the frame took.
-pub fn parse_frame(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
-    parse_frame_limited(b, MAX_FRAME)
-}
-
 fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>, FrameError> {
     let Some(header) = b.get(..FRAME_HEADER_LEN) else {
         return Ok(None);
@@ -645,7 +686,7 @@ fn parse_frame_limited(b: &[u8], limit: usize) -> Result<Option<(&[u8], usize)>,
 /// A framed Thrift payload, bounded by [`MAX_FRAME`].
 ///
 /// [`Wire::parse`] reads exactly one length-prefixed frame. Use
-/// [`Message::parse`] to read its payload and identify the message protocol.
+/// [`EncodedMessage::parse`] to read its payload and identify the message protocol.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame(
     /// Payload bytes without the four-byte length prefix.
@@ -653,7 +694,6 @@ pub struct Frame(
 );
 
 /// Why an exact [`Wire`] parse did not read one complete Thrift frame.
-/// [`parse_frame`] keeps its prefix parsing behavior.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The frame header is invalid.
@@ -687,19 +727,22 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = WriteError;
 
-    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    /// Reads exactly one frame. Refuses negative or excess lengths,
+    /// incomplete input, and trailing bytes.
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match parse_frame(b).map_err(FrameParseError::Frame)? {
+        match parse_frame_limited(b, MAX_FRAME).map_err(FrameParseError::Frame)? {
             Some((payload, used)) if used == b.len() => Ok(Self(payload.to_vec())),
             Some(_) => Err(FrameParseError::Trailing),
             None => Err(FrameParseError::Truncated),
         }
     }
 
-    /// Appends at most [`FRAME_HEADER_LEN`] plus [`MAX_FRAME`] bytes.
-    /// Leaves `out` unchanged on error.
+    /// Appends the length prefix and payload. Refuses payloads over
+    /// [`MAX_FRAME`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        out.extend_from_slice(&frame(&self.0)?);
+        if self.0.len() > MAX_FRAME { return Err(WriteError::Unwritable); }
+        out.extend_from_slice(&(self.0.len() as u32).to_be_bytes());
+        out.extend_from_slice(&self.0);
         Ok(())
     }
 }
@@ -709,11 +752,11 @@ impl Wire for Frame {
 /// Use with [`super::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
 /// plus [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once. Map frames
-/// through [`Message::parse`] to receive body errors as items.
+/// through [`EncodedMessage::parse`] to receive body errors as items.
 /// This reads framed transport; [`Messages`] reads unframed transport.
 ///
 /// ```
-/// use fictionet::stdlib::codec::{Stream, finish, pump};
+/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 /// use fictionet::stdlib::thrift::{Frame, Frames};
 ///
 /// let mut stream = Stream::new(Frames::with_limit(16));
@@ -770,75 +813,6 @@ impl Decode for Frames {
     }
 }
 
-/// Splits a framed Thrift byte stream into frame payloads. Feed it the
-/// bytes a connection reads, in order, and take payloads out until it has
-/// none. Each payload is usually one [`Message`].
-///
-/// This compatibility decoder buffers every byte fed without a limit until
-/// it is taken out or a framing error clears the buffer. Use [`Frames`] with
-/// [`super::codec::Stream`] for bounded input, EOF handling and errors
-/// reported once.
-#[derive(Clone, Debug, Default)]
-#[deprecated(note = "use codec::Stream with thrift::Frames")]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small frames costs time in proportion to their bytes.
-    start: usize,
-    failed: Option<FrameError>,
-}
-
-#[allow(deprecated)]
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes read from the connection. After a [`FrameError`] the
-    /// stream cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
-        }
-    }
-
-    /// The next whole frame's payload, if one has come. It returns `None`
-    /// when it needs more bytes, and keeps returning the same error once
-    /// the stream has broken. If frames are taken out after each `feed`,
-    /// the decoder holds at most one frame's bytes plus what one `feed`
-    /// added.
-    pub fn next_frame(&mut self) -> Option<Result<Vec<u8>, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match parse_frame(&self.buf[self.start..]) {
-            Ok(Some((payload, used))) => {
-                let payload = payload.to_vec();
-                self.start += used;
-                Some(Ok(payload))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a frame.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-}
-
 /// Reads unframed Thrift messages without holding input bytes.
 ///
 /// Use with [`super::codec::Stream`] for input bounded by [`MAX_MESSAGE`]
@@ -850,11 +824,11 @@ impl Decoder {
 /// reports truncation at EOF and protocol errors once.
 ///
 /// ```
-/// use fictionet::stdlib::codec::{Stream, finish, pump};
+/// use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
 /// use fictionet::stdlib::thrift::{Message, MessageType, Messages, Protocol};
 ///
 /// let call = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
-/// let bytes = call.to_bytes(Protocol::Compact)?;
+/// let bytes = call.to_frame(Protocol::Compact)?.0;
 /// let mut stream = Stream::new(Messages::new());
 /// let mut messages = Vec::new();
 /// pump(&mut stream, &bytes[..2], |item| messages.push(item))?;
@@ -947,7 +921,7 @@ impl Decode for Messages {
         match self.scan(input) {
             Ok(false) => Ok(Step::Need),
             Ok(true) => {
-                let (message, protocol, used) = Message::parse(input.get(..self.pos).ok_or(Error::Truncated)?)?;
+                let (message, protocol, used) = Message::parse_prefix(input.get(..self.pos).ok_or(Error::Truncated)?)?;
                 self.pos = 0;
                 self.tasks.clear();
                 self.tasks.push(Task::Head);
@@ -955,46 +929,12 @@ impl Decode for Messages {
                 self.values = 0;
                 Ok(Step::Item((message, protocol), used))
             }
-            Err(e) => Err(match Message::parse(input) {
+            Err(e) => Err(match Message::parse_prefix(input) {
                 Err(first) if first != Error::Truncated => first,
                 _ => e,
             }),
         }
     }
-}
-
-/// Splits a Thrift byte stream without frames into messages. Feed it the
-/// bytes a connection reads, in order, and take messages out until it has
-/// none.
-///
-/// Calling [`Message::parse`] again on everything read so far would also
-/// work, but each call reads the message from its start, so a message that
-/// arrives a byte at a time would take time in proportion to the square of
-/// its length. This decoder remembers how far it has read and reads each
-/// byte once, apart from a few bytes of a header it must read again when
-/// the header was split. It reads a message with [`Message::parse`] once it
-/// has all of it, so it gives the same messages and errors.
-///
-/// This compatibility decoder buffers every byte fed without a limit.
-/// Use [`Messages`] with [`super::codec::Stream`] for bounded input,
-/// EOF handling and errors reported once.
-#[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with thrift::Messages")]
-pub struct StreamDecoder {
-    buf: Vec<u8>,
-    /// Where the current message starts in `buf`. Bytes before it are
-    /// dropped in `feed` once they are half the buffer.
-    start: usize,
-    /// How far into `buf` the current message has been read.
-    pos: usize,
-    /// What is left to read of the current message, innermost last. It
-    /// holds at most two tasks for each level of nesting.
-    tasks: Vec<Task>,
-    /// Whether the current message is in the compact protocol.
-    compact: bool,
-    /// The values read so far in the current message.
-    values: usize,
-    failed: Option<Error>,
 }
 
 /// Something an unframed reader has still to read.
@@ -1011,119 +951,6 @@ enum Task {
     /// `left` more keys and values of a map at `depth`, taking turns, with
     /// a key when `left` is even.
     Entries { key: Type, value: Type, left: usize, depth: usize },
-}
-
-#[allow(deprecated)]
-impl Default for StreamDecoder {
-    fn default() -> StreamDecoder {
-        StreamDecoder::new()
-    }
-}
-
-#[allow(deprecated)]
-impl StreamDecoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> StreamDecoder {
-        StreamDecoder {
-            buf: Vec::new(),
-            start: 0,
-            pos: 0,
-            tasks: vec![Task::Head],
-            compact: false,
-            values: 0,
-            failed: None,
-        }
-    }
-
-    /// Adds bytes read from the connection. After an error the stream
-    /// cannot be read any further, and they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_none() {
-            if self.start > 0 && self.start >= self.buf.len() / 2 {
-                self.buf.drain(..self.start);
-                self.pos -= self.start;
-                self.start = 0;
-            }
-            self.buf.extend_from_slice(bytes);
-        }
-    }
-
-    /// The next whole message and the protocol it is in, if one has come.
-    /// It returns `None` when it needs more bytes, and keeps returning the
-    /// same error once the stream has broken. A message longer than
-    /// [`MAX_MESSAGE`] is [`Error::TooLong`]. If messages are taken out
-    /// after each `feed`, the decoder holds at most one message's bytes
-    /// plus what one `feed` added.
-    pub fn next_message(&mut self) -> Option<Result<(Message, Protocol), Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match self.scan() {
-            Ok(false) => None,
-            Ok(true) => {
-                let got = Message::parse(&self.buf[self.start..self.pos]);
-                self.start = self.pos;
-                self.tasks.clear();
-                self.tasks.push(Task::Head);
-                self.values = 0;
-                match got {
-                    Ok((m, protocol, _)) => Some(Ok((m, protocol))),
-                    Err(e) => Some(Err(self.fail(e))),
-                }
-            }
-            Err(e) => {
-                // Report what reading the whole message reports, unless it
-                // stops early because a count is more than the bytes held.
-                let e = match Message::parse(&self.buf[self.start..]) {
-                    Err(first) if first != Error::Truncated => first,
-                    _ => e,
-                };
-                Some(Err(self.fail(e)))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    fn fail(&mut self, e: Error) -> Error {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.tasks = Vec::new();
-        (self.start, self.pos) = (0, 0);
-        e
-    }
-
-    /// Reads as far as the bytes held allow. It returns whether the
-    /// current message is complete.
-    fn scan(&mut self) -> Result<bool, Error> {
-        while let Some(&task) = self.tasks.last() {
-            let mut r = Reader::new(&self.buf[self.pos..], self.compact);
-            r.values = self.values;
-            match step(task, &mut r, &mut self.tasks) {
-                Ok(()) => {
-                    self.pos += r.pos;
-                    self.values = r.values;
-                    self.compact = r.compact;
-                    if self.pos - self.start > MAX_MESSAGE {
-                        return Err(Error::TooLong);
-                    }
-                }
-                Err(Error::Truncated) => {
-                    // Every byte held belongs to this message, which is
-                    // not over yet.
-                    if self.buffered() > MAX_MESSAGE {
-                        return Err(Error::TooLong);
-                    }
-                    return Ok(false);
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(true)
-    }
 }
 
 /// Reads one piece of a message for `task`, then updates `tasks`. The
@@ -1495,41 +1322,60 @@ struct Writer<'o> {
     out: &'o mut Vec<u8>,
     compact: bool,
     values: usize,
+    limit: usize,
+    failed: bool,
 }
 
 impl<'o> Writer<'o> {
     fn new(out: &'o mut Vec<u8>, compact: bool) -> Writer<'o> {
-        Writer { out, compact, values: 0 }
+        Writer { out, compact, values: 0, limit: MAX_VALUE_LEN, failed: false }
+    }
+
+    fn raw(&mut self, bytes: &[u8]) {
+        if self.failed || bytes.len() > self.limit.saturating_sub(self.out.len()) {
+            self.failed = true;
+            return;
+        }
+        self.out.extend_from_slice(bytes);
+    }
+
+    fn byte(&mut self, byte: u8) {
+        self.raw(&[byte]);
+    }
+
+    fn check(&self) -> Result<(), WriteError> {
+        if self.failed { Err(WriteError::Unwritable) } else { Ok(()) }
     }
 
     fn enter(&mut self, depth: usize) -> Result<(), WriteError> {
+        self.check()?;
         if depth > MAX_DEPTH {
-            return Err(WriteError::TooDeep);
+            return Err(WriteError::Unwritable);
         }
         self.values += 1;
         if self.values > MAX_VALUES {
-            return Err(WriteError::TooMany);
+            return Err(WriteError::Unwritable);
         }
-        Ok(())
+        self.check()
     }
 
     fn varint(&mut self, mut v: u64) {
         while v >= 0x80 {
-            self.out.push((v as u8) | 0x80);
+            self.byte((v as u8) | 0x80);
             v >>= 7;
         }
-        self.out.push(v as u8);
+        self.byte(v as u8);
     }
 
     fn i16w(&mut self, v: i16) {
-        if self.compact { self.i32w(i32::from(v)) } else { self.out.extend_from_slice(&v.to_be_bytes()) }
+        if self.compact { self.i32w(i32::from(v)) } else { self.raw(&v.to_be_bytes()) }
     }
 
     fn i32w(&mut self, v: i32) {
         if self.compact {
             self.varint(u64::from(((v << 1) ^ (v >> 31)) as u32));
         } else {
-            self.out.extend_from_slice(&v.to_be_bytes());
+            self.raw(&v.to_be_bytes());
         }
     }
 
@@ -1537,27 +1383,27 @@ impl<'o> Writer<'o> {
         if self.compact {
             self.varint(((v << 1) ^ (v >> 63)) as u64);
         } else {
-            self.out.extend_from_slice(&v.to_be_bytes());
+            self.raw(&v.to_be_bytes());
         }
     }
 
     /// A length or count, after checking it against `limit`.
     fn len(&mut self, n: usize, limit: usize) -> Result<(), WriteError> {
         if n > limit {
-            return Err(WriteError::TooLong);
+            return Err(WriteError::Unwritable);
         }
         if self.compact {
             self.varint(n as u64);
         } else {
-            self.out.extend_from_slice(&(n as u32).to_be_bytes());
+            self.raw(&(n as u32).to_be_bytes());
         }
-        Ok(())
+        self.check()
     }
 
     fn binary(&mut self, b: &[u8]) -> Result<(), WriteError> {
         self.len(b.len(), MAX_BINARY_LEN)?;
-        self.out.extend_from_slice(b);
-        Ok(())
+        self.raw(b);
+        self.check()
     }
 
     fn code(&self, ty: Type) -> u8 {
@@ -1567,26 +1413,26 @@ impl<'o> Writer<'o> {
     fn value(&mut self, v: &Value, depth: usize) -> Result<(), WriteError> {
         self.enter(depth)?;
         match v {
-            Value::Bool(b) => self.out.push(match (self.compact, *b) {
+            Value::Bool(b) => self.byte(match (self.compact, *b) {
                 (true, true) => 1,
                 (true, false) => 2,
                 (false, b) => u8::from(b),
             }),
-            Value::Byte(x) => self.out.push(*x as u8),
+            Value::Byte(x) => self.byte(*x as u8),
             Value::I16(x) => self.i16w(*x),
             Value::I32(x) => self.i32w(*x),
             Value::I64(x) => self.i64w(*x),
             Value::Double(x) => {
                 let a = if self.compact { x.to_le_bytes() } else { x.to_be_bytes() };
-                self.out.extend_from_slice(&a);
+                self.raw(&a);
             }
             Value::Binary(b) => self.binary(b)?,
-            Value::Uuid(u) => self.out.extend_from_slice(u),
+            Value::Uuid(u) => self.raw(u),
             Value::Struct(fields) => self.fields(fields, depth)?,
             Value::List(l) | Value::Set(l) => self.list(l, depth)?,
             Value::Map(m) => self.map(m, depth)?,
         }
-        Ok(())
+        self.check()
     }
 
     /// A struct's fields and its stop byte. The struct itself is at
@@ -1602,9 +1448,9 @@ impl<'o> Writer<'o> {
                 };
                 let delta = i32::from(f.id) - i32::from(last);
                 if (1..=15).contains(&delta) {
-                    self.out.push(((delta as u8) << 4) | code);
+                    self.byte(((delta as u8) << 4) | code);
                 } else {
-                    self.out.push(code);
+                    self.byte(code);
                     self.i16w(f.id);
                 }
                 last = f.id;
@@ -1614,71 +1460,74 @@ impl<'o> Writer<'o> {
                     self.value(&f.value, depth + 1)?;
                 }
             } else {
-                self.out.push(f.value.ty().binary_code());
+                self.byte(f.value.ty().binary_code());
                 self.i16w(f.id);
                 self.value(&f.value, depth + 1)?;
             }
         }
-        self.out.push(0);
-        Ok(())
+        self.byte(0);
+        self.check()
     }
 
     fn list(&mut self, l: &List, depth: usize) -> Result<(), WriteError> {
         let n = l.items.len();
         if n > MAX_CONTAINER_LEN {
-            return Err(WriteError::TooLong);
+            return Err(WriteError::Unwritable);
         }
         if l.items.iter().any(|v| v.ty() != l.elem) {
-            return Err(WriteError::Mismatch);
+            return Err(WriteError::Unwritable);
         }
         let code = self.code(l.elem);
         if self.compact {
             if n < 15 {
-                self.out.push(((n as u8) << 4) | code);
+                self.byte(((n as u8) << 4) | code);
             } else {
-                self.out.push(0xf0 | code);
+                self.byte(0xf0 | code);
                 self.varint(n as u64);
             }
         } else {
-            self.out.push(code);
-            self.out.extend_from_slice(&(n as u32).to_be_bytes());
+            self.byte(code);
+            self.raw(&(n as u32).to_be_bytes());
         }
         for v in &l.items {
             self.value(v, depth + 1)?;
         }
-        Ok(())
+        self.check()
     }
 
     fn map(&mut self, m: &Map, depth: usize) -> Result<(), WriteError> {
         let n = m.entries.len();
+        if self.compact && n == 0 && (m.key != Type::Byte || m.value != Type::Byte) {
+            return Err(WriteError::Unwritable);
+        }
         if n > MAX_CONTAINER_LEN {
-            return Err(WriteError::TooLong);
+            return Err(WriteError::Unwritable);
         }
         if m.entries.iter().any(|(k, v)| k.ty() != m.key || v.ty() != m.value) {
-            return Err(WriteError::Mismatch);
+            return Err(WriteError::Unwritable);
         }
         let (k, v) = (self.code(m.key), self.code(m.value));
         if self.compact {
             self.varint(n as u64);
             if n > 0 {
-                self.out.push((k << 4) | v);
+                self.byte((k << 4) | v);
             }
         } else {
-            self.out.extend_from_slice(&[k, v]);
-            self.out.extend_from_slice(&(n as u32).to_be_bytes());
+            self.raw(&[k, v]);
+            self.raw(&(n as u32).to_be_bytes());
         }
         for (key, value) in &m.entries {
             self.value(key, depth + 1)?;
             self.value(value, depth + 1)?;
         }
-        Ok(())
+        self.check()
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests preserve the compatibility decoder behavior.
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all, chunks}};
 
     const ALL_TYPES: [Type; 12] = [
         Type::Bool,
@@ -1714,20 +1563,20 @@ mod tests {
             0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, 0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0,
             0, 3, 0x00,
         ];
-        assert_eq!(Message::parse(&bytes), Ok((add_call(), Protocol::Binary, bytes.len())));
-        assert_eq!(add_call().to_bytes(Protocol::Binary).unwrap(), bytes);
+        assert_eq!(EncodedMessage::parse(&bytes), Ok(EncodedMessage { message: add_call(), protocol: Protocol::Binary }));
+        assert_eq!(add_call().to_frame(Protocol::Binary).map(|frame| frame.0).unwrap(), bytes);
         // The unused third byte of the version word is ignored.
         let mut other = bytes;
         other[2] = 0x55;
-        assert_eq!(Message::parse(&other).unwrap().0, add_call());
+        assert_eq!(EncodedMessage::parse(&other).unwrap().message, add_call());
     }
 
     #[test]
     fn old_binary_message() {
         let bytes =
             [0, 0, 0, 3, b'a', b'd', b'd', 0x01, 0, 0, 0, 1, 0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00];
-        assert_eq!(Message::parse(&bytes), Ok((add_call(), Protocol::BinaryOld, bytes.len())));
-        assert_eq!(add_call().to_bytes(Protocol::BinaryOld).unwrap(), bytes);
+        assert_eq!(EncodedMessage::parse(&bytes), Ok(EncodedMessage { message: add_call(), protocol: Protocol::BinaryOld }));
+        assert_eq!(add_call().to_frame(Protocol::BinaryOld).map(|frame| frame.0).unwrap(), bytes);
     }
 
     #[test]
@@ -1735,13 +1584,13 @@ mod tests {
         // Protocol id, type 1 and version 1, sequence 1, name, two short
         // field headers with zigzag values, stop.
         let bytes = [0x82, 0x21, 0x01, 0x03, b'a', b'd', b'd', 0x15, 0x04, 0x15, 0x06, 0x00];
-        assert_eq!(Message::parse(&bytes), Ok((add_call(), Protocol::Compact, bytes.len())));
-        assert_eq!(add_call().to_bytes(Protocol::Compact).unwrap(), bytes);
+        assert_eq!(EncodedMessage::parse(&bytes), Ok(EncodedMessage { message: add_call(), protocol: Protocol::Compact }));
+        assert_eq!(add_call().to_frame(Protocol::Compact).map(|frame| frame.0).unwrap(), bytes);
         // A negative sequence number is a 5-byte varint, not zigzag.
         let m = Message { seq: -1, body: vec![], ..add_call() };
-        let b = m.to_bytes(Protocol::Compact).unwrap();
+        let b = m.to_frame(Protocol::Compact).map(|frame| frame.0).unwrap();
         assert_eq!(b[2..7], [0xff, 0xff, 0xff, 0xff, 0x0f]);
-        assert_eq!(Message::parse(&b).unwrap().0, m);
+        assert_eq!(EncodedMessage::parse(&b).unwrap().message, m);
     }
 
     #[test]
@@ -1754,14 +1603,14 @@ mod tests {
                 _ => call.exception(exception_kind::UNKNOWN_METHOD, "no such method"),
             }
         }
-        let mut decoder = Decoder::new();
-        decoder.feed(&[0, 0, 0, 30]);
-        decoder.feed(&[0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1]);
-        decoder.feed(&[0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00]);
-        let payload = decoder.next_frame().unwrap().unwrap();
-        let (call, protocol, used) = Message::parse(&payload).unwrap();
-        assert_eq!((protocol, used), (Protocol::Binary, payload.len()));
-        let reply = answer(&call).to_frame(protocol).unwrap();
+        let mut decoder = Stream::new(Frames::new());
+        assert_eq!(decoder.push(&[0, 0, 0, 30]), 4);
+        assert_eq!(decoder.push(&[0x80, 0x01, 0x00, 0x01, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1]), 15);
+        assert_eq!(decoder.push(&[0x08, 0, 1, 0, 0, 0, 2, 0x08, 0, 2, 0, 0, 0, 3, 0x00]), 15);
+        let payload = decoder.next().unwrap().unwrap().0;
+        let EncodedMessage { message: call, protocol } = EncodedMessage::parse(&payload).unwrap();
+        assert_eq!(protocol, Protocol::Binary);
+        let reply = answer(&call).to_frame(protocol).unwrap().to_bytes().unwrap();
         assert_eq!(
             reply,
             [
@@ -1782,24 +1631,24 @@ mod tests {
         let c = Protocol::Compact;
         // Zigzag: 0, -1, 1, -2 become 0, 1, 2, 3.
         for (v, b) in [(0, 0u8), (-1, 1), (1, 2), (-2, 3)] {
-            assert_eq!(Value::I32(v).to_bytes(c).unwrap(), [b]);
+            assert_eq!(Value::I32(v).to_frame(c).map(|frame| frame.0).unwrap(), [b]);
         }
         assert_eq!(
-            Value::I64(i64::MIN).to_bytes(c).unwrap(),
+            Value::I64(i64::MIN).to_frame(c).map(|frame| frame.0).unwrap(),
             [0xff; 9].iter().copied().chain([0x01]).collect::<Vec<_>>()
         );
-        assert_eq!(Value::I16(300).to_bytes(c).unwrap(), [0xd8, 0x04]);
+        assert_eq!(Value::I16(300).to_frame(c).map(|frame| frame.0).unwrap(), [0xd8, 0x04]);
         // Doubles are little-endian.
-        assert_eq!(Value::Double(1.0).to_bytes(c).unwrap(), [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
-        assert_eq!(Value::Double(1.0).to_bytes(Protocol::Binary).unwrap(), [0x3f, 0xf0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(Value::Double(1.0).to_frame(c).map(|frame| frame.0).unwrap(), [0, 0, 0, 0, 0, 0, 0xf0, 0x3f]);
+        assert_eq!(Value::Double(1.0).to_frame(Protocol::Binary).map(|frame| frame.0).unwrap(), [0x3f, 0xf0, 0, 0, 0, 0, 0, 0]);
         // A short list header: size 3, type i32.
         let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I32(2), Value::I32(3)] });
-        assert_eq!(l.to_bytes(c).unwrap(), [0x35, 0x02, 0x04, 0x06]);
+        assert_eq!(l.to_frame(c).map(|frame| frame.0).unwrap(), [0x35, 0x02, 0x04, 0x06]);
         // A long list header: 0xf0 and the type, then the size. Booleans
         // in lists are 1 for true and 2 for false.
         let bools: Vec<Value> = (0..15).map(|i| Value::Bool(i % 2 == 0)).collect();
         let l = Value::List(List { elem: Type::Bool, items: bools.clone() });
-        let b = l.to_bytes(c).unwrap();
+        let b = l.to_frame(c).map(|frame| frame.0).unwrap();
         assert_eq!(b[..4], [0xf1, 0x0f, 1, 2]);
         assert_eq!(Value::parse(c, Type::List, &b), Ok((l, b.len())));
         // Readers take 2 as the bool element type, and 0 as false.
@@ -1809,14 +1658,19 @@ mod tests {
         );
         // Maps: an empty one is one zero byte; otherwise size, then types.
         let m = Map { key: Type::I32, value: Type::Binary, entries: vec![] };
-        assert_eq!(Value::Map(m).to_bytes(c).unwrap(), [0]);
+        let typed = ValueBody::<true, 13>(Value::Map(m));
+        contract::check_wire_value(&typed);
+        assert_eq!(typed.to_bytes(), Err(WriteError::Unwritable));
+        let empty = ValueBody::<true, 13>(Value::Map(Map { key: Type::Byte, value: Type::Byte, entries: vec![] }));
+        contract::check_wire_value(&empty);
+        assert_eq!(empty.to_bytes().unwrap(), [0]);
         assert_eq!(
             Value::parse(c, Type::Map, &[0]),
             Ok((Value::Map(Map { key: Type::Byte, value: Type::Byte, entries: vec![] }), 1))
         );
         let m =
             Map { key: Type::I32, value: Type::Binary, entries: vec![(Value::I32(1), Value::Binary(b"a".to_vec()))] };
-        let b = Value::Map(m.clone()).to_bytes(c).unwrap();
+        let b = Value::Map(m.clone()).to_frame(c).map(|frame| frame.0).unwrap();
         assert_eq!(b, [0x01, 0x58, 0x02, 0x01, b'a']);
         assert_eq!(Value::parse(c, Type::Map, &b), Ok((Value::Map(m), 5)));
     }
@@ -1833,7 +1687,7 @@ mod tests {
             Field { id: 3, value: Value::Byte(-1) },
             Field { id: 18, value: Value::Uuid([9; 16]) },
         ]);
-        let b = s.to_bytes(c).unwrap();
+        let b = s.to_frame(c).map(|frame| frame.0).unwrap();
         let mut want = vec![0x11, 0x12, 0x03, 0xc8, 0x01, 7, 0x03, 0x06, 0xff, 0xfd];
         want.extend_from_slice(&[9; 16]);
         want.push(0);
@@ -1847,7 +1701,7 @@ mod tests {
         let Value::Struct(f) = &v else { panic!() };
         assert_eq!(f[0].id, i16::MAX - 1);
         assert_eq!(f[1].id, i16::MIN);
-        let again = v.to_bytes(c).unwrap();
+        let again = v.to_frame(c).map(|frame| frame.0).unwrap();
         assert_eq!(Value::parse(c, Type::Struct, &again), Ok((v, again.len())));
     }
 
@@ -1865,7 +1719,7 @@ mod tests {
                 }),
             },
         ]);
-        let bytes = v.to_bytes(b).unwrap();
+        let bytes = v.to_frame(b).map(|frame| frame.0).unwrap();
         let want = [
             0x02, 0xff, 0xff, 1, 0x0d, 0, 5, 11, 10, 0, 0, 0, 1, 0, 0, 0, 1, b'k', 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
             0xff, 0xfe, 0,
@@ -1874,21 +1728,21 @@ mod tests {
         assert_eq!(Value::parse(b, Type::Struct, &bytes), Ok((v.clone(), want.len())));
         assert_eq!(Value::parse(Protocol::BinaryOld, Type::Struct, &bytes), Ok((v, want.len())));
         let s = Value::Set(List { elem: Type::I16, items: vec![Value::I16(1)] });
-        assert_eq!(s.to_bytes(b).unwrap(), [6, 0, 0, 0, 1, 0, 1]);
+        assert_eq!(s.to_frame(b).map(|frame| frame.0).unwrap(), [6, 0, 0, 0, 1, 0, 1]);
     }
 
     #[test]
     fn parse_errors() {
         let (b, c) = (Protocol::Binary, Protocol::Compact);
-        assert_eq!(Message::parse(&[]), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[0x81]), Err(Error::BadProtocol(0x81)));
-        assert_eq!(Message::parse(&[0x80, 0x02, 0, 1]), Err(Error::BadVersion(0x8002_0001)));
-        assert_eq!(Message::parse(&[0x82, 0x22]), Err(Error::BadVersion(2)));
-        assert_eq!(Message::parse(&[0x82, 0xa1]), Err(Error::BadMessageType(5)));
-        assert_eq!(Message::parse(&[0x80, 0x01, 0, 0]), Err(Error::BadMessageType(0)));
-        assert_eq!(Message::parse(&[0, 0, 0, 0, 9]), Err(Error::BadMessageType(9)));
-        assert_eq!(Message::parse(&[0x82, 0x21, 0, 1, 0xff]), Err(Error::BadUtf8));
-        assert_eq!(Message::parse(&[0x7f, 0xff, 0xff, 0xff]), Err(Error::Length(0x7fff_ffff)));
+        assert_eq!(EncodedMessage::parse(&[]), Err(Error::Truncated));
+        assert_eq!(EncodedMessage::parse(&[0x81]), Err(Error::BadProtocol(0x81)));
+        assert_eq!(EncodedMessage::parse(&[0x80, 0x02, 0, 1]), Err(Error::BadVersion(0x8002_0001)));
+        assert_eq!(EncodedMessage::parse(&[0x82, 0x22]), Err(Error::BadVersion(2)));
+        assert_eq!(EncodedMessage::parse(&[0x82, 0xa1]), Err(Error::BadMessageType(5)));
+        assert_eq!(EncodedMessage::parse(&[0x80, 0x01, 0, 0]), Err(Error::BadMessageType(0)));
+        assert_eq!(EncodedMessage::parse(&[0, 0, 0, 0, 9]), Err(Error::BadMessageType(9)));
+        assert_eq!(EncodedMessage::parse(&[0x82, 0x21, 0, 1, 0xff]), Err(Error::BadUtf8));
+        assert_eq!(EncodedMessage::parse(&[0x7f, 0xff, 0xff, 0xff]), Err(Error::Length(0x7fff_ffff)));
         // Bad types in fields and containers.
         assert_eq!(Value::parse(b, Type::Struct, &[1, 0, 1]), Err(Error::BadType(1)));
         assert_eq!(Value::parse(b, Type::Struct, &[5, 0, 1]), Err(Error::BadType(5)));
@@ -1934,9 +1788,9 @@ mod tests {
     fn depth_limit() {
         for p in PROTOCOLS {
             let ok = nested(MAX_DEPTH);
-            let b = ok.to_bytes(p).unwrap();
+            let b = ok.to_frame(p).map(|frame| frame.0).unwrap();
             assert_eq!(Value::parse(p, Type::List, &b), Ok((ok, b.len())));
-            assert_eq!(nested(MAX_DEPTH + 1).to_bytes(p), Err(WriteError::TooDeep));
+            assert_eq!(nested(MAX_DEPTH + 1).to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
             // One more level by hand.
             let mut deeper = if p == Protocol::Compact { vec![0x19] } else { vec![15, 0, 0, 0, 1] };
             deeper.extend_from_slice(&b);
@@ -1944,18 +1798,18 @@ mod tests {
         }
         // A message body counts as depth 1.
         let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH - 1) }], ..add_call() };
-        assert!(m.to_bytes(Protocol::Compact).is_ok());
+        assert!(m.to_frame(Protocol::Compact).map(|frame| frame.0).is_ok());
         let m = Message { body: vec![Field { id: 1, value: nested(MAX_DEPTH) }], ..add_call() };
-        assert_eq!(m.to_bytes(Protocol::Compact), Err(WriteError::TooDeep));
+        assert_eq!(m.to_frame(Protocol::Compact).map(|frame| frame.0), Err(WriteError::Unwritable));
         // A boolean field counts too.
         let mut v = Value::Struct(vec![Field { id: 1, value: Value::Bool(true) }]);
         for _ in 2..MAX_DEPTH {
             v = Value::Struct(vec![Field { id: 1, value: v }]);
         }
-        let b = v.to_bytes(Protocol::Compact).unwrap();
+        let b = v.to_frame(Protocol::Compact).map(|frame| frame.0).unwrap();
         assert!(Value::parse(Protocol::Compact, Type::Struct, &b).is_ok());
         let v = Value::Struct(vec![Field { id: 1, value: v }]);
-        assert_eq!(v.to_bytes(Protocol::Compact), Err(WriteError::TooDeep));
+        assert_eq!(v.to_frame(Protocol::Compact).map(|frame| frame.0), Err(WriteError::Unwritable));
     }
 
     #[test]
@@ -1964,7 +1818,12 @@ mod tests {
         let v = Value::Struct(vec![Field { id: 1, value: half.clone() }, Field { id: 2, value: half }]);
         for p in PROTOCOLS {
             let mut out = vec![7];
-            assert_eq!(v.write(p, &mut out), Err(WriteError::TooMany));
+            let result = if p == Protocol::Compact {
+                ValueBody::<true, 12>(v.clone()).write(&mut out)
+            } else {
+                ValueBody::<false, 12>(v.clone()).write(&mut out)
+            };
+            assert_eq!(result, Err(WriteError::Unwritable));
             assert_eq!(out, [7]);
         }
         // Built by hand: two lists of half the limit each.
@@ -2012,135 +1871,82 @@ mod tests {
     fn write_errors() {
         for p in PROTOCOLS {
             let l = Value::List(List { elem: Type::I32, items: vec![Value::I32(1), Value::I64(1)] });
-            assert_eq!(l.to_bytes(p), Err(WriteError::Mismatch));
+            assert_eq!(l.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
             let m =
                 Value::Map(Map { key: Type::I32, value: Type::I32, entries: vec![(Value::I32(1), Value::Bool(true))] });
-            assert_eq!(m.to_bytes(p), Err(WriteError::Mismatch));
+            assert_eq!(m.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
             let long = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN + 1] });
-            assert_eq!(long.to_bytes(p), Err(WriteError::TooLong));
+            assert_eq!(long.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
             let at = Value::List(List { elem: Type::Byte, items: vec![Value::Byte(0); MAX_CONTAINER_LEN] });
-            let b = at.to_bytes(p).unwrap();
+            let b = at.to_frame(p).map(|frame| frame.0).unwrap();
             assert_eq!(Value::parse(p, Type::List, &b), Ok((at, b.len())));
             let entries = vec![(Value::Byte(0), Value::Byte(0)); MAX_CONTAINER_LEN + 1];
             let long = Value::Map(Map { key: Type::Byte, value: Type::Byte, entries });
-            assert_eq!(long.to_bytes(p), Err(WriteError::TooLong));
+            assert_eq!(long.to_frame(p).map(|frame| frame.0), Err(WriteError::Unwritable));
         }
         let big = Value::Binary(vec![0; MAX_BINARY_LEN + 1]);
-        assert_eq!(big.to_bytes(Protocol::Binary), Err(WriteError::TooLong));
+        assert_eq!(big.to_frame(Protocol::Binary).map(|frame| frame.0), Err(WriteError::Unwritable));
         let at = Value::Binary(vec![0; MAX_BINARY_LEN]);
-        let b = at.to_bytes(Protocol::Compact).unwrap();
+        let b = ValueBody::<true, 11>(at.clone()).to_bytes().unwrap();
         assert_eq!(Value::parse(Protocol::Compact, Type::Binary, &b), Ok((at, b.len())));
         let m = Message { name: "x".repeat(MAX_BINARY_LEN + 1), ..add_call() };
-        assert_eq!(m.to_bytes(Protocol::BinaryOld), Err(WriteError::TooLong));
-        assert_eq!(frame(&vec![0; MAX_FRAME + 1]), Err(WriteError::TooLong));
-        let f = frame(&vec![0; MAX_FRAME]).unwrap();
-        assert_eq!(parse_frame(&f).unwrap().unwrap().1, f.len());
+        assert_eq!(m.to_frame(Protocol::BinaryOld).map(|frame| frame.0), Err(WriteError::Unwritable));
+        assert_eq!(Frame(vec![0; MAX_FRAME + 1]).to_bytes(), Err(WriteError::Unwritable));
+        let f = Frame(vec![0; MAX_FRAME]).to_bytes().unwrap();
+        assert_eq!(Frame::parse(&f).unwrap().0.len(), MAX_FRAME);
     }
 
     #[test]
     fn frames() {
-        let payload = add_call().to_bytes(Protocol::Compact).unwrap();
-        let f = add_call().to_frame(Protocol::Compact).unwrap();
-        assert_eq!(f[..4], (payload.len() as u32).to_be_bytes());
-        assert_eq!(parse_frame(&f), Ok(Some((&payload[..], f.len()))));
-        for n in 0..f.len() {
-            assert_eq!(parse_frame(&f[..n]), Ok(None), "{n} bytes");
+        let value = add_call().to_frame(Protocol::Compact).unwrap();
+        let bytes = value.to_bytes().unwrap();
+        assert_eq!(bytes[..4], (value.0.len() as u32).to_be_bytes());
+        contract::check_wire_value(&value);
+        assert_eq!(Frame::parse(&bytes), Ok(value));
+        for n in 0..bytes.len() {
+            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need), "{n} bytes");
+            assert_eq!(Frame::parse(&bytes[..n]), Err(FrameParseError::Truncated));
         }
-        assert_eq!(parse_frame(&[0, 0, 0, 0]), Ok(Some((&[][..], 4))));
-        assert_eq!(parse_frame(&[0xff, 0xff, 0xff, 0xff]), Err(FrameError::Length(-1)));
-        assert_eq!(parse_frame(&[0x00, 0xfa, 0x00, 0x01]), Err(FrameError::Length(16_384_001)));
+        assert_eq!(Frame::parse(&[0; 4]), Ok(Frame(vec![])));
+        assert_eq!(Frame::parse(&[0xff; 4]), Err(FrameParseError::Frame(FrameError::Length(-1))));
+        assert_eq!(Frame::parse(&[0x00, 0xfa, 0x00, 0x01]), Err(FrameParseError::Frame(FrameError::Length(16_384_001))));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_frames() {
         let a = add_call().to_frame(Protocol::Binary).unwrap();
         let b = Message { seq: 2, ..add_call() }.to_frame(Protocol::Compact).unwrap();
-        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
-            while let Some(f) = d.next_frame() {
-                got.push(Message::parse(&f.unwrap()).unwrap().0.seq);
-            }
-        }
-        assert_eq!(got, [1, 2]);
-        assert_eq!(d.buffered(), 0);
-        // A broken stream stays broken.
-        d.feed(&[0x80, 0, 0, 0]);
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(i32::MIN))));
-        d.feed(&a);
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(i32::MIN))));
-        assert_eq!(d.buffered(), 0);
+        let mut bytes = a.to_bytes().unwrap();
+        b.write(&mut bytes).unwrap();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * Frames::new().capacity());
+        assert_eq!(decode_all(Frames::new, &bytes), (vec![a, b], None));
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Length(i32::MIN)))));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert!(stream.next().is_none());
+        assert_eq!(stream.buffered(), 4);
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        let one = frame(&[1, 2, 3]).unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_reads_many_small_frames_in_linear_time() {
+        let one = Frame(vec![1, 2, 3]).to_bytes().unwrap();
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        d.feed(&stream);
+        let mut stream = Stream::new(Frames::new());
         let mut n = 0;
-        while let Some(f) = d.next_frame() {
-            assert_eq!(f.unwrap(), [1, 2, 3]);
-            n += 1;
-        }
+        pump(&mut stream, &one.repeat(200_000), |frame| { assert_eq!(frame.0, [1, 2, 3]); n += 1; }).unwrap();
+        finish(&mut stream, |_| unreachable!()).unwrap();
         assert_eq!(n, 200_000);
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(stream.buffered(), 0);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
-    /// Every message `Message::parse` finds in `b`, one after another, and
-    /// the error that ends them, if it is not [`Error::Truncated`].
-    fn parse_all(mut b: &[u8]) -> (Vec<(Message, Protocol)>, Option<Error>) {
-        let mut got = Vec::new();
-        loop {
-            match Message::parse(b) {
-                Ok((m, p, used)) => {
-                    got.push((m, p));
-                    b = &b[used..];
-                }
-                Err(Error::Truncated) => return (got, None),
-                Err(e) => return (got, Some(e)),
-            }
-        }
-    }
-
-    /// Feeds `b` to a stream decoder in pieces of the sizes `sizes` gives,
-    /// taking messages out after each.
-    fn stream_all(b: &[u8], mut sizes: impl FnMut() -> usize) -> (Vec<(Message, Protocol)>, Option<Error>) {
-        let mut d = StreamDecoder::new();
-        let mut got = Vec::new();
-        let mut at = 0;
-        while at < b.len() {
-            let end = (at + sizes().max(1)).min(b.len());
-            d.feed(&b[at..end]);
-            at = end;
-            while let Some(m) = d.next_message() {
-                match m {
-                    Ok(m) => got.push(m),
-                    Err(e) => {
-                        assert_eq!(d.next_message(), Some(Err(e)));
-                        assert_eq!(d.buffered(), 0);
-                        return (got, Some(e));
-                    }
-                }
-            }
-        }
-        (got, None)
-    }
-
-    /// The stream decoder agrees with reading the bytes whole. Where a
-    /// whole read stops early because a count is more than the bytes held,
-    /// the stream decoder may already see an error further on.
-    fn stream_agrees(b: &[u8], r: &mut Lcg) {
-        let want = parse_all(b);
-        for got in [stream_all(b, || 1), stream_all(b, || b.len()), stream_all(b, || r.below(9))] {
-            assert_eq!(got.0, want.0);
-            if want.1.is_some() {
-                assert_eq!(got.1, want.1);
-            }
+    fn check_messages(bytes: &[u8]) {
+        contract::check_decode_with_alloc_limit(Messages::new, bytes, 2 * Messages::new().capacity());
+        contract::check_decode_with_held_limit(Messages::new, bytes, Messages::new().held());
+        contract::check_wire::<EncodedMessage>(bytes);
+        for (message, protocol) in decode_all(Messages::new, bytes).0 {
+            contract::check_wire_value(&EncodedMessage { message, protocol });
         }
     }
 
@@ -2154,126 +1960,105 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x40, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xff,
         ];
-        let (m, p, _) = Message::parse(&b).unwrap();
+        assert_eq!(EncodedMessage::parse(&b), Err(Error::Trailing));
+        let Step::Item((m, p), used) = Messages::new().decode(&b, false).unwrap() else { panic!() };
+        assert_eq!(EncodedMessage::parse(&b[..used]).unwrap().message, m);
         assert_eq!(p, Protocol::Compact);
         assert!(matches!(m.body[0].value, Value::Double(x) if x.is_nan()));
         assert_eq!(m, m.clone());
-        stream_agrees(&b, &mut Lcg(1));
+        check_messages(&b);
         assert_eq!(Value::Double(f64::NAN), Value::Double(f64::NAN));
         assert_ne!(Value::Double(0.0), Value::Double(-0.0));
     }
 
     #[test]
-    fn stream_decoder_splits_a_stream() {
-        let a = add_call().to_bytes(Protocol::Binary).unwrap();
-        let b = Message { seq: 2, ..add_call() }.to_bytes(Protocol::Compact).unwrap();
-        let c = Message { seq: 3, ..add_call() }.to_bytes(Protocol::BinaryOld).unwrap();
-        let stream: Vec<u8> = [&a[..], &b, &c].concat();
-        let want = vec![
-            (add_call(), Protocol::Binary),
-            (Message { seq: 2, ..add_call() }, Protocol::Compact),
-            (Message { seq: 3, ..add_call() }, Protocol::BinaryOld),
-        ];
-        assert_eq!(stream_all(&stream, || 1), (want.clone(), None));
-        assert_eq!(stream_all(&stream, || stream.len()), (want, None));
-        let mut d = StreamDecoder::default();
-        d.feed(&a[..5]);
-        assert_eq!(d.next_message(), None);
-        assert_eq!(d.buffered(), 5);
-        d.feed(&a[5..]);
-        assert_eq!(d.next_message(), Some(Ok((add_call(), Protocol::Binary))));
-        assert_eq!((d.next_message(), d.buffered()), (None, 0));
-        // Errors, which stay.
-        d.feed(&[0x81]);
-        assert_eq!(d.next_message(), Some(Err(Error::BadProtocol(0x81))));
-        d.feed(&a);
-        assert_eq!(d.next_message(), Some(Err(Error::BadProtocol(0x81))));
-        assert_eq!(d.buffered(), 0);
-        // An error is found as soon as its byte comes.
-        let mut d = StreamDecoder::new();
-        d.feed(&[0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0x05]);
-        assert_eq!(d.next_message(), Some(Err(Error::BadType(5))));
-        let mut d = StreamDecoder::new();
-        d.feed(&[0x82, 0x21, 0, 1, 0xff]);
-        assert_eq!(d.next_message(), Some(Err(Error::BadUtf8)));
-        // A list that claims more elements than have come, with a bad
-        // element: a whole read says the bytes are cut short, while the
-        // stream decoder already sees the bad type.
-        let bad = [0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e];
-        assert_eq!(Message::parse(&bad), Err(Error::Truncated));
-        let mut d = StreamDecoder::new();
-        d.feed(&bad);
-        assert_eq!(d.next_message(), Some(Err(Error::BadType(14))));
-    }
-
-    #[test]
-    fn stream_decoder_reads_each_byte_once() {
-        // 400,000 boolean fields of one byte each, fed one byte at a time.
-        // Reading from the start on each byte would take about 10^11 steps.
-        let body = (0..400_000).map(|i| Field { id: (i % 15 + 1) as i16, value: Value::Bool(i % 3 == 0) }).collect();
-        let m = Message { body, ..add_call() };
-        let b = m.to_bytes(Protocol::Compact).unwrap();
-        let started = std::time::Instant::now();
-        let mut d = StreamDecoder::new();
-        let mut got = None;
-        for byte in &b {
-            d.feed(std::slice::from_ref(byte));
-            if let Some(r) = d.next_message() {
-                got = Some(r);
-            }
+    fn messages_split_a_stream_and_report_early_errors() {
+        let mut bytes = Vec::new();
+        let mut want = Vec::new();
+        for (seq, protocol) in PROTOCOLS.into_iter().enumerate() {
+            let message = Message { seq: seq as i32, ..add_call() };
+            EncodedMessage { message: message.clone(), protocol }.write(&mut bytes).unwrap();
+            want.push((message, protocol));
         }
-        assert_eq!(got, Some(Ok((m, Protocol::Compact))));
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
-        // A long byte string, cut in many pieces, is not read again for each.
-        let m = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
-        let b = m.to_bytes(Protocol::Binary).unwrap();
-        let started = std::time::Instant::now();
-        assert_eq!(stream_all(&b, || 16), (vec![(m, Protocol::Binary)], None));
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        check_messages(&bytes);
+        assert_eq!(decode_all(Messages::new, &bytes), (want, None));
+        let a = add_call().to_frame(Protocol::Binary).unwrap().0;
+        let mut stream = Stream::new(Messages::new());
+        assert_eq!(stream.push(&a[..5]), 5);
+        assert!(stream.next().is_none());
+        assert_eq!(stream.buffered(), 5);
+        assert_eq!(stream.push(&a[5..]), a.len() - 5);
+        assert_eq!(stream.next(), Some(Ok((add_call(), Protocol::Binary))));
+        assert_eq!((stream.next(), stream.buffered()), (None, 0));
+        assert_eq!(stream.push(&[0x81]), 1);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BadProtocol(0x81)))));
+        assert_eq!(stream.push(&a), a.len());
+        assert!(stream.next().is_none());
+        for (bytes, error) in [
+            (&[0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0x05][..], Error::BadType(5)),
+            (&[0x82, 0x21, 0, 1, 0xff][..], Error::BadUtf8),
+            (&[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e][..], Error::BadType(14)),
+        ] {
+            assert_eq!(decode_all(Messages::new, bytes), (vec![], Some(Fail::Protocol(error))));
+            check_messages(bytes);
+        }
+        let bad = [0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e];
+        assert_eq!(EncodedMessage::parse(&bad), Err(Error::Truncated));
     }
 
     #[test]
-    fn stream_decoder_limits_a_message() {
-        // A message whose one field is a byte string as long as allowed,
-        // so the whole message is a few bytes over the limit.
-        let mut head = vec![0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 11, 0, 1];
-        head.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
-        let mut d = StreamDecoder::new();
-        d.feed(&head);
-        let chunk = vec![0u8; 1 << 20];
-        let mut fed = head.len();
-        let got = loop {
-            if let Some(r) = d.next_message() {
-                break r;
+    fn messages_scan_in_linear_time() {
+        // Scanning 400,000 boolean fields from the start for every byte
+        // would require about 10^11 steps.
+        let body = (0..400_000).map(|i| Field { id: (i % 15 + 1) as i16, value: Value::Bool(i % 3 == 0) }).collect();
+        let dense = Message { body, ..add_call() };
+        let binary = Message { body: vec![Field { id: 1, value: Value::Binary(vec![7; 1 << 20]) }], ..add_call() };
+        for (message, protocol, size) in [(dense, Protocol::Compact, 1), (binary, Protocol::Binary, 16)] {
+            let bytes = message.to_frame(protocol).unwrap().0;
+            let started = std::time::Instant::now();
+            let mut stream = Stream::new(Messages::new());
+            let mut got = Vec::new();
+            for part in chunks(&bytes, &[size]) {
+                pump(&mut stream, part, |item| got.push(item)).unwrap();
             }
-            assert!(fed <= MAX_MESSAGE, "fed {fed} bytes");
-            d.feed(&chunk);
-            fed += chunk.len();
+            finish(&mut stream, |item| got.push(item)).unwrap();
+            assert_eq!(got, [(message, protocol)]);
+            assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        }
+    }
+
+    #[test]
+    fn messages_limit_a_message() {
+        let mut bytes = vec![0x80, 0x01, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 11, 0, 1];
+        bytes.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
+        let overhead = bytes.len() + 1;
+        bytes.resize(overhead + MAX_BINARY_LEN, 0);
+        let mut stream = Stream::new(Messages::new());
+        let result = chunks(&bytes, &[1 << 20]).try_for_each(|part| pump(&mut stream, part, |_| unreachable!()).map(|_| ()));
+        assert_eq!(result, Err(Fail::Protocol(Error::TooLong)));
+        assert!(stream.buffered() <= stream.decoder().capacity());
+        let message = Message {
+            body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_MESSAGE - overhead]) }],
+            name: String::new(), ..add_call()
         };
-        assert_eq!(got, Err(Error::TooLong));
-        assert_eq!(d.buffered(), 0);
-        // The longest message allowed is read.
-        let n = MAX_MESSAGE - head.len() - 1;
-        let m = Message {
-            body: vec![Field { id: 1, value: Value::Binary(vec![0; n]) }],
-            name: String::new(),
-            ..add_call()
-        };
-        let b = m.to_bytes(Protocol::Binary).unwrap();
-        assert_eq!(b.len(), MAX_MESSAGE);
-        assert_eq!(stream_all(&b, || 1 << 20), (vec![(m, Protocol::Binary)], None));
+        let bytes = message.to_frame(Protocol::Binary).unwrap().0;
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+        assert_eq!(decode_all(Messages::new, &bytes), (vec![(message, Protocol::Binary)], None));
     }
 
     #[test]
     fn messages_refuse_oversize_within_capacity() {
-        use super::super::codec::{Fail, Stream};
-
         // The binary value fits its own limit, but the whole message does not.
         let message = Message {
             body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_BINARY_LEN]) }],
             ..add_call()
         };
-        let bytes = message.to_bytes(Protocol::Binary).unwrap();
+        let value = EncodedMessage { message, protocol: Protocol::Binary };
+        contract::check_wire_value(&value);
+        assert_eq!(value.to_bytes(), Err(WriteError::Unwritable));
+        let mut bytes = vec![0x80, 1, 0, 1, 0, 0, 0, 3, b'a', b'd', b'd', 0, 0, 0, 1, 11, 0, 1];
+        bytes.extend_from_slice(&(MAX_BINARY_LEN as u32).to_be_bytes());
+        bytes.resize(bytes.len() + MAX_BINARY_LEN + 1, 0);
         let mut stream = Stream::new(Messages::new());
         let capacity = stream.decoder().capacity();
         assert_eq!(capacity, MAX_MESSAGE + 1);
@@ -2291,7 +2076,7 @@ mod tests {
             body: vec![Field { id: 1, value: Value::Binary(vec![0; MAX_MESSAGE - overhead]) }],
             ..add_call()
         };
-        let bytes = message.to_bytes(Protocol::Binary).unwrap();
+        let bytes = message.to_frame(Protocol::Binary).map(|frame| frame.0).unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         let mut stream = Stream::new(Messages::new());
         assert_eq!(stream.push(&bytes), bytes.len());
@@ -2303,7 +2088,7 @@ mod tests {
     fn messages_clone_preserves_scan_storage() {
         let message = add_call();
         for protocol in PROTOCOLS {
-            let bytes = message.to_bytes(protocol).unwrap();
+            let bytes = message.to_frame(protocol).map(|frame| frame.0).unwrap();
             let mut decoder = Messages::new();
             let held = decoder.held();
             for end in 0..bytes.len() {
@@ -2321,7 +2106,7 @@ mod tests {
     fn messages_rescan_after_shorter_input() {
         let message = Message { name: "ping".into(), kind: MessageType::Call, seq: 1, body: vec![] };
         for protocol in PROTOCOLS {
-            let bytes = message.to_bytes(protocol).unwrap();
+            let bytes = message.to_frame(protocol).map(|frame| frame.0).unwrap();
             for (len, eof) in [(0, true), (2, false)] {
                 let mut decoder = Messages::new();
                 assert_eq!(decoder.decode(&bytes[..bytes.len() - 1], false), Ok(Step::Need));
@@ -2332,50 +2117,23 @@ mod tests {
     }
 
     #[test]
-    fn messages_match_compat_at_every_split() {
-        use super::super::codec::{Stream, contract, finish, pump};
-
+    fn messages_check_nested_structs_across_protocols() {
         let mut bytes = Vec::new();
+        let mut want = Vec::new();
         for (seq, protocol) in PROTOCOLS.into_iter().enumerate() {
-            let message = Message {
-                seq: seq as i32,
-                body: vec![Field {
-                    id: 1,
-                    value: Value::Struct(vec![Field { id: 2, value: Value::I64(-123) }]),
-                }],
+            let message = Message { seq: seq as i32,
+                body: vec![Field { id: 1, value: Value::Struct(vec![Field { id: 2, value: Value::I64(-123) }]) }],
                 ..add_call()
             };
-            bytes.extend(message.to_bytes(protocol).unwrap());
+            EncodedMessage { message: message.clone(), protocol }.write(&mut bytes).unwrap();
+            want.push((message, protocol));
         }
-        let (want, error) = stream_all(&bytes, || bytes.len());
-        assert_eq!(error, None);
-        assert_eq!(want.len(), PROTOCOLS.len());
-        for cut in 0..=bytes.len() {
-            let mut stream = Stream::new(Messages::new());
-            let mut legacy = StreamDecoder::new();
-            let mut got = Vec::new();
-            let mut compat = Vec::new();
-            for part in [&bytes[..cut], &bytes[cut..]] {
-                pump(&mut stream, part, |item| got.push(item)).unwrap();
-                legacy.feed(part);
-                while let Some(item) = legacy.next_message() {
-                    compat.push(item.unwrap());
-                }
-            }
-            finish(&mut stream, |item| got.push(item)).unwrap();
-            assert_eq!(got, want, "cut {cut}");
-            assert_eq!(got, compat, "cut {cut}");
-            assert_eq!(stream.offset(), bytes.len() as u64);
-        }
-        assert_eq!(stream_all(&bytes, || 1), (want, None));
-        contract::check_decode(Messages::new, &bytes);
-        contract::check_decode_with_held_limit(Messages::new, &bytes, 2 * MAX_DEPTH * core::mem::size_of::<Task>());
+        check_messages(&bytes);
+        assert_eq!(decode_all(Messages::new, &bytes), (want, None));
     }
 
     #[test]
     fn messages_bound_scan_state_and_check_contract() {
-        use super::super::codec::contract;
-
         // A chain of structs reaches the nesting limit, then exceeds it.
         for depth in [MAX_DEPTH, MAX_DEPTH + 1] {
             let mut bytes = vec![0x82, 0x21, 0, 0];
@@ -2404,14 +2162,16 @@ mod tests {
             contract::check_decode_with_held_limit(Messages::new, &bytes, held);
         }
         for protocol in PROTOCOLS {
-            let bytes = add_call().to_bytes(protocol).unwrap();
+            let bytes = add_call().to_frame(protocol).map(|frame| frame.0).unwrap();
             for at in 0..bytes.len() {
                 let mut malformed = bytes.clone();
                 malformed[at] = 0xff;
-                contract::check_decode(Messages::new, &malformed);
+                contract::check_decode_with_alloc_limit(Messages::new, &malformed, 2 * Messages::new().capacity());
             }
         }
-        contract::check_decode(Messages::new, &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e]);
+        contract::check_decode_with_alloc_limit(
+            Messages::new, &[0x82, 0x21, 0, 0, 0x19, 0xf9, 0x05, 0x0e], 2 * Messages::new().capacity(),
+        );
     }
 
     #[test]
@@ -2437,45 +2197,33 @@ mod tests {
             assert_eq!(Type::from_compact_code(t.compact_code()), Some(t));
         }
         assert!(!Error::TooDeep.to_string().is_empty());
-        assert!(!WriteError::Mismatch.to_string().is_empty());
+        assert!(!WriteError::Unwritable.to_string().is_empty());
         assert!(!FrameError::Length(-1).to_string().is_empty());
-    }
-
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
     }
 
     fn random_type(r: &mut Lcg, depth: usize) -> Type {
         let n = if depth >= 4 { 8 } else { ALL_TYPES.len() };
-        ALL_TYPES[r.below(n)]
+        ALL_TYPES[r.index(n)]
     }
 
     fn random_value(r: &mut Lcg, ty: Type, depth: usize) -> Value {
         let big = (r.next() << 31) ^ r.next();
         match ty {
-            Type::Bool => Value::Bool(r.below(2) == 0),
+            Type::Bool => Value::Bool(r.coin()),
             Type::Byte => Value::Byte(big as i8),
             Type::I16 => Value::I16(big as i16),
-            Type::I32 => Value::I32(if r.below(2) == 0 { big as i32 } else { r.below(20) as i32 - 10 }),
-            Type::I64 => Value::I64((big << r.below(40)) as i64),
+            Type::I32 => Value::I32(if r.coin() { big as i32 } else { r.index(20) as i32 - 10 }),
+            Type::I64 => Value::I64((big << r.index(40)) as i64),
             Type::Double => Value::Double(big as i64 as f64 / 7.0),
-            Type::Binary => Value::Binary((0..r.below(6)).map(|_| r.next() as u8).collect()),
+            Type::Binary => Value::Binary(r.bytes(5)),
             Type::Uuid => Value::Uuid([r.next() as u8; 16]),
             Type::Struct => {
                 let mut id: i16 = 0;
-                let fields = (0..r.below(5))
+                let fields = (0..r.index(5))
                     .map(|_| {
-                        id = match r.below(3) {
+                        id = match r.index(3) {
                             0 => id.wrapping_add(1),
-                            1 => id.wrapping_add(r.below(20) as i16),
+                            1 => id.wrapping_add(r.index(20) as i16),
                             _ => r.next() as i16,
                         };
                         let t = random_type(r, depth + 1);
@@ -2486,13 +2234,13 @@ mod tests {
             }
             Type::List | Type::Set => {
                 let elem = random_type(r, depth + 1);
-                let n = if r.below(8) == 0 { 15 + r.below(5) } else { r.below(4) };
+                let n = if r.index(8) == 0 { 15 + r.index(5) } else { r.index(4) };
                 let items = (0..n).map(|_| random_value(r, elem, depth + 1)).collect();
                 let l = List { elem, items };
                 if ty == Type::List { Value::List(l) } else { Value::Set(l) }
             }
             Type::Map => {
-                let n = r.below(4);
+                let n = r.index(4);
                 let (key, value) = if n == 0 {
                     (Type::Byte, Type::Byte)
                 } else {
@@ -2508,8 +2256,8 @@ mod tests {
     fn random_message(r: &mut Lcg) -> Message {
         let Value::Struct(body) = random_value(r, Type::Struct, 1) else { unreachable!() };
         Message {
-            name: ["", "ping", "getUser", "\u{e9}t\u{e9}"][r.below(4)].to_string(),
-            kind: MessageType::from_code(1 + r.below(4) as u8).unwrap(),
+            name: ["", "ping", "getUser", "\u{e9}t\u{e9}"][r.index(4)].to_string(),
+            kind: MessageType::from_code(1 + r.index(4) as u8).unwrap(),
             seq: r.next() as i32 - (1 << 30),
             body,
         }
@@ -2518,28 +2266,28 @@ mod tests {
     /// Checks that a message read from damaged bytes writes and reads back
     /// to the same bytes.
     fn rewrites(m: &Message, p: Protocol) {
-        let b = m.to_bytes(p).unwrap();
-        let (again, q, used) = Message::parse(&b).unwrap();
-        assert_eq!((q, used), (p, b.len()));
-        assert_eq!(again.to_bytes(p).unwrap(), b);
+        let b = m.to_frame(p).map(|frame| frame.0).unwrap();
+        let EncodedMessage { message: again, protocol: q } = EncodedMessage::parse(&b).unwrap();
+        assert_eq!(q, p);
+        assert_eq!(again.to_frame(p).map(|frame| frame.0).unwrap(), b);
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut r = Lcg(9090);
+        let mut r = Lcg::new(9090);
         for i in 0..4000 {
             let m = random_message(&mut r);
             let p = PROTOCOLS[i % 3];
-            let b = m.to_bytes(p).unwrap();
-            assert_eq!(Message::parse(&b), Ok((m.clone(), p, b.len())));
+            let b = m.to_frame(p).map(|frame| frame.0).unwrap();
+            assert_eq!(EncodedMessage::parse(&b), Ok(EncodedMessage { message: m.clone(), protocol: p }));
             // Every proper prefix is truncated.
             for n in 0..b.len() {
-                assert_eq!(Message::parse(&b[..n]), Err(Error::Truncated), "{n} of {}", b.len());
+                assert_eq!(EncodedMessage::parse(&b[..n]), Err(Error::Truncated), "{n} of {}", b.len());
             }
             // Each value type alone round trips too.
             let t = random_type(&mut r, 1);
             let v = random_value(&mut r, t, 1);
-            let vb = v.to_bytes(p).unwrap();
+            let vb = v.to_frame(p).map(|frame| frame.0).unwrap();
             assert_eq!(Value::parse(p, t, &vb), Ok((v, vb.len())));
             for n in 0..vb.len() {
                 assert_eq!(Value::parse(p, t, &vb[..n]), Err(Error::Truncated));
@@ -2547,42 +2295,29 @@ mod tests {
             // Damaged copies never panic, and what parses rewrites the same.
             for _ in 0..4 {
                 let mut d = b.clone();
-                match r.below(3) {
-                    0 => {
-                        for _ in 0..1 + r.below(3) {
-                            let at = r.below(d.len());
-                            d[at] = r.next() as u8;
-                        }
-                    }
-                    1 => d.truncate(r.below(d.len() + 1)),
-                    _ => {
-                        let at = r.below(d.len() + 1);
-                        d.insert(at, r.next() as u8);
-                    }
-                }
-                if let Ok((m, q, used)) = Message::parse(&d) {
-                    assert!(used <= d.len());
+                mutate(&mut r, &mut d);
+                if let Ok(EncodedMessage { message: m, protocol: q }) = EncodedMessage::parse(&d) {
                     rewrites(&m, q);
                 }
-                stream_agrees(&d, &mut r);
+                check_messages(&d);
                 for t in ALL_TYPES {
                     for p in PROTOCOLS {
                         if let Ok((v, used)) = Value::parse(p, t, &d) {
                             assert!(used <= d.len());
-                            let vb = v.to_bytes(p).unwrap();
+                            let vb = v.to_frame(p).map(|frame| frame.0).unwrap();
                             let (back, n) = Value::parse(p, t, &vb).unwrap();
                             assert_eq!(n, vb.len());
-                            assert_eq!(back.to_bytes(p).unwrap(), vb);
+                            assert_eq!(back.to_frame(p).map(|frame| frame.0).unwrap(), vb);
                         }
                     }
                 }
             }
             // Random bytes.
-            let junk: Vec<u8> = (0..r.below(40)).map(|_| r.next() as u8).collect();
-            if let Ok((m, q, _)) = Message::parse(&junk) {
+            let junk = r.bytes(39);
+            if let Ok(EncodedMessage { message: m, protocol: q }) = EncodedMessage::parse(&junk) {
                 rewrites(&m, q);
             }
-            stream_agrees(&junk, &mut r);
+            check_messages(&junk);
             for t in ALL_TYPES {
                 let _ = Value::parse(Protocol::Compact, t, &junk);
                 let _ = Value::parse(Protocol::Binary, t, &junk);
@@ -2591,55 +2326,34 @@ mod tests {
     }
 
     #[test]
-    fn lcg_fuzz_decoder() {
-        let mut r = Lcg(1);
+    fn lcg_fuzz_streams() {
+        let mut r = Lcg::new(1);
         for _ in 0..1000 {
-            // A few frames, sometimes damaged, fed whole and a byte at a time.
+            // Framed messages, sometimes damaged, checked across input partitions.
             let mut stream = Vec::new();
-            for _ in 0..1 + r.below(3) {
-                let p = PROTOCOLS[r.below(3)];
-                stream.extend(random_message(&mut r).to_frame(p).unwrap());
+            for _ in 0..1 + r.index(3) {
+                let p = PROTOCOLS[r.index(3)];
+                stream.extend(random_message(&mut r).to_frame(p).unwrap().to_bytes().unwrap());
             }
-            if r.below(3) == 0 {
-                let at = r.below(stream.len());
+            if r.index(3) == 0 {
+                let at = r.index(stream.len());
                 stream[at] = r.next() as u8;
             }
-            let mut whole = Decoder::new();
-            whole.feed(&stream);
-            let mut a = Vec::new();
-            while let Some(f) = whole.next_frame() {
-                let stop = f.is_err();
-                a.push(f);
-                if stop {
-                    break;
-                }
-            }
-            let mut bytewise = Decoder::new();
-            let mut b = Vec::new();
-            'outer: for byte in &stream {
-                bytewise.feed(std::slice::from_ref(byte));
-                while let Some(f) = bytewise.next_frame() {
-                    let stop = f.is_err();
-                    b.push(f);
-                    if stop {
-                        break 'outer;
-                    }
-                }
-            }
-            assert_eq!(a, b);
+            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * Frames::new().capacity());
+            let frames = decode_all(Frames::new, &stream).0;
             // The same messages without frames, sometimes damaged.
             let mut bare = Vec::new();
-            for _ in 0..1 + r.below(3) {
-                let p = PROTOCOLS[r.below(3)];
-                bare.extend(random_message(&mut r).to_bytes(p).unwrap());
+            for _ in 0..1 + r.index(3) {
+                let p = PROTOCOLS[r.index(3)];
+                bare.extend(random_message(&mut r).to_frame(p).map(|frame| frame.0).unwrap());
             }
-            if r.below(2) == 0 {
-                let at = r.below(bare.len());
+            if r.coin() {
+                let at = r.index(bare.len());
                 bare[at] = r.next() as u8;
             }
-            stream_agrees(&bare, &mut r);
-            for f in a.into_iter().flatten() {
-                if let Ok((m, q, _)) = Message::parse(&f) {
+            check_messages(&bare);
+            for f in frames {
+                if let Ok(EncodedMessage { message: m, protocol: q }) = EncodedMessage::parse(&f.0) {
                     rewrites(&m, q);
                 }
             }
