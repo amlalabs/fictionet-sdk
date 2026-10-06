@@ -158,11 +158,11 @@ fn proxy_v1_v2_round_trip_and_handoff() {
             tlvs: vec![],
         }),
     ];
-    let mut checksummed = proxy::V2_SIGNATURE.to_vec();
-    checksummed.extend_from_slice(&[0x21, 0, 0, 7, 3, 0, 4, 0, 0, 0, 0]);
-    let crc = proxy::crc32c(&checksummed);
-    checksummed[19..23].copy_from_slice(&crc.to_be_bytes());
-    headers.push(<proxy::Header as Wire>::parse(&checksummed).unwrap());
+    headers.push(proxy::Header::V2(proxy::V2 {
+        command: proxy::Command::Proxy,
+        addresses: proxy::Addresses::Unspec,
+        tlvs: vec![],
+    }.with_checksum().unwrap()));
     for header in headers {
         let bytes = Wire::to_bytes(&header).unwrap();
         contract::check_wire::<proxy::Header>(&bytes);
@@ -510,7 +510,7 @@ fn socks4_limit_is_independent_of_chunking_with_a_larger_buffer() {
     for chunk_size in [bytes.len(), 1, 7, 16] {
         let mut stream = Stream::with_buffer(socks::ClientMessages::with_limit(16), 4096);
         let mut result = None;
-        for chunk in bytes.chunks(chunk_size) {
+        for chunk in chunks(&bytes, &[chunk_size]) {
             assert_eq!(stream.push(chunk), chunk.len());
             result = stream.next();
             if result.is_some() {
@@ -841,7 +841,7 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                         };
                         let bytes = server.send(&message).unwrap();
                         let mut got = Vec::new();
-                        for chunk in bytes.chunks(chunk_size) {
+                        for chunk in chunks(&bytes, &[chunk_size]) {
                             assert_eq!(client.push(chunk), chunk.len());
                             while let Some(item) = client.next_message() {
                                 got.push(item.unwrap().unwrap());
@@ -858,7 +858,7 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                         };
                         let bytes = client.send(&message).unwrap();
                         let mut got = Vec::new();
-                        for chunk in bytes.chunks(chunk_size) {
+                        for chunk in chunks(&bytes, &[chunk_size]) {
                             assert_eq!(server.push(chunk), chunk.len());
                             while let Some(item) = server.next_message() {
                                 got.push(item.unwrap().unwrap());
@@ -1004,7 +1004,7 @@ fn rfb_pending_input_is_bounded_and_error_survives_handoff() {
     for chunk_size in [1, 1024, bytes.len()] {
         let mut server = rfb::Server::new();
         let mut accepted = 0;
-        for chunk in bytes.chunks(chunk_size) {
+        for chunk in chunks(&bytes, &[chunk_size]) {
             accepted += server.push(chunk);
             assert!(server.buffered() <= rfb::MAX_PENDING);
         }
@@ -1151,7 +1151,7 @@ fn rfb_frame_scan_accepts_raw_and_cursor_at_each_pixel_width() {
 fn contract_checks_small_arbitrary_inputs_and_wire_values() {
     let mut random = codec::test_support::Lcg::new(0x1234_5678);
     for len in 0..80 {
-        let bytes: Vec<_> = (0..len).map(|_| random.next() as u8).collect();
+        let bytes = random.bytes(len);
         contract::check_decode_with_alloc_limit(|| proxy::Headers::with_limit(32), &bytes, 2 * 32);
         contract::check_decode_with_alloc_limit(|| SocksHandshake(socks::ClientMessages::with_limit(16)), &bytes, 2 * 16);
         contract::check_decode_with_alloc_limit(|| socks::ServerMessages::socks5(socks::Command::Bind), &bytes, 2 * socks::MAX_MESSAGE);

@@ -2,45 +2,123 @@
 #![no_main]
 
 use fictionet::stdlib::{
-    codec::contract,
+    codec::{self, Wire, contract, test_support::chunks},
     rfb::{ClientMessages, ServerMessages},
 };
 
 use fictionet::stdlib::rfb::{
-    ClientMessage, Client, Dialect, PixelFormat, Phase, ServerInit, ServerMessage, Server, Version, Text,
+    ClientMessage, Client, Dialect, Error, ParseError, PixelFormat, Phase, ServerInit, ServerMessage, Server, Version, Text,
 };
 use libfuzzer_sys::fuzz_target;
 
-/// A server that answers whenever it is its turn, with VNC Authentication
-/// or None.
-fn server_turn(s: &Server, vnc: bool) -> Option<ServerMessage> {
-    Some(match s.phase() {
-        Phase::ServerVersion => ServerMessage::Version(Version::V3_8),
-        Phase::SecurityOffer if s.dialect() == Dialect::V3_3 => ServerMessage::SecurityType(if vnc { 2 } else { 1 }),
-        Phase::SecurityOffer => ServerMessage::SecurityTypes(vec![1, 2]),
-        Phase::VncChallenge => ServerMessage::VncChallenge([7; 16]),
-        Phase::SecurityResult => ServerMessage::SecurityOk,
-        Phase::ServerInit => {
-            ServerMessage::ServerInit(ServerInit { width: 4, height: 3, format: PixelFormat::TRUE_COLOR_32, name: vec![] })
-        }
-        _ => return None,
-    })
-}
+mod sessions {
+    use super::{Client, ClientMessage, Dialect, Error, ParseError, Phase, PixelFormat, Server, ServerInit, ServerMessage, Version, codec};
 
-/// A client that answers whenever it is its turn.
-fn client_turn(s: &Client, version: Version, vnc: bool) -> Option<ClientMessage> {
-    Some(match s.phase() {
-        Phase::ClientVersion => ClientMessage::Version(version),
-        Phase::SecurityChoice => {
-            // Type 0 is not a type, and cannot be picked.
-            let offered = s.offered();
-            let pick = [if vnc { 2 } else { 1 }, 1, 2].into_iter().find(|t| offered.contains(t));
-            ClientMessage::SecurityType(pick.or_else(|| offered.iter().copied().find(|&t| t != 0))?)
+    /// One session result, preserving both unit and terminal failures.
+    pub type Item<T> = Result<Result<T, ParseError>, codec::Fail<Error>>;
+
+    fn server_turn(server: &Server, vnc: bool) -> Option<ServerMessage> {
+        Some(match server.phase() {
+            Phase::ServerVersion => ServerMessage::Version(Version::V3_8),
+            Phase::SecurityOffer if server.dialect() == Dialect::V3_3 => ServerMessage::SecurityType(if vnc { 2 } else { 1 }),
+            Phase::SecurityOffer => ServerMessage::SecurityTypes(vec![1, 2]),
+            Phase::VncChallenge => ServerMessage::VncChallenge([7; 16]),
+            Phase::SecurityResult => ServerMessage::SecurityOk,
+            Phase::ServerInit => ServerMessage::ServerInit(ServerInit {
+                width: 4, height: 3, format: PixelFormat::TRUE_COLOR_32, name: vec![],
+            }),
+            _ => return None,
+        })
+    }
+
+    fn client_turn(client: &Client, version: Version, vnc: bool) -> Option<ClientMessage> {
+        Some(match client.phase() {
+            Phase::ClientVersion => ClientMessage::Version(version),
+            Phase::SecurityChoice => {
+                let offered = client.offered();
+                let pick = [if vnc { 2 } else { 1 }, 1, 2].into_iter().find(|t| offered.contains(t));
+                ClientMessage::SecurityType(pick.or_else(|| offered.iter().copied().find(|&t| t != 0))?)
+            }
+            Phase::VncResponse => ClientMessage::VncResponse([9; 16]),
+            Phase::ClientInit => ClientMessage::ClientInit { shared: true },
+            _ => return None,
+        })
+    }
+
+    fn server_pump(server: &mut Server, vnc: bool, got: &mut Vec<Item<ClientMessage>>) -> bool {
+        loop {
+            if let Some(message) = server_turn(server, vnc) {
+                server.send(&message).unwrap();
+                continue;
+            }
+            match server.next_message() {
+                Some(item) => {
+                    let failed = !matches!(item, Ok(Ok(_)));
+                    got.push(item);
+                    if failed {
+                        return false;
+                    }
+                }
+                None => {
+                    // Sends between pushes must preserve an incomplete peer unit.
+                    if server.phase() == Phase::Normal {
+                        server.send(&ServerMessage::Bell).unwrap();
+                    }
+                    return true;
+                }
+            }
         }
-        Phase::VncResponse => ClientMessage::VncResponse([9; 16]),
-        Phase::ClientInit => ClientMessage::ClientInit { shared: true },
-        _ => return None,
-    })
+    }
+
+    /// Reads bounded client input with scripted server replies and intervening Bells.
+    pub fn as_server<'a>(vnc: bool, chunks: impl IntoIterator<Item = &'a [u8]>) -> Vec<Item<ClientMessage>> {
+        let mut server = Server::new();
+        let mut got = Vec::new();
+        server_pump(&mut server, vnc, &mut got);
+        for chunk in chunks {
+            assert_eq!(server.push(chunk), chunk.len());
+            if !server_pump(&mut server, vnc, &mut got) {
+                break;
+            }
+        }
+        got
+    }
+
+    /// Reads bounded server input with scripted client replies and intervening pointer events.
+    pub fn as_client<'a>(
+        version: Version,
+        vnc: bool,
+        chunks: impl IntoIterator<Item = &'a [u8]>,
+    ) -> Vec<Item<(ServerMessage, PixelFormat)>> {
+        let mut client = Client::new();
+        let mut got = Vec::new();
+        'input: for chunk in chunks {
+            assert_eq!(client.push(chunk), chunk.len());
+            loop {
+                if let Some(message) = client_turn(&client, version, vnc) {
+                    client.send(&message).unwrap();
+                    continue;
+                }
+                match client.next_message() {
+                    Some(item) => {
+                        let failed = !matches!(item, Ok(Ok(_)));
+                        got.push(item.map(|result| result.map(|message| (message, client.pixel_format()))));
+                        if failed {
+                            break 'input;
+                        }
+                    }
+                    None => {
+                        // Even a send inside an update must preserve decoder progress.
+                        if client.phase() == Phase::Normal {
+                            client.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        got
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -116,38 +194,23 @@ fuzz_target!(|data: &[u8]| {
     let vnc = choice & 1 == 1;
     let version = [Version::V3_3, Version::V3_7, Version::V3_8, Version { major: 3, minor: 889 }][usize::from(choice >> 1) % 4];
 
-    // Exercise the sessions' two-direction state with bounded input.
+    // Compare the sessions across pushes, including sends inside partial units.
     let data = &data[..data.len().min(4096)];
-    let mut server = Server::with_limit(4096);
-    server.send(&ServerMessage::Version(Version::V3_8)).unwrap();
-    let _ = server.push(data);
-    loop {
-        if let Some(message) = server_turn(&server, vnc) {
-            server.send(&message).unwrap();
-            continue;
-        }
-        match server.next_message() {
-            Some(Ok(Ok(message))) => {
-                if !message.is_handshake() { contract::check_wire_value(&message); }
-            }
-            _ => break,
+    let whole = sessions::as_server(vnc, [data]);
+    assert_eq!(whole, sessions::as_server(vnc, chunks(data, &[1])));
+    for message in whole.iter().flatten().flatten() {
+        if !message.is_handshake() {
+            assert!(message.to_bytes().is_ok());
+            contract::check_wire_value(message);
         }
     }
-    let mut client = Client::with_limit(4096);
-    let _ = client.push(data);
-    loop {
-        if let Some(message) = client_turn(&client, version, vnc) {
-            if client.send(&message).is_err() { break; }
-            continue;
-        }
-        match client.next_message() {
-            Some(Ok(Ok(message))) if !message.is_handshake() => {
-                let mut bytes = Vec::new();
-                message.write(client.dialect(), &client.pixel_format(), &mut bytes).unwrap();
-                assert_eq!(ServerMessage::parse(&bytes, &client.pixel_format()), Ok(message));
-            }
-            Some(Ok(Ok(_))) => {}
-            _ => break,
+    let whole = sessions::as_client(version, vnc, [data]);
+    assert_eq!(whole, sessions::as_client(version, vnc, chunks(data, &[1])));
+    for (message, format) in whole.iter().flatten().flatten() {
+        if !message.is_handshake() {
+            let mut bytes = Vec::new();
+            message.write(Dialect::V3_8, format, &mut bytes).unwrap();
+            assert_eq!(ServerMessage::parse(&bytes, format), Ok(message.clone()));
         }
     }
     // Context-dependent writes are transactional too.

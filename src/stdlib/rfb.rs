@@ -270,12 +270,7 @@ impl ServerMessage {
     pub fn write(&self, dialect: Dialect, format: &PixelFormat, dest: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::new();
         match self {
-            ServerMessage::Version(v) => {
-                if !v.writable() {
-                    return Err(Error::Unwritable);
-                }
-                v.write(&mut out)?;
-            }
+            ServerMessage::Version(v) => v.write(&mut out)?,
             ServerMessage::SecurityTypes(types) => {
                 if dialect == Dialect::V3_3
                     || types.is_empty()
@@ -310,15 +305,7 @@ impl ServerMessage {
                     return Err(Error::Unwritable);
                 }
             }
-            ServerMessage::ServerInit(init) => {
-                if !init.format.is_valid() {
-                    return Err(Error::PixelFormat);
-                }
-                out.extend_from_slice(&init.width.to_be_bytes());
-                out.extend_from_slice(&init.height.to_be_bytes());
-                init.format.write(&mut out)?;
-                Text::new(&init.name).write(&mut out)?;
-            }
+            ServerMessage::ServerInit(init) => init.write(&mut out)?,
             ServerMessage::FramebufferUpdate(rects) => {
                 if rects.len() > MAX_ITEMS {
                     return Err(Error::Unwritable);
@@ -420,7 +407,9 @@ impl Wire for Text<'_> {
 
     /// Refuses text longer than [`MAX_TEXT`]. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.bytes.len() > MAX_TEXT { return Err(Error::TooLong); }
+        if self.bytes.len() > MAX_TEXT {
+            return Err(Error::TooLong);
+        }
         let len = u32::try_from(self.bytes.len()).map_err(|_| Error::TooLong)?;
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&self.bytes);
@@ -1231,7 +1220,7 @@ impl std::fmt::Display for Error {
             Error::NotRequested => f.write_str("server message the client did not ask for"),
             Error::Outstanding => f.write_str("pixel format changed while an update is outstanding"),
             Error::Phase(p) => write!(f, "message does not belong in phase {p:?}"),
-            Error::Unwritable => f.write_str("message cannot be written as it is"),
+            Error::Unwritable => f.write_str("RFB value cannot be written unchanged"),
         }
     }
 }
@@ -1279,7 +1268,6 @@ impl Version {
     fn parse_prefix(b: &[u8]) -> Result<Option<(Version, usize)>, Error> {
         run(b, version)
     }
-
 
     /// Whether both parts fit in three digits.
     fn writable(self) -> bool {
@@ -1356,7 +1344,6 @@ impl PixelFormat {
             blue_shift: b[12],
         }
     }
-
 
     /// Whether RFC 6143, section 7.4, allows this format: bits per pixel
     /// of 8, 16 or 32, no more than that many bits of depth, and for true
@@ -1544,7 +1531,6 @@ impl ClientMessage {
                 | ClientMessage::ClientInit { .. }
         )
     }
-
 }
 
 impl ServerMessage {
@@ -1565,7 +1551,6 @@ impl ServerMessage {
                 | ServerMessage::ServerCutText(_)
         )
     }
-
 }
 
 /// Where a connection is in the protocol: whose turn it is and what comes
@@ -2366,7 +2351,6 @@ mod tests {
         assert_eq!(s.buffered(), MAX_PENDING);
     }
 
-
     #[test]
     fn server_init_example() {
         let mut c = Client::new();
@@ -2418,6 +2402,220 @@ mod tests {
         assert_eq!(r[0].contents, Contents::Raw(vec![1, 2, 3, 4]));
     }
 
+    mod sessions {
+        use super::{Client, ClientMessage, Dialect, Error, ParseError, Phase, PixelFormat, Server, ServerInit, ServerMessage, Version, codec};
+
+        /// One session result, preserving both unit and terminal failures.
+        pub type Item<T> = Result<Result<T, ParseError>, codec::Fail<Error>>;
+
+        fn server_turn(server: &Server, vnc: bool) -> Option<ServerMessage> {
+            Some(match server.phase() {
+                Phase::ServerVersion => ServerMessage::Version(Version::V3_8),
+                Phase::SecurityOffer if server.dialect() == Dialect::V3_3 => ServerMessage::SecurityType(if vnc { 2 } else { 1 }),
+                Phase::SecurityOffer => ServerMessage::SecurityTypes(vec![1, 2]),
+                Phase::VncChallenge => ServerMessage::VncChallenge([7; 16]),
+                Phase::SecurityResult => ServerMessage::SecurityOk,
+                Phase::ServerInit => ServerMessage::ServerInit(ServerInit {
+                    width: 4, height: 3, format: PixelFormat::TRUE_COLOR_32, name: vec![],
+                }),
+                _ => return None,
+            })
+        }
+
+        fn client_turn(client: &Client, version: Version, vnc: bool) -> Option<ClientMessage> {
+            Some(match client.phase() {
+                Phase::ClientVersion => ClientMessage::Version(version),
+                Phase::SecurityChoice => {
+                    let offered = client.offered();
+                    let pick = [if vnc { 2 } else { 1 }, 1, 2].into_iter().find(|t| offered.contains(t));
+                    ClientMessage::SecurityType(pick.or_else(|| offered.iter().copied().find(|&t| t != 0))?)
+                }
+                Phase::VncResponse => ClientMessage::VncResponse([9; 16]),
+                Phase::ClientInit => ClientMessage::ClientInit { shared: true },
+                _ => return None,
+            })
+        }
+
+        fn server_pump(server: &mut Server, vnc: bool, got: &mut Vec<Item<ClientMessage>>) -> bool {
+            loop {
+                if let Some(message) = server_turn(server, vnc) {
+                    server.send(&message).unwrap();
+                    continue;
+                }
+                match server.next_message() {
+                    Some(item) => {
+                        let failed = !matches!(item, Ok(Ok(_)));
+                        got.push(item);
+                        if failed {
+                            return false;
+                        }
+                    }
+                    None => {
+                        // Sends between pushes must preserve an incomplete peer unit.
+                        if server.phase() == Phase::Normal {
+                            server.send(&ServerMessage::Bell).unwrap();
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+
+        /// Reads bounded client input with scripted server replies and intervening Bells.
+        pub fn as_server<'a>(vnc: bool, chunks: impl IntoIterator<Item = &'a [u8]>) -> Vec<Item<ClientMessage>> {
+            let mut server = Server::new();
+            let mut got = Vec::new();
+            server_pump(&mut server, vnc, &mut got);
+            for chunk in chunks {
+                assert_eq!(server.push(chunk), chunk.len());
+                if !server_pump(&mut server, vnc, &mut got) {
+                    break;
+                }
+            }
+            got
+        }
+
+        /// Reads bounded server input with scripted client replies and intervening pointer events.
+        pub fn as_client<'a>(
+            version: Version,
+            vnc: bool,
+            chunks: impl IntoIterator<Item = &'a [u8]>,
+        ) -> Vec<Item<(ServerMessage, PixelFormat)>> {
+            let mut client = Client::new();
+            let mut got = Vec::new();
+            'input: for chunk in chunks {
+                assert_eq!(client.push(chunk), chunk.len());
+                loop {
+                    if let Some(message) = client_turn(&client, version, vnc) {
+                        client.send(&message).unwrap();
+                        continue;
+                    }
+                    match client.next_message() {
+                        Some(item) => {
+                            let failed = !matches!(item, Ok(Ok(_)));
+                            got.push(item.map(|result| result.map(|message| (message, client.pixel_format()))));
+                            if failed {
+                                break 'input;
+                            }
+                        }
+                        None => {
+                            // Even a send inside an update must preserve decoder progress.
+                            if client.phase() == Phase::Normal {
+                                client.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            got
+        }
+    }
+
+    #[test]
+    fn handshake_truncated_prefixes() {
+        let mut to_server = b"RFB 003.008\n".to_vec();
+        SecurityChoice(2).write(&mut to_server).unwrap();
+        VncResponse([9; 16]).write(&mut to_server).unwrap();
+        ClientInit { shared: true }.write(&mut to_server).unwrap();
+        ClientMessage::KeyEvent { down: true, key: 65 }.write(&mut to_server).unwrap();
+        let whole = sessions::as_server(true, [&to_server[..]]);
+        assert_eq!(whole.len(), 5);
+        assert!(whole.iter().all(|item| matches!(item, Ok(Ok(_)))));
+        for n in 0..=to_server.len() {
+            let part = sessions::as_server(true, [&to_server[..n]]);
+            assert_eq!(part, sessions::as_server(true, chunks(&to_server[..n], &[1])));
+            assert_eq!(part, whole[..part.len()]);
+            if n < to_server.len() { assert!(part.len() < whole.len()); }
+        }
+        let mut to_client = b"RFB 003.008\n".to_vec();
+        let format = PixelFormat::TRUE_COLOR_32;
+        for message in [ServerMessage::SecurityTypes(vec![1, 2]), ServerMessage::VncChallenge([3; 16]),
+            ServerMessage::SecurityOk, ServerMessage::ServerInit(ServerInit { width: 1, height: 1, format, name: b"n".to_vec() }),
+            ServerMessage::Bell] {
+            message.write(Dialect::V3_8, &format, &mut to_client).unwrap();
+        }
+        let whole = sessions::as_client(Version::V3_8, true, [&to_client[..]]);
+        assert_eq!(whole.len(), 6);
+        assert!(whole.iter().all(|item| matches!(item, Ok(Ok(_)))));
+        for n in 0..=to_client.len() {
+            let part = sessions::as_client(Version::V3_8, true, [&to_client[..n]]);
+            assert_eq!(part, sessions::as_client(Version::V3_8, true, chunks(&to_client[..n], &[1])));
+            assert_eq!(part, whole[..part.len()]);
+            if n < to_client.len() { assert!(part.len() < whole.len()); }
+        }
+    }
+
+    #[test]
+    fn generated_sessions_agree_across_pushes() {
+        let mut rng = Lcg::new(0x5900);
+        let to_server = [vec![], b"RFB 003.008\n".to_vec(), b"RFB 003.003\n".to_vec(),
+            [&b"RFB 003.008\n"[..], &[1, 1]].concat(),
+            [&b"RFB 003.007\n"[..], &[2], &[0; 16], &[0]].concat(),
+            [&b"RFB 003.003\n"[..], &[0; 16], &[1]].concat()];
+        let init = ServerInit { width: 2, height: 2, format: PixelFormat::TRUE_COLOR_32, name: vec![] }.to_bytes().unwrap();
+        let to_client = [vec![], b"RFB 003.008\n".to_vec(),
+            [&b"RFB 003.008\n"[..], &[1, 1], &[0; 4], &init].concat(),
+            [&b"RFB 003.008\n"[..], &[0, 0, 0, 1], &init].concat(),
+            [&b"RFB 003.008\n"[..], &[1, 2], &[0; 16], &[0; 4], &init].concat()];
+        let versions = [Version::V3_3, Version::V3_7, Version::V3_8];
+        let mut normal = 0;
+        for _ in 0..4000 {
+            let vnc = rng.coin();
+            let mut data = to_server[rng.index(to_server.len())].clone();
+            ClientMessage::PointerEvent { buttons: rng.next() as u8, x: 1, y: 1 }.write(&mut data).unwrap();
+            data.extend(rng.bytes(80));
+            let whole = sessions::as_server(vnc, [&data[..]]);
+            assert_eq!(whole, sessions::as_server(vnc, chunks(&data, &[1])));
+            for message in whole.iter().flatten().flatten().filter(|m| !m.is_handshake()) {
+                normal += 1;
+                assert!(message.to_bytes().is_ok());
+                contract::check_wire_value(message);
+            }
+            let version = versions[rng.index(versions.len())];
+            let mut data = to_client[rng.index(to_client.len())].clone();
+            ServerMessage::ServerCutText(rng.bytes(30)).write(Dialect::V3_8, &PixelFormat::TRUE_COLOR_32, &mut data).unwrap();
+            data.extend(rng.bytes(80));
+            let whole = sessions::as_client(version, vnc, [&data[..]]);
+            assert_eq!(whole, sessions::as_client(version, vnc, chunks(&data, &[1])));
+            for (message, format) in whole.iter().flatten().flatten().filter(|(m, _)| !m.is_handshake()) {
+                normal += 1;
+                let bytes = server_bytes(message, Dialect::V3_8, format).unwrap();
+                assert_eq!(ServerMessage::parse(&bytes, format), Ok(message.clone()));
+            }
+        }
+        assert!(normal > 500, "only {normal} normal messages");
+    }
+
+    #[test]
+    fn session_messages_byte_at_a_time_are_bounded() {
+        let rectangles = vec![Rectangle { x: 0, y: 0, width: 1, height: 1,
+            contents: Contents::Raw(vec![1, 2, 3, 4]) }; MAX_ITEMS];
+        let update = ServerMessage::FramebufferUpdate(rectangles);
+        let bytes = server_bytes(&update, Dialect::V3_8, &PixelFormat::TRUE_COLOR_32).unwrap();
+        let (mut server, mut client) = normal_pair();
+        let started = std::time::Instant::now();
+        for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+            assert_eq!(client.push(chunk), 1);
+            if i + 1 < bytes.len() { assert_eq!(client.next_message(), None); }
+            assert!(client.buffered() <= MAX_MESSAGE);
+        }
+        assert_eq!(client.next_message(), Some(Ok(Ok(update))));
+        assert_eq!(client.buffered(), 0);
+        let message = ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 };
+        let bytes = message.to_bytes().unwrap();
+        for _ in 0..100_000 {
+            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                assert_eq!(server.push(chunk), 1);
+                if i + 1 < bytes.len() { assert_eq!(server.next_message(), None); }
+                assert!(server.buffered() <= MAX_CLIENT_MESSAGE);
+            }
+            assert_eq!(server.next_message(), Some(Ok(Ok(message.clone()))));
+        }
+        assert_eq!(server.buffered(), 0);
+        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+    }
+
     #[test]
     fn pixel_formats() {
         let f = PixelFormat::TRUE_COLOR_32;
@@ -2430,6 +2628,7 @@ mod tests {
         assert!(p.big_endian && p.true_color);
         odd[2] = 1; odd[3] = 1; odd[13..].fill(0);
         assert_eq!(p.to_bytes().unwrap(), odd);
+        assert_eq!(PixelFormat { bits_per_pixel: 24, ..f }.bytes_per_pixel(), None);
         odd[0] = 24;
         assert_eq!(PixelFormat::parse(&odd), Err(ParseError::Protocol(Error::PixelFormat)));
         // RFC 6143, section 7.4.
@@ -2482,7 +2681,12 @@ mod tests {
             }
             // And through a session, a byte at a time.
             let (mut s, _) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
-            assert_eq!(s.push(&bytes), bytes.len());
+            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                assert_eq!(s.push(chunk), chunk.len());
+                if i + 1 < bytes.len() {
+                    assert_eq!(s.next_message(), None);
+                }
+            }
             assert_eq!(s.next_message(), Some(Ok(Ok(m))));
         }
         // Handshake messages are fixed bytes.
@@ -2503,7 +2707,12 @@ mod tests {
                 assert_eq!(ServerMessage::parse(&bytes[..n], &f), Err(ParseError::Truncated), "{m:?} cut to {n}");
             }
             let (_, mut c) = converse(Version::V3_8, ServerMessage::SecurityTypes(vec![1]), Some(1), Some(ServerMessage::SecurityOk));
-            assert_eq!(c.push(&bytes), bytes.len());
+            for (i, chunk) in chunks(&bytes, &[1]).enumerate() {
+                assert_eq!(c.push(chunk), chunk.len());
+                if i + 1 < bytes.len() {
+                    assert_eq!(c.next_message(), None);
+                }
+            }
             assert_eq!(c.next_message(), Some(Ok(Ok(m))));
         }
         assert_eq!(server_bytes(&ServerMessage::Bell, Dialect::V3_3, &f), Ok(vec![2]));
@@ -2618,9 +2827,6 @@ mod tests {
         }
     }
 
-
-
-
     /// A server and a client past the handshake, with a 1024 by 768
     /// framebuffer.
     fn normal_pair() -> (Server, Client) {
@@ -2638,7 +2844,6 @@ mod tests {
         let _ = c.push(&s.send(&m).unwrap());
         assert_eq!(c.next_message(), Some(Ok(Ok(m))));
     }
-
 
     #[test]
     fn sends_between_pushes_keep_update_progress() {
@@ -2872,7 +3077,6 @@ mod tests {
         assert_eq!(c.send(&ClientMessage::SecurityType(1)), Ok(vec![1]));
     }
 
-
     fn server_bytes(message: &ServerMessage, dialect: Dialect, format: &PixelFormat) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         message.write(dialect, format, &mut out)?;
@@ -2984,5 +3188,4 @@ mod tests {
             assert_eq!(ServerMessage::parse(&bytes[2..], &format), Ok(message));
         }
     }
-
 }
