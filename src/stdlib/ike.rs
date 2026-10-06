@@ -1487,7 +1487,7 @@ impl<const FIRST: u8> Wire for Payloads<FIRST> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
+    use fictionet::stdlib::codec::{contract, Lcg, test_support::{mutate}};
     use super::*;
 
     /// An IKE_SA_INIT request laid out by hand from the figures in RFC

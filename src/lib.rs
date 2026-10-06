@@ -118,6 +118,14 @@
 //! its futures use only [`std::task::Waker`], so a world runs on tokio or
 //! on Fictionet's own [`block_on`].
 //!
+//! [`stdlib::http2`] provides frames, directional connection state, and capture
+//! presentation. HTTP/2 DATA feeds [`stdlib::grpc::Messages`] through a shared
+//! [`Demux`](stdlib::codec::Demux) budget. To show another protocol in
+//! captures, implement [`observe::Present`] for its items and byte ranges,
+//! then add it to [`observe::Registry`]. Use
+//! [`observe::Dissector::with_registry`] for capture packets or
+//! [`Cx::observe_protocols`] for live watches.
+//!
 //! # Running a world
 //!
 //! Fictionet does not own `main` or the executor. A world runs inside an

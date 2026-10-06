@@ -1,9 +1,6 @@
 use super::{
     Decode, Fail, Stream,
-    alloc::{
-        boxed::Box,
-        collections::{BTreeMap, BTreeSet},
-    },
+    alloc::collections::{BTreeMap, BTreeSet},
 };
 use core::{
     cell::Cell,
@@ -22,7 +19,7 @@ struct Entry<D: Decode> {
 /// closed until removed. Its last item or protocol error is delivered.
 /// A successful item is followed by [`Fail::Stuck`] on the next visit.
 /// Allocator overhead and provenance have separate component limits.
-pub struct Demux<K: Ord, D: Decode> {
+pub struct Demux<K: Ord, D: Decode, F = fn(&K) -> D> {
     streams: BTreeMap<K, Entry<D>>,
     ready: BTreeSet<K>,
     cursor: Option<K>,
@@ -30,14 +27,15 @@ pub struct Demux<K: Ord, D: Decode> {
     // Only one stream can escape through get_mut before the next owner call.
     dirty: Cell<Option<(K, usize)>>,
     excess: Cell<Option<K>>,
-    make: Box<dyn FnMut(&K) -> D>,
+    make: F,
     max_streams: usize,
     max_bytes: usize,
 }
-impl<K: Ord + Clone, D: Decode> Demux<K, D> {
+impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F> {
     /// Sets the stream count and shared byte limits. The factory is called
-    /// only when an absent key has a free stream slot.
-    pub fn new(max_streams: usize, max_bytes: usize, make: impl FnMut(&K) -> D + 'static) -> Self {
+    /// only when an absent key has a free stream slot. The factory's type
+    /// determines whether this owner can move between threads.
+    pub fn new(max_streams: usize, max_bytes: usize, make: F) -> Self {
         Self {
             streams: BTreeMap::new(),
             ready: BTreeSet::new(),
@@ -45,7 +43,7 @@ impl<K: Ord + Clone, D: Decode> Demux<K, D> {
             total: Cell::new(0),
             dirty: Cell::new(None),
             excess: Cell::new(None),
-            make: Box::new(make),
+            make,
             max_streams,
             max_bytes,
         }
@@ -184,7 +182,7 @@ impl<K: Ord + Clone, D: Decode> Demux<K, D> {
             .or_else(|| self.ready.first().cloned())
     }
 }
-impl<K: Ord + Clone, D: Decode> Demux<K, D>
+impl<K: Ord + Clone, D: Decode, F: FnMut(&K) -> D> Demux<K, D, F>
 where
     D::Error: Clone,
 {

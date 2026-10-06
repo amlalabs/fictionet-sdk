@@ -233,6 +233,9 @@ name = "fictionet-copy-modules"
 version = "0.0.0"
 dependencies = [
  "fictionet",
+ "hickory-proto",
+ "httparse",
+ "ring",
 ]
 
 [[package]]

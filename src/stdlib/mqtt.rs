@@ -1105,7 +1105,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
 
     fn connect_bytes() -> Vec<u8> {

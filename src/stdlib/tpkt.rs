@@ -485,7 +485,7 @@ mod codec_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, contract, test_support};
 
     // RFC 1006 section 6: version 3, reserved, then the length of the

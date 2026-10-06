@@ -901,7 +901,7 @@ impl Decode for Frames {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
-    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+    use fictionet::stdlib::codec::{Lcg, test_support::{decode_all, mutate}};
 
     fn check(input: &[u8]) {
         contract::check_decode_with_alloc_limit(Frames::new, input, 2 * Frames::new().capacity());

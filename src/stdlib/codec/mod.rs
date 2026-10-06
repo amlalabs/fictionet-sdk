@@ -80,6 +80,8 @@ use alloc::vec::Vec;
 use core::error::Error;
 
 mod buffer;
+mod lcg;
+pub use lcg::Lcg;
 mod combinators;
 pub mod contract;
 mod demux;

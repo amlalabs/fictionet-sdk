@@ -1632,7 +1632,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
 
     /// The four examples of RFC 5424 section 6.5, with the BOM bytes in

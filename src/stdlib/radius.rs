@@ -1800,7 +1800,7 @@ pub fn enum_name(kind: u8, value: u32) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, Lcg, test_support::{mutate, decode_all}};
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()

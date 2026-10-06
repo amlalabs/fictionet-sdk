@@ -2068,6 +2068,8 @@ impl Decode for StreamItems {
     }
 }
 
+type StreamFactory = Box<dyn FnMut(&u64) -> StreamItems + Send>;
+
 /// Ordered QUIC stream input under one aggregate connection budget.
 ///
 /// This is an input owner, separate from the I/O [`fictionet::stdlib::Connection`] trait.
@@ -2095,7 +2097,7 @@ impl Decode for StreamItems {
 /// then [`Self::unpause`] when it is no longer blocked.
 /// Acknowledgments and insert increments come back as values to send.
 pub struct Connection {
-    streams: codec::Demux<u64, StreamItems>,
+    streams: codec::Demux<u64, StreamItems, StreamFactory>,
     paused: std::collections::BTreeMap<u64, codec::Stream<StreamItems>>,
     sender: Endpoint,
 }
@@ -2111,19 +2113,25 @@ impl Connection {
     /// to release input before retrying. The budget is not raised automatically.
     pub fn new(sender: Endpoint, max_streams: usize, max_bytes: usize) -> Self {
         Self {
-            streams: codec::Demux::new(max_streams, max_bytes, move |id: &u64| {
-                let uni_sender = match sender {
-                    Endpoint::Client => 2,
-                    Endpoint::Server => 3,
-                };
-                if *id > MAX_VARINT || (!(*id).is_multiple_of(4) && *id % 4 != uni_sender) {
-                    StreamItems { kind: StreamKind::Invalid }
-                } else if id.is_multiple_of(4) {
-                    StreamItems::request()
-                } else {
-                    StreamItems::unidirectional()
-                }
-            }),
+            streams: codec::Demux::new(
+                max_streams,
+                max_bytes,
+                Box::new(move |id: &u64| {
+                    let uni_sender = match sender {
+                        Endpoint::Client => 2,
+                        Endpoint::Server => 3,
+                    };
+                    if *id > MAX_VARINT || (!(*id).is_multiple_of(4) && *id % 4 != uni_sender) {
+                        StreamItems {
+                            kind: StreamKind::Invalid,
+                        }
+                    } else if id.is_multiple_of(4) {
+                        StreamItems::request()
+                    } else {
+                        StreamItems::unidirectional()
+                    }
+                }),
+            ),
             paused: std::collections::BTreeMap::new(),
             sender,
         }
@@ -2225,7 +2233,7 @@ impl Connection {
 mod tests {
     use fictionet::stdlib::codec::{
         contract, Fail, Stream,
-        test_support::{decode_all, Lcg, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
     use super::*;
 

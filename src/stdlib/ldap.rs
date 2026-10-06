@@ -2555,7 +2555,7 @@ fn declared_total(b: &[u8]) -> usize {
 mod tests {
     use fictionet::stdlib::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, chunks, decode_all, mutate},
+        Lcg, test_support::{chunks, decode_all, mutate},
     };
     use super::*;
 
