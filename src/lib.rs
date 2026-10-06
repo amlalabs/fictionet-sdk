@@ -118,12 +118,6 @@
 //! its futures use only [`std::task::Waker`], so a world runs on tokio or
 //! on Fictionet's own [`block_on`].
 //!
-//! To customize a protocol, copy its file from `src/stdlib/` into your crate
-//! and edit it. Keep its `fictionet::stdlib::...` imports, then use its
-//! [`Decode`](stdlib::codec::Decode) and [`Wire`](stdlib::codec::Wire)
-//! implementations with [`Stream`](stdlib::codec::Stream). The
-//! `custom_protocol` example runs this workflow without network or root.
-//!
 //! # Running a world
 //!
 //! Fictionet does not own `main` or the executor. A world runs inside an

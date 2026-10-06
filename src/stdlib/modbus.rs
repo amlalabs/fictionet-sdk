@@ -16,10 +16,6 @@
 //! registers exist, and what they hold, is up to world code. So is whether
 //! a write succeeds.
 //!
-//! To customize this protocol, copy this file into your crate and edit it.
-//! Keep its `fictionet::stdlib::...` imports and use the copy with [`Stream`](fictionet::stdlib::codec::Stream).
-//! The `custom_protocol` example adds a server reply for one planted register.
-//!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. A request that breaks the specification becomes an
 //! [`Exception`] the world can send back, as a real device would. Writers

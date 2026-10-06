@@ -15,10 +15,6 @@
 //! and [`Collect`] cover lines and values that end at EOF. [`Spans`] records
 //! bounded provenance; [`Demux`] shares a budget across keyed streams.
 //!
-//! To customize a protocol, copy its module file into your crate and edit it.
-//! Keep its `fictionet::stdlib::...` imports. Its [`Decode`] and [`Wire`]
-//! implementations work with the same [`Stream`] and combinators.
-//!
 //! This module uses only `core` and `alloc`. The planned async `serve`
 //! adapter lives in stdlib next to [`tcp`](super::tcp), outside this module.
 //! No function here performs I/O, reads a clock, or uses global state.
