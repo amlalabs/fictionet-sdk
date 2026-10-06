@@ -52,6 +52,7 @@ cargo +nightly fuzz list
 | `dhcpv6` | bytes and constructed values, checked with codec contracts | `stdlib::dhcpv6`: DHCPv6 |
 | `enip` | arbitrary packet streams and CIP bodies plus constructed packets; checks chunking, packet policy, nested body round trips and write rollback | `stdlib::enip`: EtherNet/IP and CIP |
 | `coap` | datagrams, TCP streams, and constructed values, checked with codec contracts | `stdlib::coap`: CoAP and block transfers |
+| `fast` | bounded arbitrary bytes, original templates, parsed XML templates, and constructed values | `stdlib::fast`: stop-bit and nullable wire contracts, block framing and blocks piped into messages, presence maps, all operators, dictionary resets, template-driven framing, chunking, EOF, allocation limits, and transactional encoding |
 | `fastcgi` | arbitrary bytes and constructed values | `stdlib::fastcgi`: exact wire values, request and response state, and bounded codec contracts |
 | `bgp` | arbitrary bytes and constructed values | `stdlib::bgp`: exact frames, session context, UPDATE handling, and bounded codec contracts |
 | `ftp` | control streams, address tokens, and constructed commands and replies | `stdlib::ftp`: strict wire values and bounded codec contracts |

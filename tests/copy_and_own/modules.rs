@@ -38,6 +38,8 @@ macro_rules! protocols {
         pub mod dtls;
         #[path = "../../src/stdlib/enip.rs"]
         pub mod enip;
+        #[path = "../../src/stdlib/fast.rs"]
+        pub mod fast;
         #[path = "../../src/stdlib/fastcgi.rs"]
         pub mod fastcgi;
         #[path = "../../src/stdlib/fix.rs"]

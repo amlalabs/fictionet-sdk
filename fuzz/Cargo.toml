@@ -865,3 +865,10 @@ path = "fuzz_targets/fix.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fast"
+path = "fuzz_targets/fast.rs"
+test = false
+doc = false
+bench = false

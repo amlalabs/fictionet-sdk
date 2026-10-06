@@ -170,6 +170,7 @@ pub mod dnp3;
 pub mod dns;
 pub mod dtls;
 pub mod enip;
+pub mod fast;
 pub mod fastcgi;
 pub mod fix;
 pub mod ftp;
