@@ -8,7 +8,9 @@
 //!
 //! It cannot inspect hidden memory, prove absence of panics on untested
 //! input, or infer a protocol's held-state limit or exact wire grammar.
-//! Use [`check_decode_with_held_limit`] for a named state limit. A decoder
+//! Use [`check_decode_with_held_limit`] for a named state limit and
+//! [`check_decode_with_alloc_limit`] for a bound on the input buffer's
+//! allocation. A decoder
 //! must report its state accurately. Mode timing is enforced by the
 //! one-item interface. [`check_wire_value`] tests constructed writer values,
 //! including values a parser cannot produce.
@@ -36,6 +38,11 @@ struct Audit<'a, D> {
     source: &'a [u8],
     suffix_len: usize,
     held_limit: usize,
+}
+#[derive(Clone, Copy)]
+struct Limits {
+    held: usize,
+    alloc: usize,
 }
 impl<D: Decode> Decode for Audit<'_, D> {
     type Item = D::Item;
@@ -121,6 +128,7 @@ fn drain<D: Decode>(
     stream: &mut Stream<Audit<'_, D>>,
     out: &mut Outcome<D::Item, D::Error>,
     accepted: usize,
+    alloc_limit: usize,
 ) where
     D::Error: Clone,
 {
@@ -128,6 +136,10 @@ fn drain<D: Decode>(
         assert!(
             stream.buffered() <= stream.dec.capacity(),
             "buffered exceeds capacity"
+        );
+        assert!(
+            stream.buf.allocated() <= alloc_limit,
+            "buffer allocation exceeds limit"
         );
         assert_eq!(
             stream.offset(),
@@ -155,6 +167,10 @@ fn drain<D: Decode>(
         stream.buffered() <= stream.dec.capacity(),
         "buffered exceeds capacity"
     );
+    assert!(
+        stream.buf.allocated() <= alloc_limit,
+        "buffer allocation exceeds limit"
+    );
     assert_eq!(
         stream.offset(),
         stream.dec.state.borrow().consumed,
@@ -170,7 +186,7 @@ fn run<'a, D: Decode>(
     dec: D,
     source: &'a [u8],
     input: impl Iterator<Item = &'a [u8]>,
-    held_limit: usize,
+    limits: Limits,
 ) -> Outcome<D::Item, D::Error>
 where
     D::Error: Clone + PartialEq + Debug,
@@ -179,6 +195,10 @@ where
         dec.capacity() <= Buffer::MAX_LIMIT,
         "capacity exceeds buffer limit"
     );
+    let Limits {
+        held: held_limit,
+        alloc: alloc_limit,
+    } = limits;
     assert!(dec.held() <= held_limit, "held exceeds named limit");
     let state = Rc::new(RefCell::new(AuditState::default()));
     let mut stream = Stream::new(Audit {
@@ -200,7 +220,7 @@ where
             accepted = accepted.saturating_add(n);
             chunk = chunk.get(n..).unwrap_or_default();
             let before = stream.offset();
-            drain(&mut stream, &mut out, accepted);
+            drain(&mut stream, &mut out, accepted, alloc_limit);
             assert!(
                 n > 0 || stream.offset() > before || stream.is_done(),
                 "push made no progress"
@@ -211,7 +231,7 @@ where
         }
     }
     stream.end();
-    drain(&mut stream, &mut out, accepted);
+    drain(&mut stream, &mut out, accepted, alloc_limit);
     assert!(stream.is_done(), "driver did not finish after end");
     assert_eq!(
         stream.failed(),
@@ -252,10 +272,46 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    let whole = run(make(), data, chunks(data, &[]), held_limit);
+    check_limits(
+        make,
+        data,
+        Limits {
+            held: held_limit,
+            alloc: usize::MAX,
+        },
+    );
+}
+/// Like [`check_decode`], also checking that the stream's input buffer
+/// never has more than `alloc_limit` bytes allocated, measured by
+/// [`Buffer::allocated`] after every push and every item. A [`Stream`]
+/// keeps up to twice its limit allocated, so `2 * capacity` is the bound
+/// for a decoder whose capacity never changes.
+pub fn check_decode_with_alloc_limit<D: Decode>(
+    make: impl Fn() -> D,
+    data: &[u8],
+    alloc_limit: usize,
+) where
+    D::Item: PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+{
+    check_limits(
+        make,
+        data,
+        Limits {
+            held: usize::MAX,
+            alloc: alloc_limit,
+        },
+    );
+}
+fn check_limits<D: Decode>(make: impl Fn() -> D, data: &[u8], limits: Limits)
+where
+    D::Item: PartialEq + Debug,
+    D::Error: Clone + PartialEq + Debug,
+{
+    let whole = run(make(), data, chunks(data, &[]), limits);
     for pattern in [&[1][..], &[7], &[64], &[3, 1, 1000]] {
         assert_eq!(
-            run(make(), data, chunks(data, pattern), held_limit),
+            run(make(), data, chunks(data, pattern), limits),
             whole,
             "chunking changed decoding"
         );
@@ -263,7 +319,7 @@ where
     for seed in [0, 1, 0x1234_5678] {
         let mut rng = Lcg::new(seed);
         assert_eq!(
-            run(make(), data, random_chunks(data, &mut rng, 97), held_limit),
+            run(make(), data, random_chunks(data, &mut rng, 97), limits),
             whole,
             "random chunking changed decoding"
         );
@@ -273,7 +329,7 @@ where
             make(),
             data.get(..cut).unwrap_or_default(),
             chunks(data.get(..cut).unwrap_or_default(), &[]),
-            held_limit,
+            limits,
         );
     }
 }
