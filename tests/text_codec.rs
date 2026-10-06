@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::codec::{
     self, Decode, Fail, Step, Stream, Wire, contract, finish, pump,
-    test_support::{Lcg, chunks},
+    test_support::{Lcg, decode_all, mutate},
 };
 use fictionet::stdlib::{ftp, memcache, whois};
 use std::fmt::Debug;
@@ -21,45 +21,15 @@ where
     bytes
 }
 
-fn drive<D: Decode>(
-    decoder: D,
-    bytes: &[u8],
-    pattern: &[usize],
-) -> (Vec<D::Item>, Option<Fail<D::Error>>)
-where
-    D::Error: Clone + Debug,
-{
-    let capacity = decoder.capacity();
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    let mut failure = None;
-    for part in chunks(bytes, pattern) {
-        if let Err(e) = pump(&mut stream, part, |item| items.push(item)) {
-            failure = Some(e);
-            break;
-        }
-        assert!(stream.buffered() <= capacity);
-    }
-    if failure.is_none() {
-        failure = finish(&mut stream, |item| items.push(item)).err();
-    }
-    assert!(stream.is_done());
-    assert!(stream.next().is_none());
-    assert!(stream.next().is_none());
-    (items, failure)
-}
-
 fn round_trip<D: Decode>(make: impl Fn() -> D, bytes: &[u8], expected: &[D::Item])
 where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_stack(&make, bytes);
-    for pattern in [&[][..], &[1], &[3, 1, 7, 2, 19], &[64]] {
-        let (items, failure) = drive(make(), bytes, pattern);
-        assert_eq!(failure, None);
-        assert_eq!(items, expected);
-    }
+    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    let (items, failure) = decode_all(make, bytes);
+    assert_eq!(failure, None);
+    assert_eq!(items, expected);
 }
 
 #[test]
@@ -88,7 +58,7 @@ fn ftp_wire_preserves_numeric_middle_lines() {
         b"230-Welcome\r\n230-second line\r\n230 Login ok\r\n".as_slice(),
         b"200-a\r\n123 b\r\n200 c\r\n",
     ] {
-        let (items, failure) = drive(ftp::Replies::new(), bytes, &[1]);
+        let (items, failure) = decode_all(ftp::Replies::new, bytes);
         assert_eq!(failure, None);
         assert_eq!(items.len(), 1);
         let reply = items[0].as_ref().unwrap();
@@ -97,7 +67,7 @@ fn ftp_wire_preserves_numeric_middle_lines() {
         reply.write(&mut out).unwrap();
         assert_eq!(&out[b"prefix".len()..], bytes);
         contract::check_wire::<ftp::Reply>(bytes);
-        assert_ne!(reply.to_bytes(), bytes);
+        assert_eq!(reply.to_bytes().unwrap(), bytes);
     }
 }
 
@@ -154,20 +124,20 @@ fn ftp_line_limits_escape_boundaries_and_eof() {
     for input in [b"NOOP\r".as_slice(), b"RETR a\r\0\n"] {
         contract::check_decode(ftp::Commands::new, input);
         assert_eq!(
-            drive(ftp::Commands::new(), input, &[1]).1,
+            decode_all(ftp::Commands::new, input).1,
             Some(Fail::Protocol(ftp::DecodeError::Incomplete))
         );
     }
     for input in [b"220-hello\r\n".as_slice(), b"220-\r\n", b"220 hel"] {
         contract::check_decode(ftp::Replies::new, input);
         assert_eq!(
-            drive(ftp::Replies::new(), input, &[1]).1,
+            decode_all(ftp::Replies::new, input).1,
             Some(Fail::Protocol(ftp::DecodeError::Incomplete))
         );
     }
     let bad = [b"220-hello\n".as_slice(), &[0], b"\n220 done\n"].concat();
     assert_eq!(
-        drive(ftp::Replies::new(), &bad, &[1]).1,
+        decode_all(ftp::Replies::new, &bad).1,
         Some(Fail::Protocol(ftp::DecodeError::Reply(
             ftp::ReplyError::Text
         )))
@@ -175,7 +145,7 @@ fn ftp_line_limits_escape_boundaries_and_eof() {
     let long_reply = vec![b'1'; ftp::MAX_LINE];
     contract::check_decode(ftp::Replies::new, &long_reply);
     assert_eq!(
-        drive(ftp::Replies::new(), &long_reply, &[1]).1,
+        decode_all(ftp::Replies::new, &long_reply).1,
         Some(Fail::Protocol(ftp::DecodeError::Reply(
             ftp::ReplyError::LineTooLong
         )))
@@ -203,7 +173,7 @@ fn ftp_reply_count_limit_recovers_at_matching_code() {
 #[test]
 fn ftp_wire_is_exact_strict_and_transactional() {
     let lower = ftp::Command::new("noop", None);
-    assert_eq!(lower.to_bytes().unwrap(), b"NOOP\r\n");
+    assert_eq!(lower.to_bytes(), Err(ftp::WriteError::Unwritable));
     let mut out = b"prefix".to_vec();
     assert!(lower.write(&mut out).is_err());
     assert_eq!(out, b"prefix");
@@ -323,7 +293,7 @@ fn whois_errors_limits_and_query_truncation() {
     let mut stream = Stream::new(whois::Queries::new());
     assert_eq!(stream.push(&bytes), whois::MAX_QUERY + 2);
     assert_eq!(stream.next(), Some(Ok(Err(whois::QueryError::TooLong))));
-    let (items, failure) = drive(whois::Queries::new(), b"query\r", &[1]);
+    let (items, failure) = decode_all(whois::Queries::new, b"query\r");
     assert!(items.is_empty());
     assert_eq!(
         failure,
@@ -335,7 +305,7 @@ fn whois_errors_limits_and_query_truncation() {
 }
 
 #[test]
-fn whois_response_limit_preserves_the_legacy_flag() {
+fn whois_response_limit_reports_truncation() {
     for (bytes, truncated) in [
         (b"".as_slice(), false),
         (b"abc", false),
@@ -359,15 +329,13 @@ fn whois_response_limit_preserves_the_legacy_flag() {
     );
     for size in [whois::MAX_RESPONSE, whois::MAX_RESPONSE + 1] {
         let bytes = vec![b'x'; size];
-        let mut old = whois::ResponseDecoder::new();
-        old.feed(&bytes);
-        let truncated = old.truncated();
-        let (items, failure) = drive(whois::Responses::new(), &bytes, &[7, 4096]);
+        let truncated = size > whois::MAX_RESPONSE;
+        let (items, failure) = decode_all(whois::Responses::new, &bytes);
         assert_eq!(failure, None);
         assert_eq!(
             items,
             [whois::CollectedResponse {
-                response: old.finish(),
+                response: whois::Response::new(&bytes[..whois::MAX_RESPONSE]).unwrap(),
                 truncated
             }]
         );
@@ -388,7 +356,7 @@ fn cache_packet(value: &[u8]) -> memcache::Packet {
             expiration: 0,
         }
         .to_bytes()
-        .to_vec(),
+        .unwrap(),
         key: b"key".to_vec(),
         value: value.to_vec(),
     }
@@ -517,13 +485,13 @@ fn memcache_limits_are_checked_before_body_assembly() {
     );
     let mut bytes = vec![b'x'; memcache::MAX_LINE];
     bytes.extend_from_slice(b"\r\nversion\r\n");
-    contract::check_decode(memcache::Commands::new, &bytes);
+    contract::check_decode_with_alloc_limit(memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE);
     assert_eq!(
-        drive(memcache::Commands::new(), &bytes, &[1]).1,
+        decode_all(memcache::Commands::new, &bytes).1,
         Some(Fail::Protocol(memcache::TextFrameError::LineTooLong))
     );
     assert_eq!(
-        drive(memcache::Responses::new(), &bytes, &[1]).1,
+        decode_all(memcache::Responses::new, &bytes).1,
         Some(Fail::Protocol(memcache::TextFrameError::LineTooLong))
     );
     let mut header = [0; memcache::BINARY_HEADER_LEN];
@@ -551,7 +519,7 @@ fn memcache_eof_inside_headers_bodies_trailers_and_skips() {
     ] {
         contract::check_decode(memcache::Commands::new, bytes);
         assert_eq!(
-            drive(memcache::Commands::new(), bytes, &[1]).1,
+            decode_all(memcache::Commands::new, bytes).1,
             Some(Fail::Protocol(memcache::TextFrameError::Incomplete))
         );
     }
@@ -562,19 +530,19 @@ fn memcache_eof_inside_headers_bodies_trailers_and_skips() {
     ] {
         contract::check_decode(memcache::Responses::new, bytes);
         assert_eq!(
-            drive(memcache::Responses::new(), bytes, &[1]).1,
+            decode_all(memcache::Responses::new, bytes).1,
             Some(Fail::Protocol(memcache::TextFrameError::Incomplete))
         );
     }
     let bytes = b"set key 0 0 4\r\nda";
     contract::check_decode(|| memcache::Commands::with_limit(3), bytes);
     assert_eq!(
-        drive(memcache::Commands::with_limit(3), bytes, &[1]).1,
+        decode_all(|| memcache::Commands::with_limit(3), bytes).1,
         Some(Fail::Protocol(memcache::TextFrameError::Incomplete))
     );
     let bytes = written(&[cache_packet(b"body")]);
     for cut in [1, 23, 24, bytes.len() - 1] {
-        let (items, failure) = drive(memcache::Frames::new(), &bytes[..cut], &[1]);
+        let (items, failure) = decode_all(memcache::Frames::new, &bytes[..cut]);
         assert!(items.is_empty());
         assert_eq!(failure, Some(Fail::Truncated { unread: cut }));
     }
@@ -591,7 +559,7 @@ fn memcache_multiget_uses_its_own_line_limit() {
     round_trip(memcache::Commands::new, &bytes, &[Ok(command)]);
     let mut long = b"get ".to_vec();
     long.resize(memcache::MAX_GET_LINE, b'x');
-    let (items, failure) = drive(memcache::Commands::new(), &long, &[1]);
+    let (items, failure) = decode_all(memcache::Commands::new, &long);
     assert!(items.is_empty());
     assert_eq!(
         failure,
@@ -630,26 +598,32 @@ fn contracts_cover_random_and_mutated_input() {
     for size in 0..64 {
         let mut bytes = vec![0; size * 3];
         rng.fill(&mut bytes);
-        contract::check_decode(ftp::Commands::new, &bytes);
-        contract::check_decode(ftp::Replies::new, &bytes);
-        contract::check_decode(whois::Queries::new, &bytes);
-        contract::check_decode(|| whois::Responses::with_limit(17), &bytes);
-        contract::check_decode(memcache::Commands::new, &bytes);
-        contract::check_decode(memcache::Responses::new, &bytes);
-        contract::check_decode(|| memcache::Frames::with_limit(17), &bytes);
+        contract::check_decode_with_alloc_limit(ftp::Commands::new, &bytes, 2 * ftp::MAX_LINE);
+        contract::check_decode_with_alloc_limit(ftp::Replies::new, &bytes, 2 * ftp::MAX_LINE);
+        contract::check_decode_with_alloc_limit(whois::Queries::new, &bytes, 2 * (whois::MAX_QUERY + 2));
+        contract::check_decode_with_alloc_limit(|| whois::Responses::with_limit(17), &bytes, 2 * whois::RESPONSE_WINDOW);
+        contract::check_decode_with_alloc_limit(memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE);
+        contract::check_decode_with_alloc_limit(memcache::Responses::new, &bytes, 2 * memcache::MAX_LINE);
+        contract::check_decode_with_alloc_limit(|| memcache::Frames::with_limit(17), &bytes, 2 * (memcache::BINARY_HEADER_LEN + 17));
         contract::check_wire::<ftp::Command>(&bytes);
         contract::check_wire::<ftp::Reply>(&bytes);
+        contract::check_wire::<ftp::Request>(&bytes);
+        contract::check_wire::<ftp::PortAddress>(&bytes);
+        contract::check_wire::<ftp::EprtAddress>(&bytes);
         contract::check_wire::<whois::Query>(&bytes);
         contract::check_wire::<whois::Response>(&bytes);
         contract::check_wire::<memcache::Command>(&bytes);
         contract::check_wire::<memcache::Response>(&bytes);
         contract::check_wire::<memcache::Packet>(&bytes);
+        contract::check_wire::<memcache::UdpFrame>(&bytes);
+        contract::check_wire::<memcache::StoreExtras>(&bytes);
+        contract::check_wire::<memcache::CounterExtras>(&bytes);
     }
     let source = b"set key 0 0 4\r\na\r\nb\r\nversion\r\n";
-    for at in 0..source.len() {
+    for _ in 0..source.len() {
         let mut bytes = source.to_vec();
-        bytes[at] = rng.next() as u8;
-        contract::check_decode(memcache::Commands::new, &bytes);
+        mutate(&mut rng, &mut bytes);
+        contract::check_decode_with_alloc_limit(memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE);
         contract::check_wire::<memcache::Command>(&bytes);
     }
 }
@@ -726,23 +700,19 @@ fn memcache_long_get_line_keeps_the_content_limit_after_a_cr() {
         bytes.resize(content_len, b'x');
         bytes[memcache::MAX_LINE - 1] = b'\r';
         bytes.extend_from_slice(b"\r\n");
-        let mut legacy = memcache::CommandDecoder::new();
-        assert_eq!(legacy.feed(&bytes), bytes.len());
-        let old = legacy.next_command().unwrap();
-        for pattern in [&[][..], &[memcache::MAX_LINE], &[1, 8191, 3]] {
-            let (items, failure) = drive(memcache::Commands::new(), &bytes, pattern);
-            if content_len == memcache::MAX_GET_LINE - 2 {
-                assert_eq!(old, Err(memcache::Error::Key));
-                assert_eq!(failure, None);
-                assert_eq!(items.as_slice(), std::slice::from_ref(&old));
-            } else {
-                assert_eq!(old, Err(memcache::Error::LineTooLong));
-                assert!(items.is_empty());
-                assert_eq!(
-                    failure,
-                    Some(Fail::Protocol(memcache::TextFrameError::LineTooLong))
-                );
-            }
+        contract::check_decode_with_alloc_limit(
+            memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE,
+        );
+        let (items, failure) = decode_all(memcache::Commands::new, &bytes);
+        if content_len == memcache::MAX_GET_LINE - 2 {
+            assert_eq!(failure, None);
+            assert_eq!(items, [Err(memcache::Error::Key)]);
+        } else {
+            assert!(items.is_empty());
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(memcache::TextFrameError::LineTooLong))
+            );
         }
     }
 }
@@ -771,7 +741,6 @@ fn memcache_binary_key_length_precedes_body_length() {
         header[2..4].copy_from_slice(&(key_len as u16).to_be_bytes());
         header[8..12].copy_from_slice(&(body_len as u32).to_be_bytes());
         let error = memcache::BinaryError::KeyLength(key_len);
-        assert_eq!(memcache::Packet::parse(&header), Err(error));
         assert_eq!(
             <memcache::Packet as Wire>::parse(&header),
             Err(memcache::PacketParseError::Binary(error))
