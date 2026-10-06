@@ -430,6 +430,7 @@ impl Conn {
 /// memory only once it is written, the pages of an empty buffer can be
 /// given back while the connection stays open ([`Pages::release`]), and
 /// closing returns all of it.
+#[cfg(not(target_arch = "wasm32"))]
 struct Pages {
     ptr: *mut u8,
     len: usize,
@@ -437,8 +438,10 @@ struct Pages {
 
 // SAFETY: `Pages` owns its mapping; the raw pointer is only an address.
 // Every access goes through the endpoint's mutex.
+#[cfg(not(target_arch = "wasm32"))]
 unsafe impl Send for Pages {}
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Pages {
     /// Maps two buffers of `buffer` bytes, or `None` if the system says no.
     fn map(buffer: usize) -> Option<Pages> {
@@ -492,11 +495,33 @@ impl Pages {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for Pages {
     fn drop(&mut self) {
         // SAFETY: this unmaps exactly the mapping made in `map`, after the
         // socket that borrowed it was removed.
         unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+/// A browser has no `mmap`, so there every socket's buffers come from the
+/// heap and no `Pages` is ever made.
+#[cfg(target_arch = "wasm32")]
+enum Pages {}
+
+#[cfg(target_arch = "wasm32")]
+impl Pages {
+    fn map(_buffer: usize) -> Option<Pages> {
+        None
+    }
+
+    /// SAFETY: as on a host; no `Pages` exists to call it on.
+    unsafe fn halves(&self) -> (&'static mut [u8], &'static mut [u8]) {
+        match *self {}
+    }
+
+    fn release(&self) {
+        match *self {}
     }
 }
 

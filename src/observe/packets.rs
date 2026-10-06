@@ -4,11 +4,11 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
-use std::time::{Instant, UNIX_EPOCH};
 
 use super::decode::Dissector;
 use super::json::{self, Object};
 use super::view::{edge_id, task_id};
+use crate::sys::{Instant, UNIX_EPOCH};
 use crate::watch::{Graph, KeyLine, Meter, TapGuard};
 
 /// How many decoded packets a watch keeps.

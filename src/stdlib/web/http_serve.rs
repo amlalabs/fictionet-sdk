@@ -261,11 +261,26 @@ async fn serve_http<C: Connection + Unpin>(
     let broke = watch.as_ref().map(|_| Arc::new(std::sync::atomic::AtomicBool::new(false)));
     let io = Io { cx: cx.clone(), conn, broke: broke.clone(), first, at: 0, buf: vec![0; 16 * 1024].into_boxed_slice() };
     let route = Route { machine, scheme, port, sni, watch: watch.clone() };
-    let timer = CxTimer { cx: cx.clone() };
+    // In a browser, `std::time::Instant::now` and `SystemTime::now` panic.
+    // hyper's timer API is in `Instant`, so there hyper runs without a timer
+    // (HTTP/1.1 then has no header read timeout), and it writes no `Date`
+    // header, which it takes from `SystemTime`.
+    let browser = cfg!(target_arch = "wasm32");
+    let timer = (!browser).then(|| CxTimer { cx: cx.clone() });
     let served: Pin<Box<dyn Future<Output = Result<(), hyper::Error>> + Send>> = if h2 {
-        Box::pin(hyper::server::conn::http2::Builder::new(Executor::new(&cx)).timer(timer).serve_connection(io, route))
+        let mut builder = hyper::server::conn::http2::Builder::new(Executor::new(&cx));
+        builder.auto_date_header(!browser);
+        if let Some(timer) = timer {
+            builder.timer(timer);
+        }
+        Box::pin(builder.serve_connection(io, route))
     } else {
-        Box::pin(hyper::server::conn::http1::Builder::new().half_close(true).timer(timer).serve_connection(io, route))
+        let mut builder = hyper::server::conn::http1::Builder::new();
+        builder.half_close(true).auto_date_header(!browser);
+        if let Some(timer) = timer {
+            builder.timer(timer);
+        }
+        Box::pin(builder.serve_connection(io, route))
     };
     // HTTP/1.1 with half-close does not read while a handler works, so
     // hyper would not see a reset (by the client, or by Sites when the

@@ -695,7 +695,7 @@ impl Region {
 struct Sleep<'a> {
     cx: &'a Cx,
     /// `None` is a deadline too far away to represent: it never comes.
-    deadline: Option<std::time::Instant>,
+    deadline: Option<crate::sys::Instant>,
     timer: Option<u64>,
     wait: CancelWait,
 }
@@ -709,7 +709,7 @@ impl Future for Sleep<'_> {
             return Poll::Ready(Err(Cancelled));
         }
         if let Some(deadline) = this.deadline {
-            if std::time::Instant::now() >= deadline {
+            if crate::sys::Instant::now() >= deadline {
                 return Poll::Ready(Ok(()));
             }
             match this.timer {
@@ -740,7 +740,7 @@ impl Drop for Sleep<'_> {
 #[derive(Default)]
 pub(crate) struct Timer {
     /// The wall-clock deadline of the timer entry, if there is one.
-    deadline: Option<std::time::Instant>,
+    deadline: Option<crate::sys::Instant>,
     entry: Option<u64>,
     wait: CancelWait,
 }
@@ -756,7 +756,7 @@ impl Timer {
         // A deadline past what the clock can hold never comes.
         match cx.run.start.checked_add(deadline.since_start()) {
             Some(at) => {
-                if std::time::Instant::now() >= at {
+                if crate::sys::Instant::now() >= at {
                     self.clear();
                     return Poll::Ready(Ok(()));
                 }
@@ -798,18 +798,8 @@ fn os_random_u64() -> u64 {
         return n;
     }
     let mut buf = [0u8; 8];
-    let mut filled = 0;
-    while filled < buf.len() {
-        // SAFETY: the pointer and length describe the unfilled part of `buf`.
-        let n = unsafe { libc::getrandom(buf[filled..].as_mut_ptr().cast(), buf.len() - filled, 0) };
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            panic!("getrandom failed: {err}");
-        }
-        filled += n as usize;
+    if let Err(err) = crate::sys::random_bytes(&mut buf) {
+        panic!("getrandom failed: {err}");
     }
     u64::from_ne_bytes(buf)
 }
