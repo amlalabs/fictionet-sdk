@@ -74,19 +74,21 @@ cargo +nightly fuzz list
 | `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | exact wire values, session modes and bounded codec contracts | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
-| `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
+| `rtp` | datagrams, RFC 4571 streams, strict values, and codec contracts | `stdlib::rtp`: RTP and multiplexed RTCP |
 | `rtsp` | message streams, interleaved frames, header values, and constructed messages | `stdlib::rtsp`: strict wire values and bounded codec contracts |
 | `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
 | `sftp` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::sftp`: SFTP version 3 |
 | `sip` | message streams, UDP datagrams, header values, and constructed values | `stdlib::sip`: strict wire values and bounded codec contracts |
-| `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
+| `snmp` | BER messages, object identifiers, strict values, and codec contracts | `stdlib::snmp`: SNMP v1 and v2c |
 | `socks` | exact wire values, session modes and bounded codec contracts | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
 | `spnego` | Bare and GSS-wrapped tokens plus constructed wrappers; checks framing, mechanism rules, round trips, and write refusal | `stdlib::spnego`: SPNEGO |
-| `ssh` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ssh`: The SSH transport layer before encryption |
+| `ssh` | version lines, cleartext packets, messages, and codec contracts | `stdlib::ssh`: The SSH transport layer before encryption |
 | `stun` | TCP streams, UDP datagrams, standalone attributes, and constructed messages | `stun`: chunking and EOF, exact raw frame spans, strict attribute writes, canonical padding and fingerprints, Binding replies, and transaction IDs |
 | `syslog` | bytes and constructed values, checked with codec contracts | `stdlib::syslog`: Syslog |
 | `tds` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::tds`: SQL Server TDS |
 | `telnet` | events, binary mode changes, strict writers, and bounded codec contracts | `stdlib::telnet`: Telnet |
+| `openvpn` | wrapped control packets, TCP envelopes, and codec contracts | `stdlib::openvpn`: plain, tls-auth, and tls-crypt layouts |
+| `rtcp` | control datagrams, compound rules, strict values, and codec contracts | `stdlib::rtcp`: reports, feedback, and XR blocks |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
 | `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |
 | `thrift` | arbitrary bytes and constructed values | `stdlib::thrift`: framed and unframed messages, typed values, and bounded codec contracts |

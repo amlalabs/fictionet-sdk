@@ -3,54 +3,25 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::rtcp::{Frame, Frames};
 use fictionet::stdlib::rtcp::{
-    App, Body, Bye, Decoder, DlrrItem, ExtendedReport, Fir, MAX_BUFFERED, MAX_DATAGRAM, MAX_PACKET, Nack, Packet,
+    App, Body, Bye, Datagram, Compound, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET, Nack, Packet,
     PayloadFeedback, PayloadMessage, ReceiverReport, Remb, ReportBlock, Rpsi, SdesChunk, SdesItem, SenderReport, Sli,
-    Tmmb, TransportFeedback, TransportMessage, XrBlock, check_compound, classify, frame, parse_compound, parse_packets,
-    write_compound, write_packets,
+    Tmmb, TransportFeedback, TransportMessage, XrBlock, check_compound, classify,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` in chunks, taking datagrams out after each feed, as a
-/// world does.
-fn split(data: &[u8], bytewise: bool) -> Vec<Vec<u8>> {
-    let mut decoder = Decoder::new();
-    let mut out = Vec::new();
-    let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-    for chunk in chunks {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some(d) = decoder.next_frame() {
-                out.push(d);
-                progress = true;
-            }
-            // A full decoder always gives a datagram.
-            assert!(progress);
-        }
-    }
-    out
-}
-
-/// A datagram read every way there is. Whatever reads is written back, and
-/// reads back the same.
 fn datagram(data: &[u8]) {
     let _ = classify(data);
-    if let Ok(packets) = parse_packets(data) {
-        let bytes = write_packets(&packets).unwrap();
-        assert_eq!(bytes.len(), data.len());
-        assert_eq!(parse_packets(&bytes), Ok(packets.clone()));
-        assert_eq!(parse_compound(data).is_ok(), check_compound(&packets).is_ok());
-    }
-    if let Ok((p, used)) = Packet::parse(data) {
-        assert!(used <= data.len());
-        let bytes = p.to_bytes().unwrap();
-        assert_eq!(Packet::parse(&bytes), Ok((p, bytes.len())));
+    contract::check_wire::<Packet>(data);
+    contract::check_wire::<Datagram>(data);
+    contract::check_wire::<Compound>(data);
+    if let Ok(packets) = Datagram::parse(data) {
+        assert_eq!(packets.to_bytes().unwrap().len(), data.len());
+        assert_eq!(
+            Compound::parse(data).is_ok(),
+            check_compound(&packets.0).is_ok()
+        );
     }
 }
 
@@ -193,15 +164,15 @@ fn built(data: &[u8]) -> Result<()> {
         contract::check_wire_value(p);
         if let Ok(bytes) = p.to_bytes() {
             assert!(bytes.len() <= MAX_PACKET && bytes.len() % 4 == 0);
-            assert_eq!(Packet::parse(&bytes), Ok((p.clone(), bytes.len())));
+            assert_eq!(Packet::parse(&bytes), Ok(p.clone()));
         }
     }
-    if let Ok(bytes) = write_packets(&packets) {
+    if let Ok(bytes) = Datagram(packets.clone()).to_bytes() {
         assert!(bytes.len() <= MAX_DATAGRAM);
-        assert_eq!(parse_packets(&bytes), Ok(packets.clone()));
+        assert_eq!(Datagram::parse(&bytes).map(|p| p.0), Ok(packets.clone()));
     }
-    if let Ok(bytes) = write_compound(&packets) {
-        assert_eq!(parse_compound(&bytes), Ok(packets));
+    if let Ok(bytes) = Compound(packets.clone()).to_bytes() {
+        assert_eq!(Compound::parse(&bytes).map(|p| p.0), Ok(packets));
     }
     // NACK entries built from lost sequence numbers ask for each of them.
     let lost: Vec<u16> = list(&mut u, 40, |u| u.arbitrary())?;
@@ -214,20 +185,28 @@ fn built(data: &[u8]) -> Result<()> {
     let items = list(&mut u, 40, |u| {
         Ok(DlrrItem { ssrc: u.arbitrary()?, last_rr: u.arbitrary()?, delay_since_last_rr: u.arbitrary()? })
     })?;
-    let block = XrBlock::dlrr(&items);
+    let block = XrBlock::dlrr(&items).unwrap();
     assert_eq!(block.dlrr_items(), Some(items));
     let ntp = XrBlock::receiver_reference_time(u.arbitrary()?);
     assert!(ntp.ntp_timestamp().is_some());
     let report = Packet::from(Body::ExtendedReport(ExtendedReport { ssrc: u.arbitrary()?, blocks: vec![ntp, block] }));
     let bytes = report.to_bytes().unwrap();
-    assert_eq!(Packet::parse(&bytes), Ok((report, bytes.len())));
+    assert_eq!(Packet::parse(&bytes), Ok(report));
     Ok(())
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
-    contract::check_decode(|| Frames::new().map(|frame| parse_packets(&frame.0)), data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * (MAX_DATAGRAM + 2));
+    contract::check_decode_with_alloc_limit(
+        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        data,
+        514,
+    );
+    contract::check_decode_with_alloc_limit(
+        || Frames::new().map(|frame| Datagram::parse(&frame.0)),
+        data,
+        2 * (MAX_DATAGRAM + 2),
+    );
     contract::check_wire::<Frame>(data);
     contract::check_wire::<Packet>(data);
     let envelope = Frame(data.get(..MAX_DATAGRAM + 1).unwrap_or(data).to_vec());
@@ -238,13 +217,8 @@ fuzz_target!(|data: &[u8]| {
 
     // The bytes as one datagram.
     datagram(data);
-    // The bytes as an RFC 4571 stream, split two ways: all at once, and a
-    // byte at a time. Both give the same datagrams.
-    let datagrams = split(data, false);
-    assert_eq!(split(data, true), datagrams);
-    for d in &datagrams {
-        assert_eq!(split(&frame(d).unwrap(), false), vec![d.clone()]);
-        datagram(d);
+    for frame in decode_all(Frames::new, data).0 {
+        datagram(&frame.0);
     }
     let _ = built(data);
 });
