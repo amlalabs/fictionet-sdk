@@ -98,6 +98,8 @@ macro_rules! protocols {
         pub mod mime_multipart;
         #[path = "../../src/stdlib/modbus.rs"]
         pub mod modbus;
+        #[path = "../../src/stdlib/moldudp64.rs"]
+        pub mod moldudp64;
         #[path = "../../src/stdlib/mongodb.rs"]
         pub mod mongodb;
         #[path = "../../src/stdlib/mqtt.rs"]
@@ -178,6 +180,8 @@ macro_rules! protocols {
         pub mod snmp;
         #[path = "../../src/stdlib/socks.rs"]
         pub mod socks;
+        #[path = "../../src/stdlib/soupbintcp.rs"]
+        pub mod soupbintcp;
         #[path = "../../src/stdlib/spnego.rs"]
         pub mod spnego;
         #[path = "../../src/stdlib/ssh.rs"]

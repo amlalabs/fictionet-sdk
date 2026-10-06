@@ -268,3 +268,72 @@ fn copied_fast_uses_templates_and_the_public_driver() {
         )))
     ));
 }
+
+#[test]
+fn copied_soupbintcp_frames_through_the_public_driver() {
+    // SoupBinTCP 3.00, 2.2.1: Login Accepted, then sequenced data.
+    let mut bytes = vec![0, 31, b'A'];
+    bytes.extend_from_slice(b"        S1                   7");
+    soupbintcp::Packet::SequencedData(b"msg".to_vec())
+        .write(&mut bytes)
+        .unwrap();
+    let mut client = soupbintcp::Client::new(
+        soupbintcp::Login {
+            username: soupbintcp::Alpha::right_padded("ALICE").unwrap(),
+            password: soupbintcp::Alpha::right_padded("SECRET").unwrap(),
+            session: soupbintcp::Alpha::blank(),
+            sequence: 1,
+        },
+        soupbintcp::Timers::default(),
+        0,
+    )
+    .unwrap();
+    client.start(0).unwrap();
+    let mut stream = Stream::new(soupbintcp::Frames::default());
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(5) {
+        pump(&mut stream, chunk, |frame| {
+            events.extend(client.receive_frame(&frame, 1).unwrap())
+        })
+        .unwrap();
+    }
+    finish(&mut stream, |_| unreachable!()).unwrap();
+    assert_eq!(
+        events.last(),
+        Some(&soupbintcp::Action::Event(soupbintcp::Event::Sequenced {
+            sequence: 7
+        }))
+    );
+    assert_eq!(client.next_sequence(), 8);
+}
+
+#[test]
+fn copied_moldudp64_recovers_a_gap() {
+    let session = moldudp64::Session::left_padded("S1").unwrap();
+    let mut server =
+        moldudp64::Retransmitter::new(session, 1, moldudp64::StoreConfig::default()).unwrap();
+    for m in [&b"a"[..], b"b", b"c"] {
+        server.push(m).unwrap();
+    }
+    let mut receiver = moldudp64::Receiver::new(moldudp64::ReceiverConfig::default()).unwrap();
+    receiver.receive(&server.packet(1, 1).unwrap(), 0).unwrap();
+    let bytes = server.packet(3, 1).unwrap().to_bytes().unwrap();
+    let live = <moldudp64::Downstream as Wire>::parse(&bytes).unwrap();
+    let actions = receiver.receive(&live, 1).unwrap();
+    let Some(moldudp64::Action::Send(request)) = actions.last() else {
+        panic!("expected a request")
+    };
+    let wire = request.to_bytes().unwrap();
+    let request = <moldudp64::Request as Wire>::parse(&wire).unwrap();
+    let answer = server.answer(&request).unwrap();
+    receiver.receive(&answer, 2).unwrap();
+    assert_eq!(receiver.expected(), Some(4));
+    let mut blocks = Stream::new(moldudp64::Blocks);
+    let mut messages = Vec::new();
+    pump(&mut blocks, &bytes[moldudp64::HEADER_LENGTH..], |m| {
+        messages.push(m)
+    })
+    .unwrap();
+    finish(&mut blocks, |m| messages.push(m)).unwrap();
+    assert_eq!(messages, [b"c".to_vec()]);
+}

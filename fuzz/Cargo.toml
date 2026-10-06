@@ -790,6 +790,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "soupbintcp"
+path = "fuzz_targets/soupbintcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "observe_modbus"
 path = "fuzz_targets/observe_modbus.rs"
 test = false
@@ -869,6 +876,13 @@ bench = false
 [[bin]]
 name = "fast"
 path = "fuzz_targets/fast.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "moldudp64"
+path = "fuzz_targets/moldudp64.rs"
 test = false
 doc = false
 bench = false
