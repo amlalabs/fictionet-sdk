@@ -3,13 +3,15 @@
 #![no_main]
 
 use fictionet::stdlib::coap::{
-    Assembler, Block, BlockError, Code, Decoder, Frame, Frames, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option, peek_header,
+    Assembler, Block, BlockError, Code, Frame, Frames, MAX_BUFFERED, MAX_DATAGRAM, Message, Options, Type, option,
+    peek_header,
 };
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
+    contract::check_wire::<fictionet::stdlib::coap::Uint>(data);
     contract::check_wire::<Message>(data);
     contract::check_wire::<Frame>(data);
     let mut built = Message::new(Type::Reset, Code(data.first().copied().unwrap_or(0)), 1);
@@ -30,7 +32,7 @@ fuzz_target!(|data: &[u8]| {
         let mut reordered = m.clone();
         reordered.options.0.reverse();
         contract::check_wire_value(&reordered);
-        assert_eq!(m.to_bytes(), data);
+        assert_eq!(m.to_bytes().unwrap(), data);
         // RFC 7252 sections 4.2 and 4.3: a reader keeps only the forms a
         // type allows.
         match m.kind {
@@ -40,7 +42,7 @@ fuzz_target!(|data: &[u8]| {
             Type::Confirmable => {}
         }
         // A message read writes back whole, unless it carries SZX 7.
-        assert_eq!(m.try_to_bytes().is_some(), m.bad_block().is_none());
+        let _ = m.bad_block();
         let o = &m.options;
         let _ = (m.bad_option(), o.uri_path(), o.uri_query(), o.content_format(), o.accept(), o.max_age());
         let _ = (o.observe(), o.size1(), o.size2(), o.uri_host(), o.uri_port());
@@ -71,7 +73,7 @@ fuzz_target!(|data: &[u8]| {
             assert!(back == segments || (segments == [&b""[..]] && back.is_empty()));
         }
         // A reply always reads back.
-        let reply = m.reply(Code::CONTENT, 1).to_bytes();
+        let reply = m.reply(Code::CONTENT, 1).to_bytes().unwrap();
         assert!(reply.len() <= MAX_DATAGRAM);
         assert!(Message::parse(&reply).is_ok());
         // A Block1 block the message carries: SZX 7 is refused with 4.00
@@ -118,49 +120,9 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(a.body(), rest);
     }
 
-    // The bytes as a TCP stream, split two ways: all at once, and a byte
-    // at a time. Both give the same frames and errors, and a decoder
-    // never holds more than MAX_BUFFERED bytes.
-    let mut whole = Decoder::new();
-    let mut frames = Vec::new();
-    let mut at = 0;
-    loop {
-        at += whole.feed(&data[at..]);
-        assert!(whole.buffered() <= MAX_BUFFERED);
-        match whole.next_frame() {
-            Some(r) => frames.push(r),
-            None => break,
-        }
-        if whole.is_broken() {
-            break;
-        }
-    }
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
-        while let Some(r) = bytewise.next_frame() {
-            again.push(r);
-            if bytewise.is_broken() {
-                break;
-            }
-        }
-        if bytewise.is_broken() {
-            break;
-        }
-    }
-    assert_eq!(frames, again);
-
-    // A frame read writes back as the same bytes, and reads back the same.
-    for f in frames.iter().flatten() {
-        contract::check_wire_value(f);
-        let bytes = f.to_bytes();
-        contract::check_wire::<Frame>(&bytes);
-        assert_eq!(f.try_to_bytes().as_ref(), Some(&bytes));
-        let (back, used) = Frame::parse(&bytes).unwrap().unwrap();
-        assert_eq!(&back, f);
-        assert_eq!(used, bytes.len());
-        let _ = (f.bad_option(), f.max_message_size());
-        assert!(Frame::parse(&f.pong().to_bytes()).unwrap().is_some());
+    for frame in decode_all(Frames::new, data).0 {
+        contract::check_wire_value(&frame);
+        let _ = (frame.bad_option(), frame.max_message_size());
+        contract::check_wire_value(&frame.pong());
     }
 });

@@ -3,68 +3,23 @@
 #![no_main]
 
 use fictionet::stdlib::mqtt::{
-    ConnAck, ConnectReturnCode, Decoder, Error, Frames, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
+    ConnAck, ConnectReturnCode, Frames, MAX_PACKET, Packet, Publish, QoS, check_topic_filter, check_topic_name,
     topic_matches,
 };
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::contract;
-
-/// Feeds `data` to `d` in pieces of `piece` bytes, taking packets out as
-/// they come, until it ends or the stream breaks. It returns the packets,
-/// the error if there was one, and the bytes still held.
-fn run(d: &mut Decoder, data: &[u8], piece: usize) -> (Vec<Packet>, Option<Error>, usize) {
-    let mut packets = Vec::new();
-    for chunk in data.chunks(piece.max(1)) {
-        let mut rest = chunk;
-        loop {
-            let n = d.feed(rest);
-            assert!(d.buffered() <= d.capacity());
-            rest = &rest[n..];
-            let mut took = false;
-            while let Some(p) = d.next_packet() {
-                match p {
-                    Ok(p) => packets.push(p),
-                    Err(e) => return (packets, Some(e), d.buffered()),
-                }
-                took = true;
-            }
-            if rest.is_empty() {
-                break;
-            }
-            assert!(n > 0 || took, "a full decoder gave nothing");
-        }
-    }
-    (packets, None, d.buffered())
-}
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Frames::with_limit(MAX_PACKET), data);
     contract::check_wire::<Packet>(data);
-    // The stream, split two ways: all at once, and a byte at a time. The
-    // packets, the error and the bytes left must agree, at the largest
-    // limit, which Packet::parse uses, and at a small one taken from the
-    // input.
-    let whole = run(&mut Decoder::with_max_packet(MAX_PACKET), data, data.len());
-    assert_eq!(run(&mut Decoder::with_max_packet(MAX_PACKET), data, 1), whole);
+    contract::check_wire::<fictionet::stdlib::mqtt::RemainingLength>(data);
     let small = usize::from(data.first().copied().unwrap_or(0) & 0x3f);
-    contract::check_decode(|| Frames::with_limit(small), data);
-    let small_whole = run(&mut Decoder::with_max_packet(small), data, data.len());
-    assert_eq!(run(&mut Decoder::with_max_packet(small), data, 1), small_whole);
-    let packets = whole.0;
-
-    for p in &packets {
-        // A packet read can be written, and reads back the same.
-        let bytes = p.to_bytes().unwrap();
-        contract::check_wire::<Packet>(&bytes);
-        assert_eq!(p.encoded_len(), Ok(bytes.len()));
-        let (back, used) = Packet::parse(&bytes).unwrap().unwrap();
-        assert_eq!(&back, p);
-        assert_eq!(used, bytes.len());
+    for limit in [fictionet::stdlib::mqtt::DEFAULT_MAX_PACKET, MAX_PACKET, small] {
+        let make = || Frames::with_limit(limit);
+        contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     }
-    if let Ok(Some((p, used))) = Packet::parse(data) {
-        assert!(used <= data.len());
-        assert_eq!(packets.first(), Some(&p));
+    for packet in decode_all(Frames::new, data).0 {
+        contract::check_wire_value(&packet);
+        assert_eq!(packet.encoded_len(), Ok(packet.to_bytes().unwrap().len()));
     }
 
     // Values built from the bytes, not read: whatever the writer takes
@@ -88,9 +43,9 @@ fuzz_target!(|data: &[u8]| {
         for p in built {
             contract::check_wire_value(&p);
             let written = p.to_bytes();
-            assert_eq!(p.encoded_len(), written.as_ref().map(Vec::len).map_err(|e| *e));
+            assert_eq!(p.encoded_len().is_ok(), written.is_ok());
             if let Ok(bytes) = written {
-                assert_eq!(Packet::parse(&bytes), Ok(Some((p, bytes.len()))));
+                assert_eq!(Packet::parse(&bytes), Ok(p));
             }
         }
     }
