@@ -1,5 +1,13 @@
 //! Deterministic data and chunking helpers shared by unit tests and fuzz targets.
 //! Seeds are explicit. Chunk iterators borrow input and allocate no storage.
+//! [`mutate`] edits a byte vector in place, and [`decode_all`] runs a decoder
+//! over a whole input.
+
+use super::{
+    Decode, Fail, Stream,
+    alloc::{string::String, vec::Vec},
+    finish, pump,
+};
 
 /// The LCG used by the SDK's protocol tests. This is not a cryptographic RNG.
 #[derive(Clone, Debug)]
@@ -28,6 +36,116 @@ impl Lcg {
             *byte = self.next() as u8;
         }
     }
+    /// Returns an index below `len`, or zero when `len` is zero. Draws
+    /// through [`below`](Self::below), so it shares that method's 31-bit
+    /// range and modulo reduction.
+    pub fn index(&mut self, len: usize) -> usize {
+        let n = self.below(u64::try_from(len).unwrap_or(u64::MAX));
+        usize::try_from(n).unwrap_or_default()
+    }
+    /// Returns `true` or `false`, each about half the time.
+    pub fn coin(&mut self) -> bool {
+        self.next() & 1 == 1
+    }
+    /// Returns up to `max` random bytes; the length is drawn from `0..=max`.
+    /// Returns an empty vector if the allocation fails.
+    pub fn bytes(&mut self, max: usize) -> Vec<u8> {
+        let n = self.index(max.saturating_add(1));
+        let mut out = Vec::new();
+        if out.try_reserve_exact(n).is_err() {
+            return out;
+        }
+        out.resize(n, 0);
+        self.fill(&mut out);
+        out
+    }
+    /// Returns up to `max` printable ASCII characters (`' '` through `'~'`);
+    /// the length is drawn from `0..=max`. Returns an empty string if the
+    /// allocation fails.
+    pub fn text(&mut self, max: usize) -> String {
+        let n = self.index(max.saturating_add(1));
+        let mut out = String::new();
+        if out.try_reserve_exact(n).is_err() {
+            return out;
+        }
+        for _ in 0..n {
+            out.push(char::from(b' '.saturating_add(self.below(95) as u8)));
+        }
+        out
+    }
+}
+
+/// The most bytes one [`mutate`] call adds. Only inserting a byte and
+/// duplicating a slice grow the input, by 1 and at most this many bytes.
+pub const MUTATE_GROWTH: usize = 16;
+
+/// Applies one random edit to `bytes`: set a byte, flip a bit, truncate,
+/// insert a byte, or duplicate a slice of up to [`MUTATE_GROWTH`] bytes at
+/// another position. One call grows the vector by at most [`MUTATE_GROWTH`]
+/// bytes, so `k` calls grow it by at most `k * MUTATE_GROWTH`. An empty
+/// vector gets one inserted byte. If the allocation for growth fails, the
+/// vector is truncated instead.
+pub fn mutate(rng: &mut Lcg, bytes: &mut Vec<u8>) {
+    let len = bytes.len();
+    let choice = if len == 0 { 3 } else { rng.below(5) };
+    if choice >= 3 && bytes.try_reserve(MUTATE_GROWTH).is_err() {
+        let at = rng.index(len);
+        bytes.truncate(at);
+        return;
+    }
+    match choice {
+        0 => {
+            let value = rng.next() as u8;
+            if let Some(b) = bytes.get_mut(rng.index(len)) {
+                *b = value;
+            }
+        }
+        1 => {
+            let bit = rng.below(8);
+            if let Some(b) = bytes.get_mut(rng.index(len)) {
+                *b ^= 1 << bit;
+            }
+        }
+        2 => bytes.truncate(rng.index(len)),
+        3 => {
+            let at = rng.index(len.saturating_add(1));
+            let value = rng.next() as u8;
+            bytes.insert(at.min(len), value);
+        }
+        _ => {
+            let start = rng.index(len);
+            let n = rng
+                .index(MUTATE_GROWTH.min(len.saturating_sub(start)))
+                .saturating_add(1);
+            let at = rng.index(len.saturating_add(1)).min(len);
+            bytes.extend_from_within(start..start.saturating_add(n).min(len));
+            // The copy sits at the end; rotate it into place at `at`.
+            if let Some(tail) = bytes.get_mut(at..) {
+                let n = n.min(tail.len());
+                tail.rotate_right(n);
+            }
+        }
+    }
+}
+
+/// Runs a fresh decoder over all of `data`, then marks EOF. Returns every
+/// item delivered and the stream's terminal failure, if any. Bytes after
+/// the decoder's `End` are not decoded; drive a [`Stream`] directly to hand
+/// them to another decoder.
+pub fn decode_all<D: Decode>(
+    make: impl FnOnce() -> D,
+    data: &[u8],
+) -> (Vec<D::Item>, Option<Fail<D::Error>>)
+where
+    D::Error: Clone,
+{
+    let mut stream = Stream::new(make());
+    let mut items = Vec::new();
+    if let Err(e) = pump(&mut stream, data, |item| items.push(item)) {
+        return (items, Some(e));
+    }
+    let failure = finish(&mut stream, |item| items.push(item)).err();
+    (items, failure)
 }
 
 /// Cyclic chunking over a borrowed slice.
