@@ -47,6 +47,14 @@
 //! events. Use [`sse::RawLines`] to retain comments and [`sse::Events`] to
 //! join data lines, then write edited events back into an HTTP body.
 //!
+//! [`jsonrpc`] reads JSON-RPC 2.0 requests, notifications, responses, and
+//! batches over ordered [`json::Value`] trees. Use [`jsonrpc::Messages`] for
+//! stdio lines. For server HTTP bodies, use [`codec::Collect<json::Value>`]
+//! and [`jsonrpc::Incoming::from_value`] to retain invalid batch entries.
+//! Convert JSON parser errors with [`jsonrpc::ParseError::from`] for replies.
+//! Clients and strict callers can use [`codec::Collect<jsonrpc::Body>`].
+//! Reply helpers keep request ids exact, and writers check edited envelopes.
+//!
 //! # Three kinds of functions
 //!
 //! Every function in the stdlib is one of three kinds. The kind tells you
@@ -178,6 +186,7 @@ pub mod ipp;
 pub mod ipsec;
 pub mod json;
 pub mod json_schema;
+pub mod jsonrpc;
 pub mod kafka;
 pub mod kerberos;
 pub mod l2tp;
