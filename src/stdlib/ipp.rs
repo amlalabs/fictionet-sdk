@@ -12,8 +12,8 @@
 //! codes).
 //!
 //! Nothing here reads a socket or parses HTTP. A world that plays a
-//! printer takes the body of each POST, reads its attributes with [`Head`]
-//! and [`super::codec::Stream`] (or hands the whole body to [`Message::parse`]),
+//! printer takes the body of each POST, reads its attributes with
+//! [`Stream<Head>`](super::codec::Stream) (or parses the whole [`Message`]),
 //! and writes the bytes of its reply as the HTTP response body. Which
 //! operations the printer supports, which attributes it has, and what it
 //! does with a document are up to world code.
@@ -23,14 +23,9 @@
 //! section may be at most [`MAX_HEAD`] bytes, and collections may nest at
 //! most [`MAX_DEPTH`] deep. A group that names one attribute twice is
 //! refused, as RFC 8011 recommends. Names, and values with a fixed size,
-//! must have the form [`Attribute::name`] and [`Value`] describe. The writers never write what the
-//! reader would refuse: [`Message::to_bytes`] cuts long strings and leaves
-//! out what cannot be written, as each item's documentation says.
-//!
-//! [`Head`] yields one [`Header`] item, then End. The document remains
-//! unread for [`super::codec::Stream::swap`] into a [`super::codec::Collect`]
-//! bounded by [`MAX_DOCUMENT`]. [`Wire`] on [`Header`] writes without
-//! clipping. [`Decoder`] keeps its original behavior.
+//! must have the form [`Attribute::name`] and [`Value`] describe. Writers
+//! refuse values that cannot be written unchanged. After the head item,
+//! the document remains unread for `Stream::swap` into a bounded collector.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -58,7 +53,8 @@
 
 use std::collections::BTreeSet;
 
-use super::codec::{Decode, Step, Wire};
+extern crate self as fictionet;
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port IPP printers listen on.
 pub const PORT: u16 = 631;
@@ -84,48 +80,82 @@ pub const MAX_DEPTH: usize = 16;
 /// Tags: the byte before each group (delimiter tags) and before each value
 /// (value tags). Delimiter tags are below 0x10.
 pub mod tag {
-    #![allow(missing_docs)]
     // Delimiter tags.
+    /// Operation attributes.
     pub const OPERATION_ATTRIBUTES: u8 = 0x01;
+    /// Job attributes.
     pub const JOB_ATTRIBUTES: u8 = 0x02;
     /// Ends the attribute section. Document data follows.
     pub const END_OF_ATTRIBUTES: u8 = 0x03;
+    /// Printer attributes.
     pub const PRINTER_ATTRIBUTES: u8 = 0x04;
+    /// Unsupported attributes.
     pub const UNSUPPORTED_ATTRIBUTES: u8 = 0x05;
+    /// Subscription attributes.
     pub const SUBSCRIPTION_ATTRIBUTES: u8 = 0x06;
+    /// Event notification attributes.
     pub const EVENT_NOTIFICATION_ATTRIBUTES: u8 = 0x07;
+    /// Resource attributes.
     pub const RESOURCE_ATTRIBUTES: u8 = 0x08;
+    /// Document attributes.
     pub const DOCUMENT_ATTRIBUTES: u8 = 0x09;
+    /// System attributes.
     pub const SYSTEM_ATTRIBUTES: u8 = 0x0a;
     // Out-of-band value tags, 0x10 to 0x1f.
+    /// Unsupported.
     pub const UNSUPPORTED: u8 = 0x10;
+    /// Unknown.
     pub const UNKNOWN: u8 = 0x12;
+    /// No value.
     pub const NO_VALUE: u8 = 0x13;
+    /// Not settable.
     pub const NOT_SETTABLE: u8 = 0x15;
+    /// Delete attribute.
     pub const DELETE_ATTRIBUTE: u8 = 0x16;
+    /// Admin define.
     pub const ADMIN_DEFINE: u8 = 0x17;
     // Integer value tags.
+    /// Integer.
     pub const INTEGER: u8 = 0x21;
+    /// Boolean.
     pub const BOOLEAN: u8 = 0x22;
+    /// Enum.
     pub const ENUM: u8 = 0x23;
     // Octet-string value tags.
+    /// Octet string.
     pub const OCTET_STRING: u8 = 0x30;
+    /// Date time.
     pub const DATE_TIME: u8 = 0x31;
+    /// Resolution.
     pub const RESOLUTION: u8 = 0x32;
+    /// Range of integer.
     pub const RANGE_OF_INTEGER: u8 = 0x33;
+    /// Begins a collection.
     pub const BEG_COLLECTION: u8 = 0x34;
+    /// Text with language.
     pub const TEXT_WITH_LANGUAGE: u8 = 0x35;
+    /// Name with language.
     pub const NAME_WITH_LANGUAGE: u8 = 0x36;
+    /// Ends a collection.
     pub const END_COLLECTION: u8 = 0x37;
     // Character-string value tags.
+    /// Text without language.
     pub const TEXT_WITHOUT_LANGUAGE: u8 = 0x41;
+    /// Name without language.
     pub const NAME_WITHOUT_LANGUAGE: u8 = 0x42;
+    /// Keyword.
     pub const KEYWORD: u8 = 0x44;
+    /// URI.
     pub const URI: u8 = 0x45;
+    /// URI scheme.
     pub const URI_SCHEME: u8 = 0x46;
+    /// Charset.
     pub const CHARSET: u8 = 0x47;
+    /// Natural language.
     pub const NATURAL_LANGUAGE: u8 = 0x48;
+    /// MIME media type.
     pub const MIME_MEDIA_TYPE: u8 = 0x49;
+    /// A collection member name.
     pub const MEMBER_ATTR_NAME: u8 = 0x4a;
     /// The first four bytes of the value hold the real tag.
     pub const EXTENSION: u8 = 0x7f;
@@ -133,116 +163,219 @@ pub mod tag {
 
 /// Operation IDs, from RFC 8011 and the IANA IPP registry.
 pub mod operation {
-    #![allow(missing_docs)]
+    /// Print job.
     pub const PRINT_JOB: u16 = 0x0002;
+    /// Print uri.
     pub const PRINT_URI: u16 = 0x0003;
+    /// Validate job.
     pub const VALIDATE_JOB: u16 = 0x0004;
+    /// Create job.
     pub const CREATE_JOB: u16 = 0x0005;
+    /// Send document.
     pub const SEND_DOCUMENT: u16 = 0x0006;
+    /// Send uri.
     pub const SEND_URI: u16 = 0x0007;
+    /// Cancel job.
     pub const CANCEL_JOB: u16 = 0x0008;
+    /// Get job attributes.
     pub const GET_JOB_ATTRIBUTES: u16 = 0x0009;
+    /// Get jobs.
     pub const GET_JOBS: u16 = 0x000a;
+    /// Get printer attributes.
     pub const GET_PRINTER_ATTRIBUTES: u16 = 0x000b;
+    /// Hold job.
     pub const HOLD_JOB: u16 = 0x000c;
+    /// Release job.
     pub const RELEASE_JOB: u16 = 0x000d;
+    /// Restart job.
     pub const RESTART_JOB: u16 = 0x000e;
+    /// Pause printer.
     pub const PAUSE_PRINTER: u16 = 0x0010;
+    /// Resume printer.
     pub const RESUME_PRINTER: u16 = 0x0011;
+    /// Purge jobs.
     pub const PURGE_JOBS: u16 = 0x0012;
+    /// Set printer attributes.
     pub const SET_PRINTER_ATTRIBUTES: u16 = 0x0013;
+    /// Set job attributes.
     pub const SET_JOB_ATTRIBUTES: u16 = 0x0014;
+    /// Get printer supported values.
     pub const GET_PRINTER_SUPPORTED_VALUES: u16 = 0x0015;
+    /// Create printer subscriptions.
     pub const CREATE_PRINTER_SUBSCRIPTIONS: u16 = 0x0016;
+    /// Create job subscriptions.
     pub const CREATE_JOB_SUBSCRIPTIONS: u16 = 0x0017;
+    /// Get subscription attributes.
     pub const GET_SUBSCRIPTION_ATTRIBUTES: u16 = 0x0018;
+    /// Get subscriptions.
     pub const GET_SUBSCRIPTIONS: u16 = 0x0019;
+    /// Renew subscription.
     pub const RENEW_SUBSCRIPTION: u16 = 0x001a;
+    /// Cancel subscription.
     pub const CANCEL_SUBSCRIPTION: u16 = 0x001b;
+    /// Get notifications.
     pub const GET_NOTIFICATIONS: u16 = 0x001c;
+    /// Get resource attributes.
     pub const GET_RESOURCE_ATTRIBUTES: u16 = 0x001e;
+    /// Get resources.
     pub const GET_RESOURCES: u16 = 0x0020;
+    /// Enable printer.
     pub const ENABLE_PRINTER: u16 = 0x0022;
+    /// Disable printer.
     pub const DISABLE_PRINTER: u16 = 0x0023;
+    /// Pause printer after current job.
     pub const PAUSE_PRINTER_AFTER_CURRENT_JOB: u16 = 0x0024;
+    /// Hold new jobs.
     pub const HOLD_NEW_JOBS: u16 = 0x0025;
+    /// Release held new jobs.
     pub const RELEASE_HELD_NEW_JOBS: u16 = 0x0026;
+    /// Deactivate printer.
     pub const DEACTIVATE_PRINTER: u16 = 0x0027;
+    /// Activate printer.
     pub const ACTIVATE_PRINTER: u16 = 0x0028;
+    /// Restart printer.
     pub const RESTART_PRINTER: u16 = 0x0029;
+    /// Shutdown printer.
     pub const SHUTDOWN_PRINTER: u16 = 0x002a;
+    /// Startup printer.
     pub const STARTUP_PRINTER: u16 = 0x002b;
+    /// Reprocess job.
     pub const REPROCESS_JOB: u16 = 0x002c;
+    /// Cancel current job.
     pub const CANCEL_CURRENT_JOB: u16 = 0x002d;
+    /// Suspend current job.
     pub const SUSPEND_CURRENT_JOB: u16 = 0x002e;
+    /// Resume job.
     pub const RESUME_JOB: u16 = 0x002f;
+    /// Promote job.
     pub const PROMOTE_JOB: u16 = 0x0030;
+    /// Schedule job after.
     pub const SCHEDULE_JOB_AFTER: u16 = 0x0031;
+    /// Cancel document.
     pub const CANCEL_DOCUMENT: u16 = 0x0033;
+    /// Get document attributes.
     pub const GET_DOCUMENT_ATTRIBUTES: u16 = 0x0034;
+    /// Get documents.
     pub const GET_DOCUMENTS: u16 = 0x0035;
+    /// Delete document.
     pub const DELETE_DOCUMENT: u16 = 0x0036;
+    /// Set document attributes.
     pub const SET_DOCUMENT_ATTRIBUTES: u16 = 0x0037;
+    /// Cancel jobs.
     pub const CANCEL_JOBS: u16 = 0x0038;
+    /// Cancel my jobs.
     pub const CANCEL_MY_JOBS: u16 = 0x0039;
+    /// Resubmit job.
     pub const RESUBMIT_JOB: u16 = 0x003a;
+    /// Close job.
     pub const CLOSE_JOB: u16 = 0x003b;
+    /// Identify printer.
     pub const IDENTIFY_PRINTER: u16 = 0x003c;
+    /// Validate document.
     pub const VALIDATE_DOCUMENT: u16 = 0x003d;
 }
 
 /// Status codes, from RFC 8011 and the IANA IPP registry.
 pub mod status {
-    #![allow(missing_docs)]
+    /// Successful ok.
     pub const SUCCESSFUL_OK: u16 = 0x0000;
+    /// Successful ok ignored or substituted attributes.
     pub const SUCCESSFUL_OK_IGNORED_OR_SUBSTITUTED_ATTRIBUTES: u16 = 0x0001;
+    /// Successful ok conflicting attributes.
     pub const SUCCESSFUL_OK_CONFLICTING_ATTRIBUTES: u16 = 0x0002;
+    /// Successful ok ignored subscriptions.
     pub const SUCCESSFUL_OK_IGNORED_SUBSCRIPTIONS: u16 = 0x0003;
+    /// Successful ok too many events.
     pub const SUCCESSFUL_OK_TOO_MANY_EVENTS: u16 = 0x0005;
+    /// Successful ok events complete.
     pub const SUCCESSFUL_OK_EVENTS_COMPLETE: u16 = 0x0007;
+    /// Client error bad request.
     pub const CLIENT_ERROR_BAD_REQUEST: u16 = 0x0400;
+    /// Client error forbidden.
     pub const CLIENT_ERROR_FORBIDDEN: u16 = 0x0401;
+    /// Client error not authenticated.
     pub const CLIENT_ERROR_NOT_AUTHENTICATED: u16 = 0x0402;
+    /// Client error not authorized.
     pub const CLIENT_ERROR_NOT_AUTHORIZED: u16 = 0x0403;
+    /// Client error not possible.
     pub const CLIENT_ERROR_NOT_POSSIBLE: u16 = 0x0404;
+    /// Client error timeout.
     pub const CLIENT_ERROR_TIMEOUT: u16 = 0x0405;
+    /// Client error not found.
     pub const CLIENT_ERROR_NOT_FOUND: u16 = 0x0406;
+    /// Client error gone.
     pub const CLIENT_ERROR_GONE: u16 = 0x0407;
+    /// Client error request entity too large.
     pub const CLIENT_ERROR_REQUEST_ENTITY_TOO_LARGE: u16 = 0x0408;
+    /// Client error request value too long.
     pub const CLIENT_ERROR_REQUEST_VALUE_TOO_LONG: u16 = 0x0409;
+    /// Client error document format not supported.
     pub const CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED: u16 = 0x040a;
+    /// Client error attributes or values not supported.
     pub const CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED: u16 = 0x040b;
+    /// Client error uri scheme not supported.
     pub const CLIENT_ERROR_URI_SCHEME_NOT_SUPPORTED: u16 = 0x040c;
+    /// Client error charset not supported.
     pub const CLIENT_ERROR_CHARSET_NOT_SUPPORTED: u16 = 0x040d;
+    /// Client error conflicting attributes.
     pub const CLIENT_ERROR_CONFLICTING_ATTRIBUTES: u16 = 0x040e;
+    /// Client error compression not supported.
     pub const CLIENT_ERROR_COMPRESSION_NOT_SUPPORTED: u16 = 0x040f;
+    /// Client error compression error.
     pub const CLIENT_ERROR_COMPRESSION_ERROR: u16 = 0x0410;
+    /// Client error document format error.
     pub const CLIENT_ERROR_DOCUMENT_FORMAT_ERROR: u16 = 0x0411;
+    /// Client error document access error.
     pub const CLIENT_ERROR_DOCUMENT_ACCESS_ERROR: u16 = 0x0412;
+    /// Client error attributes not settable.
     pub const CLIENT_ERROR_ATTRIBUTES_NOT_SETTABLE: u16 = 0x0413;
+    /// Client error ignored all subscriptions.
     pub const CLIENT_ERROR_IGNORED_ALL_SUBSCRIPTIONS: u16 = 0x0414;
+    /// Client error too many subscriptions.
     pub const CLIENT_ERROR_TOO_MANY_SUBSCRIPTIONS: u16 = 0x0415;
+    /// Client error document password error.
     pub const CLIENT_ERROR_DOCUMENT_PASSWORD_ERROR: u16 = 0x0418;
+    /// Client error document permission error.
     pub const CLIENT_ERROR_DOCUMENT_PERMISSION_ERROR: u16 = 0x0419;
+    /// Client error document security error.
     pub const CLIENT_ERROR_DOCUMENT_SECURITY_ERROR: u16 = 0x041a;
+    /// Client error document unprintable error.
     pub const CLIENT_ERROR_DOCUMENT_UNPRINTABLE_ERROR: u16 = 0x041b;
+    /// Client error account info needed.
     pub const CLIENT_ERROR_ACCOUNT_INFO_NEEDED: u16 = 0x041c;
+    /// Client error account closed.
     pub const CLIENT_ERROR_ACCOUNT_CLOSED: u16 = 0x041d;
+    /// Client error account limit reached.
     pub const CLIENT_ERROR_ACCOUNT_LIMIT_REACHED: u16 = 0x041e;
+    /// Client error account authorization failed.
     pub const CLIENT_ERROR_ACCOUNT_AUTHORIZATION_FAILED: u16 = 0x041f;
+    /// Client error not fetchable.
     pub const CLIENT_ERROR_NOT_FETCHABLE: u16 = 0x0420;
+    /// Server error internal error.
     pub const SERVER_ERROR_INTERNAL_ERROR: u16 = 0x0500;
+    /// Server error operation not supported.
     pub const SERVER_ERROR_OPERATION_NOT_SUPPORTED: u16 = 0x0501;
+    /// Server error service unavailable.
     pub const SERVER_ERROR_SERVICE_UNAVAILABLE: u16 = 0x0502;
+    /// Server error version not supported.
     pub const SERVER_ERROR_VERSION_NOT_SUPPORTED: u16 = 0x0503;
+    /// Server error device error.
     pub const SERVER_ERROR_DEVICE_ERROR: u16 = 0x0504;
+    /// Server error temporary error.
     pub const SERVER_ERROR_TEMPORARY_ERROR: u16 = 0x0505;
+    /// Server error not accepting jobs.
     pub const SERVER_ERROR_NOT_ACCEPTING_JOBS: u16 = 0x0506;
+    /// Server error busy.
     pub const SERVER_ERROR_BUSY: u16 = 0x0507;
+    /// Server error job canceled.
     pub const SERVER_ERROR_JOB_CANCELED: u16 = 0x0508;
+    /// Server error multiple document jobs not supported.
     pub const SERVER_ERROR_MULTIPLE_DOCUMENT_JOBS_NOT_SUPPORTED: u16 = 0x0509;
+    /// Server error printer is deactivated.
     pub const SERVER_ERROR_PRINTER_IS_DEACTIVATED: u16 = 0x050a;
+    /// Server error too many jobs.
     pub const SERVER_ERROR_TOO_MANY_JOBS: u16 = 0x050b;
+    /// Server error too many documents.
     pub const SERVER_ERROR_TOO_MANY_DOCUMENTS: u16 = 0x050c;
 
     /// Whether `code` is in the successful class, 0x0000 to 0x00ff.
@@ -482,8 +615,7 @@ pub struct Attribute {
     /// The attribute's name, such as `"printer-uri"`. RFC 8010 section 3.2
     /// makes a name a keyword. The reader takes 1 to [`MAX_NAME`] bytes of
     /// printable US-ASCII (0x21 to 0x7e), as CUPS does, so a name with a
-    /// NUL, a space or a non-ASCII byte is refused; the writer leaves out
-    /// an attribute or member whose name is not of that form.
+    /// NUL, a space or a non-ASCII byte is refused by readers and writers.
     pub name: String,
     /// Its values. A read attribute has at least one. More than one is a
     /// "1setOf" attribute, sent as additional values.
@@ -497,9 +629,8 @@ impl Attribute {
     }
 }
 
-/// A dateTime value, laid out as in RFC 2579. The reader refuses, and the
-/// writer leaves out, a value with a field outside the range its doc
-/// gives.
+/// A dateTime value, laid out as in RFC 2579. Readers and writers refuse
+/// a value with a field outside the range its doc gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DateTime {
     /// The year, such as 2026.
@@ -527,7 +658,6 @@ pub struct DateTime {
 
 /// One attribute value. Each variant is one value tag.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Value {
     /// An out-of-band value, tags 0x10 to 0x1f, such as
     /// [`tag::UNSUPPORTED`] or [`tag::NO_VALUE`]. It carries no data; any
@@ -539,7 +669,7 @@ pub enum Value {
     Boolean(bool),
     /// Tag 0x23: an enum value, such as a printer state. RFC 8011
     /// section 5.1.5 allows 1 to 2^31 - 1; 0 and below are refused by the
-    /// reader and left out by the writer.
+    /// reader and writer.
     Enum(i32),
     /// Tag 0x30: bytes with no set format.
     OctetString(Vec<u8>),
@@ -548,14 +678,36 @@ pub enum Value {
     /// Tag 0x32: a resolution across and along the feed direction, in
     /// `units` (3 is dots per inch, 4 is dots per centimeter). RFC 8011
     /// section 5.1.16 makes both resolutions positive and the units 3 or 4;
-    /// any other is refused by the reader and left out by the writer.
-    Resolution { cross_feed: i32, feed: i32, units: i8 },
+    /// any other is refused by the reader and writer.
+    Resolution {
+        /// Resolution across the paper path. Must be positive.
+        cross_feed: i32,
+        /// Resolution along the paper path. Must be positive.
+        feed: i32,
+        /// 3 for dots per inch or 4 for dots per centimeter.
+        units: i8,
+    },
     /// Tag 0x33: a range of integers, both ends included.
-    Range { lower: i32, upper: i32 },
+    Range {
+        /// Inclusive lower bound.
+        lower: i32,
+        /// Inclusive upper bound.
+        upper: i32,
+    },
     /// Tag 0x35: text with the natural language it is in.
-    TextWithLanguage { language: String, text: String },
+    TextWithLanguage {
+        /// Natural language.
+        language: String,
+        /// Text in that language.
+        text: String,
+    },
     /// Tag 0x36: a name with the natural language it is in.
-    NameWithLanguage { language: String, name: String },
+    NameWithLanguage {
+        /// Natural language.
+        language: String,
+        /// Name in that language.
+        name: String,
+    },
     /// Tag 0x41: text in the message's charset.
     Text(String),
     /// Tag 0x42: a name in the message's charset.
@@ -577,9 +729,19 @@ pub enum Value {
     Collection(Vec<Attribute>),
     /// Tag 0x7f: an extended type, whose 32-bit tag is the first four bytes
     /// of the value, then its data.
-    Extension { tag: u32, data: Vec<u8> },
+    Extension {
+        /// Extended type tag.
+        tag: u32,
+        /// Uninterpreted value bytes.
+        data: Vec<u8>,
+    },
     /// Any other value tag, with its bytes unread.
-    Unknown { tag: u8, data: Vec<u8> },
+    Unknown {
+        /// Unrecognized value tag.
+        tag: u8,
+        /// Uninterpreted value bytes.
+        data: Vec<u8>,
+    },
 }
 
 impl Value {
@@ -636,11 +798,15 @@ impl Value {
     }
 }
 
-/// Why bytes are not an IPP message.
+/// Why IPP bytes or a value are refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
-    /// The bytes end before the end tag. Only [`Message::parse`] gives
-    /// this; the other readers wait for more bytes.
+    /// The value cannot be written without changing it.
+    Unwritable,
+    /// Document data exceeds [`MAX_DOCUMENT`] bytes.
+    DocumentTooLong,
+    /// A complete HTTP body ends before the end-of-attributes tag.
+    /// [`Head`] leaves stream truncation to the codec driver.
     Truncated,
     /// The attribute section runs past [`MAX_HEAD`] bytes.
     TooLong,
@@ -677,6 +843,8 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
             Error::Truncated => f.write_str("the message ends before its end-of-attributes tag"),
             Error::TooLong => write!(f, "the attribute section is longer than {MAX_HEAD} bytes"),
             Error::Length(n) => write!(f, "length field {n:#06x} is negative"),
@@ -757,79 +925,6 @@ impl Message {
     pub fn attribute(&self, group: u8, name: &str) -> Option<&Attribute> {
         self.groups.iter().filter(|g| g.tag == group).flat_map(|g| &g.attributes).find(|a| a.name == name)
     }
-
-    /// Reads a whole message body: the attribute section, and every byte
-    /// after it as [`Message::data`].
-    pub fn parse(b: &[u8]) -> Result<Message, Error> {
-        match Message::parse_head(b)? {
-            Some((mut m, used)) => {
-                m.data = b[used..].to_vec();
-                Ok(m)
-            }
-            None => Err(Error::Truncated),
-        }
-    }
-
-    /// Reads the attribute section at the start of `b`, up to and
-    /// including the end tag. It returns `Ok(None)` if `b` holds only part
-    /// of one, and otherwise the message, with no data, and how many bytes
-    /// of `b` it took.
-    pub fn parse_head(b: &[u8]) -> Result<Option<(Message, usize)>, Error> {
-        let mut pos = 0;
-        match scan(b, &mut pos)? {
-            Some(end) => Ok(Some((head(&b[..end])?, end))),
-            None => Ok(None),
-        }
-    }
-
-    /// The message's bytes. The reader takes back what this writes, so
-    /// some things are changed or left out:
-    ///
-    /// - A group whose tag is not a delimiter tag (0x10 or above, or the
-    ///   end tag) or is the reserved 0x00 is left out.
-    /// - An attribute or member whose name is not of the form
-    ///   [`Attribute::name`] gives, or with no value that can be written,
-    ///   is left out.
-    /// - A value that cannot be written is left out: an
-    ///   [`Value::OutOfBand`] tag outside 0x10 to 0x1f, an
-    ///   [`Value::Unknown`] tag this module gives a meaning to, an enum,
-    ///   resolution or dateTime out of its range, or a collection deeper
-    ///   than [`MAX_DEPTH`].
-    /// - Values longer than [`MAX_FIELD`] bytes are cut, strings at a
-    ///   character boundary.
-    /// - An attribute whose name is already written in the same group is
-    ///   left out, since a group may not hold one name twice.
-    /// - An attribute that would make the attribute section longer than
-    ///   [`MAX_HEAD`] is left out, as is a group that has no room for its
-    ///   tag.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + 1 + self.data.len());
-        out.extend_from_slice(&[self.version.0, self.version.1]);
-        out.extend_from_slice(&self.code.to_be_bytes());
-        out.extend_from_slice(&self.request_id.to_be_bytes());
-        for g in &self.groups {
-            if g.tag >= 0x10 || g.tag == tag::END_OF_ATTRIBUTES || g.tag == 0 || out.len() + 2 > MAX_HEAD {
-                continue;
-            }
-            out.push(g.tag);
-            let mut names: BTreeSet<&[u8]> = BTreeSet::new();
-            for a in &g.attributes {
-                let name = a.name.as_bytes();
-                if names.contains(name) {
-                    continue;
-                }
-                let mut one = Vec::new();
-                write_attribute(&mut one, a);
-                if !one.is_empty() && out.len() + one.len() < MAX_HEAD {
-                    out.extend_from_slice(&one);
-                    names.insert(name);
-                }
-            }
-        }
-        out.push(tag::END_OF_ATTRIBUTES);
-        out.extend_from_slice(&self.data);
-        out
-    }
 }
 
 fn standard_operation_group() -> Group {
@@ -842,15 +937,14 @@ fn standard_operation_group() -> Group {
     }
 }
 
-/// The default document collection limit: 64 MiB. This is a world policy,
-/// not a wire length field. Use it with [`super::codec::Collect`] after
-/// swapping out [`Head`]; worlds may choose a smaller document budget.
+/// The largest document [`Message`] reads or writes: 64 MiB. This is a
+/// world policy, not a wire length field. After [`Head`], streaming worlds
+/// choose their own document budget with [`super::codec::Collect`].
 pub const MAX_DOCUMENT: usize = 64 * 1024 * 1024;
 
 /// An IPP message through its end-of-attributes tag, without document data.
 ///
 /// [`Wire`] reads exactly this head and writes it without clipping fields.
-/// [`Message::to_bytes`] keeps its original clipping behavior.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Header {
     /// The major and minor IPP version.
@@ -897,21 +991,56 @@ impl core::fmt::Display for ParseError {
 }
 impl core::error::Error for ParseError {}
 
-/// An IPP head cannot be written without clipping or changing its value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteError;
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("IPP head cannot be represented without changing it")
+impl Header {
+    /// Attaches document bytes to this head. Writing the returned message
+    /// checks the document against [`MAX_DOCUMENT`].
+    pub fn with_document(self, data: Vec<u8>) -> Message {
+        Message {
+            version: self.version,
+            code: self.code,
+            request_id: self.request_id,
+            groups: self.groups,
+            data,
+        }
     }
 }
-impl core::error::Error for WriteError {}
+
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a complete HTTP body: the head and all following document
+    /// bytes. Refuses incomplete or invalid heads, heads over [`MAX_HEAD`],
+    /// and documents over [`MAX_DOCUMENT`].
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let end = scan_head(bytes, &mut 0, MAX_HEAD)?.ok_or(Error::Truncated)?;
+        let data = bytes.get(end..).ok_or(Error::Truncated)?;
+        if data.len() > MAX_DOCUMENT {
+            return Err(Error::DocumentTooLong);
+        }
+        Ok(head(&bytes[..end])?.with_document(data.to_vec()))
+    }
+
+    /// Appends a complete body without clipping. Refuses invalid heads,
+    /// oversized fields, and documents over [`MAX_DOCUMENT`]. Refusal
+    /// leaves `out` unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.data.len() > MAX_DOCUMENT {
+            return Err(Error::Unwritable);
+        }
+        write_head(self.version, self.code, self.request_id, &self.groups, out)?;
+        out.extend_from_slice(&self.data);
+        Ok(())
+    }
+}
 
 impl Wire for Header {
     type ParseError = ParseError;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
+    /// Reads one head through its end tag. Refuses trailing document bytes,
+    /// incomplete records, negative lengths, invalid attributes, duplicate
+    /// names, oversized heads, and collections deeper than [`MAX_DEPTH`].
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let end = scan_head(bytes, &mut 0, MAX_HEAD)
             .map_err(ParseError::Head)?
@@ -919,98 +1048,186 @@ impl Wire for Header {
         if end != bytes.len() {
             return Err(ParseError::Trailing);
         }
-        head(bytes).map(Self::from).map_err(ParseError::Head)
+        head(bytes).map_err(ParseError::Head)
     }
 
-    /// Stages at most [`MAX_HEAD`] bytes and one scalar record of at most
-    /// `MAX_FIELD + MAX_NAME + 5` bytes. Collections nest at most [`MAX_DEPTH`].
-    /// Invalid values leave the destination unchanged.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        let mut bytes = Vec::new();
-        bytes.extend_from_slice(&[self.version.0, self.version.1]);
-        bytes.extend_from_slice(&self.code.to_be_bytes());
-        bytes.extend_from_slice(&self.request_id.to_be_bytes());
-        for group in &self.groups {
-            if group.tag == 0 || group.tag >= 0x10 || group.tag == tag::END_OF_ATTRIBUTES {
-                return Err(WriteError);
-            }
-            head_room(&bytes, 1)?;
-            bytes.push(group.tag);
-            for attribute in &group.attributes {
-                if !is_name(attribute.name.as_bytes()) || attribute.values.is_empty() {
-                    return Err(WriteError);
-                }
-                for (i, value) in attribute.values.iter().enumerate() {
-                    let name = if i == 0 {
-                        attribute.name.as_bytes()
-                    } else {
-                        b""
-                    };
-                    strict_value(&mut bytes, name, value, 0)?;
-                }
-            }
-        }
-        bytes.push(tag::END_OF_ATTRIBUTES);
-        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
+    /// Appends a complete head. Refuses invalid tags, names, empty value
+    /// lists, duplicate attributes, out-of-range scalars, oversized fields
+    /// or heads, and collections deeper than [`MAX_DEPTH`]. Stages at most
+    /// [`MAX_HEAD`] bytes and one scalar of at most [`MAX_FIELD`] bytes.
+    /// Returns [`Error::Unwritable`] without changing `out` on refusal.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        write_head(self.version, self.code, self.request_id, &self.groups, out)
     }
 }
 
+fn write_head(
+    version: (u8, u8),
+    code: u16,
+    request_id: u32,
+    groups: &[Group],
+    out: &mut Vec<u8>,
+) -> Result<(), Error> {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&[version.0, version.1]);
+    bytes.extend_from_slice(&code.to_be_bytes());
+    bytes.extend_from_slice(&request_id.to_be_bytes());
+    for group in groups {
+        if group.tag == 0 || group.tag >= 0x10 || group.tag == tag::END_OF_ATTRIBUTES {
+            return Err(Error::Unwritable);
+        }
+        head_room(&bytes, 1)?;
+        bytes.push(group.tag);
+        let mut names = BTreeSet::new();
+        for attribute in &group.attributes {
+            if !is_name(attribute.name.as_bytes())
+                || attribute.values.is_empty()
+                || !names.insert(&attribute.name)
+            {
+                return Err(Error::Unwritable);
+            }
+            for (i, value) in attribute.values.iter().enumerate() {
+                let name = if i == 0 {
+                    attribute.name.as_bytes()
+                } else {
+                    b""
+                };
+                write_value(&mut bytes, name, value, 0)?;
+            }
+        }
+    }
+    bytes.push(tag::END_OF_ATTRIBUTES);
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
 // Leave room for the final end-of-attributes tag throughout encoding.
-fn head_room(out: &[u8], n: usize) -> Result<(), WriteError> {
+fn head_room(out: &[u8], n: usize) -> Result<(), Error> {
     if out.len().checked_add(n).is_none_or(|end| end >= MAX_HEAD) {
-        return Err(WriteError);
+        return Err(Error::Unwritable);
     }
     Ok(())
 }
 
-fn strict_put(out: &mut Vec<u8>, tag: u8, name: &[u8], value: &[u8]) -> Result<(), WriteError> {
+fn put(out: &mut Vec<u8>, tag: u8, name: &[u8], value: &[u8]) -> Result<(), Error> {
     if name.len() > MAX_NAME || value.len() > MAX_FIELD {
-        return Err(WriteError);
+        return Err(Error::Unwritable);
     }
     let size = 5usize
         .checked_add(name.len())
         .and_then(|n| n.checked_add(value.len()))
-        .ok_or(WriteError)?;
+        .ok_or(Error::Unwritable)?;
     head_room(out, size)?;
-    put(out, tag, name, value);
+    out.push(tag);
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(value);
     Ok(())
 }
 
-fn strict_value(
-    out: &mut Vec<u8>,
-    name: &[u8],
-    value: &Value,
-    depth: usize,
-) -> Result<(), WriteError> {
-    if let Value::Collection(members) = value {
-        if depth >= MAX_DEPTH {
-            return Err(WriteError);
-        }
-        strict_put(out, tag::BEG_COLLECTION, name, &[])?;
-        for member in members {
-            if !is_name(member.name.as_bytes()) || member.values.is_empty() {
-                return Err(WriteError);
-            }
-            strict_put(out, tag::MEMBER_ATTR_NAME, &[], member.name.as_bytes())?;
-            for value in &member.values {
-                strict_value(out, &[], value, depth + 1)?;
-            }
-        }
-        return strict_put(out, tag::END_COLLECTION, &[], &[]);
+fn write_value(out: &mut Vec<u8>, name: &[u8], v: &Value, depth: usize) -> Result<(), Error> {
+    if !in_range(v) {
+        return Err(Error::Unwritable);
     }
-    // The legacy scalar writer stages at most one bounded record. Comparing
-    // the complete head below rejects any clipping or value normalization.
-    let mut record = Vec::new();
-    if !write_value(&mut record, name, value, depth) {
-        return Err(WriteError);
+    match v {
+        Value::Collection(members) => {
+            if depth >= MAX_DEPTH {
+                return Err(Error::Unwritable);
+            }
+            put(out, tag::BEG_COLLECTION, name, &[])?;
+            for member in members {
+                if !is_name(member.name.as_bytes()) || member.values.is_empty() {
+                    return Err(Error::Unwritable);
+                }
+                put(out, tag::MEMBER_ATTR_NAME, &[], member.name.as_bytes())?;
+                for value in &member.values {
+                    write_value(out, &[], value, depth + 1)?;
+                }
+            }
+            put(out, tag::END_COLLECTION, &[], &[])
+        }
+        Value::OutOfBand(t) => {
+            if !(0x10..=0x1f).contains(t) {
+                return Err(Error::Unwritable);
+            }
+            put(out, *t, name, &[])
+        }
+        Value::Integer(n) | Value::Enum(n) => put(out, v.tag(), name, &n.to_be_bytes()),
+        Value::Boolean(b) => put(out, v.tag(), name, &[u8::from(*b)]),
+        Value::OctetString(b) => put(out, v.tag(), name, b),
+        Value::DateTime(d) => {
+            let y = d.year.to_be_bytes();
+            put(
+                out,
+                v.tag(),
+                name,
+                &[
+                    y[0],
+                    y[1],
+                    d.month,
+                    d.day,
+                    d.hour,
+                    d.minutes,
+                    d.seconds,
+                    d.deci_seconds,
+                    d.direction,
+                    d.utc_hours,
+                    d.utc_minutes,
+                ],
+            )
+        }
+        Value::Resolution {
+            cross_feed,
+            feed,
+            units,
+        } => {
+            let mut b = cross_feed.to_be_bytes().to_vec();
+            b.extend_from_slice(&feed.to_be_bytes());
+            b.push(*units as u8);
+            put(out, v.tag(), name, &b)
+        }
+        Value::Range { lower, upper } => {
+            let mut b = lower.to_be_bytes().to_vec();
+            b.extend_from_slice(&upper.to_be_bytes());
+            put(out, v.tag(), name, &b)
+        }
+        Value::TextWithLanguage { language, text: s }
+        | Value::NameWithLanguage { language, name: s } => {
+            let size = language.len().saturating_add(s.len()).saturating_add(4);
+            if size > MAX_FIELD {
+                return Err(Error::Unwritable);
+            }
+            let mut b = Vec::with_capacity(size);
+            b.extend_from_slice(&(language.len() as u16).to_be_bytes());
+            b.extend_from_slice(language.as_bytes());
+            b.extend_from_slice(&(s.len() as u16).to_be_bytes());
+            b.extend_from_slice(s.as_bytes());
+            put(out, v.tag(), name, &b)
+        }
+        Value::Text(s)
+        | Value::Name(s)
+        | Value::Keyword(s)
+        | Value::Uri(s)
+        | Value::UriScheme(s)
+        | Value::Charset(s)
+        | Value::NaturalLanguage(s)
+        | Value::MimeMediaType(s) => put(out, v.tag(), name, s.as_bytes()),
+        Value::Extension { tag: t, data } => {
+            if data.len() > MAX_FIELD - 4 {
+                return Err(Error::Unwritable);
+            }
+            let mut b = t.to_be_bytes().to_vec();
+            b.extend_from_slice(data);
+            put(out, v.tag(), name, &b)
+        }
+        Value::Unknown { tag: t, data } => {
+            if !is_unknown_tag(*t) {
+                return Err(Error::Unwritable);
+            }
+            put(out, *t, name, data)
+        }
     }
-    head_room(out, record.len())?;
-    out.extend_from_slice(&record);
-    Ok(())
 }
 
 /// A refused complete head, with the request ID needed for an error reply.
@@ -1050,7 +1267,9 @@ impl core::error::Error for HeadError {}
 /// impl Wire for Document {
 ///     type ParseError = Infallible;
 ///     type WriteError = Infallible;
+///     /// Copies bytes unchanged. The collector bounds their length. Refuses no bytes.
 ///     fn parse(bytes: &[u8]) -> Result<Self, Infallible> { Ok(Self(bytes.to_vec())) }
+///     /// Appends bytes unchanged. Refuses no values.
 ///     fn write(&self, out: &mut Vec<u8>) -> Result<(), Infallible> {
 ///         out.extend_from_slice(&self.0);
 ///         Ok(())
@@ -1123,7 +1342,6 @@ impl Decode for Head {
         let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
         self.done = true;
         let item = head(bytes)
-            .map(Header::from)
             .map_err(|error| HeadError { request_id, error });
         Ok(Step::Item(item, end))
     }
@@ -1184,139 +1402,6 @@ fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize
     }
 }
 
-/// Reads an IPP message from a body that arrives in pieces. Feed it the
-/// body's bytes in order. Once the attribute section has come,
-/// [`Decoder::next_message`] gives the message, and every later byte is
-/// document data, taken out with [`Decoder::take_data`]. Where the body
-/// ends is up to HTTP, so the decoder never knows the data is complete.
-///
-/// Until the end tag has come, the decoder holds at most [`MAX_HEAD`]
-/// bytes plus the two of a length field, however the bytes are fed and
-/// whether or not `next_message` is called in between. A longer
-/// attribute section fails with [`Error::TooLong`] as soon as it is fed.
-/// Document data is held until it is taken.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// While reading the attribute section: where the next record starts.
-    /// Everything before it has been checked, so each byte is scanned once.
-    scan: usize,
-    /// The first 8 bytes of the body, once they have come.
-    header: Option<[u8; HEADER_LEN]>,
-    state: State,
-}
-
-/// The most bytes [`scan`] reads. With this many bytes it never waits for
-/// more: a record that starts at or before [`MAX_HEAD`] needs at most its
-/// tag and 2 length bytes to show the section is too long.
-const HEAD_HOLD: usize = MAX_HEAD + 3;
-
-#[derive(Clone, Debug, Default)]
-enum State {
-    #[default]
-    Header,
-    /// The attribute section is the first this many bytes of `buf`.
-    Found(usize),
-    Data,
-    Failed(Error),
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes of the body. While the attribute section is still coming,
-    /// the bytes are checked as they are added, and the section's lengths
-    /// are checked as they arrive. After an [`Error`] bytes are dropped.
-    pub fn feed(&mut self, mut bytes: &[u8]) {
-        while let State::Header = self.state {
-            if bytes.is_empty() {
-                return;
-            }
-            let room = HEAD_HOLD.saturating_sub(self.buf.len());
-            if room == 0 {
-                // Not reached: `scan` never waits once it has HEAD_HOLD bytes.
-                self.fail(Error::TooLong);
-                return;
-            }
-            let (now, later) = bytes.split_at(room.min(bytes.len()));
-            self.buf.extend_from_slice(now);
-            bytes = later;
-            if self.header.is_none() {
-                self.header = self.buf.first_chunk::<HEADER_LEN>().copied();
-            }
-            match scan(&self.buf, &mut self.scan) {
-                Ok(None) => {}
-                Ok(Some(end)) => self.state = State::Found(end),
-                Err(e) => {
-                    self.fail(e);
-                    return;
-                }
-            }
-        }
-        if matches!(self.state, State::Found(_) | State::Data) {
-            self.buf.extend_from_slice(bytes);
-        }
-    }
-
-    fn fail(&mut self, e: Error) {
-        self.state = State::Failed(e);
-        self.buf = Vec::new();
-    }
-
-    /// The message, once its attribute section has come. It returns `None`
-    /// while it needs more bytes and after it has given the message, and
-    /// keeps returning the same error once the body has broken. The
-    /// message has no data; see [`Decoder::take_data`].
-    pub fn next_message(&mut self) -> Option<Result<Message, Error>> {
-        let end = match self.state {
-            State::Failed(e) => return Some(Err(e)),
-            State::Data | State::Header => return None,
-            State::Found(end) => end,
-        };
-        let result = match self.buf.get(..end) {
-            Some(h) => head(h).map(|m| (m, end)),
-            None => Err(Error::Truncated),
-        };
-        match result {
-            Ok((m, end)) => {
-                self.buf.drain(..end);
-                self.state = State::Data;
-                Some(Ok(m))
-            }
-            Err(e) => {
-                self.fail(e);
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// The request ID from the body's first 8 bytes, once they have come,
-    /// also after an [`Error`]. RFC 8011 section 4.1.2 asks a response to
-    /// carry the request's ID, so a world can answer a body it could not
-    /// read, such as with [`status::CLIENT_ERROR_BAD_REQUEST`].
-    pub fn request_id(&self) -> Option<u32> {
-        self.header.map(|h| u32::from_be_bytes([h[4], h[5], h[6], h[7]]))
-    }
-
-    /// The document bytes that have come since the message, or since the
-    /// last call. Before the message has been given, it returns nothing.
-    pub fn take_data(&mut self) -> Vec<u8> {
-        match self.state {
-            State::Data => std::mem::take(&mut self.buf),
-            _ => Vec::new(),
-        }
-    }
-
-    /// How many bytes are held: the part of the attribute section read so
-    /// far, or the data not yet taken.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-}
-
 /// Reads a length field at `i`: `None` if its bytes have not come.
 fn len_at(b: &[u8], i: usize) -> Result<Option<usize>, Error> {
     match b.get(i..i.saturating_add(2)) {
@@ -1328,55 +1413,13 @@ fn len_at(b: &[u8], i: usize) -> Result<Option<usize>, Error> {
     }
 }
 
-/// Walks the records of the attribute section from `*pos`, checking each
-/// length. It returns the length of the section, through the end tag, once
-/// that has come, and otherwise leaves `*pos` at the first record not yet
-/// whole. The checks run in the same order however the bytes arrive, so
-/// the same bytes always give the same error.
-fn scan(b: &[u8], pos: &mut usize) -> Result<Option<usize>, Error> {
-    if *pos < HEADER_LEN {
-        if b.len() < HEADER_LEN {
-            return Ok(None);
-        }
-        *pos = HEADER_LEN;
-    }
-    loop {
-        let p = *pos;
-        let Some(&t) = b.get(p) else { return Ok(None) };
-        if t < 0x10 {
-            if p + 1 > MAX_HEAD {
-                return Err(Error::TooLong);
-            }
-            if t == tag::END_OF_ATTRIBUTES {
-                return Ok(Some(p + 1));
-            }
-            *pos = p + 1;
-            continue;
-        }
-        let Some(n) = len_at(b, p + 1)? else { return Ok(None) };
-        let at = p + 3 + n;
-        if at + 2 > MAX_HEAD {
-            return Err(Error::TooLong);
-        }
-        let Some(v) = len_at(b, at)? else { return Ok(None) };
-        let end = at + 2 + v;
-        if end > MAX_HEAD {
-            return Err(Error::TooLong);
-        }
-        if b.len() < end {
-            return Ok(None);
-        }
-        *pos = end;
-    }
-}
-
 /// One record of the attribute section.
 enum Record<'a> {
     Delimiter(u8),
     Value { tag: u8, name: &'a [u8], value: &'a [u8] },
 }
 
-/// The records of an attribute section whose lengths [`scan`] has checked.
+/// The records of an attribute section whose lengths [`scan_head`] has checked.
 struct Records<'a> {
     b: &'a [u8],
     pos: usize,
@@ -1404,8 +1447,8 @@ impl<'a> Iterator for Records<'a> {
 }
 
 /// Reads a whole attribute section, header and end tag included, whose
-/// lengths [`scan`] has checked.
-fn head(h: &[u8]) -> Result<Message, Error> {
+/// lengths [`scan_head`] has checked.
+fn head(h: &[u8]) -> Result<Header, Error> {
     let (Some(fixed), Some(body)) = (h.get(..HEADER_LEN), h.get(HEADER_LEN..h.len().saturating_sub(1))) else {
         return Err(Error::Truncated);
     };
@@ -1437,12 +1480,11 @@ fn head(h: &[u8]) -> Result<Message, Error> {
             }
         }
     }
-    Ok(Message {
+    Ok(Header {
         version: (fixed[0], fixed[1]),
         code: u16::from_be_bytes([fixed[2], fixed[3]]),
         request_id: u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]),
         groups,
-        data: Vec::new(),
     })
 }
 
@@ -1617,148 +1659,21 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
     }
 }
 
-/// The longest start of `s` that fits in `max` bytes and ends on a
-/// character boundary.
-fn clip(s: &str, max: usize) -> &str {
-    let mut n = s.len().min(max);
-    while !s.is_char_boundary(n) {
-        n -= 1;
-    }
-    &s[..n]
-}
-
-/// Writes one record. Both fields must fit in [`MAX_FIELD`].
-fn put(out: &mut Vec<u8>, t: u8, name: &[u8], value: &[u8]) {
-    out.push(t);
-    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
-    out.extend_from_slice(name);
-    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
-    out.extend_from_slice(value);
-}
-
-/// Writes a top-level attribute, or nothing if it has an empty name or no
-/// value that can be written.
-fn write_attribute(out: &mut Vec<u8>, a: &Attribute) {
-    let name = a.name.as_bytes();
-    if !is_name(name) {
-        return;
-    }
-    let mut first = true;
-    for v in &a.values {
-        if write_value(out, if first { name } else { b"" }, v, 0) {
-            first = false;
-        }
-    }
-}
-
-/// Writes one value under `name`, and whether it did. `depth` is how many
-/// collections hold it.
-fn write_value(out: &mut Vec<u8>, name: &[u8], v: &Value, depth: usize) -> bool {
-    if !in_range(v) {
-        return false;
-    }
-    let text = |s: &str| clip(s, MAX_FIELD).as_bytes().to_vec();
-    let bytes: Vec<u8> = match v {
-        Value::OutOfBand(t) => {
-            if !(0x10..=0x1f).contains(t) {
-                return false;
-            }
-            Vec::new()
-        }
-        Value::Integer(n) | Value::Enum(n) => n.to_be_bytes().to_vec(),
-        Value::Boolean(b) => vec![u8::from(*b)],
-        Value::OctetString(b) => b[..b.len().min(MAX_FIELD)].to_vec(),
-        Value::DateTime(d) => {
-            let y = d.year.to_be_bytes();
-            vec![
-                y[0],
-                y[1],
-                d.month,
-                d.day,
-                d.hour,
-                d.minutes,
-                d.seconds,
-                d.deci_seconds,
-                d.direction,
-                d.utc_hours,
-                d.utc_minutes,
-            ]
-        }
-        Value::Resolution { cross_feed, feed, units } => {
-            let mut b = Vec::with_capacity(9);
-            b.extend_from_slice(&cross_feed.to_be_bytes());
-            b.extend_from_slice(&feed.to_be_bytes());
-            b.push(*units as u8);
-            b
-        }
-        Value::Range { lower, upper } => {
-            let mut b = Vec::with_capacity(8);
-            b.extend_from_slice(&lower.to_be_bytes());
-            b.extend_from_slice(&upper.to_be_bytes());
-            b
-        }
-        Value::TextWithLanguage { language, text: s } | Value::NameWithLanguage { language, name: s } => {
-            let language = clip(language, MAX_FIELD - 4).as_bytes();
-            let s = clip(s, MAX_FIELD - 4 - language.len()).as_bytes();
-            let mut b = Vec::with_capacity(4 + language.len() + s.len());
-            b.extend_from_slice(&(language.len() as u16).to_be_bytes());
-            b.extend_from_slice(language);
-            b.extend_from_slice(&(s.len() as u16).to_be_bytes());
-            b.extend_from_slice(s);
-            b
-        }
-        Value::Text(s)
-        | Value::Name(s)
-        | Value::Keyword(s)
-        | Value::Uri(s)
-        | Value::UriScheme(s)
-        | Value::Charset(s)
-        | Value::NaturalLanguage(s)
-        | Value::MimeMediaType(s) => text(s),
-        Value::Collection(members) => {
-            if depth >= MAX_DEPTH {
-                return false;
-            }
-            put(out, tag::BEG_COLLECTION, name, &[]);
-            for m in members {
-                let mut values = Vec::new();
-                let mut any = false;
-                for mv in &m.values {
-                    any |= write_value(&mut values, b"", mv, depth + 1);
-                }
-                let member = m.name.as_bytes();
-                if any && is_name(member) {
-                    put(out, tag::MEMBER_ATTR_NAME, b"", member);
-                    out.extend_from_slice(&values);
-                }
-            }
-            put(out, tag::END_COLLECTION, b"", &[]);
-            return true;
-        }
-        Value::Extension { tag: t, data } => {
-            let mut b = t.to_be_bytes().to_vec();
-            b.extend_from_slice(&data[..data.len().min(MAX_FIELD - 4)]);
-            b
-        }
-        Value::Unknown { tag: t, data } => {
-            if !is_unknown_tag(*t) {
-                return false;
-            }
-            data[..data.len().min(MAX_FIELD)].to_vec()
-        }
-    };
-    put(out, v.tag(), name, &bytes);
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Stream, contract,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     /// One record's bytes.
     fn rec(t: u8, name: &str, value: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
-        put(&mut out, t, name.as_bytes(), value);
+        let mut out = vec![t];
+        out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        out.extend_from_slice(value);
         out
     }
 
@@ -1802,7 +1717,7 @@ mod tests {
         assert_eq!(op("job-name"), [Value::Name("foobar".into())]);
         assert_eq!(op("ipp-attribute-fidelity"), [Value::Boolean(true)]);
         assert_eq!(m.data, b"%!PDF...");
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
     }
 
     /// The successful Print-Job response of RFC 8010 appendix A.2.
@@ -1826,7 +1741,7 @@ mod tests {
         assert_eq!(m.attribute(tag::JOB_ATTRIBUTES, "job-id").unwrap().values[0].as_i32(), Some(147));
         assert_eq!(m.attribute(tag::JOB_ATTRIBUTES, "job-state").unwrap().values, [Value::Enum(3)]);
         assert!(m.data.is_empty());
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
     }
 
     /// The Create-Job request with a "media-col" collection of RFC 8010
@@ -1870,13 +1785,13 @@ mod tests {
             Attribute::new("media-type", Value::Keyword("stationery".into())),
         ]);
         assert_eq!(col, &[expected]);
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
         // A member with two values: the second follows with no member name.
         let mut m = Message::request(operation::CREATE_JOB, 2);
         let member =
             Attribute { name: "k".into(), values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())] };
         m.add(tag::JOB_ATTRIBUTES, Attribute::new("c", Value::Collection(vec![member])));
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         let tail = [
             rec(0x34, "c", b""),
             rec(0x4a, "", b"k"),
@@ -1903,7 +1818,7 @@ mod tests {
         assert_eq!(m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(), [1, 4, 5]);
         assert!(m.groups[0].attributes.is_empty());
         assert_eq!(m.groups[1].attributes[0].values.len(), 3);
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
     }
 
     fn every_value() -> Vec<Value> {
@@ -1978,7 +1893,7 @@ mod tests {
         contract::check_wire_value(&head);
         let bytes = Wire::to_bytes(&head).unwrap();
         contract::check_wire::<Header>(&bytes);
-        contract::check_decode(Head::new, &bytes);
+        contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
         for (depth, accepted) in [(MAX_DEPTH, true), (MAX_DEPTH + 1, false)] {
             let mut message = Message::request(operation::PRINT_JOB, 3);
             message.add(tag::JOB_ATTRIBUTES, Attribute::new("nested", nested(depth)));
@@ -1997,7 +1912,7 @@ mod tests {
         for v in every_value() {
             let mut m = Message::request(operation::PRINT_JOB, 3);
             m.add(tag::JOB_ATTRIBUTES, Attribute::new("x", v.clone()));
-            let back = Message::parse(&m.to_bytes()).unwrap();
+            let back = Message::parse(&m.to_bytes().unwrap()).unwrap();
             assert_eq!(back, m, "{v:?}");
             assert!(tag_name(v.tag()).is_some() || is_unknown_tag(v.tag()) || (0x10..=0x1f).contains(&v.tag()));
         }
@@ -2009,21 +1924,49 @@ mod tests {
             Attribute::new("c", Value::Collection(vec![Attribute { name: "m".into(), values: every_value() }])),
         );
         m.data = vec![1, 2, 3];
-        assert_eq!(Message::parse(&m.to_bytes()).unwrap(), m);
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
     }
 
     #[test]
     fn exact_value_bytes() {
-        let mut out = Vec::new();
-        assert!(write_value(&mut out, b"r", &Value::Resolution { cross_feed: 600, feed: 600, units: 3 }, 0));
-        assert_eq!(out, [0x32, 0, 1, b'r', 0, 9, 0, 0, 2, 0x58, 0, 0, 2, 0x58, 3]);
-        let mut out = Vec::new();
-        let v = Value::TextWithLanguage { language: "en".into(), text: "hi".into() };
-        assert!(write_value(&mut out, b"t", &v, 0));
-        assert_eq!(out, [0x35, 0, 1, b't', 0, 8, 0, 2, b'e', b'n', 0, 2, b'h', b'i']);
-        let mut out = Vec::new();
-        assert!(write_value(&mut out, b"n", &Value::OutOfBand(tag::NO_VALUE), 0));
-        assert_eq!(out, [0x13, 0, 1, b'n', 0, 0]);
+        for (name, value, record) in [
+            (
+                "r",
+                Value::Resolution {
+                    cross_feed: 600,
+                    feed: 600,
+                    units: 3,
+                },
+                vec![0x32, 0, 1, b'r', 0, 9, 0, 0, 2, 0x58, 0, 0, 2, 0x58, 3],
+            ),
+            (
+                "t",
+                Value::TextWithLanguage {
+                    language: "en".into(),
+                    text: "hi".into(),
+                },
+                vec![0x35, 0, 1, b't', 0, 8, 0, 2, b'e', b'n', 0, 2, b'h', b'i'],
+            ),
+            (
+                "n",
+                Value::OutOfBand(tag::NO_VALUE),
+                vec![0x13, 0, 1, b'n', 0, 0],
+            ),
+        ] {
+            let head = Header {
+                version: (1, 1),
+                code: 2,
+                request_id: 1,
+                groups: vec![Group {
+                    tag: 1,
+                    attributes: vec![Attribute::new(name, value)],
+                }],
+            };
+            assert_eq!(
+                head.to_bytes().unwrap(),
+                [vec![1, 1, 0, 2, 0, 0, 0, 1, 1], record, vec![3]].concat()
+            );
+        }
     }
 
     #[test]
@@ -2092,17 +2035,11 @@ mod tests {
             long.extend(rec(0x30, "a", &[0; 30000]));
         }
         assert_eq!(Message::parse(&long), Err(Error::TooLong));
-        assert_eq!(Message::parse_head(&long), Err(Error::TooLong));
-        let mut d = Decoder::new();
-        for chunk in long.chunks(4096) {
-            d.feed(chunk);
-            if let Some(r) = d.next_message() {
-                assert_eq!(r, Err(Error::TooLong));
-                break;
-            }
-        }
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong)));
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(
+            decode_all(Head::new, &long).1,
+            Some(Fail::Protocol(Error::TooLong))
+        );
+        contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
         // Every message shows its error.
         for e in [Error::Truncated, Error::TooLong, Error::Length(0x8000), Error::NoGroup, Error::NoAttribute] {
             assert!(!e.to_string().is_empty());
@@ -2130,7 +2067,7 @@ mod tests {
         let member =
             Attribute { name: "k".into(), values: vec![Value::Keyword("a".into()), Value::Keyword("b".into())] };
         assert_eq!(m.groups[0].attributes, [Attribute::new("c", Value::Collection(vec![member]))]);
-        assert_eq!(Message::parse(&m.to_bytes()).unwrap(), m);
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
         // It needs a member with a value before it, and a value after it.
         assert_eq!(
             with(vec![rec(0x34, "c", b""), rec(0x4a, "", b""), rec(0x44, "", b"a"), rec(0x37, "", b"")]),
@@ -2149,34 +2086,32 @@ mod tests {
     }
 
     /// RFC 8011 section 4.1: a group with two attributes of one name is
-    /// malformed. Readers refuse it, and writers keep the first.
+    /// malformed. Readers and writers refuse it.
     #[test]
     fn duplicate_names() {
         let bytes = [vec![1, 1, 0, 2, 0, 0, 0, 1, 1], rec(0x44, "a", b"x"), rec(0x44, "a", b"y"), vec![3]].concat();
         assert_eq!(Message::parse(&bytes), Err(Error::Duplicate));
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Err(Error::Duplicate)));
+        assert_eq!(
+            decode_all(Head::new, &bytes),
+            (
+                vec![Err(HeadError {
+                    request_id: 1,
+                    error: Error::Duplicate
+                })],
+                None
+            )
+        );
         assert!(!Error::Duplicate.to_string().is_empty());
         // The same name in two groups is fine.
         let bytes =
             [vec![1, 1, 0, 2, 0, 0, 0, 1, 2], rec(0x44, "a", b"x"), vec![2], rec(0x44, "a", b"y"), vec![3]].concat();
         assert_eq!(Message::parse(&bytes).unwrap().groups.len(), 2);
-        // The writer leaves out the later ones.
-        let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::Integer(1)));
-        m.add(tag::JOB_ATTRIBUTES, Attribute { name: "a".into(), values: vec![] });
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::Integer(2)));
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("b", Value::Integer(3)));
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        let values: Vec<_> = back.groups[1].attributes.iter().map(|a| a.values.clone()).collect();
-        assert_eq!(values, [[Value::Integer(1)], [Value::Integer(3)]]);
-        // An attribute with nothing written does not hold its name.
-        let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::OutOfBand(0x40)));
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::Integer(2)));
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        assert_eq!(back.groups[1].attributes, [Attribute::new("a", Value::Integer(2))]);
+        let mut message = Message::request(operation::PRINT_JOB, 1);
+        message.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::Integer(1)));
+        message.add(tag::JOB_ATTRIBUTES, Attribute::new("a", Value::Integer(2)));
+        assert_unwritable(&message);
+        message.groups[1].attributes[0].values.clear();
+        assert_unwritable(&message);
     }
 
     #[test]
@@ -2193,14 +2128,16 @@ mod tests {
         assert_eq!(set.len(), 1);
         let errors: std::collections::HashSet<Error> = [Error::Duplicate, Error::Duplicate].into_iter().collect();
         assert_eq!(errors.len(), 1);
-        // A decoder can be copied part way through a body.
+        // A scan cursor can be copied without copying input.
         let bytes = print_job();
-        let mut d = Decoder::new();
-        d.feed(&bytes[..20]);
-        let mut e = d.clone();
-        e.feed(&bytes[20..]);
-        assert!(e.next_message().unwrap().is_ok());
-        assert_eq!(d.buffered(), 20);
+        let mut decoder = Head::new();
+        assert_eq!(decoder.decode(&bytes[..20], false), Ok(Step::Need));
+        let mut copy = decoder.clone();
+        assert!(matches!(
+            copy.decode(&bytes, false),
+            Ok(Step::Item(Ok(_), _))
+        ));
+        assert_eq!(decoder.decode(&bytes[..20], false), Ok(Step::Need));
     }
 
     /// A value nested in `n` collections.
@@ -2216,8 +2153,8 @@ mod tests {
     fn depth_limit() {
         let mut m = Message::request(operation::PRINT_JOB, 1);
         m.add(tag::JOB_ATTRIBUTES, Attribute::new("deep", nested(MAX_DEPTH)));
-        assert_eq!(Message::parse(&m.to_bytes()).unwrap(), m);
-        // One deeper is refused by the reader, and left out by the writer.
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
+        // One deeper is refused by both reader and writer.
         let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 1, 2];
         bytes.extend(rec(0x34, "deep", b""));
         for _ in 0..MAX_DEPTH {
@@ -2237,20 +2174,7 @@ mod tests {
             tag::JOB_ATTRIBUTES,
             Attribute { name: "x".into(), values: vec![nested(MAX_DEPTH + 5), Value::Integer(2)] },
         );
-        // The writer keeps the outer collections and leaves out the one
-        // too deep, so each attribute ends in an empty collection.
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        let attrs = &back.group(tag::JOB_ATTRIBUTES).unwrap().attributes;
-        fn depth(v: &Value) -> usize {
-            match v {
-                Value::Collection(m) => 1 + m.iter().flat_map(|a| &a.values).map(depth).max().unwrap_or(0),
-                _ => 0,
-            }
-        }
-        assert_eq!(depth(&attrs[0].values[0]), MAX_DEPTH);
-        assert_eq!(depth(&attrs[1].values[0]), MAX_DEPTH);
-        assert_eq!(attrs[1].values[1], Value::Integer(2));
-        assert_eq!(Message::parse(&back.to_bytes()).unwrap(), back);
+        assert_unwritable(&m);
         // Very deep input is cut off without deep recursion.
         let mut bytes = vec![1, 1, 0, 2, 0, 0, 0, 1, 2];
         bytes.extend(rec(0x34, "deep", b""));
@@ -2265,133 +2189,160 @@ mod tests {
     #[test]
     fn every_truncated_prefix() {
         for bytes in [print_job(), media_col()] {
-            let (m, used) = Message::parse_head(&bytes).unwrap().unwrap();
+            let message = Message::parse(&bytes).unwrap();
+            let used = bytes.len() - message.data.len();
             for n in 0..used {
-                assert_eq!(Message::parse_head(&bytes[..n]), Ok(None), "{n} bytes");
+                assert_eq!(Header::parse(&bytes[..n]), Err(ParseError::Truncated), "{n} bytes");
                 assert_eq!(Message::parse(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
-                let mut d = Decoder::new();
-                d.feed(&bytes[..n]);
-                assert_eq!(d.next_message(), None);
-                assert_eq!(d.buffered(), n);
+                assert_eq!(Head::new().decode(&bytes[..n], false), Ok(Step::Need));
             }
-            // Past the end tag, less data is still a message.
             for n in used..=bytes.len() {
-                let p = Message::parse(&bytes[..n]).unwrap();
-                assert_eq!(p.groups, m.groups);
-                assert_eq!(p.data, bytes[used..n]);
+                let parsed = Message::parse(&bytes[..n]).unwrap();
+                assert_eq!(parsed.groups, message.groups);
+                assert_eq!(parsed.data, bytes[used..n]);
             }
+            contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
         }
     }
 
     #[test]
-    fn decoder_one_byte_at_a_time() {
+    fn head_preserves_document_bytes() {
         let bytes = print_job();
-        let mut d = Decoder::new();
-        assert!(d.take_data().is_empty());
-        let mut msg = None;
-        let mut data = Vec::new();
-        for b in &bytes {
-            d.feed(std::slice::from_ref(b));
-            if let Some(r) = d.next_message() {
-                assert!(msg.is_none());
-                msg = Some(r.unwrap());
-            }
-            data.extend(d.take_data());
-        }
-        let mut msg = msg.unwrap();
-        assert_eq!(data, b"%!PDF...");
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.next_message(), None);
-        msg.data = data;
-        assert_eq!(msg, Message::parse(&bytes).unwrap());
-        // A broken body stays broken.
-        let mut d = Decoder::new();
-        d.feed(&[1, 1, 0, 2, 0, 0, 0, 1, 0x44]);
-        assert_eq!(d.next_message(), None);
-        d.feed(&[0, 1, b'a', 0, 0, 3]);
-        assert_eq!(d.next_message(), Some(Err(Error::NoGroup)));
-        d.feed(&print_job());
-        assert_eq!(d.next_message(), Some(Err(Error::NoGroup)));
-        assert_eq!(d.buffered(), 0);
-        assert!(d.take_data().is_empty());
+        contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&bytes), bytes.len());
+        let header = stream.next().unwrap().unwrap().unwrap();
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.unread(), b"%!PDF...");
+        assert_eq!(
+            header.with_document(stream.unread().to_vec()),
+            Message::parse(&bytes).unwrap()
+        );
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&[1, 1, 0, 2, 0, 0, 0, 1, 0x44]), 9);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(&[0, 1, b'a', 0, 0, 3]), 6);
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Err(HeadError {
+                request_id: 1,
+                error: Error::NoGroup
+            })))
+        );
+        assert_eq!(stream.next(), None);
     }
 
     #[test]
-    fn decoder_scans_a_large_head_in_linear_time() {
-        let mut m = Message::request(operation::PRINT_JOB, 1);
+    fn head_scans_a_large_input_in_linear_time() {
+        let mut message = Message::request(operation::PRINT_JOB, 1);
         for i in 0..30_000 {
-            m.add(tag::JOB_ATTRIBUTES, Attribute::new(format!("n{i}"), Value::Integer(i)));
+            message.add(
+                tag::JOB_ATTRIBUTES,
+                Attribute::new(format!("n{i}"), Value::Integer(i)),
+            );
         }
-        let bytes = m.to_bytes();
+        let bytes = message.to_bytes().unwrap();
         assert!(bytes.len() < MAX_HEAD);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        for b in &bytes {
-            d.feed(std::slice::from_ref(b));
-            if let Some(r) = d.next_message() {
-                assert_eq!(r.unwrap(), m);
-            }
-        }
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        contract::check_decode_with_alloc_limit(Head::new, &bytes, 2 * MAX_HEAD);
+        assert_eq!(
+            decode_all(Head::new, &bytes),
+            (vec![Ok(Header::from(message))], None)
+        );
+        assert!(
+            started.elapsed().as_secs() < 10,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
-    fn writers_cap_and_skip() {
+    fn writers_refuse_values_that_would_change() {
         let big = "é".repeat(MAX_FIELD);
-        let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("t", Value::Text(big.clone())));
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("o", Value::OctetString(vec![7; 70_000])));
-        m.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute::new("l", Value::TextWithLanguage { language: big.clone(), text: big.clone() }),
-        );
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("e", Value::Extension { tag: 1, data: vec![1; 70_000] }));
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("u", Value::Unknown { tag: 0x99, data: vec![1; 70_000] }));
-        m.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute::new("c", Value::Collection(vec![Attribute::new("m", Value::Integer(1))])),
-        );
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        let attrs = &back.group(tag::JOB_ATTRIBUTES).unwrap().attributes;
-        assert_eq!(attrs.len(), 6);
-        assert_eq!(attrs[0].values[0].as_str().unwrap().len(), MAX_FIELD - 1);
-        assert_eq!(attrs[1].values, [Value::OctetString(vec![7; MAX_FIELD])]);
-        // Things that cannot be written are left out.
-        let mut m = Message::request(operation::PRINT_JOB, 1);
-        m.groups.push(Group { tag: 0x10, attributes: vec![Attribute::new("a", Value::Integer(1))] });
-        m.groups.push(Group { tag: tag::END_OF_ATTRIBUTES, attributes: vec![] });
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("", Value::Integer(1)));
-        m.add(tag::JOB_ATTRIBUTES, Attribute { name: "none".into(), values: vec![] });
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("oob", Value::OutOfBand(0x21)));
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("unk", Value::Unknown { tag: tag::INTEGER, data: vec![] }));
-        m.add(tag::JOB_ATTRIBUTES, Attribute::new("unk", Value::Unknown { tag: tag::END_COLLECTION, data: vec![] }));
-        m.add(
-            tag::JOB_ATTRIBUTES,
-            Attribute::new(
-                "c",
-                Value::Collection(vec![
-                    Attribute { name: "empty".into(), values: vec![] },
-                    Attribute::new("", Value::Integer(1)),
-                    Attribute { name: "x".into(), values: vec![Value::OutOfBand(3), Value::Integer(5)] },
-                ]),
-            ),
-        );
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        assert_eq!(back.groups.len(), 2);
-        let expected = Attribute::new("c", Value::Collection(vec![Attribute::new("x", Value::Integer(5))]));
-        assert_eq!(back.groups[1].attributes, [expected]);
-        // A message too big for MAX_HEAD keeps what fits.
-        let mut m = Message::request(operation::PRINT_JOB, 1);
-        for i in 0..40 {
-            m.add(tag::JOB_ATTRIBUTES, Attribute::new(format!("o{i}"), Value::OctetString(vec![0; MAX_FIELD])));
+        for value in [
+            Value::Text(big.clone()),
+            Value::OctetString(vec![7; 70_000]),
+            Value::TextWithLanguage {
+                language: big.clone(),
+                text: big.clone(),
+            },
+            Value::NameWithLanguage {
+                language: "en".into(),
+                name: big,
+            },
+            Value::Extension {
+                tag: 1,
+                data: vec![1; 70_000],
+            },
+            Value::Unknown {
+                tag: 0x99,
+                data: vec![1; 70_000],
+            },
+            Value::OutOfBand(0x21),
+            Value::Unknown {
+                tag: tag::INTEGER,
+                data: vec![],
+            },
+            Value::Unknown {
+                tag: tag::END_COLLECTION,
+                data: vec![],
+            },
+            Value::Collection(vec![Attribute {
+                name: "empty".into(),
+                values: vec![],
+            }]),
+            Value::Collection(vec![Attribute::new("", Value::Integer(1))]),
+            Value::Collection(vec![Attribute {
+                name: "x".into(),
+                values: vec![Value::OutOfBand(3), Value::Integer(5)],
+            }]),
+        ] {
+            let mut message = Message::request(operation::PRINT_JOB, 1);
+            message.add(tag::JOB_ATTRIBUTES, Attribute::new("x", value));
+            assert_unwritable(&message);
         }
-        m.data = vec![5; 10];
-        let bytes = m.to_bytes();
-        let back = Message::parse(&bytes).unwrap();
-        let (_, used) = Message::parse_head(&bytes).unwrap().unwrap();
-        assert!(used <= MAX_HEAD);
-        assert!(back.groups[1].attributes.len() < 40 && back.groups[1].attributes.len() > 25);
-        assert_eq!(back.data, [5; 10]);
+        for group in [
+            Group {
+                tag: 0x10,
+                attributes: vec![],
+            },
+            Group {
+                tag: tag::END_OF_ATTRIBUTES,
+                attributes: vec![],
+            },
+            Group {
+                tag: tag::JOB_ATTRIBUTES,
+                attributes: vec![Attribute::new("", Value::Integer(1))],
+            },
+            Group {
+                tag: tag::JOB_ATTRIBUTES,
+                attributes: vec![Attribute {
+                    name: "none".into(),
+                    values: vec![],
+                }],
+            },
+        ] {
+            let mut message = Message::request(operation::PRINT_JOB, 1);
+            message.groups.push(group);
+            assert_unwritable(&message);
+        }
+        let mut message = Message::request(operation::PRINT_JOB, 1);
+        for i in 0..40 {
+            message.add(
+                tag::JOB_ATTRIBUTES,
+                Attribute::new(format!("o{i}"), Value::OctetString(vec![0; MAX_FIELD])),
+            );
+        }
+        message.data = vec![5; 10];
+        assert_unwritable(&message);
+        let mut message = Message::request(operation::PRINT_JOB, 1);
+        message.data = vec![0; MAX_DOCUMENT + 1];
+        assert_unwritable(&message);
+        let mut bytes = Message::request(operation::PRINT_JOB, 1)
+            .to_bytes()
+            .unwrap();
+        bytes.extend_from_slice(&message.data);
+        assert_eq!(Message::parse(&bytes), Err(Error::DocumentTooLong));
     }
 
     #[test]
@@ -2445,73 +2396,80 @@ mod tests {
             &[tag::END_OF_ATTRIBUTES],
         ]
         .concat();
-        let mut decoder = Decoder::new();
-        decoder.feed(&body);
-        let request = decoder.next_message().unwrap().unwrap();
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&body), body.len());
+        let request = stream
+            .next()
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .with_document(Vec::new());
         assert_eq!(request.code, operation::GET_PRINTER_ATTRIBUTES);
         let charset = request.attribute(tag::OPERATION_ATTRIBUTES, "attributes-charset").unwrap();
         assert_eq!(charset.values, [Value::Charset("utf-8".into())]);
-        let reply = answer(&request).to_bytes();
+        let reply = answer(&request).to_bytes().unwrap();
         assert_eq!(&reply[..8], [1, 1, 0, 0, 0, 0, 0, 7]);
         let back = Message::parse(&reply).unwrap();
         let state = back.attribute(tag::PRINTER_ATTRIBUTES, "printer-state").unwrap();
         assert_eq!(state.values, [Value::Enum(3)]);
         // The request the example builds by hand is the one `request` makes.
-        assert_eq!(Message::request(operation::GET_PRINTER_ATTRIBUTES, 7).to_bytes(), body);
+        assert_eq!(
+            Message::request(operation::GET_PRINTER_ATTRIBUTES, 7)
+                .to_bytes()
+                .unwrap(),
+            body
+        );
     }
 
-    /// A Print-Job head that is too long, fed in pieces with no call to
-    /// `next_message` in between, is held to MAX_HEAD and a few bytes, and
-    /// gives the same error as the whole body.
+    /// A head that exceeds the limit is refused with bounded allocation.
     #[test]
-    fn decoder_holds_a_bounded_head_without_polling() {
+    fn stream_holds_a_bounded_head_without_polling() {
         let mut long = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
         while long.len() < 3 * MAX_HEAD {
             long.extend(rec(0x30, "a", &[0; 30000]));
         }
-        let expected = Message::parse(&long);
-        assert_eq!(expected, Err(Error::TooLong));
-        for chunk in [1000, 4096, 65_536, 3 * MAX_HEAD] {
-            let mut d = Decoder::new();
-            let mut most = 0;
-            for piece in long.chunks(chunk) {
-                d.feed(piece);
-                most = most.max(d.buffered());
-            }
-            assert!(most <= HEAD_HOLD, "{chunk}: {most}");
-            assert_eq!(d.next_message(), Some(expected.clone()), "{chunk}");
-        }
-        // A head with no end tag that stays under MAX_HEAD waits.
-        let mut d = Decoder::new();
-        d.feed(&[1, 1, 0, 2, 0, 0, 0, 1, 1]);
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&long), MAX_HEAD);
+        assert_eq!(stream.push(&long), 0);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
+        assert_eq!(stream.next(), None);
+        contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
+        let mut partial = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
         for _ in 0..30 {
-            d.feed(&rec(0x30, "", &[0; 30000]));
+            partial.extend(rec(0x30, "", &[0; 30000]));
         }
-        assert!(d.buffered() <= HEAD_HOLD);
-        // A head and data fed in one piece, with no polling, are both kept.
-        let mut d = Decoder::new();
-        d.feed(&print_job());
-        d.feed(b"more");
-        let mut m = d.next_message().unwrap().unwrap();
-        m.data = d.take_data();
-        let mut want = Message::parse(&print_job()).unwrap();
-        want.data.extend_from_slice(b"more");
-        assert_eq!(m, want);
+        assert_eq!(Head::new().decode(&partial, false), Ok(Step::Need));
+        let mut bytes = print_job();
+        bytes.extend_from_slice(b"more");
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&bytes), bytes.len());
+        let header = stream.next().unwrap().unwrap().unwrap();
+        assert_eq!(stream.next(), None);
+        assert_eq!(
+            header.with_document(stream.unread().to_vec()),
+            Message::parse(&bytes).unwrap()
+        );
     }
 
     /// RFC 8011 section 4.1.2: a response copies the request ID, so the
     /// decoder keeps it when the body is broken.
     #[test]
-    fn decoder_keeps_the_request_id_after_an_error() {
-        let mut d = Decoder::new();
-        assert_eq!(d.request_id(), None);
-        d.feed(&[1, 1, 0, 2, 0, 0]);
-        assert_eq!(d.request_id(), None);
-        d.feed(&[0, 42, 1]);
-        d.feed(&rec(0x22, "a", &[2]));
-        d.feed(&[3]);
-        assert_eq!(d.next_message(), Some(Err(Error::BadValue(0x22))));
-        assert_eq!(d.request_id(), Some(42));
+    fn head_errors_carry_the_request_id() {
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&[1, 1, 0, 2, 0, 0]), 6);
+        assert_eq!(stream.next(), None);
+        let mut bytes = vec![0, 42, 1];
+        bytes.extend(rec(0x22, "a", &[2]));
+        bytes.push(3);
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(
+            stream.next(),
+            Some(Ok(Err(HeadError {
+                request_id: 42,
+                error: Error::BadValue(0x22)
+            })))
+        );
+        assert_eq!(stream.next(), None);
     }
 
     /// RFC 8010 section 3.2 and RFC 8011 section 5.1.4: a name is at most
@@ -2532,15 +2490,14 @@ mod tests {
                 Err(Error::BadName),
                 "{bad:?}"
             );
-            // The writer leaves the attribute or member out.
+            // The writer refuses the attribute or member.
             let mut m = Message::request(operation::PRINT_JOB, 1);
             m.add(tag::JOB_ATTRIBUTES, Attribute::new(bad, Value::Integer(1)));
             m.add(
                 tag::JOB_ATTRIBUTES,
                 Attribute::new("c", Value::Collection(vec![Attribute::new(bad, Value::Integer(1))])),
             );
-            let back = Message::parse(&m.to_bytes()).unwrap();
-            assert_eq!(back.groups[1].attributes, [Attribute::new("c", Value::Collection(vec![]))]);
+            assert_unwritable(&m);
         }
         let ok = "a".repeat(MAX_NAME);
         assert_eq!(with(vec![rec(0x44, &ok, b"k")]).unwrap().groups[0].attributes[0].name, ok);
@@ -2609,11 +2566,10 @@ mod tests {
             bytes.extend(rec(v.tag(), "x", &value));
             bytes.push(3);
             assert_eq!(Message::parse(&bytes), Err(Error::BadValue(v.tag())), "{v:?}");
-            // The writer leaves it out.
+            // The writer refuses it.
             let mut m = Message::request(operation::PRINT_JOB, 1);
             m.add(tag::JOB_ATTRIBUTES, Attribute { name: "x".into(), values: vec![v.clone(), Value::Integer(1)] });
-            let back = Message::parse(&m.to_bytes()).unwrap();
-            assert_eq!(back.groups[1].attributes, [Attribute::new("x", Value::Integer(1))], "{v:?}");
+            assert_unwritable(&m);
         }
         // The edges are kept.
         let mut m = Message::request(operation::PRINT_JOB, 1);
@@ -2636,7 +2592,7 @@ mod tests {
             }),
         ];
         m.add(tag::JOB_ATTRIBUTES, Attribute { name: "x".into(), values });
-        assert_eq!(Message::parse(&m.to_bytes()).unwrap(), m);
+        assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m);
     }
 
     /// RFC 8010 section 3.5.1 reserves delimiter tag 0x00.
@@ -2644,12 +2600,19 @@ mod tests {
     fn reserved_group_tag() {
         let bytes = [vec![1, 1, 0, 2, 0, 0, 0, 1, 1], vec![0], rec(0x21, "a", &[0; 4]), vec![3]].concat();
         assert_eq!(Message::parse(&bytes), Err(Error::ReservedGroup));
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Err(Error::ReservedGroup)));
+        assert_eq!(
+            decode_all(Head::new, &bytes),
+            (
+                vec![Err(HeadError {
+                    request_id: 1,
+                    error: Error::ReservedGroup
+                })],
+                None
+            )
+        );
         let mut m = Message::request(operation::PRINT_JOB, 1);
         m.groups.push(Group { tag: 0, attributes: vec![Attribute::new("a", Value::Integer(1))] });
-        assert_eq!(Message::parse(&m.to_bytes()).unwrap(), Message::request(operation::PRINT_JOB, 1));
+        assert_unwritable(&m);
         // Unassigned delimiter tags are kept, for groups defined later.
         let bytes = [vec![1, 1, 0, 2, 0, 0, 0, 1, 0x0b], rec(0x21, "a", &[0; 4]), vec![3]].concat();
         assert_eq!(Message::parse(&bytes).unwrap().groups[0].tag, 0x0b);
@@ -2674,108 +2637,46 @@ mod tests {
         assert_eq!(m.groups.iter().map(|g| g.tag).collect::<Vec<_>>(), [1, 2, 4, 2]);
     }
 
-    /// A small deterministic generator, so the fuzz loop needs no crate.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
+    fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
+        contract::check_wire_value(value);
+        let mut out = b"prefix".to_vec();
+        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
+        assert_eq!(out, b"prefix");
     }
 
     /// Checks everything the fuzz target checks, for one buffer.
     fn check(data: &[u8]) {
-        let whole = Message::parse(data);
-        // The decoder, fed all at once and a byte at a time, agrees.
-        let mut d = Decoder::new();
-        d.feed(data);
-        let first = d.next_message();
-        let mut bytewise = Decoder::new();
-        let mut got = None;
-        let mut rest = Vec::new();
-        for b in data {
-            bytewise.feed(std::slice::from_ref(b));
-            if got.is_none() {
-                got = bytewise.next_message();
-            }
-            rest.extend(bytewise.take_data());
-        }
-        // Fed in two pieces with no polling between, the decoder holds a
-        // bounded head and reads the same.
-        let mut lazy = Decoder::new();
-        let (x, y) = data.split_at(data.len() / 2);
-        lazy.feed(x);
-        assert!(lazy.buffered() <= HEAD_HOLD || matches!(Message::parse_head(x), Ok(Some(_))));
-        lazy.feed(y);
-        let mut lazy_first = lazy.next_message();
-        if let Some(Ok(m)) = &mut lazy_first {
-            m.data = lazy.take_data();
-        }
-        let want = match &whole {
-            Ok(m) => Some(Ok(m.clone())),
-            Err(Error::Truncated) => None,
-            Err(e) => Some(Err(*e)),
-        };
-        assert_eq!(lazy_first, want);
-        assert_eq!(
-            bytewise.request_id(),
-            data.first_chunk::<8>().map(|h| u32::from_be_bytes([h[4], h[5], h[6], h[7]]))
-        );
-        match &whole {
-            Ok(m) => {
-                let mut a = first.unwrap().unwrap();
-                a.data = d.take_data();
-                assert_eq!(&a, m);
-                let mut b = got.unwrap().unwrap();
-                b.data = rest;
-                assert_eq!(&b, m);
-                // A message read can be written, and reads back the same.
-                let bytes = m.to_bytes();
-                assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));
-            }
-            Err(Error::Truncated) => {
-                assert_eq!(first, None);
-                assert_eq!(got, None);
-            }
-            Err(e) => {
-                assert_eq!(first, Some(Err(*e)));
-                assert_eq!(got, Some(Err(*e)));
-            }
+        contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEAD);
+        contract::check_wire::<Header>(data);
+        contract::check_wire::<Message>(data);
+        if let Ok(message) = Message::parse(data) {
+            assert_eq!(
+                decode_all(Head::new, data),
+                (vec![Ok(Header::from(message))], None)
+            );
         }
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut rng = Lcg(0x1bb_631);
-        let seeds = [print_job(), media_col(), Message::request(2, 9).to_bytes()];
+        let mut rng = Lcg::new(0x1bb_631);
+        let seeds = [
+            print_job(),
+            media_col(),
+            Message::request(2, 9).to_bytes().unwrap(),
+        ];
         let mut full = Message::request(operation::PRINT_JOB, 3);
         full.add(tag::JOB_ATTRIBUTES, Attribute { name: "all".into(), values: every_value() });
-        let seeds = [seeds.to_vec(), vec![full.to_bytes()]].concat();
+        let seeds = [seeds.to_vec(), vec![full.to_bytes().unwrap()]].concat();
         let mut parsed = 0;
         for i in 0..6000 {
             let mut buf = if i % 4 == 0 {
-                (0..rng.below(64)).map(|_| rng.next() as u8).collect()
+                rng.bytes(64)
             } else {
-                seeds[rng.below(seeds.len())].clone()
+                seeds[rng.index(seeds.len())].clone()
             };
-            for _ in 0..rng.below(6) {
-                if buf.is_empty() {
-                    break;
-                }
-                let at = rng.below(buf.len());
-                match rng.below(5) {
-                    0 => buf[at] = rng.next() as u8,
-                    1 => buf[at] ^= 1 << rng.below(8),
-                    2 => buf.truncate(at),
-                    3 => buf.insert(at, [0, 3, 0x34, 0x37, 0x4a, 0x7f, 0x80][rng.below(7)]),
-                    _ => {
-                        buf.remove(at);
-                    }
-                }
+            for _ in 0..rng.index(6) {
+                mutate(&mut rng, &mut buf);
             }
             if Message::parse(&buf).is_ok() {
                 parsed += 1;
@@ -2789,21 +2690,24 @@ mod tests {
             let mut m = Message {
                 version: (2, 0),
                 code: rng.next() as u16,
-                request_id: rng.next(),
+                request_id: rng.next() as u32,
                 groups: vec![],
                 data: vec![],
             };
-            for _ in 0..rng.below(4) {
+            for _ in 0..rng.index(4) {
                 let mut attributes = Vec::new();
-                for j in 0..rng.below(4) {
+                for j in 0..rng.index(4) {
                     let all = every_value();
-                    let values = (0..1 + rng.below(3)).map(|_| all[rng.below(all.len())].clone()).collect();
+                    let values = (0..1 + rng.index(3)).map(|_| all[rng.index(all.len())].clone()).collect();
                     attributes.push(Attribute { name: format!("a{j}"), values });
                 }
-                m.groups.push(Group { tag: [1, 2, 4, 5, 0x0b, 0x0f][rng.below(6)], attributes });
+                m.groups.push(Group {
+                    tag: [1, 2, 4, 5, 0x0b, 0x0f][rng.index(6)],
+                    attributes,
+                });
             }
-            m.data = (0..rng.below(8)).map(|_| rng.next() as u8).collect();
-            let bytes = m.to_bytes();
+            m.data = rng.bytes(8);
+            let bytes = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&bytes).unwrap(), m);
             check(&bytes);
         }

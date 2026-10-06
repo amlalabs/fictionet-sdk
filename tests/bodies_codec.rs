@@ -1,31 +1,27 @@
 //! Session handoffs and bounded mail and print bodies through the codec driver.
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Step, Stream, Wire, contract, finish, pump,
-    test_support::chunks,
+    Collect, CollectError, Decode, Fail, Step, Stream, Wire, contract, pump,
+    test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{imf, ipp, postgres as pg};
 
-fn read<D: Decode>(decoder: D, bytes: &[u8], pattern: &[usize]) -> Vec<D::Item>
+fn read<D: Decode + Clone>(decoder: D, bytes: &[u8]) -> Vec<D::Item>
 where
     D::Error: Clone + core::fmt::Debug,
 {
-    let capacity = decoder.capacity();
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    for part in chunks(bytes, pattern) {
-        assert_eq!(
-            pump(&mut stream, part, |item| items.push(item)).unwrap(),
-            part.len()
-        );
-        assert!(stream.buffered() <= capacity);
-        assert_eq!(stream.held(), 0);
-    }
-    finish(&mut stream, |item| items.push(item)).unwrap();
-    assert!(stream.is_done());
-    assert!(stream.failed().is_none());
-    assert!(stream.next().is_none());
+    let (items, failure) = decode_all(|| decoder.clone(), bytes);
+    assert!(failure.is_none(), "{failure:?}");
     items
+}
+
+fn check<D: Decode>(make: impl Fn() -> D, bytes: &[u8])
+where
+    D::Error: Clone + PartialEq + core::fmt::Debug,
+    D::Item: PartialEq + core::fmt::Debug,
+{
+    let capacity = make().capacity();
+    contract::check_decode_with_alloc_limit(make, bytes, 2 * capacity);
 }
 
 fn failure<D: Decode>(decoder: D, bytes: &[u8], eof: bool, expected: Fail<D::Error>)
@@ -52,7 +48,7 @@ fn typed_frontend() -> pg::FrontendMessages {
 }
 
 #[test]
-fn postgres_frontend_and_backend_chunked_round_trips() {
+fn postgres_frontend_and_backend_round_trips() {
     let frontend = vec![
         pg::Frontend::Startup(pg::Startup::new("alice", "mail")),
         pg::Frontend::Query("select 1".into()),
@@ -66,13 +62,11 @@ fn postgres_frontend_and_backend_chunked_round_trips() {
         contract::check_wire_value(message);
         contract::check_wire::<pg::Frontend>(&Wire::to_bytes(message).unwrap());
     }
-    contract::check_stack(pg::FrontendMessages::new, &bytes);
-    for pattern in [&[][..], &[1], &[2, 3, 1, 7, 37]] {
-        assert_eq!(
-            read(pg::FrontendMessages::new(), &bytes, pattern),
-            frontend.iter().cloned().map(Ok).collect::<Vec<_>>()
-        );
-    }
+    check(pg::FrontendMessages::new, &bytes);
+    assert_eq!(
+        read(pg::FrontendMessages::new(), &bytes),
+        frontend.iter().cloned().map(Ok).collect::<Vec<_>>()
+    );
 
     let backend = vec![
         pg::Backend::Authentication(pg::Authentication::Ok),
@@ -90,17 +84,15 @@ fn postgres_frontend_and_backend_chunked_round_trips() {
         contract::check_wire_value(message);
         contract::check_wire::<pg::Backend>(&Wire::to_bytes(message).unwrap());
     }
-    contract::check_stack(pg::BackendMessages::new, &bytes);
-    for pattern in [&[][..], &[1], &[3, 1, 2, 47]] {
-        assert_eq!(
-            read(pg::BackendMessages::new(), &bytes, pattern),
-            backend
-                .iter()
-                .cloned()
-                .map(|m| Ok(pg::BackendEvent::Message(m)))
-                .collect::<Vec<_>>()
-        );
-    }
+    check(pg::BackendMessages::new, &bytes);
+    assert_eq!(
+        read(pg::BackendMessages::new(), &bytes),
+        backend
+            .iter()
+            .cloned()
+            .map(|m| Ok(pg::BackendEvent::Message(m)))
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -113,7 +105,7 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
         let mut bytes = Wire::to_bytes(&request).unwrap();
         let boundary = bytes.len();
         bytes.extend_from_slice(trailing);
-        contract::check_decode(pg::FrontendMessages::new, &bytes);
+        check(pg::FrontendMessages::new, &bytes);
         let mut stream = Stream::new(pg::FrontendMessages::new());
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(Ok(request.clone()))));
@@ -126,7 +118,7 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
         decoder.start_encryption();
         let startup = pg::Frontend::Startup(pg::Startup::new("u", "d"));
         assert_eq!(
-            read(decoder, &Wire::to_bytes(&startup).unwrap(), &[1]),
+            read(decoder, &Wire::to_bytes(&startup).unwrap()),
             [Ok(startup)]
         );
 
@@ -138,7 +130,7 @@ fn postgres_encryption_requests_end_with_exact_unread_transport_bytes() {
         };
         let mut response = Wire::to_bytes(&reply).unwrap();
         response.extend_from_slice(trailing);
-        contract::check_decode(make, &response);
+        check(make, &response);
         let mut stream = Stream::new(make());
         assert_eq!(stream.push(&response), response.len());
         assert_eq!(
@@ -166,27 +158,25 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
     for message in &messages {
         message.write(&mut bytes).unwrap();
     }
-    for pattern in [&[][..], &[1], &[3, 1, 11]] {
-        let mut stream = Stream::new(pg::FrontendMessages::new());
-        let mut got = Vec::new();
-        for part in chunks(&bytes, pattern) {
-            assert_eq!(stream.push(part), part.len());
-            while let Some(item) = stream.next() {
-                let message = item.unwrap().unwrap();
-                if matches!(
-                    message,
-                    pg::Frontend::SslRequest | pg::Frontend::GssEncRequest
-                ) {
-                    stream.decoder().refuse_encryption();
-                }
-                got.push(message);
+    let mut stream = Stream::new(pg::FrontendMessages::new());
+    let mut got = Vec::new();
+    for part in chunks(&bytes, &[3, 1, 11]) {
+        assert_eq!(stream.push(part), part.len());
+        while let Some(item) = stream.next() {
+            let message = item.unwrap().unwrap();
+            if matches!(
+                message,
+                pg::Frontend::SslRequest | pg::Frontend::GssEncRequest
+            ) {
+                stream.decoder().refuse_encryption();
             }
+            got.push(message);
         }
-        stream.end();
-        assert_eq!(stream.next(), None);
-        assert!(stream.failed().is_none());
-        assert_eq!(got, messages);
     }
+    stream.end();
+    assert_eq!(stream.next(), None);
+    assert!(stream.failed().is_none());
+    assert_eq!(got, messages);
 
     // A decision made after observing End resumes through swap, with the
     // negotiation history and the exact buffered startup suffix intact.
@@ -216,9 +206,9 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
         d.expect_encryption();
         d
     };
-    contract::check_decode(make, &backend);
+    check(make, &backend);
     assert_eq!(
-        read(make(), &backend, &[1]),
+        read(make(), &backend),
         [
             Ok(pg::BackendEvent::Encryption(pg::EncryptionReply::Refused)),
             Ok(pg::BackendEvent::Message(ready)),
@@ -286,9 +276,9 @@ fn postgres_cancel_and_terminate_end_at_the_item_boundary() {
 fn postgres_body_errors_are_items_and_framing_errors_end_once() {
     let mut bytes = b"Q\0\0\0\x05x".to_vec(); // Missing string terminator.
     pg::Frontend::Sync.write(&mut bytes).unwrap();
-    contract::check_decode(typed_frontend, &bytes);
+    check(typed_frontend, &bytes);
     assert_eq!(
-        read(typed_frontend(), &bytes, &[1]),
+        read(typed_frontend(), &bytes),
         [
             Err(pg::Error::Malformed {
                 tag: b'Q',
@@ -299,9 +289,9 @@ fn postgres_body_errors_are_items_and_framing_errors_end_once() {
     );
     let mut bytes = b"Z\0\0\0\x05?".to_vec();
     pg::Backend::BindComplete.write(&mut bytes).unwrap();
-    contract::check_decode(|| pg::BackendMessages::with_limit(64), &bytes);
+    check(|| pg::BackendMessages::with_limit(64), &bytes);
     assert_eq!(
-        read(pg::BackendMessages::with_limit(64), &bytes, &[1]),
+        read(pg::BackendMessages::with_limit(64), &bytes),
         [
             Err(pg::Error::Malformed {
                 tag: b'Z',
@@ -350,10 +340,10 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
         });
         if frontend {
             failure(typed_frontend(), bytes, false, expected);
-            contract::check_decode(typed_frontend, bytes);
+            check(typed_frontend, bytes);
         } else {
             failure(pg::BackendMessages::with_limit(64), bytes, false, expected);
-            contract::check_decode(|| pg::BackendMessages::with_limit(64), bytes);
+            check(|| pg::BackendMessages::with_limit(64), bytes);
         }
     }
     failure(
@@ -383,7 +373,7 @@ fn postgres_modes_and_minimum_limit_are_explicit() {
     frontend.start_messages();
     assert_eq!(frontend.phase(), pg::Phase::Messages);
     assert_eq!(
-        read(frontend.clone(), b"S\0\0\0\x04", &[1]),
+        read(frontend.clone(), b"S\0\0\0\x04"),
         [Ok(pg::Frontend::Sync)]
     );
     failure(
@@ -420,9 +410,11 @@ struct Body(Vec<u8>);
 impl Wire for Body {
     type ParseError = core::convert::Infallible;
     type WriteError = core::convert::Infallible;
+    /// Copies an opaque body. The collector enforces its size limit. Refuses no bytes.
     fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
         Ok(Self(bytes.to_vec()))
     }
+    /// Appends the body unchanged. Refuses no values.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
         out.extend_from_slice(&self.0);
         Ok(())
@@ -478,15 +470,13 @@ fn imf_header_and_collected_body_round_trip() {
     let body: Vec<u8> = (0..=255).cycle().take(1031).collect();
     bytes.extend_from_slice(&body);
     let make = || imf::Head::with_limit(128);
-    contract::check_stack(make, &bytes);
-    for pattern in [&[][..], &[1], &[3, 1, 59, 2, 83]] {
-        assert_eq!(
-            read_head_and_body(make(), &bytes, pattern, MAX_MAIL_BODY),
-            (Ok(header.clone()), body.clone())
-        );
-    }
+    check(make, &bytes);
     assert_eq!(
-        read(make(), &Wire::to_bytes(&header).unwrap(), &[1]),
+        read_head_and_body(make(), &bytes, &[3, 1, 59, 2, 83], MAX_MAIL_BODY),
+        (Ok(header.clone()), body.clone())
+    );
+    assert_eq!(
+        read(make(), &Wire::to_bytes(&header).unwrap()),
         [Ok(header)]
     );
 }
@@ -495,17 +485,15 @@ fn imf_header_and_collected_body_round_trip() {
 fn imf_bad_fields_are_items_and_header_limits_end_once() {
     let bytes = b"bad field\r\n\r\nbody";
     let make = || imf::Head::with_limit(32);
-    contract::check_decode(make, bytes);
-    for pattern in [&[][..], &[1], &[3, 7]] {
-        assert_eq!(
-            read_head_and_body(make(), bytes, pattern, MAX_MAIL_BODY),
-            (Err(imf::Error::FieldName), b"body".to_vec())
-        );
-    }
+    check(make, bytes);
+    assert_eq!(
+        read_head_and_body(make(), bytes, &[3, 7], MAX_MAIL_BODY),
+        (Err(imf::Error::FieldName), b"body".to_vec())
+    );
     // Reaching the cap without a blank line refuses the header before
     // any body is read, including at EOF.
     let oversized = b"Subject: longxxx";
-    contract::check_decode(|| imf::Head::with_limit(16), oversized);
+    check(|| imf::Head::with_limit(16), oversized);
     for eof in [false, true] {
         failure(
             imf::Head::with_limit(16),
@@ -547,15 +535,13 @@ fn ipp_head_and_collected_document_round_trip() {
     let document: Vec<u8> = (0..=255).rev().cycle().take(2057).collect();
     bytes.extend_from_slice(&document);
     let make = || ipp::Head::with_limit(512);
-    contract::check_stack(make, &bytes);
-    for pattern in [&[][..], &[1], &[3, 1, 2, 257]] {
-        assert_eq!(
-            read_head_and_body(make(), &bytes, pattern, ipp::MAX_DOCUMENT),
-            (Ok(head.clone()), document.clone())
-        );
-    }
+    check(make, &bytes);
     assert_eq!(
-        read(make(), &Wire::to_bytes(&head).unwrap(), &[1]),
+        read_head_and_body(make(), &bytes, &[3, 1, 2, 257], ipp::MAX_DOCUMENT),
+        (Ok(head.clone()), document.clone())
+    );
+    assert_eq!(
+        read(make(), &Wire::to_bytes(&head).unwrap()),
         [Ok(head)]
     );
 }
@@ -564,19 +550,17 @@ fn ipp_head_and_collected_document_round_trip() {
 fn ipp_attribute_errors_carry_request_ids_and_bad_lengths_end_once() {
     let bytes = b"\x01\x01\0\x02\0\0\0\x07\0\x03document";
     let make = || ipp::Head::with_limit(64);
-    contract::check_decode(make, bytes);
+    check(make, bytes);
     let error = ipp::HeadError {
         request_id: 7,
         error: ipp::Error::ReservedGroup,
     };
-    for pattern in [&[][..], &[1], &[3, 7]] {
-        assert_eq!(
-            read_head_and_body(make(), bytes, pattern, ipp::MAX_DOCUMENT),
-            (Err(error), b"document".to_vec())
-        );
-    }
+    assert_eq!(
+        read_head_and_body(make(), bytes, &[3, 7], ipp::MAX_DOCUMENT),
+        (Err(error), b"document".to_vec())
+    );
     let bytes = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\0\0\x80\0";
-    contract::check_decode(ipp::Head::new, bytes);
+    check(ipp::Head::new, bytes);
     failure(
         ipp::Head::new(),
         bytes,
@@ -594,23 +578,20 @@ fn ipp_overlong_names_are_head_error_items() {
     assert!(!stream.is_done());
     bytes.extend_from_slice(&[b'a'; ipp::MAX_NAME + 1]);
     bytes.extend_from_slice(b"\0\x01x\x03");
-    assert_eq!(ipp::Message::parse_head(&bytes), Err(ipp::Error::BadName));
     assert_eq!(
         <ipp::Header as Wire>::parse(&bytes),
         Err(ipp::ParseError::Head(ipp::Error::BadName))
     );
-    contract::check_decode(ipp::Head::new, &bytes);
+    check(ipp::Head::new, &bytes);
     bytes.extend_from_slice(b"document");
     let error = ipp::HeadError {
         request_id: 7,
         error: ipp::Error::BadName,
     };
-    for pattern in [&[][..], &[1], &[3, 7]] {
-        assert_eq!(
-            read_head_and_body(ipp::Head::new(), &bytes, pattern, ipp::MAX_DOCUMENT),
-            (Err(error), b"document".to_vec())
-        );
-    }
+    assert_eq!(
+        read_head_and_body(ipp::Head::new(), &bytes, &[3, 7], ipp::MAX_DOCUMENT),
+        (Err(error), b"document".to_vec())
+    );
 }
 
 #[test]
@@ -622,7 +603,7 @@ fn ipp_limits_are_refused_from_attribute_headers_and_partial_heads_truncate() {
         true,
         Fail::Truncated { unread: name.len() },
     );
-    contract::check_decode(ipp::Head::new, name);
+    check(ipp::Head::new, name);
     let value = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\0\x01n\x7f\xff";
     failure(
         ipp::Head::with_limit(64),
@@ -630,7 +611,7 @@ fn ipp_limits_are_refused_from_attribute_headers_and_partial_heads_truncate() {
         false,
         Fail::Protocol(ipp::Error::TooLong),
     );
-    contract::check_decode(|| ipp::Head::with_limit(64), value);
+    check(|| ipp::Head::with_limit(64), value);
     let truncated = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\0\x01n\0\x03a";
     failure(
         ipp::Head::new(),
@@ -800,15 +781,15 @@ fn exact_and_minimum_header_limits_make_progress() {
     let header = mail_header();
     let bytes = Wire::to_bytes(&header).unwrap();
     let make = || imf::Head::with_limit(bytes.len());
-    contract::check_decode(make, &bytes);
-    assert_eq!(read(make(), &bytes, &[1]), [Ok(header)]);
+    check(make, &bytes);
+    assert_eq!(read(make(), &bytes), [Ok(header)]);
     let head = print_head();
     let bytes = Wire::to_bytes(&head).unwrap();
     let make = || ipp::Head::with_limit(bytes.len());
-    contract::check_decode(make, &bytes);
-    assert_eq!(read(make(), &bytes, &[1]), [Ok(head)]);
-    contract::check_decode(|| imf::Head::with_limit(0), b"\nbody");
-    contract::check_decode(
+    check(make, &bytes);
+    assert_eq!(read(make(), &bytes), [Ok(head)]);
+    check(|| imf::Head::with_limit(0), b"\nbody");
+    check(
         || ipp::Head::with_limit(0),
         b"\x01\x01\0\x02\0\0\0\x07\x03body",
     );
@@ -828,7 +809,7 @@ fn malformed_startup_body_ends_the_stream_once() {
     let mut bytes = b"\0\0\0\x09\0\x03\0\0x".to_vec();
     let startup = pg::Frontend::Startup(pg::Startup::new("u", "d"));
     startup.write(&mut bytes).unwrap();
-    contract::check_decode(pg::FrontendMessages::new, &bytes);
+    check(pg::FrontendMessages::new, &bytes);
     failure(
         pg::FrontendMessages::new(),
         &bytes,
@@ -848,15 +829,10 @@ fn imf_header_only_at_eof_matches_split_message() {
         b"Subject: hi\r\nFrom: a@b.example\r\n",
         b"Subject: incomplete\r\n",
     ] {
-        contract::check_decode(imf::Head::new, bytes);
+        check(imf::Head::new, bytes);
         let (header, body) = imf::split_message(bytes).unwrap();
         assert!(body.is_empty());
-        let mut legacy = imf::Decoder::new();
-        assert_eq!(legacy.feed(bytes), bytes.len());
-        assert_eq!(legacy.finish(), Some(Ok(header.clone())));
-        for pattern in [&[][..], &[1], &[3, 1, 7]] {
-            assert_eq!(read(imf::Head::new(), bytes, pattern), [Ok(header.clone())]);
-        }
+        assert_eq!(read(imf::Head::new(), bytes), [Ok(header)]);
     }
 }
 
@@ -916,14 +892,14 @@ fn malformed_startup_requests_end_the_stream_once() {
 
 #[test]
 fn empty_heads_end_cleanly_without_an_item() {
-    assert!(read(imf::Head::new(), b"", &[1]).is_empty());
-    assert!(read(ipp::Head::new(), b"", &[1]).is_empty());
+    assert!(read(imf::Head::new(), b"").is_empty());
+    assert!(read(ipp::Head::new(), b"").is_empty());
     assert_eq!(
-        read(imf::Head::new(), b"\r\n", &[1]),
+        read(imf::Head::new(), b"\r\n"),
         [Ok(imf::Header::default())]
     );
     assert_eq!(
-        read(imf::Head::new(), b"bad field", &[1]),
+        read(imf::Head::new(), b"bad field"),
         [Err(imf::Error::FieldName)]
     );
 }

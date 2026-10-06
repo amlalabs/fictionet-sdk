@@ -45,7 +45,8 @@ cargo +nightly fuzz list
 | `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::grpc`: gRPC |
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
-| `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
+| `imf` | headers and structured field values | `stdlib::imf`: `Head`, named wire types, and bounded-allocation codec contracts |
+| `ipp` | heads, documents, and attribute values | `stdlib::ipp`: `Head`, `Header`, `Message`, and bounded-allocation codec contracts |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kafka`: Apache Kafka |
 | `kerberos` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kerberos`: Kerberos V5 |
@@ -61,7 +62,7 @@ cargo +nightly fuzz list
 | `ocsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
-| `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
+| `postgres` | startup, authentication, and typed messages | `stdlib::postgres`: frontend and backend decoders, wire types, and bounded-allocation codec contracts |
 | `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |
 | `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
