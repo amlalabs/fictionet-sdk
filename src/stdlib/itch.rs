@@ -74,9 +74,6 @@ pub const LENGTH_PREFIX: usize = 2;
 pub const MAX_FRAME: usize = u16::MAX as usize;
 /// The largest timestamp the six-byte field holds.
 pub const MAX_TIMESTAMP: u64 = (1 << 48) - 1;
-/// Nanoseconds in a day. Timestamps are nanoseconds since midnight, but
-/// the field can hold more; [`Timestamp`] accepts the field's whole range.
-pub const NANOS_PER_DAY: u64 = 86_400_000_000_000;
 
 /// The default most live orders a [`Book`] holds.
 pub const DEFAULT_MAX_ORDERS: usize = 1 << 20;
@@ -1059,7 +1056,8 @@ pub struct Level {
 /// What [`Book::apply`] did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Applied {
-    /// The message does not change the book: trades, crosses, events.
+    /// The message does not change the book: trades, crosses, events,
+    /// and an execute or cancel of zero shares of an order on the book.
     Ignored,
     /// The message changed this side of this stock.
     Changed {
@@ -1283,7 +1281,8 @@ impl Book {
         self.orders.insert(order_ref, order);
     }
     /// Takes `shares` off a live order's level, and the order off the
-    /// book when none are left. The caller has checked the shares.
+    /// book when none are left. A stock with no levels left and no
+    /// directory entry is forgotten. The caller has checked the shares.
     fn take_shares(&mut self, order_ref: u64, order: Order, shares: u32) {
         let left = order.shares - shares;
         if let Some(stock) = self.stocks.get_mut(&order.locate) {
@@ -1297,6 +1296,9 @@ impl Book {
                         self.levels = self.levels.saturating_sub(1);
                     }
                 }
+            }
+            if stock.symbol.is_none() && stock.bids.is_empty() && stock.asks.is_empty() {
+                self.stocks.remove(&order.locate);
             }
         }
         if left == 0 {
@@ -1327,6 +1329,9 @@ impl Book {
         let order = self.live(order_ref, locate)?;
         if shares > order.shares {
             return Err(BookError::Shares(order_ref));
+        }
+        if shares == 0 {
+            return Ok(Applied::Ignored);
         }
         self.take_shares(order_ref, order, shares);
         Ok(Applied::Changed {
@@ -2106,6 +2111,74 @@ mod tests {
             Ok(Applied::Directory { locate: 42 })
         );
         assert_eq!(book.symbol(42), Some(stock("ZVZZT")));
+    }
+
+    #[test]
+    fn book_ignores_zero_shares_and_forgets_empty_stocks() {
+        let mut book = Book::new(BookConfig {
+            max_stocks: 1,
+            ..BookConfig::default()
+        })
+        .unwrap();
+        book.apply(&add(1, 1, Side::Buy, 100, 10)).unwrap();
+        let h = header(1);
+        let before = format!("{book:?}");
+        for zero in [
+            Message::from(OrderExecuted {
+                header: h,
+                order_ref: 1,
+                executed_shares: 0,
+                match_number: 1,
+            }),
+            OrderCancel {
+                header: h,
+                order_ref: 1,
+                cancelled_shares: 0,
+            }
+            .into(),
+        ] {
+            assert_eq!(book.apply(&zero), Ok(Applied::Ignored));
+        }
+        assert_eq!(format!("{book:?}"), before);
+        // Zero shares of an order not on the book is still refused.
+        assert_eq!(
+            book.apply(
+                &OrderCancel {
+                    header: h,
+                    order_ref: 9,
+                    cancelled_shares: 0,
+                }
+                .into()
+            ),
+            Err(BookError::UnknownOrder(9))
+        );
+        // Once its last order goes, a stock without a directory entry is
+        // forgotten and its slot is free for another.
+        book.apply(
+            &OrderDelete {
+                header: h,
+                order_ref: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(book.stock_count(), 0);
+        book.apply(&add(2, 2, Side::Sell, 100, 10)).unwrap();
+        assert_eq!(book.stock_count(), 1);
+        // A directory entry keeps the stock.
+        let mut book = Book::new(BookConfig::default()).unwrap();
+        book.apply(&samples()[1]).unwrap();
+        book.apply(&add(1, 42, Side::Buy, 100, 10)).unwrap();
+        book.apply(
+            &OrderDelete {
+                header: header(42),
+                order_ref: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+        assert_eq!(book.symbol(42), Some(stock("ZVZZT")));
+        assert_eq!(book.stock_count(), 1);
     }
 
     #[test]

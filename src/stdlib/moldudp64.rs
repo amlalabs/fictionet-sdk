@@ -539,7 +539,9 @@ impl Receiver {
         let next = packet.next_sequence().ok_or(Error::Sequence)?;
         let expected = *s.expected.get_or_insert(first);
         s.high = s.high.max(next);
-        if packet.body == Body::EndOfSession {
+        // An End of Session below the next expected message is stale: the
+        // session's messages already run past it.
+        if packet.body == Body::EndOfSession && first >= expected {
             s.end = Some(s.end.map_or(first, |e| e.max(first)));
         }
         let mut actions = Vec::new();
@@ -747,6 +749,9 @@ impl Retransmitter {
     /// fit in one packet. `None` when `sequence` is not kept or `count` is 0.
     pub fn packet(&self, sequence: u64, count: u16) -> Option<Downstream> {
         let start = usize::try_from(sequence.checked_sub(self.first)?).ok()?;
+        if start >= self.messages.len() {
+            return None;
+        }
         let mut size = HEADER_LENGTH;
         let mut messages = Vec::new();
         for m in self.messages.range(start..).take(usize::from(count)) {
@@ -1152,6 +1157,34 @@ mod tests {
     }
 
     #[test]
+    fn stale_end_of_session_is_ignored() {
+        let mut r = Receiver::new(ReceiverConfig::default()).unwrap();
+        let _ = r.receive(&packet(1, &[b"a", b"b", b"c"]), 0).unwrap();
+        assert_eq!(r.expected(), Some(4));
+        // An End of Session marking 2 is below the messages already seen.
+        let stale = Downstream {
+            body: Body::EndOfSession,
+            ..heartbeat(2)
+        };
+        assert!(r.receive(&stale, 1).unwrap().is_empty());
+        let actions = r.receive(&packet(4, &[b"d"]), 2).unwrap();
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Event(Event::EndOfSession { .. })))
+        );
+        // The real one still ends the session.
+        let end = Downstream {
+            body: Body::EndOfSession,
+            ..heartbeat(5)
+        };
+        assert_eq!(
+            r.receive(&end, 3).unwrap(),
+            [Action::Event(Event::EndOfSession { next: 5 })]
+        );
+    }
+
+    #[test]
     fn config_limits() {
         for config in [
             ReceiverConfig {
@@ -1236,6 +1269,15 @@ mod tests {
             }),
             None
         );
+        // A request past the store, from the network, is not kept.
+        assert_eq!(
+            s.answer(&Request {
+                sequence: 8,
+                ..request
+            }),
+            None
+        );
+        assert_eq!(s.packet(u64::MAX, 1), None);
         assert_eq!(
             s.answer(&Request {
                 count: 0,

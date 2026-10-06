@@ -55,7 +55,7 @@
 //! // The exchange reads it and the world accepts the order.
 //! let Packet::UnsequencedData(payload) = Packet::parse(&packet)? else { unreachable!() };
 //! let mut exchange = Exchange::new(ExchangeConfig::default())?;
-//! let actions = exchange.receive(&Inbound::parse(&payload)?, 1_000);
+//! let actions = exchange.receive(&Inbound::parse(&payload)?, 1_000)?;
 //! let token = Token { user_ref_idx: 0, user_ref: 1 };
 //! assert_eq!(actions, [Action::Event(Event::EnterRequested(token))]);
 //! let Outbound::OrderAccepted(accepted) = exchange.accept(token, 2_000)? else { unreachable!() };
@@ -1358,6 +1358,8 @@ pub enum ExchangeError {
     UnknownMatch(u64),
     /// Order reference or match numbers ran out.
     Exhausted,
+    /// A time earlier than one already used.
+    Time,
 }
 impl fmt::Display for ExchangeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1367,6 +1369,7 @@ impl fmt::Display for ExchangeError {
             ExchangeError::Shares => f.write_str("OUCH share count is invalid"),
             ExchangeError::UnknownMatch(m) => write!(f, "no OUCH execution {m}"),
             ExchangeError::Exhausted => f.write_str("OUCH numbering is exhausted"),
+            ExchangeError::Time => f.write_str("OUCH exchange time went backwards"),
         }
     }
 }
@@ -1420,7 +1423,9 @@ pub enum Ignored {
     NoReduction(Token),
     /// A modify to a side change other than S to E, S to T or E to T.
     SideChange(Token),
-    /// A disable request when [`MAX_DISABLED_FIRMS`] are disabled.
+    /// A disable request when [`MAX_DISABLED_FIRMS`] are disabled. No
+    /// Disable Order Entry Response is sent and the UserRefNum is not
+    /// consumed, so the client may send it again later.
     TooManyFirms(Firm),
 }
 
@@ -1459,7 +1464,6 @@ struct PendingReplace {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Execution {
-    match_number: u64,
     token: Token,
     cl_ord_id: ClOrdId,
 }
@@ -1484,20 +1488,29 @@ struct Execution {
 /// change S to E, S to T or E to T (2.4). Replies carry the UserRefIdx
 /// option when the request's channel is not 0.
 ///
-/// Open and pending orders are bounded by [`ExchangeConfig::max_orders`],
-/// remembered executions by [`ExchangeConfig::max_executions`] and
-/// disabled firms by [`MAX_DISABLED_FIRMS`]. An `Err` leaves the exchange
+/// Open orders, pending enters and pending replaces together are bounded
+/// by [`ExchangeConfig::max_orders`], remembered executions by
+/// [`ExchangeConfig::max_executions`] and disabled firms by
+/// [`MAX_DISABLED_FIRMS`]. Each message costs time in proportion to what
+/// it changes, not to the orders open, except a mass cancel, which scans
+/// them. Times must not go backwards. An `Err` leaves the exchange
 /// unchanged.
 #[derive(Clone, Debug)]
 pub struct Exchange {
     config: ExchangeConfig,
     orders: HashMap<Token, Order>,
+    /// Pending replaces by replacement token.
     replaces: HashMap<Token, PendingReplace>,
+    /// The replacement token of each original with a pending replace.
+    replacing: HashMap<Token, Token>,
     last: HashMap<u8, u32>,
     disabled: Vec<Firm>,
-    executions: VecDeque<Execution>,
+    /// The last `max_executions` executions, oldest first: entry `i` has
+    /// match number `next_match - len + i`. Broken ones are `None`.
+    executions: VecDeque<Option<Execution>>,
     next_order_ref: u64,
     next_match: u64,
+    now: u64,
 }
 impl Exchange {
     /// An exchange with no orders. Refuses limits outside their ranges.
@@ -1511,11 +1524,13 @@ impl Exchange {
             config,
             orders: HashMap::new(),
             replaces: HashMap::new(),
+            replacing: HashMap::new(),
             last: HashMap::new(),
             disabled: Vec::new(),
             executions: VecDeque::new(),
             next_order_ref: config.first_order_ref,
             next_match: config.first_match,
+            now: 0,
         })
     }
     /// An order, open or awaiting [`accept`](Self::accept).
@@ -1526,20 +1541,24 @@ impl Exchange {
     pub fn orders(&self) -> impl Iterator<Item = &Order> {
         self.orders.values()
     }
-    /// The next UserRefNum the channel may use.
-    pub fn next_user_ref(&self, user_ref_idx: u8) -> u32 {
+    /// The next UserRefNum the channel may use, or `None` once it has
+    /// used `u32::MAX`.
+    pub fn next_user_ref(&self, user_ref_idx: u8) -> Option<u32> {
         self.last
             .get(&user_ref_idx)
-            .map_or(1, |n| n.saturating_add(1))
+            .map_or(Some(1), |n| n.checked_add(1))
     }
     /// Whether order entry is disabled for `firm`.
     pub fn is_disabled(&self, firm: Firm) -> bool {
         self.disabled.contains(&firm)
     }
 
-    /// Handles one inbound message.
-    pub fn receive(&mut self, message: &Inbound, now: u64) -> Vec<Action> {
-        match message {
+    /// Handles one inbound message. Refuses a time before the last one
+    /// used.
+    pub fn receive(&mut self, message: &Inbound, now: u64) -> Result<Vec<Action>, ExchangeError> {
+        self.check_time(now)?;
+        self.now = now;
+        Ok(match message {
             Inbound::EnterOrder(m) => self.enter(m, now),
             Inbound::ReplaceOrder(m) => self.replace(m, now),
             Inbound::CancelOrder(m) => {
@@ -1559,22 +1578,25 @@ impl Exchange {
             Inbound::EnableOrderEntry(m) => self.entry(m.user_ref, m.firm, &m.options, true, now),
             Inbound::AccountQuery(m) => {
                 let idx = m.options.as_ref().map_or(0, Options::user_ref_idx);
+                // A channel that used u32::MAX has no next UserRefNum;
+                // the response then carries 0, which is never valid.
                 vec![Action::Send(
                     AccountQueryResponse {
                         timestamp: now,
-                        next_user_ref: self.next_user_ref(idx),
+                        next_user_ref: self.next_user_ref(idx).unwrap_or(0),
                         options: reply(idx),
                     }
                     .into(),
                 )]
             }
-        }
+        })
     }
 
     /// Accepts a pending enter or replace and returns the Accepted or
     /// Replaced message. A replace leaves `quantity` less the chain's
     /// executions open; with none left the reply says Order Dead.
     pub fn accept(&mut self, token: Token, now: u64) -> Result<Outbound, ExchangeError> {
+        self.check_time(now)?;
         let order_ref = self.next_order_ref;
         let next = order_ref.checked_add(1).ok_or(ExchangeError::Exhausted)?;
         if let Some(pending) = self.replaces.get(&token) {
@@ -1595,7 +1617,7 @@ impl Exchange {
                 cl_ord_id: r.cl_ord_id,
                 order_ref,
                 side: r.options.side().unwrap_or(original.side),
-                options: r.options.clone(),
+                options: inherit(&original.options, &r.options),
                 ..original.clone()
             };
             let reply = OrderReplaced {
@@ -1618,15 +1640,17 @@ impl Exchange {
                     codes::order_state::LIVE
                 },
                 cl_ord_id: order.cl_ord_id,
-                options: order.options.clone(),
+                options: r.options.clone(),
             };
             let original = pending.original;
             self.replaces.remove(&token);
+            self.replacing.remove(&original);
             self.orders.remove(&original);
             if open > 0 {
                 self.orders.insert(token, order);
             }
             self.next_order_ref = next;
+            self.now = now;
             return Ok(reply.into());
         }
         let order = self
@@ -1637,6 +1661,7 @@ impl Exchange {
         order.live = true;
         order.order_ref = order_ref;
         self.next_order_ref = next;
+        self.now = now;
         Ok(OrderAccepted {
             timestamp: now,
             user_ref: token.user_ref,
@@ -1665,7 +1690,9 @@ impl Exchange {
         reason: u16,
         now: u64,
     ) -> Result<Outbound, ExchangeError> {
+        self.check_time(now)?;
         let cl_ord_id = if let Some(p) = self.replaces.remove(&token) {
+            self.replacing.remove(&p.original);
             p.request.cl_ord_id
         } else {
             let o = self
@@ -1677,6 +1704,7 @@ impl Exchange {
             self.orders.remove(&token);
             id
         };
+        self.now = now;
         Ok(rejected(token, reason, cl_ord_id, now))
     }
 
@@ -1691,6 +1719,7 @@ impl Exchange {
         liquidity_flag: u8,
         now: u64,
     ) -> Result<Outbound, ExchangeError> {
+        self.check_time(now)?;
         let order = self.open(token)?;
         if quantity == 0 || quantity > order.quantity {
             return Err(ExchangeError::Shares);
@@ -1701,15 +1730,13 @@ impl Exchange {
             .ok_or(ExchangeError::Exhausted)?;
         let cl_ord_id = order.cl_ord_id;
         self.next_match = next;
+        self.now = now;
         self.take(token, quantity, true);
         if self.executions.len() >= self.config.max_executions {
             self.executions.pop_front();
         }
-        self.executions.push_back(Execution {
-            match_number,
-            token,
-            cl_ord_id,
-        });
+        self.executions
+            .push_back(Some(Execution { token, cl_ord_id }));
         Ok(OrderExecuted {
             timestamp: now,
             user_ref: token.user_ref,
@@ -1731,10 +1758,12 @@ impl Exchange {
         reason: u8,
         now: u64,
     ) -> Result<Outbound, ExchangeError> {
+        self.check_time(now)?;
         let order = self.open(token)?;
         if quantity == 0 || quantity > order.quantity {
             return Err(ExchangeError::Shares);
         }
+        self.now = now;
         self.take(token, quantity, false);
         Ok(canceled(token, quantity, reason, now))
     }
@@ -1747,15 +1776,21 @@ impl Exchange {
         reason: u8,
         now: u64,
     ) -> Result<Outbound, ExchangeError> {
-        let i = self
-            .executions
-            .iter()
-            .position(|e| e.match_number == match_number)
-            .ok_or(ExchangeError::UnknownMatch(match_number))?;
+        self.check_time(now)?;
+        let unknown = ExchangeError::UnknownMatch(match_number);
+        // Match numbers are consecutive, so the slot is found by index.
+        let back = self.next_match.checked_sub(match_number).ok_or(unknown)?;
+        let len = self.executions.len();
+        let i = usize::try_from(back)
+            .ok()
+            .and_then(|back| len.checked_sub(back))
+            .ok_or(unknown)?;
         let e = self
             .executions
-            .remove(i)
-            .ok_or(ExchangeError::UnknownMatch(match_number))?;
+            .get_mut(i)
+            .and_then(Option::take)
+            .ok_or(unknown)?;
+        self.now = now;
         Ok(BrokenTrade {
             timestamp: now,
             user_ref: e.token.user_ref,
@@ -1768,13 +1803,23 @@ impl Exchange {
     }
 
     /// A System Event message.
-    pub fn system_event(&self, event: u8, now: u64) -> Outbound {
-        SystemEvent {
+    pub fn system_event(&mut self, event: u8, now: u64) -> Result<Outbound, ExchangeError> {
+        self.check_time(now)?;
+        self.now = now;
+        Ok(SystemEvent {
             timestamp: now,
             event,
             end: (),
         }
-        .into()
+        .into())
+    }
+
+    fn check_time(&self, now: u64) -> Result<(), ExchangeError> {
+        if now < self.now {
+            Err(ExchangeError::Time)
+        } else {
+            Ok(())
+        }
     }
 
     fn open(&self, token: Token) -> Result<&Order, ExchangeError> {
@@ -1795,7 +1840,9 @@ impl Exchange {
         }
         if order.quantity == 0 {
             self.orders.remove(&token);
-            self.replaces.retain(|_, p| p.original != token);
+            if let Some(replacement) = self.replacing.remove(&token) {
+                self.replaces.remove(&replacement);
+            }
         }
     }
     /// Consumes a UserRefNum if it is above the channel's last.
@@ -1876,7 +1923,7 @@ impl Exchange {
             user_ref_idx: idx,
             user_ref: m.user_ref,
         };
-        let busy = self.replaces.values().any(|p| p.original == original);
+        let busy = self.replacing.contains_key(&original);
         let Some(order) = self.orders.get(&original).filter(|o| o.live && !busy) else {
             return vec![Action::Event(Event::Ignored(Ignored::UnknownOrder(
                 original,
@@ -1901,6 +1948,17 @@ impl Exchange {
             ))];
         }
         self.consume(replacement);
+        if self.orders.len() + self.replaces.len() >= self.config.max_orders {
+            // A pending replace counts against the limit like a pending
+            // enter; a rejected replace leaves the original as it was.
+            return vec![Action::Send(rejected(
+                replacement,
+                codes::reject_reason::PROCESSING_ERROR,
+                m.cl_ord_id,
+                now,
+            ))];
+        }
+        self.replacing.insert(original, replacement);
         self.replaces.insert(
             replacement,
             PendingReplace {
@@ -2035,7 +2093,7 @@ impl Exchange {
             user_ref_idx: options.user_ref_idx(),
             user_ref,
         };
-        if !self.consume(token) {
+        if !self.fresh(token) {
             return vec![Action::Event(Event::Ignored(Ignored::Retransmission(
                 token,
             )))];
@@ -2045,39 +2103,50 @@ impl Exchange {
         } else {
             firm
         };
-        let mut actions = Vec::new();
+        let listed = self.disabled.contains(&target);
+        if !enable && !listed && self.disabled.len() >= MAX_DISABLED_FIRMS {
+            return vec![Action::Event(Event::Ignored(Ignored::TooManyFirms(target)))];
+        }
+        self.consume(token);
         if enable {
             self.disabled.retain(|f| *f != target);
-        } else if !self.disabled.contains(&target) {
-            if self.disabled.len() >= MAX_DISABLED_FIRMS {
-                actions.push(Action::Event(Event::Ignored(Ignored::TooManyFirms(target))));
-            } else {
-                self.disabled.push(target);
-            }
+        } else if !listed {
+            self.disabled.push(target);
         }
         let options = options.clone();
-        actions.insert(
-            0,
-            Action::Send(if enable {
-                EnableOrderEntryResponse {
-                    timestamp: now,
-                    user_ref,
-                    firm,
-                    options,
-                }
-                .into()
-            } else {
-                DisableOrderEntryResponse {
-                    timestamp: now,
-                    user_ref,
-                    firm,
-                    options,
-                }
-                .into()
-            }),
-        );
-        actions
+        vec![Action::Send(if enable {
+            EnableOrderEntryResponse {
+                timestamp: now,
+                user_ref,
+                firm,
+                options,
+            }
+            .into()
+        } else {
+            DisableOrderEntryResponse {
+                timestamp: now,
+                user_ref,
+                firm,
+                options,
+            }
+            .into()
+        })]
     }
+}
+
+/// A replacement's options: those of the replace, and for a tag it leaves
+/// out, the original order's. SharesLocated and LocateBroker are not
+/// inherited; a replace must give them again (Appendix A, note 2). Firm
+/// and GroupID, which a replace cannot carry, stay the original's (2.2).
+fn inherit(original: &Options, replace: &Options) -> Options {
+    let mut options = replace.clone();
+    for o in &original.0 {
+        let tag = o.tag();
+        if !matches!(tag, 25 | 26) && replace.get(tag).is_none() {
+            options.0.push(o.clone());
+        }
+    }
+    options
 }
 
 /// The appendage of a reply: UserRefIdx for a nonzero channel, else none.
@@ -2708,7 +2777,7 @@ mod tests {
             check_wire::<Outbound>(&bytes);
             check_wire::<EnterOrder>(&bytes);
             if let Ok(m) = Inbound::parse(&bytes) {
-                for action in exchange.receive(&m, i) {
+                for action in exchange.receive(&m, i).unwrap() {
                     match action {
                         Action::Send(out) => check_wire_value(&out),
                         Action::Event(Event::EnterRequested(t)) => {
@@ -2755,7 +2824,7 @@ mod tests {
         .unwrap();
         let e = enter(1, 500, Options::default());
         assert_eq!(
-            x.receive(&e.clone().into(), 1),
+            x.receive(&e.clone().into(), 1).unwrap(),
             [Action::Event(Event::EnterRequested(token(1)))]
         );
         assert!(!x.order(token(1)).unwrap().live);
@@ -2777,7 +2846,7 @@ mod tests {
         );
         // 1.2: a repeat of the same UserRefNum is a retransmission.
         assert_eq!(
-            x.receive(&e.into(), 3),
+            x.receive(&e.into(), 3).unwrap(),
             [Action::Event(Event::Ignored(Ignored::Retransmission(
                 token(1)
             )))]
@@ -2801,7 +2870,8 @@ mod tests {
                 }
                 .into(),
                 5,
-            ),
+            )
+            .unwrap(),
         );
         assert_eq!(
             out,
@@ -2825,7 +2895,8 @@ mod tests {
                 }
                 .into(),
                 6
-            ),
+            )
+            .unwrap(),
             [Action::Event(Event::Ignored(Ignored::NoReduction(token(
                 1
             ))))]
@@ -2844,7 +2915,10 @@ mod tests {
             Err(ExchangeError::UnknownMatch(1))
         );
         // Account query: next UserRefNum on channel 0.
-        let out = sends(x.receive(&AccountQuery { options: None }.into(), 9));
+        let out = sends(
+            x.receive(&AccountQuery { options: None }.into(), 9)
+                .unwrap(),
+        );
         assert_eq!(
             out,
             [AccountQueryResponse {
@@ -2863,15 +2937,22 @@ mod tests {
             ..ExchangeConfig::default()
         })
         .unwrap();
-        let out = sends(x.receive(&enter(1, MAX_ORDER_QUANTITY, Options::default()).into(), 1));
+        let out = sends(
+            x.receive(&enter(1, MAX_ORDER_QUANTITY, Options::default()).into(), 1)
+                .unwrap(),
+        );
         let Outbound::OrderRejected(r) = &out[0] else {
             panic!()
         };
         assert_eq!(r.reason, codes::reject_reason::INVALID_QUANTITY);
         // The rejected UserRefNum is consumed (3.8).
-        assert_eq!(x.next_user_ref(0), 2);
-        x.receive(&enter(2, 1, Options::default()).into(), 2);
-        let out = sends(x.receive(&enter(3, 1, Options::default()).into(), 3));
+        assert_eq!(x.next_user_ref(0), Some(2));
+        x.receive(&enter(2, 1, Options::default()).into(), 2)
+            .unwrap();
+        let out = sends(
+            x.receive(&enter(3, 1, Options::default()).into(), 3)
+                .unwrap(),
+        );
         let Outbound::OrderRejected(r) = &out[0] else {
             panic!()
         };
@@ -2902,7 +2983,8 @@ mod tests {
     #[test]
     fn exchange_replaces_per_the_four_cases() {
         let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
-        x.receive(&enter(10, 500, Options::default()).into(), 1);
+        x.receive(&enter(10, 500, Options::default()).into(), 1)
+            .unwrap();
         x.accept(token(10), 1).unwrap();
         x.execute(token(10), 100, Price(1), b'A', 2).unwrap();
         let replace = |orig, new, quantity| ReplaceOrder {
@@ -2918,13 +3000,13 @@ mod tests {
         };
         // Case 1: an unknown original or a used UserRefNum is ignored.
         assert_eq!(
-            x.receive(&replace(99, 11, 500).into(), 3),
+            x.receive(&replace(99, 11, 500).into(), 3).unwrap(),
             [Action::Event(Event::Ignored(Ignored::UnknownOrder(token(
                 99
             ))))]
         );
         assert_eq!(
-            x.receive(&replace(10, 10, 500).into(), 3),
+            x.receive(&replace(10, 10, 500).into(), 3).unwrap(),
             [Action::Event(Event::Ignored(Ignored::Retransmission(
                 token(10)
             )))]
@@ -2932,7 +3014,7 @@ mod tests {
         // Case 4: replaced. Shares are liable over the chain: 500 less the
         // 100 executed leaves 400 (2.2, 3.3).
         assert_eq!(
-            x.receive(&replace(10, 11, 500).into(), 4),
+            x.receive(&replace(10, 11, 500).into(), 4).unwrap(),
             [Action::Event(Event::ReplaceRequested {
                 original: token(10),
                 replacement: token(11)
@@ -2953,13 +3035,13 @@ mod tests {
         );
         // Case 3: the world rejects the replace; the original is intact and
         // the UserRefNum is consumed.
-        x.receive(&replace(11, 12, 300).into(), 6);
+        x.receive(&replace(11, 12, 300).into(), 6).unwrap();
         x.reject(token(12), codes::reject_reason::REPLACE_NOT_ALLOWED, 6)
             .unwrap();
         assert_eq!(x.order(token(11)).unwrap().quantity, 400);
-        assert_eq!(x.next_user_ref(0), 13);
+        assert_eq!(x.next_user_ref(0), Some(13));
         // A replace to no more than the executed shares is dead on arrival.
-        x.receive(&replace(11, 13, 100).into(), 7);
+        x.receive(&replace(11, 13, 100).into(), 7).unwrap();
         let Outbound::OrderReplaced(r) = x.accept(token(13), 7).unwrap() else {
             panic!()
         };
@@ -2968,9 +3050,10 @@ mod tests {
         assert_eq!(x.order(token(13)), None);
         // Case 2: an invalid quantity cancels the original; the
         // replacement UserRefNum is not consumed.
-        x.receive(&enter(14, 50, Options::default()).into(), 8);
+        x.receive(&enter(14, 50, Options::default()).into(), 8)
+            .unwrap();
         x.accept(token(14), 8).unwrap();
-        let out = sends(x.receive(&replace(14, 15, 0).into(), 9));
+        let out = sends(x.receive(&replace(14, 15, 0).into(), 9).unwrap());
         assert_eq!(
             out,
             [OrderCanceled {
@@ -2982,7 +3065,7 @@ mod tests {
             }
             .into()]
         );
-        assert_eq!(x.next_user_ref(0), 15);
+        assert_eq!(x.next_user_ref(0), Some(15));
     }
 
     #[test]
@@ -2991,10 +3074,11 @@ mod tests {
         let idx = |i| Some(Options::of(Opt::UserRefIdx(i)));
         let mut e = enter(1, 100, Options::of(Opt::UserRefIdx(4)));
         e.side = Side::Sell;
-        x.receive(&e.into(), 1);
+        x.receive(&e.into(), 1).unwrap();
         // UserRefNums run per channel: 1 is fresh on channel 0 too.
         assert_eq!(
-            x.receive(&enter(1, 100, Options::default()).into(), 1),
+            x.receive(&enter(1, 100, Options::default()).into(), 1)
+                .unwrap(),
             [Action::Event(Event::EnterRequested(token(1)))]
         );
         let t = Token {
@@ -3009,14 +3093,17 @@ mod tests {
             options: idx(4),
         };
         assert_eq!(
-            x.receive(&modify(Side::Buy, 100).into(), 2),
+            x.receive(&modify(Side::Buy, 100).into(), 2).unwrap(),
             [Action::Event(Event::Ignored(Ignored::SideChange(t)))]
         );
         assert_eq!(
-            x.receive(&modify(Side::Sell, 101).into(), 2),
+            x.receive(&modify(Side::Sell, 101).into(), 2).unwrap(),
             [Action::Event(Event::Ignored(Ignored::NoReduction(t)))]
         );
-        let out = sends(x.receive(&modify(Side::SellShortExempt, 60).into(), 3));
+        let out = sends(
+            x.receive(&modify(Side::SellShortExempt, 60).into(), 3)
+                .unwrap(),
+        );
         assert_eq!(
             out,
             [OrderModified {
@@ -3031,9 +3118,10 @@ mod tests {
         let o = x.order(t).unwrap();
         assert_eq!((o.side, o.quantity), (Side::SellShortExempt, 60));
         // E to T is allowed, T to E is not.
-        x.receive(&modify(Side::SellShort, 60).into(), 4);
+        x.receive(&modify(Side::SellShort, 60).into(), 4).unwrap();
         assert_eq!(
-            x.receive(&modify(Side::SellShortExempt, 60).into(), 4),
+            x.receive(&modify(Side::SellShortExempt, 60).into(), 4)
+                .unwrap(),
             [Action::Event(Event::Ignored(Ignored::SideChange(t)))]
         );
         // The fill on channel 4 echoes the channel.
@@ -3041,7 +3129,10 @@ mod tests {
             panic!()
         };
         assert_eq!(f.options, Options::of(Opt::UserRefIdx(4)));
-        let out = sends(x.receive(&AccountQuery { options: idx(4) }.into(), 6));
+        let out = sends(
+            x.receive(&AccountQuery { options: idx(4) }.into(), 6)
+                .unwrap(),
+        );
         assert_eq!(
             out,
             [AccountQueryResponse {
@@ -3058,7 +3149,7 @@ mod tests {
         let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
         let firm = |f: &str| Options::of(Opt::Firm(alpha(f)));
         for (n, f) in [(1, "AAAA"), (2, "AAAA"), (3, "BBBB")] {
-            x.receive(&enter(n, 10, firm(f)).into(), 1);
+            x.receive(&enter(n, 10, firm(f)).into(), 1).unwrap();
             x.accept(token(n), 1).unwrap();
         }
         let out = sends(
@@ -3071,7 +3162,8 @@ mod tests {
                 }
                 .into(),
                 2,
-            ),
+            )
+            .unwrap(),
         );
         assert_eq!(out.len(), 3);
         assert_eq!(out[0].kind(), b'X');
@@ -3097,11 +3189,12 @@ mod tests {
                 }
                 .into(),
                 3,
-            ),
+            )
+            .unwrap(),
         );
         assert_eq!(out[0].kind(), b'G');
         assert!(x.is_disabled(alpha("BBBB")));
-        let out = sends(x.receive(&enter(6, 10, firm("BBBB")).into(), 4));
+        let out = sends(x.receive(&enter(6, 10, firm("BBBB")).into(), 4).unwrap());
         let Outbound::OrderRejected(r) = &out[0] else {
             panic!()
         };
@@ -3115,13 +3208,65 @@ mod tests {
                 }
                 .into(),
                 5,
-            ),
+            )
+            .unwrap(),
         );
         assert_eq!(out[0].kind(), b'K');
         assert_eq!(
-            x.receive(&enter(8, 10, firm("BBBB")).into(), 6),
+            x.receive(&enter(8, 10, firm("BBBB")).into(), 6).unwrap(),
             [Action::Event(Event::EnterRequested(token(8)))]
         );
+    }
+
+    // A replace cannot carry GroupID or Firm, and tags it leaves out keep
+    // the original's values (2.2, Appendix A note 2), so a mass cancel by
+    // group still finds the replacement.
+    #[test]
+    fn replacement_inherits_options_for_mass_cancel() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        let options = Options(vec![
+            Opt::GroupId(7),
+            Opt::MinQty(100),
+            Opt::SharesLocated(b'Y'),
+        ]);
+        x.receive(&enter(1, 300, options).into(), 1).unwrap();
+        x.accept(token(1), 1).unwrap();
+        let replace = ReplaceOrder {
+            orig_user_ref: 1,
+            user_ref: 2,
+            quantity: 300,
+            price: Price(200_000),
+            time_in_force: b'0',
+            display: b'Y',
+            intermarket_sweep: b'N',
+            cl_ord_id: alpha("R"),
+            options: Options::of(Opt::MinQty(200)),
+        };
+        x.receive(&replace.into(), 2).unwrap();
+        let Outbound::OrderReplaced(r) = x.accept(token(2), 3).unwrap() else {
+            panic!()
+        };
+        // The reply echoes the replace's options.
+        assert_eq!(r.options, Options::of(Opt::MinQty(200)));
+        let kept = &x.order(token(2)).unwrap().options;
+        assert_eq!(kept.get(3), Some(&Opt::MinQty(200)));
+        assert_eq!(kept.group_id(), Some(7));
+        assert_eq!(kept.get(25), None);
+        let out = sends(
+            x.receive(
+                &MassCancel {
+                    user_ref: 3,
+                    firm: Alpha::blank(),
+                    symbol: Alpha::blank(),
+                    options: Options::of(Opt::GroupId(7)),
+                }
+                .into(),
+                4,
+            )
+            .unwrap(),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(x.orders().count(), 0);
     }
 
     #[test]
@@ -3175,7 +3320,9 @@ mod tests {
             server.receive(&inbound[0].clone().unwrap(), 1).unwrap(),
             [SAction::Event(SEvent::Unsequenced)]
         );
-        let actions = exchange.receive(&Inbound::parse(payload).unwrap(), 1);
+        let actions = exchange
+            .receive(&Inbound::parse(payload).unwrap(), 1)
+            .unwrap();
         assert_eq!(actions, [Action::Event(Event::EnterRequested(token(1)))]);
         // The Accepted goes back as sequenced message 1.
         let accepted = exchange.accept(token(1), 2).unwrap();
@@ -3186,5 +3333,203 @@ mod tests {
             panic!()
         };
         assert_eq!(Outbound::parse(&payload).unwrap(), accepted);
+    }
+
+    fn replace_of(orig: u32, new: u32, quantity: u32) -> ReplaceOrder {
+        ReplaceOrder {
+            orig_user_ref: orig,
+            user_ref: new,
+            quantity,
+            price: Price(200_000),
+            time_in_force: b'0',
+            display: b'Y',
+            intermarket_sweep: b'N',
+            cl_ord_id: alpha("R"),
+            options: Options::default(),
+        }
+    }
+
+    #[test]
+    fn exchange_counts_pending_replaces_against_the_limit() {
+        let mut x = Exchange::new(ExchangeConfig {
+            max_orders: 1,
+            ..ExchangeConfig::default()
+        })
+        .unwrap();
+        x.receive(&enter(1, 100, Options::default()).into(), 1)
+            .unwrap();
+        x.accept(token(1), 1).unwrap();
+        // One open order fills the limit, so its replace is rejected and
+        // the original stays as it was.
+        let out = sends(x.receive(&replace_of(1, 2, 50).into(), 2).unwrap());
+        assert_eq!(
+            out,
+            [OrderRejected {
+                timestamp: 2,
+                user_ref: 2,
+                reason: codes::reject_reason::PROCESSING_ERROR,
+                cl_ord_id: alpha("R"),
+                options: None,
+            }
+            .into()]
+        );
+        assert_eq!(x.order(token(1)).unwrap().quantity, 100);
+        assert_eq!(x.next_user_ref(0), Some(3));
+        assert_eq!(
+            x.accept(token(2), 3),
+            Err(ExchangeError::UnknownToken(token(2)))
+        );
+    }
+
+    #[test]
+    fn exchange_drops_a_pending_replace_when_its_original_closes() {
+        let mut x = Exchange::new(ExchangeConfig {
+            max_orders: 2,
+            ..ExchangeConfig::default()
+        })
+        .unwrap();
+        x.receive(&enter(1, 100, Options::default()).into(), 1)
+            .unwrap();
+        x.accept(token(1), 1).unwrap();
+        x.receive(&replace_of(1, 2, 50).into(), 2).unwrap();
+        // A second replace of the same original waits for the first.
+        assert_eq!(
+            x.receive(&replace_of(1, 3, 50).into(), 2).unwrap(),
+            [Action::Event(Event::Ignored(Ignored::UnknownOrder(token(
+                1
+            ))))]
+        );
+        x.execute(token(1), 100, Price(1), b'A', 3).unwrap();
+        assert_eq!(
+            x.accept(token(2), 4),
+            Err(ExchangeError::UnknownToken(token(2)))
+        );
+        // Both slots are free again.
+        for n in [4, 5] {
+            assert_eq!(
+                x.receive(&enter(n, 1, Options::default()).into(), 5)
+                    .unwrap(),
+                [Action::Event(Event::EnterRequested(token(n)))]
+            );
+        }
+    }
+
+    #[test]
+    fn exchange_remembers_the_last_executions_by_match_number() {
+        let mut x = Exchange::new(ExchangeConfig {
+            max_executions: 2,
+            first_match: 7,
+            ..ExchangeConfig::default()
+        })
+        .unwrap();
+        x.receive(&enter(1, 100, Options::default()).into(), 1)
+            .unwrap();
+        x.accept(token(1), 1).unwrap();
+        for _ in 0..3 {
+            x.execute(token(1), 1, Price(1), b'A', 2).unwrap();
+        }
+        // Matches 7, 8 and 9 were made; 7 is forgotten, 10 not yet made.
+        for m in [0, 6, 7, 10, u64::MAX] {
+            assert_eq!(
+                x.break_trade(m, b'E', 3),
+                Err(ExchangeError::UnknownMatch(m))
+            );
+        }
+        let Outbound::BrokenTrade(b) = x.break_trade(8, b'E', 3).unwrap() else {
+            panic!()
+        };
+        assert_eq!((b.match_number, b.user_ref), (8, 1));
+        assert_eq!(
+            x.break_trade(8, b'E', 3),
+            Err(ExchangeError::UnknownMatch(8))
+        );
+        x.break_trade(9, b'E', 3).unwrap();
+        // A new execution pushes out the broken 8.
+        x.execute(token(1), 1, Price(1), b'A', 4).unwrap();
+        x.break_trade(10, b'E', 4).unwrap();
+    }
+
+    #[test]
+    fn exchange_refuses_time_going_backwards() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        x.receive(&enter(1, 100, Options::default()).into(), 5)
+            .unwrap();
+        let before = format!("{x:?}");
+        assert_eq!(
+            x.receive(&enter(2, 100, Options::default()).into(), 4),
+            Err(ExchangeError::Time)
+        );
+        assert_eq!(x.accept(token(1), 4), Err(ExchangeError::Time));
+        assert_eq!(x.reject(token(1), 1, 4), Err(ExchangeError::Time));
+        assert_eq!(x.system_event(b'S', 4), Err(ExchangeError::Time));
+        assert_eq!(format!("{x:?}"), before);
+        x.accept(token(1), 6).unwrap();
+        assert_eq!(
+            x.execute(token(1), 1, Price(1), b'A', 5),
+            Err(ExchangeError::Time)
+        );
+        assert_eq!(x.cancel(token(1), 1, b'U', 5), Err(ExchangeError::Time));
+        x.execute(token(1), 1, Price(1), b'A', 6).unwrap();
+        assert_eq!(x.break_trade(1, b'E', 5), Err(ExchangeError::Time));
+        x.break_trade(1, b'E', 6).unwrap();
+    }
+
+    #[test]
+    fn exchange_reports_no_next_user_ref_after_the_last() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        x.receive(&enter(u32::MAX, 100, Options::default()).into(), 1)
+            .unwrap();
+        assert_eq!(x.next_user_ref(0), None);
+        assert_eq!(x.next_user_ref(1), Some(1));
+        let out = sends(
+            x.receive(&AccountQuery { options: None }.into(), 2)
+                .unwrap(),
+        );
+        assert_eq!(
+            out,
+            [AccountQueryResponse {
+                timestamp: 2,
+                next_user_ref: 0,
+                options: None
+            }
+            .into()]
+        );
+    }
+
+    #[test]
+    fn exchange_sends_no_disable_response_when_the_list_is_full() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        let disable = |user_ref: u32, firm: Firm| -> Inbound {
+            DisableOrderEntry {
+                user_ref,
+                firm,
+                options: Options::default(),
+            }
+            .into()
+        };
+        let name = |n: usize| {
+            let mut b = *b"F000";
+            for (i, d) in format!("{n:03x}").bytes().enumerate() {
+                b[1 + i] = d.to_ascii_uppercase();
+            }
+            Alpha::new(b).unwrap()
+        };
+        for n in 0..MAX_DISABLED_FIRMS {
+            let user_ref = u32::try_from(n).unwrap() + 1;
+            let out = sends(x.receive(&disable(user_ref, name(n)), 1).unwrap());
+            assert!(matches!(out[..], [Outbound::DisableOrderEntryResponse(_)]));
+        }
+        let next = u32::try_from(MAX_DISABLED_FIRMS).unwrap() + 1;
+        let full = alpha("ZZZZ");
+        assert_eq!(
+            x.receive(&disable(next, full), 2).unwrap(),
+            [Action::Event(Event::Ignored(Ignored::TooManyFirms(full)))]
+        );
+        assert!(!x.is_disabled(full));
+        // The UserRefNum was not consumed; disabling a listed firm again
+        // still answers.
+        assert_eq!(x.next_user_ref(0), Some(next));
+        let out = sends(x.receive(&disable(next, name(0)), 3).unwrap());
+        assert!(matches!(out[..], [Outbound::DisableOrderEntryResponse(_)]));
     }
 }
