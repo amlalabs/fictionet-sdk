@@ -129,7 +129,9 @@ impl Stack {
             http2::Event::Settings(s) => self.h2[1 - dir].peer_settings(&s).unwrap(),
             http2::Event::WindowUpdate(w) => self.h2[1 - dir].peer_window_update(&w).unwrap(),
             http2::Event::Reset { stream, .. } => {
+                self.h2[1 - dir].peer_reset(stream);
                 self.calls.remove(&(dir, stream));
+                self.calls.remove(&(1 - dir, stream));
             }
             _ => {}
         }
@@ -197,6 +199,47 @@ impl Stack {
         seq
     }
 }
+#[test]
+fn peer_resets_allow_repeated_stream_retirement() {
+    let mut stack = Stack::new();
+    stack.segment(0, 100, 2, &[]);
+    stack.segment(1, 200, 0x12, &[]);
+    let settings = http2::Settings {
+        flags: 0,
+        entries: vec![],
+    }
+    .to_bytes()
+    .unwrap();
+    let mut client_seq = stack.reordered(0, 101, &[http2::PREFACE.as_slice(), &settings].concat());
+    let mut server_seq = stack.reordered(1, 201, &settings);
+    let mut encoder = hpack::Encoder::new(0);
+    for stream in (1..601).step_by(2) {
+        server_seq = stack.reordered(
+            1,
+            server_seq,
+            &headers(
+                &mut encoder,
+                stream,
+                &[hpack::Field::new(":status", "200")],
+                false,
+            ),
+        );
+        client_seq = stack.reordered(
+            0,
+            client_seq,
+            &http2::Reset {
+                stream,
+                flags: 0,
+                code: 8,
+            }
+            .to_bytes()
+            .unwrap(),
+        );
+        assert!(stack.h2[1].retire(stream));
+    }
+    assert!(stack.h2[1].failed().is_none());
+}
+
 #[test]
 fn tcp_to_http2_to_grpc_with_reordering_fragments_trailers_and_a_gap() {
     let mut stack = Stack::new();

@@ -1,3 +1,15 @@
+//! HTTP/2 frames, directional state, and capture presentation (RFC 9113).
+//!
+//! Use [`Connection`] for strict decoding and [`Capture`] for packet display.
+//! Route SETTINGS and WINDOW_UPDATE to the opposite direction's
+//! [`Connection::peer_settings`] and [`Connection::peer_window_update`].
+//! Route RST_STREAM through [`Connection::peer_reset`], then retire both halves.
+//! For GOAWAY, the caller identifies abandoned streams above `last_stream`,
+//! closes both halves with `peer_reset`, and retires their DATA decoders.
+//! Idle-stream checks and stream ownership belong to the caller.
+//! SETTINGS reductions take effect when the sending direction reads its ACK.
+//! Share a [`CaptureBudget`] across capture connections to bound gRPC DATA.
+
 use fictionet::stdlib::{
     codec::{Decode, Fail, Step, Stream, Wire},
     hpack,
@@ -48,6 +60,29 @@ pub enum ErrorCode {
     InadequateSecurity = 12,
     /// The peer requires HTTP/1.1.
     Http11Required = 13,
+}
+
+impl ErrorCode {
+    /// The RFC name for a wire code, or `None` for an extension code.
+    pub fn name(code: u32) -> Option<&'static str> {
+        const NAMES: [&str; 14] = [
+            "NO_ERROR",
+            "PROTOCOL_ERROR",
+            "INTERNAL_ERROR",
+            "FLOW_CONTROL_ERROR",
+            "SETTINGS_TIMEOUT",
+            "STREAM_CLOSED",
+            "FRAME_SIZE_ERROR",
+            "REFUSED_STREAM",
+            "CANCEL",
+            "COMPRESSION_ERROR",
+            "CONNECT_ERROR",
+            "ENHANCE_YOUR_CALM",
+            "INADEQUATE_SECURITY",
+            "HTTP_1_1_REQUIRED",
+        ];
+        NAMES.get(usize::try_from(code).ok()?).copied()
+    }
 }
 
 /// A terminal error, including the code to put in GOAWAY.
@@ -756,9 +791,11 @@ impl Decode for Frames {
     type Item = FrameItem;
     type Error = Error;
     const NAME: &'static str = "HTTP/2";
+    /// The most unread frame bytes needed for a decoding step.
     fn capacity(&self) -> usize {
         (HEADER_LEN + self.limit).max(PREFACE.len())
     }
+    /// Reads one frame or display item, or skips a refused payload.
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<FrameItem>, Error> {
         if self.skip != 0 {
             let n = input.len().min(self.skip);
@@ -1180,13 +1217,23 @@ struct StreamState {
     closed: bool,
 }
 
+struct SettingsUpdate {
+    table_min: Option<usize>,
+    table_final: usize,
+    window: u32,
+    window_max: u32,
+    frame_size: u32,
+    frame_max: u32,
+}
+
 /// One sending direction of an HTTP/2 connection, with a [`Stream<Frames>`]
 /// inside. `client_side` reads client-to-server bytes, including the preface;
-/// `server_side` reads server-to-client bytes. Both require initial SETTINGS.
+/// `server_side` reads server-to-client bytes. A nonempty direction requires
+/// initial SETTINGS. An empty direction can end cleanly.
 ///
-/// Route received SETTINGS and WINDOW_UPDATE to the opposite direction's
-/// [`peer_settings`](Self::peer_settings) and [`peer_window_update`](Self::peer_window_update).
-/// HPACK table reductions take effect when that sender acknowledges SETTINGS.
+/// Route SETTINGS, WINDOW_UPDATE, and RST_STREAM as described in the module
+/// docs. Use [`peer_reset`](Self::peer_reset) for streams abandoned by GOAWAY.
+/// SETTINGS reductions take effect when that sender acknowledges them.
 /// This owner handles framing, compression, stream endings, and flow control.
 /// The caller coordinates request IDs, push permission, HTTP field semantics,
 /// SETTINGS acknowledgments, and transport writes across the two directions.
@@ -1209,7 +1256,9 @@ pub struct Connection {
     client: bool,
     stopped: bool,
     failed: Option<Error>,
-    table_updates: std::collections::VecDeque<(Option<usize>, usize)>,
+    settings_updates: std::collections::VecDeque<SettingsUpdate>,
+    initial_window: u32,
+    frame_size: u32,
 }
 impl Connection {
     /// Starts a client-to-server direction requiring the client preface.
@@ -1239,7 +1288,9 @@ impl Connection {
             client,
             stopped: false,
             failed: None,
-            table_updates: std::collections::VecDeque::new(),
+            settings_updates: std::collections::VecDeque::new(),
+            initial_window: 65_535,
+            frame_size: DEFAULT_FRAME_SIZE as u32,
         }
     }
     /// Accepts what fits. After a terminal error or gap, accepts and drops
@@ -1266,7 +1317,9 @@ impl Connection {
         ));
         self.blocks.forget();
         self.streams.clear();
-        self.table_updates.clear();
+        self.settings_updates.clear();
+        self.initial_window = 65_535;
+        self.frame_size = DEFAULT_FRAME_SIZE as u32;
         self.settings = SettingsState::default();
         self.peer = SettingsState::default();
         self.window = 65_535;
@@ -1293,7 +1346,7 @@ impl Connection {
     pub fn settings(&self) -> SettingsState {
         self.settings
     }
-    /// Settings received from the other direction.
+    /// The latest announced peer settings. Reductions can still await an ACK.
     pub fn peer(&self) -> SettingsState {
         self.peer
     }
@@ -1316,10 +1369,18 @@ impl Connection {
             false
         }
     }
-    /// Applies SETTINGS announced in the other direction. Settings affect
-    /// this sender's frame sizes and windows immediately. HPACK reductions
-    /// are queued until this direction's next SETTINGS ACK. At most 64
-    /// unacknowledged settings sets are retained. Errors stop the direction.
+    /// Marks a stream closed after a peer reset or abandonment by GOAWAY.
+    /// The caller can then release it with [`retire`](Self::retire).
+    /// Unknown streams are ignored. This does not allocate state.
+    pub fn peer_reset(&mut self, stream: u32) {
+        if let Some(state) = self.streams.get_mut(&stream) {
+            state.closed = true;
+        }
+    }
+    /// Applies SETTINGS announced in the other direction. Increases can
+    /// apply at once. HPACK, window, and frame-size reductions wait for this
+    /// direction's SETTINGS ACK. At most 64 unacknowledged sets are retained.
+    /// Errors stop the direction.
     pub fn peer_settings(&mut self, settings: &Settings) -> Result<(), Error> {
         if self.stopped {
             return Ok(());
@@ -1333,56 +1394,95 @@ impl Connection {
         if settings.flags & 1 != 0 {
             return Ok(());
         }
-        if self.table_updates.len() >= 64 {
+        if self.settings_updates.len() >= 64 {
             return Err(budget("too many unacknowledged settings"));
         }
-        // Apply each INITIAL_WINDOW_SIZE in order, including duplicate IDs.
-        let mut initial = self.peer.initial_window_size;
-        let mut windows: Vec<(u32, i64)> =
-            self.streams.iter().map(|(k, s)| (*k, s.window)).collect();
+        let mut window_min = peer.initial_window_size;
+        let mut window_max = peer.initial_window_size;
+        let mut frame_max = peer.max_frame_size;
         let mut table_min: Option<u32> = None;
         for setting in &settings.entries {
-            if setting.id == 1 {
-                table_min = Some(table_min.map_or(setting.value, |n| n.min(setting.value)));
-            }
-            if setting.id != 4 {
-                continue;
-            }
-            let delta = i64::from(setting.value) - i64::from(initial);
-            for (_, window) in &mut windows {
-                *window = window
-                    .checked_add(delta)
-                    .ok_or_else(|| error(ErrorCode::FlowControlError, "window overflow"))?;
-                if *window > i64::from(MAX_WINDOW) {
-                    return Err(error(ErrorCode::FlowControlError, "window overflow"));
+            match setting.id {
+                1 => table_min = Some(table_min.map_or(setting.value, |n| n.min(setting.value))),
+                4 => {
+                    window_min = window_min.min(setting.value);
+                    window_max = window_max.max(setting.value);
                 }
-            }
-            initial = setting.value;
-        }
-        for (k, window) in windows {
-            if let Some(s) = self.streams.get_mut(&k) {
-                s.window = window;
+                5 => frame_max = frame_max.max(setting.value),
+                _ => {}
             }
         }
-        // Increases can be used before ACK; reductions become mandatory at ACK.
+        // Check all intermediate window extremes, then apply one net delta.
+        // Reductions remain optional until ACK, including for new streams.
+        let initial = self.initial_window.max(window_max);
+        self.set_initial_window(initial, window_min, initial)?;
         if peer.header_table_size > self.peer.header_table_size {
             self.blocks
                 .table
                 .set_settings_limit(peer.header_table_size as usize);
         }
-        self.table_updates.push_back((
-            table_min.map(|n| n as usize),
-            peer.header_table_size as usize,
-        ));
+        self.settings_updates.push_back(SettingsUpdate {
+            table_min: table_min.map(|n| n as usize),
+            table_final: peer.header_table_size as usize,
+            window: peer.initial_window_size,
+            window_max,
+            frame_size: peer.max_frame_size,
+            frame_max,
+        });
         self.peer = peer;
-        self.frames
-            .decoder()
-            .set_limit(self.limits.max_frame_size.min(peer.max_frame_size as usize));
+        self.set_frame_size(self.frame_size.max(frame_max));
         Ok(())
     }
-    /// Applies credit announced by the other direction. Stream credit for
-    /// an unknown stream is refused; the caller should route updates only
-    /// after observing that stream's opening headers. Overflow stops decoding.
+    fn set_initial_window(&mut self, value: u32, min: u32, max: u32) -> Result<(), Error> {
+        let delta = i64::from(value) - i64::from(self.initial_window);
+        let low = i64::from(min) - i64::from(self.initial_window);
+        let high = i64::from(max) - i64::from(self.initial_window);
+        for state in self.streams.values_mut() {
+            if state.window.checked_add(low).is_none()
+                || state
+                    .window
+                    .checked_add(high)
+                    .is_none_or(|n| n > i64::from(MAX_WINDOW))
+            {
+                return Err(error(ErrorCode::FlowControlError, "window overflow"));
+            }
+            state.window = state
+                .window
+                .checked_add(delta)
+                .ok_or_else(|| error(ErrorCode::FlowControlError, "window overflow"))?;
+        }
+        self.initial_window = value;
+        Ok(())
+    }
+    fn set_frame_size(&mut self, value: u32) {
+        self.frame_size = value;
+        self.frames
+            .decoder()
+            .set_limit(self.limits.max_frame_size.min(value as usize));
+    }
+    fn acknowledge_settings(&mut self) -> Result<(), Error> {
+        let Some(update) = self.settings_updates.pop_front() else {
+            return Ok(());
+        };
+        if let Some(limit) = update.table_min {
+            self.blocks.table.set_settings_limit(limit);
+            self.blocks.table.set_settings_limit(update.table_final);
+        }
+        // Later increases may already be in use before their own ACK.
+        let mut window = update.window;
+        let mut frame_size = update.frame_size;
+        for pending in &self.settings_updates {
+            window = window.max(pending.window_max);
+            frame_size = frame_size.max(pending.frame_max);
+        }
+        self.set_initial_window(window, window, window)?;
+        self.set_frame_size(frame_size);
+        Ok(())
+    }
+    /// Applies credit announced by the other direction. Unknown streams
+    /// are ignored, including streams whose metadata was retired. The caller
+    /// checks idle-stream rules using both directions' opening headers.
+    /// Overflow and invalid increments stop decoding.
     pub fn peer_window_update(&mut self, update: &WindowUpdate) -> Result<(), Error> {
         if self.stopped {
             return Ok(());
@@ -1393,12 +1493,10 @@ impl Connection {
             }
             let window = if update.stream == 0 {
                 &mut self.window
+            } else if let Some(state) = self.streams.get_mut(&update.stream) {
+                &mut state.window
             } else {
-                &mut self
-                    .streams
-                    .get_mut(&update.stream)
-                    .ok_or_else(|| protocol("window update on unknown stream"))?
-                    .window
+                return Ok(());
             };
             let next = window
                 .checked_add(i64::from(update.increment))
@@ -1423,7 +1521,7 @@ impl Connection {
             return Err(budget("stream state limit"));
         }
         Ok(self.streams.entry(id).or_insert(StreamState {
-            window: i64::from(self.peer.initial_window_size),
+            window: i64::from(self.initial_window),
             headers: false,
             closed: false,
         }))
@@ -1448,7 +1546,7 @@ impl Connection {
                 None if self.frames.is_done() && self.blocks.pending.is_some() => {
                     Err(protocol("incomplete header block at EOF"))
                 }
-                None if self.frames.is_done() && self.first => {
+                None if self.frames.is_done() && self.first && self.frames.offset() != 0 => {
                     Err(protocol("missing initial SETTINGS"))
                 }
                 None => return None,
@@ -1571,10 +1669,7 @@ impl Connection {
             }
             Frame::Settings(s) => {
                 if s.flags & 1 != 0 {
-                    if let Some((Some(limit), final_limit)) = self.table_updates.pop_front() {
-                        self.blocks.table.set_settings_limit(limit);
-                        self.blocks.table.set_settings_limit(final_limit);
-                    }
+                    self.acknowledge_settings()?;
                 } else {
                     self.settings.apply(&s)?;
                 }
@@ -1582,9 +1677,7 @@ impl Connection {
             }
             Frame::Priority(p) => Some(Event::Priority(p)),
             Frame::Reset(r) => {
-                if let Some(s) = self.streams.get_mut(&r.stream) {
-                    s.closed = true;
-                }
+                self.peer_reset(r.stream);
                 Some(Event::Reset {
                     stream: r.stream,
                     code: r.code,
@@ -1638,61 +1731,194 @@ struct Call {
     spans: Spans,
     outer: u64,
 }
+/// Shared gRPC DATA credit for capture connections, capped at 8 MiB.
+/// Clone this handle into a registry factory and use [`Capture::pair_in`].
+/// The factory and every registry clone then charge the same byte limit.
+/// Copied modules and user presenters can use the same constructor pattern.
+#[derive(Clone)]
+pub struct CaptureBudget {
+    used: Arc<Mutex<usize>>,
+    limit: usize,
+}
+impl CaptureBudget {
+    /// Sets the total unread DATA limit across all participating connections.
+    pub fn new(limit: usize) -> Self {
+        Self {
+            used: Arc::new(Mutex::new(0)),
+            limit: limit.min(CAPTURE_DATA_BUDGET),
+        }
+    }
+    /// Bytes charged across all connections. A failed lock reports the limit.
+    pub fn held(&self) -> usize {
+        self.used.lock().map_or(self.limit, |used| *used)
+    }
+}
+impl Default for CaptureBudget {
+    /// Uses the built-in aggregate DATA limit.
+    fn default() -> Self {
+        Self::new(CAPTURE_DATA_BUDGET)
+    }
+}
+const CAPTURE_CALL_LIMIT: usize = 256;
+struct CaptureCalls {
+    messages: Demux<(bool, u32), grpc::Messages>,
+    state: BTreeMap<(bool, u32), Call>,
+    budget: CaptureBudget,
+    charged: usize,
+}
+impl CaptureCalls {
+    fn new(budget: CaptureBudget) -> Self {
+        Self {
+            messages: Demux::new(CAPTURE_CALL_LIMIT, budget.limit, |_| {
+                grpc::Messages::default()
+            }),
+            state: BTreeMap::new(),
+            budget,
+            charged: 0,
+        }
+    }
+    fn total(&self) -> usize {
+        self.messages.total()
+    }
+    fn account(&mut self) {
+        if let Ok(mut used) = self.budget.used.lock() {
+            let total = self.total();
+            *used = used.saturating_sub(self.charged).saturating_add(total);
+            self.charged = total;
+        }
+    }
+    fn push(&mut self, key: &(bool, u32), bytes: &[u8]) -> usize {
+        let Ok(mut used) = self.budget.used.lock() else {
+            return 0;
+        };
+        let before = self.total();
+        *used = used.saturating_sub(self.charged).saturating_add(before);
+        let room = self.budget.limit.saturating_sub(*used);
+        let n = self
+            .messages
+            .push(key, bytes.get(..bytes.len().min(room)).unwrap_or_default());
+        self.charged = self.total();
+        *used = used.saturating_sub(before).saturating_add(self.charged);
+        n
+    }
+    fn remove(&mut self, key: &(bool, u32)) {
+        self.messages.remove(key);
+        self.state.remove(key);
+        self.account();
+    }
+    fn remove_where(&mut self, matches: impl Fn(&(bool, u32)) -> bool) {
+        let keys: Vec<_> = self
+            .state
+            .keys()
+            .filter(|key| matches(key))
+            .copied()
+            .collect();
+        for key in keys {
+            self.remove(&key);
+        }
+    }
+}
+impl Drop for CaptureCalls {
+    fn drop(&mut self) {
+        if let Ok(mut used) = self.budget.used.lock() {
+            *used = used.saturating_sub(self.charged);
+        }
+    }
+}
+
+/// A terminal capture framing error or an incomplete gRPC message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CaptureError {
+    /// HTTP/2 framing or header assembly failed.
+    Http2(Error),
+    /// A gRPC message was incomplete when its direction ended.
+    GrpcTruncated {
+        /// The HTTP/2 stream carrying the message.
+        stream: u32,
+        /// Incomplete message bytes retained at EOF.
+        unread: usize,
+    },
+}
+impl From<Error> for CaptureError {
+    fn from(error: Error) -> Self {
+        Self::Http2(error)
+    }
+}
+impl core::fmt::Display for CaptureError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Http2(error) => error.fmt(f),
+            Self::GrpcTruncated { stream, unread } => {
+                write!(
+                    f,
+                    "gRPC: truncated message on stream {stream} at EOF ({unread} bytes)"
+                )
+            }
+        }
+    }
+}
+impl core::error::Error for CaptureError {}
+
 /// HTTP/2 capture decoding through [`Present`] and [`fictionet::observe::Observed`].
 /// Uses the same frame parser and header assembly as [`Connection`], with
 /// tolerant HPACK and header-only oversized items followed by `Skip`.
 /// Complete frames already available in bounded read-ahead are displayed.
 /// Missing bytes stop the direction and clear HPACK and DATA state.
 ///
-/// Recognized gRPC streams use [`Demux`] of [`grpc::Messages`], with one
-/// aggregate DATA budget across both directions when built by [`Capture::pair`],
-/// and bounded byte provenance.
+/// Recognized gRPC streams use [`Demux`] of [`grpc::Messages`]. Both directions
+/// share at most 256 call entries, each with at most 256 provenance spans.
+/// RST_STREAM and GOAWAY release abandoned calls in both directions.
+/// Share a [`CaptureBudget`] across connections, including nested TLS streams.
 /// Register a copied version exactly like the built-in:
 /// ```
 /// use fictionet::{observe::{Registry, Match}, stdlib::http2};
 /// let mut registry = Registry::new();
+/// let budget = http2::CaptureBudget::default();
 /// registry.register_with_buffer("http2", |_| Match::Yes,
-///     http2::CAPTURE_READ_AHEAD, |_| http2::Capture::pair(http2::CAPTURE_DATA_BUDGET));
+///     http2::CAPTURE_READ_AHEAD, move |_| http2::Capture::pair_in(&budget));
 /// ```
 pub struct Capture {
     frames: Frames,
     blocks: Blocks,
-    calls: Arc<Mutex<Demux<(bool, u32), grpc::Messages>>>,
+    calls: Arc<Mutex<CaptureCalls>>,
     reverse: bool,
-    call_state: BTreeMap<u32, Call>,
     offset: u64,
     stopped: bool,
     data_budget: usize,
 }
 impl Default for Capture {
+    /// Creates one direction with its own DATA budget.
     fn default() -> Self {
         Self::new(CAPTURE_DATA_BUDGET)
     }
 }
 impl Capture {
-    /// Sets the aggregate unread gRPC DATA budget, capped at 8 MiB.
-    /// At most 256 calls and 256 provenance spans per call are retained.
+    /// Creates one direction with a DATA budget capped at 8 MiB.
+    /// Use [`pair_in`](Self::pair_in) to share credit across connections.
     pub fn new(data_budget: usize) -> Self {
-        let data_budget = data_budget.min(CAPTURE_DATA_BUDGET);
+        Self::in_budget(&CaptureBudget::new(data_budget))
+    }
+    fn in_budget(budget: &CaptureBudget) -> Self {
         Self {
             frames: Frames::for_observation(CAPTURE_FRAME_LIMIT),
             blocks: Blocks::new(Limits::default().bounded(), true),
-            calls: Arc::new(Mutex::new(Demux::new(256, data_budget, |_| {
-                grpc::Messages::default()
-            }))),
+            calls: Arc::new(Mutex::new(CaptureCalls::new(budget.clone()))),
             reverse: false,
-            call_state: BTreeMap::new(),
             offset: 0,
             stopped: false,
-            data_budget,
+            data_budget: budget.limit,
         }
     }
-    /// Creates both capture directions with one shared gRPC DATA budget.
-    /// A gap releases only that direction's calls. The other direction
-    /// keeps its HPACK, pending messages, and remaining budget.
+    /// Creates both capture directions with one DATA budget for this pair.
     pub fn pair(data_budget: usize) -> [Self; 2] {
-        let first = Self::new(data_budget);
-        let mut second = Self::new(data_budget);
+        Self::pair_in(&CaptureBudget::new(data_budget))
+    }
+    /// Creates a pair charged to the supplied budget across all connections.
+    /// A gap releases only that direction's calls. Peer resets release both.
+    /// The first direction's `held()` counts the pair's DATA once.
+    pub fn pair_in(budget: &CaptureBudget) -> [Self; 2] {
+        let first = Self::in_budget(budget);
+        let mut second = Self::in_budget(budget);
         second.calls = Arc::clone(&first.calls);
         second.reverse = true;
         [first, second]
@@ -1701,7 +1927,32 @@ impl Capture {
         if let Ok(mut calls) = self.calls.lock() {
             calls.remove(&(self.reverse, stream));
         }
-        self.call_state.remove(&stream);
+    }
+    fn clear_calls(&mut self) {
+        if let Ok(mut calls) = self.calls.lock() {
+            calls.remove_where(|key| key.0 == self.reverse);
+        }
+    }
+    fn open_call(&mut self, stream: u32, item: &mut CaptureItem) {
+        if let Ok(mut calls) = self.calls.lock() {
+            let key = (self.reverse, stream);
+            if calls.state.contains_key(&key) {
+                return;
+            }
+            if calls.state.len() < CAPTURE_CALL_LIMIT {
+                calls.state.insert(
+                    key,
+                    Call {
+                        spans: Spans::new(256),
+                        outer: 0,
+                    },
+                );
+                return;
+            }
+        }
+        item.malformed = true;
+        item.layer
+            .note("gRPC", "call state limit reached or unavailable");
     }
     fn grpc_data(
         &mut self,
@@ -1711,32 +1962,37 @@ impl Capture {
         end: bool,
         item: &mut CaptureItem,
     ) {
-        let Some(call) = self.call_state.get_mut(&stream) else {
-            return;
-        };
-        let Ok(gap) = usize::try_from(start.saturating_sub(call.outer)) else {
-            item.malformed = true;
-            self.remove_call(stream);
-            return;
-        };
-        call.spans.skip(gap);
-        call.spans.push_exact(data.len());
-        call.outer = start.saturating_add(data.len() as u64);
         let shared = Arc::clone(&self.calls);
         let Ok(mut calls) = shared.lock() else {
             item.malformed = true;
             return;
         };
         let key = (self.reverse, stream);
+        let Some(call) = calls.state.get_mut(&key) else {
+            return;
+        };
+        let Ok(gap) = usize::try_from(start.saturating_sub(call.outer)) else {
+            item.malformed = true;
+            calls.remove(&key);
+            return;
+        };
+        call.spans.skip(gap);
+        call.spans.push_exact(data.len());
+        call.outer = start.saturating_add(data.len() as u64);
         let mut rest = data;
         loop {
             let n = calls.push(&key, rest);
             rest = rest.get(n..).unwrap_or_default();
             if rest.is_empty() && end {
-                calls.end(&key);
+                calls.messages.end(&key);
             }
             let mut failed = false;
-            if let Some(inner) = calls.get_mut(&key) {
+            let CaptureCalls {
+                state, messages, ..
+            } = &mut *calls;
+            if let Some(call) = state.get(&key)
+                && let Some(inner) = messages.get_mut(&key)
+            {
                 while let Some(result) = inner.with_next(|message, bytes, range| {
                     let start = call.spans.locate_exact(range).map(|r| r.start);
                     MessageDisplay {
@@ -1755,18 +2011,17 @@ impl Capture {
                     }
                 }
             }
+            calls.account();
             if failed || (n == 0 && !rest.is_empty()) {
                 item.malformed = true;
                 item.layer
                     .note("gRPC", "message decoding stopped or DATA budget exhausted");
                 calls.remove(&key);
-                self.call_state.remove(&stream);
                 break;
             }
             if rest.is_empty() {
                 if end {
                     calls.remove(&key);
-                    self.call_state.remove(&stream);
                 }
                 break;
             }
@@ -1775,11 +2030,7 @@ impl Capture {
 }
 impl Drop for Capture {
     fn drop(&mut self) {
-        if let Ok(mut calls) = self.calls.lock() {
-            for id in self.call_state.keys() {
-                calls.remove(&(self.reverse, *id));
-            }
-        }
+        self.clear_calls();
     }
 }
 fn preview(b: &[u8]) -> Option<String> {
@@ -1798,18 +2049,7 @@ fn preview(b: &[u8]) -> Option<String> {
     Some(text)
 }
 fn display_error(code: u32) -> String {
-    match code {
-        0 => "NO_ERROR",
-        1 => "PROTOCOL_ERROR",
-        2 => "INTERNAL_ERROR",
-        3 => "FLOW_CONTROL_ERROR",
-        5 => "STREAM_CLOSED",
-        7 => "REFUSED_STREAM",
-        8 => "CANCEL",
-        11 => "ENHANCE_YOUR_CALM",
-        _ => return format!("error {code}"),
-    }
-    .into()
+    ErrorCode::name(code).map_or_else(|| format!("error {code}"), str::to_owned)
 }
 fn capture_layer(h: FrameHeader, raw: &[u8]) -> CaptureItem {
     let mut layer = Layer::new("HyperText Transfer Protocol 2", 0, (0, raw.len()));
@@ -1894,19 +2134,24 @@ fn present_block(item: &mut CaptureItem, block: &hpack::Block) {
 }
 impl Decode for Capture {
     type Item = CaptureItem;
-    type Error = Error;
+    type Error = CaptureError;
     const NAME: &'static str = "HTTP/2";
+    /// The most unread frame bytes needed for a decoding step.
     fn capacity(&self) -> usize {
         self.frames.capacity()
     }
+    /// Header state plus this pair's DATA, counted in its first direction.
     fn held(&self) -> usize {
-        self.blocks.held().saturating_add(
+        self.blocks.held().saturating_add(if self.reverse {
+            0
+        } else {
             self.calls
                 .lock()
-                .map_or(self.data_budget, |calls| calls.total()),
-        )
+                .map_or(self.data_budget, |calls| calls.total())
+        })
     }
-    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<CaptureItem>, Error> {
+    /// Reads one frame or display item, or skips a refused payload.
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<CaptureItem>, CaptureError> {
         if self.stopped {
             return Ok(Step::End);
         }
@@ -1917,27 +2162,37 @@ impl Decode for Capture {
                 return Ok(Step::Skip(n));
             }
             Step::Need if eof && input.is_empty() && self.blocks.pending.is_some() => {
-                return Err(protocol("incomplete header block at EOF"));
+                self.clear_calls();
+                return Err(protocol("incomplete header block at EOF").into());
             }
             Step::Need if eof && input.is_empty() => {
-                let mut failed = false;
                 let shared = Arc::clone(&self.calls);
                 let mut calls = shared
                     .lock()
                     .map_err(|_| protocol("capture DATA state unavailable"))?;
-                for id in self.call_state.keys() {
-                    let key = (self.reverse, *id);
-                    calls.end(&key);
-                    if let Some(inner) = calls.get_mut(&key) {
+                let keys: Vec<_> = calls
+                    .state
+                    .keys()
+                    .filter(|k| k.0 == self.reverse)
+                    .copied()
+                    .collect();
+                let mut failure = None;
+                for key in keys {
+                    calls.messages.end(&key);
+                    if let Some(inner) = calls.messages.get_mut(&key) {
                         while let Some(result) = inner.next() {
-                            failed |= result.is_err();
+                            if let Err(Fail::Truncated { unread }) = result {
+                                failure.get_or_insert(CaptureError::GrpcTruncated {
+                                    stream: key.1,
+                                    unread,
+                                });
+                            }
                         }
                     }
                     calls.remove(&key);
                 }
-                self.call_state.clear();
-                if failed {
-                    return Err(protocol("incomplete gRPC message at EOF"));
+                if let Some(failure) = failure {
+                    return Err(failure);
                 }
                 return Ok(Step::End);
             }
@@ -2044,34 +2299,52 @@ impl Decode for Capture {
                                 .as_deref()
                                 .is_some_and(|v| grpc::ContentType::parse(v).is_some())
                     });
-                    if grpc && h.kind != 5 && self.call_state.len() < 256 {
-                        self.call_state.entry(h.stream).or_insert_with(|| Call {
-                            spans: Spans::new(256),
-                            outer: 0,
-                        });
+                    if grpc && h.kind != 5 {
+                        self.open_call(h.stream, &mut item);
                     }
-                    if block.end {
-                        self.grpc_data(h.stream, &[], self.offset, true, &mut item);
-                    }
+                }
+                if block.end && h.kind != 5 && self.blocks.pending.is_none() {
+                    self.grpc_data(h.stream, &[], self.offset, true, &mut item);
                 }
                 if h.kind == 1 && h.flags & 1 != 0 {
                     item.info.push_str(", end");
                 }
             }
             3 if body.len() >= 4 => {
-                let e = display_error(u32_at(body, 0)?);
+                let code = match &frame {
+                    FrameItem::Frame(Frame::Reset(reset)) => reset.code,
+                    _ => u32_at(body, 0)?,
+                };
+                let e = display_error(code);
                 item.layer.field("Error", e.clone(), (9, 13));
                 let _ = write!(item.info, " {e}");
                 item.reset = true;
-                self.remove_call(h.stream);
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.remove_where(|key| key.1 == h.stream);
+                }
             }
             4 => {
-                for (i, b) in body.chunks_exact(6).enumerate() {
-                    let id = u16::from_be_bytes([
-                        *b.first().ok_or_else(|| size("setting"))?,
-                        *b.get(1).ok_or_else(|| size("setting"))?,
-                    ]);
-                    let name = match id {
+                let partial;
+                let entries = match &frame {
+                    FrameItem::Frame(Frame::Settings(settings)) => &settings.entries,
+                    _ => {
+                        partial = body
+                            .chunks_exact(6)
+                            .map(|b| {
+                                Ok(Setting {
+                                    id: u16::from_be_bytes([
+                                        *b.first().ok_or_else(|| size("setting"))?,
+                                        *b.get(1).ok_or_else(|| size("setting"))?,
+                                    ]),
+                                    value: u32_at(b, 2)?,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        &partial
+                    }
+                };
+                for (i, setting) in entries.iter().enumerate() {
+                    let name = match setting.id {
                         1 => "HEADER_TABLE_SIZE",
                         2 => "ENABLE_PUSH",
                         3 => "MAX_CONCURRENT_STREAMS",
@@ -2083,7 +2356,7 @@ impl Decode for Capture {
                     };
                     let at = 9 + i * 6;
                     item.layer
-                        .field(name, u32_at(b, 2)?.to_string(), (at, at + 6));
+                        .field(name, setting.value.to_string(), (at, at + 6));
                 }
                 item.info = if h.flags & 1 != 0 {
                     "SETTINGS ack"
@@ -2094,17 +2367,24 @@ impl Decode for Capture {
             }
             6 => item.info = if h.flags & 1 != 0 { "PING ack" } else { "PING" }.into(),
             7 if body.len() >= 8 => {
-                let e = display_error(u32_at(body, 4)?);
-                item.layer.field(
-                    "Last stream",
-                    (u32_at(body, 0)? & MAX_WINDOW).to_string(),
-                    (9, 13),
-                );
+                let (last_stream, code) = match &frame {
+                    FrameItem::Frame(Frame::GoAway(goaway)) => (goaway.last_stream, goaway.code),
+                    _ => (u32_at(body, 0)? & MAX_WINDOW, u32_at(body, 4)?),
+                };
+                let e = display_error(code);
+                item.layer
+                    .field("Last stream", last_stream.to_string(), (9, 13));
                 item.layer.field("Error", e.clone(), (13, 17));
                 item.info = format!("GOAWAY {e}");
+                if let Ok(mut calls) = self.calls.lock() {
+                    calls.remove_where(|key| key.1 > last_stream);
+                }
             }
             8 if body.len() >= 4 => {
-                let inc = u32_at(body, 0)? & MAX_WINDOW;
+                let inc = match &frame {
+                    FrameItem::Frame(Frame::WindowUpdate(update)) => update.increment,
+                    _ => u32_at(body, 0)? & MAX_WINDOW,
+                };
                 item.layer
                     .field("Window increment", inc.to_string(), (9, 13));
                 let _ = write!(item.info, " +{inc}");
@@ -2116,12 +2396,15 @@ impl Decode for Capture {
     }
 }
 impl Present for Capture {
+    /// The frame's display summary.
     fn summary(item: &CaptureItem) -> String {
         item.layer.summary.clone()
     }
+    /// Copies fields with ranges relative to the frame bytes.
     fn fields(item: &CaptureItem, _: &[u8], layer: &mut Layer) {
         layer.fields.clone_from(&item.layer.fields);
     }
+    /// Places HTTP/2 and gRPC layers and updates the packet summary.
     fn present(
         item: &CaptureItem,
         bytes: &[u8],
@@ -2136,7 +2419,16 @@ impl Present for Capture {
         if item.reset {
             packet.tag("reset");
         }
-        packet.application(2, "HTTP/2", &item.info);
+        if packet.level() == 2
+            && item.info.starts_with("HEADERS")
+            && !packet.info.starts_with("HEADERS")
+        {
+            // Requests and responses lead the summary even after control frames.
+            packet.info = format!("{}, {}", item.info, packet.info);
+            packet.cap_info();
+        } else {
+            packet.application(2, "HTTP/2", &item.info);
+        }
         for message in &item.messages {
             let mut layer = Layer::new("gRPC", 0, (0, message.bytes.len()));
             layer.summary = grpc::Messages::summary(&message.message);
@@ -2157,20 +2449,26 @@ impl Present for Capture {
             }
         }
     }
+    /// Reports a gRPC truncation as gRPC and other failures as HTTP/2.
+    fn error(error: &Fail<CaptureError>, packet: &mut Decoded) {
+        packet.tag("malformed");
+        packet.info = match error {
+            Fail::Protocol(error @ CaptureError::GrpcTruncated { .. }) => error.to_string(),
+            _ => format!("HTTP/2: {error}"),
+        };
+    }
+    /// Bounds decoded headers by the packet's remaining display room.
     fn prepare(&mut self, packet: &Decoded) {
         self.blocks.decoded = packet.room();
     }
+    /// Whether an oversized payload still has bytes to skip.
     fn pending(&self) -> bool {
         self.frames.pending()
     }
+    /// Drops this direction's state after a capture gap.
     fn reset(&mut self) {
         self.blocks.forget();
-        if let Ok(mut calls) = self.calls.lock() {
-            for id in self.call_state.keys() {
-                calls.remove(&(self.reverse, *id));
-            }
-        }
-        self.call_state.clear();
+        self.clear_calls();
         self.frames = Frames::for_observation(CAPTURE_FRAME_LIMIT);
         self.stopped = true;
     }
@@ -2400,6 +2698,165 @@ mod tests {
         assert!(c.failed().is_some());
     }
     #[test]
+    fn peer_credit_before_response_headers_and_after_retirement_is_allowed() {
+        let mut c = Connection::server_side(Limits::default());
+        accept(&mut c, &settings());
+        let update = WindowUpdate {
+            stream: 1,
+            flags: 0,
+            increment: 1 << 20,
+        };
+        // The caller has observed the request HEADERS in the other direction.
+        c.peer_window_update(&update).unwrap();
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        accept(&mut c, &raw(0, 1, 1, b"done"));
+        assert!(c.retire(1));
+        c.peer_window_update(&update).unwrap();
+        assert!(c.failed().is_none());
+    }
+
+    #[test]
+    fn caller_can_retire_streams_abandoned_by_goaway() {
+        let mut c = Connection::server_side(Limits {
+            max_streams: 4,
+            ..Limits::default()
+        });
+        accept(&mut c, &settings());
+        for stream in [1, 3, 5, 7] {
+            accept(&mut c, &raw(1, 4, stream, &[0x88]));
+        }
+        // The peer's GOAWAY accepted only stream 1. The caller owns this list.
+        for stream in [3, 5, 7] {
+            c.peer_reset(stream);
+            assert!(c.retire(stream));
+        }
+        c.peer_reset(99);
+        assert!(!c.retire(99));
+        assert!(!c.retire(1));
+        for stream in [9, 11, 13] {
+            accept(&mut c, &raw(1, 4, stream, &[0x88]));
+        }
+        assert!(c.failed().is_none());
+    }
+
+    #[test]
+    fn window_reductions_accept_in_flight_data_until_ack() {
+        for already_open in [false, true] {
+            let mut c = Connection::client_side(Limits::default());
+            if already_open {
+                accept(&mut c, &[PREFACE.as_slice(), &settings()].concat());
+                accept(&mut c, &raw(1, 4, 1, &[0x82]));
+            }
+            c.peer_settings(&Settings {
+                flags: 0,
+                entries: vec![Setting {
+                    id: 4,
+                    value: 16_384,
+                }],
+            })
+            .unwrap();
+            if !already_open {
+                accept(&mut c, &[PREFACE.as_slice(), &settings()].concat());
+                accept(&mut c, &raw(1, 4, 1, &[0x82]));
+            }
+            accept(&mut c, &raw(0, 0, 1, &[0; 16_384]));
+            accept(&mut c, &raw(0, 0, 1, &[0; 10_000]));
+            accept(&mut c, &raw(4, 1, 0, &[]));
+            assert_eq!(c.stream_window(1), Some(-10_000));
+            assert_eq!(c.push(&raw(0, 0, 1, &[0])), 10);
+            assert_eq!(
+                c.next().unwrap().unwrap_err().code,
+                ErrorCode::FlowControlError
+            );
+        }
+    }
+
+    #[test]
+    fn frame_size_reductions_accept_in_flight_frames_until_ack() {
+        let mut c = Connection::server_side(Limits {
+            max_frame_size: 32_768,
+            ..Limits::default()
+        });
+        accept(&mut c, &settings());
+        for value in [32_768, 16_384] {
+            c.peer_settings(&Settings {
+                flags: 0,
+                entries: vec![Setting { id: 5, value }],
+            })
+            .unwrap();
+            if value == 32_768 {
+                accept(&mut c, &raw(4, 1, 0, &[]));
+            }
+        }
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        accept(&mut c, &raw(0, 0, 1, &[0; 20_000]));
+        accept(&mut c, &raw(4, 1, 0, &[]));
+        let header = FrameHeader {
+            length: 20_000,
+            kind: 0,
+            flags: 0,
+            stream: 1,
+        };
+        assert_eq!(c.push(&header.to_bytes().unwrap()), 9);
+        assert_eq!(
+            c.next().unwrap().unwrap_err().code,
+            ErrorCode::FrameSizeError
+        );
+    }
+
+    #[test]
+    fn canceled_capture_calls_release_both_directions() {
+        let [a, b] = Capture::pair(CAPTURE_DATA_BUDGET);
+        let mut a = Stream::new(a);
+        let mut b = Stream::new(b);
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("content-type", "application/grpc")],
+                &mut block,
+            )
+            .unwrap();
+        for id in (1..601).step_by(2) {
+            pump(&mut b, &raw(1, 4, id, &block), |_| {}).unwrap();
+            pump(&mut b, &raw(0, 0, id, &[0, 0]), |_| {}).unwrap();
+            pump(&mut a, &raw(3, 0, id, &8u32.to_be_bytes()), |_| {}).unwrap();
+        }
+        let mut messages = Vec::new();
+        pump(&mut b, &raw(1, 4, 1001, &block), |_| {}).unwrap();
+        pump(&mut b, &raw(0, 1, 1001, &[0, 0, 0, 0, 1, b'x']), |item| {
+            messages.extend(item.messages)
+        })
+        .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message.data, b"x");
+        assert_eq!(b.decoder().calls.lock().unwrap().total(), 0);
+    }
+
+    #[test]
+    fn goaway_and_undecodable_trailers_release_capture_calls() {
+        let [a, b] = Capture::pair(32);
+        let mut a = Stream::new(a);
+        let mut b = Stream::new(b);
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("content-type", "application/grpc")],
+                &mut block,
+            )
+            .unwrap();
+        for dir in [&mut a, &mut b] {
+            for id in [1, 3] {
+                pump(dir, &raw(1, 4, id, &block), |_| {}).unwrap();
+                pump(dir, &raw(0, 0, id, &[0, 0]), |_| {}).unwrap();
+            }
+        }
+        pump(&mut a, &raw(7, 0, 0, &[0, 0, 0, 1, 0, 0, 0, 0]), |_| {}).unwrap();
+        assert_eq!(a.decoder().calls.lock().unwrap().total(), 4);
+        pump(&mut a, &raw(1, 5, 1, &[0xff]), |_| {}).unwrap();
+        assert_eq!(a.decoder().calls.lock().unwrap().total(), 2);
+    }
+
+    #[test]
     fn settings_update_opposite_direction_and_padding_spends_credit() {
         let mut c = Connection::server_side(Limits::default());
         accept(&mut c, &settings());
@@ -2419,7 +2876,7 @@ mod tests {
             ],
         };
         c.peer_settings(&announced).unwrap();
-        assert_eq!(c.stream_window(1), Some(-2));
+        assert_eq!(c.stream_window(1), Some(65_531));
         assert_eq!(c.peer().max_frame_size, 32_768);
         assert_eq!(c.settings().max_frame_size, 16_384);
         c.peer_window_update(&WindowUpdate {
@@ -2428,8 +2885,9 @@ mod tests {
             increment: 10,
         })
         .unwrap();
-        assert_eq!(c.stream_window(1), Some(8));
+        assert_eq!(c.stream_window(1), Some(65_541));
         accept(&mut c, &raw(4, 1, 0, &[]));
+        assert_eq!(c.stream_window(1), Some(8));
         assert_eq!(c.blocks.table.settings_limit(), Some(0));
         accept(&mut c, &raw(1, 4, 3, &[0x20, 0x88]));
         assert_eq!(c.stream_window(3), Some(2));
@@ -2492,6 +2950,7 @@ mod tests {
                 entries: vec![Setting { id: 4, value: 1 }],
             })
             .unwrap();
+            accept(&mut c, &raw(4, 1, 0, &[]));
             assert_eq!(c.push(&frame), frame.len());
             assert_eq!(c.next().unwrap().unwrap_err().code, code);
             assert!(c.next().is_none());
@@ -2587,6 +3046,141 @@ mod tests {
         .unwrap();
         assert!(malformed);
         assert_eq!(a.decoder().calls.lock().unwrap().total(), 4);
+    }
+
+    #[test]
+    fn shared_capture_budget_counts_connections_once_and_returns_credit() {
+        let budget = CaptureBudget::new(4096);
+        let mut connections = Vec::new();
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("content-type", "application/grpc")],
+                &mut block,
+            )
+            .unwrap();
+        for _ in 0..32 {
+            let mut pair = Capture::pair_in(&budget).map(Stream::new);
+            for dir in &mut pair {
+                pump(dir, &raw(1, 4, 1, &block), |_| {}).unwrap();
+                let mut partial = vec![0, 0, 0, 4, 0];
+                partial.resize(512, 0);
+                pump(dir, &raw(0, 0, 1, &partial), |_| {}).unwrap();
+            }
+            connections.push(pair);
+            assert!(budget.held() <= 4096);
+            let held: usize = connections
+                .iter_mut()
+                .flat_map(|pair| pair.iter_mut())
+                .map(|dir| dir.held())
+                .sum();
+            assert_eq!(held, budget.held());
+        }
+        assert_eq!(budget.held(), 4096);
+        connections.remove(0);
+        assert_eq!(budget.held(), 3072);
+        connections[0][0].decoder().reset();
+        assert_eq!(budget.held(), 2560);
+        drop(connections);
+        assert_eq!(budget.held(), 0);
+    }
+
+    #[test]
+    fn capture_call_limit_is_shared_and_reported() {
+        let [a, b] = Capture::pair(4096);
+        let mut dirs = [Stream::new(a), Stream::new(b)];
+        let mut block = Vec::new();
+        hpack::Encoder::new(0)
+            .encode_block(
+                &[hpack::Field::new("content-type", "application/grpc")],
+                &mut block,
+            )
+            .unwrap();
+        for n in 0..256 {
+            pump(
+                &mut dirs[n % 2],
+                &raw(1, 4, 1 + n as u32 * 2, &block),
+                |item| {
+                    assert!(!item.malformed);
+                },
+            )
+            .unwrap();
+        }
+        pump(&mut dirs[0], &raw(1, 4, 1001, &block), |item| {
+            assert!(item.malformed);
+            assert!(
+                item.layer
+                    .fields
+                    .iter()
+                    .any(|f| f.value.contains("call state limit"))
+            );
+        })
+        .unwrap();
+        pump(&mut dirs[1], &raw(3, 0, 1, &8u32.to_be_bytes()), |_| {}).unwrap();
+        pump(&mut dirs[0], &raw(1, 4, 1003, &block), |item| {
+            assert!(!item.malformed)
+        })
+        .unwrap();
+        pump(&mut dirs[0], &raw(0, 1, 1003, &[0, 0, 0, 0, 0]), |item| {
+            assert_eq!(item.messages.len(), 1);
+            assert!(!item.malformed);
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn empty_directions_end_cleanly_but_a_preface_requires_settings() {
+        for mut c in [
+            Connection::client_side(Limits::default()),
+            Connection::server_side(Limits::default()),
+        ] {
+            c.end();
+            assert!(c.next().is_none());
+            assert!(c.is_done());
+            assert!(c.failed().is_none());
+        }
+        let mut c = Connection::client_side(Limits::default());
+        accept(&mut c, PREFACE);
+        c.end();
+        assert_eq!(
+            c.next().unwrap().unwrap_err().reason,
+            "missing initial SETTINGS"
+        );
+    }
+
+    #[test]
+    fn queued_window_reductions_and_increases_follow_ack_order() {
+        let mut c = Connection::server_side(Limits::default());
+        accept(&mut c, &settings());
+        accept(&mut c, &raw(1, 4, 1, &[0x88]));
+        for values in [vec![0], vec![100_000], vec![10, 20]] {
+            c.peer_settings(&Settings {
+                flags: 0,
+                entries: values
+                    .into_iter()
+                    .map(|value| Setting { id: 4, value })
+                    .collect(),
+            })
+            .unwrap();
+        }
+        assert_eq!(c.stream_window(1), Some(100_000));
+        for expected in [100_000, 100_000, 20] {
+            accept(&mut c, &raw(4, 1, 0, &[]));
+            assert_eq!(c.stream_window(1), Some(expected));
+        }
+        c.peer_window_update(&WindowUpdate {
+            stream: 1,
+            flags: 0,
+            increment: MAX_WINDOW - 20,
+        })
+        .unwrap();
+        let error = c
+            .peer_settings(&Settings {
+                flags: 0,
+                entries: vec![Setting { id: 4, value: 21 }, Setting { id: 4, value: 20 }],
+            })
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::FlowControlError);
     }
 
     #[test]

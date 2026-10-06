@@ -752,6 +752,18 @@ fn spans_coarse_gaps_eviction_and_zero_retention() {
     assert!(overflow.outer_offset() > 0);
 }
 #[test]
+fn demux_accepts_a_local_borrowing_factory() {
+    let count = std::rc::Rc::new(core::cell::Cell::new(0));
+    let mut d = Demux::new(2, 4, |_: &u8| {
+        count.set(count.get() + 1);
+        Pairs
+    });
+    assert_eq!(d.push(&1, b"ab"), 2);
+    assert_eq!(d.next(), Some((1, Ok(b"ab".to_vec()))));
+    assert_eq!(count.get(), 1);
+}
+
+#[test]
 fn demux_limits_order_eof_remove_and_held_budget() {
     let mut d = Demux::new(2, 4, |_: &u8| Pairs);
     assert!(d.is_empty());

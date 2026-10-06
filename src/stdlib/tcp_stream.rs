@@ -1,3 +1,10 @@
+//! Bounded TCP capture reassembly with ordered bytes, gaps, and end signals.
+//!
+//! Feed captured [`Segment`] values to [`Reassembler::push`]. Route each
+//! [`TcpEvent`] by its [`FlowKey`] to the application's directional decoder.
+//! A gap invalidates framing and compression state. An end marks input EOF.
+//! [`Limits`] bounds retained payloads, segments, and tracked directions.
+
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 

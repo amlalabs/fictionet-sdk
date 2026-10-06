@@ -458,23 +458,14 @@ impl Tls {
         }
     }
 
-    /// ALPN h2 selects http2 and http/1.1 selects http1, when registered.
-    /// Other values use matchers. Selection spans records; eight unmatched
+    /// Supplies negotiated ALPN to the registry's protocol matchers.
+    /// Selection spans records; eight unmatched
     /// bytes reject plaintext permanently, bounding retries and retained bytes.
     fn inner_data(&mut self, i: usize, plain: &[u8], place: Place, d: &mut Decoded) {
         self.inner_offsets[i] = self.inner_offsets[i].saturating_add(plain.len() as u64);
         if self.inner.is_none() {
             let mut registry = self.registry.clone();
             registry.automatic(Transport::Tcp);
-            let hint = match self.alpn.as_deref() {
-                Some("h2") => Some("http2"),
-                Some("http/1.1") => Some("http1"),
-                _ => None,
-            };
-            if let Some(name) = hint {
-                // Unknown names leave automatic selection in place.
-                registry.choose(Transport::Tcp, name);
-            }
             let inner = Conversation::with_registry(self.ports.0, self.ports.1, registry)
                 .with_alpn(self.alpn.clone());
             self.inner = Some(inner);
@@ -697,7 +688,7 @@ mod tests {
     use fictionet::observe::Match;
 
     #[test]
-    fn alpn_hints_choose_only_h2_and_http11() {
+    fn alpn_matchers_choose_registered_protocols() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -711,12 +702,19 @@ mod tests {
         ] {
             let selected = Arc::new(AtomicUsize::new(0));
             let mut registry = Registry::new();
-            for (name, id) in [("http2", 1), ("http1", 2), ("automatic", 3)] {
+            for (name, id) in [("automatic", 3), ("custom_h2", 1), ("custom_http1", 2)] {
                 let selected = selected.clone();
                 registry.register(
                     name,
-                    move |_| {
-                        if id == 3 { Match::Yes } else { Match::No }
+                    move |s| {
+                        if id == 3
+                            || (id == 1 && s.alpn == Some("h2"))
+                            || (id == 2 && s.alpn == Some("http/1.1"))
+                        {
+                            Match::Yes
+                        } else {
+                            Match::No
+                        }
                     },
                     move |_| {
                         selected.store(id, Ordering::Relaxed);
@@ -725,7 +723,7 @@ mod tests {
                 );
             }
             // An outer explicit choice must not leak into plaintext selection.
-            assert!(registry.choose(Transport::Tcp, "http1"));
+            assert!(registry.choose(Transport::Tcp, "custom_http1"));
             let mut tls = Tls::new((40000, 443), registry);
             tls.alpn = alpn.map(str::to_owned);
             let mut packet = Decoded::default();
@@ -877,13 +875,20 @@ mod tests {
             if replacement { "http1" } else { "tiny" },
             move |s| {
                 if replacement {
-                    return Match::No;
+                    return if s.alpn == Some("http/1.1") {
+                        Match::Yes
+                    } else {
+                        Match::No
+                    };
                 }
                 if s.ports != (40000, 9443) {
                     return Match::No;
                 }
-                if expected_alpn.as_deref() == Some("alpn-only") {
-                    return if s.alpn == Some("alpn-only") {
+                if matches!(
+                    expected_alpn.as_deref(),
+                    Some("alpn-only" | "h2" | "http/1.1")
+                ) {
+                    return if s.alpn == expected_alpn.as_deref() {
                         Match::Yes
                     } else {
                         Match::No
@@ -990,6 +995,7 @@ mod tests {
         tls_user_protocol(Some("alpn-only"), false, true);
         for alpn in ["h2", "http/1.1"] {
             tls_user_protocol(Some(alpn), false, false);
+            tls_user_protocol(Some(alpn), false, true);
         }
     }
 

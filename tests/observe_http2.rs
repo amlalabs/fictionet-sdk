@@ -36,6 +36,45 @@ fn data(bytes: &[u8], flags: u8) -> Vec<u8> {
     .unwrap()
 }
 #[test]
+fn registry_connections_share_the_capture_data_budget() {
+    let registry = Registry::default();
+    let mut connections = Vec::new();
+    let mut refused = 0;
+    let mut partial = vec![0, 0, 0x40, 0, 0]; // A 4 MiB message.
+    partial.resize(16_384, 0);
+    for _ in 0..12 {
+        let mut protocol = registry
+            .clone()
+            .open(Selection {
+                transport: Transport::Tcp,
+                ports: (40000, 443),
+                first: http2::PREFACE,
+                alpn: None,
+            })
+            .unwrap();
+        let mut packet = Decoded::default();
+        protocol.data(
+            false,
+            &[http2::PREFACE.as_slice(), &headers()].concat(),
+            Place::default(),
+            &mut packet,
+            &[],
+        );
+        for n in 0..64 {
+            let bytes = data(if n == 0 { &partial } else { &[0; 16_384] }, 0);
+            packet = Decoded::default();
+            protocol.data(false, &bytes, Place::default(), &mut packet, &[]);
+            refused += usize::from(packet.tags.contains(&"malformed"));
+        }
+        connections.push(protocol);
+    }
+    assert!(
+        refused > 0,
+        "12 MiB of partial messages must exceed the shared 8 MiB budget"
+    );
+}
+
+#[test]
 fn frames_and_grpc_fields_keep_their_packet_byte_ranges() {
     let mut observed = Observed::new(http2::Capture::default());
     let head = headers();
@@ -156,16 +195,12 @@ fn frames_split_between_packets_and_messages_split_between_frames_get_buffers() 
 fn copied_capture_replaces_the_builtin_through_the_same_registry() {
     let mut builtin = Registry::default();
     let mut copied = Registry::default();
+    let budget = fictionet_copy_modules::http2::CaptureBudget::default();
     copied.register_with_buffer(
         "http2",
         |_| Match::Yes,
         http2::CAPTURE_READ_AHEAD,
-        |_| {
-            [
-                fictionet_copy_modules::http2::Capture::default(),
-                fictionet_copy_modules::http2::Capture::default(),
-            ]
-        },
+        move |_| fictionet_copy_modules::http2::Capture::pair_in(&budget),
     );
     assert!(builtin.choose(Transport::Tcp, "http2"));
     let selection = Selection {
@@ -203,6 +238,24 @@ fn copied_capture_replaces_the_builtin_through_the_same_registry() {
     copied_grpc.data(&[0, 0, 0, 0, 0], Place::default(), &mut packet);
     assert_eq!(packet.layers[0].name, "gRPC");
 }
+#[test]
+fn eof_reports_a_grpc_truncation() {
+    let mut observed = Observed::new(http2::Capture::default());
+    let mut packet = Decoded::default();
+    observed.data(&headers(), Place::default(), &mut packet);
+    observed.data(&data(&[0, 0], 0), Place::default(), &mut packet);
+    packet = Decoded::default();
+    observed.end(&mut packet);
+    assert!(packet.tags.contains(&"malformed"));
+    assert!(
+        packet.info.starts_with("gRPC: truncated message"),
+        "{}",
+        packet.info
+    );
+    assert!(!packet.info.contains("HTTP/2"));
+    assert!(!observed.waiting());
+}
+
 #[test]
 fn incomplete_grpc_at_trailers_and_gaps_do_not_join_stale_bytes() {
     let mut observed = Observed::new(http2::Capture::default());

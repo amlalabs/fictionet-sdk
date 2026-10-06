@@ -26,10 +26,6 @@ pub(super) fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
         d.level = level;
         d.proto = proto.into();
         d.info = text.to_owned();
-    } else if level == d.level && text.starts_with("HEADERS") && !d.info.starts_with("HEADERS") {
-        // Requests and responses go first, ahead of SETTINGS and the like,
-        // so a cut-off line still shows them.
-        d.info = format!("{text}, {}", d.info);
     } else if level == d.level {
         d.info.push_str(", ");
         d.info.push_str(text);
@@ -49,7 +45,10 @@ fn register_http(registry: &mut Registry) {
     registry.register_with_buffer(
         "http1",
         |s| {
-            if s.transport == Transport::Tcp && looks_like_http1(s.first) {
+            if s.transport == Transport::Tcp
+                && (s.alpn == Some("http/1.1")
+                    || (s.alpn != Some("h2") && looks_like_http1(s.first)))
+            {
                 Match::Yes
             } else {
                 Match::No
@@ -58,12 +57,13 @@ fn register_http(registry: &mut Registry) {
         MAX_BUFFER + 1 + 65_535,
         |_| protocols::Http1::pair(),
     );
+    let budget = http2::CaptureBudget::default();
     registry.register_with_buffer(
         "http2",
         |s| {
-            if s.transport != Transport::Tcp {
+            if s.transport != Transport::Tcp || s.alpn == Some("http/1.1") {
                 Match::No
-            } else if s.first.starts_with(http2::PREFACE) {
+            } else if s.alpn == Some("h2") || s.first.starts_with(http2::PREFACE) {
                 Match::Yes
             } else if http2::PREFACE.starts_with(s.first) {
                 Match::More
@@ -72,7 +72,7 @@ fn register_http(registry: &mut Registry) {
             }
         },
         http2::CAPTURE_READ_AHEAD,
-        |_| http2::Capture::pair(http2::CAPTURE_DATA_BUDGET),
+        move |_| http2::Capture::pair_in(&budget),
     );
 }
 

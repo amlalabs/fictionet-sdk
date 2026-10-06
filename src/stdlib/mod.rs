@@ -160,7 +160,6 @@ pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
 pub mod hpack;
-/// HTTP/2 frames, directional state, and capture presentation (RFC 9113).
 pub mod http2;
 pub mod http3;
 pub mod huffman;
@@ -200,7 +199,6 @@ pub mod pim;
 pub mod pop3;
 pub mod portmap;
 pub mod postgres;
-/// RFC 7541 prefix integers shared by HPACK and QPACK.
 pub mod prefix_int;
 pub mod protobuf;
 pub mod proxy_protocol;
@@ -227,7 +225,6 @@ pub mod ssh;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
-#[expect(missing_docs, reason = "Reassembly is documented on its public types.")]
 pub mod tcp_stream;
 pub mod tds;
 pub mod telnet;
