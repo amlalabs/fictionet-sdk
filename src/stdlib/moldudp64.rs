@@ -747,6 +747,9 @@ impl Retransmitter {
     /// fit in one packet. `None` when `sequence` is not kept or `count` is 0.
     pub fn packet(&self, sequence: u64, count: u16) -> Option<Downstream> {
         let start = usize::try_from(sequence.checked_sub(self.first)?).ok()?;
+        if start >= self.messages.len() {
+            return None;
+        }
         let mut size = HEADER_LENGTH;
         let mut messages = Vec::new();
         for m in self.messages.range(start..).take(usize::from(count)) {
@@ -1236,6 +1239,15 @@ mod tests {
             }),
             None
         );
+        // A request past the store, from the network, is not kept.
+        assert_eq!(
+            s.answer(&Request {
+                sequence: 8,
+                ..request
+            }),
+            None
+        );
+        assert_eq!(s.packet(u64::MAX, 1), None);
         assert_eq!(
             s.answer(&Request {
                 count: 0,

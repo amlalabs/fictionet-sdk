@@ -1595,7 +1595,7 @@ impl Exchange {
                 cl_ord_id: r.cl_ord_id,
                 order_ref,
                 side: r.options.side().unwrap_or(original.side),
-                options: r.options.clone(),
+                options: inherit(&original.options, &r.options),
                 ..original.clone()
             };
             let reply = OrderReplaced {
@@ -1618,7 +1618,7 @@ impl Exchange {
                     codes::order_state::LIVE
                 },
                 cl_ord_id: order.cl_ord_id,
-                options: order.options.clone(),
+                options: r.options.clone(),
             };
             let original = pending.original;
             self.replaces.remove(&token);
@@ -2078,6 +2078,21 @@ impl Exchange {
         );
         actions
     }
+}
+
+/// A replacement's options: those of the replace, and for a tag it leaves
+/// out, the original order's. SharesLocated and LocateBroker are not
+/// inherited; a replace must give them again (Appendix A, note 2). Firm
+/// and GroupID, which a replace cannot carry, stay the original's (2.2).
+fn inherit(original: &Options, replace: &Options) -> Options {
+    let mut options = replace.clone();
+    for o in &original.0 {
+        let tag = o.tag();
+        if !matches!(tag, 25 | 26) && replace.get(tag).is_none() {
+            options.0.push(o.clone());
+        }
+    }
+    options
 }
 
 /// The appendage of a reply: UserRefIdx for a nonzero channel, else none.
@@ -3122,6 +3137,56 @@ mod tests {
             x.receive(&enter(8, 10, firm("BBBB")).into(), 6),
             [Action::Event(Event::EnterRequested(token(8)))]
         );
+    }
+
+    // A replace cannot carry GroupID or Firm, and tags it leaves out keep
+    // the original's values (2.2, Appendix A note 2), so a mass cancel by
+    // group still finds the replacement.
+    #[test]
+    fn replacement_inherits_options_for_mass_cancel() {
+        let mut x = Exchange::new(ExchangeConfig::default()).unwrap();
+        let options = Options(vec![
+            Opt::GroupId(7),
+            Opt::MinQty(100),
+            Opt::SharesLocated(b'Y'),
+        ]);
+        x.receive(&enter(1, 300, options).into(), 1);
+        x.accept(token(1), 1).unwrap();
+        let replace = ReplaceOrder {
+            orig_user_ref: 1,
+            user_ref: 2,
+            quantity: 300,
+            price: Price(200_000),
+            time_in_force: b'0',
+            display: b'Y',
+            intermarket_sweep: b'N',
+            cl_ord_id: alpha("R"),
+            options: Options::of(Opt::MinQty(200)),
+        };
+        x.receive(&replace.into(), 2);
+        let Outbound::OrderReplaced(r) = x.accept(token(2), 3).unwrap() else {
+            panic!()
+        };
+        // The reply echoes the replace's options.
+        assert_eq!(r.options, Options::of(Opt::MinQty(200)));
+        let kept = &x.order(token(2)).unwrap().options;
+        assert_eq!(kept.get(3), Some(&Opt::MinQty(200)));
+        assert_eq!(kept.group_id(), Some(7));
+        assert_eq!(kept.get(25), None);
+        let out = sends(
+            x.receive(
+                &MassCancel {
+                    user_ref: 3,
+                    firm: Alpha::blank(),
+                    symbol: Alpha::blank(),
+                    options: Options::of(Opt::GroupId(7)),
+                }
+                .into(),
+                4,
+            ),
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(x.orders().count(), 0);
     }
 
     #[test]
