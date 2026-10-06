@@ -36,6 +36,10 @@
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
 //!
+//! Use [`hpack::Decoder`] and [`hpack::Encoder`] for complete HTTP/2 header
+//! blocks. Each direction has its own dynamic table. [`huffman`] supplies
+//! the RFC 7541 string code shared by [`hpack`] and [`qpack`].
+//!
 //! # Three kinds of functions
 //!
 //! Every function in the stdlib is one of three kinds. The kind tells you
@@ -152,7 +156,9 @@ pub mod geneve;
 pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
+pub mod hpack;
 pub mod http3;
+pub mod huffman;
 pub mod icmp;
 pub mod iec104;
 pub mod igmp;

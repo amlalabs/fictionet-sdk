@@ -74,6 +74,8 @@ cargo +nightly fuzz list
 | `postgres` | startup, authentication, and typed messages | `stdlib::postgres`: frontend and backend decoders, wire types, and bounded-allocation codec contracts |
 | `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
+| `hpack` | wire contracts, complete blocks, settings limits, table recovery, and encode/decode round trips | `stdlib::hpack`: HTTP/2 header compression |
+| `huffman` | wire contracts, EOS and padding refusal, byte round trips | `stdlib::huffman`: the RFC 7541 code shared by HPACK and QPACK |
 | `qpack` | wire values, bounded instruction contracts, tables, blocked sections, and acknowledgments | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
 | `quic` | datagram and payload wire contracts, every short-header ID length, and reassembly | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, bounded stream contracts, and strict value and command writers | `stdlib::resp`: RESP, the Redis protocol |

@@ -434,7 +434,6 @@ mod decode;
 mod json;
 mod keys;
 mod packets;
-mod hpack;
 mod pcap;
 mod session;
 mod stream;

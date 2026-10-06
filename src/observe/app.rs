@@ -11,8 +11,9 @@
 use std::collections::VecDeque;
 use std::fmt::Write;
 
+use fictionet::stdlib::hpack;
+
 use super::decode::{Decoded, Layer, be16, be32};
-use super::hpack;
 use crate::watch::KeyLine;
 
 /// Where some bytes of a stream are: from stream offset `stream_start`,
@@ -643,7 +644,6 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
 // ---------------------------------------------------------------------------
 // HTTP/2
 
-#[derive(Default)]
 struct Http2 {
     /// The connection preface has been read (the client's direction).
     started: bool,
@@ -653,6 +653,12 @@ struct Http2 {
     /// Bytes of this direction were lost, so where frames start is not
     /// known: the rest of it is not decoded.
     lost: bool,
+}
+
+impl Default for Http2 {
+    fn default() -> Self {
+        Self { started: false, hpack: hpack::Decoder::for_observation(), block: None, lost: false }
+    }
 }
 
 impl Http2 {
@@ -914,12 +920,15 @@ fn header_block(
         h2.block = Some(pending);
         return;
     }
-    let Some(block) = h2.hpack.decode(bytes, d.room()) else {
+    let Ok(block) = h2.hpack.decode_block(bytes, d.room()) else {
         l.note("Header block", "could not be decoded: it is malformed");
         d.tag("malformed");
         return;
     };
-    let get = |n: &str| block.headers.iter().find(|h| h.name.as_deref() == Some(n)).and_then(|h| h.value.clone());
+    let get = |n: &str| {
+        block.headers.iter().find(|h| h.name.as_deref() == Some(n.as_bytes()))
+            .and_then(|h| h.value.as_deref().map(|v| String::from_utf8_lossy(v).into_owned()))
+    };
     if let Some(status) = get(":status") {
         let _ = write!(text, ": {status}");
     } else if let (Some(m), Some(p)) = (get(":method"), get(":path")) {
@@ -931,8 +940,8 @@ fn header_block(
     const UNKNOWN: &str = "not known: it names a table entry that a header block not decoded may have changed";
     for h in block.headers {
         match (h.name, h.value) {
-            (Some(name), Some(value)) => l.note(&name, value),
-            (None, Some(value)) => l.note("Header", format!("{value} (its name is {UNKNOWN})")),
+            (Some(name), Some(value)) => l.note(&String::from_utf8_lossy(&name), String::from_utf8_lossy(&value)),
+            (None, Some(value)) => l.note("Header", format!("{} (its name is {UNKNOWN})", String::from_utf8_lossy(&value))),
             _ => l.note("Header", UNKNOWN),
         }
     }
