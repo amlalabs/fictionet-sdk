@@ -3,38 +3,12 @@
 //! writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::contract::{check_decode_with_alloc_limit, check_wire, check_wire_value};
 use fictionet::stdlib::mongodb::{
-    Body, Bson, Compressed, Decoder, Document, Frames, Message, MessageError, Msg, Query, Reply, Sequence,
+    Body, Bson, Compressed, Document, Frames, Message, Msg, Query, Reply, Sequence, MAX_MESSAGE_SIZE,
 };
+use fictionet::stdlib::codec::test_support::decode_all;
 use libfuzzer_sys::fuzz_target;
-
-/// Every message the decoder gives, stopping where the stream breaks. It
-/// feeds `chunk` bytes at a time, at most what the decoder takes, and checks
-/// that it never holds more than its capacity.
-fn decode(data: &[u8], chunk: usize, limit: usize) -> Vec<Result<Message, MessageError>> {
-    let mut decoder = Decoder::with_limit(limit);
-    let mut out = Vec::new();
-    for piece in data.chunks(chunk.max(1)) {
-        let mut piece = piece;
-        while !piece.is_empty() {
-            let took = decoder.feed(piece);
-            assert!(decoder.buffered() <= decoder.capacity());
-            piece = &piece[took..];
-            let mut got = false;
-            while let Some(m) = decoder.next_message() {
-                got = true;
-                out.push(m);
-                if decoder.failed().is_some() {
-                    return out;
-                }
-            }
-            // A full decoder always gives a message or an error.
-            assert!(took > 0 || got);
-        }
-    }
-    out
-}
 
 /// Bytes taken one at a time from the input, then zeros.
 struct Bytes<'a>(&'a [u8]);
@@ -114,43 +88,14 @@ fn message(b: &mut Bytes<'_>) -> Message {
 }
 
 fuzz_target!(|data: &[u8]| {
-    check_decode(Frames::new, data);
-    check_decode(|| Frames::with_limit(64), data);
+    check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE_SIZE);
+    check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 128);
     check_wire::<Message>(data);
-
-    // The stream, split three ways: all at once, a byte at a time, and
-    // through a decoder with a small limit.
-    let messages = decode(data, data.len(), usize::MAX);
-    assert_eq!(messages, decode(data, 1, usize::MAX));
-    let small = decode(data, 7, 64);
-    assert!(small.len() <= messages.len() + 1);
-
-    for m in messages.into_iter().flatten() {
-        // A message read can be written, and reads back the same. Inputs
-        // here are far below the size limits, so writing cannot fail.
-        let bytes = m.to_bytes().unwrap();
-        check_wire::<Message>(&bytes);
-        let (back, used) = Message::parse(&bytes).unwrap().unwrap();
-        assert_eq!(back, m);
-        assert_eq!(used, bytes.len());
+    check_wire::<Document>(data);
+    for message in decode_all(Frames::new, data).0.into_iter().flatten() {
+        check_wire_value(&message);
     }
-    // Any bytes as a BSON document on their own.
-    if let Ok((doc, used)) = Document::parse(data) {
-        assert!(used <= data.len());
-        let bytes = doc.to_bytes().unwrap();
-        assert_eq!(Document::parse(&bytes).unwrap(), (doc, bytes.len()));
-    }
-    // Values built from the bytes, not read: whatever a writer accepts
-    // reads back the same.
-    let mut b = Bytes(data);
-    let doc = document(&mut b, 4);
-    if let Ok(bytes) = doc.to_bytes() {
-        assert_eq!(Document::parse(&bytes).unwrap(), (doc, bytes.len()));
-    }
-    let m = message(&mut b);
-    check_wire_value(&m);
-    if let Ok(bytes) = m.to_bytes() {
-        check_decode(Frames::new, &bytes);
-        assert_eq!(Message::parse(&bytes).unwrap(), Some((m, bytes.len())));
-    }
+    let mut bytes = Bytes(data);
+    check_wire_value(&document(&mut bytes, 4));
+    check_wire_value(&message(&mut bytes));
 });

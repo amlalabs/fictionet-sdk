@@ -11,9 +11,9 @@
 //! answers with an OP_REPLY. This module follows the MongoDB Wire Protocol
 //! reference and the BSON 1.1 specification at bsonspec.org.
 //!
-//! Nothing here reads a socket. A world that plays a database server feeds
-//! the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Decoder`], gets [`Message`]s back, reads each one's command document,
+//! A world that plays a database server passes bytes from a
+//! [`tcp`](crate::stdlib::tcp) connection to
+//! [`Stream<Frames>`](super::codec::Stream), reads each message's command document,
 //! and writes the reply's bytes back to the connection. Which databases
 //! and collections exist, and what they hold, is up to world code.
 //!
@@ -21,22 +21,15 @@
 //! send any bytes it likes. Documents nest at most [`MAX_DEPTH`] deep and
 //! hold at most [`MAX_DOCUMENT_SIZE`] bytes ([`MAX_COMMAND_SIZE`] for a
 //! command or reply document in a message), and a message holds at most
-//! [`MAX_MESSAGE_SIZE`] bytes. A [`Decoder`] holds at most one message's
+//! [`MAX_MESSAGE_SIZE`] bytes. The stream holds at most one message's
 //! bytes. OP_MSG checksums (CRC-32C) are checked and
 //! written. Compressed messages (OP_COMPRESSED) are reported with their
 //! compressor and bytes, not decompressed. Every writer checks the same
 //! limits, so what it writes always reads back.
 //!
-//! New stacks use [`Frames`] with [`codec::Stream`](super::codec::Stream).
-//! Body errors are per-message items; the frame is consumed and reading
-//! continues. Only invalid lengths and unknown OP_MSG section kinds end
-//! the stream, with the error reported once. Partial frames at EOF are
-//! reported as truncation. [`Decoder`] keeps its repeated terminal errors.
-//! [`Wire`] parses exactly one [`Message`] and writes it transactionally.
-//! The inherent [`Message::parse`] still accepts a prefix.
-//!
 //! ```
-//! use fictionet::stdlib::mongodb::{Body, Bson, Decoder, Document, Message, Msg, Reply};
+//! use fictionet::stdlib::mongodb::{Body, Bson, Frames, Document, Message, Msg, Reply};
+//! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! /// Answers the handshake and `ping`, and nothing else.
 //! fn answer(request: &Message, next_id: i32) -> Message {
@@ -64,22 +57,21 @@
 //! assert_eq!(bytes.len(), 16 + 4 + 1 + 30);
 //! assert_eq!(bytes[12..16], [0xdd, 0x07, 0, 0]); // op code 2013, OP_MSG
 //!
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(Frames::new());
 //! for b in &bytes {
-//!     decoder.feed(std::slice::from_ref(b));
+//!     assert_eq!(stream.push(std::slice::from_ref(b)), 1);
 //! }
-//! let request = decoder.next_message().unwrap().unwrap();
+//! let request = stream.next().unwrap().unwrap().unwrap();
 //! let reply = answer(&request, 1);
 //! assert_eq!(reply.response_to, 7);
 //!
 //! let out = reply.to_bytes().unwrap();
-//! let (back, used) = Message::parse(&out).unwrap().unwrap();
-//! assert_eq!(used, out.len());
+//! let back = Message::parse(&out).unwrap();
 //! let Body::Msg(m) = back.body else { panic!("not an OP_MSG") };
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use crate::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port MongoDB servers listen on.
 pub const PORT: u16 = 27017;
@@ -158,27 +150,47 @@ pub mod flag {
 
 /// The type bytes of BSON elements.
 pub mod element_type {
-    #![allow(missing_docs)]
+    /// BSON double type.
     pub const DOUBLE: u8 = 0x01;
+    /// BSON string type.
     pub const STRING: u8 = 0x02;
+    /// BSON document type.
     pub const DOCUMENT: u8 = 0x03;
+    /// BSON array type.
     pub const ARRAY: u8 = 0x04;
+    /// BSON binary type.
     pub const BINARY: u8 = 0x05;
+    /// BSON undefined type.
     pub const UNDEFINED: u8 = 0x06;
+    /// BSON object id type.
     pub const OBJECT_ID: u8 = 0x07;
+    /// BSON boolean type.
     pub const BOOLEAN: u8 = 0x08;
+    /// BSON date time type.
     pub const DATE_TIME: u8 = 0x09;
+    /// BSON null type.
     pub const NULL: u8 = 0x0a;
+    /// BSON regex type.
     pub const REGEX: u8 = 0x0b;
+    /// BSON db pointer type.
     pub const DB_POINTER: u8 = 0x0c;
+    /// BSON javascript type.
     pub const JAVASCRIPT: u8 = 0x0d;
+    /// BSON symbol type.
     pub const SYMBOL: u8 = 0x0e;
+    /// BSON javascript with scope type.
     pub const JAVASCRIPT_WITH_SCOPE: u8 = 0x0f;
+    /// BSON int32 type.
     pub const INT32: u8 = 0x10;
+    /// BSON timestamp type.
     pub const TIMESTAMP: u8 = 0x11;
+    /// BSON int64 type.
     pub const INT64: u8 = 0x12;
+    /// BSON decimal128 type.
     pub const DECIMAL128: u8 = 0x13;
+    /// BSON min key type.
     pub const MIN_KEY: u8 = 0xff;
+    /// BSON max key type.
     pub const MAX_KEY: u8 = 0x7f;
 }
 
@@ -219,7 +231,7 @@ pub enum Bson {
         /// The bytes.
         bytes: Vec<u8>,
     },
-    /// Undefined. Deprecated.
+    /// Undefined. A historical BSON wire type.
     Undefined,
     /// A 12-byte ObjectId.
     ObjectId([u8; 12]),
@@ -237,7 +249,7 @@ pub enum Bson {
         /// The options, such as "i" or "ms".
         options: String,
     },
-    /// A reference to a document in another collection. Deprecated.
+    /// A reference to a document in another collection. A historical BSON wire type.
     DbPointer {
         /// The collection's namespace.
         namespace: String,
@@ -246,9 +258,9 @@ pub enum Bson {
     },
     /// JavaScript code.
     JavaScript(String),
-    /// A symbol. Deprecated.
+    /// A symbol. A historical BSON wire type.
     Symbol(String),
-    /// JavaScript code and the variables in scope for it. Deprecated.
+    /// JavaScript code and the variables in scope for it. A historical BSON wire type.
     JavaScriptWithScope {
         /// The code.
         code: String,
@@ -396,13 +408,18 @@ impl Bson {
 /// A BSON document: keys and values, in the order they were written. Keys
 /// may repeat, as they may on the wire. A key may not hold a zero byte.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Document(pub Vec<(String, Bson)>);
+pub struct Document(
+    /// Elements in wire order.
+    pub Vec<(String, Bson)>,
+);
 
 /// Why bytes are not a BSON document, or why a document cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BsonError {
     /// A length or a value runs past the bytes there are.
     Truncated,
+    /// Bytes remain after the document.
+    Trailing,
     /// A length field is out of range: a document under 5 bytes or over
     /// its limit ([`MAX_DOCUMENT_SIZE`], or [`MAX_COMMAND_SIZE`] for a
     /// command document in a message), a string under 1 byte, a negative binary
@@ -422,15 +439,8 @@ pub enum BsonError {
     Depth,
     /// More elements than [`MAX_ELEMENTS`].
     TooManyElements,
-    /// For a writer: a document would be larger than its limit
-    /// ([`MAX_DOCUMENT_SIZE`], or [`MAX_COMMAND_SIZE`] for a command
-    /// document in a message). The number is a size the document would
-    /// reach at least. A writer stops as soon as it knows, so it never
-    /// holds much more than one document's limit.
-    TooLarge(usize),
-    /// For a writer: a key, regex part, collection name or sequence
-    /// identifier holds a zero byte, which would end it early.
-    Nul,
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// An array's keys are not "0", "1", "2" and so on, in order.
     ArrayKey,
     /// Binary data of the old subtype 2 does not start with a 4-byte
@@ -443,6 +453,8 @@ pub enum BsonError {
 impl std::fmt::Display for BsonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BsonError::Unwritable => f.write_str("value cannot be written as given"),
+            BsonError::Trailing => f.write_str("bytes after BSON document"),
             BsonError::Truncated => f.write_str("BSON runs past the end of its bytes"),
             BsonError::Length(n) => write!(f, "BSON length field {n} out of range"),
             BsonError::Terminator => f.write_str("BSON document, string or name not terminated"),
@@ -451,8 +463,6 @@ impl std::fmt::Display for BsonError {
             BsonError::Bool(b) => write!(f, "BSON boolean byte {b}, not 0 or 1"),
             BsonError::Depth => write!(f, "BSON nests deeper than {MAX_DEPTH}"),
             BsonError::TooManyElements => write!(f, "more than {MAX_ELEMENTS} BSON elements"),
-            BsonError::TooLarge(n) => write!(f, "BSON document of at least {n} bytes, over its limit"),
-            BsonError::Nul => f.write_str("a BSON name holds a zero byte"),
             BsonError::ArrayKey => f.write_str("BSON array keys are not 0, 1, 2 and so on"),
             BsonError::OldBinary => f.write_str("BSON binary subtype 2 length does not match its bytes"),
             BsonError::RegexOptions => f.write_str("BSON regex options are not in alphabetical order"),
@@ -509,20 +519,32 @@ impl Document {
         self.0.is_empty()
     }
 
-    /// Reads the document at the start of `b`, and how many bytes it took.
-    /// Bytes after it are left alone.
-    pub fn parse(b: &[u8]) -> Result<(Document, usize), BsonError> {
+}
+
+impl Wire for Document {
+    type ParseError = BsonError;
+    type WriteError = BsonError;
+
+    /// Reads one BSON document. Refuses trailing bytes, invalid elements,
+    /// and documents beyond the size, nesting, or element limits.
+    fn parse(b: &[u8]) -> Result<Self, BsonError> {
         let mut budget = MAX_ELEMENTS;
-        parse_document(b, 1, MAX_DOCUMENT_SIZE, &mut budget)
+        let (doc, used) = parse_document(b, 1, MAX_DOCUMENT_SIZE, &mut budget)?;
+        if used != b.len() { return Err(BsonError::Trailing); }
+        Ok(doc)
     }
 
-    /// The document's bytes. It fails if the document breaks a limit this
-    /// module's reader enforces, or holds a key or regex with a zero byte.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, BsonError> {
-        let mut out = Vec::new();
+    /// Appends a document. Refuses invalid binary lengths, regex options,
+    /// zero bytes in names, and values beyond the reader's limits.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), BsonError> {
+        let start = out.len();
         let mut budget = MAX_ELEMENTS;
-        write_top(self, MAX_DOCUMENT_SIZE, &mut budget, &mut out)?;
-        Ok(out)
+        if write_top(self, MAX_DOCUMENT_SIZE, &mut budget, out).is_err() {
+            out.truncate(start);
+            return Err(BsonError::Unwritable);
+        }
+        Ok(())
     }
 }
 
@@ -732,7 +754,7 @@ impl Limit {
     /// Fails if adding `n` bytes to `out` would pass the end.
     fn room(self, out: &[u8], n: usize) -> Result<(), BsonError> {
         let at = out.len().saturating_add(n);
-        if at > self.end { Err(BsonError::TooLarge(at - (self.end - self.max))) } else { Ok(()) }
+        if at > self.end { Err(BsonError::Unwritable) } else { Ok(()) }
     }
 }
 
@@ -777,7 +799,7 @@ fn write_elements<'a, K: AsRef<str>>(
         // The trailing zero is still to come.
         let len = out.len() - start + 1;
         if len > limit.max {
-            return Err(BsonError::TooLarge(len));
+            return Err(BsonError::Unwritable);
         }
         limit.room(out, 1)?;
     }
@@ -833,7 +855,7 @@ fn write_value(
             write_document(scope, next, limit, budget, out)?;
             let total = out.len() - start;
             if total > limit.max {
-                return Err(BsonError::TooLarge(total));
+                return Err(BsonError::Unwritable);
             }
             out[start..start + 4].copy_from_slice(&(total as i32).to_le_bytes());
         }
@@ -895,7 +917,7 @@ fn write_string(s: &str, limit: Limit, out: &mut Vec<u8>) -> Result<(), BsonErro
 /// first: a document's, or the message's.
 fn write_cstring(s: &str, out: &mut Vec<u8>) -> Result<(), BsonError> {
     if s.as_bytes().contains(&0) {
-        return Err(BsonError::Nul);
+        return Err(BsonError::Unwritable);
     }
     out.extend_from_slice(s.as_bytes());
     out.push(0);
@@ -941,12 +963,26 @@ pub struct Header {
     pub op_code: i32,
 }
 
-impl Header {
-    /// Reads the header at the start of `b`, if all 16 bytes are there.
-    /// It does not check the fields.
-    pub fn parse(b: &[u8]) -> Option<Header> {
+impl Wire for Header {
+    type ParseError = MessageError;
+    type WriteError = std::convert::Infallible;
+
+    /// Reads exactly 16 header bytes. Refuses incomplete or trailing bytes.
+    /// Field values are left unchecked until the complete message is read.
+    fn parse(b: &[u8]) -> Result<Self, MessageError> {
+        if b.len() > HEADER_LEN { return Err(MessageError::Trailing); }
         let mut r = Reader::new(b);
-        Some(Header { length: r.i32()?, request_id: r.i32()?, response_to: r.i32()?, op_code: r.i32()? })
+        let e = MessageError::Truncated;
+        Ok(Header { length: r.i32().ok_or(e)?, request_id: r.i32().ok_or(e)?,
+            response_to: r.i32().ok_or(e)?, op_code: r.i32().ok_or(e)? })
+    }
+
+    /// Appends the four header fields without refusing any field value.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+        for field in [self.length, self.request_id, self.response_to, self.op_code] {
+            out.extend_from_slice(&field.to_le_bytes());
+        }
+        Ok(())
     }
 }
 
@@ -1110,8 +1146,8 @@ pub enum MessageError {
     /// An OP_MSG section kind other than 0 or 1. This includes kind 2,
     /// which only servers use among themselves, and kind 3, telemetry a
     /// client sends only to a server that says it takes it. The OP_MSG
-    /// specification says the connection must then be closed, so both
-    /// [`Frames`] and [`Decoder`] stop here for good.
+    /// specification says the connection must then be closed, so [`Frames`]
+    /// stops here for good.
     SectionKind(u8),
     /// An OP_MSG has this many body sections, not exactly one.
     BodyCount(usize),
@@ -1130,11 +1166,8 @@ pub enum MessageError {
     NumberReturned(i32),
     /// More documents than [`MAX_DOCUMENTS`].
     TooManyDocuments,
-    /// For a writer: [`Body::Other`] with an op code another variant
-    /// stands for.
-    OpCode(i32),
-    /// For a writer: the message would be larger than [`MAX_MESSAGE_SIZE`].
-    TooLarge(usize),
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// Two OP_MSG document sequences share an identifier.
     DuplicateIdentifier,
     /// An OP_MSG body has two top-level fields with the same name, or a
@@ -1151,6 +1184,7 @@ pub enum MessageError {
 impl std::fmt::Display for MessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            MessageError::Unwritable => f.write_str("value cannot be written as given"),
             MessageError::Length(n) => write!(f, "message length {n} out of range"),
             MessageError::Truncated => f.write_str("a field runs past the end of the message"),
             MessageError::Trailing => f.write_str("bytes left at the end of the message"),
@@ -1164,8 +1198,6 @@ impl std::fmt::Display for MessageError {
             }
             MessageError::NumberReturned(n) => write!(f, "OP_REPLY says {n} documents, which does not match"),
             MessageError::TooManyDocuments => write!(f, "more than {MAX_DOCUMENTS} documents in one message"),
-            MessageError::OpCode(op) => write!(f, "op code {op} needs its own body, not raw bytes"),
-            MessageError::TooLarge(n) => write!(f, "message of {n} bytes, over {MAX_MESSAGE_SIZE}"),
             MessageError::DuplicateIdentifier => f.write_str("two OP_MSG document sequences share an identifier"),
             MessageError::TooManySequences => write!(f, "more than {MAX_SEQUENCES} OP_MSG document sequences"),
             MessageError::DuplicateField => f.write_str("an OP_MSG body field is given twice"),
@@ -1195,16 +1227,9 @@ fn frame_len(b: &[u8], max: usize) -> Result<Option<usize>, MessageError> {
 }
 
 impl Message {
-    /// Reads the message at the start of `b`. It returns `Ok(None)` if `b`
-    /// holds only part of one, and otherwise the message and how many bytes
-    /// of `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Message, usize)>, MessageError> {
-        parse_message(b, MAX_MESSAGE_SIZE)
-    }
-
     /// Reads one whole message, whose length field is already checked.
     fn from_frame(frame: &[u8]) -> Result<Message, MessageError> {
-        let header = Header::parse(frame).ok_or(MessageError::Truncated)?;
+        let header = Header::parse(frame.get(..HEADER_LEN).ok_or(MessageError::Truncated)?)?;
         let data = &frame[HEADER_LEN..];
         let body = match header.op_code {
             op_code::MSG => Body::Msg(parse_msg(frame, data)?),
@@ -1225,10 +1250,40 @@ impl Message {
         Ok(Message { request_id: header.request_id, response_to: header.response_to, body })
     }
 
-    /// The message's bytes. It fails if a document or name cannot be
-    /// written, the message breaks a limit, or a [`Body::Other`] uses an op
-    /// code another variant stands for.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, MessageError> {
+    /// A message that answers this one with `body`, with `request_id` as
+    /// its own ID.
+    pub fn reply(&self, request_id: i32, body: Body) -> Message {
+        Message { request_id, response_to: self.request_id, body }
+    }
+}
+
+// Only complete, bounded messages reach the body parser.
+fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, MessageError> {
+    let Some(len) = frame_len(b, limit)? else { return Ok(None) };
+    let frame = b.get(..len).ok_or(MessageError::Truncated)?;
+    Ok(Some((Message::from_frame(frame)?, len)))
+}
+
+impl Wire for Message {
+    type ParseError = MessageError;
+    type WriteError = MessageError;
+
+    /// Reads exactly one message, bounded by [`MAX_MESSAGE_SIZE`].
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, MessageError> {
+        match parse_message(b, MAX_MESSAGE_SIZE)? {
+            Some((message, used)) if used == b.len() => Ok(message),
+            Some(_) => Err(MessageError::Trailing),
+            None => Err(MessageError::Truncated),
+        }
+    }
+
+    /// Appends a message. Refuses invalid BSON or names, unknown flags,
+    /// conflicting op codes, invalid compressed sizes, duplicate fields,
+    /// and values beyond the message limits. Leaves `destination` unchanged
+    /// on error. Computes OP_MSG checksums from the completed message.
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), MessageError> {
+        let bytes = (|| -> Result<Vec<u8>, MessageError> {
         let mut out = Vec::new();
         out.extend_from_slice(&[0; 4]);
         out.extend_from_slice(&self.request_id.to_le_bytes());
@@ -1278,7 +1333,7 @@ impl Message {
             }
             Body::Other { op_code, data } => {
                 if matches!(*op_code, op_code::MSG | op_code::QUERY | op_code::REPLY | op_code::COMPRESSED) {
-                    return Err(MessageError::OpCode(*op_code));
+                    return Err(MessageError::Unwritable);
                 }
                 check_size(HEADER_LEN + data.len())?;
                 out.extend_from_slice(data);
@@ -1293,40 +1348,8 @@ impl Message {
             out.extend_from_slice(&crc.to_le_bytes());
         }
         Ok(out)
-    }
-
-    /// A message that answers this one with `body`, with `request_id` as
-    /// its own ID.
-    pub fn reply(&self, request_id: i32, body: Body) -> Message {
-        Message { request_id, response_to: self.request_id, body }
-    }
-}
-
-// Only complete, bounded messages reach the body parser.
-fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, MessageError> {
-    let Some(len) = frame_len(b, limit)? else { return Ok(None) };
-    let frame = b.get(..len).ok_or(MessageError::Truncated)?;
-    Ok(Some((Message::from_frame(frame)?, len)))
-}
-
-impl Wire for Message {
-    type ParseError = MessageError;
-    type WriteError = MessageError;
-
-    /// Reads exactly one message, bounded by [`MAX_MESSAGE_SIZE`].
-    /// Incomplete input and trailing bytes are errors.
-    fn parse(b: &[u8]) -> Result<Self, MessageError> {
-        match Message::parse(b)? {
-            Some((message, used)) if used == b.len() => Ok(message),
-            Some(_) => Err(MessageError::Trailing),
-            None => Err(MessageError::Truncated),
-        }
-    }
-
-    /// Appends at most [`MAX_MESSAGE_SIZE`] bytes. Leaves `out` unchanged
-    /// on error. The existing writer validates BSON, flags, and checksums.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageError> {
-        out.extend_from_slice(&self.to_bytes()?);
+        })().map_err(|_| MessageError::Unwritable)?;
+        destination.extend_from_slice(&bytes);
         Ok(())
     }
 }
@@ -1341,7 +1364,7 @@ impl Wire for Message {
 /// Items are `Result<Message, MessageError>`. A body error consumes its
 /// frame and is returned as an error item, so the next message can still
 /// be read. Only [`MessageError::Length`] from the length field and
-/// [`MessageError::SectionKind`] end the stream, as with [`Decoder`].
+/// [`MessageError::SectionKind`] end the stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
     limit: usize,
@@ -1393,7 +1416,7 @@ impl Decode for Frames {
 }
 
 fn check_size(len: usize) -> Result<(), MessageError> {
-    if len > MAX_MESSAGE_SIZE { Err(MessageError::TooLarge(len)) } else { Ok(()) }
+    if len > MAX_MESSAGE_SIZE { Err(MessageError::Unwritable) } else { Ok(()) }
 }
 
 /// An OP_COMPRESSED size names the bytes of a message after its header,
@@ -1596,112 +1619,10 @@ fn parse_reply(data: &[u8]) -> Result<Reply, MessageError> {
     Ok(Reply { flags, cursor_id, starting_from, documents })
 }
 
-/// Splits a MongoDB byte stream into messages. Feed it the bytes a
-/// connection reads, in order, and take messages out until it has none.
-#[derive(Clone, Debug)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small messages costs time in proportion to their bytes.
-    start: usize,
-    max: usize,
-    failed: Option<MessageError>,
-}
-
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder::new()
-    }
-}
-
-impl Decoder {
-    /// A decoder holding no bytes, taking messages up to
-    /// [`MAX_MESSAGE_SIZE`].
-    pub fn new() -> Decoder {
-        Decoder { buf: Vec::new(), start: 0, max: MAX_MESSAGE_SIZE, failed: None }
-    }
-
-    /// A decoder taking messages up to `max` bytes, header included. `max`
-    /// is held between [`HEADER_LEN`] and [`MAX_MESSAGE_SIZE`].
-    pub fn with_limit(max: usize) -> Decoder {
-        Decoder { max: max.clamp(HEADER_LEN, MAX_MESSAGE_SIZE), ..Decoder::new() }
-    }
-
-    /// Adds bytes read from the connection and returns how many it took.
-    /// It holds at most [`Decoder::capacity`] bytes not yet taken out, so
-    /// it may take fewer than it is given. Take messages out with
-    /// [`Decoder::next_message`], then feed it the rest; once it is full,
-    /// `next_message` always gives a message or an error. After the stream
-    /// breaks, every byte is taken and dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The most bytes the decoder holds that have not been taken out: one
-    /// message of the largest size it takes.
-    pub fn capacity(&self) -> usize {
-        self.max
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes. A message whose length is fine but whose body is
-    /// not is taken out and returned as an error, and the stream goes on,
-    /// except after an unknown OP_MSG section kind
-    /// ([`MessageError::SectionKind`]), when the connection must be closed.
-    /// That error and a bad length break the stream: the decoder keeps
-    /// returning the same error, and [`Decoder::failed`] gives it.
-    pub fn next_message(&mut self) -> Option<Result<Message, MessageError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let rest = &self.buf[self.start..];
-        let result = match frame_len(rest, self.max) {
-            Ok(Some(len)) => {
-                let message = Message::from_frame(&rest[..len]);
-                self.start += len;
-                if self.start == self.buf.len() {
-                    // Nothing is left: let go of a large buffer.
-                    self.buf.clear();
-                    self.buf.shrink_to(64 * 1024);
-                    self.start = 0;
-                }
-                message
-            }
-            Ok(None) => return None,
-            Err(e) => Err(e),
-        };
-        if let Err(e @ (MessageError::Length(_) | MessageError::SectionKind(_))) = result {
-            self.failed = Some(e);
-            self.buf = Vec::new();
-            self.start = 0;
-        }
-        Some(result)
-    }
-
-    /// The error that broke the stream, if one has.
-    pub fn failed(&self) -> Option<MessageError> {
-        self.failed
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn s(v: &str) -> Bson {
         Bson::String(v.to_owned())
@@ -1749,7 +1670,7 @@ mod tests {
         let bytes = b"\x16\x00\x00\x00\x02hello\x00\x06\x00\x00\x00world\x00\x00";
         let doc = Document::new().with("hello", s("world"));
         assert_eq!(doc.to_bytes().unwrap(), bytes);
-        assert_eq!(Document::parse(bytes).unwrap(), (doc, 22));
+        assert_eq!(Document::parse(bytes).unwrap(), doc);
     }
 
     #[test]
@@ -1758,21 +1679,21 @@ mod tests {
             \x011\x00\x33\x33\x33\x33\x33\x33\x14\x40\x102\x00\xc2\x07\x00\x00\x00\x00";
         let doc = Document::new().with("BSON", Bson::Array(vec![s("awesome"), Bson::Double(5.05), Bson::Int32(1986)]));
         assert_eq!(doc.to_bytes().unwrap(), bytes);
-        assert_eq!(Document::parse(bytes).unwrap(), (doc, 49));
+        assert_eq!(Document::parse(bytes).unwrap(), doc);
     }
 
     #[test]
     fn empty_document() {
         assert_eq!(Document::new().to_bytes().unwrap(), [5, 0, 0, 0, 0]);
-        assert_eq!(Document::parse(&[5, 0, 0, 0, 0, 9]).unwrap(), (Document::new(), 5));
+        assert_eq!(Document::parse(&[5, 0, 0, 0, 0, 9]), Err(BsonError::Trailing));
+        assert_eq!(Document::parse(&[5, 0, 0, 0, 0]), Ok(Document::new()));
     }
 
     #[test]
     fn every_type_round_trips() {
         let doc = every_type();
         let bytes = doc.to_bytes().unwrap();
-        let (back, used) = Document::parse(&bytes).unwrap();
-        assert_eq!(used, bytes.len());
+        let back = Document::parse(&bytes).unwrap();
         assert_eq!(back, doc);
         assert_eq!(back.get("i64"), Some(&Bson::Int64(i64::MAX)));
         assert_eq!(back.get("missing"), None);
@@ -1802,7 +1723,7 @@ mod tests {
         // bsonspec.org: array keys are integers, starting at 0 and
         // continuing in order.
         let good = Document::new().with("0", Bson::Int32(1)).with("1", Bson::Int32(2));
-        let (doc, _) = Document::parse(&array_of(&good)).unwrap();
+        let doc = Document::parse(&array_of(&good)).unwrap();
         assert_eq!(doc, Document::new().with("a", Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])));
         for bad in [
             Document::new().with("x", Bson::Int32(1)),
@@ -1820,10 +1741,10 @@ mod tests {
         // Subtype 2: the bytes are an int32 and that many bytes.
         let good = Bson::Binary { subtype: 2, bytes: vec![2, 0, 0, 0, 7, 8] };
         let doc = Document::new().with("b", good);
-        assert_eq!(Document::parse(&doc.to_bytes().unwrap()).unwrap().0, doc);
+        assert_eq!(Document::parse(&doc.to_bytes().unwrap()).unwrap(), doc);
         for bytes in [vec![], vec![1, 0, 0], vec![3, 0, 0, 0, 7, 8], vec![0xff, 0xff, 0xff, 0xff]] {
             let bad = Document::new().with("b", Bson::Binary { subtype: 2, bytes: bytes.clone() });
-            assert_eq!(bad.to_bytes(), Err(BsonError::OldBinary), "{bytes:?}");
+            assert_eq!(bad.to_bytes(), Err(BsonError::Unwritable), "{bytes:?}");
             let mut inner = vec![element_type::BINARY, b'b', 0];
             inner.extend_from_slice(&(bytes.len() as i32).to_le_bytes());
             inner.push(2);
@@ -1837,10 +1758,10 @@ mod tests {
         let re = |o: &str| Document::new().with("r", Bson::Regex { pattern: "a".into(), options: o.into() });
         for ok in ["", "i", "ilmsux", "mx"] {
             let doc = re(ok);
-            assert_eq!(Document::parse(&doc.to_bytes().unwrap()).unwrap().0, doc);
+            assert_eq!(Document::parse(&doc.to_bytes().unwrap()).unwrap(), doc);
         }
         for bad in ["mi", "ii", "xs"] {
-            assert_eq!(re(bad).to_bytes(), Err(BsonError::RegexOptions), "{bad}");
+            assert_eq!(re(bad).to_bytes(), Err(BsonError::Unwritable), "{bad}");
             let mut inner = vec![element_type::REGEX, b'r', 0, b'a', 0];
             inner.extend_from_slice(bad.as_bytes());
             inner.push(0);
@@ -1854,7 +1775,7 @@ mod tests {
         let mut m = Msg::new(Document::new());
         m.sequences = vec![seq("documents"), seq("documents")];
         let bad = Message { request_id: 0, response_to: 0, body: Body::Msg(m) };
-        assert_eq!(bad.to_bytes(), Err(MessageError::DuplicateIdentifier));
+        assert_eq!(bad.to_bytes(), Err(MessageError::Unwritable));
         // The same by hand.
         let mut d = 0u32.to_le_bytes().to_vec();
         d.extend_from_slice(&[0, 5, 0, 0, 0, 0]);
@@ -1871,7 +1792,7 @@ mod tests {
         let mut m = Msg::new(Document::new());
         m.sequences = ids.iter().map(|id| Sequence { identifier: id.clone(), documents: vec![] }).collect();
         let bad = Message { request_id: 0, response_to: 0, body: Body::Msg(m.clone()) };
-        assert_eq!(bad.to_bytes(), Err(MessageError::TooManySequences));
+        assert_eq!(bad.to_bytes(), Err(MessageError::Unwritable));
         // The same by hand, and one fewer reads.
         let mut d = 0u32.to_le_bytes().to_vec();
         d.extend_from_slice(&[0, 5, 0, 0, 0, 0]);
@@ -1885,7 +1806,7 @@ mod tests {
         m.sequences.pop();
         let ok = Message { request_id: 0, response_to: 0, body: Body::Msg(m) };
         let bytes = ok.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, ok);
+        assert_eq!(Message::parse(&bytes).unwrap(), ok);
     }
 
     #[test]
@@ -1952,8 +1873,8 @@ mod tests {
     fn depth_limit() {
         let ok = nested(MAX_DEPTH);
         let bytes = ok.to_bytes().unwrap();
-        assert_eq!(Document::parse(&bytes).unwrap().0, ok);
-        assert_eq!(nested(MAX_DEPTH + 1).to_bytes(), Err(BsonError::Depth));
+        assert_eq!(Document::parse(&bytes).unwrap(), ok);
+        assert_eq!(nested(MAX_DEPTH + 1).to_bytes(), Err(BsonError::Unwritable));
         // The same, built by hand: one more level around the bytes above.
         let mut inner = vec![3, b'd', 0];
         inner.extend_from_slice(&bytes);
@@ -1963,13 +1884,13 @@ mod tests {
         for _ in 0..MAX_DEPTH {
             v = Bson::Array(vec![v]);
         }
-        assert_eq!(Document::new().with("a", v).to_bytes(), Err(BsonError::Depth));
+        assert_eq!(Document::new().with("a", v).to_bytes(), Err(BsonError::Unwritable));
     }
 
     #[test]
     fn element_limit() {
         let many = Document::new().with("a", Bson::Array(vec![Bson::Null; MAX_ELEMENTS]));
-        assert_eq!(many.to_bytes(), Err(BsonError::TooManyElements));
+        assert_eq!(many.to_bytes(), Err(BsonError::Unwritable));
         // MAX_ELEMENTS + 1 nulls with empty keys.
         let mut inner = Vec::with_capacity(2 * (MAX_ELEMENTS + 1));
         for _ in 0..=MAX_ELEMENTS {
@@ -1977,27 +1898,27 @@ mod tests {
         }
         assert_eq!(Document::parse(&raw(&inner)), Err(BsonError::TooManyElements));
         inner.truncate(2 * MAX_ELEMENTS);
-        assert_eq!(Document::parse(&raw(&inner)).unwrap().0.len(), MAX_ELEMENTS);
+        assert_eq!(Document::parse(&raw(&inner)).unwrap().len(), MAX_ELEMENTS);
     }
 
     #[test]
     fn writers_refuse_what_readers_refuse() {
         let huge = "x".repeat(MAX_DOCUMENT_SIZE);
-        assert!(matches!(Document::new().with("s", s(&huge)).to_bytes(), Err(BsonError::TooLarge(_))));
+        assert!(matches!(Document::new().with("s", s(&huge)).to_bytes(), Err(BsonError::Unwritable)));
         let half = "x".repeat(MAX_DOCUMENT_SIZE / 2);
         let two = Document::new().with("a", s(&half)).with("b", s(&half));
-        assert!(matches!(two.to_bytes(), Err(BsonError::TooLarge(_))));
+        assert!(matches!(two.to_bytes(), Err(BsonError::Unwritable)));
         let bin = Bson::Binary { subtype: 0, bytes: vec![0; MAX_DOCUMENT_SIZE] };
-        assert!(matches!(Document::new().with("b", bin).to_bytes(), Err(BsonError::TooLarge(_))));
-        assert_eq!(Document::new().with("a\0b", Bson::Null).to_bytes(), Err(BsonError::Nul));
+        assert!(matches!(Document::new().with("b", bin).to_bytes(), Err(BsonError::Unwritable)));
+        assert_eq!(Document::new().with("a\0b", Bson::Null).to_bytes(), Err(BsonError::Unwritable));
         let re = Bson::Regex { pattern: "a\0".into(), options: String::new() };
-        assert_eq!(Document::new().with("r", re).to_bytes(), Err(BsonError::Nul));
+        assert_eq!(Document::new().with("r", re).to_bytes(), Err(BsonError::Unwritable));
         // The largest document a writer allows reads back.
         let fits = "x".repeat(MAX_DOCUMENT_SIZE - 4 - 3 - 4 - 1 - 1);
         let doc = Document::new().with("s", s(&fits));
         let bytes = doc.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_DOCUMENT_SIZE);
-        assert_eq!(Document::parse(&bytes).unwrap().0, doc);
+        assert_eq!(Document::parse(&bytes).unwrap(), doc);
     }
 
     #[test]
@@ -2035,10 +1956,10 @@ mod tests {
         m.sequences.push(Sequence { identifier: "d".into(), documents: vec![half(n)] });
         let ok = Message { request_id: 0, response_to: 0, body: Body::Msg(m.clone()) };
         let bytes = ok.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, ok);
+        assert_eq!(Message::parse(&bytes).unwrap(), ok);
         m.sequences[0].documents[0] = half(n + 1);
         let over = Message { request_id: 0, response_to: 0, body: Body::Msg(m) };
-        assert_eq!(over.to_bytes(), Err(MessageError::Bson(BsonError::TooManyElements)));
+        assert_eq!(over.to_bytes(), Err(MessageError::Unwritable));
         // The same by hand: one more null at the end of the sequence's
         // array, with the four lengths around it fixed.
         let mut longer = bytes.clone();
@@ -2049,7 +1970,7 @@ mod tests {
         longer.extend_from_slice(&[0, 0, 0]);
         let grow = (2 + key.len()) as i32;
         // Lengths to fix: the message, the sequence, the document, the array.
-        let body_len = Document::parse(&bytes[21..]).unwrap().1;
+        let body_len = i32::from_le_bytes(bytes[21..25].try_into().unwrap()) as usize;
         let seq_at = 21 + body_len + 1;
         let doc_at = seq_at + 4 + 2;
         let arr_at = doc_at + 4 + 3;
@@ -2080,12 +2001,12 @@ mod tests {
             }),
         };
         let bytes = m.to_bytes().unwrap();
-        let header = Header::parse(&bytes).unwrap();
+        let header = Header::parse(&bytes[..HEADER_LEN]).unwrap();
         assert_eq!(header.length as usize, bytes.len());
         assert_eq!(header.op_code, op_code::MSG);
         let crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
         assert_eq!(crc, crc32c(&bytes[..bytes.len() - 4]));
-        assert_eq!(Message::parse(&bytes).unwrap(), Some((m, bytes.len())));
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
         // A changed byte fails the checksum.
         let mut bad = bytes.clone();
         bad[30] ^= 1;
@@ -2101,7 +2022,7 @@ mod tests {
         data.push(0);
         data.extend_from_slice(&body);
         let bytes = frame(op_code::MSG, &data);
-        let (m, _) = Message::parse(&bytes).unwrap().unwrap();
+        let m = Message::parse(&bytes).unwrap();
         let Body::Msg(msg) = m.body else { panic!() };
         assert_eq!(msg.sequences, vec![Sequence { identifier: "d".into(), documents: vec![] }]);
         assert_eq!(msg.body.get("x"), Some(&Bson::Int32(1)));
@@ -2136,21 +2057,21 @@ mod tests {
         assert_eq!(bytes.len(), 16 + 4 + 11 + 4 + 4 + 19);
         assert_eq!(&bytes[20..31], b"admin.$cmd\0");
         assert_eq!(&bytes[35..39], &[0xff; 4]);
-        assert_eq!(Message::parse(&bytes).unwrap(), Some((q.clone(), bytes.len())));
+        assert_eq!(Message::parse(&bytes).unwrap(), q.clone());
         let mut with_fields = q.clone();
         if let Body::Query(query) = &mut with_fields.body {
             query.fields = Some(Document::new().with("a", Bson::Int32(1)));
         }
         let b = with_fields.to_bytes().unwrap();
-        assert_eq!(Message::parse(&b).unwrap().unwrap().0, with_fields);
+        assert_eq!(Message::parse(&b).unwrap(), with_fields);
 
         let hello = Document::new().with("ismaster", Bson::Boolean(true)).with("ok", Bson::Double(1.0));
         let r = q.reply(9, Body::Reply(Reply { flags: 8, ..Reply::new(vec![hello]) }));
         assert_eq!(r.response_to, 1);
         let bytes = r.to_bytes().unwrap();
-        assert_eq!(Header::parse(&bytes).unwrap().op_code, op_code::REPLY);
+        assert_eq!(Header::parse(&bytes[..HEADER_LEN]).unwrap().op_code, op_code::REPLY);
         assert_eq!(&bytes[32..36], &1i32.to_le_bytes()); // numberReturned
-        assert_eq!(Message::parse(&bytes).unwrap(), Some((r, bytes.len())));
+        assert_eq!(Message::parse(&bytes).unwrap(), r);
     }
 
     #[test]
@@ -2167,13 +2088,13 @@ mod tests {
         };
         let bytes = c.to_bytes().unwrap();
         assert_eq!(bytes.len(), 16 + 9 + 3);
-        assert_eq!(Message::parse(&bytes).unwrap(), Some((c, bytes.len())));
+        assert_eq!(Message::parse(&bytes).unwrap(), c);
         let o =
             Message { request_id: 2, response_to: 0, body: Body::Other { op_code: op_code::INSERT, data: vec![9] } };
         let bytes = o.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap(), Some((o, bytes.len())));
+        assert_eq!(Message::parse(&bytes).unwrap(), o);
         let bad = Message { request_id: 2, response_to: 0, body: Body::Other { op_code: op_code::MSG, data: vec![] } };
-        assert_eq!(bad.to_bytes(), Err(MessageError::OpCode(op_code::MSG)));
+        assert_eq!(bad.to_bytes(), Err(MessageError::Unwritable));
     }
 
     #[test]
@@ -2189,12 +2110,10 @@ mod tests {
         };
         let bytes = m.to_bytes().unwrap();
         for n in 0..bytes.len() {
-            assert_eq!(Message::parse(&bytes[..n]), Ok(None), "{n} bytes");
-            let mut d = Decoder::new();
-            d.feed(&bytes[..n]);
-            assert_eq!(d.next_message(), None);
+            assert_eq!(Message::parse(&bytes[..n]), Err(MessageError::Truncated), "{n} bytes");
+            assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need));
         }
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, m);
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
     }
 
     #[test]
@@ -2217,7 +2136,7 @@ mod tests {
         // Flags.
         assert_eq!(Message::parse(&with(1 << 2, &sec0)), Err(E::Flags(4)));
         // Optional bits pass, and are dropped.
-        let (m, _) = Message::parse(&with(1 << 20 | 1 << 1, &sec0)).unwrap().unwrap();
+        let m = Message::parse(&with(1 << 20 | 1 << 1, &sec0)).unwrap();
         assert!(matches!(m.body, Body::Msg(Msg { flags: flag::MORE_TO_COME, .. })));
         // Section kinds and body counts.
         assert_eq!(Message::parse(&with(0, &[2])), Err(E::SectionKind(2)));
@@ -2277,17 +2196,17 @@ mod tests {
         let seq = |id: &str, n: usize| Sequence { identifier: id.into(), documents: vec![empty.clone(); n] };
         let one = Msg { flags: 0, body: empty.clone(), sequences: vec![seq("a", MAX_DOCUMENTS + 1)] };
         let m = Message { request_id: 0, response_to: 0, body: Body::Msg(one) };
-        assert_eq!(m.to_bytes(), Err(MessageError::TooManyDocuments));
+        assert_eq!(m.to_bytes(), Err(MessageError::Unwritable));
         let three = vec![seq("a", MAX_DOCUMENTS), seq("b", MAX_DOCUMENTS), seq("c", 1)];
         let m = Message {
             request_id: 0,
             response_to: 0,
             body: Body::Msg(Msg { sequences: three, ..Msg::new(empty.clone()) }),
         };
-        assert_eq!(m.to_bytes(), Err(MessageError::TooManyDocuments));
+        assert_eq!(m.to_bytes(), Err(MessageError::Unwritable));
         let r =
             Message { request_id: 0, response_to: 0, body: Body::Reply(Reply::new(vec![empty; MAX_DOCUMENTS + 1])) };
-        assert_eq!(r.to_bytes(), Err(MessageError::TooManyDocuments));
+        assert_eq!(r.to_bytes(), Err(MessageError::Unwritable));
     }
 
     #[test]
@@ -2295,125 +2214,87 @@ mod tests {
         let mut m = Msg::new(Document::new());
         m.flags = 1 << 5;
         let bad = Message { request_id: 0, response_to: 0, body: Body::Msg(m) };
-        assert_eq!(bad.to_bytes(), Err(MessageError::Flags(1 << 5)));
+        assert_eq!(bad.to_bytes(), Err(MessageError::Unwritable));
         let mut m = Msg::new(Document::new());
         m.sequences.push(Sequence { identifier: "a\0".into(), documents: vec![] });
         let bad = Message { request_id: 0, response_to: 0, body: Body::Msg(m) };
-        assert_eq!(bad.to_bytes(), Err(MessageError::Bson(BsonError::Nul)));
+        assert_eq!(bad.to_bytes(), Err(MessageError::Unwritable));
         let big = Message {
             request_id: 0,
             response_to: 0,
             body: Body::Other { op_code: 1234, data: vec![0; MAX_MESSAGE_SIZE] },
         };
-        assert_eq!(big.to_bytes(), Err(MessageError::TooLarge(MAX_MESSAGE_SIZE + HEADER_LEN)));
+        assert_eq!(big.to_bytes(), Err(MessageError::Unwritable));
         // Two full documents in a sequence fit; a third does not.
         let full = Document::new().with("s", s(&"x".repeat(MAX_DOCUMENT_SIZE - 13)));
         let mut m = Msg::new(Document::new());
         m.sequences.push(Sequence { identifier: "d".into(), documents: vec![full.clone(); 2] });
         let ok = Message { request_id: 0, response_to: 0, body: Body::Msg(m.clone()) };
         let bytes = ok.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, ok);
+        assert_eq!(Message::parse(&bytes).unwrap(), ok);
         m.sequences[0].documents.push(full);
         let bad = Message { request_id: 0, response_to: 0, body: Body::Msg(m) };
-        assert!(matches!(bad.to_bytes(), Err(MessageError::TooLarge(_))));
+        assert!(matches!(bad.to_bytes(), Err(MessageError::Unwritable)));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_messages_and_keeps_body_errors() {
         let a = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
         let b = msg(2, Document::new().with("hello", Bson::Int32(1))).to_bytes().unwrap();
-        // A message with a good length and a bad body: section kind 9.
-        let bad = frame(op_code::MSG, &[0, 0, 0, 0, 9]);
-        let stream: Vec<u8> = [&a[..], &bad, &b].concat();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        'outer: for byte in &stream {
-            d.feed(std::slice::from_ref(byte));
-            while let Some(m) = d.next_message() {
-                got.push(m.map(|m| m.request_id));
-                if d.failed().is_some() {
-                    break 'outer;
-                }
+        for (body, terminal) in [(&[0, 0, 0, 0, 9][..], true), (&[0, 0, 0, 0][..], false)] {
+            let bytes = [&a[..], &frame(op_code::MSG, body), &b].concat();
+            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE_SIZE);
+            let (items, failure) = decode_all(Frames::new, &bytes);
+            let ids: Vec<_> = items.into_iter().map(|m| m.map(|m| m.request_id)).collect();
+            if terminal {
+                assert_eq!(ids, [Ok(1)]);
+                assert_eq!(failure, Some(Fail::Protocol(MessageError::SectionKind(9))));
+            } else {
+                assert_eq!(ids, [Ok(1), Err(MessageError::BodyCount(0)), Ok(2)]);
+                assert_eq!(failure, None);
             }
         }
-        // The OP_MSG specification: an unknown section kind closes the
-        // connection, so the stream stops there.
-        assert_eq!(got, [Ok(1), Err(MessageError::SectionKind(9))]);
-        assert_eq!(d.failed(), Some(MessageError::SectionKind(9)));
-        assert_eq!(d.buffered(), 0);
-        // Any other bad body is taken out and the stream goes on.
-        let bad = frame(op_code::MSG, &[0, 0, 0, 0]);
-        let stream: Vec<u8> = [&a[..], &bad, &b].concat();
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&stream), stream.len());
-        let got: Vec<_> = std::iter::from_fn(|| d.next_message()).map(|m| m.map(|m| m.request_id)).collect();
-        assert_eq!(got, [Ok(1), Err(MessageError::BodyCount(0)), Ok(2)]);
-        assert_eq!(d.failed(), None);
-        // A bad length breaks the stream for good.
-        d.feed(&[3, 0, 0, 0]);
-        assert_eq!(d.next_message(), Some(Err(MessageError::Length(3))));
-        d.feed(&a);
-        assert_eq!(d.next_message(), Some(Err(MessageError::Length(3))));
-        assert_eq!(d.failed(), Some(MessageError::Length(3)));
-        assert_eq!(d.buffered(), 0);
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[3, 0, 0, 0]), 4);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(MessageError::Length(3)))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(MessageError::Length(3))));
     }
 
     #[test]
-    fn decoder_limit() {
+    fn stream_limit() {
         let a = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
-        let mut d = Decoder::with_limit(a.len());
-        d.feed(&a);
-        assert!(d.next_message().unwrap().is_ok());
-        let mut d = Decoder::with_limit(a.len() - 1);
-        d.feed(&a[..4]);
-        assert_eq!(d.next_message(), Some(Err(MessageError::Length(a.len() as i32))));
-        assert_eq!(Decoder::with_limit(0).max, HEADER_LEN);
-        assert_eq!(Decoder::with_limit(usize::MAX).max, MAX_MESSAGE_SIZE);
+        assert_eq!(decode_all(|| Frames::with_limit(a.len()), &a).0.len(), 1);
+        assert_eq!(decode_all(|| Frames::with_limit(a.len() - 1), &a).1,
+            Some(Fail::Protocol(MessageError::Length(a.len() as i32))));
+        assert_eq!(Frames::with_limit(0).limit(), HEADER_LEN);
+        assert_eq!(Frames::with_limit(usize::MAX).limit(), MAX_MESSAGE_SIZE);
     }
 
     #[test]
-    fn decoder_takes_many_small_messages_in_linear_time() {
+    fn stream_takes_many_small_messages_in_linear_time() {
         let one = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
+        let bytes = one.repeat(100_000);
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        d.feed(&stream);
-        let mut n = 0;
-        while let Some(m) = d.next_message() {
-            m.unwrap();
-            n += 1;
-        }
-        assert_eq!(n, 100_000);
-        assert_eq!(d.buffered(), 0);
+        let (items, failure) = decode_all(Frames::new, &bytes);
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 100_000);
+        assert!(items.iter().all(Result::is_ok));
         assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
     }
 
     #[test]
-    fn decoder_holds_at_most_one_message() {
+    fn stream_holds_at_most_one_message() {
         let a = msg(1, Document::new().with("ping", Bson::Int32(1))).to_bytes().unwrap();
-        let mut d = Decoder::with_limit(a.len());
-        assert_eq!(d.capacity(), a.len());
-        // Many messages in one feed: it takes one message's worth.
-        let stream: Vec<u8> = a.iter().copied().cycle().take(a.len() * 1000).collect();
-        let mut fed = 0;
-        let mut n = 0;
-        while fed < stream.len() {
-            fed += d.feed(&stream[fed..]);
-            assert!(d.buffered() <= d.capacity());
-            while let Some(m) = d.next_message() {
-                m.unwrap();
-                n += 1;
-            }
-        }
-        assert_eq!(n, 1000);
-        // A small limit, fed a lot, holds no more than its limit.
-        let mut d = Decoder::with_limit(16);
-        assert_eq!(d.feed(&vec![0x41; 1 << 20]), 16);
-        assert_eq!(d.feed(&[0x41; 8]), 0);
-        assert_eq!(d.buffered(), 16);
-        assert!(d.next_message().unwrap().is_err());
-        assert_eq!(d.feed(&[1; 8]), 8); // a broken stream drops what it gets
-        assert_eq!(d.buffered(), 0);
+        let bytes = a.repeat(1000);
+        contract::check_decode_with_alloc_limit(|| Frames::with_limit(a.len()), &bytes, 2 * a.len());
+        assert_eq!(decode_all(|| Frames::with_limit(a.len()), &bytes).0.len(), 1000);
+        let mut stream = Stream::new(Frames::with_limit(16));
+        assert_eq!(stream.push(&vec![0x41; 1 << 20]), 16);
+        assert_eq!(stream.push(&[0x41; 8]), 0);
+        assert_eq!(stream.buffered(), 16);
+        assert!(stream.next().unwrap().is_err());
+        assert_eq!(stream.next(), None);
     }
 
     #[test]
@@ -2428,7 +2309,7 @@ mod tests {
         let mut out = Vec::new();
         let mut budget = MAX_ELEMENTS;
         assert!(
-            matches!(write_top(&doc, MAX_DOCUMENT_SIZE, &mut budget, &mut out), Err(BsonError::TooLarge(n)) if n > MAX_DOCUMENT_SIZE)
+            matches!(write_top(&doc, MAX_DOCUMENT_SIZE, &mut budget, &mut out), Err(BsonError::Unwritable))
         );
         assert!(out.len() <= MAX_DOCUMENT_SIZE, "held {} bytes", out.len());
         // Strings and binary inside a nested document, the same.
@@ -2436,7 +2317,7 @@ mod tests {
         let inner = Document::new().with("a", s(&half)).with("b", s(&half)).with("c", s(&half));
         let mut out = Vec::new();
         let doc = Document::new().with("d", Bson::Document(inner));
-        assert!(matches!(write_top(&doc, MAX_DOCUMENT_SIZE, &mut budget, &mut out), Err(BsonError::TooLarge(_))));
+        assert!(matches!(write_top(&doc, MAX_DOCUMENT_SIZE, &mut budget, &mut out), Err(BsonError::Unwritable)));
         assert!(out.len() <= MAX_DOCUMENT_SIZE);
     }
 
@@ -2450,29 +2331,29 @@ mod tests {
             .with("id", Bson::Int64(0))
             .with("ns", s("db.c"));
         let body = Document::new().with("cursor", Bson::Document(cursor)).with("ok", Bson::Double(1.0));
-        assert!(matches!(body.to_bytes(), Err(BsonError::TooLarge(_))));
+        assert!(matches!(body.to_bytes(), Err(BsonError::Unwritable)));
         let m = msg(1, body.clone());
         let bytes = m.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, m);
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
         let r = Message { request_id: 1, response_to: 0, body: Body::Reply(Reply::new(vec![body])) };
         let bytes = r.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, r);
+        assert_eq!(Message::parse(&bytes).unwrap(), r);
         // The command limit holds too.
         let over = Document::new().with("s", s(&"x".repeat(MAX_COMMAND_SIZE - 12)));
-        assert!(matches!(msg(1, over).to_bytes(), Err(MessageError::Bson(BsonError::TooLarge(_)))));
+        assert!(matches!(msg(1, over).to_bytes(), Err(MessageError::Unwritable)));
         // A sequence document is held to the document limit.
         let big = Document::new().with("s", s(&"x".repeat(MAX_DOCUMENT_SIZE - 12)));
         let mut m = Msg::new(Document::new());
         m.sequences.push(Sequence { identifier: "d".into(), documents: vec![big] });
         let m = Message { request_id: 1, response_to: 0, body: Body::Msg(m) };
-        assert!(matches!(m.to_bytes(), Err(MessageError::Bson(BsonError::TooLarge(_)))));
+        assert!(matches!(m.to_bytes(), Err(MessageError::Unwritable)));
     }
 
     #[test]
     fn body_fields_are_unique() {
         // Wire protocol, OP_MSG kind 0: top-level field names are unique.
         let body = Document::new().with("ping", Bson::Int32(1)).with("$db", s("a")).with("$db", s("b"));
-        assert_eq!(msg(1, body.clone()).to_bytes(), Err(MessageError::DuplicateField));
+        assert_eq!(msg(1, body.clone()).to_bytes(), Err(MessageError::Unwritable));
         let mut d = 0u32.to_le_bytes().to_vec();
         d.push(0);
         d.extend_from_slice(&body.to_bytes().unwrap());
@@ -2480,7 +2361,7 @@ mod tests {
         // Repeated keys deeper down are still fine.
         let inner = Document::new().with("a", Bson::Null).with("a", Bson::Null);
         let ok = msg(1, Document::new().with("x", Bson::Document(inner)));
-        assert_eq!(Message::parse(&ok.to_bytes().unwrap()).unwrap().unwrap().0, ok);
+        assert_eq!(Message::parse(&ok.to_bytes().unwrap()).unwrap(), ok);
     }
 
     #[test]
@@ -2509,10 +2390,10 @@ mod tests {
             d.push(0);
             let parsed = Message::parse(&frame(op_code::MSG, &d));
             if bad {
-                assert_eq!(m.to_bytes(), Err(MessageError::DuplicateField), "{id}");
+                assert_eq!(m.to_bytes(), Err(MessageError::Unwritable), "{id}");
                 assert_eq!(parsed, Err(MessageError::DuplicateField), "{id}");
             } else {
-                assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap().unwrap().0, m, "{id}");
+                assert_eq!(Message::parse(&m.to_bytes().unwrap()).unwrap(), m, "{id}");
                 assert!(parsed.is_ok(), "{id}");
             }
         }
@@ -2532,7 +2413,7 @@ mod tests {
         };
         let m = Message { request_id: 1, response_to: 0, body: Body::Msg(m) };
         let bytes = m.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, m);
+        assert_eq!(Message::parse(&bytes).unwrap(), m);
     }
 
     #[test]
@@ -2561,12 +2442,12 @@ mod tests {
             (i32::MAX, compressor::SNAPPY, vec![]),
             (1, compressor::NOOP, vec![]),
         ] {
-            assert_eq!(c(size, comp, data.clone()).to_bytes(), Err(MessageError::UncompressedSize(size)));
+            assert_eq!(c(size, comp, data.clone()).to_bytes(), Err(MessageError::Unwritable));
             assert_eq!(Message::parse(&raw(size, comp, &data)), Err(MessageError::UncompressedSize(size)));
         }
         let ok = c(3, compressor::NOOP, vec![1, 2, 3]);
         let bytes = ok.to_bytes().unwrap();
-        assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, ok);
+        assert_eq!(Message::parse(&bytes).unwrap(), ok);
         let ok = c(too_big - 1, compressor::ZSTD, vec![1]);
         assert!(ok.to_bytes().is_ok());
     }
@@ -2591,7 +2472,7 @@ mod tests {
             d.extend_from_slice(id.as_bytes());
             d.push(0);
             let bytes = frame(op_code::MSG, &d);
-            assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, m);
+            assert_eq!(Message::parse(&bytes).unwrap(), m);
             assert_eq!(m.to_bytes().unwrap(), bytes);
             let q = Message {
                 request_id: 1,
@@ -2606,7 +2487,7 @@ mod tests {
                 }),
             };
             let bytes = q.to_bytes().unwrap();
-            assert_eq!(Message::parse(&bytes).unwrap().unwrap().0, q);
+            assert_eq!(Message::parse(&bytes).unwrap(), q);
         }
     }
 
@@ -2618,62 +2499,21 @@ mod tests {
             response_to: 0,
             body: Body::Msg(Msg { flags: 1 << 20, ..Msg::new(Document::new()) }),
         };
-        assert_eq!(m.to_bytes(), Err(MessageError::Flags(1 << 20)));
+        assert_eq!(m.to_bytes(), Err(MessageError::Unwritable));
     }
 
-    /// A small deterministic generator, so the fuzz loop is the same on
-    /// every run.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) as u32
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
-    }
-
-    fn decode_all(data: &[u8], chunk: usize) -> Vec<Result<Message, MessageError>> {
-        let mut d = Decoder::new();
-        let mut out = Vec::new();
-        for mut piece in data.chunks(chunk.max(1)) {
-            while !piece.is_empty() {
-                piece = &piece[d.feed(piece)..];
-                assert!(d.buffered() <= d.capacity());
-                while let Some(m) = d.next_message() {
-                    out.push(m);
-                    if d.failed().is_some() {
-                        return out;
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// What every input must satisfy: no panic, readers agree however the
-    /// bytes are split, and whatever reads writes and reads back the same.
     fn check(data: &[u8]) {
-        if let Ok((doc, used)) = Document::parse(data) {
-            assert!(used <= data.len());
-            let bytes = doc.to_bytes().unwrap();
-            assert_eq!(Document::parse(&bytes).unwrap(), (doc, bytes.len()));
-        }
-        let whole = decode_all(data, data.len());
-        assert_eq!(whole, decode_all(data, 1));
-        assert_eq!(whole, decode_all(data, 7));
-        for m in whole.into_iter().flatten() {
-            let bytes = m.to_bytes().unwrap();
-            assert_eq!(Message::parse(&bytes).unwrap(), Some((m, bytes.len())));
+        contract::check_wire::<Document>(data);
+        contract::check_wire::<Message>(data);
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE_SIZE);
+        for message in decode_all(Frames::new, data).0.into_iter().flatten() {
+            contract::check_wire_value(&message);
         }
     }
 
     #[test]
-    fn lcg_fuzz() {
-        let mut rng = Lcg(0x6d_6f6e_676f_6462);
+    fn generated_inputs_obey_contracts() {
+        let mut rng = Lcg::new(0x6d_6f6e_676f_6462);
         let mut seeds: Vec<Vec<u8>> = vec![every_type().to_bytes().unwrap()];
         let full = Msg {
             flags: flag::CHECKSUM_PRESENT,
@@ -2694,29 +2534,8 @@ mod tests {
         let reply = Reply::new(vec![every_type(), Document::new()]);
         seeds.push(Message { request_id: 4, response_to: 3, body: Body::Reply(reply) }.to_bytes().unwrap());
         for _ in 0..6000 {
-            let mut data = if rng.below(4) == 0 {
-                let n = rng.below(64);
-                (0..n).map(|_| rng.next() as u8).collect()
-            } else {
-                let mut d = seeds[rng.below(seeds.len())].clone();
-                for _ in 0..1 + rng.below(4) {
-                    let i = rng.below(d.len());
-                    match rng.below(4) {
-                        0 => d[i] = rng.next() as u8,
-                        1 => d[i] ^= 1 << rng.below(8),
-                        2 => d.truncate(i),
-                        _ => d.insert(i, rng.next() as u8),
-                    }
-                    if d.is_empty() {
-                        break;
-                    }
-                }
-                d
-            };
-            if rng.below(3) == 0 {
-                let again = data.clone();
-                data.extend_from_slice(&again);
-            }
+            let mut data = if rng.coin() { rng.bytes(64) } else { seeds[rng.index(seeds.len())].clone() };
+            mutate(&mut rng, &mut data);
             check(&data);
             // Bytes after a header, as each op code.
             for op in [op_code::MSG, op_code::QUERY, op_code::REPLY, op_code::COMPRESSED] {
