@@ -218,6 +218,7 @@ fn resp_scan_resumes_across_lines_and_aggregates() {
     bytes.extend_from_slice(b";0\r\n+");
     bytes.extend(std::iter::repeat_n(b'y', resp::MAX_LINE_LEN));
     bytes.extend_from_slice(b"\r\n.\r\n");
+    contract::check_decode_with_alloc_limit(resp::Values::new, &bytes, 2 * resp::MAX_FRAME_LEN);
     let (values, error) = decode_all(resp::Values::new, &bytes);
     assert_eq!(error, None);
     assert_eq!(

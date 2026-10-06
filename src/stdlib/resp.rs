@@ -2840,7 +2840,19 @@ mod tests {
         assert!(start.elapsed() < std::time::Duration::from_secs(20), "{:?}", start.elapsed());
     }
 
-    /// Long lines keep the stream contract and complete within a tight time bound.
+    /// Feeds a stream one byte at a time, draining it after each byte, until
+    /// it takes no more input.
+    fn byte_at_a_time<D: codec::Decode<Error = ParseError>>(mut stream: Stream<D>, bytes: &[u8]) {
+        for byte in bytes {
+            if stream.push(core::slice::from_ref(byte)) == 0 {
+                break;
+            }
+            while stream.next().is_some() {}
+        }
+    }
+
+    /// Long lines keep the stream contract and complete within a tight time
+    /// bound when fed one byte at a time.
     #[test]
     fn stream_is_linear_in_one_long_line() {
         let mut elapsed = std::time::Duration::ZERO;
@@ -2851,8 +2863,9 @@ mod tests {
             bytes.extend_from_slice(b"\r\n");
             check_values(&bytes, Limits::DEFAULT);
             let start = std::time::Instant::now();
-            let (items, error) = decode_all(Values::new, &bytes);
+            byte_at_a_time(Stream::new(Values::new()), &bytes);
             elapsed += start.elapsed();
+            let (items, error) = decode_all(Values::new, &bytes);
             assert_eq!(items.len(), usize::from(byte == b'a'));
             assert_eq!(error.is_none(), byte == b'a');
         }
@@ -2862,8 +2875,9 @@ mod tests {
             bytes.extend_from_slice(end);
             check_commands(&bytes, Limits::DEFAULT);
             let start = std::time::Instant::now();
-            let (items, error) = decode_all(Commands::new, &bytes);
+            byte_at_a_time(Stream::new(Commands::new()), &bytes);
             elapsed += start.elapsed();
+            let (items, error) = decode_all(Commands::new, &bytes);
             assert_eq!(items.len(), usize::from(byte == b'a'));
             assert_eq!(error.is_none(), byte == b'a');
         }
