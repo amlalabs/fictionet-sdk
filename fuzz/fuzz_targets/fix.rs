@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::{
     codec::{
-        Wire,
+        Stream, Wire,
         contract::{check_decode_with_alloc_limit, check_wire, check_wire_value},
         test_support::decode_all,
     },
@@ -54,8 +54,8 @@ fuzz_target!(|input: &[u8]| {
         .get(..input.len().min(MAX_FUZZ_INPUT))
         .unwrap_or_default();
     check_wire::<Message>(data);
-    check_decode_with_alloc_limit(|| Frames, data, 2 * MAX_MESSAGE_SIZE);
-    let (messages, _) = decode_all(|| Frames, data);
+    check_decode_with_alloc_limit(Frames::default, data, 2 * MAX_MESSAGE_SIZE);
+    let (messages, _) = decode_all(Frames::default, data);
     for message in messages {
         check_wire_value(&message);
         let _ = NewOrderSingle::view(&message);
@@ -77,7 +77,20 @@ fuzz_target!(|input: &[u8]| {
         built.push_data(95, data).unwrap();
         check_wire_value(&built);
         let wire = built.to_bytes().unwrap();
-        check_decode_with_alloc_limit(|| Frames, &wire, 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(Frames::default, &wire, 2 * MAX_MESSAGE_SIZE);
+        // A complete garbled frame must not hide the valid frame after it.
+        let mut corrupt = wire.clone();
+        let digit = corrupt.len() - 2;
+        corrupt[digit] = if corrupt[digit] == b'0' { b'1' } else { b'0' };
+        corrupt.extend_from_slice(&wire);
+        check_decode_with_alloc_limit(Frames::default, &corrupt, 2 * MAX_MESSAGE_SIZE);
+        let mut stream = Stream::new(Frames::default());
+        assert_eq!(stream.push(&corrupt), corrupt.len());
+        assert_eq!(stream.next(), Some(Ok(built.clone())));
+        stream.end();
+        assert!(stream.next().is_none());
+        assert!(stream.failed().is_none());
+        assert_eq!(stream.decoder().garbled(), 1);
     }
     let mut group = Message::new(Version::Fix44, b"X").unwrap();
     group
@@ -128,7 +141,12 @@ fuzz_target!(|input: &[u8]| {
         };
         let mut message = peer(kind, n);
         if code & 32 != 0 {
-            message.push(43, b"Y").unwrap();
+            message
+                .push(43, if step.get(4) == Some(&0) { b"X" } else { b"Y" })
+                .unwrap();
+        }
+        if step.get(4) == Some(&1) {
+            message.push(112, b"a").unwrap().push(112, b"b").unwrap();
         }
         if code & 64 != 0 {
             message.push(122, TIME).unwrap();

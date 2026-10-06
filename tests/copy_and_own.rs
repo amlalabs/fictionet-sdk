@@ -4,7 +4,7 @@
 //! as its library. That build has no `cfg(test)`, so the copied modules' unit
 //! tests are compiled out. The SDK already runs them in `cargo test --lib`;
 //! running their parser and fuzz loops again would nearly double that work.
-//! This integration target runs only the two public-trait checks below.
+//! This integration target runs only the public-trait checks below.
 
 #![allow(dead_code)]
 
@@ -249,4 +249,19 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     finish(&mut stream, |item| requests.push(item)).unwrap();
     assert_eq!(requests, [Ok(request)]);
     assert!(stream.is_done());
+}
+
+#[test]
+fn copied_fix_skips_garbled_frames_through_the_public_driver() {
+    // FIX 4.4 Vol 2 case 3.b: discard an invalid checksum and continue.
+    let good = b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01";
+    let bad = b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01";
+    let mut stream = Stream::new(fix::Frames::default());
+    let mut messages = Vec::new();
+    pump(&mut stream, bad, |item| messages.push(item)).unwrap();
+    pump(&mut stream, good, |item| messages.push(item)).unwrap();
+    finish(&mut stream, |item| messages.push(item)).unwrap();
+    assert_eq!(messages, [fix::Message::parse(good).unwrap()]);
+    assert_eq!(stream.decoder().garbled(), 1);
+    assert!(stream.failed().is_none());
 }

@@ -53,8 +53,11 @@ pub const MAX_GROUP_COUNT: usize = 1024;
 pub const MAX_GROUP_LAYOUTS: usize = 128;
 /// Maximum member tags in one group layout.
 pub const MAX_GROUP_MEMBERS: usize = 256;
-/// Maximum sequence numbers in a single replay request or gap fill.
+/// Maximum sequence numbers in one emitted replay range or outbound gap fill.
+/// Received gap fills only move counters and have no range limit.
 pub const MAX_RESEND_RANGE: u32 = 10_000;
+/// Maximum disjoint pending replay ranges retained by a session.
+pub const MAX_PENDING_RESENDS: usize = 16;
 /// Maximum bytes in a session CompID or application version identifier.
 pub const MAX_SESSION_ID_LENGTH: usize = 64;
 /// Maximum negotiated heartbeat interval, in seconds.
@@ -240,7 +243,9 @@ fn append_field(out: &mut Vec<u8>, tag: u32, value: &[u8]) {
 
 /// An ordered message. Tags 8 and 35 lead the stored list; tags 9 and 10 are
 /// checked on parse and generated on write. Other fields preserve their bytes.
-/// Groups stay flat until interpreted with a [`GroupLayout`].
+/// Groups stay flat until interpreted with a [`GroupLayout`]. BodyLength may
+/// contain leading zeros on input. Writing normalizes this derived field
+/// (FIX TagValue Encoding 5.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     fields: Vec<Field>,
@@ -287,14 +292,17 @@ impl Message {
         check_field(tag, value)?;
         let size = digits(tag as usize) + 2 + value.len();
         let stored = self.stored_size.checked_add(size).ok_or(Error::Limit)?;
-        if self.fields.len() >= MAX_FIELDS
-            || stored.saturating_add(MAX_PREFIX_SIZE + 7) > MAX_MESSAGE_SIZE
-        {
+        if self.fields.len() >= MAX_FIELDS || self.encoded_size(stored)? > MAX_MESSAGE_SIZE {
             return Err(Error::Limit);
         }
         self.fields.push(Field::new(tag, value)?);
         self.stored_size = stored;
         Ok(self)
+    }
+    fn encoded_size(&self, stored: usize) -> Result<usize, Error> {
+        let begin = self.fields.first().ok_or(Error::Header)?;
+        let body = stored.checked_sub(begin.size()).ok_or(Error::Header)?;
+        stored.checked_add(3 + digits(body) + 7).ok_or(Error::Limit)
     }
     /// Appends a standard Length/data pair, deriving the Length value.
     /// Refuses unknown pairs or size limits without changing the message.
@@ -321,8 +329,7 @@ impl Message {
         {
             return Err(Error::Header);
         }
-        if self.fields.len() > MAX_FIELDS
-            || self.stored_size + MAX_PREFIX_SIZE + 7 > MAX_MESSAGE_SIZE
+        if self.fields.len() > MAX_FIELDS || self.encoded_size(self.stored_size)? > MAX_MESSAGE_SIZE
         {
             return Err(Error::Limit);
         }
@@ -515,6 +522,7 @@ impl Wire for Message {
     type WriteError = Error;
     /// Reads exactly one message. Refuses truncation, trailing bytes, bad
     /// envelope order, lengths, checksum, fields, data pairs, and named limits.
+    /// Leading zeros in BodyLength are accepted and normalized on write.
     fn parse(input: &[u8]) -> Result<Self, Error> {
         if input.len() > MAX_MESSAGE_SIZE {
             return Err(Error::Limit);
@@ -610,8 +618,28 @@ impl Wire for Message {
 /// Splits a TCP byte stream using BodyLength. No input bytes are retained.
 /// At most [`MAX_PREFIX_SIZE`] header bytes are rescanned per call. The body
 /// is parsed only when complete, so one-byte delivery takes linear time.
+/// Use [`Self::default`] to start with a zero garbled-message count.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, pump}, fix::Frames};
+/// let mut stream = Stream::new(Frames::default());
+/// // FIX 4.4 Vol 2 case 3.b: a complete message with an incorrect checksum.
+/// pump(&mut stream, b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01", |_| unreachable!())?;
+/// assert_eq!(stream.decoder().garbled(), 1);
+/// assert!(stream.failed().is_none());
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::fix::Error>>(())
+/// ```
 #[derive(Clone, Copy, Debug, Default)]
-pub struct Frames;
+pub struct Frames {
+    garbled: u64,
+}
+impl Frames {
+    /// Number of complete frames dropped after a per-message parse failure.
+    /// Saturates at `u64::MAX`. Unrecoverable prefix errors are not counted.
+    pub fn garbled(&self) -> u64 {
+        self.garbled
+    }
+}
 impl Decode for Frames {
     type Item = Message;
     type Error = Error;
@@ -620,7 +648,9 @@ impl Decode for Frames {
     fn capacity(&self) -> usize {
         MAX_MESSAGE_SIZE
     }
-    /// Returns one checked message. Refuses invalid framing or message bytes.
+    /// Returns one checked message. Drops a complete garbled frame with `Skip`,
+    /// as required by FIX 4.4 Vol 2 cases 2.d, 2.m, 2.t and 3.b.
+    /// Only an invalid 8=/9= prefix or an excessive BodyLength ends framing.
     /// Partial input returns `Need`, including at EOF; the driver reports truncation.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
         let Some((_, total)) = prefix(input)? else {
@@ -629,7 +659,13 @@ impl Decode for Frames {
         let Some(bytes) = input.get(..total) else {
             return Ok(Step::Need);
         };
-        Ok(Step::Item(Message::parse(bytes)?, total))
+        Ok(match Message::parse(bytes) {
+            Ok(message) => Step::Item(message, total),
+            Err(_) => {
+                self.garbled = self.garbled.saturating_add(1);
+                Step::Skip(total)
+            }
+        })
     }
 }
 
@@ -925,6 +961,9 @@ pub enum SessionState {
     Established,
     /// Logout sent; awaiting the peer's confirmation or timeout.
     LogoutSent,
+    /// Logout response sent; awaiting transport close or timeout. Resend requests
+    /// and application messages are still processed (FIX 4.4 Vol 2 case 13b).
+    LogoutReceived,
     /// Caller should close the transport.
     Closed,
 }
@@ -947,8 +986,13 @@ pub struct SessionConfig {
     pub transmission_grace_ms: u64,
     /// Logon response timeout, in milliseconds, from construction or start.
     pub logon_timeout_ms: u64,
-    /// Logout response timeout, in milliseconds.
+    /// Timeout for a Logout response or the peer's transport close, in milliseconds.
     pub logout_timeout_ms: u64,
+    /// Maximum absolute difference between inbound SendingTime and the caller's
+    /// UTC `sending_time`, in milliseconds. `None` disables the accuracy check.
+    /// A violation sends Reject reason 10 then Logout (FIX 4.4 Vol 2 case 2.o).
+    /// An invalid initial Logon follows Session Layer 4.3.1 instead.
+    pub sending_time_tolerance_ms: Option<u64>,
     /// Permits ResetSeqNumFlag=Y on the initial Logon exchange.
     pub allow_logon_reset: bool,
     /// DefaultApplVerID (1137). Required for FIXT 1.1; absent for FIX 4.x.
@@ -970,6 +1014,7 @@ impl SessionConfig {
             transmission_grace_ms: 1000,
             logon_timeout_ms: 10_000,
             logout_timeout_ms: 2000,
+            sending_time_tolerance_ms: None,
             allow_logon_reset: false,
             default_appl_ver_id: (version == Version::Fixt11).then(|| "6".into()),
         })
@@ -1004,9 +1049,9 @@ pub enum CloseReason {
     Logout,
     /// Logon was not completed before the configured deadline.
     LogonTimeout,
-    /// Logout was not confirmed before the configured deadline.
+    /// A Logout response or the peer's transport close missed its deadline.
     LogoutTimeout,
-    /// The peer did not answer a TestRequest before its deadline.
+    /// No non-garbled message arrived before the TestRequest deadline.
     TestRequestTimeout,
     /// A low sequence number arrived without PossDupFlag.
     SequenceTooLow,
@@ -1058,7 +1103,8 @@ pub enum Event {
         /// FIX SessionRejectReason (373).
         reason: u32,
     },
-    /// SequenceReset changed the next inbound sequence number.
+    /// SequenceReset increased the next inbound sequence number. An equal
+    /// reset-mode NewSeqNo produces no event and changes no counter (Vol 2 11.b).
     SequenceReset {
         /// Previous next expected number.
         previous: u32,
@@ -1098,7 +1144,9 @@ fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), Error> {
 /// Recovery retains only range counters. Messages above the expected number
 /// are requested again, including the first observed high message. The caller
 /// supplies replay messages one at a time; no replay store or input queue grows
-/// inside the machine. All emitted ranges are at most [`MAX_RESEND_RANGE`].
+/// inside the machine. At most [`MAX_PENDING_RESENDS`] disjoint ranges are
+/// queued. All emitted ranges are at most [`MAX_RESEND_RANGE`]. Drop this
+/// machine when the peer closes the transport; persist its counters first.
 #[derive(Clone, Debug)]
 pub struct Session {
     config: SessionConfig,
@@ -1115,7 +1163,7 @@ pub struct Session {
     gap_high: Option<u32>,
     requested_through: Option<u32>,
     reset_requested: bool,
-    replay_remaining: Option<(u32, u32)>,
+    replay_ranges: std::collections::VecDeque<(u32, u32)>,
 }
 impl Session {
     /// Creates a machine using persisted next inbound and outbound numbers.
@@ -1145,7 +1193,7 @@ impl Session {
             gap_high: None,
             requested_through: None,
             reset_requested: false,
-            replay_remaining: None,
+            replay_ranges: std::collections::VecDeque::new(),
         })
     }
     /// Current connection state.
@@ -1213,7 +1261,10 @@ impl Session {
         })
     }
     /// Processes a received message. Emits administrative responses and events.
-    /// Refuses wire-invalid values and backward caller time transactionally.
+    /// Peer session faults produce Reject or Logout actions, or a silent close
+    /// for an invalid initial acceptor Logon (Session Layer 4.3.1). Refuses
+    /// wire-invalid caller values, closed state, invalid caller time, or local
+    /// sequence exhaustion transactionally. Any non-garbled input clears probes.
     pub fn receive(
         &mut self,
         message: &Message,
@@ -1227,7 +1278,7 @@ impl Session {
     }
     /// Advances timers. Sends Heartbeat after outgoing silence, TestRequest
     /// after inbound silence plus grace, and disconnects on expired probes.
-    /// Only a Heartbeat with the outstanding TestReqID satisfies a probe.
+    /// Any non-garbled inbound message satisfies a probe (Vol 2 state row 14).
     pub fn tick(&mut self, now_ms: u64, sending_time: &[u8]) -> Result<Vec<Action>, Error> {
         self.transaction(now_ms, sending_time, |s, actions| {
             match s.state {
@@ -1238,7 +1289,7 @@ impl Session {
                     }
                     return Ok(());
                 }
-                SessionState::LogoutSent => {
+                SessionState::LogoutSent | SessionState::LogoutReceived => {
                     if now_ms - s.state_since >= s.config.logout_timeout_ms {
                         s.close(CloseReason::LogoutTimeout, actions)?;
                     }
@@ -1307,6 +1358,7 @@ impl Session {
     }
     /// Initiates Logout and waits for confirmation. Refuses a closed or
     /// not-yet-established session, invalid Text, and sequence exhaustion.
+    /// Empty `text` omits optional Text(58), as in Session Layer 9.6.
     pub fn logout(
         &mut self,
         text: &[u8],
@@ -1317,7 +1369,14 @@ impl Session {
             if s.state != SessionState::Established {
                 return Err(Error::State);
             }
-            s.emit(b"5", &[(58, text)], now_ms, sending_time, actions)?;
+            let fields = [(58, text)];
+            s.emit(
+                b"5",
+                if text.is_empty() { &[] } else { &fields },
+                now_ms,
+                sending_time,
+                actions,
+            )?;
             s.state = SessionState::LogoutSent;
             s.state_since = now_ms;
             Ok(())
@@ -1368,7 +1427,10 @@ impl Session {
             if number >= s.outgoing {
                 return Err(Error::Sequence);
             }
-            let original_time = original.unique(122)?.unwrap_or(required(original, 52)?);
+            let original_time = match original.unique(122)? {
+                Some(time) => time,
+                None => required(original, 52)?,
+            };
             if timestamp(original_time)? > timestamp(sending_time)? {
                 return Err(Error::Time);
             }
@@ -1467,10 +1529,16 @@ impl Session {
         *self = staged;
         Ok(actions)
     }
+    fn initial(&self) -> bool {
+        matches!(
+            self.state,
+            SessionState::AwaitingLogon | SessionState::LogonSent
+        )
+    }
     fn recovery_state(&self) -> Result<(), Error> {
         if matches!(
             self.state,
-            SessionState::Established | SessionState::LogoutSent
+            SessionState::Established | SessionState::LogoutSent | SessionState::LogoutReceived
         ) {
             Ok(())
         } else {
@@ -1565,6 +1633,9 @@ impl Session {
         time: &[u8],
         actions: &mut Vec<Action>,
     ) -> Result<(), Error> {
+        if self.initial() && self.config.role == Role::Acceptor {
+            return self.close(reason, actions);
+        }
         self.emit(b"5", &[(58, text)], now, time, actions)?;
         self.close(reason, actions)
     }
@@ -1634,77 +1705,129 @@ impl Session {
         if self.state == SessionState::Closed {
             return Err(Error::State);
         }
-        if message.version()? != self.config.version
-            || required(message, 49)? != self.config.target_comp_id.as_bytes()
-            || required(message, 56)? != self.config.sender_comp_id.as_bytes()
-        {
+        let initial = self.initial();
+        let kind = message.msg_type();
+        if initial && kind != b"A" {
+            if kind == b"5" && self.config.role == Role::Initiator {
+                return self.close(CloseReason::Logout, actions);
+            }
+            return self.fatal(CloseReason::Protocol, b"Logon required", now, time, actions);
+        }
+        if initial && self.config.role == Role::Initiator && self.state != SessionState::LogonSent {
             return self.fatal(
                 CloseReason::Protocol,
-                b"Session identity mismatch",
+                b"Unexpected Logon",
                 now,
                 time,
                 actions,
             );
         }
-        if self.config.version == Version::Fixt11 {
-            let ordered = message.fields.get(2).map(Field::tag) == Some(49)
-                && message.fields.get(3).map(Field::tag) == Some(56);
-            let appl = message.unique(1128)?;
-            if !ordered
-                || (appl.is_some()
-                    && (admin(message.msg_type())
-                        || message.fields.get(4).map(Field::tag) != Some(1128)))
-            {
+        // A complete non-garbled message establishes transport liveness, even
+        // if a field requires a Reject. FIX 4.4 Vol 2 state matrix row 14.
+        self.last_received = now;
+        self.test = None;
+        let n = match number(message, 34).and_then(seq) {
+            Ok(n) => n,
+            Err(Error::Missing(34)) => {
                 return self.fatal(
                     CloseReason::Protocol,
-                    b"Invalid FIXT header order",
+                    b"Missing MsgSeqNum",
                     now,
                     time,
                     actions,
                 );
             }
-            if let Some(value) = appl {
-                session_id(value)?;
-            }
-        }
-        let n = number(message, 34)?;
-        seq(n)?;
-        let kind = message.msg_type();
-        let duplicate = flag(message, 43)?;
-        let gap_fill = kind == b"4" && flag(message, 123)?;
-        let reset_mode = kind == b"4" && !gap_fill;
-        let initial = matches!(
-            self.state,
-            SessionState::AwaitingLogon | SessionState::LogonSent
-        );
-        if initial && kind != b"A" {
-            if kind == b"5" {
-                return self.close(CloseReason::Logout, actions);
-            }
-            return self.fatal(CloseReason::Protocol, b"Logon required", now, time, actions);
-        }
-        if initial && kind == b"A" {
-            let reset = flag(message, 141)?;
-            if (reset && (!self.config.allow_logon_reset || n != 1))
-                || (self.config.role == Role::Initiator
-                    && (self.state != SessionState::LogonSent || reset != self.reset_requested))
-            {
-                return self.fatal(
-                    CloseReason::Protocol,
-                    b"Invalid Logon reset",
+            Err(error) => {
+                return self.reject_input(
+                    self.incoming,
+                    34,
+                    reject_reason(error, 6),
                     now,
                     time,
                     actions,
                 );
             }
-            if reset {
-                self.incoming = 1;
-                if self.config.role == Role::Acceptor {
-                    self.outgoing = 1;
+        };
+        // A peer field error is a protocol outcome. Only caller misuse returns
+        // Err from receive. FIX 4.4 Vol 2 cases 14.b, 14.e, 14.f and 14.h.
+        macro_rules! read_input {
+            ($result:expr, $tag:expr, $reason:expr) => {
+                match $result {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return self.reject_input(
+                            n,
+                            $tag,
+                            reject_reason(error, $reason),
+                            now,
+                            time,
+                            actions,
+                        )
+                    }
                 }
+            };
+        }
+        if message.version()? != self.config.version {
+            return self.fatal(
+                CloseReason::Protocol,
+                b"Session version mismatch",
+                now,
+                time,
+                actions,
+            );
+        }
+        for tag in [49, 56] {
+            let actual = read_input!(required(message, tag), tag, 5);
+            let expected = if tag == 49 {
+                self.config.target_comp_id.as_bytes()
+            } else {
+                self.config.sender_comp_id.as_bytes()
+            };
+            if actual != expected {
+                if !initial {
+                    self.reject_input(n, tag, 9, now, time, actions)?;
+                }
+                return self.fatal(
+                    CloseReason::Protocol,
+                    b"Session identity mismatch",
+                    now,
+                    time,
+                    actions,
+                );
             }
         }
-        if !reset_mode && n < self.incoming && !duplicate {
+        let appl = read_input!(message.unique(1128), 1128, 5);
+        if let Some(value) = appl {
+            if self.config.version != Version::Fixt11 || admin(kind) {
+                return self.reject_input(n, 1128, 5, now, time, actions);
+            }
+            read_input!(session_id(value), 1128, 5);
+        }
+        let duplicate = read_input!(flag(message, 43), 43, 5);
+        let reset = read_input!(flag(message, 141), 141, 5);
+        let gap_fill = kind == b"4" && read_input!(flag(message, 123), 123, 5);
+        let reset_mode = kind == b"4" && !gap_fill;
+        let test_id = read_input!(message.unique(112), 112, 5);
+        if test_id.is_some_and(|id| id.len() > MAX_TEST_REQUEST_ID_LENGTH) {
+            return self.reject_input(n, 112, 5, now, time, actions);
+        }
+        if kind == b"1" && test_id.is_none() {
+            return self.reject_input(n, 112, 1, now, time, actions);
+        }
+        if initial
+            && ((reset && (!self.config.allow_logon_reset || n != 1))
+                || (self.config.role == Role::Initiator && reset != self.reset_requested))
+        {
+            return self.fatal(
+                CloseReason::Protocol,
+                b"Invalid Logon reset",
+                now,
+                time,
+                actions,
+            );
+        }
+        let expected = if initial && reset { 1 } else { self.incoming };
+        if !reset_mode && n < expected && !duplicate {
             return self.fatal(
                 CloseReason::SequenceTooLow,
                 b"MsgSeqNum too low",
@@ -1713,41 +1836,92 @@ impl Session {
                 actions,
             );
         }
-        // Validate duplicate timestamps before ignoring their payloads.
-        let sent = match required(message, 52).and_then(timestamp) {
-            Ok(value) => value,
-            Err(_) => return self.reject_input(n, 52, 6, now, time, actions),
-        };
+        let sent = read_input!(required(message, 52).and_then(timestamp), 52, 6);
+        let original = read_input!(message.unique(122), 122, 6);
         if duplicate {
-            let original = match message.unique(122)? {
-                Some(value) => match timestamp(value) {
-                    Ok(value) => value,
-                    Err(_) => return self.reject_input(n, 122, 6, now, time, actions),
-                },
-                None => return self.reject_input(n, 122, 1, now, time, actions),
-            };
-            if original > sent {
+            let original = read_input!(
+                original.ok_or(Error::Missing(122)).and_then(timestamp),
+                122,
+                6
+            );
+            // Lower duplicates are ignored, including this ordering check.
+            // FIX 4.4 Vol 2 cases 2.e and 2.f.
+            if n == expected && original > sent {
                 return self.reject_input(n, 122, 10, now, time, actions);
             }
-        } else if message.unique(122)?.is_some() {
+        } else if original.is_some() {
             return self.reject_input(n, 122, 5, now, time, actions);
         }
-        self.last_received = now;
-        if !reset_mode && n < self.incoming {
-            return action(actions, Action::Event(Event::Duplicate(n)));
-        }
-        if reset_mode {
-            let next = number(message, 36)?;
-            seq(next)?;
-            if next <= self.incoming {
-                self.reject_inner(n, 36, 5, now, time, actions)?;
+        if let Some(tolerance) = self.config.sending_time_tolerance_ms {
+            let distance = timestamp_nanos(sent)?.abs_diff(timestamp_nanos(timestamp(time)?)?);
+            if distance > u128::from(tolerance) * 1_000_000 {
+                if !initial {
+                    self.reject_input(n, 52, 10, now, time, actions)?;
+                }
                 return self.fatal(
                     CloseReason::Protocol,
-                    b"NewSeqNo must increase",
+                    b"SendingTime outside tolerance",
                     now,
                     time,
                     actions,
                 );
+            }
+        }
+        let mut heartbeat = self.heartbeat;
+        let mut peer_version = None;
+        if kind == b"A" {
+            let encryption = read_input!(number(message, 98), 98, 6);
+            if encryption != 0 {
+                return self.reject_input(n, 98, 5, now, time, actions);
+            }
+            heartbeat = read_input!(number(message, 108), 108, 6);
+            if heartbeat > MAX_HEARTBEAT_SECONDS {
+                return self.reject_input(n, 108, 5, now, time, actions);
+            }
+            if self.config.version == Version::Fixt11 {
+                let id = read_input!(required(message, 1137), 1137, 5);
+                read_input!(session_id(id), 1137, 5);
+                peer_version = Some(id.to_vec());
+            }
+            if initial && self.config.role == Role::Initiator && heartbeat != self.heartbeat {
+                return self.fatal(
+                    CloseReason::Protocol,
+                    b"HeartBtInt mismatch",
+                    now,
+                    time,
+                    actions,
+                );
+            }
+        }
+        // Validate the entire initial Logon before resetting persisted counters.
+        if initial && reset {
+            self.incoming = 1;
+            if self.config.role == Role::Acceptor {
+                self.outgoing = 1;
+            }
+        }
+        let next = if kind == b"4" {
+            let next = read_input!(number(message, 36), 36, 6);
+            if seq(next).is_err() {
+                return self.reject_inner(n, 36, 5, now, time, actions);
+            }
+            next
+        } else {
+            0
+        };
+        if gap_fill && next <= n {
+            // FIX 4.4 Vol 2 case 10.e: reject without advancing or closing.
+            return self.reject_inner(n, 36, 5, now, time, actions);
+        }
+        if !reset_mode && n < self.incoming {
+            return action(actions, Action::Event(Event::Duplicate(n)));
+        }
+        if reset_mode {
+            if next < self.incoming {
+                return self.reject_inner(n, 36, 5, now, time, actions);
+            }
+            if next == self.incoming {
+                return Ok(());
             }
             let previous = self.incoming;
             self.incoming = next;
@@ -1772,41 +1946,11 @@ impl Session {
                 }),
             )?;
         }
-        // Logon and ResendRequest must be handled even when above the expected
-        // number. A high Logout confirmation ends a locally initiated logout.
+        // Logon and ResendRequest are processed even above the expected number.
         if initial && kind == b"A" {
-            if number(message, 98)? != 0 {
-                return self.fatal(
-                    CloseReason::Protocol,
-                    b"EncryptMethod not supported",
-                    now,
-                    time,
-                    actions,
-                );
-            }
-            let heartbeat = number(message, 108)?;
-            if heartbeat > MAX_HEARTBEAT_SECONDS {
-                return Err(Error::Limit);
-            }
-            if self.config.role == Role::Initiator && heartbeat != self.heartbeat {
-                return self.fatal(
-                    CloseReason::Protocol,
-                    b"HeartBtInt mismatch",
-                    now,
-                    time,
-                    actions,
-                );
-            }
             self.heartbeat = heartbeat;
-            let peer_version = if self.config.version == Version::Fixt11 {
-                let id = required(message, 1137)?;
-                session_id(id)?;
-                Some(id.to_vec())
-            } else {
-                None
-            };
             if self.config.role == Role::Acceptor {
-                self.logon(now, time, flag(message, 141)?, actions)?;
+                self.logon(now, time, reset, actions)?;
             }
             self.state = SessionState::Established;
             self.state_since = now;
@@ -1825,6 +1969,9 @@ impl Session {
                 actions,
             );
         } else if kind == b"2" && !duplicate {
+            // Validate before changing either the replay queue or inbound counter.
+            read_input!(number(message, 7), 7, 6);
+            read_input!(number(message, 16), 16, 6);
             self.resend_request(message, n, now, time, actions)?;
         } else if kind == b"5" && !duplicate {
             if self.state == SessionState::LogoutSent {
@@ -1833,32 +1980,21 @@ impl Session {
                 }
                 return self.close(CloseReason::Logout, actions);
             }
-            self.request_gap(now, time, actions)?;
-            self.emit(b"5", &[], now, time, actions)?;
-            if high {
-                self.state = SessionState::LogoutSent;
+            if self.state != SessionState::LogoutReceived {
+                self.request_gap(now, time, actions)?;
+                self.emit(b"5", &[], now, time, actions)?;
+                self.state = SessionState::LogoutReceived;
                 self.state_since = now;
-                return Ok(());
             }
-            self.incoming = advance(self.incoming)?;
-            return self.close(CloseReason::Logout, actions);
+            if !high {
+                self.incoming = advance(self.incoming)?;
+            }
+            return Ok(());
         }
         if high {
             return self.request_gap(now, time, actions);
         }
         if gap_fill {
-            let next = number(message, 36)?;
-            seq(next)?;
-            if next <= self.incoming || next - self.incoming > MAX_RESEND_RANGE {
-                self.reject_inner(n, 36, 5, now, time, actions)?;
-                return self.fatal(
-                    CloseReason::Protocol,
-                    b"Invalid gap fill",
-                    now,
-                    time,
-                    actions,
-                );
-            }
             let previous = self.incoming;
             self.incoming = next;
             action(
@@ -1875,37 +2011,29 @@ impl Session {
                 action(actions, Action::Event(Event::Duplicate(n)))?;
             } else {
                 match kind {
-                    b"A" | b"2" => {}
-                    b"0" => {
-                        if let Some((id, _)) = &self.test
-                            && message.unique(112)? == Some(id.as_bytes())
-                        {
-                            self.test = None;
+                    b"A" | b"2" | b"0" => {}
+                    b"1" => {
+                        if let Some(id) = test_id {
+                            self.emit(b"0", &[(112, id)], now, time, actions)?;
                         }
                     }
-                    b"1" => match message.unique(112)? {
-                        Some(id) if id.len() <= MAX_TEST_REQUEST_ID_LENGTH => {
-                            self.emit(b"0", &[(112, id)], now, time, actions)?
-                        }
-                        Some(_) => self.reject_inner(n, 112, 5, now, time, actions)?,
-                        None => self.reject_inner(n, 112, 1, now, time, actions)?,
-                    },
                     b"3" => match number(message, 45).and_then(seq) {
                         Ok(reference) => {
                             action(actions, Action::Event(Event::RejectReceived(reference)))?
                         }
-                        Err(_) => self.reject_inner(n, 45, 5, now, time, actions)?,
+                        Err(error) => {
+                            self.reject_inner(n, 45, reject_reason(error, 6), now, time, actions)?
+                        }
                     },
                     _ => {
-                        if self.state == SessionState::Established {
-                            action(
-                                actions,
-                                Action::Event(Event::Application {
-                                    sequence: n,
-                                    possible_duplicate: duplicate,
-                                }),
-                            )?;
-                        }
+                        self.recovery_state()?;
+                        action(
+                            actions,
+                            Action::Event(Event::Application {
+                                sequence: n,
+                                possible_duplicate: duplicate,
+                            }),
+                        )?;
                     }
                 }
             }
@@ -1921,6 +2049,9 @@ impl Session {
         time: &[u8],
         actions: &mut Vec<Action>,
     ) -> Result<(), Error> {
+        if self.initial() {
+            return self.fatal(CloseReason::Protocol, b"Invalid Logon", now, time, actions);
+        }
         if n == self.incoming {
             self.incoming = advance(self.incoming)?;
         }
@@ -1949,12 +2080,27 @@ impl Session {
         if begin == 0 || begin > end {
             return self.reject_inner(n, 7, 5, now, time, actions);
         }
-        let (begin, end) = if let Some((old_begin, old_end)) = self.replay_remaining {
-            (begin.min(old_begin), end.max(old_end))
-        } else {
-            (begin, end)
-        };
-        self.replay_remaining = Some((begin, end));
+        // Merge only overlapping or adjacent ranges. Restart the bounded scan
+        // when a merge expands the range, so transitive overlaps also coalesce.
+        let (mut begin, mut end) = (begin, end);
+        let mut at = 0;
+        let mut insert_at = self.replay_ranges.len();
+        while let Some(&(old_begin, old_end)) = self.replay_ranges.get(at) {
+            if begin <= old_end.saturating_add(1) && old_begin <= end.saturating_add(1) {
+                begin = begin.min(old_begin);
+                end = end.max(old_end);
+                self.replay_ranges.remove(at);
+                insert_at = insert_at.min(at);
+                at = 0;
+            } else {
+                at += 1;
+            }
+        }
+        if self.replay_ranges.len() >= MAX_PENDING_RESENDS {
+            return self.reject_inner(n, 7, 5, now, time, actions);
+        }
+        self.replay_ranges
+            .insert(insert_at.min(self.replay_ranges.len()), (begin, end));
         if let Some(event) = self.next_resend_range() {
             action(actions, Action::Event(event))?;
         }
@@ -1962,17 +2108,25 @@ impl Session {
     }
     /// Takes the next bounded replay work range after a received ResendRequest.
     /// Large requests are split into inclusive ranges of [`MAX_RESEND_RANGE`].
-    /// Overlapping pending requests are coalesced. Returns `None` when drained.
+    /// Overlapping or adjacent requests are coalesced. Disjoint requests wait
+    /// until earlier work drains. A full [`MAX_PENDING_RESENDS`] queue rejects
+    /// a new disjoint request with reason 5. Returns `None` when drained.
     /// This only advances work cursors; it does not advance FIX sequence numbers.
     pub fn next_resend_range(&mut self) -> Option<Event> {
-        let (begin, last) = self.replay_remaining?;
+        let (begin, last) = self.replay_ranges.pop_front()?;
         let end = last.min(begin.saturating_add(MAX_RESEND_RANGE - 1));
-        self.replay_remaining = if end < last {
-            end.checked_add(1).map(|n| (n, last))
-        } else {
-            None
-        };
+        if end < last {
+            self.replay_ranges.push_front((end.checked_add(1)?, last));
+        }
         Some(Event::Resend { begin, end })
+    }
+}
+fn reject_reason(error: Error, fallback: u32) -> u32 {
+    match error {
+        Error::Missing(_) => 1,
+        Error::Duplicate(_) => 13,
+        Error::Sequence | Error::Limit => 5,
+        _ => fallback,
     }
 }
 fn session_tag(tag: u32) -> bool {
@@ -2048,6 +2202,36 @@ fn timestamp(bytes: &[u8]) -> Result<[u32; 7], Error> {
     Ok([year, month, day, hour, minute, second, fraction])
 }
 
+fn timestamp_nanos(value: [u32; 7]) -> Result<u128, Error> {
+    let [year, month, day, hour, minute, second, fraction] = value;
+    let previous = u128::from(year).checked_sub(1).ok_or(Error::Time)?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let mut days = previous * 365 + previous / 4 - previous / 100 + previous / 400;
+    for m in 1..month {
+        days += match m {
+            4 | 6 | 9 | 11 => 30,
+            2 if leap => 29,
+            2 => 28,
+            _ => 31,
+        };
+    }
+    days = days
+        .checked_add(u128::from(day))
+        .and_then(|n| n.checked_sub(1))
+        .ok_or(Error::Time)?;
+    // Four-digit years bound the day count. Checked conversions retain the
+    // full nanosecond fraction and handle changes of day, month, and year.
+    days.checked_mul(24)
+        .and_then(|n| n.checked_add(u128::from(hour)))
+        .and_then(|n| n.checked_mul(60))
+        .and_then(|n| n.checked_add(u128::from(minute)))
+        .and_then(|n| n.checked_mul(60))
+        .and_then(|n| n.checked_add(u128::from(second)))
+        .and_then(|n| n.checked_mul(1_000_000_000))
+        .and_then(|n| n.checked_add(u128::from(fraction)))
+        .ok_or(Error::Time)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2057,8 +2241,10 @@ mod tests {
         test_support::decode_all,
     };
 
-    // Exact byte examples using the FIX 4.2 Administrative Messages tables:
-    // Logon (p. 27) and Heartbeat (p. 26), and Appendix B checksum calculation.
+    // LOGON is the public Wikipedia Financial Information eXchange example
+    // (https://en.wikipedia.org/wiki/Financial_Information_eXchange).
+    // HEARTBEAT is constructed from it with sequence 178 and time +30 seconds.
+    // These are not published FIX conformance test vectors.
     const LOGON: &[u8] = b"8=FIX.4.2\x019=65\x0135=A\x0149=SERVER\x0156=CLIENT\x0134=177\x0152=20090107-18:15:16\x0198=0\x01108=30\x0110=062\x01";
     const HEARTBEAT: &[u8] = b"8=FIX.4.2\x019=53\x0135=0\x0149=SERVER\x0156=CLIENT\x0134=178\x0152=20090107-18:15:46\x0110=021\x01";
     const TIME: &[u8] = b"20261006-12:00:00";
@@ -2134,25 +2320,444 @@ mod tests {
         bytes
     }
 
+    // Constructed exact-byte fixtures for the cited public session test cases.
+    fn received_bytes(session: &mut Session, bytes: &[u8], now: u64) -> Vec<Action> {
+        check_wire::<Message>(bytes);
+        let message = Message::parse(bytes).unwrap();
+        let actions = session.receive(&message, now, TIME).unwrap();
+        checked(&actions);
+        actions
+    }
+
     #[test]
-    fn published_message_shapes_exact_bytes_and_contracts() {
+    fn review_a_fixt_headers_accept_tag_order() {
+        // Session Layer 8.5: only 8, 9, 35 have fixed header positions.
+        let mut session = Session::new(
+            SessionConfig::new(Version::Fixt11, Role::Acceptor, "LOCAL", "PEER").unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        received_bytes(&mut session, b"8=FIXT.1.1\x019=71\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x011137=6\x0110=008\x01", 0);
+        assert_eq!(session.state(), SessionState::Established);
+        assert!(received_bytes(&mut session, b"8=FIXT.1.1\x019=52\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=158\x01", 1).is_empty());
+        assert_eq!(session.next_inbound(), 3);
+    }
+
+    #[test]
+    fn review_b_acceptor_first_message_closes_without_sending() {
+        // Session Layer 4.3.1; FIX 4.4 Vol 2 cases 1S.b and 1S.c.
+        for bytes in [b"8=FIX.4.4\x019=52\x0135=0\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=079\x01".as_slice(), b"8=FIX.4.4\x019=64\x0135=A\x0134=1\x0149=EVIL\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=128\x01"] {
+            let mut session = Session::new(
+                SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap(),
+                1, 1, 0,
+            ).unwrap();
+            assert_eq!(received_bytes(&mut session, bytes, 1),
+                [Action::Event(Event::Disconnected(CloseReason::Protocol))]);
+            assert_eq!((session.next_inbound(), session.next_outbound()), (1, 1));
+        }
+    }
+
+    #[test]
+    fn review_c_invalid_logon_timestamps_never_send_reject_first() {
+        // Session Layer 4.3.1; FIX 4.4 Vol 2 cases 1S.d and 1B.e.
+        for role in [Role::Acceptor, Role::Initiator] {
+            for bytes in [b"8=FIX.4.4\x019=52\x0135=A\x0134=1\x0149=PEER\x0152=bad\x0156=LOCAL\x0198=0\x01108=30\x01141=Y\x0110=185\x01".as_slice(), b"8=FIX.4.4\x019=83\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=bad\x0198=0\x01108=30\x01141=Y\x0110=162\x01", b"8=FIX.4.4\x019=97\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:02\x0198=0\x01108=30\x01141=Y\x0110=215\x01"] {
+                let mut config = SessionConfig::new(Version::Fix44, role, "LOCAL", "PEER").unwrap();
+                config.allow_logon_reset = true;
+                let mut session = Session::new(config, 7, 9, 0).unwrap();
+                if role == Role::Initiator { session.start(0, TIME, true).unwrap(); }
+                let before = (session.next_inbound(), session.next_outbound());
+                let actions = received_bytes(&mut session, bytes, 1);
+                assert_eq!(session.state(), SessionState::Closed);
+                let sent = sends(&actions);
+                if role == Role::Acceptor {
+                    assert!(sent.is_empty());
+                    assert_eq!((session.next_inbound(), session.next_outbound()), before);
+                } else {
+                    assert_eq!(sent.len(), 1);
+                    assert_eq!(sent[0].msg_type(), b"5");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn review_d_reset_equal_is_noop() {
+        // FIX 4.4 Vol 2 case 11.b: equal NewSeqNo is accepted.
+        let mut session = established(Version::Fix44);
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=2\x0110=050\x01", 1);
+        assert!(sends(&actions).is_empty());
+        assert_eq!(session.state(), SessionState::Established);
+        assert_eq!((session.next_inbound(), session.next_outbound()), (2, 2));
+    }
+
+    #[test]
+    fn review_d_invalid_reset_and_gap_fill_only_reject() {
+        // FIX 4.4 Vol 2 cases 11.c and 10.e: no disconnect or inbound change.
+        for bytes in [b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=1\x0110=049\x01".as_slice(), b"8=FIX.4.4\x019=63\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=2\x0110=092\x01", b"8=FIX.4.4\x019=63\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=1\x0110=091\x01"] {
+            let mut session = established(Version::Fix44);
+            let actions = received_bytes(&mut session, bytes, 1);
+            let sent = sends(&actions);
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].msg_type(), b"3");
+            assert_eq!(sent[0].get(373), Some(b"5".as_slice()));
+            assert_eq!(session.state(), SessionState::Established);
+            assert_eq!(session.next_inbound(), 2);
+        }
+    }
+
+    #[test]
+    fn review_d_large_gap_fill_moves_only_counters() {
+        // FIX 4.4 Vol 2 case 10.b: no bound on an inbound gap's size.
+        let mut session = established(Version::Fix44);
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=67\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01123=Y\x0136=10003\x0110=034\x01", 1);
+        assert!(sends(&actions).is_empty());
+        assert_eq!(session.state(), SessionState::Established);
+        assert_eq!(session.next_inbound(), 10003);
+    }
+
+    #[test]
+    fn review_e_logout_response_waits_and_serves_resends() {
+        // FIX 4.4 Vol 2 state matrix row 15 and case 13b.
+        let mut session = established(Version::Fix44);
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=5\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=085\x01", 1);
+        assert_eq!(sends(&actions)[0].msg_type(), b"5");
+        assert_ne!(session.state(), SessionState::Closed);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Event(Event::Disconnected(_))))
+        );
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=61\x0135=2\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=1\x0116=0\x0110=206\x01", 2);
+        assert!(has_event(&actions, Event::Resend { begin: 1, end: 2 }));
+        assert!(session.tick(2000, TIME).unwrap().is_empty());
+        assert!(has_event(
+            &session.tick(2001, TIME).unwrap(),
+            Event::Disconnected(CloseReason::LogoutTimeout)
+        ));
+    }
+
+    #[test]
+    fn review_f_application_traffic_satisfies_probe() {
+        // FIX 4.4 Vol 2 state matrix row 14: any non-garbled inbound message.
+        let mut session = established(Version::Fix44);
+        session.test_request(b"probe", 0, TIME).unwrap();
+        received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=8\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=088\x01", 1000);
+        for second in 2..=65u32 {
+            let app = inbound(Version::Fix44, b"8", second + 1, &[]);
+            let now = u64::from(second) * 1000;
+            session.receive(&app, now, TIME).unwrap();
+            checked(&session.tick(now, TIME).unwrap());
+            assert_eq!(session.state(), SessionState::Established);
+        }
+    }
+
+    #[test]
+    fn review_g_garbled_frames_do_not_end_stream() {
+        // FIX 4.4 Vol 2 cases 2.d, 2.m, 2.t, 3.b: discard then continue.
+        let mut bad_checksum = HEARTBEAT.to_vec();
+        let digit = bad_checksum.len() - 2;
+        bad_checksum[digit] = b'2';
+        let malformed = b"8=FIX.4.4\x019=52\x0149=PEER\x0135=0\x0134=2\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=080\x01";
+        for bad in [bad_checksum.as_slice(), malformed] {
+            let wire = [bad, LOGON].concat();
+            let (messages, failure) = decode_all(Frames::default, &wire);
+            assert_eq!(failure, None);
+            assert_eq!(messages, [Message::parse(LOGON).unwrap()]);
+            check_decode_with_alloc_limit(Frames::default, &wire, 2 * MAX_MESSAGE_SIZE);
+        }
+    }
+
+    #[test]
+    fn review_h_application_delivered_while_logout_sent() {
+        // Session Layer state 16 and section 4.6.3: deliver during recovery.
+        let mut session = established(Version::Fix44);
+        session.logout(b"bye", 0, TIME).unwrap();
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=8\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=088\x01", 1);
+        assert!(has_event(
+            &actions,
+            Event::Application {
+                sequence: 2,
+                possible_duplicate: false
+            }
+        ));
+        assert_eq!(session.next_inbound(), 3);
+    }
+
+    #[test]
+    fn malformed_peer_fields_reject_and_do_not_reopen_consumed_gaps() {
+        // FIX 4.4 Vol 2 cases 14.b, 14.e, 14.f, 14.h; Session Layer 4.5.4.
+        for (bytes, version, tag, reason) in [
+            (b"8=FIX.4.4\x019=57\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=X\x0110=082\x01".as_slice(), Version::Fix44, 43, 5),
+            (b"8=FIX.4.4\x019=70\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x01141=X\x0110=166\x01".as_slice(), Version::Fix44, 141, 5),
+            (b"8=FIX.4.4\x019=62\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=N\x0143=Y\x0110=066\x01".as_slice(), Version::Fix44, 43, 13),
+            (b"8=FIX.4.4\x019=64\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01112=a\x01112=b\x0110=186\x01".as_slice(), Version::Fix44, 112, 13),
+            (b"8=FIX.4.4\x019=101\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x01122=20261006-12:00:00\x0110=201\x01".as_slice(), Version::Fix44, 122, 13),
+            (b"8=FIX.4.4\x019=67\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=86401\x0110=032\x01".as_slice(), Version::Fix44, 108, 5),
+            (b"8=FIX.4.4\x019=57\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x0110=069\x01".as_slice(), Version::Fix44, 108, 1),
+            (b"8=FIX.4.4\x019=59\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01108=30\x0110=162\x01".as_slice(), Version::Fix44, 98, 1),
+            (b"8=FIX.4.4\x019=64\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=x\x01108=30\x0110=197\x01".as_slice(), Version::Fix44, 98, 6),
+            (b"8=FIX.4.4\x019=63\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=x\x0110=145\x01".as_slice(), Version::Fix44, 108, 6),
+            (b"8=FIX.4.4\x019=57\x0135=2\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0116=0\x0110=044\x01".as_slice(), Version::Fix44, 7, 1),
+            (b"8=FIX.4.4\x019=61\x0135=2\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=1\x0116=x\x0110=021\x01".as_slice(), Version::Fix44, 16, 6),
+            (b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=x\x0110=120\x01".as_slice(), Version::Fix44, 36, 6),
+            (b"8=FIX.4.4\x019=52\x0135=0\x0134=x\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=150\x01".as_slice(), Version::Fix44, 34, 6),
+            (b"8=FIXT.1.1\x019=64\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=203\x01".as_slice(), Version::Fixt11, 1137, 1),
+        ] {
+            let mut session = established(version);
+            let actions = received_bytes(&mut session, bytes, 1);
+            assert!(has_event(&actions, Event::Rejected { sequence: 2, tag, reason }), "{tag}");
+            assert_eq!(sends(&actions)[0].get(373), Some(reason.to_string().as_bytes()));
+            assert_eq!(session.next_inbound(), 3);
+            assert_eq!(session.state(), SessionState::Established);
+            // Repeating the same malformed sequence cannot trigger its own
+            // ResendRequest again, or roll back the previous inbound advance.
+            let again = received_bytes(&mut session, bytes, 2);
+            assert!(sends(&again).iter().all(|m| m.msg_type() != b"2"));
+            assert!(session.next_inbound() >= 3);
+        }
+    }
+
+    #[test]
+    fn invalid_initial_logon_fields_close_without_changing_acceptor_counters() {
+        // Session Layer 4.3.1. Validate fields before applying ResetSeqNumFlag.
+        for role in [Role::Acceptor, Role::Initiator] {
+            for bytes in [
+                b"8=FIXT.1.1\x019=77\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x01141=X\x011137=6\x0110=058\x01".as_slice(),
+                b"8=FIXT.1.1\x019=80\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=86401\x01141=Y\x011137=6\x0110=213\x01".as_slice(),
+                b"8=FIXT.1.1\x019=70\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01141=Y\x011137=6\x0110=250\x01".as_slice(),
+                b"8=FIXT.1.1\x019=72\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01108=30\x01141=Y\x011137=6\x0110=087\x01".as_slice(),
+                b"8=FIXT.1.1\x019=70\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x01141=Y\x0110=244\x01".as_slice(),
+            ] {
+                let mut config = SessionConfig::new(Version::Fixt11, role, "LOCAL", "PEER").unwrap();
+                config.allow_logon_reset = true;
+                let mut session = Session::new(config, 7, 9, 0).unwrap();
+                if role == Role::Initiator { session.start(0, TIME, true).unwrap(); }
+                let before = (session.next_inbound(), session.next_outbound());
+                let actions = received_bytes(&mut session, bytes, 1);
+                assert_eq!(session.state(), SessionState::Closed);
+                if role == Role::Acceptor {
+                    assert!(sends(&actions).is_empty());
+                    assert_eq!((session.next_inbound(), session.next_outbound()), before);
+                } else {
+                    assert_eq!(sends(&actions).len(), 1);
+                    assert_eq!(sends(&actions)[0].msg_type(), b"5");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn missing_sequence_is_fatal_and_compid_mismatch_rejects_before_logout() {
+        // Session Layer 4.5.3; FIX 4.4 Vol 2 case 2.k.
+        let mut session = established(Version::Fix44);
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=47\x0135=0\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=125\x01", 1);
+        assert_eq!(sends(&actions).len(), 1);
+        assert_eq!(sends(&actions)[0].msg_type(), b"5");
+        assert_eq!(session.state(), SessionState::Closed);
+        assert_eq!(session.next_inbound(), 2);
+        let mut session = established(Version::Fix44);
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=52\x0135=0\x0134=2\x0149=EVIL\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=084\x01", 1);
+        let sent = sends(&actions);
+        assert_eq!(
+            sent.iter().map(Message::msg_type).collect::<Vec<_>>(),
+            [b"3", b"5"]
+        );
+        assert_eq!(sent[0].get(373), Some(b"9".as_slice()));
+        assert_eq!(session.next_inbound(), 3);
+        assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn lower_duplicates_ignore_timestamp_order() {
+        // FIX 4.4 Vol 2 cases 2.e and 2.f.
+        let mut session = established(Version::Fix44);
+        assert_eq!(received_bytes(&mut session, b"8=FIX.4.4\x019=79\x0135=8\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:02\x0110=136\x01", 1), [Action::Event(Event::Duplicate(1))]);
+        assert_eq!(session.next_inbound(), 2);
+    }
+
+    #[test]
+    fn sending_time_tolerance_is_optional_and_handles_calendar_boundaries() {
+        // FIX 4.4 Vol 2 case 2.o; Session Layer 4.2.3.
+        let bytes = b"8=FIX.4.4\x019=52\x0135=8\x0134=2\x0149=PEER\x0152=20261231-23:59:00.000\x0156=LOCAL\x0110=103\x01";
+        let message = Message::parse(bytes).unwrap();
+        let mut session = established(Version::Fix44);
+        assert!(has_event(
+            &session.receive(&message, 1, TIME).unwrap(),
+            Event::Application {
+                sequence: 2,
+                possible_duplicate: false
+            }
+        ));
+        for (time, accepted) in [
+            (b"20270101-00:01:00.000".as_slice(), true),
+            (b"20270101-00:01:00.001".as_slice(), false),
+            (b"20261231-23:56:59.999".as_slice(), false),
+        ] {
+            let mut session = established(Version::Fix44);
+            session.config.sending_time_tolerance_ms = Some(120_000);
+            let actions = session.receive(&message, 1, time).unwrap();
+            checked(&actions);
+            if accepted {
+                assert!(sends(&actions).is_empty());
+                assert_eq!(session.state(), SessionState::Established);
+            } else {
+                let sent = sends(&actions);
+                assert_eq!(sent.len(), 2);
+                assert_eq!(sent[0].get(373), Some(b"10".as_slice()));
+                assert_eq!(sent[1].msg_type(), b"5");
+                assert_eq!(session.state(), SessionState::Closed);
+            }
+            assert_eq!(session.next_inbound(), 3);
+        }
+    }
+
+    #[test]
+    fn logout_can_omit_text_and_replay_can_use_original_time_alone() {
+        // Session Layer 9.6 (optional Text), 4.8.4 (original timestamp).
+        let mut session = established(Version::Fix44);
+        assert!(
+            sends(&session.logout(b"", 1, TIME).unwrap())[0]
+                .get(58)
+                .is_none()
+        );
+        let stored = Message::parse(b"8=FIX.4.4\x019=49\x0135=8\x0134=1\x0149=LOCAL\x0156=PEER\x01122=20261006-12:00:00\x0110=204\x01").unwrap();
+        let actions = session.replay(&stored, 2, LATER).unwrap();
+        assert_eq!(sends(&actions)[0].get(122), Some(TIME));
+    }
+
+    #[test]
+    fn initiator_logon_before_start_names_unexpected_logon() {
+        let mut session = Session::new(
+            SessionConfig::new(Version::Fix44, Role::Initiator, "LOCAL", "PEER").unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=64\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=124\x01", 1);
+        assert_eq!(
+            sends(&actions)[0].get(58),
+            Some(b"Unexpected Logon".as_slice())
+        );
+    }
+
+    #[test]
+    fn resend_disjoint_ranges_stay_queued_and_touching_ranges_merge() {
+        // Session Layer 4.8.3: replay only the requested inclusive ranges.
+        let mut session = established(Version::Fix44);
+        session.outgoing = 40_001;
+        let first = received_bytes(&mut session, b"8=FIX.4.4\x019=69\x0135=2\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=10005\x0116=40000\x0110=094\x01", 1);
+        assert!(has_event(
+            &first,
+            Event::Resend {
+                begin: 10005,
+                end: 20004
+            }
+        ));
+        let second = received_bytes(&mut session, b"8=FIX.4.4\x019=61\x0135=2\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=1\x0116=3\x0110=209\x01", 2);
+        assert!(has_event(
+            &second,
+            Event::Resend {
+                begin: 20005,
+                end: 30004
+            }
+        ));
+        assert_eq!(
+            session.next_resend_range(),
+            Some(Event::Resend {
+                begin: 30005,
+                end: 40000
+            })
+        );
+        assert_eq!(
+            session.next_resend_range(),
+            Some(Event::Resend { begin: 1, end: 3 })
+        );
+        assert_eq!(session.next_resend_range(), None);
+        session.replay_ranges.push_back((10001, 20000));
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=69\x0135=2\x0134=4\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=20001\x0116=20003\x0110=094\x01", 3);
+        assert!(has_event(
+            &actions,
+            Event::Resend {
+                begin: 10001,
+                end: 20000
+            }
+        ));
+        assert_eq!(
+            session.next_resend_range(),
+            Some(Event::Resend {
+                begin: 20001,
+                end: 20003
+            })
+        );
+        assert_eq!(session.next_resend_range(), None);
+    }
+
+    #[test]
+    fn bodylength_leading_zeros_normalize_and_encoded_limit_is_exact() {
+        // FIX TagValue Encoding 5.1: BodyLength is derived.
+        let bytes = b"8=FIX.4.4\x019=005\x0135=0\x0110=003\x01";
+        let parsed = Message::parse(bytes).unwrap();
+        assert_eq!(
+            parsed.to_bytes().unwrap(),
+            b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01"
+        );
+        check_wire::<Message>(bytes);
+        let mut message = Message::new(Version::Fix44, b"8").unwrap();
+        for _ in 0..3 {
+            message.push(58, &vec![b'x'; MAX_VALUE_LENGTH]).unwrap();
+        }
+        // The final BodyLength has seven digits; the fourth field adds four
+        // bytes for its tag, equals sign, and delimiter.
+        let remaining =
+            MAX_MESSAGE_SIZE - message.stored_size - (3 + digits(MAX_MESSAGE_SIZE) + 7) - 4;
+        message.push(58, &vec![b'x'; remaining]).unwrap();
+        let wire = message.to_bytes().unwrap();
+        assert_eq!(wire.len(), MAX_MESSAGE_SIZE);
+        check_wire::<Message>(&wire);
+        check_wire_value(&message);
+        assert_eq!(Message::parse(&wire), Ok(message.clone()));
+        assert_eq!(message.push(58, b"x"), Err(Error::Limit));
+        let mut frames = Frames::default();
+        assert!(matches!(
+            frames.decode(&wire, false),
+            Ok(Step::Item(_, MAX_MESSAGE_SIZE))
+        ));
+    }
+
+    #[test]
+    fn garbled_count_tracks_skips_and_saturates() {
+        let bad = b"8=FIX.4.4\x019=9\x0135=0\x0158=\x0110=082\x01";
+        let mut frames = Frames::default();
+        assert_eq!(frames.decode(bad, false), Ok(Step::Skip(bad.len())));
+        assert_eq!(frames.garbled(), 1);
+        frames.garbled = u64::MAX;
+        assert_eq!(frames.decode(bad, false), Ok(Step::Skip(bad.len())));
+        assert_eq!(frames.garbled(), u64::MAX);
+    }
+
+    #[test]
+    fn public_example_and_derived_heartbeat_exact_bytes_and_contracts() {
         for bytes in [LOGON, HEARTBEAT] {
             let message = Message::parse(bytes).unwrap();
             assert_eq!(message.to_bytes().unwrap(), bytes);
             check_wire::<Message>(bytes);
             check_wire_value(&message);
-            check_decode_with_alloc_limit(|| Frames, bytes, 2 * MAX_MESSAGE_SIZE);
+            check_decode_with_alloc_limit(Frames::default, bytes, 2 * MAX_MESSAGE_SIZE);
             for n in 0..bytes.len() {
                 assert!(Message::parse(bytes.get(..n).unwrap()).is_err());
             }
         }
         assert_eq!(Message::parse(LOGON).unwrap().get(108), Some(&b"30"[..]));
         let stream = [LOGON, HEARTBEAT].concat();
-        let (messages, failure) = decode_all(|| Frames, &stream);
+        let (messages, failure) = decode_all(Frames::default, &stream);
         assert_eq!(failure, None);
         assert_eq!(messages.len(), 2);
         assert_eq!(Message::parse(&stream), Err(Error::Trailing));
-        check_decode_with_alloc_limit(|| Frames, &stream, 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(Frames::default, &stream, 2 * MAX_MESSAGE_SIZE);
     }
 
     #[test]
@@ -2171,7 +2776,7 @@ mod tests {
             let wire = wire_body(body);
             assert!(Message::parse(&wire).is_err(), "{body:?}");
             check_wire::<Message>(&wire);
-            check_decode_with_alloc_limit(|| Frames, &wire, 2 * MAX_MESSAGE_SIZE);
+            check_decode_with_alloc_limit(Frames::default, &wire, 2 * MAX_MESSAGE_SIZE);
         }
         let mut corrupted = LOGON.to_vec();
         *corrupted.last_mut().unwrap() = b'0';
@@ -2192,9 +2797,13 @@ mod tests {
             b"8=FIX.4.4\x019=0\x01",
             b"8=FIX.4.4\x019=-1\x01",
         ] {
-            assert!(Frames.decode(bytes, false).is_err());
+            assert!(Frames::default().decode(bytes, false).is_err());
         }
-        check_decode_with_alloc_limit(|| Frames, &[b'x'; MAX_PREFIX_SIZE], 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(
+            Frames::default,
+            &[b'x'; MAX_PREFIX_SIZE],
+            2 * MAX_MESSAGE_SIZE,
+        );
     }
 
     #[test]
@@ -2209,7 +2818,7 @@ mod tests {
                 Some(data.as_slice())
             );
             check_wire_value(&message);
-            check_decode_with_alloc_limit(|| Frames, &wire, 2 * MAX_MESSAGE_SIZE);
+            check_decode_with_alloc_limit(Frames::default, &wire, 2 * MAX_MESSAGE_SIZE);
         }
         for body in [
             b"35=A\x0196=abc\x01".as_slice(),
@@ -2474,10 +3083,7 @@ mod tests {
             ));
             let logout = sends(&client.logout(b"done", 5, TIME).unwrap()).remove(0);
             let actions = server.receive(&logout, 6, TIME).unwrap();
-            assert!(has_event(
-                &actions,
-                Event::Disconnected(CloseReason::Logout)
-            ));
+            assert_eq!(server.state(), SessionState::LogoutReceived);
             let reply = sends(&actions).remove(0);
             assert!(has_event(
                 &client.receive(&reply, 7, TIME).unwrap(),
@@ -2502,8 +3108,7 @@ mod tests {
         let test = sends(&s.tick(31_000, TIME).unwrap()).remove(0);
         assert_eq!(test.msg_type(), b"1");
         let mut timed_out = s.clone();
-        let wrong = inbound(Version::Fix44, b"0", 2, &[(112, b"wrong")]);
-        timed_out.receive(&wrong, 31_100, TIME).unwrap();
+
         assert!(has_event(
             &timed_out.tick(62_000, TIME).unwrap(),
             Event::Disconnected(CloseReason::TestRequestTimeout)
@@ -2668,8 +3273,13 @@ mod tests {
         checked(&events);
         assert!(has_event(
             &events,
-            Event::Disconnected(CloseReason::Protocol)
+            Event::Rejected {
+                sequence: 999,
+                tag: 36,
+                reason: 5
+            }
         ));
+        assert_eq!(s.state(), SessionState::Established);
         assert_eq!(s.next_inbound(), 50);
     }
 
@@ -2805,7 +3415,7 @@ mod tests {
     }
 
     #[test]
-    fn fixt_application_version_occupies_the_sixth_wire_field() {
+    fn fixt_writer_orders_application_version_but_reader_accepts_other_positions() {
         let mut s = established(Version::Fixt11);
         let mut body = Message::new(Version::Fixt11, b"D").unwrap();
         body.push(11, b"order").unwrap().push(1128, b"4").unwrap();
@@ -2813,10 +3423,13 @@ mod tests {
         assert_eq!(outbound.fields().get(4).unwrap().tag(), 1128);
         let replay = sends(&s.replay(&outbound, 2, LATER).unwrap()).remove(0);
         assert_eq!(replay.fields().get(4).unwrap().tag(), 1128);
-        let invalid = inbound(Version::Fixt11, b"D", 2, &[(1128, b"4")]);
+        let reordered = inbound(Version::Fixt11, b"D", 2, &[(1128, b"4")]);
         assert!(has_event(
-            &s.receive(&invalid, 3, TIME).unwrap(),
-            Event::Disconnected(CloseReason::Protocol)
+            &s.receive(&reordered, 3, TIME).unwrap(),
+            Event::Application {
+                sequence: 2,
+                possible_duplicate: false
+            }
         ));
     }
 
@@ -2881,7 +3494,7 @@ mod tests {
         let mut message = Message::new(Version::Fix44, b"W").unwrap();
         message.push_data(95, &vec![SOH; 32 * 1024]).unwrap();
         let bytes = message.to_bytes().unwrap();
-        let mut stream = Stream::new(Frames);
+        let mut stream = Stream::new(Frames::default());
         for b in &bytes {
             assert_eq!(stream.push(&[*b]), 1);
             if let Some(item) = stream.next() {
@@ -2898,7 +3511,7 @@ mod tests {
                 *b ^= 0x80;
             }
             check_wire::<Message>(&bytes);
-            check_decode_with_alloc_limit(|| Frames, &bytes, 2 * MAX_MESSAGE_SIZE);
+            check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
         }
     }
 }
