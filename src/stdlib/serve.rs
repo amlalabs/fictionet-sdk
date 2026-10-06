@@ -10,15 +10,15 @@
 //! and events and timers out.
 //!
 //! [`serve`] is the one driver that joins a service to a
-//! [`Connection`](crate::stdlib::Connection): it reads, decodes, calls the
+//! [`Connection`]: it reads, decodes, calls the
 //! service, writes its reply, honors its timers, and closes. [`listen`]
-//! runs `serve` for every connection a [`tcp::Listener`] accepts, with a
+//! runs `serve` for every connection a [`Listener`] accepts, with a
 //! cap on how many are open, and TLS first when the options ask for it.
 //! [`serve_datagram`] does the same for a UDP socket, one datagram at a
 //! time. The driver carries the codec tools without the service knowing:
 //! a [`Transcript`] records both directions with a
-//! [`Recorder`](crate::stdlib::codec::Recorder), and a [`FaultPlan`] runs
-//! [`Faults`](crate::stdlib::codec::Faults) on the bytes and items in, and
+//! [`Recorder`], and a [`FaultPlan`] runs
+//! [`Faults`] on the bytes and items in, and
 //! the bytes out.
 //!
 //! A service that echoes each line back, and closes on `quit`:
@@ -62,7 +62,7 @@
 //! # struct Echo;
 //! # impl serve::Service for Echo {
 //! #     type Decode = fictionet::stdlib::codec::Lines; type World = (); type Error = std::convert::Infallible;
-//! #     fn decoder(&self) -> Self::Decode { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::Lf) }
+//! #     fn decoder(&self) -> Self::Decode { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
 //! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &(), _: &mut serve::ServeCtx<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # }
 //! # fn world(cx: &Cx, side: fictionet::End) -> Result {
@@ -725,6 +725,8 @@ struct ConnFaults<D: Decode> {
     front: Option<Stream<D>>,
 }
 
+// The fault engine hands the replacement type by reference, `&Vec<u8>`.
+#[allow(clippy::ptr_arg)]
 fn write_raw(value: &Vec<u8>, out: &mut Buffer) -> Result<(), RewriteError<Infallible>> {
     if value.len() > out.room() {
         return Err(RewriteError::TooLong { limit: out.limit() });
@@ -1317,9 +1319,8 @@ where
         match woke {
             Woke::Read(Ok(0)) => {
                 eof = true;
-                match &mut d.faults {
-                    Some(f) => f.inbound(&[], true, &mut d.queue),
-                    None => {}
+                if let Some(f) = &mut d.faults {
+                    f.inbound(&[], true, &mut d.queue);
                 }
             }
             Woke::Read(Ok(n)) => {

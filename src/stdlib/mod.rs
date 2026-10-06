@@ -20,9 +20,16 @@
 //! - **Links.** [`delay`] and [`bottleneck`] sit on an interface and change
 //!   how its packets travel, as a slow or distant link would. [`filter`]
 //!   shows each packet to your code, which can drop it.
-//! - **Websites.** [`web::Sites`] builds all of the above for you: DNS,
-//!   addresses, a router, one machine per address, TLS and HTTP. Start
-//!   there if the world is a set of websites.
+//! - **Services.** A [`serve::Service`] is the server side of one protocol
+//!   for one connection, written with no I/O. [`serve::serve`] and
+//!   [`serve::listen`] run it over a connection or a listener. HTTP is one
+//!   ([`httpd`]). Every service records what it sees in one
+//!   [`journal`].
+//! - **Networks.** [`net::Net`] builds all of the above for you: the
+//!   sandboxes' subnet, DNS, addresses, a router, one machine per address,
+//!   and each host's services. [`web::Sites`] is a preset on it for a world
+//!   of websites. Start there. [`scenario`] changes a running world on a
+//!   timeline and grades its journal.
 //!
 //! Every piece is ordinary code built from the same public items, so you
 //! can wire a network by hand when `Sites` does not fit. To put a link in
@@ -64,8 +71,8 @@
 //! - [`tcp::endpoint`] and [`udp::endpoint`] stop when their interface
 //!   closes.
 //!
-//! [`web::Sites::serve`] is the one function that starts many tasks: one
-//! for each part of the network it builds. Each task yields after at most 64
+//! [`net::Net::serve`] and [`web::Sites::serve`] start many tasks: one for
+//! each part of the network they build. Each task yields after at most 64
 //! packets in a row, so a busy interface cannot starve the rest of the run
 //! (see [`Cx::yield_now`]).
 //!
@@ -79,7 +86,9 @@
 //! | [`route::router`] | many interfaces with prefixes | a handle for adding routes later; it forwards between them |
 //! | [`tcp::endpoint`] | TCP packets and an address | listeners and connections |
 //! | [`udp::endpoint`] | UDP packets and an address | sockets |
+//! | [`net::Net::serve`] | the attachments, and the hosts with their services | nothing: it builds DNS, routing, machines and every service |
 //! | [`web::Sites::serve`] | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
+//! | [`serve::listen`] | a TCP listener, and a function that makes a service | the accepting task |
 //!
 //! **Functions you await.** These are `async`. They take `&Cx`, as every
 //! wait in Fictionet does, and run inside the task that awaits them. They
@@ -550,7 +559,7 @@ pub enum PortEvent {
 /// of them. The stdlib's routers, filters and links are built on it, and
 /// so can a world's own. It waits for the first packet on any interface, a deadline,
 /// or one extra source. It takes interfaces in turn, so that a busy one
-/// cannot starve the others. It yields after [`BUDGET`] packets in a row.
+/// cannot starve the others. It yields after 64 packets in a row.
 ///
 /// Each interface is polled with its own waker, which puts the interface in
 /// a queue of ready interfaces. A turn polls only the interfaces in that

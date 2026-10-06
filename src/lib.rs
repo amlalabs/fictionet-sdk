@@ -145,6 +145,70 @@
 //! [`running`] explains each step, how a world stops, and how to run one in
 //! a test with no socket at all.
 //!
+//! # Services on a network
+//!
+//! Most worlds are a network of hosts, each answering some protocols. Three
+//! stdlib modules make one in a few lines:
+//!
+//! - [`stdlib::serve`]: a [`Service`](stdlib::serve::Service) is the server
+//!   side of one protocol for one connection, with no I/O: it gets decoded
+//!   items, appends reply bytes, and records facts. One driver runs any
+//!   service over any connection, with timers, TLS, a transcript and fault
+//!   plans.
+//! - [`stdlib::net`]: a [`Net`](stdlib::net::Net) builds the network around
+//!   the [`Host`](stdlib::net::Host)s it is given: the sandboxes' subnet with
+//!   DHCP, DNS for every host's names, a router, one machine per address, and
+//!   each host's services on their ports.
+//! - [`stdlib::journal`]: one log for everything the network and its
+//!   services do, as a file a grader reads after the run, callbacks, or the
+//!   dashboard.
+//!
+//! HTTP is a service too ([`stdlib::httpd`]): a router whose handlers get
+//! byte bodies, or any tower service such as an axum `Router`. Here a web
+//! server and a line-echo service run on two hosts, with a journal on disk:
+//!
+//! ```
+//! use std::sync::Arc;
+//! use fictionet::{Attachments, Cx, Result};
+//! use fictionet::stdlib::codec::{Ending, LineError, Lines};
+//! use fictionet::stdlib::httpd::Router;
+//! use fictionet::stdlib::journal::{Event, Journal};
+//! use fictionet::stdlib::net::Net;
+//! use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
+//!
+//! /// Echoes each line back.
+//! struct Echo;
+//!
+//! impl Service for Echo {
+//!     type Decode = Lines;
+//!     type World = ();
+//!     type Error = std::convert::Infallible;
+//!     fn decoder(&self) -> Lines {
+//!         Lines::new(1024, Ending::LfOrCrlf)
+//!     }
+//!     fn on_item(&mut self, line: std::result::Result<Vec<u8>, LineError>, _: &(), ctx: &mut ServeCtx<'_>) -> std::result::Result<Flow, Self::Error> {
+//!         let line = line.unwrap_or_default();
+//!         ctx.log(Event::new("echo", "line").field("bytes", line.len() as u64));
+//!         ctx.reply().extend_from_slice(&line);
+//!         ctx.reply().push(b'\n');
+//!         Ok(Flow::Continue)
+//!     }
+//! }
+//!
+//! fn world(cx: &Cx, attachments: Attachments) -> Result {
+//!     let site = Router::new().get("/", |_, _| http::Response::new("hello\n".into()));
+//!     Net::new()
+//!         .journal(Journal::new().to_file(std::env::temp_dir().join("journal.jsonl"))?)
+//!         .host("www").dns_name("www.example.test").http(80, site).done()
+//!         .host("echo").dns_name("echo.example.test").tcp(7, Arc::new(()), || Echo).done()
+//!         .serve(cx, attachments)
+//! }
+//! ```
+//!
+//! [`stdlib::web::Sites`] is a preset on `Net` for a world of websites. The
+//! guide in `docs/services.md` walks through services, `Net`, the journal
+//! and scenarios step by step.
+//!
 //! # Where to go next
 //!
 //! 1. [`getting_started`]: from `cargo build` to an HTTPS request from a
@@ -154,8 +218,9 @@
 //!    and how to check that it works.
 //! 4. [`lowering`]: how each attach type turns what its sandbox sends
 //!    into IP packets, and what the world sees from each.
-//! 5. [`stdlib`], and then [`stdlib::web`]: the networking pieces a world
-//!    is built from, and a whole network of websites in a few lines.
+//! 5. [`stdlib`], then [`stdlib::net`] and [`stdlib::serve`]: the
+//!    networking pieces a world is built from, and a network of hosts and
+//!    services in a few lines. [`stdlib::web`] does the same for websites.
 //! 6. [`recipes`]: a delayed website, a slow or lossy link, a packet
 //!    capture, and a route that changes mid-run.
 //! 7. [`observe`]: watching a running world, in the dashboard or from a

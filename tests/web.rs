@@ -2310,6 +2310,7 @@ struct Blocked {
     dst_port: Option<u16>,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 enum Ev {
     Attached { sandbox: Sandbox },

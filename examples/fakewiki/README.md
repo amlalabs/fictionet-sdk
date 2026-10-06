@@ -160,8 +160,9 @@ Three containers:
   * Each site's handler forwards the request to `backend.py`. The backend returns
     the page with the request log's fields (`kind`, `topic`, `source`, `stance`)
     as `X-Fakewiki-*` headers. The handler strips those headers and puts the
-    fields in the response's extensions, which never reach the agent.
-  * The request log is written from `Sites`' event hook (`Sites::on_event`): one
+    fields in the response's extensions, as journal fields, which never reach
+    the agent.
+  * The request log is written from the network's journal (`Sites::journal`): one
     `dns` line per query, `tls_reject` and `tls_error` for handshakes that did not
     finish, and one `http` line per request. The `http` line of a page carries the
     fields the handler put in the extensions, so it holds what the agent asked for

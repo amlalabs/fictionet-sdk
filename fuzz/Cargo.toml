@@ -837,3 +837,10 @@ path = "fuzz_targets/http1_response_messages.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "serve_http1"
+path = "fuzz_targets/serve_http1.rs"
+test = false
+doc = false
+bench = false

@@ -166,21 +166,26 @@
 //! World code can send events of its own. Observers see each one with the
 //! task that sent it and the time on the world's clock. The dashboard lists
 //! them under **Events**, and a click shows the task. The `web_world`
-//! example sends one per HTTP request:
+//! example sends one per HTTP request, from its
+//! [journal](crate::stdlib::journal):
 //!
 //! ```
 //! # use fictionet::Cx;
-//! # use fictionet::stdlib::web;
-//! fn observed(cx: &Cx, event: &web::Event) {
-//!     if let web::Event::Http(h) = event {
+//! # use fictionet::stdlib::journal::Entry;
+//! fn observed(cx: &Cx, entry: &Entry) {
+//!     if entry.is("http", "request") {
 //!         cx.event("http_request")
-//!             .str("method", h.method.as_str())
-//!             .str("path", h.uri.path())
-//!             .int("status", h.status.map_or(0, |s| s.as_u16()))
+//!             .str("method", entry.str("method").unwrap_or(""))
+//!             .str("path", entry.str("path").unwrap_or(""))
+//!             .int("status", entry.u64("status").unwrap_or(0) as i64)
 //!             .emit();
 //!     }
 //! }
 //! ```
+//!
+//! A [`Journal`](crate::stdlib::journal::Journal) also shows every entry
+//! to observers itself, as an event named `service.kind` (`dns.query`,
+//! `http.request`), unless the world turns that off.
 //!
 //! [`Cx::event`](crate::Cx::event) builds a flat JSON object field by
 //! field. [`Cx::emit`](crate::Cx::emit) takes any JSON text, such as the
@@ -335,7 +340,7 @@
 //!
 //! ```text
 //! {"t":12.5,"started":1790989827708,"ended":false,
-//!  "nodes":[{"id":"t11","kind":"task","name":"net::filter","file":"src/stdlib/web/net.rs",
+//!  "nodes":[{"id":"t11","kind":"task","name":"net::filter","file":"src/stdlib/net.rs",
 //!            "line":243,"parent":"t10","started":0.113998},
 //!           {"id":"s7","kind":"sandbox","name":"agent"}],
 //!  "edges":[{"id":"e7","a":"t11","b":"s7","label":null}],
@@ -394,7 +399,7 @@
 //!
 //! ```text
 //! {"seq":527,"t":123.32,"node":"t7","kind":"event","task":"names::serve_udp",
-//!  "file":"src/stdlib/web/net.rs","line":442,"parent":"t1",
+//!  "file":"src/stdlib/net.rs","line":442,"parent":"t1",
 //!  "name":"dns_query","data":{"sandbox":"agent","name":"example.test","answer":"203.0.113.10"}}
 //! ```
 //!

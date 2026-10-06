@@ -5,7 +5,7 @@
 //! [`Net`] builds the whole network around the [`Host`]s a world declares.
 //! Each host has addresses, DNS names, and services on its ports: any
 //! [`Service`] over TCP or UDP, the same over TLS chosen by SNI, and HTTP
-//! sites ([`httpd`](crate::stdlib::httpd)) with name-based virtual hosting.
+//! sites ([`httpd`]) with name-based virtual hosting.
 //! Every sandbox that attaches is put on the sandboxes' subnet, given an
 //! address by DHCP or by its first packet, and kept from reaching the other
 //! sandboxes. A world then writes only its services.
@@ -21,7 +21,7 @@
 //! # macro_rules! svc { ($t:ty, $w:ty) => {
 //! # impl serve::Service for $t {
 //! #     type Decode = fictionet::stdlib::codec::Lines; type World = $w; type Error = std::convert::Infallible;
-//! #     fn decoder(&self) -> Self::Decode { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::Lf) }
+//! #     fn decoder(&self) -> Self::Decode { fictionet::stdlib::codec::Lines::new(64, fictionet::stdlib::codec::Ending::LfOrCrlf) }
 //! #     fn on_item(&mut self, _: Result<Vec<u8>, fictionet::stdlib::codec::LineError>, _: &$w, _: &mut serve::ServeCtx<'_>) -> std::result::Result<serve::Flow, Self::Error> { Ok(serve::Flow::Continue) }
 //! # } } }
 //! # svc!(Ldap, Directory); svc!(Plc, Plant);
@@ -470,6 +470,7 @@ impl Host {
 }
 
 /// [`Host`], while it is added to a [`Net`]: [`done`](Self::done) adds it.
+/// [`Net::add_host`] adds a host built on its own.
 pub struct HostBuilder {
     net: Net,
     host: Host,
@@ -649,7 +650,7 @@ impl Net {
     }
 
     /// Adds a host built on its own.
-    pub fn add(mut self, host: Host) -> Net {
+    pub fn add_host(mut self, host: Host) -> Net {
         self.hosts.push(host);
         self
     }

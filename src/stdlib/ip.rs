@@ -394,12 +394,12 @@ impl Reassembly {
     /// Takes a packet from the agent's side, as a host takes it in.
     ///
     /// An IPv6 packet's extension headers are checked with
-    /// [`wire::ext6_chain`] as it arrives, fragment or not. So the headers
+    /// `wire::ext6_chain` as it arrives, fragment or not. So the headers
     /// in front of every fragment are checked, not only the first
     /// fragment's (RFC 8200, section 4.5), and a first fragment must hold
     /// the whole chain (RFC 7112). Fragments are then put back together
-    /// ([`push`](Reassembly::push)). A whole IPv6 packet is checked again
-    /// and its extension headers taken out ([`wire::strip_ext6`]); that
+    /// (`push`). A whole IPv6 packet is checked again
+    /// and its extension headers taken out (`wire::strip_ext6`); that
     /// also drops a packet whose fragments held another fragment.
     pub fn intake(&mut self, packet: Packet, now: Instant) -> Intake {
         let refused = |packet: Packet, reject| {

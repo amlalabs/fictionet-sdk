@@ -8,7 +8,7 @@
 //!
 //! `Sites` is a preset on [`net::Net`](crate::stdlib::net::Net): each site
 //! is a [`Host`](crate::stdlib::net::Host) with a DNS name per site and a
-//! [`Website`](crate::stdlib::net::Website) on ports 80 and 443, made when
+//! [`Website`] on ports 80 and 443, made when
 //! its name is first looked up. HTTP is
 //! [`httpd`](crate::stdlib::httpd), a service like any other. A world that
 //! needs other services next to its websites builds on `Net` directly.
@@ -119,8 +119,8 @@
 //! `axum::Router` is one. So is a plain async function wrapped in
 //! `tower::service_fn`. So is `web::proxy()` (feature `tokio`, on by
 //! default), which forwards to the real site. [`Site::handler`] takes an
-//! [`httpd::Handler`](crate::stdlib::httpd::Handler) instead, such as an
-//! [`httpd::Router`](crate::stdlib::httpd::Router), whose handlers get plain
+//! [`httpd::Handler`] instead, such as an
+//! [`httpd::Router`], whose handlers get plain
 //! byte bodies and no runtime. A request's body is read whole before the
 //! handler is called, up to 64 MiB; past that the answer is `413`.
 //!
@@ -242,7 +242,7 @@
 //!   - a site without `tls`: served over plain HTTP on 80. A TLS handshake
 //!     for its name on 443 is rejected with `unrecognized_name`.
 //! - **HTTP/1.0, HTTP/1.1 and HTTP/2** on every connection: HTTP/1 with
-//!   [`httpd::Http1`](crate::stdlib::httpd::Http1), HTTP/2 with hyper for
+//!   [`httpd::Http1`], HTTP/2 with hyper for
 //!   now. Over TLS, the
 //!   version is agreed in the handshake (ALPN): `serve` sets the ALPN list
 //!   of each config to `h2` and `http/1.1`, so a browser gets HTTP/2 and
@@ -671,7 +671,7 @@ impl Site {
     }
 
     /// A site served by an [`httpd::Handler`], such as an
-    /// [`httpd::Router`](crate::stdlib::httpd::Router).
+    /// [`httpd::Router`].
     pub fn handler(handler: impl Handler) -> Site {
         Site { website: Website::new(handler), at: None, at_v6: None, family: Family::Both }
     }

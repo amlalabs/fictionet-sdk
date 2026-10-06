@@ -109,7 +109,7 @@ async fn world(cx: Cx, attachments: Attachments) -> Result {
         for &(port, kind) in m.ports {
             host = host.tcp(port, Arc::new(()), move || Port { kind, request: 0 });
         }
-        net = net.add(host);
+        net = net.add_host(host);
     }
     // Each sandbox goes through a short delay started in its own group, so
     // the group holds the task that reads the sandbox, and the sandbox with

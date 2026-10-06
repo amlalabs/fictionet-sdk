@@ -1,6 +1,6 @@
 //! HTTP as a service: a router whose handlers get plain byte bodies, an
 //! adapter that runs any tower service (axum included), and name-based
-//! virtual hosting, all on [`serve`](crate::stdlib::serve).
+//! virtual hosting, all on [`serve`].
 //!
 //! A [`Handler`] answers one request. Three kinds come ready:
 //!
@@ -8,7 +8,7 @@
 //!   gets an [`Exchange`] (the clock reading, randomness, the connection)
 //!   and an `http::Request<Bytes>`, and returns an `http::Response<Bytes>`.
 //!   No runtime is involved, so it unit-tests with
-//!   [`serve::Harness`](crate::stdlib::serve::Harness). An async route gets
+//!   [`serve::Harness`]. An async route gets
 //!   a [`Cx`] instead.
 //! - [`tower`]: any `tower_service::Service<http::Request<Body>>`, such as an
 //!   `axum::Router`, run as deferred work of the connection.
@@ -17,7 +17,7 @@
 //!   the `421 Misdirected Request` of [`web::Sites`](crate::stdlib::web::Sites).
 //!
 //! [`Http1`] is the [`Service`](crate::stdlib::serve::Service) that speaks
-//! HTTP/1.0 and 1.1 to a client, on [`http1`](crate::stdlib::http1)'s
+//! HTTP/1.0 and 1.1 to a client, on [`http1`]'s
 //! decoder: keep-alive, pipelining, `Expect: 100-continue`, `HEAD`, chunked
 //! responses for bodies of unknown length, and a 30-second limit on each
 //! request's head. [`serve_connection`] picks the version for a
@@ -57,7 +57,7 @@
 //! or what the handler set, such as `redirect`), `status`, `sent` (body
 //! bytes handed to the connection) and `complete` (whether the whole body
 //! was). A handler adds its own fields by putting
-//! [`Fields`](crate::stdlib::journal::Fields) in its response's
+//! [`Fields`] in its response's
 //! extensions; they come first, and the service's own facts win a clash.
 //! A connection that ends in an error is one `http.error` event, with
 //! `local`, `cause` (`protocol`, `timeout` or `transport`) and `detail`.
@@ -998,10 +998,13 @@ mod serve_fail {
 /// bytes sent stays close to what went out.
 const PIECE: usize = 16 * 1024;
 
+/// A handler's response, on its way.
+type Making = Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>;
+
 /// A response being made or streamed, as deferred work of a connection.
 struct Streaming {
     work: Option<Later>,
-    making: Option<Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send>>>,
+    making: Option<Making>,
     body: Option<Body>,
     rest: Bytes,
     response: Option<Response<Body>>,

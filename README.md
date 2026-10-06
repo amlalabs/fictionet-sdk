@@ -119,7 +119,7 @@ watches:
 
 ```text
 {"event":"note","data":{"seq":4,"t":4.050251,"node":"t32","kind":"event","task":"execute","file":"src/stdlib/web.rs","line":1299,"parent":"t31","name":"http_request","data":{"sandbox":"agent","method":"GET","host":"example.test","path":"/","status":200,"bytes":48}}}
-{"event":"note","data":{"seq":7,"t":4.063997,"node":"t33","kind":"event","task":"http_serve::accept","file":"src/stdlib/web/http_serve.rs","line":94,"parent":"t29","name":"http_request","data":{"sandbox":"agent","method":"GET","host":"example.test","path":"/","status":301,"bytes":31}}}
+{"event":"note","data":{"seq":7,"t":4.063997,"node":"t33","kind":"event","task":"net::accept","file":"src/stdlib/net.rs","line":1336,"parent":"t29","name":"http_request","data":{"sandbox":"agent","method":"GET","host":"example.test","path":"/","status":301,"bytes":31}}}
 ```
 
 `fictionet dashboard` shows the same world in a browser
