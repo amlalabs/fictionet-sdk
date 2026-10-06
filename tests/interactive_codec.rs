@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::codec::{
     AssembleError, Decode, Fail, Step, Stream, Wire, contract, finish, pump,
-    test_support::{Lcg, chunks, decode_all},
+    Lcg, test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{telnet as tn, websocket as ws};
 

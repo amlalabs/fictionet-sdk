@@ -746,3 +746,10 @@ path = "fuzz_targets/rdp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "codegen_ir"
+path = "fuzz_targets/codegen_ir.rs"
+test = false
+doc = false
+bench = false

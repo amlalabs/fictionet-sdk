@@ -1857,7 +1857,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         Fail, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Lcg, test_support::{mutate, decode_all},
     };
 
     fn rr(ssrc: u32) -> Packet {

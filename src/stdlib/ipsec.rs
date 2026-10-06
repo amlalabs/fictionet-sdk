@@ -658,7 +658,7 @@ impl Wire for AhHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, Lcg, test_support::{decode_all, mutate}};
 
     fn check<M>(limit: usize, b: &[u8]) -> Result<M, IpsecError>
     where M: Wire<ParseError = IpsecError, WriteError = IpsecError> + Clone + std::fmt::Debug + PartialEq {

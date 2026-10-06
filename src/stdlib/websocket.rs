@@ -1547,7 +1547,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         AssembleError, Decode, Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, test_support::{decode_all, mutate},
     };
 
     // RFC 6455 section 5.7.

@@ -1,8 +1,8 @@
 //! Chunked bodies and RESP streams through the shared codec driver.
 
 use fictionet::stdlib::codec::{
-    Decode, Fail, Stream, Wire, contract, finish, pump,
-    test_support::{Lcg, decode_all, mutate},
+    Decode, Fail, Lcg, Stream, Wire, contract, finish, pump,
+    test_support::{decode_all, mutate},
 };
 use fictionet::stdlib::{resp, sdp, wake_on_lan as wol};
 

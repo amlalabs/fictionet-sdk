@@ -1627,7 +1627,7 @@ fn parse_reply(data: &[u8]) -> Result<Reply, MessageError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, Lcg, test_support::{mutate, decode_all}};
 
     fn s(v: &str) -> Bson {
         Bson::String(v.to_owned())

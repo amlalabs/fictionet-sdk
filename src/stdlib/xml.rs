@@ -2164,7 +2164,8 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{Fail, Stream, contract, pump};
-    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+    use fictionet::stdlib::codec::Lcg;
+    use fictionet::stdlib::codec::test_support::{decode_all, mutate};
 
     fn built_text(builder: Builder) -> Result<String, ErrorKind> {
         let document = builder.build()?;

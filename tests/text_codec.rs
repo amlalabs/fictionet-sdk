@@ -2,7 +2,7 @@
 
 use fictionet::stdlib::codec::{
     self, Decode, Fail, Step, Stream, Wire, contract, finish, pump,
-    test_support::{Lcg, decode_all, mutate},
+    Lcg, test_support::{decode_all, mutate},
 };
 use fictionet::stdlib::{ftp, memcache, whois};
 use std::fmt::Debug;

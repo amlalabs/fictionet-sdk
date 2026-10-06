@@ -209,6 +209,7 @@ dependencies = [
  "axum",
  "bytes",
  "etherparse",
+ "fictionet-codegen",
  "fictionet-copy-modules",
  "h2",
  "hickory-proto",
@@ -227,6 +228,10 @@ dependencies = [
  "tokio",
  "tower-service",
 ]
+
+[[package]]
+name = "fictionet-codegen"
+version = "0.1.0"
 
 [[package]]
 name = "fictionet-copy-modules"

@@ -1,0 +1,172 @@
+{
+  "doc": "Every scalar width, null sentinels, and data forms.",
+  "byte_order": "little",
+  "types": [
+    {
+      "name": "primitive message",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "value_u8",
+          "type": "u8"
+        },
+        {
+          "name": "value_u16",
+          "type": "u16"
+        },
+        {
+          "name": "value_u32",
+          "type": "u32",
+          "byte_order": "big",
+          "fixed_size": 4
+        },
+        {
+          "name": "value_u64",
+          "type": "u64"
+        },
+        {
+          "name": "value_i8",
+          "type": "i8"
+        },
+        {
+          "name": "value_i16",
+          "type": "i16"
+        },
+        {
+          "name": "value_i32",
+          "type": "i32"
+        },
+        {
+          "name": "value_i64",
+          "type": "i64"
+        },
+        {
+          "name": "value_f32",
+          "type": "f32"
+        },
+        {
+          "name": "value_f64",
+          "type": "f64"
+        },
+        {
+          "name": "null_u8",
+          "type": {
+            "kind": "optional",
+            "item": "u8",
+            "null": 255
+          }
+        },
+        {
+          "name": "null_u16",
+          "type": {
+            "kind": "optional",
+            "item": "u16",
+            "null": 65535
+          }
+        },
+        {
+          "name": "null_u32",
+          "type": {
+            "kind": "optional",
+            "item": "u32",
+            "null": 4294967295
+          }
+        },
+        {
+          "name": "null_u64",
+          "type": {
+            "kind": "optional",
+            "item": "u64",
+            "null": 18446744073709551615
+          }
+        },
+        {
+          "name": "null_i8",
+          "type": {
+            "kind": "optional",
+            "item": "i8",
+            "null": -128
+          }
+        },
+        {
+          "name": "null_i16",
+          "type": {
+            "kind": "optional",
+            "item": "i16",
+            "null": -32768
+          }
+        },
+        {
+          "name": "null_i32",
+          "type": {
+            "kind": "optional",
+            "item": "i32",
+            "null": -2147483648
+          }
+        },
+        {
+          "name": "null_i64",
+          "type": {
+            "kind": "optional",
+            "item": "i64",
+            "null": -9223372036854775808
+          }
+        },
+        {
+          "name": "null_f32",
+          "type": {
+            "kind": "optional",
+            "item": "f32",
+            "null": -999.0
+          }
+        },
+        {
+          "name": "null_f64",
+          "type": {
+            "kind": "optional",
+            "item": "f64",
+            "null": -999.0
+          }
+        },
+        {
+          "name": "type",
+          "type": {
+            "kind": "bytes",
+            "size": 4
+          }
+        },
+        {
+          "name": "fixed-text",
+          "type": {
+            "kind": "string",
+            "size": 3
+          }
+        },
+        {
+          "name": "data",
+          "type": {
+            "kind": "bytes",
+            "prefix": "u16",
+            "limit": 32
+          }
+        },
+        {
+          "name": "text",
+          "type": {
+            "kind": "string",
+            "prefix": "u8",
+            "limit": 24
+          }
+        },
+        {
+          "name": "maybe",
+          "type": {
+            "kind": "optional",
+            "item": "u32",
+            "flag": "u8"
+          }
+        }
+      ]
+    }
+  ]
+}

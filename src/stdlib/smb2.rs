@@ -2981,7 +2981,7 @@ fn le64(b: &[u8], at: usize) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, Lcg, test_support::{mutate, decode_all}};
 
     // The byte layouts below are built field by field from MS-SMB2,
     // section 2.2, not with this module's writers.

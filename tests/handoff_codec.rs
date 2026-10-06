@@ -1149,7 +1149,7 @@ fn rfb_frame_scan_accepts_raw_and_cursor_at_each_pixel_width() {
 
 #[test]
 fn contract_checks_small_arbitrary_inputs_and_wire_values() {
-    let mut random = codec::test_support::Lcg::new(0x1234_5678);
+    let mut random = codec::Lcg::new(0x1234_5678);
     for len in 0..80 {
         let bytes = random.bytes(len);
         contract::check_decode_with_alloc_limit(|| proxy::Headers::with_limit(32), &bytes, 2 * 32);

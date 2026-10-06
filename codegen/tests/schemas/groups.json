@@ -1,0 +1,110 @@
+{
+  "types": [
+    {
+      "name": "Status",
+      "kind": "enum",
+      "repr": "i16",
+      "variants": [
+        {
+          "name": "off",
+          "value": -1
+        },
+        {
+          "name": "on",
+          "value": 32767
+        }
+      ]
+    },
+    {
+      "name": "Flags",
+      "kind": "set",
+      "repr": "u64",
+      "bits": [
+        {
+          "name": "ready",
+          "bit": 0
+        },
+        {
+          "name": "last",
+          "bit": 63
+        }
+      ]
+    },
+    {
+      "name": "Entry",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "status",
+          "type": {
+            "kind": "ref",
+            "name": "Status"
+          }
+        },
+        {
+          "name": "flags",
+          "type": {
+            "kind": "ref",
+            "name": "Flags"
+          }
+        },
+        {
+          "name": "values",
+          "type": {
+            "kind": "group",
+            "item": {
+              "kind": "group",
+              "item": "i32",
+              "count": "u8",
+              "limit": 3
+            },
+            "count": "u16",
+            "limit": 3
+          },
+          "byte_order": "little"
+        }
+      ]
+    },
+    {
+      "name": "Batch",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "entries",
+          "type": {
+            "kind": "group",
+            "item": {
+              "kind": "ref",
+              "name": "Entry"
+            },
+            "count": "u8",
+            "limit": 3
+          }
+        },
+        {
+          "name": "label",
+          "type": {
+            "kind": "optional",
+            "item": {
+              "kind": "string",
+              "prefix": "u16",
+              "limit": 12
+            },
+            "flag": "u16"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Wire",
+      "doc": "A type whose source name matches the imported trait.",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "gen",
+          "type": "u8"
+        }
+      ]
+    }
+  ]
+}

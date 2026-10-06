@@ -522,7 +522,7 @@ mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
         contract,
-        test_support::{Lcg, mutate, decode_all},
+        Lcg, test_support::{mutate, decode_all},
     };
     fn rtp(payload: &[u8]) -> RtpPacket {
         RtpPacket {

@@ -1837,7 +1837,7 @@ impl<'a> Reader<'a> {
 mod tests {
     use fictionet::stdlib::codec::{
         contract,
-        test_support::{Lcg, mutate},
+        Lcg, test_support::{mutate},
     };
     use super::*;
 

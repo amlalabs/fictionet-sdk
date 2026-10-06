@@ -83,6 +83,7 @@ mod buffer;
 mod combinators;
 pub mod contract;
 mod demux;
+mod lcg;
 mod pipe;
 mod stream;
 pub mod test_support;
@@ -93,6 +94,7 @@ pub use combinators::{
     Map,
 };
 pub use demux::Demux;
+pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use stream::{Fail, PumpError, Stream, finish, pump, try_pump};
 
