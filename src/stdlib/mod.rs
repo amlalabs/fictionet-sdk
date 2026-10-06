@@ -159,6 +159,7 @@ pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
 pub mod hpack;
+pub mod http1;
 pub mod http3;
 pub mod huffman;
 pub mod icmp;

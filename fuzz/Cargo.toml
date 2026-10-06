@@ -809,3 +809,31 @@ path = "fuzz_targets/observe_tls.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http1_requests"
+path = "fuzz_targets/http1_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_responses"
+path = "fuzz_targets/http1_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_request_messages"
+path = "fuzz_targets/http1_request_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_response_messages"
+path = "fuzz_targets/http1_response_messages.rs"
+test = false
+doc = false
+bench = false
