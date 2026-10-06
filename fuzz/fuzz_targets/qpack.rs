@@ -6,6 +6,10 @@ use fictionet::stdlib::qpack::{
     Decoder, DecoderInstruction, Encoder, EncoderInstruction, Field, MAX_STRING, Representation, Section,
     huffman_decode, huffman_encode,
 };
+use fictionet::stdlib::{
+    codec::{Stream, contract},
+    qpack,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Every byte of a decoder stream must read as whole instructions.
@@ -17,10 +21,67 @@ fn assert_whole_instructions(mut b: &[u8]) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(qpack::EncoderInstructions::new, data);
+    contract::check_decode(qpack::DecoderInstructions::new, data);
+    contract::check_wire::<EncoderInstruction>(data);
+    contract::check_wire::<DecoderInstruction>(data);
+    contract::check_wire::<Representation>(data);
+    let integer = data.iter().take(8).fold(0u64, |n, b| (n << 8) | u64::from(*b));
+    let value = data.get(..data.len().min(MAX_STRING + 1)).unwrap_or_default().to_vec();
+    for ins in [
+        EncoderInstruction::SetCapacity(integer),
+        EncoderInstruction::Duplicate(integer),
+        EncoderInstruction::InsertWithNameRef { static_table: true, index: integer, value: value.clone() },
+        EncoderInstruction::InsertWithLiteralName { name: b"x-fuzz".to_vec(), value },
+    ] {
+        contract::check_wire_value(&ins);
+    }
+    for ins in [
+        DecoderInstruction::SectionAck(integer),
+        DecoderInstruction::StreamCancel(integer),
+        DecoderInstruction::InsertCountIncrement(integer),
+    ] {
+        contract::check_wire_value(&ins);
+    }
+
     // The first byte splits the rest, in proportion: an encoder stream, then
     // field sections.
     let Some((&split, rest)) = data.split_first() else { return };
     let (stream, section) = rest.split_at(usize::from(split) * rest.len() / 255);
+
+    // The same bytes through the new one-item API, with explicit session state.
+    let mut table = qpack::Table::new(4096);
+    let mut instructions = Stream::new(qpack::EncoderInstructions::new());
+    let mut input = stream;
+    while !input.is_empty() && !instructions.is_done() {
+        let n = instructions.push(input);
+        input = input.get(n..).unwrap_or_default();
+        let mut stop = false;
+        while let Some(item) = instructions.next() {
+            match item {
+                Ok(Ok(ins)) => {
+                    if table.apply(ins).is_err() {
+                        stop = true;
+                        break;
+                    }
+                }
+                _ => {
+                    stop = true;
+                    break;
+                }
+            }
+        }
+        if stop || n == 0 {
+            break;
+        }
+    }
+    if let Ok(qpack::SectionResult::Blocked(blocked)) = qpack::decode_section(&table, 0, section) {
+        let mut held = qpack::BlockedSections::new(4);
+        assert!(held.push(blocked).is_ok());
+        let _ = held.next_ready(&table);
+        let _ = held.cancel(&table, 0);
+        assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
+    }
 
     // The encoder stream, split two ways: all at once, and a byte at a time.
     let mut whole = Decoder::new(4096, 4, 16 << 10);
@@ -100,6 +161,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(huffman_decode(&huffman_encode(data)).as_deref(), Ok(cut));
     // Any bytes as a field value, written and read back.
     let rep = Representation::LiteralName { never_index: false, name: b"x".to_vec(), value: cut.to_vec() };
+    contract::check_wire_value(&rep);
     assert_eq!(Representation::parse(&rep.to_bytes()).map(|(r, _)| r), Ok(rep));
 
     // Any bytes as a decoder stream, read by an encoder that has inserted

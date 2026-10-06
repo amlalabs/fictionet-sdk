@@ -6,6 +6,15 @@
 //! Extended CONNECT follows RFC 9220 and RFC 8441. Priority dictionaries
 //! use the RFC 8941 grammar, including values and parameters we ignore.
 //!
+//! New connections use [`Connection`] to share one [`codec::Demux`] input
+//! budget. [`Frames`], [`ControlFrames`], and [`StreamHeaders`] also work
+//! directly with [`codec::Stream`]. A stream header yields one item, then
+//! `End`; `Stream::swap` preserves the first payload byte and all later bytes.
+//! QPACK tables, blocked sections, and acknowledgment values stay with the
+//! caller. [`RequestState`] validates decoded request/push frames;
+//! [`HeaderList::from_fields`] validates standalone received fields.
+//! The existing sessions below keep their original behavior.
+//!
 //! [`Decoder`] reads frames without stream context. [`ControlDecoder`]
 //! and [`RequestDecoder`] also enforce stream placement and ordering.
 //! Read a unidirectional stream's [`StreamHeader`] first; pass control or
@@ -51,7 +60,10 @@
 
 #![deny(missing_docs)]
 
-use super::{qpack, quic};
+use super::{
+    codec::{self, Decode, Step, Wire},
+    qpack, quic,
+};
 
 /// The greatest QUIC variable-length integer, including a stream or push ID.
 pub const MAX_VARINT: u64 = quic::MAX_VARINT;
@@ -380,6 +392,15 @@ fn known_frame(t: u64) -> bool {
 fn forbidden_frame(t: u64) -> bool {
     matches!(t, 2 | 6 | 8 | 9)
 }
+fn frame_payload_limit(kind: u64) -> usize {
+    match kind {
+        frame_type::HEADERS => MAX_SECTION_BYTES,
+        frame_type::SETTINGS => MAX_SETTINGS_BYTES,
+        frame_type::PUSH_PROMISE => MAX_SECTION_BYTES + 8,
+        frame_type::PRIORITY_UPDATE_REQUEST | frame_type::PRIORITY_UPDATE_PUSH => MAX_PRIORITY_BYTES + 8,
+        _ => MAX_FRAME_PAYLOAD,
+    }
+}
 fn field_bytes(b: &[u8]) -> Result<(), Error> {
     if b.len() > MAX_SECTION_BYTES { Err(Error::Limit) } else { Ok(()) }
 }
@@ -418,13 +439,7 @@ impl Frame {
         }
         let Some((len, b)) = varint(bytes.get(a..).ok_or(Error::Frame)?) else { return Ok(None) };
         let len = usize::try_from(len).map_err(|_| Error::Limit)?;
-        let limit = match t {
-            1 => MAX_SECTION_BYTES,
-            4 => MAX_SETTINGS_BYTES,
-            5 => MAX_SECTION_BYTES + 8,
-            0x0f0700 | 0x0f0701 => MAX_PRIORITY_BYTES + 8,
-            _ => MAX_FRAME_PAYLOAD,
-        };
+        let limit = frame_payload_limit(t);
         if len > limit {
             return Err(Error::Limit);
         }
@@ -1172,6 +1187,23 @@ fn uri_path(path: &[u8]) -> bool {
     true
 }
 impl HeaderList {
+    /// Validates received fields and normalizes repeated identical Content-Length
+    /// values to one field, as [`Self::decode`] does. For response context such
+    /// as HEAD or CONNECT, use [`RequestState`] to enforce message semantics.
+    pub fn from_fields(fields: Vec<qpack::Field>, kind: HeaderKind) -> Result<Self, Error> {
+        Self::received(fields, kind, false).map(|(headers, _)| headers)
+    }
+    fn received(
+        fields: Vec<qpack::Field>,
+        kind: HeaderKind,
+        connect_response: bool,
+    ) -> Result<(Self, HeaderInfo), Error> {
+        let mut headers = Self { fields };
+        let info = headers.info(kind, Receive { length_list: true, connect_response })?;
+        normalize_length(&mut headers.fields, info.content_length);
+        Ok((headers, info))
+    }
+
     /// Checks bounds, field characters, forbidden connection fields, pseudo-header
     /// placement and uniqueness, required fields, CONNECT and status rules.
     /// For non-HTTP schemes the caller also checks scheme-specific URI rules.
@@ -1411,16 +1443,13 @@ pub enum Endpoint {
 #[derive(Debug)]
 pub struct ControlDecoder {
     decoder: Decoder,
-    sender: Endpoint,
-    settings: bool,
-    goaway: Option<u64>,
-    max_push: Option<u64>,
+    state: ControlState,
     failed: bool,
 }
 impl ControlDecoder {
     /// Makes a decoder for a control stream sent by this endpoint.
     pub fn new(sender: Endpoint) -> Self {
-        Self { decoder: Decoder::new(), sender, settings: false, goaway: None, max_push: None, failed: false }
+        Self { decoder: Decoder::new(), state: ControlState::new(sender), failed: false }
     }
     /// Takes at most the available MAX_BUFFERED space and returns the count.
     pub fn feed(&mut self, bytes: &[u8]) -> usize {
@@ -1441,7 +1470,7 @@ impl ControlDecoder {
         }
         let result = self.decoder.next_frame()?;
         let result = result.and_then(|frame| {
-            self.accept(&frame)?;
+            self.state.accept(&frame)?;
             Ok(frame)
         });
         if result.is_err() {
@@ -1449,6 +1478,26 @@ impl ControlDecoder {
             self.decoder.fail();
         }
         Some(result)
+    }
+    /// Marks a control-stream FIN. A control stream is critical, so closure is
+    /// always CLOSED_CRITICAL_STREAM, even at a frame boundary.
+    pub fn finish(&mut self) -> Result<(), Error> {
+        self.failed = true;
+        self.decoder.fail();
+        Err(Error::ClosedCriticalStream)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ControlState {
+    sender: Endpoint,
+    settings: bool,
+    goaway: Option<u64>,
+    max_push: Option<u64>,
+}
+impl ControlState {
+    fn new(sender: Endpoint) -> Self {
+        Self { sender, settings: false, goaway: None, max_push: None }
     }
     fn accept(&mut self, frame: &Frame) -> Result<(), Error> {
         if !self.settings {
@@ -1484,13 +1533,6 @@ impl ControlDecoder {
             Frame::PriorityUpdate { .. } if self.sender != Endpoint::Client => Err(unexpected),
             _ => Ok(()),
         }
-    }
-    /// Marks a control-stream FIN. A control stream is critical, so closure is
-    /// always CLOSED_CRITICAL_STREAM, even at a frame boundary.
-    pub fn finish(&mut self) -> Result<(), Error> {
-        self.failed = true;
-        self.decoder.fail();
-        Err(Error::ClosedCriticalStream)
     }
 }
 
@@ -1560,85 +1602,44 @@ enum PendingSection {
 #[derive(Debug)]
 pub struct RequestDecoder {
     decoder: Decoder,
-    stream: u64,
-    side: MessageSide,
-    push: bool,
-    extended_connect: bool,
-    state: MessageState,
-    pending: Option<PendingSection>,
+    state: RequestState,
     retry: Option<Frame>,
-    content_length: Option<u64>,
-    body_bytes: u64,
-    no_content: bool,
-    no_trailers: bool,
-    tunnel: bool,
-    stopped: bool,
 }
 impl RequestDecoder {
     /// Makes a decoder for stream 0, 4, 8, and so on. Set extended_connect only
     /// when the server's ENABLE_CONNECT_PROTOCOL setting permits it.
     pub fn new(stream: u64, side: MessageSide, extended_connect: bool) -> Result<Self, Error> {
-        if stream > MAX_VARINT || !stream.is_multiple_of(4) {
-            return Err(Error::Id);
-        }
-        Ok(Self {
-            decoder: Decoder::new(),
-            stream,
-            side,
-            push: false,
-            extended_connect,
-            state: MessageState::Initial,
-            pending: None,
-            retry: None,
-            content_length: None,
-            body_bytes: 0,
-            no_content: false,
-            no_trailers: false,
-            tunnel: false,
-            stopped: false,
-        })
+        Ok(Self { decoder: Decoder::new(), state: RequestState::new(stream, side, extended_connect)?, retry: None })
     }
     /// Makes a response decoder for a server-initiated unidirectional push
     /// stream (IDs 3, 7, 11, ...). Its type and push ID must already be read.
     /// Push permissions and duplicate push streams are checked by the caller.
     /// It reads a response to GET; call set_push_side for a promised HEAD.
     pub fn push(stream: u64) -> Result<Self, Error> {
-        if stream > MAX_VARINT || stream % 4 != 3 {
-            return Err(Error::Id);
-        }
-        let mut decoder = Self::new(0, MessageSide::Response, false)?;
-        decoder.stream = stream;
-        decoder.push = true;
-        Ok(decoder)
+        Ok(Self { decoder: Decoder::new(), state: RequestState::push(stream)?, retry: None })
     }
     /// Sets the promised method's response side on a push stream: Response
-    /// or HeadResponse. Push stream bytes can arrive before their PUSH_PROMISE,
-    /// so feed may run first; call this before next_event returns the final
-    /// headers. Other sides, request streams and later calls are State errors.
+    /// or HeadResponse. Call before final headers; other sides or later calls
+    /// return State. Feed may run before this method.
     pub fn set_push_side(&mut self, side: MessageSide) -> Result<(), Error> {
-        if !self.push
-            || self.stopped
-            || self.state != MessageState::Initial
-            || self.pending.is_some()
-            || !matches!(side, MessageSide::Response | MessageSide::HeadResponse)
-        {
-            return Err(Error::State);
-        }
-        self.side = side;
-        Ok(())
+        self.state.set_push_side(side)
     }
     /// The QUIC stream ID to use when routing QPACK results.
     pub fn stream_id(&self) -> u64 {
-        self.stream
+        self.state.stream_id()
     }
     /// Whether QPACK is retaining a section that must be passed to resume.
     pub fn is_blocked(&self) -> bool {
-        self.pending.is_some()
+        self.state.is_blocked()
     }
     /// Copies input and returns the count taken. A blocked, stopped or QPACK
     /// backlog decoder takes zero; otherwise drain events and retry the suffix.
     pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.stopped || self.pending.is_some() || self.retry.is_some() { 0 } else { self.decoder.feed(bytes) }
+        if self.state.stopped || self.state.pending.is_some() || self.retry.is_some() {
+            0
+        } else {
+            self.decoder.feed(bytes)
+        }
     }
     /// Retained input and retry section bytes, at most MAX_STREAM_BUFFERED.
     pub fn buffered(&self) -> usize {
@@ -1659,9 +1660,224 @@ impl RequestDecoder {
             }
     }
     fn fail(&mut self) {
-        self.stopped = true;
+        self.state.fail();
         self.decoder.fail();
         self.retry = None;
+    }
+    /// Takes one event using the connection's shared QPACK decoder. None means
+    /// more input or a blocked section is needed. Backlog preserves the encoded
+    /// section for retry after QPACK output is drained.
+    pub fn next_event(&mut self, qpack: &mut qpack::Decoder) -> Option<Result<Event, Error>> {
+        if self.state.stopped || self.state.pending.is_some() {
+            return None;
+        }
+        let frame = match self.retry.take() {
+            Some(frame) => frame,
+            None => match self.decoder.next_frame()? {
+                Ok(frame) => frame,
+                Err(e) => {
+                    self.fail();
+                    return Some(Err(e));
+                }
+            },
+        };
+        let pending = match self.state.pending_section(&frame) {
+            Ok(pending) => pending,
+            Err(e) => {
+                self.fail();
+                return Some(Err(e));
+            }
+        };
+        let result = if let Some((pending, bytes)) = pending {
+            match qpack.decode_section(self.state.stream, bytes) {
+                Ok(qpack::Section::Fields(fields)) => self.state.accept_fields(pending, fields),
+                Ok(qpack::Section::Blocked) => {
+                    self.state.pending = Some(pending);
+                    Ok(Event::Blocked)
+                }
+                Err(qpack::Error::Backlog) => {
+                    self.retry = Some(frame);
+                    return Some(Err(Error::Qpack(qpack::Error::Backlog)));
+                }
+                Err(e) => Err(Error::Qpack(e)),
+            }
+        } else {
+            self.state.accept_frame(&frame)
+        };
+        if result.is_err() {
+            self.fail();
+        }
+        Some(result)
+    }
+    /// Supplies the matching result from qpack::Decoder::next_unblocked. A
+    /// different stream ID is a local State error and leaves this decoder alone.
+    /// The supplied fields are bounded and checked just like immediate results.
+    pub fn resume(&mut self, stream: u64, fields: Result<Vec<qpack::Field>, qpack::Error>) -> Result<Event, Error> {
+        if stream != self.state.stream || self.state.stopped {
+            return Err(Error::State);
+        }
+        let pending = self.state.pending.take().ok_or(Error::State)?;
+        let result = fields.map_err(Error::Qpack).and_then(|fields| self.state.accept_fields(pending, fields));
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// Checks a stream FIN after draining events. A blocked section must be
+    /// resumed first; State leaves it intact. Partial frames are FRAME_ERROR,
+    /// missing final headers are REQUEST_INCOMPLETE, and length mismatches are
+    /// MESSAGE_ERROR. Success closes the decoder to further input.
+    pub fn finish(&mut self) -> Result<(), Error> {
+        if self.state.stopped || self.state.pending.is_some() || self.retry.is_some() {
+            return Err(Error::State);
+        }
+        let result = if self.decoder.buffered() > 0 { Err(Error::Frame) } else { self.state.finish() };
+        self.fail();
+        result
+    }
+}
+
+/// One request-session result. The caller owns blocked sections and output instructions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestResult {
+    /// An HTTP event or field-validation error, with its QPACK acknowledgment.
+    /// Even rejected HTTP fields can form a successfully decoded QPACK section;
+    /// send its acknowledgment before handling the HTTP stream error.
+    Event {
+        /// The message event, with received field lists normalized, or their error.
+        event: Result<Event, Error>,
+        /// Send this value on the decoder stream before taking an insert increment.
+        ack: Option<qpack::DecoderInstruction>,
+    },
+    /// Call [`Connection::pause`] until the section can be retried, then
+    /// [`RequestState::resume`] and [`Connection::unpause`] before reading more frames.
+    Blocked(qpack::BlockedSection),
+}
+
+/// Request or push message state over decoded [`Frame`] values.
+///
+/// Drive [`Frames`] with [`codec::Stream`] or route [`Connection`] frame items
+/// here. This state shares message checks with [`RequestDecoder`]: HEADERS and
+/// DATA ordering, trailers, interim responses, CONNECT, and Content-Length.
+/// Received duplicate identical Content-Length values are normalized.
+/// No input, blocked field bytes, or acknowledgment queue is retained here.
+/// Hold returned blocked sections in [`qpack::BlockedSections`] and call
+/// [`Connection::pause`] for this stream (or stop driving its standalone
+/// [`codec::Stream`]). Pass its retried result to [`Self::resume`], then call
+/// [`Connection::unpause`] once it is no longer blocked. Send every returned
+/// acknowledgment in order, even on reset, before [`qpack::Table::take_increment`].
+/// Use [`Self::with_field_limit`] to enforce the advertised
+/// SETTINGS_MAX_FIELD_SECTION_SIZE on immediate and retried sections.
+/// Protocol errors stop the session; local [`Error::State`] leaves it intact.
+/// After the byte decoder reaches a clean FIN, call [`Self::finish`].
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire}, http3::{self, Frame, MessageSide}, qpack};
+/// let headers = http3::HeaderList { fields: vec![
+///     qpack::Field::new(":status", "200"), qpack::Field::new("content-length", "0"),
+/// ] };
+/// let mut encoder = qpack::Encoder::new(0, http3::MAX_FIELD_SECTION_SIZE);
+/// let bytes = headers.encode(&mut encoder, 0, http3::HeaderKind::Response)?;
+/// let mut input = Stream::new(http3::Frames::new());
+/// let frame = Wire::to_bytes(&Frame::Headers(bytes))?;
+/// assert_eq!(input.push(&frame), frame.len());
+/// let table = qpack::Table::new(0);
+/// let mut state = http3::RequestState::new(0, MessageSide::Response, false)?;
+/// let result = state.step(&input.next().unwrap()??, &table)?;
+/// assert!(matches!(result, http3::RequestResult::Event { event: Ok(http3::Event::Headers(_)), ack: None }));
+/// input.end();
+/// assert!(input.next().is_none());
+/// state.finish()?;
+/// # Ok::<(), Box<dyn core::error::Error>>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct RequestState {
+    stream: u64,
+    side: MessageSide,
+    push: bool,
+    extended_connect: bool,
+    state: MessageState,
+    pending: Option<PendingSection>,
+    field_limit: u64,
+    content_length: Option<u64>,
+    body_bytes: u64,
+    no_content: bool,
+    no_trailers: bool,
+    tunnel: bool,
+    stopped: bool,
+}
+impl RequestState {
+    /// Makes message state for stream 0, 4, 8, and so on. Set extended_connect only
+    /// when the server's ENABLE_CONNECT_PROTOCOL setting permits it.
+    pub fn new(stream: u64, side: MessageSide, extended_connect: bool) -> Result<Self, Error> {
+        if stream > MAX_VARINT || !stream.is_multiple_of(4) {
+            return Err(Error::Id);
+        }
+        Ok(Self {
+            stream,
+            side,
+            push: false,
+            extended_connect,
+            state: MessageState::Initial,
+            pending: None,
+            field_limit: MAX_FIELD_SECTION_SIZE,
+            content_length: None,
+            body_bytes: 0,
+            no_content: false,
+            no_trailers: false,
+            tunnel: false,
+            stopped: false,
+        })
+    }
+    /// Makes response state for a server-initiated unidirectional push
+    /// stream (IDs 3, 7, 11, ...). Its type and push ID must already be read.
+    /// Push permissions and duplicate push streams are checked by the caller.
+    /// It reads a response to GET; call set_push_side for a promised HEAD.
+    pub fn push(stream: u64) -> Result<Self, Error> {
+        if stream > MAX_VARINT || stream % 4 != 3 {
+            return Err(Error::Id);
+        }
+        let mut decoder = Self::new(0, MessageSide::Response, false)?;
+        decoder.stream = stream;
+        decoder.push = true;
+        Ok(decoder)
+    }
+    /// Sets the received field-section limit, capped by [`MAX_FIELD_SECTION_SIZE`].
+    /// Call after [`Self::new`] or [`Self::push`] with the endpoint's advertised
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE. The default is [`MAX_FIELD_SECTION_SIZE`].
+    /// Counts name and value bytes plus [`qpack::ENTRY_OVERHEAD`] per field;
+    /// zero permits only empty sections. Blocked sections retain the limit
+    /// used when they were first stepped, including across later retries.
+    pub fn with_field_limit(mut self, limit: u64) -> Self {
+        self.field_limit = limit.min(MAX_FIELD_SECTION_SIZE);
+        self
+    }
+    /// Sets the promised method's response side on a push stream: Response
+    /// or HeadResponse. Push stream bytes can arrive before their PUSH_PROMISE,
+    /// call this before step returns the final
+    /// headers. Other sides, request streams and later calls are State errors.
+    pub fn set_push_side(&mut self, side: MessageSide) -> Result<(), Error> {
+        if !self.push
+            || self.stopped
+            || self.state != MessageState::Initial
+            || self.pending.is_some()
+            || !matches!(side, MessageSide::Response | MessageSide::HeadResponse)
+        {
+            return Err(Error::State);
+        }
+        self.side = side;
+        Ok(())
+    }
+    /// The QUIC stream ID to use when routing QPACK results.
+    pub fn stream_id(&self) -> u64 {
+        self.stream
+    }
+    /// Whether the caller holds a section that must be retried and resumed.
+    pub fn is_blocked(&self) -> bool {
+        self.pending.is_some()
+    }
+    fn fail(&mut self) {
+        self.stopped = true;
         self.pending = None;
     }
     fn kind(&self, pending: PendingSection) -> HeaderKind {
@@ -1678,11 +1894,8 @@ impl RequestDecoder {
         }
     }
     fn accept_fields(&mut self, pending: PendingSection, fields: Vec<qpack::Field>) -> Result<Event, Error> {
-        let mut headers = HeaderList { fields };
         let kind = self.kind(pending);
-        let receive = Receive { length_list: true, connect_response: self.side == MessageSide::ConnectResponse };
-        let info = headers.info(kind, receive)?;
-        normalize_length(&mut headers.fields, info.content_length);
+        let (headers, info) = HeaderList::received(fields, kind, self.side == MessageSide::ConnectResponse)?;
         if let PendingSection::Promise(push_id) = pending {
             return Ok(Event::PushPromise { push_id, headers });
         }
@@ -1709,23 +1922,7 @@ impl RequestDecoder {
         self.content_length = if self.tunnel || hypothetical { None } else { info.content_length };
         Ok(Event::Headers(headers))
     }
-    /// Takes one event using the connection's shared QPACK decoder. None means
-    /// more input or a blocked section is needed. Backlog preserves the encoded
-    /// section for retry after QPACK output is drained.
-    pub fn next_event(&mut self, qpack: &mut qpack::Decoder) -> Option<Result<Event, Error>> {
-        if self.stopped || self.pending.is_some() {
-            return None;
-        }
-        let frame = match self.retry.take() {
-            Some(frame) => frame,
-            None => match self.decoder.next_frame()? {
-                Ok(frame) => frame,
-                Err(e) => {
-                    self.fail();
-                    return Some(Err(e));
-                }
-            },
-        };
+    fn pending_section<'a>(&self, frame: &'a Frame) -> Result<Option<(PendingSection, &'a [u8])>, Error> {
         let t = frame.frame_type();
         // RFC 9114 section 4.4: an open tunnel carries only DATA and extension
         // frames. This is checked before QPACK sees a section.
@@ -1737,84 +1934,114 @@ impl RequestDecoder {
             None
         };
         if let Some(e) = refused {
-            self.fail();
-            return Some(Err(e));
+            return Err(e);
         }
-        let pending = match &frame {
-            Frame::Headers(_) if self.state != MessageState::Trailers => Some(PendingSection::Headers),
-            Frame::PushPromise { push_id, .. } if self.side != MessageSide::Request && !self.push => {
-                Some(PendingSection::Promise(*push_id))
+        let pending = match frame {
+            Frame::Headers(bytes) if self.state != MessageState::Trailers => {
+                Some((PendingSection::Headers, bytes.as_slice()))
+            }
+            Frame::PushPromise { push_id, field_section } if self.side != MessageSide::Request && !self.push => {
+                Some((PendingSection::Promise(*push_id), field_section.as_slice()))
             }
             _ => None,
         };
-        let result = if let Some(pending) = pending {
-            let bytes = match &frame {
-                Frame::Headers(b) => b.as_slice(),
-                Frame::PushPromise { field_section, .. } => field_section.as_slice(),
-                _ => &[],
-            };
-            match qpack.decode_section(self.stream, bytes) {
-                Ok(qpack::Section::Fields(fields)) => self.accept_fields(pending, fields),
-                Ok(qpack::Section::Blocked) => {
-                    self.pending = Some(pending);
-                    Ok(Event::Blocked)
-                }
-                Err(qpack::Error::Backlog) => {
-                    self.retry = Some(frame);
-                    return Some(Err(Error::Qpack(qpack::Error::Backlog)));
-                }
-                Err(e) => Err(Error::Qpack(e)),
-            }
-        } else {
-            match frame {
-                Frame::Data(data) if self.state == MessageState::Body => {
-                    if self.no_content && !data.is_empty() {
-                        Err(Error::Message("content forbidden for this response"))
-                    } else if let Some(total) = self.body_bytes.checked_add(data.len() as u64) {
-                        if self.content_length.is_some_and(|n| total > n) {
-                            Err(Error::Message("DATA exceeds Content-Length"))
-                        } else {
-                            self.body_bytes = total;
-                            Ok(Event::Data(data))
-                        }
-                    } else {
-                        Err(Error::Limit)
-                    }
-                }
-                other @ Frame::Unknown { .. } => Ok(Event::Unknown(other)),
-                _ => Err(Error::UnexpectedFrame(t)),
-            }
-        };
-        if result.is_err() {
-            self.fail();
-        }
-        Some(result)
+        Ok(pending)
     }
-    /// Supplies the matching result from qpack::Decoder::next_unblocked. A
-    /// different stream ID is a local State error and leaves this decoder alone.
-    /// The supplied fields are bounded and checked just like immediate results.
-    pub fn resume(&mut self, stream: u64, fields: Result<Vec<qpack::Field>, qpack::Error>) -> Result<Event, Error> {
-        if stream != self.stream || self.stopped {
+    fn accept_frame(&mut self, frame: &Frame) -> Result<Event, Error> {
+        let t = frame.frame_type();
+        match frame {
+            Frame::Data(data) if self.state == MessageState::Body => {
+                if self.no_content && !data.is_empty() {
+                    Err(Error::Message("content forbidden for this response"))
+                } else if let Some(total) = self.body_bytes.checked_add(data.len() as u64) {
+                    if self.content_length.is_some_and(|n| total > n) {
+                        Err(Error::Message("DATA exceeds Content-Length"))
+                    } else {
+                        self.body_bytes = total;
+                        Ok(Event::Data(data.clone()))
+                    }
+                } else {
+                    Err(Error::Limit)
+                }
+            }
+            other @ Frame::Unknown { .. } => Ok(Event::Unknown(other.clone())),
+            _ => Err(Error::UnexpectedFrame(t)),
+        }
+    }
+    fn accept_section(
+        &mut self,
+        pending: PendingSection,
+        section: qpack::SectionResult,
+    ) -> Result<RequestResult, Error> {
+        match section {
+            qpack::SectionResult::Fields { fields, ack } => {
+                self.pending = None;
+                let event = self.accept_fields(pending, fields);
+                if event.is_err() {
+                    self.fail();
+                }
+                Ok(RequestResult::Event { event, ack })
+            }
+            qpack::SectionResult::Blocked(section) => {
+                self.pending = Some(pending);
+                Ok(RequestResult::Blocked(section))
+            }
+        }
+    }
+    /// Validates one decoded frame against the receiving QPACK table.
+    /// A blocked or finished session returns State without consuming the frame.
+    /// On Blocked, call [`Connection::pause`], retain the returned section, and
+    /// resume it before [`Connection::unpause`] allows the next frame.
+    /// Field-validation errors are carried beside their acknowledgment in
+    /// [`RequestResult::Event`]; send that acknowledgment even for invalid HTTP
+    /// fields. Placement and QPACK decoding failures return `Err`.
+    pub fn step(&mut self, frame: &Frame, table: &qpack::Table) -> Result<RequestResult, Error> {
+        if self.stopped || self.pending.is_some() {
             return Err(Error::State);
         }
-        let pending = self.pending.take().ok_or(Error::State)?;
-        let result = fields.map_err(Error::Qpack).and_then(|fields| self.accept_fields(pending, fields));
+        let result = self.pending_section(frame).and_then(|pending| {
+            if let Some((pending, bytes)) = pending {
+                let section = qpack::decode_section_with_limit(table, self.stream, bytes, self.field_limit)
+                    .map_err(Error::Qpack)?;
+                self.accept_section(pending, section)
+            } else {
+                self.accept_frame(frame).map(|event| RequestResult::Event { event: Ok(event), ack: None })
+            }
+        });
         if result.is_err() {
             self.fail();
         }
         result
     }
-    /// Checks a stream FIN after draining events. A blocked section must be
-    /// resumed first; State leaves it intact. Partial frames are FRAME_ERROR,
-    /// missing final headers are REQUEST_INCOMPLETE, and length mismatches are
-    /// MESSAGE_ERROR. Success closes the decoder to further input.
-    pub fn finish(&mut self) -> Result<(), Error> {
-        if self.stopped || self.pending.is_some() || self.retry.is_some() {
+    /// Supplies this stream's retried section, including errors from retry.
+    /// A still-blocked value is returned for the caller to retain again.
+    /// A mismatched stream or a session without a pending section returns State.
+    pub fn resume(
+        &mut self,
+        stream: u64,
+        section: Result<qpack::SectionResult, qpack::Error>,
+    ) -> Result<RequestResult, Error> {
+        if self.stopped
+            || stream != self.stream
+            || matches!(&section, Ok(qpack::SectionResult::Blocked(blocked)) if blocked.stream_id() != stream)
+        {
             return Err(Error::State);
         }
-        let result = if self.decoder.buffered() > 0 {
-            Err(Error::Frame)
-        } else if self.state == MessageState::Initial {
+        let pending = self.pending.ok_or(Error::State)?;
+        let result = section.map_err(Error::Qpack).and_then(|section| self.accept_section(pending, section));
+        if result.is_err() {
+            self.fail();
+        }
+        result
+    }
+    /// Checks message completeness and Content-Length after a clean byte-stream FIN.
+    /// A blocked session must resume first; State leaves its pending section intact.
+    /// Success or a protocol error closes the session to further frames.
+    pub fn finish(&mut self) -> Result<(), Error> {
+        if self.stopped || self.pending.is_some() {
+            return Err(Error::State);
+        }
+        let result = if self.state == MessageState::Initial {
             Err(Error::Incomplete)
         } else if self.content_length.is_some_and(|n| n != self.body_bytes) {
             Err(Error::Message("DATA differs from Content-Length"))
@@ -1823,6 +2050,568 @@ impl RequestDecoder {
         };
         self.fail();
         result
+    }
+}
+
+// ---------------------------------------------------------------------
+// Slice decoders and the connection's shared input budget.
+
+/// Why an exact [`Wire`] parse did not read one complete frame or stream header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameParseError {
+    /// The frame or stream header was invalid.
+    Frame(Error),
+    /// The input ended before a complete value, including empty input.
+    Truncated,
+    /// Bytes follow the first complete value.
+    Trailing,
+}
+
+impl std::fmt::Display for FrameParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frame(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete HTTP/3 value"),
+            Self::Trailing => f.write_str("bytes follow the HTTP/3 value"),
+        }
+    }
+}
+
+impl std::error::Error for FrameParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Frame(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+/// An HTTP/3 stream failure, with the QPACK stream role kept for error codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StreamError {
+    /// An HTTP/3 framing or session error.
+    Http3(Error),
+    /// Invalid QPACK encoder-stream framing or instruction contents.
+    QpackEncoder(qpack::Error),
+    /// Invalid QPACK decoder-stream framing or instruction contents.
+    QpackDecoder(qpack::Error),
+}
+
+impl StreamError {
+    /// The suggested application error code; local API conditions have none.
+    pub fn application_code(self) -> Option<u64> {
+        match self {
+            Self::Http3(e) => e.application_code(),
+            Self::QpackEncoder(_) => Some(error_code::QPACK_ENCODER_STREAM_ERROR),
+            Self::QpackDecoder(_) => Some(error_code::QPACK_DECODER_STREAM_ERROR),
+        }
+    }
+}
+
+impl From<Error> for StreamError {
+    fn from(error: Error) -> Self {
+        Self::Http3(error)
+    }
+}
+
+impl std::fmt::Display for StreamError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http3(e) => e.fmt(f),
+            Self::QpackEncoder(e) => write!(f, "QPACK encoder stream: {e}"),
+            Self::QpackDecoder(e) => write!(f, "QPACK decoder stream: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for StreamError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Http3(e) => Some(e),
+            Self::QpackEncoder(e) | Self::QpackDecoder(e) => Some(e),
+        }
+    }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Frame::parse(bytes).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == bytes.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+impl Wire for Settings {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::parse(bytes)
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&self.to_bytes()?);
+        Ok(())
+    }
+}
+
+impl Wire for StreamHeader {
+    type ParseError = FrameParseError;
+    type WriteError = Error;
+
+    fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(bytes).map_err(FrameParseError::Frame)? {
+            Some((header, used)) if used == bytes.len() => Ok(header),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&StreamHeader::to_bytes(*self)?);
+        Ok(())
+    }
+}
+
+/// Reads one complete frame per call without holding input.
+///
+/// Declared payloads above [`MAX_FRAME_PAYLOAD`] or the smaller per-type
+/// limits, forbidden frame types, and invalid single-varint lengths end
+/// framing as soon as the header is known. Other complete-frame
+/// failures are error items, preserving the next boundary. Applications
+/// enforce the associated HTTP/3 connection or stream error policy.
+/// Partial frames return [`Step::Need`], including at EOF, so [`codec::Stream`]
+/// reports truncation. Allocation grows only when the driver receives bytes.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
+
+impl Frames {
+    /// Creates an input-free decoder bounded by [`MAX_FRAME`].
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Decode for Frames {
+    type Item = Result<Frame, Error>;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/3 frames";
+
+    fn capacity(&self) -> usize {
+        MAX_FRAME
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        let Some((kind, a)) = varint(input) else { return Ok(Step::Need) };
+        if forbidden_frame(kind) {
+            return Err(Error::UnexpectedFrame(kind));
+        }
+        let Some((length, b)) = varint(input.get(a..).ok_or(Error::Frame)?) else { return Ok(Step::Need) };
+        let length = usize::try_from(length).map_err(|_| Error::Limit)?;
+        let limit = frame_payload_limit(kind);
+        if length > limit {
+            return Err(Error::Limit);
+        }
+        if matches!(kind, 3 | 7 | 0x0d) && !(1..=8).contains(&length) {
+            return Err(Error::Frame);
+        }
+        let used = a.checked_add(b).and_then(|header| header.checked_add(length)).ok_or(Error::Limit)?;
+        let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
+        Ok(Step::Item(Frame::parse(bytes).and_then(|parsed| parsed.map(|(frame, _)| frame).ok_or(Error::Frame)), used))
+    }
+}
+
+/// Reads one unidirectional stream header, then returns [`Step::End`].
+///
+/// The item consumes only the type integer and, for a push stream, its push
+/// ID. All following bytes stay unread for [`codec::Stream::swap`]. Capacity
+/// is [`MAX_STREAM_HEADER`]. At EOF, a partial prefix is reported as truncated;
+/// the connection may discard that stream as RFC 9114 section 6.2 permits.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire}, http3::{Frame, Frames, StreamHeader, StreamHeaders}};
+/// let mut bytes = Wire::to_bytes(&StreamHeader::Push(7))?;
+/// Wire::write(&Frame::Data(vec![1, 2]), &mut bytes)?;
+/// let mut stream = Stream::new(StreamHeaders::new());
+/// assert_eq!(stream.push(&bytes), bytes.len());
+/// assert_eq!(stream.next(), Some(Ok(StreamHeader::Push(7))));
+/// assert_eq!(stream.next(), None); // End leaves the DATA bytes unread.
+/// let mut stream = stream.swap(Frames::new());
+/// assert_eq!(stream.next(), Some(Ok(Ok(Frame::Data(vec![1, 2])))));
+/// # Ok::<(), fictionet::stdlib::http3::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StreamHeaders {
+    taken: bool,
+}
+
+impl StreamHeaders {
+    /// Creates a decoder for one stream prefix.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Decode for StreamHeaders {
+    type Item = StreamHeader;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/3 stream header";
+
+    fn capacity(&self) -> usize {
+        MAX_STREAM_HEADER
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<StreamHeader>, Error> {
+        if self.taken {
+            return Ok(Step::End);
+        }
+        Ok(match StreamHeader::parse(input)? {
+            Some((header, used)) => {
+                self.taken = true;
+                Step::Item(header, used)
+            }
+            None => Step::Need,
+        })
+    }
+}
+
+/// Reads frames on a control stream after its type header.
+///
+/// Validates first and unique SETTINGS, frame placement, sender restrictions,
+/// and monotonic GOAWAY and MAX_PUSH_ID values. Complete invalid units are
+/// error items. The caller decides the connection response before reading
+/// again. State changes only on accepted frame items. Any FIN, including one
+/// in the middle of a frame, ends with [`Error::ClosedCriticalStream`].
+#[derive(Clone, Debug)]
+pub struct ControlFrames {
+    state: ControlState,
+}
+
+impl ControlFrames {
+    /// Creates a control decoder for the endpoint sending this stream.
+    pub fn new(sender: Endpoint) -> Self {
+        Self { state: ControlState::new(sender) }
+    }
+}
+
+impl Decode for ControlFrames {
+    type Item = Result<Frame, Error>;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/3 control stream";
+
+    fn capacity(&self) -> usize {
+        MAX_FRAME
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+        if eof && input.is_empty() {
+            return Err(Error::ClosedCriticalStream);
+        }
+        Ok(match Frames.decode(input, eof)? {
+            Step::Item(item, used) => Step::Item(
+                item.and_then(|frame| {
+                    self.state.accept(&frame)?;
+                    Ok(frame)
+                }),
+                used,
+            ),
+            Step::Need if eof => return Err(Error::ClosedCriticalStream),
+            Step::Need => Step::Need,
+            Step::Skip(n) => Step::Skip(n),
+            Step::End => Step::End,
+        })
+    }
+}
+
+/// A single unit read on one connection stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StreamItem {
+    /// A stream prefix. The next item belongs to the selected decoder.
+    Header(StreamHeader),
+    /// A control, request, or push frame. QPACK sections remain encoded.
+    Frame(Frame),
+    /// One instruction to apply to the session's receiving QPACK table.
+    EncoderInstruction(qpack::EncoderInstruction),
+    /// One acknowledgment, cancellation, or insert-count increment.
+    DecoderInstruction(qpack::DecoderInstruction),
+}
+
+#[derive(Clone, Debug)]
+enum StreamKind {
+    Header(StreamHeaders),
+    Frames,
+    Control(ControlFrames),
+    Encoder,
+    Decoder,
+    Ignore,
+    Invalid,
+}
+
+/// The selected byte decoder for a single HTTP/3 stream.
+///
+/// [`Connection`] drives these with [`codec::Demux`]. Tables, blocked
+/// sections, acknowledgment values, and HTTP request semantics belong to
+/// the caller. Use [`RequestState::step`] between frame items, or
+/// [`qpack::decode_section`] and [`HeaderList::from_fields`] for standalone
+/// sections. Unknown stream payloads are skipped in bounded
+/// chunks. Every variant owns no input and retains no output queue. Any FIN
+/// on a control or QPACK stream, including within a partial unit, returns
+/// [`StreamError::Http3`] carrying [`Error::ClosedCriticalStream`].
+#[derive(Clone, Debug)]
+pub struct StreamDecoder {
+    kind: StreamKind,
+    paused: bool,
+    deferred_end: bool,
+}
+
+impl StreamDecoder {
+    /// Reads request or response frames without a unidirectional prefix.
+    pub fn request() -> Self {
+        Self { kind: StreamKind::Frames, paused: false, deferred_end: false }
+    }
+    /// Reads one unidirectional header and ends for a driver handoff.
+    pub fn unidirectional() -> Self {
+        Self { kind: StreamKind::Header(StreamHeaders::new()), paused: false, deferred_end: false }
+    }
+    /// Selects the decoder for bytes after a complete stream header.
+    /// Use [`codec::Stream::swap`] so unread bytes and EOF are preserved.
+    pub fn after_header(header: StreamHeader, sender: Endpoint) -> Self {
+        let kind = match header {
+            StreamHeader::Control => StreamKind::Control(ControlFrames::new(sender)),
+            StreamHeader::Push(_) => StreamKind::Frames,
+            StreamHeader::QpackEncoder => StreamKind::Encoder,
+            StreamHeader::QpackDecoder => StreamKind::Decoder,
+            StreamHeader::Unknown(_) => StreamKind::Ignore,
+        };
+        Self { kind, paused: false, deferred_end: false }
+    }
+}
+
+fn stream_step<T>(
+    step: Step<T>,
+    wrap: impl FnOnce(T) -> Result<StreamItem, StreamError>,
+) -> Step<Result<StreamItem, StreamError>> {
+    match step {
+        Step::Item(item, used) => Step::Item(wrap(item), used),
+        Step::Need => Step::Need,
+        Step::End => Step::End,
+        Step::Skip(n) => Step::Skip(n),
+    }
+}
+
+impl Decode for StreamDecoder {
+    type Item = Result<StreamItem, StreamError>;
+    type Error = StreamError;
+    const NAME: &'static str = "HTTP/3 stream";
+
+    fn capacity(&self) -> usize {
+        match self.kind {
+            StreamKind::Header(_) => MAX_STREAM_HEADER,
+            StreamKind::Encoder => qpack::MAX_INSTRUCTION,
+            StreamKind::Decoder => qpack::MAX_INTEGER_BYTES,
+            StreamKind::Frames | StreamKind::Control(_) => MAX_FRAME,
+            StreamKind::Ignore | StreamKind::Invalid => MAX_STREAM_HEADER,
+        }
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, StreamError> {
+        if self.paused {
+            // End keeps the unread suffix for unpause's swap, even at capacity
+            // or after EOF. Need would instead report Stuck or Truncated.
+            return Ok(Step::End);
+        }
+        Ok(match &mut self.kind {
+            StreamKind::Header(decoder) => {
+                stream_step(decoder.decode(input, eof)?, |header| Ok(StreamItem::Header(header)))
+            }
+            StreamKind::Frames => stream_step(Frames.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?))),
+            StreamKind::Control(decoder) => {
+                stream_step(decoder.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?)))
+            }
+            StreamKind::Encoder => {
+                if eof && input.is_empty() {
+                    return Err(Error::ClosedCriticalStream.into());
+                }
+                let step = qpack::EncoderInstructions.decode(input, eof).map_err(StreamError::QpackEncoder)?;
+                if eof && matches!(step, Step::Need) {
+                    return Err(Error::ClosedCriticalStream.into());
+                }
+                stream_step(step, |item| item.map(StreamItem::EncoderInstruction).map_err(StreamError::QpackEncoder))
+            }
+            StreamKind::Decoder => {
+                if eof && input.is_empty() {
+                    return Err(Error::ClosedCriticalStream.into());
+                }
+                let step = qpack::DecoderInstructions.decode(input, eof).map_err(StreamError::QpackDecoder)?;
+                if eof && matches!(step, Step::Need) {
+                    return Err(Error::ClosedCriticalStream.into());
+                }
+                stream_step(step, |item| item.map(StreamItem::DecoderInstruction).map_err(StreamError::QpackDecoder))
+            }
+            StreamKind::Ignore if input.is_empty() => Step::Need,
+            StreamKind::Ignore => Step::Skip(input.len()),
+            StreamKind::Invalid => return Err(Error::Id.into()),
+        })
+    }
+}
+
+/// Ordered QUIC stream input under one aggregate connection budget.
+///
+/// This is an input owner, separate from the I/O [`super::Connection`] trait.
+/// Each stream has its own decoder inside [`codec::Demux`]. The constructor
+/// bounds both stream count and the sum of unread and decoder-held bytes.
+/// Buffers allocate as input arrives. Metadata and allocator overhead are
+/// separate from the byte budget and bounded by `max_streams`.
+///
+/// Unidirectional headers yield an item, then `End`. Before returning the
+/// item, this owner swaps the same stream to its selected decoder, keeping
+/// unread bytes, offset, and EOF. The next call reads the first payload byte.
+/// Bidirectional client streams start directly with frames. Invalid stream
+/// IDs fail on decoding. Remove closed keys only after QUIC has retired them.
+///
+/// This owner does not enforce unique critical streams, push permissions,
+/// request ordering, or settings negotiation. Those are session decisions
+/// made between items. The caller owns [`qpack::Table`] and
+/// [`qpack::BlockedSections`]; their limits are separate from input.
+/// Use [`RequestState::step`] for request/push frame items, or
+/// [`HeaderList::from_fields`] for standalone received fields.
+/// On [`RequestResult::Blocked`], call [`Self::pause`] so later frames stay
+/// in the input budget. Retry the section and call [`RequestState::resume`],
+/// then [`Self::unpause`] when it is no longer blocked.
+/// Acknowledgments and insert increments come back as values to send.
+pub struct Connection {
+    streams: codec::Demux<u64, StreamDecoder>,
+    sender: Endpoint,
+}
+
+impl Connection {
+    /// Creates input routing for bytes sent by one peer endpoint.
+    /// `max_streams` bounds open and closed keys; `max_bytes` is shared by
+    /// every input stream, including control and both QPACK streams.
+    /// Set `max_bytes` to at least [`MAX_FRAME`], plus room for partial units
+    /// on other concurrent streams. A smaller budget may stall on a valid frame.
+    /// Even with that minimum, multiple partial frames can exhaust the budget:
+    /// if push returns zero and nothing can be drained, reset/remove a stream
+    /// to release input before retrying. The budget is not raised automatically.
+    pub fn new(sender: Endpoint, max_streams: usize, max_bytes: usize) -> Self {
+        Self {
+            streams: codec::Demux::new(max_streams, max_bytes, move |id: &u64| {
+                let uni_sender = match sender {
+                    Endpoint::Client => 2,
+                    Endpoint::Server => 3,
+                };
+                if *id > MAX_VARINT || (!(*id).is_multiple_of(4) && *id % 4 != uni_sender) {
+                    StreamDecoder { kind: StreamKind::Invalid, paused: false, deferred_end: false }
+                } else if id.is_multiple_of(4) {
+                    StreamDecoder::request()
+                } else {
+                    StreamDecoder::unidirectional()
+                }
+            }),
+            sender,
+        }
+    }
+    /// Accepts what fits in the shared budget. Drain items and retry the
+    /// suffix after this count. A zero count means no input currently fits.
+    /// If draining makes no progress, reset/remove a stream to free its budget.
+    /// After EOF or a terminal result, accepts and drops bytes like `Demux`.
+    /// Paused streams always return zero, including after [`Self::end`].
+    #[must_use = "bytes past the returned count were not taken"]
+    pub fn push(&mut self, stream: u64, bytes: &[u8]) -> usize {
+        if self.streams.get_mut(&stream).is_some_and(|stream| stream.decoder().paused) {
+            return 0;
+        }
+        self.streams.push(&stream, bytes)
+    }
+    /// Stops an existing stream between items, retaining all unread bytes in
+    /// the shared budget. [`Self::push`] refuses its input and [`Self::next`]
+    /// yields nothing for it until [`Self::unpause`]. Other streams keep running.
+    /// Repeated pauses, absent keys, and completed or failed streams are unchanged.
+    pub fn pause(&mut self, stream: u64) {
+        if let Some(stream) = self.streams.get_mut(&stream)
+            && !stream.is_done()
+        {
+            stream.decoder().paused = true;
+        }
+    }
+    /// Resumes a paused stream and applies any EOF recorded while paused.
+    /// Buffered bytes and their offsets are preserved. Call after the blocked
+    /// section has been retried and accepted by [`RequestState::resume`].
+    /// Absent and unpaused keys are unchanged; terminal failures are not restarted.
+    pub fn unpause(&mut self, stream: u64) {
+        if let Some(stream) = self.streams.get_mut(&stream)
+            && stream.decoder().paused
+        {
+            let decoder = stream.decoder();
+            decoder.paused = false;
+            let end = core::mem::take(&mut decoder.deferred_end);
+            let next = decoder.clone();
+            Self::swap_stream(stream, next);
+            if end {
+                stream.end();
+            }
+        }
+    }
+    /// Marks EOF on an existing stream. Partial request/push units report
+    /// truncation; any control or QPACK stream FIN is ClosedCriticalStream.
+    /// On a paused stream, records EOF for [`Self::unpause`] without decoding.
+    pub fn end(&mut self, stream: u64) {
+        if let Some(stream) = self.streams.get_mut(&stream)
+            && stream.decoder().paused
+        {
+            stream.decoder().deferred_end = true;
+            return;
+        }
+        self.streams.end(&stream);
+    }
+    /// Takes one item or terminal error, with its QUIC stream ID.
+    /// Complete-unit errors are the inner result; framing errors are outer.
+    /// A header handoff is completed before another payload item is read.
+    #[allow(clippy::should_implement_trait, clippy::type_complexity)]
+    pub fn next(&mut self) -> Option<(u64, Result<Result<StreamItem, StreamError>, codec::Fail<StreamError>>)> {
+        let (id, result) = self.streams.next()?;
+        if let Ok(Ok(StreamItem::Header(header))) = &result
+            && let Some(stream) = self.streams.get_mut(&id)
+        {
+            // The header decoder has yielded its one item. Its next step
+            // is End, which consumes none of the already buffered payload.
+            let _ = stream.next();
+            let next = StreamDecoder::after_header(*header, self.sender);
+            Self::swap_stream(stream, next);
+        }
+        Some((id, result))
+    }
+    fn swap_stream(stream: &mut codec::Stream<StreamDecoder>, next: StreamDecoder) {
+        // swap takes ownership; the temporary stream allocates no input buffer.
+        let previous = core::mem::replace(stream, codec::Stream::new(StreamDecoder::unidirectional()));
+        *stream = previous.swap(next);
+    }
+    /// The aggregate unread and decoder-held bytes across every stream.
+    pub fn buffered(&self) -> usize {
+        self.streams.total()
+    }
+    /// The number of stream keys, including completed streams.
+    pub fn len(&self) -> usize {
+        self.streams.len()
+    }
+    /// Whether there are no stream keys.
+    pub fn is_empty(&self) -> bool {
+        self.streams.is_empty()
+    }
+    /// Removes a retired key and returns its stream, including unread bytes
+    /// and any terminal failure. The next push for this key can reopen it.
+    pub fn remove(&mut self, stream: u64) -> Option<codec::Stream<StreamDecoder>> {
+        self.streams.remove(&stream)
     }
 }
 
@@ -2711,11 +3500,11 @@ mod tests {
         assert_eq!(d.next_event(&mut q), Some(Err(Error::Qpack(qpack::Error::Truncated))));
         assert_eq!(d.feed(&[1]), 0);
         let mut d = RequestDecoder::new(0, MessageSide::Request, false).unwrap();
-        d.pending = Some(PendingSection::Headers);
+        d.state.pending = Some(PendingSection::Headers);
         assert!(matches!(d.resume(0, Ok(response("200").fields)), Err(Error::Message(_))));
         assert_eq!(d.feed(&[1]), 0);
         let mut d = RequestDecoder::new(0, MessageSide::Request, false).unwrap();
-        d.pending = Some(PendingSection::Headers);
+        d.state.pending = Some(PendingSection::Headers);
         assert_eq!(d.resume(0, Err(qpack::Error::Huffman)), Err(Error::Qpack(qpack::Error::Huffman)));
     }
     #[test]

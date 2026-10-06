@@ -1,6 +1,7 @@
 //! HTTP/3 stream bytes, field sections and Priority dictionaries.
 #![no_main]
 
+use fictionet::stdlib::{codec::contract, http3};
 use fictionet::stdlib::{
     http3::{
         ControlDecoder, Decoder, Endpoint, Error, Event, Frame, HeaderKind, HeaderList, MAX_BUFFERED,
@@ -222,6 +223,20 @@ fn shared_qpack(data: &[u8], side: MessageSide) {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(http3::Frames::new, data);
+    contract::check_decode(http3::StreamHeaders::new, data);
+    contract::check_decode(http3::StreamDecoder::request, data);
+    contract::check_decode(http3::StreamDecoder::unidirectional, data);
+    for sender in [Endpoint::Client, Endpoint::Server] {
+        contract::check_decode(|| http3::ControlFrames::new(sender), data);
+    }
+    for header in [StreamHeader::QpackEncoder, StreamHeader::QpackDecoder, StreamHeader::Unknown(64)] {
+        contract::check_decode(|| http3::StreamDecoder::after_header(header, Endpoint::Client), data);
+    }
+    contract::check_wire::<Frame>(data);
+    contract::check_wire::<Settings>(data);
+    contract::check_wire::<StreamHeader>(data);
+
     if let Ok(Some((frame, _))) = Frame::parse(data) {
         check_frame(&frame);
     }
@@ -249,6 +264,18 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(prefix.finish(), Ok(()));
     }
     let bytes = data.get(..data.len().min(MAX_FUZZ_INPUT)).unwrap();
+    let mut connection = http3::Connection::new(Endpoint::Client, 5, http3::MAX_FRAME + MAX_FUZZ_INPUT);
+    for (index, chunk) in bytes.chunks(17).enumerate() {
+        let id = [0, 2, 4, 6, 10][index % 5];
+        let _ = connection.push(id, chunk);
+        while connection.next().is_some() {}
+        assert!(connection.buffered() <= MAX_FUZZ_INPUT);
+    }
+    for id in [0, 2, 4, 6, 10] {
+        connection.end(id);
+    }
+    while connection.next().is_some() {}
+
     assert_eq!(raw(bytes, bytes.len()), raw(bytes, 1));
     for sender in [Endpoint::Client, Endpoint::Server] {
         assert_eq!(control(bytes, bytes.len(), sender), control(bytes, 1, sender));
@@ -288,6 +315,7 @@ fuzz_target!(|data: &[u8]| {
         Frame::PriorityUpdate { element: PriorityElement::Request(id), value: bytes.to_vec() },
         Frame::PriorityUpdate { element: PriorityElement::Push(id), value: bytes.to_vec() },
     ] {
+        contract::check_wire_value(&frame);
         if frame.to_bytes().is_ok() {
             check_frame(&frame);
         }
