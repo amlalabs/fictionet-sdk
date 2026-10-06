@@ -3,41 +3,13 @@
 //! world writes them.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::smb2::{
-    ChainedPayload, Compressed, Decoder, ErrorResponse, Frame, FrameError, Frames, HEADER_LEN, IoctlResponse,
-    MAX_BUFFERED, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response, Transform,
-    TreeConnectRequest, WriteRequest, command, frame, parse_chain, parse_frame, status,
+    ChainedPayload, Compressed, Error, ErrorResponse, Frame, Header, Frames, HEADER_LEN, IoctlResponse, Message,
+    MAX_FRAME, MAX_MESSAGE, NegotiateContext, NegotiateResponse, Packet, ReadRequest, Request, Response, Transform,
+    TreeConnectRequest, WriteRequest, command, status,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` whole or a byte at a time, taking payloads out after each
-/// feed, as a world does. Every payload, then the error that broke the
-/// stream, if one did. The chunks are walked, not collected, so a large
-/// input costs no more than itself.
-fn split(data: &[u8], bytewise: bool) -> (Vec<Vec<u8>>, Option<FrameError>) {
-    let mut decoder = Decoder::new();
-    let mut payloads = Vec::new();
-    for chunk in data.chunks(if bytewise { 1 } else { data.len().max(1) }) {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some(r) = decoder.next_frame() {
-                match r {
-                    Ok(p) => payloads.push(p),
-                    Err(e) => return (payloads, Some(e)),
-                }
-                progress = true;
-            }
-            // A full decoder always gives a payload or an error.
-            assert!(progress);
-        }
-    }
-    (payloads, None)
-}
 
 /// Whether a body written back is no longer than the one read, or no
 /// longer than its own StructureSize. Then a message read whole always fits
@@ -47,6 +19,24 @@ fn no_longer(command: u16, new: &[u8], old: &[u8]) -> bool {
     let slack = if command == command::CREATE { 7 } else { 0 };
     new.len() <= old.len() + slack
         || new.get(..2).is_some_and(|s| new.len() <= usize::from(u16::from_le_bytes([s[0], s[1]])))
+}
+
+/// A body read alone can fit while its message header or CREATE padding
+/// puts the complete message past the limit.
+fn written_body(message: Result<Message, Error>, command: u16, old: &[u8]) -> Option<Vec<u8>> {
+    match message {
+        Ok(message) => {
+            contract::check_wire_value(&message);
+            assert!(no_longer(command, &message.body, old));
+            Some(message.body)
+        }
+        Err(error) => {
+            assert_eq!(error, Error::Unwritable);
+            let slack = if command == command::CREATE { 7 } else { 0 };
+            assert!(old.len().saturating_add(HEADER_LEN + slack) > MAX_MESSAGE);
+            None
+        }
+    }
 }
 
 /// A payload read every way there is. Whatever reads is written back, and
@@ -59,15 +49,15 @@ fn payload(data: &[u8], status: u32) {
     let Packet::Smb2(messages) = packet else { return };
     assert_eq!(bytes, data);
     for m in &messages {
-        if let Ok(req) = m.request() {
-            let body = req.to_body().unwrap();
-            assert!(no_longer(m.header.command, &body, &m.body));
+        if let Ok(req) = m.request()
+            && let Some(body) = written_body(req.message(0), m.header.command, &m.body)
+        {
             assert_eq!(Request::parse(m.header.command, &body), Ok(req));
         }
         for s in [m.header.status, status] {
-            if let Ok(resp) = Response::parse(m.header.command, s, &m.body) {
-                let body = resp.to_body(m.header.command, s).unwrap();
-                assert!(no_longer(m.header.command, &body, &m.body));
+            if let Ok(resp) = Response::parse(m.header.command, s, &m.body)
+                && let Some(body) = written_body(resp.message(&m.header, s), m.header.command, &m.body)
+            {
                 assert_eq!(Response::parse(m.header.command, s, &body), Ok(resp));
             }
         }
@@ -79,7 +69,7 @@ fn payload(data: &[u8], status: u32) {
 /// same.
 fn entry_points(data: &[u8]) {
     let too_long = data.len() > MAX_MESSAGE;
-    if let Ok(messages) = parse_chain(data) {
+    if let Ok(Packet::Smb2(messages)) = Packet::parse(data) {
         assert!(!too_long);
         assert_eq!(Packet::Smb2(messages).to_bytes().unwrap(), data);
     }
@@ -101,14 +91,14 @@ fn body(data: &[u8]) {
     let [c, s, rest @ ..] = data else { return };
     let command = u16::from(*c % 0x16);
     let status = [0, 0x8000_0005, 0xc000_0016, 0xc000_0022, 0x103, 0x10c, 0xc000_000d][usize::from(*s % 7)];
-    if let Ok(req) = Request::parse(command, rest) {
-        let back = req.to_body().unwrap();
-        assert!(no_longer(command, &back, rest));
+    if let Ok(req) = Request::parse(command, rest)
+        && let Some(back) = written_body(req.message(0), command, rest)
+    {
         assert_eq!(Request::parse(command, &back), Ok(req));
     }
-    if let Ok(resp) = Response::parse(command, status, rest) {
-        let back = resp.to_body(command, status).unwrap();
-        assert!(no_longer(command, &back, rest));
+    if let Ok(resp) = Response::parse(command, status, rest)
+        && let Some(back) = written_body(resp.message(&Header::new(command, 0), status), command, rest)
+    {
         assert_eq!(Response::parse(command, status, &back), Ok(resp));
     }
 }
@@ -151,7 +141,7 @@ fn constructed(data: &[u8]) {
         ..Default::default()
     });
     let s = [0, status::BUFFER_OVERFLOW, status::INVALID_PARAMETER][usize::from(b.byte() % 3)];
-    if let Ok(body) = ioctl.to_body(command::IOCTL, s) {
+    if let Ok(body) = ioctl.message(&Header::new(command::IOCTL, 0), s).map(|m| m.body) {
         let at = |i: usize| u32::from_le_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
         if at(36) != 0 {
             assert_eq!(at(32), (at(24) + at(28)).next_multiple_of(8));
@@ -161,7 +151,7 @@ fn constructed(data: &[u8]) {
 
     // 2.2.2: error data holds the error contexts its count claims.
     let error = Response::Error(ErrorResponse { context_count: b.byte() % 4, data: b.take(name_len * 2) });
-    if let Ok(body) = error.to_body(command::CREATE, status::ACCESS_DENIED) {
+    if let Ok(body) = error.message(&Header::new(command::CREATE, 0), status::ACCESS_DENIED).map(|m| m.body) {
         assert_eq!(Response::parse(command::CREATE, status::ACCESS_DENIED, &body), Ok(error));
     }
 
@@ -184,7 +174,7 @@ fn constructed(data: &[u8]) {
     // 2.2.9.1: an extended TREE_CONNECT puts the path after the extension.
     let path = b.take(name_len * 2).chunks(2).map(|c| u16::from(c[0])).collect();
     let tree = Request::TreeConnect(TreeConnectRequest { flags: b.u16() % 8, path });
-    let body = tree.to_body().unwrap();
+    let body = tree.message(0).map(|m| m.body).unwrap();
     assert_eq!(Request::parse(command::TREE_CONNECT, &body), Ok(tree));
 
     // 2.2.19 and 2.2.21: channel information only with a channel.
@@ -198,7 +188,7 @@ fn constructed(data: &[u8]) {
         ..Default::default()
     });
     for req in [read, write] {
-        match req.to_body() {
+        match req.message(0).map(|m| m.body) {
             Ok(body) => assert_eq!(Request::parse(req.command(), &body), Ok(req)),
             Err(_) => assert!(channel == 0 && !info.is_empty()),
         }
@@ -208,16 +198,16 @@ fn constructed(data: &[u8]) {
     let kinds: Vec<u16> = b.take(3).iter().map(|k| u16::from(k % 4)).collect();
     let contexts = kinds.iter().map(|&kind| NegotiateContext { kind, data: vec![1, 0] }).collect();
     let negotiate = Response::Negotiate(NegotiateResponse { dialect: 0x311, contexts, ..Default::default() });
-    if let Ok(body) = negotiate.to_body(command::NEGOTIATE, 0) {
+    if let Ok(body) = negotiate.message(&Header::new(command::NEGOTIATE, 0), 0).map(|m| m.body) {
         assert_eq!(kinds.iter().filter(|&&k| k == 1).count(), 1);
         assert_eq!(Response::parse(command::NEGOTIATE, 0, &body), Ok(negotiate));
     }
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_FRAME);
     contract::check_wire::<Frame>(data);
-    contract::check_decode(|| Frames::new().map(|f| Packet::parse(&f.payload)), data);
+    contract::check_decode_with_alloc_limit(|| Frames::new().map(|f| Packet::parse(&f.payload)), data, 2 * MAX_FRAME);
     contract::check_wire_value(&Frame {
         payload: data.to_vec(),
     });
@@ -227,16 +217,14 @@ fuzz_target!(|data: &[u8]| {
         });
     }
 
-    // The stream, split two ways: all at once, and a byte at a time. Both
-    // give the same payloads and the same error.
-    let (payloads, err) = split(data, false);
-    assert_eq!(split(data, true), (payloads.clone(), err));
-    for p in &payloads {
-        // A payload read can be framed, and reads back the same.
-        let bytes = frame(p).unwrap();
-        assert_eq!(parse_frame(&bytes), Ok(Some((&p[..], bytes.len()))));
-        payload(p, 0);
+    for frame in decode_all(Frames::new, data).0 {
+        contract::check_wire_value(&frame);
+        payload(&frame.payload, 0);
     }
+    contract::check_wire::<Packet>(data);
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Transform>(data);
+    contract::check_wire::<Compressed>(data);
     // Any bytes as a payload on their own, through each reader, and as a
     // body.
     payload(data, 0xc000_0016);

@@ -3,48 +3,12 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::dcerpc::{
-    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Decoder, EncodeError, Error, Frames,
-    MAX_BUFFERED, MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SyntaxId, Uuid, flags,
+    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error, Frames,
+    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SyntaxId, Uuid, flags,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` in chunks, taking PDUs out after each feed, as a world
-/// does. Every result, ending with the error that broke the stream, if one
-/// did.
-fn split(data: &[u8], bytewise: bool) -> Vec<std::result::Result<Pdu, Error>> {
-    let mut decoder = Decoder::new();
-    let mut out = Vec::new();
-    let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-    for chunk in chunks {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            rest = &rest[took..];
-            let mut progress = took > 0;
-            while let Some((r, frame)) = decoder.next_frame() {
-                let fatal = matches!(r, Err(e) if e.breaks_stream());
-                // The frame is the PDU's bytes as they came.
-                if fatal {
-                    assert!(frame.is_empty());
-                } else {
-                    let frame = frame.to_vec();
-                    assert_eq!(Pdu::parse(&frame).map(|o| o.map(|(p, _)| p)), r.clone().map(Some));
-                }
-                out.push(r);
-                if fatal {
-                    return out;
-                }
-                progress = true;
-            }
-            // A full decoder always gives a PDU or an error.
-            assert!(progress);
-        }
-    }
-    out
-}
 
 /// A PDU read is written back and reads the same, unless the writer's
 /// padding or reserved fields make it longer than a fragment.
@@ -53,9 +17,9 @@ fn rewrite(pdu: &Pdu) {
     match pdu.to_bytes() {
         Ok(bytes) => {
             assert!(bytes.len() <= MAX_FRAG);
-            assert_eq!(Pdu::parse(&bytes), Ok(Some((pdu.clone(), bytes.len()))));
+            assert_eq!(Pdu::parse(&bytes), Ok(pdu.clone()));
         }
-        Err(e) => assert_eq!(e, EncodeError::TooLong),
+        Err(e) => assert_eq!(e, Error::Unwritable),
     }
 }
 
@@ -161,7 +125,7 @@ fn built(data: &[u8]) -> Result<()> {
     contract::check_wire_value(&p);
     if let Ok(bytes) = p.to_bytes() {
         assert!(bytes.len() <= MAX_FRAG);
-        assert_eq!(Pdu::parse(&bytes), Ok(Some((p.clone(), bytes.len()))));
+        assert_eq!(Pdu::parse(&bytes), Ok(p.clone()));
     }
     let max: u16 = u.arbitrary()?;
     let call = matches!(p.body, Body::Request { .. } | Body::Response { .. });
@@ -174,7 +138,7 @@ fn built(data: &[u8]) -> Result<()> {
         // Every fragment writes, within the size asked for.
         let bytes = f.to_bytes().unwrap();
         assert!(bytes.len() <= usize::from(max));
-        assert_eq!(Pdu::parse(&bytes), Ok(Some((f.clone(), bytes.len()))));
+        assert_eq!(Pdu::parse(&bytes), Ok(f.clone()));
         // A nonzero hint counts down by the stub data already sent.
         if let (Some(whole), Some(hint)) = (alloc_hint(&p), alloc_hint(f)) {
             let left = if whole == 0 { 0 } else { whole.saturating_sub(u32::try_from(sent).unwrap_or(u32::MAX)) };
@@ -243,15 +207,12 @@ fn related(u: &mut Unstructured, mut parts: Vec<Pdu>, mut want: Pdu) -> Result<(
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * Frames::new().capacity());
     contract::check_wire::<Pdu>(data);
-    contract::check_decode(|| Frames::with_limit(0), data);
-    contract::check_decode(|| Frames::with_limit(64), data);
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(0), data, 2 * Frames::with_limit(0).capacity());
+    contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
 
-    // The stream, split two ways: all at once, and a byte at a time. Both
-    // give the same PDUs and the same errors.
-    let results = split(data, false);
-    assert_eq!(split(data, true), results);
+    let (results, _) = decode_all(Frames::new, data);
 
     let mut r = Reassembler::new(4096);
     for p in results.into_iter().flatten() {

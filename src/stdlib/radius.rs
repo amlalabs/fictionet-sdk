@@ -17,7 +17,7 @@
 //! extended vendor-specific attributes. Its dictionary holds every
 //! standard attribute from 1 to 101, and it reads the data types of RFC
 //! 6572 and RFC 8044. RFC 6613 and RFC 6614 carry the same packets
-//! over TCP and TLS, and [`Decoder`] splits such a stream into packets.
+//! over TCP and TLS. [`Stream<Frames>`](super::codec::Stream) reads those streams.
 //!
 //! Nothing here reads a socket, and nothing here does cryptography. A
 //! world that plays a RADIUS server gives each datagram's bytes to
@@ -29,20 +29,16 @@
 //! values stay as the bytes on the wire. The docs of [`Packet::reply`]
 //! say which bytes each authenticator is taken over.
 //!
-//! New TCP or TLS readers use [`Frames`] with [`super::codec::Stream`] for
-//! bounded buffering and EOF handling. [`Packet`] implements [`Wire`] for
-//! exact parsing and transactional writing. The inherent [`Packet::parse`]
-//! still accepts datagram padding, and [`Decoder`] keeps its original behavior.
-//!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A packet whose attributes do not fit its length is refused
 //! whole, as RFC 2865 asks. A single attribute whose value does not fit
 //! its type is only an error when that value is read, so a world can
 //! skip attributes it does not use, as RFC 6929 asks. Every writer
 //! refuses what its reader would refuse: it returns `None` or
-//! [`TooLong`] rather than cut a value or leave an attribute out.
+//! [`Error::Unwritable`] rather than cut a value or leave an attribute out.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::radius::{attr, enum_name, Code, Packet, Value};
 //!
 //! // An Accounting-Request: a session for "bob" has started.
@@ -71,7 +67,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use super::codec::{Decode, Step, Wire};
+use crate::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP port RADIUS servers take Access-Requests on.
 pub const AUTH_PORT: u16 = 1812;
@@ -108,9 +104,6 @@ pub const MAX_LONG_EXTENDED_VALUE: usize = MAX_PACKET - HEADER_LEN - 4 * (MAX_PA
 pub const MAX_CONCAT_VALUE: usize = MAX_PACKET - HEADER_LEN - 2 * (MAX_PACKET - HEADER_LEN).div_ceil(255);
 /// The most attributes a packet can hold: each takes at least 2 bytes.
 pub const MAX_ATTRIBUTES: usize = (MAX_PACKET - HEADER_LEN) / 2;
-/// The most bytes a [`Decoder`] holds that have not been taken out: one
-/// longest packet.
-pub const MAX_BUFFERED: usize = MAX_PACKET;
 
 /// The More flag in a long extended attribute's flags byte: more of the
 /// value follows in another attribute.
@@ -258,7 +251,7 @@ impl Attribute {
     /// sub-attribute is not in the standard space; make one with
     /// [`Attribute::from_value_as`].
     pub fn from_value(kind: u8, value: &Value) -> Option<Attribute> {
-        let a = Attribute { kind, value: value.to_bytes()? };
+        let a = Attribute { kind, value: value.encode()? };
         (a.decode().as_ref() == Ok(value)).then_some(a)
     }
 
@@ -267,7 +260,7 @@ impl Attribute {
     /// knows. It returns `None` unless the bytes read back as the same
     /// value of `data_type`, as for [`Attribute::from_value`].
     pub fn from_value_as(kind: u8, data_type: DataType, value: &Value) -> Option<Attribute> {
-        let bytes = value.to_bytes()?;
+        let bytes = value.encode()?;
         (Value::decode(data_type, &bytes).as_ref() == Ok(value)).then_some(Attribute { kind, value: bytes })
     }
 
@@ -349,11 +342,16 @@ pub struct Packet {
 /// Why bytes are not a RADIUS packet. RFC 2865 asks a server to drop such
 /// a packet without an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PacketError {
+pub enum Error {
     /// Fewer bytes than the 20-byte header. The value is how many came.
     Short(usize),
     /// The length field was below 20 or above 4096.
-    Length(u16),
+    Length {
+        /// The declared packet length.
+        length: usize,
+        /// The largest accepted packet length.
+        limit: usize,
+    },
     /// The datagram was shorter than its length field says.
     Truncated {
         /// The length field.
@@ -364,82 +362,60 @@ pub enum PacketError {
     /// The attribute at this offset in the packet has a length below 2,
     /// or runs past the packet's length.
     Attribute(usize),
+    /// Bytes follow the declared packet length, including datagram padding.
+    Trailing {
+        /// Number of trailing bytes.
+        remaining: usize,
+    },
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
-impl std::fmt::Display for PacketError {
+impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PacketError::Short(n) => write!(f, "{n} bytes, fewer than the 20-byte RADIUS header"),
-            PacketError::Length(n) => write!(f, "length field {n}, outside 20..=4096"),
-            PacketError::Truncated { length, got } => write!(f, "length field {length}, but only {got} bytes came"),
-            PacketError::Attribute(at) => write!(f, "the attribute at offset {at} does not fit the packet"),
+            Error::Short(n) => write!(f, "{n} bytes, fewer than the 20-byte RADIUS header"),
+            Error::Length { length, limit } => write!(f, "length field {length}, outside {HEADER_LEN}..={limit}"),
+            Error::Trailing { remaining } => write!(f, "{remaining} bytes after RADIUS packet"),
+            Error::Unwritable => f.write_str("RADIUS value cannot be written without changing it"),
+            Error::Truncated { length, got } => write!(f, "length field {length}, but only {got} bytes came"),
+            Error::Attribute(at) => write!(f, "the attribute at offset {at} does not fit the packet"),
         }
     }
 }
 
-impl std::error::Error for PacketError {}
+impl std::error::Error for Error {}
 
-/// A packet or attribute would not fit within [`MAX_PACKET`] or
-/// [`MAX_VALUE`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TooLong;
+impl Wire for Attribute {
+    type ParseError = Error;
+    type WriteError = Error;
 
-impl std::fmt::Display for TooLong {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("too long for a RADIUS packet or attribute")
+    /// Reads one type-length-value attribute. Refuses lengths below two,
+    /// incomplete attributes, and trailing bytes. Values remain opaque.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let [kind, length, ..] = bytes else { return Err(Error::Attribute(0)) };
+        if *length < 2 || usize::from(*length) != bytes.len() {
+            return Err(Error::Attribute(0));
+        }
+        Ok(Self { kind: *kind, value: bytes[2..].to_vec() })
+    }
+
+    /// Appends one attribute. Refuses values over [`MAX_VALUE`].
+    /// Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.value.len() > MAX_VALUE {
+            return Err(Error::Unwritable);
+        }
+        out.extend_from_slice(&[self.kind, (self.value.len() + 2) as u8]);
+        out.extend_from_slice(&self.value);
+        Ok(())
     }
 }
-
-impl std::error::Error for TooLong {}
 
 impl Packet {
     /// A packet with no attributes.
     pub fn new(code: Code, identifier: u8, authenticator: [u8; AUTHENTICATOR_LEN]) -> Packet {
         Packet { code, identifier, authenticator, attributes: Vec::new() }
-    }
-
-    /// Reads the packet in a datagram. Bytes past the length field are
-    /// padding, and are dropped, as RFC 2865 says.
-    pub fn parse(b: &[u8]) -> Result<Packet, PacketError> {
-        if b.len() < HEADER_LEN {
-            return Err(PacketError::Short(b.len()));
-        }
-        let length = u16::from_be_bytes([b[2], b[3]]);
-        let end = usize::from(length);
-        if !(HEADER_LEN..=MAX_PACKET).contains(&end) {
-            return Err(PacketError::Length(length));
-        }
-        if b.len() < end {
-            return Err(PacketError::Truncated { length, got: b.len() });
-        }
-        let mut authenticator = [0u8; AUTHENTICATOR_LEN];
-        authenticator.copy_from_slice(&b[4..HEADER_LEN]);
-        let attributes =
-            parse_attributes(&b[HEADER_LEN..end], 2).map_err(|at| PacketError::Attribute(HEADER_LEN + at))?;
-        Ok(Packet { code: Code::from_u8(b[0]), identifier: b[1], authenticator, attributes })
-    }
-
-    /// The packet's bytes. It returns [`TooLong`], and writes nothing,
-    /// if a value is longer than [`MAX_VALUE`] or the packet would be
-    /// longer than [`MAX_PACKET`]: it never cuts a value or leaves an
-    /// attribute out.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, TooLong> {
-        let length = self.encoded_len();
-        if length > MAX_PACKET || self.attributes.iter().any(|a| a.value.len() > MAX_VALUE) {
-            return Err(TooLong);
-        }
-        let mut out = Vec::with_capacity(length);
-        out.push(self.code.to_u8());
-        out.push(self.identifier);
-        // length is at most MAX_PACKET, so it fits in 16 bits.
-        out.extend_from_slice(&(length as u16).to_be_bytes());
-        out.extend_from_slice(&self.authenticator);
-        for a in &self.attributes {
-            out.push(a.kind);
-            out.push((a.value.len() + 2) as u8);
-            out.extend_from_slice(&a.value);
-        }
-        Ok(out)
     }
 
     /// How many bytes the packet takes, header included. When this is
@@ -491,11 +467,11 @@ impl Packet {
     /// [`MAX_PACKET`] or the value longer than [`MAX_VALUE`]. It refuses
     /// any attribute while the packet is already too long, as it can be
     /// after changes to [`Packet::attributes`].
-    pub fn push(&mut self, attribute: Attribute) -> Result<(), TooLong> {
+    pub fn push(&mut self, attribute: Attribute) -> Result<(), Error> {
         if attribute.value.len() > MAX_VALUE
             || self.encoded_len().saturating_add(2 + attribute.value.len()) > MAX_PACKET
         {
-            return Err(TooLong);
+            return Err(Error::Unwritable);
         }
         self.attributes.push(attribute);
         Ok(())
@@ -582,98 +558,63 @@ impl Packet {
     /// Adds the attributes that carry `extended`, splitting a long value
     /// into fragments. Nothing is added if they would not fit in the
     /// packet, or if [`Extended::to_attributes`] cannot write them.
-    pub fn push_extended(&mut self, extended: &Extended) -> Result<(), TooLong> {
-        let attributes = extended.to_attributes().ok_or(TooLong)?;
+    pub fn push_extended(&mut self, extended: &Extended) -> Result<(), Error> {
+        let attributes = extended.to_attributes().ok_or(Error::Unwritable)?;
         let need: usize = attributes.iter().map(|a| 2 + a.value.len()).sum();
         if self.encoded_len().saturating_add(need) > MAX_PACKET {
-            return Err(TooLong);
+            return Err(Error::Unwritable);
         }
         self.attributes.extend(attributes);
         Ok(())
     }
 }
 
-/// Why an exact [`Wire`] parse did not contain one complete packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The packet was invalid or incomplete.
-    Packet(PacketError),
-    /// Bytes followed the packet's declared length, including datagram padding.
-    Trailing {
-        /// Number of bytes after the packet.
-        remaining: usize,
-    },
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Packet(e) => e.fmt(f),
-            Self::Trailing { remaining } => write!(f, "{remaining} bytes after RADIUS packet"),
-        }
-    }
-}
-
-impl core::error::Error for ParseError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Packet(error) => Some(error),
-            Self::Trailing { .. } => None,
-        }
-    }
-}
-
 impl Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = TooLong;
+    type ParseError = Error;
+    type WriteError = Error;
 
-    /// Reads exactly one packet. Datagram padding is refused.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let packet = Packet::parse(bytes).map_err(ParseError::Packet)?;
-        let used = packet.encoded_len();
-        if used != bytes.len() {
-            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
+    /// Reads exactly one packet. Refuses lengths outside 20..=4096, truncated
+    /// headers or attributes, and trailing bytes, including datagram padding.
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
+        if b.len() < HEADER_LEN {
+            return Err(Error::Short(b.len()));
         }
-        Ok(packet)
+        let length = u16::from_be_bytes([b[2], b[3]]);
+        let end = usize::from(length);
+        if !(HEADER_LEN..=MAX_PACKET).contains(&end) {
+            return Err(Error::Length { length: end, limit: MAX_PACKET });
+        }
+        if b.len() < end {
+            return Err(Error::Truncated { length, got: b.len() });
+        }
+        if b.len() != end {
+            return Err(Error::Trailing { remaining: b.len() - end });
+        }
+        let mut authenticator = [0u8; AUTHENTICATOR_LEN];
+        authenticator.copy_from_slice(&b[4..HEADER_LEN]);
+        let attributes =
+            parse_attributes(&b[HEADER_LEN..end], 2).map_err(|at| Error::Attribute(HEADER_LEN + at))?;
+        Ok(Packet { code: Code::from_u8(b[0]), identifier: b[1], authenticator, attributes })
     }
 
-    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), TooLong> {
-        out.extend_from_slice(&self.to_bytes()?);
+    /// Appends one packet. Refuses values over [`MAX_VALUE`] or packets over
+    /// [`MAX_PACKET`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let length = self.encoded_len();
+        if length > MAX_PACKET || self.attributes.iter().any(|a| a.value.len() > MAX_VALUE) {
+            return Err(Error::Unwritable);
+        }
+        out.push(self.code.to_u8());
+        out.push(self.identifier);
+        // length is at most MAX_PACKET, so it fits in 16 bits.
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+        out.extend_from_slice(&self.authenticator);
+        for a in &self.attributes {
+            out.push(a.kind);
+            out.push((a.value.len() + 2) as u8);
+            out.extend_from_slice(&a.value);
+        }
         Ok(())
-    }
-}
-
-/// Why a [`Frames`] stream cannot continue.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameError {
-    /// The packet was invalid: a length field below [`HEADER_LEN`], or
-    /// attributes that do not fit the packet.
-    Packet(PacketError),
-    /// The length field exceeded the configured limit.
-    TooLong {
-        /// The length field.
-        length: usize,
-        /// The largest accepted packet, including its header.
-        limit: usize,
-    },
-}
-
-impl core::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Packet(e) => e.fmt(f),
-            Self::TooLong { length, limit } => write!(f, "length field {length}, outside {HEADER_LEN}..={limit}"),
-        }
-    }
-}
-
-impl core::error::Error for FrameError {
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            Self::Packet(error) => Some(error),
-            Self::TooLong { .. } => None,
-        }
     }
 }
 
@@ -682,11 +623,8 @@ impl core::error::Error for FrameError {
 /// Use with [`super::codec::Stream`] for a buffer bounded by [`limit`](Self::limit).
 /// The first four bytes suffice to refuse an invalid or excessive length. Partial packets
 /// return [`Step::Need`], including at EOF, so the driver reports truncation.
-/// A [`FrameError`] ends the stream: [`FrameError::TooLong`] for a length above
-/// the limit, and [`FrameError::Packet`] for a length below the header or for
-/// attributes that do not fit, as in [`Decoder`].
+/// An invalid length or malformed attributes ends the stream.
 /// [RFC 6613 §2.6.4] requires closing the connection on malformed attributes.
-/// The legacy decoder remains separate to preserve repeated errors and buffer clearing.
 ///
 /// [RFC 6613 §2.6.4]: https://www.rfc-editor.org/rfc/rfc6613.html#section-2.6.4
 ///
@@ -735,25 +673,25 @@ impl Default for Frames {
 
 impl Decode for Frames {
     type Item = Packet;
-    type Error = FrameError;
+    type Error = Error;
     const NAME: &'static str = "RADIUS";
 
     fn capacity(&self) -> usize {
         self.limit
     }
 
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, FrameError> {
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Error> {
         let Some(&[_, _, hi, lo]) = input.get(..4) else { return Ok(Step::Need) };
         let length = u16::from_be_bytes([hi, lo]);
         let used = usize::from(length);
         if used < HEADER_LEN {
-            return Err(FrameError::Packet(PacketError::Length(length)));
+            return Err(Error::Length { length: used, limit: self.limit });
         }
         if used > self.limit {
-            return Err(FrameError::TooLong { length: used, limit: self.limit });
+            return Err(Error::Length { length: used, limit: self.limit });
         }
         let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
-        Ok(Step::Item(Packet::parse(bytes).map_err(FrameError::Packet)?, used))
+        Ok(Step::Item(Packet::parse(bytes)?, used))
     }
 }
 
@@ -797,99 +735,11 @@ fn attributes_len(attributes: &[Attribute]) -> usize {
     attributes.iter().fold(0, |n: usize, a| n.saturating_add(2).saturating_add(a.value.len()))
 }
 
-/// Writes attributes as type, length, value. It returns `None`, having
-/// written part of them, if a value is longer than [`MAX_VALUE`].
 fn write_attributes(out: &mut Vec<u8>, attributes: &[Attribute]) -> Option<()> {
     for a in attributes {
-        if a.value.len() > MAX_VALUE {
-            return None;
-        }
-        out.push(a.kind);
-        out.push((a.value.len() + 2) as u8);
-        out.extend_from_slice(&a.value);
+        a.write(out).ok()?;
     }
     Some(())
-}
-
-/// Splits a stream of RADIUS packets, as RADIUS over TCP (RFC 6613) and
-/// over TLS (RFC 6614) carry them, into packets. Feed it the bytes a
-/// connection reads, in order, and take packets out until it has none.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small packets costs time in proportion to their bytes.
-    start: usize,
-    failed: Option<PacketError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take packets
-    /// out with [`Decoder::next_packet`] and feed it the rest. Once it is
-    /// full, `next_packet` always gives a packet or an error, so a loop of
-    /// feeding and taking out always ends. After a [`PacketError`] the
-    /// stream cannot be read any further, and every byte is taken and
-    /// dropped.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole packet, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken, since RFC 6613 asks for the connection to be
-    /// closed then.
-    pub fn next_packet(&mut self) -> Option<Result<Packet, PacketError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let b = &self.buf[self.start..];
-        if b.len() < 4 {
-            return None;
-        }
-        let length = u16::from_be_bytes([b[2], b[3]]);
-        let result = if !(HEADER_LEN..=MAX_PACKET).contains(&usize::from(length)) {
-            Err(PacketError::Length(length))
-        } else if b.len() < usize::from(length) {
-            return None;
-        } else {
-            Packet::parse(&b[..usize::from(length)])
-        };
-        match result {
-            Ok(p) => {
-                self.start += usize::from(length);
-                Some(Ok(p))
-            }
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a packet.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
 }
 
 /// The data types attribute values come in (RFC 8044 names most of
@@ -941,9 +791,8 @@ pub enum DataType {
 }
 
 /// A value read as its data type. [`Value::decode`] reads one, and
-/// [`Value::to_bytes`] writes it back.
+/// [`Value::to_attribute`] constructs an attribute that holds it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Value {
     /// [`DataType::Text`].
     Text(String),
@@ -963,10 +812,20 @@ pub enum Value {
     Ipv6Address(Ipv6Addr),
     /// [`DataType::Ipv6Prefix`]: `length` bits of `prefix`, with the bits
     /// past them zero.
-    Ipv6Prefix { length: u8, prefix: Ipv6Addr },
+    Ipv6Prefix {
+        /// Number of significant prefix bits.
+        length: u8,
+        /// Address with all remaining bits zero.
+        prefix: Ipv6Addr,
+    },
     /// [`DataType::Ipv4Prefix`]: `length` bits of `prefix`, with the bits
     /// past them zero.
-    Ipv4Prefix { length: u8, prefix: Ipv4Addr },
+    Ipv4Prefix {
+        /// Number of significant prefix bits.
+        length: u8,
+        /// Address with all remaining bits zero.
+        prefix: Ipv4Addr,
+    },
     /// [`DataType::InterfaceId`].
     InterfaceId([u8; 8]),
     /// [`DataType::Vsa`].
@@ -974,10 +833,22 @@ pub enum Value {
     /// [`DataType::Evs`].
     Evs(Evs),
     /// [`DataType::Extended`]: the Extended-Type and the bytes after it.
-    Extended { ext_type: u8, data: Vec<u8> },
+    Extended {
+        /// Extended-Type number.
+        ext_type: u8,
+        /// Opaque value bytes.
+        data: Vec<u8>,
+    },
     /// [`DataType::LongExtended`]: the Extended-Type, whether the More
     /// flag is set, and this fragment's bytes.
-    LongExtended { ext_type: u8, more: bool, data: Vec<u8> },
+    LongExtended {
+        /// Extended-Type number.
+        ext_type: u8,
+        /// Whether another fragment follows.
+        more: bool,
+        /// Opaque value bytes.
+        data: Vec<u8>,
+    },
     /// [`DataType::Tlv`]: the TLVs, each as an [`Attribute`]. Their
     /// values are left as bytes; read a nested TLV list with
     /// [`Value::decode`] again.
@@ -1141,23 +1012,19 @@ impl Value {
         }
     }
 
-    /// The value's bytes. It returns `None` if they would be longer than
-    /// [`MAX_VALUE`], or if [`Value::decode`] would refuse them, as it
-    /// does an empty TLV list, a Vendor-Specific value with no vendor
-    /// bytes, or a long extended fragment with the More flag that is not
-    /// full length.
-    ///
-    /// A prefix is written in its clean form: a prefix length past the
-    /// address's bits is cut to them, prefix bits past the length are
-    /// cleared, and an IPv4 prefix that is all zeros gets length 32, as
-    /// RFC 8044 asks. Such a prefix reads back changed, which
-    /// [`Attribute::from_value`] refuses.
-    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+    /// Makes a TLV or vendor attribute using this value's data type.
+    /// Refuses values that exceed [`MAX_VALUE`] or would read back changed.
+    /// Use [`Attribute::from_value`] for the standard attribute dictionary.
+    pub fn to_attribute(&self, kind: u8) -> Option<Attribute> {
+        Attribute::from_value_as(kind, self.data_type(), self)
+    }
+
+    fn encode(&self) -> Option<Vec<u8>> {
         if self.encoded_len() > MAX_VALUE {
             return None;
         }
         let out = self.raw_bytes()?;
-        Value::decode(self.data_type(), &out).is_ok().then_some(out)
+        (Value::decode(self.data_type(), &out).as_ref() == Ok(self)).then_some(out)
     }
 
     /// How many bytes [`Value::raw_bytes`] writes, worked out without
@@ -1169,7 +1036,7 @@ impl Value {
             Value::Address(_) | Value::Integer(_) | Value::Enum(_) | Value::Time(_) => 4,
             Value::Integer64(_) | Value::InterfaceId(_) => 8,
             Value::Ipv6Address(_) => 16,
-            Value::Ipv6Prefix { length, .. } => 2 + usize::from((*length).min(128)).div_ceil(8),
+            Value::Ipv6Prefix { length, .. } => 2 + usize::from(*length).div_ceil(8),
             Value::Ipv4Prefix { .. } => 6,
             Value::Vsa(v) => v.data.len().saturating_add(4),
             Value::Evs(e) => e.data.len().saturating_add(5),
@@ -1190,22 +1057,29 @@ impl Value {
             Value::Integer64(n) => n.to_be_bytes().to_vec(),
             Value::Ipv6Address(a) => a.octets().to_vec(),
             Value::Ipv6Prefix { length, prefix } => {
-                let length = (*length).min(128);
-                let a = mask(&prefix.octets(), length);
+                if *length > 128 || mask(&prefix.octets(), *length) != prefix.octets() {
+                    return None;
+                }
+                let length = *length;
+                let a = prefix.octets();
                 let mut out = vec![0, length];
                 out.extend_from_slice(&a[..usize::from(length).div_ceil(8)]);
                 out
             }
             Value::Ipv4Prefix { length, prefix } => {
-                let a = mask(&prefix.octets(), (*length).min(32));
-                let length = if a == [0; 4] { 32 } else { (*length).min(32) };
+                if *length > 32 || mask(&prefix.octets(), *length) != prefix.octets()
+                    || (prefix.is_unspecified() && *length != 32) {
+                    return None;
+                }
+                let a = prefix.octets();
+                let length = *length;
                 let mut out = vec![0, length];
                 out.extend_from_slice(&a);
                 out
             }
             Value::InterfaceId(a) => a.to_vec(),
-            Value::Vsa(v) => v.to_bytes()?,
-            Value::Evs(e) => e.to_bytes()?,
+            Value::Vsa(v) => v.to_bytes().ok()?,
+            Value::Evs(e) => e.to_bytes().ok()?,
             Value::Extended { ext_type, data } => {
                 let mut out = vec![*ext_type];
                 out.extend_from_slice(data);
@@ -1250,29 +1124,33 @@ pub struct Vsa {
     pub data: Vec<u8>,
 }
 
-impl Vsa {
-    /// Reads a Vendor-Specific value: the 4-byte vendor number and at
-    /// least one byte after it, since RFC 2865 asks for a Length of 7 or
-    /// more.
-    pub fn parse(b: &[u8]) -> Result<Vsa, ValueError> {
-        if b.len() < 5 {
+impl Wire for Vsa {
+    type ParseError = ValueError;
+    type WriteError = Error;
+
+    /// Reads a vendor value. Refuses fewer than 5 bytes or more than
+    /// [`MAX_VALUE`] bytes. Keeps the vendor number and opaque data.
+    fn parse(b: &[u8]) -> Result<Vsa, ValueError> {
+        if !(5..=MAX_VALUE).contains(&b.len()) {
             return Err(ValueError::Length(b.len()));
         }
         Ok(Vsa { vendor: u32::from_be_bytes([b[0], b[1], b[2], b[3]]), data: b[4..].to_vec() })
     }
 
-    /// The value's bytes: the vendor number, then the vendor's bytes. It
-    /// returns `None` if there are no vendor's bytes, which
-    /// [`Vsa::parse`] refuses, or the value would be longer than
-    /// [`MAX_VALUE`].
-    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+    /// Appends the vendor fields and data. Refuses empty data or values
+    /// over [`MAX_VALUE`]. Leaves the destination unchanged on error.
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         if self.data.is_empty() || self.data.len() > MAX_VALUE - 4 {
-            return None;
+            return Err(Error::Unwritable);
         }
         let mut out = self.vendor.to_be_bytes().to_vec();
         out.extend_from_slice(&self.data);
-        Some(out)
+        destination.extend_from_slice(&out);
+        Ok(())
     }
+}
+
+impl Vsa {
 
     /// The vendor's bytes read as sub-attributes, each a 1-byte type, a
     /// 1-byte length (2 or more, counting both) and a value, as RFC 2865
@@ -1309,28 +1187,30 @@ pub struct Evs {
     pub data: Vec<u8>,
 }
 
-impl Evs {
-    /// Reads an extended vendor-specific value: the vendor number, the
-    /// type, and at least one byte after them, as RFC 6929 asks.
-    pub fn parse(b: &[u8]) -> Result<Evs, ValueError> {
-        if b.len() < 6 {
+impl Wire for Evs {
+    type ParseError = ValueError;
+    type WriteError = Error;
+
+    /// Reads a vendor value. Refuses fewer than 6 bytes or more than
+    /// [`MAX_LONG_EXTENDED_VALUE`] bytes. Keeps the vendor number and opaque data.
+    fn parse(b: &[u8]) -> Result<Evs, ValueError> {
+        if !(6..=MAX_LONG_EXTENDED_VALUE).contains(&b.len()) {
             return Err(ValueError::Length(b.len()));
         }
         Ok(Evs { vendor: u32::from_be_bytes([b[0], b[1], b[2], b[3]]), evs_type: b[4], data: b[5..].to_vec() })
     }
 
-    /// The value's bytes: the vendor number, the type, then the bytes. It
-    /// returns `None` if there are no vendor's bytes, which
-    /// [`Evs::parse`] refuses, or the value would not fit in a long
-    /// extended attribute ([`MAX_LONG_EXTENDED_VALUE`]).
-    pub fn to_bytes(&self) -> Option<Vec<u8>> {
+    /// Appends the vendor fields and data. Refuses empty data or values
+    /// over [`MAX_LONG_EXTENDED_VALUE`]. Leaves the destination unchanged on error.
+    fn write(&self, destination: &mut Vec<u8>) -> Result<(), Error> {
         if self.data.is_empty() || self.data.len() > MAX_LONG_EXTENDED_VALUE - 5 {
-            return None;
+            return Err(Error::Unwritable);
         }
         let mut out = self.vendor.to_be_bytes().to_vec();
         out.push(self.evs_type);
         out.extend_from_slice(&self.data);
-        Some(out)
+        destination.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1419,109 +1299,211 @@ impl Extended {
 /// [`DICTIONARY`] under its RFC name, such as User-Name for
 /// [`attr::USER_NAME`].
 pub mod attr {
-    #![allow(missing_docs)]
+    /// The USER-NAME attribute type.
     pub const USER_NAME: u8 = 1;
+    /// The USER-PASSWORD attribute type.
     pub const USER_PASSWORD: u8 = 2;
+    /// The CHAP-PASSWORD attribute type.
     pub const CHAP_PASSWORD: u8 = 3;
+    /// The NAS-IP-ADDRESS attribute type.
     pub const NAS_IP_ADDRESS: u8 = 4;
+    /// The NAS-PORT attribute type.
     pub const NAS_PORT: u8 = 5;
+    /// The SERVICE-TYPE attribute type.
     pub const SERVICE_TYPE: u8 = 6;
+    /// The FRAMED-PROTOCOL attribute type.
     pub const FRAMED_PROTOCOL: u8 = 7;
+    /// The FRAMED-IP-ADDRESS attribute type.
     pub const FRAMED_IP_ADDRESS: u8 = 8;
+    /// The FRAMED-IP-NETMASK attribute type.
     pub const FRAMED_IP_NETMASK: u8 = 9;
+    /// The FRAMED-ROUTING attribute type.
     pub const FRAMED_ROUTING: u8 = 10;
+    /// The FILTER-ID attribute type.
     pub const FILTER_ID: u8 = 11;
+    /// The FRAMED-MTU attribute type.
     pub const FRAMED_MTU: u8 = 12;
+    /// The FRAMED-COMPRESSION attribute type.
     pub const FRAMED_COMPRESSION: u8 = 13;
+    /// The LOGIN-IP-HOST attribute type.
     pub const LOGIN_IP_HOST: u8 = 14;
+    /// The LOGIN-SERVICE attribute type.
     pub const LOGIN_SERVICE: u8 = 15;
+    /// The LOGIN-TCP-PORT attribute type.
     pub const LOGIN_TCP_PORT: u8 = 16;
+    /// The REPLY-MESSAGE attribute type.
     pub const REPLY_MESSAGE: u8 = 18;
+    /// The CALLBACK-NUMBER attribute type.
     pub const CALLBACK_NUMBER: u8 = 19;
+    /// The CALLBACK-ID attribute type.
     pub const CALLBACK_ID: u8 = 20;
+    /// The FRAMED-ROUTE attribute type.
     pub const FRAMED_ROUTE: u8 = 22;
+    /// The FRAMED-IPX-NETWORK attribute type.
     pub const FRAMED_IPX_NETWORK: u8 = 23;
+    /// The STATE attribute type.
     pub const STATE: u8 = 24;
+    /// The CLASS attribute type.
     pub const CLASS: u8 = 25;
+    /// The VENDOR-SPECIFIC attribute type.
     pub const VENDOR_SPECIFIC: u8 = 26;
+    /// The SESSION-TIMEOUT attribute type.
     pub const SESSION_TIMEOUT: u8 = 27;
+    /// The IDLE-TIMEOUT attribute type.
     pub const IDLE_TIMEOUT: u8 = 28;
+    /// The TERMINATION-ACTION attribute type.
     pub const TERMINATION_ACTION: u8 = 29;
+    /// The CALLED-STATION-ID attribute type.
     pub const CALLED_STATION_ID: u8 = 30;
+    /// The CALLING-STATION-ID attribute type.
     pub const CALLING_STATION_ID: u8 = 31;
+    /// The NAS-IDENTIFIER attribute type.
     pub const NAS_IDENTIFIER: u8 = 32;
+    /// The PROXY-STATE attribute type.
     pub const PROXY_STATE: u8 = 33;
+    /// The LOGIN-LAT-SERVICE attribute type.
     pub const LOGIN_LAT_SERVICE: u8 = 34;
+    /// The LOGIN-LAT-NODE attribute type.
     pub const LOGIN_LAT_NODE: u8 = 35;
+    /// The LOGIN-LAT-GROUP attribute type.
     pub const LOGIN_LAT_GROUP: u8 = 36;
+    /// The FRAMED-APPLETALK-LINK attribute type.
     pub const FRAMED_APPLETALK_LINK: u8 = 37;
+    /// The FRAMED-APPLETALK-NETWORK attribute type.
     pub const FRAMED_APPLETALK_NETWORK: u8 = 38;
+    /// The FRAMED-APPLETALK-ZONE attribute type.
     pub const FRAMED_APPLETALK_ZONE: u8 = 39;
+    /// The ACCT-STATUS-TYPE attribute type.
     pub const ACCT_STATUS_TYPE: u8 = 40;
+    /// The ACCT-DELAY-TIME attribute type.
     pub const ACCT_DELAY_TIME: u8 = 41;
+    /// The ACCT-INPUT-OCTETS attribute type.
     pub const ACCT_INPUT_OCTETS: u8 = 42;
+    /// The ACCT-OUTPUT-OCTETS attribute type.
     pub const ACCT_OUTPUT_OCTETS: u8 = 43;
+    /// The ACCT-SESSION-ID attribute type.
     pub const ACCT_SESSION_ID: u8 = 44;
+    /// The ACCT-AUTHENTIC attribute type.
     pub const ACCT_AUTHENTIC: u8 = 45;
+    /// The ACCT-SESSION-TIME attribute type.
     pub const ACCT_SESSION_TIME: u8 = 46;
+    /// The ACCT-INPUT-PACKETS attribute type.
     pub const ACCT_INPUT_PACKETS: u8 = 47;
+    /// The ACCT-OUTPUT-PACKETS attribute type.
     pub const ACCT_OUTPUT_PACKETS: u8 = 48;
+    /// The ACCT-TERMINATE-CAUSE attribute type.
     pub const ACCT_TERMINATE_CAUSE: u8 = 49;
+    /// The ACCT-MULTI-SESSION-ID attribute type.
     pub const ACCT_MULTI_SESSION_ID: u8 = 50;
+    /// The ACCT-LINK-COUNT attribute type.
     pub const ACCT_LINK_COUNT: u8 = 51;
+    /// The ACCT-INPUT-GIGAWORDS attribute type.
     pub const ACCT_INPUT_GIGAWORDS: u8 = 52;
+    /// The ACCT-OUTPUT-GIGAWORDS attribute type.
     pub const ACCT_OUTPUT_GIGAWORDS: u8 = 53;
+    /// The EVENT-TIMESTAMP attribute type.
     pub const EVENT_TIMESTAMP: u8 = 55;
+    /// The EGRESS-VLANID attribute type.
     pub const EGRESS_VLANID: u8 = 56;
+    /// The INGRESS-FILTERS attribute type.
     pub const INGRESS_FILTERS: u8 = 57;
+    /// The EGRESS-VLAN-NAME attribute type.
     pub const EGRESS_VLAN_NAME: u8 = 58;
+    /// The USER-PRIORITY-TABLE attribute type.
     pub const USER_PRIORITY_TABLE: u8 = 59;
+    /// The CHAP-CHALLENGE attribute type.
     pub const CHAP_CHALLENGE: u8 = 60;
+    /// The NAS-PORT-TYPE attribute type.
     pub const NAS_PORT_TYPE: u8 = 61;
+    /// The PORT-LIMIT attribute type.
     pub const PORT_LIMIT: u8 = 62;
+    /// The LOGIN-LAT-PORT attribute type.
     pub const LOGIN_LAT_PORT: u8 = 63;
+    /// The TUNNEL-TYPE attribute type.
     pub const TUNNEL_TYPE: u8 = 64;
+    /// The TUNNEL-MEDIUM-TYPE attribute type.
     pub const TUNNEL_MEDIUM_TYPE: u8 = 65;
+    /// The TUNNEL-CLIENT-ENDPOINT attribute type.
     pub const TUNNEL_CLIENT_ENDPOINT: u8 = 66;
+    /// The TUNNEL-SERVER-ENDPOINT attribute type.
     pub const TUNNEL_SERVER_ENDPOINT: u8 = 67;
+    /// The ACCT-TUNNEL-CONNECTION attribute type.
     pub const ACCT_TUNNEL_CONNECTION: u8 = 68;
+    /// The TUNNEL-PASSWORD attribute type.
     pub const TUNNEL_PASSWORD: u8 = 69;
+    /// The ARAP-PASSWORD attribute type.
     pub const ARAP_PASSWORD: u8 = 70;
+    /// The ARAP-FEATURES attribute type.
     pub const ARAP_FEATURES: u8 = 71;
+    /// The ARAP-ZONE-ACCESS attribute type.
     pub const ARAP_ZONE_ACCESS: u8 = 72;
+    /// The ARAP-SECURITY attribute type.
     pub const ARAP_SECURITY: u8 = 73;
+    /// The ARAP-SECURITY-DATA attribute type.
     pub const ARAP_SECURITY_DATA: u8 = 74;
+    /// The PASSWORD-RETRY attribute type.
     pub const PASSWORD_RETRY: u8 = 75;
+    /// The PROMPT attribute type.
     pub const PROMPT: u8 = 76;
+    /// The CONNECT-INFO attribute type.
     pub const CONNECT_INFO: u8 = 77;
+    /// The CONFIGURATION-TOKEN attribute type.
     pub const CONFIGURATION_TOKEN: u8 = 78;
+    /// The EAP-MESSAGE attribute type.
     pub const EAP_MESSAGE: u8 = 79;
+    /// The MESSAGE-AUTHENTICATOR attribute type.
     pub const MESSAGE_AUTHENTICATOR: u8 = 80;
+    /// The TUNNEL-PRIVATE-GROUP-ID attribute type.
     pub const TUNNEL_PRIVATE_GROUP_ID: u8 = 81;
+    /// The TUNNEL-ASSIGNMENT-ID attribute type.
     pub const TUNNEL_ASSIGNMENT_ID: u8 = 82;
+    /// The TUNNEL-PREFERENCE attribute type.
     pub const TUNNEL_PREFERENCE: u8 = 83;
+    /// The ARAP-CHALLENGE-RESPONSE attribute type.
     pub const ARAP_CHALLENGE_RESPONSE: u8 = 84;
+    /// The ACCT-INTERIM-INTERVAL attribute type.
     pub const ACCT_INTERIM_INTERVAL: u8 = 85;
+    /// The ACCT-TUNNEL-PACKETS-LOST attribute type.
     pub const ACCT_TUNNEL_PACKETS_LOST: u8 = 86;
+    /// The NAS-PORT-ID attribute type.
     pub const NAS_PORT_ID: u8 = 87;
+    /// The FRAMED-POOL attribute type.
     pub const FRAMED_POOL: u8 = 88;
+    /// The CUI attribute type.
     pub const CUI: u8 = 89;
+    /// The TUNNEL-CLIENT-AUTH-ID attribute type.
     pub const TUNNEL_CLIENT_AUTH_ID: u8 = 90;
+    /// The TUNNEL-SERVER-AUTH-ID attribute type.
     pub const TUNNEL_SERVER_AUTH_ID: u8 = 91;
+    /// The NAS-FILTER-RULE attribute type.
     pub const NAS_FILTER_RULE: u8 = 92;
+    /// The ORIGINATING-LINE-INFO attribute type.
     pub const ORIGINATING_LINE_INFO: u8 = 94;
+    /// The NAS-IPV6-ADDRESS attribute type.
     pub const NAS_IPV6_ADDRESS: u8 = 95;
+    /// The FRAMED-INTERFACE-ID attribute type.
     pub const FRAMED_INTERFACE_ID: u8 = 96;
+    /// The FRAMED-IPV6-PREFIX attribute type.
     pub const FRAMED_IPV6_PREFIX: u8 = 97;
+    /// The LOGIN-IPV6-HOST attribute type.
     pub const LOGIN_IPV6_HOST: u8 = 98;
+    /// The FRAMED-IPV6-ROUTE attribute type.
     pub const FRAMED_IPV6_ROUTE: u8 = 99;
+    /// The FRAMED-IPV6-POOL attribute type.
     pub const FRAMED_IPV6_POOL: u8 = 100;
+    /// The ERROR-CAUSE attribute type.
     pub const ERROR_CAUSE: u8 = 101;
+    /// The EXTENDED-TYPE-1 attribute type.
     pub const EXTENDED_TYPE_1: u8 = 241;
+    /// The EXTENDED-TYPE-2 attribute type.
     pub const EXTENDED_TYPE_2: u8 = 242;
+    /// The EXTENDED-TYPE-3 attribute type.
     pub const EXTENDED_TYPE_3: u8 = 243;
+    /// The EXTENDED-TYPE-4 attribute type.
     pub const EXTENDED_TYPE_4: u8 = 244;
+    /// The LONG-EXTENDED-TYPE-1 attribute type.
     pub const LONG_EXTENDED_TYPE_1: u8 = 245;
+    /// The LONG-EXTENDED-TYPE-2 attribute type.
     pub const LONG_EXTENDED_TYPE_2: u8 = 246;
 }
 
@@ -1791,6 +1773,7 @@ pub fn enum_name(kind: u8, value: u32) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace().map(|h| u8::from_str_radix(h, 16).unwrap()).collect()
@@ -1893,55 +1876,46 @@ mod tests {
             for n in 0..bytes.len() {
                 let e = Packet::parse(&bytes[..n]).unwrap_err();
                 if n < HEADER_LEN {
-                    assert_eq!(e, PacketError::Short(n));
+                    assert_eq!(e, Error::Short(n));
                 } else {
-                    assert_eq!(e, PacketError::Truncated { length: bytes.len() as u16, got: n });
+                    assert_eq!(e, Error::Truncated { length: bytes.len() as u16, got: n });
                 }
             }
-            // A stream decoder waits instead.
-            let mut d = Decoder::new();
-            for (i, b) in bytes.iter().enumerate() {
-                assert_eq!(d.feed(std::slice::from_ref(b)), 1);
-                let got = d.next_packet();
-                if i + 1 < bytes.len() {
-                    assert!(got.is_none(), "{i}");
-                } else {
-                    assert_eq!(got.unwrap().unwrap().to_bytes().unwrap(), bytes);
-                }
-            }
+            contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_PACKET);
+            assert_eq!(decode_all(Frames::new, &bytes), (vec![Packet::parse(&bytes).unwrap()], None));
         }
     }
 
     #[test]
     fn packet_errors() {
-        assert_eq!(Packet::parse(&[1, 0, 0]), Err(PacketError::Short(3)));
+        assert_eq!(Packet::parse(&[1, 0, 0]), Err(Error::Short(3)));
         let mut b = vec![1, 0, 0, 19];
         b.extend_from_slice(&[0; 16]);
-        assert_eq!(Packet::parse(&b), Err(PacketError::Length(19)));
+        assert_eq!(Packet::parse(&b), Err(Error::Length { length: 19, limit: MAX_PACKET }));
         b[2..4].copy_from_slice(&4097u16.to_be_bytes());
-        assert_eq!(Packet::parse(&b), Err(PacketError::Length(4097)));
+        assert_eq!(Packet::parse(&b), Err(Error::Length { length: 4097, limit: MAX_PACKET }));
         b[2..4].copy_from_slice(&22u16.to_be_bytes());
-        assert_eq!(Packet::parse(&b), Err(PacketError::Truncated { length: 22, got: 20 }));
+        assert_eq!(Packet::parse(&b), Err(Error::Truncated { length: 22, got: 20 }));
         // An attribute of length 1, then one that runs past the length.
         b.extend_from_slice(&[1, 1]);
-        assert_eq!(Packet::parse(&b), Err(PacketError::Attribute(20)));
+        assert_eq!(Packet::parse(&b), Err(Error::Attribute(20)));
         b[21] = 3;
-        assert_eq!(Packet::parse(&b), Err(PacketError::Attribute(20)));
+        assert_eq!(Packet::parse(&b), Err(Error::Attribute(20)));
         // A lone type byte with no length.
         b[3] = 21;
-        assert_eq!(Packet::parse(&b), Err(PacketError::Attribute(20)));
-        // Length 2 is an empty attribute, and bytes past the length are
-        // padding.
+        assert_eq!(Packet::parse(&b[..21]), Err(Error::Attribute(20)));
+        // Length 2 is an empty attribute. Exact parsing refuses padding.
         b[3] = 22;
         b[21] = 2;
         b.extend_from_slice(&[9, 9, 9]);
-        let p = Packet::parse(&b).unwrap();
+        assert_eq!(Packet::parse(&b), Err(Error::Trailing { remaining: 3 }));
+        let p = Packet::parse(&b[..22]).unwrap();
         assert_eq!(p.attributes, [Attribute { kind: 1, value: vec![] }]);
         assert_eq!(p.to_bytes().unwrap(), b[..22]);
-        for e in [PacketError::Short(1), PacketError::Length(1), PacketError::Attribute(20)] {
+        for e in [Error::Short(1), Error::Length { length: 1, limit: MAX_PACKET }, Error::Attribute(20)] {
             assert!(!e.to_string().is_empty());
         }
-        assert!(!PacketError::Truncated { length: 1, got: 0 }.to_string().is_empty());
+        assert!(!Error::Truncated { length: 1, got: 0 }.to_string().is_empty());
     }
 
     #[test]
@@ -2040,21 +2014,20 @@ mod tests {
         ];
         for (t, v) in cases {
             assert_eq!(v.data_type(), if t == DataType::Concat { DataType::String } else { t });
-            assert_eq!(Value::decode(t, &v.to_bytes().unwrap()), Ok(v.clone()), "{t:?}");
-            assert_eq!(Attribute::from_value_as(1, t, &v).map(|a| a.value), Some(v.to_bytes().unwrap()));
+            assert_eq!(Value::decode(t, &v.to_attribute(1).map(|a| a.value).unwrap()), Ok(v.clone()), "{t:?}");
+            assert_eq!(Attribute::from_value_as(1, t, &v).map(|a| a.value), Some(v.to_attribute(1).map(|a| a.value).unwrap()));
         }
         assert_eq!(Value::String(vec![]).data_type(), DataType::String);
         // Wire forms.
         let p = Value::Ipv6Prefix { length: 64, prefix: "2001:db8:1:2::".parse().unwrap() };
-        assert_eq!(p.to_bytes().unwrap(), hex("00 40 20 01 0d b8 00 01 00 02"));
+        assert_eq!(p.to_attribute(1).map(|a| a.value).unwrap(), hex("00 40 20 01 0d b8 00 01 00 02"));
         let p = Value::Ipv4Prefix { length: 24, prefix: Ipv4Addr::new(10, 1, 2, 0) };
-        assert_eq!(p.to_bytes().unwrap(), [0, 24, 10, 1, 2, 0]);
-        // A prefix written with stray bits and too long a length comes out
-        // clean.
+        assert_eq!(p.to_attribute(1).map(|a| a.value).unwrap(), [0, 24, 10, 1, 2, 0]);
+        // Prefixes with stray bits or excessive lengths are refused.
         let p = Value::Ipv4Prefix { length: 40, prefix: Ipv4Addr::new(1, 2, 3, 4) };
-        assert_eq!(p.to_bytes().unwrap(), [0, 32, 1, 2, 3, 4]);
+        assert_eq!(p.to_attribute(1), None);
         let p = Value::Ipv6Prefix { length: 4, prefix: "ffff::".parse().unwrap() };
-        assert_eq!(p.to_bytes().unwrap(), [0, 4, 0xf0]);
+        assert_eq!(p.to_attribute(1), None);
         // A full-length IPv6 prefix field is also read, and the reserved
         // byte is ignored.
         let mut b = vec![7, 64];
@@ -2093,7 +2066,7 @@ mod tests {
         {
             assert!(!e.to_string().is_empty());
         }
-        assert!(!TooLong.to_string().is_empty());
+        assert!(!Error::Unwritable.to_string().is_empty());
         // An attribute the dictionary does not know reads as bytes.
         assert_eq!(Attribute { kind: 200, value: vec![1] }.decode(), Ok(Value::String(vec![1])));
     }
@@ -2117,7 +2090,7 @@ mod tests {
         assert!(Vsa::from_sub_attributes(1, &[Attribute { kind: 1, value: vec![0; 247] }]).is_some());
         assert_eq!(Vsa::from_sub_attributes(1, &[]), None);
         let big = Vsa { vendor: 1, data: vec![0; 250] };
-        assert_eq!(big.to_bytes(), None);
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
         assert!(Attribute::from_value(attr::VENDOR_SPECIFIC, &Value::Vsa(big)).is_none());
     }
 
@@ -2208,7 +2181,7 @@ mod tests {
         assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap().extended(), [Ok(most.clone())]);
         // A second one does not fit, and nothing is added.
         let before = r.attributes.len();
-        assert_eq!(r.push_extended(&most), Err(TooLong));
+        assert_eq!(r.push_extended(&most), Err(Error::Unwritable));
         assert_eq!(r.attributes.len(), before);
     }
 
@@ -2236,18 +2209,18 @@ mod tests {
         let empty_tlv = Value::Tlv(vec![Attribute { kind: 1, value: vec![] }]);
         assert_eq!(Attribute::from_value_as(1, T::Tlv, &empty_tlv), None);
         assert_eq!(Attribute::from_value_as(1, T::Tlv, &Value::Tlv(vec![])), None);
-        assert_eq!(Value::Tlv(vec![]).to_bytes(), None);
+        assert_eq!(Value::Tlv(vec![]).to_attribute(1).map(|a| a.value), None);
         assert_eq!(Vsa::from_sub_attributes(9, &[]), None);
-        assert_eq!(Vsa { vendor: 9, data: vec![] }.to_bytes(), None);
-        assert_eq!(Value::Vsa(Vsa { vendor: 9, data: vec![] }).to_bytes(), None);
-        assert_eq!(Evs { vendor: 9, evs_type: 1, data: vec![] }.to_bytes(), None);
-        assert_eq!(Value::Evs(Evs { vendor: 9, evs_type: 1, data: vec![] }).to_bytes(), None);
-        assert_eq!(Value::Extended { ext_type: 1, data: vec![] }.to_bytes(), None);
+        assert_eq!(Vsa { vendor: 9, data: vec![] }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Value::Vsa(Vsa { vendor: 9, data: vec![] }).to_attribute(1).map(|a| a.value), None);
+        assert_eq!(Evs { vendor: 9, evs_type: 1, data: vec![] }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Value::Evs(Evs { vendor: 9, evs_type: 1, data: vec![] }).to_attribute(1).map(|a| a.value), None);
+        assert_eq!(Value::Extended { ext_type: 1, data: vec![] }.to_attribute(1).map(|a| a.value), None);
         let short_more = Value::LongExtended { ext_type: 1, more: true, data: vec![1] };
-        assert_eq!(short_more.to_bytes(), None);
+        assert_eq!(short_more.to_attribute(1).map(|a| a.value), None);
         assert_eq!(Attribute::from_value(245, &short_more), None);
         let mut p = Packet::new(Code::AccessRequest, 1, [0; 16]);
-        assert_eq!(p.push_extended(&Extended { kind: 241, ext_type: 1, data: vec![] }), Err(TooLong));
+        assert_eq!(p.push_extended(&Extended { kind: 241, ext_type: 1, data: vec![] }), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2288,13 +2261,12 @@ mod tests {
     }
 
     #[test]
-    fn ipv4_prefix_of_zeros_has_length_32() {
+    fn ipv4_prefix_of_zeros_requires_length_32() {
         // RFC 8044, section 3.11.
         assert_eq!(Value::decode(DataType::Ipv4Prefix, &[0, 8, 0, 0, 0, 0]), Err(ValueError::Prefix));
         assert_eq!(Value::decode(DataType::Ipv4Prefix, &[0, 0, 0, 0, 0, 0]), Err(ValueError::Prefix));
         let zero = Value::Ipv4Prefix { length: 0, prefix: Ipv4Addr::new(10, 0, 0, 0) };
-        assert_eq!(zero.to_bytes().unwrap(), [0, 32, 0, 0, 0, 0]);
-        assert!(Value::decode(DataType::Ipv4Prefix, &zero.to_bytes().unwrap()).is_ok());
+        assert_eq!(zero.to_attribute(1), None);
     }
 
     #[test]
@@ -2366,10 +2338,10 @@ mod tests {
         // "é".repeat(127) would leave text that is not UTF-8.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
         p.attributes.push(Attribute { kind: attr::USER_NAME, value: "é".repeat(127).into_bytes() });
-        assert_eq!(p.to_bytes(), Err(TooLong));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         assert!(Attribute::from_value(attr::CLASS, &Value::String(vec![0; 254])).is_none());
-        assert_eq!(Value::String(vec![0; 254]).to_bytes(), None);
-        assert_eq!(p.push(Attribute { kind: 1, value: vec![0; 254] }), Err(TooLong));
+        assert_eq!(Value::String(vec![0; 254]).to_attribute(1).map(|a| a.value), None);
+        assert_eq!(p.push(Attribute { kind: 1, value: vec![0; 254] }), Err(Error::Unwritable));
         // A packet past MAX_PACKET is refused, not cut: the Session-Timeout
         // after fifteen 253-byte Class values and one of 249 bytes is not
         // left out.
@@ -2381,7 +2353,7 @@ mod tests {
         assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
         p.attributes.push(Attribute::from_value(attr::SESSION_TIMEOUT, &Value::Integer(60)).unwrap());
         assert_eq!(p.encoded_len(), MAX_PACKET + 6);
-        assert_eq!(p.to_bytes(), Err(TooLong));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         // push refuses anything once the packet is too long, however it
         // got so.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
@@ -2389,9 +2361,9 @@ mod tests {
             p.attributes.push(Attribute { kind: attr::CLASS, value: vec![1; MAX_VALUE] });
         }
         assert_eq!(p.encoded_len(), 4100);
-        assert_eq!(p.push(Attribute { kind: attr::CLASS, value: vec![1] }), Err(TooLong));
+        assert_eq!(p.push(Attribute { kind: attr::CLASS, value: vec![1] }), Err(Error::Unwritable));
         let e = Extended { kind: 241, ext_type: 1, data: vec![1] };
-        assert_eq!(p.push_extended(&e), Err(TooLong));
+        assert_eq!(p.push_extended(&e), Err(Error::Unwritable));
         assert_eq!(p.attributes.len(), 16);
         // push stops at the limit.
         let mut p = Packet::new(Code::AccessAccept, 1, [0; 16]);
@@ -2400,63 +2372,49 @@ mod tests {
         assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
         // TLVs past MAX_VALUE are refused, not cut.
         let t = Value::Tlv(vec![Attribute { kind: 1, value: vec![0; 300] }]);
-        assert_eq!(t.to_bytes(), None);
+        assert_eq!(t.to_attribute(1).map(|a| a.value), None);
         let t = Value::Tlv(vec![Attribute { kind: 1, value: vec![0; 100] }; 3]);
-        assert_eq!(t.to_bytes(), None);
+        assert_eq!(t.to_attribute(1).map(|a| a.value), None);
         let t = Value::Tlv(vec![Attribute { kind: 1, value: vec![0; 251] }]);
-        assert_eq!(t.to_bytes().unwrap().len(), MAX_VALUE);
+        assert_eq!(t.to_attribute(1).map(|a| a.value).unwrap().len(), MAX_VALUE);
         // Values too long for an attribute are refused before they are
         // copied.
-        assert_eq!(Value::Text("x".repeat(254)).to_bytes(), None);
-        assert_eq!(Value::Extended { ext_type: 1, data: vec![0; 253] }.to_bytes(), None);
-        assert_eq!(Value::LongExtended { ext_type: 1, more: false, data: vec![0; 252] }.to_bytes(), None);
-        assert_eq!(Value::Evs(Evs { vendor: 1, evs_type: 1, data: vec![0; 249] }).to_bytes(), None);
-        assert!(Value::Evs(Evs { vendor: 1, evs_type: 1, data: vec![0; 248] }).to_bytes().is_some());
+        assert_eq!(Value::Text("x".repeat(254)).to_attribute(1).map(|a| a.value), None);
+        assert_eq!(Value::Extended { ext_type: 1, data: vec![0; 253] }.to_attribute(1).map(|a| a.value), None);
+        assert_eq!(Value::LongExtended { ext_type: 1, more: false, data: vec![0; 252] }.to_attribute(1).map(|a| a.value), None);
+        assert_eq!(Value::Evs(Evs { vendor: 1, evs_type: 1, data: vec![0; 249] }).to_attribute(1).map(|a| a.value), None);
+        assert!(Value::Evs(Evs { vendor: 1, evs_type: 1, data: vec![0; 248] }).to_attribute(1).map(|a| a.value).is_some());
         // An extended vendor-specific value can be as long as a long
         // extended attribute carries.
-        assert!(Evs { vendor: 1, evs_type: 1, data: vec![0; MAX_LONG_EXTENDED_VALUE - 5] }.to_bytes().is_some());
-        assert_eq!(Evs { vendor: 1, evs_type: 1, data: vec![0; MAX_LONG_EXTENDED_VALUE - 4] }.to_bytes(), None);
+        assert!(Evs { vendor: 1, evs_type: 1, data: vec![0; MAX_LONG_EXTENDED_VALUE - 5] }.to_bytes().is_ok());
+        assert_eq!(Evs { vendor: 1, evs_type: 1, data: vec![0; MAX_LONG_EXTENDED_VALUE - 4] }.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
+    fn stream_splits_packets() {
         let a = hex(ACCESS_REQUEST);
-        let b = hex(ACCESS_ACCEPT);
-        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(p) = d.next_packet() {
-                got.push(p.unwrap().code);
-            }
-        }
-        assert_eq!(got, [Code::AccessRequest, Code::AccessAccept]);
-        assert_eq!(d.buffered(), 0);
-        // A bad length breaks the stream for good.
-        assert_eq!(d.feed(&[1, 0, 0, 5]), 4);
-        assert_eq!(d.next_packet(), Some(Err(PacketError::Length(5))));
-        assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_packet(), Some(Err(PacketError::Length(5))));
-        assert_eq!(d.buffered(), 0);
-        // So does a packet whose attributes do not fit.
-        let mut d = Decoder::new();
-        let mut bad = a.clone();
+        let data = [a.clone(), hex(ACCESS_ACCEPT)].concat();
+        contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_PACKET);
+        let (packets, error) = decode_all(Frames::new, &data);
+        assert_eq!(error, None);
+        assert_eq!(packets.iter().map(|p| p.code).collect::<Vec<_>>(), [Code::AccessRequest, Code::AccessAccept]);
+        assert_eq!(decode_all(Frames::new, &[1, 0, 0, 5]).1,
+            Some(Fail::Protocol(Error::Length { length: 5, limit: MAX_PACKET })));
+        let mut bad = a;
         bad[21] = 1;
-        assert_eq!(d.feed(&bad), bad.len());
-        assert_eq!(d.next_packet(), Some(Err(PacketError::Attribute(20))));
+        assert_eq!(decode_all(Frames::new, &bad).1, Some(Fail::Protocol(Error::Attribute(20))));
     }
 
     #[test]
-    fn decoder_holds_at_most_one_packet() {
-        // A stream fed in one call is taken a packet's worth at a time.
+    fn stream_holds_at_most_one_packet() {
+        // A stream pushed in one call is taken a packet's worth at a time.
         let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 1000).collect();
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&stream), MAX_BUFFERED);
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), 0);
-        assert_eq!(d.buffered(), MAX_BUFFERED);
-        let (packets, error) = split(&stream, false);
+        let mut d = Stream::new(Frames::new());
+        assert_eq!(d.push(&stream), MAX_PACKET);
+        assert_eq!(d.push(&stream[MAX_PACKET..]), 0);
+        assert_eq!(d.buffered(), MAX_PACKET);
+        let (packets, error) = decode_all(Frames::new, &stream);
         assert_eq!((packets.len(), error), (1000, None));
         // A packet of the longest length fills the decoder, and is read.
         let mut big = Packet::new(Code::AccessAccept, 2, [0; 16]);
@@ -2465,18 +2423,18 @@ mod tests {
         big.push(Attribute { kind: attr::CLASS, value: vec![2; room] }).unwrap();
         let bytes = big.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_PACKET);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[bytes.clone(), bytes.clone()].concat()), MAX_BUFFERED);
-        assert_eq!(d.next_packet(), Some(Ok(big)));
+        let mut d = Stream::new(Frames::new());
+        assert_eq!(d.push(&[bytes.clone(), bytes.clone()].concat()), MAX_PACKET);
+        assert_eq!(d.next(), Some(Ok(big)));
         assert_eq!(d.buffered(), 0);
     }
 
     #[test]
-    fn decoder_takes_many_small_packets_in_linear_time() {
+    fn stream_takes_many_small_packets_in_linear_time() {
         let one = Packet::new(Code::StatusServer, 1, [0; 16]).to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
         let started = std::time::Instant::now();
-        let (packets, error) = split(&stream, false);
+        let (packets, error) = decode_all(Frames::new, &stream);
         assert_eq!((packets.len(), error), (100_000, None));
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
@@ -2591,7 +2549,7 @@ mod tests {
                 let e = Extended { kind, ext_type, data: vec![1] };
                 assert_eq!(e.to_attributes(), None);
                 let mut p = Packet::new(Code::AccessRequest, 1, [0; 16]);
-                assert_eq!(p.push_extended(&e), Err(TooLong));
+                assert_eq!(p.push_extended(&e), Err(Error::Unwritable));
             }
         }
         assert!(Extended { kind: 241, ext_type: 240, data: vec![1] }.to_attributes().is_some());
@@ -2615,19 +2573,6 @@ mod tests {
         assert_eq!(s.hash_one(Code::Other(43)), s.hash_one(Code::CoaRequest));
     }
 
-    /// A deterministic linear congruential generator, so failures repeat.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn byte(&mut self) -> u8 {
-            self.next() as u8
-        }
-    }
-
     /// Checks everything a reader gives back writes and reads back the
     /// same.
     fn check(data: &[u8]) {
@@ -2638,7 +2583,7 @@ mod tests {
                 if let Ok(v) = a.decode() {
                     let t = a.info().map_or(DataType::String, |i| i.data_type);
                     assert!(Attribute::from_value(a.kind, &v).is_some());
-                    assert_eq!(Value::decode(t, &v.to_bytes().unwrap()), Ok(v));
+                    assert_eq!(Value::decode(t, &v.to_attribute(1).map(|a| a.value).unwrap()), Ok(v));
                 }
                 if let Ok(Value::Vsa(v)) = a.decode()
                     && let Ok(subs) = v.sub_attributes()
@@ -2647,7 +2592,7 @@ mod tests {
                 }
                 for t in [DataType::Tlv, DataType::Ipv6Prefix, DataType::Ipv4Prefix, DataType::Evs] {
                     if let Ok(v) = Value::decode(t, &a.value) {
-                        assert_eq!(Value::decode(t, &v.to_bytes().unwrap()), Ok(v));
+                        assert_eq!(Value::decode(t, &v.to_attribute(1).map(|a| a.value).unwrap()), Ok(v));
                     }
                 }
             }
@@ -2663,72 +2608,43 @@ mod tests {
             let again: Vec<Extended> = q.extended().into_iter().map(Result::unwrap).collect();
             assert_eq!(again, ext);
         }
-        assert_eq!(split(data, false), split(data, true));
-    }
-
-    /// Feeds `data` to a decoder all at once or a byte at a time, taking
-    /// packets out after each feed, as a world does. Every packet, then
-    /// the error that broke the stream, if one did.
-    fn split(data: &[u8], bytewise: bool) -> (Vec<Packet>, Option<PacketError>) {
-        let mut d = Decoder::new();
-        let mut packets = Vec::new();
-        let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-        for chunk in chunks {
-            let mut rest = chunk;
-            while !rest.is_empty() {
-                let took = d.feed(rest);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                rest = &rest[took..];
-                let mut progress = took > 0;
-                while let Some(r) = d.next_packet() {
-                    match r {
-                        Ok(p) => packets.push(p),
-                        Err(e) => return (packets, Some(e)),
-                    }
-                    progress = true;
-                }
-                // A full decoder always gives a packet or an error.
-                assert!(progress);
-            }
-        }
-        (packets, None)
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_PACKET);
+        contract::check_wire::<Packet>(data);
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut rng = Lcg(0x5eed);
+        let mut rng = Lcg::new(0x5eed);
         let seeds = [hex(ACCESS_REQUEST), hex(ACCESS_ACCEPT), hex(CHAP_REQUEST), hex(CHALLENGE)];
-        for i in 0..6000 {
+        for i in 0..512 {
             let mut data = if i % 3 == 0 {
                 // Random bytes behind a plausible header.
-                let n = 20 + (rng.next() % 300) as usize;
-                let mut d: Vec<u8> = (0..n).map(|_| rng.byte()).collect();
+                let n = 20 + rng.index(300);
+                let mut d = vec![0; n];
+                rng.fill(&mut d);
                 d[2..4].copy_from_slice(&(n as u16).to_be_bytes());
                 d
             } else if i % 3 == 1 {
                 // A real packet with some bytes changed.
                 let mut d = seeds[i % seeds.len()].clone();
-                for _ in 0..1 + rng.next() % 4 {
-                    let at = rng.next() as usize % d.len();
-                    d[at] = rng.byte();
-                }
+                mutate(&mut rng, &mut d);
                 d
             } else {
                 // Well-formed attributes of random types.
-                let mut d = vec![rng.byte(), rng.byte(), 0, 0];
+                let mut d = vec![rng.next() as u8, rng.next() as u8, 0, 0];
                 d.extend_from_slice(&[0; 16]);
-                for _ in 0..rng.next() % 8 {
+                for _ in 0..rng.index(8) {
                     let kinds = [26, 97, 241, 245, 246, 1, 4, 55, 79, 200];
-                    let kind = kinds[rng.next() as usize % kinds.len()];
-                    let more = rng.next().is_multiple_of(2);
+                    let kind = kinds[rng.index(kinds.len())];
+                    let more = rng.coin();
                     // A fragment with the More flag is valid only at full
                     // length, so make most of them so.
-                    let full = more && kind >= 245 && !rng.next().is_multiple_of(4);
-                    let len = if full { MAX_VALUE } else { (rng.next() % 40) as usize };
+                    let full = more && kind >= 245 && rng.index(4) != 0;
+                    let len = if full { MAX_VALUE } else { rng.index(40) };
                     d.push(kind);
                     d.push(len as u8 + 2);
                     for j in 0..len {
-                        d.push(if j == 1 && more { MORE_FLAG } else { rng.byte() % 8 });
+                        d.push(if j == 1 && more { MORE_FLAG } else { rng.index(8) as u8 });
                     }
                 }
                 let n = d.len() as u16;
