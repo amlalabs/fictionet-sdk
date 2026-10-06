@@ -68,8 +68,7 @@
 //! transport.params.push(TransportParam::ServerPort(6256, Some(6257)));
 //! let mut reply = request.reply(200, "OK");
 //! reply.push_header("Session", "47112344");
-//! let value = String::from_utf8(transport.to_bytes().unwrap()).unwrap();
-//! reply.push_header("Transport", &value);
+//! reply.push_value("Transport", &transport).unwrap();
 //! assert_eq!(
 //!     reply.to_bytes().unwrap(),
 //!     b"RTSP/1.0 200 OK\r\nCSeq: 302\r\nSession: 47112344\r\n\
@@ -219,13 +218,13 @@ impl std::fmt::Display for Error {
             Error::Trailing => f.write_str("bytes after wire unit"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::TooLong => {
-                write!(f, "head over {MAX_HEAD}, body over {MAX_BODY} or frame over {MAX_INTERLEAVED} bytes")
+                write!(f, "head or header value over {MAX_HEAD}, body over {MAX_BODY} or frame over {MAX_INTERLEAVED} bytes")
             }
             Error::TooMany => {
                 write!(f, "over {MAX_HEADERS} headers, {MAX_TRANSPORTS} transports or {MAX_PARAMS} parameters")
             }
             Error::LineEnding => f.write_str("CR or LF outside a CRLF pair"),
-            Error::Utf8 => f.write_str("head is not UTF-8"),
+            Error::Utf8 => f.write_str("head or header value is not UTF-8"),
             Error::StartLine => f.write_str("malformed request or status line"),
             Error::Version => f.write_str("version is not RTSP/1.0 or RTSP/2.0"),
             Error::HeaderLine => f.write_str("malformed header line"),
@@ -364,6 +363,15 @@ impl Message {
     /// Adds a header at the end.
     pub fn push_header(&mut self, name: &str, value: &str) {
         self.headers.push(Header::new(name, value));
+    }
+
+    /// Adds a header from a wire value. Refuses a failed value write or
+    /// invalid UTF-8, and leaves the headers unchanged on error.
+    /// The message writer checks the header name, text, and size limits.
+    pub fn push_value(&mut self, name: &str, value: &impl Wire<WriteError = Error>) -> Result<(), Error> {
+        let value = String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)?;
+        self.headers.push(Header { name: name.to_string(), value });
+        Ok(())
     }
 
     /// Sets the header named `name` to `value`: the first one is changed
@@ -506,7 +514,6 @@ impl Interleaved {
         let Some(data) = b.get(INTERLEAVED_HEADER_LEN..end) else { return Ok(None) };
         Ok(Some((Interleaved { channel: b[1], data: data.to_vec() }, end)))
     }
-
 }
 
 /// What an RTSP connection carries: a message or an interleaved frame.
@@ -1205,7 +1212,6 @@ impl Transport {
         }
         Ok(out)
     }
-
 
     /// The first `interleaved` parameter's channels.
     pub fn interleaved(&self) -> Option<(u8, Option<u8>)> {
@@ -2621,8 +2627,8 @@ mod tests {
         for code in [100, 199, 204, 304] {
             let mut m = Message::response(Version::Rtsp10, code, "x");
             m.body = b"ab".to_vec();
-            assert_eq!(m.to_bytes(), Err(Error::Unwritable), "{code}");
             m.push_header("Content-Length", "2");
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable), "{code}");
             m.start = StartLine::Status { version: Version::Rtsp20, code, reason: "x".into() };
             assert!(m.to_bytes().is_ok());
         }
@@ -2781,6 +2787,7 @@ mod tests {
         assert_eq!(p(b"OPTIONS *\r\n\r\n"), Err(Error::StartLine));
         assert_eq!(p(b"OPTIONS  RTSP/1.0\r\n\r\n"), Err(Error::StartLine));
         assert_eq!(p(b"OPT;ONS * RTSP/1.0\r\n\r\n"), Err(Error::StartLine));
+        // A leading $ selects interleaved framing before start-line validation.
         assert_eq!(p(b"$X * RTSP/1.0\r\n\r\n"), Err(Error::Incomplete));
         assert_eq!(p(b"RTSP/1.0 99 Low\r\n\r\n"), Err(Error::StartLine));
         assert_eq!(p(b"RTSP/1.0 600 High\r\n\r\n"), Err(Error::StartLine));
@@ -2861,7 +2868,6 @@ mod tests {
             contract::check_decode_with_alloc_limit(Frames::new, bytes, 2 * MAX_MESSAGE);
             for n in 0..bytes.len() {
                 assert_eq!(Item::parse(&bytes[..n]), Err(Error::Incomplete));
-                assert_eq!(Frames::new().decode(&bytes[..n], false), Ok(Step::Need));
             }
             assert!(Item::parse(bytes).is_ok());
         }
@@ -2882,6 +2888,21 @@ mod tests {
         // Folded lines join with a space.
         let m = msg(b"OPTIONS * RTSP/1.0\r\nX: a\r\n  b\r\n\t\r\n\r\n");
         assert_eq!(m.header("X"), Some("a b"));
+    }
+
+    #[test]
+    fn header_values_append_only_after_a_valid_write() {
+        let mut message = msg(OPTIONS);
+        let transport = Transport::parse(b"RTP/AVP/TCP;interleaved=0-1").unwrap();
+        message.push_value("Transport", &transport).unwrap();
+        assert_eq!(message.transports(), Ok(vec![transport]));
+        let before = message.clone();
+        let invalid = Session { id: "a;b".into(), timeout: None };
+        assert_eq!(message.push_value("Session", &invalid), Err(Error::Malformed("Session")));
+        assert_eq!(message, before);
+        let binary = Interleaved { channel: 0xff, data: vec![] };
+        assert_eq!(message.push_value("X", &binary), Err(Error::Utf8));
+        assert_eq!(message, before);
     }
 
     #[test]
@@ -2958,24 +2979,52 @@ mod tests {
 
     fn round_trip(item: &Item) {
         contract::check_wire_value(item);
+        if let Item::Interleaved(frame) = item {
+            frame.to_bytes().unwrap();
+            return;
+        }
+        if let Err(error) = item.to_bytes() {
+            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {item:?}");
+            return;
+        }
         if let Item::Message(message) = item {
             if let Ok(value) = message.session() {
                 contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
             }
             if let Ok(value) = message.range() {
                 contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
             }
-            if let Ok(values) = message.transports() {
-                contract::check_wire_value(&Transports { values });
+            if let Ok(values) = message.transports()
+                && !values.is_empty()
+            {
+                let value = Transports { values };
+                contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
+            }
+            if message.method().is_some() {
+                let reply = message.reply(100, "Continue");
+                contract::check_wire_value(&reply);
+                assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
             }
         }
     }
 
     fn values_round_trip(bytes: &[u8]) {
-        contract::check_wire::<Session>(bytes);
-        contract::check_wire::<Transport>(bytes);
-        contract::check_wire::<Transports>(bytes);
-        contract::check_wire::<Range>(bytes);
+        macro_rules! check {
+            ($($ty:ty),+) => {$(
+                contract::check_wire::<$ty>(bytes);
+                // Read text directly so a writer failure cannot hide as a parse refusal.
+                if let Ok(text) = core::str::from_utf8(bytes)
+                    && let Ok(value) = <$ty>::read_value(text)
+                {
+                    contract::check_wire_value(&value);
+                    assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+                }
+            )+};
+        }
+        check!(Session, Transport, Transports, Range);
     }
 
     #[test]

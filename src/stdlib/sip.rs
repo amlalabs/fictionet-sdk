@@ -9,7 +9,7 @@
 //! over UDP or TCP, usually on port 5060. This module follows RFC 3261.
 //!
 //! Nothing here reads a socket. A world that plays a phone or a proxy reads
-//! a complete message with [`Message::parse`]. Over TCP, it pushes bytes
+//! a UDP message with [`Message::read_datagram`]. Over TCP, it pushes bytes
 //! into [`Stream<Frames>`](super::codec::Stream), which splits messages by
 //! their Content-Length. Either way, it reads the headers it needs with
 //! [`Message::vias`], [`Message::from`], [`Message::cseq`] and the others,
@@ -29,8 +29,9 @@
 //! endings, is bounded by [`MAX_HEAD`]; the header count by [`MAX_HEADERS`];
 //! bodies by [`MAX_BODY`]. Stream messages, including bodiless responses,
 //! require Content-Length (or compact `l`). No status overrides it.
-//! Exact messages require a length and refuse trailing bytes, including
-//! messages received in a datagram.
+//! [`Message::parse`] requires a length and refuses trailing bytes.
+//! [`Message::read_datagram`] uses the rest of the datagram as the body
+//! when no length is present, and discards bytes after a declared body.
 //!
 //! A malformed start line or unrelated header with a trusted message
 //! boundary is an error item. An over-limit line, head, or body, or an
@@ -54,7 +55,7 @@
 //!     Contact: <sip:alice@pc33.atlanta.com>\r\n\
 //!     Accept: application/sdp\r\n\
 //!     Content-Length: 0\r\n\r\n";
-//! let request = Message::parse(datagram).unwrap();
+//! let request = Message::read_datagram(datagram).unwrap();
 //! assert_eq!(request.method(), Some("OPTIONS"));
 //! let uri = Uri::parse(request.request_uri().unwrap().as_bytes()).unwrap();
 //! assert_eq!(uri.user.as_deref(), Some("carol"));
@@ -235,10 +236,10 @@ impl std::fmt::Display for Error {
             Error::Incomplete => f.write_str("incomplete wire unit"),
             Error::Trailing => f.write_str("bytes after wire unit"),
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::TooLong => write!(f, "head over {MAX_HEAD} bytes or body over {MAX_BODY} bytes"),
+            Error::TooLong => write!(f, "head or header value over {MAX_HEAD} bytes or body over {MAX_BODY} bytes"),
             Error::TooMany => write!(f, "over {MAX_HEADERS} headers or {MAX_VALUES} values"),
             Error::LineEnding => f.write_str("CR or LF outside a CRLF pair"),
-            Error::Utf8 => f.write_str("head is not UTF-8"),
+            Error::Utf8 => f.write_str("head or header value is not UTF-8"),
             Error::StartLine => f.write_str("malformed request or status line"),
             Error::Version => f.write_str("version is not SIP/2.0"),
             Error::HeaderLine => f.write_str("malformed header line"),
@@ -314,6 +315,30 @@ impl Message {
     /// A response with no headers and no body.
     pub fn response(code: u16, reason: &str) -> Message {
         Message { start: StartLine::Status { code, reason: reason.to_string() }, headers: Vec::new(), body: Vec::new() }
+    }
+
+    /// Reads one UDP datagram with CRLF lines, per RFC 3261 section 18.3.
+    /// With Content-Length or compact `l`, the body is that many bytes;
+    /// bytes after it are discarded. Without a length, the body is the
+    /// rest of the datagram. Refuses malformed heads, duplicate lengths,
+    /// incomplete heads or declared bodies, and heads, lines, bodies, or
+    /// header counts over their named limits.
+    ///
+    /// This reader preserves the headers. To write a message received
+    /// without Content-Length, set that header to the body length first.
+    pub fn read_datagram(datagram: &[u8]) -> Result<Message, Error> {
+        let mut lines = Lines::new(MAX_LINE, Ending::Crlf);
+        let mut scanned = 0;
+        let end = scan_head(&mut lines, &mut scanned, datagram)?.ok_or(Error::Incomplete)?;
+        let (mut message, length) = parse_head(datagram.get(..end).ok_or(Error::Incomplete)?)?;
+        let rest = datagram.get(end..).ok_or(Error::Incomplete)?;
+        let body = match length {
+            Some(length) => rest.get(..length).ok_or(Error::Incomplete)?,
+            None if rest.len() > MAX_BODY => return Err(Error::TooLong),
+            None => rest,
+        };
+        message.body = body.to_vec();
+        Ok(message)
     }
 
     /// The method, for a request.
@@ -569,33 +594,10 @@ impl Decode for Frames {
                 return Ok(Step::Skip(skip));
             }
         }
-        while self.body.is_none() {
-            let room = MAX_HEAD.saturating_sub(self.scanned);
-            let rest = input.get(self.scanned..).unwrap_or_default();
-            let window = rest.get(..rest.len().min(room)).unwrap_or_default();
-            // Leave partial lines unread at EOF. Stream reports truncation.
-            let step = match self.lines.decode(window, false) {
-                Ok(step) => step,
-                Err(never) => match never {},
-            };
-            match step {
-                Step::Item(line, used) => {
-                    match line {
-                        Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
-                        Err(LineError::BareLf) => return Err(Error::LineEnding),
-                        Err(LineError::Unterminated) => return Ok(Step::Need),
-                        Ok(_) => {}
-                    }
-                    self.scanned = self.scanned.checked_add(used).ok_or(Error::TooLong)?;
-                    let raw = window.get(..used).unwrap_or_default();
-                    if raw == b"\r\n" {
-                        let head = input.get(..self.scanned).ok_or(Error::TooLong)?;
-                        self.body = Some((self.scanned, frame_body_length(head)?));
-                    }
-                }
-                _ if window.len() >= room => return Err(Error::TooLong),
-                _ => return Ok(Step::Need),
-            }
+        if self.body.is_none() {
+            let Some(end) = scan_head(&mut self.lines, &mut self.scanned, input)? else { return Ok(Step::Need) };
+            let head = input.get(..end).ok_or(Error::TooLong)?;
+            self.body = Some((end, frame_body_length(head)?));
         }
         let Some((head, length)) = self.body else { return Ok(Step::Need) };
         let used = head.checked_add(length).ok_or(Error::TooLong)?;
@@ -607,6 +609,38 @@ impl Decode for Frames {
         self.scanned = 0;
         self.body = None;
         Ok(Step::Item(message, used))
+    }
+}
+
+// Both transports scan bounded CRLF lines before parsing the head.
+fn scan_head(lines: &mut Lines, scanned: &mut usize, input: &[u8]) -> Result<Option<usize>, Error> {
+    loop {
+        let room = MAX_HEAD.saturating_sub(*scanned);
+        let rest = input.get(*scanned..).unwrap_or_default();
+        let window = rest.get(..rest.len().min(room)).unwrap_or_default();
+        // Leave partial lines unread. The caller handles truncation.
+        let step = match lines.decode(window, false) {
+            Ok(step) => step,
+            Err(never) => match never {},
+        };
+        match step {
+            Step::Item(line, used) => {
+                match line {
+                    Err(LineError::TooLong { .. }) => return Err(Error::TooLong),
+                    Err(LineError::BareLf) => return Err(Error::LineEnding),
+                    Err(LineError::Unterminated) => return Ok(None),
+                    Ok(_) => {}
+                }
+                *scanned = scanned.checked_add(used).ok_or(Error::TooLong)?;
+                let raw = window.get(..used).unwrap_or_default();
+                // One initial CRLF alone is not a complete head.
+                if raw == b"\r\n" && *scanned > 2 {
+                    return Ok(Some(*scanned));
+                }
+            }
+            _ if window.len() >= room => return Err(Error::TooLong),
+            _ => return Ok(None),
+        }
     }
 }
 
@@ -2594,6 +2628,37 @@ mod tests {
     }
 
     #[test]
+    fn datagram_framing() {
+        // RFC 3261 section 18.3: bytes past a declared body are dropped.
+        let bytes = b"OPTIONS sip:a@b SIP/2.0\r\nContent-Length: 01\r\n\r\nab";
+        let message = Message::read_datagram(bytes).unwrap();
+        assert_eq!(message.body, b"a");
+        assert_eq!(message.header("Content-Length"), Some("01"));
+        round_trip(&message);
+        // Without Content-Length, every body prefix is a complete datagram.
+        let head = b"OPTIONS sip:a@b SIP/2.0\r\nX: a\r\n b\r\n\r\n";
+        let body = b"\0\xff\r\nSIP/2.0";
+        let bytes = [head.as_slice(), body].concat();
+        for n in 0..=body.len() {
+            let mut message = Message::read_datagram(&bytes[..head.len() + n]).unwrap();
+            assert_eq!(message.body, body[..n]);
+            assert_eq!(message.header("X"), Some("a b"));
+            assert_eq!(message.content_length(), Ok(None));
+            message.push_header("Content-Length", &n.to_string());
+            round_trip(&message);
+        }
+        assert_eq!(
+            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\r\nl: 3\r\n\r\nab"),
+            Err(Error::Incomplete)
+        );
+        assert_eq!(
+            Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\r\nl: 0\r\nContent-Length: 0\r\n\r\n"),
+            Err(Error::ContentLength)
+        );
+        assert_eq!(Message::read_datagram(b"OPTIONS sip:a@b SIP/2.0\n\n"), Err(Error::LineEnding));
+    }
+
+    #[test]
     fn message_errors() {
         let e = |b: &[u8]| Message::parse(b).unwrap_err();
         assert_eq!(e(b""), Error::Incomplete);
@@ -2612,6 +2677,11 @@ mod tests {
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: 1\r2\r\nl: 0\r\n\r\n"), Error::LineEnding);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\n\r\r\nl: 0\r\n\r\n"), Error::LineEnding);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nX: \xff\r\nl: 0\r\n\r\n"), Error::Utf8);
+        // The stream skips an empty keep-alive line, then needs a start line.
+        assert_eq!(e(b"\r\nl: 0\r\n\r\n"), Error::MissingContentLength);
+        assert_eq!(e(b"\r\nX: 1\r\nl: 0\r\n\r\n"), Error::StartLine);
+        assert_eq!(Message::read_datagram(b"\r\nl: 0\r\n\r\n"), Err(Error::StartLine));
+        assert_eq!(Message::read_datagram(b"\r\nX: 1\r\n\r\n"), Err(Error::StartLine));
         for line in [
             " ",
             "OPTIONS",
@@ -2642,7 +2712,7 @@ mod tests {
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: x\r\n\r\n"), Error::ContentLength);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: \r\n\r\n"), Error::ContentLength);
         assert_eq!(e(b"OPTIONS sip:a@b SIP/2.0\r\nl: 1\r\nContent-Length: 2\r\n\r\nab"), Error::ContentLength);
-        // Bytes past the body are refused.
+        // Exact stream messages refuse bytes past the body.
         assert_eq!(
             Message::parse(b"OPTIONS sip:a@b SIP/2.0\r\nContent-Length: 01\r\n\r\nab"),
             Err(Error::Trailing)
@@ -2783,8 +2853,10 @@ mod tests {
                 let part = &whole[..n];
                 assert_eq!(Frames::new().decode(part, false), Ok(Step::Need), "{n} bytes");
                 assert_eq!(Message::parse(part), Err(Error::Incomplete), "{n} bytes");
+                assert_eq!(Message::read_datagram(part), Err(Error::Incomplete), "{n} bytes");
             }
             assert!(Message::parse(&whole).is_ok());
+            assert_eq!(Message::read_datagram(&whole), Message::parse(&whole));
         }
         // Prefixes of values never panic and never read as the whole.
         for text in [
@@ -2814,43 +2886,89 @@ mod tests {
         for message in items.iter().flatten() {
             round_trip(message);
         }
+        let datagram = Message::read_datagram(data);
+        let datagrams = usize::from(datagram.is_ok());
+        if let Ok(mut message) = datagram {
+            if message.content_length().unwrap().is_none() {
+                message.push_header("Content-Length", &message.body.len().to_string());
+            }
+            round_trip(&message);
+        }
         values_round_trip(data);
-        items.iter().flatten().count() + usize::from(Message::parse(data).is_ok())
+        items.iter().flatten().count() + datagrams
     }
 
     fn round_trip(message: &Message) {
         contract::check_wire_value(message);
+        if let Err(error) = message.to_bytes() {
+            assert!(matches!(error, Error::TooLong | Error::TooMany), "{error:?} for {message:?}");
+            return;
+        }
         if let Ok(vias) = message.vias() {
             for value in vias {
                 contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
             }
         }
         for read in [Message::from, Message::to] {
             if let Ok(value) = read(message) {
                 contract::check_wire_value(&value);
+                value.to_bytes().unwrap();
             }
         }
         if let Ok(value) = message.cseq() {
-            contract::check_wire_value(&value);
+            cseq_round_trip(&value);
         }
         if let Ok(value) = message.contacts() {
             contract::check_wire_value(&value);
+            if let Err(error) = value.to_bytes() {
+                assert_eq!(value, Contacts::List(vec![]), "{error:?}");
+            }
         }
-        if let Some(uri) = message.request_uri() {
-            contract::check_wire::<Uri>(uri.as_bytes());
+        if let Some(uri) = message.request_uri()
+            && let Ok(value) = Uri::read_value(uri)
+        {
+            contract::check_wire_value(&value);
+            value.to_bytes().unwrap();
+            for param in &value.params {
+                assert!(value.param(&param.name).is_some());
+            }
         }
-        let mut reply = message.reply(100, "Trying");
-        reply.set_header("Content-Length", "0");
-        contract::check_wire_value(&reply);
+        if message.method().is_some() {
+            let mut reply = message.reply(100, "Trying");
+            reply.set_header("Content-Length", "0");
+            contract::check_wire_value(&reply);
+            assert!(matches!(reply.to_bytes(), Ok(_) | Err(Error::TooLong | Error::TooMany)));
+        }
     }
 
+    fn cseq_round_trip(value: &CSeq) {
+        contract::check_wire_value(value);
+        if let Err(error) = value.to_bytes() {
+            assert!(value.seq >= 1 << 31, "{error:?} for {value:?}");
+        }
+    }
 
     fn values_round_trip(bytes: &[u8]) {
-        contract::check_wire::<Uri>(bytes);
-        contract::check_wire::<NameAddr>(bytes);
-        contract::check_wire::<Via>(bytes);
+        macro_rules! check {
+            ($($ty:ty),+) => {$(
+                contract::check_wire::<$ty>(bytes);
+                // Read text directly so a writer failure cannot hide as a parse refusal.
+                if let Ok(text) = core::str::from_utf8(bytes)
+                    && let Ok(value) = <$ty>::read_value(text)
+                {
+                    contract::check_wire_value(&value);
+                    assert!(matches!(value.to_bytes(), Ok(_) | Err(Error::TooLong)), "{value:?}");
+                }
+            )+};
+        }
+        check!(Uri, NameAddr, Via, Contacts);
         contract::check_wire::<CSeq>(bytes);
-        contract::check_wire::<Contacts>(bytes);
+        if let Ok(text) = core::str::from_utf8(bytes)
+            && let Ok(value) = CSeq::read_value(text)
+        {
+            cseq_round_trip(&value);
+        }
     }
 
     #[test]
@@ -2973,7 +3091,6 @@ mod tests {
         }
         assert!(written > 5000, "only {written} writes succeeded");
     }
-
 
     #[test]
     fn stream_holds_at_most_one_message() {

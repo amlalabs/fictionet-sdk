@@ -263,6 +263,46 @@ fn folded_lengths_and_unrelated_bad_headers_keep_boundaries() {
 }
 
 #[test]
+fn sip_datagram_framing_and_limits() {
+    let head = b"SIP/2.0 200 OK\r\n\r\n";
+    let mut bytes = head.to_vec();
+    bytes.resize(head.len() + sip::MAX_BODY, b'x');
+    let mut message = sip::Message::read_datagram(&bytes).unwrap();
+    assert_eq!(message.body.len(), sip::MAX_BODY);
+    assert_eq!(message.content_length(), Ok(None));
+    message.push_header("l", &sip::MAX_BODY.to_string());
+    contract::check_wire_value(&message);
+    assert!(message.to_bytes().is_ok());
+    bytes.push(b'x');
+    assert_eq!(sip::Message::read_datagram(&bytes), Err(sip::Error::TooLong));
+
+    // Discarded bytes do not count against the body or message limit.
+    let mut bytes = b"SIP/2.0 200 OK\r\nl: 01\r\n\r\na".to_vec();
+    bytes.resize(sip::MAX_MESSAGE + 1, b'x');
+    let message = sip::Message::read_datagram(&bytes).unwrap();
+    assert_eq!(message.body, b"a");
+    assert_eq!(message.header("l"), Some("01"));
+    contract::check_wire_value(&message);
+    assert_eq!(sip::Message::read_datagram(&message.to_bytes().unwrap()), Ok(message));
+    let declared = format!("SIP/2.0 200 OK\r\nl: {}\r\n\r\n", sip::MAX_BODY + 1);
+    assert_eq!(sip::Message::read_datagram(declared.as_bytes()), Err(sip::Error::TooLong));
+
+    let mut head = b"SIP/2.0 200 OK\r\nX: ".to_vec();
+    head.resize(sip::MAX_HEAD - 4, b'a');
+    head.extend_from_slice(b"\r\n\r\n");
+    let mut message = sip::Message::read_datagram(&head).unwrap();
+    assert!(message.body.is_empty());
+    // Adding the stream length can exceed the canonical head limit.
+    message.push_header("l", "0");
+    assert_eq!(message.to_bytes(), Err(sip::Error::TooLong));
+    head.insert(head.len() - 4, b'a');
+    assert_eq!(sip::Message::read_datagram(&head), Err(sip::Error::TooLong));
+    assert_eq!(sip::Message::read_datagram(&vec![b'a'; sip::MAX_HEAD]), Err(sip::Error::TooLong));
+    let headers = format!("SIP/2.0 200 OK\r\n{}\r\n", "X: a\r\n".repeat(sip::MAX_HEADERS + 1));
+    assert_eq!(sip::Message::read_datagram(headers.as_bytes()), Err(sip::Error::TooMany));
+}
+
+#[test]
 fn exact_parsers_and_transactional_writers_preserve_fields() {
     let rtsp = b"RTSP/1.0 200 OK\r\ncontent-length: 01\r\nX: a\r\n b\r\n\r\nx";
     let sip = b"SIP/2.0 200 OK\r\nl: 01\r\nX: a\r\n b\r\n\r\nx";
