@@ -11,18 +11,27 @@
 //! (terminal type) and RFC 1073 (window size), and negotiates options with
 //! the Q method of RFC 1143, which never loops.
 //!
-//! Nothing here reads a socket. A world that plays a Telnet server feeds
-//! the bytes a TCP connection reads to a [`Decoder`], gets [`Event`]s back,
-//! hands each negotiation to a [`Negotiation`], and writes the bytes it
-//! returns to the connection. What the server says, and which options it
-//! agrees to, is up to world code.
+//! Nothing here reads a socket. A world that plays a Telnet server pushes
+//! the bytes a TCP connection reads to a [`codec::Stream`] of [`Events`],
+//! gets [`Event`]s back, hands each negotiation to a [`Negotiation`], and
+//! writes the bytes it returns to the connection. What the server says,
+//! and which options it agrees to, is up to world code.
 //!
-//! The decoder takes any bytes. A command it does not know, or a
+//! New sessions use [`Events`] with [`codec::Stream`]. It yields one
+//! event per call so negotiation can change binary mode between items.
+//! The default delivers one data byte per event immediately; batch readers
+//! can use [`Events::with_data_limit`] to wait for larger runs.
+//! [`Wire`] for [`Event`] uses NVT mode; [`Event::write_with`] and
+//! [`Event::parse_with`] accept an explicit binary mode. The legacy
+//! [`Decoder`] keeps its original behavior.
+//!
+//! The legacy decoder takes any bytes. A command it does not know, or a
 //! subnegotiation that is cut off or too long, becomes an
 //! [`Event::Error`], and the stream goes on, as it does in real servers.
 //!
 //! ```
-//! use fictionet::stdlib::telnet::{option, Change, Decoder, Event, Negotiation, Side, Subnegotiation, Verb};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::telnet::{option, Change, Events, Event, Negotiation, Side, Subnegotiation, Verb};
 //!
 //! // The server agrees to let the client send its terminal type.
 //! let mut options = Negotiation::new();
@@ -32,10 +41,12 @@
 //! assert_eq!(ask.send, Some([255, 253, 24]));
 //!
 //! // The client agrees (IAC WILL TERMINAL-TYPE) and types "ls", CR LF.
-//! let mut decoder = Decoder::new();
-//! let events = decoder.feed(&[255, 251, 24, b'l', b's', 13, 10]);
-//! assert_eq!(events[0], Event::Negotiation { verb: Verb::Will, option: option::TERMINAL_TYPE });
-//! assert_eq!(events[1], Event::Data(b"ls\r\n".to_vec()));
+//! let mut stream = Stream::new(Events::new());
+//! assert_eq!(stream.push(&[255, 251, 24, b'l', b's', 13, 10]), 7);
+//! assert_eq!(stream.next(), Some(Ok(Event::Negotiation { verb: Verb::Will, option: option::TERMINAL_TYPE })));
+//! for &byte in b"ls\r\n" {
+//!     assert_eq!(stream.next(), Some(Ok(Event::Data(vec![byte]))));
+//! }
 //!
 //! // The WILL answers the DO, so nothing more is sent, and the option is on.
 //! let reaction = options.receive(Verb::Will, option::TERMINAL_TYPE);
@@ -43,12 +54,14 @@
 //! assert_eq!(reaction.change, Some(Change { side: Side::Remote, option: option::TERMINAL_TYPE, enabled: true }));
 //!
 //! // The server asks for the name, and the client sends it.
-//! assert_eq!(Subnegotiation::TerminalTypeSend.to_bytes(), [255, 250, 24, 1, 255, 240]);
-//! let events = decoder.feed(b"\xff\xfa\x18\x00VT100\xff\xf0");
-//! let Event::Subnegotiation { option, data } = &events[0] else { panic!() };
-//! let name = Subnegotiation::parse(*option, data).unwrap();
+//! assert_eq!(Wire::to_bytes(&Subnegotiation::TerminalTypeSend).unwrap(), [255, 250, 24, 1, 255, 240]);
+//! assert_eq!(stream.push(b"\xff\xfa\x18\x00VT100\xff\xf0"), 11);
+//! let Some(Ok(Event::Subnegotiation { option, data })) = stream.next() else { panic!() };
+//! let name = Subnegotiation::parse(option, &data).unwrap();
 //! assert_eq!(name, Subnegotiation::TerminalTypeIs("VT100".to_string()));
 //! ```
+
+use super::codec::{self, Decode, Step, Wire};
 
 /// The TCP port Telnet servers listen on.
 pub const PORT: u16 = 23;
@@ -264,7 +277,7 @@ impl Command {
     }
 }
 
-/// What a [`Decoder`] found in the stream.
+/// What [`Events`] or a legacy [`Decoder`] found in the stream.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
     /// Data, with IAC escapes undone and, outside binary mode, each CR NUL
@@ -768,6 +781,422 @@ fn terminal_type_is(name: impl Iterator<Item = u8>) -> Vec<u8> {
         out.extend_from_slice(b"UNKNOWN");
     }
     out
+}
+
+/// The largest configurable data run from [`Events`], and the most data
+/// bytes in one [`Wire`] event. [`Events::new`] uses a limit of 1.
+pub const MAX_DATA: usize = 1024;
+/// The most encoded bytes needed for a data run or subnegotiation,
+/// including doubled IAC bytes, framing, or detection of an oversized payload.
+pub const MAX_EVENT_WIRE: usize = 2 * MAX_SUBNEGOTIATION + 5;
+
+/// Reads one Telnet event per call without retaining input bytes.
+///
+/// By default, each data byte is delivered as its own event, so interactive
+/// sessions receive input without waiting for a command or EOF. Batch readers
+/// can use [`Self::with_data_limit`]: data runs then end at a command, the
+/// configured limit, or EOF, waiting across chunk boundaries so partitioning
+/// never changes the items.
+/// A trailing NVT CR waits for its next byte or EOF. Scan cursors keep
+/// bytewise input linear. All payload storage belongs to returned items.
+///
+/// Recoverable failures remain [`Event::Error`] items. As in [`Decoder`],
+/// an oversized subnegotiation is discarded through IAC SE and reported
+/// as [`DecodeError::SubnegotiationTooLong`]. An interrupting command yields
+/// [`DecodeError::SubnegotiationInterrupted`] first, then the command on
+/// the next call. Discarding holds only an option code, with no byte buffer.
+/// Partial commands and subnegotiations return [`Step::Need`] at EOF for
+/// [`codec::Fail::Truncated`]. EOF during an oversized discarded unit is
+/// terminal [`DecodeError::Truncated`], since its prefix was consumed.
+///
+/// Change binary mode only between items. The session owns negotiation:
+///
+/// ```
+/// use fictionet::stdlib::{codec::Stream, telnet::{self, Event, Negotiation, Side}};
+/// let mut stream = Stream::new(telnet::Events::new());
+/// let mut options = Negotiation::new();
+/// options.allow_remote(telnet::option::BINARY, true);
+/// assert_eq!(stream.push(&[255, 251, 0, 13, 0]), 5);
+/// if let Some(Ok(Event::Negotiation { verb, option })) = stream.next() {
+///     let reaction = options.receive(verb, option);
+///     // The session sends reaction.send, if present.
+///     if let Some(change) = reaction.change {
+///         if change.side == Side::Remote && change.option == telnet::option::BINARY {
+///             stream.decoder().set_binary(change.enabled);
+///         }
+///     }
+/// }
+/// assert_eq!(stream.next(), Some(Ok(Event::Data(vec![13]))));
+/// assert_eq!(stream.next(), Some(Ok(Event::Data(vec![0]))));
+/// ```
+#[derive(Clone, Debug)]
+pub struct Events {
+    binary: bool,
+    data_limit: usize,
+    scanned: usize,
+    count: usize,
+    cr_nul: bool,
+    dropping: Option<u8>,
+}
+
+impl Default for Events {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Events {
+    /// Starts in NVT mode, delivering one data byte per event.
+    pub fn new() -> Self {
+        Self::with_data_limit(1)
+    }
+
+    /// Sets the decoded data run limit, clamped to 1 through [`MAX_DATA`].
+    /// Limits above 1 batch data until a command, the limit, or EOF.
+    /// Subnegotiations keep their separate [`MAX_SUBNEGOTIATION`] limit.
+    pub fn with_data_limit(limit: usize) -> Self {
+        Self {
+            binary: false,
+            data_limit: limit.clamp(1, MAX_DATA),
+            scanned: 0,
+            count: 0,
+            cr_nul: false,
+            dropping: None,
+        }
+    }
+
+    /// Changes receive mode between items, before reading the next item.
+    /// A NUL owed to an earlier NVT CR is still dropped across commands,
+    /// even if a negotiation has since enabled binary mode.
+    pub fn set_binary(&mut self, binary: bool) {
+        self.binary = binary;
+        self.scanned = 0;
+        self.count = 0;
+    }
+
+    /// Whether received data is in binary mode.
+    pub fn binary(&self) -> bool {
+        self.binary
+    }
+
+    /// The most decoded bytes in each data item.
+    pub fn data_limit(&self) -> usize {
+        self.data_limit
+    }
+
+    fn reset_scan(&mut self) {
+        self.scanned = 0;
+        self.count = 0;
+    }
+
+    fn data_item(&mut self, input: &[u8]) -> Step<Event> {
+        let used = self.scanned;
+        let raw = input.get(..used).unwrap_or_default();
+        let mut data = Vec::with_capacity(self.count);
+        let mut at = 0usize;
+        while let Some((byte, n)) = data_byte(raw, at, self.binary, true) {
+            data.push(byte);
+            at = at.saturating_add(n);
+        }
+        self.cr_nul = !self.binary && raw.last() == Some(&CR);
+        self.reset_scan();
+        Step::Item(Event::Data(data), used)
+    }
+
+    fn data(&mut self, input: &[u8], eof: bool) -> Step<Event> {
+        loop {
+            if self.count == self.data_limit {
+                return self.data_item(input);
+            }
+            if let Some((_, n)) = data_byte(input, self.scanned, self.binary, eof) {
+                self.scanned = self.scanned.saturating_add(n);
+                self.count += 1; // Bounded by data_limit.
+                continue;
+            }
+            let command =
+                input.get(self.scanned) == Some(&IAC) && (input.get(self.scanned.saturating_add(1)).is_some() || eof);
+            if self.count > 0 && (command || eof && self.scanned == input.len()) {
+                return self.data_item(input);
+            }
+            return Step::Need;
+        }
+    }
+
+    fn subnegotiation(&mut self, input: &[u8], option: u8) -> Step<Event> {
+        self.scanned = self.scanned.max(3);
+        loop {
+            let Some(&byte) = input.get(self.scanned) else { return Step::Need };
+            if byte == IAC {
+                let Some(&next) = input.get(self.scanned.saturating_add(1)) else { return Step::Need };
+                if next != IAC {
+                    let end = self.scanned;
+                    self.reset_scan();
+                    if next != cmd::SE {
+                        return Step::Item(Event::Error(DecodeError::SubnegotiationInterrupted { option }), end);
+                    }
+                    let raw = input.get(3..end).unwrap_or_default();
+                    let mut data = Vec::new();
+                    let mut at = 0usize;
+                    while let Some(&b) = raw.get(at) {
+                        data.push(b);
+                        at = at.saturating_add(if b == IAC { 2 } else { 1 });
+                    }
+                    return Step::Item(Event::Subnegotiation { option, data }, end.saturating_add(2));
+                }
+            }
+            self.scanned = self.scanned.saturating_add(if byte == IAC { 2 } else { 1 });
+            self.count += 1; // Stop at MAX_SUBNEGOTIATION + 1.
+            if self.count > MAX_SUBNEGOTIATION {
+                let used = self.scanned;
+                self.reset_scan();
+                self.dropping = Some(option);
+                return Step::Skip(used);
+            }
+        }
+    }
+
+    fn discard(&mut self, input: &[u8], eof: bool, option: u8) -> Result<Step<Event>, DecodeError> {
+        let mut at = 0usize;
+        while let Some(&byte) = input.get(at) {
+            if byte == IAC {
+                let Some(&next) = input.get(at.saturating_add(1)) else { break };
+                if next != IAC {
+                    self.dropping = None;
+                    return Ok(if next == cmd::SE {
+                        Step::Item(Event::Error(DecodeError::SubnegotiationTooLong { option }), at.saturating_add(2))
+                    } else {
+                        Step::Item(Event::Error(DecodeError::SubnegotiationInterrupted { option }), at)
+                    });
+                }
+            }
+            at = at.saturating_add(if byte == IAC { 2 } else { 1 });
+        }
+        if at > 0 {
+            Ok(Step::Skip(at))
+        } else if eof {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(Step::Need)
+        }
+    }
+}
+
+// One data byte and its wire width. Commands and partial escapes stop the scan.
+fn data_byte(input: &[u8], at: usize, binary: bool, eof: bool) -> Option<(u8, usize)> {
+    let &byte = input.get(at)?;
+    let next = input.get(at.saturating_add(1));
+    match byte {
+        IAC => (next == Some(&IAC)).then_some((IAC, 2)),
+        CR if !binary => match next {
+            Some(&NUL) => Some((CR, 2)),
+            None if !eof => None,
+            _ => Some((CR, 1)),
+        },
+        _ => Some((byte, 1)),
+    }
+}
+
+impl codec::Decode for Events {
+    type Item = Event;
+    type Error = DecodeError;
+    const NAME: &'static str = "Telnet";
+
+    fn capacity(&self) -> usize {
+        MAX_EVENT_WIRE.max(2 * self.data_limit)
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Event>, DecodeError> {
+        if let Some(option) = self.dropping {
+            return self.discard(input, eof, option);
+        }
+        let Some(&first) = input.first() else { return Ok(Step::Need) };
+        if first != IAC && self.cr_nul {
+            self.cr_nul = false;
+            if first == NUL {
+                return Ok(Step::Skip(1));
+            }
+        }
+        if first != IAC || input.get(1) == Some(&IAC) {
+            return Ok(self.data(input, eof));
+        }
+        let Some(&command) = input.get(1) else { return Ok(Step::Need) };
+        if let Some(verb) = Verb::from_byte(command) {
+            let Some(&option) = input.get(2) else { return Ok(Step::Need) };
+            return Ok(Step::Item(Event::Negotiation { verb, option }, 3));
+        }
+        if command == cmd::SB {
+            let Some(&option) = input.get(2) else { return Ok(Step::Need) };
+            return Ok(self.subnegotiation(input, option));
+        }
+        let event = if let Some(command) = Command::from_byte(command) {
+            Event::Command(command)
+        } else if command == cmd::SE {
+            Event::Error(DecodeError::StraySubnegotiationEnd)
+        } else {
+            Event::Error(DecodeError::UnknownCommand(command))
+        };
+        Ok(Step::Item(event, 2))
+    }
+}
+
+/// Why a byte slice is not exactly one event or typed subnegotiation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EventParseError {
+    /// A malformed event was found.
+    Decode(DecodeError),
+    /// The slice has no complete event.
+    Truncated,
+    /// The slice contains bytes after the first event.
+    Trailing,
+    /// The input exceeds [`MAX_DATA`], [`MAX_SUBNEGOTIATION`], or [`MAX_EVENT_WIRE`].
+    TooLong,
+    /// An event of another kind was read where a typed subnegotiation was required.
+    UnexpectedEvent,
+    /// A typed subnegotiation has invalid data.
+    Subnegotiation(SubnegotiationError),
+}
+
+impl core::fmt::Display for EventParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Decode(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete Telnet event"),
+            Self::Trailing => f.write_str("bytes after Telnet event"),
+            Self::TooLong => f.write_str("Telnet event exceeds its wire limit"),
+            Self::UnexpectedEvent => f.write_str("expected a Telnet subnegotiation"),
+            Self::Subnegotiation(e) => e.fmt(f),
+        }
+    }
+}
+
+impl core::error::Error for EventParseError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Decode(e) => Some(e),
+            Self::Subnegotiation(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// Why an event or typed subnegotiation cannot be written exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The payload exceeds [`MAX_DATA`] or [`MAX_SUBNEGOTIATION`].
+    TooLong,
+    /// The value has no exact representation: empty data, a diagnostic,
+    /// an invalid terminal name, or a known option stored as `Other`.
+    Unrepresentable,
+}
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TooLong => f.write_str("Telnet payload exceeds its wire limit"),
+            Self::Unrepresentable => f.write_str("Telnet value has no exact wire form"),
+        }
+    }
+}
+
+impl core::error::Error for WriteError {}
+
+impl Event {
+    /// Reads exactly one event in the given binary mode. Diagnostic error
+    /// items are refused because they have no exact wire representation.
+    /// Data is bounded by [`MAX_DATA`]; use [`Events`] for longer streams.
+    pub fn parse_with(bytes: &[u8], binary: bool) -> Result<Self, EventParseError> {
+        if bytes.len() > MAX_EVENT_WIRE {
+            return Err(EventParseError::TooLong);
+        }
+        let mut decoder = Events::with_data_limit(MAX_DATA);
+        decoder.set_binary(binary);
+        match decoder
+            .decode(bytes, true)
+            .map_err(EventParseError::Decode)?
+        {
+            Step::Item(Event::Error(e), _) => Err(EventParseError::Decode(e)),
+            Step::Item(event, used) if used == bytes.len() => Ok(event),
+            Step::Item(_, _) => Err(EventParseError::Trailing),
+            Step::Skip(_) => Err(EventParseError::TooLong),
+            _ => Err(EventParseError::Truncated),
+        }
+    }
+
+    /// Appends an event in the given binary mode. IAC is doubled; NVT CR
+    /// handling matches [`escape_data`]. Empty data, diagnostics, and
+    /// oversized values are refused before changing `out`. Temporary
+    /// encoded storage is bounded by [`MAX_EVENT_WIRE`].
+    pub fn write_with(&self, out: &mut Vec<u8>, binary: bool) -> Result<(), WriteError> {
+        match self {
+            Event::Data(data) if data.len() > MAX_DATA => return Err(WriteError::TooLong),
+            Event::Data(data) if data.is_empty() => return Err(WriteError::Unrepresentable),
+            Event::Subnegotiation { data, .. } if data.len() > MAX_SUBNEGOTIATION => {
+                return Err(WriteError::TooLong);
+            }
+            Event::Error(_) => return Err(WriteError::Unrepresentable),
+            _ => {}
+        }
+        let bytes = self.to_bytes(binary);
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Event {
+    type ParseError = EventParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one NVT event. Use [`Event::parse_with`] for binary mode.
+    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
+        Self::parse_with(bytes, false)
+    }
+
+    /// Writes one NVT event transactionally. Use [`Event::write_with`] for binary mode.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        self.write_with(out, false)
+    }
+}
+
+impl Wire for Subnegotiation {
+    type ParseError = EventParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one complete IAC SB ... IAC SE unit, including its option.
+    fn parse(bytes: &[u8]) -> Result<Self, EventParseError> {
+        match <Event as Wire>::parse(bytes)? {
+            Event::Subnegotiation { option, data } => {
+                Self::parse(option, &data).map_err(EventParseError::Subnegotiation)
+            }
+            _ => Err(EventParseError::UnexpectedEvent),
+        }
+    }
+
+    /// Writes the typed value without normalizing or clipping it. Known
+    /// options in `Other`, invalid names, and oversized payloads are refused.
+    /// Temporary storage is bounded by [`MAX_EVENT_WIRE`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        match self {
+            Self::TerminalTypeIs(name)
+                if name.is_empty()
+                    || name.len() > MAX_TERMINAL_TYPE
+                    || !name.as_bytes().iter().all(is_name_byte) =>
+            {
+                return Err(WriteError::Unrepresentable);
+            }
+            Self::Other {
+                option: option::TERMINAL_TYPE | option::NAWS,
+                ..
+            } => {
+                return Err(WriteError::Unrepresentable);
+            }
+            Self::Other { data, .. } if data.len() > MAX_SUBNEGOTIATION => {
+                return Err(WriteError::TooLong);
+            }
+            _ => {}
+        }
+        out.extend_from_slice(&self.to_bytes());
+        Ok(())
+    }
 }
 
 /// Which end of the connection an option is about. Each option is

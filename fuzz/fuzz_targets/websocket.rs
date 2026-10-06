@@ -2,8 +2,10 @@
 //! world playing a WebSocket server or client reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::contract;
 use fictionet::stdlib::websocket::{
-    Close, Decoder, Error, Frame, Header, Message, Role, check_request, check_response, request_headers,
+    Close, Decoder, Error, Frame, Frames, Header, Message, Messages, Opcode, Role, check_request,
+    check_response, request_headers,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -52,6 +54,22 @@ fn messages(role: Role, max_message: usize, mut data: &[u8], sizes: &[usize], la
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Frame>(data);
+    for role in [Role::Server, Role::Client] {
+        contract::check_decode(|| Frames::new(role), data);
+        contract::check_decode(|| Messages::new(role), data);
+        contract::check_decode_with_held_limit(|| Messages::with_limit(role, 125), data, 125);
+    }
+    for opcode in [Opcode::Text, Opcode::Binary, Opcode::Continuation, Opcode::Close, Opcode::Ping, Opcode::Pong] {
+        let frame = Frame {
+            fin: data.first().is_some_and(|b| b & 1 != 0),
+            opcode,
+            mask: data.first().is_some_and(|b| b & 2 != 0).then_some([1, 2, 3, 4]),
+            payload: data.iter().take(4096).copied().collect(),
+        };
+        contract::check_wire_value(&frame);
+    }
+
     // Uneven piece sizes and a message limit, taken from the input itself.
     let sizes: Vec<usize> = data.iter().take(4).map(|&b| usize::from(b % 17) + 1).collect();
     let limit = data.first().map_or(usize::MAX, |&b| if b & 1 == 0 { usize::MAX } else { usize::from(b) });
