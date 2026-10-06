@@ -2,17 +2,14 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::iec104::Frames;
 use fictionet::stdlib::iec104::{Asdu, Frame, Object};
 use libfuzzer_sys::fuzz_target;
 
 fn asdu(bytes: &[u8]) {
+    check_wire::<Asdu>(bytes);
     if let Ok(asdu) = <Asdu as Wire>::parse(bytes) {
-        assert_eq!(
-            <Asdu as Wire>::parse(&asdu.to_bytes().unwrap()),
-            Ok(asdu.clone())
-        );
         for width in [0, 1, 2, 3, 5, 7, 8, 12, usize::MAX] {
             if let Ok(objects) = asdu.objects(width) {
                 let mut back = asdu.clone();
@@ -26,17 +23,13 @@ fn asdu(bytes: &[u8]) {
 fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Frame>(data);
-    let mut stream = Stream::new(Frames);
-    let mut frames = Vec::new();
-    let _ = pump(&mut stream, data, |frame| frames.push(frame));
+    let (frames, _) = decode_all(Frames::new, data);
     for frame in &frames {
-        let bytes = frame.to_bytes().unwrap();
-        assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame.clone()));
+        check_wire_value(frame);
         if let Frame::Information { asdu: bytes, .. } = frame {
             asdu(bytes);
         }
     }
-    check_wire::<Asdu>(data);
     asdu(data);
     if data.len() >= 4 {
         let send = u16::from_le_bytes([data[0], data[1]]);
@@ -50,9 +43,6 @@ fuzz_target!(|data: &[u8]| {
             Frame::Supervisory { receive },
         ] {
             check_wire_value(&frame);
-            if let Ok(bytes) = frame.to_bytes() {
-                assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame));
-            }
         }
         let mut built = Asdu {
             type_id: data[0],
@@ -65,9 +55,7 @@ fuzz_target!(|data: &[u8]| {
             common_address: 1,
             data: data[4..].to_vec(),
         };
-        if let Ok(bytes) = built.to_bytes() {
-            assert_eq!(<Asdu as Wire>::parse(&bytes), Ok(built.clone()));
-        }
+        check_wire_value(&built);
         let objects: Vec<_> = data
             .chunks(4)
             .map(|b| Object {

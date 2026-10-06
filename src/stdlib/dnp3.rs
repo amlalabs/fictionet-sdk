@@ -389,8 +389,8 @@ impl Reassembler {
         }
     }
 
-    /// Application bytes held so far.
-    pub fn buffered(&self) -> usize {
+    /// Application bytes pending in the current fragment.
+    pub fn pending(&self) -> usize {
         self.data.len()
     }
 }
@@ -618,11 +618,11 @@ mod tests {
         s.final_segment = false;
         assert_eq!(r.push(&s), Ok(None));
         assert_eq!(r.push(&s), Ok(None)); // FIR replaces unfinished data.
-        assert_eq!(r.buffered(), 2);
+        assert_eq!(r.pending(), 2);
         s.first = false;
         s.sequence = 2;
         assert_eq!(r.push(&s), Err(TransportError::Sequence));
-        assert_eq!(r.buffered(), 0);
+        assert_eq!(r.pending(), 0);
         s.sequence = 64;
         assert_eq!(s.to_bytes(), Err(TransportError::Sequence));
         assert_eq!(Segment::parse(&[]), Err(TransportError::Length));
@@ -643,12 +643,12 @@ mod tests {
         loop {
             s.sequence = (s.sequence + 1) & 63;
             match r.push(&s) {
-                Ok(None) => assert!(r.buffered() <= MAX_FRAGMENT),
+                Ok(None) => assert!(r.pending() <= MAX_FRAGMENT),
                 Err(TransportError::TooLong) => break,
                 other => panic!("unexpected result {other:?}"),
             }
         }
-        assert_eq!(r.buffered(), 0);
+        assert_eq!(r.pending(), 0);
         s.first = true;
         s.final_segment = true;
         assert_eq!(r.push(&s), Ok(Some(s.data.clone())));

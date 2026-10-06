@@ -2,7 +2,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::dnp3::Frames;
 use fictionet::stdlib::dnp3::{Fragment, Frame, MAX_FRAGMENT, Reassembler, Segment};
 use libfuzzer_sys::fuzz_target;
@@ -10,16 +10,11 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Frame>(data);
-    let mut stream = Stream::new(Frames);
-    let mut frames = Vec::new();
-    let _ = pump(&mut stream, data, |frame| frames.push(frame));
+    let (frames, _) = decode_all(Frames::new, data);
     for frame in &frames {
         check_wire_value(frame);
         if let Ok(segment) = frame.segment() {
-            assert_eq!(
-                <Segment as Wire>::parse(&segment.to_bytes().unwrap()),
-                Ok(segment)
-            );
+            check_wire_value(&segment);
         }
     }
     // Structured input reaches CRC-protected payloads even for random bytes.
@@ -33,9 +28,8 @@ fuzz_target!(|data: &[u8]| {
         check_wire_value(&frame);
         let bytes = frame.to_bytes().unwrap();
         check_decode(Frames::new, &bytes);
-        let mut again = Stream::new(Frames);
-        let mut back = Vec::new();
-        pump(&mut again, &bytes, |f| back.push(f)).unwrap();
+        let (back, failure) = decode_all(Frames::new, &bytes);
+        assert!(failure.is_none());
         assert_eq!(back, [frame]);
     }
     check_wire_value(&Frame {
@@ -62,7 +56,7 @@ fuzz_target!(|data: &[u8]| {
     for chunk in data.chunks(250) {
         if let Ok(segment) = <Segment as Wire>::parse(chunk) {
             let _ = reassembler.push(&segment);
-            assert!(reassembler.buffered() <= MAX_FRAGMENT);
+            assert!(reassembler.pending() <= MAX_FRAGMENT);
         }
     }
     if !data.is_empty() && data.len() <= MAX_FRAGMENT {

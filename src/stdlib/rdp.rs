@@ -2429,10 +2429,12 @@ impl Wire for ActivePdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Fail, Stream, contract, pump, test_support::Lcg};
+    use crate::stdlib::codec::{
+        Fail, Stream, contract, pump,
+        test_support::{self, Lcg},
+    };
 
     fn hex(s: &str) -> Vec<u8> {
-        assert!(s.len() <= 2 * MAX_FRAME);
         s.split_whitespace()
             .map(|x| u8::from_str_radix(x, 16).unwrap())
             .collect()
@@ -4180,14 +4182,12 @@ mod tests {
             seeds.push(p.to_bytes().unwrap());
         }
         for _ in 0..2500 {
-            let n = rng.next() as usize % 512;
-            let random: Vec<_> = (0..n).map(|_| rng.next() as u8).collect();
+            let random = rng.bytes(511);
             check_parsers(&random);
             contract::check_decode(Frames::new, &random);
-            let mut b = seeds[rng.next() as usize % seeds.len()].clone();
-            for _ in 0..(rng.next() % 4) {
-                let i = rng.next() as usize % b.len();
-                b[i] ^= rng.next() as u8;
+            let mut b = seeds[rng.index(seeds.len())].clone();
+            for _ in 0..rng.below(4) {
+                test_support::mutate(&mut rng, &mut b);
             }
             check_parsers(&b);
             contract::check_decode(Frames::new, &b);

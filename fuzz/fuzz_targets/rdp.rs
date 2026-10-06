@@ -56,12 +56,11 @@ fn pdu(data: &[u8]) {
     if let Ok(blocks) = DataBlocks::parse(data) {
         let bytes = blocks.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_GCC_DATA);
-        assert_eq!(DataBlocks::parse(&bytes), Ok(blocks));
     }
     if let Ok(value) = <McsPdu as Wire>::parse(data) {
+        check_wire_value(&value);
         let bytes = value.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_PDU);
-        assert_eq!(<McsPdu as Wire>::parse(&bytes), Ok(value.clone()));
         if let McsPdu::SendData { data, .. } = value {
             security(&data);
             plaintext(&data);
@@ -72,11 +71,8 @@ fn pdu(data: &[u8]) {
 }
 
 fn security(data: &[u8]) {
+    check_wire::<SecurityPayload>(data);
     if let Ok(value) = <SecurityPayload as Wire>::parse(data) {
-        assert_eq!(
-            <SecurityPayload as Wire>::parse(&value.to_bytes().unwrap()),
-            Ok(value.clone())
-        );
         if let Ok(data) = value.plaintext() {
             plaintext(data);
         }

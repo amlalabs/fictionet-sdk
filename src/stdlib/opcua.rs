@@ -192,10 +192,9 @@ pub const MAX_DATE_TIME: i64 = 2_650_467_743_990_000_000;
 /// The largest picoseconds field of a DataValue. Readers map larger values
 /// to this limit. Writers refuse values above it.
 pub const MAX_PICOSECONDS: u16 = 9999;
-/// The largest sequence number a legacy security policy may not wrap
-/// after. Once a number is above it, the next may wrap around to a number
-/// below 1024. A [`Messages`] accepts that wrap inside a message, as well
-/// as the plain one past `u32::MAX`.
+/// Above this sequence number, a legacy security policy may wrap to a
+/// number below 1024. A [`Messages`] accepts that wrap inside a message,
+/// as well as the plain one past `u32::MAX`.
 pub const LEGACY_WRAP: u32 = u32::MAX - 1024;
 /// The URI of security policy None, the only policy this module carries.
 pub const SECURITY_POLICY_NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
@@ -674,7 +673,7 @@ impl Writer {
         self.bytes(&v.to_le_bytes());
     }
     /// An Int64, written as it is. A DateTime goes through
-    /// [`Reader::date_time`].
+    /// [`Writer::date_time`].
     fn i64(&mut self, v: i64) {
         self.bytes(&v.to_le_bytes());
     }
@@ -3507,7 +3506,10 @@ impl Wire for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Fail, Stream, contract, pump, test_support::Lcg};
+    use crate::stdlib::codec::{
+        Fail, Stream, contract, pump,
+        test_support::{self, Lcg, decode_all},
+    };
 
     /// Writes chunks and fails the test with the original error on refusal.
     fn wire_chunks(chunks: Vec<Chunk>) -> Vec<u8> {
@@ -5822,25 +5824,24 @@ mod tests {
         for round in 0..4000 {
             // Half random bytes, half a valid sample with a few bytes changed.
             let mut b: Vec<u8> = if round % 2 == 0 {
-                let n = rng.below(300) as usize;
-                let mut v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+                let mut v = rng.bytes(299);
+                let n = v.len();
                 // Start some with a real header so the parsers go deeper.
                 if n >= 8 && rng.below(2) == 0 {
                     let types: [&[u8; 4]; 7] = [
                         b"HELF", b"ACKF", b"ERRF", b"RHEF", b"OPNF", b"CLOF", b"MSGC",
                     ];
-                    v[..4].copy_from_slice(types[rng.below(7) as usize]);
-                    v[4..8].copy_from_slice(&le32(rng.below(n as u64 + 1) as u32));
+                    v[..4].copy_from_slice(types[rng.index(types.len())]);
+                    v[4..8].copy_from_slice(&le32(rng.index(n + 1) as u32));
                 }
                 v
             } else {
-                let mut v = seeds[rng.below(seeds.len() as u64) as usize].clone();
+                let mut v = seeds[rng.index(seeds.len())].clone();
                 for _ in 0..1 + rng.below(4) {
-                    let i = rng.below(v.len() as u64) as usize;
-                    v[i] = rng.next() as u8;
+                    test_support::mutate(&mut rng, &mut v);
                 }
                 if rng.below(4) == 0 {
-                    v.truncate(rng.below(v.len() as u64) as usize);
+                    test_support::mutate(&mut rng, &mut v);
                 }
                 v
             };
@@ -5858,12 +5859,8 @@ mod tests {
                 &b,
                 limits.message_limit() as usize,
             );
-            let mut stream = Stream::new(Messages::with_limits(limits));
-            let mut first = Vec::new();
-            let _ = pump(&mut stream, &b, |message| {
-                first.push(Ok::<_, Fail<ChunkError>>(message))
-            });
-            for m in first.iter().flatten() {
+            let (first, _) = decode_all(|| Messages::with_limits(limits), &b);
+            for m in &first {
                 // A message read writes, and reads back the same.
                 let out = m
                     .chunks(&limits)

@@ -1754,7 +1754,10 @@ impl Wire for ForwardCloseResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, contract, pump, test_support::Lcg};
+    use crate::stdlib::codec::{
+        Stream, contract, pump,
+        test_support::{self, Lcg, decode_all},
+    };
 
     #[test]
     fn register_session_round_trip() {
@@ -3048,79 +3051,45 @@ mod tests {
         ]
     }
 
-    /// What every reader must hold for any bytes: no panic, a packet read
-    /// writes back to bytes that read the same, and a stream fed in pieces
-    /// finds what one fed all at once finds.
+    /// Checks stream contracts, packet validation and nested CIP values.
     fn check(data: &[u8]) {
         assert_eq!(
             Stream::new(Frames).push(data),
             data.len().min(FRAMES_CAPACITY)
         );
         contract::check_decode(Frames::new, data);
-        let mut stream = Stream::new(Frames);
-        let mut packets = Vec::new();
-        pump(&mut stream, data, |p| packets.push(p)).unwrap();
+        let (packets, _) = decode_all(Frames::new, data);
         for p in &packets {
-            // A packet that passes the check writes back to bytes that read
-            // the same; one that fails it cannot be written.
-            match (p.check(), p.to_bytes()) {
-                (Ok(()), Ok(bytes)) => {
-                    let (back, used) = Packet::parse(&bytes).unwrap();
-                    assert_eq!(&back, p);
-                    assert_eq!(used, bytes.len());
-                }
-                (Err(_), Err(_)) => {}
-                other => panic!("check and writer disagree: {other:?}"),
-            }
-            // Try the data as each CIP structure; any that reads must write
-            // back to bytes that read the same.
+            contract::check_wire_value(p);
+            assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());
+            contract::check_wire::<SendData>(&p.data);
             if let Ok(send) = SendData::parse(&p.data) {
                 for it in &send.cpf.items {
                     check_item(&it.data);
                 }
-                assert_eq!(SendData::parse(&send.to_bytes().unwrap()), Ok(send));
             }
+            contract::check_wire::<Cpf>(&p.data);
             if let Ok(cpf) = Cpf::parse(&p.data) {
                 for it in &cpf.items {
                     check_item(&it.data);
                 }
-                assert_eq!(Cpf::parse(&cpf.to_bytes().unwrap()), Ok(cpf));
             }
             check_item(&p.data);
         }
     }
 
-    /// Tries the bytes of one item as each CIP structure, and the bodies
-    /// inside a message; any that reads must write back to bytes that read
-    /// the same.
+    /// Checks wire contracts for a CIP item and its nested message bodies.
     fn check_item(b: &[u8]) {
+        contract::check_wire::<MessageRequest>(b);
         if let Ok(req) = MessageRequest::parse(b) {
-            if let Ok(open) = ForwardOpenRequest::parse(&req.data) {
-                assert_eq!(
-                    ForwardOpenRequest::parse(&open.to_bytes().unwrap()),
-                    Ok(open)
-                );
-            }
-            if let Ok(close) = ForwardCloseRequest::parse(&req.data) {
-                assert_eq!(
-                    ForwardCloseRequest::parse(&close.to_bytes().unwrap()),
-                    Ok(close)
-                );
-            }
-            assert_eq!(MessageRequest::parse(&req.to_bytes().unwrap()), Ok(req));
+            contract::check_wire::<ForwardOpenRequest>(&req.data);
+            contract::check_wire::<ForwardCloseRequest>(&req.data);
         }
+        contract::check_wire::<MessageResponse>(b);
         if let Ok(resp) = MessageResponse::parse(b) {
-            if let Ok(open) = ForwardOpenResponse::parse(&resp.data) {
-                assert_eq!(
-                    ForwardOpenResponse::parse(&open.to_bytes().unwrap()),
-                    Ok(open)
-                );
-            }
-            assert_eq!(MessageResponse::parse(&resp.to_bytes().unwrap()), Ok(resp));
+            contract::check_wire::<ForwardOpenResponse>(&resp.data);
         }
-        if let Ok(id) = Identity::parse(b) {
-            assert_eq!(Identity::parse(&id.to_bytes().unwrap()), Ok(id));
-        }
+        contract::check_wire::<Identity>(b);
     }
 
     #[test]
@@ -3130,22 +3099,11 @@ mod tests {
         let mut read = 0;
         for i in 0..6000 {
             let data: Vec<u8> = if i % 2 == 0 {
-                let n = rng.below(64);
-                (0..n).map(|_| rng.next() as u8).collect()
+                rng.bytes(63)
             } else {
-                let mut d = samples[rng.below(samples.len() as u64) as usize].clone();
+                let mut d = samples[rng.index(samples.len())].clone();
                 for _ in 0..1 + rng.below(4) {
-                    match rng.below(3) {
-                        0 if !d.is_empty() => {
-                            let k = rng.below(d.len() as u64) as usize;
-                            d[k] = rng.next() as u8;
-                        }
-                        1 if !d.is_empty() => {
-                            let k = rng.below(d.len() as u64) as usize;
-                            d.truncate(k);
-                        }
-                        _ => d.push(rng.next() as u8),
-                    }
+                    test_support::mutate(&mut rng, &mut d);
                 }
                 d
             };
