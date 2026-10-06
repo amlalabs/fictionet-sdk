@@ -146,7 +146,7 @@ pub async fn fetch_text(https: bool, http2: bool) -> std::result::Result<String,
 #[derive(Clone)]
 struct Hello;
 
-impl tower_service::Service<Request<Incoming>> for Hello {
+impl tower_service::Service<Request<web::Body>> for Hello {
     type Response = Response<Full<Bytes>>;
     type Error = Infallible;
     type Future = std::future::Ready<std::result::Result<Self::Response, Infallible>>;
@@ -155,7 +155,7 @@ impl tower_service::Service<Request<Incoming>> for Hello {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, request: Request<web::Body>) -> Self::Future {
         let body = format!("hello from {NAME}: {} {}\n", request.method(), request.uri().path());
         std::future::ready(Ok(Response::new(Full::new(Bytes::from(body)))))
     }
