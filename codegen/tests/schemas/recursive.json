@@ -1,0 +1,49 @@
+{
+  "types": [
+    {
+      "name": "Node",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "value",
+          "type": "u32"
+        },
+        {
+          "name": "children",
+          "type": {
+            "kind": "group",
+            "item": {
+              "kind": "ref",
+              "name": "Node"
+            },
+            "count": "u8",
+            "limit": 2
+          }
+        },
+        {
+          "name": "next",
+          "type": {
+            "kind": "optional",
+            "item": {
+              "kind": "ref",
+              "name": "Node"
+            },
+            "flag": "u8"
+          }
+        }
+      ]
+    }
+  ],
+  "streams": [
+    {
+      "name": "NodeFrames",
+      "item": "Node",
+      "prefix": "u32",
+      "byte_order": "big",
+      "magic": [
+        70,
+        78
+      ]
+    }
+  ]
+}

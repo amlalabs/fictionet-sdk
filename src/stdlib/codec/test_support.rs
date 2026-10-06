@@ -2,10 +2,13 @@
 //! Seeds are explicit. Chunk iterators borrow input and allocate no storage.
 //! [`mutate`] edits a byte vector in place, and [`decode_all`] runs a decoder
 //! over a whole input.
+//!
+//! [`rounds`] sizes randomized loops and large inputs, so a default
+//! `cargo test` stays fast and a deep run is one environment variable away.
+//! [`assert_linear`] checks that work grows linearly with input size by
+//! comparing two sizes, instead of holding a test to a wall-clock limit.
 
-use super::{Decode, Fail, Stream, alloc::vec::Vec, finish, pump};
-
-use fictionet::stdlib::codec::Lcg;
+use super::{Decode, Fail, Lcg, Stream, alloc::vec::Vec, finish, pump};
 
 /// The most bytes one [`mutate`] call adds. Only inserting a byte and
 /// duplicating a slice grow the input, by 1 and at most this many bytes.
@@ -147,5 +150,116 @@ impl<'a> Iterator for RandomChunks<'a, '_> {
         let part = self.rest.get(..n)?;
         self.rest = self.rest.get(n..).unwrap_or_default();
         Some(part)
+    }
+}
+
+/// The environment variable that scales [`rounds`]: a positive integer,
+/// read once per process. Unset, empty or invalid means 1.
+pub const SCALE_VAR: &str = "FICTIONET_TEST_SCALE";
+
+/// The scale [`rounds`] multiplies by: [`SCALE_VAR`] if it holds a positive
+/// integer, otherwise 1.
+pub fn scale() -> usize {
+    static SCALE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var(SCALE_VAR)
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(1)
+    })
+}
+
+/// Returns `n` times [`scale`]: the iteration count or input size for a
+/// randomized or large-input test. Tests pass the count that keeps a default
+/// run fast; `FICTIONET_TEST_SCALE=100 cargo test` runs a hundred times as
+/// many rounds.
+///
+/// ```
+/// use fictionet::stdlib::codec::test_support::{rounds, scale};
+/// assert_eq!(rounds(500), 500 * scale());
+/// ```
+pub fn rounds(n: usize) -> usize {
+    n.saturating_mul(scale())
+}
+
+/// Checks that `run(size)` takes time linear in `size`, not quadratic.
+/// Times `run(n)` and `run(4 * n)`, alternating, three times each, and
+/// keeps the fastest of each. Linear work takes about 4 times as long at
+/// 4 times the size, quadratic work about 16 times. The check fails when the
+/// ratio exceeds 10. It times the CPU the calling thread uses, not the
+/// clock on the wall, so other work on a busy machine does not count. Pick
+/// `n` so that `run(n)` takes at least a millisecond, or timer noise decides
+/// the ratio.
+///
+/// `run` builds its input and decodes it; building with `repeat` or a loop
+/// is linear too, so it does not hide quadratic decoding.
+///
+/// # Panics
+///
+/// If the ratio exceeds 10. `name` labels the message.
+pub fn assert_linear(name: &str, n: usize, mut run: impl FnMut(usize)) {
+    let time = |run: &mut dyn FnMut(usize), size| {
+        let started = thread_cpu_time();
+        run(size);
+        thread_cpu_time().saturating_sub(started)
+    };
+    let (mut small, mut large) = (core::time::Duration::MAX, core::time::Duration::MAX);
+    for _ in 0..3 {
+        small = small.min(time(&mut run, n));
+        large = large.min(time(&mut run, n.saturating_mul(4)));
+    }
+    let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+    assert!(
+        ratio <= 10.0,
+        "{name}: 4 times the input took {ratio:.1} times as long \
+         ({small:?} for {n}, {large:?} for {}); linear work stays near 4",
+        n.saturating_mul(4)
+    );
+}
+
+/// The CPU time the calling thread has used, where the platform reports it,
+/// and the time since the first call otherwise.
+fn thread_cpu_time() -> core::time::Duration {
+    #[cfg(unix)]
+    {
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `t` is a valid, writable timespec.
+        if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) } == 0 {
+            return core::time::Duration::new(
+                u64::try_from(t.tv_sec).unwrap_or_default(),
+                u32::try_from(t.tv_nsec).unwrap_or_default(),
+            );
+        }
+    }
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assert_linear;
+    use core::hint::black_box;
+
+    fn work(steps: usize) {
+        let mut x = 0u64;
+        for i in 0..steps {
+            x = black_box(x.wrapping_mul(31).wrapping_add(i as u64));
+        }
+        black_box(x);
+    }
+
+    #[test]
+    fn linear_work_passes() {
+        assert_linear("linear", 1_000_000, work);
+    }
+
+    #[test]
+    #[should_panic(expected = "times as long")]
+    fn quadratic_work_fails() {
+        assert_linear("quadratic", 500, |n| work(n * n));
     }
 }

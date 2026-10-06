@@ -5,6 +5,7 @@ use std::task::{Context, Poll, Waker};
 
 use crate::cable::pair_with_guard;
 use crate::cx::CancelWait;
+#[cfg(not(target_arch = "wasm32"))]
 use crate::listen::SocketLink;
 use crate::watch::{Graph, Meter};
 use crate::{Cancelled, Cx, End, Interface, Packet, RecvError};
@@ -52,6 +53,7 @@ enum Link {
     /// An interface from [`Attacher::attach`].
     Cable(End),
     /// A connection from attach, accepted by [`listen`](crate::listen).
+    #[cfg(not(target_arch = "wasm32"))]
     Socket(SocketLink),
     /// What [`Attachments::map`] made from another attachment, and a check
     /// for whether that attachment's sandbox has detached.
@@ -78,6 +80,7 @@ impl Attachment {
     fn detached(&self) -> bool {
         match &self.link {
             Link::Cable(end) => end.peer_gone(),
+            #[cfg(not(target_arch = "wasm32"))]
             Link::Socket(link) => link.peer_gone(),
             Link::Mapped { gone, .. } => gone(),
         }
@@ -88,11 +91,13 @@ impl Attachment {
     fn detached_check(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
         match &self.link {
             Link::Cable(end) => Arc::new(end.peer_gone_check()),
+            #[cfg(not(target_arch = "wasm32"))]
             Link::Socket(link) => Arc::new(link.peer_gone_check()),
             Link::Mapped { gone, .. } => gone.clone(),
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn from_socket(name: String, mtu: u16, link: SocketLink) -> Attachment {
         let meter = Meter::new();
         meter.set_sandbox(&name);
@@ -123,6 +128,7 @@ impl Interface for Attachment {
     fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
         match &mut self.link {
             Link::Cable(end) => end.poll_recv(cx, task),
+            #[cfg(not(target_arch = "wasm32"))]
             Link::Socket(link) => {
                 let current = crate::watch::current_task();
                 if current != self.seen && current != 0 {
@@ -142,6 +148,7 @@ impl Interface for Attachment {
     fn send(&mut self, packet: Packet) {
         match &mut self.link {
             Link::Cable(end) => end.send(packet),
+            #[cfg(not(target_arch = "wasm32"))]
             Link::Socket(link) => {
                 self.meter.sent(0, &packet);
                 link.send(packet)

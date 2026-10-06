@@ -29,16 +29,39 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Build
         run: cargo build --locked --all-targets ${{ matrix.features }}
       - name: Test
-        run: cargo test --locked ${{ matrix.features }}
+        run: cargo nextest run --locked --workspace ${{ matrix.features }}
+      - name: Doctests
+        run: cargo test --locked --doc --workspace ${{ matrix.features }}
       - name: Docs
         run: cargo doc --locked --no-deps ${{ matrix.features }}
         env:
           RUSTDOCFLAGS: -D warnings
       - name: Clippy
         run: cargo clippy --locked --all-targets ${{ matrix.features }} -- -D warnings
+
+  wasm:
+    name: wasm32 (browser)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # ring's C code builds with clang, which on the runner has the wasm32 target.
+      - name: Check
+        run: cargo check --locked --lib --no-default-features --target wasm32-unknown-unknown
+      - name: Clippy
+        run: cargo clippy --locked --lib --no-default-features --target wasm32-unknown-unknown -- -D warnings
+      - name: Check the browser example
+        run: cargo check --locked --all-targets --manifest-path examples/wasm_world/Cargo.toml --target wasm32-unknown-unknown
 
   msrv:
     name: MSRV (1.91)

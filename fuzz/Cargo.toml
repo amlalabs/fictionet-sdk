@@ -41,6 +41,34 @@ doc = false
 bench = false
 
 [[bin]]
+name = "json_schema"
+path = "fuzz_targets/json_schema.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse_lines"
+path = "fuzz_targets/sse_lines.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sse_events"
+path = "fuzz_targets/sse_events.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sbe"
+path = "fuzz_targets/sbe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "relay"
 path = "fuzz_targets/relay.rs"
 test = false
@@ -769,6 +797,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "soupbintcp"
+path = "fuzz_targets/soupbintcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "observe_modbus"
 path = "fuzz_targets/observe_modbus.rs"
 test = false
@@ -818,8 +853,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "http2"
+path = "fuzz_targets/http2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "http1_responses"
 path = "fuzz_targets/http1_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonrpc_lines"
+path = "fuzz_targets/jsonrpc_lines.rs"
 test = false
 doc = false
 bench = false
@@ -832,8 +881,22 @@ doc = false
 bench = false
 
 [[bin]]
+name = "jsonrpc_body"
+path = "fuzz_targets/jsonrpc_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "http1_response_messages"
 path = "fuzz_targets/http1_response_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codegen_ir"
+path = "fuzz_targets/codegen_ir.rs"
 test = false
 doc = false
 bench = false
@@ -846,8 +909,29 @@ doc = false
 bench = false
 
 [[bin]]
+name = "fix"
+path = "fuzz_targets/fix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "observe_http2"
 path = "fuzz_targets/observe_http2.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fast"
+path = "fuzz_targets/fast.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "moldudp64"
+path = "fuzz_targets/moldudp64.rs"
 test = false
 doc = false
 bench = false

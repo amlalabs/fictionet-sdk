@@ -2,7 +2,8 @@ extern crate alloc;
 
 use alloc::{string::String, vec::Vec};
 
-/// The LCG used by the SDK's protocol tests. This is not a cryptographic RNG.
+/// The shared deterministic generator for codec tools and protocol tests.
+/// This is not a cryptographic RNG.
 #[derive(Clone, Debug)]
 pub struct Lcg(u64);
 impl Lcg {

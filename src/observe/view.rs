@@ -255,7 +255,7 @@ pub(crate) fn snapshot(graph: &Graph) -> (View, Message) {
     let notes: Vec<String> = notes.iter().map(note_json).collect();
     let data = Object::new()
         .secs("t", graph.start.elapsed())
-        .num("started", graph.start_wall.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis()))
+        .num("started", graph.start_wall.duration_since(crate::sys::UNIX_EPOCH).map_or(0, |d| d.as_millis()))
         .bool("ended", view.ended)
         .raw("groups", &json::array(view.groups.values()))
         .raw("nodes", &json::array(view.nodes.values()))

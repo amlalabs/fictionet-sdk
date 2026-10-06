@@ -3078,7 +3078,7 @@ mod tests {
             b"smpte-30-drop=1:2:3:4.5-",
         ];
         let mut read = 0;
-        for round in 0..6000 {
+        for round in 0..fictionet::stdlib::codec::test_support::rounds(1500) {
             let base: &[u8] = match round % 3 {
                 0 => &stream,
                 1 => seeds[rng.index(seeds.len())].as_slice(),
@@ -3092,7 +3092,7 @@ mod tests {
         }
         assert!(read > 3000, "only {read} items read");
         // Mix arbitrary bytes into text as well as checking byte noise.
-        for _ in 0..3000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(750) {
             let mut text = rng.text(200).into_bytes();
             let at = rng.index(text.len().saturating_add(1));
             text.splice(at..at, rng.bytes(4));

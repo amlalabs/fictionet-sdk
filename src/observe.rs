@@ -217,7 +217,9 @@
 //!
 //! Each copy is decoded the way Wireshark decodes it. Packets on a link are
 //! IPv4 or IPv6 with no Ethernet header. The decoder reads IP, TCP, UDP and
-//! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. TCP
+//! ICMP, then DNS, DHCP, HTTP/1.1, and HTTP/2 with its headers. HTTP/2 uses
+//! [`Capture`](crate::stdlib::http2::Capture) through the public registry.
+//! Recognized gRPC calls add message layers from DATA under a shared budget. TCP
 //! connections are followed in order, so a message spread over several
 //! packets is shown whole on the packet that completes it. An HTTP/2 header
 //! that names a table entry the decoder could not follow, for example
@@ -470,6 +472,7 @@ mod json;
 mod keys;
 mod packets;
 mod pcap;
+#[cfg(not(target_arch = "wasm32"))]
 mod session;
 mod view;
 
@@ -477,7 +480,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::watch::Graph;
-use crate::{Attacher, Cx};
+use crate::Cx;
 pub(crate) use keys::observed_config;
 pub(crate) use packets::LinkWatch;
 
@@ -485,6 +488,7 @@ pub(crate) use packets::LinkWatch;
 /// stopped asking for them.
 const WATCH_LINGER: Duration = if cfg!(test) { Duration::from_millis(200) } else { Duration::from_secs(60) };
 /// How often the reaper looks for watches to forget.
+#[cfg(not(target_arch = "wasm32"))]
 const REAP_EVERY: Duration = if cfg!(test) { Duration::from_millis(50) } else { Duration::from_secs(5) };
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -493,7 +497,8 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Serves one observer session on `fd`, which has been accepted on the
 /// world socket of `attacher`.
-pub(crate) fn serve_session(attacher: Attacher, fd: std::os::fd::OwnedFd) {
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn serve_session(attacher: crate::Attacher, fd: std::os::fd::OwnedFd) {
     session::start(attacher, fd);
 }
 
@@ -521,27 +526,40 @@ pub(crate) fn reap_later(graph: &Arc<Graph>) {
     if reaper.1 {
         return;
     }
-    reaper.1 = true;
-    let started = std::thread::Builder::new().name("fictionet-reaper".into()).spawn(|| {
-        loop {
-            std::thread::sleep(REAP_EVERY);
-            let mut reaper = lock(&REAPER);
-            // A world that ended, or has no watches left, needs no more.
-            reaper.0.retain(|g| {
-                g.upgrade().is_some_and(|g| {
-                    reap(&g);
-                    !lock(&g.watches).is_empty()
-                })
-            });
-            if reaper.0.is_empty() {
-                reaper.1 = false;
-                return;
+    reaper.1 = start_reaper();
+}
+
+/// Starts the thread that reaps the worlds in [`REAPER`]. Returns whether
+/// it runs.
+#[cfg(not(target_arch = "wasm32"))]
+fn start_reaper() -> bool {
+    std::thread::Builder::new()
+        .name("fictionet-reaper".into())
+        .spawn(|| {
+            loop {
+                std::thread::sleep(REAP_EVERY);
+                let mut reaper = lock(&REAPER);
+                // A world that ended, or has no watches left, needs no more.
+                reaper.0.retain(|g| {
+                    g.upgrade().is_some_and(|g| {
+                        reap(&g);
+                        !lock(&g.watches).is_empty()
+                    })
+                });
+                if reaper.0.is_empty() {
+                    reaper.1 = false;
+                    return;
+                }
             }
-        }
-    });
-    if started.is_err() {
-        reaper.1 = false;
-    }
+        })
+        .is_ok()
+}
+
+/// A browser has no thread for the reaper. Idle watches there are
+/// forgotten when the next watch starts.
+#[cfg(target_arch = "wasm32")]
+fn start_reaper() -> bool {
+    false
 }
 
 /// The watch of link `id` in `graph`, made if needed, and a subscription
@@ -656,9 +674,15 @@ pub(crate) fn emit(cx: &Cx, name: &str, payload: &str) -> Result<(), NotJson> {
 /// Tells observers that a queue dropped `packet` with `waiting` packets
 /// ahead of it.
 pub(crate) fn note_drop(cx: &Cx, packet: &crate::Packet, waiting: usize) {
+    note_dropped(cx, packet, &format!("the queue was full, {waiting} packets waiting"));
+}
+
+/// Tells observers that `packet` was dropped, and `why`: a note of kind
+/// `drop` with the packet's addresses, protocol and length.
+pub(crate) fn note_dropped(cx: &Cx, packet: &crate::Packet, why: &str) {
     // Only the headers: this runs on the world's own thread.
     let d = decode::Dissector::headers_only().decode(&packet.0, &[]);
-    let text = format!("{} → {} {} ({} bytes): the queue was full, {waiting} packets waiting", d.src, d.dst, d.proto, packet.0.len());
+    let text = format!("{} → {} {} ({} bytes): {why}", d.src, d.dst, d.proto, packet.0.len());
     cx.graph().note("drop", text, Some(&packet.0));
 }
 

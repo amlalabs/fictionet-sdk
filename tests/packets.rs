@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use etherparse::PacketBuilder;
 use fictionet::prelude::*;
-use fictionet::stdlib::route::{Prefix, router};
+use fictionet::stdlib::route::{Prefix, lan, router};
 use fictionet::stdlib::{bottleneck, delay, icmp, ip};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
@@ -587,6 +587,263 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
 }
 
 #[test]
+fn lan_forwards_unicast_and_floods_ip_group_traffic() {
+    world(|cx| async move {
+        let network: Prefix = "192.168.56.0/24".parse()?;
+        let lan = lan(&cx, network);
+        let (a_lan, mut a) = pair();
+        let (b_lan, mut b) = pair();
+        let (c_lan, mut c) = pair();
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+        lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
+
+        // Unicast goes only to the member that owns the destination.
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 1);
+        assert!(recv_within(&cx, &mut c, ms(20)).await.is_none());
+
+        // The subnet broadcast, limited broadcast and multicast are copied
+        // to every member except the sender.
+        for (dst, tag) in [
+            ([192, 168, 56, 255], 2),
+            ([255, 255, 255, 255], 3),
+            ([224, 0, 0, 252], 4),
+        ] {
+            a.send(Packet(v4_udp([192, 168, 56, 10], dst, &[tag])));
+            assert_eq!(recv_soon(&cx, &mut b).await.0[28], tag);
+            assert_eq!(recv_soon(&cx, &mut c).await.0[28], tag);
+            assert!(recv_within(&cx, &mut a, ms(20)).await.is_none());
+        }
+
+        // Reconnecting an address replaces the old member.
+        let (new_b_lan, mut new_b) = pair();
+        lan.add("192.168.56.11".parse()?, Box::new(new_b_lan))?;
+        assert_eq!(b.recv(&cx).await, Err(RecvError::Closed));
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[5])));
+        assert_eq!(recv_soon(&cx, &mut new_b).await.0[28], 5);
+
+        let (outside_lan, _outside) = pair();
+        assert!(lan.add("192.168.57.1".parse()?, Box::new(outside_lan)).is_err());
+
+        drop(lan);
+        drop((a, b, c, new_b));
+        Ok(())
+    });
+}
+
+#[test]
+fn lan_sends_off_subnet_unicast_to_the_gateway_or_drops_it() {
+    world(|cx| async move {
+        let lan = lan(&cx, "192.168.56.0/24".parse()?);
+        let (a_lan, mut a) = pair();
+        let (b_lan, mut b) = pair();
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+
+        // With no gateway, a packet for another subnet goes nowhere, and
+        // the LAN carries on.
+        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[1])));
+        assert!(recv_within(&cx, &mut b, ms(20)).await.is_none());
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[2])));
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 2);
+
+        // With one, it goes there. The gateway's packets come in like a
+        // member's: unicast to the owner, broadcast to everyone.
+        let (gw_lan, mut gw) = pair();
+        lan.gateway(Box::new(gw_lan))?;
+        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[3])));
+        assert_eq!(recv_soon(&cx, &mut gw).await.0[28], 3);
+        gw.send(Packet(v4_udp([10, 0, 0, 1], [192, 168, 56, 11], &[4])));
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 4);
+        assert!(recv_within(&cx, &mut a, ms(20)).await.is_none());
+        gw.send(Packet(v4_udp([10, 0, 0, 1], [192, 168, 56, 255], &[5])));
+        assert_eq!(recv_soon(&cx, &mut a).await.0[28], 5);
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 5);
+
+        // Members' broadcasts and multicasts stay among the members.
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 255], &[6])));
+        a.send(Packet(v4_udp([192, 168, 56, 10], [224, 0, 0, 252], &[7])));
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 6);
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 7);
+        assert!(recv_within(&cx, &mut gw, ms(20)).await.is_none());
+
+        // A packet from the gateway for another subnet is dropped, not
+        // sent back.
+        gw.send(Packet(v4_udp([10, 0, 0, 1], [10, 0, 0, 2], &[8])));
+        assert!(recv_within(&cx, &mut gw, ms(20)).await.is_none());
+
+        // A new gateway replaces the old one, which is closed.
+        let (gw2_lan, mut gw2) = pair();
+        lan.gateway(Box::new(gw2_lan))?;
+        assert_eq!(gw.recv(&cx).await, Err(RecvError::Closed));
+        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[9])));
+        assert_eq!(recv_soon(&cx, &mut gw2).await.0[28], 9);
+
+        // When the gateway closes, the LAN is sealed again.
+        drop(gw2);
+        cx.sleep(ms(20)).await?;
+        a.send(Packet(v4_udp([192, 168, 56, 10], [10, 0, 0, 1], &[10])));
+        for end in [&mut a, &mut b] {
+            assert!(recv_within(&cx, end, ms(20)).await.is_none());
+        }
+
+        drop(lan);
+        drop((a, b));
+        Ok(())
+    });
+}
+
+const LL_A: [u8; 16] = [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+const LLMNR6: [u8; 16] = [0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3];
+
+#[test]
+fn lan_carries_one_address_family() {
+    world(|cx| async move {
+        // IPv6 on an IPv4 LAN is dropped: link-local multicast and unicast
+        // alike, gateway or not. IPv4 still flows.
+        let lan4 = lan(&cx, "192.168.56.0/24".parse()?);
+        let (a_lan, mut a) = pair();
+        let (b_lan, mut b) = pair();
+        let (gw_lan, mut gw) = pair();
+        lan4.add("192.168.56.10".parse()?, Box::new(a_lan))?;
+        lan4.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+        lan4.gateway(Box::new(gw_lan))?;
+        a.send(Packet(v6_udp(LL_A, LLMNR6, &[1])));
+        a.send(Packet(v6_udp(LL_A, B6, &[2])));
+        // IPv4 link-local stays on the LAN too: no member, so dropped.
+        a.send(Packet(v4_udp([192, 168, 56, 10], [169, 254, 1, 1], &[3])));
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[4])));
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 4);
+        for end in [&mut a, &mut b, &mut gw] {
+            assert!(recv_within(&cx, end, ms(20)).await.is_none());
+        }
+
+        // An IPv6 LAN forwards unicast, floods multicast, takes no IPv4
+        // member and drops IPv4 packets. Link-local unicast is on the LAN,
+        // so it never reaches the gateway.
+        let lan6 = lan(&cx, "fd00::/64".parse()?);
+        let fd = |host: u8| -> [u8; 16] { [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, host] };
+        let (c_lan, mut c) = pair();
+        let (d_lan, mut d) = pair();
+        let (e_lan, mut e) = pair();
+        let (gw6_lan, mut gw6) = pair();
+        lan6.add("fd00::10".parse()?, Box::new(c_lan))?;
+        lan6.add("fd00::11".parse()?, Box::new(d_lan))?;
+        lan6.add("fd00::22".parse()?, Box::new(e_lan))?;
+        lan6.gateway(Box::new(gw6_lan))?;
+        let (x_lan, _x) = pair();
+        assert!(lan6.add("192.168.56.10".parse()?, Box::new(x_lan)).is_err());
+        c.send(Packet(v6_udp(fd(0x10), fd(0x11), &[5])));
+        assert_eq!(recv_soon(&cx, &mut d).await.0[48], 5);
+        assert!(recv_within(&cx, &mut e, ms(20)).await.is_none());
+        c.send(Packet(v6_udp(fd(0x10), LLMNR6, &[6])));
+        assert_eq!(recv_soon(&cx, &mut d).await.0[48], 6);
+        assert_eq!(recv_soon(&cx, &mut e).await.0[48], 6);
+        c.send(Packet(v6_udp(fd(0x10), B6, &[7])));
+        assert_eq!(recv_soon(&cx, &mut gw6).await.0[48], 7);
+        c.send(Packet(v6_udp(LL_A, [0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11], &[8])));
+        c.send(Packet(v4_udp(A4, B4, &[9])));
+        for end in [&mut c, &mut d, &mut e, &mut gw6] {
+            assert!(recv_within(&cx, end, ms(20)).await.is_none());
+        }
+
+        drop((lan4, lan6));
+        drop((a, b, gw, c, d, e, gw6));
+        Ok(())
+    });
+}
+
+#[test]
+fn lan_forgets_a_member_whose_interface_closed() {
+    world(|cx| async move {
+        let lan = lan(&cx, "192.168.56.0/24".parse()?);
+        let (a_lan, mut a) = pair();
+        let (b_lan, b) = pair();
+        let (c_lan, mut c) = pair();
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+        lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
+        drop(b);
+        cx.sleep(ms(20)).await?;
+
+        // Unicast for it goes nowhere. Broadcast still reaches the rest.
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
+        assert!(recv_within(&cx, &mut c, ms(20)).await.is_none());
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 255], &[2])));
+        assert_eq!(recv_soon(&cx, &mut c).await.0[28], 2);
+
+        // The address is free for a new member.
+        let (b2_lan, mut b2) = pair();
+        lan.add("192.168.56.11".parse()?, Box::new(b2_lan))?;
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[3])));
+        assert_eq!(recv_soon(&cx, &mut b2).await.0[28], 3);
+
+        // The LAN ends once every member has closed and the handle is
+        // gone. The run then ends, which `world` checks.
+        drop(lan);
+        drop((a, b2, c));
+        Ok(())
+    });
+}
+
+/// Wraps a cable end and logs `s` for every packet the task sends to it.
+struct LoggedSend {
+    inner: End,
+    log: Arc<Mutex<Vec<char>>>,
+}
+
+impl Interface for LoggedSend {
+    fn poll_recv(&mut self, cx: &Cx, task: &mut Context<'_>) -> Poll<Result<Packet, RecvError>> {
+        self.inner.poll_recv(cx, task)
+    }
+    fn send(&mut self, packet: Packet) {
+        self.log.lock().unwrap().push('s');
+        self.inner.send(packet)
+    }
+}
+
+/// A broadcast to seven members is seven sends, and the LAN counts each
+/// of them toward its budget, so it yields after eight broadcasts, not
+/// after 64.
+#[test]
+fn lan_fan_out_counts_toward_the_budget() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let l = log.clone();
+    world(move |cx| async move {
+        let done = Arc::new(AtomicBool::new(false));
+        let lan = lan(&cx, "10.0.0.0/24".parse()?);
+        let (sender_lan, mut sender) = pair();
+        lan.add("10.0.0.1".parse()?, Box::new(sender_lan))?;
+        let mut members = Vec::new();
+        for i in 0..7u8 {
+            let (lan_side, far) = pair();
+            let addr = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10 + i));
+            lan.add(addr, Box::new(LoggedSend { inner: lan_side, log: l.clone() }))?;
+            members.push(far);
+        }
+        for i in 0..200u32 {
+            sender.send(Packet(v4_udp([10, 0, 0, 1], [10, 0, 0, 255], &i.to_be_bytes())));
+        }
+        ticker(&cx, l.clone(), done.clone());
+        for far in &mut members {
+            for _ in 0..200 {
+                recv_soon(&cx, far).await;
+            }
+        }
+        done.store(true, Ordering::SeqCst);
+        drop(lan);
+        drop((sender, members));
+        Ok(())
+    });
+    let log = log.lock().unwrap();
+    assert_eq!(log.iter().filter(|c| **c == 's').count(), 1400);
+    let longest = longest_run(&log);
+    assert!(longest <= 64, "the LAN sent {longest} packets in a row");
+    assert!(longest >= 16, "the test did not load the LAN ({longest})");
+}
+
+#[test]
 fn a_router_with_no_routes_and_no_handle_ends() {
     world(|cx| async move {
         drop(router(&cx, Vec::new()));
@@ -818,8 +1075,12 @@ fn every_task_stops_when_its_region_is_cancelled() {
             let (a, b) = pair();
             keep.push(a);
             let r = router(&cx, vec![("0.0.0.0/0".parse()?, Box::new(b) as Box<dyn Interface>)]);
+            let (a, b) = pair();
+            keep.push(a);
+            let l = lan(&cx, "10.0.0.0/24".parse()?);
+            l.add("10.0.0.2".parse()?, Box::new(b))?;
             cx.sleep(ms(20)).await?;
-            let _keep = (keep, r);
+            let _keep = (keep, r, l);
             Err("stop".into())
         }))
     });

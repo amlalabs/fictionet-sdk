@@ -15,8 +15,10 @@
 //!   build one from an interface: [`ip::split_protocols`] splits its packets
 //!   by protocol, and [`tcp::endpoint`] and [`udp::endpoint`] give the TCP
 //!   and UDP parts listeners, connections and sockets.
-//! - **Routers.** [`route::router`] forwards packets between sandboxes and
-//!   machines by destination address.
+//! - **Networks.** [`route::router`] forwards packets between routes by
+//!   destination address. [`route::lan`] joins machines on one IP subnet,
+//!   floods broadcast and multicast traffic to its members, and hands
+//!   packets for other subnets to a gateway.
 //! - **Links.** [`delay`] and [`bottleneck`] sit on an interface and change
 //!   how its packets travel, as a slow or distant link would. [`filter`]
 //!   shows each packet to your code, which can drop it.
@@ -45,9 +47,24 @@
 //! Implement [`Present`](crate::observe::Present) to show its items and byte
 //! ranges in observe, then add it to [`Registry`](crate::observe::Registry).
 //!
+//! Use [`http2::Connection`] for directional HTTP/2 state and [`http2::Capture`]
+//! with the public observe registry. DATA payloads feed [`grpc::Messages`]
+//! through [`codec::Demux`] under one byte budget across streams.
 //! Use [`hpack::Table`] and [`hpack::Encoder`] for complete HTTP/2 header
 //! blocks. Each direction has its own dynamic table. [`huffman`] supplies
 //! the RFC 7541 string code shared by [`hpack`] and [`qpack`].
+//!
+//! [`sse`] reads streaming API response bodies as fields or dispatched
+//! events. Use [`sse::RawLines`] to retain comments and [`sse::Events`] to
+//! join data lines, then write edited events back into an HTTP body.
+//!
+//! [`jsonrpc`] reads JSON-RPC 2.0 requests, notifications, responses, and
+//! batches over ordered [`json::Value`] trees. Use [`jsonrpc::Messages`] for
+//! stdio lines. For server HTTP bodies, use [`codec::Collect<json::Value>`]
+//! and [`jsonrpc::Incoming::from_value`] to retain invalid batch entries.
+//! Convert JSON parser errors with [`jsonrpc::ParseError::from`] for replies.
+//! Clients and strict callers can use [`codec::Collect<jsonrpc::Body>`].
+//! Reply helpers keep request ids exact, and writers check edited envelopes.
 //!
 //! # Three kinds of functions
 //!
@@ -68,6 +85,8 @@
 //!   all of the interfaces they returned have closed.
 //! - [`route::router`] stops when the last of its interfaces has closed and
 //!   no [`Router`](route::Router) handle is left to add more.
+//! - [`route::lan`] stops when its members and gateway have all closed and
+//!   no [`Lan`](route::Lan) handle is left to add more.
 //! - [`tcp::endpoint`] and [`udp::endpoint`] stop when their interface
 //!   closes.
 //!
@@ -84,6 +103,7 @@
 //! | [`ip::split_versions`] | an interface | IPv4, IPv6 and other packets, split apart |
 //! | [`ip::split_protocols`] | an interface | TCP, UDP, ICMP and other packets, split apart |
 //! | [`route::router`] | many interfaces with prefixes | a handle for adding routes later; it forwards between them |
+//! | [`route::lan`] | one IP subnet | a handle for adding members and a gateway; it forwards unicast and floods broadcast and multicast |
 //! | [`tcp::endpoint`] | TCP packets and an address | listeners and connections |
 //! | [`udp::endpoint`] | UDP packets and an address | sockets |
 //! | [`net::Net::serve`] | the attachments, and the hosts with their services | nothing: it builds DNS, routing, machines and every service |
@@ -161,7 +181,9 @@ pub mod dnp3;
 pub mod dns;
 pub mod dtls;
 pub mod enip;
+pub mod fast;
 pub mod fastcgi;
+pub mod fix;
 pub mod ftp;
 pub mod geneve;
 pub mod git_protocol;
@@ -169,6 +191,7 @@ pub mod gre;
 pub mod grpc;
 pub mod hpack;
 pub mod http1;
+pub mod http2;
 pub mod http3;
 pub mod httpd;
 pub mod huffman;
@@ -183,6 +206,8 @@ pub mod ipp;
 pub mod ipsec;
 pub mod journal;
 pub mod json;
+pub mod json_schema;
+pub mod jsonrpc;
 pub mod kafka;
 pub mod kerberos;
 pub mod l2tp;
@@ -190,6 +215,7 @@ pub mod ldap;
 pub mod memcache;
 pub mod mime_multipart;
 pub mod modbus;
+pub mod moldudp64;
 pub mod mongodb;
 pub mod mqtt;
 pub mod mysql;
@@ -210,7 +236,6 @@ pub mod pim;
 pub mod pop3;
 pub mod portmap;
 pub mod postgres;
-/// RFC 7541 prefix integers shared by HPACK and QPACK.
 pub mod prefix_int;
 pub mod protobuf;
 pub mod proxy_protocol;
@@ -226,6 +251,7 @@ pub mod rtcp;
 pub mod rtp;
 pub mod rtsp;
 pub mod scenario;
+pub mod sbe;
 pub mod sdp;
 pub mod serve;
 pub mod sftp;
@@ -234,12 +260,13 @@ pub mod smb2;
 pub mod smtp;
 pub mod snmp;
 pub mod socks;
+pub mod soupbintcp;
 pub mod spnego;
 pub mod ssh;
+pub mod sse;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
-#[expect(missing_docs, reason = "Reassembly is documented on its public types.")]
 pub mod tcp_stream;
 pub mod tds;
 pub mod telnet;

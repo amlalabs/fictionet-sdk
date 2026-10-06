@@ -118,6 +118,14 @@
 //! its futures use only [`std::task::Waker`], so a world runs on tokio or
 //! on Fictionet's own [`block_on`].
 //!
+//! [`stdlib::http2`] provides frames, directional connection state, and capture
+//! presentation. HTTP/2 DATA feeds [`stdlib::grpc::Messages`] through a shared
+//! [`Demux`](stdlib::codec::Demux) budget. To show another protocol in
+//! captures, implement [`observe::Present`] for its items and byte ranges,
+//! then add it to [`observe::Registry`]. Use
+//! [`observe::Dissector::with_registry`] for capture packets or
+//! [`Cx::observe_protocols`] for live watches.
+//!
 //! # Running a world
 //!
 //! Fictionet does not own `main` or the executor. A world runs inside an
@@ -242,15 +250,40 @@
 //! (server side), `h2`, `smoltcp` and `hickory-proto`. A world that needs
 //! neither `fictionet::tokio` nor `web::proxy` can leave the feature out
 //! with `default-features = false`.
+//!
+//! # In a browser
+//!
+//! The library also builds for `wasm32-unknown-unknown`, with
+//! `default-features = false`. A world then runs inside a page: [`run`],
+//! [`Cx`] and its timers, [`block_on`], [`pair`], [`attachments`], the
+//! [`stdlib`] with smoltcp, DNS, `web::Sites` and TLS (rustls with ring,
+//! whose C code needs a clang with the wasm32 target). The page plays the
+//! sandboxes through [`Attacher::attach`], whose [`End`] carries raw IP
+//! packets.
+//!
+//! What needs an operating system is left out of that build: [`listen`]
+//! and [`WorldSocket`], the `fictionet` command, observer sessions, and
+//! the `tokio` feature. The clocks come from `performance.now()` and
+//! `Date.now()`, random bytes from `crypto.getRandomValues`, and timers
+//! from `setTimeout`. In a page, hand [`run`] to the event loop with
+//! `wasm_bindgen_futures`. [`block_on`] also works, but spins between
+//! timers. Two limits come from hyper and h2, which read `std`'s clock: a
+//! site serves HTTP/2 but not HTTP/1.1, and an HTTP/2 stream that the
+//! world's side resets panics. `examples/wasm_world` runs DNS, HTTP/2 and
+//! HTTPS through a world in Node.js.
 
 #![warn(missing_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// A browser build leaves out the observer sessions, which are what reads
+// the watches, taps and packet decoding. That code stays in, unused there.
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 // Protocol files use the same imports here and when copied into a user crate.
 extern crate self as fictionet;
 
 mod attach;
 pub mod attaching;
+mod block_on;
 mod cable;
 mod cx;
 #[cfg(fuzzing)]
@@ -258,12 +291,15 @@ mod cx;
 pub mod fuzzing;
 pub mod observe;
 pub mod getting_started;
+#[cfg(not(target_arch = "wasm32"))]
 mod listen;
 pub mod lowering;
+#[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
 pub mod relay;
 mod run;
 pub mod running;
+mod sys;
 mod timer;
 mod watch;
 pub mod proto;
@@ -292,7 +328,9 @@ pub mod prelude {
 pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
 pub use cable::{End, pair, pair_with_limit};
 pub use cx::{Cancelled, Cx, Task};
-pub use listen::{Listening, ParseWorldSocketError, WorldSocket, block_on, listen};
+pub use block_on::block_on;
+#[cfg(not(target_arch = "wasm32"))]
+pub use listen::{Listening, ParseWorldSocketError, WorldSocket, listen};
 pub use run::run;
 
 use std::future::Future;

@@ -2320,7 +2320,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut r = Lcg::new(9090);
-        for i in 0..4000 {
+        for i in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
             let m = random_message(&mut r);
             let p = PROTOCOLS[i % 3];
             let b = EncodedMessage { message: m.clone(), protocol: p }.to_bytes().unwrap();

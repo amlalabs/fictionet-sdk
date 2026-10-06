@@ -2272,7 +2272,7 @@ mod tests {
             samples.push(p.to_bytes().unwrap());
         }
         let mut rng = Lcg::new(0xdce);
-        for _ in 0..60_000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(15_000) {
             let mut data = if rng.coin() {
                 let mut bytes = samples[rng.index(samples.len())].clone();
                 if rng.coin() {

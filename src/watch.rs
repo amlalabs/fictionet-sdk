@@ -17,9 +17,10 @@ use std::collections::{HashMap, VecDeque};
 use std::panic::Location;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
 
 use crate::Packet;
+use crate::sys::{Instant, SystemTime};
 
 thread_local! {
     /// The id of the task this thread is polling, or 0 outside any task.

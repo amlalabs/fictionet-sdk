@@ -4542,7 +4542,7 @@ mod tests {
     fn fuzz_loop() {
         let corpus = corpus();
         let mut rng = Lcg::new(0x5eed);
-        for _ in 0..30_000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(7500) {
             let mut payload = if rng.coin() {
                 corpus[rng.index(corpus.len())].clone()
             } else {

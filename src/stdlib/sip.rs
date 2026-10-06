@@ -3023,7 +3023,8 @@ mod tests {
             b"<sip:a@b>;expires=60, \"C, D\" <sip:c@d>, mailto:x@y;q=0.1",
         ];
         let mut read = 0;
-        for round in 0..6000 {
+        let rounds = fictionet::stdlib::codec::test_support::rounds(1500);
+        for round in 0..rounds {
             let base: &[u8] = match round % 3 {
                 0 => &stream,
                 1 => seeds[rng.index(seeds.len())].as_slice(),
@@ -3035,10 +3036,11 @@ mod tests {
             }
             read += check(&data);
         }
-        // This seed reads 2800 messages; allow a small margin.
-        assert!(read > 2750, "only {read} messages read");
+        // With this seed, a round reads about 0.45 messages (675 in 1500
+        // rounds, 2800 in 6000); allow a small margin.
+        assert!(read > rounds * 43 / 100, "only {read} messages read in {rounds} rounds");
         // Mix arbitrary bytes into text as well as checking byte noise.
-        for _ in 0..3000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(750) {
             let mut text = rng.text(200).into_bytes();
             let at = rng.index(text.len().saturating_add(1));
             text.splice(at..at, rng.bytes(4));

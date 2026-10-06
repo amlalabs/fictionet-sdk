@@ -1260,9 +1260,17 @@ mod h2 {
         let broke = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let io = Io { cx: cx.clone(), conn, broke: broke.clone(), buf: vec![0; 16 * 1024].into_boxed_slice() };
         let route = Route { cx: cx.clone(), handler, info: Arc::new(info.clone()), journal: journal.clone() };
-        let served = hyper::server::conn::http2::Builder::new(Executor { cx: cx.clone() })
-            .timer(CxTimer { cx: cx.clone() })
-            .serve_connection(io, route);
+        // In a browser, `std::time::Instant::now` and `SystemTime::now` panic.
+        // hyper's timer API is in `Instant`, so there hyper runs without a
+        // timer, and it writes no `Date` header, which it takes from
+        // `SystemTime`.
+        let browser = cfg!(target_arch = "wasm32");
+        let mut builder = hyper::server::conn::http2::Builder::new(Executor { cx: cx.clone() });
+        builder.auto_date_header(!browser);
+        if !browser {
+            builder.timer(CxTimer { cx: cx.clone() });
+        }
+        let served = builder.serve_connection(io, route);
         let mut served = pin!(served);
         let mut stopping = pin!(cx.cancelled());
         let result = poll_fn(|task| {

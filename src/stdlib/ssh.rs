@@ -2380,7 +2380,7 @@ mod tests {
             value
         };
         let list = |g: &mut Lcg| (0..g.index(6)).map(|_| text(g, 80)).collect();
-        for _ in 0..4000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
             for sample in &payloads {
                 let mut payload = sample.clone();
                 mutate(&mut g, &mut payload);

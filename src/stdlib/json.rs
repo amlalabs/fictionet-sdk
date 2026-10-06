@@ -23,6 +23,10 @@
 //! keeps its members in order, duplicate keys included, since RFC 8259
 //! leaves their meaning to the reader.
 //!
+//! [`Value`] implements `Drop` to release nested trees without recursion.
+//! Its fields cannot be moved out by pattern matching. Match a mutable
+//! reference and use [`core::mem::take`] to take an array, object, or string.
+//!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::json::{Number, Value};
@@ -204,6 +208,8 @@ impl Number {
 
 /// One JSON value. An object is a list of members in the order they were
 /// read, and may hold the same key more than once.
+/// Dropping a value uses an explicit work list, including hand-built trees
+/// deeper than [`MAX_DEPTH`]. Take owned fields through a mutable reference.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Value {
     /// `null`, the default.
@@ -219,6 +225,35 @@ pub enum Value {
     Array(Vec<Value>),
     /// An object's members, in order, duplicates kept.
     Object(Vec<(String, Value)>),
+}
+
+impl Drop for Value {
+    fn drop(&mut self) {
+        // Detach containers before dropping their parent. Scalars drop in
+        // place, so an all-scalar container needs no work list allocation.
+        // Each container enters the list once. Its size is bounded by the tree.
+        fn detach(value: &mut Value, pending: &mut Vec<Value>) {
+            match value {
+                Value::Array(items) => pending.extend(
+                    items
+                        .drain(..)
+                        .filter(|v| matches!(v, Value::Array(_) | Value::Object(_))),
+                ),
+                Value::Object(members) => pending.extend(
+                    members
+                        .drain(..)
+                        .map(|(_, v)| v)
+                        .filter(|v| matches!(v, Value::Array(_) | Value::Object(_))),
+                ),
+                _ => {}
+            }
+        }
+        let mut pending = Vec::new();
+        detach(self, &mut pending);
+        while let Some(mut value) = pending.pop() {
+            detach(&mut value, &mut pending);
+        }
+    }
 }
 
 impl From<bool> for Value {
@@ -1326,13 +1361,32 @@ mod tests {
     }
 
     #[test]
+    fn deeply_nested_hand_built_values_drop_without_recursion() {
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let mut value = Value::Null;
+                for _ in 0..100_000 {
+                    value = Value::Array(vec![Value::from("sibling"), value]);
+                    value = Value::Object(vec![("child".into(), value)]);
+                }
+                drop(value);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn writer_refuses_what_the_parser_would() {
         let mut deep = Value::Null;
         for _ in 0..MAX_DEPTH + 1 {
             deep = Value::Array(vec![deep]);
         }
         assert_eq!(deep.to_bytes().unwrap_err().kind, ErrorKind::TooDeep);
-        let Value::Array(mut inner) = deep else { panic!() };
+        let Value::Array(inner) = &mut deep else {
+            panic!()
+        };
         round_trip(&inner.pop().unwrap());
         let big = Value::String("x".repeat(MAX_SIZE));
         assert_eq!(big.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
@@ -1561,19 +1615,24 @@ mod tests {
 
     #[test]
     fn stream_reads_large_batch() {
-        let started = std::time::Instant::now();
-        let bytes = "0\n".repeat(MAX_SIZE);
-        let mut stream = Stream::new(Values::new());
-        let mut count = 0;
-        pump(&mut stream, bytes.as_bytes(), |value| {
-            assert_eq!(value, n("0"));
-            count += 1;
-        }).unwrap();
-        finish(&mut stream, |_| panic!("no pending value")).unwrap();
-        assert_eq!(count, MAX_SIZE);
-        assert_eq!(stream.buffered(), 0);
-        assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        // Returns the bytes the decoder allocated.
+        let read = |size: usize| {
+            let bytes = "0\n".repeat(size);
+            let mut stream = Stream::new(Values::new());
+            let mut count = 0;
+            pump(&mut stream, bytes.as_bytes(), |value| {
+                assert_eq!(value, n("0"));
+                count += 1;
+            }).unwrap();
+            finish(&mut stream, |_| panic!("no pending value")).unwrap();
+            assert_eq!(count, size);
+            assert_eq!(stream.buffered(), 0);
+            stream.into_parts().0.allocated()
+        };
+        assert!(read(MAX_SIZE) <= 2 * (MAX_SIZE + 1));
+        fictionet::stdlib::codec::test_support::assert_linear("json values", MAX_SIZE / 16, |size| {
+            read(size);
+        });
     }
 
     const PIECES: [&str; 32] = [

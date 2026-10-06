@@ -1,0 +1,39 @@
+[package]
+name = "wasm-world"
+version = "0.0.0"
+edition = "2024"
+description = "A small Fictionet world that runs in a browser: one DNS name, one HTTP site, one request."
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its own workspace, so its dependencies stay out of the fictionet crate's
+# workspace and lock file.
+[workspace]
+
+# cdylib for `wasm-pack build`, rlib for the tests.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Default features off: the `tokio` feature is for real sockets.
+fictionet = { path = "../..", default-features = false }
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1", "http2"] }
+tower-service = "0.3"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+
+# The page's entry point, `fetchText`.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1

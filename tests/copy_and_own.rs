@@ -1,233 +1,7 @@
-//! Compile every protocol file as code owned by a consumer crate.
-//!
-//! The dev dependency in `tests/copy_and_own/Cargo.toml` uses this same file
-//! as its library. That build has no `cfg(test)`, so the copied modules' unit
-//! tests are compiled out. The SDK already runs them in `cargo test --lib`;
-//! running their parser and fuzz loops again would nearly double that work.
-//! This integration target runs only the public-trait checks below.
+//! Check public codec traits through the separate consumer fixture.
+//! Copied modules compile without cfg(test) in fictionet-copy-modules.
 
-#![allow(dead_code)]
-
-#[cfg(not(test))]
-macro_rules! protocols {
-    () => {
-        #[path = "../src/observe/protocols.rs"]
-        pub mod observe_protocols;
-        #[path = "../src/observe/tls.rs"]
-        pub mod observe_tls;
-        #[path = "../src/observe/conversation.rs"]
-        pub mod observe_conversation;
-        #[path = "../src/stdlib/codec/interceptor.rs"]
-        pub mod interceptor;
-        #[path = "../src/stdlib/codec/recorder.rs"]
-        pub mod recorder;
-        #[path = "../src/stdlib/codec/faults.rs"]
-        pub mod faults;
-        #[path = "../src/stdlib/codec/lcg.rs"]
-        pub mod lcg;
-        #[path = "../src/stdlib/amqp.rs"]
-        pub mod amqp;
-        #[path = "../src/stdlib/asn1.rs"]
-        pub mod asn1;
-        #[path = "../src/stdlib/bacnet.rs"]
-        pub mod bacnet;
-        #[path = "../src/stdlib/bgp.rs"]
-        pub mod bgp;
-        #[path = "../src/stdlib/coap.rs"]
-        pub mod coap;
-        #[path = "../src/stdlib/cotp.rs"]
-        pub mod cotp;
-        #[path = "../src/stdlib/dcerpc.rs"]
-        pub mod dcerpc;
-        #[path = "../src/stdlib/dhcp.rs"]
-        pub mod dhcp;
-        #[path = "../src/stdlib/dhcpv6.rs"]
-        pub mod dhcpv6;
-        #[path = "../src/stdlib/diameter.rs"]
-        pub mod diameter;
-        #[path = "../src/stdlib/dnp3.rs"]
-        pub mod dnp3;
-        #[path = "../src/stdlib/dtls.rs"]
-        pub mod dtls;
-        #[path = "../src/stdlib/enip.rs"]
-        pub mod enip;
-        #[path = "../src/stdlib/fastcgi.rs"]
-        pub mod fastcgi;
-        #[path = "../src/stdlib/ftp.rs"]
-        pub mod ftp;
-        #[path = "../src/stdlib/geneve.rs"]
-        pub mod geneve;
-        #[path = "../src/stdlib/git_protocol.rs"]
-        pub mod git_protocol;
-        #[path = "../src/stdlib/gre.rs"]
-        pub mod gre;
-        #[path = "../src/stdlib/grpc.rs"]
-        pub mod grpc;
-        #[path = "../src/stdlib/hpack.rs"]
-        pub mod hpack;
-        #[path = "../src/stdlib/huffman.rs"]
-        pub mod huffman;
-        #[path = "../src/stdlib/http1.rs"]
-        pub mod http1;
-        #[path = "../src/stdlib/http3.rs"]
-        pub mod http3;
-        #[path = "../src/stdlib/iec104.rs"]
-        pub mod iec104;
-        #[path = "../src/stdlib/igmp.rs"]
-        pub mod igmp;
-        #[path = "../src/stdlib/ike.rs"]
-        pub mod ike;
-        #[path = "../src/stdlib/imap.rs"]
-        pub mod imap;
-        #[path = "../src/stdlib/imf.rs"]
-        pub mod imf;
-        #[path = "../src/stdlib/ipp.rs"]
-        pub mod ipp;
-        #[path = "../src/stdlib/ipsec.rs"]
-        pub mod ipsec;
-        #[path = "../src/stdlib/json.rs"]
-        pub mod json;
-        #[path = "../src/stdlib/kafka.rs"]
-        pub mod kafka;
-        #[path = "../src/stdlib/kerberos.rs"]
-        pub mod kerberos;
-        #[path = "../src/stdlib/l2tp.rs"]
-        pub mod l2tp;
-        #[path = "../src/stdlib/ldap.rs"]
-        pub mod ldap;
-        #[path = "../src/stdlib/memcache.rs"]
-        pub mod memcache;
-        #[path = "../src/stdlib/mime_multipart.rs"]
-        pub mod mime_multipart;
-        #[path = "../src/stdlib/modbus.rs"]
-        pub mod modbus;
-        #[path = "../src/stdlib/mongodb.rs"]
-        pub mod mongodb;
-        #[path = "../src/stdlib/mqtt.rs"]
-        pub mod mqtt;
-        #[path = "../src/stdlib/mysql.rs"]
-        pub mod mysql;
-        #[path = "../src/stdlib/nbdgm.rs"]
-        pub mod nbdgm;
-        #[path = "../src/stdlib/nbns.rs"]
-        pub mod nbns;
-        #[path = "../src/stdlib/nbss.rs"]
-        pub mod nbss;
-        #[path = "../src/stdlib/nfs.rs"]
-        pub mod nfs;
-        #[path = "../src/stdlib/ntlmssp.rs"]
-        pub mod ntlmssp;
-        #[path = "../src/stdlib/ntp.rs"]
-        pub mod ntp;
-        #[path = "../src/stdlib/ocsp.rs"]
-        pub mod ocsp;
-        #[path = "../src/stdlib/onc_rpc.rs"]
-        pub mod onc_rpc;
-        #[path = "../src/stdlib/opcua.rs"]
-        pub mod opcua;
-        #[path = "../src/stdlib/openvpn.rs"]
-        pub mod openvpn;
-        #[path = "../src/stdlib/ospf.rs"]
-        pub mod ospf;
-        #[path = "../src/stdlib/pcp.rs"]
-        pub mod pcp;
-        #[path = "../src/stdlib/pim.rs"]
-        pub mod pim;
-        #[path = "../src/stdlib/pop3.rs"]
-        pub mod pop3;
-        #[path = "../src/stdlib/portmap.rs"]
-        pub mod portmap;
-        #[path = "../src/stdlib/postgres.rs"]
-        pub mod postgres;
-        #[path = "../src/stdlib/prefix_int.rs"]
-        pub mod prefix_int;
-        #[path = "../src/stdlib/protobuf.rs"]
-        pub mod protobuf;
-        #[path = "../src/stdlib/proxy_protocol.rs"]
-        pub mod proxy_protocol;
-        #[path = "../src/stdlib/qpack.rs"]
-        pub mod qpack;
-        #[path = "../src/stdlib/quic.rs"]
-        pub mod quic;
-        #[path = "../src/stdlib/radius.rs"]
-        pub mod radius;
-        #[path = "../src/stdlib/rdp.rs"]
-        pub mod rdp;
-        #[path = "../src/stdlib/resp.rs"]
-        pub mod resp;
-        #[path = "../src/stdlib/rfb.rs"]
-        pub mod rfb;
-        #[path = "../src/stdlib/rip.rs"]
-        pub mod rip;
-        #[path = "../src/stdlib/rtcp.rs"]
-        pub mod rtcp;
-        #[path = "../src/stdlib/rtp.rs"]
-        pub mod rtp;
-        #[path = "../src/stdlib/rtsp.rs"]
-        pub mod rtsp;
-        #[path = "../src/stdlib/sdp.rs"]
-        pub mod sdp;
-        #[path = "../src/stdlib/sftp.rs"]
-        pub mod sftp;
-        #[path = "../src/stdlib/sip.rs"]
-        pub mod sip;
-        #[path = "../src/stdlib/smb2.rs"]
-        pub mod smb2;
-        #[path = "../src/stdlib/smtp.rs"]
-        pub mod smtp;
-        #[path = "../src/stdlib/snmp.rs"]
-        pub mod snmp;
-        #[path = "../src/stdlib/socks.rs"]
-        pub mod socks;
-        #[path = "../src/stdlib/spnego.rs"]
-        pub mod spnego;
-        #[path = "../src/stdlib/ssh.rs"]
-        pub mod ssh;
-        #[path = "../src/stdlib/stun.rs"]
-        pub mod stun;
-        #[path = "../src/stdlib/syslog.rs"]
-        pub mod syslog;
-        #[path = "../src/stdlib/tcp_stream.rs"]
-        pub mod tcp_stream;
-        #[path = "../src/stdlib/tds.rs"]
-        pub mod tds;
-        #[path = "../src/stdlib/telnet.rs"]
-        pub mod telnet;
-        #[path = "../src/stdlib/tftp.rs"]
-        pub mod tftp;
-        #[path = "../src/stdlib/thrift.rs"]
-        pub mod thrift;
-        #[path = "../src/stdlib/tpkt.rs"]
-        pub mod tpkt;
-        #[path = "../src/stdlib/urlencoded_form.rs"]
-        pub mod urlencoded_form;
-        #[path = "../src/stdlib/vrrp.rs"]
-        pub mod vrrp;
-        #[path = "../src/stdlib/vxlan.rs"]
-        pub mod vxlan;
-        #[path = "../src/stdlib/wake_on_lan.rs"]
-        pub mod wake_on_lan;
-        #[path = "../src/stdlib/websocket.rs"]
-        pub mod websocket;
-        #[path = "../src/stdlib/whois.rs"]
-        pub mod whois;
-        #[path = "../src/stdlib/wireguard.rs"]
-        pub mod wireguard;
-        #[path = "../src/stdlib/x509.rs"]
-        pub mod x509;
-        #[path = "../src/stdlib/xml.rs"]
-        pub mod xml;
-        #[path = "../src/stdlib/zabbix.rs"]
-        pub mod zabbix;
-    };
-}
-
-#[cfg(not(test))]
-protocols!();
-
-#[cfg(test)]
 use fictionet::stdlib::codec::{Decode, Stream, Wire, finish, pump};
-#[cfg(test)]
 use fictionet_copy_modules::*;
 
 #[test]
@@ -394,4 +168,172 @@ fn copied_tls_and_selection_driver_use_the_public_registry() {
     assert!(!conversation.waiting(false));
     conversation.lost(false);
     assert!(format!("{packet:?}").contains("Finished"));
+}
+
+#[test]
+fn copied_sse_uses_public_lines_and_wire() {
+    let event = sse::Event::new("first\nsecond");
+    let bytes = event.to_bytes().unwrap();
+    let mut stream = Stream::new(sse::Events::default());
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(1) {
+        pump(&mut stream, chunk, |event| events.push(event)).unwrap();
+    }
+    finish(&mut stream, |event| events.push(event)).unwrap();
+    assert_eq!(events, [event]);
+}
+
+#[test]
+fn copied_fix_skips_garbled_frames_through_the_public_driver() {
+    // FIX 4.4 Vol 2 case 3.b: discard an invalid checksum and continue.
+    let good = b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01";
+    let bad = b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01";
+    let mut stream = Stream::new(fix::Frames::default());
+    let mut messages = Vec::new();
+    pump(&mut stream, bad, |item| messages.push(item)).unwrap();
+    pump(&mut stream, good, |item| messages.push(item)).unwrap();
+    finish(&mut stream, |item| messages.push(item)).unwrap();
+    assert_eq!(messages, [Ok(fix::Message::parse(good).unwrap())]);
+    assert_eq!(stream.decoder().garbled(), 1);
+    assert!(stream.failed().is_none());
+}
+
+#[test]
+fn copied_fix_passes_field_failures_to_the_session() {
+    // FIX 4.4 Vol 2 case 14.d; Session Layer 4.5.4.
+    let mut session = fix::Session::new(
+        fix::SessionConfig::new(fix::Version::Fix44, fix::Role::Acceptor, "LOCAL", "PEER").unwrap(),
+        1,
+        1,
+        0,
+    )
+    .unwrap();
+    let mut logon = fix::Message::new(fix::Version::Fix44, b"A").unwrap();
+    let time = b"20261006-12:00:00";
+    for (tag, value) in [
+        (34, b"1".as_slice()),
+        (49, b"PEER"),
+        (56, b"LOCAL"),
+        (52, time),
+        (98, b"0"),
+        (108, b"30"),
+    ] {
+        logon.push(tag, value).unwrap();
+    }
+    session.receive(&logon, 0, time).unwrap();
+    let bytes = b"8=FIX.4.4\x019=56\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0158=\x0110=255\x01";
+    let mut stream = Stream::new(fix::Frames::default());
+    assert_eq!(stream.push(bytes), bytes.len());
+    let frame = stream.next().unwrap().unwrap();
+    assert_eq!(frame.as_ref().unwrap_err().reason(), 4);
+    let actions = session.receive_frame(&frame, 1, time).unwrap();
+    let fix::Action::Send(reject) = &actions[0] else {
+        panic!("expected Reject")
+    };
+    assert_eq!(reject.get(371), Some(b"58".as_slice()));
+    assert_eq!(reject.get(373), Some(b"4".as_slice()));
+    assert_eq!(session.next_inbound(), 3);
+    assert_eq!(stream.decoder().garbled(), 0);
+}
+
+#[test]
+fn copied_fast_uses_templates_and_the_public_driver() {
+    let templates = fast::Templates::from_xml(br#"<template xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Example" id="1"><uInt32 name="n"><increment value="1"/></uInt32></template>"#).unwrap();
+    let value = fast::Message {
+        template_id: 1,
+        fields: vec![fast::Value::UInt32(1)],
+    };
+    let mut bytes = Vec::new();
+    fast::Encoder::new(templates.clone())
+        .write(&value, &mut bytes)
+        .unwrap();
+    assert_eq!(bytes, [0xc0, 0x81]);
+    let mut stream = Stream::new(fast::Frames::new(templates.clone()));
+    assert_eq!(stream.push(&bytes), bytes.len());
+    assert_eq!(stream.next().unwrap().unwrap(), value);
+    assert_eq!(fast::UInt64::parse(&[0x81]).unwrap(), fast::UInt64(1));
+    let mut blocks = Stream::new(fast::BlockFrames::new(fast::Frames::new(
+        templates.clone(),
+    )));
+    assert_eq!(blocks.push(&[0, 0x82, 0xc0, 0x81]), 4);
+    assert_eq!(blocks.next().unwrap().unwrap(), value);
+    let mut split = Stream::new(fast::BlockFrames::new(fast::Frames::new(
+        templates,
+    )));
+    assert_eq!(split.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
+    assert!(matches!(
+        split.next(),
+        Some(Err(fictionet::stdlib::codec::Fail::Protocol(
+            fast::Error::BlockBoundary
+        )))
+    ));
+}
+
+#[test]
+fn copied_soupbintcp_frames_through_the_public_driver() {
+    // SoupBinTCP 3.00, 2.2.1: Login Accepted, then sequenced data.
+    let mut bytes = vec![0, 31, b'A'];
+    bytes.extend_from_slice(b"        S1                   7");
+    soupbintcp::Packet::SequencedData(b"msg".to_vec())
+        .write(&mut bytes)
+        .unwrap();
+    let mut client = soupbintcp::Client::new(
+        soupbintcp::Login {
+            username: soupbintcp::Alpha::right_padded("ALICE").unwrap(),
+            password: soupbintcp::Alpha::right_padded("SECRET").unwrap(),
+            session: soupbintcp::Alpha::blank(),
+            sequence: 1,
+        },
+        soupbintcp::Timers::default(),
+        0,
+    )
+    .unwrap();
+    client.start(0).unwrap();
+    let mut stream = Stream::new(soupbintcp::Frames::default());
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(5) {
+        pump(&mut stream, chunk, |frame| {
+            events.extend(client.receive_frame(&frame, 1).unwrap())
+        })
+        .unwrap();
+    }
+    finish(&mut stream, |_| unreachable!()).unwrap();
+    assert_eq!(
+        events.last(),
+        Some(&soupbintcp::Action::Event(soupbintcp::Event::Sequenced {
+            sequence: 7
+        }))
+    );
+    assert_eq!(client.next_sequence(), 8);
+}
+
+#[test]
+fn copied_moldudp64_recovers_a_gap() {
+    let session = moldudp64::Session::left_padded("S1").unwrap();
+    let mut server =
+        moldudp64::Retransmitter::new(session, 1, moldudp64::StoreConfig::default()).unwrap();
+    for m in [&b"a"[..], b"b", b"c"] {
+        server.push(m).unwrap();
+    }
+    let mut receiver = moldudp64::Receiver::new(moldudp64::ReceiverConfig::default()).unwrap();
+    receiver.receive(&server.packet(1, 1).unwrap(), 0).unwrap();
+    let bytes = server.packet(3, 1).unwrap().to_bytes().unwrap();
+    let live = <moldudp64::Downstream as Wire>::parse(&bytes).unwrap();
+    let actions = receiver.receive(&live, 1).unwrap();
+    let Some(moldudp64::Action::Send(request)) = actions.last() else {
+        panic!("expected a request")
+    };
+    let wire = request.to_bytes().unwrap();
+    let request = <moldudp64::Request as Wire>::parse(&wire).unwrap();
+    let answer = server.answer(&request).unwrap();
+    receiver.receive(&answer, 2).unwrap();
+    assert_eq!(receiver.expected(), Some(4));
+    let mut blocks = Stream::new(moldudp64::Blocks);
+    let mut messages = Vec::new();
+    pump(&mut blocks, &bytes[moldudp64::HEADER_LENGTH..], |m| {
+        messages.push(m)
+    })
+    .unwrap();
+    finish(&mut blocks, |m| messages.push(m)).unwrap();
+    assert_eq!(messages, [b"c".to_vec()]);
 }

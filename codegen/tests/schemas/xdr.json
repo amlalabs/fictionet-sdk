@@ -1,0 +1,76 @@
+{
+  "types": [
+    {
+      "name": "Choice",
+      "kind": "enum",
+      "repr": "i32",
+      "variants": [
+        {
+          "name": "negative",
+          "value": -1
+        },
+        {
+          "name": "zero",
+          "value": 0
+        },
+        {
+          "name": "positive",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "Record",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "unsigned",
+          "type": "u32"
+        },
+        {
+          "name": "signed",
+          "type": "i32"
+        },
+        {
+          "name": "wide",
+          "type": "u64"
+        },
+        {
+          "name": "negative",
+          "type": "i64"
+        },
+        {
+          "name": "choice",
+          "type": {
+            "kind": "ref",
+            "name": "Choice"
+          }
+        },
+        {
+          "name": "opaque",
+          "type": {
+            "kind": "bytes",
+            "size": 4
+          }
+        },
+        {
+          "name": "entries",
+          "type": {
+            "kind": "group",
+            "item": "u32",
+            "count": "u32",
+            "limit": 8
+          }
+        },
+        {
+          "name": "maybe",
+          "type": {
+            "kind": "optional",
+            "item": "u64",
+            "flag": "u32"
+          }
+        }
+      ]
+    }
+  ]
+}

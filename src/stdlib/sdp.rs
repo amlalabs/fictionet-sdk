@@ -2481,7 +2481,7 @@ mod tests {
         const ALPHABET: &[u8] = b" =:/\r\n\0\xff0aZ-";
         let mut rng = Lcg::new(0x5d9);
         let lines: Vec<&[u8]> = EVERY_LINE.split_inclusive(|&b| b == b'\n').collect();
-        for round in 0..4000 {
+        for round in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
             let mut b: Vec<u8> = match round % 3 {
                 // Random bytes.
                 0 => rng.bytes(199),
@@ -2513,7 +2513,7 @@ mod tests {
         let words =
             ["a", "IN", "IP4", "x y", "", "0", "rtp:map", "-", "\u{e9}", "a\r", "/", "RTP/AVP", "\0", "96 opus/48000"];
         let mut written = 0;
-        for _ in 0..3000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(750) {
             let mut d = sample();
             for _ in 0..rng.index(4) {
                 let w = words[rng.index(words.len())].to_string();

@@ -508,7 +508,7 @@ fn lines_crlf_policy_limits_and_partial_eof() {
 }
 #[test]
 fn lines_partition_invariance_and_scan_cursor() {
-    for ending in [Ending::Crlf, Ending::LfOrCrlf] {
+    for ending in [Ending::Crlf, Ending::LfOrCrlf, Ending::LfOrCrOrCrlf] {
         for data in [
             &b"abc\r\nx\n\n123456789\r\nok\r\npartial"[..],
             b"abcd\n",
@@ -528,6 +528,49 @@ fn lines_partition_invariance_and_scan_cursor() {
     assert!(s.next().is_none());
     assert_eq!(s.push(b"\n"), 1);
     assert_eq!(s.next(), Some(Ok(Ok(b"abc".to_vec()))));
+}
+#[test]
+fn lines_cr_lf_and_crlf() {
+    let ending = Ending::LfOrCrOrCrlf;
+    assert_eq!(
+        read_lines(b"a\rb\nc\r\n\r\n\rx\r", 1, ending),
+        vec![
+            Ok(b"a".to_vec()),
+            Ok(b"b".to_vec()),
+            Ok(b"c".to_vec()),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(b"x".to_vec())
+        ]
+    );
+    for max in 0..=4 {
+        for data in [
+            &b"ab\r\nx\ry\n\r\r\nlast"[..],
+            b"abcd\r\nx\r",
+            b"abcd\r",
+            b"abcdef\r\n\rx\n",
+            b"a\r\r\nb\r\nc\n",
+            b"\r",
+            b"\r\n",
+        ] {
+            contract::check_decode(|| Lines::new(max, ending), data);
+        }
+    }
+    assert_eq!(
+        read_lines(b"abcdef\r\nx\r", 1, ending),
+        vec![Err(LineError::TooLong { max: 1 }), Ok(b"x".to_vec())]
+    );
+    let mut stream = Stream::new(Lines::new(3, ending));
+    assert_eq!(stream.push(b"abc\r"), 4);
+    assert!(stream.next().is_none());
+    assert_eq!(stream.push(b"\n"), 1);
+    assert_eq!(stream.next(), Some(Ok(Ok(b"abc".to_vec()))));
+    assert_eq!(stream.offset(), 5);
+    assert_eq!(stream.push(b"x\r"), 2);
+    assert!(stream.next().is_none());
+    stream.end();
+    assert_eq!(stream.next(), Some(Ok(Ok(b"x".to_vec()))));
+    assert!(stream.next().is_none());
 }
 fn fragments(item: Vec<u8>) -> Fragment<Vec<u8>> {
     match item.first() {
@@ -751,6 +794,18 @@ fn spans_coarse_gaps_eviction_and_zero_retention() {
     overflow.push(usize::MAX, usize::MAX);
     assert!(overflow.outer_offset() > 0);
 }
+#[test]
+fn demux_accepts_a_local_borrowing_factory() {
+    let count = std::rc::Rc::new(core::cell::Cell::new(0));
+    let mut d = Demux::new(2, 4, |_: &u8| {
+        count.set(count.get() + 1);
+        Pairs
+    });
+    assert_eq!(d.push(&1, b"ab"), 2);
+    assert_eq!(d.next(), Some((1, Ok(b"ab".to_vec()))));
+    assert_eq!(count.get(), 1);
+}
+
 #[test]
 fn demux_limits_order_eof_remove_and_held_budget() {
     let mut d = Demux::new(2, 4, |_: &u8| Pairs);
@@ -1419,9 +1474,10 @@ fn regression_pipe_end_with_unpushed_payload() {
 
 #[test]
 fn regression_demux_visits_only_ready_streams() {
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
     struct Counted {
-        calls: Rc<Cell<usize>>,
-        held_calls: Rc<Cell<usize>>,
+        calls: Arc<AtomicUsize>,
+        held_calls: Arc<AtomicUsize>,
     }
     impl Decode for Counted {
         type Item = u8;
@@ -1431,16 +1487,16 @@ fn regression_demux_visits_only_ready_streams() {
             2
         }
         fn held(&self) -> usize {
-            self.held_calls.set(self.held_calls.get() + 1);
+            self.held_calls.fetch_add(1, Ordering::Relaxed);
             0
         }
         fn decode(&mut self, b: &[u8], eof: bool) -> Result<Step<u8>, Infallible> {
-            self.calls.set(self.calls.get() + 1);
+            self.calls.fetch_add(1, Ordering::Relaxed);
             Bytes.decode(b, eof)
         }
     }
-    let calls = Rc::new(Cell::new(0));
-    let held_calls = Rc::new(Cell::new(0));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let held_calls = Arc::new(AtomicUsize::new(0));
     let counters = (calls.clone(), held_calls.clone());
     let mut d = Demux::new(4096, 8192, move |_: &usize| Counted {
         calls: counters.0.clone(),
@@ -1450,19 +1506,19 @@ fn regression_demux_visits_only_ready_streams() {
         assert_eq!(d.push(&key, b""), 0);
     }
     assert!(d.next().is_none());
-    calls.set(0);
-    held_calls.set(0);
+    calls.store(0, Ordering::Relaxed);
+    held_calls.store(0, Ordering::Relaxed);
     for key in (0..4096).cycle().take(8192) {
         assert_eq!(d.push(&key, b"a"), 1);
         assert_eq!(d.next(), Some((key, Ok(b'a'))));
         assert!(d.next().is_none());
         assert_eq!(d.total(), 0);
     }
-    assert!(calls.get() <= 8192 * 2, "{} decode calls", calls.get());
+    assert!(calls.load(Ordering::Relaxed) <= 8192 * 2, "{} decode calls", calls.load(Ordering::Relaxed));
     assert!(
-        held_calls.get() <= 8192 * 12,
+        held_calls.load(Ordering::Relaxed) <= 8192 * 12,
         "{} held calls",
-        held_calls.get()
+        held_calls.load(Ordering::Relaxed)
     );
 }
 

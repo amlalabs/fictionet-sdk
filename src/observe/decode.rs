@@ -201,7 +201,7 @@ impl Decoded {
     }
 
     /// Bytes the detail still has room for.
-    pub(crate) fn room(&self) -> usize {
+    pub fn room(&self) -> usize {
         if self.cut > 0 { 0 } else { MAX_DETAIL - self.used }
     }
 
@@ -504,8 +504,9 @@ impl Dissector {
                     conversation.lost(reversed);
                 }
                 TcpEvent::Gap { resumed: false, .. } => gap = true,
-                // Presenters currently have no close hook. Keep their
-                // state until a SYN replaces the captured connection.
+                // Forwarding Protocol::end would end Observed streams, but
+                // reassembly still delivers captured payload after FIN or RST.
+                // Keep the conversation until a SYN replaces it.
                 TcpEvent::End { .. } => {}
             }
         }
@@ -822,6 +823,27 @@ mod tests {
         assert_eq!(first.info, "HTTP/1.1 200 OK");
         let second = dis.decode(&tcp_back(541, 0x18, b"HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n"), &[]);
         assert_eq!(second.info, "HTTP/1.1 404 Not Found");
+    }
+
+    #[test]
+    fn captured_payload_after_close_still_completes_http2_headers() {
+        for flags in [0x11, 0x14] {
+            let mut dis = Dissector::default();
+            let mut first = fictionet::stdlib::http2::PREFACE.to_vec();
+            first.extend(h2_frame(1, 0, 1, &[0x82]));
+            dis.decode(&tcp(40000, 80, 100, 2, b""), &[]);
+            dis.decode(&tcp(40000, 80, 101, 0x18, &first), &[]);
+            let end = 101 + first.len() as u32;
+            let close = dis.decode(&tcp(40000, 80, end, flags, b""), &[]);
+            assert!(!close.tags.contains(&"malformed"));
+            let next = end + u32::from(flags & 1 != 0);
+            let done = dis.decode(
+                &tcp(40000, 80, next, 0x18, &h2_frame(9, 4, 1, &[0x84])),
+                &[],
+            );
+            assert_eq!(done.info, "CONTINUATION[1]: GET /");
+            assert!(!done.tags.contains(&"malformed"));
+        }
     }
 
     /// Segments held across the point where sequence numbers wrap are

@@ -168,16 +168,23 @@ the codec tools. The file's `fictionet::stdlib::...` imports need no change.
 [`custom_protocol`](examples/custom_protocol) shows this with a Modbus register.
 Run it with `cargo run --example custom_protocol`; it needs no network or root.
 
-For header compression outside the web server, use the public
-[`stdlib::hpack`](src/stdlib/hpack.rs) block encoder and decoder for HTTP/2,
-or [`stdlib::qpack`](src/stdlib/qpack.rs) for HTTP/3. Both use
-[`stdlib::huffman`](src/stdlib/huffman.rs).
+For HTTP/2 outside the web server, use the public
+[`stdlib::http2`](src/stdlib/http2.rs) frame and connection codecs for HTTP/2,
+with the [`stdlib::hpack`](src/stdlib/hpack.rs) block encoder and decoder,
+or [`stdlib::qpack`](src/stdlib/qpack.rs) for HTTP/3 header compression. Both use
+[`stdlib::huffman`](src/stdlib/huffman.rs). HTTP/2 capture presentation uses the
+public observe adapter. gRPC messages use `stdlib::grpc::Messages` through
+`codec::Demux`, with one DATA budget across streams.
 
 To show your decoder in observe, implement `observe::Present` and register it
 with `observe::Registry`. Built-ins use the same registry. Match by port or
 first bytes, or select a name explicitly. Use `Dissector::with_registry` for
 capture packets, or `cx.observe_protocols` for live world watches. See
 [adding an observe protocol](docs/observe-protocols.md).
+
+[`stdlib::sse`](src/stdlib/sse.rs) reads server-sent events from streaming
+HTTP response bodies. It exposes raw fields and comments for proxies, joins
+dispatched events, and writes edited events for API mocks and MCP transports.
 
 ## Where sandboxes can run
 
@@ -213,6 +220,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
 | [`examples/border`](examples/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
 | [`examples/scan`](examples/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |
+| [`examples/goad`](examples/goad) | A private IPv4 LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
 | [`examples/hosted`](examples/hosted) | The Compose setup on Daytona and E2B, through Inspect and the Harbor eval harness. |
 
 ## Documentation
@@ -247,7 +255,8 @@ Start at the crate root, which explains the main ideas, then read in this order:
 
 ```console
 $ cargo build --all-targets --features tokio
-$ cargo test --features tokio
+$ cargo nextest run --workspace --features tokio
+$ cargo test --doc --workspace --features tokio
 $ cargo clippy --all-targets --features tokio
 ```
 

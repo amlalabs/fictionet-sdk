@@ -2666,7 +2666,7 @@ mod tests {
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5eed);
         let seeds = [hex(ACCESS_REQUEST), hex(ACCESS_ACCEPT), hex(CHAP_REQUEST), hex(CHALLENGE)];
-        for i in 0..11_000 {
+        for i in 0..fictionet::stdlib::codec::test_support::rounds(2750) {
             let mut data = if i % 3 == 0 {
                 // Random bytes behind a plausible header.
                 let n = 20 + rng.index(300);
