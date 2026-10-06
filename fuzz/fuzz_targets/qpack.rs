@@ -2,13 +2,71 @@
 #![no_main]
 
 use fictionet::stdlib::{
-    codec::{Wire, contract, test_support::decode_all},
+    codec::{Stream, Wire, contract, test_support::decode_all, try_pump},
     qpack::{
         self, DecoderInstruction, DecoderInstructions, EncoderInstruction, EncoderInstructions, FieldSection,
         HuffmanString, Integer, Representation, SectionResult, Table,
     },
 };
 use libfuzzer_sys::fuzz_target;
+
+/// Retains sections from two streams across a partial encoder instruction.
+fn blocked_sections(bytes: &[u8]) {
+    let Some((&split, rest)) = bytes.split_first() else { return };
+    let (instructions, sections) = rest.split_at(usize::from(split) * rest.len() / 255);
+    let (early, late) = instructions.split_at(instructions.len() / 2);
+    let mut table = Table::new(4096);
+    let mut input = Stream::new(EncoderInstructions::new());
+    let mut held = qpack::BlockedSections::new(2);
+    let mut sent = [Vec::new(), Vec::new()];
+    if try_pump(&mut input, early, |instruction| table.apply(instruction?)).is_ok() {
+        for (i, piece) in sections.chunks(sections.len().div_ceil(4).max(1)).enumerate() {
+            let k = i % 2;
+            match qpack::decode_section(&table, k as u64 * 4, piece) {
+                Ok(SectionResult::Blocked(section)) => {
+                    sent[k].push(section.clone());
+                    held.push(section).unwrap();
+                }
+                Ok(SectionResult::Fields { ack, .. }) => {
+                    if let Some(ack) = ack {
+                        contract::check_wire_value(&ack);
+                    }
+                }
+                Err(_) => break,
+            }
+            assert_eq!(held.len(), sent.iter().map(Vec::len).sum::<usize>());
+            assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
+        }
+        let mut taken = [0; 2];
+        if try_pump(&mut input, late, |instruction| table.apply(instruction?)).is_ok() {
+            while let Some((id, result)) = held.next_ready(&table) {
+                let k = match id {
+                    0 => 0,
+                    4 => 1,
+                    _ => panic!("released an unknown stream"),
+                };
+                assert!(taken[k] < sent[k].len());
+                assert_eq!(result, sent[k][taken[k]].clone().retry(&table));
+                assert!(!matches!(result, Ok(SectionResult::Blocked(_))));
+                if let Ok(SectionResult::Fields { ack: Some(ack), .. }) = result {
+                    contract::check_wire_value(&ack);
+                }
+                taken[k] += 1;
+                assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
+            }
+        }
+        let pending = [sent[0].len() - taken[0], sent[1].len() - taken[1]];
+        assert_eq!(held.len(), pending.iter().sum::<usize>());
+        for (k, id) in [0, 4].into_iter().enumerate() {
+            let before = held.len();
+            contract::check_wire_value(&held.cancel(&table, id).unwrap());
+            assert_eq!(held.len(), before - pending[k]);
+            assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
+        }
+        assert!(held.is_empty());
+        assert_eq!(held.buffered(), 0);
+    }
+}
 
 fuzz_target!(|input: &[u8]| {
     let bytes = &input[..input.len().min(16 << 10)];
@@ -21,6 +79,31 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire::<FieldSection>(bytes);
     contract::check_decode_with_alloc_limit(EncoderInstructions::new, bytes, 2 * qpack::MAX_INSTRUCTION);
     contract::check_decode_with_alloc_limit(DecoderInstructions::new, bytes, 2 * qpack::MAX_INTEGER_BYTES);
+
+    let integer = input.iter().take(8).fold(0u64, |n, b| (n << 8) | u64::from(*b));
+    let value = input[..input.len().min(qpack::MAX_STRING + 1)].to_vec();
+    for instruction in [
+        EncoderInstruction::SetCapacity(integer),
+        EncoderInstruction::Duplicate(integer),
+        EncoderInstruction::InsertWithNameRef { static_table: true, index: integer, value: value.clone() },
+        EncoderInstruction::InsertWithLiteralName { name: b"x-fuzz".to_vec(), value: value.clone() },
+    ] {
+        contract::check_wire_value(&instruction);
+    }
+    for instruction in [
+        DecoderInstruction::SectionAck(integer),
+        DecoderInstruction::StreamCancel(integer),
+        DecoderInstruction::InsertCountIncrement(integer),
+    ] {
+        contract::check_wire_value(&instruction);
+    }
+    contract::check_wire_value(&HuffmanString(value.clone()));
+    contract::check_wire_value(&Representation::LiteralName {
+        never_index: integer & 1 != 0,
+        name: b"x-fuzz".to_vec(),
+        value,
+    });
+    blocked_sections(bytes);
 
     let mut table = Table::new(4096);
     let (instructions, _) = decode_all(EncoderInstructions::new, bytes);
@@ -73,8 +156,14 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire_value(&instruction);
     receiving.apply(instruction).unwrap();
     encoder.apply_instruction(receiving.take_increment().unwrap()).unwrap();
-    let section = encoder.section(4, &[qpack::Field::new("x-fuzz", value)]).unwrap();
-    contract::check_wire_value(&section);
+    let (_, instruction) = encoder.insert(b"x-other", b"2").unwrap();
+    receiving.apply(instruction).unwrap();
+    encoder.apply_instruction(receiving.take_increment().unwrap()).unwrap();
+    for stream in [0, 4, 4] {
+        let section =
+            encoder.section(stream, &[qpack::Field::new("x-fuzz", value), qpack::Field::new("x-other", "2")]).unwrap();
+        contract::check_wire_value(&section);
+    }
     let (acks, _) = decode_all(DecoderInstructions::new, bytes);
     for ack in acks {
         if ack.and_then(|ack| encoder.apply_instruction(ack)).is_err() {

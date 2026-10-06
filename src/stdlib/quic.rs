@@ -21,7 +21,8 @@
 //! server reads a datagram with [`split_datagram`],
 //! reads each packet's frames with [`Payload`], and puts CRYPTO and
 //! STREAM data back in order with a [`Reassembler`]. It writes answers as
-//! [`Datagram`] values. The short-header connection-ID length is explicit.
+//! [`Datagram`] values. The short-header connection-ID length is `Datagram`'s
+//! const parameter and the `short_dcid_len` argument to [`split_datagram`].
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Every limit on what a reader keeps is a named constant.
@@ -1834,11 +1835,11 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::codec::{
         contract,
         test_support::{Lcg, mutate},
     };
+    use super::*;
 
     fn datagram(packets: &[Packet]) -> Result<Vec<u8>, Error> {
         let len = packets
@@ -1848,29 +1849,21 @@ mod tests {
                 _ => None,
             })
             .unwrap_or(0);
-        match len {
-            0 => Datagram::<0>(packets.to_vec()).to_bytes(),
-            1 => Datagram::<1>(packets.to_vec()).to_bytes(),
-            2 => Datagram::<2>(packets.to_vec()).to_bytes(),
-            3 => Datagram::<3>(packets.to_vec()).to_bytes(),
-            4 => Datagram::<4>(packets.to_vec()).to_bytes(),
-            5 => Datagram::<5>(packets.to_vec()).to_bytes(),
-            6 => Datagram::<6>(packets.to_vec()).to_bytes(),
-            7 => Datagram::<7>(packets.to_vec()).to_bytes(),
-            8 => Datagram::<8>(packets.to_vec()).to_bytes(),
-            9 => Datagram::<9>(packets.to_vec()).to_bytes(),
-            10 => Datagram::<10>(packets.to_vec()).to_bytes(),
-            11 => Datagram::<11>(packets.to_vec()).to_bytes(),
-            12 => Datagram::<12>(packets.to_vec()).to_bytes(),
-            13 => Datagram::<13>(packets.to_vec()).to_bytes(),
-            14 => Datagram::<14>(packets.to_vec()).to_bytes(),
-            15 => Datagram::<15>(packets.to_vec()).to_bytes(),
-            16 => Datagram::<16>(packets.to_vec()).to_bytes(),
-            17 => Datagram::<17>(packets.to_vec()).to_bytes(),
-            18 => Datagram::<18>(packets.to_vec()).to_bytes(),
-            19 => Datagram::<19>(packets.to_vec()).to_bytes(),
-            20 => Datagram::<20>(packets.to_vec()).to_bytes(),
-            _ => Err(Error::Unwritable),
+        macro_rules! dispatch {
+            ($($n:literal),* $(,)?) => {
+                match len {
+                    $($n => Datagram::<$n>(packets.to_vec()).to_bytes(),)*
+                    _ => Err(Error::Unwritable),
+                }
+            };
+        }
+        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
+    }
+
+    fn check_payload(bytes: &[u8]) {
+        contract::check_wire::<Payload>(bytes);
+        if let Ok(payload) = Payload::parse(bytes) {
+            assert!(payload.to_bytes().unwrap().len() <= bytes.len());
         }
     }
 
@@ -2462,9 +2455,7 @@ mod tests {
         // whatever it reads can be written.
         let zeros = vec![0; MAX_PAYLOAD + 1];
         assert_eq!(Frame::parse(&zeros), Err(Error::TooLong(MAX_PAYLOAD + 1)));
-        let f = Frame::parse(&zeros[..MAX_PAYLOAD]).unwrap();
-        let used = MAX_PAYLOAD;
-        assert_eq!((f.to_bytes().unwrap().len(), used), (MAX_PAYLOAD, MAX_PAYLOAD));
+        assert_eq!(Frame::parse(&zeros[..MAX_PAYLOAD]), Ok(Frame::Padding(MAX_PAYLOAD)));
         let mut crypto = hex("06007fff");
         crypto.resize(MAX_PAYLOAD + 1, 0);
         assert_eq!(Frame::parse(&crypto), Err(Error::TooLong(MAX_PAYLOAD + 1)));
@@ -2856,6 +2847,30 @@ mod tests {
     }
 
     #[test]
+    fn split_datagram_keeps_packets_before_a_truncated_tail() {
+        let payload = Payload(vec![Frame::Ping, Frame::Padding(3)]);
+        let packet = Packet::Handshake {
+            version: VERSION_1,
+            dcid: vec![],
+            scid: vec![],
+            number: PacketNumber { value: 0, len: 1 },
+            payload: payload.to_bytes().unwrap(),
+        };
+        let prefix = Datagram::<0>(vec![packet.clone(), packet.clone()]);
+        let mut bytes = prefix.to_bytes().unwrap();
+        bytes.push(0xc0);
+        assert_eq!(Datagram::<0>::parse(&bytes), Err(Error::Truncated));
+        let (packets, error) = split_datagram(&bytes, 0);
+        assert_eq!(error, Some(Error::Truncated));
+        assert_eq!(packets, prefix.0);
+        contract::check_wire_value(&Datagram::<0>(packets.clone()));
+        for packet in packets {
+            assert_eq!(Payload::parse(packet.payload().unwrap()), Ok(payload.clone()));
+            contract::check_wire_value(&Datagram::<0>(vec![packet]));
+        }
+    }
+
+    #[test]
     fn generated_wire_contracts_and_reassembly() {
         let mut rng = Lcg::new(0x5155_4943);
         let seeds: Vec<_> = sample_packets()
@@ -2868,13 +2883,27 @@ mod tests {
             mutate(&mut rng, &mut bytes);
             contract::check_wire::<VarInt>(&bytes);
             contract::check_wire::<Frame>(&bytes);
-            contract::check_wire::<Payload>(&bytes);
+            check_payload(&bytes);
             contract::check_wire::<Datagram<0>>(&bytes);
             contract::check_wire::<Datagram<8>>(&bytes);
-            let (packets, _) = split_datagram(&bytes, 8);
-            if !packets.is_empty() {
-                let wire = Datagram::<8>(packets.clone()).to_bytes().unwrap();
-                assert_eq!(split_datagram(&wire, 8), (packets, None));
+            for dcid_len in 0..=20 {
+                let (packets, _) = split_datagram(&bytes, dcid_len);
+                if !packets.is_empty() {
+                    let wire = datagram(&packets).unwrap();
+                    assert_eq!(split_datagram(&wire, dcid_len), (packets.clone(), None));
+                }
+                for packet in packets {
+                    if let Some(payload) = packet.payload() {
+                        check_payload(payload);
+                    }
+                }
+            }
+            if round % 10 == 1 {
+                let mut last = None;
+                for cut in 0..=bytes.len() {
+                    last = Some((Packet::parse(&bytes[..cut], 8), Payload::parse(&bytes[..cut])));
+                }
+                assert_eq!(last, Some((Packet::parse(&bytes, 8), Payload::parse(&bytes))));
             }
             if round % 50 == 0 {
                 let mut reassembler = Reassembler::new();

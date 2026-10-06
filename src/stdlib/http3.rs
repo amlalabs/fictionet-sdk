@@ -437,7 +437,6 @@ impl Frame {
         };
         Ok(frame)
     }
-
 }
 
 /// The prefix of a unidirectional stream. Unknown and reserved types must be
@@ -471,7 +470,6 @@ impl StreamHeader {
         };
         Ok(Some((header, used)))
     }
-
 }
 
 /// Recognized Priority dictionary members. Missing or ignored members stay
@@ -499,6 +497,7 @@ impl Wire for Priority {
 
     /// Reads an RFC 8941 dictionary. Refuses invalid syntax and size or member limits.
     /// Unknown members and invalid member values are ignored. The last duplicate wins.
+    /// Canonical writing keeps only `u` and `i`, dropping unknown members and parameters.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         if bytes.len() > MAX_PRIORITY_BYTES {
             return Err(Error::Limit);
@@ -2170,6 +2169,8 @@ impl Connection {
     }
     /// Marks EOF on an existing stream. Partial request/push units report
     /// truncation; any control or QPACK stream FIN is ClosedCriticalStream.
+    /// A unidirectional stream closed inside its type prefix ends with
+    /// [`codec::Fail::Truncated`], which is not a connection error; the caller discards the stream.
     /// On a paused stream, records EOF for [`Self::unpause`] without decoding.
     pub fn end(&mut self, stream: u64) {
         if let Some(saved) = self.paused.get_mut(&stream) {
@@ -2222,11 +2223,11 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::codec::{
         contract, Fail, Stream,
         test_support::{decode_all, Lcg, mutate},
     };
+    use super::*;
 
     fn event(state: &mut RequestState, frame: Frame, table: &qpack::Table) -> Result<Event, Error> {
         match state.step(&frame, table)? {

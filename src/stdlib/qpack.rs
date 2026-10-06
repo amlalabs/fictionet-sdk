@@ -624,30 +624,43 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
 /// The dynamic table: entries inserted in order, each with an absolute
 /// index counting from 0, the oldest evicted first when room is needed.
 /// Both sides of a connection keep one, and keep it the same.
+///
+/// Byte decoders do not borrow or modify it. The receiver applies one
+/// instruction between items and lends the table to [`decode_section`].
+/// Blocked sections and output bytes stay with the caller. The encoding
+/// role uses [`Encoder`] to protect entries awaiting acknowledgment.
+/// Section decoding borrows `&Table`: entries are read-only, while a
+/// [`core::cell::Cell`] tracks reported inserts. This makes the table `!Sync`.
+/// Send every returned Section Ack, even if its stream is reset and a Stream
+/// Cancel is also sent. Decoding already counts the ack as reported; dropping
+/// it would make later [`Table::take_increment`] values too small.
+/// Send acknowledgments in return order before taking an increment.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DynamicTable {
+pub struct Table {
     entries: VecDeque<(Vec<u8>, Vec<u8>)>,
     size: u64,
     capacity: u64,
     max_capacity: u64,
     advertised: u64,
     inserted: u64,
+    reported: core::cell::Cell<u64>,
 }
 
-impl DynamicTable {
+impl Table {
     /// An empty table with capacity 0, for a decoder that advertised
     /// `max_capacity` as its SETTINGS_QPACK_MAX_TABLE_CAPACITY. The
     /// capacity may grow to `max_capacity` lowered to
     /// [`MAX_TABLE_CAPACITY`]; Required Insert Counts are encoded with
     /// `max_capacity` as advertised.
-    pub fn new(max_capacity: u64) -> DynamicTable {
-        DynamicTable {
+    pub fn new(max_capacity: u64) -> Table {
+        Table {
             entries: VecDeque::new(),
             size: 0,
             capacity: 0,
             max_capacity: max_capacity.min(MAX_TABLE_CAPACITY),
             advertised: max_capacity,
             inserted: 0,
+            reported: core::cell::Cell::new(0),
         }
     }
 
@@ -751,6 +764,42 @@ impl DynamicTable {
         Ok(index)
     }
 
+    /// Applies one encoder instruction between decoded items.
+    /// Errors leave the table unchanged. Application errors are session
+    /// decisions; the instruction decoder only establishes its boundary.
+    pub fn apply(&mut self, instruction: EncoderInstruction) -> Result<(), Error> {
+        check_encoder_instruction(&instruction)?;
+        let (name, value) = match instruction {
+            EncoderInstruction::SetCapacity(n) => return self.set_capacity(n),
+            EncoderInstruction::InsertWithLiteralName { name, value } => (name, value),
+            EncoderInstruction::InsertWithNameRef { static_table: true, index, value } => {
+                let (name, _) = static_entry(index).ok_or(Error::StaticIndex(index))?;
+                (name.as_bytes().to_vec(), value)
+            }
+            EncoderInstruction::InsertWithNameRef { static_table: false, index, value } => {
+                let (name, _) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
+                (name.to_vec(), value)
+            }
+            EncoderInstruction::Duplicate(index) => {
+                let (name, value) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
+                (name.to_vec(), value.to_vec())
+            }
+        };
+        self.insert(name, value)?;
+        Ok(())
+    }
+    /// Takes an Insert Count Increment for received inserts not yet reported.
+    /// Section acknowledgments returned by [`decode_section`] or
+    /// [`BlockedSection::retry`] already report their Required Insert Counts.
+    /// Send those values first, then this value, on the decoder stream.
+    /// No bytes are queued; a second call without new inserts returns `None`.
+    pub fn take_increment(&mut self) -> Option<DecoderInstruction> {
+        let count = self.insert_count();
+        let increment = count.saturating_sub(self.reported.get());
+        self.reported.set(count);
+        (increment != 0).then_some(DecoderInstruction::InsertCountIncrement(increment))
+    }
+
     fn evict_to(&mut self, room: u64) {
         while self.size > room {
             match self.entries.pop_front() {
@@ -837,8 +886,6 @@ impl EncoderInstruction {
             Err(Stop::Bad(e)) => Err(e),
         }
     }
-
-
 }
 
 /// An instruction on the decoder stream, which tells the encoder what the
@@ -878,8 +925,6 @@ impl DecoderInstruction {
             Err(Stop::Bad(e)) => Err(e),
         }
     }
-
-
 }
 
 // ---------------------------------------------------------------------
@@ -1157,11 +1202,10 @@ impl Representation {
             Err(Stop::Bad(e)) => Err(e),
         }
     }
-
 }
 
 /// Decodes the field lines after a section's prefix.
-fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u64) -> Result<Vec<Field>, Error> {
+fn decode_fields(table: &Table, prefix: SectionPrefix, b: &[u8], limit: u64) -> Result<Vec<Field>, Error> {
     let SectionPrefix { required_insert_count: required, base } = prefix;
     let mut fields = Vec::new();
     let mut size = 0u64;
@@ -1170,7 +1214,7 @@ fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u
     // The entry at absolute index `abs`, which must be below the Required
     // Insert Count; `sent` is the index as the field line gave it.
     fn lookup<'t>(
-        table: &'t DynamicTable,
+        table: &'t Table,
         required: u64,
         largest: &mut Option<u64>,
         abs: Option<u64>,
@@ -1240,7 +1284,7 @@ struct Outstanding {
 /// which entries it may use and evict.
 #[derive(Clone, Debug)]
 pub struct Encoder {
-    table: DynamicTable,
+    table: Table,
     field_limit: u64,
     known_received: u64,
     outstanding: VecDeque<Outstanding>,
@@ -1254,7 +1298,7 @@ impl Encoder {
     /// capacity as advertised. The table starts with capacity 0.
     pub fn new(max_table_capacity: u64, max_field_section_size: u64) -> Encoder {
         Encoder {
-            table: DynamicTable::new(max_table_capacity),
+            table: Table::new(max_table_capacity),
             field_limit: max_field_section_size.min(MAX_FIELD_SECTION_SIZE),
             known_received: 0,
             outstanding: VecDeque::new(),
@@ -1262,7 +1306,7 @@ impl Encoder {
     }
 
     /// The dynamic table as the encoder has built it.
-    pub fn table(&self) -> &DynamicTable {
+    pub fn table(&self) -> &Table {
         &self.table
     }
 
@@ -1346,7 +1390,8 @@ impl Encoder {
     /// literal. A section past the peer's field section size limit is
     /// [`Error::FieldSectionTooLarge`], one with more than [`MAX_FIELDS`]
     /// fields [`Error::TooManyFields`], and a name or value longer than
-    /// [`MAX_STRING`] [`Error::StringTooLong`].
+    /// [`MAX_STRING`] [`Error::StringTooLong`]. A stream above [`MAX_INTEGER`]
+    /// is refused with [`Error::Unwritable`].
     pub fn section(&mut self, stream: u64, fields: &[Field]) -> Result<FieldSection, Error> {
         if stream > MAX_INTEGER {
             return Err(Error::Unwritable);
@@ -1747,119 +1792,6 @@ impl Wire for Representation {
     }
 }
 
-/// The decoder role's bounded dynamic table and reported insert count.
-///
-/// Byte decoders do not borrow or modify it. The caller applies one
-/// instruction between items and lends the table to [`decode_section`].
-/// There are no blocked sections or output bytes hidden in this type.
-/// Every method serves the receiving (decoder) role. The encoding role uses
-/// [`Encoder`], including [`Encoder::apply_instruction`] for peer acknowledgments.
-/// Section decoding deliberately borrows `&Table`, matching the codec design's
-/// shared session state: entries are read-only, while a [`core::cell::Cell`]
-/// tracks reported inserts. This makes the table `!Sync`.
-/// Every returned Section Ack must be sent, even if its stream is reset and
-/// a Stream Cancel is also sent. Decoding already counts the ack as reported;
-/// dropping it would make later [`Table::take_increment`] values too small.
-/// Send acknowledgments in return order before taking an increment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Table {
-    dynamic: DynamicTable,
-    reported: core::cell::Cell<u64>,
-}
-
-impl Table {
-    /// Creates a zero-capacity table. Storage is capped by
-    /// [`MAX_TABLE_CAPACITY`]; insert-count wrapping uses the advertised
-    /// `max_capacity`, as it does in [`DynamicTable::new`].
-    pub fn new(max_capacity: u64) -> Self {
-        Self { dynamic: DynamicTable::new(max_capacity), reported: core::cell::Cell::new(0) }
-    }
-    /// The maximum allowed capacity, capped by [`MAX_TABLE_CAPACITY`].
-    pub fn max_capacity(&self) -> u64 {
-        self.dynamic.max_capacity()
-    }
-    /// The current entry-size limit.
-    pub fn capacity(&self) -> u64 {
-        self.dynamic.capacity()
-    }
-    /// Stored name and value bytes plus [`ENTRY_OVERHEAD`] per entry.
-    pub fn size(&self) -> u64 {
-        self.dynamic.size()
-    }
-    /// The number of live entries.
-    pub fn len(&self) -> usize {
-        self.dynamic.len()
-    }
-    /// Whether no entries are live.
-    pub fn is_empty(&self) -> bool {
-        self.dynamic.is_empty()
-    }
-    /// The total number of inserts, including entries since evicted.
-    pub fn insert_count(&self) -> u64 {
-        self.dynamic.insert_count()
-    }
-    /// The advertised maximum entries used to wrap Required Insert Counts.
-    pub fn max_entries(&self) -> u64 {
-        self.dynamic.max_entries()
-    }
-    /// The absolute index of the oldest live entry.
-    pub fn first_index(&self) -> u64 {
-        self.dynamic.first_index()
-    }
-    /// Looks up a live entry by absolute index.
-    pub fn get(&self, index: u64) -> Option<(&[u8], &[u8])> {
-        self.dynamic.get(index)
-    }
-    /// Looks up a relative index, with zero naming the newest entry.
-    pub fn get_relative(&self, index: u64) -> Option<(&[u8], &[u8])> {
-        self.dynamic.get_relative(index)
-    }
-    /// Changes capacity and evicts oldest entries until they fit.
-    /// An excessive capacity leaves the table unchanged.
-    pub fn set_capacity(&mut self, capacity: u64) -> Result<(), Error> {
-        self.dynamic.set_capacity(capacity)
-    }
-    /// Inserts bounded strings and returns the new absolute index.
-    /// Evicts oldest entries as needed. Errors leave the table unchanged.
-    pub fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) -> Result<u64, Error> {
-        self.dynamic.insert(name, value)
-    }
-    /// Applies one encoder instruction between decoded items.
-    /// Errors leave the table unchanged. Application errors are session
-    /// decisions; the instruction decoder only establishes its boundary.
-    pub fn apply(&mut self, instruction: EncoderInstruction) -> Result<(), Error> {
-        check_encoder_instruction(&instruction)?;
-        let (name, value) = match instruction {
-            EncoderInstruction::SetCapacity(n) => return self.set_capacity(n),
-            EncoderInstruction::InsertWithLiteralName { name, value } => (name, value),
-            EncoderInstruction::InsertWithNameRef { static_table: true, index, value } => {
-                let (name, _) = static_entry(index).ok_or(Error::StaticIndex(index))?;
-                (name.as_bytes().to_vec(), value)
-            }
-            EncoderInstruction::InsertWithNameRef { static_table: false, index, value } => {
-                let (name, _) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
-                (name.to_vec(), value)
-            }
-            EncoderInstruction::Duplicate(index) => {
-                let (name, value) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
-                (name.to_vec(), value.to_vec())
-            }
-        };
-        self.insert(name, value)?;
-        Ok(())
-    }
-    /// Takes an Insert Count Increment for received inserts not yet reported.
-    /// Section acknowledgments returned by [`decode_section`] or
-    /// [`BlockedSection::retry`] already report their Required Insert Counts.
-    /// Send those values first, then this value, on the decoder stream.
-    /// No bytes are queued; a second call without new inserts returns `None`.
-    pub fn take_increment(&mut self) -> Option<DecoderInstruction> {
-        let count = self.insert_count();
-        let increment = count.saturating_sub(self.reported.get());
-        self.reported.set(count);
-        (increment != 0).then_some(DecoderInstruction::InsertCountIncrement(increment))
-    }
-}
 
 /// The value produced by [`decode_section`]. No result is queued internally.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1920,7 +1852,7 @@ fn section_fields(
     body: &[u8],
     limit: u64,
 ) -> Result<SectionResult, Error> {
-    let fields = decode_fields(&table.dynamic, prefix, body, limit)?;
+    let fields = decode_fields(table, prefix, body, limit)?;
     let ack = (prefix.required_insert_count != 0).then_some(DecoderInstruction::SectionAck(stream));
     table.reported.set(table.reported.get().max(prefix.required_insert_count));
     Ok(SectionResult::Fields { fields, ack })
@@ -2056,11 +1988,11 @@ impl BlockedSections {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::codec::{
         contract,
         test_support::{decode_all, Lcg, mutate},
     };
+    use super::*;
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
         let (items, error) = decode_all(EncoderInstructions::new, bytes);
@@ -2373,7 +2305,7 @@ mod tests {
 
     #[test]
     fn dynamic_table_capacity_and_eviction() {
-        let mut t = DynamicTable::new(100);
+        let mut t = Table::new(100);
         assert_eq!(t.max_entries(), 3);
         assert_eq!(t.insert(b"a".to_vec(), b"b".to_vec()), Err(Error::EntryTooLarge));
         assert_eq!(t.set_capacity(101), Err(Error::Capacity(101)));
@@ -2398,7 +2330,7 @@ mod tests {
         assert_eq!(t.insert_count(), 4);
         t.set_capacity(0).unwrap();
         assert!(t.is_empty());
-        assert_eq!(DynamicTable::new(u64::MAX).max_capacity(), MAX_TABLE_CAPACITY);
+        assert_eq!(Table::new(u64::MAX).max_capacity(), MAX_TABLE_CAPACITY);
     }
 
     #[test]
@@ -2460,6 +2392,9 @@ mod tests {
         e.set_capacity(100).unwrap();
         assert_eq!(e.insert(b"x-a", b"1").map(|v| v.0), Ok(0));
         assert_eq!(e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)), Ok(()));
+        assert_eq!(e.section(MAX_INTEGER + 1, &[Field::new("x-a", "1")]), Err(Error::Unwritable));
+        assert!(e.outstanding.is_empty());
+        assert_eq!(e.table().insert_count(), 1);
         let section = e.section(4, &[Field::new("x-a", "1")]).unwrap();
         assert_eq!(section.to_bytes().unwrap(), [0x02, 0x00, 0x80]);
         // Entry 0 is in use until stream 4's section is acknowledged.
@@ -2482,6 +2417,34 @@ mod tests {
         );
         assert_eq!(small.section(0, &vec![Field::new("a", ""); MAX_FIELDS + 1]), Err(Error::TooManyFields));
         assert_eq!(small.section(0, &[Field::new(vec![0; MAX_STRING + 1], "")]), Err(Error::StringTooLong));
+    }
+
+    #[test]
+    fn encoder_releases_each_streams_sections_in_order() {
+        let mut encoder = Encoder::new(4096, MAX_FIELD_SECTION_SIZE);
+        encoder.set_capacity(4096).unwrap();
+        encoder.insert(b"x-a", b"1").unwrap();
+        encoder.insert(b"x-b", b"2").unwrap();
+        encoder.apply_instruction(DecoderInstruction::InsertCountIncrement(2)).unwrap();
+        for (stream, name, value) in [(0, "x-a", "1"), (4, "x-a", "1"), (4, "x-b", "2")] {
+            let section = encoder.section(stream, &[Field::new(name, value)]).unwrap();
+            contract::check_wire_value(&section);
+        }
+        assert_eq!(encoder.set_capacity(36), Err(Error::Referenced));
+        let mut bytes = Vec::new();
+        for stream in [0, 4, 4] {
+            DecoderInstruction::SectionAck(stream).write(&mut bytes).unwrap();
+        }
+        let (instructions, failure) = decode_all(DecoderInstructions::new, &bytes);
+        assert_eq!(failure, None);
+        assert_eq!(instructions.len(), 3);
+        for (i, instruction) in instructions.into_iter().enumerate() {
+            encoder.apply_instruction(instruction.unwrap()).unwrap();
+            let expected = if i == 0 { Err(Error::Referenced) } else { Ok(EncoderInstruction::SetCapacity(36)) };
+            assert_eq!(encoder.set_capacity(36), expected);
+        }
+        assert_eq!(encoder.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
+        assert_eq!(encoder.apply_instruction(DecoderInstruction::SectionAck(4)), Err(Error::UnknownStream(4)));
     }
 
     #[test]
@@ -2541,9 +2504,14 @@ mod tests {
             let mut instructions = Vec::new();
             let mut acknowledgments = Vec::new();
             for step in 0..1600 {
-                let field = Field::new(names[rng.index(names.len())], format!("v{}", rng.index(8)));
+                let field = |rng: &mut Lcg| {
+                    let name = names[rng.index(names.len())];
+                    let value = format!("v{}", rng.index(8)).repeat(rng.index(6) + 1);
+                    Field { name: name.as_bytes().to_vec(), value: value.into_bytes(), never_index: rng.index(10) == 0 }
+                };
+                let insert = field(&mut rng);
                 if rng.coin() {
-                    if let Ok((_, ins)) = encoder.insert(&field.name, &field.value) {
+                    if let Ok((_, ins)) = encoder.insert(&insert.name, &insert.value) {
                         instructions.push(ins);
                     }
                 } else if !encoder.table().is_empty() {
@@ -2558,14 +2526,15 @@ mod tests {
                     }
                 }
                 let stream = step * 4;
-                let section = encoder.section(stream, std::slice::from_ref(&field)).unwrap();
+                let list: Vec<_> = (0..rng.index(6)).map(|_| field(&mut rng)).collect();
+                let section = encoder.section(stream, &list).unwrap();
                 dynamic_sections += usize::from(section.prefix.encoded_insert_count != 0);
                 let SectionResult::Fields { fields, ack } =
                     decode_section(&table, stream, &section.to_bytes().unwrap()).unwrap()
                 else {
                     panic!("blocked")
                 };
-                assert_eq!(fields, [field]);
+                assert_eq!(fields, list);
                 acknowledgments.extend(ack);
                 if rng.coin() {
                     acknowledgments.push(DecoderInstruction::StreamCancel(stream));
@@ -2580,7 +2549,10 @@ mod tests {
             for ins in instructions {
                 table.apply(ins).unwrap();
             }
-            assert_eq!(&table.dynamic, encoder.table());
+            assert_eq!(table.entries, encoder.table().entries);
+            assert_eq!(table.capacity(), encoder.table().capacity());
+            assert_eq!(table.size(), encoder.table().size());
+            assert_eq!(table.insert_count(), encoder.table().insert_count());
         }
         assert!(dynamic_sections > 100, "{dynamic_sections}");
     }
@@ -2629,6 +2601,15 @@ mod tests {
                 assert!(fields.iter().map(Field::size).sum::<u64>() <= 1 << 14);
             }
             contract::check_decode_with_alloc_limit(EncoderInstructions::new, &data, 2 * MAX_INSTRUCTION);
+            let mut changed = table.clone();
+            let (instructions, _) = decode_all(EncoderInstructions::new, &data);
+            for instruction in instructions {
+                if instruction.and_then(|instruction| changed.apply(instruction)).is_err() {
+                    break;
+                }
+                assert!(changed.size() <= changed.capacity());
+                assert!(changed.capacity() <= changed.max_capacity());
+            }
         }
     }
 
@@ -2796,6 +2777,7 @@ mod tests {
     #[test]
     fn huffman_writer_refuses_truncation() {
         let long = HuffmanString(vec![b'0'; MAX_STRING + 1]);
+        contract::check_wire_value(&long);
         assert_eq!(long.to_bytes(), Err(Error::Unwritable));
         contract::check_wire_value(&HuffmanString(vec![b'0'; MAX_STRING]));
     }

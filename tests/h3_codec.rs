@@ -271,8 +271,65 @@ fn request_blocked_value_resumes_after_table_update() {
 }
 
 #[test]
+fn two_request_states_resume_in_qpack_release_order() {
+    use http3::{Event, MessageSide, RequestResult, RequestState};
+    let mut table = Table::new(4096);
+    table.set_capacity(4096).unwrap();
+    let mut held = qpack::BlockedSections::new(2);
+    let mut states = [
+        RequestState::new(0, MessageSide::Request, false).unwrap(),
+        RequestState::new(4, MessageSide::Request, false).unwrap(),
+    ];
+    let mut connection = Connection::new(Endpoint::Client, 2, 2 * http3::MAX_FRAME);
+    for (id, required) in [(0, 2), (4, 1)] {
+        let mut reps: Vec<_> = received_request(&[])
+            .into_iter()
+            .map(|field| Rep::LiteralName { never_index: field.never_index, name: field.name, value: field.value })
+            .collect();
+        reps.push(Rep::Indexed { static_table: false, index: 0 });
+        let mut bytes = wire(&Frame::Headers(section(required, required, table.max_entries(), &reps)));
+        Frame::Data(vec![id as u8]).write(&mut bytes).unwrap();
+        assert_eq!(connection.push(id, &bytes), bytes.len());
+        connection.end(id);
+    }
+    for _ in 0..2 {
+        let (id, item) = connection.next().unwrap();
+        let StreamItem::Frame(frame) = item.unwrap().unwrap() else { panic!("expected HEADERS") };
+        let state = states.iter_mut().find(|state| state.stream_id() == id).unwrap();
+        let RequestResult::Blocked(section) = state.step(&frame, &table).unwrap() else { panic!("must block") };
+        held.push(section).unwrap();
+        connection.pause(id);
+    }
+    assert!(connection.next().is_none());
+    for (expected_id, value) in [(4, "first"), (0, "second")] {
+        table.apply(EI::InsertWithLiteralName { name: b"x-order".to_vec(), value: value.as_bytes().to_vec() }).unwrap();
+        let (id, result) = held.next_ready(&table).unwrap();
+        assert_eq!(id, expected_id);
+        let state = states.iter_mut().find(|state| state.stream_id() == id).unwrap();
+        assert!(state.is_blocked());
+        let mut fields = received_request(&[]);
+        fields.push(Field::new("x-order", value));
+        assert_eq!(
+            state.resume(id, result),
+            Ok(RequestResult::Event {
+                event: Ok(Event::Headers(http3::HeaderList { fields })),
+                ack: Some(DI::SectionAck(id))
+            })
+        );
+        connection.unpause(id);
+        assert_eq!(connection.next(), Some((id, Ok(Ok(StreamItem::Frame(Frame::Data(vec![id as u8])))))));
+        assert!(connection.next().is_none());
+        assert!(held.next_ready(&table).is_none());
+        assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
+        assert_eq!(state.finish(), Ok(()));
+    }
+    assert!(held.is_empty());
+    assert_eq!(held.buffered(), 0);
+}
+
+#[test]
 fn request_state_checks_message_sequences() {
-    use http3::{MessageSide as Side, RequestResult};
+    use http3::{Error, MessageSide as Side, RequestResult, frame_type as t};
     let request = literal_headers(&received_request(&["5, 5"]));
     let response = |status| literal_headers(&[Field::new(":status", status)]);
     let length_response = |status| literal_headers(&[Field::new(":status", status), Field::new("content-length", "5")]);
@@ -282,32 +339,68 @@ fn request_state_checks_message_sequences() {
     let Frame::Headers(promised) = literal_headers(&received_request(&[])) else { unreachable!() };
     let promise = Frame::PushPromise { push_id: 0, field_section: promised };
     let connect = literal_headers(&[Field::new(":method", "CONNECT"), Field::new(":authority", "a.example:443")]);
-    for (case, (side, push, frames)) in [
-        (Side::Request, false, vec![]),
-        (Side::Request, false, vec![data.clone()]),
-        (Side::Request, false, vec![unknown.clone(), request.clone(), data.clone(), trailers.clone()]),
-        (Side::Request, false, vec![request.clone(), Frame::Data(vec![0; 6])]),
-        (Side::Request, false, vec![request.clone(), Frame::Data(vec![0; 3])]),
-        (Side::Request, false, vec![request.clone(), data.clone(), trailers.clone(), data.clone()]),
-        (Side::Request, false, vec![request.clone(), data.clone(), trailers.clone(), trailers.clone()]),
-        (Side::Request, false, vec![promise.clone()]),
-        (Side::Request, false, vec![connect.clone(), data.clone()]),
-        (Side::Request, false, vec![connect, request]),
-        (Side::Response, false, vec![response("103")]),
+    for (case, (side, push, frames, expected)) in [
+        (Side::Request, false, vec![], Err(Error::Incomplete)),
+        (Side::Request, false, vec![data.clone()], Err(Error::UnexpectedFrame(t::DATA))),
+        (Side::Request, false, vec![unknown.clone(), request.clone(), data.clone(), trailers.clone()], Ok(())),
+        (
+            Side::Request,
+            false,
+            vec![request.clone(), Frame::Data(vec![0; 6])],
+            Err(Error::Message("DATA exceeds Content-Length")),
+        ),
+        (
+            Side::Request,
+            false,
+            vec![request.clone(), Frame::Data(vec![0; 3])],
+            Err(Error::Message("DATA differs from Content-Length")),
+        ),
+        (
+            Side::Request,
+            false,
+            vec![request.clone(), data.clone(), trailers.clone(), data.clone()],
+            Err(Error::UnexpectedFrame(t::DATA)),
+        ),
+        (
+            Side::Request,
+            false,
+            vec![request.clone(), data.clone(), trailers.clone(), trailers.clone()],
+            Err(Error::UnexpectedFrame(t::HEADERS)),
+        ),
+        (Side::Request, false, vec![promise.clone()], Err(Error::UnexpectedFrame(t::PUSH_PROMISE))),
+        (Side::Request, false, vec![connect.clone(), data.clone()], Ok(())),
+        (Side::Request, false, vec![connect, request], Err(Error::UnexpectedFrame(t::HEADERS))),
+        (Side::Response, false, vec![response("103")], Err(Error::Incomplete)),
         (
             Side::Response,
             false,
             vec![response("103"), promise.clone(), length_response("200"), data.clone(), trailers.clone()],
+            Ok(()),
         ),
-        (Side::Response, false, vec![response("204"), data.clone()]),
-        (Side::Response, false, vec![response("204"), trailers.clone()]),
-        (Side::Response, false, vec![length_response("304")]),
-        (Side::HeadResponse, false, vec![length_response("200")]),
-        (Side::HeadResponse, false, vec![length_response("200"), data.clone()]),
-        (Side::ConnectResponse, false, vec![length_response("204"), Frame::Data(vec![0; 20])]),
-        (Side::ConnectResponse, false, vec![response("200"), trailers]),
-        (Side::Response, true, vec![response("200"), promise]),
-        (Side::HeadResponse, true, vec![length_response("200"), unknown]),
+        (
+            Side::Response,
+            false,
+            vec![response("204"), data.clone()],
+            Err(Error::Message("content forbidden for this response")),
+        ),
+        (
+            Side::Response,
+            false,
+            vec![response("204"), trailers.clone()],
+            Err(Error::Message("trailers forbidden for this response")),
+        ),
+        (Side::Response, false, vec![length_response("304")], Ok(())),
+        (Side::HeadResponse, false, vec![length_response("200")], Ok(())),
+        (
+            Side::HeadResponse,
+            false,
+            vec![length_response("200"), data.clone()],
+            Err(Error::Message("content forbidden for this response")),
+        ),
+        (Side::ConnectResponse, false, vec![length_response("204"), Frame::Data(vec![0; 20])], Ok(())),
+        (Side::ConnectResponse, false, vec![response("200"), trailers], Err(Error::UnexpectedFrame(t::HEADERS))),
+        (Side::Response, true, vec![response("200"), promise], Err(Error::UnexpectedFrame(t::PUSH_PROMISE))),
+        (Side::HeadResponse, true, vec![length_response("200"), unknown], Ok(())),
     ]
     .into_iter()
     .enumerate()
@@ -333,14 +426,7 @@ fn request_state_checks_message_sequences() {
         if outcome.is_ok() {
             outcome = state.finish();
         }
-        match case {
-            2 | 8 | 11 | 14 | 15 | 17 | 20 => assert_eq!(outcome, Ok(()), "case {case}"),
-            0 | 10 => assert_eq!(outcome, Err(http3::Error::Incomplete)),
-            1 | 5 | 6 | 7 | 9 | 18 | 19 => {
-                assert!(matches!(outcome, Err(http3::Error::UnexpectedFrame(_))), "case {case}: {outcome:?}")
-            }
-            _ => assert!(matches!(outcome, Err(http3::Error::Message(_))), "case {case}: {outcome:?}"),
-        }
+        assert_eq!(outcome, expected, "case {case}");
     }
 }
 
@@ -478,7 +564,6 @@ fn wire_errors_distinguish_truncation_trailing_and_protocol() {
 }
 
 
-
 #[test]
 fn reset_before_section_decode_cancels() {
     let mut held = qpack::BlockedSections::new(4);
@@ -521,7 +606,6 @@ fn increments_without_blocked_streams_and_after_section_acks() {
     assert_eq!(qpack::decode_section(&table, 16, &invalid), Err(qpack::Error::InsertCount));
     assert_eq!(table.take_increment(), Some(DI::InsertCountIncrement(1)));
 }
-
 
 
 #[test]
@@ -726,8 +810,11 @@ fn qpack_section_limits_and_static_ack_policy() {
 }
 
 fn blocked(table: &Table, stream: u64, required: u64, body_len: usize) -> qpack::BlockedSection {
-    let mut bytes =
-        qpack::SectionPrefix { required_insert_count: required, base: required }.encoded(table.max_entries()).unwrap().to_bytes().unwrap();
+    let mut bytes = qpack::SectionPrefix { required_insert_count: required, base: required }
+        .encoded(table.max_entries())
+        .unwrap()
+        .to_bytes()
+        .unwrap();
     bytes.resize(bytes.len() + body_len, 0x80);
     let SectionResult::Blocked(value) = qpack::decode_section(table, stream, &bytes).unwrap() else {
         panic!("expected a blocked value");
@@ -861,17 +948,37 @@ fn qpack_instruction_failures_and_eof() {
 fn qpack_strict_writers() {
     for invalid in [
         EI::SetCapacity(qpack::MAX_TABLE_CAPACITY + 1),
+        EI::SetCapacity(qpack::MAX_INTEGER + 1),
         EI::Duplicate(qpack::MAX_INTEGER + 1),
         EI::InsertWithNameRef { static_table: true, index: 99, value: vec![] },
+        EI::InsertWithNameRef { static_table: false, index: qpack::MAX_INTEGER + 1, value: vec![] },
+        EI::InsertWithNameRef { static_table: true, index: 0, value: vec![0; qpack::MAX_STRING + 1] },
         EI::InsertWithLiteralName { name: vec![b'a'; qpack::MAX_STRING + 1], value: vec![] },
+        EI::InsertWithLiteralName { name: b"x-fuzz".to_vec(), value: vec![0; qpack::MAX_STRING + 1] },
     ] {
         contract::check_wire_value(&invalid);
         let mut out = vec![7, 9];
         assert!(Wire::write(&invalid, &mut out).is_err());
         assert_eq!(out, [7, 9]);
     }
-    for invalid in [DI::InsertCountIncrement(0), DI::SectionAck(u64::MAX), DI::StreamCancel(u64::MAX)] {
+    for invalid in [
+        DI::InsertCountIncrement(0),
+        DI::InsertCountIncrement(qpack::MAX_INTEGER + 1),
+        DI::SectionAck(u64::MAX),
+        DI::StreamCancel(u64::MAX),
+    ] {
         contract::check_wire_value(&invalid);
+        assert_eq!(invalid.to_bytes(), Err(qpack::Error::Unwritable));
+    }
+    for invalid in [
+        Rep::Indexed { static_table: true, index: qpack::MAX_INTEGER + 1 },
+        Rep::IndexedPostBase(qpack::MAX_INTEGER + 1),
+        Rep::LiteralNameRef { never_index: false, static_table: false, index: u64::MAX, value: vec![] },
+        Rep::LiteralPostBaseNameRef { never_index: true, index: u64::MAX, value: vec![] },
+        Rep::LiteralName { never_index: true, name: b"x-fuzz".to_vec(), value: vec![0; qpack::MAX_STRING + 1] },
+    ] {
+        contract::check_wire_value(&invalid);
+        assert_eq!(invalid.to_bytes(), Err(qpack::Error::Unwritable));
     }
     let mut trailing = wire(&EI::SetCapacity(8));
     trailing.push(0);
@@ -1202,11 +1309,17 @@ fn http3_strict_writers_are_transactional() {
         Frame::Data(vec![0; http3::MAX_FRAME_PAYLOAD + 1]),
         Frame::Unknown { frame_type: 0, payload: vec![] },
         Frame::Goaway(http3::MAX_VARINT + 1),
+        Frame::CancelPush(http3::MAX_VARINT + 1),
+        Frame::MaxPushId(http3::MAX_VARINT + 1),
+        Frame::PushPromise { push_id: http3::MAX_VARINT + 1, field_section: vec![0, 0] },
+        Frame::Unknown { frame_type: http3::MAX_VARINT + 1, payload: vec![] },
+        Frame::PriorityUpdate { element: http3::PriorityElement::Request(http3::MAX_VARINT + 1), value: vec![] },
+        Frame::PriorityUpdate { element: http3::PriorityElement::Push(http3::MAX_VARINT + 1), value: vec![] },
         Frame::Settings(http3::Settings { entries: vec![http3::Setting { id: 8, value: 2 }] }),
     ] {
         contract::check_wire_value(&frame);
         let mut output = vec![0xaa, 0xbb];
-        assert!(Wire::write(&frame, &mut output).is_err());
+        assert_eq!(Wire::write(&frame, &mut output), Err(http3::Error::Unwritable));
         assert_eq!(output, [0xaa, 0xbb]);
     }
     for header in
@@ -1218,6 +1331,35 @@ fn http3_strict_writers_are_transactional() {
     let mut bytes = wire(&Frame::Data(vec![]));
     bytes.push(0);
     assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::FrameParseError::Trailing));
+}
+
+#[test]
+fn http3_header_list_section_preserves_values_and_never_index() {
+    use http3::{HeaderKind, HeaderList};
+    let kind = HeaderKind::Request { extended_connect: false };
+    for value in [b"".as_slice(), b"a repeated value", b"a\tb", b"\x80\xff", b"\0", b"a\nb", b" leading"] {
+        for never_index in [false, true] {
+            let mut fields = received_request(&[]);
+            fields.push(Field { name: b"x-fuzz".to_vec(), value: value.to_vec(), never_index });
+            let headers = HeaderList { fields };
+            let result = headers.section(&mut qpack::Encoder::new(0, http3::MAX_FIELD_SECTION_SIZE), 0, kind);
+            if matches!(value, b"\0" | b"a\nb" | b" leading") {
+                assert_eq!(result, Err(http3::Error::Message("invalid field value")));
+                continue;
+            }
+            let section = result.unwrap();
+            contract::check_wire_value(&section);
+            let SectionResult::Fields { fields, ack } =
+                qpack::decode_section(&Table::new(0), 0, &wire(&section)).unwrap()
+            else {
+                panic!("a literal section blocked");
+            };
+            assert_eq!(ack, None);
+            let decoded = HeaderList::from_fields(fields, kind).unwrap();
+            assert_eq!(decoded.validate(kind), Ok(()));
+            assert_eq!(decoded, headers);
+        }
+    }
 }
 
 #[test]

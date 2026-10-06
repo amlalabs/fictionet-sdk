@@ -3,17 +3,24 @@
 
 use fictionet::stdlib::{
     codec::{Wire, contract},
-    quic::{Datagram, Frame, Payload, Reassembler, VarInt},
+    quic::{self, Datagram, Frame, Payload, Reassembler, VarInt},
 };
 use libfuzzer_sys::fuzz_target;
 
 fn datagram<const N: usize>(bytes: &[u8]) {
     contract::check_wire::<Datagram<N>>(bytes);
-    if let Ok(value) = Datagram::<N>::parse(bytes) {
-        for packet in value.0 {
-            if let Some(payload) = packet.payload() {
-                contract::check_wire::<Payload>(payload);
-            }
+    let (packets, _) = quic::split_datagram(bytes, N);
+    if !packets.is_empty() {
+        contract::check_wire_value(&Datagram::<N>(packets.clone()));
+    }
+    for packet in packets {
+        if let Some(payload) = packet.payload() {
+            contract::check_wire::<Payload>(payload);
+        }
+        let value = Datagram::<N>(vec![packet]);
+        contract::check_wire_value(&value);
+        if let Ok(bytes) = value.to_bytes() {
+            assert_eq!(quic::Packet::parse(&bytes, N), Ok((value.0[0].clone(), bytes.len())));
         }
     }
 }
@@ -24,30 +31,15 @@ fuzz_target!(|input: &[u8]| {
     contract::check_wire::<Frame>(bytes);
     contract::check_wire::<Payload>(bytes);
     // Every legal short-header ID length, plus one past the limit.
-    match pick % 22 {
-        0 => datagram::<0>(bytes),
-        1 => datagram::<1>(bytes),
-        2 => datagram::<2>(bytes),
-        3 => datagram::<3>(bytes),
-        4 => datagram::<4>(bytes),
-        5 => datagram::<5>(bytes),
-        6 => datagram::<6>(bytes),
-        7 => datagram::<7>(bytes),
-        8 => datagram::<8>(bytes),
-        9 => datagram::<9>(bytes),
-        10 => datagram::<10>(bytes),
-        11 => datagram::<11>(bytes),
-        12 => datagram::<12>(bytes),
-        13 => datagram::<13>(bytes),
-        14 => datagram::<14>(bytes),
-        15 => datagram::<15>(bytes),
-        16 => datagram::<16>(bytes),
-        17 => datagram::<17>(bytes),
-        18 => datagram::<18>(bytes),
-        19 => datagram::<19>(bytes),
-        20 => datagram::<20>(bytes),
-        _ => datagram::<21>(bytes),
+    macro_rules! dispatch {
+        ($($n:literal),* $(,)?) => {
+            match pick % 22 {
+                $($n => datagram::<$n>(bytes),)*
+                _ => datagram::<21>(bytes),
+            }
+        };
     }
+    dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
     let mut ordered = Reassembler::new();
     if ordered.insert(0, bytes).is_ok() {
         let mut reversed = Reassembler::new();
