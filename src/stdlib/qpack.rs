@@ -16,8 +16,9 @@
 //! [`DecoderInstructions`] with [`super::codec::Stream`]. Apply each
 //! instruction between items. [`decode_section`] returns fields and an
 //! acknowledgment or a [`BlockedSection`] the caller holds and retries.
-//! [`BlockedSections`] and [`PendingInstructions`] provide explicit bounded
-//! storage. The compatibility session below keeps its original behavior.
+//! [`BlockedSections`] bounds held sections; [`Table::take_increment`] returns
+//! acknowledgment values for inserts not reported by section acknowledgments.
+//! The existing session below keeps its original behavior.
 //!
 //! Nothing here reads a socket. A world that plays an HTTP/3 server gives
 //! a [`Decoder`] the bytes of the peer's encoder stream and each request's
@@ -39,7 +40,6 @@
 //! section is [`error_code::DECOMPRESSION_FAILED`].
 //!
 //! ```
-//! # #![allow(deprecated)]
 //! use fictionet::stdlib::qpack::{Decoder, Encoder, Field, Section};
 //!
 //! // RFC 9204 Appendix B.1: ":path: /index.html" as a literal with a
@@ -107,6 +107,9 @@ pub const MAX_BLOCKED_SECTIONS: usize = 4 * MAX_BLOCKED_STREAMS;
 /// strings. A reader of either stream holds at most this many bytes of an
 /// unfinished instruction, plus at most this many more while it reads.
 pub const MAX_INSTRUCTION: usize = 2 * (10 + MAX_STRING);
+/// Maximum encoded prefixed integer: one prefix byte and nine continuation bytes.
+/// Every decoder-stream instruction consists of exactly one such integer.
+pub const MAX_INTEGER_BYTES: usize = 10;
 /// The most bytes an encoder or decoder holds for its stream before they
 /// are taken. Past it, a call that would add more is [`Error::Backlog`];
 /// one instruction may take the total past it.
@@ -246,10 +249,6 @@ pub fn static_find_name(name: &[u8]) -> Option<u64> {
 /// Why bytes could not be read, or an instruction could not be applied.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// Bytes followed a complete wire value.
-    Trailing,
-    /// A caller-owned instruction buffer reached [`MAX_PENDING_STREAM`].
-    PendingFull,
     /// A field section ended in the middle of its prefix or a field line.
     Truncated,
     /// An integer was above [`MAX_INTEGER`], or had too many bytes.
@@ -295,16 +294,12 @@ pub enum Error {
     /// [`Encoder::take_encoder_stream`] or [`Decoder::take_decoder_stream`].
     /// Nothing changed; take them and try again. This is the caller's
     /// state, not the peer's fault, and not a connection error.
-    #[deprecated(note = "use decode_section acknowledgment values and PendingInstructions")]
     Backlog,
 }
 
-#[allow(deprecated)] // Format the compatibility error without changing it.
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Trailing => f.write_str("bytes after a complete value"),
-            Error::PendingFull => f.write_str("instruction buffer is full"),
             Error::Truncated => f.write_str("field section cut short"),
             Error::IntegerOverflow => f.write_str("integer too large"),
             Error::StringTooLong => f.write_str("string too long"),
@@ -624,7 +619,6 @@ fn entry_size(name: &[u8], value: &[u8]) -> u64 {
 /// index counting from 0, the oldest evicted first when room is needed.
 /// Both sides of a connection keep one, and keep it the same.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[deprecated(note = "use qpack::Table for caller-owned codec session state")]
 pub struct DynamicTable {
     entries: VecDeque<(Vec<u8>, Vec<u8>)>,
     size: u64,
@@ -634,7 +628,6 @@ pub struct DynamicTable {
     inserted: u64,
 }
 
-#[allow(deprecated)] // Preserve the original table API used by compatibility sessions.
 impl DynamicTable {
     /// An empty table with capacity 0, for a decoder that advertised
     /// `max_capacity` as its SETTINGS_QPACK_MAX_TABLE_CAPACITY. The
@@ -827,7 +820,6 @@ impl EncoderInstruction {
     /// The instruction's bytes. Strings are Huffman-coded when that is
     /// shorter. Integers above [`MAX_INTEGER`] are lowered to it and
     /// strings longer than [`MAX_STRING`] are cut.
-    #[deprecated(note = "use codec::Wire::write for strict transactional encoding")]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
@@ -886,7 +878,6 @@ impl DecoderInstruction {
 
     /// The instruction's bytes. Integers above [`MAX_INTEGER`] are lowered
     /// to it.
-    #[deprecated(note = "use codec::Wire::write for strict transactional encoding")]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
@@ -1013,7 +1004,6 @@ pub enum Representation {
     LiteralName { never_index: bool, name: Vec<u8>, value: Vec<u8> },
 }
 
-#[allow(deprecated)] // Keep both legacy writers unchanged.
 impl Representation {
     /// Reads the field line at the start of `b`, and returns it and its
     /// length. A field line cut short is [`Error::Truncated`].
@@ -1052,7 +1042,6 @@ impl Representation {
     /// Appends the field line's bytes. Strings are Huffman-coded when that
     /// is shorter. Integers above [`MAX_INTEGER`] are lowered to it and
     /// strings longer than [`MAX_STRING`] are cut.
-    #[deprecated(note = "use codec::Wire::write for strict transactional encoding")]
     pub fn write(&self, out: &mut Vec<u8>) {
         match self {
             Representation::Indexed { static_table, index } => {
@@ -1076,7 +1065,6 @@ impl Representation {
     }
 
     /// The field line's bytes, as [`Representation::write`] makes them.
-    #[deprecated(note = "use codec::Wire::write for strict transactional encoding")]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.write(&mut out);
@@ -1085,7 +1073,6 @@ impl Representation {
 }
 
 /// Decodes the field lines after a section's prefix.
-#[allow(deprecated)] // Both table APIs share the same bounded field interpreter.
 fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u64) -> Result<Vec<Field>, Error> {
     let SectionPrefix { required_insert_count: required, base } = prefix;
     let mut fields = Vec::new();
@@ -1154,7 +1141,6 @@ fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u
 
 /// What [`Decoder::decode_section`] made of a field section.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[deprecated(note = "use qpack::SectionResult returned by qpack::decode_section")]
 pub enum Section {
     /// The section's fields, in order.
     Fields(Vec<Field>),
@@ -1214,8 +1200,6 @@ fn read_stream<T>(
 /// encoder stream builds, decodes field sections, and writes the decoder
 /// stream.
 #[derive(Clone, Debug)]
-#[deprecated(note = "use Table, EncoderInstructions with codec::Stream, and decode_section")]
-#[allow(deprecated)] // The compatibility decoder retains its original table.
 pub struct Decoder {
     table: DynamicTable,
     max_blocked: usize,
@@ -1236,7 +1220,6 @@ pub struct Decoder {
     reported: u64,
 }
 
-#[allow(deprecated)] // Preserve the compatibility session and its backlog behavior.
 impl Decoder {
     /// A decoder with the settings it advertises: its
     /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, SETTINGS_QPACK_BLOCKED_STREAMS
@@ -1448,7 +1431,6 @@ struct Outstanding {
 /// encodes field sections, and reads the peer's decoder stream to learn
 /// which entries it may use and evict.
 #[derive(Clone, Debug)]
-#[allow(deprecated)] // The encoding session retains its original table return type.
 pub struct Encoder {
     table: DynamicTable,
     field_limit: u64,
@@ -1459,7 +1441,6 @@ pub struct Encoder {
     failed: Option<Error>,
 }
 
-#[allow(deprecated)] // The encoding session retains its existing output API.
 impl Encoder {
     /// An encoder for a peer that advertised this
     /// SETTINGS_QPACK_MAX_TABLE_CAPACITY and
@@ -1668,7 +1649,6 @@ impl Encoder {
     /// Adds bytes read from the peer's decoder stream and applies each
     /// whole instruction. An error is a connection error; once there is
     /// one, every later call returns it and bytes are dropped.
-    #[deprecated(note = "use codec::Stream with DecoderInstructions, then Encoder::apply_instruction")]
     pub fn feed_decoder_stream(&mut self, bytes: &[u8]) -> Result<(), Error> {
         if let Some(e) = self.failed {
             return Err(e);
@@ -1807,13 +1787,13 @@ impl Decode for EncoderInstructions {
 /// Zero increments are error items. Integer overflow ends framing. Partial
 /// integers return [`Step::Need`], so [`super::codec::Stream`] reports EOF
 /// truncation. Stream acknowledgments need the caller's section metadata;
-/// update [`Table::acknowledge`] or [`Table::increment_known_received`]
-/// between items. This decoder has no table or pending output queue.
+/// call [`Encoder::apply_instruction`] between items. This decoder has no
+/// table or pending output queue.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DecoderInstructions;
 
 impl DecoderInstructions {
-    /// Creates a decoder bounded by [`MAX_INSTRUCTION`].
+    /// Creates a decoder bounded by [`MAX_INTEGER_BYTES`].
     pub fn new() -> Self {
         Self
     }
@@ -1825,7 +1805,7 @@ impl Decode for DecoderInstructions {
     const NAME: &'static str = "QPACK decoder stream";
 
     fn capacity(&self) -> usize {
-        MAX_INSTRUCTION
+        MAX_INTEGER_BYTES
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
@@ -1837,19 +1817,50 @@ impl Decode for DecoderInstructions {
     }
 }
 
+/// Why an exact [`Wire`] parse did not read one complete QPACK value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// An instruction or field-line representation was invalid.
+    Instruction(Error),
+    /// The input ended before a complete value, including empty input.
+    Truncated,
+    /// Bytes follow the first complete value.
+    Trailing,
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Instruction(e) => e.fmt(f),
+            Self::Truncated => f.write_str("input ended before a complete QPACK value"),
+            Self::Trailing => f.write_str("bytes follow the QPACK value"),
+        }
+    }
+}
+
+impl std::error::Error for ParseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Instruction(e) => Some(e),
+            Self::Truncated | Self::Trailing => None,
+        }
+    }
+}
+
+/// Strict encoding and exact parsing. SetCapacity is limited to
+/// [`MAX_TABLE_CAPACITY`] in both directions, even if the peer advertises more.
 impl Wire for EncoderInstruction {
-    type ParseError = Error;
+    type ParseError = ParseError;
     type WriteError = Error;
 
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match EncoderInstructions.decode(bytes, true)? {
-            Step::Item(item, used) if used == bytes.len() => item,
-            Step::Item(_, _) => Err(Error::Trailing),
-            _ => Err(Error::Truncated),
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        match EncoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+            Step::Item(item, used) if used == bytes.len() => item.map_err(ParseError::Instruction),
+            Step::Item(_, _) => Err(ParseError::Trailing),
+            _ => Err(ParseError::Truncated),
         }
     }
 
-    #[allow(deprecated)] // The bounded legacy writer is used only after validation.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_encoder_instruction(self)?;
         out.extend_from_slice(&self.to_bytes());
@@ -1870,18 +1881,17 @@ fn check_decoder_instruction(instruction: &DecoderInstruction) -> Result<(), Err
 }
 
 impl Wire for DecoderInstruction {
-    type ParseError = Error;
+    type ParseError = ParseError;
     type WriteError = Error;
 
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        match DecoderInstructions.decode(bytes, true)? {
-            Step::Item(item, used) if used == bytes.len() => item,
-            Step::Item(_, _) => Err(Error::Trailing),
-            _ => Err(Error::Truncated),
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        match DecoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+            Step::Item(item, used) if used == bytes.len() => item.map_err(ParseError::Instruction),
+            Step::Item(_, _) => Err(ParseError::Trailing),
+            _ => Err(ParseError::Truncated),
         }
     }
 
-    #[allow(deprecated)] // The bounded legacy writer is used only after validation.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_decoder_instruction(self)?;
         out.extend_from_slice(&self.to_bytes());
@@ -1890,18 +1900,20 @@ impl Wire for DecoderInstruction {
 }
 
 impl Wire for Representation {
-    type ParseError = Error;
+    type ParseError = ParseError;
     type WriteError = Error;
 
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let (rep, used) = Self::parse(bytes)?;
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let (rep, used) = Self::parse(bytes).map_err(|e| match e {
+            Error::Truncated => ParseError::Truncated,
+            other => ParseError::Instruction(other),
+        })?;
         if used != bytes.len() {
-            return Err(Error::Trailing);
+            return Err(ParseError::Trailing);
         }
         Ok(rep)
     }
 
-    #[allow(deprecated)] // Check the legacy writer's value before appending.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (index, name, value): (u64, &[u8], &[u8]) = match self {
             Self::Indexed { index, .. } | Self::IndexedPostBase(index) => (*index, &[], &[]),
@@ -1919,27 +1931,26 @@ impl Wire for Representation {
     }
 }
 
-/// A session's bounded dynamic table and peer acknowledgment count.
+/// The decoder role's bounded dynamic table and reported insert count.
 ///
 /// Byte decoders do not borrow or modify it. The caller applies one
 /// instruction between items and lends the table to [`decode_section`].
 /// There are no blocked sections or output bytes hidden in this type.
-/// Encoding sessions must protect entries referenced by outstanding sections
-/// before calling an operation that evicts entries.
+/// Every method serves the receiving (decoder) role. The encoding role uses
+/// [`Encoder`], including [`Encoder::apply_instruction`] for peer acknowledgments.
+/// Send returned section acknowledgments before calling [`Table::take_increment`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(deprecated)] // Reuse table storage without changing the compatibility API.
 pub struct Table {
     dynamic: DynamicTable,
-    known_received: u64,
+    reported: core::cell::Cell<u64>,
 }
 
-#[allow(deprecated)] // The private table storage implements the existing eviction rules.
 impl Table {
     /// Creates a zero-capacity table. Storage is capped by
     /// [`MAX_TABLE_CAPACITY`]; insert-count wrapping uses the advertised
     /// `max_capacity`, as it does in [`DynamicTable::new`].
     pub fn new(max_capacity: u64) -> Self {
-        Self { dynamic: DynamicTable::new(max_capacity), known_received: 0 }
+        Self { dynamic: DynamicTable::new(max_capacity), reported: core::cell::Cell::new(0) }
     }
     /// The maximum allowed capacity, capped by [`MAX_TABLE_CAPACITY`].
     pub fn max_capacity(&self) -> u64 {
@@ -1964,10 +1975,6 @@ impl Table {
     /// The total number of inserts, including entries since evicted.
     pub fn insert_count(&self) -> u64 {
         self.dynamic.insert_count()
-    }
-    /// The peer's acknowledged insert count.
-    pub fn known_received_count(&self) -> u64 {
-        self.known_received
     }
     /// The advertised maximum entries used to wrap Required Insert Counts.
     pub fn max_entries(&self) -> u64 {
@@ -2035,24 +2042,16 @@ impl Table {
         self.insert(name, value)?;
         Ok(())
     }
-    /// Records a Section Acknowledgment's Required Insert Count.
-    /// The caller resolves its stream ID using its outstanding sections.
-    /// Counts past this table's inserts fail without changing state.
-    pub fn acknowledge(&mut self, required: u64) -> Result<(), Error> {
-        if required > self.insert_count() {
-            return Err(Error::Increment);
-        }
-        self.known_received = self.known_received.max(required);
-        Ok(())
-    }
-    /// Applies an Insert Count Increment. Zero or counts past the inserts
-    /// fail without changing state. Cancellations remain caller-owned state.
-    pub fn increment_known_received(&mut self, increment: u64) -> Result<(), Error> {
-        if increment == 0 {
-            return Err(Error::ZeroIncrement);
-        }
-        let count = self.known_received.checked_add(increment).ok_or(Error::Increment)?;
-        self.acknowledge(count)
+    /// Takes an Insert Count Increment for received inserts not yet reported.
+    /// Section acknowledgments returned by [`decode_section`] or
+    /// [`BlockedSection::retry`] already report their Required Insert Counts.
+    /// Send those values first, then this value, on the decoder stream.
+    /// No bytes are queued; a second call without new inserts returns `None`.
+    pub fn take_increment(&mut self) -> Option<DecoderInstruction> {
+        let count = self.insert_count();
+        let increment = count - self.reported.get();
+        self.reported.set(count);
+        (increment != 0).then_some(DecoderInstruction::InsertCountIncrement(increment))
     }
 }
 
@@ -2115,6 +2114,7 @@ fn section_fields(
 ) -> Result<SectionResult, Error> {
     let fields = decode_fields(&table.dynamic, prefix, body, limit)?;
     let ack = (prefix.required_insert_count != 0).then_some(DecoderInstruction::SectionAck(stream));
+    table.reported.set(table.reported.get().max(prefix.required_insert_count));
     Ok(SectionResult::Fields { fields, ack })
 }
 
@@ -2124,8 +2124,12 @@ fn section_fields(
 /// A blocked value must be retried through [`BlockedSection::retry`] so its
 /// original Required Insert Count is preserved across wrapping. Applications
 /// stop that request stream until retry completes and preserve section order.
-/// Use [`BlockedSections`] and [`PendingInstructions`] for bounded storage.
-/// No call emits [`Error::Backlog`] or changes the table.
+/// Use [`BlockedSections`] for bounded storage. Acknowledgments are values
+/// to send on the decoder stream; there is no internal output queue.
+/// Successful decoding updates only the decoder's reported count, through
+/// interior mutability; entries stay unchanged. Send returned acknowledgments
+/// in call order before taking [`Table::take_increment`] for the remaining inserts.
+/// No call emits [`Error::Backlog`].
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire}, qpack::{self, EncoderInstruction, Table}};
@@ -2231,57 +2235,16 @@ impl BlockedSections {
         Some((section.stream, section.retry(table)))
     }
     /// Removes every section on a stream. Returns the cancellation value
-    /// to write if any section was removed. Does not queue output bytes.
-    pub fn cancel(&mut self, stream: u64) -> Option<DecoderInstruction> {
-        let before = self.sections.len();
+    /// to write whenever the decoder advertised nonzero table capacity, even
+    /// if reset arrived before a section was decoded. Does not queue output bytes.
+    pub fn cancel(&mut self, table: &Table, stream: u64) -> Option<DecoderInstruction> {
         self.sections.retain(|s| s.stream != stream);
         self.bytes = self.sections.iter().map(BlockedSection::buffered).sum();
-        (before != self.sections.len()).then_some(DecoderInstruction::StreamCancel(stream))
-    }
-}
-
-/// Explicit caller-owned decoder-stream output, bounded by [`MAX_PENDING_STREAM`].
-///
-/// Instructions are supplied as values. Decoders never append here. A full
-/// buffer returns [`Error::PendingFull`], preserving both its bytes and the
-/// instruction. Drain it with [`take`](Self::take) and retry the same value.
-#[derive(Clone, Debug, Default)]
-pub struct PendingInstructions {
-    bytes: Vec<u8>,
-}
-
-impl PendingInstructions {
-    /// Creates empty storage without allocating.
-    pub fn new() -> Self {
-        Self::default()
-    }
-    /// Queues a strict instruction transactionally, refusing before buffering
-    /// if its encoded length would exceed [`MAX_PENDING_STREAM`].
-    pub fn push(&mut self, instruction: &DecoderInstruction) -> Result<(), Error> {
-        let bytes = Wire::to_bytes(instruction)?;
-        if bytes.len() > MAX_PENDING_STREAM.saturating_sub(self.bytes.len()) {
-            return Err(Error::PendingFull);
-        }
-        let needed = self.bytes.len().saturating_add(bytes.len());
-        if needed > self.bytes.capacity() {
-            let target = needed.max(self.bytes.capacity().saturating_mul(2)).min(MAX_PENDING_STREAM);
-            self.bytes.reserve_exact(target.saturating_sub(self.bytes.len()));
-        }
-        self.bytes.extend_from_slice(&bytes);
-        Ok(())
-    }
-    /// The number of pending wire bytes.
-    pub fn buffered(&self) -> usize {
-        self.bytes.len()
-    }
-    /// Takes the pending bytes once, leaving empty storage.
-    pub fn take(&mut self) -> Vec<u8> {
-        core::mem::take(&mut self.bytes)
+        (table.max_capacity() > 0).then_some(DecoderInstruction::StreamCancel(stream))
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests also exercise the compatibility APIs.
 mod tests {
     use super::*;
 

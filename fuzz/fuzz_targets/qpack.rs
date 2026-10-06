@@ -1,7 +1,6 @@
 //! QPACK encoder streams, decoder streams and field sections, as a world
 //! playing an HTTP/3 server reads them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the unchanged compatibility APIs.
 
 use fictionet::stdlib::qpack::{
     Decoder, DecoderInstruction, Encoder, EncoderInstruction, Field, MAX_STRING, Representation, Section,
@@ -80,7 +79,7 @@ fuzz_target!(|data: &[u8]| {
         let mut held = qpack::BlockedSections::new(4);
         assert!(held.push(blocked).is_ok());
         let _ = held.next_ready(&table);
-        let _ = held.cancel(0);
+        let _ = held.cancel(&table, 0);
         assert!(held.buffered() <= qpack::MAX_BLOCKED_BYTES);
     }
 

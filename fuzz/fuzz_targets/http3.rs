@@ -1,6 +1,5 @@
 //! HTTP/3 stream bytes, field sections and Priority dictionaries.
 #![no_main]
-#![allow(deprecated)] // Also exercise the unchanged compatibility APIs.
 
 use fictionet::stdlib::{codec::contract, http3};
 use fictionet::stdlib::{
@@ -265,7 +264,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(prefix.finish(), Ok(()));
     }
     let bytes = data.get(..data.len().min(MAX_FUZZ_INPUT)).unwrap();
-    let mut connection = http3::Connection::new(Endpoint::Client, 5, MAX_FUZZ_INPUT);
+    let mut connection = http3::Connection::new(Endpoint::Client, 5, http3::MAX_FRAME + MAX_FUZZ_INPUT);
     for (index, chunk) in bytes.chunks(17).enumerate() {
         let id = [0, 2, 4, 6, 10][index % 5];
         let _ = connection.push(id, chunk);
