@@ -15,9 +15,10 @@
 //! 4-byte common header: the version, a padding flag, a 5-bit count, the
 //! packet type and the length in 32-bit words, less one. RFC 3550 calls
 //! such a datagram a compound packet and sets rules for it. It starts with
-//! a sender or receiver report, it carries an SDES CNAME, and only its last
-//! packet may carry padding. RFC 4585 adds that feedback comes after the
-//! reports and SDES. [`Datagram`] holds the packets. [`Compound`] also
+//! a sender or receiver report, an SDES CNAME comes right after the
+//! reports, and only its last packet may carry padding. RFC 4585 adds that
+//! feedback comes after the reports and SDES. [`Datagram`] holds the
+//! packets. [`Compound`] also
 //! checks those rules. [`check_compound`] checks packets before sending.
 //! This module also reads TMMBR, TMMBN, FIR, REMB and extended reports.
 //!
@@ -698,7 +699,7 @@ pub enum CompoundError {
     /// The first packet is not a sender or receiver report; holds its
     /// packet type.
     FirstNotReport(u8),
-    /// No SDES chunk carries a CNAME item.
+    /// No SDES chunk right after the reports carries a CNAME item.
     NoCname,
     /// A packet other than the last carries padding.
     Padding,
@@ -1313,8 +1314,9 @@ fn parse_datagram(b: &[u8]) -> Result<Vec<Packet>, ParseError> {
 }
 
 /// Checks the rules of RFC 3550 for a compound packet: there is at least
-/// one packet, the first is a sender or receiver report, an SDES chunk
-/// carries a CNAME item, only the last packet has padding, and no
+/// one packet, the first is a sender or receiver report, the reports are
+/// followed straight away by SDES packets of which one chunk carries a
+/// CNAME item (RFC 3550 section 6.1), only the last packet has padding, and no
 /// feedback packet comes before a report or SDES packet (RFC 4585
 /// section 3.1). RFC 5506
 /// lets two ends agree to send packets without these rules; such a world
@@ -1338,10 +1340,14 @@ pub fn check_compound(packets: &[Packet]) -> Result<(), CompoundError> {
             return Err(CompoundError::FeedbackOrder);
         }
     }
-    let cname = packets.iter().any(|p| match &p.body {
-        Body::SourceDescription(chunks) => chunks.iter().any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME)),
-        _ => false,
-    });
+    let cname = packets
+        .iter()
+        .skip_while(|p| matches!(p.body, Body::SenderReport(_) | Body::ReceiverReport(_)))
+        .map_while(|p| match &p.body {
+            Body::SourceDescription(chunks) => Some(chunks),
+            _ => None,
+        })
+        .any(|chunks| chunks.iter().any(|c| c.items.iter().any(|i| i.kind == sdes::CNAME)));
     if !cname {
         return Err(CompoundError::NoCname);
     }

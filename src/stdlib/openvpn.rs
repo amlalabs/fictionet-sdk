@@ -367,24 +367,24 @@ pub enum Packet {
     Control {
         /// Which control packet it is.
         kind: ControlKind,
-        /// The key ID, 0 to [`MAX_KEY_ID`]. A writer keeps its low 3 bits.
+        /// The key ID, 0 to [`MAX_KEY_ID`]. A writer refuses a larger value.
         key_id: u8,
         /// The packet's fields.
         body: ControlBody,
     },
     /// A P_DATA_V1 packet.
     DataV1 {
-        /// The key ID, 0 to [`MAX_KEY_ID`]. A writer keeps its low 3 bits.
+        /// The key ID, 0 to [`MAX_KEY_ID`]. A writer refuses a larger value.
         key_id: u8,
         /// The encrypted tunnel packet, as bytes.
         payload: Vec<u8>,
     },
     /// A P_DATA_V2 packet.
     DataV2 {
-        /// The key ID, 0 to [`MAX_KEY_ID`]. A writer keeps its low 3 bits.
+        /// The key ID, 0 to [`MAX_KEY_ID`]. A writer refuses a larger value.
         key_id: u8,
         /// The peer ID the server gave this client, 0 to [`MAX_PEER_ID`],
-        /// or [`NO_PEER_ID`]. A writer keeps its low 24 bits.
+        /// or [`NO_PEER_ID`]. A writer refuses a larger value.
         peer_id: u32,
         /// The encrypted tunnel packet, as bytes.
         payload: Vec<u8>,

@@ -480,6 +480,25 @@ fn compound_rules_and_cname_order() {
         Compound::parse(&Datagram(late).to_bytes().unwrap()),
         Err(ParseError::Compound(CompoundError::FeedbackOrder))
     );
+    let app = Packet::from(Body::App(App {
+        subtype: 1,
+        ssrc: 2,
+        name: *b"abcd",
+        data: vec![],
+    }));
+    let bye = Packet::from(Body::Bye(Bye {
+        sources: vec![1],
+        reason: None,
+    }));
+    for between in [app, bye] {
+        let packets = vec![report(), between, cname()];
+        assert_eq!(check_compound(&packets), Err(CompoundError::NoCname));
+        assert_eq!(
+            Compound::parse(&Datagram(packets.clone()).to_bytes().unwrap()),
+            Err(ParseError::Compound(CompoundError::NoCname))
+        );
+        assert_eq!(Compound(packets).to_bytes(), Err(EncodeError::Unwritable));
+    }
     let valid = Compound(vec![
         report(),
         report(),
