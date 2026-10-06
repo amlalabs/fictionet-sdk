@@ -13,40 +13,51 @@ use super::json;
 use crate::watch::KeyLine;
 
 /// A field of a layer, and where its bytes are.
-pub(crate) struct Field {
-    pub(crate) name: String,
-    pub(crate) value: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Field {
+    /// Display name.
+    pub name: String,
+    /// Display value.
+    pub value: String,
     /// Byte range in the layer's buffer.
-    pub(crate) range: Option<(usize, usize)>,
+    pub range: Option<(usize, usize)>,
 }
 
 /// One protocol layer of a packet.
-pub(crate) struct Layer {
-    pub(crate) name: String,
-    pub(crate) summary: String,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Layer {
+    /// Display name.
+    pub name: String,
+    /// One-line description.
+    pub summary: String,
     /// Which buffer the ranges index: 0 is the packet itself.
-    pub(crate) buf: usize,
-    pub(crate) range: (usize, usize),
-    pub(crate) fields: Vec<Field>,
+    pub buf: usize,
+    /// Byte range in the selected buffer.
+    pub range: (usize, usize),
+    /// Fields and notes in display order.
+    pub fields: Vec<Field>,
 }
 
 impl Layer {
-    pub(crate) fn new(name: &str, buf: usize, range: (usize, usize)) -> Layer {
+    /// Creates an empty layer with the given buffer and byte range.
+    pub fn new(name: &str, buf: usize, range: (usize, usize)) -> Layer {
         Layer { name: name.to_owned(), summary: String::new(), buf, range, fields: Vec::new() }
     }
 
-    pub(crate) fn field(&mut self, name: &str, value: impl Into<String>, range: (usize, usize)) {
+    /// Adds a field with a byte range in this layer's buffer.
+    pub fn field(&mut self, name: &str, value: impl Into<String>, range: (usize, usize)) {
         self.fields.push(Field { name: name.to_owned(), value: value.into(), range: Some(range) });
     }
 
-    pub(crate) fn note(&mut self, name: &str, value: impl Into<String>) {
+    /// Adds a note without a byte range.
+    pub fn note(&mut self, name: &str, value: impl Into<String>) {
         self.fields.push(Field { name: name.to_owned(), value: value.into(), range: None });
     }
 
     /// Roughly how many bytes the layer adds to the packet's detail.
     fn size(&self) -> usize {
-        let fields: usize = self.fields.iter().map(|f| f.name.len() + f.value.len() + 32).sum();
-        self.name.len() + self.summary.len() + fields + 64
+        let fields = self.fields.iter().fold(0usize, |sum, f| sum.saturating_add(f.name.len()).saturating_add(f.value.len()).saturating_add(32));
+        self.name.len().saturating_add(self.summary.len()).saturating_add(fields).saturating_add(64)
     }
 }
 
@@ -61,19 +72,25 @@ const MAX_INFO: usize = 1024;
 
 /// A decoded packet.
 #[derive(Default)]
-pub(crate) struct Decoded {
-    pub(crate) src: String,
-    pub(crate) dst: String,
-    pub(crate) proto: String,
-    pub(crate) info: String,
-    pub(crate) tags: Vec<&'static str>,
+pub struct Decoded {
+    /// Source endpoint.
+    pub src: String,
+    /// Destination endpoint.
+    pub dst: String,
+    /// Highest decoded protocol.
+    pub proto: String,
+    /// Packet list summary.
+    pub info: String,
+    /// Packet annotations.
+    pub tags: Vec<&'static str>,
     /// How high the protocol in `proto` is: 0 for IP and transport, 1 for
     /// TLS, 2 for what TLS carries and other applications.
     pub(crate) level: u8,
-    pub(crate) layers: Vec<Layer>,
+    /// Protocol layers in display order.
+    pub layers: Vec<Layer>,
     /// Bytes other than the packet that layers point into, such as
     /// decrypted TLS, with a name for each.
-    pub(crate) extra: Vec<(String, Vec<u8>)>,
+    pub extra: Vec<(String, Vec<u8>)>,
     /// Bytes of layers and buffers kept so far, toward [`MAX_DETAIL`].
     used: usize,
     /// Layers and buffers not kept, past [`MAX_DETAIL`].
@@ -81,9 +98,14 @@ pub(crate) struct Decoded {
 }
 
 impl Decoded {
+    /// Updates the packet summary at an application level: 1 for TLS,
+    /// 2 for its payload or another application protocol.
+    pub fn application(&mut self, level: u8, protocol: &str, text: &str) {
+        super::app::info(self, level, protocol, text);
+    }
+
     /// The layers as a JSON array.
-    #[cfg(test)]
-    pub(crate) fn layers_json(&self) -> String {
+    pub fn layers_json(&self) -> String {
         let mut out = String::new();
         self.write_layers(&mut out);
         out
@@ -93,7 +115,7 @@ impl Decoded {
     /// `buf`, `range` and `fields`, each field with `name`, `value` and,
     /// if it points at bytes, `range`. Written straight into `out`, since
     /// this runs for every packet kept on a watched link.
-    pub(crate) fn write_layers(&self, out: &mut String) {
+    pub fn write_layers(&self, out: &mut String) {
         out.push('[');
         for (i, l) in self.layers.iter().enumerate() {
             if i > 0 {
@@ -124,7 +146,7 @@ impl Decoded {
 
     /// Appends the buffers as a JSON array: the packet, then each extra
     /// buffer, as objects with `name` and `hex`.
-    pub(crate) fn write_buffers(&self, out: &mut String, packet: &[u8]) {
+    pub fn write_buffers(&self, out: &mut String, packet: &[u8]) {
         out.reserve(2 * packet.len() + self.extra.iter().map(|(n, b)| n.len() + 2 * b.len() + 24).sum::<usize>() + 32);
         out.push('[');
         let all = std::iter::once(("Packet", packet)).chain(self.extra.iter().map(|(n, b)| (n.as_str(), b.as_slice())));
@@ -141,12 +163,12 @@ impl Decoded {
         out.push(']');
     }
 
-    /// Adds a buffer and returns its index. Past [`MAX_DETAIL`], the buffer
+    /// Adds a buffer and returns its index. Past the 1 MiB detail limit, the buffer
     /// is not kept, and neither is any layer after it, so the index it
     /// returns is never shown.
-    pub(crate) fn buffer(&mut self, name: &str, bytes: Vec<u8>) -> usize {
+    pub fn buffer(&mut self, name: &str, bytes: Vec<u8>) -> usize {
         // Shown as hex: two characters a byte.
-        if !self.take(name.len() + bytes.len() * 2) {
+        if !self.take(name.len().saturating_add(bytes.len().saturating_mul(2))) {
             return self.extra.len() + 1;
         }
         self.extra.push((name.to_owned(), bytes));
@@ -154,7 +176,7 @@ impl Decoded {
     }
 
     /// Adds a layer, unless the detail is full.
-    pub(crate) fn push(&mut self, layer: Layer) {
+    pub fn push(&mut self, layer: Layer) {
         if self.take(layer.size()) {
             self.layers.push(layer);
         }
@@ -164,7 +186,7 @@ impl Decoded {
     /// was cut before.
     fn take(&mut self, n: usize) -> bool {
         if self.cut > 0 || n > self.room() {
-            self.cut += 1;
+            self.cut = self.cut.saturating_add(1);
             return false;
         }
         self.used += n;
@@ -177,7 +199,7 @@ impl Decoded {
     }
 
     /// Adds a tag, once.
-    pub(crate) fn tag(&mut self, tag: &'static str) {
+    pub fn tag(&mut self, tag: &'static str) {
         if !self.tags.contains(&tag) {
             self.tags.push(tag);
         }
@@ -198,7 +220,7 @@ impl Decoded {
 
 /// Decodes the packets of one link, in order.
 #[derive(Default)]
-pub(crate) struct Dissector {
+pub struct Dissector {
     tcp: super::stream::Streams,
     /// Stop at the transport layer.
     headers_only: bool,
@@ -224,12 +246,19 @@ fn ip_proto_name(p: u8) -> &'static str {
 }
 
 impl Dissector {
+    /// Creates a dissector with built-in or user protocol registrations.
+    pub fn with_registry(registry: super::Registry) -> Self {
+        Self { tcp: super::stream::Streams::with_registry(registry), headers_only: false }
+    }
+
     /// A dissector that decodes IP, TCP, UDP and ICMP, and nothing past.
     pub(crate) fn headers_only() -> Dissector {
         Dissector { headers_only: true, ..Dissector::default() }
     }
 
-    pub(crate) fn decode(&mut self, p: &[u8], keys: &[KeyLine]) -> Decoded {
+    /// Decodes one raw IPv4 or IPv6 packet. Pass TLS key log entries when
+    /// decryption is wanted. Packet sources may be pcap readers or live captures.
+    pub fn decode(&mut self, p: &[u8], keys: &[KeyLine]) -> Decoded {
         let mut d = Decoded::default();
         match p.first().map(|b| b >> 4) {
             Some(4) => self.ipv4(p, &mut d, keys),
@@ -356,7 +385,7 @@ impl Dissector {
         let body = &p[at..end];
         match proto {
             6 => self.tcp(p, at, end, src, dst, d, keys),
-            17 => udp(p, at, end, d, !self.headers_only),
+            17 => udp(p, at, end, d, !self.headers_only, self.tcp.registry()),
             1 => icmp(p, at, end, d, false),
             58 => icmp(p, at, end, d, true),
             other => {
@@ -476,7 +505,7 @@ fn tcp_options(o: &[u8]) -> Vec<String> {
     out
 }
 
-fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, apps: bool) {
+fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, apps: bool, registry: &super::Registry) {
     let u = &p[at..end];
     if u.len() < 8 {
         return truncated(d, "UDP", u.len());
@@ -508,12 +537,14 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, apps: bool) {
     if !apps || body.0 >= body.1 {
         return;
     }
-    if sport == 53 || dport == 53 {
-        let place = super::app::Place { stream_start: 0, buf: 0, offset: Some(body.0), len: body.1 - body.0 };
-        super::app::dns(&p[body.0..body.1], place, 0, d);
-    } else if matches!((sport, dport), (67, 68) | (68, 67)) {
-        super::app::dhcp(p, body, d);
+    let bytes = &p[body.0..body.1];
+    let selection = super::Selection { transport: super::Transport::Udp, ports: (sport, dport), first: bytes.get(..bytes.len().min(64)).unwrap_or_default() };
+    if let Ok(mut protocol) = registry.open(selection) {
+        let place = super::Place { stream_start: 0, buf: 0, offset: Some(body.0), len: bytes.len() };
+        protocol.data(false, bytes, place, d, &[]);
+        protocol.end(false, d);
     }
+
 }
 
 fn icmp(p: &[u8], at: usize, end: usize, d: &mut Decoded, v6: bool) {

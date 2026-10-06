@@ -18,6 +18,11 @@ cargo +nightly fuzz list
 
 | Target | What it feeds | Code it reaches |
 |---|---|---|
+| `observe_modbus` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Modbus` |
+| `observe_dns` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dns` |
+| `observe_dhcp` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dhcp` |
+| `observe_http1` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Http1` |
+| `observe_tls` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::TlsRecords` |
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |

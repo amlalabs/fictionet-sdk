@@ -5,7 +5,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
-use super::app::{Conversation, Place};
+use super::app::Conversation;
+use super::{Place, Registry};
 use super::decode::Decoded;
 use crate::watch::KeyLine;
 
@@ -51,6 +52,7 @@ pub(crate) struct Streams {
     conversations: HashMap<FlowKey, Conversation>,
     /// Bytes held in every flow's `held`.
     held: usize,
+    registry: Registry,
 }
 
 /// How many directions of connections are followed at once. Past that, the
@@ -70,6 +72,10 @@ fn before(a: u32, b: u32) -> bool {
 }
 
 impl Streams {
+    pub(crate) fn with_registry(registry: Registry) -> Self { Self { registry, ..Self::default() } }
+
+    pub(crate) fn registry(&self) -> &Registry { &self.registry }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn segment(
         &mut self,
@@ -147,7 +153,7 @@ impl Streams {
                 if skip < data.len() {
                     let start = flow.delivered;
                     chunks.push((start, data[skip..].to_vec(), Some(range.0 + skip)));
-                    flow.delivered += (data.len() - skip) as u64;
+                    flow.delivered = flow.delivered.saturating_add((data.len() - skip) as u64);
                     flow.next = Some(seq.wrapping_add(data.len() as u32));
                 }
             } else if self.held + data.len() <= MAX_HELD && flow.held.len() < 256 {
@@ -170,7 +176,7 @@ impl Streams {
             if before(next, s) && !gap {
                 break;
             }
-            let bytes = flow.held.remove(&k).unwrap();
+            let Some(bytes) = flow.held.remove(&k) else { break };
             flow.held_bytes -= bytes.len();
             self.held -= bytes.len();
             if gap && before(next, s) {
@@ -183,7 +189,7 @@ impl Streams {
             if !before(s, next) || skip < bytes.len() {
                 let skip = if before(s, next) { skip } else { 0 };
                 chunks.push((flow.delivered, bytes[skip..].to_vec(), None));
-                flow.delivered += (bytes.len() - skip) as u64;
+                flow.delivered = flow.delivered.saturating_add((bytes.len() - skip) as u64);
                 flow.next = Some(s.wrapping_add(bytes.len() as u32));
             }
         }
@@ -199,7 +205,7 @@ impl Streams {
             return;
         }
         let (ckey, reversed) = conversation_key(key);
-        let conversation = self.conversations.entry(ckey).or_insert_with(|| Conversation::new(ckey.1, ckey.3));
+        let conversation = self.conversations.entry(ckey).or_insert_with(|| Conversation::with_registry(ckey.1, ckey.3, self.registry.clone()));
         let layers = d.layers.len() + d.cut;
         for (start, bytes, at) in chunks {
             if bytes.is_empty() {

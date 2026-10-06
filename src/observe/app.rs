@@ -2,49 +2,25 @@
 //! which is decrypted when the world's TLS stack gave its session keys.
 //!
 //! A [`Conversation`] is one TCP connection, both ways. It guesses the
-//! protocol from the ports and the first bytes, then decodes each
+//! protocol through the public registry, using ports or first bytes, then decodes each
 //! direction's byte stream as it arrives. Each message it finds becomes a
 //! [`Layer`] of the packet that completed it. When the whole message lies
 //! in that packet, its fields point at the packet's own bytes; otherwise
 //! the message gets a buffer of its own, as Wireshark's "Reassembled TCP".
 
-use std::collections::VecDeque;
 use std::fmt::Write;
 
 use super::decode::{Decoded, Layer, be16, be32};
 use super::hpack;
 use crate::watch::KeyLine;
 
-/// Where some bytes of a stream are: from stream offset `stream_start`,
-/// `len` bytes, found at `offset` in buffer `buf` of the packet's
-/// [`Decoded`], if they are all in one place there.
-#[derive(Clone, Copy)]
-pub(crate) struct Place {
-    pub(crate) stream_start: u64,
-    pub(crate) buf: usize,
-    pub(crate) offset: Option<usize>,
-    pub(crate) len: usize,
-}
-
-impl Place {
-    /// The buffer and the start in it of the message at stream offset
-    /// `start`, adding a buffer named `name` with `bytes` if the message
-    /// is not all in this place.
-    fn locate(&self, d: &mut Decoded, start: u64, bytes: &[u8], name: &str) -> (usize, usize) {
-        if let Some(off) = self.offset
-            && start >= self.stream_start
-            && start + bytes.len() as u64 <= self.stream_start + self.len as u64
-        {
-            return (self.buf, off + (start - self.stream_start) as usize);
-        }
-        (d.buffer(name, bytes.to_vec()), 0)
-    }
-}
+use super::{Match, Observed, Place, Placement, Present, Protocol, Registry, Selection, Transport};
+use super::protocols;
 
 /// Sets the packet's protocol and info from a message at `level`: 1 for
 /// TLS records, 2 for what they carry and for plain HTTP. A higher level
 /// replaces what lower ones said; the same level adds to it.
-fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
+pub(super) fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
     if level > d.level {
         d.level = level;
         d.proto = proto.into();
@@ -61,7 +37,7 @@ fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
 }
 
 /// Text for a preview of bytes: the start, if it reads as text.
-fn preview(b: &[u8]) -> Option<String> {
+pub(super) fn preview(b: &[u8]) -> Option<String> {
     let cut = &b[..b.len().min(160)];
     let text = std::str::from_utf8(cut).ok()?;
     if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
@@ -76,146 +52,17 @@ fn preview(b: &[u8]) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------
-// DNS and DHCP
-
-/// Decodes the DNS message `msg`, which starts at stream offset `start` of
-/// the bytes at `place`.
-pub(crate) fn dns(msg: &[u8], place: Place, start: u64, d: &mut Decoded) {
-    use hickory_proto::op::{Message, MessageType};
-    let (buf, base) = place.locate(d, start, msg, "DNS message");
-    let mut l = Layer::new("Domain Name System", buf, (base, base + msg.len()));
-    let Ok(m) = Message::from_vec(msg) else {
-        l.summary = "malformed".into();
-        d.push(l);
-        d.proto = "DNS".into();
-        d.info = "Malformed DNS message".into();
-        d.tag("malformed");
-        return;
-    };
-    let md = &m.metadata;
-    let response = md.message_type == MessageType::Response;
-    l.field("Transaction ID", format!("0x{:04x}", md.id), (base, base + 2));
-    let mut flags = vec![if response { "response" } else { "query" }.to_owned()];
-    if md.recursion_desired {
-        flags.push("recursion desired".into());
-    }
-    if md.recursion_available {
-        flags.push("recursion available".into());
-    }
-    if md.authoritative {
-        flags.push("authoritative".into());
-    }
-    if md.truncation {
-        flags.push("truncated".into());
-    }
-    l.field("Flags", flags.join(", "), (base + 2, base + 4));
-    if response {
-        l.field("Reply code", format!("{}", md.response_code), (base + 3, base + 4));
-    }
-    let mut q_text = Vec::new();
-    for q in &m.queries {
-        let name = q.name().to_string();
-        let name = name.trim_end_matches('.');
-        l.note("Query", format!("{name}: type {}, class {}", q.query_type(), q.query_class()));
-        q_text.push(format!("{} {name}", q.query_type()));
-    }
-    let mut a_text = Vec::new();
-    for (section, records) in [("Answer", &m.answers), ("Authority", &m.authorities), ("Additional", &m.additionals)] {
-        for r in records.iter() {
-            let name = r.name.to_string();
-            let data = r.data.to_string();
-            l.note(section, format!("{}: type {}, TTL {}, {data}", name.trim_end_matches('.'), r.record_type(), r.ttl));
-            if section == "Answer" {
-                a_text.push(format!("{} {data}", r.record_type()));
-            }
-        }
-    }
-    let mut text = format!("Standard query{} 0x{:04x} {}", if response { " response" } else { "" }, md.id, q_text.join(" "));
-    if response {
-        let code = md.response_code.to_string();
-        if code != "No Error" {
-            let _ = write!(text, " {code}");
-            d.tag("dns-error");
-        }
-        if !a_text.is_empty() {
-            let _ = write!(text, " {}", a_text.join(" "));
-        }
-    }
-    l.summary = text.clone();
-    d.push(l);
-    d.proto = "DNS".into();
-    d.info = text;
-    d.cap_info();
-}
-
-/// Decodes a DHCP message at `range` of the packet.
-pub(crate) fn dhcp(p: &[u8], range: (usize, usize), d: &mut Decoded) {
-    let Some(m) = crate::stdlib::dhcp::Message::parse(&p[range.0..range.1]) else { return };
-    let kind = match m.message_type() {
-        Some(1) => "Discover",
-        Some(2) => "Offer",
-        Some(3) => "Request",
-        Some(4) => "Decline",
-        Some(5) => "ACK",
-        Some(6) => "NAK",
-        Some(7) => "Release",
-        Some(8) => "Inform",
-        _ => "message",
-    };
-    let mut l = Layer::new("Dynamic Host Configuration Protocol", 0, range);
-    l.summary = kind.into();
-    l.field("Transaction ID", format!("0x{:08x}", m.xid), (range.0 + 4, range.0 + 8));
-    l.field("Your address", m.yiaddr.to_string(), (range.0 + 16, range.0 + 20));
-    for (code, value) in &m.options {
-        let v = match (code, value.len()) {
-            (1 | 3 | 6 | 50 | 54, n) if n % 4 == 0 && n > 0 => {
-                value.chunks(4).map(|c| format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3])).collect::<Vec<_>>().join(", ")
-            }
-            (51, 4) => format!("{} s", be32(value, 0)),
-            _ => format!("{} bytes", value.len()),
-        };
-        let name = match code {
-            1 => "Subnet mask",
-            3 => "Router",
-            6 => "DNS servers",
-            12 => "Host name",
-            50 => "Requested address",
-            51 => "Lease time",
-            53 => "Message type",
-            54 => "Server",
-            _ => "Option",
-        };
-        l.note(name, if *code == 53 { kind.to_owned() } else { format!("{v} (option {code})") });
-    }
-    d.push(l);
-    d.proto = "DHCP".into();
-    d.info = format!("DHCP {kind} - Transaction ID 0x{:08x}", m.xid);
-}
-
-// ---------------------------------------------------------------------------
 // TCP conversations
 
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// Bytes a direction may hold while waiting for the end of a message. A
 /// longer message whose length its header gives is shown by that header,
 /// and the rest of it is skipped. One whose end cannot be found that way
-/// is dropped. With at most 512 directions followed (see `stream`), and a
-/// decrypted stream beside each, this bounds what a link's decoder holds
-/// at 64 MiB, whatever the agent sends.
+/// is dropped. TCP follows at most 512 directions (see `stream`). The
+/// codec presenters also bound input, with read-ahead for one packet.
 const MAX_BUFFER: usize = 32 << 10;
 /// The longest HTTP/2 header block kept across CONTINUATION frames.
 const MAX_HEADER_BLOCK: usize = 64 << 10;
-
-enum Proto {
-    Unknown,
-    Dns,
-    Tls(Box<Tls>),
-    Http1,
-    Http2,
-    Modbus,
-    /// Not a protocol this decodes.
-    Opaque,
-}
 
 /// One direction's bytes not decoded yet.
 #[derive(Default)]
@@ -226,7 +73,6 @@ struct Dir {
     /// Bytes still to come of a message too long to hold, which are
     /// dropped as they arrive.
     skip: u64,
-    http1: Http1,
     http2: Http2,
 }
 
@@ -242,8 +88,9 @@ impl Dir {
     }
 
     fn consume(&mut self, n: usize) {
+        let n = n.min(self.buf.len());
         self.buf.drain(..n);
-        self.start += n as u64;
+        self.start = self.start.saturating_add(n as u64);
     }
 
     /// Consumes a message of `len` bytes at the start of `buf`, of which
@@ -259,7 +106,6 @@ impl Dir {
     fn lose(&mut self) {
         self.buf.clear();
         self.skip = 0;
-        self.http1 = Http1::default();
         self.http2.lose();
     }
 
@@ -276,24 +122,11 @@ impl Dir {
 /// address and port sort first.
 pub(crate) struct Conversation {
     ports: (u16, u16),
-    proto: Proto,
-    dirs: [Dir; 2],
-    /// The methods of HTTP/1.1 requests not yet answered, oldest first,
-    /// since a response to HEAD or CONNECT is framed differently.
-    methods: Methods,
-}
-
-/// HTTP/1.1 request methods waiting for their responses.
-#[derive(Default)]
-pub(crate) struct Methods(VecDeque<String>);
-
-impl Methods {
-    fn push(&mut self, m: &str) {
-        if self.0.len() >= 64 {
-            self.0.pop_front();
-        }
-        self.0.push_back(m.to_owned());
-    }
+    registry: Registry,
+    protocol: Option<Box<dyn Protocol>>,
+    prefix: [Vec<u8>; 2],
+    prefix_start: [u64; 2],
+    rejected: bool,
 }
 
 fn looks_like_http1(b: &[u8]) -> bool {
@@ -302,99 +135,121 @@ fn looks_like_http1(b: &[u8]) -> bool {
 }
 
 impl Conversation {
-    pub(crate) fn new(port_a: u16, port_b: u16) -> Conversation {
-        Conversation {
-            ports: (port_a, port_b),
-            proto: Proto::Unknown,
-            dirs: [Dir::default(), Dir::default()],
-            methods: Methods::default(),
-        }
+    #[cfg(test)]
+    pub(crate) fn new(port_a: u16, port_b: u16) -> Self {
+        Self::with_registry(port_a, port_b, Registry::default())
     }
 
-    /// Whether direction `dir` holds bytes of a message not yet complete.
+    pub(crate) fn with_registry(port_a: u16, port_b: u16, registry: Registry) -> Self {
+        Self { ports: (port_a, port_b), registry, protocol: None, prefix: [Vec::new(), Vec::new()], prefix_start: [0; 2], rejected: false }
+    }
+
     pub(crate) fn waiting(&self, dir: bool) -> bool {
-        let d = &self.dirs[dir as usize];
-        (!d.buf.is_empty() || d.skip > 0) && !matches!(self.proto, Proto::Opaque | Proto::Unknown)
+        self.protocol.as_ref().is_some_and(|p| p.waiting(dir))
     }
 
-    /// Bytes of direction `dir` were lost: what was buffered cannot be
-    /// finished, and HTTP/2's header tables are no longer known.
     pub(crate) fn lost(&mut self, dir: bool) {
-        let i = dir as usize;
-        self.dirs[i].lose();
-        if let Proto::Tls(tls) = &mut self.proto {
-            tls.inner[i].lose();
-            tls.hs_plain[i].clear();
-            tls.hs_sealed[i].clear();
-        }
+        if let Some(protocol) = &mut self.protocol { protocol.lost(dir); }
+        if let Some(prefix) = self.prefix.get_mut(usize::from(dir)) { prefix.clear(); }
     }
 
     pub(crate) fn data(&mut self, dir: bool, bytes: &[u8], place: Place, d: &mut Decoded, keys: &[KeyLine]) {
-        let i = dir as usize;
-        self.dirs[i].push(bytes, &place);
-        if matches!(self.proto, Proto::Unknown) {
-            let b = &self.dirs[i].buf;
-            self.proto = if self.ports.0 == 53 || self.ports.1 == 53 {
-                Proto::Dns
-            } else if self.ports.0 == MODBUS_PORT || self.ports.1 == MODBUS_PORT {
-                Proto::Modbus
-            } else if b.len() >= 2 && b[0] == 0x16 && b[1] == 0x03 {
-                Proto::Tls(Box::default())
-            } else if b.starts_with(HTTP2_PREFACE) || (b.len() < HTTP2_PREFACE.len() && HTTP2_PREFACE.starts_with(b)) {
-                if b.len() < HTTP2_PREFACE.len() {
-                    return;
-                }
-                Proto::Http2
-            } else if looks_like_http1(b) {
-                Proto::Http1
-            } else if b.len() < 8 {
-                return;
-            } else {
-                Proto::Opaque
-            };
+        if self.rejected { return; }
+        if let Some(protocol) = &mut self.protocol {
+            let i = usize::from(dir);
+            if let Some(held) = self.prefix.get_mut(i) && !held.is_empty() {
+                protocol.data(dir, held, Place { stream_start: self.prefix_start[i], len: held.len(), ..Place::default() }, d, keys);
+                held.clear();
+            }
+            protocol.data(dir, bytes, place, d, keys);
+            return;
         }
-        match &mut self.proto {
-            Proto::Dns => dns_stream(&mut self.dirs[i], place, d),
-            Proto::Http1 => http1(&mut self.dirs[i], &mut self.methods, place, d),
-            Proto::Http2 => http2(&mut self.dirs[i], place, d),
-            Proto::Modbus => {
-                // Direction 0 is from the endpoint on `ports.0`.
-                let to = if i == 0 { self.ports.1 } else { self.ports.0 };
-                if !modbus_stream(&mut self.dirs[i], to == MODBUS_PORT, place, d) {
-                    self.proto = Proto::Opaque;
+        let i = usize::from(dir);
+        let Some(prefix) = self.prefix.get_mut(i) else { return };
+        let old = prefix.len();
+        if old == 0 { self.prefix_start[i] = place.stream_start; }
+        prefix.extend_from_slice(bytes.get(..bytes.len().min(64usize.saturating_sub(old))).unwrap_or_default());
+        match self.registry.open(Selection { transport: Transport::Tcp, ports: self.ports, first: prefix }) {
+            Ok(mut protocol) => {
+                prefix.truncate(old);
+                if !prefix.is_empty() {
+                    protocol.data(dir, prefix, Place { stream_start: self.prefix_start[i], len: prefix.len(), ..Place::default() }, d, keys);
+                    prefix.clear();
+                }
+                protocol.data(dir, bytes, place, d, keys);
+                self.protocol = Some(protocol);
+            }
+            Err(decision) => {
+                if prefix.len() >= 64 || (decision == Match::No && prefix.len() >= 8) {
+                    self.rejected = true;
+                    self.prefix.iter_mut().for_each(Vec::clear);
                 }
             }
-            Proto::Tls(tls) => tls.data(i, &mut self.dirs[i], place, d, keys),
-            Proto::Opaque | Proto::Unknown => {
-                let n = self.dirs[i].buf.len();
-                self.dirs[i].consume(n);
-            }
         }
-        self.dirs[i].limit();
     }
 }
 
-/// DNS over TCP: each message after its two-byte length.
-fn dns_stream(dir: &mut Dir, place: Place, d: &mut Decoded) {
-    while dir.buf.len() >= 2 {
-        let len = usize::from(be16(&dir.buf, 0));
-        if 2 + len > MAX_BUFFER && dir.buf.len() < 2 + len {
-            let (buf, base) = place.locate(d, dir.start, &dir.buf[..2], "DNS message length");
-            let mut l = Layer::new("Domain Name System", buf, (base, base + 2));
-            l.field("Length", len.to_string(), (base, base + 2));
-            l.summary = format!("a {len}-byte message, too long to decode here");
-            d.push(l);
-            d.proto = "DNS".into();
-            d.info = format!("DNS message of {len} bytes, not decoded");
-            dir.consume_message(2 + len);
-            continue;
+fn register_http(registry: &mut Registry) {
+    registry.register_with_buffer("http1", |s| {
+        if s.transport == Transport::Tcp && looks_like_http1(s.first) { Match::Yes } else { Match::No }
+    }, 128 << 10, |_| protocols::Http1::pair());
+    registry.register_protocol("http2", |s| {
+        if s.transport != Transport::Tcp { Match::No }
+        else if s.first.starts_with(HTTP2_PREFACE) { Match::Yes }
+        else if HTTP2_PREFACE.starts_with(s.first) { Match::More }
+        else { Match::No }
+    }, |_| Box::new(H2Session { dirs: [Dir::default(), Dir::default()] }));
+}
+
+pub(super) fn register(registry: &mut Registry) {
+    register_http(registry);
+    registry.register_protocol("tls", |s| {
+        if s.transport == Transport::Tcp && s.first.starts_with(&[0x16, 0x03]) { Match::Yes } else { Match::No }
+    }, |_| Box::new(TlsSession::default()));
+    registry.register_protocol("modbus", |s| {
+        if s.transport == Transport::Tcp && (s.ports.0 == MODBUS_PORT || s.ports.1 == MODBUS_PORT) { Match::Yes } else { Match::No }
+    }, |s| Box::new(ModbusSession { dirs: [Some(Observed::new(protocols::Modbus::new(s.ports.1 == MODBUS_PORT))), Some(Observed::new(protocols::Modbus::new(s.ports.0 == MODBUS_PORT)))], stopped: false }));
+    registry.register("dhcp", |s| {
+        if s.transport == Transport::Udp && matches!(s.ports, (67, 68) | (68, 67)) { Match::Yes } else { Match::No }
+    }, |_| [protocols::Dhcp::default(), protocols::Dhcp::default()]);
+    registry.register_with_buffer("dns", |s| {
+        if s.ports.0 == 53 || s.ports.1 == 53 { Match::Yes } else { Match::No }
+    }, 65_538, |s| [protocols::Dns::new(s.transport == Transport::Tcp), protocols::Dns::new(s.transport == Transport::Tcp)]);
+}
+
+struct H2Session { dirs: [Dir; 2] }
+impl Protocol for H2Session {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, _: &[KeyLine]) {
+        let dir = &mut self.dirs[usize::from(reverse)];
+        dir.push(bytes, &at);
+        http2(dir, at, d);
+        dir.limit();
+    }
+    fn waiting(&self, reverse: bool) -> bool {
+        let dir = &self.dirs[usize::from(reverse)];
+        !dir.buf.is_empty() || dir.skip > 0
+    }
+    fn lost(&mut self, reverse: bool) { self.dirs[usize::from(reverse)].lose(); }
+}
+
+struct ModbusSession {
+    dirs: [Option<Observed<protocols::Modbus>>; 2],
+    stopped: bool,
+}
+impl Protocol for ModbusSession {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, _: &[KeyLine]) {
+        if self.stopped { return; }
+        if let Some(dir) = &mut self.dirs[usize::from(reverse)] {
+            dir.data(bytes, at, d);
+            self.stopped = dir.failed().is_some();
         }
-        if dir.buf.len() < 2 + len {
-            break;
-        }
-        let msg = dir.buf[2..2 + len].to_vec();
-        dns(&msg, place, dir.start + 2, d);
-        dir.consume(2 + len);
+    }
+    fn waiting(&self, reverse: bool) -> bool {
+        !self.stopped && self.dirs[usize::from(reverse)].as_ref().is_some_and(Observed::waiting)
+    }
+    fn lost(&mut self, reverse: bool) {
+        let slot = &mut self.dirs[usize::from(reverse)];
+        *slot = slot.take().map(Observed::reset);
     }
 }
 
@@ -402,243 +257,6 @@ fn dns_stream(dir: &mut Dir, place: Place, d: &mut Decoded) {
 // Modbus/TCP
 
 const MODBUS_PORT: u16 = crate::stdlib::modbus::PORT;
-
-/// Modbus/TCP: frames after their 7-byte header. `request` says whether
-/// this direction goes to the server. Returns false if the stream is not
-/// Modbus, so the conversation stops decoding it.
-fn modbus_stream(dir: &mut Dir, request: bool, place: Place, d: &mut Decoded) -> bool {
-    use crate::stdlib::modbus::{Frame, Request, Response};
-    loop {
-        let (frame, used) = match Frame::parse(&dir.buf) {
-            Ok(Some(f)) => f,
-            Ok(None) => return true,
-            Err(_) => return false,
-        };
-        let (buf, base) = place.locate(d, dir.start, &dir.buf[..used], "Modbus/TCP frame");
-        let mut l = Layer::new("Modbus/TCP", buf, (base, base + used));
-        l.field("Transaction identifier", frame.transaction.to_string(), (base, base + 2));
-        l.field("Protocol identifier", "0".to_owned(), (base + 2, base + 4));
-        l.field("Length", (used - 6).to_string(), (base + 4, base + 6));
-        l.field("Unit identifier", frame.unit.to_string(), (base + 6, base + 7));
-        let function = frame.function().unwrap_or(0);
-        l.field("Function code", format!("{} ({})", function & 0x7f, modbus_function(function & 0x7f)), (base + 7, base + 8));
-        let detail = if request {
-            match Request::parse(&frame.pdu) {
-                Ok(Request::ReadCoils { address, quantity })
-                | Ok(Request::ReadDiscreteInputs { address, quantity })
-                | Ok(Request::ReadHoldingRegisters { address, quantity })
-                | Ok(Request::ReadInputRegisters { address, quantity }) => format!("address {address}, quantity {quantity}"),
-                Ok(Request::WriteSingleCoil { address, value }) => format!("address {address}, {}", if value { "on" } else { "off" }),
-                Ok(Request::WriteSingleRegister { address, value }) => format!("address {address}, value {value}"),
-                Ok(Request::WriteMultipleCoils { address, values }) => format!("address {address}, {} coils", values.len()),
-                Ok(Request::WriteMultipleRegisters { address, values }) => {
-                    format!("address {address}, values {values:?}")
-                }
-                Ok(Request::Other { data, .. }) => format!("{} bytes of data", data.len()),
-                Err(e) => format!("malformed: a server answers {e}"),
-            }
-        } else {
-            match Response::parse(&frame.pdu) {
-                Ok((_, Response::Bits(bits))) => format!("{} bits", bits.len()),
-                Ok((_, Response::Registers(regs))) => format!("registers {regs:?}"),
-                Ok((_, Response::WriteSingleCoil { address, value })) => {
-                    format!("address {address}, {}", if value { "on" } else { "off" })
-                }
-                Ok((_, Response::WriteSingleRegister { address, value })) => format!("address {address}, value {value}"),
-                Ok((_, Response::WriteMultiple { address, quantity })) => format!("address {address}, quantity {quantity}"),
-                Ok((_, Response::Exception(e))) => format!("exception: {e}"),
-                Ok((_, Response::Other(data))) => format!("{} bytes of data", data.len()),
-                Err(_) => "malformed".to_owned(),
-            }
-        };
-        let kind = if request { "Query" } else { "Response" };
-        l.summary = format!("{kind}, transaction {}, unit {}: {detail}", frame.transaction, frame.unit);
-        l.note(if request { "Request" } else { "Response" }, detail.clone());
-        d.push(l);
-        info(
-            d,
-            2,
-            "Modbus/TCP",
-            &format!("{kind}: Trans: {}; Unit: {}, Func: {}: {}", frame.transaction, frame.unit, function & 0x7f, modbus_function(function & 0x7f)),
-        );
-        dir.consume(used);
-    }
-}
-
-fn modbus_function(f: u8) -> &'static str {
-    match f {
-        1 => "Read Coils",
-        2 => "Read Discrete Inputs",
-        3 => "Read Holding Registers",
-        4 => "Read Input Registers",
-        5 => "Write Single Coil",
-        6 => "Write Single Register",
-        15 => "Write Multiple Coils",
-        16 => "Write Multiple Registers",
-        _ => "Other",
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HTTP/1.1
-
-#[derive(Default)]
-enum Http1 {
-    /// Waiting for a request or status line and headers.
-    #[default]
-    Head,
-    /// In a body of known length: bytes left, and the start of it.
-    Body { left: u64, seen: Vec<u8>, total: u64 },
-    /// In a chunked body: bytes left of the current chunk (0 between
-    /// chunks), and the start of it.
-    Chunked { left: u64, seen: Vec<u8>, total: u64 },
-    /// In a body that lasts until the connection closes.
-    ToClose,
-    /// After a CONNECT was accepted: bytes of another protocol.
-    Tunnel,
-}
-
-fn http1(dir: &mut Dir, methods: &mut Methods, place: Place, d: &mut Decoded) {
-    loop {
-        match &mut dir.http1 {
-            Http1::Head => {
-                let Some(end) = dir.buf.windows(4).position(|w| w == b"\r\n\r\n") else { return };
-                let head = dir.buf[..end + 4].to_vec();
-                let mut headers = [httparse::EMPTY_HEADER; 64];
-                let (line, kind, body) = if head.starts_with(b"HTTP/") {
-                    let mut r = httparse::Response::new(&mut headers);
-                    if !matches!(r.parse(&head), Ok(httparse::Status::Complete(_))) {
-                        dir.consume(end + 4);
-                        continue;
-                    }
-                    let code = r.code.unwrap_or(0);
-                    let line = format!("HTTP/1.{} {code} {}", r.version.unwrap_or(1), r.reason.unwrap_or(""));
-                    // A 1xx response is followed by the real one, for the
-                    // same request.
-                    let method = if (100..200).contains(&code) { None } else { methods.0.pop_front() };
-                    let body = match method.as_deref() {
-                        // What follows a CONNECT's 2xx is a tunnel, not HTTP.
-                        Some("CONNECT") if (200..300).contains(&code) => Http1::Tunnel,
-                        Some("HEAD") => Http1::Head,
-                        _ => body_kind(r.headers, (100..200).contains(&code) || code == 204 || code == 304, true),
-                    };
-                    (line, "response", body)
-                } else {
-                    let mut r = httparse::Request::new(&mut headers);
-                    if !matches!(r.parse(&head), Ok(httparse::Status::Complete(_))) {
-                        dir.consume(end + 4);
-                        continue;
-                    }
-                    let line =
-                        format!("{} {} HTTP/1.{}", r.method.unwrap_or("?"), r.path.unwrap_or("?"), r.version.unwrap_or(1));
-                    methods.push(r.method.unwrap_or("?"));
-                    let body = body_kind(r.headers, false, false);
-                    (line, "request", body)
-                };
-                let (buf, base) = place.locate(d, dir.start, &head, "Reassembled HTTP head");
-                let mut l = Layer::new("Hypertext Transfer Protocol", buf, (base, base + head.len()));
-                l.summary = line.clone();
-                // Each header line, with its bytes.
-                let mut at = 0;
-                for (n, text) in head[..end].split(|b| *b == b'\n').enumerate() {
-                    let t = String::from_utf8_lossy(text).trim_end().to_owned();
-                    let range = (base + at, base + at + text.len());
-                    at += text.len() + 1;
-                    if n == 0 {
-                        l.field(if kind == "request" { "Request line" } else { "Status line" }, t, range);
-                    } else if let Some((k, v)) = t.split_once(':') {
-                        l.field(k.trim(), v.trim(), range);
-                    }
-                }
-                d.push(l);
-                info(d, 2, "HTTP", &line);
-                dir.consume(end + 4);
-                dir.http1 = body;
-            }
-            Http1::Body { left, seen, total } => {
-                if dir.buf.is_empty() {
-                    return;
-                }
-                let n = (*left).min(dir.buf.len() as u64) as usize;
-                if seen.len() < 4096 {
-                    seen.extend_from_slice(&dir.buf[..n.min(4096 - seen.len())]);
-                }
-                *left -= n as u64;
-                let (done, total, seen) = (*left == 0, *total, std::mem::take(seen));
-                dir.consume(n);
-                if !done {
-                    if let Http1::Body { seen: s, .. } = &mut dir.http1 {
-                        *s = seen;
-                    }
-                    return;
-                }
-                body_layer(d, total, &seen);
-                dir.http1 = Http1::Head;
-            }
-            Http1::Chunked { left, seen, total } => {
-                if *left == 0 {
-                    // A chunk size line, after the CRLF that ends the chunk before.
-                    let skip = if dir.buf.starts_with(b"\r\n") { 2 } else { 0 };
-                    let Some(end) = dir.buf[skip..].windows(2).position(|w| w == b"\r\n") else { return };
-                    let line = String::from_utf8_lossy(&dir.buf[skip..skip + end]).to_string();
-                    let size = u64::from_str_radix(line.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
-                    if size == 0 {
-                        // The last chunk, and the trailer's empty line.
-                        let Some(rest) = dir.buf[skip + end + 2..].windows(2).position(|w| w == b"\r\n") else { return };
-                        let (total, seen) = (*total, std::mem::take(seen));
-                        dir.consume(skip + end + 2 + rest + 2);
-                        body_layer(d, total, &seen);
-                        dir.http1 = Http1::Head;
-                        continue;
-                    }
-                    *left = size;
-                    *total += size;
-                    dir.consume(skip + end + 2);
-                    continue;
-                }
-                if dir.buf.is_empty() {
-                    return;
-                }
-                let n = (*left).min(dir.buf.len() as u64) as usize;
-                if seen.len() < 4096 {
-                    seen.extend_from_slice(&dir.buf[..n.min(4096 - seen.len())]);
-                }
-                *left -= n as u64;
-                dir.consume(n);
-            }
-            Http1::ToClose | Http1::Tunnel => {
-                let n = dir.buf.len();
-                dir.consume(n);
-                return;
-            }
-        }
-    }
-}
-
-fn body_kind(headers: &[httparse::Header<'_>], none: bool, response: bool) -> Http1 {
-    if none {
-        return Http1::Head;
-    }
-    let get = |name: &str| headers.iter().find(|h| h.name.eq_ignore_ascii_case(name)).map(|h| String::from_utf8_lossy(h.value).to_string());
-    if get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked")) {
-        return Http1::Chunked { left: 0, seen: Vec::new(), total: 0 };
-    }
-    match get("content-length").and_then(|v| v.trim().parse::<u64>().ok()) {
-        Some(0) => Http1::Head,
-        Some(n) => Http1::Body { left: n, seen: Vec::new(), total: n },
-        None if response => Http1::ToClose,
-        None => Http1::Head,
-    }
-}
-
-fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
-    let mut l = Layer::new("HTTP body", 0, (0, 0));
-    l.summary = format!("{total} bytes");
-    if let Some(text) = preview(seen) {
-        l.note("Text", text);
-    }
-    d.push(l);
-}
 
 // ---------------------------------------------------------------------------
 // HTTP/2
@@ -967,15 +585,43 @@ struct Tls {
     /// Each direction's decryption, once the keys are known.
     keys: [Option<DirKeys>; 2],
     /// The decrypted stream of each direction, and its protocol.
-    inner: [Dir; 2],
-    inner_proto: Option<bool>,
-    inner_methods: Methods,
+    inner: Option<Conversation>,
+    inner_offsets: [u64; 2],
     /// Handshake messages cut across records, plain and decrypted, until
     /// they are whole.
     hs_plain: [Vec<u8>; 2],
     hs_sealed: [Vec<u8>; 2],
     /// A KeyUpdate came in this direction: its next records use new keys.
     key_update: [bool; 2],
+}
+
+struct TlsSession {
+    tls: Tls,
+    dirs: [Option<Observed<protocols::TlsRecords>>; 2],
+}
+impl Default for TlsSession {
+    fn default() -> Self {
+        Self { tls: Tls::default(), dirs: std::array::from_fn(|_| Some(Observed::with_buffer(protocols::TlsRecords::default(), 65_540))) }
+    }
+}
+impl Protocol for TlsSession {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, keys: &[KeyLine]) {
+        let i = usize::from(reverse);
+        if let Some(dir) = &mut self.dirs[i] {
+            dir.data_with(bytes, at, d, |item, raw, start, place, d| self.tls.present_record(i, item, raw, start, place, d, keys));
+        }
+    }
+    fn waiting(&self, reverse: bool) -> bool {
+        self.dirs[usize::from(reverse)].as_ref().is_some_and(Observed::waiting)
+    }
+    fn lost(&mut self, reverse: bool) {
+        let i = usize::from(reverse);
+        let slot = &mut self.dirs[i];
+        *slot = slot.take().map(Observed::reset);
+        if let Some(inner) = &mut self.tls.inner { inner.lost(reverse); }
+        self.tls.hs_plain[i].clear();
+        self.tls.hs_sealed[i].clear();
+    }
 }
 
 /// The longest handshake message put together from several records.
@@ -1118,7 +764,7 @@ impl DirKeys {
     fn open(&mut self, header: &[u8], body: &[u8]) -> Option<(u8, Vec<u8>, bool)> {
         if let Some(hs) = &self.handshake {
             if let Some((kind, plain)) = open_with(hs, self.seq, header, body) {
-                self.seq += 1;
+                self.seq = self.seq.checked_add(1)?;
                 return Some((kind, plain, false));
             }
             let (kind, plain) = open_with(&self.app, 0, header, body)?;
@@ -1127,7 +773,7 @@ impl DirKeys {
             return Some((kind, plain, true));
         }
         let (kind, plain) = open_with(&self.app, self.seq, header, body)?;
-        self.seq += 1;
+        self.seq = self.seq.checked_add(1)?;
         Some((kind, plain, true))
     }
 }
@@ -1154,31 +800,18 @@ impl Tls {
         }
     }
 
-    fn data(&mut self, i: usize, dir: &mut Dir, place: Place, d: &mut Decoded, keys: &[KeyLine]) {
-        while dir.buf.len() >= 5 {
-            let len = usize::from(be16(&dir.buf, 3));
-            if 5 + len > MAX_BUFFER && dir.buf.len() < 5 + len {
-                // Far longer than TLS allows (RFC 8446, 5.2): shown by its
-                // header, and skipped.
-                let header = dir.buf[..5].to_vec();
-                let (buf, base) = place.locate(d, dir.start, &header, "TLS record header");
-                let mut l = Layer::new("Transport Layer Security", buf, (base, base + 5));
-                l.field("Content type", header[0].to_string(), (base, base + 1));
-                l.field("Length", len.to_string(), (base + 3, base + 5));
-                l.summary = format!("a {len}-byte record, longer than TLS allows");
-                d.push(l);
-                d.tag("malformed");
-                info(d, 1, "TLS", "Record too long");
-                dir.consume_message(5 + len);
-                continue;
-            }
-            if dir.buf.len() < 5 + len {
-                return;
-            }
-            let record = dir.buf[..5 + len].to_vec();
-            let (buf, base) = place.locate(d, dir.start, &record, "Reassembled TLS record");
-            dir.consume(5 + len);
-            self.record(i, &record, buf, base, d, keys);
+    #[allow(clippy::too_many_arguments)]
+    fn present_record(&mut self, i: usize, item: protocols::Record, record: &[u8], start: u64, place: &Placement, d: &mut Decoded, keys: &[KeyLine]) {
+        if item.oversized {
+            let mut layer = Layer::new("Transport Layer Security", 0, (0, record.len()));
+            layer.summary = protocols::TlsRecords::summary(&item);
+            protocols::TlsRecords::fields(&item, record, &mut layer);
+            place.push(d, start, record, "TLS record header", layer);
+            d.tag("malformed");
+            info(d, 1, "TLS", "Record too long");
+        } else {
+            let (buf, base) = place.locate(d, start, record, "Reassembled TLS record");
+            self.record(i, record, buf, base, d, keys);
         }
     }
 
@@ -1188,16 +821,10 @@ impl Tls {
         let body = &record[5..];
         let version = |tls: &Tls| if tls.tls13 { "TLSv1.3" } else if tls.cipher.is_some() { "TLSv1.2" } else { "TLS" };
         let mut l = Layer::new("Transport Layer Security", buf, (base, base + record.len()));
-        let kind_name = match kind {
-            20 => "Change Cipher Spec",
-            21 => "Alert",
-            22 => "Handshake",
-            23 => "Application Data",
-            _ => "unknown",
-        };
-        l.field("Content type", format!("{kind_name} ({kind})"), (base, base + 1));
-        l.field("Version", format!("0x{:04x}", be16(record, 1)), (base + 1, base + 3));
-        l.field("Length", body.len().to_string(), (base + 3, base + 5));
+        protocols::TlsRecords::fields(&protocols::Record { length: body.len(), oversized: false }, record, &mut l);
+        for field in &mut l.fields {
+            field.range = field.range.and_then(|(a, b)| Some((base.checked_add(a)?, base.checked_add(b)?)));
+        }
         match kind {
             22 => {
                 let names = self.handshake_records(i, body, buf, base + 5, d, &mut l, false);
@@ -1265,7 +892,7 @@ impl Tls {
                             _ => {
                                 l.summary = format!("{version} Application Data, {} bytes decrypted", plain.len());
                                 d.push(l);
-                                let inner_place = Place { stream_start: self.inner[i].start + self.inner[i].buf.len() as u64, buf: pb, offset: Some(0), len: plain.len() };
+                                let inner_place = Place { stream_start: self.inner_offsets[i], buf: pb, offset: Some(0), len: plain.len() };
                                 self.inner_data(i, &plain, inner_place, d);
                             }
                         }
@@ -1279,28 +906,25 @@ impl Tls {
         }
     }
 
-    /// Feeds decrypted application data to HTTP/1.1 or HTTP/2.
+    /// Feeds decrypted application data through the public selection mechanism.
     fn inner_data(&mut self, i: usize, plain: &[u8], place: Place, d: &mut Decoded) {
-        let dir = &mut self.inner[i];
-        dir.push(plain, &place);
-        if self.inner_proto.is_none() {
-            self.inner_proto = match self.alpn.as_deref() {
-                Some("h2") => Some(true),
-                Some(_) => Some(false),
-                None if dir.buf.starts_with(HTTP2_PREFACE) => Some(true),
-                None if looks_like_http1(&dir.buf) => Some(false),
-                None => None,
+        self.inner_offsets[i] = self.inner_offsets[i].saturating_add(plain.len() as u64);
+        if self.inner.is_none() {
+            let mut registry = Registry::new();
+            register_http(&mut registry);
+            let selected = match self.alpn.as_deref() {
+                Some("h2") => "http2".to_owned(),
+                Some(_) => "http1".to_owned(),
+                None => {
+                    let selection = Selection { transport: Transport::Tcp, ports: (0, 0), first: plain.get(..plain.len().min(64)).unwrap_or_default() };
+                    let Ok(name) = registry.select(selection) else { return };
+                    name.to_owned()
+                }
             };
+            registry.choose(&selected);
+            self.inner = Some(Conversation::with_registry(0, 0, registry));
         }
-        match self.inner_proto {
-            Some(true) => http2(dir, place, d),
-            Some(false) => http1(dir, &mut self.inner_methods, place, d),
-            None => {
-                let n = dir.buf.len();
-                dir.consume(n);
-            }
-        }
-        dir.limit();
+        if let Some(conversation) = &mut self.inner { conversation.data(i != 0, plain, place, d, &[]); }
     }
 
     /// Decodes the handshake messages that `body`, at `base` in buffer
@@ -1377,8 +1001,7 @@ impl Tls {
                             _ => {}
                         }
                     }
-                    if let Some(sni) = &self.sni {
-                        let last = names.last_mut().unwrap();
+                    if let Some(sni) = &self.sni && let Some(last) = names.last_mut() {
                         *last = format!("Client Hello ({sni})");
                     }
                 }
@@ -1589,7 +1212,7 @@ mod tests {
         f.c.lost(true);
         let d = f.send(true, &frame(1, 0x4, 3, &[0x88, 0xbe]), 1500);
         assert!(d.layers.is_empty());
-        assert!(f.c.dirs[1].http2.lost);
+        assert!(!f.c.waiting(true));
     }
 
     /// A DATA frame longer than the buffer is shown by its header and
@@ -1622,6 +1245,33 @@ mod tests {
         }
         assert_eq!(infos[0], "DNS message of 39959 bytes, not decoded");
         assert!(infos.last().unwrap().starts_with("Standard query response 0x1234"), "{infos:?}");
+    }
+
+    #[test]
+    fn a_complete_large_item_keeps_its_packet_bytes() {
+        let mut dns = Feeder::new((40000, 53));
+        let mut message = 40_000u16.to_be_bytes().to_vec();
+        message.resize(40_002, 0);
+        let d = dns.send(false, &message, message.len());
+        assert_eq!(d.layers[0].range, (2, message.len()));
+        assert_eq!(d.layers[0].buf, 0);
+        assert!(d.extra.is_empty());
+
+        let mut tls = Feeder::new((40000, 443));
+        tls.send(false, &[22, 3, 3, 0, 0], 1500);
+        let mut record = vec![23, 3, 3, 0x9c, 0x40];
+        record.resize(40_005, 1);
+        let d = tls.send(false, &record, record.len());
+        assert_eq!(d.layers[0].range, (0, record.len()));
+        assert!(!d.tags.contains(&"malformed"));
+        assert_eq!(d.info, "Application Data");
+
+        let mut http = Feeder::new((40000, 80));
+        let request = format!("GET /{} HTTP/1.1\r\n\r\n", "x".repeat(40_000));
+        let d = http.send(false, request.as_bytes(), request.len());
+        assert_eq!(d.layers[0].range, (0, request.len()));
+        assert_eq!(d.layers[0].buf, 0);
+        assert!(d.info.starts_with("GET /"));
     }
 
     #[test]
@@ -1682,11 +1332,10 @@ mod tests {
         let mut at = 0u64;
         let mut feed = |tls: &mut Tls, record: &[u8]| {
             let mut d = Decoded::default();
-            let mut dir = Dir::default();
+            let mut dir = Observed::new(protocols::TlsRecords::default());
             let place = Place { stream_start: at, buf: 0, offset: Some(0), len: record.len() };
             at += record.len() as u64;
-            dir.push(record, &place);
-            tls.data(0, &mut dir, place, &mut d, &[]);
+            dir.data_with(record, place, &mut d, |item, raw, start, place, d| tls.present_record(0, item, raw, start, place, d, &[]));
             d.tags.contains(&"decrypted")
         };
         const KEY_UPDATE: [u8; 5] = [24, 0, 0, 1, 0];
