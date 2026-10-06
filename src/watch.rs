@@ -380,10 +380,13 @@ pub(crate) struct Note {
 /// One line of an `SSLKEYLOGFILE`: a TLS secret and the client random it
 /// belongs to.
 #[derive(Clone, Debug)]
-pub(crate) struct KeyLine {
-    pub(crate) label: String,
-    pub(crate) client_random: Vec<u8>,
-    pub(crate) secret: Vec<u8>,
+pub struct KeyLine {
+    /// SSLKEYLOGFILE label, such as CLIENT_TRAFFIC_SECRET_0.
+    pub label: String,
+    /// ClientHello random identifying the session.
+    pub client_random: Vec<u8>,
+    /// Traffic secret bytes.
+    pub secret: Vec<u8>,
 }
 
 const MAX_NOTES: usize = 5000;
@@ -404,6 +407,8 @@ pub(crate) struct Graph {
     /// The id of the next group.
     next_group: AtomicU64,
     state: Mutex<GraphState>,
+    /// Application decoders for links watched from now on.
+    pub(crate) protocols: Mutex<crate::observe::Registry>,
     /// Watched links, so observers of one link share one decoded copy.
     pub(crate) watches: Mutex<std::collections::HashMap<u64, Arc<crate::observe::LinkWatch>>>,
 }
@@ -433,6 +438,7 @@ impl Graph {
             next_group: AtomicU64::new(1),
             state: Mutex::new(GraphState { next_note: 1, sweep_at: 64, ..GraphState::default() }),
             watches: Mutex::default(),
+            protocols: Mutex::default(),
         })
     }
 

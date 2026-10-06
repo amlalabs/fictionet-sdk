@@ -117,7 +117,7 @@ impl LinkWatch {
                 guard: None,
                 after: 0,
                 next_row: 1,
-                dissector: Dissector::default(),
+                dissector: Dissector::with_registry(lock(&graph.protocols).clone()),
                 rows: VecDeque::new(),
                 row_bytes: 0,
                 released: Instant::now(),

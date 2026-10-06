@@ -4,13 +4,19 @@
 //! as its library. That build has no `cfg(test)`, so the copied modules' unit
 //! tests are compiled out. The SDK already runs them in `cargo test --lib`;
 //! running their parser and fuzz loops again would nearly double that work.
-//! This integration target runs only the two public-trait checks below.
+//! This integration target runs only the public-trait checks below.
 
 #![allow(dead_code)]
 
 #[cfg(not(test))]
 macro_rules! protocols {
     () => {
+        #[path = "../src/observe/protocols.rs"]
+        pub mod observe_protocols;
+        #[path = "../src/observe/tls.rs"]
+        pub mod observe_tls;
+        #[path = "../src/observe/conversation.rs"]
+        pub mod observe_conversation;
         #[path = "../src/stdlib/amqp.rs"]
         pub mod amqp;
         #[path = "../src/stdlib/asn1.rs"]
@@ -49,6 +55,10 @@ macro_rules! protocols {
         pub mod gre;
         #[path = "../src/stdlib/grpc.rs"]
         pub mod grpc;
+        #[path = "../src/stdlib/hpack.rs"]
+        pub mod hpack;
+        #[path = "../src/stdlib/huffman.rs"]
+        pub mod huffman;
         #[path = "../src/stdlib/http3.rs"]
         pub mod http3;
         #[path = "../src/stdlib/iec104.rs"]
@@ -119,6 +129,8 @@ macro_rules! protocols {
         pub mod portmap;
         #[path = "../src/stdlib/postgres.rs"]
         pub mod postgres;
+        #[path = "../src/stdlib/prefix_int.rs"]
+        pub mod prefix_int;
         #[path = "../src/stdlib/protobuf.rs"]
         pub mod protobuf;
         #[path = "../src/stdlib/proxy_protocol.rs"]
@@ -165,6 +177,8 @@ macro_rules! protocols {
         pub mod stun;
         #[path = "../src/stdlib/syslog.rs"]
         pub mod syslog;
+        #[path = "../src/stdlib/tcp_stream.rs"]
+        pub mod tcp_stream;
         #[path = "../src/stdlib/tds.rs"]
         pub mod tds;
         #[path = "../src/stdlib/telnet.rs"]
@@ -247,4 +261,127 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     finish(&mut stream, |item| requests.push(item)).unwrap();
     assert_eq!(requests, [Ok(request)]);
     assert!(stream.is_done());
+}
+
+#[test]
+fn copied_presenters_plug_into_observe_and_construct_display_items() {
+    use fictionet::observe::{
+        Decoded, Layer, Match, Observed, Place, Present, Registry, Selection, Transport,
+    };
+    let mut registry = Registry::new();
+    registry.register(
+        "modbus",
+        |_| Match::Yes,
+        |_| {
+            [
+                observe_protocols::Modbus::new(true),
+                observe_protocols::Modbus::new(false),
+            ]
+        },
+    );
+    let mut protocol = registry
+        .open(Selection {
+            transport: Transport::Tcp,
+            ports: (40000, 502),
+            first: &[],
+            alpn: None,
+        })
+        .unwrap();
+    let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
+    let mut packet = Decoded::default();
+    protocol.data(
+        false,
+        &bytes,
+        Place {
+            offset: Some(0),
+            len: bytes.len(),
+            ..Place::default()
+        },
+        &mut packet,
+        &[],
+    );
+    assert_eq!(packet.proto, "Modbus/TCP");
+    assert_eq!(packet.layers[0].range, (0, bytes.len()));
+    let item = observe_protocols::Display::from_packet(packet, "Copied frame");
+    assert!(observe_protocols::Modbus::summary(&item).contains("transaction 7"));
+    assert!(format!("{registry:?}").contains("modbus"));
+    assert!(
+        format!("{:?}", Observed::new(observe_protocols::Modbus::new(true))).contains("Modbus/TCP")
+    );
+
+    let mut packet = Decoded::default();
+    packet.application(2, "Custom", "message");
+    assert_eq!(packet.level(), 2);
+    packet.push(Layer::new("Custom", 0, (0, 1)));
+    let item = observe_protocols::Display::from_packet(packet, "Custom bytes");
+    let mut layer = Layer::new("Custom", 0, (0, 1));
+    observe_protocols::Dns::fields(&item, b"x", &mut layer);
+    let mut packet = Decoded::default();
+    observe_protocols::Dns::present(
+        &item,
+        b"x",
+        0,
+        &fictionet::observe::Placement::new(Place {
+            offset: Some(4),
+            len: 1,
+            ..Place::default()
+        }),
+        &mut packet,
+    );
+    assert_eq!(packet.layers[0].range, (4, 5));
+    assert_eq!(packet.info, "message");
+}
+
+#[test]
+fn copied_modbus_session_stops_both_directions_after_bad_framing() {
+    use fictionet::observe::{Conversation, Decoded, Match, Place, Registry};
+    let mut registry = Registry::new();
+    registry.register_protocol(
+        "modbus",
+        |_| Match::Yes,
+        |s, _| Box::new(observe_protocols::ModbusSession::new(s.ports)),
+    );
+    let mut conversation = Conversation::with_registry(40000, 502, registry);
+    let bad = [0, 9, 0, 5, 0, 6, 1, 3, 0, 0, 0, 1];
+    let reply = [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2];
+    for (reverse, bytes) in [(false, &bad[..]), (true, &reply[..])] {
+        let mut packet = Decoded::default();
+        conversation.data(reverse, bytes, Place::default(), &mut packet, &[]);
+        assert!(packet.layers.is_empty());
+        assert!(packet.tags.is_empty());
+        assert!(!conversation.waiting(reverse));
+    }
+}
+
+#[test]
+fn copied_tls_and_selection_driver_use_the_public_registry() {
+    use fictionet::observe::{Decoded, Match, Place, Registry};
+    let mut registry = Registry::default();
+    registry.register_protocol(
+        "tls",
+        |_| Match::Yes,
+        |s, registry| Box::new(observe_tls::TlsSession::new(s.ports, registry.clone())),
+    );
+    let mut conversation = observe_conversation::Conversation::with_registry(40000, 443, registry);
+    let mut packet = Decoded::default();
+    let record = [22, 3, 3, 0, 4, 20, 0, 0, 0];
+    conversation.data(false, &record[..3], Place::default(), &mut packet, &[]);
+    assert!(conversation.waiting(false));
+    conversation.data(
+        false,
+        &record[3..],
+        Place {
+            stream_start: 3,
+            ..Place::default()
+        },
+        &mut packet,
+        &[],
+    );
+    assert_eq!(packet.proto, "TLS");
+    assert_eq!(packet.info, "Finished");
+    assert_eq!(packet.layers[0].range, (0, record.len()));
+    assert_eq!(packet.extra[0].1, record);
+    assert!(!conversation.waiting(false));
+    conversation.lost(false);
+    assert!(format!("{packet:?}").contains("Finished"));
 }

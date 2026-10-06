@@ -168,6 +168,17 @@ the codec tools. The file's `fictionet::stdlib::...` imports need no change.
 [`custom_protocol`](examples/custom_protocol) shows this with a Modbus register.
 Run it with `cargo run --example custom_protocol`; it needs no network or root.
 
+For header compression outside the web server, use the public
+[`stdlib::hpack`](src/stdlib/hpack.rs) block encoder and decoder for HTTP/2,
+or [`stdlib::qpack`](src/stdlib/qpack.rs) for HTTP/3. Both use
+[`stdlib::huffman`](src/stdlib/huffman.rs).
+
+To show your decoder in observe, implement `observe::Present` and register it
+with `observe::Registry`. Built-ins use the same registry. Match by port or
+first bytes, or select a name explicitly. Use `Dissector::with_registry` for
+capture packets, or `cx.observe_protocols` for live world watches. See
+[adding an observe protocol](docs/observe-protocols.md).
+
 ## Where sandboxes can run
 
 | Where the sandbox runs | How it attaches | Tested by |

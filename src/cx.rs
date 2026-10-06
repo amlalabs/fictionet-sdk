@@ -262,6 +262,14 @@ impl Cx {
         self.run.graph.observed()
     }
 
+    /// Sets application decoders for newly watched links in this world.
+    /// Existing watches keep their registry and connection state. Call this
+    /// before clients start observing to include custom protocols in the
+    /// dashboard, JSON replies, and captured packet details.
+    pub fn observe_protocols(&self, registry: crate::observe::Registry) {
+        *self.run.graph.protocols.lock().unwrap_or_else(|e| e.into_inner()) = registry;
+    }
+
     /// Starts a custom event called `name`, which observers see next to
     /// the task that sent it. Add fields, then call
     /// [`emit`](crate::observe::Event::emit).

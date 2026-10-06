@@ -35,6 +35,12 @@
 //! [`codec::Decode`] and [`codec::Wire`] implementations into [`codec::Stream`]
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
+//! Implement [`Present`](crate::observe::Present) to show its items and byte
+//! ranges in observe, then add it to [`Registry`](crate::observe::Registry).
+//!
+//! Use [`hpack::Table`] and [`hpack::Encoder`] for complete HTTP/2 header
+//! blocks. Each direction has its own dynamic table. [`huffman`] supplies
+//! the RFC 7541 string code shared by [`hpack`] and [`qpack`].
 //!
 //! # Three kinds of functions
 //!
@@ -152,7 +158,9 @@ pub mod geneve;
 pub mod git_protocol;
 pub mod gre;
 pub mod grpc;
+pub mod hpack;
 pub mod http3;
+pub mod huffman;
 pub mod icmp;
 pub mod iec104;
 pub mod igmp;
@@ -189,6 +197,8 @@ pub mod pim;
 pub mod pop3;
 pub mod portmap;
 pub mod postgres;
+/// RFC 7541 prefix integers shared by HPACK and QPACK.
+pub mod prefix_int;
 pub mod protobuf;
 pub mod proxy_protocol;
 pub mod qpack;
@@ -214,6 +224,8 @@ pub mod ssh;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
+#[expect(missing_docs, reason = "Reassembly is documented on its public types.")]
+pub mod tcp_stream;
 pub mod tds;
 pub mod telnet;
 pub mod tftp;
