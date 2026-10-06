@@ -130,10 +130,7 @@ impl Type {
 /// Class 0 holds the methods, classes 2, 4 and 5 the responses, and
 /// class 7 the signals of CoAP over TCP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Code(
-    /// The packed three-bit class and five-bit detail.
-    pub u8,
-);
+pub struct Code(pub u8);
 
 #[allow(missing_docs)] // each name is the code's name in the registry
 impl Code {
@@ -492,15 +489,6 @@ pub struct CoapOption {
     pub value: Vec<u8>,
 }
 
-/// A message's options, sorted by number, with repeats in insertion order.
-/// Readers and setters preserve this order. Writers refuse decreasing numbers.
-/// Callers that change the public list must keep it sorted before writing.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
-pub struct Options(
-    /// The options in wire order, including repeated numbers.
-    pub Vec<CoapOption>,
-);
-
 impl CoapOption {
     /// An option carrying an unsigned value in its shortest encoding.
     pub fn uint(number: u16, value: u32) -> Self {
@@ -512,6 +500,12 @@ impl CoapOption {
         Self { number, value: bytes }
     }
 }
+
+/// A message's options, sorted by number, with repeats in insertion order.
+/// Readers and setters preserve this order. Writers refuse decreasing numbers.
+/// Callers that change the public list must keep it sorted before writing.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Options(pub Vec<CoapOption>);
 
 impl Options {
     /// No options.
@@ -588,9 +582,7 @@ impl Options {
 
     /// Sets option `number` to the shortest bytes for `n`.
     pub fn set_uint(&mut self, number: u16, n: u32) {
-        self.remove(number);
-        let at = self.0.partition_point(|o| o.number <= number);
-        self.0.insert(at, CoapOption::uint(number, n));
+        self.set(number, CoapOption::uint(number, n).value);
     }
 
     /// Every value of option `number` as text, or `None` if one is not

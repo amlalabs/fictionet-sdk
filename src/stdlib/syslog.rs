@@ -2491,6 +2491,7 @@ mod tests {
             }
             check_stream(&buf);
         }
+        let alphabet = ["é", "\n"];
         for round in 0..2000 {
             // Messages built from random values: what is written reads back,
             // and writing that again gives the same bytes.
@@ -2519,7 +2520,11 @@ mod tests {
             for _ in 0..rng.index(4) {
                 let mut e = SdElement::new(rng.text(40));
                 for _ in 0..rng.index(4) {
-                    e = e.param(rng.text(5), rng.text(10));
+                    let mut value = rng.text(10);
+                    if rng.coin() {
+                        value.push_str(alphabet[rng.index(alphabet.len())]);
+                    }
+                    e = e.param(rng.text(5), value);
                 }
                 m.structured_data.push(e);
             }
@@ -2558,11 +2563,21 @@ mod tests {
                     }
                 }
                 m.msg = rng.text(20).into_bytes();
+            }
+            if m.bom && rng.coin() {
+                m.msg.extend_from_slice(alphabet[rng.index(alphabet.len())].as_bytes());
+            }
+            if round % 2 == 0 {
                 assert!(m.to_bytes().is_ok());
             }
             contract::check_wire_value(&m);
             if let Ok(bytes) = m.to_bytes() {
-                check_stream(&Frame::new(Framing::OctetCounting, bytes).to_bytes().unwrap());
+                let framing = if rng.coin() { Framing::OctetCounting } else { Framing::NonTransparent };
+                let frame = Frame::new(framing, bytes);
+                contract::check_wire_value(&frame);
+                if let Ok(bytes) = frame.to_bytes() {
+                    check_stream(&bytes);
+                }
             }
 
             let mut b = BsdMessage::new(m.priority, m.msg.clone());

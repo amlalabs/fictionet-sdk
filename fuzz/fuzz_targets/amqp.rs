@@ -6,8 +6,8 @@ use fictionet::stdlib::amqp::{
     BasicProperties, ContentHeader, Frame, FrameKind, Frames, MAX_PAYLOAD, Method, Table, content_frames, frame_limit,
     plain_credentials,
 };
-use libfuzzer_sys::fuzz_target;
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use libfuzzer_sys::fuzz_target;
 
 /// Writes a message with `content_frames` and reads it back through a
 /// decoder of the same frame-max.

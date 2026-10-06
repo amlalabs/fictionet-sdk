@@ -1523,8 +1523,7 @@ mod tests {
             })
         };
         let over = publish(MAX_REMAINING_LENGTH - 2);
-        let too_large = Error::Unwritable;
-        assert_eq!(over.encoded_len(), Err(too_large));
+        assert_eq!(over.encoded_len(), Err(Error::Unwritable));
         assert_eq!(over.to_bytes(), Err(Error::Unwritable));
         drop(over);
         assert_eq!(publish(MAX_REMAINING_LENGTH - 3).encoded_len(), Ok(MAX_PACKET));
@@ -1602,6 +1601,10 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
+        // 4 MiB of PINGREQs, pushed at once. Moving the rest of the buffer
+        // down after each packet took about 23 s here (1.4 s for 1 MiB,
+        // optimized); taking them by offset takes milliseconds. The 5 s
+        // bound is loose so a slow machine still passes.
         let data = [0xc0u8, 0].repeat(1 << 21);
         let started = std::time::Instant::now();
         let mut stream = Stream::new(Frames::new());
@@ -1706,6 +1709,7 @@ mod tests {
         let make = || Frames::with_limit(small);
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
         for packet in decode_all(Frames::new, data).0 {
+            contract::check_wire_value(&packet);
             assert_eq!(packet.encoded_len(), Ok(packet.to_bytes().unwrap().len()));
         }
     }
@@ -1716,7 +1720,20 @@ mod tests {
         let samples = samples();
         let mut read = 0;
         for i in 0..4000 {
-            let mut bytes = if i % 2 == 0 { rng.bytes(48) } else { samples[rng.index(samples.len())].1.clone() };
+            let mut bytes = if i % 2 == 0 {
+                let mut b = rng.bytes(48);
+                if let Some(first) = b.first_mut()
+                    && rng.coin()
+                {
+                    *first &= 0xf3;
+                }
+                if b.len() > 1 && rng.coin() {
+                    b[1] &= 0x3f;
+                }
+                b
+            } else {
+                samples[rng.index(samples.len())].1.clone()
+            };
             if i % 4 != 1 {
                 mutate(&mut rng, &mut bytes);
             }

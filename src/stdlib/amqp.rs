@@ -104,74 +104,47 @@ pub const MAX_DEPTH: usize = 32;
 
 /// Frame type codes.
 pub mod frame_type {
-    /// The method frame type code.
+    #![allow(missing_docs)]
     pub const METHOD: u8 = 1;
-    /// The header frame type code.
     pub const HEADER: u8 = 2;
-    /// The body frame type code.
     pub const BODY: u8 = 3;
-    /// The heartbeat frame type code.
     pub const HEARTBEAT: u8 = 8;
 }
 
 /// Class identifiers this module reads and writes.
 pub mod class {
-    /// The connection class identifier.
+    #![allow(missing_docs)]
     pub const CONNECTION: u16 = 10;
-    /// The channel class identifier.
     pub const CHANNEL: u16 = 20;
-    /// The exchange class identifier.
     pub const EXCHANGE: u16 = 40;
-    /// The queue class identifier.
     pub const QUEUE: u16 = 50;
-    /// The basic class identifier.
     pub const BASIC: u16 = 60;
-    /// The confirm class identifier.
     pub const CONFIRM: u16 = 85;
-    /// The tx class identifier.
     pub const TX: u16 = 90;
 }
 
 /// Reply codes, sent in `connection.close`, `channel.close` and
 /// `basic.return`.
 pub mod reply {
-    /// The success reply code.
+    #![allow(missing_docs)]
     pub const SUCCESS: u16 = 200;
-    /// The content too large reply code.
     pub const CONTENT_TOO_LARGE: u16 = 311;
-    /// The no route reply code.
     pub const NO_ROUTE: u16 = 312;
-    /// The no consumers reply code.
     pub const NO_CONSUMERS: u16 = 313;
-    /// The connection forced reply code.
     pub const CONNECTION_FORCED: u16 = 320;
-    /// The invalid path reply code.
     pub const INVALID_PATH: u16 = 402;
-    /// The access refused reply code.
     pub const ACCESS_REFUSED: u16 = 403;
-    /// The not found reply code.
     pub const NOT_FOUND: u16 = 404;
-    /// The resource locked reply code.
     pub const RESOURCE_LOCKED: u16 = 405;
-    /// The precondition failed reply code.
     pub const PRECONDITION_FAILED: u16 = 406;
-    /// The frame error reply code.
     pub const FRAME_ERROR: u16 = 501;
-    /// The syntax error reply code.
     pub const SYNTAX_ERROR: u16 = 502;
-    /// The command invalid reply code.
     pub const COMMAND_INVALID: u16 = 503;
-    /// The channel error reply code.
     pub const CHANNEL_ERROR: u16 = 504;
-    /// The unexpected frame reply code.
     pub const UNEXPECTED_FRAME: u16 = 505;
-    /// The resource error reply code.
     pub const RESOURCE_ERROR: u16 = 506;
-    /// The not allowed reply code.
     pub const NOT_ALLOWED: u16 = 530;
-    /// The not implemented reply code.
     pub const NOT_IMPLEMENTED: u16 = 540;
-    /// The internal error reply code.
     pub const INTERNAL_ERROR: u16 = 541;
 }
 
@@ -905,33 +878,20 @@ pub struct ContentHeader {
 
 /// Property flag bits in a basic content header.
 pub mod property_flag {
-    /// The content type property presence bit.
+    #![allow(missing_docs)]
     pub const CONTENT_TYPE: u16 = 1 << 15;
-    /// The content encoding property presence bit.
     pub const CONTENT_ENCODING: u16 = 1 << 14;
-    /// The headers property presence bit.
     pub const HEADERS: u16 = 1 << 13;
-    /// The delivery mode property presence bit.
     pub const DELIVERY_MODE: u16 = 1 << 12;
-    /// The priority property presence bit.
     pub const PRIORITY: u16 = 1 << 11;
-    /// The correlation id property presence bit.
     pub const CORRELATION_ID: u16 = 1 << 10;
-    /// The reply to property presence bit.
     pub const REPLY_TO: u16 = 1 << 9;
-    /// The expiration property presence bit.
     pub const EXPIRATION: u16 = 1 << 8;
-    /// The message id property presence bit.
     pub const MESSAGE_ID: u16 = 1 << 7;
-    /// The timestamp property presence bit.
     pub const TIMESTAMP: u16 = 1 << 6;
-    /// The type property presence bit.
     pub const TYPE: u16 = 1 << 5;
-    /// The user id property presence bit.
     pub const USER_ID: u16 = 1 << 4;
-    /// The app id property presence bit.
     pub const APP_ID: u16 = 1 << 3;
-    /// The cluster id property presence bit.
     pub const CLUSTER_ID: u16 = 1 << 2;
 }
 
@@ -1102,102 +1062,49 @@ fn header_payload(body_size: u64, pr: &BasicProperties) -> Result<Vec<u8>, Encod
 /// and names its arguments; flags are `bool`s, short strings are
 /// `String`s, and long strings are byte vectors.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Method {
     /// 10.10, broker to client: the protocol version, the broker's
     /// properties, and the SASL mechanisms and locales it offers, each
     /// list separated by spaces.
     ConnectionStart {
-        /// The protocol major version.
         version_major: u8,
-        /// The protocol minor version.
         version_minor: u8,
-        /// The broker properties.
         server_properties: Table,
-        /// The space-separated SASL mechanism names.
         mechanisms: Vec<u8>,
-        /// The space-separated locale names.
         locales: Vec<u8>,
     },
     /// 10.11: the client's properties, its chosen mechanism and locale,
     /// and its SASL response (for PLAIN, a zero byte, the user, a zero
     /// byte and the password).
-    ConnectionStartOk {
-        /// The client properties.
-        client_properties: Table,
-        /// The chosen SASL mechanism.
-        mechanism: String,
-        /// The SASL response bytes.
-        response: Vec<u8>,
-        /// The chosen locale.
-        locale: String,
-    },
+    ConnectionStartOk { client_properties: Table, mechanism: String, response: Vec<u8>, locale: String },
     /// 10.20: a SASL challenge.
-    ConnectionSecure {
-        /// The SASL challenge bytes.
-        challenge: Vec<u8>,
-    },
+    ConnectionSecure { challenge: Vec<u8> },
     /// 10.21: the client's answer to a challenge.
-    ConnectionSecureOk {
-        /// The SASL response bytes.
-        response: Vec<u8>,
-    },
+    ConnectionSecureOk { response: Vec<u8> },
     /// 10.30, broker to client: the most channels, the largest frame and
     /// the heartbeat interval in seconds the broker proposes. 0 means no
     /// limit, or no heartbeats.
-    ConnectionTune {
-        /// The highest channel number; zero means no limit.
-        channel_max: u16,
-        /// The largest frame in bytes; zero means no limit.
-        frame_max: u32,
-        /// The heartbeat interval in seconds; zero disables it.
-        heartbeat: u16,
-    },
+    ConnectionTune { channel_max: u16, frame_max: u32, heartbeat: u16 },
     /// 10.31: what the client settles on.
-    ConnectionTuneOk {
-        /// The highest channel number; zero means no limit.
-        channel_max: u16,
-        /// The largest frame in bytes; zero means no limit.
-        frame_max: u32,
-        /// The heartbeat interval in seconds; zero disables it.
-        heartbeat: u16,
-    },
+    ConnectionTuneOk { channel_max: u16, frame_max: u32, heartbeat: u16 },
     /// 10.40: open the virtual host named.
-    ConnectionOpen {
-        /// The virtual host name.
-        virtual_host: String,
-    },
+    ConnectionOpen { virtual_host: String },
     /// 10.41.
     ConnectionOpenOk,
     /// 10.50: close the connection, with a reply code and text, and the
     /// class and method that caused it, or zeros.
-    ConnectionClose {
-        /// The protocol reply code.
-        reply_code: u16,
-        /// The reply description.
-        reply_text: String,
-        /// The class that caused the reply, or zero.
-        class_id: u16,
-        /// The method that caused the reply, or zero.
-        method_id: u16,
-    },
+    ConnectionClose { reply_code: u16, reply_text: String, class_id: u16, method_id: u16 },
     /// 10.51.
     ConnectionCloseOk,
     /// 10.60, a RabbitMQ extension: the broker has stopped reading
     /// publishes, for the reason given.
-    ConnectionBlocked {
-        /// The reason for this change.
-        reason: String,
-    },
+    ConnectionBlocked { reason: String },
     /// 10.61, a RabbitMQ extension: the broker reads publishes again.
     ConnectionUnblocked,
     /// 10.70, a RabbitMQ extension: a new secret, such as a refreshed
     /// OAuth token.
-    ConnectionUpdateSecret {
-        /// The replacement authentication secret.
-        new_secret: Vec<u8>,
-        /// The reason for this change.
-        reason: String,
-    },
+    ConnectionUpdateSecret { new_secret: Vec<u8>, reason: String },
     /// 10.71.
     ConnectionUpdateSecretOk,
     /// 20.10: open the frame's channel.
@@ -1205,325 +1112,123 @@ pub enum Method {
     /// 20.11.
     ChannelOpenOk,
     /// 20.20: pause (`active` false) or resume content on the channel.
-    ChannelFlow {
-        /// Whether content delivery is enabled.
-        active: bool,
-    },
+    ChannelFlow { active: bool },
     /// 20.21.
-    ChannelFlowOk {
-        /// Whether content delivery is enabled.
-        active: bool,
-    },
+    ChannelFlowOk { active: bool },
     /// 20.40: close the channel, as [`Method::ConnectionClose`] does the
     /// connection.
-    ChannelClose {
-        /// The protocol reply code.
-        reply_code: u16,
-        /// The reply description.
-        reply_text: String,
-        /// The class that caused the reply, or zero.
-        class_id: u16,
-        /// The method that caused the reply, or zero.
-        method_id: u16,
-    },
+    ChannelClose { reply_code: u16, reply_text: String, class_id: u16, method_id: u16 },
     /// 20.41.
     ChannelCloseOk,
     /// 40.10: create an exchange of type `kind` (`direct`, `fanout`,
     /// `topic`, `headers`), or with `passive`, check that it exists.
     ExchangeDeclare {
-        /// The exchange name.
         exchange: String,
-        /// The exchange type.
         kind: String,
-        /// Checks existence without creating the resource.
         passive: bool,
-        /// Keeps the resource across broker restarts.
         durable: bool,
-        /// Deletes the resource when its last user leaves.
         auto_delete: bool,
-        /// Restricts publishing to other exchanges.
         internal: bool,
-        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        /// The extension arguments.
         arguments: Table,
     },
     /// 40.11.
     ExchangeDeclareOk,
     /// 40.20: delete an exchange.
-    ExchangeDelete {
-        /// The exchange name.
-        exchange: String,
-        /// Requires that no consumers or bindings use the resource.
-        if_unused: bool,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-    },
+    ExchangeDelete { exchange: String, if_unused: bool, no_wait: bool },
     /// 40.21.
     ExchangeDeleteOk,
     /// 40.30, a RabbitMQ extension: route from exchange `source` to
     /// exchange `destination`.
-    ExchangeBind {
-        /// The destination exchange.
-        destination: String,
-        /// The source exchange.
-        source: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-        /// The extension arguments.
-        arguments: Table,
-    },
+    ExchangeBind { destination: String, source: String, routing_key: String, no_wait: bool, arguments: Table },
     /// 40.31.
     ExchangeBindOk,
     /// 40.40, a RabbitMQ extension: undo an exchange binding.
-    ExchangeUnbind {
-        /// The destination exchange.
-        destination: String,
-        /// The source exchange.
-        source: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-        /// The extension arguments.
-        arguments: Table,
-    },
+    ExchangeUnbind { destination: String, source: String, routing_key: String, no_wait: bool, arguments: Table },
     /// 40.51.
     ExchangeUnbindOk,
     /// 50.10: create a queue, or with `passive`, check that it exists. An
     /// empty name asks the broker to choose one.
     QueueDeclare {
-        /// The queue name.
         queue: String,
-        /// Checks existence without creating the resource.
         passive: bool,
-        /// Keeps the resource across broker restarts.
         durable: bool,
-        /// Restricts the resource to this connection or consumer.
         exclusive: bool,
-        /// Deletes the resource when its last user leaves.
         auto_delete: bool,
-        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        /// The extension arguments.
         arguments: Table,
     },
     /// 50.11: the queue's name and how many messages and consumers it has.
-    QueueDeclareOk {
-        /// The queue name.
-        queue: String,
-        /// The number of messages in the queue or affected by the operation.
-        message_count: u32,
-        /// The number of consumers on the queue.
-        consumer_count: u32,
-    },
+    QueueDeclareOk { queue: String, message_count: u32, consumer_count: u32 },
     /// 50.20: route messages from `exchange` with `routing_key` to `queue`.
-    QueueBind {
-        /// The queue name.
-        queue: String,
-        /// The exchange name.
-        exchange: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-        /// The extension arguments.
-        arguments: Table,
-    },
+    QueueBind { queue: String, exchange: String, routing_key: String, no_wait: bool, arguments: Table },
     /// 50.21.
     QueueBindOk,
     /// 50.30: drop every message in a queue.
-    QueuePurge {
-        /// The queue name.
-        queue: String,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-    },
+    QueuePurge { queue: String, no_wait: bool },
     /// 50.31: how many messages were dropped.
-    QueuePurgeOk {
-        /// The number of messages in the queue or affected by the operation.
-        message_count: u32,
-    },
+    QueuePurgeOk { message_count: u32 },
     /// 50.40: delete a queue.
-    QueueDelete {
-        /// The queue name.
-        queue: String,
-        /// Requires that no consumers or bindings use the resource.
-        if_unused: bool,
-        /// Requires an empty queue.
-        if_empty: bool,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-    },
+    QueueDelete { queue: String, if_unused: bool, if_empty: bool, no_wait: bool },
     /// 50.41: how many messages were dropped with it.
-    QueueDeleteOk {
-        /// The number of messages in the queue or affected by the operation.
-        message_count: u32,
-    },
+    QueueDeleteOk { message_count: u32 },
     /// 50.50: undo a queue binding.
-    QueueUnbind {
-        /// The queue name.
-        queue: String,
-        /// The exchange name.
-        exchange: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-        /// The extension arguments.
-        arguments: Table,
-    },
+    QueueUnbind { queue: String, exchange: String, routing_key: String, arguments: Table },
     /// 50.51.
     QueueUnbindOk,
     /// 60.10: how many bytes and messages may be sent to consumers before
     /// they acknowledge, on this channel or, with `global`, the
     /// connection.
-    BasicQos {
-        /// The unacknowledged content limit in bytes; zero disables it.
-        prefetch_size: u32,
-        /// The unacknowledged message limit; zero disables it.
-        prefetch_count: u16,
-        /// Applies the limit to the connection.
-        global: bool,
-    },
+    BasicQos { prefetch_size: u32, prefetch_count: u16, global: bool },
     /// 60.11.
     BasicQosOk,
     /// 60.20: start a consumer on `queue`. An empty tag asks the broker to
     /// choose one.
     BasicConsume {
-        /// The queue name.
         queue: String,
-        /// The consumer identifier.
         consumer_tag: String,
-        /// Suppresses messages from the same connection.
         no_local: bool,
-        /// Disables explicit delivery acknowledgements.
         no_ack: bool,
-        /// Restricts the resource to this connection or consumer.
         exclusive: bool,
-        /// Suppresses the method acknowledgement.
         no_wait: bool,
-        /// The extension arguments.
         arguments: Table,
     },
     /// 60.21: the consumer's tag.
-    BasicConsumeOk {
-        /// The consumer identifier.
-        consumer_tag: String,
-    },
+    BasicConsumeOk { consumer_tag: String },
     /// 60.30: stop a consumer.
-    BasicCancel {
-        /// The consumer identifier.
-        consumer_tag: String,
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-    },
+    BasicCancel { consumer_tag: String, no_wait: bool },
     /// 60.31.
-    BasicCancelOk {
-        /// The consumer identifier.
-        consumer_tag: String,
-    },
+    BasicCancelOk { consumer_tag: String },
     /// 60.40: publish the message that follows to `exchange` with
     /// `routing_key`. Content follows.
-    BasicPublish {
-        /// The exchange name.
-        exchange: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-        /// Returns messages that cannot be routed.
-        mandatory: bool,
-        /// Requires immediate delivery to a consumer.
-        immediate: bool,
-    },
+    BasicPublish { exchange: String, routing_key: String, mandatory: bool, immediate: bool },
     /// 60.50: a mandatory message could not be routed, and comes back.
     /// Content follows.
-    BasicReturn {
-        /// The protocol reply code.
-        reply_code: u16,
-        /// The reply description.
-        reply_text: String,
-        /// The exchange name.
-        exchange: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-    },
+    BasicReturn { reply_code: u16, reply_text: String, exchange: String, routing_key: String },
     /// 60.60: a message for a consumer. Content follows.
-    BasicDeliver {
-        /// The consumer identifier.
-        consumer_tag: String,
-        /// The channel delivery sequence number.
-        delivery_tag: u64,
-        /// Marks a delivery attempted before.
-        redelivered: bool,
-        /// The exchange name.
-        exchange: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-    },
+    BasicDeliver { consumer_tag: String, delivery_tag: u64, redelivered: bool, exchange: String, routing_key: String },
     /// 60.70: take one message from `queue`.
-    BasicGet {
-        /// The queue name.
-        queue: String,
-        /// Disables explicit delivery acknowledgements.
-        no_ack: bool,
-    },
+    BasicGet { queue: String, no_ack: bool },
     /// 60.71: the message taken, and how many are left. Content follows.
-    BasicGetOk {
-        /// The channel delivery sequence number.
-        delivery_tag: u64,
-        /// Marks a delivery attempted before.
-        redelivered: bool,
-        /// The exchange name.
-        exchange: String,
-        /// The routing key used by the binding or message.
-        routing_key: String,
-        /// The number of messages in the queue or affected by the operation.
-        message_count: u32,
-    },
+    BasicGetOk { delivery_tag: u64, redelivered: bool, exchange: String, routing_key: String, message_count: u32 },
     /// 60.72: the queue was empty.
     BasicGetEmpty,
     /// 60.80: acknowledge a delivery, or with `multiple`, every one up to
     /// it. In confirm mode the broker sends it for publishes.
-    BasicAck {
-        /// The channel delivery sequence number.
-        delivery_tag: u64,
-        /// Includes every outstanding delivery through this tag.
-        multiple: bool,
-    },
+    BasicAck { delivery_tag: u64, multiple: bool },
     /// 60.90: refuse one delivery.
-    BasicReject {
-        /// The channel delivery sequence number.
-        delivery_tag: u64,
-        /// Returns refused deliveries to their queues.
-        requeue: bool,
-    },
+    BasicReject { delivery_tag: u64, requeue: bool },
     /// 60.100: redeliver unacknowledged messages, with no reply.
-    BasicRecoverAsync {
-        /// Returns refused deliveries to their queues.
-        requeue: bool,
-    },
+    BasicRecoverAsync { requeue: bool },
     /// 60.110: redeliver unacknowledged messages.
-    BasicRecover {
-        /// Returns refused deliveries to their queues.
-        requeue: bool,
-    },
+    BasicRecover { requeue: bool },
     /// 60.111.
     BasicRecoverOk,
     /// 60.120, a RabbitMQ extension: refuse a delivery, or with
     /// `multiple`, every one up to it.
-    BasicNack {
-        /// The channel delivery sequence number.
-        delivery_tag: u64,
-        /// Includes every outstanding delivery through this tag.
-        multiple: bool,
-        /// Returns refused deliveries to their queues.
-        requeue: bool,
-    },
+    BasicNack { delivery_tag: u64, multiple: bool, requeue: bool },
     /// 85.10, a RabbitMQ extension: put the channel in confirm mode.
-    ConfirmSelect {
-        /// Suppresses the method acknowledgement.
-        no_wait: bool,
-    },
+    ConfirmSelect { no_wait: bool },
     /// 85.11.
     ConfirmSelectOk,
     /// 90.10: put the channel in transaction mode.
@@ -3140,6 +2845,7 @@ mod tests {
     fn stream_buffer_is_bounded() {
         let chunk = vec![3u8; 100_000];
         contract::check_decode_with_alloc_limit(Frames::new, &chunk, 2 * DEFAULT_FRAME_MAX as usize);
+        assert!(matches!(decode_all(Frames::new, &chunk).1, Some(Fail::Protocol(FrameError::TooLarge { .. }))));
         let one = Frame::method(1, &Method::BasicAck { delivery_tag: 1, multiple: false }).unwrap();
         let mut bytes = PROTOCOL_HEADER.to_vec();
         bytes.extend(one.to_bytes().unwrap().repeat(1000));

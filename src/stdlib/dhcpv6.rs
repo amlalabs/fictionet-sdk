@@ -248,10 +248,7 @@ pub mod hardware {
 /// starting with a 2-byte type. A DUID is read only if it is
 /// [`MIN_DUID`] to [`MAX_DUID`] bytes long; writers refuse any other.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Duid(
-    /// The DUID type and identifier bytes.
-    pub Vec<u8>,
-);
+pub struct Duid(pub Vec<u8>);
 
 impl Duid {
     /// A DUID-LLT: a hardware type, a time in seconds since midnight UTC on
@@ -643,8 +640,14 @@ impl Message {
         }
     }
 
-    /// Wraps a message for relay transport. Refuses an unwritable inner
-    /// message. The outer message must also fit when written.
+    /// A Relay-forward message that carries `inner`, as a relay agent
+    /// sends it, with transaction ID 0. A relay agent that received `inner`
+    /// from a client uses hop count 0; one that received a Relay-forward
+    /// uses its hop count plus 1.
+    ///
+    /// Returns [`WriteError::Unwritable`] when `inner` cannot be written.
+    /// The outer message's [`Wire::write`] refuses it if it does not fit
+    /// within [`MAX_MESSAGE`].
     pub fn relay_forward(
         inner: &Message,
         hop_count: u8,
@@ -797,8 +800,13 @@ impl Message {
         m
     }
 
-    /// Wraps a message for relay transport. Refuses an unwritable inner
-    /// message. The outer message must also fit when written.
+    /// The Relay-reply that sends `inner` back through the relay agent
+    /// that sent this Relay-forward. It copies the hop count, the link and
+    /// peer addresses, and the Interface-Id option if there is one.
+    ///
+    /// Returns [`WriteError::Unwritable`] when `inner` cannot be written.
+    /// The outer message's [`Wire::write`] refuses it if it does not fit
+    /// within [`MAX_MESSAGE`].
     pub fn relay_reply(&self, inner: &Message) -> Result<Message, WriteError> {
         let mut options = Vec::new();
         if let Some(id) = self.interface_id() {
@@ -906,7 +914,8 @@ impl Wire for Frame {
     /// excess nesting, and size limits. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         let bytes = self.0.write_within(MAX_TCP_MESSAGE)?;
-        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        let len = u16::try_from(bytes.len()).map_err(|_| WriteError::Unwritable)?;
+        out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -1902,13 +1911,22 @@ mod tests {
             assert!(value.to_bytes().is_err(), "{:?}", value.options);
             contract::check_wire_value(&value);
         }
-        for option in [
-            DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 5000]),
-            DhcpOption::Oro(vec![23; 40000]),
-            DhcpOption::StatusCode(StatusCode { code: 0, message: "x".repeat(70000) }),
+        for (option, fits) in [
+            (DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4094]), true),
+            (DhcpOption::DnsServers(vec![Ipv6Addr::LOCALHOST; 4095]), false),
+            (DhcpOption::Oro(vec![23; 32759]), true),
+            (DhcpOption::Oro(vec![23; 32760]), false),
+            (DhcpOption::StatusCode(StatusCode { code: 0, message: "x".repeat(70000) }), false),
         ] {
             let value = Message { options: vec![option], ..Message::new(msg::REPLY, 1) };
-            assert!(value.to_bytes().is_err());
+            let mut out = vec![0x5a];
+            if fits {
+                value.write(&mut out).unwrap();
+                assert_eq!(Message::parse(&out[1..]), Ok(value.clone()));
+            } else {
+                assert_eq!(value.write(&mut out), Err(WriteError::Unwritable));
+                assert_eq!(out, [0x5a]);
+            }
             contract::check_wire_value(&value);
         }
 
@@ -2129,6 +2147,18 @@ mod tests {
         assert_eq!(stream.next(), Some(Ok(Err(ParseError::Short))));
         assert_eq!(stream.push(&[0; 4096]), 2);
         contract::check_decode_with_alloc_limit(Frames::new, &[0; 4096], 2 * MAX_BUFFERED);
+    }
+
+    #[test]
+    fn relay_constructors_refuse_unwritable_inner_messages() {
+        let mut inner = Message::new(msg::SOLICIT, 1);
+        inner.transaction = 0x0100_0000;
+        assert_eq!(
+            Message::relay_forward(&inner, 0, Ipv6Addr::UNSPECIFIED, Ipv6Addr::UNSPECIFIED),
+            Err(WriteError::Unwritable)
+        );
+        let forward = Message::new(msg::RELAY_FORW, 0);
+        assert_eq!(forward.relay_reply(&inner), Err(WriteError::Unwritable));
     }
 
     #[test]

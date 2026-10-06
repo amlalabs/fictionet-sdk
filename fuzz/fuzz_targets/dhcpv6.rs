@@ -2,9 +2,9 @@
 //! datagrams and from TCP streams, and the answers it builds from them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::dhcpv6::{DhcpOption, Duid, Frame, Frames, HOP_COUNT_LIMIT, MAX_BUFFERED, MAX_MESSAGE, Message, msg};
 use libfuzzer_sys::fuzz_target;
-use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_BUFFERED);
