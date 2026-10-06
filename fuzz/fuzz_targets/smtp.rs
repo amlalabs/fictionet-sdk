@@ -1,10 +1,10 @@
 //! SMTP commands, replies, DATA, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::smtp::{
-    Command, Data, Input, MAX_DATA, MAX_DATA_LINE, MAX_LINE, MAX_REPLY_TEXT, Replies, Reply,
-    Request, Server,
+    Command, Data, DecodeError, Input, MAX_DATA, MAX_DATA_LINE, MAX_LINE, MAX_REPLY_TEXT,
+    ParseError, Replies, Reply, Request, Server,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -12,6 +12,17 @@ fn data_server() -> Server {
     let mut server = Server::new();
     server.start_data().unwrap();
     server
+}
+
+fn check_reply(reply: &Reply) {
+    contract::check_wire_value(reply);
+    if let Ok(bytes) = reply.to_bytes() {
+        contract::check_decode_with_held_limit(Replies::new, &bytes, MAX_REPLY_TEXT);
+        assert_eq!(
+            decode_all(Replies::new, &bytes),
+            (vec![Ok(reply.clone())], None)
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -35,8 +46,25 @@ fuzz_target!(|data: &[u8]| {
             }
         }
     }
-    for reply in decode_all(Replies::new, data).0.into_iter().flatten() {
-        contract::check_wire::<Reply>(&reply.to_bytes().unwrap());
+    let (replies, failure) = decode_all(Replies::new, data);
+    match Reply::parse(data) {
+        Ok(reply) => assert_eq!(replies.first(), Some(&Ok(reply))),
+        Err(ParseError::Invalid(error)) => {
+            if let Some(first) = replies.first() {
+                assert_eq!(first, &Err(error));
+            } else {
+                assert_eq!(failure, Some(Fail::Protocol(DecodeError::Reply(error))));
+            }
+        }
+        Err(ParseError::Framing(error)) => {
+            assert!(replies.is_empty());
+            assert_eq!(failure, Some(Fail::Protocol(error)));
+        }
+        Err(ParseError::Incomplete) => assert!(replies.is_empty()),
+        Err(ParseError::Trailing) => assert!(matches!(replies.first(), Some(Ok(_)))),
+    }
+    for reply in replies.into_iter().flatten() {
+        check_reply(&reply);
     }
     for item in decode_all(data_server, data).0 {
         if let Ok(Input::Message(bytes)) = item {
@@ -51,7 +79,7 @@ fuzz_target!(|data: &[u8]| {
     let command = Command::new(verb, arg);
     contract::check_wire_value(&command);
     contract::check_wire_value(&Request::Other(command));
-    contract::check_wire_value(&Reply {
+    check_reply(&Reply {
         code: data.first().map_or(250, |b| u16::from(*b) * 3),
         lines: text.split('\n').map(str::to_string).collect(),
     });

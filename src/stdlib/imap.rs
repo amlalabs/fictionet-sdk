@@ -52,10 +52,7 @@ extern crate alloc;
 extern crate self as fictionet;
 
 use self::alloc::{string::String, sync::Arc, vec::Vec};
-use fictionet::stdlib::{
-    codec::{self, Decode, Wire},
-    smtp::WriteError,
-};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// The TCP port IMAP servers listen on.
 pub const PORT: u16 = 143;
@@ -945,6 +942,20 @@ impl core::fmt::Display for ParseError {
     }
 }
 impl core::error::Error for ParseError {}
+
+/// Why an IMAP value cannot be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The value cannot fit its wire grammar and limits without changing.
+    Unwritable,
+}
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("IMAP value cannot be written without changing it")
+    }
+}
+impl core::error::Error for WriteError {}
 
 impl Wire for Command {
     type ParseError = ParseError;
@@ -2069,27 +2080,63 @@ mod tests {
 
     #[test]
     fn command_errors() {
-        for bytes in [
-            b"\r\n".as_slice(),
-            b"a\r\n",
-            b"a \r\n",
-            b"a NOOP \r\n",
-            b"a NOOP\n",
-            b"a NOOP\r\nb NOOP\r\n",
-            b"a X (b\r\n",
-            b"a X (b)c\r\n",
-            b"a X ( b)\r\n",
-            b"a X \"ab\r\n",
-            b"a X \"ab",
-            b"a X \"a\\b\"\r\n",
-            b"a X {}\r\n",
-            b"a X {3}x\r\n",
-            b"a X {3}\r\nab",
-            b"a X BODY[1\r\n",
-            b"+ X\r\n",
-            b"* X\r\n",
+        for (bytes, tag, reason) in [
+            (b"\r\n".as_slice(), None, "a command starts with a tag"),
+            (b"a\r\n", None, "a space must follow the tag"),
+            (b"a \r\n", Some("a"), "a command name must follow the tag"),
+            (b"a NOOP \r\n", Some("a"), "expected a value"),
+            (b"a NOOP\n", Some("a"), "a line must end with CRLF"),
+            (b"a X (b\r\n", Some("a"), "expected a space or ) in a list"),
+            (
+                b"a X (b)c\r\n",
+                Some("a"),
+                "expected a space or the end of the line",
+            ),
+            (b"a X ( b)\r\n", Some("a"), "expected a value"),
+            (
+                b"a X \"ab\r\n",
+                Some("a"),
+                "a quoted string holds NUL, CR or LF",
+            ),
+            (
+                b"a X \"a\\b\"\r\n",
+                Some("a"),
+                "only \\\" and \\\\ may be escaped",
+            ),
+            (b"a X {}\r\n", Some("a"), "a literal's size must follow {"),
+            (
+                b"a X {3}x\r\n",
+                Some("a"),
+                "a literal's size must end with } and CRLF",
+            ),
+            (b"a X BODY[1\r\n", Some("a"), "an atom has [ without ]"),
+            (b"+ X\r\n", None, "a command starts with a tag"),
+            (b"* X\r\n", None, "a command starts with a tag"),
         ] {
-            assert!(Command::parse(bytes).is_err(), "{bytes:?}");
+            let error = Error::Syntax {
+                tag: tag.map(String::from),
+                reason,
+            };
+            assert_eq!(
+                Command::parse(bytes),
+                Err(ParseError::Invalid(error.clone())),
+                "{bytes:?}"
+            );
+            assert_eq!(decode_all(Commands::new, bytes), (vec![Err(error)], None));
+            contract::check_decode_with_alloc_limit(Commands::new, bytes, 2 * MAX_LINE);
+        }
+        assert_eq!(
+            Command::parse(b"a NOOP\r\nb NOOP\r\n"),
+            Err(ParseError::Trailing)
+        );
+        for (bytes, error) in [
+            (
+                b"a X \"ab".as_slice(),
+                DecodeError::Line(codec::LineError::Unterminated),
+            ),
+            (b"a X {3}\r\nab", DecodeError::Incomplete),
+        ] {
+            assert_eq!(Command::parse(bytes), Err(ParseError::Framing(error)));
             contract::check_decode_with_alloc_limit(Commands::new, bytes, 2 * MAX_LINE);
         }
         for (depth, valid) in [(MAX_DEPTH, true), (MAX_DEPTH + 1, false)] {
@@ -2100,9 +2147,18 @@ mod tests {
                 b"\r\n".to_vec(),
             ]
             .concat();
-            assert_eq!(Command::parse(&bytes).is_ok(), valid);
             if valid {
                 assert_eq!(cmd(&bytes).to_bytes().unwrap(), bytes);
+            } else {
+                let error = Error::Syntax {
+                    tag: Some("a".into()),
+                    reason: "lists nest too deeply",
+                };
+                assert_eq!(
+                    Command::parse(&bytes),
+                    Err(ParseError::Invalid(error.clone()))
+                );
+                assert_eq!(decode_all(Commands::new, &bytes), (vec![Err(error)], None));
             }
         }
         let quoted = [
@@ -2111,7 +2167,15 @@ mod tests {
             b"\"\r\n".to_vec(),
         ]
         .concat();
-        assert!(Command::parse(&quoted).is_err());
+        let error = Error::Syntax {
+            tag: Some("a".into()),
+            reason: "a quoted string is too long",
+        };
+        assert_eq!(
+            Command::parse(&quoted),
+            Err(ParseError::Invalid(error.clone()))
+        );
+        assert_eq!(decode_all(Commands::new, &quoted), (vec![Err(error)], None));
         assert_eq!(
             Command::parse(b"a X {99999999999999999999999}\r\n"),
             Err(ParseError::Invalid(Error::LiteralTooLarge {
@@ -2681,17 +2745,68 @@ mod tests {
 
     #[test]
     fn generated_streams_obey_contracts() {
+        const PIECES: &[&[u8]] = &[
+            b"a1",
+            b" ",
+            b" ",
+            b"\r\n",
+            b"\r\n",
+            b"\n",
+            b"\r",
+            b"*",
+            b"+",
+            b"(",
+            b")",
+            b"\"",
+            b"\\",
+            b"{",
+            b"}",
+            b"{3}\r\n",
+            b"{2+}\r\n",
+            b"{0}\r\n",
+            b"OK",
+            b"NO",
+            b"BYE",
+            b"[",
+            b"]",
+            b"FETCH",
+            b"BODY[HEADER]",
+            b"\\Seen",
+            b"NIL",
+            b"1:*",
+            b"x",
+            b"\0",
+            b"\xff",
+            b"\xc3\xa9",
+            b"\"q\"",
+            b"[CODE]",
+            b"{99999999}\r\n",
+            b"%",
+            b"LOGIN",
+            b"~{3}\r\nx\0\xff",
+            b"~{2+}\r\n\0x",
+            b"\"q\\\"\\\\\"",
+        ];
         let seeds: &[&[u8]] = &[
             b"a LOGIN {3}\r\nabc {2+}\r\nhi\r\nb NOOP\r\n",
+            b"a APPEND INBOX ~{3}\r\na\0\xff\r\n",
+            b"a X ~{2+}\r\n\0x \"q\\\"\\\\\"\r\n",
+            b"a APPEND INBOX {99999999}\r\n",
+            b"* 1 FETCH (BINARY[] ~{3}\r\na\0\xff)\r\n",
             b"* OK [CODE] x\r\n",
             b"* 1 FETCH (BODY[] {3}\r\nabc)\r\n",
             b"a FETCH 1 BODY[HEADER.FIELDS (FROM)]\r\n",
         ];
         let mut rng = Lcg::new(0x1ee7_1ee7);
         let (mut commands, mut replies) = (0, 0);
-        for _ in 0..512 {
+        for _ in 0..1024 {
             let mut bytes = seeds[rng.index(seeds.len())].to_vec();
             if rng.coin() {
+                for _ in 0..rng.index(32) {
+                    bytes.extend_from_slice(PIECES[rng.index(PIECES.len())]);
+                }
+            }
+            for _ in 0..rng.index(5) {
                 mutate(&mut rng, &mut bytes);
             }
             contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
@@ -2733,6 +2848,7 @@ mod tests {
             "n\0",
             "\0",
         ];
+        let (mut commands_written, mut responses_written) = (0, 0);
         for _ in 0..1000 {
             let mut args = Vec::new();
             for _ in 0..rng.index(6) {
@@ -2755,9 +2871,22 @@ mod tests {
                 }
                 args.push(value);
             }
-            let tag = words[rng.index(words.len())];
-            contract::check_wire_value(&Command::new(tag, "X", args.clone()));
-            contract::check_wire_value(&Response::Data(args));
+            let tags = ["a", "A1", "t2", "tag.3"];
+            let tag = tags[rng.index(tags.len())];
+            let command = Command::new(tag, "X", args.clone());
+            contract::check_wire_value(&command);
+            if command.to_bytes().is_ok() {
+                commands_written += 1;
+            }
+            let response = Response::Data(args);
+            contract::check_wire_value(&response);
+            if let Ok(bytes) = response.to_bytes() {
+                assert_eq!(
+                    decode_all(Responses::new, &bytes),
+                    (vec![Ok(response)], None)
+                );
+                responses_written += 1;
+            }
             let text = rng.text(128);
             contract::check_wire_value(&Response::Status {
                 tag: Some(tag.into()),
@@ -2767,5 +2896,13 @@ mod tests {
             });
             contract::check_wire_value(&Response::continue_req(&text));
         }
+        assert!(
+            commands_written > 500,
+            "{commands_written} commands written"
+        );
+        assert!(
+            responses_written > 100,
+            "{responses_written} responses written"
+        );
     }
 }

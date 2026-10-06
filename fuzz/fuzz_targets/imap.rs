@@ -51,6 +51,7 @@ fuzz_target!(|data: &[u8]| {
         commands
     };
     contract::check_decode_with_alloc_limit(raw, data, 2 * MAX_LINE);
+    contract::check_decode_with_held_limit(raw, data, MAX_HELD);
     let choices = data.get(..8).unwrap_or(data);
     contract::check_decode_with_alloc_limit(
         || Refusals {
@@ -71,6 +72,12 @@ fuzz_target!(|data: &[u8]| {
             let offsets = Command::continuation_offsets(&bytes).unwrap();
             assert!(offsets.windows(2).all(|w| w[0] < w[1]));
             assert!(offsets.iter().all(|&at| at <= bytes.len()));
+            for at in offsets {
+                let header = bytes[..at].strip_suffix(b"}\r\n").unwrap();
+                let open = header.iter().rposition(|&b| b == b'{').unwrap();
+                let size = &header[open + 1..];
+                assert!(!size.is_empty() && size.iter().all(u8::is_ascii_digit));
+            }
         }
     }
     for response in decode_all(Responses::new, data).0.into_iter().flatten() {

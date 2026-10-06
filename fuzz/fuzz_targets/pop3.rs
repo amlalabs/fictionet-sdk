@@ -8,6 +8,22 @@ use fictionet::stdlib::pop3::{
 };
 use libfuzzer_sys::fuzz_target;
 
+fn check_reply(reply: &Reply) {
+    contract::check_wire_value(reply);
+    if let Ok(bytes) = reply.to_bytes() {
+        let make = || {
+            let mut replies = Replies::new();
+            replies.expect(reply.body.is_some()).unwrap();
+            replies
+        };
+        contract::check_decode_with_held_limit(make, &bytes, MAX_REPLY_HELD);
+        assert_eq!(
+            decode_all(make, &bytes),
+            (vec![Ok(Output::Reply(reply.clone()))], None)
+        );
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Commands::new, data, 2 * (MAX_AUTH_LINE + 2));
     contract::check_decode_with_held_limit(Commands::new, data, 0);
@@ -43,7 +59,7 @@ fuzz_target!(|data: &[u8]| {
         contract::check_decode_with_held_limit(make, data, MAX_REPLY_HELD);
         for item in decode_all(make, data).0 {
             if let Ok(Output::Reply(reply)) = item {
-                contract::check_wire::<Reply>(&reply.to_bytes().unwrap());
+                check_reply(&reply);
                 if let Some(code) = &reply.code {
                     assert!(reply.has_code(code) && reply.has_code(&code.to_ascii_lowercase()));
                 }
@@ -78,7 +94,7 @@ fuzz_target!(|data: &[u8]| {
         argument: Some(sb.to_string()),
     };
     contract::check_wire_value(&command);
-    contract::check_wire_value(&Reply {
+    check_reply(&Reply {
         ok: pick & 1 == 0,
         code: (pick & 2 != 0).then(|| sa.to_string()),
         text: sb.to_string(),

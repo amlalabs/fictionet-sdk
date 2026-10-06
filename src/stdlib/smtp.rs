@@ -322,7 +322,6 @@ impl Request {
             Self::Noop(Some(s)) | Self::Help(Some(s)) if s.len() > MAX_LINE => {
                 return Err(WriteError::Unwritable);
             }
-            Self::Other(c) => c.validate().map_err(|_| WriteError::Unwritable)?,
             _ => {}
         }
         let command = match self {
@@ -556,7 +555,7 @@ impl core::fmt::Display for ParseError {
 }
 impl core::error::Error for ParseError {}
 
-/// Why an SMTP, POP3, or IMAP value cannot be written.
+/// Why an SMTP value cannot be written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
     /// The value cannot fit its wire grammar and limits without changing.
@@ -565,7 +564,7 @@ pub enum WriteError {
 
 impl core::fmt::Display for WriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("mail value cannot be written unchanged")
+        f.write_str("SMTP value cannot be written without changing it")
     }
 }
 impl core::error::Error for WriteError {}
@@ -597,7 +596,13 @@ impl Wire for Command {
         if self.verb.bytes().any(|b| b.is_ascii_lowercase()) {
             return Err(WriteError::Unwritable);
         }
-        let size = self.verb.len() + self.arg.as_ref().map_or(0, |a| a.len() + 1) + 2;
+        let size = self
+            .verb
+            .len()
+            .checked_add(self.arg.as_ref().map_or(0, String::len))
+            .and_then(|n| n.checked_add(usize::from(self.arg.is_some())))
+            .and_then(|n| n.checked_add(2))
+            .ok_or(WriteError::Unwritable)?;
         out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
         out.extend_from_slice(self.verb.as_bytes());
         if let Some(arg) = &self.arg {
@@ -1120,10 +1125,7 @@ mod tests {
         ] {
             let command = Command::parse(format!("{line}\r\n").as_bytes()).unwrap();
             let bytes = command.to_bytes().unwrap();
-            assert_eq!(
-                Command::parse(&bytes),
-                Ok(command.clone())
-            );
+            assert_eq!(Command::parse(&bytes), Ok(command.clone()));
             let request = Request::from_command(&command).unwrap();
             let bytes = request.to_bytes().unwrap();
             let back = Command::parse(&bytes).unwrap();
@@ -1169,8 +1171,15 @@ mod tests {
             let c = Command::parse(format!("{line}\r\n").as_bytes()).unwrap();
             assert_eq!(Request::from_command(&c), Err(Error::Argument), "{line}");
         }
-        for line in [&b"NOOP\r\nQUIT"[..], b"NOOP\0", b"\xff", b"NOOP\x7f"] {
-            assert!(Command::parse(&[line, b"\r\n"].concat()).is_err());
+        assert_eq!(
+            Command::parse(b"NOOP\r\nQUIT\r\n"),
+            Err(ParseError::Trailing)
+        );
+        for line in [&b"NOOP\0"[..], b"\xff", b"NOOP\x7f"] {
+            assert_eq!(
+                Command::parse(&[line, b"\r\n"].concat()),
+                Err(ParseError::Invalid(Error::Text))
+            );
         }
         assert!(Command::new("NOOP QUIT", None).to_bytes().is_err());
         assert!(Command::new("NOOP", Some("x\r\nQUIT")).to_bytes().is_err());
@@ -1198,7 +1207,6 @@ mod tests {
             .is_err()
         );
     }
-
 
     #[test]
     fn command_line_limits_and_recovery() {
@@ -1231,18 +1239,32 @@ mod tests {
             (vec![Ok(first), Ok(Reply::new(221, ""))], None)
         );
         contract::check_decode_with_alloc_limit(Replies::new, bytes, 2 * MAX_LINE);
-        for bad in [
-            b"250-hi\r\n550 done\r\n".as_slice(),
-            b"250-hi\r\n PIPELINING\r\n250 done\r\n",
-            b"199 hi\r\n",
-            b"260 hi\r\n",
-            b"250xhi\r\n",
-            b"250 hi\n",
-            b"250 hi\0\r\n",
+        for (bad, error, fatal) in [
+            (&b"250-hi\r\n550 done\r\n"[..], Error::ReplyMismatch, true),
+            (
+                b"250-hi\r\n PIPELINING\r\n250 done\r\n",
+                Error::ReplyCode,
+                true,
+            ),
+            (b"199 hi\r\n", Error::ReplyCode, false),
+            (b"260 hi\r\n", Error::ReplyCode, false),
+            (b"250xhi\r\n", Error::ReplyCode, false),
+            (b"250 hi\n", Error::LineEnding, false),
+            (b"250 hi\0\r\n", Error::Text, false),
         ] {
-            assert!(Reply::parse(bad).is_err());
-            let (items, failure) = decode_all(Replies::new, bad);
-            assert!(failure.is_some() || items.iter().any(Result::is_err));
+            assert_eq!(Reply::parse(bad), Err(ParseError::Invalid(error)));
+            let expected = if fatal {
+                (vec![], Some(Fail::Protocol(DecodeError::Reply(error))))
+            } else {
+                (vec![Err(error)], None)
+            };
+            assert_eq!(decode_all(Replies::new, bad), expected);
+            // A continuation failure ends the stream before a later valid reply.
+            if fatal {
+                let followed = [bad, b"250 next\r\n"].concat();
+                assert_eq!(decode_all(Replies::new, &followed), expected);
+                contract::check_decode_with_alloc_limit(Replies::new, &followed, 2 * MAX_LINE);
+            }
             contract::check_decode_with_alloc_limit(Replies::new, bad, 2 * MAX_LINE);
         }
     }
@@ -1258,7 +1280,10 @@ mod tests {
         assert_eq!(decode_all(Replies::new, &bytes), (vec![Ok(reply)], None));
         let short = b"250-one\r\n250 two\r\n";
         for cut in 0..short.len() {
-            assert!(Reply::parse(&short[..cut]).is_err());
+            assert!(
+                decode_all(Replies::new, &short[..cut]).0.is_empty(),
+                "prefix {cut}"
+            );
         }
         contract::check_decode_with_alloc_limit(Replies::new, short, 2 * MAX_LINE);
         let endless = b"250-\r\n".repeat(MAX_REPLY_LINES);
@@ -1363,12 +1388,7 @@ mod tests {
                 Some(Fail::Protocol(DecodeError::Limit(Error::LineTooLong)))
             );
         }
-        for bad in [
-            b"bare\n".as_slice(),
-            b"bare\r",
-            b"nul\0\r\n",
-            b"cr\rinside\r\n",
-        ] {
+        for bad in [&b"bare\n"[..], b"bare\r", b"nul\0\r\n", b"cr\rinside\r\n"] {
             refused(&Data {
                 bytes: bad.to_vec(),
             });
@@ -1388,6 +1408,11 @@ mod tests {
                 None
             )
         );
+        let mut stream = Stream::new(data_server());
+        assert_eq!(stream.push(bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Ok(Err(Error::LineEnding))));
+        assert_eq!(stream.held(), 0);
+        contract::check_decode_with_held_limit(data_server, bytes, MAX_DATA);
         contract::check_decode_with_alloc_limit(data_server, bytes, 2 * (MAX_DATA_LINE + 1));
     }
 
@@ -1417,15 +1442,51 @@ mod tests {
 
     #[test]
     fn mutated_streams_and_values_obey_contracts() {
+        const PIECES: &[&[u8]] = &[
+            b"MAIL FROM:",
+            b"RCPT TO:",
+            b"<>",
+            b"<alice@example.test>",
+            b"<\"a > b\"@example.test>",
+            b"<\"a\\\"b\"@example.test>",
+            b" SIZE=0",
+            b" BODY=8BITMIME",
+            b" SMTPUTF8",
+            b" NOTIFY=SUCCESS,FAILURE",
+            b"EHLO example.test",
+            b"DATA",
+            b"NOOP",
+            b"QUIT",
+            b"AUTH PLAIN =",
+            b"250-",
+            b"250 ",
+            b"550 ",
+            b"..dot",
+            b".\r\n",
+            b"\r\n",
+            b"\n",
+            b"\r",
+            b"\0",
+            b"\xff",
+        ];
         let seeds: &[&[u8]] = &[
             b"EHLO example.test\r\nDATA\r\n",
+            b"MAIL FROM:<> SIZE=0\r\nRCPT TO:<Postmaster>\r\n",
+            b"MAIL FROM:<\"a\\\"b\"@example.test> BODY=8BITMIME\r\nRCPT TO:<alice@example.test>\r\n",
             b"250-one\r\n250 done\r\n",
             b"..dot\r\n.\r\n",
         ];
         let mut rng = Lcg::new(25);
-        for _ in 0..128 {
+        for _ in 0..256 {
             let mut bytes = seeds[rng.index(seeds.len())].to_vec();
-            mutate(&mut rng, &mut bytes);
+            if rng.coin() {
+                for _ in 0..rng.index(32) {
+                    bytes.extend_from_slice(PIECES[rng.index(PIECES.len())]);
+                }
+            }
+            for _ in 0..rng.index(5) {
+                mutate(&mut rng, &mut bytes);
+            }
             contract::check_decode_with_alloc_limit(Server::new, &bytes, 2 * (MAX_DATA_LINE + 1));
             contract::check_decode_with_alloc_limit(Replies::new, &bytes, 2 * MAX_LINE);
             contract::check_decode_with_alloc_limit(data_server, &bytes, 2 * (MAX_DATA_LINE + 1));

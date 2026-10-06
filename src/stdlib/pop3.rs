@@ -47,10 +47,7 @@ extern crate alloc;
 extern crate self as fictionet;
 
 use self::alloc::{collections::VecDeque, string::String, vec::Vec};
-use fictionet::stdlib::{
-    codec::{self, Decode, Wire},
-    smtp::WriteError,
-};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 use std::num::NonZeroU32;
 
 /// The TCP port POP3 servers listen on.
@@ -765,6 +762,20 @@ impl core::fmt::Display for ParseError {
 }
 impl core::error::Error for ParseError {}
 
+/// Why a POP3 value cannot be written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteError {
+    /// The value cannot fit its wire grammar and limits without changing.
+    Unwritable,
+}
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("POP3 value cannot be written without changing it")
+    }
+}
+impl core::error::Error for WriteError {}
+
 impl Wire for Command {
     type ParseError = ParseError;
     type WriteError = WriteError;
@@ -789,7 +800,13 @@ impl Wire for Command {
     /// Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         self.validate()?;
-        let size = self.keyword.len() + self.argument.as_ref().map_or(0, |a| a.len() + 1) + 2;
+        let size = self
+            .keyword
+            .len()
+            .checked_add(self.argument.as_ref().map_or(0, String::len))
+            .and_then(|n| n.checked_add(usize::from(self.argument.is_some())))
+            .and_then(|n| n.checked_add(2))
+            .ok_or(WriteError::Unwritable)?;
         out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
         out.extend_from_slice(self.keyword.as_bytes());
         if let Some(arg) = &self.argument {
@@ -1037,8 +1054,12 @@ impl Wire for UniqueIdListing {
             return Err(WriteError::Unwritable);
         }
         let message = self.message.to_string();
-        out.try_reserve(message.len() + 1 + self.id.len())
-            .map_err(|_| WriteError::Unwritable)?;
+        let size = message
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_add(self.id.len()))
+            .ok_or(WriteError::Unwritable)?;
+        out.try_reserve(size).map_err(|_| WriteError::Unwritable)?;
         out.extend_from_slice(message.as_bytes());
         out.push(b' ');
         out.extend_from_slice(self.id.as_bytes());
@@ -2127,16 +2148,23 @@ mod tests {
 
     #[test]
     fn writers_stop_reading_input_past_their_limits() {
+        let started = std::time::Instant::now();
         refused(&Reply::ok("").with_body(vec![b'\n'; MAX_BODY * 8]));
         let text = "t".repeat(MAX_BODY);
         refused(&Reply::ok(&text));
         refused(&Request::Pass(text.clone()));
         refused(&Request::User(text));
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn decoders_take_many_small_lines_in_linear_time() {
         let wire = b"NOOP\r\n".repeat(200_000);
+        let started = std::time::Instant::now();
         let (items, error) = decode_all(Commands::new, &wire);
         assert_eq!(error, None);
         assert_eq!(items.len(), 200_000);
@@ -2147,6 +2175,17 @@ mod tests {
         ]
         .concat();
         assert_eq!(Reply::parse(&body).unwrap().lines().count(), 200_000);
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "took {:?}",
+            started.elapsed()
+        );
+        contract::check_decode_with_alloc_limit(Commands::new, &wire, 2 * (MAX_AUTH_LINE + 2));
+        contract::check_decode_with_alloc_limit(
+            || reply_reader(true),
+            &body,
+            2 * (MAX_AUTH_LINE + 2),
+        );
     }
 
     #[test]
@@ -2343,16 +2382,63 @@ mod tests {
 
     #[test]
     fn generated_streams_and_values_obey_contracts() {
+        const PIECES: &[&[u8]] = &[
+            b"USER ",
+            b"PASS ",
+            b"APOP ",
+            b"LIST",
+            b"RETR ",
+            b"TOP ",
+            b"UIDL",
+            b"CAPA",
+            b"STLS",
+            b"STAT",
+            b"QUIT",
+            b"+OK",
+            b"-ERR",
+            b"+OK ",
+            b"-ERR ",
+            b" [",
+            b"[IN-USE]",
+            b"[sys/temp/x]y",
+            b"SYS/TEMP",
+            b"]",
+            b"/",
+            b"\r\n",
+            b"\n",
+            b"\r",
+            b".\r\n",
+            b"..",
+            b".",
+            b" ",
+            b"1",
+            b"0",
+            b"42",
+            b"c4c9334bac560ecc979e58001b3e22fb",
+            b"<1.2@x>",
+            b"\0",
+            b"\xff",
+            b"\xc3\xa9",
+        ];
         let seeds: &[&[u8]] = &[
             b"USER alice\r\nPASS open sesame\r\nLIST\r\n",
+            b"APOP alice c4c9334bac560ecc979e58001b3e22fb\r\n",
+            b"TOP 1 0\r\nRETR 1\r\nUIDL\r\nCAPA\r\n",
             b"+OK [SYS/TEMP] x\r\n",
             b"+OK\r\n..dot\r\n.\r\n",
             b"-ERR [AUTH]no\r\n",
         ];
         let mut rng = Lcg::new(0x9093);
-        for _ in 0..256 {
+        for _ in 0..512 {
             let mut data = seeds[rng.index(seeds.len())].to_vec();
-            mutate(&mut rng, &mut data);
+            if rng.coin() {
+                for _ in 0..rng.index(32) {
+                    data.extend_from_slice(PIECES[rng.index(PIECES.len())]);
+                }
+            }
+            for _ in 0..rng.index(5) {
+                mutate(&mut rng, &mut data);
+            }
             contract::check_decode_with_alloc_limit(Commands::new, &data, 2 * (MAX_AUTH_LINE + 2));
             for multi in [false, true] {
                 contract::check_decode_with_alloc_limit(
@@ -2394,7 +2480,7 @@ mod tests {
             });
             contract::check_wire_value(&ScanListing {
                 message: n(1),
-                octets: rng.next(),
+                octets: (rng.next() << 33) | (rng.next() << 2) | rng.below(4),
             });
         }
     }
