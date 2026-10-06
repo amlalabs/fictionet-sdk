@@ -3,17 +3,21 @@
 //! Content-Length, chunked bodies, connection close, Expect: 100-continue,
 //! and CONNECT handoff use the shared codec drivers. Non-empty trailers and
 //! chunk extensions are refused. Requests ignore Upgrade offers and continue
-//! as HTTP; 101 responses are outside this module's scope.
+//! as HTTP; 101 responses end HTTP for handoff without handling Upgrade.
 
 use fictionet::stdlib::codec::{
     Buffer, Decode, Ending, Fail, LineError, Lines, PumpError, Step, Stream, Wire, finish, try_pump,
 };
+use fictionet::stdlib::json;
 use std::collections::VecDeque;
 use std::fmt;
 
 /// The largest owned body accepted by [`Request`] and [`Response`]: 8 MiB.
-/// Streaming decoders have no total body limit.
+/// The event decoders [`Requests`] and [`Responses`] have no total body limit.
 pub const MAX_BODY: usize = 8 << 20;
+/// The largest whole message retained for exact forwarding: 9 MiB.
+/// This includes the head, body, and all chunk framing.
+pub const MAX_MESSAGE: usize = 9 << 20;
 /// The largest chunk-size line, excluding CRLF: 128 bytes.
 pub const MAX_CHUNK_LINE: usize = 128;
 /// The most request methods waiting for responses: 128.
@@ -27,14 +31,7 @@ pub const MAX_EMPTY_LINES: usize = 8;
 /// 64 KiB for the complete head, and 8 KiB per body event. The head limit
 /// includes every CRLF and the final empty line. Decoders clamp byte limits
 /// to [`Buffer::MAX_LIMIT`] and raise a zero body block size to one.
-/// Limits count received bytes. Writers emit fields as `name:value`, with
-/// no added space, and omit the space before an empty reason phrase. The
-/// written head is never longer than the received head. Wire uses default
-/// limits; a decoder configured with larger limits can accept larger heads.
 /// Ignored empty lines before a request do not count toward its head limit.
-/// Body events have fixed boundaries, independent of input chunking. A
-/// block is emitted when full, at a wire chunk boundary, or at body end.
-/// Choose a smaller `body_chunk` for low latency on close-delimited streams.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
     /// Maximum start-line content bytes. Default: 8192.
@@ -46,6 +43,9 @@ pub struct Limits {
     /// Maximum complete head bytes. Default: 65536.
     pub head: usize,
     /// Maximum bytes in one body event. Default: 8192.
+    /// Blocks end when full, at a wire chunk boundary, or at body end.
+    /// Boundaries do not depend on input chunking. Use smaller blocks for
+    /// low latency on close-delimited streams.
     pub body_chunk: usize,
 }
 
@@ -115,7 +115,8 @@ pub enum Error {
     Http10TransferEncoding,
     /// A writer found forbidden framing fields on 1xx, 204, or CONNECT 2xx.
     ForbiddenFraming,
-    /// A 101 response would switch protocols, outside this module's scope.
+    /// A writer or Wire parser refuses a 101 protocol switch. The streaming
+    /// response decoders accept it only to end HTTP for handoff.
     Upgrade,
     /// The chunk-size line exceeds [`MAX_CHUNK_LINE`].
     ChunkLineTooLong,
@@ -127,8 +128,10 @@ pub enum Error {
     ChunkEnding,
     /// A non-empty trailer section is outside this module's scope.
     Trailers,
-    /// An owned body exceeds [`MAX_BODY`].
+    /// An owned body exceeds its configured byte limit or [`MAX_BODY`].
     BodyTooLong,
+    /// A whole message exceeds its wire byte limit, including chunk framing.
+    MessageTooLong,
     /// A body does not agree with its head's framing.
     BodyLength,
     /// The response method queue is full.
@@ -168,6 +171,7 @@ impl fmt::Display for Error {
             Self::ChunkEnding => "HTTP chunk data requires CRLF",
             Self::Trailers => "non-empty HTTP trailers are not supported",
             Self::BodyTooLong => "owned HTTP body exceeds limit",
+            Self::MessageTooLong => "HTTP message wire bytes exceed limit",
             Self::BodyLength => "HTTP body does not match its framing",
             Self::TooManyRequests => "HTTP response method queue is full",
             Self::State => "inconsistent HTTP framing state",
@@ -388,9 +392,7 @@ impl Decode for Requests {
         let Some(n) = self.core.head(input)? else {
             return Ok(Step::Need);
         };
-        let head = request_head(&input[..n])?;
-        let info = fields(&head.headers, head.version)?;
-        let framing = request_framing(info)?;
+        let (head, info, framing) = request_head(&input[..n])?;
         self.empty_lines = 0;
         self.core
             .begin(framing, info.close || head.method == "CONNECT");
@@ -407,8 +409,8 @@ impl Decode for Requests {
 /// bytes of held state. Queue before feeding the corresponding response.
 /// HEAD, 1xx, 204, and 304 have no body. A successful CONNECT ends HTTP after
 /// Done, leaving tunnel bytes in `Stream::into_parts`. A response without a
-/// length or final chunked coding ends at EOF. Status 101 is refused because
-/// protocol switching through Upgrade is outside this module's scope.
+/// length or final chunked coding ends at EOF. Status 101 also ends HTTP
+/// after Done for handoff. Upgrade negotiation is left to the caller.
 /// Valid length fields on bodyless responses do not create a body. Conflicting
 /// lengths and Transfer-Encoding with Content-Length are always refused.
 /// Writers additionally refuse framing fields forbidden by HTTP semantics.
@@ -427,6 +429,7 @@ impl Decode for Requests {
 pub struct Responses {
     core: Reader,
     methods: VecDeque<Method>,
+    strict: bool,
 }
 
 impl Responses {
@@ -435,6 +438,7 @@ impl Responses {
         Self {
             core: Reader::new(limits),
             methods: VecDeque::new(),
+            strict: false,
         }
     }
     /// Queues a request method. Invalid tokens and a full queue are refused
@@ -472,16 +476,275 @@ impl Decode for Responses {
         let Some(n) = self.core.head(input)? else {
             return Ok(Step::Need);
         };
-        let head = response_head(&input[..n])?;
+        let (head, info) = response_head(&input[..n])?;
         let method = self.methods.front().copied().unwrap_or(Method::Other);
-        let info = fields(&head.headers, head.version)?;
-        let framing = response_framing(&head, info, method)?;
-        let tunnel = method == Method::Connect && (200..300).contains(&head.status);
+        let framing = if self.strict {
+            writable_response(&head, info, method)?
+        } else {
+            response_framing(&head, info, method)?
+        };
+        response_size(&head, self.core.limits)?;
+        let tunnel =
+            head.status == 101 || (method == Method::Connect && (200..300).contains(&head.status));
         if head.status >= 200 {
             self.methods.pop_front();
         }
-        self.core.begin(framing, info.close || tunnel);
+        self.core
+            .begin(framing, (head.status >= 200 && info.close) || tunnel);
         Ok(Step::Item(Event::Head(head), n))
+    }
+}
+
+/// Whole requests on a persistent connection, built from [`Requests`].
+///
+/// Each item consumes its complete wire message. These message decoders give
+/// generic tools whole messages. [`Stream::with_next`] exposes the original
+/// head and all chunk-size lines and endings with each item.
+/// The driver's buffer retains these bytes until Done. The decoder holds
+/// the parsed head and body, reported by [`Decode::held`]. Scan positions
+/// keep one-byte feeding linear. Leading empty CRLF lines remain skips.
+///
+/// Default bounds are [`MAX_BODY`] for the decoded body and [`MAX_MESSAGE`]
+/// for the wire message. A message can reach either limit first. Use
+/// [`Requests`] when the body must be streamed without accumulation.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire, test_support}, http1::RequestMessages};
+/// let bytes = b"GET / HTTP/1.1\r\nHost:test\r\n\r\nGET /next HTTP/1.1\r\nHost:test\r\n\r\n";
+/// let mut stream = Stream::new(RequestMessages::default());
+/// assert_eq!(stream.push(bytes), bytes.len());
+/// let mut raw = Vec::new();
+/// let mut encoded = Vec::new();
+/// let mut requests = Vec::new();
+/// while let Some(result) = stream.with_next(|request, wire, range| {
+///     assert_eq!(range.start, u64::try_from(raw.len()).unwrap());
+///     raw.extend_from_slice(wire);
+///     assert_eq!(range.end, u64::try_from(raw.len()).unwrap());
+///     request
+/// }) {
+///     let request = result?;
+///     request.write(&mut encoded)?;
+///     requests.push(request);
+/// }
+/// assert_eq!(raw, bytes);
+/// assert_eq!(requests.len(), 2);
+/// assert_eq!(test_support::decode_all(RequestMessages::default, &encoded), (requests, None));
+/// assert!(!stream.is_done());
+/// stream.end();
+/// assert!(stream.next().is_none());
+/// assert!(stream.is_done());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+pub struct RequestMessages {
+    inner: Requests,
+    message: Message<RequestHead>,
+}
+
+impl RequestMessages {
+    /// Creates a decoder with these head limits and default message bounds.
+    pub fn new(limits: Limits) -> Self {
+        Self::with_limits(limits, MAX_BODY, MAX_MESSAGE)
+    }
+    /// Creates a decoder with smaller body and wire byte bounds. Bounds
+    /// are clamped to MAX_BODY and MAX_MESSAGE. Head limits are unchanged.
+    pub fn with_limits(mut limits: Limits, body: usize, wire: usize) -> Self {
+        let message = Message::new(body, wire);
+        limits.body_chunk = limits.body_chunk.min(message.body_limit.saturating_add(1));
+        Self {
+            inner: Requests::new(limits),
+            message,
+        }
+    }
+}
+
+impl Default for RequestMessages {
+    fn default() -> Self {
+        Self::new(Limits::default())
+    }
+}
+
+impl Decode for RequestMessages {
+    type Item = Request;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/1 whole requests";
+    fn capacity(&self) -> usize {
+        self.message.capacity()
+    }
+    fn held(&self) -> usize {
+        self.message.held()
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Request>, Error> {
+        Ok(map_message(
+            self.message.decode(&mut self.inner, input, eof)?,
+            |head, body| Request { head, body },
+        ))
+    }
+}
+
+/// Whole responses on a persistent connection, built from [`Responses`].
+///
+/// Wire bytes and held state have the same bounds and accounting as
+/// [`RequestMessages`]. Informational responses are separate items. A
+/// close-delimited response needs EOF. Queue methods before the matching
+/// response with [`Self::expect_method`]. Forwarding preserves HEAD and
+/// CONNECT bytes; replacements of those responses need [`Response::write_for`].
+pub struct ResponseMessages {
+    inner: Responses,
+    message: Message<ResponseHead>,
+}
+
+impl ResponseMessages {
+    /// Creates a decoder with these head limits and default message bounds.
+    pub fn new(limits: Limits) -> Self {
+        Self::with_limits(limits, MAX_BODY, MAX_MESSAGE)
+    }
+    /// Creates a decoder with body and wire byte bounds, clamped to MAX_BODY
+    /// and MAX_MESSAGE. Head limits are unchanged.
+    pub fn with_limits(mut limits: Limits, body: usize, wire: usize) -> Self {
+        let message = Message::new(body, wire);
+        limits.body_chunk = limits.body_chunk.min(message.body_limit.saturating_add(1));
+        Self {
+            inner: Responses::new(limits),
+            message,
+        }
+    }
+    /// Queues a method with the same validation and bound as
+    /// [`Responses::expect_method`]. Interim responses keep it queued.
+    pub fn expect_method(&mut self, method: &str) -> Result<(), Error> {
+        self.inner.expect_method(method)
+    }
+}
+
+impl Default for ResponseMessages {
+    fn default() -> Self {
+        Self::new(Limits::default())
+    }
+}
+
+impl Decode for ResponseMessages {
+    type Item = Response;
+    type Error = Error;
+    const NAME: &'static str = "HTTP/1 whole responses";
+    fn capacity(&self) -> usize {
+        self.message.capacity()
+    }
+    fn held(&self) -> usize {
+        self.message.held().saturating_add(self.inner.held())
+    }
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Response>, Error> {
+        Ok(map_message(
+            self.message.decode(&mut self.inner, input, eof)?,
+            |head, body| Response { head, body },
+        ))
+    }
+}
+
+// The raw message stays in the driver, so generic tools need no HTTP path.
+// Only parsed output and an offset into the stable unread slice live here.
+struct Message<H> {
+    head: Option<H>,
+    head_bytes: usize,
+    body: Vec<u8>,
+    scanned: usize,
+    body_limit: usize,
+    wire_limit: usize,
+}
+
+impl<H> Message<H> {
+    fn new(body: usize, wire: usize) -> Self {
+        Self {
+            head: None,
+            head_bytes: 0,
+            body: Vec::new(),
+            scanned: 0,
+            body_limit: body.min(MAX_BODY),
+            wire_limit: wire.min(MAX_MESSAGE),
+        }
+    }
+    fn capacity(&self) -> usize {
+        self.wire_limit.saturating_add(1)
+    }
+    fn held(&self) -> usize {
+        self.head_bytes.saturating_add(self.body.len())
+    }
+    fn decode<D: Decode<Item = Event<H>, Error = Error>>(
+        &mut self,
+        inner: &mut D,
+        input: &[u8],
+        eof: bool,
+    ) -> Result<Step<(H, Vec<u8>)>, Error> {
+        let before = self.held();
+        let window = &input[..input.len().min(self.wire_limit)];
+        loop {
+            let rest = window.get(self.scanned..).ok_or(Error::State)?;
+            let step = inner.decode(rest, eof && input.len() <= self.wire_limit)?;
+            let used = match step {
+                Step::Item(Event::Head(head), n) => {
+                    if self.head.is_some() {
+                        return Err(Error::State);
+                    }
+                    self.head = Some(head);
+                    self.head_bytes = n;
+                    n
+                }
+                Step::Item(Event::Body(data), n) => {
+                    if self
+                        .body
+                        .len()
+                        .checked_add(data.len())
+                        .is_none_or(|n| n > self.body_limit)
+                    {
+                        return Err(Error::BodyTooLong);
+                    }
+                    self.body.extend_from_slice(&data);
+                    n
+                }
+                Step::Item(Event::Done, n) => {
+                    let used = self.scanned.checked_add(n).ok_or(Error::MessageTooLong)?;
+                    let head = self.head.take().ok_or(Error::State)?;
+                    self.head_bytes = 0;
+                    self.scanned = 0;
+                    return Ok(Step::Item((head, std::mem::take(&mut self.body)), used));
+                }
+                Step::Skip(n) if self.head.is_none() => return Ok(Step::Skip(n)),
+                Step::Skip(n) => n,
+                Step::Need => {
+                    if input.len() > self.wire_limit {
+                        return Err(Error::MessageTooLong);
+                    }
+                    // Report newly assembled output as finite state progress.
+                    // The next call resumes at the same partial unit and needs input.
+                    return Ok(if self.held() > before {
+                        Step::Skip(0)
+                    } else {
+                        Step::Need
+                    });
+                }
+                Step::End => {
+                    return if self.head.is_some() {
+                        Err(Error::Incomplete)
+                    } else {
+                        Ok(Step::End)
+                    };
+                }
+            };
+            if used == 0 || used > rest.len() {
+                return Err(Error::State);
+            }
+            self.scanned = self
+                .scanned
+                .checked_add(used)
+                .ok_or(Error::MessageTooLong)?;
+        }
+    }
+}
+
+fn map_message<H, T>(step: Step<(H, Vec<u8>)>, f: impl FnOnce(H, Vec<u8>) -> T) -> Step<T> {
+    match step {
+        Step::Item((head, body), n) => Step::Item(f(head, body), n),
+        Step::Skip(n) => Step::Skip(n),
+        Step::Need => Step::Need,
+        Step::End => Step::End,
     }
 }
 
@@ -489,7 +752,7 @@ impl Decode for Responses {
 ///
 /// The body has chunked framing removed and is bounded by [`MAX_BODY`].
 /// `Wire` uses default head limits. `Collect<Request>` reads exactly one
-/// bounded wire message at EOF; use [`Requests`] for persistent streams.
+/// bounded wire message at EOF; use [`RequestMessages`] for persistent streams.
 /// Editing a body requires updating Content-Length, or choosing chunked.
 /// Writers validate the entire message before appending any bytes.
 ///
@@ -536,6 +799,115 @@ pub struct Response {
 }
 
 impl Response {
+    /// Creates an empty HTTP/1.1 response with an empty reason phrase.
+    /// Adds Content-Length: 0 except for 1xx, 204, and 304 responses.
+    /// The writer validates the status before emitting any bytes.
+    pub fn status(status: u16) -> Self {
+        let mut headers = Vec::new();
+        if status >= 200 && status != 204 && status != 304 {
+            headers.push(Header {
+                name: "Content-Length".into(),
+                value: b"0".to_vec(),
+            });
+        }
+        Self {
+            head: ResponseHead {
+                version: Version::Http11,
+                status,
+                reason: Vec::new(),
+                headers,
+            },
+            body: Vec::new(),
+        }
+    }
+    /// Creates a 200 response with application/json and an exact
+    /// Content-Length. Copies at most MAX_BODY bytes. The caller supplies
+    /// encoded JSON; this constructor does not parse or normalize it.
+    pub fn json(body: &[u8]) -> Result<Self, Error> {
+        if body.len() > MAX_BODY {
+            return Err(Error::BodyTooLong);
+        }
+        Ok(Self::with_content(200, "application/json", body.to_vec()))
+    }
+    /// Creates the head that opens a 200 event stream for an MCP session.
+    /// Sets text/event-stream, Cache-Control: no-cache, Mcp-Session-Id,
+    /// and Transfer-Encoding: chunked. Write the head, then write each
+    /// encoded SSE event through [`Chunk`]. An empty Chunk ends the stream.
+    /// No body or final chunk is written by this head's Wire implementation.
+    /// Invalid session field bytes are refused when the head is written.
+    ///
+    /// ```
+    /// use fictionet::stdlib::{codec::Wire, http1::{Chunk, Response}};
+    /// let mut out = Response::event_stream("session-1").to_bytes()?;
+    /// Chunk(b"data: {}\n\n".to_vec()).write(&mut out)?;
+    /// Chunk(Vec::new()).write(&mut out)?;
+    /// assert_eq!(Response::parse(&out)?.body, b"data: {}\n\n");
+    /// # Ok::<(), fictionet::stdlib::http1::Error>(())
+    /// ```
+    pub fn event_stream(session_id: &str) -> ResponseHead {
+        ResponseHead {
+            version: Version::Http11,
+            status: 200,
+            reason: Vec::new(),
+            headers: vec![
+                Header {
+                    name: "Content-Type".into(),
+                    value: b"text/event-stream".to_vec(),
+                },
+                Header {
+                    name: "Cache-Control".into(),
+                    value: b"no-cache".to_vec(),
+                },
+                Header {
+                    name: "Mcp-Session-Id".into(),
+                    value: session_id.as_bytes().to_vec(),
+                },
+                Header {
+                    name: "Transfer-Encoding".into(),
+                    value: b"chunked".to_vec(),
+                },
+            ],
+        }
+    }
+    /// Creates an application/problem+json response with `type` set to
+    /// `about:blank`, the status, and the supplied detail. Uses [`json::Value`]
+    /// to escape strings and set Content-Length from the encoded bytes.
+    /// Refuses statuses outside 400..=599 and problems beyond [`json::MAX_SIZE`].
+    pub fn problem(status: u16, detail: &str) -> Result<Self, Error> {
+        if !(400..=599).contains(&status) {
+            return Err(Error::StartLine);
+        }
+        if detail.len() > json::MAX_SIZE {
+            return Err(Error::BodyTooLong);
+        }
+        let value = json::Value::Object(vec![
+            ("type".into(), json::Value::from("about:blank")),
+            ("status".into(), json::Value::from(u32::from(status))),
+            ("detail".into(), json::Value::from(detail)),
+        ]);
+        let body = value.to_bytes().map_err(|_| Error::BodyTooLong)?;
+        Ok(Self::with_content(status, "application/problem+json", body))
+    }
+    fn with_content(status: u16, content_type: &str, body: Vec<u8>) -> Self {
+        Self {
+            head: ResponseHead {
+                version: Version::Http11,
+                status,
+                reason: Vec::new(),
+                headers: vec![
+                    Header {
+                        name: "Content-Type".into(),
+                        value: content_type.as_bytes().to_vec(),
+                    },
+                    Header {
+                        name: "Content-Length".into(),
+                        value: body.len().to_string().into_bytes(),
+                    },
+                ],
+            },
+            body,
+        }
+    }
     /// Parses exactly one response with the given request method. Tunnel
     /// bytes after a CONNECT head are trailing bytes here; use Responses
     /// and Stream for handoff. Informational responses are separate values.
@@ -543,8 +915,8 @@ impl Response {
     pub fn parse_for(bytes: &[u8], method: &str) -> Result<Self, Error> {
         let mut decoder = Responses::default();
         decoder.expect_method(method)?;
+        decoder.strict = true;
         let (head, body) = whole(decoder, bytes)?;
-        validate_response_for(&head, Method::parse(method)?)?;
         Ok(Self { head, body })
     }
     /// Appends a response using the given request method. Validates the
@@ -947,9 +1319,6 @@ fn request_framing(info: Fields) -> Result<Framing, Error> {
     }
 }
 fn response_framing(head: &ResponseHead, info: Fields, method: Method) -> Result<Framing, Error> {
-    if head.status == 101 {
-        return Err(Error::Upgrade);
-    }
     if head.status < 200 || head.status == 204 {
         return Ok(Framing::Empty);
     }
@@ -984,13 +1353,7 @@ fn split_head(b: &[u8]) -> Result<(&[u8], Vec<Header>), Error> {
         }
         let colon = line.iter().position(|b| *b == b':').ok_or(Error::Header)?;
         let name = &line[..colon];
-        if !token(name) {
-            return Err(Error::Header);
-        }
         let value = trim(&line[colon.saturating_add(1)..]);
-        if !value.iter().copied().all(field_byte) {
-            return Err(Error::Header);
-        }
         headers.push(Header {
             name: String::from_utf8(name.to_vec()).map_err(|_| Error::Header)?,
             value: value.to_vec(),
@@ -1070,7 +1433,7 @@ fn validate_host(head: &RequestHead) -> Result<(), Error> {
         _ => Err(Error::Host),
     }
 }
-fn request_head(b: &[u8]) -> Result<RequestHead, Error> {
+fn request_head(b: &[u8]) -> Result<(RequestHead, Fields, Framing), Error> {
     let (line, headers) = split_head(b)?;
     let mut parts = line.split(|b| *b == b' ');
     let method = parts.next().ok_or(Error::StartLine)?;
@@ -1085,12 +1448,10 @@ fn request_head(b: &[u8]) -> Result<RequestHead, Error> {
         version,
         headers,
     };
-    validate_target(&head.method, &head.target)?;
-    validate_host(&head)?;
-    request_framing(fields(&head.headers, head.version)?)?;
-    Ok(head)
+    let (info, framing) = request_info(&head)?;
+    Ok((head, info, framing))
 }
-fn response_head(b: &[u8]) -> Result<ResponseHead, Error> {
+fn response_head(b: &[u8]) -> Result<(ResponseHead, Fields), Error> {
     let (line, headers) = split_head(b)?;
     let mut parts = line.splitn(3, |b| *b == b' ');
     let version = version(parts.next().ok_or(Error::StartLine)?)?;
@@ -1098,7 +1459,8 @@ fn response_head(b: &[u8]) -> Result<ResponseHead, Error> {
     if status.len() != 3 {
         return Err(Error::StartLine);
     }
-    let status = number(status, 10, Error::StartLine)? as u16;
+    let status =
+        u16::try_from(number(status, 10, Error::StartLine)?).map_err(|_| Error::StartLine)?;
     let reason = parts.next().unwrap_or_default();
     if !(100..=599).contains(&status) || !reason.iter().copied().all(field_byte) {
         return Err(Error::StartLine);
@@ -1109,12 +1471,11 @@ fn response_head(b: &[u8]) -> Result<ResponseHead, Error> {
         reason: reason.to_vec(),
         headers,
     };
-    response_framing(&head, fields(&head.headers, head.version)?, Method::Other)?;
-    Ok(head)
+    let info = fields(&head.headers, head.version)?;
+    Ok((head, info))
 }
 
-fn head_size(start: usize, headers: &[Header]) -> Result<(), Error> {
-    let limits = Limits::default();
+fn head_size(start: usize, headers: &[Header], limits: Limits) -> Result<(), Error> {
     if start > limits.start_line {
         return Err(Error::StartLineTooLong);
     }
@@ -1142,40 +1503,48 @@ fn head_size(start: usize, headers: &[Header]) -> Result<(), Error> {
     }
     Ok(())
 }
-fn validate_request(head: &RequestHead) -> Result<(), Error> {
+fn request_info(head: &RequestHead) -> Result<(Fields, Framing), Error> {
     validate_target(&head.method, &head.target)?;
     validate_host(head)?;
-    request_framing(fields(&head.headers, head.version)?)?;
+    let info = fields(&head.headers, head.version)?;
+    Ok((info, request_framing(info)?))
+}
+fn validate_request(head: &RequestHead) -> Result<Framing, Error> {
+    let (_, framing) = request_info(head)?;
     let start = head
         .method
         .len()
         .checked_add(head.target.len())
         .and_then(|n| n.checked_add(10))
         .ok_or(Error::StartLineTooLong)?;
-    head_size(start, &head.headers)
+    head_size(start, &head.headers, Limits::default())?;
+    Ok(framing)
 }
-fn validate_response(head: &ResponseHead) -> Result<(), Error> {
+fn validate_response_for(head: &ResponseHead, method: Method) -> Result<Framing, Error> {
     if !(100..=599).contains(&head.status) || !head.reason.iter().copied().all(field_byte) {
         return Err(Error::StartLine);
     }
     let info = fields(&head.headers, head.version)?;
-    if (head.status < 200 || head.status == 204) && (info.length.is_some() || info.transfer) {
-        return Err(Error::ForbiddenFraming);
-    }
-    response_framing(head, info, Method::Other)?;
+    response_size(head, Limits::default())?;
+    writable_response(head, info, method)
+}
+fn response_size(head: &ResponseHead, limits: Limits) -> Result<(), Error> {
     head_size(
         head.reason
             .len()
-            .checked_add(if head.reason.is_empty() { 12 } else { 13 })
+            .checked_add(13)
             .ok_or(Error::StartLineTooLong)?,
         &head.headers,
+        limits,
     )
 }
-fn validate_response_for(head: &ResponseHead, method: Method) -> Result<Framing, Error> {
-    validate_response(head)?;
-    let info = fields(&head.headers, head.version)?;
-    if method == Method::Connect
-        && (200..300).contains(&head.status)
+fn writable_response(head: &ResponseHead, info: Fields, method: Method) -> Result<Framing, Error> {
+    if head.status == 101 {
+        return Err(Error::Upgrade);
+    }
+    if (head.status < 200
+        || head.status == 204
+        || (method == Method::Connect && (200..300).contains(&head.status)))
         && (info.length.is_some() || info.transfer)
     {
         return Err(Error::ForbiddenFraming);
@@ -1204,10 +1573,8 @@ fn emit_response(head: &ResponseHead, out: &mut Vec<u8>) {
     out.extend_from_slice(head.version.as_str().as_bytes());
     out.push(b' ');
     out.extend_from_slice(head.status.to_string().as_bytes());
-    if !head.reason.is_empty() {
-        out.push(b' ');
-        out.extend_from_slice(&head.reason);
-    }
+    out.push(b' ');
+    out.extend_from_slice(&head.reason);
     out.extend_from_slice(b"\r\n");
     emit_headers(&head.headers, out);
 }
@@ -1311,14 +1678,26 @@ fn wire_failure(failure: Fail<Error>) -> Error {
 impl Wire for RequestHead {
     type ParseError = Error;
     type WriteError = Error;
-    /// Parses exactly one request head under default limits.
+    /// Parses exactly one request head under default limits. Ignores up to
+    /// eight leading empty CRLF lines, as [`Request::parse`] does.
     fn parse(b: &[u8]) -> Result<Self, Error> {
+        let mut b = b;
+        for _ in 0..MAX_EMPTY_LINES {
+            let Some(rest) = b.strip_prefix(b"\r\n") else {
+                break;
+            };
+            b = rest;
+        }
+        if b.starts_with(b"\r\n") {
+            return Err(Error::StartLine);
+        }
         exact_head(b)?;
-        let head = request_head(b)?;
-        validate_request(&head)?;
+        let (head, _, _) = request_head(b)?;
         Ok(head)
     }
     /// Validates the complete head before appending it. No body is written.
+    /// Uses default limits and emits fields as `name:value`. The written
+    /// head fits the same limits as the decoder. Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         validate_request(self)?;
         emit_request(self, out);
@@ -1331,13 +1710,17 @@ impl Wire for ResponseHead {
     /// Parses exactly one response head under default limits.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         exact_head(b)?;
-        let head = response_head(b)?;
-        validate_response(&head)?;
+        let (head, info) = response_head(b)?;
+        response_size(&head, Limits::default())?;
+        writable_response(&head, info, Method::Other)?;
         Ok(head)
     }
     /// Validates the complete head before appending it. No body is written.
+    /// Uses default limits, `name:value` fields, and a space after the
+    /// status even with an empty reason. The written head fits the decoder's
+    /// limits. Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        validate_response(self)?;
+        validate_response_for(self, Method::Other)?;
         emit_response(self, out);
         Ok(())
     }
@@ -1348,14 +1731,14 @@ impl Wire for Request {
     /// Parses exactly one request with default head limits and MAX_BODY.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         let (head, body) = whole(Requests::default(), b)?;
-        validate_request(&head)?;
         Ok(Self { head, body })
     }
     /// Validates all fields and the body length before appending any bytes.
     /// Chunked bodies are written as one data chunk and an empty last chunk.
+    /// Uses default head limits and MAX_BODY. Fields use `name:value`.
+    /// Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        validate_request(&self.head)?;
-        let framing = request_framing(fields(&self.head.headers, self.head.version)?)?;
+        let framing = validate_request(&self.head)?;
         validate_body(&self.body, framing)?;
         emit_request(&self.head, out);
         emit_body(&self.body, framing, out);
@@ -1372,6 +1755,8 @@ impl Wire for Response {
     }
     /// Validates an ordinary response and its full body before writing.
     /// Use write_for for HEAD and CONNECT. Close-delimited output needs EOF.
+    /// Uses default head limits and MAX_BODY. Fields use `name:value`; the
+    /// status always has a following space. Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         self.write_for("GET", out)
     }
@@ -1824,7 +2209,10 @@ mod tests {
         let bytes = b"HTTP/1.1 200\r\nContent-Length:0\r\n\r\n";
         let response = Response::parse(bytes).unwrap();
         assert!(response.head.reason.is_empty());
-        assert_eq!(response.to_bytes().unwrap(), bytes);
+        assert_eq!(
+            response.to_bytes().unwrap(),
+            b"HTTP/1.1 200 \r\nContent-Length:0\r\n\r\n"
+        );
         contract::check_wire::<Response>(bytes);
         contract::check_wire::<ResponseHead>(bytes);
         contract::check_decode(Responses::default, bytes);
@@ -1880,7 +2268,7 @@ mod tests {
     fn received_head_limits_allow_writing_and_rewriting() {
         for (request, prefix) in [
             (true, b"GET / HTTP/1.1\r\nHost:a\r\n".as_slice()),
-            (false, b"HTTP/1.1 200\r\nContent-Length:0\r\n"),
+            (false, b"HTTP/1.1 200 \r\nContent-Length:0\r\n"),
         ] {
             let mut line_boundary = prefix.to_vec();
             line_boundary.extend_from_slice(b"X:");
@@ -2010,6 +2398,287 @@ mod tests {
         );
         contract::check_decode(Requests::default, request);
         contract::check_decode(Responses::default, response);
+    }
+
+    #[test]
+    fn interim_close_waits_for_the_final_response() {
+        for (bytes, interim, body, closed) in [
+            (
+                b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi".as_slice(),
+                103,
+                b"hi".as_slice(),
+                false,
+            ),
+            (
+                b"HTTP/1.0 100 Continue\r\n\r\nHTTP/1.0 200 OK\r\nContent-Length: 1\r\n\r\nx",
+                100,
+                b"x",
+                true,
+            ),
+        ] {
+            let make = || {
+                let mut decoder = Responses::default();
+                decoder.expect_method("GET").unwrap();
+                decoder
+            };
+            let mut stream = Stream::new(make());
+            assert_eq!(stream.push(bytes), bytes.len());
+            assert!(matches!(stream.next(), Some(Ok(Event::Head(h))) if h.status == interim));
+            assert_eq!(stream.next(), Some(Ok(Event::Done)));
+            assert!(matches!(stream.next(), Some(Ok(Event::Head(h))) if h.status == 200));
+            assert_eq!(stream.next(), Some(Ok(Event::Body(body.to_vec()))));
+            assert_eq!(stream.next(), Some(Ok(Event::Done)));
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.is_done(), closed);
+            assert!(stream.unread().is_empty());
+            assert_eq!(stream.failed(), None);
+            contract::check_decode(make, bytes);
+        }
+    }
+
+    #[test]
+    fn whole_messages_obey_contracts_and_limits() {
+        let pipeline = [CHUNKED, GET, POST].concat();
+        let make = || RequestMessages::with_limits(small(), 5, CHUNKED.len());
+        contract::check_decode_with_held_limit(make, &pipeline, CHUNKED.len() + 5);
+        contract::check_decode_with_alloc_limit(make, &pipeline, (CHUNKED.len() + 1) * 2);
+        let (messages, error) = test_support::decode_all(make, &pipeline);
+        assert_eq!(error, None);
+        assert_eq!(
+            messages,
+            [
+                Request::parse(CHUNKED).unwrap(),
+                Request::parse(GET).unwrap(),
+                Request::parse(POST).unwrap()
+            ]
+        );
+        for bytes in [CHUNKED, POST] {
+            let make = || RequestMessages::with_limits(small(), 4, 512);
+            assert_eq!(
+                test_support::decode_all(make, bytes).1,
+                Some(Fail::Protocol(Error::BodyTooLong))
+            );
+            contract::check_decode(make, bytes);
+            let make = || RequestMessages::with_limits(small(), 5, bytes.len() - 1);
+            assert_eq!(
+                test_support::decode_all(make, bytes).1,
+                Some(Fail::Protocol(Error::MessageTooLong))
+            );
+            contract::check_decode(make, bytes);
+        }
+        for bytes in [GET, b"", b"\r", b"\r\n", b"GET"] {
+            for limit in [0, 1, 2, GET.len() - 1, GET.len()] {
+                contract::check_decode(|| RequestMessages::with_limits(small(), 0, limit), bytes);
+            }
+        }
+        let make = || {
+            let mut decoder = ResponseMessages::with_limits(small(), 5, 128);
+            decoder.expect_method("HEAD").unwrap();
+            decoder.expect_method("GET").unwrap();
+            decoder
+        };
+        let bytes = b"HTTP/1.1 103 Early Hints\r\nConnection: close\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 90\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        contract::check_decode_with_held_limit(make, bytes, 135);
+        let (responses, error) = test_support::decode_all(make, bytes);
+        assert_eq!(error, None);
+        assert_eq!(responses.len(), 3);
+        assert!(responses[1].body.is_empty());
+        assert_eq!(responses[2].body, b"hello");
+        for bytes in [OK, b"HTTP/1.1 200 OK\r\n\r\nhello"] {
+            let make = || ResponseMessages::with_limits(small(), 5, bytes.len());
+            contract::check_decode(make, bytes);
+            assert_eq!(
+                test_support::decode_all(make, bytes),
+                (vec![Response::parse(bytes).unwrap()], None)
+            );
+            let make = || ResponseMessages::with_limits(small(), 4, 128);
+            contract::check_decode(make, bytes);
+            assert_eq!(
+                test_support::decode_all(make, bytes).1,
+                Some(Fail::Protocol(Error::BodyTooLong))
+            );
+        }
+        // Long runs of tiny chunks must not exhaust the driver's zero-step budget.
+        let mut tiny = request_with("Transfer-Encoding: chunked\r\n", b"");
+        tiny.extend_from_slice(&b"0001\r\nx\r\n".repeat(256));
+        tiny.extend_from_slice(b"0\r\n\r\n");
+        contract::check_decode(RequestMessages::default, &tiny);
+        assert_eq!(
+            test_support::decode_all(RequestMessages::default, &tiny).0[0]
+                .body
+                .len(),
+            256
+        );
+    }
+
+    #[test]
+    fn whole_messages_preserve_handoff_and_response_queue_bounds() {
+        for bytes in [
+            b"HTTP/1.1 101 Switching Protocols\r\n\r\ntunnel".as_slice(),
+            b"HTTP/1.1 200 OK\r\n\r\ntunnel",
+        ] {
+            let make = || {
+                let mut decoder = ResponseMessages::default();
+                decoder.expect_method("CONNECT").unwrap();
+                decoder
+            };
+            let mut stream = Stream::new(make());
+            assert_eq!(stream.push(bytes), bytes.len());
+            assert!(stream.next().unwrap().unwrap().body.is_empty());
+            assert_eq!(stream.next(), None);
+            assert!(stream.is_done());
+            assert_eq!(stream.unread(), b"tunnel");
+            contract::check_decode(make, bytes);
+        }
+        let mut decoder = ResponseMessages::default();
+        assert_eq!(decoder.expect_method("bad method"), Err(Error::StartLine));
+        for _ in 0..MAX_PENDING_REQUESTS {
+            decoder.expect_method("GET").unwrap();
+        }
+        assert_eq!(decoder.expect_method("GET"), Err(Error::TooManyRequests));
+        assert_eq!(decoder.held(), MAX_PENDING_REQUESTS);
+    }
+
+    #[test]
+    fn leading_empty_lines_agree_between_request_wire_types() {
+        for n in 0..=MAX_EMPTY_LINES + 1 {
+            let bytes = [b"\r\n".repeat(n), GET.to_vec()].concat();
+            assert_eq!(
+                Request::parse(&bytes).map(|r| r.head),
+                RequestHead::parse(&bytes)
+            );
+            contract::check_wire::<Request>(&bytes);
+            contract::check_wire::<RequestHead>(&bytes);
+        }
+    }
+
+    #[test]
+    fn empty_reason_space_counts_toward_response_limits() {
+        let response = Response::status(204);
+        assert_eq!(response.to_bytes().unwrap(), b"HTTP/1.1 204 \r\n\r\n");
+        let short = b"HTTP/1.1 204\r\n\r\n";
+        let limits = Limits {
+            head: short.len(),
+            ..Limits::default()
+        };
+        assert_eq!(
+            test_support::decode_all(|| Responses::new(limits), short).1,
+            Some(Fail::Protocol(Error::HeadTooLong))
+        );
+        contract::check_decode(|| Responses::new(limits), short);
+        let limits = Limits {
+            start_line: 12,
+            ..Limits::default()
+        };
+        assert_eq!(
+            test_support::decode_all(|| Responses::new(limits), short).1,
+            Some(Fail::Protocol(Error::StartLineTooLong))
+        );
+        let limits = Limits {
+            head: short.len() + 1,
+            start_line: 13,
+            ..Limits::default()
+        };
+        assert_eq!(
+            test_support::decode_all(|| Responses::new(limits), short).1,
+            None
+        );
+        contract::check_decode(|| Responses::new(limits), short);
+        let mut head = response.head;
+        head.reason = vec![b'a'; Limits::default().start_line - 13];
+        contract::check_wire_value(&head);
+        head.reason.push(b'a');
+        refused(&head, Error::StartLineTooLong);
+    }
+
+    #[test]
+    fn response_constructors_use_wire_and_json() {
+        for status in [100, 202, 204, 304, 404] {
+            let response = Response::status(status);
+            contract::check_wire_value(&response);
+            assert_eq!(
+                named(&response.head.headers, "content-length").next(),
+                if [100, 204, 304].contains(&status) {
+                    None
+                } else {
+                    Some(b"0".as_slice())
+                }
+            );
+        }
+        refused(&Response::status(99), Error::StartLine);
+        let response = Response::json(b" {\"ok\": true} \n").unwrap();
+        assert_eq!(response.body, b" {\"ok\": true} \n");
+        assert_eq!(
+            named(&response.head.headers, "content-type").next(),
+            Some(b"application/json".as_slice())
+        );
+        contract::check_wire_value(&response);
+        assert!(Response::json(b"not JSON").is_ok());
+        assert_eq!(
+            Response::json(&vec![b'x'; MAX_BODY + 1]),
+            Err(Error::BodyTooLong)
+        );
+        let detail = "quote \" slash \\ newline\n tab\t café";
+        let response = Response::problem(404, detail).unwrap();
+        assert_eq!(
+            named(&response.head.headers, "content-type").next(),
+            Some(b"application/problem+json".as_slice())
+        );
+        let value = json::Value::parse(&response.body).unwrap();
+        assert_eq!(
+            value.get("type").and_then(json::Value::as_str),
+            Some("about:blank")
+        );
+        assert_eq!(value.get("status").and_then(json::Value::as_u64), Some(404));
+        assert_eq!(
+            value.get("detail").and_then(json::Value::as_str),
+            Some(detail)
+        );
+        contract::check_wire_value(&response);
+        assert_eq!(Response::problem(204, "bad"), Err(Error::StartLine));
+        assert_eq!(
+            Response::problem(400, &"\n".repeat(json::MAX_SIZE)),
+            Err(Error::BodyTooLong)
+        );
+        let head = Response::event_stream("session-1");
+        contract::check_wire_value(&head);
+        assert_eq!(
+            named(&head.headers, "content-type").next(),
+            Some(b"text/event-stream".as_slice())
+        );
+        assert_eq!(
+            named(&head.headers, "mcp-session-id").next(),
+            Some(b"session-1".as_slice())
+        );
+        assert_eq!(
+            named(&head.headers, "cache-control").next(),
+            Some(b"no-cache".as_slice())
+        );
+        assert_eq!(named(&head.headers, "content-length").next(), None);
+        let mut out = head.to_bytes().unwrap();
+        let mut stream = Stream::new(Responses::default());
+        assert_eq!(stream.push(&out), out.len());
+        assert!(matches!(stream.next(), Some(Ok(Event::Head(_)))));
+        assert_eq!(stream.next(), None);
+        assert!(!stream.is_done());
+        Chunk(b"data: {}\n\n".to_vec()).write(&mut out).unwrap();
+        Chunk(Vec::new()).write(&mut out).unwrap();
+        assert_eq!(Response::parse(&out).unwrap().body, b"data: {}\n\n");
+        refused(&Response::event_stream("bad\r\nfield"), Error::Header);
+    }
+
+    #[test]
+    fn switching_protocols_leaves_bytes_for_handoff() {
+        let bytes = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: example\r\n\r\ntunnel";
+        let mut stream = Stream::new(Responses::default());
+        assert_eq!(stream.push(bytes), bytes.len());
+        assert!(matches!(stream.next(), Some(Ok(Event::Head(h))) if h.status == 101));
+        assert_eq!(stream.next(), Some(Ok(Event::Done)));
+        assert_eq!(stream.next(), None);
+        assert!(stream.is_done());
+        assert_eq!(stream.failed(), None);
+        assert_eq!(stream.unread(), b"tunnel");
+        contract::check_decode(Responses::default, bytes);
     }
 
     #[test]
@@ -2295,7 +2964,10 @@ mod tests {
             Error::StartLine,
         );
         request_error(b"CONNECT / HTTP/1.1\r\nHost: x\r\n\r\n", Error::StartLine);
-        response_error(b"HTTP/1.1 101 Switching Protocols\r\n\r\n", Error::Upgrade);
+        assert_eq!(
+            Response::parse(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
+            Err(Error::Upgrade)
+        );
         request_error(
             b"POST / HTTP/1.0\r\nTransfer-Encoding: chunked\r\n\r\n",
             Error::Http10TransferEncoding,

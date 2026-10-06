@@ -66,6 +66,8 @@ cargo +nightly fuzz list
 | `http3` | bounded frame and stream contracts, field validation, connection routing, and QPACK pause/resume | `stdlib::http3`: HTTP/3 |
 | `http1_requests` | request stream and Collect contracts, head limits, chunk framing, and transactional constructed writers | `stdlib::http1`: Requests, Request, RequestHead, Chunk |
 | `http1_responses` | response stream and Collect contracts, queued HEAD/CONNECT methods, method-aware parse/write symmetry, body framing, and transactional writers | `stdlib::http1`: Responses, Response, ResponseHead |
+| `http1_request_messages` | whole-message contracts, bounded body and wire storage, pipelined requests, exact raw forwarding, and Wire round trips | `stdlib::http1`: RequestMessages |
+| `http1_response_messages` | whole-message contracts, queued GET/HEAD/CONNECT methods, interim close handling, body and wire bounds, and exact forwarding | `stdlib::http1`: ResponseMessages |
 | `nbns` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
 | `ntp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntp`: NTP |

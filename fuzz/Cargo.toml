@@ -760,3 +760,17 @@ path = "fuzz_targets/rdp.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "http1_request_messages"
+path = "fuzz_targets/http1_request_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_response_messages"
+path = "fuzz_targets/http1_response_messages.rs"
+test = false
+doc = false
+bench = false
