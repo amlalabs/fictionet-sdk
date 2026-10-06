@@ -419,7 +419,7 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Incomplete => f.write_str("incomplete split MySQL message"),
-            FrameError::Unwritable => f.write_str("value cannot be written as given"),
+            FrameError::Unwritable => f.write_str("value cannot be written without changing it"),
             FrameError::Sequence { expected, got } => write!(f, "sequence ID {got}, expected {expected}"),
             FrameError::TooLong(n) => write!(f, "message of at least {n} bytes is over the limit"),
         }
@@ -621,7 +621,7 @@ impl std::fmt::Display for Error {
             Error::Finished => f.write_str("packet after the last result ended"),
             Error::Length(n) => write!(f, "length {n} does not fit the field"),
             Error::Value(v) => write!(f, "value {v} is not allowed in this field"),
-            Error::Unwritable => f.write_str("value cannot be written as given"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -655,7 +655,9 @@ impl Message {
     /// payload or one beyond [`MAX_MESSAGE`].
     pub fn from_payload(seq: u8, payload: &impl Wire<WriteError = Error>) -> Result<Self, Error> {
         let payload = payload.to_bytes()?;
-        if payload.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+        if payload.len() > MAX_MESSAGE {
+            return Err(Error::Unwritable);
+        }
         Ok(Self { seq, payload })
     }
 }
@@ -683,7 +685,9 @@ impl Wire for Message {
     /// short or empty final packet. Refuses payloads above [`MAX_MESSAGE`]
     /// before changing the destination.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
-        if self.payload.len() > MAX_MESSAGE { return Err(FrameError::Unwritable); }
+        if self.payload.len() > MAX_MESSAGE {
+            return Err(FrameError::Unwritable);
+        }
         put_packets(out, self.seq, &self.payload);
         Ok(())
     }
@@ -898,7 +902,7 @@ impl Handshake {
 /// is, what it can do, and its answer to the server's challenge.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HandshakeResponse {
-    /// The client's capability flags. [`capability::PROTOCOL_41`] is
+    /// The client's capability flags. [`capability::PROTOCOL_41`]
     /// must be set.
     pub capabilities: u32,
     /// The longest message the client will send.
@@ -1339,7 +1343,7 @@ pub enum Command {
     /// Any other command, such as COM_STMT_EXECUTE or COM_CHANGE_USER,
     /// with its data unread. Its command byte must be one no other
     /// variant covers, or [`Command::message`] gives
-    /// [`Error::Header`].
+    /// [`Error::Unwritable`].
     Other {
         /// The command byte.
         command: u8,
@@ -2985,6 +2989,7 @@ mod tests {
         for caps in CAPS_SETS {
             if let Ok(value) = OkPacket::parse(bytes, caps) {
                 let message = value.message(0, caps).unwrap();
+                assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);
                 assert_eq!(OkPacket::parse(&message.payload, caps), Ok(value.clone()));
                 assert_eq!(OkPacket::parse(&value.end_message(0, caps).unwrap().payload, caps), Ok(value));
@@ -3001,7 +3006,10 @@ mod tests {
             let _ = ResultReader::new(caps).push(bytes);
         }
         for columns in 0..4 {
-            if let Ok(row) = parse_row(bytes, columns) { contract::check_wire_value(&row); }
+            if let Ok(row) = parse_row(bytes, columns) {
+                assert!(row.to_bytes().is_ok(), "{row:?}");
+                contract::check_wire_value(&row);
+            }
         }
     }
 
@@ -3076,6 +3084,7 @@ mod tests {
             contract::check_wire::<Message>(&bytes);
             for message in decode_all(|| Messages::with_limit(limit), &bytes).0 {
                 check_payload(&message.payload);
+                assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);
                 for caps in CAPS_SETS { let _ = ResultReader::new(caps).push(&message.payload); }
             }

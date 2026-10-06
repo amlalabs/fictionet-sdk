@@ -71,7 +71,7 @@
 //! assert_eq!(m.body.get("ok"), Some(&Bson::Double(1.0)));
 //! ```
 
-use crate::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port MongoDB servers listen on.
 pub const PORT: u16 = 27017;
@@ -453,7 +453,7 @@ pub enum BsonError {
 impl std::fmt::Display for BsonError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BsonError::Unwritable => f.write_str("value cannot be written as given"),
+            BsonError::Unwritable => f.write_str("value cannot be written without changing it"),
             BsonError::Trailing => f.write_str("bytes after BSON document"),
             BsonError::Truncated => f.write_str("BSON runs past the end of its bytes"),
             BsonError::Length(n) => write!(f, "BSON length field {n} out of range"),
@@ -530,7 +530,9 @@ impl Wire for Document {
     fn parse(b: &[u8]) -> Result<Self, BsonError> {
         let mut budget = MAX_ELEMENTS;
         let (doc, used) = parse_document(b, 1, MAX_DOCUMENT_SIZE, &mut budget)?;
-        if used != b.len() { return Err(BsonError::Trailing); }
+        if used != b.len() {
+            return Err(BsonError::Trailing);
+        }
         Ok(doc)
     }
 
@@ -970,7 +972,9 @@ impl Wire for Header {
     /// Reads exactly 16 header bytes. Refuses incomplete or trailing bytes.
     /// Field values are left unchecked until the complete message is read.
     fn parse(b: &[u8]) -> Result<Self, MessageError> {
-        if b.len() > HEADER_LEN { return Err(MessageError::Trailing); }
+        if b.len() > HEADER_LEN {
+            return Err(MessageError::Trailing);
+        }
         let mut r = Reader::new(b);
         let e = MessageError::Truncated;
         Ok(Header { length: r.i32().ok_or(e)?, request_id: r.i32().ok_or(e)?,
@@ -1140,8 +1144,7 @@ pub enum MessageError {
     Trailing,
     /// A document, or a name in the message, is not well formed.
     Bson(BsonError),
-    /// An OP_MSG sets a required flag bit this module does not know. For a
-    /// writer: any bit not in [`flag::KNOWN`].
+    /// An OP_MSG sets a required flag bit this module does not know.
     Flags(u32),
     /// An OP_MSG section kind other than 0 or 1. This includes kind 2,
     /// which only servers use among themselves, and kind 3, telemetry a
@@ -1184,7 +1187,7 @@ pub enum MessageError {
 impl std::fmt::Display for MessageError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MessageError::Unwritable => f.write_str("value cannot be written as given"),
+            MessageError::Unwritable => f.write_str("value cannot be written without changing it"),
             MessageError::Length(n) => write!(f, "message length {n} out of range"),
             MessageError::Truncated => f.write_str("a field runs past the end of the message"),
             MessageError::Trailing => f.write_str("bytes left at the end of the message"),
@@ -1250,40 +1253,7 @@ impl Message {
         Ok(Message { request_id: header.request_id, response_to: header.response_to, body })
     }
 
-    /// A message that answers this one with `body`, with `request_id` as
-    /// its own ID.
-    pub fn reply(&self, request_id: i32, body: Body) -> Message {
-        Message { request_id, response_to: self.request_id, body }
-    }
-}
-
-// Only complete, bounded messages reach the body parser.
-fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, MessageError> {
-    let Some(len) = frame_len(b, limit)? else { return Ok(None) };
-    let frame = b.get(..len).ok_or(MessageError::Truncated)?;
-    Ok(Some((Message::from_frame(frame)?, len)))
-}
-
-impl Wire for Message {
-    type ParseError = MessageError;
-    type WriteError = MessageError;
-
-    /// Reads exactly one message, bounded by [`MAX_MESSAGE_SIZE`].
-    /// Incomplete input and trailing bytes are errors.
-    fn parse(b: &[u8]) -> Result<Self, MessageError> {
-        match parse_message(b, MAX_MESSAGE_SIZE)? {
-            Some((message, used)) if used == b.len() => Ok(message),
-            Some(_) => Err(MessageError::Trailing),
-            None => Err(MessageError::Truncated),
-        }
-    }
-
-    /// Appends a message. Refuses invalid BSON or names, unknown flags,
-    /// conflicting op codes, invalid compressed sizes, duplicate fields,
-    /// and values beyond the message limits. Leaves `destination` unchanged
-    /// on error. Computes OP_MSG checksums from the completed message.
-    fn write(&self, destination: &mut Vec<u8>) -> Result<(), MessageError> {
-        let bytes = (|| -> Result<Vec<u8>, MessageError> {
+    fn encode(&self) -> Result<Vec<u8>, MessageError> {
         let mut out = Vec::new();
         out.extend_from_slice(&[0; 4]);
         out.extend_from_slice(&self.request_id.to_le_bytes());
@@ -1348,8 +1318,43 @@ impl Wire for Message {
             out.extend_from_slice(&crc.to_le_bytes());
         }
         Ok(out)
-        })().map_err(|_| MessageError::Unwritable)?;
-        destination.extend_from_slice(&bytes);
+    }
+
+    /// A message that answers this one with `body`, with `request_id` as
+    /// its own ID.
+    pub fn reply(&self, request_id: i32, body: Body) -> Message {
+        Message { request_id, response_to: self.request_id, body }
+    }
+}
+
+// Only complete, bounded messages reach the body parser.
+fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, MessageError> {
+    let Some(len) = frame_len(b, limit)? else { return Ok(None) };
+    let frame = b.get(..len).ok_or(MessageError::Truncated)?;
+    Ok(Some((Message::from_frame(frame)?, len)))
+}
+
+impl Wire for Message {
+    type ParseError = MessageError;
+    type WriteError = MessageError;
+
+    /// Reads exactly one message, bounded by [`MAX_MESSAGE_SIZE`].
+    /// Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, MessageError> {
+        match parse_message(b, MAX_MESSAGE_SIZE)? {
+            Some((message, used)) if used == b.len() => Ok(message),
+            Some(_) => Err(MessageError::Trailing),
+            None => Err(MessageError::Truncated),
+        }
+    }
+
+    /// Appends a message. Refuses invalid BSON or names, unknown flags,
+    /// conflicting op codes, invalid compressed sizes, duplicate fields,
+    /// and values beyond the message limits. Leaves `out` unchanged
+    /// on error. Computes OP_MSG checksums from the completed message.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageError> {
+        let bytes = self.encode().map_err(|_| MessageError::Unwritable)?;
+        out.extend_from_slice(&bytes);
         Ok(())
     }
 }
@@ -2507,6 +2512,7 @@ mod tests {
         contract::check_wire::<Message>(data);
         contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE_SIZE);
         for message in decode_all(Frames::new, data).0.into_iter().flatten() {
+            assert!(message.to_bytes().is_ok(), "{message:?}");
             contract::check_wire_value(&message);
         }
     }

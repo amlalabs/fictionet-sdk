@@ -7,7 +7,7 @@ use fictionet::stdlib::codec::contract::{check_decode_with_alloc_limit, check_wi
 use fictionet::stdlib::mongodb::{
     Body, Bson, Compressed, Document, Frames, Message, Msg, Query, Reply, Sequence, MAX_MESSAGE_SIZE,
 };
-use fictionet::stdlib::codec::test_support::decode_all;
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use libfuzzer_sys::fuzz_target;
 
 /// Bytes taken one at a time from the input, then zeros.
@@ -93,9 +93,14 @@ fuzz_target!(|data: &[u8]| {
     check_wire::<Message>(data);
     check_wire::<Document>(data);
     for message in decode_all(Frames::new, data).0.into_iter().flatten() {
+        assert!(message.to_bytes().is_ok(), "{message:?}");
         check_wire_value(&message);
     }
     let mut bytes = Bytes(data);
     check_wire_value(&document(&mut bytes, 4));
-    check_wire_value(&message(&mut bytes));
+    let message = message(&mut bytes);
+    check_wire_value(&message);
+    if let Ok(encoded) = message.to_bytes() {
+        check_decode_with_alloc_limit(Frames::new, &encoded, 2 * MAX_MESSAGE_SIZE);
+    }
 });

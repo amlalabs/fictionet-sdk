@@ -839,9 +839,15 @@ fn payload_readers_refuse_trailing_bytes() {
     let mut bytes = response.to_bytes().unwrap();
     bytes.push(0);
     assert_eq!(mysql::HandshakeResponse::parse(&bytes), Err(mysql::Error::Trailing));
-    let mut bytes = mysql::Column::new(b"a", mysql::column_type::LONG).to_bytes().unwrap();
-    bytes.push(0);
+    let column = mysql::Column::new(b"a", mysql::column_type::LONG);
+    let mut bytes = column.to_bytes().unwrap();
+    // COM_FIELD_LIST appends a length-encoded default after the fixed fields.
+    bytes.extend_from_slice(&[1, b'0']);
     assert_eq!(mysql::Column::parse(&bytes), Err(mysql::Error::Trailing));
+    let mut reader = mysql::ResultReader::new(mysql::capability::PROTOCOL_41);
+    assert_eq!(reader.push(&[1]), Ok(mysql::ResultEvent::ColumnCount(1)));
+    assert_eq!(reader.push(&bytes), Err(mysql::Error::Trailing));
+    assert_eq!(reader.push(&column.to_bytes().unwrap()), Ok(mysql::ResultEvent::Column(column)));
     let mut bytes = tds::Prelogin::new(tds::Version::default(), tds::encryption::OFF).to_bytes().unwrap();
     bytes.push(0);
     assert_eq!(tds::Prelogin::parse(&bytes), Err(tds::Error::Invalid("bytes after PRELOGIN")));
@@ -854,7 +860,9 @@ fn payload_readers_refuse_trailing_bytes() {
 fn mysql_writers_preserve_flags_and_optional_fields() {
     use mysql::{Error, HandshakeResponse, OkPacket, capability};
     refused_write(&HandshakeResponse::default());
-    refused_write(&mysql::SslRequest::default());
+    for capabilities in [0, capability::SSL, capability::PROTOCOL_41] {
+        refused_write(&mysql::SslRequest { capabilities, ..mysql::SslRequest::default() });
+    }
     refused_write(&mysql::Handshake { auth_data: vec![1; 21], auth_plugin: b"plugin".to_vec(),
         ..mysql::Handshake::default() });
     let base = HandshakeResponse { capabilities: capability::PROTOCOL_41, ..HandshakeResponse::default() };

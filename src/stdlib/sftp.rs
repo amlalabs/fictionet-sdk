@@ -216,7 +216,7 @@ pub enum PacketError {
 impl std::fmt::Display for PacketError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PacketError::Unwritable => f.write_str("value cannot be written as given"),
+            PacketError::Unwritable => f.write_str("value cannot be written without changing it"),
             PacketError::Empty => f.write_str("packet length 0, with no type byte"),
             PacketError::TooLong(n) => write!(f, "packet length {n}, over the limit"),
         }
@@ -408,7 +408,7 @@ impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ParseError::Packet(e) => e.fmt(f),
-            ParseError::Unwritable => f.write_str("value cannot be written as given"),
+            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::UnknownType(t) => write!(f, "packet type {t} is not known here"),
             ParseError::Truncated => f.write_str("the packet ended inside a field"),
             ParseError::Trailing => f.write_str("bytes after the last field"),
@@ -629,191 +629,89 @@ impl NameEntry {
     }
 }
 
+/// How many entries from the start of `names` fit in one NAME response.
+/// Stops at the first entry that cannot be written unchanged or would
+/// exceed [`MAX_PACKET`], and never counts more than [`MAX_NAMES`].
+/// A server can send the remaining entries in a later READDIR response.
+pub fn names_that_fit(names: &[NameEntry]) -> usize {
+    // The type byte, request id, and entry count.
+    let mut used = 1usize + 4 + 4;
+    let mut entry = Vec::new();
+    for (i, name) in names.iter().take(MAX_NAMES).enumerate() {
+        entry.clear();
+        if name.encode(&mut entry).is_err() {
+            return i;
+        }
+        let Some(total) = used.checked_add(entry.len()).filter(|&n| n <= MAX_PACKET) else {
+            return i;
+        };
+        used = total;
+    }
+    names.len().min(MAX_NAMES)
+}
+
 /// A request: what a client asks a server to do. Every request but INIT
 /// carries an id the server copies into its response.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Request {
     /// INIT: the client's highest `version`, and the `extensions` it
     /// offers. The first packet of a session. A reader skips extensions
     /// over their limits, as it would any it does not know.
-    Init {
-        /// Protocol version.
-        version: u32,
-        /// Advertised extensions.
-        extensions: Vec<Extension>,
-    },
+    Init { version: u32, extensions: Vec<Extension> },
     /// OPEN: open the file at `path` with [`open_flags`] `flags`, and set
     /// `attrs` if it is created. Answered with HANDLE or STATUS.
-    Open {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-        /// Open flags.
-        flags: u32,
-        /// File attributes.
-        attrs: Attrs,
-    },
+    Open { id: u32, path: Vec<u8>, flags: u32, attrs: Attrs },
     /// CLOSE: close `handle`. Answered with STATUS.
-    Close {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-    },
+    Close { id: u32, handle: Vec<u8> },
     /// READ: read up to `len` bytes at `offset`. Answered with DATA, or
     /// STATUS (EOF at the end of the file).
-    Read {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-        /// Byte offset in the file.
-        offset: u64,
-        /// Requested byte count.
-        len: u32,
-    },
+    Read { id: u32, handle: Vec<u8>, offset: u64, len: u32 },
     /// WRITE: write `data` at `offset`. Answered with STATUS.
-    Write {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-        /// Byte offset in the file.
-        offset: u64,
-        /// Payload bytes.
-        data: Vec<u8>,
-    },
+    Write { id: u32, handle: Vec<u8>, offset: u64, data: Vec<u8> },
     /// LSTAT: the attributes of `path`, not following a final symbolic
     /// link. Answered with ATTRS or STATUS.
-    Lstat {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Lstat { id: u32, path: Vec<u8> },
     /// FSTAT: the attributes of the open file `handle`. Answered with
     /// ATTRS or STATUS.
-    Fstat {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-    },
+    Fstat { id: u32, handle: Vec<u8> },
     /// SETSTAT: set `attrs` on `path`. Answered with STATUS.
-    Setstat {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-        /// File attributes.
-        attrs: Attrs,
-    },
+    Setstat { id: u32, path: Vec<u8>, attrs: Attrs },
     /// FSETSTAT: set `attrs` on the open file `handle`. Answered with
     /// STATUS.
-    Fsetstat {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-        /// File attributes.
-        attrs: Attrs,
-    },
+    Fsetstat { id: u32, handle: Vec<u8>, attrs: Attrs },
     /// OPENDIR: open the directory at `path` for listing. Answered with
     /// HANDLE or STATUS.
-    Opendir {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Opendir { id: u32, path: Vec<u8> },
     /// READDIR: the next names in the directory `handle`. Answered with
     /// NAME, or STATUS (EOF when there are no more).
-    Readdir {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-    },
+    Readdir { id: u32, handle: Vec<u8> },
     /// REMOVE: remove the file at `path`. Answered with STATUS.
-    Remove {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Remove { id: u32, path: Vec<u8> },
     /// MKDIR: make a directory at `path` with `attrs`. Answered with
     /// STATUS.
-    Mkdir {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-        /// File attributes.
-        attrs: Attrs,
-    },
+    Mkdir { id: u32, path: Vec<u8>, attrs: Attrs },
     /// RMDIR: remove the directory at `path`. Answered with STATUS.
-    Rmdir {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Rmdir { id: u32, path: Vec<u8> },
     /// REALPATH: the absolute, canonical form of `path`. Answered with a
     /// NAME of one entry, or STATUS.
-    Realpath {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Realpath { id: u32, path: Vec<u8> },
     /// STAT: the attributes of `path`, following symbolic links. Answered
     /// with ATTRS or STATUS.
-    Stat {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Stat { id: u32, path: Vec<u8> },
     /// RENAME: rename `from` to `to`. Answered with STATUS.
-    Rename {
-        /// Request identifier.
-        id: u32,
-        /// Source path.
-        from: Vec<u8>,
-        /// Destination path.
-        to: Vec<u8>,
-    },
+    Rename { id: u32, from: Vec<u8>, to: Vec<u8> },
     /// READLINK: the target of the symbolic link at `path`. Answered with
     /// a NAME of one entry, or STATUS.
-    Readlink {
-        /// Request identifier.
-        id: u32,
-        /// File or directory path.
-        path: Vec<u8>,
-    },
+    Readlink { id: u32, path: Vec<u8> },
     /// SYMLINK: make a symbolic link at `linkpath` pointing to
     /// `targetpath`, in the order the specification gives. OpenSSH sends
     /// the two the other way round, target first. Answered with STATUS.
-    Symlink {
-        /// Request identifier.
-        id: u32,
-        /// Symbolic link path.
-        linkpath: Vec<u8>,
-        /// Link target path.
-        targetpath: Vec<u8>,
-    },
+    Symlink { id: u32, linkpath: Vec<u8>, targetpath: Vec<u8> },
     /// EXTENDED: the request `name` (such as `statvfs@openssh.com`), with
     /// `data` laid out as that request defines. Answered with
     /// EXTENDED_REPLY or STATUS.
-    Extended {
-        /// Request identifier.
-        id: u32,
-        /// Extension name.
-        name: Vec<u8>,
-        /// Payload bytes.
-        data: Vec<u8>,
-    },
+    Extended { id: u32, name: Vec<u8>, data: Vec<u8> },
 }
 
 impl Request {
@@ -979,66 +877,28 @@ impl Request {
 /// A response: what a server answers. Every response but VERSION carries
 /// the id of the request it answers.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Response {
     /// VERSION: the `version` the session will use, and the `extensions`
     /// the server offers. The specification asks for the lower of the
     /// client's version and the server's. This module writes only version
     /// 3 packets, so a server built on it answers 3, as OpenSSH does.
-    Version {
-        /// Protocol version.
-        version: u32,
-        /// Advertised extensions.
-        extensions: Vec<Extension>,
-    },
+    Version { version: u32, extensions: Vec<Extension> },
     /// STATUS: how a request ended, with a `message` for people to read
     /// and the `language` tag it is written in. Both may be empty.
-    Status {
-        /// Request identifier.
-        id: u32,
-        /// Result status.
-        status: Status,
-        /// Status message.
-        message: Vec<u8>,
-        /// Language tag.
-        language: Vec<u8>,
-    },
+    Status { id: u32, status: Status, message: Vec<u8>, language: Vec<u8> },
     /// HANDLE: the `handle` of a file or directory just opened.
-    Handle {
-        /// Request identifier.
-        id: u32,
-        /// Open file or directory handle.
-        handle: Vec<u8>,
-    },
+    Handle { id: u32, handle: Vec<u8> },
     /// DATA: bytes read from a file.
-    Data {
-        /// Request identifier.
-        id: u32,
-        /// Payload bytes.
-        data: Vec<u8>,
-    },
+    Data { id: u32, data: Vec<u8> },
     /// NAME: names, for READDIR, REALPATH and READLINK. The list must fit
     /// within one packet and contain at most [`MAX_NAMES`] entries.
-    Name {
-        /// Request identifier.
-        id: u32,
-        /// Directory entries.
-        names: Vec<NameEntry>,
-    },
+    Name { id: u32, names: Vec<NameEntry> },
     /// ATTRS: a file's attributes, for STAT, LSTAT and FSTAT.
-    Attrs {
-        /// Request identifier.
-        id: u32,
-        /// File attributes.
-        attrs: Attrs,
-    },
+    Attrs { id: u32, attrs: Attrs },
     /// EXTENDED_REPLY: the answer to an EXTENDED request, laid out as that
     /// request defines.
-    ExtendedReply {
-        /// Request identifier.
-        id: u32,
-        /// Payload bytes.
-        data: Vec<u8>,
-    },
+    ExtendedReply { id: u32, data: Vec<u8> },
 }
 
 impl Response {
@@ -1479,9 +1339,11 @@ mod tests {
         }
         assert_eq!(Status::from_code(u32::MAX).code(), u32::MAX);
         assert_eq!(Status::from_code(8), Status::OpUnsupported);
-        let response = Response::Status { id: 1, status: Status::Other(2), message: vec![], language: vec![] };
-        assert_eq!(response.to_bytes(), Err(ParseError::Unwritable));
-        contract::check_wire_value(&response);
+        for code in 0..=8 {
+            let response = Response::Status { id: 1, status: Status::Other(code), message: vec![], language: vec![] };
+            assert_eq!(response.to_bytes(), Err(ParseError::Unwritable));
+            contract::check_wire_value(&response);
+        }
         assert_eq!(Status::NoSuchFile.to_string(), "no such file");
         assert_eq!(ParseError::UnknownType(77).status(), Status::OpUnsupported);
         assert_eq!(ParseError::Truncated.status(), Status::BadMessage);
@@ -1707,6 +1569,43 @@ mod tests {
     }
 
     #[test]
+    fn name_prefix_fits_without_changing_entries() {
+        let fits = |names: &[NameEntry]| {
+            let fit = names_that_fit(names);
+            let response = Response::Name { id: 1, names: names[..fit].to_vec() };
+            assert_eq!(Response::parse(&response.to_bytes().unwrap()), Ok(response));
+            if fit < names.len() {
+                let next = Response::Name { id: 1, names: names[..fit + 1].to_vec() };
+                let mut out = vec![7];
+                assert_eq!(next.write(&mut out), Err(ParseError::Unwritable));
+                assert_eq!(out, [7]);
+            }
+            fit
+        };
+        let big = NameEntry {
+            filename: vec![b'f'; MAX_PATH], longname: vec![b'l'; MAX_PATH], attrs: full_attrs(),
+        };
+        let names = vec![big; 50];
+        let fit = fits(&names);
+        assert!(fit > 0 && fit < names.len());
+        assert_eq!(fits(&vec![NameEntry::default(); MAX_NAMES + 1]), MAX_NAMES);
+        assert_eq!(fits(&[]), 0);
+        for bad in [
+            NameEntry { filename: vec![0; MAX_PATH + 1], ..NameEntry::default() },
+            NameEntry { longname: vec![0; MAX_PATH + 1], ..NameEntry::default() },
+            NameEntry { attrs: Attrs { extended: vec![Extension::default(); MAX_ATTR_EXTENSIONS + 1],
+                ..Attrs::default() }, ..NameEntry::default() },
+            NameEntry { attrs: Attrs { extended: vec![Extension { name: vec![0; MAX_EXTENSION_NAME + 1],
+                data: vec![] }], ..Attrs::default() }, ..NameEntry::default() },
+            NameEntry { attrs: Attrs { extended: vec![Extension { name: vec![], data: vec![0; MAX_TEXT + 1] }],
+                ..Attrs::default() }, ..NameEntry::default() },
+        ] {
+            assert_eq!(fits(std::slice::from_ref(&bad)), 0);
+            assert_eq!(fits(&[NameEntry::default(), bad, NameEntry::default()]), 1);
+        }
+    }
+
+    #[test]
     fn stream_holds_at_most_one_packet() {
         let one = Request::Readdir { id: 1, handle: s(b"d") }.to_bytes().unwrap();
         let bytes = one.repeat(100);
@@ -1790,8 +1689,14 @@ mod tests {
             contract::check_wire::<Attrs>(&bytes);
             for kind in 0..=255 {
                 let packet = Packet { kind, body: bytes.clone() };
-                if let Ok(request) = Request::from_packet(&packet) { contract::check_wire_value(&request); }
-                if let Ok(response) = Response::from_packet(&packet) { contract::check_wire_value(&response); }
+                if let Ok(request) = Request::from_packet(&packet) {
+                    assert!(request.to_bytes().is_ok(), "{request:?}");
+                    contract::check_wire_value(&request);
+                }
+                if let Ok(response) = Response::from_packet(&packet) {
+                    assert!(response.to_bytes().is_ok(), "{response:?}");
+                    contract::check_wire_value(&response);
+                }
             }
         }
     }

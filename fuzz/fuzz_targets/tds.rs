@@ -1,7 +1,7 @@
 //! TDS packet, message, login, batch, and token contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::tds::*;
 use libfuzzer_sys::fuzz_target;
 
@@ -48,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
         window: data.get(4).copied().unwrap_or(0), data: data.to_vec(),
     });
     for message in decode_all(|| Messages::with_limit(LIMIT), data).0 {
+        assert!(message.to_bytes().is_ok(), "{message:?}");
         contract::check_wire_value(&message);
     }
     for all_headers in [true, false] {
@@ -56,7 +57,9 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     let tokens: Vec<Token> = TokenReader::new(data).map_while(Result::ok).collect();
-    contract::check_wire_value(&TokenStream(tokens.clone()));
+    let stream = TokenStream(tokens.clone());
+    assert!(stream.to_bytes().is_ok(), "{stream:?}");
+    contract::check_wire_value(&stream);
     if let Some(columns) = tokens.iter().rev().find_map(|t| match t {
         Token::ColMetadata(Some(c)) => Some(c.clone()), _ => None,
     }) {
@@ -66,22 +69,42 @@ fuzz_target!(|data: &[u8]| {
     }
     let (head, rest) = data.split_at(data.len().min(8));
     let text = String::from_utf8_lossy(rest);
-    let options = rest.chunks(9).take(40).enumerate().map(|(i, chunk)| PreloginOption {
-        token: head.get(i % head.len().max(1)).copied().unwrap_or(0) % 10, data: chunk.to_vec(),
-    }).collect();
-    contract::check_wire_value(&Prelogin { options });
-    contract::check_wire_value(&Login7 {
-        option_flags3: head.first().copied().unwrap_or(0),
+    let valid = head.first().is_none_or(|b| b & 3 != 0);
+    let mut prelogin = Prelogin::new(Version::default(), encryption::OFF);
+    for (i, chunk) in rest.chunks(9).take(if valid { MAX_PRELOGIN_OPTIONS - 2 } else { 40 }).enumerate() {
+        prelogin.options.push(PreloginOption {
+            token: if valid { 9 + i as u8 } else { head[i % head.len()] % 10 },
+            data: chunk.to_vec(),
+        });
+    }
+    if valid {
+        assert!(prelogin.to_bytes().is_ok(), "{prelogin:?}");
+    }
+    contract::check_wire_value(&prelogin);
+    let login = Login7 {
+        option_flags3: head.first().copied().unwrap_or(0) & !option_flags3::EXTENSION,
         user_name: text.chars().take(200).collect(), password: text.chars().rev().take(200).collect(),
         change_password: text.chars().skip(3).take(5).collect(), ..Login7::new()
-    });
-    let batch = SqlBatch {
-        headers: Some(rest.chunks(13).take(20).map(|c| StreamHeader {
-            kind: u16::from(c[0] % 4), data: c[1..].to_vec(),
-        }).collect()), text: text.into_owned(),
     };
-    if let Ok(message) = batch.message() {
+    if let Err(error) = login.to_bytes() {
+        assert_eq!(error, Error::Unwritable);
+        let units = |s: &str| s.encode_utf16().count();
+        assert!(units(&login.user_name) > MAX_LOGIN_NAME
+            || units(&login.password) > MAX_LOGIN_NAME
+            || (login.option_flags3 & option_flags3::CHANGE_PASSWORD == 0 && !login.change_password.is_empty()));
+    }
+    contract::check_wire_value(&login);
+    let mut batch = SqlBatch::new(&text);
+    batch.headers.as_mut().unwrap().extend(rest.chunks(13).take(if valid { MAX_HEADERS - 1 } else { 20 }).enumerate().map(|(i, c)| StreamHeader {
+        kind: if valid { 0x100 + i as u16 } else { u16::from(c[0] % 4) }, data: c[1..].to_vec(),
+    }));
+    let message = batch.message();
+    if valid && rest.len() <= MAX_MESSAGE / 4 {
+        assert!(message.is_ok(), "{batch:?}");
+    }
+    if let Ok(message) = message {
         assert_eq!(SqlBatch::parse(&message.data, true), Ok(batch));
+        assert!(message.to_bytes().is_ok(), "{message:?}");
         contract::check_wire_value(&message);
     }
     let kinds = [

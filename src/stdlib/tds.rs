@@ -450,7 +450,7 @@ impl std::fmt::Display for FrameError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             FrameError::Incomplete => f.write_str("message ended without EOM"),
-            FrameError::Unwritable => f.write_str("value cannot be written as given"),
+            FrameError::Unwritable => f.write_str("value cannot be written without changing it"),
             FrameError::Length(n) => write!(f, "packet length {n}, below the 8-byte header"),
             FrameError::TypeChanged { expected, got } => {
                 write!(
@@ -802,7 +802,7 @@ impl std::fmt::Display for Error {
             Error::UnknownToken(t) => write!(f, "unknown token {t:#04x}"),
             Error::UnsupportedType(t) => write!(f, "unsupported data type {t:#04x}"),
             Error::NoColumns => write!(f, "row before any column metadata"),
-            Error::Unwritable => write!(f, "value cannot be written as given"),
+            Error::Unwritable => write!(f, "value cannot be written without changing it"),
         }
     }
 }
@@ -1317,11 +1317,10 @@ impl Login7 {
             if block > MAX_LOGIN7.saturating_sub(LOGIN7_FIXED_LEN + var.len()) {
                 return Err(Error::Unwritable);
             }
-            let kept = features;
-            if !kept.is_empty() {
+            if !features.is_empty() {
                 let at = (LOGIN7_FIXED_LEN + var.len()) as u32;
                 var[p..p + 4].copy_from_slice(&at.to_le_bytes());
-                for f in kept {
+                for f in features {
                     var.push(f.id);
                     var.extend_from_slice(&(f.data.len() as u32).to_le_bytes());
                     var.extend_from_slice(&f.data);
@@ -4074,10 +4073,14 @@ mod tests {
     #[test]
     fn writer_refuses_what_would_not_read_back() {
         let mut w = TokenStream::default();
-        assert_eq!(TokenStream(w.0.iter().cloned().chain([Token::Row(vec![])]).collect()).write(&mut Vec::new()), Err(Error::Unwritable));
+        let mut out = vec![7];
+        assert_eq!(TokenStream(vec![Token::Row(vec![])]).write(&mut out), Err(Error::Unwritable));
+        assert_eq!(out, [7]);
+        assert_eq!(TokenReader::new(&[token::ROW]).next(), Some(Err(Error::NoColumns)));
         let cols = vec![Column::new("a", TypeInfo::fixed(data_type::INT4))];
         w.0.push(Token::ColMetadata(Some(cols)));
-        let before = w.to_bytes().unwrap().as_slice().len();
+        w.write(&mut out).unwrap();
+        let before = out.clone();
         for bad in [
             Token::Row(vec![]),
             Token::Row(vec![Value::Null]),
@@ -4133,11 +4136,15 @@ mod tests {
                 data: vec![],
             }]),
         ] {
-            assert_eq!(TokenStream(w.0.iter().cloned().chain([bad.clone()]).collect()).write(&mut Vec::new()), Err(Error::Unwritable), "{bad:?}");
-            assert_eq!(w.to_bytes().unwrap().as_slice().len(), before);
+            w.0.push(bad);
+            assert_eq!(w.write(&mut out), Err(Error::Unwritable), "{w:?}");
+            assert_eq!(out, before);
+            w.0.pop();
         }
-        // Still usable.
+        // Still writable after each refused token has been removed.
         w.0.push(Token::Row(vec![Value::Int(1)]));
+        w.write(&mut out).unwrap();
+        assert_eq!(TokenStream::parse(&out[before.len()..]), Ok(w));
     }
 
     #[test]
@@ -4619,7 +4626,7 @@ mod tests {
         let (messages, failure) = decode_all(|| Messages::with_limit(600), &bytes);
         assert_eq!(failure, None);
         assert_eq!(messages.len(), 400);
-        contract::check_decode_with_alloc_limit(|| Messages::with_limit(600), &one, 2 * (600 + HEADER_LEN));
+        contract::check_decode_with_alloc_limit(|| Messages::with_limit(600), &bytes, 2 * (600 + HEADER_LEN));
     }
 
     /// Oversized messages and token streams fail without partial output.
@@ -5067,7 +5074,9 @@ mod tests {
             }
         }
         let tokens: Vec<_> = TokenReader::new(bytes).map_while(Result::ok).collect();
-        contract::check_wire_value(&TokenStream(tokens));
+        let stream = TokenStream(tokens);
+        assert!(stream.to_bytes().is_ok(), "{stream:?}");
+        contract::check_wire_value(&stream);
     }
 
     fn samples() -> Vec<Vec<u8>> {
@@ -5120,6 +5129,7 @@ mod tests {
             contract::check_decode_with_alloc_limit(|| Messages::with_limit(64), &stream, 2 * (64 + HEADER_LEN));
             contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), &stream, 128);
             for message in decode_all(|| Messages::with_limit(64), &stream).0 {
+                assert!(message.to_bytes().is_ok(), "{message:?}");
                 contract::check_wire_value(&message);
             }
         }

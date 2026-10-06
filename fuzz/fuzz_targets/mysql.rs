@@ -50,7 +50,10 @@ fn payload(bytes: &[u8]) {
         }
     }
     for columns in 0..4 {
-        if let Ok(row) = parse_row(bytes, columns) { contract::check_wire_value(&row); }
+        if let Ok(row) = parse_row(bytes, columns) {
+            assert!(row.to_bytes().is_ok(), "{row:?}");
+            contract::check_wire_value(&row);
+        }
     }
 
 }
@@ -120,6 +123,7 @@ fuzz_target!(|data: &[u8]| {
         2 * (HEADER_LEN + limit.min(MAX_PACKET_PAYLOAD)));
     let messages = decode_all(|| Messages::with_limit(limit), data).0;
     for message in &messages {
+        assert!(message.to_bytes().is_ok(), "{message:?}");
         contract::check_wire_value(message);
         payload(&message.payload);
     }

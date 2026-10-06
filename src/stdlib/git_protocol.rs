@@ -118,7 +118,7 @@ pub enum PacketError {
 impl std::fmt::Display for PacketError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            PacketError::Unwritable => f.write_str("value cannot be written as given"),
+            PacketError::Unwritable => f.write_str("value cannot be written without changing it"),
             PacketError::Header => write!(f, "pkt-line length is not four hex digits"),
             PacketError::Reserved => write!(f, "pkt-line length 0003 is reserved"),
             PacketError::TooLong(n) => write!(f, "pkt-line length {n} is above {MAX_PACKET}"),
@@ -174,8 +174,6 @@ impl Packet {
             _ => None,
         }
     }
-
-
 }
 
 impl Wire for Packet {
@@ -339,7 +337,7 @@ impl std::fmt::Display for ParseError {
         match self {
             ParseError::Truncated => f.write_str("incomplete Git protocol unit"),
             ParseError::Trailing => f.write_str("bytes after Git protocol unit"),
-            ParseError::Unwritable => f.write_str("value cannot be written as given"),
+            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::Packet(e) => write!(f, "{e}"),
             ParseError::Text => write!(f, "a line is not UTF-8 text on one line"),
             ParseError::ObjectId => write!(f, "an object id is not 40 or 64 hex digits"),
@@ -1891,7 +1889,7 @@ mod tests {
         let ad = Advertisement::parse(&pkt(&[&format!("{A} HEAD\n"), "0000"])).unwrap();
         assert!(ad.capabilities.is_empty());
         assert_eq!(Advertisement::parse(&ad.to_bytes().unwrap()).unwrap(), ad);
-        // A leading ref named capabilities^{} with a zero id is not written.
+        // A leading ref named capabilities^{} with a zero id is refused.
         let odd = Advertisement {
             refs: vec![
                 AdvertisedRef { id: ObjectId::zero(false), name: "capabilities^{}".into() },
@@ -1982,8 +1980,7 @@ mod tests {
         assert_eq!(V2Request::parse(&pkt(&["command=\n", "0000"])).map(|_| ()), command);
         assert_eq!(V2Request::parse(&pkt(&["command=ls refs\n", "0000"])).map(|_| ()), command);
         assert_eq!(V2Request::parse(&pkt(&["command=a=b\n", "0000"])).map(|_| ()), command);
-        // A command whose name has nothing a key may hold is written as an
-        // empty request.
+        // A command whose name has nothing a key may hold is refused.
         let empty = V2Request::Command(Command { name: "?!".into(), capabilities: vec![], args: vec!["x".into()] });
         assert_eq!(empty.to_bytes(), Err(ParseError::Unwritable));
         contract::check_wire_value(&empty);
@@ -2154,7 +2151,7 @@ mod tests {
         assert_eq!(bad.ls_refs_args(), Err(ParseError::Text));
         let long = Command { name: "ls-refs".into(), capabilities: vec![], args: vec![format!("ref-prefix {}", "p".repeat(MAX_TEXT + 1))] };
         assert_eq!(long.ls_refs_args(), Err(ParseError::TooLong));
-        // Writers clean what they write.
+        // Writers refuse fields that would need changes.
         let req = V2Request::Command(Command {
             name: "a\nb".into(),
             capabilities: vec![Capability::with_value("k=k", "v\0v")],
@@ -2479,19 +2476,54 @@ mod tests {
         contract::check_wire::<Advertisement>(data);
         contract::check_wire::<CapabilityAdvertisement>(data);
         contract::check_wire::<V2Request>(data);
+        // Bytes still buffered are handed over without changes, even after a bad packet.
+        let mut stream = Stream::new(Frames::new());
+        let pushed = stream.push(data);
+        let mut used = 0;
+        while let Some(Ok(packet)) = stream.next() {
+            used += packet.to_bytes().unwrap().len();
+        }
+        let (buffer, _) = stream.into_parts();
+        assert_eq!(buffer.unread(), &data[used..pushed]);
         for packet in decode_all(Frames::new, data).0 {
             if let Some(bytes) = packet.data() {
                 contract::check_wire::<ClientLine>(bytes);
                 contract::check_wire::<ServerLine>(bytes);
                 contract::check_wire::<LsRef>(bytes);
                 contract::check_wire::<LsRefsArg>(bytes);
-                if let Ok(request) = ProtoRequest::from_data(bytes) { contract::check_wire_value(&request); }
+                if let Ok(request) = ProtoRequest::from_data(bytes) {
+                    assert!(request.to_bytes().is_ok(), "{request:?}");
+                    contract::check_wire_value(&request);
+                }
             }
         }
         if let Ok(V2Request::Command(command)) = V2Request::parse(data) {
-            if let Ok(args) = command.fetch_args() { for arg in args { contract::check_wire_value(&arg); } }
-            if let Ok(args) = command.ls_refs_args() { for arg in args { contract::check_wire_value(&arg); } }
+            if let Ok(args) = command.fetch_args() {
+                for arg in args {
+                    assert!(arg.to_bytes().is_ok(), "{arg:?}");
+                    contract::check_wire_value(&arg);
+                }
+            }
+            if let Ok(args) = command.ls_refs_args() {
+                for arg in args {
+                    assert!(arg.to_bytes().is_ok(), "{arg:?}");
+                    contract::check_wire_value(&arg);
+                }
+            }
         }
+        let max = data.first().map_or(0, |b| usize::from(*b) * 300);
+        let mut bytes = Vec::new();
+        for packet in band_packets(Band::Pack, data, max) {
+            packet.write(&mut bytes).unwrap();
+        }
+        let (items, failure) = decode_all(|| Bands, &bytes);
+        assert_eq!(failure, None);
+        let mut back = Vec::new();
+        for item in items {
+            let Demuxed::Data(Band::Pack, payload) = item else { panic!("unexpected band") };
+            back.extend(payload);
+        }
+        assert_eq!(back, data);
     }
 
     #[test]
@@ -2542,7 +2574,8 @@ mod tests {
             for _ in 0..rng.index(8) {
                 if rng.coin() { bytes.extend(rng.bytes(12)); }
                 else if rng.coin() {
-                    let data = rng.bytes(20);
+                    let alphabet = b" \0\n=^{}abc0123";
+                    let data = rng.text(20).bytes().map(|b| alphabet[usize::from(b) % alphabet.len()]).collect();
                     Packet::Data(data).write(&mut bytes).unwrap();
                 } else {
                     let mut piece = pieces[rng.index(pieces.len())].clone();
