@@ -222,6 +222,8 @@ pub mod ssh;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;
+#[expect(missing_docs, reason = "Reassembly is documented on its public types.")]
+pub mod tcp_stream;
 pub mod tds;
 pub mod telnet;
 pub mod tftp;

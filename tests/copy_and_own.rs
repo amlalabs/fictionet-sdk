@@ -171,6 +171,8 @@ macro_rules! protocols {
         pub mod stun;
         #[path = "../src/stdlib/syslog.rs"]
         pub mod syslog;
+        #[path = "../src/stdlib/tcp_stream.rs"]
+        pub mod tcp_stream;
         #[path = "../src/stdlib/tds.rs"]
         pub mod tds;
         #[path = "../src/stdlib/telnet.rs"]

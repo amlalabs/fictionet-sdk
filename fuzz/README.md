@@ -23,6 +23,7 @@ cargo +nightly fuzz list
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |
 | `stack` | packets, with checksums made right or not | a machine: `split_protocols`, `tcp::endpoint`, `udp::endpoint`, ping replies, over IPv4 and IPv6 |
 | `tcp` | TCP segments and the world's own calls, structured | `tcp::endpoint`: smoltcp's state machine and the stdlib's code around it |
+| `tcp_stream` | arbitrary segment directions, sequence numbers, flags, payloads, and limits; checks byte accounting, placement, event order, and buffer bounds | `stdlib::tcp_stream::Reassembler`: captured TCP reassembly |
 | `tls` | the client's bytes | `tls::server` (the ClientHello and SNI), `ClientHello::finish`, `TlsConnection` |
 | `dns` | DNS messages | hickory-proto's parser, and attach's resolver reading an answer |
 | `web` | packets, DNS queries, DHCP messages, TCP segments | `web::Sites`: the filter, DHCP, DNS over UDP and TCP, routing, the machines |
