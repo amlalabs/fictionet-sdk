@@ -490,7 +490,7 @@ fn fold(out: &mut Vec<u8>, name: &str, v: &[u8]) {
     // its own but not after the name.
     let first = v.iter().position(|&c| is_ws(c)).unwrap_or(v.len());
     let mut used = name.len() + 2;
-    if used + first > limit && first < limit {
+    if first > 0 && used + first > limit && first < limit {
         out.extend_from_slice(b"\r\n");
         used = 1;
     }
@@ -2210,6 +2210,29 @@ mod tests {
         h.push("A", &format!("b{}c", " ".repeat(200)));
         let bytes = h.to_bytes().unwrap();
         assert_eq!(Header::parse(&bytes).unwrap(), h);
+    }
+
+    #[test]
+    fn empty_value_under_a_long_name_has_no_whitespace_only_line() {
+        let mut header = Header::default();
+        header.push(&"N".repeat(78), "");
+        let bytes = header.to_bytes().unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            text.split("\r\n").all(|line| {
+                line.is_empty() || line.bytes().any(|c| !matches!(c, b' ' | b'\t'))
+            })
+        );
+        assert_eq!(Header::parse(&bytes), Ok(header));
+
+        let mut header = Header::default();
+        header.push(&"N".repeat(MAX_LINE_BYTES - 2), "");
+        let bytes = header.to_bytes().unwrap();
+        assert_eq!(bytes.iter().position(|&c| c == b'\r'), Some(MAX_LINE_BYTES));
+        header.fields[0].name.push('N');
+        let mut out = b"prefix".to_vec();
+        assert_eq!(header.write(&mut out), Err(Error::Unwritable));
+        assert_eq!(out, b"prefix");
     }
 
     #[test]

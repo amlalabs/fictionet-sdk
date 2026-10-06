@@ -13,6 +13,8 @@ fn is_control(c: char) -> bool {
     c.is_ascii_control() && c != '\t'
 }
 
+// Keep exact size checks to catch false refusals near output limits, even
+// when escaping or encoding expands otherwise valid input.
 // Count RFC 2047 wrappers, base64 quartets, and separators at UTF-8 boundaries.
 fn encoded_size(text: &str) -> usize {
     let mut size = 0usize;
@@ -108,7 +110,7 @@ fn folded_size(name: &str, value: &str) -> (usize, usize) {
     let mut used = name.len() + 2;
     let mut size = used.saturating_add(v.len()).saturating_add(2);
     let mut longest = 0;
-    if used + first > limit && first < limit {
+    if first > 0 && used + first > limit && first < limit {
         longest = name.len() + 1;
         size = size.saturating_add(2);
         used = 1;
@@ -150,6 +152,17 @@ fn folded_size(name: &str, value: &str) -> (usize, usize) {
     (size, longest.max(used + v.len() - start))
 }
 
+fn check_header(header: &Header, line_limit: usize) {
+    contract::check_wire_value(header);
+    if let Ok(bytes) = header.to_bytes() {
+        for line in bytes.split(|&c| c == b'\n') {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            assert!(line.len() <= line_limit);
+            assert!(line.is_empty() || line.iter().any(|c| !matches!(c, b' ' | b'\t')));
+        }
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEADER_BYTES);
     contract::check_decode_with_alloc_limit(|| Head::with_limit(64), data, 128);
@@ -179,7 +192,7 @@ fuzz_target!(|data: &[u8]| {
                 assert_eq!(stream.next(), Some(Ok(Ok(header.clone()))));
                 assert_eq!(stream.unread(), body);
             }
-            contract::check_wire_value(&header);
+            check_header(&header, MAX_LINE_BYTES);
             if let Err(Error::Unwritable) = header.to_bytes() {
                 let sizes: Vec<_> = header
                     .fields
@@ -218,14 +231,7 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(decode_text(&encoded), text);
             let mut header = Header::default();
             header.push("Subject", &encoded);
-            contract::check_wire_value(&header);
-            if let Ok(bytes) = header.to_bytes() {
-                assert!(
-                    bytes
-                        .split(|&c| c == b'\n')
-                        .all(|line| line.len() <= ENCODED_LINE_LEN + 1)
-                );
-            }
+            check_header(&header, ENCODED_LINE_LEN);
         }
         if let Ok(list) = parse_address_list(&text) {
             let list = AddressList(list);
@@ -259,7 +265,7 @@ fuzz_target!(|data: &[u8]| {
         }
         let mut header = Header::default();
         header.push("Subject", &text);
-        contract::check_wire_value(&header);
+        check_header(&header, MAX_LINE_BYTES);
     }
     let mut body = Header::default().to_bytes().unwrap();
     body.extend_from_slice(data.get(..4096).unwrap_or(data));

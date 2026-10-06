@@ -8,14 +8,11 @@ use fictionet::stdlib::postgres::{
 };
 use libfuzzer_sys::fuzz_target;
 
-fn typed_frontend() -> FrontendMessages {
-    let mut decoder = FrontendMessages::with_limit(64);
-    decoder.start_messages();
-    decoder
-}
-
 fuzz_target!(|data: &[u8]| {
-    for make in [|| FrontendMessages::with_limit(64), typed_frontend] {
+    for make in [
+        || FrontendMessages::with_limit(64),
+        || FrontendMessages::established(64),
+    ] {
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
         for message in decode_all(make, data).0.into_iter().flatten() {
             if let Frontend::Startup(startup) = &message {

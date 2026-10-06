@@ -31,9 +31,6 @@
 //! UTF-8 with no NUL byte as well. [`Wire`] refuses values that cannot
 //! be written unchanged.
 //!
-//! The stream holds at most one message's worth of unread bytes. `push`
-//! says how many bytes it accepted; keep the remainder for the next call.
-//!
 //! ```
 //! use fictionet::stdlib::postgres::{
 //!     oid, Authentication, Backend, Field, Frontend, FrontendMessages, Startup, TransactionStatus,
@@ -1370,7 +1367,10 @@ impl Wire for Frontend {
     /// malformed fields, counts, formats, keys, or UTF-8 text.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let parsed = if bytes.first() == Some(&0) {
-            parse_startup_from(bytes, true)
+            split_startup(bytes, false).and_then(|part| {
+                part.map(|(body, used)| startup_body(body).map(|message| (message, used)))
+                    .transpose()
+            })
         } else {
             split_typed(bytes, frontend_limit, MAX_MESSAGE).and_then(|part| {
                 part.map(|(tag, body, used)| {
@@ -1699,6 +1699,15 @@ impl FrontendMessages {
     }
 
     /// Selects typed messages for an already established session.
+    /// The length-field limit is clamped as in [`Self::with_limit`].
+    /// Use this when the connection's startup has already been read.
+    pub fn established(limit: usize) -> Self {
+        let mut messages = Self::with_limit(limit);
+        messages.start_messages();
+        messages
+    }
+
+    /// Selects typed messages for an already established session.
     /// Call before reading its bytes, between items.
     pub fn start_messages(&mut self) {
         self.phase = Phase::Messages;
@@ -2013,13 +2022,6 @@ fn split_typed(b: &[u8], limit: fn(u8) -> Option<usize>, max: usize) -> Result<O
         return Ok(None);
     }
     Ok(Some((tag, &b[5..end], end)))
-}
-
-/// Reads a startup-phase message, looking for a TLS record first when
-/// `tls` is set: at the opening of a connection.
-fn parse_startup_from(b: &[u8], tls: bool) -> Result<Option<(Frontend, usize)>, Error> {
-    let Some((body, used)) = split_startup(b, tls)? else { return Ok(None) };
-    Ok(Some((startup_body(body)?, used)))
 }
 
 /// The body (after the length) and total size of the startup-phase
@@ -2653,7 +2655,7 @@ mod tests {
     #[test]
     fn extended_query() {
         let bytes = extended_bytes();
-        let (got, failure) = decode_all(typed_frontend, &bytes);
+        let (got, failure) = decode_all(|| FrontendMessages::established(SMALL_MESSAGE), &bytes);
         assert_eq!(failure, None);
         assert_eq!(
             got,
@@ -2869,7 +2871,7 @@ mod tests {
             Err(ParseError::Message(Error::UnknownType(b'Z')))
         );
         assert_eq!(
-            typed_frontend().decode(&[0], false),
+            FrontendMessages::established(SMALL_MESSAGE).decode(&[0], false),
             Err(Error::UnknownType(0))
         );
         assert_eq!(
@@ -2983,6 +2985,38 @@ mod tests {
         );
 
         let g = |tag, body: &[u8]| Backend::parse(&typed(tag, body));
+        assert_eq!(
+            g(b'R', b"\0\0\0\x06"),
+            Err(ParseError::Message(m(b'R', Malformed::BadAuth(6))))
+        );
+        assert_eq!(
+            g(b'R', b"\0\0\0\x05ab"),
+            Err(ParseError::Message(m(b'R', Malformed::Truncated)))
+        );
+        assert_eq!(
+            g(b'R', b"\0\0\0\x0aSCRAM\0"),
+            Err(ParseError::Message(m(b'R', Malformed::UnterminatedString)))
+        );
+        assert_eq!(
+            g(b'R', b"\0\0\0\0x"),
+            Err(ParseError::Message(m(b'R', Malformed::TrailingBytes)))
+        );
+        assert_eq!(
+            g(b'K', b"\0\0\0\x01"),
+            Err(ParseError::Message(m(b'K', Malformed::BadKeyLength(0))))
+        );
+        assert_eq!(
+            g(b'K', &[0; 261]),
+            Err(ParseError::Message(m(b'K', Malformed::BadKeyLength(257))))
+        );
+        assert_eq!(
+            g(b'Z', b""),
+            Err(ParseError::Message(m(b'Z', Malformed::Truncated)))
+        );
+        assert_eq!(
+            g(b'G', b"\x02\0\0"),
+            Err(ParseError::Message(m(b'G', Malformed::BadFormat(2))))
+        );
         assert_eq!(
             g(b'T', b"\0\x01a\0\0\0\0\0\0\0\0\0\0\x17\0\x04\xff\xff\xff\xff\0\x05"),
             Err(ParseError::Message(m(b'T', Malformed::BadFormat(5))))
@@ -3217,7 +3251,7 @@ mod tests {
                 let mut decoder = if message.is_startup() {
                     FrontendMessages::new()
                 } else {
-                    typed_frontend()
+                    FrontendMessages::established(SMALL_MESSAGE)
                 };
                 assert_eq!(decoder.decode(&bytes[..n], false), Ok(Step::Need));
                 assert_eq!(Frontend::parse(&bytes[..n]), Err(ParseError::Truncated));
@@ -3379,7 +3413,7 @@ mod tests {
     fn malformed_body_drops_only_its_message() {
         let input = b"P\0\0\0\x09\0\0\0\0xS\0\0\0\x04S\0\0\0\x03";
         assert_eq!(
-            decode_all(typed_frontend, input),
+            decode_all(|| FrontendMessages::established(SMALL_MESSAGE), input),
             (
                 vec![Err(bad(b'P', Malformed::TrailingBytes)), Ok(Frontend::Sync)],
                 Some(Fail::Protocol(Error::BadLength(3))),
@@ -3590,7 +3624,9 @@ mod tests {
             }
             let message = random_backend(&mut rng);
             contract::check_wire_value(&message);
-            if let Ok(bytes) = message.to_bytes() {
+            let bytes = message.to_bytes();
+            assert_eq!(bytes.is_ok(), clean_backend(&message), "{message:?}");
+            if let Ok(bytes) = bytes {
                 assert_eq!(Backend::parse(&bytes), Ok(message));
                 contract::check_wire::<Backend>(&bytes);
             }
@@ -3618,7 +3654,11 @@ mod tests {
             let mut startup = startup_bytes();
             startup.extend_from_slice(&data);
             let make: fn() -> FrontendMessages = || FrontendMessages::with_limit(64);
-            for (make, input) in [(make, &data), (make, &startup), (typed_frontend, &data)] {
+            for (make, input) in [
+                (make, &data),
+                (make, &startup),
+                (|| FrontendMessages::established(SMALL_MESSAGE), &data),
+            ] {
                 contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
                 for m in decode_all(make, input).0.into_iter().flatten() {
                     let b = m.to_bytes().unwrap();
@@ -3734,12 +3774,6 @@ mod tests {
         ]
     }
 
-    fn typed_frontend() -> FrontendMessages {
-        let mut decoder = FrontendMessages::with_limit(SMALL_MESSAGE);
-        decoder.start_messages();
-        decoder
-    }
-
     fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
         contract::check_wire_value(value);
         let mut out = b"prefix".to_vec();
@@ -3805,6 +3839,59 @@ mod tests {
                 param_types,
             } => ok(name) && ok(query) && param_types.len() <= MAX_COUNT,
             _ => true,
+        }
+    }
+
+    fn clean_backend(m: &Backend) -> bool {
+        let ok = |s: &str| !s.contains('\0');
+        if backend_size(m) > MAX_MESSAGE {
+            return false;
+        }
+        match m {
+            Backend::Authentication(Authentication::Sasl(names)) => {
+                names.len() <= MAX_COUNT && names.iter().all(|name| !name.is_empty() && ok(name))
+            }
+            Backend::BackendKeyData { secret_key, .. } => {
+                (MIN_BACKEND_KEY..=MAX_SECRET_KEY).contains(&secret_key.len())
+            }
+            Backend::CommandComplete(s) => ok(s),
+            Backend::CopyInResponse(c)
+            | Backend::CopyOutResponse(c)
+            | Backend::CopyBothResponse(c) => {
+                c.columns.len() <= MAX_COUNT
+                    && (c.format == Format::Binary || c.columns.iter().all(|f| *f == Format::Text))
+            }
+            Backend::DataRow(values) => values.len() <= MAX_COUNT,
+            Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
+                let mut seen = [false; 256];
+                d.fields.iter().all(|(code, value)| {
+                    *code != 0
+                        && !std::mem::replace(&mut seen[usize::from(*code)], true)
+                        && ok(value)
+                })
+            }
+            Backend::NegotiateProtocolVersion { unrecognized, .. } => {
+                unrecognized.len() <= MAX_COUNT && unrecognized.iter().all(|name| ok(name))
+            }
+            Backend::NotificationResponse {
+                channel, payload, ..
+            } => ok(channel) && ok(payload),
+            Backend::ParameterDescription(types) => types.len() <= MAX_COUNT,
+            Backend::ParameterStatus { name, value } => ok(name) && ok(value),
+            Backend::RowDescription(fields) => {
+                fields.len() <= MAX_COUNT && fields.iter().all(|f| ok(&f.name))
+            }
+            Backend::Authentication(_)
+            | Backend::BindComplete
+            | Backend::CloseComplete
+            | Backend::CopyData(_)
+            | Backend::CopyDone
+            | Backend::EmptyQueryResponse
+            | Backend::FunctionCallResponse(_)
+            | Backend::NoData
+            | Backend::ParseComplete
+            | Backend::PortalSuspended
+            | Backend::ReadyForQuery(_) => true,
         }
     }
 

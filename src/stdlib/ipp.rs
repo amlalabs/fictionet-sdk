@@ -79,80 +79,49 @@ pub const MAX_DEPTH: usize = 16;
 /// Tags: the byte before each group (delimiter tags) and before each value
 /// (value tags). Delimiter tags are below 0x10.
 pub mod tag {
+    #![allow(missing_docs)]
     // Delimiter tags.
-    /// Operation attributes.
     pub const OPERATION_ATTRIBUTES: u8 = 0x01;
-    /// Job attributes.
     pub const JOB_ATTRIBUTES: u8 = 0x02;
     /// Ends the attribute section. Document data follows.
     pub const END_OF_ATTRIBUTES: u8 = 0x03;
-    /// Printer attributes.
     pub const PRINTER_ATTRIBUTES: u8 = 0x04;
-    /// Unsupported attributes.
     pub const UNSUPPORTED_ATTRIBUTES: u8 = 0x05;
-    /// Subscription attributes.
     pub const SUBSCRIPTION_ATTRIBUTES: u8 = 0x06;
-    /// Event notification attributes.
     pub const EVENT_NOTIFICATION_ATTRIBUTES: u8 = 0x07;
-    /// Resource attributes.
     pub const RESOURCE_ATTRIBUTES: u8 = 0x08;
-    /// Document attributes.
     pub const DOCUMENT_ATTRIBUTES: u8 = 0x09;
-    /// System attributes.
     pub const SYSTEM_ATTRIBUTES: u8 = 0x0a;
     // Out-of-band value tags, 0x10 to 0x1f.
-    /// Unsupported.
     pub const UNSUPPORTED: u8 = 0x10;
-    /// Unknown.
     pub const UNKNOWN: u8 = 0x12;
-    /// No value.
     pub const NO_VALUE: u8 = 0x13;
-    /// Not settable.
     pub const NOT_SETTABLE: u8 = 0x15;
-    /// Delete attribute.
     pub const DELETE_ATTRIBUTE: u8 = 0x16;
-    /// Admin define.
     pub const ADMIN_DEFINE: u8 = 0x17;
     // Integer value tags.
-    /// Integer.
     pub const INTEGER: u8 = 0x21;
-    /// Boolean.
     pub const BOOLEAN: u8 = 0x22;
-    /// Enum.
     pub const ENUM: u8 = 0x23;
     // Octet-string value tags.
-    /// Octet string.
     pub const OCTET_STRING: u8 = 0x30;
-    /// Date time.
     pub const DATE_TIME: u8 = 0x31;
-    /// Resolution.
     pub const RESOLUTION: u8 = 0x32;
-    /// Range of integer.
     pub const RANGE_OF_INTEGER: u8 = 0x33;
     /// Begins a collection.
     pub const BEG_COLLECTION: u8 = 0x34;
-    /// Text with language.
     pub const TEXT_WITH_LANGUAGE: u8 = 0x35;
-    /// Name with language.
     pub const NAME_WITH_LANGUAGE: u8 = 0x36;
     /// Ends a collection.
     pub const END_COLLECTION: u8 = 0x37;
     // Character-string value tags.
-    /// Text without language.
     pub const TEXT_WITHOUT_LANGUAGE: u8 = 0x41;
-    /// Name without language.
     pub const NAME_WITHOUT_LANGUAGE: u8 = 0x42;
-    /// Keyword.
     pub const KEYWORD: u8 = 0x44;
-    /// URI.
     pub const URI: u8 = 0x45;
-    /// URI scheme.
     pub const URI_SCHEME: u8 = 0x46;
-    /// Charset.
     pub const CHARSET: u8 = 0x47;
-    /// Natural language.
     pub const NATURAL_LANGUAGE: u8 = 0x48;
-    /// MIME media type.
     pub const MIME_MEDIA_TYPE: u8 = 0x49;
     /// A collection member name.
     pub const MEMBER_ATTR_NAME: u8 = 0x4a;
@@ -162,219 +131,116 @@ pub mod tag {
 
 /// Operation IDs, from RFC 8011 and the IANA IPP registry.
 pub mod operation {
-    /// Print job.
+    #![allow(missing_docs)]
     pub const PRINT_JOB: u16 = 0x0002;
-    /// Print uri.
     pub const PRINT_URI: u16 = 0x0003;
-    /// Validate job.
     pub const VALIDATE_JOB: u16 = 0x0004;
-    /// Create job.
     pub const CREATE_JOB: u16 = 0x0005;
-    /// Send document.
     pub const SEND_DOCUMENT: u16 = 0x0006;
-    /// Send uri.
     pub const SEND_URI: u16 = 0x0007;
-    /// Cancel job.
     pub const CANCEL_JOB: u16 = 0x0008;
-    /// Get job attributes.
     pub const GET_JOB_ATTRIBUTES: u16 = 0x0009;
-    /// Get jobs.
     pub const GET_JOBS: u16 = 0x000a;
-    /// Get printer attributes.
     pub const GET_PRINTER_ATTRIBUTES: u16 = 0x000b;
-    /// Hold job.
     pub const HOLD_JOB: u16 = 0x000c;
-    /// Release job.
     pub const RELEASE_JOB: u16 = 0x000d;
-    /// Restart job.
     pub const RESTART_JOB: u16 = 0x000e;
-    /// Pause printer.
     pub const PAUSE_PRINTER: u16 = 0x0010;
-    /// Resume printer.
     pub const RESUME_PRINTER: u16 = 0x0011;
-    /// Purge jobs.
     pub const PURGE_JOBS: u16 = 0x0012;
-    /// Set printer attributes.
     pub const SET_PRINTER_ATTRIBUTES: u16 = 0x0013;
-    /// Set job attributes.
     pub const SET_JOB_ATTRIBUTES: u16 = 0x0014;
-    /// Get printer supported values.
     pub const GET_PRINTER_SUPPORTED_VALUES: u16 = 0x0015;
-    /// Create printer subscriptions.
     pub const CREATE_PRINTER_SUBSCRIPTIONS: u16 = 0x0016;
-    /// Create job subscriptions.
     pub const CREATE_JOB_SUBSCRIPTIONS: u16 = 0x0017;
-    /// Get subscription attributes.
     pub const GET_SUBSCRIPTION_ATTRIBUTES: u16 = 0x0018;
-    /// Get subscriptions.
     pub const GET_SUBSCRIPTIONS: u16 = 0x0019;
-    /// Renew subscription.
     pub const RENEW_SUBSCRIPTION: u16 = 0x001a;
-    /// Cancel subscription.
     pub const CANCEL_SUBSCRIPTION: u16 = 0x001b;
-    /// Get notifications.
     pub const GET_NOTIFICATIONS: u16 = 0x001c;
-    /// Get resource attributes.
     pub const GET_RESOURCE_ATTRIBUTES: u16 = 0x001e;
-    /// Get resources.
     pub const GET_RESOURCES: u16 = 0x0020;
-    /// Enable printer.
     pub const ENABLE_PRINTER: u16 = 0x0022;
-    /// Disable printer.
     pub const DISABLE_PRINTER: u16 = 0x0023;
-    /// Pause printer after current job.
     pub const PAUSE_PRINTER_AFTER_CURRENT_JOB: u16 = 0x0024;
-    /// Hold new jobs.
     pub const HOLD_NEW_JOBS: u16 = 0x0025;
-    /// Release held new jobs.
     pub const RELEASE_HELD_NEW_JOBS: u16 = 0x0026;
-    /// Deactivate printer.
     pub const DEACTIVATE_PRINTER: u16 = 0x0027;
-    /// Activate printer.
     pub const ACTIVATE_PRINTER: u16 = 0x0028;
-    /// Restart printer.
     pub const RESTART_PRINTER: u16 = 0x0029;
-    /// Shutdown printer.
     pub const SHUTDOWN_PRINTER: u16 = 0x002a;
-    /// Startup printer.
     pub const STARTUP_PRINTER: u16 = 0x002b;
-    /// Reprocess job.
     pub const REPROCESS_JOB: u16 = 0x002c;
-    /// Cancel current job.
     pub const CANCEL_CURRENT_JOB: u16 = 0x002d;
-    /// Suspend current job.
     pub const SUSPEND_CURRENT_JOB: u16 = 0x002e;
-    /// Resume job.
     pub const RESUME_JOB: u16 = 0x002f;
-    /// Promote job.
     pub const PROMOTE_JOB: u16 = 0x0030;
-    /// Schedule job after.
     pub const SCHEDULE_JOB_AFTER: u16 = 0x0031;
-    /// Cancel document.
     pub const CANCEL_DOCUMENT: u16 = 0x0033;
-    /// Get document attributes.
     pub const GET_DOCUMENT_ATTRIBUTES: u16 = 0x0034;
-    /// Get documents.
     pub const GET_DOCUMENTS: u16 = 0x0035;
-    /// Delete document.
     pub const DELETE_DOCUMENT: u16 = 0x0036;
-    /// Set document attributes.
     pub const SET_DOCUMENT_ATTRIBUTES: u16 = 0x0037;
-    /// Cancel jobs.
     pub const CANCEL_JOBS: u16 = 0x0038;
-    /// Cancel my jobs.
     pub const CANCEL_MY_JOBS: u16 = 0x0039;
-    /// Resubmit job.
     pub const RESUBMIT_JOB: u16 = 0x003a;
-    /// Close job.
     pub const CLOSE_JOB: u16 = 0x003b;
-    /// Identify printer.
     pub const IDENTIFY_PRINTER: u16 = 0x003c;
-    /// Validate document.
     pub const VALIDATE_DOCUMENT: u16 = 0x003d;
 }
 
 /// Status codes, from RFC 8011 and the IANA IPP registry.
 pub mod status {
-    /// Successful ok.
+    #![allow(missing_docs)]
     pub const SUCCESSFUL_OK: u16 = 0x0000;
-    /// Successful ok ignored or substituted attributes.
     pub const SUCCESSFUL_OK_IGNORED_OR_SUBSTITUTED_ATTRIBUTES: u16 = 0x0001;
-    /// Successful ok conflicting attributes.
     pub const SUCCESSFUL_OK_CONFLICTING_ATTRIBUTES: u16 = 0x0002;
-    /// Successful ok ignored subscriptions.
     pub const SUCCESSFUL_OK_IGNORED_SUBSCRIPTIONS: u16 = 0x0003;
-    /// Successful ok too many events.
     pub const SUCCESSFUL_OK_TOO_MANY_EVENTS: u16 = 0x0005;
-    /// Successful ok events complete.
     pub const SUCCESSFUL_OK_EVENTS_COMPLETE: u16 = 0x0007;
-    /// Client error bad request.
     pub const CLIENT_ERROR_BAD_REQUEST: u16 = 0x0400;
-    /// Client error forbidden.
     pub const CLIENT_ERROR_FORBIDDEN: u16 = 0x0401;
-    /// Client error not authenticated.
     pub const CLIENT_ERROR_NOT_AUTHENTICATED: u16 = 0x0402;
-    /// Client error not authorized.
     pub const CLIENT_ERROR_NOT_AUTHORIZED: u16 = 0x0403;
-    /// Client error not possible.
     pub const CLIENT_ERROR_NOT_POSSIBLE: u16 = 0x0404;
-    /// Client error timeout.
     pub const CLIENT_ERROR_TIMEOUT: u16 = 0x0405;
-    /// Client error not found.
     pub const CLIENT_ERROR_NOT_FOUND: u16 = 0x0406;
-    /// Client error gone.
     pub const CLIENT_ERROR_GONE: u16 = 0x0407;
-    /// Client error request entity too large.
     pub const CLIENT_ERROR_REQUEST_ENTITY_TOO_LARGE: u16 = 0x0408;
-    /// Client error request value too long.
     pub const CLIENT_ERROR_REQUEST_VALUE_TOO_LONG: u16 = 0x0409;
-    /// Client error document format not supported.
     pub const CLIENT_ERROR_DOCUMENT_FORMAT_NOT_SUPPORTED: u16 = 0x040a;
-    /// Client error attributes or values not supported.
     pub const CLIENT_ERROR_ATTRIBUTES_OR_VALUES_NOT_SUPPORTED: u16 = 0x040b;
-    /// Client error uri scheme not supported.
     pub const CLIENT_ERROR_URI_SCHEME_NOT_SUPPORTED: u16 = 0x040c;
-    /// Client error charset not supported.
     pub const CLIENT_ERROR_CHARSET_NOT_SUPPORTED: u16 = 0x040d;
-    /// Client error conflicting attributes.
     pub const CLIENT_ERROR_CONFLICTING_ATTRIBUTES: u16 = 0x040e;
-    /// Client error compression not supported.
     pub const CLIENT_ERROR_COMPRESSION_NOT_SUPPORTED: u16 = 0x040f;
-    /// Client error compression error.
     pub const CLIENT_ERROR_COMPRESSION_ERROR: u16 = 0x0410;
-    /// Client error document format error.
     pub const CLIENT_ERROR_DOCUMENT_FORMAT_ERROR: u16 = 0x0411;
-    /// Client error document access error.
     pub const CLIENT_ERROR_DOCUMENT_ACCESS_ERROR: u16 = 0x0412;
-    /// Client error attributes not settable.
     pub const CLIENT_ERROR_ATTRIBUTES_NOT_SETTABLE: u16 = 0x0413;
-    /// Client error ignored all subscriptions.
     pub const CLIENT_ERROR_IGNORED_ALL_SUBSCRIPTIONS: u16 = 0x0414;
-    /// Client error too many subscriptions.
     pub const CLIENT_ERROR_TOO_MANY_SUBSCRIPTIONS: u16 = 0x0415;
-    /// Client error document password error.
     pub const CLIENT_ERROR_DOCUMENT_PASSWORD_ERROR: u16 = 0x0418;
-    /// Client error document permission error.
     pub const CLIENT_ERROR_DOCUMENT_PERMISSION_ERROR: u16 = 0x0419;
-    /// Client error document security error.
     pub const CLIENT_ERROR_DOCUMENT_SECURITY_ERROR: u16 = 0x041a;
-    /// Client error document unprintable error.
     pub const CLIENT_ERROR_DOCUMENT_UNPRINTABLE_ERROR: u16 = 0x041b;
-    /// Client error account info needed.
     pub const CLIENT_ERROR_ACCOUNT_INFO_NEEDED: u16 = 0x041c;
-    /// Client error account closed.
     pub const CLIENT_ERROR_ACCOUNT_CLOSED: u16 = 0x041d;
-    /// Client error account limit reached.
     pub const CLIENT_ERROR_ACCOUNT_LIMIT_REACHED: u16 = 0x041e;
-    /// Client error account authorization failed.
     pub const CLIENT_ERROR_ACCOUNT_AUTHORIZATION_FAILED: u16 = 0x041f;
-    /// Client error not fetchable.
     pub const CLIENT_ERROR_NOT_FETCHABLE: u16 = 0x0420;
-    /// Server error internal error.
     pub const SERVER_ERROR_INTERNAL_ERROR: u16 = 0x0500;
-    /// Server error operation not supported.
     pub const SERVER_ERROR_OPERATION_NOT_SUPPORTED: u16 = 0x0501;
-    /// Server error service unavailable.
     pub const SERVER_ERROR_SERVICE_UNAVAILABLE: u16 = 0x0502;
-    /// Server error version not supported.
     pub const SERVER_ERROR_VERSION_NOT_SUPPORTED: u16 = 0x0503;
-    /// Server error device error.
     pub const SERVER_ERROR_DEVICE_ERROR: u16 = 0x0504;
-    /// Server error temporary error.
     pub const SERVER_ERROR_TEMPORARY_ERROR: u16 = 0x0505;
-    /// Server error not accepting jobs.
     pub const SERVER_ERROR_NOT_ACCEPTING_JOBS: u16 = 0x0506;
-    /// Server error busy.
     pub const SERVER_ERROR_BUSY: u16 = 0x0507;
-    /// Server error job canceled.
     pub const SERVER_ERROR_JOB_CANCELED: u16 = 0x0508;
-    /// Server error multiple document jobs not supported.
     pub const SERVER_ERROR_MULTIPLE_DOCUMENT_JOBS_NOT_SUPPORTED: u16 = 0x0509;
-    /// Server error printer is deactivated.
     pub const SERVER_ERROR_PRINTER_IS_DEACTIVATED: u16 = 0x050a;
-    /// Server error too many jobs.
     pub const SERVER_ERROR_TOO_MANY_JOBS: u16 = 0x050b;
-    /// Server error too many documents.
     pub const SERVER_ERROR_TOO_MANY_DOCUMENTS: u16 = 0x050c;
 
     /// Whether `code` is in the successful class, 0x0000 to 0x00ff.
@@ -802,9 +668,6 @@ impl Value {
 pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
-    /// The fixed header or attribute section is incomplete.
-    /// [`Head`] leaves stream truncation to the codec driver.
-    Truncated,
     /// The attribute section runs past [`MAX_HEAD`] bytes.
     TooLong,
     /// A name or value length field is above [`MAX_FIELD`], so it is
@@ -841,7 +704,6 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::Truncated => f.write_str("the message ends before its end-of-attributes tag"),
             Error::TooLong => write!(f, "the attribute section is longer than {MAX_HEAD} bytes"),
             Error::Length(n) => write!(f, "length field {n:#06x} is negative"),
             Error::NoGroup => f.write_str("an attribute comes before any group tag"),
@@ -1015,8 +877,9 @@ impl Wire for Message {
         let end = scan_head(bytes, &mut 0, MAX_HEAD)
             .map_err(ParseError::Head)?
             .ok_or(ParseError::Truncated)?;
-        let data = bytes.get(end..).ok_or(ParseError::Truncated)?;
-        let header = head(&bytes[..end]).map_err(ParseError::Head)?;
+        let (bytes, data) = bytes.split_at_checked(end).ok_or(ParseError::Truncated)?;
+        let (fixed, body) = bytes.split_first_chunk().ok_or(ParseError::Truncated)?;
+        let header = head(fixed, body).map_err(ParseError::Head)?;
         if data.len() > MAX_DOCUMENT {
             return Err(ParseError::DocumentTooLong);
         }
@@ -1050,7 +913,8 @@ impl Wire for Header {
         if end != bytes.len() {
             return Err(ParseError::Trailing);
         }
-        head(bytes).map_err(ParseError::Head)
+        let (fixed, body) = bytes.split_first_chunk().ok_or(ParseError::Truncated)?;
+        head(fixed, body).map_err(ParseError::Head)
     }
 
     /// Appends a complete head. Refuses invalid tags, names, empty value
@@ -1346,11 +1210,15 @@ impl Decode for Head {
         let Some(end) = scan_head(input, &mut self.scanned, self.head_limit)? else {
             return Ok(Step::Need);
         };
-        let bytes = input.get(..end).ok_or(Error::Truncated)?;
-        let fixed = bytes.first_chunk::<HEADER_LEN>().ok_or(Error::Truncated)?;
+        let Some(bytes) = input.get(..end) else {
+            return Ok(Step::Need);
+        };
+        let Some((fixed, body)) = bytes.split_first_chunk::<HEADER_LEN>() else {
+            return Ok(Step::Need);
+        };
         let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
         self.done = true;
-        let item = head(bytes).map_err(|error| HeadError { request_id, error });
+        let item = head(fixed, body).map_err(|error| HeadError { request_id, error });
         Ok(Step::Item(item, end))
     }
 }
@@ -1359,12 +1227,10 @@ impl Decode for Head {
 // Reserve space for the end tag. Name validity is checked by head() once
 // the complete attribute section and its document boundary are known.
 fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize>, Error> {
-    if *pos < HEADER_LEN {
-        if bytes.len() < HEADER_LEN {
-            return Ok(None);
-        }
-        *pos = HEADER_LEN;
+    if bytes.len() < HEADER_LEN {
+        return Ok(None);
     }
+    *pos = (*pos).max(HEADER_LEN);
     loop {
         let p = *pos;
         let Some(&tag) = bytes.get(p) else {
@@ -1454,12 +1320,9 @@ impl<'a> Iterator for Records<'a> {
     }
 }
 
-/// Reads a whole attribute section, header and end tag included, whose
-/// lengths [`scan_head`] has checked.
-fn head(h: &[u8]) -> Result<Header, Error> {
-    let (Some(fixed), Some(body)) = (h.get(..HEADER_LEN), h.get(HEADER_LEN..h.len().saturating_sub(1))) else {
-        return Err(Error::Truncated);
-    };
+/// Reads a fixed header and an attribute section through its end tag,
+/// whose lengths [`scan_head`] has checked.
+fn head(fixed: &[u8; HEADER_LEN], body: &[u8]) -> Result<Header, Error> {
     let mut records = Records { b: body, pos: 0 };
     let mut groups: Vec<Group> = Vec::new();
     // The names in the current group, to find one used twice. A BTreeSet
@@ -1467,6 +1330,7 @@ fn head(h: &[u8]) -> Result<Header, Error> {
     let mut names: BTreeSet<&[u8]> = BTreeSet::new();
     while let Some(r) = records.next() {
         match r {
+            Record::Delimiter(tag::END_OF_ATTRIBUTES) => break,
             Record::Delimiter(0) => return Err(Error::ReservedGroup),
             Record::Delimiter(t) => {
                 groups.push(Group { tag: t, attributes: Vec::new() });
@@ -2084,11 +1948,11 @@ mod tests {
         );
         // Collection errors.
         assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", b"m"), rec(0x37, "", b"")]),
+            with(vec![vec![1], rec(0x37, "a", b"")]),
             Err(ParseError::Head(Error::Collection))
         );
         assert_eq!(
-            with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", b"m"), rec(0x4a, "", b"n")]),
+            with(vec![vec![1], rec(0x4a, "a", b"m")]),
             Err(ParseError::Head(Error::Collection))
         );
         assert_eq!(
@@ -2142,7 +2006,12 @@ mod tests {
         );
         contract::check_decode_with_alloc_limit(Head::new, &long, 2 * MAX_HEAD);
         // Every message shows its error.
-        for e in [Error::Truncated, Error::TooLong, Error::Length(0x8000), Error::NoGroup, Error::NoAttribute] {
+        for e in [
+            Error::TooLong,
+            Error::Length(0x8000),
+            Error::NoGroup,
+            Error::NoAttribute,
+        ] {
             assert!(!e.to_string().is_empty());
         }
         for e in [Error::BadValue(0x21), Error::BadName, Error::Collection, Error::TooDeep, Error::ReservedGroup] {
@@ -2828,7 +2697,7 @@ mod tests {
                 let end = scan_head(data, &mut 0, MAX_HEAD).unwrap().unwrap();
                 assert_eq!(
                     (items, failure),
-                    (vec![Ok(head(&data[..end]).unwrap())], None)
+                    (vec![Ok(Header::parse(&data[..end]).unwrap())], None)
                 );
             }
             Err(ParseError::Truncated) => {

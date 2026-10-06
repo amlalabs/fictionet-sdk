@@ -42,12 +42,6 @@ where
     assert_eq!(stream.unread(), bytes);
 }
 
-fn typed_frontend() -> pg::FrontendMessages {
-    let mut decoder = pg::FrontendMessages::with_limit(64);
-    decoder.start_messages();
-    decoder
-}
-
 #[test]
 fn postgres_frontend_and_backend_round_trips() {
     let frontend = vec![
@@ -256,7 +250,10 @@ fn postgres_cancel_and_terminate_end_at_the_item_boundary() {
                 secret_key: vec![2; 4],
             },
         ),
-        (typed_frontend(), pg::Frontend::Terminate),
+        (
+            pg::FrontendMessages::established(64),
+            pg::Frontend::Terminate,
+        ),
     ] {
         let mut bytes = Wire::to_bytes(&message).unwrap();
         bytes.extend_from_slice(b"unread");
@@ -273,9 +270,9 @@ fn postgres_cancel_and_terminate_end_at_the_item_boundary() {
 fn postgres_body_errors_are_items_and_framing_errors_end_once() {
     let mut bytes = b"Q\0\0\0\x05x".to_vec(); // Missing string terminator.
     pg::Frontend::Sync.write(&mut bytes).unwrap();
-    check(typed_frontend, &bytes);
+    check(|| pg::FrontendMessages::established(64), &bytes);
     assert_eq!(
-        read(typed_frontend(), &bytes),
+        read(pg::FrontendMessages::established(64), &bytes),
         [
             Err(pg::Error::Malformed {
                 tag: b'Q',
@@ -298,7 +295,7 @@ fn postgres_body_errors_are_items_and_framing_errors_end_once() {
         ]
     );
     failure(
-        typed_frontend(),
+        pg::FrontendMessages::established(64),
         b"?",
         false,
         Fail::Protocol(pg::Error::UnknownType(b'?')),
@@ -336,8 +333,13 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
             max: 64,
         });
         if frontend {
-            failure(typed_frontend(), bytes, false, expected);
-            check(typed_frontend, bytes);
+            failure(
+                pg::FrontendMessages::established(64),
+                bytes,
+                false,
+                expected,
+            );
+            check(|| pg::FrontendMessages::established(64), bytes);
         } else {
             failure(pg::BackendMessages::with_limit(64), bytes, false, expected);
             check(|| pg::BackendMessages::with_limit(64), bytes);
@@ -350,7 +352,7 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
         Fail::Truncated { unread: 5 },
     );
     failure(
-        typed_frontend(),
+        pg::FrontendMessages::established(64),
         b"Q\0\0\0\x08ab",
         true,
         Fail::Truncated { unread: 7 },
@@ -365,9 +367,8 @@ fn postgres_limits_are_refused_from_headers_and_partial_units_truncate() {
 
 #[test]
 fn postgres_modes_and_minimum_limit_are_explicit() {
-    let mut frontend = pg::FrontendMessages::with_limit(0);
+    let frontend = pg::FrontendMessages::established(0);
     assert_eq!(frontend.limit(), 4);
-    frontend.start_messages();
     assert_eq!(frontend.phase(), pg::Phase::Messages);
     assert_eq!(
         read(frontend.clone(), b"S\0\0\0\x04"),
