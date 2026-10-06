@@ -2,11 +2,19 @@
 //! reads them at the start of a connection.
 #![no_main]
 
+use fictionet::stdlib::{codec::contract, proxy_protocol::Headers};
+
 use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Ssl, SslTlv, Step, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Headers::new, data);
+    contract::check_decode(|| Headers::with_limit(32), data);
+    contract::check_wire::<Header>(data);
+    contract::check_wire_value(&Header::V1(V1::Unknown(
+        data.iter().take(108).copied().collect(),
+    )));
     let parsed = Header::parse(data);
 
     // The stream, split two ways: all at once, and a byte at a time.
@@ -72,6 +80,7 @@ fuzz_target!(|data: &[u8]| {
             Header::V2(V2 { command: Command::Proxy, addresses: Addresses::from_addrs(transport, src, dst), tlvs: vec![] }),
         ];
         for h in headers {
+            contract::check_wire_value(&h);
             let bytes = h.to_bytes();
             let (back, n) = Header::parse(&bytes).unwrap().unwrap();
             assert_eq!(back, h);

@@ -25,6 +25,15 @@
 //! likes. Every length is bounded by a named limit, and a decoder never
 //! holds more than [`MAX_BUFFERED`] bytes.
 //!
+//! New code uses [`ClientMessages`] or [`ServerMessages`] with
+//! [`codec::Stream`]. Choose methods and verify authentication between
+//! items, then hand off unread bytes with `swap` or `into_parts` after
+//! `End`. While a decision is pending, pipelined bytes stay buffered up
+//! to capacity, so [`codec::pump`] can return before `select` or `verified`.
+//! Individual greeting, auth, request and reply types implement
+//! [`Wire`] with exact parsing and transactional writing. The legacy
+//! decoders and their `take_data` methods retain their original behavior.
+//!
 //! ```
 //! use fictionet::stdlib::socks::{
 //!     Address, ClientMessage, Command, Method, Reply, ReplyCode, Selection, ServerDecoder, ServerStage,
@@ -58,6 +67,442 @@
 //! ```
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+use super::codec::{self, Step, Wire};
+
+/// Why a SOCKS stream cannot find its next unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// A version, address type or field boundary is invalid.
+    Protocol(Error),
+    /// A unit exceeds the configured whole-message limit.
+    TooLong,
+    /// Input reached capacity before `select` or `verified` decided the next stage.
+    DecisionRequired(ServerStage),
+}
+
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Protocol(e) => e.fmt(f),
+            Self::TooLong => f.write_str("SOCKS unit exceeds its limit"),
+            Self::DecisionRequired(s) => write!(f, "SOCKS decision required in {s:?}"),
+        }
+    }
+}
+impl core::error::Error for DecodeError {}
+
+/// Why a SOCKS value cannot be read or written exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WireError {
+    /// The unit is malformed.
+    Protocol(Error),
+    /// The unit is incomplete.
+    Truncated,
+    /// Bytes follow the unit.
+    Trailing,
+    /// Encoding would clip a field or change a variant.
+    Unrepresentable,
+}
+impl core::fmt::Display for WireError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Protocol(e) => e.fmt(f),
+            Self::Truncated => f.write_str("incomplete SOCKS unit"),
+            Self::Trailing => f.write_str("bytes after the SOCKS unit"),
+            Self::Unrepresentable => f.write_str("SOCKS value cannot be written unchanged"),
+        }
+    }
+}
+impl core::error::Error for WireError {}
+
+macro_rules! socks_wire {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl Wire for $ty {
+            type ParseError = WireError;
+            type WriteError = WireError;
+
+            /// Reads exactly one unit, bounded by `MAX_MESSAGE`.
+            fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+                let (value, used) = Self::parse(bytes)
+                    .map_err(WireError::Protocol)?.ok_or(WireError::Truncated)?;
+                if used != bytes.len() { return Err(WireError::Trailing); }
+                Ok(value)
+            }
+
+            /// Appends a strict encoding. Leaves `out` unchanged on error.
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
+                let bytes = self.to_bytes();
+                if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+                    return Err(WireError::Unrepresentable);
+                }
+                out.extend_from_slice(&bytes);
+                Ok(())
+            }
+        }
+    )+};
+}
+socks_wire!(Greeting, Selection, AuthRequest, AuthReply, Request, Reply, Socks4Request, Socks4Reply);
+
+fn sized_end(at: usize, len: usize) -> Result<usize, DecodeError> {
+    at.checked_add(len).ok_or(DecodeError::TooLong)
+}
+
+// Finds framing without interpreting command and reserved fields. Those
+// are per-unit failures once the endpoint establishes an exact boundary.
+fn endpoint_end(b: &[u8], at: usize) -> Result<Option<usize>, DecodeError> {
+    let Some(&kind) = b.get(at) else { return Ok(None) };
+    Ok(Some(match kind {
+        atyp::IPV4 => sized_end(at, 7)?,
+        atyp::IPV6 => sized_end(at, 19)?,
+        atyp::DOMAIN => {
+            let Some(&n) = b.get(sized_end(at, 1)?) else {
+                return Ok(None);
+            };
+            sized_end(sized_end(at, 4)?, usize::from(n))?
+        }
+        other => return Err(DecodeError::Protocol(Error::AddressType(other))),
+    }))
+}
+
+#[derive(Clone, Debug, Default)]
+struct Scan4 {
+    pos: usize,
+    user_end: Option<usize>,
+}
+impl Scan4 {
+    fn length(&mut self, b: &[u8]) -> Result<Option<usize>, DecodeError> {
+        let Some(&[a, c, d, e]) = b.get(4..8) else { return Ok(None) };
+        let domain = [a, c, d] == [0, 0, 0] && e != 0;
+        self.pos = self.pos.max(8);
+        loop {
+            let start = self.user_end.map_or(Ok(8), |n| sized_end(n, 1))?;
+            let max = if self.user_end.is_some() { MAX_SOCKS4_DOMAIN } else { MAX_USER_ID };
+            let field_end = sized_end(sized_end(start, max)?, 1)?;
+            let end = b.len().min(field_end);
+            let bytes = b.get(self.pos..end).unwrap_or_default();
+            if let Some(n) = bytes.iter().position(|&v| v == 0) {
+                let nul = sized_end(self.pos, n)?;
+                self.pos = sized_end(nul, 1)?;
+                if self.user_end.is_some() || !domain {
+                    return Ok(Some(self.pos));
+                }
+                self.user_end = Some(nul);
+            } else {
+                self.pos = end;
+                return if end == field_end {
+                    Err(DecodeError::Protocol(Error::FieldTooLong))
+                } else {
+                    Ok(None)
+                };
+            }
+        }
+    }
+}
+
+/// Reads client greeting, authentication and request units without input ownership.
+///
+/// Use with [`codec::Stream`]. Call [`select`](Self::select) immediately
+/// after a greeting item and [`verified`](Self::verified) after an auth
+/// item. Until that decision, input below capacity returns [`Step::Need`],
+/// allowing [`codec::pump`] and [`codec::try_pump`] to return to the world
+/// with pipelined bytes buffered. At capacity, decoding fails with
+/// [`DecodeError::DecisionRequired`]. Decide before filling that allowance.
+/// Complete malformed requests are `Err` items. Unknown framing and limits
+/// are terminal errors. Both leave [`ServerStage::Failed`]. A request is
+/// the last item; the next call returns [`Step::End`]. Unsupported selected
+/// methods and refusal also end.
+/// Use `Stream::swap` or `into_parts` for the unread tunnel bytes, and send
+/// any input not accepted by `push` to the next decoder. EOF inside a unit
+/// returns `Need` so the driver reports truncation.
+#[derive(Clone, Debug)]
+pub struct ClientMessages {
+    stage: ServerStage,
+    offered: MethodSet,
+    limit: usize,
+    scan4: Scan4,
+}
+impl ClientMessages {
+    /// Starts at the greeting, with a whole-unit limit of [`MAX_MESSAGE`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_MESSAGE)
+    }
+
+    /// Sets the whole-unit limit, clamped to 10 through [`MAX_MESSAGE`].
+    /// The floor fits a SOCKS5 IPv4 request.
+    /// Counted units are refused from their length fields before the body.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            stage: ServerStage::Greeting,
+            offered: MethodSet::default(),
+            limit: limit.clamp(10, MAX_MESSAGE),
+            scan4: Scan4::default(),
+        }
+    }
+
+    /// The current handshake stage.
+    pub fn stage(&self) -> ServerStage {
+        self.stage
+    }
+
+    /// The largest accepted unit, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Chooses an offered method between items. Returns false outside the
+    /// selection stage or for a method that was not offered.
+    pub fn select(&mut self, method: Method) -> bool {
+        if self.stage != ServerStage::Selecting || !self.offered.allows(method) {
+            return false;
+        }
+        self.stage = match Method::from_code(method.code()) {
+            Method::NoAuth => ServerStage::Request,
+            Method::UsernamePassword => ServerStage::Auth,
+            Method::NoAcceptable => ServerStage::Closed,
+            _ => ServerStage::Done,
+        };
+        true
+    }
+
+    /// Accepts or refuses authentication between items. Does nothing
+    /// outside the verification stage. Refusal preserves unread bytes.
+    pub fn verified(&mut self, good: bool) {
+        if self.stage == ServerStage::Verifying {
+            self.stage = if good { ServerStage::Request } else { ServerStage::Closed };
+        }
+    }
+}
+impl Default for ClientMessages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl codec::Decode for ClientMessages {
+    type Item = Result<ClientMessage, Error>;
+    type Error = DecodeError;
+    const NAME: &'static str = "SOCKS client units";
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, DecodeError> {
+        self.decode_unit(b)
+            .inspect_err(|_| self.stage = ServerStage::Failed)
+    }
+}
+impl ClientMessages {
+    fn decode_unit(&mut self, b: &[u8]) -> Result<Step<Result<ClientMessage, Error>>, DecodeError> {
+        match self.stage {
+            ServerStage::Done | ServerStage::Closed | ServerStage::Failed => return Ok(Step::End),
+            ServerStage::Selecting | ServerStage::Verifying if b.len() < self.limit => {
+                return Ok(Step::Need);
+            }
+            ServerStage::Selecting | ServerStage::Verifying => {
+                return Err(DecodeError::DecisionRequired(self.stage));
+            }
+            _ => {}
+        }
+        let Some(&first) = b.first() else { return Ok(Step::Need) };
+        let v4 = self.stage == ServerStage::Greeting && first == VERSION_4;
+        let version = if v4 {
+            VERSION_4
+        } else if self.stage == ServerStage::Auth {
+            AUTH_VERSION
+        } else {
+            VERSION_5
+        };
+        check_version(b, version).map_err(DecodeError::Protocol)?;
+        let end = if v4 {
+            self.scan4.length(b.get(..self.limit).unwrap_or(b))?
+        } else {
+            match self.stage {
+                ServerStage::Greeting => b
+                    .get(1)
+                    .map(|&n| sized_end(2, usize::from(n)))
+                    .transpose()?,
+                ServerStage::Auth => match b.get(1) {
+                    Some(&n) => {
+                        let at = sized_end(2, usize::from(n))?;
+                        let header = sized_end(at, 1)?;
+                        if header > self.limit {
+                            return Err(DecodeError::TooLong);
+                        }
+                        b.get(at)
+                            .map(|&p| sized_end(header, usize::from(p)))
+                            .transpose()?
+                    }
+                    None => None,
+                },
+                _ => endpoint_end(b, 3)?,
+            }
+        };
+        let Some(used) = end else {
+            return if b.len() >= self.limit { Err(DecodeError::TooLong) } else { Ok(Step::Need) };
+        };
+        if used > self.limit {
+            return Err(DecodeError::TooLong);
+        }
+        let Some(bytes) = b.get(..used) else { return Ok(Step::Need) };
+        let item = if v4 {
+            Socks4Request::parse(bytes).map(|v| v.map(|(m, _)| ClientMessage::Socks4(m)))
+        } else {
+            match self.stage {
+                ServerStage::Greeting => Greeting::parse(bytes).map(|v| v.map(|(m, _)| ClientMessage::Greeting(m))),
+                ServerStage::Auth => AuthRequest::parse(bytes).map(|v| v.map(|(m, _)| ClientMessage::Auth(m))),
+                _ => Request::parse(bytes).map(|v| v.map(|(m, _)| ClientMessage::Request(m))),
+            }
+        }
+        .and_then(|v| v.ok_or(Error::Truncated));
+        self.stage = match &item {
+            Ok(ClientMessage::Greeting(g)) => {
+                self.offered = MethodSet::of(&g.methods);
+                ServerStage::Selecting
+            }
+            Ok(ClientMessage::Auth(_)) => ServerStage::Verifying,
+            Ok(_) => ServerStage::Done,
+            Err(_) => ServerStage::Failed,
+        };
+        Ok(Step::Item(item, used))
+    }
+}
+
+/// Reads proxy replies, then ends with unread tunnel bytes in the stream.
+///
+/// This owns no input; use it with [`codec::Stream`]. BIND reads
+/// both replies. Refusal and unsupported methods yield their last item,
+/// then `End`. Bad complete units are items; framing and limits are errors.
+/// Both kinds of error leave [`ClientStage::Failed`], preserving unread bytes.
+#[derive(Clone, Debug)]
+pub struct ServerMessages {
+    stage: ClientStage,
+    socks4: bool,
+    bind: bool,
+    offered: Option<MethodSet>,
+    limit: usize,
+}
+impl ServerMessages {
+    /// Reads a SOCKS5 selection, optional auth reply, and request replies.
+    pub fn socks5(command: Command) -> Self {
+        Self::with_limit(command, MAX_MESSAGE)
+    }
+
+    /// Reads SOCKS5 replies with a whole-unit limit clamped to 10 through
+    /// [`MAX_MESSAGE`]. The floor fits an IPv4 reply. Declared endpoint
+    /// lengths are checked before the body.
+    pub fn with_limit(command: Command, limit: usize) -> Self {
+        Self {
+            stage: ClientStage::Selection,
+            socks4: false,
+            bind: command == Command::Bind,
+            offered: None,
+            limit: limit.clamp(10, MAX_MESSAGE),
+        }
+    }
+
+    /// Also checks the selection against the first [`MAX_METHODS`] offers.
+    pub fn socks5_offering(command: Command, methods: &[Method]) -> Self {
+        Self { offered: Some(MethodSet::of(methods)), ..Self::socks5(command) }
+    }
+
+    /// Reads SOCKS4 or SOCKS4a replies, including BIND's second reply.
+    pub fn socks4(command: Socks4Command) -> Self {
+        Self::socks4_with_limit(command, MAX_MESSAGE)
+    }
+
+    /// Reads SOCKS4 replies with a limit clamped to [`SOCKS4_REPLY_LEN`]
+    /// through [`MAX_MESSAGE`]. Each reply occupies exactly eight bytes.
+    pub fn socks4_with_limit(command: Socks4Command, limit: usize) -> Self {
+        Self {
+            stage: ClientStage::Reply,
+            socks4: true,
+            bind: command == Socks4Command::Bind,
+            offered: None,
+            limit: limit.clamp(SOCKS4_REPLY_LEN, MAX_MESSAGE),
+        }
+    }
+
+    /// The largest accepted unit, including its header.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The current reply stage.
+    pub fn stage(&self) -> ClientStage {
+        self.stage
+    }
+}
+impl codec::Decode for ServerMessages {
+    type Item = Result<ServerMessage, Error>;
+    type Error = DecodeError;
+    const NAME: &'static str = "SOCKS server units";
+    fn capacity(&self) -> usize {
+        self.limit
+    }
+
+    fn decode(&mut self, b: &[u8], _: bool) -> Result<Step<Self::Item>, DecodeError> {
+        self.decode_unit(b)
+            .inspect_err(|_| self.stage = ClientStage::Failed)
+    }
+}
+impl ServerMessages {
+    fn decode_unit(&mut self, b: &[u8]) -> Result<Step<Result<ServerMessage, Error>>, DecodeError> {
+        if matches!(self.stage, ClientStage::Done | ClientStage::Closed | ClientStage::Failed) {
+            return Ok(Step::End);
+        }
+        let version = if self.socks4 {
+            VERSION_4_REPLY
+        } else if self.stage == ClientStage::Auth {
+            AUTH_VERSION
+        } else {
+            VERSION_5
+        };
+        check_version(b, version).map_err(DecodeError::Protocol)?;
+        let used = match self.stage {
+            ClientStage::Selection | ClientStage::Auth => 2,
+            _ if self.socks4 => SOCKS4_REPLY_LEN,
+            _ => match endpoint_end(b, 3)? {
+                Some(n) => n,
+                None => return Ok(Step::Need),
+            },
+        };
+        if used > self.limit {
+            return Err(DecodeError::TooLong);
+        }
+        let Some(bytes) = b.get(..used) else { return Ok(Step::Need) };
+        let item = match self.stage {
+            ClientStage::Selection => Selection::parse(bytes).map(|v| v.map(|(m, _)| ServerMessage::Selection(m))),
+            ClientStage::Auth => AuthReply::parse(bytes).map(|v| v.map(|(m, _)| ServerMessage::Auth(m))),
+            _ if self.socks4 => Socks4Reply::parse(bytes).map(|v| v.map(|(m, _)| ServerMessage::Socks4(m))),
+            _ => Reply::parse(bytes).map(|v| v.map(|(m, _)| ServerMessage::Reply(m))),
+        }
+        .and_then(|v| v.ok_or(Error::Truncated))
+        .and_then(|m| {
+            if let ServerMessage::Selection(s) = &m
+                && self.offered.is_some_and(|o| !o.allows(s.method))
+            {
+                return Err(Error::Method(s.method.code()));
+            }
+            Ok(m)
+        });
+        let reply_stage =
+            if self.bind && self.stage == ClientStage::Reply { ClientStage::SecondReply } else { ClientStage::Done };
+        self.stage = match &item {
+            Ok(ServerMessage::Selection(s)) => match Method::from_code(s.method.code()) {
+                Method::NoAuth => ClientStage::Reply,
+                Method::UsernamePassword => ClientStage::Auth,
+                Method::NoAcceptable => ClientStage::Closed,
+                _ => ClientStage::Done,
+            },
+            Ok(ServerMessage::Auth(a)) if a.success() => ClientStage::Reply,
+            Ok(ServerMessage::Reply(r)) if r.code.code() == ReplyCode::Succeeded.code() => reply_stage,
+            Ok(ServerMessage::Socks4(r)) if r.code.code() == Socks4Code::Granted.code() => reply_stage,
+            Ok(_) => ClientStage::Closed,
+            Err(_) => ClientStage::Failed,
+        };
+        Ok(Step::Item(item, used))
+    }
+}
 
 /// The TCP port SOCKS proxies listen on.
 pub const PORT: u16 = 1080;
@@ -926,37 +1371,38 @@ pub enum ClientMessage {
     Socks4(Socks4Request),
 }
 
-/// Where a [`ServerDecoder`] is in the handshake.
+/// Where [`ClientMessages`] or a [`ServerDecoder`] is in the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServerStage {
     /// Waiting for the client's first message: a SOCKS5 greeting or a
     /// SOCKS4 request.
     Greeting,
     /// Waiting for the world to choose a method with
-    /// [`ServerDecoder::select`].
+    /// [`ClientMessages::select`] or [`ServerDecoder::select`].
     Selecting,
     /// Waiting for a username and password.
     Auth,
     /// Waiting for the world to say whether the login is good with
-    /// [`ServerDecoder::verified`].
+    /// [`ClientMessages::verified`] or [`ServerDecoder::verified`].
     Verifying,
     /// Waiting for a SOCKS5 request.
     Request,
     /// The handshake is over, or went on with a method this module does
     /// not read. The bytes that follow are the world's, through
-    /// [`ServerDecoder::take_data`].
+    /// [`codec::Stream::into_parts`] or [`ServerDecoder::take_data`].
     Done,
-    /// The proxy refused the client and closes the connection. Bytes fed
-    /// now are dropped.
+    /// The proxy refused the client and closes the connection. The stream
+    /// decoder ends; the legacy decoder drops further fed bytes.
     Closed,
-    /// The client broke the protocol. The decoder keeps returning the
-    /// error.
+    /// The client broke the protocol, or decoding failed. No tunnel handoff
+    /// is allowed. The stream reports the error once; the legacy decoder repeats it.
     Failed,
 }
 
 /// Reads what a SOCKS client sends, for a world that plays a proxy. Feed
 /// it the bytes a connection reads, in order, and take messages out until
 /// it has none.
+/// New code uses [`ClientMessages`] with [`codec::Stream`].
 #[derive(Clone, Debug)]
 pub struct ServerDecoder {
     buf: Buffer,
@@ -1083,6 +1529,7 @@ impl ServerDecoder {
     /// If bytes were dropped past [`MAX_BUFFERED`], it returns nothing and
     /// the decoder fails with [`Error::Overflow`], so the stream it hands
     /// out never has a gap.
+    /// New code uses [`ClientMessages`] and [`codec::Stream::into_parts`] or `swap`.
     pub fn take_data(&mut self) -> Vec<u8> {
         if self.stage != ServerStage::Done {
             return Vec::new();
@@ -1113,7 +1560,7 @@ pub enum ServerMessage {
     Socks4(Socks4Reply),
 }
 
-/// Where a [`ClientDecoder`] is in the handshake.
+/// Where [`ServerMessages`] or a [`ClientDecoder`] is in the handshake.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClientStage {
     /// Waiting for the proxy's method selection.
@@ -1127,19 +1574,20 @@ pub enum ClientStage {
     SecondReply,
     /// The handshake is over, or went on with a method this module does
     /// not read. The bytes that follow are the world's, through
-    /// [`ClientDecoder::take_data`].
+    /// [`codec::Stream::into_parts`] or [`ClientDecoder::take_data`].
     Done,
-    /// The proxy refused, and closes the connection. Bytes fed now are
-    /// dropped.
+    /// The proxy refused, and closes the connection. The stream decoder
+    /// ends; the legacy decoder drops further fed bytes.
     Closed,
-    /// The proxy broke the protocol. The decoder keeps returning the
-    /// error.
+    /// The proxy broke the protocol, or decoding failed. No tunnel handoff
+    /// is allowed. The stream reports the error once; the legacy decoder repeats it.
     Failed,
 }
 
 /// Reads what a SOCKS proxy sends, for a world that plays a client. Feed
 /// it the bytes a connection reads, in order, and take messages out until
 /// it has none.
+/// New code uses [`ServerMessages`] with [`codec::Stream`].
 #[derive(Clone, Debug)]
 pub struct ClientDecoder {
     buf: Buffer,
@@ -1282,6 +1730,7 @@ impl ClientDecoder {
 
     /// Takes out the bytes held after the handshake, as
     /// [`ServerDecoder::take_data`] does.
+    /// New code uses [`ServerMessages`] and [`codec::Stream::into_parts`] or `swap`.
     pub fn take_data(&mut self) -> Vec<u8> {
         if self.stage != ClientStage::Done {
             return Vec::new();

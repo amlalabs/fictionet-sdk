@@ -7,6 +7,10 @@ use fictionet::stdlib::socks::{
     MAX_DATAGRAM, MAX_METHODS, Method, Reply, Request, Selection, ServerDecoder, ServerMessage, Socks4Command,
     Socks4Destination, Socks4Reply, Socks4Request, UdpHeader,
 };
+use fictionet::stdlib::{
+    codec::{Decode, Step, contract},
+    socks::{ClientMessages, ServerMessages},
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Takes messages out of a proxy's decoder, choosing a method and judging
@@ -52,6 +56,34 @@ fn drain_client(d: &mut ClientDecoder, out: &mut Vec<Result<ServerMessage, Error
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(ClientMessages::new, data);
+    contract::check_decode(|| ClientMessages::with_limit(16), data);
+    for method in [Method::NoAuth, Method::UsernamePassword] {
+        contract::check_decode(
+            || {
+                let mut d = ClientMessages::with_limit(16);
+                assert!(matches!(
+                    d.decode(&[5, 1, method.code()], false),
+                    Ok(Step::Item(_, 3))
+                ));
+                assert!(d.select(method));
+                d
+            },
+            data,
+        );
+    }
+    contract::check_decode(|| ServerMessages::socks5(Command::Connect), data);
+    contract::check_decode(|| ServerMessages::with_limit(Command::Bind, 16), data);
+    contract::check_decode(|| ServerMessages::socks4(Socks4Command::Bind), data);
+    contract::check_wire::<Greeting>(data);
+    contract::check_wire::<Selection>(data);
+    contract::check_wire::<AuthRequest>(data);
+    contract::check_wire::<AuthReply>(data);
+    contract::check_wire::<Request>(data);
+    contract::check_wire::<Reply>(data);
+    contract::check_wire::<Socks4Request>(data);
+    contract::check_wire::<Socks4Reply>(data);
+    contract::check_wire_value(&AuthRequest { username: data.iter().take(256).copied().collect(), password: vec![] });
     // Past this, the two ways of feeding drop different bytes.
     if data.len() > MAX_BUFFERED {
         return;
