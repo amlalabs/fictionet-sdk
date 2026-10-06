@@ -17,7 +17,7 @@
 //! into them. Which TSAPs exist, what TPDU size to accept, and what the
 //! data means are up to world code.
 //!
-//! New stream readers use [`tpdus`] for individual TPDUs or [`messages`]
+//! Stream readers use [`tpdus`] for individual TPDUs or [`messages`]
 //! for EOT reassembly. Both compose the shared [`tpkt::Packets`] decoder.
 //! [`Tpdu`] implements [`Wire`] with a [`MAX_TPDU`] input limit and a
 //! strict, transactional writer. [`over_tpkt`] provides TPKT conversions
@@ -178,8 +178,6 @@ pub mod cause {
     pub const INVALID_PARAMETER_VALUE: u8 = 3;
 }
 
-/// Why bytes are not a TPKT stream. Either way, the connection holds no
-/// more packets a reader can find, and a real server closes it.
 /// One parameter in a TPDU header's variable part: a code and a value of
 /// up to [`MAX_PARAMETER`] bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,7 +219,9 @@ impl Variable {
         let mut params = Vec::new();
         let mut rest = b;
         while let [code, len, tail @ ..] = rest {
-            let Some(value) = tail.get(..usize::from(*len)) else { return Variable::Raw(b.to_vec()) };
+            let Some(value) = tail.get(..usize::from(*len)) else {
+                return Variable::Raw(b.to_vec());
+            };
             params.push(Parameter { code: *code, value: value.to_vec() });
             rest = tail.get(usize::from(*len)..).unwrap_or_default();
         }
@@ -577,7 +577,9 @@ impl core::fmt::Display for TpduError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             TpduError::Empty => f.write_str("empty TPDU"),
-            TpduError::LengthIndicator(li) => write!(f, "length indicator {li} does not fit the TPDU"),
+            TpduError::LengthIndicator(li) => {
+                write!(f, "length indicator {li} does not fit the TPDU")
+            }
             TpduError::Truncated { needed, have } => {
                 write!(f, "TPDU header needs {needed} bytes, has {have}")
             }
@@ -785,7 +787,9 @@ impl Tpdu {
             return Err(TpduError::Truncated { needed: usize::from(li) + 1, have: b.len() });
         };
         let data = rest.get(usize::from(li)..).unwrap_or_default();
-        let Some(&code_byte) = header.first() else { return Err(TpduError::Unsupported(0)) };
+        let Some(&code_byte) = header.first() else {
+            return Err(TpduError::Unsupported(0));
+        };
         match code_byte & 0xf0 {
             code::CONNECTION_REQUEST | code::CONNECTION_CONFIRM => {
                 let [_, dst_hi, dst_lo, src_hi, src_lo, class, variable @ ..] = header else {
@@ -947,7 +951,6 @@ mod codec_tests {
     }
 
     #[test]
-
     fn over_tpkt_message_writer_matches_both_wire_layers() {
         for size in [0, 125, 126, MAX_TPDU, MAX_MESSAGE] {
             let message = vec![0x5a; size];
@@ -1052,7 +1055,7 @@ mod codec_tests {
         }
         contract::check_decode_with_held_limit(|| messages(132, 1024), &wire, 1024);
 
-        // The existing message writer uses the same packet and TPDU layers.
+        // The message writer uses the same packet and TPDU layers.
         let written = over_tpkt::write_message(&message, 128).unwrap();
         let chunks: Vec<_> = test_support::chunks(&written, &[1]).collect();
         assert_eq!(drive(messages(132, 1024), &chunks), vec![Assembled::Message(message)]);
@@ -1898,7 +1901,9 @@ mod tests {
                 _ => Tpdu::Error(ErrorTpdu { dst_ref: rng.next() as u16, cause: rng.next() as u8, variable }),
             };
             contract::check_wire_value(&t);
-            let Ok(packet) = over_tpkt::from_tpdu(&t) else { continue };
+            let Ok(packet) = over_tpkt::from_tpdu(&t) else {
+                continue;
+            };
             let packet = packet.to_bytes().unwrap();
             let back = tpdu_from_packet(&packet);
             // Reading it back again changes nothing more.

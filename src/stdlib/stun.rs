@@ -224,11 +224,9 @@ pub enum Attribute {
     XorMappedAddress(SocketAddr),
     /// ALTERNATE-SERVER: another server to try, sent with error 300.
     AlternateServer(SocketAddr),
-    /// USERNAME. The parser and strict writer accept [`MAX_TEXT`] bytes.
-    /// The writer accepts up to [`MAX_TEXT`] bytes.
+    /// USERNAME. The parser and writer accept up to [`MAX_TEXT`] bytes.
     Username(String),
-    /// REALM. The parser and strict writer accept [`MAX_TEXT`] bytes.
-    /// The writer accepts up to [`MAX_TEXT`] bytes.
+    /// REALM. The parser and writer accept up to [`MAX_TEXT`] bytes.
     Realm(String),
     /// NONCE, with the same limits as REALM.
     Nonce(String),
@@ -301,7 +299,9 @@ impl Attribute {
             attr::NONCE => Ok(Attribute::Nonce(read_text(typ, value, MAX_TEXT)?)),
             attr::SOFTWARE => Ok(Attribute::Software(read_text(typ, value, MAX_TEXT)?)),
             attr::ERROR_CODE => {
-                let [_, _, class_byte, number_byte, reason @ ..] = value else { return Err(bad()) };
+                let [_, _, class_byte, number_byte, reason @ ..] = value else {
+                    return Err(bad());
+                };
                 let class = u16::from(class_byte & 0x07);
                 let number = u16::from(*number_byte);
                 if !(3..=6).contains(&class) || number > 99 {
@@ -368,7 +368,6 @@ impl Attribute {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Message {
     /// The method, 12 bits. Higher bits are refused by the writer.
-    /// The strict writer refuses them.
     pub method: u16,
     /// The class.
     pub class: Class,
@@ -452,17 +451,25 @@ impl core::fmt::Display for ParseError {
         match self {
             ParseError::Truncated => f.write_str("message cut short"),
             ParseError::TrailingBytes(n) => write!(f, "{n} bytes after the message"),
-            ParseError::TopBits(b) => write!(f, "first byte {b:#04x} has its top bits set, not STUN"),
+            ParseError::TopBits(b) => {
+                write!(f, "first byte {b:#04x} has its top bits set, not STUN")
+            }
             ParseError::Length(n) => write!(f, "message length {n} is not a multiple of 4"),
             ParseError::MagicCookie(c) => write!(f, "magic cookie {c:#010x}, not 0x2112a442"),
-            ParseError::AttributeTruncated { typ } => write!(f, "attribute {typ:#06x} runs past the message"),
+            ParseError::AttributeTruncated { typ } => {
+                write!(f, "attribute {typ:#06x} runs past the message")
+            }
             ParseError::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
             ParseError::AttributeValue { typ, len } => {
                 write!(f, "attribute {typ:#06x} has a bad length {len}")
             }
             ParseError::AddressFamily(fam) => write!(f, "address family {fam}, not 1 or 2"),
-            ParseError::Text { typ } => write!(f, "attribute {typ:#06x} is not UTF-8 or is too long"),
-            ParseError::ErrorCode { class, number } => write!(f, "error code class {class} number {number}"),
+            ParseError::Text { typ } => {
+                write!(f, "attribute {typ:#06x} is not UTF-8 or is too long")
+            }
+            ParseError::ErrorCode { class, number } => {
+                write!(f, "error code class {class} number {number}")
+            }
             ParseError::FingerprintNotLast => f.write_str("FINGERPRINT is not the last attribute"),
             ParseError::Fingerprint { expected, found } => {
                 write!(f, "FINGERPRINT {found:#010x}, the message gives {expected:#010x}")
@@ -500,7 +507,9 @@ impl core::fmt::Display for WriteError {
             Self::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
             Self::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
             Self::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
-            Self::Attribute { typ } => write!(f, "attribute {typ:#06x} cannot be written unchanged"),
+            Self::Attribute { typ } => {
+                write!(f, "attribute {typ:#06x} cannot be written unchanged")
+            }
         }
     }
 }
@@ -836,7 +845,9 @@ impl Decode for Frames {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Self::Error> {
-        let Some(total) = header(input)? else { return Ok(Step::Need) };
+        let Some(total) = header(input)? else {
+            return Ok(Step::Need);
+        };
         let frame = input.get(..total).ok_or(ParseError::Truncated)?;
         Ok(Step::Item(frame.to_vec(), total))
     }
@@ -877,11 +888,15 @@ fn header(b: &[u8]) -> Result<Option<usize>, ParseError> {
     {
         return Err(ParseError::TopBits(first));
     }
-    let Some(length) = be16(b, 2) else { return Ok(None) };
+    let Some(length) = be16(b, 2) else {
+        return Ok(None);
+    };
     if !length.is_multiple_of(4) {
         return Err(ParseError::Length(length));
     }
-    let Some(cookie) = be32(b, 4) else { return Ok(None) };
+    let Some(cookie) = be32(b, 4) else {
+        return Ok(None);
+    };
     if cookie != MAGIC_COOKIE {
         return Err(ParseError::MagicCookie(cookie));
     }
@@ -920,7 +935,9 @@ fn xor_key(transaction: &[u8; 12]) -> [u8; 16] {
 
 fn read_address(typ: u16, v: &[u8], xor: Option<&[u8; 12]>) -> Result<SocketAddr, ParseError> {
     let bad = || ParseError::AttributeValue { typ, len: v.len() };
-    let [_, family, hi, lo, address @ ..] = v else { return Err(bad()) };
+    let [_, family, hi, lo, address @ ..] = v else {
+        return Err(bad());
+    };
     let key = xor.map(xor_key).unwrap_or([0; 16]);
     let port = u16::from_be_bytes([*hi, *lo]) ^ be16(&key, 0).ok_or_else(bad)?;
     match *family {
@@ -1367,7 +1384,8 @@ mod tests {
     }
 
     #[test]
-    fn writer_preserves_parser_text_limits() {
+    fn writer_preserves_parser_max_text_limit() {
+        // This checks the parser's MAX_TEXT limit, not RFC 8489 sender limits.
         let mut message = Message::binding_request([0; 12]);
         message.attributes = vec![
             Attribute::Software("é".repeat(200)),
@@ -1659,7 +1677,7 @@ mod tests {
             let mut responses = Vec::new();
             for byte in &replies {
                 assert_eq!(
-                    pump(&mut response_stream, core::slice::from_ref(byte), |item| responses.push(item)),
+                    pump(&mut response_stream, core::slice::from_ref(byte), |item| { responses.push(item) }),
                     Ok(1)
                 );
             }
@@ -1669,7 +1687,8 @@ mod tests {
             assert_eq!(response_stream.failed(), None);
         }
 
-        // The existing borrowed API still reports the same flattened results.
+        // Mixed attribute and header errors obey the decoder contract.
+        contract::check_decode(|| Frames::new().map(|frame| Message::parse(&frame)), &bytes);
     }
 
     #[test]

@@ -23,7 +23,7 @@
 //! or one per call in [`codec::Demux`]. [`codec::Pipe`] can feed it DATA
 //! payloads that split messages at any byte. [`Message`] implements
 //! [`codec::Wire`] for exact parsing and transactional writing. Its
-//! inherent [`parse`](Message::parse) remains a prefix parser.
+//! inherent [`parse`](Message::parse) reads a prefix.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. The decoder never holds more than one message, and
@@ -163,7 +163,7 @@ impl fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Why an exact [`Wire`] parse did not contain one complete [`Message`].
-/// The inherent [`Message::parse`] remains a prefix parser.
+/// The inherent [`Message::parse`] reads a prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MessageParseError {
     /// Input ended before a complete message.
@@ -171,7 +171,7 @@ pub enum MessageParseError {
         /// Number of available bytes.
         unread: usize,
     },
-    /// Invalid framing or an incomplete message, including empty input.
+    /// Invalid framing.
     Frame(FrameError),
     /// Bytes followed the first complete message.
     Trailing {
@@ -185,7 +185,9 @@ impl fmt::Display for MessageParseError {
         match self {
             Self::Truncated { unread } => write!(f, "message ended after {unread} bytes"),
             Self::Frame(e) => e.fmt(f),
-            Self::Trailing { remaining } => write!(f, "trailing bytes after the message: {remaining}"),
+            Self::Trailing { remaining } => {
+                write!(f, "trailing bytes after the message: {remaining}")
+            }
         }
     }
 }
@@ -1098,7 +1100,9 @@ impl fmt::Display for HeaderError {
         match self {
             HeaderError::Name(n) => write!(f, "header name {n:?} is not allowed in gRPC metadata"),
             HeaderError::Value(n) => write!(f, "value of header {n:?} is not allowed"),
-            HeaderError::TooLarge(n) => write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}"),
+            HeaderError::TooLarge(n) => {
+                write!(f, "request headers of {n} bytes, over {MAX_HEADER_LIST}")
+            }
         }
     }
 }
@@ -1268,7 +1272,9 @@ impl Request {
             None => None,
             Some(t) => match Timeout::parse(&t) {
                 Ok(t) => Some(t),
-                Err(e) => return Err(Rejection::Status(Status::new(Code::Internal, &e.to_string()))),
+                Err(e) => {
+                    return Err(Rejection::Status(Status::new(Code::Internal, &e.to_string())));
+                }
             },
         };
         let encoding = match encoding.as_deref().map(trim) {

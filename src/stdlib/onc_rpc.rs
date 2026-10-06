@@ -146,7 +146,8 @@ pub enum XdrError {
     Bool(u32),
     /// An enum or union discriminant had a value the type does not have.
     Discriminant(u32),
-    /// A length or count was above the limit for that field.
+    /// The field length, item count, or attempted total buffer length that
+    /// exceeded its limit. Values above `u32::MAX` are reported as `u32::MAX`.
     TooLong(u32),
     /// A string was not UTF-8.
     Utf8,
@@ -269,8 +270,8 @@ impl<'a> Reader<'a> {
         Ok(data)
     }
 
-    /// Appends a length, the complete opaque value, and XDR alignment bytes.
-    /// The length must fit in `u32`. The buffer stays within [`MAX_RECORD`].
+    /// Variable-length opaque data of at most `max` bytes: a length, the
+    /// bytes, and zero padding. A longer length is [`XdrError::TooLong`].
     pub fn opaque(&mut self, max: usize) -> Result<&'a [u8], XdrError> {
         let len = self.uint()?;
         let n = usize::try_from(len).map_err(|_| XdrError::TooLong(len))?;
@@ -286,9 +287,10 @@ impl<'a> Reader<'a> {
         std::str::from_utf8(self.opaque(max)?).map_err(|_| XdrError::Utf8)
     }
 
-    /// Appends a count and each item. Length overflow is an error.
-    /// An array above [`MAX_ARRAY_RESERVE`] entries must use at least four
-    /// bytes per item, matching [`Reader::array`].
+    /// A variable-length array of at most `max` items, each read by `item`.
+    /// A count above both [`MAX_ARRAY_RESERVE`] and a quarter of the bytes
+    /// left is refused before any items are read. Room is made up front
+    /// for at most [`MAX_ARRAY_RESERVE`] items and 64 KiB.
     pub fn array<T>(
         &mut self,
         max: usize,
@@ -353,12 +355,15 @@ impl Writer {
     }
 
     /// Appends bytes within the record budget.
+    /// An error carries the total length the append would produce.
     fn append(&mut self, bytes: &[u8]) {
         if self.error.is_some() {
             return;
         }
-        if self.buf.len().checked_add(bytes.len()).is_none_or(|n| n > MAX_RECORD) {
-            self.reject(XdrError::TooLong(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+        let total = self.buf.len().checked_add(bytes.len());
+        if total.is_none_or(|n| n > MAX_RECORD) {
+            let length = total.and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX);
+            self.reject(XdrError::TooLong(length));
             return;
         }
         self.buf.extend_from_slice(bytes);
@@ -1102,7 +1107,9 @@ impl Decode for Fragments {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Fragment>, RecordError> {
-        let Some(mark) = input.get(..RECORD_MARK_LEN) else { return Ok(Step::Need) };
+        let Some(mark) = input.get(..RECORD_MARK_LEN) else {
+            return Ok(Step::Need);
+        };
         let mut bytes = [0; RECORD_MARK_LEN];
         bytes.copy_from_slice(mark);
         let mark = u32::from_be_bytes(bytes);
@@ -1112,7 +1119,9 @@ impl Decode for Fragments {
             return Err(RecordError::TooLong(self.limit));
         }
         let used = RECORD_MARK_LEN.checked_add(len).ok_or(RecordError::TooLong(self.limit))?;
-        let Some(data) = input.get(RECORD_MARK_LEN..used) else { return Ok(Step::Need) };
+        let Some(data) = input.get(RECORD_MARK_LEN..used) else {
+            return Ok(Step::Need);
+        };
         let last = mark & LAST_FRAGMENT != 0;
         self.record_len = if last { 0 } else { total };
         Ok(Step::Item(Fragment { last, data: data.to_vec() }, used))
@@ -1225,10 +1234,10 @@ pub fn encode_fragments(record: &[u8], fragment_len: usize) -> Result<Vec<u8>, R
     let mut out = Vec::with_capacity(record.len().saturating_add(count.saturating_mul(4)));
     let mut chunks = record.chunks(size).peekable();
     if chunks.peek().is_none() {
-        Fragment { last: true, data: Vec::new() }.write(&mut out)?;
+        write_fragment(&[], true, &mut out)?;
     }
     while let Some(chunk) = chunks.next() {
-        Fragment { last: chunks.peek().is_none(), data: chunk.to_vec() }.write(&mut out)?;
+        write_fragment(chunk, chunks.peek().is_none(), &mut out)?;
     }
     Ok(out)
 }
@@ -2105,6 +2114,12 @@ mod tests {
         let mut writer = Writer::new();
         writer.opaque_fixed(&vec![0; MAX_RECORD + 1]);
         assert!(writer.finish().is_err());
+        let mut writer = Writer::new();
+        writer.opaque_fixed(&vec![0; MAX_RECORD]);
+        assert_eq!(writer.as_bytes().len(), MAX_RECORD);
+        writer.uint(1).uhyper(2);
+        assert_eq!(writer.as_bytes().len(), MAX_RECORD);
+        assert_eq!(writer.finish(), Err(XdrError::TooLong((MAX_RECORD + 4) as u32)));
     }
 
     fn random_auth(rng: &mut Lcg) -> Auth {

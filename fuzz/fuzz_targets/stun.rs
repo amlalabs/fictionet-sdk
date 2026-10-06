@@ -2,7 +2,7 @@
 //! datagrams and TCP streams.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Stream, Wire, contract};
 use fictionet::stdlib::stun::{Attribute, Frames, MAX_VALUE, Message, answer_binding};
 use libfuzzer_sys::fuzz_target;
 
@@ -10,6 +10,31 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode(Frames::new, data);
     contract::check_decode(|| Frames::new().map(|frame| <Message as Wire>::parse(&frame)), data);
     contract::check_wire::<Message>(data);
+
+    // MESSAGE-INTEGRITY uses each frame's original bytes at its stream offset.
+    let mut stream = Stream::new(Frames::new());
+    let mut remaining = data;
+    loop {
+        let taken = stream.push(remaining);
+        remaining = &remaining[taken..];
+        if remaining.is_empty() {
+            stream.end();
+        }
+        while let Some(result) = stream.with_next(|frame, raw, span| {
+            let start = usize::try_from(span.start).unwrap();
+            let end = usize::try_from(span.end).unwrap();
+            assert_eq!(Some(raw), data.get(start..end));
+            assert_eq!(frame, raw);
+        }) {
+            if result.is_err() {
+                break;
+            }
+        }
+        if stream.is_done() {
+            break;
+        }
+        assert!(taken > 0);
+    }
 
     // A parsed datagram writes without changing its value. Canonical
     // padding and ignored attributes may shorten its bytes. Replies

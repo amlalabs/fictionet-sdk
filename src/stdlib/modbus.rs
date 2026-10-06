@@ -20,7 +20,7 @@
 //! It reports a framing error once and checks for partial frames at EOF.
 //! [`Wire`] reads exactly one frame and appends its bytes with a strict
 //! writer. Use `<Frame as Wire>::parse(bytes)` for exact parsing;
-//! [`Frame::parse`] still reads a prefix and allows trailing bytes.
+//! [`Frame::parse`] reads a prefix and allows trailing bytes.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. A request that breaks the specification becomes an
@@ -455,7 +455,9 @@ impl Request {
         if pdu.len() > MAX_PDU {
             return Err(Exception::IllegalDataValue);
         }
-        let fixed = |n: usize| if data.len() == n { Ok(()) } else { Err(Exception::IllegalDataValue) };
+        let fixed = |n: usize| {
+            if data.len() == n { Ok(()) } else { Err(Exception::IllegalDataValue) }
+        };
         let read = |max: u16| -> Result<(u16, u16), Exception> {
             fixed(4)?;
             let (address, quantity) = (be16(data, 0), be16(data, 2));
@@ -641,7 +643,9 @@ impl Response {
             }
             Ok(rest)
         };
-        let pair = || if data.len() == 4 { Ok((be16(data, 0), be16(data, 2))) } else { Err(ResponseError) };
+        let pair = || {
+            if data.len() == 4 { Ok((be16(data, 0), be16(data, 2))) } else { Err(ResponseError) }
+        };
         let response = match code {
             0 => return Err(ResponseError),
             function::READ_COILS | function::READ_DISCRETE_INPUTS => {
@@ -1456,7 +1460,9 @@ mod tests {
                         Response::Other(vec![q as u8; n.min(300)]),
                     ];
                     for resp in resps {
-                        let Ok(pdu) = resp.to_pdu(function) else { continue };
+                        let Ok(pdu) = resp.to_pdu(function) else {
+                            continue;
+                        };
                         assert!(!pdu.is_empty() && pdu.len() <= MAX_PDU);
                         let (f, back) = Response::parse(&pdu).unwrap();
                         assert_eq!(f, function & !function::EXCEPTION_FLAG);

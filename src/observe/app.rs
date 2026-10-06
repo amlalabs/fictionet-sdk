@@ -407,19 +407,13 @@ const MODBUS_PORT: u16 = crate::stdlib::modbus::PORT;
 /// this direction goes to the server. Returns false if the stream is not
 /// Modbus, so the conversation stops decoding it.
 fn modbus_stream(dir: &mut Dir, request: bool, place: Place, d: &mut Decoded) -> bool {
-    use crate::stdlib::codec::Stream;
-    use crate::stdlib::modbus::{Frames, Request, Response};
-    let mut stream = Stream::new(Frames);
-    let mut pushed = 0usize;
+    use crate::stdlib::modbus::{Frame, Request, Response};
     loop {
-        let accepted = stream.push(dir.buf.get(pushed..).unwrap_or_default());
-        pushed = pushed.saturating_add(accepted);
-        let (frame, used) = match stream.with_next(|frame, raw, _| (frame, raw.len())) {
-            Some(Ok(frame)) => frame,
-            None => return true,
-            Some(Err(_)) => return false,
+        let (frame, used) = match Frame::parse(&dir.buf) {
+            Ok(Some(f)) => f,
+            Ok(None) => return true,
+            Err(_) => return false,
         };
-        pushed = pushed.saturating_sub(used);
         let (buf, base) = place.locate(d, dir.start, &dir.buf[..used], "Modbus/TCP frame");
         let mut l = Layer::new("Modbus/TCP", buf, (base, base + used));
         l.field("Transaction identifier", frame.transaction.to_string(), (base, base + 2));

@@ -19,7 +19,7 @@
 //! [`Packets`] implements [`super::codec::Decode`] for a caller-owned input
 //! buffer. Use [`super::codec::Stream`] to drive it with bounded storage
 //! and EOF handling. [`Packet`] implements [`Wire`] for exact parsing and
-//! transactional writing. Its inherent `parse` still reads one prefix.
+//! transactional writing. Its inherent `parse` reads one prefix.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A stream that breaks the format gives a [`TpktError`], and a
@@ -469,7 +469,6 @@ mod tests {
             cotp::over_tpkt::tpdu(&packet),
             Ok(Tpdu::Data(Data { eot: true, number: 0, data: vec![] }))
         );
-        assert_eq!(cotp::over_tpkt::from_tpdu(&cotp::over_tpkt::tpdu(&packet).unwrap()), Ok(packet.clone()));
         assert_eq!(cotp::over_tpkt::from_tpdu(&cotp::over_tpkt::tpdu(&packet).unwrap()), Ok(packet));
     }
 
@@ -577,7 +576,7 @@ mod tests {
     // A TPDU too big for one packet, or with a field wider than its format,
     // is refused rather than cut or masked into a different TPDU.
     #[test]
-    fn try_from_tpdu_refuses_lossy_tpdus() {
+    fn from_tpdu_refuses_lossy_tpdus() {
         let data = |n: usize, number: u8| Tpdu::Data(Data { eot: true, number, data: vec![0x41; n] });
         // The longest data a data TPDU in one packet carries: 3 header bytes.
         let fits = data(MAX_PAYLOAD - 3, 0);
@@ -610,8 +609,8 @@ mod tests {
             connect(&|c| c.variable = cotp::Variable::Raw(vec![0; 249])),
             Err(EncodeError::Unrepresentable)
         );
-        // Raw bytes that happen to split into parameters, as RDP writes, are
-        // the same bytes on the wire, so they are fine.
+        // Strict conversion refuses Raw bytes that read back as parameters,
+        // including empty Raw. Use Variable::parse to choose the wire form.
         assert!(connect(&|c| c.variable = cotp::Variable::Raw(vec![0xc1, 1, 9])).is_err());
         assert!(connect(&|c| c.variable = cotp::Variable::Raw(vec![1; 248])).is_ok());
         assert!(connect(&|c| c.variable = cotp::Variable::Raw(vec![])).is_err());
@@ -730,7 +729,6 @@ mod tests {
             }
             let limit = [MAX_PACKET, 7, 20, 64, 1000][rng.below(5) as usize];
             let whole = split(&data, limit);
-            assert_eq!(split(&data, limit), whole);
             for p in &whole.0 {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
                 let bytes = p.to_bytes().unwrap();

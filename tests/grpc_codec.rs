@@ -109,7 +109,7 @@ fn route(chunk_size: usize) {
 
     for (key, items) in &results {
         for message in items.iter().flatten() {
-            // The existing writer round-trips through the new decoder bytewise.
+            // The writer round-trips through the decoder bytewise.
             let bytes = message.to_bytes().unwrap();
             let mut stream = Stream::new(Messages::with_limit(MESSAGE_LIMIT));
             let mut decoded = Vec::new();
