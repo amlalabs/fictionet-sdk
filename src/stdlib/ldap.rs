@@ -3956,6 +3956,47 @@ mod tests {
         text
     }
 
+    /// Mixes LDAP text with arbitrary bytes to cover escaping and binary values.
+    fn filter_value(g: &mut Lcg, max: usize) -> Vec<u8> {
+        if g.coin() {
+            value_text(g, max).into_bytes()
+        } else {
+            g.bytes(max)
+        }
+    }
+
+    #[test]
+    fn generated_text_covers_ldap_escape_characters() {
+        let mut g = Lcg::new(0x1da9);
+        let mut dn_chars = String::new();
+        let mut filter_chars = String::new();
+        for _ in 0..1024 {
+            let text = value_text(&mut g, 6);
+            dn_chars.push_str(&text);
+            let dn = Dn(vec![Rdn(vec![Ava {
+                attribute: "cn".into(),
+                value: AttributeValue::Text(text),
+            }])]);
+            assert_eq!(Dn::parse(&dn.to_text().unwrap()), Ok(dn));
+
+            let value = filter_value(&mut g, 6);
+            if let Ok(text) = std::str::from_utf8(&value) {
+                filter_chars.push_str(text);
+            }
+            let filter = Filter::Equal {
+                attribute: "cn".into(),
+                value,
+            };
+            assert_eq!(Filter::parse_text(&filter.to_text().unwrap()), Ok(filter));
+        }
+        for ch in [
+            '\\', '\0', 'é', '*', '(', ')', '"', ',', '+', '<', '>', ';', '=', '#',
+        ] {
+            assert!(dn_chars.contains(ch), "DN generator missed {ch:?}");
+            assert!(filter_chars.contains(ch), "filter generator missed {ch:?}");
+        }
+    }
+
     /// A filter text can write: names that are names, no empty initial or
     /// final parts, no extension choices.
     fn make_filter(g: &mut Lcg, depth: usize) -> Filter {
@@ -3967,7 +4008,7 @@ mod tests {
             2 => Filter::Not(Box::new(make_filter(g, depth + 1))),
             3 => Filter::Equal {
                 attribute: attribute_name(g),
-                value: g.bytes(6),
+                value: filter_value(g, 6),
             },
             4 => {
                 let initial = if g.coin() {
@@ -3988,22 +4029,22 @@ mod tests {
                 Filter::Substrings {
                     attribute: attribute_name(g),
                     initial,
-                    any: (0..n).map(|_| g.bytes(3)).collect(),
+                    any: (0..n).map(|_| filter_value(g, 3)).collect(),
                     last,
                 }
             }
             5 => Filter::GreaterOrEqual {
                 attribute: attribute_name(g),
-                value: g.bytes(6),
+                value: filter_value(g, 6),
             },
             6 => Filter::LessOrEqual {
                 attribute: attribute_name(g),
-                value: g.bytes(6),
+                value: filter_value(g, 6),
             },
             7 => Filter::Present(attribute_name(g)),
             8 => Filter::Approx {
                 attribute: attribute_name(g),
-                value: g.bytes(6),
+                value: filter_value(g, 6),
             },
             _ => {
                 let rule = if g.coin() {
@@ -4019,7 +4060,7 @@ mod tests {
                 Filter::Extensible {
                     rule,
                     attribute,
-                    value: g.bytes(6),
+                    value: filter_value(g, 6),
                     dn_attributes: g.coin(),
                 }
             }
@@ -4252,7 +4293,8 @@ mod tests {
             mutate(&mut g, &mut tf);
             check_text(&String::from_utf8_lossy(&tf));
         }
-        // The whole stream in one pump. check_bytes covers sample chunking.
+        // Check the generated stream across chunk boundaries and at EOF.
+        contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_MESSAGE);
         let (all, err) = decode_all(Frames::new, &stream);
         assert_eq!(all.len(), ROUNDS);
         assert_eq!(err, None);

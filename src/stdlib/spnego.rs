@@ -27,6 +27,8 @@
 //! Every reader checks lengths and nesting, because the agent can send any
 //! bytes it likes. Tokens are read as BER and written as DER. A token is at
 //! most [`MAX_TOKEN`] bytes and offers at most [`MAX_MECHS`] mechanisms.
+//! [`Wire::parse`] refuses a received hintAddress with [`Error::HintAddress`].
+//! A world playing an HTTP or SMB server cannot read such a negotiation token.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -108,8 +110,8 @@ pub enum Error {
     MissingMechTypes,
     /// A negState outside the four RFC 4178 defines.
     NegState(i64),
-    /// A writer was given a hintAddress. \[MS-SPNG\] 2.2.1 says a sender
-    /// must leave it out, even an empty one; a reader still reads one.
+    /// A received or written token has a hintAddress. \[MS-SPNG\] 2.2.1
+    /// says a sender must leave it out, even an empty one.
     HintAddress,
 }
 

@@ -1075,7 +1075,9 @@ impl Message {
 
     /// Reads one message under `rules`. [`Rules::Ber`] also takes the
     /// indefinite lengths and split strings some older implementations
-    /// send.
+    /// send. This reader stays lenient: it does not check the DER output.
+    /// A value read near [`MAX_MESSAGE`] may grow past it when written.
+    /// [`Wire::parse`] checks that the DER output fits.
     pub fn parse_with(b: &[u8], rules: Rules) -> Result<Message, Error> {
         whole(b, rules, |r| {
             let tag = r.peek()?.tag();
