@@ -27,7 +27,8 @@
 //!
 //! Nothing here reads a socket or decrypts anything. A world that plays a
 //! DTLS server takes each datagram it receives, reads it with
-//! [`Datagram::parse`], passes handshake fragments to a [`Reassembler`] and
+//! [`Datagram::read`] and its negotiated CID length, passes handshake
+//! fragments to a [`Reassembler`] and
 //! decides what to answer. Protected records keep their bytes as they
 //! came; keys and ciphers are up to world code.
 //!
@@ -61,12 +62,12 @@
 //!     connection_id: vec![],
 //!     fragment: message.to_bytes().unwrap(),
 //! };
-//! let datagram = Record::<0>::Plain(record).to_bytes().unwrap();
+//! let datagram = Record::Plain(record).datagram(0).unwrap().to_bytes().unwrap();
 //! // A 13-byte record header, a 12-byte handshake header, a 42-byte body.
 //! assert_eq!(datagram.len(), 13 + 12 + 42);
 //!
 //! // The server reads the datagram and puts the message back together.
-//! let records = Datagram::<0>::parse(&datagram).unwrap().0;
+//! let records = Datagram::read(&datagram, 0).unwrap();
 //! let Record::Plain(record) = &records[0] else { panic!("a plain record") };
 //! assert_eq!(record.content_type, ContentType::HANDSHAKE);
 //! let mut reassembler = Reassembler::new();
@@ -110,8 +111,11 @@ pub const MAX_UNIFIED_PAYLOAD: usize = 16384 + 256;
 pub const MAX_CID_LEN: usize = 255;
 /// The largest 48-bit sequence number a 13-byte header can carry.
 pub const MAX_SEQUENCE: u64 = (1 << 48) - 1;
-/// The most records [`Datagram::parse`] reads from one datagram.
+/// The most records [`Datagram::read`] reads from one datagram.
 pub const MAX_RECORDS_PER_DATAGRAM: usize = 256;
+/// The largest encoded datagram under the record count and size limits.
+/// A world must also enforce the size of its UDP transport.
+pub const MAX_DATAGRAM_LEN: usize = MAX_RECORDS_PER_DATAGRAM * (RECORD_HEADER_LEN + MAX_CID_LEN + MAX_PLAIN_FRAGMENT);
 /// The most handshake fragments [`Fragments::parse`] reads from one
 /// record.
 pub const MAX_FRAGMENTS_PER_RECORD: usize = 2048;
@@ -307,7 +311,7 @@ pub struct PlainRecord {
     pub sequence: u64,
     /// The connection ID. Only records of type [`ContentType::TLS12_CID`]
     /// carry one. Other types refuse a nonempty ID. Its length is not on
-    /// the wire. The writer refuses a length different from `CID_LEN`,
+    /// the wire. The writer refuses a length different from the selected CID length,
     /// whose maximum is [`MAX_CID_LEN`].
     pub connection_id: Vec<u8>,
     /// The record's payload: plaintext in epoch 0, and protected bytes
@@ -346,8 +350,8 @@ pub struct UnifiedRecord {
     /// The low two bits of the epoch. The writer refuses values above 3.
     pub epoch_bits: u8,
     /// The connection ID, if the header carries one. Its length is not on
-    /// the wire. Readers use the `CID_LEN` const parameter. The writer
-    /// refuses a length different from `CID_LEN` or above [`MAX_CID_LEN`].
+    /// the wire. Readers use the the selected CID length const parameter. The writer
+    /// refuses a length different from the selected CID length or above [`MAX_CID_LEN`].
     pub connection_id: Option<Vec<u8>>,
     /// The sequence number's low bits.
     pub sequence: Sequence,
@@ -361,7 +365,7 @@ pub struct UnifiedRecord {
 
 /// One DTLS record, with either header.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Record<const CID_LEN: u8 = 0> {
+pub enum Record {
     /// A record with the 13-byte header.
     Plain(PlainRecord),
     /// A DTLS 1.3 record with the unified header.
@@ -374,7 +378,6 @@ pub enum Record<const CID_LEN: u8 = 0> {
 pub enum RecordError {
     /// Bytes follow the complete record.
     Trailing,
-
     /// The value cannot be written without changing it.
     Unwritable,
     /// There were no bytes.
@@ -408,18 +411,18 @@ impl std::fmt::Display for RecordError {
 
 impl std::error::Error for RecordError {}
 
-impl<const CID_LEN: u8> Record<CID_LEN> {
+impl Record {
     /// Reads the record at the start of `b` and says how many bytes it
-    /// took. `CID_LEN` is the length of the connection IDs this end
+    /// took. `cid_len` is the length of the connection IDs this end
     /// chose, 0 if it uses none. A unified header without a length takes
     /// every byte left.
-    fn parse_prefix(b: &[u8]) -> Result<(Self, usize), RecordError> {
+    fn parse_prefix(b: &[u8], cid_len: u8) -> Result<(Self, usize), RecordError> {
         let Some(&first) = b.first() else { return Err(RecordError::Empty) };
         let mut r = Reader::new(b);
         if first & unified_bits::FIXED_MASK == unified_bits::FIXED {
             r.u8()?;
             let connection_id =
-                if first & unified_bits::CID != 0 { Some(r.take(usize::from(CID_LEN))?.to_vec()) } else { None };
+                if first & unified_bits::CID != 0 { Some(r.take(usize::from(cid_len))?.to_vec()) } else { None };
             let sequence =
                 if first & unified_bits::SEQ16 != 0 { Sequence::Long(r.u16()?) } else { Sequence::Short(r.u8()?) };
             let has_length = first & unified_bits::LENGTH != 0;
@@ -451,7 +454,7 @@ impl<const CID_LEN: u8> Record<CID_LEN> {
         let epoch = r.u16()?;
         let sequence = r.u48()?;
         let connection_id =
-            if content_type == ContentType::TLS12_CID { r.take(usize::from(CID_LEN))?.to_vec() } else { Vec::new() };
+            if content_type == ContentType::TLS12_CID { r.take(usize::from(cid_len))?.to_vec() } else { Vec::new() };
         let len = usize::from(r.u16()?);
         if len > plain_limit(epoch) {
             return Err(RecordError::Length(len));
@@ -462,41 +465,73 @@ impl<const CID_LEN: u8> Record<CID_LEN> {
     }
 }
 
-/// Records carried by one datagram, with the session's connection ID length.
+/// The bytes of one DTLS datagram. Record boundaries need the negotiated
+/// connection ID length, which is supplied to [`Datagram::read`].
+/// [`Datagram::new`] checks and assembles records using that same length.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Datagram<const CID_LEN: u8 = 0>(
-    /// Records in datagram order.
-    pub Vec<Record<CID_LEN>>,
+pub struct Datagram(
+    /// Datagram bytes, bounded by [`MAX_DATAGRAM_LEN`].
+    pub Vec<u8>,
 );
 
-impl<const CID_LEN: u8> Wire for Datagram<CID_LEN> {
-    type ParseError = RecordError;
-    type WriteError = RecordError;
+impl Datagram {
+    /// Builds a datagram from records with the endpoint's `cid_len`.
+    /// Refuses mismatched IDs, oversized fields or counts, and a record
+    /// after a unified record without a length. No record is cut or padded.
+    pub fn new(records: &[Record], cid_len: u8) -> Result<Self, RecordError> {
+        if records.len() > MAX_RECORDS_PER_DATAGRAM {
+            return Err(RecordError::Unwritable);
+        }
+        let mut out = Vec::new();
+        for (i, record) in records.iter().enumerate() {
+            if matches!(record, Record::Unified(u) if !u.has_length) && i + 1 != records.len() {
+                return Err(RecordError::Unwritable);
+            }
+            record.append(&mut out, cid_len)?;
+        }
+        Ok(Self(out))
+    }
 
-    /// Reads all records. Refuses malformed records and more than the named record limit.
-    fn parse(b: &[u8]) -> Result<Self, RecordError> {
+    /// Reads all records with the connection ID length chosen by this endpoint.
+    /// Refuses malformed records and more than [`MAX_RECORDS_PER_DATAGRAM`]
+    /// records. An empty datagram contains no records. A unified record
+    /// without a length consumes the rest of the datagram.
+    pub fn read(b: &[u8], cid_len: u8) -> Result<Vec<Record>, RecordError> {
         let mut records = Vec::new();
         let mut at = 0;
         while at < b.len() {
-            if records.len() == MAX_RECORDS_PER_DATAGRAM { return Err(RecordError::TooManyRecords); }
-            let (record, used) = Record::<CID_LEN>::parse_prefix(&b[at..])?;
+            if records.len() == MAX_RECORDS_PER_DATAGRAM {
+                return Err(RecordError::TooManyRecords);
+            }
+            let (record, used) = Record::parse_prefix(&b[at..], cid_len)?;
             records.push(record);
             at += used;
         }
-        Ok(Self(records))
+        Ok(records)
+    }
+}
+
+impl Wire for Datagram {
+    type ParseError = RecordError;
+    type WriteError = RecordError;
+
+    /// Keeps datagram bytes without interpreting record boundaries.
+    /// Refuses input above [`MAX_DATAGRAM_LEN`]. Use [`Datagram::read`]
+    /// to validate records with the negotiated connection ID length.
+    fn parse(b: &[u8]) -> Result<Self, RecordError> {
+        if b.len() > MAX_DATAGRAM_LEN {
+            return Err(RecordError::Length(b.len()));
+        }
+        Ok(Self(b.to_vec()))
     }
 
-    /// Appends every record. Refuses mismatched IDs, oversized fields and a record after an open unified record.
+    /// Appends the stored bytes unchanged. Refuses values above [`MAX_DATAGRAM_LEN`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), RecordError> {
-        if self.0.len() > MAX_RECORDS_PER_DATAGRAM { return Err(RecordError::Unwritable); }
-        let mut out = Vec::new();
-        for (i, record) in self.0.iter().enumerate() {
-            if matches!(record, Record::Unified(u) if !u.has_length) && i + 1 != self.0.len() {
-                return Err(RecordError::Unwritable);
-            }
-            record.write(&mut out)?;
+        if self.0.len() > MAX_DATAGRAM_LEN {
+            return Err(RecordError::Unwritable);
         }
-        commit_record(dst, &out)
+        dst.extend_from_slice(&self.0);
+        Ok(())
     }
 }
 
@@ -610,7 +645,9 @@ pub struct Handshake {
 impl Handshake {
     /// One fragment that covers the whole message.
     pub fn to_fragment(&self) -> Result<Fragment, HandshakeError> {
-        if self.body.len() > MAX_MESSAGE_LEN { return Err(HandshakeError::Unwritable); }
+        if self.body.len() > MAX_MESSAGE_LEN {
+            return Err(HandshakeError::Unwritable);
+        }
         let body = &self.body;
         Ok(Fragment {
             msg_type: self.msg_type,
@@ -625,7 +662,9 @@ impl Handshake {
     /// order. A `max_body` of 0 counts as 1. An empty message is one empty
     /// fragment.
     pub fn fragments(&self, max_body: usize) -> Result<Vec<Fragment>, HandshakeError> {
-        if self.body.len() > MAX_MESSAGE_LEN { return Err(HandshakeError::Unwritable); }
+        if self.body.len() > MAX_MESSAGE_LEN {
+            return Err(HandshakeError::Unwritable);
+        }
         let body = &self.body;
         if body.is_empty() {
             return Ok(vec![self.to_fragment()?]);
@@ -1091,7 +1130,9 @@ fn find_extension(extensions: Option<&[Extension]>, typ: u16) -> Option<&[u8]> {
 
 /// Writes `b`, at most 255 bytes, behind a one-byte length.
 fn put_vec8(out: &mut Vec<u8>, b: &[u8]) -> Result<(), HandshakeError> {
-    if b.len() > 255 { return Err(HandshakeError::Unwritable); }
+    if b.len() > 255 {
+        return Err(HandshakeError::Unwritable);
+    }
     out.push(b.len() as u8);
     out.extend_from_slice(b);
     Ok(())
@@ -1170,30 +1211,39 @@ impl<'a> Reader<'a> {
     }
 }
 
-impl<const CID_LEN: u8> Wire for Record<CID_LEN> {
-    type ParseError = RecordError;
-    type WriteError = RecordError;
-
-    /// Reads one complete record. `CID_LEN` is the connection ID length
+impl Record {
+    /// Reads one complete record. `cid_len` is the connection ID length
     /// chosen by this endpoint, or zero when it uses no connection IDs.
     /// Refuses unknown content types, short or oversized payloads and trailing bytes.
     /// A unified record without a length consumes the whole input.
-    fn parse(b: &[u8]) -> Result<Self, RecordError> {
-        let (record, used) = Self::parse_prefix(b)?;
-        if used != b.len() { return Err(RecordError::Trailing); }
+    pub fn read(b: &[u8], cid_len: u8) -> Result<Self, RecordError> {
+        let (record, used) = Self::parse_prefix(b, cid_len)?;
+        if used != b.len() {
+            return Err(RecordError::Trailing);
+        }
         Ok(record)
+    }
+
+    /// Wraps this record in a datagram using the endpoint's `cid_len`.
+    /// Refuses sequence numbers wider than 48 bits, epoch bits above three,
+    /// mismatched connection ID lengths, IDs on non-CID plaintext records,
+    /// and payloads above the limits for their header and epoch.
+    pub fn datagram(&self, cid_len: u8) -> Result<Datagram, RecordError> {
+        Datagram::new(std::slice::from_ref(self), cid_len)
     }
 
     /// Appends the record. Refuses sequence numbers wider than 48 bits, epoch bits
     /// above three, wrong connection ID lengths, IDs on non-CID plaintext records,
     /// and oversized payloads. Leaves the destination unchanged on error.
-    fn write(&self, dst: &mut Vec<u8>) -> Result<(), RecordError> {
+    fn append(&self, dst: &mut Vec<u8>, cid_len: u8) -> Result<(), RecordError> {
         let mut out = Vec::new();
         match self {
             Record::Plain(p) => {
                 if p.sequence > MAX_SEQUENCE || p.fragment.len() > plain_limit(p.epoch)
-                    || if p.content_type == ContentType::TLS12_CID { p.connection_id.len() != usize::from(CID_LEN) } else { !p.connection_id.is_empty() }
-                { return Err(RecordError::Unwritable); }
+                    || if p.content_type == ContentType::TLS12_CID { p.connection_id.len() != usize::from(cid_len) } else { !p.connection_id.is_empty() }
+                {
+                    return Err(RecordError::Unwritable);
+                }
                 out.push(p.content_type.get());
                 out.extend_from_slice(&p.version.to_be_bytes());
                 out.extend_from_slice(&p.epoch.to_be_bytes());
@@ -1207,8 +1257,10 @@ impl<const CID_LEN: u8> Wire for Record<CID_LEN> {
             }
             Record::Unified(u) => {
                 if u.epoch_bits > unified_bits::EPOCH_MASK || u.payload.len() > MAX_UNIFIED_PAYLOAD
-                    || u.connection_id.as_ref().is_some_and(|id| id.len() != usize::from(CID_LEN))
-                { return Err(RecordError::Unwritable); }
+                    || u.connection_id.as_ref().is_some_and(|id| id.len() != usize::from(cid_len))
+                {
+                    return Err(RecordError::Unwritable);
+                }
                 let has_length = u.has_length;
                 let mut first = unified_bits::FIXED | (u.epoch_bits & unified_bits::EPOCH_MASK);
                 if u.connection_id.is_some() {
@@ -1235,7 +1287,8 @@ impl<const CID_LEN: u8> Wire for Record<CID_LEN> {
                 out.extend_from_slice(payload);
             }
         }
-        commit_record(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1246,14 +1299,18 @@ impl Wire for Fragment {
     /// Reads one fragment. Refuses malformed ranges, oversized messages and trailing bytes.
     fn parse(b: &[u8]) -> Result<Fragment, HandshakeError> {
         let (fragment, used) = Self::parse_prefix(b)?;
-        if used != b.len() { return Err(HandshakeError::Trailing); }
+        if used != b.len() {
+            return Err(HandshakeError::Trailing);
+        }
         Ok(fragment)
     }
 
     /// Appends the complete fragment. Refuses messages above [`MAX_MESSAGE_LEN`] and
     /// fragment ranges outside their declared message. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
-        if self.length as usize > MAX_MESSAGE_LEN || self.offset > self.length || self.body.len() > (self.length - self.offset) as usize { return Err(HandshakeError::Unwritable); }
+        if self.length as usize > MAX_MESSAGE_LEN || self.offset > self.length || self.body.len() > (self.length - self.offset) as usize {
+            return Err(HandshakeError::Unwritable);
+        }
         let length = self.length;
         let offset = self.offset;
         let body = &self.body;
@@ -1264,7 +1321,8 @@ impl Wire for Fragment {
         out.extend_from_slice(&offset.to_be_bytes()[1..]);
         out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
         out.extend_from_slice(body);
-        commit_handshake(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1275,7 +1333,9 @@ impl Wire for Handshake {
     /// Reads one whole handshake. Refuses partial fragments and trailing bytes.
     fn parse(b: &[u8]) -> Result<Handshake, HandshakeError> {
         let fragment = Fragment::parse(b)?;
-        if !fragment.is_whole() { return Err(HandshakeError::FragmentRange); }
+        if !fragment.is_whole() {
+            return Err(HandshakeError::FragmentRange);
+        }
         Ok(Self { msg_type: fragment.msg_type, message_seq: fragment.message_seq, body: fragment.body })
     }
 
@@ -1315,7 +1375,9 @@ impl Wire for ClientHello {
     /// suite and compression lists, duplicate extensions and oversized extension blocks.
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
-        if self.session_id.len() > MAX_SESSION_ID { return Err(HandshakeError::Unwritable); }
+        if self.session_id.len() > MAX_SESSION_ID {
+            return Err(HandshakeError::Unwritable);
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.random);
@@ -1333,7 +1395,8 @@ impl Wire for ClientHello {
         let methods = &self.compression_methods;
         put_vec8(&mut out, methods)?;
         put_extensions(&mut out, self.extensions.as_deref())?;
-        commit_handshake(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1357,7 +1420,9 @@ impl Wire for ServerHello {
     /// Appends the hello body. Refuses oversized session IDs, duplicate extensions and
     /// oversized extension blocks. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
-        if self.session_id.len() > MAX_SESSION_ID { return Err(HandshakeError::Unwritable); }
+        if self.session_id.len() > MAX_SESSION_ID {
+            return Err(HandshakeError::Unwritable);
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&self.version.to_be_bytes());
         out.extend_from_slice(&self.random);
@@ -1365,7 +1430,8 @@ impl Wire for ServerHello {
         out.extend_from_slice(&self.cipher_suite.to_be_bytes());
         out.push(self.compression_method);
         put_extensions(&mut out, self.extensions.as_deref())?;
-        commit_handshake(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1390,7 +1456,8 @@ impl Wire for HelloVerifyRequest {
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
         let mut out = self.version.to_be_bytes().to_vec();
         put_vec8(&mut out, &self.cookie)?;
-        commit_handshake(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1423,27 +1490,14 @@ impl Wire for Fragments {
     /// Appends every fragment. Refuses invalid values and more than [`MAX_FRAGMENTS_PER_RECORD`].
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
-        if self.0.len() > MAX_FRAGMENTS_PER_RECORD { return Err(HandshakeError::Unwritable); }
+        if self.0.len() > MAX_FRAGMENTS_PER_RECORD {
+            return Err(HandshakeError::Unwritable);
+        }
         let mut out = Vec::new();
         for fragment in &self.0 { fragment.write(&mut out)?; }
-        commit_handshake(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit_handshake(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), HandshakeError> {
-    dst.try_reserve(out.len())
-        .map_err(|_| HandshakeError::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit_record(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), RecordError> {
-    dst.try_reserve(out.len())
-        .map_err(|_| RecordError::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1480,22 +1534,22 @@ mod tests {
 
     #[test]
     fn plain_record() {
-        let r = Record::<0>::parse(&PLAIN).unwrap();
-        assert_eq!(r.to_bytes().unwrap().len(), 16);
+        let r = Record::read(&PLAIN, 0).unwrap();
+        assert_eq!(r.datagram(0).unwrap().to_bytes().unwrap().len(), 16);
         let Record::Plain(p) = &r else { panic!() };
         assert_eq!(p.content_type, ContentType::HANDSHAKE);
         assert_eq!((p.version, p.epoch, p.sequence), (version::DTLS_1_2, 1, 5));
         assert_eq!(p.fragment, [0xaa, 0xbb, 0xcc]);
         assert!(p.connection_id.is_empty());
-        assert_eq!(r.to_bytes().unwrap(), PLAIN);
-        // Bytes after the record are left for the next one.
+        assert_eq!(r.datagram(0).unwrap().to_bytes().unwrap(), PLAIN);
+        // The one-record reader refuses a second record.
         let mut two = PLAIN.to_vec();
         two.extend_from_slice(&PLAIN);
-        assert_eq!(Record::<0>::parse(&two), Err(RecordError::Trailing));
+        assert_eq!(Record::read(&two, 0), Err(RecordError::Trailing));
         // The full 48-bit sequence number.
         let mut b = PLAIN;
         b[5..11].copy_from_slice(&[0xff; 6]);
-        let Record::Plain(p) = Record::<0>::parse(&b).unwrap() else { panic!() };
+        let Record::Plain(p) = Record::read(&b, 0).unwrap() else { panic!() };
         assert_eq!(p.sequence, MAX_SEQUENCE);
     }
 
@@ -1504,15 +1558,15 @@ mod tests {
         // RFC 9146: the connection ID sits between the sequence number and
         // the length.
         let b = [25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 9, 0x11, 0x22, 0, 1, 0x55];
-        let r = Record::<2>::parse(&b).unwrap();
-        assert_eq!(r.to_bytes().unwrap().len(), b.len());
+        let r = Record::read(&b, 2).unwrap();
+        assert_eq!(r.datagram(2).unwrap().to_bytes().unwrap().len(), b.len());
         let Record::Plain(p) = &r else { panic!() };
         assert_eq!(p.content_type, ContentType::TLS12_CID);
         assert_eq!(p.connection_id, [0x11, 0x22]);
         assert_eq!(p.fragment, [0x55]);
-        assert_eq!(r.to_bytes().unwrap(), b);
+        assert_eq!(r.datagram(2).unwrap().to_bytes().unwrap(), b);
         // Other types carry no connection ID, whatever its length.
-        assert_eq!(Record::<2>::parse(&PLAIN).unwrap().to_bytes().unwrap().len(), 16);
+        assert_eq!(Record::read(&PLAIN, 2).unwrap().datagram(2).unwrap().to_bytes().unwrap().len(), 16);
     }
 
     #[test]
@@ -1520,9 +1574,9 @@ mod tests {
         // 0x2c: fixed bits 001, no connection ID, 16-bit sequence, a
         // length, epoch bits 0 (RFC 9147, section 4).
         let b = [0x2c, 0x01, 0x02, 0x00, 0x02, 0xde, 0xad, 0xff];
-        assert_eq!(Record::<0>::parse(&b), Err(RecordError::Trailing));
-        let r = Record::<0>::parse(&b[..7]).unwrap();
-        assert_eq!(r.to_bytes().unwrap().len(), 7);
+        assert_eq!(Record::read(&b, 0), Err(RecordError::Trailing));
+        let r = Record::read(&b[..7], 0).unwrap();
+        assert_eq!(r.datagram(0).unwrap().to_bytes().unwrap().len(), 7);
         assert_eq!(
             r,
             Record::Unified(UnifiedRecord {
@@ -1533,63 +1587,63 @@ mod tests {
                 payload: vec![0xde, 0xad],
             })
         );
-        assert_eq!(r.to_bytes().unwrap(), b[..7]);
+        assert_eq!(r.datagram(0).unwrap().to_bytes().unwrap(), b[..7]);
         // 0x33: a connection ID, an 8-bit sequence, no length, epoch bits 3.
         // The record runs to the end of the datagram.
         let b = [0x33, 0xa1, 0xa2, 0xa3, 0x07, 1, 2, 3, 4];
-        let r = Record::<3>::parse(&b).unwrap();
-        assert_eq!(r.to_bytes().unwrap().len(), b.len());
+        let r = Record::read(&b, 3).unwrap();
+        assert_eq!(r.datagram(3).unwrap().to_bytes().unwrap().len(), b.len());
         let Record::Unified(u) = &r else { panic!() };
         assert_eq!(u.epoch_bits, 3);
         assert_eq!(u.connection_id.as_deref(), Some(&[0xa1, 0xa2, 0xa3][..]));
         assert_eq!(u.sequence, Sequence::Short(7));
         assert!(!u.has_length);
         assert_eq!(u.payload, [1, 2, 3, 4]);
-        assert_eq!(r.to_bytes().unwrap(), b);
+        assert_eq!(r.datagram(3).unwrap().to_bytes().unwrap(), b);
         // The top three bits decide: 0x3f is unified, 0x40 is neither.
-        assert!(matches!(Record::<0>::parse(&[0x3f, 0, 0, 0, 0]), Ok(Record::Unified(_))));
-        assert_eq!(Record::<0>::parse(&[0x40, 0, 0]), Err(RecordError::ContentType(0x40)));
+        assert!(matches!(Record::read(&[0x3f, 0, 0, 0, 0], 0), Ok(Record::Unified(_))));
+        assert_eq!(Record::read(&[0x40, 0, 0], 0), Err(RecordError::ContentType(0x40)));
     }
 
     #[test]
     fn record_errors() {
-        assert_eq!(Record::<0>::parse(&[]), Err(RecordError::Empty));
-        assert_eq!(Record::<0>::parse(&[19, 0xfe, 0xfd]), Err(RecordError::ContentType(19)));
-        assert_eq!(Record::<0>::parse(&[0xff]), Err(RecordError::ContentType(0xff)));
+        assert_eq!(Record::read(&[], 0), Err(RecordError::Empty));
+        assert_eq!(Record::read(&[19, 0xfe, 0xfd], 0), Err(RecordError::ContentType(19)));
+        assert_eq!(Record::read(&[0xff], 0), Err(RecordError::ContentType(0xff)));
         // Every prefix of a plain record ends inside it.
         for n in 1..PLAIN.len() {
-            assert_eq!(Record::<0>::parse(&PLAIN[..n]), Err(RecordError::Truncated), "{n} bytes");
+            assert_eq!(Record::read(&PLAIN[..n], 0), Err(RecordError::Truncated), "{n} bytes");
         }
         let cid = [25, 0xfe, 0xfd, 0, 1, 0, 0, 0, 0, 0, 9, 0x11, 0x22, 0, 1, 0x55];
         for n in 1..cid.len() {
-            assert_eq!(Record::<2>::parse(&cid[..n]), Err(RecordError::Truncated), "{n} bytes");
+            assert_eq!(Record::read(&cid[..n], 2), Err(RecordError::Truncated), "{n} bytes");
         }
         // Every prefix of a unified record with a length.
         let u = [0x3c, 0xaa, 0x01, 0x02, 0x00, 0x02, 0xde, 0xad];
         for n in 1..u.len() {
-            assert_eq!(Record::<1>::parse(&u[..n]), Err(RecordError::Truncated), "{n} bytes");
+            assert_eq!(Record::read(&u[..n], 1), Err(RecordError::Truncated), "{n} bytes");
         }
         // Without a length, a prefix past the sequence number still reads.
         let u = [0x30, 0xaa, 0x01, 0xde, 0xad];
-        assert_eq!(Record::<1>::parse(&u[..1]), Err(RecordError::Truncated));
-        assert_eq!(Record::<1>::parse(&u[..2]), Err(RecordError::Truncated));
-        assert!(Record::<1>::parse(&u[..3]).is_ok());
+        assert_eq!(Record::read(&u[..1], 1), Err(RecordError::Truncated));
+        assert_eq!(Record::read(&u[..2], 1), Err(RecordError::Truncated));
+        assert!(Record::read(&u[..3], 1).is_ok());
         // Lengths over the limits.
         let mut b = PLAIN;
         b[11..13].copy_from_slice(&((MAX_PLAIN_FRAGMENT + 1) as u16).to_be_bytes());
-        assert_eq!(Record::<0>::parse(&b), Err(RecordError::Length(MAX_PLAIN_FRAGMENT + 1)));
+        assert_eq!(Record::read(&b, 0), Err(RecordError::Length(MAX_PLAIN_FRAGMENT + 1)));
         let b = [0x2c, 0, 0, 0xff, 0xff];
-        assert_eq!(Record::<0>::parse(&b), Err(RecordError::Length(0xffff)));
+        assert_eq!(Record::read(&b, 0), Err(RecordError::Length(0xffff)));
         let mut b = vec![0x20, 0];
         b.extend(std::iter::repeat_n(0, MAX_UNIFIED_PAYLOAD + 1));
-        assert_eq!(Record::<0>::parse(&b), Err(RecordError::Length(MAX_UNIFIED_PAYLOAD + 1)));
+        assert_eq!(Record::read(&b, 0), Err(RecordError::Length(MAX_UNIFIED_PAYLOAD + 1)));
         b.pop();
-        assert!(Record::<0>::parse(&b).is_ok());
+        assert!(Record::read(&b, 0).is_ok());
     }
 
     #[test]
     fn datagrams() {
-        let plain = Record::<0>::parse(&PLAIN).unwrap();
+        let plain = Record::read(&PLAIN, 0).unwrap();
         let tail = Record::Unified(UnifiedRecord {
             epoch_bits: 2,
             connection_id: None,
@@ -1601,26 +1655,25 @@ mod tests {
         framed.has_length = true;
         let framed = Record::Unified(framed);
         let records = vec![plain.clone(), framed.clone(), plain.clone(), tail.clone()];
-        let bytes = Datagram::<0>(records.to_vec()).to_bytes().unwrap();
-        let back = Datagram::<0>::parse(&bytes).map(|d| d.0).unwrap();
+        let bytes = Datagram::new(&records, 0).unwrap().to_bytes().unwrap();
+        let back = Datagram::read(&bytes, 0).unwrap();
         assert_eq!(back, records);
-        assert_eq!(Datagram::<0>(back.to_vec()).to_bytes().unwrap(), bytes);
-        assert_eq!(Datagram::<0>::parse(&[]).map(|d| d.0), Ok(vec![]));
+        assert_eq!(Datagram::new(&back, 0).unwrap().to_bytes().unwrap(), bytes);
+        assert_eq!(Datagram::read(&[], 0), Ok(vec![]));
         // An error anywhere fails the datagram.
         let mut bad = PLAIN.to_vec();
         bad.push(0x99);
-        assert_eq!(Datagram::<0>::parse(&bad).map(|d| d.0), Err(RecordError::ContentType(0x99)));
+        assert_eq!(Datagram::read(&bad, 0), Err(RecordError::ContentType(0x99)));
         bad.pop();
         bad.extend_from_slice(&PLAIN[..5]);
-        assert_eq!(Datagram::<0>::parse(&bad).map(|d| d.0), Err(RecordError::Truncated));
+        assert_eq!(Datagram::read(&bad, 0), Err(RecordError::Truncated));
         // Too many records.
         let empty = [0x2c, 0, 0, 0, 0];
         let many: Vec<u8> = empty.iter().copied().cycle().take(5 * (MAX_RECORDS_PER_DATAGRAM + 1)).collect();
-        assert_eq!(Datagram::<0>::parse(&many).map(|d| d.0), Err(RecordError::TooManyRecords));
-        assert_eq!(Datagram::<0>::parse(&many[5..]).map(|d| d.0).unwrap().len(), MAX_RECORDS_PER_DATAGRAM);
-        let many = Datagram::<0>(vec![plain; MAX_RECORDS_PER_DATAGRAM + 5]);
-        contract::check_wire_value(&many);
-        assert_eq!(many.to_bytes(), Err(RecordError::Unwritable));
+        assert_eq!(Datagram::read(&many, 0), Err(RecordError::TooManyRecords));
+        assert_eq!(Datagram::read(&many[5..], 0).unwrap().len(), MAX_RECORDS_PER_DATAGRAM);
+        let many = Datagram::new(&vec![plain; MAX_RECORDS_PER_DATAGRAM + 5], 0);
+        assert_eq!(many, Err(RecordError::Unwritable));
     }
 
     #[test]
@@ -1885,7 +1938,7 @@ mod tests {
         let m = Handshake { msg_type: 1, message_seq: 0, body: ch.to_bytes().unwrap() };
         let mut r = Reassembler::new();
         for f in m.fragments(MAX_PLAINTEXT - HANDSHAKE_HEADER_LEN).unwrap() {
-            let rec = Record::<0>::Plain(PlainRecord {
+            let rec = Record::Plain(PlainRecord {
                 content_type: ContentType::HANDSHAKE,
                 version: version::DTLS_1_2,
                 epoch: 0,
@@ -1893,7 +1946,7 @@ mod tests {
                 connection_id: vec![],
                 fragment: f.to_bytes().unwrap(),
             });
-            let Record::Plain(p) = Record::<0>::parse(&rec.to_bytes().unwrap()).unwrap() else { panic!() };
+            let Record::Plain(p) = Record::read(&rec.datagram(0).unwrap().to_bytes().unwrap(), 0).unwrap() else { panic!() };
             for f in Fragments::parse(&p.fragment).unwrap().0 {
                 assert_eq!(r.add(&f), Ok(Added::New));
             }
@@ -1914,7 +1967,7 @@ mod tests {
         contract::check_wire_value(&h);
         assert_eq!(h.to_bytes(), Err(HandshakeError::Unwritable));
 
-        let p = Record::<0>::Plain(PlainRecord {
+        let p = Record::Plain(PlainRecord {
             content_type: ContentType::TLS12_CID,
             version: 0,
             epoch: 0,
@@ -1922,17 +1975,15 @@ mod tests {
             connection_id: vec![1; 300],
             fragment: vec![0; 70000],
         });
-        contract::check_wire_value(&p);
-        assert_eq!(p.to_bytes(), Err(RecordError::Unwritable));
-        let u = Record::<0>::Unified(UnifiedRecord {
+        assert_eq!(p.datagram(0), Err(RecordError::Unwritable));
+        let u = Record::Unified(UnifiedRecord {
             epoch_bits: 0xff,
             connection_id: Some(vec![1; 300]),
             sequence: Sequence::Long(9),
             has_length: false,
             payload: vec![0; 70000],
         });
-        contract::check_wire_value(&u);
-        assert_eq!(u.to_bytes(), Err(RecordError::Unwritable));
+        assert_eq!(u.datagram(0), Err(RecordError::Unwritable));
 
         let f = Fragment { msg_type: 1, length: u32::MAX, message_seq: 0, offset: u32::MAX, body: vec![1; 10] };
         contract::check_wire_value(&f);
@@ -2086,12 +2137,39 @@ mod tests {
         // data, so a writer must not add a length to it. A record without
         // one ends the datagram, so later records make the value unwritable.
         let open = unified(None, false, vec![9; 20]);
-        let plain = Record::<0>::parse(&PLAIN).unwrap();
-        let invalid = Datagram::<0>(vec![plain.clone(), open.clone(), plain.clone()]);
-        contract::check_wire_value(&invalid);
-        assert_eq!(invalid.to_bytes(), Err(RecordError::Unwritable));
-        let valid = Datagram::<0>(vec![plain, open]);
+        let plain = Record::read(&PLAIN, 0).unwrap();
+        let invalid = Datagram::new(&[plain.clone(), open.clone(), plain.clone()], 0);
+        assert_eq!(invalid, Err(RecordError::Unwritable));
+        let valid = Datagram::new(&[plain, open], 0).unwrap();
         contract::check_wire_value(&valid);
+    }
+
+    #[test]
+    fn datagram_bytes_obey_the_size_limit() {
+        let bytes = vec![0; MAX_DATAGRAM_LEN + 1];
+        assert_eq!(Datagram::parse(&bytes), Err(RecordError::Length(bytes.len())));
+        contract::check_wire::<Datagram>(&bytes);
+        let datagram = Datagram(bytes);
+        assert_eq!(datagram.to_bytes(), Err(RecordError::Unwritable));
+        contract::check_wire_value(&datagram);
+    }
+
+    #[test]
+    fn runtime_cid_lengths_round_trip() {
+        for cid_len in 0..=u8::MAX {
+            let records = [
+                cid_record(vec![0xa5; usize::from(cid_len)]),
+                unified(Some(vec![0x5a; usize::from(cid_len)]), true, vec![7; 16]),
+            ];
+            let datagram = Datagram::new(&records, cid_len).unwrap();
+            let bytes = datagram.to_bytes().unwrap();
+            assert_eq!(Datagram::read(&bytes, cid_len).unwrap(), records);
+            contract::check_wire_value(&datagram);
+            for record in records {
+                let bytes = record.datagram(cid_len).unwrap().to_bytes().unwrap();
+                assert_eq!(Record::read(&bytes, cid_len), Ok(record));
+            }
+        }
     }
 
     #[test]
@@ -2105,8 +2183,11 @@ mod tests {
             unified(Some(vec![3]), true, vec![0; 16]),
             unified(None, true, vec![0; 16]),
         ];
-        assert_eq!(Datagram::<0>(records.to_vec()).to_bytes(), Err(RecordError::Unwritable));
-        for record in records { contract::check_wire_value(&record); }
+        let selected = [records[0].clone(), records[3].clone(), records[4].clone()];
+        let datagram = Datagram::new(&selected, 1).unwrap();
+        assert_eq!(Datagram::read(&datagram.to_bytes().unwrap(), 1).unwrap(), selected);
+        contract::check_wire_value(&datagram);
+        assert_eq!(Datagram::new(&records, 1), Err(RecordError::Unwritable));
     }
 
     #[test]
@@ -2121,14 +2202,13 @@ mod tests {
             b.extend(std::iter::repeat_n(0, n));
             b
         };
-        assert!(Record::<0>::parse(&record(0, MAX_PLAINTEXT)).is_ok());
-        assert_eq!(Record::<0>::parse(&record(0, MAX_PLAINTEXT + 1)), Err(RecordError::Length(MAX_PLAINTEXT + 1)));
-        assert!(Record::<0>::parse(&record(1, MAX_PLAIN_FRAGMENT)).is_ok());
-        let Ok(Record::Plain(mut p)) = Record::<0>::parse(&record(1, MAX_PLAIN_FRAGMENT)) else { panic!() };
+        assert!(Record::read(&record(0, MAX_PLAINTEXT), 0).is_ok());
+        assert_eq!(Record::read(&record(0, MAX_PLAINTEXT + 1), 0), Err(RecordError::Length(MAX_PLAINTEXT + 1)));
+        assert!(Record::read(&record(1, MAX_PLAIN_FRAGMENT), 0).is_ok());
+        let Ok(Record::Plain(mut p)) = Record::read(&record(1, MAX_PLAIN_FRAGMENT), 0) else { panic!() };
         p.epoch = 0;
-        let value = Record::<0>::Plain(p);
-        contract::check_wire_value(&value);
-        assert_eq!(value.to_bytes(), Err(RecordError::Unwritable));
+        let value = Record::Plain(p);
+        assert_eq!(value.datagram(0), Err(RecordError::Unwritable));
     }
 
     #[test]
@@ -2175,7 +2255,7 @@ mod tests {
         let mut empty_compression = b.clone();
         empty_compression.extend_from_slice(&[0, 2, 0xc0, 0x2b, 0]);
         assert_eq!(ClientHello::parse(&empty_compression), Err(HandshakeError::CompressionMethods));
-        // Writers put in the least the format allows.
+        // Writers refuse missing mandatory vectors.
         let mut ch = ClientHello::parse(&client_hello_bytes()).unwrap();
         ch.cipher_suites.clear();
         ch.compression_methods.clear();
@@ -2207,13 +2287,16 @@ mod tests {
 
     /// Checks every reader on `b`, and that what they read writes back to
     /// bytes that read the same.
-    fn check<const CID_LEN: u8>(b: &[u8]) {
-        contract::check_wire::<Record<CID_LEN>>(b);
-        contract::check_wire::<Datagram<CID_LEN>>(b);
-        if let Ok(record) = Record::<CID_LEN>::parse(b) {
-            assert_eq!(record.to_bytes().unwrap(), b);
+    fn check(b: &[u8], cid_len: u8) {
+        contract::check_wire::<Datagram>(b);
+        if let Ok(record) = Record::read(b, cid_len) {
+            let datagram = record.datagram(cid_len).unwrap();
+            contract::check_wire_value(&datagram);
+            assert_eq!(datagram.to_bytes().unwrap(), b);
         }
-        if let Ok(datagram) = Datagram::<CID_LEN>::parse(b) {
+        if let Ok(records) = Datagram::read(b, cid_len) {
+            let datagram = Datagram::new(&records, cid_len).unwrap();
+            contract::check_wire_value(&datagram);
             assert_eq!(datagram.to_bytes().unwrap(), b);
         }
         contract::check_wire::<Fragment>(b);
@@ -2289,10 +2372,13 @@ mod tests {
                     }
                 }
             }
-            if Record::<0>::parse(&b).is_ok() || Fragment::parse(&b).is_ok() {
+            if Record::read(&b, 0).is_ok() || Fragment::parse(&b).is_ok() {
                 parsed += 1;
             }
-            { check::<0>(&b); check::<1>(&b); check::<8>(&b); };
+            check(&b, 0);
+            check(&b, 1);
+            check(&b, 8);
+            check(&b, rng.next() as u8);
 
             // Random messages, split into random fragments, passed in a random
             // order with repeats, and one byte at a time, come back whole.

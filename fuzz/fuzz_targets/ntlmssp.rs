@@ -115,12 +115,7 @@ fn response(b: &[u8]) {
 /// A version built from fuzz bytes.
 fn version(u: &mut Unstructured) -> Result<Option<Version>> {
     Ok(if u.arbitrary()? {
-        Some(Version {
-            major: u.arbitrary()?,
-            minor: u.arbitrary()?,
-            build: u.arbitrary()?,
-            revision: u.arbitrary()?,
-        })
+        Some(Version { major: u.arbitrary()?, minor: u.arbitrary()?, build: u.arbitrary()?, revision: u.arbitrary()? })
     } else {
         None
     })
@@ -152,12 +147,7 @@ fn message(u: &mut Unstructured) -> Result<Message> {
     let flags: u32 = u.arbitrary()?;
     let version = version(u)?;
     Ok(match u.int_in_range(0..=2u8)? {
-        0 => Message::Negotiate(Negotiate {
-            flags,
-            domain: bytes(u, 300)?,
-            workstation: bytes(u, 300)?,
-            version,
-        }),
+        0 => Message::Negotiate(Negotiate { flags, domain: bytes(u, 300)?, workstation: bytes(u, 300)?, version }),
         1 => Message::Challenge(Challenge {
             flags,
             target_name: bytes(u, 300)?,
@@ -174,11 +164,7 @@ fn message(u: &mut Unstructured) -> Result<Message> {
             workstation: bytes(u, 300)?,
             session_key: bytes(u, 300)?,
             version,
-            mic: if u.arbitrary()? {
-                Some(u.arbitrary()?)
-            } else {
-                None
-            },
+            mic: if u.arbitrary()? { Some(u.arbitrary()?) } else { None },
         }),
     })
 }
@@ -212,9 +198,7 @@ fn built(data: &[u8]) -> Result<()> {
         Err(_) => assert!(
             list.len() > MAX_AV_PAIRS
                 || !list.iter().all(shaped)
-                || list
-                    .iter()
-                    .any(|p| p.id == av_id::EOL || p.value.len() > MAX_FIELD)
+                || list.iter().any(|p| p.id == av_id::EOL || p.value.len() > MAX_FIELD)
                 || 4 + list.iter().map(|p| 4 + p.value.len()).sum::<usize>() > MAX_FIELD
         ),
     }

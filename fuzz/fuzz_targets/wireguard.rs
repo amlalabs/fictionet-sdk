@@ -38,11 +38,7 @@ fuzz_target!(|data: &[u8]| {
     if data.len() >= 12 {
         let receiver = u32::from_le_bytes(data[..4].try_into().unwrap());
         let counter = u64::from_le_bytes(data[4..12].try_into().unwrap());
-        let d = Data {
-            receiver,
-            counter,
-            encrypted: data[12..].to_vec(),
-        };
+        let d = Data { receiver, counter, encrypted: data[12..].to_vec() };
         contract::check_wire_value(&d);
         let n = d.encrypted.len();
         match d.to_bytes() {

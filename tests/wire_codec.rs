@@ -35,7 +35,7 @@ fn complete_units_refuse_a_second_unit() {
         Err(ntlmssp::ParseError::Trailing)
     );
 
-    let record = dtls::Record::<8>::Plain(dtls::PlainRecord {
+    let record = dtls::Record::Plain(dtls::PlainRecord {
         content_type: dtls::ContentType::TLS12_CID,
         version: dtls::version::DTLS_1_2,
         epoch: 1,
@@ -43,30 +43,33 @@ fn complete_units_refuse_a_second_unit() {
         connection_id: vec![3; 8],
         fragment: vec![7; 16],
     });
-    let datagram = dtls::Datagram(vec![record.clone(), record]);
+    let datagram = dtls::Datagram::new(&[record.clone(), record.clone()], 8).unwrap();
     let bytes = datagram.to_bytes().unwrap();
-    assert_eq!(dtls::Datagram::<8>::parse(&bytes), Ok(datagram));
+    assert_eq!(dtls::Datagram::read(&bytes, 8), Ok(vec![record.clone(), record]));
+    contract::check_wire_value(&datagram);
     assert_eq!(
-        dtls::Record::<8>::parse(&bytes),
+        dtls::Record::read(&bytes, 8),
         Err(dtls::RecordError::Trailing)
     );
 }
 
 #[test]
-fn length_bearing_control_and_nat_pmp_units_refuse_trailing_bytes() {
+fn control_and_nat_pmp_units_ignore_trailing_bytes() {
     let control = l2tp::V3Control::new(1, 2, 3, &l2tp::ControlMessage::zlb()).unwrap();
     let mut bytes = control.to_bytes().unwrap();
     bytes.push(0);
-    assert_eq!(l2tp::V3Control::parse(&bytes), Err(l2tp::Error::Trailing));
+    assert_eq!(l2tp::V3Control::parse(&bytes), Ok(control));
+    contract::check_wire::<l2tp::V3Control>(&bytes);
 
     let mut bytes = pcp::NatPmpRequest::ExternalAddress.to_bytes().unwrap();
     bytes.push(0);
-    assert!(pcp::NatPmpRequest::parse(&bytes).is_err());
+    assert_eq!(pcp::NatPmpRequest::parse(&bytes), Ok(pcp::NatPmpRequest::ExternalAddress));
+    contract::check_wire::<pcp::NatPmpRequest>(&bytes);
 }
 
 #[test]
 fn nbns_reply_construction_sets_tc_before_writing() {
-    let name = nbns::Name::new("WORLD", 0x20).with_scope("EXAMPLE.TEST");
+    let name = nbns::Name::new("WORLD", 0x20).with_scope_clipped("EXAMPLE.TEST");
     let query = nbns::Packet::name_query(7, name.clone(), false);
     let owner = nbns::NbEntry {
         group: false,

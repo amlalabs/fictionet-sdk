@@ -46,12 +46,7 @@ fuzz_target!(|data: &[u8]| {
                 .map(|c| NbEntry {
                     group: c[0] & 1 != 0,
                     node_type: NodeType::from_bits(u16::from(c[0] >> 1)),
-                    address: Ipv4Addr::new(
-                        c[0],
-                        *c.get(1).unwrap_or(&0),
-                        *c.get(2).unwrap_or(&0),
-                        1,
-                    ),
+                    address: Ipv4Addr::new(c[0], *c.get(1).unwrap_or(&0), *c.get(2).unwrap_or(&0), 1),
                 })
                 .collect();
             let names: Vec<NodeName> = data
@@ -87,7 +82,7 @@ fuzz_target!(|data: &[u8]| {
     // Any text as a scope: the name keeps what the wire holds, so it reads
     // back the same.
     if let Ok(text) = std::str::from_utf8(data) {
-        let name = Name::new("W", 0x20).with_scope(text);
+        let name = Name::new("W", 0x20).with_scope_clipped(text);
         let q = Packet::name_query(1, name.clone(), false);
         assert_eq!(
             Packet::parse(&q.to_bytes().unwrap()).unwrap().questions[0].name,

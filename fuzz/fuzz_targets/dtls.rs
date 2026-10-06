@@ -12,7 +12,7 @@ use libfuzzer_sys::fuzz_target;
 
 /// Records built from the bytes, 24 at a time: plain and unified, with and
 /// without connection IDs of 0 to 3 bytes, with and without lengths.
-fn records_from<const CID_LEN: u8>(data: &[u8]) -> Vec<Record<CID_LEN>> {
+fn records_from(data: &[u8]) -> Vec<Record> {
     data.chunks(24)
         .take(MAX_RECORDS_PER_DATAGRAM)
         .map(|c| {
@@ -22,11 +22,7 @@ fn records_from<const CID_LEN: u8>(data: &[u8]) -> Vec<Record<CID_LEN>> {
             if k & 1 == 0 {
                 let with_cid = k & 2 != 0;
                 Record::Plain(PlainRecord {
-                    content_type: if with_cid {
-                        ContentType::TLS12_CID
-                    } else {
-                        ContentType::HANDSHAKE
-                    },
+                    content_type: if with_cid { ContentType::TLS12_CID } else { ContentType::HANDSHAKE },
                     version: 0xfefd,
                     epoch: u16::from(k & 4 != 0),
                     sequence: u64::from(k),
@@ -46,30 +42,36 @@ fn records_from<const CID_LEN: u8>(data: &[u8]) -> Vec<Record<CID_LEN>> {
         .collect()
 }
 
-/// Checks a selected CID length and constructed records through the strict writer.
-fn records<const CID_LEN: u8>(data: &[u8]) {
-    contract::check_wire::<Record<CID_LEN>>(data);
-    contract::check_wire::<Datagram<CID_LEN>>(data);
-    if let Ok(record) = Record::<CID_LEN>::parse(data) {
-        assert_eq!(record.to_bytes().unwrap(), data);
-    }
-    if let Ok(datagram) = Datagram::<CID_LEN>::parse(data) {
+/// Checks the runtime CID length and strict datagram construction.
+fn records(data: &[u8], cid_len: u8) {
+    if let Ok(record) = Record::read(data, cid_len) {
+        let datagram = record.datagram(cid_len).unwrap();
+        contract::check_wire_value(&datagram);
         assert_eq!(datagram.to_bytes().unwrap(), data);
     }
-    let built = records_from::<CID_LEN>(data);
-    for record in &built {
-        contract::check_wire_value(record);
+    if let Ok(records) = Datagram::read(data, cid_len) {
+        let datagram = Datagram::new(&records, cid_len).unwrap();
+        contract::check_wire_value(&datagram);
+        assert_eq!(datagram.to_bytes().unwrap(), data);
     }
-    contract::check_wire_value(&Datagram(built));
+    let built = records_from(data);
+    for record in &built {
+        if let Ok(datagram) = record.datagram(cid_len) {
+            contract::check_wire_value(&datagram);
+            assert_eq!(Record::read(&datagram.to_bytes().unwrap(), cid_len).as_ref(), Ok(record));
+        }
+    }
+    if let Ok(datagram) = Datagram::new(&built, cid_len) {
+        contract::check_wire_value(&datagram);
+        assert_eq!(Datagram::read(&datagram.to_bytes().unwrap(), cid_len), Ok(built));
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<Record<0>>(data);
-    contract::check_wire::<Record<1>>(data);
-    contract::check_wire::<Record<8>>(data);
-    contract::check_wire::<Datagram<0>>(data);
-    contract::check_wire::<Datagram<1>>(data);
-    contract::check_wire::<Datagram<8>>(data);
+    contract::check_wire::<Datagram>(data);
+    records(data, 0);
+    records(data, 1);
+    records(data, 8);
     contract::check_wire::<Fragment>(data);
     contract::check_wire::<Fragments>(data);
     contract::check_wire::<Handshake>(data);
@@ -79,46 +81,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((&cid_len, data)) = data.split_first() else {
         return;
     };
-    // Cover short, long and maximum CID lengths with concrete Wire units.
-    match cid_len {
-        0 => records::<0>(data),
-        1 => records::<1>(data),
-        2 => records::<2>(data),
-        3 => records::<3>(data),
-        4 => records::<4>(data),
-        5 => records::<5>(data),
-        6 => records::<6>(data),
-        7 => records::<7>(data),
-        8 => records::<8>(data),
-        9 => records::<9>(data),
-        10 => records::<10>(data),
-        11 => records::<11>(data),
-        12 => records::<12>(data),
-        13 => records::<13>(data),
-        14 => records::<14>(data),
-        15 => records::<15>(data),
-        16 => records::<16>(data),
-        17 => records::<17>(data),
-        18 => records::<18>(data),
-        19 => records::<19>(data),
-        20 => records::<20>(data),
-        21 => records::<21>(data),
-        22 => records::<22>(data),
-        23 => records::<23>(data),
-        24 => records::<24>(data),
-        25 => records::<25>(data),
-        26 => records::<26>(data),
-        27 => records::<27>(data),
-        28 => records::<28>(data),
-        29 => records::<29>(data),
-        30 => records::<30>(data),
-        31 => records::<31>(data),
-        32 => records::<32>(data),
-        64 => records::<64>(data),
-        128 => records::<128>(data),
-        254 => records::<254>(data),
-        _ => records::<255>(data),
-    }
+    records(data, cid_len);
 
     // The bytes as a handshake record's payload. Fragments write back the
     // same, and a reassembler takes them without holding too much. The
@@ -139,11 +102,7 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         let body = data[..data.len().min(MAX_MESSAGE_LEN)].to_vec();
-        let next = Handshake {
-            msg_type: cid_len,
-            message_seq: r.next_seq(),
-            body,
-        };
+        let next = Handshake { msg_type: cid_len, message_seq: r.next_seq(), body };
         match r.add(&next.to_fragment().unwrap()) {
             Ok(_) => assert!(r.next_message().is_some()),
             Err(e) => assert_eq!(e, ReassemblyError::Conflict),
@@ -154,11 +113,7 @@ fuzz_target!(|data: &[u8]| {
     // The bytes as a message, sent a byte at a time, come back whole.
     // Fragment constructors refuse bodies above the message limit.
     if data.len() <= MAX_MESSAGE_LEN {
-        let m = Handshake {
-            msg_type: cid_len,
-            message_seq: 0,
-            body: data.to_vec(),
-        };
+        let m = Handshake { msg_type: cid_len, message_seq: 0, body: data.to_vec() };
         let mut r = Reassembler::new();
         for f in m.fragments(1).unwrap() {
             contract::check_wire_value(&f);

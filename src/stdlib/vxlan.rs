@@ -190,7 +190,6 @@ impl std::fmt::Display for Error {
             Error::Version(v) => write!(f, "VXLAN-GPE version {v}, not 0"),
             Error::NextProtocolWithoutP(p) => write!(f, "next protocol {p} with the P flag clear"),
             Error::ReservedNextProtocol => write!(f, "next protocol 0, which is reserved, with the P flag set"),
-
         }
     }
 }
@@ -251,7 +250,7 @@ impl Wire for Packet {
     /// and frames above [`MAX_PAYLOAD`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let out = write(flags::I, 0, self.vni, &self.frame)?;
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+
         dst.extend_from_slice(&out);
         Ok(())
     }
@@ -312,7 +311,7 @@ impl Wire for GpePacket {
             first |= flags::O;
         }
         let out = write(first, self.next_protocol.unwrap_or(0), self.vni, &self.payload)?;
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+
         dst.extend_from_slice(&out);
         Ok(())
     }

@@ -3,9 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::ntp::{
-    KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply,
-};
+use fictionet::stdlib::ntp::{KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -25,20 +23,14 @@ fuzz_target!(|data: &[u8]| {
             _ => None,
         };
         let r = server_reply(&p, &ServerInfo::default(), p.receive, p.transmit);
-        assert_eq!(
-            r.as_ref().ok().map(|r| (r.mode, r.version)),
-            answer.map(|m| (m, p.version))
-        );
+        assert_eq!(r.as_ref().ok().map(|r| (r.mode, r.version)), answer.map(|m| (m, p.version)));
         if let Ok(r) = r {
             contract::check_wire_value(&r);
             assert!(r.to_bytes().is_ok());
             assert_eq!(Packet::parse(&r.to_bytes().unwrap()).as_ref(), Ok(&r));
         }
         let r = kiss_reply(&p, KissCode::from_bytes(p.reference_id));
-        assert_eq!(
-            r.as_ref().ok().map(|r| (r.mode, r.version)),
-            answer.map(|m| (m, p.version))
-        );
+        assert_eq!(r.as_ref().ok().map(|r| (r.mode, r.version)), answer.map(|m| (m, p.version)));
         if let Ok(r) = r {
             contract::check_wire_value(&r);
             assert!(r.to_bytes().is_ok());
@@ -49,10 +41,7 @@ fuzz_target!(|data: &[u8]| {
         // the next era's second 0.
         let (secs, nanos) = p.transmit.to_unix();
         assert!(nanos < 1_000_000_000);
-        let (a, b) = (
-            Timestamp::from_unix(secs, nanos).to_bits(),
-            p.transmit.to_bits(),
-        );
+        let (a, b) = (Timestamp::from_unix(secs, nanos).to_bits(), p.transmit.to_bits());
         assert!(a.wrapping_sub(b).min(b.wrapping_sub(a)) <= 3);
         // A request never carries a kiss code.
         if p.mode == Mode::Client {
@@ -63,9 +52,6 @@ fuzz_target!(|data: &[u8]| {
     if let Some(b) = data.get(..12) {
         let secs = i64::from_be_bytes(b[..8].try_into().unwrap());
         let nanos = u32::from_be_bytes(b[8..].try_into().unwrap()) % 1_000_000_000;
-        assert_eq!(
-            Timestamp::from_unix(secs, nanos).to_unix_near(secs),
-            (secs, nanos)
-        );
+        assert_eq!(Timestamp::from_unix(secs, nanos).to_unix_near(secs), (secs, nanos));
     }
 });

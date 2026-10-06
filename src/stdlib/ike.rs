@@ -1054,7 +1054,9 @@ fn write_chain(payloads: &[Payload], cap: usize) -> Option<(u8, Vec<u8>)> {
             _ => None,
         };
         parts.push((p.kind(), inner, p.critical, body));
-        if inner.is_some() && i + 1 != payloads.len() { return None; }
+        if inner.is_some() && i + 1 != payloads.len() {
+            return None;
+        }
     }
     let first = parts.first().map_or(payload::NONE, |p| p.0);
     let mut out = Vec::with_capacity(used);
@@ -1109,7 +1111,9 @@ fn write_body(body: &Body, room: usize) -> Option<Vec<u8>> {
             fixed(4)?;
             let size = usize::from(d.spi_size);
             let fits = if size == 0 { MAX_DELETE_SPIS } else { (room - 4) / size };
-            if d.spis.len() > MAX_DELETE_SPIS.min(fits) || d.spis.iter().any(|s| s.len() != size) { return None; }
+            if d.spis.len() > MAX_DELETE_SPIS.min(fits) || d.spis.iter().any(|s| s.len() != size) {
+                return None;
+            }
             let spis = &d.spis;
             out.extend_from_slice(&[d.protocol, d.spi_size]);
             out.extend_from_slice(&(spis.len() as u16).to_be_bytes());
@@ -1133,7 +1137,9 @@ fn write_body(body: &Body, room: usize) -> Option<Vec<u8>> {
 }
 
 fn write_sa(props: &[Proposal], room: usize, out: &mut Vec<u8>) -> Option<()> {
-    if props.len() > MAX_PROPOSALS { return None; }
+    if props.len() > MAX_PROPOSALS {
+        return None;
+    }
     let mut last = None;
     for p in props {
         let bytes = write_proposal(p, room.checked_sub(out.len())?)?;
@@ -1154,7 +1160,9 @@ fn write_proposal(p: &Proposal, room: usize) -> Option<Vec<u8>> {
     let mut out = vec![2, 0, 0, 0, p.number, p.protocol, spi.len() as u8, 0];
     out.extend_from_slice(spi);
     let (mut n, mut last) = (0u8, None);
-    if p.transforms.len() > MAX_TRANSFORMS { return None; }
+    if p.transforms.len() > MAX_TRANSFORMS {
+        return None;
+    }
     for t in &p.transforms {
         let bytes = write_transform(t, room.checked_sub(out.len())?)?;
         last = Some(out.len());
@@ -1177,9 +1185,13 @@ fn write_transform(t: &Transform, room: usize) -> Option<Vec<u8>> {
     }
     let mut out = vec![3, 0, 0, 0, t.kind, 0];
     out.extend_from_slice(&t.id.to_be_bytes());
-    if t.attributes.len() > MAX_ATTRIBUTES { return None; }
+    if t.attributes.len() > MAX_ATTRIBUTES {
+        return None;
+    }
     for a in &t.attributes {
-        if a.kind > 0x7fff { return None; }
+        if a.kind > 0x7fff {
+            return None;
+        }
         let kind = a.kind & 0x7fff;
         let mut bytes = Vec::new();
         match &a.value {
@@ -1291,7 +1303,9 @@ impl Wire for Header {
     /// Reads exactly the 28-byte header. Refuses short or trailing input.
     /// The version and flag bytes are kept without validation.
     fn parse(b: &[u8]) -> Result<Header, Error> {
-        if b.len() != HEADER_LEN { return Err(if b.len() < HEADER_LEN { Error::Short } else { Error::Trailing }); }
+        if b.len() != HEADER_LEN {
+            return Err(if b.len() < HEADER_LEN { Error::Short } else { Error::Trailing });
+        }
 
         let mut r = Reader::new(b);
         let h = (|| {
@@ -1309,7 +1323,7 @@ impl Wire for Header {
         h.ok_or(Error::Short)
     }
 
-    /// Appends all header fields unchanged. Refuses allocation failure.
+    /// Appends all header fields unchanged. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = [0u8; HEADER_LEN];
         out[0..8].copy_from_slice(&self.initiator_spi.to_be_bytes());
@@ -1320,7 +1334,8 @@ impl Wire for Header {
         out[19] = self.flags;
         out[20..24].copy_from_slice(&self.message_id.to_be_bytes());
         out[24..28].copy_from_slice(&self.length.to_be_bytes());
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1376,8 +1391,11 @@ impl Wire for Message {
         let mut out = Vec::with_capacity(HEADER_LEN + chain.len());
         header.write(&mut out)?;
         out.extend_from_slice(&chain);
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        commit(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(Error::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1389,7 +1407,9 @@ impl Wire for NatT {
     /// other than a keepalive, is [`Error::Short`].
     /// Refuses input above [`MAX_MESSAGE`] + 4 and malformed or trailing IKE bytes.
     fn parse(b: &[u8]) -> Result<NatT, Error> {
-        if b.len() > MAX_MESSAGE + NON_ESP_MARKER.len() { return Err(Error::Limit("datagram bytes")); }
+        if b.len() > MAX_MESSAGE + NON_ESP_MARKER.len() {
+            return Err(Error::Limit("datagram bytes"));
+        }
 
         if b == [NAT_KEEPALIVE] {
             return Ok(NatT::Keepalive);
@@ -1416,11 +1436,30 @@ impl Wire for NatT {
                 out.extend_from_slice(data);
             }
         }
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
 /// An IKE payload chain whose first payload type is supplied by its enclosing header.
+/// When that type is known only at run time, put the payloads in a [`Message`]
+/// and write it. Byte 16 gives the first type; bytes from [`HEADER_LEN`] onward
+/// are the inner chain. The temporary header is excluded from the plaintext
+/// encrypted for an SK payload. This uses the same limits as `Payloads`.
+///
+/// ```
+/// use fictionet::stdlib::codec::Wire;
+/// use fictionet::stdlib::ike::{Body, Message, Payload, HEADER_LEN, exchange, parse_payloads};
+/// let payloads = vec![Payload::new(Body::Nonce(vec![7; 32]))];
+/// let envelope = Message {
+///     initiator_spi: 0, responder_spi: 0, minor_version: 0,
+///     exchange: exchange::INFORMATIONAL, flags: 0, message_id: 0,
+///     payloads: payloads.clone(),
+/// };
+/// let bytes = envelope.to_bytes().unwrap();
+/// let (first, chain) = (bytes[16], &bytes[HEADER_LEN..]);
+/// assert_eq!(parse_payloads(first, chain).unwrap(), payloads);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Payloads<const FIRST: u8>(
     /// Payloads in chain order.
@@ -1442,15 +1481,9 @@ impl<const FIRST: u8> Wire for Payloads<FIRST> {
         if first != FIRST || parse_payloads(first, &bytes).as_ref() != Ok(&self.0) {
             return Err(Error::Unwritable);
         }
-        commit(out, &bytes)
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), Error> {
-    dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1795,12 +1828,25 @@ mod tests {
         }
         // The chain on its own, as inside an SK payload.
         let bytes = m.to_bytes().unwrap();
-            let first = bytes[16];
-            let chain = bytes[HEADER_LEN..].to_vec();
+        let first = bytes[16];
+        let chain = bytes[HEADER_LEN..].to_vec();
         assert_eq!(first, payload::SA);
         assert_eq!(chain, bytes[HEADER_LEN..]);
         assert_eq!(parse_payloads(first, &chain), Ok(m.payloads));
         assert_eq!(parse_payloads(0, &[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn payloads_write_and_refuse_a_different_first_type() {
+        let payloads = every_body();
+        let chain = Payloads::<{ payload::SA }>(payloads.clone());
+        let bytes = chain.to_bytes().unwrap();
+        assert_eq!(Payloads::<{ payload::SA }>::parse(&bytes), Ok(chain.clone()));
+        contract::check_wire_value(&chain);
+        let wrong = Payloads::<{ payload::NONCE }>(payloads);
+        assert_eq!(wrong.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&wrong);
+        contract::check_wire_value(&Payloads::<0>(vec![]));
     }
 
     #[test]
@@ -2018,8 +2064,8 @@ mod tests {
                 assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
             }
             let bytes = m.to_bytes().unwrap();
-            let first = bytes[16];
-            let chain = bytes[HEADER_LEN..].to_vec();
+        let first = bytes[16];
+        let chain = bytes[HEADER_LEN..].to_vec();
             assert_eq!(parse_payloads(first, &chain).as_ref(), Ok(&m.payloads));
         }
         if let Ok(NatT::Ike(m)) = NatT::parse(data) {

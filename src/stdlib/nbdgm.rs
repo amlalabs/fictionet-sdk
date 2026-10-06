@@ -196,13 +196,15 @@ impl Name {
     /// This name with the scope `scope`, given with dots between labels.
     /// Empty labels are skipped. Labels are cut to [`MAX_LABEL`] bytes
     /// and stop before the name would exceed [`MAX_NAME_LEN`].
-    pub fn with_scope(mut self, scope: &str) -> Name {
+    pub fn with_scope_clipped(mut self, scope: &str) -> Name {
         self.scope.clear();
         let mut size = 1 + ENCODED_LEN + 1;
         for label in scope.split('.').filter(|l| !l.is_empty()) {
             let bytes = label.as_bytes();
             let len = bytes.len().min(MAX_LABEL);
-            if size + 1 + len > MAX_NAME_LEN { break; }
+            if size + 1 + len > MAX_NAME_LEN {
+                break;
+            }
             self.scope.push(bytes[..len].to_vec());
             size += 1 + len;
         }
@@ -582,7 +584,9 @@ impl Packet {
         let names = source.len() + destination.len();
         let room = MAX_PACKET - DATAGRAM_HEADER_LEN - names;
         let size = max_data.clamp(1, room);
-        if d.data.len() > MAX_REASSEMBLED { return Err(ParseError::Unwritable); }
+        if d.data.len() > MAX_REASSEMBLED {
+            return Err(ParseError::Unwritable);
+        }
         let data = &d.data;
         let chunks: Vec<&[u8]> = if data.is_empty() { vec![data] } else { data.chunks(size).collect() };
         let last = chunks.len() - 1;
@@ -709,7 +713,9 @@ impl Wire for Name {
     /// first-level labels, oversized names and trailing bytes.
     fn parse(b: &[u8]) -> Result<Name, ParseError> {
         let (value, used) = Self::parse_prefix(b)?;
-        if used != b.len() { return Err(ParseError::Trailing(b.len() - used)); }
+        if used != b.len() {
+            return Err(ParseError::Trailing(b.len() - used));
+        }
         Ok(value)
     }
 
@@ -720,7 +726,9 @@ impl Wire for Name {
         out.push(ENCODED_LEN as u8);
         out.extend_from_slice(&encode_first_level(&self.bytes));
         for label in &self.scope {
-            if label.len() > MAX_LABEL { return Err(ParseError::Unwritable); }
+            if label.len() > MAX_LABEL {
+                return Err(ParseError::Unwritable);
+            }
             if label.is_empty() {
                 return Err(ParseError::Unwritable);
             }
@@ -732,7 +740,7 @@ impl Wire for Name {
             out.extend_from_slice(label);
         }
         out.push(0);
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+
         dst.extend_from_slice(&out);
         Ok(())
     }
@@ -822,7 +830,9 @@ impl Wire for Packet {
                 let destination = d.destination.to_bytes()?;
                 // Names are at most 255 bytes each, so there is always room.
                 let room = MAX_PACKET - DATAGRAM_HEADER_LEN - source.len() - destination.len();
-                if d.data.len() > room { return Err(ParseError::Unwritable); }
+                if d.data.len() > room {
+                    return Err(ParseError::Unwritable);
+                }
                 let data = &d.data;
                 let length = source.len() + destination.len() + data.len();
                 // MAX_PACKET is under 65,536, so the length fits.
@@ -837,8 +847,9 @@ impl Wire for Packet {
                 n.write(&mut out)?
             }
         }
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(ParseError::Unwritable);
+        }
         dst.extend_from_slice(&out);
         Ok(())
     }
@@ -871,7 +882,7 @@ mod tests {
             id: 7,
             source_ip: ip(),
             source_port: 138,
-            body: Body::QueryRequest(Name::new("FILES", 0x20).with_scope("corp.example")),
+            body: Body::QueryRequest(Name::new("FILES", 0x20).with_scope_clipped("corp.example")),
         };
         let mut b =
             Packet::datagram(DatagramKind::Broadcast, 9, ip(), 138, Name::new("A", 0), Name::wildcard(), vec![1, 2, 3]);
@@ -947,7 +958,7 @@ mod tests {
 
     #[test]
     fn queries() {
-        let name = Name::new("FILES", 0x20).with_scope("corp.example");
+        let name = Name::new("FILES", 0x20).with_scope_clipped("corp.example");
         let q = Packet {
             flags: Flags::whole(),
             id: 5,

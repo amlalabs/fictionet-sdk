@@ -669,7 +669,7 @@ impl Wire for Packet {
         self.receive.write(&mut out)?;
         self.transmit.write(&mut out)?;
         out.extend_from_slice(trailer);
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+
         dst.extend_from_slice(&out);
         Ok(())
     }
@@ -685,11 +685,12 @@ impl Wire for KissCode {
         Ok(Self::from_bytes(bytes))
     }
 
-    /// Appends four bytes. Refuses an Other value that names a defined code or allocation failure.
+    /// Appends four bytes. Refuses an Other value that names a defined code.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         let bytes = self.octets();
-        if Self::from_bytes(bytes) != *self { return Err(ParseError::Unwritable); }
-        dst.try_reserve(4).map_err(|_| ParseError::Unwritable)?;
+        if Self::from_bytes(bytes) != *self {
+            return Err(ParseError::Unwritable);
+        }
         dst.extend_from_slice(&bytes);
         Ok(())
     }
@@ -701,13 +702,14 @@ impl Wire for Timestamp {
 
     /// Reads exactly eight bytes. Refuses short or trailing input.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
-        if b.len() != 8 { return Err(ParseError::FieldLength { want: 8, got: b.len() }); }
+        if b.len() != 8 {
+            return Err(ParseError::FieldLength { want: 8, got: b.len() });
+        }
         Ok(Self::read(b, 0))
     }
 
-    /// Appends seconds and fraction in network order. Refuses allocation failure.
+    /// Appends seconds and fraction in network order. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
-        dst.try_reserve(8).map_err(|_| ParseError::Unwritable)?;
         dst.extend_from_slice(&self.seconds.to_be_bytes());
         dst.extend_from_slice(&self.fraction.to_be_bytes());
         Ok(())

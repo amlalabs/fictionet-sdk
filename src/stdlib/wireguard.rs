@@ -314,12 +314,13 @@ pub struct Plaintext(
 
 impl Plaintext {
     /// Copies a plaintext and adds the zeros chosen by [padding].
-    /// Refuses a padded length above [`MAX_PLAINTEXT`] or allocation failure.
+    /// Refuses a padded length above [`MAX_PLAINTEXT`].
     pub fn padded(plaintext: &[u8], mtu: usize) -> Result<Self, Error> {
         let padded = plaintext.len().checked_add(padding(plaintext.len(), mtu)).ok_or(Error::Unwritable)?;
-        if padded > MAX_PLAINTEXT { return Err(Error::Unwritable); }
+        if padded > MAX_PLAINTEXT {
+            return Err(Error::Unwritable);
+        }
         let mut out = Vec::new();
-        out.try_reserve_exact(padded).map_err(|_| Error::Unwritable)?;
         out.extend_from_slice(plaintext);
         out.resize(padded, 0);
         Ok(Self(out))
@@ -332,14 +333,17 @@ impl Wire for Plaintext {
 
     /// Keeps every byte, including zeros. Refuses input above [`MAX_PLAINTEXT`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
-        if b.len() > MAX_PLAINTEXT { return Err(Error::Length { kind: message_type::DATA, len: b.len() }); }
+        if b.len() > MAX_PLAINTEXT {
+            return Err(Error::Length { kind: message_type::DATA, len: b.len() });
+        }
         Ok(Self(b.to_vec()))
     }
 
-    /// Appends the stored plaintext. Refuses oversized values or allocation failure.
+    /// Appends the stored plaintext. Refuses oversized values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
-        if self.0.len() > MAX_PLAINTEXT { return Err(Error::Unwritable); }
-        dst.try_reserve(self.0.len()).map_err(|_| Error::Unwritable)?;
+        if self.0.len() > MAX_PLAINTEXT {
+            return Err(Error::Unwritable);
+        }
         dst.extend_from_slice(&self.0);
         Ok(())
     }
@@ -534,7 +538,7 @@ impl Wire for Initiation {
         })
     }
 
-    /// Appends the complete 148-byte initiation. Refuses allocation failure.
+    /// Appends the complete 148-byte initiation. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = header(message_type::INITIATION, INITIATION_LEN);
         out.extend_from_slice(&self.sender.to_le_bytes());
@@ -543,7 +547,8 @@ impl Wire for Initiation {
         out.extend_from_slice(&self.encrypted_timestamp);
         out.extend_from_slice(&self.mac1);
         out.extend_from_slice(&self.mac2);
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -566,7 +571,7 @@ impl Wire for Response {
         })
     }
 
-    /// Appends the complete 92-byte response. Refuses allocation failure.
+    /// Appends the complete 92-byte response. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = header(message_type::RESPONSE, RESPONSE_LEN);
         out.extend_from_slice(&self.sender.to_le_bytes());
@@ -575,7 +580,8 @@ impl Wire for Response {
         out.extend_from_slice(&self.encrypted_nothing);
         out.extend_from_slice(&self.mac1);
         out.extend_from_slice(&self.mac2);
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -591,13 +597,14 @@ impl Wire for CookieReply {
         Ok(CookieReply { receiver: r.u32()?, nonce: r.array()?, encrypted_cookie: r.array()? })
     }
 
-    /// Appends the complete 64-byte cookie reply. Refuses allocation failure.
+    /// Appends the complete 64-byte cookie reply. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = header(message_type::COOKIE_REPLY, COOKIE_REPLY_LEN);
         out.extend_from_slice(&self.receiver.to_le_bytes());
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.encrypted_cookie);
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -635,15 +642,9 @@ impl Wire for Data {
         out.extend_from_slice(&self.receiver.to_le_bytes());
         out.extend_from_slice(&self.counter.to_le_bytes());
         out.extend_from_slice(&self.encrypted);
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), Error> {
-    dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
 }
 
 #[cfg(test)]

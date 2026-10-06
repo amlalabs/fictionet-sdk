@@ -15,7 +15,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Payloads<46>>(data);
     if let Ok(message) = Message::parse(data) {
         let bytes = message.to_bytes().unwrap();
-        for n in 0..bytes.len().min(HEADER_LEN) {
+        for n in 0..bytes.len().min(200) {
             assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
         }
         let natt = NatT::Ike(message);

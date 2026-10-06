@@ -29,7 +29,7 @@
 //! and writers both refuse repeated option names.
 //!
 //! ```
-//! use fictionet::stdlib::codec::{Decode, Step, Wire};
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::tftp::{negotiate, Event, Packet, ReadTransfer, MAX_BLOCK_SIZE};
 //!
 //! // A read request for boot.img, asking for 1024-byte blocks and the size.
@@ -663,9 +663,8 @@ impl Wire for NetasciiByte {
         }
     }
 
-    /// Appends one encoded character. Refuses allocation failure.
+    /// Appends one encoded character. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
-        dst.try_reserve(2).map_err(|_| ParseError::Unwritable)?;
         match self.0 {
             b'\n' => dst.extend_from_slice(b"\r\n"),
             b'\r' => dst.extend_from_slice(b"\r\0"),
@@ -764,7 +763,9 @@ fn clipped_utf8(s: &str, max: usize) -> &str {
 }
 
 fn put_str(out: &mut Vec<u8>, s: &str) -> Result<(), ParseError> {
-    if s.len() > MAX_STRING || s.contains('\0') { return Err(ParseError::Unwritable); }
+    if s.len() > MAX_STRING || s.contains('\0') {
+        return Err(ParseError::Unwritable);
+    }
     out.extend_from_slice(s.as_bytes());
     out.push(0);
     Ok(())
@@ -793,7 +794,9 @@ fn clipped_options(options: &[TftpOption], start: usize, limit: usize) -> Vec<(&
 }
 
 fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) -> Result<(), ParseError> {
-    if options.len() > MAX_OPTIONS { return Err(ParseError::Unwritable); }
+    if options.len() > MAX_OPTIONS {
+        return Err(ParseError::Unwritable);
+    }
     let mut names = std::collections::HashSet::new();
     for option in options {
         if option.name.len() > MAX_STRING || option.value.len() > MAX_STRING {
@@ -804,9 +807,13 @@ fn put_options(out: &mut Vec<u8>, options: &[TftpOption], limit: usize) -> Resul
         }
         put_str(out, &option.name)?;
         put_str(out, &option.value)?;
-        if out.len() > limit { return Err(ParseError::Unwritable); }
+        if out.len() > limit {
+            return Err(ParseError::Unwritable);
+        }
     }
-    if out.len() > limit { return Err(ParseError::Unwritable); }
+    if out.len() > limit {
+        return Err(ParseError::Unwritable);
+    }
     Ok(())
 }
 
@@ -882,7 +889,9 @@ impl Wire for Packet {
                 put_options(&mut out, &r.options, MAX_REQUEST)?;
             }
             Packet::Data { block, data } => {
-                if data.len() > usize::from(MAX_BLOCK_SIZE) { return Err(ParseError::Unwritable); }
+                if data.len() > usize::from(MAX_BLOCK_SIZE) {
+                    return Err(ParseError::Unwritable);
+                }
                 out.reserve(4 + data.len());
                 out.extend_from_slice(&opcode::DATA.to_be_bytes());
                 out.extend_from_slice(&block.to_be_bytes());
@@ -902,7 +911,6 @@ impl Wire for Packet {
                 put_options(&mut out, options, MAX_PACKET)?;
             }
         }
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
         dst.extend_from_slice(&out);
         Ok(())
     }

@@ -218,7 +218,7 @@ impl Name {
     /// This constructor keeps what the wire holds: empty
     /// labels are left out, labels are cut to [`MAX_LABEL`] bytes, and
     /// labels stop once the name would pass [`MAX_NAME_LEN`].
-    pub fn with_scope(mut self, scope: &str) -> Name {
+    pub fn with_scope_clipped(mut self, scope: &str) -> Name {
         self.scope = clipped_labels(1 + ENCODED_LEN, scope.split('.').map(str::as_bytes));
         self
     }
@@ -322,8 +322,8 @@ impl RrName {
     }
 
     /// The domain name `name`, given with dots between labels, kept by
-    /// the rules of [`Name::with_scope`].
-    pub fn domain(name: &str) -> RrName {
+    /// the rules of [`Name::with_scope_clipped`].
+    pub fn domain_clipped(name: &str) -> RrName {
         RrName::Domain(clipped_labels(0, name.split('.').map(str::as_bytes)))
     }
 
@@ -629,7 +629,9 @@ impl RData {
     fn write_data(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
         match self {
             RData::Nb(entries) => {
-                if entries.len() > MAX_NB_ENTRIES { return Err(ParseError::Unwritable); }
+                if entries.len() > MAX_NB_ENTRIES {
+                    return Err(ParseError::Unwritable);
+                }
                 for entry in entries { entry.write(out); }
             }
             RData::NodeStatus(status) => {
@@ -651,7 +653,9 @@ impl RData {
                 out.extend_from_slice(data);
             }
         }
-        if out.len() > MAX_RDATA { return Err(ParseError::Unwritable); }
+        if out.len() > MAX_RDATA {
+            return Err(ParseError::Unwritable);
+        }
         Ok(())
     }
 }
@@ -722,7 +726,7 @@ fn remember(written: &mut std::collections::HashMap<Vec<u8>, u16>, full: Option<
 /// Why a datagram is not an NBNS packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// Bytes follow the complete unit.
+    /// Bytes follow a complete [`Name`] or [`RrName`].
     Trailing(usize),
     /// The value cannot be written without changing it.
     Unwritable,
@@ -730,6 +734,8 @@ pub enum ParseError {
     Truncated,
     /// The datagram is longer than [`MAX_PACKET`].
     TooLong(usize),
+    /// Expanded names make the re-encoded packet exceed [`MAX_PACKET`].
+    ExpansionTooLong,
     /// A section counts more entries than [`MAX_RECORDS`].
     TooManyRecords(u16),
     /// A label's length byte starts with the bits 01 or 10, which mark
@@ -754,6 +760,7 @@ impl std::fmt::Display for ParseError {
             ParseError::Trailing(n) => write!(f, "{n} bytes after the unit"),
             ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::Truncated => f.write_str("packet ends early"),
+            ParseError::ExpansionTooLong => write!(f, "expanded packet exceeds {MAX_PACKET} bytes"),
             ParseError::TooLong(n) => write!(f, "datagram of {n} bytes, over {MAX_PACKET}"),
             ParseError::TooManyRecords(n) => write!(f, "section of {n} entries, over {MAX_RECORDS}"),
             ParseError::BadLabel(b) => write!(f, "label length byte {b:#04x}"),
@@ -1155,7 +1162,9 @@ impl Wire for Name {
     /// Reads one complete name. Refuses invalid labels, pointers outside the input and trailing bytes.
     fn parse(b: &[u8]) -> Result<Name, ParseError> {
         let (value, used) = read_name(b, 0)?;
-        if used != b.len() { return Err(ParseError::Trailing(b.len() - used)); }
+        if used != b.len() {
+            return Err(ParseError::Trailing(b.len() - used));
+        }
         Ok(value)
     }
 
@@ -1166,7 +1175,8 @@ impl Wire for Name {
         out.push(ENCODED_LEN as u8);
         out.extend_from_slice(&encode_first_level(&self.bytes));
         put_labels(&mut out, self.scope.iter().map(Vec::as_slice))?;
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1177,7 +1187,9 @@ impl Wire for RrName {
     /// Reads one complete name. Refuses invalid labels, pointers outside the input and trailing bytes.
     fn parse(b: &[u8]) -> Result<RrName, ParseError> {
         let (value, used) = read_rr_name(b, 0)?;
-        if used != b.len() { return Err(ParseError::Trailing(b.len() - used)); }
+        if used != b.len() {
+            return Err(ParseError::Trailing(b.len() - used));
+        }
         Ok(value)
     }
 
@@ -1189,8 +1201,11 @@ impl Wire for RrName {
             RrName::NetBios(n) => n.write(&mut out)?,
             RrName::Domain(labels) => put_labels(&mut out, labels.iter().map(Vec::as_slice))?,
         }
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        commit(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(ParseError::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1198,8 +1213,8 @@ impl Wire for Packet {
     type ParseError = ParseError;
     type WriteError = ParseError;
 
-    /// Reads a complete datagram with compressed names. Refuses trailing bytes,
-    /// invalid records, and names whose expansion cannot be written within [`MAX_PACKET`].
+    /// Reads a datagram with compressed names, ignoring bytes after its records.
+    /// Refuses invalid records and packets whose expanded encoding exceeds [`MAX_PACKET`].
     fn parse(b: &[u8]) -> Result<Packet, ParseError> {
         if b.len() > MAX_PACKET {
             return Err(ParseError::TooLong(b.len()));
@@ -1253,7 +1268,6 @@ impl Wire for Packet {
                 pos = start + len;
             }
         }
-        if pos != b.len() { return Err(ParseError::Trailing(b.len() - pos)); }
         let [answers, authority, additional] = sections;
         let packet = Packet {
             id: be16(b, 0),
@@ -1266,7 +1280,7 @@ impl Wire for Packet {
             authority,
             additional,
         };
-        packet.encode()?;
+        packet.encode().map_err(|_| ParseError::ExpansionTooLong)?;
         Ok(packet)
     }
 
@@ -1275,8 +1289,11 @@ impl Wire for Packet {
     /// Preserves the TC flag. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         let out = self.encode()?;
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        commit(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(ParseError::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1299,13 +1316,17 @@ impl Packet {
             out.extend_from_slice(&q.qtype.to_be_bytes());
             out.extend_from_slice(&q.class.to_be_bytes());
             remember(&mut written, full, at);
-            if out.len() > MAX_PACKET { return Err(ParseError::Unwritable); }
+            if out.len() > MAX_PACKET {
+                return Err(ParseError::Unwritable);
+            }
         }
         for record in self.answers.iter().chain(&self.authority).chain(&self.additional) {
             let at = out.len();
             let full = record.write_record(&mut out, &written)?;
             remember(&mut written, full, at);
-            if out.len() > MAX_PACKET { return Err(ParseError::Unwritable); }
+            if out.len() > MAX_PACKET {
+                return Err(ParseError::Unwritable);
+            }
         }
         Ok(out)
     }
@@ -1316,14 +1337,6 @@ fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
     name.to_bytes().map_or(0, |bytes| {
         MAX_DATAGRAM.saturating_sub(HEADER_LEN + bytes.len() + 10 + fixed_data) / entry_len
     })
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), ParseError> {
-    dst.try_reserve(out.len())
-        .map_err(|_| ParseError::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1372,7 +1385,7 @@ mod tests {
                     [1, 2, 3, 4, 5, 6],
                 )
                 .to_bytes().unwrap(),
-            Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false).to_bytes().unwrap(),
+            Packet::name_query(9, Name::new("FRED", 0x20).with_scope_clipped("NETBIOS.COM"), false).to_bytes().unwrap(),
             req.wack(Name::new("FRED", 0x20), 5).to_bytes().unwrap(),
             req.wack(RrName::null(), 5).to_bytes().unwrap(),
             redirect_bytes(),
@@ -1399,7 +1412,7 @@ mod tests {
     #[test]
     fn scope_example() {
         // RFC 1002 section 4.1: FRED in the scope NETBIOS.COM.
-        let name = Name::new("FRED", 0x20).with_scope("NETBIOS.COM");
+        let name = Name::new("FRED", 0x20).with_scope_clipped("NETBIOS.COM");
         let mut want = vec![0x20];
         want.extend_from_slice(FRED);
         want.extend_from_slice(b"\x07NETBIOS\x03COM\x00");
@@ -1555,12 +1568,12 @@ mod tests {
     }
 
     #[test]
-    fn rfc1001_name_with_scope_example() {
+    fn rfc1001_name_with_scope_clipped_example() {
         // RFC 1001 section 14.1: "The NetBIOS name" in SCOPE.ID.COM. The
         // name keeps its case, so it is built from its bytes. The RFC
         // prints FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF, which has two letters
         // wrong: it decodes to "Tge NetBIOS tame".
-        let name = Name { bytes: *b"The NetBIOS name", scope: Vec::new() }.with_scope("SCOPE.ID.COM");
+        let name = Name { bytes: *b"The NetBIOS name", scope: Vec::new() }.with_scope_clipped("SCOPE.ID.COM");
         assert_eq!(&name.to_bytes().unwrap()[1..1 + ENCODED_LEN], b"FEGIGFCAEOGFHEECEJEPFDCAGOGBGNGF");
         assert_eq!(decode_first_level(b"FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF"), Some(*b"Tge NetBIOS tame"));
         let wire = name.to_bytes().unwrap();
@@ -1773,10 +1786,28 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bytes_are_refused() {
+    fn expanded_packet_uses_a_reader_error() {
+        // NS data points to a long earlier name. Re-encoding expands that
+        // pointer; an opaque record fills the remaining packet space.
+        let name = RrName::Domain(vec![vec![b'a'; 63]; 3]);
+        let mut bytes = hex("0001 8000 0000 0002 0000 0000");
+        name.write(&mut bytes).unwrap();
+        bytes.extend_from_slice(&hex("0002 0001 00000000 0002 c00c"));
+        bytes.push(0);
+        let data_len = MAX_PACKET - bytes.len() - 10;
+        bytes.extend_from_slice(&hex("0099 0001 00000000"));
+        bytes.extend_from_slice(&(data_len as u16).to_be_bytes());
+        bytes.resize(MAX_PACKET, 0);
+        assert_eq!(Packet::parse(&bytes), Err(ParseError::ExpansionTooLong));
+        contract::check_wire::<Packet>(&bytes);
+    }
+
+    #[test]
+    fn trailing_bytes_are_ignored() {
         let mut b = query_bytes();
         b.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(Packet::parse(&b), Err(ParseError::Trailing(3)));
+        assert_eq!(Packet::parse(&b), Packet::parse(&query_bytes()));
+        contract::check_wire::<Packet>(&b);
     }
 
     #[test]
@@ -1834,7 +1865,7 @@ mod tests {
         let req = Packet::parse(&query_bytes()).unwrap();
         for name in [
             Name::new("FRED", 0x20),
-            Name::new("FRED", 0x20).with_scope(&"x.".repeat(200)),
+            Name::new("FRED", 0x20).with_scope_clipped(&"x.".repeat(200)),
         ] {
             let node = NodeName::unique(&name);
             for count in [0, 3, 100, 10_909] {
@@ -1890,14 +1921,14 @@ mod tests {
     }
 
     #[test]
-    fn with_scope_keeps_what_the_wire_holds() {
+    fn with_scope_clipped_keeps_what_the_wire_holds() {
         let long = "a.".repeat(1_000_000);
-        let name = Name::new("FRED", 0x20).with_scope(&long);
+        let name = Name::new("FRED", 0x20).with_scope_clipped(&long);
         assert!(name.scope.len() < 128);
         let wire = name.to_bytes().unwrap();
         assert_eq!(read_name(&wire, 0).unwrap().0, name);
         let label = "x".repeat(64);
-        let name = Name::new("FRED", 0x20).with_scope(&label);
+        let name = Name::new("FRED", 0x20).with_scope_clipped(&label);
         assert_eq!(name.scope, vec![vec![b'x'; MAX_LABEL]]);
         assert_eq!(read_name(&name.to_bytes().unwrap(), 0).unwrap().0, name);
     }
@@ -1941,7 +1972,7 @@ mod tests {
         let mut q = hex("0001 0000 0001 0000 0000 0000 00 0020 0001");
         assert_eq!(Packet::parse(&q), Err(ParseError::BadFirstLevel));
         q[5] = 0;
-        assert_eq!(Packet::parse(&q), Err(ParseError::Trailing(5)));
+        assert_eq!(Packet::parse(&q), Packet::parse(&q[..HEADER_LEN]));
         assert!(Packet::parse(&q[..HEADER_LEN]).is_ok());
     }
 
@@ -1949,7 +1980,7 @@ mod tests {
     fn redirect_with_domain_names() {
         let b = redirect_bytes();
         let p = Packet::parse(&b).unwrap();
-        assert_eq!(p.authority[0].name, RrName::domain("netbios.com".to_uppercase().as_str()));
+        assert_eq!(p.authority[0].name, RrName::domain_clipped("netbios.com".to_uppercase().as_str()));
         assert_eq!(p.authority[0].name.to_string(), "NETBIOS.COM");
         let ns = vec![b"NS".to_vec(), b"NETBIOS".to_vec(), b"COM".to_vec()];
         assert_eq!(p.authority[0].data, RData::Ns(ns.clone()));
@@ -1970,7 +2001,7 @@ mod tests {
         // its NS data points at the scope inside it, at offset 95. The
         // writer turns the repeated name into a pointer, so the scope
         // moves; the NS data must still name NETBIOS.COM.
-        let fred = Name::new("FRED", 0x20).with_scope("NETBIOS.COM");
+        let fred = Name::new("FRED", 0x20).with_scope_clipped("NETBIOS.COM");
         let mut b = hex("0009 8100 0001 0000 0001 0000");
         b.extend_from_slice(&fred.to_bytes().unwrap());
         b.extend_from_slice(&hex("0020 0001"));

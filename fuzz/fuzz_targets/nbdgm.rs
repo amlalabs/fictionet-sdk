@@ -45,10 +45,7 @@ fuzz_target!(|data: &[u8]| {
         }
         // The fragments of a datagram put back together give its data.
         if let Some(d) = p.as_datagram() {
-            let got = whole
-                .as_ref()
-                .and_then(Packet::as_datagram)
-                .map(|w| &w.data);
+            let got = whole.as_ref().and_then(Packet::as_datagram).map(|w| &w.data);
             assert_eq!(got, Some(&d.data));
         }
     }

@@ -232,7 +232,6 @@ pub enum ParseError {
     Unicode,
     /// Bytes follow the last payload field.
     Trailing,
-
     /// A message of more than [`MAX_MESSAGE`] bytes, a message whose
     /// fields (which may overlap) would not fit in that when written
     /// back, or an NT response or AV pair list of more than [`MAX_FIELD`].
@@ -742,15 +741,18 @@ impl Wire for UnicodeName {
 
     /// Reads the whole name. Refuses invalid UTF-16 or more than [`MAX_FIELD`] bytes.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
-        if b.len() > MAX_FIELD { return Err(ParseError::TooLong); }
+        if b.len() > MAX_FIELD {
+            return Err(ParseError::TooLong);
+        }
         decode_utf16le(b).map(Self).ok_or(ParseError::Unicode)
     }
 
-    /// Appends UTF-16LE. Refuses names above [`MAX_FIELD`] bytes or allocation failure.
+    /// Appends UTF-16LE. Refuses names above [`MAX_FIELD`] bytes.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         let len = self.0.encode_utf16().count().checked_mul(2).ok_or(EncodeError::Unwritable)?;
-        if len > MAX_FIELD { return Err(EncodeError::Unwritable); }
-        dst.try_reserve(len).map_err(|_| EncodeError::Unwritable)?;
+        if len > MAX_FIELD {
+            return Err(EncodeError::Unwritable);
+        }
         for unit in self.0.encode_utf16() { dst.extend_from_slice(&unit.to_le_bytes()); }
         Ok(())
     }
@@ -758,13 +760,15 @@ impl Wire for UnicodeName {
 
 /// The string UTF-16LE bytes spell, or None for odd length or invalid UTF-16.
 fn decode_utf16le(b: &[u8]) -> Option<String> {
-    if !b.len().is_multiple_of(2) { return None; }
+    if !b.len().is_multiple_of(2) {
+        return None;
+    }
     let units = b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]]));
     char::decode_utf16(units).collect::<Result<String, _>>().ok()
 }
 
 /// The original AUTHENTICATE layout with its MIC field set to zero.
-/// Construct it with [Authenticate::mic_input] before computing the MIC.
+/// Construct it with [`Authenticate::mic_input`] before computing the MIC.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MicInput(Vec<u8>);
 
@@ -774,13 +778,14 @@ impl Wire for MicInput {
 
     /// Keeps the original layout. Refuses invalid tokens, absent MICs and nonzero MICs.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
-        if Authenticate::parse(b)?.mic != Some([0; MIC_LEN]) { return Err(ParseError::Field("MIC")); }
+        if Authenticate::parse(b)?.mic != Some([0; MIC_LEN]) {
+            return Err(ParseError::Field("MIC"));
+        }
         Ok(Self(b.to_vec()))
     }
 
-    /// Appends the stored token without changing field offsets. Refuses allocation failure.
+    /// Appends the stored token without changing field offsets. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
-        dst.try_reserve(self.0.len()).map_err(|_| EncodeError::Unwritable)?;
         dst.extend_from_slice(&self.0);
         Ok(())
     }
@@ -843,34 +848,35 @@ impl AvPairs {
 
 /// Writes a complete AV list after checking all lengths.
 fn write_pairs(pairs: &[AvPair], dst: &mut Vec<u8>) -> Result<(), EncodeError> {
-        if pairs.len() > MAX_AV_PAIRS {
+    if pairs.len() > MAX_AV_PAIRS {
+        return Err(EncodeError::Unwritable);
+    }
+    let mut total = 4usize;
+    for p in pairs {
+        if p.id == av_id::EOL {
             return Err(EncodeError::Unwritable);
         }
-        let mut total = 4usize;
-        for p in pairs {
-            if p.id == av_id::EOL {
-                return Err(EncodeError::Unwritable);
-            }
-            if p.value.len() > usize::from(u16::MAX) {
-                return Err(EncodeError::Unwritable);
-            }
-            if !av_value_fits(p.id, &p.value) {
-                return Err(EncodeError::Unwritable);
-            }
-            total = total.saturating_add(4 + p.value.len());
-        }
-        // Checked before anything is copied, so a long list costs nothing.
-        if total > MAX_FIELD {
+        if p.value.len() > usize::from(u16::MAX) {
             return Err(EncodeError::Unwritable);
         }
-        let mut out = Vec::with_capacity(total);
-        for p in pairs {
-            out.extend_from_slice(&p.id.to_le_bytes());
-            out.extend_from_slice(&(p.value.len() as u16).to_le_bytes());
-            out.extend_from_slice(&p.value);
+        if !av_value_fits(p.id, &p.value) {
+            return Err(EncodeError::Unwritable);
         }
+        total = total.saturating_add(4 + p.value.len());
+    }
+    // Checked before anything is copied, so a long list costs nothing.
+    if total > MAX_FIELD {
+        return Err(EncodeError::Unwritable);
+    }
+    let mut out = Vec::with_capacity(total);
+    for p in pairs {
+        out.extend_from_slice(&p.id.to_le_bytes());
+        out.extend_from_slice(&(p.value.len() as u16).to_le_bytes());
+        out.extend_from_slice(&p.value);
+    }
     out.extend_from_slice(&[0, 0, 0, 0]);
-    commit(dst, &out)
+    dst.extend_from_slice(&out);
+    Ok(())
 }
 
 impl Wire for AvPairs {
@@ -882,7 +888,9 @@ impl Wire for AvPairs {
     /// and trailing bytes. Unknown IDs keep their complete values.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
         let (pairs, used) = Self::parse_prefix(b)?;
-        if used != b.len() { return Err(ParseError::Trailing); }
+        if used != b.len() {
+            return Err(ParseError::Trailing);
+        }
         Ok(Self(pairs))
     }
 
@@ -918,13 +926,14 @@ impl Wire for Negotiate {
         Ok(n)
     }
 
-    /// Appends the token. Refuses oversized fields, inconsistent flags and version,
-    /// and stored fields the flags would hide. Leaves the destination unchanged on error.
+    /// Appends the token. Refuses oversized fields or messages and inconsistent
+    /// flags and version. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         check_version(self.flags, self.version)?;
         let mut out = start(message_type::NEGOTIATE, NEGOTIATE_HEADER_LEN, 12, self.flags, self.version);
         put_fields(&mut out, &[(16, &self.domain), (24, &self.workstation)])?;
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -932,8 +941,8 @@ impl Wire for Challenge {
     type ParseError = ParseError;
     type WriteError = EncodeError;
 
-    /// Reads a CHALLENGE message. Bytes past the payload are refused, and
-    /// so are the 8 reserved bytes. A Unicode target name must have an
+    /// Reads a CHALLENGE message. Bytes past the payload are refused.
+    /// The 8 reserved bytes are ignored. A Unicode target name must have an
     /// even offset and length, and a target info must be exactly one AV
     /// pair list. A field whose flag ([`flags::REQUEST_TARGET`] or
     /// [`flags::NEGOTIATE_TARGET_INFO`]) is clear is read when it is good
@@ -961,8 +970,9 @@ impl Wire for Challenge {
         Ok(c)
     }
 
-    /// Appends the token. Refuses oversized fields, invalid target info, inconsistent
-    /// flags and version, and fields the flags would hide. Leaves the destination unchanged on error.
+    /// Appends the token. Refuses oversized fields or messages, invalid target info,
+    /// odd Unicode fields, and inconsistent flags and version.
+    /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         check_version(self.flags, self.version)?;
         check_text(
@@ -978,7 +988,8 @@ impl Wire for Challenge {
             &mut out,
             &[(12, &self.target_name), (40, &self.target_info)],
         )?;
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1057,7 +1068,8 @@ impl Wire for Authenticate {
             *f = (AUTH_FIELDS[i].0, data[i]);
         }
         put_fields(&mut out, &fields)?;
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1114,12 +1126,13 @@ impl Wire for LmV2Response {
         Ok(LmV2Response { response, client_challenge })
     }
 
-    /// Appends the 16-byte response and 8-byte challenge. Refuses allocation failure.
+    /// Appends the 16-byte response and 8-byte challenge. Refuses no values.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut out = [0u8; V1_RESPONSE_LEN];
         out[..16].copy_from_slice(&self.response);
         out[16..].copy_from_slice(&self.client_challenge);
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1155,7 +1168,6 @@ impl Wire for NtResponse {
         match self {
             Self::Empty => Ok(()),
             Self::V1(bytes) => {
-                dst.try_reserve(bytes.len()).map_err(|_| EncodeError::Unwritable)?;
                 dst.extend_from_slice(bytes);
                 Ok(())
             }
@@ -1171,9 +1183,15 @@ impl Wire for ClientChallenge {
     /// Reads the complete blob and keeps bytes after its AV end marker.
     /// Refuses short headers, versions other than 1, invalid AV pairs and oversized blobs.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
-        if b.len() > MAX_FIELD - NT_PROOF_LEN { return Err(ParseError::TooLong); }
-        if b.len() < CLIENT_CHALLENGE_HEADER_LEN + 4 { return Err(ParseError::ResponseLength(b.len())); }
-        if b[0] != 1 || b[1] != 1 { return Err(ParseError::ResponseVersion(b[0], b[1])); }
+        if b.len() > MAX_FIELD - NT_PROOF_LEN {
+            return Err(ParseError::TooLong);
+        }
+        if b.len() < CLIENT_CHALLENGE_HEADER_LEN + 4 {
+            return Err(ParseError::ResponseLength(b.len()));
+        }
+        if b[0] != 1 || b[1] != 1 {
+            return Err(ParseError::ResponseVersion(b[0], b[1]));
+        }
         let timestamp = u64::from_le_bytes(b[8..16].try_into().map_err(|_| ParseError::Truncated)?);
         let challenge = b[16..24].try_into().map_err(|_| ParseError::Truncated)?;
         let (av_pairs, used) = AvPairs::parse_prefix(&b[CLIENT_CHALLENGE_HEADER_LEN..])?;
@@ -1184,7 +1202,7 @@ impl Wire for ClientChallenge {
     }
 
     /// Appends the complete blob with zero reserved fields. Refuses invalid versions,
-    /// invalid AV pairs, lengths above the response limit and allocation failure.
+    /// invalid AV pairs and lengths above the response limit.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         if self.resp_type != 1 || self.hi_resp_type != 1 || self.trailing.len() > MAX_FIELD {
             return Err(EncodeError::Unwritable);
@@ -1193,8 +1211,9 @@ impl Wire for ClientChallenge {
         write_pairs(&self.av_pairs, &mut pairs)?;
         let total = CLIENT_CHALLENGE_HEADER_LEN.checked_add(pairs.len())
             .and_then(|n| n.checked_add(self.trailing.len())).ok_or(EncodeError::Unwritable)?;
-        if total > MAX_FIELD - NT_PROOF_LEN { return Err(EncodeError::Unwritable); }
-        dst.try_reserve(total).map_err(|_| EncodeError::Unwritable)?;
+        if total > MAX_FIELD - NT_PROOF_LEN {
+            return Err(EncodeError::Unwritable);
+        }
         dst.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 0]);
         dst.extend_from_slice(&self.timestamp.to_le_bytes());
         dst.extend_from_slice(&self.challenge);
@@ -1216,12 +1235,13 @@ impl Wire for NtlmV2Response {
         Ok(Self { nt_proof, client: ClientChallenge::parse(blob)? })
     }
 
-    /// Appends the proof and client blob. Refuses invalid or oversized blobs and allocation failure.
+    /// Appends the proof and client blob. Refuses invalid or oversized blobs.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.nt_proof);
         self.client.write(&mut out)?;
-        commit(dst, &out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1231,13 +1251,23 @@ impl Wire for AvPair {
 
     /// Reads one pair, including an empty end marker. Refuses invalid lengths, values and trailing bytes.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
-        if b.len() > MAX_FIELD { return Err(ParseError::TooLong); }
-        if b.len() < 4 { return Err(ParseError::AvPairs); }
+        if b.len() > MAX_FIELD {
+            return Err(ParseError::TooLong);
+        }
+        if b.len() < 4 {
+            return Err(ParseError::AvPairs);
+        }
         let id = le16(b, 0);
         let len = le16(b, 2);
-        if id == av_id::EOL && len != 0 { return Err(ParseError::AvEolLength(len)); }
-        if b.len() != 4 + usize::from(len) { return Err(ParseError::AvPairs); }
-        if !av_value_fits(id, &b[4..]) { return Err(ParseError::AvValue(id)); }
+        if id == av_id::EOL && len != 0 {
+            return Err(ParseError::AvEolLength(len));
+        }
+        if b.len() != 4 + usize::from(len) {
+            return Err(ParseError::AvPairs);
+        }
+        if !av_value_fits(id, &b[4..]) {
+            return Err(ParseError::AvValue(id));
+        }
         Ok(Self { id, value: b[4..].to_vec() })
     }
 
@@ -1247,7 +1277,6 @@ impl Wire for AvPair {
             || (self.id == av_id::EOL && !self.value.is_empty()) {
             return Err(EncodeError::Unwritable);
         }
-        dst.try_reserve(4 + self.value.len()).map_err(|_| EncodeError::Unwritable)?;
         dst.extend_from_slice(&self.id.to_le_bytes());
         dst.extend_from_slice(&(self.value.len() as u16).to_le_bytes());
         dst.extend_from_slice(&self.value);
@@ -1267,7 +1296,9 @@ fn check_end(b: &[u8], fixed: usize, slots: &[usize]) -> Result<(), ParseError> 
             }
         }
     }
-    if end != b.len() { return Err(ParseError::Trailing); }
+    if end != b.len() {
+        return Err(ParseError::Trailing);
+    }
     Ok(())
 }
 
@@ -1281,24 +1312,16 @@ impl Wire for Version {
         Ok(Self::from_bytes(bytes))
     }
 
-    /// Appends eight bytes with zero reserved fields. Refuses allocation failure.
+    /// Appends eight bytes with zero reserved fields. Refuses no values.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let [b0, b1] = self.build.to_le_bytes();
-        out.try_reserve(VERSION_LEN).map_err(|_| EncodeError::Unwritable)?;
+
         out.extend_from_slice(&[self.major, self.minor, b0, b1, 0, 0, 0, self.revision]);
         Ok(())
     }
 }
 
 impl std::error::Error for EncodeError {}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), EncodeError> {
-    dst.try_reserve(out.len())
-        .map_err(|_| EncodeError::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {

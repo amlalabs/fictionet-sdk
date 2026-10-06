@@ -584,8 +584,7 @@ pub fn error_reply(request: &[u8], result: ResultCode, lifetime: u32, epoch: u32
     for (slot, value) in reserved.iter_mut().zip(request.get(12..request.len().min(24)).unwrap_or_default()) { *slot = *value; }
     let mut body = request.get(HEADER_LEN..request.len().min(MAX_MESSAGE)).unwrap_or_default().to_vec();
     body.resize(body.len().next_multiple_of(4), 0);
-    let (operation, options) = read_body(opcode, &body, false)
-        .unwrap_or_else(|_| (Operation::Other { opcode, data: body }, vec![]));
+    let (operation, options) = response_body(opcode, &body);
     Response { result, lifetime, epoch, reserved, operation, options }
 }
 
@@ -664,7 +663,6 @@ impl NatPmpProtocol {
 pub enum NatPmpError {
     /// Bytes follow a fixed-size message.
     Trailing,
-
     /// The value cannot be written without changing it.
     Unwritable,
     /// Too few bytes for the opcode. The value is the length.
@@ -1021,6 +1019,21 @@ fn read_body(op: u8, body: &[u8], strict: bool) -> Result<(Operation, Vec<PcpOpt
     }
 }
 
+/// Keeps response bytes opaque when decoding would discard reserved bytes
+/// or option padding. This also preserves the request body in error replies.
+fn response_body(opcode: u8, body: &[u8]) -> (Operation, Vec<PcpOption>) {
+    if let Ok((operation, options)) = read_body(opcode, body, false) {
+        let mut encoded = Vec::new();
+        if write_operation(&mut encoded, &operation).is_ok()
+            && write_options(&mut encoded, &options, false).is_ok()
+            && encoded == body
+        {
+            return (operation, options);
+        }
+    }
+    (Operation::Other { opcode, data: body.to_vec() }, vec![])
+}
+
 /// Reads MAP data from exactly [`MAP_LEN`] bytes.
 fn read_map(d: &[u8]) -> Map {
     let mut nonce = [0; 12];
@@ -1107,7 +1120,9 @@ fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), ParseError> 
         }
         Operation::Other { data, .. } => {
             let room = MAX_MESSAGE.saturating_sub(out.len());
-            if data.len() > room || !data.len().is_multiple_of(4) { return Err(ParseError::Unwritable); }
+            if data.len() > room || !data.len().is_multiple_of(4) {
+                return Err(ParseError::Unwritable);
+            }
             out.extend_from_slice(data);
         }
     }
@@ -1117,7 +1132,9 @@ fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), ParseError> 
 /// Writes every option. Refuses oversized options, duplicate request singletons
 /// and opaque request options that name a defined code.
 fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Result<(), ParseError> {
-    if options.len() > MAX_OPTIONS { return Err(ParseError::Unwritable); }
+    if options.len() > MAX_OPTIONS {
+        return Err(ParseError::Unwritable);
+    }
     let (mut third_party, mut prefer_failure) = (false, false);
     for o in options {
         if request {
@@ -1134,7 +1151,9 @@ fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Res
                 *seen = true;
             }
         }
-        if matches!(o, PcpOption::Other { data, .. } if data.len() > MAX_MESSAGE) { return Err(ParseError::Unwritable); }
+        if matches!(o, PcpOption::Other { data, .. } if data.len() > MAX_MESSAGE) {
+            return Err(ParseError::Unwritable);
+        }
         let data = o.data();
         let size = OPTION_HEADER_LEN.saturating_add(data.len().next_multiple_of(4));
         if out.len().saturating_add(size) > MAX_MESSAGE {
@@ -1203,8 +1222,11 @@ impl Wire for Request {
         out.extend_from_slice(&self.client.octets());
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, true)?;
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        commit_pcp(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(ParseError::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1218,7 +1240,8 @@ impl Wire for Response {
     /// do not understand, so a known option with the wrong length becomes
     /// [`PcpOption::Other`], repeats are kept, and MAP or PEER data or
     /// options that do not read leave the operation as
-    /// [`Operation::Other`].
+    /// [`Operation::Other`]. Nonzero body reserved bytes or option padding
+    /// also use that variant so error replies can copy the request body.
     /// Refuses malformed or trailing input.
     fn parse(b: &[u8]) -> Result<Response, ParseError> {
         if b.len() < 4 {
@@ -1233,8 +1256,7 @@ impl Wire for Response {
         check_length(b)?;
         let op = b[1] & !RESPONSE_FLAG;
         let body = &b[HEADER_LEN..];
-        let (operation, options) = read_body(op, body, false)
-            .unwrap_or_else(|_| (Operation::Other { opcode: op, data: body.to_vec() }, vec![]));
+        let (operation, options) = response_body(op, body);
         let mut reserved = [0; 12];
         reserved.copy_from_slice(&b[12..24]);
         Ok(Response {
@@ -1257,8 +1279,11 @@ impl Wire for Response {
         out.extend_from_slice(&self.reserved);
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, false)?;
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        commit_pcp(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(ParseError::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1266,8 +1291,8 @@ impl Wire for NatPmpRequest {
     type ParseError = NatPmpError;
     type WriteError = NatPmpError;
 
-    /// Reads a request. Bytes past a fixed opcode body are refused.
-    /// Refuses malformed or trailing input.
+    /// Reads a request, ignoring bytes past a fixed opcode body.
+    /// Refuses incomplete headers or bodies, responses and oversized input.
     fn parse(b: &[u8]) -> Result<NatPmpRequest, NatPmpError> {
         if b.len() < 2 {
             return Err(NatPmpError::Short(b.len()));
@@ -1284,14 +1309,12 @@ impl Wire for NatPmpRequest {
         }
         Ok(match op {
             nat_pmp_opcode::EXTERNAL_ADDRESS => {
-                if b.len() != 2 { return Err(NatPmpError::Trailing); }
                 NatPmpRequest::ExternalAddress
             },
             nat_pmp_opcode::MAP_UDP | nat_pmp_opcode::MAP_TCP => {
                 if b.len() < 12 {
                     return Err(NatPmpError::Short(b.len()));
                 }
-                if b.len() != 12 { return Err(NatPmpError::Trailing); }
                 let protocol = if op == nat_pmp_opcode::MAP_UDP { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
                 NatPmpRequest::Map {
                     protocol,
@@ -1319,15 +1342,23 @@ impl Wire for NatPmpRequest {
                 out
             }
             NatPmpRequest::Unsupported { opcode, data } => {
-                if *opcode <= nat_pmp_opcode::MAP_TCP || *opcode >= RESPONSE_FLAG { return Err(NatPmpError::Unwritable); }
+                if *opcode <= nat_pmp_opcode::MAP_TCP || *opcode >= RESPONSE_FLAG {
+                    return Err(NatPmpError::Unwritable);
+                }
                 let o = *opcode;
                 let mut out = vec![NAT_PMP_VERSION, o];
-                out.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 2)]);
+                if data.len() > MAX_MESSAGE - 2 {
+                    return Err(NatPmpError::Unwritable);
+                }
+                out.extend_from_slice(data);
                 out
             }
         };
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(NatPmpError::Unwritable); }
-        commit_nat_pmp(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(NatPmpError::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1403,16 +1434,24 @@ impl Wire for NatPmpResponse {
                 out
             }
             NatPmpResponse::Other { opcode, result, data } => {
-                if *opcode <= 2 || *opcode >= RESPONSE_FLAG { return Err(NatPmpError::Unwritable); }
+                if *opcode <= 2 || *opcode >= RESPONSE_FLAG {
+                    return Err(NatPmpError::Unwritable);
+                }
                 let op = opcode | RESPONSE_FLAG;
                 let mut out = vec![NAT_PMP_VERSION, op];
                 out.extend_from_slice(&result.code().to_be_bytes());
-                out.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 4)]);
+                if data.len() > MAX_MESSAGE - 4 {
+                    return Err(NatPmpError::Unwritable);
+                }
+                out.extend_from_slice(data);
                 out
             }
         };
-        if Self::parse(&out).as_ref() != Ok(self) { return Err(NatPmpError::Unwritable); }
-        commit_nat_pmp(dst, &out)
+        if Self::parse(&out).as_ref() != Ok(self) {
+            return Err(NatPmpError::Unwritable);
+        }
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
@@ -1445,22 +1484,6 @@ impl Wire for Reply {
             Self::NatPmp(value) => value.write(out).map_err(|_| ParseError::Unwritable),
         }
     }
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit_nat_pmp(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), NatPmpError> {
-    dst.try_reserve(out.len())
-        .map_err(|_| NatPmpError::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
-}
-
-/// Appends staged bytes after reserving space. Refuses allocation failure.
-fn commit_pcp(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), ParseError> {
-    dst.try_reserve(out.len())
-        .map_err(|_| ParseError::Unwritable)?;
-    dst.extend_from_slice(out);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1822,6 +1845,17 @@ mod tests {
         assert_eq!(ResultCode::NoResources.error_lifetime(), 30);
         assert_eq!(ResultCode::NotAuthorized.error_lifetime(), 1800);
         assert_eq!(ResultCode::Success.error_lifetime(), 0);
+    }
+
+    #[test]
+    fn error_reply_copies_map_and_option_reserved_bytes() {
+        let mut request = map_request().to_bytes().unwrap();
+        request[HEADER_LEN + 13..HEADER_LEN + 16].copy_from_slice(&[1, 2, 3]);
+        request.extend_from_slice(&[2, 0x7f, 0, 0]);
+        let reply = error_reply(&request, ResultCode::MalformedRequest, 60, 9);
+        assert_eq!(reply.to_bytes().unwrap()[HEADER_LEN..], request[HEADER_LEN..]);
+        contract::check_wire_value(&reply);
+        contract::check_wire::<Response>(&reply.to_bytes().unwrap());
     }
 
     #[test]

@@ -41,13 +41,22 @@ fuzz_target!(|data: &[u8]| {
             assert_eq!(control.to_bytes(), Err(Error::Unwritable));
         }
     }
+    // Reserved bits are read, and written as zero.
+    if let Ok(avp) = Avp::parse(data) {
+        assert_eq!(Avp::reserved_bits(data).unwrap(), (data[0] >> 2) & 15);
+        assert_eq!(Avp::reserved_bits(&avp.to_bytes().unwrap()), Ok(0));
+    }
+    if let Ok(message) = ControlMessage::parse(data)
+        && !message.is_zlb()
+    {
+        assert_eq!(Avp::reserved_bits(&message.to_bytes().unwrap()), Ok(0));
+    }
     let byte = |i: usize| data.get(i).copied().unwrap_or(0);
     let code = u16::from_be_bytes([byte(0), byte(1)]);
     assert_eq!(MessageType::from_code(code).code(), code);
     let avp = Avp {
         mandatory: byte(2) & 1 != 0,
         hidden: byte(2) & 2 != 0,
-        reserved: byte(3),
         vendor: u16::from(byte(4)),
         attribute: code,
         value: data[..data.len().min(MAX_AVP_VALUE + 1)].to_vec(),
@@ -57,7 +66,6 @@ fuzz_target!(|data: &[u8]| {
         message_type: (byte(2) & 4 != 0).then(|| MessageType::from_code(code)),
         mandatory: byte(2) & 1 != 0,
         vendor: u16::from(byte(4)),
-        reserved: byte(5),
         avps: vec![avp],
     };
     contract::check_wire_value(&message);

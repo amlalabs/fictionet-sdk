@@ -35,10 +35,10 @@ cargo +nightly fuzz list
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
-| `bacnet` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::bacnet`: BACnet/IP |
+| `bacnet` | wire units, service prefix readers, bounded decoder allocations and strict writers | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
-| `dtls` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::dtls`: DTLS records and handshake bodies |
+| `dtls` | every runtime CID length, record and datagram construction, handshake rules and wire contracts | `stdlib::dtls`: Datagram TLS |
 | `enip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::enip`: EtherNet/IP and CIP |
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |

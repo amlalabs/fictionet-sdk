@@ -29,7 +29,10 @@ fuzz_target!(|data: &[u8]| {
         }
         let reply = error_reply(b, ResultCode::MalformedRequest, 30, 1);
         contract::check_wire_value(&reply);
-        assert!(reply.to_bytes().is_ok());
+        let bytes = reply.to_bytes().unwrap();
+        let body = b.get(HEADER_LEN..b.len().min(MAX_MESSAGE)).unwrap_or_default();
+        assert_eq!(&bytes[HEADER_LEN..HEADER_LEN + body.len()], body);
+        assert!(bytes[HEADER_LEN + body.len()..].iter().all(|&byte| byte == 0));
         for speaks in [Speaks::Pcp, Speaks::NatPmp, Speaks::Both] {
             if let Incoming::Reply(reply) = receive(b, speaks, source, 11) {
                 contract::check_wire_value(&reply);
