@@ -199,10 +199,15 @@ mod __wire {
             &mut self,
             width: usize,
             limit: usize,
+            minimum: usize,
             le: bool,
             mut f: impl FnMut(&mut Self) -> Result<T, Error>,
         ) -> Result<Vec<T>, Error> {
             let n = self.count(width, le, limit)?;
+            let remaining = self.bytes.len().saturating_sub(self.pos);
+            if minimum != 0 && n > remaining / minimum {
+                return Err(Error::Truncated);
+            }
             let bytes = n
                 .checked_mul(std::mem::size_of::<T>())
                 .ok_or(Error::Limit)?;
@@ -223,9 +228,17 @@ mod __wire {
             le: bool,
             f: impl FnOnce(&mut Self) -> Result<T, Error>,
         ) -> Result<Option<T>, Error> {
-            match self.count(width, le, 1)? {
+            let flag = match width {
+                1 => u64::from(self.scalar::<u8>(le)?),
+                2 => u64::from(self.scalar::<u16>(le)?),
+                4 => u64::from(self.scalar::<u32>(le)?),
+                8 => self.scalar::<u64>(le)?,
+                _ => return Err(Error::Value),
+            };
+            match flag {
                 0 => Ok(None),
-                _ => self.nested(f).map(Some),
+                1 => self.nested(f).map(Some),
+                _ => Err(Error::Value),
             }
         }
         pub fn nullable<T: Scalar>(&mut self, null: T, le: bool) -> Result<Option<T>, Error> {
@@ -342,6 +355,7 @@ mod __wire {
     pub struct Sampler {
         pub rng: fictionet::stdlib::codec::Lcg,
         budget: Budget,
+        minimal: bool,
     }
     #[cfg(test)]
     impl Sampler {
@@ -352,6 +366,7 @@ mod __wire {
             Self {
                 rng: fictionet::stdlib::codec::Lcg::new(seed),
                 budget: Budget::default(),
+                minimal: seed == 0,
             }
         }
         pub fn nested<T>(
@@ -366,6 +381,8 @@ mod __wire {
         pub fn bytes(&mut self, width: usize, size: usize) -> Result<Vec<u8>, Error> {
             let n = if width == 0 {
                 size
+            } else if self.minimal {
+                0
             } else {
                 self.rng.index(size.min(8).saturating_add(1))
             };
@@ -392,7 +409,7 @@ mod __wire {
             limit: usize,
             mut f: impl FnMut(&mut Self) -> Result<T, Error>,
         ) -> Result<Vec<T>, Error> {
-            let n = if self.budget.depth < 4 {
+            let n = if !self.minimal && self.budget.depth < 4 {
                 self.rng.index(limit.min(2).saturating_add(1))
             } else {
                 0
@@ -412,7 +429,7 @@ mod __wire {
             &mut self,
             f: impl FnOnce(&mut Self) -> Result<T, Error>,
         ) -> Result<Option<T>, Error> {
-            if self.budget.depth < 4 && self.rng.coin() {
+            if !self.minimal && self.budget.depth < 4 && self.rng.coin() {
                 self.nested(f).map(Some)
             } else {
                 Ok(None)
@@ -425,6 +442,64 @@ mod __wire {
                 Some(value)
             })
         }
+    }
+    #[cfg(test)]
+    pub fn check<T>() -> Result<(), Error>
+    where
+        T: Codec
+            + fictionet::stdlib::codec::Wire<ParseError = Error, WriteError = Error>
+            + std::fmt::Debug
+            + PartialEq,
+    {
+        use fictionet::stdlib::codec::contract;
+        let mut successes = 0;
+        for seed in 0..32 {
+            let mut s = Sampler::seed(seed);
+            if let Ok(value) = T::sample(&mut s) {
+                contract::check_wire_value(&value);
+                if let Ok(bytes) = value.to_bytes() {
+                    assert_eq!(T::parse(&bytes)?, value);
+                    successes += 1;
+                }
+            }
+        }
+        assert!(
+            successes > 0,
+            "no writable sample for {}",
+            std::any::type_name::<T>()
+        );
+        Ok(())
+    }
+    #[cfg(test)]
+    pub fn check_stream<T, D>(
+        make: impl Fn() -> D,
+        write: fn(&T, &mut Vec<u8>) -> Result<(), Error>,
+        header: usize,
+    ) where
+        T: Codec + std::fmt::Debug + PartialEq,
+        D: fictionet::stdlib::codec::Decode<Item = T, Error = Error>,
+    {
+        use fictionet::stdlib::codec::contract;
+        let mut successes = 0;
+        for seed in 0..32 {
+            let mut s = Sampler::seed(seed);
+            if let Ok(value) = T::sample(&mut s) {
+                let mut bytes = Vec::new();
+                if write(&value, &mut bytes).is_ok() {
+                    contract::check_decode_with_alloc_limit(
+                        &make,
+                        &bytes,
+                        2 * (MAX_MESSAGE + header),
+                    );
+                    successes += 1;
+                }
+            }
+        }
+        assert!(
+            successes > 0,
+            "no writable frame for {}",
+            std::any::type_name::<D>()
+        );
     }
     pub fn parse<T: Codec>(bytes: &[u8], le: bool) -> Result<T, Error> {
         if bytes.len() > MAX_MESSAGE {
@@ -539,28 +614,33 @@ pub struct LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameN
 {
     #[doc = "LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName"]
     pub long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name:
-        __Value0,
+        u64,
 }
 impl __wire::Codec for LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName {
     fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {
         r.nested(|r| {
-            Ok(Self {
-                long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name: __read0(r, le)?,
-            })
+            let __field0 = __read0(r, le)?;
+            let value = Self {
+                long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name: __field0,
+            };
+            Ok(value)
         })
     }
     fn encode(&self, w: &mut __wire::Writer, le: bool) -> Result<(), Error> {
         w.nested(|w| {
-            __write0(w, &self.long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name, le)?;
+            let value = &self.long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name;
+            __write0(w, value, le)?;
             Ok(())
         })
     }
     #[cfg(test)]
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
-            Ok(Self {
-                long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name: __sample0(s)?,
-            })
+            let __field0 = __sample0(s)?;
+            let value = Self {
+                long_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name_name: __field0,
+            };
+            Ok(value)
         })
     }
 }
@@ -568,14 +648,14 @@ impl fictionet::stdlib::codec::Wire for LongNameNameNameNameNameNameNameNameName
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one exact value. Refuses truncation, trailing bytes, invalid values,
-    /// non-finite floats, invalid UTF-8, and all declared resource limits.
+    /// Reads one exact value. Refuses truncation and trailing bytes.
+    /// Refuses values above the declared resource limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, false)
     }
 
-    /// Appends one value. Refuses invalid values, wrong fixed sizes, reserved
-    /// nulls in Some, non-finite floats, and resource limits. Errors leave out unchanged.
+    /// Appends one value. Errors leave out unchanged.
+    /// Refuses values above the declared resource limits.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -592,7 +672,10 @@ impl __wire::Codec for Enum {
         r.nested(|r| {
             let v = r.scalar::<u64>(le)?;
             match v {
-                18446744073709551615 => Ok(Self::LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName),
+                18446744073709551615 => {
+                    let value = Self::LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName;
+                    Ok(value)
+                }
                 _ => Err(Error::Value),
             }
         })
@@ -609,7 +692,8 @@ impl __wire::Codec for Enum {
     fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {
         s.nested(|s| {
             let _ = s;
-            Ok(Self::LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName)
+            let value = Self::LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName;
+            Ok(value)
         })
     }
 }
@@ -617,14 +701,15 @@ impl fictionet::stdlib::codec::Wire for Enum {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one exact value. Refuses truncation, trailing bytes, invalid values,
-    /// non-finite floats, invalid UTF-8, and all declared resource limits.
+    /// Reads one exact value. Refuses truncation and trailing bytes.
+    /// Refuses values above the declared resource limits.
+    /// Refuses unknown enum values.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, false)
     }
 
-    /// Appends one value. Refuses invalid values, wrong fixed sizes, reserved
-    /// nulls in Some, non-finite floats, and resource limits. Errors leave out unchanged.
+    /// Appends one value. Errors leave out unchanged.
+    /// Refuses values above the declared resource limits.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -667,14 +752,16 @@ impl fictionet::stdlib::codec::Wire for EmptyFlags {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one exact value. Refuses truncation, trailing bytes, invalid values,
-    /// non-finite floats, invalid UTF-8, and all declared resource limits.
+    /// Reads one exact value. Refuses truncation and trailing bytes.
+    /// Refuses values above the declared resource limits.
+    /// Refuses undeclared set bits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, false)
     }
 
-    /// Appends one value. Refuses invalid values, wrong fixed sizes, reserved
-    /// nulls in Some, non-finite floats, and resource limits. Errors leave out unchanged.
+    /// Appends one value. Errors leave out unchanged.
+    /// Refuses values above the declared resource limits.
+    /// Refuses undeclared set bits.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -729,14 +816,14 @@ impl fictionet::stdlib::codec::Wire for AllFlags {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads one exact value. Refuses truncation, trailing bytes, invalid values,
-    /// non-finite floats, invalid UTF-8, and all declared resource limits.
+    /// Reads one exact value. Refuses truncation and trailing bytes.
+    /// Refuses values above the declared resource limits.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         __wire::parse(bytes, false)
     }
 
-    /// Appends one value. Refuses invalid values, wrong fixed sizes, reserved
-    /// nulls in Some, non-finite floats, and resource limits. Errors leave out unchanged.
+    /// Appends one value. Errors leave out unchanged.
+    /// Refuses values above the declared resource limits.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         __wire::write(self, out, false)
     }
@@ -780,46 +867,28 @@ impl fictionet::stdlib::codec::Decode for Frames {
 #[cfg(test)]
 mod generated_tests {
     use super::*;
-    use fictionet::stdlib::codec::{Wire as _, contract};
 
     #[test]
     fn generated_contracts() -> Result<(), Error> {
-        for seed in 0..32 {
-            let mut s = __wire::Sampler::seed(seed);
-            if let Ok(value) = <LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName as __wire::Codec>::sample(&mut s) {
-                contract::check_wire_value(&value);
-                if let Ok(bytes) = value.to_bytes() {
-                    assert_eq!(LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName::parse(&bytes)?, value);
-                }
-            }
-            if let Ok(value) = <Enum as __wire::Codec>::sample(&mut s) {
-                contract::check_wire_value(&value);
-                if let Ok(bytes) = value.to_bytes() {
-                    assert_eq!(Enum::parse(&bytes)?, value);
-                }
-            }
-            if let Ok(value) = <EmptyFlags as __wire::Codec>::sample(&mut s) {
-                contract::check_wire_value(&value);
-                if let Ok(bytes) = value.to_bytes() {
-                    assert_eq!(EmptyFlags::parse(&bytes)?, value);
-                }
-            }
-            if let Ok(value) = <AllFlags as __wire::Codec>::sample(&mut s) {
-                contract::check_wire_value(&value);
-                if let Ok(bytes) = value.to_bytes() {
-                    assert_eq!(AllFlags::parse(&bytes)?, value);
-                }
-            }
-            if let Ok(value) = <LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName as __wire::Codec>::sample(&mut s) {
-                let mut bytes = Vec::new();
-                if Frames::write(&value, &mut bytes).is_ok() {
-                    contract::check_decode_with_alloc_limit(
-                        || Frames,
-                        &bytes,
-                        2 * (MAX_MESSAGE + 264),
-                    );
-                }
-            }
+        {
+            use super::LongNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameNameName as Value;
+            __wire::check::<Value>()?;
+        }
+        {
+            use super::Enum as Value;
+            __wire::check::<Value>()?;
+        }
+        {
+            use super::EmptyFlags as Value;
+            __wire::check::<Value>()?;
+        }
+        {
+            use super::AllFlags as Value;
+            __wire::check::<Value>()?;
+        }
+        {
+            use super::Frames;
+            __wire::check_stream(|| Frames, Frames::write, 264);
         }
         Ok(())
     }

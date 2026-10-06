@@ -29,8 +29,17 @@ pub struct IrFrontEnd;
 /// Registered front ends. Add one instance here to expose another format.
 pub static FORMATS: &[&dyn FrontEnd] = &[&IrFrontEnd];
 
+/// Generated source and the validated schema used to emit it.
+#[derive(Clone, Debug)]
+pub struct Generated {
+    /// Copy-and-own Rust module.
+    pub source: String,
+    /// Schema available for optional fuzz target emission.
+    pub schema: crate::ValidatedSchema,
+}
+
 /// Parses, validates, and emits a format from [`FORMATS`].
-pub fn generate(format: &str, inputs: &[Input], defaults: Limits) -> Result<String, Error> {
+pub fn generate(format: &str, inputs: &[Input], defaults: Limits) -> Result<Generated, Error> {
     let frontend = FORMATS.iter().find(|f| f.name() == format).ok_or_else(|| {
         Error::new(
             ErrorKind::UnknownFormat,
@@ -39,10 +48,14 @@ pub fn generate(format: &str, inputs: &[Input], defaults: Limits) -> Result<Stri
         )
     })?;
     let checked = crate::validate(frontend.parse(inputs, defaults)?, defaults)?;
-    crate::emit(
+    let source = crate::emit(
         &checked,
         &inputs.iter().map(|i| i.name.clone()).collect::<Vec<_>>(),
-    )
+    )?;
+    Ok(Generated {
+        source,
+        schema: checked,
+    })
 }
 impl FrontEnd for IrFrontEnd {
     fn name(&self) -> &'static str {
@@ -140,13 +153,45 @@ fn integer(v: Value, path: &str) -> Result<i128, Error> {
 fn size(v: Value, path: &str) -> Result<usize, Error> {
     usize::try_from(integer(v, path)?).map_err(|_| shape(path, "expected nonnegative usize"))
 }
-fn number(v: Value, path: &str) -> Result<Number, Error> {
+fn decimal(s: &str) -> Option<(bool, String, i64)> {
+    let negative = s.starts_with('-');
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let (mantissa, exponent) = s.split_once(['e', 'E']).unwrap_or((s, "0"));
+    let fraction = mantissa.split_once('.').map_or(0, |(_, f)| f.len());
+    let digits = mantissa.replace('.', "");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some((negative, "0".into(), 0));
+    }
+    let trimmed = digits.trim_end_matches('0');
+    let exponent = exponent
+        .parse::<i64>()
+        .ok()?
+        .checked_sub(i64::try_from(fraction).ok()?)?
+        .checked_add(i64::try_from(digits.len() - trimmed.len()).ok()?)?;
+    Some((negative, trimmed.into(), exponent))
+}
+fn number(v: Value, path: &str, scalar: Option<Primitive>) -> Result<Number, Error> {
     match v {
         Value::Number(n) => {
-            if n.contains(['.', 'e', 'E']) {
-                n.parse()
-                    .map(Number::Float)
-                    .map_err(|_| shape(path, "invalid float"))
+            if n.contains(['.', 'e', 'E']) || (n == "-0" && scalar.is_some_and(Primitive::is_float))
+            {
+                let (value, spelling) = if scalar == Some(Primitive::F32) {
+                    let f = n.parse::<f32>().map_err(|_| shape(path, "invalid float"))?;
+                    (f64::from(f), f.to_string())
+                } else {
+                    let f = n.parse::<f64>().map_err(|_| shape(path, "invalid float"))?;
+                    (f, f.to_string())
+                };
+                let source = decimal(&n);
+                if !value.is_finite() || source.is_none() || source != decimal(&spelling) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidValue,
+                        path,
+                        "float null must round-trip as a decimal at its width",
+                    ));
+                }
+                Ok(Number::Float(value))
             } else {
                 n.parse()
                     .map(Number::Integer)
@@ -320,7 +365,14 @@ fn ty(v: Value, path: &str) -> Result<Type, Error> {
         "optional" => {
             let item = Box::new(ty(o.required("item")?, &format!("{path}.item"))?);
             let presence = match o.take("null") {
-                Some(v) => Presence::Null(number(v, path)?),
+                Some(v) => Presence::Null(number(
+                    v,
+                    path,
+                    match item.as_ref() {
+                        Type::Scalar(p) => Some(*p),
+                        _ => None,
+                    },
+                )?),
                 None => Presence::Flag(width(o.required("flag")?, path)?),
             };
             Type::Optional { item, presence }

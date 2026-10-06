@@ -1,6 +1,6 @@
 //! A deterministic emitter. No compiler or formatter is invoked at generation time.
 use crate::{Error, ErrorKind, ValidatedSchema, ir::*, rust_identifier, validate::IdentifierCase};
-use std::fmt::Write;
+use std::{collections::BTreeSet, fmt::Write};
 
 impl From<std::fmt::Error> for Error {
     fn from(_: std::fmt::Error) -> Self {
@@ -21,6 +21,66 @@ impl Write for Output {
         }
         self.0.push_str(text);
         Ok(())
+    }
+}
+// Prefer the first layout that fits. The final choice is the fallback for
+// identifiers that cannot fit on a line by themselves.
+fn layout(width: usize, choices: &[String]) -> String {
+    choices
+        .iter()
+        .find(|s| s.lines().all(|line| line.len() <= width))
+        .or_else(|| choices.last())
+        .cloned()
+        .unwrap_or_default()
+}
+fn braced(header: &str) -> String {
+    layout(100, &[format!("{header} {{"), format!("{header}\n{{")])
+}
+fn implementation(trait_name: Option<&str>, rust: &str) -> String {
+    let (flat, split) = match trait_name {
+        Some(t) => (
+            format!("impl {t} for {rust} {{"),
+            format!("impl {t}\n    for {rust}\n{{"),
+        ),
+        None => (format!("impl {rust} {{"), format!("impl\n    {rust}\n{{")),
+    };
+    layout(100, &[flat.clone(), split, flat])
+}
+fn assignment(prefix: &str, value: &str, suffix: &str, indent: usize) -> String {
+    let flat = format!("{prefix} {value}{suffix}");
+    let split = format!("{prefix}\n{}{value}{suffix}", " ".repeat(indent));
+    layout(100, &[flat.clone(), split, flat])
+}
+fn type_layout(prefix: &str, ty: &str, suffix: &str, indent: usize) -> String {
+    let flat = format!("{prefix}{ty}{suffix}");
+    let Some((outer, inner)) = ty.split_once('<') else {
+        return flat;
+    };
+    let inner = inner.strip_suffix('>').unwrap_or(inner);
+    let split = format!(
+        "{prefix}{outer}<\n{}\n{}>{suffix}",
+        type_layout(&" ".repeat(indent + 4), inner, ",", indent + 4),
+        " ".repeat(indent)
+    );
+    layout(100, &[flat.clone(), split, flat])
+}
+fn public_field(field: &str, ty: &str) -> String {
+    let prefix = format!("    pub {field}:");
+    layout(
+        100,
+        &[
+            format!("{prefix} {ty},"),
+            format!("{prefix}\n        {ty},"),
+            type_layout(&format!("{prefix} "), ty, ",", 4),
+            format!("{prefix}\n{}", type_layout("        ", ty, ",", 8)),
+        ],
+    )
+}
+fn import(module: &str, name: &str, alias: &str) -> String {
+    if name == alias {
+        format!("use {module}::{name};")
+    } else {
+        format!("use {module}::{name} as {alias};")
     }
 }
 fn name(s: &str) -> Result<String, Error> {
@@ -74,19 +134,62 @@ fn header(out: &mut Output, inputs: &[String]) -> Result<(), Error> {
 struct Node<'a> {
     ty: &'a Type,
     child: Option<usize>,
+    rust: String,
+    boxed: bool,
+    minimum: usize,
 }
-fn add<'a>(ty: &'a Type, nodes: &mut Vec<Node<'a>>) -> usize {
+fn add<'a>(
+    ty: &'a Type,
+    nodes: &mut Vec<Node<'a>>,
+    owner: &str,
+    checked: &ValidatedSchema,
+    in_vec: bool,
+) -> Result<usize, Error> {
     let child = match ty {
-        Type::Group { item, .. }
-        | Type::Optional {
+        Type::Group { item, .. } => Some(add(item, nodes, owner, checked, true)?),
+        Type::Optional {
             item,
             presence: Presence::Flag(_),
-        } => Some(add(item, nodes)),
+        } => Some(add(item, nodes, owner, checked, in_vec)?),
         _ => None,
     };
+    let boxed =
+        matches!(ty, Type::Ref(target) if !in_vec && checked.recursion.needs_box(owner, target));
+    let rust = match ty {
+        Type::Scalar(p) => p.rust().into(),
+        Type::Bytes(_) => "Vec<u8>".into(),
+        Type::String(_) => "String".into(),
+        Type::Ref(n) => {
+            if boxed {
+                format!("Box<{}>", name(n)?)
+            } else {
+                name(n)?
+            }
+        }
+        Type::Group { .. } => format!("Vec<{}>", nodes[child.ok_or_else(missing)?].rust),
+        Type::Optional { item, presence } => {
+            let inner = match presence {
+                Presence::Flag(_) => nodes[child.ok_or_else(missing)?].rust.clone(),
+                Presence::Null(_) => match item.as_ref() {
+                    Type::Scalar(p) => p.rust().into(),
+                    _ => return Err(missing()),
+                },
+            };
+            format!("Option<{inner}>")
+        }
+    };
+    let minimum = crate::validate::minimum_type(ty, &checked.minimum)
+        .ok_or_else(missing)?
+        .size;
     let index = nodes.len();
-    nodes.push(Node { ty, child });
-    index
+    nodes.push(Node {
+        ty,
+        child,
+        rust,
+        boxed,
+        minimum,
+    });
+    Ok(index)
 }
 fn missing() -> Error {
     Error::new(
@@ -102,8 +205,15 @@ fn length(len: &Length) -> Result<(usize, usize), Error> {
     }
 }
 fn literal(number: &Number, p: Primitive) -> String {
+    let f = match number {
+        Number::Integer(n) => *n as f64,
+        Number::Float(n) => *n,
+    };
+    if p == Primitive::F32 {
+        return format!("{:?}f32", f as f32);
+    }
     match number {
-        Number::Integer(n) if p.is_float() => format!("{:?}{}", *n as f64, p.rust()),
+        Number::Integer(_) if p.is_float() => format!("{f:?}f64"),
         Number::Integer(n) => format!("{n}{}", p.rust()),
         Number::Float(n) => format!("{n:?}{}", p.rust()),
     }
@@ -117,7 +227,7 @@ fn scalar_sample(p: Primitive) -> String {
         format!("s.number() as {}", p.rust())
     }
 }
-fn node(out: &mut Output, i: usize, n: &Node<'_>) -> Result<(), Error> {
+fn node(out: &mut Output, i: usize, n: &Node<'_>, nodes: &[Node<'_>]) -> Result<(), Error> {
     let child = n.child.unwrap_or(0);
     let (ty, read, write, sample) = match n.ty {
         Type::Scalar(p) => (
@@ -131,6 +241,7 @@ fn node(out: &mut Output, i: usize, n: &Node<'_>) -> Result<(), Error> {
             let text = matches!(n.ty, Type::String(_));
             let method = if text { "text" } else { "bytes" };
             let b = if text { "v.as_bytes()" } else { "v" };
+            writeln!(out, "const __LIMIT{i}: usize = {size};")?;
             (
                 if text {
                     "String".into()
@@ -141,27 +252,36 @@ fn node(out: &mut Output, i: usize, n: &Node<'_>) -> Result<(), Error> {
                 format!("w.bytes({b}, {width}, __LIMIT{i}, le)"),
                 format!("s.{method}({width}, __LIMIT{i})"),
             )
-                .tap_limit(out, i, size)?
         }
         Type::Ref(s) => {
             let name = name(s)?;
-            (
-                format!("Box<{name}>"),
-                format!("r.reference::<{name}>(le)"),
-                "w.reference(v.as_ref(), le)".into(),
-                format!("s.reference::<{name}>()"),
-            )
+            if n.boxed {
+                (
+                    format!("Box<{name}>"),
+                    "r.reference(le)".into(),
+                    "w.reference(v.as_ref(), le)".into(),
+                    "s.reference()".into(),
+                )
+            } else {
+                (
+                    name,
+                    format!("<__Value{i} as __wire::Codec>::read(r, le)"),
+                    "__wire::Codec::encode(v, w, le)".into(),
+                    format!("<__Value{i} as __wire::Codec>::sample(s)"),
+                )
+            }
         }
         Type::Group { count, limit, .. } => {
             let width = count.bytes();
             let limit = limit.ok_or_else(missing)?;
+            let minimum = nodes[child].minimum;
+            writeln!(out, "const __LIMIT{i}: usize = {limit};")?;
             (
                 format!("Vec<__Value{child}>"),
-                format!("r.group({width}, __LIMIT{i}, le, |r| __read{child}(r, le))"),
+                format!("r.group({width}, __LIMIT{i}, {minimum}, le, |r| __read{child}(r, le))"),
                 format!("w.group(v, {width}, __LIMIT{i}, le, |w, v| __write{child}(w, v, le))"),
                 format!("s.group(__LIMIT{i}, __sample{child})"),
             )
-                .tap_limit(out, i, limit)?
         }
         Type::Optional { item, presence } => {
             let (read, write, sample) = match presence {
@@ -202,7 +322,11 @@ fn node(out: &mut Output, i: usize, n: &Node<'_>) -> Result<(), Error> {
             (optional_type, read, write, sample)
         }
     };
-    writeln!(out, "type __Value{i} = {ty};")?;
+    writeln!(
+        out,
+        "{}",
+        assignment(&format!("type __Value{i} ="), &ty, ";", 4)
+    )?;
     writeln!(
         out,
         "fn __read{i}(r: &mut __wire::Reader<'_>, le: bool) -> Result<__Value{i}, Error> {{\n    {read}\n}}"
@@ -226,16 +350,6 @@ fn node(out: &mut Output, i: usize, n: &Node<'_>) -> Result<(), Error> {
     writeln!(out, "    {sample}\n}}\n")?;
     Ok(())
 }
-trait LimitTuple: Sized {
-    fn tap_limit(self, out: &mut Output, i: usize, limit: usize) -> Result<Self, Error>;
-}
-impl LimitTuple for (String, String, String, String) {
-    fn tap_limit(self, out: &mut Output, i: usize, limit: usize) -> Result<Self, Error> {
-        writeln!(out, "const __LIMIT{i}: usize = {limit};")?;
-        Ok(self)
-    }
-}
-
 /// Emits one self-contained Rust module using only public Fictionet APIs.
 /// Input names appear as escaped basenames in the copy-and-own header.
 /// Declaration order is preserved. No files or processes are accessed.
@@ -283,63 +397,64 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
         let mut ids = Vec::new();
         if let Definition::Struct(fs) = &t.definition {
             for f in fs {
-                ids.push(add(&f.ty, &mut nodes));
+                ids.push(add(&f.ty, &mut nodes, &t.name, checked, false)?);
             }
         }
         field_nodes.push(ids);
     }
     writeln!(out)?;
     for (i, n) in nodes.iter().enumerate() {
-        node(&mut out, i, n)?;
+        node(&mut out, i, n, &nodes)?;
     }
     for (t, ids) in checked.schema.types.iter().zip(&field_nodes) {
         let rust = name(&t.name)?;
+        let mask = match &t.definition {
+            Definition::Set { bits, .. } => {
+                bits.iter().fold(0u64, |mask, b| mask | (1u64 << b.bit))
+            }
+            _ => 0,
+        };
         documentation(&mut out, &t.doc, &format!("Wire type {}.", t.name))?;
         match &t.definition {
-            Definition::Struct(fs) if fs.is_empty() => {
-                writeln!(
-                    out,
-                    "#[derive(Clone, Debug, PartialEq)]\npub struct {rust} {{}}"
-                )?;
-            }
             Definition::Struct(fs) => {
                 writeln!(out, "#[derive(Clone, Debug, PartialEq)]")?;
-                let gap = if rust.len() + 13 > 100 { "\n" } else { " " };
-                writeln!(out, "pub struct {rust}{gap}{{")?;
-                for (f, id) in fs.iter().zip(ids) {
+                if fs.is_empty() {
                     writeln!(
                         out,
-                        "    #[doc = {:?}]",
-                        if f.doc.is_empty() {
-                            f.name.as_str()
-                        } else {
-                            &f.doc
-                        }
+                        "{}",
+                        layout(
+                            100,
+                            &[
+                                format!("pub struct {rust} {{}}"),
+                                format!("pub struct {rust}\n{{}}")
+                            ]
+                        )
                     )?;
-                    let field = field(&f.name)?;
-                    let line = format!("    pub {field}: __Value{id},");
-                    if line.len() <= 100 {
-                        writeln!(out, "{line}")?;
-                    } else {
-                        writeln!(out, "    pub {field}:\n        __Value{id},")?;
+                } else {
+                    writeln!(out, "{}", braced(&format!("pub struct {rust}")))?;
+                    for (f, id) in fs.iter().zip(ids) {
+                        writeln!(
+                            out,
+                            "    #[doc = {:?}]",
+                            if f.doc.is_empty() { &f.name } else { &f.doc }
+                        )?;
+                        let field = field(&f.name)?;
+                        writeln!(out, "{}", public_field(&field, &nodes[*id].rust))?;
                     }
+                    writeln!(out, "}}")?;
                 }
-                writeln!(out, "}}")?;
             }
             Definition::Enum { variants, .. } => {
                 writeln!(
                     out,
-                    "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub enum {rust} {{"
+                    "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\n{}",
+                    braced(&format!("pub enum {rust}"))
                 )?;
                 for v in variants {
                     writeln!(
                         out,
                         "    #[doc = {:?}]\n    {},",
-                        if v.doc.is_empty() {
-                            v.name.as_str()
-                        } else {
-                            &v.doc
-                        },
+                        if v.doc.is_empty() { &v.name } else { &v.doc },
                         name(&v.name)?
                     )?;
                 }
@@ -352,56 +467,48 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
                     "#[derive(Clone, Copy, Debug, PartialEq, Eq)]\npub struct {rust}(\n    /// Declared bits only. Unknown bits are refused by the writer.\n    pub {scalar},\n);"
                 )?;
                 if !bits.is_empty() {
-                    writeln!(out, "impl {rust} {{")?;
-                }
-                for b in bits {
-                    writeln!(
-                        out,
-                        "    #[doc = {:?}]\n    pub const {}: {scalar} = 1 << {};",
-                        if b.doc.is_empty() {
-                            b.name.as_str()
-                        } else {
-                            &b.doc
-                        },
-                        rust_identifier(&b.name, IdentifierCase::Constant)?,
-                        b.bit
-                    )?;
-                }
-                if !bits.is_empty() {
+                    writeln!(out, "{}", implementation(None, &rust))?;
+                    for b in bits {
+                        writeln!(
+                            out,
+                            "    #[doc = {:?}]",
+                            if b.doc.is_empty() { &b.name } else { &b.doc }
+                        )?;
+                        let bit = rust_identifier(&b.name, IdentifierCase::Constant)?;
+                        writeln!(
+                            out,
+                            "{}",
+                            layout(
+                                100,
+                                &[
+                                    format!("    pub const {bit}: {scalar} = 1 << {};", b.bit),
+                                    format!(
+                                        "    pub const {bit}: {scalar} =\n        1 << {};",
+                                        b.bit
+                                    ),
+                                    format!(
+                                        "    pub const {bit}:\n        {scalar} = 1 << {};",
+                                        b.bit
+                                    ),
+                                ]
+                            )
+                        )?;
+                    }
                     writeln!(out, "}}")?;
                 }
             }
         }
+        writeln!(out, "{}", implementation(Some("__wire::Codec"), &rust))?;
+        let order_arg = match &t.definition {
+            Definition::Struct(fs) if fs.iter().all(|f| f.byte_order.is_some()) => "_le",
+            _ => "le",
+        };
         writeln!(
             out,
-            "impl __wire::Codec for {rust} {{\n    fn read(r: &mut __wire::Reader<'_>, le: bool) -> Result<Self, Error> {{"
+            "    fn read(r: &mut __wire::Reader<'_>, {order_arg}: bool) -> Result<Self, Error> {{\n        r.nested(|r| {{"
         )?;
-        writeln!(out, "        r.nested(|r| {{")?;
         match &t.definition {
-            Definition::Struct(fs) if fs.is_empty() => {
-                writeln!(
-                    out,
-                    "            let _ = (r, le);\n            Ok(Self {{}})"
-                )?;
-            }
-            Definition::Struct(fs) => {
-                if fs.is_empty() {
-                    writeln!(out, "            let _ = (r, le);")?;
-                }
-                writeln!(out, "            Ok(Self {{")?;
-                for (f, id) in fs.iter().zip(ids) {
-                    writeln!(
-                        out,
-                        "                {}: __read{id}(r, {})?,",
-                        field(&f.name)?,
-                        f.byte_order
-                            .map(le)
-                            .map(|b| b.to_string())
-                            .unwrap_or("le".into())
-                    )?;
-                }
-                writeln!(out, "            }})")?;
-            }
+            Definition::Struct(fs) => struct_value(&mut out, fs, ids, false)?,
             Definition::Enum { repr, variants } => {
                 writeln!(
                     out,
@@ -409,57 +516,67 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
                     repr.rust()
                 )?;
                 for v in variants {
+                    // The binding keeps long variant paths out of nested calls.
+                    writeln!(out, "                {} => {{", v.value)?;
                     writeln!(
                         out,
-                        "                {} => Ok(Self::{}),",
-                        v.value,
-                        name(&v.name)?
+                        "{}",
+                        assignment(
+                            "                    let value =",
+                            &format!("Self::{}", name(&v.name)?),
+                            ";",
+                            24
+                        )
                     )?;
+                    writeln!(out, "                    Ok(value)\n                }}")?;
                 }
                 writeln!(
                     out,
                     "                _ => Err(Error::Value),\n            }}"
                 )?;
             }
-            Definition::Set { repr, bits } => {
-                let mask = bits.iter().fold(0u64, |mask, b| mask | (1u64 << b.bit));
+            Definition::Set { repr, .. } => {
                 writeln!(
                     out,
                     "            let v = r.scalar::<u{}>(le)?;",
                     repr.bytes() * 8
                 )?;
-                if mask != repr.max() {
-                    let condition = if mask == 0 {
-                        "v != 0".into()
-                    } else {
-                        format!("v & !{mask} != 0")
-                    };
-                    writeln!(
-                        out,
-                        "            if {condition} {{\n                return Err(Error::Value);\n            }}"
-                    )?;
-                }
+                set_check(&mut out, *repr, mask)?;
                 writeln!(out, "            Ok(Self(v))")?;
             }
         }
         writeln!(
             out,
-            "        }})\n    }}\n    fn encode(&self, w: &mut __wire::Writer, le: bool) -> Result<(), Error> {{\n        w.nested(|w| {{"
+            "        }})\n    }}\n    fn encode(&self, w: &mut __wire::Writer, {order_arg}: bool) -> Result<(), Error> {{\n        w.nested(|w| {{"
         )?;
         match &t.definition {
             Definition::Struct(fs) => {
                 if fs.is_empty() {
-                    writeln!(out, "            let _ = (w, le);")?;
+                    writeln!(out, "            let _ = w;")?;
                 }
                 for (f, id) in fs.iter().zip(ids) {
+                    // Keep the call independent of the public field's name length.
+                    let f_name = field(&f.name)?;
+                    let flat = format!("            let value = &self.{f_name};");
                     writeln!(
                         out,
-                        "            __write{id}(w, &self.{}, {})?;",
-                        field(&f.name)?,
-                        f.byte_order
-                            .map(le)
-                            .map(|b| b.to_string())
-                            .unwrap_or("le".into())
+                        "{}",
+                        layout(
+                            100,
+                            &[
+                                flat.clone(),
+                                format!("            let value =\n                &self.{f_name};"),
+                                format!(
+                                    "            let value = &self\n                .{f_name};"
+                                ),
+                                flat,
+                            ]
+                        )
+                    )?;
+                    writeln!(
+                        out,
+                        "            __write{id}(w, value, {})?;",
+                        field_order(f)
                     )?;
                 }
                 writeln!(out, "            Ok(())")?;
@@ -467,29 +584,19 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
             Definition::Enum { repr, variants } => {
                 writeln!(out, "            let v: {} = match self {{", repr.rust())?;
                 for v in variants {
-                    writeln!(
-                        out,
-                        "                Self::{} => {},",
-                        name(&v.name)?,
+                    let variant = name(&v.name)?;
+                    let flat = format!("                Self::{variant} => {},", v.value);
+                    let split = format!(
+                        "                Self::{variant} => {{\n                    {}\n                }}",
                         v.value
-                    )?;
+                    );
+                    writeln!(out, "{}", layout(100, &[flat.clone(), split, flat]))?;
                 }
                 writeln!(out, "            }};\n            w.scalar(v, le)")?;
             }
-            Definition::Set { repr, bits } => {
-                let mask = bits.iter().fold(0u64, |mask, b| mask | (1u64 << b.bit));
+            Definition::Set { repr, .. } => {
                 writeln!(out, "            let v = self.0;")?;
-                if mask != repr.max() {
-                    let condition = if mask == 0 {
-                        "v != 0".into()
-                    } else {
-                        format!("v & !{mask} != 0")
-                    };
-                    writeln!(
-                        out,
-                        "            if {condition} {{\n                return Err(Error::Value);\n            }}"
-                    )?;
-                }
+                set_check(&mut out, *repr, mask)?;
                 writeln!(out, "            w.scalar(v, le)")?;
             }
         }
@@ -498,51 +605,51 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
             "        }})\n    }}\n    #[cfg(test)]\n    fn sample(s: &mut __wire::Sampler) -> Result<Self, Error> {{\n        s.nested(|s| {{"
         )?;
         match &t.definition {
-            Definition::Struct(fs) if fs.is_empty() => {
-                writeln!(out, "            let _ = s;\n            Ok(Self {{}})")?;
-            }
-            Definition::Struct(fs) => {
-                if fs.is_empty() {
-                    writeln!(out, "            let _ = s;")?;
-                }
-                writeln!(out, "            Ok(Self {{")?;
-                for (f, id) in fs.iter().zip(ids) {
-                    writeln!(
-                        out,
-                        "                {}: __sample{id}(s)?,",
-                        field(&f.name)?
-                    )?;
-                }
-                writeln!(out, "            }})")?;
-            }
+            Definition::Struct(fs) => struct_value(&mut out, fs, ids, true)?,
             Definition::Enum { variants, .. } if variants.len() == 1 => {
-                let variant = variants.first().ok_or_else(missing)?;
+                writeln!(out, "            let _ = s;")?;
                 writeln!(
                     out,
-                    "            let _ = s;\n            Ok(Self::{})",
-                    name(&variant.name)?
+                    "{}",
+                    assignment(
+                        "            let value =",
+                        &format!("Self::{}", name(&variants[0].name)?),
+                        ";",
+                        16
+                    )
                 )?;
+                writeln!(out, "            Ok(value)")?;
             }
             Definition::Enum { variants, .. } => {
                 writeln!(
                     out,
-                    "            Ok(match s.rng.below({}) {{",
+                    "            let choice = s.rng.below({});\n            match choice {{",
                     variants.len()
                 )?;
                 for (i, v) in variants.iter().enumerate() {
                     let arm = if i + 1 == variants.len() {
-                        "_".to_string()
+                        "_".into()
                     } else {
                         i.to_string()
                     };
-                    writeln!(out, "                {arm} => Self::{},", name(&v.name)?)?;
+                    writeln!(out, "                {arm} => {{")?;
+                    writeln!(
+                        out,
+                        "{}",
+                        assignment(
+                            "                    let value =",
+                            &format!("Self::{}", name(&v.name)?),
+                            ";",
+                            24
+                        )
+                    )?;
+                    writeln!(out, "                    Ok(value)\n                }}")?;
                 }
-                writeln!(out, "            }})")?;
+                writeln!(out, "            }}")?;
             }
-            Definition::Set { repr, bits } => {
-                let mask = bits.iter().fold(0u64, |mask, b| mask | (1u64 << b.bit));
+            Definition::Set { repr, .. } => {
                 let random = if *repr == Width::U64 {
-                    "s.number()".to_string()
+                    "s.number()".into()
                 } else {
                     format!("s.number() as u{}", repr.bytes() * 8)
                 };
@@ -564,8 +671,19 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
         writeln!(out, "        }})\n    }}\n}}")?;
         writeln!(
             out,
-            "impl fictionet::stdlib::codec::Wire for {rust} {{\n    type ParseError = Error;\n    type WriteError = Error;\n\n    /// Reads one exact value. Refuses truncation, trailing bytes, invalid values,\n    /// non-finite floats, invalid UTF-8, and all declared resource limits.\n    fn parse(bytes: &[u8]) -> Result<Self, Error> {{\n        __wire::parse(bytes, {})\n    }}\n\n    /// Appends one value. Refuses invalid values, wrong fixed sizes, reserved\n    /// nulls in Some, non-finite floats, and resource limits. Errors leave out unchanged.\n    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {{\n        __wire::write(self, out, {})\n    }}\n}}\n",
-            le(checked.schema.byte_order),
+            "{}\n    type ParseError = Error;\n    type WriteError = Error;\n",
+            implementation(Some("fictionet::stdlib::codec::Wire"), &rust)
+        )?;
+        wire_docs(&mut out, t, checked, false)?;
+        writeln!(
+            out,
+            "    fn parse(bytes: &[u8]) -> Result<Self, Error> {{\n        __wire::parse(bytes, {})\n    }}\n",
+            le(checked.schema.byte_order)
+        )?;
+        wire_docs(&mut out, t, checked, true)?;
+        writeln!(
+            out,
+            "    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {{\n        __wire::write(self, out, {})\n    }}\n}}\n",
             le(checked.schema.byte_order)
         )?;
     }
@@ -575,6 +693,161 @@ pub fn emit(checked: &ValidatedSchema, inputs: &[String]) -> Result<String, Erro
     tests(&mut out, checked)?;
     Ok(out.0)
 }
+fn field_order(f: &Field) -> String {
+    f.byte_order
+        .map(le)
+        .map(|b| b.to_string())
+        .unwrap_or("le".into())
+}
+fn struct_value(out: &mut Output, fs: &[Field], ids: &[usize], sample: bool) -> Result<(), Error> {
+    if fs.is_empty() {
+        writeln!(
+            out,
+            "            let _ = {};\n            Ok(Self {{}})",
+            if sample { "s" } else { "r" }
+        )?;
+        return Ok(());
+    }
+    let mut members = Vec::new();
+    for (f, id) in fs.iter().zip(ids) {
+        let expression = if sample {
+            format!("__sample{id}(s)?")
+        } else {
+            format!("__read{id}(r, {})?", field_order(f))
+        };
+        writeln!(out, "            let __field{id} = {expression};")?;
+        members.push((field(&f.name)?, format!("__field{id}")));
+    }
+    let flat = format!(
+        "            let value = Self {{ {} }};",
+        members
+            .iter()
+            .map(|(f, v)| format!("{f}: {v}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    let mut split = String::from("            let value = Self {\n");
+    for (f, v) in members {
+        writeln!(
+            split,
+            "{}",
+            assignment(&format!("                {f}:"), &v, ",", 20)
+        )?;
+    }
+    split.push_str("            };");
+    // rustfmt's default struct_lit_width is 18 bytes between the braces.
+    writeln!(
+        out,
+        "{}\n            Ok(value)",
+        layout(
+            18 + "            let value = Self {  };".len(),
+            &[flat, split]
+        )
+    )?;
+    Ok(())
+}
+fn set_check(out: &mut Output, repr: Width, mask: u64) -> Result<(), Error> {
+    if mask != repr.max() {
+        let condition = if mask == 0 {
+            "v != 0".into()
+        } else {
+            format!("v & !{mask} != 0")
+        };
+        writeln!(
+            out,
+            "            if {condition} {{\n                return Err(Error::Value);\n            }}"
+        )?;
+    }
+    Ok(())
+}
+fn wire_docs(
+    out: &mut Output,
+    t: &NamedType,
+    checked: &ValidatedSchema,
+    write: bool,
+) -> Result<(), Error> {
+    let mut refusals = BTreeSet::new();
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![t];
+    while let Some(t) = pending.pop() {
+        if !seen.insert(&t.name) {
+            continue;
+        }
+        match &t.definition {
+            Definition::Enum { .. } if !write => {
+                refusals.insert("unknown enum values");
+            }
+            Definition::Set { repr, bits } if bits.len() < repr.bytes() * 8 => {
+                refusals.insert("undeclared set bits");
+            }
+            Definition::Struct(fs) => {
+                for f in fs {
+                    let mut ty = &f.ty;
+                    loop {
+                        match ty {
+                            Type::Scalar(p) if p.is_float() => {
+                                refusals.insert("non-finite floats");
+                            }
+                            Type::String(_) if !write => {
+                                refusals.insert("invalid UTF-8");
+                            }
+                            Type::Bytes(Length::Fixed(_)) | Type::String(Length::Fixed(_))
+                                if write =>
+                            {
+                                refusals.insert("wrong fixed data lengths");
+                            }
+                            Type::Ref(n) => {
+                                if let Some(t) = checked.schema.types.iter().find(|t| &t.name == n)
+                                {
+                                    pending.push(t);
+                                }
+                            }
+                            Type::Optional { item, presence } => {
+                                match presence {
+                                    Presence::Flag(_) if !write => {
+                                        refusals.insert("flags other than 0 or 1");
+                                    }
+                                    Presence::Null(_) if write => {
+                                        refusals.insert("reserved nulls in Some");
+                                    }
+                                    _ => {}
+                                }
+                                ty = item;
+                                continue;
+                            }
+                            Type::Group { item, .. } => {
+                                ty = item;
+                                continue;
+                            }
+                            _ => {}
+                        }
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    writeln!(
+        out,
+        "    /// {}",
+        if write {
+            "Appends one value. Errors leave out unchanged."
+        } else if checked.minimum.get(&t.name).is_some_and(|m| m.size == 0) {
+            "Reads one exact value. Refuses trailing bytes."
+        } else {
+            "Reads one exact value. Refuses truncation and trailing bytes."
+        }
+    )?;
+    writeln!(
+        out,
+        "    /// Refuses values above the declared resource limits."
+    )?;
+    for refusal in refusals {
+        writeln!(out, "    /// Refuses {refusal}.")?;
+    }
+    Ok(())
+}
 fn stream(out: &mut Output, s: &Stream, body: ByteOrder) -> Result<(), Error> {
     let rust = name(&s.name)?;
     let item = name(&s.item)?;
@@ -582,45 +855,78 @@ fn stream(out: &mut Output, s: &Stream, body: ByteOrder) -> Result<(), Error> {
     let prefix_le = le(s.byte_order);
     let body_le = le(body);
     let magic = format!("b\"{}\"", s.magic.escape_ascii());
-    let signature =
-        format!("    pub fn write(value: &{item}, out: &mut Vec<u8>) -> Result<(), Error> {{");
-    let signature = if signature.len() > 100 {
-        format!(
-            "    pub fn write(\n        value: &{item},\n        out: &mut Vec<u8>,\n    ) -> Result<(), Error> {{"
-        )
-    } else {
-        signature
-    };
     writeln!(
         out,
-        "/// Frames of [`{item}`], with fixed magic and a body-length prefix.\n#[derive(Clone, Copy, Debug, Default)]\npub struct {rust};\nimpl {rust} {{\n    const MAGIC: &'static [u8] = {magic};\n\n    /// Appends a complete frame. Refuses invalid bodies and prefix overflow.\n    /// Errors leave the destination unchanged.\n{signature}\n        __wire::write_frame(value, out, Self::MAGIC, {width}, {prefix_le}, {body_le})\n    }}\n}}\nimpl fictionet::stdlib::codec::Decode for {rust} {{\n    type Item = {item};\n    type Error = Error;\n    const NAME: &'static str = {:?};\n\n    fn capacity(&self) -> usize {{\n        MAX_MESSAGE + {}\n    }}\n\n    /// Refuses bad magic, oversized prefixes, and invalid complete bodies.\n    /// Partial frames return Need, including at EOF. Holds no input.\n    fn decode(\n        &mut self,\n        input: &[u8],\n        _eof: bool,\n    ) -> Result<fictionet::stdlib::codec::Step<Self::Item>, Error> {{\n        __wire::frame(input, Self::MAGIC, {width}, {prefix_le}, {body_le})\n    }}\n}}\n",
-        s.name,
+        "/// Frames of [`{item}`], with fixed magic and a body-length prefix.\n#[derive(Clone, Copy, Debug, Default)]\npub struct {rust};\n{}",
+        implementation(None, &rust)
+    )?;
+    writeln!(
+        out,
+        "{}\n",
+        assignment("    const MAGIC: &'static [u8] =", &magic, ";", 8)
+    )?;
+    writeln!(
+        out,
+        "    /// Appends a complete frame. Refuses invalid bodies and prefix overflow.\n    /// Errors leave the destination unchanged."
+    )?;
+    let signature = layout(
+        100,
+        &[
+            format!("    pub fn write(value: &{item}, out: &mut Vec<u8>) -> Result<(), Error> {{"),
+            format!(
+                "    pub fn write(\n        value: &{item},\n        out: &mut Vec<u8>,\n    ) -> Result<(), Error> {{"
+            ),
+        ],
+    );
+    writeln!(
+        out,
+        "{signature}\n        __wire::write_frame(value, out, Self::MAGIC, {width}, {prefix_le}, {body_le})\n    }}\n}}\n{}",
+        implementation(Some("fictionet::stdlib::codec::Decode"), &rust)
+    )?;
+    writeln!(out, "{}", assignment("    type Item =", &item, ";", 8))?;
+    writeln!(out, "    type Error = Error;")?;
+    writeln!(
+        out,
+        "{}\n",
+        assignment(
+            "    const NAME: &'static str =",
+            &format!("{:?}", s.name),
+            ";",
+            8
+        )
+    )?;
+    writeln!(
+        out,
+        "    fn capacity(&self) -> usize {{\n        MAX_MESSAGE + {}\n    }}\n\n    /// Refuses bad magic, oversized prefixes, and invalid complete bodies.\n    /// Partial frames return Need, including at EOF. Holds no input.\n    fn decode(\n        &mut self,\n        input: &[u8],\n        _eof: bool,\n    ) -> Result<fictionet::stdlib::codec::Step<Self::Item>, Error> {{\n        __wire::frame(input, Self::MAGIC, {width}, {prefix_le}, {body_le})\n    }}\n}}\n",
         s.magic.len() + width
     )?;
     Ok(())
 }
 fn tests(out: &mut Output, checked: &ValidatedSchema) -> Result<(), Error> {
+    if checked.schema.types.is_empty() {
+        return Ok(());
+    }
     writeln!(
         out,
-        "#[cfg(test)]\nmod generated_tests {{\n    use super::*;\n    use fictionet::stdlib::codec::{{Wire as _, contract}};\n\n    #[test]\n    fn generated_contracts() -> Result<(), Error> {{\n        for seed in 0..32 {{\n            let mut s = __wire::Sampler::seed(seed);"
+        "#[cfg(test)]\nmod generated_tests {{\n    use super::*;\n\n    #[test]\n    fn generated_contracts() -> Result<(), Error> {{"
     )?;
     for t in &checked.schema.types {
-        let n = name(&t.name)?;
         writeln!(
             out,
-            "            if let Ok(value) = <{n} as __wire::Codec>::sample(&mut s) {{\n                contract::check_wire_value(&value);\n                if let Ok(bytes) = value.to_bytes() {{\n                    assert_eq!({n}::parse(&bytes)?, value);\n                }}\n            }}"
+            "        {{\n            {}\n            __wire::check::<Value>()?;\n        }}",
+            import("super", &name(&t.name)?, "Value")
         )?;
     }
-    for stream in &checked.schema.streams {
-        let n = name(&stream.item)?;
-        let f = name(&stream.name)?;
+    for s in &checked.schema.streams {
+        let n = name(&s.name)?;
         writeln!(
             out,
-            "            if let Ok(value) = <{n} as __wire::Codec>::sample(&mut s) {{\n                let mut bytes = Vec::new();\n                if {f}::write(&value, &mut bytes).is_ok() {{\n                    contract::check_decode_with_alloc_limit(\n                        || {f},\n                        &bytes,\n                        2 * (MAX_MESSAGE + {}),\n                    );\n                }}\n            }}",
-            stream.magic.len() + stream.prefix.bytes()
+            "        {{\n            {}\n            __wire::check_stream(|| Frames, Frames::write, {});\n        }}",
+            import("super", &n, "Frames"),
+            s.magic.len() + s.prefix.bytes()
         )?;
     }
-    writeln!(out, "        }}\n        Ok(())\n    }}\n}}")?;
+    writeln!(out, "        Ok(())\n    }}\n}}")?;
     Ok(())
 }
 
@@ -648,15 +954,15 @@ pub fn emit_fuzz(
     for t in &checked.schema.types {
         writeln!(
             out,
-            "    contract::check_wire::<protocol::{}>(data);",
-            name(&t.name)?
+            "    {{\n        {}\n        contract::check_wire::<Value>(data);\n    }}",
+            import("protocol", &name(&t.name)?, "Value")
         )?;
     }
     for s in &checked.schema.streams {
         writeln!(
             out,
-            "    contract::check_decode_with_alloc_limit(\n        || protocol::{},\n        data,\n        2 * (protocol::MAX_MESSAGE + {}),\n    );",
-            name(&s.name)?,
+            "    {{\n        {}\n        contract::check_decode_with_alloc_limit(|| Frames, data, 2 * (protocol::MAX_MESSAGE + {}));\n    }}",
+            import("protocol", &name(&s.name)?, "Frames"),
             s.magic.len() + s.prefix.bytes()
         )?;
     }

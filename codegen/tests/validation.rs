@@ -377,3 +377,195 @@ fn diagnostic_locations_do_not_copy_unbounded_names() {
     assert_eq!(error.kind, ErrorKind::InputLimit);
     assert!(error.location.len() < MAX_NAME);
 }
+
+#[test]
+fn minimum_depth_and_message_size_must_fit() {
+    let mut chain = Schema::default();
+    for i in 0..=40 {
+        let mut named = one(if i == 40 {
+            Type::Scalar(Primitive::U8)
+        } else {
+            Type::Ref(format!("C{}", i + 1))
+        })
+        .types
+        .remove(0);
+        named.name = format!("C{i}");
+        chain.types.push(named);
+    }
+    assert_eq!(
+        validate(chain.clone(), Limits::default()).unwrap_err().kind,
+        ErrorKind::IrLimit
+    );
+    validate(
+        chain,
+        Limits {
+            max_depth: 41,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+
+    let pair = schema(r#"{"types":[{"name":"A","kind":"struct","fields":[{"name":"b","type":{"kind":"ref","name":"B"}}]},{"name":"B","kind":"enum","repr":"u8","variants":[{"name":"v","value":1}]}]}"#).unwrap();
+    assert_eq!(
+        validate(
+            pair.clone(),
+            Limits {
+                max_depth: 1,
+                ..Limits::default()
+            }
+        )
+        .unwrap_err()
+        .kind,
+        ErrorKind::IrLimit
+    );
+    validate(
+        pair,
+        Limits {
+            max_depth: 2,
+            max_message: 1,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+
+    let mut s = one(Type::Bytes(Length::Fixed(DEFAULT_MAX_MESSAGE)));
+    let Definition::Struct(fs) = &mut s.types[0].definition else {
+        unreachable!()
+    };
+    let mut second = fs[0].clone();
+    second.name = "second".into();
+    fs.push(second);
+    assert_eq!(
+        validate(s, Limits::default()).unwrap_err().kind,
+        ErrorKind::IrLimit
+    );
+    for ty in [
+        Type::Optional {
+            item: Box::new(Type::Ref("Value".into())),
+            presence: Presence::Flag(Width::U8),
+        },
+        Type::Group {
+            item: Box::new(Type::Ref("Value".into())),
+            count: Width::U8,
+            limit: Some(1),
+        },
+    ] {
+        validate(
+            one(ty),
+            Limits {
+                max_depth: 1,
+                max_message: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn public_fields_show_types_and_only_inline_cycles_need_boxes() {
+    let groups = emit(&checked(include_str!("schemas/groups.json")).unwrap(), &[]).unwrap();
+    for declaration in [
+        "pub status: Status,",
+        "pub flags: Flags,",
+        "pub values: Vec<Vec<i32>>,",
+        "pub entries: Vec<Entry>,",
+        "pub label: Option<String>,",
+    ] {
+        assert!(groups.contains(declaration), "missing {declaration}");
+    }
+    let recursive = emit(
+        &checked(include_str!("schemas/recursive.json")).unwrap(),
+        &[],
+    )
+    .unwrap();
+    assert!(recursive.contains("pub children: Vec<Node>,"));
+    assert!(recursive.contains("pub next: Option<Box<Node>>,"));
+    let mutual = checked(r#"{"types":[{"name":"A","kind":"struct","fields":[{"name":"b","type":{"kind":"ref","name":"B"}}]},{"name":"B","kind":"struct","fields":[{"name":"a","type":{"kind":"optional","flag":"u8","item":{"kind":"ref","name":"A"}}}]},{"name":"C","kind":"struct","fields":[{"name":"a","type":{"kind":"ref","name":"A"}},{"name":"c","type":{"kind":"optional","flag":"u8","item":{"kind":"ref","name":"C"}}}]}]}"#).unwrap();
+    let source = emit(&mutual, &[]).unwrap();
+    assert!(source.contains("pub b: Box<B>,"));
+    assert!(source.contains("pub a: Option<Box<A>>,"));
+    assert!(source.contains("pub a: A,"));
+    let vector_cycle = checked(r#"{"types":[{"name":"A","kind":"struct","fields":[{"name":"b","type":{"kind":"ref","name":"B"}}]},{"name":"B","kind":"struct","fields":[{"name":"a","type":{"kind":"group","count":"u8","item":{"kind":"ref","name":"A"}}}]}]}"#).unwrap();
+    assert_eq!(
+        vector_cycle.recursive_types().collect::<Vec<_>>(),
+        ["A", "B"]
+    );
+    let source = emit(&vector_cycle, &[]).unwrap();
+    assert!(source.contains("pub b: B,"));
+    assert!(source.contains("pub a: Vec<A>,"));
+}
+
+#[test]
+fn float_null_decimals_round_trip_at_their_width() {
+    for (repr, literal, accepted) in [
+        ("f32", "1e-400", false),
+        ("f64", "1e-400", false),
+        ("f32", "-1e-400", false),
+        ("f64", "-1e-400", false),
+        ("f32", "1.00000001", false),
+        ("f64", "0.10000000000000001", false),
+        ("f32", "0.1", true),
+        ("f64", "0.1", true),
+        ("f32", "1.2500e0", true),
+        ("f64", "125e-2", true),
+        ("f32", "3.4028235e38", true),
+        ("f64", "1.7976931348623157e308", true),
+        ("f32", "1e-45", true),
+        ("f64", "5e-324", true),
+        ("f32", "-0.0", true),
+        ("f64", "0.00e123", true),
+        ("f32", "1e39", false),
+        ("f64", "1e309", false),
+    ] {
+        let input = format!(
+            r#"{{"types":[{{"name":"A","kind":"struct","fields":[{{"name":"n","type":{{"kind":"optional","item":"{repr}","null":{literal}}}}}]}}]}}"#
+        );
+        assert_eq!(checked(&input).is_ok(), accepted, "{repr}: {literal}");
+    }
+    let s = one(Type::Optional {
+        item: Box::new(Type::Scalar(Primitive::F32)),
+        presence: Presence::Null(Number::Float(f64::from(f32::MAX))),
+    });
+    let source = emit(&validate(s, Limits::default()).unwrap(), &[]).unwrap();
+    assert!(source.contains("3.4028235e38f32"));
+    assert!(!source.contains("3.4028234663852886"));
+}
+
+#[test]
+fn wire_docs_name_only_applicable_value_refusals() {
+    let source = emit(
+        &checked(include_str!("schemas/short_names.json")).unwrap(),
+        &[],
+    )
+    .unwrap();
+    let wire = source
+        .split("impl fictionet::stdlib::codec::Wire for A {")
+        .nth(1)
+        .unwrap()
+        .split("/// Frames of")
+        .next()
+        .unwrap();
+    assert!(wire.contains("unknown enum values"));
+    for irrelevant in [
+        "non-finite",
+        "nulls",
+        "UTF-8",
+        "fixed data",
+        "set bits",
+        "flags other",
+    ] {
+        assert!(!wire.contains(irrelevant), "{irrelevant}");
+    }
+    let source = emit(&checked(include_str!("schemas/groups.json")).unwrap(), &[]).unwrap();
+    let entry = source
+        .split("impl fictionet::stdlib::codec::Wire for Entry {")
+        .nth(1)
+        .unwrap()
+        .split("#[doc =")
+        .next()
+        .unwrap();
+    assert!(entry.contains("unknown enum values"));
+    assert!(entry.contains("undeclared set bits"));
+    assert!(!entry.contains("UTF-8"));
+}

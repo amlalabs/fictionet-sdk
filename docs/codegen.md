@@ -12,6 +12,7 @@ formats such as SBE, FIX, FAST, XDR, protobuf, ASN.1, OpenAPI/JSON
 Schema, and DCE/RPC parse their schemas into this IR. Tagged fields,
 varints, padding rules, and text formats get their own IR encoding forms
 when those front ends need them.
+Unions will be added when a front end needs them.
 
 ## Generate and use a module
 
@@ -71,11 +72,14 @@ structural visits, including named values, group entries, and present
 flagged options. This prevents nested collections of empty values from
 causing excessive work. `MAX_DEPTH` counts active named values, group
 entries, and present flagged options. The parser and writer use the same
-accounting. A schema can require more bytes or depth than an application
-limit allows; such values are refused at runtime.
+accounting. Validation refuses a named type if its minimum encoded size
+or nesting depth exceeds these limits. Empty collections and absent
+options define the minimum. Larger values are checked at runtime.
 
-Parsing vectors reserves the checked length exactly. Allocation budgets
-refer to requested storage; allocator bookkeeping is outside the budget.
+Parsing a group checks that its minimum entry sizes fit the remaining
+input before reserving the checked count. Zero-byte entries still use
+the node and allocation budgets. Allocation budgets refer to requested
+storage; allocator bookkeeping is outside the budget.
 Writers stage at most `MAX_MESSAGE` bytes, with vector growth bounded by
 twice that number. Frame writers also stage at most 264 header bytes.
 The caller owns and budgets the destination vector across multiple
@@ -188,19 +192,27 @@ one. Docs do not affect parsing.
 | `{"kind":"group","count":"u16","limit":8,"item":"u32"}` | Unsigned entry count and consecutive entries as `Vec<T>` |
 | `{"kind":"optional","flag":"u8","item":"i32"}` | A 0 or 1 flag; 1 is followed by a value, as `Option<T>` |
 | `{"kind":"optional","null":-1,"item":"i32"}` | One scalar; the reserved value means `None` |
-| `{"kind":"ref","name":"Order"}` | Named type, emitted as `Box<Order>` |
+| `{"kind":"ref","name":"Order"}` | Named type, emitted as `Order` unless an inline cycle needs `Box<Order>` |
 
 Prefix, count, flag, and set widths are `u8`, `u16`, `u32`, or `u64`.
 Variable data and groups may omit `limit`; validation fills it from the
 CLI default, capped to the width. Groups and flagged options can nest.
 Null options require a scalar item, and the null must fit exactly.
-Floating-point nulls must be finite and exactly representable. Float
-sentinels compare by bits, so positive and negative zero remain distinct.
+Floating-point null decimals must be finite and round-trip through the
+width's shortest decimal spelling. Equivalent decimal spellings, such as
+`1.25` and `125e-2`, are accepted. Extra digits that round away and nonzero
+values that underflow to zero are refused for both widths. Integer nulls
+must be exactly representable. In the library IR, `Number::Float` holds an
+already parsed binary value; it must fit the target width without rounding.
+Float sentinels compare by bits, so positive and negative zero remain distinct.
 `Some(null)` is refused by the writer.
 
-References use exact source names. All references are boxed, including
-acyclic ones. Cycles are detected and listed by
-`ValidatedSchema::recursive_types`. A mandatory reference cycle without
+References use exact source names. Public fields show their Rust types
+directly. Acyclic references use the named type. References inside a
+`Vec` also use the named type. Direct fields and options use `Box` only
+when they close a cycle through inline fields. A cycle through a `Vec`
+already has the indirection Rust needs. All reference cycles are listed
+by `ValidatedSchema::recursive_types`. A mandatory reference cycle without
 a terminating optional field or group has no finite value and is refused.
 Every generated read and write has a depth guard.
 
@@ -238,8 +250,11 @@ The crate exports `Schema`, `NamedType`, `Definition`, `Field`, `Type`,
 and `Limits`. Construct them directly or use `FrontEnd::parse`. Call
 `validate(schema, limits)` to obtain a `ValidatedSchema`, then
 `emit(&validated, &input_names)` to get Rust source. `generate` combines
-registry lookup, parsing, validation, and emission. `Error` carries an
-`ErrorKind`, a location or schema path, and a short explanation.
+registry lookup, parsing, validation, and emission. It returns `Generated`,
+with `source: String` and `schema: ValidatedSchema`. The CLI uses this same
+pipeline and uses the returned schema for an optional fuzz target.
+`Error` carries an `ErrorKind`, a location or schema path, and a short
+explanation.
 
 Implement `FrontEnd: Sync` with `name()` and
 `parse(&[Input], Limits) -> Result<Schema, Error>`. The parser must bound
@@ -262,11 +277,15 @@ under the node budget. There is no speculative parsing of partial stream
 bodies. Returned values have bounded depth, including when dropped.
 
 Generated tests build bounded values with public `codec::Lcg` and run
-`contract::check_wire_value`. Stream tests also run
-`check_decode_with_alloc_limit`. Tests cover invalid writes, malformed
+`contract::check_wire_value`. Each type and stream must sample and write
+successfully at least once. Seed zero selects the minimum shape.
+Stream tests also run `check_decode_with_alloc_limit`. Tests cover invalid writes, malformed
 bytes, recursion limits, every generator error category, CLI errors,
 JSON limits, deterministic output, and exact golden source bytes.
-The golden check runs `rustfmt --check` when `rustfmt` is on PATH.
+Formatting checks run `rustfmt --edition 2024 --check` over the goldens,
+every name length from 1 through `MAX_NAME`, and deterministic random
+schemas when rustfmt is on PATH. Random modules also compile with warnings
+denied and run their generated tests. They use clippy when it is installed.
 
 The XDR example covers big-endian signed and unsigned numbers, enums,
 fixed opaque bytes, counted arrays, and four-byte optional flags.
@@ -276,8 +295,9 @@ and compare generated reads and writes with `onc_rpc::Reader` and
 mutations, and arbitrary bytes. Protobuf and ASN.1 use tagged encodings.
 Their front ends add the IR forms and the matching comparisons.
 
-Goldens live in `codegen/tests/golden`. The root integration target
-`tests/codegen.rs` compiles them and runs their emitted tests. Additional
+Goldens live in `codegen/tests/golden`. The codegen test target compiles
+them and runs their emitted tests. It also runs the root integration checks
+in `tests/codegen.rs`. Additional
 fixtures check small allocation and work budgets, long identifiers, and
 maximum-sized stream headers. To update:
 
@@ -293,6 +313,12 @@ To emit another target:
 ```sh
 CARGO_BUILD_JOBS=4 cargo run -p fictionet-codegen -- ir schema.json -o protocol.rs --fuzz fuzz/fuzz_targets/protocol.rs
 ```
+
+Output paths are checked against every input and each other before any
+input is read. Existing symlinks are resolved; Unix hard links are also
+compared. The module and fuzz target are staged in temporary files before
+renaming them into place. Each rename replaces one file; the pair is not
+a filesystem transaction.
 
 `--fuzz` writes a target-relative module path. The target needs the fuzz
 workspace's `libfuzzer-sys` and `fictionet` dependencies. The generated

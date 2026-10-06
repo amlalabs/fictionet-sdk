@@ -105,6 +105,24 @@
           "type": "u8"
         }
       ]
+    },
+    {
+      "name": "TextBatch",
+      "kind": "struct",
+      "fields": [
+        {
+          "name": "texts",
+          "type": {
+            "kind": "group",
+            "item": {
+              "kind": "string",
+              "prefix": "u8"
+            },
+            "count": "u32",
+            "limit": 1048576
+          }
+        }
+      ]
     }
   ]
 }

@@ -19,7 +19,7 @@ pub mod ir;
 mod json;
 mod validate;
 pub use emit::{emit, emit_fuzz};
-pub use frontend::{FORMATS, FrontEnd, Input, IrFrontEnd, generate};
+pub use frontend::{FORMATS, FrontEnd, Generated, Input, IrFrontEnd, generate};
 pub use ir::*;
 pub use validate::{IdentifierCase, ValidatedSchema, rust_identifier, validate};
 

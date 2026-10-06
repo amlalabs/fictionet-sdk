@@ -12,10 +12,12 @@ use fictionet::stdlib::codec::contract;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_wire::<protocol::Node>(data);
-    contract::check_decode_with_alloc_limit(
-        || protocol::NodeFrames,
-        data,
-        2 * (protocol::MAX_MESSAGE + 6),
-    );
+    {
+        use protocol::Node as Value;
+        contract::check_wire::<Value>(data);
+    }
+    {
+        use protocol::NodeFrames as Frames;
+        contract::check_decode_with_alloc_limit(|| Frames, data, 2 * (protocol::MAX_MESSAGE + 6));
+    }
 });

@@ -232,6 +232,9 @@ dependencies = [
 [[package]]
 name = "fictionet-codegen"
 version = "0.1.0"
+dependencies = [
+ "fictionet",
+]
 
 [[package]]
 name = "fictionet-copy-modules"

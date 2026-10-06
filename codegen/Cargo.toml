@@ -6,5 +6,8 @@ rust-version = "1.91"
 description = "Bounded, copy-and-own Fictionet protocol generation"
 license = "MIT OR Apache-2.0"
 
+[dev-dependencies]
+fictionet = { path = ".." }
+
 [lints.rust]
 missing_docs = "deny"

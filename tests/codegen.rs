@@ -25,12 +25,12 @@ fn dynamic_read(bytes: &[u8]) -> Result<xdr::Record, XdrError> {
     let signed = r.int()?;
     let wide = r.uhyper()?;
     let negative = r.hyper()?;
-    let choice = Box::new(match r.enumeration()? {
+    let choice = match r.enumeration()? {
         -1 => xdr::Choice::Negative,
         0 => xdr::Choice::Zero,
         1 => xdr::Choice::Positive,
         n => return Err(XdrError::Discriminant(n as u32)),
-    });
+    };
     let opaque = r.opaque_fixed(4)?.to_vec();
     let entries = r.array(8, Reader::uint)?;
     let maybe = r.optional(Reader::uhyper)?;
@@ -52,7 +52,7 @@ fn dynamic_write(value: &xdr::Record) -> Vec<u8> {
         .int(value.signed)
         .uhyper(value.wide)
         .hyper(value.negative);
-    w.enumeration(match *value.choice {
+    w.enumeration(match value.choice {
         xdr::Choice::Negative => -1,
         xdr::Choice::Zero => 0,
         xdr::Choice::Positive => 1,
@@ -78,11 +78,11 @@ fn xdr_differential_examples_generated_values_and_mutated_inputs() {
             signed: rng.next() as i32,
             wide,
             negative: !(wide as i64),
-            choice: Box::new(match rng.below(3) {
+            choice: match rng.below(3) {
                 0 => xdr::Choice::Negative,
                 1 => xdr::Choice::Zero,
                 _ => xdr::Choice::Positive,
-            }),
+            },
             opaque: vec![rng.next() as u8; 4],
             entries: (0..rng.below(9)).map(|_| rng.next() as u32).collect(),
             maybe: rng.coin().then_some(wide),
@@ -120,7 +120,7 @@ fn recursive_depth_and_transactional_errors() {
     for _ in 0..5 {
         value = Node {
             value: 2,
-            children: vec![Box::new(value)],
+            children: vec![value],
             next: None,
         };
     }
@@ -344,15 +344,15 @@ fn generator_handles_mutated_and_arbitrary_json() {
 #[test]
 fn total_allocation_and_node_budgets_cover_empty_groups() {
     use budgets::{Bag, Empty, Error};
-    // Three zero-sized entries: seven structural visits and 24 vector bytes.
+    // Three zero-sized entries: seven structural visits and no heap bytes.
     assert!(Bag::parse(&[3, 0]).is_ok());
     // Four entries fit the allocation budget but exceed eight structural visits.
     assert_eq!(Bag::parse(&[4, 0]), Err(Error::Limit));
-    // Five entries exceed the allocation budget before any entry is parsed.
+    // Five entries also exceed the structural visit budget.
     assert_eq!(Bag::parse(&[5, 0]), Err(Error::Limit));
     let mut out = vec![1, 2, 3];
     let value = Bag {
-        items: (0..4).map(|_| Box::new(Empty {})).collect(),
+        items: (0..4).map(|_| Empty {}).collect(),
         data: Vec::new(),
     };
     assert_eq!(value.write(&mut out), Err(Error::Limit));
@@ -363,4 +363,16 @@ fn total_allocation_and_node_budgets_cover_empty_groups() {
     let mut bytes = vec![0; 129];
     bytes[0] = 0;
     assert_eq!(Bag::parse(&bytes), Err(Error::Limit));
+}
+
+#[test]
+fn group_counts_must_fit_the_remaining_input() {
+    use fictionet::stdlib::codec::Wire;
+    // A count must fit the remaining bytes before it consumes allocation budget.
+    assert_eq!(groups::Batch::parse(&[255]), Err(groups::Error::Limit));
+    assert_eq!(groups::Batch::parse(&[3]), Err(groups::Error::Truncated));
+    assert_eq!(
+        groups::TextBatch::parse(&[0, 16, 0, 0, 0]),
+        Err(groups::Error::Truncated)
+    );
 }

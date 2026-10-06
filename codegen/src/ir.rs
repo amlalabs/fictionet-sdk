@@ -212,7 +212,7 @@ pub enum Type {
         /// Absence encoding.
         presence: Presence,
     },
-    /// An exact source name. Generated references are boxed to allow cycles.
+    /// An exact source name. Only cycles through inline fields require boxes.
     Ref(String),
 }
 

@@ -9,6 +9,10 @@ const EXAMPLES: &[&str] = &[
     "xdr",
     "budgets",
     "edges",
+    "one_field",
+    "short_names",
+    "long_names",
+    "float_nulls",
 ];
 #[test]
 fn goldens_and_determinism() {
@@ -29,10 +33,14 @@ fn goldens_and_determinism() {
             name: format!("/ignored/path/{name}.json"),
             bytes: std::fs::read(root.join(format!("schemas/{name}.json"))).unwrap(),
         };
-        let source = generate("ir", std::slice::from_ref(&input), limits).unwrap();
+        let source = generate("ir", std::slice::from_ref(&input), limits)
+            .unwrap()
+            .source;
         assert_eq!(
             source,
-            generate("ir", std::slice::from_ref(&input), limits).unwrap()
+            generate("ir", std::slice::from_ref(&input), limits)
+                .unwrap()
+                .source
         );
         let path = root.join(format!("golden/{name}.rs"));
         if std::env::var_os("BLESS_CODEGEN").is_some() {
@@ -45,7 +53,7 @@ fn goldens_and_determinism() {
         );
         let mut renamed = input.clone();
         renamed.name = format!("C:\\other\\{name}.json");
-        assert_eq!(source, generate("ir", &[renamed], limits).unwrap());
+        assert_eq!(source, generate("ir", &[renamed], limits).unwrap().source);
         if *name == "recursive" {
             let checked = validate(IrFrontEnd.parse(&[input], limits).unwrap(), limits).unwrap();
             assert_eq!(checked.recursive_types().collect::<Vec<_>>(), ["Node"]);

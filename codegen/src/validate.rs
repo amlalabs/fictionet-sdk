@@ -107,7 +107,23 @@ const RESERVED: &[&str] = &[
 pub struct ValidatedSchema {
     pub(crate) schema: Schema,
     pub(crate) limits: Limits,
-    pub(crate) recursive: BTreeSet<String>,
+    pub(crate) recursion: Recursion,
+    pub(crate) minimum: BTreeMap<String, Minimum>,
+}
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Recursion {
+    types: BTreeSet<String>,
+    boxed: BTreeSet<(String, String)>,
+}
+impl Recursion {
+    pub(crate) fn needs_box(&self, owner: &str, target: &str) -> bool {
+        self.boxed.contains(&(owner.into(), target.into()))
+    }
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Minimum {
+    pub(crate) size: usize,
+    depth: usize,
 }
 impl ValidatedSchema {
     /// Normalized schema. Every variable-length item has an explicit limit.
@@ -120,7 +136,7 @@ impl ValidatedSchema {
     }
     /// Source names participating in reference cycles, in sorted order.
     pub fn recursive_types(&self) -> impl Iterator<Item = &str> {
-        self.recursive.iter().map(String::as_str)
+        self.recursion.types.iter().map(String::as_str)
     }
 }
 fn err(kind: ErrorKind, path: &str, message: &str) -> Error {
@@ -162,14 +178,16 @@ fn scope<'a>(
 }
 /// Checks resource limits, identifiers, widths, references, and cycles.
 /// Missing collection limits are filled from `limits.max_collection`.
+/// Minimum encoded sizes and nesting depths must fit the configured limits.
 /// Mandatory cycles with no finite value are refused. Other cycles are
 /// recorded and use the generated `MAX_DEPTH` guard on both read and write.
 pub fn validate(mut schema: Schema, limits: Limits) -> Result<ValidatedSchema, Error> {
     match validate_inner(&mut schema, limits) {
-        Ok(recursive) => Ok(ValidatedSchema {
+        Ok((recursion, minimum)) => Ok(ValidatedSchema {
             schema,
             limits,
-            recursive,
+            recursion,
+            minimum,
         }),
         Err(error) => {
             // A caller may construct an arbitrarily deep boxed IR. Dispose of
@@ -188,7 +206,10 @@ pub fn validate(mut schema: Schema, limits: Limits) -> Result<ValidatedSchema, E
         }
     }
 }
-fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<BTreeSet<String>, Error> {
+fn validate_inner(
+    schema: &mut Schema,
+    limits: Limits,
+) -> Result<(Recursion, BTreeMap<String, Minimum>), Error> {
     if !(1..=16 << 20).contains(&limits.max_message)
         || limits.max_collection > 1 << 20
         || !(1..=64).contains(&limits.max_depth)
@@ -328,70 +349,119 @@ fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<BTreeSet<String
             }
         }
     }
-    let mut inhabited = BTreeSet::new();
+    let mut minimum = BTreeMap::new();
     loop {
-        let before = inhabited.len();
+        let before = minimum.len();
         for t in &schema.types {
-            if match &t.definition {
-                Definition::Struct(fs) => fs.iter().all(|f| finite(&f.ty, &inhabited)),
-                _ => true,
-            } {
-                inhabited.insert(t.name.clone());
+            let value = match &t.definition {
+                Definition::Struct(fs) => fs.iter().try_fold(Minimum::default(), |mut sum, f| {
+                    let field = minimum_type(&f.ty, &minimum)?;
+                    sum.size = sum.size.saturating_add(field.size);
+                    sum.depth = sum.depth.max(field.depth);
+                    Some(sum)
+                }),
+                Definition::Enum { repr, .. } => Some(Minimum {
+                    size: repr.bytes(),
+                    depth: 0,
+                }),
+                Definition::Set { repr, .. } => Some(Minimum {
+                    size: repr.bytes(),
+                    depth: 0,
+                }),
+            };
+            if let Some(mut value) = value {
+                value.depth += 1;
+                if value.size > limits.max_message || value.depth > limits.max_depth {
+                    return Err(err(
+                        ErrorKind::IrLimit,
+                        &format!("types.{}", t.name),
+                        "minimum encoded size or nesting depth exceeds the configured limit",
+                    ));
+                }
+                minimum.insert(t.name.clone(), value);
             }
         }
-        if before == inhabited.len() {
+        if before == minimum.len() {
             break;
         }
     }
-    if let Some(t) = schema.types.iter().find(|t| !inhabited.contains(&t.name)) {
+    if let Some(t) = schema.types.iter().find(|t| !minimum.contains_key(&t.name)) {
         return Err(err(
             ErrorKind::UninhabitedType,
             &format!("types.{}", t.name),
             "mandatory cycle has no finite value",
         ));
     }
-    let edges: BTreeMap<String, Vec<String>> = schema
-        .types
-        .iter()
-        .map(|t| {
-            let mut refs = Vec::new();
-            if let Definition::Struct(fs) = &t.definition {
-                for f in fs {
-                    references(&f.ty, &mut refs);
+    let edges = |through_groups| -> BTreeMap<String, Vec<String>> {
+        schema
+            .types
+            .iter()
+            .map(|t| {
+                let mut refs = Vec::new();
+                if let Definition::Struct(fs) = &t.definition {
+                    for f in fs {
+                        references(&f.ty, &mut refs, through_groups);
+                    }
                 }
-            }
-            (t.name.clone(), refs)
-        })
-        .collect();
-    let mut recursive = BTreeSet::new();
+                (t.name.clone(), refs)
+            })
+            .collect()
+    };
+    let all = edges(true);
+    let inline = edges(false);
+    let mut recursion = Recursion::default();
     for t in &schema.types {
-        let mut pending = edges.get(&t.name).cloned().unwrap_or_default();
-        let mut seen = BTreeSet::new();
-        while let Some(next) = pending.pop() {
-            if next == t.name {
-                recursive.insert(t.name.clone());
-                break;
-            }
-            if seen.insert(next.clone())
-                && let Some(nexts) = edges.get(&next)
+        if reachable(&t.name, &all).contains(&t.name) {
+            recursion.types.insert(t.name.clone());
+        }
+        // A Vec already breaks the Rust layout cycle. Only inline paths need boxes.
+        for source in reachable(&t.name, &inline) {
+            if inline
+                .get(&source)
+                .is_some_and(|targets| targets.contains(&t.name))
             {
-                pending.extend(nexts.iter().cloned());
+                recursion.boxed.insert((source, t.name.clone()));
             }
         }
     }
-    Ok(recursive)
+    Ok((recursion, minimum))
 }
-fn finite(ty: &Type, inhabited: &BTreeSet<String>) -> bool {
-    match ty {
-        Type::Ref(n) => inhabited.contains(n),
-        Type::Group { .. } | Type::Optional { .. } => true,
-        _ => true,
+fn reachable(start: &str, edges: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
+    let mut pending = edges.get(start).cloned().unwrap_or_default();
+    let mut seen = BTreeSet::new();
+    while let Some(next) = pending.pop() {
+        if seen.insert(next.clone())
+            && let Some(nexts) = edges.get(&next)
+        {
+            pending.extend(nexts.iter().cloned());
+        }
     }
+    seen
 }
-fn references(ty: &Type, refs: &mut Vec<String>) {
+pub(crate) fn minimum_type(ty: &Type, named: &BTreeMap<String, Minimum>) -> Option<Minimum> {
+    let size = match ty {
+        Type::Ref(n) => return named.get(n).copied(),
+        Type::Scalar(p) => p.bytes(),
+        Type::Bytes(Length::Fixed(n)) | Type::String(Length::Fixed(n)) => *n,
+        Type::Bytes(Length::Variable { prefix, .. })
+        | Type::String(Length::Variable { prefix, .. }) => prefix.bytes(),
+        Type::Group { count, .. } => count.bytes(),
+        Type::Optional {
+            presence: Presence::Flag(flag),
+            ..
+        } => flag.bytes(),
+        Type::Optional {
+            item,
+            presence: Presence::Null(_),
+        } => return minimum_type(item, named),
+    };
+    Some(Minimum { size, depth: 0 })
+}
+fn references(ty: &Type, refs: &mut Vec<String>, through_groups: bool) {
     match ty {
         Type::Ref(n) => refs.push(n.clone()),
-        Type::Group { item, .. } | Type::Optional { item, .. } => references(item, refs),
+        Type::Group { item, .. } if through_groups => references(item, refs, through_groups),
+        Type::Optional { item, .. } => references(item, refs, through_groups),
         _ => {}
     }
 }

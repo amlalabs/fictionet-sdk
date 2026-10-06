@@ -108,3 +108,125 @@ fn generate_limits_fuzz_and_bad_files() {
     assert!(!cli(&["ir", i, "-o", i]).status.success());
     assert!(!cli(&["ir", i, "-o", o, "--fuzz", o]).status.success());
 }
+
+#[test]
+fn outputs_cannot_alias_inputs_or_each_other() {
+    let scratch = Scratch::new();
+    let schema = include_str!("schemas/recursive.json");
+    for args in [
+        vec!["ir", "input.json", "-o", "out.rs", "--fuzz", "./input.json"],
+        vec!["ir", "input.json", "-o", "./input.json"],
+        vec!["ir", "input.json", "-o", "out.rs", "--fuzz", "./out.rs"],
+    ] {
+        std::fs::write(scratch.0.join("input.json"), schema).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+            .current_dir(&scratch.0)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "accepted {args:?}");
+        assert!(String::from_utf8_lossy(&result.stderr).contains("Cli"));
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("input.json")).unwrap(),
+            schema
+        );
+        assert!(!scratch.0.join("out.rs").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn outputs_cannot_alias_inputs_through_links() {
+    let scratch = Scratch::new();
+    let schema = include_str!("schemas/recursive.json");
+    std::fs::write(scratch.0.join("input.json"), schema).unwrap();
+    std::os::unix::fs::symlink("input.json", scratch.0.join("link.json")).unwrap();
+    std::fs::hard_link(scratch.0.join("input.json"), scratch.0.join("hard.json")).unwrap();
+    for args in [
+        vec!["ir", "link.json", "-o", "input.json"],
+        vec!["ir", "input.json", "-o", "link.json"],
+        vec!["ir", "input.json", "-o", "out.rs", "--fuzz", "link.json"],
+        vec!["ir", "hard.json", "-o", "input.json"],
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+            .current_dir(&scratch.0)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert!(!result.status.success(), "accepted {args:?}");
+        assert_eq!(
+            std::fs::read_to_string(scratch.0.join("input.json")).unwrap(),
+            schema
+        );
+        assert!(!scratch.0.join("out.rs").exists());
+    }
+}
+
+#[test]
+fn failed_fuzz_staging_keeps_existing_module() {
+    let scratch = Scratch::new();
+    std::fs::write(
+        scratch.0.join("input.json"),
+        include_str!("schemas/recursive.json"),
+    )
+    .unwrap();
+    std::fs::write(scratch.0.join("out.rs"), "original").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+        .current_dir(&scratch.0)
+        .args([
+            "ir",
+            "input.json",
+            "-o",
+            "out.rs",
+            "--fuzz",
+            "missing/fuzz.rs",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join("out.rs")).unwrap(),
+        "original"
+    );
+    assert_eq!(std::fs::read_dir(&scratch.0).unwrap().count(), 2);
+}
+
+#[test]
+fn checks_all_paths_before_opening_inputs() {
+    let scratch = Scratch::new();
+    std::fs::write(scratch.0.join("input.json"), "unread").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+        .current_dir(&scratch.0)
+        .args([
+            "ir",
+            "missing.json",
+            "input.json",
+            "-o",
+            "out.rs",
+            "--fuzz",
+            "./input.json",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("Cli"));
+    assert_eq!(
+        std::fs::read_to_string(scratch.0.join("input.json")).unwrap(),
+        "unread"
+    );
+}
+
+#[test]
+fn refuses_an_impossible_depth_from_cli() {
+    let scratch = Scratch::new();
+    let schema = r#"{"types":[{"name":"A","kind":"struct","fields":[{"name":"b","type":{"kind":"ref","name":"B"}}]},{"name":"B","kind":"struct","fields":[]}]}"#;
+    std::fs::write(scratch.0.join("input.json"), schema).unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_fictionet-codegen"))
+        .current_dir(&scratch.0)
+        .args(["ir", "input.json", "-o", "out.rs", "--max-depth", "1"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("IrLimit"));
+    assert!(!scratch.0.join("out.rs").exists());
+}
