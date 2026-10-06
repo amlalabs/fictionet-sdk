@@ -22,6 +22,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&packet);
     contract::check_wire_value(&Datagram::Esp(packet));
     if let Ok(a) = AhPacket::parse(data) {
+        assert_eq!(a.to_bytes().unwrap(), data);
         let (header, payload) = AhPacket::split(data).unwrap();
         assert_eq!(header, a.header);
         assert_eq!(payload, &a.payload);

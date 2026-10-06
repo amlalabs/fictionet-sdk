@@ -24,8 +24,9 @@
 //! the packet's [`Endpoints`], and prepares a reply with [`Packet::frame`].
 //! Write that frame with [`Wire::write`] in an IP packet with protocol
 //! [`PROTOCOL`], usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`].
-//! For pieces of one payload, use [`Stream<Collect<Datagram>>`](super::codec::Stream)
-//! with [`MAX_MESSAGE`], map the payload through [`Packet::parse`], and
+//! For pieces of one payload, use [`Stream<Frames>`](super::codec::Stream)
+//! with `Frames = Collect<Datagram>` and a limit of [`MAX_MESSAGE`].
+//! Map the payload through [`Packet::parse`], and
 //! call `end` at the IP packet boundary. Which routers and links exist,
 //! when Hellos go out, and how routes are worked out are up to world code.
 //!
@@ -1625,14 +1626,12 @@ fn check_designated(body: &LsaBody, advertising_router: Ipv4Addr) -> Result<(), 
     if list.contains(&advertising_router) { Ok(()) } else { Err(OspfError::LsaBody) }
 }
 
-/// What the bytes so far show of how a payload is laid out.
+/// The boundaries declared by a complete payload's headers.
 struct Layout {
     /// Where the packet and its digest end.
     base: usize,
-    /// Where the payload ends, signaling block included, once the bytes
-    /// show it. It is unknown while a block may follow and its header
-    /// has not come in.
-    end: Option<usize>,
+    /// Where the payload ends, including any signaling block.
+    end: usize,
 }
 
 /// The ones' complement checksum of a link-local signaling block, with
@@ -1641,12 +1640,10 @@ fn lls_checksum(block: &[u8]) -> u16 {
     !fold(sum_words(0, &block[2..]))
 }
 
-/// Checks the header fields the bytes so far hold, in the order they come.
-/// Once the length and, for a Hello or Database Description, the L bit
-/// are known it returns the layout. Every error it gives holds for any
-/// bytes that could follow.
-fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<Layout>, OspfError> {
-    let Some(base) = check_base(b, endpoints)? else { return Ok(None) };
+/// Checks a complete payload's header and returns its declared end,
+/// including any digest and link-local signaling block.
+fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Layout, OspfError> {
+    let base = check_base(b, endpoints)?;
     let v = endpoints.version();
     let len = usize::from(be16(b, 2));
     // Where the options byte holding the L bit sits, and the bit.
@@ -1659,30 +1656,28 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<Layout>, OspfE
     };
     // A packet too short to hold its options fails as a body anyway.
     let lls = match l_at {
-        Some((at, bit)) if at < len => match b.get(at) {
-            None => return Ok(None),
-            Some(&o) => o & bit != 0,
-        },
+        Some((at, bit)) if at < len => b.get(at).ok_or(OspfError::Truncated)? & bit != 0,
         _ => false,
     };
-    if !lls {
-        return Ok(Some(Layout { base, end: Some(base) }));
+    // The L bit may be set without a block following the packet.
+    if !lls || b.len() == base {
+        return Ok(Layout { base, end: base });
     }
     if b.len() < base + 4 {
-        return Ok(Some(Layout { base, end: None }));
+        return Err(OspfError::Truncated);
     }
     let words = usize::from(be16(b, base + 2));
     let end = base + words * 4;
     if words == 0 || end > MAX_MESSAGE {
         return Err(OspfError::Lls);
     }
-    Ok(Some(Layout { base, end: Some(end) }))
+    Ok(Layout { base, end })
 }
 
-/// The header checks up to the length, which give where the packet and
-/// its digest end.
-fn check_base(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, OspfError> {
-    let Some(&version) = b.first() else { return Ok(None) };
+/// Checks the header through its length and authentication fields, then
+/// returns where the packet and its digest end. Refuses missing fields.
+fn check_base(b: &[u8], endpoints: &Endpoints) -> Result<usize, OspfError> {
+    let &version = b.first().ok_or(OspfError::Truncated)?;
     if version != 2 && version != 3 {
         return Err(OspfError::Version(version));
     }
@@ -1690,30 +1685,28 @@ fn check_base(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, OspfErro
     if version != v.number() {
         return Err(OspfError::Family);
     }
-    let Some(&t) = b.get(1) else { return Ok(None) };
+    let &t = b.get(1).ok_or(OspfError::Truncated)?;
     if !(packet_type::HELLO..=packet_type::LINK_STATE_ACK).contains(&t) {
         return Err(OspfError::Type(t));
     }
     if b.len() < 4 {
-        return Ok(None);
+        return Err(OspfError::Truncated);
     }
     let length = be16(b, 2);
     if usize::from(length) < v.header_len() {
         return Err(OspfError::Length(length));
     }
     if v == Version::V3 {
-        return Ok(Some(usize::from(length)));
+        return Ok(usize::from(length));
     }
     if b.len() < 16 {
-        return Ok(None);
+        return Err(OspfError::Truncated);
     }
     if be16(b, 14) != auth_type::CRYPTOGRAPHIC {
-        return Ok(Some(usize::from(length)));
+        return Ok(usize::from(length));
     }
-    match b.get(19) {
-        None => Ok(None),
-        Some(&n) => Ok(Some(usize::from(length) + usize::from(n))),
-    }
+    let &n = b.get(19).ok_or(OspfError::Truncated)?;
+    Ok(usize::from(length) + usize::from(n))
 }
 
 impl Packet {
@@ -1726,13 +1719,8 @@ impl Packet {
     /// by its length. A checksum of 0xffff is taken where 0x0000 is due,
     /// since the two are equal in ones' complement.
     pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Packet, OspfError> {
-        let layout = check_header(b, endpoints)?.ok_or(OspfError::Truncated)?;
-        let end = match layout.end {
-            Some(end) => end,
-            // The L bit is set and no block follows.
-            None if b.len() == layout.base => layout.base,
-            None => return Err(OspfError::Truncated),
-        };
+        let layout = check_header(b, endpoints)?;
+        let end = layout.end;
         if b.len() < end {
             return Err(OspfError::Truncated);
         }
@@ -2093,50 +2081,12 @@ fn put_lsa_header(out: &mut Vec<u8>, h: &LsaHeader, v: Version) -> Result<(), Os
     Ok(())
 }
 
-/// One bounded IP payload, with every received byte preserved.
-///
-/// [`Wire`](super::codec::Wire) reads the entire payload and checks only
-/// [`MAX_MESSAGE`]. It does not validate an OSPF message or its checksum.
-/// Use [`Packet::parse`] with the packet's [`Endpoints`] for that check.
-/// The endpoints are not encoded in this payload.
-///
-/// ```
-/// use fictionet::stdlib::{codec::{Collect, Decode, Stream}, ospf};
-/// # let endpoints = ospf::Endpoints::V4 {
-/// #     source: "192.0.2.1".parse().unwrap(),
-/// #     destination: "224.0.0.1".parse().unwrap(),
-/// # };
-/// let messages = Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
-///     .map(move |datagram| ospf::Packet::parse(&datagram.0, &endpoints));
-/// let mut stream = Stream::new(messages);
-/// // Push chunks of one IP payload, then call stream.end().
-/// # stream.end();
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Datagram(
-    /// Complete payload bytes, including the received checksum.
-    /// Parsing and writing refuse more than [`MAX_MESSAGE`] bytes.
-    pub Vec<u8>,
-);
-
-crate::bounded_datagram_wire!(Datagram, OspfError, OspfError::TooLong, MAX_MESSAGE);
-
-fn be16(b: &[u8], i: usize) -> u16 {
-    u16::from_be_bytes([b[i], b[i + 1]])
-}
-
-fn be32(b: &[u8], i: usize) -> u32 {
-    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
-}
-
 /// Implements byte-preserving [`Wire`] for a named tuple payload with a byte limit.
-/// The payload stores a `Vec<u8>` in its first field. Its protocol parser
-/// supplies any context that is absent from the bytes. Used by OSPF, PIM,
-/// and VRRP so their bounded payloads share the same length checks.
-#[macro_export]
+/// The payload stores a `Vec<u8>` in its first field. Its OSPF parser
+/// supplies any context that is absent from the bytes.
 macro_rules! bounded_datagram_wire {
     ($unit:ty, $error:ty, $too_long:expr, $limit:expr) => {
-        impl $crate::stdlib::codec::Wire for $unit {
+        impl Wire for $unit {
             type ParseError = $error;
             type WriteError = $error;
 
@@ -2160,6 +2110,42 @@ macro_rules! bounded_datagram_wire {
     };
 }
 
+/// One bounded IP payload, with every received byte preserved.
+///
+/// [`Wire`] reads the entire payload and checks only
+/// [`MAX_MESSAGE`]. It does not validate an OSPF message or its checksum.
+/// Use [`Packet::parse`] with the packet's [`Endpoints`] for that check.
+/// The endpoints are not encoded in this payload.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Collect, Decode, Stream}, ospf};
+/// # let endpoints = ospf::Endpoints::V4 {
+/// #     source: "192.0.2.1".parse().unwrap(),
+/// #     destination: "224.0.0.1".parse().unwrap(),
+/// # };
+/// let messages = Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
+///     .map(move |datagram| ospf::Packet::parse(&datagram.0, &endpoints));
+/// let mut stream = Stream::new(messages);
+/// // Push chunks of one IP payload, then call stream.end().
+/// # stream.end();
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Datagram(
+    /// Complete payload bytes, including the received checksum.
+    /// Parsing and writing refuse more than [`MAX_MESSAGE`] bytes.
+    pub Vec<u8>,
+);
+
+bounded_datagram_wire!(Datagram, OspfError, OspfError::TooLong, MAX_MESSAGE);
+
+fn be16(b: &[u8], i: usize) -> u16 {
+    u16::from_be_bytes([b[i], b[i + 1]])
+}
+
+fn be32(b: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
+}
+
 /// An LSA's bytes, interpreted with a separate [`Version`].
 /// Construct with [`Lsa::frame`] or copy a bounded payload with [`Wire::parse`].
 /// Use [`Lsa::parse`] to validate its fields and Fletcher checksum.
@@ -2168,7 +2154,7 @@ pub struct LsaFrame(
     /// Complete LSA bytes, at most [`MAX_LSA`].
     pub Vec<u8>,
 );
-crate::bounded_datagram_wire!(LsaFrame, OspfError, OspfError::TooLong, MAX_LSA);
+bounded_datagram_wire!(LsaFrame, OspfError, OspfError::TooLong, MAX_LSA);
 
 /// An LSA body's bytes, interpreted with a separate version and LS type.
 /// Construct with [`LsaBody::frame`] or copy a bounded payload with [`Wire::parse`].
@@ -2178,7 +2164,7 @@ pub struct LsaBodyFrame(
     /// Body bytes, at most [`MAX_LSA`] minus [`LSA_HEADER_LEN`].
     pub Vec<u8>,
 );
-crate::bounded_datagram_wire!(LsaBodyFrame, OspfError, OspfError::TooLong, MAX_LSA - LSA_HEADER_LEN);
+bounded_datagram_wire!(LsaBodyFrame, OspfError, OspfError::TooLong, MAX_LSA - LSA_HEADER_LEN);
 
 #[cfg(test)]
 mod tests {
@@ -3437,7 +3423,7 @@ mod tests {
 
     impl Samples for Lcg {
         fn ip4(&mut self) -> Ipv4Addr {
-            Ipv4Addr::from(self.next() as u32)
+            Ipv4Addr::from(u32::from_be_bytes(std::array::from_fn(|_| self.next() as u8)))
         }
         fn ip6(&mut self) -> Ipv6Addr {
             let mut a = [0u8; 16];
@@ -3445,7 +3431,7 @@ mod tests {
             Ipv6Addr::from(a)
         }
         fn u24(&mut self) -> u32 {
-            (self.next() as u32) & MAX_U24
+            u32::from_be_bytes(std::array::from_fn(|_| self.next() as u8)) & MAX_U24
         }
         fn prefix(&mut self) -> Prefix {
             let length = self.index(129) as u8;
@@ -3458,7 +3444,7 @@ mod tests {
         }
         /// A sequence number other than the reserved one.
         fn sequence(&mut self) -> u32 {
-            match self.next() as u32 {
+            match u32::from_be_bytes(std::array::from_fn(|_| self.next() as u8)) {
                 RESERVED_SEQUENCE => INITIAL_SEQUENCE,
                 s => s,
             }
@@ -3515,7 +3501,7 @@ mod tests {
                                 tos: if i == 0 { 0 } else { rng.next() as u8 & 0x7f },
                                 metric: rng.u24(),
                                 forwarding_address: rng.ip4(),
-                                route_tag: (rng.next() as u32),
+                                route_tag: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                             })
                             .collect(),
                     }),
@@ -3535,8 +3521,8 @@ mod tests {
                             .map(|_| RouterInterface {
                                 kind: [1, 2, 4][rng.index(3)],
                                 metric: rng.next() as u16,
-                                interface_id: (rng.next() as u32),
-                                neighbor_interface_id: (rng.next() as u32),
+                                interface_id: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
+                                neighbor_interface_id: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                                 neighbor_router_id: rng.ip4(),
                             })
                             .collect(),
@@ -3570,7 +3556,7 @@ mod tests {
                         } else {
                             None
                         },
-                        route_tag: if !rng.coin() { Some(rng.next() as u32) } else { None },
+                        route_tag: if !rng.coin() { Some(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8))) } else { None },
                         referenced: if !rng.coin() {
                             Some((1 + rng.index(0xfffe) as u16, rng.ip4()))
                         } else {
@@ -3635,13 +3621,13 @@ mod tests {
                     hello_interval: rng.next() as u16,
                     options: rng.next() as u8,
                     priority: rng.next() as u8,
-                    dead_interval: (rng.next() as u32),
+                    dead_interval: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                     designated_router: rng.ip4(),
                     backup_designated_router: rng.ip4(),
                     neighbors: (0..n).map(|_| rng.ip4()).collect(),
                 }),
                 Version::V3 => Body::HelloV3(HelloV3 {
-                    interface_id: (rng.next() as u32),
+                    interface_id: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                     priority: rng.next() as u8,
                     options: rng.u24(),
                     hello_interval: rng.next() as u16,
@@ -3653,15 +3639,15 @@ mod tests {
             },
             1 => Body::DatabaseDescription(DatabaseDescription {
                 mtu: rng.next() as u16,
-                options: if v == Version::V2 { (rng.next() as u32) & 0xff } else { rng.u24() },
+                options: if v == Version::V2 { u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)) & 0xff } else { rng.u24() },
                 flags: rng.next() as u8,
-                sequence: (rng.next() as u32),
+                sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                 headers: (0..n).map(|_| random_header(rng, v)).collect(),
             }),
             2 => Body::LinkStateRequest(
                 (0..n)
                     .map(|_| LsaKey {
-                        ls_type: if v == Version::V2 { rng.next() as u32 } else { (rng.next() as u32) & 0xffff },
+                        ls_type: if v == Version::V2 { u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)) } else { u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)) & 0xffff },
                         link_state_id: rng.ip4(),
                         advertising_router: rng.ip4(),
                     })
@@ -3677,7 +3663,7 @@ mod tests {
                     1 => Auth::Simple([rng.next() as u8; 8]),
                     2 => Auth::Cryptographic {
                         key_id: rng.next() as u8,
-                        sequence: (rng.next() as u32),
+                        sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                         digest: rng.bytes(32),
                     },
                     _ => Auth::Other { kind: 3 + rng.index(100) as u16, data: [rng.next() as u8; 8] },
@@ -3759,7 +3745,7 @@ mod tests {
             0 => l.ls_type = rng.next() as u16,
             1 => l.options = rng.next() as u8,
             2 => l.age = rng.next() as u16,
-            3 => l.sequence = if !rng.coin() { RESERVED_SEQUENCE } else { rng.next() as u32 },
+            3 => l.sequence = if !rng.coin() { RESERVED_SEQUENCE } else { u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)) },
             4 => match &mut l.body {
                 LsaBody::Router(r) => {
                     if let Some(link) = r.links.first_mut() {
@@ -3773,14 +3759,14 @@ mod tests {
                 LsaBody::Network(n) => n.attached_routers.truncate(rng.index(2)),
                 LsaBody::NetworkV3(n) => {
                     if !rng.coin() {
-                        n.options = rng.next() as u32;
+                        n.options = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8));
                     } else {
                         n.attached_routers.truncate(rng.index(2));
                     }
                 }
                 LsaBody::Summary(s) => {
                     if !rng.coin() {
-                        s.metric = rng.next() as u32;
+                        s.metric = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8));
                     } else {
                         s.network_mask = rng.ip4();
                     }
@@ -3788,14 +3774,14 @@ mod tests {
                 LsaBody::AsExternal(e) => match rng.index(3) {
                     0 => e.routes.clear(),
                     1 => e.routes[0].tos = rng.next() as u8,
-                    _ => e.routes[0].metric = rng.next() as u32,
+                    _ => e.routes[0].metric = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                 },
                 LsaBody::RouterV3(r) => match r.interfaces.first_mut() {
                     Some(i) if !rng.coin() => i.kind = rng.next() as u8,
-                    _ => r.options = rng.next() as u32,
+                    _ => r.options = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                 },
                 LsaBody::InterAreaPrefix(p) => p.prefix = wild_prefix(rng),
-                LsaBody::InterAreaRouter(r) => r.metric = rng.next() as u32,
+                LsaBody::InterAreaRouter(r) => r.metric = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                 LsaBody::AsExternalV3(e) => match rng.index(3) {
                     0 => e.prefix = wild_prefix(rng),
                     1 => e.referenced = Some((rng.index(3) as u16, rng.ip4())),
@@ -3830,7 +3816,7 @@ mod tests {
                     }
                 }
                 Body::DatabaseDescription(d) => {
-                    d.options = (rng.next() as u32) >> rng.index(32);
+                    d.options = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)) >> rng.index(32);
                     if let Some(h) = d.headers.first_mut() {
                         h.options = rng.next() as u8;
                         h.ls_type = rng.next() as u16;
@@ -3851,10 +3837,10 @@ mod tests {
                 }
                 Body::LinkStateRequest(keys) => {
                     if let Some(k) = keys.first_mut() {
-                        k.ls_type = rng.next() as u32;
+                        k.ls_type = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8));
                     }
                 }
-                Body::HelloV3(h) => h.options = (rng.next() as u32) >> rng.index(32),
+                Body::HelloV3(h) => h.options = u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)) >> rng.index(32),
                 Body::HelloV2(h) => h.options = rng.next() as u8,
             }
             if rng.index(4) == 0 {
@@ -3893,21 +3879,25 @@ mod tests {
             // Mutations, with the checksums fixed again so the parser
             // looks past them.
             let mut bad = good.clone();
-            mutate(&mut rng, &mut bad);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut bad);
+            }
             check_bytes(&bad, &e);
             check_bytes(&fix(bad.clone(), &e), &e);
             // An LSA, with its checksum set right after mutating it.
             let l = random_lsa(&mut rng, e.version());
             let mut lb = l.frame(e.version()).and_then(|frame| frame.to_bytes()).unwrap();
-            mutate(&mut rng, &mut lb);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut lb);
+            }
             check_bytes(&fix_lsa(lb), &e);
             // Random bytes behind a plausible header.
-            let len = rng.index(80);
             let mut raw = rng.bytes(80);
             if raw.len() >= 4 {
                 raw[0] = e.version().number();
                 raw[1] = 1 + rng.index(5) as u8;
-                raw[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+                let len = raw.len() as u16;
+                raw[2..4].copy_from_slice(&len.to_be_bytes());
             }
             check_bytes(&fix(raw, &e), &e);
         }

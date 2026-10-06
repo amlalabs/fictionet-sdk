@@ -271,6 +271,7 @@ fn rip_and_ripng_messages() {
     };
     let bytes = round_trip(&received, rip::MAX_MESSAGE);
     assert_eq!(bytes.len(), rip::MAX_MESSAGE);
+    assert!(!received.fits_datagram());
     assert_eq!(received.to_bytes().unwrap(), bytes);
     assert_eq!(rip::Message::parse(&bytes), Ok(received));
     round_trip(&rip::NgMessage::whole_table_request(), rip::MAX_NG_MESSAGE);

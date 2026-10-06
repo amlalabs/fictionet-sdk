@@ -42,6 +42,7 @@ fn check(data: &[u8]) {
     let parsed = Message::parse(data);
 
     if let Ok(m) = &parsed {
+        assert_eq!(Message::receive(data).as_ref(), Ok(m));
         // A message read follows the RFCs, checked apart from the module's
         // own rules, can be written, and reads back the same.
         assert!(conforms(m), "{m:?}");

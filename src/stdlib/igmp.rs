@@ -13,18 +13,20 @@
 //!
 //! Nothing here reads a socket. A world that plays a host or a router
 //! hands each IGMP payload (the bytes after the IPv4 header) to
-//! [`Message::parse`], looks at the [`Message`], and sends the bytes
+//! [`Message::receive`], looks at the [`Message`], and sends the bytes
 //! [`Message::to_bytes`] returns in an IPv4 packet with protocol
 //! [`PROTOCOL`], a TTL of 1 and the Router Alert option, to the address
 //! [`Message::destination`] gives. For pieces of one payload, use
-//! [`Stream<Collect<Message>>`](super::codec::Stream) with [`MAX_MESSAGE`]
-//! as the collection limit, then call `end` at the IPv4 packet boundary.
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Message>`
+//! and [`MAX_MESSAGE`] as the collection limit. Call `end` at the IPv4 boundary.
+//! This collection uses the strict [`Message::parse`] reader.
 //! Which groups a host has joined, and what a router does with a report,
 //! is up to world code.
 //!
 //! Every reader checks lengths and the checksum, because the agent can send
 //! any bytes it likes. Bytes past the message and its declared auxiliary
-//! data are refused. Reserved fields and
+//! data are included in the checksum and ignored by [`Message::receive`].
+//! [`Message::parse`] refuses them. Reserved fields and
 //! the unused field of version 1 reports are ignored when read and written
 //! as zero. So is the group field of a version 1 query, which RFC 1112
 //! says is zero when sent and ignored when read. Auxiliary data in a
@@ -385,7 +387,6 @@ impl Wire for Code {
     }
 }
 
-
 /// The Internet checksum of `b`: the ones' complement of the ones'
 /// complement sum of its 16-bit words, with a zero byte added to an odd
 /// length. A message with a correct checksum field sums to 0.
@@ -546,16 +547,18 @@ impl Message {
         // also keeps every count within its 16 bits.
         n.filter(|&n| n <= MAX_MESSAGE).ok_or(IgmpError::TooLong)
     }
-}
 
-impl Wire for Message {
-    type ParseError = IgmpError;
-    type WriteError = IgmpError;
+    /// Reads a complete IPv4 IGMP payload as a receiver does. Checks the
+    /// checksum over all of `b`, then ignores bytes after the message and
+    /// its declared auxiliary data (RFC 2236 2.5, RFC 3376 4.1.10 and 4.2.11).
+    /// Refuses invalid lengths, types, checksums, addresses, and payloads
+    /// above [`MAX_MESSAGE`], as [`Message::parse`] does.
+    pub fn receive(b: &[u8]) -> Result<Message, IgmpError> {
+        Self::read(b, false)
+    }
 
-    /// Reads one complete IPv4 IGMP payload. Refuses invalid lengths,
-    /// types, checksums, addresses, and trailing bytes. Reserved fields and
-    /// version 1 query groups are ignored. Declared auxiliary data is skipped.
-    fn parse(b: &[u8]) -> Result<Self, IgmpError> {
+    /// Reads the message, optionally requiring it to fill the payload.
+    fn read(b: &[u8], exact: bool) -> Result<Message, IgmpError> {
         let &t = b.first().ok_or(IgmpError::Truncated)?;
         if !known_type(t) {
             return Err(IgmpError::UnknownType(t));
@@ -619,11 +622,23 @@ impl Wire for Message {
                 used = at;
                 Ok(Message::ReportV3 { records })
             }
-         }?;
-        if used != b.len() {
+        }?;
+        if exact && used != b.len() {
             return Err(IgmpError::Trailing { remaining: b.len() - used });
         }
         Ok(message)
+    }
+}
+
+impl Wire for Message {
+    type ParseError = IgmpError;
+    type WriteError = IgmpError;
+
+    /// Reads one complete IPv4 IGMP payload. Refuses invalid lengths,
+    /// types, checksums, addresses, and trailing bytes. Reserved fields and
+    /// version 1 query groups are ignored. Declared auxiliary data is skipped.
+    fn parse(b: &[u8]) -> Result<Self, IgmpError> {
+        Self::read(b, true)
     }
 
     /// The message's bytes, with the checksum filled in. It fails if the
@@ -885,19 +900,43 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bytes_are_refused() {
-        let mut b = Message::ReportV2 { group: ip(239, 9, 9, 9) }.to_bytes().unwrap();
-        b.extend_from_slice(&[1, 2, 3, 4, 5]);
-        let b = fix(b);
-        assert_eq!(Message::parse(&b), Err(IgmpError::Trailing { remaining: 5 }));
-        let q = QueryV3 { max_resp_code: 1, group: ip(0, 0, 0, 0), suppress: false, qrv: 1, qqic: 1, sources: vec![] };
-        let mut b = Message::QueryV3(q.clone()).to_bytes().unwrap();
-        b.extend_from_slice(&[9; 3]);
-        assert_eq!(Message::parse(&fix(b)), Err(IgmpError::Trailing { remaining: 3 }));
-        // The extra bytes are in the checksum.
-        let mut b = Message::Leave { group: ip(239, 1, 1, 1) }.to_bytes().unwrap();
-        b.push(1);
-        assert_eq!(Message::parse(&b), Err(IgmpError::Checksum));
+    fn trailing_bytes_are_ignored() {
+        let messages = [
+            Message::ReportV2 { group: ip(239, 9, 9, 9) },
+            Message::Leave { group: ip(239, 1, 1, 1) },
+            Message::QueryV3(QueryV3 {
+                max_resp_code: 1, group: Ipv4Addr::UNSPECIFIED, suppress: false,
+                qrv: 1, qqic: 1, sources: vec![],
+            }),
+            Message::QueryV3(QueryV3 {
+                max_resp_code: 1, group: ip(239, 1, 1, 1), suppress: false,
+                qrv: 1, qqic: 1, sources: vec![ip(192, 0, 2, 1)],
+            }),
+            Message::ReportV3 { records: vec![GroupRecord {
+                kind: RecordType::ModeIsInclude, group: ip(239, 1, 1, 1),
+                sources: vec![ip(192, 0, 2, 1)],
+            }] },
+        ];
+        for m in messages {
+            let mut b = m.to_bytes().unwrap();
+            assert_eq!(Message::receive(&b).as_ref(), Ok(&m));
+            // A report's declared auxiliary data is skipped before trailing bytes.
+            if matches!(m, Message::ReportV3 { .. }) {
+                b[9] = 1;
+                b.extend_from_slice(&[6, 7, 8, 9]);
+                b = fix(b);
+                assert_eq!(Message::parse(&b).as_ref(), Ok(&m));
+                assert_eq!(Message::receive(&b).as_ref(), Ok(&m));
+                assert_eq!(Message::receive(&fix(b[..b.len() - 1].to_vec())), Err(IgmpError::Truncated));
+            }
+            b.extend_from_slice(&[1, 2, 3, 4, 5]);
+            // Trailing bytes still participate in the checksum.
+            assert_eq!(Message::receive(&b), Err(IgmpError::Checksum));
+            assert_eq!(Message::parse(&b), Err(IgmpError::Checksum));
+            let b = fix(b);
+            assert_eq!(Message::receive(&b), Ok(m));
+            assert_eq!(collect(&b), Err(IgmpError::Trailing { remaining: 5 }));
+        }
     }
 
     #[test]
@@ -1174,7 +1213,9 @@ mod tests {
     impl Samples for Lcg {
         /// Any address at all.
         fn addr(&mut self) -> Ipv4Addr {
-            Ipv4Addr::from(self.next() as u32)
+            let mut bytes = [0; 4];
+            self.fill(&mut bytes);
+            Ipv4Addr::from(bytes)
         }
         /// A multicast address, 224.0.0.0 to 239.255.255.255.
         fn group(&mut self) -> Ipv4Addr {
@@ -1308,6 +1349,7 @@ mod tests {
     fn check_bytes(data: &[u8]) {
         let parsed = Message::parse(data);
         if let Ok(m) = &parsed {
+            assert_eq!(Message::receive(data).as_ref(), Ok(m));
             // A message read follows the RFCs, can be written, and reads
             // back the same.
             assert!(conforms(m), "{m:?}");
@@ -1340,7 +1382,9 @@ mod tests {
             // Flip some bytes, cut or extend, and fix the checksum most of
             // the time so the parser looks past it.
             let mut mutated = b.clone();
-            mutate(&mut rng, &mut mutated);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut mutated);
+            }
             if rng.index(4) != 0 {
                 mutated = fix(mutated);
             }

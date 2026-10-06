@@ -22,8 +22,8 @@
 //! [`Plaintext::parse`] reads the trailer: the padding, the pad length and
 //! the next header. To send, it builds the same values and writes their
 //! bytes through [`Wire::write`]. For pieces of one packet, use
-//! [`Stream<Collect<EspPacket>>`](super::codec::Stream), or collect an
-//! [`AhPacket`] or [`Datagram`]. Set the collection limit to [`MAX_PACKET`]
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<EspPacket>`,
+//! `Collect<AhPacket>`, or `Collect<Datagram>`. Set the limit to [`MAX_PACKET`]
 //! for IP payloads or [`MAX_DATAGRAM`] for UDP. Call `end` at that boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -321,7 +321,6 @@ pub struct AhHeader {
 }
 
 impl AhHeader {
-
     /// A header with the reserved field set to zero, as a sender must.
     pub fn new(next_header: u8, spi: u32, sequence: u32, icv: Vec<u8>) -> AhHeader {
         AhHeader { next_header, reserved: 0, spi, sequence, icv }
@@ -651,16 +650,19 @@ mod tests {
     use super::*;
     use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
-    fn check<M>(b: &[u8]) -> Result<M, IpsecError>
+    fn check<M>(limit: usize, b: &[u8]) -> Result<M, IpsecError>
     where M: Wire<ParseError = IpsecError, WriteError = IpsecError> + Clone + std::fmt::Debug + PartialEq {
-        let make = || Collect::<M>::new(MAX_PACKET);
-        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_PACKET + 1));
+        let make = || Collect::<M>::new(limit);
+        contract::check_decode_with_alloc_limit(make, b, 2 * (limit + 1));
         contract::check_wire::<M>(b);
         let parsed = M::parse(b);
         let (items, failure) = decode_all(make, b);
-        if b.len() <= MAX_PACKET {
+        if b.len() <= limit {
             assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
             assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
+        } else {
+            assert!(items.is_empty());
+            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit })));
         }
         if let Ok(p) = &parsed { assert_eq!(p.to_bytes().unwrap(), b); }
         contract::check_wire::<Plaintext>(b);
@@ -668,9 +670,9 @@ mod tests {
     }
 
     fn check_all(b: &[u8]) {
-        let _ = check::<EspPacket>(b);
-        let _ = check::<AhPacket>(b);
-        let _ = check::<Datagram>(b);
+        let _ = check::<EspPacket>(MAX_PACKET, b);
+        let _ = check::<AhPacket>(MAX_PACKET, b);
+        let _ = check::<Datagram>(MAX_DATAGRAM, b);
     }
 
     fn esp(spi: u32, sequence: u32, payload: &[u8]) -> EspPacket {
@@ -687,7 +689,7 @@ mod tests {
     #[test]
     fn esp_layout() {
         let b = [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2a, 0xde, 0xad, 0xbe, 0xef];
-        let p = check::<EspPacket>(&b).unwrap();
+        let p = check::<EspPacket>(MAX_PACKET, &b).unwrap();
         assert_eq!(p, esp(0x100, 42, &[0xde, 0xad, 0xbe, 0xef]));
         assert_eq!(p.to_bytes().unwrap(), b);
         // With a 2-byte ICV, the rest is the encrypted part.
@@ -707,7 +709,7 @@ mod tests {
         let p = esp(7, 1, &bytes);
         let wire = p.to_bytes().unwrap();
         assert_eq!(wire, [0, 0, 0, 7, 0, 0, 0, 1, 1, 2, 3, 4, 5, 1, 1, 6]);
-        let back = check::<EspPacket>(&wire).unwrap();
+        let back = check::<EspPacket>(MAX_PACKET, &wire).unwrap();
         assert_eq!(Plaintext::parse(&back.payload), Ok(plain));
     }
 
@@ -833,12 +835,11 @@ mod tests {
         assert_eq!(Datagram::Esp(big).to_bytes(), Err(IpsecError::TooLong));
         let fits = Datagram::Esp(esp(1, 1, &vec![0; MAX_DATAGRAM - 8]));
         let bytes = fits.to_bytes().unwrap();
-        assert_eq!(check::<Datagram>(&bytes), Ok(fits));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &bytes), Ok(fits));
         // The reader holds to the same limit, all at once or in pieces.
         let mut long = bytes;
         long.push(0);
-        assert_eq!(check::<Datagram>(&long), Err(IpsecError::TooLong));
-
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &long), Err(IpsecError::TooLong));
     }
 
     #[test]
@@ -852,7 +853,7 @@ mod tests {
         b.extend_from_slice(b"segment");
         let p = AhPacket { header: h.clone(), payload: b"segment".to_vec() };
         assert_eq!(p.to_bytes().unwrap(), b);
-        assert_eq!(check::<AhPacket>(&b), Ok(p));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &b), Ok(p));
         assert_eq!(h.len(), 24);
         assert!(h.is_ipv6_aligned() && !h.is_empty());
         assert_eq!(AhPacket::split(&b).unwrap(), (h.clone(), &b"segment"[..]));
@@ -868,7 +869,7 @@ mod tests {
     fn ah_shortest_and_longest() {
         // Payload length 1: the fixed fields alone, no ICV.
         let b = [next_header::IPV4, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
-        let p = check::<AhPacket>(&b).unwrap();
+        let p = check::<AhPacket>(MAX_PACKET, &b).unwrap();
         assert_eq!(p.header, ah(4, 1, 0, &[]));
         assert!(p.payload.is_empty());
         // Payload length 255: the longest ICV.
@@ -882,7 +883,7 @@ mod tests {
     #[test]
     fn ah_reserved_field_is_kept() {
         let b = [4, 1, 0xab, 0xcd, 0, 0, 0, 9, 0, 0, 0, 1];
-        let p = check::<AhPacket>(&b).unwrap();
+        let p = check::<AhPacket>(MAX_PACKET, &b).unwrap();
         assert_eq!(p.header, AhHeader { reserved: 0xabcd, ..ah(4, 9, 1, &[]) });
         assert_eq!(p.to_bytes().unwrap(), b);
         // A new header writes it as zero.
@@ -902,49 +903,49 @@ mod tests {
 
     #[test]
     fn udp_datagrams() {
-        assert_eq!(check::<Datagram>(&[0xff]), Ok(Datagram::Keepalive));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0xff]), Ok(Datagram::Keepalive));
         assert_eq!(Datagram::Keepalive.to_bytes().unwrap(), [0xff]);
         // An IKE message after the non-ESP marker. An IKE header is longer;
         // its bytes are kept as they are.
         let b = [0, 0, 0, 0, 0x21, 0x22, 0x23];
-        assert_eq!(check::<Datagram>(&b), Ok(Datagram::Ike(vec![0x21, 0x22, 0x23])));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &b), Ok(Datagram::Ike(vec![0x21, 0x22, 0x23])));
         assert_eq!(Datagram::Ike(vec![0x21, 0x22, 0x23]).to_bytes().unwrap(), b);
-        assert_eq!(check::<Datagram>(&[0, 0, 0, 0]), Ok(Datagram::Ike(vec![])));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0, 0, 0, 0]), Ok(Datagram::Ike(vec![])));
         // Anything else is ESP.
         let b = [0, 0, 0x10, 0, 0, 0, 0, 3, 0, 4];
-        assert_eq!(check::<Datagram>(&b), Ok(Datagram::Esp(esp(0x1000, 3, &[0, 4]))));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &b), Ok(Datagram::Esp(esp(0x1000, 3, &[0, 4]))));
         // Two keepalive bytes are not a keepalive.
-        assert_eq!(check::<Datagram>(&[0xff, 0xff]), Err(IpsecError::Truncated));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0xff, 0xff]), Err(IpsecError::Truncated));
     }
 
     #[test]
     fn each_read_error() {
         // ESP.
-        assert_eq!(check::<EspPacket>(&[]), Err(IpsecError::Truncated));
-        assert_eq!(check::<EspPacket>(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 4]), Err(IpsecError::ZeroSpi));
-        assert_eq!(check::<EspPacket>(&[0, 0, 0, 1, 0, 0, 0, 1, 0]), Err(IpsecError::Truncated));
+        assert_eq!(check::<EspPacket>(MAX_PACKET, &[]), Err(IpsecError::Truncated));
+        assert_eq!(check::<EspPacket>(MAX_PACKET, &[0, 0, 0, 0, 0, 0, 0, 1, 0, 4]), Err(IpsecError::ZeroSpi));
+        assert_eq!(check::<EspPacket>(MAX_PACKET, &[0, 0, 0, 1, 0, 0, 0, 1, 0]), Err(IpsecError::Truncated));
         let mut long = vec![0, 0, 0, 1];
         long.resize(MAX_PACKET + 1, 0);
-        assert_eq!(check::<EspPacket>(&long), Err(IpsecError::TooLong));
+        assert_eq!(check::<EspPacket>(MAX_PACKET, &long), Err(IpsecError::TooLong));
         long.truncate(MAX_PACKET);
-        assert!(check::<EspPacket>(&long).is_ok());
+        assert!(check::<EspPacket>(MAX_PACKET, &long).is_ok());
         // AH.
-        assert_eq!(check::<AhPacket>(&[4]), Err(IpsecError::Truncated));
-        assert_eq!(check::<AhPacket>(&[4, 0, 0, 0, 0, 0, 0, 1]), Err(IpsecError::AhLength(0)));
-        assert_eq!(check::<AhPacket>(&[4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Err(IpsecError::ZeroSpi));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4]), Err(IpsecError::Truncated));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 0, 0, 0, 0, 0, 0, 1]), Err(IpsecError::AhLength(0)));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Err(IpsecError::ZeroSpi));
         // A payload length of 3 says 20 bytes; 16 are there.
-        assert_eq!(check::<AhPacket>(&[4, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]), Err(IpsecError::Truncated));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0]), Err(IpsecError::Truncated));
         let mut long = vec![4, 1, 0, 0, 0, 0, 0, 1];
         long.resize(MAX_PACKET + 1, 0);
-        assert_eq!(check::<AhPacket>(&long), Err(IpsecError::TooLong));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &long), Err(IpsecError::TooLong));
         // UDP.
-        assert_eq!(check::<Datagram>(&[]), Err(IpsecError::Truncated));
-        assert_eq!(check::<Datagram>(&[0x7f]), Err(IpsecError::Truncated));
-        assert_eq!(check::<Datagram>(&[0, 0, 0, 1, 0, 0, 0, 1]), Err(IpsecError::Truncated));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[]), Err(IpsecError::Truncated));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0x7f]), Err(IpsecError::Truncated));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &[0, 0, 0, 1, 0, 0, 0, 1]), Err(IpsecError::Truncated));
         let mut long = vec![0; MAX_PACKET + 1];
-        assert_eq!(check::<Datagram>(&long), Err(IpsecError::TooLong));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &long), Err(IpsecError::TooLong));
         long[3] = 1;
-        assert_eq!(check::<Datagram>(&long), Err(IpsecError::TooLong));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &long), Err(IpsecError::TooLong));
         // The plaintext.
         assert_eq!(Plaintext::parse(&[]), Err(IpsecError::Truncated));
         assert_eq!(Plaintext::parse(&[4]), Err(IpsecError::Truncated));
@@ -1031,39 +1032,39 @@ mod tests {
         for p in esp_samples() {
             let b = p.to_bytes().unwrap();
             for n in 0..b.len() {
-                let got = check::<EspPacket>(&b[..n]);
+                let got = check::<EspPacket>(MAX_PACKET, &b[..n]);
                 if n >= MIN_ESP_LEN { assert!(got.is_ok()); }
                 else { assert_eq!(got, Err(IpsecError::Truncated)); }
             }
-            assert_eq!(check::<EspPacket>(&b), Ok(p));
+            assert_eq!(check::<EspPacket>(MAX_PACKET, &b), Ok(p));
         }
         for p in ah_samples() {
             let b = p.to_bytes().unwrap();
             for n in 0..b.len() {
-                let got = check::<AhPacket>(&b[..n]);
+                let got = check::<AhPacket>(MAX_PACKET, &b[..n]);
                 if n >= p.header.len() {
                     let got = got.unwrap();
                     assert_eq!(got.header, p.header);
                     assert_eq!(got.payload, p.payload[..n - p.header.len()]);
                 } else { assert_eq!(got, Err(IpsecError::Truncated)); }
             }
-            assert_eq!(check::<AhPacket>(&b), Ok(p));
+            assert_eq!(check::<AhPacket>(MAX_PACKET, &b), Ok(p));
         }
         for p in udp_samples() {
             let b = p.to_bytes().unwrap();
             for n in 0..b.len() {
-                let got = check::<Datagram>(&b[..n]);
+                let got = check::<Datagram>(MAX_DATAGRAM, &b[..n]);
                 match &p {
                     Datagram::Esp(_) if n >= MIN_ESP_LEN => assert!(got.is_ok()),
                     Datagram::Ike(m) if n >= 4 => assert_eq!(got, Ok(Datagram::Ike(m[..n - 4].to_vec()))),
                     _ => assert_eq!(got, Err(IpsecError::Truncated)),
                 }
             }
-            assert_eq!(check::<Datagram>(&b), Ok(p));
+            assert_eq!(check::<Datagram>(MAX_DATAGRAM, &b), Ok(p));
         }
         let b = Plaintext::padded(b"abcdefg".to_vec(), 4, 8).unwrap().to_bytes().unwrap();
         for n in 0..b.len() {
-            let got = check::<Plaintext>(&b[..n]);
+            let got = check::<Plaintext>(MAX_PACKET, &b[..n]);
             if n < 2 { assert_eq!(got, Err(IpsecError::Truncated)); }
         }
     }
@@ -1071,17 +1072,17 @@ mod tests {
     #[test]
     fn collection_chunk_contract() {
         let mut rng = Lcg::new(2410);
-        for _ in 0..2_000 { check_all(&random_packet(&mut rng)); }
+        for _ in 0..2_000 { random_packet(&mut rng).check(); }
     }
 
     #[test]
     fn collection_errors_and_limits() {
-        assert_eq!(check::<EspPacket>(&[0; 4]), Err(IpsecError::ZeroSpi));
-        assert_eq!(check::<AhPacket>(&[4, 0]), Err(IpsecError::AhLength(0)));
-        assert_eq!(check::<Datagram>(&vec![1; 70_000]), Err(IpsecError::TooLong));
+        assert_eq!(check::<EspPacket>(MAX_PACKET, &[0; 4]), Err(IpsecError::ZeroSpi));
+        assert_eq!(check::<AhPacket>(MAX_PACKET, &[4, 0]), Err(IpsecError::AhLength(0)));
+        assert_eq!(check::<Datagram>(MAX_DATAGRAM, &vec![1; 70_000]), Err(IpsecError::TooLong));
         let mut big = vec![1; 3 * MAX_PACKET];
         big[..4].copy_from_slice(&[0, 0, 0, 1]);
-        assert_eq!(check::<EspPacket>(&big), Err(IpsecError::TooLong));
+        assert_eq!(check::<EspPacket>(MAX_PACKET, &big), Err(IpsecError::TooLong));
     }
 
     #[test]
@@ -1101,29 +1102,52 @@ mod tests {
 
     impl Samples for Lcg {
         fn spi(&mut self) -> u32 {
-            (self.next() as u32).max(1)
+            u32::from_be_bytes(std::array::from_fn(|_| self.next() as u8)).max(1)
         }
     }
 
-    fn random_packet(rng: &mut Lcg) -> Vec<u8> {
+    enum Packet {
+        Esp(EspPacket),
+        Ah(AhPacket),
+        Udp(Datagram),
+    }
+
+    impl Packet {
+        fn check(self) -> Vec<u8> {
+            fn round_trip<M>(value: M, limit: usize) -> Vec<u8>
+            where M: Wire<ParseError = IpsecError, WriteError = IpsecError> + Clone + std::fmt::Debug + PartialEq {
+                contract::check_wire_value(&value);
+                let bytes = value.to_bytes().unwrap();
+                assert_eq!(check::<M>(limit, &bytes), Ok(value));
+                bytes
+            }
+            match self {
+                Self::Esp(value) => round_trip(value, MAX_PACKET),
+                Self::Ah(value) => round_trip(value, MAX_PACKET),
+                Self::Udp(value) => round_trip(value, MAX_DATAGRAM),
+            }
+        }
+    }
+
+    fn random_packet(rng: &mut Lcg) -> Packet {
         let esp_packet = |rng: &mut Lcg| {
             let mut payload = rng.bytes(40);
             payload.extend_from_slice(&[0, 4]);
-            EspPacket { spi: rng.spi(), sequence: rng.next() as u32, payload }
+            EspPacket { spi: rng.spi(), sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)), payload }
         };
         match rng.index(5) {
-            0 => esp_packet(rng).to_bytes().unwrap(),
+            0 => Packet::Esp(esp_packet(rng)),
             1 => {
                 let mut icv = vec![0; rng.index(9) * 4];
                 rng.fill(&mut icv);
                 let header = AhHeader { next_header: rng.next() as u8,
                     reserved: if rng.coin() { 0 } else { rng.next() as u16 },
-                    spi: rng.spi(), sequence: rng.next() as u32, icv };
-                AhPacket { header, payload: rng.bytes(32) }.to_bytes().unwrap()
+                    spi: rng.spi(), sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)), icv };
+                Packet::Ah(AhPacket { header, payload: rng.bytes(32) })
             }
-            2 => Datagram::Keepalive.to_bytes().unwrap(),
-            3 => Datagram::Ike(rng.bytes(32)).to_bytes().unwrap(),
-            _ => Datagram::Esp(esp_packet(rng)).to_bytes().unwrap(),
+            2 => Packet::Udp(Datagram::Keepalive),
+            3 => Packet::Udp(Datagram::Ike(rng.bytes(32))),
+            _ => Packet::Udp(Datagram::Esp(esp_packet(rng))),
         }
     }
 
@@ -1131,7 +1155,7 @@ mod tests {
     fn fuzz_round_trips() {
         let mut rng = Lcg::new(0x4303);
         for _ in 0..3_000 {
-            let b = random_packet(&mut rng);
+            let b = random_packet(&mut rng).check();
             check_all(&b);
             // The plaintext writer and reader agree too.
             let n = rng.index(64);
@@ -1152,8 +1176,10 @@ mod tests {
     fn fuzz_mutated_packets() {
         let mut rng = Lcg::new(0x4302);
         for _ in 0..4_000 {
-            let mut b = random_packet(&mut rng);
-            mutate(&mut rng, &mut b);
+            let mut b = random_packet(&mut rng).check();
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut b);
+            }
             check_all(&b);
         }
     }

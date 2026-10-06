@@ -15,8 +15,8 @@
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
 //! [`Wire::to_bytes`] returns. For pieces of one packet, use
-//! [`Stream<Collect<Packet>>`](super::codec::Stream) with a collection
-//! limit of [`MAX_PACKET`], then call `end` at the packet boundary.
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Packet>`
+//! and a collection limit of [`MAX_PACKET`]. Call `end` at the packet boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header with an unknown version, with the routing bits or the
@@ -520,7 +520,7 @@ mod tests {
         Header::Pptp(PptpHeader { call_id, sequence, ack })
     }
 
-    /// Parses `b` three ways and checks they agree, and that a packet read
+    /// Parses `b` directly and through Collect and checks they agree. A packet read
     /// writes back to bytes that read the same.
     fn check(b: &[u8]) -> Result<Packet, GreError> {
         let parsed = Packet::parse(b);
@@ -907,7 +907,9 @@ mod tests {
         let mut rng = Lcg::new(0xc0de);
         for _ in 0..4_000 {
             let mut b = random_packet(&mut rng).to_bytes().unwrap();
-            mutate(&mut rng, &mut b);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut b);
+            }
             let _ = check(&b);
         }
     }

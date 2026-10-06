@@ -4,7 +4,7 @@
 use fictionet::stdlib::rip::{
     Entries, MAX_PREFIX_LEN, Message, NgEntries, NgEntry, NgMessage, Received,
 };
-use fictionet::stdlib::{codec::{Wire, Collect, contract}, rip};
+use fictionet::stdlib::{codec::{Wire, Collect, Stream, contract}, rip};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -25,6 +25,15 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire_value(&message);
     let parsed = Message::parse(data);
     if let Ok(m) = &parsed {
+        assert_eq!(m.fits_datagram(), data.len() <= rip::MAX_DATAGRAM);
+        let mut stream = Stream::new(Collect::<Message>::new(rip::MAX_MESSAGE));
+        assert_eq!(stream.push(data), data.len());
+        stream.end();
+        assert_eq!(stream.with_next(|message, raw, span| {
+            assert_eq!(raw, data);
+            assert_eq!(span, 0..data.len() as u64);
+            message
+        }), Some(Ok(m.clone())));
         let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), data.len());
         assert_eq!(Message::parse(&bytes).as_ref(), Ok(m));

@@ -22,9 +22,11 @@
 //! Nothing here reads a socket. A world that plays a router hands each UDP
 //! payload it reads on port [`PORT`] to [`Message::parse`], or on port
 //! [`NG_PORT`] to [`NgMessage::parse`], looks at the routes, and sends the
-//! bytes [`Wire::to_bytes`] returns. For pieces of one payload, use
-//! [`Stream<Collect<Message>>`](super::codec::Stream) with [`MAX_MESSAGE`],
-//! or collect [`NgMessage`] with [`MAX_NG_MESSAGE`]. Call `end` at the UDP
+//! bytes [`Wire::to_bytes`] returns. Check [`Message::fits_datagram`] before
+//! sending a RIP message. For pieces of one payload, use
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Message>`
+//! and a limit of [`MAX_MESSAGE`], or `Collect<NgMessage>` with
+//! [`MAX_NG_MESSAGE`]. Call `end` at the UDP
 //! boundary. Which routes exist,
 //! what their metrics are, and whether a password or a digest is right are
 //! up to world code. The authentication data is kept as bytes.
@@ -112,6 +114,12 @@ pub const TRAILER_HEADER_LEN: usize = 4;
 /// The longest RIP message: the most entries, then the longest trailer.
 pub const MAX_MESSAGE: usize = HEADER_LEN + MAX_ENTRIES * ENTRY_LEN + TRAILER_HEADER_LEN + MAX_AUTH_DATA;
 
+/// The longest RIP datagram to send: RFC 1058 3.1 limits a datagram to
+/// 512 bytes. RFC 4822 does not say whether its trailer counts.
+/// FRRouting counts it, and drops longer datagrams, so with a 16-byte
+/// digest a message holds at most 23 routes. Readers and writers accept up
+/// to [`MAX_MESSAGE`]. Check [`Message::fits_datagram`] before sending.
+pub const MAX_DATAGRAM: usize = 512;
 /// The longest UDP payload, which bounds a RIPng message.
 pub const MAX_UDP_PAYLOAD: usize = 65527;
 /// The most entries a RIPng message holds: as many as fit in the longest
@@ -389,6 +397,22 @@ impl std::fmt::Display for RipError {
 impl std::error::Error for RipError {}
 
 impl Message {
+    /// Whether the message fits the [`MAX_DATAGRAM`] sending limit,
+    /// including its authentication trailer. This checks size only;
+    /// [`Wire::write`] also checks the fields.
+    pub fn fits_datagram(&self) -> bool {
+        let routes = match &self.entries {
+            Entries::WholeTable => 1,
+            Entries::Routes(routes) => routes.len(),
+        };
+        let entries = routes.saturating_add(usize::from(self.auth.is_some()));
+        let trailer = match &self.auth {
+            Some(Auth::Crypto(c)) => TRAILER_HEADER_LEN.saturating_add(c.data.len()),
+            _ => 0,
+        };
+        HEADER_LEN.saturating_add(entries.saturating_mul(ENTRY_LEN)).saturating_add(trailer) <= MAX_DATAGRAM
+    }
+
     /// A request for the whole table, with no authentication.
     pub fn whole_table_request(version: Version) -> Message {
         Message { command: Command::Request, version, auth: None, entries: Entries::WholeTable }
@@ -659,20 +683,19 @@ impl NgMessage {
     }
 }
 
-/// Reads the RIPng header at the start of `b`: the command, once the
-/// version is known to be 1. It returns `Ok(None)` if `b` is shorter than
-/// the header.
-fn ng_header(b: &[u8]) -> Result<Option<Command>, RipError> {
-    let Some(&c) = b.first() else { return Ok(None) };
+/// Reads a complete RIPng header. Refuses an invalid command or version
+/// and a header shorter than [`HEADER_LEN`].
+fn ng_header(b: &[u8]) -> Result<Command, RipError> {
+    let &c = b.first().ok_or(RipError::Truncated)?;
     let command = Command::from_code(c)?;
-    let Some(&v) = b.get(1) else { return Ok(None) };
+    let &v = b.get(1).ok_or(RipError::Truncated)?;
     if v != 1 {
         return Err(RipError::Version(v));
     }
     if b.len() < HEADER_LEN {
-        return Ok(None);
+        return Err(RipError::Truncated);
     }
-    Ok(Some(command))
+    Ok(command)
 }
 
 /// Reads RIPng entry number `entry`, the 20 bytes `e`.
@@ -711,7 +734,7 @@ fn is_whole_table_ng(r: NgRoute) -> bool {
 /// `skip`, a route with a bad prefix length or metric is left out and its
 /// error added there instead.
 fn scan_ng(b: &[u8], mut skip: Option<&mut Vec<RipError>>) -> Result<NgMessage, RipError> {
-    let Some(command) = ng_header(b)? else { return Err(RipError::Truncated) };
+    let command = ng_header(b)?;
     let mut entries = Vec::new();
     let mut count = 0;
     let mut at = HEADER_LEN;
@@ -758,7 +781,6 @@ impl Wire for Message {
         Routes::default().read(b).map(|(m, _)| m)
     }
 
-    ///
     /// Appends a message. Refuses invalid fields, excessive route or digest
     /// lengths, and values that would read back differently. Preserves all
     /// parsed messages. Leaves the destination unchanged on error.
@@ -839,15 +861,16 @@ impl Wire for NgMessage {
     type ParseError = RipError;
     type WriteError = RipError;
 
-    /// Reads a complete UDP payload. Refuses invalid header, route,
-    /// authentication, and length fields.
+    /// Reads a complete RIPng UDP payload. Refuses an invalid command or
+    /// version, missing or partial entries, excessive entry counts, invalid
+    /// prefix lengths, and metrics outside the command's range.
     fn parse(b: &[u8]) -> Result<Self, RipError> {
         scan_ng(b, None)
     }
 
-    /// Appends a message. Refuses invalid fields, excessive route or digest
-    /// lengths, and values that would read back differently. Preserves all
-    /// parsed messages. Leaves the destination unchanged on error.
+    /// Appends a RIPng message. Refuses missing or excessive entries, invalid
+    /// prefix lengths or metrics, and next hops or whole-table forms that
+    /// would read back differently. Leaves the destination unchanged on error.
     fn write(&self, destination: &mut Vec<u8>) -> Result<(), RipError> {
         let one = [NgEntry::Route(WHOLE_TABLE_NG)];
         let entries: &[NgEntry] = match &self.entries {
@@ -1531,8 +1554,9 @@ mod tests {
     }
 
     #[test]
-    fn writers_preserve_full_authenticated_messages() {
-        // Both 23 and 24 routes fit with a 16-byte digest.
+    fn messages_fit_the_512_byte_sending_limit() {
+        // With a 16-byte digest, 23 routes fit the sending limit and 24 do not.
+        // Both messages still write without losing routes.
         let route = RouteEntry {
             tag: 0,
             address: ip4(10, 0, 0, 0),
@@ -1546,6 +1570,8 @@ mod tests {
             auth: Some(Auth::Crypto(Crypto { key_id: 1, data_len: 16, sequence: 1, data: vec![9; 16] })),
             entries: Entries::Routes(vec![route; n]),
         };
+        assert!(crypto(23).fits_datagram());
+        assert!(!crypto(24).fits_datagram());
         let b = crypto(23).to_bytes().unwrap();
         assert_eq!(b.len(), 504);
         assert_eq!(check(&b), Ok(crypto(23)));
@@ -1565,6 +1591,17 @@ mod tests {
         // Without a trailer, 25 entries are 504 bytes.
         let plain = Message { auth: Some(Auth::Password([0; 16])), ..crypto(24) };
         assert_eq!(plain.to_bytes().unwrap().len(), 504);
+        assert!(plain.fits_datagram());
+        // Include the exact boundary and the first byte above it.
+        for size in [MAX_DATAGRAM, MAX_DATAGRAM + 1] {
+            let digest = size - 488; // Header, authentication, 23 routes, trailer header.
+            let m = Message {
+                auth: Some(Auth::Crypto(Crypto { key_id: 1, data_len: digest as u8, sequence: 1, data: vec![9; digest] })),
+                ..crypto(23)
+            };
+            assert_eq!(m.to_bytes().unwrap().len(), size);
+            assert_eq!(m.fits_datagram(), size <= MAX_DATAGRAM);
+        }
     }
 
     #[test]
@@ -1590,8 +1627,6 @@ mod tests {
         assert_eq!(routes.len(), MAX_ENTRIES);
     }
 
-
-
     /// Bytes shaped like a message: a sample with a few bytes changed, cut
     /// or added to, or bytes made up from a header.
     fn shaped(rng: &mut Lcg, pool: &[Vec<u8>]) -> Vec<u8> {
@@ -1606,7 +1641,9 @@ mod tests {
         } else {
             pool[rng.index(pool.len())].clone()
         };
-        mutate(rng, &mut b);
+        for _ in 0..1 + rng.index(4) {
+            mutate(rng, &mut b);
+        }
         b
     }
 
@@ -1615,8 +1652,14 @@ mod tests {
         let mut rng = Lcg::new(0x5eed_0520);
         let pool = samples();
         let ng_pool = ng_samples();
+        let mut repeated = msg(2, 2, &[route_bytes(1)]);
+        for _ in 0..MAX_ENTRIES {
+            repeated.extend_from_within(HEADER_LEN..HEADER_LEN + ENTRY_LEN);
+        }
+        assert_eq!(check(&repeated), Err(RipError::TooManyEntries));
         let (mut ok, mut ng_ok) = (0, 0);
-        for _ in 0..6000 {
+        // Deeper mutations need more trials to keep reaching valid messages.
+        for _ in 0..12_000 {
             let b = shaped(&mut rng, &pool);
             if check(&b).is_ok() {
                 ok += 1;
@@ -1652,7 +1695,7 @@ mod tests {
                     Some(Auth::Crypto(Crypto {
                         key_id: rng.next() as u8,
                         data_len,
-                        sequence: (rng.next() as u32),
+                        sequence: u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)),
                         data: vec![rng.next() as u8; n],
                     }))
                 }
@@ -1665,7 +1708,7 @@ mod tests {
                 let routes = (0..rng.index(28))
                     .map(|_| RouteEntry {
                         tag: u16::from(small(&mut rng)),
-                        address: Ipv4Addr::from(rng.next() as u32),
+                        address: Ipv4Addr::from(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8))),
                         mask: Ipv4Addr::from(if !rng.coin() { 0 } else { u32::MAX << rng.index(32) }),
                         next_hop: Ipv4Addr::from(u32::from(small(&mut rng))),
                         metric: rng.index(19) as u8,
@@ -1685,10 +1728,10 @@ mod tests {
                     (0..rng.index(8))
                         .map(|_| {
                             if rng.index(4) == 0 {
-                                NgEntry::NextHop(Ipv6Addr::from(u128::from(rng.next() as u32)))
+                                NgEntry::NextHop(Ipv6Addr::from(u128::from(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8)))))
                             } else {
                                 NgEntry::Route(NgRoute {
-                                    prefix: Ipv6Addr::from(u128::from(rng.next() as u32) << 96),
+                                    prefix: Ipv6Addr::from(u128::from(u32::from_be_bytes(std::array::from_fn(|_| rng.next() as u8))) << 96),
                                     tag: u16::from(small(&mut rng)),
                                     prefix_len: rng.index(140) as u8,
                                     metric: rng.index(19) as u8,

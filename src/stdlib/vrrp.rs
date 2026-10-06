@@ -27,8 +27,9 @@
 //! prepares an [`Advertisement::frame`] to write with [`Wire::write`](super::codec::Wire::write). Use
 //! protocol [`PROTOCOL`] and a TTL or hop limit of [`HOP_LIMIT`], to the
 //! address [`Advertisement::destination`] gives. For pieces of one payload,
-//! use [`Stream<Collect<Datagram>>`](super::codec::Stream) with [`MAX_MESSAGE`],
-//! map through [`Advertisement::parse`], and call `end` at the IP boundary.
+//! use [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Datagram>`
+//! and a limit of [`MAX_MESSAGE`]. Map through [`Advertisement::parse`]
+//! and call `end` at the IP boundary.
 //! Which virtual routers exist, their priorities, and the
 //! timers that decide when a backup takes over are up to world code.
 //!
@@ -475,12 +476,11 @@ fn checksum_matches(got: u16, want: Option<u16>) -> bool {
     }
 }
 
-/// Checks the header fields the bytes so far hold, in the order they come.
-/// Once the count is known it returns the advertisement's full length.
-/// Every error it gives holds for any bytes that could follow, which lets
-/// [`Advertisement::parse`] reject an invalid prefix.
-fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, VrrpError> {
-    let Some(&first) = b.first() else { return Ok(None) };
+/// Checks a complete header and returns the advertisement's full length.
+/// Refuses missing fields and invalid version, type, address family,
+/// source, VRID, count, or authentication type.
+fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<usize, VrrpError> {
+    let Some(&first) = b.first() else { return Err(VrrpError::Truncated) };
     let version = first >> 4;
     if version != 2 && version != 3 {
         return Err(VrrpError::Version(version));
@@ -494,11 +494,11 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, VrrpEr
         _ => {}
     }
     match b.get(1) {
-        None => return Ok(None),
+        None => return Err(VrrpError::Truncated),
         Some(0) => return Err(VrrpError::Vrid),
         Some(_) => {}
     }
-    let Some(&count) = b.get(3) else { return Ok(None) };
+    let Some(&count) = b.get(3) else { return Err(VrrpError::Truncated) };
     if count == 0 {
         return Err(VrrpError::NoAddresses);
     }
@@ -510,7 +510,8 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<usize>, VrrpEr
     }
     // At most 8 + 255 * 16, so this cannot overflow.
     let auth = if version == 2 { AUTH_DATA_LEN } else { 0 };
-    Ok(Some(HEADER_LEN + usize::from(count) * endpoints.address_len() + auth))
+    if b.len() < HEADER_LEN { return Err(VrrpError::Truncated); }
+    Ok(HEADER_LEN + usize::from(count) * endpoints.address_len() + auth)
 }
 
 impl Advertisement {
@@ -521,7 +522,7 @@ impl Advertisement {
     /// [`checksum_rfc5798`]. A checksum of 0xffff is taken where 0x0000 is
     /// due, since the two are equal in ones' complement.
     pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Advertisement, VrrpError> {
-        let len = check_header(b, endpoints)?.ok_or(VrrpError::Truncated)?;
+        let len = check_header(b, endpoints)?;
         if b.len() < len {
             return Err(VrrpError::Truncated);
         }
@@ -739,7 +740,25 @@ pub struct Datagram(
     pub Vec<u8>,
 );
 
-crate::bounded_datagram_wire!(Datagram, VrrpError, VrrpError::TooLong, MAX_MESSAGE);
+impl super::codec::Wire for Datagram {
+    type ParseError = VrrpError;
+    type WriteError = VrrpError;
+
+    /// Copies a complete payload. Refuses more than [`MAX_MESSAGE`] bytes.
+    /// Protocol and checksum checks require the contextual parser.
+    fn parse(bytes: &[u8]) -> Result<Self, VrrpError> {
+        if bytes.len() > MAX_MESSAGE { return Err(VrrpError::TooLong); }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Appends the payload unchanged. Refuses more than [`MAX_MESSAGE`] bytes.
+    /// Leaves `out` unchanged on error. Does not compute or check a checksum.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), VrrpError> {
+        if self.0.len() > MAX_MESSAGE { return Err(VrrpError::TooLong); }
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1072,7 +1091,6 @@ mod tests {
             assert_eq!(a.address_count(), a.addresses().count());
             let b = a.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
             assert_eq!(usize::from(b[3]), a.address_count());
-
         }
         let v3 =
             AdvertisementV3 { vrid: 1, priority: 1, interval: 1, addresses: Addresses::V6(vec![Ipv6Addr::LOCALHOST]) };

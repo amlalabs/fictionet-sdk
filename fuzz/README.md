@@ -42,17 +42,13 @@ cargo +nightly fuzz list
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | datagrams and constructed headers; bounded collection and wire contracts | `stdlib::geneve`: Geneve |
-| `gre` | GRE and PPTP packets; exact payload boundaries and wire contracts | `stdlib::gre`: GRE |
-| `igmp` | messages and checksum-corrected inputs; bounded collection and wire contracts | `stdlib::igmp`: IGMP |
-| `ipsec` | ESP, AH, NAT-T, and plaintext values; bounded collection and wire contracts | `stdlib::ipsec`: IPsec |
-| `ospf` | packets and LSAs; contextual parsing and bounded payload contracts | `stdlib::ospf`: OSPFv2 and OSPFv3 |
-| `pim` | messages and checksum-corrected inputs; contextual parsing and bounded payload contracts | `stdlib::pim`: PIMv2 |
-| `rip` | RIP and RIPng routes and authentication; bounded collection and wire contracts | `stdlib::rip`: RIP |
-| `vrrp` | advertisements, checksum oracles, and constructed values; bounded payload contracts | `stdlib::vrrp`: VRRP |
 | `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
+| `gre` | GRE and PPTP packets; exact payload boundaries and wire contracts | `stdlib::gre`: GRE |
 | `grpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::grpc`: gRPC |
+| `igmp` | messages and checksum-corrected inputs; bounded collection and wire contracts | `stdlib::igmp`: IGMP |
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
+| `ipsec` | ESP, AH, NAT-T, and plaintext values; bounded collection and wire contracts | `stdlib::ipsec`: IPsec |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kafka`: Apache Kafka |
 | `kerberos` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kerberos`: Kerberos V5 |
@@ -68,6 +64,8 @@ cargo +nightly fuzz list
 | `ocsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
+| `ospf` | packets and LSAs; contextual parsing and bounded payload contracts | `stdlib::ospf`: OSPFv2 and OSPFv3 |
+| `pim` | messages and checksum-corrected inputs; contextual parsing and bounded payload contracts | `stdlib::pim`: PIMv2 |
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
 | `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |
@@ -75,6 +73,7 @@ cargo +nightly fuzz list
 | `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
+| `rip` | RIP and RIPng routes and authentication; bounded collection and wire contracts | `stdlib::rip`: RIP |
 | `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
 | `rtsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtsp`: RTSP |
 | `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
@@ -89,6 +88,7 @@ cargo +nightly fuzz list
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
 | `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
+| `vrrp` | advertisements, checksum oracles, and constructed values; bounded payload contracts | `stdlib::vrrp`: VRRP |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::x509`: X.509 certificates and CRLs |

@@ -28,8 +28,8 @@
 //! Write that frame with [`Wire::write`](super::codec::Wire::write) in an IP packet with protocol
 //! [`PROTOCOL`]. Hello, Join/Prune, Assert and Bootstrap messages go to
 //! [`ALL_PIM_ROUTERS_V4`] or [`ALL_PIM_ROUTERS_V6`] with a TTL of 1. A
-//! [`Stream<Collect<Datagram>>`](super::codec::Stream) collects pieces
-//! with [`MAX_MESSAGE`] as its limit. Map each payload through
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Datagram>`,
+//! collects pieces with [`MAX_MESSAGE`] as its limit. Map each payload through
 //! [`Message::parse`] and call `end` at the IP packet boundary. Which routers are
 //! neighbors, what trees exist and who wins an assert are up to world code.
 //!
@@ -643,9 +643,8 @@ fn checksum_matches(got: u16, want: u16) -> bool {
     got == want || (want == 0 && got == 0xffff)
 }
 
-/// Checks what the bytes so far show about the header. Every error it
-/// gives holds for any bytes that could follow. `max` is the
-/// longest message the packet can carry.
+/// Checks a complete header. Refuses a wrong version, a missing header,
+/// or a payload above `max`, the longest message the packet can carry.
 fn check_header(b: &[u8], max: usize) -> Result<(), PimError> {
     if let Some(&first) = b.first() {
         let version = first >> 4;
@@ -655,6 +654,9 @@ fn check_header(b: &[u8], max: usize) -> Result<(), PimError> {
     }
     if b.len() > max {
         return Err(PimError::TooLong);
+    }
+    if b.len() < HEADER_LEN {
+        return Err(PimError::Truncated);
     }
     Ok(())
 }
@@ -927,9 +929,6 @@ impl Message {
     /// has no meaning is read as clear.
     pub fn parse(b: &[u8], endpoints: &Endpoints) -> Result<Message, PimError> {
         check_header(b, endpoints.max_message())?;
-        if b.len() < HEADER_LEN {
-            return Err(PimError::Truncated);
-        }
         let want = checksum(b, endpoints).ok_or(PimError::Truncated)?;
         let got = u16::from_be_bytes([b[2], b[3]]);
         // RFC 7761 sets the IPv6 pseudo-header length of a Register to 8
@@ -1462,7 +1461,25 @@ pub struct Datagram(
     pub Vec<u8>,
 );
 
-crate::bounded_datagram_wire!(Datagram, PimError, PimError::TooLong, MAX_MESSAGE);
+impl super::codec::Wire for Datagram {
+    type ParseError = PimError;
+    type WriteError = PimError;
+
+    /// Copies a complete payload. Refuses more than [`MAX_MESSAGE`] bytes.
+    /// Protocol and checksum checks require the contextual parser.
+    fn parse(bytes: &[u8]) -> Result<Self, PimError> {
+        if bytes.len() > MAX_MESSAGE { return Err(PimError::TooLong); }
+        Ok(Self(bytes.to_vec()))
+    }
+
+    /// Appends the payload unchanged. Refuses more than [`MAX_MESSAGE`] bytes.
+    /// Leaves `out` unchanged on error. Does not compute or check a checksum.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), PimError> {
+        if self.0.len() > MAX_MESSAGE { return Err(PimError::TooLong); }
+        out.extend_from_slice(&self.0);
+        Ok(())
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -2536,9 +2553,9 @@ mod tests {
         }
     }
 
-    /// What the fuzz target checks: parse and the decoder agree, whole and
-    /// a byte at a time, and whatever parses, except a C-RP-Adv with no
-    /// groups, writes back to bytes that read the same.
+    /// Checks parsing against bounded collection under the chunk contract.
+    /// Whatever parses, except a C-RP-Adv with no groups, writes back to
+    /// bytes that read the same.
     fn check_bytes(data: &[u8], e: &Endpoints) {
         let parsed = Message::parse(data, e);
         assert_eq!(collect(data, e), parsed);
@@ -2572,7 +2589,9 @@ mod tests {
             let b = round_trip(&m, &e);
             // Mutated, with the checksum set right so the body is read.
             let mut data = b.clone();
-            mutate(&mut rng, &mut data);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut data);
+            }
             if !data.is_empty() {
                 data[0] = (data[0] & 0x0f) | 0x20;
             }

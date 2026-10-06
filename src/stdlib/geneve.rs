@@ -15,8 +15,8 @@
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
 //! [`Wire::to_bytes`] returns. For pieces of one datagram, use
-//! [`Stream<Collect<Packet>>`](super::codec::Stream) with a collection
-//! limit of [`MAX_DATAGRAM`], then call `end` at the datagram boundary.
+//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Packet>`
+//! and a collection limit of [`MAX_DATAGRAM`]. Call `end` at the datagram boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header whose version is not 0, whose options run past the
@@ -590,8 +590,7 @@ mod tests {
     }
 
     /// Every prefix of `b` reads as incomplete or as the error the whole
-    /// gives, and the error first shows at the same prefix for the
-    /// decoder.
+    /// gives.
     fn check_prefixes(b: &[u8]) {
         let whole = Header::parse_prefix(b);
         for n in 0..=b.len() {
@@ -625,7 +624,6 @@ mod tests {
         assert_eq!(collect(&b), Err(GeneveError::TooLong));
         b.pop();
         assert!(Packet::parse(&b).is_ok());
-
     }
 
     #[test]
@@ -640,7 +638,6 @@ mod tests {
             assert_eq!(Header::parse_prefix(&b[..n]), Ok(None), "prefix {n}");
             assert_eq!(Packet::parse(&b[..n]), Err(GeneveError::Truncated), "prefix {n}");
             assert_eq!(Header::split(&b[..n]), Err(GeneveError::Truncated));
-            assert_eq!(collect(&b[..n]), Err(GeneveError::Truncated));
             assert_eq!(collect(&b[..n]), Err(GeneveError::Truncated));
         }
         // From the end of the header on, the rest is payload.
@@ -727,7 +724,8 @@ mod tests {
             let mut options = Vec::new();
             for _ in 0..rng.index(70) {
                 let n = if rng.index(4) == 0 { rng.index(140) } else { rng.index(8) * 4 };
-                let data = rng.bytes(n);
+                let mut data = vec![0; n];
+                rng.fill(&mut data);
                 options.push(GeneveOption {
                     class: rng.next() as u16,
                     kind: rng.next() as u8,
@@ -803,8 +801,6 @@ mod tests {
             assert!(!e.to_string().is_empty());
         }
     }
-
-
 
     /// A random packet the writer accepts.
     fn random_packet(rng: &mut Lcg) -> Packet {
