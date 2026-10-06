@@ -774,3 +774,17 @@ path = "fuzz_targets/ouch.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "cboe_pitch"
+path = "fuzz_targets/cboe_pitch.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cboe_boe"
+path = "fuzz_targets/cboe_boe.rs"
+test = false
+doc = false
+bench = false

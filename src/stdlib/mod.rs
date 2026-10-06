@@ -134,6 +134,8 @@ pub mod amqp;
 pub mod asn1;
 pub mod bacnet;
 pub mod bgp;
+pub mod cboe_boe;
+pub mod cboe_pitch;
 pub mod coap;
 pub mod codec;
 pub mod cotp;
