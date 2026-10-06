@@ -17,6 +17,24 @@ fn check_error(error: ParseError) {
     contract::check_wire_value(&reply);
 }
 
+fn check_incoming(incoming: Result<Incoming, ParseError>) {
+    match incoming {
+        Ok(incoming) => {
+            let items = match incoming {
+                Incoming::Message(m) => vec![m],
+                Incoming::Batch(ms) => ms,
+            };
+            for item in items {
+                match item {
+                    Ok(message) => contract::check_wire_value(&message),
+                    Err(error) => check_error(error),
+                }
+            }
+        }
+        Err(error) => check_error(error),
+    }
+}
+
 fuzz_target!(|input: &[u8]| {
     let (limit, limits, data) = match input {
         [a, b, rest @ ..] if a & 0x80 != 0 => (
@@ -32,6 +50,15 @@ fuzz_target!(|input: &[u8]| {
     };
     let make = || Collect::<Body>::new(limit);
     contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+    let server = || Collect::<Value>::new(limit);
+    contract::check_decode_with_alloc_limit(server, data, 2 * server().capacity());
+    let (values, failure) = decode_all(server, data);
+    if let Some(Fail::Protocol(CollectError::Parse(error))) = failure {
+        check_error(error.into());
+    }
+    for value in values {
+        check_incoming(Incoming::from_value(value));
+    }
     contract::check_wire::<Message>(data);
     contract::check_wire::<Batch>(data);
     contract::check_wire::<Body>(data);
@@ -66,21 +93,7 @@ fuzz_target!(|input: &[u8]| {
             Err(error) => check_error(error),
         }
     }
-    match jsonrpc::parse_incoming_with(data, &limits) {
-        Ok(incoming) => {
-            let items = match incoming {
-                Incoming::Message(m) => vec![m],
-                Incoming::Batch(ms) => ms,
-            };
-            for item in items {
-                match item {
-                    Ok(message) => contract::check_wire_value(&message),
-                    Err(error) => check_error(error),
-                }
-            }
-        }
-        Err(error) => check_error(error),
-    }
+    check_incoming(jsonrpc::parse_incoming_with(data, &limits));
     if let Ok(Value::Array(values)) = &mut Value::parse(data) {
         let batch = Batch {
             messages: core::mem::take(values)

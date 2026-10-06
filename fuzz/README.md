@@ -51,7 +51,7 @@ cargo +nightly fuzz list
 | `imap` | commands, responses, literals, raw lines, and refusal decisions | `stdlib::imap`: strict wire values and bounded codec contracts |
 | `imf` | headers and structured field values | `stdlib::imf`: `Head`, named wire types, and bounded-allocation codec contracts |
 | `json` | wire values and streams checked with bounded codec contracts | `stdlib::json`: JSON |
-| `jsonrpc_body` | single bodies and batches, malformed entries, selected JSON limits, and edited responses | `stdlib::jsonrpc`: Collect contracts, exact envelope writes, batch error recovery, writable error replies, and write/decode round trips |
+| `jsonrpc_body` | single bodies and batches, malformed entries, selected JSON limits, and edited responses | `stdlib::jsonrpc`: strict body and server JSON Collect contracts, Incoming batch recovery, public JSON error conversion, writable error replies, and write/decode round trips |
 | `jsonrpc_lines` | LF/CRLF message streams with selected line and JSON limits, recoverable errors, and edited envelopes | `stdlib::jsonrpc`: Lines composition, codec contracts, transactional writes, writable error replies, and write/decode round trips |
 | `kafka` | arbitrary bytes and constructed values | `stdlib::kafka`: exact wire values, versioned messages, and bounded codec contracts |
 | `kerberos` | DER/BER messages, TCP records, and METHOD-DATA; checks record bounds, request-body slices, round trips, and write refusal | `stdlib::kerberos`: Kerberos V5 |

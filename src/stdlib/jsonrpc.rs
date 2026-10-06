@@ -10,13 +10,14 @@
 //!
 //! For MCP stdio, [`Messages`] applies JSON parsing to [`Lines`]. Every line
 //! yields a message or a recoverable [`ParseError`]. Blank lines are errors.
+//! An MCP server may skip them by checking `error.kind == ErrorKind::BlankLine`.
 //! An overlong line yields one error, then skips through LF. A final line
 //! without LF is refused even if its JSON is complete. LF and CRLF work.
 //! Batches belong to the body API, not this single-message stdio framing.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, try_pump};
-//! use fictionet::stdlib::{json::Value, jsonrpc::{Message, Messages}};
+//! use fictionet::stdlib::{json::Value, jsonrpc::{ErrorKind, Message, Messages}};
 //!
 //! let mut stdin = Stream::new(Messages::new());
 //! let mut stdout = Vec::new();
@@ -25,6 +26,7 @@
 //!     let reply = match item {
 //!         Ok(Message::Request(req)) => Some(req.success(Value::Object(vec![]))?),
 //!         Ok(Message::Notification(_)) | Ok(Message::Response(_)) => None,
+//!         Err(error) if error.kind == ErrorKind::BlankLine => None,
 //!         Err(error) if !error.is_response() => Some(error.response()),
 //!         Err(_) => None,
 //!     };
@@ -39,31 +41,54 @@
 //! # Ok::<(), Box<dyn core::error::Error>>(())
 //! ```
 //!
-//! For streamable HTTP, feed each POST's body chunks into
-//! `Stream::new(Collect::<Body>::new(json::MAX_SIZE))`, then call `finish`
-//! at that body's end. [`parse_incoming`] also exposes each invalid batch
-//! entry so a server can answer it separately. The MCP layer chooses which
-//! protocol revisions permit batches; this module implements JSON-RPC batches.
-//! HTTP routing, session headers, and method dispatch belong to that layer.
+//! For server HTTP bodies, feed each POST's chunks into
+//! `Stream::new(Collect::<json::Value>::new(json::MAX_SIZE))`, then call
+//! `finish` at that body's end. Pass the value to [`Incoming::from_value`]
+//! to retain each invalid batch entry. Convert a `CollectError::Parse` JSON
+//! error with [`ParseError::from`] to build its reply. [`parse_incoming`]
+//! provides the same entry handling for bytes already collected.
+//! Clients and strict callers can use `Collect::<Body>` to refuse a whole
+//! batch on any invalid entry. The MCP layer chooses which revisions permit
+//! batches. HTTP routing, session headers, and method dispatch belong there.
 //!
 //! ```
-//! use fictionet::stdlib::codec::{Collect, Stream, Wire, finish, pump};
-//! use fictionet::stdlib::{json, jsonrpc::{Body, Message}};
+//! use fictionet::stdlib::codec::{Collect, CollectError, Fail, Stream, Wire, finish, pump};
+//! use fictionet::stdlib::{json, jsonrpc::{Batch, Body, Incoming, Message, ParseError}};
 //!
-//! let mut post = Stream::new(Collect::<Body>::new(json::MAX_SIZE));
-//! let mut bodies = Vec::new();
-//! pump(&mut post, br#"{"jsonrpc":"2.0","method":"ping","id":"a"}"#,
-//!     |body| bodies.push(body))?;
-//! finish(&mut post, |body| bodies.push(body))?;
-//! if let Some(Body::Message(Message::Request(req))) = bodies.pop() {
-//!     let reply = Message::Response(req.success(json::Value::Null)?);
-//!     match reply.to_bytes() {
-//!         Ok(application_json) => {
-//!             // Send these bytes as the HTTP response body, or as SSE event data.
-//!             assert!(Message::parse(&application_json).is_ok());
-//!         }
-//!         Err(error) => eprintln!("reply refused: {error}"),
+//! let mut post = Stream::new(Collect::<json::Value>::new(json::MAX_SIZE));
+//! let mut values = Vec::new();
+//! pump(&mut post, br#"[{"jsonrpc":"2.0","method":"ping","id":"a"},{"foo":"boo"}]"#,
+//!     |value| values.push(value))?;
+//! let incoming = match finish(&mut post, |value| values.push(value)) {
+//!     Ok(()) => Incoming::from_value(values.pop().ok_or("missing body")?),
+//!     Err(Fail::Protocol(CollectError::Parse(error))) => Err(ParseError::from(error)),
+//!     Err(error) => return Err(error.into()),
+//! };
+//! let (batch, entries) = match incoming {
+//!     Ok(Incoming::Batch(entries)) => (true, entries),
+//!     Ok(Incoming::Message(entry)) => (false, vec![entry]),
+//!     Err(error) => (false, vec![Err(error)]),
+//! };
+//! let mut replies = Vec::new();
+//! for entry in entries {
+//!     let reply = match entry {
+//!         Ok(Message::Request(req)) => Some(req.success(json::Value::Null)?),
+//!         Err(error) if !error.is_response() => Some(error.response()),
+//!         _ => None,
+//!     };
+//!     if let Some(reply) = reply {
+//!         replies.push(Message::Response(reply));
 //!     }
+//! }
+//! let reply = if batch && !replies.is_empty() {
+//!     Some(Body::Batch(Batch { messages: replies }))
+//! } else {
+//!     replies.pop().map(Body::Message)
+//! };
+//! if let Some(reply) = reply {
+//!     let application_json = reply.to_bytes()?;
+//!     // Send these bytes as the HTTP response body, or as SSE event data.
+//!     assert!(Body::parse(&application_json).is_ok());
 //! }
 //! # Ok::<(), Box<dyn core::error::Error>>(())
 //! ```
@@ -132,7 +157,8 @@ pub enum Id {
 }
 
 impl Id {
-    /// Reads an identifier. Refuses other types and the default JSON limits.
+    /// Reads an identifier. Refuses other types and values beyond the default
+    /// JSON limits.
     pub fn from_value(mut value: Value) -> Result<Self, ParseError> {
         bounded(&value)?;
         match &mut value {
@@ -281,10 +307,10 @@ impl ParseError {
         }
     }
 
-    /// Whether the refused value was an object without a `method` member.
-    /// This includes incomplete response envelopes and empty objects. A
-    /// malformed `method` still marks a call. False means a call or unknown
-    /// shape, including invalid JSON, nonobjects, and line framing failures.
+    /// Whether the refused value was an object with no `method` member and
+    /// at least one `result` or `error` member. This includes incomplete
+    /// responses. A malformed `method` still marks a call. False means a call
+    /// or unknown shape, including empty objects and invalid JSON.
     /// Servers should not answer errors for which this returns true.
     pub fn is_response(&self) -> bool {
         self.response
@@ -301,11 +327,11 @@ impl ParseError {
         } else {
             "Invalid Request"
         };
-        let reply = Response::error(Some(self.id.clone()), code, message);
+        let reply = Response::error(self.id.clone(), code, message);
         if checked(&reply.value, Kind::Response).is_ok() {
             reply
         } else {
-            Response::error(None, code, message)
+            Response::error(Id::Null, code, message)
         }
     }
 }
@@ -341,6 +367,15 @@ impl fmt::Display for ParseError {
 }
 impl core::error::Error for ParseError {}
 
+impl From<json::Error> for ParseError {
+    /// Wraps a JSON parser error with a null id and no batch position.
+    /// Syntax errors map to [`PARSE_ERROR`]; JSON limits map to
+    /// [`INVALID_REQUEST`]. The input has no known response shape.
+    fn from(error: json::Error) -> Self {
+        problem(ErrorKind::Json(error))
+    }
+}
+
 fn problem(kind: ErrorKind) -> ParseError {
     ParseError {
         kind,
@@ -363,7 +398,7 @@ fn bounded(value: &Value) -> Result<Vec<u8>, ParseError> {
 }
 fn bounded_envelope(value: &Value) -> Result<Vec<u8>, ParseError> {
     bounded(value).map_err(|mut error| {
-        error.response = value.as_object().is_some() && value.get("method").is_none();
+        error.response = response_shape(value);
         error
     })
 }
@@ -372,8 +407,13 @@ fn envelope_problem(kind: ErrorKind, value: &Value) -> ParseError {
         kind,
         id: recover_id(value),
         batch_index: None,
-        response: value.as_object().is_some() && value.get("method").is_none(),
+        response: response_shape(value),
     }
+}
+fn response_shape(value: &Value) -> bool {
+    value.as_object().is_some()
+        && value.get("method").is_none()
+        && (value.get("result").is_some() || value.get("error").is_some())
 }
 fn recover_id(value: &Value) -> Id {
     let Some(members) = value.as_object() else {
@@ -500,6 +540,11 @@ fn integer(number: &Number) -> bool {
 
 fn checked(value: &Value, kind: Kind) -> Result<Vec<u8>, ParseError> {
     let bytes = bounded_envelope(value)?;
+    check_envelope(value, kind)?;
+    Ok(bytes)
+}
+
+fn check_envelope(value: &Value, kind: Kind) -> Result<(), ParseError> {
     let result = envelope(value).and_then(|actual| {
         if actual == kind {
             Ok(())
@@ -507,51 +552,37 @@ fn checked(value: &Value, kind: Kind) -> Result<Vec<u8>, ParseError> {
             Err(ErrorKind::MessageKind)
         }
     });
-    result.map_err(|kind| envelope_problem(kind, value))?;
-    Ok(bytes)
+    result.map_err(|kind| envelope_problem(kind, value))
 }
 
-macro_rules! envelope_type {
-    ($name:ident, $kind:ident, $doc:literal) => {
-        #[doc = $doc]
-        #[derive(Clone, Debug, PartialEq, Eq)]
-        pub struct $name {
-            /// The complete ordered envelope, including extension members.
-            /// Direct edits may invalidate it. Conversion and writing refuse
-            /// invalid envelopes instead of fixing or dropping members.
-            pub value: Value,
-        }
-        impl $name {
-            /// Checks this message kind and the default JSON limits.
-            pub fn from_value(value: Value) -> Result<Self, ParseError> {
-                checked(&value, Kind::$kind)?;
-                Ok(Self { value })
-            }
-            /// Checks and copies the complete value, preserving all members.
-            /// Refuses invalid envelopes or values beyond default JSON limits.
-            pub fn to_value(&self) -> Result<Value, ParseError> {
-                checked(&self.value, Kind::$kind)?;
-                Ok(self.value.clone())
-            }
-        }
-    };
+/// A method call with an id. Use `new` or `from_value`, then edit `value`
+/// in place for proxy rewrites.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Request {
+    /// The complete ordered envelope, including extension members.
+    /// Direct edits may invalidate it. Conversion and writing refuse
+    /// invalid envelopes instead of fixing or dropping members.
+    pub value: Value,
 }
 
-envelope_type!(
-    Request,
-    Request,
-    "A method call with an id. Use `new` or `from_value`, then edit `value` in place for proxy rewrites."
-);
-envelope_type!(
-    Notification,
-    Notification,
-    "A method call without an id. Valid notifications never require a response."
-);
-envelope_type!(
-    Response,
-    Response,
-    "A reply with an id and exactly one of result or error. Its ordered envelope is checked on conversion and writing."
-);
+/// A method call without an id. Valid notifications never require a response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notification {
+    /// The complete ordered envelope, including extension members.
+    /// Direct edits may invalidate it. Conversion and writing refuse
+    /// invalid envelopes instead of fixing or dropping members.
+    pub value: Value,
+}
+
+/// A reply with an id and exactly one of result or error. Its ordered envelope
+/// is checked on conversion and writing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Response {
+    /// The complete ordered envelope, including extension members.
+    /// Direct edits may invalidate it. Conversion and writing refuse
+    /// invalid envelopes instead of fixing or dropping members.
+    pub value: Value,
+}
 
 fn call(method: String, params: Option<Params>, id: Option<Id>) -> Value {
     let mut fields = vec![
@@ -574,24 +605,27 @@ fn id_value(id: Id) -> Value {
     }
 }
 
-macro_rules! call_accessors {
-    ($name:ident) => {
-        impl $name {
-            /// The method string, or `None` after an invalid direct edit.
-            pub fn method(&self) -> Option<&str> {
-                self.value.get("method")?.as_str()
-            }
-            /// The optional parameter value. Direct edits may invalidate its shape.
-            pub fn params(&self) -> Option<&Value> {
-                self.value.get("params")
-            }
-        }
-    };
-}
-call_accessors!(Request);
-call_accessors!(Notification);
-
 impl Request {
+    /// Checks this message kind and the default JSON limits.
+    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+        checked(&value, Kind::Request)?;
+        Ok(Self { value })
+    }
+    /// Checks and copies the complete value, preserving all members.
+    /// Refuses invalid envelopes or values beyond default JSON limits.
+    pub fn to_value(&self) -> Result<Value, ParseError> {
+        checked(&self.value, Kind::Request)?;
+        Ok(self.value.clone())
+    }
+    /// The method string, or `None` after an invalid direct edit.
+    pub fn method(&self) -> Option<&str> {
+        self.value.get("method")?.as_str()
+    }
+    /// The optional parameter value. Direct edits may invalidate its shape.
+    pub fn params(&self) -> Option<&Value> {
+        self.value.get("params")
+    }
+
     /// Builds a request. Size and nesting are checked on conversion or writing.
     /// Names beginning with `rpc.` are accepted for protocol extensions.
     pub fn new(method: impl Into<String>, params: Option<Params>, id: Id) -> Self {
@@ -599,27 +633,48 @@ impl Request {
             value: call(method.into(), params, Some(id)),
         }
     }
-    /// The id after checking the whole request and its JSON limits.
+    /// The id after checking the envelope members. Does not traverse params
+    /// or extensions. Conversion and writing check their JSON limits.
     pub fn id(&self) -> Result<Id, ParseError> {
-        checked(&self.value, Kind::Request)?;
+        check_envelope(&self.value, Kind::Request)?;
         Ok(recover_id(&self.value))
     }
-    /// Answers this request with a result and its exact id. Refuses an invalid
-    /// request. The complete reply can exceed JSON limits, even for a valid
-    /// request with a large id. Handle write errors per message so a refused
+    /// Answers this request with a result and its exact id. Checks envelope
+    /// members as [`Self::id`] does. The reply can exceed JSON limits, even
+    /// for a valid request with a large id. Handle write errors so a refused
     /// reply does not stop dispatching later messages.
     pub fn success(&self, result: Value) -> Result<Response, ParseError> {
         Ok(Response::success(self.id()?, result))
     }
-    /// Answers this request with an error and its exact id. Refuses an invalid
-    /// request. The complete reply can exceed JSON limits, even for a valid
-    /// request with a large id. Handle write errors per message so a refused
+    /// Answers this request with an error and its exact id. Checks envelope
+    /// members as [`Self::id`] does. The reply can exceed JSON limits, even
+    /// for a valid request with a large id. Handle write errors so a refused
     /// reply does not stop dispatching later messages.
     pub fn error(&self, code: i64, message: impl Into<String>) -> Result<Response, ParseError> {
-        Ok(Response::error(Some(self.id()?), code, message))
+        Ok(Response::error(self.id()?, code, message))
     }
 }
 impl Notification {
+    /// Checks this message kind and the default JSON limits.
+    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+        checked(&value, Kind::Notification)?;
+        Ok(Self { value })
+    }
+    /// Checks and copies the complete value, preserving all members.
+    /// Refuses invalid envelopes or values beyond default JSON limits.
+    pub fn to_value(&self) -> Result<Value, ParseError> {
+        checked(&self.value, Kind::Notification)?;
+        Ok(self.value.clone())
+    }
+    /// The method string, or `None` after an invalid direct edit.
+    pub fn method(&self) -> Option<&str> {
+        self.value.get("method")?.as_str()
+    }
+    /// The optional parameter value. Direct edits may invalidate its shape.
+    pub fn params(&self) -> Option<&Value> {
+        self.value.get("params")
+    }
+
     /// Builds a notification. Limits are checked on conversion or writing.
     pub fn new(method: impl Into<String>, params: Option<Params>) -> Self {
         Self {
@@ -682,6 +737,18 @@ pub enum Outcome {
     Error(Error),
 }
 impl Response {
+    /// Checks this message kind and the default JSON limits.
+    pub fn from_value(value: Value) -> Result<Self, ParseError> {
+        checked(&value, Kind::Response)?;
+        Ok(Self { value })
+    }
+    /// Checks and copies the complete value, preserving all members.
+    /// Refuses invalid envelopes or values beyond default JSON limits.
+    pub fn to_value(&self) -> Result<Value, ParseError> {
+        checked(&self.value, Kind::Response)?;
+        Ok(self.value.clone())
+    }
+
     /// Builds a success. Limits are checked on conversion or writing.
     pub fn success(id: Id, result: Value) -> Self {
         Self {
@@ -692,10 +759,10 @@ impl Response {
             ]),
         }
     }
-    /// Builds an error response. `None` means an unreadable id and writes null.
+    /// Builds an error response. Use [`Id::Null`] for an unreadable id.
     /// Limits are checked on conversion or writing.
-    pub fn error(id: Option<Id>, code: i64, message: impl Into<String>) -> Self {
-        Self::with_error(id.unwrap_or(Id::Null), Error::new(code, message))
+    pub fn error(id: Id, code: i64, message: impl Into<String>) -> Self {
+        Self::with_error(id, Error::new(code, message))
     }
     /// Builds a response from a complete error object, including data and
     /// extensions. The object and limits are checked on conversion or writing.
@@ -785,9 +852,7 @@ impl Message {
     /// Parses exactly one message with caller-selected JSON limits, clamped to
     /// JSON's hard caps. Arrays, trailing values, and invalid envelopes fail.
     pub fn parse_with(input: &[u8], limits: &Limits) -> Result<Self, ParseError> {
-        Self::from_bounded(
-            json::parse_with(input, limits).map_err(|e| problem(ErrorKind::Json(e)))?,
-        )
+        Self::from_bounded(json::parse_with(input, limits).map_err(ParseError::from)?)
     }
     /// Appends compact JSON followed by one LF. Refuses invalid envelopes,
     /// JSON limits, or allocation failure.
@@ -932,9 +997,7 @@ pub fn parse_incoming(input: &[u8]) -> Result<Incoming, ParseError> {
 /// Reads server input with tighter JSON limits and individual batch errors.
 /// Invalid JSON, resource limits, and empty arrays fail the whole body.
 pub fn parse_incoming_with(input: &[u8], limits: &Limits) -> Result<Incoming, ParseError> {
-    Incoming::from_bounded(
-        json::parse_with(input, limits).map_err(|e| problem(ErrorKind::Json(e)))?,
-    )
+    Incoming::from_bounded(json::parse_with(input, limits).map_err(ParseError::from)?)
 }
 
 fn batch_entries(
@@ -1010,9 +1073,7 @@ impl Wire for Batch {
     /// Reads one nonempty array within default JSON limits. Refuses invalid
     /// entries, scalar bodies, empty batches, and trailing values.
     fn parse(input: &[u8]) -> Result<Self, ParseError> {
-        Self::from_value(
-            json::parse_with(input, &Limits::default()).map_err(|e| problem(ErrorKind::Json(e)))?,
-        )
+        Self::from_value(json::parse_with(input, &Limits::default()).map_err(ParseError::from)?)
     }
     /// Appends compact JSON. Refuses empty batches, invalid envelopes, and
     /// aggregate size, depth, or element limits, and destination allocation
@@ -1030,7 +1091,7 @@ impl Wire for Body {
     /// Reads one message or nonempty batch. Refuses invalid JSON, envelopes,
     /// trailing values, and default JSON limits.
     fn parse(input: &[u8]) -> Result<Self, ParseError> {
-        Self::from_value(Value::parse(input).map_err(|e| problem(ErrorKind::Json(e)))?)
+        Self::from_value(Value::parse(input).map_err(ParseError::from)?)
     }
     /// Appends compact JSON. Refuses everything the contained message or
     /// batch writer refuses. On refusal, the destination is unchanged.
@@ -1044,6 +1105,7 @@ impl Wire for Body {
 
 /// Newline-delimited single messages for stdio, built on [`Lines`].
 /// The item is `Result<Message, ParseError>`; errors do not stop framing.
+/// An MCP server may skip items whose public kind is [`ErrorKind::BlankLine`].
 /// It retains no input or payload state and processes input in linear time.
 pub struct Messages {
     lines: Map<Lines, LineParser>,
@@ -1259,6 +1321,7 @@ mod tests {
                 r#"[
             {"jsonrpc":"2.0","result":7,"id":"1"},
             {"jsonrpc":"2.0","result":19,"id":"2"},
+            {"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null},
             {"jsonrpc":"2.0","error":{"code":-32601,"message":"Method not found"},"id":"5"},
             {"jsonrpc":"2.0","result":["hello",5],"id":"9"}
         ]"#,
@@ -1764,8 +1827,13 @@ mod tests {
     fn response_shape_and_write_refusals_keep_context() {
         for (text, response) in [
             (r#"{"jsonrpc":"2.0","id":5,"result":1,"error":{}}"#, true),
-            (r#"{"jsonrpc":"bad","id":5}"#, true),
-            ("{}", true),
+            (r#"{"jsonrpc":"bad","id":5}"#, false),
+            ("{}", false),
+            (r#"{"id":1}"#, false),
+            (r#"{"jsonrpc":"2.0","id":5,"params":[1]}"#, false),
+            (r#"{"jsonrpc":"2.0","id":5,"methood":"ping"}"#, false),
+            (r#"{"result":null}"#, true),
+            (r#"{"error":null}"#, true),
             (r#"{"jsonrpc":"2.0","method":null,"id":5}"#, false),
             (
                 r#"{"jsonrpc":"2.0","method":null,"method":null,"id":5}"#,
@@ -1777,6 +1845,18 @@ mod tests {
             let error = Message::parse(text.as_bytes()).unwrap_err();
             assert_eq!(error.is_response(), response, "{text}");
             assert_eq!(dispatch(Err(error)).is_none(), response);
+        }
+        for (text, response) in [
+            (r#"{"id":1}"#, false),
+            (r#"{"result":null}"#, true),
+            (r#"{"error":null}"#, true),
+            (r#"{"method":null,"result":null}"#, false),
+        ] {
+            let mut oversized = value(text);
+            set(&mut oversized, "x", Value::from("x".repeat(json::MAX_SIZE)));
+            let error = Message::from_value(oversized).unwrap_err();
+            assert!(matches!(error.kind, ErrorKind::Limit(_)));
+            assert_eq!(error.is_response(), response, "{text}");
         }
         let bad = Message::Response(Response {
             value: value(r#"{"jsonrpc":"2.0","id":5,"result":1,"error":{}}"#),
@@ -1822,6 +1902,47 @@ mod tests {
             )))
             .is_some()
         );
+    }
+
+    #[test]
+    fn request_id_checks_envelope_without_traversing_payloads() {
+        let mut deep = Value::Null;
+        for _ in 0..1_000 {
+            deep = Value::Array(vec![deep]);
+        }
+        let id = Id::Number(Number::from_text("1e400").unwrap());
+        let mut request = Request::new("ping", Some(Params::Array(vec![deep])), id.clone());
+        assert_eq!(request.id().unwrap(), id);
+        for reply in [
+            request.success(Value::Null).unwrap(),
+            request.error(INTERNAL_ERROR, "Internal error").unwrap(),
+        ] {
+            assert_eq!(reply.id().unwrap(), id);
+            contract::check_wire_value(&Message::Response(reply));
+        }
+        // Accessors do not relax strict conversion or writing.
+        assert!(request.to_value().is_err());
+        contract::check_wire_value(&Message::Request(request.clone()));
+        set(&mut request.value, "method", Value::Null);
+        assert_eq!(request.id().unwrap_err().kind, ErrorKind::Method);
+        assert!(request.success(Value::Null).is_err());
+        assert!(request.error(INTERNAL_ERROR, "Internal error").is_err());
+        set(&mut request.value, "method", Value::from("ping"));
+        set(&mut request.value, "params", Value::Null);
+        assert_eq!(request.id().unwrap_err().kind, ErrorKind::Params);
+    }
+
+    #[test]
+    fn error_responses_take_an_explicit_id() {
+        for id in [
+            Id::Null,
+            Id::String("call".into()),
+            Id::Number(Number::from_i64(1)),
+        ] {
+            let reply = Response::error(id.clone(), INTERNAL_ERROR, "Internal error");
+            assert_eq!(reply.id().unwrap(), id);
+            contract::check_wire_value(&Message::Response(reply));
+        }
     }
 
     #[test]

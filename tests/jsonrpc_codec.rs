@@ -1,33 +1,13 @@
 //! JSON-RPC envelopes and stdio/HTTP framing through public codec tools.
 
 use fictionet::stdlib::codec::{
-    Carry, Collect, Decode, Demux, Ending, Layered, Lines, Pipe, Stream, Wire, contract, finish,
-    pump,
-    test_support::{Lcg, chunks, decode_all, mutate, random_chunks},
+    Carry, Collect, CollectError, Demux, Ending, Fail, Layered, Lines, Pipe, Stream, Wire,
+    contract, finish, pump,
+    test_support::{Lcg, chunks, decode_all, mutate},
     try_pump,
 };
 use fictionet::stdlib::json::{self, Limits, Value};
 use fictionet::stdlib::jsonrpc::{self, Batch, Body, ErrorKind, Id, Message, Messages, Request};
-use std::fmt::Debug;
-
-fn partitioned<'a, D: Decode>(decoder: D, parts: impl Iterator<Item = &'a [u8]>) -> Vec<D::Item>
-where
-    D::Error: Clone + Debug,
-{
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    for part in parts {
-        assert_eq!(
-            pump(&mut stream, part, |item| items.push(item)).unwrap(),
-            part.len()
-        );
-        assert!(stream.buffered() <= stream.decoder().capacity());
-    }
-    finish(&mut stream, |item| items.push(item)).unwrap();
-    assert!(stream.is_done());
-    assert!(stream.failed().is_none());
-    items
-}
 
 #[test]
 fn line_write_decode_round_trips_under_all_chunkings() {
@@ -47,16 +27,7 @@ fn line_write_decode_round_trips_under_all_chunkings() {
     let expected: Vec<_> = messages.into_iter().map(Ok).collect();
     contract::check_decode(Messages::new, &bytes);
     contract::check_decode_with_held_limit(Messages::new, &bytes, 0);
-    assert_eq!(partitioned(Messages::new(), chunks(&bytes, &[1])), expected);
-    for seed in 0..12 {
-        assert_eq!(
-            partitioned(
-                Messages::new(),
-                random_chunks(&bytes, &mut Lcg::new(seed), 37)
-            ),
-            expected
-        );
-    }
+    assert_eq!(decode_all(Messages::new, &bytes), (expected, None));
 }
 
 #[test]
@@ -73,15 +44,144 @@ fn body_wire_and_collection_contracts() {
         contract::check_decode(make, bytes);
         let body = Body::parse(bytes).unwrap();
         let written = body.to_bytes().unwrap();
-        assert_eq!(decode_all(make, &written), (vec![body.clone()], None));
+        assert_eq!(decode_all(make, &written), (vec![body], None));
+    }
+}
+
+#[test]
+fn server_body_collection_preserves_mixed_batch_entries() {
+    let bytes = br#"[{"jsonrpc":"2.0","method":"ping","id":"1"},{"foo":"boo"},{"jsonrpc":"2.0","method":"ready"},{"result":null}]"#;
+    let make = || Collect::<Value>::new(json::MAX_SIZE);
+    contract::check_decode(make, bytes);
+    let (values, failure) = decode_all(make, bytes);
+    assert_eq!(failure, None);
+    assert_eq!(values.len(), 1);
+    let mut replies = Vec::new();
+    for value in values {
+        let jsonrpc::Incoming::Batch(entries) = jsonrpc::Incoming::from_value(value).unwrap()
+        else {
+            panic!("expected a batch");
+        };
+        assert_eq!(entries.len(), 4);
+        for entry in entries {
+            match entry {
+                Ok(Message::Request(request)) => {
+                    replies.push(Message::Response(request.success(Value::Null).unwrap()));
+                }
+                Err(error) if !error.is_response() => {
+                    assert_eq!(error.batch_index, Some(1));
+                    replies.push(Message::Response(error.response()));
+                }
+                _ => {}
+            }
+        }
+    }
+    let reply = Batch { messages: replies };
+    assert_eq!(reply.to_bytes().unwrap(), br#"[{"jsonrpc":"2.0","result":null,"id":"1"},{"jsonrpc":"2.0","error":{"code":-32600,"message":"Invalid Request"},"id":null}]"#);
+    contract::check_wire_value(&reply);
+}
+
+#[test]
+fn server_body_json_errors_have_public_rpc_conversion() {
+    for bytes in [b"{".as_slice(), b"", b"[{\"jsonrpc\":\"2.0\",]"] {
+        let make = || Collect::<Value>::new(json::MAX_SIZE);
+        contract::check_decode(make, bytes);
+        let (items, failure) = decode_all(make, bytes);
+        assert!(items.is_empty());
+        let Some(Fail::Protocol(CollectError::Parse(json_error))) = failure else {
+            panic!("expected a JSON parse error");
+        };
+        let error = jsonrpc::ParseError::from(json_error);
+        assert_eq!(error.kind, ErrorKind::Json(json_error));
+        assert_eq!(error.id, Id::Null);
+        assert_eq!(error.batch_index, None);
+        assert!(!error.is_response());
+        let reply = Message::Response(error.response());
         assert_eq!(
-            partitioned(make(), chunks(bytes, &[1])),
-            std::slice::from_ref(&body)
+            reply.to_bytes().unwrap(),
+            br#"{"jsonrpc":"2.0","error":{"code":-32700,"message":"Parse error"},"id":null}"#
         );
+        contract::check_wire_value(&reply);
+    }
+    let bytes = vec![b'1'; json::MAX_NUMBER_LEN + 1];
+    let (items, failure) = decode_all(|| Collect::<Value>::new(json::MAX_SIZE), &bytes);
+    assert!(items.is_empty());
+    let Some(Fail::Protocol(CollectError::Parse(json_error))) = failure else {
+        panic!("expected a JSON limit error");
+    };
+    let error = jsonrpc::ParseError::from(json_error);
+    assert_eq!(error.rpc_code(), jsonrpc::INVALID_REQUEST);
+    contract::check_wire_value(&Message::Response(error.response()));
+}
+
+#[test]
+fn mcp_dispatch_can_skip_blank_lines_by_public_kind() {
+    let bytes = b"\n \t\r\n{\n{\"jsonrpc\":\"2.0\",\"method\":\"ping\",\"id\":1}\n";
+    contract::check_decode(Messages::new, bytes);
+    let (items, failure) = decode_all(Messages::new, bytes);
+    assert_eq!(failure, None);
+    assert_eq!(items.len(), 4);
+    let mut replies = Vec::new();
+    let mut blanks = 0;
+    for item in items {
+        let reply = match item {
+            Err(error) if error.kind == ErrorKind::BlankLine => {
+                blanks += 1;
+                continue;
+            }
+            Err(error) if !error.is_response() => error.response(),
+            Ok(Message::Request(request)) => request.success(Value::Null).unwrap(),
+            _ => continue,
+        };
+        Message::Response(reply).write_line(&mut replies).unwrap();
+    }
+    assert_eq!(blanks, 2);
+    let (items, failure) = decode_all(Messages::new, &replies);
+    assert_eq!(failure, None);
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[0]
+            .as_ref()
+            .unwrap()
+            .value()
+            .get("error")
+            .unwrap()
+            .get("code"),
+        Some(&Value::from(jsonrpc::PARSE_ERROR))
+    );
+    assert_eq!(
+        items[1].as_ref().unwrap().value().get("id"),
+        Some(&Value::from(1))
+    );
+}
+
+#[test]
+fn stdio_answers_objects_without_method_or_response_members() {
+    for (bytes, id) in [
+        (b"{}\n".as_slice(), Value::Null),
+        (b"{\"id\":1}\n", Value::from(1)),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"id\":5,\"params\":[1]}\n",
+            Value::from(5),
+        ),
+        (
+            b"{\"jsonrpc\":\"2.0\",\"id\":5,\"methood\":\"ping\"}\n",
+            Value::from(5),
+        ),
+    ] {
+        contract::check_decode(Messages::new, bytes);
+        let (items, failure) = decode_all(Messages::new, bytes);
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 1);
+        let error = items.into_iter().next().unwrap().unwrap_err();
+        assert!(!error.is_response());
+        let reply = Message::Response(error.response());
+        assert_eq!(reply.value().get("id"), Some(&id));
         assert_eq!(
-            partitioned(make(), random_chunks(bytes, &mut Lcg::new(71), 19)),
-            [body]
+            reply.value().get("error").unwrap().get("code"),
+            Some(&Value::from(jsonrpc::INVALID_REQUEST))
         );
+        contract::check_wire_value(&reply);
     }
 }
 
@@ -91,11 +191,6 @@ fn recoverable_errors_and_eof_contracts() {
     contract::check_decode(Messages::new, bytes);
     let (items, failure) = decode_all(Messages::new, bytes);
     assert_eq!(failure, None);
-    assert_eq!(partitioned(Messages::new(), chunks(bytes, &[1])), items);
-    assert_eq!(
-        partitioned(Messages::new(), random_chunks(bytes, &mut Lcg::new(99), 13)),
-        items
-    );
     assert!(items.iter().any(Result::is_ok));
     for error in items.into_iter().filter_map(Result::err) {
         contract::check_wire_value(&Message::Response(error.response()));
@@ -264,7 +359,12 @@ fn lines_take_one_byte_at_a_time_in_linear_time() {
     bytes.extend(vec![b'x'; jsonrpc::MAX_LINE + 100]);
     bytes.extend_from_slice(b"\n{\"jsonrpc\":\"2.0\",\"method\":\"ok\"}\n");
     let started = std::time::Instant::now();
-    let items = partitioned(Messages::new(), chunks(&bytes, &[1]));
+    let mut stream = Stream::new(Messages::new());
+    let mut items = Vec::new();
+    for part in chunks(&bytes, &[1]) {
+        pump(&mut stream, part, |item| items.push(item)).unwrap();
+    }
+    finish(&mut stream, |item| items.push(item)).unwrap();
     assert_eq!(items.len(), 3);
     assert!(items[0].is_ok());
     assert!(matches!(

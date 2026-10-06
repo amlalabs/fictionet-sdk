@@ -23,6 +23,10 @@
 //! keeps its members in order, duplicate keys included, since RFC 8259
 //! leaves their meaning to the reader.
 //!
+//! [`Value`] implements `Drop` to release nested trees without recursion.
+//! Its fields cannot be moved out by pattern matching. Match a mutable
+//! reference and use [`core::mem::take`] to take an array, object, or string.
+//!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::json::{Number, Value};
@@ -225,12 +229,22 @@ pub enum Value {
 
 impl Drop for Value {
     fn drop(&mut self) {
-        // Detach children before dropping their parent. Each node enters the
-        // work list once, so work and storage are bounded by the owned tree.
+        // Detach containers before dropping their parent. Scalars drop in
+        // place, so an all-scalar container needs no work list allocation.
+        // Each container enters the list once. Its size is bounded by the tree.
         fn detach(value: &mut Value, pending: &mut Vec<Value>) {
             match value {
-                Value::Array(items) => pending.append(items),
-                Value::Object(members) => pending.extend(members.drain(..).map(|(_, v)| v)),
+                Value::Array(items) => pending.extend(
+                    items
+                        .drain(..)
+                        .filter(|v| matches!(v, Value::Array(_) | Value::Object(_))),
+                ),
+                Value::Object(members) => pending.extend(
+                    members
+                        .drain(..)
+                        .map(|(_, v)| v)
+                        .filter(|v| matches!(v, Value::Array(_) | Value::Object(_))),
+                ),
                 _ => {}
             }
         }

@@ -38,8 +38,11 @@
 //!
 //! [`jsonrpc`] reads JSON-RPC 2.0 requests, notifications, responses, and
 //! batches over ordered [`json::Value`] trees. Use [`jsonrpc::Messages`] for
-//! stdio lines and [`codec::Collect<jsonrpc::Body>`] for an HTTP body. Reply
-//! helpers keep request ids exact, and writers check edited envelopes.
+//! stdio lines. For server HTTP bodies, use [`codec::Collect<json::Value>`]
+//! and [`jsonrpc::Incoming::from_value`] to retain invalid batch entries.
+//! Convert JSON parser errors with [`jsonrpc::ParseError::from`] for replies.
+//! Clients and strict callers can use [`codec::Collect<jsonrpc::Body>`].
+//! Reply helpers keep request ids exact, and writers check edited envelopes.
 //!
 //! # Three kinds of functions
 //!
