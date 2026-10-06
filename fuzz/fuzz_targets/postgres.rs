@@ -3,7 +3,7 @@
 
 use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::postgres::{
-    Backend, BackendMessages, EncryptionReply, Frontend, FrontendMessages, Password,
+    Backend, BackendEvent, BackendMessages, EncryptionReply, Frontend, FrontendMessages, Password,
     SaslInitialResponse, Startup,
 };
 use libfuzzer_sys::fuzz_target;
@@ -18,7 +18,6 @@ fuzz_target!(|data: &[u8]| {
     for make in [|| FrontendMessages::with_limit(64), typed_frontend] {
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
         for message in decode_all(make, data).0.into_iter().flatten() {
-            contract::check_wire_value(&message);
             if let Frontend::Startup(startup) = &message {
                 if startup.database().is_some() {
                     assert!(
@@ -34,6 +33,10 @@ fuzz_target!(|data: &[u8]| {
                     contract::check_wire_value(&sasl.to_message().unwrap());
                 }
             }
+            let m = message;
+            let b = m.to_bytes().unwrap();
+            assert_eq!(Frontend::parse(&b), Ok(m));
+            contract::check_wire::<Frontend>(&b);
         }
     }
     for make in [
@@ -45,6 +48,13 @@ fuzz_target!(|data: &[u8]| {
         },
     ] {
         contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
+        for item in decode_all(make, data).0.into_iter().flatten() {
+            if let BackendEvent::Message(m) = item {
+                let b = m.to_bytes().unwrap();
+                assert_eq!(Backend::parse(&b), Ok(m));
+                contract::check_wire::<Backend>(&b);
+            }
+        }
     }
     contract::check_wire::<Frontend>(data);
     contract::check_wire::<Backend>(data);
@@ -69,4 +79,9 @@ fuzz_target!(|data: &[u8]| {
     startup.extend_from_slice(data);
     let make = || FrontendMessages::with_limit(64);
     contract::check_decode_with_alloc_limit(make, &startup, 2 * make().capacity());
+    for m in decode_all(make, &startup).0.into_iter().flatten() {
+        let b = m.to_bytes().unwrap();
+        assert_eq!(Frontend::parse(&b), Ok(m));
+        contract::check_wire::<Frontend>(&b);
+    }
 });

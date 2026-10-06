@@ -76,8 +76,7 @@
 //! assert_eq!(bytes[bytes.len() - 6..], *b"Z\0\0\0\x05I");
 //! ```
 
-extern crate self as fictionet;
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port PostgreSQL servers listen on.
 pub const PORT: u16 = 5432;
@@ -562,12 +561,15 @@ pub enum Frontend {
     Startup(Startup),
     /// SSLRequest: asks to switch to TLS. The server answers with one
     /// byte, [`ACCEPT_SSL`] or [`REFUSE_ENCRYPTION`]. A server that
-    /// accepts uses [`FrontendMessages::start_encryption`]. The decoder refuses
-    /// a second SSLRequest on one connection.
+    /// accepts calls [`super::codec::Stream::into_parts`], then
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// The decoder refuses a second SSLRequest on one connection.
     SslRequest,
     /// GSSENCRequest: asks to switch to GSSAPI encryption. The server
     /// answers with one byte, [`ACCEPT_GSSENC`] or [`REFUSE_ENCRYPTION`],
-    /// and uses [`FrontendMessages::start_encryption`] if it accepts. The decoder refuses a second GSSENCRequest on one connection.
+    /// then calls [`super::codec::Stream::into_parts`] if it accepts and
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// The decoder refuses a second GSSENCRequest on one connection.
     GssEncRequest,
     /// CancelRequest: stop the query running in another session. The
     /// server answers nothing and closes the connection.
@@ -651,9 +653,6 @@ impl Frontend {
     /// Wraps a password in an authentication message. Refuses NUL and
     /// passwords whose UTF-8 bytes exceed the authentication message limit.
     pub fn password(password: &str) -> Result<Frontend, Error> {
-        if password.len() > MAX_AUTH_MESSAGE - 5 {
-            return Err(Error::Unwritable);
-        }
         Ok(Frontend::AuthResponse(
             Password(password.into()).to_bytes()?,
         ))
@@ -967,9 +966,10 @@ pub enum Error {
     /// The connection opened with a TLS record, not a startup-phase
     /// message: the client asked for direct TLS (`sslnegotiation=direct`).
     /// A server that supports it starts TLS with the bytes
-    /// [`super::codec::Stream::into_parts`] retains, then starts a new stream
-    /// with the returned decoder for decrypted bytes. As in PostgreSQL, only the first byte
-    /// of a connection is read this way.
+    /// [`super::codec::Stream::into_parts`] retains, then calls
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// A new stream uses that decoder for decrypted bytes. As in
+    /// PostgreSQL, only the first byte of a connection is read this way.
     DirectTls,
     /// A startup-phase message with a code that is neither protocol
     /// version 3 nor a known request, or a second SSLRequest or
@@ -1100,7 +1100,7 @@ impl core::fmt::Display for ParseError {
 impl core::error::Error for ParseError {}
 
 // Sizes include the length field but exclude the type byte. Use the
-// original field lengths: clipping cannot make a strict write succeed.
+// original field lengths.
 fn size_sum(fixed: usize, fields: impl IntoIterator<Item = usize>) -> usize {
     fields.into_iter().fold(fixed, usize::saturating_add)
 }
@@ -1270,7 +1270,7 @@ impl Wire for SaslInitialResponse {
         Ok(Self { mechanism, data })
     }
 
-    /// Appends the mechanism and optional data without clipping. Refuses
+    /// Appends the mechanism and optional data. Refuses
     /// NUL in the mechanism and oversized bodies. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let size = self
@@ -1290,7 +1290,7 @@ impl Wire for SaslInitialResponse {
 }
 
 // Field writing is shared by both directions. Callers bound the complete
-// message size before staging. Every variable count is checked, never clipped.
+// message size before staging. Every variable count is checked.
 struct Out {
     buf: Vec<u8>,
 }
@@ -2419,14 +2419,13 @@ fn show_tag(t: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
+    use super::super::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };
 
     #[test]
     fn all_message_variants_obey_wire_contract() {
-        use crate::stdlib::codec::contract;
         for message in all_frontend() {
             contract::check_wire_value(&message);
             let bytes = Wire::to_bytes(&message).unwrap();
@@ -3142,6 +3141,11 @@ mod tests {
             let (buffer, mut decoder) = stream.into_parts();
             assert_eq!(buffer.unread(), b"injected");
             decoder.start_encryption();
+            let startup = Frontend::Startup(Startup::new("alice", "shop"));
+            assert_eq!(
+                decode_all(|| decoder.clone(), &startup.to_bytes().unwrap()),
+                (vec![Ok(startup)], None)
+            );
             assert_eq!(
                 decoder.decode(&second.to_bytes().unwrap(), false),
                 Err(Error::UnsupportedProtocol(code))
@@ -3578,7 +3582,9 @@ mod tests {
         for _ in 0..3000 {
             let message = random_frontend(&mut rng);
             contract::check_wire_value(&message);
-            if let Ok(bytes) = message.to_bytes() {
+            let bytes = message.to_bytes();
+            assert_eq!(bytes.is_ok(), clean_frontend(&message), "{message:?}");
+            if let Ok(bytes) = bytes {
                 assert_eq!(Frontend::parse(&bytes), Ok(message));
                 contract::check_wire::<Frontend>(&bytes);
             }
@@ -3609,17 +3615,29 @@ mod tests {
                 _ => back.clone(),
             };
             mutate(&mut rng, &mut data);
-            contract::check_decode_with_alloc_limit(
-                || FrontendMessages::with_limit(64),
-                &data,
-                2 * (MAX_STARTUP + 4),
-            );
-            contract::check_decode_with_alloc_limit(
-                typed_frontend,
-                &data,
-                2 * typed_frontend().capacity(),
-            );
+            let mut startup = startup_bytes();
+            startup.extend_from_slice(&data);
+            let make: fn() -> FrontendMessages = || FrontendMessages::with_limit(64);
+            for (make, input) in [(make, &data), (make, &startup), (typed_frontend, &data)] {
+                contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
+                for m in decode_all(make, input).0.into_iter().flatten() {
+                    let b = m.to_bytes().unwrap();
+                    assert_eq!(Frontend::parse(&b), Ok(m));
+                    contract::check_wire::<Frontend>(&b);
+                }
+            }
             contract::check_decode_with_alloc_limit(|| BackendMessages::with_limit(64), &data, 130);
+            for item in decode_all(|| BackendMessages::with_limit(64), &data)
+                .0
+                .into_iter()
+                .flatten()
+            {
+                if let BackendEvent::Message(m) = item {
+                    let b = m.to_bytes().unwrap();
+                    assert_eq!(Backend::parse(&b), Ok(m));
+                    contract::check_wire::<Backend>(&b);
+                }
+            }
             contract::check_wire::<Frontend>(&data);
             contract::check_wire::<Backend>(&data);
             contract::check_wire::<Password>(&data);
@@ -3749,6 +3767,54 @@ mod tests {
         (0..rng.index(5)).map(|_| make(rng)).collect()
     }
 
+    fn clean_frontend(m: &Frontend) -> bool {
+        let ok = |s: &String| !s.contains('\0');
+        if frontend_size(m) > m.tag().and_then(frontend_limit).unwrap_or(MAX_STARTUP + 4) {
+            return false;
+        }
+        match m {
+            Frontend::Startup(s) => s
+                .params
+                .iter()
+                .all(|(n, v)| ok(n) && ok(v) && !n.is_empty()),
+            Frontend::CancelRequest { secret_key, .. } => {
+                (1..=MAX_SECRET_KEY).contains(&secret_key.len())
+            }
+            Frontend::Bind(b) => {
+                ok(&b.portal)
+                    && ok(&b.statement)
+                    && (b.param_formats.len() <= 1 || b.param_formats.len() == b.params.len())
+                    && b.param_formats.len() <= MAX_COUNT
+                    && b.params.len() <= MAX_COUNT
+                    && b.result_formats.len() <= MAX_COUNT
+                    && check_text_values(&b.param_formats, &b.params).is_ok()
+            }
+            Frontend::FunctionCall(f) => {
+                (f.arg_formats.len() <= 1 || f.arg_formats.len() == f.args.len())
+                    && f.arg_formats.len() <= MAX_COUNT
+                    && f.args.len() <= MAX_COUNT
+                    && check_text_values(&f.arg_formats, &f.args).is_ok()
+            }
+            Frontend::Close { name, .. } | Frontend::Describe { name, .. } => ok(name),
+            Frontend::CopyFail(s) | Frontend::Query(s) | Frontend::Execute { portal: s, .. } => {
+                ok(s)
+            }
+            Frontend::Parse {
+                name,
+                query,
+                param_types,
+            } => ok(name) && ok(query) && param_types.len() <= MAX_COUNT,
+            _ => true,
+        }
+    }
+
+    fn random_text(rng: &mut Lcg) -> String {
+        const PIECES: &[&str] = &["", "a", "hello", " ", "\0", "é", "漢"];
+        (0..rng.index(40))
+            .map(|_| PIECES[rng.index(PIECES.len())])
+            .collect()
+    }
+
     fn random_frontend(rng: &mut Lcg) -> Frontend {
         let target = if rng.coin() {
             Target::Statement
@@ -3758,7 +3824,7 @@ mod tests {
         match rng.index(18) {
             0 => Frontend::Startup(Startup {
                 minor_version: rng.index(4) as u16,
-                params: list(rng, |r| (r.text(300), r.text(300))),
+                params: list(rng, |r| (random_text(r), random_text(r))),
             }),
             1 => Frontend::SslRequest,
             2 => Frontend::GssEncRequest,
@@ -3774,8 +3840,8 @@ mod tests {
                     _ => params.iter().map(|_| random_format(rng)).collect(),
                 };
                 Frontend::Bind(Bind {
-                    portal: rng.text(300),
-                    statement: rng.text(300),
+                    portal: random_text(rng),
+                    statement: random_text(rng),
                     param_formats,
                     params,
                     result_formats: list(rng, random_format),
@@ -3783,17 +3849,17 @@ mod tests {
             }
             5 => Frontend::Close {
                 target,
-                name: rng.text(300),
+                name: random_text(rng),
             },
             6 => Frontend::CopyData(rng.bytes(300)),
             7 => Frontend::CopyDone,
-            8 => Frontend::CopyFail(rng.text(300)),
+            8 => Frontend::CopyFail(random_text(rng)),
             9 => Frontend::Describe {
                 target,
-                name: rng.text(300),
+                name: random_text(rng),
             },
             10 => Frontend::Execute {
-                portal: rng.text(300),
+                portal: random_text(rng),
                 max_rows: rng.next() as i32,
             },
             11 => Frontend::Flush,
@@ -3804,10 +3870,12 @@ mod tests {
                 result_format: random_format(rng),
             }),
             13 => Frontend::AuthResponse(rng.bytes(300)),
-            14 => {
-                Frontend::Parse { name: rng.text(300), query: rng.text(300), param_types: list(rng, |r| r.next() as u32) }
-            }
-            15 => Frontend::Query(rng.text(300)),
+            14 => Frontend::Parse {
+                name: random_text(rng),
+                query: random_text(rng),
+                param_types: list(rng, |r| r.next() as u32),
+            },
+            15 => Frontend::Query(random_text(rng)),
             16 => Frontend::Sync,
             _ => Frontend::Terminate,
         }
@@ -3815,7 +3883,7 @@ mod tests {
 
     fn random_backend(rng: &mut Lcg) -> Backend {
         let diagnostic = |r: &mut Lcg| Diagnostic {
-            fields: list(r, |r| (r.next() as u8, r.text(300))),
+            fields: list(r, |r| (r.next() as u8, random_text(r))),
         };
         let copy = |r: &mut Lcg| CopyFormat {
             format: random_format(r),
@@ -3835,7 +3903,7 @@ mod tests {
                 4 => Authentication::Gss,
                 5 => Authentication::GssContinue(rng.bytes(300)),
                 6 => Authentication::Sspi,
-                7 => Authentication::Sasl(list(rng, |r| r.text(300))),
+                7 => Authentication::Sasl(list(rng, random_text)),
                 8 => Authentication::SaslContinue(rng.bytes(300)),
                 _ => Authentication::SaslFinal(rng.bytes(300)),
             }),
@@ -3845,7 +3913,7 @@ mod tests {
             },
             2 => Backend::BindComplete,
             3 => Backend::CloseComplete,
-            4 => Backend::CommandComplete(rng.text(300)),
+            4 => Backend::CommandComplete(random_text(rng)),
             5 => Backend::CopyData(rng.bytes(300)),
             6 => Backend::CopyDone,
             7 => Backend::CopyInResponse(copy(rng)),
@@ -3857,19 +3925,19 @@ mod tests {
             13 => Backend::FunctionCallResponse(random_value(rng)),
             14 => Backend::NegotiateProtocolVersion {
                 version: rng.next() as u32,
-                unrecognized: list(rng, |r| r.text(300)),
+                unrecognized: list(rng, random_text),
             },
             15 => Backend::NoData,
             16 => Backend::NoticeResponse(diagnostic(rng)),
             17 => Backend::NotificationResponse {
                 process_id: rng.next() as u32,
-                channel: rng.text(300),
-                payload: rng.text(300),
+                channel: random_text(rng),
+                payload: random_text(rng),
             },
             18 => Backend::ParameterDescription(list(rng, |r| r.next() as u32)),
             19 => Backend::ParameterStatus {
-                name: rng.text(300),
-                value: rng.text(300),
+                name: random_text(rng),
+                value: random_text(rng),
             },
             20 => Backend::ParseComplete,
             21 => Backend::PortalSuspended,
@@ -3879,7 +3947,7 @@ mod tests {
                 _ => TransactionStatus::Failed,
             }),
             _ => Backend::RowDescription(list(rng, |r| Field {
-                name: r.text(300),
+                name: random_text(r),
                 table_oid: r.next() as u32,
                 column: r.next() as i16,
                 type_oid: r.next() as u32,

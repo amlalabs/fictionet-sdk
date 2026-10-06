@@ -21,6 +21,7 @@ where
     D::Item: PartialEq + core::fmt::Debug,
 {
     let capacity = make().capacity();
+    contract::check_decode_with_held_limit(&make, bytes, 0);
     contract::check_decode_with_alloc_limit(make, bytes, 2 * capacity);
 }
 
@@ -158,45 +159,41 @@ fn postgres_refusal_resumes_startup_then_typed_messages() {
     for message in &messages {
         message.write(&mut bytes).unwrap();
     }
-    let mut stream = Stream::new(pg::FrontendMessages::new());
-    let mut got = Vec::new();
-    for part in chunks(&bytes, &[3, 1, 11]) {
-        assert_eq!(stream.push(part), part.len());
-        while let Some(item) = stream.next() {
-            let message = item.unwrap().unwrap();
-            if matches!(
-                message,
-                pg::Frontend::SslRequest | pg::Frontend::GssEncRequest
-            ) {
-                stream.decoder().refuse_encryption();
+    for pattern in [&[][..], &[1], &[3, 1, 11]] {
+        for after_end in [false, true] {
+            let mut stream = Stream::new(pg::FrontendMessages::new());
+            let mut got = Vec::new();
+            for part in chunks(&bytes, pattern) {
+                assert_eq!(stream.push(part), part.len());
+                assert_eq!(stream.held(), 0);
+                assert!(stream.buffered() <= stream.decoder().capacity());
+                while let Some(item) = stream.next() {
+                    let message = item.unwrap().unwrap();
+                    if matches!(
+                        message,
+                        pg::Frontend::SslRequest | pg::Frontend::GssEncRequest
+                    ) {
+                        if after_end {
+                            assert_eq!(stream.next(), None);
+                            assert!(stream.is_done());
+                            let mut next = stream.decoder().clone();
+                            next.refuse_encryption();
+                            stream = stream.swap(next);
+                        } else {
+                            stream.decoder().refuse_encryption();
+                        }
+                    }
+                    got.push(message);
+                }
             }
-            got.push(message);
+            assert_eq!(stream.decoder().phase(), pg::Phase::Messages);
+            stream.end();
+            assert_eq!(stream.next(), None);
+            assert!(stream.failed().is_none());
+            assert_eq!(got, messages);
+            assert_eq!(stream.offset(), bytes.len() as u64);
         }
     }
-    stream.end();
-    assert_eq!(stream.next(), None);
-    assert!(stream.failed().is_none());
-    assert_eq!(got, messages);
-
-    // A decision made after observing End resumes through swap, with the
-    // negotiation history and the exact buffered startup suffix intact.
-    let mut stream = Stream::new(pg::FrontendMessages::new());
-    assert_eq!(stream.push(&bytes), bytes.len());
-    for request in [pg::Frontend::SslRequest, pg::Frontend::GssEncRequest] {
-        assert_eq!(stream.next(), Some(Ok(Ok(request))));
-        assert_eq!(stream.next(), None);
-        assert!(stream.is_done());
-        let mut next = stream.decoder().clone();
-        next.refuse_encryption();
-        stream = stream.swap(next);
-    }
-    for message in messages.iter().skip(2) {
-        assert_eq!(stream.next(), Some(Ok(Ok(message.clone()))));
-    }
-    assert_eq!(stream.decoder().phase(), pg::Phase::Messages);
-    stream.end();
-    assert_eq!(stream.next(), None);
-    assert_eq!(stream.offset(), bytes.len() as u64);
 
     let mut backend = Wire::to_bytes(&pg::EncryptionReply::Refused).unwrap();
     let ready = pg::Backend::ReadyForQuery(pg::TransactionStatus::Idle);
@@ -444,6 +441,8 @@ where
         }
         let took = stream.push(pending);
         assert!(took > 0);
+        assert_eq!(stream.held(), 0);
+        assert!(stream.buffered() <= stream.decoder().capacity());
         pending = &pending[took..];
     };
     assert!(stream.next().is_none());
@@ -454,6 +453,8 @@ where
             pump(&mut body, part, |_| panic!("body before EOF")).unwrap(),
             part.len()
         );
+        assert_eq!(body.held(), 0);
+        assert!(body.buffered() <= body.decoder().capacity());
     }
     body.end();
     let Body(bytes) = body.next().unwrap().unwrap();
@@ -471,10 +472,12 @@ fn imf_header_and_collected_body_round_trip() {
     bytes.extend_from_slice(&body);
     let make = || imf::Head::with_limit(128);
     check(make, &bytes);
-    assert_eq!(
-        read_head_and_body(make(), &bytes, &[3, 1, 59, 2, 83], MAX_MAIL_BODY),
-        (Ok(header.clone()), body.clone())
-    );
+    for pattern in [&[][..], &[1], &[3, 1, 59, 2, 83]] {
+        assert_eq!(
+            read_head_and_body(make(), &bytes, pattern, MAX_MAIL_BODY),
+            (Ok(header.clone()), body.clone())
+        );
+    }
     assert_eq!(
         read(make(), &Wire::to_bytes(&header).unwrap()),
         [Ok(header)]
@@ -486,10 +489,12 @@ fn imf_bad_fields_are_items_and_header_limits_end_once() {
     let bytes = b"bad field\r\n\r\nbody";
     let make = || imf::Head::with_limit(32);
     check(make, bytes);
-    assert_eq!(
-        read_head_and_body(make(), bytes, &[3, 7], MAX_MAIL_BODY),
-        (Err(imf::Error::FieldName), b"body".to_vec())
-    );
+    for pattern in [&[][..], &[1], &[3, 7]] {
+        assert_eq!(
+            read_head_and_body(make(), bytes, pattern, MAX_MAIL_BODY),
+            (Err(imf::Error::FieldName), b"body".to_vec())
+        );
+    }
     // Reaching the cap without a blank line refuses the header before
     // any body is read, including at EOF.
     let oversized = b"Subject: longxxx";
@@ -536,10 +541,12 @@ fn ipp_head_and_collected_document_round_trip() {
     bytes.extend_from_slice(&document);
     let make = || ipp::Head::with_limit(512);
     check(make, &bytes);
-    assert_eq!(
-        read_head_and_body(make(), &bytes, &[3, 1, 2, 257], ipp::MAX_DOCUMENT),
-        (Ok(head.clone()), document.clone())
-    );
+    for pattern in [&[][..], &[1], &[3, 1, 2, 257]] {
+        assert_eq!(
+            read_head_and_body(make(), &bytes, pattern, ipp::MAX_DOCUMENT),
+            (Ok(head.clone()), document.clone())
+        );
+    }
     assert_eq!(
         read(make(), &Wire::to_bytes(&head).unwrap()),
         [Ok(head)]
@@ -555,10 +562,12 @@ fn ipp_attribute_errors_carry_request_ids_and_bad_lengths_end_once() {
         request_id: 7,
         error: ipp::Error::ReservedGroup,
     };
-    assert_eq!(
-        read_head_and_body(make(), bytes, &[3, 7], ipp::MAX_DOCUMENT),
-        (Err(error), b"document".to_vec())
-    );
+    for pattern in [&[][..], &[1], &[3, 7]] {
+        assert_eq!(
+            read_head_and_body(make(), bytes, pattern, ipp::MAX_DOCUMENT),
+            (Err(error), b"document".to_vec())
+        );
+    }
     let bytes = b"\x01\x01\0\x02\0\0\0\x07\x01\x41\0\0\x80\0";
     check(ipp::Head::new, bytes);
     failure(
@@ -588,10 +597,12 @@ fn ipp_overlong_names_are_head_error_items() {
         request_id: 7,
         error: ipp::Error::BadName,
     };
-    assert_eq!(
-        read_head_and_body(ipp::Head::new(), &bytes, &[3, 7], ipp::MAX_DOCUMENT),
-        (Err(error), b"document".to_vec())
-    );
+    for pattern in [&[][..], &[1], &[3, 7]] {
+        assert_eq!(
+            read_head_and_body(ipp::Head::new(), &bytes, pattern, ipp::MAX_DOCUMENT),
+            (Err(error), b"document".to_vec())
+        );
+    }
 }
 
 #[test]

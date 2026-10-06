@@ -61,8 +61,7 @@
 //! assert_eq!(bytes, "To: John Doe <jdoe@machine.example>\r\nSubject: Re: Café hours\r\n\r\n".as_bytes());
 //! ```
 
-extern crate self as fictionet;
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 
 /// The longest header section, counting the blank line that ends it.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -97,6 +96,9 @@ pub const ENCODED_LINE_LEN: usize = 76;
 pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
+    /// The strict reader cannot preserve this header or value in the
+    /// supported wire form. Lenient readers may accept it.
+    UnsupportedForm,
     /// The header section, or a value, is longer than this module reads:
     /// [`MAX_HEADER_BYTES`] or [`MAX_VALUE_BYTES`].
     TooLarge,
@@ -125,6 +127,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Error::Unwritable => "value cannot be written without changing it",
+            Error::UnsupportedForm => "unsupported header or value form",
             Error::TooLarge => "header or value too large",
             Error::TooManyFields => "too many header fields",
             Error::FieldName => "bad or missing field name",
@@ -222,6 +225,7 @@ impl Wire for Header {
     /// endings and unfolds fields. Refuses trailing bytes, missing blank
     /// lines, invalid names or UTF-8, obsolete control text, and headers
     /// that exceed the field, line, or total size limits when written.
+    /// Forms that cannot be preserved use [`Error::UnsupportedForm`].
     /// [`Head`] and [`split_message`] also read obsolete field text.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let (header, used) = Self::prefix(bytes)
@@ -230,7 +234,9 @@ impl Wire for Header {
         if used != bytes.len() {
             return Err(ParseError::Trailing);
         }
-        header.write(&mut Vec::new()).map_err(ParseError::Header)?;
+        header
+            .write(&mut Vec::new())
+            .map_err(|_| ParseError::Header(Error::UnsupportedForm))?;
         Ok(header)
     }
 
@@ -1145,13 +1151,16 @@ macro_rules! text_wire {
             type WriteError = Error;
 
             #[doc = $parse]
+            /// Forms that cannot be preserved use [`Error::UnsupportedForm`].
             fn parse(bytes: &[u8]) -> Result<Self, Error> {
                 if bytes.len() > MAX_VALUE_BYTES {
                     return Err(Error::TooLarge);
                 }
                 let text = std::str::from_utf8(bytes).map_err(|_| Error::Utf8)?;
                 let value = Self::read(text)?;
-                value.write(&mut Vec::new())?;
+                value
+                    .write(&mut Vec::new())
+                    .map_err(|_| Error::UnsupportedForm)?;
                 Ok(value)
             }
 
@@ -1680,7 +1689,7 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
+    use super::super::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };
@@ -2043,8 +2052,17 @@ mod tests {
         );
         assert_eq!(parse_message_ids("").unwrap(), []);
         let id = parse_message_ids("<\"a b\"@[x]>").unwrap().remove(0);
-        assert_eq!(MessageId::parse(b"<\"a b\"@[x]>"), Err(Error::Unwritable));
-        assert_eq!(id, MessageId { left: "a b".into(), right: "[x]".into() });
+        assert_eq!(
+            MessageId::parse(b"<\"a b\"@[x]>"),
+            Err(Error::UnsupportedForm)
+        );
+        assert_eq!(
+            id,
+            MessageId {
+                left: "a b".into(),
+                right: "[x]".into()
+            }
+        );
         // The writer does not write the obsolete quoted left part back.
         assert_eq!(id.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable));
         for s in
@@ -2253,7 +2271,7 @@ mod tests {
         );
         assert_eq!(
             Header::parse(fits.as_bytes()),
-            Err(ParseError::Header(Error::Unwritable))
+            Err(ParseError::Header(Error::UnsupportedForm))
         );
         let over = format!("A: {}\r\n\r\n", "b".repeat(MAX_HEADER_BYTES - 6));
         assert_eq!(
@@ -2399,7 +2417,10 @@ mod tests {
         // A message ID's left part is dot-atom text, and its right part
         // dot-atom text or a literal with no white space (section 3.6.4).
         assert!(parse_message_ids("<\"a b\"@x>").is_ok());
-        assert_eq!(MessageId::parse(b"<\"a b\"@x>"), Err(Error::Unwritable));
+        assert_eq!(
+            MessageId::parse(b"<\"a b\"@x>"),
+            Err(Error::UnsupportedForm)
+        );
         for (l, r) in [("a b", "x"), ("a", "[x y]"), ("", "x"), ("a", "[x\u{1}]")] {
             let id = MessageId { left: l.into(), right: r.into() };
             assert_eq!(id.to_bytes().map(|b| String::from_utf8(b).unwrap()), Err(Error::Unwritable), "{id:?}");
@@ -2966,11 +2987,16 @@ mod tests {
     fn check(data: &[u8]) {
         contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEADER_BYTES);
         contract::check_wire::<Header>(data);
-        let Ok((header, _)) = split_message(data) else {
-            return;
+        let (items, failure) = decode_all(Head::new, data);
+        let (header, body) = match split_message(data) {
+            Ok(parts) => parts,
+            Err(error) => {
+                assert!(items == [Err(error)] || failure == Some(Fail::Protocol(error)));
+                return;
+            }
         };
         assert_eq!(
-            decode_all(Head::new, data),
+            (items, failure),
             (
                 if data.is_empty() {
                     vec![]
@@ -2980,7 +3006,31 @@ mod tests {
                 None
             )
         );
+        if !data.is_empty() {
+            let mut stream = Stream::with_buffer(Head::new(), data.len());
+            assert_eq!(stream.push(data), data.len());
+            stream.end();
+            assert_eq!(stream.next(), Some(Ok(Ok(header.clone()))));
+            assert_eq!(stream.unread(), body);
+        }
         contract::check_wire_value(&header);
+        if let Err(Error::Unwritable) = header.to_bytes() {
+            let mut rendered = Vec::new();
+            for field in &header.fields {
+                fold(&mut rendered, &field.name, field.value.as_bytes());
+            }
+            assert!(
+                header
+                    .fields
+                    .iter()
+                    .any(|field| field.value.contains(is_control))
+                    || header.fields.len() > MAX_FIELDS
+                    || rendered.len().saturating_add(2) > MAX_HEADER_BYTES
+                    || rendered
+                        .split(|&c| c == b'\n')
+                        .any(|line| line.len() > MAX_LINE_BYTES + 1)
+            );
+        }
         for field in &header.fields {
             check_value(&field.value);
         }
@@ -2989,18 +3039,20 @@ mod tests {
     fn check_value(value: &str) {
         let _ = decode_text(value);
         let bytes = value.as_bytes();
-        {
-            contract::check_wire::<Mailbox>(bytes);
-            contract::check_wire::<Address>(bytes);
-            contract::check_wire::<AddressList>(bytes);
-            contract::check_wire::<DateTime>(bytes);
-            contract::check_wire::<MessageId>(bytes);
-            contract::check_wire::<MessageIds>(bytes);
-            contract::check_wire::<EncodedText>(bytes);
-        }
+        contract::check_wire::<Mailbox>(bytes);
+        contract::check_wire::<Address>(bytes);
+        contract::check_wire::<AddressList>(bytes);
+        contract::check_wire::<DateTime>(bytes);
+        contract::check_wire::<MessageId>(bytes);
+        contract::check_wire::<MessageIds>(bytes);
+        contract::check_wire::<EncodedText>(bytes);
         let encoded = EncodedText(value.into());
         contract::check_wire_value(&encoded);
-        if let Ok(bytes) = encoded.to_bytes() {
+        let result = encoded.to_bytes();
+        if !value.contains(['\0', '\r', '\n']) && encoded_text(value).len() <= MAX_VALUE_BYTES {
+            assert!(result.is_ok(), "{value:?}");
+        }
+        if let Ok(bytes) = result {
             let text = String::from_utf8(bytes).unwrap();
             assert_eq!(decode_text(&text), value);
             let mut header = Header::default();
@@ -3014,10 +3066,57 @@ mod tests {
             }
         }
         if let Ok(list) = parse_address_list(value) {
-            contract::check_wire_value(&AddressList(list));
+            let list = AddressList(list);
+            contract::check_wire_value(&list);
+            if let Err(Error::Unwritable) = list.to_bytes() {
+                assert!(
+                    value.contains(is_control)
+                        || value.contains('\\')
+                        || render_address_list(&list.0) == Err(Error::TooLarge),
+                    "{value:?}"
+                );
+            }
         }
         if let Ok(ids) = parse_message_ids(value) {
-            contract::check_wire_value(&MessageIds(ids));
+            let ids = MessageIds(ids);
+            contract::check_wire_value(&ids);
+            if let Err(Error::Unwritable) = ids.to_bytes() {
+                assert!(
+                    ids.0.iter().any(|id| id.to_bytes().is_err())
+                        || ids.0.len() > MAX_MESSAGE_IDS
+                        || render_message_ids(&ids.0) == Err(Error::TooLarge),
+                    "{value:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn strict_reader_refusals_use_read_errors() {
+        let header = format!("Subject: {}\r\n\r\n", "x".repeat(MAX_LINE_BYTES));
+        assert!(split_message(header.as_bytes()).is_ok());
+        assert_eq!(
+            Header::parse(header.as_bytes()),
+            Err(ParseError::Header(Error::UnsupportedForm))
+        );
+        assert_eq!(
+            MessageId::parse(b"<\"a b\"@example.test>"),
+            Err(Error::UnsupportedForm)
+        );
+        assert_eq!(EncodedText::parse(b"a\0b"), Err(Error::UnsupportedForm));
+    }
+
+    #[test]
+    fn stream_and_writer_checks_cover_size_boundaries() {
+        check(format!("X: {}\r\n\r\nbody", "x".repeat(MAX_LINE_BYTES)).as_bytes());
+        check(format!("X: {}", "x".repeat(MAX_HEADER_BYTES)).as_bytes());
+        for value in [
+            "a\x01b@example.test".to_owned(),
+            "<\"a b\"@example.test>".to_owned(),
+            "漢".repeat(MAX_VALUE_BYTES / 3),
+            "x".repeat(MAX_VALUE_BYTES),
+        ] {
+            check_value(&value);
         }
     }
 

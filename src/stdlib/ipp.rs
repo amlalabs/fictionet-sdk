@@ -53,8 +53,7 @@
 
 use std::collections::BTreeSet;
 
-extern crate self as fictionet;
-use fictionet::stdlib::codec::{Decode, Step, Wire};
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port IPP printers listen on.
 pub const PORT: u16 = 631;
@@ -803,9 +802,7 @@ impl Value {
 pub enum Error {
     /// The value cannot be written without changing it.
     Unwritable,
-    /// Document data exceeds [`MAX_DOCUMENT`] bytes.
-    DocumentTooLong,
-    /// A complete HTTP body ends before the end-of-attributes tag.
+    /// The fixed header or attribute section is incomplete.
     /// [`Head`] leaves stream truncation to the codec driver.
     Truncated,
     /// The attribute section runs past [`MAX_HEAD`] bytes.
@@ -844,7 +841,6 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Unwritable => f.write_str("value cannot be written without changing it"),
-            Error::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
             Error::Truncated => f.write_str("the message ends before its end-of-attributes tag"),
             Error::TooLong => write!(f, "the attribute section is longer than {MAX_HEAD} bytes"),
             Error::Length(n) => write!(f, "length field {n:#06x} is negative"),
@@ -944,7 +940,7 @@ pub const MAX_DOCUMENT: usize = 64 * 1024 * 1024;
 
 /// An IPP message through its end-of-attributes tag, without document data.
 ///
-/// [`Wire`] reads exactly this head and writes it without clipping fields.
+/// [`Wire`] reads and writes exactly this head.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Header {
     /// The major and minor IPP version.
@@ -969,15 +965,17 @@ impl From<Message> for Header {
     }
 }
 
-/// Why bytes do not contain exactly one IPP head.
+/// Why bytes do not contain one complete IPP head or message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
     /// The head was refused.
     Head(Error),
     /// The input ends before the end-of-attributes tag.
     Truncated,
-    /// Bytes follow the end-of-attributes tag.
+    /// Bytes follow the end-of-attributes tag when reading a [`Header`].
     Trailing,
+    /// A [`Message`] document is longer than [`MAX_DOCUMENT`].
+    DocumentTooLong,
 }
 
 impl core::fmt::Display for ParseError {
@@ -986,6 +984,7 @@ impl core::fmt::Display for ParseError {
             Self::Head(e) => e.fmt(f),
             Self::Truncated => f.write_str("IPP head ended early"),
             Self::Trailing => f.write_str("bytes follow the IPP head"),
+            Self::DocumentTooLong => write!(f, "document exceeds {MAX_DOCUMENT} bytes"),
         }
     }
 }
@@ -1006,24 +1005,27 @@ impl Header {
 }
 
 impl Wire for Message {
-    type ParseError = Error;
+    type ParseError = ParseError;
     type WriteError = Error;
 
     /// Reads a complete HTTP body: the head and all following document
     /// bytes. Refuses incomplete or invalid heads, heads over [`MAX_HEAD`],
     /// and documents over [`MAX_DOCUMENT`].
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let end = scan_head(bytes, &mut 0, MAX_HEAD)?.ok_or(Error::Truncated)?;
-        let data = bytes.get(end..).ok_or(Error::Truncated)?;
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let end = scan_head(bytes, &mut 0, MAX_HEAD)
+            .map_err(ParseError::Head)?
+            .ok_or(ParseError::Truncated)?;
+        let data = bytes.get(end..).ok_or(ParseError::Truncated)?;
+        let header = head(&bytes[..end]).map_err(ParseError::Head)?;
         if data.len() > MAX_DOCUMENT {
-            return Err(Error::DocumentTooLong);
+            return Err(ParseError::DocumentTooLong);
         }
-        Ok(head(&bytes[..end])?.with_document(data.to_vec()))
+        Ok(header.with_document(data.to_vec()))
     }
 
-    /// Appends a complete body without clipping. Refuses invalid heads,
-    /// oversized fields, and documents over [`MAX_DOCUMENT`]. Refusal
-    /// leaves `out` unchanged.
+    /// Appends a complete body. Refuses the heads listed by
+    /// [`Header::write`] and documents over [`MAX_DOCUMENT`].
+    /// Refusal leaves `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         if self.data.len() > MAX_DOCUMENT {
             return Err(Error::Unwritable);
@@ -1259,6 +1261,13 @@ impl core::error::Error for HeadError {}
 /// over-long names, are [`HeadError`] items carrying the request ID; the
 /// document boundary remains known. No input bytes are retained.
 ///
+/// After a framing failure or truncation, no head bytes have been consumed.
+/// Once eight bytes have arrived, bytes `4..8` of
+/// [`super::codec::Stream::unread`] hold the request ID in big-endian order.
+/// Echo that ID in a [`status::CLIENT_ERROR_BAD_REQUEST`] response, as
+/// RFC 8011 section 4.1.2 requires. For a complete head, use the request ID
+/// in the [`Header`] or [`HeadError`] item instead.
+///
 /// ```
 /// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, ipp::{Head, MAX_DOCUMENT}};
 /// use core::convert::Infallible;
@@ -1341,8 +1350,7 @@ impl Decode for Head {
         let fixed = bytes.first_chunk::<HEADER_LEN>().ok_or(Error::Truncated)?;
         let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
         self.done = true;
-        let item = head(bytes)
-            .map_err(|error| HeadError { request_id, error });
+        let item = head(bytes).map_err(|error| HeadError { request_id, error });
         Ok(Step::Item(item, end))
     }
 }
@@ -1662,7 +1670,7 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{
+    use super::super::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };
@@ -1990,51 +1998,144 @@ mod tests {
     fn errors() {
         let hdr = vec![1, 1, 0, 2, 0, 0, 0, 1];
         let with = |parts: Vec<Vec<u8>>| Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat());
-        assert_eq!(Message::parse(&hdr), Err(Error::Truncated));
-        assert_eq!(Message::parse(&[1, 1]), Err(Error::Truncated));
-        assert_eq!(with(vec![rec(0x44, "a", b"b")]), Err(Error::NoGroup));
-        assert_eq!(with(vec![vec![1], rec(0x44, "", b"b")]), Err(Error::NoAttribute));
+        assert_eq!(Message::parse(&hdr), Err(ParseError::Truncated));
+        assert_eq!(Message::parse(&[1, 1]), Err(ParseError::Truncated));
+        assert_eq!(
+            with(vec![rec(0x44, "a", b"b")]),
+            Err(ParseError::Head(Error::NoGroup))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x44, "", b"b")]),
+            Err(ParseError::Head(Error::NoAttribute))
+        );
         // A new group forgets the last attribute.
-        assert_eq!(with(vec![vec![1], rec(0x44, "a", b"b"), vec![2], rec(0x44, "", b"b")]), Err(Error::NoAttribute));
-        assert_eq!(with(vec![vec![1, 0x44, 0x80, 0x00]]), Err(Error::Length(0x8000)));
-        assert_eq!(with(vec![vec![1, 0x44, 0, 1, b'a', 0xff, 0xff]]), Err(Error::Length(0xffff)));
-        assert_eq!(with(vec![vec![1], rec(0x21, "a", &[0, 0, 1])]), Err(Error::BadValue(0x21)));
-        assert_eq!(with(vec![vec![1], rec(0x23, "a", &[0, 0, 0, 0, 1])]), Err(Error::BadValue(0x23)));
-        assert_eq!(with(vec![vec![1], rec(0x22, "a", &[2])]), Err(Error::BadValue(0x22)));
-        assert_eq!(with(vec![vec![1], rec(0x22, "a", &[])]), Err(Error::BadValue(0x22)));
-        assert_eq!(with(vec![vec![1], rec(0x31, "a", &[0; 10])]), Err(Error::BadValue(0x31)));
-        assert_eq!(with(vec![vec![1], rec(0x32, "a", &[0; 8])]), Err(Error::BadValue(0x32)));
-        assert_eq!(with(vec![vec![1], rec(0x33, "a", &[0; 9])]), Err(Error::BadValue(0x33)));
-        assert_eq!(with(vec![vec![1], rec(0x35, "a", &[0, 2, b'e'])]), Err(Error::BadValue(0x35)));
-        assert_eq!(with(vec![vec![1], rec(0x35, "a", &[0, 0, 0, 0, 9])]), Err(Error::BadValue(0x35)));
-        assert_eq!(with(vec![vec![1], rec(0x36, "a", &[0, 0])]), Err(Error::BadValue(0x36)));
-        assert_eq!(with(vec![vec![1], rec(0x41, "a", &[0xff])]), Err(Error::BadValue(0x41)));
-        assert_eq!(with(vec![vec![1], rec(0x7f, "a", &[0, 0, 1])]), Err(Error::BadValue(0x7f)));
-        assert_eq!(with(vec![vec![1], rec(0x44, "a!~", b"")]).map(|_| ()), Ok(()));
-        assert_eq!(with(vec![vec![1, 0x44, 0, 1, 0xc3, 0, 0]]), Err(Error::BadName));
+        assert_eq!(
+            with(vec![
+                vec![1],
+                rec(0x44, "a", b"b"),
+                vec![2],
+                rec(0x44, "", b"b")
+            ]),
+            Err(ParseError::Head(Error::NoAttribute))
+        );
+        assert_eq!(
+            with(vec![vec![1, 0x44, 0x80, 0x00]]),
+            Err(ParseError::Head(Error::Length(0x8000)))
+        );
+        assert_eq!(
+            with(vec![vec![1, 0x44, 0, 1, b'a', 0xff, 0xff]]),
+            Err(ParseError::Head(Error::Length(0xffff)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x21, "a", &[0, 0, 1])]),
+            Err(ParseError::Head(Error::BadValue(0x21)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x23, "a", &[0, 0, 0, 0, 1])]),
+            Err(ParseError::Head(Error::BadValue(0x23)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x22, "a", &[2])]),
+            Err(ParseError::Head(Error::BadValue(0x22)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x22, "a", &[])]),
+            Err(ParseError::Head(Error::BadValue(0x22)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x31, "a", &[0; 10])]),
+            Err(ParseError::Head(Error::BadValue(0x31)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x32, "a", &[0; 8])]),
+            Err(ParseError::Head(Error::BadValue(0x32)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x33, "a", &[0; 9])]),
+            Err(ParseError::Head(Error::BadValue(0x33)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x35, "a", &[0, 2, b'e'])]),
+            Err(ParseError::Head(Error::BadValue(0x35)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x35, "a", &[0, 0, 0, 0, 9])]),
+            Err(ParseError::Head(Error::BadValue(0x35)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x36, "a", &[0, 0])]),
+            Err(ParseError::Head(Error::BadValue(0x36)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x41, "a", &[0xff])]),
+            Err(ParseError::Head(Error::BadValue(0x41)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x7f, "a", &[0, 0, 1])]),
+            Err(ParseError::Head(Error::BadValue(0x7f)))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x44, "a!~", b"")]).map(|_| ()),
+            Ok(())
+        );
+        assert_eq!(
+            with(vec![vec![1, 0x44, 0, 1, 0xc3, 0, 0]]),
+            Err(ParseError::Head(Error::BadName))
+        );
         // Collection errors.
-        assert_eq!(with(vec![vec![1], rec(0x37, "a", b"")]), Err(Error::Collection));
-        assert_eq!(with(vec![vec![1], rec(0x4a, "a", b"m")]), Err(Error::Collection));
-        assert_eq!(with(vec![vec![1], rec(0x34, "a", b"")]), Err(Error::Collection));
-        assert_eq!(with(vec![vec![1], rec(0x34, "a", b""), vec![2]]), Err(Error::Collection));
-        assert_eq!(with(vec![vec![1], rec(0x34, "a", b""), rec(0x21, "", &[0; 4])]), Err(Error::Collection));
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", b"m"), rec(0x37, "", b"")]),
-            Err(Error::Collection)
+            Err(ParseError::Head(Error::Collection))
         );
         assert_eq!(
             with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", b"m"), rec(0x4a, "", b"n")]),
-            Err(Error::Collection)
+            Err(ParseError::Head(Error::Collection))
         );
-        assert_eq!(with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "x", b"m")]), Err(Error::Collection));
-        assert_eq!(with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", &[0xff])]), Err(Error::BadName));
+        assert_eq!(
+            with(vec![vec![1], rec(0x34, "a", b"")]),
+            Err(ParseError::Head(Error::Collection))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x34, "a", b""), vec![2]]),
+            Err(ParseError::Head(Error::Collection))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x34, "a", b""), rec(0x21, "", &[0; 4])]),
+            Err(ParseError::Head(Error::Collection))
+        );
+        assert_eq!(
+            with(vec![
+                vec![1],
+                rec(0x34, "a", b""),
+                rec(0x4a, "", b"m"),
+                rec(0x37, "", b"")
+            ]),
+            Err(ParseError::Head(Error::Collection))
+        );
+        assert_eq!(
+            with(vec![
+                vec![1],
+                rec(0x34, "a", b""),
+                rec(0x4a, "", b"m"),
+                rec(0x4a, "", b"n")
+            ]),
+            Err(ParseError::Head(Error::Collection))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "x", b"m")]),
+            Err(ParseError::Head(Error::Collection))
+        );
+        assert_eq!(
+            with(vec![vec![1], rec(0x34, "a", b""), rec(0x4a, "", &[0xff])]),
+            Err(ParseError::Head(Error::BadName))
+        );
         // The head may not run past MAX_HEAD.
         let mut long = hdr.clone();
         long.push(1);
         while long.len() < MAX_HEAD {
             long.extend(rec(0x30, "a", &[0; 30000]));
         }
-        assert_eq!(Message::parse(&long), Err(Error::TooLong));
+        assert_eq!(Message::parse(&long), Err(ParseError::Head(Error::TooLong)));
         assert_eq!(
             decode_all(Head::new, &long).1,
             Some(Fail::Protocol(Error::TooLong))
@@ -2071,16 +2172,16 @@ mod tests {
         // It needs a member with a value before it, and a value after it.
         assert_eq!(
             with(vec![rec(0x34, "c", b""), rec(0x4a, "", b""), rec(0x44, "", b"a"), rec(0x37, "", b"")]),
-            Err(Error::Collection)
+            Err(ParseError::Head(Error::Collection))
         );
         assert_eq!(
             with(vec![rec(0x34, "c", b""), rec(0x4a, "", b"k"), rec(0x4a, "", b""), rec(0x44, "", b"a")]),
-            Err(Error::Collection)
+            Err(ParseError::Head(Error::Collection))
         );
         for after in [rec(0x37, "", b""), rec(0x4a, "", b"n"), rec(0x4a, "", b"")] {
             assert_eq!(
                 with(vec![rec(0x34, "c", b""), rec(0x4a, "", b"k"), rec(0x44, "", b"a"), rec(0x4a, "", b""), after]),
-                Err(Error::Collection)
+                Err(ParseError::Head(Error::Collection))
             );
         }
     }
@@ -2089,8 +2190,17 @@ mod tests {
     /// malformed. Readers and writers refuse it.
     #[test]
     fn duplicate_names() {
-        let bytes = [vec![1, 1, 0, 2, 0, 0, 0, 1, 1], rec(0x44, "a", b"x"), rec(0x44, "a", b"y"), vec![3]].concat();
-        assert_eq!(Message::parse(&bytes), Err(Error::Duplicate));
+        let bytes = [
+            vec![1, 1, 0, 2, 0, 0, 0, 1, 1],
+            rec(0x44, "a", b"x"),
+            rec(0x44, "a", b"y"),
+            vec![3],
+        ]
+        .concat();
+        assert_eq!(
+            Message::parse(&bytes),
+            Err(ParseError::Head(Error::Duplicate))
+        );
         assert_eq!(
             decode_all(Head::new, &bytes),
             (
@@ -2167,7 +2277,10 @@ mod tests {
             bytes.extend(rec(0x37, "", b""));
         }
         bytes.push(3);
-        assert_eq!(Message::parse(&bytes), Err(Error::TooDeep));
+        assert_eq!(
+            Message::parse(&bytes),
+            Err(ParseError::Head(Error::TooDeep))
+        );
         let mut m = Message::request(operation::PRINT_JOB, 1);
         m.add(tag::JOB_ATTRIBUTES, Attribute::new("deep", nested(MAX_DEPTH + 1)));
         m.add(
@@ -2183,7 +2296,10 @@ mod tests {
             bytes.extend(rec(0x34, "", b""));
         }
         bytes.push(3);
-        assert_eq!(Message::parse(&bytes), Err(Error::TooDeep));
+        assert_eq!(
+            Message::parse(&bytes),
+            Err(ParseError::Head(Error::TooDeep))
+        );
     }
 
     #[test]
@@ -2192,8 +2308,20 @@ mod tests {
             let message = Message::parse(&bytes).unwrap();
             let used = bytes.len() - message.data.len();
             for n in 0..used {
-                assert_eq!(Header::parse(&bytes[..n]), Err(ParseError::Truncated), "{n} bytes");
-                assert_eq!(Message::parse(&bytes[..n]), Err(Error::Truncated), "{n} bytes");
+                assert_eq!(
+                    Message::parse(&bytes[..n]).unwrap_err().to_string(),
+                    Header::parse(&bytes[..n]).unwrap_err().to_string()
+                );
+                assert_eq!(
+                    Header::parse(&bytes[..n]),
+                    Err(ParseError::Truncated),
+                    "{n} bytes"
+                );
+                assert_eq!(
+                    Message::parse(&bytes[..n]),
+                    Err(ParseError::Truncated),
+                    "{n} bytes"
+                );
                 assert_eq!(Head::new().decode(&bytes[..n], false), Ok(Step::Need));
             }
             for n in used..=bytes.len() {
@@ -2342,7 +2470,12 @@ mod tests {
             .to_bytes()
             .unwrap();
         bytes.extend_from_slice(&message.data);
-        assert_eq!(Message::parse(&bytes), Err(Error::DocumentTooLong));
+        assert_eq!(Message::parse(&bytes), Err(ParseError::DocumentTooLong));
+        bytes[8] = 0;
+        assert_eq!(
+            Message::parse(&bytes),
+            Err(ParseError::Head(Error::ReservedGroup))
+        );
     }
 
     #[test]
@@ -2479,7 +2612,11 @@ mod tests {
         let hdr = vec![1, 1, 0, 2, 0, 0, 0, 1, 1];
         let with = |parts: Vec<Vec<u8>>| Message::parse(&[vec![hdr.clone()], parts, vec![vec![3]]].concat().concat());
         for bad in ["x\0y", "a b", "é", &"a".repeat(MAX_NAME + 1)] {
-            assert_eq!(with(vec![rec(0x44, bad, b"k")]), Err(Error::BadName), "{bad:?}");
+            assert_eq!(
+                with(vec![rec(0x44, bad, b"k")]),
+                Err(ParseError::Head(Error::BadName)),
+                "{bad:?}"
+            );
             assert_eq!(
                 with(vec![
                     rec(0x34, "c", b""),
@@ -2487,7 +2624,7 @@ mod tests {
                     rec(0x21, "", &[0; 4]),
                     rec(0x37, "", b"")
                 ]),
-                Err(Error::BadName),
+                Err(ParseError::Head(Error::BadName)),
                 "{bad:?}"
             );
             // The writer refuses the attribute or member.
@@ -2565,7 +2702,11 @@ mod tests {
             }
             bytes.extend(rec(v.tag(), "x", &value));
             bytes.push(3);
-            assert_eq!(Message::parse(&bytes), Err(Error::BadValue(v.tag())), "{v:?}");
+            assert_eq!(
+                Message::parse(&bytes),
+                Err(ParseError::Head(Error::BadValue(v.tag()))),
+                "{v:?}"
+            );
             // The writer refuses it.
             let mut m = Message::request(operation::PRINT_JOB, 1);
             m.add(tag::JOB_ATTRIBUTES, Attribute { name: "x".into(), values: vec![v.clone(), Value::Integer(1)] });
@@ -2598,8 +2739,17 @@ mod tests {
     /// RFC 8010 section 3.5.1 reserves delimiter tag 0x00.
     #[test]
     fn reserved_group_tag() {
-        let bytes = [vec![1, 1, 0, 2, 0, 0, 0, 1, 1], vec![0], rec(0x21, "a", &[0; 4]), vec![3]].concat();
-        assert_eq!(Message::parse(&bytes), Err(Error::ReservedGroup));
+        let bytes = [
+            vec![1, 1, 0, 2, 0, 0, 0, 1, 1],
+            vec![0],
+            rec(0x21, "a", &[0; 4]),
+            vec![3],
+        ]
+        .concat();
+        assert_eq!(
+            Message::parse(&bytes),
+            Err(ParseError::Head(Error::ReservedGroup))
+        );
         assert_eq!(
             decode_all(Head::new, &bytes),
             (
@@ -2644,16 +2794,79 @@ mod tests {
         assert_eq!(out, b"prefix");
     }
 
+    #[test]
+    fn framing_failure_keeps_request_id_for_bad_request_reply() {
+        let bytes = b"\x01\x01\0\x02\0\0\0\x2a\x01\x41\xff\xff";
+        let mut stream = Stream::new(Head::new());
+        assert_eq!(stream.push(&bytes[..8]), 8);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(&bytes[8..]), bytes.len() - 8);
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::Length(0xffff))))
+        );
+        let fixed = stream.unread().first_chunk::<8>().unwrap();
+        let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+        assert_eq!(request_id, 42);
+        let reply = Message::request(operation::PRINT_JOB, request_id)
+            .response(status::CLIENT_ERROR_BAD_REQUEST);
+        assert_eq!(Message::parse(&reply.to_bytes().unwrap()), Ok(reply));
+        check(bytes);
+    }
+
     /// Checks everything the fuzz target checks, for one buffer.
     fn check(data: &[u8]) {
         contract::check_decode_with_alloc_limit(Head::new, data, 2 * MAX_HEAD);
         contract::check_wire::<Header>(data);
         contract::check_wire::<Message>(data);
-        if let Ok(message) = Message::parse(data) {
-            assert_eq!(
-                decode_all(Head::new, data),
-                (vec![Ok(Header::from(message))], None)
-            );
+        let (items, failure) = decode_all(Head::new, data);
+        match Message::parse(data) {
+            Ok(message) => {
+                assert_eq!((items, failure), (vec![Ok(Header::from(message))], None));
+            }
+            Err(ParseError::DocumentTooLong) => {
+                let end = scan_head(data, &mut 0, MAX_HEAD).unwrap().unwrap();
+                assert_eq!(
+                    (items, failure),
+                    (vec![Ok(head(&data[..end]).unwrap())], None)
+                );
+            }
+            Err(ParseError::Truncated) => {
+                assert!(items.is_empty());
+                assert_eq!(
+                    failure,
+                    (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })
+                );
+            }
+            Err(ParseError::Head(error @ (Error::Length(_) | Error::TooLong))) => {
+                assert!(items.is_empty());
+                assert_eq!(failure, Some(Fail::Protocol(error)));
+            }
+            Err(ParseError::Head(error)) => {
+                let fixed = data.first_chunk::<8>().unwrap();
+                let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+                assert_eq!(
+                    (items, failure),
+                    (vec![Err(HeadError { request_id, error })], None)
+                );
+            }
+            Err(ParseError::Trailing) => panic!("a message includes its document"),
+        }
+        let mut stream = Stream::new(Head::new());
+        let _ = stream.push(data);
+        stream.end();
+        let item = stream.next();
+        if let Some(fixed) = data.first_chunk::<8>() {
+            let expected = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+            let request_id = match item {
+                Some(Ok(Ok(header))) => header.request_id,
+                Some(Ok(Err(error))) => error.request_id,
+                _ => {
+                    let fixed = stream.unread().first_chunk::<8>().unwrap();
+                    u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]])
+                }
+            };
+            assert_eq!(request_id, expected);
         }
     }
 
@@ -2677,6 +2890,9 @@ mod tests {
             };
             for _ in 0..rng.index(6) {
                 mutate(&mut rng, &mut buf);
+                let tags = [0, 3, 0x34, 0x37, 0x4a, 0x7f, 0x80];
+                let at = rng.index(buf.len() + 1);
+                buf.insert(at, tags[rng.index(tags.len())]);
             }
             if Message::parse(&buf).is_ok() {
                 parsed += 1;
