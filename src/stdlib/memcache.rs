@@ -30,7 +30,8 @@
 //! the server should then close the connection, as memcached does with a
 //! line it will not take. Each text input buffer holds at most [`MAX_LINE`]
 //! bytes. Assemblies are bounded by [`MAX_TEXT_HELD`]. Writers refuse
-//! invalid fields, oversized values, and values that would change when read back.
+//! invalid fields, oversized values, and values that would change when
+//! read back.
 //!
 //! ```
 //! use std::collections::HashMap;
@@ -101,9 +102,10 @@ pub const MAX_META_FLAGS: usize = 24;
 /// written.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The line was longer than [`MAX_LINE`], or [`MAX_GET_LINE`] for a
-    /// `get` or `gets`. The stream cannot be read any further, and a real
-    /// server closes the connection.
+    /// A writer's line exceeds [`MAX_LINE`], or [`MAX_GET_LINE`] for `get`
+    /// or `gets`, including CRLF. Also returned by [`Wire::parse`] for
+    /// input beyond [`MAX_TEXT_UNIT`]. Stream readers report overlong
+    /// lines as [`TextFrameError::LineTooLong`].
     LineTooLong,
     /// The first word was not a command, or not a reply, this module
     /// knows. An empty line is one too. A command with too few or too many
@@ -115,7 +117,9 @@ pub enum Error {
     /// them, and this is the error for a flag it does not know, a flag
     /// given twice, a token that is not the number the flag takes, a mode
     /// the command does not have, an opaque token over 32 bytes counting
-    /// its `O`, or, with `b`, a key that is not base64.
+    /// its `O`, or, with `b`, a key that is not base64. Writers also return
+    /// this for an empty key list or token, too many meta flags, or CR or
+    /// LF in message text.
     Format,
     /// The delta of `incr` or `decr` was not a number from 0 to
     /// `u64::MAX`.
@@ -123,28 +127,30 @@ pub enum Error {
     /// The expiration time of `touch`, `gat` or `gats` was not a number
     /// that fits in 32 signed bits.
     Exptime,
-    /// A key was longer than [`MAX_KEY`], or held a space or control byte.
+    /// A key was empty, longer than [`MAX_KEY`], or held a space or control byte.
     Key,
-    /// The declared data block length exceeds the configured limit
-    /// ([`MAX_VALUE`] by default). A decoder skips the block, as memcached does.
+    /// A declared data block length exceeds the reader's configured limit
+    /// ([`MAX_VALUE`] by default), or a writer's block exceeds [`MAX_VALUE`].
+    /// A decoder skips the block, as memcached does.
     TooLarge(usize),
     /// The data block did not end with CR LF. A decoder has skipped it.
     BadDataChunk,
-    /// The value would change when read back.
+    /// A command or response would be refused or change when read back
+    /// after its fields pass the writer's checks. Readers never yield this.
     Unwritable,
 }
 
 impl Error {
-    /// The reply memcached sends a client for this error.
+    /// The reply memcached sends a client for this protocol error.
+    /// [`Error::Unwritable`] maps to the generic `ERROR` reply.
     pub fn reply(self) -> Response {
         match self {
             Error::LineTooLong => Response::ClientError(b"line too long".to_vec()),
-            Error::UnknownCommand => Response::Error,
+            Error::UnknownCommand | Error::Unwritable => Response::Error,
             Error::Format | Error::Key => Response::ClientError(b"bad command line format".to_vec()),
             Error::Delta => Response::ClientError(b"invalid numeric delta argument".to_vec()),
             Error::Exptime => Response::ClientError(b"invalid exptime argument".to_vec()),
             Error::TooLarge(_) => Response::ServerError(b"object too large for cache".to_vec()),
-            Error::Unwritable => Response::ServerError(b"unwritable value".to_vec()),
             Error::BadDataChunk => Response::ClientError(b"bad data chunk".to_vec()),
         }
     }
@@ -160,7 +166,7 @@ impl std::fmt::Display for Error {
             Error::Exptime => f.write_str("expiration time not a 32-bit signed number"),
             Error::Key => write!(f, "key empty, over {MAX_KEY} bytes, or holding a space or control byte"),
             Error::TooLarge(n) => write!(f, "data block of {n} bytes exceeds the configured limit"),
-            Error::Unwritable => f.write_str("memcache value cannot be written unchanged"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::BadDataChunk => f.write_str("data block not ended by CR LF"),
         }
     }
@@ -1894,11 +1900,12 @@ fn quiet_command(command: &Command) -> bool {
 /// text/binary switch is inferred; choose [`Frames`] for binary streams.
 ///
 /// Bad lines and blocks are error items. Oversized blocks and malformed
-/// meta storage blocks are skipped by their declared count, as memcached does. Overlong lines and incomplete EOF end framing.
+/// meta storage blocks are skipped by their declared count, as memcached
+/// does. Overlong lines and incomplete EOF end framing.
 /// Held state is bounded by [`MAX_TEXT_HELD`].
 ///
-/// [`Wire::parse`] additionally re-encodes each command and refuses values
-/// that do not round trip, including some commands this decoder accepts.
+/// [`Wire::parse`] requires exactly one complete command and also checks
+/// that it can be written and read back unchanged.
 pub struct Commands {
     inner: TextUnits<Command>,
 }
@@ -1966,8 +1973,8 @@ impl Decode for Commands {
 /// blocks are error items; overlong lines and incomplete EOF are terminal.
 /// Held state is bounded by [`MAX_TEXT_HELD`].
 ///
-/// [`Wire::parse`] additionally re-encodes each response and refuses values
-/// that do not round trip, including some responses this decoder accepts.
+/// [`Wire::parse`] requires exactly one complete response and also checks
+/// that it can be written and read back unchanged.
 pub struct Responses {
     inner: TextUnits<Response>,
 }
@@ -2040,10 +2047,7 @@ impl Wire for Command {
     /// and refuses commands that do not round trip.
     fn parse(bytes: &[u8]) -> Result<Self, CommandParseError> {
         let item = exact_command(bytes)?;
-        let encoded = item.to_bytes().map_err(CommandParseError::Text)?;
-        if exact_command(&encoded).as_ref() != Ok(&item) {
-            return Err(CommandParseError::Text(Error::Unwritable));
-        }
+        item.to_bytes().map_err(CommandParseError::Text)?;
         Ok(item)
     }
 
@@ -2171,10 +2175,7 @@ impl Wire for Response {
     /// and refuses responses that do not round trip.
     fn parse(bytes: &[u8]) -> Result<Self, ResponseParseError> {
         let item = exact_response(bytes)?;
-        let encoded = item.to_bytes().map_err(ResponseParseError::Text)?;
-        if exact_response(&encoded).as_ref() != Ok(&item) {
-            return Err(ResponseParseError::Text(Error::Unwritable));
-        }
+        item.to_bytes().map_err(ResponseParseError::Text)?;
         Ok(item)
     }
 
@@ -2735,6 +2736,8 @@ mod tests {
         assert_eq!(commands(b"set k 0 0 2\r\nab\n\nversion\r\n"), [Err(Error::BadDataChunk), Ok(Command::Version)]);
         // Each error has the reply memcached sends.
         assert_eq!(Error::UnknownCommand.reply().to_bytes().unwrap(), b"ERROR\r\n");
+        assert_eq!(Error::Unwritable.reply(), Response::Error);
+        assert_eq!(Error::Unwritable.reply().to_bytes().unwrap(), b"ERROR\r\n");
         assert_eq!(Error::BadDataChunk.reply().to_bytes().unwrap(), b"CLIENT_ERROR bad data chunk\r\n");
         assert_eq!(Error::Key.reply().to_bytes().unwrap(), b"CLIENT_ERROR bad command line format\r\n");
         assert_eq!(Error::TooLarge(5).reply().to_bytes().unwrap(), b"SERVER_ERROR object too large for cache\r\n");
@@ -2750,6 +2753,7 @@ mod tests {
             Error::Key,
             Error::TooLarge(1),
             Error::BadDataChunk,
+            Error::Unwritable,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -3014,7 +3018,15 @@ mod tests {
     }
 
     fn fuzz_buffer(rng: &mut Lcg, pieces: &[Vec<u8>]) -> Vec<u8> {
-        let mut bytes = if rng.coin() { pieces[rng.index(pieces.len())].clone() } else { rng.bytes(100) };
+        let mut bytes = Vec::new();
+        for _ in 0..rng.index(7) {
+            let piece = &pieces[rng.index(pieces.len())];
+            match rng.index(4) {
+                0 => bytes.extend_from_slice(&piece[..rng.index(piece.len() + 1)]),
+                1 => bytes.extend(rng.bytes(100)),
+                _ => bytes.extend_from_slice(piece),
+            }
+        }
         for _ in 0..rng.index(4) {
             mutate(rng, &mut bytes);
         }
@@ -3036,9 +3048,13 @@ mod tests {
             contract::check_wire::<Response>(&bytes);
             for command in commands(&bytes).iter().flatten() {
                 contract::check_wire_value(command);
+                let bytes = command.to_bytes().unwrap();
+                assert_eq!(decode_all(Commands::new, &bytes), (vec![Ok(command.clone())], None));
             }
             for response in responses(&bytes).iter().flatten() {
                 contract::check_wire_value(response);
+                let bytes = response.to_bytes().unwrap();
+                assert_eq!(decode_all(Responses::new, &bytes), (vec![Ok(response.clone())], None));
             }
         }
     }
@@ -3102,12 +3118,12 @@ mod tests {
                 assert!(turns < 1000, "the loop does not end");
                 let replies = match command {
                     Err(_) => return (out, turns),
-                    Ok(command) => { match command {
-                    Err(_) if decoder.decoder().quiet_error() => vec![],
-                    Ok(Command::Get { .. }) => vec![Response::End],
-                    Ok(_) => vec![Response::Error],
-                    Err(e) => vec![e.reply()],
-                    } }
+                    Ok(command) => match command {
+                        Err(_) if decoder.decoder().quiet_error() => vec![],
+                        Ok(Command::Get { .. }) => vec![Response::End],
+                        Ok(_) => vec![Response::Error],
+                        Err(e) => vec![e.reply()],
+                    },
                 };
                 for reply in replies {
                     out.extend(reply.to_bytes().unwrap());

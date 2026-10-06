@@ -25,7 +25,8 @@
 //! closes the connection. Query lines accept CRLF and bare LF. A client
 //! collects replies with [`Stream<Responses>`](super::codec::Stream) and
 //! calls `end` at connection close. The resulting [`CollectedResponse`]
-//! preserves the truncation flag. Names, owners, and referrals belong to world code.
+//! preserves the truncation flag. Names, owners, and referrals belong to
+//! world code.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A query line longer than [`MAX_QUERY`] is an error, and the
@@ -190,10 +191,12 @@ impl std::error::Error for QueryError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EncodeError {
     /// A key, value, block order, or referral would change when read back.
-    /// Keys must be valid field labels. Value lines must have no outer
-    /// whitespace or control characters other than tabs. Blocks start at
-    /// zero and advance by at most one. Referral hosts must be canonical
-    /// lowercase names or IPv6 addresses, and ports must be nonzero.
+    /// Keys must be nonempty, at most [`MAX_KEY`] bytes, and have no colon,
+    /// control character, outer whitespace, or leading `%`, `#`, `>` or `+`.
+    /// Value lines must have no outer whitespace or controls other than tabs.
+    /// An empty first value line cannot precede continuation lines. Blocks
+    /// start at zero and advance by at most one. Referral hosts must follow
+    /// [`Referral::to_field`]'s rules, and ports must be nonzero.
     Unwritable,
     /// More than [`MAX_FIELDS`] fields, or more than [`MAX_RESPONSE`] bytes.
     TooLong,
@@ -202,7 +205,7 @@ pub enum EncodeError {
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            EncodeError::Unwritable => f.write_str("WHOIS value cannot be written unchanged"),
+            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
             EncodeError::TooLong => f.write_str("more than one WHOIS response may hold"),
         }
     }
@@ -1462,6 +1465,10 @@ mod tests {
         let seeds = [VERISIGN, RIPE, IANA, ARIN, "-B -T inetnum 193.0.0.1\r\n"];
         for _ in 0..4000 {
             let mut data = if rng.coin() { seeds[rng.index(seeds.len())].as_bytes().to_vec() } else { rng.bytes(300) };
+            if rng.index(16) == 0 {
+                data = vec![b'x'; MAX_QUERY + 1 + rng.index(MAX_QUERY)];
+                data.extend_from_slice(b"\r\nexample.com\r\n");
+            }
             mutate(&mut rng, &mut data);
             contract::check_decode_with_alloc_limit(Queries::new, &data, 2 * (MAX_QUERY + 2));
             contract::check_decode_with_alloc_limit(Responses::new, &data, 2 * RESPONSE_WINDOW);
@@ -1469,6 +1476,7 @@ mod tests {
             contract::check_wire::<Response>(&data);
             for q in decode_all(Queries::new, &data).0.iter().flatten() {
                 contract::check_wire_value(q);
+                q.to_bytes().unwrap();
                 assert!(q.flags().len() <= q.as_str().len());
                 assert!(q.terms().len() <= q.as_str().len());
             }
@@ -1627,7 +1635,7 @@ mod tests {
     }
 
     #[test]
-    fn lcg_fuzz_clean_fields_round_trip() {
+    fn random_clean_fields_round_trip() {
         // Keys and values made to pass the writer, so the round trip runs
         // every time.
         let mut rng = Lcg::new(43);

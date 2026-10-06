@@ -34,15 +34,13 @@ fuzz_target!(|data: &[u8]| {
 
     for command in decode_all(Commands::new, data).0.iter().flatten() {
         check_wire_value(command);
-        if let Ok(bytes) = command.to_bytes() {
-            assert_eq!(decode_all(Commands::new, &bytes), (vec![Ok(command.clone())], None));
-        }
+        let bytes = command.to_bytes().unwrap();
+        assert_eq!(decode_all(Commands::new, &bytes), (vec![Ok(command.clone())], None));
     }
     for response in decode_all(Responses::new, data).0.iter().flatten() {
         check_wire_value(response);
-        if let Ok(bytes) = response.to_bytes() {
-            assert_eq!(decode_all(Responses::new, &bytes), (vec![Ok(response.clone())], None));
-        }
+        let bytes = response.to_bytes().unwrap();
+        assert_eq!(decode_all(Responses::new, &bytes), (vec![Ok(response.clone())], None));
     }
 
     // Writers given values built from the input, not read from it.

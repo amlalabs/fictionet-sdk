@@ -172,18 +172,25 @@ impl Command {
     }
 }
 
-/// Why a command could not be written. A writer refuses rather than send
-/// a line that reads back as something else.
+/// Why a command, request, reply or address token could not be written.
+/// A writer refuses a value that would read back as something else.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WriteError {
-    /// The verb was not one to four ASCII letters.
+    /// A command verb was empty, longer than [`MAX_VERB`], or held a byte
+    /// other than an ASCII letter. Lowercase letters give [`Self::Unwritable`].
     Verb,
-    /// The argument held a NUL, or a LF that does not follow a CR. A line
-    /// can carry neither.
+    /// A command argument held a NUL, or an LF that does not follow a CR.
     Text,
-    /// The line would be longer than [`MAX_LINE`].
+    /// A command or reply line, including a feature line, would exceed
+    /// [`MAX_LINE`] bytes with its prefix, escaping and CRLF.
     LineTooLong,
-    /// The value would change when read back.
+    /// The value would change when read back: a lowercase command verb,
+    /// a request whose argument does not fit its verb, a known verb in
+    /// [`Request::Other`], or an IPv6 EPRT address with scope or flow info.
+    /// Also returned for empty reply line lists, more than [`MAX_REPLY_LINES`]
+    /// lines, CR, LF or NUL in reply text, or a middle line that ends the reply.
+    /// [`Reply::feature_list`] returns this for invalid names or parameters,
+    /// empty parameter values, or more than [`MAX_FEATURES`] features.
     Unwritable,
 }
 
@@ -192,8 +199,8 @@ impl std::fmt::Display for WriteError {
         match self {
             WriteError::Verb => f.write_str("command verb is not one to four letters"),
             WriteError::Text => f.write_str("argument holds a NUL or a LF not after a CR"),
-            WriteError::LineTooLong => f.write_str("command line too long"),
-            WriteError::Unwritable => f.write_str("FTP value cannot be written unchanged"),
+            WriteError::LineTooLong => f.write_str("line too long"),
+            WriteError::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -912,8 +919,10 @@ pub mod code {
 ///
 /// A reply of one line is written `220 Ready`. A reply of several is
 /// written with a hyphen after the code on the first line and a space on
-/// the last. Middle lines stay unchanged; a line that would end the
-/// reply is refused (RFC 959, section 4.2):
+/// the last. [`Wire::write`] writes text as given and refuses a middle
+/// line that would end the reply. Server code building a multiline reply
+/// must pad any middle line that starts with three digits, as required by
+/// [RFC 959, section 4.2](https://www.rfc-editor.org/rfc/rfc959#section-4.2):
 ///
 /// ```text
 /// 211-Extensions supported:
@@ -997,7 +1006,8 @@ impl std::fmt::Display for FeatureError {
 impl std::error::Error for FeatureError {}
 
 impl Reply {
-    /// A reply of one line. Writing refuses text that exceeds [`MAX_LINE`].
+    /// A reply of one line. Writing refuses text longer than `MAX_REPLY_TEXT`
+    /// bytes, so the line with its code, separator and CRLF fits in [`MAX_LINE`].
     pub fn new(code: ReplyCode, text: &str) -> Reply {
         Reply { code, lines: vec![text.to_string()] }
     }
@@ -1056,8 +1066,11 @@ impl Reply {
         for feature in features {
             let size = feature.name.len().checked_add(1)
                 .and_then(|n| feature.params.as_ref().map_or(Some(n), |p| n.checked_add(1)?.checked_add(p.len())))
-                .ok_or(WriteError::Unwritable)?;
-            if size > MAX_CONTENT || feature.name.is_empty()
+                .ok_or(WriteError::LineTooLong)?;
+            if size > MAX_CONTENT {
+                return Err(WriteError::LineTooLong);
+            }
+            if feature.name.is_empty()
                 || !feature.name.bytes().all(|b| b.is_ascii_graphic())
                 || feature.params.as_ref().is_some_and(|p| p.is_empty() || !p.chars().all(feature_char))
             {
@@ -1715,8 +1728,10 @@ impl Wire for Reply {
         for (i, line) in self.lines.iter().enumerate() {
             let middle = i != 0 && i != count - 1;
             let limit = if middle { MAX_CONTENT } else { MAX_REPLY_TEXT };
-            if line.len() > limit
-                || line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
+            if line.len() > limit {
+                return Err(WriteError::LineTooLong);
+            }
+            if line.bytes().any(|b| matches!(b, b'\r' | b'\n' | 0))
                 || (middle && ends(line, self.code))
             {
                 return Err(WriteError::Unwritable);
@@ -2037,9 +2052,11 @@ mod tests {
         // `)` as the delimiter (RFC 2428, section 3).
         let r = reply_of(b"229 Entering Extended Passive Mode ()))6446))\r\n");
         assert_eq!(r.extended_passive_port(), Ok(6446));
-        let scoped = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5, 7, 9));
-        assert_eq!(EprtAddress { address: scoped }.to_bytes(), Err(WriteError::Unwritable));
-        assert_eq!(Request::Eprt(scoped).to_bytes(), Err(WriteError::Unwritable));
+        for (flow, scope) in [(7, 0), (0, 9), (7, 9)] {
+            let address = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 5, flow, scope));
+            assert_eq!(EprtAddress { address }.to_bytes(), Err(WriteError::Unwritable));
+            assert_eq!(Request::Eprt(address).to_bytes(), Err(WriteError::Unwritable));
+        }
     }
 
     #[test]
@@ -2132,6 +2149,8 @@ mod tests {
             (Request::Allo("xyz".into()), WriteError::Unwritable),
             (Request::Other(Command::new("RETR", None)), WriteError::Unwritable),
             (Request::Other(Command::new("NOOP", None)), WriteError::Unwritable),
+            (Request::Other(Command::new("noop", None)), WriteError::Unwritable),
+            (Request::Other(Command::new("abcd", None)), WriteError::Unwritable),
             (Request::Stor("é".repeat(MAX_LINE)), WriteError::LineTooLong),
             (Request::Stor("x".repeat(64 << 20)), WriteError::LineTooLong),
         ] {
@@ -2155,7 +2174,6 @@ mod tests {
             vec!["a".into(), "2\r30 x".into(), "end".into()],
             (0..MAX_REPLY_LINES + 5).map(|i| i.to_string()).collect(),
             vec![],
-            vec!["x".repeat(2 * MAX_LINE)],
         ] {
             let reply = Reply { code: code::HELP, lines };
             let mut out = b"prefix".to_vec();
@@ -2165,13 +2183,12 @@ mod tests {
         let reply = Reply { code: code::READY, lines: vec!["a".into(), "230 Logged in".into(), "999-x".into(), "end".into()] };
         assert_eq!(reply.to_bytes().unwrap(), b"220-a\r\n230 Logged in\r\n999-x\r\n220 end\r\n");
         let one = Reply::new(code::OK, &"x".repeat(2 * MAX_LINE));
-        assert_eq!(one.to_bytes(), Err(WriteError::Unwritable));
+        assert_eq!(one.to_bytes(), Err(WriteError::LineTooLong));
         for feature in [
             Feature { name: "a b".into(), params: Some("p\r\nq\x01\té".into()) },
             Feature { name: " ".into(), params: None },
             Feature { name: "X".into(), params: Some(String::new()) },
             Feature { name: "Y".into(), params: Some("\x01".into()) },
-            Feature { name: "x".repeat(2 * MAX_LINE), params: Some("p".repeat(2 * MAX_LINE)) },
         ] {
             assert_eq!(Reply::feature_list(&[feature]), Err(WriteError::Unwritable));
         }
@@ -2180,6 +2197,39 @@ mod tests {
         let reply = Reply::feature_list(&many[..MAX_FEATURES]).unwrap();
         assert_eq!(reply.features().unwrap().len(), MAX_FEATURES);
         contract::check_wire_value(&reply);
+    }
+
+    #[test]
+    fn reply_and_feature_line_limits() {
+        for at in 0..3 {
+            let limit = if at == 1 { MAX_CONTENT } else { MAX_REPLY_TEXT };
+            let mut reply = Reply { code: code::HELP, lines: vec!["start".into(), "middle".into(), "end".into()] };
+            reply.lines[at] = "x".repeat(limit);
+            let bytes = reply.to_bytes().unwrap();
+            assert_eq!(Reply::parse(&bytes), Ok(reply.clone()));
+            reply.lines[at].push('x');
+            let mut out = b"prefix".to_vec();
+            assert_eq!(reply.write(&mut out), Err(WriteError::LineTooLong));
+            assert_eq!(out, b"prefix");
+        }
+        for mut feature in [
+            Feature { name: "x".repeat(MAX_CONTENT - 1), params: None },
+            Feature { name: "X".into(), params: Some("p".repeat(MAX_CONTENT - 3)) },
+        ] {
+            let reply = Reply::feature_list(std::slice::from_ref(&feature)).unwrap();
+            assert_eq!(Reply::parse(&reply.to_bytes().unwrap()), Ok(reply));
+            if let Some(params) = &mut feature.params {
+                params.push('p');
+            } else {
+                feature.name.push('x');
+            }
+            assert_eq!(Reply::feature_list(&[feature]), Err(WriteError::LineTooLong));
+        }
+        let reply = Reply::new(code::OK, &"x".repeat(MAX_REPLY_TEXT));
+        assert_eq!(reply.to_bytes().unwrap().len(), MAX_LINE);
+        let reply = Reply::new(code::OK, &"x".repeat(MAX_REPLY_TEXT + 1));
+        assert_eq!(reply.lines[0].len(), MAX_REPLY_TEXT + 1);
+        assert_eq!(reply.to_bytes(), Err(WriteError::LineTooLong));
     }
 
     #[test]
@@ -2322,6 +2372,10 @@ mod tests {
         ];
         for _ in 0..4000 {
             let mut data = if rng.coin() { seeds[rng.index(seeds.len())].to_vec() } else { rng.bytes(256) };
+            if rng.index(16) == 0 {
+                data.extend(std::iter::repeat_n(b'x', rng.index(3 * MAX_LINE / 2 + 1)));
+                data.extend_from_slice(b"\r\nNOOP\r\n");
+            }
             mutate(&mut rng, &mut data);
             contract::check_decode_with_alloc_limit(Commands::new, &data, 2 * MAX_LINE);
             contract::check_decode_with_alloc_limit(Replies::new, &data, 2 * MAX_LINE);
@@ -2335,8 +2389,10 @@ mod tests {
             contract::check_wire_value(&EprtAddress { address: address.into() });
             for command in commands(&data).iter().flatten() {
                 contract::check_wire_value(command);
+                command.to_bytes().unwrap();
                 if let Ok(request) = Request::from_command(command) {
                     contract::check_wire_value(&request);
+                    request.to_bytes().unwrap();
                 }
             }
             for reply in replies(&data).iter().flatten() {

@@ -620,11 +620,23 @@ fn contracts_cover_random_and_mutated_input() {
         contract::check_wire::<memcache::CounterExtras>(&bytes);
     }
     let source = b"set key 0 0 4\r\na\r\nb\r\nversion\r\n";
-    for _ in 0..source.len() {
+    for at in 0..source.len() {
         let mut bytes = source.to_vec();
+        bytes[at] = rng.next() as u8;
         mutate(&mut rng, &mut bytes);
         contract::check_decode_with_alloc_limit(memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE);
         contract::check_wire::<memcache::Command>(&bytes);
+    }
+}
+
+#[test]
+fn unwritable_errors_have_one_description() {
+    for message in [
+        ftp::WriteError::Unwritable.to_string(),
+        whois::EncodeError::Unwritable.to_string(),
+        memcache::Error::Unwritable.to_string(),
+    ] {
+        assert_eq!(message, "value cannot be written without changing it");
     }
 }
 
