@@ -261,7 +261,45 @@ fn copied_fix_skips_garbled_frames_through_the_public_driver() {
     pump(&mut stream, bad, |item| messages.push(item)).unwrap();
     pump(&mut stream, good, |item| messages.push(item)).unwrap();
     finish(&mut stream, |item| messages.push(item)).unwrap();
-    assert_eq!(messages, [fix::Message::parse(good).unwrap()]);
+    assert_eq!(messages, [Ok(fix::Message::parse(good).unwrap())]);
     assert_eq!(stream.decoder().garbled(), 1);
     assert!(stream.failed().is_none());
+}
+
+#[test]
+fn copied_fix_passes_field_failures_to_the_session() {
+    // FIX 4.4 Vol 2 case 14.d; Session Layer 4.5.4.
+    let mut session = fix::Session::new(
+        fix::SessionConfig::new(fix::Version::Fix44, fix::Role::Acceptor, "LOCAL", "PEER").unwrap(),
+        1,
+        1,
+        0,
+    )
+    .unwrap();
+    let mut logon = fix::Message::new(fix::Version::Fix44, b"A").unwrap();
+    let time = b"20261006-12:00:00";
+    for (tag, value) in [
+        (34, b"1".as_slice()),
+        (49, b"PEER"),
+        (56, b"LOCAL"),
+        (52, time),
+        (98, b"0"),
+        (108, b"30"),
+    ] {
+        logon.push(tag, value).unwrap();
+    }
+    session.receive(&logon, 0, time).unwrap();
+    let bytes = b"8=FIX.4.4\x019=56\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0158=\x0110=255\x01";
+    let mut stream = Stream::new(fix::Frames::default());
+    assert_eq!(stream.push(bytes), bytes.len());
+    let frame = stream.next().unwrap().unwrap();
+    assert_eq!(frame.as_ref().unwrap_err().reason(), 4);
+    let actions = session.receive_frame(&frame, 1, time).unwrap();
+    let fix::Action::Send(reject) = &actions[0] else {
+        panic!("expected Reject")
+    };
+    assert_eq!(reject.get(371), Some(b"58".as_slice()));
+    assert_eq!(reject.get(373), Some(b"4".as_slice()));
+    assert_eq!(session.next_inbound(), 3);
+    assert_eq!(stream.decoder().garbled(), 0);
 }

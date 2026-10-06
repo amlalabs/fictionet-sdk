@@ -56,7 +56,16 @@ fuzz_target!(|input: &[u8]| {
     check_wire::<Message>(data);
     check_decode_with_alloc_limit(Frames::default, data, 2 * MAX_MESSAGE_SIZE);
     let (messages, _) = decode_all(Frames::default, data);
-    for message in messages {
+    for frame in messages {
+        let config = SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap();
+        let mut session = Session::new(config, 1, 1, 0).unwrap();
+        let mut logon = peer(b"A", 1);
+        logon.push(98, b"0").unwrap().push(108, b"1").unwrap();
+        session.receive(&logon, 0, TIME).unwrap();
+        if let Ok(actions) = session.receive_frame(&frame, 0, TIME) {
+            check_actions(&actions);
+        }
+        let Ok(message) = frame else { continue };
         check_wire_value(&message);
         let _ = NewOrderSingle::view(&message);
         let _ = ExecutionReport::view(&message);
@@ -84,14 +93,48 @@ fuzz_target!(|input: &[u8]| {
         corrupt[digit] = if corrupt[digit] == b'0' { b'1' } else { b'0' };
         corrupt.extend_from_slice(&wire);
         check_decode_with_alloc_limit(Frames::default, &corrupt, 2 * MAX_MESSAGE_SIZE);
-        let mut stream = Stream::new(Frames::default());
-        assert_eq!(stream.push(&corrupt), corrupt.len());
-        assert_eq!(stream.next(), Some(Ok(built.clone())));
-        stream.end();
-        assert!(stream.next().is_none());
-        assert!(stream.failed().is_none());
-        assert_eq!(stream.decoder().garbled(), 1);
+        // Fixed garbles test recovery without mistaking arbitrary binary
+        // payload bytes for intentional nested frame starts during resync.
+        for bad in [
+            b"8=FIX.4.4\x019=6\x0135=0\x0110=163\x01".as_slice(),
+            b"8=FIX.4.4\x019=4\x0135=0\x0110=163\x01",
+            b"8=FIX.4.4\x0135=0\x019=5\x0110=xxx\x01",
+            b"x",
+        ] {
+            let bytes = [bad, wire.as_slice()].concat();
+            check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+            let mut stream = Stream::new(Frames::default());
+            assert_eq!(stream.push(&bytes), bytes.len());
+            assert_eq!(stream.next(), Some(Ok(Ok(built.clone()))));
+            stream.end();
+            assert!(stream.next().is_none());
+            assert!(stream.failed().is_none());
+            assert_eq!(stream.decoder().garbled(), 1);
+        }
     }
+    let field = match data.first().copied().unwrap_or(0) % 4 {
+        0 => b"58=\x01".as_slice(),
+        1 => b"abc=1\x01",
+        2 => b"95=2\x0196=x\x01",
+        _ => b"34=abc\x01",
+    };
+    let mut body = b"35=0\x0134=2\x0149=PEER\x0156=LOCAL\x0152=20261006-12:00:00\x01".to_vec();
+    body.extend_from_slice(field);
+    let mut bytes = format!("8=FIX.4.4\x019={}\x01", body.len()).into_bytes();
+    bytes.extend_from_slice(&body);
+    let sum = bytes.iter().fold(0u8, |sum, b| sum.wrapping_add(*b));
+    bytes.extend_from_slice(format!("10={sum:03}\x01").as_bytes());
+    check_wire::<Message>(&bytes);
+    check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+    let (frames, failure) = decode_all(Frames::default, &bytes);
+    assert!(failure.is_none());
+    assert_eq!(frames.len(), 1);
+    let config = SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap();
+    let mut session = Session::new(config, 1, 1, 0).unwrap();
+    let mut logon = peer(b"A", 1);
+    logon.push(98, b"0").unwrap().push(108, b"1").unwrap();
+    session.receive(&logon, 0, TIME).unwrap();
+    check_actions(&session.receive_frame(&frames[0], 0, TIME).unwrap());
     let mut group = Message::new(Version::Fix44, b"X").unwrap();
     group
         .push(

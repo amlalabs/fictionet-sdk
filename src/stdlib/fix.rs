@@ -1,7 +1,7 @@
 //! FIX tag=value messages, repeating-group views, and caller-driven sessions.
 //!
-//! The wire rules follow FIX 4.4 Volume 2, “Message Format”, “Data Integrity”,
-//! and “Session Protocol”, and FIXT 1.1 (March 2008), “Session Protocol” and
+//! The wire rules follow FIX 4.4 Volume 2, “Standard Message header”,
+//! “Data Integrity”, and “Session Protocol”, and FIXT 1.1 (March 2008), “Session Protocol” and
 //! “Administrative Messages”. The session also follows FIX Session Layer
 //! (June 2020), sections 4.3–4.8 (establishment, termination, liveness, recovery).
 //! Public sources: [FIX 4.4 Volume 2](https://www.fixtrading.org/wp-content/uploads/download-manager-files/fix-44_VOL-2_w_Errata_20030618.pdf),
@@ -13,10 +13,16 @@
 //! sections 4.2–4.3 and 5.1–5.2. [FIX 4.2](https://www.fixtrading.org/wp-content/uploads/download-manager-files/fix-42-with_errata_20010501.pdf)
 //! covers repeating groups and the named administrative and application messages.
 //! No proprietary dictionary or member-only Word document is included.
+//! Volume 2 uses unnumbered section headings. Its numbered test cases are cited
+//! below. In-session Logon resets (Session Layer 4.4.2) are not supported;
+//! ResetSeqNumFlag is supported only in the initial Logon exchange (4.4.3).
+//! Timestamps support seconds through nanoseconds. Picoseconds are refused.
 //!
 //! [`Message`] retains field order. BodyLength and CheckSum are derived, so
-//! they are not stored in its field list. [`Frames`] reads complete messages
-//! from a [`fictionet::stdlib::codec::Stream`]. Group layouts are supplied by
+//! they are not stored in its field list. [`Frames`] yields `Result<Message,
+//! Malformed>` from a [`fictionet::stdlib::codec::Stream`]. Pass each item to
+//! [`Session::receive_frame`]. Only envelope faults are skipped as garbled.
+//! Group layouts are supplied by
 //! the caller. Application views check message type and expose borrowed values;
 //! they do not impose a venue's required fields or trading rules.
 //!
@@ -56,6 +62,9 @@ pub const MAX_GROUP_MEMBERS: usize = 256;
 /// Maximum sequence numbers in one emitted replay range or outbound gap fill.
 /// Received gap fills only move counters and have no range limit.
 pub const MAX_RESEND_RANGE: u32 = 10_000;
+/// Maximum ResendRequests with the same BeginSeqNo before Logout and close.
+/// Bounds repeated failed recovery as recommended by Session Layer 4.5.2.
+pub const MAX_RESEND_ATTEMPTS: u32 = 3;
 /// Maximum disjoint pending replay ranges retained by a session.
 pub const MAX_PENDING_RESENDS: usize = 16;
 /// Maximum bytes in a session CompID or application version identifier.
@@ -66,9 +75,15 @@ pub const MAX_HEARTBEAT_SECONDS: u32 = 86_400;
 pub const MAX_ACTIONS: usize = 16;
 /// Maximum length of a TestReqID issued or echoed by the session.
 pub const MAX_TEST_REQUEST_ID_LENGTH: usize = 64;
+/// Maximum UTC timestamp length, through nanoseconds. Picosecond timestamps
+/// (30 bytes) are refused by session operations.
+pub const MAX_TIMESTAMP_LENGTH: usize = 27;
 
-/// Standard Length/data pairs through FIX 4.4. Length immediately precedes data.
+/// Standard Length/data pairs through FIX 4.4, plus FIXT/FIX 5.0 extensions.
+/// Length immediately precedes data.
 /// Includes SecureData, Signature, RawData, XmlData, and encoded text fields.
+/// Password pairs follow Session Layer 4.3.10 Table 2 and 9.2. SecurityXML
+/// follows [FIX Application Layer Introduction 7.33](https://www.fixtrading.org/wp-content/uploads/download-manager-files/FIX-Latest-Specification-Introduction.pdf).
 pub const LENGTH_DATA_PAIRS: &[(u32, u32)] = &[
     (90, 91),
     (93, 89),
@@ -86,6 +101,9 @@ pub const LENGTH_DATA_PAIRS: &[(u32, u32)] = &[
     (445, 446),
     (618, 619),
     (621, 622),
+    (1184, 1185),
+    (1401, 1402),
+    (1403, 1404),
 ];
 
 /// Why a message, layout, or session operation was refused.
@@ -177,6 +195,8 @@ impl Field {
     /// Constructs a bounded field. Refuses zero tags, empty values, embedded SOH
     /// in text, and values over [`MAX_VALUE_LENGTH`]. Text remains single-byte
     /// character data; the caller selects its character set.
+    /// Empty data fields are refused too, including `95=0|96=|`. This applies
+    /// the no-value rule in FIX 4.4 Vol 2 case 14.d to data as well as text.
     pub fn new(tag: u32, value: &[u8]) -> Result<Self, Error> {
         check_field(tag, value)?;
         Ok(Self {
@@ -305,7 +325,7 @@ impl Message {
         stored.checked_add(3 + digits(body) + 7).ok_or(Error::Limit)
     }
     /// Appends a standard Length/data pair, deriving the Length value.
-    /// Refuses unknown pairs or size limits without changing the message.
+    /// Refuses empty data, unknown pairs, or size limits without changing the message.
     pub fn push_data(&mut self, length_tag: u32, value: &[u8]) -> Result<&mut Self, Error> {
         let tag = data_tag(length_tag).ok_or(Error::DataLength)?;
         let count = self.fields.len();
@@ -513,10 +533,174 @@ fn next_field<'a>(
         return Err(Error::DataLength);
     }
     let value = input.get(start..end).ok_or(Error::Incomplete)?;
-    check_field(tag, value)?;
     *pos = end + 1;
     Ok((tag, value))
 }
+/// A field fault in a message whose envelope and checksum were checked.
+/// Pass this item to [`Session::receive_frame`]. The retained fields are bounded
+/// by [`MAX_FIELDS`] and [`MAX_MESSAGE_SIZE`]. Unreadable tags are omitted.
+/// Parsing stops at an ambiguous data boundary; later bytes are never searched
+/// for session headers inside binary data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Malformed {
+    message: Message,
+    tag: Option<u32>,
+    reason: u32,
+    error: Error,
+}
+impl Malformed {
+    /// MsgSeqNum when a unique, positive, supported number could be read.
+    pub fn sequence(&self) -> Option<u32> {
+        number(&self.message, 34).and_then(seq).ok()
+    }
+    /// MsgType, or an empty slice when its value could not be read.
+    pub fn msg_type(&self) -> &[u8] {
+        self.message.msg_type()
+    }
+    /// RefTagID, absent when the tag itself was unreadable.
+    pub fn tag(&self) -> Option<u32> {
+        self.tag
+    }
+    /// SessionRejectReason: 4 for an empty value, 0 for an invalid tag, or 5
+    /// for an invalid data length or a named limit.
+    pub fn reason(&self) -> u32 {
+        self.reason
+    }
+}
+impl fmt::Display for Malformed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "FIX field {:?}: {} (reason {})",
+            self.tag, self.error, self.reason
+        )
+    }
+}
+impl std::error::Error for Malformed {}
+
+// Envelope errors are outer errors. Field failures are per-unit items.
+fn parse_frame(input: &[u8]) -> Result<Result<Message, Malformed>, Error> {
+    if input.len() > MAX_MESSAGE_SIZE {
+        return Err(Error::Limit);
+    }
+    let (start, total) = prefix(input)?.ok_or(Error::Incomplete)?;
+    if input.len() < total {
+        return Err(Error::Incomplete);
+    }
+    if input.len() > total {
+        return Err(Error::Trailing);
+    }
+    let checksum_at = total.checked_sub(7).ok_or(Error::BodyLength)?;
+    let trailer = input.get(checksum_at..).ok_or(Error::Incomplete)?;
+    let checksum = match trailer {
+        [b'1', b'0', b'=', a, b, c, SOH]
+            if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() =>
+        {
+            u32::from(*a - b'0') * 100 + u32::from(*b - b'0') * 10 + u32::from(*c - b'0')
+        }
+        _ => return Err(Error::Checksum),
+    };
+    let content = input.get(..checksum_at).ok_or(Error::BodyLength)?;
+    if content.last() != Some(&SOH) {
+        return Err(Error::BodyLength);
+    }
+    if content.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) as u32 != checksum {
+        return Err(Error::Checksum);
+    }
+    let mut pos = 0;
+    let (_, begin) = next_field(content, &mut pos, None)?;
+    let mut message = Message {
+        fields: vec![Field::new(8, begin)?],
+        stored_size: 0,
+    };
+    message.stored_size = message.fields[0].size();
+    pos = start;
+    let mut pending = None;
+    let mut fault = None;
+    while pos < checksum_at {
+        let at = pos;
+        let raw = pending.take();
+        let first = at == start;
+        let rest = content.get(at..).ok_or(Error::Incomplete)?;
+        let tag_hint = rest
+            .iter()
+            .take(11)
+            .position(|b| *b == b'=')
+            .and_then(|eq| decimal(&rest[..eq]).ok());
+        if first && tag_hint != Some(35) {
+            return Err(Error::Header);
+        }
+        if matches!(tag_hint, Some(8..=10)) || (!first && tag_hint == Some(35)) {
+            return Err(Error::Header);
+        }
+        if message.fields.len() >= MAX_FIELDS {
+            fault.get_or_insert((tag_hint, 5, Error::Limit));
+            break;
+        }
+        let (tag, value) = match next_field(content, &mut pos, raw) {
+            Ok(field) => field,
+            Err(error) => {
+                let reason = if matches!(error, Error::DataLength | Error::Limit) {
+                    5
+                } else {
+                    0
+                };
+                fault.get_or_insert((tag_hint, reason, error));
+                // A bad data length makes the following delimiter ambiguous.
+                // Stop rather than read apparent headers inside raw bytes.
+                if raw.is_some() || tag_hint.is_some_and(is_data) {
+                    break;
+                }
+                let Some(end) = rest.iter().position(|b| *b == SOH) else {
+                    break;
+                };
+                pos = at.checked_add(end + 1).ok_or(Error::Limit)?;
+                continue;
+            }
+        };
+        if let Err(error) = check_field(tag, value) {
+            let reason = if tag == 0 {
+                0
+            } else if value.is_empty() {
+                4
+            } else {
+                5
+            };
+            fault.get_or_insert((Some(tag), reason, error));
+        }
+        let field = Field {
+            tag,
+            value: value.to_vec(),
+        };
+        message.stored_size = message
+            .stored_size
+            .checked_add(field.size())
+            .ok_or(Error::Limit)?;
+        message.fields.push(field);
+        if let Some(data) = data_tag(tag) {
+            match decimal(value) {
+                Ok(len) if len as usize <= MAX_VALUE_LENGTH => pending = Some((data, len as usize)),
+                _ => {
+                    fault.get_or_insert((Some(tag), 5, Error::DataLength));
+                    break;
+                }
+            }
+        }
+    }
+    if let Some((tag, _)) = pending {
+        fault.get_or_insert((Some(tag), 5, Error::DataLength));
+    }
+    Ok(match fault {
+        Some((tag, reason, error)) => Err(Malformed {
+            message,
+            tag,
+            reason,
+            error,
+        }),
+        None => Ok(message),
+    })
+}
+
 impl Wire for Message {
     type ParseError = Error;
     type WriteError = Error;
@@ -524,59 +708,7 @@ impl Wire for Message {
     /// envelope order, lengths, checksum, fields, data pairs, and named limits.
     /// Leading zeros in BodyLength are accepted and normalized on write.
     fn parse(input: &[u8]) -> Result<Self, Error> {
-        if input.len() > MAX_MESSAGE_SIZE {
-            return Err(Error::Limit);
-        }
-        let (start, total) = prefix(input)?.ok_or(Error::Incomplete)?;
-        if input.len() < total {
-            return Err(Error::Incomplete);
-        }
-        if input.len() > total {
-            return Err(Error::Trailing);
-        }
-        let checksum_at = total.checked_sub(7).ok_or(Error::BodyLength)?;
-        let trailer = input.get(checksum_at..).ok_or(Error::Incomplete)?;
-        let checksum = match trailer {
-            [b'1', b'0', b'=', a, b, c, SOH]
-                if a.is_ascii_digit() && b.is_ascii_digit() && c.is_ascii_digit() =>
-            {
-                u32::from(*a - b'0') * 100 + u32::from(*b - b'0') * 10 + u32::from(*c - b'0')
-            }
-            _ => return Err(Error::Checksum),
-        };
-        let content = input.get(..checksum_at).ok_or(Error::BodyLength)?;
-        if content.last() != Some(&SOH) {
-            return Err(Error::BodyLength);
-        }
-        if content.iter().fold(0u8, |sum, b| sum.wrapping_add(*b)) as u32 != checksum {
-            return Err(Error::Checksum);
-        }
-        let mut pos = 0;
-        let (tag, begin) = next_field(content, &mut pos, None)?;
-        if tag != 8 {
-            return Err(Error::Header);
-        }
-        let version = Version::from_begin_string(begin)?;
-        pos = start;
-        let (tag, kind) = next_field(content, &mut pos, None)?;
-        if tag != 35 {
-            return Err(Error::Header);
-        }
-        let mut message = Self::new(version, kind)?;
-        let mut pending = None;
-        while pos < checksum_at {
-            let (tag, value) = next_field(content, &mut pos, pending.take())?;
-            message.push(tag, value)?;
-            if let Some(data) = data_tag(tag) {
-                let len = decimal(value).map_err(|_| Error::DataLength)? as usize;
-                if len > MAX_VALUE_LENGTH {
-                    return Err(Error::Limit);
-                }
-                pending = Some((data, len));
-            }
-        }
-        message.validate()?;
-        Ok(message)
+        parse_frame(input)?.map_err(|malformed| malformed.error)
     }
     /// Appends one message with computed BodyLength and three-digit CheckSum.
     /// Refuses invalid fields, envelope tags, data pairs, or named limits.
@@ -632,39 +764,94 @@ impl Wire for Message {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames {
     garbled: u64,
+    unsupported_versions: u64,
+    resync: bool,
+    scanned: usize,
 }
 impl Frames {
-    /// Number of complete frames dropped after a per-message parse failure.
-    /// Saturates at `u64::MAX`. Unrecoverable prefix errors are not counted.
+    /// Number of rejected envelope candidates or runs of noise. A resync scan
+    /// counts once across input chunks. Saturates at `u64::MAX`.
     pub fn garbled(&self) -> u64 {
         self.garbled
     }
+    /// Unsupported BeginString candidates skipped, saturating at `u64::MAX`.
+    /// A caller enforcing FIX 4.4 Vol 2 case 2.i must check this after draining
+    /// input. During an established session, call [`Session::logout`] with a
+    /// version diagnostic, send its actions, and close the transport. An initial
+    /// acceptor instead closes silently (Session Layer 4.6.4). Framing alone
+    /// cannot send Logout or decide the session identity policy.
+    pub fn unsupported_versions(&self) -> u64 {
+        self.unsupported_versions
+    }
+    fn recover(&mut self, input: &[u8], eof: bool) -> Step<Result<Message, Malformed>> {
+        if !self.resync {
+            self.garbled = self.garbled.saturating_add(1);
+            self.resync = true;
+            self.scanned = 1;
+        }
+        // The cursor is relative to the unread start. Keep four bytes when a
+        // full marker has not arrived, including across buffer compaction.
+        while let Some(window) = input.get(self.scanned..).and_then(|b| b.get(..5)) {
+            if window == b"8=FIX" {
+                let used = self.scanned;
+                self.resync = false;
+                self.scanned = 0;
+                return Step::Skip(used);
+            }
+            self.scanned += 1;
+        }
+        let used = if eof {
+            input.len()
+        } else {
+            input.len().saturating_sub(4)
+        };
+        self.scanned = self.scanned.saturating_sub(used);
+        if used == 0 {
+            Step::Need
+        } else {
+            Step::Skip(used)
+        }
+    }
 }
 impl Decode for Frames {
-    type Item = Message;
+    type Item = Result<Message, Malformed>;
     type Error = Error;
     const NAME: &'static str = "FIX";
     /// The maximum unread input needed before a message or error is returned.
     fn capacity(&self) -> usize {
         MAX_MESSAGE_SIZE
     }
-    /// Returns one checked message. Drops a complete garbled frame with `Skip`,
-    /// as required by FIX 4.4 Vol 2 cases 2.d, 2.m, 2.t and 3.b.
-    /// Only an invalid 8=/9= prefix or an excessive BodyLength ends framing.
-    /// Partial input returns `Need`, including at EOF; the driver reports truncation.
-    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
-        let Some((_, total)) = prefix(input)? else {
-            return Ok(Step::Need);
+    /// Returns a checked message or a [`Malformed`] field-failure item.
+    /// On an envelope fault, skips to the next
+    /// `8=FIX` after offset zero, retaining four bytes for a split marker.
+    /// Includes bad lengths, misplaced tags, unsupported versions, and noise
+    /// (FIX 4.4 Vol 2 cases 2.d, 2.m, 2.t, 3.b; Session Layer 4.5.2).
+    /// Never uses a failed candidate's BodyLength as the skip distance.
+    /// At EOF, searches incomplete candidates for a later frame. Otherwise
+    /// partial input returns `Need`; the driver reports any final truncation.
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+        if self.resync {
+            return Ok(self.recover(input, eof));
+        }
+        let total = match prefix(input) {
+            Ok(Some((_, total))) => total,
+            Ok(None) => return Ok(Step::Need),
+            Err(error) => {
+                if error == Error::Version {
+                    self.unsupported_versions = self.unsupported_versions.saturating_add(1);
+                }
+                return Ok(self.recover(input, eof));
+            }
         };
         let Some(bytes) = input.get(..total) else {
+            if eof && input.windows(5).skip(1).any(|b| b == b"8=FIX") {
+                return Ok(self.recover(input, eof));
+            }
             return Ok(Step::Need);
         };
-        Ok(match Message::parse(bytes) {
+        Ok(match parse_frame(bytes) {
             Ok(message) => Step::Item(message, total),
-            Err(_) => {
-                self.garbled = self.garbled.saturating_add(1);
-                Step::Skip(total)
-            }
+            Err(_) => self.recover(input, eof),
         })
     }
 }
@@ -991,7 +1178,8 @@ pub struct SessionConfig {
     /// Maximum absolute difference between inbound SendingTime and the caller's
     /// UTC `sending_time`, in milliseconds. `None` disables the accuracy check.
     /// A violation sends Reject reason 10 then Logout (FIX 4.4 Vol 2 case 2.o).
-    /// An invalid initial Logon follows Session Layer 4.3.1 instead.
+    /// An invalid initial Logon sends Logout, subject to the identity exceptions
+    /// in Session Layer 4.6.4.
     pub sending_time_tolerance_ms: Option<u64>,
     /// Permits ResetSeqNumFlag=Y on the initial Logon exchange.
     pub allow_logon_reset: bool,
@@ -1098,8 +1286,8 @@ pub enum Event {
     Rejected {
         /// Rejected sequence number.
         sequence: u32,
-        /// Offending field.
-        tag: u32,
+        /// Offending field, when its tag could be read.
+        tag: Option<u32>,
         /// FIX SessionRejectReason (373).
         reason: u32,
     },
@@ -1136,7 +1324,8 @@ fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), Error> {
 ///
 /// All time arguments are monotonic milliseconds chosen by the caller.
 /// SendingTime is a separately supplied UTC timestamp. Receive operations
-/// require wire-valid messages; pass [`Frames`] output directly. The caller
+/// use [`Self::receive`] for wire-valid messages or [`Self::receive_frame`] for
+/// [`Frames`] items. The caller
 /// authenticates the peer before handing over Logon and owns persistence.
 /// Counters advance when output is emitted, so the caller must persist and send
 /// each returned message in order. An `Err` leaves the machine unchanged.
@@ -1147,6 +1336,10 @@ fn action(actions: &mut Vec<Action>, value: Action) -> Result<(), Error> {
 /// inside the machine. At most [`MAX_PENDING_RESENDS`] disjoint ranges are
 /// queued. All emitted ranges are at most [`MAX_RESEND_RANGE`]. Drop this
 /// machine when the peer closes the transport; persist its counters first.
+/// After [`MAX_RESEND_ATTEMPTS`] requests with the same BeginSeqNo, the next
+/// failed recovery sends Logout and closes (Session Layer 4.5.2).
+/// A high Logout waits for recovery or `logout_timeout_ms` before acknowledgement
+/// (4.8.8 Table 3). A second timeout then bounds the wait for transport close.
 #[derive(Clone, Debug)]
 pub struct Session {
     config: SessionConfig,
@@ -1162,6 +1355,9 @@ pub struct Session {
     test_serial: u64,
     gap_high: Option<u32>,
     requested_through: Option<u32>,
+    resend_begin: u32,
+    resend_attempts: u32,
+    pending_logout: Option<(u32, u64)>,
     reset_requested: bool,
     replay_ranges: std::collections::VecDeque<(u32, u32)>,
 }
@@ -1192,6 +1388,9 @@ impl Session {
             test_serial: 0,
             gap_high: None,
             requested_through: None,
+            resend_begin: 0,
+            resend_attempts: 0,
+            pending_logout: None,
             reset_requested: false,
             replay_ranges: std::collections::VecDeque::new(),
         })
@@ -1262,7 +1461,11 @@ impl Session {
     }
     /// Processes a received message. Emits administrative responses and events.
     /// Peer session faults produce Reject or Logout actions, or a silent close
-    /// for an invalid initial acceptor Logon (Session Layer 4.3.1). Refuses
+    /// for an initial acceptor identity fault (Session Layer 4.6.4). Other invalid
+    /// initial Logons send Logout before closing (4.3.11; Vol 2 case 1S.d).
+    /// These specific rules take precedence over the broad silent-close wording
+    /// in 4.3.1. A first message other than Logon still closes silently (1S.b).
+    /// Refuses
     /// wire-invalid caller values, closed state, invalid caller time, or local
     /// sequence exhaustion transactionally. Any non-garbled input clears probes.
     pub fn receive(
@@ -1273,8 +1476,27 @@ impl Session {
     ) -> Result<Vec<Action>, Error> {
         message.validate()?;
         self.transaction(now_ms, sending_time, |s, actions| {
-            s.receive_inner(message, now_ms, sending_time, actions)
+            s.receive_inner(message, None, now_ms, sending_time, actions)
         })
+    }
+    /// Processes an item from [`Frames`], including a field failure in a valid
+    /// envelope. Rejects known sequences and advances only the expected number
+    /// (FIX 4.4 Vol 2 case 14.d; Session Layer 4.5.4). Missing or unreadable
+    /// MsgSeqNum sends Logout and closes (4.5.3). Lower PossDup messages are
+    /// ignored before field validation. Refuses the same caller errors as
+    /// [`Self::receive`], leaving the session unchanged on `Err`.
+    pub fn receive_frame(
+        &mut self,
+        frame: &Result<Message, Malformed>,
+        now_ms: u64,
+        sending_time: &[u8],
+    ) -> Result<Vec<Action>, Error> {
+        match frame {
+            Ok(message) => self.receive(message, now_ms, sending_time),
+            Err(fault) => self.transaction(now_ms, sending_time, |s, actions| {
+                s.receive_inner(&fault.message, Some(fault), now_ms, sending_time, actions)
+            }),
+        }
     }
     /// Advances timers. Sends Heartbeat after outgoing silence, TestRequest
     /// after inbound silence plus grace, and disconnects on expired probes.
@@ -1296,6 +1518,12 @@ impl Session {
                     return Ok(());
                 }
                 SessionState::Established => {}
+            }
+            if s.pending_logout
+                .is_some_and(|(_, since)| now_ms - since >= s.config.logout_timeout_ms)
+            {
+                s.acknowledge_logout(now_ms, sending_time, actions)?;
+                return Ok(());
             }
             let interval = u64::from(s.heartbeat) * 1000;
             let timeout = interval + s.config.transmission_grace_ms;
@@ -1384,6 +1612,10 @@ impl Session {
     }
     /// Sends a session Reject for an application-level field validation failure.
     /// `reason` is SessionRejectReason (373); `tag` is RefTagID (371).
+    /// Includes diagnostic Text. RefMsgType is omitted because this method has
+    /// no input message; Rejects generated by receive operations include it.
+    /// Refuses non-established state, invalid reference numbers, caller time,
+    /// or local sequence exhaustion without changing the session.
     pub fn reject(
         &mut self,
         reference: u32,
@@ -1397,7 +1629,14 @@ impl Session {
                 return Err(Error::State);
             }
             seq(reference)?;
-            s.reject_inner(reference, tag, reason, now_ms, sending_time, actions)
+            s.reject_inner(
+                (reference, b""),
+                Some(tag),
+                reason,
+                now_ms,
+                sending_time,
+                actions,
+            )
         })
     }
     /// Replays a stored application message or Reject at its original MsgSeqNum.
@@ -1633,36 +1872,35 @@ impl Session {
         time: &[u8],
         actions: &mut Vec<Action>,
     ) -> Result<(), Error> {
-        if self.initial() && self.config.role == Role::Acceptor {
-            return self.close(reason, actions);
-        }
         self.emit(b"5", &[(58, text)], now, time, actions)?;
         self.close(reason, actions)
     }
     fn reject_inner(
         &mut self,
-        reference: u32,
-        tag: u32,
+        reference: (u32, &[u8]),
+        tag: Option<u32>,
         reason: u32,
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
     ) -> Result<(), Error> {
-        self.emit(
-            b"3",
-            &[
-                (45, reference.to_string().as_bytes()),
-                (371, tag.to_string().as_bytes()),
-                (373, reason.to_string().as_bytes()),
-            ],
-            now,
-            time,
-            actions,
-        )?;
+        let (sequence, kind) = reference;
+        let mut message = self.header(b"3", self.outgoing, time)?;
+        message.push(45, sequence.to_string().as_bytes())?;
+        if let Some(tag) = tag {
+            message.push(371, tag.to_string().as_bytes())?;
+        }
+        if !kind.is_empty() {
+            message.push(372, kind)?;
+        }
+        message
+            .push(373, reason.to_string().as_bytes())?
+            .push(58, reject_text(reason))?;
+        self.send_fresh(message, now, actions)?;
         action(
             actions,
             Action::Event(Event::Rejected {
-                sequence: reference,
+                sequence,
                 tag,
                 reason,
             }),
@@ -1678,7 +1916,21 @@ impl Session {
             if self.incoming > high {
                 self.gap_high = None;
                 self.requested_through = None;
+                self.resend_attempts = 0;
             } else if self.requested_through.is_none_or(|n| self.incoming > n) {
+                if self.resend_begin != self.incoming {
+                    self.resend_begin = self.incoming;
+                    self.resend_attempts = 0;
+                }
+                if self.resend_attempts >= MAX_RESEND_ATTEMPTS {
+                    return self.fatal(
+                        CloseReason::Protocol,
+                        b"Resend attempt limit",
+                        now,
+                        time,
+                        actions,
+                    );
+                }
                 let end = high.min(self.incoming.saturating_add(MAX_RESEND_RANGE - 1));
                 self.emit(
                     b"2",
@@ -1691,13 +1943,36 @@ impl Session {
                     actions,
                 )?;
                 self.requested_through = Some(end);
+                self.resend_attempts += 1;
             }
         }
+        if self.pending_logout.is_some_and(|(n, _)| self.incoming > n) {
+            self.acknowledge_logout(now, time, actions)?;
+        }
         Ok(())
+    }
+    fn acknowledge_logout(
+        &mut self,
+        now: u64,
+        time: &[u8],
+        actions: &mut Vec<Action>,
+    ) -> Result<(), Error> {
+        self.emit(b"5", &[], now, time, actions)?;
+        self.pending_logout = None;
+        self.state = SessionState::LogoutReceived;
+        self.state_since = now;
+        Ok(())
+    }
+    fn observe_gap(&mut self, n: u32) {
+        self.gap_high = Some(self.gap_high.unwrap_or(n).max(n));
+        if self.requested_through.is_some_and(|end| n >= end) {
+            self.requested_through = None;
+        }
     }
     fn receive_inner(
         &mut self,
         message: &Message,
+        fault: Option<&Malformed>,
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
@@ -1710,6 +1985,9 @@ impl Session {
         if initial && kind != b"A" {
             if kind == b"5" && self.config.role == Role::Initiator {
                 return self.close(CloseReason::Logout, actions);
+            }
+            if self.config.role == Role::Acceptor {
+                return self.close(CloseReason::Protocol, actions);
             }
             return self.fatal(CloseReason::Protocol, b"Logon required", now, time, actions);
         }
@@ -1726,28 +2004,37 @@ impl Session {
         // if a field requires a Reject. FIX 4.4 Vol 2 state matrix row 14.
         self.last_received = now;
         self.test = None;
+        // Initial identity faults take precedence over other field failures.
+        // Session Layer 4.6.4 restricts the silent-close rule in 4.3.1.
+        if initial
+            && self.config.role == Role::Acceptor
+            && (message.version()? != self.config.version
+                || required(message, 49) != Ok(self.config.target_comp_id.as_bytes())
+                || required(message, 56) != Ok(self.config.sender_comp_id.as_bytes()))
+        {
+            return self.close(CloseReason::Protocol, actions);
+        }
         let n = match number(message, 34).and_then(seq) {
             Ok(n) => n,
-            Err(Error::Missing(34)) => {
+            Err(_) => {
                 return self.fatal(
                     CloseReason::Protocol,
-                    b"Missing MsgSeqNum",
-                    now,
-                    time,
-                    actions,
-                );
-            }
-            Err(error) => {
-                return self.reject_input(
-                    self.incoming,
-                    34,
-                    reject_reason(error, 6),
+                    b"Missing or unreadable MsgSeqNum",
                     now,
                     time,
                     actions,
                 );
             }
         };
+        // FIX 4.4 Vol 2 cases 2.e/2.f: ignore lower duplicates before Rejects.
+        let expected = if initial && flag(message, 141) == Ok(true) {
+            1
+        } else {
+            self.incoming
+        };
+        if n < expected && flag(message, 43) == Ok(true) {
+            return action(actions, Action::Event(Event::Duplicate(n)));
+        }
         // A peer field error is a protocol outcome. Only caller misuse returns
         // Err from receive. FIX 4.4 Vol 2 cases 14.b, 14.e, 14.f and 14.h.
         macro_rules! read_input {
@@ -1756,8 +2043,8 @@ impl Session {
                     Ok(value) => value,
                     Err(error) => {
                         return self.reject_input(
-                            n,
-                            $tag,
+                            (n, kind),
+                            Some($tag),
                             reject_reason(error, $reason),
                             now,
                             time,
@@ -1785,7 +2072,7 @@ impl Session {
             };
             if actual != expected {
                 if !initial {
-                    self.reject_input(n, tag, 9, now, time, actions)?;
+                    self.reject_input((n, message.msg_type()), Some(tag), 9, now, time, actions)?;
                 }
                 return self.fatal(
                     CloseReason::Protocol,
@@ -1796,10 +2083,29 @@ impl Session {
                 );
             }
         }
+        if let Some(fault) = fault {
+            if n < self.incoming && flag(message, 43) != Ok(true) {
+                return self.fatal(
+                    CloseReason::SequenceTooLow,
+                    b"MsgSeqNum too low",
+                    now,
+                    time,
+                    actions,
+                );
+            }
+            return self.reject_input((n, kind), fault.tag, fault.reason, now, time, actions);
+        }
         let appl = read_input!(message.unique(1128), 1128, 5);
         if let Some(value) = appl {
             if self.config.version != Version::Fixt11 || admin(kind) {
-                return self.reject_input(n, 1128, 5, now, time, actions);
+                return self.reject_input(
+                    (n, message.msg_type()),
+                    Some(1128),
+                    5,
+                    now,
+                    time,
+                    actions,
+                );
             }
             read_input!(session_id(value), 1128, 5);
         }
@@ -1809,10 +2115,10 @@ impl Session {
         let reset_mode = kind == b"4" && !gap_fill;
         let test_id = read_input!(message.unique(112), 112, 5);
         if test_id.is_some_and(|id| id.len() > MAX_TEST_REQUEST_ID_LENGTH) {
-            return self.reject_input(n, 112, 5, now, time, actions);
+            return self.reject_input((n, message.msg_type()), Some(112), 5, now, time, actions);
         }
         if kind == b"1" && test_id.is_none() {
-            return self.reject_input(n, 112, 1, now, time, actions);
+            return self.reject_input((n, message.msg_type()), Some(112), 1, now, time, actions);
         }
         if initial
             && ((reset && (!self.config.allow_logon_reset || n != 1))
@@ -1847,16 +2153,23 @@ impl Session {
             // Lower duplicates are ignored, including this ordering check.
             // FIX 4.4 Vol 2 cases 2.e and 2.f.
             if n == expected && original > sent {
-                return self.reject_input(n, 122, 10, now, time, actions);
+                return self.reject_input(
+                    (n, message.msg_type()),
+                    Some(122),
+                    10,
+                    now,
+                    time,
+                    actions,
+                );
             }
         } else if original.is_some() {
-            return self.reject_input(n, 122, 5, now, time, actions);
+            return self.reject_input((n, message.msg_type()), Some(122), 5, now, time, actions);
         }
         if let Some(tolerance) = self.config.sending_time_tolerance_ms {
             let distance = timestamp_nanos(sent)?.abs_diff(timestamp_nanos(timestamp(time)?)?);
             if distance > u128::from(tolerance) * 1_000_000 {
                 if !initial {
-                    self.reject_input(n, 52, 10, now, time, actions)?;
+                    self.reject_input((n, message.msg_type()), Some(52), 10, now, time, actions)?;
                 }
                 return self.fatal(
                     CloseReason::Protocol,
@@ -1872,11 +2185,18 @@ impl Session {
         if kind == b"A" {
             let encryption = read_input!(number(message, 98), 98, 6);
             if encryption != 0 {
-                return self.reject_input(n, 98, 5, now, time, actions);
+                return self.reject_input((n, message.msg_type()), Some(98), 5, now, time, actions);
             }
             heartbeat = read_input!(number(message, 108), 108, 6);
             if heartbeat > MAX_HEARTBEAT_SECONDS {
-                return self.reject_input(n, 108, 5, now, time, actions);
+                return self.reject_input(
+                    (n, message.msg_type()),
+                    Some(108),
+                    5,
+                    now,
+                    time,
+                    actions,
+                );
             }
             if self.config.version == Version::Fixt11 {
                 let id = read_input!(required(message, 1137), 1137, 5);
@@ -1903,7 +2223,7 @@ impl Session {
         let next = if kind == b"4" {
             let next = read_input!(number(message, 36), 36, 6);
             if seq(next).is_err() {
-                return self.reject_inner(n, 36, 5, now, time, actions);
+                return self.reject_inner((n, message.msg_type()), Some(36), 5, now, time, actions);
             }
             next
         } else {
@@ -1911,14 +2231,14 @@ impl Session {
         };
         if gap_fill && next <= n {
             // FIX 4.4 Vol 2 case 10.e: reject without advancing or closing.
-            return self.reject_inner(n, 36, 5, now, time, actions);
+            return self.reject_inner((n, message.msg_type()), Some(36), 5, now, time, actions);
         }
         if !reset_mode && n < self.incoming {
             return action(actions, Action::Event(Event::Duplicate(n)));
         }
         if reset_mode {
             if next < self.incoming {
-                return self.reject_inner(n, 36, 5, now, time, actions);
+                return self.reject_inner((n, message.msg_type()), Some(36), 5, now, time, actions);
             }
             if next == self.incoming {
                 return Ok(());
@@ -1937,7 +2257,7 @@ impl Session {
         }
         let high = n > self.incoming;
         if high {
-            self.gap_high = Some(self.gap_high.unwrap_or(n).max(n));
+            self.observe_gap(n);
             action(
                 actions,
                 Action::Event(Event::Gap {
@@ -1981,10 +2301,13 @@ impl Session {
                 return self.close(CloseReason::Logout, actions);
             }
             if self.state != SessionState::LogoutReceived {
+                if high {
+                    // Preserve the first request's deadline on repeated Logout.
+                    self.pending_logout.get_or_insert((n, now));
+                    return self.request_gap(now, time, actions);
+                }
                 self.request_gap(now, time, actions)?;
-                self.emit(b"5", &[], now, time, actions)?;
-                self.state = SessionState::LogoutReceived;
-                self.state_since = now;
+                self.acknowledge_logout(now, time, actions)?;
             }
             if !high {
                 self.incoming = advance(self.incoming)?;
@@ -2021,9 +2344,14 @@ impl Session {
                         Ok(reference) => {
                             action(actions, Action::Event(Event::RejectReceived(reference)))?
                         }
-                        Err(error) => {
-                            self.reject_inner(n, 45, reject_reason(error, 6), now, time, actions)?
-                        }
+                        Err(error) => self.reject_inner(
+                            (n, message.msg_type()),
+                            Some(45),
+                            reject_reason(error, 6),
+                            now,
+                            time,
+                            actions,
+                        )?,
                     },
                     _ => {
                         self.recovery_state()?;
@@ -2042,13 +2370,14 @@ impl Session {
     }
     fn reject_input(
         &mut self,
-        n: u32,
-        tag: u32,
+        reference: (u32, &[u8]),
+        tag: Option<u32>,
         reason: u32,
         now: u64,
         time: &[u8],
         actions: &mut Vec<Action>,
     ) -> Result<(), Error> {
+        let (n, _) = reference;
         if self.initial() {
             return self.fatal(CloseReason::Protocol, b"Invalid Logon", now, time, actions);
         }
@@ -2056,9 +2385,9 @@ impl Session {
             self.incoming = advance(self.incoming)?;
         }
         if n > self.incoming {
-            self.gap_high = Some(self.gap_high.unwrap_or(n).max(n));
+            self.observe_gap(n);
         }
-        self.reject_inner(n, tag, reason, now, time, actions)?;
+        self.reject_inner(reference, tag, reason, now, time, actions)?;
         self.request_gap(now, time, actions)
     }
     fn resend_request(
@@ -2078,7 +2407,7 @@ impl Session {
             requested_end.min(last)
         };
         if begin == 0 || begin > end {
-            return self.reject_inner(n, 7, 5, now, time, actions);
+            return self.reject_inner((n, message.msg_type()), Some(7), 5, now, time, actions);
         }
         // Merge only overlapping or adjacent ranges. Restart the bounded scan
         // when a merge expands the range, so transitive overlaps also coalesce.
@@ -2097,7 +2426,7 @@ impl Session {
             }
         }
         if self.replay_ranges.len() >= MAX_PENDING_RESENDS {
-            return self.reject_inner(n, 7, 5, now, time, actions);
+            return self.reject_inner((n, message.msg_type()), Some(7), 5, now, time, actions);
         }
         self.replay_ranges
             .insert(insert_at.min(self.replay_ranges.len()), (begin, end));
@@ -2119,6 +2448,19 @@ impl Session {
             self.replay_ranges.push_front((end.checked_add(1)?, last));
         }
         Some(Event::Resend { begin, end })
+    }
+}
+fn reject_text(reason: u32) -> &'static [u8] {
+    match reason {
+        0 => b"Invalid tag number",
+        1 => b"Required tag missing",
+        4 => b"Tag specified without a value",
+        5 => b"Value outside allowed range or invalid data length",
+        6 => b"Incorrect data format",
+        9 => b"CompID problem",
+        10 => b"SendingTime accuracy problem",
+        13 => b"Tag appears more than once",
+        _ => b"Invalid message field",
     }
 }
 fn reject_reason(error: Error, fallback: u32) -> u32 {
@@ -2158,8 +2500,6 @@ fn seq(n: u32) -> Result<u32, Error> {
 fn advance(n: u32) -> Result<u32, Error> {
     seq(n.checked_add(1).ok_or(Error::Sequence)?)
 }
-/// Maximum bytes in a supported UTC timestamp, through nanosecond precision.
-pub const MAX_TIMESTAMP_LENGTH: usize = 27;
 fn timestamp(bytes: &[u8]) -> Result<[u32; 7], Error> {
     if !matches!(bytes.len(), 17 | 21 | 24 | MAX_TIMESTAMP_LENGTH)
         || bytes.get(8) != Some(&b'-')
@@ -2330,6 +2670,329 @@ mod tests {
     }
 
     #[test]
+    fn round_two_a_resynchronizes_after_bad_lengths_positions_and_noise() {
+        // FIX 4.4 Vol 2 cases 2.m, 2.t; Session Layer 4.5.2.
+        let good = b"8=FIX.4.4\x019=5\x0135=0\x0110=163\x01";
+        for bad in [
+            b"8=FIX.4.4\x019=6\x0135=0\x0110=163\x01".as_slice(),
+            b"8=FIX.4.4\x019=5\x0135=0\x0158=x\x0110=000\x01",
+            b"8=FIX.4.4\x0135=0\x019=5\x0110=xxx\x01",
+            b"x",
+        ] {
+            let bytes = [bad, good, good].concat();
+            let (items, failure) = decode_all(Frames::default, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), 2);
+            for chunks in [1, bytes.len()] {
+                let mut stream = Stream::new(Frames::default());
+                let mut count = 0;
+                for chunk in bytes.chunks(chunks) {
+                    fictionet::stdlib::codec::pump(&mut stream, chunk, |_| count += 1).unwrap();
+                }
+                fictionet::stdlib::codec::finish(&mut stream, |_| count += 1).unwrap();
+                assert_eq!(count, 2);
+                assert_eq!(stream.decoder().garbled(), 1);
+            }
+            check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+        }
+        for bad in [
+            b"8=FIX.4.4\x019=4\x0135=0\x0110=163\x01".as_slice(),
+            b"8=FIX.4.4\x019=50\x0135=0\x0110=163\x01",
+            b"8=FIX.4.4\x019=5000\x0135=0\x0110=163\x01",
+        ] {
+            let bytes = [bad, LOGON].concat();
+            let (items, failure) = decode_all(Frames::default, &bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), 1);
+            check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+        }
+    }
+
+    const HIGH_FOUR: &[u8] = b"8=FIX.4.4\x019=52\x0135=D\x0134=4\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=102\x01";
+    const REPLAY_TWO: &[u8] = b"8=FIX.4.4\x019=79\x0135=D\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x0110=147\x01";
+    const REPLAY_FOUR: &[u8] = b"8=FIX.4.4\x019=79\x0135=D\x0134=4\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x0110=149\x01";
+    const EMPTY_TEXT: &[u8] = b"8=FIX.4.4\x019=56\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0158=\x0110=255\x01";
+    const HIGH_LOGOUT: &[u8] = b"8=FIX.4.4\x019=52\x0135=5\x0134=5\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=088\x01";
+
+    #[test]
+    fn round_two_b_lost_replay_requests_the_remaining_gap() {
+        // Session Layer 4.5.2 and 4.8.2: replay 3 is lost or garbled.
+        let mut session = established(Version::Fix44);
+        let sent = sends(&received_bytes(&mut session, HIGH_FOUR, 1));
+        assert_eq!(sent[0].get(7), Some(b"2".as_slice()));
+        assert_eq!(sent[0].get(16), Some(b"4".as_slice()));
+        received_bytes(&mut session, REPLAY_TWO, 2);
+        let sent = sends(&received_bytes(&mut session, REPLAY_FOUR, 3));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].msg_type(), b"2");
+        assert_eq!(sent[0].get(7), Some(b"3".as_slice()));
+        assert_eq!(session.next_inbound(), 3);
+    }
+
+    #[test]
+    fn round_two_b_repeated_resend_requests_are_bounded() {
+        // Session Layer 4.5.2 recommends guarding repeated failed recovery.
+        let mut session = established(Version::Fix44);
+        for now in 1..=u64::from(MAX_RESEND_ATTEMPTS) {
+            let sent = sends(&received_bytes(&mut session, HIGH_FOUR, now));
+            assert_eq!(sent.len(), 1);
+            assert_eq!(sent[0].msg_type(), b"2");
+            assert_eq!(sent[0].get(7), Some(b"2".as_slice()));
+        }
+        let actions = received_bytes(&mut session, HIGH_FOUR, u64::from(MAX_RESEND_ATTEMPTS) + 1);
+        assert_eq!(sends(&actions)[0].msg_type(), b"5");
+        assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn round_two_c_empty_field_is_an_item() {
+        // FIX 4.4 Vol 2 case 14.d: a valid envelope requires a field Reject.
+        check_wire::<Message>(EMPTY_TEXT);
+        let (items, failure) = decode_all(Frames::default, EMPTY_TEXT);
+        assert_eq!(failure, None);
+        assert_eq!(items.len(), 1);
+        let fault = items[0].as_ref().unwrap_err();
+        assert_eq!(fault.sequence(), Some(2));
+        assert_eq!(
+            (fault.msg_type(), fault.tag(), fault.reason()),
+            (b"0".as_slice(), Some(58), 4)
+        );
+        let mut session = established(Version::Fix44);
+        let actions = session.receive_frame(&items[0], 1, TIME).unwrap();
+        let sent = sends(&actions);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].msg_type(), b"3");
+        assert_eq!(sent[0].get(45), Some(b"2".as_slice()));
+        assert_eq!(sent[0].get(371), Some(b"58".as_slice()));
+        assert_eq!(sent[0].get(372), Some(b"0".as_slice()));
+        assert_eq!(sent[0].get(373), Some(b"4".as_slice()));
+        assert!(sent[0].get(58).is_some());
+        assert_eq!(session.next_inbound(), 3);
+        let replay = b"8=FIX.4.4\x019=83\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x0158=\x0110=037\x01";
+        let (items, failure) = decode_all(Frames::default, replay);
+        assert_eq!(failure, None);
+        assert_eq!(
+            session.receive_frame(&items[0], 2, TIME).unwrap(),
+            [Action::Event(Event::Duplicate(2))]
+        );
+        assert_eq!(session.next_inbound(), 3);
+        check_decode_with_alloc_limit(Frames::default, EMPTY_TEXT, 2 * MAX_MESSAGE_SIZE);
+        check_decode_with_alloc_limit(Frames::default, replay, 2 * MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn round_two_d_high_logout_waits_for_recovery() {
+        // Session Layer 4.8.8 Table 3 and 4.6.3: recover before acknowledging.
+        let mut session = established(Version::Fix44);
+        let actions = received_bytes(&mut session, HIGH_LOGOUT, 1);
+        assert!(has_event(
+            &actions,
+            Event::Gap {
+                expected: 2,
+                received: 5
+            }
+        ));
+        let sent = sends(&actions);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].msg_type(), b"2");
+        assert_eq!(sent[0].get(7), Some(b"2".as_slice()));
+        assert_eq!(sent[0].get(16), Some(b"5".as_slice()));
+        assert!(sends(&received_bytes(&mut session, REPLAY_TWO, 2)).is_empty());
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=90\x0135=4\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x01123=Y\x0136=6\x0110=135\x01", 3);
+        assert_eq!(sends(&actions)[0].msg_type(), b"5");
+        assert_eq!(session.next_inbound(), 6);
+        assert_eq!(session.state(), SessionState::LogoutReceived);
+    }
+
+    #[test]
+    fn round_two_d_high_logout_acknowledgement_has_a_deadline() {
+        // Session Layer 4.6 and 4.8.8 Table 3: bound the recovery wait.
+        let mut session = established(Version::Fix44);
+        received_bytes(&mut session, HIGH_LOGOUT, 1);
+        assert!(session.tick(2000, TIME).unwrap().is_empty());
+        let actions = session.tick(2001, TIME).unwrap();
+        assert_eq!(sends(&actions).len(), 1);
+        assert_eq!(sends(&actions)[0].msg_type(), b"5");
+        assert_eq!(session.state(), SessionState::LogoutReceived);
+    }
+
+    #[test]
+    fn round_two_c_field_faults_reject_without_garbling() {
+        // FIX 4.4 Vol 2 cases 14.a/14.d/14.e; Session Layer 4.5.4.
+        for (bytes, tag, reason) in [
+            (b"8=FIX.4.4\x019=58\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x01abc=1\x0110=235\x01".as_slice(), None, 0),
+            (b"8=FIX.4.4\x019=56\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x010=1\x0110=243\x01".as_slice(), Some(0), 0),
+            (b"8=FIX.4.4\x019=62\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0195=2\x0196=a\x0110=061\x01".as_slice(), Some(96), 5),
+            (b"8=FIX.4.4\x019=61\x0135=0\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0195=0\x0196=\x0110=217\x01".as_slice(), Some(96), 4),
+        ] {
+            let mut stream = Stream::new(Frames::default());
+            assert_eq!(stream.push(bytes), bytes.len());
+            let item = stream.next().unwrap().unwrap();
+            assert_eq!(stream.decoder().garbled(), 0);
+            let fault = item.as_ref().unwrap_err();
+            assert_eq!((fault.sequence(), fault.tag(), fault.reason()), (Some(2), tag, reason));
+            let mut session = established(Version::Fix44);
+            let sent = sends(&session.receive_frame(&item, 1, TIME).unwrap());
+            assert_eq!(sent[0].get(371), tag.map(|t| t.to_string()).as_deref().map(str::as_bytes));
+            assert_eq!(sent[0].get(373), Some(reason.to_string().as_bytes()));
+            assert_eq!(session.next_inbound(), 3);
+            assert!(Message::parse(bytes).is_err());
+            check_wire::<Message>(bytes);
+            check_decode_with_alloc_limit(Frames::default, bytes, 2 * MAX_MESSAGE_SIZE);
+        }
+        // An empty data value is refused transactionally, like other empty fields.
+        let mut message = Message::new(Version::Fix44, b"0").unwrap();
+        let before = message.clone();
+        assert_eq!(message.push_data(95, b""), Err(Error::Field));
+        assert_eq!(message, before);
+    }
+
+    #[test]
+    fn round_two_c_unreadable_sequence_logs_out_without_consuming_it() {
+        // Session Layer 4.5.3: an unreadable 34 is treated as missing.
+        for bytes in [
+            b"8=FIX.4.4\x019=54\x0135=0\x0134=abc\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=070\x01".as_slice(),
+            b"8=FIX.4.4\x019=52\x0135=0\x0134=0\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=078\x01".as_slice(),
+            b"8=FIX.4.4\x019=55\x0135=0\x0134=\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0158=\x0110=204\x01".as_slice(),
+        ] {
+            let (items, failure) = decode_all(Frames::default, bytes);
+            assert_eq!(failure, None);
+            assert_eq!(items.len(), 1);
+            let mut session = established(Version::Fix44);
+            let actions = session.receive_frame(&items[0], 1, TIME).unwrap();
+            assert_eq!(sends(&actions)[0].msg_type(), b"5");
+            assert_eq!(session.state(), SessionState::Closed);
+            assert_eq!(session.next_inbound(), 2);
+        }
+    }
+
+    #[test]
+    fn round_two_lower_duplicates_precede_field_rejects() {
+        // FIX 4.4 Vol 2 cases 2.e/2.f: no field Reject for consumed duplicates.
+        for bytes in [
+            b"8=FIX.4.4\x019=68\x0135=4\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01123=X\x0136=7\x0110=098\x01".as_slice(),
+            b"8=FIX.4.4\x019=69\x0135=4\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01112=a\x01112=b\x0110=192\x01".as_slice(),
+            b"8=FIX.4.4\x019=61\x0135=4\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x0158=\x0110=252\x01".as_slice(),
+        ] {
+            let (items, failure) = decode_all(Frames::default, bytes);
+            assert_eq!(failure, None);
+            let mut session = established(Version::Fix44);
+            assert_eq!(session.receive_frame(&items[0], 1, TIME).unwrap(), [Action::Event(Event::Duplicate(1))]);
+            assert_eq!(session.next_inbound(), 2);
+        }
+        // A lower replayed Logon also precedes ordinary field validation.
+        let mut session = Session::new(
+            SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap(),
+            5,
+            7,
+            0,
+        )
+        .unwrap();
+        let actions = received_bytes(&mut session, b"8=FIX.4.4\x019=64\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x0198=bad\x0110=055\x01", 1);
+        assert_eq!(actions, [Action::Event(Event::Duplicate(1))]);
+        assert_eq!(session.next_inbound(), 5);
+    }
+
+    #[test]
+    fn round_two_initial_logon_errors_send_logout_except_identity() {
+        // Session Layer 4.3.11/4.6.4 and FIX 4.4 Vol 2 case 1S.d.
+        for bytes in [
+            b"8=FIX.4.4\x019=64\x0135=A\x0134=3\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=126\x01".as_slice(),
+            b"8=FIX.4.4\x019=65\x0135=A\x0134=5\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=abc\x0110=068\x01".as_slice(),
+            b"8=FIX.4.4\x019=70\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x01141=Y\x0110=166\x01".as_slice(),
+        ] {
+            let config = SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap();
+            let mut session = Session::new(config, 5, 7, 0).unwrap();
+            let actions = received_bytes(&mut session, bytes, 1);
+            assert_eq!(sends(&actions).len(), 1);
+            assert_eq!(sends(&actions)[0].msg_type(), b"5");
+            assert_eq!(session.next_inbound(), 5);
+            assert_eq!(session.next_outbound(), 8);
+            assert_eq!(session.state(), SessionState::Closed);
+        }
+        let mut session = Session::new(
+            SessionConfig::new(Version::Fix44, Role::Acceptor, "LOCAL", "PEER").unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        let actions = received_bytes(&mut session, b"8=FIX.4.2\x019=64\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=122\x01", 1);
+        assert_eq!(
+            actions,
+            [Action::Event(Event::Disconnected(CloseReason::Protocol))]
+        );
+    }
+
+    #[test]
+    fn round_two_unsupported_version_resync_is_observable() {
+        // FIX 4.4 Vol 2 case 2.i; Session Layer 4.6.4 (initial identity).
+        let bytes = [b"8=FIX.4.1\x019=5\x0135=0\x0110=160\x01".as_slice(), LOGON].concat();
+        let mut stream = Stream::new(Frames::default());
+        for byte in &bytes {
+            fictionet::stdlib::codec::pump(&mut stream, &[*byte], |item| {
+                assert_eq!(item, Ok(Message::parse(LOGON).unwrap()));
+            })
+            .unwrap();
+        }
+        assert_eq!(stream.decoder().unsupported_versions(), 1);
+        assert_eq!(stream.decoder().garbled(), 1);
+        check_decode_with_alloc_limit(Frames::default, &bytes, 2 * MAX_MESSAGE_SIZE);
+    }
+
+    #[test]
+    fn round_two_data_pairs_and_timestamp_precision() {
+        // Session Layer 9.2; FIX Application Layer Introduction 7.33.
+        for bytes in [
+            b"8=FIXT.1.1\x019=21\x0135=A\x011184=3\x011185=a\x01b\x0110=064\x01".as_slice(),
+            b"8=FIXT.1.1\x019=21\x0135=A\x011401=3\x011402=a\x01b\x0110=048\x01".as_slice(),
+            b"8=FIXT.1.1\x019=21\x0135=A\x011403=3\x011404=a\x01b\x0110=052\x01".as_slice(),
+        ] {
+            let message = Message::parse(bytes).unwrap();
+            assert_eq!(message.to_bytes().unwrap(), bytes);
+            check_wire::<Message>(bytes);
+            check_wire_value(&message);
+            check_decode_with_alloc_limit(Frames::default, bytes, 2 * MAX_MESSAGE_SIZE);
+        }
+        assert_eq!(
+            timestamp(b"20261006-12:00:00.123456789012"),
+            Err(Error::Time)
+        );
+        assert!(timestamp(b"20261006-12:00:00.123456789").is_ok());
+    }
+
+    #[test]
+    fn round_two_pending_logout_acknowledges_replayed_logout_once() {
+        // Session Layer 4.8.8 Table 3: consume the recorded number first.
+        let mut session = established(Version::Fix44);
+        received_bytes(&mut session, HIGH_LOGOUT, 1);
+        let gap = b"8=FIX.4.4\x019=90\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x01123=Y\x0136=5\x0110=133\x01";
+        assert!(sends(&received_bytes(&mut session, gap, 2)).is_empty());
+        assert_eq!(session.next_inbound(), 5);
+        let replay = b"8=FIX.4.4\x019=79\x0135=5\x0134=5\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:00\x0110=135\x01";
+        let sent = sends(&received_bytes(&mut session, replay, 3));
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].msg_type(), b"5");
+        assert_eq!(session.next_inbound(), 6);
+        assert!(sends(&received_bytes(&mut session, replay, 4)).is_empty());
+        assert_eq!(session.state(), SessionState::LogoutReceived);
+    }
+
+    #[test]
+    fn round_two_retry_budget_restarts_after_inbound_progress() {
+        // Session Layer 4.5.2: only repeated requests with the same begin count.
+        let mut session = established(Version::Fix44);
+        for now in 1..=u64::from(MAX_RESEND_ATTEMPTS) {
+            received_bytes(&mut session, HIGH_FOUR, now);
+        }
+        let now = u64::from(MAX_RESEND_ATTEMPTS) + 1;
+        received_bytes(&mut session, REPLAY_TWO, now);
+        let sent = sends(&received_bytes(&mut session, REPLAY_FOUR, now + 1));
+        assert_eq!(sent[0].get(7), Some(b"3".as_slice()));
+        assert_eq!(session.state(), SessionState::Established);
+    }
+
+    #[test]
     fn review_a_fixt_headers_accept_tag_order() {
         // Session Layer 8.5: only 8, 9, 35 have fixed header positions.
         let mut session = Session::new(
@@ -2361,7 +3024,7 @@ mod tests {
 
     #[test]
     fn review_c_invalid_logon_timestamps_never_send_reject_first() {
-        // Session Layer 4.3.1; FIX 4.4 Vol 2 cases 1S.d and 1B.e.
+        // Session Layer 4.3.11 and 4.6.4; FIX 4.4 Vol 2 cases 1S.d and 1B.e.
         for role in [Role::Acceptor, Role::Initiator] {
             for bytes in [b"8=FIX.4.4\x019=52\x0135=A\x0134=1\x0149=PEER\x0152=bad\x0156=LOCAL\x0198=0\x01108=30\x01141=Y\x0110=185\x01".as_slice(), b"8=FIX.4.4\x019=83\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=bad\x0198=0\x01108=30\x01141=Y\x0110=162\x01", b"8=FIX.4.4\x019=97\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0143=Y\x01122=20261006-12:00:02\x0198=0\x01108=30\x01141=Y\x0110=215\x01"] {
                 let mut config = SessionConfig::new(Version::Fix44, role, "LOCAL", "PEER").unwrap();
@@ -2372,13 +3035,10 @@ mod tests {
                 let actions = received_bytes(&mut session, bytes, 1);
                 assert_eq!(session.state(), SessionState::Closed);
                 let sent = sends(&actions);
-                if role == Role::Acceptor {
-                    assert!(sent.is_empty());
-                    assert_eq!((session.next_inbound(), session.next_outbound()), before);
-                } else {
-                    assert_eq!(sent.len(), 1);
-                    assert_eq!(sent[0].msg_type(), b"5");
-                }
+                assert_eq!(sent.len(), 1);
+                assert_eq!(sent[0].msg_type(), b"5");
+                assert_eq!(session.next_inbound(), before.0);
+                assert_eq!(session.next_outbound(), before.1 + 1);
             }
         }
     }
@@ -2465,7 +3125,7 @@ mod tests {
             let wire = [bad, LOGON].concat();
             let (messages, failure) = decode_all(Frames::default, &wire);
             assert_eq!(failure, None);
-            assert_eq!(messages, [Message::parse(LOGON).unwrap()]);
+            assert_eq!(messages, [Ok(Message::parse(LOGON).unwrap())]);
             check_decode_with_alloc_limit(Frames::default, &wire, 2 * MAX_MESSAGE_SIZE);
         }
     }
@@ -2503,12 +3163,11 @@ mod tests {
             (b"8=FIX.4.4\x019=57\x0135=2\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0116=0\x0110=044\x01".as_slice(), Version::Fix44, 7, 1),
             (b"8=FIX.4.4\x019=61\x0135=2\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x017=1\x0116=x\x0110=021\x01".as_slice(), Version::Fix44, 16, 6),
             (b"8=FIX.4.4\x019=57\x0135=4\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0136=x\x0110=120\x01".as_slice(), Version::Fix44, 36, 6),
-            (b"8=FIX.4.4\x019=52\x0135=0\x0134=x\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0110=150\x01".as_slice(), Version::Fix44, 34, 6),
             (b"8=FIXT.1.1\x019=64\x0135=A\x0134=2\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x0110=203\x01".as_slice(), Version::Fixt11, 1137, 1),
         ] {
             let mut session = established(version);
             let actions = received_bytes(&mut session, bytes, 1);
-            assert!(has_event(&actions, Event::Rejected { sequence: 2, tag, reason }), "{tag}");
+            assert!(has_event(&actions, Event::Rejected { sequence: 2, tag: Some(tag), reason }), "{tag}");
             assert_eq!(sends(&actions)[0].get(373), Some(reason.to_string().as_bytes()));
             assert_eq!(session.next_inbound(), 3);
             assert_eq!(session.state(), SessionState::Established);
@@ -2521,8 +3180,8 @@ mod tests {
     }
 
     #[test]
-    fn invalid_initial_logon_fields_close_without_changing_acceptor_counters() {
-        // Session Layer 4.3.1. Validate fields before applying ResetSeqNumFlag.
+    fn invalid_initial_logon_fields_send_logout_without_resetting_counters() {
+        // Session Layer 4.3.11/4.6.4. Validate before applying ResetSeqNumFlag.
         for role in [Role::Acceptor, Role::Initiator] {
             for bytes in [
                 b"8=FIXT.1.1\x019=77\x0135=A\x0134=1\x0149=PEER\x0152=20261006-12:00:01.000\x0156=LOCAL\x0198=0\x01108=30\x01141=X\x011137=6\x0110=058\x01".as_slice(),
@@ -2538,13 +3197,10 @@ mod tests {
                 let before = (session.next_inbound(), session.next_outbound());
                 let actions = received_bytes(&mut session, bytes, 1);
                 assert_eq!(session.state(), SessionState::Closed);
-                if role == Role::Acceptor {
-                    assert!(sends(&actions).is_empty());
-                    assert_eq!((session.next_inbound(), session.next_outbound()), before);
-                } else {
-                    assert_eq!(sends(&actions).len(), 1);
-                    assert_eq!(sends(&actions)[0].msg_type(), b"5");
-                }
+                assert_eq!(sends(&actions).len(), 1);
+                assert_eq!(sends(&actions)[0].msg_type(), b"5");
+                assert_eq!(session.next_inbound(), before.0);
+                assert_eq!(session.next_outbound(), before.1 + 1);
             }
         }
     }
@@ -2730,12 +3386,16 @@ mod tests {
 
     #[test]
     fn garbled_count_tracks_skips_and_saturates() {
-        let bad = b"8=FIX.4.4\x019=9\x0135=0\x0158=\x0110=082\x01";
+        // FIX 4.4 Vol 2 case 3.b: invalid checksum, not an empty field.
+        let bad = b"8=FIX.4.4\x019=5\x0135=0\x0110=164\x01";
         let mut frames = Frames::default();
-        assert_eq!(frames.decode(bad, false), Ok(Step::Skip(bad.len())));
+        assert_eq!(frames.decode(bad, true), Ok(Step::Skip(bad.len())));
         assert_eq!(frames.garbled(), 1);
-        frames.garbled = u64::MAX;
-        assert_eq!(frames.decode(bad, false), Ok(Step::Skip(bad.len())));
+        let mut frames = Frames {
+            garbled: u64::MAX,
+            ..Frames::default()
+        };
+        assert_eq!(frames.decode(bad, true), Ok(Step::Skip(bad.len())));
         assert_eq!(frames.garbled(), u64::MAX);
     }
 
@@ -2797,7 +3457,10 @@ mod tests {
             b"8=FIX.4.4\x019=0\x01",
             b"8=FIX.4.4\x019=-1\x01",
         ] {
-            assert!(Frames::default().decode(bytes, false).is_err());
+            assert!(matches!(
+                Frames::default().decode(bytes, false),
+                Ok(Step::Skip(_))
+            ));
         }
         check_decode_with_alloc_limit(
             Frames::default,
@@ -3172,7 +3835,10 @@ mod tests {
             }
         ));
         assert_eq!(s.next_inbound(), 2);
-        assert!(sends(&s.receive(&high, 2, TIME).unwrap()).is_empty());
+        assert_eq!(
+            sends(&s.receive(&high, 2, TIME).unwrap())[0].get(7),
+            Some(b"2".as_slice())
+        );
         let gap = inbound(
             Version::Fix44,
             b"4",
@@ -3225,7 +3891,7 @@ mod tests {
             &events,
             Event::Rejected {
                 sequence: 2,
-                tag: 122,
+                tag: Some(122),
                 reason: 1
             }
         ));
@@ -3241,7 +3907,7 @@ mod tests {
             &s.receive(&future, 3, TIME).unwrap(),
             Event::Rejected {
                 sequence: 3,
-                tag: 122,
+                tag: Some(122),
                 reason: 10
             }
         ));
@@ -3275,7 +3941,7 @@ mod tests {
             &events,
             Event::Rejected {
                 sequence: 999,
-                tag: 36,
+                tag: Some(36),
                 reason: 5
             }
         ));
@@ -3498,7 +4164,7 @@ mod tests {
         for b in &bytes {
             assert_eq!(stream.push(&[*b]), 1);
             if let Some(item) = stream.next() {
-                assert_eq!(item.unwrap(), message);
+                assert_eq!(item.unwrap(), Ok(message.clone()));
             }
         }
         stream.end();
