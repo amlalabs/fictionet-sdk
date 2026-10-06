@@ -36,6 +36,10 @@
 //! and the generic codec tools. Named sibling modules stay SDK dependencies.
 //! See the `custom_protocol` example for a copied Modbus module.
 //!
+//! [`sse`] reads streaming API response bodies as fields or dispatched
+//! events. Use [`sse::RawLines`] to retain comments and [`sse::Events`] to
+//! join data lines, then write edited events back into an HTTP body.
+//!
 //! # Three kinds of functions
 //!
 //! Every function in the stdlib is one of three kinds. The kind tells you
@@ -211,6 +215,7 @@ pub mod snmp;
 pub mod socks;
 pub mod spnego;
 pub mod ssh;
+pub mod sse;
 pub mod stun;
 pub mod syslog;
 pub mod tcp;

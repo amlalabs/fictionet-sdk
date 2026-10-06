@@ -168,6 +168,10 @@ the codec tools. The file's `fictionet::stdlib::...` imports need no change.
 [`custom_protocol`](examples/custom_protocol) shows this with a Modbus register.
 Run it with `cargo run --example custom_protocol`; it needs no network or root.
 
+[`stdlib::sse`](src/stdlib/sse.rs) reads server-sent events from streaming
+HTTP response bodies. It exposes raw fields and comments for proxies, joins
+dispatched events, and writes edited events for API mocks and MCP transports.
+
 ## Where sandboxes can run
 
 | Where the sandbox runs | How it attaches | Tested by |

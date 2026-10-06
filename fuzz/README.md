@@ -87,6 +87,8 @@ cargo +nightly fuzz list
 | `socks` | exact wire values, session modes and bounded codec contracts | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
 | `spnego` | Bare and GSS-wrapped tokens plus constructed wrappers; checks framing, mechanism rules, round trips, and write refusal | `stdlib::spnego`: SPNEGO |
 | `ssh` | version lines, cleartext packets, messages, and codec contracts | `stdlib::ssh`: The SSH transport layer before encryption |
+| `sse_lines` | arbitrary lines and constructed fields; chunking, split CRLF, BOM, UTF-8 replacement, limits, write rollback and decode/write round trips | `stdlib::sse`: raw fields, comments, retry and ignored fields |
+| `sse_events` | arbitrary event streams and constructed events; dispatch, ID state, EOF discard, block limits, codec contracts and decode/write round trips | `stdlib::sse`: bounded event assembly and strict event writing |
 | `stun` | TCP streams, UDP datagrams, standalone attributes, and constructed messages | `stun`: chunking and EOF, exact raw frame spans, strict attribute writes, canonical padding and fingerprints, Binding replies, and transaction IDs |
 | `syslog` | bytes and constructed values, checked with codec contracts | `stdlib::syslog`: Syslog |
 | `tds` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::tds`: SQL Server TDS |

@@ -508,7 +508,7 @@ fn lines_crlf_policy_limits_and_partial_eof() {
 }
 #[test]
 fn lines_partition_invariance_and_scan_cursor() {
-    for ending in [Ending::Crlf, Ending::LfOrCrlf] {
+    for ending in [Ending::Crlf, Ending::LfOrCrlf, Ending::LfOrCrOrCrlf] {
         for data in [
             &b"abc\r\nx\n\n123456789\r\nok\r\npartial"[..],
             b"abcd\n",
@@ -528,6 +528,49 @@ fn lines_partition_invariance_and_scan_cursor() {
     assert!(s.next().is_none());
     assert_eq!(s.push(b"\n"), 1);
     assert_eq!(s.next(), Some(Ok(Ok(b"abc".to_vec()))));
+}
+#[test]
+fn lines_cr_lf_and_crlf() {
+    let ending = Ending::LfOrCrOrCrlf;
+    assert_eq!(
+        read_lines(b"a\rb\nc\r\n\r\n\rx\r", 1, ending),
+        vec![
+            Ok(b"a".to_vec()),
+            Ok(b"b".to_vec()),
+            Ok(b"c".to_vec()),
+            Ok(vec![]),
+            Ok(vec![]),
+            Ok(b"x".to_vec())
+        ]
+    );
+    for max in 0..=4 {
+        for data in [
+            &b"ab\r\nx\ry\n\r\r\nlast"[..],
+            b"abcd\r\nx\r",
+            b"abcd\r",
+            b"abcdef\r\n\rx\n",
+            b"a\r\r\nb\r\nc\n",
+            b"\r",
+            b"\r\n",
+        ] {
+            contract::check_decode(|| Lines::new(max, ending), data);
+        }
+    }
+    assert_eq!(
+        read_lines(b"abcdef\r\nx\r", 1, ending),
+        vec![Err(LineError::TooLong { max: 1 }), Ok(b"x".to_vec())]
+    );
+    let mut stream = Stream::new(Lines::new(3, ending));
+    assert_eq!(stream.push(b"abc\r"), 4);
+    assert!(stream.next().is_none());
+    assert_eq!(stream.push(b"\n"), 1);
+    assert_eq!(stream.next(), Some(Ok(Ok(b"abc".to_vec()))));
+    assert_eq!(stream.offset(), 5);
+    assert_eq!(stream.push(b"x\r"), 2);
+    assert!(stream.next().is_none());
+    stream.end();
+    assert_eq!(stream.next(), Some(Ok(Ok(b"x".to_vec()))));
+    assert!(stream.next().is_none());
 }
 fn fragments(item: Vec<u8>) -> Fragment<Vec<u8>> {
     match item.first() {

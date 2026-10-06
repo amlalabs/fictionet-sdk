@@ -104,6 +104,9 @@ pub enum Ending {
     Crlf,
     /// LF, optionally preceded by CR.
     LfOrCrlf,
+    /// LF, CR, or CR followed by LF. A final CR waits for one more byte
+    /// or EOF so a split CRLF remains one terminator.
+    LfOrCrOrCrlf,
 }
 /// Why one line was refused. Framing continues after the refused line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,8 +133,8 @@ impl fmt::Display for LineError {
 impl Error for LineError {}
 
 /// Incremental line framing with a content limit and an ending policy.
-/// Overlong lines produce one error item, then skips through their LF.
-/// The scan cursor visits each input byte only once.
+/// Overlong lines produce one error item, then skip through their terminator.
+/// The scan cursor keeps work linear, including split terminators.
 pub struct Lines {
     max: usize,
     ending: Ending,
@@ -160,9 +163,20 @@ impl Decode for Lines {
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Infallible> {
         if self.skipping {
             self.scanned = 0;
-            if let Some(i) = input.iter().position(|b| *b == b'\n') {
+            if let Some(i) = input.iter().position(|b| {
+                *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r')
+            }) {
+                let mut n = i.saturating_add(1);
+                if self.ending == Ending::LfOrCrOrCrlf && input.get(i) == Some(&b'\r') {
+                    if n == input.len() && !eof {
+                        return Ok(if i == 0 { Step::Need } else { Step::Skip(i) });
+                    }
+                    if input.get(n) == Some(&b'\n') {
+                        n = n.saturating_add(1);
+                    }
+                }
                 self.skipping = false;
-                return Ok(Step::Skip(i.saturating_add(1)));
+                return Ok(Step::Skip(n));
             }
             return Ok(if input.is_empty() {
                 Step::Need
@@ -178,10 +192,28 @@ impl Decode for Lines {
             .get(scan..stop)
             .unwrap_or_default()
             .iter()
-            .position(|b| *b == b'\n')
+            .position(|b| {
+                *b == b'\n' || (self.ending == Ending::LfOrCrOrCrlf && *b == b'\r')
+            })
             .map(|i| scan.saturating_add(i));
         if let Some(i) = newline {
-            let cr = i.checked_sub(1).and_then(|p| input.get(p)) == Some(&b'\r');
+            let any_cr = self.ending == Ending::LfOrCrOrCrlf;
+            let mut n = i.saturating_add(1);
+            if any_cr && input.get(i) == Some(&b'\r') {
+                if n == input.len() && !eof {
+                    self.scanned = i;
+                    if i <= self.max {
+                        return Ok(Step::Need);
+                    }
+                    self.scanned = 0;
+                    self.skipping = true;
+                    return Ok(Step::Item(Err(LineError::TooLong { max: self.max }), i));
+                }
+                if input.get(n) == Some(&b'\n') {
+                    n = n.saturating_add(1);
+                }
+            }
+            let cr = !any_cr && i.checked_sub(1).and_then(|p| input.get(p)) == Some(&b'\r');
             let content = i.saturating_sub(usize::from(cr));
             self.scanned = 0;
             let line = if content > self.max {
@@ -191,7 +223,7 @@ impl Decode for Lines {
             } else {
                 Ok(input.get(..content).unwrap_or_default().to_vec())
             };
-            return Ok(Step::Item(line, i.saturating_add(1)));
+            return Ok(Step::Item(line, n));
         }
         self.scanned = stop;
         if stop >= self.capacity() {

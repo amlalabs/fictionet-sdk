@@ -161,6 +161,8 @@ macro_rules! protocols {
         pub mod spnego;
         #[path = "../src/stdlib/ssh.rs"]
         pub mod ssh;
+        #[path = "../src/stdlib/sse.rs"]
+        pub mod sse;
         #[path = "../src/stdlib/stun.rs"]
         pub mod stun;
         #[path = "../src/stdlib/syslog.rs"]
@@ -247,4 +249,17 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     finish(&mut stream, |item| requests.push(item)).unwrap();
     assert_eq!(requests, [Ok(request)]);
     assert!(stream.is_done());
+}
+
+#[test]
+fn copied_sse_uses_public_lines_and_wire() {
+    let event = sse::Event::new("first\nsecond");
+    let bytes = event.to_bytes().unwrap();
+    let mut stream = Stream::new(sse::Events::default());
+    let mut events = Vec::new();
+    for chunk in bytes.chunks(1) {
+        pump(&mut stream, chunk, |event| events.push(event)).unwrap();
+    }
+    finish(&mut stream, |event| events.push(event)).unwrap();
+    assert_eq!(events, [event]);
 }
