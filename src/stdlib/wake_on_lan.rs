@@ -19,24 +19,22 @@
 //! Nothing here reads a socket. A world that plays a sleeping host passes
 //! each payload it receives to [`wakes`] with the host's MAC address and
 //! password, and wakes the host when that returns true. A world that plays
-//! a tool or a router reads payloads with [`MagicPacket::parse`] or
-//! [`MagicPacket::find`], or feeds them in pieces to a [`Scanner`], and
-//! writes packets with [`MagicPacket::to_bytes`].
+//! a tool or a router reads exact packets with [`MagicPacket::parse`],
+//! searches payloads with [`MagicPacket::find`], or uses
+//! [`Stream<Packets>`](super::codec::Stream) for a payload ending at EOF,
+//! and writes packets with [`MagicPacket::write`].
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A payload longer than [`MAX_PAYLOAD`] is refused. What the
 //! writer produces, the reader reads back the same.
 //!
-//! New stacks use [`Packets`] with [`codec::Stream`] for one datagram
-//! ending at EOF. [`Wire`] for [`MagicPacket`] reads exactly one packet
-//! at offset zero. The inherent parsers still search the payload.
-//!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::wake_on_lan::{wakes, MagicPacket, Password, PACKET_LEN, PORT};
 //!
 //! let mac = [0x00, 0x11, 0x22, 0x33, 0x44, 0x55];
 //! let packet = MagicPacket::new(mac);
-//! let bytes = packet.to_bytes();
+//! let bytes = packet.to_bytes().unwrap();
 //! assert_eq!(bytes.len(), PACKET_LEN);
 //! assert_eq!(&bytes[..6], &[0xff; 6]);
 //! assert_eq!(&bytes[6..12], &mac);
@@ -52,7 +50,7 @@
 //! // A host with a SecureOn password wakes only when the password follows.
 //! let password = Password::Four([1, 2, 3, 4]);
 //! assert!(!wakes(&bytes, mac, Some(&password)));
-//! let locked = MagicPacket::with_password(mac, password).to_bytes();
+//! let locked = MagicPacket::with_password(mac, password).to_bytes().unwrap();
 //! assert!(wakes(&locked, mac, Some(&password)));
 //! // A host with no password ignores the bytes that follow.
 //! assert!(wakes(&locked, mac, None));
@@ -204,21 +202,6 @@ impl MagicPacket {
         false
     }
 
-    /// The packet's bytes: the sync stream, sixteen repeats of the address,
-    /// then the password, if there is one. A payload of exactly these bytes
-    /// reads back as this packet.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.len());
-        out.extend_from_slice(&[SYNC; SYNC_LEN]);
-        for _ in 0..REPEATS {
-            out.extend_from_slice(&self.mac);
-        }
-        if let Some(p) = &self.password {
-            out.extend_from_slice(p.as_bytes());
-        }
-        out
-    }
-
     /// The first magic packet in `payload`, and the offset its sync stream
     /// starts at.
     ///
@@ -245,12 +228,6 @@ impl MagicPacket {
                 password: Password::from_bytes(rest),
             },
         ))
-    }
-
-    /// The first magic packet in `payload`, as [`MagicPacket::find`] reads
-    /// it, without its offset.
-    pub fn parse(payload: &[u8]) -> Result<MagicPacket, ParseError> {
-        MagicPacket::find(payload).map(|(_, p)| p)
     }
 }
 
@@ -279,7 +256,7 @@ impl Wire for MagicPacket {
     type WriteError = core::convert::Infallible;
 
     /// Reads one packet at offset zero, with an optional 4 or 6 byte password.
-    /// The inherent parser still searches an entire payload.
+    /// Refuses any other length, invalid sync bytes, or unequal address repeats.
     fn parse(bytes: &[u8]) -> Result<Self, PacketError> {
         let tail = bytes.get(PACKET_LEN..).ok_or(PacketError::Length)?;
         let password = if tail.is_empty() {
@@ -291,9 +268,16 @@ impl Wire for MagicPacket {
         Ok(Self { mac, password })
     }
 
-    /// Appends at most [`MAX_PACKET_LEN`] bytes. Every packet is representable.
+    /// Appends the sync stream, sixteen address repeats, and any password.
+    /// Produces at most [`MAX_PACKET_LEN`] bytes. No packet value is refused.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
-        out.extend_from_slice(&self.to_bytes());
+        out.extend_from_slice(&[SYNC; SYNC_LEN]);
+        for _ in 0..REPEATS {
+            out.extend_from_slice(&self.mac);
+        }
+        if let Some(password) = &self.password {
+            out.extend_from_slice(password.as_bytes());
+        }
         Ok(())
     }
 }
@@ -370,136 +354,26 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
     })
 }
 
-/// Reads one payload handed over in pieces, as a card scans a frame while
-/// it arrives. It holds at most [`PACKET_LEN`] bytes of the payload at a
-/// time, and gives the same answer as [`MagicPacket::find`] would on the
-/// whole payload.
-/// This compatibility type retains its early [`Scanner::found`] result
-/// and repeated [`Scanner::finish`] calls. Use [`Packets`] with
-/// [`codec::Stream`] for the EOF-driven interface.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[deprecated(note = "use codec::Stream with wake_on_lan::Packets for one payload ending at EOF")]
-pub struct Scanner {
-    /// How many bytes of the payload have been fed, up to one past
-    /// [`MAX_PAYLOAD`].
-    seen: usize,
-    /// The last bytes fed, until a packet is found.
-    window: [u8; PACKET_LEN],
-    /// How many bytes of `window` are filled.
-    filled: usize,
-    /// The offset and address of the first packet, once one is found.
-    found: Option<(usize, Mac)>,
-    /// The first bytes after the packet.
-    tail: [u8; MAX_PASSWORD],
-    /// How many bytes followed the packet, up to one past [`MAX_PASSWORD`].
-    tail_len: usize,
-}
-
-#[allow(deprecated)]
-impl Default for Scanner {
-    fn default() -> Self {
-        Scanner::new()
-    }
-}
-
-#[allow(deprecated)]
-impl Scanner {
-    /// A scanner at the start of a payload.
-    pub fn new() -> Scanner {
-        Scanner {
-            seen: 0,
-            window: [0; PACKET_LEN],
-            filled: 0,
-            found: None,
-            tail: [0; MAX_PASSWORD],
-            tail_len: 0,
-        }
-    }
-
-    /// Reads the next bytes of the payload. Bytes past [`MAX_PAYLOAD`] are
-    /// counted but not read, and make [`Scanner::finish`] refuse the
-    /// payload.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if self.seen > MAX_PAYLOAD {
-                return;
-            }
-            self.seen = self.seen.saturating_add(1);
-            if self.seen > MAX_PAYLOAD {
-                return;
-            }
-            if self.found.is_some() {
-                if let Some(slot) = self.tail.get_mut(self.tail_len) {
-                    *slot = b;
-                }
-                self.tail_len = self.tail_len.saturating_add(1).min(MAX_PASSWORD + 1);
-                continue;
-            }
-            if self.filled == PACKET_LEN {
-                self.window.copy_within(1.., 0);
-                self.window[PACKET_LEN - 1] = b;
-            } else {
-                self.window[self.filled] = b;
-                self.filled += 1;
-            }
-            if let Some(mac) = packet_at(&self.window[..self.filled]) {
-                self.found = Some((self.seen.saturating_sub(PACKET_LEN), mac));
-            }
-        }
-    }
-
-    /// How many bytes have been fed, counting at most one past
-    /// [`MAX_PAYLOAD`].
-    pub fn seen(&self) -> usize {
-        self.seen
-    }
-
-    /// The offset and address of the first packet, as soon as its last
-    /// repeat has been fed. Its password, if any, is known only at the end.
-    pub fn found(&self) -> Option<(usize, Mac)> {
-        if self.seen > MAX_PAYLOAD {
-            None
-        } else {
-            self.found
-        }
-    }
-
-    /// The first packet in everything fed, and its offset, read as
-    /// [`MagicPacket::find`] reads a whole payload.
-    pub fn finish(&self) -> Result<(usize, MagicPacket), ParseError> {
-        if self.seen > MAX_PAYLOAD {
-            return Err(ParseError::TooLong);
-        }
-        let (offset, mac) = self.found.ok_or(ParseError::NotFound)?;
-        let password = self
-            .tail
-            .get(..self.tail_len)
-            .and_then(Password::from_bytes);
-        Ok((offset, MagicPacket { mac, password }))
-    }
-}
-
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+    use codec::{
+        Stream, contract,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
-    fn scan(payload: &[u8], piece: usize) -> Result<(usize, MagicPacket), ParseError> {
-        let mut s = Scanner::new();
-        for chunk in payload.chunks(piece.max(1)) {
-            s.feed(chunk);
-        }
-        s.finish()
-    }
-
-    fn check_all_ways(payload: &[u8]) -> Result<(usize, MagicPacket), ParseError> {
+    fn check_payload(payload: &[u8]) -> Result<(usize, MagicPacket), ParseError> {
+        // Adapter consistency only: Packets delegates to find at EOF.
         let whole = MagicPacket::find(payload);
-        assert_eq!(scan(payload, payload.len()), whole);
-        assert_eq!(scan(payload, 1), whole);
-        assert_eq!(scan(payload, 7), whole);
-        assert_eq!(MagicPacket::parse(payload), whole.map(|(_, p)| p));
+        let expected = match whole {
+            Ok(packet) => (vec![packet], None),
+            Err(error) => (vec![], Some(codec::Fail::Protocol(error))),
+        };
+        assert_eq!(decode_all(Packets::new, payload), expected);
+        contract::check_decode_with_alloc_limit(Packets::new, payload, 2 * (MAX_PAYLOAD + 1));
+        contract::check_wire::<MagicPacket>(payload);
         whole
     }
 
@@ -517,7 +391,7 @@ mod tests {
             frame.extend_from_slice(&MAC);
         }
         frame.extend_from_slice(&[0xaa, 0xbb, 0xcc]); // more data
-        assert_eq!(check_all_ways(&frame), Ok((17, MagicPacket::new(MAC))));
+        assert_eq!(check_payload(&frame), Ok((17, MagicPacket::new(MAC))));
         assert!(wakes(&frame, MAC, None));
         assert!(!wakes(&frame, [0x11, 0x22, 0x33, 0x44, 0x55, 0x67], None));
     }
@@ -544,10 +418,10 @@ mod tests {
             MagicPacket::with_password([0; 6], Password::Six([0; 6])),
         ];
         for p in cases {
-            let bytes = p.to_bytes();
+            let bytes = p.to_bytes().unwrap();
             assert_eq!(bytes.len(), p.len());
             assert!(!p.is_empty());
-            assert_eq!(check_all_ways(&bytes), Ok((0, p)));
+            assert_eq!(check_payload(&bytes), Ok((0, p)));
             assert!(wakes(&bytes, p.mac, p.password.as_ref()));
             assert!(wakes(&bytes, p.mac, None));
         }
@@ -571,7 +445,7 @@ mod tests {
 
     #[test]
     fn trailing_bytes_other_than_four_or_six_are_not_a_password() {
-        let base = MagicPacket::new(MAC).to_bytes();
+        let base = MagicPacket::new(MAC).to_bytes().unwrap();
         for n in 0..20 {
             let mut p = base.clone();
             p.extend((0..n).map(|i| i as u8));
@@ -581,7 +455,7 @@ mod tests {
                 _ => None,
             };
             assert_eq!(
-                check_all_ways(&p),
+                check_payload(&p),
                 Ok((
                     0,
                     MagicPacket {
@@ -595,19 +469,19 @@ mod tests {
 
     #[test]
     fn error_not_found() {
-        assert_eq!(check_all_ways(&[]), Err(ParseError::NotFound));
-        assert_eq!(check_all_ways(&[0xff; 6]), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&[]), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&[0xff; 6]), Err(ParseError::NotFound));
         // One repeat wrong.
-        let mut p = MagicPacket::new(MAC).to_bytes();
+        let mut p = MagicPacket::new(MAC).to_bytes().unwrap();
         p[50] ^= 1;
-        assert_eq!(check_all_ways(&p), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&p), Err(ParseError::NotFound));
         // A sync byte wrong.
-        let mut p = MagicPacket::new(MAC).to_bytes();
+        let mut p = MagicPacket::new(MAC).to_bytes().unwrap();
         p[3] = 0xfe;
-        assert_eq!(check_all_ways(&p), Err(ParseError::NotFound));
+        assert_eq!(check_payload(&p), Err(ParseError::NotFound));
         // Only fifteen repeats.
-        let p = &MagicPacket::new(MAC).to_bytes()[..96];
-        assert_eq!(check_all_ways(p), Err(ParseError::NotFound));
+        let p = &MagicPacket::new(MAC).to_bytes().unwrap()[..96];
+        assert_eq!(check_payload(p), Err(ParseError::NotFound));
         assert!(!wakes(p, MAC, None));
         assert_eq!(
             ParseError::NotFound.to_string(),
@@ -618,23 +492,28 @@ mod tests {
     #[test]
     fn error_too_long() {
         let mut p = vec![0u8; MAX_PAYLOAD - PACKET_LEN];
-        p.extend_from_slice(&MagicPacket::new(MAC).to_bytes());
+        p.extend_from_slice(&MagicPacket::new(MAC).to_bytes().unwrap());
         assert_eq!(p.len(), MAX_PAYLOAD);
         assert_eq!(
-            check_all_ways(&p),
+            check_payload(&p),
             Ok((MAX_PAYLOAD - PACKET_LEN, MagicPacket::new(MAC)))
         );
         assert!(wakes(&p, MAC, None));
         p.push(0);
-        assert_eq!(check_all_ways(&p), Err(ParseError::TooLong));
+        assert_eq!(check_payload(&p), Err(ParseError::TooLong));
         assert!(!wakes(&p, MAC, None));
-        let mut s = Scanner::new();
-        s.feed(&p);
-        assert_eq!(s.found(), None);
-        assert_eq!(s.seen(), MAX_PAYLOAD + 1);
-        s.feed(&p);
-        assert_eq!(s.seen(), MAX_PAYLOAD + 1);
-        assert_eq!(s.finish(), Err(ParseError::TooLong));
+        let mut s = Stream::new(Packets::new());
+        assert_eq!(s.push(&p), MAX_PAYLOAD + 1);
+        assert_eq!(
+            s.next(),
+            Some(Err(codec::Fail::Protocol(ParseError::TooLong)))
+        );
+        assert_eq!(s.push(&p), p.len());
+        assert_eq!(s.next(), None);
+        assert_eq!(
+            s.failed(),
+            Some(&codec::Fail::Protocol(ParseError::TooLong))
+        );
         assert!(ParseError::TooLong.to_string().contains("65535"));
     }
 
@@ -645,10 +524,10 @@ mod tests {
             MagicPacket::with_password(MAC, Password::Four([7, 8, 9, 10])),
             MagicPacket::with_password(MAC, Password::Six([7, 8, 9, 10, 11, 12])),
         ] {
-            let bytes = p.to_bytes();
+            let bytes = p.to_bytes().unwrap();
             for n in 0..bytes.len() {
                 let prefix = &bytes[..n];
-                let got = check_all_ways(prefix);
+                let got = check_payload(prefix);
                 if n < PACKET_LEN {
                     assert_eq!(got, Err(ParseError::NotFound), "prefix {n}");
                     assert!(!wakes(prefix, MAC, None));
@@ -672,13 +551,15 @@ mod tests {
     #[test]
     fn first_packet_wins_and_wakes_checks_every_one() {
         let other = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0x01];
-        let mut p = MagicPacket::new(other).to_bytes();
+        let mut p = MagicPacket::new(other).to_bytes().unwrap();
         p.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7]);
         p.extend_from_slice(
-            &MagicPacket::with_password(MAC, Password::Four([9, 9, 9, 9])).to_bytes(),
+            &MagicPacket::with_password(MAC, Password::Four([9, 9, 9, 9]))
+                .to_bytes()
+                .unwrap(),
         );
         p.extend_from_slice(&[0, 0, 0]);
-        assert_eq!(check_all_ways(&p), Ok((0, MagicPacket::new(other))));
+        assert_eq!(check_payload(&p), Ok((0, MagicPacket::new(other))));
         assert!(wakes(&p, other, None));
         assert!(wakes(&p, MAC, None));
         // The password after the second packet is checked though data
@@ -695,7 +576,7 @@ mod tests {
             Password::Four([1, 2, 3, 4]),
             Password::Six([1, 2, 3, 4, 5, 6]),
         ] {
-            let bytes = MagicPacket::with_password(MAC, sent).to_bytes();
+            let bytes = MagicPacket::with_password(MAC, sent).to_bytes().unwrap();
             assert!(wakes(&bytes, MAC, Some(&sent)));
             for i in 0..sent.as_bytes().len() {
                 let mut wrong = sent.as_bytes().to_vec();
@@ -710,29 +591,27 @@ mod tests {
     fn long_runs_of_ff() {
         // Extra 0xFF bytes before the sync stream move the packet on.
         let mut p = vec![0xff; 3];
-        p.extend_from_slice(&MagicPacket::new(MAC).to_bytes());
-        assert_eq!(check_all_ways(&p), Ok((3, MagicPacket::new(MAC))));
+        p.extend_from_slice(&MagicPacket::new(MAC).to_bytes().unwrap());
+        assert_eq!(check_payload(&p), Ok((3, MagicPacket::new(MAC))));
         // A run of 110 0xFF bytes is a packet for ff:ff:ff:ff:ff:ff at
         // offset 0, followed by 8 bytes: no password.
         let p = vec![0xff; 110];
-        assert_eq!(check_all_ways(&p), Ok((0, MagicPacket::new([0xff; 6]))));
+        assert_eq!(check_payload(&p), Ok((0, MagicPacket::new([0xff; 6]))));
         assert!(wakes(&p, [0xff; 6], Some(&Password::Six([0xff; 6]))));
     }
 
     #[test]
-    fn scanner_reports_found_early() {
-        let bytes = MagicPacket::with_password(MAC, Password::Six([1; 6])).to_bytes();
-        let mut s = Scanner::default();
-        for (i, b) in bytes.iter().enumerate() {
-            assert_eq!(s.found().is_some(), i >= PACKET_LEN);
-            s.feed(&[*b]);
-        }
-        assert_eq!(s.found(), Some((0, MAC)));
-        assert_eq!(s.seen(), MAX_PACKET_LEN);
-        assert_eq!(
-            s.finish(),
-            Ok((0, MagicPacket::with_password(MAC, Password::Six([1; 6]))))
-        );
+    fn packet_waits_for_password_at_eof() {
+        let packet = MagicPacket::with_password(MAC, Password::Six([1; 6]));
+        let bytes = packet.to_bytes().unwrap();
+        let mut s = Stream::new(Packets::new());
+        assert_eq!(s.push(&bytes[..PACKET_LEN]), PACKET_LEN);
+        assert_eq!(s.next(), None);
+        assert_eq!(s.push(&bytes[PACKET_LEN..]), MAX_PASSWORD);
+        assert_eq!(s.next(), None);
+        s.end();
+        assert_eq!(s.next(), Some(Ok((0, packet))));
+        assert_eq!(s.next(), None);
     }
 
     /// The largest payload, all 0xFF bytes, holds a packet at every offset.
@@ -741,64 +620,39 @@ mod tests {
     fn largest_payload_of_ff() {
         let p = vec![0xff; MAX_PAYLOAD];
         let ff = MagicPacket::new([0xff; 6]);
-        assert_eq!(check_all_ways(&p), Ok((0, ff)));
+        assert_eq!(check_payload(&p), Ok((0, ff)));
         assert!(wakes(&p, [0xff; 6], Some(&Password::Six([0xff; 6]))));
         assert!(!wakes(&p, MAC, None));
-        // Pieces fed after the limit is passed change nothing.
-        let mut s = Scanner::new();
-        s.feed(&p);
-        let before = s.clone();
-        assert_eq!(s.finish(), Ok((0, ff)));
-        s.feed(&[0xff]);
-        assert_ne!(s, before);
-        let after = s.clone();
-        s.feed(&p);
-        assert_eq!(s, after);
-        assert_eq!(s.finish(), Err(ParseError::TooLong));
-    }
-
-    /// A small linear congruential generator, so the loop below is the
-    /// same on every run.
-    struct Lcg(u64);
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() as usize) % n.max(1)
-        }
+        let mut over = p;
+        over.push(0xff);
+        assert_eq!(check_payload(&over), Err(ParseError::TooLong));
     }
 
     #[test]
     fn lcg_fuzz() {
-        let mut rng = Lcg(0x5eed);
+        let mut rng = Lcg::new(0x5eed);
         let mut found = 0;
         for round in 0..4000 {
-            let len = rng.below(400);
+            let len = rng.index(400);
             // Bytes from a small alphabet, so sync streams and repeats turn
             // up often.
             let alphabet: [u8; 4] = [0xff, MAC[0], rng.next() as u8, 0];
-            let mut buf: Vec<u8> = (0..len).map(|_| alphabet[rng.below(4)]).collect();
+            let mut buf: Vec<u8> = (0..len).map(|_| alphabet[rng.index(4)]).collect();
             if round % 3 == 0 {
-                let mac: Mac = if rng.below(2) == 0 { MAC } else { [0xff; 6] };
-                let pw = match rng.below(3) {
+                let mac: Mac = if rng.coin() { MAC } else { [0xff; 6] };
+                let pw = match rng.index(3) {
                     0 => None,
                     1 => Some(Password::Four([rng.next() as u8; 4])),
                     _ => Some(Password::Six([rng.next() as u8; 6])),
                 };
-                let at = rng.below(buf.len() + 1);
-                let packet = MagicPacket { mac, password: pw }.to_bytes();
+                let at = rng.index(buf.len() + 1);
+                let packet = MagicPacket { mac, password: pw }.to_bytes().unwrap();
                 buf.splice(at..at, packet);
-                if rng.below(4) == 0 {
-                    let i = rng.below(buf.len());
-                    buf[i] ^= 1 << rng.below(8);
+                if rng.index(4) == 0 {
+                    mutate(&mut rng, &mut buf);
                 }
             }
-            let got = check_all_ways(&buf);
+            let got = check_payload(&buf);
             if let Ok((offset, p)) = got {
                 found += 1;
                 assert!(offset + PACKET_LEN <= buf.len());
@@ -806,7 +660,7 @@ mod tests {
                 assert!(wakes(&buf, p.mac, None));
                 assert!(wakes(&buf, p.mac, p.password.as_ref()));
                 // Written alone, it reads back the same.
-                assert_eq!(MagicPacket::find(&p.to_bytes()), Ok((0, p)));
+                assert_eq!(MagicPacket::find(&p.to_bytes().unwrap()), Ok((0, p)));
                 // No packet starts before it.
                 assert!((0..offset).all(|i| packet_at(&buf[i..]).is_none()));
             } else {
@@ -817,7 +671,7 @@ mod tests {
             // Every prefix gives the same answer all ways too.
             if round % 50 == 0 {
                 for n in 0..buf.len() {
-                    let _ = check_all_ways(&buf[..n]);
+                    let _ = check_payload(&buf[..n]);
                 }
             }
         }

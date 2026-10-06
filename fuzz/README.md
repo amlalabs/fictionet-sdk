@@ -72,11 +72,11 @@ cargo +nightly fuzz list
 | `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
 | `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
 | `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
-| `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
+| `resp` | arbitrary bytes, bounded stream contracts, and strict value and command writers | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | exact wire values, session modes and bounded codec contracts | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
 | `rtp` | datagrams, RFC 4571 streams, strict values, and codec contracts | `stdlib::rtp`: RTP and multiplexed RTCP |
 | `rtsp` | message streams, interleaved frames, header values, and constructed messages | `stdlib::rtsp`: strict wire values and bounded codec contracts |
-| `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
+| `sdp` | arbitrary bodies, bounded EOF decoding, strict writing, and typed attributes | `stdlib::sdp`: SDP |
 | `sftp` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::sftp`: SFTP version 3 |
 | `sip` | message streams, UDP datagrams, header values, and constructed values | `stdlib::sip`: strict wire values and bounded codec contracts |
 | `snmp` | BER messages, object identifiers, strict values, and codec contracts | `stdlib::snmp`: SNMP v1 and v2c |
@@ -98,6 +98,7 @@ cargo +nightly fuzz list
 | `x509` | DER certificates, CRLs, extensions, and PEM bundles; checks signed-byte preservation, text framing, limits, and constructed writes | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | wire values and streams checked with bounded codec contracts | `stdlib::xml`: XML 1.0 |
 | `zabbix` | arbitrary bytes and constructed values | `stdlib::zabbix`: exact headers, packets, JSON messages, and bounded codec contracts |
+| `wake_on_lan` | arbitrary payloads, bounded EOF decoding, exact packet writing, and password checks | `stdlib::wake_on_lan`: Wake-on-LAN |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules
