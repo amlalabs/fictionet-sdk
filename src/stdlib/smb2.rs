@@ -14,7 +14,7 @@
 //! specification, sections 2.1 and 2.2.
 //!
 //! A world that plays a file server pushes connection bytes into a
-//! [`Stream<Frames>`](super::codec::Stream), gets the payload of
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets the payload of
 //! each transport frame back, reads it as a [`Packet`], reads each
 //! [`Message`]'s [`Request`], and writes the bytes of its replies back to
 //! the connection. Which dialects, users, shares and files exist, and what
@@ -69,7 +69,7 @@
 //! assert_eq!(out[..8], [0, 0, 0, 129, 0xfe, b'S', b'M', b'B']);
 //! ```
 
-use crate::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port SMB servers listen on for direct TCP.
 pub const PORT: u16 = 445;
@@ -489,7 +489,7 @@ impl Wire for Frame {
 
 /// Reads direct TCP frames without retaining input.
 ///
-/// Use with [`super::codec::Stream`] for a buffer bounded by the four-byte
+/// Use with [`fictionet::stdlib::codec::Stream`] for a buffer bounded by the four-byte
 /// header plus [`limit`](Self::limit), at most [`MAX_FRAME`]. The header
 /// suffices to refuse a payload above the configured limit.
 /// Partial frames return [`Step::Need`], including at EOF, so the driver
@@ -2981,7 +2981,7 @@ fn le64(b: &[u8], at: usize) -> Result<u64, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     // The byte layouts below are built field by field from MS-SMB2,
     // section 2.2, not with this module's writers.

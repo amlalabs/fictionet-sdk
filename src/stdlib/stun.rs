@@ -19,7 +19,7 @@
 //! Nothing here reads a socket. A world that plays a STUN server takes each
 //! UDP datagram it receives, reads it with [`Message::parse`], passes it and
 //! the datagram's source address to [`answer_binding`], and sends the
-//! reply's bytes back. Over TCP, [`Stream<Frames>`](super::codec::Stream)
+//! reply's bytes back. Over TCP, [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
 //! splits the byte stream into messages. Use [`codec::Stream::with_next`] for each
 //! frame's exact bytes. Integrity values stay as raw bytes. World code
 //! computes HMACs over those original bytes, including their padding.
@@ -61,7 +61,7 @@ use alloc::{
 };
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
-use super::codec::{self, Decode, Step};
+use fictionet::stdlib::codec::{self, Decode, Step};
 
 /// The UDP and TCP port STUN servers listen on.
 pub const PORT: u16 = 3478;
@@ -1172,8 +1172,8 @@ fn be32(b: &[u8], i: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Fail, Stream, Wire, contract, finish, pump, test_support};
+    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::{Fail, Stream, Wire, contract, finish, pump, test_support};
 
     const TID: [u8; 12] = [
         0xb7, 0xe7, 0xa7, 0x01, 0xbc, 0x34, 0xd6, 0x86, 0xfa, 0x87, 0xdf, 0xae,

@@ -14,7 +14,7 @@
 //! and RFC 1002, sections 4.1 and 4.3.
 //!
 //! A world that plays a file server pushes bytes from a TCP connection
-//! into a [`Stream<Frames>`](super::codec::Stream), gets [`Packet`]s
+//! into a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s
 //! back, and writes the bytes of its answers back to the connection. Which
 //! names it listens on, and what it says to a session request, is up to
 //! world code.
@@ -69,7 +69,7 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0x82, 0x00, 0x00, 0x00]);
 //! ```
 
-use crate::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port the session service listens on.
 pub const PORT: u16 = 139;
@@ -449,7 +449,7 @@ impl Wire for Packet {
 
 /// Reads session packets without retaining input.
 ///
-/// Use with [`super::codec::Stream`] for bounded buffering. The header
+/// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The header
 /// suffices to refuse a body above [`limit`](Self::limit). Partial packets
 /// return [`Step::Need`], including at EOF. The driver reports truncation
 /// and reports errors once. All packet errors end this decoder.
@@ -570,7 +570,7 @@ fn parse_limited(b: &[u8], limit: usize) -> Result<Option<(Packet, usize)>, Erro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     /// "FRED" padded with spaces, from RFC 1002, section 4.1.
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";

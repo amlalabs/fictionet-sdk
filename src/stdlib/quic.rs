@@ -78,7 +78,7 @@
 //! assert_eq!(Payload::parse(payload).unwrap().0, [hello, Frame::Padding(10)]);
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 /// The UDP port QUIC servers for HTTP/3 listen on.
 pub const PORT: u16 = 443;
@@ -1835,7 +1835,7 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         contract,
         test_support::{Lcg, mutate},
     };

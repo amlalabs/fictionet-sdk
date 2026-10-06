@@ -57,7 +57,6 @@
 //! assert!(!window.accept(0));
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port WireGuard peers usually listen on.

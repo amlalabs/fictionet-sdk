@@ -9,7 +9,7 @@
 //! names the user and carries responses computed from the challenge and
 //! the user's password. The three messages travel inside SMB, HTTP
 //! (`Authorization: NTLM`), RPC, LDAP and others, often wrapped in a
-//! [`spnego`](crate::stdlib::spnego) token. This module follows Microsoft's
+//! [`spnego`](fictionet::stdlib::spnego) token. This module follows Microsoft's
 //! \[MS-NLMP\] section 2.2.
 //!
 //! Nothing here reads a socket, decodes base64 or computes a hash. A world
@@ -84,7 +84,6 @@
 //! assert_eq!(v2.client.challenge, [9; 8]);
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 /// The 8 bytes every NTLMSSP message starts with.

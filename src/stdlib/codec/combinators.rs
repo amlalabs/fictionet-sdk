@@ -15,10 +15,6 @@ impl<D, F> Map<D, F> {
     pub fn inner(&mut self) -> &mut D {
         &mut self.inner
     }
-    /// Returns the wrapped decoder and closure.
-    pub fn into_parts(self) -> (D, F) {
-        (self.inner, self.f)
-    }
 }
 impl<D: Decode, U, F: FnMut(D::Item) -> U> Decode for Map<D, F> {
     type Item = U;
@@ -280,10 +276,6 @@ impl<D, F> Assemble<D, F> {
             limit: limit.min(Buffer::MAX_LIMIT),
             active: false,
         }
-    }
-    /// Access to the fragment decoder between items.
-    pub fn inner(&mut self) -> &mut D {
-        &mut self.inner
     }
 }
 impl<D: Decode, T, F: FnMut(D::Item) -> Fragment<T>> Decode for Assemble<D, F> {

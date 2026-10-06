@@ -246,6 +246,22 @@ impl Frame {
         self.pdu.first().copied()
     }
 
+    // CUSTOM EDIT: serve holding register 42 with the planted value 0xc0de.
+    /// Answers a read of register 42; other requests get a protocol exception.
+    pub fn planted_reply(&self) -> Result<Frame, EncodeError> {
+        let pdu = match Request::parse(&self.pdu) {
+            Ok(Request::ReadHoldingRegisters { address: 42, quantity: 1 }) => {
+                Response::Registers(vec![0xc0de]).to_pdu(function::READ_HOLDING_REGISTERS)?
+            }
+            Ok(Request::ReadHoldingRegisters { .. }) => {
+                Exception::IllegalDataAddress.to_pdu(function::READ_HOLDING_REGISTERS)
+            }
+            Ok(other) => Exception::IllegalFunction.to_pdu(other.function()),
+            Err(error) => error.to_pdu(self.function().unwrap_or(0)),
+        };
+        Ok(self.reply(pdu))
+    }
+
     /// A frame that answers this one with `pdu`, with the same transaction
     /// and unit.
     pub fn reply(&self, pdu: Vec<u8>) -> Frame {

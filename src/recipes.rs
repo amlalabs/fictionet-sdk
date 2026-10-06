@@ -6,6 +6,12 @@
 //! websites running, as in [`getting_started`](crate::getting_started),
 //! and want to change the network the agent sees.
 //!
+//! To change a protocol, copy its module file from `src/stdlib/` into your
+//! crate, edit it, and plug it into [`Stream`](crate::stdlib::codec::Stream)
+//! through the public codec traits. Keep its `fictionet::stdlib::...` imports.
+//! `cargo run --example custom_protocol` reads a planted Modbus register
+//! through a copied module. This example needs no network or root.
+//!
 //! # Putting something in front of every sandbox
 //!
 //! [`web::Sites::serve`](crate::stdlib::web::Sites::serve) takes the

@@ -12,8 +12,8 @@
 //! sections 5 and 7.2.
 //!
 //! Nothing here reads a socket or touches a key. A world that plays a KDC
-//! pushes the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection
-//! to a [`Stream<Frames>`](super::codec::Stream), or takes a UDP datagram as it is, and reads each
+//! pushes the bytes it reads from a [`tcp`](fictionet::stdlib::tcp) connection
+//! to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or takes a UDP datagram as it is, and reads each
 //! message with [`Message::parse`]. It writes the reply with
 //! [`Wire::write`], with a [`Frame`] around its DER for TCP. The parts
 //! that are encrypted (the ticket's secrets, the reply's session key, the
@@ -90,8 +90,8 @@
 //! assert_eq!(reply.msg_type(), msg_type::KRB_ERROR);
 //! ```
 
-use super::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use std::fmt;
 
 /// The port KDCs listen on, over UDP and TCP.
@@ -1218,7 +1218,7 @@ impl Wire for Message {
 
 /// One TCP record's payload, bounded by [`MAX_MESSAGE`].
 ///
-/// [`super::codec::Wire`] reads exactly one length-prefixed record and
+/// [`fictionet::stdlib::codec::Wire`] reads exactly one length-prefixed record and
 /// writes the prefix and payload. The payload is not interpreted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame(
@@ -1278,11 +1278,11 @@ impl Wire for Frame {
 
 /// Reads Kerberos TCP records without holding input bytes.
 ///
-/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
+/// Use with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) for a buffer limited to
 /// [`TCP_HEADER_LEN`] plus the configured message limit. The four-byte prefix
 /// suffices to refuse reserved bits and oversized messages. Map each
 /// payload through [`Message::parse`] to interpret it. Partial records
-/// return [`super::codec::Step::Need`], including at EOF. The stream
+/// return [`fictionet::stdlib::codec::Step::Need`], including at EOF. The stream
 /// reports truncation at EOF and framing errors once.
 #[derive(Clone, Copy, Debug)]
 pub struct Frames {
@@ -1616,7 +1616,7 @@ impl Wire for MethodData {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, finish as finish_stream, pump,
         test_support::{Lcg, chunks, decode_all, mutate},
     };
@@ -2393,7 +2393,7 @@ mod tests {
 
     #[test]
     fn codec_frames_bound_input_and_keep_empty_records() {
-        use super::super::codec::{Decode, Fail, Stream, Wire, contract};
+        use fictionet::stdlib::codec::{Decode, Fail, Stream, Wire, contract};
         assert_eq!(Frames::new().capacity(), TCP_HEADER_LEN + MAX_MESSAGE);
         let frame = Frame(vec![9; MAX_MESSAGE]);
         let bytes = <Frame as Wire>::to_bytes(&frame).unwrap();
@@ -2410,7 +2410,7 @@ mod tests {
 
     #[test]
     fn codec_writers_are_exact_and_transactional() {
-        use super::super::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire, contract};
         for message in all_messages() {
             contract::check_wire_value(&message);
             contract::check_wire::<Message>(&message.to_bytes().unwrap());
@@ -2432,7 +2432,7 @@ mod tests {
 
     #[test]
     fn codec_wire_parse_refuses_reencoding_past_the_limit() {
-        use super::super::codec::Wire;
+        use fictionet::stdlib::codec::Wire;
         let build = |cipher_len| {
             let mut w = Writer::new();
             w.constructed(Tag::application(15), |w| {

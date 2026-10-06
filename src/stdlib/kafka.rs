@@ -12,7 +12,7 @@
 //! definitions in Kafka's source.
 //!
 //! Nothing here reads a socket. A world that plays a broker passes TCP
-//! bytes to [`Stream<Frames>`](super::codec::Stream), gets each frame's
+//! bytes to [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets each frame's
 //! payload back, reads it
 //! with [`Request::parse`], and writes the reply from
 //! [`Response::to_frame`] back to the connection. Which topics exist,
@@ -69,7 +69,7 @@
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 /// The TCP port Kafka brokers listen on.
@@ -1136,7 +1136,7 @@ impl Wire for Frame {
 
 /// Reads Kafka frames without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for input bounded by [`SIZE_LEN`] plus
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`SIZE_LEN`] plus
 /// [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once. Map frames
 /// through [`Request::parse`] to receive body errors as items.
@@ -2176,7 +2176,7 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     enum BodyCase {
         Request(Request),

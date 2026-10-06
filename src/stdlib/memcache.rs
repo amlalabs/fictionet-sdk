@@ -14,11 +14,11 @@
 //! repository and the binary protocol pages of the memcached wiki.
 //!
 //! A world that plays a memcached server pushes TCP bytes into
-//! [`Stream<Commands>`](super::codec::Stream), reads [`Command`] values,
+//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream), reads [`Command`] values,
 //! and writes each [`Response`] back. A client uses
-//! [`Stream<Responses>`](super::codec::Stream). Headers accept CRLF or
+//! [`Stream<Responses>`](fictionet::stdlib::codec::Stream). Headers accept CRLF or
 //! bare LF; counted data blocks require CRLF. Binary connections use
-//! [`Stream<Frames>`](super::codec::Stream). [`UdpFrame`] describes each
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream). [`UdpFrame`] describes each
 //! datagram. Cache contents and expiration belong to world code.
 //!
 //! Every reader checks keys, line lengths, numbers and data lengths,
@@ -72,7 +72,7 @@
 //! assert_eq!(out, b"STORED\r\nVALUE greeting 5 5\r\nhello\r\nEND\r\nERROR\r\n");
 //! ```
 
-use super::codec::{self, Decode, Step, Wire};
+use fictionet::stdlib::codec::{self, Decode, Step, Wire};
 
 /// The port memcached listens on, for both TCP and UDP.
 pub const PORT: u16 = 11211;
@@ -1890,7 +1890,7 @@ fn quiet_command(command: &Command) -> bool {
     )
 }
 
-/// Reads text commands using [`super::codec::Lines`] and counted bodies.
+/// Reads text commands using [`fictionet::stdlib::codec::Lines`] and counted bodies.
 ///
 /// CRLF and bare LF end headers. Data blocks require trailing CRLF.
 /// Ordinary lines use [`MAX_LINE`]; `get` and `gets` use [`MAX_GET_LINE`].
@@ -1962,7 +1962,7 @@ impl Decode for Commands {
     }
 }
 
-/// Reads text replies using [`super::codec::Lines`] and counted bodies.
+/// Reads text replies using [`fictionet::stdlib::codec::Lines`] and counted bodies.
 ///
 /// Headers accept CRLF or bare LF under [`MAX_LINE`]. VALUE and VA bodies
 /// use the parsed count and require trailing CRLF. Invalid lines and data

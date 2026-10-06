@@ -41,7 +41,6 @@
 //! assert_eq!(answer.origin, request.transmit);
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port NTP servers listen on.

@@ -14,7 +14,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a database server
 //! sends a [`Handshake`] inside a [`Message`]. It reads packets with
-//! [`Stream<Frames>`](super::codec::Stream), or uses [`Messages`] in that
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to join split packets and check their sequence IDs. It reads
 //! each payload as a [`HandshakeResponse`] or [`Command`], then builds
 //! reply messages from [`OkPacket`], [`ErrPacket`], or [`ResultSet`].
@@ -71,7 +71,7 @@
 //! assert!(reader.is_done());
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port MySQL servers listen on.
 pub const PORT: u16 = 3306;
@@ -515,7 +515,7 @@ impl Wire for Frame {
 
 /// Reads individual MySQL packets without holding input bytes.
 ///
-/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
 /// by [`HEADER_LEN`] plus [`limit`](Self::limit). Oversized payloads are
 /// refused from the header. Partial packets return [`Step::Need`], including
 /// at EOF, so the stream reports truncation. Sequence IDs are preserved;
@@ -2104,7 +2104,7 @@ impl OkPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, pump, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, test_support::{Lcg, mutate, decode_all}};
 
     const CAPS41: u32 = capability::PROTOCOL_41 | capability::SECURE_CONNECTION | capability::TRANSACTIONS;
     const CAPS_MODERN: u32 = CAPS41

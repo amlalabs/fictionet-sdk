@@ -17,7 +17,7 @@
 //! datagram it receives to [`Message::parse`], answers the [`Pdu`] inside
 //! from its own MIB, and sends the bytes of [`Message::response`] back.
 //! Which objects exist, what they hold, and which communities may read or
-//! write them is up to world code. Over TCP (RFC 3430), [`Stream<Frames>`](super::codec::Stream)
+//! write them is up to world code. Over TCP (RFC 3430), [`Stream<Frames>`](fictionet::stdlib::codec::Stream)
 //! splits the stream into messages first. Body errors are items; invalid
 //! BER envelopes end the stream.
 //!
@@ -61,7 +61,7 @@
 use std::fmt;
 use std::str::FromStr;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP port agents listen on for requests.
 pub const PORT: u16 = 161;
@@ -1542,7 +1542,7 @@ const MAX_BER_HEADER: usize = 128;
 /// 128 bytes to read the longest permitted definite-length header, even
 /// when the configured limit is smaller. The header suffices to refuse
 /// an oversized message before its body arrives. Partial messages return
-/// [`Step::Need`], including at EOF, so [`super::codec::Stream`] reports
+/// [`Step::Need`], including at EOF, so [`fictionet::stdlib::codec::Stream`] reports
 /// truncation. Redundant long-form BER lengths are accepted. Message bodies
 /// must use SNMP v1 or v2c.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1602,7 +1602,7 @@ impl Decode for Frames {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Stream, Fail, pump, contract,
         test_support::{Lcg, mutate, decode_all},
     };

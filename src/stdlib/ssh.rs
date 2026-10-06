@@ -20,8 +20,8 @@
 //! and then decides what to do, for example send DISCONNECT.
 //!
 //! Nothing here reads a socket. A world pushes TCP bytes through
-//! [`Stream<Events>`](super::codec::Stream) for the version exchange and
-//! numbered packets, or [`Stream<Frames>`](super::codec::Stream) after it.
+//! [`Stream<Events>`](fictionet::stdlib::codec::Stream) for the version exchange and
+//! numbered packets, or [`Stream<Frames>`](fictionet::stdlib::codec::Stream) after it.
 //! It reads payloads with [`Message::parse`] and builds replies with
 //! [`Identification::new`] and [`Packet::from_message`]. Which
 //! algorithms the world offers, and what its software line says, is up to
@@ -64,7 +64,7 @@
 //! assert_eq!(Packet::new(vec![21]).to_bytes().unwrap().len(), 16);
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port SSH servers listen on.
 pub const PORT: u16 = 22;
@@ -605,7 +605,7 @@ impl Wire for Packet {
 /// This decoder owns no input. Its capacity is the configured packet
 /// limit, including the length field. Oversized packets are refused from
 /// their four-byte length. Partial packets return [`Step::Need`], including
-/// at EOF, so [`super::codec::Stream`] reports truncation.
+/// at EOF, so [`fictionet::stdlib::codec::Stream`] reports truncation.
 /// Use [`Lines`] or [`Events`] for the bounded version exchange.
 /// Stop using this framer when keys take effect. It performs no encryption
 /// or MAC processing. Payload messages are parsed separately by [`Message::parse`].
@@ -1558,7 +1558,7 @@ fn is_known(n: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         contract, Stream, Fail, pump,
         test_support::{decode_all, chunks, Lcg, mutate},
     };

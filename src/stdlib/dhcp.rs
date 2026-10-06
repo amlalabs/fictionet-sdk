@@ -1,5 +1,5 @@
 //! DHCP messages (RFC 2131 and RFC 2132): reading and writing them, with no
-//! I/O. The DHCP server in [`web::Sites`](crate::stdlib::web::Sites) uses
+//! I/O. The DHCP server in [`web::Sites`](fictionet::stdlib::web::Sites) uses
 //! it, and so does the DHCP server that `fictionet attach --type tap` runs
 //! for a VM.
 //!

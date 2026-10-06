@@ -10,8 +10,8 @@
 //! gitprotocol-v2.
 //!
 //! A world that plays a Git server passes bytes from a
-//! [`tcp`](crate::stdlib::tcp) connection to
-//! [`Stream<Frames>`](super::codec::Stream), reads the client's [`ProtoRequest`],
+//! [`tcp`](fictionet::stdlib::tcp) connection to
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), reads the client's [`ProtoRequest`],
 //! and writes back an
 //! [`Advertisement`] (version 0 or 1) or a [`CapabilityAdvertisement`]
 //! (version 2). It then reads the client's [`V2Request`]s or
@@ -59,7 +59,7 @@
 //! assert!(reply.ends_with(b" HEAD symref-target:refs/heads/main\n0000"));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port `git://` servers listen on.
 pub const PORT: u16 = 9418;
@@ -213,7 +213,7 @@ impl Wire for Packet {
 
 /// Reads Git pkt-lines without holding input bytes.
 ///
-/// Use with [`codec::Stream`](super::codec::Stream) for a buffer limited
+/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer limited
 /// to [`MAX_PACKET`]. Oversized packets are refused from the header.
 /// Partial packets return [`Step::Need`], including at EOF, so the stream
 /// reports truncation. Flush, delimiter, response-end, and empty data
@@ -221,8 +221,8 @@ impl Wire for Packet {
 ///
 /// After the flush that ends a receive-pack command list, raw PACK bytes
 /// may follow. Before reading another item, the world must hand off with
-/// [`Stream::into_parts`](super::codec::Stream::into_parts), or
-/// [`Stream::swap`](super::codec::Stream::swap) to a pack decoder. Both
+/// [`Stream::into_parts`](fictionet::stdlib::codec::Stream::into_parts), or
+/// [`Stream::swap`](fictionet::stdlib::codec::Stream::swap) to a pack decoder. Both
 /// preserve unread bytes; [`Frames`] cannot parse raw PACK data.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
@@ -1599,7 +1599,7 @@ message_wire!(ServiceHeader,
     "Reads one smart HTTP service line followed by a flush. Refuses unknown services and any other packet layout.",
     "Appends the service announcement and flush. Every service value is representable.");
 message_wire!(Advertisement,
-    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns ParseError::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames>`](super::codec::Stream) and use [`Advertisement::from_packets`].",
+    "Reads a version 0 or 1 ref advertisement through its flush. Refuses malformed refs or capabilities, object IDs inconsistent with object-format, and refs after shallow lines. An ERR line returns ParseError::Remote immediately, even before a flush; its text is limited to MAX_TEXT. Each parse starts at the beginning. For incremental input, collect packets with [`Stream<Frames>`](fictionet::stdlib::codec::Stream) and use [`Advertisement::from_packets`].",
     "Appends refs, capabilities, shallow lines, and a flush. Refuses invalid fields, conflicting object formats, a first ref that would become the empty-ref marker, and values beyond the reader limits. SHA-1 is the default object format.");
 message_wire!(CapabilityAdvertisement,
     "Reads version 2 and its capabilities through a flush. Refuses missing version 2 or malformed capabilities. An ERR line returns ParseError::Remote immediately, even before a flush; its text is limited to MAX_TEXT.",
@@ -1644,7 +1644,7 @@ line_wire!(LsRefsArg, LsRef, ClientLine, ServerLine);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     const A: &str = "7217a7c7e582c46cec22a130adf4b9d7d950fba0";
     const B: &str = "1d3fcd5ced445d1abc402225c0b8a1299641f497";

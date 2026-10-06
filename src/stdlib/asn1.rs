@@ -11,7 +11,7 @@
 //! specification, and the character sets and time formats of ITU-T X.680.
 //!
 //! Nothing here reads a socket. A world that plays an LDAP server pushes the
-//! bytes it reads from a connection to a [`Stream<Elements>`](super::codec::Stream),
+//! bytes it reads from a connection to a [`Stream<Elements>`](fictionet::stdlib::codec::Stream),
 //! gets one message's bytes at a time, and walks each one with a [`Reader`]. A world that
 //! checks a certificate reads it with [`Rules::Der`], so any encoding DER
 //! does not allow is refused. Replies are built with a [`Writer`], which
@@ -58,7 +58,7 @@ use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// Encodes `value` and appends the bytes only if `decode` reads the same value.
 ///
@@ -84,7 +84,7 @@ pub fn write_checked<T: PartialEq, E>(
 }
 
 /// The longest element, header and contents together, a reader accepts and
-/// a writer writes. A [`Stream<Elements>`](super::codec::Stream) never holds much more than this.
+/// a writer writes. A [`Stream<Elements>`](fictionet::stdlib::codec::Stream) never holds much more than this.
 pub const MAX_INPUT: usize = 1 << 20;
 /// How deep constructed values may nest. Elements read straight from the
 /// input are at depth 0, their children at depth 1, and so on. A
@@ -651,7 +651,7 @@ fn check_frame(bytes: &[u8]) -> Result<(), Error> {
 
 /// Reads ASN.1 elements without holding input bytes.
 ///
-/// Use with [`Stream<Elements>`](super::codec::Stream) for a buffer limited to [`MAX_INPUT`].
+/// Use with [`Stream<Elements>`](fictionet::stdlib::codec::Stream) for a buffer limited to [`MAX_INPUT`].
 /// Partial elements return [`Step::Need`], including at EOF. The stream
 /// reports truncation at EOF and framing errors once. An indefinite BER
 /// length keeps a scan position relative to the unread start, so pushing
@@ -2196,7 +2196,7 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, chunks, mutate},
     };
@@ -3474,7 +3474,7 @@ mod tests {
 
     #[test]
     fn codec_wire_is_exact_and_transactional() {
-        use super::super::codec::{Wire, contract};
+        use fictionet::stdlib::codec::{Wire, contract};
         for bytes in [&[5, 0][..], &[0x30, 0x80, 5, 0, 0, 0], &[4], &[5, 0, 5, 0]] {
             contract::check_wire::<Frame>(bytes);
             contract::check_wire_value(&Frame(bytes.to_vec()));
@@ -3490,7 +3490,7 @@ mod tests {
 
     #[test]
     fn codec_indefinite_scan_survives_compaction() {
-        use super::super::codec::{Stream, contract};
+        use fictionet::stdlib::codec::{Stream, contract};
         let mut w = Writer::new();
         w.octet_string(&[1; 256]);
         let first = w.finish().unwrap();

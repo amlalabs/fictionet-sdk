@@ -12,7 +12,7 @@
 //! Nothing here reads a socket. A world that plays a device reads each
 //! datagram it gets with [`Message::parse`], looks at its code, path and
 //! options, and sends back the bytes of [`Message::to_bytes`] for the
-//! reply. Over TCP it pushes the bytes it reads to a [`Stream<Frames>`](super::codec::Stream) and gets
+//! reply. Over TCP it pushes the bytes it reads to a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) and gets
 //! [`Frame`]s back. Which resources exist, and what they hold, is up to
 //! world code.
 //!
@@ -53,7 +53,7 @@
 //! assert_eq!(reply.to_bytes().unwrap(), [0x61, 0x45, 0x12, 0x34, 0x77, 0xc0, 0xff, b'2', b'1', b'.', b'5']);
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP and TCP port CoAP servers listen on.
 pub const PORT: u16 = 5683;
@@ -81,7 +81,7 @@ pub const MAX_FRAME_BODY: usize = 1 << 20;
 /// The longest TCP frame header: the length and token-length byte, a
 /// 4-byte extended length, and the code.
 pub const MAX_FRAME_HEADER: usize = 6;
-/// The most bytes a [`Stream<Frames>`](super::codec::Stream) holds: one whole frame of the largest
+/// The most bytes a [`Stream<Frames>`](fictionet::stdlib::codec::Stream) holds: one whole frame of the largest
 /// size.
 pub const MAX_BUFFERED: usize = MAX_FRAME_HEADER + MAX_TOKEN + MAX_FRAME_BODY;
 /// The longest body an [`Assembler`] collects.
@@ -1205,7 +1205,7 @@ impl Wire for Frame {
 
 /// Reads CoAP over TCP frames without retaining input bytes.
 ///
-/// Use with [`super::codec::Stream`] for at most [`MAX_BUFFERED`] unread
+/// Use with [`fictionet::stdlib::codec::Stream`] for at most [`MAX_BUFFERED`] unread
 /// bytes. Header and body errors end the stream.
 /// Partial frames return [`Step::Need`], including at EOF. The driver
 /// reports truncation. UDP datagrams use [`Wire`] on [`Message`] directly.
@@ -1594,7 +1594,7 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, pump,
         test_support::{Lcg, decode_all, mutate},
     };

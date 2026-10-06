@@ -14,11 +14,11 @@
 //! specification in redis-specifications.
 //!
 //! Nothing here reads a socket. A world that plays a Redis server uses
-//! [`Stream<Commands>`](super::codec::Stream) to read requests and
+//! [`Stream<Commands>`](fictionet::stdlib::codec::Stream) to read requests and
 //! [`Resp2::mapped`] to convert replies before [`Resp2::write`] sends them.
 //! After `HELLO 3`, it uses [`Value::write`]. RESP2 writes null as `$-1\r\n`;
 //! RESP3 writes `_\r\n`. A client uses
-//! [`Stream<Values>`](super::codec::Stream) to read replies. Which commands
+//! [`Stream<Values>`](fictionet::stdlib::codec::Stream) to read replies. Which commands
 //! exist and what they do is up to world code.
 //!
 //! Every reader checks lengths, counts and nesting against [`Limits`].
@@ -59,7 +59,7 @@
 
 extern crate alloc;
 
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 use alloc::{
     boxed::Box,
     format,

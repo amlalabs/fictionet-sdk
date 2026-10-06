@@ -19,7 +19,7 @@
 //! options, and a [`ReadTransfer`] works out which packet to send next
 //! for one read. When to resend a packet, and how many times, is up to
 //! the caller: on a timeout it sends [`ReadTransfer::current`] again.
-//! Read netascii DATA bodies with [`Stream<Netascii>`](super::codec::Stream)
+//! Read netascii DATA bodies with [`Stream<Netascii>`](fictionet::stdlib::codec::Stream)
 //! to retain a CR split across packets.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
@@ -65,7 +65,6 @@
 //! assert_eq!(transfer.current(), None);
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The UDP port TFTP servers listen on for requests. The transfer itself
@@ -675,7 +674,7 @@ impl Wire for NetasciiByte {
 }
 
 /// Reads netascii characters across DATA blocks.
-/// Use [`Stream<Netascii>`](super::codec::Stream) to retain a split CR pair.
+/// Use [`Stream<Netascii>`](fictionet::stdlib::codec::Stream) to retain a split CR pair.
 /// Its input buffer holds at most two bytes, and it holds no private bytes.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Netascii;

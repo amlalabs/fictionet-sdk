@@ -12,7 +12,7 @@
 //! Nothing here reads a socket. A world that plays a web server takes a
 //! request body from its HTTP code, finds the boundary with [`boundary`],
 //! and reads the parts with [`Multipart::parse`]. A body that comes in
-//! pieces goes to [`Stream<Parts>`](super::codec::Stream), which returns
+//! pieces goes to [`Stream<Parts>`](fictionet::stdlib::codec::Stream), which returns
 //! complete [`Part`] values within a fixed size limit. What the fields mean,
 //! and where uploaded files go, is up to world code.
 //! Write raw HTTP bodies with [`Body`] and choose the multipart subtype in
@@ -58,7 +58,6 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use alloc::{
     collections::BTreeSet,
@@ -667,7 +666,7 @@ fn part_header_end(input: &[u8], scanned: usize) -> Result<Option<usize>, Error>
 /// A partial header returns [`Step::Need`]. An unclosed body returns
 /// [`Error::Truncated`]. Other syntax and limit errors also end the stream.
 /// Capacity is [`MAX_PART`] plus [`MAX_BOUNDARY_LINE`] plus one overflow byte.
-/// Drive it with [`Stream<Parts>`](super::codec::Stream).
+/// Drive it with [`Stream<Parts>`](fictionet::stdlib::codec::Stream).
 /// An empty stream ends cleanly with no items, unlike [`Multipart::parse`],
 /// while a preamble-only body is an error.
 ///

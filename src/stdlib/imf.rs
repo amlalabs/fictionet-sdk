@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a mail server takes the
 //! bytes of a message from its SMTP session and hands them to
-//! [`split_message`], or uses [`Stream<Head>`](super::codec::Stream). It gets back a
+//! [`split_message`], or uses [`Stream<Head>`](fictionet::stdlib::codec::Stream). It gets back a
 //! [`Header`] of [`Field`]s and the body bytes. The structured fields are
 //! read on demand: [`parse_address_list`] for `From`, `To` and `Cc`,
 //! [`DateTime::parse`] for `Date`, [`MessageId::parse`] and
@@ -61,7 +61,7 @@
 //! assert_eq!(bytes, "To: John Doe <jdoe@machine.example>\r\nSubject: Re: Café hours\r\n\r\n".as_bytes());
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The longest header section, counting the blank line that ends it.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -288,7 +288,7 @@ impl Wire for Header {
 /// Reads one header item, then returns [`Step::End`] unconditionally.
 ///
 /// The enclosing SMTP or MIME layer supplies EOF. A blank line ends the
-/// header; all following bytes remain unread for [`super::codec::Stream::swap`]
+/// header; all following bytes remain unread for [`fictionet::stdlib::codec::Stream::swap`]
 /// into a body collector or a multipart decoder. No input bytes are retained.
 /// Capacity is the header limit, including the terminating blank line.
 ///
@@ -1689,7 +1689,7 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract,
         test_support::{Lcg, decode_all, mutate},
     };

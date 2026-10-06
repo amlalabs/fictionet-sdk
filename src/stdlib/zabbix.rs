@@ -13,8 +13,8 @@
 //! manual.
 //!
 //! Nothing here reads a socket. A world that plays a Zabbix server
-//! passes the bytes a [`tcp`](crate::stdlib::tcp) connection reads to a
-//! [`Stream<Frames>`](super::codec::Stream), gets [`Packet`]s back,
+//! passes the bytes a [`tcp`](fictionet::stdlib::tcp) connection reads to a
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Packet`]s back,
 //! reads each one's [`Message`], and writes the reply's bytes back to
 //! the connection. Compressed data is reported with
 //! [`Packet::is_compressed`] and left as it came; it is not
@@ -55,7 +55,7 @@
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{format, string::{String, ToString}, vec::Vec};
 
 /// The TCP port a Zabbix agent listens on for the server's questions.
@@ -335,7 +335,7 @@ impl Wire for Packet {
 
 /// Reads Zabbix packets without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for input bounded by [`LARGE_HEADER_LEN`]
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`LARGE_HEADER_LEN`]
 /// plus [`Self::limit`]. Partial packets return [`Step::Need`], including at
 /// EOF. The stream reports truncation at EOF and framing errors once.
 /// Compressed payloads remain bytes. Body parsing stays separate.
@@ -941,7 +941,7 @@ impl Scanner<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Fail, Stream, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Fail, Stream, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     fn packet_bytes(flags: u8, data: &[u8], reserved: u32) -> Vec<u8> {
         let mut v = b"ZBXD".to_vec();

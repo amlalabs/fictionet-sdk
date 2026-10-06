@@ -24,8 +24,8 @@
 //! the packet's [`Endpoints`], and prepares a reply with [`Packet::frame`].
 //! Write that frame with [`Wire::write`] in an IP packet with protocol
 //! [`PROTOCOL`], usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`].
-//! For pieces of one payload, use [`Stream<Frames>`](super::codec::Stream)
-//! with `Frames = Collect<Datagram>` and a limit of [`MAX_MESSAGE`].
+//! For pieces of one payload, use [`Stream<Collect<Datagram>>`](fictionet::stdlib::codec::Stream)
+//! with a limit of [`MAX_MESSAGE`].
 //! Map the payload through [`Packet::parse`], and call `end` at the IP
 //! packet boundary. Which routers and links exist, when Hellos go out,
 //! and how routes are worked out are up to world code.
@@ -95,7 +95,7 @@
 //! assert!(Packet::parse(&bad, &link).is_err());
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -2173,10 +2173,10 @@ bounded_datagram_wire!(LsaBodyFrame, OspfError, OspfError::TooLong, MAX_LSA - LS
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, OspfError> {
-        use crate::stdlib::codec::Decode;
+        use fictionet::stdlib::codec::Decode;
         let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Packet::parse(&d.0, e));
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
         contract::check_wire::<Datagram>(b);

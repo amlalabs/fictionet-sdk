@@ -11,7 +11,7 @@
 //! (terminal type) and RFC 1073 (window size), and negotiates options with
 //! the Q method of RFC 1143, which never loops.
 //!
-//! A world pushes connection bytes to [`Stream<Events>`](super::codec::Stream),
+//! A world pushes connection bytes to [`Stream<Events>`](fictionet::stdlib::codec::Stream),
 //! reads one [`Event`] at a time, and hands negotiations to [`Negotiation`].
 //! It writes each returned reply event and changes binary mode between items.
 //! The default delivers each data byte immediately. Batch readers can use
@@ -52,7 +52,7 @@
 //! assert_eq!(name, Subnegotiation::TerminalTypeIs("VT100".to_string()));
 //! ```
 
-use super::codec::{self, Decode, Step, Wire};
+use fictionet::stdlib::codec::{self, Decode, Step, Wire};
 
 /// The TCP port Telnet servers listen on.
 pub const PORT: u16 = 23;
@@ -1179,7 +1179,7 @@ fn asked(state: OptionState, on: bool) -> (OptionState, Option<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::codec::{
+    use fictionet::stdlib::codec::{
         Fail, Stream, contract, finish, pump,
         test_support::{Lcg, decode_all, mutate},
     };

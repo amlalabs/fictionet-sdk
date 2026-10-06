@@ -85,10 +85,6 @@ impl Spans {
     pub fn is_empty(&self) -> bool {
         self.ring.is_empty()
     }
-    /// The configured retained span limit.
-    pub fn limit(&self) -> usize {
-        self.keep
-    }
     /// The next inner byte offset.
     pub fn inner_offset(&self) -> u64 {
         self.inner_at
@@ -231,10 +227,6 @@ impl<O: Decode, I: Decode, F> Pipe<O, I, F> {
     /// advance outer offsets. Skipped bytes are counted with the next item.
     pub fn spans(&self) -> &Spans {
         &self.spans
-    }
-    /// Access to the outer decoder between items.
-    pub fn outer(&mut self) -> &mut O {
-        &mut self.outer
     }
     /// Access to the inner decoder between items.
     pub fn inner(&mut self) -> &mut I {

@@ -60,7 +60,6 @@
 //! assert_eq!(answer.answers[0].data, RData::Nb(vec![owner]));
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 use std::net::Ipv4Addr;

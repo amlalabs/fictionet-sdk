@@ -72,7 +72,6 @@
 //! assert_eq!(d.data, announcement);
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 use std::net::Ipv4Addr;

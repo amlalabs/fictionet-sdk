@@ -85,7 +85,6 @@
 //! assert_eq!(back.cookie, [0xaa; 16]);
 //! ```
 
-extern crate self as fictionet;
 use fictionet::stdlib::codec::Wire;
 
 /// The UDP port CoAP over DTLS listens on.

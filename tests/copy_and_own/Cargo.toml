@@ -1,0 +1,13 @@
+[package]
+name = "fictionet-copy-modules"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "../copy_and_own.rs"
+test = false
+doctest = false
+
+[dependencies]
+fictionet = { path = "../..", default-features = false }

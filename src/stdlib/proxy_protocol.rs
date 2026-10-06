@@ -12,7 +12,7 @@
 //! "PROXY protocol" specification, versions 1 and 2.
 //!
 //! A server behind a proxy pushes the first connection bytes into
-//! [`Stream<Headers>`](super::codec::Stream). It reads one [`Header`] result,
+//! [`Stream<Headers>`](fictionet::stdlib::codec::Stream). It reads one [`Header`] result,
 //! then hands the unread suffix to the next protocol with `swap` or
 //! `into_parts`. A proxy appends its header with [`Wire::write`] before
 //! sending the client's bytes.
@@ -61,7 +61,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
 /// Why the next PROXY header cannot be framed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

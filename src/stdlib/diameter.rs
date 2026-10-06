@@ -20,7 +20,7 @@
 //! AVPs included, down to [`MAX_DEPTH`] levels.
 //!
 //! A world that plays a Diameter server pushes connection bytes into a
-//! [`Stream<Frames>`](super::codec::Stream), gets [`Message`]s back,
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets [`Message`]s back,
 //! and writes each answer's bytes to the connection. Which applications,
 //! subscribers and sessions exist is up to world code.
 //!
@@ -69,7 +69,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The port Diameter peers listen on, over TCP or SCTP.
 pub const PORT: u16 = 3868;
@@ -660,7 +660,7 @@ impl core::error::Error for Malformed {
 
 /// Reads Diameter messages without retaining input.
 ///
-/// Use with [`super::codec::Stream`] for bounded buffering. The first four
+/// Use with [`fictionet::stdlib::codec::Stream`] for bounded buffering. The first four
 /// bytes suffice to refuse a message above [`limit`](Self::limit). Partial
 /// messages return [`Step::Need`], including at EOF. The driver reports
 /// truncation and reports header errors once. Only [`Error::Version`],
@@ -1475,7 +1475,7 @@ fn be32(b: &[u8], i: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn id(s: &str) -> Identity {
         Identity::new(s).unwrap()

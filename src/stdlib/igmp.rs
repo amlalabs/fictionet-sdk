@@ -17,7 +17,7 @@
 //! [`Message::to_bytes`] returns in an IPv4 packet with protocol
 //! [`PROTOCOL`], a TTL of 1 and the Router Alert option, to the address
 //! [`Message::destination`] gives. For pieces of one payload, use
-//! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Message>`
+//! [`Stream<Collect<Message>>`](fictionet::stdlib::codec::Stream)
 //! and [`MAX_MESSAGE`] as the collection limit. Call `end` at the IPv4 boundary.
 //! This collection uses the strict [`Message::parse`] reader.
 //! Which groups a host has joined, and what a router does with a report,
@@ -101,7 +101,7 @@
 //! assert_eq!(reports[0].to_bytes().unwrap(), [0x22, 0, 0xea, 0xf9, 0, 0, 0, 1, 2, 0, 0, 0, 239, 1, 2, 3]);
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::Ipv4Addr;
 
@@ -694,7 +694,7 @@ impl Wire for Message {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8]) -> Result<Message, IgmpError> {
         let make = || Collect::<Message>::new(MAX_MESSAGE);

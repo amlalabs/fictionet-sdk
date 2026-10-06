@@ -16,11 +16,11 @@
 //! like.
 //!
 //! A world that plays a server keeps a [`Server`] session. It pushes bytes
-//! from a [`tcp`](super::tcp) connection, takes [`ClientMessage`]s out, and
+//! from a [`tcp`](fictionet::stdlib::tcp) connection, takes [`ClientMessage`]s out, and
 //! answers with [`ServerMessage`]s. A client uses [`Client`]. Each session
 //! tracks both directions, since the next peer unit depends on what was
-//! sent. The byte layers are [`Stream<ClientMessages>`](super::codec::Stream)
-//! and [`Stream<ServerMessages>`](super::codec::Stream). Change modes between
+//! sent. The byte layers are [`Stream<ClientMessages>`](fictionet::stdlib::codec::Stream)
+//! and [`Stream<ServerMessages>`](fictionet::stdlib::codec::Stream). Change modes between
 //! items. Unsupported security and closed sessions preserve the unread
 //! suffix for `into_parts` or `swap`.
 //!
@@ -69,7 +69,7 @@
 //! );
 //! ```
 
-use super::codec::{self, Decode, Step, Stream, Wire};
+use fictionet::stdlib::codec::{self, Decode, Step, Stream, Wire};
 
 /// Why an RFB unit cannot be read or its decoder mode cannot change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

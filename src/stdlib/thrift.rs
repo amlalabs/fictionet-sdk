@@ -19,7 +19,7 @@
 //! is a 4-byte big-endian length followed by the message.
 //!
 //! Nothing here reads a socket. A world that plays a Thrift server
-//! passes TCP bytes to [`Stream<Frames>`](super::codec::Stream), reads
+//! passes TCP bytes to [`Stream<Frames>`](fictionet::stdlib::codec::Stream), reads
 //! each frame's [`EncodedMessage`], and writes
 //! the reply's bytes back. Values are read without a schema, into a
 //! tree of [`Value`]s, so world code decides what each field number
@@ -72,7 +72,7 @@
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{string::String, vec, vec::Vec};
 
 /// The TCP port Thrift servers commonly listen on.
@@ -739,7 +739,7 @@ impl Wire for Frame {
 
 /// Reads framed Thrift payloads without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`FRAME_HEADER_LEN`]
 /// plus [`Self::limit`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once. Map frames
 /// through [`EncodedMessage::parse`] to receive body errors as items.
@@ -805,7 +805,7 @@ impl Decode for Frames {
 
 /// Reads unframed Thrift messages without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for input bounded by [`MAX_MESSAGE`]
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`MAX_MESSAGE`]
 /// plus one byte, which lets the scanner refuse an oversized message.
 /// The scan cursor is relative to the unread start and resets after each
 /// item. The task stack reserves two slots per level of [`MAX_DEPTH`];
@@ -1517,7 +1517,7 @@ impl<'o> Writer<'o> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all, chunks}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all, chunks}};
 
     const ALL_TYPES: [Type; 12] = [
         Type::Bool,

@@ -13,7 +13,7 @@
 //! follows the Microsoft [MS-TDS] specification for TDS 7.2 to 7.4.
 //!
 //! Nothing here reads a socket. A world reads packets with
-//! [`Stream<Frames>`](super::codec::Stream), or uses [`Messages`] in that
+//! [`Stream<Frames>`](fictionet::stdlib::codec::Stream), or uses [`Messages`] in that
 //! driver to assemble packets through EOM. It reads message data as
 //! [`Prelogin`], [`Login7`], or [`SqlBatch`]. It answers with [`Prelogin`]
 //! or a [`TokenStream`]. World code decides which users, databases, and
@@ -64,7 +64,7 @@
 //! assert_eq!(TokenStream::parse(&message.data), Ok(reply));
 //! ```
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port SQL Server listens on.
 pub const PORT: u16 = 1433;
@@ -558,7 +558,7 @@ impl Wire for Packet {
 
 /// Reads individual TDS packets without holding input bytes.
 ///
-/// Use with [`codec::Stream`](super::codec::Stream) for a buffer bounded
+/// Use with [`codec::Stream`](fictionet::stdlib::codec::Stream) for a buffer bounded
 /// by [`limit`](Self::limit), including the header. Oversized packets are
 /// refused from the first four bytes. Partial packets return [`Step::Need`],
 /// including at EOF, so the stream reports truncation. Message assembly
@@ -3267,7 +3267,7 @@ fn le32(b: &[u8], i: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     fn hex(s: &str) -> Vec<u8> {
         s.split_whitespace()

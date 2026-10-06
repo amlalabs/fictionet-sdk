@@ -27,7 +27,7 @@
 //! prepares an [`Advertisement::frame`] to write with [`Wire::write`].
 //! Use protocol [`PROTOCOL`] and a TTL or hop limit of [`HOP_LIMIT`], to the
 //! address [`Advertisement::destination`] gives. For pieces of one payload,
-//! use [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Datagram>`
+//! use [`Stream<Collect<Datagram>>`](fictionet::stdlib::codec::Stream)
 //! and a limit of [`MAX_MESSAGE`]. Map through [`Advertisement::parse`]
 //! and call `end` at the IP boundary. Which virtual routers exist, their
 //! priorities, and the timers that decide when a backup takes over are
@@ -99,7 +99,7 @@
 //! assert_eq!(ad.frame(&master).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
 //! ```
 
-use super::codec::Wire;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -772,10 +772,10 @@ impl Wire for Datagram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Wire, Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+    use fictionet::stdlib::codec::{Wire, Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
 
     fn collect(b: &[u8], e: &Endpoints) -> Result<Advertisement, VrrpError> {
-        use crate::stdlib::codec::Decode;
+        use fictionet::stdlib::codec::Decode;
         let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Advertisement::parse(&d.0, e));
         contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
         contract::check_wire::<Datagram>(b);

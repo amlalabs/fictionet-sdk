@@ -13,7 +13,7 @@
 //! integer format and the Huffman code.
 //!
 //! A server reads encoder instructions with
-//! [`Stream<EncoderInstructions>`](super::codec::Stream) and applies each to
+//! [`Stream<EncoderInstructions>`](fictionet::stdlib::codec::Stream) and applies each to
 //! a [`Table`]. [`decode_section`] returns fields and an acknowledgment or a
 //! [`BlockedSection`] to hold and retry. [`BlockedSections`] bounds that queue.
 //! [`Encoder`] returns instruction and field-section values. Write those values
@@ -50,7 +50,7 @@
 
 use std::collections::VecDeque;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The largest integer a reader accepts, 2^62 - 1, the largest QUIC stream
 /// ID. Larger values cannot be written.
@@ -1495,7 +1495,7 @@ impl Encoder {
 
     /// Applies one decoded peer instruction between items.
     ///
-    /// Pair with [`DecoderInstructions`] and [`super::codec::Stream`]. This
+    /// Pair with [`DecoderInstructions`] and [`fictionet::stdlib::codec::Stream`]. This
     /// resolves Section Acknowledgments against this session's outstanding
     /// sections and updates its known received count. Errors do not change
     /// session state; the caller must enforce the QPACK connection policy.
@@ -1531,7 +1531,7 @@ impl Encoder {
 
 /// Reads one encoder instruction per call without owning input.
 ///
-/// Use with [`super::codec::Stream`]. Integer overflow and excessive string
+/// Use with [`fictionet::stdlib::codec::Stream`]. Integer overflow and excessive string
 /// lengths end framing. A complete instruction with invalid contents is an
 /// error item. Apply successful items with [`Table::apply`] between calls.
 /// Partial instructions return [`Step::Need`], including at EOF.
@@ -1615,7 +1615,7 @@ impl Decode for EncoderInstructions {
 /// Reads one decoder instruction per call without owning input.
 ///
 /// Zero increments are error items. Integer overflow ends framing. Partial
-/// integers return [`Step::Need`], so [`super::codec::Stream`] reports EOF
+/// integers return [`Step::Need`], so [`fictionet::stdlib::codec::Stream`] reports EOF
 /// truncation. Stream acknowledgments need the caller's section metadata;
 /// call [`Encoder::apply_instruction`] between items. This decoder has no
 /// table or pending output queue.
@@ -1998,7 +1998,7 @@ impl BlockedSections {
 
 #[cfg(test)]
 mod tests {
-    use super::super::codec::{
+    use fictionet::stdlib::codec::{
         contract,
         test_support::{decode_all, Lcg, mutate},
     };

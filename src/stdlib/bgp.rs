@@ -15,7 +15,7 @@
 //! refresh errors) and RFC 9072 (long OPEN optional parameters).
 //!
 //! Nothing here reads a socket. A world that plays a router passes the
-//! bytes it reads from a TCP connection to [`Stream<Frames>`](super::codec::Stream),
+//! bytes it reads from a TCP connection to [`Stream<Frames>`](fictionet::stdlib::codec::Stream),
 //! gets [`Frame`]s back, and reads each one with [`Message::decode`].
 //! It builds a reply with [`Message::to_frame`] and writes its bytes
 //! back to the connection. Which routes exist,
@@ -90,7 +90,7 @@
 
 extern crate alloc;
 
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 use alloc::{vec, vec::Vec};
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -565,7 +565,7 @@ impl Wire for Frame {
 
 /// Reads BGP frames without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for input bounded by [`MAX_MESSAGE_LEN`].
+/// Use with [`fictionet::stdlib::codec::Stream`] for input bounded by [`MAX_MESSAGE_LEN`].
 /// Partial frames return [`Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and framing errors once. Map frames through
 /// [`Message::decode`] with the session's [`Context`] to read their bodies.
@@ -1975,7 +1975,7 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
 
     fn encode(message: &Message, context: &Context) -> Result<Vec<u8>, EncodeError> {
         message.to_frame(context)?.to_bytes()

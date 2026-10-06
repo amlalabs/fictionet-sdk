@@ -15,7 +15,7 @@
 //! chapter 12, and Microsoft's extensions in MS-RPCE, section 2.2.2.
 //!
 //! A world that plays an RPC server pushes bytes from a connection or pipe
-//! into a [`Stream<Frames>`](super::codec::Stream), gets
+//! into a [`Stream<Frames>`](fictionet::stdlib::codec::Stream), gets
 //! [`Pdu`]s back, and writes the bytes of its answers. A large call comes
 //! in several fragments, which a [`Reassembler`] joins, and
 //! [`Pdu::fragments`] splits an answer the same way. Which interfaces
@@ -91,7 +91,7 @@
 //! assert_eq!(reply.len(), 16 + 8 + 2 + 4 + 2 + 4 + 24);
 //! ```
 
-use crate::stdlib::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The TCP port of the endpoint mapper.
 pub const PORT: u16 = 135;
@@ -445,7 +445,7 @@ impl Default for DataRep {
 /// An authentication verifier: the trailer at the end of a PDU and the
 /// security provider's token. The padding before it and the reserved
 /// byte are not kept; the writer works the padding out, as zeros.
-/// [`Stream::with_next`](super::codec::Stream::with_next) gives a PDU's bytes as they came, padding
+/// [`Stream::with_next`](fictionet::stdlib::codec::Stream::with_next) gives a PDU's bytes as they came, padding
 /// included, for a world that checks or decrypts a verifier. To sign one
 /// it writes, a world writes the PDU with a token of the right length,
 /// then fills the token in over the last bytes (and, for privacy,
@@ -1027,7 +1027,7 @@ impl Wire for Pdu {
 /// [`limit`](Self::limit). Lengths are checked as soon as their first ten
 /// header bytes arrive, before any body is needed.
 /// Partial fragments return [`Step::Need`], including at EOF, so
-/// [`super::codec::Stream`] reports truncation. [`super::codec::Stream::with_next`] gives
+/// [`fictionet::stdlib::codec::Stream`] reports truncation. [`fictionet::stdlib::codec::Stream::with_next`] gives
 /// the original fragment bytes for authentication, including discarded padding.
 /// Proxies should forward those bytes: a received PDU can fit the limit while
 /// canonical padding or reserved fields would make [`Wire::write`] refuse it.
@@ -1474,7 +1474,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
 
     /// An endpoint mapper bind as Windows sends it: one context, the
     /// endpoint mapper over NDR.
@@ -1593,7 +1593,7 @@ mod tests {
 
     #[test]
     fn codec_writes_each_body_in_both_byte_orders() {
-        use crate::stdlib::codec::contract;
+        use fictionet::stdlib::codec::contract;
 
         for mut pdu in all_bodies() {
             for drep in [DataRep::LITTLE_ENDIAN, DataRep::BIG_ENDIAN] {
