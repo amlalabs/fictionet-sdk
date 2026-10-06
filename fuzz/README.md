@@ -32,7 +32,8 @@ cargo +nightly fuzz list
 | `modbus` | a Modbus/TCP byte stream, whole and a byte at a time | `modbus::Decoder`, `Frame`, `Request` and `Response`, reading and writing |
 | `dnp3` | arbitrary and constructed link frames, CRC blocks and transport segments | `stdlib::dnp3`: framing, transport reassembly and application headers |
 | `iec104` | APDU streams, ASDU headers and information object layouts | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
-| `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
+| `pop3` | commands, replies, AUTH lines, expectations, and listings | `stdlib::pop3`: strict wire values and bounded codec contracts |
+| `smtp` | commands, replies, DATA, and constructed values | `stdlib::smtp`: strict wire values, dot-stuffing, and bounded codec contracts |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
@@ -44,7 +45,7 @@ cargo +nightly fuzz list
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::grpc`: gRPC |
-| `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
+| `imap` | commands, responses, literals, raw lines, and refusal decisions | `stdlib::imap`: strict wire values and bounded codec contracts |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kafka`: Apache Kafka |
