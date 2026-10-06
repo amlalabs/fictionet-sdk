@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::nbns::{
-    MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, RrName,
+    MAX_DATAGRAM, MAX_PACKET, Name, NbEntry, NodeName, NodeType, Packet, ParseError, RrName,
     decode_first_level, rcode,
 };
 use libfuzzer_sys::fuzz_target;
@@ -79,14 +79,14 @@ fuzz_target!(|data: &[u8]| {
         .unwrap();
         assert_eq!(&bytes[1..33], data);
     }
-    // Any text as a scope: the name keeps what the wire holds, so it reads
-    // back the same.
+    // Any text as a scope: the writer either refuses the name or writes
+    // one that reads back the same.
     if let Ok(text) = std::str::from_utf8(data) {
-        let name = Name::new("W", 0x20).with_scope_clipped(text);
+        let name = Name::new("W", 0x20).with_scope(text);
         let q = Packet::name_query(1, name.clone(), false);
-        assert_eq!(
-            Packet::parse(&q.to_bytes().unwrap()).unwrap().questions[0].name,
-            name
-        );
+        match q.to_bytes() {
+            Ok(bytes) => assert_eq!(Packet::parse(&bytes).unwrap().questions[0].name, name),
+            Err(e) => assert_eq!(e, ParseError::Unwritable),
+        }
     }
 });

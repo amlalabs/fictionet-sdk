@@ -1086,6 +1086,27 @@ mod tests {
     }
 
     #[test]
+    fn writers_refuse_strings_with_nul() {
+        // Each string is short, so only the NUL rule applies. Mode is an
+        // enum whose names hold no NUL.
+        let request = |filename: &str, options| Request { filename: filename.to_string(), mode: Mode::Octet, options };
+        for packet in [
+            Packet::ReadRequest(request("a\0b", vec![])),
+            Packet::WriteRequest(request("\0", vec![])),
+            Packet::ReadRequest(request("a", vec![TftpOption::new("bl\0ksize", "512")])),
+            Packet::WriteRequest(request("a", vec![TftpOption::new("blksize", "512\0")])),
+            Packet::OptionAck { options: vec![TftpOption::new("tsize\0", "1")] },
+            Packet::OptionAck { options: vec![TftpOption::new("tsize", "1\0")] },
+            Packet::Error { code: ErrorCode::NotDefined, message: "no\0pe".to_string() },
+        ] {
+            assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable), "{packet:?}");
+            contract::check_wire_value(&packet);
+        }
+        let fine = Packet::ReadRequest(request("a", vec![TftpOption::new("blksize", "512")]));
+        assert_eq!(Packet::parse(&fine.to_bytes().unwrap()), Ok(fine));
+    }
+
+    #[test]
     fn numbers() {
         assert_eq!(parse_number("0"), Some(0));
         assert_eq!(parse_number("1024"), Some(1024));

@@ -1915,6 +1915,106 @@ mod tests {
     }
 
     #[test]
+    fn client_hello_writer_refuses_each_field_on_its_own() {
+        let base = ClientHello::parse(&client_hello_bytes()).unwrap();
+        assert_eq!(base.to_bytes().unwrap(), client_hello_bytes());
+        let mut ext_block = base.clone();
+        ext_block.extensions = Some(vec![Extension { typ: 1, data: vec![0; MAX_EXTENSIONS_LEN - 3] }]);
+        let mut ext_sum = base.clone();
+        ext_sum.extensions = Some(vec![
+            Extension { typ: 1, data: vec![0; 40000] },
+            Extension { typ: 2, data: vec![0; 30000] },
+        ]);
+        let with = |change: fn(&mut ClientHello)| {
+            let mut c = base.clone();
+            change(&mut c);
+            c
+        };
+        let values = [
+            ("one extension", ext_block),
+            ("two extensions", ext_sum),
+            ("session_id", with(|c| c.session_id = vec![1; MAX_SESSION_ID + 1])),
+            ("cookie", with(|c| c.cookie = vec![2; MAX_COOKIE + 1])),
+            ("cipher_suites", with(|c| c.cipher_suites = vec![0x1301; MAX_CIPHER_SUITES + 1])),
+            ("no cipher_suites", with(|c| c.cipher_suites.clear())),
+            ("compression_methods", with(|c| c.compression_methods = vec![0; MAX_COMPRESSION_METHODS + 1])),
+            ("no compression_methods", with(|c| c.compression_methods.clear())),
+        ];
+        for (name, c) in values {
+            assert_eq!(c.to_bytes(), Err(HandshakeError::Unwritable), "{name}");
+            contract::check_wire_value(&c);
+        }
+    }
+
+    #[test]
+    fn record_writer_refuses_each_field_on_its_own() {
+        let plain = PlainRecord {
+            content_type: ContentType::TLS12_CID,
+            version: version::DTLS_1_2,
+            epoch: 1,
+            sequence: MAX_SEQUENCE,
+            connection_id: vec![1; 4],
+            fragment: vec![0; MAX_PLAIN_FRAGMENT],
+        };
+        let unified = UnifiedRecord {
+            epoch_bits: unified_bits::EPOCH_MASK,
+            connection_id: Some(vec![1; 4]),
+            sequence: Sequence::Long(9),
+            has_length: true,
+            payload: vec![0; MAX_UNIFIED_PAYLOAD],
+        };
+        for r in [Record::Plain(plain.clone()), Record::Unified(unified.clone())] {
+            let d = r.datagram(4).unwrap();
+            assert_eq!(Datagram::read(&d.0, 4), Ok(vec![r]));
+        }
+        let mut bad = Vec::new();
+        let mut p = plain.clone();
+        p.sequence = MAX_SEQUENCE + 1;
+        bad.push(("sequence", Record::Plain(p)));
+        let mut p = plain.clone();
+        p.connection_id = vec![1; 5];
+        bad.push(("plain cid", Record::Plain(p)));
+        let mut p = plain.clone();
+        p.content_type = ContentType::APPLICATION_DATA;
+        bad.push(("cid on a non-CID record", Record::Plain(p)));
+        let mut p = plain.clone();
+        p.fragment.push(0);
+        bad.push(("fragment", Record::Plain(p)));
+        let mut p = plain.clone();
+        p.epoch = 0;
+        p.fragment = vec![0; MAX_PLAINTEXT + 1];
+        bad.push(("epoch 0 fragment", Record::Plain(p)));
+        let mut u = unified.clone();
+        u.epoch_bits = unified_bits::EPOCH_MASK + 1;
+        bad.push(("epoch_bits", Record::Unified(u)));
+        let mut u = unified.clone();
+        u.connection_id = Some(vec![1; 3]);
+        bad.push(("unified cid", Record::Unified(u)));
+        let mut u = unified.clone();
+        u.payload.push(0);
+        bad.push(("payload", Record::Unified(u)));
+        for (name, r) in bad {
+            assert_eq!(r.datagram(4), Err(RecordError::Unwritable), "{name}");
+        }
+    }
+
+    #[test]
+    fn fragment_writer_refuses_each_range_on_its_own() {
+        let ok = Fragment { msg_type: 1, length: MAX_MESSAGE_LEN as u32, message_seq: 0, offset: 2, body: vec![1; 3] };
+        assert_eq!(Fragment::parse(&ok.to_bytes().unwrap()), Ok(ok.clone()));
+        let at_end = Fragment { msg_type: 1, length: 4, message_seq: 0, offset: 4, body: vec![] };
+        assert_eq!(Fragment::parse(&at_end.to_bytes().unwrap()), Ok(at_end));
+        for (name, f) in [
+            ("length", Fragment { length: MAX_MESSAGE_LEN as u32 + 1, offset: 0, body: vec![], ..ok.clone() }),
+            ("offset", Fragment { length: 4, offset: 5, body: vec![], ..ok.clone() }),
+            ("body", Fragment { length: 4, offset: 2, body: vec![1; 3], ..ok.clone() }),
+        ] {
+            assert_eq!(f.to_bytes(), Err(HandshakeError::Unwritable), "{name}");
+            contract::check_wire_value(&f);
+        }
+    }
+
+    #[test]
     fn writers_refuse_oversized_fields() {
         let ch = ClientHello {
             version: version::DTLS_1_2,

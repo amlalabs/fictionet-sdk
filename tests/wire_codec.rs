@@ -69,7 +69,7 @@ fn control_and_nat_pmp_units_ignore_trailing_bytes() {
 
 #[test]
 fn nbns_reply_construction_sets_tc_before_writing() {
-    let name = nbns::Name::new("WORLD", 0x20).with_scope_clipped("EXAMPLE.TEST");
+    let name = nbns::Name::new("WORLD", 0x20).with_scope("EXAMPLE.TEST");
     let query = nbns::Packet::name_query(7, name.clone(), false);
     let owner = nbns::NbEntry {
         group: false,

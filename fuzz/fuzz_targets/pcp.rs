@@ -38,7 +38,12 @@ fuzz_target!(|data: &[u8]| {
                 contract::check_wire_value(&reply);
                 let bytes = reply.to_bytes().unwrap();
                 assert!(bytes.len() <= MAX_MESSAGE);
-                assert_eq!(receive(&bytes, speaks, source, 11), Incoming::Ignore);
+                // RFC 6886 section 3.5 writes the unsupported-version reply
+                // with opcode 0, so a NAT-PMP server reads it back as an
+                // external address request. Every other reply is ignored.
+                if !matches!(reply, Reply::NatPmp(NatPmpResponse::UnsupportedVersion { .. })) {
+                    assert_eq!(receive(&bytes, speaks, source, 11), Incoming::Ignore);
+                }
             }
         }
         if let Some(version) = unsupported_version(b) {

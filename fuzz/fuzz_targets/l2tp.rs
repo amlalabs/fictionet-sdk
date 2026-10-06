@@ -50,6 +50,11 @@ fuzz_target!(|data: &[u8]| {
         && !message.is_zlb()
     {
         assert_eq!(Avp::reserved_bits(&message.to_bytes().unwrap()), Ok(0));
+        let bits = ControlMessage::reserved_bits(data).unwrap();
+        assert_eq!(bits.len(), 1 + message.avps.len());
+        assert_eq!(bits[0], Avp::reserved_bits(data).unwrap());
+        let written = ControlMessage::reserved_bits(&message.to_bytes().unwrap()).unwrap();
+        assert!(written.iter().all(|&b| b == 0));
     }
     let byte = |i: usize| data.get(i).copied().unwrap_or(0);
     let code = u16::from_be_bytes([byte(0), byte(1)]);

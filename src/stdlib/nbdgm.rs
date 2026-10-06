@@ -194,20 +194,11 @@ impl Name {
     }
 
     /// This name with the scope `scope`, given with dots between labels.
-    /// Empty labels are skipped. Labels are cut to [`MAX_LABEL`] bytes
-    /// and stop before the name would exceed [`MAX_NAME_LEN`].
-    pub fn with_scope_clipped(mut self, scope: &str) -> Name {
-        self.scope.clear();
-        let mut size = 1 + ENCODED_LEN + 1;
-        for label in scope.split('.').filter(|l| !l.is_empty()) {
-            let bytes = label.as_bytes();
-            let len = bytes.len().min(MAX_LABEL);
-            if size + 1 + len > MAX_NAME_LEN {
-                break;
-            }
-            self.scope.push(bytes[..len].to_vec());
-            size += 1 + len;
-        }
+    /// Empty labels are skipped. Other labels are kept as given, so the
+    /// writer refuses labels above [`MAX_LABEL`] and names above
+    /// [`MAX_NAME_LEN`].
+    pub fn with_scope(mut self, scope: &str) -> Name {
+        self.scope = scope.split('.').filter(|l| !l.is_empty()).map(|l| l.as_bytes().to_vec()).collect();
         self
     }
 
@@ -882,7 +873,7 @@ mod tests {
             id: 7,
             source_ip: ip(),
             source_port: 138,
-            body: Body::QueryRequest(Name::new("FILES", 0x20).with_scope_clipped("corp.example")),
+            body: Body::QueryRequest(Name::new("FILES", 0x20).with_scope("corp.example")),
         };
         let mut b =
             Packet::datagram(DatagramKind::Broadcast, 9, ip(), 138, Name::new("A", 0), Name::wildcard(), vec![1, 2, 3]);
@@ -958,7 +949,7 @@ mod tests {
 
     #[test]
     fn queries() {
-        let name = Name::new("FILES", 0x20).with_scope_clipped("corp.example");
+        let name = Name::new("FILES", 0x20).with_scope("corp.example");
         let q = Packet {
             flags: Flags::whole(),
             id: 5,
@@ -1103,6 +1094,31 @@ mod tests {
         let n = Name { bytes: [b'A'; 16], scope: vec![vec![], b"x".to_vec()] };
         assert_eq!(n.to_bytes(), Err(ParseError::Unwritable));
         contract::check_wire_value(&n);
+    }
+
+    #[test]
+    fn name_writer_refuses_each_limit_on_its_own() {
+        // One label a byte past MAX_LABEL, in a short name.
+        let wide = Name { bytes: [b'A'; 16], scope: vec![vec![b'x'; MAX_LABEL + 1]] };
+        assert_eq!(wide.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&wide);
+        // Five legal labels that make a 354-byte name.
+        let long = Name { bytes: [b'A'; 16], scope: vec![vec![b'x'; MAX_LABEL]; 5] };
+        assert_eq!(long.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&long);
+        // A name of exactly MAX_NAME_LEN bytes is written and reads back.
+        let mut scope = vec![vec![b'x'; MAX_LABEL]; 3];
+        scope.push(vec![b'y'; 28]);
+        let full = Name { bytes: [b'A'; 16], scope };
+        let wire = full.to_bytes().unwrap();
+        assert_eq!(wire.len(), MAX_NAME_LEN);
+        assert_eq!(Name::parse(&wire), Ok(full.clone()));
+        contract::check_wire_value(&full);
+        // One more byte in the last label passes it.
+        let mut over = full;
+        over.scope[3].push(b'y');
+        assert_eq!(over.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&over);
     }
 
     #[test]

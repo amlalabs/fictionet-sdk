@@ -36,7 +36,8 @@
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Reserved header bits are written as zero. A reader ignores those
-//! bits. [`Avp::reserved_bits`] reports received AVP reserved bits so an
+//! bits. [`ControlMessage::reserved_bits`] reports each received AVP's
+//! reserved bits, and [`Avp::reserved_bits`] those of one AVP, so an
 //! L2TPv2 peer can treat the AVP as unknown (RFC 2661 section 4.1).
 //! Parsed values omit those bits, and writers always send them as zero.
 //!
@@ -510,6 +511,24 @@ impl ControlMessage {
     pub fn find_vendor(&self, vendor: u16, attribute: u16) -> Option<&Avp> {
         self.avps.iter().find(|a| a.vendor == vendor && a.attribute == attribute)
     }
+
+    /// The four reserved bits of each AVP in the control message body
+    /// `body`, in order, starting with the message type AVP. A ZLB
+    /// acknowledgment gives none. An L2TPv2 peer treats an AVP whose bits
+    /// are not zero as one it does not know (RFC 2661 section 4.1); L2TPv3
+    /// ignores them. Refuses what [`ControlMessage::parse`](Wire::parse)
+    /// refuses.
+    pub fn reserved_bits(body: &[u8]) -> Result<Vec<u8>, Error> {
+        Self::parse(body)?;
+        let mut bits = Vec::new();
+        let mut at = 0;
+        while let Some(header) = body.get(at..).and_then(<[u8]>::first_chunk::<2>) {
+            let word = u16::from_be_bytes(*header);
+            bits.push(((word & avp_bits::RESERVED) >> 10) as u8);
+            at += usize::from(word & avp_bits::LENGTH);
+        }
+        Ok(bits)
+    }
 }
 
 /// An L2TPv2 datagram, control or data, with the fields its header holds.
@@ -722,7 +741,7 @@ impl Wire for ControlMessage {
     /// Empty bytes are a ZLB acknowledgment. Otherwise the body must be
     /// whole AVPs, at most [`MAX_AVPS`] of them, and the first one a
     /// message type AVP. Its M bit and vendor ID are kept. Reserved bits
-    /// are ignored; [`Avp::reserved_bits`] reads them from the body header.
+    /// are ignored; [`ControlMessage::reserved_bits`] reads them from the body.
     /// Refuses malformed or trailing input.
     fn parse(body: &[u8]) -> Result<ControlMessage, Error> {
         if body.len() > MAX_MESSAGE {
@@ -1224,6 +1243,19 @@ mod tests {
         assert_eq!(Avp::reserved_bits(&m.to_bytes().unwrap()), Ok(0));
         assert_eq!(Avp::reserved_bits(&[]), Err(Error::Truncated));
         contract::check_wire::<ControlMessage>(&bytes);
+    }
+
+    #[test]
+    fn reserved_bits_of_every_avp_are_read() {
+        // A HELLO, then an AVP with reserved bits 0b1001, then one with none.
+        let body = [0x80, 8, 0, 0, 0, 0, 0, 6, 0xa4, 8, 0, 0, 0, 9, 0, 7, 0x80, 8, 0, 0, 0, 10, 0, 1];
+        let m = ControlMessage::parse(&body).unwrap();
+        assert_eq!(m.avps.len(), 2);
+        assert_eq!(ControlMessage::reserved_bits(&body), Ok(vec![0, 9, 0]));
+        assert_eq!(ControlMessage::reserved_bits(&m.to_bytes().unwrap()), Ok(vec![0, 0, 0]));
+        assert_eq!(ControlMessage::reserved_bits(&[]), Ok(vec![]));
+        assert_eq!(ControlMessage::reserved_bits(&body[..20]), Err(Error::Truncated));
+        assert_eq!(ControlMessage::reserved_bits(&body[8..]), Err(Error::MessageType));
     }
 
     #[test]

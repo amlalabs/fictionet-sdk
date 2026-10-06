@@ -215,11 +215,11 @@ impl Name {
     }
 
     /// This name with the scope `scope`, given with dots between labels.
-    /// This constructor keeps what the wire holds: empty
-    /// labels are left out, labels are cut to [`MAX_LABEL`] bytes, and
-    /// labels stop once the name would pass [`MAX_NAME_LEN`].
-    pub fn with_scope_clipped(mut self, scope: &str) -> Name {
-        self.scope = clipped_labels(1 + ENCODED_LEN, scope.split('.').map(str::as_bytes));
+    /// Empty labels are skipped. Other labels are kept as given, so the
+    /// writer refuses labels above [`MAX_LABEL`] and names above
+    /// [`MAX_NAME_LEN`].
+    pub fn with_scope(mut self, scope: &str) -> Name {
+        self.scope = dotted_labels(scope);
         self
     }
 
@@ -236,25 +236,10 @@ impl Name {
     }
 }
 
-/// The labels a constructor keeps of `labels`, in a name whose labels before
-/// them take `used` bytes: empty labels are left out, labels are cut to
-/// [`MAX_LABEL`] bytes, and labels stop once the name would pass
-/// [`MAX_NAME_LEN`]. It reads `labels` only as far as it keeps them.
-fn clipped_labels<'a>(mut used: usize, labels: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
-    for label in labels {
-        let label = &label[..label.len().min(MAX_LABEL)];
-        if label.is_empty() {
-            continue;
-        }
-        // The label, its length byte, and the final zero must fit.
-        if used + 1 + label.len() + 1 > MAX_NAME_LEN {
-            break;
-        }
-        used += 1 + label.len();
-        out.push(label.to_vec());
-    }
-    out
+/// The labels of `text`, given with dots between them. Empty labels are
+/// skipped; the others are kept as given.
+fn dotted_labels(text: &str) -> Vec<Vec<u8>> {
+    text.split('.').filter(|l| !l.is_empty()).map(|l| l.as_bytes().to_vec()).collect()
 }
 
 /// Appends valid labels and the final zero to a name. Refuses empty or
@@ -321,10 +306,10 @@ impl RrName {
         RrName::Domain(Vec::new())
     }
 
-    /// The domain name `name`, given with dots between labels, kept by
-    /// the rules of [`Name::with_scope_clipped`].
-    pub fn domain_clipped(name: &str) -> RrName {
-        RrName::Domain(clipped_labels(0, name.split('.').map(str::as_bytes)))
+    /// The domain name `name`, given with dots between labels, split by
+    /// the rules of [`Name::with_scope`].
+    pub fn domain(name: &str) -> RrName {
+        RrName::Domain(dotted_labels(name))
     }
 
     /// The NetBIOS name, if this is one.
@@ -1385,7 +1370,7 @@ mod tests {
                     [1, 2, 3, 4, 5, 6],
                 )
                 .to_bytes().unwrap(),
-            Packet::name_query(9, Name::new("FRED", 0x20).with_scope_clipped("NETBIOS.COM"), false).to_bytes().unwrap(),
+            Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false).to_bytes().unwrap(),
             req.wack(Name::new("FRED", 0x20), 5).to_bytes().unwrap(),
             req.wack(RrName::null(), 5).to_bytes().unwrap(),
             redirect_bytes(),
@@ -1412,7 +1397,7 @@ mod tests {
     #[test]
     fn scope_example() {
         // RFC 1002 section 4.1: FRED in the scope NETBIOS.COM.
-        let name = Name::new("FRED", 0x20).with_scope_clipped("NETBIOS.COM");
+        let name = Name::new("FRED", 0x20).with_scope("NETBIOS.COM");
         let mut want = vec![0x20];
         want.extend_from_slice(FRED);
         want.extend_from_slice(b"\x07NETBIOS\x03COM\x00");
@@ -1568,12 +1553,12 @@ mod tests {
     }
 
     #[test]
-    fn rfc1001_name_with_scope_clipped_example() {
+    fn rfc1001_name_with_scope_example() {
         // RFC 1001 section 14.1: "The NetBIOS name" in SCOPE.ID.COM. The
         // name keeps its case, so it is built from its bytes. The RFC
         // prints FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF, which has two letters
         // wrong: it decodes to "Tge NetBIOS tame".
-        let name = Name { bytes: *b"The NetBIOS name", scope: Vec::new() }.with_scope_clipped("SCOPE.ID.COM");
+        let name = Name { bytes: *b"The NetBIOS name", scope: Vec::new() }.with_scope("SCOPE.ID.COM");
         assert_eq!(&name.to_bytes().unwrap()[1..1 + ENCODED_LEN], b"FEGIGFCAEOGFHEECEJEPFDCAGOGBGNGF");
         assert_eq!(decode_first_level(b"FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF"), Some(*b"Tge NetBIOS tame"));
         let wire = name.to_bytes().unwrap();
@@ -1865,7 +1850,7 @@ mod tests {
         let req = Packet::parse(&query_bytes()).unwrap();
         for name in [
             Name::new("FRED", 0x20),
-            Name::new("FRED", 0x20).with_scope_clipped(&"x.".repeat(200)),
+            Name::new("FRED", 0x20).with_scope(&"x.".repeat(110)),
         ] {
             let node = NodeName::unique(&name);
             for count in [0, 3, 100, 10_909] {
@@ -1921,16 +1906,31 @@ mod tests {
     }
 
     #[test]
-    fn with_scope_clipped_keeps_what_the_wire_holds() {
-        let long = "a.".repeat(1_000_000);
-        let name = Name::new("FRED", 0x20).with_scope_clipped(&long);
-        assert!(name.scope.len() < 128);
+    fn with_scope_keeps_labels_and_write_refuses_long_ones() {
+        // 110 two-byte labels fill the name to 254 bytes; one more passes
+        // MAX_NAME_LEN.
+        let name = Name::new("FRED", 0x20).with_scope(&"x.".repeat(110));
+        assert_eq!(name.scope.len(), 110);
         let wire = name.to_bytes().unwrap();
+        assert_eq!(wire.len(), MAX_NAME_LEN - 1);
         assert_eq!(read_name(&wire, 0).unwrap().0, name);
-        let label = "x".repeat(64);
-        let name = Name::new("FRED", 0x20).with_scope_clipped(&label);
-        assert_eq!(name.scope, vec![vec![b'x'; MAX_LABEL]]);
+        let long = Name::new("FRED", 0x20).with_scope(&"x.".repeat(111));
+        assert_eq!(long.scope.len(), 111);
+        assert_eq!(long.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&long);
+        let huge = Name::new("FRED", 0x20).with_scope(&"a.".repeat(100_000));
+        assert_eq!(huge.to_bytes(), Err(ParseError::Unwritable));
+        // A label of MAX_LABEL bytes is written; one byte more is refused.
+        let name = Name::new("FRED", 0x20).with_scope(&"x".repeat(MAX_LABEL));
         assert_eq!(read_name(&name.to_bytes().unwrap(), 0).unwrap().0, name);
+        let wide = Name::new("FRED", 0x20).with_scope(&"x".repeat(MAX_LABEL + 1));
+        assert_eq!(wide.scope, vec![vec![b'x'; MAX_LABEL + 1]]);
+        assert_eq!(wide.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&wide);
+        let domain = RrName::domain(&"x".repeat(MAX_LABEL + 1));
+        assert_eq!(domain, RrName::Domain(vec![vec![b'x'; MAX_LABEL + 1]]));
+        assert_eq!(domain.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&domain);
     }
 
     #[test]
@@ -1980,7 +1980,7 @@ mod tests {
     fn redirect_with_domain_names() {
         let b = redirect_bytes();
         let p = Packet::parse(&b).unwrap();
-        assert_eq!(p.authority[0].name, RrName::domain_clipped("netbios.com".to_uppercase().as_str()));
+        assert_eq!(p.authority[0].name, RrName::domain("netbios.com".to_uppercase().as_str()));
         assert_eq!(p.authority[0].name.to_string(), "NETBIOS.COM");
         let ns = vec![b"NS".to_vec(), b"NETBIOS".to_vec(), b"COM".to_vec()];
         assert_eq!(p.authority[0].data, RData::Ns(ns.clone()));
@@ -2001,7 +2001,7 @@ mod tests {
         // its NS data points at the scope inside it, at offset 95. The
         // writer turns the repeated name into a pointer, so the scope
         // moves; the NS data must still name NETBIOS.COM.
-        let fred = Name::new("FRED", 0x20).with_scope_clipped("NETBIOS.COM");
+        let fred = Name::new("FRED", 0x20).with_scope("NETBIOS.COM");
         let mut b = hex("0009 8100 0001 0000 0001 0000");
         b.extend_from_slice(&fred.to_bytes().unwrap());
         b.extend_from_slice(&hex("0020 0001"));
