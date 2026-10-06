@@ -1836,7 +1836,10 @@ impl Candidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{Stream, contract, test_support::{Lcg, decode_all, mutate}};
+    use codec::{
+        Stream, contract,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     /// The example in RFC 8866, section 5.
     const RFC_EXAMPLE: &[u8] = b"v=0\r\n\
@@ -1886,6 +1889,7 @@ mod tests {
         a=sendonly\r\n\
         m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\n";
 
+    // Adapter and chunking checks: Wire::parse also uses Descriptions.
     fn check_description(b: &[u8]) -> Result<SessionDescription, Error> {
         contract::check_decode_with_alloc_limit(Descriptions::new, b, 2 * (MAX_LINE_LEN + 2));
         contract::check_decode_with_held_limit(Descriptions::new, b, MAX_LEN);
@@ -2474,6 +2478,7 @@ mod tests {
 
     #[test]
     fn fuzz_reader() {
+        const ALPHABET: &[u8] = b" =:/\r\n\0\xff0aZ-";
         let mut rng = Lcg::new(0x5d9);
         let lines: Vec<&[u8]> = EVERY_LINE.split_inclusive(|&b| b == b'\n').collect();
         for round in 0..4000 {
@@ -2493,6 +2498,10 @@ mod tests {
             };
             for _ in 0..rng.index(4) {
                 mutate(&mut rng, &mut b);
+                if rng.coin() && !b.is_empty() {
+                    let at = rng.index(b.len());
+                    b[at] = ALPHABET[rng.index(ALPHABET.len())];
+                }
             }
             check_bytes(&b);
         }

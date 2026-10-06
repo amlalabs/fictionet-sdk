@@ -68,6 +68,7 @@ fn built(data: &[u8]) -> Result<()> {
 fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(Packets::new, data, 2 * (MAX_PAYLOAD + 1));
     contract::check_wire::<MagicPacket>(data);
+    // Adapter consistency only: Packets delegates to find at EOF.
     let found = MagicPacket::find(data);
     let expected = match found {
         Ok(packet) => (vec![packet], None),

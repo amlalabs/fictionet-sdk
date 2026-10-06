@@ -365,6 +365,7 @@ mod tests {
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
 
     fn check_payload(payload: &[u8]) -> Result<(usize, MagicPacket), ParseError> {
+        // Adapter consistency only: Packets delegates to find at EOF.
         let whole = MagicPacket::find(payload);
         let expected = match whole {
             Ok(packet) => (vec![packet], None),

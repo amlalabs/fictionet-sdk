@@ -2,11 +2,11 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{
-    Decode, Wire, contract,
+    Decode, Fail, Wire, contract,
     test_support::{Lcg, decode_all},
 };
 use fictionet::stdlib::resp::{
-    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, Resp2, Value, Values, WireError,
+    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, ParseError, Resp2, Value, Values, WireError,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -50,23 +50,52 @@ fuzz_target!(|data: &[u8]| {
         max_line_len: rng.index(64),
         max_frame_len: rng.index(data.len().saturating_add(2)),
     };
-    for limits in [Limits::DEFAULT, small, drawn] {
-        let allocation = 2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN);
-        contract::check_decode_with_alloc_limit(|| Values::with_limits(limits).map(WireValue), data, allocation);
-        contract::check_decode_with_alloc_limit(|| Commands::with_limits(limits), data, allocation);
-        for command in decode_all(|| Commands::with_limits(limits), data).0 {
+    for (index, limits) in [Limits::DEFAULT, small, drawn].into_iter().enumerate() {
+        // Default and small limits keep all chunk and prefix checks. Drawn limits
+        // exercise whole input without repeating those expensive schedules.
+        if index < 2 {
+            let allocation = 2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN);
+            contract::check_decode_with_alloc_limit(|| Values::with_limits(limits).map(WireValue), data, allocation);
+            contract::check_decode_with_alloc_limit(|| Commands::with_limits(limits), data, allocation);
+        }
+        let values = decode_all(|| Values::with_limits(limits), data);
+        let commands = decode_all(|| Commands::with_limits(limits), data);
+        if index == 0 {
+            // Exact parsing bypasses the stream's scan gate. These parsers use default limits.
+            partial_oracle(data, Value::parse(data), &values, |_| false);
+            partial_oracle(data, Command::parse(data), &commands, |command| command.args.is_empty());
+        }
+        for command in commands.0 {
             contract::check_wire_value(&command);
         }
-        for value in decode_all(|| Values::with_limits(limits), data).0 {
+        for value in values.0 {
             if let Ok(bytes) = value.to_bytes() {
                 assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
             }
-            if let Ok(bytes) = Resp2(value).to_bytes() {
-                assert_eq!(Resp2::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
-            }
+            contract::check_wire_value(&Resp2(value.clone()));
+            contract::check_wire_value(&Resp2::mapped(value));
         }
     }
 });
+
+fn partial_oracle<T: Wire<ParseError = WireError, WriteError = WireError>>(
+    data: &[u8],
+    parsed: Result<T, WireError>,
+    decoded: &(Vec<T>, Option<Fail<ParseError>>),
+    empty: impl Fn(&T) -> bool,
+) {
+    let expected = match parsed {
+        Ok(value) => (if empty(&value) { vec![] } else { vec![value.to_bytes().unwrap()] }, None),
+        // An empty stream has no incomplete frame.
+        Err(WireError::Incomplete) => (vec![], (!data.is_empty()).then_some(Fail::Truncated { unread: data.len() })),
+        Err(WireError::Parse(error)) if error != ParseError::FrameTooLarge => (vec![], Some(Fail::Protocol(error))),
+        // Trailing frames need prefix parsing. Size expansion can be refused by
+        // Wire::parse after a stream has successfully read the value.
+        _ => return,
+    };
+    let actual: Vec<_> = decoded.0.iter().map(|value| value.to_bytes().unwrap()).collect();
+    assert_eq!((actual, decoded.1.clone()), expected);
+}
 
 fn wire_same(a: &Value, b: &Value) -> bool {
     let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| wire_same(x, y));

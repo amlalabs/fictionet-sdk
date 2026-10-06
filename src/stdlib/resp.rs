@@ -15,8 +15,9 @@
 //!
 //! Nothing here reads a socket. A world that plays a Redis server uses
 //! [`Stream<Commands>`](super::codec::Stream) to read requests and
-//! [`Resp2::write`] to send replies until `HELLO 3` selects [`Value::write`].
-//! The former writes null as `$-1\r\n`; the latter writes `_\r\n`. A client uses
+//! [`Resp2::mapped`] to convert replies before [`Resp2::write`] sends them.
+//! After `HELLO 3`, it uses [`Value::write`]. RESP2 writes null as `$-1\r\n`;
+//! RESP3 writes `_\r\n`. A client uses
 //! [`Stream<Values>`](super::codec::Stream) to read replies. Which commands
 //! exist and what they do is up to world code.
 //!
@@ -47,7 +48,7 @@
 //!         (Some("GET"), [_, k]) => store.get(k).map_or(Value::Null, |v| Value::Bulk(v.clone())),
 //!         _ => Value::error("ERR unknown command"),
 //!     };
-//!     Resp2(reply).write(&mut out).unwrap();
+//!     Resp2::mapped(reply).write(&mut out).unwrap();
 //! }
 //! assert_eq!(out, b"+OK\r\n$5\r\nhello\r\n");
 //!
@@ -229,15 +230,10 @@ pub enum Value {
 
 /// A reply in Redis's RESP2 form, used before a client selects `HELLO 3`.
 ///
-/// Writing maps null to `$-1`, booleans to integers, and doubles, big
-/// numbers and verbatim text to bulk strings. Bulk errors become simple
-/// errors. Maps become flat arrays of keys and values. Sets and pushes
-/// become arrays. Attributes contribute only their value.
-///
-/// Parsing accepts only RESP2 types, including both null forms. It never
-/// produces RESP3 variants. A parsed value round trips through this writer.
-/// A constructed RESP3 variant reads back as its mapped RESP2 value.
-/// Both methods use [`Limits::DEFAULT`]. Writing never clips fields.
+/// Parsing and writing accept only RESP2 variants, including both null forms.
+/// Writing refuses RESP3-only variants at any depth. Use [`Resp2::mapped`]
+/// to convert a reply first. Both wire methods use [`Limits::DEFAULT`].
+/// Writing never clips fields.
 ///
 /// ```
 /// use fictionet::stdlib::codec::Wire;
@@ -246,13 +242,61 @@ pub enum Value {
 /// let missing = Resp2(Value::Null);
 /// assert_eq!(missing.to_bytes().unwrap(), b"$-1\r\n");
 /// assert_eq!(Resp2::parse(b"$-1\r\n").unwrap(), missing);
-/// assert_eq!(Resp2(Value::Boolean(true)).to_bytes().unwrap(), b":1\r\n");
+/// let reply = Resp2::mapped(Value::Boolean(true));
+/// let mut bytes = Vec::new();
+/// reply.write(&mut bytes).unwrap();
+/// assert_eq!(bytes, b":1\r\n");
+/// assert_eq!(Resp2::parse(&bytes).unwrap(), reply);
 /// ```
 #[derive(Clone, Debug, PartialEq)]
 pub struct Resp2(
-    /// The value to encode using Redis's RESP2 mapping.
+    /// The value to encode without changing its RESP2 representation.
     pub Value,
 );
+
+impl Resp2 {
+    /// Converts a reply using Redis's RESP2 mapping.
+    ///
+    /// Booleans become integers. Doubles, big numbers, and verbatim text
+    /// become bulk strings. Bulk errors become simple errors. Maps become
+    /// flat arrays of keys and values. Sets and pushes become arrays.
+    /// Attribute wrappers and their entries are dropped. Null forms stay
+    /// distinct. Children are converted by the same rules.
+    ///
+    /// No field is clipped. Oversized or overly nested aggregates are
+    /// left for [`Resp2::write`] to refuse. Other limits apply to the
+    /// converted fields, so a bulk error containing CR or LF is refused.
+    pub fn mapped(value: Value) -> Self {
+        Self(map_resp2(value, 0))
+    }
+}
+
+fn map_resp2(mut value: Value, depth: usize) -> Value {
+    // Unwrap attributes without recursion, even when they exceed the wire depth.
+    while let Value::Attribute { value: inner, .. } = value {
+        value = *inner;
+    }
+    match value {
+        Value::Boolean(b) => Value::Integer(i64::from(b)),
+        Value::Double(n) => Value::Bulk(fmt_double(n).into_bytes()),
+        Value::BigNumber(text) => Value::Bulk(text.into_bytes()),
+        Value::BulkError(bytes) => Value::Error(bytes),
+        Value::Verbatim { text, .. } => Value::Bulk(text),
+        Value::Array(items) | Value::Set(items) | Value::Push(items) => {
+            if depth >= MAX_DEPTH || items.len() > MAX_ELEMENTS {
+                return Value::Array(items);
+            }
+            Value::Array(items.into_iter().map(|item| map_resp2(item, depth + 1)).collect())
+        }
+        Value::Map(entries) => {
+            if depth >= MAX_DEPTH || entries.len() > MAX_ELEMENTS / 2 {
+                return Value::Map(entries);
+            }
+            Value::Array(entries.into_iter().flat_map(|(k, v)| [k, v]).map(|v| map_resp2(v, depth + 1)).collect())
+        }
+        value => value,
+    }
+}
 
 /// Why bytes are not RESP. Either way, the stream holds no more values a
 /// reader can find, and a server answers with [`ParseError::reply`] and
@@ -1564,6 +1608,8 @@ impl Wire for Value {
     /// can expand when written.
     fn parse(bytes: &[u8]) -> Result<Self, WireError> {
         let value = exact(value_top(bytes, &Limits::DEFAULT), bytes.len())?;
+        // Parsing validates every field. Only size expansion can make writing fail:
+        // doubles expand, and streamed bulk chunks can exceed the plain bulk limit.
         value
             .write(&mut Vec::new())
             .map_err(|_| WireError::Parse(ParseError::FrameTooLarge))?;
@@ -1577,10 +1623,7 @@ impl Wire for Value {
     /// first string, and values exceeding size, count, or nesting limits.
     /// An error leaves `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        let mut bytes = Vec::new();
-        strict_value(&mut bytes, self, 0, true)?;
-        out.extend_from_slice(&bytes);
-        Ok(())
+        transactional(out, |out, limit| strict_value(out, self, 0, true, limit))
     }
 }
 
@@ -1600,18 +1643,13 @@ impl Wire for Resp2 {
         .map(Self)
     }
 
-    /// Appends this value using the RESP2 mapping described by [`Resp2`].
-    /// Refuses CR or LF in simple strings or errors, malformed big numbers,
-    /// and size, count, or nesting violations. Big numbers must fit
-    /// [`MAX_LINE_LEN`]. Flattened maps must fit [`MAX_ELEMENTS`] elements.
-    /// Attributes count toward [`MAX_DEPTH`], but their entries are omitted.
-    /// Pushes become arrays at any position. No field is clipped, and an
-    /// error leaves `out` unchanged.
+    /// Appends one strict RESP2 value, with null written as `$-1`.
+    /// Refuses Boolean, Double, BigNumber, BulkError, Verbatim, Map, Set,
+    /// Push, and Attribute variants at any depth. Also refuses CR or LF
+    /// in simple strings or errors and size, count, or nesting violations.
+    /// An error leaves `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        let mut bytes = Vec::new();
-        strict_resp2(&mut bytes, &self.0, 0)?;
-        out.extend_from_slice(&bytes);
-        Ok(())
+        transactional(out, |out, limit| strict_resp2(out, &self.0, 0, limit))
     }
 }
 
@@ -1661,47 +1699,28 @@ fn resp2_value(bytes: &[u8], pos: usize, depth: usize) -> Step<Value> {
     }
 }
 
-// Recursion includes omitted attributes and stops before their children.
-fn strict_resp2(out: &mut Vec<u8>, value: &Value, depth: usize) -> Result<(), WireError> {
+fn strict_resp2(out: &mut Vec<u8>, value: &Value, depth: usize, limit: usize) -> Result<(), WireError> {
     match value {
-        Value::Null => strict_bytes(out, b"$-1\r\n"),
-        Value::Boolean(b) => strict_bytes(out, if *b { b":1\r\n" } else { b":0\r\n" }),
-        Value::Double(n) => strict_bulk(out, marker::BULK, &[], fmt_double(*n).as_bytes()),
-        Value::BigNumber(text) => {
-            if text.len() > MAX_LINE_LEN || !big_ok(text.as_bytes()) {
-                return Err(WireError::Unwritable);
-            }
-            strict_bulk(out, marker::BULK, &[], text.as_bytes())
-        }
-        Value::BulkError(bytes) => strict_line(out, marker::ERROR, bytes),
-        Value::Verbatim { text, .. } => strict_bulk(out, marker::BULK, &[], text),
-        Value::Array(items) | Value::Set(items) | Value::Push(items) => {
-            strict_header(out, marker::ARRAY, items.len(), depth)?;
+        Value::Null => strict_bytes(out, b"$-1\r\n", limit),
+        Value::Array(items) => {
+            strict_header(out, marker::ARRAY, items.len(), depth, limit)?;
             for item in items {
-                strict_resp2(out, item, depth + 1)?;
+                strict_resp2(out, item, depth + 1, limit)?;
             }
             Ok(())
         }
-        Value::Map(entries) => {
-            let count = entries.len().checked_mul(2).ok_or(WireError::Unwritable)?;
-            strict_header(out, marker::ARRAY, count, depth)?;
-            for (key, value) in entries {
-                strict_resp2(out, key, depth + 1)?;
-                strict_resp2(out, value, depth + 1)?;
-            }
-            Ok(())
+        Value::Simple(_) | Value::Error(_) | Value::Integer(_) | Value::Bulk(_) | Value::NullArray => {
+            strict_value(out, value, depth, false, limit)
         }
-        Value::Attribute { value, .. } => {
-            if depth >= MAX_DEPTH {
-                return Err(WireError::Unwritable);
-            }
-            strict_resp2(out, value, depth + 1)
-        }
-        Value::Simple(_)
-        | Value::Error(_)
-        | Value::Integer(_)
-        | Value::Bulk(_)
-        | Value::NullArray => strict_value(out, value, depth, false),
+        Value::Boolean(_)
+        | Value::Double(_)
+        | Value::BigNumber(_)
+        | Value::BulkError(_)
+        | Value::Verbatim { .. }
+        | Value::Map(_)
+        | Value::Set(_)
+        | Value::Push(_)
+        | Value::Attribute { .. } => Err(WireError::Unwritable),
     }
 }
 
@@ -1720,6 +1739,8 @@ impl Wire for Command {
     /// commands whose array encoding exceeds the default limits.
     fn parse(bytes: &[u8]) -> Result<Self, WireError> {
         let command = exact(command_top(bytes, &Limits::DEFAULT), bytes.len())?;
+        // Parsed arguments already meet field limits. Only expansion from an
+        // inline command to an array of bulk strings can exceed the frame limit.
         command
             .write(&mut Vec::new())
             .map_err(|_| WireError::Parse(ParseError::FrameTooLarge))?;
@@ -1730,70 +1751,79 @@ impl Wire for Command {
     /// Refuses oversized arguments, argument counts, or total frame sizes.
     /// An error leaves `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WireError> {
-        let mut bytes = Vec::new();
-        strict_header(&mut bytes, marker::ARRAY, self.args.len(), 0)?;
-        for arg in &self.args {
-            strict_bulk(&mut bytes, marker::BULK, &[], arg)?;
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
+        transactional(out, |out, limit| {
+            strict_header(out, marker::ARRAY, self.args.len(), 0, limit)?;
+            for arg in &self.args {
+                strict_bulk(out, marker::BULK, &[], arg, limit)?;
+            }
+            Ok(())
+        })
     }
 }
 
-fn strict_bytes(out: &mut Vec<u8>, bytes: &[u8]) -> Result<(), WireError> {
-    if out.len().checked_add(bytes.len()).is_none_or(|n| n > MAX_FRAME_LEN) {
+fn transactional(
+    out: &mut Vec<u8>,
+    write: impl FnOnce(&mut Vec<u8>, usize) -> Result<(), WireError>,
+) -> Result<(), WireError> {
+    let start = out.len();
+    let limit = start.checked_add(MAX_FRAME_LEN).ok_or(WireError::Unwritable)?;
+    write(out, limit).inspect_err(|_| out.truncate(start))
+}
+
+fn strict_bytes(out: &mut Vec<u8>, bytes: &[u8], limit: usize) -> Result<(), WireError> {
+    if out.len().checked_add(bytes.len()).is_none_or(|n| n > limit) {
         return Err(WireError::Unwritable);
     }
     out.extend_from_slice(bytes);
     Ok(())
 }
 
-fn strict_line(out: &mut Vec<u8>, marker: u8, text: &[u8]) -> Result<(), WireError> {
+fn strict_line(out: &mut Vec<u8>, marker: u8, text: &[u8], limit: usize) -> Result<(), WireError> {
     if text.len() > MAX_LINE_LEN || text.iter().any(|b| matches!(b, b'\r' | b'\n')) {
         return Err(WireError::Unwritable);
     }
-    strict_bytes(out, &[marker])?;
-    strict_bytes(out, text)?;
-    strict_bytes(out, b"\r\n")
+    strict_bytes(out, &[marker], limit)?;
+    strict_bytes(out, text, limit)?;
+    strict_bytes(out, b"\r\n", limit)
 }
 
-fn strict_bulk(out: &mut Vec<u8>, marker: u8, prefix: &[u8], bytes: &[u8]) -> Result<(), WireError> {
+fn strict_bulk(out: &mut Vec<u8>, marker: u8, prefix: &[u8], bytes: &[u8], limit: usize) -> Result<(), WireError> {
     let len = prefix.len().checked_add(bytes.len()).filter(|&n| n <= MAX_BULK_LEN).ok_or(WireError::Unwritable)?;
-    strict_line(out, marker, len.to_string().as_bytes())?;
-    strict_bytes(out, prefix)?;
-    strict_bytes(out, bytes)?;
-    strict_bytes(out, b"\r\n")
+    strict_line(out, marker, len.to_string().as_bytes(), limit)?;
+    strict_bytes(out, prefix, limit)?;
+    strict_bytes(out, bytes, limit)?;
+    strict_bytes(out, b"\r\n", limit)
 }
 
-fn strict_header(out: &mut Vec<u8>, marker: u8, count: usize, depth: usize) -> Result<(), WireError> {
+fn strict_header(out: &mut Vec<u8>, marker: u8, count: usize, depth: usize, limit: usize) -> Result<(), WireError> {
     if count > MAX_ELEMENTS || depth >= MAX_DEPTH {
         return Err(WireError::Unwritable);
     }
-    strict_line(out, marker, count.to_string().as_bytes())
+    strict_line(out, marker, count.to_string().as_bytes(), limit)
 }
 
 // Recursion stops at MAX_DEPTH before inspecting deeper children.
-fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool) -> Result<(), WireError> {
+fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool, limit: usize) -> Result<(), WireError> {
     match value {
-        Value::Simple(bytes) => strict_line(out, marker::SIMPLE, bytes),
-        Value::Error(bytes) => strict_line(out, marker::ERROR, bytes),
-        Value::Integer(n) => strict_line(out, marker::INTEGER, n.to_string().as_bytes()),
-        Value::Bulk(bytes) => strict_bulk(out, marker::BULK, &[], bytes),
-        Value::Null => strict_bytes(out, b"_\r\n"),
-        Value::NullArray => strict_bytes(out, b"*-1\r\n"),
-        Value::Boolean(b) => strict_bytes(out, if *b { b"#t\r\n" } else { b"#f\r\n" }),
-        Value::Double(n) => strict_line(out, marker::DOUBLE, fmt_double(*n).as_bytes()),
+        Value::Simple(bytes) => strict_line(out, marker::SIMPLE, bytes, limit),
+        Value::Error(bytes) => strict_line(out, marker::ERROR, bytes, limit),
+        Value::Integer(n) => strict_line(out, marker::INTEGER, n.to_string().as_bytes(), limit),
+        Value::Bulk(bytes) => strict_bulk(out, marker::BULK, &[], bytes, limit),
+        Value::Null => strict_bytes(out, b"_\r\n", limit),
+        Value::NullArray => strict_bytes(out, b"*-1\r\n", limit),
+        Value::Boolean(b) => strict_bytes(out, if *b { b"#t\r\n" } else { b"#f\r\n" }, limit),
+        Value::Double(n) => strict_line(out, marker::DOUBLE, fmt_double(*n).as_bytes(), limit),
         Value::BigNumber(text) => {
             if text.len() > MAX_LINE_LEN || !big_ok(text.as_bytes()) {
                 return Err(WireError::Unwritable);
             }
-            strict_line(out, marker::BIG_NUMBER, text.as_bytes())
+            strict_line(out, marker::BIG_NUMBER, text.as_bytes(), limit)
         }
-        Value::BulkError(bytes) => strict_bulk(out, marker::BULK_ERROR, &[], bytes),
+        Value::BulkError(bytes) => strict_bulk(out, marker::BULK_ERROR, &[], bytes, limit),
         Value::Verbatim { format, text } => {
             let &[a, b, c] = format;
             let prefix = [a, b, c, b':'];
-            strict_bulk(out, marker::VERBATIM, &prefix, text)
+            strict_bulk(out, marker::VERBATIM, &prefix, text, limit)
         }
         Value::Array(items) | Value::Set(items) | Value::Push(items) => {
             let marker = match value {
@@ -1806,21 +1836,21 @@ fn strict_value(out: &mut Vec<u8>, value: &Value, depth: usize, top: bool) -> Re
                     marker::PUSH
                 }
             };
-            strict_header(out, marker, items.len(), depth)?;
+            strict_header(out, marker, items.len(), depth, limit)?;
             for item in items {
-                strict_value(out, item, depth + 1, false)?;
+                strict_value(out, item, depth + 1, false, limit)?;
             }
             Ok(())
         }
         Value::Map(entries) | Value::Attribute { attributes: entries, .. } => {
             let marker = if matches!(value, Value::Map(_)) { marker::MAP } else { marker::ATTRIBUTE };
-            strict_header(out, marker, entries.len(), depth)?;
+            strict_header(out, marker, entries.len(), depth, limit)?;
             for (key, value) in entries {
-                strict_value(out, key, depth + 1, false)?;
-                strict_value(out, value, depth + 1, false)?;
+                strict_value(out, key, depth + 1, false, limit)?;
+                strict_value(out, value, depth + 1, false, limit)?;
             }
             if let Value::Attribute { value, .. } = value {
-                strict_value(out, value, depth + 1, top)?;
+                strict_value(out, value, depth + 1, top, limit)?;
             }
             Ok(())
         }
@@ -1842,7 +1872,10 @@ fn fmt_double(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{Step as Decoded, Stream, contract, test_support::{Lcg, decode_all, mutate}};
+    use codec::{
+        Step as Decoded, Stream, contract,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, ParseError> {
         Values::with_limits(limits).decode(b, false)
@@ -1865,6 +1898,58 @@ mod tests {
             || Commands::with_limits(limits), b,
             2 * limits.max_frame_len.clamp(1, MAX_FRAME_LEN),
         );
+    }
+
+    // One-shot parsing bypasses the scan gate used by Values and Commands.
+    fn one_shot<T>(mut bytes: &[u8], parse: impl Fn(&[u8]) -> Step<T>) -> (Vec<T>, Option<codec::Fail<ParseError>>) {
+        let mut items = Vec::new();
+        while !bytes.is_empty() {
+            match parse(bytes) {
+                Ok((item, used)) => {
+                    assert!(used > 0 && used <= bytes.len());
+                    items.push(item);
+                    bytes = &bytes[used..];
+                }
+                Err(Fail::Need(_)) => return (items, Some(codec::Fail::Truncated { unread: bytes.len() })),
+                Err(Fail::Bad(error)) => return (items, Some(codec::Fail::Protocol(error))),
+            }
+        }
+        (items, None)
+    }
+
+    fn check_one_shot(bytes: &[u8], limits: Limits) {
+        let (actual, error) = decode_all(|| Values::with_limits(limits), bytes);
+        let (expected, expected_error) = one_shot(bytes, |b| value_top(frame(b, &limits), &limits));
+        assert_eq!(error, expected_error, "{} {limits:?}", bytes.escape_ascii());
+        assert_eq!(actual.len(), expected.len(), "{} {limits:?}", bytes.escape_ascii());
+        assert!(actual.iter().zip(&expected).all(|(a, b)| wire_same(a, b)), "{actual:?} != {expected:?}");
+        let (mut expected, error) = one_shot(bytes, |b| command_top(frame(b, &limits), &limits));
+        expected.retain(|command| !command.args.is_empty());
+        assert_eq!(
+            decode_all(|| Commands::with_limits(limits), bytes),
+            (expected, error),
+            "{} {limits:?}",
+            bytes.escape_ascii()
+        );
+    }
+
+    // Compare every field, including values too large to encode; NaN has one wire spelling.
+    fn wire_same(a: &Value, b: &Value) -> bool {
+        let all = |x: &[Value], y: &[Value]| x.len() == y.len() && x.iter().zip(y).all(|(x, y)| wire_same(x, y));
+        let pairs = |x: &[(Value, Value)], y: &[(Value, Value)]| {
+            x.len() == y.len() && x.iter().zip(y).all(|((a, b), (c, d))| wire_same(a, c) && wire_same(b, d))
+        };
+        match (a, b) {
+            (Value::Double(x), Value::Double(y)) => x == y || (x.is_nan() && y.is_nan()),
+            (Value::Array(x), Value::Array(y)) | (Value::Set(x), Value::Set(y)) | (Value::Push(x), Value::Push(y)) => {
+                all(x, y)
+            }
+            (Value::Map(x), Value::Map(y)) => pairs(x, y),
+            (Value::Attribute { attributes: x, value: v }, Value::Attribute { attributes: y, value: w }) => {
+                pairs(x, y) && wire_same(v, w)
+            }
+            _ => a == b,
+        }
     }
 
     fn one(b: &[u8]) -> Value {
@@ -2031,55 +2116,22 @@ mod tests {
             (Value::Boolean(false), b":0\r\n", b"#f\r\n"),
             (Value::Boolean(true), b":1\r\n", b"#t\r\n"),
             (Value::Double(1.23), b"$4\r\n1.23\r\n", b",1.23\r\n"),
-            (
-                Value::Double(f64::NEG_INFINITY),
-                b"$4\r\n-inf\r\n",
-                b",-inf\r\n",
-            ),
+            (Value::Double(f64::NEG_INFINITY), b"$4\r\n-inf\r\n", b",-inf\r\n"),
             (Value::Double(f64::NAN), b"$3\r\nnan\r\n", b",nan\r\n"),
+            (Value::BigNumber("-12".into()), b"$3\r\n-12\r\n", b"(-12\r\n"),
+            (Value::BulkError(b"SYNTAX invalid syntax".to_vec()), b"-SYNTAX invalid syntax\r\n", VALID[27]),
+            (Value::Verbatim { format: *b"txt", text: b"Some string".to_vec() }, b"$11\r\nSome string\r\n", VALID[28]),
+            (Value::Map(vec![(s("first"), Value::Integer(1))]), b"*2\r\n+first\r\n:1\r\n", b"%1\r\n+first\r\n:1\r\n"),
+            (Value::Set(vec![Value::Integer(1)]), b"*1\r\n:1\r\n", b"~1\r\n:1\r\n"),
+            (Value::Push(vec![s("a"), Value::Integer(1)]), b"*2\r\n+a\r\n:1\r\n", b">2\r\n+a\r\n:1\r\n"),
             (
-                Value::BigNumber("-12".into()),
-                b"$3\r\n-12\r\n",
-                b"(-12\r\n",
-            ),
-            (
-                Value::BulkError(b"SYNTAX invalid syntax".to_vec()),
-                b"-SYNTAX invalid syntax\r\n",
-                VALID[27],
-            ),
-            (
-                Value::Verbatim {
-                    format: *b"txt",
-                    text: b"Some string".to_vec(),
-                },
-                b"$11\r\nSome string\r\n",
-                VALID[28],
-            ),
-            (
-                Value::Map(vec![(s("first"), Value::Integer(1))]),
-                b"*2\r\n+first\r\n:1\r\n",
-                b"%1\r\n+first\r\n:1\r\n",
-            ),
-            (
-                Value::Set(vec![Value::Integer(1)]),
-                b"*1\r\n:1\r\n",
-                b"~1\r\n:1\r\n",
-            ),
-            (
-                Value::Push(vec![s("a"), Value::Integer(1)]),
-                b"*2\r\n+a\r\n:1\r\n",
-                b">2\r\n+a\r\n:1\r\n",
-            ),
-            (
-                Value::Attribute {
-                    attributes: vec![(s("ttl"), Value::Integer(1))],
-                    value: Box::new(Value::ok()),
-                },
+                Value::Attribute { attributes: vec![(s("ttl"), Value::Integer(1))], value: Box::new(Value::ok()) },
                 b"+OK\r\n",
                 b"|1\r\n+ttl\r\n:1\r\n+OK\r\n",
             ),
         ] {
-            assert_eq!(Resp2(v.clone()).to_bytes().unwrap(), r2, "{v:?}");
+            assert_eq!(Resp2::mapped(v.clone()).to_bytes().unwrap(), r2, "{v:?}");
+            contract::check_wire_value(&Resp2::mapped(v.clone()));
             assert_eq!(v.to_bytes().unwrap(), r3, "{v:?}");
             contract::check_wire::<Resp2>(r2);
             assert_eq!(Resp2::parse(r2).unwrap().to_bytes().unwrap(), r2);
@@ -2139,25 +2191,52 @@ mod tests {
     }
 
     #[test]
+    fn resp2_write_refuses_resp3_variants_at_any_depth() {
+        for value in [
+            Value::Boolean(true),
+            Value::Double(1.23),
+            Value::BigNumber("12".into()),
+            Value::BulkError(b"ERR example".to_vec()),
+            Value::Verbatim { format: *b"txt", text: b"example".to_vec() },
+            Value::Map(vec![(s("a"), Value::Integer(1))]),
+            Value::Set(vec![Value::Integer(1)]),
+            Value::Push(vec![s("a")]),
+            Value::Attribute { attributes: vec![(s("ttl"), Value::Integer(1))], value: Box::new(Value::ok()) },
+        ] {
+            for depth in [0, 1, MAX_DEPTH] {
+                let mut nested = value.clone();
+                for _ in 0..depth {
+                    nested = Value::Array(vec![Value::ok(), nested]);
+                }
+                let reply = Resp2(nested);
+                contract::check_wire_value(&reply);
+                let mut out = b"prefix".to_vec();
+                assert_eq!(reply.write(&mut out), Err(WireError::Unwritable));
+                assert_eq!(out, b"prefix");
+            }
+        }
+    }
+
+    #[test]
     fn resp2_mapping_refuses_clipping_and_rolls_back() {
         let mut deep = Value::Null;
-        for _ in 0..MAX_DEPTH {
+        for _ in 0..MAX_DEPTH + 1 {
             deep = Value::Attribute {
                 attributes: vec![],
                 value: Box::new(deep),
             };
         }
-        assert_eq!(Resp2(deep.clone()).to_bytes().unwrap(), b"$-1\r\n");
-        let deep = Value::Attribute {
-            attributes: vec![],
-            value: Box::new(deep),
-        };
+        assert_eq!(Resp2::mapped(deep.clone()).to_bytes().unwrap(), b"$-1\r\n");
+        // Removed attributes do not consume the converted array depth.
+        let mut deep = Value::Null;
+        for _ in 0..MAX_DEPTH + 1 {
+            deep = Value::Array(vec![deep]);
+        }
         for value in [
             Value::Array(vec![Value::ok(), Value::BulkError(b"x\ny".to_vec())]),
             Value::BulkError(vec![b'x'; MAX_LINE_LEN + 1]),
             Value::error("x\ry"),
-            Value::BigNumber("1".repeat(MAX_LINE_LEN + 1)),
-            Value::BigNumber("".into()),
+            Value::BigNumber("1".repeat(MAX_BULK_LEN + 1)),
             Value::Verbatim {
                 format: *b"txt",
                 text: vec![0; MAX_BULK_LEN + 1],
@@ -2166,7 +2245,8 @@ mod tests {
             Value::Map(vec![(Value::Null, Value::Null); MAX_ELEMENTS / 2 + 1]),
             Value::Push(vec![Value::Null; MAX_ELEMENTS + 1]),
         ] {
-            let reply = Resp2(value);
+            let reply = Resp2::mapped(value);
+            contract::check_wire_value(&reply);
             let mut out = b"prefix".to_vec();
             assert_eq!(reply.write(&mut out), Err(WireError::Unwritable));
             assert_eq!(out, b"prefix");
@@ -2179,16 +2259,24 @@ mod tests {
                 Value::Push(vec![Value::Integer(1)]),
             ])),
         };
-        let bytes = Resp2(value).to_bytes().unwrap();
+        let reply = Resp2::mapped(value);
+        contract::check_wire_value(&reply);
+        let bytes = reply.to_bytes().unwrap();
         assert_eq!(bytes, b"*2\r\n*0\r\n*1\r\n:1\r\n");
         contract::check_wire::<Resp2>(&bytes);
         assert_eq!(
-            Resp2(Value::BulkError(vec![b'x'; MAX_LINE_LEN]))
-                .to_bytes()
-                .unwrap()
-                .len(),
+            Resp2::mapped(Value::BulkError(vec![b'x'; MAX_LINE_LEN])).to_bytes().unwrap().len(),
             MAX_LINE_LEN + 3
         );
+    }
+
+    #[test]
+    fn resp2_mapping_checks_converted_fields() {
+        for text in [String::new(), "12x".into(), "1".repeat(MAX_LINE_LEN + 1)] {
+            let reply = Resp2::mapped(Value::BigNumber(text.clone()));
+            assert_eq!(reply, Resp2(Value::Bulk(text.into_bytes())));
+            contract::check_wire_value(&reply);
+        }
     }
 
     #[test]
@@ -2404,7 +2492,7 @@ mod tests {
             assert_eq!(value.to_bytes(), Err(WireError::Unwritable));
             if let Value::Verbatim { text, .. } = &value {
                 // Its format prefix is omitted in RESP2, so this text fits.
-                let bytes = Resp2(value.clone()).to_bytes().unwrap();
+                let bytes = Resp2::mapped(value.clone()).to_bytes().unwrap();
                 assert_eq!(Resp2::parse(&bytes), Ok(Resp2(Value::Bulk(text.clone()))));
             } else {
                 let reply = Resp2(value);
@@ -2472,13 +2560,8 @@ mod tests {
                 contract::check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
                 assert_eq!(Value::parse(&bytes), Ok(value.clone()));
-                let reply = Resp2(value);
-                if resp2 {
-                    contract::check_wire_value(&reply);
-                }
-                if let Ok(bytes) = reply.to_bytes() {
-                    assert_eq!(Resp2::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
-                }
+                contract::check_wire_value(&Resp2(value.clone()));
+                contract::check_wire_value(&Resp2::mapped(value));
             }
             let command = Command { args: (0..r.index(5)).map(|_| r.bytes(10)).collect() };
             contract::check_wire_value(&command);
@@ -2584,6 +2667,7 @@ mod tests {
             for limits in [Limits::DEFAULT, small] {
                 check_values(&b, limits);
                 check_commands(&b, limits);
+                check_one_shot(&b, limits);
                 for command in decode_all(|| Commands::with_limits(limits), &b).0 {
                     contract::check_wire_value(&command);
                 }
@@ -2592,9 +2676,8 @@ mod tests {
                     if let Ok(bytes) = value.to_bytes() {
                         assert_eq!(Value::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
                     }
-                    if let Ok(bytes) = Resp2(value).to_bytes() {
-                        assert_eq!(Resp2::parse(&bytes).unwrap().to_bytes().unwrap(), bytes);
-                    }
+                    contract::check_wire_value(&Resp2(value.clone()));
+                    contract::check_wire_value(&Resp2::mapped(value));
                 }
             }
             contract::check_wire::<Resp2>(&b);
@@ -2708,8 +2791,11 @@ mod tests {
         ];
         for b in inputs {
             for end in 0..=b.len() {
-                check_values(&b[..end], lim);
-                check_commands(&b[..end], lim);
+                for limits in [Limits::DEFAULT, lim] {
+                    check_values(&b[..end], limits);
+                    check_commands(&b[..end], limits);
+                    check_one_shot(&b[..end], limits);
+                }
             }
         }
     }
@@ -2843,9 +2929,15 @@ mod tests {
         assert_eq!(bytes.len(), MAX_FRAME_LEN);
         assert_eq!(Command::parse(&bytes), Ok(command.clone()));
         assert!(Resp2::parse(&bytes).is_ok());
+        // Existing output is outside this frame's size budget.
+        contract::check_wire_value(&command);
+        contract::check_wire_value(&command.to_value());
+        contract::check_wire_value(&Resp2(command.to_value()));
         command.args[4].push(3);
         assert_eq!(command.to_bytes(), Err(WireError::Unwritable));
+        contract::check_wire_value(&command);
         let value = command.to_value();
+        contract::check_wire_value(&value);
         assert_eq!(value.to_bytes(), Err(WireError::Unwritable));
         let mut out = b"prefix".to_vec();
         assert_eq!(Resp2(value).write(&mut out), Err(WireError::Unwritable));

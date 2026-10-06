@@ -43,6 +43,7 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
+    // Adapter consistency only: Wire::parse also uses Descriptions.
     let whole = SessionDescription::parse(data);
     let expected = match &whole {
         Ok(description) => (vec![description.clone()], None),

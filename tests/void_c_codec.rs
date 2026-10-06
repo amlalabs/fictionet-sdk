@@ -465,6 +465,7 @@ fn contracts_on_mutated_values_and_bodies() {
                 &bytes,
                 2 * wol::Packets::new().capacity(),
             );
+            // Adapter consistency: SDP parse uses Descriptions; Packets uses find.
             let expected = match sdp::SessionDescription::parse(&bytes) {
                 Ok(desc) => (vec![desc], None),
                 Err(e) => (vec![], Some(Fail::Protocol(e))),
