@@ -49,10 +49,9 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use self::alloc::{string::String, sync::Arc, vec::Vec};
-use fictionet::stdlib::codec::{self, Decode, Wire};
+use super::codec::{self, Decode, Wire};
 
 /// The TCP port IMAP servers listen on.
 pub const PORT: u16 = 143;
@@ -119,9 +118,19 @@ impl Value {
         Value::Atom(s.to_string())
     }
 
-    /// A quoted string. Its writer checks UTF-8, characters, and length.
+    /// A quoted string when the bytes are UTF-8 without NUL, CR, or LF and
+    /// fit [`MAX_QUOTED`]. Otherwise, a synchronizing [`Value::Literal`].
+    /// The writer still refuses NUL and lengths over [`MAX_LITERAL`].
+    /// Use [`Value::Binary`] for bytes that include NUL.
     pub fn string(b: &[u8]) -> Value {
-        Value::Quoted(b.to_vec())
+        if b.len() <= MAX_QUOTED && text_str(b).is_ok() {
+            Value::Quoted(b.to_vec())
+        } else {
+            Value::Literal {
+                data: b.to_vec(),
+                non_sync: false,
+            }
+        }
     }
 
     /// A number, as an atom.
@@ -381,7 +390,9 @@ impl Response {
     /// `NIL`, and so is a control character, which the delimiter's
     /// quoted form cannot hold. The mailbox goes out as an atom only when
     /// IMAP allows one there; a name with a space, `%`, `*` or `\` goes
-    /// out quoted, as does `NIL`.
+    /// out quoted, as does `NIL`. Names that cannot be quoted use a
+    /// synchronizing literal, as in [`Value::string`]. The writer refuses
+    /// NUL and lengths over [`MAX_LITERAL`] in those names.
     pub fn list(attributes: &[&str], delimiter: Option<char>, mailbox: &[u8]) -> Response {
         let attrs = attributes.iter().map(|a| Value::atom(a)).collect();
         let delim = match delimiter {
@@ -2015,6 +2026,54 @@ mod tests {
         refused(&r);
     }
 
+    fn strings_needing_literals() -> Vec<Vec<u8>> {
+        vec![
+            b"a\r\nb".to_vec(),
+            b"a\rb".to_vec(),
+            b"a\nb".to_vec(),
+            b"a\xffb".to_vec(),
+            vec![b' '; MAX_QUOTED + 1],
+        ]
+    }
+
+    #[test]
+    fn fetch_strings_use_literals_when_needed() {
+        for body in strings_needing_literals() {
+            let response = Response::fetch(1, vec![Value::atom("BODY[]"), Value::string(&body)]);
+            let expected = [
+                format!("* 1 FETCH (BODY[] {{{}}}\r\n", body.len()).as_bytes(),
+                &body,
+                b")\r\n",
+            ]
+            .concat();
+            assert_eq!(response.to_bytes().unwrap(), expected);
+            assert_eq!(Response::parse(&expected), Ok(response.clone()));
+            assert_eq!(responses(&expected), vec![Ok(response)]);
+            contract::check_decode_with_alloc_limit(Responses::new, &expected, 2 * MAX_LINE);
+        }
+        assert_eq!(
+            Value::string(&vec![b'a'; MAX_QUOTED]),
+            Value::Quoted(vec![b'a'; MAX_QUOTED])
+        );
+    }
+
+    #[test]
+    fn list_mailboxes_use_literals_when_needed() {
+        for mailbox in strings_needing_literals() {
+            let response = Response::list(&[], None, &mailbox);
+            let expected = [
+                format!("* LIST () NIL {{{}}}\r\n", mailbox.len()).as_bytes(),
+                &mailbox,
+                b"\r\n",
+            ]
+            .concat();
+            assert_eq!(response.to_bytes().unwrap(), expected);
+            assert_eq!(Response::parse(&expected), Ok(response.clone()));
+            assert_eq!(responses(&expected), vec![Ok(response)]);
+            contract::check_decode_with_alloc_limit(Responses::new, &expected, 2 * MAX_LINE);
+        }
+    }
+
     #[test]
     fn writers() {
         for (value, bytes) in [
@@ -2027,6 +2086,14 @@ mod tests {
                 b"a2 OK [READ-ONLY] done\r\n",
             ),
             (Response::continue_req(""), b"+ \r\n"),
+            (
+                Response::list(&["\\HasNoChildren"], Some('.'), b"Sent Items"),
+                b"* LIST (\\HasNoChildren) \".\" \"Sent Items\"\r\n",
+            ),
+            (
+                Response::list(&[], None, b"INBOX"),
+                b"* LIST () NIL INBOX\r\n",
+            ),
             (Response::Data(vec![]), b"*\r\n"),
         ] {
             assert_eq!(value.to_bytes().unwrap(), bytes);
@@ -2304,6 +2371,15 @@ mod tests {
             stream.next(),
             Some(Ok(Ok(Input::Command(Command::new("b2", "NOOP", vec![])))))
         );
+        let wire = b"b3 APPEND INBOX {10}\r\n";
+        assert_eq!(stream.push(wire), wire.len());
+        assert!(matches!(
+            stream.next(),
+            Some(Ok(Ok(Input::Continue { size: 10, .. })))
+        ));
+        assert!(stream.decoder().refuse_literal());
+        assert!(stream.held() == 0 && stream.buffered() == 0);
+        assert_eq!(stream.next(), None);
         let items = events(b"c1 APPEND INBOX {2000000}\r\nc2 NOOP\r\n");
         let error = items[0].as_ref().unwrap_err();
         assert_eq!(error.tag(), Some("c1"));
@@ -2324,10 +2400,16 @@ mod tests {
         let items = events(b"e1 X (\r\ne2 NOOP\r\n");
         assert_eq!(items[0].as_ref().unwrap_err().tag(), Some("e1"));
         assert!(matches!(items[1], Ok(Input::Command(_))));
-        assert!(matches!(
-            decode_all(Commands::new, &vec![b'a'; MAX_TEXT]).1,
-            Some(Fail::Protocol(DecodeError::Line(_)))
-        ));
+        let mut stream = Stream::new(Commands::new());
+        assert_eq!(stream.push(&vec![b'a'; MAX_TEXT - 1]), MAX_TEXT - 1);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(b"a"), 1);
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(DecodeError::Line(
+                codec::LineError::TooLong { max: MAX_LINE - 2 }
+            ))))
+        );
     }
 
     #[test]
@@ -2426,7 +2508,7 @@ mod tests {
         refused(&Command::new(
             "a",
             "X",
-            vec![Value::string(&vec![b'q'; MAX_QUOTED + 1])],
+            vec![Value::Quoted(vec![b'q'; MAX_QUOTED + 1])],
         ));
     }
 
@@ -2478,10 +2560,14 @@ mod tests {
         let command = cmd("a X \"é\"\r\n".as_bytes());
         assert_eq!(command.args[0].as_str(), Some("é"));
         assert_eq!(cmd(&command.to_bytes().unwrap()), command);
-        refused(&Command::new("a", "X", vec![Value::string(b"\xff")]));
+        refused(&Command::new(
+            "a",
+            "X",
+            vec![Value::Quoted(b"\xff".to_vec())],
+        ));
         refused(&Response::Data(vec![
             Value::atom("X"),
-            Value::string(b"a\x80"),
+            Value::Quoted(b"a\x80".to_vec()),
         ]));
         let command = Command::new(
             "a",
@@ -2539,6 +2625,12 @@ mod tests {
         assert!(matches!(
             decode_all(make, b"DONE\nx NOOP\r\n").0[0],
             Err(Error::Syntax { .. })
+        ));
+        assert!(matches!(
+            decode_all(make, &vec![b'a'; MAX_TEXT]).1,
+            Some(Fail::Protocol(DecodeError::Line(
+                codec::LineError::TooLong { .. }
+            )))
         ));
     }
 
@@ -2690,6 +2782,7 @@ mod tests {
         fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, DecodeError> {
             if core::mem::take(&mut self.refuse) {
                 assert!(self.commands.refuse_literal());
+                assert!(!self.commands.refuse_literal());
             }
             let step = self.commands.decode(bytes, eof)?;
             if let Step::Item(item, _) = &step {
@@ -2726,9 +2819,8 @@ mod tests {
         );
         contract::check_decode_with_alloc_limit(make, bytes, 2 * MAX_LINE);
         let mut rng = Lcg::new(7);
-        for _ in 0..128 {
-            let mut bytes = bytes.to_vec();
-            mutate(&mut rng, &mut bytes);
+        for _ in 0..5000 {
+            let bytes = generated_stream(&mut rng);
             let choices = rng.bytes(8);
             contract::check_decode_with_alloc_limit(
                 || Refusals {
@@ -2743,8 +2835,7 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_streams_obey_contracts() {
+    fn generated_stream(rng: &mut Lcg) -> Vec<u8> {
         const PIECES: &[&[u8]] = &[
             b"a1",
             b" ",
@@ -2797,18 +2888,24 @@ mod tests {
             b"* 1 FETCH (BODY[] {3}\r\nabc)\r\n",
             b"a FETCH 1 BODY[HEADER.FIELDS (FROM)]\r\n",
         ];
+        let mut bytes = seeds[rng.index(seeds.len())].to_vec();
+        if rng.coin() {
+            for _ in 0..rng.index(32) {
+                bytes.extend_from_slice(PIECES[rng.index(PIECES.len())]);
+            }
+        }
+        for _ in 0..rng.index(5) {
+            mutate(rng, &mut bytes);
+        }
+        bytes
+    }
+
+    #[test]
+    fn generated_streams_obey_contracts() {
         let mut rng = Lcg::new(0x1ee7_1ee7);
         let (mut commands, mut replies) = (0, 0);
         for _ in 0..1024 {
-            let mut bytes = seeds[rng.index(seeds.len())].to_vec();
-            if rng.coin() {
-                for _ in 0..rng.index(32) {
-                    bytes.extend_from_slice(PIECES[rng.index(PIECES.len())]);
-                }
-            }
-            for _ in 0..rng.index(5) {
-                mutate(&mut rng, &mut bytes);
-            }
+            let bytes = generated_stream(&mut rng);
             contract::check_decode_with_alloc_limit(Commands::new, &bytes, 2 * MAX_LINE);
             contract::check_decode_with_alloc_limit(Responses::new, &bytes, 2 * MAX_LINE);
             contract::check_wire::<Command>(&bytes);

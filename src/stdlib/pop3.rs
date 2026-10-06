@@ -44,10 +44,9 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use self::alloc::{collections::VecDeque, string::String, vec::Vec};
-use fictionet::stdlib::codec::{self, Decode, Wire};
+use super::codec::{self, Decode, Wire};
 use std::num::NonZeroU32;
 
 /// The TCP port POP3 servers listen on.
@@ -776,6 +775,30 @@ impl core::fmt::Display for WriteError {
 }
 impl core::error::Error for WriteError {}
 
+impl Command {
+    fn validate(&self) -> Result<(), WriteError> {
+        let size = self.keyword.len().checked_add(
+            self.argument
+                .as_ref()
+                .map_or(0, |a| a.len().saturating_add(1)),
+        );
+        if size.is_none_or(|n| n > MAX_COMMAND_LINE - 2)
+            || !(MIN_KEYWORD..=MAX_KEYWORD).contains(&self.keyword.len())
+            || !self
+                .keyword
+                .bytes()
+                .all(|b| b.is_ascii_graphic() && !b.is_ascii_lowercase())
+            || self
+                .argument
+                .as_ref()
+                .is_some_and(|a| a.is_empty() || a.chars().any(char::is_control))
+        {
+            return Err(WriteError::Unwritable);
+        }
+        Ok(())
+    }
+}
+
 impl Wire for Command {
     type ParseError = ParseError;
     type WriteError = WriteError;
@@ -940,30 +963,6 @@ impl Wire for Reply {
                 out.extend_from_slice(line);
             }
             out.extend_from_slice(b".\r\n");
-        }
-        Ok(())
-    }
-}
-
-impl Command {
-    fn validate(&self) -> Result<(), WriteError> {
-        let size = self.keyword.len().checked_add(
-            self.argument
-                .as_ref()
-                .map_or(0, |a| a.len().saturating_add(1)),
-        );
-        if size.is_none_or(|n| n > MAX_COMMAND_LINE - 2)
-            || !(MIN_KEYWORD..=MAX_KEYWORD).contains(&self.keyword.len())
-            || !self
-                .keyword
-                .bytes()
-                .all(|b| b.is_ascii_graphic() && !b.is_ascii_lowercase())
-            || self
-                .argument
-                .as_ref()
-                .is_some_and(|a| a.is_empty() || a.chars().any(char::is_control))
-        {
-            return Err(WriteError::Unwritable);
         }
         Ok(())
     }
@@ -1678,6 +1677,7 @@ mod tests {
         assert_eq!(Reply::ok("2 320(octets)").drop_listing(), Some((2, 320)));
         assert_eq!(Reply::ok("2 320 octets").drop_listing(), Some((2, 320)));
         assert_eq!(scan(b"1 120(octets)"), Some((n(1), 120)));
+        assert_eq!(scan(b"1 12 extra"), Some((n(1), 12)));
         assert_eq!(Reply::ok("2 (320)").drop_listing(), None);
         assert_eq!(Reply::ok("2x 320").drop_listing(), None);
         assert_eq!(scan(b"1x 120"), None);
@@ -1896,7 +1896,16 @@ mod tests {
             b"+OK a\0b",
             b"+OK a\rb",
         ] {
-            assert!(status(line).is_err(), "{line:?}");
+            assert_eq!(
+                status(line),
+                Err(ParseError::Reply(ReplyItemError::Reply(
+                    ReplyError::BadStatus
+                ))),
+                "{line:?}"
+            );
+        }
+        for line in [b"+OK [IN-USE".as_slice(), b"+OK [/X]", b"+OK [A B]"] {
+            assert_eq!(status(line).unwrap().code, None, "{line:?}");
         }
         let long = [b"+OK ".as_slice(), &[b'a'; 507]].concat();
         assert!(status(&long).is_err());

@@ -36,10 +36,9 @@
 //! ```
 
 extern crate alloc;
-extern crate self as fictionet;
 
 use self::alloc::{string::String, vec::Vec};
-use fictionet::stdlib::codec::{self, Decode, Wire};
+use super::codec::{self, Decode, Wire};
 
 /// SMTP relay port.
 pub const PORT: u16 = 25;
