@@ -10,29 +10,6 @@ use std::net::Ipv4Addr;
 const PAYLOAD: &[u8] = b"\x00\xffpayload\r\nPROXY \x05\x01\x00RFB 003.008\n";
 const LIMIT: usize = 4096;
 
-#[test]
-#[deny(deprecated)]
-fn legacy_handoff_apis_add_no_deprecations() {
-    let mut proxy = proxy::Decoder::new();
-    assert_eq!(proxy.feed(b"PROXY "), proxy::Step::NeedMore);
-    let mut server = socks::ServerDecoder::new();
-    server.feed(&[5, 1, 0]);
-    assert!(matches!(
-        server.next_message(),
-        Some(Ok(socks::ClientMessage::Greeting(_)))
-    ));
-    assert!(server.take_data().is_empty());
-    let mut client = socks::ClientDecoder::socks5(socks::Command::Connect);
-    client.feed(&[5, 0]);
-    assert!(matches!(
-        client.next_message(),
-        Some(Ok(socks::ServerMessage::Selection(_)))
-    ));
-    assert!(client.take_data().is_empty());
-    assert_eq!(rfb::ServerSession::new().phase(), rfb::Phase::ServerVersion);
-    assert_eq!(rfb::ClientSession::new().phase(), rfb::Phase::ServerVersion);
-}
-
 struct Bytes;
 impl Decode for Bytes {
     type Item = u8;
@@ -133,7 +110,7 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode(&make, bytes);
+    contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2));
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(bytes), bytes.len());
     assert_eq!(stream.next(), Some(Err(failure.clone())));
@@ -149,7 +126,7 @@ where
     D::Item: Debug + PartialEq,
     D::Error: Clone + Debug + PartialEq,
 {
-    contract::check_decode(&make, bytes);
+    contract::check_decode_with_alloc_limit(&make, bytes, make().capacity().saturating_mul(2));
     let mut stream = Stream::new(make());
     assert_eq!(stream.push(bytes), bytes.len());
     assert_eq!(stream.next(), None);
@@ -181,12 +158,10 @@ fn proxy_v1_v2_round_trip_and_handoff() {
             tlvs: vec![],
         }),
     ];
-    let checksummed = proxy::Header::V2(proxy::V2 {
-        command: proxy::Command::Proxy,
-        addresses: proxy::Addresses::Unspec,
-        tlvs: vec![proxy::Tlv::Crc32c(0)],
-    })
-    .to_bytes();
+    let mut checksummed = proxy::V2_SIGNATURE.to_vec();
+    checksummed.extend_from_slice(&[0x21, 0, 0, 7, 3, 0, 4, 0, 0, 0, 0]);
+    let crc = proxy::crc32c(&checksummed);
+    checksummed[19..23].copy_from_slice(&crc.to_be_bytes());
     headers.push(<proxy::Header as Wire>::parse(&checksummed).unwrap());
     for header in headers {
         let bytes = Wire::to_bytes(&header).unwrap();
@@ -394,7 +369,7 @@ fn socks_modes_and_complete_request_errors() {
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
     assert_eq!(stream.into_parts().0.unread(), PAYLOAD);
-    contract::check_decode(socks::ClientMessages::new, &bytes); // Pending decisions preserve bytes below capacity.
+    contract::check_decode_with_alloc_limit(socks::ClientMessages::new, &bytes, 2 * socks::MAX_MESSAGE); // Pending decisions preserve bytes below capacity.
 }
 
 #[test]
@@ -739,12 +714,12 @@ fn rfb_whole_handshake_into_messages_and_handoff() {
     ];
     let mut bytes = Vec::new();
     for m in &messages {
-        if let rfb::ClientMessage::Version(v) = m {
-            Wire::write(v, &mut bytes).unwrap();
-        } else if m.is_handshake() {
-            bytes.extend(m.to_bytes().unwrap());
-        } else {
-            Wire::write(m, &mut bytes).unwrap();
+        match m {
+            rfb::ClientMessage::Version(v) => v.write(&mut bytes).unwrap(),
+            rfb::ClientMessage::SecurityType(t) => rfb::SecurityChoice(*t).write(&mut bytes).unwrap(),
+            rfb::ClientMessage::VncResponse(r) => rfb::VncResponse(*r).write(&mut bytes).unwrap(),
+            rfb::ClientMessage::ClientInit { shared } => rfb::ClientInit { shared: *shared }.write(&mut bytes).unwrap(),
+            _ => m.write(&mut bytes).unwrap(),
         }
     }
     handoff(
@@ -801,7 +776,7 @@ fn rfb_body_errors_are_items_and_mode_changes_require_boundaries() {
     assert!(stream.decoder().set_phase(rfb::Phase::Closed).is_ok());
     assert_eq!(stream.next(), None);
     assert!(stream.is_done());
-    contract::check_decode(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes);
+    contract::check_decode_with_alloc_limit(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes, 2 * LIMIT);
 }
 
 #[test]
@@ -918,7 +893,7 @@ fn rfb_stream_sessions_negotiate_all_existing_dialects() {
                     height: 1,
                     contents: rfb::Contents::Raw(vec![0; 4]),
                 }]);
-                let mut bytes = bad.to_bytes(server.dialect(), &format()).unwrap();
+                let mut bytes = server_bytes(&bad, server.dialect(), &format()).unwrap();
                 rfb::ServerMessage::Bell
                     .write(server.dialect(), &format(), &mut bytes)
                     .unwrap();
@@ -988,7 +963,7 @@ fn rfb_sessions_handoff_unsupported_security_and_refusal() {
     assert!(matches!(client.next_message(), Some(Ok(Ok(rfb::ServerMessage::Version(_))))));
     client.send(&rfb::ClientMessage::Version(rfb::Version::V3_8)).unwrap();
     let refusal = rfb::ServerMessage::SecurityFailure(b"no access".to_vec());
-    let mut bytes = refusal.to_bytes(rfb::Dialect::V3_8, &format()).unwrap();
+    let mut bytes = server_bytes(&refusal, rfb::Dialect::V3_8, &format()).unwrap();
     bytes.extend_from_slice(PAYLOAD);
     assert_eq!(client.push(&bytes), bytes.len());
     assert_eq!(client.next_message(), Some(Ok(Ok(refusal))));
@@ -1157,14 +1132,14 @@ fn rfb_frame_scan_accepts_raw_and_cursor_at_each_pixel_width() {
                 },
             },
         ]);
-        let bytes = message.to_bytes(rfb::Dialect::V3_8, &format).unwrap();
+        let bytes = server_bytes(&message, rfb::Dialect::V3_8, &format).unwrap();
         let make = || {
             let mut d = rfb::ServerMessages::with_limit(LIMIT);
             d.set_mode(rfb::Phase::Normal, rfb::Dialect::V3_8, format)
                 .unwrap();
             d
         };
-        contract::check_decode(make, &bytes);
+        contract::check_decode_with_alloc_limit(make, &bytes, 2 * LIMIT);
         let mut stream = Stream::new(make());
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Ok(Ok(message))));
@@ -1177,11 +1152,11 @@ fn contract_checks_small_arbitrary_inputs_and_wire_values() {
     let mut random = codec::test_support::Lcg::new(0x1234_5678);
     for len in 0..80 {
         let bytes: Vec<_> = (0..len).map(|_| random.next() as u8).collect();
-        contract::check_decode(|| proxy::Headers::with_limit(32), &bytes);
-        contract::check_decode(|| SocksHandshake(socks::ClientMessages::with_limit(16)), &bytes);
-        contract::check_decode(|| socks::ServerMessages::socks5(socks::Command::Bind), &bytes);
-        contract::check_decode(|| server_decoder(rfb::Phase::Normal, LIMIT), &bytes);
-        contract::check_decode(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes);
+        contract::check_decode_with_alloc_limit(|| proxy::Headers::with_limit(32), &bytes, 2 * 32);
+        contract::check_decode_with_alloc_limit(|| SocksHandshake(socks::ClientMessages::with_limit(16)), &bytes, 2 * 16);
+        contract::check_decode_with_alloc_limit(|| socks::ServerMessages::socks5(socks::Command::Bind), &bytes, 2 * socks::MAX_MESSAGE);
+        contract::check_decode_with_alloc_limit(|| server_decoder(rfb::Phase::Normal, LIMIT), &bytes, 2 * LIMIT);
+        contract::check_decode_with_alloc_limit(|| client_decoder(rfb::Phase::Normal, LIMIT), &bytes, 2 * LIMIT);
         contract::check_wire::<proxy::Header>(&bytes);
         contract::check_wire::<socks::Greeting>(&bytes);
         contract::check_wire::<socks::AuthRequest>(&bytes);
@@ -1387,4 +1362,10 @@ fn rfb_client_limits_pending_input_after_turn_change() {
     assert!(client.is_done());
     assert_eq!(client.buffered(), 200_000);
     assert_eq!(client.push(b"discard"), 7);
+}
+
+fn server_bytes(message: &rfb::ServerMessage, dialect: rfb::Dialect, format: &rfb::PixelFormat) -> Result<Vec<u8>, rfb::Error> {
+    let mut out = Vec::new();
+    message.write(dialect, format, &mut out)?;
+    Ok(out)
 }

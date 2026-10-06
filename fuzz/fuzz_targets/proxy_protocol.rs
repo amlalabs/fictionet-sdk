@@ -2,64 +2,24 @@
 //! reads them at the start of a connection.
 #![no_main]
 
-use fictionet::stdlib::{codec::contract, proxy_protocol::Headers};
+use fictionet::stdlib::{codec::{contract, Wire}, proxy_protocol::Headers};
 
-use fictionet::stdlib::proxy_protocol::{Addresses, Command, Decoder, Header, Ssl, SslTlv, Step, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
+use fictionet::stdlib::proxy_protocol::{Addresses, Command, Header, Ssl, SslTlv, Tlv, Transport, MAX_HEADER_LEN, MAX_TLV_VALUE, V1, V2};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Headers::new, data);
-    contract::check_decode(|| Headers::with_limit(32), data);
+    contract::check_decode_with_alloc_limit(Headers::new, data, 2 * MAX_HEADER_LEN);
+    contract::check_decode_with_alloc_limit(|| Headers::with_limit(32), data, 64);
     contract::check_wire::<Header>(data);
     contract::check_wire_value(&Header::V1(V1::Unknown(
         data.iter().take(108).copied().collect(),
     )));
-    let parsed = Header::parse(data);
-
-    // The stream, split two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new();
-    let all_at_once = whole.feed(data);
-    let mut bytewise = Decoder::new();
-    let mut found = Step::NeedMore;
-    for (i, b) in data.iter().enumerate() {
-        match bytewise.feed(std::slice::from_ref(b)) {
-            Step::NeedMore => assert!(bytewise.buffered() <= MAX_HEADER_LEN),
-            Step::Header { header, rest } => {
-                assert!(rest.is_empty());
-                let mut rest = rest;
-                rest.extend_from_slice(&data[i + 1..]);
-                found = Step::Header { header, rest };
-                break;
-            }
-            Step::Failed { error, bytes } => {
-                let mut bytes = bytes;
-                bytes.extend_from_slice(&data[i + 1..]);
-                found = Step::Failed { error, bytes };
-                break;
-            }
-            Step::Finished => unreachable!(),
-        }
-    }
-    assert_eq!(all_at_once, found);
-
-    match (&parsed, &all_at_once) {
-        (Ok(None), Step::NeedMore) => {}
-        (Ok(Some((h, used))), Step::Header { header, rest }) => {
-            assert_eq!(h, header);
-            assert_eq!(rest, &data[*used..]);
-            // A header read can be written, and reads back the same.
-            let bytes = h.to_bytes();
-            let (back, n) = Header::parse(&bytes).unwrap().unwrap();
-            assert_eq!(&back, h);
-            assert_eq!(n, bytes.len());
-        }
-        (Err(e), Step::Failed { error, bytes }) => {
-            assert_eq!(e, error);
-            assert_eq!(bytes, data);
-        }
-        (p, s) => panic!("parse {p:?}, decoder {s:?}"),
-    }
+    contract::check_wire::<V1>(data);
+    contract::check_wire::<V2>(data);
+    contract::check_wire::<Tlv>(data);
+    contract::check_wire::<Ssl>(data);
+    contract::check_wire::<SslTlv>(data);
 
     // Headers built from socket addresses taken from the input read back.
     if let Some(a) = data.get(..38) {
@@ -81,10 +41,8 @@ fuzz_target!(|data: &[u8]| {
         ];
         for h in headers {
             contract::check_wire_value(&h);
-            let bytes = h.to_bytes();
-            let (back, n) = Header::parse(&bytes).unwrap().unwrap();
-            assert_eq!(back, h);
-            assert_eq!(n, bytes.len());
+            let bytes = h.to_bytes().unwrap();
+            assert_eq!(Header::parse(&bytes), Ok(h));
         }
     }
 
@@ -97,15 +55,14 @@ fuzz_target!(|data: &[u8]| {
         }
     }
     if let Ok(ssl) = Ssl::parse(data) {
-        assert_eq!(ssl.to_value(), data);
+        assert_eq!(ssl.to_bytes().unwrap(), data);
         let h = Header::V2(V2 { command: Command::Proxy, addresses: Addresses::Unspec, tlvs: vec![Tlv::Ssl(ssl)] });
-        let bytes = h.to_bytes();
-        assert_eq!(Header::parse(&bytes), Ok(Some((h, bytes.len()))));
+        let bytes = h.to_bytes().unwrap();
+        assert_eq!(Header::parse(&bytes), Ok(h));
     }
 
     // Headers with TLVs of every variant built from the input, including
-    // ones a writer must cut or leave out. What is written reads back, and
-    // writing that again gives the same bytes.
+    // oversized fields and variant aliases that writers refuse.
     let mut tlvs = Vec::new();
     let mut rest = data;
     while let [pick, len_hi, len_lo, tail @ ..] = rest {
@@ -115,7 +72,7 @@ fuzz_target!(|data: &[u8]| {
         let mut v = v.to_vec();
         v.resize(n, *pick);
         rest = next;
-        let sub = |v: &[u8]| v.chunks(7).map(|c| SslTlv::from_raw(0x21 + c[0] % 6, &c[1..])).collect();
+        let sub = |v: &[u8]| v.chunks(7).map(|c| SslTlv::from_raw(0x21 + c[0] % 6, &c[1..]).unwrap()).collect();
         tlvs.push(match pick % 9 {
             0 => Tlv::Alpn(v),
             1 => Tlv::Authority(v),
@@ -133,10 +90,6 @@ fuzz_target!(|data: &[u8]| {
     if !tlvs.is_empty() {
         let command = if data[0] & 0x80 == 0 { Command::Local } else { Command::Proxy };
         let h = Header::V2(V2 { command, addresses: Addresses::Unspec, tlvs });
-        let bytes = h.to_bytes();
-        assert!(bytes.len() <= MAX_HEADER_LEN);
-        let (back, n) = Header::parse(&bytes).unwrap().unwrap();
-        assert_eq!(n, bytes.len());
-        assert_eq!(back.to_bytes(), bytes);
+        contract::check_wire_value(&h);
     }
 });

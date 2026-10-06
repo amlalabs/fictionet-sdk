@@ -7,13 +7,13 @@ use fictionet::stdlib::{
 };
 
 use fictionet::stdlib::rfb::{
-    ClientMessage, ClientSession, Dialect, Error, PixelFormat, Phase, ServerInit, ServerMessage, ServerSession, Version,
+    ClientMessage, Client, Dialect, PixelFormat, Phase, ServerInit, ServerMessage, Server, Version, Text,
 };
 use libfuzzer_sys::fuzz_target;
 
 /// A server that answers whenever it is its turn, with VNC Authentication
 /// or None.
-fn server_turn(s: &ServerSession, vnc: bool) -> Option<ServerMessage> {
+fn server_turn(s: &Server, vnc: bool) -> Option<ServerMessage> {
     Some(match s.phase() {
         Phase::ServerVersion => ServerMessage::Version(Version::V3_8),
         Phase::SecurityOffer if s.dialect() == Dialect::V3_3 => ServerMessage::SecurityType(if vnc { 2 } else { 1 }),
@@ -28,7 +28,7 @@ fn server_turn(s: &ServerSession, vnc: bool) -> Option<ServerMessage> {
 }
 
 /// A client that answers whenever it is its turn.
-fn client_turn(s: &ClientSession, version: Version, vnc: bool) -> Option<ClientMessage> {
+fn client_turn(s: &Client, version: Version, vnc: bool) -> Option<ClientMessage> {
     Some(match s.phase() {
         Phase::ClientVersion => ClientMessage::Version(version),
         Phase::SecurityChoice => {
@@ -43,91 +43,17 @@ fn client_turn(s: &ClientSession, version: Version, vnc: bool) -> Option<ClientM
     })
 }
 
-/// Sends whatever the server has to send, then takes out what the client
-/// sent, until it needs more bytes. It returns false once the stream broke.
-fn server_pump(s: &mut ServerSession, vnc: bool, got: &mut Vec<Result<ClientMessage, Error>>) -> bool {
-    loop {
-        if let Some(m) = server_turn(s, vnc) {
-            s.send(&m).unwrap();
-            continue;
-        }
-        match s.next_message() {
-            Some(Ok(m)) => got.push(Ok(m)),
-            Some(Err(e)) => {
-                got.push(Err(e));
-                return false;
-            }
-            None => {
-                // Sends that do not change how the client's bytes split,
-                // between any two feeds.
-                if s.phase() == Phase::Normal {
-                    s.send(&ServerMessage::Bell).unwrap();
-                }
-                return true;
-            }
-        }
-    }
-}
-
-fn as_server<'a>(vnc: bool, chunks: impl Iterator<Item = &'a [u8]>) -> Vec<Result<ClientMessage, Error>> {
-    let mut s = ServerSession::new();
-    let mut got = Vec::new();
-    // The server speaks first, before any of the client's bytes come, so
-    // every chunking feeds them in the same phases.
-    server_pump(&mut s, vnc, &mut got);
-    for chunk in chunks {
-        s.feed(chunk);
-        if !server_pump(&mut s, vnc, &mut got) {
-            break;
-        }
-    }
-    got
-}
-
-fn as_client<'a>(
-    version: Version,
-    vnc: bool,
-    chunks: impl Iterator<Item = &'a [u8]>,
-) -> Vec<Result<(ServerMessage, PixelFormat), Error>> {
-    let mut s = ClientSession::new();
-    let mut got = Vec::new();
-    'feed: for chunk in chunks {
-        s.feed(chunk);
-        loop {
-            if let Some(m) = client_turn(&s, version, vnc) {
-                s.send(&m).unwrap();
-                continue;
-            }
-            match s.next_message() {
-                Some(Ok(m)) => got.push(Ok((m, s.pixel_format()))),
-                Some(Err(e)) => {
-                    got.push(Err(e));
-                    break 'feed;
-                }
-                None => {
-                    // A pointer event between feeds, even mid-update, must
-                    // not change what is read.
-                    if s.phase() == Phase::Normal {
-                        s.send(&ClientMessage::PointerEvent { buttons: 0, x: 1, y: 1 }).unwrap();
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    got
-}
-
 fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Version>(data);
+    contract::check_wire::<Text>(data);
     contract::check_wire::<PixelFormat>(data);
     contract::check_wire::<ServerInit>(data);
     contract::check_wire::<ClientMessage>(data);
     contract::check_wire_value(&ClientMessage::ClientCutText(
         data.iter().take(4097).copied().collect(),
     ));
-    contract::check_decode(ClientMessages::new, data);
-    contract::check_decode(ServerMessages::new, data);
+    contract::check_decode_with_alloc_limit(ClientMessages::new, data, 2 * fictionet::stdlib::rfb::MAX_CLIENT_MESSAGE);
+    contract::check_decode_with_alloc_limit(ServerMessages::new, data, 2 * fictionet::stdlib::rfb::MAX_MESSAGE);
     let selectors = [
         data.first().copied().unwrap_or(0),
         data.get(1).copied().unwrap_or(0),
@@ -168,57 +94,68 @@ fuzz_target!(|data: &[u8]| {
             ..PixelFormat::TRUE_COLOR_32
         },
     ][usize::from(selectors[3]) % 3];
-    contract::check_decode(
+    contract::check_decode_with_alloc_limit(
         || {
             let mut d = ClientMessages::with_limit(4096);
             d.set_phase(client_phase).unwrap();
             d
         },
         input,
+        8192,
     );
-    contract::check_decode(
+    contract::check_decode_with_alloc_limit(
         || {
             let mut d = ServerMessages::with_limit(4096);
             d.set_mode(server_phase, dialect, format).unwrap();
             d
         },
         input,
+        8192,
     );
     let Some((&choice, data)) = data.split_first() else { return };
     let vnc = choice & 1 == 1;
     let version = [Version::V3_3, Version::V3_7, Version::V3_8, Version { major: 3, minor: 889 }][usize::from(choice >> 1) % 4];
 
-    // The stream as a server reads it, split two ways: all at once, and a
-    // byte at a time.
-    let whole = as_server(vnc, std::iter::once(data));
-    assert_eq!(whole, as_server(vnc, data.chunks(1)));
-    for m in whole.iter().flatten() {
-        // A message read can be written, and reads back the same.
-        let bytes = m.to_bytes().unwrap();
-        if !m.is_handshake() {
-            assert_eq!(ClientMessage::parse(&bytes), Ok(Some((m.clone(), bytes.len()))));
+    // Exercise the sessions' two-direction state with bounded input.
+    let data = &data[..data.len().min(4096)];
+    let mut server = Server::with_limit(4096);
+    server.send(&ServerMessage::Version(Version::V3_8)).unwrap();
+    let _ = server.push(data);
+    loop {
+        if let Some(message) = server_turn(&server, vnc) {
+            server.send(&message).unwrap();
+            continue;
+        }
+        match server.next_message() {
+            Some(Ok(Ok(message))) => {
+                if !message.is_handshake() { contract::check_wire_value(&message); }
+            }
+            _ => break,
         }
     }
-
-    // The same bytes as a client reads them.
-    let whole = as_client(version, vnc, std::iter::once(data));
-    assert_eq!(whole, as_client(version, vnc, data.chunks(1)));
-    for (m, format) in whole.iter().flatten() {
-        if !m.is_handshake() {
-            let bytes = m.to_bytes(Dialect::V3_8, format).unwrap();
-            assert_eq!(ServerMessage::parse(&bytes, format), Ok(Some((m.clone(), bytes.len()))));
+    let mut client = Client::with_limit(4096);
+    let _ = client.push(data);
+    loop {
+        if let Some(message) = client_turn(&client, version, vnc) {
+            if client.send(&message).is_err() { break; }
+            continue;
+        }
+        match client.next_message() {
+            Some(Ok(Ok(message))) if !message.is_handshake() => {
+                let mut bytes = Vec::new();
+                message.write(client.dialect(), &client.pixel_format(), &mut bytes).unwrap();
+                assert_eq!(ServerMessage::parse(&bytes, &client.pixel_format()), Ok(message));
+            }
+            Some(Ok(Ok(_))) => {}
+            _ => break,
         }
     }
-
-    // Any bytes as a message on their own.
-    let _ = Version::parse(data);
-    if let Ok(Some((m, _))) = ClientMessage::parse(data) {
-        assert_eq!(ClientMessage::parse(&m.to_bytes().unwrap()).unwrap().unwrap().0, m);
-    }
-    let mut format = PixelFormat::TRUE_COLOR_32;
-    format.bits_per_pixel = [8, 16, 32, 24][usize::from(choice) % 4];
-    if let Ok(Some((m, _))) = ServerMessage::parse(data, &format) {
-        let bytes = m.to_bytes(Dialect::V3_8, &format).unwrap();
-        assert_eq!(ServerMessage::parse(&bytes, &format).unwrap().unwrap().0, m);
+    // Context-dependent writes are transactional too.
+    if let Ok(message) = ServerMessage::parse(data, &format) {
+        let mut bytes = vec![7, 8];
+        match message.write(dialect, &format, &mut bytes) {
+            Ok(()) => assert_eq!(ServerMessage::parse(&bytes[2..], &format), Ok(message)),
+            Err(_) => assert_eq!(bytes, [7, 8]),
+        }
     }
 });
