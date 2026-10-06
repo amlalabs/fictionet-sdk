@@ -2,9 +2,11 @@
 //! reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::pop3::{
-    Command, CommandDecoder, MAX_AUTH_LINE, MAX_COMMAND_LINE, Reply, ReplyDecoder, Request,
-    parse_scan_listing, parse_unique_id_listing, write_scan_listing, write_unique_id_listing,
+    Command, CommandDecoder, Commands, MAX_AUTH_LINE, MAX_COMMAND_LINE, MAX_REPLY_HELD, Output,
+    Replies, Reply, ReplyDecoder, ReplyItemError, Request, parse_scan_listing,
+    parse_unique_id_listing, write_scan_listing, write_unique_id_listing,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -14,6 +16,54 @@ fn multi_line(i: usize) -> bool {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode_with_held_limit(Commands::new, data, 0);
+    contract::check_decode_with_held_limit(
+        || {
+            let mut commands = Commands::new();
+            commands.expect_line().unwrap();
+            commands
+        },
+        data,
+        0,
+    );
+    // AUTH with one raw line selected, then LIST. Only a challenge comes
+    // back raw; any other line is AUTH's final reply.
+    contract::check_decode_with_held_limit(
+        || {
+            let mut replies = Replies::new();
+            replies.expect(false).unwrap();
+            replies.expect_line().unwrap();
+            replies.expect(true).unwrap();
+            replies.map(|item: Result<Output, ReplyItemError>| {
+                if let Ok(Output::Line(line)) = &item {
+                    assert!(line == b"+" || line.starts_with(b"+ "));
+                }
+                item
+            })
+        },
+        data,
+        MAX_REPLY_HELD,
+    );
+    for multi in [false, true] {
+        contract::check_decode_with_held_limit(
+            || {
+                let mut replies = Replies::new();
+                for _ in 0..4 {
+                    replies.expect(multi).unwrap();
+                }
+                replies.map(|item: Result<Output, ReplyItemError>| {
+                    if let Ok(Output::Reply(reply)) = &item {
+                        contract::check_wire_value(reply);
+                    }
+                    item
+                })
+            },
+            data,
+            MAX_REPLY_HELD,
+        );
+    }
+    contract::check_wire::<Command>(data);
+    contract::check_wire::<Reply>(data);
     // The stream as commands, split two ways: all at once, and a byte at a
     // time. A bad line spoils only itself, so every result is kept.
     let mut whole = CommandDecoder::new();
@@ -132,6 +182,22 @@ fuzz_target!(|data: &[u8]| {
         },
     };
     let has_body = reply.ok && reply.body.is_some();
+    contract::check_wire_value(&reply);
+    contract::check_wire_value(&Command {
+        keyword: sa.to_string(),
+        argument: Some(sb.to_string()),
+    });
+    if let Ok(bytes) = Wire::to_bytes(&reply) {
+        contract::check_decode_with_held_limit(
+            || {
+                let mut replies = Replies::new();
+                replies.expect(has_body).unwrap();
+                replies
+            },
+            &bytes,
+            MAX_REPLY_HELD,
+        );
+    }
     let bytes = reply.to_bytes();
     let (back, used) = Reply::parse(&bytes, has_body).unwrap().unwrap();
     assert_eq!(used, bytes.len());

@@ -30,6 +30,13 @@
 //! the grammar is an [`Error`] the server answers with `BAD`, and the
 //! stream goes on. A line or literal past the limits breaks the stream
 //! ([`Error::is_fatal`]), and a real server sends `* BYE` and closes it.
+//! New stacks use [`Commands`] or [`Responses`] with [`codec::Stream`].
+//! [`Wire`] adds exact parsing and strict, transactional writing. These APIs
+//! require CRLF and apply RFC 9051's non-synchronizing literal limit to
+//! commands. Server responses cannot use non-synchronizing literals.
+//! [`Commands::expect_line`] selects one raw AUTHENTICATE answer or IDLE
+//! `DONE` line between items, without interpreting command or literal syntax.
+//! Legacy parsers, decoders, and `to_bytes` methods keep their original behavior.
 //!
 //! ```
 //! use fictionet::stdlib::imap::{Decoder, Event, Response, Status};
@@ -50,6 +57,11 @@
 //! assert_eq!(reply.to_bytes(), b"a1 OK LOGIN completed\r\n");
 //! assert_eq!(decoder.next_event(), None);
 //! ```
+
+extern crate alloc;
+
+use self::alloc::{string::String, sync::Arc, vec::Vec};
+use super::codec::{self, Decode, Wire};
 
 /// The TCP port IMAP servers listen on.
 pub const PORT: u16 = 143;
@@ -625,6 +637,26 @@ pub enum Event {
         /// The literal's size, at most [`MAX_LITERAL`].
         size: usize,
     },
+}
+
+/// One command, literal continuation, or raw line from [`Commands`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Input {
+    /// A whole command.
+    Command(Command),
+    /// The client sent `{size}` and waits for a continuation request.
+    /// Send one, such as [`Response::continue_req`], and read the next item,
+    /// or call [`Commands::refuse_literal`] and answer `tag NO`.
+    /// Every line ending in `{size}` requests a continuation, even if its
+    /// start breaks the grammar; the whole command then yields [`Error::Syntax`].
+    Continue {
+        /// The command tag, if well-formed. Continuations share one copy.
+        tag: Option<Arc<str>>,
+        /// The literal's size, at most [`MAX_LITERAL`].
+        size: usize,
+    },
+    /// A raw line without CRLF, selected by [`Commands::expect_line`].
+    Line(Vec<u8>),
 }
 
 /// Splits the byte stream a client sends into commands. Feed it the bytes
@@ -1303,7 +1335,8 @@ fn fit(s: &str, max: usize) -> &str {
 
 /// The longest non-synchronizing literal a client sends, unless the
 /// server says it takes longer ones (RFC 9051, section 4.3).
-const MAX_NON_SYNC: usize = 4096;
+/// [`Commands`] enforces this limit without enabling the LITERAL+ extension.
+pub const MAX_NON_SYNC: usize = 4096;
 
 /// Writes ` value` for each value that fits. `out` holds only text so
 /// far; a CRLF will follow. For a client, where the bytes of each
@@ -1466,6 +1499,562 @@ impl Writer<'_> {
 /// literals.
 fn drop_nul(s: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     if s.contains(&0) { s.iter().copied().filter(|&b| b != 0).collect::<Vec<u8>>().into() } else { s.into() }
+}
+
+/// Local maximum line size, including CRLF, for the shared decoders.
+/// RFC 9051 defines no universal line maximum. The aggregate text limit
+/// [`MAX_TEXT`] also applies across all lines of one message.
+pub const MAX_LINE: usize = MAX_TEXT;
+/// Maximum assembled bytes and cached tag bytes in a shared decoder.
+pub const MAX_HELD: usize = MAX_MESSAGE + MAX_LINE;
+
+/// Why a shared IMAP decoder cannot continue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// A line exceeded its limit, ended early, or broke literal framing.
+    Line(codec::LineError),
+    /// A message or non-synchronizing literal exceeded its limit.
+    Limit(Error),
+    /// Storage for a bounded message could not be allocated.
+    Allocation,
+    /// EOF interrupted a literal or the command or response containing it.
+    Incomplete,
+    /// A raw line was requested while a command or literal was in progress.
+    State,
+}
+
+impl core::fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Line(e) => e.fmt(f),
+            Self::Limit(e) => e.fmt(f),
+            Self::Allocation => f.write_str("IMAP assembly allocation failed"),
+            Self::Incomplete => f.write_str("incomplete IMAP literal or message"),
+            Self::State => f.write_str("IMAP raw line requires a command boundary"),
+        }
+    }
+}
+impl core::error::Error for DecodeError {}
+
+/// Why bytes are not exactly one IMAP wire value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// A complete command or response is malformed.
+    Invalid(Error),
+    /// Line framing or assembly failed.
+    Framing(DecodeError),
+    /// No complete value was present.
+    Incomplete,
+    /// Bytes follow the value.
+    Trailing,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Invalid(e) => e.fmt(f),
+            Self::Framing(e) => e.fmt(f),
+            Self::Incomplete => f.write_str("incomplete IMAP value"),
+            Self::Trailing => f.write_str("bytes after IMAP value"),
+        }
+    }
+}
+impl core::error::Error for ParseError {}
+
+/// The value cannot be written within the limits without changing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("IMAP value cannot be written unchanged")
+    }
+}
+impl core::error::Error for WriteError {}
+
+impl Wire for Command {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    /// Reads one whole command, including counted literals and final CRLF.
+    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
+        let mut commands = Commands::new();
+        loop {
+            match commands.decode(bytes, true).map_err(ParseError::Framing)? {
+                codec::Step::Item(Ok(Input::Continue { .. }), used) | codec::Step::Skip(used) => {
+                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?;
+                }
+                codec::Step::Item(command, used) => {
+                    let command = command.map_err(ParseError::Invalid)?;
+                    if used != bytes.len() {
+                        return Err(ParseError::Trailing);
+                    }
+                    return match command {
+                        Input::Command(command) => Ok(command),
+                        Input::Continue { .. } | Input::Line(_) => Err(ParseError::Incomplete),
+                    };
+                }
+                _ => return Err(ParseError::Incomplete),
+            }
+        }
+    }
+
+    /// Appends bounded CRLF framing and literal bytes without normalization.
+    /// Errors leave `out` unchanged. Synchronizing literals still require
+    /// the peer's continuation before their payload is sent.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let bytes = self.to_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Response {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    /// Reads one whole response with CRLF framing and counted literal bytes.
+    fn parse(mut bytes: &[u8]) -> Result<Self, ParseError> {
+        let mut responses = Responses::new();
+        loop {
+            match responses.decode(bytes, true).map_err(ParseError::Framing)? {
+                codec::Step::Item(response, used) => {
+                    let response = response.map_err(ParseError::Invalid)?;
+                    if used != bytes.len() {
+                        return Err(ParseError::Trailing);
+                    }
+                    return Ok(response);
+                }
+                codec::Step::Skip(used) => {
+                    bytes = bytes.get(used..).ok_or(ParseError::Incomplete)?
+                }
+                _ => return Err(ParseError::Incomplete),
+            }
+        }
+    }
+
+    /// Appends bounded CRLF framing and literal bytes without normalization.
+    /// Refuses clipped or changed values before appending to `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let bytes = self.to_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+// A parsed value must also fit after canonical re-encoding. In particular,
+// a literal inside a section becomes quoted text in an Atom and may expand.
+fn codec_command(bytes: &[u8]) -> Result<Command, Error> {
+    let command = Command::parse(bytes)?;
+    if Command::parse(&command.to_bytes()).as_ref() != Ok(&command) {
+        return Err(Error::Syntax {
+            tag: Some(command.tag),
+            reason: "command cannot be written unchanged",
+        });
+    }
+    Ok(command)
+}
+
+fn codec_response(bytes: &[u8]) -> Result<Response, Error> {
+    let response = Response::parse(bytes)?;
+    if Response::parse(&response.to_bytes()).as_ref() != Ok(&response) {
+        return Err(Error::Syntax {
+            tag: None,
+            reason: "response cannot be written unchanged",
+        });
+    }
+    Ok(response)
+}
+
+enum MailFrame {
+    Continue { tag: Option<Arc<str>>, size: usize },
+    Message(Vec<u8>),
+}
+
+// Lines own only the scan cursor. Counted literal bytes bypass Lines and
+// enter this bounded assembly only when a Skip consumes them.
+struct MessageLines {
+    lines: codec::Lines,
+    message: Vec<u8>,
+    text: usize,
+    remaining: usize,
+    response: bool,
+    partial: bool,
+    kind: Option<Kind>,
+    tag: Option<Arc<str>>,
+    waiting: bool,
+}
+
+impl MessageLines {
+    fn new(response: bool) -> Self {
+        Self {
+            lines: codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf),
+            message: Vec::new(),
+            text: 0,
+            remaining: 0,
+            response,
+            partial: false,
+            kind: None,
+            tag: None,
+            waiting: false,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.lines = codec::Lines::new(MAX_LINE - 2, codec::Ending::Crlf);
+        self.message = Vec::new();
+        self.text = 0;
+        self.remaining = 0;
+        self.partial = false;
+        self.kind = None;
+        self.tag = None;
+        self.waiting = false;
+    }
+
+    fn held(&self) -> usize {
+        self.message
+            .len()
+            .saturating_add(self.tag.as_ref().map_or(0, |tag| tag.len()))
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), DecodeError> {
+        let size = self
+            .message
+            .len()
+            .checked_add(bytes.len())
+            .filter(|&n| n <= MAX_MESSAGE)
+            .ok_or(DecodeError::Limit(Error::TooLong))?;
+        if size > self.message.capacity() {
+            let target = size
+                .max(self.message.capacity().saturating_mul(2))
+                .min(MAX_MESSAGE);
+            self.message
+                .try_reserve_exact(target.saturating_sub(self.message.len()))
+                .map_err(|_| DecodeError::Allocation)?;
+        }
+        self.message.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn decode(
+        &mut self,
+        input: &[u8],
+        eof: bool,
+    ) -> Result<codec::Step<Result<MailFrame, Error>>, DecodeError> {
+        if self.remaining != 0 {
+            if input.is_empty() {
+                return if eof {
+                    Err(DecodeError::Incomplete)
+                } else {
+                    Ok(codec::Step::Need)
+                };
+            }
+            let used = self.remaining.min(input.len());
+            let part = input.get(..used).unwrap_or_default();
+            self.append(part)?;
+            self.remaining = self.remaining.saturating_sub(used);
+            self.waiting = false;
+            return Ok(codec::Step::Skip(used));
+        }
+        let step = match self.lines.decode(input, eof) {
+            Ok(step) => step,
+            Err(never) => match never {},
+        };
+        let (mut line, used) = match step {
+            codec::Step::Item(Ok(line), used) => (line, used),
+            codec::Step::Item(Err(codec::LineError::BareLf), used) => {
+                let mut candidate = input
+                    .get(..used)
+                    .unwrap_or_default()
+                    .strip_suffix(b"\n")
+                    .unwrap_or_default()
+                    .to_vec();
+                candidate.extend_from_slice(b"\r\n");
+                let literals = !self.response
+                    || self.kind.unwrap_or_else(|| classify(content(&candidate))) == Kind::Data;
+                if literals && marker(&candidate, !self.response).is_some() {
+                    return Err(DecodeError::Line(codec::LineError::BareLf));
+                }
+                let error = Error::Syntax {
+                    tag: self
+                        .tag
+                        .as_deref()
+                        .map(String::from)
+                        .or_else(|| tag_of(&candidate)),
+                    reason: "a line must end with CRLF",
+                };
+                self.reset();
+                return Ok(codec::Step::Item(Err(error), used));
+            }
+            codec::Step::Item(Err(e), _) => return Err(DecodeError::Line(e)),
+            codec::Step::Need if eof && !self.message.is_empty() => {
+                return Err(DecodeError::Incomplete);
+            }
+            codec::Step::Need => {
+                self.partial = !input.is_empty();
+                return Ok(codec::Step::Need);
+            }
+            codec::Step::Skip(used) => return Ok(codec::Step::Skip(used)),
+            codec::Step::End => return Ok(codec::Step::End),
+        };
+        self.partial = false;
+        self.waiting = false;
+        if self.message.is_empty() {
+            self.kind = Some(classify(&line));
+            self.tag = tag_of(&line).map(Arc::from);
+        }
+        line.extend_from_slice(b"\r\n");
+        self.text = self
+            .text
+            .checked_add(line.len())
+            .filter(|&n| n <= MAX_TEXT)
+            .ok_or(DecodeError::Limit(Error::TooLong))?;
+        let end = self
+            .message
+            .len()
+            .checked_add(line.len())
+            .filter(|&n| n <= MAX_MESSAGE)
+            .ok_or(DecodeError::Limit(Error::TooLong))?;
+        let literal = (!self.response || self.kind == Some(Kind::Data))
+            .then(|| marker(&line, !self.response))
+            .flatten();
+        if let Some((size, non_sync)) = literal {
+            let limit = if non_sync { MAX_NON_SYNC } else { MAX_LITERAL };
+            let count = usize::try_from(size)
+                .ok()
+                .filter(|&n| n <= limit)
+                .filter(|&n| end.checked_add(n).is_some_and(|total| total <= MAX_MESSAGE));
+            let Some(count) = count else {
+                let waiting = !self.response && !non_sync;
+                let error = Error::LiteralTooLarge {
+                    tag: self.tag.as_deref().map(String::from),
+                    size,
+                    waiting,
+                };
+                if waiting {
+                    self.reset();
+                    return Ok(codec::Step::Item(Err(error), used));
+                }
+                return Err(DecodeError::Limit(error));
+            };
+            self.append(&line)?;
+            self.remaining = count;
+            if !self.response && !non_sync {
+                self.waiting = true;
+                return Ok(codec::Step::Item(
+                    Ok(MailFrame::Continue {
+                        tag: self.tag.clone(),
+                        size: count,
+                    }),
+                    used,
+                ));
+            }
+            return Ok(codec::Step::Skip(used));
+        }
+        self.append(&line)?;
+        let message = core::mem::take(&mut self.message);
+        self.reset();
+        Ok(codec::Step::Item(Ok(MailFrame::Message(message)), used))
+    }
+}
+
+/// Reads commands and literal continuation events over [`codec::Lines`].
+///
+/// CRLF is required outside literals. Lines are bounded by [`MAX_LINE`],
+/// aggregate text by [`MAX_TEXT`], each literal by [`MAX_LITERAL`], and
+/// the assembly by [`MAX_MESSAGE`]. Non-synchronizing literals also obey
+/// [`MAX_NON_SYNC`]. Literal bytes may contain CRLF and bypass Lines.
+/// Retained state is bounded by [`MAX_HELD`]. Bytewise input takes linear time.
+///
+/// Syntax failures at known message boundaries are error items. An oversized
+/// synchronizing literal is also an item: the client is still waiting, so
+/// the world can refuse it. Line overflow, oversized non-synchronizing
+/// literals, and EOF during an assembly end the stream. After a continuation
+/// event, send the continuation and read on, or call
+/// [`refuse_literal`](Self::refuse_literal) between items.
+/// For AUTHENTICATE answers and IDLE's `DONE`, call
+/// [`expect_line`](Self::expect_line) between items. It returns one
+/// [`Input::Line`] under the same [`MAX_LINE`] limit, then resumes commands.
+/// The legacy [`Decoder`] keeps its void feed and original limits.
+///
+/// ```
+/// use fictionet::stdlib::{codec::Stream, imap::{Commands, Input}};
+/// let mut stream = Stream::new(Commands::new());
+/// let bytes = b"a LOGIN user {3}\r\nabc\r\n";
+/// assert_eq!(stream.push(bytes), bytes.len());
+/// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Continue { size: 3, .. })))));
+/// assert!(matches!(stream.next(), Some(Ok(Ok(Input::Command(_))))));
+/// ```
+pub struct Commands {
+    framing: MessageLines,
+    raw_line: bool,
+}
+
+impl Default for Commands {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Commands {
+    /// Creates a command decoder with no pending literal.
+    pub fn new() -> Self {
+        Self {
+            framing: MessageLines::new(false),
+            raw_line: false,
+        }
+    }
+
+    /// Selects one raw AUTHENTICATE answer or IDLE `DONE` line.
+    /// Call between items. Refuses a partial command, a pending literal, or
+    /// an already selected raw line without changing the mode. Literal-looking
+    /// text in this line is returned unchanged, without a continuation event.
+    pub fn expect_line(&mut self) -> Result<(), DecodeError> {
+        if self.raw_line
+            || self.framing.partial
+            || !self.framing.message.is_empty()
+            || self.framing.waiting
+            || self.framing.remaining != 0
+        {
+            return Err(DecodeError::State);
+        }
+        self.raw_line = true;
+        Ok(())
+    }
+
+    /// Drops the command at its synchronizing literal boundary.
+    /// Returns false unless the last continuation is still waiting.
+    /// Unread bytes remain in the stream and will be read as commands.
+    pub fn refuse_literal(&mut self) -> bool {
+        if !self.framing.waiting {
+            return false;
+        }
+        self.framing.reset();
+        true
+    }
+}
+
+impl Decode for Commands {
+    type Item = Result<Input, Error>;
+    type Error = DecodeError;
+    const NAME: &'static str = "IMAP commands";
+
+    fn capacity(&self) -> usize {
+        MAX_LINE
+    }
+
+    fn held(&self) -> usize {
+        self.framing.held()
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+        if self.raw_line {
+            let step = match self.framing.lines.decode(input, eof) {
+                Ok(step) => step,
+                Err(never) => match never {},
+            };
+            return Ok(match step {
+                codec::Step::Item(line, used) => {
+                    self.raw_line = false;
+                    self.framing.reset();
+                    let line = match line {
+                        Ok(line) => Ok(Input::Line(line)),
+                        Err(codec::LineError::BareLf) => Err(Error::Syntax {
+                            tag: None,
+                            reason: "a line must end with CRLF",
+                        }),
+                        Err(e) => return Err(DecodeError::Line(e)),
+                    };
+                    codec::Step::Item(line, used)
+                }
+                codec::Step::Need => {
+                    self.framing.partial = !input.is_empty();
+                    codec::Step::Need
+                }
+                codec::Step::Skip(used) => codec::Step::Skip(used),
+                codec::Step::End => codec::Step::End,
+            });
+        }
+        Ok(match self.framing.decode(input, eof)? {
+            codec::Step::Item(frame, used) => codec::Step::Item(
+                frame.and_then(|frame| match frame {
+                    MailFrame::Continue { tag, size } => Ok(Input::Continue { tag, size }),
+                    MailFrame::Message(bytes) => codec_command(&bytes).map(Input::Command),
+                }),
+                used,
+            ),
+            codec::Step::Skip(used) => codec::Step::Skip(used),
+            codec::Step::Need => codec::Step::Need,
+            codec::Step::End => codec::Step::End,
+        })
+    }
+}
+
+/// Reads responses over CRLF lines and counted literals.
+///
+/// Uses the same line, literal, assembly, and retained-state limits as
+/// [`Commands`]. Server literals must use `{n}`, never `{n+}`, and do not
+/// generate continuation events. A data response ending in `{n+}` is a
+/// syntax error item; the following line remains a separate response.
+/// A status or continuation response ending in `{n}` is ordinary text.
+/// Malformed complete responses are error items. Line overflow, oversized
+/// literals, and incomplete assemblies end the stream.
+/// The legacy [`ResponseDecoder`] keeps its void feed and repeating errors.
+pub struct Responses {
+    framing: MessageLines,
+}
+
+impl Default for Responses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Responses {
+    /// Creates a response decoder with no pending literal.
+    pub fn new() -> Self {
+        Self {
+            framing: MessageLines::new(true),
+        }
+    }
+}
+
+impl Decode for Responses {
+    type Item = Result<Response, Error>;
+    type Error = DecodeError;
+    const NAME: &'static str = "IMAP responses";
+
+    fn capacity(&self) -> usize {
+        MAX_LINE
+    }
+
+    fn held(&self) -> usize {
+        self.framing.held()
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<codec::Step<Self::Item>, DecodeError> {
+        Ok(match self.framing.decode(input, eof)? {
+            codec::Step::Item(frame, used) => codec::Step::Item(
+                frame.and_then(|frame| match frame {
+                    MailFrame::Message(bytes) => codec_response(&bytes),
+                    MailFrame::Continue { .. } => Err(Error::Syntax {
+                        tag: None,
+                        reason: "unexpected continuation event",
+                    }),
+                }),
+                used,
+            ),
+            codec::Step::Skip(used) => codec::Step::Skip(used),
+            codec::Step::Need => codec::Step::Need,
+            codec::Step::End => codec::Step::End,
+        })
+    }
 }
 
 #[cfg(test)]
