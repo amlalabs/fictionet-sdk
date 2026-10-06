@@ -2070,6 +2070,7 @@ fn regression_pipe_spans_cover_assembled_message() {
     assert_eq!(
         spans.iter().cloned().collect::<Vec<_>>(),
         vec![Span {
+            exact: false,
             inner: 0..4,
             outer: 0..8
         }]

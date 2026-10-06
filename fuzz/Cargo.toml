@@ -762,8 +762,43 @@ doc = false
 bench = false
 
 [[bin]]
+name = "observe_modbus"
+path = "fuzz_targets/observe_modbus.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "huffman"
 path = "fuzz_targets/huffman.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observe_dns"
+path = "fuzz_targets/observe_dns.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observe_dhcp"
+path = "fuzz_targets/observe_dhcp.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observe_http1"
+path = "fuzz_targets/observe_http1.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "observe_tls"
+path = "fuzz_targets/observe_tls.rs"
 test = false
 doc = false
 bench = false

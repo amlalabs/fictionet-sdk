@@ -123,6 +123,9 @@
 //! [`Decode`](stdlib::codec::Decode) and [`Wire`](stdlib::codec::Wire)
 //! implementations with [`Stream`](stdlib::codec::Stream). The
 //! `custom_protocol` example runs this workflow without network or root.
+//! Implement [`observe::Present`] to show its items and byte ranges, then
+//! add it to [`observe::Registry`]. Use [`observe::Dissector::with_registry`]
+//! for capture packets or [`Cx::observe_protocols`] for live watches.
 //!
 //! # Running a world
 //!

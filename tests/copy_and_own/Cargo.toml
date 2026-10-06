@@ -11,3 +11,6 @@ doctest = false
 
 [dependencies]
 fictionet = { path = "../..", default-features = false }
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+httparse = "1.10"
+ring = "0.17"
