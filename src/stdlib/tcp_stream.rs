@@ -73,7 +73,7 @@ pub enum TcpEvent {
         /// bytes. Buffered segments use `None`.
         input_offset: Option<usize>,
     },
-    /// A payload was dropped because a bound was reached.
+    /// A payload or FIN was dropped because a bound was reached.
     Gap {
         /// The direction with missing bytes.
         dir: FlowKey,
@@ -119,11 +119,14 @@ pub struct Reassembled {
     pub events: Vec<TcpEvent>,
 }
 
+#[derive(Debug)]
 struct Flow {
     isn: u32,
     next: Option<u32>,
-    // Relative sequence keys keep segments ordered across wire wraparound.
-    held: BTreeMap<u32, Vec<u8>>,
+    // Unwrapped position of next, including SYN, FIN, and skipped gaps.
+    position: u64,
+    // Keys use the same unwrapped positions, even after multiple wire wraps.
+    held: BTreeMap<u64, Vec<u8>>,
     held_bytes: usize,
     delivered: u64,
     opened: Option<(u32, u32)>,
@@ -135,6 +138,7 @@ impl Flow {
         Self {
             isn,
             next: None,
+            position: 0,
             held: BTreeMap::new(),
             held_bytes: 0,
             delivered: 0,
@@ -151,10 +155,13 @@ impl Flow {
         input_offset: Option<usize>,
     ) -> TcpEvent {
         let offset = self.delivered;
-        let Some(delivered) = u64::try_from(bytes.len())
-            .ok()
-            .and_then(|n| offset.checked_add(n))
-        else {
+        let Some((delivered, position, len)) = u32::try_from(bytes.len()).ok().and_then(|len| {
+            Some((
+                offset.checked_add(u64::from(len))?,
+                self.position.checked_add(u64::from(len))?,
+                len,
+            ))
+        }) else {
             return TcpEvent::Gap {
                 dir,
                 offset,
@@ -162,7 +169,8 @@ impl Flow {
             };
         };
         self.delivered = delivered;
-        self.next = Some(seq.wrapping_add(bytes.len() as u32));
+        self.position = position;
+        self.next = Some(seq.wrapping_add(len));
         TcpEvent::Bytes {
             dir,
             offset,
@@ -185,13 +193,20 @@ impl Flow {
 /// emits [`TcpEvent::Gap`], and drains its contiguous successors. With no
 /// buffered segment it reports a gap and keeps waiting. The limits are
 /// checked before replacement, including for retransmits of held data.
+/// A retransmit counts against `max_segments` even if it replaces a segment.
+/// One stalled direction can hold the entire shared `max_buffered` budget
+/// indefinitely. Other directions then drop out-of-order payloads until
+/// that state is drained, reset by SYN, or cleared by the flow limit.
 /// Returned events own their bytes and are outside the retained budget.
 ///
-/// TCP sequence comparisons and advances deliberately wrap modulo 2^32.
-/// As with TCP serial arithmetic, live sequence distances must be less
-/// than 2^31. Payloads longer than `i32::MAX` are dropped with a gap.
-/// Stream byte offsets use checked arithmetic; exhausting `u64` drops
-/// that output with a gap. Missing bytes never increase the byte offset.
+/// Wire sequence comparisons and advances deliberately wrap modulo 2^32.
+/// Incoming sequence distances must be less than 2^31. Held segments use
+/// unwrapped `u64` stream positions, so they stay ordered across wire wraps.
+/// Positions advance with payload, SYN, FIN, and resumed gaps. Payloads
+/// longer than `i32::MAX` are dropped with a gap. Positions and delivered
+/// byte offsets use checked arithmetic. Overflow drops the affected
+/// payload or FIN with a gap. Missing bytes, SYN, and FIN never increase
+/// the delivered byte offset.
 ///
 /// No application protocol types are required. Feed byte events to any
 /// decoder and reset its state when reassembly resumes after a gap.
@@ -208,6 +223,7 @@ impl Flow {
 /// assert_eq!(tcp.buffered(), 0);
 /// # Ok::<(), std::net::AddrParseError>(())
 /// ```
+#[derive(Debug)]
 pub struct Reassembler {
     limits: Limits,
     flows: HashMap<FlowKey, Flow>,
@@ -278,6 +294,7 @@ impl Reassembler {
             flags,
             payload,
         } = segment;
+        let payload_len = u32::try_from(payload.len()).ok();
         let mut result = Reassembled {
             rel_seq: 0,
             rel_ack: 0,
@@ -312,14 +329,13 @@ impl Reassembler {
             release(&mut self.held, flow.held_bytes);
             *flow = Flow::new(seq);
             flow.next = Some(seq.wrapping_add(1));
-            flow.opened = Some((
-                seq.wrapping_add(1),
-                seq.wrapping_add(1).wrapping_add(payload.len() as u32),
-            ));
+            flow.position = 1;
+            flow.opened =
+                payload_len.map(|len| (seq.wrapping_add(1), seq.wrapping_add(1).wrapping_add(len)));
         }
         result.rel_seq = seq.wrapping_sub(flow.isn);
         result.retransmission = flow.next.is_some_and(|next| {
-            !payload.is_empty() && !before(next, seq.wrapping_add(payload.len() as u32)) && !syn
+            payload_len.is_some_and(|len| len != 0 && !before(next, seq.wrapping_add(len)) && !syn)
         });
         let seq = if syn { seq.wrapping_add(1) } else { seq };
         let next = *flow.next.get_or_insert(seq);
@@ -332,26 +348,18 @@ impl Reassembler {
                 if let Some(bytes) = payload.get(skip..).filter(|b| !b.is_empty()) {
                     result.events.push(flow.bytes(key, next, bytes, Some(skip)));
                 }
-            } else if self
-                .held
-                .checked_add(payload.len())
-                .is_some_and(|n| n <= self.limits.max_buffered)
+            } else if let (Some(total), Some(local), Some(position)) = (
+                self.held.checked_add(payload.len()),
+                flow.held_bytes.checked_add(payload.len()),
+                flow.position.checked_add(u64::from(seq.wrapping_sub(next))),
+            ) && total <= self.limits.max_buffered
                 && flow.held.len() < self.limits.max_segments
             {
-                // The global check also bounds this direction's addition.
-                if let (Some(total), Some(local)) = (
-                    self.held.checked_add(payload.len()),
-                    flow.held_bytes.checked_add(payload.len()),
-                ) {
-                    self.held = total;
-                    flow.held_bytes = local;
-                    if let Some(old) = flow
-                        .held
-                        .insert(seq.wrapping_sub(flow.isn), payload.to_vec())
-                    {
-                        release(&mut flow.held_bytes, old.len());
-                        release(&mut self.held, old.len());
-                    }
+                self.held = total;
+                flow.held_bytes = local;
+                if let Some(old) = flow.held.insert(position, payload.to_vec()) {
+                    release(&mut flow.held_bytes, old.len());
+                    release(&mut self.held, old.len());
                 }
             } else {
                 gap = true;
@@ -359,17 +367,18 @@ impl Reassembler {
         }
         while let Some((&k, _)) = flow.held.first_key_value() {
             let next = flow.next.unwrap_or(seq);
-            let s = k.wrapping_add(flow.isn);
-            if before(next, s) && !gap {
-                break;
-            }
-            let Some((_, bytes)) = flow.held.pop_first() else {
-                break;
-            };
-            release(&mut flow.held_bytes, bytes.len());
-            release(&mut self.held, bytes.len());
-            if gap && before(next, s) {
-                flow.next = Some(s);
+            if k > flow.position {
+                if !gap {
+                    break;
+                }
+                let Some(jump) = k
+                    .checked_sub(flow.position)
+                    .and_then(|n| u32::try_from(n).ok())
+                else {
+                    break;
+                };
+                flow.next = Some(next.wrapping_add(jump));
+                flow.position = k;
                 gap = false;
                 result.events.push(TcpEvent::Gap {
                     dir: key,
@@ -377,16 +386,22 @@ impl Reassembler {
                     resumed: true,
                 });
             }
-            let next = flow.next.unwrap_or(s);
-            let skip = if before(s, next) {
-                next.wrapping_sub(s) as usize
-            } else {
-                0
+            let Some((_, bytes)) = flow.held.pop_first() else {
+                break;
+            };
+            release(&mut flow.held_bytes, bytes.len());
+            release(&mut self.held, bytes.len());
+            let Some(skip) = flow
+                .position
+                .checked_sub(k)
+                .and_then(|n| usize::try_from(n).ok())
+            else {
+                continue;
             };
             if let Some(tail) = bytes.get(skip..).filter(|b| !b.is_empty()) {
                 result
                     .events
-                    .push(flow.bytes(key, s.wrapping_add(skip as u32), tail, None));
+                    .push(flow.bytes(key, flow.next.unwrap_or(seq), tail, None));
             }
         }
         if gap {
@@ -396,9 +411,20 @@ impl Reassembler {
                 resumed: false,
             });
         }
-        let fin = flags & 0x01 != 0 && flow.next == Some(seq.wrapping_add(payload.len() as u32));
+        let mut fin = flags & 0x01 != 0
+            && payload_len.is_some_and(|len| flow.next == Some(seq.wrapping_add(len)));
         if fin {
-            flow.next = flow.next.map(|n| n.wrapping_add(1));
+            if let Some(position) = flow.position.checked_add(1) {
+                flow.next = flow.next.map(|n| n.wrapping_add(1));
+                flow.position = position;
+            } else {
+                fin = false;
+                result.events.push(TcpEvent::Gap {
+                    dir: key,
+                    offset: flow.delivered,
+                    resumed: false,
+                });
+            }
         }
         if !flow.ended && (fin || flags & 0x04 != 0) {
             flow.ended = true;
@@ -544,6 +570,95 @@ mod tests {
         assert_eq!(tcp.push(segment(1, 0x19, b"de")).events, [end]);
         assert!(tcp.push(segment(1, 0x19, b"de")).events.is_empty());
         assert_eq!(tcp.flows.get(&key()).unwrap().next, Some(4));
+    }
+
+    #[test]
+    fn held_segments_stay_ordered_after_a_full_sequence_wrap() {
+        let mut tcp = Reassembler::default();
+        let isn = 1000u32;
+        tcp.push(segment(isn, 2, b""));
+        let flow = tcp.flows.get_mut(&key()).unwrap();
+        flow.next = Some(isn.wrapping_sub(10));
+        flow.position = (1 << 32) - 10;
+        assert!(tcp.push(segment(isn + 2, 0x18, b"xyz")).events.is_empty());
+        assert!(
+            tcp.push(segment(isn - 5, 0x18, b"fghijkl"))
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            tcp.push(segment(isn - 10, 0x18, b"abcde")).events,
+            [
+                bytes(0, b"abcde", Some(0)),
+                bytes(5, b"fghijkl", None),
+                bytes(12, b"xyz", None)
+            ]
+        );
+        assert_eq!(tcp.buffered(), 0);
+    }
+
+    fn resume_two_large_gaps(tcp: &mut Reassembler, dropped: &[u8]) -> u32 {
+        tcp.push(segment(100, 2, b""));
+        let mut next = 101u32;
+        for offset in 0..2 {
+            let resumed = next.wrapping_add(3 << 29);
+            assert!(tcp.push(segment(resumed, 0x18, b"x")).events.is_empty());
+            assert_eq!(
+                tcp.push(segment(resumed.wrapping_add(100), 0x18, dropped))
+                    .events,
+                [gap(offset, true), bytes(offset, b"x", None)]
+            );
+            next = resumed.wrapping_add(1);
+        }
+        assert_eq!(tcp.buffered(), 0);
+        next
+    }
+
+    fn drain_near_bytes_before_distant_bytes(tcp: &mut Reassembler, next: u32) {
+        assert!(tcp.push(segment(next + 4, 0x18, b"BB")).events.is_empty());
+        assert!(
+            tcp.push(segment(next.wrapping_add(3 << 29), 0x18, b"C"))
+                .events
+                .is_empty()
+        );
+        assert_eq!(
+            tcp.push(segment(next, 0x18, b"AAAA")).events,
+            [bytes(2, b"AAAA", Some(0)), bytes(6, b"BB", None)]
+        );
+        assert_eq!(tcp.buffered(), 1);
+        assert_eq!(tcp.buffered_segments(key()), 1);
+        // Fill the budget to resume again and verify that C was retained.
+        assert_eq!(
+            tcp.push(segment(
+                next.wrapping_add(3 << 29).wrapping_add(100),
+                0x18,
+                b"drop"
+            ))
+            .events,
+            [gap(8, true), bytes(8, b"C", None)]
+        );
+        assert_eq!(tcp.buffered(), 0);
+    }
+
+    #[test]
+    fn held_segments_stay_ordered_after_large_gap_resumes() {
+        let mut tcp = Reassembler::new(Limits {
+            max_buffered: 1,
+            ..Limits::default()
+        });
+        let next = resume_two_large_gaps(&mut tcp, b"x");
+        tcp.limits.max_buffered = 4;
+        drain_near_bytes_before_distant_bytes(&mut tcp, next);
+    }
+
+    #[test]
+    fn public_pushes_keep_held_segments_ordered_after_large_gap_resumes() {
+        let mut tcp = Reassembler::new(Limits {
+            max_buffered: 4,
+            ..Limits::default()
+        });
+        let next = resume_two_large_gaps(&mut tcp, b"drop");
+        drain_near_bytes_before_distant_bytes(&mut tcp, next);
     }
 
     #[test]
@@ -789,6 +904,70 @@ mod tests {
             );
         }
         assert_eq!(tcp.buffered(), 0);
+    }
+
+    #[test]
+    fn in_order_fin_advances_the_position_before_held_bytes() {
+        let mut tcp = Reassembler::default();
+        tcp.push(segment(100, 2, b""));
+        tcp.push(segment(104, 0x18, b"d"));
+        assert_eq!(
+            tcp.push(segment(101, 0x11, b"ab")).events,
+            [
+                bytes(0, b"ab", Some(0)),
+                TcpEvent::End {
+                    dir: key(),
+                    offset: 2,
+                    reset: false
+                }
+            ]
+        );
+        assert_eq!(
+            tcp.push(segment(104, 0x10, b"")).events,
+            [bytes(2, b"d", None)]
+        );
+        assert_eq!(tcp.buffered(), 0);
+    }
+
+    #[test]
+    fn position_exhaustion_drops_payloads_and_fin_without_wrapping() {
+        for (seq, flags, payload) in [
+            (101, 0x18, b"x".as_slice()),
+            (102, 0x18, b"x".as_slice()),
+            (101, 0x11, b"".as_slice()),
+        ] {
+            let mut tcp = Reassembler::default();
+            tcp.push(segment(100, 2, b""));
+            tcp.flows.get_mut(&key()).unwrap().position = u64::MAX;
+            assert_eq!(
+                tcp.push(segment(seq, flags, payload)).events,
+                [gap(0, false)]
+            );
+            assert_eq!(tcp.buffered(), 0);
+            let flow = &tcp.flows[&key()];
+            assert_eq!(flow.position, u64::MAX);
+            assert_eq!(flow.next, Some(101));
+            assert_eq!(flow.delivered, 0);
+            assert!(!flow.ended);
+        }
+    }
+
+    #[test]
+    fn buffered_payload_cannot_overflow_the_position() {
+        let mut tcp = Reassembler::default();
+        tcp.push(segment(100, 2, b""));
+        tcp.flows.get_mut(&key()).unwrap().position = u64::MAX - 1;
+        assert!(tcp.push(segment(102, 0x18, b"xy")).events.is_empty());
+        assert_eq!(
+            tcp.push(segment(101, 0x18, b"a")).events,
+            [bytes(0, b"a", Some(0)), gap(1, false)]
+        );
+        assert_eq!(tcp.buffered(), 0);
+        assert_eq!(tcp.buffered_segments(key()), 0);
+        let flow = &tcp.flows[&key()];
+        assert_eq!(flow.position, u64::MAX);
+        assert_eq!(flow.next, Some(102));
+        assert_eq!(flow.delivered, 1);
     }
 
     #[test]

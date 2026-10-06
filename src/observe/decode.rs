@@ -383,7 +383,13 @@ impl Dissector {
         let (seq, ack, flags, win) = (be32(t, 4), be32(t, 8), t[13], be16(t, 14));
         let payload = (at + off, end);
         let key = (src, sport, dst, dport);
-        let flow = self.tcp.push(Segment { key, seq, ack, flags, payload: if self.headers_only { &[] } else { &p[payload.0..payload.1] } });
+        let flow = self.tcp.push(Segment {
+            key,
+            seq,
+            ack,
+            flags,
+            payload: &p[payload.0..payload.1],
+        });
         let (ckey, reversed) = conversation_key(key);
         if flow.cleared {
             self.conversations.clear();
@@ -437,9 +443,7 @@ impl Dissector {
         if self.headers_only {
             return;
         }
-        if flow.events.iter().any(|event| matches!(event, TcpEvent::Gap { resumed: false, .. })) {
-            d.tag("gap");
-        }
+        let mut gap = false;
         let layers = d.layers.len().checked_add(d.cut);
         let mut delivered = false;
         for event in flow.events {
@@ -454,11 +458,14 @@ impl Dissector {
                     let conversation = self.conversations.entry(ckey).or_insert_with(|| super::app::Conversation::new(ckey.1, ckey.3));
                     conversation.lost(reversed);
                 }
-                TcpEvent::Gap { resumed: false, .. } => {}
+                TcpEvent::Gap { resumed: false, .. } => gap = true,
                 // Presenters currently have no close hook. Keep their
                 // state until a SYN replaces the captured connection.
                 TcpEvent::End { .. } => {}
             }
+        }
+        if gap {
+            d.tag("gap");
         }
         if delivered && d.layers.len().checked_add(d.cut) == layers && self.conversations.get(&ckey).is_some_and(|c| c.waiting(reversed)) {
             d.info.push_str(" [part of a longer message]");
@@ -734,6 +741,26 @@ mod tests {
         p[12..16].copy_from_slice(&[10, 0, 0, 1]);
         p[16..20].copy_from_slice(&[10, 0, 0, 2]);
         p
+    }
+
+    #[test]
+    fn headers_only_keeps_fast_open_and_retransmission_state() {
+        for ack in [101u32, 103] {
+            let mut dis = Dissector::headers_only();
+            let syn = dis.decode(&tcp(40000, 80, 100, 0x02, b"ab"), &[]);
+            assert_eq!(syn.layers.len(), 2);
+            let mut syn_ack = tcp_back(500, 0x12, b"");
+            syn_ack[28..32].copy_from_slice(&ack.to_be_bytes());
+            dis.decode(&syn_ack, &[]);
+            let repeated = dis.decode(&tcp(40000, 80, 101, 0x18, b"ab"), &[]);
+            assert!(repeated.info.contains("Seq=1 "));
+            assert!(repeated.tags.contains(&"retransmission"));
+            let next = dis.decode(&tcp(40000, 80, 103, 0x18, b"cd"), &[]);
+            assert!(next.info.contains("Seq=3 "));
+            assert!(!next.tags.contains(&"retransmission"));
+            assert_eq!(next.layers.len(), 2);
+            assert!(dis.conversations.is_empty());
+        }
     }
 
     /// A response to HEAD has no body, whatever its content-length says,
