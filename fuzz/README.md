@@ -63,6 +63,7 @@ cargo +nightly fuzz list
 | `mongodb` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mongodb`: MongoDB |
 | `mqtt` | bytes and constructed values, checked with codec contracts | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mysql`: MySQL |
+| `http3` | bounded frame and stream contracts, field validation, connection routing, and QPACK pause/resume | `stdlib::http3`: HTTP/3 |
 | `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
 | `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
@@ -73,8 +74,8 @@ cargo +nightly fuzz list
 | `postgres` | startup, authentication, and typed messages | `stdlib::postgres`: frontend and backend decoders, wire types, and bounded-allocation codec contracts |
 | `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
-| `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
-| `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
+| `qpack` | wire values, bounded instruction contracts, tables, blocked sections, and acknowledgments | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
+| `quic` | datagram and payload wire contracts, every short-header ID length, and reassembly | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, bounded stream contracts, and strict value and command writers | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | exact wire values, session modes and bounded codec contracts | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
 | `rtp` | datagrams, RFC 4571 streams, strict values, and codec contracts | `stdlib::rtp`: RTP and multiplexed RTCP |

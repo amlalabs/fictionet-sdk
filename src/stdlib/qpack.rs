@@ -12,57 +12,40 @@
 //! which it may evict. This module follows RFC 9204, and RFC 7541 for the
 //! integer format and the Huffman code.
 //!
-//! New sessions use [`Table`], [`EncoderInstructions`], and
-//! [`DecoderInstructions`] with [`super::codec::Stream`]. Apply each
-//! instruction between items. [`decode_section`] returns fields and an
-//! acknowledgment or a [`BlockedSection`] the caller holds and retries.
-//! [`BlockedSections`] bounds held sections; [`Table::take_increment`] returns
-//! acknowledgment values for inserts not reported by section acknowledgments.
-//! The existing session below keeps its original behavior.
-//!
-//! Nothing here reads a socket. A world that plays an HTTP/3 server gives
-//! a [`Decoder`] the bytes of the peer's encoder stream and each request's
-//! field section, and writes what [`Decoder::take_decoder_stream`] returns
-//! to its own decoder stream. To answer, it encodes the response's fields
-//! with an [`Encoder`], writes [`Encoder::take_encoder_stream`] to its
-//! encoder stream, and reads the peer's decoder stream into
-//! [`Encoder::feed_decoder_stream`]. Which entries to insert is up to world
-//! code. The encoder only refers to entries the peer has acknowledged, so
-//! its field sections never block.
-//!
-//! Every reader checks lengths, indexes and sizes, because the agent can
-//! send any bytes it likes. Integers stop at [`MAX_INTEGER`], strings at
-//! [`MAX_STRING`], tables at [`MAX_TABLE_CAPACITY`] and field sections at
-//! [`MAX_FIELD_SECTION_SIZE`]. An error from [`Decoder::feed_encoder_stream`]
-//! is the connection error [`error_code::ENCODER_STREAM_ERROR`], one from
-//! [`Encoder::feed_decoder_stream`] is
-//! [`error_code::DECODER_STREAM_ERROR`], and one from decoding a field
-//! section is [`error_code::DECOMPRESSION_FAILED`].
+//! A server reads encoder instructions with
+//! [`Stream<EncoderInstructions>`](super::codec::Stream) and applies each to
+//! a [`Table`]. [`decode_section`] returns fields and an acknowledgment or a
+//! [`BlockedSection`] to hold and retry. [`BlockedSections`] bounds that queue.
+//! [`Encoder`] returns instruction and field-section values. Write those values
+//! with [`Wire::write`] and apply peer acknowledgments between decoded items.
+//! The encoder only references entries the peer has acknowledged.
 //!
 //! ```
-//! use fictionet::stdlib::qpack::{Decoder, Encoder, Field, Section};
+//! use fictionet::stdlib::{codec::Wire, qpack::{self, Encoder, Field, Table, SectionResult}};
 //!
-//! // RFC 9204 Appendix B.1: ":path: /index.html" as a literal with a
-//! // reference to static entry 1, and no dynamic table.
-//! let mut decoder = Decoder::new(4096, 16, 16 << 10);
-//! let mut section = vec![0x00, 0x00, 0x51, 0x0b];
-//! section.extend_from_slice(b"/index.html");
-//! let Section::Fields(fields) = decoder.decode_section(0, &section).unwrap() else { panic!() };
+//! // RFC 9204 Appendix B.1: a literal value with static name entry 1.
+//! let mut bytes = vec![0x00, 0x00, 0x51, 0x0b];
+//! bytes.extend_from_slice(b"/index.html");
+//! let SectionResult::Fields { fields, ack } = qpack::decode_section(&Table::new(4096), 0, &bytes).unwrap()
+//!     else { panic!("section is blocked") };
 //! assert_eq!(fields, [Field::new(":path", "/index.html")]);
+//! assert_eq!(ack, None);
 //!
-//! // An encoder inserts a field, the decoder reads the insert and
-//! // acknowledges it, and the encoder then refers to the entry.
 //! let mut encoder = Encoder::new(4096, 16 << 10);
-//! encoder.set_capacity(4096).unwrap();
-//! encoder.insert(b"x-trace", b"abc").unwrap();
-//! decoder.feed_encoder_stream(&encoder.take_encoder_stream()).unwrap();
-//! encoder.feed_decoder_stream(&decoder.take_decoder_stream()).unwrap();
+//! let mut table = Table::new(4096);
+//! table.apply(encoder.set_capacity(4096).unwrap()).unwrap();
+//! let (_, instruction) = encoder.insert(b"x-trace", b"abc").unwrap();
+//! table.apply(instruction).unwrap();
+//! encoder.apply_instruction(table.take_increment().unwrap()).unwrap();
 //! let fields = vec![Field::new(":method", "GET"), Field::new("x-trace", "abc")];
-//! let bytes = encoder.encode_section(4, &fields).unwrap();
+//! let section = encoder.section(4, &fields).unwrap();
+//! let bytes = section.to_bytes().unwrap();
 //! // Prefix, then static entry 17 and dynamic entry 0: four bytes.
 //! assert_eq!(bytes.len(), 4);
-//! let Section::Fields(back) = decoder.decode_section(4, &bytes).unwrap() else { panic!() };
+//! let SectionResult::Fields { fields: back, ack } = qpack::decode_section(&table, 4, &bytes).unwrap()
+//!     else { panic!("section is blocked") };
 //! assert_eq!(back, fields);
+//! encoder.apply_instruction(ack.unwrap()).unwrap();
 //! ```
 
 use std::collections::VecDeque;
@@ -70,13 +53,12 @@ use std::collections::VecDeque;
 use super::codec::{Decode, Step, Wire};
 
 /// The largest integer a reader accepts, 2^62 - 1, the largest QUIC stream
-/// ID. Writers lower larger values to it.
+/// ID. Larger values cannot be written.
 pub const MAX_INTEGER: u64 = (1 << 62) - 1;
-/// The longest string, before or after Huffman decoding. Writers, the
-/// Huffman encoder included, cut longer strings to this length.
+/// The longest string before or after Huffman decoding.
 pub const MAX_STRING: usize = 64 << 10;
 /// The largest dynamic table capacity. A larger maximum given to
-/// [`Decoder::new`] or [`Encoder::new`] still sets how Required Insert
+/// [`Table::new`] or [`Encoder::new`] still sets how Required Insert
 /// Counts are encoded, as RFC 9204 requires, but the table never grows past
 /// this. A decoder refuses a larger capacity, so a world should not
 /// advertise more.
@@ -93,11 +75,10 @@ pub const MAX_SECTION_BYTES: usize = MAX_FIELD_SECTION_SIZE as usize + 64;
 /// The most fields one field section may hold.
 pub const MAX_FIELDS: usize = 4096;
 /// The most streams a decoder lets wait for inserts. A larger number given
-/// to [`Decoder::new`] is lowered to it.
+/// to [`BlockedSections::new`] is lowered to it.
 pub const MAX_BLOCKED_STREAMS: usize = 256;
 /// The most bytes of field sections a decoder holds: those waiting for
-/// inserts, and those released but not yet taken from
-/// [`Decoder::unblocked`].
+/// inserts in [`BlockedSections`].
 pub const MAX_BLOCKED_BYTES: usize = 1 << 20;
 /// The most field sections a decoder holds, counted as for
 /// [`MAX_BLOCKED_BYTES`]. One stream may have several, such as a header and
@@ -110,10 +91,6 @@ pub const MAX_INSTRUCTION: usize = 2 * (10 + MAX_STRING);
 /// Maximum encoded prefixed integer: one prefix byte and nine continuation bytes.
 /// Every decoder-stream instruction consists of exactly one such integer.
 pub const MAX_INTEGER_BYTES: usize = 10;
-/// The most bytes an encoder or decoder holds for its stream before they
-/// are taken. Past it, a call that would add more is [`Error::Backlog`];
-/// one instruction may take the total past it.
-pub const MAX_PENDING_STREAM: usize = 1 << 20;
 /// The most field sections an encoder tracks while it waits for their
 /// acknowledgments. Past it, the encoder stops using the dynamic table.
 pub const MAX_OUTSTANDING: usize = 1024;
@@ -279,9 +256,6 @@ pub enum Error {
     Increment,
     /// A Section Acknowledgment for a stream with no section waiting.
     UnknownStream(u64),
-    /// A section would block more streams than allowed, or would hold
-    /// more than [`MAX_BLOCKED_SECTIONS`] or [`MAX_BLOCKED_BYTES`].
-    TooManyBlocked,
     /// A field section larger than the limit on field section size.
     FieldSectionTooLarge,
     /// A field section with more than [`MAX_FIELDS`] fields.
@@ -290,11 +264,8 @@ pub enum Error {
     /// field section not yet acknowledged refers to, or one whose insert
     /// the decoder has not acknowledged.
     Referenced,
-    /// At least [`MAX_PENDING_STREAM`] bytes wait to be taken with
-    /// [`Encoder::take_encoder_stream`] or [`Decoder::take_decoder_stream`].
-    /// Nothing changed; take them and try again. This is the caller's
-    /// state, not the peer's fault, and not a connection error.
-    Backlog,
+    /// The value cannot be written without changing it.
+    Unwritable,
 }
 
 impl std::fmt::Display for Error {
@@ -313,11 +284,10 @@ impl std::fmt::Display for Error {
             Error::ZeroIncrement => f.write_str("Insert Count Increment of 0"),
             Error::Increment => f.write_str("Insert Count Increment past the inserts"),
             Error::UnknownStream(s) => write!(f, "no section waiting on stream {s}"),
-            Error::TooManyBlocked => f.write_str("too many blocked streams"),
             Error::FieldSectionTooLarge => f.write_str("field section too large"),
             Error::TooManyFields => f.write_str("too many fields"),
             Error::Referenced => f.write_str("would evict an entry still in use"),
-            Error::Backlog => f.write_str("too many stream bytes not yet taken"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -397,7 +367,7 @@ impl<'a> Cursor<'a> {
 }
 
 /// A string as sent. Readers decode it only once the whole instruction or
-/// field line is there, so bytes fed one at a time cost linear time.
+/// field line is there, so bytes pushed one at a time cost linear time.
 struct RawString<'a> {
     huffman: bool,
     bytes: &'a [u8],
@@ -409,14 +379,9 @@ impl RawString<'_> {
     }
 }
 
-/// Appends `v` as an integer with a `prefix`-bit prefix (1 to 8 bits),
-/// the bits above it set to `flags`. Bits of `flags` inside the prefix are
-/// ignored. Values above [`MAX_INTEGER`] are lowered to it.
-pub fn encode_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, v: u64) {
-    let prefix = prefix.clamp(1, 8);
-    let v = v.min(MAX_INTEGER);
+// All callers validate the prefix, flags, and value before writing.
+fn put_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, v: u64) {
     let max = (1u64 << prefix) - 1;
-    let flags = flags & !(max as u8);
     if v < max {
         out.push(flags | v as u8);
         return;
@@ -430,28 +395,97 @@ pub fn encode_integer(out: &mut Vec<u8>, prefix: u8, flags: u8, v: u64) {
     out.push(rest as u8);
 }
 
-/// Reads an integer with a `prefix`-bit prefix (1 to 8 bits) from the
-/// start of `b`. It returns `Ok(None)` if `b` holds only part of one, and
-/// otherwise the value and how many bytes it took.
-pub fn decode_integer(b: &[u8], prefix: u8) -> Result<Option<(u64, usize)>, Error> {
-    let mut c = Cursor { b, i: 0 };
-    match c.int(prefix.clamp(1, 8)) {
-        Ok(v) => Ok(Some((v, c.i))),
-        Err(Stop::More) => Ok(None),
-        Err(Stop::Bad(e)) => Err(e),
+/// A prefixed integer and the flags above its `PREFIX` low bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Integer<const PREFIX: u8> {
+    /// Bits outside the integer prefix.
+    pub flags: u8,
+    /// The integer, at most [`MAX_INTEGER`].
+    pub value: u64,
+}
+
+impl<const PREFIX: u8> Wire for Integer<PREFIX> {
+    type ParseError = ParseError;
+    type WriteError = Error;
+
+    /// Reads one integer. Refuses invalid prefix widths, overflow, truncation, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        if !(1..=8).contains(&PREFIX) {
+            return Err(ParseError::Instruction(Error::IntegerOverflow));
+        }
+        let mut c = Cursor { b: bytes, i: 0 };
+        let value = c.int(PREFIX).map_err(parse_stop)?;
+        let mask = ((1u16 << PREFIX) - 1) as u8;
+        exact(Ok((Self { flags: bytes[0] & !mask, value }, c.i)), bytes.len())
+    }
+
+    /// Writes one integer. Refuses invalid prefix widths, overlapping flags, and overflow.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if !(1..=8).contains(&PREFIX) || self.value > MAX_INTEGER {
+            return Err(Error::Unwritable);
+        }
+        let mask = ((1u16 << PREFIX) - 1) as u8;
+        if self.flags & mask != 0 {
+            return Err(Error::Unwritable);
+        }
+        put_integer(out, PREFIX, self.flags, self.value);
+        Ok(())
+    }
+}
+
+fn parse_stop(stop: Stop) -> ParseError {
+    match stop {
+        Stop::More => ParseError::Truncated,
+        Stop::Bad(error) => ParseError::Instruction(error),
+    }
+}
+
+fn exact<T>(result: Result<(T, usize), ParseError>, len: usize) -> Result<T, ParseError> {
+    let (value, used) = result?;
+    if used != len {
+        return Err(ParseError::Trailing);
+    }
+    Ok(value)
+}
+
+/// A string encoded with the RFC 7541 Huffman code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HuffmanString(
+    /// Decoded bytes, at most [`MAX_STRING`].
+    pub Vec<u8>,
+);
+
+impl Wire for HuffmanString {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a Huffman string. Refuses invalid codes, padding, and excessive decoded length.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.len() > MAX_STRING * 30 / 8 {
+            return Err(Error::StringTooLong);
+        }
+        huffman_decode(bytes).map(Self)
+    }
+
+    /// Writes a Huffman string with terminal one bits. Refuses more than [`MAX_STRING`] bytes.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.len() > MAX_STRING {
+            return Err(Error::Unwritable);
+        }
+        huffman_encode_into(out, &self.0);
+        Ok(())
     }
 }
 
 /// Appends `s` as a string with a `prefix`-bit length, Huffman-coded if
-/// that is shorter. Strings longer than [`MAX_STRING`] are cut.
+/// that is shorter. Callers check [`MAX_STRING`] first.
 fn put_string(out: &mut Vec<u8>, prefix: u8, flags: u8, s: &[u8]) {
-    let s = &s[..s.len().min(MAX_STRING)];
     let h = huffman_len(s);
     if h < s.len() {
-        encode_integer(out, prefix, flags | (1 << prefix), h as u64);
+        put_integer(out, prefix, flags | (1 << prefix), h as u64);
         huffman_encode_into(out, s);
     } else {
-        encode_integer(out, prefix, flags, s.len() as u64);
+        put_integer(out, prefix, flags, s.len() as u64);
         out.extend_from_slice(s);
     }
 }
@@ -514,25 +548,13 @@ const fn build_huffman() -> Huffman {
     h
 }
 
-/// How many bytes [`huffman_encode`] makes of `s`: `s` cut to
-/// [`MAX_STRING`], Huffman-coded.
-pub fn huffman_len(s: &[u8]) -> usize {
-    let s = &s[..s.len().min(MAX_STRING)];
+// Callers bound the input by MAX_STRING before counting bits.
+fn huffman_len(s: &[u8]) -> usize {
     let bits: usize = s.iter().map(|&b| usize::from(HUFFMAN_LENGTHS[usize::from(b)])).sum();
     bits.div_ceil(8)
 }
 
-/// `s` Huffman-coded, padded with 1 bits. Like the other writers, it cuts
-/// `s` to [`MAX_STRING`] bytes, so [`huffman_decode`] always reads the
-/// result back.
-pub fn huffman_encode(s: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(huffman_len(s));
-    huffman_encode_into(&mut out, s);
-    out
-}
-
 fn huffman_encode_into(out: &mut Vec<u8>, s: &[u8]) {
-    let s = &s[..s.len().min(MAX_STRING)];
     let (mut acc, mut bits) = (0u64, 0u32);
     for &b in s {
         let len = u32::from(HUFFMAN_LENGTHS[usize::from(b)]);
@@ -553,7 +575,7 @@ fn huffman_encode_into(out: &mut Vec<u8>, s: &[u8]) {
 /// Decodes a Huffman-coded string. Padding must be fewer than 8 bits, all
 /// 1s, and the end-of-string code may not appear. The result is at most
 /// [`MAX_STRING`] bytes.
-pub fn huffman_decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
+fn huffman_decode(bytes: &[u8]) -> Result<Vec<u8>, Error> {
     let h = &HUFFMAN;
     let mut out = Vec::with_capacity((bytes.len().saturating_mul(8) / 5).min(MAX_STRING));
     let (mut code, mut len) = (0u32, 0usize);
@@ -612,36 +634,49 @@ impl Field {
 }
 
 fn entry_size(name: &[u8], value: &[u8]) -> u64 {
-    name.len() as u64 + value.len() as u64 + ENTRY_OVERHEAD
+    (name.len() as u64).saturating_add(value.len() as u64).saturating_add(ENTRY_OVERHEAD)
 }
 
 /// The dynamic table: entries inserted in order, each with an absolute
 /// index counting from 0, the oldest evicted first when room is needed.
 /// Both sides of a connection keep one, and keep it the same.
+///
+/// Byte decoders do not borrow or modify it. The receiver applies one
+/// instruction between items and lends the table to [`decode_section`].
+/// Blocked sections and output bytes stay with the caller. The encoding
+/// role uses [`Encoder`] to protect entries awaiting acknowledgment.
+/// Section decoding borrows `&Table`: entries are read-only, while a
+/// [`core::cell::Cell`] tracks reported inserts. This makes the table `!Sync`.
+/// Send every returned Section Ack, even if its stream is reset and a Stream
+/// Cancel is also sent. Decoding already counts the ack as reported; dropping
+/// it would make later [`Table::take_increment`] values too small.
+/// Send acknowledgments in return order before taking an increment.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DynamicTable {
+pub struct Table {
     entries: VecDeque<(Vec<u8>, Vec<u8>)>,
     size: u64,
     capacity: u64,
     max_capacity: u64,
     advertised: u64,
     inserted: u64,
+    reported: core::cell::Cell<u64>,
 }
 
-impl DynamicTable {
+impl Table {
     /// An empty table with capacity 0, for a decoder that advertised
     /// `max_capacity` as its SETTINGS_QPACK_MAX_TABLE_CAPACITY. The
     /// capacity may grow to `max_capacity` lowered to
     /// [`MAX_TABLE_CAPACITY`]; Required Insert Counts are encoded with
     /// `max_capacity` as advertised.
-    pub fn new(max_capacity: u64) -> DynamicTable {
-        DynamicTable {
+    pub fn new(max_capacity: u64) -> Table {
+        Table {
             entries: VecDeque::new(),
             size: 0,
             capacity: 0,
             max_capacity: max_capacity.min(MAX_TABLE_CAPACITY),
             advertised: max_capacity,
             inserted: 0,
+            reported: core::cell::Cell::new(0),
         }
     }
 
@@ -727,18 +762,58 @@ impl DynamicTable {
 
     /// Inserts an entry, evicting the oldest entries to make room, and
     /// returns its absolute index. An entry larger than the capacity is
-    /// [`Error::EntryTooLarge`], and the table is left as it was.
-    pub fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) -> Result<u64, Error> {
+    /// [`Error::EntryTooLarge`]. Strings above [`MAX_STRING`] and an exhausted
+    /// insert-count range are refused. Errors leave the table unchanged.
+    pub fn insert(&mut self, mut name: Vec<u8>, mut value: Vec<u8>) -> Result<u64, Error> {
+        check_strings(&name, &value)?;
         let size = entry_size(&name, &value);
         if size > self.capacity {
             return Err(Error::EntryTooLarge);
         }
         let index = self.inserted;
-        self.inserted = index.checked_add(1).ok_or(Error::IntegerOverflow)?;
+        self.inserted = index.checked_add(1).filter(|n| *n <= MAX_INTEGER).ok_or(Error::IntegerOverflow)?;
         self.evict_to(self.capacity - size);
         self.size += size;
+        name.shrink_to_fit();
+        value.shrink_to_fit();
         self.entries.push_back((name, value));
         Ok(index)
+    }
+
+    /// Applies one encoder instruction between decoded items.
+    /// Errors leave the table unchanged. Application errors are session
+    /// decisions; the instruction decoder only establishes its boundary.
+    pub fn apply(&mut self, instruction: EncoderInstruction) -> Result<(), Error> {
+        check_encoder_instruction(&instruction)?;
+        let (name, value) = match instruction {
+            EncoderInstruction::SetCapacity(n) => return self.set_capacity(n),
+            EncoderInstruction::InsertWithLiteralName { name, value } => (name, value),
+            EncoderInstruction::InsertWithNameRef { static_table: true, index, value } => {
+                let (name, _) = static_entry(index).ok_or(Error::StaticIndex(index))?;
+                (name.as_bytes().to_vec(), value)
+            }
+            EncoderInstruction::InsertWithNameRef { static_table: false, index, value } => {
+                let (name, _) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
+                (name.to_vec(), value)
+            }
+            EncoderInstruction::Duplicate(index) => {
+                let (name, value) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
+                (name.to_vec(), value.to_vec())
+            }
+        };
+        self.insert(name, value)?;
+        Ok(())
+    }
+    /// Takes an Insert Count Increment for received inserts not yet reported.
+    /// Section acknowledgments returned by [`decode_section`] or
+    /// [`BlockedSection::retry`] already report their Required Insert Counts.
+    /// Send those values first, then this value, on the decoder stream.
+    /// No bytes are queued; a second call without new inserts returns `None`.
+    pub fn take_increment(&mut self) -> Option<DecoderInstruction> {
+        let count = self.insert_count();
+        let increment = count.saturating_sub(self.reported.get());
+        self.reported.set(count);
+        (increment != 0).then_some(DecoderInstruction::InsertCountIncrement(increment))
     }
 
     fn evict_to(&mut self, room: u64) {
@@ -774,15 +849,26 @@ impl DynamicTable {
 
 /// An instruction on the encoder stream, which changes the dynamic table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum EncoderInstruction {
     /// Set the table's capacity.
     SetCapacity(u64),
     /// Insert an entry with `value` and the name of static entry `index`,
     /// or of the dynamic entry at relative `index` (0 is the newest).
-    InsertWithNameRef { static_table: bool, index: u64, value: Vec<u8> },
+    InsertWithNameRef {
+        /// Whether the index refers to the static table.
+        static_table: bool,
+        /// The table index described by this variant.
+        index: u64,
+        /// The field value bytes.
+        value: Vec<u8>,
+    },
     /// Insert an entry with this name and value.
-    InsertWithLiteralName { name: Vec<u8>, value: Vec<u8> },
+    InsertWithLiteralName {
+        /// The field name bytes.
+        name: Vec<u8>,
+        /// The field value bytes.
+        value: Vec<u8>,
+    },
     /// Insert a copy of the dynamic entry at this relative index.
     Duplicate(u64),
 }
@@ -791,7 +877,7 @@ impl EncoderInstruction {
     /// Reads the instruction at the start of `b`. It returns `Ok(None)` if
     /// `b` holds only part of one, and otherwise the instruction and how
     /// many bytes it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(EncoderInstruction, usize)>, Error> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(EncoderInstruction, usize)>, Error> {
         let mut c = Cursor { b, i: 0 };
         let read = |c: &mut Cursor| -> Result<EncoderInstruction, Stop> {
             let first = c.peek()?;
@@ -816,26 +902,6 @@ impl EncoderInstruction {
             Err(Stop::Bad(e)) => Err(e),
         }
     }
-
-    /// The instruction's bytes. Strings are Huffman-coded when that is
-    /// shorter. Integers above [`MAX_INTEGER`] are lowered to it and
-    /// strings longer than [`MAX_STRING`] are cut.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            EncoderInstruction::SetCapacity(c) => encode_integer(&mut out, 5, 0x20, *c),
-            EncoderInstruction::InsertWithNameRef { static_table, index, value } => {
-                encode_integer(&mut out, 6, if *static_table { 0xc0 } else { 0x80 }, *index);
-                put_string(&mut out, 7, 0, value);
-            }
-            EncoderInstruction::InsertWithLiteralName { name, value } => {
-                put_string(&mut out, 5, 0x40, name);
-                put_string(&mut out, 7, 0, value);
-            }
-            EncoderInstruction::Duplicate(i) => encode_integer(&mut out, 5, 0, *i),
-        }
-        out
-    }
 }
 
 /// An instruction on the decoder stream, which tells the encoder what the
@@ -857,7 +923,7 @@ impl DecoderInstruction {
     /// `b` holds only part of one, and otherwise the instruction and how
     /// many bytes it took. An increment of 0 is read; an [`Encoder`]
     /// refuses it.
-    pub fn parse(b: &[u8]) -> Result<Option<(DecoderInstruction, usize)>, Error> {
+    fn parse_prefix(b: &[u8]) -> Result<Option<(DecoderInstruction, usize)>, Error> {
         let mut c = Cursor { b, i: 0 };
         let read = |c: &mut Cursor| -> Result<DecoderInstruction, Stop> {
             let first = c.peek()?;
@@ -874,18 +940,6 @@ impl DecoderInstruction {
             Err(Stop::More) => Ok(None),
             Err(Stop::Bad(e)) => Err(e),
         }
-    }
-
-    /// The instruction's bytes. Integers above [`MAX_INTEGER`] are lowered
-    /// to it.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            DecoderInstruction::SectionAck(s) => encode_integer(&mut out, 7, 0x80, *s),
-            DecoderInstruction::StreamCancel(s) => encode_integer(&mut out, 6, 0x40, *s),
-            DecoderInstruction::InsertCountIncrement(n) => encode_integer(&mut out, 6, 0, *n),
-        }
-        out
     }
 }
 
@@ -964,50 +1018,172 @@ impl SectionPrefix {
         }
     }
 
-    /// The prefix's bytes, for a decoder with `max_entries`. A nonzero
+    /// The wire prefix for a decoder with `max_entries`. A nonzero
     /// count with `max_entries` 0, or a Base more than [`MAX_INTEGER`] from
     /// the count, is an error. The prefix reads back the same only if the
     /// decoder's insert count is within `max_entries` of the required one,
     /// as it is when the section's entries are in its table.
-    pub fn to_bytes(&self, max_entries: u64) -> Result<Vec<u8>, Error> {
+    pub fn encoded(&self, max_entries: u64) -> Result<EncodedPrefix, Error> {
         let required = self.required_insert_count;
-        let encoded = encode_insert_count(required, max_entries).ok_or(Error::InsertCount)?;
-        let (sign, delta) =
-            if self.base >= required { (0, self.base - required) } else { (0x80, required - self.base - 1) };
-        if delta > MAX_INTEGER {
-            return Err(Error::IntegerOverflow);
+        let encoded = encode_insert_count(required, max_entries).ok_or(Error::Unwritable)?;
+        if encoded > MAX_INTEGER {
+            return Err(Error::Unwritable);
         }
-        let mut out = Vec::new();
-        encode_integer(&mut out, 8, 0, encoded);
-        encode_integer(&mut out, 7, sign, delta);
-        Ok(out)
+        let negative = self.base < required;
+        let delta_base = if negative { required - self.base - 1 } else { self.base - required };
+        if delta_base > MAX_INTEGER {
+            return Err(Error::Unwritable);
+        }
+        Ok(EncodedPrefix { encoded_insert_count: encoded, negative, delta_base })
+    }
+}
+
+/// The two encoded integers at the start of a field section.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EncodedPrefix {
+    /// Required Insert Count modulo the advertised table size.
+    pub encoded_insert_count: u64,
+    /// Whether Base is below Required Insert Count.
+    pub negative: bool,
+    /// The difference used to recover Base.
+    pub delta_base: u64,
+}
+
+impl EncodedPrefix {
+    fn parse_prefix(bytes: &[u8]) -> Result<(Self, usize), ParseError> {
+        let mut c = Cursor { b: bytes, i: 0 };
+        let encoded_insert_count = c.int(8).map_err(parse_stop)?;
+        let negative = c.peek().map_err(parse_stop)? & 0x80 != 0;
+        let delta_base = c.int(7).map_err(parse_stop)?;
+        Ok((Self { encoded_insert_count, negative, delta_base }, c.i))
+    }
+}
+
+impl Wire for EncodedPrefix {
+    type ParseError = ParseError;
+    type WriteError = Error;
+
+    /// Reads one prefix. Refuses overflowing integers, truncation, and trailing bytes.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        exact(Self::parse_prefix(bytes), bytes.len())
+    }
+
+    /// Writes one prefix. Refuses integers above [`MAX_INTEGER`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.encoded_insert_count > MAX_INTEGER || self.delta_base > MAX_INTEGER {
+            return Err(Error::Unwritable);
+        }
+        put_integer(out, 8, 0, self.encoded_insert_count);
+        put_integer(out, 7, if self.negative { 0x80 } else { 0 }, self.delta_base);
+        Ok(())
+    }
+}
+
+/// An encoded field section before references are resolved against a table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FieldSection {
+    /// Insert-count and Base information.
+    pub prefix: EncodedPrefix,
+    /// Field lines in their transmitted order.
+    pub representations: Vec<Representation>,
+}
+
+impl Wire for FieldSection {
+    type ParseError = ParseError;
+    type WriteError = Error;
+
+    /// Reads a complete section. Refuses malformed lines, truncation, and section size or count limits.
+    /// Table-dependent reference checks belong to [`decode_section`].
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        if bytes.len() > MAX_SECTION_BYTES {
+            return Err(ParseError::Instruction(Error::FieldSectionTooLarge));
+        }
+        let (prefix, mut used) = EncodedPrefix::parse_prefix(bytes)?;
+        let mut representations = Vec::new();
+        while used < bytes.len() {
+            if representations.len() == MAX_FIELDS {
+                return Err(ParseError::Instruction(Error::TooManyFields));
+            }
+            let (rep, n) = Representation::parse_prefix(&bytes[used..]).map_err(|e| match e {
+                Error::Truncated => ParseError::Truncated,
+                other => ParseError::Instruction(other),
+            })?;
+            used += n;
+            representations.push(rep);
+        }
+        Ok(Self { prefix, representations })
+    }
+
+    /// Writes a complete section. Refuses invalid lines and excessive encoded size or field count.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.representations.len() > MAX_FIELDS {
+            return Err(Error::Unwritable);
+        }
+        let mut bytes = Vec::new();
+        self.prefix.write(&mut bytes)?;
+        for rep in &self.representations {
+            rep.write(&mut bytes)?;
+            if bytes.len() > MAX_SECTION_BYTES {
+                return Err(Error::Unwritable);
+            }
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
 }
 
 /// One field line of an encoded field section.
+/// A section resolves these references against its prefix and dynamic table.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Representation {
     /// The whole field from static entry `index`, or from the dynamic
     /// entry at relative `index` (Base - 1 - `index` is its absolute
     /// index).
-    Indexed { static_table: bool, index: u64 },
+    Indexed {
+        /// Whether the index refers to the static table.
+        static_table: bool,
+        /// The table index described by this variant.
+        index: u64,
+    },
     /// The whole field from the dynamic entry whose absolute index is Base
     /// plus this number.
     IndexedPostBase(u64),
     /// The name from a static or relative dynamic entry, and `value`.
-    LiteralNameRef { never_index: bool, static_table: bool, index: u64, value: Vec<u8> },
+    LiteralNameRef {
+        /// Whether the field must remain a literal when forwarded.
+        never_index: bool,
+        /// Whether the index refers to the static table.
+        static_table: bool,
+        /// The table index described by this variant.
+        index: u64,
+        /// The field value bytes.
+        value: Vec<u8>,
+    },
     /// The name from the dynamic entry with absolute index Base + `index`,
     /// and `value`.
-    LiteralPostBaseNameRef { never_index: bool, index: u64, value: Vec<u8> },
+    LiteralPostBaseNameRef {
+        /// Whether the field must remain a literal when forwarded.
+        never_index: bool,
+        /// The table index described by this variant.
+        index: u64,
+        /// The field value bytes.
+        value: Vec<u8>,
+    },
     /// The name and value spelled out.
-    LiteralName { never_index: bool, name: Vec<u8>, value: Vec<u8> },
+    LiteralName {
+        /// Whether the field must remain a literal when forwarded.
+        never_index: bool,
+        /// The field name bytes.
+        name: Vec<u8>,
+        /// The field value bytes.
+        value: Vec<u8>,
+    },
 }
 
 impl Representation {
     /// Reads the field line at the start of `b`, and returns it and its
     /// length. A field line cut short is [`Error::Truncated`].
-    pub fn parse(b: &[u8]) -> Result<(Representation, usize), Error> {
+    fn parse_prefix(b: &[u8]) -> Result<(Representation, usize), Error> {
         let mut c = Cursor { b, i: 0 };
         let read = |c: &mut Cursor| -> Result<Representation, Stop> {
             let first = c.peek()?;
@@ -1038,42 +1214,10 @@ impl Representation {
             Err(Stop::Bad(e)) => Err(e),
         }
     }
-
-    /// Appends the field line's bytes. Strings are Huffman-coded when that
-    /// is shorter. Integers above [`MAX_INTEGER`] are lowered to it and
-    /// strings longer than [`MAX_STRING`] are cut.
-    pub fn write(&self, out: &mut Vec<u8>) {
-        match self {
-            Representation::Indexed { static_table, index } => {
-                encode_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)
-            }
-            Representation::IndexedPostBase(index) => encode_integer(out, 4, 0x10, *index),
-            Representation::LiteralNameRef { never_index, static_table, index, value } => {
-                let flags = 0x40 | if *never_index { 0x20 } else { 0 } | if *static_table { 0x10 } else { 0 };
-                encode_integer(out, 4, flags, *index);
-                put_string(out, 7, 0, value);
-            }
-            Representation::LiteralPostBaseNameRef { never_index, index, value } => {
-                encode_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index);
-                put_string(out, 7, 0, value);
-            }
-            Representation::LiteralName { never_index, name, value } => {
-                put_string(out, 3, if *never_index { 0x30 } else { 0x20 }, name);
-                put_string(out, 7, 0, value);
-            }
-        }
-    }
-
-    /// The field line's bytes, as [`Representation::write`] makes them.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.write(&mut out);
-        out
-    }
 }
 
 /// Decodes the field lines after a section's prefix.
-fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u64) -> Result<Vec<Field>, Error> {
+fn decode_fields(table: &Table, prefix: SectionPrefix, b: &[u8], limit: u64) -> Result<Vec<Field>, Error> {
     let SectionPrefix { required_insert_count: required, base } = prefix;
     let mut fields = Vec::new();
     let mut size = 0u64;
@@ -1082,7 +1226,7 @@ fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u
     // The entry at absolute index `abs`, which must be below the Required
     // Insert Count; `sent` is the index as the field line gave it.
     fn lookup<'t>(
-        table: &'t DynamicTable,
+        table: &'t Table,
         required: u64,
         largest: &mut Option<u64>,
         abs: Option<u64>,
@@ -1097,7 +1241,7 @@ fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u
     let relative = |index: u64| index.checked_add(1).and_then(|d| base.checked_sub(d));
     let static_ = |index: u64| static_entry(index).ok_or(Error::StaticIndex(index));
     while i < b.len() {
-        let (rep, used) = Representation::parse(&b[i..])?;
+        let (rep, used) = Representation::parse_prefix(&b[i..])?;
         i += used;
         let field = match rep {
             Representation::Indexed { static_table: true, index } => Field::new(static_(index)?.0, static_(index)?.1),
@@ -1139,286 +1283,6 @@ fn decode_fields(table: &DynamicTable, prefix: SectionPrefix, b: &[u8], limit: u
     Ok(fields)
 }
 
-/// What [`Decoder::decode_section`] made of a field section.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Section {
-    /// The section's fields, in order.
-    Fields(Vec<Field>),
-    /// The section needs inserts the decoder has not received, or waits
-    /// behind an earlier section on its stream that does or that has not
-    /// been taken out yet. Its fields come out of [`Decoder::unblocked`] or
-    /// [`Decoder::next_unblocked`], in the order its stream sent them.
-    Blocked,
-}
-
-#[derive(Clone, Debug)]
-struct HeldSection {
-    stream: u64,
-    prefix: SectionPrefix,
-    body: Vec<u8>,
-}
-
-/// Reads whole instructions from `bytes`, after the unfinished one held in
-/// `buf`, and applies each. It copies at most [`MAX_INSTRUCTION`] bytes of
-/// `bytes` into `buf` at a time and keeps only what is left of an
-/// unfinished instruction, so `buf` stays below a few times
-/// [`MAX_INSTRUCTION`] whatever the input.
-/// Reads one instruction from the front of a buffer, if it is all there.
-type Parse<T> = fn(&[u8]) -> Result<Option<(T, usize)>, Error>;
-
-fn read_stream<T>(
-    buf: &mut Vec<u8>,
-    bytes: &[u8],
-    parse: Parse<T>,
-    mut apply: impl FnMut(T) -> Result<(), Error>,
-) -> Result<(), Error> {
-    for chunk in bytes.chunks(MAX_INSTRUCTION) {
-        buf.extend_from_slice(chunk);
-        let mut start = 0;
-        let result = loop {
-            match parse(&buf[start..]) {
-                Ok(Some((ins, used))) => {
-                    start += used;
-                    if let Err(e) = apply(ins) {
-                        break Err(e);
-                    }
-                }
-                Ok(None) => break Ok(()),
-                Err(e) => break Err(e),
-            }
-        };
-        buf.drain(..start);
-        result?;
-    }
-    if buf.capacity() > 2 * MAX_INSTRUCTION {
-        buf.shrink_to(MAX_INSTRUCTION);
-    }
-    Ok(())
-}
-
-/// The decoding side of QPACK: it keeps the dynamic table the peer's
-/// encoder stream builds, decodes field sections, and writes the decoder
-/// stream.
-#[derive(Clone, Debug)]
-pub struct Decoder {
-    table: DynamicTable,
-    max_blocked: usize,
-    field_limit: u64,
-    buf: Vec<u8>,
-    failed: Option<Error>,
-    /// Sections waiting for inserts, or behind one that is, oldest first.
-    blocked: Vec<HeldSection>,
-    /// Sections whose inserts have arrived, still encoded, oldest first.
-    /// They are decoded and acknowledged as they are taken out, so the
-    /// encoder keeps their entries until then.
-    ready: VecDeque<HeldSection>,
-    /// The body bytes of `blocked` and `ready`.
-    held_bytes: usize,
-    out: Vec<u8>,
-    /// The insert count the encoder knows of, from acknowledgments and
-    /// increments already written.
-    reported: u64,
-}
-
-impl Decoder {
-    /// A decoder with the settings it advertises: its
-    /// SETTINGS_QPACK_MAX_TABLE_CAPACITY, SETTINGS_QPACK_BLOCKED_STREAMS
-    /// and SETTINGS_MAX_FIELD_SECTION_SIZE. Each is lowered to this
-    /// module's limit, except that Required Insert Counts are read with the
-    /// table capacity as advertised.
-    pub fn new(max_table_capacity: u64, max_blocked_streams: usize, max_field_section_size: u64) -> Decoder {
-        Decoder {
-            table: DynamicTable::new(max_table_capacity),
-            max_blocked: max_blocked_streams.min(MAX_BLOCKED_STREAMS),
-            field_limit: max_field_section_size.min(MAX_FIELD_SECTION_SIZE),
-            buf: Vec::new(),
-            failed: None,
-            blocked: Vec::new(),
-            ready: VecDeque::new(),
-            held_bytes: 0,
-            out: Vec::new(),
-            reported: 0,
-        }
-    }
-
-    /// The dynamic table as the encoder stream has built it so far.
-    pub fn table(&self) -> &DynamicTable {
-        &self.table
-    }
-
-    /// Adds bytes read from the peer's encoder stream and applies each
-    /// whole instruction. An error is a connection error; once there is
-    /// one, every later call returns it and bytes are dropped. Sections
-    /// the new inserts unblock wait, still encoded, for
-    /// [`Decoder::unblocked`] or [`Decoder::next_unblocked`].
-    pub fn feed_encoder_stream(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        let mut buf = std::mem::take(&mut self.buf);
-        let result = read_stream(&mut buf, bytes, EncoderInstruction::parse, |ins| self.apply(ins));
-        self.buf = buf;
-        if let Err(e) = result {
-            self.failed = Some(e);
-            self.buf = Vec::new();
-        }
-        result
-    }
-
-    fn apply(&mut self, ins: EncoderInstruction) -> Result<(), Error> {
-        let (name, value) = match ins {
-            EncoderInstruction::SetCapacity(c) => return self.table.set_capacity(c),
-            EncoderInstruction::InsertWithNameRef { static_table: true, index, value } => {
-                let (n, _) = static_entry(index).ok_or(Error::StaticIndex(index))?;
-                (n.as_bytes().to_vec(), value)
-            }
-            EncoderInstruction::InsertWithNameRef { static_table: false, index, value } => {
-                let (n, _) = self.table.get_relative(index).ok_or(Error::DynamicIndex(index))?;
-                (n.to_vec(), value)
-            }
-            EncoderInstruction::InsertWithLiteralName { name, value } => (name, value),
-            EncoderInstruction::Duplicate(index) => {
-                let (n, v) = self.table.get_relative(index).ok_or(Error::DynamicIndex(index))?;
-                (n.to_vec(), v.to_vec())
-            }
-        };
-        self.table.insert(name, value)?;
-        self.unblock();
-        Ok(())
-    }
-
-    /// Moves each blocked section whose inserts have all arrived, and that
-    /// has no blocked section before it on its stream, to `ready`.
-    fn unblock(&mut self) {
-        let count = self.table.insert_count();
-        if !self.blocked.iter().any(|b| b.prefix.required_insert_count <= count) {
-            return;
-        }
-        let mut stuck = std::collections::HashSet::new();
-        for b in std::mem::take(&mut self.blocked) {
-            if b.prefix.required_insert_count <= count && !stuck.contains(&b.stream) {
-                self.ready.push_back(b);
-            } else {
-                stuck.insert(b.stream);
-                self.blocked.push(b);
-            }
-        }
-    }
-
-    fn acknowledge(&mut self, stream: u64, required: u64) {
-        if required > 0 {
-            self.out.extend_from_slice(&DecoderInstruction::SectionAck(stream).to_bytes());
-            self.reported = self.reported.max(required);
-        }
-    }
-
-    /// Decodes the encoded field section that came on `stream`, a QUIC
-    /// stream ID below 2^62. A section that needs inserts not yet received
-    /// is held and gives [`Section::Blocked`], as is one behind such a
-    /// section, or behind one not yet taken out, on the same stream. If
-    /// that would block more streams than the limit, or hold more than
-    /// [`MAX_BLOCKED_SECTIONS`] or [`MAX_BLOCKED_BYTES`], it is
-    /// [`Error::TooManyBlocked`]. Any of these errors is the connection
-    /// error [`error_code::DECOMPRESSION_FAILED`]. [`Error::Backlog`] is
-    /// not: it means the decoder stream holds [`MAX_PENDING_STREAM`] bytes
-    /// not yet taken, and nothing was read.
-    pub fn decode_section(&mut self, stream: u64, bytes: &[u8]) -> Result<Section, Error> {
-        if self.out.len() >= MAX_PENDING_STREAM {
-            return Err(Error::Backlog);
-        }
-        if bytes.len() > MAX_SECTION_BYTES {
-            return Err(Error::FieldSectionTooLarge);
-        }
-        let (prefix, used) = SectionPrefix::parse(bytes, self.table.max_entries(), self.table.insert_count())?;
-        let body = &bytes[used..];
-        let needs_inserts = prefix.required_insert_count > self.table.insert_count();
-        let behind_blocked = self.blocked.iter().any(|b| b.stream == stream);
-        let behind_ready = self.ready.iter().any(|b| b.stream == stream);
-        if needs_inserts || behind_blocked || behind_ready {
-            let too_many = needs_inserts && !behind_blocked && self.blocked_streams() >= self.max_blocked;
-            let full = self.blocked.len() + self.ready.len() >= MAX_BLOCKED_SECTIONS;
-            if too_many || full || self.held_bytes + body.len() > MAX_BLOCKED_BYTES {
-                return Err(Error::TooManyBlocked);
-            }
-            self.held_bytes += body.len();
-            let held = HeldSection { stream, prefix, body: body.to_vec() };
-            if needs_inserts || behind_blocked {
-                self.blocked.push(held);
-            } else {
-                self.ready.push_back(held);
-            }
-            return Ok(Section::Blocked);
-        }
-        let fields = decode_fields(&self.table, prefix, body, self.field_limit)?;
-        self.acknowledge(stream, prefix.required_insert_count);
-        Ok(Section::Fields(fields))
-    }
-
-    /// Decodes and takes out the oldest section that was blocked and whose
-    /// inserts have since arrived, with its stream, and acknowledges it. It
-    /// is `None` if there is none, or if the decoder stream holds
-    /// [`MAX_PENDING_STREAM`] bytes not yet taken. An error in the result
-    /// is the connection error [`error_code::DECOMPRESSION_FAILED`].
-    pub fn next_unblocked(&mut self) -> Option<(u64, Result<Vec<Field>, Error>)> {
-        if self.out.len() >= MAX_PENDING_STREAM {
-            return None;
-        }
-        let b = self.ready.pop_front()?;
-        self.held_bytes -= b.body.len();
-        let result = decode_fields(&self.table, b.prefix, &b.body, self.field_limit);
-        if result.is_ok() {
-            self.acknowledge(b.stream, b.prefix.required_insert_count);
-        }
-        Some((b.stream, result))
-    }
-
-    /// Every section [`Decoder::next_unblocked`] would give, oldest first.
-    /// Sections on one stream come out in the order they were sent. Since
-    /// each may decode to the field section size limit, a world that wants
-    /// to bound memory takes them one at a time instead.
-    pub fn unblocked(&mut self) -> Vec<(u64, Result<Vec<Field>, Error>)> {
-        std::iter::from_fn(|| self.next_unblocked()).collect()
-    }
-
-    /// How many streams have a section waiting for inserts. This is what
-    /// SETTINGS_QPACK_BLOCKED_STREAMS limits.
-    pub fn blocked_streams(&self) -> usize {
-        let mut streams: Vec<u64> = self.blocked.iter().map(|b| b.stream).collect();
-        streams.sort_unstable();
-        streams.dedup();
-        streams.len()
-    }
-
-    /// Drops what waits for `stream`, which was reset or abandoned, and
-    /// tells the encoder so, unless the table can hold nothing. If the
-    /// decoder stream holds [`MAX_PENDING_STREAM`] bytes not yet taken, it
-    /// is [`Error::Backlog`] and nothing changes.
-    pub fn cancel_stream(&mut self, stream: u64) -> Result<(), Error> {
-        if self.out.len() >= MAX_PENDING_STREAM {
-            return Err(Error::Backlog);
-        }
-        self.blocked.retain(|b| b.stream != stream);
-        self.ready.retain(|b| b.stream != stream);
-        self.held_bytes = self.blocked.iter().chain(&self.ready).map(|b| b.body.len()).sum();
-        if self.table.max_capacity() > 0 {
-            self.out.extend_from_slice(&DecoderInstruction::StreamCancel(stream).to_bytes());
-        }
-        Ok(())
-    }
-
-    /// The bytes to write to the decoder stream: acknowledgments and
-    /// cancellations so far, then an Insert Count Increment for inserts
-    /// not yet reported. Each byte is returned once.
-    pub fn take_decoder_stream(&mut self) -> Vec<u8> {
-        let count = self.table.insert_count();
-        if count > self.reported {
-            self.out.extend_from_slice(&DecoderInstruction::InsertCountIncrement(count - self.reported).to_bytes());
-            self.reported = count;
-        }
-        std::mem::take(&mut self.out)
-    }
-}
-
 #[derive(Clone, Copy, Debug)]
 struct Outstanding {
     stream: u64,
@@ -1432,13 +1296,10 @@ struct Outstanding {
 /// which entries it may use and evict.
 #[derive(Clone, Debug)]
 pub struct Encoder {
-    table: DynamicTable,
+    table: Table,
     field_limit: u64,
     known_received: u64,
     outstanding: VecDeque<Outstanding>,
-    out: Vec<u8>,
-    buf: Vec<u8>,
-    failed: Option<Error>,
 }
 
 impl Encoder {
@@ -1449,18 +1310,15 @@ impl Encoder {
     /// capacity as advertised. The table starts with capacity 0.
     pub fn new(max_table_capacity: u64, max_field_section_size: u64) -> Encoder {
         Encoder {
-            table: DynamicTable::new(max_table_capacity),
+            table: Table::new(max_table_capacity),
             field_limit: max_field_section_size.min(MAX_FIELD_SECTION_SIZE),
             known_received: 0,
             outstanding: VecDeque::new(),
-            out: Vec::new(),
-            buf: Vec::new(),
-            failed: None,
         }
     }
 
     /// The dynamic table as the encoder has built it.
-    pub fn table(&self) -> &DynamicTable {
+    pub fn table(&self) -> &Table {
         &self.table
     }
 
@@ -1480,42 +1338,34 @@ impl Encoder {
 
     /// Whether room for `size` more within `capacity` keeps every entry
     /// that is not evictable.
-    /// It is also [`Error::Backlog`] if the encoder stream holds
-    /// [`MAX_PENDING_STREAM`] bytes not yet taken.
     fn room(&self, size: u64, capacity: u64) -> Result<(), Error> {
-        if self.out.len() >= MAX_PENDING_STREAM {
-            return Err(Error::Backlog);
-        }
         let kept = self.table.first_kept(size, capacity).ok_or(Error::EntryTooLarge)?;
         if kept > self.evict_limit() { Err(Error::Referenced) } else { Ok(()) }
     }
 
-    /// Sets the table's capacity and writes the instruction. A capacity
+    /// Sets the table's capacity and returns the instruction. A capacity
     /// above the maximum is [`Error::Capacity`]. One that would evict an
     /// entry in use, or one whose insert the decoder has not acknowledged,
-    /// is [`Error::Referenced`]. If the encoder stream holds
-    /// [`MAX_PENDING_STREAM`] bytes not yet taken, it is [`Error::Backlog`].
+    /// is [`Error::Referenced`].
     /// On an error nothing changes.
-    pub fn set_capacity(&mut self, capacity: u64) -> Result<(), Error> {
+    pub fn set_capacity(&mut self, capacity: u64) -> Result<EncoderInstruction, Error> {
         if capacity > self.table.max_capacity() {
             return Err(Error::Capacity(capacity));
         }
         self.room(0, capacity)?;
         self.table.set_capacity(capacity)?;
-        self.out.extend_from_slice(&EncoderInstruction::SetCapacity(capacity).to_bytes());
-        Ok(())
+        Ok(EncoderInstruction::SetCapacity(capacity))
     }
 
-    /// Inserts an entry and writes the instruction, naming the static or
+    /// Inserts an entry and returns the instruction, naming the static or
     /// dynamic entry with the same name when there is one. It returns the
-    /// entry's absolute index. A name or value longer than [`MAX_STRING`]
+    /// entry's absolute index and the instruction. A name or value longer than [`MAX_STRING`]
     /// is [`Error::StringTooLong`], and an entry larger than the capacity
     /// [`Error::EntryTooLarge`]. One that would evict an entry in use, or
     /// one whose insert the decoder has not acknowledged, is
-    /// [`Error::Referenced`]. If the encoder stream holds
-    /// [`MAX_PENDING_STREAM`] bytes not yet taken, it is [`Error::Backlog`].
+    /// [`Error::Referenced`].
     /// On an error nothing changes.
-    pub fn insert(&mut self, name: &[u8], value: &[u8]) -> Result<u64, Error> {
+    pub fn insert(&mut self, name: &[u8], value: &[u8]) -> Result<(u64, EncoderInstruction), Error> {
         if name.len() > MAX_STRING || value.len() > MAX_STRING {
             return Err(Error::StringTooLong);
         }
@@ -1529,33 +1379,35 @@ impl Encoder {
             EncoderInstruction::InsertWithLiteralName { name: name.to_vec(), value: value.to_vec() }
         };
         let abs = self.table.insert(name.to_vec(), value.to_vec())?;
-        self.out.extend_from_slice(&ins.to_bytes());
-        Ok(abs)
+        Ok((abs, ins))
     }
 
-    /// Inserts a copy of the entry at absolute index `index` and writes the
+    /// Inserts a copy of the entry at absolute index `index` and returns the
     /// instruction, which keeps a used entry from being evicted. It
-    /// returns the copy's absolute index. It fails as [`Encoder::insert`]
+    /// returns the copy's absolute index and the instruction. It fails as [`Encoder::insert`]
     /// does, and with [`Error::DynamicIndex`] if the table does not hold
     /// the entry.
-    pub fn duplicate(&mut self, index: u64) -> Result<u64, Error> {
+    pub fn duplicate(&mut self, index: u64) -> Result<(u64, EncoderInstruction), Error> {
         let (n, v) = self.table.get(index).ok_or(Error::DynamicIndex(index))?;
         let (n, v) = (n.to_vec(), v.to_vec());
         self.room(entry_size(&n, &v), self.table.capacity())?;
         let relative = self.table.insert_count() - 1 - index;
         let abs = self.table.insert(n, v)?;
-        self.out.extend_from_slice(&EncoderInstruction::Duplicate(relative).to_bytes());
-        Ok(abs)
+        Ok((abs, EncoderInstruction::Duplicate(relative)))
     }
 
-    /// Encodes `fields` for `stream`, a QUIC stream ID below 2^62. Each
+    /// Builds a field section from `fields` for `stream`, a QUIC stream ID below 2^62. Each
     /// field uses a static entry, or a dynamic entry the decoder has
     /// acknowledged, when one matches; otherwise it is written as a
     /// literal. A section past the peer's field section size limit is
     /// [`Error::FieldSectionTooLarge`], one with more than [`MAX_FIELDS`]
     /// fields [`Error::TooManyFields`], and a name or value longer than
-    /// [`MAX_STRING`] [`Error::StringTooLong`].
-    pub fn encode_section(&mut self, stream: u64, fields: &[Field]) -> Result<Vec<u8>, Error> {
+    /// [`MAX_STRING`] [`Error::StringTooLong`]. A stream above [`MAX_INTEGER`]
+    /// is refused with [`Error::Unwritable`].
+    pub fn section(&mut self, stream: u64, fields: &[Field]) -> Result<FieldSection, Error> {
+        if stream > MAX_INTEGER {
+            return Err(Error::Unwritable);
+        }
         if fields.len() > MAX_FIELDS {
             return Err(Error::TooManyFields);
         }
@@ -1609,7 +1461,8 @@ impl Encoder {
         });
         let required = newest.map_or(0, |n| n + 1);
         let prefix = SectionPrefix { required_insert_count: required, base: required };
-        let mut out = prefix.to_bytes(self.table.max_entries())?;
+        let prefix = prefix.encoded(self.table.max_entries())?;
+        let mut representations = Vec::with_capacity(fields.len());
         for (line, f) in lines.iter().zip(fields) {
             let rep = match *line {
                 Line::Static(index) => Representation::Indexed { static_table: true, index },
@@ -1632,35 +1485,12 @@ impl Encoder {
                     value: f.value.clone(),
                 },
             };
-            rep.write(&mut out);
+            representations.push(rep);
         }
         if let Some(oldest) = oldest {
             self.outstanding.push_back(Outstanding { stream, required, oldest });
         }
-        Ok(out)
-    }
-
-    /// The bytes to write to the encoder stream. Each byte is returned
-    /// once.
-    pub fn take_encoder_stream(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.out)
-    }
-
-    /// Adds bytes read from the peer's decoder stream and applies each
-    /// whole instruction. An error is a connection error; once there is
-    /// one, every later call returns it and bytes are dropped.
-    pub fn feed_decoder_stream(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        let mut buf = std::mem::take(&mut self.buf);
-        let result = read_stream(&mut buf, bytes, DecoderInstruction::parse, |ins| self.apply(ins));
-        self.buf = buf;
-        if let Err(e) = result {
-            self.failed = Some(e);
-            self.buf = Vec::new();
-        }
-        result
+        Ok(FieldSection { prefix, representations })
     }
 
     /// Applies one decoded peer instruction between items.
@@ -1773,7 +1603,7 @@ impl Decode for EncoderInstructions {
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
         let Some(used) = encoder_instruction_len(input)? else { return Ok(Step::Need) };
         let bytes = input.get(..used).ok_or(Error::Truncated)?;
-        let item = EncoderInstruction::parse(bytes).and_then(|parsed| {
+        let item = EncoderInstruction::parse_prefix(bytes).and_then(|parsed| {
             let (ins, _) = parsed.ok_or(Error::Truncated)?;
             check_encoder_instruction(&ins)?;
             Ok(ins)
@@ -1809,7 +1639,7 @@ impl Decode for DecoderInstructions {
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
-        Ok(match DecoderInstruction::parse(input)? {
+        Ok(match DecoderInstruction::parse_prefix(input)? {
             Some((DecoderInstruction::InsertCountIncrement(0), used)) => Step::Item(Err(Error::ZeroIncrement), used),
             Some((ins, used)) => Step::Item(Ok(ins), used),
             None => Step::Need,
@@ -1853,17 +1683,32 @@ impl Wire for EncoderInstruction {
     type ParseError = ParseError;
     type WriteError = Error;
 
+    /// Reads exactly one instruction. Refuses truncation, trailing bytes, integer overflow,
+    /// invalid Huffman strings, oversized strings or capacity, and invalid static name indexes.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match EncoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
-            Step::Item(item, used) if used == bytes.len() => item.map_err(ParseError::Instruction),
-            Step::Item(_, _) => Err(ParseError::Trailing),
+        let parsed = match EncoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+            Step::Item(item, used) => Ok((item, used)),
             _ => Err(ParseError::Truncated),
-        }
+        };
+        exact(parsed, bytes.len())?.map_err(ParseError::Instruction)
     }
 
+    /// Writes one instruction, using Huffman strings when shorter. Refuses oversized strings,
+    /// integer overflow, capacity above MAX_TABLE_CAPACITY, and invalid static name indexes.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        check_encoder_instruction(self)?;
-        out.extend_from_slice(&self.to_bytes());
+        check_encoder_instruction(self).map_err(|_| Error::Unwritable)?;
+        match self {
+            EncoderInstruction::SetCapacity(c) => put_integer(out, 5, 0x20, *c),
+            EncoderInstruction::InsertWithNameRef { static_table, index, value } => {
+                put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index);
+                put_string(out, 7, 0, value);
+            }
+            EncoderInstruction::InsertWithLiteralName { name, value } => {
+                put_string(out, 5, 0x40, name);
+                put_string(out, 7, 0, value);
+            }
+            EncoderInstruction::Duplicate(i) => put_integer(out, 5, 0, *i),
+        }
         Ok(())
     }
 }
@@ -1884,17 +1729,23 @@ impl Wire for DecoderInstruction {
     type ParseError = ParseError;
     type WriteError = Error;
 
+    /// Reads exactly one instruction. Refuses truncation, trailing bytes, overflow, and zero increments.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match DecoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
-            Step::Item(item, used) if used == bytes.len() => item.map_err(ParseError::Instruction),
-            Step::Item(_, _) => Err(ParseError::Trailing),
+        let parsed = match DecoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+            Step::Item(item, used) => Ok((item, used)),
             _ => Err(ParseError::Truncated),
-        }
+        };
+        exact(parsed, bytes.len())?.map_err(ParseError::Instruction)
     }
 
+    /// Writes one instruction. Refuses integers above MAX_INTEGER and zero increments.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        check_decoder_instruction(self)?;
-        out.extend_from_slice(&self.to_bytes());
+        check_decoder_instruction(self).map_err(|_| Error::Unwritable)?;
+        match self {
+            DecoderInstruction::SectionAck(s) => put_integer(out, 7, 0x80, *s),
+            DecoderInstruction::StreamCancel(s) => put_integer(out, 6, 0x40, *s),
+            DecoderInstruction::InsertCountIncrement(n) => put_integer(out, 6, 0, *n),
+        }
         Ok(())
     }
 }
@@ -1903,17 +1754,20 @@ impl Wire for Representation {
     type ParseError = ParseError;
     type WriteError = Error;
 
+    /// Reads one field line. Refuses truncation, trailing bytes, overflow, invalid Huffman
+    /// strings, and excessive string lengths. Table references are resolved by decode_section.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (rep, used) = Self::parse(bytes).map_err(|e| match e {
+        let parsed = Self::parse_prefix(bytes).map_err(|e| {
+            match e {
             Error::Truncated => ParseError::Truncated,
             other => ParseError::Instruction(other),
-        })?;
-        if used != bytes.len() {
-            return Err(ParseError::Trailing);
         }
-        Ok(rep)
+        });
+        exact(parsed, bytes.len())
     }
 
+    /// Writes one field line, using Huffman strings when shorter. Refuses integers above
+    /// MAX_INTEGER and strings longer than MAX_STRING.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         let (index, name, value): (u64, &[u8], &[u8]) = match self {
             Self::Indexed { index, .. } | Self::IndexedPostBase(index) => (*index, &[], &[]),
@@ -1923,136 +1777,29 @@ impl Wire for Representation {
             Self::LiteralName { name, value, .. } => (0, name, value),
         };
         if index > MAX_INTEGER {
-            return Err(Error::IntegerOverflow);
+            return Err(Error::Unwritable);
         }
-        check_strings(name, value)?;
-        out.extend_from_slice(&self.to_bytes());
+        check_strings(name, value).map_err(|_| Error::Unwritable)?;
+        match self {
+            Representation::Indexed { static_table, index } => {
+                put_integer(out, 6, if *static_table { 0xc0 } else { 0x80 }, *index)
+            }
+            Representation::IndexedPostBase(index) => put_integer(out, 4, 0x10, *index),
+            Representation::LiteralNameRef { never_index, static_table, index, value } => {
+                let flags = 0x40 | if *never_index { 0x20 } else { 0 } | if *static_table { 0x10 } else { 0 };
+                put_integer(out, 4, flags, *index);
+                put_string(out, 7, 0, value);
+            }
+            Representation::LiteralPostBaseNameRef { never_index, index, value } => {
+                put_integer(out, 3, if *never_index { 0x08 } else { 0 }, *index);
+                put_string(out, 7, 0, value);
+            }
+            Representation::LiteralName { never_index, name, value } => {
+                put_string(out, 3, if *never_index { 0x30 } else { 0x20 }, name);
+                put_string(out, 7, 0, value);
+            }
+        }
         Ok(())
-    }
-}
-
-/// The decoder role's bounded dynamic table and reported insert count.
-///
-/// Byte decoders do not borrow or modify it. The caller applies one
-/// instruction between items and lends the table to [`decode_section`].
-/// There are no blocked sections or output bytes hidden in this type.
-/// Every method serves the receiving (decoder) role. The encoding role uses
-/// [`Encoder`], including [`Encoder::apply_instruction`] for peer acknowledgments.
-/// Section decoding deliberately borrows `&Table`, matching the codec design's
-/// shared session state: entries are read-only, while a [`core::cell::Cell`]
-/// tracks reported inserts. This makes the table `!Sync`.
-/// Every returned Section Ack must be sent, even if its stream is reset and
-/// a Stream Cancel is also sent. Decoding already counts the ack as reported;
-/// dropping it would make later [`Table::take_increment`] values too small.
-/// Send acknowledgments in return order before taking an increment.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Table {
-    dynamic: DynamicTable,
-    reported: core::cell::Cell<u64>,
-}
-
-impl Table {
-    /// Creates a zero-capacity table. Storage is capped by
-    /// [`MAX_TABLE_CAPACITY`]; insert-count wrapping uses the advertised
-    /// `max_capacity`, as it does in [`DynamicTable::new`].
-    pub fn new(max_capacity: u64) -> Self {
-        Self { dynamic: DynamicTable::new(max_capacity), reported: core::cell::Cell::new(0) }
-    }
-    /// The maximum allowed capacity, capped by [`MAX_TABLE_CAPACITY`].
-    pub fn max_capacity(&self) -> u64 {
-        self.dynamic.max_capacity()
-    }
-    /// The current entry-size limit.
-    pub fn capacity(&self) -> u64 {
-        self.dynamic.capacity()
-    }
-    /// Stored name and value bytes plus [`ENTRY_OVERHEAD`] per entry.
-    pub fn size(&self) -> u64 {
-        self.dynamic.size()
-    }
-    /// The number of live entries.
-    pub fn len(&self) -> usize {
-        self.dynamic.len()
-    }
-    /// Whether no entries are live.
-    pub fn is_empty(&self) -> bool {
-        self.dynamic.is_empty()
-    }
-    /// The total number of inserts, including entries since evicted.
-    pub fn insert_count(&self) -> u64 {
-        self.dynamic.insert_count()
-    }
-    /// The advertised maximum entries used to wrap Required Insert Counts.
-    pub fn max_entries(&self) -> u64 {
-        self.dynamic.max_entries()
-    }
-    /// The absolute index of the oldest live entry.
-    pub fn first_index(&self) -> u64 {
-        self.dynamic.first_index()
-    }
-    /// Looks up a live entry by absolute index.
-    pub fn get(&self, index: u64) -> Option<(&[u8], &[u8])> {
-        self.dynamic.get(index)
-    }
-    /// Looks up a relative index, with zero naming the newest entry.
-    pub fn get_relative(&self, index: u64) -> Option<(&[u8], &[u8])> {
-        self.dynamic.get_relative(index)
-    }
-    /// Changes capacity and evicts oldest entries until they fit.
-    /// An excessive capacity leaves the table unchanged.
-    pub fn set_capacity(&mut self, capacity: u64) -> Result<(), Error> {
-        self.dynamic.set_capacity(capacity)
-    }
-    /// Inserts bounded strings and returns the new absolute index.
-    /// Evicts oldest entries as needed. Errors leave the table unchanged.
-    pub fn insert(&mut self, mut name: Vec<u8>, mut value: Vec<u8>) -> Result<u64, Error> {
-        check_strings(&name, &value)?;
-        if self.insert_count() >= MAX_INTEGER {
-            return Err(Error::IntegerOverflow);
-        }
-        if entry_size(&name, &value) > self.capacity() {
-            return Err(Error::EntryTooLarge);
-        }
-        // Caller vectors may have excess reserved space unrelated to their
-        // bounded strings. Do not retain that space in session state.
-        name.shrink_to_fit();
-        value.shrink_to_fit();
-        self.dynamic.insert(name, value)
-    }
-    /// Applies one encoder instruction between decoded items.
-    /// Errors leave the table unchanged. Application errors are session
-    /// decisions; the instruction decoder only establishes its boundary.
-    pub fn apply(&mut self, instruction: EncoderInstruction) -> Result<(), Error> {
-        check_encoder_instruction(&instruction)?;
-        let (name, value) = match instruction {
-            EncoderInstruction::SetCapacity(n) => return self.set_capacity(n),
-            EncoderInstruction::InsertWithLiteralName { name, value } => (name, value),
-            EncoderInstruction::InsertWithNameRef { static_table: true, index, value } => {
-                let (name, _) = static_entry(index).ok_or(Error::StaticIndex(index))?;
-                (name.as_bytes().to_vec(), value)
-            }
-            EncoderInstruction::InsertWithNameRef { static_table: false, index, value } => {
-                let (name, _) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
-                (name.to_vec(), value)
-            }
-            EncoderInstruction::Duplicate(index) => {
-                let (name, value) = self.get_relative(index).ok_or(Error::DynamicIndex(index))?;
-                (name.to_vec(), value.to_vec())
-            }
-        };
-        self.insert(name, value)?;
-        Ok(())
-    }
-    /// Takes an Insert Count Increment for received inserts not yet reported.
-    /// Section acknowledgments returned by [`decode_section`] or
-    /// [`BlockedSection::retry`] already report their Required Insert Counts.
-    /// Send those values first, then this value, on the decoder stream.
-    /// No bytes are queued; a second call without new inserts returns `None`.
-    pub fn take_increment(&mut self) -> Option<DecoderInstruction> {
-        let count = self.insert_count();
-        let increment = count.saturating_sub(self.reported.get());
-        self.reported.set(count);
-        (increment != 0).then_some(DecoderInstruction::InsertCountIncrement(increment))
     }
 }
 
@@ -2115,7 +1862,7 @@ fn section_fields(
     body: &[u8],
     limit: u64,
 ) -> Result<SectionResult, Error> {
-    let fields = decode_fields(&table.dynamic, prefix, body, limit)?;
+    let fields = decode_fields(table, prefix, body, limit)?;
     let ack = (prefix.required_insert_count != 0).then_some(DecoderInstruction::SectionAck(stream));
     table.reported.set(table.reported.get().max(prefix.required_insert_count));
     Ok(SectionResult::Fields { fields, ack })
@@ -2134,7 +1881,6 @@ fn section_fields(
 /// in call order before taking [`Table::take_increment`] for the remaining inserts.
 /// Every returned Section Ack must be sent, even when resetting that stream;
 /// a Stream Cancel does not replace it.
-/// No call emits [`Error::Backlog`].
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, Wire}, qpack::{self, EncoderInstruction, Table}};
@@ -2252,82 +1998,84 @@ impl BlockedSections {
 
 #[cfg(test)]
 mod tests {
+    use super::super::codec::{
+        contract,
+        test_support::{decode_all, Lcg, mutate},
+    };
     use super::*;
+
+    fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
+        let (items, error) = decode_all(EncoderInstructions::new, bytes);
+        assert!(error.is_none(), "{error:?}");
+        for item in items {
+            table.apply(item?)?;
+        }
+        Ok(())
+    }
+
+    fn blocked(table: &Table, stream: u64, bytes: &[u8]) -> BlockedSection {
+        let SectionResult::Blocked(section) = decode_section(table, stream, bytes).unwrap() else { panic!("ready") };
+        section
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         let s: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
         s.chunks(2).map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap()).collect()
     }
 
-    fn fields(section: Section) -> Vec<Field> {
-        match section {
-            Section::Fields(f) => f,
-            Section::Blocked => panic!("blocked"),
-        }
-    }
-
-    /// A deterministic generator: a linear congruential one.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-        fn below(&mut self, n: u64) -> u64 {
-            self.next() % n
-        }
-        fn bytes(&mut self, max: u64) -> Vec<u8> {
-            let n = self.below(max + 1);
-            (0..n).map(|_| self.next() as u8).collect()
-        }
+    fn fields(section: SectionResult) -> Vec<Field> {
+        let SectionResult::Fields { fields, .. } = section else { panic!("blocked") };
+        fields
     }
 
     // RFC 7541 Appendix C.1: integers.
 
     #[test]
     fn integer_examples() {
-        let mut out = Vec::new();
-        encode_integer(&mut out, 5, 0, 10);
-        assert_eq!(out, [0x0a]);
-        out.clear();
-        encode_integer(&mut out, 5, 0, 1337);
-        assert_eq!(out, [0x1f, 0x9a, 0x0a]);
-        out.clear();
-        encode_integer(&mut out, 8, 0, 42);
-        assert_eq!(out, [0x2a]);
-        assert_eq!(decode_integer(&[0x1f, 0x9a, 0x0a], 5), Ok(Some((1337, 3))));
-        assert_eq!(decode_integer(&[0xea], 5), Ok(Some((10, 1))));
+        assert_eq!(Integer::<5> { flags: 0, value: 10 }.to_bytes().unwrap(), [0x0a]);
+        assert_eq!(Integer::<5> { flags: 0, value: 1337 }.to_bytes().unwrap(), [0x1f, 0x9a, 0x0a]);
+        assert_eq!(Integer::<5>::parse(&[0x1f, 0x9a, 0x0a]), Ok(Integer { flags: 0, value: 1337 }));
+        assert_eq!(Integer::<8> { flags: 0, value: 42 }.to_bytes().unwrap(), [0x2a]);
+        assert_eq!(Integer::<5>::parse(&[0xea]), Ok(Integer { flags: 0xe0, value: 10 }));
         for n in 0..3 {
-            assert_eq!(decode_integer(&[0x1f, 0x9a, 0x0a][..n], 5), Ok(None));
+            assert_eq!(Integer::<5>::parse(&[0x1f, 0x9a, 0x0a][..n]), Err(ParseError::Truncated));
         }
     }
 
     #[test]
     fn integer_limits() {
-        for prefix in 1..=8 {
-            for v in [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_INTEGER - 1, MAX_INTEGER, u64::MAX] {
-                let mut out = Vec::new();
-                encode_integer(&mut out, prefix, 0, v);
-                assert!(out.len() <= 10);
-                assert_eq!(decode_integer(&out, prefix), Ok(Some((v.min(MAX_INTEGER), out.len()))));
+        fn check<const P: u8>() {
+            for value in
+                [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_INTEGER - 1, MAX_INTEGER, MAX_INTEGER + 1, u64::MAX]
+            {
+                let unit = Integer::<P> { flags: 0, value };
+                contract::check_wire_value(&unit);
+                if value > MAX_INTEGER {
+                    assert_eq!(unit.to_bytes(), Err(Error::Unwritable));
+                } else {
+                    assert!(unit.to_bytes().unwrap().len() <= MAX_INTEGER_BYTES);
+                }
             }
         }
-        // One past the maximum.
-        let mut over = vec![0xff];
-        let mut rest = MAX_INTEGER + 1 - 255;
-        while rest >= 0x80 {
-            over.push((rest & 0x7f) as u8 | 0x80);
-            rest >>= 7;
+        check::<1>();
+        check::<2>();
+        check::<3>();
+        check::<4>();
+        check::<5>();
+        check::<6>();
+        check::<7>();
+        check::<8>();
+        assert_eq!(Integer::<0> { flags: 0, value: 0 }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Integer::<9>::parse(&[0]), Err(ParseError::Instruction(Error::IntegerOverflow)));
+        assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_INTEGER }));
+        // MAX_INTEGER + 1 with an eight-bit prefix.
+        for bytes in [vec![0xff; 30], hex("ff 81feffffffffffff3f")] {
+            assert_eq!(Integer::<8>::parse(&bytes), Err(ParseError::Instruction(Error::IntegerOverflow)));
         }
-        over.push(rest as u8);
-        assert_eq!(decode_integer(&over, 8), Err(Error::IntegerOverflow));
-        // Too many continuation bytes, even of zeros.
-        let mut long = vec![0x1f];
-        long.extend_from_slice(&[0x80; 10]);
-        long.push(0);
-        assert_eq!(decode_integer(&long, 5), Err(Error::IntegerOverflow));
-        assert_eq!(decode_integer(&[0xff; 30], 8), Err(Error::IntegerOverflow));
+        assert_eq!(
+            Integer::<5>::parse(&[0x1f, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0]),
+            Err(ParseError::Instruction(Error::IntegerOverflow))
+        );
     }
 
     // RFC 7541 Appendix C.4: Huffman-coded strings.
@@ -2344,8 +2092,8 @@ mod tests {
             ("Mon, 21 Oct 2013 20:13:21 GMT", "d07a be94 1054 d444 a820 0595 040b 8166 e082 a62d 1bff"),
             ("https://www.example.com", "9d29 ad17 1863 c78f 0b97 c8e9 ae82 ae43 d3"),
         ] {
-            assert_eq!(huffman_encode(text.as_bytes()), hex(code), "{text}");
-            assert_eq!(huffman_decode(&hex(code)).unwrap(), text.as_bytes());
+            assert_eq!(HuffmanString(text.as_bytes().to_vec()).to_bytes().unwrap(), hex(code), "{text}");
+            assert_eq!(HuffmanString::parse(&hex(code)).map(|s| s.0).unwrap(), text.as_bytes());
             assert_eq!(huffman_len(text.as_bytes()), hex(code).len());
         }
     }
@@ -2353,28 +2101,34 @@ mod tests {
     #[test]
     fn huffman_every_byte_round_trips() {
         let all: Vec<u8> = (0..=255).collect();
-        assert_eq!(huffman_decode(&huffman_encode(&all)).unwrap(), all);
+        assert_eq!(HuffmanString::parse(&HuffmanString(all.clone()).to_bytes().unwrap()).map(|s| s.0).unwrap(), all);
         for b in 0..=255u8 {
-            assert_eq!(huffman_decode(&huffman_encode(&[b])).unwrap(), [b]);
+            assert_eq!(HuffmanString::parse(&HuffmanString(vec![b]).to_bytes().unwrap()).map(|s| s.0).unwrap(), [b]);
         }
-        assert_eq!(huffman_decode(&[]).unwrap(), b"");
+        assert_eq!(HuffmanString::parse(&[]).map(|s| s.0).unwrap(), b"");
     }
 
     #[test]
     fn huffman_errors() {
         // Eight 1 bits of padding.
-        assert_eq!(huffman_decode(&[0xff]), Err(Error::Huffman));
+        assert_eq!(HuffmanString::parse(&[0xff]).map(|s| s.0), Err(Error::Huffman));
         // The end-of-string code: thirty 1 bits.
-        assert_eq!(huffman_decode(&[0xff, 0xff, 0xff, 0xff]), Err(Error::Huffman));
+        assert_eq!(HuffmanString::parse(&[0xff, 0xff, 0xff, 0xff]).map(|s| s.0), Err(Error::Huffman));
         // 'a' (00011) padded with 0 bits.
-        assert_eq!(huffman_decode(&[0x18]), Err(Error::Huffman));
-        assert_eq!(huffman_decode(&[0x1f]).unwrap(), b"a");
+        assert_eq!(HuffmanString::parse(&[0x18]).map(|s| s.0), Err(Error::Huffman));
+        assert_eq!(HuffmanString::parse(&[0x1f]).map(|s| s.0).unwrap(), b"a");
         // Too long once decoded: '0' is 5 bits, so this gives 1.6 bytes per byte.
         // Eight '0's are 40 zero bits, so MAX_STRING of them are MAX_STRING
         // * 5 / 8 zero bytes; five more bytes hold eight more.
         let long = vec![0; MAX_STRING * 5 / 8 + 5];
-        assert_eq!(huffman_decode(&long), Err(Error::StringTooLong));
-        assert_eq!(huffman_decode(&huffman_encode(&vec![b'0'; MAX_STRING])).unwrap().len(), MAX_STRING);
+        assert_eq!(HuffmanString::parse(&long).map(|s| s.0), Err(Error::StringTooLong));
+        assert_eq!(
+            HuffmanString::parse(&HuffmanString(vec![b'0'; MAX_STRING]).to_bytes().unwrap())
+                .map(|s| s.0)
+                .unwrap()
+                .len(),
+            MAX_STRING
+        );
     }
 
     #[test]
@@ -2395,59 +2149,62 @@ mod tests {
 
     #[test]
     fn rfc_b1_literal_with_static_name() {
-        let mut d = Decoder::new(0, 0, 1 << 16);
+        let mut table = Table::new(0);
         let section = hex("0000 510b 2f69 6e64 6578 2e68 746d 6c");
-        assert_eq!(fields(d.decode_section(0, &section).unwrap()), [Field::new(":path", "/index.html")]);
-        // No dynamic table use, so nothing to acknowledge.
-        assert_eq!(d.take_decoder_stream(), b"");
+        assert_eq!(
+            decode_section(&table, 0, &section),
+            Ok(SectionResult::Fields { fields: vec![Field::new(":path", "/index.html")], ack: None })
+        );
+        assert_eq!(table.take_increment(), None);
     }
 
     #[test]
     fn rfc_b2_to_b5_dynamic_table() {
-        let mut d = Decoder::new(220, 2, 1 << 16);
-        // B.2: the section on stream 4 arrives before the inserts.
+        let mut table = Table::new(220);
+        let mut held = BlockedSections::new(2);
         let s4 = hex("0381 10 11");
-        assert_eq!(d.decode_section(4, &s4), Ok(Section::Blocked));
-        assert_eq!(d.blocked_streams(), 1);
+        held.push(blocked(&table, 4, &s4)).unwrap();
         let enc = hex("3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468");
-        d.feed_encoder_stream(&enc).unwrap();
-        assert_eq!(d.table().size(), 106);
-        let unblocked = d.unblocked();
+        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &enc, 2 * MAX_INSTRUCTION);
+        apply(&mut table, &enc).unwrap();
+        assert_eq!(table.size(), 106);
         assert_eq!(
-            unblocked,
-            [(4, Ok(vec![Field::new(":authority", "www.example.com"), Field::new(":path", "/sample/path")]))]
+            held.next_ready(&table),
+            Some((
+                4,
+                Ok(SectionResult::Fields {
+                    fields: vec![Field::new(":authority", "www.example.com"), Field::new(":path", "/sample/path")],
+                    ack: Some(DecoderInstruction::SectionAck(4)),
+                })
+            ))
         );
-        assert_eq!(d.take_decoder_stream(), [0x84]);
-        // B.3: an insert with a literal name.
-        d.feed_encoder_stream(&hex("4a637573746f6d2d6b65790c637573746f6d2d76616c7565")).unwrap();
-        assert_eq!(d.table().size(), 160);
-        assert_eq!(d.take_decoder_stream(), [0x01]);
-        // B.4: the section on stream 8 needs a duplicate not yet sent, and
-        // the stream is cancelled.
+        assert_eq!(table.take_increment(), None);
+        apply(&mut table, &hex("4a637573746f6d2d6b65790c637573746f6d2d76616c7565")).unwrap();
+        assert_eq!(table.size(), 160);
+        assert_eq!(table.take_increment(), Some(DecoderInstruction::InsertCountIncrement(1)));
         let s8 = hex("0500 80 c1 81");
-        assert_eq!(d.decode_section(8, &s8), Ok(Section::Blocked));
-        d.cancel_stream(8).unwrap();
-        assert_eq!(d.take_decoder_stream(), [0x48]);
-        d.feed_encoder_stream(&hex("02")).unwrap();
-        assert_eq!(d.unblocked(), []);
-        assert_eq!(d.table().size(), 217);
-        assert_eq!(d.table().get(3), Some((&b":authority"[..], &b"www.example.com"[..])));
-        // The same section, decoded now.
+        held.push(blocked(&table, 8, &s8)).unwrap();
+        assert_eq!(held.cancel(&table, 8), Some(DecoderInstruction::StreamCancel(8)));
+        apply(&mut table, &[2]).unwrap();
+        assert_eq!(held.next_ready(&table), None);
+        assert_eq!(table.size(), 217);
+        assert_eq!(table.get(3), Some((&b":authority"[..], &b"www.example.com"[..])));
         assert_eq!(
-            fields(d.decode_section(12, &s8).unwrap()),
-            [
-                Field::new(":authority", "www.example.com"),
-                Field::new(":path", "/"),
-                Field::new("custom-key", "custom-value")
-            ]
+            decode_section(&table, 12, &s8),
+            Ok(SectionResult::Fields {
+                fields: vec![
+                    Field::new(":authority", "www.example.com"),
+                    Field::new(":path", "/"),
+                    Field::new("custom-key", "custom-value")
+                ],
+                ack: Some(DecoderInstruction::SectionAck(12)),
+            })
         );
-        // B.5: an insert naming dynamic entry 1 (relative), which evicts
-        // entry 0.
-        d.feed_encoder_stream(&hex("810d637573746f6d2d76616c756532")).unwrap();
-        assert_eq!(d.table().size(), 215);
-        assert_eq!(d.table().first_index(), 1);
-        assert_eq!(d.table().get(4), Some((&b"custom-key"[..], &b"custom-value2"[..])));
-        assert_eq!(d.take_decoder_stream(), [0x8c, 0x01]);
+        apply(&mut table, &hex("810d637573746f6d2d76616c756532")).unwrap();
+        assert_eq!(table.size(), 215);
+        assert_eq!(table.first_index(), 1);
+        assert_eq!(table.get(4), Some((&b"custom-key"[..], &b"custom-value2"[..])));
+        assert_eq!(table.take_increment(), Some(DecoderInstruction::InsertCountIncrement(1)));
     }
 
     #[test]
@@ -2476,7 +2233,7 @@ mod tests {
     fn section_prefix() {
         for (required, base) in [(0, 0), (2, 0), (4, 4), (4, 9), (5, 1), (100, 0)] {
             let p = SectionPrefix { required_insert_count: required, base };
-            let bytes = p.to_bytes(128).unwrap();
+            let bytes = p.encoded(128).unwrap().to_bytes().unwrap();
             assert_eq!(SectionPrefix::parse(&bytes, 128, required), Ok((p, bytes.len())));
             for n in 0..bytes.len() {
                 assert_eq!(SectionPrefix::parse(&bytes[..n], 128, required), Err(Error::Truncated));
@@ -2485,9 +2242,9 @@ mod tests {
         // A negative Base.
         assert_eq!(SectionPrefix::parse(&[0x00, 0x80], 6, 0), Err(Error::Base));
         assert_eq!(SectionPrefix::parse(&[0x03, 0x82], 6, 2), Err(Error::Base));
-        assert_eq!(SectionPrefix { required_insert_count: 1, base: 0 }.to_bytes(0), Err(Error::InsertCount));
+        assert_eq!(SectionPrefix { required_insert_count: 1, base: 0 }.encoded(0), Err(Error::Unwritable));
         let far = SectionPrefix { required_insert_count: 0, base: u64::MAX };
-        assert_eq!(far.to_bytes(6), Err(Error::IntegerOverflow));
+        assert_eq!(far.encoded(6), Err(Error::Unwritable));
     }
 
     #[test]
@@ -2510,28 +2267,20 @@ mod tests {
             Representation::LiteralName { never_index: false, name: b"custom-key".to_vec(), value: b"v".to_vec() },
             Representation::LiteralName { never_index: true, name: vec![0xff; 40], value: vec![b'a'; 300] },
         ];
-        for r in &reps {
-            let bytes = r.to_bytes();
-            assert_eq!(Representation::parse(&bytes), Ok((r.clone(), bytes.len())), "{r:?}");
+        for rep in &reps {
+            contract::check_wire_value(rep);
+            let bytes = rep.to_bytes().unwrap();
             for n in 0..bytes.len() {
-                assert_eq!(Representation::parse(&bytes[..n]), Err(Error::Truncated), "{r:?} cut at {n}");
+                assert_eq!(Representation::parse(&bytes[..n]), Err(ParseError::Truncated));
             }
         }
-        // A string past the limit is cut by the writer, refused by the reader.
-        let r = Representation::LiteralName { never_index: false, name: b"n".to_vec(), value: vec![0; MAX_STRING + 1] };
-        let (back, _) = Representation::parse(&r.to_bytes()).unwrap();
-        let Representation::LiteralName { value, .. } = back else { panic!() };
-        assert_eq!(value.len(), MAX_STRING);
-        let mut raw = vec![0x50, 0x7f];
-        let mut rest = MAX_STRING as u64 + 1 - 127;
-        while rest >= 0x80 {
-            raw.push((rest & 0x7f) as u8 | 0x80);
-            rest >>= 7;
-        }
-        raw.push(rest as u8);
-        assert_eq!(Representation::parse(&raw), Err(Error::StringTooLong));
-        // A bad Huffman string.
-        assert_eq!(Representation::parse(&[0x50, 0x81, 0xff]), Err(Error::Huffman));
+        let large =
+            Representation::LiteralName { never_index: false, name: b"n".to_vec(), value: vec![0; MAX_STRING + 1] };
+        assert_eq!(large.to_bytes(), Err(Error::Unwritable));
+        let mut raw = vec![0x50];
+        Integer::<7> { flags: 0, value: MAX_STRING as u64 + 1 }.write(&mut raw).unwrap();
+        assert_eq!(Representation::parse(&raw), Err(ParseError::Instruction(Error::StringTooLong)));
+        assert_eq!(Representation::parse(&[0x50, 0x81, 0xff]), Err(ParseError::Instruction(Error::Huffman)));
     }
 
     #[test]
@@ -2547,33 +2296,31 @@ mod tests {
             EncoderInstruction::Duplicate(MAX_INTEGER),
         ];
         for ins in &enc {
-            let bytes = ins.to_bytes();
-            assert_eq!(EncoderInstruction::parse(&bytes), Ok(Some((ins.clone(), bytes.len()))));
-            for n in 0..bytes.len() {
-                assert_eq!(EncoderInstruction::parse(&bytes[..n]), Ok(None), "{ins:?} cut at {n}");
-            }
+            contract::check_wire_value(ins);
+            contract::check_decode_with_alloc_limit(
+                EncoderInstructions::new,
+                &ins.to_bytes().unwrap(),
+                2 * MAX_INSTRUCTION,
+            );
         }
-        assert_eq!(EncoderInstruction::SetCapacity(220).to_bytes(), [0x3f, 0xbd, 0x01]);
-        assert_eq!(EncoderInstruction::Duplicate(2).to_bytes(), [0x02]);
-        let dec = [
+        assert_eq!(EncoderInstruction::SetCapacity(220).to_bytes().unwrap(), [0x3f, 0xbd, 0x01]);
+        assert_eq!(EncoderInstruction::Duplicate(2).to_bytes().unwrap(), [0x02]);
+        for (ins, bytes) in [
             (DecoderInstruction::SectionAck(4), vec![0x84]),
             (DecoderInstruction::StreamCancel(8), vec![0x48]),
             (DecoderInstruction::InsertCountIncrement(1), vec![0x01]),
-            (DecoderInstruction::SectionAck(1 << 40), DecoderInstruction::SectionAck(1 << 40).to_bytes()),
-        ];
-        for (ins, bytes) in &dec {
-            assert_eq!(&ins.to_bytes(), bytes);
-            assert_eq!(DecoderInstruction::parse(bytes), Ok(Some((*ins, bytes.len()))));
-            for n in 0..bytes.len() {
-                assert_eq!(DecoderInstruction::parse(&bytes[..n]), Ok(None));
-            }
+            (DecoderInstruction::SectionAck(1 << 40), DecoderInstruction::SectionAck(1 << 40).to_bytes().unwrap()),
+        ] {
+            assert_eq!(ins.to_bytes().unwrap(), bytes);
+            contract::check_wire_value(&ins);
+            contract::check_decode_with_alloc_limit(DecoderInstructions::new, &bytes, 2 * MAX_INTEGER_BYTES);
         }
-        assert_eq!(DecoderInstruction::parse(&[0xff; 12]), Err(Error::IntegerOverflow));
+        assert_eq!(DecoderInstruction::parse(&[0xff; 12]), Err(ParseError::Instruction(Error::IntegerOverflow)));
     }
 
     #[test]
     fn dynamic_table_capacity_and_eviction() {
-        let mut t = DynamicTable::new(100);
+        let mut t = Table::new(100);
         assert_eq!(t.max_entries(), 3);
         assert_eq!(t.insert(b"a".to_vec(), b"b".to_vec()), Err(Error::EntryTooLarge));
         assert_eq!(t.set_capacity(101), Err(Error::Capacity(101)));
@@ -2598,56 +2345,56 @@ mod tests {
         assert_eq!(t.insert_count(), 4);
         t.set_capacity(0).unwrap();
         assert!(t.is_empty());
-        assert_eq!(DynamicTable::new(u64::MAX).max_capacity(), MAX_TABLE_CAPACITY);
+        assert_eq!(Table::new(u64::MAX).max_capacity(), MAX_TABLE_CAPACITY);
     }
 
     #[test]
     fn decoder_errors() {
-        let mut d = Decoder::new(220, 1, 200);
-        // Encoder stream errors, each latched.
-        let mut e = d.clone();
-        assert_eq!(e.feed_encoder_stream(&[0x3f, 0xbe, 0x01]), Err(Error::Capacity(221)));
-        assert_eq!(e.feed_encoder_stream(&[0x20]), Err(Error::Capacity(221)));
-        let mut e = d.clone();
-        assert_eq!(e.feed_encoder_stream(&[0xc0 | 0x3f, 99 - 63, 0]), Err(Error::StaticIndex(99)));
-        let mut e = d.clone();
-        assert_eq!(e.feed_encoder_stream(&[0x80, 0]), Err(Error::DynamicIndex(0)));
-        let mut e = d.clone();
-        assert_eq!(e.feed_encoder_stream(&[0x00]), Err(Error::DynamicIndex(0)));
-        let mut e = d.clone();
-        assert_eq!(e.feed_encoder_stream(&[0x41, b'a', 0x01, b'b']), Err(Error::EntryTooLarge));
+        let mut table = Table::new(220);
+        for (bytes, error) in [
+            (vec![0x3f, 0xbe, 0x01], Error::Capacity(221)),
+            (vec![0xff, 99 - 63, 0], Error::StaticIndex(99)),
+            (vec![0x80, 0], Error::DynamicIndex(0)),
+            (vec![0], Error::DynamicIndex(0)),
+            (vec![0x41, b'a', 1, b'b'], Error::EntryTooLarge),
+        ] {
+            assert_eq!(apply(&mut table.clone(), &bytes), Err(error));
+        }
         // Field section errors.
-        assert_eq!(d.decode_section(0, &[]), Err(Error::Truncated));
-        assert_eq!(d.decode_section(0, &[0x00]), Err(Error::Truncated));
-        assert_eq!(d.decode_section(0, &[0x00, 0x00, 0x51]), Err(Error::Truncated));
-        assert_eq!(d.decode_section(0, &[0x00, 0x00, 0xff, 0x24]), Err(Error::StaticIndex(99)));
-        assert_eq!(d.decode_section(0, &[0x00, 0x00, 0x80]), Err(Error::DynamicIndex(0)));
-        assert_eq!(d.decode_section(0, &[0x00, 0x00, 0x10]), Err(Error::DynamicIndex(0)));
-        assert_eq!(d.decode_section(0, &[0x0e, 0x00]), Err(Error::InsertCount));
-        assert_eq!(d.decode_section(0, &[0x00, 0x80]), Err(Error::Base));
+        assert_eq!(decode_section_with_limit(&table, 0, &[], 200), Err(Error::Truncated));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x00], 200), Err(Error::Truncated));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x51], 200), Err(Error::Truncated));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0xff, 0x24], 200), Err(Error::StaticIndex(99)));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x80], 200), Err(Error::DynamicIndex(0)));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x00, 0x10], 200), Err(Error::DynamicIndex(0)));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x0e, 0x00], 200), Err(Error::InsertCount));
+        assert_eq!(decode_section_with_limit(&table, 0, &[0x00, 0x80], 200), Err(Error::Base));
         let mut big = vec![0x00, 0x00];
         for _ in 0..10 {
             big.push(0xc0 | 31); // static 31: 64 bytes counted
         }
-        assert_eq!(d.decode_section(0, &big), Err(Error::FieldSectionTooLarge));
-        assert_eq!(d.decode_section(0, &vec![0; MAX_SECTION_BYTES + 1]), Err(Error::FieldSectionTooLarge));
-        // Blocked streams: one allowed.
-        assert_eq!(d.decode_section(0, &[0x02, 0x00, 0x80]), Ok(Section::Blocked));
-        assert_eq!(d.decode_section(4, &[0x02, 0x00, 0x80]), Err(Error::TooManyBlocked));
-        // A section that asks for more inserts than it uses.
-        d.feed_encoder_stream(&[0x3f, 0xbd, 0x01, 0x41, b'a', 0x01, b'b', 0x41, b'c', 0x01, b'd']).unwrap();
-        assert_eq!(d.unblocked(), [(0, Ok(vec![Field::new("a", "b")]))]);
-        assert_eq!(d.decode_section(8, &[0x03, 0x00, 0x81]), Err(Error::InsertCount));
-        assert_eq!(d.decode_section(8, &[0x03, 0x00, 0xd1]), Err(Error::InsertCount));
-        assert_eq!(fields(d.decode_section(8, &[0x03, 0x00, 0x80, 0x81]).unwrap()).len(), 2);
+        assert_eq!(decode_section_with_limit(&table, 0, &big, 200), Err(Error::FieldSectionTooLarge));
+        assert_eq!(
+            decode_section_with_limit(&table, 0, &vec![0; MAX_SECTION_BYTES + 1], 200),
+            Err(Error::FieldSectionTooLarge)
+        );
+        let mut held = BlockedSections::new(1);
+        held.push(blocked(&table, 0, &[2, 0, 0x80])).unwrap();
+        assert!(held.push(blocked(&table, 4, &[2, 0, 0x80])).is_err());
+        apply(&mut table, &[0x3f, 0xbd, 0x01, 0x41, b'a', 1, b'b', 0x41, b'c', 1, b'd']).unwrap();
+        let (id, result) = held.next_ready(&table).unwrap();
+        assert_eq!((id, fields(result.unwrap())), (0, vec![Field::new("a", "b")]));
+        assert_eq!(decode_section(&table, 8, &[0x03, 0x00, 0x81]), Err(Error::InsertCount));
+        assert_eq!(decode_section(&table, 8, &[0x03, 0x00, 0xd1]), Err(Error::InsertCount));
+        assert_eq!(fields(decode_section(&table, 8, &[0x03, 0x00, 0x80, 0x81]).unwrap()).len(), 2);
         // An index at or past the Required Insert Count, post-base.
-        assert_eq!(d.decode_section(8, &[0x02, 0x80, 0x10, 0x11]), Err(Error::DynamicIndex(1)));
-        assert_eq!(fields(d.decode_section(8, &[0x03, 0x81, 0x10, 0x11]).unwrap()).len(), 2);
+        assert_eq!(decode_section(&table, 8, &[0x02, 0x80, 0x10, 0x11]), Err(Error::DynamicIndex(1)));
+        assert_eq!(fields(decode_section(&table, 8, &[0x03, 0x81, 0x10, 0x11]).unwrap()).len(), 2);
         // Too many fields.
         let mut many = vec![0x00, 0x00];
         many.extend(std::iter::repeat_n(0xc0 | 17, MAX_FIELDS + 1));
-        let mut wide = Decoder::new(0, 0, MAX_FIELD_SECTION_SIZE);
-        assert_eq!(wide.decode_section(0, &many), Err(Error::TooManyFields));
+        let wide = Table::new(0);
+        assert_eq!(decode_section(&wide, 0, &many), Err(Error::TooManyFields));
     }
 
     #[test]
@@ -2658,77 +2405,103 @@ mod tests {
         assert_eq!(e.insert(&vec![0; MAX_STRING + 1], b""), Err(Error::StringTooLong));
         assert_eq!(e.duplicate(0), Err(Error::DynamicIndex(0)));
         e.set_capacity(100).unwrap();
-        assert_eq!(e.insert(b"x-a", b"1"), Ok(0));
-        assert_eq!(e.feed_decoder_stream(&[0x01]), Ok(()));
-        let section = e.encode_section(4, &[Field::new("x-a", "1")]).unwrap();
-        assert_eq!(section, [0x02, 0x00, 0x80]);
+        assert_eq!(e.insert(b"x-a", b"1").map(|v| v.0), Ok(0));
+        assert_eq!(e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)), Ok(()));
+        assert_eq!(e.section(MAX_INTEGER + 1, &[Field::new("x-a", "1")]), Err(Error::Unwritable));
+        assert!(e.outstanding.is_empty());
+        assert_eq!(e.table().insert_count(), 1);
+        let section = e.section(4, &[Field::new("x-a", "1")]).unwrap();
+        assert_eq!(section.to_bytes().unwrap(), [0x02, 0x00, 0x80]);
         // Entry 0 is in use until stream 4's section is acknowledged.
         assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()), Err(Error::Referenced));
         assert_eq!(e.set_capacity(0), Err(Error::Referenced));
-        assert_eq!(e.feed_decoder_stream(&[0x84]), Ok(()));
-        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()), Ok(1));
-        // Decoder stream errors, each latched.
+        assert_eq!(e.apply_instruction(DecoderInstruction::SectionAck(4)), Ok(()));
+        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()).map(|v| v.0), Ok(1));
+        // Invalid acknowledgment values do not change session state.
         let mut f = e.clone();
-        assert_eq!(f.feed_decoder_stream(&[0x84]), Err(Error::UnknownStream(4)));
-        assert_eq!(f.feed_decoder_stream(&[0x48]), Err(Error::UnknownStream(4)));
+        assert_eq!(f.apply_instruction(DecoderInstruction::SectionAck(4)), Err(Error::UnknownStream(4)));
         let mut f = e.clone();
-        assert_eq!(f.feed_decoder_stream(&[0x00]), Err(Error::ZeroIncrement));
+        assert_eq!(f.apply_instruction(DecoderInstruction::InsertCountIncrement(0)), Err(Error::ZeroIncrement));
         let mut f = e.clone();
-        assert_eq!(f.feed_decoder_stream(&[0x02]), Err(Error::Increment));
-        let mut f = e.clone();
-        assert_eq!(
-            f.feed_decoder_stream(&[0x3f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f]),
-            Err(Error::IntegerOverflow)
-        );
+        assert_eq!(f.apply_instruction(DecoderInstruction::InsertCountIncrement(2)), Err(Error::Increment));
         // Section errors.
         let mut small = Encoder::new(0, 100);
         assert_eq!(
-            small.encode_section(0, &[Field::new(vec![b'n'; 40], vec![b'v'; 40])]),
+            small.section(0, &[Field::new(vec![b'n'; 40], vec![b'v'; 40])]),
             Err(Error::FieldSectionTooLarge)
         );
-        assert_eq!(small.encode_section(0, &vec![Field::new("a", ""); MAX_FIELDS + 1]), Err(Error::TooManyFields));
-        assert_eq!(small.encode_section(0, &[Field::new(vec![0; MAX_STRING + 1], "")]), Err(Error::StringTooLong));
+        assert_eq!(small.section(0, &vec![Field::new("a", ""); MAX_FIELDS + 1]), Err(Error::TooManyFields));
+        assert_eq!(small.section(0, &[Field::new(vec![0; MAX_STRING + 1], "")]), Err(Error::StringTooLong));
+    }
+
+    #[test]
+    fn encoder_releases_each_streams_sections_in_order() {
+        let mut encoder = Encoder::new(4096, MAX_FIELD_SECTION_SIZE);
+        encoder.set_capacity(4096).unwrap();
+        encoder.insert(b"x-a", b"1").unwrap();
+        encoder.insert(b"x-b", b"2").unwrap();
+        encoder.apply_instruction(DecoderInstruction::InsertCountIncrement(2)).unwrap();
+        for (stream, name, value) in [(0, "x-a", "1"), (4, "x-a", "1"), (4, "x-b", "2")] {
+            let section = encoder.section(stream, &[Field::new(name, value)]).unwrap();
+            contract::check_wire_value(&section);
+        }
+        assert_eq!(encoder.set_capacity(36), Err(Error::Referenced));
+        let mut bytes = Vec::new();
+        for stream in [0, 4, 4] {
+            DecoderInstruction::SectionAck(stream).write(&mut bytes).unwrap();
+        }
+        let (instructions, failure) = decode_all(DecoderInstructions::new, &bytes);
+        assert_eq!(failure, None);
+        assert_eq!(instructions.len(), 3);
+        for (i, instruction) in instructions.into_iter().enumerate() {
+            encoder.apply_instruction(instruction.unwrap()).unwrap();
+            let expected = if i == 0 { Err(Error::Referenced) } else { Ok(EncoderInstruction::SetCapacity(36)) };
+            assert_eq!(encoder.set_capacity(36), expected);
+        }
+        assert_eq!(encoder.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
+        assert_eq!(encoder.apply_instruction(DecoderInstruction::SectionAck(4)), Err(Error::UnknownStream(4)));
     }
 
     #[test]
     fn never_index_fields_stay_literal() {
         let mut e = Encoder::new(4096, 1 << 16);
-        let mut d = Decoder::new(4096, 0, 1 << 16);
-        e.set_capacity(4096).unwrap();
-        e.insert(b"x-secret", b"s").unwrap();
-        d.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
-        e.feed_decoder_stream(&d.take_decoder_stream()).unwrap();
+        let mut table = Table::new(4096);
+        table.apply(e.set_capacity(4096).unwrap()).unwrap();
+        table.apply(e.insert(b"x-secret", b"s").unwrap().1).unwrap();
+        e.apply_instruction(table.take_increment().unwrap()).unwrap();
         let mut secret = Field::new("x-secret", "s");
         secret.never_index = true;
         let mut auth = Field::new("authorization", "");
         auth.never_index = true;
         let list = vec![secret, auth, Field::new("x-secret", "s")];
-        let bytes = e.encode_section(0, &list).unwrap();
-        assert_eq!(fields(d.decode_section(0, &bytes).unwrap()), list);
-        let (rep, _) = Representation::parse(&bytes[2..]).unwrap();
+        let bytes = e.section(0, &list).unwrap().to_bytes().unwrap();
+        assert_eq!(fields(decode_section(&table, 0, &bytes).unwrap()), list);
+        let section = FieldSection::parse(&bytes).unwrap();
+        let rep = &section.representations[0];
         assert!(matches!(rep, Representation::LiteralNameRef { never_index: true, .. }));
     }
 
     #[test]
     fn truncated_sections() {
         let mut e = Encoder::new(4096, 1 << 16);
-        let mut d = Decoder::new(4096, 0, 1 << 16);
-        e.set_capacity(4096).unwrap();
-        e.insert(b"x-one", b"first").unwrap();
-        d.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
-        e.feed_decoder_stream(&d.take_decoder_stream()).unwrap();
+        let mut table = Table::new(4096);
+        table.apply(e.set_capacity(4096).unwrap()).unwrap();
+        table.apply(e.insert(b"x-one", b"first").unwrap().1).unwrap();
+        e.apply_instruction(table.take_increment().unwrap()).unwrap();
         let list = vec![
             Field::new(":status", "200"),
             Field::new("x-one", "first"),
             Field::new("content-type", "text/x-weird"),
             Field::new("x-two", "a longer value that is Huffman-coded"),
         ];
-        let bytes = e.encode_section(0, &list).unwrap();
-        assert_eq!(fields(d.decode_section(0, &bytes).unwrap()), list);
+        let bytes = e.section(0, &list).unwrap().to_bytes().unwrap();
+        assert_eq!(fields(decode_section(&table, 0, &bytes).unwrap()), list);
         for n in 0..bytes.len() {
-            match d.clone().decode_section(0, &bytes[..n]) {
+            match decode_section(&table, 0, &bytes[..n]) {
                 Err(Error::Truncated) | Err(Error::InsertCount) => {}
-                Ok(Section::Fields(f)) => assert!(f.len() < list.len() && list.starts_with(&f), "cut at {n}"),
+                Ok(SectionResult::Fields { fields: f, .. }) => {
+                    assert!(f.len() < list.len() && list.starts_with(&f), "cut at {n}")
+                }
                 other => panic!("cut at {n}: {other:?}"),
             }
         }
@@ -2736,160 +2509,123 @@ mod tests {
 
     #[test]
     fn encoder_and_decoder_stay_in_step() {
-        let names: [&[u8]; 6] = [b":path", b"x-id", b"cookie", b"x-long", b"accept", b"x-a"];
-        let mut rng = Lcg(7);
+        let names = [":path", "x-id", "cookie", "x-long", "accept", "x-a"];
+        let mut rng = Lcg::new(7);
         let mut dynamic_sections = 0;
-        for round in 0..40 {
-            let cap = [0u64, 64, 220, 500, 4096][round % 5];
-            let mut e = Encoder::new(cap, 1 << 16);
-            let mut d = Decoder::new(cap, 0, 1 << 16);
-            if cap > 0 {
-                e.set_capacity(cap - rng.below(cap / 2 + 1)).unwrap();
-            }
-            let mut pending_dec = Vec::new();
-            for step in 0..200u64 {
+        for cap in [0, 64, 220, 500, 4096] {
+            let mut encoder = Encoder::new(cap, 1 << 16);
+            let mut table = Table::new(cap);
+            let capacity = cap - rng.index((cap / 2 + 1) as usize) as u64;
+            table.apply(encoder.set_capacity(capacity).unwrap()).unwrap();
+            let mut instructions = Vec::new();
+            let mut acknowledgments = Vec::new();
+            for step in 0..1600 {
                 let field = |rng: &mut Lcg| {
-                    let name = names[rng.below(names.len() as u64) as usize];
-                    let value = format!("v{}", rng.below(8)).repeat(rng.below(6) as usize + 1);
-                    let mut f = Field::new(name, value);
-                    f.never_index = rng.below(10) == 0;
-                    f
+                    let name = names[rng.index(names.len())];
+                    let value = format!("v{}", rng.index(8)).repeat(rng.index(6) + 1);
+                    Field { name: name.as_bytes().to_vec(), value: value.into_bytes(), never_index: rng.index(10) == 0 }
                 };
-                match rng.below(5) {
-                    0 | 1 => {
-                        let f = field(&mut rng);
-                        let _ = e.insert(&f.name, &f.value);
+                let insert = field(&mut rng);
+                if rng.coin() {
+                    if let Ok((_, ins)) = encoder.insert(&insert.name, &insert.value) {
+                        instructions.push(ins);
                     }
-                    2 => {
-                        let first = e.table().first_index();
-                        let n = e.table().insert_count() - first;
-                        if n > 0 {
-                            let _ = e.duplicate(first + rng.below(n));
-                        }
-                    }
-                    _ => {
-                        d.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
-                        let list: Vec<Field> = (0..rng.below(6)).map(|_| field(&mut rng)).collect();
-                        let stream = step * 4;
-                        let bytes = e.encode_section(stream, &list).unwrap();
-                        dynamic_sections += usize::from(bytes[0] != 0);
-                        assert_eq!(fields(d.decode_section(stream, &bytes).unwrap()), list);
-                        if rng.below(4) == 0 {
-                            d.cancel_stream(stream).unwrap();
-                        }
+                } else if !encoder.table().is_empty() {
+                    let index = encoder.table().first_index() + rng.index(encoder.table().len()) as u64;
+                    if let Ok((_, ins)) = encoder.duplicate(index) {
+                        instructions.push(ins);
                     }
                 }
-                if rng.below(3) == 0 {
-                    d.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
+                if rng.coin() {
+                    for ins in instructions.drain(..) {
+                        table.apply(ins).unwrap();
+                    }
                 }
-                pending_dec.extend(d.take_decoder_stream());
-                if rng.below(3) == 0 {
-                    // Deliver the decoder stream a byte at a time.
-                    for b in pending_dec.drain(..) {
-                        e.feed_decoder_stream(&[b]).unwrap();
+                let stream = step * 4;
+                let list: Vec<_> = (0..rng.index(6)).map(|_| field(&mut rng)).collect();
+                let section = encoder.section(stream, &list).unwrap();
+                dynamic_sections += usize::from(section.prefix.encoded_insert_count != 0);
+                let SectionResult::Fields { fields, ack } =
+                    decode_section(&table, stream, &section.to_bytes().unwrap()).unwrap()
+                else {
+                    panic!("blocked")
+                };
+                assert_eq!(fields, list);
+                acknowledgments.extend(ack);
+                if rng.coin() {
+                    acknowledgments.push(DecoderInstruction::StreamCancel(stream));
+                }
+                acknowledgments.extend(table.take_increment());
+                if rng.coin() {
+                    for ack in acknowledgments.drain(..) {
+                        encoder.apply_instruction(ack).unwrap();
                     }
                 }
             }
-            d.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
-            assert_eq!(d.table(), e.table());
+            for ins in instructions {
+                table.apply(ins).unwrap();
+            }
+            assert_eq!(table.entries, encoder.table().entries);
+            assert_eq!(table.capacity(), encoder.table().capacity());
+            assert_eq!(table.size(), encoder.table().size());
+            assert_eq!(table.insert_count(), encoder.table().insert_count());
         }
         assert!(dynamic_sections > 100, "{dynamic_sections}");
     }
 
     #[test]
-    fn lcg_fuzz() {
-        let mut rng = Lcg(0x9204);
+    fn generated_wire_and_stream_contracts() {
+        let mut rng = Lcg::new(0x9204);
         for round in 0..4000 {
-            let mut data = rng.bytes(64);
-            // Bias some buffers toward valid-looking starts.
-            if round % 3 == 0 && !data.is_empty() {
-                data[0] &= 0x3f;
-            }
-            // The encoder stream, whole and a byte at a time.
-            let mut whole = Decoder::new(220, 4, 1 << 12);
-            let r1 = whole.feed_encoder_stream(&data);
-            let mut bytewise = Decoder::new(220, 4, 1 << 12);
-            let mut r2 = Ok(());
-            for b in &data {
-                r2 = bytewise.feed_encoder_stream(std::slice::from_ref(b));
-                if r2.is_err() {
+            let mut data = if round % 2 == 0 { rng.bytes(64) } else { vec![0, 0, 0xd1, 0x50, 1, b'x'] };
+            mutate(&mut rng, &mut data);
+            contract::check_decode_with_alloc_limit(EncoderInstructions::new, &data, 2 * MAX_INSTRUCTION);
+            contract::check_decode_with_alloc_limit(DecoderInstructions::new, &data, 2 * MAX_INTEGER_BYTES);
+            contract::check_wire::<EncoderInstruction>(&data);
+            contract::check_wire::<DecoderInstruction>(&data);
+            contract::check_wire::<Representation>(&data);
+            contract::check_wire::<HuffmanString>(&data);
+            contract::check_wire::<FieldSection>(&data);
+            let mut table = Table::new(220);
+            let _ = apply(&mut table, &[]);
+            let (items, _) = decode_all(EncoderInstructions::new, &data);
+            for item in items {
+                if item.and_then(|ins| table.apply(ins)).is_err() {
                     break;
                 }
             }
-            assert_eq!(r1, r2);
-            assert_eq!(whole.table(), bytewise.table());
-            // The same bytes as a field section, against that table.
-            match whole.decode_section(0, &data) {
-                Ok(Section::Fields(list)) => {
-                    let mut e = Encoder::new(0, 1 << 12);
-                    let bytes = e.encode_section(0, &list).unwrap();
-                    assert_eq!(fields(Decoder::new(0, 0, 1 << 12).decode_section(0, &bytes).unwrap()), list);
-                }
-                Ok(Section::Blocked) | Err(_) => {}
+            if let Ok(SectionResult::Fields { fields: list, .. }) = decode_section_with_limit(&table, 0, &data, 1 << 12)
+            {
+                let bytes = Encoder::new(0, 1 << 12).section(0, &list).unwrap().to_bytes().unwrap();
+                assert_eq!(fields(decode_section(&Table::new(0), 0, &bytes).unwrap()), list);
             }
-            // As single items.
-            if let Ok((rep, used)) = Representation::parse(&data) {
-                assert!(used <= data.len());
-                let bytes = rep.to_bytes();
-                assert_eq!(Representation::parse(&bytes), Ok((rep, bytes.len())));
-            }
-            if let Ok(Some((ins, _))) = EncoderInstruction::parse(&data) {
-                let bytes = ins.to_bytes();
-                assert_eq!(EncoderInstruction::parse(&bytes), Ok(Some((ins, bytes.len()))));
-            }
-            if let Ok(Some((ins, _))) = DecoderInstruction::parse(&data) {
-                let bytes = ins.to_bytes();
-                assert_eq!(DecoderInstruction::parse(&bytes), Ok(Some((ins, bytes.len()))));
-            }
-            if let Ok(s) = huffman_decode(&data) {
-                assert_eq!(huffman_decode(&huffman_encode(&s)), Ok(s));
-            }
-            // The decoder stream, whole and a byte at a time.
-            let mut e1 = Encoder::new(220, 1 << 12);
-            let mut e2 = e1.clone();
-            let r1 = e1.feed_decoder_stream(&data);
-            let mut r2 = Ok(());
-            for b in &data {
-                r2 = e2.feed_decoder_stream(std::slice::from_ref(b));
-                if r2.is_err() {
-                    break;
-                }
-            }
-            assert_eq!(r1, r2);
         }
     }
 
     #[test]
-    fn lcg_fuzz_with_a_built_table() {
-        // A table with entries, then random sections against it.
-        let mut rng = Lcg(42);
-        let mut base = Decoder::new(4096, 8, 1 << 14);
-        let mut e = Encoder::new(4096, 1 << 14);
-        e.set_capacity(4096).unwrap();
-        for i in 0..40u32 {
-            e.insert(format!("x-h{}", i % 7).as_bytes(), format!("{i}").as_bytes()).unwrap();
+    fn generated_sections_with_a_built_table() {
+        let mut rng = Lcg::new(42);
+        let mut table = Table::new(4096);
+        table.set_capacity(4096).unwrap();
+        for i in 0..40 {
+            table.insert(format!("x-h{}", i % 7).into_bytes(), i.to_string().into_bytes()).unwrap();
         }
-        base.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
         for _ in 0..3000 {
-            let mut data = vec![rng.below(80) as u8, rng.below(256) as u8];
+            let mut data = vec![rng.index(80) as u8, rng.next() as u8];
             data.extend(rng.bytes(40));
-            let mut d = base.clone();
-            if let Ok(Section::Fields(list)) = d.decode_section(0, &data) {
-                assert!(list.iter().map(Field::size).sum::<u64>() <= 1 << 14);
+            if let Ok(SectionResult::Fields { fields, .. }) = decode_section_with_limit(&table, 0, &data, 1 << 14) {
+                assert!(fields.iter().map(Field::size).sum::<u64>() <= 1 << 14);
             }
-            // Instructions on top of the table, whole and a byte at a time.
-            let mut a = base.clone();
-            let mut b = base.clone();
-            let ra = a.feed_encoder_stream(&data);
-            let mut rb = Ok(());
-            for byte in &data {
-                rb = b.feed_encoder_stream(std::slice::from_ref(byte));
-                if rb.is_err() {
+            contract::check_decode_with_alloc_limit(EncoderInstructions::new, &data, 2 * MAX_INSTRUCTION);
+            let mut changed = table.clone();
+            let (instructions, _) = decode_all(EncoderInstructions::new, &data);
+            for instruction in instructions {
+                if instruction.and_then(|instruction| changed.apply(instruction)).is_err() {
                     break;
                 }
+                assert!(changed.size() <= changed.capacity());
+                assert!(changed.capacity() <= changed.max_capacity());
             }
-            assert_eq!(ra, rb);
-            assert_eq!(a.table(), b.table());
         }
     }
 
@@ -2899,215 +2635,168 @@ mod tests {
         // decoder has acknowledged its insert.
         let mut e = Encoder::new(100, 1 << 16);
         e.set_capacity(100).unwrap();
-        assert_eq!(e.insert(b"x-a", b"1"), Ok(0)); // 36
+        assert_eq!(e.insert(b"x-a", b"1").map(|v| v.0), Ok(0)); // 36
         assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()), Err(Error::Referenced));
-        assert_eq!(e.duplicate(0), Ok(1)); // 72
+        assert_eq!(e.duplicate(0).map(|v| v.0), Ok(1)); // 72
         assert_eq!(e.duplicate(1), Err(Error::Referenced));
         assert_eq!(e.set_capacity(40), Err(Error::Referenced));
-        let mut d = Decoder::new(100, 0, 1 << 16);
-        d.feed_encoder_stream(&e.take_encoder_stream()).unwrap();
-        assert_eq!(d.table(), e.table());
         // Once both inserts are acknowledged, they may go.
-        e.feed_decoder_stream(&[0x02]).unwrap();
-        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()), Ok(2));
+        e.apply_instruction(DecoderInstruction::InsertCountIncrement(2)).unwrap();
+        assert_eq!(e.insert(b"x-b", vec![b'2'; 40].as_slice()).map(|v| v.0), Ok(2));
         assert_eq!(e.table().first_index(), 2);
         assert_eq!(e.set_capacity(0), Err(Error::Referenced));
-        e.feed_decoder_stream(&[0x01]).unwrap();
-        assert_eq!(e.set_capacity(0), Ok(()));
+        e.apply_instruction(DecoderInstruction::InsertCountIncrement(1)).unwrap();
+        assert_eq!(e.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
     }
 
     #[test]
     fn blocked_streams_are_counted_by_stream() {
-        // RFC 9204 section 2.1.2 limits streams, not sections: a header
-        // section and a trailer section blocked on one stream count once.
-        let mut d = Decoder::new(220, 1, 1 << 16);
-        assert_eq!(d.decode_section(0, &[0x02, 0x00, 0x80]), Ok(Section::Blocked));
-        assert_eq!(d.decode_section(0, &[0x02, 0x00, 0x80]), Ok(Section::Blocked));
-        assert_eq!(d.blocked_streams(), 1);
-        assert_eq!(d.decode_section(4, &[0x02, 0x00, 0x80]), Err(Error::TooManyBlocked));
-        d.feed_encoder_stream(&[0x3f, 0xbd, 0x01, 0x41, b'a', 0x01, b'b']).unwrap();
-        let a = vec![Field::new("a", "b")];
-        assert_eq!(d.unblocked(), [(0, Ok(a.clone())), (0, Ok(a))]);
-        assert_eq!(d.blocked_streams(), 0);
-        assert_eq!(d.take_decoder_stream(), [0x80, 0x80]);
+        let mut table = Table::new(220);
+        let mut held = BlockedSections::new(1);
+        for _ in 0..2 {
+            held.push(blocked(&table, 0, &[2, 0, 0x80])).unwrap();
+        }
+        assert!(held.push(blocked(&table, 4, &[2, 0, 0x80])).is_err());
+        apply(&mut table, &[0x3f, 0xbd, 1, 0x41, b'a', 1, b'b']).unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                held.next_ready(&table),
+                Some((
+                    0,
+                    Ok(SectionResult::Fields {
+                        fields: vec![Field::new("a", "b")],
+                        ack: Some(DecoderInstruction::SectionAck(0)),
+                    })
+                ))
+            );
+        }
+        assert!(held.is_empty());
+        assert_eq!(table.take_increment(), None);
     }
 
     #[test]
-    fn long_instructions_fed_a_byte_at_a_time() {
-        // A long Huffman-coded name must not be decoded again for every
-        // byte of the value that follows it.
+    fn long_instruction_allocation_contract() {
         let ins = EncoderInstruction::InsertWithLiteralName { name: vec![b'0'; 30_000], value: vec![b'1'; 30_000] };
-        let bytes = ins.to_bytes();
-        let mut d = Decoder::new(MAX_TABLE_CAPACITY, 0, 1 << 16);
-        d.feed_encoder_stream(&EncoderInstruction::SetCapacity(MAX_TABLE_CAPACITY).to_bytes()).unwrap();
+        let bytes = ins.to_bytes().unwrap();
         let start = std::time::Instant::now();
-        for b in &bytes {
-            d.feed_encoder_stream(std::slice::from_ref(b)).unwrap();
-        }
-        assert_eq!(d.table().len(), 1);
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "{:?}", start.elapsed());
+        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &bytes, 2 * MAX_INSTRUCTION);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "instruction decoding exceeded two seconds");
+        let mut table = Table::new(MAX_TABLE_CAPACITY);
+        table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
+        apply(&mut table, &bytes).unwrap();
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
     fn blocked_sections_are_bounded_on_one_stream() {
-        // Empty blocked sections cost no body bytes, so the byte limit
-        // alone would let one stream hold any number of them.
-        let mut d = Decoder::new(4096, 1, 1 << 16);
+        let table = Table::new(4096);
+        let mut held = BlockedSections::new(1);
         for _ in 0..MAX_BLOCKED_SECTIONS {
-            assert_eq!(d.decode_section(0, &[0x02, 0x00]), Ok(Section::Blocked));
+            held.push(blocked(&table, 0, &[2, 0])).unwrap();
         }
-        assert_eq!(d.decode_section(0, &[0x02, 0x00]), Err(Error::TooManyBlocked));
-        assert_eq!(d.blocked_streams(), 1);
+        assert!(held.push(blocked(&table, 0, &[2, 0])).is_err());
+        assert_eq!(held.buffered(), 0);
+        assert_eq!(held.len(), MAX_BLOCKED_SECTIONS);
     }
 
     #[test]
     fn integer_flags_never_spill_into_the_value() {
-        let mut out = Vec::new();
-        encode_integer(&mut out, 5, 0xff, 3);
-        assert_eq!(out, [0xe3]);
-        assert_eq!(decode_integer(&out, 5), Ok(Some((3, 1))));
+        assert_eq!(Integer::<5> { flags: 0xff, value: 3 }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Integer::<5> { flags: 0xe0, value: 3 }.to_bytes().unwrap(), [0xe3]);
     }
 
     #[test]
     fn sections_on_one_stream_are_acknowledged_in_order() {
-        // RFC 9204 section 4.4.1: the encoder takes a Section Acknowledgment
-        // to mean the oldest unacknowledged section on that stream.
-        let mut d = Decoder::new(220, 1, 1 << 16);
-        d.feed_encoder_stream(&[0x3f, 0xbd, 0x01]).unwrap();
-        // Needs entry 1, then a section that needs entry 0, then one that
-        // needs nothing.
-        assert_eq!(d.decode_section(0, &[0x03, 0x00, 0x80]), Ok(Section::Blocked));
-        assert_eq!(d.decode_section(0, &[0x02, 0x00, 0x80]), Ok(Section::Blocked));
-        assert_eq!(d.decode_section(0, &[0x00, 0x00, 0xd1]), Ok(Section::Blocked));
-        d.feed_encoder_stream(&[0x41, b'a', 0x01, b'1']).unwrap();
-        // The second section has its entry, but waits behind the first.
-        assert_eq!(d.unblocked(), []);
-        assert_eq!(d.take_decoder_stream(), [0x01]);
-        d.feed_encoder_stream(&[0x41, b'b', 0x01, b'2']).unwrap();
-        assert_eq!(
-            d.unblocked(),
-            [
-                (0, Ok(vec![Field::new("b", "2")])),
-                (0, Ok(vec![Field::new("a", "1")])),
-                (0, Ok(vec![Field::new(":method", "GET")])),
-            ]
-        );
-        // The acknowledgment of the section needing two inserts reports both.
-        assert_eq!(d.take_decoder_stream(), [0x80, 0x80]);
-        // A section that could be decoded at once also waits behind one
-        // not yet taken out of the decoder.
-        assert_eq!(d.decode_section(4, &[0x04, 0x00, 0x80]), Ok(Section::Blocked));
-        d.feed_encoder_stream(&[0x41, b'c', 0x01, b'3']).unwrap();
-        assert_eq!(d.decode_section(4, &[0x00, 0x00, 0xd1]), Ok(Section::Blocked));
-        assert_eq!(d.decode_section(8, &[0x00, 0x00, 0xd1]), Ok(Section::Fields(vec![Field::new(":method", "GET")])));
-        assert_eq!(d.unblocked(), [(4, Ok(vec![Field::new("c", "3")])), (4, Ok(vec![Field::new(":method", "GET")]))]);
+        let mut table = Table::new(220);
+        table.set_capacity(220).unwrap();
+        let mut held = BlockedSections::new(1);
+        held.push(blocked(&table, 0, &[3, 0, 0x80])).unwrap();
+        held.push(blocked(&table, 0, &[2, 0, 0x80])).unwrap();
+        apply(&mut table, &[0x41, b'a', 1, b'1']).unwrap();
+        assert_eq!(held.next_ready(&table), None);
+        assert_eq!(table.take_increment(), Some(DecoderInstruction::InsertCountIncrement(1)));
+        apply(&mut table, &[0x41, b'b', 1, b'2']).unwrap();
+        for field in [Field::new("b", "2"), Field::new("a", "1")] {
+            assert_eq!(
+                held.next_ready(&table),
+                Some((
+                    0,
+                    Ok(SectionResult::Fields { fields: vec![field], ack: Some(DecoderInstruction::SectionAck(0)) })
+                ))
+            );
+        }
+        assert_eq!(table.take_increment(), None);
+        // The owner waits until the blocked section is taken before reading later frames.
+        assert_eq!(fields(decode_section(&table, 0, &[0, 0, 0xd1]).unwrap()), [Field::new(":method", "GET")]);
+        held.push(blocked(&table, 4, &[4, 0, 0x80])).unwrap();
+        apply(&mut table, &[0x41, b'c', 1, b'3']).unwrap();
+        assert_eq!(fields(decode_section(&table, 8, &[0, 0, 0xd1]).unwrap()), [Field::new(":method", "GET")]);
+        assert_eq!(fields(held.next_ready(&table).unwrap().1.unwrap()), [Field::new("c", "3")]);
+        assert_eq!(fields(decode_section(&table, 4, &[0, 0, 0xd1]).unwrap()), [Field::new(":method", "GET")]);
     }
 
     #[test]
     fn released_sections_stay_within_the_held_limits() {
-        // Sections released by inserts but not yet taken still count
-        // against the limits, so block-and-insert cycles cannot grow memory.
-        let mut d = Decoder::new(MAX_TABLE_CAPACITY, 1, MAX_FIELD_SECTION_SIZE);
-        d.feed_encoder_stream(&EncoderInstruction::SetCapacity(MAX_TABLE_CAPACITY).to_bytes()).unwrap();
-        let mut failed = None;
-        'cycles: for cycle in 0..3u64 {
-            let section = SectionPrefix { required_insert_count: cycle + 1, base: cycle + 1 }
-                .to_bytes(d.table().max_entries())
-                .unwrap();
-            let mut section = section;
-            section.extend_from_slice(&[0x80, 0x80, 0x80, 0x80]);
-            for _ in 0..MAX_BLOCKED_SECTIONS {
-                if let Err(e) = d.decode_section(0, &section) {
-                    failed = Some(e);
-                    break 'cycles;
-                }
-            }
-            let ins = EncoderInstruction::InsertWithLiteralName { name: b"n".to_vec(), value: vec![b'v'; 60_000] };
-            d.feed_encoder_stream(&ins.to_bytes()).unwrap();
+        let mut table = Table::new(MAX_TABLE_CAPACITY);
+        table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
+        let mut held = BlockedSections::new(1);
+        for _ in 0..MAX_BLOCKED_SECTIONS {
+            held.push(blocked(&table, 0, &[2, 0, 0x80, 0x80, 0x80, 0x80])).unwrap();
         }
-        assert_eq!(failed, Some(Error::TooManyBlocked));
-        // Taking them out one at a time decodes one at a time.
-        let (stream, first) = d.next_unblocked().unwrap();
-        assert_eq!((stream, first.unwrap().len()), (0, 4));
-        assert_eq!(d.unblocked().len(), MAX_BLOCKED_SECTIONS - 1);
-        assert_eq!(d.next_unblocked(), None);
+        table.insert(b"n".to_vec(), vec![b'v'; 60_000]).unwrap();
+        assert!(held.push(blocked(&table, 0, &[3, 0, 0x80])).is_err());
+        for _ in 0..MAX_BLOCKED_SECTIONS {
+            let (stream, result) = held.next_ready(&table).unwrap();
+            assert_eq!((stream, fields(result.unwrap()).len()), (0, 4));
+        }
+        assert_eq!(held.next_ready(&table), None);
     }
 
     #[test]
     fn advertised_capacity_sets_the_insert_count_modulus() {
-        // RFC 9204 section 4.5.1.1: MaxEntries comes from the advertised
-        // SETTINGS_QPACK_MAX_TABLE_CAPACITY, even above this module's limit.
         let advertised = 128 << 10;
-        let mut e = Encoder::new(advertised, 1 << 16);
-        assert_eq!(e.table().max_entries(), 4096);
-        assert_eq!(e.table().max_capacity(), MAX_TABLE_CAPACITY);
-        e.set_capacity(MAX_TABLE_CAPACITY).unwrap();
-        for i in 0..4096u32 {
-            e.insert(b"x", i.to_string().as_bytes()).unwrap();
-            e.feed_decoder_stream(&[0x01]).unwrap();
+        let mut encoder = Encoder::new(advertised, 1 << 16);
+        let mut table = Table::new(advertised);
+        assert_eq!(encoder.table().max_entries(), 4096);
+        assert_eq!(encoder.table().max_capacity(), MAX_TABLE_CAPACITY);
+        table.apply(encoder.set_capacity(MAX_TABLE_CAPACITY).unwrap()).unwrap();
+        for i in 0..4096 {
+            table.apply(encoder.insert(b"x", i.to_string().as_bytes()).unwrap().1).unwrap();
+            encoder.apply_instruction(table.take_increment().unwrap()).unwrap();
         }
-        let bytes = e.encode_section(0, &[Field::new("x", "4095")]).unwrap();
+        let bytes = encoder.section(0, &[Field::new("x", "4095")]).unwrap().to_bytes().unwrap();
         let (prefix, _) = SectionPrefix::parse(&bytes, advertised / ENTRY_OVERHEAD, 4096).unwrap();
         assert_eq!(prefix.required_insert_count, 4096);
-        // A decoder that advertised the same reads it back.
-        let mut d = Decoder::new(advertised, 0, 1 << 16);
-        assert_eq!(d.table().max_entries(), 4096);
-        let mut s = SectionPrefix { required_insert_count: 0, base: 0 }.to_bytes(4096).unwrap();
-        s.push(0xd1);
-        assert!(d.decode_section(0, &s).is_ok());
+        assert_eq!(fields(decode_section(&table, 0, &bytes).unwrap()), [Field::new("x", "4095")]);
     }
 
     #[test]
     fn stream_readers_keep_bounded_buffers() {
-        let mut d = Decoder::new(4096, 0, 1 << 16);
-        d.feed_encoder_stream(&vec![0x20; 4 << 20]).unwrap();
-        d.feed_encoder_stream(&[0x20]).unwrap();
-        assert!(d.buf.capacity() <= 4 * MAX_INSTRUCTION, "{}", d.buf.capacity());
-        let mut e = Encoder::new(4096, 1 << 16);
-        e.feed_decoder_stream(&vec![0x40; 4 << 20]).unwrap();
-        e.feed_decoder_stream(&[0x40]).unwrap();
-        assert!(e.buf.capacity() <= 4 * MAX_INSTRUCTION, "{}", e.buf.capacity());
-        // An instruction split across calls still reads.
+        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &vec![0x20; 4096], 2 * MAX_INSTRUCTION);
+        contract::check_decode_with_alloc_limit(DecoderInstructions::new, &vec![0x40; 4096], 2 * MAX_INTEGER_BYTES);
         let ins = EncoderInstruction::InsertWithLiteralName { name: b"n".to_vec(), value: vec![b'v'; 100] };
-        let mut bytes = EncoderInstruction::SetCapacity(4096).to_bytes();
-        bytes.extend(ins.to_bytes());
-        let (a, b) = bytes.split_at(40);
-        d.feed_encoder_stream(a).unwrap();
-        d.feed_encoder_stream(b).unwrap();
-        assert_eq!(d.table().len(), 1);
+        let mut bytes = EncoderInstruction::SetCapacity(4096).to_bytes().unwrap();
+        ins.write(&mut bytes).unwrap();
+        contract::check_decode_with_alloc_limit(EncoderInstructions::new, &bytes, 2 * MAX_INSTRUCTION);
+        let mut table = Table::new(4096);
+        apply(&mut table, &bytes).unwrap();
+        assert_eq!(table.len(), 1);
     }
 
     #[test]
-    fn pending_stream_output_is_bounded() {
-        let mut e = Encoder::new(4096, 1 << 16);
-        let mut refused = false;
-        for _ in 0..(2 << 20) {
-            if e.set_capacity(0).is_err() {
-                refused = true;
-                break;
-            }
+    fn instruction_values_do_not_accumulate_in_sessions() {
+        let mut encoder = Encoder::new(4096, 1 << 16);
+        for _ in 0..4096 {
+            assert_eq!(encoder.set_capacity(0), Ok(EncoderInstruction::SetCapacity(0)));
         }
-        assert!(refused && e.out.len() <= 2 << 20, "{}", e.out.len());
-        e.take_encoder_stream();
-        assert_eq!(e.set_capacity(0), Ok(()));
-
-        let mut d = Decoder::new(4096, 0, 1 << 16);
-        let mut refused = false;
-        for stream in 0..(2u64 << 20) {
-            if d.cancel_stream(stream).is_err() {
-                refused = true;
-                break;
-            }
-        }
-        assert!(refused && d.out.len() <= 2 << 20, "{}", d.out.len());
-        d.take_decoder_stream();
-        assert_eq!(d.cancel_stream(0), Ok(()));
+        assert!(encoder.table().is_empty());
     }
 
     #[test]
-    fn huffman_writer_output_always_reads_back() {
-        let long = vec![b'0'; MAX_STRING + 1];
-        assert_eq!(huffman_decode(&huffman_encode(&long)).unwrap(), &long[..MAX_STRING]);
-        assert_eq!(huffman_len(&long), huffman_len(&long[..MAX_STRING]));
+    fn huffman_writer_refuses_truncation() {
+        let long = HuffmanString(vec![b'0'; MAX_STRING + 1]);
+        contract::check_wire_value(&long);
+        assert_eq!(long.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&HuffmanString(vec![b'0'; MAX_STRING]));
     }
 }

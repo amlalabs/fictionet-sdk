@@ -1,57 +1,68 @@
-//! QUIC datagrams, packets and frames, as a world playing a QUIC server
-//! reads them once protection is removed.
+//! QUIC datagrams and frame payloads after protection is removed.
 #![no_main]
 
-use fictionet::stdlib::quic::{Frame, Packet, Reassembler, parse_frames, split_datagram, write_datagram, write_frames};
+use fictionet::stdlib::{
+    codec::{Wire, contract},
+    quic::{self, Datagram, Frame, Payload, Reassembler, VarInt},
+};
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // The first byte picks the short header's connection ID length, up to
-    // 21 so the limit is tried too. The rest is one datagram.
-    let Some((&pick, datagram)) = data.split_first() else { return };
-    let dcid_len = usize::from(pick % 22);
-
-    // Packets read can be written, and the datagram reads back the same.
-    let (packets, _) = split_datagram(datagram, dcid_len);
-    if !packets.is_empty() {
-        let bytes = write_datagram(&packets).unwrap();
-        assert_eq!(split_datagram(&bytes, dcid_len), (packets.clone(), None));
-    }
-    for p in &packets {
-        let bytes = p.to_bytes().unwrap();
-        let (back, used) = Packet::parse(&bytes, dcid_len).unwrap();
-        assert_eq!(&back, p);
-        assert_eq!(used, bytes.len());
-        if let Some(payload) = p.payload() {
-            check_frames(payload);
-        }
-    }
-
-    // Any bytes as a payload on their own, and as a single frame.
-    check_frames(datagram);
-    if let Ok((f, used)) = Frame::parse(datagram) {
-        assert!(used > 0 && used <= datagram.len());
-        assert_eq!(parse_frames(&f.to_bytes().unwrap()).unwrap(), [f]);
-    }
-
-    // The bytes as stream data, fed to a reassembler all at once, and a
-    // byte at a time from the last byte back. Both give the same stream.
-    let mut whole = Reassembler::new();
-    let mut bytewise = Reassembler::new();
-    if whole.insert(0, datagram).is_ok() {
-        for (i, b) in datagram.iter().enumerate().rev() {
-            bytewise.insert(i as u64, std::slice::from_ref(b)).unwrap();
-        }
-        assert_eq!(whole.read(), bytewise.read());
-    }
-});
-
-/// Frames read can be written, read back the same, and take no more
-/// bytes than they did.
-fn check_frames(payload: &[u8]) {
-    if let Ok(frames) = parse_frames(payload) {
-        let bytes = write_frames(&frames).unwrap();
-        assert!(bytes.len() <= payload.len());
-        assert_eq!(parse_frames(&bytes).unwrap(), frames);
+fn check_payload(bytes: &[u8]) {
+    contract::check_wire::<Payload>(bytes);
+    if let Ok(payload) = Payload::parse(bytes) {
+        assert!(payload.to_bytes().unwrap().len() <= bytes.len());
     }
 }
+
+fn datagram<const N: usize>(bytes: &[u8]) {
+    contract::check_wire::<Datagram<N>>(bytes);
+    let (packets, _) = quic::split_datagram(bytes, N);
+    // With a legal ID length, every packet read can be written, together and one at a time.
+    let writable = N <= 20;
+    if !packets.is_empty() {
+        let value = Datagram::<N>(packets.clone());
+        contract::check_wire_value(&value);
+        if writable {
+            assert_eq!(quic::split_datagram(&value.to_bytes().unwrap(), N), (packets.clone(), None));
+        }
+    }
+    for packet in packets {
+        if let Some(payload) = packet.payload() {
+            check_payload(payload);
+        }
+        let value = Datagram::<N>(vec![packet]);
+        contract::check_wire_value(&value);
+        let written = value.to_bytes();
+        if writable {
+            assert!(written.is_ok());
+        }
+        if let Ok(bytes) = written {
+            assert_eq!(quic::Packet::parse(&bytes, N), Ok((value.0[0].clone(), bytes.len())));
+        }
+    }
+}
+
+fuzz_target!(|input: &[u8]| {
+    let Some((&pick, bytes)) = input.split_first() else { return };
+    contract::check_wire::<VarInt>(bytes);
+    contract::check_wire::<Frame>(bytes);
+    check_payload(bytes);
+    // Every legal short-header ID length, plus one past the limit.
+    macro_rules! dispatch {
+        ($($n:literal),* $(,)?) => {
+            match pick % 22 {
+                $($n => datagram::<$n>(bytes),)*
+                _ => datagram::<21>(bytes),
+            }
+        };
+    }
+    dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20);
+    let mut ordered = Reassembler::new();
+    if ordered.insert(0, bytes).is_ok() {
+        let mut reversed = Reassembler::new();
+        for (offset, byte) in bytes.iter().enumerate().rev() {
+            reversed.insert(offset as u64, std::slice::from_ref(byte)).unwrap();
+        }
+        assert_eq!(ordered.read(), reversed.read());
+    }
+});

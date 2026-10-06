@@ -19,9 +19,10 @@
 //! protection the caller has already removed, or will add after.
 //! [`Packet`] says where the AEAD tag goes. A world that plays a QUIC
 //! server reads a datagram with [`split_datagram`],
-//! reads each packet's frames with [`parse_frames`], puts CRYPTO and
-//! STREAM data back in order with a [`Reassembler`], and writes its
-//! answers with [`write_frames`] and [`Packet::to_bytes`].
+//! reads each packet's frames with [`Payload`], and puts CRYPTO and
+//! STREAM data back in order with a [`Reassembler`]. It writes answers as
+//! [`Datagram`] values. The short-header connection-ID length is `Datagram`'s
+//! const parameter and the `short_dcid_len` argument to [`split_datagram`].
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. Every limit on what a reader keeps is a named constant.
@@ -31,8 +32,9 @@
 //!
 //! ```
 //! use fictionet::stdlib::quic::{
-//!     Frame, Packet, PacketNumber, VERSION_1, VERSION_2, parse_frames, write_frames,
+//!     Datagram, Frame, Packet, PacketNumber, Payload, VERSION_1, VERSION_2,
 //! };
+//! use fictionet::stdlib::codec::Wire;
 //!
 //! // A client's first packet in a version this server does not speak:
 //! // a long header, version 0x1a2a3a4a, an 8-byte destination connection
@@ -52,14 +54,14 @@
 //!     scid: dcid,
 //!     versions: vec![VERSION_1, VERSION_2],
 //! };
-//! let bytes = reply.to_bytes().unwrap();
+//! let bytes = Datagram::<0>(vec![reply]).to_bytes().unwrap();
 //! assert_eq!(bytes[..10], [0xc0, 0, 0, 0, 0, 4, 9, 9, 9, 9]);
 //! assert_eq!(bytes.len(), 1 + 4 + 1 + 4 + 1 + 8 + 4 + 4);
 //!
 //! // A version 1 Initial packet, unprotected, holding a CRYPTO frame and
 //! // some padding.
 //! let hello = Frame::Crypto { offset: 0, data: b"hello".to_vec() };
-//! let payload = write_frames(&[hello.clone(), Frame::Padding(10)]).unwrap();
+//! let payload = Payload(vec![hello.clone(), Frame::Padding(10)]).to_bytes().unwrap();
 //! let initial = Packet::Initial {
 //!     version: VERSION_1,
 //!     dcid: vec![0x83; 8],
@@ -68,13 +70,15 @@
 //!     number: PacketNumber { value: 0, len: 1 },
 //!     payload,
 //! };
-//! let bytes = initial.to_bytes().unwrap();
+//! let bytes = Datagram::<0>(vec![initial.clone()]).to_bytes().unwrap();
 //! let (back, used) = Packet::parse(&bytes, 0).unwrap();
 //! assert_eq!(used, bytes.len());
 //! assert_eq!(back, initial);
 //! let Packet::Initial { payload, .. } = &back else { panic!("not an Initial") };
-//! assert_eq!(parse_frames(payload).unwrap(), [hello, Frame::Padding(10)]);
+//! assert_eq!(Payload::parse(payload).unwrap().0, [hello, Frame::Padding(10)]);
 //! ```
+
+use super::codec::Wire;
 
 /// The UDP port QUIC servers for HTTP/3 listen on.
 pub const PORT: u16 = 443;
@@ -94,8 +98,7 @@ pub const MAX_ANY_CID_LEN: usize = 255;
 /// The largest datagram a reader accepts or a writer makes: the largest
 /// UDP payload.
 pub const MAX_DATAGRAM: usize = 65_527;
-/// The longest packet payload [`parse_frames`] reads or [`write_frames`]
-/// makes.
+/// The longest packet payload [`Payload`] reads or writes.
 pub const MAX_PAYLOAD: usize = MAX_DATAGRAM;
 /// The most frames one payload may hold. A run of PADDING bytes counts
 /// as one frame.
@@ -117,14 +120,21 @@ pub const MAX_REASSEMBLY: usize = 65_536;
 
 /// Frame types (RFC 9000, section 19 and table 3).
 pub mod frame_type {
-    #![allow(missing_docs)]
+    /// Padding bytes.
     pub const PADDING: u64 = 0x00;
+    /// A request for acknowledgment.
     pub const PING: u64 = 0x01;
+    /// Acknowledged packet ranges.
     pub const ACK: u64 = 0x02;
+    /// Acknowledged ranges with ECN counts.
     pub const ACK_ECN: u64 = 0x03;
+    /// Abandon a stream.
     pub const RESET_STREAM: u64 = 0x04;
+    /// Ask the peer to stop a stream.
     pub const STOP_SENDING: u64 = 0x05;
+    /// TLS handshake data.
     pub const CRYPTO: u64 = 0x06;
+    /// A token for a later Initial packet.
     pub const NEW_TOKEN: u64 = 0x07;
     /// STREAM frames are 0x08 to 0x0f. The low three bits are flags.
     pub const STREAM: u64 = 0x08;
@@ -134,43 +144,74 @@ pub mod frame_type {
     pub const STREAM_LEN: u64 = 0x02;
     /// In a STREAM frame type: this frame ends the stream.
     pub const STREAM_FIN: u64 = 0x01;
+    /// The connection flow-control limit.
     pub const MAX_DATA: u64 = 0x10;
+    /// A stream flow-control limit.
     pub const MAX_STREAM_DATA: u64 = 0x11;
+    /// The bidirectional stream count limit.
     pub const MAX_STREAMS_BIDI: u64 = 0x12;
+    /// The unidirectional stream count limit.
     pub const MAX_STREAMS_UNI: u64 = 0x13;
+    /// The sender reached its connection limit.
     pub const DATA_BLOCKED: u64 = 0x14;
+    /// The sender reached a stream limit.
     pub const STREAM_DATA_BLOCKED: u64 = 0x15;
+    /// The sender reached its bidirectional stream count limit.
     pub const STREAMS_BLOCKED_BIDI: u64 = 0x16;
+    /// The sender reached its unidirectional stream count limit.
     pub const STREAMS_BLOCKED_UNI: u64 = 0x17;
+    /// A new connection ID and reset token.
     pub const NEW_CONNECTION_ID: u64 = 0x18;
+    /// Retire a connection ID.
     pub const RETIRE_CONNECTION_ID: u64 = 0x19;
+    /// A path-validation challenge.
     pub const PATH_CHALLENGE: u64 = 0x1a;
+    /// A path-validation response.
     pub const PATH_RESPONSE: u64 = 0x1b;
+    /// A transport connection close.
     pub const CONNECTION_CLOSE: u64 = 0x1c;
+    /// An application connection close.
     pub const CONNECTION_CLOSE_APP: u64 = 0x1d;
+    /// The server completed the handshake.
     pub const HANDSHAKE_DONE: u64 = 0x1e;
 }
 
 /// Transport error codes, sent in a CONNECTION_CLOSE frame of type 0x1c
 /// (RFC 9000, section 20.1).
 pub mod error_code {
-    #![allow(missing_docs)]
+    /// Normal connection closure.
     pub const NO_ERROR: u64 = 0x00;
+    /// An internal endpoint error.
     pub const INTERNAL_ERROR: u64 = 0x01;
+    /// The endpoint refused the connection.
     pub const CONNECTION_REFUSED: u64 = 0x02;
+    /// A flow-control limit was exceeded.
     pub const FLOW_CONTROL_ERROR: u64 = 0x03;
+    /// A stream-count limit was exceeded.
     pub const STREAM_LIMIT_ERROR: u64 = 0x04;
+    /// A frame is invalid for this stream state.
     pub const STREAM_STATE_ERROR: u64 = 0x05;
+    /// The stream final size is inconsistent.
     pub const FINAL_SIZE_ERROR: u64 = 0x06;
+    /// A frame is malformed.
     pub const FRAME_ENCODING_ERROR: u64 = 0x07;
+    /// A transport parameter is invalid.
     pub const TRANSPORT_PARAMETER_ERROR: u64 = 0x08;
+    /// Too many connection IDs are active.
     pub const CONNECTION_ID_LIMIT_ERROR: u64 = 0x09;
+    /// A transport protocol rule was broken.
     pub const PROTOCOL_VIOLATION: u64 = 0x0a;
+    /// An address-validation token is invalid.
     pub const INVALID_TOKEN: u64 = 0x0b;
+    /// The application caused closure.
     pub const APPLICATION_ERROR: u64 = 0x0c;
+    /// Too much CRYPTO data is buffered.
     pub const CRYPTO_BUFFER_EXCEEDED: u64 = 0x0d;
+    /// A key update is invalid.
     pub const KEY_UPDATE_ERROR: u64 = 0x0e;
+    /// The packet-protection usage limit was reached.
     pub const AEAD_LIMIT_REACHED: u64 = 0x0f;
+    /// No path can carry the connection.
     pub const NO_VIABLE_PATH: u64 = 0x10;
     /// TLS alerts are sent as this plus the alert number.
     pub const CRYPTO_ERROR: u64 = 0x0100;
@@ -180,6 +221,10 @@ pub mod error_code {
 /// written as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
+    /// Bytes follow the complete wire value.
+    Trailing,
     /// The bytes ended before a field did, or a length field asks for
     /// more bytes than there are. Inside a frame, this is
     /// [`Error::FrameEncoding`] instead, which names the frame's type.
@@ -195,16 +240,6 @@ pub enum Error {
     /// A connection ID is longer than the version allows. It holds the
     /// length.
     ConnectionIdLength(usize),
-    /// A writer was given a version that does not fit the packet type.
-    Version(u32),
-    /// A packet number does not fit its length, or the length is not 1 to
-    /// 4 bytes.
-    PacketNumber {
-        /// The truncated packet number.
-        value: u32,
-        /// Its length in bytes.
-        len: u8,
-    },
     /// A long header's Length field is too small to hold the packet
     /// number. It holds the field.
     Length(u64),
@@ -214,9 +249,6 @@ pub enum Error {
     VersionList(usize),
     /// A Retry packet has no token.
     EmptyToken,
-    /// A value is above [`MAX_VARINT`], so no variable-length integer can
-    /// hold it.
-    VarintTooLarge(u64),
     /// A payload holds no frames, or a datagram no packets.
     Empty,
     /// A frame type this module does not know. It holds the type.
@@ -232,16 +264,8 @@ pub enum Error {
     /// An ACK frame has more than [`MAX_ACK_RANGES`] extra ranges. It
     /// holds the frame type, 0x02 or 0x03.
     TooManyAckRanges(u64),
-    /// A writer was given bits for a packet's first byte that do not fit
-    /// their field: `unused` in Version Negotiation (7 bits) or Retry (4
-    /// bits), or `bits` in another version's packet (7 bits). It holds the
-    /// value.
-    FirstByte(u8),
     /// A datagram holds more than [`MAX_COALESCED`] packets.
     TooManyPackets,
-    /// A packet with no Length field is followed by another packet in the
-    /// same datagram, where a writer was asked to put one.
-    MisplacedPacket,
     /// A packet's destination connection ID differs from that of the
     /// first packet in its datagram. RFC 9000 forbids a sender to mix
     /// them, and a receiver ignores the packets after one that differs.
@@ -265,7 +289,7 @@ impl Error {
             | Error::FrameEncoding(_)
             | Error::TooManyFrames
             | Error::TooManyAckRanges(_) => error_code::FRAME_ENCODING_ERROR,
-            Error::VarintTooLarge(_) => error_code::INTERNAL_ERROR,
+            Error::Unwritable => error_code::INTERNAL_ERROR,
             Error::Window(_) => error_code::CRYPTO_BUFFER_EXCEEDED,
             _ => error_code::PROTOCOL_VIOLATION,
         }
@@ -287,26 +311,23 @@ impl Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Trailing => f.write_str("bytes follow the QUIC value"),
             Error::Truncated => f.write_str("the bytes end before the packet or frame does"),
             Error::TooLong(n) => write!(f, "{n} bytes, more than a datagram holds"),
             Error::FixedBit => f.write_str("the fixed bit is 0"),
             Error::ReservedBits => f.write_str("the reserved bits are not 0"),
             Error::ConnectionIdLength(n) => write!(f, "a {n}-byte connection ID is too long"),
-            Error::Version(v) => write!(f, "version {v:#010x} does not fit the packet type"),
-            Error::PacketNumber { value, len } => write!(f, "packet number {value} does not fit in {len} bytes"),
             Error::Length(n) => write!(f, "Length field {n} cannot hold the packet number"),
             Error::VersionList(n) => write!(f, "a {n}-byte version list is empty or not whole versions"),
             Error::EmptyToken => f.write_str("a Retry packet with no token"),
-            Error::VarintTooLarge(v) => write!(f, "{v} is above 2^62 - 1"),
             Error::Empty => f.write_str("no frames or packets"),
             Error::UnknownFrame(t) => write!(f, "unknown frame type {t:#x}"),
             Error::FrameEncoding(t) => write!(f, "frame of type {t:#x} breaks its rules"),
             Error::LongFrameType(t) => write!(f, "frame type {t:#x} is not in its shortest form"),
             Error::TooManyFrames => write!(f, "more than {MAX_FRAMES} frames"),
             Error::TooManyAckRanges(_) => write!(f, "more than {MAX_ACK_RANGES} ACK ranges"),
-            Error::FirstByte(b) => write!(f, "{b:#04x} does not fit its bits of the first byte"),
             Error::TooManyPackets => write!(f, "more than {MAX_COALESCED} packets in a datagram"),
-            Error::MisplacedPacket => f.write_str("a packet with no Length field is not last in its datagram"),
             Error::MixedConnectionIds => f.write_str("packets in one datagram have different connection IDs"),
             Error::Window(end) => write!(f, "data ending at offset {end} is past what may be held"),
         }
@@ -345,15 +366,45 @@ pub fn read_varint(b: &[u8]) -> Result<(u64, usize), Error> {
 
 /// Appends the shortest encoding of `v` to `out`. It fails if `v` is
 /// above [`MAX_VARINT`].
-pub fn write_varint(v: u64, out: &mut Vec<u8>) -> Result<(), Error> {
+fn put_varint(v: u64, out: &mut Vec<u8>) -> Result<(), Error> {
     match varint_len(v) {
         Some(1) => out.push(v as u8),
         Some(2) => out.extend_from_slice(&(v as u16 | 0x4000).to_be_bytes()),
         Some(4) => out.extend_from_slice(&(v as u32 | 0x8000_0000).to_be_bytes()),
         Some(_) => out.extend_from_slice(&(v | 0xc000_0000_0000_0000).to_be_bytes()),
-        None => return Err(Error::VarintTooLarge(v)),
+        None => return Err(Error::Unwritable),
     }
     Ok(())
+}
+
+/// A QUIC variable-length integer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VarInt(
+    /// The value, at most [`MAX_VARINT`].
+    pub u64,
+);
+
+fn exact<T>(result: Result<(T, usize), Error>, len: usize) -> Result<T, Error> {
+    let (value, used) = result?;
+    if used != len {
+        return Err(Error::Trailing);
+    }
+    Ok(value)
+}
+
+impl Wire for VarInt {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one integer. Refuses truncation and trailing bytes; accepts longer encodings.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        exact(read_varint(bytes), bytes.len()).map(Self)
+    }
+
+    /// Writes the shortest encoding. Refuses values above [`MAX_VARINT`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        put_varint(self.0, out).map_err(|_| Error::Unwritable)
+    }
 }
 
 // Packet numbers (RFC 9000, section 17.1 and appendix A).
@@ -422,7 +473,7 @@ impl PacketNumber {
 
     fn write(self, out: &mut Vec<u8>) -> Result<(), Error> {
         if !self.is_valid() {
-            return Err(Error::PacketNumber { value: self.value, len: self.len });
+            return Err(Error::Unwritable);
         }
         let bytes = self.value.to_be_bytes();
         out.extend_from_slice(&bytes[4 - usize::from(self.len)..]);
@@ -462,7 +513,7 @@ impl Space {
 }
 
 /// One QUIC packet, with its header protection removed. The payload is
-/// kept as bytes; [`parse_frames`] reads the frames in it once the AEAD
+/// kept as bytes; [`Payload`] reads the frames in it once the AEAD
 /// protection is removed. In Initial, 0-RTT and Handshake packets, the
 /// payload is what the Length field covers past the packet number, so on
 /// the wire it ends with the 16-byte AEAD tag. A reader decrypts the
@@ -474,37 +525,115 @@ impl Space {
 /// 2 allow up to [`MAX_CID_LEN`] bytes, and the other kinds up to
 /// [`MAX_ANY_CID_LEN`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Packet {
     /// A server's list of the `versions` it supports, sent when a client
     /// asks for one it does not. `unused` is the low 7 bits of the first
     /// byte. A server may set them to anything, but should set 0x40 so the
     /// packet looks like it has a fixed bit. `dcid` and `scid` echo the
     /// client's source and destination connection IDs.
-    VersionNegotiation { unused: u8, dcid: Vec<u8>, scid: Vec<u8>, versions: Vec<u32> },
+    VersionNegotiation {
+        /// Unused low bits of the first byte.
+        unused: u8,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// Source connection ID.
+        scid: Vec<u8>,
+        /// Supported version numbers in wire order.
+        versions: Vec<u32>,
+    },
     /// The first packets of a connection, carrying the TLS handshake's
     /// start. `token` is from a Retry or NEW_TOKEN frame, or empty. A
     /// server's Initial packets must have an empty token, which a client
     /// checks itself.
-    Initial { version: u32, dcid: Vec<u8>, scid: Vec<u8>, token: Vec<u8>, number: PacketNumber, payload: Vec<u8> },
+    Initial {
+        /// The QUIC version number.
+        version: u32,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// Source connection ID.
+        scid: Vec<u8>,
+        /// The address-validation token.
+        token: Vec<u8>,
+        /// The truncated packet number.
+        number: PacketNumber,
+        /// Payload bytes after the packet number.
+        payload: Vec<u8>,
+    },
     /// Early data a client sends before the handshake ends.
-    ZeroRtt { version: u32, dcid: Vec<u8>, scid: Vec<u8>, number: PacketNumber, payload: Vec<u8> },
+    ZeroRtt {
+        /// The QUIC version number.
+        version: u32,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// Source connection ID.
+        scid: Vec<u8>,
+        /// The truncated packet number.
+        number: PacketNumber,
+        /// Payload bytes after the packet number.
+        payload: Vec<u8>,
+    },
     /// The rest of the TLS handshake.
-    Handshake { version: u32, dcid: Vec<u8>, scid: Vec<u8>, number: PacketNumber, payload: Vec<u8> },
+    Handshake {
+        /// The QUIC version number.
+        version: u32,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// Source connection ID.
+        scid: Vec<u8>,
+        /// The truncated packet number.
+        number: PacketNumber,
+        /// Payload bytes after the packet number.
+        payload: Vec<u8>,
+    },
     /// A server's request that the client prove its address by sending
     /// `token` back. `unused` is the low 4 bits of the first byte. `tag`
     /// is the integrity tag, computed with AES-GCM; this module keeps it
     /// as bytes and does not check it.
-    Retry { version: u32, unused: u8, dcid: Vec<u8>, scid: Vec<u8>, token: Vec<u8>, tag: [u8; RETRY_TAG_LEN] },
+    Retry {
+        /// The QUIC version number.
+        version: u32,
+        /// Unused low bits of the first byte.
+        unused: u8,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// Source connection ID.
+        scid: Vec<u8>,
+        /// The address-validation token.
+        token: Vec<u8>,
+        /// Retry integrity tag bytes.
+        tag: [u8; RETRY_TAG_LEN],
+    },
     /// A packet after the handshake. Its destination connection ID has no
     /// length on the wire, so a reader must know it. `spin` is the latency
     /// spin bit and `key_phase` says which keys protect it.
-    Short { spin: bool, key_phase: bool, dcid: Vec<u8>, number: PacketNumber, payload: Vec<u8> },
+    Short {
+        /// The latency spin bit.
+        spin: bool,
+        /// The packet-protection key phase.
+        key_phase: bool,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// The truncated packet number.
+        number: PacketNumber,
+        /// Payload bytes after the packet number.
+        payload: Vec<u8>,
+    },
     /// A long header packet of a version other than 1 or 2. Only the
     /// parts all versions share are read (RFC 8999): the low 7 bits of the
     /// first byte, the version and the connection IDs. `rest` is the
     /// datagram's remaining bytes.
-    OtherVersion { bits: u8, version: u32, dcid: Vec<u8>, scid: Vec<u8>, rest: Vec<u8> },
+    OtherVersion {
+        /// The low seven bits of the first byte.
+        bits: u8,
+        /// The QUIC version number.
+        version: u32,
+        /// Destination connection ID.
+        dcid: Vec<u8>,
+        /// Source connection ID.
+        scid: Vec<u8>,
+        /// Remaining bytes of the datagram.
+        rest: Vec<u8>,
+    },
 }
 
 impl Packet {
@@ -593,7 +722,7 @@ impl Packet {
     /// or a packet longer than
     /// [`MAX_DATAGRAM`]. Anything it writes, [`Packet::parse`] reads back
     /// the same, given the short header's connection ID length.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut out = Vec::new();
         match self {
             Packet::VersionNegotiation { unused, dcid, scid, versions } => {
@@ -650,7 +779,7 @@ impl Packet {
             }
             Packet::OtherVersion { bits, version, dcid, scid, rest } => {
                 if [VERSION_NEGOTIATION, VERSION_1, VERSION_2].contains(version) {
-                    return Err(Error::Version(*version));
+                    return Err(Error::Unwritable);
                 }
                 check_len(rest.len())?;
                 out.push(0x80 | fits(*bits, 0x7f)?);
@@ -780,7 +909,7 @@ fn long_bits(version: u32, kind: LongKind) -> Result<u8, Error> {
     match version {
         VERSION_1 => Ok(bits),
         VERSION_2 => Ok((bits + 1) & 0x03),
-        v => Err(Error::Version(v)),
+        _ => Err(Error::Unwritable),
     }
 }
 
@@ -809,7 +938,7 @@ fn pn_from(bytes: &[u8], len: u8) -> PacketNumber {
 
 /// `v`, if it has no bits outside `mask`.
 fn fits(v: u8, mask: u8) -> Result<u8, Error> {
-    if v & !mask == 0 { Ok(v) } else { Err(Error::FirstByte(v)) }
+    if v & !mask == 0 { Ok(v) } else { Err(Error::Unwritable) }
 }
 
 fn check_len(n: usize) -> Result<(), Error> {
@@ -845,11 +974,11 @@ fn write_long(
     write_cid(dcid, MAX_CID_LEN, out)?;
     write_cid(scid, MAX_CID_LEN, out)?;
     if let Some(t) = token {
-        write_varint(t.len() as u64, out)?;
+        put_varint(t.len() as u64, out)?;
         out.extend_from_slice(t);
     }
     // Both lengths are at most MAX_DATAGRAM, so neither sum overflows.
-    write_varint(u64::from(number.len) + payload.len() as u64, out)?;
+    put_varint(u64::from(number.len) + payload.len() as u64, out)?;
     number.write(out)?;
     out.extend_from_slice(payload);
     Ok(())
@@ -889,28 +1018,53 @@ pub fn split_datagram(b: &[u8], short_dcid_len: usize) -> (Vec<Packet>, Option<E
     (packets, None)
 }
 
-/// One datagram holding `packets`, in order. Only the last may be a
-/// packet with no Length field (all but Initial, 0-RTT and Handshake).
-/// All must have the same destination connection ID.
-pub fn write_datagram(packets: &[Packet]) -> Result<Vec<u8>, Error> {
-    if packets.is_empty() {
-        return Err(Error::Empty);
-    }
-    if packets.len() > MAX_COALESCED {
-        return Err(Error::TooManyPackets);
-    }
-    let mut out = Vec::new();
-    for (i, p) in packets.iter().enumerate() {
-        if i + 1 < packets.len() && !p.has_length() {
-            return Err(Error::MisplacedPacket);
+/// A complete UDP datagram containing packets with one destination connection ID.
+/// `SHORT_DCID_LEN` is the connection's short-header destination-ID length.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Datagram<const SHORT_DCID_LEN: usize>(
+    /// Packets in transmitted order. Only the last may omit its Length field.
+    pub Vec<Packet>,
+);
+
+impl<const SHORT_DCID_LEN: usize> Wire for Datagram<SHORT_DCID_LEN> {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads the whole datagram. Refuses empty, oversized, malformed, or excessive packets
+    /// and mixed destination IDs. Short headers use `SHORT_DCID_LEN` bytes for the ID.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let (packets, error) = split_datagram(bytes, SHORT_DCID_LEN);
+        match error {
+            Some(error) => Err(error),
+            None => Ok(Self(packets)),
         }
-        if packets.first().is_some_and(|f| f.dcid() != p.dcid()) {
-            return Err(Error::MixedConnectionIds);
-        }
-        out.extend_from_slice(&p.to_bytes()?);
-        check_len(out.len())?;
     }
-    Ok(out)
+
+    /// Writes one datagram. Refuses invalid packet fields, lengthless packets before the end,
+    /// mixed IDs, a short-header ID of the wrong length, and size or packet-count limits.
+    /// Packet checks reject oversized IDs or packet numbers, mismatched versions, invalid first-byte
+    /// bits, an empty version list, and a Retry without a token. Errors leave `out` unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.is_empty() || self.0.len() > MAX_COALESCED {
+            return Err(Error::Unwritable);
+        }
+        let mut bytes = Vec::new();
+        for (i, packet) in self.0.iter().enumerate() {
+            if (i + 1 < self.0.len() && !packet.has_length())
+                || packet.dcid() != self.0[0].dcid()
+                || matches!(packet, Packet::Short { dcid, .. } if dcid.len() != SHORT_DCID_LEN)
+            {
+                return Err(Error::Unwritable);
+            }
+            let encoded = packet.encode().map_err(|_| Error::Unwritable)?;
+            if encoded.len() > MAX_DATAGRAM.saturating_sub(bytes.len()) {
+                return Err(Error::Unwritable);
+            }
+            bytes.extend_from_slice(&encoded);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 // Frames (RFC 9000, section 19).
@@ -1009,14 +1163,12 @@ pub struct StreamFrame {
     /// Whether this frame ends the stream.
     pub fin: bool,
     /// Whether a length field is written. Without one, the data runs to
-    /// the end of the packet, so [`write_frames`] writes one anyway for
-    /// any frame but the last.
+    /// the end of the packet. [`Payload`] refuses such a frame before the last.
     pub length: bool,
 }
 
 /// One frame. PADDING bytes in a row are read as one frame.
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(missing_docs)] // each variant's doc names its fields
 pub enum Frame {
     /// This many PADDING bytes (type 0x00), at least 1.
     Padding(usize),
@@ -1026,11 +1178,28 @@ pub enum Frame {
     Ack(Ack),
     /// RESET_STREAM (0x04): the sender abandons `stream` at `final_size`
     /// bytes, with an application `error_code`.
-    ResetStream { stream: u64, error_code: u64, final_size: u64 },
+    ResetStream {
+        /// The QUIC stream ID.
+        stream: u64,
+        /// The application or transport error code.
+        error_code: u64,
+        /// The final stream size in bytes.
+        final_size: u64,
+    },
     /// STOP_SENDING (0x05): asks the peer to stop sending on `stream`.
-    StopSending { stream: u64, error_code: u64 },
+    StopSending {
+        /// The QUIC stream ID.
+        stream: u64,
+        /// The application or transport error code.
+        error_code: u64,
+    },
     /// CRYPTO (0x06): TLS handshake bytes at `offset`.
-    Crypto { offset: u64, data: Vec<u8> },
+    Crypto {
+        /// The starting byte offset.
+        offset: u64,
+        /// The frame data.
+        data: Vec<u8>,
+    },
     /// NEW_TOKEN (0x07): a token, never empty, for a later Initial.
     NewToken(Vec<u8>),
     /// STREAM (0x08 to 0x0f).
@@ -1038,22 +1207,51 @@ pub enum Frame {
     /// MAX_DATA (0x10): the connection's flow control limit in bytes.
     MaxData(u64),
     /// MAX_STREAM_DATA (0x11): `stream`'s flow control limit in bytes.
-    MaxStreamData { stream: u64, max: u64 },
+    MaxStreamData {
+        /// The QUIC stream ID.
+        stream: u64,
+        /// The advertised limit.
+        max: u64,
+    },
     /// MAX_STREAMS (0x12 when `bidi`, 0x13 if not): how many streams the
     /// peer may open, at most [`MAX_STREAM_COUNT`].
-    MaxStreams { bidi: bool, max: u64 },
+    MaxStreams {
+        /// Whether the limit applies to bidirectional streams.
+        bidi: bool,
+        /// The advertised limit.
+        max: u64,
+    },
     /// DATA_BLOCKED (0x14): the sender is held at this connection limit.
     DataBlocked(u64),
     /// STREAM_DATA_BLOCKED (0x15): the sender is held at `limit` on
     /// `stream`.
-    StreamDataBlocked { stream: u64, limit: u64 },
+    StreamDataBlocked {
+        /// The QUIC stream ID.
+        stream: u64,
+        /// The limit that blocked transmission.
+        limit: u64,
+    },
     /// STREAMS_BLOCKED (0x16 when `bidi`, 0x17 if not): the sender wants
     /// more streams than `limit`, at most [`MAX_STREAM_COUNT`].
-    StreamsBlocked { bidi: bool, limit: u64 },
+    StreamsBlocked {
+        /// Whether the limit applies to bidirectional streams.
+        bidi: bool,
+        /// The limit that blocked transmission.
+        limit: u64,
+    },
     /// NEW_CONNECTION_ID (0x18): another connection ID, of 1 to
     /// [`MAX_CID_LEN`] bytes, numbered `sequence`. The peer retires those
     /// numbered below `retire_prior_to`, which is at most `sequence`.
-    NewConnectionId { sequence: u64, retire_prior_to: u64, id: Vec<u8>, reset_token: [u8; RESET_TOKEN_LEN] },
+    NewConnectionId {
+        /// The connection-ID sequence number.
+        sequence: u64,
+        /// Retire connection IDs with smaller sequence numbers.
+        retire_prior_to: u64,
+        /// The new connection ID.
+        id: Vec<u8>,
+        /// The stateless reset token.
+        reset_token: [u8; RESET_TOKEN_LEN],
+    },
     /// RETIRE_CONNECTION_ID (0x19): the sequence number to retire.
     RetireConnectionId(u64),
     /// PATH_CHALLENGE (0x1a): 8 bytes the peer must echo.
@@ -1063,7 +1261,14 @@ pub enum Frame {
     /// CONNECTION_CLOSE: 0x1c with the `frame_type` that caused a
     /// transport error, or 0x1d, an application close, when it is `None`.
     /// `reason` should be UTF-8, and is kept as bytes.
-    ConnectionClose { error_code: u64, frame_type: Option<u64>, reason: Vec<u8> },
+    ConnectionClose {
+        /// The application or transport error code.
+        error_code: u64,
+        /// The offending frame type for a transport close, or None for an application close.
+        frame_type: Option<u64>,
+        /// Reason bytes, normally UTF-8.
+        reason: Vec<u8>,
+    },
     /// HANDSHAKE_DONE (0x1e): the server says the handshake is confirmed.
     HandshakeDone,
 }
@@ -1071,9 +1276,9 @@ pub enum Frame {
 impl Frame {
     /// Reads the frame at the start of `b`, a packet payload or what is
     /// left of one, and returns it with how many bytes it took. A run of
-    /// PADDING takes every 0x00 byte in a row. Like [`parse_frames`], it
+    /// PADDING takes every 0x00 byte in a row. Like [`Payload`], it
     /// refuses more than [`MAX_PAYLOAD`] bytes.
-    pub fn parse(b: &[u8]) -> Result<(Frame, usize), Error> {
+    fn parse_prefix(b: &[u8]) -> Result<(Frame, usize), Error> {
         if b.len() > MAX_PAYLOAD {
             return Err(Error::TooLong(b.len()));
         }
@@ -1082,18 +1287,8 @@ impl Frame {
         Ok((frame, r.pos))
     }
 
-    /// The frame's bytes, as the last frame of a payload. It fails if the
-    /// frame breaks its rules or would make a payload longer than
-    /// [`MAX_PAYLOAD`], so [`parse_frames`] reads anything it writes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::new();
-        self.write(&mut out, true)?;
-        check_len(out.len())?;
-        Ok(out)
-    }
-
     /// The frame's type. A STREAM frame's type has its flags set as
-    /// [`Frame::to_bytes`] would write them.
+    /// [`Wire::write`] would write them.
     pub fn frame_type(&self) -> u64 {
         use frame_type as t;
         match self {
@@ -1110,7 +1305,7 @@ impl Frame {
             Frame::StopSending { .. } => t::STOP_SENDING,
             Frame::Crypto { .. } => t::CRYPTO,
             Frame::NewToken(_) => t::NEW_TOKEN,
-            Frame::Stream(s) => stream_type(s, true),
+            Frame::Stream(s) => stream_type(s),
             Frame::MaxData(_) => t::MAX_DATA,
             Frame::MaxStreamData { .. } => t::MAX_STREAM_DATA,
             Frame::MaxStreams { bidi: true, .. } => t::MAX_STREAMS_BIDI,
@@ -1154,9 +1349,8 @@ impl Frame {
         !matches!(self, Frame::Ack(_) | Frame::Padding(_) | Frame::ConnectionClose { .. })
     }
 
-    /// Appends the frame's bytes to `out`. `last` says whether it ends
-    /// the payload, which lets a STREAM frame leave out its length.
-    fn write(&self, out: &mut Vec<u8>, last: bool) -> Result<(), Error> {
+    // Appends a checked frame into a temporary payload buffer.
+    fn encode(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         use frame_type as t;
         let ty = self.frame_type();
         match self {
@@ -1167,7 +1361,7 @@ impl Frame {
                 if *n > MAX_PAYLOAD {
                     return Err(Error::TooLong(*n));
                 }
-                out.resize(out.len() + n, 0);
+                out.resize(out.len().checked_add(*n).ok_or(Error::Unwritable)?, 0);
             }
             Frame::Ping | Frame::HandshakeDone => out.push(ty as u8),
             Frame::Ack(a) => {
@@ -1211,7 +1405,7 @@ impl Frame {
                 out.extend_from_slice(token);
             }
             Frame::Stream(s) => {
-                let ty = stream_type(s, last);
+                let ty = stream_type(s);
                 check_len(s.data.len())?;
                 check_end(ty, s.offset, s.data.len())?;
                 out.push(ty as u8);
@@ -1269,13 +1463,13 @@ impl Frame {
 }
 
 /// The type byte a STREAM frame is written with.
-fn stream_type(s: &StreamFrame, last: bool) -> u64 {
+fn stream_type(s: &StreamFrame) -> u64 {
     use frame_type as t;
     let mut ty = t::STREAM;
     if s.offset != 0 {
         ty |= t::STREAM_OFF;
     }
-    if s.length || !last {
+    if s.length {
         ty |= t::STREAM_LEN;
     }
     if s.fin {
@@ -1294,7 +1488,7 @@ fn check_end(ty: u64, offset: u64, len: usize) -> Result<(), Error> {
 }
 
 fn put(out: &mut Vec<u8>, values: &[u64]) -> Result<(), Error> {
-    values.iter().try_for_each(|v| write_varint(*v, out))
+    values.iter().try_for_each(|v| put_varint(*v, out))
 }
 
 fn parse_frame(r: &mut Reader<'_>) -> Result<Frame, Error> {
@@ -1417,53 +1611,87 @@ fn parse_body(ty: u64, r: &mut Reader<'_>) -> Result<Frame, Error> {
     Ok(frame)
 }
 
-/// Reads every frame in a packet payload. A payload must hold at least
-/// one frame and at most [`MAX_FRAMES`], and be at most [`MAX_PAYLOAD`]
-/// bytes.
-pub fn parse_frames(payload: &[u8]) -> Result<Vec<Frame>, Error> {
-    if payload.is_empty() {
-        return Err(Error::Empty);
+impl Wire for Frame {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one frame. Refuses trailing bytes, malformed fields, nonminimal frame types,
+    /// and payloads larger than [`MAX_PAYLOAD`]. A padding run is one frame.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        exact(Self::parse_prefix(bytes), bytes.len())
     }
-    if payload.len() > MAX_PAYLOAD {
-        return Err(Error::TooLong(payload.len()));
-    }
-    let mut r = Reader::new(payload);
-    let mut frames = Vec::new();
-    while r.left() > 0 {
-        if frames.len() == MAX_FRAMES {
-            return Err(Error::TooManyFrames);
+
+    /// Writes a frame. Refuses invalid fields, zero padding, and excessive payload size.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let mut bytes = Vec::new();
+        self.encode(&mut bytes).map_err(|_| Error::Unwritable)?;
+        if bytes.len() > MAX_PAYLOAD {
+            return Err(Error::Unwritable);
         }
-        frames.push(parse_frame(&mut r)?);
+        out.extend_from_slice(&bytes);
+        Ok(())
     }
-    Ok(frames)
 }
 
-/// A packet payload holding `frames`, in order. A STREAM frame other than
-/// the last gets a length field even if it asks for none. PADDING frames
-/// in a row read back as one. It fails on an empty list, on more than
-/// [`MAX_FRAMES`] frames, on a frame that breaks its rules, and on a
-/// payload longer than [`MAX_PAYLOAD`].
-pub fn write_frames(frames: &[Frame]) -> Result<Vec<u8>, Error> {
-    if frames.is_empty() {
-        return Err(Error::Empty);
-    }
-    if frames.len() > MAX_FRAMES {
-        return Err(Error::TooManyFrames);
-    }
-    let mut out = Vec::new();
-    for (i, f) in frames.iter().enumerate() {
-        f.write(&mut out, i + 1 == frames.len())?;
-        if out.len() > MAX_PAYLOAD {
-            return Err(Error::TooLong(out.len()));
+/// A packet's complete frame payload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payload(
+    /// Frames in transmitted order.
+    pub Vec<Frame>,
+);
+
+impl Wire for Payload {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads all frames. Refuses empty or oversized payloads, excessive frame counts,
+    /// malformed fields, and frame types that are unknown or use a longer encoding.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        if bytes.is_empty() {
+            return Err(Error::Empty);
         }
+        if bytes.len() > MAX_PAYLOAD {
+            return Err(Error::TooLong(bytes.len()));
+        }
+        let mut reader = Reader::new(bytes);
+        let mut frames = Vec::new();
+        while reader.left() > 0 {
+            if frames.len() == MAX_FRAMES {
+                return Err(Error::TooManyFrames);
+            }
+            frames.push(parse_frame(&mut reader)?);
+        }
+        Ok(Self(frames))
     }
-    Ok(out)
+
+    /// Writes all frames. Refuses invalid frames, empty or excessive lists, oversized payloads,
+    /// adjacent padding frames, and a lengthless STREAM frame before the last frame.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.is_empty() || self.0.len() > MAX_FRAMES {
+            return Err(Error::Unwritable);
+        }
+        let mut bytes = Vec::new();
+        for (i, frame) in self.0.iter().enumerate() {
+            if matches!(frame, Frame::Stream(s) if !s.length && i + 1 < self.0.len())
+                || (matches!(frame, Frame::Padding(_))
+                    && self.0.get(i + 1).is_some_and(|f| matches!(f, Frame::Padding(_))))
+            {
+                return Err(Error::Unwritable);
+            }
+            frame.write(&mut bytes)?;
+            if bytes.len() > MAX_PAYLOAD {
+                return Err(Error::Unwritable);
+            }
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
 }
 
 // Putting stream data back in order.
 
 /// Puts CRYPTO or STREAM data back in order. Frames may arrive out of
-/// order, more than once, or overlapping. Feed each frame's offset and
+/// order, more than once, or overlapping. Pass each frame's offset and
 /// bytes to [`Reassembler::insert`], and take the bytes that are now in
 /// order with [`Reassembler::read`]. Where two frames overlap, the bytes
 /// that came first are kept. It holds at most [`MAX_REASSEMBLY`] bytes
@@ -1607,7 +1835,37 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::codec::{
+        contract,
+        test_support::{Lcg, mutate},
+    };
     use super::*;
+
+    fn datagram(packets: &[Packet]) -> Result<Vec<u8>, Error> {
+        let len = packets
+            .iter()
+            .find_map(|packet| match packet {
+                Packet::Short { dcid, .. } => Some(dcid.len()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        macro_rules! dispatch {
+            ($($n:literal),* $(,)?) => {
+                match len {
+                    $($n => Datagram::<$n>(packets.to_vec()).to_bytes(),)*
+                    _ => Err(Error::Unwritable),
+                }
+            };
+        }
+        dispatch!(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20)
+    }
+
+    fn check_payload(bytes: &[u8]) {
+        contract::check_wire::<Payload>(bytes);
+        if let Ok(payload) = Payload::parse(bytes) {
+            assert!(payload.to_bytes().unwrap().len() <= bytes.len());
+        }
+    }
 
     fn hex(s: &str) -> Vec<u8> {
         let s: Vec<u8> = s.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
@@ -1615,8 +1873,8 @@ mod tests {
     }
 
     fn roundtrip_frames(frames: &[Frame]) {
-        let bytes = write_frames(frames).unwrap();
-        assert_eq!(parse_frames(&bytes).unwrap(), frames, "{bytes:02x?}");
+        let bytes = Payload((frames).to_vec()).to_bytes().unwrap();
+        assert_eq!(Payload::parse(&bytes).map(|payload| payload.0).unwrap(), frames, "{bytes:02x?}");
     }
 
     // RFC 9000, appendix A.1.
@@ -1633,10 +1891,10 @@ mod tests {
             assert_eq!(read_varint(&b), Ok((value, b.len())));
         }
         let mut out = Vec::new();
-        write_varint(151_288_809_941_952_652, &mut out).unwrap();
-        write_varint(494_878_333, &mut out).unwrap();
-        write_varint(15_293, &mut out).unwrap();
-        write_varint(37, &mut out).unwrap();
+        VarInt(151_288_809_941_952_652).write(&mut out).unwrap();
+        VarInt(494_878_333).write(&mut out).unwrap();
+        VarInt(15_293).write(&mut out).unwrap();
+        VarInt(37).write(&mut out).unwrap();
         assert_eq!(out, hex("c2197c5eff14e88c 9d7f3e7d 7bbd 25"));
     }
 
@@ -1644,7 +1902,7 @@ mod tests {
     fn varint_bounds() {
         for v in [0, 63, 64, 16_383, 16_384, (1 << 30) - 1, 1 << 30, MAX_VARINT] {
             let mut out = Vec::new();
-            write_varint(v, &mut out).unwrap();
+            VarInt(v).write(&mut out).unwrap();
             assert_eq!(Some(out.len()), varint_len(v));
             assert_eq!(read_varint(&out), Ok((v, out.len())));
             for cut in 0..out.len() {
@@ -1652,7 +1910,7 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        assert_eq!(write_varint(MAX_VARINT + 1, &mut out), Err(Error::VarintTooLarge(MAX_VARINT + 1)));
+        assert_eq!(VarInt(MAX_VARINT + 1).write(&mut out), Err(Error::Unwritable));
         assert_eq!(varint_len(u64::MAX), None);
         assert!(out.is_empty());
     }
@@ -1709,8 +1967,8 @@ mod tests {
         );
         assert_eq!(p.space(), Some(Space::Initial));
         assert_eq!(p.dcid(), hex("8394c8f03e515708"));
-        assert_eq!(p.to_bytes().unwrap(), b);
-        let frames = parse_frames(p.payload().unwrap()).unwrap();
+        assert_eq!(datagram(std::slice::from_ref(&p)).unwrap(), b);
+        let frames = Payload::parse(p.payload().unwrap()).map(|payload| payload.0).unwrap();
         assert_eq!(frames, [crypto, Frame::Padding(1182 - 4 - 245)]);
         assert!(frames.iter().all(|f| f.allowed_in(Space::Initial)));
     }
@@ -1730,11 +1988,11 @@ mod tests {
         assert_eq!(scid, &hex("f067a5502a4262b5"));
         assert_eq!(*number, PacketNumber { value: 1, len: 2 });
         assert_eq!(payload.len(), 0x75 - 2);
-        let read = parse_frames(&payload[..payload.len() - 16]).unwrap();
+        let read = Payload::parse(&payload[..payload.len() - 16]).map(|payload| payload.0).unwrap();
         let ack = Ack { largest: 0, delay: 0, first_range: 0, ranges: vec![], ecn: None };
         assert_eq!(read, [Frame::Ack(ack), Frame::Crypto { offset: 0, data: vec![0x02; 90] }]);
-        assert_eq!(write_frames(&read).unwrap(), frames);
-        assert_eq!(p.to_bytes().unwrap(), b);
+        assert_eq!(Payload((read).to_vec()).to_bytes().unwrap(), frames);
+        assert_eq!(datagram(std::slice::from_ref(&p)).unwrap(), b);
     }
 
     // RFC 9001, appendix A.4 and RFC 9369, appendix A.4: Retry packets.
@@ -1768,7 +2026,7 @@ mod tests {
             assert_eq!(p, want);
             assert_eq!(p.space(), None);
             assert_eq!(p.payload(), None);
-            assert_eq!(p.to_bytes().unwrap(), b);
+            assert_eq!(datagram(std::slice::from_ref(&p)).unwrap(), b);
         }
     }
 
@@ -1781,8 +2039,8 @@ mod tests {
         let number = PacketNumber { value: 0xbff4, len: 3 };
         assert_eq!(p, Packet::Short { spin: false, key_phase: false, dcid: vec![], number, payload: vec![1] });
         assert_eq!(number.decode(Some(654_360_563)), Some(654_360_564));
-        assert_eq!(parse_frames(p.payload().unwrap()).unwrap(), [Frame::Ping]);
-        assert_eq!(p.to_bytes().unwrap(), b);
+        assert_eq!(Payload::parse(p.payload().unwrap()).map(|payload| payload.0).unwrap(), [Frame::Ping]);
+        assert_eq!(datagram(std::slice::from_ref(&p)).unwrap(), b);
         // The spin and key phase bits, with a connection ID.
         let p = Packet::Short {
             spin: true,
@@ -1791,7 +2049,7 @@ mod tests {
             number: PacketNumber { value: 0x1234_5678, len: 4 },
             payload: vec![0x1e],
         };
-        let b = p.to_bytes().unwrap();
+        let b = datagram(std::slice::from_ref(&p)).unwrap();
         assert_eq!(b[0], 0x40 | 0x20 | 0x04 | 0x03);
         assert_eq!(Packet::parse(&b, 8).unwrap(), (p, b.len()));
     }
@@ -1818,7 +2076,7 @@ mod tests {
             (Packet::ZeroRtt { version: VERSION_1, dcid: d.clone(), scid: s.clone(), number, payload: vec![1] }, 1),
             (Packet::Handshake { version: VERSION_1, dcid: d.clone(), scid: s.clone(), number, payload: vec![1] }, 2),
         ] {
-            let b = p.to_bytes().unwrap();
+            let b = datagram(std::slice::from_ref(&p)).unwrap();
             assert_eq!((b[0] >> 4) & 3, bits, "{p:?}");
             assert_eq!(Packet::parse(&b, 0).unwrap(), (p, b.len()));
         }
@@ -1832,7 +2090,7 @@ mod tests {
             scid: vec![],
             versions: vec![VERSION_1, VERSION_2, 0x0a0a_0a0a],
         };
-        let b = vn.to_bytes().unwrap();
+        let b = datagram(std::slice::from_ref(&vn)).unwrap();
         assert_eq!(b[..6], [0xd5, 0, 0, 0, 0, 200]);
         assert_eq!(Packet::parse(&b, 0).unwrap(), (vn, b.len()));
         let other = Packet::OtherVersion {
@@ -1842,11 +2100,11 @@ mod tests {
             scid: vec![2; 30],
             rest: vec![3; 10],
         };
-        let b = other.to_bytes().unwrap();
+        let b = datagram(std::slice::from_ref(&other)).unwrap();
         assert_eq!(Packet::parse(&b, 0).unwrap(), (other, b.len()));
         // A Version Negotiation packet whose versions are cut short.
         let mut b =
-            Packet::VersionNegotiation { unused: 0, dcid: vec![], scid: vec![], versions: vec![1] }.to_bytes().unwrap();
+            Datagram::<0>(vec![Packet::VersionNegotiation { unused: 0, dcid: vec![], scid: vec![], versions: vec![1] }]).to_bytes().unwrap();
         b.pop();
         assert_eq!(Packet::parse(&b, 0), Err(Error::VersionList(3)));
     }
@@ -1860,29 +2118,29 @@ mod tests {
             scid: vec![2; 8],
             token: vec![],
             number,
-            payload: write_frames(&[Frame::Crypto { offset: 0, data: vec![4; 100] }]).unwrap(),
+            payload: Payload(([Frame::Crypto { offset: 0, data: vec![4; 100] }]).to_vec()).to_bytes().unwrap(),
         };
         let handshake = Packet::Handshake {
             version: VERSION_1,
             dcid: vec![1; 8],
             scid: vec![2; 8],
             number,
-            payload: write_frames(&[Frame::Ping]).unwrap(),
+            payload: Payload(([Frame::Ping]).to_vec()).to_bytes().unwrap(),
         };
         let short = Packet::Short { spin: false, key_phase: false, dcid: vec![1; 8], number, payload: vec![0x1e] };
         let packets = vec![initial.clone(), handshake.clone(), short.clone()];
-        let b = write_datagram(&packets).unwrap();
+        let b = datagram(&packets).unwrap();
         assert_eq!(split_datagram(&b, 8), (packets, None));
         // Only the last packet may lack a Length field.
-        assert_eq!(write_datagram(&[short.clone(), initial.clone()]), Err(Error::MisplacedPacket));
-        assert_eq!(write_datagram(&[]), Err(Error::Empty));
-        assert_eq!(write_datagram(&vec![handshake.clone(); MAX_COALESCED + 1]), Err(Error::TooManyPackets));
+        assert_eq!(datagram(&[short.clone(), initial.clone()]), Err(Error::Unwritable));
+        assert_eq!(datagram(&[]), Err(Error::Unwritable));
+        assert_eq!(datagram(&vec![handshake.clone(); MAX_COALESCED + 1]), Err(Error::Unwritable));
         // A broken packet keeps the ones before it.
-        let mut b = write_datagram(&[initial.clone(), handshake.clone()]).unwrap();
+        let mut b = datagram(&[initial.clone(), handshake.clone()]).unwrap();
         b.push(0x00);
         assert_eq!(split_datagram(&b, 8), (vec![initial, handshake.clone()], Some(Error::FixedBit)));
         assert_eq!(split_datagram(&[], 8), (vec![], Some(Error::Empty)));
-        let many = vec![handshake.to_bytes().unwrap(); MAX_COALESCED + 1].concat();
+        let many = vec![datagram(std::slice::from_ref(&handshake)).unwrap(); MAX_COALESCED + 1].concat();
         let (got, err) = split_datagram(&many, 0);
         assert_eq!((got.len(), err), (MAX_COALESCED, Some(Error::TooManyPackets)));
         assert_eq!(split_datagram(&vec![0x40; MAX_DATAGRAM + 1], 0).1, Some(Error::TooLong(MAX_DATAGRAM + 1)));
@@ -1927,8 +2185,8 @@ mod tests {
         roundtrip_frames(&frames);
         for f in &frames {
             let b = f.to_bytes().unwrap();
-            assert_eq!(Frame::parse(&b), Ok((f.clone(), b.len())), "{f:?}");
-            assert_eq!(parse_frames(&b).unwrap(), std::slice::from_ref(f));
+            assert_eq!(Frame::parse(&b), Ok(f.clone()), "{f:?}");
+            assert_eq!(Payload::parse(&b).map(|payload| payload.0).unwrap(), std::slice::from_ref(f));
             if !matches!(f, Frame::Stream(_)) {
                 assert_eq!(read_varint(&b).unwrap().0, f.frame_type());
             }
@@ -1944,14 +2202,20 @@ mod tests {
         let s = StreamFrame { id: 4, offset: 0, data: b"hi".to_vec(), fin: true, length: false };
         assert_eq!(Frame::Stream(s.clone()).to_bytes().unwrap(), hex("09046869"));
         // Not last, a STREAM frame gets a length.
-        let b = write_frames(&[Frame::Stream(s.clone()), Frame::Ping]).unwrap();
+        assert_eq!(Payload(vec![Frame::Stream(s.clone()), Frame::Ping]).to_bytes(), Err(Error::Unwritable));
+        let mut s = s;
+        s.length = true;
+        let b = Payload(vec![Frame::Stream(s.clone()), Frame::Ping]).to_bytes().unwrap();
         assert_eq!(b, hex("0b0402686901"));
         let with_len = StreamFrame { length: true, ..s };
-        assert_eq!(parse_frames(&b).unwrap(), [Frame::Stream(with_len), Frame::Ping]);
+        assert_eq!(Payload::parse(&b).map(|payload| payload.0).unwrap(), [Frame::Stream(with_len), Frame::Ping]);
         // An offset field holding 0 reads as no offset.
-        assert_eq!(parse_frames(&hex("0c040068")).unwrap(), parse_frames(&hex("080468")).unwrap());
+        assert_eq!(
+            Payload::parse(&hex("0c040068")).map(|payload| payload.0).unwrap(),
+            Payload::parse(&hex("080468")).map(|payload| payload.0).unwrap()
+        );
         // Longer encodings than needed are accepted in fields.
-        assert_eq!(parse_frames(&hex("1040ff")).unwrap(), [Frame::MaxData(0xff)]);
+        assert_eq!(Payload::parse(&hex("1040ff")).map(|payload| payload.0).unwrap(), [Frame::MaxData(0xff)]);
     }
 
     #[test]
@@ -2015,12 +2279,12 @@ mod tests {
         assert_eq!(Packet::parse(&[0x48, 0, 1], 0), Err(Error::ReservedBits));
         assert_eq!(Packet::parse(&[0x40, 0, 1], 21), Err(Error::ConnectionIdLength(21)));
         assert_eq!(Packet::parse(&[0x40, 0, 1], 3), Err(Error::Truncated));
-        let mut b = hs(vec![]).to_bytes().unwrap();
+        let mut b = datagram(&[hs(vec![])]).unwrap();
         b[0] &= !0x40;
         assert_eq!(Packet::parse(&b, 0), Err(Error::FixedBit));
         b[0] |= 0x40 | 0x04;
         assert_eq!(Packet::parse(&b, 0), Err(Error::ReservedBits));
-        let mut b = hs(vec![]).to_bytes().unwrap();
+        let mut b = datagram(&[hs(vec![])]).unwrap();
         b[7] = 0; // The Length field.
         assert_eq!(Packet::parse(&b, 0), Err(Error::Length(0)));
         b[7] = 3;
@@ -2033,89 +2297,107 @@ mod tests {
         assert_eq!(Packet::parse(&retry[..retry.len() - 1], 0), Err(Error::Truncated));
         assert_eq!(Packet::parse(&retry[..20], 0), Err(Error::Truncated));
         // Writing.
-        assert_eq!(hs(vec![0; 21]).to_bytes(), Err(Error::ConnectionIdLength(21)));
+        assert_eq!(datagram(&[hs(vec![0; 21])]), Err(Error::Unwritable));
         let bad = Packet::Handshake { version: 7, dcid: vec![], scid: vec![], number, payload: vec![] };
-        assert_eq!(bad.to_bytes(), Err(Error::Version(7)));
+        assert_eq!(datagram(std::slice::from_ref(&bad)), Err(Error::Unwritable));
         let bad = Packet::OtherVersion { bits: 0, version: VERSION_1, dcid: vec![], scid: vec![], rest: vec![] };
-        assert_eq!(bad.to_bytes(), Err(Error::Version(VERSION_1)));
+        assert_eq!(datagram(std::slice::from_ref(&bad)), Err(Error::Unwritable));
         let bad = Packet::OtherVersion { bits: 0, version: 9, dcid: vec![0; 256], scid: vec![], rest: vec![] };
-        assert_eq!(bad.to_bytes(), Err(Error::ConnectionIdLength(256)));
+        assert_eq!(datagram(std::slice::from_ref(&bad)), Err(Error::Unwritable));
         for number in
             [PacketNumber { value: 256, len: 1 }, PacketNumber { value: 0, len: 0 }, PacketNumber { value: 0, len: 5 }]
         {
             let p = Packet::Short { spin: false, key_phase: false, dcid: vec![], number, payload: vec![1] };
-            assert_eq!(p.to_bytes(), Err(Error::PacketNumber { value: number.value, len: number.len }));
+            assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
         }
         let p = Packet::Short { spin: false, key_phase: false, dcid: vec![0; 21], number, payload: vec![1] };
-        assert_eq!(p.to_bytes(), Err(Error::ConnectionIdLength(21)));
+        assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
         let p =
             Packet::Short { spin: false, key_phase: false, dcid: vec![0; 20], number, payload: vec![0; MAX_DATAGRAM] };
-        assert_eq!(p.to_bytes(), Err(Error::TooLong(MAX_DATAGRAM + 22)));
+        assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
         let p =
             Packet::Retry { version: VERSION_2, unused: 0, dcid: vec![], scid: vec![], token: vec![], tag: [0; 16] };
-        assert_eq!(p.to_bytes(), Err(Error::EmptyToken));
+        assert_eq!(datagram(std::slice::from_ref(&p)), Err(Error::Unwritable));
     }
 
     #[test]
     fn frame_errors() {
         use frame_type as t;
-        assert_eq!(parse_frames(&[]), Err(Error::Empty));
-        assert_eq!(parse_frames(&vec![1; MAX_PAYLOAD + 1]), Err(Error::TooLong(MAX_PAYLOAD + 1)));
-        assert_eq!(parse_frames(&vec![1; MAX_FRAMES + 1]), Err(Error::TooManyFrames));
-        assert_eq!(parse_frames(&vec![1; MAX_FRAMES]).unwrap().len(), MAX_FRAMES);
-        assert_eq!(parse_frames(&[0x1f]), Err(Error::UnknownFrame(0x1f)));
-        assert_eq!(parse_frames(&hex("4040")), Err(Error::UnknownFrame(0x40)));
-        assert_eq!(parse_frames(&hex("4030")), Err(Error::LongFrameType(0x30)));
-        assert_eq!(parse_frames(&hex("4001")), Err(Error::LongFrameType(t::PING)));
-        // ACK ranges below 0.
-        assert_eq!(parse_frames(&hex("0205000006")), Err(Error::FrameEncoding(t::ACK)));
-        assert_eq!(parse_frames(&hex("02050001000400")), Err(Error::FrameEncoding(t::ACK)));
-        assert_eq!(parse_frames(&hex("02050001000202")), Err(Error::FrameEncoding(t::ACK)));
+        assert_eq!(Payload::parse(&[]).map(|payload| payload.0), Err(Error::Empty));
         assert_eq!(
-            parse_frames(&hex("02050001000100")),
+            Payload::parse(&vec![1; MAX_PAYLOAD + 1]).map(|payload| payload.0),
+            Err(Error::TooLong(MAX_PAYLOAD + 1))
+        );
+        assert_eq!(Payload::parse(&vec![1; MAX_FRAMES + 1]).map(|payload| payload.0), Err(Error::TooManyFrames));
+        assert_eq!(Payload::parse(&vec![1; MAX_FRAMES]).map(|payload| payload.0).unwrap().len(), MAX_FRAMES);
+        assert_eq!(Payload::parse(&[0x1f]).map(|payload| payload.0), Err(Error::UnknownFrame(0x1f)));
+        assert_eq!(Payload::parse(&hex("4040")).map(|payload| payload.0), Err(Error::UnknownFrame(0x40)));
+        assert_eq!(Payload::parse(&hex("4030")).map(|payload| payload.0), Err(Error::LongFrameType(0x30)));
+        assert_eq!(Payload::parse(&hex("4001")).map(|payload| payload.0), Err(Error::LongFrameType(t::PING)));
+        // ACK ranges below 0.
+        assert_eq!(Payload::parse(&hex("0205000006")).map(|payload| payload.0), Err(Error::FrameEncoding(t::ACK)));
+        assert_eq!(Payload::parse(&hex("02050001000400")).map(|payload| payload.0), Err(Error::FrameEncoding(t::ACK)));
+        assert_eq!(Payload::parse(&hex("02050001000202")).map(|payload| payload.0), Err(Error::FrameEncoding(t::ACK)));
+        assert_eq!(
+            Payload::parse(&hex("02050001000100")).map(|payload| payload.0),
             Ok(vec![Frame::Ack(Ack::from_ranges(&[(5, 5), (2, 2)], 0).unwrap())])
         );
         let mut b = vec![0x02, 0, 0];
-        write_varint(MAX_ACK_RANGES as u64 + 1, &mut b).unwrap();
-        assert_eq!(parse_frames(&b), Err(Error::TooManyAckRanges(t::ACK)));
+        VarInt(MAX_ACK_RANGES as u64 + 1).write(&mut b).unwrap();
+        assert_eq!(Payload::parse(&b).map(|payload| payload.0), Err(Error::TooManyAckRanges(t::ACK)));
         assert_eq!(Error::TooManyAckRanges(t::ACK).frame_type(), Some(t::ACK));
         // Data ending past 2^62 - 1.
-        assert_eq!(parse_frames(&hex("06ffffffffffffffff0100")), Err(Error::FrameEncoding(t::CRYPTO)));
-        assert_eq!(parse_frames(&hex("0c00ffffffffffffffff00")), Err(Error::FrameEncoding(0x0c)));
-        assert_eq!(parse_frames(&hex("0700")), Err(Error::FrameEncoding(t::NEW_TOKEN)));
-        assert_eq!(parse_frames(&hex("12d000000000000001")), Err(Error::FrameEncoding(t::MAX_STREAMS_BIDI)));
-        assert_eq!(parse_frames(&hex("17d000000000000001")), Err(Error::FrameEncoding(t::STREAMS_BLOCKED_UNI)));
-        assert_eq!(parse_frames(&hex("18010000")), Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)));
-        assert_eq!(parse_frames(&hex("18010015")), Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)));
-        assert_eq!(parse_frames(&hex("18010201")), Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)));
-        // Writing.
-        assert_eq!(write_frames(&[]), Err(Error::Empty));
-        assert_eq!(write_frames(&vec![Frame::Ping; MAX_FRAMES + 1]), Err(Error::TooManyFrames));
-        assert_eq!(Frame::Padding(0).to_bytes(), Err(Error::FrameEncoding(t::PADDING)));
-        assert_eq!(Frame::Padding(MAX_PAYLOAD + 1).to_bytes(), Err(Error::TooLong(MAX_PAYLOAD + 1)));
-        assert_eq!(write_frames(&[Frame::Padding(MAX_PAYLOAD), Frame::Ping]), Err(Error::TooLong(MAX_PAYLOAD + 1)));
-        assert_eq!(Frame::MaxData(MAX_VARINT + 1).to_bytes(), Err(Error::VarintTooLarge(MAX_VARINT + 1)));
-        assert_eq!(Frame::NewToken(vec![]).to_bytes(), Err(Error::FrameEncoding(t::NEW_TOKEN)));
         assert_eq!(
-            Frame::MaxStreams { bidi: false, max: MAX_STREAM_COUNT + 1 }.to_bytes(),
-            Err(Error::FrameEncoding(t::MAX_STREAMS_UNI))
-        );
-        assert_eq!(
-            Frame::StreamsBlocked { bidi: true, limit: MAX_STREAM_COUNT + 1 }.to_bytes(),
-            Err(Error::FrameEncoding(t::STREAMS_BLOCKED_BIDI))
-        );
-        assert_eq!(
-            Frame::Crypto { offset: MAX_VARINT, data: vec![1] }.to_bytes(),
+            Payload::parse(&hex("06ffffffffffffffff0100")).map(|payload| payload.0),
             Err(Error::FrameEncoding(t::CRYPTO))
         );
+        assert_eq!(
+            Payload::parse(&hex("0c00ffffffffffffffff00")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(0x0c))
+        );
+        assert_eq!(Payload::parse(&hex("0700")).map(|payload| payload.0), Err(Error::FrameEncoding(t::NEW_TOKEN)));
+        assert_eq!(
+            Payload::parse(&hex("12d000000000000001")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(t::MAX_STREAMS_BIDI))
+        );
+        assert_eq!(
+            Payload::parse(&hex("17d000000000000001")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(t::STREAMS_BLOCKED_UNI))
+        );
+        assert_eq!(
+            Payload::parse(&hex("18010000")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(t::NEW_CONNECTION_ID))
+        );
+        assert_eq!(
+            Payload::parse(&hex("18010015")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(t::NEW_CONNECTION_ID))
+        );
+        assert_eq!(
+            Payload::parse(&hex("18010201")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(t::NEW_CONNECTION_ID))
+        );
+        // Writing.
+        assert_eq!(Payload(([]).to_vec()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Payload((vec![Frame::Ping; MAX_FRAMES + 1]).to_vec()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame::Padding(0).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame::Padding(MAX_PAYLOAD + 1).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Payload(([Frame::Padding(MAX_PAYLOAD), Frame::Ping]).to_vec()).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame::MaxData(MAX_VARINT + 1).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame::NewToken(vec![]).to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Frame::MaxStreams { bidi: false, max: MAX_STREAM_COUNT + 1 }.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(
+            Frame::StreamsBlocked { bidi: true, limit: MAX_STREAM_COUNT + 1 }.to_bytes(),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(Frame::Crypto { offset: MAX_VARINT, data: vec![1] }.to_bytes(), Err(Error::Unwritable));
         let s = StreamFrame { id: 0, offset: MAX_VARINT, data: vec![1], fin: false, length: false };
-        assert_eq!(Frame::Stream(s).to_bytes(), Err(Error::FrameEncoding(0x0c)));
+        assert_eq!(Frame::Stream(s).to_bytes(), Err(Error::Unwritable));
         for (id, retire) in [(vec![], 0), (vec![0; 21], 0), (vec![1], 2)] {
             let f = Frame::NewConnectionId { sequence: 1, retire_prior_to: retire, id, reset_token: [0; 16] };
-            assert_eq!(f.to_bytes(), Err(Error::FrameEncoding(t::NEW_CONNECTION_ID)));
+            assert_eq!(f.to_bytes(), Err(Error::Unwritable));
         }
         let bad = Ack { largest: 5, delay: 0, first_range: 6, ranges: vec![], ecn: None };
-        assert_eq!(Frame::Ack(bad).to_bytes(), Err(Error::FrameEncoding(t::ACK)));
+        assert_eq!(Frame::Ack(bad).to_bytes(), Err(Error::Unwritable));
         let many = Ack {
             largest: 0,
             delay: 0,
@@ -2123,13 +2405,13 @@ mod tests {
             ranges: vec![AckRange { gap: 0, len: 0 }; MAX_ACK_RANGES + 1],
             ecn: None,
         };
-        assert_eq!(Frame::Ack(many).to_bytes(), Err(Error::TooManyAckRanges(t::ACK)));
+        assert_eq!(Frame::Ack(many).to_bytes(), Err(Error::Unwritable));
         // Codes for CONNECTION_CLOSE.
         assert_eq!(Error::UnknownFrame(0x40).transport_code(), error_code::FRAME_ENCODING_ERROR);
         assert_eq!(Error::UnknownFrame(0x40).frame_type(), Some(0x40));
         assert_eq!(Error::Empty.transport_code(), error_code::PROTOCOL_VIOLATION);
         assert_eq!(Error::Empty.frame_type(), None);
-        assert_eq!(Error::VarintTooLarge(0).transport_code(), error_code::INTERNAL_ERROR);
+        assert_eq!(Error::Unwritable.transport_code(), error_code::INTERNAL_ERROR);
         assert_eq!(Error::Window(0).transport_code(), error_code::CRYPTO_BUFFER_EXCEEDED);
     }
 
@@ -2139,15 +2421,18 @@ mod tests {
         use frame_type as t;
         // Section 12.4: a frame type in a longer encoding than needed is a
         // PROTOCOL_VIOLATION, not a FRAME_ENCODING_ERROR.
-        assert_eq!(parse_frames(&hex("4001")), Err(Error::LongFrameType(t::PING)));
+        assert_eq!(Payload::parse(&hex("4001")).map(|payload| payload.0), Err(Error::LongFrameType(t::PING)));
         assert_eq!(Error::LongFrameType(t::PING).transport_code(), error_code::PROTOCOL_VIOLATION);
         assert_eq!(Error::LongFrameType(t::PING).frame_type(), Some(t::PING));
         // Section 20.1: a frame cut short by the payload's end is badly
         // formatted, a FRAME_ENCODING_ERROR naming its type.
-        assert_eq!(parse_frames(&hex("0600")), Err(Error::FrameEncoding(t::CRYPTO)));
-        assert_eq!(parse_frames(&hex("1a0102")), Err(Error::FrameEncoding(t::PATH_CHALLENGE)));
-        assert_eq!(parse_frames(&hex("0b0005ff")), Err(Error::FrameEncoding(0x0b)));
-        assert_eq!(parse_frames(&hex("0140")), Err(Error::Truncated));
+        assert_eq!(Payload::parse(&hex("0600")).map(|payload| payload.0), Err(Error::FrameEncoding(t::CRYPTO)));
+        assert_eq!(
+            Payload::parse(&hex("1a0102")).map(|payload| payload.0),
+            Err(Error::FrameEncoding(t::PATH_CHALLENGE))
+        );
+        assert_eq!(Payload::parse(&hex("0b0005ff")).map(|payload| payload.0), Err(Error::FrameEncoding(0x0b)));
+        assert_eq!(Payload::parse(&hex("0140")).map(|payload| payload.0), Err(Error::Truncated));
         assert_eq!(Error::Truncated.transport_code(), error_code::FRAME_ENCODING_ERROR);
         // Section 12.2: packets in one datagram share a destination
         // connection ID. A sender must not mix them, and a receiver
@@ -2155,23 +2440,22 @@ mod tests {
         let number = PacketNumber { value: 0, len: 1 };
         let hs = |dcid: Vec<u8>| Packet::Handshake { version: VERSION_1, dcid, scid: vec![], number, payload: vec![1] };
         let (a, b) = (hs(vec![1; 8]), hs(vec![2; 8]));
-        assert_eq!(write_datagram(&[a.clone(), b.clone()]), Err(Error::MixedConnectionIds));
-        let bytes = [a.to_bytes().unwrap(), b.to_bytes().unwrap()].concat();
+        assert_eq!(datagram(&[a.clone(), b.clone()]), Err(Error::Unwritable));
+        let bytes = [datagram(std::slice::from_ref(&a)).unwrap(), datagram(std::slice::from_ref(&b)).unwrap()].concat();
         assert_eq!(split_datagram(&bytes, 8), (vec![a.clone()], Some(Error::MixedConnectionIds)));
         let short = Packet::Short { spin: false, key_phase: false, dcid: vec![1; 8], number, payload: vec![1] };
-        let bytes = write_datagram(&[a.clone(), short.clone()]).unwrap();
+        let bytes = datagram(&[a.clone(), short.clone()]).unwrap();
         assert_eq!(split_datagram(&bytes, 8), (vec![a, short], None));
     }
 
     #[test]
     fn second_review() {
         use frame_type as t;
-        // Frame::parse holds to MAX_PAYLOAD as parse_frames does, so
+        // Frame::parse holds to MAX_PAYLOAD as Payload does, so
         // whatever it reads can be written.
         let zeros = vec![0; MAX_PAYLOAD + 1];
         assert_eq!(Frame::parse(&zeros), Err(Error::TooLong(MAX_PAYLOAD + 1)));
-        let (f, used) = Frame::parse(&zeros[..MAX_PAYLOAD]).unwrap();
-        assert_eq!((f.to_bytes().unwrap().len(), used), (MAX_PAYLOAD, MAX_PAYLOAD));
+        assert_eq!(Frame::parse(&zeros[..MAX_PAYLOAD]), Ok(Frame::Padding(MAX_PAYLOAD)));
         let mut crypto = hex("06007fff");
         crypto.resize(MAX_PAYLOAD + 1, 0);
         assert_eq!(Frame::parse(&crypto), Err(Error::TooLong(MAX_PAYLOAD + 1)));
@@ -2186,7 +2470,7 @@ mod tests {
         // versions is ignored, so it is neither read nor written.
         assert_eq!(Packet::parse(&hex("c0 00000000 00 00"), 0), Err(Error::VersionList(0)));
         let empty = Packet::VersionNegotiation { unused: 0x40, dcid: vec![], scid: vec![], versions: vec![] };
-        assert_eq!(empty.to_bytes(), Err(Error::VersionList(0)));
+        assert_eq!(datagram(std::slice::from_ref(&empty)), Err(Error::Unwritable));
 
         // RFC 9000, section 12.3: 0-RTT and 1-RTT packets share one
         // packet number space.
@@ -2198,7 +2482,7 @@ mod tests {
         // Writers refuse first-byte bits that do not fit their field,
         // rather than dropping them.
         let vn = Packet::VersionNegotiation { unused: 0x80, dcid: vec![], scid: vec![], versions: vec![VERSION_1] };
-        assert_eq!(vn.to_bytes(), Err(Error::FirstByte(0x80)));
+        assert_eq!(datagram(std::slice::from_ref(&vn)), Err(Error::Unwritable));
         let retry = Packet::Retry {
             version: VERSION_1,
             unused: 0x10,
@@ -2207,27 +2491,27 @@ mod tests {
             token: vec![1],
             tag: [0; RETRY_TAG_LEN],
         };
-        assert_eq!(retry.to_bytes(), Err(Error::FirstByte(0x10)));
+        assert_eq!(datagram(std::slice::from_ref(&retry)), Err(Error::Unwritable));
         let other = Packet::OtherVersion { bits: 0x80, version: 5, dcid: vec![], scid: vec![], rest: vec![] };
-        assert_eq!(other.to_bytes(), Err(Error::FirstByte(0x80)));
+        assert_eq!(datagram(std::slice::from_ref(&other)), Err(Error::Unwritable));
 
         // An ACK frame with too many ranges names its own type, 0x02 or
         // 0x03.
         for ty in [t::ACK, t::ACK_ECN] {
             let mut b = vec![ty as u8, 0, 0];
-            write_varint(MAX_ACK_RANGES as u64 + 1, &mut b).unwrap();
-            assert_eq!(parse_frames(&b), Err(Error::TooManyAckRanges(ty)));
+            VarInt(MAX_ACK_RANGES as u64 + 1).write(&mut b).unwrap();
+            assert_eq!(Payload::parse(&b).map(|payload| payload.0), Err(Error::TooManyAckRanges(ty)));
             assert_eq!(Error::TooManyAckRanges(ty).frame_type(), Some(ty));
         }
         let ranges = vec![AckRange { gap: 0, len: 0 }; MAX_ACK_RANGES + 1];
         let ecn = Some(EcnCounts { ect0: 0, ect1: 0, ce: 0 });
         let ack = Frame::Ack(Ack { largest: MAX_VARINT, delay: 0, first_range: 0, ranges, ecn });
-        assert_eq!(ack.to_bytes(), Err(Error::TooManyAckRanges(t::ACK_ECN)));
+        assert_eq!(ack.to_bytes(), Err(Error::Unwritable));
 
         // The Length field covers the payload as it is on the wire,
         // AEAD tag included. A sender reserves the tag's bytes at the end
         // of the payload before it protects the packet.
-        let mut payload = write_frames(&[Frame::Ping]).unwrap();
+        let mut payload = Payload(([Frame::Ping]).to_vec()).to_bytes().unwrap();
         payload.resize(payload.len() + 16, 0);
         let hs = Packet::Handshake {
             version: VERSION_1,
@@ -2236,7 +2520,7 @@ mod tests {
             number: PacketNumber { value: 0, len: 1 },
             payload,
         };
-        let b = hs.to_bytes().unwrap();
+        let b = datagram(std::slice::from_ref(&hs)).unwrap();
         assert_eq!(b[7], 1 + 1 + 16);
         assert_eq!(Packet::parse(&b, 0).unwrap(), (hs, b.len()));
     }
@@ -2249,21 +2533,18 @@ mod tests {
             Error::FixedBit,
             Error::ReservedBits,
             Error::ConnectionIdLength(21),
-            Error::Version(7),
-            Error::PacketNumber { value: 1, len: 0 },
             Error::Length(0),
             Error::VersionList(3),
             Error::EmptyToken,
-            Error::VarintTooLarge(1 << 62),
             Error::Empty,
+            Error::Unwritable,
+            Error::Trailing,
             Error::UnknownFrame(0x40),
             Error::FrameEncoding(0x18),
             Error::LongFrameType(0x01),
             Error::TooManyFrames,
             Error::TooManyAckRanges(2),
-            Error::FirstByte(0x80),
             Error::TooManyPackets,
-            Error::MisplacedPacket,
             Error::MixedConnectionIds,
             Error::Window(9),
         ];
@@ -2274,7 +2555,7 @@ mod tests {
 
     fn sample_packets() -> Vec<(Packet, usize)> {
         let number = PacketNumber { value: 0x0102, len: 2 };
-        let payload = write_frames(&sample_frames()).unwrap();
+        let payload = Payload((sample_frames()).to_vec()).to_bytes().unwrap();
         let mut tag = [0; 16];
         tag[3] = 9;
         vec![
@@ -2326,7 +2607,7 @@ mod tests {
     #[test]
     fn every_packet_round_trips() {
         for (p, n) in sample_packets() {
-            let b = p.to_bytes().unwrap();
+            let b = datagram(std::slice::from_ref(&p)).unwrap();
             assert_eq!(Packet::parse(&b, n), Ok((p.clone(), b.len())));
             assert_eq!(split_datagram(&b, n), (vec![p], None));
         }
@@ -2338,7 +2619,7 @@ mod tests {
     #[test]
     fn every_truncated_prefix() {
         for (p, n) in sample_packets() {
-            let b = p.to_bytes().unwrap();
+            let b = datagram(std::slice::from_ref(&p)).unwrap();
             for cut in 0..b.len() {
                 if let Ok((q, used)) = Packet::parse(&b[..cut], n) {
                     assert!(!p.has_length(), "{p:?} at {cut}");
@@ -2353,7 +2634,7 @@ mod tests {
             let b = f.to_bytes().unwrap();
             let open = matches!(f, Frame::Padding(_) | Frame::Stream(StreamFrame { length: false, .. }));
             for cut in 0..b.len() {
-                let r = parse_frames(&b[..cut]);
+                let r = Payload::parse(&b[..cut]).map(|payload| payload.0);
                 if open && cut > 0 {
                     assert_ne!(r.ok(), Some(vec![f.clone()]));
                 } else {
@@ -2362,9 +2643,9 @@ mod tests {
             }
         }
         // The whole sample payload, too.
-        let b = write_frames(&sample_frames()).unwrap();
+        let b = Payload((sample_frames()).to_vec()).to_bytes().unwrap();
         for cut in 0..b.len() {
-            assert_ne!(parse_frames(&b[..cut]).ok(), Some(sample_frames()));
+            assert_ne!(Payload::parse(&b[..cut]).map(|payload| payload.0).ok(), Some(sample_frames()));
         }
     }
 
@@ -2402,7 +2683,7 @@ mod tests {
         assert_eq!(r.read(), vec![2; MAX_REASSEMBLY]);
     }
 
-    // The CRYPTO frames of a payload, fed to a reassembler one byte at a
+    // The CRYPTO frames of a payload, inserted into a reassembler one byte at a
     // time, last byte first, give the same stream as one frame.
     #[test]
     fn reassembler_one_byte_at_a_time() {
@@ -2411,10 +2692,11 @@ mod tests {
         for (i, b) in data.iter().enumerate().rev() {
             frames.push(Frame::Crypto { offset: i as u64, data: vec![*b] });
         }
-        let payload = write_frames(&frames[..1000]).unwrap();
+        let payload = Payload((frames[..1000]).to_vec()).to_bytes().unwrap();
         let mut r = Reassembler::new();
         for chunk in frames.chunks(1000) {
-            let payload_frames = parse_frames(&write_frames(chunk).unwrap()).unwrap();
+            let payload_frames =
+                Payload::parse(&Payload((chunk).to_vec()).to_bytes().unwrap()).map(|payload| payload.0).unwrap();
             for f in payload_frames {
                 let Frame::Crypto { offset, data } = f else { panic!() };
                 r.insert(offset, &data).unwrap();
@@ -2425,7 +2707,7 @@ mod tests {
     }
 
     // Found in the hardening review: accessors a world needs to answer a
-    // packet, a frame writer that made bytes parse_frames refused, and a
+    // packet, a frame writer that made bytes Payload refused, and a
     // reassembler that moved everything it held on each small read.
     #[test]
     fn hardening_review() {
@@ -2441,18 +2723,18 @@ mod tests {
         let short = Packet::Short { spin: false, key_phase: false, dcid: vec![], number: n, payload: vec![1] };
         assert_eq!((short.scid(), short.version(), short.number()), (None, None, Some(n)));
 
-        // Frame::to_bytes never writes more than parse_frames reads.
+        // Frame::to_bytes never writes more than Payload reads.
         let big = vec![0; MAX_PAYLOAD];
         let crypto = Frame::Crypto { offset: 0, data: big.clone() };
-        assert_eq!(crypto.to_bytes(), Err(Error::TooLong(MAX_PAYLOAD + 1 + 1 + 4)));
+        assert_eq!(crypto.to_bytes(), Err(Error::Unwritable));
         let stream = Frame::Stream(StreamFrame { id: 0, offset: 0, data: big.clone(), fin: false, length: false });
-        assert!(matches!(stream.to_bytes(), Err(Error::TooLong(_))));
+        assert!(matches!(stream.to_bytes(), Err(Error::Unwritable)));
         let close = Frame::ConnectionClose { error_code: 0, frame_type: None, reason: big };
-        assert!(matches!(close.to_bytes(), Err(Error::TooLong(_))));
+        assert!(matches!(close.to_bytes(), Err(Error::Unwritable)));
         let crypto = Frame::Crypto { offset: 0, data: vec![0; MAX_PAYLOAD + 1] };
-        assert_eq!(crypto.to_bytes(), Err(Error::TooLong(MAX_PAYLOAD + 1)));
+        assert_eq!(crypto.to_bytes(), Err(Error::Unwritable));
         let fits = Frame::Crypto { offset: 0, data: vec![0; MAX_PAYLOAD - 1 - 1 - 4] };
-        assert_eq!(parse_frames(&fits.to_bytes().unwrap()).unwrap(), [fits]);
+        assert_eq!(Payload::parse(&fits.to_bytes().unwrap()).map(|payload| payload.0).unwrap(), [fits]);
 
         // A reassembler read one byte at a time, with a byte held at the
         // far end of its window, gives the stream in order. With a queue,
@@ -2470,200 +2752,198 @@ mod tests {
         assert_eq!(Reassembler::new(), Reassembler::default());
     }
 
-    /// A deterministic generator for the fuzz loop.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-
-        fn below(&mut self, n: u32) -> u32 {
-            if n == 0 { 0 } else { self.next() % n }
-        }
-
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
-
-        /// Up to `max - 1` random bytes.
-        fn some(&mut self, max: u32) -> Vec<u8> {
-            let n = self.below(max) as usize;
-            self.bytes(n)
-        }
-
-        /// A varint-sized value, often small, sometimes near the edges.
-        fn value(&mut self) -> u64 {
-            match self.below(6) {
-                0 => u64::from(self.below(64)),
-                1 => u64::from(self.below(20_000)),
-                2 => u64::from(self.next()),
-                3 => MAX_VARINT - u64::from(self.below(3)),
-                4 => MAX_VARINT + u64::from(self.below(3)),
-                _ => (u64::from(self.next()) << 30) | u64::from(self.next()),
-            }
+    fn random_value(rng: &mut Lcg) -> u64 {
+        match rng.index(6) {
+            0 => rng.index(64) as u64,
+            1 => rng.index(20_000) as u64,
+            2 => rng.next(),
+            3 => MAX_VARINT - rng.index(3) as u64,
+            4 => MAX_VARINT + rng.index(3) as u64,
+            _ => (rng.next() << 30) | rng.next(),
         }
     }
 
     fn random_frame(rng: &mut Lcg) -> Frame {
-        let small = |rng: &mut Lcg| rng.some(12);
-        match rng.below(22) {
-            0 => Frame::Padding(rng.below(4) as usize),
+        let small = |rng: &mut Lcg| rng.bytes(12);
+        match rng.index(22) {
+            0 => Frame::Padding(rng.index(4)),
             1 => Frame::Ping,
             2 => {
                 let ranges =
-                    (0..rng.below(4)).map(|_| AckRange { gap: rng.value() % 50, len: rng.value() % 50 }).collect();
-                let ecn = if rng.below(2) == 0 { None } else { Some(EcnCounts { ect0: rng.value(), ect1: 1, ce: 2 }) };
+                    (0..rng.index(4)).map(|_| AckRange { gap: random_value(rng) % 50, len: random_value(rng) % 50 }).collect();
+                let ecn = if rng.coin() { None } else { Some(EcnCounts { ect0: random_value(rng), ect1: 1, ce: 2 }) };
                 Frame::Ack(Ack {
-                    largest: rng.value(),
-                    delay: rng.value(),
-                    first_range: rng.value() % 100,
+                    largest: random_value(rng),
+                    delay: random_value(rng),
+                    first_range: random_value(rng) % 100,
                     ranges,
                     ecn,
                 })
             }
-            3 => Frame::ResetStream { stream: rng.value(), error_code: rng.value(), final_size: rng.value() },
-            4 => Frame::StopSending { stream: rng.value(), error_code: rng.value() },
-            5 => Frame::Crypto { offset: rng.value(), data: small(rng) },
+            3 => Frame::ResetStream {
+                stream: random_value(rng),
+                error_code: random_value(rng),
+                final_size: random_value(rng),
+            },
+            4 => Frame::StopSending { stream: random_value(rng), error_code: random_value(rng) },
+            5 => Frame::Crypto { offset: random_value(rng), data: small(rng) },
             6 => Frame::NewToken(small(rng)),
             7 => Frame::Stream(StreamFrame {
-                id: rng.value(),
-                offset: rng.value(),
+                id: random_value(rng),
+                offset: random_value(rng),
                 data: small(rng),
-                fin: rng.below(2) == 0,
-                length: rng.below(2) == 0,
+                fin: rng.coin(),
+                length: rng.coin(),
             }),
-            8 => Frame::MaxData(rng.value()),
-            9 => Frame::MaxStreamData { stream: rng.value(), max: rng.value() },
-            10 => Frame::MaxStreams { bidi: rng.below(2) == 0, max: rng.value() >> rng.below(4) },
-            11 => Frame::DataBlocked(rng.value()),
-            12 => Frame::StreamDataBlocked { stream: rng.value(), limit: rng.value() },
-            13 => Frame::StreamsBlocked { bidi: rng.below(2) == 0, limit: rng.value() >> rng.below(4) },
+            8 => Frame::MaxData(random_value(rng)),
+            9 => Frame::MaxStreamData { stream: random_value(rng), max: random_value(rng) },
+            10 => Frame::MaxStreams { bidi: rng.coin(), max: random_value(rng) >> rng.index(4) },
+            11 => Frame::DataBlocked(random_value(rng)),
+            12 => Frame::StreamDataBlocked { stream: random_value(rng), limit: random_value(rng) },
+            13 => Frame::StreamsBlocked { bidi: rng.coin(), limit: random_value(rng) >> rng.index(4) },
             14 => Frame::NewConnectionId {
-                sequence: rng.value(),
-                retire_prior_to: rng.value(),
-                id: rng.some(23),
+                sequence: random_value(rng),
+                retire_prior_to: random_value(rng),
+                id: rng.bytes(23),
                 reset_token: [7; 16],
             },
-            15 => Frame::RetireConnectionId(rng.value()),
+            15 => Frame::RetireConnectionId(random_value(rng)),
             16 => Frame::PathChallenge([rng.next() as u8; 8]),
             17 => Frame::PathResponse([rng.next() as u8; 8]),
-            18 => Frame::ConnectionClose { error_code: rng.value(), frame_type: Some(rng.value()), reason: small(rng) },
-            19 => Frame::ConnectionClose { error_code: rng.value(), frame_type: None, reason: small(rng) },
+            18 => Frame::ConnectionClose {
+                error_code: random_value(rng),
+                frame_type: Some(random_value(rng)),
+                reason: small(rng),
+            },
+            19 => Frame::ConnectionClose { error_code: random_value(rng), frame_type: None, reason: small(rng) },
             20 => Frame::HandshakeDone,
             _ => Frame::Ping,
         }
     }
 
-    /// Whatever bytes a reader is given, it does not panic, and what it
-    /// reads writes back to bytes it reads the same.
-    fn check_bytes(b: &[u8], dcid_len: usize) {
-        if let Ok(frames) = parse_frames(b) {
-            let again = write_frames(&frames).unwrap();
-            assert_eq!(parse_frames(&again).unwrap(), frames);
-            assert!(again.len() <= b.len());
+    #[test]
+    fn payload_writer_refuses_changes_and_keeps_the_destination() {
+        for payload in [
+            Payload(vec![Frame::Padding(1), Frame::Padding(2)]),
+            Payload(vec![
+                Frame::Stream(StreamFrame { id: 0, offset: 0, data: vec![1], fin: false, length: false }),
+                Frame::Ping,
+            ]),
+        ] {
+            let mut out = vec![9, 8];
+            assert_eq!(payload.write(&mut out), Err(Error::Unwritable));
+            assert_eq!(out, [9, 8]);
+            contract::check_wire_value(&payload);
         }
-        let (packets, _) = split_datagram(b, dcid_len);
-        if !packets.is_empty() {
-            let bytes = write_datagram(&packets).unwrap();
-            assert_eq!(split_datagram(&bytes, dcid_len), (packets.clone(), None));
-        }
-        for p in &packets {
-            if let Some(payload) = p.payload() {
-                let _ = parse_frames(payload);
-            }
-        }
-        if let Ok((f, used)) = Frame::parse(b) {
-            assert!(used <= b.len() && used > 0);
-            assert_eq!(parse_frames(&f.to_bytes().unwrap()).unwrap(), [f]);
+        let packet = Packet::Short {
+            spin: false,
+            key_phase: false,
+            dcid: vec![1; 8],
+            number: PacketNumber { value: 0, len: 1 },
+            payload: vec![1],
+        };
+        assert_eq!(Datagram::<0>(vec![packet.clone()]).to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&Datagram::<8>(vec![packet]));
+    }
+
+    #[test]
+    fn split_datagram_keeps_packets_before_a_truncated_tail() {
+        let payload = Payload(vec![Frame::Ping, Frame::Padding(3)]);
+        let packet = Packet::Handshake {
+            version: VERSION_1,
+            dcid: vec![],
+            scid: vec![],
+            number: PacketNumber { value: 0, len: 1 },
+            payload: payload.to_bytes().unwrap(),
+        };
+        let prefix = Datagram::<0>(vec![packet.clone(), packet.clone()]);
+        let mut bytes = prefix.to_bytes().unwrap();
+        bytes.push(0xc0);
+        assert_eq!(Datagram::<0>::parse(&bytes), Err(Error::Truncated));
+        let (packets, error) = split_datagram(&bytes, 0);
+        assert_eq!(error, Some(Error::Truncated));
+        assert_eq!(packets, prefix.0);
+        contract::check_wire_value(&Datagram::<0>(packets.clone()));
+        for packet in packets {
+            assert_eq!(Payload::parse(packet.payload().unwrap()), Ok(payload.clone()));
+            contract::check_wire_value(&Datagram::<0>(vec![packet]));
         }
     }
 
     #[test]
-    fn lcg_fuzz() {
-        let mut rng = Lcg(0x5155_4943);
-        let seeds: Vec<Vec<u8>> = sample_packets()
+    fn generated_wire_contracts_and_reassembly() {
+        let mut rng = Lcg::new(0x5155_4943);
+        let seeds: Vec<_> = sample_packets()
             .iter()
-            .map(|(p, _)| p.to_bytes().unwrap())
-            .chain(std::iter::once(write_frames(&sample_frames()).unwrap()))
+            .map(|(p, _)| datagram(std::slice::from_ref(p)).unwrap())
+            .chain(std::iter::once(Payload(sample_frames()).to_bytes().unwrap()))
             .collect();
         for round in 0..6000 {
-            let b = if round % 2 == 0 {
-                let n = rng.below(80) as usize;
-                rng.bytes(n)
-            } else {
-                // A valid packet or payload with a few bytes changed.
-                let mut b = seeds[rng.below(seeds.len() as u32) as usize].clone();
-                for _ in 0..1 + rng.below(4) {
-                    let i = rng.below(b.len() as u32) as usize;
-                    b[i] = rng.next() as u8;
+            let mut bytes = if rng.coin() { rng.bytes(80) } else { seeds[rng.index(seeds.len())].clone() };
+            mutate(&mut rng, &mut bytes);
+            contract::check_wire::<VarInt>(&bytes);
+            contract::check_wire::<Frame>(&bytes);
+            check_payload(&bytes);
+            contract::check_wire::<Datagram<0>>(&bytes);
+            contract::check_wire::<Datagram<8>>(&bytes);
+            for dcid_len in 0..=20 {
+                let (packets, _) = split_datagram(&bytes, dcid_len);
+                if !packets.is_empty() {
+                    let wire = datagram(&packets).unwrap();
+                    assert_eq!(split_datagram(&wire, dcid_len), (packets.clone(), None));
                 }
-                if rng.below(3) == 0 {
-                    b.truncate(rng.below(b.len() as u32) as usize);
+                for packet in packets {
+                    if let Some(payload) = packet.payload() {
+                        check_payload(payload);
+                    }
+                    let wire = datagram(std::slice::from_ref(&packet)).unwrap();
+                    assert_eq!(Packet::parse(&wire, dcid_len), Ok((packet, wire.len())));
                 }
-                b
-            };
-            check_bytes(&b, rng.below(22) as usize);
-            // The bytes fed one at a time: each longer prefix is read
-            // without panic, and the last read is the whole read.
+            }
             if round % 10 == 1 {
                 let mut last = None;
-                for cut in 0..=b.len() {
-                    last = Some(parse_frames(&b[..cut]));
-                    let _ = Packet::parse(&b[..cut], 8);
+                for cut in 0..=bytes.len() {
+                    last = Some((Packet::parse(&bytes[..cut], 8), Payload::parse(&bytes[..cut])));
                 }
-                assert_eq!(last, Some(parse_frames(&b)));
+                assert_eq!(last, Some((Packet::parse(&bytes, 8), Payload::parse(&bytes))));
             }
-            // Bytes fed to a reassembler one at a time, in a shuffled
-            // order, give the same stream as all at once.
             if round % 50 == 0 {
-                let mut r = Reassembler::new();
-                let mut order: Vec<usize> = (0..b.len()).collect();
+                let mut reassembler = Reassembler::new();
+                let mut order: Vec<_> = (0..bytes.len()).collect();
                 for i in (1..order.len()).rev() {
-                    order.swap(i, rng.below(i as u32 + 1) as usize);
+                    order.swap(i, rng.index(i + 1));
                 }
                 for i in order {
-                    r.insert(i as u64, &b[i..i + 1]).unwrap();
+                    reassembler.insert(i as u64, &bytes[i..i + 1]).unwrap();
                 }
-                assert_eq!(r.read(), b);
+                assert_eq!(reassembler.read(), bytes);
             }
-        }
-        // Writers never make bytes their readers refuse.
-        for _ in 0..6000 {
-            let frames: Vec<Frame> = (0..1 + rng.below(5)).map(|_| random_frame(&mut rng)).collect();
-            if let Ok(b) = write_frames(&frames) {
-                let back = parse_frames(&b).unwrap();
-                assert_eq!(write_frames(&back).unwrap(), b);
+            let frames: Vec<_> = (0..1 + rng.index(5)).map(|_| random_frame(&mut rng)).collect();
+            for frame in &frames {
+                contract::check_wire_value(frame);
             }
-            for f in &frames {
-                if let Ok(b) = f.to_bytes() {
-                    assert_eq!(Frame::parse(&b).map(|(g, n)| (g.to_bytes().unwrap(), n)), Ok((b.clone(), b.len())));
-                }
-            }
-            let number = PacketNumber { value: rng.next() >> rng.below(32), len: rng.below(6) as u8 };
-            let version = [VERSION_1, VERSION_2, 0, 5][rng.below(4) as usize];
-            let dcid = rng.some(24);
-            let scid = rng.some(24);
-            let payload = rng.some(30);
-            let p = match rng.below(7) {
+            contract::check_wire_value(&Payload(frames));
+            let number = PacketNumber { value: (rng.next() >> rng.index(32)) as u32, len: rng.index(6) as u8 };
+            let version = [VERSION_1, VERSION_2, 0, 5][rng.index(4)];
+            let dcid = rng.bytes(24);
+            let scid = rng.bytes(24);
+            let payload = rng.bytes(30);
+            let packet = match rng.index(7) {
                 0 => Packet::Initial { version, dcid, scid, token: payload.clone(), number, payload },
                 1 => Packet::ZeroRtt { version, dcid, scid, number, payload },
                 2 => Packet::Handshake { version, dcid, scid, number, payload },
                 3 => Packet::Retry { version, unused: rng.next() as u8, dcid, scid, token: payload, tag: [1; 16] },
-                4 => Packet::Short { spin: true, key_phase: rng.below(2) == 0, dcid, number, payload },
+                4 => Packet::Short { spin: true, key_phase: rng.coin(), dcid, number, payload },
                 5 => Packet::VersionNegotiation {
                     unused: rng.next() as u8,
                     dcid,
                     scid,
-                    versions: vec![rng.next(); payload.len()],
+                    versions: vec![rng.next() as u32; payload.len()],
                 },
                 _ => Packet::OtherVersion { bits: rng.next() as u8, version, dcid, scid, rest: payload },
             };
-            if let Ok(b) = p.to_bytes() {
-                let (back, used) = Packet::parse(&b, p.dcid().len()).unwrap();
-                assert_eq!(used, b.len());
-                assert_eq!(back, p);
+            if let Ok(bytes) = datagram(std::slice::from_ref(&packet)) {
+                assert_eq!(Packet::parse(&bytes, packet.dcid().len()), Ok((packet, bytes.len())));
             }
         }
     }
