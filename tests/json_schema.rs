@@ -1,0 +1,119 @@
+//! Schema validation and mock values using only the public API.
+use fictionet::stdlib::codec::{Wire, contract, test_support};
+use fictionet::stdlib::json::{self, Value};
+use fictionet::stdlib::json_schema::{
+    Dialect, ErrorMode, GenerationLimits, Options, Schema, ValidationKind,
+};
+
+fn parse(bytes: &[u8]) -> Value {
+    json::parse_with(bytes, &json::Limits::default()).unwrap()
+}
+
+#[test]
+fn mcp_tool_input_schema_and_mock_arguments() {
+    let tool = parse(
+        br#"{
+        "name":"lookup_customer",
+        "inputSchema":{
+            "type":"object",
+            "properties":{
+                "customer/id":{"type":"integer","minimum":1},
+                "include_notes":{"type":"boolean"},
+                "limit":{"type":"integer","minimum":1,"maximum":10}
+            },
+            "required":["customer/id"],
+            "additionalProperties":false
+        }
+    }"#,
+    );
+    let schema = Schema::compile(tool.get("inputSchema").unwrap()).unwrap();
+    let args = parse(br#"{"customer/id":42,"include_notes":true}"#);
+    assert!(schema.validate(&args).is_valid());
+    let report = schema.validate_with(
+        &parse(br#"{"customer/id":0,"limit":"ten"}"#),
+        ErrorMode::All,
+    );
+    assert_eq!(report.errors.len(), 2);
+    assert_eq!(report.errors[0].instance_path, "/customer~1id");
+    assert_eq!(
+        report.errors[0].schema_path,
+        "/properties/customer~1id/minimum"
+    );
+    assert_eq!(report.errors[0].kind, ValidationKind::Assertion("minimum"));
+    assert_eq!(report.errors[1].instance_path, "/limit");
+    for seed in 0..100 {
+        let example = schema.generate(seed, GenerationLimits::default()).unwrap();
+        assert!(schema.validate(&example).is_valid());
+        assert_eq!(
+            example,
+            schema.generate(seed, GenerationLimits::default()).unwrap()
+        );
+        contract::check_wire_value(&example);
+        let bytes = example.to_bytes().unwrap();
+        let (streamed, failure) = test_support::decode_all(json::Values::default, &bytes);
+        assert!(failure.is_none());
+        assert_eq!(streamed, [example]);
+    }
+}
+
+#[test]
+fn openapi30_nullable_request_body_and_examples() {
+    let request_body = parse(
+        br#"{
+        "required":true,
+        "content":{"application/json":{"schema":{
+            "type":"object",
+            "properties":{
+                "name":{"type":"string","minLength":1,"example":"Ada"},
+                "note":{"type":"string","nullable":true},
+                "amount":{"type":"number","minimum":0,"exclusiveMinimum":true}
+            },
+            "required":["name","note","amount"],
+            "additionalProperties":false
+        }}}
+    }"#,
+    );
+    let source = request_body
+        .get("content")
+        .unwrap()
+        .get("application/json")
+        .unwrap()
+        .get("schema")
+        .unwrap();
+    let schema = Schema::compile_with(
+        source,
+        Options {
+            dialect: Dialect::OpenApi30,
+            ..Options::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        schema
+            .validate(&parse(br#"{"name":"Ada","note":null,"amount":0.01}"#))
+            .is_valid()
+    );
+    let report = schema.validate(&parse(br#"{"name":"Ada","note":null,"amount":0}"#));
+    assert_eq!(report.errors[0].instance_path, "/amount");
+    assert_eq!(
+        report.errors[0].schema_path,
+        "/properties/amount/exclusiveMinimum"
+    );
+    for seed in 0..100 {
+        let example = schema.generate(seed, GenerationLimits::default()).unwrap();
+        assert!(schema.validate(&example).is_valid());
+    }
+    assert_eq!(
+        Schema::compile(source).unwrap_err().schema_path,
+        "/properties/amount/exclusiveMinimum"
+    );
+}
+
+#[test]
+fn copied_schema_module_composes_with_sdk_json() {
+    let source = parse(br#"{"type":"integer","minimum":4}"#);
+    let schema = fictionet_copy_modules::json_schema::Schema::compile(&source).unwrap();
+    assert!(schema.validate(&Value::from(5)).is_valid());
+    let example = schema.generate(12, Default::default()).unwrap();
+    assert!(schema.validate(&example).is_valid());
+}

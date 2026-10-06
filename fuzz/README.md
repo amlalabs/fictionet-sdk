@@ -18,6 +18,7 @@ cargo +nightly fuzz list
 
 | Target | What it feeds | Code it reaches |
 |---|---|---|
+| `json_schema` | Byte-split schema and instance pairs; dialects, error paths and caps, deterministic examples, and generated-value validation | `stdlib::json_schema`: compilation, local refs, exact decimal assertions, bounded branch evaluation, and generation; JSON wire contracts |
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |
