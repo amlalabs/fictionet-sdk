@@ -24,7 +24,10 @@ fn round_trip(b: &[u8]) {
                 (Message::AsReq(r) | Message::TgsReq(r), Ok(body)) => {
                     assert!(b.windows(body.len()).any(|w| w == body));
                     if rules == Rules::Der {
-                        assert_eq!(KdcReqBody::parse(body).as_ref(), Ok(&r.body));
+                        match KdcReqBody::parse(body) {
+                            Ok(parsed) => assert_eq!(parsed, r.body),
+                            Err(e) => assert_eq!(e, Error::TooLong),
+                        }
                     }
                 }
                 (Message::AsReq(_) | Message::TgsReq(_), Err(e)) => panic!("no body: {e:?}"),

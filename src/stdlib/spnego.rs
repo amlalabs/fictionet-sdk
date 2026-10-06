@@ -774,19 +774,32 @@ fn token_len_limited(b: &[u8], limit: usize) -> Result<Option<usize>, Error> {
     Ok(if b.len() >= total { Some(total) } else { None })
 }
 
-asn1::der_wire!(InitialContextToken,
+impl Wire for InitialContextToken {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a whole wrapper from `bytes`, which must hold nothing else.
     /// Reads BER. Refuses indefinite wrappers, wrapped negTokenResp, and
     /// input or DER output over [`MAX_TOKEN`].
-    parse checks encode;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
     /// Appends the wrapper as DER. It fails with [`Error::TooLong`] if
     /// the result would be longer than [`MAX_TOKEN`].
     /// Refuses a SPNEGO wrapper containing negTokenResp.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
-asn1::der_wire!(NegotiationToken,
+impl Wire for NegotiationToken {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a whole token from `bytes`, which must hold nothing else. A
     /// negTokenInit may be inside a GSS-API wrapper, as a first token is,
     /// or not. A negTokenResp must not be wrapped (RFC 4178 section 4.1),
@@ -794,20 +807,27 @@ asn1::der_wire!(NegotiationToken,
     /// SPNEGO.
     /// Reads BER. Refuses invalid fields, exceeded mechanism lists, hintAddress,
     /// and input or DER output over [`MAX_TOKEN`].
-    parse checks encode;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
     /// Appends the token as DER, without a GSS-API wrapper, as every token
     /// after the first is sent. It fails if the result would be longer than
     /// [`MAX_TOKEN`], if a NegTokenInit offers more than [`MAX_MECHS`]
     /// mechanisms or, without hints, none, if hints hold a hintAddress, or
     /// if a value cannot be written.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
 /// Reads complete tokens without holding input bytes.
 ///
 /// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer bounded by the configured
-/// token limit, with at least 16 bytes to read or refuse any ASN.1 header.
+/// token limit, with at least [`asn1::HEADER_ROOM`] bytes to read or refuse any ASN.1 header.
 /// Only outer headers are checked. Map items through [`NegotiationToken::parse`]
 /// or [`InitialContextToken::parse`] to interpret them. Partial tokens return
 /// [`super::codec::Step::Need`], including at EOF. The stream reports
@@ -937,7 +957,8 @@ mod tests {
         assert_eq!(t.mech_list_mic, None);
         // Written back, byte for byte.
         assert_eq!(
-            InitialContextToken::spnego(&NegotiationToken::Init(t)).and_then(|token| token.to_bytes())
+            InitialContextToken::spnego(&NegotiationToken::Init(t))
+                .and_then(|token| token.to_bytes())
                 .unwrap(),
             b
         );
@@ -1042,7 +1063,8 @@ mod tests {
             assert_eq!(NegotiationToken::parse(&bare).unwrap(), t);
             assert_eq!(token_len(&bare), Ok(Some(bare.len())));
             if let NegotiationToken::Init(_) = t {
-                let wrapped = InitialContextToken::spnego(&t).and_then(|token| token.to_bytes())
+                let wrapped = InitialContextToken::spnego(&t)
+                    .and_then(|token| token.to_bytes())
                     .unwrap();
                 assert_eq!(NegotiationToken::parse(&wrapped).unwrap(), t);
                 assert_eq!(token_len(&wrapped), Ok(Some(wrapped.len())));

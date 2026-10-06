@@ -934,47 +934,71 @@ fn hex_digit(c: u8) -> Result<u8, Error> {
     }
 }
 
-asn1::der_wire!(OcspRequest,
+impl Wire for OcspRequest {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a request from its DER, such as a POST body.
     /// Refuses trailing bytes, invalid fields, empty requests, exceeded lists,
     /// and input over [`MAX_MESSAGE`]. Signed requests must name a requestor.
-    parse;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
     /// Appends the request as DER, for a world that plays a client. It fails if a
     /// list is empty or over its limit, a hash has the wrong length, a raw
     /// DER part is not one well-formed element, the requestor name is not
     /// a GeneralName, the request is signed but names no requestor, or the
     /// whole is over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
-asn1::der_wire!(OcspResponse,
+impl Wire for OcspResponse {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a response from its DER, such as an HTTP reply's body. A basic
     /// response inside is read too, and an error in it is an error here.
     /// Refuses trailing bytes, unknown status codes, status/bytes mismatches,
     /// and input over [`MAX_MESSAGE`].
-    parse;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
     /// Appends the response as DER, for a world that plays a responder. It fails
     /// where [`BasicResponse::write`] does, if the status and the bytes
     /// disagree or [`ResponseBytes::Other`] has the basic type's
     /// identifier ([`Error::ResponseBytes`]), or if the whole is over
     /// [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
-asn1::der_wire!(BasicResponse,
+impl Wire for BasicResponse {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a basic response from its DER: the contents of a response's
     /// OCTET STRING.
     /// Refuses trailing bytes, invalid fields, exceeded lists, and input over
     /// [`MAX_MESSAGE`].
-    parse;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
     /// Appends the basic response as DER. It fails if a list is over its limit, a
     /// time is not in the form RFC 5280 allows, a raw DER part is not one
     /// well-formed element, or the whole is over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
 /// Reads whole DER messages without holding input bytes.
 ///
@@ -1460,16 +1484,24 @@ fn write_single_response(w: &mut Writer, r: &SingleResponse) {
     });
 }
 
-asn1::der_wire!(ResponseData,
+impl Wire for ResponseData {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads one complete DER ResponseData. Refuses invalid fields, exceeded
     /// lists, trailing bytes, and input over [`MAX_MESSAGE`].
-    parse;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
     /// Appends the DER the responder signs, as it appears inside a
     /// [`BasicResponse`]. Refuses invalid fields, exceeded lists, invalid
     /// responder IDs, hash lengths or times, and output over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
 #[cfg(test)]
 mod tests {

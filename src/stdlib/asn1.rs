@@ -60,46 +60,28 @@ use std::fmt;
 
 use super::codec::{Decode, Step, Wire};
 
-// Wire for values with decode and encode: write encodes, reads back, and
-// refuses a value that changes. Parse may also check the encoding's limits.
-macro_rules! der_wire {
-    ($ty:ty, $(#[$parse_doc:meta])* parse $(checks $encode:ident)?;
-        $(#[$write_doc:meta])* write;) => {
-        impl $crate::stdlib::codec::Wire for $ty {
-            type ParseError = Error;
-            type WriteError = Error;
-
-            $(#[$parse_doc])*
-            fn parse(bytes: &[u8]) -> Result<Self, Error> {
-                let value = Self::decode(bytes)?;
-                $(value.$encode()?;)?
-                Ok(value)
-            }
-
-            $(#[$write_doc])*
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                let bytes = self.encode()?;
-                if Self::decode(&bytes).as_ref() != Ok(self) {
-                    return Err(Error::Unwritable);
-                }
-                out.extend_from_slice(&bytes);
-                Ok(())
-            }
-        }
-    };
-    ($($ty:ty),+ $(,)?) => { $(
-        $crate::stdlib::asn1::der_wire!($ty,
-            /// Reads one complete DER value. Refuses malformed fields,
-            /// trailing bytes, and exceeded limits. See this type's docs.
-            parse;
-            /// Appends DER. Refuses invalid fields, exceeded limits, and
-            /// values that change when encoded. See this type's docs.
-            /// Leaves the destination unchanged on error.
-            write;
-        );
-    )+ };
+/// Encodes `value` and appends the bytes only if `decode` reads the same value.
+///
+/// Use this in [`Wire::write`] implementations with separate encode and decode
+/// functions. Those functions must enforce the type's size and field limits.
+/// The temporary encoding is kept only for this call.
+///
+/// Returns an encoding error unchanged. Returns `unwritable` if decoding fails
+/// or changes the value. Leaves `out` unchanged on either error.
+pub fn write_checked<T: PartialEq, E>(
+    value: &T,
+    encode: impl FnOnce(&T) -> Result<Vec<u8>, E>,
+    decode: impl FnOnce(&[u8]) -> Result<T, E>,
+    unwritable: E,
+    out: &mut Vec<u8>,
+) -> Result<(), E> {
+    let bytes = encode(value)?;
+    if decode(&bytes).as_ref().ok() != Some(value) {
+        return Err(unwritable);
+    }
+    out.extend_from_slice(&bytes);
+    Ok(())
 }
-pub(crate) use der_wire;
 
 /// The longest element, header and contents together, a reader accepts and
 /// a writer writes. A [`Stream<Elements>`](super::codec::Stream) never holds much more than this.

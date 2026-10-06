@@ -2704,26 +2704,329 @@ impl Decode for PemBlocks {
     }
 }
 
-asn1::der_wire!(
-    CrlReason,
-    CrlNumber,
-    IssuerAltName,
-    AuthorityInfoAccess,
-    CrlDistributionPoints,
-    AuthorityKeyIdentifier,
-    SubjectKeyIdentifier,
-    SubjectAltName,
-    ExtendedKeyUsage,
-    KeyUsage,
-    BasicConstraints,
-    Value,
-    Name,
-    PublicKeyInfo,
-    TbsCertificate,
-    Certificate,
-    TbsCertList,
-    Crl
-);
+impl Wire for CrlReason {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for CrlNumber {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for IssuerAltName {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for AuthorityInfoAccess {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for CrlDistributionPoints {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for AuthorityKeyIdentifier {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for SubjectKeyIdentifier {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for SubjectAltName {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for ExtendedKeyUsage {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for KeyUsage {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for BasicConstraints {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for Value {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for Name {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for PublicKeyInfo {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for TbsCertificate {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for Certificate {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for TbsCertList {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
+
+impl Wire for Crl {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one complete DER value. Refuses malformed fields,
+    /// trailing bytes, and exceeded limits. See this type's docs.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
+    /// Appends DER. Refuses invalid fields, exceeded limits, and
+    /// values that change when encoded. See this type's docs.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -3675,6 +3978,24 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     }
 
     #[test]
+    fn pem_stream_reports_bad_base64_at_the_end_marker() {
+        let mut stream = Stream::new(PemBlocks::new());
+        let begin = b"-----BEGIN X-----\n";
+        assert_eq!(stream.push(begin), begin.len());
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(b"!!!\n"), 4);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), None);
+        let end = b"-----END X----";
+        assert_eq!(stream.push(end), end.len());
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(b"-"), 1);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::Pem))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(Error::Pem)));
+    }
+
+    #[test]
     fn pem_decoder_takes_a_big_block_a_byte_at_a_time_in_linear_time() {
         let big = Pem { label: "X".into(), data: vec![0x5a; MAX_PEM_DATA] }.to_bytes().unwrap();
         let started = std::time::Instant::now();
@@ -3824,6 +4145,9 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                         }
                         check(&b.data);
                     }
+                }
+                Err(Error::Pem) if !text.windows(PEM_END.len()).any(|w| w == PEM_END) => {
+                    assert!(matches!(whole.1, Some(Fail::Truncated { .. })));
                 }
                 Err(e) => assert!(whole.1.is_some(), "{e}"),
             }

@@ -4,7 +4,7 @@
 
 use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::spnego::{
-    Frames, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
+    Error, Frames, InitialContextToken, MAX_TOKEN, Mech, NegotiationToken, token_len,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -26,14 +26,18 @@ fuzz_target!(|data: &[u8]| {
     for t in tokens.iter().map(Vec::as_slice).chain([data]) {
         contract::check_wire::<NegotiationToken>(t);
         contract::check_wire::<InitialContextToken>(t);
-        if let Ok(token @ NegotiationToken::Init(_)) = NegotiationToken::parse(t) {
-            let wrapper = InitialContextToken {
-                mech: Mech::Spnego,
-                inner: token.to_bytes().unwrap(),
-            };
-            contract::check_wire_value(&wrapper);
-            if let Ok(bytes) = wrapper.to_bytes() {
-                assert_eq!(NegotiationToken::parse(&bytes), Ok(token));
+        if let Ok(token) = NegotiationToken::parse(t) {
+            let wrapped = InitialContextToken::spnego(&token);
+            match token {
+                NegotiationToken::Resp(_) => assert_eq!(wrapped, Err(Error::WrappedResp)),
+                NegotiationToken::Init(_) => match wrapped {
+                    Ok(wrapper) => {
+                        contract::check_wire_value(&wrapper);
+                        let bytes = wrapper.to_bytes().unwrap();
+                        assert_eq!(NegotiationToken::parse(&bytes), Ok(token));
+                    }
+                    Err(e) => assert_eq!(e, Error::TooLong),
+                },
             }
         }
         if let Ok(wrapper) = InitialContextToken::parse(t) {

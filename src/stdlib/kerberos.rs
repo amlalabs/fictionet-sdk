@@ -1190,12 +1190,20 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-asn1::der_wire!(Message,
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads one complete DER message, as RFC 4120 requires.
     /// Refuses invalid tags, versions, fields, and lists, trailing bytes,
     /// and input or DER output over [`MAX_MESSAGE`]. Short flags and signed
     /// integer forms can expand when written.
-    parse checks encode;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
     /// Appends the message as DER, as a UDP datagram carries it. A list over its
     /// limit, a Microseconds field over [`MAX_MICROSECONDS`], or a message
     /// longer than [`MAX_MESSAGE`] is an error, and nothing is written. A
@@ -1203,8 +1211,10 @@ asn1::der_wire!(Message,
     /// past it. DER can expand BER forms or short flags. [`Wire::parse`]
     /// checks that the resulting encoding fits.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
 /// One TCP record's payload, bounded by [`MAX_MESSAGE`].
 ///
@@ -1501,38 +1511,69 @@ fn w_flags(w: &mut Writer, n: u32, f: u32) {
     w.explicit(n, |w| w.bit_string(&f.to_be_bytes(), 0));
 }
 
-asn1::der_wire!(EncryptedData,
+impl Wire for EncryptedData {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads an EncryptedData standing alone in `bytes`, as a PA-DATA value
     /// holds one.
     /// Refuses malformed DER, trailing bytes, and input or DER output over
     /// [`MAX_MESSAGE`]. Signed kvno values are read as UInt32.
-    parse checks encode;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
     /// Appends this EncryptedData as DER. Refuses output over [`MAX_MESSAGE`].
     /// Signed kvno input can expand when written as UInt32. The parser checks
     /// that the resulting encoding still fits.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
-asn1::der_wire!(Ticket,
+impl Wire for Ticket {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a Ticket standing alone in `bytes`, as a credential cache holds
     /// one.
     /// Refuses malformed DER, invalid realms or names, wrong versions, trailing
     /// bytes, and input or DER output over [`MAX_MESSAGE`].
-    parse checks encode;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
     /// Appends this Ticket as DER. Refuses invalid realms or names and
     /// output over [`MAX_MESSAGE`]. As with [`EncryptedData::write`], DER
     /// may expand a signed kvno; the parser checks that the result fits.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
-asn1::der_wire!(KdcReqBody,
+impl Wire for KdcReqBody {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a KDC-REQ-BODY standing alone in `bytes`, such as the bytes a
     /// checksum covers.
     /// Refuses malformed DER, invalid fields or lists, trailing bytes,
     /// and input or DER output over [`MAX_MESSAGE`].
-    parse checks encode;
+    /// For a body that grows past the limit when written, read its message
+    /// with [`Message::parse_with`]. Use [`Message::kdc_req_body`] for the
+    /// original bytes that a checksum covers.
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        let value = Self::decode(bytes)?;
+        value.encode()?;
+        Ok(value)
+    }
+
     /// Appends the body as DER. A body read and written again may
     /// not be the bytes it was read from: options shorter than 32 bits, a
     /// nonce or kvno written as a negative number, an empty optional list,
@@ -1540,8 +1581,10 @@ asn1::der_wire!(KdcReqBody,
     /// that was received, take its bytes with [`Message::kdc_req_body`].
     /// Refuses invalid fields or lists and output over [`MAX_MESSAGE`].
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(self, Self::encode, Self::decode, Error::Unwritable, out)
+    }
+}
 
 /// METHOD-DATA: a DER SEQUENCE OF PA-DATA, bounded by [`MAX_PADATA`].
 /// A KRB-ERROR with [`error_code::KDC_ERR_PREAUTH_REQUIRED`] carries it.
@@ -1575,7 +1618,7 @@ impl Wire for MethodData {
 mod tests {
     use super::super::codec::{
         Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks, mutate},
+        test_support::{Lcg, chunks, decode_all, mutate},
     };
     use super::*;
 
@@ -1990,6 +2033,55 @@ mod tests {
     }
 
     #[test]
+    fn a_request_body_near_the_limit_can_grow_too_long() {
+        let mut request = as_req();
+        request.padata = None;
+        let mut tickets = vec![tgt(); MAX_TICKETS];
+        // Start above the DER length-width boundaries, then fill the exact
+        // remaining space in one step. This keeps the test linear in size.
+        tickets[0].enc_part.cipher.resize(MAX_MESSAGE / 2, 0xaa);
+        request.body.additional_tickets = Some(tickets);
+        let mut message = Message::TgsReq(request);
+        let room = MAX_MESSAGE
+            .checked_sub(message.to_bytes().unwrap().len())
+            .unwrap();
+        let Message::TgsReq(request) = &mut message else {
+            panic!()
+        };
+        let cipher = &mut request.body.additional_tickets.as_mut().unwrap()[0]
+            .enc_part
+            .cipher;
+        cipher.resize(cipher.len().checked_add(room).unwrap(), 0xaa);
+        let mut bytes = message.to_bytes().unwrap();
+        assert_eq!(bytes.len(), MAX_MESSAGE);
+
+        // Each kvno 2 becomes -1 without changing the input length. Reading
+        // it as UInt32 makes its next encoding four bytes longer.
+        let mut changed = 0;
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i..].starts_with(&[0xa1, 0x03, 0x02, 0x01, 0x02]) {
+                bytes[i + 4] = 0xff;
+                changed += 1;
+            }
+        }
+        assert_eq!(changed, MAX_TICKETS);
+        let Message::TgsReq(parsed) = Message::parse_with(&bytes, Rules::Der).unwrap() else {
+            panic!("expected TGS-REQ");
+        };
+        let tickets = parsed.body.additional_tickets.as_ref().unwrap();
+        assert_eq!(tickets.len(), MAX_TICKETS);
+        assert!(
+            tickets
+                .iter()
+                .all(|ticket| ticket.enc_part.kvno == Some(u32::MAX))
+        );
+        let body = Message::kdc_req_body(&bytes, Rules::Der).unwrap();
+        assert!(body.len() <= MAX_MESSAGE);
+        assert_eq!(parsed.body.to_bytes(), Err(Error::TooLong));
+        assert_eq!(KdcReqBody::parse(body), Err(Error::TooLong));
+    }
+
+    #[test]
     fn every_truncated_prefix_fails() {
         for m in all_messages() {
             let der = m.to_bytes().unwrap();
@@ -2292,11 +2384,7 @@ mod tests {
             read += check_any(&data);
             if let Ok(f) = Frame(data.clone()).to_bytes() {
                 check_any(&f);
-                let mut d = Stream::new(Frames::new());
-                for part in chunks(&f, &[1]) {
-                    assert_eq!(d.push(part), part.len());
-                }
-                assert_eq!(d.next(), Some(Ok(data.clone())));
+                assert_eq!(decode_all(Frames::new, &f), (vec![data], None));
             }
         }
         // Some changed messages still read, so the round trip is tested.

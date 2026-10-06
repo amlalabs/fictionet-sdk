@@ -110,8 +110,8 @@ pub enum Error {
     /// Filter or DN text is longer than [`MAX_TEXT`].
     TextTooLong,
     /// A value has no form a reader would accept, such as an attribute
-    /// name with spaces in filter text.
-    Unwritable,
+    /// name with spaces in filter text. The reason says what is wrong.
+    Unwritable(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -125,7 +125,7 @@ impl fmt::Display for Error {
             Error::Filter(why) => write!(f, "bad filter: {why}"),
             Error::Syntax(at) => write!(f, "malformed text at byte {at}"),
             Error::TextTooLong => write!(f, "text longer than {MAX_TEXT} bytes"),
-            Error::Unwritable => f.write_str("value cannot be written without changing it"),
+            Error::Unwritable(why) => write!(f, "cannot write: {why}"),
         }
     }
 }
@@ -1301,7 +1301,9 @@ impl Op {
                             contents,
                         } => {
                             if *number == 0 || *number == 3 {
-                                return Err(Error::Unwritable);
+                                return Err(Error::Unwritable(
+                                    "authentication choice 0 or 3 is simple or SASL",
+                                ));
                             }
                             w.put(context(*number, *constructed), contents)
                         }
@@ -1324,7 +1326,9 @@ impl Op {
                     return Err(Error::Range("timeLimit"));
                 }
                 if matches!(s.scope, Scope::Other(0..=2)) {
-                    return Err(Error::Unwritable);
+                    return Err(Error::Unwritable(
+                        "Scope::Other with a named scope's number",
+                    ));
                 }
                 w.nest(app(3), |w| {
                     w.octets(s.base.as_bytes())?;
@@ -1352,7 +1356,9 @@ impl Op {
                 w.nest(Tag::SEQUENCE, |w| {
                     for c in &m.changes {
                         if matches!(c.op, ModifyOperation::Other(0..=2)) {
-                            return Err(Error::Unwritable);
+                            return Err(Error::Unwritable(
+                                "ModifyOperation::Other with a named operation's number",
+                            ));
                         }
                         w.nest(Tag::SEQUENCE, |w| {
                             w.uint(Tag::ENUMERATED, c.op.code())?;
@@ -1365,7 +1371,7 @@ impl Op {
             Op::ModifyResponse(r) => w.nest(app(7), |w| write_result(w, r)),
             Op::AddRequest(a) => {
                 if a.attributes.iter().any(|a| a.values.is_empty()) {
-                    return Err(Error::Unwritable);
+                    return Err(Error::Unwritable("an added attribute with no values"));
                 }
                 w.nest(app(8), |w| {
                     w.octets(a.dn.as_bytes())?;
@@ -1400,7 +1406,7 @@ impl Op {
                 w.uint(app(16), *id)
             }
             Op::SearchResultReference(uris) if uris.is_empty() => {
-                Err(Error::Unwritable)
+                Err(Error::Unwritable("a search reference with no URIs"))
             }
             Op::SearchResultReference(uris) => w.nest(app(19), |w| {
                 for u in uris {
@@ -1755,7 +1761,9 @@ impl Filter {
                 contents,
             } => {
                 if *number <= 9 {
-                    return Err(Error::Unwritable);
+                    return Err(Error::Unwritable(
+                        "filter choices 0 to 9 have their own variants",
+                    ));
                 }
                 w.put(context(*number, *constructed), contents)
             }
@@ -1801,7 +1809,9 @@ impl Filter {
         }
         let name = |out: &mut String, a: &str| {
             if !is_attribute(a) {
-                return Err(Error::Unwritable);
+                return Err(Error::Unwritable(
+                    "attribute description is not a name or numeric OID",
+                ));
             }
             push_text(out, a)
         };
@@ -1842,7 +1852,9 @@ impl Filter {
                 if initial.as_ref().is_some_and(Vec::is_empty)
                     || last.as_ref().is_some_and(Vec::is_empty)
                 {
-                    return Err(Error::Unwritable);
+                    return Err(Error::Unwritable(
+                        "an empty initial or final substring has no text form",
+                    ));
                 }
                 name(out, attribute)?;
                 push_text(out, "=")?;
@@ -1894,12 +1906,16 @@ impl Filter {
                 }
                 if let Some(r) = rule {
                     if !is_oid(r) {
-                        return Err(Error::Unwritable);
+                        return Err(Error::Unwritable(
+                            "matching rule is not a name or numeric OID",
+                        ));
                     }
                     // After a type, text reads a lone `:dn` as the
                     // dnAttributes flag. With no type it can only be a rule.
                     if r.eq_ignore_ascii_case("dn") && !dn_attributes && attribute.is_some() {
-                        return Err(Error::Unwritable);
+                        return Err(Error::Unwritable(
+                            "a matching rule named dn after a type reads back as the dn flag",
+                        ));
                     }
                     push_text(out, ":")?;
                     push_text(out, r)?;
@@ -1908,7 +1924,7 @@ impl Filter {
                 escape_value(out, value)?;
             }
             Filter::Other { .. } => {
-                return Err(Error::Unwritable);
+                return Err(Error::Unwritable("filter choice with no text form"));
             }
         }
         push_text(out, ")")
@@ -2270,14 +2286,16 @@ impl Dn {
                 push_text(out, ",")?;
             }
             if rdn.0.is_empty() {
-                return Err(Error::Unwritable);
+                return Err(Error::Unwritable("an RDN with no values"));
             }
             for (j, ava) in rdn.0.iter().enumerate() {
                 if j > 0 {
                     push_text(out, "+")?;
                 }
                 if !is_oid(&ava.attribute) {
-                    return Err(Error::Unwritable);
+                    return Err(Error::Unwritable(
+                        "attribute type is not a name or numeric OID",
+                    ));
                 }
                 push_text(out, &ava.attribute)?;
                 push_text(out, "=")?;
@@ -2285,7 +2303,7 @@ impl Dn {
                     AttributeValue::Text(v) => escape_dn_value(out, v)?,
                     AttributeValue::Ber(b) => {
                         if b.is_empty() {
-                            return Err(Error::Unwritable);
+                            return Err(Error::Unwritable("an empty BER value"));
                         }
                         push_text(out, "#")?;
                         for &x in b {
@@ -2406,11 +2424,17 @@ fn parse_ava(s: &[u8], start: usize) -> Result<(Ava, usize), Error> {
 // ---------------------------------------------------------------------------
 // The stream.
 
-asn1::der_wire!(Message,
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads one whole message: a TCP message the caller has framed, or a
     /// CLDAP datagram that holds one message. Bytes after it are an error.
     /// Reads BER. Refuses malformed fields and messages over [`MAX_MESSAGE`].
-    parse;
+    fn parse(bytes: &[u8]) -> Result<Self, Error> {
+        Self::decode(bytes)
+    }
+
     /// Appends DER. Refuses values that
     /// [`Message::parse`] would refuse or read back as another value: an ID
     /// or limit over [`MAX_INT`], a version outside 1 to 127, a filter
@@ -2422,8 +2446,16 @@ asn1::der_wire!(Message,
     /// empty list of controls, are left out, as their defaults. An empty
     /// referral is left out, as no referral.
     /// Refuses values that change when encoded. Leaves `out` unchanged on error.
-    write;
-);
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        asn1::write_checked(
+            self,
+            Self::encode,
+            Self::decode,
+            Error::Unwritable("message changes when parsed"),
+            out,
+        )
+    }
+}
 
 /// Reads LDAP messages without holding input bytes.
 ///
@@ -2447,7 +2479,7 @@ impl Frames {
     }
 
     /// Sets the whole-message limit, clamped to [`MAX_MESSAGE`].
-    /// The buffer holds at least 16 bytes to read or refuse any header.
+    /// The buffer holds at least [`asn1::HEADER_ROOM`] bytes to read or refuse any header.
     /// Zero refuses every message.
     pub fn with_limit(limit: usize) -> Self {
         Self {
@@ -2947,29 +2979,29 @@ mod tests {
         ));
         assert!(matches!(
             eq("c n", "x").to_text(),
-            Err(Error::Unwritable)
+            Err(Error::Unwritable(_))
         ));
-        assert!(matches!(eq("", "x").to_text(), Err(Error::Unwritable)));
+        assert!(matches!(eq("", "x").to_text(), Err(Error::Unwritable(_))));
         let bad_rule = Filter::Extensible {
             rule: Some("1..2".into()),
             attribute: Some("cn".into()),
             value: vec![],
             dn_attributes: false,
         };
-        assert!(matches!(bad_rule.to_text(), Err(Error::Unwritable)));
+        assert!(matches!(bad_rule.to_text(), Err(Error::Unwritable(_))));
         let dn_rule = Filter::Extensible {
             rule: Some("dn".into()),
             attribute: Some("cn".into()),
             value: vec![],
             dn_attributes: false,
         };
-        assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable)));
+        assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable(_))));
         let other = Filter::Other {
             number: 12,
             constructed: false,
             contents: vec![1],
         };
-        assert!(matches!(other.to_text(), Err(Error::Unwritable)));
+        assert!(matches!(other.to_text(), Err(Error::Unwritable(_))));
         round_trip(&msg(1, Op::SearchRequest(search(other))));
         let other_low = Filter::Other {
             number: 7,
@@ -2978,7 +3010,7 @@ mod tests {
         };
         assert!(matches!(
             msg(1, Op::SearchRequest(search(other_low))).to_bytes(),
-            Err(Error::Unwritable)
+            Err(Error::Unwritable(_))
         ));
         let mut deep = eq("a", "1");
         for _ in 0..MAX_FILTER_DEPTH {
@@ -3016,7 +3048,7 @@ mod tests {
                 any,
                 last,
             };
-            assert!(matches!(f.to_text(), Err(Error::Unwritable)), "{f:?}");
+            assert!(matches!(f.to_text(), Err(Error::Unwritable(_))), "{f:?}");
             // The BER form still holds it.
             round_trip(&msg(1, Op::SearchRequest(search(f))));
         }
@@ -3157,18 +3189,18 @@ mod tests {
         }
         assert!(matches!(
             Dn(vec![Rdn(vec![])]).to_text(),
-            Err(Error::Unwritable)
+            Err(Error::Unwritable(_))
         ));
         let bad_type = Dn(vec![Rdn(vec![Ava {
             attribute: "c n".into(),
             value: AttributeValue::Text("x".into()),
         }])]);
-        assert!(matches!(bad_type.to_text(), Err(Error::Unwritable)));
+        assert!(matches!(bad_type.to_text(), Err(Error::Unwritable(_))));
         let empty_ber = Dn(vec![Rdn(vec![Ava {
             attribute: "cn".into(),
             value: AttributeValue::Ber(vec![]),
         }])]);
-        assert!(matches!(empty_ber.to_text(), Err(Error::Unwritable)));
+        assert!(matches!(empty_ber.to_text(), Err(Error::Unwritable(_))));
         assert_eq!(
             ava(&"x".repeat(MAX_TEXT)).to_text(),
             Err(Error::TextTooLong)
@@ -3509,11 +3541,11 @@ mod tests {
         };
         assert!(matches!(
             msg(1, other(0)).to_bytes(),
-            Err(Error::Unwritable)
+            Err(Error::Unwritable(_))
         ));
         assert!(matches!(
             msg(1, other(3)).to_bytes(),
-            Err(Error::Unwritable)
+            Err(Error::Unwritable(_))
         ));
         round_trip(&msg(1, other(u32::MAX)));
         // Too large: the writer stops at MAX_MESSAGE.
@@ -3817,7 +3849,7 @@ mod tests {
                 }],
             }),
         );
-        assert!(matches!(add.to_bytes(), Err(Error::Unwritable)));
+        assert!(matches!(add.to_bytes(), Err(Error::Unwritable(_))));
         // 30 0e 02 01 01 68 09 04 01 x 30 04 30 02 04 00 ... built by hand.
         let add_bytes = [
             0x30, 0x13, 0x02, 0x01, 0x01, 0x68, 0x0e, 0x04, 0x04, b'c', b'n', b'=', b'x', 0x30,
@@ -3828,7 +3860,7 @@ mod tests {
         assert!(Message::parse(&empty_ref).is_err());
         assert!(matches!(
             msg(1, Op::SearchResultReference(vec![])).to_bytes(),
-            Err(Error::Unwritable)
+            Err(Error::Unwritable(_))
         ));
         let empty_referral = [
             0x30, 0x0e, 0x02, 0x01, 0x01, 0x65, 0x09, 0x0a, 0x01, 0x0a, 0x04, 0x00, 0x04, 0x00,
@@ -3855,7 +3887,7 @@ mod tests {
             s.scope = Scope::Other(n);
             assert!(matches!(
                 msg(1, Op::SearchRequest(s.clone())).to_bytes(),
-                Err(Error::Unwritable)
+                Err(Error::Unwritable(_))
             ));
             let m = msg(
                 1,
@@ -3870,7 +3902,7 @@ mod tests {
                     }],
                 }),
             );
-            assert!(matches!(m.to_bytes(), Err(Error::Unwritable)));
+            assert!(matches!(m.to_bytes(), Err(Error::Unwritable(_))));
         }
         s.scope = Scope::Other(3);
         round_trip(&msg(1, Op::SearchRequest(s)));
@@ -3894,7 +3926,7 @@ mod tests {
             value: b"x".to_vec(),
             dn_attributes: false,
         };
-        assert!(matches!(typed.to_text(), Err(Error::Unwritable)));
+        assert!(matches!(typed.to_text(), Err(Error::Unwritable(_))));
     }
 
     #[test]
