@@ -316,7 +316,11 @@ impl<'a> Reader<'a> {
         &mut self,
         item: impl FnOnce(&mut Reader<'a>) -> Result<T, XdrError>,
     ) -> Result<Option<T>, XdrError> {
-        if self.bool()? { Ok(Some(item(self)?)) } else { Ok(None) }
+        if self.bool()? {
+            Ok(Some(item(self)?))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -349,7 +353,7 @@ impl Writer {
 
     /// Finishes an XDR value and checks it with its procedure-specific reader.
     /// A value that would read differently returns [`XdrError::Unwritable`].
-    pub(crate) fn finish_value<T: PartialEq>(
+    pub fn finish_value<T: PartialEq>(
         self,
         value: &T,
         read: impl FnOnce(&[u8]) -> Result<T, XdrError>,
@@ -362,7 +366,7 @@ impl Writer {
     }
 
     /// Refuses this value. The first error is returned by [`Self::finish`].
-    pub(crate) fn reject(&mut self, error: XdrError) {
+    pub fn reject(&mut self, error: XdrError) {
         if self.error.is_none() {
             self.error = Some(error);
         }
@@ -376,7 +380,9 @@ impl Writer {
         }
         let total = self.buf.len().checked_add(bytes.len());
         if total.is_none_or(|n| n > MAX_RECORD) {
-            let length = total.and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX);
+            let length = total
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(u32::MAX);
             self.reject(XdrError::TooLong(length));
             return;
         }
@@ -465,7 +471,11 @@ impl Writer {
     }
 
     /// An optional value: a boolean, then the value if there is one.
-    pub fn optional<T>(&mut self, value: Option<&T>, item: impl FnOnce(&mut Writer, &T)) -> &mut Writer {
+    pub fn optional<T>(
+        &mut self,
+        value: Option<&T>,
+        item: impl FnOnce(&mut Writer, &T),
+    ) -> &mut Writer {
         self.bool(value.is_some());
         if let Some(v) = value {
             item(self, v);
@@ -476,7 +486,8 @@ impl Writer {
 
 /// How many of `n` items of type `T` to make room for before reading them.
 fn reserve<T>(n: usize) -> usize {
-    n.min(MAX_ARRAY_RESERVE).min(MAX_RESERVE_BYTES / std::mem::size_of::<T>().max(1))
+    n.min(MAX_ARRAY_RESERVE)
+        .min(MAX_RESERVE_BYTES / std::mem::size_of::<T>().max(1))
 }
 
 /// How many zero bytes pad `n` bytes to a multiple of 4.
@@ -510,7 +521,13 @@ impl AuthSys {
         let gid = r.uint()?;
         let gids = r.array(MAX_GIDS, Reader::uint)?;
         r.finish()?;
-        Ok(AuthSys { stamp, machine_name, uid, gid, gids })
+        Ok(AuthSys {
+            stamp,
+            machine_name,
+            uid,
+            gid,
+            gids,
+        })
     }
 }
 
@@ -536,7 +553,10 @@ impl Wire for AuthSys {
             ));
         }
         let mut w = Writer::new();
-        w.uint(self.stamp).string(&self.machine_name).uint(self.uid).uint(self.gid);
+        w.uint(self.stamp)
+            .string(&self.machine_name)
+            .uint(self.uid)
+            .uint(self.gid);
         w.array(&self.gids, |w, group| {
             w.uint(*group);
         });
@@ -588,14 +608,22 @@ impl Auth {
             flavor::NONE if body.is_empty() => Auth::None,
             flavor::SYS => match AuthSys::parse(body) {
                 Ok(sys) => Auth::Sys(sys),
-                Err(_) => Auth::Other { flavor, body: body.to_vec() },
+                Err(_) => Auth::Other {
+                    flavor,
+                    body: body.to_vec(),
+                },
             },
-            _ => Auth::Other { flavor, body: body.to_vec() },
+            _ => Auth::Other {
+                flavor,
+                body: body.to_vec(),
+            },
         })
     }
 
     /// Appends authentication fields after checking their limits.
-    fn write(&self, w: &mut Writer) {
+    /// A value that would read differently sets [`XdrError::Unwritable`].
+    /// Retrieve any error with [`Writer::finish`].
+    pub fn write(&self, w: &mut Writer) {
         if auth_wire_len(self).is_err() {
             w.reject(XdrError::Unwritable);
             return;
@@ -694,7 +722,10 @@ impl Reply {
     /// A reply that took the call, with this status and an AUTH_NONE
     /// verifier.
     pub fn accepted(status: Accept) -> Reply {
-        Reply::Accepted { verf: Auth::None, status }
+        Reply::Accepted {
+            verf: Auth::None,
+            status,
+        }
     }
 }
 
@@ -842,7 +873,9 @@ impl Message {
     /// last field does.
     pub fn parse(b: &[u8]) -> Result<Message, XdrError> {
         if b.len() > MAX_RECORD {
-            return Err(XdrError::TooLong(u32::try_from(b.len()).unwrap_or(u32::MAX)));
+            return Err(XdrError::TooLong(
+                u32::try_from(b.len()).unwrap_or(u32::MAX),
+            ));
         }
         let mut r = Reader::new(b);
         let xid = r.uint()?;
@@ -855,7 +888,15 @@ impl Message {
                 let cred = Auth::read(&mut r)?;
                 let verf = Auth::read(&mut r)?;
                 let args = r.rest().to_vec();
-                Body::Call(Call { rpc_version, program, version, procedure, cred, verf, args })
+                Body::Call(Call {
+                    rpc_version,
+                    program,
+                    version,
+                    procedure,
+                    cred,
+                    verf,
+                    args,
+                })
             }
             1 => Body::Reply(match r.uint()? {
                 0 => {
@@ -863,7 +904,10 @@ impl Message {
                     let status = match r.uint()? {
                         0 => Accept::Success(r.rest().to_vec()),
                         1 => Accept::ProgUnavail,
-                        2 => Accept::ProgMismatch { low: r.uint()?, high: r.uint()? },
+                        2 => Accept::ProgMismatch {
+                            low: r.uint()?,
+                            high: r.uint()?,
+                        },
                         3 => Accept::ProcUnavail,
                         4 => Accept::GarbageArgs,
                         5 => Accept::SystemErr,
@@ -872,7 +916,10 @@ impl Message {
                     Reply::Accepted { verf, status }
                 }
                 1 => Reply::Denied(match r.uint()? {
-                    0 => Reject::RpcMismatch { low: r.uint()?, high: r.uint()? },
+                    0 => Reject::RpcMismatch {
+                        low: r.uint()?,
+                        high: r.uint()?,
+                    },
                     1 => Reject::AuthError(AuthStat::from_code(r.uint()?)),
                     n => return Err(XdrError::Discriminant(n)),
                 }),
@@ -887,7 +934,10 @@ impl Message {
     /// A message that answers this one with `reply`, with the same
     /// transaction ID.
     pub fn reply(&self, reply: Reply) -> Message {
-        Message { xid: self.xid, body: Body::Reply(reply) }
+        Message {
+            xid: self.xid,
+            body: Body::Reply(reply),
+        }
     }
 }
 
@@ -927,7 +977,9 @@ fn auth_wire_len(auth: &Auth) -> Result<usize, MessageWriteError> {
         Auth::None => 0,
         Auth::Sys(sys) => {
             if sys.machine_name.len() > MAX_MACHINE_NAME {
-                return Err(MessageWriteError::TooLong { limit: MAX_MACHINE_NAME });
+                return Err(MessageWriteError::TooLong {
+                    limit: MAX_MACHINE_NAME,
+                });
             }
             if sys.gids.len() > MAX_GIDS {
                 return Err(MessageWriteError::TooLong { limit: MAX_GIDS });
@@ -939,7 +991,9 @@ fn auth_wire_len(auth: &Auth) -> Result<usize, MessageWriteError> {
         }
         Auth::Other { flavor, body } => {
             if body.len() > MAX_AUTH_BODY {
-                return Err(MessageWriteError::TooLong { limit: MAX_AUTH_BODY });
+                return Err(MessageWriteError::TooLong {
+                    limit: MAX_AUTH_BODY,
+                });
             }
             if (*flavor == flavor::NONE && body.is_empty())
                 || (*flavor == flavor::SYS && AuthSys::parse(body).is_ok())
@@ -949,7 +1003,9 @@ fn auth_wire_len(auth: &Auth) -> Result<usize, MessageWriteError> {
             body.len()
         }
     };
-    Ok(8usize.saturating_add(body_len).saturating_add(padding(body_len)))
+    Ok(8usize
+        .saturating_add(body_len)
+        .saturating_add(padding(body_len)))
 }
 
 impl Wire for Message {
@@ -978,13 +1034,13 @@ impl Wire for Message {
                 .saturating_add(auth_wire_len(&call.cred)?)
                 .saturating_add(auth_wire_len(&call.verf)?)
                 .saturating_add(call.args.len()),
-            Body::Reply(Reply::Accepted { verf, status }) => {
-                16usize.saturating_add(auth_wire_len(verf)?).saturating_add(match status {
+            Body::Reply(Reply::Accepted { verf, status }) => 16usize
+                .saturating_add(auth_wire_len(verf)?)
+                .saturating_add(match status {
                     Accept::Success(results) => results.len(),
                     Accept::ProgMismatch { .. } => 8,
                     _ => 0,
-                })
-            }
+                }),
             Body::Reply(Reply::Denied(Reject::RpcMismatch { .. })) => 24,
             Body::Reply(Reply::Denied(Reject::AuthError(status))) => {
                 if AuthStat::from_code(status.code()) != *status {
@@ -1001,10 +1057,16 @@ impl Wire for Message {
         w.uint(self.xid);
         match &self.body {
             Body::Call(c) => {
-                w.uint(0).uint(c.rpc_version).uint(c.program).uint(c.version).uint(c.procedure);
+                w.uint(0)
+                    .uint(c.rpc_version)
+                    .uint(c.program)
+                    .uint(c.version)
+                    .uint(c.procedure);
                 c.cred.write(&mut w);
                 c.verf.write(&mut w);
-                let mut bytes = w.finish().map_err(|_| MessageWriteError::TooLong { limit: MAX_RECORD })?;
+                let mut bytes = w
+                    .finish()
+                    .map_err(|_| MessageWriteError::TooLong { limit: MAX_RECORD })?;
                 bytes.extend_from_slice(&c.args);
                 out.extend_from_slice(&bytes);
                 return Ok(());
@@ -1015,8 +1077,9 @@ impl Wire for Message {
                 w.uint(status.code());
                 match status {
                     Accept::Success(results) => {
-                        let mut bytes =
-                            w.finish().map_err(|_| MessageWriteError::TooLong { limit: MAX_RECORD })?;
+                        let mut bytes = w
+                            .finish()
+                            .map_err(|_| MessageWriteError::TooLong { limit: MAX_RECORD })?;
                         bytes.extend_from_slice(results);
                         out.extend_from_slice(&bytes);
                         return Ok(());
@@ -1035,7 +1098,10 @@ impl Wire for Message {
                 };
             }
         }
-        out.extend_from_slice(&w.finish().map_err(|_| MessageWriteError::TooLong { limit: MAX_RECORD })?);
+        out.extend_from_slice(
+            &w.finish()
+                .map_err(|_| MessageWriteError::TooLong { limit: MAX_RECORD })?,
+        );
         Ok(())
     }
 }
@@ -1093,7 +1159,9 @@ impl Wire for Fragment {
             .map_err(|error| RecordParseError::Framing(AssembleError::Inner(error)))?
         {
             Step::Item(fragment, used) if used == bytes.len() => Ok(fragment),
-            Step::Item(_, used) => Err(RecordParseError::Trailing(bytes.len().saturating_sub(used))),
+            Step::Item(_, used) => {
+                Err(RecordParseError::Trailing(bytes.len().saturating_sub(used)))
+            }
             _ => Err(RecordParseError::Truncated),
         }
     }
@@ -1126,7 +1194,10 @@ impl Fragments {
     /// Sets the record limit, clamped to [`MAX_RECORD`]. Zero permits only
     /// empty fragments. Input capacity also includes [`RECORD_MARK_LEN`].
     pub fn with_limit(limit: usize) -> Self {
-        Self { limit: limit.min(MAX_RECORD), record_len: 0 }
+        Self {
+            limit: limit.min(MAX_RECORD),
+            record_len: 0,
+        }
     }
 
     /// The maximum sum of payload bytes in one record.
@@ -1160,18 +1231,30 @@ impl Decode for Fragments {
         let mut bytes = [0; RECORD_MARK_LEN];
         bytes.copy_from_slice(mark);
         let mark = u32::from_be_bytes(bytes);
-        let len = usize::try_from(mark & MAX_FRAGMENT).map_err(|_| RecordError::TooLong(self.limit))?;
-        let total = self.record_len.checked_add(len).ok_or(RecordError::TooLong(self.limit))?;
+        let len =
+            usize::try_from(mark & MAX_FRAGMENT).map_err(|_| RecordError::TooLong(self.limit))?;
+        let total = self
+            .record_len
+            .checked_add(len)
+            .ok_or(RecordError::TooLong(self.limit))?;
         if total > self.limit {
             return Err(RecordError::TooLong(self.limit));
         }
-        let used = RECORD_MARK_LEN.checked_add(len).ok_or(RecordError::TooLong(self.limit))?;
+        let used = RECORD_MARK_LEN
+            .checked_add(len)
+            .ok_or(RecordError::TooLong(self.limit))?;
         let Some(data) = input.get(RECORD_MARK_LEN..used) else {
             return Ok(Step::Need);
         };
         let last = mark & LAST_FRAGMENT != 0;
         self.record_len = if last { 0 } else { total };
-        Ok(Step::Item(Fragment { last, data: data.to_vec() }, used))
+        Ok(Step::Item(
+            Fragment {
+                last,
+                data: data.to_vec(),
+            },
+            used,
+        ))
     }
 }
 
@@ -1190,7 +1273,10 @@ pub type Records = Assemble<Fragments, fn(Fragment) -> codec::Fragment<Infallibl
 pub fn records(limit: usize) -> Records {
     let fragments = Fragments::with_limit(limit);
     let limit = fragments.limit();
-    Assemble::new(fragments, limit, |f| codec::Fragment::Part { data: f.data, last: f.last })
+    Assemble::new(fragments, limit, |f| codec::Fragment::Part {
+        data: f.data,
+        last: f.last,
+    })
 }
 
 /// Decodes TCP records and parses each as an RPC message.
@@ -1260,7 +1346,10 @@ impl Wire for Record {
     fn parse(mut input: &[u8]) -> Result<Self, RecordParseError> {
         let mut decoder = records(MAX_RECORD);
         loop {
-            match decoder.decode(input, true).map_err(RecordParseError::Framing)? {
+            match decoder
+                .decode(input, true)
+                .map_err(RecordParseError::Framing)?
+            {
                 Step::Item(Assembled::Message(data), used) => {
                     let trailing = input.len().saturating_sub(used);
                     return if trailing == 0 {
@@ -1321,12 +1410,20 @@ pub struct Mapping {
 impl Mapping {
     /// Reads a mapping from the reader.
     pub fn read(r: &mut Reader<'_>) -> Result<Mapping, XdrError> {
-        Ok(Mapping { program: r.uint()?, version: r.uint()?, protocol: r.uint()?, port: r.uint()? })
+        Ok(Mapping {
+            program: r.uint()?,
+            version: r.uint()?,
+            protocol: r.uint()?,
+            port: r.uint()?,
+        })
     }
 
     /// Writes the mapping.
     pub fn write(&self, w: &mut Writer) {
-        w.uint(self.program).uint(self.version).uint(self.protocol).uint(self.port);
+        w.uint(self.program)
+            .uint(self.version)
+            .uint(self.protocol)
+            .uint(self.port);
     }
 }
 
@@ -1366,7 +1463,9 @@ impl Rpcb {
         w.uint(self.program).uint(self.version);
         for s in [&self.netid, &self.addr, &self.owner] {
             if s.len() > MAX_RPCB_STRING {
-                w.reject(XdrError::TooLong(u32::try_from(s.len()).unwrap_or(u32::MAX)));
+                w.reject(XdrError::TooLong(
+                    u32::try_from(s.len()).unwrap_or(u32::MAX),
+                ));
                 return;
             }
             w.string(s);
@@ -1401,19 +1500,35 @@ mod tests {
         wire.extend(encode_fragments(payload, 3).unwrap());
         wire.extend(Record((b"").to_vec()).to_bytes().unwrap());
         contract::check_decode_with_alloc_limit(
-            || Fragments::with_limit(payload.len()), &wire, 2 * (payload.len() + RECORD_MARK_LEN),
+            || Fragments::with_limit(payload.len()),
+            &wire,
+            2 * (payload.len() + RECORD_MARK_LEN),
         );
-        contract::check_decode_with_held_limit(|| super::records(payload.len()), &wire, payload.len());
+        contract::check_decode_with_held_limit(
+            || super::records(payload.len()),
+            &wire,
+            payload.len(),
+        );
 
         let mut stream = Stream::new(super::records(payload.len()));
         let mut items = Vec::new();
         for byte in &wire {
-            assert_eq!(pump(&mut stream, core::slice::from_ref(byte), |item| items.push(item)), Ok(1));
+            assert_eq!(
+                pump(&mut stream, core::slice::from_ref(byte), |item| items
+                    .push(item)),
+                Ok(1)
+            );
             assert!(stream.buffered() <= payload.len() + RECORD_MARK_LEN);
             assert!(stream.held() <= payload.len());
         }
         assert_eq!(finish(&mut stream, |item| items.push(item)), Ok(()));
-        assert_eq!(items, vec![Assembled::Message(payload.to_vec()), Assembled::Message(Vec::new())]);
+        assert_eq!(
+            items,
+            vec![
+                Assembled::Message(payload.to_vec()),
+                Assembled::Message(Vec::new())
+            ]
+        );
     }
 
     #[test]
@@ -1421,14 +1536,28 @@ mod tests {
         let mut fragments = Fragments::with_limit(3);
         assert_eq!(
             fragments.decode(&[0, 0, 0, 2, 1, 2], false),
-            Ok(Step::Item(Fragment { last: false, data: vec![1, 2] }, 6))
+            Ok(Step::Item(
+                Fragment {
+                    last: false,
+                    data: vec![1, 2]
+                },
+                6
+            ))
         );
-        assert_eq!(fragments.decode(&[0x80, 0, 0, 2], false), Err(RecordError::TooLong(3)));
-        assert_eq!(Fragments::with_limit(usize::MAX).capacity(), MAX_RECORD + RECORD_MARK_LEN);
+        assert_eq!(
+            fragments.decode(&[0x80, 0, 0, 2], false),
+            Err(RecordError::TooLong(3))
+        );
+        assert_eq!(
+            Fragments::with_limit(usize::MAX).capacity(),
+            MAX_RECORD + RECORD_MARK_LEN
+        );
 
         let wire = [0, 0, 0, 2, 1, 2, 0x80, 0, 0, 2];
         contract::check_decode_with_alloc_limit(
-            || super::records(3), &wire, 2 * (3 + RECORD_MARK_LEN),
+            || super::records(3),
+            &wire,
+            2 * (3 + RECORD_MARK_LEN),
         );
         let mut stream = Stream::new(super::records(3));
         let error = Fail::Protocol(AssembleError::Inner(RecordError::TooLong(3)));
@@ -1439,10 +1568,14 @@ mod tests {
 
         // The generic stage still enforces its own limit independently.
         let mut smaller =
-            Assemble::new(Fragments::with_limit(8), 1, |f: Fragment| codec::Fragment::<Infallible>::Part {
-                data: f.data,
-                last: f.last,
-            });
+            Assemble::new(
+                Fragments::with_limit(8),
+                1,
+                |f: Fragment| codec::Fragment::<Infallible>::Part {
+                    data: f.data,
+                    last: f.last,
+                },
+            );
         assert_eq!(
             smaller.decode(&Record((b"ab").to_vec()).to_bytes().unwrap(), false),
             Err(AssembleError::TooLong { limit: 1 })
@@ -1455,18 +1588,28 @@ mod tests {
             let mut wire = (payload.len() as u32).to_be_bytes().to_vec();
             wire.extend_from_slice(payload);
             let mut stream = Stream::new(super::records(8));
-            assert_eq!(pump(&mut stream, &wire, |_| panic!("nonfinal fragment")), Ok(wire.len()));
+            assert_eq!(
+                pump(&mut stream, &wire, |_| panic!("nonfinal fragment")),
+                Ok(wire.len())
+            );
             assert_eq!(
                 finish(&mut stream, |_| panic!("unfinished record")),
-                Err(Fail::Protocol(AssembleError::Incomplete { held: payload.len() }))
+                Err(Fail::Protocol(AssembleError::Incomplete {
+                    held: payload.len()
+                }))
             );
         }
         for partial in [b"\x80".as_slice(), b"\x80\0\0\x02x".as_slice()] {
             let mut stream = Stream::new(super::records(8));
-            assert_eq!(pump(&mut stream, partial, |_| panic!("partial fragment")), Ok(partial.len()));
+            assert_eq!(
+                pump(&mut stream, partial, |_| panic!("partial fragment")),
+                Ok(partial.len())
+            );
             assert_eq!(
                 finish(&mut stream, |_| panic!("partial fragment")),
-                Err(Fail::Truncated { unread: partial.len() })
+                Err(Fail::Truncated {
+                    unread: partial.len()
+                })
             );
         }
         contract::check_decode(|| super::records(0), &[0, 0, 0, 0, 0x80, 0, 0, 0]);
@@ -1486,7 +1629,10 @@ mod tests {
         }
         let oversized = Record(vec![3; MAX_RECORD + 1]);
         let mut out = vec![1, 2, 3];
-        assert_eq!(oversized.write(&mut out), Err(RecordError::TooLong(MAX_RECORD)));
+        assert_eq!(
+            oversized.write(&mut out),
+            Err(RecordError::TooLong(MAX_RECORD))
+        );
         assert_eq!(out, [1, 2, 3]);
         assert_eq!(oversized.to_bytes(), Err(RecordError::TooLong(MAX_RECORD)));
         let mut trailing = Record((b"a").to_vec()).to_bytes().unwrap();
@@ -1495,7 +1641,9 @@ mod tests {
         assert_eq!(Record::parse(&[]), Err(RecordParseError::Truncated));
         assert_eq!(
             Record::parse(&[0, 0, 0, 0]),
-            Err(RecordParseError::Framing(AssembleError::Incomplete { held: 0 }))
+            Err(RecordParseError::Framing(AssembleError::Incomplete {
+                held: 0
+            }))
         );
     }
 
@@ -1527,50 +1675,109 @@ mod tests {
         });
         for auth in [
             max_auth,
-            Auth::Other { flavor: 99, body: vec![5; MAX_AUTH_BODY] },
-            Auth::Other { flavor: flavor::NONE, body: vec![1] },
-            Auth::Other { flavor: flavor::SYS, body: vec![1] },
+            Auth::Other {
+                flavor: 99,
+                body: vec![5; MAX_AUTH_BODY],
+            },
+            Auth::Other {
+                flavor: flavor::NONE,
+                body: vec![1],
+            },
+            Auth::Other {
+                flavor: flavor::SYS,
+                body: vec![1],
+            },
         ] {
             let mut c = Call::new(1, 2, 3, vec![4]);
             c.cred = auth.clone();
             c.verf = auth.clone();
-            messages.push(Message { xid: 7, body: Body::Call(c) });
-            messages.push(call.reply(Reply::Accepted { verf: auth, status: Accept::Success(vec![9]) }));
+            messages.push(Message {
+                xid: 7,
+                body: Body::Call(c),
+            });
+            messages.push(call.reply(Reply::Accepted {
+                verf: auth,
+                status: Accept::Success(vec![9]),
+            }));
         }
         for message in messages {
             contract::check_wire_value(&message);
-            assert_eq!(<Message as Wire>::to_bytes(&message), Ok(message.to_bytes().unwrap()));
+            assert_eq!(
+                <Message as Wire>::to_bytes(&message),
+                Ok(message.to_bytes().unwrap())
+            );
         }
     }
 
     #[test]
     fn codec_message_writer_refuses_loss_and_rolls_back() {
-        let sys = AuthSys { stamp: 1, machine_name: "host".into(), uid: 2, gid: 3, gids: vec![] };
+        let sys = AuthSys {
+            stamp: 1,
+            machine_name: "host".into(),
+            uid: 2,
+            gid: 3,
+            gids: vec![],
+        };
         let mut long_name = sys.clone();
         long_name.machine_name = "x".repeat(MAX_MACHINE_NAME + 1);
         let mut long_groups = sys.clone();
         long_groups.gids = vec![0; MAX_GIDS + 1];
         for (auth, error) in [
-            (Auth::Sys(long_name), MessageWriteError::TooLong { limit: MAX_MACHINE_NAME }),
-            (Auth::Sys(long_groups), MessageWriteError::TooLong { limit: MAX_GIDS }),
             (
-                Auth::Other { flavor: 99, body: vec![0; MAX_AUTH_BODY + 1] },
-                MessageWriteError::TooLong { limit: MAX_AUTH_BODY },
+                Auth::Sys(long_name),
+                MessageWriteError::TooLong {
+                    limit: MAX_MACHINE_NAME,
+                },
             ),
-            (Auth::Other { flavor: flavor::NONE, body: vec![] }, MessageWriteError::Xdr(XdrError::Unwritable)),
             (
-                Auth::Other { flavor: flavor::SYS, body: sys.to_bytes().unwrap() },
+                Auth::Sys(long_groups),
+                MessageWriteError::TooLong { limit: MAX_GIDS },
+            ),
+            (
+                Auth::Other {
+                    flavor: 99,
+                    body: vec![0; MAX_AUTH_BODY + 1],
+                },
+                MessageWriteError::TooLong {
+                    limit: MAX_AUTH_BODY,
+                },
+            ),
+            (
+                Auth::Other {
+                    flavor: flavor::NONE,
+                    body: vec![],
+                },
+                MessageWriteError::Xdr(XdrError::Unwritable),
+            ),
+            (
+                Auth::Other {
+                    flavor: flavor::SYS,
+                    body: sys.to_bytes().unwrap(),
+                },
                 MessageWriteError::Xdr(XdrError::Unwritable),
             ),
         ] {
             let mut call = Call::new(1, 2, 3, Vec::new());
             call.cred = auth.clone();
             for message in [
-                Message { xid: 1, body: Body::Call(call.clone()) },
-                Message { xid: 1, body: Body::Call(Call { cred: Auth::None, verf: auth.clone(), ..call }) },
                 Message {
                     xid: 1,
-                    body: Body::Reply(Reply::Accepted { verf: auth, status: Accept::ProgUnavail }),
+                    body: Body::Call(call.clone()),
+                },
+                Message {
+                    xid: 1,
+                    body: Body::Call(Call {
+                        cred: Auth::None,
+                        verf: auth.clone(),
+                        ..call
+                    }),
+                },
+                Message {
+                    xid: 1,
+                    body: Body::Reply(Reply::Accepted {
+                        verf: auth,
+                        status: Accept::ProgUnavail,
+                    }),
                 },
             ] {
                 let mut out = vec![1, 2, 3];
@@ -1580,30 +1787,53 @@ mod tests {
                 assert_eq!(message.to_bytes(), Err(error));
             }
         }
-        let alias =
-            Message { xid: 1, body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))) };
-        assert_eq!(alias.write(&mut Vec::new()), Err(MessageWriteError::Xdr(XdrError::Unwritable)));
+        let alias = Message {
+            xid: 1,
+            body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))),
+        };
+        assert_eq!(
+            alias.write(&mut Vec::new()),
+            Err(MessageWriteError::Xdr(XdrError::Unwritable))
+        );
         contract::check_wire_value(&alias);
     }
 
     #[test]
     fn codec_message_size_includes_the_header() {
         for message in [
-            Message { xid: 1, body: Body::Call(Call::new(1, 2, 3, vec![0; MAX_RECORD - 40])) },
-            Message { xid: 2, body: Body::Reply(Reply::success(vec![0; MAX_RECORD - 24])) },
+            Message {
+                xid: 1,
+                body: Body::Call(Call::new(1, 2, 3, vec![0; MAX_RECORD - 40])),
+            },
+            Message {
+                xid: 2,
+                body: Body::Reply(Reply::success(vec![0; MAX_RECORD - 24])),
+            },
         ] {
-            assert_eq!(<Message as Wire>::to_bytes(&message).unwrap().len(), MAX_RECORD);
+            assert_eq!(
+                <Message as Wire>::to_bytes(&message).unwrap().len(),
+                MAX_RECORD
+            );
             contract::check_wire_value(&message);
             let mut too_long = message.clone();
             match &mut too_long.body {
                 Body::Call(call) => call.args.push(1),
-                Body::Reply(Reply::Accepted { status: Accept::Success(data), .. }) => data.push(1),
+                Body::Reply(Reply::Accepted {
+                    status: Accept::Success(data),
+                    ..
+                }) => data.push(1),
                 _ => unreachable!(),
             }
             let mut out = vec![42];
-            assert_eq!(too_long.write(&mut out), Err(MessageWriteError::TooLong { limit: MAX_RECORD }));
+            assert_eq!(
+                too_long.write(&mut out),
+                Err(MessageWriteError::TooLong { limit: MAX_RECORD })
+            );
             assert_eq!(out, [42]);
-            assert_eq!(too_long.to_bytes(), Err(MessageWriteError::TooLong { limit: MAX_RECORD }));
+            assert_eq!(
+                too_long.to_bytes(),
+                Err(MessageWriteError::TooLong { limit: MAX_RECORD })
+            );
         }
     }
 
@@ -1633,10 +1863,17 @@ mod tests {
     #[test]
     fn rfc4506_file_example() {
         let (name, kind, interp, owner, data) = read_file(&FILE).unwrap();
-        assert_eq!((name.as_str(), kind, interp.as_str(), owner.as_str()), ("sillyprog", 2, "lisp", "john"));
+        assert_eq!(
+            (name.as_str(), kind, interp.as_str(), owner.as_str()),
+            ("sillyprog", 2, "lisp", "john")
+        );
         assert_eq!(data, b"(quit)");
         let mut w = Writer::new();
-        w.string(&name).enumeration(kind).string(&interp).string(&owner).opaque(&data);
+        w.string(&name)
+            .enumeration(kind)
+            .string(&interp)
+            .string(&owner)
+            .opaque(&data);
         assert_eq!(w.finish().unwrap(), FILE);
         // Every truncated prefix ends early.
         for n in 0..FILE.len() {
@@ -1647,11 +1884,19 @@ mod tests {
     #[test]
     fn basic_types() {
         let mut w = Writer::new();
-        w.int(-2).uint(0xdead_beef).hyper(-3).uhyper(0x0102_0304_0506_0708).bool(true).bool(false);
+        w.int(-2)
+            .uint(0xdead_beef)
+            .hyper(-3)
+            .uhyper(0x0102_0304_0506_0708)
+            .bool(true)
+            .bool(false);
         w.opaque_fixed(&[1, 2, 3, 4, 5]);
         let bytes = w.finish().unwrap();
         assert_eq!(&bytes[..4], &[0xff, 0xff, 0xff, 0xfe]);
-        assert_eq!(&bytes[8..16], &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd]);
+        assert_eq!(
+            &bytes[8..16],
+            &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfd]
+        );
         assert_eq!(&bytes[16..24], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(&bytes[32..], &[1, 2, 3, 4, 5, 0, 0, 0]);
         let mut r = Reader::new(&bytes);
@@ -1681,7 +1926,9 @@ mod tests {
         let bytes = w.finish().unwrap();
         assert_eq!(
             bytes,
-            [0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0]
+            [
+                0, 0, 0, 3, 0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0, 9, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 0
+            ]
         );
         let mut r = Reader::new(&bytes);
         assert_eq!(r.array(3, Reader::uint), Ok(vec![7, 8, 9]));
@@ -1689,7 +1936,10 @@ mod tests {
         assert_eq!(r.optional(Reader::uint), Ok(None));
         assert_eq!(r.finish(), Ok(()));
         // Over the caller's limit, and a count the bytes cannot hold.
-        assert_eq!(Reader::new(&bytes).array(2, Reader::uint), Err(XdrError::TooLong(3)));
+        assert_eq!(
+            Reader::new(&bytes).array(2, Reader::uint),
+            Err(XdrError::TooLong(3))
+        );
         assert_eq!(
             Reader::new(&[0xff, 0xff, 0xff, 0xff]).array(usize::MAX, Reader::uint),
             Err(XdrError::Short)
@@ -1700,11 +1950,26 @@ mod tests {
     fn xdr_errors() {
         assert_eq!(Reader::new(&[0, 0, 0]).uint(), Err(XdrError::Short));
         assert_eq!(Reader::new(&[0, 0, 0, 2]).bool(), Err(XdrError::Bool(2)));
-        assert_eq!(Reader::new(&[0, 0, 0, 1, 7, 0, 1, 0]).opaque(4), Err(XdrError::Padding));
-        assert_eq!(Reader::new(&[0, 0, 0, 5, 1, 2, 3, 4, 5, 0, 0, 0]).opaque(4), Err(XdrError::TooLong(5)));
-        assert_eq!(Reader::new(&[0, 0, 0, 2, 0xc3, 0x28, 0, 0]).string(4), Err(XdrError::Utf8));
-        assert_eq!(Reader::new(&[0xff, 0xff, 0xff, 0xff]).opaque(usize::MAX), Err(XdrError::Short));
-        assert_eq!(Reader::new(&[0, 0, 0, 0, 1]).optional(Reader::uint), Ok(None));
+        assert_eq!(
+            Reader::new(&[0, 0, 0, 1, 7, 0, 1, 0]).opaque(4),
+            Err(XdrError::Padding)
+        );
+        assert_eq!(
+            Reader::new(&[0, 0, 0, 5, 1, 2, 3, 4, 5, 0, 0, 0]).opaque(4),
+            Err(XdrError::TooLong(5))
+        );
+        assert_eq!(
+            Reader::new(&[0, 0, 0, 2, 0xc3, 0x28, 0, 0]).string(4),
+            Err(XdrError::Utf8)
+        );
+        assert_eq!(
+            Reader::new(&[0xff, 0xff, 0xff, 0xff]).opaque(usize::MAX),
+            Err(XdrError::Short)
+        );
+        assert_eq!(
+            Reader::new(&[0, 0, 0, 0, 1]).optional(Reader::uint),
+            Ok(None)
+        );
         let mut r = Reader::new(&[0, 0, 0, 0, 1]);
         r.uint().unwrap();
         assert_eq!(r.finish(), Err(XdrError::Trailing(1)));
@@ -1741,7 +2006,13 @@ mod tests {
     fn call_with_auth_sys() {
         let bytes = nfs_call_bytes();
         let m = Message::parse(&bytes).unwrap();
-        let sys = AuthSys { stamp: 9, machine_name: "host1".into(), uid: 1000, gid: 100, gids: vec![10] };
+        let sys = AuthSys {
+            stamp: 9,
+            machine_name: "host1".into(),
+            uid: 1000,
+            gid: 100,
+            gids: vec![10],
+        };
         let call = Call {
             rpc_version: 2,
             program: 100_003,
@@ -1751,7 +2022,13 @@ mod tests {
             verf: Auth::None,
             args: vec![0, 0, 0, 4, 0xaa, 0xbb, 0xcc, 0xdd],
         };
-        assert_eq!(m, Message { xid: 0x1234_5678, body: Body::Call(call) });
+        assert_eq!(
+            m,
+            Message {
+                xid: 0x1234_5678,
+                body: Body::Call(call)
+            }
+        );
         assert_eq!(m.to_bytes().unwrap(), bytes);
         // Every truncated prefix up to the arguments fails, and none panics.
         for n in 0..bytes.len() {
@@ -1769,18 +2046,45 @@ mod tests {
         // AUTH_NONE with a body, and AUTH_SYS with a short body, stay as
         // they are.
         let mut w = Writer::new();
-        Auth::Other { flavor: 0, body: vec![1, 2, 3, 4] }.write(&mut w);
-        Auth::Other { flavor: 1, body: vec![0, 0, 0, 1] }.write(&mut w);
-        Auth::Other { flavor: flavor::RPCSEC_GSS, body: vec![9; 12] }.write(&mut w);
+        Auth::Other {
+            flavor: 0,
+            body: vec![1, 2, 3, 4],
+        }
+        .write(&mut w);
+        Auth::Other {
+            flavor: 1,
+            body: vec![0, 0, 0, 1],
+        }
+        .write(&mut w);
+        Auth::Other {
+            flavor: flavor::RPCSEC_GSS,
+            body: vec![9; 12],
+        }
+        .write(&mut w);
         let bytes = w.finish().unwrap();
         let mut r = Reader::new(&bytes);
-        assert_eq!(Auth::read(&mut r), Ok(Auth::Other { flavor: 0, body: vec![1, 2, 3, 4] }));
-        assert_eq!(Auth::read(&mut r), Ok(Auth::Other { flavor: 1, body: vec![0, 0, 0, 1] }));
+        assert_eq!(
+            Auth::read(&mut r),
+            Ok(Auth::Other {
+                flavor: 0,
+                body: vec![1, 2, 3, 4]
+            })
+        );
+        assert_eq!(
+            Auth::read(&mut r),
+            Ok(Auth::Other {
+                flavor: 1,
+                body: vec![0, 0, 0, 1]
+            })
+        );
         assert_eq!(Auth::read(&mut r).unwrap().flavor(), 6);
         // A body over 400 bytes.
         let mut w = Writer::new();
         w.uint(1).opaque(&[0; 404]);
-        assert_eq!(Auth::read(&mut Reader::new(&w.finish().unwrap())), Err(XdrError::TooLong(404)));
+        assert_eq!(
+            Auth::read(&mut Reader::new(&w.finish().unwrap())),
+            Err(XdrError::TooLong(404))
+        );
     }
 
     #[test]
@@ -1796,21 +2100,35 @@ mod tests {
         ];
         let stats = (0..=15).map(|n| Reply::Denied(Reject::AuthError(AuthStat::from_code(n))));
         for reply in replies.into_iter().chain(stats) {
-            let m = Message { xid: 42, body: Body::Reply(reply) };
+            let m = Message {
+                xid: 42,
+                body: Body::Reply(reply),
+            };
             let bytes = m.to_bytes().unwrap();
             assert_eq!(Message::parse(&bytes), Ok(m.clone()));
             for n in 0..bytes.len() {
                 let r = Message::parse(&bytes[..n]);
-                let success =
-                    matches!(m.body, Body::Reply(Reply::Accepted { status: Accept::Success(_), .. }));
+                let success = matches!(
+                    m.body,
+                    Body::Reply(Reply::Accepted {
+                        status: Accept::Success(_),
+                        ..
+                    })
+                );
                 if !(success && n >= 24) {
                     assert_eq!(r, Err(XdrError::Short), "{m:?} at {n}");
                 }
             }
         }
         // Spot check one layout: denied, AUTH_ERROR, AUTH_TOOWEAK.
-        let m = Message { xid: 1, body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::TooWeak))) };
-        assert_eq!(m.to_bytes().unwrap(), [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 5]);
+        let m = Message {
+            xid: 1,
+            body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::TooWeak))),
+        };
+        assert_eq!(
+            m.to_bytes().unwrap(),
+            [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 5]
+        );
         for n in 0..=100 {
             assert_eq!(AuthStat::from_code(n).code(), n);
         }
@@ -1821,12 +2139,18 @@ mod tests {
     fn message_errors() {
         let d = XdrError::Discriminant;
         assert_eq!(Message::parse(&[0, 0, 0, 1, 0, 0, 0, 2]), Err(d(2)));
-        assert_eq!(Message::parse(&[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2]), Err(d(2)));
+        assert_eq!(
+            Message::parse(&[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2]),
+            Err(d(2))
+        );
         let accepted = [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let mut b = accepted.to_vec();
         b.extend_from_slice(&[0, 0, 0, 6]);
         assert_eq!(Message::parse(&b), Err(d(6)));
-        assert_eq!(Message::parse(&[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2]), Err(d(2)));
+        assert_eq!(
+            Message::parse(&[0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 2]),
+            Err(d(2))
+        );
         // Bytes after a reply that has no results.
         let mut b = accepted.to_vec();
         b.extend_from_slice(&[0, 0, 0, 1, 9]);
@@ -1851,7 +2175,11 @@ mod tests {
         codec::finish(&mut stream, |item| got.push(item)).unwrap();
         assert_eq!(
             got,
-            [Assembled::Message(msg.clone()), Assembled::Message(msg), Assembled::Message(vec![])]
+            [
+                Assembled::Message(msg.clone()),
+                Assembled::Message(msg),
+                Assembled::Message(vec![])
+            ]
         );
         for n in 0..one.len() {
             let mut stream = Stream::new(super::records(MAX_RECORD));
@@ -1859,7 +2187,10 @@ mod tests {
             assert_eq!(stream.next(), None);
         }
         assert_eq!(Record(vec![]).to_bytes().unwrap(), [0x80, 0, 0, 0]);
-        assert_eq!(encode_fragments(&[1, 2], 0).unwrap(), [0, 0, 0, 1, 1, 0x80, 0, 0, 1, 2]);
+        assert_eq!(
+            encode_fragments(&[1, 2], 0).unwrap(),
+            [0, 0, 0, 1, 1, 0x80, 0, 0, 1, 2]
+        );
     }
 
     #[test]
@@ -1869,10 +2200,16 @@ mod tests {
         let mut got = Vec::new();
         codec::pump(&mut stream, &bytes, |item| got.push(item)).unwrap();
         assert_eq!(got, [Assembled::Message(vec![0; 10])]);
-        let error =
-            codec::pump(&mut stream, &[0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 3], |_| panic!())
-                .unwrap_err();
-        assert_eq!(error, Fail::Protocol(AssembleError::Inner(RecordError::TooLong(10))));
+        let error = codec::pump(
+            &mut stream,
+            &[0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0, 3],
+            |_| panic!(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Fail::Protocol(AssembleError::Inner(RecordError::TooLong(10)))
+        );
         assert_eq!(stream.next(), None);
         assert_eq!(stream.failed(), Some(&error));
         assert_eq!(stream.push(&[0; 100]), 100);
@@ -1880,27 +2217,52 @@ mod tests {
         assert_eq!(stream.push(&[0xff; 4]), 4);
         assert_eq!(
             stream.next(),
-            Some(Err(Fail::Protocol(AssembleError::Inner(RecordError::TooLong(MAX_RECORD)))))
+            Some(Err(Fail::Protocol(AssembleError::Inner(
+                RecordError::TooLong(MAX_RECORD)
+            ))))
         );
         assert_eq!(Fragments::with_limit(usize::MAX).limit(), MAX_RECORD);
     }
 
     #[test]
     fn noncanonical_authentication_is_refused() {
-        let sys = AuthSys { stamp: 1, machine_name: "m".into(), uid: 2, gid: 3, gids: vec![4] };
+        let sys = AuthSys {
+            stamp: 1,
+            machine_name: "m".into(),
+            uid: 2,
+            gid: 3,
+            gids: vec![4],
+        };
         for auth in [
-            Auth::Other { flavor: 0, body: vec![] },
-            Auth::Other { flavor: 1, body: sys.to_bytes().unwrap() },
+            Auth::Other {
+                flavor: 0,
+                body: vec![],
+            },
+            Auth::Other {
+                flavor: 1,
+                body: sys.to_bytes().unwrap(),
+            },
         ] {
             let mut call = Call::new(1, 2, 3, vec![]);
             call.cred = auth;
-            let message = Message { xid: 1, body: Body::Call(call) };
-            assert_eq!(message.to_bytes(), Err(MessageWriteError::Xdr(XdrError::Unwritable)));
+            let message = Message {
+                xid: 1,
+                body: Body::Call(call),
+            };
+            assert_eq!(
+                message.to_bytes(),
+                Err(MessageWriteError::Xdr(XdrError::Unwritable))
+            );
             contract::check_wire_value(&message);
         }
-        let message =
-            Message { xid: 1, body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(5)))) };
-        assert_eq!(message.to_bytes(), Err(MessageWriteError::Xdr(XdrError::Unwritable)));
+        let message = Message {
+            xid: 1,
+            body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(5)))),
+        };
+        assert_eq!(
+            message.to_bytes(),
+            Err(MessageWriteError::Xdr(XdrError::Unwritable))
+        );
         assert_eq!(AuthSys::parse(&sys.to_bytes().unwrap()), Ok(sys));
     }
 
@@ -1914,9 +2276,17 @@ mod tests {
             r.uint()?;
             Err(XdrError::Padding)
         };
-        assert_eq!(Reader::new(&bytes).array(usize::MAX, big), Err(XdrError::Padding));
+        assert_eq!(
+            Reader::new(&bytes).array(usize::MAX, big),
+            Err(XdrError::Padding)
+        );
         // Items that read still all come back.
-        assert_eq!(Reader::new(&bytes).array(usize::MAX, Reader::uint).map(|v| v.len()), Ok(1 << 20));
+        assert_eq!(
+            Reader::new(&bytes)
+                .array(usize::MAX, Reader::uint)
+                .map(|v| v.len()),
+            Ok(1 << 20)
+        );
     }
 
     #[test]
@@ -1931,7 +2301,12 @@ mod tests {
         .unwrap();
         assert_eq!(got, count);
         let mut items = Vec::new();
-        codec::pump(&mut stream, &encode_fragments(&[1, 2, 3], 2).unwrap(), |item| items.push(item)).unwrap();
+        codec::pump(
+            &mut stream,
+            &encode_fragments(&[1, 2, 3], 2).unwrap(),
+            |item| items.push(item),
+        )
+        .unwrap();
         assert_eq!(items, [Assembled::Message(vec![1, 2, 3])]);
         assert_eq!(stream.buffered(), 0);
     }
@@ -1945,7 +2320,10 @@ mod tests {
         let mut items = Vec::new();
         let error = codec::pump(&mut stream, &bytes, |item| items.push(item)).unwrap_err();
         assert_eq!(items, [Assembled::Message(vec![1, 2])]);
-        assert_eq!(error, Fail::Protocol(AssembleError::Inner(RecordError::TooLong(8))));
+        assert_eq!(
+            error,
+            Fail::Protocol(AssembleError::Inner(RecordError::TooLong(8)))
+        );
         assert!(stream.buffered() <= 12);
         assert_eq!(stream.push(&[0; 1024]), 1024);
         assert_eq!(stream.next(), None);
@@ -1972,7 +2350,11 @@ mod tests {
 
     #[test]
     fn stream_reports_incomplete_records_at_eof() {
-        for bytes in [&[0, 0, 0, 0][..], &[0, 0, 0, 0, 0x80, 0, 0][..], &[0x80, 0, 0, 4, 1][..]] {
+        for bytes in [
+            &[0, 0, 0, 0][..],
+            &[0, 0, 0, 0, 0x80, 0, 0][..],
+            &[0x80, 0, 0, 4, 1][..],
+        ] {
             contract::check_decode(|| super::records(MAX_RECORD), bytes);
             let mut stream = Stream::new(super::records(MAX_RECORD));
             assert_eq!(stream.push(bytes), bytes.len());
@@ -1988,12 +2370,18 @@ mod tests {
     #[test]
     fn record_writers_refuse_excess_data() {
         let record = Record(vec![3; MAX_RECORD]);
-        for bytes in [record.to_bytes().unwrap(), encode_fragments(&record.0, 1 << 16).unwrap()] {
+        for bytes in [
+            record.to_bytes().unwrap(),
+            encode_fragments(&record.0, 1 << 16).unwrap(),
+        ] {
             assert_eq!(Record::parse(&bytes), Ok(record.clone()));
         }
         let record = Record(vec![3; MAX_RECORD + 1]);
         assert_eq!(record.to_bytes(), Err(RecordError::TooLong(MAX_RECORD)));
-        assert_eq!(encode_fragments(&record.0, 1 << 16), Err(RecordError::TooLong(MAX_RECORD)));
+        assert_eq!(
+            encode_fragments(&record.0, 1 << 16),
+            Err(RecordError::TooLong(MAX_RECORD))
+        );
     }
 
     #[test]
@@ -2010,14 +2398,22 @@ mod tests {
         assert_eq!(r.finish(), Ok(()));
         let full = (MAX_ARRAY_RESERVE as u32).to_be_bytes();
         assert_eq!(
-            Reader::new(&full).array(usize::MAX, |r| r.opaque_fixed(0)).map(|v| v.len()),
+            Reader::new(&full)
+                .array(usize::MAX, |r| r.opaque_fixed(0))
+                .map(|v| v.len()),
             Ok(MAX_ARRAY_RESERVE)
         );
         // Past that, a count still needs 4 bytes an item.
         let over = (MAX_ARRAY_RESERVE as u32 + 1).to_be_bytes();
-        assert_eq!(Reader::new(&over).array(usize::MAX, |r| r.opaque_fixed(0)), Err(XdrError::Short));
+        assert_eq!(
+            Reader::new(&over).array(usize::MAX, |r| r.opaque_fixed(0)),
+            Err(XdrError::Short)
+        );
         // Items that need bytes still end early.
-        assert_eq!(Reader::new(&[0, 0, 0, 2, 0, 0, 0, 1]).array(9, Reader::uint), Err(XdrError::Short));
+        assert_eq!(
+            Reader::new(&[0, 0, 0, 2, 0, 0, 0, 1]).array(9, Reader::uint),
+            Err(XdrError::Short)
+        );
     }
 
     #[test]
@@ -2039,7 +2435,12 @@ mod tests {
             }
         }
         assert!(!silent_on_failure(&call(5, procedure::CALLIT)));
-        assert!(!silent_on_failure(&Call::new(100_003, 3, procedure::CALLIT, vec![])));
+        assert!(!silent_on_failure(&Call::new(
+            100_003,
+            3,
+            procedure::CALLIT,
+            vec![]
+        )));
     }
 
     #[test]
@@ -2059,19 +2460,37 @@ mod tests {
             0, 1, 0x86, 0xa3, 0, 0, 0, 3, 0, 0, 0, 17, 0, 0, 0, 0,
         ];
         assert_eq!(bytes, expect);
-        let Body::Call(call) = Message::parse(&bytes).unwrap().body else { panic!() };
+        let Body::Call(call) = Message::parse(&bytes).unwrap().body else {
+            panic!()
+        };
         assert_eq!(Request::from_call(&call).unwrap().call(1).unwrap(), m);
         assert_eq!(
-            PmapResult::parse(procedure::GETPORT, &PmapResult::Port(2049).to_bytes().unwrap()),
+            PmapResult::parse(
+                procedure::GETPORT,
+                &PmapResult::Port(2049).to_bytes().unwrap()
+            ),
             Ok(PmapResult::Port(2049))
         );
-        assert_eq!(PmapResult::parse(procedure::GETPORT, &[0, 0, 8]), Err(ParseError::Xdr(XdrError::Short)));
+        assert_eq!(
+            PmapResult::parse(procedure::GETPORT, &[0, 0, 8]),
+            Err(ParseError::Xdr(XdrError::Short))
+        );
     }
 
     #[test]
     fn portmap_requests_and_errors() {
-        let map = Mapping { program: 100_005, version: 1, protocol: IPPROTO_TCP, port: 635 };
-        for req in [PmapRequest::Null, PmapRequest::Set(map), PmapRequest::Unset(map), PmapRequest::Dump] {
+        let map = Mapping {
+            program: 100_005,
+            version: 1,
+            protocol: IPPROTO_TCP,
+            port: 635,
+        };
+        for req in [
+            PmapRequest::Null,
+            PmapRequest::Set(map),
+            PmapRequest::Unset(map),
+            PmapRequest::Dump,
+        ] {
             let req = Request::Pmap(req);
             let call = req.to_call().unwrap();
             assert_eq!(Request::from_call(&call), Ok(req));
@@ -2087,18 +2506,37 @@ mod tests {
         assert_eq!(Request::from_call(&call), Err(ParseError::Procedure(6)));
         call.procedure = procedure::SET;
         call.args.pop();
-        assert_eq!(Request::from_call(&call), Err(ParseError::Xdr(XdrError::Short)));
+        assert_eq!(
+            Request::from_call(&call),
+            Err(ParseError::Xdr(XdrError::Short))
+        );
         call.procedure = procedure::NULL;
-        assert_eq!(Request::from_call(&call), Err(ParseError::Xdr(XdrError::Trailing(call.args.len()))));
+        assert_eq!(
+            Request::from_call(&call),
+            Err(ParseError::Xdr(XdrError::Trailing(call.args.len())))
+        );
         assert_eq!(
             PmapResult::parse(procedure::SET, &PmapResult::Bool(true).to_bytes().unwrap()),
             Ok(PmapResult::Bool(true))
         );
-        assert_eq!(PmapResult::parse(procedure::SET, &[0, 0, 0, 3]), Err(ParseError::Xdr(XdrError::Bool(3))));
+        assert_eq!(
+            PmapResult::parse(procedure::SET, &[0, 0, 0, 3]),
+            Err(ParseError::Xdr(XdrError::Bool(3)))
+        );
         let maps = PmapResult::Dump(vec![map; 3]);
-        assert_eq!(PmapResult::parse(procedure::DUMP, &maps.to_bytes().unwrap()), Ok(maps));
-        assert_eq!(PmapResult::parse(procedure::DUMP, &[0, 0, 0, 0]), Ok(PmapResult::Dump(vec![])));
-        assert!(PmapResult::Dump(vec![map; portmap::MAX_LIST + 5]).to_bytes().is_err());
+        assert_eq!(
+            PmapResult::parse(procedure::DUMP, &maps.to_bytes().unwrap()),
+            Ok(maps)
+        );
+        assert_eq!(
+            PmapResult::parse(procedure::DUMP, &[0, 0, 0, 0]),
+            Ok(PmapResult::Dump(vec![]))
+        );
+        assert!(
+            PmapResult::Dump(vec![map; portmap::MAX_LIST + 5])
+                .to_bytes()
+                .is_err()
+        );
         let mut over = Writer::new();
         for _ in 0..=portmap::MAX_LIST {
             over.bool(true);
@@ -2124,7 +2562,10 @@ mod tests {
             addr: String::new(),
             owner: "superuser".into(),
         };
-        let request = Request::Rpcb { version: 4, request: RpcbRequest::GetAddr(b.clone()) };
+        let request = Request::Rpcb {
+            version: 4,
+            request: RpcbRequest::GetAddr(b.clone()),
+        };
         let call = request.to_call().unwrap();
         #[rustfmt::skip]
         assert_eq!(call.args, [
@@ -2132,8 +2573,15 @@ mod tests {
             0, 0, 0, 9, b's', b'u', b'p', b'e', b'r', b'u', b's', b'e', b'r', 0, 0, 0,
         ]);
         assert_eq!(Request::from_call(&call), Ok(request));
-        for request in [RpcbRequest::Null, RpcbRequest::Set(b.clone()), RpcbRequest::Unset(b.clone())] {
-            let req = Request::Rpcb { version: 3, request };
+        for request in [
+            RpcbRequest::Null,
+            RpcbRequest::Set(b.clone()),
+            RpcbRequest::Unset(b.clone()),
+        ] {
+            let req = Request::Rpcb {
+                version: 3,
+                request,
+            };
             assert_eq!(Request::from_call(&req.to_call().unwrap()), Ok(req));
         }
         let mut c = call;
@@ -2144,37 +2592,70 @@ mod tests {
         assert_eq!(Request::from_call(&c), Err(ParseError::Procedure(9)));
         c.procedure = 3;
         c.args.truncate(10);
-        assert_eq!(Request::from_call(&c), Err(ParseError::Xdr(XdrError::Short)));
+        assert_eq!(
+            Request::from_call(&c),
+            Err(ParseError::Xdr(XdrError::Short))
+        );
         c.program = 7;
         assert_eq!(Request::from_call(&c), Err(ParseError::Program(7)));
         let addr: SocketAddr = "10.0.0.5:2049".parse().unwrap();
         let u = portmap::format_uaddr(addr);
         assert_eq!(u, "10.0.0.5.8.1");
         let result = RpcbResult::Addr(u.clone());
-        assert_eq!(RpcbResult::parse(procedure::GETADDR, &result.to_bytes().unwrap()), Ok(result));
+        assert_eq!(
+            RpcbResult::parse(procedure::GETADDR, &result.to_bytes().unwrap()),
+            Ok(result)
+        );
         assert_eq!(portmap::parse_uaddr(&u), Some(addr));
         let v6: SocketAddr = "[fe80::1]:111".parse().unwrap();
         assert_eq!(portmap::format_uaddr(v6), "fe80::1.0.111");
         assert_eq!(portmap::parse_uaddr("fe80::1.0.111"), Some(v6));
-        for bad in ["", "10.0.0.5", "10.0.0.5.256.1", "10.0.0.5.+8.1", "x.1.2", "10.0.0.5.8."] {
+        for bad in [
+            "",
+            "10.0.0.5",
+            "10.0.0.5.256.1",
+            "10.0.0.5.+8.1",
+            "x.1.2",
+            "10.0.0.5.8.",
+        ] {
             assert_eq!(portmap::parse_uaddr(bad), None, "{bad}");
         }
     }
 
     #[test]
     fn writers_refuse_excess_fields() {
-        let sys = AuthSys { stamp: 0, machine_name: "é".repeat(200), uid: 0, gid: 0, gids: vec![1; 40] };
+        let sys = AuthSys {
+            stamp: 0,
+            machine_name: "é".repeat(200),
+            uid: 0,
+            gid: 0,
+            gids: vec![1; 40],
+        };
         assert!(sys.to_bytes().is_err());
-        let call = Call { cred: Auth::Sys(sys), ..Call::new(1, 1, 1, vec![]) };
-        let message = Message { xid: 0, body: Body::Call(call) };
+        let call = Call {
+            cred: Auth::Sys(sys),
+            ..Call::new(1, 1, 1, vec![])
+        };
+        let message = Message {
+            xid: 0,
+            body: Body::Call(call),
+        };
         assert!(message.to_bytes().is_err());
         contract::check_wire_value(&message);
-        let other = Auth::Other { flavor: 9, body: vec![1; 1000] };
+        let other = Auth::Other {
+            flavor: 9,
+            body: vec![1; 1000],
+        };
         let mut writer = Writer::new();
         other.write(&mut writer);
         assert!(writer.finish().is_err());
-        let long =
-            Rpcb { program: 1, version: 1, netid: "n".repeat(999), addr: "a".into(), owner: "o".into() };
+        let long = Rpcb {
+            program: 1,
+            version: 1,
+            netid: "n".repeat(999),
+            addr: "a".into(),
+            owner: "o".into(),
+        };
         assert!(RpcbRequest::Set(long).to_args().is_err());
         assert!(RpcbResult::Addr("z".repeat(999)).to_bytes().is_err());
         let mut writer = Writer::new();
@@ -2185,7 +2666,10 @@ mod tests {
         assert_eq!(writer.as_bytes().len(), MAX_RECORD);
         writer.uint(1).uhyper(2);
         assert_eq!(writer.as_bytes().len(), MAX_RECORD);
-        assert_eq!(writer.finish(), Err(XdrError::TooLong((MAX_RECORD + 4) as u32)));
+        assert_eq!(
+            writer.finish(),
+            Err(XdrError::TooLong((MAX_RECORD + 4) as u32))
+        );
     }
 
     fn random_auth(rng: &mut Lcg) -> Auth {
@@ -2211,7 +2695,11 @@ mod tests {
         let words = |rng: &mut Lcg| -> Vec<u8> {
             let mut w = Writer::new();
             for _ in 0..rng.below(6) {
-                w.uint(if !rng.coin() { rng.below(4) as u32 } else { rng.next() as u32 });
+                w.uint(if !rng.coin() {
+                    rng.below(4) as u32
+                } else {
+                    rng.next() as u32
+                });
             }
             w.finish().unwrap()
         };
@@ -2254,20 +2742,32 @@ mod tests {
                 let status = match rng.below(6) {
                     0 => Accept::Success(words(rng)),
                     1 => Accept::ProgUnavail,
-                    2 => Accept::ProgMismatch { low: (rng.below(4) as u32), high: (rng.below(4) as u32) },
+                    2 => Accept::ProgMismatch {
+                        low: (rng.below(4) as u32),
+                        high: (rng.below(4) as u32),
+                    },
                     3 => Accept::ProcUnavail,
                     4 => Accept::GarbageArgs,
                     _ => Accept::SystemErr,
                 };
-                Body::Reply(Reply::Accepted { verf: random_auth(rng), status })
+                Body::Reply(Reply::Accepted {
+                    verf: random_auth(rng),
+                    status,
+                })
             }
             _ => Body::Reply(Reply::Denied(if !rng.coin() {
-                Reject::RpcMismatch { low: (rng.below(4) as u32), high: (rng.below(4) as u32) }
+                Reject::RpcMismatch {
+                    low: (rng.below(4) as u32),
+                    high: (rng.below(4) as u32),
+                }
             } else {
                 Reject::AuthError(AuthStat::from_code(rng.below(20) as u32))
             })),
         };
-        Message { xid: (rng.next() as u32), body }
+        Message {
+            xid: (rng.next() as u32),
+            body,
+        }
     }
 
     /// The bytes of a random message, often changed: a byte flipped, cut

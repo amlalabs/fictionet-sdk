@@ -228,7 +228,11 @@ impl Frame {
         if b.len() < end {
             return Ok(None);
         }
-        let frame = Frame { transaction: be16(b, 0), unit: b[6], pdu: b[HEADER_LEN..end].to_vec() };
+        let frame = Frame {
+            transaction: be16(b, 0),
+            unit: b[6],
+            pdu: b[HEADER_LEN..end].to_vec(),
+        };
         Ok(Some((frame, end)))
     }
 
@@ -241,7 +245,11 @@ impl Frame {
     /// A frame that answers this one with `pdu`, with the same transaction
     /// and unit.
     pub fn reply(&self, pdu: Vec<u8>) -> Frame {
-        Frame { transaction: self.transaction, unit: self.unit, pdu }
+        Frame {
+            transaction: self.transaction,
+            unit: self.unit,
+            pdu,
+        }
     }
 }
 
@@ -458,7 +466,11 @@ impl Request {
             return Err(Exception::IllegalDataValue);
         }
         let fixed = |n: usize| {
-            if data.len() == n { Ok(()) } else { Err(Exception::IllegalDataValue) }
+            if data.len() == n {
+                Ok(())
+            } else {
+                Err(Exception::IllegalDataValue)
+            }
         };
         let read = |max: u16| -> Result<(u16, u16), Exception> {
             fixed(4)?;
@@ -493,24 +505,38 @@ impl Request {
                     0x0000 => false,
                     _ => return Err(Exception::IllegalDataValue),
                 };
-                Request::WriteSingleCoil { address: be16(data, 0), value }
+                Request::WriteSingleCoil {
+                    address: be16(data, 0),
+                    value,
+                }
             }
             function::WRITE_SINGLE_REGISTER => {
                 fixed(4)?;
-                Request::WriteSingleRegister { address: be16(data, 0), value: be16(data, 2) }
+                Request::WriteSingleRegister {
+                    address: be16(data, 0),
+                    value: be16(data, 2),
+                }
             }
             function::WRITE_MULTIPLE_COILS => {
                 let (address, quantity, bytes) =
                     multiple(data, MAX_WRITE_BITS, |q| usize::from(q).div_ceil(8))?;
-                let values = (0..usize::from(quantity)).map(|i| bytes[i / 8] >> (i % 8) & 1 == 1).collect();
+                let values = (0..usize::from(quantity))
+                    .map(|i| bytes[i / 8] >> (i % 8) & 1 == 1)
+                    .collect();
                 Request::WriteMultipleCoils { address, values }
             }
             function::WRITE_MULTIPLE_REGISTERS => {
-                let (address, quantity, bytes) = multiple(data, MAX_WRITE_REGISTERS, |q| 2 * usize::from(q))?;
-                let values = (0..usize::from(quantity)).map(|i| be16(bytes, 2 * i)).collect();
+                let (address, quantity, bytes) =
+                    multiple(data, MAX_WRITE_REGISTERS, |q| 2 * usize::from(q))?;
+                let values = (0..usize::from(quantity))
+                    .map(|i| be16(bytes, 2 * i))
+                    .collect();
                 Request::WriteMultipleRegisters { address, values }
             }
-            _ => Request::Other { function, data: data.to_vec() },
+            _ => Request::Other {
+                function,
+                data: data.to_vec(),
+            },
         })
     }
 
@@ -538,7 +564,8 @@ impl Request {
     pub fn to_pdu(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = vec![self.function()];
         match self {
-            Request::ReadCoils { address, quantity } | Request::ReadDiscreteInputs { address, quantity } => {
+            Request::ReadCoils { address, quantity }
+            | Request::ReadDiscreteInputs { address, quantity } => {
                 check_quantity(*address, usize::from(*quantity), MAX_READ_BITS)?;
                 out.extend_from_slice(&address.to_be_bytes());
                 out.extend_from_slice(&quantity.to_be_bytes());
@@ -634,7 +661,10 @@ impl Response {
         let (&code, data) = pdu.split_first().ok_or(ResponseError)?;
         if code & function::EXCEPTION_FLAG != 0 {
             let [e] = data else { return Err(ResponseError) };
-            return Ok((code & !function::EXCEPTION_FLAG, Response::Exception(Exception::from_code(*e))));
+            return Ok((
+                code & !function::EXCEPTION_FLAG,
+                Response::Exception(Exception::from_code(*e)),
+            ));
         }
         // A read's byte count: 1 to 250, which is 2000 bits or 125
         // registers.
@@ -646,20 +676,33 @@ impl Response {
             Ok(rest)
         };
         let pair = || {
-            if data.len() == 4 { Ok((be16(data, 0), be16(data, 2))) } else { Err(ResponseError) }
+            if data.len() == 4 {
+                Ok((be16(data, 0), be16(data, 2)))
+            } else {
+                Err(ResponseError)
+            }
         };
         let response = match code {
             0 => return Err(ResponseError),
             function::READ_COILS | function::READ_DISCRETE_INPUTS => {
                 let bytes = counted()?;
-                Response::Bits((0..bytes.len() * 8).map(|i| bytes[i / 8] >> (i % 8) & 1 == 1).collect())
+                Response::Bits(
+                    (0..bytes.len() * 8)
+                        .map(|i| bytes[i / 8] >> (i % 8) & 1 == 1)
+                        .collect(),
+                )
             }
             function::READ_HOLDING_REGISTERS | function::READ_INPUT_REGISTERS => {
                 let bytes = counted()?;
                 if bytes.len() % 2 != 0 {
                     return Err(ResponseError);
                 }
-                Response::Registers(bytes.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect())
+                Response::Registers(
+                    bytes
+                        .chunks_exact(2)
+                        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                        .collect(),
+                )
             }
             function::WRITE_SINGLE_COIL => {
                 let (address, raw) = pair()?;
@@ -676,8 +719,11 @@ impl Response {
             }
             function::WRITE_MULTIPLE_COILS | function::WRITE_MULTIPLE_REGISTERS => {
                 let (address, quantity) = pair()?;
-                let max =
-                    if code == function::WRITE_MULTIPLE_COILS { MAX_WRITE_BITS } else { MAX_WRITE_REGISTERS };
+                let max = if code == function::WRITE_MULTIPLE_COILS {
+                    MAX_WRITE_BITS
+                } else {
+                    MAX_WRITE_REGISTERS
+                };
                 check_quantity(address, usize::from(quantity), max).map_err(|_| ResponseError)?;
                 Response::WriteMultiple { address, quantity }
             }
@@ -698,7 +744,10 @@ impl Response {
         let mut out = vec![function];
         match self {
             Response::Bits(bits) => {
-                if !matches!(function, function::READ_COILS | function::READ_DISCRETE_INPUTS) {
+                if !matches!(
+                    function,
+                    function::READ_COILS | function::READ_DISCRETE_INPUTS
+                ) {
                     return wrong;
                 }
                 if bits.is_empty() || bits.len() > usize::from(MAX_READ_BITS) {
@@ -709,7 +758,10 @@ impl Response {
                 out.extend_from_slice(&bytes);
             }
             Response::Registers(regs) => {
-                if !matches!(function, function::READ_HOLDING_REGISTERS | function::READ_INPUT_REGISTERS) {
+                if !matches!(
+                    function,
+                    function::READ_HOLDING_REGISTERS | function::READ_INPUT_REGISTERS
+                ) {
                     return wrong;
                 }
                 if regs.is_empty() || regs.len() > usize::from(MAX_READ_REGISTERS) {
@@ -796,7 +848,11 @@ fn check_other(function: u8) -> Result<(), EncodeError> {
 /// The address, quantity and value bytes of a write-multiple request,
 /// checked: the quantity is in range, the byte count is what the quantity
 /// needs, and the bytes are all there.
-fn multiple(data: &[u8], max: u16, need: impl Fn(u16) -> usize) -> Result<(u16, u16, &[u8]), Exception> {
+fn multiple(
+    data: &[u8],
+    max: u16,
+    need: impl Fn(u16) -> usize,
+) -> Result<(u16, u16, &[u8]), Exception> {
     if data.len() < 5 {
         return Err(Exception::IllegalDataValue);
     }
@@ -844,44 +900,93 @@ mod tests {
     #[test]
     fn read_coils_example() {
         let req = Request::parse(&[0x01, 0x00, 0x13, 0x00, 0x13]).unwrap();
-        assert_eq!(req, Request::ReadCoils { address: 0x13, quantity: 0x13 });
+        assert_eq!(
+            req,
+            Request::ReadCoils {
+                address: 0x13,
+                quantity: 0x13
+            }
+        );
         let (f, resp) = Response::parse(&[0x01, 0x03, 0xcd, 0x6b, 0x05]).unwrap();
         assert_eq!(f, 1);
         let Response::Bits(bits) = resp else { panic!() };
         // Coils 20..27 are 0xCD, low bit first: on, off, on, on, off, off, on, on.
-        assert_eq!(&bits[..8], &[true, false, true, true, false, false, true, true]);
+        assert_eq!(
+            &bits[..8],
+            &[true, false, true, true, false, false, true, true]
+        );
     }
 
     #[test]
     fn read_holding_registers_example() {
         let req = Request::parse(&[0x03, 0x00, 0x6b, 0x00, 0x03]).unwrap();
-        assert_eq!(req, Request::ReadHoldingRegisters { address: 0x6b, quantity: 3 });
-        let pdu = Response::Registers(vec![0x022b, 0x0000, 0x0064]).to_pdu(3).unwrap();
+        assert_eq!(
+            req,
+            Request::ReadHoldingRegisters {
+                address: 0x6b,
+                quantity: 3
+            }
+        );
+        let pdu = Response::Registers(vec![0x022b, 0x0000, 0x0064])
+            .to_pdu(3)
+            .unwrap();
         assert_eq!(pdu, [0x03, 0x06, 0x02, 0x2b, 0x00, 0x00, 0x00, 0x64]);
-        assert_eq!(Response::parse(&pdu).unwrap(), (3, Response::Registers(vec![0x022b, 0, 0x64])));
+        assert_eq!(
+            Response::parse(&pdu).unwrap(),
+            (3, Response::Registers(vec![0x022b, 0, 0x64]))
+        );
     }
 
     #[test]
     fn write_single_coil_example() {
         let pdu = [0x05, 0x00, 0xac, 0xff, 0x00];
-        assert_eq!(Request::parse(&pdu).unwrap(), Request::WriteSingleCoil { address: 0xac, value: true });
+        assert_eq!(
+            Request::parse(&pdu).unwrap(),
+            Request::WriteSingleCoil {
+                address: 0xac,
+                value: true
+            }
+        );
         // The response echoes the request.
-        assert_eq!(Response::WriteSingleCoil { address: 0xac, value: true }.to_pdu(5).unwrap(), pdu);
+        assert_eq!(
+            Response::WriteSingleCoil {
+                address: 0xac,
+                value: true
+            }
+            .to_pdu(5)
+            .unwrap(),
+            pdu
+        );
         // Any value but 0xFF00 or 0x0000 is refused.
-        assert_eq!(Request::parse(&[0x05, 0x00, 0xac, 0x12, 0x34]), Err(Exception::IllegalDataValue));
+        assert_eq!(
+            Request::parse(&[0x05, 0x00, 0xac, 0x12, 0x34]),
+            Err(Exception::IllegalDataValue)
+        );
     }
 
     #[test]
     fn write_multiple_coils_example() {
         let pdu = [0x0f, 0x00, 0x13, 0x00, 0x0a, 0x02, 0xcd, 0x01];
         let req = Request::parse(&pdu).unwrap();
-        let Request::WriteMultipleCoils { address, values } = &req else { panic!() };
+        let Request::WriteMultipleCoils { address, values } = &req else {
+            panic!()
+        };
         assert_eq!(*address, 0x13);
         assert_eq!(values.len(), 10);
-        assert_eq!(&values[..], &[true, false, true, true, false, false, true, true, true, false]);
+        assert_eq!(
+            &values[..],
+            &[
+                true, false, true, true, false, false, true, true, true, false
+            ]
+        );
         assert_eq!(req.to_pdu().unwrap(), pdu);
         assert_eq!(
-            Response::WriteMultiple { address: 0x13, quantity: 10 }.to_pdu(0x0f).unwrap(),
+            Response::WriteMultiple {
+                address: 0x13,
+                quantity: 10
+            }
+            .to_pdu(0x0f)
+            .unwrap(),
             [0x0f, 0, 0x13, 0, 0x0a]
         );
     }
@@ -890,33 +995,72 @@ mod tests {
     fn write_multiple_registers_example() {
         let pdu = [0x10, 0x00, 0x01, 0x00, 0x02, 0x04, 0x00, 0x0a, 0x01, 0x02];
         let req = Request::parse(&pdu).unwrap();
-        assert_eq!(req, Request::WriteMultipleRegisters { address: 1, values: vec![0x000a, 0x0102] });
+        assert_eq!(
+            req,
+            Request::WriteMultipleRegisters {
+                address: 1,
+                values: vec![0x000a, 0x0102]
+            }
+        );
         assert_eq!(req.to_pdu().unwrap(), pdu);
     }
 
     #[test]
     fn bad_requests_get_the_right_exception() {
         assert_eq!(Request::parse(&[]), Err(Exception::IllegalFunction));
-        assert_eq!(Request::parse(&[0x83, 0, 0, 0, 1]), Err(Exception::IllegalFunction));
+        assert_eq!(
+            Request::parse(&[0x83, 0, 0, 0, 1]),
+            Err(Exception::IllegalFunction)
+        );
         // Quantity 0 and quantity over the limit.
-        assert_eq!(Request::parse(&[0x03, 0, 0, 0, 0]), Err(Exception::IllegalDataValue));
-        assert_eq!(Request::parse(&[0x03, 0, 0, 0, 126]), Err(Exception::IllegalDataValue));
-        assert_eq!(Request::parse(&[0x01, 0, 0, 0x07, 0xd1]), Err(Exception::IllegalDataValue));
+        assert_eq!(
+            Request::parse(&[0x03, 0, 0, 0, 0]),
+            Err(Exception::IllegalDataValue)
+        );
+        assert_eq!(
+            Request::parse(&[0x03, 0, 0, 0, 126]),
+            Err(Exception::IllegalDataValue)
+        );
+        assert_eq!(
+            Request::parse(&[0x01, 0, 0, 0x07, 0xd1]),
+            Err(Exception::IllegalDataValue)
+        );
         // A range past address 65535.
-        assert_eq!(Request::parse(&[0x03, 0xff, 0xff, 0, 2]), Err(Exception::IllegalDataAddress));
+        assert_eq!(
+            Request::parse(&[0x03, 0xff, 0xff, 0, 2]),
+            Err(Exception::IllegalDataAddress)
+        );
         assert!(Request::parse(&[0x03, 0xff, 0xff, 0, 1]).is_ok());
         // Wrong lengths.
-        assert_eq!(Request::parse(&[0x03, 0, 0, 0]), Err(Exception::IllegalDataValue));
-        assert_eq!(Request::parse(&[0x06, 0, 0, 0, 0, 0]), Err(Exception::IllegalDataValue));
+        assert_eq!(
+            Request::parse(&[0x03, 0, 0, 0]),
+            Err(Exception::IllegalDataValue)
+        );
+        assert_eq!(
+            Request::parse(&[0x06, 0, 0, 0, 0, 0]),
+            Err(Exception::IllegalDataValue)
+        );
         // A byte count that does not match the quantity.
-        assert_eq!(Request::parse(&[0x10, 0, 1, 0, 2, 3, 0, 0, 0]), Err(Exception::IllegalDataValue));
-        assert_eq!(Request::parse(&[0x0f, 0, 0, 0, 9, 1, 0xff]), Err(Exception::IllegalDataValue));
+        assert_eq!(
+            Request::parse(&[0x10, 0, 1, 0, 2, 3, 0, 0, 0]),
+            Err(Exception::IllegalDataValue)
+        );
+        assert_eq!(
+            Request::parse(&[0x0f, 0, 0, 0, 9, 1, 0xff]),
+            Err(Exception::IllegalDataValue)
+        );
         // Missing bytes after a correct count.
-        assert_eq!(Request::parse(&[0x10, 0, 1, 0, 2, 4, 0, 0, 0]), Err(Exception::IllegalDataValue));
+        assert_eq!(
+            Request::parse(&[0x10, 0, 1, 0, 2, 4, 0, 0, 0]),
+            Err(Exception::IllegalDataValue)
+        );
         // Functions this module does not read stay as they are.
         assert_eq!(
             Request::parse(&[0x2b, 0x0e, 1, 0]),
-            Ok(Request::Other { function: 0x2b, data: vec![0x0e, 1, 0] })
+            Ok(Request::Other {
+                function: 0x2b,
+                data: vec![0x0e, 1, 0]
+            })
         );
     }
 
@@ -935,10 +1079,19 @@ mod tests {
 
     #[test]
     fn frames() {
-        let bytes = [0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x11, 0x03, 0x00, 0x6b, 0x00, 0x03, 0xaa];
+        let bytes = [
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x06, 0x11, 0x03, 0x00, 0x6b, 0x00, 0x03, 0xaa,
+        ];
         let (frame, used) = Frame::parse(&bytes).unwrap().unwrap();
         assert_eq!(used, 12);
-        assert_eq!(frame, Frame { transaction: 1, unit: 0x11, pdu: vec![0x03, 0x00, 0x6b, 0x00, 0x03] });
+        assert_eq!(
+            frame,
+            Frame {
+                transaction: 1,
+                unit: 0x11,
+                pdu: vec![0x03, 0x00, 0x6b, 0x00, 0x03]
+            }
+        );
         assert_eq!(frame.to_bytes().unwrap(), bytes[..12]);
         // Part of a frame.
         for n in 0..12 {
@@ -947,43 +1100,72 @@ mod tests {
         // Not Modbus, known from the first four bytes.
         assert_eq!(Frame::parse(&[0, 1, 0, 5]), Err(FrameError::Protocol(5)));
         // Lengths out of range.
-        assert_eq!(Frame::parse(&[0, 1, 0, 0, 0, 1, 1]), Err(FrameError::Length(1)));
-        assert_eq!(Frame::parse(&[0, 1, 0, 0, 0, 255, 1]), Err(FrameError::Length(255)));
+        assert_eq!(
+            Frame::parse(&[0, 1, 0, 0, 0, 1, 1]),
+            Err(FrameError::Length(1))
+        );
+        assert_eq!(
+            Frame::parse(&[0, 1, 0, 0, 0, 255, 1]),
+            Err(FrameError::Length(255))
+        );
         assert!(matches!(Frame::parse(&[0, 1, 0, 0, 0, 254, 1]), Ok(None)));
     }
 
     #[test]
     fn wire_requires_exactly_one_frame() {
         for length in [1, MAX_PDU] {
-            let frame = Frame { transaction: u16::MAX, unit: u8::MAX, pdu: vec![0x41; length] };
+            let frame = Frame {
+                transaction: u16::MAX,
+                unit: u8::MAX,
+                pdu: vec![0x41; length],
+            };
             let bytes = frame.to_bytes().unwrap();
             assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame.clone()));
             contract::check_wire::<Frame>(&bytes);
             for cut in 0..bytes.len() {
                 let prefix = bytes.get(..cut).unwrap();
-                assert_eq!(<Frame as Wire>::parse(prefix), Err(FrameParseError::Truncated));
+                assert_eq!(
+                    <Frame as Wire>::parse(prefix),
+                    Err(FrameParseError::Truncated)
+                );
                 assert_eq!(Frame::parse(prefix), Ok(None));
             }
             for suffix in [&[0][..], bytes.as_slice()] {
                 let mut trailing = bytes.clone();
                 trailing.extend_from_slice(suffix);
-                assert_eq!(<Frame as Wire>::parse(&trailing), Err(FrameParseError::Trailing));
-                assert_eq!(Frame::parse(&trailing), Ok(Some((frame.clone(), bytes.len()))));
+                assert_eq!(
+                    <Frame as Wire>::parse(&trailing),
+                    Err(FrameParseError::Trailing)
+                );
+                assert_eq!(
+                    Frame::parse(&trailing),
+                    Ok(Some((frame.clone(), bytes.len())))
+                );
             }
         }
         for (bytes, error) in [
             (&[0, 1, 0, 5][..], FrameError::Protocol(5)),
             (&[0, 1, 0, 0, 0, 1, 1][..], FrameError::Length(1)),
-            (&[0, 1, 0, 0, 0xff, 0xff, 1][..], FrameError::Length(u16::MAX)),
+            (
+                &[0, 1, 0, 0, 0xff, 0xff, 1][..],
+                FrameError::Length(u16::MAX),
+            ),
         ] {
-            assert_eq!(<Frame as Wire>::parse(bytes), Err(FrameParseError::Frame(error)));
+            assert_eq!(
+                <Frame as Wire>::parse(bytes),
+                Err(FrameParseError::Frame(error))
+            );
         }
     }
 
     #[test]
     fn wire_appends_or_leaves_the_destination_unchanged() {
         for length in [0, 1, MAX_PDU, MAX_PDU + 1] {
-            let frame = Frame { transaction: 7, unit: 1, pdu: vec![0x41; length] };
+            let frame = Frame {
+                transaction: 7,
+                unit: 1,
+                pdu: vec![0x41; length],
+            };
             contract::check_wire_value(&frame);
             let prefix = [0x12, 0x34];
             let mut out = prefix.to_vec();
@@ -1009,9 +1191,21 @@ mod tests {
     #[test]
     fn codec_frames_bound_input_and_preserve_ranges() {
         let frames = [
-            Frame { transaction: 1, unit: 1, pdu: vec![0x41; MAX_PDU] },
-            Frame { transaction: 2, unit: 1, pdu: vec![0x41] },
-            Frame { transaction: 3, unit: 1, pdu: vec![0x42; MAX_PDU] },
+            Frame {
+                transaction: 1,
+                unit: 1,
+                pdu: vec![0x41; MAX_PDU],
+            },
+            Frame {
+                transaction: 2,
+                unit: 1,
+                pdu: vec![0x41],
+            },
+            Frame {
+                transaction: 3,
+                unit: 1,
+                pdu: vec![0x42; MAX_PDU],
+            },
         ];
         let mut bytes = Vec::new();
         for frame in &frames {
@@ -1058,7 +1252,11 @@ mod tests {
 
     #[test]
     fn codec_frames_report_truncation_and_framing_errors_once() {
-        let frame = Frame { transaction: 1, unit: 1, pdu: vec![0x41; MAX_PDU] };
+        let frame = Frame {
+            transaction: 1,
+            unit: 1,
+            pdu: vec![0x41; MAX_PDU],
+        };
         let bytes = frame.to_bytes().unwrap();
         // Include every prefix of a maximum frame, beyond the harness's 256-byte cutoff.
         for cut in 0..bytes.len() {
@@ -1074,7 +1272,10 @@ mod tests {
             assert_eq!(stream.failed(), failure.as_ref());
             assert!(stream.is_done());
         }
-        assert_eq!(Frames.decode(&bytes, true), Ok(Step::Item(frame, bytes.len())));
+        assert_eq!(
+            Frames.decode(&bytes, true),
+            Ok(Step::Item(frame, bytes.len()))
+        );
         for (bad, error) in [
             (&[0, 1, 0, 5][..], FrameError::Protocol(5)),
             (&[0, 1, 0, 0, 0, 0, 1][..], FrameError::Length(0)),
@@ -1099,21 +1300,77 @@ mod tests {
         const MAX_TEST_FRAMES: usize = 5;
         const MAX_TEST_BYTES: usize = MAX_TEST_FRAMES * MAX_FRAME;
         let requests = [
-            (7, Request::WriteSingleRegister { address: 2, value: 1234 }.to_pdu().unwrap()),
-            (8, Request::ReadHoldingRegisters { address: 2, quantity: 1 }.to_pdu().unwrap()),
+            (
+                7,
+                Request::WriteSingleRegister {
+                    address: 2,
+                    value: 1234,
+                }
+                .to_pdu()
+                .unwrap(),
+            ),
+            (
+                8,
+                Request::ReadHoldingRegisters {
+                    address: 2,
+                    quantity: 1,
+                }
+                .to_pdu()
+                .unwrap(),
+            ),
             (9, vec![3, 0, 2, 0, 0]), // Zero quantity gets a wire exception.
-            (10, Request::ReadHoldingRegisters { address: 10, quantity: 1 }.to_pdu().unwrap()),
-            (11, Request::ReadHoldingRegisters { address: 2, quantity: 1 }.to_pdu().unwrap()),
+            (
+                10,
+                Request::ReadHoldingRegisters {
+                    address: 10,
+                    quantity: 1,
+                }
+                .to_pdu()
+                .unwrap(),
+            ),
+            (
+                11,
+                Request::ReadHoldingRegisters {
+                    address: 2,
+                    quantity: 1,
+                }
+                .to_pdu()
+                .unwrap(),
+            ),
         ];
         let mut input = Vec::new();
         for (transaction, pdu) in requests {
-            Frame { transaction, unit: 17, pdu }.write(&mut input).unwrap();
+            Frame {
+                transaction,
+                unit: 17,
+                pdu,
+            }
+            .write(&mut input)
+            .unwrap();
         }
         let expected = [
-            (7, 17, Ok((6, Response::WriteSingleRegister { address: 2, value: 1234 }))),
+            (
+                7,
+                17,
+                Ok((
+                    6,
+                    Response::WriteSingleRegister {
+                        address: 2,
+                        value: 1234,
+                    },
+                )),
+            ),
             (8, 17, Ok((3, Response::Registers(vec![1234])))),
-            (9, 17, Ok((3, Response::Exception(Exception::IllegalDataValue)))),
-            (10, 17, Ok((3, Response::Exception(Exception::IllegalDataAddress)))),
+            (
+                9,
+                17,
+                Ok((3, Response::Exception(Exception::IllegalDataValue))),
+            ),
+            (
+                10,
+                17,
+                Ok((3, Response::Exception(Exception::IllegalDataAddress))),
+            ),
             (11, 17, Ok((3, Response::Registers(vec![1234])))),
         ];
         let make_requests = || {
@@ -1161,8 +1418,9 @@ mod tests {
             }
             finish(&mut server, |_| panic!("unexpected request at EOF")).unwrap();
             assert_eq!(registers.get(2), Some(&1234));
-            let mut client =
-                Stream::new(Frames.map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))));
+            let mut client = Stream::new(
+                Frames.map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))),
+            );
             let mut got = Vec::new();
             for chunk in test_support::chunks(&output, sizes) {
                 assert_eq!(
@@ -1183,9 +1441,21 @@ mod tests {
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let a = Frame { transaction: 1, unit: 1, pdu: vec![3, 0, 0, 0, 1] }.to_bytes().unwrap();
-        let b = Frame { transaction: 2, unit: 1, pdu: vec![6, 0, 1, 0, 9] }.to_bytes().unwrap();
+    fn stream_splits_a_stream() {
+        let a = Frame {
+            transaction: 1,
+            unit: 1,
+            pdu: vec![3, 0, 0, 0, 1],
+        }
+        .to_bytes()
+        .unwrap();
+        let b = Frame {
+            transaction: 2,
+            unit: 1,
+            pdu: vec![6, 0, 1, 0, 9],
+        }
+        .to_bytes()
+        .unwrap();
         let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
         let mut d = Stream::new(Frames);
         // One byte at a time.
@@ -1208,9 +1478,20 @@ mod tests {
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        let one = Frame { transaction: 1, unit: 1, pdu: vec![3, 0, 0, 0, 1] }.to_bytes().unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
+    fn stream_takes_many_small_frames_in_linear_time() {
+        let one = Frame {
+            transaction: 1,
+            unit: 1,
+            pdu: vec![3, 0, 0, 0, 1],
+        }
+        .to_bytes()
+        .unwrap();
+        let stream: Vec<u8> = one
+            .iter()
+            .copied()
+            .cycle()
+            .take(one.len() * 200_000)
+            .collect();
         let started = std::time::Instant::now();
         let mut d = Stream::new(Frames);
         let mut rest = &stream[..];
@@ -1224,18 +1505,15 @@ mod tests {
         }
         assert_eq!(n, 200_000);
         assert_eq!(d.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
-    }
-
-    fn split(data: &[u8]) -> Vec<Frame> {
-        contract::check_decode_with_alloc_limit(|| Frames, data, 2 * MAX_FRAME);
-        let (frames, failure) = test_support::decode_all(|| Frames, data);
-        assert_eq!(failure, None);
-        frames
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
-    fn review_decoder_holds_at_most_max_buffered() {
+    fn stream_is_bounded() {
         // 64 KiB of zeros in one push: the decoder takes only what it may
         // hold, and the header it sees is already broken.
         let mut d = Stream::new(Frames);
@@ -1251,9 +1529,20 @@ mod tests {
         for t in 0..50u16 {
             let mut pdu = vec![0x41];
             pdu.resize(MAX_PDU, t as u8);
-            stream.extend(Frame { transaction: t, unit: 1, pdu }.to_bytes().unwrap());
+            stream.extend(
+                Frame {
+                    transaction: t,
+                    unit: 1,
+                    pdu,
+                }
+                .to_bytes()
+                .unwrap(),
+            );
         }
-        assert_eq!(split(&stream).len(), 50);
+        contract::check_decode_with_alloc_limit(|| Frames, &stream, 2 * MAX_FRAME);
+        let (frames, failure) = test_support::decode_all(|| Frames, &stream);
+        assert_eq!(failure, None);
+        assert_eq!(frames.len(), 50);
         // A decoder that is full gives room back once frames are taken out.
         let mut d = Stream::new(Frames);
         assert_eq!(d.push(&stream), MAX_FRAME);
@@ -1275,26 +1564,56 @@ mod tests {
 
     #[test]
     fn review_writers_refuse_rather_than_truncate() {
-        let req = Request::WriteMultipleRegisters { address: 0, values: vec![1; 124] };
+        let req = Request::WriteMultipleRegisters {
+            address: 0,
+            values: vec![1; 124],
+        };
         assert_eq!(req.to_pdu(), Err(EncodeError::Quantity));
-        let req = Request::WriteMultipleCoils { address: 0, values: vec![true; 1969] };
+        let req = Request::WriteMultipleCoils {
+            address: 0,
+            values: vec![true; 1969],
+        };
         assert_eq!(req.to_pdu(), Err(EncodeError::Quantity));
-        assert_eq!(Response::Registers(vec![7; 126]).to_pdu(3), Err(EncodeError::Quantity));
         assert_eq!(
-            Request::Other { function: 0x41, data: vec![0; MAX_PDU] }.to_pdu(),
+            Response::Registers(vec![7; 126]).to_pdu(3),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Request::Other {
+                function: 0x41,
+                data: vec![0; MAX_PDU]
+            }
+            .to_pdu(),
             Err(EncodeError::TooLong)
         );
-        assert_eq!(Response::Other(vec![0; MAX_PDU]).to_pdu(0x41), Err(EncodeError::TooLong));
-        let frame = Frame { transaction: 0, unit: 0, pdu: vec![0; 1000] };
+        assert_eq!(
+            Response::Other(vec![0; MAX_PDU]).to_pdu(0x41),
+            Err(EncodeError::TooLong)
+        );
+        let frame = Frame {
+            transaction: 0,
+            unit: 0,
+            pdu: vec![0; 1000],
+        };
         assert_eq!(frame.to_bytes(), Err(EncodeError::TooLong));
         // The longest of each still fits and reads back whole.
-        let req = Request::WriteMultipleRegisters { address: 0, values: vec![1; 123] };
+        let req = Request::WriteMultipleRegisters {
+            address: 0,
+            values: vec![1; 123],
+        };
         assert_eq!(Request::parse(&req.to_pdu().unwrap()), Ok(req));
-        let req = Request::WriteMultipleCoils { address: 0, values: vec![true; 1968] };
+        let req = Request::WriteMultipleCoils {
+            address: 0,
+            values: vec![true; 1968],
+        };
         assert_eq!(Request::parse(&req.to_pdu().unwrap()), Ok(req));
         let resp = Response::Registers(vec![7; 125]);
         assert_eq!(Response::parse(&resp.to_pdu(4).unwrap()), Ok((4, resp)));
-        let frame = Frame { transaction: 0, unit: 0, pdu: vec![0x41; MAX_PDU] };
+        let frame = Frame {
+            transaction: 0,
+            unit: 0,
+            pdu: vec![0x41; MAX_PDU],
+        };
         let bytes = frame.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_FRAME);
         assert_eq!(Frame::parse(&bytes), Ok(Some((frame, MAX_FRAME))));
@@ -1303,62 +1622,128 @@ mod tests {
     #[test]
     fn review_request_writers_check_quantity_and_range() {
         assert_eq!(
-            Request::ReadHoldingRegisters { address: 0, quantity: 0 }.to_pdu(),
+            Request::ReadHoldingRegisters {
+                address: 0,
+                quantity: 0
+            }
+            .to_pdu(),
             Err(EncodeError::Quantity)
         );
         assert_eq!(
-            Request::ReadInputRegisters { address: 0, quantity: 126 }.to_pdu(),
+            Request::ReadInputRegisters {
+                address: 0,
+                quantity: 126
+            }
+            .to_pdu(),
             Err(EncodeError::Quantity)
         );
-        assert_eq!(Request::ReadCoils { address: 0, quantity: 2001 }.to_pdu(), Err(EncodeError::Quantity));
         assert_eq!(
-            Request::ReadHoldingRegisters { address: 65535, quantity: 2 }.to_pdu(),
+            Request::ReadCoils {
+                address: 0,
+                quantity: 2001
+            }
+            .to_pdu(),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Request::ReadHoldingRegisters {
+                address: 65535,
+                quantity: 2
+            }
+            .to_pdu(),
             Err(EncodeError::Address)
         );
         assert_eq!(
-            Request::WriteMultipleRegisters { address: 0, values: vec![] }.to_pdu(),
+            Request::WriteMultipleRegisters {
+                address: 0,
+                values: vec![]
+            }
+            .to_pdu(),
             Err(EncodeError::Quantity)
         );
         assert_eq!(
-            Request::WriteMultipleCoils { address: 0, values: vec![] }.to_pdu(),
+            Request::WriteMultipleCoils {
+                address: 0,
+                values: vec![]
+            }
+            .to_pdu(),
             Err(EncodeError::Quantity)
         );
         assert_eq!(
-            Request::WriteMultipleCoils { address: 65535, values: vec![true; 2] }.to_pdu(),
+            Request::WriteMultipleCoils {
+                address: 65535,
+                values: vec![true; 2]
+            }
+            .to_pdu(),
             Err(EncodeError::Address)
         );
-        let last = Request::ReadDiscreteInputs { address: 65535, quantity: 1 };
+        let last = Request::ReadDiscreteInputs {
+            address: 65535,
+            quantity: 1,
+        };
         assert_eq!(Request::parse(&last.to_pdu().unwrap()), Ok(last));
     }
 
     #[test]
     fn review_empty_frame_is_refused() {
-        let frame = Frame { transaction: 0, unit: 1, pdu: vec![] };
+        let frame = Frame {
+            transaction: 0,
+            unit: 1,
+            pdu: vec![],
+        };
         assert_eq!(frame.to_bytes(), Err(EncodeError::EmptyPdu));
         assert_eq!(frame.reply(vec![]).to_bytes(), Err(EncodeError::EmptyPdu));
-        let one = Frame { transaction: 0, unit: 1, pdu: vec![0x41] };
+        let one = Frame {
+            transaction: 0,
+            unit: 1,
+            pdu: vec![0x41],
+        };
         assert_eq!(Frame::parse(&one.to_bytes().unwrap()), Ok(Some((one, 8))));
     }
 
     #[test]
     fn review_response_writers_check_the_function() {
-        assert_eq!(Response::Bits(vec![true]).to_pdu(3), Err(EncodeError::Function(3)));
-        assert_eq!(Response::Registers(vec![1]).to_pdu(1), Err(EncodeError::Function(1)));
         assert_eq!(
-            Response::WriteSingleCoil { address: 0, value: true }.to_pdu(6),
+            Response::Bits(vec![true]).to_pdu(3),
+            Err(EncodeError::Function(3))
+        );
+        assert_eq!(
+            Response::Registers(vec![1]).to_pdu(1),
+            Err(EncodeError::Function(1))
+        );
+        assert_eq!(
+            Response::WriteSingleCoil {
+                address: 0,
+                value: true
+            }
+            .to_pdu(6),
             Err(EncodeError::Function(6))
         );
         assert_eq!(
-            Response::WriteSingleRegister { address: 0, value: 1 }.to_pdu(5),
+            Response::WriteSingleRegister {
+                address: 0,
+                value: 1
+            }
+            .to_pdu(5),
             Err(EncodeError::Function(5))
         );
         assert_eq!(
-            Response::WriteMultiple { address: 0, quantity: 1 }.to_pdu(3),
+            Response::WriteMultiple {
+                address: 0,
+                quantity: 1
+            }
+            .to_pdu(3),
             Err(EncodeError::Function(3))
         );
-        assert_eq!(Response::Bits(vec![true]).to_pdu(0x81), Err(EncodeError::Function(0x81)));
+        assert_eq!(
+            Response::Bits(vec![true]).to_pdu(0x81),
+            Err(EncodeError::Function(0x81))
+        );
         // An exception answers any function.
-        assert_eq!(Response::Exception(Exception::ServerDeviceBusy).to_pdu(0x41), Ok(vec![0xc1, 0x06]));
+        assert_eq!(
+            Response::Exception(Exception::ServerDeviceBusy).to_pdu(0x41),
+            Ok(vec![0xc1, 0x06])
+        );
     }
 
     #[test]
@@ -1376,55 +1761,114 @@ mod tests {
         // Write acknowledgements of 0, too many, or past address 65535.
         assert_eq!(Response::parse(&[0x10, 0, 0, 0, 0]), Err(ResponseError));
         assert_eq!(Response::parse(&[0x10, 0, 0, 0, 124]), Err(ResponseError));
-        assert_eq!(Response::parse(&[0x0f, 0, 0, 0x07, 0xb1]), Err(ResponseError));
-        assert_eq!(Response::parse(&[0x10, 0xff, 0xff, 0, 2]), Err(ResponseError));
+        assert_eq!(
+            Response::parse(&[0x0f, 0, 0, 0x07, 0xb1]),
+            Err(ResponseError)
+        );
+        assert_eq!(
+            Response::parse(&[0x10, 0xff, 0xff, 0, 2]),
+            Err(ResponseError)
+        );
         assert!(Response::parse(&[0x0f, 0, 0, 0x07, 0xb0]).is_ok());
         // Function code 0.
         assert_eq!(Response::parse(&[0x00]), Err(ResponseError));
         assert_eq!(Response::parse(&[0x00, 1, 2]), Err(ResponseError));
         // The writers keep to the same limits.
-        assert_eq!(Response::Bits(vec![false; 2001]).to_pdu(1), Err(EncodeError::Quantity));
+        assert_eq!(
+            Response::Bits(vec![false; 2001]).to_pdu(1),
+            Err(EncodeError::Quantity)
+        );
         assert_eq!(Response::Bits(vec![]).to_pdu(1), Err(EncodeError::Quantity));
-        assert_eq!(Response::Registers(vec![]).to_pdu(3), Err(EncodeError::Quantity));
         assert_eq!(
-            Response::WriteMultiple { address: 0, quantity: 0 }.to_pdu(16),
+            Response::Registers(vec![]).to_pdu(3),
             Err(EncodeError::Quantity)
         );
         assert_eq!(
-            Response::WriteMultiple { address: 0, quantity: 124 }.to_pdu(16),
+            Response::WriteMultiple {
+                address: 0,
+                quantity: 0
+            }
+            .to_pdu(16),
             Err(EncodeError::Quantity)
         );
         assert_eq!(
-            Response::WriteMultiple { address: 65535, quantity: 2 }.to_pdu(15),
+            Response::WriteMultiple {
+                address: 0,
+                quantity: 124
+            }
+            .to_pdu(16),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Response::WriteMultiple {
+                address: 65535,
+                quantity: 2
+            }
+            .to_pdu(15),
             Err(EncodeError::Address)
         );
-        assert_eq!(Response::Other(vec![1]).to_pdu(0), Err(EncodeError::Function(0)));
+        assert_eq!(
+            Response::Other(vec![1]).to_pdu(0),
+            Err(EncodeError::Function(0))
+        );
         let pdu = Response::Bits(vec![true; 2000]).to_pdu(2).unwrap();
-        assert_eq!(Response::parse(&pdu), Ok((2, Response::Bits(vec![true; 2000]))));
+        assert_eq!(
+            Response::parse(&pdu),
+            Ok((2, Response::Bits(vec![true; 2000])))
+        );
     }
 
     #[test]
     fn review_other_variants_do_not_alias_typed_ones() {
-        let req = Request::Other { function: 3, data: vec![0, 0, 0, 1] };
+        let req = Request::Other {
+            function: 3,
+            data: vec![0, 0, 0, 1],
+        };
         assert_eq!(req.to_pdu(), Err(EncodeError::Function(3)));
-        assert_eq!(Request::Other { function: 0, data: vec![] }.to_pdu(), Err(EncodeError::Function(0)));
         assert_eq!(
-            Request::Other { function: 0x83, data: vec![2] }.to_pdu(),
+            Request::Other {
+                function: 0,
+                data: vec![]
+            }
+            .to_pdu(),
+            Err(EncodeError::Function(0))
+        );
+        assert_eq!(
+            Request::Other {
+                function: 0x83,
+                data: vec![2]
+            }
+            .to_pdu(),
             Err(EncodeError::Function(0x83))
         );
-        assert_eq!(Response::Other(vec![2, 0, 1]).to_pdu(3), Err(EncodeError::Function(3)));
-        assert_eq!(Response::Other(vec![2]).to_pdu(0x83), Err(EncodeError::Function(0x83)));
+        assert_eq!(
+            Response::Other(vec![2, 0, 1]).to_pdu(3),
+            Err(EncodeError::Function(3))
+        );
+        assert_eq!(
+            Response::Other(vec![2]).to_pdu(0x83),
+            Err(EncodeError::Function(0x83))
+        );
         // An exception's code is what makes it, so `Other(1)` reads back
         // equal.
         let pdu = Response::Exception(Exception::Other(1)).to_pdu(3).unwrap();
-        assert_eq!(Response::parse(&pdu), Ok((3, Response::Exception(Exception::Other(1)))));
+        assert_eq!(
+            Response::parse(&pdu),
+            Ok((3, Response::Exception(Exception::Other(1))))
+        );
         assert_eq!(Exception::Other(1), Exception::IllegalFunction);
         assert_ne!(Exception::Other(9), Exception::IllegalFunction);
         // Other functions round trip.
-        let req = Request::Other { function: 0x2b, data: vec![0x0e, 1, 0] };
+        let req = Request::Other {
+            function: 0x2b,
+            data: vec![0x0e, 1, 0],
+        };
         assert_eq!(Request::parse(&req.to_pdu().unwrap()), Ok(req));
         let resp = Response::Other(vec![0x0e, 1]);
-        assert_eq!(Response::parse(&resp.to_pdu(0x2b).unwrap()), Ok((0x2b, resp)));
+        assert_eq!(
+            Response::parse(&resp.to_pdu(0x2b).unwrap()),
+            Ok((0x2b, resp))
+        );
     }
 
     /// Every value a writer accepts reads back the same, over a spread of
@@ -1432,17 +1876,37 @@ mod tests {
     #[test]
     fn review_what_writers_accept_reads_back_the_same() {
         let addresses = [0u16, 1, 100, 65400, 65534, 65535];
-        let counts = [0usize, 1, 7, 8, 9, 123, 124, 125, 126, 1968, 1969, 2000, 2001];
+        let counts = [
+            0usize, 1, 7, 8, 9, 123, 124, 125, 126, 1968, 1969, 2000, 2001,
+        ];
         for &address in &addresses {
             for &n in &counts {
                 let q = n as u16;
                 let reqs = [
-                    Request::ReadCoils { address, quantity: q },
-                    Request::ReadDiscreteInputs { address, quantity: q },
-                    Request::ReadHoldingRegisters { address, quantity: q },
-                    Request::ReadInputRegisters { address, quantity: q },
-                    Request::WriteMultipleCoils { address, values: (0..n).map(|i| i % 3 == 0).collect() },
-                    Request::WriteMultipleRegisters { address, values: (0..n).map(|i| i as u16).collect() },
+                    Request::ReadCoils {
+                        address,
+                        quantity: q,
+                    },
+                    Request::ReadDiscreteInputs {
+                        address,
+                        quantity: q,
+                    },
+                    Request::ReadHoldingRegisters {
+                        address,
+                        quantity: q,
+                    },
+                    Request::ReadInputRegisters {
+                        address,
+                        quantity: q,
+                    },
+                    Request::WriteMultipleCoils {
+                        address,
+                        values: (0..n).map(|i| i % 3 == 0).collect(),
+                    },
+                    Request::WriteMultipleRegisters {
+                        address,
+                        values: (0..n).map(|i| i as u16).collect(),
+                    },
                 ];
                 for req in reqs {
                     if let Ok(pdu) = req.to_pdu() {
@@ -1454,9 +1918,15 @@ mod tests {
                     let resps = [
                         Response::Bits((0..n).map(|i| i % 3 == 0).collect()),
                         Response::Registers((0..n).map(|i| i as u16).collect()),
-                        Response::WriteSingleCoil { address, value: n % 2 == 0 },
+                        Response::WriteSingleCoil {
+                            address,
+                            value: n % 2 == 0,
+                        },
                         Response::WriteSingleRegister { address, value: q },
-                        Response::WriteMultiple { address, quantity: q },
+                        Response::WriteMultiple {
+                            address,
+                            quantity: q,
+                        },
                         Response::Exception(Exception::from_code(q as u8)),
                         Response::Other(vec![q as u8; n.min(300)]),
                     ];

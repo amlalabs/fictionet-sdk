@@ -1,7 +1,7 @@
 use fictionet::stdlib::codec::{
     Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Wire, contract, test_support,
 };
-use fictionet::stdlib::grpc::{FrameError, HEADER_LEN, Message, Messages};
+use fictionet::stdlib::grpc::{Code, FrameError, HEADER_LEN, Message, Messages, fail_status};
 use std::collections::BTreeMap;
 
 const MESSAGE_LIMIT: usize = 8;
@@ -14,6 +14,16 @@ type Key = (u8, u32);
 type Calls = Demux<Key, Messages>;
 type Results = BTreeMap<Key, Vec<Result<Message, Fail<FrameError>>>>;
 
+#[test]
+fn partial_message_prefix_ends_the_call_with_internal() {
+    for prefix in 1..HEADER_LEN {
+        let (_, failure) = test_support::decode_all(Messages::new, &vec![0; prefix]);
+        let failure = failure.unwrap();
+        assert_eq!(failure, Fail::Truncated { unread: prefix });
+        assert_eq!(fail_status(&failure).code, Code::Internal);
+    }
+}
+
 // Payloads already extracted by HTTP/2, as in design section 5.3.
 // No padding is included. Each direction has its own stream ID space.
 struct Data<'a> {
@@ -24,24 +34,66 @@ struct Data<'a> {
 
 fn frames() -> [Data<'static>; 11] {
     [
-        Data { key: (0, 1), payload: &[0, 0], end: false },
-        Data { key: (0, 3), payload: &[1, 0, 0], end: false },
-        Data { key: (0, 5), payload: &[0, 0, 0, 0], end: false },
-        Data { key: (0, 1), payload: &[0, 0, 5, b'a'], end: false },
-        Data { key: (0, 3), payload: &[0, 3, 0xff], end: false },
+        Data {
+            key: (0, 1),
+            payload: &[0, 0],
+            end: false,
+        },
+        Data {
+            key: (0, 3),
+            payload: &[1, 0, 0],
+            end: false,
+        },
+        Data {
+            key: (0, 5),
+            payload: &[0, 0, 0, 0],
+            end: false,
+        },
+        Data {
+            key: (0, 1),
+            payload: &[0, 0, 5, b'a'],
+            end: false,
+        },
+        Data {
+            key: (0, 3),
+            payload: &[0, 3, 0xff],
+            end: false,
+        },
         // Only the final header byte arrives. There is no oversized body.
-        Data { key: (0, 5), payload: &[9], end: false },
-        Data { key: (0, 7), payload: &[0, 0, 0, 0, 4, b't'], end: true },
-        Data { key: (1, 1), payload: &[0, 0, 0, 0, 1, b'r'], end: true },
+        Data {
+            key: (0, 5),
+            payload: &[9],
+            end: false,
+        },
+        Data {
+            key: (0, 7),
+            payload: &[0, 0, 0, 0, 4, b't'],
+            end: true,
+        },
+        Data {
+            key: (1, 1),
+            payload: &[0, 0, 0, 0, 1, b'r'],
+            end: true,
+        },
         // Finishes the first body, then carries two complete messages.
         // This payload is larger than one gRPC driver's buffer.
         Data {
             key: (0, 1),
-            payload: &[b'b', b'c', b'd', b'e', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, b'x', b'y'],
+            payload: &[
+                b'b', b'c', b'd', b'e', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, b'x', b'y',
+            ],
             end: false,
         },
-        Data { key: (0, 3), payload: &[0, 0x7f], end: true },
-        Data { key: (0, 1), payload: &[], end: true },
+        Data {
+            key: (0, 3),
+            payload: &[0, 0x7f],
+            end: true,
+        },
+        Data {
+            key: (0, 1),
+            payload: &[],
+            end: true,
+        },
     ]
 }
 
@@ -53,7 +105,9 @@ fn drain(calls: &mut Calls, results: &mut Results) {
 }
 
 fn route(chunk_size: usize) {
-    let mut calls = Calls::new(MAX_STREAMS, MAX_BYTES, |_| Messages::with_limit(MESSAGE_LIMIT));
+    let mut calls = Calls::new(MAX_STREAMS, MAX_BYTES, |_| {
+        Messages::with_limit(MESSAGE_LIMIT)
+    });
     let mut results = Results::new();
     let mut saw_backpressure = false;
     for frame in frames() {
@@ -74,7 +128,10 @@ fn route(chunk_size: usize) {
             let stream = calls.get_mut(&frame.key).unwrap();
             assert_eq!(
                 stream.failed(),
-                Some(&Fail::Protocol(FrameError::TooLarge { length: 9, limit: MESSAGE_LIMIT }))
+                Some(&Fail::Protocol(FrameError::TooLarge {
+                    length: 9,
+                    limit: MESSAGE_LIMIT
+                }))
             );
             assert_eq!(stream.buffered(), HEADER_LEN);
             assert_eq!(stream.held(), 0);
@@ -92,15 +149,39 @@ fn route(chunk_size: usize) {
         (
             (0, 1),
             vec![
-                Ok(Message { compressed: false, data: b"abcde".to_vec() }),
+                Ok(Message {
+                    compressed: false,
+                    data: b"abcde".to_vec(),
+                }),
                 Ok(Message::default()),
-                Ok(Message { compressed: false, data: b"xy".to_vec() }),
+                Ok(Message {
+                    compressed: false,
+                    data: b"xy".to_vec(),
+                }),
             ],
         ),
-        ((0, 3), vec![Ok(Message { compressed: true, data: vec![0xff, 0, 0x7f] })]),
-        ((0, 5), vec![Err(Fail::Protocol(FrameError::TooLarge { length: 9, limit: MESSAGE_LIMIT }))]),
+        (
+            (0, 3),
+            vec![Ok(Message {
+                compressed: true,
+                data: vec![0xff, 0, 0x7f],
+            })],
+        ),
+        (
+            (0, 5),
+            vec![Err(Fail::Protocol(FrameError::TooLarge {
+                length: 9,
+                limit: MESSAGE_LIMIT,
+            }))],
+        ),
         ((0, 7), vec![Err(Fail::Truncated { unread: 6 })]),
-        ((1, 1), vec![Ok(Message { compressed: false, data: b"r".to_vec() })]),
+        (
+            (1, 1),
+            vec![Ok(Message {
+                compressed: false,
+                data: b"r".to_vec(),
+            })],
+        ),
     ]);
     assert_eq!(results, expected);
     assert_eq!(calls.len(), MAX_STREAMS);
@@ -112,9 +193,12 @@ fn route(chunk_size: usize) {
             // The writer round-trips through the decoder bytewise.
             let bytes = message.to_bytes().unwrap();
             contract::check_decode_with_alloc_limit(
-                || Messages::with_limit(MESSAGE_LIMIT), &bytes, 2 * (HEADER_LEN + MESSAGE_LIMIT),
+                || Messages::with_limit(MESSAGE_LIMIT),
+                &bytes,
+                2 * (HEADER_LEN + MESSAGE_LIMIT),
             );
-            let (decoded, failure) = test_support::decode_all(|| Messages::with_limit(MESSAGE_LIMIT), &bytes);
+            let (decoded, failure) =
+                test_support::decode_all(|| Messages::with_limit(MESSAGE_LIMIT), &bytes);
             assert_eq!(failure, None);
             assert_eq!(decoded, std::slice::from_ref(message));
         }
@@ -198,7 +282,14 @@ fn data_bytes(stream: u32, payloads: &[(&[u8], bool)]) -> Vec<u8> {
 #[test]
 fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
     let make = || {
-        Pipe::new(DataFrames { stream: 1, ended: false }, Messages::with_limit(MESSAGE_LIMIT), Carry::Bytes)
+        Pipe::new(
+            DataFrames {
+                stream: 1,
+                ended: false,
+            },
+            Messages::with_limit(MESSAGE_LIMIT),
+            Carry::Bytes,
+        )
     };
     let cases = [
         (
@@ -211,16 +302,28 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
                 ],
             ),
             vec![
-                Message { compressed: false, data: b"abc".to_vec() },
-                Message { compressed: true, data: vec![] },
-                Message { compressed: false, data: b"z".to_vec() },
+                Message {
+                    compressed: false,
+                    data: b"abc".to_vec(),
+                },
+                Message {
+                    compressed: true,
+                    data: vec![],
+                },
+                Message {
+                    compressed: false,
+                    data: b"z".to_vec(),
+                },
             ],
             None,
         ),
         (
             data_bytes(1, &[(&[0, 0], false), (&[0, 0, 9], false)]),
             vec![],
-            Some(Fail::Protocol(FrameError::TooLarge { length: 9, limit: MESSAGE_LIMIT })),
+            Some(Fail::Protocol(FrameError::TooLarge {
+                length: 9,
+                limit: MESSAGE_LIMIT,
+            })),
         ),
         (
             data_bytes(1, &[(&[0, 0], false), (&[0, 0, 4, b'x'], true)]),
@@ -231,7 +334,14 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
     for (bytes, expected, failure) in cases {
         contract::check_stack(make, &bytes);
         let (items, failed) = test_support::decode_all(make, &bytes);
-        assert_eq!(items, expected.iter().cloned().map(Layered::Inner).collect::<Vec<_>>());
+        assert_eq!(
+            items,
+            expected
+                .iter()
+                .cloned()
+                .map(Layered::Inner)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(failed, failure.map(|e| Fail::Protocol(PipeError::Inner(e))));
     }
 }

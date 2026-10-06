@@ -7,14 +7,20 @@ use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_va
 use fictionet::stdlib::codec::{Assembled, Wire, test_support::decode_all};
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
 use fictionet::stdlib::cotp::{messages, over_tpkt};
-use fictionet::stdlib::tpkt::{EncodeError, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, Packet, Packets};
+use fictionet::stdlib::tpkt::{
+    EncodeError, HEADER_LEN, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, MIN_PAYLOAD, Packet,
+    Packets,
+};
 use libfuzzer_sys::fuzz_target;
 
 /// Values a world builds: whatever a writer accepts reads back the same.
 fn built(data: &[u8]) -> Result<()> {
     let mut u = Unstructured::new(data);
     // A header a writer takes reads back the same.
-    let header = Header { reserved: u.arbitrary()?, length: u.arbitrary()? };
+    let header = Header {
+        reserved: u.arbitrary()?,
+        length: u.arbitrary()?,
+    };
     match header.to_bytes() {
         Ok(bytes) => assert_eq!(<Header as Wire>::parse(&bytes), Ok(header)),
         Err(e) => {
@@ -23,7 +29,10 @@ fn built(data: &[u8]) -> Result<()> {
         }
     }
     let n = u.int_in_range(0..=300usize)?;
-    let packet = Packet { reserved: u.arbitrary()?, payload: u.bytes(n)?.to_vec() };
+    let packet = Packet {
+        reserved: u.arbitrary()?,
+        payload: u.bytes(n)?.to_vec(),
+    };
     check_wire_value(&packet);
     match packet.to_bytes() {
         Ok(bytes) => assert_eq!(<Packet as Wire>::parse(&bytes), Ok(packet)),
@@ -35,7 +44,11 @@ fn built(data: &[u8]) -> Result<()> {
     let n = u.int_in_range(MAX_PAYLOAD - 300..=MAX_PAYLOAD + 10)?;
     let n = if u.arbitrary()? { n } else { n % 300 };
     let number: u8 = u.arbitrary()?;
-    let data = Tpdu::Data(Data { eot: u.arbitrary()?, number, data: vec![0x41; n] });
+    let data = Tpdu::Data(Data {
+        eot: u.arbitrary()?,
+        number,
+        data: vec![0x41; n],
+    });
     check_wire_value(&data);
     let fits = n <= MAX_PAYLOAD - 3 && number < 0x80;
     match over_tpkt::from_tpdu(&data) {
@@ -45,7 +58,10 @@ fn built(data: &[u8]) -> Result<()> {
         }
         Err(e) => {
             assert!(!fits);
-            assert_eq!(e, EncodeError::Unwritable);
+            assert_eq!(
+                e,
+                over_tpkt::EncodeError::Tpdu(fictionet::stdlib::cotp::EncodeError::Unwritable)
+            );
         }
     }
     // A connection request a world builds, with any fields, parameters,
@@ -68,7 +84,10 @@ fn built(data: &[u8]) -> Result<()> {
         let mut params = Vec::new();
         for _ in 0..u.int_in_range(0..=4)? {
             let n = u.int_in_range(0..=260usize)?;
-            params.push(Parameter { code: u.arbitrary()?, value: u.bytes(n)?.to_vec() });
+            params.push(Parameter {
+                code: u.arbitrary()?,
+                value: u.bytes(n)?.to_vec(),
+            });
         }
         Variable::Parameters(params)
     };
@@ -105,10 +124,15 @@ fuzz_target!(|data: &[u8]| {
         check_decode(|| Packets::with_limit(limit), data);
         let (packets, _) = decode_all(|| Packets::with_limit(limit), data);
         for packet in packets {
+            assert!(packet.payload.len() + HEADER_LEN <= Packets::with_limit(limit).limit());
+            assert!((MIN_PAYLOAD..=MAX_PAYLOAD).contains(&packet.payload.len()));
             check_wire_value(&packet);
             check_wire::<Tpdu>(&packet.payload);
             if let Ok(tpdu) = over_tpkt::tpdu(&packet) {
-                assert_eq!(over_tpkt::tpdu(&over_tpkt::from_tpdu(&tpdu).unwrap()), Ok(tpdu));
+                assert_eq!(
+                    over_tpkt::tpdu(&over_tpkt::from_tpdu(&tpdu).unwrap()),
+                    Ok(tpdu)
+                );
             }
         }
     }
