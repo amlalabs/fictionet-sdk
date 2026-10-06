@@ -1,7 +1,7 @@
 # Fuzzing Fictionet
 
 The agent in the sandbox is the one adversary in Fictionet's trust model.
-Every byte it sends reaches world-side code. The targets here feed the
+Every byte it sends reaches world-side code. The targets here exercise the
 parsers and state machines on that path. A panic, a hang or memory that
 grows without end in one of them is a denial of service against the
 world.
@@ -16,7 +16,7 @@ cargo +nightly fuzz list
 
 ## The targets
 
-| Target | What it feeds | Code it reaches |
+| Target | Input | Code it reaches |
 |---|---|---|
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
@@ -66,11 +66,11 @@ cargo +nightly fuzz list
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |
 | `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
 | `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
-| `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
+| `resp` | arbitrary bytes, bounded stream contracts, and strict value and command writers | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
 | `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
 | `rtsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtsp`: RTSP |
-| `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
+| `sdp` | arbitrary bodies, bounded EOF decoding, strict writing, and typed attributes | `stdlib::sdp`: SDP |
 | `sftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sftp`: SFTP version 3 |
 | `sip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sip`: SIP |
 | `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
@@ -83,6 +83,7 @@ cargo +nightly fuzz list
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
 | `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
+| `wake_on_lan` | arbitrary payloads, bounded EOF decoding, exact packet writing, and password checks | `stdlib::wake_on_lan`: Wake-on-LAN |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::xml`: XML 1.0 |

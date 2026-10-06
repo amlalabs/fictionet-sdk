@@ -1,29 +1,14 @@
 //! Wake-on-LAN payloads, as a world playing a sleeping host or a tool reads
 //! them, and magic packets a world builds, as it writes them.
 #![no_main]
-#![allow(deprecated)] // Also check the unchanged compatibility scanner.
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Fail, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::wake_on_lan::{
     MAX_PACKET_LEN, MAX_PAYLOAD, Mac, MagicPacket, PACKET_LEN, Packets, ParseError, Password,
-    Scanner, wakes,
+    wakes,
 };
 use libfuzzer_sys::fuzz_target;
-
-/// Feeds `data` to a scanner whole, or a byte at a time.
-fn scan(data: &[u8], bytewise: bool) -> std::result::Result<(usize, MagicPacket), ParseError> {
-    let mut s = Scanner::new();
-    if bytewise {
-        for b in data {
-            s.feed(&[*b]);
-            assert!(s.seen() <= MAX_PAYLOAD + 1);
-        }
-    } else {
-        s.feed(data);
-    }
-    s.finish()
-}
 
 /// Whether `payload` wakes the card, checked the slow way: some offset
 /// holds six 0xFF bytes, sixteen copies of `mac` and then, if the card has
@@ -73,7 +58,7 @@ fn built(data: &[u8]) -> Result<()> {
     };
     let packet = MagicPacket { mac, password };
     contract::check_wire_value(&packet);
-    let bytes = packet.to_bytes();
+    let bytes = packet.to_bytes().unwrap();
     assert_eq!(bytes.len(), packet.len());
     assert!(bytes.len() <= MAX_PACKET_LEN);
     assert_eq!(MagicPacket::find(&bytes), Ok((0, packet)));
@@ -82,14 +67,14 @@ fn built(data: &[u8]) -> Result<()> {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Packets::new, data);
+    contract::check_decode_with_alloc_limit(Packets::new, data, 2 * (MAX_PAYLOAD + 1));
     contract::check_wire::<MagicPacket>(data);
-    // The payload read three ways: whole, and by a scanner fed all at once
-    // and a byte at a time. All give the same answer.
     let found = MagicPacket::find(data);
-    assert_eq!(scan(data, false), found);
-    assert_eq!(scan(data, true), found);
-    assert_eq!(MagicPacket::parse(data), found.map(|(_, p)| p));
+    let expected = match found {
+        Ok(packet) => (vec![packet], None),
+        Err(error) => (vec![], Some(Fail::Protocol(error))),
+    };
+    assert_eq!(decode_all(Packets::new, data), expected);
 
     match found {
         Ok((offset, p)) => {
@@ -111,7 +96,7 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
             // Written alone, it reads back the same.
-            assert_eq!(MagicPacket::find(&p.to_bytes()), Ok((0, p)));
+            assert_eq!(MagicPacket::find(&p.to_bytes().unwrap()), Ok((0, p)));
         }
         Err(ParseError::TooLong) => assert!(data.len() > MAX_PAYLOAD),
         Err(ParseError::NotFound) => {}

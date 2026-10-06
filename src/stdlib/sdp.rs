@@ -10,14 +10,11 @@
 //!
 //! Nothing here reads a socket. A world that plays a SIP phone takes the
 //! body of an INVITE, reads it with [`SessionDescription::parse`] (or a
-//! [`Decoder`], fed as bytes come), picks the streams and codecs it will
-//! take, and writes its answer with [`SessionDescription::to_bytes`].
+//! [`Stream<Descriptions>`](super::codec::Stream), with a body ending at EOF),
+//! picks the streams and codecs it will take, and writes its answer with
+//! [`SessionDescription::write`].
 //! Which codecs a world accepts, and what it does with the media, is up
 //! to world code.
-//!
-//! New stacks use [`Descriptions`] with [`codec::Stream`] for one body
-//! ending at EOF. [`SessionDescription`] implements [`Wire`] using the
-//! same parsing and writing rules as its inherent methods.
 //!
 //! Every reader checks the line order, each field's syntax and the size
 //! limits below, because the agent can send any bytes it likes. Lines may
@@ -33,6 +30,7 @@
 //! then drops them, and a description has no field for them.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::sdp::{Direction, SessionDescription};
 //!
 //! let offer = b"v=0\r\n\
@@ -493,105 +491,7 @@ impl Decode for Descriptions {
     }
 }
 
-/// Reads a session description as its bytes come, a chunk at a time.
-/// Feed it every byte of the body, then call [`Decoder::finish`]. It holds
-/// at most one partial line, and stops reading at the first error.
-/// This compatibility type retains its immediate [`Decoder::error`]
-/// reporting. New callers can use [`Descriptions`] with [`codec::Stream`].
-#[derive(Debug, Default)]
-#[deprecated(note = "use codec::Stream with sdp::Descriptions")]
-pub struct Decoder {
-    line: Vec<u8>,
-    total: usize,
-    lines: usize,
-    description: Description,
-    failed: Option<Error>,
-}
-
-#[allow(deprecated)]
-impl Decoder {
-    /// A decoder that has read nothing.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Reads more of the description. After an error the rest is
-    /// dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        for &b in bytes {
-            if self.failed.is_some() {
-                return;
-            }
-            self.total += 1;
-            // A bare LF counts as the CRLF the writer would write.
-            if b == b'\n' && self.line.last() != Some(&b'\r') {
-                self.total += 1;
-            }
-            if self.total > MAX_LEN {
-                self.fail(Error::TooLong);
-            } else if b == b'\n' {
-                self.end_line();
-            } else {
-                self.line.push(b);
-                // One more byte for a CR that may come before the LF.
-                if self.line.len() > MAX_LINE_LEN + 1 {
-                    self.fail(Error::LineTooLong { line: self.lines + 1 });
-                }
-            }
-        }
-    }
-
-    /// The error that stopped the decoder, if one has.
-    pub fn error(&self) -> Option<Error> {
-        self.failed
-    }
-
-    /// Reads the last line, if it had no line ending, and returns the
-    /// description.
-    pub fn finish(mut self) -> Result<SessionDescription, Error> {
-        if self.failed.is_none() && !self.line.is_empty() {
-            // The line ending the writer would add.
-            self.total += if self.line.last() == Some(&b'\r') { 1 } else { 2 };
-            if self.total > MAX_LEN {
-                self.fail(Error::TooLong);
-            } else {
-                self.end_line();
-            }
-        }
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        self.description.finish()
-    }
-
-    fn fail(&mut self, e: Error) {
-        self.failed = Some(e);
-        self.line = Vec::new();
-    }
-
-    fn end_line(&mut self) {
-        let mut line = core::mem::take(&mut self.line);
-        if line.last() == Some(&b'\r') {
-            line.pop();
-        }
-        self.lines += 1;
-        let n = self.lines;
-        if n > MAX_LINES {
-            return self.fail(Error::TooManyLines);
-        }
-        if line.len() > MAX_LINE_LEN {
-            return self.fail(Error::LineTooLong { line: n });
-        }
-        if let Err(e) = self.description.read_line(&line, n) {
-            self.fail(e);
-        }
-        // Keep the buffer's room for the next line.
-        line.clear();
-        self.line = line;
-    }
-}
-
-/// Parsed lines shared by both input drivers.
+/// Parsed lines of one description.
 #[derive(Debug, Default)]
 struct Description {
     stage: u8,
@@ -1210,7 +1110,7 @@ struct LineBuf<'a> {
 
 impl core::fmt::Write for LineBuf<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        if self.over || self.out.len() - self.start + s.len() > MAX_LINE_LEN {
+        if self.over || self.out.len().saturating_sub(self.start).saturating_add(s.len()) > MAX_LINE_LEN {
             self.over = true;
         } else {
             self.out.push_str(s);
@@ -1306,14 +1206,6 @@ impl SessionDescription {
         }
     }
 
-    /// Reads a whole description, such as the body of a SIP message.
-    #[allow(deprecated)] // Preserve the one-shot parser and its error order.
-    pub fn parse(bytes: &[u8]) -> Result<SessionDescription, Error> {
-        let mut d = Decoder::new();
-        d.feed(bytes);
-        d.finish()
-    }
-
     /// Whether the `s=` and `i=` lines, which `a=charset` governs, are
     /// ASCII.
     fn text_is_ascii(&self) -> bool {
@@ -1322,16 +1214,54 @@ impl SessionDescription {
             && self.media.iter().all(|m| m.information.as_deref().is_none_or(str::is_ascii))
     }
 
-    /// The description's bytes, lines in the order RFC 8866 requires, each
+    /// The first session-level attribute named `name`.
+    pub fn attribute(&self, name: &str) -> Option<&Attribute> {
+        self.attributes.iter().find(|a| a.name == name)
+    }
+
+    /// Every session-level attribute named `name`, in order.
+    pub fn attributes_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Attribute> + 'a {
+        self.attributes.iter().filter(move |a| a.name == name)
+    }
+
+    /// The direction a stream flows: its own direction attribute, else
+    /// the session's, else [`Direction::SendRecv`], as RFC 8866 says.
+    pub fn direction(&self, media: &Media) -> Direction {
+        media.direction().or_else(|| self.attributes.iter().find_map(Direction::from_attribute)).unwrap_or_default()
+    }
+}
+
+impl Wire for SessionDescription {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a whole description, such as the body of a SIP message.
+    /// Accepts CRLF, bare LF, and a final line without an ending. Refuses
+    /// invalid syntax, line order, missing fields, and size limit violations.
+    /// Obsolete `k=` lines are checked and dropped.
+    fn parse(mut bytes: &[u8]) -> Result<Self, Error> {
+        let mut descriptions = Descriptions::new();
+        loop {
+            match descriptions.decode(bytes, true)? {
+                codec::Step::Skip(used) => {
+                    bytes = bytes.get(used..).ok_or(Error::TooLong)?;
+                }
+                codec::Step::Item(description, _) => return Ok(description),
+                codec::Step::Need | codec::Step::End => return Err(Error::Missing('v')),
+            }
+        }
+    }
+
+    /// Appends the description as lines in the order RFC 8866 requires, each
     /// ending in CRLF. It fails, naming the line, if a field holds what
     /// its line's syntax does not allow, such as a space in a token or a
     /// line break in text, or if the result would break a size limit. It
     /// also fails if there is no time description, or a media description
     /// has no connection to use. Whatever it writes, [`parse`] reads back
-    /// equal.
+    /// equal. An error leaves `out` unchanged.
     ///
     /// [`parse`]: SessionDescription::parse
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         use core::fmt::Write;
         if self.times.is_empty() {
             return Err(Error::Missing('t'));
@@ -1435,37 +1365,7 @@ impl SessionDescription {
             }
             w.attributes(&m.attributes)?;
         }
-        Ok(w.out.into_bytes())
-    }
-
-    /// The first session-level attribute named `name`.
-    pub fn attribute(&self, name: &str) -> Option<&Attribute> {
-        self.attributes.iter().find(|a| a.name == name)
-    }
-
-    /// Every session-level attribute named `name`, in order.
-    pub fn attributes_named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Attribute> + 'a {
-        self.attributes.iter().filter(move |a| a.name == name)
-    }
-
-    /// The direction a stream flows: its own direction attribute, else
-    /// the session's, else [`Direction::SendRecv`], as RFC 8866 says.
-    pub fn direction(&self, media: &Media) -> Direction {
-        media.direction().or_else(|| self.attributes.iter().find_map(Direction::from_attribute)).unwrap_or_default()
-    }
-}
-
-impl Wire for SessionDescription {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        SessionDescription::parse(bytes)
-    }
-
-    /// Appends the existing CRLF encoding. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&self.to_bytes()?);
+        out.extend_from_slice(w.out.as_bytes());
         Ok(())
     }
 }
@@ -1533,7 +1433,7 @@ fn check(ok: bool) -> Result<(), AttributeError> {
 /// `a=name:value`, of at most [`MAX_LINE_LEN`] bytes. The typed helpers
 /// read and write no longer values, so they never copy more than a line.
 fn fits(name: &str, value: &str) -> bool {
-    "a=:".len() + name.len() + value.len() <= MAX_LINE_LEN
+    "a=:".len().saturating_add(name.len()).saturating_add(value.len()) <= MAX_LINE_LEN
 }
 
 /// The value of an attribute named `name` that fits on one line, or an
@@ -1932,9 +1832,9 @@ impl Candidate {
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+    use codec::{Stream, contract, test_support::{Lcg, decode_all, mutate}};
 
     /// The example in RFC 8866, section 5.
     const RFC_EXAMPLE: &[u8] = b"v=0\r\n\
@@ -1984,12 +1884,18 @@ mod tests {
         a=sendonly\r\n\
         m=application 0 UDP/DTLS/SCTP webrtc-datachannel\r\n";
 
-    fn bytewise(b: &[u8]) -> Result<SessionDescription, Error> {
-        let mut d = Decoder::new();
-        for byte in b {
-            d.feed(std::slice::from_ref(byte));
+    fn check_description(b: &[u8]) -> Result<SessionDescription, Error> {
+        contract::check_decode_with_alloc_limit(Descriptions::new, b, 2 * (MAX_LINE_LEN + 2));
+        contract::check_decode_with_held_limit(Descriptions::new, b, MAX_LEN);
+        let (mut items, failure) = decode_all(Descriptions::new, b);
+        match failure {
+            Some(codec::Fail::Protocol(error)) => Err(error),
+            None => {
+                assert_eq!(items.len(), 1);
+                Ok(items.remove(0))
+            }
+            other => panic!("unexpected stream failure: {other:?}"),
         }
-        d.finish()
     }
 
     #[test]
@@ -2014,7 +1920,7 @@ mod tests {
         assert_eq!(map, RtpMap { payload: 99, encoding: "h263-1998".into(), clock_rate: 90000, params: None });
         // Written back, it is the same bytes.
         assert_eq!(d.to_bytes().unwrap(), RFC_EXAMPLE);
-        assert_eq!(bytewise(RFC_EXAMPLE), Ok(d));
+        assert_eq!(check_description(RFC_EXAMPLE), Ok(d));
     }
 
     #[test]
@@ -2071,7 +1977,7 @@ mod tests {
         // differ, but the description reads back equal.
         let bytes = d.to_bytes().unwrap();
         assert_eq!(SessionDescription::parse(&bytes), Ok(d.clone()));
-        assert_eq!(bytewise(EVERY_LINE), Ok(d));
+        assert_eq!(check_description(EVERY_LINE), Ok(d));
         let text = String::from_utf8(bytes).unwrap();
         assert_eq!(text.matches("r=7d 1h 0 25h\r\n").count(), 2);
         assert!(text.contains("z=3730928400 -1h 3749680800 0\r\n"));
@@ -2109,7 +2015,7 @@ mod tests {
         let Err(e) = SessionDescription::parse(b) else {
             panic!("parsed: {:?}", String::from_utf8_lossy(&b[..b.len().min(200)]))
         };
-        assert_eq!(bytewise(b), Err(e));
+        assert_eq!(check_description(b), Err(e));
         e
     }
 
@@ -2256,11 +2162,12 @@ mod tests {
         let fits = format!("t=0 0\r\na=x:{}\r\n", "y".repeat(MAX_LINE_LEN - 4));
         assert!(SessionDescription::parse(&with(&fits)).is_ok());
         // A long line is caught before its end comes.
-        let mut d = Decoder::new();
-        d.feed(&vec![b'a'; MAX_LINE_LEN + 2]);
-        assert_eq!(d.error(), Some(Error::LineTooLong { line: 1 }));
-        d.feed(b"\r\nv=0");
-        assert_eq!(d.finish(), Err(Error::LineTooLong { line: 1 }));
+        let mut d = Stream::new(Descriptions::new());
+        assert_eq!(d.push(&vec![b'a'; MAX_LINE_LEN + 2]), MAX_LINE_LEN + 2);
+        assert_eq!(d.next(), Some(Err(codec::Fail::Protocol(Error::LineTooLong { line: 1 }))));
+        assert_eq!(d.push(b"\r\nv=0"), 5);
+        assert_eq!(d.next(), None);
+        assert_eq!(d.failed(), Some(&codec::Fail::Protocol(Error::LineTooLong { line: 1 })));
         // Too many lines.
         let many = format!("t=0 0\r\n{}", "a=x\r\n".repeat(MAX_LINES));
         assert_eq!(err(&with(&many)), Error::TooManyLines);
@@ -2523,7 +2430,7 @@ mod tests {
             for n in 0..full.len() {
                 let part = &full[..n];
                 let got = SessionDescription::parse(part);
-                assert_eq!(bytewise(part), got, "{n}");
+                assert_eq!(check_description(part), got, "{n}");
                 match &got {
                     Ok(d) => {
                         assert_eq!(SessionDescription::parse(&d.to_bytes().unwrap()), Ok(d.clone()));
@@ -2538,38 +2445,11 @@ mod tests {
         }
     }
 
-    /// A deterministic generator, so a failing case can be found again.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-
-        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
-            xs[self.below(xs.len())]
-        }
-    }
-
-    /// Checks the reader on `b`: it agrees with itself fed a byte at a
-    /// time and in odd chunks, and what it reads, the writer writes and
-    /// the reader reads back.
-    fn check_bytes(b: &[u8], rng: &mut Lcg) {
+    /// Checks partition invariance, bounds, and writer round trips.
+    fn check_bytes(b: &[u8]) {
         let got = SessionDescription::parse(b);
-        assert_eq!(bytewise(b), got);
-        let mut d = Decoder::new();
-        let mut rest = b;
-        while !rest.is_empty() {
-            let n = (rng.below(7) + 1).min(rest.len());
-            d.feed(&rest[..n]);
-            rest = &rest[n..];
-        }
-        assert_eq!(d.finish(), got);
+        assert_eq!(check_description(b), got);
+        contract::check_wire::<SessionDescription>(b);
         if let Ok(desc) = got {
             let out = desc.to_bytes().unwrap();
             assert_eq!(SessionDescription::parse(&out), Ok(desc.clone()));
@@ -2592,46 +2472,42 @@ mod tests {
 
     #[test]
     fn fuzz_reader() {
-        let mut rng = Lcg(0x5d9);
+        let mut rng = Lcg::new(0x5d9);
         let lines: Vec<&[u8]> = EVERY_LINE.split_inclusive(|&b| b == b'\n').collect();
-        let noise = b" =:/\r\n\0\xff0aZ-";
         for round in 0..4000 {
             let mut b: Vec<u8> = match round % 3 {
                 // Random bytes.
-                0 => (0..rng.below(200)).map(|_| rng.next() as u8).collect(),
+                0 => rng.bytes(199),
                 // Lines of the sample, shuffled, dropped and repeated.
                 1 => {
                     let mut b = lines[..3].concat();
-                    for _ in 0..rng.below(30) {
-                        b.extend_from_slice(lines[rng.below(lines.len())]);
+                    for _ in 0..rng.index(30) {
+                        b.extend_from_slice(lines[rng.index(lines.len())]);
                     }
                     b
                 }
                 // The sample with bytes changed.
                 _ => EVERY_LINE.to_vec(),
             };
-            for _ in 0..rng.below(4) {
-                if !b.is_empty() {
-                    let i = rng.below(b.len());
-                    b[i] = noise[rng.below(noise.len())];
-                }
+            for _ in 0..rng.index(4) {
+                mutate(&mut rng, &mut b);
             }
-            check_bytes(&b, &mut rng);
+            check_bytes(&b);
         }
     }
 
     #[test]
     fn fuzz_writer() {
-        let mut rng = Lcg(42);
+        let mut rng = Lcg::new(42);
         let words =
             ["a", "IN", "IP4", "x y", "", "0", "rtp:map", "-", "\u{e9}", "a\r", "/", "RTP/AVP", "\0", "96 opus/48000"];
         let mut written = 0;
         for _ in 0..3000 {
             let mut d = sample();
-            for _ in 0..rng.below(4) {
-                let w = rng.pick(&words).to_string();
+            for _ in 0..rng.index(4) {
+                let w = words[rng.index(words.len())].to_string();
                 let n = rng.next();
-                match rng.below(16) {
+                match rng.index(16) {
                     0 => d.origin.username = w,
                     1 => d.origin.address = w,
                     2 => d.name = w,
@@ -2654,10 +2530,11 @@ mod tests {
                     _ => d.uri = Some(w),
                 }
             }
+            contract::check_wire_value(&d);
             if let Ok(bytes) = d.to_bytes() {
                 written += 1;
                 assert_eq!(SessionDescription::parse(&bytes), Ok(d.clone()));
-                assert_eq!(bytewise(&bytes), Ok(d));
+                assert_eq!(check_description(&bytes), Ok(d));
             }
         }
         assert!(written > 300, "{written}");
@@ -2729,31 +2606,31 @@ mod tests {
 
     #[test]
     fn fuzz_candidate_writer() {
-        let mut rng = Lcg(7);
+        let mut rng = Lcg::new(7);
         let words = ["host", "HOST", "Relay", "x", "a b", "", "raddr", "RPORT", "typ", "1", "+/", "\u{e9}", "a\r"];
         let mut written = 0;
         for _ in 0..3000 {
             let mut c = Candidate {
-                foundation: rng.pick(&words).into(),
-                component: rng.below(300) as u16,
-                transport: rng.pick(&words).into(),
+                foundation: words[rng.index(words.len())].into(),
+                component: rng.index(300) as u16,
+                transport: words[rng.index(words.len())].into(),
                 priority: rng.next() as u32,
-                address: rng.pick(&words).into(),
+                address: words[rng.index(words.len())].into(),
                 port: rng.next() as u16,
-                kind: CandidateType::from_name(rng.pick(&words)),
+                kind: CandidateType::from_name(words[rng.index(words.len())]),
                 ..Candidate::default()
             };
-            if rng.below(3) == 0 {
-                c.kind = CandidateType::Other(rng.pick(&words).into());
+            if rng.index(3) == 0 {
+                c.kind = CandidateType::Other(words[rng.index(words.len())].into());
             }
-            if rng.below(2) == 0 {
-                c.related_address = Some(rng.pick(&words).into());
+            if rng.index(2) == 0 {
+                c.related_address = Some(words[rng.index(words.len())].into());
             }
-            if rng.below(2) == 0 {
+            if rng.index(2) == 0 {
                 c.related_port = Some(rng.next() as u16);
             }
-            for _ in 0..rng.below(3) {
-                c.extensions.push((rng.pick(&words).into(), rng.pick(&words).into()));
+            for _ in 0..rng.index(3) {
+                c.extensions.push((words[rng.index(words.len())].into(), words[rng.index(words.len())].into()));
             }
             if let Ok(a) = c.to_attribute() {
                 written += 1;
@@ -2783,11 +2660,14 @@ mod tests {
 
     #[test]
     fn decoder_stops_at_the_first_error() {
-        let mut d = Decoder::new();
-        d.feed(b"v=0\r\nq=1\r\n");
-        assert_eq!(d.error(), Some(Error::UnknownType { line: 2, kind: 'q' }));
-        d.feed(RFC_EXAMPLE);
-        assert_eq!(d.finish(), Err(Error::UnknownType { line: 2, kind: 'q' }));
+        let mut d = Stream::new(Descriptions::new());
+        assert_eq!(d.push(b"v=0\r\nq=1\r\n"), 10);
+        let error = codec::Fail::Protocol(Error::UnknownType { line: 2, kind: 'q' });
+        assert_eq!(d.next(), Some(Err(error.clone())));
+        assert_eq!(d.push(RFC_EXAMPLE), RFC_EXAMPLE.len());
+        d.end();
+        assert_eq!(d.next(), None);
+        assert_eq!(d.failed(), Some(&error));
     }
 
     #[test]
@@ -2889,9 +2769,7 @@ mod tests {
         body.push_str("a=y\n");
         assert!(body.len() < MAX_LEN);
         assert_eq!(err(body.as_bytes()), Error::TooLong);
-        let mut d = Decoder::new();
-        d.feed(body.trim_end().as_bytes());
-        assert_eq!(d.finish(), Err(Error::TooLong));
+        assert_eq!(check_description(body.trim_end().as_bytes()), Err(Error::TooLong));
     }
 
     #[test]

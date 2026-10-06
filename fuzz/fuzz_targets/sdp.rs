@@ -1,11 +1,10 @@
 //! SDP session descriptions, as a world playing a SIP phone or a WebRTC
 //! peer reads them.
 #![no_main]
-#![allow(deprecated)] // Also check the unchanged compatibility decoder.
 
-use fictionet::stdlib::codec::contract;
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
 use fictionet::stdlib::sdp::{
-    Attribute, Candidate, Decoder, Descriptions, Fmtp, MAX_LINE_LEN, MAX_LINES, RtpMap, SessionDescription,
+    Attribute, Candidate, Descriptions, Fmtp, MAX_LINE_LEN, MAX_LINES, RtpMap, SessionDescription,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -32,7 +31,7 @@ fn check_attribute(a: &Attribute) {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Descriptions::new, data);
+    contract::check_decode_with_alloc_limit(Descriptions::new, data, 2 * (MAX_LINE_LEN + 2));
     contract::check_decode_with_held_limit(Descriptions::new, data, fictionet::stdlib::sdp::MAX_LEN);
     contract::check_wire::<SessionDescription>(data);
     // The input as one attribute value, as a trickled ICE candidate comes
@@ -44,13 +43,12 @@ fuzz_target!(|data: &[u8]| {
         }
     }
 
-    // The body, read two ways: all at once, and a byte at a time.
     let whole = SessionDescription::parse(data);
-    let mut bytewise = Decoder::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-    }
-    assert_eq!(bytewise.finish(), whole);
+    let expected = match &whole {
+        Ok(description) => (vec![description.clone()], None),
+        Err(error) => (vec![], Some(fictionet::stdlib::codec::Fail::Protocol(*error))),
+    };
+    assert_eq!(decode_all(Descriptions::new, data), expected);
 
     let Ok(desc) = whole else { return };
     // A description read can be written, and reads back the same. The
