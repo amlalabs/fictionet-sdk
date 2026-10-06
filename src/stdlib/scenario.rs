@@ -27,6 +27,7 @@
 //! let checks = scenario.checks();
 //! # fictionet::block_on(fictionet::run(move |cx| async move {
 //! let _timeline = scenario.run(&cx, Arc::new(Plant { spoofed: AtomicBool::new(false) }));
+//! # cx.cancel(); // End the example's world without waiting two minutes.
 //! # Ok(()) }))?;
 //! let report = checks.grade(&[]);
 //! assert!(report.passed());
