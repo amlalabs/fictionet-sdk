@@ -842,6 +842,26 @@ impl Http1 {
     }
 }
 
+/// The head at the start of `unread`, read with an empty Host field added
+/// after its request line, if that makes it a request head: an HTTP/1.1
+/// request that named no host.
+fn without_host(unread: &[u8]) -> Option<RequestHead> {
+    let line_end = unread.windows(2).position(|w| w == b"\r\n")?;
+    let head_end = unread.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    if head_end <= line_end {
+        return None;
+    }
+    let mut patched = unread[..line_end + 2].to_vec();
+    patched.extend_from_slice(b"Host:\r\n");
+    patched.extend_from_slice(&unread[line_end + 2..head_end]);
+    let mut head = <RequestHead as fictionet::stdlib::codec::Wire>::parse(&patched).ok()?;
+    // The handler sees the request as it came, without the field added.
+    if head.headers.first().is_some_and(|h| h.name == "Host" && h.value.is_empty()) {
+        head.headers.remove(0);
+    }
+    Some(head)
+}
+
 /// A request body that ends early: `bytes`, then an error saying `why`.
 /// A handler that reads it frame by frame sees what came.
 fn partial(bytes: Bytes, why: &'static str) -> Body {
@@ -971,6 +991,16 @@ impl serve::Service for Http1 {
             got.extend_from_slice(&ctx.unread()[..ctx.unread().len().min(room)]);
             let body = partial(Bytes::from(got), "the request body was cut off");
             self.dispatch(ctx, body, true);
+            return Ok(());
+        }
+        if matches!(error, fictionet::stdlib::codec::Fail::Protocol(http1::Error::Host))
+            && let Some(head) = without_host(ctx.unread())
+        {
+            // An HTTP/1.1 request with no Host field: the handler answers
+            // it, as a request that names no host (`400`, `no_host`).
+            self.head = Some(head);
+            self.started = ctx.now();
+            self.dispatch(ctx, Body::empty(), true);
             return Ok(());
         }
         if ctx.logging() {

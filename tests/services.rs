@@ -441,6 +441,22 @@ fn http1_answers_routes_head_errors_and_keep_alive() {
 }
 
 #[test]
+fn an_http11_request_with_no_host_reaches_the_handler_as_one_that_names_no_host() {
+    let vhosts = httpd::VirtualHosts::new();
+    let mut h = Harness::new(Http1::new(vhosts), ());
+    let _ = h.push(b"GET /x HTTP/1.1\r\nAccept: */*\r\n\r\n");
+    assert!(http_text(&h).starts_with("HTTP/1.1 400 Bad Request"), "{}", http_text(&h));
+    assert!(h.closed());
+    let e = &h.events()[0];
+    assert!(e.is("http", "request"));
+    assert_eq!(e.get("answer").and_then(json::Value::as_str), Some("no_host"));
+    assert!(e.get("host").unwrap().is_null());
+    assert_eq!(e.get("path").and_then(json::Value::as_str), Some("/x"));
+    let names: Vec<&str> = e.get("headers").and_then(json::Value::as_array).unwrap().iter().map(|p| p.as_array().unwrap()[0].as_str().unwrap()).collect();
+    assert_eq!(names, ["accept"]);
+}
+
+#[test]
 fn http1_closes_when_asked_and_on_http10() {
     let router = Router::new().get("/", |_, _| http::Response::new(Bytes::from("x")));
     let mut h = Harness::new(Http1::new(router.clone()), ());
