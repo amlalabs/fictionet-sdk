@@ -2,14 +2,15 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::rdp::Frames;
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
-    Connection, ConnectionKind, DataBlock, Decoder, Error, FailureCode, Frame, GccConference,
-    INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_BUFFERED, MAX_CAPABILITY, MAX_CHANNELS,
-    MAX_CONNECTION_DATA, MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING,
-    MAX_PDU, MAX_PER_LENGTH, MAX_STORAGE, McsConnect, McsPdu, Negotiation, Protocols,
-    SERVER_CHANNEL_ID, SecurityPayload, read_blocks, read_data, write_blocks, write_data,
+    Connection, ConnectionKind, DataBlock, DataBlocks, FailureCode, Frame, GccConference,
+    INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA,
+    MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING, MAX_PDU,
+    MAX_PER_LENGTH, McsConnect, McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload,
+    read_data, write_data,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -21,45 +22,35 @@ fn prefix(data: &[u8], n: usize) -> &[u8] {
     data.get(..data.len().min(n)).unwrap_or_default()
 }
 
-fn plaintext(data: &[u8]) {
-    macro_rules! roundtrip {
-        ($ty:ty) => {
-            if let Ok(value) = <$ty>::parse(data) {
-                let bytes = value.to_bytes().unwrap();
-                assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty>::parse(&bytes), Ok(value));
-            }
-        };
+fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(data: &[u8]) {
+    if let Ok(value) = T::parse(data) {
+        check_wire_value(&value);
+        let bytes = value.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_PDU);
     }
-    roundtrip!(ClientInfo);
-    roundtrip!(LicenseError);
-    roundtrip!(ActivePdu);
-    roundtrip!(CapabilitySet);
+}
+
+fn plaintext(data: &[u8]) {
+    roundtrip::<ClientInfo>(data);
+    roundtrip::<LicenseError>(data);
+    roundtrip::<ActivePdu>(data);
+    roundtrip::<CapabilitySet>(data);
 }
 
 fn pdu(data: &[u8]) {
-    macro_rules! roundtrip {
-        ($ty:ty) => {
-            if let Ok(value) = <$ty>::parse(data) {
-                let bytes = value.to_bytes().unwrap();
-                assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty>::parse(&bytes), Ok(value));
-            }
-        };
-    }
-    roundtrip!(Negotiation);
-    roundtrip!(DataBlock);
-    roundtrip!(GccConference);
-    roundtrip!(McsConnect);
-    if let Ok(blocks) = read_blocks(data) {
-        let bytes = write_blocks(&blocks).unwrap();
+    roundtrip::<Negotiation>(data);
+    roundtrip::<DataBlock>(data);
+    roundtrip::<GccConference>(data);
+    roundtrip::<McsConnect>(data);
+    check_wire::<DataBlocks>(data);
+    if let Ok(blocks) = DataBlocks::parse(data) {
+        let bytes = blocks.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_GCC_DATA);
-        assert_eq!(read_blocks(&bytes), Ok(blocks));
     }
-    if let Ok(value) = McsPdu::parse(data) {
+    if let Ok(value) = <McsPdu as Wire>::parse(data) {
+        check_wire_value(&value);
         let bytes = value.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_PDU);
-        assert_eq!(McsPdu::parse(&bytes), Ok(value.clone()));
         if let McsPdu::SendData { data, .. } = value {
             security(&data);
             plaintext(&data);
@@ -70,11 +61,8 @@ fn pdu(data: &[u8]) {
 }
 
 fn security(data: &[u8]) {
-    if let Ok(value) = SecurityPayload::parse(data) {
-        assert_eq!(
-            SecurityPayload::parse(&value.to_bytes().unwrap()),
-            Ok(value.clone())
-        );
+    check_wire::<SecurityPayload>(data);
+    if let Ok(value) = <SecurityPayload as Wire>::parse(data) {
         if let Ok(data) = value.plaintext() {
             plaintext(data);
         }
@@ -85,7 +73,6 @@ fn frame(value: &Frame) -> Vec<u8> {
     check_wire_value(value);
     let bytes = value.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_FRAME);
-    assert_eq!(Frame::parse(&bytes), Ok(Some((value.clone(), bytes.len()))));
     if let Frame::SlowPath(packet) = value {
         if let Ok(c) = Connection::from_packet(packet) {
             assert_eq!(Connection::from_packet(&c.to_packet().unwrap()), Ok(c));
@@ -98,51 +85,16 @@ fn frame(value: &Frame) -> Vec<u8> {
     bytes
 }
 
-// Canonical frame bytes also encode frame boundaries, so equality checks
-// both the frames and their order without an unbounded list of objects.
-fn stream(data: &[u8], step: usize) -> (Vec<u8>, Option<Error>, usize) {
-    let mut decoder = Decoder::new();
-    let mut transcript = Vec::with_capacity(MAX_FUZZ_INPUT);
-    for chunk in data.chunks(step.max(1)) {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(took <= rest.len());
-            rest = rest.get(took..).unwrap();
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            assert!(decoder.storage_capacity() <= MAX_STORAGE);
-            let mut progress = took != 0;
-            while let Some(result) = decoder.next_frame() {
-                match result {
-                    Ok(value) => {
-                        let bytes = frame(&value);
-                        assert!(transcript.len() + bytes.len() <= MAX_FUZZ_INPUT);
-                        transcript.extend_from_slice(&bytes);
-                        progress = true;
-                    }
-                    Err(e) => {
-                        assert_eq!(decoder.next_frame(), Some(Err(e)));
-                        assert_eq!(decoder.buffered(), 0);
-                        return (transcript, Some(e), 0);
-                    }
-                }
-            }
-            assert!(progress, "a full decoder must yield a frame or error");
-        }
-    }
-    (transcript, None, decoder.buffered())
-}
-
 fn built(data: &[u8]) {
     let byte = |i: usize| data.get(i).copied().unwrap_or(0);
     let word = |i: usize| u32::from_le_bytes([byte(i), byte(i + 1), byte(i + 2), byte(i + 3)]);
     let body = prefix(data, MAX_BUILT_BODY);
     macro_rules! check {
         ($ty:ty, $value:expr) => {{
-            let value = $value;
+            let value: $ty = $value;
+            check_wire_value(&value);
             if let Ok(bytes) = value.to_bytes() {
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty>::parse(&bytes), Ok(value));
             }
         }};
     }
@@ -182,9 +134,6 @@ fn built(data: &[u8]) {
         payload: prefix(data, MAX_FAST_PATH).to_vec(),
     };
     check_wire_value(&fast);
-    if let Ok(bytes) = fast.to_bytes() {
-        assert_eq!(Frame::parse(&bytes), Ok(Some((fast, bytes.len()))));
-    }
     check!(
         DataBlock,
         DataBlock::Other {
@@ -214,7 +163,7 @@ fn built(data: &[u8]) {
     check!(DataBlock, block);
     check!(
         GccConference,
-        GccConference::Request(vec![DataBlock::ClientMultitransport(word(0))])
+        GccConference::Request(DataBlocks(vec![DataBlock::ClientMultitransport(word(0))]))
     );
     check!(
         GccConference,
@@ -222,7 +171,7 @@ fn built(data: &[u8]) {
             node_id: word(0),
             tag: word(4) as i32,
             result: byte(8),
-            blocks: vec![DataBlock::ServerMultitransport(word(9))],
+            blocks: DataBlocks(vec![DataBlock::ServerMultitransport(word(9))]),
         }
     );
     let mcs = McsPdu::SendData {
@@ -313,13 +262,9 @@ fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Frame>(data);
     pdu(data);
-    if let Ok(Some((value, used))) = Frame::parse(data) {
-        assert!(used <= data.len());
+    let (frames, _) = decode_all(Frames::new, data);
+    for value in frames {
         frame(&value);
-    }
-    let whole = stream(data, data.len());
-    for step in [1, 3, 64] {
-        assert_eq!(stream(data, step), whole);
     }
     built(data);
 });

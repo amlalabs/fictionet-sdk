@@ -3,47 +3,18 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::enip::Frames;
 use fictionet::stdlib::enip::{
-    Cpf, Decoder, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest,
-    ForwardOpenResponse, Identity, MAX_BUFFERED, MessageRequest, MessageResponse, Packet,
-    RegisterSession, SendData,
+    Cpf, ForwardCloseRequest, ForwardCloseResponse, ForwardOpenRequest, ForwardOpenResponse,
+    Identity, MessageRequest, MessageResponse, Packet, RegisterSession, SendData,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Packet>(data);
-    // The stream, split two ways: as much as the decoder takes at once,
-    // and a byte at a time.
-    let mut whole = Decoder::new();
-    let mut packets = Vec::new();
-    let mut rest = data;
-    loop {
-        let took = whole.feed(rest);
-        assert!(whole.buffered() <= MAX_BUFFERED);
-        rest = &rest[took..];
-        let before = packets.len();
-        while let Some(p) = whole.next_packet() {
-            packets.push(p);
-        }
-        if rest.is_empty() {
-            break;
-        }
-        // A decoder that took nothing holds a whole packet, so the loop
-        // above took one out and the next feed takes bytes.
-        assert!(took > 0 || packets.len() > before);
-    }
-    let mut bytewise = Decoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        assert_eq!(bytewise.feed(std::slice::from_ref(b)), 1);
-        while let Some(p) = bytewise.next_packet() {
-            again.push(p);
-        }
-    }
-    assert_eq!(packets, again);
-
+    let (packets, _) = decode_all(Frames::new, data);
     let built = Packet {
         command: fictionet::stdlib::enip::Command::Other(u16::from(
             data.first().copied().unwrap_or(0),
@@ -53,89 +24,56 @@ fuzz_target!(|data: &[u8]| {
         sender_context: [0; 8],
         options: u32::from(data.get(1).copied().unwrap_or(0)),
         data: data
-            .get(..data.len().min(MAX_BUFFERED))
+            .get(..data.len().min(fictionet::stdlib::enip::MAX_PACKET))
             .unwrap_or_default()
             .to_vec(),
     };
     check_wire_value(&built);
     for p in &packets {
         check_wire_value(p);
-        // A packet that passes the check writes back to bytes that read the
-        // same; one that fails it cannot be written.
-        match (p.check(), p.to_bytes()) {
-            (Ok(()), Ok(bytes)) => {
-                let (back, used) = Packet::parse(&bytes).unwrap();
-                assert_eq!(&back, p);
-                assert_eq!(used, bytes.len());
-            }
-            (Err(_), Err(_)) => {}
-            other => panic!("check and writer disagree: {other:?}"),
-        }
+        // Validation and writing must agree on whether a packet is allowed.
+        assert_eq!(p.check().is_ok(), p.to_bytes().is_ok());
         // The data as each CIP structure: any that reads must write back to
         // bytes that read the same.
-        if let Ok(send) = SendData::parse(&p.data) {
+        check_wire::<SendData>(&p.data);
+        if let Ok(send) = <SendData as Wire>::parse(&p.data) {
             for it in &send.cpf.items {
                 check_item(&it.data);
             }
-            assert_eq!(SendData::parse(&send.to_bytes().unwrap()), Ok(send));
         }
-        if let Ok(cpf) = Cpf::parse(&p.data) {
+        check_wire::<Cpf>(&p.data);
+        if let Ok(cpf) = <Cpf as Wire>::parse(&p.data) {
             for it in &cpf.items {
                 check_item(&it.data);
             }
-            assert_eq!(Cpf::parse(&cpf.to_bytes().unwrap()), Ok(cpf));
         }
         check_item(&p.data);
     }
 
     // Any bytes on their own, as each structure. None may panic, and each
     // read must write back to bytes that read the same.
-    if let Ok(cpf) = Cpf::parse(data) {
-        assert_eq!(Cpf::parse(&cpf.to_bytes().unwrap()), Ok(cpf));
-    }
-    if let Ok(send) = SendData::parse(data) {
-        assert_eq!(SendData::parse(&send.to_bytes().unwrap()), Ok(send));
-    }
-    if let Ok(rs) = RegisterSession::parse(data) {
-        assert_eq!(RegisterSession::parse(&rs.to_bytes()), Ok(rs));
-    }
-    if let Ok(fo) = ForwardOpenRequest::parse(data) {
-        assert_eq!(ForwardOpenRequest::parse(&fo.to_bytes().unwrap()), Ok(fo));
-    }
-    if let Ok(fo) = ForwardOpenResponse::parse(data) {
-        assert_eq!(ForwardOpenResponse::parse(&fo.to_bytes().unwrap()), Ok(fo));
-    }
-    if let Ok(fc) = ForwardCloseRequest::parse(data) {
-        assert_eq!(ForwardCloseRequest::parse(&fc.to_bytes().unwrap()), Ok(fc));
-    }
-    if let Ok(fc) = ForwardCloseResponse::parse(data) {
-        assert_eq!(ForwardCloseResponse::parse(&fc.to_bytes().unwrap()), Ok(fc));
-    }
+    check_wire::<Cpf>(data);
+    check_wire::<SendData>(data);
+    check_wire::<RegisterSession>(data);
+    check_wire::<ForwardOpenRequest>(data);
+    check_wire::<ForwardOpenResponse>(data);
+    check_wire::<ForwardCloseRequest>(data);
+    check_wire::<ForwardCloseResponse>(data);
     check_item(data);
 });
 
 /// The bytes of one item as each CIP structure, and the bodies inside a
 /// message: any that reads must write back to bytes that read the same.
 fn check_item(b: &[u8]) {
-    if let Ok(req) = MessageRequest::parse(b) {
-        if let Ok(fo) = ForwardOpenRequest::parse(&req.data) {
-            assert_eq!(ForwardOpenRequest::parse(&fo.to_bytes().unwrap()), Ok(fo));
-        }
-        if let Ok(fc) = ForwardCloseRequest::parse(&req.data) {
-            assert_eq!(ForwardCloseRequest::parse(&fc.to_bytes().unwrap()), Ok(fc));
-        }
-        assert_eq!(MessageRequest::parse(&req.to_bytes().unwrap()), Ok(req));
+    check_wire::<MessageRequest>(b);
+    check_wire::<MessageResponse>(b);
+    check_wire::<Identity>(b);
+    if let Ok(req) = <MessageRequest as Wire>::parse(b) {
+        check_wire::<ForwardOpenRequest>(&req.data);
+        check_wire::<ForwardCloseRequest>(&req.data);
     }
-    if let Ok(resp) = MessageResponse::parse(b) {
-        if let Ok(fo) = ForwardOpenResponse::parse(&resp.data) {
-            assert_eq!(ForwardOpenResponse::parse(&fo.to_bytes().unwrap()), Ok(fo));
-        }
-        if let Ok(fc) = ForwardCloseResponse::parse(&resp.data) {
-            assert_eq!(ForwardCloseResponse::parse(&fc.to_bytes().unwrap()), Ok(fc));
-        }
-        assert_eq!(MessageResponse::parse(&resp.to_bytes().unwrap()), Ok(resp));
-    }
-    if let Ok(id) = Identity::parse(b) {
-        assert_eq!(Identity::parse(&id.to_bytes().unwrap()), Ok(id));
+    if let Ok(resp) = <MessageResponse as Wire>::parse(b) {
+        check_wire::<ForwardOpenResponse>(&resp.data);
+        check_wire::<ForwardCloseResponse>(&resp.data);
     }
 }

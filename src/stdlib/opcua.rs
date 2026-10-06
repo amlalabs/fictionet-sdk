@@ -10,14 +10,14 @@
 //! encoding of the built-in types, and the OpenSecureChannel and
 //! CloseSecureChannel services with security policy None.
 //!
-//! Nothing here reads a socket. A world that plays a server feeds the
-//! bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Decoder`] and gets [`Message`]s back. It answers a [`Hello`] with an
-//! [`Acknowledge`], gives the decoder the negotiated [`Limits`], reads each
-//! [`SecureMessage`]'s body as a [`Service`], and writes its answers with
-//! [`Message::to_bytes`]. Chunks of a long message are put back together
-//! before the world sees it. What the address space holds, and which
-//! requests succeed, is up to world code.
+//! Nothing here reads a socket. A world pushes connection bytes to a
+//! [`Stream<Messages>`](super::codec::Stream) and gets [`Message`]s back.
+//! It answers a [`Hello`] with an [`Acknowledge`], gives the decoder the
+//! negotiated [`Limits`], reads each [`SecureMessage`]'s body as a [`Service`],
+//! and splits replies with [`Message::chunks`]. Each chunk is written with
+//! [`Wire::write`].
+//! Chunks of a long message are put back together before the world sees it.
+//! What the address space holds, and which requests succeed, is up to world code.
 //!
 //! There is no cryptography. A secure message's body is kept exactly as it
 //! came, which is the plain body under policy None. A world that is asked
@@ -32,20 +32,15 @@
 //! message writer checks the same limits and returns an [`EncodeError`]
 //! rather than write bytes a reader would refuse.
 //!
-//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream) to read
-//! individual [`Chunk`]s under negotiated limits. [`Chunk`] implements
-//! [`Wire`] for exact parsing and transactional writing under the module's
-//! maximum chunk size. Message assembly and connection sequence checks
-//! remain in [`Decoder`]. Message writers still take explicit peer limits.
-//!
 //! ```
+//! use fictionet::stdlib::codec::{Stream, Wire};
 //! use fictionet::stdlib::opcua::{
-//!     AsymmetricHeader, ChannelSecurityToken, Decoder, Limits, Message, OpenSecureChannelRequest,
+//!     AsymmetricHeader, ChannelSecurityToken, Messages, Limits, Message, OpenSecureChannelRequest,
 //!     OpenSecureChannelResponse, RequestHeader, RequestType, ResponseHeader, SecureKind,
 //!     SecureMessage, SecurityMode, Service, SECURITY_POLICY_NONE,
 //! };
 //!
-//! let mut server = Decoder::new();
+//! let mut server = Stream::new(Messages::new());
 //!
 //! // A client's Hello: version 0, 64 KiB buffers, no message or chunk
 //! // limits, and its endpoint URL.
@@ -57,15 +52,18 @@
 //! }
 //! hel.extend_from_slice(&(url.len() as i32).to_le_bytes());
 //! hel.extend_from_slice(url);
-//! server.feed(&hel);
+//! assert_eq!(server.push(&hel), hel.len());
 //!
-//! let Some(Ok(Message::Hello(hello))) = server.next_message() else { panic!() };
+//! let Some(Ok(Message::Hello(hello))) = server.next() else { panic!() };
 //! assert_eq!(hello.endpoint_url, "opc.tcp://plc:4840");
 //! // The server takes chunks of up to 8192 bytes, the smallest allowed.
 //! let ack = hello.acknowledge(&Limits::default());
 //! assert_eq!(ack.receive_buffer_size, 8192);
-//! server.set_limits(ack.limits());
-//! let reply = Message::Acknowledge(ack).to_bytes(&hello.limits()).unwrap();
+//! server.decoder().set_limits(ack.limits());
+//! let mut reply = Vec::new();
+//! for chunk in Message::Acknowledge(ack).chunks(&hello.limits()).unwrap() {
+//!     chunk.write(&mut reply).unwrap();
+//! }
 //! assert_eq!(&reply[..4], b"ACKF");
 //! assert_eq!(reply.len(), 28);
 //!
@@ -85,16 +83,21 @@
 //!     request_id: 1,
 //!     body: request.to_bytes().unwrap(),
 //! });
-//! server.feed(&opn.to_bytes(&ack.limits()).unwrap());
+//! let mut bytes = Vec::new();
+//! for chunk in opn.chunks(&ack.limits()).unwrap() { chunk.write(&mut bytes).unwrap(); }
+//! assert_eq!(server.push(&bytes), bytes.len());
 //!
-//! let Some(Ok(Message::Secure(msg))) = server.next_message() else { panic!() };
+//! let Some(Ok(Message::Secure(msg))) = server.next() else { panic!() };
 //! let SecureKind::Open(security) = &msg.kind else { panic!() };
 //! assert_eq!(security.policy_uri, SECURITY_POLICY_NONE);
 //! let Ok(Service::OpenSecureChannelRequest(req)) = Service::parse(&msg.body) else { panic!() };
 //!
 //! // The server issues channel 7, token 1.
 //! let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
-//!     header: ResponseHeader { request_handle: req.header.request_handle, ..ResponseHeader::default() },
+//!     header: ResponseHeader {
+//!         request_handle: req.header.request_handle,
+//!         ..ResponseHeader::default()
+//!     },
 //!     server_protocol_version: 0,
 //!     security_token: ChannelSecurityToken {
 //!         channel_id: 7,
@@ -111,7 +114,8 @@
 //!     request_id: msg.request_id,
 //!     body: response.to_bytes().unwrap(),
 //! });
-//! let bytes = answer.to_bytes(&hello.limits()).unwrap();
+//! let mut bytes = Vec::new();
+//! for chunk in answer.chunks(&hello.limits()).unwrap() { chunk.write(&mut bytes).unwrap(); }
 //! assert_eq!(&bytes[..4], b"OPNF");
 //! assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
 //! ```
@@ -126,12 +130,12 @@ pub const HEADER_LEN: usize = 8;
 /// The UA TCP protocol version this module speaks.
 pub const PROTOCOL_VERSION: u32 = 0;
 /// The smallest send or receive buffer a Hello or Acknowledge may name.
-/// It is also the largest chunk a [`Decoder`] takes before [`Limits`] are
+/// It is also the largest chunk a [`Messages`] takes before [`Limits`] are
 /// negotiated.
 pub const MIN_BUFFER_SIZE: u32 = 8192;
-/// The largest chunk a [`Decoder`] takes, whatever was negotiated.
+/// The largest chunk a [`Messages`] takes, whatever was negotiated.
 pub const MAX_BUFFER_SIZE: u32 = 1 << 20;
-/// The largest message body a [`Decoder`] puts together from chunks,
+/// The largest message body a [`Messages`] puts together from chunks,
 /// whatever was negotiated.
 pub const MAX_MESSAGE_SIZE: u32 = 1 << 24;
 /// The most chunks one message may take, whatever was negotiated.
@@ -144,7 +148,7 @@ pub const MAX_URL_LEN: usize = 4095;
 pub const MAX_REASON_LEN: usize = 4096;
 /// The longest security policy URI in an OPN chunk, in bytes.
 pub const MAX_POLICY_URI_LEN: usize = 255;
-/// The largest HEL, ACK, ERR or RHE message a [`Decoder`] takes, even
+/// The largest HEL, ACK, ERR or RHE message a [`Messages`] takes, even
 /// when the negotiated chunk size is smaller: a ReverseHello holding two
 /// URLs of the longest length.
 pub const MAX_HANDSHAKE_SIZE: u32 = (HEADER_LEN + 2 * (4 + MAX_URL_LEN)) as u32;
@@ -152,7 +156,7 @@ pub const MAX_HANDSHAKE_SIZE: u32 = (HEADER_LEN + 2 * (4 + MAX_URL_LEN)) as u32;
 pub const MAX_STRING_LEN: usize = MAX_MESSAGE_SIZE as usize;
 /// The most elements in one array.
 pub const MAX_ARRAY_LEN: usize = 1 << 16;
-/// The most values one [`Reader`] reads, or one [`Writer`] writes: every
+/// The most values one [`Reader`] reads, or one [`Wire::write`] writes: every
 /// array element, and every Variant, DataValue and DiagnosticInfo, counted
 /// together. A value in memory can be a hundred times larger than its one
 /// byte on the wire, so this bounds what a message can make a reader
@@ -163,25 +167,21 @@ pub const MAX_DIMENSIONS: usize = 32;
 /// How deeply Variants, DataValues and DiagnosticInfos may nest inside
 /// one another. Part 6 asks decoders to take at least 100 levels.
 pub const MAX_DEPTH: usize = 100;
-/// The most bytes a [`Decoder`] holds that it has not yet taken out as
-/// messages. [`Decoder::feed`] takes no more than fit.
-pub const MAX_BUFFERED: usize = 4 << 20;
 /// The longest String identifier of a NodeId, in characters, and the
 /// longest Opaque one, in bytes (Part 3, 8.2.4).
 pub const MAX_NODE_ID_LEN: usize = 4096;
 /// The longest name of a QualifiedName, in characters (Part 3, 8.3).
 pub const MAX_QUALIFIED_NAME_LEN: usize = 512;
-/// The latest DateTime a writer keeps: 9999-12-31 23:59:59 UTC. A writer
-/// writes this and anything later as `i64::MAX`, and anything at or before
-/// the 1601 epoch as 0, as Part 6 asks.
+/// The upper DateTime threshold: 9999-12-31 23:59:59 UTC. Readers map this
+/// and later values to `i64::MAX`, and dates before the 1601 epoch to zero.
+/// Writers require the mapped value and refuse values that would change.
 pub const MAX_DATE_TIME: i64 = 2_650_467_743_990_000_000;
-/// The largest picoseconds field of a DataValue. Readers read a larger one
-/// as this, and writers write a larger one as this.
+/// The largest picoseconds field of a DataValue. Readers map larger values
+/// to this limit. Writers refuse values above it.
 pub const MAX_PICOSECONDS: u16 = 9999;
-/// The largest sequence number a legacy security policy may not wrap
-/// after. Once a number is above it, the next may wrap around to a number
-/// below 1024. A [`Decoder`] accepts that wrap inside a message, as well
-/// as the plain one past `u32::MAX`.
+/// Above this sequence number, a legacy security policy may wrap to a
+/// number below 1024. A [`Messages`] accepts that wrap inside a message,
+/// as well as the plain one past `u32::MAX`.
 pub const LEGACY_WRAP: u32 = u32::MAX - 1024;
 /// The URI of security policy None, the only policy this module carries.
 pub const SECURITY_POLICY_NONE: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
@@ -337,9 +337,6 @@ pub enum EncodeError {
     /// A Hello or Acknowledge names a buffer smaller than
     /// [`MIN_BUFFER_SIZE`].
     BufferSize(u32),
-    /// A [`Service::Other`] carries the type id of a service this module
-    /// reads, so its body would be read as that service.
-    KnownTypeId,
     /// A NodeId's String identifier or a QualifiedName's name holds a C0
     /// or C1 control character.
     ControlChar,
@@ -347,6 +344,9 @@ pub enum EncodeError {
     /// receiver thumbprint under policy None, or a thumbprint that is not
     /// 20 bytes.
     SecurityHeader,
+    /// A field would read back as a different value, or [`Service::Other`]
+    /// carries a known service type ID.
+    Unwritable,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -358,9 +358,9 @@ impl std::fmt::Display for EncodeError {
             EncodeError::VariantType => f.write_str("a Variant holds a value of the wrong type"),
             EncodeError::Dimensions => f.write_str("array dimensions do not match the array"),
             EncodeError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
-            EncodeError::KnownTypeId => f.write_str("an unread service carries a known type id"),
             EncodeError::ControlChar => f.write_str("a name holds a control character"),
             EncodeError::SecurityHeader => f.write_str("the security header breaks its policy"),
+            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -383,12 +383,20 @@ pub struct Reader<'a> {
     values: usize,
     /// How many DataValues the value being read is inside.
     data_values: usize,
+    writable: bool,
 }
 
 impl<'a> Reader<'a> {
     /// A reader at the start of `bytes`.
     pub fn new(bytes: &'a [u8]) -> Reader<'a> {
-        Reader { bytes, pos: 0, depth: 0, values: 0, data_values: 0 }
+        Reader {
+            bytes,
+            pos: 0,
+            depth: 0,
+            values: 0,
+            data_values: 0,
+            writable: false,
+        }
     }
 
     /// How many bytes are left.
@@ -465,9 +473,9 @@ impl<'a> Reader<'a> {
         Ok(i64::from_le_bytes(self.array()?))
     }
     /// A DateTime: 100-nanosecond intervals since January 1, 1601 (UTC).
-    /// It reads as [`Writer::date_time`] writes: anything at or before the
+    /// Anything at or before the
     /// epoch as 0, and anything at or after [`MAX_DATE_TIME`] as
-    /// `i64::MAX`, so a value read writes back the same.
+    /// `i64::MAX`. Writers require these canonical values.
     pub fn date_time(&mut self) -> Result<i64, DecodeError> {
         Ok(clamp_date_time(self.i64()?))
     }
@@ -510,7 +518,9 @@ impl<'a> Reader<'a> {
     pub fn string_max(&mut self, max: usize) -> Result<Option<String>, DecodeError> {
         match self.byte_string_max(max)? {
             None => Ok(None),
-            Some(b) => String::from_utf8(b).map(Some).map_err(|_| DecodeError::Utf8),
+            Some(b) => String::from_utf8(b)
+                .map(Some)
+                .map_err(|_| DecodeError::Utf8),
         }
     }
 
@@ -557,7 +567,10 @@ impl<'a> Reader<'a> {
     /// Runs `f` one level deeper, failing past [`MAX_DEPTH`]. It counts
     /// one value toward [`MAX_VALUES`]. The depth is restored whether `f`
     /// succeeds or not.
-    fn nested<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T, DecodeError>) -> Result<T, DecodeError> {
+    fn nested<T>(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<T, DecodeError>,
+    ) -> Result<T, DecodeError> {
         if self.depth >= MAX_DEPTH {
             return Err(DecodeError::Depth);
         }
@@ -572,8 +585,9 @@ impl<'a> Reader<'a> {
 /// Builds bytes in the OPC UA binary encoding. It checks every limit a
 /// [`Reader`] checks, so what it writes reads back.
 #[derive(Debug, Default)]
-pub struct Writer {
+struct Writer {
     out: Vec<u8>,
+    error: Option<EncodeError>,
     depth: usize,
     values: usize,
     /// How many DataValues the value being written is inside.
@@ -582,84 +596,99 @@ pub struct Writer {
 
 impl Writer {
     /// A writer holding no bytes.
-    pub fn new() -> Writer {
+    fn new() -> Writer {
         Writer::default()
     }
 
     /// The bytes written.
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.out
-    }
-
-    /// How many bytes have been written.
-    pub fn len(&self) -> usize {
-        self.out.len()
-    }
-
-    /// Whether nothing has been written.
-    pub fn is_empty(&self) -> bool {
-        self.out.is_empty()
+    fn into_bytes(self) -> Result<Vec<u8>, EncodeError> {
+        match self.error {
+            Some(error) => Err(error),
+            None => Ok(self.out),
+        }
     }
 
     /// Raw bytes, with no length.
-    pub fn bytes(&mut self, b: &[u8]) {
-        self.out.extend_from_slice(b);
+    fn bytes(&mut self, b: &[u8]) {
+        if self.error.is_some() {
+            return;
+        }
+        if self
+            .out
+            .len()
+            .checked_add(b.len())
+            .is_none_or(|n| n > MAX_MESSAGE_SIZE as usize)
+        {
+            self.error = Some(EncodeError::TooLong);
+        } else {
+            self.out.extend_from_slice(b);
+        }
     }
     /// A Byte.
-    pub fn u8(&mut self, v: u8) {
-        self.out.push(v);
+    fn u8(&mut self, v: u8) {
+        self.bytes(&[v]);
     }
     /// An SByte.
-    pub fn i8(&mut self, v: i8) {
+    fn i8(&mut self, v: i8) {
         self.bytes(&v.to_le_bytes());
     }
     /// A Boolean, as 1 or 0.
-    pub fn bool(&mut self, v: bool) {
-        self.out.push(u8::from(v));
+    fn bool(&mut self, v: bool) {
+        self.u8(u8::from(v));
     }
     /// A UInt16.
-    pub fn u16(&mut self, v: u16) {
+    fn u16(&mut self, v: u16) {
         self.bytes(&v.to_le_bytes());
     }
     /// An Int16.
-    pub fn i16(&mut self, v: i16) {
+    fn i16(&mut self, v: i16) {
         self.bytes(&v.to_le_bytes());
     }
     /// A UInt32.
-    pub fn u32(&mut self, v: u32) {
+    fn u32(&mut self, v: u32) {
         self.bytes(&v.to_le_bytes());
     }
     /// An Int32.
-    pub fn i32(&mut self, v: i32) {
+    fn i32(&mut self, v: i32) {
         self.bytes(&v.to_le_bytes());
     }
     /// A UInt64.
-    pub fn u64(&mut self, v: u64) {
+    fn u64(&mut self, v: u64) {
         self.bytes(&v.to_le_bytes());
     }
     /// An Int64, written as it is. A DateTime goes through
     /// [`Writer::date_time`].
-    pub fn i64(&mut self, v: i64) {
+    fn i64(&mut self, v: i64) {
         self.bytes(&v.to_le_bytes());
     }
-    /// A DateTime. One at or before the 1601 epoch is written as 0, and
-    /// one at or after [`MAX_DATE_TIME`] as `i64::MAX`, as Part 6 asks.
-    pub fn date_time(&mut self, v: i64) {
-        self.i64(clamp_date_time(v));
+    /// A canonical DateTime. Values changed by the reader are refused.
+    fn date_time(&mut self, v: i64) {
+        if v != clamp_date_time(v) {
+            self.error = Some(EncodeError::Unwritable);
+        }
+        self.i64(v);
     }
     /// A Float. Any NaN is written as the quiet NaN Part 6 names.
-    pub fn f32(&mut self, v: f32) {
-        let v = if v.is_nan() { f32::from_bits(0xffc0_0000) } else { v };
+    fn f32(&mut self, v: f32) {
+        let v = if v.is_nan() {
+            f32::from_bits(0xffc0_0000)
+        } else {
+            v
+        };
         self.bytes(&v.to_le_bytes());
     }
     /// A Double. Any NaN is written as the quiet NaN Part 6 names.
-    pub fn f64(&mut self, v: f64) {
-        let v = if v.is_nan() { f64::from_bits(0xfff8_0000_0000_0000) } else { v };
+    fn f64(&mut self, v: f64) {
+        let v = if v.is_nan() {
+            f64::from_bits(0xfff8_0000_0000_0000)
+        } else {
+            v
+        };
         self.bytes(&v.to_le_bytes());
     }
 
     /// A ByteString of at most `max` bytes. `None` is written as null.
-    pub fn byte_string_max(&mut self, b: Option<&[u8]>, max: usize) -> Result<(), EncodeError> {
+    fn byte_string_max(&mut self, b: Option<&[u8]>, max: usize) -> Result<(), EncodeError> {
         match b {
             None => self.i32(-1),
             Some(b) => {
@@ -675,23 +704,23 @@ impl Writer {
     }
 
     /// A ByteString of at most [`MAX_STRING_LEN`] bytes.
-    pub fn byte_string(&mut self, b: Option<&[u8]>) -> Result<(), EncodeError> {
+    fn byte_string(&mut self, b: Option<&[u8]>) -> Result<(), EncodeError> {
         self.byte_string_max(b, MAX_STRING_LEN)
     }
 
     /// A String of at most `max` bytes. `None` is written as null.
-    pub fn string_max(&mut self, s: Option<&str>, max: usize) -> Result<(), EncodeError> {
+    fn string_max(&mut self, s: Option<&str>, max: usize) -> Result<(), EncodeError> {
         self.byte_string_max(s.map(str::as_bytes), max)
     }
 
     /// A String of at most [`MAX_STRING_LEN`] bytes.
-    pub fn string(&mut self, s: Option<&str>) -> Result<(), EncodeError> {
+    fn string(&mut self, s: Option<&str>) -> Result<(), EncodeError> {
         self.string_max(s, MAX_STRING_LEN)
     }
 
     /// An array's length, at most [`MAX_ARRAY_LEN`]. Its elements count
     /// toward [`MAX_VALUES`], as a [`Reader`] counts them.
-    pub fn array_len(&mut self, n: usize) -> Result<(), EncodeError> {
+    fn array_len(&mut self, n: usize) -> Result<(), EncodeError> {
         if n > MAX_ARRAY_LEN {
             return Err(EncodeError::TooLong);
         }
@@ -709,13 +738,8 @@ impl Writer {
         Ok(())
     }
 
-    /// A value of type `T`.
-    pub fn write<T: Binary>(&mut self, v: &T) -> Result<(), EncodeError> {
-        v.encode(self)
-    }
-
     /// An array of `T`: a length, then the elements.
-    pub fn write_array<T: Binary>(&mut self, values: &[T]) -> Result<(), EncodeError> {
+    fn write_array<T: BinaryWrite>(&mut self, values: &[T]) -> Result<(), EncodeError> {
         self.array_len(values.len())?;
         for v in values {
             v.encode(self)?;
@@ -726,7 +750,10 @@ impl Writer {
     /// Runs `f` one level deeper, failing past [`MAX_DEPTH`]. It counts
     /// one value toward [`MAX_VALUES`], as a [`Reader`] does. The depth is
     /// restored whether `f` succeeds or not.
-    fn nested(&mut self, f: impl FnOnce(&mut Self) -> Result<(), EncodeError>) -> Result<(), EncodeError> {
+    fn nested(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<(), EncodeError>,
+    ) -> Result<(), EncodeError> {
         if self.depth >= MAX_DEPTH {
             return Err(EncodeError::TooDeep);
         }
@@ -754,32 +781,17 @@ fn clamp_date_time(v: i64) -> i64 {
 pub trait Binary: Sized {
     /// Reads one value from `r`.
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
-    /// Writes the value to `w`.
+}
+
+/// A type that writes an OPC UA binary encoding.
+trait BinaryWrite {
+    /// Writes one value to `w`.
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError>;
-}
-
-/// Reads one value of type `T` that fills all of `bytes`.
-pub fn decode<T: Binary>(bytes: &[u8]) -> Result<T, DecodeError> {
-    let mut r = Reader::new(bytes);
-    let v = T::decode(&mut r)?;
-    r.finish()?;
-    Ok(v)
-}
-
-/// The bytes of one value of type `T`.
-pub fn encode<T: Binary>(v: &T) -> Result<Vec<u8>, EncodeError> {
-    let mut w = Writer::new();
-    v.encode(&mut w)?;
-    Ok(w.into_bytes())
 }
 
 impl Binary for StatusCode {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(StatusCode(r.u32()?))
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.u32(self.0);
-        Ok(())
     }
 }
 
@@ -789,37 +801,61 @@ impl Binary for StatusCode {
 
 /// Built-in type ids, as a Variant's encoding mask names them.
 pub mod type_id {
-    #![allow(missing_docs)]
+    /// Null (0).
     pub const NULL: u8 = 0;
+    /// Boolean (1).
     pub const BOOLEAN: u8 = 1;
+    /// SByte (2).
     pub const SBYTE: u8 = 2;
+    /// Byte (3).
     pub const BYTE: u8 = 3;
+    /// Int16 (4).
     pub const INT16: u8 = 4;
+    /// UInt16 (5).
     pub const UINT16: u8 = 5;
+    /// Int32 (6).
     pub const INT32: u8 = 6;
+    /// UInt32 (7).
     pub const UINT32: u8 = 7;
+    /// Int64 (8).
     pub const INT64: u8 = 8;
+    /// UInt64 (9).
     pub const UINT64: u8 = 9;
+    /// Float (10).
     pub const FLOAT: u8 = 10;
+    /// Double (11).
     pub const DOUBLE: u8 = 11;
+    /// String (12).
     pub const STRING: u8 = 12;
+    /// DateTime (13).
     pub const DATE_TIME: u8 = 13;
+    /// Guid (14).
     pub const GUID: u8 = 14;
+    /// ByteString (15).
     pub const BYTE_STRING: u8 = 15;
+    /// XmlElement (16).
     pub const XML_ELEMENT: u8 = 16;
+    /// NodeId (17).
     pub const NODE_ID: u8 = 17;
+    /// ExpandedNodeId (18).
     pub const EXPANDED_NODE_ID: u8 = 18;
+    /// StatusCode (19).
     pub const STATUS_CODE: u8 = 19;
+    /// QualifiedName (20).
     pub const QUALIFIED_NAME: u8 = 20;
+    /// LocalizedText (21).
     pub const LOCALIZED_TEXT: u8 = 21;
+    /// ExtensionObject (22).
     pub const EXTENSION_OBJECT: u8 = 22;
+    /// DataValue (23).
     pub const DATA_VALUE: u8 = 23;
+    /// Variant (24).
     pub const VARIANT: u8 = 24;
+    /// DiagnosticInfo (25).
     pub const DIAGNOSTIC_INFO: u8 = 25;
-    /// Ids 26 to 31 are reserved. Readers keep their values as
-    /// ByteStrings, as the specification asks.
+    /// First reserved type id (26), read as a ByteString.
     pub const RESERVED_FIRST: u8 = 26;
-    /// The last reserved id.
+    /// Last reserved type id (31), read as a ByteString.
     pub const RESERVED_LAST: u8 = 31;
 }
 
@@ -839,14 +875,12 @@ pub struct Guid {
 
 impl Binary for Guid {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Ok(Guid { data1: r.u32()?, data2: r.u16()?, data3: r.u16()?, data4: r.array()? })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.u32(self.data1);
-        w.u16(self.data2);
-        w.u16(self.data3);
-        w.bytes(&self.data4);
-        Ok(())
+        Ok(Guid {
+            data1: r.u32()?,
+            data2: r.u16()?,
+            data3: r.u16()?,
+            data4: r.array()?,
+        })
     }
 }
 
@@ -886,12 +920,18 @@ impl Default for NodeId {
 impl NodeId {
     /// A numeric NodeId.
     pub fn numeric(namespace: u16, id: u32) -> NodeId {
-        NodeId { namespace, identifier: Identifier::Numeric(id) }
+        NodeId {
+            namespace,
+            identifier: Identifier::Numeric(id),
+        }
     }
 
     /// A string NodeId.
     pub fn string(namespace: u16, id: &str) -> NodeId {
-        NodeId { namespace, identifier: Identifier::String(id.to_string()) }
+        NodeId {
+            namespace,
+            identifier: Identifier::String(id.to_string()),
+        }
     }
 
     /// Whether this is a null NodeId: in namespace 0, numeric 0, an empty
@@ -930,17 +970,25 @@ impl NodeId {
             }
             3 => {
                 let namespace = r.u16()?;
-                NodeId { namespace, identifier: Identifier::String(read_name(r, MAX_NODE_ID_LEN)?) }
+                NodeId {
+                    namespace,
+                    identifier: Identifier::String(read_name(r, MAX_NODE_ID_LEN)?),
+                }
             }
             4 => {
                 let namespace = r.u16()?;
-                NodeId { namespace, identifier: Identifier::Guid(r.read()?) }
+                NodeId {
+                    namespace,
+                    identifier: Identifier::Guid(r.read()?),
+                }
             }
             5 => {
                 let namespace = r.u16()?;
                 NodeId {
                     namespace,
-                    identifier: Identifier::Opaque(r.byte_string_max(MAX_NODE_ID_LEN)?.unwrap_or_default()),
+                    identifier: Identifier::Opaque(
+                        r.byte_string_max(MAX_NODE_ID_LEN)?.unwrap_or_default(),
+                    ),
                 }
             }
             _ => return Err(DecodeError::NodeIdForm(form)),
@@ -1000,7 +1048,9 @@ fn read_name(r: &mut Reader<'_>, max: usize) -> Result<String, DecodeError> {
     let s = r.string_max(max * 4)?.unwrap_or_default();
     let chars = s.chars().count();
     if chars > max {
-        return Err(DecodeError::Length(i32::try_from(chars).unwrap_or(i32::MAX)));
+        return Err(DecodeError::Length(
+            i32::try_from(chars).unwrap_or(i32::MAX),
+        ));
     }
     if s.chars().any(is_c0_c1) {
         return Err(DecodeError::ControlChar);
@@ -1027,20 +1077,17 @@ impl Binary for NodeId {
         }
         NodeId::decode_form(r, form)
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        self.encode_flags(w, 0)
-    }
 }
 
 /// An ExpandedNodeId: a NodeId that may name its namespace by URI and a
 /// server by index.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ExpandedNodeId {
-    /// The NodeId. When a namespace URI is given, its namespace index is
-    /// written as 0, as Part 6 asks, and reads as 0.
+    /// The NodeId. A namespace URI requires namespace index zero when writing.
+    /// The reader sets the index to zero when a URI is present.
     pub node_id: NodeId,
     /// The namespace's URI, if given. A null or empty URI reads as `None`,
-    /// and an empty one is left off the wire.
+    /// and writers refuse an empty URI. Use None to omit it.
     pub namespace_uri: Option<String>,
     /// The index into the server table. 0 is the local server, and is
     /// left off the wire.
@@ -1050,7 +1097,11 @@ pub struct ExpandedNodeId {
 impl From<NodeId> for ExpandedNodeId {
     /// The NodeId on the local server, with no namespace URI.
     fn from(node_id: NodeId) -> ExpandedNodeId {
-        ExpandedNodeId { node_id, namespace_uri: None, server_index: 0 }
+        ExpandedNodeId {
+            node_id,
+            namespace_uri: None,
+            server_index: 0,
+        }
     }
 }
 
@@ -1058,35 +1109,20 @@ impl Binary for ExpandedNodeId {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let form = r.u8()?;
         let mut node_id = NodeId::decode_form(r, form)?;
-        let namespace_uri = if form & 0x80 != 0 { r.string()?.filter(|u| !u.is_empty()) } else { None };
+        let namespace_uri = if form & 0x80 != 0 {
+            r.string()?.filter(|u| !u.is_empty())
+        } else {
+            None
+        };
         if namespace_uri.is_some() {
             node_id.namespace = 0;
         }
         let server_index = if form & 0x40 != 0 { r.u32()? } else { 0 };
-        Ok(ExpandedNodeId { node_id, namespace_uri, server_index })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        let uri = self.namespace_uri.as_deref().filter(|u| !u.is_empty());
-        let mut flags = 0;
-        if uri.is_some() {
-            flags |= 0x80;
-        }
-        if self.server_index != 0 {
-            flags |= 0x40;
-        }
-        if uri.is_some() && self.node_id.namespace != 0 {
-            let node_id = NodeId { namespace: 0, ..self.node_id.clone() };
-            node_id.encode_flags(w, flags)?;
-        } else {
-            self.node_id.encode_flags(w, flags)?;
-        }
-        if let Some(uri) = uri {
-            w.string(Some(uri))?;
-        }
-        if self.server_index != 0 {
-            w.u32(self.server_index);
-        }
-        Ok(())
+        Ok(ExpandedNodeId {
+            node_id,
+            namespace_uri,
+            server_index,
+        })
     }
 }
 
@@ -1102,12 +1138,10 @@ pub struct QualifiedName {
 
 impl Binary for QualifiedName {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Ok(QualifiedName { namespace: r.u16()?, name: read_name(r, MAX_QUALIFIED_NAME_LEN)? })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        check_name(&self.name, MAX_QUALIFIED_NAME_LEN)?;
-        w.u16(self.namespace);
-        w.string(Some(&self.name))
+        Ok(QualifiedName {
+            namespace: r.u16()?,
+            name: read_name(r, MAX_QUALIFIED_NAME_LEN)?,
+        })
     }
 }
 
@@ -1129,16 +1163,6 @@ impl Binary for LocalizedText {
         let locale = if mask & 0x01 != 0 { r.string()? } else { None };
         let text = if mask & 0x02 != 0 { r.string()? } else { None };
         Ok(LocalizedText { locale, text })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.u8(u8::from(self.locale.is_some()) | u8::from(self.text.is_some()) << 1);
-        if let Some(l) = &self.locale {
-            w.string(Some(l))?;
-        }
-        if let Some(t) = &self.text {
-            w.string(Some(t))?;
-        }
-        Ok(())
     }
 }
 
@@ -1176,21 +1200,6 @@ impl Binary for ExtensionObject {
         };
         Ok(ExtensionObject { type_id, body })
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        self.type_id.encode(w)?;
-        match &self.body {
-            ExtensionBody::None => w.u8(0),
-            ExtensionBody::Binary(b) => {
-                w.u8(1);
-                w.byte_string(Some(b))?;
-            }
-            ExtensionBody::Xml(b) => {
-                w.u8(2);
-                w.byte_string(Some(b))?;
-            }
-        }
-        Ok(())
-    }
 }
 
 /// A DiagnosticInfo: where a status came from. Every field is optional.
@@ -1216,9 +1225,6 @@ pub struct DiagnosticInfo {
 impl Binary for DiagnosticInfo {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         r.nested(DiagnosticInfo::decode_inner)
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.nested(|w| self.encode_inner(w))
     }
 }
 
@@ -1269,7 +1275,15 @@ impl DiagnosticInfo {
             }
         }
         w.u8(mask);
-        for v in [self.symbolic_id, self.namespace_uri, self.locale, self.localized_text].into_iter().flatten() {
+        for v in [
+            self.symbolic_id,
+            self.namespace_uri,
+            self.locale,
+            self.localized_text,
+        ]
+        .into_iter()
+        .flatten()
+        {
             w.i32(v);
         }
         if let Some(s) = &self.additional_info {
@@ -1286,36 +1300,55 @@ impl DiagnosticInfo {
 }
 
 /// One value of a built-in type, as a Variant holds it.
-#[derive(Clone, Debug, PartialEq)]
-#[allow(missing_docs)] // each variant is the built-in type it names
+/// NaNs of the same floating type compare equal. Their wire form is canonical.
+#[derive(Clone, Debug)]
 pub enum Value {
+    /// The OPC UA Boolean value.
     Boolean(bool),
+    /// The OPC UA SByte value.
     SByte(i8),
+    /// The OPC UA Byte value.
     Byte(u8),
+    /// The OPC UA Int16 value.
     Int16(i16),
+    /// The OPC UA UInt16 value.
     UInt16(u16),
+    /// The OPC UA Int32 value.
     Int32(i32),
+    /// The OPC UA UInt32 value.
     UInt32(u32),
+    /// The OPC UA Int64 value.
     Int64(i64),
+    /// The OPC UA UInt64 value.
     UInt64(u64),
+    /// The OPC UA Float value.
     Float(f32),
+    /// The OPC UA Double value.
     Double(f64),
     /// A String. Null is `None`.
     String(Option<String>),
     /// 100-nanosecond intervals since January 1, 1601 (UTC), bounded as
-    /// [`Writer::date_time`] and [`Reader::date_time`] bound it.
+    /// [`Reader::date_time`] bounds it.
     DateTime(i64),
+    /// The OPC UA Guid value.
     Guid(Guid),
     /// A ByteString. Null is `None`.
     ByteString(Option<Vec<u8>>),
     /// An XmlElement's bytes, unread. Null is `None`.
     XmlElement(Option<Vec<u8>>),
+    /// The OPC UA NodeId value.
     NodeId(NodeId),
+    /// The OPC UA ExpandedNodeId value.
     ExpandedNodeId(ExpandedNodeId),
+    /// The OPC UA StatusCode value.
     StatusCode(StatusCode),
+    /// The OPC UA QualifiedName value.
     QualifiedName(QualifiedName),
+    /// The OPC UA LocalizedText value.
     LocalizedText(LocalizedText),
+    /// The OPC UA ExtensionObject value.
     ExtensionObject(Box<ExtensionObject>),
+    /// The OPC UA DataValue value.
     DataValue(Box<DataValue>),
     /// A Variant, which may only appear as an array element.
     Variant(Box<Variant>),
@@ -1326,9 +1359,54 @@ pub enum Value {
     /// take one, as Part 6 asks, but writers refuse it, since encoders
     /// shall not use these ids.
     Reserved {
+        /// The reserved built-in type id.
         type_id: u8,
+        /// The opaque ByteString; None means null.
         bytes: Option<Vec<u8>>,
     },
+}
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::SByte(a), Self::SByte(b)) => a == b,
+            (Self::Byte(a), Self::Byte(b)) => a == b,
+            (Self::Int16(a), Self::Int16(b)) => a == b,
+            (Self::UInt16(a), Self::UInt16(b)) => a == b,
+            (Self::Int32(a), Self::Int32(b)) => a == b,
+            (Self::UInt32(a), Self::UInt32(b)) => a == b,
+            (Self::Int64(a), Self::Int64(b)) => a == b,
+            (Self::UInt64(a), Self::UInt64(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Self::Double(a), Self::Double(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Self::String(a), Self::String(b)) => a == b,
+            (Self::DateTime(a), Self::DateTime(b)) => a == b,
+            (Self::Guid(a), Self::Guid(b)) => a == b,
+            (Self::ByteString(a), Self::ByteString(b)) => a == b,
+            (Self::XmlElement(a), Self::XmlElement(b)) => a == b,
+            (Self::NodeId(a), Self::NodeId(b)) => a == b,
+            (Self::ExpandedNodeId(a), Self::ExpandedNodeId(b)) => a == b,
+            (Self::StatusCode(a), Self::StatusCode(b)) => a == b,
+            (Self::QualifiedName(a), Self::QualifiedName(b)) => a == b,
+            (Self::LocalizedText(a), Self::LocalizedText(b)) => a == b,
+            (Self::ExtensionObject(a), Self::ExtensionObject(b)) => a == b,
+            (Self::DataValue(a), Self::DataValue(b)) => a == b,
+            (Self::Variant(a), Self::Variant(b)) => a == b,
+            (Self::DiagnosticInfo(a), Self::DiagnosticInfo(b)) => a == b,
+
+            (
+                Self::Reserved {
+                    type_id: a,
+                    bytes: ab,
+                },
+                Self::Reserved {
+                    type_id: b,
+                    bytes: bb,
+                },
+            ) => a == b && ab == bb,
+            _ => false,
+        }
+    }
 }
 
 impl Value {
@@ -1385,7 +1463,8 @@ impl Value {
     /// Reads a value of built-in type `t`, which [`Value::readable`] takes.
     fn decode(r: &mut Reader<'_>, t: u8) -> Result<Value, DecodeError> {
         use type_id as id;
-        if !Value::readable(t, r.data_values) {
+        if !Value::readable(t, r.data_values) || (r.writable && !Value::writable(t, r.data_values))
+        {
             return Err(DecodeError::VariantType(t));
         }
         Ok(match t {
@@ -1413,7 +1492,10 @@ impl Value {
             id::EXTENSION_OBJECT => Value::ExtensionObject(Box::new(r.read()?)),
             id::DATA_VALUE => Value::DataValue(Box::new(r.read()?)),
             id::VARIANT => Value::Variant(Box::new(r.read()?)),
-            id::RESERVED_FIRST..=id::RESERVED_LAST => Value::Reserved { type_id: t, bytes: r.byte_string()? },
+            id::RESERVED_FIRST..=id::RESERVED_LAST => Value::Reserved {
+                type_id: t,
+                bytes: r.byte_string()?,
+            },
             _ => return Err(DecodeError::VariantType(t)),
         })
     }
@@ -1446,7 +1528,9 @@ impl Value {
             Value::ExtensionObject(e) => e.encode(w)?,
             Value::DataValue(d) => d.encode(w)?,
             Value::Variant(v) => v.encode(w)?,
-            Value::DiagnosticInfo(_) | Value::Reserved { .. } => return Err(EncodeError::VariantType),
+            Value::DiagnosticInfo(_) | Value::Reserved { .. } => {
+                return Err(EncodeError::VariantType);
+            }
         }
         Ok(())
     }
@@ -1461,9 +1545,10 @@ pub enum Variant {
     /// One value. It may not be a [`Value::Variant`].
     Scalar(Value),
     /// An array of values, all of built-in type `type_id`, which is never
-    /// 0 or 25 (DiagnosticInfo). A null array reads as empty. With `dimensions`, the array is multi-dimensional:
-    /// there are at least 2 dimensions, as Part 6 asks, every one is above
-    /// 0, and they multiply out to its length.
+    /// 0 or 25 (DiagnosticInfo). A null array reads as empty.
+    /// With `dimensions`, the array is multi-dimensional: there are at least
+    /// 2 dimensions, as Part 6 asks, every one is above 0, and they multiply
+    /// out to its length.
     Array {
         /// The built-in type of every element, 1 to 31 but not 25.
         /// Writers also refuse the reserved ids, 26 to 31.
@@ -1487,9 +1572,6 @@ impl From<Value> for Variant {
 impl Binary for Variant {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         r.nested(Variant::decode_inner)
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.nested(|w| self.encode_inner(w))
     }
 }
 
@@ -1515,7 +1597,9 @@ impl Variant {
         } else {
             // The type is checked before the length, so an empty array
             // of a type that cannot be there is refused too.
-            if !Value::readable(t, r.data_values) {
+            if !Value::readable(t, r.data_values)
+                || (r.writable && !Value::writable(t, r.data_values))
+            {
                 return Err(DecodeError::VariantType(t));
             }
             let n = r.array_len()?;
@@ -1540,7 +1624,11 @@ impl Variant {
             } else {
                 None
             };
-            Variant::Array { type_id: t, values, dimensions }
+            Variant::Array {
+                type_id: t,
+                values,
+                dimensions,
+            }
         };
         Ok(v)
     }
@@ -1556,7 +1644,11 @@ impl Variant {
                 w.u8(t);
                 v.encode(w)?;
             }
-            Variant::Array { type_id: t, values, dimensions } => {
+            Variant::Array {
+                type_id: t,
+                values,
+                dimensions,
+            } => {
                 if !Value::writable(*t, w.data_values) {
                     return Err(EncodeError::VariantType);
                 }
@@ -1616,7 +1708,7 @@ pub struct DataValue {
     pub source_timestamp: Option<i64>,
     /// What to add to the source timestamp, in units of 10 picoseconds,
     /// up to [`MAX_PICOSECONDS`]. A reader reads a larger value as
-    /// [`MAX_PICOSECONDS`], and a writer writes one as it.
+    /// [`MAX_PICOSECONDS`]. Writers refuse a value above that limit.
     pub source_picoseconds: Option<u16>,
     /// When the server saw the value, as a DateTime.
     pub server_timestamp: Option<i64>,
@@ -1633,14 +1725,6 @@ impl Binary for DataValue {
             r.data_values += 1;
             let out = DataValue::decode_inner(r);
             r.data_values -= 1;
-            out
-        })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.nested(|w| {
-            w.data_values += 1;
-            let out = self.encode_inner(w);
-            w.data_values -= 1;
             out
         })
     }
@@ -1700,13 +1784,19 @@ impl DataValue {
             w.date_time(t);
         }
         if let Some(p) = self.source_picoseconds {
-            w.u16(p.min(MAX_PICOSECONDS));
+            if p > MAX_PICOSECONDS {
+                return Err(EncodeError::Unwritable);
+            }
+            w.u16(p);
         }
         if let Some(t) = self.server_timestamp {
             w.date_time(t);
         }
         if let Some(p) = self.server_picoseconds {
-            w.u16(p.min(MAX_PICOSECONDS));
+            if p > MAX_PICOSECONDS {
+                return Err(EncodeError::Unwritable);
+            }
+            w.u16(p);
         }
         Ok(())
     }
@@ -1767,7 +1857,13 @@ impl MessageType {
     /// Whether this is one of the connection protocol's messages (HEL,
     /// ACK, ERR, RHE) rather than a secure channel chunk.
     pub fn is_handshake(self) -> bool {
-        matches!(self, MessageType::Hello | MessageType::Acknowledge | MessageType::Error | MessageType::ReverseHello)
+        matches!(
+            self,
+            MessageType::Hello
+                | MessageType::Acknowledge
+                | MessageType::Error
+                | MessageType::ReverseHello
+        )
     }
 }
 
@@ -1854,23 +1950,32 @@ pub enum ChunkError {
     MessageTooLarge(u32),
     /// A message took more chunks than the negotiated limit.
     TooManyChunks(u32),
+    /// Input ended before the final chunk of a message.
+    Incomplete,
 }
 
 impl ChunkError {
     /// The status code a server sends in an ERR message for this error.
     pub fn status(&self) -> StatusCode {
         match self {
-            ChunkError::MessageType(_) | ChunkError::ChunkType(..) => StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID,
-            // The endpoint URL is the only length a Hello holds.
-            ChunkError::Decode(MessageType::Hello, DecodeError::Length(_)) => StatusCode::BAD_TCP_ENDPOINT_URL_INVALID,
-            ChunkError::TooSmall(_) | ChunkError::Decode(..) | ChunkError::Interleaved => {
-                StatusCode::BAD_DECODING_ERROR
+            ChunkError::MessageType(_) | ChunkError::ChunkType(..) => {
+                StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID
             }
+            // The endpoint URL is the only length a Hello holds.
+            ChunkError::Decode(MessageType::Hello, DecodeError::Length(_)) => {
+                StatusCode::BAD_TCP_ENDPOINT_URL_INVALID
+            }
+            ChunkError::TooSmall(_)
+            | ChunkError::Decode(..)
+            | ChunkError::Interleaved
+            | ChunkError::Incomplete => StatusCode::BAD_DECODING_ERROR,
             ChunkError::TooLarge { .. } => StatusCode::BAD_TCP_MESSAGE_TOO_LARGE,
             ChunkError::BufferSize(_) => StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES,
             ChunkError::Mismatch => StatusCode::BAD_TCP_SECURE_CHANNEL_UNKNOWN,
             ChunkError::Sequence { .. } => StatusCode::BAD_SEQUENCE_NUMBER_INVALID,
-            ChunkError::MessageTooLarge(_) | ChunkError::TooManyChunks(_) => StatusCode::BAD_REQUEST_TOO_LARGE,
+            ChunkError::MessageTooLarge(_) | ChunkError::TooManyChunks(_) => {
+                StatusCode::BAD_REQUEST_TOO_LARGE
+            }
         }
     }
 }
@@ -1878,7 +1983,11 @@ impl ChunkError {
 impl std::fmt::Display for ChunkError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ChunkError::MessageType(c) => write!(f, "message type {:?} is not OPC UA", String::from_utf8_lossy(c)),
+            ChunkError::MessageType(c) => write!(
+                f,
+                "message type {:?} is not OPC UA",
+                String::from_utf8_lossy(c)
+            ),
             ChunkError::ChunkType(t, b) => write!(f, "chunk type {b:#04x} is not valid for {t:?}"),
             ChunkError::TooSmall(n) => write!(f, "chunk size {n} is smaller than its header"),
             ChunkError::TooLarge { size, limit } => {
@@ -1893,6 +2002,7 @@ impl std::fmt::Display for ChunkError {
             }
             ChunkError::MessageTooLarge(n) => write!(f, "message body over the limit of {n} bytes"),
             ChunkError::TooManyChunks(n) => write!(f, "message over the limit of {n} chunks"),
+            ChunkError::Incomplete => f.write_str("incomplete OPC UA message"),
         }
     }
 }
@@ -1916,7 +2026,11 @@ impl Default for Limits {
     /// What a decoder takes before anything is negotiated: chunks of
     /// [`MIN_BUFFER_SIZE`], and no message or chunk count limit.
     fn default() -> Limits {
-        Limits { receive_buffer_size: MIN_BUFFER_SIZE, max_message_size: 0, max_chunk_count: 0 }
+        Limits {
+            receive_buffer_size: MIN_BUFFER_SIZE,
+            max_message_size: 0,
+            max_chunk_count: 0,
+        }
     }
 }
 
@@ -1924,7 +2038,8 @@ impl Limits {
     /// The largest chunk taken: the receive buffer size, raised to
     /// [`MIN_BUFFER_SIZE`] and capped at [`MAX_BUFFER_SIZE`].
     pub fn chunk_limit(&self) -> u32 {
-        self.receive_buffer_size.clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE)
+        self.receive_buffer_size
+            .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE)
     }
 
     /// The largest message body taken, capped at [`MAX_MESSAGE_SIZE`].
@@ -1987,12 +2102,20 @@ impl Chunk {
         if b.len() < end {
             return Ok(None);
         }
-        Ok(Some((Chunk { message_type, chunk_type, body: b[HEADER_LEN..end].to_vec() }, end)))
+        Ok(Some((
+            Chunk {
+                message_type,
+                chunk_type,
+                body: b[HEADER_LEN..end].to_vec(),
+            },
+            end,
+        )))
     }
 }
 
 /// Why an exact [`Wire`] parse did not read one complete chunk.
-/// [`Chunk::parse`] keeps its prefix parser and caller-supplied limits.
+/// [`Chunk::parse`] reads a prefix under caller-supplied limits and returns
+/// the bytes used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChunkParseError {
     /// The chunk header is invalid or exceeds [`MAX_BUFFER_SIZE`].
@@ -2029,6 +2152,11 @@ impl Wire for Chunk {
     /// Reads exactly one chunk bounded by [`MAX_BUFFER_SIZE`].
     /// The body stays opaque. Negotiated limits belong to [`Frames`].
     /// Handshake chunk type bytes read as [`ChunkType::Final`].
+    /// Returns [`ChunkParseError::Truncated`] for incomplete input and
+    /// [`ChunkParseError::Trailing`] for extra bytes. Invalid message types,
+    /// chunk types or sizes return [`ChunkParseError::Chunk`] containing
+    /// [`ChunkError::MessageType`], [`ChunkError::ChunkType`],
+    /// [`ChunkError::TooSmall`] or [`ChunkError::TooLarge`].
     fn parse(b: &[u8]) -> Result<Self, ChunkParseError> {
         let limits = Limits {
             receive_buffer_size: MAX_BUFFER_SIZE,
@@ -2043,6 +2171,8 @@ impl Wire for Chunk {
 
     /// Appends at most [`MAX_BUFFER_SIZE`] bytes, leaving `out` unchanged
     /// on error. Only MSG chunks may be intermediate or abort chunks.
+    /// Returns [`ChunkError::ChunkType`] for an intermediate or abort chunk
+    /// outside MSG, and [`ChunkError::TooLarge`] above [`MAX_BUFFER_SIZE`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), ChunkError> {
         if self.message_type != MessageType::Message && self.chunk_type != ChunkType::Final {
             return Err(ChunkError::ChunkType(
@@ -2080,7 +2210,7 @@ impl Wire for Chunk {
 /// Partial chunks return [`Step::Need`], including at EOF, when
 /// [`Stream`](super::codec::Stream) reports truncation.
 /// Message bodies, chunk counts, and sequence numbers are not checked here.
-/// The existing [`Decoder`] keeps message assembly and connection checks.
+/// Use [`Messages`] for message assembly and connection checks.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames {
     limits: Limits,
@@ -2120,6 +2250,10 @@ impl Decode for Frames {
         self.limits.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
     }
 
+    /// Reads a chunk prefix, returning [`Step::Need`] while incomplete.
+    /// Returns [`ChunkError::MessageType`] or [`ChunkError::ChunkType`] for
+    /// invalid type bytes, [`ChunkError::TooSmall`] below the header size,
+    /// and [`ChunkError::TooLarge`] above the negotiated limit.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, ChunkError> {
         Ok(match Chunk::parse(input, &self.limits)? {
             Some((chunk, used)) => Step::Item(chunk, used),
@@ -2138,14 +2272,13 @@ fn read_reason(r: &mut Reader<'_>) -> Result<String, DecodeError> {
     }
 }
 
-/// Wraps `body` in a chunk header.
-fn chunk_bytes(message_type: MessageType, chunk_type: ChunkType, body: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
-    out.extend_from_slice(&message_type.code());
-    out.push(chunk_type.byte());
-    out.extend_from_slice(&((HEADER_LEN + body.len()) as u32).to_le_bytes());
-    out.extend_from_slice(body);
-    out
+/// Builds a chunk value from its body.
+fn chunk(message_type: MessageType, chunk_type: ChunkType, body: Vec<u8>) -> Chunk {
+    Chunk {
+        message_type,
+        chunk_type,
+        body,
+    }
 }
 
 /// A Hello: the first message a client sends, naming what it can take.
@@ -2178,13 +2311,18 @@ impl Hello {
     /// The Acknowledge a server with receive limits `ours` answers with.
     /// Its buffer sizes are what both sides can take, and never below
     /// [`MIN_BUFFER_SIZE`]. Its message and chunk count limits are the
-    /// ones a [`Decoder`] with `ours` enforces, so they are never 0: the
+    /// ones a [`Messages`] with `ours` enforces, so they are never 0: the
     /// module's own caps always apply.
     pub fn acknowledge(&self, ours: &Limits) -> Acknowledge {
         Acknowledge {
             protocol_version: PROTOCOL_VERSION,
-            receive_buffer_size: ours.chunk_limit().min(self.send_buffer_size).max(MIN_BUFFER_SIZE),
-            send_buffer_size: self.receive_buffer_size.clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE),
+            receive_buffer_size: ours
+                .chunk_limit()
+                .min(self.send_buffer_size)
+                .max(MIN_BUFFER_SIZE),
+            send_buffer_size: self
+                .receive_buffer_size
+                .clamp(MIN_BUFFER_SIZE, MAX_BUFFER_SIZE),
             max_message_size: ours.message_limit(),
             max_chunk_count: ours.chunk_count_limit(),
         }
@@ -2214,7 +2352,7 @@ impl Hello {
             w.u32(v);
         }
         w.string_max(Some(&self.endpoint_url), MAX_URL_LEN)?;
-        Ok(w.into_bytes())
+        w.into_bytes()
     }
 }
 
@@ -2237,7 +2375,7 @@ pub struct Acknowledge {
 
 impl Acknowledge {
     /// What the server takes in, for writing to it, and for its own
-    /// [`Decoder::set_limits`].
+    /// [`Messages::set_limits`].
     pub fn limits(&self) -> Limits {
         Limits {
             receive_buffer_size: self.receive_buffer_size,
@@ -2268,7 +2406,7 @@ impl Acknowledge {
         ] {
             w.u32(v);
         }
-        Ok(w.into_bytes())
+        w.into_bytes()
     }
 }
 
@@ -2332,7 +2470,10 @@ impl AsymmetricHeader {
     /// policy, if any.
     fn bad_length(&self) -> Option<usize> {
         let len = |f: &Option<Vec<u8>>| f.as_ref().map_or(0, Vec::len);
-        let (cert, thumb) = (len(&self.sender_certificate), len(&self.receiver_thumbprint));
+        let (cert, thumb) = (
+            len(&self.sender_certificate),
+            len(&self.receiver_thumbprint),
+        );
         if self.policy_uri == SECURITY_POLICY_NONE {
             [cert, thumb].into_iter().find(|&n| n != 0)
         } else {
@@ -2420,28 +2561,29 @@ pub enum Message {
 }
 
 impl Message {
-    /// The message's bytes, split into as few chunks as a peer that takes
-    /// `peer` allows. It fails if the message breaks a rule or limit the
-    /// peer's [`Decoder`] checks: an OPN or CLO too large for one chunk, a
-    /// MSG with too large a body or needing too many chunks, a buffer size
-    /// below [`MIN_BUFFER_SIZE`], or a string past its limit.
-    pub fn to_bytes(&self, peer: &Limits) -> Result<Vec<u8>, EncodeError> {
-        Ok(match self {
-            Message::Hello(h) => chunk_bytes(MessageType::Hello, ChunkType::Final, &h.body()?),
-            Message::Acknowledge(a) => chunk_bytes(MessageType::Acknowledge, ChunkType::Final, &a.body()?),
+    /// Splits the message into as few chunks as a peer that takes
+    /// `peer` allows. Write each chunk with [`Wire::write`]. It fails if the
+    /// message breaks a rule or limit the peer's [`Messages`] checks:
+    /// an OPN or CLO too large for one chunk, a MSG with too large a body or
+    /// needing too many chunks, a buffer size below [`MIN_BUFFER_SIZE`], or a
+    /// string past its limit.
+    pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, EncodeError> {
+        Ok(vec![match self {
+            Message::Hello(h) => chunk(MessageType::Hello, ChunkType::Final, h.body()?),
+            Message::Acknowledge(a) => chunk(MessageType::Acknowledge, ChunkType::Final, a.body()?),
             Message::Error(e) => {
                 let mut w = Writer::new();
                 e.error.encode(&mut w)?;
                 w.string_max(Some(&e.reason), MAX_REASON_LEN)?;
-                chunk_bytes(MessageType::Error, ChunkType::Final, &w.into_bytes())
+                chunk(MessageType::Error, ChunkType::Final, w.into_bytes()?)
             }
             Message::ReverseHello(rh) => {
                 let mut w = Writer::new();
                 w.string_max(Some(&rh.server_uri), MAX_URL_LEN)?;
                 w.string_max(Some(&rh.endpoint_url), MAX_URL_LEN)?;
-                chunk_bytes(MessageType::ReverseHello, ChunkType::Final, &w.into_bytes())
+                chunk(MessageType::ReverseHello, ChunkType::Final, w.into_bytes()?)
             }
-            Message::Secure(m) => m.to_chunks(peer)?.concat(),
+            Message::Secure(m) => return m.chunks(peer),
             Message::Abort(a) => {
                 let mut w = Writer::new();
                 for v in [a.channel_id, a.token_id, a.sequence_number, a.request_id] {
@@ -2450,16 +2592,16 @@ impl Message {
                 a.error.encode(&mut w)?;
                 w.string_max(Some(&a.reason), MAX_REASON_LEN)?;
                 // At most 4 * 5 + 4 + MAX_REASON_LEN bytes, under any chunk limit.
-                chunk_bytes(MessageType::Message, ChunkType::Abort, &w.into_bytes())
+                chunk(MessageType::Message, ChunkType::Abort, w.into_bytes()?)
             }
-        })
+        }])
     }
 }
 
 impl SecureMessage {
-    /// The message's chunks, each as large as a peer that takes `peer`
-    /// allows. See [`Message::to_bytes`] for when it fails.
-    pub fn to_chunks(&self, peer: &Limits) -> Result<Vec<Vec<u8>>, EncodeError> {
+    /// Splits the message into chunks, each as large as a peer that takes `peer`
+    /// allows. See [`Message::chunks`] for when it fails.
+    pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, EncodeError> {
         let chunk_limit = peer.chunk_limit() as usize;
         if self.body.len() > peer.message_limit() as usize {
             return Err(EncodeError::TooLong);
@@ -2477,7 +2619,7 @@ impl SecureMessage {
             }
             SecureKind::Close { token_id } | SecureKind::Message { token_id } => w.u32(*token_id),
         }
-        let security = w.into_bytes();
+        let security = w.into_bytes()?;
         let message_type = self.kind.message_type();
         // The header, the security header and the sequence header.
         let overhead = HEADER_LEN + security.len() + 8;
@@ -2488,7 +2630,11 @@ impl SecureMessage {
         let single = !matches!(self.kind, SecureKind::Message { .. });
         // Count the chunks before making any, so a message that cannot be
         // sent allocates nothing for them.
-        let count = if self.body.is_empty() { 1 } else { self.body.len().div_ceil(per_chunk) };
+        let count = if self.body.is_empty() {
+            1
+        } else {
+            self.body.len().div_ceil(per_chunk)
+        };
         if (single && count > 1) || count > peer.chunk_count_limit() as usize {
             return Err(EncodeError::TooLong);
         }
@@ -2505,8 +2651,12 @@ impl SecureMessage {
             body.extend_from_slice(&self.sequence_number.wrapping_add(i as u32).to_le_bytes());
             body.extend_from_slice(&self.request_id.to_le_bytes());
             body.extend_from_slice(piece);
-            let chunk_type = if i == last { ChunkType::Final } else { ChunkType::Intermediate };
-            out.push(chunk_bytes(message_type, chunk_type, &body));
+            let chunk_type = if i == last {
+                ChunkType::Final
+            } else {
+                ChunkType::Intermediate
+            };
+            out.push(chunk(message_type, chunk_type, body));
         }
         Ok(out)
     }
@@ -2552,7 +2702,13 @@ fn decode_secure(message_type: MessageType, body: &[u8]) -> Result<SecureChunk, 
     };
     let sequence_number = r.u32()?;
     let request_id = r.u32()?;
-    Ok(SecureChunk { kind, channel_id, sequence_number, request_id, rest: r.rest().to_vec() })
+    Ok(SecureChunk {
+        kind,
+        channel_id,
+        sequence_number,
+        request_id,
+        rest: r.rest().to_vec(),
+    })
 }
 
 /// Whether `got` follows `prev`: one more, or a wrap to below 1024 from a
@@ -2561,111 +2717,55 @@ fn follows(prev: u32, got: u32) -> bool {
     got == prev.wrapping_add(1) || (prev > LEGACY_WRAP && got < 1024)
 }
 
-/// Splits an OPC UA byte stream into messages, putting the chunks of each
-/// MSG back together. Feed it the bytes a connection reads, in order, and
-/// take messages out until it has none. After a Hello is answered, give it
-/// the negotiated [`Limits`] with [`Decoder::set_limits`].
+/// Reads OPC UA messages and assembles MSG chunks under negotiated limits.
 ///
-/// One connection carries one secure channel, so the decoder checks that
-/// every OPN, CLO and MSG chunk's sequence number follows the one before
-/// it, across messages as well as within one (Part 6, 6.7.2.4).
+/// Use with [`Stream<Messages>`](super::codec::Stream). Each secure chunk must follow
+/// the previous sequence number, including across message boundaries.
+/// Input stays in the stream. Only an unfinished message body is held here.
+/// EOF during an assembly returns [`ChunkError::Incomplete`], including when
+/// its body is empty. [`Decode::held`] counts body bytes, so zero held bytes
+/// does not imply a complete message. Use [`Messages::is_between_messages`]
+/// to check for an unfinished assembly. Set receive limits between messages
+/// through [`Stream::decoder`](super::codec::Stream::decoder).
 #[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer.
-    start: usize,
+pub struct Messages {
     limits: Limits,
     partial: Option<Partial>,
-    /// The sequence number of the last secure chunk read.
     last_sequence: Option<u32>,
-    failed: Option<ChunkError>,
 }
 
-impl Decoder {
-    /// A decoder holding no bytes, with [`Limits::default`].
-    pub fn new() -> Decoder {
-        Decoder::default()
+impl Messages {
+    /// Creates a message decoder with [`Limits::default`].
+    pub fn new() -> Self {
+        Self::default()
     }
 
-    /// A decoder holding no bytes, with `limits`.
-    pub fn with_limits(limits: Limits) -> Decoder {
-        Decoder { limits, ..Decoder::default() }
+    /// Creates a message decoder with the supplied receive limits.
+    pub fn with_limits(limits: Limits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
     }
 
-    /// Sets what this side takes in. Chunks already taken out are not
-    /// checked again.
+    /// Sets receive limits. Use [`Self::is_between_messages`] to check for
+    /// an unfinished assembly first. Already consumed chunks are not checked
+    /// again. A smaller limit applies to the next chunk.
     pub fn set_limits(&mut self, limits: Limits) {
         self.limits = limits;
     }
 
-    /// What this side takes in.
+    /// Returns true when no partial message assembly is held.
+    ///
+    /// Empty intermediate MSG chunks still start an assembly, even when
+    /// [`Decode::held`] is zero. This does not inspect unread stream bytes.
+    pub fn is_between_messages(&self) -> bool {
+        self.partial.is_none()
+    }
+
+    /// Returns the supplied receive limits.
     pub fn limits(&self) -> Limits {
         self.limits
-    }
-
-    /// Adds bytes read from the connection, and returns how many it took.
-    /// It holds at most [`MAX_BUFFERED`] bytes not yet taken out, which is
-    /// room for any chunk, so it takes fewer than `bytes` only when that
-    /// much is waiting. Take messages out with [`Decoder::next_message`],
-    /// then feed it the rest. After a [`ChunkError`] the stream cannot be
-    /// read any further, and every byte is taken and dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
-        if self.start > 0 && (self.start >= self.buf.len() / 2 || self.buf.len() + n > MAX_BUFFERED) {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// How many bytes are held, waiting for the rest of a chunk.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    /// Whether the stream so far ends where a message does: no bytes of a
-    /// chunk are held, and no MSG is waiting for its final chunk. A
-    /// connection that closes when this is false closed partway through a
-    /// message. It is false once the stream has broken.
-    pub fn is_between_messages(&self) -> bool {
-        self.failed.is_none() && self.partial.is_none() && self.buffered() == 0
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken. A decoder holds at most [`MAX_BUFFERED`] bytes
-    /// fed but not taken out, and one message body within its limits.
-    pub fn next_message(&mut self) -> Option<Result<Message, ChunkError>> {
-        if let Some(e) = &self.failed {
-            return Some(Err(e.clone()));
-        }
-        loop {
-            match Chunk::parse(&self.buf[self.start..], &self.limits) {
-                Ok(None) => return None,
-                Ok(Some((chunk, used))) => {
-                    self.start += used;
-                    match self.take(chunk) {
-                        Ok(Some(m)) => return Some(Ok(m)),
-                        Ok(None) => continue,
-                        Err(e) => return Some(Err(self.fail(e))),
-                    }
-                }
-                Err(e) => return Some(Err(self.fail(e))),
-            }
-        }
-    }
-
-    fn fail(&mut self, e: ChunkError) -> ChunkError {
-        self.failed = Some(e.clone());
-        self.buf = Vec::new();
-        self.start = 0;
-        self.partial = None;
-        e
     }
 
     /// Handles one chunk: a whole message, or `None` for part of a MSG.
@@ -2712,7 +2812,10 @@ impl Decoder {
                 let server_uri = r.string_max(MAX_URL_LEN).map_err(de)?.unwrap_or_default();
                 let endpoint_url = r.string_max(MAX_URL_LEN).map_err(de)?.unwrap_or_default();
                 r.finish().map_err(de)?;
-                Message::ReverseHello(ReverseHello { server_uri, endpoint_url })
+                Message::ReverseHello(ReverseHello {
+                    server_uri,
+                    endpoint_url,
+                })
             }
             MessageType::Open | MessageType::Close | MessageType::Message => {
                 let s = decode_secure(t, &chunk.body).map_err(de)?;
@@ -2722,11 +2825,18 @@ impl Decoder {
         Ok(Some(message))
     }
 
-    fn take_secure(&mut self, chunk_type: ChunkType, s: SecureChunk) -> Result<Option<Message>, ChunkError> {
+    fn take_secure(
+        &mut self,
+        chunk_type: ChunkType,
+        s: SecureChunk,
+    ) -> Result<Option<Message>, ChunkError> {
         if let Some(prev) = self.last_sequence
             && !follows(prev, s.sequence_number)
         {
-            return Err(ChunkError::Sequence { expected: prev.wrapping_add(1), got: s.sequence_number });
+            return Err(ChunkError::Sequence {
+                expected: prev.wrapping_add(1),
+                got: s.sequence_number,
+            });
         }
         self.last_sequence = Some(s.sequence_number);
         let message_limit = self.limits.message_limit();
@@ -2781,11 +2891,19 @@ impl Decoder {
                 reason,
             })));
         }
-        partial.chunks += 1;
+        partial.chunks = partial
+            .chunks
+            .checked_add(1)
+            .ok_or(ChunkError::TooManyChunks(count_limit))?;
         if partial.chunks > count_limit {
             return Err(ChunkError::TooManyChunks(count_limit));
         }
-        if partial.body.len() + s.rest.len() > message_limit as usize {
+        if partial
+            .body
+            .len()
+            .checked_add(s.rest.len())
+            .is_none_or(|n| n > message_limit as usize)
+        {
             return Err(ChunkError::MessageTooLarge(message_limit));
         }
         partial.body.extend_from_slice(&s.rest);
@@ -2803,6 +2921,39 @@ impl Decoder {
     }
 }
 
+impl Decode for Messages {
+    type Item = Message;
+    type Error = ChunkError;
+    const NAME: &'static str = "OPC UA messages";
+
+    fn capacity(&self) -> usize {
+        self.limits.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
+    }
+
+    fn held(&self) -> usize {
+        self.partial.as_ref().map_or(0, |p| p.body.len())
+    }
+
+    /// Reads chunks and joins secure messages. Chunk header errors are those
+    /// of [`Frames::decode`]. Invalid bodies return [`ChunkError::Decode`];
+    /// undersized handshake buffers return [`ChunkError::BufferSize`].
+    /// Broken order or changed secure headers return [`ChunkError::Sequence`]
+    /// or [`ChunkError::Interleaved`]. Changed channel or token IDs return
+    /// [`ChunkError::Mismatch`]. Excess assembly bytes or chunks return
+    /// [`ChunkError::MessageTooLarge`] or [`ChunkError::TooManyChunks`].
+    /// EOF during assembly returns [`ChunkError::Incomplete`].
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, ChunkError> {
+        match Chunk::parse(input, &self.limits)? {
+            Some((chunk, used)) => Ok(match self.take(chunk)? {
+                Some(message) => Step::Item(message, used),
+                None => Step::Skip(used),
+            }),
+            None if eof && self.partial.is_some() => Err(ChunkError::Incomplete),
+            None => Ok(Step::Need),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------
 // Services
 // ---------------------------------------------------------------------
@@ -2810,11 +2961,15 @@ impl Decoder {
 /// The numeric ids, in namespace 0, of the binary encodings of the
 /// services this module reads. A message body starts with one.
 pub mod encoding_id {
-    #![allow(missing_docs)]
+    /// ServiceFault binary encoding (397).
     pub const SERVICE_FAULT: u32 = 397;
+    /// OpenSecureChannelRequest binary encoding (446).
     pub const OPEN_SECURE_CHANNEL_REQUEST: u32 = 446;
+    /// OpenSecureChannelResponse binary encoding (449).
     pub const OPEN_SECURE_CHANNEL_RESPONSE: u32 = 449;
+    /// CloseSecureChannelRequest binary encoding (452).
     pub const CLOSE_SECURE_CHANNEL_REQUEST: u32 = 452;
+    /// CloseSecureChannelResponse binary encoding (455).
     pub const CLOSE_SECURE_CHANNEL_RESPONSE: u32 = 455;
 }
 
@@ -2849,15 +3004,6 @@ impl Binary for RequestHeader {
             additional_header: r.read()?,
         })
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        self.authentication_token.encode(w)?;
-        w.date_time(self.timestamp);
-        w.u32(self.request_handle);
-        w.u32(self.return_diagnostics);
-        w.string(self.audit_entry_id.as_deref())?;
-        w.u32(self.timeout_hint);
-        self.additional_header.encode(w)
-    }
 }
 
 /// The header at the start of every response.
@@ -2882,9 +3028,6 @@ impl Binary for Option<String> {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError> {
         r.string()
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.string(self.as_deref())
-    }
 }
 
 impl Binary for ResponseHeader {
@@ -2897,14 +3040,6 @@ impl Binary for ResponseHeader {
             string_table: r.read_array()?,
             additional_header: r.read()?,
         })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.date_time(self.timestamp);
-        w.u32(self.request_handle);
-        self.service_result.encode(w)?;
-        self.service_diagnostics.encode(w)?;
-        w.write_array(&self.string_table)?;
-        self.additional_header.encode(w)
     }
 }
 
@@ -2938,10 +3073,6 @@ impl Binary for RequestType {
             n => Err(DecodeError::Enum(n)),
         }
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.i32(*self as i32);
-        Ok(())
-    }
 }
 
 impl Binary for SecurityMode {
@@ -2953,10 +3084,6 @@ impl Binary for SecurityMode {
             3 => Ok(SecurityMode::SignAndEncrypt),
             n => Err(DecodeError::Enum(n)),
         }
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.i32(*self as i32);
-        Ok(())
     }
 }
 
@@ -2988,15 +3115,6 @@ impl Binary for OpenSecureChannelRequest {
             requested_lifetime: r.u32()?,
         })
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        self.header.encode(w)?;
-        w.u32(self.client_protocol_version);
-        self.request_type.encode(w)?;
-        self.security_mode.encode(w)?;
-        w.byte_string(self.client_nonce.as_deref())?;
-        w.u32(self.requested_lifetime);
-        Ok(())
-    }
 }
 
 /// The token a secure channel uses, issued by the server.
@@ -3021,13 +3139,6 @@ impl Binary for ChannelSecurityToken {
             revised_lifetime: r.u32()?,
         })
     }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        w.u32(self.channel_id);
-        w.u32(self.token_id);
-        w.date_time(self.created_at);
-        w.u32(self.revised_lifetime);
-        Ok(())
-    }
 }
 
 /// An OpenSecureChannel response.
@@ -3051,12 +3162,6 @@ impl Binary for OpenSecureChannelResponse {
             security_token: r.read()?,
             server_nonce: r.byte_string()?,
         })
-    }
-    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
-        self.header.encode(w)?;
-        w.u32(self.server_protocol_version);
-        self.security_token.encode(w)?;
-        w.byte_string(self.server_nonce.as_deref())
     }
 }
 
@@ -3084,23 +3189,6 @@ pub enum Service {
 }
 
 impl Service {
-    /// Reads a message body. A known service must fill the body exactly.
-    pub fn parse(body: &[u8]) -> Result<Service, DecodeError> {
-        let mut r = Reader::new(body);
-        let type_id: NodeId = r.read()?;
-        let service = match type_id.ns0() {
-            Some(encoding_id::OPEN_SECURE_CHANNEL_REQUEST) => Service::OpenSecureChannelRequest(r.read()?),
-            Some(encoding_id::OPEN_SECURE_CHANNEL_RESPONSE) => Service::OpenSecureChannelResponse(r.read()?),
-            Some(encoding_id::CLOSE_SECURE_CHANNEL_REQUEST) => Service::CloseSecureChannelRequest(r.read()?),
-            Some(encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE) => Service::CloseSecureChannelResponse(r.read()?),
-            Some(encoding_id::SERVICE_FAULT) => Service::ServiceFault(r.read()?),
-            _ => {
-                return Ok(Service::Other { type_id, body: r.rest().to_vec() });
-            }
-        };
-        r.finish()?;
-        Ok(service)
-    }
 
     /// The NodeId of the service's encoding.
     pub fn type_id(&self) -> NodeId {
@@ -3114,18 +3202,428 @@ impl Service {
         };
         NodeId::numeric(0, id)
     }
+}
 
-    /// The message body. It fails if a field breaks a limit, or if
-    /// [`Service::Other`] carries the type id of a service this module
-    /// reads.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+impl BinaryWrite for StatusCode {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.0);
+        Ok(())
+    }
+}
+
+impl BinaryWrite for Guid {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.data1);
+        w.u16(self.data2);
+        w.u16(self.data3);
+        w.bytes(&self.data4);
+        Ok(())
+    }
+}
+
+impl BinaryWrite for NodeId {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.encode_flags(w, 0)
+    }
+}
+
+impl BinaryWrite for ExpandedNodeId {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        let uri = self.namespace_uri.as_deref().filter(|u| !u.is_empty());
+        let mut flags = 0;
+        if uri.is_some() {
+            flags |= 0x80;
+        }
+        if self.server_index != 0 {
+            flags |= 0x40;
+        }
+        if (uri.is_some() && self.node_id.namespace != 0)
+            || self.namespace_uri.as_deref() == Some("")
+        {
+            return Err(EncodeError::Unwritable);
+        }
+        self.node_id.encode_flags(w, flags)?;
+        if let Some(uri) = uri {
+            w.string(Some(uri))?;
+        }
+        if self.server_index != 0 {
+            w.u32(self.server_index);
+        }
+        Ok(())
+    }
+}
+
+impl BinaryWrite for QualifiedName {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        check_name(&self.name, MAX_QUALIFIED_NAME_LEN)?;
+        w.u16(self.namespace);
+        w.string(Some(&self.name))
+    }
+}
+
+impl BinaryWrite for LocalizedText {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u8(u8::from(self.locale.is_some()) | u8::from(self.text.is_some()) << 1);
+        if let Some(l) = &self.locale {
+            w.string(Some(l))?;
+        }
+        if let Some(t) = &self.text {
+            w.string(Some(t))?;
+        }
+        Ok(())
+    }
+}
+
+impl BinaryWrite for ExtensionObject {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.type_id.encode(w)?;
+        match &self.body {
+            ExtensionBody::None => w.u8(0),
+            ExtensionBody::Binary(b) => {
+                w.u8(1);
+                w.byte_string(Some(b))?;
+            }
+            ExtensionBody::Xml(b) => {
+                w.u8(2);
+                w.byte_string(Some(b))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BinaryWrite for DiagnosticInfo {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.nested(|w| self.encode_inner(w))
+    }
+}
+
+impl BinaryWrite for Variant {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.nested(|w| self.encode_inner(w))
+    }
+}
+
+impl BinaryWrite for DataValue {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.nested(|w| {
+            w.data_values += 1;
+            let out = self.encode_inner(w);
+            w.data_values -= 1;
+            out
+        })
+    }
+}
+
+impl BinaryWrite for RequestHeader {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.authentication_token.encode(w)?;
+        w.date_time(self.timestamp);
+        w.u32(self.request_handle);
+        w.u32(self.return_diagnostics);
+        w.string(self.audit_entry_id.as_deref())?;
+        w.u32(self.timeout_hint);
+        self.additional_header.encode(w)
+    }
+}
+
+impl BinaryWrite for Option<String> {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.string(self.as_deref())
+    }
+}
+
+impl BinaryWrite for ResponseHeader {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.date_time(self.timestamp);
+        w.u32(self.request_handle);
+        self.service_result.encode(w)?;
+        self.service_diagnostics.encode(w)?;
+        w.write_array(&self.string_table)?;
+        self.additional_header.encode(w)
+    }
+}
+
+impl BinaryWrite for RequestType {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.i32(*self as i32);
+        Ok(())
+    }
+}
+
+impl BinaryWrite for SecurityMode {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.i32(*self as i32);
+        Ok(())
+    }
+}
+
+impl BinaryWrite for OpenSecureChannelRequest {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.header.encode(w)?;
+        w.u32(self.client_protocol_version);
+        self.request_type.encode(w)?;
+        self.security_mode.encode(w)?;
+        w.byte_string(self.client_nonce.as_deref())?;
+        w.u32(self.requested_lifetime);
+        Ok(())
+    }
+}
+
+impl BinaryWrite for ChannelSecurityToken {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        w.u32(self.channel_id);
+        w.u32(self.token_id);
+        w.date_time(self.created_at);
+        w.u32(self.revised_lifetime);
+        Ok(())
+    }
+}
+
+impl BinaryWrite for OpenSecureChannelResponse {
+    fn encode(&self, w: &mut Writer) -> Result<(), EncodeError> {
+        self.header.encode(w)?;
+        w.u32(self.server_protocol_version);
+        self.security_token.encode(w)?;
+        w.byte_string(self.server_nonce.as_deref())
+    }
+}
+
+macro_rules! binary_wire {
+    ($($ty:ty => ($read:literal, $write:literal)),+ $(,)?) => { $(
+        impl Wire for $ty {
+            type ParseError = DecodeError;
+            type WriteError = EncodeError;
+
+            /// Reads one complete binary value. Returns [`DecodeError::End`]
+            /// for short fields, [`DecodeError::Trailing`] for extra bytes,
+            /// and [`DecodeError::Length`] above [`MAX_MESSAGE_SIZE`].
+            #[doc = $read]
+            fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
+                if bytes.len() > MAX_MESSAGE_SIZE as usize {
+                    return Err(DecodeError::Length(i32::try_from(bytes.len()).unwrap_or(i32::MAX)));
+                }
+                let mut reader = Reader::new(bytes);
+                reader.writable = true;
+                let value = Self::decode(&mut reader)?;
+                reader.finish()?;
+                Ok(value)
+            }
+
+            /// Appends the binary value. Leaves `out` unchanged on error.
+            #[doc = $write]
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+                let mut writer = Writer::new();
+                self.encode(&mut writer)?;
+                out.extend_from_slice(&writer.into_bytes()?);
+                Ok(())
+            }
+        }
+    )+ };
+}
+
+binary_wire!(
+    StatusCode => (
+        "Every four-byte status code is accepted.",
+        "Every status code is writable; this method never returns an error."
+    ),
+    Guid => (
+        "Every 16-byte GUID is accepted.",
+        "Every GUID is writable; this method never returns an error."
+    ),
+    NodeId => (
+        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
+[`DecodeError::ControlChar`].",
+        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
+[`EncodeError::ControlChar`] for control characters in names."
+    ),
+    ExpandedNodeId => (
+        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
+[`DecodeError::ControlChar`]. Namespace URI lengths and UTF-8 use the same string
+errors.",
+        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
+[`EncodeError::ControlChar`] for control characters in names. Returns
+[`EncodeError::Unwritable`] for an empty namespace URI or a nonzero namespace index with
+a URI. Excess total or URI sizes return [`EncodeError::TooLong`]."
+    ),
+    QualifiedName => (
+        "Invalid string lengths or UTF-8 return [`DecodeError::Length`] or [`DecodeError::Utf8`].
+Excess name characters or control characters return [`DecodeError::Length`] or
+[`DecodeError::ControlChar`].",
+        "Returns [`EncodeError::TooLong`] above [`MAX_QUALIFIED_NAME_LEN`] characters and
+[`EncodeError::ControlChar`] for control characters."
+    ),
+    LocalizedText => (
+        "Invalid string lengths or UTF-8 return [`DecodeError::Length`] or [`DecodeError::Utf8`].
+Unknown mask bits return [`DecodeError::Mask`].",
+        "Returns [`EncodeError::TooLong`] for strings above [`MAX_STRING_LEN`] or total bytes
+above [`MAX_MESSAGE_SIZE`]."
+    ),
+    ExtensionObject => (
+        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
+[`DecodeError::ControlChar`]. Unknown body encodings return [`DecodeError::Mask`];
+invalid body lengths return [`DecodeError::Length`].",
+        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
+[`EncodeError::ControlChar`] for control characters in names. Excess body or total sizes
+return [`EncodeError::TooLong`]."
+    ),
+    DiagnosticInfo => (
+        "Unknown mask bits return [`DecodeError::Mask`]. Invalid string lengths or UTF-8 return
+[`DecodeError::Length`] or [`DecodeError::Utf8`]. Excess nesting or value counts return
+[`DecodeError::Depth`] or [`DecodeError::TooManyValues`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
+[`EncodeError::TooManyValues`] above [`MAX_VALUES`]."
+    ),
+    Variant => (
+        "Invalid or reserved type IDs, including reserved types inside arrays, return
+[`DecodeError::VariantType`]. Invalid array dimensions return
+[`DecodeError::Dimensions`]. Nested fields may also return [`DecodeError::Length`],
+[`DecodeError::Utf8`], [`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`],
+[`DecodeError::Mask`], [`DecodeError::Depth`] or [`DecodeError::TooManyValues`] for
+invalid encodings or limits. Use [`Reader`] for reserved types.",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
+[`EncodeError::TooManyValues`] above [`MAX_VALUES`]. Returns
+[`EncodeError::VariantType`] for reserved types, mismatched array elements, scalar
+Variants, DiagnosticInfo or a DataValue inside another DataValue. Invalid dimensions
+return [`EncodeError::Dimensions`]. Control characters in names return
+[`EncodeError::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
+picoseconds above [`MAX_PICOSECONDS`] return [`EncodeError::Unwritable`]. NaNs are
+written in canonical form."
+    ),
+    DataValue => (
+        "Unknown mask bits return [`DecodeError::Mask`]. Invalid or reserved type IDs, including
+reserved types inside arrays, return [`DecodeError::VariantType`]. Invalid array
+dimensions return [`DecodeError::Dimensions`]. Nested fields may also return
+[`DecodeError::Length`], [`DecodeError::Utf8`], [`DecodeError::NodeIdForm`],
+[`DecodeError::ControlChar`], [`DecodeError::Mask`], [`DecodeError::Depth`] or
+[`DecodeError::TooManyValues`] for invalid encodings or limits. Use [`Reader`] for
+reserved types.",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
+[`EncodeError::TooManyValues`] above [`MAX_VALUES`]. Returns
+[`EncodeError::VariantType`] for reserved types, mismatched array elements, scalar
+Variants, DiagnosticInfo or a DataValue inside another DataValue. Invalid dimensions
+return [`EncodeError::Dimensions`]. Control characters in names return
+[`EncodeError::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
+picoseconds above [`MAX_PICOSECONDS`] return [`EncodeError::Unwritable`]. NaNs are
+written in canonical form."
+    ),
+    RequestHeader => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps."
+    ),
+    ResponseHeader => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
+Excess diagnostic nesting or array value counts return [`DecodeError::Depth`] or
+[`DecodeError::TooManyValues`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
+array value counts return [`EncodeError::TooDeep`] or [`EncodeError::TooManyValues`]."
+    ),
+    RequestType => (
+        "An integer other than zero or one returns [`DecodeError::Enum`].",
+        "Both request types are writable; this method never returns an error."
+    ),
+    SecurityMode => (
+        "An integer outside zero through three returns [`DecodeError::Enum`].",
+        "All four modes are writable, including Invalid; this method never returns an error."
+    ),
+    OpenSecureChannelRequest => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
+Unknown request types or security modes return [`DecodeError::Enum`]. Invalid nonce
+lengths return [`DecodeError::Length`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps."
+    ),
+    ChannelSecurityToken => (
+        "All fields are accepted; the creation time is clamped as in [`Reader::date_time`].",
+        "Returns [`EncodeError::Unwritable`] if the creation time is negative or is at least
+[`MAX_DATE_TIME`] without being `i64::MAX`."
+    ),
+    OpenSecureChannelResponse => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
+Excess diagnostic nesting or array value counts return [`DecodeError::Depth`] or
+[`DecodeError::TooManyValues`]. Invalid nonce lengths return [`DecodeError::Length`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
+array value counts return [`EncodeError::TooDeep`] or [`EncodeError::TooManyValues`]."
+    )
+);
+
+impl Wire for Service {
+    type ParseError = DecodeError;
+    type WriteError = EncodeError;
+
+    /// Reads a message body. A known service must fill the body exactly.
+    /// Returns [`DecodeError::Length`] above [`MAX_MESSAGE_SIZE`] or for
+    /// invalid field lengths, [`DecodeError::End`] for short fields, and
+    /// [`DecodeError::Trailing`] after a known service. Nested fields can return
+    /// [`DecodeError::Utf8`], [`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`],
+    /// [`DecodeError::Mask`], [`DecodeError::Enum`], [`DecodeError::Depth`] or
+    /// [`DecodeError::TooManyValues`] for their invalid encodings or limits.
+    fn parse(body: &[u8]) -> Result<Service, DecodeError> {
+        if body.len() > MAX_MESSAGE_SIZE as usize {
+            return Err(DecodeError::Length(
+                i32::try_from(body.len()).unwrap_or(i32::MAX),
+            ));
+        }
+        let mut r = Reader::new(body);
+        let type_id: NodeId = r.read()?;
+        let service = match type_id.ns0() {
+            Some(encoding_id::OPEN_SECURE_CHANNEL_REQUEST) => {
+                Service::OpenSecureChannelRequest(r.read()?)
+            }
+            Some(encoding_id::OPEN_SECURE_CHANNEL_RESPONSE) => {
+                Service::OpenSecureChannelResponse(r.read()?)
+            }
+            Some(encoding_id::CLOSE_SECURE_CHANNEL_REQUEST) => {
+                Service::CloseSecureChannelRequest(r.read()?)
+            }
+            Some(encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE) => {
+                Service::CloseSecureChannelResponse(r.read()?)
+            }
+            Some(encoding_id::SERVICE_FAULT) => Service::ServiceFault(r.read()?),
+            _ => {
+                return Ok(Service::Other {
+                    type_id,
+                    body: r.rest().to_vec(),
+                });
+            }
+        };
+        r.finish()?;
+        Ok(service)
+    }
+
+    /// Writes the encoding NodeId and service fields. Returns
+    /// [`EncodeError::Unwritable`] for `Other` with a known service ID or a
+    /// noncanonical timestamp. Returns [`EncodeError::TooLong`] for excess
+    /// field or message sizes, [`EncodeError::TooDeep`] or
+    /// [`EncodeError::TooManyValues`] for nested diagnostics, and
+    /// [`EncodeError::ControlChar`] for control characters in names.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut w = Writer::new();
         self.type_id().encode(&mut w)?;
         match self {
             Service::OpenSecureChannelRequest(s) => s.encode(&mut w)?,
             Service::OpenSecureChannelResponse(s) => s.encode(&mut w)?,
             Service::CloseSecureChannelRequest(h) => h.encode(&mut w)?,
-            Service::CloseSecureChannelResponse(h) | Service::ServiceFault(h) => h.encode(&mut w)?,
+            Service::CloseSecureChannelResponse(h) | Service::ServiceFault(h) => {
+                h.encode(&mut w)?
+            }
             Service::Other { type_id, body } => {
                 let known = [
                     encoding_id::SERVICE_FAULT,
@@ -3135,18 +3633,34 @@ impl Service {
                     encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE,
                 ];
                 if type_id.ns0().is_some_and(|id| known.contains(&id)) {
-                    return Err(EncodeError::KnownTypeId);
+                    return Err(EncodeError::Unwritable);
                 }
                 w.bytes(body);
             }
         }
-        Ok(w.into_bytes())
+        out.extend_from_slice(&w.into_bytes()?);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::codec::{
+        Fail, Stream, contract, pump,
+        test_support::{self, Lcg, decode_all},
+    };
+
+    /// Writes chunks and fails the test with the original error on refusal.
+    fn wire_chunks(chunks: Vec<Chunk>) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in chunks {
+            chunk
+                .write(&mut out)
+                .expect("message chunks must be writable");
+        }
+        out
+    }
 
     fn le32(v: u32) -> [u8; 4] {
         v.to_le_bytes()
@@ -3185,16 +3699,9 @@ mod tests {
         b
     }
 
-    fn all(d: &mut Decoder) -> Vec<Result<Message, ChunkError>> {
-        let mut out = Vec::new();
-        while let Some(m) = d.next_message() {
-            let stop = m.is_err();
-            out.push(m);
-            if stop {
-                break;
-            }
-        }
-        out
+    // Drain staged chunks without marking EOF; later pushes remain valid.
+    fn drain(d: &mut Stream<Messages>) -> Vec<Result<Message, Fail<ChunkError>>> {
+        std::iter::from_fn(|| d.next()).collect()
     }
 
     // Examples from OPC UA Part 6, section 5.2.
@@ -3204,16 +3711,28 @@ mod tests {
         // "水Boy" is 6 bytes of UTF-8.
         let mut w = Writer::new();
         w.string(Some("水Boy")).unwrap();
-        assert_eq!(w.into_bytes(), [0x06, 0, 0, 0, 0xe6, 0xb0, 0xb4, 0x42, 0x6f, 0x79]);
+        assert_eq!(
+            w.into_bytes().unwrap(),
+            [0x06, 0, 0, 0, 0xe6, 0xb0, 0xb4, 0x42, 0x6f, 0x79]
+        );
         let mut w = Writer::new();
         w.string(None).unwrap();
-        assert_eq!(w.into_bytes(), [0xff; 4]);
+        assert_eq!(w.into_bytes().unwrap(), [0xff; 4]);
         let mut r = Reader::new(&[0xff, 0xff, 0xff, 0xff, 0, 0, 0, 0]);
         assert_eq!(r.string(), Ok(None));
         assert_eq!(r.string(), Ok(Some(String::new())));
-        assert_eq!(Reader::new(&[0xfe, 0xff, 0xff, 0xff]).string(), Err(DecodeError::Length(-2)));
-        assert_eq!(Reader::new(&[5, 0, 0, 0, b'a']).string(), Err(DecodeError::Length(5)));
-        assert_eq!(Reader::new(&[1, 0, 0, 0, 0xff]).string(), Err(DecodeError::Utf8));
+        assert_eq!(
+            Reader::new(&[0xfe, 0xff, 0xff, 0xff]).string(),
+            Err(DecodeError::Length(-2))
+        );
+        assert_eq!(
+            Reader::new(&[5, 0, 0, 0, b'a']).string(),
+            Err(DecodeError::Length(5))
+        );
+        assert_eq!(
+            Reader::new(&[1, 0, 0, 0, 0xff]).string(),
+            Err(DecodeError::Utf8)
+        );
     }
 
     #[test]
@@ -3225,120 +3744,294 @@ mod tests {
             data3: 0x4ae6,
             data4: [0x8d, 0x28, 0xb4, 0x04, 0xdc, 0x7d, 0xaf, 0x63],
         };
-        let bytes = [0x91, 0x2b, 0x96, 0x72, 0x75, 0xfa, 0xe6, 0x4a, 0x8d, 0x28, 0xb4, 0x04, 0xdc, 0x7d, 0xaf, 0x63];
-        assert_eq!(encode(&g).unwrap(), bytes);
-        assert_eq!(decode::<Guid>(&bytes), Ok(g));
+        let bytes = [
+            0x91, 0x2b, 0x96, 0x72, 0x75, 0xfa, 0xe6, 0x4a, 0x8d, 0x28, 0xb4, 0x04, 0xdc, 0x7d,
+            0xaf, 0x63,
+        ];
+        assert_eq!(Wire::to_bytes(&g).unwrap(), bytes);
+        assert_eq!(<Guid as Wire>::parse(&bytes), Ok(g));
     }
 
     #[test]
     fn node_id_examples() {
         // Two-byte form: 72 in namespace 0.
-        assert_eq!(encode(&NodeId::numeric(0, 72)).unwrap(), [0x00, 0x48]);
+        assert_eq!(
+            Wire::to_bytes(&NodeId::numeric(0, 72)).unwrap(),
+            [0x00, 0x48]
+        );
         // Four-byte form: 1025 in namespace 5.
-        assert_eq!(encode(&NodeId::numeric(5, 1025)).unwrap(), [0x01, 0x05, 0x01, 0x04]);
+        assert_eq!(
+            Wire::to_bytes(&NodeId::numeric(5, 1025)).unwrap(),
+            [0x01, 0x05, 0x01, 0x04]
+        );
         // String form: "Hot水" in namespace 1.
-        let hot = [0x03, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x48, 0x6f, 0x74, 0xe6, 0xb0, 0xb4];
-        assert_eq!(encode(&NodeId::string(1, "Hot水")).unwrap(), hot);
-        assert_eq!(decode::<NodeId>(&hot), Ok(NodeId::string(1, "Hot水")));
+        let hot = [
+            0x03, 0x01, 0x00, 0x06, 0x00, 0x00, 0x00, 0x48, 0x6f, 0x74, 0xe6, 0xb0, 0xb4,
+        ];
+        assert_eq!(Wire::to_bytes(&NodeId::string(1, "Hot水")).unwrap(), hot);
+        assert_eq!(
+            <NodeId as Wire>::parse(&hot),
+            Ok(NodeId::string(1, "Hot水"))
+        );
         // Numeric form when the short ones do not fit.
-        assert_eq!(encode(&NodeId::numeric(0, 70000)).unwrap(), [0x02, 0, 0, 0x70, 0x11, 0x01, 0x00]);
-        assert_eq!(encode(&NodeId::numeric(300, 1)).unwrap(), [0x02, 0x2c, 0x01, 1, 0, 0, 0]);
+        assert_eq!(
+            Wire::to_bytes(&NodeId::numeric(0, 70000)).unwrap(),
+            [0x02, 0, 0, 0x70, 0x11, 0x01, 0x00]
+        );
+        assert_eq!(
+            Wire::to_bytes(&NodeId::numeric(300, 1)).unwrap(),
+            [0x02, 0x2c, 0x01, 1, 0, 0, 0]
+        );
         // Readers take any form, so a long form reads as the same NodeId.
-        assert_eq!(decode::<NodeId>(&[0x02, 0, 0, 72, 0, 0, 0]), Ok(NodeId::numeric(0, 72)));
+        assert_eq!(
+            <NodeId as Wire>::parse(&[0x02, 0, 0, 72, 0, 0, 0]),
+            Ok(NodeId::numeric(0, 72))
+        );
         // Guid and opaque forms.
-        let g = NodeId { namespace: 2, identifier: Identifier::Guid(Guid::default()) };
-        assert_eq!(decode::<NodeId>(&encode(&g).unwrap()), Ok(g));
-        let o = NodeId { namespace: 2, identifier: Identifier::Opaque(vec![1, 2, 3]) };
-        assert_eq!(decode::<NodeId>(&encode(&o).unwrap()), Ok(o));
+        let g = NodeId {
+            namespace: 2,
+            identifier: Identifier::Guid(Guid::default()),
+        };
+        assert_eq!(<NodeId as Wire>::parse(&Wire::to_bytes(&g).unwrap()), Ok(g));
+        let o = NodeId {
+            namespace: 2,
+            identifier: Identifier::Opaque(vec![1, 2, 3]),
+        };
+        assert_eq!(<NodeId as Wire>::parse(&Wire::to_bytes(&o).unwrap()), Ok(o));
         // A null string identifier reads as empty.
-        assert_eq!(decode::<NodeId>(&[0x03, 1, 0, 0xff, 0xff, 0xff, 0xff]), Ok(NodeId::string(1, "")));
+        assert_eq!(
+            <NodeId as Wire>::parse(&[0x03, 1, 0, 0xff, 0xff, 0xff, 0xff]),
+            Ok(NodeId::string(1, ""))
+        );
         // Bad forms.
-        assert_eq!(decode::<NodeId>(&[0x06, 0]), Err(DecodeError::NodeIdForm(6)));
-        assert_eq!(decode::<NodeId>(&[0x80, 0]), Err(DecodeError::NodeIdForm(0x80)));
-        assert_eq!(decode::<NodeId>(&[0x00, 1, 2]), Err(DecodeError::Trailing(1)));
-        assert_eq!(decode::<NodeId>(&[0x01, 1]), Err(DecodeError::End));
+        assert_eq!(
+            <NodeId as Wire>::parse(&[0x06, 0]),
+            Err(DecodeError::NodeIdForm(6))
+        );
+        assert_eq!(
+            <NodeId as Wire>::parse(&[0x80, 0]),
+            Err(DecodeError::NodeIdForm(0x80))
+        );
+        assert_eq!(
+            <NodeId as Wire>::parse(&[0x00, 1, 2]),
+            Err(DecodeError::Trailing(1))
+        );
+        assert_eq!(<NodeId as Wire>::parse(&[0x01, 1]), Err(DecodeError::End));
         assert!(NodeId::default().is_null());
     }
 
     #[test]
     fn expanded_node_id() {
-        let e =
-            ExpandedNodeId { node_id: NodeId::numeric(0, 85), namespace_uri: Some("urn:x".into()), server_index: 3 };
-        let bytes = encode(&e).unwrap();
+        let e = ExpandedNodeId {
+            node_id: NodeId::numeric(0, 85),
+            namespace_uri: Some("urn:x".into()),
+            server_index: 3,
+        };
+        let bytes = Wire::to_bytes(&e).unwrap();
         assert_eq!(bytes[..2], [0xc0, 85]);
-        assert_eq!(decode::<ExpandedNodeId>(&bytes), Ok(e));
-        let plain = ExpandedNodeId { node_id: NodeId::numeric(0, 85), ..Default::default() };
-        assert_eq!(encode(&plain).unwrap(), [0, 85]);
+        assert_eq!(<ExpandedNodeId as Wire>::parse(&bytes), Ok(e));
+        let plain = ExpandedNodeId {
+            node_id: NodeId::numeric(0, 85),
+            ..Default::default()
+        };
+        assert_eq!(Wire::to_bytes(&plain).unwrap(), [0, 85]);
         // A null URI with the flag set reads as no URI.
-        assert_eq!(decode::<ExpandedNodeId>(&[0x80, 85, 0xff, 0xff, 0xff, 0xff]), Ok(plain));
-        assert_eq!(decode::<ExpandedNodeId>(&[0x87, 85]), Err(DecodeError::NodeIdForm(0x87)));
+        assert_eq!(
+            <ExpandedNodeId as Wire>::parse(&[0x80, 85, 0xff, 0xff, 0xff, 0xff]),
+            Ok(plain)
+        );
+        assert_eq!(
+            <ExpandedNodeId as Wire>::parse(&[0x87, 85]),
+            Err(DecodeError::NodeIdForm(0x87))
+        );
     }
 
     #[test]
     fn names_and_texts() {
-        let q = QualifiedName { namespace: 2, name: "Pump".into() };
-        assert_eq!(encode(&q).unwrap(), [2, 0, 4, 0, 0, 0, b'P', b'u', b'm', b'p']);
-        assert_eq!(decode::<QualifiedName>(&encode(&q).unwrap()), Ok(q));
-        let t = LocalizedText { locale: Some("en".into()), text: Some("Hi".into()) };
-        assert_eq!(encode(&t).unwrap(), [3, 2, 0, 0, 0, b'e', b'n', 2, 0, 0, 0, b'H', b'i']);
-        assert_eq!(decode::<LocalizedText>(&encode(&t).unwrap()), Ok(t));
-        assert_eq!(encode(&LocalizedText::default()).unwrap(), [0]);
-        assert_eq!(decode::<LocalizedText>(&[4]), Err(DecodeError::Mask(4)));
+        let q = QualifiedName {
+            namespace: 2,
+            name: "Pump".into(),
+        };
+        assert_eq!(
+            Wire::to_bytes(&q).unwrap(),
+            [2, 0, 4, 0, 0, 0, b'P', b'u', b'm', b'p']
+        );
+        assert_eq!(
+            <QualifiedName as Wire>::parse(&Wire::to_bytes(&q).unwrap()),
+            Ok(q)
+        );
+        let t = LocalizedText {
+            locale: Some("en".into()),
+            text: Some("Hi".into()),
+        };
+        assert_eq!(
+            Wire::to_bytes(&t).unwrap(),
+            [3, 2, 0, 0, 0, b'e', b'n', 2, 0, 0, 0, b'H', b'i']
+        );
+        assert_eq!(
+            <LocalizedText as Wire>::parse(&Wire::to_bytes(&t).unwrap()),
+            Ok(t)
+        );
+        assert_eq!(Wire::to_bytes(&LocalizedText::default()).unwrap(), [0]);
+        assert_eq!(
+            <LocalizedText as Wire>::parse(&[4]),
+            Err(DecodeError::Mask(4))
+        );
     }
 
     #[test]
     fn extension_objects_stay_raw() {
-        let e = ExtensionObject { type_id: NodeId::numeric(0, 324), body: ExtensionBody::Binary(vec![9, 8, 7]) };
-        let bytes = encode(&e).unwrap();
+        let e = ExtensionObject {
+            type_id: NodeId::numeric(0, 324),
+            body: ExtensionBody::Binary(vec![9, 8, 7]),
+        };
+        let bytes = Wire::to_bytes(&e).unwrap();
         assert_eq!(bytes, [0x01, 0, 0x44, 0x01, 1, 3, 0, 0, 0, 9, 8, 7]);
-        assert_eq!(decode::<ExtensionObject>(&bytes), Ok(e));
-        let x = ExtensionObject { type_id: NodeId::default(), body: ExtensionBody::Xml(b"<a/>".to_vec()) };
-        assert_eq!(decode::<ExtensionObject>(&encode(&x).unwrap()), Ok(x));
-        assert_eq!(encode(&ExtensionObject::default()).unwrap(), [0, 0, 0]);
-        assert_eq!(decode::<ExtensionObject>(&[0, 0, 3]), Err(DecodeError::Mask(3)));
+        assert_eq!(<ExtensionObject as Wire>::parse(&bytes), Ok(e));
+        let x = ExtensionObject {
+            type_id: NodeId::default(),
+            body: ExtensionBody::Xml(b"<a/>".to_vec()),
+        };
+        assert_eq!(
+            <ExtensionObject as Wire>::parse(&Wire::to_bytes(&x).unwrap()),
+            Ok(x)
+        );
+        assert_eq!(
+            Wire::to_bytes(&ExtensionObject::default()).unwrap(),
+            [0, 0, 0]
+        );
+        assert_eq!(
+            <ExtensionObject as Wire>::parse(&[0, 0, 3]),
+            Err(DecodeError::Mask(3))
+        );
     }
 
     #[test]
     fn variants() {
         // A scalar Int32.
         let v = Variant::Scalar(Value::Int32(-2));
-        assert_eq!(encode(&v).unwrap(), [6, 0xfe, 0xff, 0xff, 0xff]);
-        assert_eq!(decode::<Variant>(&[6, 0xfe, 0xff, 0xff, 0xff]), Ok(v));
-        assert_eq!(encode(&Variant::Null).unwrap(), [0]);
+        assert_eq!(Wire::to_bytes(&v).unwrap(), [6, 0xfe, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            <Variant as Wire>::parse(&[6, 0xfe, 0xff, 0xff, 0xff]),
+            Ok(v)
+        );
+        assert_eq!(Wire::to_bytes(&Variant::Null).unwrap(), [0]);
         // A 2 by 2 array of Bytes.
         let a = Variant::Array {
             type_id: type_id::BYTE,
             values: (1..=4).map(Value::Byte).collect(),
             dimensions: Some(vec![2, 2]),
         };
-        let bytes = encode(&a).unwrap();
-        assert_eq!(bytes, [0xc3, 4, 0, 0, 0, 1, 2, 3, 4, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0]);
-        assert_eq!(decode::<Variant>(&bytes), Ok(a));
+        let bytes = Wire::to_bytes(&a).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                0xc3, 4, 0, 0, 0, 1, 2, 3, 4, 2, 0, 0, 0, 2, 0, 0, 0, 2, 0, 0, 0
+            ]
+        );
+        assert_eq!(<Variant as Wire>::parse(&bytes), Ok(a));
         // A null array reads as empty.
-        let empty = Variant::Array { type_id: type_id::STRING, values: vec![], dimensions: None };
-        assert_eq!(decode::<Variant>(&[0x8c, 0xff, 0xff, 0xff, 0xff]), Ok(empty));
+        let empty = Variant::Array {
+            type_id: type_id::STRING,
+            values: vec![],
+            dimensions: None,
+        };
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x8c, 0xff, 0xff, 0xff, 0xff]),
+            Ok(empty)
+        );
         // An array of Variants, and every other type, round trip.
         let every = Variant::Array {
             type_id: type_id::VARIANT,
-            values: sample_values().into_iter().map(|v| Value::Variant(Box::new(Variant::Scalar(v)))).collect(),
+            values: sample_values()
+                .into_iter()
+                .map(|v| Value::Variant(Box::new(Variant::Scalar(v))))
+                .collect(),
             dimensions: None,
         };
-        let bytes = encode(&every).unwrap();
-        let back: Variant = decode(&bytes).unwrap();
-        assert_eq!(encode(&back).unwrap(), bytes);
-        // Reserved type ids are kept as ByteStrings.
-        assert_eq!(
-            decode::<Variant>(&[27, 1, 0, 0, 0, 5]),
-            Ok(Variant::Scalar(Value::Reserved { type_id: 27, bytes: Some(vec![5]) }))
-        );
+        let bytes = Wire::to_bytes(&every).unwrap();
+        let back: Variant = Wire::parse(&bytes).unwrap();
+        assert_eq!(Wire::to_bytes(&back).unwrap(), bytes);
+    }
+
+    #[test]
+    fn reserved_variants_read_but_do_not_write() {
+        for type_id in type_id::RESERVED_FIRST..=type_id::RESERVED_LAST {
+            let reserved = Value::Reserved {
+                type_id,
+                bytes: Some(vec![5]),
+            };
+            let cases = [
+                (
+                    vec![type_id, 1, 0, 0, 0, 5],
+                    Variant::Scalar(reserved.clone()),
+                ),
+                (
+                    vec![type_id | 0x80, 1, 0, 0, 0, 1, 0, 0, 0, 5],
+                    Variant::Array {
+                        type_id,
+                        values: vec![reserved],
+                        dimensions: None,
+                    },
+                ),
+                (
+                    vec![type_id | 0x80, 0, 0, 0, 0],
+                    Variant::Array {
+                        type_id,
+                        values: vec![],
+                        dimensions: None,
+                    },
+                ),
+            ];
+            for (bytes, expected) in cases {
+                let mut reader = Reader::new(&bytes);
+                let value = reader.read::<Variant>().unwrap();
+                assert_eq!(reader.finish(), Ok(()));
+                assert_eq!(value, expected);
+                assert_eq!(
+                    <Variant as Wire>::parse(&bytes),
+                    Err(DecodeError::VariantType(type_id))
+                );
+                let mut out = vec![0xa5];
+                assert_eq!(value.write(&mut out), Err(EncodeError::VariantType));
+                assert_eq!(out, [0xa5]);
+                check_reader::<Variant>(&bytes);
+
+                let mut data_value_bytes = vec![1];
+                data_value_bytes.extend_from_slice(&bytes);
+                let mut reader = Reader::new(&data_value_bytes);
+                let value = reader.read::<DataValue>().unwrap();
+                assert_eq!(reader.finish(), Ok(()));
+                assert_eq!(value.value, Some(expected));
+                assert_eq!(
+                    <DataValue as Wire>::parse(&data_value_bytes),
+                    Err(DecodeError::VariantType(type_id))
+                );
+                assert_eq!(value.write(&mut out), Err(EncodeError::VariantType));
+                assert_eq!(out, [0xa5]);
+                check_reader::<DataValue>(&data_value_bytes);
+            }
+        }
     }
 
     #[test]
     fn variant_errors() {
-        assert_eq!(decode::<Variant>(&[32]), Err(DecodeError::VariantType(32)));
-        assert_eq!(decode::<Variant>(&[0x80]), Err(DecodeError::VariantType(0)));
-        assert_eq!(decode::<Variant>(&[24, 0]), Err(DecodeError::VariantType(24)));
-        assert_eq!(decode::<Variant>(&[0x46, 0, 0, 0, 0]), Err(DecodeError::Dimensions));
+        assert_eq!(
+            <Variant as Wire>::parse(&[32]),
+            Err(DecodeError::VariantType(32))
+        );
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x80]),
+            Err(DecodeError::VariantType(0))
+        );
+        assert_eq!(
+            <Variant as Wire>::parse(&[24, 0]),
+            Err(DecodeError::VariantType(24))
+        );
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x46, 0, 0, 0, 0]),
+            Err(DecodeError::Dimensions)
+        );
         // Dimensions that do not multiply out, a zero dimension, none, or too many.
         let base = [0xc3u8, 2, 0, 0, 0, 1, 2];
         for dims in [vec![1i32, 3], vec![0], vec![], vec![-1, -2], vec![1; 33]] {
@@ -3347,24 +4040,53 @@ mod tests {
             for d in &dims {
                 b.extend_from_slice(&d.to_le_bytes());
             }
-            assert_eq!(decode::<Variant>(&b), Err(DecodeError::Dimensions), "{dims:?}");
+            assert_eq!(
+                <Variant as Wire>::parse(&b),
+                Err(DecodeError::Dimensions),
+                "{dims:?}"
+            );
         }
         // An array length past the bytes left.
-        assert_eq!(decode::<Variant>(&[0x83, 9, 0, 0, 0, 1]), Err(DecodeError::Length(9)));
-        assert_eq!(decode::<Variant>(&[0x83, 0xfe, 0xff, 0xff, 0xff]), Err(DecodeError::Length(-2)));
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x83, 9, 0, 0, 0, 1]),
+            Err(DecodeError::Length(9))
+        );
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x83, 0xfe, 0xff, 0xff, 0xff]),
+            Err(DecodeError::Length(-2))
+        );
         // Writers refuse what readers refuse.
         let nested = Variant::Scalar(Value::Variant(Box::new(Variant::Null)));
-        assert_eq!(encode(&nested), Err(EncodeError::VariantType));
-        let mixed = Variant::Array { type_id: 3, values: vec![Value::Byte(1), Value::SByte(1)], dimensions: None };
-        assert_eq!(encode(&mixed), Err(EncodeError::VariantType));
-        let null = Variant::Array { type_id: 0, values: vec![], dimensions: None };
-        assert_eq!(encode(&null), Err(EncodeError::VariantType));
-        let dims = Variant::Array { type_id: 3, values: vec![Value::Byte(1)], dimensions: Some(vec![2]) };
-        assert_eq!(encode(&dims), Err(EncodeError::Dimensions));
-        let reserved = Variant::Scalar(Value::Reserved { type_id: 5, bytes: None });
-        assert_eq!(encode(&reserved), Err(EncodeError::VariantType));
-        let long = Variant::Array { type_id: 3, values: vec![Value::Byte(0); MAX_ARRAY_LEN + 1], dimensions: None };
-        assert_eq!(encode(&long), Err(EncodeError::TooLong));
+        assert_eq!(Wire::to_bytes(&nested), Err(EncodeError::VariantType));
+        let mixed = Variant::Array {
+            type_id: 3,
+            values: vec![Value::Byte(1), Value::SByte(1)],
+            dimensions: None,
+        };
+        assert_eq!(Wire::to_bytes(&mixed), Err(EncodeError::VariantType));
+        let null = Variant::Array {
+            type_id: 0,
+            values: vec![],
+            dimensions: None,
+        };
+        assert_eq!(Wire::to_bytes(&null), Err(EncodeError::VariantType));
+        let dims = Variant::Array {
+            type_id: 3,
+            values: vec![Value::Byte(1)],
+            dimensions: Some(vec![2]),
+        };
+        assert_eq!(Wire::to_bytes(&dims), Err(EncodeError::Dimensions));
+        let reserved = Variant::Scalar(Value::Reserved {
+            type_id: 5,
+            bytes: None,
+        });
+        assert_eq!(Wire::to_bytes(&reserved), Err(EncodeError::VariantType));
+        let long = Variant::Array {
+            type_id: 3,
+            values: vec![Value::Byte(0); MAX_ARRAY_LEN + 1],
+            dimensions: None,
+        };
+        assert_eq!(Wire::to_bytes(&long), Err(EncodeError::TooLong));
     }
 
     /// `levels` Variants, each an array holding the next, around an Int32.
@@ -3382,20 +4104,26 @@ mod tests {
 
     #[test]
     fn nesting_is_bounded() {
-        let bytes = encode(&nest(MAX_DEPTH)).unwrap();
-        assert_eq!(decode::<Variant>(&bytes), Ok(nest(MAX_DEPTH)));
-        assert_eq!(encode(&nest(MAX_DEPTH + 1)), Err(EncodeError::TooDeep));
+        let bytes = Wire::to_bytes(&nest(MAX_DEPTH)).unwrap();
+        assert_eq!(<Variant as Wire>::parse(&bytes), Ok(nest(MAX_DEPTH)));
+        assert_eq!(
+            Wire::to_bytes(&nest(MAX_DEPTH + 1)),
+            Err(EncodeError::TooDeep)
+        );
         // One level more, written by hand, does not read.
         let mut deep = Vec::new();
         for _ in 0..MAX_DEPTH {
             deep.extend_from_slice(&[0x98, 1, 0, 0, 0]);
         }
         deep.extend_from_slice(&[6, 1, 0, 0, 0]);
-        assert_eq!(decode::<Variant>(&deep), Err(DecodeError::Depth));
+        assert_eq!(<Variant as Wire>::parse(&deep), Err(DecodeError::Depth));
         let mut diag = vec![0x40u8; MAX_DEPTH];
         diag.push(0);
-        assert_eq!(decode::<DiagnosticInfo>(&diag), Err(DecodeError::Depth));
-        assert!(decode::<DiagnosticInfo>(&diag[1..]).is_ok());
+        assert_eq!(
+            <DiagnosticInfo as Wire>::parse(&diag),
+            Err(DecodeError::Depth)
+        );
+        assert!(<DiagnosticInfo as Wire>::parse(&diag[1..]).is_ok());
         // A failed read leaves the reader's depth where it was.
         let mut r = Reader::new(&deep);
         assert!(r.read::<Variant>().is_err());
@@ -3413,14 +4141,17 @@ mod tests {
             server_timestamp: Some(3),
             server_picoseconds: Some(4),
         };
-        let bytes = encode(&d).unwrap();
+        let bytes = Wire::to_bytes(&d).unwrap();
         assert_eq!(bytes[0], 0x3f);
         // Source picoseconds come before the server timestamp: after the
         // mask (1), the Variant (9), the status (4) and the source timestamp (8).
         assert_eq!(bytes[22..24], [2, 0]);
-        assert_eq!(decode::<DataValue>(&bytes), Ok(d));
-        assert_eq!(encode(&DataValue::default()).unwrap(), [0]);
-        assert_eq!(decode::<DataValue>(&[0x40]), Err(DecodeError::Mask(0x40)));
+        assert_eq!(<DataValue as Wire>::parse(&bytes), Ok(d));
+        assert_eq!(Wire::to_bytes(&DataValue::default()).unwrap(), [0]);
+        assert_eq!(
+            <DataValue as Wire>::parse(&[0x40]),
+            Err(DecodeError::Mask(0x40))
+        );
     }
 
     #[test]
@@ -3432,24 +4163,45 @@ mod tests {
             localized_text: Some(4),
             additional_info: Some("x".into()),
             inner_status_code: Some(StatusCode::BAD_DECODING_ERROR),
-            inner_diagnostic_info: Some(Box::new(DiagnosticInfo { symbolic_id: Some(9), ..Default::default() })),
+            inner_diagnostic_info: Some(Box::new(DiagnosticInfo {
+                symbolic_id: Some(9),
+                ..Default::default()
+            })),
         };
-        let bytes = encode(&d).unwrap();
+        let bytes = Wire::to_bytes(&d).unwrap();
         // Locale comes before localized text on the wire.
-        assert_eq!(bytes[..17], [0x7f, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]);
-        assert_eq!(decode::<DiagnosticInfo>(&bytes), Ok(d));
-        assert_eq!(decode::<DiagnosticInfo>(&[0x80]), Err(DecodeError::Mask(0x80)));
+        assert_eq!(
+            bytes[..17],
+            [0x7f, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0]
+        );
+        assert_eq!(<DiagnosticInfo as Wire>::parse(&bytes), Ok(d));
+        assert_eq!(
+            <DiagnosticInfo as Wire>::parse(&[0x80]),
+            Err(DecodeError::Mask(0x80))
+        );
     }
 
     #[test]
     fn hello_and_acknowledge() {
         let bytes = hel_bytes(65536, 65536, b"opc.tcp://a:4840");
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        let Some(Ok(Message::Hello(h))) = d.next_message() else { panic!() };
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
+        let Some(Ok(Message::Hello(h))) = d.next() else {
+            panic!()
+        };
         assert_eq!(h.endpoint_url, "opc.tcp://a:4840");
-        assert_eq!(Message::Hello(h.clone()).to_bytes(&Limits::default()).unwrap(), bytes);
-        let ours = Limits { receive_buffer_size: 32768, max_message_size: 1 << 20, max_chunk_count: 64 };
+        assert_eq!(
+            Message::Hello(h.clone())
+                .chunks(&Limits::default())
+                .map(wire_chunks)
+                .unwrap(),
+            bytes
+        );
+        let ours = Limits {
+            receive_buffer_size: 32768,
+            max_message_size: 1 << 20,
+            max_chunk_count: 64,
+        };
         let ack = h.acknowledge(&ours);
         assert_eq!(
             ack,
@@ -3461,104 +4213,224 @@ mod tests {
                 max_chunk_count: 64
             }
         );
-        let ack_bytes = Message::Acknowledge(ack).to_bytes(&h.limits()).unwrap();
+        let ack_bytes = Message::Acknowledge(ack)
+            .chunks(&h.limits())
+            .map(wire_chunks)
+            .unwrap();
         assert_eq!(ack_bytes[..8], [b'A', b'C', b'K', b'F', 28, 0, 0, 0]);
-        let mut c = Decoder::new();
-        c.feed(&ack_bytes);
-        assert_eq!(c.next_message(), Some(Ok(Message::Acknowledge(ack))));
+        let mut c = Stream::new(Messages::new());
+        assert_eq!(c.push(&ack_bytes), ack_bytes.len());
+        assert_eq!(c.next(), Some(Ok(Message::Acknowledge(ack))));
         // The client's small send buffer caps what the server takes.
-        let small = Hello { send_buffer_size: 8192, ..h.clone() };
+        let small = Hello {
+            send_buffer_size: 8192,
+            ..h.clone()
+        };
         assert_eq!(small.acknowledge(&ours).receive_buffer_size, 8192);
         // Buffers below the minimum are refused both ways.
-        let mut d = Decoder::new();
-        d.feed(&hel_bytes(1024, 65536, b""));
-        assert_eq!(d.next_message(), Some(Err(ChunkError::BufferSize(1024))));
-        assert_eq!(d.next_message().unwrap().unwrap_err().status(), StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES);
-        let low = Hello { receive_buffer_size: 100, ..h.clone() };
-        assert_eq!(Message::Hello(low).to_bytes(&Limits::default()), Err(EncodeError::BufferSize(100)));
-        let low = Acknowledge { send_buffer_size: 100, ..ack };
-        assert_eq!(Message::Acknowledge(low).to_bytes(&Limits::default()), Err(EncodeError::BufferSize(100)));
-        let mut c = Decoder::new();
+        let mut d = Stream::new(Messages::new());
+        let input = &hel_bytes(1024, 65536, b"");
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::BufferSize(1024))))
+        );
+        let Some(Fail::Protocol(error)) = d.failed() else {
+            panic!("expected protocol error")
+        };
+        assert_eq!(error.status(), StatusCode::BAD_TCP_NOT_ENOUGH_RESOURCES);
+        let low = Hello {
+            receive_buffer_size: 100,
+            ..h.clone()
+        };
+        assert_eq!(
+            Message::Hello(low)
+                .chunks(&Limits::default())
+                .map(wire_chunks),
+            Err(EncodeError::BufferSize(100))
+        );
+        let low = Acknowledge {
+            send_buffer_size: 100,
+            ..ack
+        };
+        assert_eq!(
+            Message::Acknowledge(low)
+                .chunks(&Limits::default())
+                .map(wire_chunks),
+            Err(EncodeError::BufferSize(100))
+        );
+        let mut c = Stream::new(Messages::new());
         let mut low_ack = ack_bytes.clone();
         low_ack[12..16].copy_from_slice(&le32(10));
-        c.feed(&low_ack);
-        assert_eq!(c.next_message(), Some(Err(ChunkError::BufferSize(10))));
-        // A URL past the limit.
-        let long = Hello { endpoint_url: "a".repeat(MAX_URL_LEN + 1), ..h.clone() };
-        assert_eq!(Message::Hello(long).to_bytes(&Limits::default()), Err(EncodeError::TooLong));
-        let longest = Hello { endpoint_url: "a".repeat(MAX_URL_LEN), ..h };
-        let bytes = Message::Hello(longest.clone()).to_bytes(&Limits::default()).unwrap();
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Ok(Message::Hello(longest))));
-        let bad = hel_bytes(8192, 8192, &[b'a'; MAX_URL_LEN + 1]);
-        let mut d = Decoder::new();
-        d.feed(&bad);
+        assert_eq!(c.push(&low_ack), low_ack.len());
         assert_eq!(
-            d.next_message(),
-            Some(Err(ChunkError::Decode(MessageType::Hello, DecodeError::Length(MAX_URL_LEN as i32 + 1))))
+            c.next(),
+            Some(Err(Fail::Protocol(ChunkError::BufferSize(10))))
+        );
+        // A URL past the limit.
+        let long = Hello {
+            endpoint_url: "a".repeat(MAX_URL_LEN + 1),
+            ..h.clone()
+        };
+        assert_eq!(
+            Message::Hello(long)
+                .chunks(&Limits::default())
+                .map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
+        let longest = Hello {
+            endpoint_url: "a".repeat(MAX_URL_LEN),
+            ..h
+        };
+        let bytes = Message::Hello(longest.clone())
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.next(), Some(Ok(Message::Hello(longest))));
+        let bad = hel_bytes(8192, 8192, &[b'a'; MAX_URL_LEN + 1]);
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bad), bad.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::Decode(
+                MessageType::Hello,
+                DecodeError::Length(MAX_URL_LEN as i32 + 1)
+            ))))
         );
         // Bytes after the Hello's fields.
         let mut trailing = hel_bytes(8192, 8192, b"x");
         trailing.push(0);
         trailing[4] += 1;
-        let mut d = Decoder::new();
-        d.feed(&trailing);
-        assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Hello, DecodeError::Trailing(1)))));
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&trailing), trailing.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::Decode(
+                MessageType::Hello,
+                DecodeError::Trailing(1)
+            ))))
+        );
     }
 
     #[test]
     fn error_and_reverse_hello() {
-        let e = Message::Error(ErrorMessage { error: StatusCode::BAD_TCP_ENDPOINT_URL_INVALID, reason: "no".into() });
-        let bytes = e.to_bytes(&Limits::default()).unwrap();
-        assert_eq!(bytes, [b'E', b'R', b'R', b'F', 18, 0, 0, 0, 0, 0, 0x83, 0x80, 2, 0, 0, 0, b'n', b'o']);
+        let e = Message::Error(ErrorMessage {
+            error: StatusCode::BAD_TCP_ENDPOINT_URL_INVALID,
+            reason: "no".into(),
+        });
+        let bytes = e.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(
+            bytes,
+            [
+                b'E', b'R', b'R', b'F', 18, 0, 0, 0, 0, 0, 0x83, 0x80, 2, 0, 0, 0, b'n', b'o'
+            ]
+        );
         let rh = Message::ReverseHello(ReverseHello {
             server_uri: "a".repeat(MAX_URL_LEN),
             endpoint_url: "b".repeat(MAX_URL_LEN),
         });
-        let rh_bytes = rh.to_bytes(&Limits::default()).unwrap();
+        let rh_bytes = rh.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(rh_bytes.len() as u32, MAX_HANDSHAKE_SIZE);
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        d.feed(&rh_bytes);
-        assert_eq!(all(&mut d), [Ok(e), Ok(rh)]);
-        let long = ErrorMessage { error: StatusCode::GOOD, reason: "r".repeat(MAX_REASON_LEN + 1) };
-        assert_eq!(Message::Error(long).to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.push(&rh_bytes), rh_bytes.len());
+        assert_eq!(drain(&mut d), [Ok(e), Ok(rh)]);
+        let long = ErrorMessage {
+            error: StatusCode::GOOD,
+            reason: "r".repeat(MAX_REASON_LEN + 1),
+        };
+        assert_eq!(
+            Message::Error(long)
+                .chunks(&Limits::default())
+                .map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
         // An ERR missing its reason.
-        let mut d = Decoder::new();
-        d.feed(&[b'E', b'R', b'R', b'F', 12, 0, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Error, DecodeError::End))));
+        let mut d = Stream::new(Messages::new());
+        let input = &[b'E', b'R', b'R', b'F', 12, 0, 0, 0, 0, 0, 0, 0];
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::Decode(
+                MessageType::Error,
+                DecodeError::End
+            ))))
+        );
     }
 
     #[test]
     fn chunk_header_errors() {
         let l = Limits::default();
-        assert_eq!(Chunk::parse(b"GET", &l), Err(ChunkError::MessageType(*b"GET")));
+        assert_eq!(
+            Chunk::parse(b"GET", &l),
+            Err(ChunkError::MessageType(*b"GET"))
+        );
         assert_eq!(Chunk::parse(b"HE", &l), Ok(None));
         // The fourth byte of a HEL, ACK, ERR or RHE is reserved and ignored.
         assert_eq!(Chunk::parse(b"HELC", &l), Ok(None));
-        assert_eq!(Chunk::parse(b"OPNC", &l), Err(ChunkError::ChunkType(MessageType::Open, b'C')));
-        assert_eq!(Chunk::parse(b"CLOA", &l), Err(ChunkError::ChunkType(MessageType::Close, b'A')));
-        assert_eq!(Chunk::parse(b"MSGX", &l), Err(ChunkError::ChunkType(MessageType::Message, b'X')));
-        assert_eq!(Chunk::parse(b"MSGC\x07\0\0\0", &l), Err(ChunkError::TooSmall(7)));
+        assert_eq!(
+            Chunk::parse(b"OPNC", &l),
+            Err(ChunkError::ChunkType(MessageType::Open, b'C'))
+        );
+        assert_eq!(
+            Chunk::parse(b"CLOA", &l),
+            Err(ChunkError::ChunkType(MessageType::Close, b'A'))
+        );
+        assert_eq!(
+            Chunk::parse(b"MSGX", &l),
+            Err(ChunkError::ChunkType(MessageType::Message, b'X'))
+        );
+        assert_eq!(
+            Chunk::parse(b"MSGC\x07\0\0\0", &l),
+            Err(ChunkError::TooSmall(7))
+        );
         assert_eq!(
             Chunk::parse(b"MSGF\x01\x20\0\0", &l),
-            Err(ChunkError::TooLarge { size: 8193, limit: MIN_BUFFER_SIZE })
+            Err(ChunkError::TooLarge {
+                size: 8193,
+                limit: MIN_BUFFER_SIZE
+            })
         );
         assert_eq!(
             Chunk::parse(b"HELF\xff\xff\0\0", &l),
-            Err(ChunkError::TooLarge { size: 65535, limit: MAX_HANDSHAKE_SIZE })
+            Err(ChunkError::TooLarge {
+                size: 65535,
+                limit: MAX_HANDSHAKE_SIZE
+            })
         );
-        let big = Limits { receive_buffer_size: 65536, ..l };
+        let big = Limits {
+            receive_buffer_size: 65536,
+            ..l
+        };
         assert_eq!(Chunk::parse(b"MSGF\x01\x20\0\0", &big), Ok(None));
         assert_eq!(
-            Chunk::parse(b"MSGF\0\0\0\x10", &Limits { receive_buffer_size: u32::MAX, ..l }),
-            Err(ChunkError::TooLarge { size: 1 << 28, limit: MAX_BUFFER_SIZE })
+            Chunk::parse(
+                b"MSGF\0\0\0\x10",
+                &Limits {
+                    receive_buffer_size: u32::MAX,
+                    ..l
+                }
+            ),
+            Err(ChunkError::TooLarge {
+                size: 1 << 28,
+                limit: MAX_BUFFER_SIZE
+            })
         );
         let (c, used) = Chunk::parse(b"MSGF\x08\0\0\0rest", &l).unwrap().unwrap();
-        assert_eq!((c.message_type, c.chunk_type, c.body.len(), used), (MessageType::Message, ChunkType::Final, 0, 8));
-        assert_eq!(ChunkError::MessageType(*b"GET").status(), StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID);
-        assert_eq!(ChunkError::TooLarge { size: 0, limit: 0 }.status(), StatusCode::BAD_TCP_MESSAGE_TOO_LARGE);
+        assert_eq!(
+            (c.message_type, c.chunk_type, c.body.len(), used),
+            (MessageType::Message, ChunkType::Final, 0, 8)
+        );
+        assert_eq!(
+            ChunkError::MessageType(*b"GET").status(),
+            StatusCode::BAD_TCP_MESSAGE_TYPE_INVALID
+        );
+        assert_eq!(
+            ChunkError::TooLarge { size: 0, limit: 0 }.status(),
+            StatusCode::BAD_TCP_MESSAGE_TOO_LARGE
+        );
     }
 
     fn open_request() -> Service {
@@ -3593,14 +4465,17 @@ mod tests {
             request_id: 1,
             body,
         });
-        let bytes = opn.to_bytes(&Limits::default()).unwrap();
+        let bytes = opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(bytes[..4], *b"OPNF");
         assert_eq!(bytes[8..12], [0, 0, 0, 0]);
         assert_eq!(bytes[12..16], le32(SECURITY_POLICY_NONE.len() as u32));
-        assert_eq!(bytes[16..16 + SECURITY_POLICY_NONE.len()], *SECURITY_POLICY_NONE.as_bytes());
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Ok(opn)));
+        assert_eq!(
+            bytes[16..16 + SECURITY_POLICY_NONE.len()],
+            *SECURITY_POLICY_NONE.as_bytes()
+        );
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.next(), Some(Ok(opn)));
 
         let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
             header: ResponseHeader {
@@ -3609,7 +4484,12 @@ mod tests {
                 ..Default::default()
             },
             server_protocol_version: 0,
-            security_token: ChannelSecurityToken { channel_id: 9, token_id: 1, created_at: 5, revised_lifetime: 600 },
+            security_token: ChannelSecurityToken {
+                channel_id: 9,
+                token_id: 1,
+                created_at: 5,
+                revised_lifetime: 600,
+            },
             server_nonce: None,
         });
         let bytes = response.to_bytes().unwrap();
@@ -3639,12 +4519,18 @@ mod tests {
                 service_result: StatusCode::BAD_SERVICE_UNSUPPORTED,
                 ..Default::default()
             }),
-            Service::Other { type_id: NodeId::numeric(0, 631), body: vec![1, 2, 3] },
+            Service::Other {
+                type_id: NodeId::numeric(0, 631),
+                body: vec![1, 2, 3],
+            },
         ] {
             assert_eq!(Service::parse(&s.to_bytes().unwrap()), Ok(s));
         }
-        let fake = Service::Other { type_id: NodeId::numeric(0, 446), body: vec![] };
-        assert_eq!(fake.to_bytes(), Err(EncodeError::KnownTypeId));
+        let fake = Service::Other {
+            type_id: NodeId::numeric(0, 446),
+            body: vec![],
+        };
+        assert_eq!(fake.to_bytes(), Err(EncodeError::Unwritable));
         assert_eq!(Service::parse(&[]), Err(DecodeError::End));
     }
 
@@ -3655,13 +4541,15 @@ mod tests {
             channel_id: 9,
             sequence_number: 60,
             request_id: 8,
-            body: Service::CloseSecureChannelRequest(RequestHeader::default()).to_bytes().unwrap(),
+            body: Service::CloseSecureChannelRequest(RequestHeader::default())
+                .to_bytes()
+                .unwrap(),
         });
-        let bytes = clo.to_bytes(&Limits::default()).unwrap();
+        let bytes = clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(bytes[..4], *b"CLOF");
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Ok(clo)));
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.next(), Some(Ok(clo)));
         // A CLO too large for one chunk.
         let big = Message::Secure(SecureMessage {
             kind: SecureKind::Close { token_id: 1 },
@@ -3670,15 +4558,24 @@ mod tests {
             request_id: 0,
             body: vec![0; MIN_BUFFER_SIZE as usize],
         });
-        assert_eq!(big.to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        assert_eq!(
+            big.chunks(&Limits::default()).map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
         let opn = Message::Secure(SecureMessage {
-            kind: SecureKind::Open(AsymmetricHeader { policy_uri: "p".repeat(256), ..AsymmetricHeader::none() }),
+            kind: SecureKind::Open(AsymmetricHeader {
+                policy_uri: "p".repeat(256),
+                ..AsymmetricHeader::none()
+            }),
             channel_id: 0,
             sequence_number: 0,
             request_id: 0,
             body: vec![],
         });
-        assert_eq!(opn.to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        assert_eq!(
+            opn.chunks(&Limits::default()).map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
     }
 
     #[test]
@@ -3686,42 +4583,56 @@ mod tests {
         let body: Vec<u8> = (0..30_000u32).map(|i| i as u8).collect();
         let m = msg(1, u32::MAX - 1, 5, body);
         let chunks = match &m {
-            Message::Secure(s) => s.to_chunks(&Limits::default()).unwrap(),
+            Message::Secure(s) => s.chunks(&Limits::default()).unwrap(),
             _ => unreachable!(),
         };
         assert_eq!(chunks.len(), 4);
-        assert!(chunks.iter().all(|c| c.len() <= MIN_BUFFER_SIZE as usize));
-        assert_eq!(chunks[0][3], b'C');
-        assert_eq!(chunks[3][3], b'F');
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.body.len() + HEADER_LEN <= MIN_BUFFER_SIZE as usize)
+        );
+        assert_eq!(chunks[0].chunk_type, ChunkType::Intermediate);
+        assert_eq!(chunks[3].chunk_type, ChunkType::Final);
         // The sequence numbers wrap past u32::MAX.
-        assert_eq!(chunks[2][16..20], le32(0));
-        let mut d = Decoder::new();
-        for c in &chunks {
-            for b in c {
-                d.feed(std::slice::from_ref(b));
-                if let Some(r) = d.next_message() {
-                    assert_eq!(r, Ok(m.clone()));
-                }
-            }
-        }
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(chunks[2].body[8..12], le32(0));
+        let bytes = wire_chunks(chunks);
+        contract::check_decode_with_held_limit(Messages::new, &bytes, MAX_MESSAGE_SIZE as usize);
+        contract::check_decode_with_alloc_limit(
+            Messages::new, &bytes, 2 * MAX_HANDSHAKE_SIZE as usize,
+        );
+        let mut stream = Stream::new(Messages::new());
+        let mut messages = Vec::new();
+        pump(&mut stream, &bytes, |message| messages.push(message)).unwrap();
+        assert_eq!(messages, [m]);
+        assert_eq!(stream.held(), 0);
         // An empty MSG is one chunk.
         let e = msg(1, 1, 1, vec![]);
-        assert_eq!(e.to_bytes(&Limits::default()).unwrap().len(), 24);
+        assert_eq!(
+            e.chunks(&Limits::default()).map(wire_chunks).unwrap().len(),
+            24
+        );
         // A legacy wrap below 1024 is accepted.
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP + 3, 5, b"ab"));
-        d.feed(&msg_chunk(b'F', 7, 1, 2, 5, b"cd"));
-        assert_eq!(d.next_message(), Some(Ok(msg(1, LEGACY_WRAP + 3, 5, b"abcd".to_vec()))));
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 3, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 2, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Ok(msg(1, LEGACY_WRAP + 3, 5, b"abcd".to_vec())))
+        );
     }
 
     #[test]
     fn aborts() {
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'C', 7, 1, 10, 5, b"part"));
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, 10, 5, b"part");
+        assert_eq!(d.push(input), input.len());
         let mut tail = le32(StatusCode::BAD_RESPONSE_TOO_LARGE.0).to_vec();
         tail.extend_from_slice(&[1, 0, 0, 0, b'x']);
-        d.feed(&msg_chunk(b'A', 7, 1, 11, 5, &tail));
+        let input = &msg_chunk(b'A', 7, 1, 11, 5, &tail);
+        assert_eq!(d.push(input), input.len());
         let abort = Abort {
             channel_id: 7,
             token_id: 1,
@@ -3730,25 +4641,39 @@ mod tests {
             error: StatusCode::BAD_RESPONSE_TOO_LARGE,
             reason: "x".into(),
         };
-        assert_eq!(d.next_message(), Some(Ok(Message::Abort(abort.clone()))));
+        assert_eq!(d.next(), Some(Ok(Message::Abort(abort.clone()))));
         // The next message starts afresh.
-        d.feed(&msg_chunk(b'F', 7, 1, 12, 6, b"z"));
-        assert_eq!(d.next_message(), Some(Ok(msg(1, 12, 6, b"z".to_vec()))));
-        let bytes = Message::Abort(abort.clone()).to_bytes(&Limits::default()).unwrap();
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Ok(Message::Abort(abort))));
+        let input = &msg_chunk(b'F', 7, 1, 12, 6, b"z");
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(d.next(), Some(Ok(msg(1, 12, 6, b"z".to_vec()))));
+        let bytes = Message::Abort(abort.clone())
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.next(), Some(Ok(Message::Abort(abort))));
         // An abort with no status.
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'A', 7, 1, 1, 1, &[]));
-        assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Message, DecodeError::End))));
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'A', 7, 1, 1, 1, &[]);
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::Decode(
+                MessageType::Message,
+                DecodeError::End
+            ))))
+        );
     }
 
     #[test]
     fn stream_errors() {
         let cases: Vec<(Vec<Vec<u8>>, Limits, ChunkError)> = vec![
             (
-                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 1, 2, 6, b"")],
+                vec![
+                    msg_chunk(b'C', 7, 1, 1, 5, b""),
+                    msg_chunk(b'F', 7, 1, 2, 6, b""),
+                ],
                 Limits::default(),
                 ChunkError::Interleaved,
             ),
@@ -3758,28 +4683,52 @@ mod tests {
                 ChunkError::Interleaved,
             ),
             (
-                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 8, 1, 2, 5, b"")],
+                vec![
+                    msg_chunk(b'C', 7, 1, 1, 5, b""),
+                    msg_chunk(b'F', 8, 1, 2, 5, b""),
+                ],
                 Limits::default(),
                 ChunkError::Mismatch,
             ),
             (
-                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 2, 2, 5, b"")],
+                vec![
+                    msg_chunk(b'C', 7, 1, 1, 5, b""),
+                    msg_chunk(b'F', 7, 2, 2, 5, b""),
+                ],
                 Limits::default(),
                 ChunkError::Mismatch,
             ),
             (
-                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 1, 3, 5, b"")],
+                vec![
+                    msg_chunk(b'C', 7, 1, 1, 5, b""),
+                    msg_chunk(b'F', 7, 1, 3, 5, b""),
+                ],
                 Limits::default(),
-                ChunkError::Sequence { expected: 2, got: 3 },
+                ChunkError::Sequence {
+                    expected: 2,
+                    got: 3,
+                },
             ),
             (
-                vec![msg_chunk(b'C', 7, 1, 1, 5, b""), msg_chunk(b'F', 7, 1, 2, 5, b"")],
-                Limits { max_chunk_count: 1, ..Limits::default() },
+                vec![
+                    msg_chunk(b'C', 7, 1, 1, 5, b""),
+                    msg_chunk(b'F', 7, 1, 2, 5, b""),
+                ],
+                Limits {
+                    max_chunk_count: 1,
+                    ..Limits::default()
+                },
                 ChunkError::TooManyChunks(1),
             ),
             (
-                vec![msg_chunk(b'C', 7, 1, 1, 5, b"abc"), msg_chunk(b'F', 7, 1, 2, 5, b"abc")],
-                Limits { max_message_size: 5, ..Limits::default() },
+                vec![
+                    msg_chunk(b'C', 7, 1, 1, 5, b"abc"),
+                    msg_chunk(b'F', 7, 1, 2, 5, b"abc"),
+                ],
+                Limits {
+                    max_message_size: 5,
+                    ..Limits::default()
+                },
                 ChunkError::MessageTooLarge(5),
             ),
             (
@@ -3789,16 +4738,22 @@ mod tests {
             ),
         ];
         for (chunks, limits, want) in cases {
-            let mut d = Decoder::with_limits(limits);
+            let mut d = Stream::new(Messages::with_limits(limits));
             for c in &chunks {
-                d.feed(c);
+                assert_eq!(d.push(c), c.len());
             }
-            let got = all(&mut d);
-            assert_eq!(got.last(), Some(&Err(want.clone())), "{want}");
-            // It stays broken, and drops what comes next.
-            d.feed(&hel_bytes(8192, 8192, b""));
-            assert_eq!(d.next_message(), Some(Err(want)));
-            assert_eq!(d.buffered(), 0);
+            let got = drain(&mut d);
+            assert_eq!(
+                got.last(),
+                Some(&Err(Fail::Protocol(want.clone()))),
+                "{want}"
+            );
+            // A failed stream drops later input and retains its error.
+            let unread = d.buffered();
+            assert_eq!(d.push(&hel_bytes(8192, 8192, b"")), 32);
+            assert_eq!(d.next(), None);
+            assert_eq!(d.failed(), Some(&Fail::Protocol(want)));
+            assert_eq!(d.buffered(), unread);
         }
         // An OPN body past the message limit.
         let opn = Message::Secure(SecureMessage {
@@ -3808,35 +4763,62 @@ mod tests {
             request_id: 0,
             body: vec![0; 10],
         });
-        let small = Limits { max_message_size: 5, ..Limits::default() };
-        assert_eq!(opn.to_bytes(&small), Err(EncodeError::TooLong));
-        let mut d = Decoder::with_limits(small);
-        d.feed(&opn.to_bytes(&Limits::default()).unwrap());
-        assert_eq!(d.next_message(), Some(Err(ChunkError::MessageTooLarge(5))));
+        let small = Limits {
+            max_message_size: 5,
+            ..Limits::default()
+        };
+        assert_eq!(
+            opn.chunks(&small).map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
+        let mut d = Stream::new(Messages::with_limits(small));
+        let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::MessageTooLarge(5))))
+        );
     }
 
     #[test]
     fn writers_respect_limits() {
-        let peer = Limits { receive_buffer_size: 8192, max_message_size: 20_000, max_chunk_count: 2 };
-        assert_eq!(msg(1, 0, 0, vec![0; 20_001]).to_bytes(&peer), Err(EncodeError::TooLong));
+        let peer = Limits {
+            receive_buffer_size: 8192,
+            max_message_size: 20_000,
+            max_chunk_count: 2,
+        };
+        assert_eq!(
+            msg(1, 0, 0, vec![0; 20_001]).chunks(&peer).map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
         // 20000 bytes need 3 chunks of 8192.
-        assert_eq!(msg(1, 0, 0, vec![0; 20_000]).to_bytes(&peer), Err(EncodeError::TooLong));
+        assert_eq!(
+            msg(1, 0, 0, vec![0; 20_000]).chunks(&peer).map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
         let ok = msg(1, 0, 0, vec![0; 16_000]);
-        let bytes = ok.to_bytes(&peer).unwrap();
-        let mut d = Decoder::with_limits(peer);
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Ok(ok)));
+        let bytes = ok.chunks(&peer).map(wire_chunks).unwrap();
+        let mut d = Stream::with_buffer(Messages::with_limits(peer), MAX_BUFFER_SIZE as usize);
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.next(), Some(Ok(ok)));
         // The module's caps apply over what a peer says.
-        let huge = Limits { receive_buffer_size: u32::MAX, max_message_size: u32::MAX, max_chunk_count: u32::MAX };
+        let huge = Limits {
+            receive_buffer_size: u32::MAX,
+            max_message_size: u32::MAX,
+            max_chunk_count: u32::MAX,
+        };
         assert_eq!(huge.chunk_limit(), MAX_BUFFER_SIZE);
         assert_eq!(huge.message_limit(), MAX_MESSAGE_SIZE);
         assert_eq!(huge.chunk_count_limit(), MAX_CHUNK_COUNT);
-        let tiny = Limits { receive_buffer_size: 1, max_message_size: 0, max_chunk_count: 0 };
+        let tiny = Limits {
+            receive_buffer_size: 1,
+            max_message_size: 0,
+            max_chunk_count: 0,
+        };
         assert_eq!(tiny.chunk_limit(), MIN_BUFFER_SIZE);
         let mut w = Writer::new();
         assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(EncodeError::TooLong));
         assert_eq!(w.string_max(Some("abc"), 2), Err(EncodeError::TooLong));
-        assert!(w.is_empty());
     }
 
     #[test]
@@ -3854,11 +4836,15 @@ mod tests {
         let ack = hello.acknowledge(&Limits::default());
         assert_eq!(ack.max_message_size, MAX_MESSAGE_SIZE);
         assert_eq!(ack.max_chunk_count, MAX_CHUNK_COUNT);
-        let ours = Limits { receive_buffer_size: 8192, max_message_size: 100, max_chunk_count: 2 };
+        let ours = Limits {
+            receive_buffer_size: 8192,
+            max_message_size: 100,
+            max_chunk_count: 2,
+        };
         let ack = hello.acknowledge(&ours);
         assert_eq!((ack.max_message_size, ack.max_chunk_count), (100, 2));
-        let d = Decoder::with_limits(ack.limits());
-        assert_eq!(d.limits().message_limit(), ack.max_message_size);
+        let mut d = Stream::new(Messages::with_limits(ack.limits()));
+        assert_eq!(d.decoder().limits().message_limit(), ack.max_message_size);
     }
 
     #[test]
@@ -3866,18 +4852,36 @@ mod tests {
         // Part 6: a legacy sequence number shall not wrap until it is
         // greater than 4 294 966 271.
         assert_eq!(LEGACY_WRAP, 4_294_966_271);
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP, 5, b"ab"));
-        d.feed(&msg_chunk(b'F', 7, 1, 2, 5, b"cd"));
-        assert_eq!(d.next_message(), Some(Err(ChunkError::Sequence { expected: LEGACY_WRAP + 1, got: 2 })));
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab"));
-        d.feed(&msg_chunk(b'F', 7, 1, 1023, 5, b"cd"));
-        assert_eq!(d.next_message(), Some(Ok(msg(1, LEGACY_WRAP + 1, 5, b"abcd".to_vec()))));
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab"));
-        d.feed(&msg_chunk(b'F', 7, 1, 1024, 5, b"cd"));
-        assert!(matches!(d.next_message(), Some(Err(ChunkError::Sequence { .. }))));
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 2, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::Sequence {
+                expected: LEGACY_WRAP + 1,
+                got: 2
+            })))
+        );
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 1023, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            d.next(),
+            Some(Ok(msg(1, LEGACY_WRAP + 1, 5, b"abcd".to_vec())))
+        );
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'C', 7, 1, LEGACY_WRAP + 1, 5, b"ab");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 1024, 5, b"cd");
+        assert_eq!(d.push(input), input.len());
+        assert!(matches!(
+            d.next(),
+            Some(Err(Fail::Protocol(ChunkError::Sequence { .. })))
+        ));
     }
 
     #[test]
@@ -3889,22 +4893,35 @@ mod tests {
         err.extend_from_slice(&le32(StatusCode::BAD_TCP_INTERNAL_ERROR.0));
         err.extend_from_slice(&le32(long.len() as u32));
         err.extend_from_slice(&long);
-        let mut d = Decoder::new();
-        d.feed(&err);
-        let want = ErrorMessage { error: StatusCode::BAD_TCP_INTERNAL_ERROR, reason: String::new() };
-        assert_eq!(d.next_message(), Some(Ok(Message::Error(want))));
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&err), err.len());
+        let want = ErrorMessage {
+            error: StatusCode::BAD_TCP_INTERNAL_ERROR,
+            reason: String::new(),
+        };
+        assert_eq!(d.next(), Some(Ok(Message::Error(want))));
         let mut tail = le32(StatusCode::BAD_RESPONSE_TOO_LARGE.0).to_vec();
         tail.extend_from_slice(&le32(long.len() as u32));
         tail.extend_from_slice(&long);
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'A', 7, 1, 1, 5, &tail));
-        let Some(Ok(Message::Abort(a))) = d.next_message() else { panic!() };
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'A', 7, 1, 1, 5, &tail);
+        assert_eq!(d.push(input), input.len());
+        let Some(Ok(Message::Abort(a))) = d.next() else {
+            panic!()
+        };
         assert_eq!(a.reason, "");
         // A reason of the longest length is kept.
-        let ok = ErrorMessage { error: StatusCode::GOOD, reason: "r".repeat(MAX_REASON_LEN) };
-        let mut d = Decoder::new();
-        d.feed(&Message::Error(ok.clone()).to_bytes(&Limits::default()).unwrap());
-        assert_eq!(d.next_message(), Some(Ok(Message::Error(ok))));
+        let ok = ErrorMessage {
+            error: StatusCode::GOOD,
+            reason: "r".repeat(MAX_REASON_LEN),
+        };
+        let mut d = Stream::new(Messages::new());
+        let input = &Message::Error(ok.clone())
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(d.next(), Some(Ok(Message::Error(ok))));
     }
 
     #[test]
@@ -3912,23 +4929,43 @@ mod tests {
         // Part 6: the endpoint URL shall be less than 4096 bytes, and a
         // server answers a longer one with Bad_TcpEndpointUrlInvalid.
         assert_eq!(MAX_URL_LEN, 4095);
-        let mut d = Decoder::new();
-        d.feed(&hel_bytes(8192, 8192, &[b'a'; 4096]));
-        let e = d.next_message().unwrap().unwrap_err();
-        assert_eq!(e, ChunkError::Decode(MessageType::Hello, DecodeError::Length(4096)));
+        let mut d = Stream::new(Messages::new());
+        let input = &hel_bytes(8192, 8192, &[b'a'; 4096]);
+        assert_eq!(d.push(input), input.len());
+        let Fail::Protocol(e) = d.next().unwrap().unwrap_err() else {
+            panic!("expected protocol error")
+        };
+        assert_eq!(
+            e,
+            ChunkError::Decode(MessageType::Hello, DecodeError::Length(4096))
+        );
         assert_eq!(e.status(), StatusCode::BAD_TCP_ENDPOINT_URL_INVALID);
-        let rh = ReverseHello { server_uri: "a".repeat(4096), endpoint_url: String::new() };
-        assert_eq!(Message::ReverseHello(rh).to_bytes(&Limits::default()), Err(EncodeError::TooLong));
+        let rh = ReverseHello {
+            server_uri: "a".repeat(4096),
+            endpoint_url: String::new(),
+        };
+        assert_eq!(
+            Message::ReverseHello(rh)
+                .chunks(&Limits::default())
+                .map(wire_chunks),
+            Err(EncodeError::TooLong)
+        );
     }
 
     #[test]
     fn array_dimensions_need_two_or_more() {
         // Part 6: ArrayDimensions are only present for 2 or more dimensions.
-        let one =
-            Variant::Array { type_id: 3, values: vec![Value::Byte(1), Value::Byte(2)], dimensions: Some(vec![2]) };
-        assert_eq!(encode(&one), Err(EncodeError::Dimensions));
+        let one = Variant::Array {
+            type_id: 3,
+            values: vec![Value::Byte(1), Value::Byte(2)],
+            dimensions: Some(vec![2]),
+        };
+        assert_eq!(Wire::to_bytes(&one), Err(EncodeError::Dimensions));
         let bytes = [0xc3u8, 2, 0, 0, 0, 1, 2, 1, 0, 0, 0, 2, 0, 0, 0];
-        assert_eq!(decode::<Variant>(&bytes), Err(DecodeError::Dimensions));
+        assert_eq!(
+            <Variant as Wire>::parse(&bytes),
+            Err(DecodeError::Dimensions)
+        );
     }
 
     #[test]
@@ -3936,16 +4973,20 @@ mod tests {
         // Arrays of 65536 Bytes, inside an array of Variants: each array
         // is within MAX_ARRAY_LEN, but together they pass MAX_VALUES. The
         // outer array's elements and each inner Variant count too.
-        let inner = Variant::Array { type_id: 3, values: vec![Value::Byte(0); MAX_ARRAY_LEN], dimensions: None };
+        let inner = Variant::Array {
+            type_id: 3,
+            values: vec![Value::Byte(0); MAX_ARRAY_LEN],
+            dimensions: None,
+        };
         let outer = |n: usize| Variant::Array {
             type_id: type_id::VARIANT,
             values: vec![Value::Variant(Box::new(inner.clone())); n],
             dimensions: None,
         };
         let n = MAX_VALUES / MAX_ARRAY_LEN;
-        let fits = encode(&outer(n - 1)).unwrap();
-        assert!(decode::<Variant>(&fits).is_ok());
-        assert_eq!(encode(&outer(n)), Err(EncodeError::TooManyValues));
+        let fits = Wire::to_bytes(&outer(n - 1)).unwrap();
+        assert!(<Variant as Wire>::parse(&fits).is_ok());
+        assert_eq!(Wire::to_bytes(&outer(n)), Err(EncodeError::TooManyValues));
         let mut bytes = vec![0x98];
         bytes.extend_from_slice(&le32(n as u32));
         for _ in 0..n {
@@ -3953,7 +4994,10 @@ mod tests {
             bytes.extend_from_slice(&le32(MAX_ARRAY_LEN as u32));
             bytes.extend_from_slice(&vec![0; MAX_ARRAY_LEN]);
         }
-        assert_eq!(decode::<Variant>(&bytes), Err(DecodeError::TooManyValues));
+        assert_eq!(
+            <Variant as Wire>::parse(&bytes),
+            Err(DecodeError::TooManyValues)
+        );
     }
 
     #[test]
@@ -3969,15 +5013,22 @@ mod tests {
             bytes.extend_from_slice(&vec![0x40; per - 1]);
             bytes.push(0);
         }
-        assert_eq!(Reader::new(&bytes).read_array::<DiagnosticInfo>(), Err(DecodeError::TooManyValues));
+        assert_eq!(
+            Reader::new(&bytes).read_array::<DiagnosticInfo>(),
+            Err(DecodeError::TooManyValues)
+        );
         // The writer stops at the same count as the reader.
         let mut deep = DiagnosticInfo::default();
         for _ in 1..per {
-            deep = DiagnosticInfo { inner_diagnostic_info: Some(Box::new(deep)), ..Default::default() };
+            deep = DiagnosticInfo {
+                inner_diagnostic_info: Some(Box::new(deep)),
+                ..Default::default()
+            };
         }
         let fill = |k: usize| {
             let mut w = Writer::new();
-            w.write_array(&vec![deep.clone(); k]).map(|()| w.into_bytes())
+            w.write_array(&vec![deep.clone(); k])
+                .map(|()| w.into_bytes().unwrap())
         };
         // Each element is 1 + per values.
         let most = MAX_VALUES / (1 + per);
@@ -3997,22 +5048,39 @@ mod tests {
         }
         assert_eq!(ChunkType::from_byte(b'X'), None);
         let e: ExpandedNodeId = NodeId::numeric(0, 85).into();
-        assert_eq!(encode(&e).unwrap(), [0, 85]);
-        assert_eq!(Variant::from(Value::Int32(-2)), Variant::Scalar(Value::Int32(-2)));
-        assert_eq!(DecodeError::TooManyValues.to_string(), format!("more than {MAX_VALUES} values"));
-        assert_eq!(EncodeError::TooManyValues.to_string(), format!("more than {MAX_VALUES} values"));
+        assert_eq!(Wire::to_bytes(&e).unwrap(), [0, 85]);
+        assert_eq!(
+            Variant::from(Value::Int32(-2)),
+            Variant::Scalar(Value::Int32(-2))
+        );
+        assert_eq!(
+            DecodeError::TooManyValues.to_string(),
+            format!("more than {MAX_VALUES} values")
+        );
+        assert_eq!(
+            EncodeError::TooManyValues.to_string(),
+            format!("more than {MAX_VALUES} values")
+        );
     }
 
     /// Byte streams that each hold one whole message.
     fn samples() -> Vec<Vec<u8>> {
         let mut out = vec![
             hel_bytes(65536, 65536, b"opc.tcp://a"),
-            Message::Error(ErrorMessage { error: StatusCode::BAD_DECODING_ERROR, reason: "r".into() })
-                .to_bytes(&Limits::default())
-                .unwrap(),
-            Message::ReverseHello(ReverseHello { server_uri: "u".into(), endpoint_url: "e".into() })
-                .to_bytes(&Limits::default())
-                .unwrap(),
+            Message::Error(ErrorMessage {
+                error: StatusCode::BAD_DECODING_ERROR,
+                reason: "r".into(),
+            })
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap(),
+            Message::ReverseHello(ReverseHello {
+                server_uri: "u".into(),
+                endpoint_url: "e".into(),
+            })
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap(),
             Message::Secure(SecureMessage {
                 kind: SecureKind::Open(AsymmetricHeader::none()),
                 channel_id: 0,
@@ -4020,9 +5088,13 @@ mod tests {
                 request_id: 1,
                 body: open_request().to_bytes().unwrap(),
             })
-            .to_bytes(&Limits::default())
+            .chunks(&Limits::default())
+            .map(wire_chunks)
             .unwrap(),
-            msg(1, 2, 3, vec![1; 9000]).to_bytes(&Limits::default()).unwrap(),
+            msg(1, 2, 3, vec![1; 9000])
+                .chunks(&Limits::default())
+                .map(wire_chunks)
+                .unwrap(),
         ];
         let mut ack = b"ACKF".to_vec();
         ack.extend_from_slice(&le32(28));
@@ -4034,9 +5106,14 @@ mod tests {
         abort.extend_from_slice(&[0xff; 4]);
         out.push(msg_chunk(b'A', 1, 2, 3, 4, &abort));
         // A MSG holding a Variant, so mutations reach the value readers.
-        let mut body = encode(&NodeId::numeric(1, 999)).unwrap();
-        body.extend_from_slice(&encode(&every_variant()).unwrap());
-        out.push(msg(1, 1, 1, body).to_bytes(&Limits::default()).unwrap());
+        let mut body = Wire::to_bytes(&NodeId::numeric(1, 999)).unwrap();
+        body.extend_from_slice(&Wire::to_bytes(&every_variant()).unwrap());
+        out.push(
+            msg(1, 1, 1, body)
+                .chunks(&Limits::default())
+                .map(wire_chunks)
+                .unwrap(),
+        );
         out
     }
 
@@ -4056,46 +5133,77 @@ mod tests {
             Value::String(Some("s".into())),
             Value::String(None),
             Value::DateTime(11),
-            Value::Guid(Guid { data1: 1, data2: 2, data3: 3, data4: [4; 8] }),
+            Value::Guid(Guid {
+                data1: 1,
+                data2: 2,
+                data3: 3,
+                data4: [4; 8],
+            }),
             Value::ByteString(Some(vec![1, 2])),
             Value::XmlElement(Some(b"<x/>".to_vec())),
             Value::NodeId(NodeId::string(3, "n")),
-            Value::ExpandedNodeId(ExpandedNodeId { server_index: 1, ..Default::default() }),
+            Value::ExpandedNodeId(ExpandedNodeId {
+                server_index: 1,
+                ..Default::default()
+            }),
             Value::StatusCode(StatusCode::BAD_UNEXPECTED_ERROR),
-            Value::QualifiedName(QualifiedName { namespace: 1, name: "q".into() }),
-            Value::LocalizedText(LocalizedText { locale: None, text: Some("t".into()) }),
+            Value::QualifiedName(QualifiedName {
+                namespace: 1,
+                name: "q".into(),
+            }),
+            Value::LocalizedText(LocalizedText {
+                locale: None,
+                text: Some("t".into()),
+            }),
             Value::ExtensionObject(Box::new(ExtensionObject {
                 type_id: NodeId::numeric(0, 1),
                 body: ExtensionBody::Binary(vec![0]),
             })),
-            Value::DataValue(Box::new(DataValue { status: Some(StatusCode(1)), ..Default::default() })),
+            Value::DataValue(Box::new(DataValue {
+                status: Some(StatusCode(1)),
+                ..Default::default()
+            })),
         ]
     }
 
     fn every_variant() -> Variant {
         Variant::Array {
             type_id: type_id::VARIANT,
-            values: sample_values().into_iter().map(|v| Value::Variant(Box::new(Variant::Scalar(v)))).collect(),
+            values: sample_values()
+                .into_iter()
+                .map(|v| Value::Variant(Box::new(Variant::Scalar(v))))
+                .collect(),
             dimensions: Some(vec![2, 12]),
         }
     }
 
     #[test]
     fn every_truncated_prefix_waits_or_fails() {
-        // As a stream, a prefix of a message is only waiting, fed whole or
-        // a byte at a time.
-        for s in samples() {
-            let mut d = Decoder::new();
-            for n in 0..s.len() {
-                let mut whole = Decoder::new();
-                whole.feed(&s[..n]);
-                assert_eq!(whole.next_message(), None, "{n} of {}", s.len());
-                d.feed(&s[n..n + 1]);
-                if n + 1 < s.len() {
-                    assert_eq!(d.next_message(), None, "{n} of {}", s.len());
+        for bytes in samples() {
+            contract::check_decode_with_held_limit(
+                Messages::new,
+                &bytes,
+                MAX_MESSAGE_SIZE as usize,
+            );
+            for cut in 0..bytes.len() {
+                let mut stream = Stream::new(Messages::new());
+                pump(&mut stream, &bytes[..cut], |_| {
+                    panic!("partial message was emitted")
+                })
+                .unwrap();
+                stream.end();
+                if cut == 0 {
+                    assert!(stream.next().is_none());
+                } else {
+                    assert!(stream.next().unwrap().is_err());
                 }
             }
-            assert!(matches!(d.next_message(), Some(Ok(_))));
+            let mut stream = Stream::new(Messages::new());
+            let mut got = Vec::new();
+            pump(&mut stream, &bytes, |message| got.push(message)).unwrap();
+            stream.end();
+            assert!(stream.next().is_none());
+            assert_eq!(got.len(), 1);
         }
         // As values, prefixes end too soon.
         let req = open_request().to_bytes().unwrap();
@@ -4110,18 +5218,32 @@ mod tests {
             server_timestamp: Some(5),
             server_picoseconds: Some(6),
         };
-        let dv = encode(&full).unwrap();
+        let dv = Wire::to_bytes(&full).unwrap();
         for n in 0..dv.len() {
-            assert_eq!(decode::<DataValue>(&dv[..n]), Err(DecodeError::End), "{n}");
+            assert_eq!(
+                <DataValue as Wire>::parse(&dv[..n]),
+                Err(DecodeError::End),
+                "{n}"
+            );
         }
         // A string's length can outrun a prefix before its bytes do.
-        let v = encode(&every_variant()).unwrap();
+        let v = Wire::to_bytes(&every_variant()).unwrap();
         for n in 0..v.len() {
-            assert!(matches!(decode::<Variant>(&v[..n]), Err(DecodeError::End | DecodeError::Length(_))), "{n}");
+            assert!(
+                matches!(
+                    <Variant as Wire>::parse(&v[..n]),
+                    Err(DecodeError::End | DecodeError::Length(_))
+                ),
+                "{n}"
+            );
         }
-        let d = encode(&DiagnosticInfo { additional_info: Some("abc".into()), ..Default::default() }).unwrap();
+        let d = Wire::to_bytes(&DiagnosticInfo {
+            additional_info: Some("abc".into()),
+            ..Default::default()
+        })
+        .unwrap();
         for n in 0..d.len() {
-            assert!(decode::<DiagnosticInfo>(&d[..n]).is_err());
+            assert!(<DiagnosticInfo as Wire>::parse(&d[..n]).is_err());
         }
     }
 
@@ -4129,39 +5251,50 @@ mod tests {
     fn decoder_takes_many_small_messages_in_linear_time() {
         let mut stream = Vec::new();
         for seq in 0..100_000 {
-            stream.extend_from_slice(&msg(1, seq, 1, vec![1, 2, 3]).to_bytes(&Limits::default()).unwrap());
+            stream.extend_from_slice(
+                &msg(1, seq, 1, vec![1, 2, 3])
+                    .chunks(&Limits::default())
+                    .map(wire_chunks)
+                    .unwrap(),
+            );
         }
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Messages::new());
         let mut n = 0;
-        let mut rest = &stream[..];
-        while !rest.is_empty() {
-            rest = &rest[d.feed(rest)..];
-            while let Some(m) = d.next_message() {
-                m.unwrap();
-                n += 1;
-            }
-        }
+        pump(&mut d, &stream, |_| n += 1).unwrap();
         assert_eq!(n, 100_000);
         assert_eq!(d.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert!(
+            started.elapsed().as_secs() < 5,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn module_example() {
-        let mut server = Decoder::new();
+        let mut server = Stream::new(Messages::new());
         let url = b"opc.tcp://plc:4840";
-        server.feed(&hel_bytes(65536, 65536, url));
-        let Some(Ok(Message::Hello(hello))) = server.next_message() else { panic!() };
+        let input = &hel_bytes(65536, 65536, url);
+        assert_eq!(server.push(input), input.len());
+        let Some(Ok(Message::Hello(hello))) = server.next() else {
+            panic!()
+        };
         let ack = hello.acknowledge(&Limits::default());
         assert_eq!(ack.receive_buffer_size, 8192);
-        server.set_limits(ack.limits());
-        assert_eq!(server.limits(), ack.limits());
-        let reply = Message::Acknowledge(ack).to_bytes(&hello.limits()).unwrap();
+        server.decoder().set_limits(ack.limits());
+        assert_eq!(server.decoder().limits(), ack.limits());
+        let reply = Message::Acknowledge(ack)
+            .chunks(&hello.limits())
+            .map(wire_chunks)
+            .unwrap();
         assert_eq!(&reply[..4], b"ACKF");
         assert_eq!(reply.len(), 28);
         let request = Service::OpenSecureChannelRequest(OpenSecureChannelRequest {
-            header: RequestHeader { request_handle: 1, ..RequestHeader::default() },
+            header: RequestHeader {
+                request_handle: 1,
+                ..RequestHeader::default()
+            },
             client_protocol_version: 0,
             request_type: RequestType::Issue,
             security_mode: SecurityMode::None,
@@ -4175,13 +5308,23 @@ mod tests {
             request_id: 1,
             body: request.to_bytes().unwrap(),
         });
-        server.feed(&opn.to_bytes(&ack.limits()).unwrap());
-        let Some(Ok(Message::Secure(msg))) = server.next_message() else { panic!() };
-        let SecureKind::Open(security) = &msg.kind else { panic!() };
+        let input = &opn.chunks(&ack.limits()).map(wire_chunks).unwrap();
+        assert_eq!(server.push(input), input.len());
+        let Some(Ok(Message::Secure(msg))) = server.next() else {
+            panic!()
+        };
+        let SecureKind::Open(security) = &msg.kind else {
+            panic!()
+        };
         assert_eq!(security.policy_uri, SECURITY_POLICY_NONE);
-        let Ok(Service::OpenSecureChannelRequest(req)) = Service::parse(&msg.body) else { panic!() };
+        let Ok(Service::OpenSecureChannelRequest(req)) = Service::parse(&msg.body) else {
+            panic!()
+        };
         let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
-            header: ResponseHeader { request_handle: req.header.request_handle, ..ResponseHeader::default() },
+            header: ResponseHeader {
+                request_handle: req.header.request_handle,
+                ..ResponseHeader::default()
+            },
             server_protocol_version: 0,
             security_token: ChannelSecurityToken {
                 channel_id: 7,
@@ -4198,7 +5341,7 @@ mod tests {
             request_id: msg.request_id,
             body: response.to_bytes().unwrap(),
         });
-        let bytes = answer.to_bytes(&hello.limits()).unwrap();
+        let bytes = answer.chunks(&hello.limits()).map(wire_chunks).unwrap();
         assert_eq!(&bytes[..4], b"OPNF");
         assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
     }
@@ -4206,18 +5349,23 @@ mod tests {
     // Findings from review, each checked against Part 6 or Part 3.
 
     #[test]
-    fn feed_holds_a_bounded_amount() {
+    fn push_holds_a_bounded_amount() {
         let one = hel_bytes(8192, 8192, b"x");
-        let stream: Vec<u8> = one.iter().copied().cycle().take(MAX_BUFFERED + 1000 * one.len()).collect();
-        let mut d = Decoder::new();
-        let took = d.feed(&stream);
-        assert_eq!(took, MAX_BUFFERED);
-        assert_eq!(d.buffered(), MAX_BUFFERED);
-        assert_eq!(d.feed(&stream[took..]), 0);
+        let stream: Vec<u8> = one
+            .iter()
+            .copied()
+            .cycle()
+            .take(MAX_BUFFER_SIZE as usize + 1000 * one.len())
+            .collect();
+        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
+        let took = d.push(&stream);
+        assert_eq!(took, MAX_BUFFER_SIZE as usize);
+        assert_eq!(d.buffered(), MAX_BUFFER_SIZE as usize);
+        assert_eq!(d.push(&stream[took..]), 0);
         // Taking a message out makes room again.
-        assert!(matches!(d.next_message(), Some(Ok(Message::Hello(_)))));
-        assert_eq!(d.feed(&stream[took..]), one.len());
-        assert!(d.buf.len() <= MAX_BUFFERED);
+        assert!(matches!(d.next(), Some(Ok(Message::Hello(_)))));
+        assert_eq!(d.push(&stream[took..]), one.len());
+        assert!(d.buffered() <= MAX_BUFFER_SIZE as usize);
     }
 
     #[test]
@@ -4239,21 +5387,33 @@ mod tests {
             body: vec![0; MAX_MESSAGE_SIZE as usize],
         };
         let started = std::time::Instant::now();
-        assert_eq!(opn.to_chunks(&Limits::default()), Err(EncodeError::TooLong));
-        assert!(started.elapsed().as_millis() < 500, "took {:?}", started.elapsed());
+        assert_eq!(opn.chunks(&Limits::default()), Err(EncodeError::TooLong));
+        assert!(
+            started.elapsed().as_millis() < 500,
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn sequence_numbers_follow_across_messages() {
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'F', 7, 1, 10, 1, b"a"));
-        d.feed(&msg_chunk(b'F', 7, 1, 10, 2, b"b"));
+        let mut d = Stream::new(Messages::new());
+        let input = &msg_chunk(b'F', 7, 1, 10, 1, b"a");
+        assert_eq!(d.push(input), input.len());
+        let input = &msg_chunk(b'F', 7, 1, 10, 2, b"b");
+        assert_eq!(d.push(input), input.len());
         assert_eq!(
-            all(&mut d),
-            [Ok(msg(1, 10, 1, b"a".to_vec())), Err(ChunkError::Sequence { expected: 11, got: 10 })]
+            drain(&mut d),
+            [
+                Ok(msg(1, 10, 1, b"a".to_vec())),
+                Err(Fail::Protocol(ChunkError::Sequence {
+                    expected: 11,
+                    got: 10
+                }))
+            ]
         );
         // OPN, then a MSG of two chunks, then a CLO, numbered in turn.
-        let mut d = Decoder::new();
+        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         let opn = Message::Secure(SecureMessage {
             kind: SecureKind::Open(AsymmetricHeader::none()),
             channel_id: 0,
@@ -4261,8 +5421,13 @@ mod tests {
             request_id: 1,
             body: vec![],
         });
-        d.feed(&opn.to_bytes(&Limits::default()).unwrap());
-        d.feed(&msg(1, 6, 2, vec![0; 9000]).to_bytes(&Limits::default()).unwrap());
+        let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        let input = &msg(1, 6, 2, vec![0; 9000])
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        assert_eq!(d.push(input), input.len());
         let clo = Message::Secure(SecureMessage {
             kind: SecureKind::Close { token_id: 1 },
             channel_id: 7,
@@ -4270,77 +5435,184 @@ mod tests {
             request_id: 3,
             body: vec![],
         });
-        d.feed(&clo.to_bytes(&Limits::default()).unwrap());
-        assert!(all(&mut d).iter().all(Result::is_ok));
-        let mut d = Decoder::new();
-        d.feed(&opn.to_bytes(&Limits::default()).unwrap());
-        d.feed(&clo.to_bytes(&Limits::default()).unwrap());
-        assert_eq!(all(&mut d).last(), Some(&Err(ChunkError::Sequence { expected: 6, got: 8 })));
+        let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        assert!(drain(&mut d).iter().all(Result::is_ok));
+        let mut d = Stream::new(Messages::new());
+        let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
+        assert_eq!(d.push(input), input.len());
+        assert_eq!(
+            drain(&mut d).last(),
+            Some(&Err(Fail::Protocol(ChunkError::Sequence {
+                expected: 6,
+                got: 8
+            })))
+        );
     }
 
     #[test]
-    fn a_decoder_says_whether_it_is_between_messages() {
-        let mut d = Decoder::new();
-        assert!(d.is_between_messages());
-        d.feed(&msg_chunk(b'C', 7, 1, 1, 5, b"part"));
-        assert_eq!(d.next_message(), None);
-        assert_eq!(d.buffered(), 0);
-        assert!(!d.is_between_messages());
-        d.feed(&msg_chunk(b'F', 7, 1, 2, 5, b"end"));
-        assert!(d.next_message().unwrap().is_ok());
-        assert!(d.is_between_messages());
-        d.feed(b"MSG");
-        assert!(!d.is_between_messages());
+    fn messages_report_empty_partial_assemblies() {
+        let mut stream = Stream::new(Messages::new());
+        assert!(stream.decoder().is_between_messages());
+        for sequence in [1, 2] {
+            let chunk = msg_chunk(b'C', 7, 1, sequence, 5, b"");
+            assert_eq!(stream.push(&chunk), chunk.len());
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.buffered(), 0);
+            assert_eq!(stream.held(), 0);
+            assert!(!stream.decoder().is_between_messages());
+        }
+        let chunk = msg_chunk(b'F', 7, 1, 3, 5, b"");
+        assert_eq!(stream.push(&chunk), chunk.len());
+        assert_eq!(stream.next(), Some(Ok(msg(1, 1, 5, vec![]))));
+        assert!(stream.decoder().is_between_messages());
+        stream.end();
+        assert_eq!(stream.next(), None);
+    }
+
+    #[test]
+    fn message_completion_at_eof_includes_empty_bodies() {
+        for body in [b"".as_slice(), b"part"] {
+            for complete in [false, true] {
+                let mut d = Stream::new(Messages::new());
+                let input = msg_chunk(b'C', 7, 1, 1, 5, body);
+                assert_eq!(d.push(&input), input.len());
+                assert_eq!(d.next(), None);
+                assert_eq!(d.buffered(), 0);
+                assert_eq!(d.held(), body.len());
+                assert!(d.failed().is_none());
+
+                // Byte counts do not say whether an empty MSG is complete.
+                if complete {
+                    let input = msg_chunk(b'F', 7, 1, 2, 5, b"end");
+                    assert_eq!(d.push(&input), input.len());
+                    assert_eq!(d.next(), Some(Ok(msg(1, 1, 5, [body, b"end"].concat()))));
+                    assert_eq!(d.buffered(), 0);
+                    assert_eq!(d.held(), 0);
+                }
+                d.end();
+                if complete {
+                    assert_eq!(d.next(), None);
+                    assert!(d.failed().is_none());
+                } else {
+                    let error = Fail::Protocol(ChunkError::Incomplete);
+                    assert_eq!(d.next(), Some(Err(error.clone())));
+                    assert_eq!(d.failed(), Some(&error));
+                }
+                assert!(d.is_done());
+                assert_eq!(d.next(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn a_partial_header_after_a_message_is_truncated_at_eof() {
+        let mut d = Stream::new(Messages::new());
+        let input = msg_chunk(b'F', 7, 1, 1, 5, b"body");
+        assert_eq!(d.push(&input), input.len());
+        assert_eq!(d.next(), Some(Ok(msg(1, 1, 5, b"body".to_vec()))));
+        assert_eq!(d.push(b"MSG"), 3);
+        assert_eq!(d.next(), None);
+        assert_eq!(d.buffered(), 3);
+        d.end();
+        assert_eq!(d.next(), Some(Err(Fail::Truncated { unread: 3 })));
     }
 
     #[test]
     fn an_error_message_ends_a_partial_message() {
-        let mut d = Decoder::new();
-        d.feed(&msg_chunk(b'C', 7, 1, 1, 5, b"part"));
-        let err = Message::Error(ErrorMessage { error: StatusCode::BAD_TCP_INTERNAL_ERROR, reason: "bye".into() });
-        d.feed(&err.to_bytes(&Limits::default()).unwrap());
-        assert_eq!(d.next_message(), Some(Ok(err)));
-        assert!(d.is_between_messages());
+        let err = Message::Error(ErrorMessage {
+            error: StatusCode::BAD_TCP_INTERNAL_ERROR,
+            reason: "bye".into(),
+        });
+        for body in [b"".as_slice(), b"part"] {
+            let mut d = Stream::new(Messages::new());
+            let input = msg_chunk(b'C', 7, 1, 1, 5, body);
+            assert_eq!(d.push(&input), input.len());
+            assert_eq!(d.next(), None);
+            assert_eq!(d.held(), body.len());
+            let input = err.chunks(&Limits::default()).map(wire_chunks).unwrap();
+            assert_eq!(d.push(&input), input.len());
+            assert_eq!(d.next(), Some(Ok(err.clone())));
+            assert_eq!(d.buffered(), 0);
+            assert_eq!(d.held(), 0);
+            d.end();
+            assert_eq!(d.next(), None);
+            assert!(d.is_done());
+            assert!(d.failed().is_none());
+        }
     }
 
     #[test]
     fn variants_hold_no_diagnostic_infos_or_nested_data_values() {
         // Part 6, 5.1.9.
-        assert_eq!(decode::<Variant>(&[0x19, 0]), Err(DecodeError::VariantType(25)));
-        assert_eq!(decode::<Variant>(&[0x99, 0, 0, 0, 0]), Err(DecodeError::VariantType(25)));
-        assert_eq!(decode::<Variant>(&[0x17, 0x01, 0x17, 0]), Err(DecodeError::VariantType(23)));
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x19, 0]),
+            Err(DecodeError::VariantType(25))
+        );
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x99, 0, 0, 0, 0]),
+            Err(DecodeError::VariantType(25))
+        );
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x17, 0x01, 0x17, 0]),
+            Err(DecodeError::VariantType(23))
+        );
         // Indirectly too: through an array of Variants.
-        assert_eq!(decode::<DataValue>(&[0x01, 0x98, 1, 0, 0, 0, 0x17, 0]), Err(DecodeError::VariantType(23)));
+        assert_eq!(
+            <DataValue as Wire>::parse(&[0x01, 0x98, 1, 0, 0, 0, 0x17, 0]),
+            Err(DecodeError::VariantType(23))
+        );
         // A DataValue in a Variant that is not inside one is fine.
-        assert!(decode::<Variant>(&[0x17, 0x01, 0x06, 1, 0, 0, 0]).is_ok());
+        assert!(<Variant as Wire>::parse(&[0x17, 0x01, 0x06, 1, 0, 0, 0]).is_ok());
         let diag = Variant::Scalar(Value::DiagnosticInfo(Box::default()));
-        assert_eq!(encode(&diag), Err(EncodeError::VariantType));
-        let inner = DataValue { value: Some(Variant::Null), ..Default::default() };
+        assert_eq!(Wire::to_bytes(&diag), Err(EncodeError::VariantType));
+        let inner = DataValue {
+            value: Some(Variant::Null),
+            ..Default::default()
+        };
         let outer = DataValue {
             value: Some(Variant::Array {
                 type_id: type_id::VARIANT,
-                values: vec![Value::Variant(Box::new(Variant::Scalar(Value::DataValue(Box::new(inner.clone())))))],
+                values: vec![Value::Variant(Box::new(Variant::Scalar(Value::DataValue(
+                    Box::new(inner.clone()),
+                ))))],
                 dimensions: None,
             }),
             ..Default::default()
         };
-        assert_eq!(encode(&outer), Err(EncodeError::VariantType));
-        assert!(encode(&Variant::Scalar(Value::DataValue(Box::new(inner)))).is_ok());
+        assert_eq!(Wire::to_bytes(&outer), Err(EncodeError::VariantType));
+        assert!(Wire::to_bytes(&Variant::Scalar(Value::DataValue(Box::new(inner)))).is_ok());
     }
 
     #[test]
     fn variant_types_are_checked_before_the_array_length() {
         // Part 6, 5.2.2.16: type 32 does not exist, even for an empty array.
-        assert_eq!(decode::<Variant>(&[0xa0, 0, 0, 0, 0]), Err(DecodeError::VariantType(32)));
+        assert_eq!(
+            <Variant as Wire>::parse(&[0xa0, 0, 0, 0, 0]),
+            Err(DecodeError::VariantType(32))
+        );
         // Encoders shall not use the reserved ids 26 to 31.
         assert_eq!(
-            encode(&Variant::Scalar(Value::Reserved { type_id: 26, bytes: None })),
+            Wire::to_bytes(&Variant::Scalar(Value::Reserved {
+                type_id: 26,
+                bytes: None
+            })),
             Err(EncodeError::VariantType)
         );
-        let empty = Variant::Array { type_id: 27, values: vec![], dimensions: None };
-        assert_eq!(encode(&empty), Err(EncodeError::VariantType));
-        // Readers still take them.
-        assert!(decode::<Variant>(&[0x9b, 0, 0, 0, 0]).is_ok());
+        let empty = Variant::Array {
+            type_id: 27,
+            values: vec![],
+            dimensions: None,
+        };
+        assert_eq!(Wire::to_bytes(&empty), Err(EncodeError::VariantType));
+        // Binary readers accept reserved type ids.
+        assert!(Reader::new(&[0x9b, 0, 0, 0, 0]).read::<Variant>().is_ok());
+        assert_eq!(
+            <Variant as Wire>::parse(&[0x9b, 0, 0, 0, 0]),
+            Err(DecodeError::VariantType(27))
+        );
     }
 
     #[test]
@@ -4352,77 +5624,162 @@ mod tests {
             deep.extend_from_slice(&[0x98, 1, 0, 0, 0]);
         }
         deep.extend_from_slice(&[6, 1, 0, 0, 0]);
-        let v = decode::<Variant>(&deep).unwrap();
-        assert_eq!(encode(&v).unwrap(), deep);
+        let v = <Variant as Wire>::parse(&deep).unwrap();
+        assert_eq!(Wire::to_bytes(&v).unwrap(), deep);
     }
 
     #[test]
     fn node_id_and_qualified_name_limits() {
         // Part 3, 8.2.4 and 8.3: lengths in characters, no C0 or C1.
         let longest = NodeId::string(1, &"水".repeat(MAX_NODE_ID_LEN));
-        assert_eq!(decode::<NodeId>(&encode(&longest).unwrap()), Ok(longest));
-        assert_eq!(encode(&NodeId::string(1, &"a".repeat(MAX_NODE_ID_LEN + 1))), Err(EncodeError::TooLong));
+        assert_eq!(
+            <NodeId as Wire>::parse(&Wire::to_bytes(&longest).unwrap()),
+            Ok(longest)
+        );
+        assert_eq!(
+            Wire::to_bytes(&NodeId::string(1, &"a".repeat(MAX_NODE_ID_LEN + 1))),
+            Err(EncodeError::TooLong)
+        );
         let mut long = vec![0x03, 1, 0];
         long.extend_from_slice(&le32(MAX_NODE_ID_LEN as u32 + 1));
         long.extend_from_slice(&vec![b'a'; MAX_NODE_ID_LEN + 1]);
-        assert_eq!(decode::<NodeId>(&long), Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1)));
+        assert_eq!(
+            <NodeId as Wire>::parse(&long),
+            Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1))
+        );
         long[0] = 0x05;
-        assert_eq!(decode::<NodeId>(&long), Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1)));
-        let opaque = NodeId { namespace: 1, identifier: Identifier::Opaque(vec![0; MAX_NODE_ID_LEN + 1]) };
-        assert_eq!(encode(&opaque), Err(EncodeError::TooLong));
-        assert_eq!(encode(&NodeId::string(1, "a\nb")), Err(EncodeError::ControlChar));
-        assert_eq!(encode(&NodeId::string(1, "a\u{85}b")), Err(EncodeError::ControlChar));
-        assert_eq!(decode::<NodeId>(&[0x03, 1, 0, 3, 0, 0, 0, b'a', b'\n', b'b']), Err(DecodeError::ControlChar));
-        let q = QualifiedName { namespace: 0, name: "q".repeat(MAX_QUALIFIED_NAME_LEN + 1) };
-        assert_eq!(encode(&q), Err(EncodeError::TooLong));
+        assert_eq!(
+            <NodeId as Wire>::parse(&long),
+            Err(DecodeError::Length(MAX_NODE_ID_LEN as i32 + 1))
+        );
+        let opaque = NodeId {
+            namespace: 1,
+            identifier: Identifier::Opaque(vec![0; MAX_NODE_ID_LEN + 1]),
+        };
+        assert_eq!(Wire::to_bytes(&opaque), Err(EncodeError::TooLong));
+        assert_eq!(
+            Wire::to_bytes(&NodeId::string(1, "a\nb")),
+            Err(EncodeError::ControlChar)
+        );
+        assert_eq!(
+            Wire::to_bytes(&NodeId::string(1, "a\u{85}b")),
+            Err(EncodeError::ControlChar)
+        );
+        assert_eq!(
+            <NodeId as Wire>::parse(&[0x03, 1, 0, 3, 0, 0, 0, b'a', b'\n', b'b']),
+            Err(DecodeError::ControlChar)
+        );
+        let q = QualifiedName {
+            namespace: 0,
+            name: "q".repeat(MAX_QUALIFIED_NAME_LEN + 1),
+        };
+        assert_eq!(Wire::to_bytes(&q), Err(EncodeError::TooLong));
         let mut qb = vec![0, 0];
         qb.extend_from_slice(&le32(MAX_QUALIFIED_NAME_LEN as u32 + 1));
         qb.extend_from_slice(&vec![b'q'; MAX_QUALIFIED_NAME_LEN + 1]);
-        assert_eq!(decode::<QualifiedName>(&qb), Err(DecodeError::Length(MAX_QUALIFIED_NAME_LEN as i32 + 1)));
-        let ok = QualifiedName { namespace: 0, name: "q".repeat(MAX_QUALIFIED_NAME_LEN) };
-        assert_eq!(decode::<QualifiedName>(&encode(&ok).unwrap()), Ok(ok));
-        assert_eq!(encode(&QualifiedName { namespace: 0, name: "\t".into() }), Err(EncodeError::ControlChar));
+        assert_eq!(
+            <QualifiedName as Wire>::parse(&qb),
+            Err(DecodeError::Length(MAX_QUALIFIED_NAME_LEN as i32 + 1))
+        );
+        let ok = QualifiedName {
+            namespace: 0,
+            name: "q".repeat(MAX_QUALIFIED_NAME_LEN),
+        };
+        assert_eq!(
+            <QualifiedName as Wire>::parse(&Wire::to_bytes(&ok).unwrap()),
+            Ok(ok)
+        );
+        assert_eq!(
+            Wire::to_bytes(&QualifiedName {
+                namespace: 0,
+                name: "\t".into()
+            }),
+            Err(EncodeError::ControlChar)
+        );
     }
 
     #[test]
     fn every_null_node_id_is_null() {
         // Part 3, 8.2.4, Table 24.
         assert!(NodeId::string(0, "").is_null());
-        assert!(NodeId { namespace: 0, identifier: Identifier::Guid(Guid::default()) }.is_null());
-        assert!(NodeId { namespace: 0, identifier: Identifier::Opaque(vec![]) }.is_null());
+        assert!(
+            NodeId {
+                namespace: 0,
+                identifier: Identifier::Guid(Guid::default())
+            }
+            .is_null()
+        );
+        assert!(
+            NodeId {
+                namespace: 0,
+                identifier: Identifier::Opaque(vec![])
+            }
+            .is_null()
+        );
         assert!(!NodeId::string(1, "").is_null());
         assert!(!NodeId::numeric(0, 1).is_null());
     }
 
     #[test]
-    fn expanded_node_ids_with_a_uri_write_namespace_zero() {
+    fn expanded_node_ids_require_namespace_zero_with_a_uri() {
         // Part 6, 5.2.2.10.
-        let e =
-            ExpandedNodeId { node_id: NodeId::numeric(7, 42), namespace_uri: Some("urn:x".into()), server_index: 0 };
-        let bytes = encode(&e).unwrap();
+        let e = ExpandedNodeId {
+            node_id: NodeId::numeric(7, 42),
+            namespace_uri: Some("urn:x".into()),
+            server_index: 0,
+        };
+        assert_eq!(e.to_bytes(), Err(EncodeError::Unwritable));
+        let e = ExpandedNodeId {
+            node_id: NodeId::numeric(0, 42),
+            ..e
+        };
+        let bytes = e.to_bytes().unwrap();
         assert_eq!(bytes[..2], [0x80, 42]);
-        let back = decode::<ExpandedNodeId>(&bytes).unwrap();
+        let back = <ExpandedNodeId as Wire>::parse(&bytes).unwrap();
         assert_eq!(back.node_id, NodeId::numeric(0, 42));
         // A namespace index sent beside a URI reads as 0.
         assert_eq!(
-            decode::<ExpandedNodeId>(&[0x81, 7, 42, 0, 1, 0, 0, 0, b'u']).unwrap().node_id,
+            <ExpandedNodeId as Wire>::parse(&[0x81, 7, 42, 0, 1, 0, 0, 0, b'u'])
+                .unwrap()
+                .node_id,
             NodeId::numeric(0, 42)
         );
-        // An empty URI is left off.
-        let empty =
-            ExpandedNodeId { node_id: NodeId::numeric(0, 42), namespace_uri: Some(String::new()), server_index: 0 };
-        assert_eq!(encode(&empty).unwrap(), [0, 42]);
-        assert_eq!(decode::<ExpandedNodeId>(&[0x80, 42, 0, 0, 0, 0]).unwrap().namespace_uri, None);
+        // An empty URI would read back as None and is refused.
+        let empty = ExpandedNodeId {
+            node_id: NodeId::numeric(0, 42),
+            namespace_uri: Some(String::new()),
+            server_index: 0,
+        };
+        assert_eq!(empty.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(
+            <ExpandedNodeId as Wire>::parse(&[0x80, 42, 0, 0, 0, 0])
+                .unwrap()
+                .namespace_uri,
+            None
+        );
     }
 
     #[test]
     fn picoseconds_stay_below_ten_thousand() {
         // Part 6, 5.2.2.17.
         let bytes = [0x14, 1, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff];
-        assert_eq!(decode::<DataValue>(&bytes).unwrap().source_picoseconds, Some(MAX_PICOSECONDS));
-        let d = DataValue { server_timestamp: Some(1), server_picoseconds: Some(10_000), ..Default::default() };
-        let out = encode(&d).unwrap();
-        assert_eq!(out[out.len() - 2..], MAX_PICOSECONDS.to_le_bytes());
+        assert_eq!(
+            <DataValue as Wire>::parse(&bytes)
+                .unwrap()
+                .source_picoseconds,
+            Some(MAX_PICOSECONDS)
+        );
+        let d = DataValue {
+            server_timestamp: Some(1),
+            server_picoseconds: Some(10_000),
+            ..Default::default()
+        };
+        assert_eq!(d.to_bytes(), Err(EncodeError::Unwritable));
+        let d = DataValue {
+            server_picoseconds: Some(MAX_PICOSECONDS),
+            ..d
+        };
+        contract::check_wire_value(&d);
     }
 
     #[test]
@@ -4439,28 +5796,48 @@ mod tests {
             })
         };
         for h in [
-            AsymmetricHeader { sender_certificate: Some(vec![1]), ..AsymmetricHeader::none() },
-            AsymmetricHeader { receiver_thumbprint: Some(vec![1]), ..AsymmetricHeader::none() },
+            AsymmetricHeader {
+                sender_certificate: Some(vec![1]),
+                ..AsymmetricHeader::none()
+            },
+            AsymmetricHeader {
+                receiver_thumbprint: Some(vec![1]),
+                ..AsymmetricHeader::none()
+            },
             AsymmetricHeader {
                 policy_uri: "urn:p".into(),
                 receiver_thumbprint: Some(vec![1]),
                 sender_certificate: None,
             },
         ] {
-            assert_eq!(opn(h.clone()).to_bytes(&Limits::default()), Err(EncodeError::SecurityHeader));
+            assert_eq!(
+                opn(h.clone()).chunks(&Limits::default()).map(wire_chunks),
+                Err(EncodeError::SecurityHeader)
+            );
             // The same header, written by hand, does not read.
-            let good = opn(AsymmetricHeader { policy_uri: h.policy_uri.clone(), ..AsymmetricHeader::none() });
-            let mut bytes = good.to_bytes(&Limits::default()).unwrap();
+            let good = opn(AsymmetricHeader {
+                policy_uri: h.policy_uri.clone(),
+                ..AsymmetricHeader::none()
+            });
+            let mut bytes = good.chunks(&Limits::default()).map(wire_chunks).unwrap();
             let at = 12 + 4 + h.policy_uri.len();
             let mut fields = Writer::new();
             fields.byte_string(h.sender_certificate.as_deref()).unwrap();
-            fields.byte_string(h.receiver_thumbprint.as_deref()).unwrap();
-            bytes.splice(at..at + 8, fields.into_bytes());
+            fields
+                .byte_string(h.receiver_thumbprint.as_deref())
+                .unwrap();
+            bytes.splice(at..at + 8, fields.into_bytes().unwrap());
             let size = bytes.len() as u32;
             bytes[4..8].copy_from_slice(&le32(size));
-            let mut d = Decoder::new();
-            d.feed(&bytes);
-            assert_eq!(d.next_message(), Some(Err(ChunkError::Decode(MessageType::Open, DecodeError::Length(1)))));
+            let mut d = Stream::new(Messages::new());
+            assert_eq!(d.push(&bytes), bytes.len());
+            assert_eq!(
+                d.next(),
+                Some(Err(Fail::Protocol(ChunkError::Decode(
+                    MessageType::Open,
+                    DecodeError::Length(1)
+                ))))
+            );
         }
         // Empty fields, and a 20-byte thumbprint under another policy, are fine.
         let empty = AsymmetricHeader {
@@ -4468,16 +5845,24 @@ mod tests {
             receiver_thumbprint: Some(vec![]),
             ..AsymmetricHeader::none()
         };
-        let bytes = opn(empty.clone()).to_bytes(&Limits::default()).unwrap();
-        let mut d = Decoder::new();
-        d.feed(&bytes);
-        assert_eq!(d.next_message(), Some(Ok(opn(empty))));
+        let bytes = opn(empty.clone())
+            .chunks(&Limits::default())
+            .map(wire_chunks)
+            .unwrap();
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&bytes), bytes.len());
+        assert_eq!(d.next(), Some(Ok(opn(empty))));
         let signed = AsymmetricHeader {
             policy_uri: "urn:p".into(),
             sender_certificate: Some(vec![1; 30]),
             receiver_thumbprint: Some(vec![2; THUMBPRINT_LEN]),
         };
-        assert!(opn(signed).to_bytes(&Limits::default()).is_ok());
+        assert!(
+            opn(signed)
+                .chunks(&Limits::default())
+                .map(wire_chunks)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -4485,96 +5870,112 @@ mod tests {
         // Part 6, 7.1.2.2: receivers ignore the fourth byte of a HEL.
         let mut hel = hel_bytes(8192, 8192, b"x");
         hel[3] = 0;
-        let mut d = Decoder::new();
-        d.feed(&hel);
-        let Some(Ok(m)) = d.next_message() else { panic!() };
-        // Writers still write 'F'.
-        assert_eq!(m.to_bytes(&Limits::default()).unwrap()[3], b'F');
+        let mut d = Stream::new(Messages::new());
+        assert_eq!(d.push(&hel), hel.len());
+        let Some(Ok(m)) = d.next() else { panic!() };
+        // Writers use 'F'.
+        assert_eq!(
+            m.chunks(&Limits::default()).map(wire_chunks).unwrap()[3],
+            b'F'
+        );
     }
 
     #[test]
     fn nans_are_written_quiet() {
         // Part 6, 5.2.2.3.
-        let f = encode(&Variant::Scalar(Value::Float(f32::from_bits(0x7f80_0001)))).unwrap();
+        let f =
+            Wire::to_bytes(&Variant::Scalar(Value::Float(f32::from_bits(0x7f80_0001)))).unwrap();
         assert_eq!(f[1..], [0, 0, 0xc0, 0xff]);
-        let d = encode(&Variant::Scalar(Value::Double(f64::from_bits(0x7ff0_0000_0000_0001)))).unwrap();
+        let d = Wire::to_bytes(&Variant::Scalar(Value::Double(f64::from_bits(
+            0x7ff0_0000_0000_0001,
+        ))))
+        .unwrap();
         assert_eq!(d[1..], [0, 0, 0, 0, 0, 0, 0xf8, 0xff]);
-        assert_eq!(encode(&Variant::Scalar(Value::Float(1.5))).unwrap()[1..], 1.5f32.to_le_bytes());
+        assert_eq!(
+            Wire::to_bytes(&Variant::Scalar(Value::Float(1.5))).unwrap()[1..],
+            1.5f32.to_le_bytes()
+        );
     }
 
     #[test]
     fn date_times_are_bounded() {
         // Part 6, 5.2.2.5.
-        assert_eq!(encode(&Variant::Scalar(Value::DateTime(-1))).unwrap()[1..], [0; 8]);
-        assert_eq!(encode(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME))).unwrap()[1..], i64::MAX.to_le_bytes());
         assert_eq!(
-            encode(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME - 1))).unwrap()[1..],
+            Wire::to_bytes(&Variant::Scalar(Value::DateTime(-1))),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(
+            Wire::to_bytes(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME))),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(
+            Wire::to_bytes(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME - 1))).unwrap()[1..],
             (MAX_DATE_TIME - 1).to_le_bytes()
         );
         // An Int64 is written as it is.
-        assert_eq!(encode(&Variant::Scalar(Value::Int64(-1))).unwrap()[1..], [0xff; 8]);
+        assert_eq!(
+            Wire::to_bytes(&Variant::Scalar(Value::Int64(-1))).unwrap()[1..],
+            [0xff; 8]
+        );
         let mut b = vec![13];
         b.extend_from_slice(&(-5i64).to_le_bytes());
-        assert_eq!(decode::<Variant>(&b), Ok(Variant::Scalar(Value::DateTime(0))));
-        let h = RequestHeader { timestamp: -9, ..Default::default() };
-        assert_eq!(encode(&h).unwrap()[2..10], [0; 8]);
+        assert_eq!(
+            <Variant as Wire>::parse(&b),
+            Ok(Variant::Scalar(Value::DateTime(0)))
+        );
+        let h = RequestHeader {
+            timestamp: -9,
+            ..Default::default()
+        };
+        assert_eq!(Wire::to_bytes(&h), Err(EncodeError::Unwritable));
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: u32) -> u32 {
-            self.next() % n.max(1)
-        }
-    }
-
-    /// Reads a value, and if it reads and writes, checks that the bytes
-    /// written read back and write the same.
-    /// Reads a value, and if it reads, checks that it writes, unless it
-    /// holds a reserved Variant type only readers take, and that the bytes
-    /// written read back and write the same.
-    fn round_trip<T: Binary>(b: &[u8]) {
-        if let Ok(v) = decode::<T>(b) {
-            match encode(&v) {
-                Ok(out) => {
-                    let back: T = decode(&out).expect("written bytes read back");
-                    assert_eq!(encode(&back).unwrap(), out);
-                }
+    /// Checks permissive reads, including reserved Variant types that cannot be written.
+    fn check_reader<T: Binary + Wire<WriteError = EncodeError> + PartialEq + core::fmt::Debug>(
+        bytes: &[u8],
+    ) {
+        let mut reader = Reader::new(bytes);
+        if let Ok(value) = reader.read::<T>()
+            && reader.finish().is_ok()
+        {
+            match value.to_bytes() {
+                Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
                 Err(EncodeError::VariantType) => {}
-                Err(e) => panic!("a value read does not write: {e}"),
+                Err(error) => panic!("{error}"),
             }
         }
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x5e_ed0f_0bca);
+        let mut rng = Lcg::new(0x5e_ed0f_0bca);
         let seeds = samples();
-        let small = Limits { receive_buffer_size: 8192, max_message_size: 1 << 16, max_chunk_count: 8 };
+        let small = Limits {
+            receive_buffer_size: 8192,
+            max_message_size: 1 << 16,
+            max_chunk_count: 8,
+        };
         for round in 0..4000 {
             // Half random bytes, half a valid sample with a few bytes changed.
             let mut b: Vec<u8> = if round % 2 == 0 {
-                let n = rng.below(300) as usize;
-                let mut v: Vec<u8> = (0..n).map(|_| rng.next() as u8).collect();
+                let mut v = rng.bytes(299);
+                let n = v.len();
                 // Start some with a real header so the parsers go deeper.
-                if n >= 8 && rng.below(2) == 0 {
-                    let types: [&[u8; 4]; 7] = [b"HELF", b"ACKF", b"ERRF", b"RHEF", b"OPNF", b"CLOF", b"MSGC"];
-                    v[..4].copy_from_slice(types[rng.below(7) as usize]);
-                    v[4..8].copy_from_slice(&le32(rng.below(n as u32 + 1)));
+                if n >= 8 && rng.coin() {
+                    let types: [&[u8; 4]; 7] = [
+                        b"HELF", b"ACKF", b"ERRF", b"RHEF", b"OPNF", b"CLOF", b"MSGC",
+                    ];
+                    v[..4].copy_from_slice(types[rng.index(types.len())]);
+                    v[4..8].copy_from_slice(&le32(rng.index(n + 1) as u32));
                 }
                 v
             } else {
-                let mut v = seeds[rng.below(seeds.len() as u32) as usize].clone();
+                let mut v = seeds[rng.index(seeds.len())].clone();
                 for _ in 0..1 + rng.below(4) {
-                    let i = rng.below(v.len() as u32) as usize;
-                    v[i] = rng.next() as u8;
+                    test_support::mutate(&mut rng, &mut v);
                 }
                 if rng.below(4) == 0 {
-                    v.truncate(rng.below(v.len() as u32) as usize);
+                    test_support::mutate(&mut rng, &mut v);
                 }
                 v
             };
@@ -4582,57 +5983,49 @@ mod tests {
                 b.extend_from_slice(&seeds[0]);
             }
 
-            // The stream, all at once and a byte at a time.
-            let limits = if round % 3 == 0 { small } else { Limits::default() };
-            let mut whole = Decoder::with_limits(limits);
-            whole.feed(&b);
-            let first = all(&mut whole);
-            let mut bytewise = Decoder::with_limits(limits);
-            let mut second = Vec::new();
-            for byte in &b {
-                bytewise.feed(std::slice::from_ref(byte));
-                while let Some(m) = bytewise.next_message() {
-                    let stop = m.is_err();
-                    second.push(m);
-                    if stop {
-                        break;
-                    }
-                }
-                if second.last().is_some_and(|m| m.is_err()) {
-                    break;
-                }
-            }
-            assert_eq!(first, second);
-            for m in first.iter().flatten() {
+            let limits = if round % 3 == 0 {
+                small
+            } else {
+                Limits::default()
+            };
+            contract::check_decode_with_held_limit(
+                || Messages::with_limits(limits),
+                &b,
+                limits.message_limit() as usize,
+            );
+            let (first, _) = decode_all(|| Messages::with_limits(limits), &b);
+            for m in &first {
                 // A message read writes, and reads back the same.
-                let out = m.to_bytes(&limits).expect("a message read can be written");
-                let mut d = Decoder::with_limits(limits);
-                d.feed(&out);
-                assert_eq!(d.next_message().as_ref(), Some(&Ok(m.clone())));
-                if let Message::Secure(s) = m
-                    && let Ok(service) = Service::parse(&s.body)
-                {
-                    let body = service.to_bytes().expect("a service read can be written");
-                    assert_eq!(Service::parse(&body), Ok(service.clone()));
-                    if let Service::Other { body, .. } = service {
-                        round_trip::<Variant>(&body);
+                let out = m
+                    .chunks(&limits)
+                    .map(wire_chunks)
+                    .expect("a message read can be written");
+                let mut d =
+                    Stream::with_buffer(Messages::with_limits(limits), MAX_BUFFER_SIZE as usize);
+                assert_eq!(d.push(&out), out.len());
+                assert_eq!(d.next().as_ref(), Some(&Ok(m.clone())));
+                if let Message::Secure(s) = m {
+                    contract::check_wire::<Service>(&s.body);
+                    if let Ok(Service::Other { body, .. }) = Service::parse(&s.body) {
+                        contract::check_wire::<Variant>(&body);
+                        check_reader::<Variant>(&body);
                     }
                 }
             }
 
             // The same bytes as values.
-            round_trip::<Variant>(&b);
-            round_trip::<DataValue>(&b);
-            round_trip::<DiagnosticInfo>(&b);
-            round_trip::<ExpandedNodeId>(&b);
-            round_trip::<NodeId>(&b);
-            round_trip::<LocalizedText>(&b);
-            round_trip::<ExtensionObject>(&b);
-            round_trip::<ResponseHeader>(&b);
-            if let Ok(s) = Service::parse(&b) {
-                let out = s.to_bytes().expect("a service read can be written");
-                assert_eq!(Service::parse(&out), Ok(s));
-            }
+            contract::check_wire::<Variant>(&b);
+            contract::check_wire::<DataValue>(&b);
+            contract::check_wire::<DiagnosticInfo>(&b);
+            check_reader::<Variant>(&b);
+            check_reader::<DataValue>(&b);
+            check_reader::<DiagnosticInfo>(&b);
+            contract::check_wire::<ExpandedNodeId>(&b);
+            contract::check_wire::<NodeId>(&b);
+            contract::check_wire::<LocalizedText>(&b);
+            contract::check_wire::<ExtensionObject>(&b);
+            contract::check_wire::<ResponseHeader>(&b);
+            contract::check_wire::<Service>(&b);
             // Every value at every offset, one byte at a time through a reader.
             let mut r = Reader::new(&b);
             while r.remaining() > 0 {
