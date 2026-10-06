@@ -337,3 +337,27 @@ fn copied_moldudp64_recovers_a_gap() {
     finish(&mut blocks, |m| messages.push(m)).unwrap();
     assert_eq!(messages, [b"c".to_vec()]);
 }
+
+#[test]
+fn copied_generated_cme_module_frames_packets() {
+    let packet = cme_mdp3::Packet {
+        header: cme_mdp3::PacketHeader {
+            sequence: 3,
+            sending_time: 4,
+        },
+        messages: vec![
+            cme_mdp3::Message::AdminHeartbeat12(cme_mdp3::AdminHeartbeat12 {}),
+            cme_mdp3::Message::AdminLogin15(cme_mdp3::AdminLogin15 { heart_bt_int: 30 }),
+        ],
+    };
+    let bytes = packet.to_bytes().unwrap();
+    assert_eq!(<cme_mdp3::Packet as Wire>::parse(&bytes).unwrap(), packet);
+    let mut stream = Stream::new(cme_mdp3::Frames);
+    let mut messages = Vec::new();
+    for chunk in bytes[cme_mdp3::PACKET_HEADER..].chunks(3) {
+        pump(&mut stream, chunk, |m| messages.push(m)).unwrap();
+    }
+    finish(&mut stream, |m| messages.push(m)).unwrap();
+    assert_eq!(messages, packet.messages);
+    assert_eq!(cme_mdp3::Price9::EXPONENT, -9);
+}

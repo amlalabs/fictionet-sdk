@@ -29,6 +29,7 @@ fn one(ty: Type) -> Schema {
                 ty,
                 byte_order: None,
                 fixed_size: None,
+                offset: None,
             }]),
         }],
         ..Schema::default()
@@ -568,4 +569,182 @@ fn wire_docs_name_only_applicable_value_refusals() {
     assert!(entry.contains("unknown enum values"));
     assert!(entry.contains("undeclared set bits"));
     assert!(!entry.contains("UTF-8"));
+}
+
+const HEADER: &str = r#"{"size":4,"fields":[{"name":"len","offset":0,"width":"u16","role":"length"},{"name":"n","offset":2,"width":"u8","role":"count"}]}"#;
+fn with_entry(field: &str) -> String {
+    format!(
+        r#"{{"types":[{{"name":"E","kind":"enum","repr":"u8","variants":[{{"name":"a","value":1}}]}},{{"name":"B","kind":"block","length":2,"fields":[{{"name":"x","type":"u16"}}]}},{{"name":"S","kind":"struct","fields":[{field}]}}]}}"#
+    )
+}
+fn union(header: &str, cases: &str) -> String {
+    format!(
+        r#"{{"types":[{{"name":"B","kind":"block","length":2,"fields":[{{"name":"x","type":"u16"}}]}},{{"name":"T","kind":"struct","fields":[]}},{{"name":"U","kind":"union","header":{header},"cases":[{cases}]}}]}}"#
+    )
+}
+const UNION_HEADER: &str = r#"{"size":4,"fields":[{"name":"len","offset":0,"width":"u16","role":"length"},{"name":"tag","offset":2,"width":"u16","role":"tag","max":100}]}"#;
+
+#[test]
+fn ranges_constants_and_null_enums() {
+    checked(&with_entry(
+        r#"{"name":"r","type":{"kind":"range","item":"i8","min":-5,"max":5}},
+           {"name":"c","type":{"kind":"constant","item":"u8","value":7}},
+           {"name":"k","type":{"kind":"constant","enum":"E","variant":"a"}},
+           {"name":"b","type":{"kind":"constant","bytes":[1,2]}},
+           {"name":"o","type":{"kind":"optional","item":{"kind":"ref","name":"E"},"null":0}},
+           {"name":"p","type":{"kind":"optional","item":{"kind":"range","item":"u8","min":1,"max":9},"null":0}}"#,
+    ))
+    .unwrap();
+    for field in [
+        r#"{"name":"r","type":{"kind":"range","item":"i8","min":5,"max":-5}}"#,
+        r#"{"name":"r","type":{"kind":"range","item":"u8","min":0,"max":256}}"#,
+        r#"{"name":"c","type":{"kind":"constant","item":"u8","value":-1}}"#,
+        r#"{"name":"c","type":{"kind":"constant","enum":"E","variant":"zzz"}}"#,
+        r#"{"name":"c","type":{"kind":"constant","enum":"B","variant":"x"}}"#,
+        r#"{"name":"g","type":{"kind":"optional","flag":"u8","item":{"kind":"constant","item":"u8","value":1}}}"#,
+        r#"{"name":"o","type":{"kind":"optional","item":{"kind":"ref","name":"E"},"null":1}}"#,
+        r#"{"name":"o","type":{"kind":"optional","item":{"kind":"ref","name":"E"},"null":256}}"#,
+        r#"{"name":"o","type":{"kind":"optional","item":{"kind":"ref","name":"B"},"null":0}}"#,
+        r#"{"name":"g","type":{"kind":"block_group","item":"E","header":HEADER}}"#,
+        r#"{"name":"g","type":{"kind":"block_group","item":"S","header":HEADER}}"#,
+    ] {
+        fail(
+            &with_entry(&field.replace("HEADER", HEADER)),
+            ErrorKind::InvalidValue,
+        );
+    }
+    fail(
+        &with_entry(r#"{"name":"c","type":{"kind":"constant","enum":"Q","variant":"a"}}"#),
+        ErrorKind::UnknownReference,
+    );
+    fail(
+        &with_entry(r#"{"name":"c","type":{"kind":"constant","item":"u8","value":1},"offset":0}"#),
+        ErrorKind::InvalidSize,
+    );
+    let mut s = one(Type::Constant(Constant::Bytes(vec![0; MAX_CONSTANT + 1])));
+    assert_eq!(
+        validate(s.clone(), Limits::default()).unwrap_err().kind,
+        ErrorKind::InvalidValue
+    );
+    s.types[0].definition = Definition::Struct(vec![]);
+    validate(s, Limits::default()).unwrap();
+}
+
+#[test]
+fn offsets_and_block_layouts() {
+    let ok = checked(
+        r#"{"types":[{"name":"S","kind":"struct","fields":[{"name":"a","type":"u8"},{"name":"b","type":"u16","offset":4}]},
+            {"name":"T","kind":"struct","fields":[{"name":"s","type":{"kind":"ref","name":"S"},"fixed_size":6}]}]}"#,
+    );
+    ok.unwrap();
+    for json in [
+        r#"{"types":[{"name":"S","kind":"struct","fields":[{"name":"a","type":"u16"},{"name":"b","type":"u8","offset":1}]}]}"#,
+        r#"{"types":[{"name":"S","kind":"struct","fields":[{"name":"a","type":{"kind":"bytes","prefix":"u8"}},{"name":"b","type":"u8","offset":9}]}]}"#,
+        r#"{"types":[{"name":"B","kind":"block","length":1,"fields":[{"name":"a","type":"u16"}]}]}"#,
+        r#"{"types":[{"name":"B","kind":"block","length":4,"fields":[{"name":"a","type":{"kind":"bytes","prefix":"u8"}},{"name":"b","type":"u8"}]}]}"#,
+        r#"{"types":[{"name":"B","kind":"block","length":2000000,"fields":[]}]}"#,
+    ] {
+        fail(json, ErrorKind::InvalidSize);
+    }
+    let blocks = checked(
+        r#"{"types":[{"name":"B","kind":"block","length":8,"fields":[{"name":"a","type":"u16"}]},
+            {"name":"S","kind":"struct","fields":[{"name":"b","type":{"kind":"ref","name":"B"},"fixed_size":8}]}]}"#,
+    );
+    blocks.unwrap();
+}
+
+#[test]
+fn headers_unions_and_block_groups() {
+    checked(&union(
+        UNION_HEADER,
+        r#"{"name":"b","tag":1,"item":"B"},{"name":"c","tag":2,"item":"B"}"#,
+    ))
+    .unwrap();
+    checked(&union(
+        r#"{"size":1,"fields":[{"name":"tag","offset":0,"width":"u8","role":"tag"}]}"#,
+        r#"{"name":"t","tag":1,"item":"T"}"#,
+    ))
+    .unwrap();
+    for (header, cases) in [
+        (
+            UNION_HEADER,
+            r#"{"name":"b","tag":1,"item":"B"},{"name":"c","tag":1,"item":"B"}"#,
+        ),
+        (UNION_HEADER, r#"{"name":"b","tag":101,"item":"B"}"#),
+        (UNION_HEADER, r#"{"name":"t","tag":1,"item":"T"}"#),
+        (UNION_HEADER, ""),
+        (
+            r#"{"size":2,"fields":[{"name":"len","offset":0,"width":"u16","role":"length"}]}"#,
+            r#"{"name":"b","tag":1,"item":"B"}"#,
+        ),
+        (
+            r#"{"size":2,"fields":[{"name":"t","offset":0,"width":"u8","role":"tag"},{"name":"n","offset":1,"width":"u8","role":"count"}]}"#,
+            r#"{"name":"t","tag":1,"item":"T"}"#,
+        ),
+        (
+            r#"{"size":2,"fields":[{"name":"t","offset":0,"width":"u8","role":"tag","max":300}]}"#,
+            r#"{"name":"t","tag":1,"item":"T"}"#,
+        ),
+        (
+            r#"{"size":2,"fields":[{"name":"t","offset":0,"width":"u8","role":"tag"},{"name":"c","offset":1,"width":"u8","role":"constant","value":9,"max":8}]}"#,
+            r#"{"name":"t","tag":1,"item":"T"}"#,
+        ),
+        (
+            r#"{"size":2,"fields":[{"name":"t","offset":0,"width":"u8","role":"tag"},{"name":"v","offset":1,"width":"u8","role":"version","current":1,"minimum":2}]}"#,
+            r#"{"name":"t","tag":1,"item":"T"}"#,
+        ),
+    ] {
+        fail(&union(header, cases), ErrorKind::InvalidValue);
+    }
+    for header in [
+        r#"{"size":2,"fields":[{"name":"t","offset":0,"width":"u16","role":"tag"},{"name":"c","offset":1,"width":"u8","role":"constant","value":1}]}"#,
+        r#"{"size":1,"fields":[{"name":"t","offset":0,"width":"u16","role":"tag"}]}"#,
+    ] {
+        fail(
+            &union(header, r#"{"name":"t","tag":1,"item":"T"}"#),
+            ErrorKind::InvalidSize,
+        );
+    }
+    fail(
+        &union(
+            r#"{"size":300,"fields":[{"name":"t","offset":0,"width":"u8","role":"tag"}]}"#,
+            r#"{"name":"t","tag":1,"item":"T"}"#,
+        ),
+        ErrorKind::IrLimit,
+    );
+    fail(
+        &union(UNION_HEADER, r#"{"name":"b","tag":1,"item":"Q"}"#),
+        ErrorKind::UnknownReference,
+    );
+    fail(
+        &union(
+            UNION_HEADER,
+            r#"{"name":"b","tag":1,"item":"B"},{"name":"b","tag":2,"item":"B"}"#,
+        ),
+        ErrorKind::DuplicateName,
+    );
+    // A union inside its own case is refused, even through a group.
+    fail(
+        r#"{"types":[{"name":"S","kind":"struct","fields":[{"name":"u","type":{"kind":"group","count":"u8","item":{"kind":"ref","name":"U"}}}]},
+            {"name":"U","kind":"union","header":{"size":1,"fields":[{"name":"t","offset":0,"width":"u8","role":"tag"}]},"cases":[{"name":"s","tag":1,"item":"S"}]}]}"#,
+        ErrorKind::IrLimit,
+    );
+    let group = |limit: &str, max: &str| {
+        with_entry(&format!(
+            r#"{{"name":"g","type":{{"kind":"block_group","item":"B",{limit}"header":{{"size":3,"fields":[{{"name":"len","offset":0,"width":"u16","role":"length"{max}}},{{"name":"n","offset":2,"width":"u8","role":"count","max":10}}]}}}}}}"#
+        ))
+    };
+    let checked_group = checked(&group("", "")).unwrap();
+    let Definition::Struct(fields) = &checked_group.schema().types[2].definition else {
+        panic!()
+    };
+    assert!(matches!(
+        fields[0].ty,
+        Type::BlockGroup {
+            limit: Some(10),
+            ..
+        }
+    ));
+    fail(&group(r#""limit":11,"#, ""), ErrorKind::InvalidLimit);
+    fail(&group("", r#","max":1"#), ErrorKind::InvalidValue);
 }

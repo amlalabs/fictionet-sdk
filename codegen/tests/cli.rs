@@ -37,7 +37,7 @@ fn cli(args: &[&str]) -> Output {
 fn list_help_and_argument_errors() {
     let list = cli(&["--list"]);
     assert!(list.status.success());
-    assert_eq!(list.stdout, b"ir\n");
+    assert_eq!(list.stdout, b"ir\nsbe\n");
     assert!(cli(&["--help"]).status.success());
     for (args, kind) in [
         (vec!["not-a-format"], "UnknownFormat"),
@@ -229,4 +229,29 @@ fn refuses_an_impossible_depth_from_cli() {
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("IrLimit"));
     assert!(!scratch.0.join("out.rs").exists());
+}
+
+#[test]
+fn sbe_format_matches_its_golden_and_reports_xml_errors() {
+    let scratch = Scratch::new();
+    let input = scratch.0.join("sbe_sample.xml");
+    let output = scratch.0.join("sample.rs");
+    std::fs::write(&input, include_str!("schemas/sbe_sample.xml")).unwrap();
+    let (i, o) = (input.to_str().unwrap(), output.to_str().unwrap());
+    let good = cli(&["sbe", i, "-o", o]);
+    assert!(
+        good.status.success(),
+        "{}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&output).unwrap(),
+        include_str!("golden/sbe_sample.rs")
+    );
+    std::fs::write(&input, "<messageSchema id='1'><types>").unwrap();
+    let bad = cli(&["sbe", i, "-o", o]);
+    assert!(!bad.status.success());
+    assert!(String::from_utf8_lossy(&bad.stderr).contains("XmlSyntax"));
+    let two = cli(&["sbe", i, i, "-o", o]);
+    assert!(String::from_utf8_lossy(&two.stderr).contains("Cli"));
 }

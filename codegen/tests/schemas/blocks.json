@@ -1,0 +1,102 @@
+{
+  "doc": "Blocks, headers, ranges, constants, and offsets.",
+  "byte_order": "little",
+  "types": [
+    {
+      "name": "Side",
+      "kind": "enum",
+      "repr": "u8",
+      "variants": [
+        { "name": "buy", "value": 49 },
+        { "name": "sell", "value": 50 }
+      ]
+    },
+    {
+      "name": "Price",
+      "kind": "struct",
+      "doc": "A decimal with a fixed exponent.",
+      "fields": [
+        {
+          "name": "mantissa",
+          "type": {
+            "kind": "optional",
+            "item": { "kind": "range", "item": "i64", "min": -9223372036854775807, "max": 9223372036854775806 },
+            "null": 9223372036854775807
+          }
+        },
+        {
+          "name": "exponent",
+          "type": { "kind": "constant", "item": "i8", "value": -9 }
+        }
+      ]
+    },
+    {
+      "name": "Entry",
+      "kind": "block",
+      "length": 16,
+      "fields": [
+        { "name": "price", "type": { "kind": "ref", "name": "Price" } },
+        { "name": "kind", "type": { "kind": "constant", "enum": "Side", "variant": "buy" } },
+        {
+          "name": "level",
+          "type": { "kind": "range", "item": "u8", "min": 1, "max": 10 },
+          "offset": 9
+        },
+        {
+          "name": "side",
+          "type": { "kind": "optional", "item": { "kind": "ref", "name": "Side" }, "null": 0 }
+        }
+      ]
+    },
+    {
+      "name": "Book",
+      "kind": "block",
+      "length": 12,
+      "fields": [
+        { "name": "time", "type": { "kind": "range", "item": "u64", "min": 0, "max": 18446744073709551614 } },
+        { "name": "source", "type": { "kind": "constant", "bytes": [56] } },
+        { "name": "code", "type": { "kind": "bytes", "size": 2 }, "offset": 9 },
+        {
+          "name": "entries",
+          "type": {
+            "kind": "block_group",
+            "item": "Entry",
+            "limit": 8,
+            "header": {
+              "size": 4,
+              "fields": [
+                { "name": "blockLength", "offset": 0, "width": "u16", "role": "length", "max": 65534 },
+                { "name": "numInGroup", "offset": 3, "width": "u8", "role": "count" }
+              ]
+            }
+          }
+        },
+        { "name": "note", "type": { "kind": "bytes", "prefix": "u16", "limit": 32 } }
+      ]
+    },
+    {
+      "name": "Heartbeat",
+      "kind": "block",
+      "length": 0,
+      "fields": []
+    },
+    {
+      "name": "Message",
+      "kind": "union",
+      "doc": "A header followed by a block.",
+      "header": {
+        "size": 8,
+        "fields": [
+          { "name": "blockLength", "offset": 0, "width": "u16", "role": "length", "max": 65534 },
+          { "name": "templateId", "offset": 2, "width": "u16", "role": "tag", "max": 65534 },
+          { "name": "schemaId", "offset": 4, "width": "u16", "role": "constant", "value": 7 },
+          { "name": "version", "offset": 6, "width": "u16", "role": "version", "current": 3, "minimum": 2, "max": 65534 }
+        ]
+      },
+      "cases": [
+        { "name": "Book", "tag": 46, "item": "Book" },
+        { "name": "Heartbeat", "tag": 12, "item": "Heartbeat", "doc": "Keeps the session open." }
+      ]
+    }
+  ]
+}

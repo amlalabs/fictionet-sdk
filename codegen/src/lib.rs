@@ -17,10 +17,13 @@ mod emit;
 mod frontend;
 pub mod ir;
 mod json;
+mod sbe;
 mod validate;
+mod xml;
 pub use emit::{emit, emit_fuzz};
 pub use frontend::{FORMATS, FrontEnd, Generated, Input, IrFrontEnd, generate};
 pub use ir::*;
+pub use sbe::SbeFrontEnd;
 pub use validate::{IdentifierCase, ValidatedSchema, rust_identifier, validate};
 
 /// A stable category for generator failures.
@@ -56,6 +59,12 @@ pub enum ErrorKind {
     InvalidLimit,
     /// A mandatory reference cycle has no finite value.
     UninhabitedType,
+    /// Malformed XML, or an XML construct the reader does not accept.
+    XmlSyntax,
+    /// A schema element is missing an attribute or has the wrong structure.
+    SchemaShape,
+    /// A valid schema uses a feature the front end does not map to the IR.
+    Unsupported,
 }
 
 /// A typed failure with a source location or schema path.

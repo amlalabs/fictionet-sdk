@@ -12,6 +12,12 @@ pub const MAX_INPUT: usize = 1 << 20;
 pub const MAX_JSON_DEPTH: usize = 64;
 /// Maximum JSON values and object keys per document.
 pub const MAX_JSON_ELEMENTS: usize = 65_536;
+/// Maximum XML element nesting.
+pub const MAX_XML_DEPTH: usize = 32;
+/// Maximum XML elements per document.
+pub const MAX_XML_ELEMENTS: usize = 16_384;
+/// Maximum attributes on one XML element.
+pub const MAX_XML_ATTRIBUTES: usize = 32;
 /// Maximum named types in one schema.
 pub const MAX_TYPES: usize = 256;
 /// Maximum fields, variants, and bits across a schema.
@@ -26,6 +32,10 @@ pub const MAX_NAME: usize = 128;
 pub const MAX_DOC: usize = 4096;
 /// Maximum generated source size in bytes.
 pub const MAX_OUTPUT: usize = 32 << 20;
+/// Maximum size of a [`Header`] in bytes.
+pub const MAX_HEADER: usize = 256;
+/// Maximum bytes in one [`Constant::Bytes`] value.
+pub const MAX_CONSTANT: usize = 4096;
 
 /// Defaults supplied when a schema omits a resource limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,7 +193,8 @@ pub enum Length {
 pub enum Presence {
     /// An unsigned 0 or 1 before the value.
     Flag(Width),
-    /// A reserved scalar value. Only scalar items are allowed.
+    /// A reserved value. Allowed for scalar, range, and enum reference
+    /// items. For an enum, the value is in the enum's representation.
     Null(Number),
 }
 
@@ -214,6 +225,112 @@ pub enum Type {
     },
     /// An exact source name. Only cycles through inline fields require boxes.
     Ref(String),
+    /// A scalar limited to an inclusive range. Other values are refused.
+    Range {
+        /// The scalar type.
+        item: Primitive,
+        /// Smallest accepted value.
+        min: Number,
+        /// Largest accepted value.
+        max: Number,
+    },
+    /// A value fixed by the schema. It occupies no bytes and has no Rust
+    /// field; the struct gets an associated constant instead. Only allowed
+    /// as a direct struct field type.
+    Constant(Constant),
+    /// A header with a count, followed by that many entries of a named
+    /// struct. When the header has a [`Role::Length`] field, the item must
+    /// be a [`Definition::Block`], and every entry uses that wire length.
+    BlockGroup {
+        /// Source name of the entry type.
+        item: String,
+        /// Fixed header before the entries.
+        header: Header,
+        /// Maximum entries. Validation fills an omitted limit.
+        limit: Option<usize>,
+    },
+}
+
+/// A value fixed by the schema.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Constant {
+    /// A number of a scalar type.
+    Number {
+        /// The scalar type.
+        ty: Primitive,
+        /// The value. It must fit the type exactly.
+        value: Number,
+    },
+    /// Fixed bytes, at most [`MAX_CONSTANT`].
+    Bytes(Vec<u8>),
+    /// A variant of a named enum.
+    Variant {
+        /// Source name of the enum.
+        ty: String,
+        /// Source name of the variant.
+        name: String,
+    },
+}
+
+/// What a [`HeaderField`] carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// Selects the case of a [`Definition::Union`].
+    Tag,
+    /// Wire length of the following fixed block. Readers accept any length
+    /// that holds the block's fixed fields and skip the rest. Writers emit
+    /// the declared block length.
+    Length,
+    /// Number of entries in a [`Type::BlockGroup`].
+    Count,
+    /// A schema version. Writers emit `current`. Readers refuse versions
+    /// below `minimum`.
+    Version {
+        /// The version written.
+        current: u64,
+        /// The oldest version read.
+        minimum: u64,
+    },
+    /// A fixed value. Readers refuse any other value.
+    Constant(u64),
+}
+
+/// One unsigned field of a [`Header`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeaderField {
+    /// Source name, used in documentation and diagnostics.
+    pub name: String,
+    /// Byte offset within the header.
+    pub offset: usize,
+    /// Unsigned width.
+    pub width: Width,
+    /// Meaning of the value.
+    pub role: Role,
+    /// Largest accepted value. `None` allows the full width.
+    pub max: Option<u64>,
+}
+
+/// A fixed-size run of unsigned fields at explicit offsets. Bytes not
+/// covered by a field are ignored when read and written as zero.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Header {
+    /// Total size in bytes, at most [`MAX_HEADER`].
+    pub size: usize,
+    /// Fields in documentation order. They must not overlap.
+    pub fields: Vec<HeaderField>,
+}
+
+/// One case of a [`Definition::Union`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Case {
+    /// Source name of the Rust enum variant.
+    pub name: String,
+    /// Case documentation.
+    pub doc: String,
+    /// Tag value that selects this case.
+    pub tag: u64,
+    /// Source name of the case's value type.
+    pub item: String,
 }
 
 /// One ordered struct field.
@@ -229,6 +346,9 @@ pub struct Field {
     pub byte_order: Option<ByteOrder>,
     /// Optional assertion of a fixed wire size, checked during validation.
     pub fixed_size: Option<usize>,
+    /// Byte offset from the start of the struct. Earlier fields must have
+    /// fixed sizes. Skipped bytes are ignored when read and written as zero.
+    pub offset: Option<usize>,
 }
 
 /// One enum variant and its integer value.
@@ -272,6 +392,33 @@ pub enum Definition {
         /// Unique names and bit positions.
         bits: Vec<Bit>,
     },
+    /// A struct whose leading fixed-size fields fill a block of `length`
+    /// bytes. Variable-size fields follow the block. Read through a header
+    /// [`Role::Length`], the block may be longer, and the extra bytes are
+    /// skipped, or shorter, down to the end of its fixed fields.
+    Block {
+        /// Declared block length, written by every writer.
+        length: usize,
+        /// Fixed fields first, then variable fields.
+        fields: Vec<Field>,
+    },
+    /// A header followed by one of several values, selected by the
+    /// header's [`Role::Tag`] field.
+    Union {
+        /// Header with exactly one tag, at most one length, and no count.
+        header: Header,
+        /// Cases with unique names and tags.
+        cases: Vec<Case>,
+    },
+}
+impl Definition {
+    /// Fields of a struct or block.
+    pub fn fields(&self) -> Option<&[Field]> {
+        match self {
+            Self::Struct(fields) | Self::Block { fields, .. } => Some(fields),
+            _ => None,
+        }
+    }
 }
 
 /// One named wire type.

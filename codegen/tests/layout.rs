@@ -10,6 +10,7 @@ fn field(name: String, ty: Type) -> Field {
         doc: String::new(),
         byte_order: None,
         fixed_size: None,
+        offset: None,
     }
 }
 fn named(name: String, definition: Definition) -> NamedType {

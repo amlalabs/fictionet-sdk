@@ -881,6 +881,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "cme_mdp3"
+path = "fuzz_targets/cme_mdp3.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "moldudp64"
 path = "fuzz_targets/moldudp64.rs"
 test = false

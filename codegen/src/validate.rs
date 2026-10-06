@@ -109,6 +109,18 @@ pub struct ValidatedSchema {
     pub(crate) limits: Limits,
     pub(crate) recursion: Recursion,
     pub(crate) minimum: BTreeMap<String, Minimum>,
+    /// Fixed layout of each block, by source name.
+    pub(crate) blocks: BTreeMap<String, BlockLayout>,
+    /// Fields, by type name and field index, whose offset skips bytes.
+    pub(crate) gaps: BTreeSet<(String, usize)>,
+}
+/// Where a block's fixed fields end.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BlockLayout {
+    /// End of the fixed fields in bytes.
+    pub(crate) end: usize,
+    /// Index of the first variable field, or the field count.
+    pub(crate) split: usize,
 }
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Recursion {
@@ -176,24 +188,38 @@ fn scope<'a>(
     }
     Ok(())
 }
+/// What validation needs to know about a named type while checking others.
+#[derive(Clone, Debug)]
+enum Kind {
+    Struct,
+    Block(usize),
+    Enum(Primitive, Vec<(String, i128)>),
+    Other,
+}
 /// Checks resource limits, identifiers, widths, references, and cycles.
 /// Missing collection limits are filled from `limits.max_collection`.
 /// Minimum encoded sizes and nesting depths must fit the configured limits.
 /// Mandatory cycles with no finite value are refused. Other cycles are
 /// recorded and use the generated `MAX_DEPTH` guard on both read and write.
+/// Unions may not take part in cycles. Field offsets, block layouts,
+/// headers, ranges, and constants are checked against their types.
 pub fn validate(mut schema: Schema, limits: Limits) -> Result<ValidatedSchema, Error> {
     match validate_inner(&mut schema, limits) {
-        Ok((recursion, minimum)) => Ok(ValidatedSchema {
+        Ok((recursion, minimum, blocks, gaps)) => Ok(ValidatedSchema {
             schema,
             limits,
             recursion,
             minimum,
+            blocks,
+            gaps,
         }),
         Err(error) => {
             // A caller may construct an arbitrarily deep boxed IR. Dispose of
             // rejected field chains iteratively, including before returning an error.
             for named in schema.types {
-                if let Definition::Struct(fields) = named.definition {
+                if let Definition::Struct(fields) | Definition::Block { fields, .. } =
+                    named.definition
+                {
                     for field in fields {
                         let mut ty = field.ty;
                         while let Type::Group { item, .. } | Type::Optional { item, .. } = ty {
@@ -206,10 +232,13 @@ pub fn validate(mut schema: Schema, limits: Limits) -> Result<ValidatedSchema, E
         }
     }
 }
-fn validate_inner(
-    schema: &mut Schema,
-    limits: Limits,
-) -> Result<(Recursion, BTreeMap<String, Minimum>), Error> {
+type Validated = (
+    Recursion,
+    BTreeMap<String, Minimum>,
+    BTreeMap<String, BlockLayout>,
+    BTreeSet<(String, usize)>,
+);
+fn validate_inner(schema: &mut Schema, limits: Limits) -> Result<Validated, Error> {
     if !(1..=16 << 20).contains(&limits.max_message)
         || limits.max_collection > 1 << 20
         || !(1..=64).contains(&limits.max_depth)
@@ -236,13 +265,28 @@ fn validate_inner(
         "schema",
         RESERVED,
     )?;
-    let names: BTreeSet<String> = schema.types.iter().map(|t| t.name.clone()).collect();
+    let kinds: BTreeMap<String, Kind> = schema
+        .types
+        .iter()
+        .map(|t| {
+            let kind = match &t.definition {
+                Definition::Struct(_) => Kind::Struct,
+                Definition::Block { length, .. } => Kind::Block(*length),
+                Definition::Enum { repr, variants } => Kind::Enum(
+                    *repr,
+                    variants.iter().map(|v| (v.name.clone(), v.value)).collect(),
+                ),
+                _ => Kind::Other,
+            };
+            (t.name.clone(), kind)
+        })
+        .collect();
     let mut fields = 0usize;
     for t in &mut schema.types {
         let path = format!("types.{}", t.name);
         doc(&t.doc, &path)?;
         match &mut t.definition {
-            Definition::Struct(fs) => {
+            Definition::Struct(fs) | Definition::Block { fields: fs, .. } => {
                 fields += fs.len();
                 if fs.len() > MAX_STRUCT_FIELDS {
                     return Err(err(ErrorKind::IrLimit, &path, "MAX_STRUCT_FIELDS exceeded"));
@@ -253,10 +297,29 @@ fn validate_inner(
                     &path,
                     &[],
                 )?;
+                scope(
+                    fs.iter()
+                        .filter(|f| matches!(f.ty, Type::Constant(_)))
+                        .map(|f| f.name.as_str()),
+                    IdentifierCase::Constant,
+                    &path,
+                    &[],
+                )?;
                 for f in fs {
                     let path = format!("{path}.{}", f.name);
                     doc(&f.doc, &path)?;
-                    normalize(&mut f.ty, &path, 0, &names, limits)?;
+                    if let Type::Constant(c) = &f.ty {
+                        if f.offset.is_some() || f.byte_order.is_some() {
+                            return Err(err(
+                                ErrorKind::InvalidSize,
+                                &path,
+                                "constants take no offset or byte order",
+                            ));
+                        }
+                        constant(c, &path, &kinds)?;
+                    } else {
+                        normalize(&mut f.ty, &path, 0, &kinds, limits)?;
+                    }
                 }
             }
             Definition::Enum { repr, variants } => {
@@ -306,13 +369,53 @@ fn validate_inner(
                     }
                 }
             }
+            Definition::Union { header, cases } => {
+                fields += cases.len() + header.fields.len();
+                scope(
+                    cases.iter().map(|c| c.name.as_str()),
+                    IdentifierCase::Type,
+                    &path,
+                    &[],
+                )?;
+                check_header(header, &path, HeaderUse::Union)?;
+                if cases.is_empty() {
+                    return Err(err(
+                        ErrorKind::InvalidValue,
+                        &path,
+                        "unions need at least one case",
+                    ));
+                }
+                let tag = header
+                    .fields
+                    .iter()
+                    .find(|f| f.role == Role::Tag)
+                    .map_or(0, field_max);
+                let length = header
+                    .fields
+                    .iter()
+                    .find(|f| f.role == Role::Length)
+                    .map(field_max);
+                let mut tags = BTreeSet::new();
+                for c in cases.iter() {
+                    let path = format!("{path}.{}", c.name);
+                    doc(&c.doc, &path)?;
+                    if c.tag > tag || !tags.insert(c.tag) {
+                        return Err(err(
+                            ErrorKind::InvalidValue,
+                            &path,
+                            "case tag above the tag field's maximum, or duplicated",
+                        ));
+                    }
+                    item_kind(&c.item, length, &path, &kinds, false)?;
+                }
+            }
         }
         if fields > MAX_FIELDS {
             return Err(err(ErrorKind::IrLimit, &path, "MAX_FIELDS exceeded"));
         }
     }
     for s in &schema.streams {
-        if !names.contains(&s.item) {
+        if !kinds.contains_key(&s.item) {
             return Err(err(
                 ErrorKind::UnknownReference,
                 &format!("streams.{}", s.name),
@@ -333,20 +436,71 @@ fn validate_inner(
         .map(|t| (t.name.as_str(), &t.definition))
         .collect();
     let mut fixed = BTreeMap::new();
+    let mut blocks = BTreeMap::new();
+    let mut gaps = BTreeSet::new();
     for t in &schema.types {
-        if let Definition::Struct(fs) = &t.definition {
-            for f in fs {
-                if let Some(size) = f.fixed_size
-                    && fixed_size(&f.ty, &definitions, &mut fixed, &mut BTreeSet::new())
-                        != Some(size)
-                {
-                    return Err(err(
-                        ErrorKind::InvalidSize,
-                        &format!("types.{}.{}", t.name, f.name),
-                        "fixed_size disagrees with wire type",
-                    ));
+        let Some(fs) = t.definition.fields() else {
+            continue;
+        };
+        let mut position = Some(0usize);
+        let mut layout = BlockLayout {
+            end: 0,
+            split: fs.len(),
+        };
+        for (i, f) in fs.iter().enumerate() {
+            let path = format!("types.{}.{}", t.name, f.name);
+            let size = fixed_size(&f.ty, &definitions, &mut fixed, &mut BTreeSet::new());
+            if let Some(expected) = f.fixed_size
+                && size != Some(expected)
+            {
+                return Err(err(
+                    ErrorKind::InvalidSize,
+                    &path,
+                    "fixed_size disagrees with wire type",
+                ));
+            }
+            if matches!(f.ty, Type::Constant(_)) {
+                continue;
+            }
+            if let Some(offset) = f.offset {
+                match position {
+                    Some(p) if offset >= p && offset <= limits.max_message => {
+                        if offset > p {
+                            gaps.insert((t.name.clone(), i));
+                        }
+                        position = Some(offset);
+                    }
+                    _ => {
+                        return Err(err(
+                            ErrorKind::InvalidSize,
+                            &path,
+                            "offset overlaps an earlier field or follows a variable field",
+                        ));
+                    }
                 }
             }
+            position = position.zip(size).and_then(|(p, n)| p.checked_add(n));
+            if size.is_none() {
+                layout.split = layout.split.min(i);
+            } else if layout.split < fs.len() && matches!(t.definition, Definition::Block { .. }) {
+                return Err(err(
+                    ErrorKind::InvalidSize,
+                    &path,
+                    "block fields of fixed size must precede variable fields",
+                ));
+            } else if let Some(p) = position {
+                layout.end = p;
+            }
+        }
+        if let Definition::Block { length, .. } = &t.definition {
+            if layout.end > *length || *length > limits.max_message {
+                return Err(err(
+                    ErrorKind::InvalidSize,
+                    &format!("types.{}", t.name),
+                    "block length is below its fixed fields or above max_message",
+                ));
+            }
+            blocks.insert(t.name.clone(), layout);
         }
     }
     let mut minimum = BTreeMap::new();
@@ -354,12 +508,12 @@ fn validate_inner(
         let before = minimum.len();
         for t in &schema.types {
             let value = match &t.definition {
-                Definition::Struct(fs) => fs.iter().try_fold(Minimum::default(), |mut sum, f| {
-                    let field = minimum_type(&f.ty, &minimum)?;
-                    sum.size = sum.size.saturating_add(field.size);
-                    sum.depth = sum.depth.max(field.depth);
-                    Some(sum)
-                }),
+                Definition::Struct(fs) => layout_minimum(fs, &minimum, None),
+                Definition::Block { length, fields } => layout_minimum(
+                    fields,
+                    &minimum,
+                    Some((*length, blocks.get(&t.name).map_or(0, |b| b.end))),
+                ),
                 Definition::Enum { repr, .. } => Some(Minimum {
                     size: repr.bytes(),
                     depth: 0,
@@ -368,6 +522,16 @@ fn validate_inner(
                     size: repr.bytes(),
                     depth: 0,
                 }),
+                // Cases read through a length may be shorter than declared,
+                // so only the header is a safe lower bound.
+                Definition::Union { header, cases } => cases
+                    .iter()
+                    .filter_map(|c| minimum.get(&c.item).map(|m: &Minimum| m.depth))
+                    .min()
+                    .map(|depth| Minimum {
+                        size: header.size,
+                        depth,
+                    }),
             };
             if let Some(mut value) = value {
                 value.depth += 1;
@@ -398,10 +562,16 @@ fn validate_inner(
             .iter()
             .map(|t| {
                 let mut refs = Vec::new();
-                if let Definition::Struct(fs) = &t.definition {
-                    for f in fs {
-                        references(&f.ty, &mut refs, through_groups);
+                match &t.definition {
+                    Definition::Struct(fs) | Definition::Block { fields: fs, .. } => {
+                        for f in fs {
+                            references(&f.ty, &mut refs, through_groups);
+                        }
                     }
+                    Definition::Union { cases, .. } => {
+                        refs.extend(cases.iter().map(|c| c.item.clone()));
+                    }
+                    _ => {}
                 }
                 (t.name.clone(), refs)
             })
@@ -412,6 +582,13 @@ fn validate_inner(
     let mut recursion = Recursion::default();
     for t in &schema.types {
         if reachable(&t.name, &all).contains(&t.name) {
+            if matches!(t.definition, Definition::Union { .. }) {
+                return Err(err(
+                    ErrorKind::IrLimit,
+                    &format!("types.{}", t.name),
+                    "unions may not take part in reference cycles",
+                ));
+            }
             recursion.types.insert(t.name.clone());
         }
         // A Vec already breaks the Rust layout cycle. Only inline paths need boxes.
@@ -424,7 +601,31 @@ fn validate_inner(
             }
         }
     }
-    Ok((recursion, minimum))
+    Ok((recursion, minimum, blocks, gaps))
+}
+fn layout_minimum(
+    fields: &[Field],
+    named: &BTreeMap<String, Minimum>,
+    block: Option<(usize, usize)>,
+) -> Option<Minimum> {
+    let mut sum = Minimum::default();
+    for f in fields {
+        if matches!(f.ty, Type::Constant(_)) {
+            continue;
+        }
+        let field = minimum_type(&f.ty, named)?;
+        if let Some(offset) = f.offset {
+            sum.size = sum.size.max(offset);
+        }
+        sum.size = sum.size.saturating_add(field.size);
+        sum.depth = sum.depth.max(field.depth);
+    }
+    // Blocks read through their codec use the declared length in place of
+    // the end of their fixed fields.
+    if let Some((length, end)) = block {
+        sum.size = sum.size.saturating_sub(end).saturating_add(length);
+    }
+    Some(sum)
 }
 fn reachable(start: &str, edges: &BTreeMap<String, Vec<String>>) -> BTreeSet<String> {
     let mut pending = edges.get(start).cloned().unwrap_or_default();
@@ -441,11 +642,13 @@ fn reachable(start: &str, edges: &BTreeMap<String, Vec<String>>) -> BTreeSet<Str
 pub(crate) fn minimum_type(ty: &Type, named: &BTreeMap<String, Minimum>) -> Option<Minimum> {
     let size = match ty {
         Type::Ref(n) => return named.get(n).copied(),
-        Type::Scalar(p) => p.bytes(),
+        Type::Scalar(p) | Type::Range { item: p, .. } => p.bytes(),
         Type::Bytes(Length::Fixed(n)) | Type::String(Length::Fixed(n)) => *n,
         Type::Bytes(Length::Variable { prefix, .. })
         | Type::String(Length::Variable { prefix, .. }) => prefix.bytes(),
         Type::Group { count, .. } => count.bytes(),
+        Type::BlockGroup { header, .. } => header.size,
+        Type::Constant(_) => 0,
         Type::Optional {
             presence: Presence::Flag(flag),
             ..
@@ -461,15 +664,153 @@ fn references(ty: &Type, refs: &mut Vec<String>, through_groups: bool) {
     match ty {
         Type::Ref(n) => refs.push(n.clone()),
         Type::Group { item, .. } if through_groups => references(item, refs, through_groups),
+        Type::BlockGroup { item, .. } if through_groups => refs.push(item.clone()),
         Type::Optional { item, .. } => references(item, refs, through_groups),
         _ => {}
+    }
+}
+fn field_max(f: &HeaderField) -> u64 {
+    f.max.unwrap_or(f.width.max())
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeaderUse {
+    Union,
+    Group,
+}
+fn check_header(h: &Header, path: &str, usage: HeaderUse) -> Result<(), Error> {
+    if h.size > MAX_HEADER || h.fields.len() > MAX_HEADER {
+        return Err(err(ErrorKind::IrLimit, path, "header exceeds MAX_HEADER"));
+    }
+    let mut spans = Vec::new();
+    let (mut tags, mut lengths, mut counts, mut versions) = (0, 0, 0, 0);
+    for f in &h.fields {
+        let p = format!("{path}.header.{}", f.name);
+        if f.name.is_empty() || f.name.len() > MAX_NAME {
+            return Err(err(
+                ErrorKind::InvalidName,
+                &p,
+                "header field names must be 1..=MAX_NAME bytes",
+            ));
+        }
+        let end = f.offset.checked_add(f.width.bytes());
+        if end.is_none_or(|end| end > h.size) {
+            return Err(err(
+                ErrorKind::InvalidSize,
+                &p,
+                "field ends past the header",
+            ));
+        }
+        spans.push((f.offset, f.width.bytes()));
+        let max = field_max(f);
+        if max > f.width.max() {
+            return Err(err(ErrorKind::InvalidValue, &p, "max exceeds the width"));
+        }
+        match &f.role {
+            Role::Tag => tags += 1,
+            Role::Length => lengths += 1,
+            Role::Count => counts += 1,
+            Role::Version { current, minimum } => {
+                versions += 1;
+                if minimum > current || *current > max {
+                    return Err(err(
+                        ErrorKind::InvalidValue,
+                        &p,
+                        "version needs minimum <= current <= max",
+                    ));
+                }
+            }
+            Role::Constant(v) => {
+                if *v > max {
+                    return Err(err(ErrorKind::InvalidValue, &p, "constant above max"));
+                }
+            }
+        }
+    }
+    spans.sort_unstable();
+    if spans.windows(2).any(|w| match w {
+        [(a, n), (b, _)] => a + n > *b,
+        _ => false,
+    }) {
+        return Err(err(ErrorKind::InvalidSize, path, "header fields overlap"));
+    }
+    let valid = match usage {
+        HeaderUse::Union => tags == 1 && lengths <= 1 && counts == 0 && versions <= 1,
+        HeaderUse::Group => counts == 1 && lengths <= 1 && tags == 0 && versions == 0,
+    };
+    if !valid {
+        return Err(err(
+            ErrorKind::InvalidValue,
+            path,
+            "unions need one tag, groups one count; at most one length and version",
+        ));
+    }
+    Ok(())
+}
+/// Checks that `item` names a type usable as a case or entry. A header
+/// length requires a block whose declared length fits the length field.
+fn item_kind(
+    item: &str,
+    length: Option<u64>,
+    path: &str,
+    kinds: &BTreeMap<String, Kind>,
+    entry: bool,
+) -> Result<(), Error> {
+    let kind = kinds
+        .get(item)
+        .ok_or_else(|| err(ErrorKind::UnknownReference, path, "unknown named type"))?;
+    match (kind, length) {
+        (Kind::Block(n), Some(max)) if u64::try_from(*n).is_ok_and(|n| n <= max) => Ok(()),
+        (_, Some(_)) => Err(err(
+            ErrorKind::InvalidValue,
+            path,
+            "a header length needs a block whose length fits the length field",
+        )),
+        (Kind::Struct | Kind::Block(_), None) => Ok(()),
+        (_, None) if !entry => Ok(()),
+        _ => Err(err(
+            ErrorKind::InvalidValue,
+            path,
+            "group entries must be structs or blocks",
+        )),
+    }
+}
+fn constant(c: &Constant, path: &str, kinds: &BTreeMap<String, Kind>) -> Result<(), Error> {
+    let ok = match c {
+        Constant::Number { ty, value } => fits(value, *ty),
+        Constant::Bytes(b) => b.len() <= MAX_CONSTANT,
+        Constant::Variant { ty, name } => match kinds.get(ty) {
+            Some(Kind::Enum(_, variants)) => variants.iter().any(|(n, _)| n == name),
+            Some(_) => false,
+            None => {
+                return Err(err(ErrorKind::UnknownReference, path, "unknown named type"));
+            }
+        },
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(err(
+            ErrorKind::InvalidValue,
+            path,
+            "constant does not fit its type, exceeds MAX_CONSTANT, or names no variant",
+        ))
+    }
+}
+fn number_le(a: &Number, b: &Number, p: Primitive) -> bool {
+    let float = |n: &Number| match n {
+        Number::Integer(n) => *n as f64,
+        Number::Float(f) => *f,
+    };
+    match (a, b) {
+        (Number::Integer(a), Number::Integer(b)) if !p.is_float() => a <= b,
+        _ => float(a) <= float(b),
     }
 }
 fn normalize(
     ty: &mut Type,
     path: &str,
     depth: usize,
-    names: &BTreeSet<String>,
+    kinds: &BTreeMap<String, Kind>,
     limits: Limits,
 ) -> Result<(), Error> {
     if depth >= MAX_NESTING {
@@ -477,6 +818,22 @@ fn normalize(
     }
     match ty {
         Type::Scalar(_) => {}
+        Type::Range { item, min, max } => {
+            if !fits(min, *item) || !fits(max, *item) || !number_le(min, max, *item) {
+                return Err(err(
+                    ErrorKind::InvalidValue,
+                    path,
+                    "range bounds must fit the scalar and satisfy min <= max",
+                ));
+            }
+        }
+        Type::Constant(_) => {
+            return Err(err(
+                ErrorKind::InvalidValue,
+                path,
+                "constants are only allowed as direct struct fields",
+            ));
+        }
         Type::Bytes(length) | Type::String(length) => match length {
             Length::Fixed(n) => {
                 if *n > limits.max_message {
@@ -491,25 +848,63 @@ fn normalize(
         },
         Type::Group { item, count, limit } => {
             collection(limit, *count, limits, path)?;
-            normalize(item, path, depth + 1, names, limits)?;
+            normalize(item, path, depth + 1, kinds, limits)?;
+        }
+        Type::BlockGroup {
+            item,
+            header,
+            limit,
+        } => {
+            check_header(header, path, HeaderUse::Group)?;
+            let count = header
+                .fields
+                .iter()
+                .find(|f| f.role == Role::Count)
+                .ok_or_else(|| err(ErrorKind::InvalidValue, path, "group header needs a count"))?;
+            let length = header
+                .fields
+                .iter()
+                .find(|f| f.role == Role::Length)
+                .map(field_max);
+            if limit.is_none() {
+                let max = usize::try_from(field_max(count)).unwrap_or(usize::MAX);
+                *limit = Some(limits.max_collection.min(max));
+            }
+            collection(limit, count.width, limits, path)?;
+            if limit.is_some_and(|n| u64::try_from(n).map_or(true, |n| n > field_max(count))) {
+                return Err(err(
+                    ErrorKind::InvalidLimit,
+                    path,
+                    "group limit exceeds the count field's maximum",
+                ));
+            }
+            item_kind(item, length, path, kinds, true)?;
         }
         Type::Optional { item, presence } => {
             if let Presence::Null(null) = presence {
-                match item.as_ref() {
-                    Type::Scalar(p) if fits(null, *p) => {}
-                    _ => {
-                        return Err(err(
-                            ErrorKind::InvalidValue,
-                            path,
-                            "null requires a scalar and an exactly representable finite value",
-                        ));
-                    }
+                let valid = match item.as_ref() {
+                    Type::Scalar(p) => fits(null, *p),
+                    Type::Range { item: p, .. } => fits(null, *p),
+                    Type::Ref(name) => match (kinds.get(name), &*null) {
+                        (Some(Kind::Enum(repr, variants)), Number::Integer(n)) => {
+                            fits(null, *repr) && variants.iter().all(|(_, v)| v != n)
+                        }
+                        _ => false,
+                    },
+                    _ => false,
+                };
+                if !valid {
+                    return Err(err(
+                        ErrorKind::InvalidValue,
+                        path,
+                        "null requires a scalar, range, or enum item and an exactly representable value that is not a variant",
+                    ));
                 }
             }
-            normalize(item, path, depth + 1, names, limits)?;
+            normalize(item, path, depth + 1, kinds, limits)?;
         }
         Type::Ref(name) => {
-            if !names.contains(name) {
+            if !kinds.contains_key(name) {
                 return Err(err(ErrorKind::UnknownReference, path, "unknown named type"));
             }
         }
@@ -563,6 +958,8 @@ pub(crate) fn fits(n: &Number, p: Primitive) -> bool {
         (0..(1i128 << bits)).contains(n)
     }
 }
+/// Wire size of fixed-size layouts. Offsets that move backwards make a
+/// layout invalid; validation reports them separately.
 fn fixed_size(
     ty: &Type,
     defs: &BTreeMap<&str, &Definition>,
@@ -570,8 +967,9 @@ fn fixed_size(
     active: &mut BTreeSet<String>,
 ) -> Option<usize> {
     match ty {
-        Type::Scalar(p) => Some(p.bytes()),
+        Type::Scalar(p) | Type::Range { item: p, .. } => Some(p.bytes()),
         Type::Bytes(Length::Fixed(n)) | Type::String(Length::Fixed(n)) => Some(*n),
+        Type::Constant(_) => Some(0),
         Type::Optional {
             item,
             presence: Presence::Null(_),
@@ -586,9 +984,25 @@ fn fixed_size(
             let size = match defs.get(name.as_str())? {
                 Definition::Enum { repr, .. } => Some(repr.bytes()),
                 Definition::Set { repr, .. } => Some(repr.bytes()),
+                Definition::Union { .. } => None,
                 Definition::Struct(fs) => fs.iter().try_fold(0usize, |sum, f| {
-                    sum.checked_add(fixed_size(&f.ty, defs, memo, active)?)
+                    let size = fixed_size(&f.ty, defs, memo, active)?;
+                    if matches!(f.ty, Type::Constant(_)) {
+                        return Some(sum);
+                    }
+                    let start = match f.offset {
+                        Some(o) if o >= sum => o,
+                        Some(_) => return None,
+                        None => sum,
+                    };
+                    start.checked_add(size)
                 }),
+                Definition::Block { length, fields } => {
+                    let all_fixed = fields
+                        .iter()
+                        .all(|f| fixed_size(&f.ty, defs, memo, active).is_some());
+                    all_fixed.then_some(*length)
+                }
             };
             active.remove(name);
             memo.insert(name.clone(), size);
