@@ -398,8 +398,6 @@ impl Header {
     pub fn minor(&self) -> u8 {
         self.version & 0x0f
     }
-
-
 }
 
 /// One IKEv2 message: the header's fields and the payloads. The header's
@@ -584,8 +582,7 @@ pub struct Proposal {
     /// The protocol: see [`protocol`].
     pub protocol: u8,
     /// The sender's SPI: empty for IKE in IKE_SA_INIT, 4 bytes for ESP
-    /// and AH, 8 for IKE when rekeying. At most [`MAX_SPI`] bytes are
-    /// written.
+    /// and AH, 8 for IKE when rekeying. The writer refuses more than [`MAX_SPI`] bytes.
     pub spi: Vec<u8>,
     /// The transforms. Several of one type are alternatives.
     pub transforms: Vec<Transform>,
@@ -616,8 +613,7 @@ pub struct Attribute {
 pub enum AttributeValue {
     /// A two-byte value in the attribute itself (the TV form).
     Short(u16),
-    /// A value with its own length (the TLV form). At most 65535 bytes
-    /// are written.
+    /// A value with its own length (the TLV form). The writer refuses more than 65535 bytes.
     Long(Vec<u8>),
 }
 
@@ -645,8 +641,8 @@ pub struct Identification {
 pub struct Notify {
     /// The protocol the SPI belongs to, or 0 with no SPI.
     pub protocol: u8,
-    /// The SPI of the SA the notify is about, often empty. At most
-    /// [`MAX_SPI`] bytes are written.
+    /// The SPI of the SA the notify is about, often empty. The writer refuses
+    /// more than [`MAX_SPI`] bytes.
     pub spi: Vec<u8>,
     /// The notify message type: see [`notify`].
     pub kind: u16,
@@ -1324,9 +1320,7 @@ impl Wire for Header {
         out[19] = self.flags;
         out[20..24].copy_from_slice(&self.message_id.to_be_bytes());
         out[24..28].copy_from_slice(&self.length.to_be_bytes());
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1383,9 +1377,7 @@ impl Wire for Message {
         header.write(&mut out)?;
         out.extend_from_slice(&chain);
         if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1395,7 +1387,7 @@ impl Wire for NatT {
 
     /// Reads a datagram that came to port 4500. Fewer than four bytes,
     /// other than a keepalive, is [`Error::Short`].
-    /// Refuses input above MAX_MESSAGE + 4 and malformed or trailing IKE bytes.
+    /// Refuses input above [`MAX_MESSAGE`] + 4 and malformed or trailing IKE bytes.
     fn parse(b: &[u8]) -> Result<NatT, Error> {
         if b.len() > MAX_MESSAGE + NON_ESP_MARKER.len() { return Err(Error::Limit("datagram bytes")); }
 
@@ -1410,7 +1402,7 @@ impl Wire for NatT {
     }
 
     /// Appends the UDP payload. Refuses unwritable IKE messages and ESP data shorter
-    /// than four bytes, above MAX_MESSAGE + 4, or beginning with the non-ESP marker.
+    /// than four bytes, above [`MAX_MESSAGE`] + 4, or beginning with the non-ESP marker.
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let mut out = Vec::new();
@@ -1424,9 +1416,7 @@ impl Wire for NatT {
                 out.extend_from_slice(data);
             }
         }
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1452,10 +1442,15 @@ impl<const FIRST: u8> Wire for Payloads<FIRST> {
         if first != FIRST || parse_payloads(first, &bytes).as_ref() != Ok(&self.0) {
             return Err(Error::Unwritable);
         }
-        out.try_reserve(bytes.len()).map_err(|_| Error::Unwritable)?;
-        out.extend_from_slice(&bytes);
-        Ok(())
+        commit(out, &bytes)
     }
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), Error> {
+    dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
 }
 
 #[cfg(test)]

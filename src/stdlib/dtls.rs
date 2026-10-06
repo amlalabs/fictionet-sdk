@@ -70,7 +70,7 @@
 //! let Record::Plain(record) = &records[0] else { panic!("a plain record") };
 //! assert_eq!(record.content_type, ContentType::HANDSHAKE);
 //! let mut reassembler = Reassembler::new();
-//! for fragment in Fragments::parse(&record.fragment).map(|fragments| fragments.0).unwrap() {
+//! for fragment in Fragments::parse(&record.fragment).unwrap().0 {
 //!     reassembler.add(&fragment).unwrap();
 //! }
 //! let got = reassembler.next_message().unwrap();
@@ -306,13 +306,13 @@ pub struct PlainRecord {
     /// The record's sequence number within its epoch. Values above 48 bits are refused.
     pub sequence: u64,
     /// The connection ID. Only records of type [`ContentType::TLS12_CID`]
-    /// carry one, and other types write none. At most [`MAX_CID_LEN`] bytes
-    /// are written. Its length is not on the wire, so the receiver reads it
-    /// back only with the `cid_len` it chose.
+    /// carry one. Other types refuse a nonempty ID. Its length is not on
+    /// the wire. The writer refuses a length different from `CID_LEN`,
+    /// whose maximum is [`MAX_CID_LEN`].
     pub connection_id: Vec<u8>,
     /// The record's payload: plaintext in epoch 0, and protected bytes
-    /// after that. At most [`MAX_PLAINTEXT`] bytes are written in epoch 0,
-    /// and at most [`MAX_PLAIN_FRAGMENT`] after it.
+    /// after that. The writer refuses more than [`MAX_PLAINTEXT`] bytes in
+    /// epoch 0, or more than [`MAX_PLAIN_FRAGMENT`] after it.
     pub fragment: Vec<u8>,
 }
 
@@ -346,16 +346,16 @@ pub struct UnifiedRecord {
     /// The low two bits of the epoch. The writer refuses values above 3.
     pub epoch_bits: u8,
     /// The connection ID, if the header carries one. Its length is not on
-    /// the wire: the receiver chose it, so readers take it as an argument.
-    /// At most [`MAX_CID_LEN`] bytes are written.
+    /// the wire. Readers use the `CID_LEN` const parameter. The writer
+    /// refuses a length different from `CID_LEN` or above [`MAX_CID_LEN`].
     pub connection_id: Option<Vec<u8>>,
     /// The sequence number's low bits.
     pub sequence: Sequence,
     /// Whether the header has a length. A record without one runs to the
     /// end of the datagram.
     pub has_length: bool,
-    /// The protected payload. At most [`MAX_UNIFIED_PAYLOAD`] bytes are
-    /// written.
+    /// The protected payload. The writer refuses more than
+    /// [`MAX_UNIFIED_PAYLOAD`] bytes.
     pub payload: Vec<u8>,
 }
 
@@ -460,7 +460,6 @@ impl<const CID_LEN: u8> Record<CID_LEN> {
         let record = PlainRecord { content_type, version, epoch, sequence, connection_id, fragment };
         Ok((Record::Plain(record), r.at))
     }
-
 }
 
 /// Records carried by one datagram, with the session's connection ID length.
@@ -497,9 +496,7 @@ impl<const CID_LEN: u8> Wire for Datagram<CID_LEN> {
             }
             record.write(&mut out)?;
         }
-        dst.try_reserve(out.len()).map_err(|_| RecordError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_record(dst, &out)
     }
 }
 
@@ -606,7 +603,7 @@ pub struct Handshake {
     pub msg_type: u8,
     /// The message's place in the handshake.
     pub message_seq: u16,
-    /// The message body. At most [`MAX_MESSAGE_LEN`] bytes are written.
+    /// The message body. The writer refuses more than [`MAX_MESSAGE_LEN`] bytes.
     pub body: Vec<u8>,
 }
 
@@ -696,22 +693,19 @@ pub struct ClientHello {
     pub version: u16,
     /// The client's random value.
     pub random: [u8; RANDOM_LEN],
-    /// A session to resume. At most [`MAX_SESSION_ID`] bytes are written.
+    /// A session to resume. The writer refuses more than [`MAX_SESSION_ID`] bytes.
     pub session_id: Vec<u8>,
-    /// The cookie from a HelloVerifyRequest, or empty. At most
-    /// [`MAX_COOKIE`] bytes are written.
+    /// The cookie from a HelloVerifyRequest, or empty. The writer refuses
+    /// more than [`MAX_COOKIE`] bytes.
     pub cookie: Vec<u8>,
-    /// The cipher suites offered, by number, in order of preference. At
-    /// most [`MAX_CIPHER_SUITES`] are written. The format needs one at
-    /// least, so an empty list is written as the one suite 0
-    /// (TLS_NULL_WITH_NULL_NULL), which no server may choose.
+    /// The cipher suites offered, by number, in order of preference. The
+    /// writer refuses an empty list or more than [`MAX_CIPHER_SUITES`].
     pub cipher_suites: Vec<u16>,
-    /// The compression methods offered. 0 is none. At most
-    /// [`MAX_COMPRESSION_METHODS`] are written. The format needs one at
-    /// least, so an empty list is written as the one method 0.
+    /// The compression methods offered. 0 is none. The writer refuses an
+    /// empty list or more than [`MAX_COMPRESSION_METHODS`].
     pub compression_methods: Vec<u8>,
     /// The extensions, or None if their length field is absent.
-    /// Writers refuse duplicate types and blocks above MAX_EXTENSIONS_LEN.
+    /// Writers refuse duplicate types and blocks above [`MAX_EXTENSIONS_LEN`].
     pub extensions: Option<Vec<Extension>>,
 }
 
@@ -743,15 +737,15 @@ pub struct ServerHello {
     /// The server's random value.
     pub random: [u8; RANDOM_LEN],
     /// The session ID. In DTLS 1.3 it is empty: unlike TLS 1.3, a DTLS 1.3
-    /// server must not echo the client's (RFC 9147, section 5). At most
-    /// [`MAX_SESSION_ID`] bytes are written.
+    /// server must not echo the client's (RFC 9147, section 5). The writer
+    /// refuses more than [`MAX_SESSION_ID`] bytes.
     pub session_id: Vec<u8>,
     /// The cipher suite chosen.
     pub cipher_suite: u16,
     /// The compression method chosen.
     pub compression_method: u8,
     /// The extensions, or None if their length field is absent.
-    /// Writers refuse duplicate types and blocks above MAX_EXTENSIONS_LEN.
+    /// Writers refuse duplicate types and blocks above [`MAX_EXTENSIONS_LEN`].
     pub extensions: Option<Vec<Extension>>,
 }
 
@@ -784,7 +778,7 @@ pub struct HelloVerifyRequest {
     /// The server version. RFC 6347 has servers send
     /// [`version::DTLS_1_0`] here.
     pub version: u16,
-    /// The cookie. At most [`MAX_COOKIE`] bytes are written.
+    /// The cookie. The writer refuses more than [`MAX_COOKIE`] bytes.
     pub cookie: Vec<u8>,
 }
 
@@ -1241,9 +1235,7 @@ impl<const CID_LEN: u8> Wire for Record<CID_LEN> {
                 out.extend_from_slice(payload);
             }
         }
-        dst.try_reserve(out.len()).map_err(|_| RecordError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_record(dst, &out)
     }
 }
 
@@ -1258,7 +1250,7 @@ impl Wire for Fragment {
         Ok(fragment)
     }
 
-    /// Appends the complete fragment. Refuses messages above MAX_MESSAGE_LEN and
+    /// Appends the complete fragment. Refuses messages above [`MAX_MESSAGE_LEN`] and
     /// fragment ranges outside their declared message. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
         if self.length as usize > MAX_MESSAGE_LEN || self.offset > self.length || self.body.len() > (self.length - self.offset) as usize { return Err(HandshakeError::Unwritable); }
@@ -1272,9 +1264,7 @@ impl Wire for Fragment {
         out.extend_from_slice(&offset.to_be_bytes()[1..]);
         out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
         out.extend_from_slice(body);
-        dst.try_reserve(out.len()).map_err(|_| HandshakeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_handshake(dst, &out)
     }
 }
 
@@ -1289,11 +1279,10 @@ impl Wire for Handshake {
         Ok(Self { msg_type: fragment.msg_type, message_seq: fragment.message_seq, body: fragment.body })
     }
 
-    /// Appends one whole handshake fragment. Refuses bodies above MAX_MESSAGE_LEN.
+    /// Appends one whole handshake fragment. Refuses bodies above [`MAX_MESSAGE_LEN`].
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
         self.to_fragment()?.write(dst)
-
     }
 }
 
@@ -1344,9 +1333,7 @@ impl Wire for ClientHello {
         let methods = &self.compression_methods;
         put_vec8(&mut out, methods)?;
         put_extensions(&mut out, self.extensions.as_deref())?;
-        dst.try_reserve(out.len()).map_err(|_| HandshakeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_handshake(dst, &out)
     }
 }
 
@@ -1378,9 +1365,7 @@ impl Wire for ServerHello {
         out.extend_from_slice(&self.cipher_suite.to_be_bytes());
         out.push(self.compression_method);
         put_extensions(&mut out, self.extensions.as_deref())?;
-        dst.try_reserve(out.len()).map_err(|_| HandshakeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_handshake(dst, &out)
     }
 }
 
@@ -1405,9 +1390,7 @@ impl Wire for HelloVerifyRequest {
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
         let mut out = self.version.to_be_bytes().to_vec();
         put_vec8(&mut out, &self.cookie)?;
-        dst.try_reserve(out.len()).map_err(|_| HandshakeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_handshake(dst, &out)
     }
 }
 
@@ -1437,16 +1420,30 @@ impl Wire for Fragments {
         Ok(Self(out))
     }
 
-    /// Appends every fragment. Refuses invalid values and more than MAX_FRAGMENTS_PER_RECORD.
+    /// Appends every fragment. Refuses invalid values and more than [`MAX_FRAGMENTS_PER_RECORD`].
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), HandshakeError> {
         if self.0.len() > MAX_FRAGMENTS_PER_RECORD { return Err(HandshakeError::Unwritable); }
         let mut out = Vec::new();
         for fragment in &self.0 { fragment.write(&mut out)?; }
-        dst.try_reserve(out.len()).map_err(|_| HandshakeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_handshake(dst, &out)
     }
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit_handshake(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), HandshakeError> {
+    dst.try_reserve(out.len())
+        .map_err(|_| HandshakeError::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit_record(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), RecordError> {
+    dst.try_reserve(out.len())
+        .map_err(|_| RecordError::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1666,7 +1663,10 @@ mod tests {
         let empty = Handshake { msg_type: 14, message_seq: 1, body: vec![] }.to_bytes().unwrap();
         assert_eq!(empty, [14, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]);
         let many: Vec<u8> = empty.iter().copied().cycle().take(12 * MAX_FRAGMENTS_PER_RECORD).collect();
-        assert_eq!(Fragments::parse(&many).map(|fragments| fragments.0).unwrap().len(), MAX_FRAGMENTS_PER_RECORD);
+        assert_eq!(
+            Fragments::parse(&many).unwrap().0.len(),
+            MAX_FRAGMENTS_PER_RECORD
+        );
         let mut more = many.clone();
         more.extend_from_slice(&empty);
         assert_eq!(Fragments::parse(&more).map(|fragments| fragments.0), Err(HandshakeError::TooManyFragments));
@@ -1894,7 +1894,7 @@ mod tests {
                 fragment: f.to_bytes().unwrap(),
             });
             let Record::Plain(p) = Record::<0>::parse(&rec.to_bytes().unwrap()).unwrap() else { panic!() };
-            for f in Fragments::parse(&p.fragment).map(|fragments| fragments.0).unwrap() {
+            for f in Fragments::parse(&p.fragment).unwrap().0 {
                 assert_eq!(r.add(&f), Ok(Added::New));
             }
         }
@@ -2198,7 +2198,7 @@ mod tests {
         bytes[n - 7] = 12;
         bytes.extend_from_slice(&[0, 43, 0, 2, 0xfe, 0xfc]);
         assert_eq!(ServerHello::parse(&bytes), Err(HandshakeError::DuplicateExtension(43)));
-        // Writers keep the first of each type.
+        // Writers refuse duplicate types.
         let svs = |v: u8| Extension { typ: extension_type::SUPPORTED_VERSIONS, data: vec![0xfe, v] };
         sh.extensions = Some(vec![svs(0xfc), Extension { typ: 1, data: vec![] }, svs(0xfd)]);
         contract::check_wire_value(&sh);
@@ -2210,6 +2210,12 @@ mod tests {
     fn check<const CID_LEN: u8>(b: &[u8]) {
         contract::check_wire::<Record<CID_LEN>>(b);
         contract::check_wire::<Datagram<CID_LEN>>(b);
+        if let Ok(record) = Record::<CID_LEN>::parse(b) {
+            assert_eq!(record.to_bytes().unwrap(), b);
+        }
+        if let Ok(datagram) = Datagram::<CID_LEN>::parse(b) {
+            assert_eq!(datagram.to_bytes().unwrap(), b);
+        }
         contract::check_wire::<Fragment>(b);
         contract::check_wire::<Handshake>(b);
         contract::check_wire::<ClientHello>(b);

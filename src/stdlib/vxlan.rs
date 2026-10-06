@@ -155,8 +155,8 @@ impl Default for GpePacket {
     }
 }
 
-/// Why a datagram is not a VXLAN or VXLAN-GPE packet. A real endpoint
-/// drops such a datagram and sends nothing back.
+/// Why a VXLAN or VXLAN-GPE packet cannot be read or written. A real
+/// endpoint drops an unreadable datagram and sends nothing back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
     /// The value cannot be written without changing it.
@@ -178,7 +178,6 @@ pub enum Error {
     /// a value the draft reserves, so the header names no protocol. The
     /// writer reports [`Error::Unwritable`] for `next_protocol: Some(0)`.
     ReservedNextProtocol,
-
 }
 
 impl std::fmt::Display for Error {
@@ -195,7 +194,6 @@ impl std::fmt::Display for Error {
         }
     }
 }
-
 
 impl GpePacket {
     /// What the payload is, with the P flag's absence read as Ethernet.
@@ -250,7 +248,7 @@ impl Wire for Packet {
     }
 
     /// Appends the VXLAN header and Ethernet frame. Refuses VNIs wider than 24 bits
-    /// and frames above MAX_PAYLOAD. Leaves the destination unchanged on error.
+    /// and frames above [`MAX_PAYLOAD`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let out = write(flags::I, 0, self.vni, &self.frame)?;
         dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
@@ -297,7 +295,7 @@ impl Wire for GpePacket {
     }
 
     /// Appends the GPE header and payload. Refuses VNIs wider than 24 bits,
-    /// payloads above MAX_PAYLOAD and next protocol Some(0).
+    /// payloads above [`MAX_PAYLOAD`] and next protocol Some(0).
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.next_protocol == Some(0) {
@@ -324,8 +322,8 @@ impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg}};
     use super::*;
+    use fictionet::stdlib::codec::{contract, test_support::Lcg};
 
     /// The ARP request from the module doc: VNI 5001 and a 14-byte frame.
     fn example() -> Vec<u8> {
@@ -417,7 +415,6 @@ mod tests {
             Error::Version(2),
             Error::NextProtocolWithoutP(1),
             Error::ReservedNextProtocol,
-            Error::Unwritable,
             Error::Unwritable,
         ] {
             assert!(!e.to_string().is_empty());

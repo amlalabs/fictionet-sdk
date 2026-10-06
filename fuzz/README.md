@@ -35,32 +35,38 @@ cargo +nightly fuzz list
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
-| `bacnet` | complete wire units and shared codec contracts | `stdlib::bacnet`: BACnet/IP |
+| `bacnet` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
+| `dtls` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::dtls`: DTLS records and handshake bodies |
 | `enip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::enip`: EtherNet/IP and CIP |
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::grpc`: gRPC |
+| `ike` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ike`: IKEv2 and NAT-T |
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kafka`: Apache Kafka |
 | `kerberos` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kerberos`: Kerberos V5 |
+| `l2tp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::l2tp`: L2TPv2 and L2TPv3 |
 | `ldap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ldap`: LDAP |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
 | `mime_multipart` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mongodb`: MongoDB |
 | `mqtt` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mysql`: MySQL |
-| `nbns` | complete wire units and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
+| `nbdgm` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbdgm`: NetBIOS datagrams |
+| `nbns` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nfs`: NFS version 3 and MOUNT version 3 |
-| `ntp` | complete wire units and shared codec contracts | `stdlib::ntp`: NTP |
+| `ntlmssp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntlmssp`: NTLMSSP tokens and fields |
+| `ntp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntp`: NTP |
 | `ocsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
+| `pcp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::pcp`: PCP and NAT-PMP |
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
 | `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |
@@ -80,19 +86,13 @@ cargo +nightly fuzz list
 | `stun` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::stun`: STUN |
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
-| `tftp` | complete wire units and shared codec contracts | `stdlib::tftp`: TFTP and bounded netascii text decoding |
+| `tftp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::tftp`: TFTP and bounded netascii text decoding |
 | `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
-| `vxlan` | complete wire units and shared codec contracts | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
+| `vxlan` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
+| `wireguard` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::wireguard`: WireGuard messages and replay windows |
 | `x509` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::xml`: XML 1.0 |
-| `dtls` | complete wire units and shared codec contracts | `stdlib::dtls`: DTLS records and handshake bodies |
-| `ike` | complete wire units and shared codec contracts | `stdlib::ike`: IKEv2 and NAT-T |
-| `l2tp` | complete wire units and shared codec contracts | `stdlib::l2tp`: L2TPv2 and L2TPv3 |
-| `nbdgm` | complete wire units and shared codec contracts | `stdlib::nbdgm`: NetBIOS datagrams |
-| `ntlmssp` | complete wire units and shared codec contracts | `stdlib::ntlmssp`: NTLMSSP tokens and fields |
-| `pcp` | complete wire units and shared codec contracts | `stdlib::pcp`: PCP and NAT-PMP |
-| `wireguard` | complete wire units and shared codec contracts | `stdlib::wireguard`: WireGuard messages and replay windows |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules

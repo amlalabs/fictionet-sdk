@@ -167,8 +167,8 @@ pub struct Name {
     /// The 16 bytes: up to 15 characters padded with spaces, then the
     /// suffix.
     pub bytes: [u8; NAME_LEN],
-    /// The scope labels. Writers refuse empty labels, labels above MAX_LABEL,
-    /// and names above MAX_NAME_LEN.
+    /// The scope labels. Writers refuse empty labels, labels above [`MAX_LABEL`],
+    /// and names above [`MAX_NAME_LEN`].
     pub scope: Vec<Vec<u8>>,
 }
 
@@ -574,7 +574,7 @@ impl Packet {
 
     /// Splits this datagram into fragments of at most max_data bytes.
     /// The fragment size is limited to what fits with the names, and at least one.
-    /// Offsets start at zero. Refuses data above MAX_REASSEMBLED or invalid names.
+    /// Offsets start at zero. Refuses data above [`MAX_REASSEMBLED`] or invalid names.
     /// Non-datagram packets come back as one packet.
     pub fn split(&self, max_data: usize) -> Result<Vec<Packet>, ParseError> {
         let Body::Datagram(d) = &self.body else { return Ok(vec![self.clone()]) };
@@ -714,7 +714,7 @@ impl Wire for Name {
     }
 
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
-    /// names above MAX_NAME_LEN. Leaves the destination unchanged on error.
+    /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         let mut out = Vec::with_capacity(ENCODED_LEN + 2);
         out.push(ENCODED_LEN as u8);
@@ -1015,12 +1015,12 @@ mod tests {
             n.extend_from_slice(&[b'x'; 63]);
         }
         n.push(0);
-        assert_eq!(Name::parse(&n).map(|value| (value, n.len())), Err(ParseError::Name));
+        assert_eq!(Name::parse(&n), Err(ParseError::Name));
         // A label longer than 63 (and not a pointer).
         let mut n = vec![32];
         n.extend_from_slice(&[b'A'; 32]);
         n.push(64);
-        assert_eq!(Name::parse(&n).map(|value| (value, n.len())), Err(ParseError::Name));
+        assert_eq!(Name::parse(&n), Err(ParseError::Name));
         for e in [ParseError::Truncated, ParseError::Name, ParseError::Length { field: 1, actual: 2 }] {
             assert!(!e.to_string().is_empty());
         }
@@ -1043,11 +1043,22 @@ mod tests {
         n.extend_from_slice(&[b'y'; 28]);
         n.push(0);
         assert_eq!(n.len(), MAX_NAME_LEN);
-        assert_eq!(Name::parse(&n).map(|value| (value, n.len())).map(|(_, used)| used), Ok(MAX_NAME_LEN));
+        assert_eq!(
+            Name::parse(&n),
+            Ok(Name {
+                bytes: [0; NAME_LEN],
+                scope: vec![
+                    vec![b'x'; 63],
+                    vec![b'x'; 63],
+                    vec![b'x'; 63],
+                    vec![b'y'; 28]
+                ]
+            })
+        );
         let mut over = n.clone();
         over.insert(n.len() - 1, b'y');
         over[n.len() - 30] = 29;
-        assert_eq!(Name::parse(&over).map(|value| (value, over.len())), Err(ParseError::Name));
+        assert_eq!(Name::parse(&over), Err(ParseError::Name));
         // The flags bits: M is 0x01, F is 0x02, SNT is 0x0c.
         assert_eq!(Flags { more: true, first: false, node_type: NodeType::M }.to_byte(), 0x09);
         // A length field that ends inside the names refuses the packet.
@@ -1205,7 +1216,7 @@ mod tests {
             let mut buf = if round % 3 == 0 {
                 let len = rng.index(120);
                 let mut b = vec![0; len];
-            rng.fill(&mut b);
+                rng.fill(&mut b);
                 if let Some(t) = b.first_mut() {
                     *t = 0x10 + rng.index(8) as u8;
                 }
@@ -1213,7 +1224,18 @@ mod tests {
             } else {
                 seeds[rng.index(seeds.len())].clone()
             };
-            for _ in 0..rng.index(4) { mutate(&mut rng, &mut buf); }
+            for _ in 0..rng.index(4) {
+                mutate(&mut rng, &mut buf);
+                let at = rng.index(buf.len());
+                if let Some(byte) = buf.get_mut(at) {
+                    *byte = match rng.index(4) {
+                        0 => 0xc0,
+                        1 => b'A' + rng.index(16) as u8,
+                        2 => rng.index(64) as u8,
+                        _ => b'Q',
+                    };
+                }
+            }
             check(&buf, &mut r);
             // The datagram, one byte more at a time: every prefix is read
             // or refused, and never panics.

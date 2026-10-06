@@ -19,6 +19,8 @@
 //! options, and a [`ReadTransfer`] works out which packet to send next
 //! for one read. When to resend a packet, and how many times, is up to
 //! the caller: on a timeout it sends [`ReadTransfer::current`] again.
+//! Read netascii DATA bodies with [`Stream<Netascii>`](super::codec::Stream)
+//! to retain a CR split across packets.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Strings, option lists and packets all have limits, given below
@@ -866,7 +868,7 @@ impl Wire for Packet {
     }
 
     /// Appends the complete packet. Refuses NULs or oversized strings, repeated options,
-    /// requests above MAX_REQUEST and DATA above MAX_BLOCK_SIZE.
+    /// requests above [`MAX_REQUEST`] and DATA above [`MAX_BLOCK_SIZE`].
     /// Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         let mut out = Vec::new();
@@ -1405,7 +1407,7 @@ mod tests {
             } else {
                 let len = rng.index(64);
                 let mut b = vec![0; len];
-            rng.fill(&mut b);
+                rng.fill(&mut b);
                 if len >= 2 {
                     b[0] = 0;
                     b[1] = rng.index(8) as u8;

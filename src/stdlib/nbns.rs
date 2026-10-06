@@ -26,8 +26,9 @@
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Writers refuse oversized or invalid values without changing the destination.
-//! A packet is written in at most [`MAX_DATAGRAM`] bytes, as RFC 1002
-//! asks, and a writer that has to leave anything out sets the TC flag.
+//! Query and node-status reply constructors cut their owner or name lists
+//! to fit [`MAX_DATAGRAM`] and set TC when they cut a list, as RFC 1002 asks.
+//! Writers preserve the chosen records and TC flag, up to [`MAX_PACKET`].
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -71,8 +72,8 @@ pub const HEADER_LEN: usize = 12;
 /// The largest packet read or written here: the IPv4 UDP payload limit.
 pub const MAX_PACKET: usize = 65_507;
 /// The 576-byte datagram budget from RFC 1002 section 4.2.1.1.
-/// Callers choose which records to send and whether to set TC.
-/// Writers preserve those choices and allow up to MAX_PACKET.
+/// Query and node-status reply constructors cut their lists to this budget
+/// and set TC. Writers preserve all fields and allow up to [`MAX_PACKET`].
 pub const MAX_DATAGRAM: usize = 576;
 /// The largest section allowed here. Readers and writers refuse larger counts.
 pub const MAX_RECORDS: usize = 64;
@@ -187,8 +188,8 @@ pub struct Name {
     /// The 16 bytes: up to 15 characters padded with spaces, then the
     /// suffix.
     pub bytes: [u8; NAME_LEN],
-    /// The scope labels. Writers refuse empty labels, labels above MAX_LABEL,
-    /// and names above MAX_NAME_LEN.
+    /// The scope labels. Writers refuse empty labels, labels above [`MAX_LABEL`],
+    /// and names above [`MAX_NAME_LEN`].
     pub scope: Vec<Vec<u8>>,
 }
 
@@ -233,8 +234,6 @@ impl Name {
     pub fn suffix(&self) -> u8 {
         self.bytes[NAME_LEN - 1]
     }
-
-
 }
 
 /// The labels a constructor keeps of `labels`, in a name whose labels before
@@ -259,7 +258,7 @@ fn clipped_labels<'a>(mut used: usize, labels: impl Iterator<Item = &'a [u8]>) -
 }
 
 /// Appends valid labels and the final zero to a name. Refuses empty or
-/// oversized labels and names above MAX_NAME_LEN.
+/// oversized labels and names above [`MAX_NAME_LEN`].
 fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), ParseError> {
     for label in labels {
         if label.is_empty() || label.len() > MAX_LABEL || out.len() + label.len() + 2 > MAX_NAME_LEN {
@@ -335,8 +334,6 @@ impl RrName {
             RrName::Domain(_) => None,
         }
     }
-
-
 }
 
 impl From<Name> for RrName {
@@ -548,7 +545,7 @@ impl NodeName {
 /// bytes of statistics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeStatus {
-    /// The node names. Writers refuse more than MAX_NODE_NAMES.
+    /// The node names. Writers refuse more than [`MAX_NODE_NAMES`].
     pub names: Vec<NodeName>,
     /// The statistics block, kept in full. RFC 1002 specifies
     /// [`STATISTICS_LEN`] bytes, starting with the node's six-byte unit ID
@@ -784,8 +781,8 @@ pub struct Packet {
     pub flags: Flags,
     /// The result code; see [`rcode`]. Values above 15 are refused.
     pub rcode: u8,
-    /// The question section. Writers refuse sections above MAX_RECORDS
-    /// or packets above MAX_PACKET. The TC flag is preserved.
+    /// The question section. Writers refuse sections above [`MAX_RECORDS`]
+    /// or packets above [`MAX_PACKET`]. The TC flag is preserved.
     pub questions: Vec<Question>,
     /// The answer section.
     pub answers: Vec<Record>,
@@ -1005,10 +1002,16 @@ impl Packet {
 
     /// The positive answer to a name query: `name` is held by `owners`
     /// for `ttl` seconds. AA and RD are set, whatever the query had
-    /// (RFC 1002 section 4.2.13).
-    pub fn query_response(&self, name: Name, ttl: u32, owners: Vec<NbEntry>) -> Packet {
+    /// (RFC 1002 section 4.2.13). Cuts the owner list to fit [`MAX_DATAGRAM`]
+    /// and sets TC when owners are omitted. An invalid name remains unwritable.
+    pub fn query_response(&self, name: Name, ttl: u32, mut owners: Vec<NbEntry>) -> Packet {
+        let limit = reply_list_limit(&name, 0, NB_ENTRY_LEN);
+        let truncated = owners.len() > limit;
+        owners.truncate(limit);
         let record = Record { name: name.into(), class: CLASS_IN, ttl, data: RData::Nb(owners) };
-        self.reply(Opcode::Query, rcode::OK, record)
+        let mut p = self.reply(Opcode::Query, rcode::OK, record);
+        p.flags.truncated = truncated;
+        p
     }
 
     /// The negative answer to a name query, with result code `code`,
@@ -1024,13 +1027,24 @@ impl Packet {
     /// The answer to a node status request: the node holds `names`, and
     /// its unit ID (MAC address) is `unit_id`. The other statistics are
     /// zero (RFC 1002 section 4.2.18). `name` is the name asked about.
-    pub fn node_status_response(&self, name: Name, names: Vec<NodeName>, unit_id: [u8; 6]) -> Packet {
+    /// Cuts the name list to fit [`MAX_DATAGRAM`] and sets TC when names
+    /// are omitted. An invalid name remains unwritable.
+    pub fn node_status_response(
+        &self,
+        name: Name,
+        mut names: Vec<NodeName>,
+        unit_id: [u8; 6],
+    ) -> Packet {
+        let limit = reply_list_limit(&name, 1 + STATISTICS_LEN, NODE_NAME_LEN);
+        let truncated = names.len() > limit;
+        names.truncate(limit);
         let mut statistics = vec![0u8; STATISTICS_LEN];
         statistics[..6].copy_from_slice(&unit_id);
         let data = RData::NodeStatus(NodeStatus { names, statistics });
         let record = Record { name: name.into(), class: CLASS_IN, ttl: 0, data };
         let mut p = self.reply(Opcode::Query, rcode::OK, record);
         p.flags.recursion_desired = false;
+        p.flags.truncated = truncated;
         p
     }
 
@@ -1146,15 +1160,13 @@ impl Wire for Name {
     }
 
     /// Appends the uncompressed name. Refuses empty or oversized scope labels and
-    /// names above MAX_NAME_LEN. Leaves the destination unchanged on error.
+    /// names above [`MAX_NAME_LEN`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         let mut out = Vec::with_capacity(ENCODED_LEN + 2);
         out.push(ENCODED_LEN as u8);
         out.extend_from_slice(&encode_first_level(&self.bytes));
         put_labels(&mut out, self.scope.iter().map(Vec::as_slice))?;
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1178,9 +1190,7 @@ impl Wire for RrName {
             RrName::Domain(labels) => put_labels(&mut out, labels.iter().map(Vec::as_slice))?,
         }
         if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1189,7 +1199,7 @@ impl Wire for Packet {
     type WriteError = ParseError;
 
     /// Reads a complete datagram with compressed names. Refuses trailing bytes,
-    /// invalid records, and names whose expansion cannot be written within MAX_PACKET.
+    /// invalid records, and names whose expansion cannot be written within [`MAX_PACKET`].
     fn parse(b: &[u8]) -> Result<Packet, ParseError> {
         if b.len() > MAX_PACKET {
             return Err(ParseError::TooLong(b.len()));
@@ -1266,9 +1276,7 @@ impl Wire for Packet {
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         let out = self.encode()?;
         if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1301,6 +1309,21 @@ impl Packet {
         }
         Ok(out)
     }
+}
+
+/// The entries that fit a one-record reply, including its uncompressed name.
+fn reply_list_limit(name: &Name, fixed_data: usize, entry_len: usize) -> usize {
+    name.to_bytes().map_or(0, |bytes| {
+        MAX_DATAGRAM.saturating_sub(HEADER_LEN + bytes.len() + 10 + fixed_data) / entry_len
+    })
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), ParseError> {
+    dst.try_reserve(out.len())
+        .map_err(|_| ParseError::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1807,18 +1830,59 @@ mod tests {
     }
 
     #[test]
-    fn writer_preserves_records_and_tc() {
+    fn reply_constructors_keep_to_576_bytes_and_set_tc() {
         let req = Packet::parse(&query_bytes()).unwrap();
-        let resp = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 100]);
-        let b = resp.to_bytes().unwrap();
-        assert!(b.len() > MAX_DATAGRAM);
-        assert_eq!(Packet::parse(&b), Ok(resp.clone()));
-        assert!(!resp.flags.truncated);
-        let small = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 3]);
-        contract::check_wire_value(&small);
-        let huge = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 10_909]);
-        assert_eq!(huge.to_bytes(), Err(ParseError::Unwritable));
-        contract::check_wire_value(&huge);
+        for name in [
+            Name::new("FRED", 0x20),
+            Name::new("FRED", 0x20).with_scope(&"x.".repeat(200)),
+        ] {
+            let node = NodeName::unique(&name);
+            for count in [0, 3, 100, 10_909] {
+                for (reply, item_len, items) in [
+                    (
+                        req.query_response(name.clone(), 60, vec![owner(1); count]),
+                        NB_ENTRY_LEN,
+                        0,
+                    ),
+                    (
+                        req.node_status_response(name.clone(), vec![node; count], [7; 6]),
+                        NODE_NAME_LEN,
+                        1,
+                    ),
+                ] {
+                    contract::check_wire_value(&reply);
+                    let bytes = reply.to_bytes().unwrap();
+                    assert!(bytes.len() <= MAX_DATAGRAM);
+                    assert_eq!(Packet::parse(&bytes), Ok(reply.clone()));
+                    let retained = match &reply.answers[0].data {
+                        RData::Nb(owners) => {
+                            assert_eq!(items, 0);
+                            assert_eq!(owners, &vec![owner(1); owners.len()]);
+                            owners.len()
+                        }
+                        RData::NodeStatus(status) => {
+                            assert_eq!(items, 1);
+                            assert_eq!(status.names, vec![node; status.names.len()]);
+                            assert_eq!(status.unit_id(), Some([7; 6]));
+                            status.names.len()
+                        }
+                        _ => panic!("unexpected reply data"),
+                    };
+                    assert_eq!(reply.flags.truncated, retained < count);
+                    if retained < count {
+                        assert!(bytes.len() + item_len > MAX_DATAGRAM);
+                    }
+                }
+            }
+        }
+        // Directly constructed packets retain all records and TC as supplied.
+        let mut packet = req.query_response(Name::new("FRED", 0x20), 60, vec![]);
+        packet.answers[0].data = RData::Nb(vec![owner(1); 100]);
+        assert!(packet.to_bytes().unwrap().len() > MAX_DATAGRAM);
+        assert!(!packet.flags.truncated);
+        packet.answers[0].data = RData::Nb(vec![owner(1); MAX_NB_ENTRIES + 1]);
+        assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&packet);
         let mut many = Packet::name_query(1, Name::new("FRED", 0x20), false);
         many.questions = vec![many.questions[0].clone(); MAX_RECORDS + 1];
         assert_eq!(many.to_bytes(), Err(ParseError::Unwritable));
@@ -1922,12 +1986,12 @@ mod tests {
         let back = Packet::parse(&out).unwrap();
         assert_eq!(back.authority[0].data, RData::Ns(scope));
         assert_eq!(back, p);
-        // Built NS data with a pointer cannot be placed, so it is left out.
+        // Opaque NS data with a pointer is refused.
         let mut built = p.clone();
         built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: vec![0xc0, 0x5f] };
         assert_eq!(built.to_bytes(), Err(ParseError::Unwritable));
         contract::check_wire_value(&built);
-        // Built NS data that is one plain name reads back as Ns.
+        // Opaque NS data that would read as Ns is also refused.
         built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: b"\x03COM\x00".to_vec() };
         assert_eq!(built.to_bytes(), Err(ParseError::Unwritable));
         built.authority[0].data = RData::Ns(vec![b"COM".to_vec()]);
@@ -1986,7 +2050,7 @@ mod tests {
             let mut buf = if round % 2 == 0 {
                 let len = rng.index(120);
                 let mut b = vec![0; len];
-            rng.fill(&mut b);
+                rng.fill(&mut b);
                 // Give most a plausible header, so names get read.
                 if b.len() >= 12 {
                     for i in (4..12).step_by(2) {
@@ -1998,7 +2062,18 @@ mod tests {
             } else {
                 seeds[rng.index(seeds.len())].clone()
             };
-            for _ in 0..rng.index(4) { mutate(&mut rng, &mut buf); }
+            for _ in 0..rng.index(4) {
+                mutate(&mut rng, &mut buf);
+                let at = rng.index(buf.len());
+                if let Some(byte) = buf.get_mut(at) {
+                    *byte = match rng.index(4) {
+                        0 => 0xc0,
+                        1 => b'A' + rng.index(16) as u8,
+                        2 => rng.index(64) as u8,
+                        _ => b'Q',
+                    };
+                }
+            }
             check(&buf);
             // The datagram as it arrives, one byte more at a time: every
             // prefix is read or refused, and never panics.

@@ -1204,9 +1204,7 @@ impl Wire for Request {
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, true)?;
         if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_pcp(dst, &out)
     }
 }
 
@@ -1260,9 +1258,7 @@ impl Wire for Response {
         write_operation(&mut out, &self.operation)?;
         write_options(&mut out, &self.options, false)?;
         if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_pcp(dst, &out)
     }
 }
 
@@ -1331,9 +1327,7 @@ impl Wire for NatPmpRequest {
             }
         };
         if Self::parse(&out).as_ref() != Ok(self) { return Err(NatPmpError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| NatPmpError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_nat_pmp(dst, &out)
     }
 }
 
@@ -1418,9 +1412,7 @@ impl Wire for NatPmpResponse {
             }
         };
         if Self::parse(&out).as_ref() != Ok(self) { return Err(NatPmpError::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| NatPmpError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit_nat_pmp(dst, &out)
     }
 }
 
@@ -1453,6 +1445,22 @@ impl Wire for Reply {
             Self::NatPmp(value) => value.write(out).map_err(|_| ParseError::Unwritable),
         }
     }
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit_nat_pmp(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), NatPmpError> {
+    dst.try_reserve(out.len())
+        .map_err(|_| NatPmpError::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit_pcp(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), ParseError> {
+    dst.try_reserve(out.len())
+        .map_err(|_| ParseError::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2074,7 +2082,7 @@ mod tests {
 
     #[test]
     fn writers_refuse_values_that_would_change() {
-        // Too many options: the ones that do not fit are left out.
+        // Too many options are refused.
         let many = vec![PcpOption::Other { code: 200, data: vec![1; 40] }; 100];
         let r = with(map_request(), many.clone());
         assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
@@ -2082,10 +2090,10 @@ mod tests {
         let resp = Response { options: many, ..map_request().reply(ResultCode::Success, 0, 0) };
         assert_eq!(resp.to_bytes(), Err(ParseError::Unwritable));
         contract::check_wire_value(&resp);
-        // One huge option is left out, and a later small one still fits.
+        // An oversized option refuses the whole value.
         let r = with(map_request(), vec![PcpOption::Other { code: 200, data: vec![0; 70000] }, filter(0)]);
         assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
-        // Repeats and fake known options are left out of requests.
+        // Repeated singleton options and opaque known options are refused.
         let r = with(
             map_request(),
             vec![
@@ -2097,7 +2105,7 @@ mod tests {
             ],
         );
         assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
-        // An unknown opcode that looks known is written as 127.
+        // An unknown opcode that looks known is refused.
         let r = Request {
             lifetime: 0,
             client: Ipv6Addr::LOCALHOST,

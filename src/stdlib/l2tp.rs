@@ -460,7 +460,6 @@ impl Avp {
         };
         Ok((avp, len))
     }
-
 }
 
 /// A control message body: its type, the bits of its message type AVP,
@@ -693,7 +692,7 @@ impl Wire for Avp {
     }
 
     /// Appends the AVP, including its stored reserved bits. Refuses values above
-    /// MAX_AVP_VALUE or reserved bits above 15. Leaves the destination unchanged on error.
+    /// [`MAX_AVP_VALUE`] or reserved bits above 15. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.value.len() > MAX_AVP_VALUE || self.reserved > 15 { return Err(Error::Unwritable); }
         let value = &self.value;
@@ -709,9 +708,7 @@ impl Wire for Avp {
         out.extend_from_slice(&self.vendor.to_be_bytes());
         out.extend_from_slice(&self.attribute.to_be_bytes());
         out.extend_from_slice(value);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -775,9 +772,7 @@ impl Wire for ControlMessage {
             if out.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
         }
         if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -899,9 +894,7 @@ impl Wire for V2Packet {
             out.extend_from_slice(pad);
         }
         out.extend_from_slice(payload);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -946,9 +939,7 @@ impl Wire for V3Control {
         out.extend_from_slice(&self.ns.to_be_bytes());
         out.extend_from_slice(&self.nr.to_be_bytes());
         out.extend_from_slice(payload);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -994,9 +985,7 @@ impl<const COOKIE_LEN: usize> Wire for V3Data<COOKIE_LEN> {
         out.extend_from_slice(&self.session.to_be_bytes());
         out.extend_from_slice(cookie);
         out.extend_from_slice(payload);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1031,8 +1020,14 @@ impl Wire for Packet {
             Packet::V3Control(p) => p.write(dst),
             Packet::V3Data(p) => p.write(dst),
         }
-
     }
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), Error> {
+    dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1119,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn reserved_bits_are_ignored_and_written_as_zero() {
+    fn reserved_header_bits_are_ignored_and_written_as_zero() {
         // Every x bit set on a data header, and on a control header.
         let data = [0x34, 0xf2, 0, 1, 0, 2, 9];
         let p = V2Packet::parse(&data).unwrap();
@@ -1136,8 +1131,7 @@ mod tests {
         // A hidden mandatory vendor AVP with reserved bits set: M, H,
         // rsvd 0b0101, length 10, vendor 9, attribute 0x1234, 4 bytes.
         let bytes = [0xd4, 10, 0, 9, 0x12, 0x34, 1, 2, 3, 4];
-        let (a, used) = Avp::parse(&bytes).map(|value| (value, bytes.len())).unwrap();
-        assert_eq!(used, 10);
+        let a = Avp::parse(&bytes).unwrap();
         assert_eq!(
             a,
             Avp { mandatory: true, hidden: true, reserved: 5, vendor: 9, attribute: 0x1234, value: vec![1, 2, 3, 4] }
@@ -1147,8 +1141,8 @@ mod tests {
         assert_eq!(a.to_bytes().unwrap(), bytes);
         let r = Avp { reserved: 1, ..Avp::from_u16(attribute::ASSIGNED_TUNNEL_ID, 7) };
         assert_eq!(r.to_bytes().unwrap(), [0x84, 8, 0, 0, 0, 9, 0, 7]);
-        assert_eq!(Avp::parse(&bytes[..9]).map(|value| (value, bytes[..9].len())), Err(Error::Truncated));
-        assert_eq!(Avp::parse(&[0x80, 5, 0, 0, 0, 0]).map(|value| (value, [0x80, 5, 0, 0, 0, 0].len())), Err(Error::AvpLength(5)));
+        assert_eq!(Avp::parse(&bytes[..9]), Err(Error::Truncated));
+        assert_eq!(Avp::parse(&[0x80, 5, 0, 0, 0, 0]), Err(Error::AvpLength(5)));
         // An oversized value cannot fit the length field.
         let big = Avp::new(attribute::CHALLENGE, vec![7; 5000]);
         assert_eq!(big.to_bytes(), Err(Error::Unwritable));
@@ -1423,32 +1417,42 @@ mod tests {
         // Values built by hand, with any field contents: what the writers
         // give always reads, and writing what was read gives the same bytes.
         let mut rng = Lcg::new(0x0001_2661);
-        for _ in 0..2_000 {
+        let mut written = 0;
+        for iteration in 0..2_000 {
             let u16r = |rng: &mut Lcg| u16::from_be_bytes([(rng.next() as u8), (rng.next() as u8)]);
             let mut avps = Vec::new();
             for _ in 0..rng.index(8) {
                 avps.push(Avp {
                     mandatory: rng.coin(),
                     hidden: rng.coin(),
-                    reserved: (rng.next() as u8),
+                    reserved: rng.index(16) as u8,
                     vendor: u16r(&mut rng),
                     attribute: u16r(&mut rng),
-                    value: rng.bytes(1500),
+                    value: rng.bytes(MAX_AVP_VALUE),
                 });
             }
-            let message = ControlMessage {
-                message_type: if rng.index(8) == 0 {
+            let mut message = ControlMessage {
+                message_type: if avps.is_empty() && rng.index(8) == 0 {
                     None
                 } else {
                     Some(MessageType::from_code(u16r(&mut rng)))
                 },
                 mandatory: rng.coin(),
                 vendor: if rng.coin() { 0 } else { u16r(&mut rng) },
-                reserved: (rng.next() as u8),
+                reserved: rng.index(16) as u8,
                 avps,
             };
+            if iteration % 16 == 0 {
+                message.reserved = 16;
+            }
+            if iteration % 17 == 0
+                && let Some(avp) = message.avps.first_mut()
+            {
+                avp.reserved = 16;
+            }
             contract::check_wire_value(&message);
             let Ok(body) = message.to_bytes() else { continue };
+            written += 1;
             let read = ControlMessage::parse(&body).unwrap();
             assert_eq!(read, message.clone());
             assert_eq!(read.to_bytes().unwrap(), body);
@@ -1470,9 +1474,23 @@ mod tests {
                 0 => rng.bytes(10),
                 n => vec![rng.next() as u8; [0, 4, 8][n - 1]],
             };
-            let d = V3Data::<0> { session: u32::from(u16r(&mut rng)), cookie, payload: body };
-            contract::check_wire_value(&d);
+            macro_rules! data {
+                ($len:expr) => {{
+                    let d = V3Data::<$len> {
+                        session: u32::from(u16r(&mut rng)),
+                        cookie,
+                        payload: body,
+                    };
+                    contract::check_wire_value(&d);
+                }};
+            }
+            match cookie.len() {
+                4 => data!(4),
+                8 => data!(8),
+                _ => data!(0),
+            }
         }
+        assert!(written > 1500, "only {written} messages written");
     }
 
     /// What the fuzz target checks: whatever reads, writes and reads back

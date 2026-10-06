@@ -218,7 +218,8 @@ pub enum Error {
     Reserved([u8; 3]),
     /// The message has the wrong length for its type: not the exact size
     /// of a handshake message, or a transport data message shorter than
-    /// [`MIN_DATA_LEN`] or longer than [`MAX_MESSAGE`].
+    /// [`MIN_DATA_LEN`] or longer than [`MAX_MESSAGE`]. Also used for plaintext
+    /// above [`MAX_PLAINTEXT`], with kind [`message_type::DATA`] and its plaintext length.
     Length {
         /// The type byte.
         kind: u8,
@@ -313,7 +314,7 @@ pub struct Plaintext(
 
 impl Plaintext {
     /// Copies a plaintext and adds the zeros chosen by [padding].
-    /// Refuses a padded length above [MAX_PLAINTEXT] or allocation failure.
+    /// Refuses a padded length above [`MAX_PLAINTEXT`] or allocation failure.
     pub fn padded(plaintext: &[u8], mtu: usize) -> Result<Self, Error> {
         let padded = plaintext.len().checked_add(padding(plaintext.len(), mtu)).ok_or(Error::Unwritable)?;
         if padded > MAX_PLAINTEXT { return Err(Error::Unwritable); }
@@ -329,7 +330,7 @@ impl Wire for Plaintext {
     type ParseError = Error;
     type WriteError = Error;
 
-    /// Keeps every byte, including zeros. Refuses input above [MAX_PLAINTEXT].
+    /// Keeps every byte, including zeros. Refuses input above [`MAX_PLAINTEXT`].
     fn parse(b: &[u8]) -> Result<Self, Error> {
         if b.len() > MAX_PLAINTEXT { return Err(Error::Length { kind: message_type::DATA, len: b.len() }); }
         Ok(Self(b.to_vec()))
@@ -542,9 +543,7 @@ impl Wire for Initiation {
         out.extend_from_slice(&self.encrypted_timestamp);
         out.extend_from_slice(&self.mac1);
         out.extend_from_slice(&self.mac2);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -576,9 +575,7 @@ impl Wire for Response {
         out.extend_from_slice(&self.encrypted_nothing);
         out.extend_from_slice(&self.mac1);
         out.extend_from_slice(&self.mac2);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -600,9 +597,7 @@ impl Wire for CookieReply {
         out.extend_from_slice(&self.receiver.to_le_bytes());
         out.extend_from_slice(&self.nonce);
         out.extend_from_slice(&self.encrypted_cookie);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -629,8 +624,8 @@ impl Wire for Data {
         Ok(Data { receiver, counter, encrypted })
     }
 
-    /// Appends the complete transport message. Refuses ciphertext shorter than TAG_LEN
-    /// or longer than MAX_ENCRYPTED. Leaves the destination unchanged on error.
+    /// Appends the complete transport message. Refuses ciphertext shorter than [`TAG_LEN`]
+    /// or longer than [`MAX_ENCRYPTED`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         let len = DATA_HEADER_LEN.saturating_add(self.encrypted.len());
         if !(TAG_LEN..=MAX_ENCRYPTED).contains(&self.encrypted.len()) {
@@ -640,16 +635,21 @@ impl Wire for Data {
         out.extend_from_slice(&self.receiver.to_le_bytes());
         out.extend_from_slice(&self.counter.to_le_bytes());
         out.extend_from_slice(&self.encrypted);
-        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
+}
+
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), Error> {
+    dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg}};
     use super::*;
+    use fictionet::stdlib::codec::{contract, test_support::Lcg};
 
     fn init() -> Initiation {
         Initiation {

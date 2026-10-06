@@ -223,8 +223,6 @@ impl Version {
     pub fn from_bytes(b: [u8; VERSION_LEN]) -> Version {
         Version { major: b[0], minor: b[1], build: u16::from_le_bytes([b[2], b[3]]), revision: b[7] }
     }
-
-
 }
 
 /// Why bytes are not the message, or the part of one, a reader expected.
@@ -307,7 +305,6 @@ impl std::fmt::Display for EncodeError {
         f.write_str("value cannot be written without changing it")
     }
 }
-
 
 /// One attribute-value pair of a target info list.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -519,7 +516,7 @@ fn check_target_info(t: &[u8]) -> Result<(), ParseError> {
 }
 
 /// Checks that a Unicode string has an even length.
-fn check_text(unicode: bool, data: &[u8], _name: &'static str) -> Result<(), EncodeError> {
+fn check_text(unicode: bool, data: &[u8]) -> Result<(), EncodeError> {
     if unicode && !data.len().is_multiple_of(2) {
         return Err(EncodeError::Unwritable);
     }
@@ -551,9 +548,9 @@ fn written_len(fixed: usize, lens: &[usize]) -> usize {
 /// Appends the payload fields to `out`, which holds the fixed part, and
 /// fills in each field's length, maximum length and offset at its slot.
 /// Each field that is not empty starts at an even offset.
-fn put_fields(out: &mut Vec<u8>, fields: &[(usize, &[u8], &'static str)]) -> Result<(), EncodeError> {
+fn put_fields(out: &mut Vec<u8>, fields: &[(usize, &[u8])]) -> Result<(), EncodeError> {
     let mut lens = [0usize; 6];
-    for (i, &(_, data, _name)) in fields.iter().enumerate() {
+    for (i, &(_, data)) in fields.iter().enumerate() {
         if data.len() > MAX_FIELD {
             return Err(EncodeError::Unwritable);
         }
@@ -566,7 +563,7 @@ fn put_fields(out: &mut Vec<u8>, fields: &[(usize, &[u8], &'static str)]) -> Res
         return Err(EncodeError::Unwritable);
     }
     out.reserve(total - out.len());
-    for &(slot, data, _) in fields {
+    for &(slot, data) in fields {
         if !data.is_empty() && out.len() % 2 == 1 {
             out.push(0);
         }
@@ -659,8 +656,6 @@ impl Authenticate {
     fn fields(&self) -> [&[u8]; 6] {
         [&self.lm_response, &self.nt_response, &self.domain, &self.user, &self.workstation, &self.session_key]
     }
-
-
 }
 
 impl Message {
@@ -745,13 +740,13 @@ impl Wire for UnicodeName {
     type ParseError = ParseError;
     type WriteError = EncodeError;
 
-    /// Reads the whole name. Refuses invalid UTF-16 or more than MAX_FIELD bytes.
+    /// Reads the whole name. Refuses invalid UTF-16 or more than [`MAX_FIELD`] bytes.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
         if b.len() > MAX_FIELD { return Err(ParseError::TooLong); }
         decode_utf16le(b).map(Self).ok_or(ParseError::Unicode)
     }
 
-    /// Appends UTF-16LE. Refuses names above MAX_FIELD bytes or allocation failure.
+    /// Appends UTF-16LE. Refuses names above [`MAX_FIELD`] bytes or allocation failure.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         let len = self.0.encode_utf16().count().checked_mul(2).ok_or(EncodeError::Unwritable)?;
         if len > MAX_FIELD { return Err(EncodeError::Unwritable); }
@@ -874,11 +869,8 @@ fn write_pairs(pairs: &[AvPair], dst: &mut Vec<u8>) -> Result<(), EncodeError> {
             out.extend_from_slice(&(p.value.len() as u16).to_le_bytes());
             out.extend_from_slice(&p.value);
         }
-        out.extend_from_slice(&[0, 0, 0, 0]);
-        dst.try_reserve(out.len()).map_err(|_| EncodeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
-
+    out.extend_from_slice(&[0, 0, 0, 0]);
+    commit(dst, &out)
 }
 
 impl Wire for AvPairs {
@@ -886,7 +878,7 @@ impl Wire for AvPairs {
     type WriteError = EncodeError;
 
     /// Reads a complete AV list and its end marker. Refuses a missing marker,
-    /// invalid values for defined IDs, excess pair counts, lists above MAX_FIELD
+    /// invalid values for defined IDs, excess pair counts, lists above [`MAX_FIELD`]
     /// and trailing bytes. Unknown IDs keep their complete values.
     fn parse(b: &[u8]) -> Result<Self, ParseError> {
         let (pairs, used) = Self::parse_prefix(b)?;
@@ -931,10 +923,8 @@ impl Wire for Negotiate {
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         check_version(self.flags, self.version)?;
         let mut out = start(message_type::NEGOTIATE, NEGOTIATE_HEADER_LEN, 12, self.flags, self.version);
-        put_fields(&mut out, &[(16, &self.domain, "domain"), (24, &self.workstation, "workstation")])?;
-        dst.try_reserve(out.len()).map_err(|_| EncodeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        put_fields(&mut out, &[(16, &self.domain), (24, &self.workstation)])?;
+        commit(dst, &out)
     }
 }
 
@@ -975,16 +965,20 @@ impl Wire for Challenge {
     /// flags and version, and fields the flags would hide. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         check_version(self.flags, self.version)?;
-        check_text(self.flags & flags::NEGOTIATE_UNICODE != 0, &self.target_name, "target name")?;
+        check_text(
+            self.flags & flags::NEGOTIATE_UNICODE != 0,
+            &self.target_name,
+        )?;
         if self.target_info.len() <= MAX_FIELD && check_target_info(&self.target_info).is_err() {
             return Err(EncodeError::Unwritable);
         }
         let mut out = start(message_type::CHALLENGE, CHALLENGE_HEADER_LEN, 20, self.flags, self.version);
         out[24..32].copy_from_slice(&self.server_challenge);
-        put_fields(&mut out, &[(12, &self.target_name, "target name"), (40, &self.target_info, "target info")])?;
-        dst.try_reserve(out.len()).map_err(|_| EncodeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        put_fields(
+            &mut out,
+            &[(12, &self.target_name), (40, &self.target_info)],
+        )?;
+        commit(dst, &out)
     }
 }
 
@@ -1046,9 +1040,9 @@ impl Wire for Authenticate {
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         check_version(self.flags, self.version)?;
         let unicode = self.flags & flags::NEGOTIATE_UNICODE != 0;
-        check_text(unicode, &self.domain, "domain")?;
-        check_text(unicode, &self.user, "user")?;
-        check_text(unicode, &self.workstation, "workstation")?;
+        check_text(unicode, &self.domain)?;
+        check_text(unicode, &self.user)?;
+        check_text(unicode, &self.workstation)?;
         if self.nt_response.len() <= MAX_FIELD && NtResponse::parse(&self.nt_response).is_err() {
             return Err(EncodeError::Unwritable);
         }
@@ -1058,14 +1052,12 @@ impl Wire for Authenticate {
             out.extend_from_slice(&m);
         }
         let data = self.fields();
-        let mut fields = [(0usize, &[][..], ""); 6];
+        let mut fields = [(0usize, &[][..]); 6];
         for (i, f) in fields.iter_mut().enumerate() {
-            *f = (AUTH_FIELDS[i].0, data[i], AUTH_FIELDS[i].1);
+            *f = (AUTH_FIELDS[i].0, data[i]);
         }
         put_fields(&mut out, &fields)?;
-        dst.try_reserve(out.len()).map_err(|_| EncodeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1102,7 +1094,6 @@ impl Wire for Message {
             Message::Challenge(m) => m.write(dst),
             Message::Authenticate(m) => m.write(dst),
         }
-
     }
 }
 
@@ -1128,9 +1119,7 @@ impl Wire for LmV2Response {
         let mut out = [0u8; V1_RESPONSE_LEN];
         out[..16].copy_from_slice(&self.response);
         out[16..].copy_from_slice(&self.client_challenge);
-        dst.try_reserve(out.len()).map_err(|_| EncodeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1161,7 +1150,7 @@ impl Wire for NtResponse {
     }
 
     /// Appends the selected response. Refuses invalid NTLMv2 versions, AV pairs and
-    /// lengths above MAX_FIELD. Leaves the destination unchanged on error.
+    /// lengths above [`MAX_FIELD`]. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         match self {
             Self::Empty => Ok(()),
@@ -1232,9 +1221,7 @@ impl Wire for NtlmV2Response {
         let mut out = Vec::new();
         out.extend_from_slice(&self.nt_proof);
         self.client.write(&mut out)?;
-        dst.try_reserve(out.len()).map_err(|_| EncodeError::Unwritable)?;
-        dst.extend_from_slice(&out);
-        Ok(())
+        commit(dst, &out)
     }
 }
 
@@ -1254,7 +1241,7 @@ impl Wire for AvPair {
         Ok(Self { id, value: b[4..].to_vec() })
     }
 
-    /// Appends one pair. Refuses invalid values, lengths above MAX_FIELD and nonempty end markers.
+    /// Appends one pair. Refuses invalid values, lengths above [`MAX_FIELD`] and nonempty end markers.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         if self.value.len() > MAX_FIELD - 4 || !av_value_fits(self.id, &self.value)
             || (self.id == av_id::EOL && !self.value.is_empty()) {
@@ -1305,6 +1292,14 @@ impl Wire for Version {
 
 impl std::error::Error for EncodeError {}
 
+/// Appends staged bytes after reserving space. Refuses allocation failure.
+fn commit(dst: &mut Vec<u8>, out: &[u8]) -> Result<(), EncodeError> {
+    dst.try_reserve(out.len())
+        .map_err(|_| EncodeError::Unwritable)?;
+    dst.extend_from_slice(out);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
@@ -1330,8 +1325,7 @@ mod tests {
         assert_eq!(c.server_challenge, [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
         assert_eq!(c.version, Some(Version { major: 6, minor: 0, build: 6000, revision: NTLMSSP_REVISION_W2K3 }));
         assert_eq!(UnicodeName::parse(&c.target_name).ok().map(|name| name.0).as_deref(), Some("Server"));
-        let (pairs, used) = AvPairs::parse(&c.target_info).map(|value| (value.0, c.target_info.len())).unwrap();
-        assert_eq!(used, c.target_info.len());
+        let AvPairs(pairs) = AvPairs::parse(&c.target_info).unwrap();
         assert_eq!(
             pairs,
             vec![
@@ -1383,7 +1377,10 @@ mod tests {
         assert_eq!(v2.client.challenge, [0xaa; 8]);
         // The client copied the server's target info into its blob.
         let c = Challenge::parse(&SPEC_CHALLENGE).unwrap();
-        assert_eq!(v2.client.av_pairs, AvPairs::parse(&c.target_info).map(|value| (value.0, c.target_info.len())).unwrap().0);
+        assert_eq!(
+            v2.client.av_pairs,
+            AvPairs::parse(&c.target_info).unwrap().0
+        );
         assert_eq!(v2.client.trailing, vec![0; 4]);
         assert_eq!(NtResponse::V2(v2).to_bytes().unwrap(), a.nt_response);
         // Written back, the fields are in another order, and read the same.
@@ -1493,15 +1490,21 @@ mod tests {
 
     #[test]
     fn av_pair_errors() {
-        assert_eq!(AvPairs::parse(&[]).map(|value| (value.0, 0)), Err(ParseError::AvPairs));
-        assert_eq!(AvPairs::parse(&[0, 0, 0]).map(|value| (value.0, [0, 0, 0].len())), Err(ParseError::AvPairs));
-        assert_eq!(AvPairs::parse(&[0, 0, 1, 0, 9]).map(|value| (value.0, [0, 0, 1, 0, 9].len())), Err(ParseError::AvEolLength(1)));
-        assert_eq!(AvPairs::parse(&[1, 0, 2, 0, 9]).map(|value| (value.0, [1, 0, 2, 0, 9].len())), Err(ParseError::AvPairs));
+        assert_eq!(AvPairs::parse(&[]), Err(ParseError::AvPairs));
+        assert_eq!(AvPairs::parse(&[0, 0, 0]), Err(ParseError::AvPairs));
+        assert_eq!(
+            AvPairs::parse(&[0, 0, 1, 0, 9]),
+            Err(ParseError::AvEolLength(1))
+        );
+        assert_eq!(AvPairs::parse(&[1, 0, 2, 0, 9]), Err(ParseError::AvPairs));
         assert_eq!(AvPairs::parse(&[0, 0, 0, 0, 7]), Err(ParseError::Trailing));
         // An ID the specification does not define keeps any value.
         assert_eq!(
-            AvPairs::parse(&[0x40, 0, 1, 0, 9, 0, 0, 0, 0]).map(|value| (value.0, [0x40, 0, 1, 0, 9, 0, 0, 0, 0].len())),
-            Ok((vec![AvPair { id: 0x40, value: vec![9] }], 9))
+            AvPairs::parse(&[0x40, 0, 1, 0, 9, 0, 0, 0, 0]),
+            Ok(AvPairs(vec![AvPair {
+                id: 0x40,
+                value: vec![9]
+            }]))
         );
         let many = vec![AvPair { id: 1, value: Vec::new() }; MAX_AV_PAIRS + 1];
         assert_eq!(AvPairs(many.to_vec()).to_bytes(), Err(EncodeError::Unwritable));
@@ -1510,8 +1513,8 @@ mod tests {
             b.extend_from_slice(&[1, 0, 0, 0]);
         }
         b.extend_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(AvPairs::parse(&b).map(|value| (value.0, b.len())), Err(ParseError::TooManyAvPairs));
-        assert_eq!(AvPairs::parse(&b[4..]).map(|value| (value.0, b[4..].len())).unwrap().0.len(), MAX_AV_PAIRS);
+        assert_eq!(AvPairs::parse(&b), Err(ParseError::TooManyAvPairs));
+        assert_eq!(AvPairs::parse(&b[4..]).unwrap().0.len(), MAX_AV_PAIRS);
         assert_eq!(AvPairs(vec![AvPair { id: 0, value: Vec::new() }]).to_bytes(), Err(EncodeError::Unwritable));
         let big = AvPair { id: 1, value: vec![0; 65536] };
         assert_eq!(AvPairs([big].to_vec()).to_bytes(), Err(EncodeError::Unwritable));
@@ -1773,7 +1776,7 @@ mod tests {
         }
         let list = AvPairs([AvPair { id: 2, value: vec![1, 2, 3, 4] }].to_vec()).to_bytes().unwrap();
         for n in 0..list.len() {
-            assert!(AvPairs::parse(&list[..n]).map(|value| (value.0, list[..n].len())).is_err());
+            assert!(AvPairs::parse(&list[..n]).is_err());
         }
     }
 
@@ -1885,7 +1888,10 @@ mod tests {
     #[test]
     fn av_values_have_the_length_their_id_allows() {
         // \[MS-NLMP\] 2.2.2.1: MsvAvFlags is a 32-bit value.
-        assert_eq!(AvPairs::parse(&[6, 0, 1, 0, 2, 0, 0, 0, 0]).map(|value| (value.0, [6, 0, 1, 0, 2, 0, 0, 0, 0].len())), Err(ParseError::AvValue(av_id::FLAGS)));
+        assert_eq!(
+            AvPairs::parse(&[6, 0, 1, 0, 2, 0, 0, 0, 0]),
+            Err(ParseError::AvValue(av_id::FLAGS))
+        );
         for (id, len) in [(av_id::FLAGS, 4), (av_id::TIMESTAMP, 8), (av_id::CHANNEL_BINDINGS, 16)] {
             for n in [0, 1, len - 1, len + 1] {
                 let p = AvPair { id, value: vec![0; n] };
@@ -1893,12 +1899,15 @@ mod tests {
             }
             let p = AvPair { id, value: vec![0; len] };
             let list = AvPairs(vec![p.clone()]).to_bytes().unwrap();
-            assert_eq!(AvPairs::parse(&list).map(|value| (value.0, list.len())), Ok((vec![p], list.len())));
+            assert_eq!(AvPairs::parse(&list), Ok(AvPairs(vec![p])));
         }
         // Names are UTF-16LE, so of even length.
         for id in [1, 2, 3, 4, 5, 9] {
             assert_eq!(AvPairs([AvPair { id, value: vec![b'A'] }].to_vec()).to_bytes(), Err(EncodeError::Unwritable));
-            assert_eq!(AvPairs::parse(&[id as u8, 0, 1, 0, b'A', 0, 0, 0, 0]).map(|value| (value.0, [id as u8, 0, 1, 0, b'A', 0, 0, 0, 0].len())), Err(ParseError::AvValue(id)));
+            assert_eq!(
+                AvPairs::parse(&[id as u8, 0, 1, 0, b'A', 0, 0, 0, 0]),
+                Err(ParseError::AvValue(id))
+            );
         }
     }
 
@@ -1957,7 +1966,7 @@ mod tests {
         let fits = [AvPair { id: 0x40, value: vec![0; MAX_FIELD - 8] }];
         let list = AvPairs(fits.to_vec()).to_bytes().unwrap();
         assert_eq!(list.len(), MAX_FIELD);
-        assert_eq!(AvPairs::parse(&list).map(|value| (value.0, list.len())).unwrap().1, MAX_FIELD);
+        assert_eq!(AvPairs::parse(&list), Ok(AvPairs(fits.to_vec())));
         // A list read from a longer slice stops at that limit.
         let mut b = Vec::new();
         for _ in 0..2 {
@@ -1965,11 +1974,11 @@ mod tests {
             b.extend_from_slice(&[0; 40000]);
         }
         b.extend_from_slice(&[0, 0, 0, 0]);
-        assert_eq!(AvPairs::parse(&b).map(|value| (value.0, b.len())), Err(ParseError::TooLong));
+        assert_eq!(AvPairs::parse(&b), Err(ParseError::TooLong));
         let mut over = list.clone();
         over[2..4].copy_from_slice(&((MAX_FIELD - 8) as u16 + 1).to_le_bytes());
         over.push(0);
-        assert_eq!(AvPairs::parse(&over).map(|value| (value.0, over.len())), Err(ParseError::TooLong));
+        assert_eq!(AvPairs::parse(&over), Err(ParseError::TooLong));
     }
 
     trait Samples {
@@ -2090,7 +2099,7 @@ mod tests {
             {
                 let pairs = c.target_info_pairs().unwrap();
                 let list = AvPairs(pairs.to_vec()).to_bytes().unwrap();
-                assert_eq!(AvPairs::parse(&list).map(|value| (value.0, list.len())), Ok((pairs, list.len())));
+                assert_eq!(AvPairs::parse(&list), Ok(AvPairs(pairs)));
             }
             if let Message::Authenticate(a) = &m {
                 let nt = a.nt().unwrap();
@@ -2100,10 +2109,9 @@ mod tests {
         if let Ok(nt) = NtResponse::parse(b) {
             assert_eq!(NtResponse::parse(&nt.to_bytes().unwrap()), Ok(nt));
         }
-        if let Ok((pairs, used)) = AvPairs::parse(b).map(|value| (value.0, (b).len())) {
-            assert!(used <= b.len());
+        if let Ok(AvPairs(pairs)) = AvPairs::parse(b) {
             let list = AvPairs(pairs.to_vec()).to_bytes().unwrap();
-            assert_eq!(AvPairs::parse(&list).map(|value| (value.0, list.len())), Ok((pairs, list.len())));
+            assert_eq!(AvPairs::parse(&list), Ok(AvPairs(pairs)));
         }
         if let Ok(r) = LmV2Response::parse(b) {
             assert_eq!(r.to_bytes().unwrap(), b);

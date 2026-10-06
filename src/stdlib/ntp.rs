@@ -235,8 +235,6 @@ impl Timestamp {
     fn read(b: &[u8], i: usize) -> Timestamp {
         Timestamp { seconds: be32(b, i), fraction: be32(b, i + 4) }
     }
-
-
 }
 
 /// A kiss code: the four ASCII letters a stratum-0 server puts where the
@@ -651,7 +649,7 @@ impl Wire for Packet {
         })
     }
 
-    /// Appends the packet. Refuses versions outside 1 to 7, trailers above MAX_TRAILER,
+    /// Appends the packet. Refuses versions outside 1 to 7, trailers above [`MAX_TRAILER`],
     /// and trailer lengths that are not multiples of four. Leaves the destination unchanged on error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
         if !(1..=7).contains(&self.version) || self.trailer.len() > MAX_TRAILER || !self.trailer.len().is_multiple_of(4) {
