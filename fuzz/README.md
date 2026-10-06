@@ -23,6 +23,12 @@ cargo +nightly fuzz list
 | `observe_dhcp` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Dhcp` |
 | `observe_http1` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::Http1` |
 | `observe_tls` | Capture bytes with codec contract checks for chunking, EOF, and bounds | `observe::protocols::TlsRecords` |
+| `codec_tools` | arbitrary Modbus/TCP, JSON, and line streams, byte edits, and seeded item plans | `codec`: one-pass recording with Forward and empty fault plans equals consumed input for JSON, Lines, Modbus, and Pipe; transactional replacement, recorder bounds, skip and failure events, and repeatable fault output |
+| `codec_tools` / Hold | every 11th item held for two later items, then EOF flush | held count and byte limits, release order, transactional flush |
+| `codec_tools` / Split | every 17th byte call split at offset 2 with a delay | two pushes with a delay marker at their boundary |
+| `codec_tools` / range Drop | every 19th byte call removes bytes 1..4 | clamped range edits and retained prefix/suffix |
+| `codec_tools` / range Repeat | every 23rd byte call repeats bytes 1..3 three times | range repetition under the output limit |
+| `codec_tools` / delayed Raw | item calls 2..=3 replace bytes with a delay | combined action, call window, raw replacement |
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |

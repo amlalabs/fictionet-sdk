@@ -1505,11 +1505,11 @@ impl Wire for ResponseData {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, chunks, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{chunks, mutate},
+    };
 
     fn cert_id(serial: &[u8]) -> CertId {
         CertId {

@@ -2223,8 +2223,11 @@ wire_value!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
     use fictionet::stdlib::codec::{Fail, Stream, contract};
+    use fictionet::stdlib::codec::{
+        Lcg,
+        test_support::{decode_all, mutate},
+    };
 
     fn wire_text<T: Wire<WriteError = Error>>(value: &T) -> Result<String, Error> {
         String::from_utf8(value.to_bytes()?).map_err(|_| Error::Utf8)

@@ -1,12 +1,10 @@
 //! RESP values, commands, custom limits, and strict writer contracts.
 #![no_main]
 
-use fictionet::stdlib::codec::{
-    Decode, Fail, Wire, contract,
-    test_support::{Lcg, decode_all},
-};
+use fictionet::stdlib::codec::{Decode, Fail, Lcg, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::resp::{
-    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, ParseError, Resp2, Value, Values, WireError,
+    Command, Commands, Limits, MAX_FRAME_LEN, MAX_LINE_LEN, ParseError, Resp2, Value, Values,
+    WireError,
 };
 use libfuzzer_sys::fuzz_target;
 

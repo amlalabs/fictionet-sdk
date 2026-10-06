@@ -1873,8 +1873,8 @@ fn fmt_double(f: f64) -> String {
 mod tests {
     use super::*;
     use codec::{
-        Step as Decoded, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, Step as Decoded, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     fn value_step(b: &[u8], limits: Limits) -> Result<Decoded<Value>, ParseError> {

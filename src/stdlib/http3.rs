@@ -2223,11 +2223,11 @@ impl Connection {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        contract, Fail, Stream,
-        test_support::{decode_all, Lcg, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
+    };
 
     fn event(state: &mut RequestState, frame: Frame, table: &qpack::Table) -> Result<Event, Error> {
         match state.step(&frame, table)? {

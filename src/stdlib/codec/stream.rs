@@ -35,6 +35,43 @@ impl<E: fmt::Display> fmt::Display for Fail<E> {
 }
 impl<E: Error> Error for Fail<E> {}
 
+/// A borrowed observation made before the driver releases bytes.
+/// Ranges use this stream's offsets and saturate at `u64::MAX`.
+/// Inner items released from held state have empty bytes and ranges.
+#[derive(Debug)]
+pub enum StreamEvent<'a, T, E> {
+    /// A decoded item and exactly the bytes consumed by its step.
+    Item {
+        /// The decoded value, including recoverable errors represented as items.
+        item: &'a T,
+        /// Original consumed bytes. These have not been re-encoded.
+        bytes: &'a [u8],
+        /// Consumed stream coordinates.
+        range: Range<u64>,
+    },
+    /// Bytes consumed without an item. Zero-byte transitions are included.
+    Skipped {
+        /// Original skipped bytes.
+        bytes: &'a [u8],
+        /// Skipped stream coordinates.
+        range: Range<u64>,
+    },
+    /// Clean completion, including EOF with no unread bytes.
+    Ended {
+        /// First unread byte. Any remaining suffix belongs to a handoff.
+        offset: u64,
+    },
+    /// A terminal failure. Reported once, just like the returned error.
+    Failed {
+        /// The error retained by the stream.
+        error: &'a Fail<E>,
+        /// The unread bytes at failure. They remain available for handoff.
+        bytes: &'a [u8],
+        /// Coordinates of those unread bytes.
+        range: Range<u64>,
+    },
+}
+
 /// One decoder and its bounded input buffer.
 ///
 /// A terminal error is returned once. Later calls return no items and
@@ -184,6 +221,18 @@ where
         &mut self,
         f: impl FnOnce(D::Item, &[u8], Range<u64>) -> R,
     ) -> Option<Result<R, Fail<D::Error>>> {
+        self.with_next_observed(f, |_| {})
+    }
+    /// Like [`with_next`](Self::with_next), with borrowed observations of
+    /// items, skips, clean completion, and failure. Observations occur in
+    /// decoding order, before consuming bytes and before calling `f`.
+    /// Completion and failure are each observed only on their first call.
+    /// Waiting for input emits nothing and copies no bytes.
+    pub fn with_next_observed<R>(
+        &mut self,
+        f: impl FnOnce(D::Item, &[u8], Range<u64>) -> R,
+        mut observe: impl FnMut(StreamEvent<'_, D::Item, D::Error>),
+    ) -> Option<Result<R, Fail<D::Error>>> {
         if self.done {
             return None;
         }
@@ -193,12 +242,12 @@ where
             let before = self.dec.held();
             let step = match self.dec.decode(self.buf.unread(), self.eof) {
                 Ok(step) => step,
-                Err(e) => return self.fail(Fail::Protocol(e)),
+                Err(e) => return self.fail_observed(Fail::Protocol(e), &mut observe),
             };
             match &step {
                 Step::Item(_, n) | Step::Skip(n) => {
                     if *n > self.buf.len() {
-                        return self.fail(self.stuck());
+                        return self.fail_observed(self.stuck(), &mut observe);
                     }
                     if matches!(step, Step::Skip(0)) {
                         // Items return to the caller and need no loop allowance.
@@ -211,20 +260,27 @@ where
                         *budget = budget.saturating_add(after.saturating_sub(*high));
                         *high = (*high).max(after);
                         let Some(left) = budget.checked_sub(1) else {
-                            return self.fail(self.stuck());
+                            return self.fail_observed(self.stuck(), &mut observe);
                         };
                         *budget = left;
                     } else {
                         zero_budget = None;
                     }
                 }
-                Step::Need if self.dec.held() > before => return self.fail(self.stuck()),
+                Step::Need if self.dec.held() > before => {
+                    return self.fail_observed(self.stuck(), &mut observe);
+                }
                 _ => {}
             }
             match step {
                 Step::Item(item, n) => {
                     let start = self.buf.offset();
                     let end = start.saturating_add(u64::try_from(n).unwrap_or(u64::MAX));
+                    observe(StreamEvent::Item {
+                        item: &item,
+                        bytes: self.buf.unread().get(..n).unwrap_or_default(),
+                        range: start..end,
+                    });
                     let result = f(
                         item,
                         self.buf.unread().get(..n).unwrap_or_default(),
@@ -233,28 +289,57 @@ where
                     self.buf.consume(n);
                     return Some(Ok(result));
                 }
-                Step::Skip(n) => self.buf.consume(n),
+                Step::Skip(n) => {
+                    let start = self.buf.offset();
+                    observe(StreamEvent::Skipped {
+                        bytes: self.buf.unread().get(..n).unwrap_or_default(),
+                        range: start..start.saturating_add(u64::try_from(n).unwrap_or(u64::MAX)),
+                    });
+                    self.buf.consume(n);
+                }
                 Step::Need => {
                     if self.eof {
                         if self.buf.is_empty() {
                             self.done = true;
+                            observe(StreamEvent::Ended {
+                                offset: self.offset(),
+                            });
                             return None;
                         }
-                        return self.fail(Fail::Truncated {
-                            unread: self.buf.len(),
-                        });
+                        return self.fail_observed(
+                            Fail::Truncated {
+                                unread: self.buf.len(),
+                            },
+                            &mut observe,
+                        );
                     }
                     if self.buf.len() >= self.dec.capacity() || self.buf.room() == 0 {
-                        return self.fail(self.stuck());
+                        return self.fail_observed(self.stuck(), &mut observe);
                     }
                     return None;
                 }
                 Step::End => {
                     self.done = true;
+                    observe(StreamEvent::Ended {
+                        offset: self.offset(),
+                    });
                     return None;
                 }
             }
         }
+    }
+    fn fail_observed<R>(
+        &mut self,
+        fail: Fail<D::Error>,
+        observe: &mut impl FnMut(StreamEvent<'_, D::Item, D::Error>),
+    ) -> Option<Result<R, Fail<D::Error>>> {
+        let start = self.offset();
+        observe(StreamEvent::Failed {
+            error: &fail,
+            bytes: self.unread(),
+            range: start..start.saturating_add(u64::try_from(self.buffered()).unwrap_or(u64::MAX)),
+        });
+        self.fail(fail)
     }
 }
 

@@ -1475,7 +1475,10 @@ fn be32(b: &[u8], i: usize) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
+    };
 
     fn id(s: &str) -> Identity {
         Identity::new(s).unwrap()

@@ -2422,8 +2422,8 @@ fn show_tag(t: u8) -> String {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     #[test]

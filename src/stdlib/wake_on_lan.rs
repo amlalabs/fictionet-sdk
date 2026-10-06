@@ -358,8 +358,8 @@ pub fn wakes(payload: &[u8], mac: Mac, password: Option<&Password>) -> bool {
 mod tests {
     use super::*;
     use codec::{
-        Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     const MAC: Mac = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];

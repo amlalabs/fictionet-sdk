@@ -1690,8 +1690,8 @@ fn write_domain(out: &mut String, s: &str, err: Error, spaces: bool) -> Result<(
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     fn mailbox(name: Option<&str>, local: &str, domain: &str) -> Mailbox {

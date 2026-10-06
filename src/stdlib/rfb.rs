@@ -2029,7 +2029,10 @@ fn rectangle(c: &mut Cur<'_>, format: &PixelFormat) -> Result<Rectangle, Stop> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{contract, test_support::{Lcg, chunks, decode_all, mutate}};
+    use codec::{
+        Lcg, contract,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     /// Runs a server and a client session against each other, passing
     /// every message through bytes, and checks each side reads what the

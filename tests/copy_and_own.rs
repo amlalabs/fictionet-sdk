@@ -17,6 +17,14 @@ macro_rules! protocols {
         pub mod observe_tls;
         #[path = "../src/observe/conversation.rs"]
         pub mod observe_conversation;
+        #[path = "../src/stdlib/codec/interceptor.rs"]
+        pub mod interceptor;
+        #[path = "../src/stdlib/codec/recorder.rs"]
+        pub mod recorder;
+        #[path = "../src/stdlib/codec/faults.rs"]
+        pub mod faults;
+        #[path = "../src/stdlib/codec/lcg.rs"]
+        pub mod lcg;
         #[path = "../src/stdlib/amqp.rs"]
         pub mod amqp;
         #[path = "../src/stdlib/asn1.rs"]

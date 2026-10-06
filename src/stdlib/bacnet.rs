@@ -2002,7 +2002,7 @@ impl Wire for Values {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{contract, test_support::Lcg};
+    use fictionet::stdlib::codec::{Lcg, contract};
 
     fn hex(s: &str) -> Vec<u8> {
         let s: String = s.split_whitespace().collect();

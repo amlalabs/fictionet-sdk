@@ -2176,7 +2176,10 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract, finish, pump,
+        test_support::{decode_all, mutate},
+    };
 
     enum BodyCase {
         Request(Request),

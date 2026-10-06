@@ -1415,7 +1415,10 @@ fn be16(b: &[u8], i: usize) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{Decode, Fail, Stream, contract, test_support::{Lcg, chunks, decode_all, mutate}};
+    use codec::{
+        Decode, Fail, Lcg, Stream, contract,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     fn request() -> Request {
         Request { command: Command::Connect, address: Address::Ipv4(Ipv4Addr::new(192, 168, 1, 2)), port: 8080 }

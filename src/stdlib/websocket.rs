@@ -1546,8 +1546,8 @@ fn base64_value(c: u8) -> Option<u8> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        AssembleError, Decode, Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        AssembleError, Decode, Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     // RFC 6455 section 5.7.

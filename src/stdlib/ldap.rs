@@ -2553,11 +2553,11 @@ fn declared_total(b: &[u8]) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, chunks, decode_all, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     fn msg(id: u32, op: Op) -> Message {
         Message {

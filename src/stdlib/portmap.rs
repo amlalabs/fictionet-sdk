@@ -1092,10 +1092,10 @@ fn write_list<T>(
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::onc_rpc::{MAX_RECORD, Record, records};
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
+    use fictionet::stdlib::onc_rpc::{MAX_RECORD, Record, records};
 
     fn rpcb(rng: &mut Lcg) -> Rpcb {
         Rpcb {

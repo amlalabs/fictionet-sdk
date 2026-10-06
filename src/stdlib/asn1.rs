@@ -2196,11 +2196,11 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, chunks, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{chunks, mutate},
+    };
 
     /// Writes `e` again with a [`Writer`], if every value in it is one the
     /// writer has a method for. Read under DER, the copy must be the same
