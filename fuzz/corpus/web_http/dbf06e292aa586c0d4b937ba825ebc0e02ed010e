@@ -1,0 +1,10 @@
+4POST /c HTTP/1.1
+Host: other.test
+Transfer-Encoding: ch%nkst
+Transg: chunkstert: oth行行行行行coding: ch%nkst
+Transfert: other.test
+Transfer-Enckding: chunkst
+Transfer-Encodi-Enco悙悙悙悙悙悙悙ding: chunkhunkst
+Transfer-Encodi-Encoding: chunked
+
+

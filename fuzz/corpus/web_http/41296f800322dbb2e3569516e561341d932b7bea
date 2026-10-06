@@ -1,0 +1,18 @@
+4POST /c HTTP/1.1
+Host: other.test
+Transfer-Encodi^^st: /l/b H/1.st
+
+HEAD /b/a HTTP/1.1
+Host: pl
+
+HEAD /b HTTP/1.1
+Host: pl`ain.test
+
+HEAD /b HTTP/1.1
+Host: plafin.test
+
+GET /big HTTP/1.1
+Host: plain.tesTTPHost: /l/b HTTÿÿÿÿÿÿÿÿÿÿrôôôôôôôôôôôôôôôôôôôô^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ÿÿÿÿÿÿÿÿÿÿÿÿÿÿÿššššššššššššššššššššššššššššššššššššššššššôôôôrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrPUT /e HTTP/1.2
+2.0Host: bo
+
+ÿÿÿÿth.ÿt

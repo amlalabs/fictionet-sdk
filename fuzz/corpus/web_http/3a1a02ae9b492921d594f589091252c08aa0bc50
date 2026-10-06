@@ -1,0 +1,15 @@
+4POST /c HTTP/1.1
+Host: other.test
+Transfer-Encoding: ch%nkst
+Transfert: other.test
+Transfer-Enckding: ct
+Transfer-Encoding: ch%nkPUT /e HTTP/1.1
+Host: both*test
+
+Expect: 100-const
+Transfert: other.test
+Transfer-Enckding:ÿÿÿÿÿÿÿ
+Transfer-Encodi-Eÿÿÿÿÿÿÿÿ chunkhunkst
+Transfer-Encodi-Encoding: chunked
+
+

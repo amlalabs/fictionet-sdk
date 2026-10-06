@@ -1,0 +1,16 @@
+4POST /c HTTP/1.1
+Host: other.test
+Transfer-Encoding: ch%nkst
+Transfrt: other.test
+Transfer-Enckding: ct
+Transfmr-Encoding: ch%nkPUT /e HTTP/1.1
+Host: both*tesŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽt
+Expect: 100-const
+Transfert: o: other.test
+Transfer-Enckding: ct
+Transfmr-Encoding: ch%nkPUT /e HTTP/1.1
+Host: both*tesŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽŽther.test
+Transfer-Enckdin-Encodi-Encoding: chunkhunkst
+Transfer-Encodi-Encoding: chunked
+
+
