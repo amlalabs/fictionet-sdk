@@ -32,6 +32,9 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(Packet::parse(&bytes), Ok(p.clone()));
     }
     contract::check_wire::<Name>(data);
+    if let Ok(name) = Name::parse(data) {
+        assert_eq!(name.to_bytes().unwrap(), data);
+    }
     let _ = decode_first_level(data);
 
     // Values built from the bytes, not read: each either writes bytes

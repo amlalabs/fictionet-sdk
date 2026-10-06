@@ -3,10 +3,11 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::codec::{Decode, Step, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::dcerpc::{
-    Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error, Frames,
-    MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SyntaxId, Uuid, flags,
+    AUTH_PAD_ALIGN, Auth, Bind, BindAck, BindNak, Body, Context, ContextResult, DataRep, Error,
+    Frames, MAX_FRAG, MAX_FRAGMENTS, Pdu, Reassembler, ReassemblyError, SEC_TRAILER_LEN, SyntaxId,
+    Uuid, flags,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -19,7 +20,27 @@ fn rewrite(pdu: &Pdu) {
             assert!(bytes.len() <= MAX_FRAG);
             assert_eq!(Pdu::parse(&bytes), Ok(pdu.clone()));
         }
-        Err(e) => assert_eq!(e, Error::Unwritable),
+        Err(e) => {
+            assert_eq!(e, Error::Unwritable);
+            let mut bare = pdu.clone();
+            let auth = bare
+                .auth
+                .take()
+                .expect("only auth padding can exceed the limit");
+            let reserved = if matches!(bare.body, Body::Auth3) {
+                bare.body = Body::Shutdown;
+                4
+            } else {
+                0
+            };
+            let length = bare.to_bytes().unwrap().len() + reserved;
+            let (alignment, padded) = pdu
+                .body
+                .stub()
+                .map_or((4, length), |stub| (AUTH_PAD_ALIGN, stub.len()));
+            let padding = (alignment - padded % alignment) % alignment;
+            assert!(length + padding + SEC_TRAILER_LEN + auth.value.len() > MAX_FRAG);
+        }
     }
 }
 
@@ -213,6 +234,22 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode_with_alloc_limit(|| Frames::with_limit(64), data, 2 * Frames::with_limit(64).capacity());
 
     let (results, _) = decode_all(Frames::new, data);
+    let mut rest = data;
+    for result in &results {
+        let length = Pdu::frame_length(rest).unwrap().unwrap();
+        let (raw, tail) = rest.split_at(length);
+        assert_eq!(
+            Frames::new().decode(raw, false),
+            Ok(Step::Item(result.clone(), length))
+        );
+        // Exact parsing also checks that the canonical rewrite fits.
+        let exact = result.clone().and_then(|pdu| {
+            pdu.to_bytes()?;
+            Ok(pdu)
+        });
+        assert_eq!(Pdu::parse(raw), exact);
+        rest = tail;
+    }
 
     let mut r = Reassembler::new(4096);
     for p in results.into_iter().flatten() {

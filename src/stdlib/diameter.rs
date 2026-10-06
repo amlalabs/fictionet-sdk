@@ -407,7 +407,9 @@ pub enum Error {
 }
 
 impl Error {
-    /// The Result-Code a server answers this error with.
+    /// The Result-Code a server answers a read error with.
+    /// [`Error::Unwritable`] is a write-side error and must never produce
+    /// a reply. Its fallback code here is not a response to a peer.
     pub fn result_code(self) -> u32 {
         match self {
             Error::Incomplete | Error::Trailing { .. } | Error::Unwritable => result::INVALID_MESSAGE_LENGTH,
@@ -589,7 +591,6 @@ impl Message {
         }
         Ok(())
     }
-
 }
 
 impl Wire for Message {
@@ -818,7 +819,8 @@ impl Avp {
     /// mandatory flag follows RFC 6733, section 4.5: clear for
     /// Product-Name, Firmware-Revision, Error-Message and
     /// Error-Reporting-Host, and set for every other code. Refuses values
-    /// that exceed the message limit or would read back changed.
+    /// that exceed length or AVP count limits, text containing NUL, UDP
+    /// Diameter URIs, and [`Address::Other`] with an IPv4 or IPv6 family.
     pub fn new(code: u32, value: &Value) -> Result<Avp, Error> {
         let mandatory = !matches!(
             code,
@@ -1147,7 +1149,9 @@ impl Value {
         let limit = MAX_MESSAGE - HEADER_LEN - AVP_HEADER_LEN;
         Ok(match self {
             Value::OctetString(b) => {
-                if b.len() > limit { return Err(Error::Unwritable); }
+                if b.len() > limit {
+                    return Err(Error::Unwritable);
+                }
                 b.clone()
             }
             Value::Integer32(v) | Value::Enumerated(v) => v.to_be_bytes().to_vec(),
@@ -1164,12 +1168,16 @@ impl Value {
             }
             Value::Address(a) => a.to_bytes()?,
             Value::Utf8String(s) => {
-                if s.len() > limit || s.contains('\0') { return Err(Error::Unwritable); }
+                if s.len() > limit || s.contains('\0') {
+                    return Err(Error::Unwritable);
+                }
                 s.as_bytes().to_vec()
             }
             Value::DiameterIdentity(id) => id.as_str().as_bytes().to_vec(),
             Value::DiameterUri(uri) => {
-                if uri.udp_diameter() { return Err(Error::Unwritable); }
+                if uri.udp_diameter() {
+                    return Err(Error::Unwritable);
+                }
                 uri.to_string().into_bytes()
             }
         })
@@ -1201,7 +1209,9 @@ impl Wire for Address {
     /// IPv4 or IPv6 lengths, and values over [`MAX_AVP_DATA`].
     fn parse(d: &[u8]) -> Result<Self, Error> {
         let bad = Error::Value { code: 0, format: Format::Address };
-        if d.len() > MAX_AVP_DATA { return Err(bad); }
+        if d.len() > MAX_AVP_DATA {
+            return Err(bad);
+        }
         let (family, rest) = d.split_first_chunk::<2>().ok_or(bad)?;
         let family = u16::from_be_bytes(*family);
         Ok(match (family, rest.len()) {
@@ -1245,7 +1255,6 @@ impl Address {
     pub const IPV4: u16 = 1;
     /// IANA's address family number for IPv6.
     pub const IPV6: u16 = 2;
-
 }
 
 /// Seconds from 1900, the NTP epoch, to 1970, the Unix epoch.
@@ -1334,8 +1343,9 @@ pub enum AaaProtocol {
 /// Its parts come in this order: the scheme, the FQDN, then an optional
 /// port, transport and protocol. Scheme and parameter names are read
 /// without regard to case and written in lower case. RFC 6733 forbids UDP
-/// with Diameter, the default protocol, so the reader refuses that pair
-/// and the writer leaves such a transport out.
+/// with Diameter, the default protocol. The reader and the AVP writer
+/// refuse that pair. Display still prints `transport=udp` for it, producing
+/// text that [`Uri::parse`] refuses.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Uri {
     /// The `aaas` scheme: the connection uses TLS or DTLS.
@@ -2240,6 +2250,9 @@ mod tests {
         contract::check_wire::<Message>(data);
         contract::check_wire::<Avp>(data);
         contract::check_wire::<Address>(data);
+        if let Ok(address) = Address::parse(data) {
+            assert_eq!(address.to_bytes().unwrap(), data);
+        }
         for message in decode_all(Frames::new, data).0.into_iter().flatten() {
             contract::check_wire_value(&message);
             let _ = check(&message.avps, base);
@@ -2249,6 +2262,9 @@ mod tests {
                 for format in FORMATS {
                     if let Ok(value) = avp.value(format) {
                         let rebuilt = Avp::new(avp.code, &value).unwrap();
+                        if !matches!(format, Format::Grouped | Format::DiameterUri) {
+                            assert_eq!(rebuilt.data, avp.data);
+                        }
                         let reread = rebuilt.value(format).unwrap();
                         assert_eq!(Avp::new(avp.code, &reread).unwrap().data, rebuilt.data);
                     }
@@ -2269,7 +2285,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut r = Lcg::new(0x5eed_d1a3);
-        for round in 0..512 {
+        for round in 0..38_000 {
             let data = match round % 3 {
                 // Random bytes behind a plausible header.
                 0 => {
@@ -2299,7 +2315,7 @@ mod tests {
             exercise(&data);
         }
         // Random AVPs: each value reads back in its own format, to the same bytes.
-        for _ in 0..512 {
+        for _ in 0..38_000 {
             let (a, v) = random_avp(&mut r, 0);
             let back = Avp::parse(&a.to_bytes().unwrap()).unwrap();
             assert_eq!(back, a);
@@ -2307,7 +2323,7 @@ mod tests {
         }
         // Random strings as URIs.
         let alphabet = b"aAs:/;=0123456789.tcpransportoldiemu+x";
-        for _ in 0..512 {
+        for _ in 0..38_000 {
             let mut s = String::from(["aaa://", "aaas://", "AaA://", ""][r.index(4)]);
             for byte in r.bytes(30) {
                 s.push(alphabet[usize::from(byte) % alphabet.len()] as char);

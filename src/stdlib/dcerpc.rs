@@ -780,7 +780,7 @@ impl Pdu {
     /// returns `Ok(None)` until the fragment length has come, and an
     /// error as soon as the bytes so far break the header, from the second
     /// byte on.
-    fn frame_length(b: &[u8]) -> Result<Option<usize>, Error> {
+    pub fn frame_length(b: &[u8]) -> Result<Option<usize>, Error> {
         if b.len() >= 2 && (b[0] != VERSION || b[1] > 1) {
             return Err(Error::Version { major: b[0], minor: b[1] });
         }
@@ -2269,8 +2269,36 @@ mod tests {
             samples.push(p.to_bytes().unwrap());
         }
         let mut rng = Lcg::new(0xdce);
-        for _ in 0..512 {
-            let mut data = if rng.coin() { samples[rng.index(samples.len())].clone() } else { rng.bytes(120) };
+        for _ in 0..60_000 {
+            let mut data = if rng.coin() {
+                let mut bytes = samples[rng.index(samples.len())].clone();
+                if rng.coin() {
+                    bytes.extend_from_slice(&samples[rng.index(samples.len())]);
+                }
+                bytes
+            } else {
+                let mut bytes = rng.bytes(120);
+                if bytes.len() >= HEADER_LEN && rng.coin() {
+                    bytes[0] = VERSION;
+                    bytes[1] = rng.index(2) as u8;
+                    bytes[2] = rng.index(20) as u8;
+                    let le = rng.coin();
+                    bytes[4] = if le { 0x10 } else { 0 };
+                    let length = bytes.len() as u16;
+                    let auth = if rng.coin() { 0 } else { rng.index(32) as u16 };
+                    bytes[8..10].copy_from_slice(&if le {
+                        length.to_le_bytes()
+                    } else {
+                        length.to_be_bytes()
+                    });
+                    bytes[10..12].copy_from_slice(&if le {
+                        auth.to_le_bytes()
+                    } else {
+                        auth.to_be_bytes()
+                    });
+                }
+                bytes
+            };
             mutate(&mut rng, &mut data);
             contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_FRAG);
             contract::check_wire::<Pdu>(&data);
@@ -2281,7 +2309,27 @@ mod tests {
                 // writer's padding or reserved fields make it too long.
                 match p.to_bytes() {
                     Ok(bytes) => assert_eq!(Pdu::parse(&bytes), Ok(p.clone())),
-                    Err(e) => assert_eq!(e, Error::Unwritable),
+                    Err(e) => {
+                        assert_eq!(e, Error::Unwritable);
+                        let mut bare = p.clone();
+                        let auth = bare
+                            .auth
+                            .take()
+                            .expect("only auth padding can exceed the limit");
+                        let reserved = if matches!(bare.body, Body::Auth3) {
+                            bare.body = Body::Shutdown;
+                            4
+                        } else {
+                            0
+                        };
+                        let length = bare.to_bytes().unwrap().len() + reserved;
+                        let (alignment, padded) = p
+                            .body
+                            .stub()
+                            .map_or((4, length), |stub| (AUTH_PAD_ALIGN, stub.len()));
+                        let padding = (alignment - padded % alignment) % alignment;
+                        assert!(length + padding + SEC_TRAILER_LEN + auth.value.len() > MAX_FRAG);
+                    }
                 }
                 if p.auth.is_none()
                     && let Ok(parts) = p.fragments(40 + rng.index(256) as u16)

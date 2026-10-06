@@ -69,8 +69,10 @@ where
 {
     for cut in 1..bytes.len() {
         let mut stream = Stream::new(make());
-        assert_eq!(stream.push(&bytes[..cut]), cut);
-        assert_eq!(stream.next(), None);
+        for byte in &bytes[..cut] {
+            assert_eq!(stream.push(core::slice::from_ref(byte)), 1);
+            assert_eq!(stream.next(), None);
+        }
         stream.end();
         let failure = Fail::Truncated { unread: cut };
         assert_eq!(stream.next(), Some(Err(failure.clone())));
@@ -92,7 +94,11 @@ where
     contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
     let mut stream = Stream::new(make());
     let failure = Fail::Protocol(error);
-    assert_eq!(stream.push(bytes), bytes.len());
+    for byte in &bytes[..bytes.len() - 1] {
+        assert_eq!(stream.push(core::slice::from_ref(byte)), 1);
+        assert_eq!(stream.next(), None);
+    }
+    assert_eq!(stream.push(&bytes[bytes.len() - 1..]), 1);
     assert_eq!(stream.next(), Some(Err(failure.clone())));
     assert_eq!(stream.failed(), Some(&failure));
     assert!(stream.is_done());

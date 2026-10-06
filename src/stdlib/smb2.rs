@@ -477,7 +477,9 @@ impl Wire for Frame {
     /// Appends a transport header and payload. Refuses payloads over
     /// [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        if self.payload.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+        if self.payload.len() > MAX_MESSAGE {
+            return Err(Error::Unwritable);
+        }
         out.push(0);
         out.extend_from_slice(&(self.payload.len() as u32).to_be_bytes()[1..]);
         out.extend_from_slice(&self.payload);
@@ -626,7 +628,9 @@ impl Packet {
     /// headers, and packets over [`MAX_MESSAGE`]. The padding becomes part
     /// of each message's body before the packet is written.
     pub fn compound(mut messages: Vec<Message>) -> Result<Self, Error> {
-        if messages.is_empty() || messages.len() > MAX_CHAIN { return Err(Error::Unwritable); }
+        if messages.is_empty() || messages.len() > MAX_CHAIN {
+            return Err(Error::Unwritable);
+        }
         let last = messages.len() - 1;
         let mut total = 0usize;
         for (i, message) in messages.iter().enumerate() {
@@ -1031,9 +1035,13 @@ impl Wire for Message {
     /// Reads one standalone message. Refuses invalid protocol or header
     /// sizes, nonzero NextCommand, and messages over [`MAX_MESSAGE`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        if bytes.len() > MAX_MESSAGE { return Err(Error::TooLong); }
+        if bytes.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
         let (header, next) = Header::read(bytes)?;
-        if next != 0 { return Err(Error::NextCommand(next)); }
+        if next != 0 {
+            return Err(Error::NextCommand(next));
+        }
         Ok(Self { header, body: bytes[HEADER_LEN..].to_vec() })
     }
 
@@ -1058,8 +1066,12 @@ impl Message {
     }
 
     /// A request message: `header` with the body of `request`. The header's
-    /// command must be the request's. Refuses invalid body fields or a
-    /// complete message over [`MAX_MESSAGE`].
+    /// command must be the request's. Buffers follow the fixed body fields.
+    /// A WRITE puts data first unless that would push the channel info's
+    /// 16-bit offset past 65535; then channel info comes first.
+    /// Refuses invalid body fields, buffers too long for their length
+    /// fields, `Other` with a known command, or a complete message over
+    /// [`MAX_MESSAGE`].
     pub fn from_request(header: Header, request: &Request) -> Result<Message, Error> {
         if header.command != request.command() {
             return Err(Error::Unwritable);
@@ -1073,13 +1085,16 @@ impl Message {
     /// `response`, under `status`. See [`Header::reply`]. Refuses invalid
     /// body fields, mismatched commands or statuses, and complete messages
     /// over [`MAX_MESSAGE`].
+    /// Refuses any body [`Response::parse`] would read as another kind:
+    /// a typed response for another command, `Other` for a known command,
+    /// or an error body where the status calls for a typed body or the
+    /// other way around.
     pub fn reply_to(request: &Header, status: u32, response: &Response) -> Result<Message, Error> {
         let header = request.reply(status);
         let body = response.encode_body(header.command, status)?;
         too_long(HEADER_LEN.saturating_add(body.len()))?;
         Ok(Message { body, header })
     }
-
 }
 
 /// Reads an SMB2 payload: one message, or a compound chain of them linked
@@ -1122,7 +1137,9 @@ fn write_messages(messages: &[Message]) -> Result<Vec<u8>, Error> {
     for (i, m) in messages.iter().enumerate() {
         let last = i + 1 == messages.len();
         let len = HEADER_LEN.checked_add(m.body.len()).ok_or(Error::Unwritable)?;
-        if !last && !len.is_multiple_of(8) { return Err(Error::Unwritable); }
+        if !last && !len.is_multiple_of(8) {
+            return Err(Error::Unwritable);
+        }
         too_long(out.len().saturating_add(len))?;
         let next = if last { 0 } else { len as u32 };
         out.extend_from_slice(&m.header.encode(next)?);
@@ -1583,6 +1600,10 @@ impl Request {
     /// Builds a request message with this command and `message_id`.
     /// Refuses bodies that exceed field or message limits or would read
     /// back changed.
+    /// Buffers follow the fixed body fields. A WRITE puts data first unless
+    /// that would push the channel info's 16-bit offset past 65535; then
+    /// channel info comes first. Refuses `Other` with a known command and
+    /// buffers too long for their length fields.
     pub fn message(&self, message_id: u64) -> Result<Message, Error> {
         Message::from_request(Header::new(self.command(), message_id), self)
     }
@@ -1850,10 +1871,7 @@ impl Request {
         })
     }
 
-    /// The request's body bytes, with buffers right after the fixed part.
-    /// A WRITE puts its data first, unless that would push the channel
-    /// info's 16-bit offset past 65535. An `Other` request with a command this module reads as a typed one
-    /// is an error, as is a buffer too long for its length field.
+    /// Builds the body for [`Request::message`], applying its writer rules.
     fn encode_body(&self) -> Result<Vec<u8>, Error> {
         let mut w = Vec::new();
         match self {
@@ -2257,6 +2275,10 @@ impl Response {
     /// Builds an answer to `request` under `status`.
     /// Refuses mismatched commands or statuses, invalid body fields, and
     /// values that exceed field or message limits.
+    /// Refuses any body [`Response::parse`] would read as another kind:
+    /// a typed response for another command, `Other` for a known command,
+    /// or an error body where the status calls for a typed body or the
+    /// other way around.
     pub fn message(&self, request: &Header, status: u32) -> Result<Message, Error> {
         Message::reply_to(request, status, self)
     }
@@ -2434,11 +2456,7 @@ impl Response {
         })
     }
 
-    /// The response's body bytes, for a response to `command` with
-    /// `status`. It is an error if [`Response::parse`] would read the bytes
-    /// back as another kind of body: a typed response for another command,
-    /// an `Other` one for a command this module reads, or an error body
-    /// where the status calls for a typed one, or the other way round.
+    /// Builds the body for [`Response::message`], applying its writer rules.
     fn encode_body(&self, command: u16, status: u32) -> Result<Vec<u8>, Error> {
         match self.command() {
             Some(c) if c != command => return Err(Error::Unwritable),
@@ -3040,8 +3058,7 @@ mod tests {
     #[test]
     fn sync_and_async_headers() {
         let b = header_bytes(command::READ, 0, flags::SIGNED, 0, 7, 0x0001_0001, 0x4000_0000_0001);
-        let (h, next) = (Message::parse(&b).unwrap().header, 0);
-        assert_eq!(next, 0);
+        let h = Message::parse(&b).unwrap().header;
         assert_eq!(h.command, command::READ);
         assert_eq!(h.credit_charge, 1);
         assert_eq!(h.credits, 31);
@@ -3053,7 +3070,7 @@ mod tests {
         let mut a = b.clone();
         a[16..20].copy_from_slice(&(flags::ASYNC_COMMAND | flags::SERVER_TO_REDIR).to_le_bytes());
         a[8..12].copy_from_slice(&status::PENDING.to_le_bytes());
-        let (h, _) = (Message::parse(&a).unwrap().header, 0);
+        let h = Message::parse(&a).unwrap().header;
         assert_eq!(h.target, Target::Async { async_id: 0x0001_0001_0000_feff });
         assert!(h.is_response());
         assert_eq!(Message { header: h, body: vec![] }.to_bytes().unwrap()[..], a[..]);
@@ -4522,8 +4539,22 @@ mod tests {
     fn fuzz_loop() {
         let corpus = corpus();
         let mut rng = Lcg::new(0x5eed);
-        for _ in 0..512 {
-            let mut payload = if rng.coin() { corpus[rng.index(corpus.len())].clone() } else { rng.bytes(200) };
+        for _ in 0..30_000 {
+            let mut payload = if rng.coin() {
+                corpus[rng.index(corpus.len())].clone()
+            } else {
+                let mut bytes = rng.bytes(200);
+                if bytes.len() >= 4 {
+                    let ids = [protocol::SMB2, protocol::TRANSFORM, protocol::COMPRESSION];
+                    bytes[..4].copy_from_slice(&ids[rng.index(ids.len())]);
+                }
+                bytes
+            };
+            // Small offset and length values reach more body readers.
+            if !payload.is_empty() && rng.index(3) == 0 {
+                let at = rng.index(payload.len());
+                payload[at] = rng.index(130) as u8;
+            }
             mutate(&mut rng, &mut payload);
             contract::check_wire::<Packet>(&payload);
             let status = [

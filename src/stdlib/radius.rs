@@ -21,7 +21,7 @@
 //!
 //! Nothing here reads a socket, and nothing here does cryptography. A
 //! world that plays a RADIUS server gives each datagram's bytes to
-//! [`Packet::parse`], reads the attributes it cares about, builds the
+//! [`Packet::parse_datagram`], reads the attributes it cares about, builds the
 //! answer with [`Packet::reply`], and sends back the bytes of
 //! [`Packet::to_bytes`]. The authenticators, the Message-Authenticator
 //! attribute and the hiding of User-Password and Tunnel-Password all use
@@ -48,7 +48,7 @@
 //! bytes.extend_from_slice(&[44, 5, b'a', b'b', b'c']); // Acct-Session-Id = "abc"
 //! bytes.extend_from_slice(&[1, 5, b'b', b'o', b'b']); // User-Name = "bob"
 //!
-//! let request = Packet::parse(&bytes).unwrap();
+//! let request = Packet::parse_datagram(&bytes).unwrap();
 //! assert_eq!(request.code, Code::AccountingRequest);
 //! let status = request.get(attr::ACCT_STATUS_TYPE).unwrap().decode();
 //! assert_eq!(status, Ok(Value::Enum(1)));
@@ -413,6 +413,32 @@ impl Wire for Attribute {
 }
 
 impl Packet {
+    /// Reads one RADIUS datagram. Octets past the Length field are padding
+    /// and are ignored on reception, as RFC 2865, section 3 requires.
+    /// Refuses headers shorter than [`HEADER_LEN`], lengths outside
+    /// `20..=4096`, truncated packets, and malformed attributes.
+    /// Use [`Wire::parse`] when trailing bytes must be refused.
+    pub fn parse_datagram(b: &[u8]) -> Result<Packet, Error> {
+        if b.len() < HEADER_LEN {
+            return Err(Error::Short(b.len()));
+        }
+        let length = u16::from_be_bytes([b[2], b[3]]);
+        let end = usize::from(length);
+        if !(HEADER_LEN..=MAX_PACKET).contains(&end) {
+            return Err(Error::Length {
+                length: end,
+                limit: MAX_PACKET,
+            });
+        }
+        if b.len() < end {
+            return Err(Error::Truncated {
+                length,
+                got: b.len(),
+            });
+        }
+        <Packet as Wire>::parse(&b[..end])
+    }
+
     /// A packet with no attributes.
     pub fn new(code: Code, identifier: u8, authenticator: [u8; AUTHENTICATOR_LEN]) -> Packet {
         Packet { code, identifier, authenticator, attributes: Vec::new() }
@@ -735,6 +761,8 @@ fn attributes_len(attributes: &[Attribute]) -> usize {
     attributes.iter().fold(0, |n: usize, a| n.saturating_add(2).saturating_add(a.value.len()))
 }
 
+/// Appends attributes and may stop partway on refusal. Both callers use a
+/// fresh local Vec, so no partial result escapes.
 fn write_attributes(out: &mut Vec<u8>, attributes: &[Attribute]) -> Option<()> {
     for a in attributes {
         a.write(out).ok()?;
@@ -1151,7 +1179,6 @@ impl Wire for Vsa {
 }
 
 impl Vsa {
-
     /// The vendor's bytes read as sub-attributes, each a 1-byte type, a
     /// 1-byte length (2 or more, counting both) and a value, as RFC 2865
     /// suggests. Vendors that lay their bytes out another way give
@@ -1880,6 +1907,7 @@ mod tests {
                 } else {
                     assert_eq!(e, Error::Truncated { length: bytes.len() as u16, got: n });
                 }
+                assert_eq!(Packet::parse_datagram(&bytes[..n]), Err(e));
             }
             contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_PACKET);
             assert_eq!(decode_all(Frames::new, &bytes), (vec![Packet::parse(&bytes).unwrap()], None));
@@ -1889,29 +1917,41 @@ mod tests {
     #[test]
     fn packet_errors() {
         assert_eq!(Packet::parse(&[1, 0, 0]), Err(Error::Short(3)));
+        assert_eq!(Packet::parse_datagram(&[1, 0, 0]), Err(Error::Short(3)));
         let mut b = vec![1, 0, 0, 19];
         b.extend_from_slice(&[0; 16]);
         assert_eq!(Packet::parse(&b), Err(Error::Length { length: 19, limit: MAX_PACKET }));
+        assert_eq!(Packet::parse_datagram(&b), Packet::parse(&b));
         b[2..4].copy_from_slice(&4097u16.to_be_bytes());
         assert_eq!(Packet::parse(&b), Err(Error::Length { length: 4097, limit: MAX_PACKET }));
+        assert_eq!(Packet::parse_datagram(&b), Packet::parse(&b));
         b[2..4].copy_from_slice(&22u16.to_be_bytes());
         assert_eq!(Packet::parse(&b), Err(Error::Truncated { length: 22, got: 20 }));
+        assert_eq!(Packet::parse_datagram(&b), Packet::parse(&b));
         // An attribute of length 1, then one that runs past the length.
         b.extend_from_slice(&[1, 1]);
         assert_eq!(Packet::parse(&b), Err(Error::Attribute(20)));
+        assert_eq!(Packet::parse_datagram(&b), Packet::parse(&b));
         b[21] = 3;
         assert_eq!(Packet::parse(&b), Err(Error::Attribute(20)));
+        assert_eq!(Packet::parse_datagram(&b), Packet::parse(&b));
         // A lone type byte with no length.
         b[3] = 21;
         assert_eq!(Packet::parse(&b[..21]), Err(Error::Attribute(20)));
+        assert_eq!(Packet::parse_datagram(&b[..21]), Packet::parse(&b[..21]));
         // Length 2 is an empty attribute. Exact parsing refuses padding.
         b[3] = 22;
         b[21] = 2;
         b.extend_from_slice(&[9, 9, 9]);
         assert_eq!(Packet::parse(&b), Err(Error::Trailing { remaining: 3 }));
         let p = Packet::parse(&b[..22]).unwrap();
+        // Bytes past the length are padding.
+        assert_eq!(Packet::parse_datagram(&b), Ok(p.clone()));
         assert_eq!(p.attributes, [Attribute { kind: 1, value: vec![] }]);
         assert_eq!(p.to_bytes().unwrap(), b[..22]);
+        // Padding is outside the packet length limit too.
+        b.resize(MAX_PACKET + 1, 9);
+        assert_eq!(Packet::parse_datagram(&b), Ok(p));
         for e in [Error::Short(1), Error::Length { length: 1, limit: MAX_PACKET }, Error::Attribute(20)] {
             assert!(!e.to_string().is_empty());
         }
@@ -2576,9 +2616,16 @@ mod tests {
     /// Checks everything a reader gives back writes and reads back the
     /// same.
     fn check(data: &[u8]) {
-        if let Ok(p) = Packet::parse(data) {
+        if let Ok(p) = Packet::parse_datagram(data) {
             let bytes = p.to_bytes().unwrap();
             assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
+            let mut padded = bytes.clone();
+            padded.extend_from_slice(&[9, 9, 9]);
+            assert_eq!(Packet::parse_datagram(&padded).as_ref(), Ok(&p));
+            assert_eq!(
+                Packet::parse(&padded),
+                Err(Error::Trailing { remaining: 3 })
+            );
             for a in &p.attributes {
                 if let Ok(v) = a.decode() {
                     let t = a.info().map_or(DataType::String, |i| i.data_type);
@@ -2616,7 +2663,7 @@ mod tests {
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5eed);
         let seeds = [hex(ACCESS_REQUEST), hex(ACCESS_ACCEPT), hex(CHAP_REQUEST), hex(CHALLENGE)];
-        for i in 0..512 {
+        for i in 0..11_000 {
             let mut data = if i % 3 == 0 {
                 // Random bytes behind a plausible header.
                 let n = 20 + rng.index(300);

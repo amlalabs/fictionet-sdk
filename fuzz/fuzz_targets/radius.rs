@@ -110,7 +110,10 @@ fn construct(data: &[u8]) -> Option<()> {
                 let before = p.clone();
                 match p.push_extended(&e) {
                     Ok(()) => assert!(e.ext_type < RESERVED_EXTENDED_TYPES),
-                    Err(error) => { assert_eq!(error, Error::Unwritable); assert_eq!(p, before); },
+                    Err(error) => {
+                        assert_eq!(error, Error::Unwritable);
+                        assert_eq!(p, before);
+                    }
                 }
             }
             // Raw bytes through push.
@@ -144,10 +147,17 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Packet>(data);
 
     // The bytes as one datagram.
-    if let Ok(p) = Packet::parse(data) {
+    if let Ok(p) = Packet::parse_datagram(data) {
         // A packet read can be written, and reads back the same.
         let bytes = p.to_bytes().expect("a packet read can be written");
         assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
+        let mut padded = bytes.clone();
+        padded.extend_from_slice(&[9, 9, 9]);
+        assert_eq!(Packet::parse_datagram(&padded).as_ref(), Ok(&p));
+        assert_eq!(
+            Packet::parse(&padded),
+            Err(Error::Trailing { remaining: 3 })
+        );
         for a in &p.attributes {
             // A value read as its type writes back to bytes that read the same.
             if let Ok(v) = a.decode() {

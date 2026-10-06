@@ -21,8 +21,8 @@
 //!
 //! Names are carried in the first-level encoding: each of a name's 16
 //! bytes becomes two letters from `A` to `P`, so `F` (0x46) becomes `EG`.
-//! The encoded name is a 32-byte label, which
-//! may be followed by the labels of a scope.
+//! The encoded name is a 32-byte label, which may be followed by the
+//! labels of a scope.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A packet that breaks the specification is an [`Error`], and the
@@ -117,7 +117,7 @@ pub mod flags {
 
 /// The first-level encoding of a 16-byte NetBIOS name: each byte becomes
 /// two letters, `A` plus its high half, then `A` plus its low half.
-fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
+pub fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
     let mut out = [0u8; ENCODED_LEN];
     for (i, b) in name.iter().enumerate() {
         out[2 * i] = b'A' + (b >> 4);
@@ -389,7 +389,6 @@ impl Packet {
             Packet::KeepAlive => kind::KEEP_ALIVE,
         }
     }
-
 }
 
 impl Wire for Packet {
@@ -915,14 +914,49 @@ mod tests {
     #[test]
     fn generated_packets_and_names() {
         let mut rng = Lcg::new(0x5eed);
-        for _ in 0..512 {
-            let mut data = if rng.coin() { request().to_bytes().unwrap() } else { rng.bytes(120) };
+        for _ in 0..70_000 {
+            let mut data = if rng.coin() {
+                request().to_bytes().unwrap()
+            } else {
+                let mut bytes = rng.bytes(120);
+                if bytes.len() >= HEADER_LEN && rng.coin() {
+                    let kinds = [
+                        kind::MESSAGE,
+                        kind::REQUEST,
+                        kind::POSITIVE,
+                        kind::NEGATIVE,
+                        kind::RETARGET,
+                        kind::KEEP_ALIVE,
+                    ];
+                    bytes[0] = kinds[rng.index(kinds.len())];
+                    bytes[1] = 0;
+                    let length = (bytes.len() - HEADER_LEN) as u16;
+                    bytes[2..4].copy_from_slice(&length.to_be_bytes());
+                }
+                bytes
+            };
             mutate(&mut rng, &mut data);
             contract::check_decode_with_alloc_limit(Frames::new, &data, 2 * MAX_PACKET);
             contract::check_wire::<Packet>(&data);
             contract::check_wire::<Name>(&data);
-            let scope = data.chunks(rng.index(80) + 1).map(<[u8]>::to_vec).collect();
+            let mut scope: Vec<Vec<u8>> =
+                data.chunks(rng.index(80) + 1).map(<[u8]>::to_vec).collect();
+            if rng.index(8) == 0 {
+                scope.push(Vec::new());
+            }
             let name = Name { bytes: [rng.next() as u8; NAME_LEN], scope };
+            let fits = name
+                .scope
+                .iter()
+                .all(|label| (1..=MAX_LABEL).contains(&label.len()))
+                && 2 + ENCODED_LEN
+                    + name
+                        .scope
+                        .iter()
+                        .map(|label| 1 + label.len())
+                        .sum::<usize>()
+                    <= MAX_NAME_LEN;
+            assert_eq!(name.to_bytes().is_ok(), fits);
             contract::check_wire_value(&name);
             contract::check_wire_value(&Packet::Request { called: name, calling: fred() });
             contract::check_wire_value(&Packet::Negative(NegativeCode::Other(rng.next() as u8)));
