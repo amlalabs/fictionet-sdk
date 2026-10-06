@@ -1666,8 +1666,8 @@ impl Decode for Responses {
 mod tests {
     use super::*;
     use codec::{
-        Fail, Step, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Step, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     fn cmd(bytes: &[u8]) -> Command {

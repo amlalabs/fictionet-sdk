@@ -922,8 +922,8 @@ impl Decode for Frames {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        contract, Stream, Fail,
-        test_support::{decode_all, Lcg, mutate},
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     fn wire(packet: &Packet) -> Result<Vec<u8>, EncodeError> {

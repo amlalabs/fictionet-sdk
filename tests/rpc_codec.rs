@@ -2,8 +2,8 @@
 
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract, finish,
-    test_support::{Lcg, mutate, decode_all},
+    Decode, Fail, Lcg, Step, Stream, Wire, contract, finish,
+    test_support::{decode_all, mutate},
 };
 use fictionet::stdlib::{dcerpc, diameter, nbss, radius, smb2};
 

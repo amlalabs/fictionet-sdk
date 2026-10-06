@@ -18,7 +18,12 @@ cargo +nightly fuzz list
 
 | Target | What it feeds | Code it reaches |
 |---|---|---|
-| `codec_tools` | arbitrary Modbus/TCP and line streams, byte edits, and seeded item plans | `codec`: exact forwarding, transactional replacement, recorder bounds, skip and failure events, and repeatable fault output |
+| `codec_tools` | arbitrary Modbus/TCP, JSON, and line streams, byte edits, and seeded item plans | `codec`: consumed-input forwarding, transactional replacement, tagged recorder bounds, truncated skip and failure events, and repeatable fault output |
+| `codec_tools` / Hold | every 11th item held for two later items, then EOF flush | held count and byte limits, release order, transactional flush |
+| `codec_tools` / Split | every 17th byte call split at offset 2 with a delay | two pushes with a delay marker at their boundary |
+| `codec_tools` / range Drop | every 19th byte call removes bytes 1..4 | clamped range edits and retained prefix/suffix |
+| `codec_tools` / range Repeat | every 23rd byte call repeats bytes 1..3 three times | range repetition under the output limit |
+| `codec_tools` / delayed Raw | item calls 2..=3 replace bytes with a delay | combined action, call window, raw replacement |
 | `relay` | relay messages | `relay::decode` |
 | `packets` | whole packets | `ip::split_protocols`'s sorting, `icmp::echo_reply`, `dhcp::Message::parse` |
 | `ip_reassembly` | IPv4 and IPv6 fragments, with timing | fragment reassembly in `ip::split_protocols` |

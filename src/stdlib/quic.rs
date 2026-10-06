@@ -1835,11 +1835,8 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        contract,
-        test_support::{Lcg, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
 
     fn datagram(packets: &[Packet]) -> Result<Vec<u8>, Error> {
         let len = packets

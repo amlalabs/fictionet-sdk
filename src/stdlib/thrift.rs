@@ -1517,7 +1517,10 @@ impl<'o> Writer<'o> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, finish, test_support::{Lcg, mutate, decode_all, chunks}};
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract, finish, pump,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     const ALL_TYPES: [Type; 12] = [
         Type::Bool,

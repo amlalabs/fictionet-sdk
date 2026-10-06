@@ -1559,8 +1559,8 @@ fn is_known(n: u8) -> bool {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        contract, Stream, Fail, pump,
-        test_support::{decode_all, chunks, Lcg, mutate},
+        Fail, Lcg, Stream, contract, pump,
+        test_support::{chunks, decode_all, mutate},
     };
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()

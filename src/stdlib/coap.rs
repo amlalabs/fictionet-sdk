@@ -1595,8 +1595,8 @@ fn write_body(out: &mut Vec<u8>, options: &Options, payload: &[u8], budget: usiz
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Stream, contract, pump,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Stream, contract, pump,
+        test_support::{decode_all, mutate},
     };
 
     fn get(path: &str, id: u16, token: &[u8]) -> Message {

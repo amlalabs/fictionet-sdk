@@ -521,8 +521,8 @@ impl<'a> Reader<'a> {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        contract,
-        test_support::{Lcg, mutate, decode_all},
+        Lcg, contract,
+        test_support::{decode_all, mutate},
     };
     fn rtp(payload: &[u8]) -> RtpPacket {
         RtpPacket {

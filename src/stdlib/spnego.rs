@@ -881,11 +881,11 @@ impl Decode for Frames {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, chunks, decode_all, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     /// The hint name Windows and Samba send in a NegTokenInit2.
     const HINT: &[u8] = b"not_defined_in_RFC4178@please_ignore";

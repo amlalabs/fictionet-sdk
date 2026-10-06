@@ -1394,8 +1394,8 @@ fn addr(b: &[u8], i: usize) -> Ipv6Addr {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Stream, contract, pump,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, Stream, contract, pump,
+        test_support::{decode_all, mutate},
     };
 
     fn a(s: &str) -> Ipv6Addr {

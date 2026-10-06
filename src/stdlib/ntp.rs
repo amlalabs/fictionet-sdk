@@ -717,8 +717,8 @@ impl Wire for Timestamp {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::Lcg};
     use super::*;
+    use fictionet::stdlib::codec::{Lcg, contract};
 
     /// A server reply as an SNTP client might receive it: version 4,
     /// stratum 2, reference ID 192.0.2.1, and a 20-byte key ID and MAC.

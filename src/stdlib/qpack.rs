@@ -1998,11 +1998,11 @@ impl BlockedSections {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        contract,
-        test_support::{decode_all, Lcg, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Lcg, contract,
+        test_support::{decode_all, mutate},
+    };
 
     fn apply(table: &mut Table, bytes: &[u8]) -> Result<(), Error> {
         let (items, error) = decode_all(EncoderInstructions::new, bytes);

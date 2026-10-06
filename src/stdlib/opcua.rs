@@ -3647,8 +3647,8 @@ impl Wire for Service {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Stream, contract, pump,
-        test_support::{self, Lcg, decode_all},
+        Fail, Lcg, Stream, contract, pump,
+        test_support::{self, decode_all},
     };
 
     /// Writes chunks and fails the test with the original error on refusal.

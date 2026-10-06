@@ -1616,11 +1616,11 @@ impl Wire for MethodData {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks, decode_all, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract, finish as finish_stream, pump,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     fn time(s: &str) -> KerberosTime {
         KerberosTime::new(s).unwrap()

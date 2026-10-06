@@ -321,7 +321,7 @@ impl std::error::Error for Error {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{contract, test_support::Lcg};
+    use fictionet::stdlib::codec::{Lcg, contract};
 
     /// The ARP request from the module doc: VNI 5001 and a 14-byte frame.
     fn example() -> Vec<u8> {

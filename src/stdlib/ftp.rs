@@ -1796,7 +1796,10 @@ mod tests {
     use super::*;
     use std::net::SocketAddrV6;
 
-    use codec::{Fail, Stream, contract, test_support::{Lcg, decode_all, mutate}};
+    use codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
+    };
 
     fn commands(bytes: &[u8]) -> Vec<Result<Command, CommandError>> {
         decode_all(Commands::new, bytes).0

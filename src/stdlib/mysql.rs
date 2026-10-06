@@ -2104,7 +2104,10 @@ impl OkPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, pump, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract, pump,
+        test_support::{decode_all, mutate},
+    };
 
     const CAPS41: u32 = capability::PROTOCOL_41 | capability::SECURE_CONNECTION | capability::TRANSACTIONS;
     const CAPS_MODERN: u32 = CAPS41

@@ -2533,10 +2533,10 @@ fn write_opaque(w: &mut Writer, bytes: &[u8], max: usize) {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::onc_rpc::{Body, MAX_RECORD, Record, records};
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Assembled, Wire, contract, test_support};
+    use fictionet::stdlib::onc_rpc::{Body, MAX_RECORD, Record, records};
 
     fn fh(b: &[u8]) -> FileHandle {
         FileHandle(b.to_vec())

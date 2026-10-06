@@ -3,13 +3,9 @@
 //! [`mutate`] edits a byte vector in place, and [`decode_all`] runs a decoder
 //! over a whole input.
 
-use super::{
-    Decode, Fail, Stream,
-    alloc::vec::Vec,
-    finish, pump,
-};
+use super::{Decode, Fail, Stream, alloc::vec::Vec, finish, pump};
 
-pub use fictionet::stdlib::codec::Lcg;
+use fictionet::stdlib::codec::Lcg;
 
 /// The most bytes one [`mutate`] call adds. Only inserting a byte and
 /// duplicating a slice grow the input, by 1 and at most this many bytes.

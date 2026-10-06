@@ -88,15 +88,11 @@ mod buffer;
 mod combinators;
 pub mod contract;
 mod demux;
-/// Seeded byte and item fault plans with delay markers.
-pub mod faults;
-/// Exact-byte forwarding and caller-directed replacement.
-pub mod interceptor;
-/// Small deterministic generator shared by tools and tests.
-pub mod lcg;
+mod faults;
+mod interceptor;
+mod lcg;
 mod pipe;
-/// Bounded transcripts of driver events in both directions.
-pub mod recorder;
+mod recorder;
 mod stream;
 pub mod test_support;
 
@@ -106,8 +102,8 @@ pub use combinators::{
     Map,
 };
 pub use demux::Demux;
-pub use faults::{ByteFault, FaultAction, Faults, ItemFault, Rule, Trigger};
-pub use interceptor::{InterceptError, Interceptor, Rewrite, RewriteError};
+pub use faults::{ByteFault, FaultDelay, FaultError, Faults, ItemFault, Rule, Trigger};
+pub use interceptor::{InterceptError, Interceptor, Rewrite, RewriteError, SkipPolicy};
 pub use lcg::Lcg;
 pub use pipe::{Carry, DEFAULT_SPANS, Layered, Pipe, PipeError, Span, Spans};
 pub use recorder::{Direction, Record, RecordKind, Recorder};

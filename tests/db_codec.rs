@@ -2,8 +2,7 @@
 
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract, finish,
-    test_support::{Lcg, decode_all},
+    Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, test_support::decode_all,
 };
 use fictionet::stdlib::{git_protocol, mongodb, mysql, sftp, tds};
 

@@ -1474,7 +1474,10 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::{Stream, Fail, contract, test_support::{Lcg, mutate, decode_all}};
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
+    };
 
     /// An endpoint mapper bind as Windows sends it: one context, the
     /// endpoint mapper over NDR.

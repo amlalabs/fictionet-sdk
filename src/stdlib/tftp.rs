@@ -917,8 +917,8 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
+    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
 
     fn rrq_example() -> Vec<u8> {
         b"\x00\x01boot.img\x00octet\x00blksize\x001024\x00tsize\x000\x00".to_vec()

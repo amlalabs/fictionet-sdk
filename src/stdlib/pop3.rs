@@ -1447,8 +1447,8 @@ impl Decode for Replies {
 mod tests {
     use super::*;
     use codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     fn scan(bytes: &[u8]) -> Option<(NonZeroU32, u64)> {

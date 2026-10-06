@@ -1180,8 +1180,8 @@ fn asked(state: OptionState, on: bool) -> (OptionState, Option<bool>) {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Stream, contract, finish, pump,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Stream, contract, finish, pump,
+        test_support::{decode_all, mutate},
     };
 
     /// Adjacent data events joined, so streams split in different places

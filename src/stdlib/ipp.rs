@@ -1535,8 +1535,8 @@ fn read_members(records: &mut Records<'_>, depth: usize) -> Result<Vec<Attribute
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Fail, Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Fail, Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     /// One record's bytes.

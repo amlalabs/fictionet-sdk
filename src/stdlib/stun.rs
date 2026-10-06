@@ -1172,7 +1172,7 @@ fn be32(b: &[u8], i: usize) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Fail, Stream, Wire, contract, finish, pump, test_support};
 
     const TID: [u8; 12] = [

@@ -22,19 +22,23 @@ pub enum RecordKind<T, E> {
     Skipped,
     /// Clean completion. The entry has an empty byte range.
     Ended,
-    /// A terminal failure. The entry holds the unread bytes at failure.
+    /// A terminal failure. The full range identifies unread bytes at failure.
     Failed(Fail<E>),
 }
 
 /// One observation in decoding order, with its original wire bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Record<T, E> {
+    /// Caller-assigned stream key. Together with direction, it identifies offsets.
+    pub tag: u64,
     /// Endpoint direction. Each direction has its own stream offsets.
     pub direction: Direction,
     /// Consumed bytes for items and skips; unread bytes for failures.
     /// Offsets saturate at `u64::MAX`, as they do in [`Stream`].
     pub range: Range<u64>,
-    /// Exact bytes seen by the driver. Never reconstructed with a writer.
+    /// Whether the byte budget kept only a prefix of the observed bytes.
+    pub truncated: bool,
+    /// Retained prefix of exact driver bytes. Never reconstructed with a writer.
     pub bytes: Vec<u8>,
     /// Item, skip, end, or failure details.
     pub kind: RecordKind<T, E>,
@@ -42,18 +46,20 @@ pub struct Record<T, E> {
 
 /// A transcript bounded by entry count and retained wire bytes.
 ///
-/// Entries are evicted oldest first to fit both limits. An entry larger
-/// than the byte limit is dropped without evicting existing entries.
-/// Allocation refusal also drops the incoming entry. [`dropped`](Self::dropped)
+/// Entries are evicted oldest first to fit both limits. Bytes larger than
+/// the budget are truncated; the kind and full range survive, including
+/// for skips and terminal failures. Storage is reserved before eviction.
+/// Allocation refusal drops only the incoming entry. [`dropped`](Self::dropped)
 /// counts all lost entries, including evictions, and saturates at `u64::MAX`.
-/// A zero entry limit disables retention. A zero byte limit permits only
-/// entries with no wire bytes, such as ends and items from held state.
+/// A zero entry limit disables retention. A zero byte limit keeps entry
+/// metadata with empty bytes and marks nonempty observations truncated.
 ///
 /// The byte limit counts `Record::bytes`, not storage inside cloned items
 /// or errors. Those keep their decoder's named limits; the entry limit
 /// bounds how many such values are held. Allocator overhead is separate.
-/// Attach one recorder per Demux key, or label keys in world code before
-/// combining transcripts. The recorder does not infer stream identity.
+/// Use one recorder for all Demux keys and directions under one budget.
+/// Assign each stream a numeric tag with [`with_next_tagged`](Self::with_next_tagged).
+/// Untagged calls use zero. The recorder does not infer stream identity.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Direction, Recorder, Stream}, modbus};
@@ -134,28 +140,31 @@ impl<T, E> Recorder<T, E> {
     }
 }
 impl<T: Clone, E: Clone> Recorder<T, E> {
-    /// Copies one borrowed driver observation. Returns whether it was
-    /// retained. This does not affect decoding or forwarding. No item or
-    /// error is cloned when its wire bytes already exceed the byte bound.
+    /// Copies a driver observation with tag zero. Returns whether retained.
+    /// Byte truncation preserves the full range and kind under the budget.
     pub fn observe(&mut self, direction: Direction, event: StreamEvent<'_, T, E>) -> bool {
+        self.observe_tagged(0, direction, event)
+    }
+
+    /// Copies an observation with a caller-assigned stream key. Count and
+    /// byte limits are shared across all tags and directions.
+    pub fn observe_tagged(
+        &mut self,
+        tag: u64,
+        direction: Direction,
+        event: StreamEvent<'_, T, E>,
+    ) -> bool {
         let (bytes, range) = match &event {
             StreamEvent::Item { bytes, range, .. }
             | StreamEvent::Skipped { bytes, range }
             | StreamEvent::Failed { bytes, range, .. } => (*bytes, range.clone()),
             StreamEvent::Ended { offset } => (&[][..], *offset..*offset),
         };
-        if self.max_entries == 0 || bytes.len() > self.max_bytes {
+        if self.max_entries == 0 {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
-        while self.entries.len() >= self.max_entries
-            || bytes.len() > self.max_bytes.saturating_sub(self.retained)
-        {
-            if self.pop_front().is_none() {
-                break;
-            }
-            self.dropped = self.dropped.saturating_add(1);
-        }
+        let keep = bytes.len().min(self.max_bytes);
         let mut owned = Vec::new();
         let target = self
             .entries
@@ -163,8 +172,9 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
             .saturating_mul(2)
             .max(1)
             .min(self.max_entries);
-        if owned.try_reserve_exact(bytes.len()).is_err()
+        if owned.try_reserve_exact(keep).is_err()
             || (self.entries.len() == self.entries.capacity()
+                && self.entries.len() < self.max_entries
                 && self
                     .entries
                     .try_reserve_exact(target.saturating_sub(self.entries.len()))
@@ -173,16 +183,26 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
             self.dropped = self.dropped.saturating_add(1);
             return false;
         }
-        owned.extend_from_slice(bytes);
+        owned.extend_from_slice(&bytes[..keep]);
         let kind = match event {
             StreamEvent::Item { item, .. } => RecordKind::Item(item.clone()),
             StreamEvent::Skipped { .. } => RecordKind::Skipped,
             StreamEvent::Ended { .. } => RecordKind::Ended,
             StreamEvent::Failed { error, .. } => RecordKind::Failed(error.clone()),
         };
+        while self.entries.len() >= self.max_entries
+            || keep > self.max_bytes.saturating_sub(self.retained)
+        {
+            if self.pop_front().is_none() {
+                break;
+            }
+            self.dropped = self.dropped.saturating_add(1);
+        }
         self.retained = self.retained.saturating_add(owned.len());
         self.entries.push_back(Record {
+            tag,
             direction,
+            truncated: keep < bytes.len(),
             range,
             bytes: owned,
             kind,
@@ -200,8 +220,21 @@ impl<T: Clone, E: Clone> Recorder<T, E> {
         stream: &mut Stream<D>,
         f: impl FnOnce(T, &[u8], Range<u64>) -> R,
     ) -> Option<Result<R, Fail<E>>> {
+        self.with_next_tagged(0, direction, stream, f)
+    }
+
+    /// Drives and records one keyed stream. Use one recorder across every
+    /// Demux key to keep an aggregate transcript bound. Offsets are local
+    /// to the supplied stream; the key and direction label them.
+    pub fn with_next_tagged<D: Decode<Item = T, Error = E>, R>(
+        &mut self,
+        tag: u64,
+        direction: Direction,
+        stream: &mut Stream<D>,
+        f: impl FnOnce(T, &[u8], Range<u64>) -> R,
+    ) -> Option<Result<R, Fail<E>>> {
         stream.with_next_observed(f, |event| {
-            self.observe(direction, event);
+            self.observe_tagged(tag, direction, event);
         })
     }
 }
@@ -215,7 +248,7 @@ mod tests {
     };
 
     #[test]
-    fn bounds_drop_oldest_and_oversized_incoming() {
+    fn bounds_drop_oldest_and_truncate_oversized_incoming() {
         let mut log = Recorder::<u8, core::convert::Infallible>::new(2, 3);
         for i in 0..3u8 {
             assert!(log.observe(
@@ -229,15 +262,18 @@ mod tests {
         }
         assert_eq!(log.len(), 2);
         assert_eq!(log.dropped(), 1);
-        assert!(!log.observe(
+        assert!(log.observe(
             Direction::ServerToClient,
             StreamEvent::Skipped {
                 bytes: b"long",
                 range: 0..4
             }
         ));
-        assert_eq!(log.dropped(), 2);
-        assert_eq!(log.iter().next().unwrap().bytes, [1]);
+        assert_eq!(log.dropped(), 3);
+        let entry = log.iter().next().unwrap();
+        assert_eq!(entry.bytes, b"lon");
+        assert_eq!(entry.range, 0..4);
+        assert!(entry.truncated);
         assert!(log.observe(
             Direction::ServerToClient,
             StreamEvent::Skipped {

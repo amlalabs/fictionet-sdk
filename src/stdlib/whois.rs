@@ -1051,7 +1051,10 @@ impl Decode for Responses {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codec::{Stream, contract, test_support::{Lcg, decode_all, mutate}};
+    use codec::{
+        Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
+    };
 
     /// An answer in the layout Verisign uses for .com, cut short.
     const VERISIGN: &str = concat!(

@@ -1701,8 +1701,8 @@ impl Wire for ForwardCloseResponse {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Stream, contract, pump,
-        test_support::{self, Lcg, decode_all},
+        Lcg, Stream, contract, pump,
+        test_support::{self, decode_all},
     };
 
     #[test]

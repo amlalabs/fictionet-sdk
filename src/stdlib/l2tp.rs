@@ -1059,8 +1059,8 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
+    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
 
     /// The SCCRQ from the module doc.
     fn sccrq() -> Vec<u8> {

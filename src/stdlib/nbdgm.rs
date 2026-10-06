@@ -847,8 +847,8 @@ impl Wire for Packet {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
+    use fictionet::stdlib::codec::{Lcg, contract, test_support::mutate};
 
     fn ip() -> Ipv4Addr {
         Ipv4Addr::new(10, 0, 0, 9)

@@ -3,10 +3,10 @@
 use core::time::Duration;
 use fictionet::stdlib::{
     codec::{
-        ByteFault, Decode, Direction, Ending, Faults, Interceptor, ItemFault, Lines, Recorder,
-        Rewrite, Rule, Stream, Trigger, Wire, test_support,
+        ByteFault, Carry, Decode, Direction, Ending, Faults, Interceptor, ItemFault, Lines, Pipe,
+        Recorder, Rewrite, Rule, Stream, Trigger, Wire, test_support,
     },
-    modbus,
+    json, modbus,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -19,27 +19,40 @@ where
     let proxy = Interceptor::new(32768);
     let mut recorder = Recorder::new(8, 512);
     let mut output = Vec::new();
-    let mut expected = Vec::new();
+    let mut recorded = Stream::new(make());
+    let mut failed = false;
     for chunk in input.chunks(1).chain(core::iter::once(&[][..])) {
         if chunk.is_empty() {
             stream.end();
+            recorded.end();
         }
-        if !stream.is_done() {
-            assert_eq!(stream.push(chunk), chunk.len());
+        if !failed {
+            let before = stream.offset() as usize;
+            let result = proxy.intercept_with(
+                &mut stream,
+                chunk,
+                &mut output,
+                |_, _, _| Rewrite::Forward,
+                modbus::Frame::write,
+            );
+            let consumed = if result.is_err() {
+                failed = true;
+                before // This call rolled back output, including any skips.
+            } else {
+                stream.offset() as usize
+            };
+            assert_eq!(output, input[..consumed]);
         }
-        while let Some(r) =
-            recorder.with_next(Direction::ClientToServer, &mut stream, |_, raw, range| {
-                let source = &input[range.start as usize..range.end as usize];
-                assert_eq!(raw, source);
-                expected.extend_from_slice(source);
-                proxy.apply::<modbus::Frame>(raw, Rewrite::Forward, &mut output)
+        if !recorded.is_done() {
+            assert_eq!(recorded.push(chunk), chunk.len());
+        }
+        while let Some(result) =
+            recorder.with_next(Direction::ClientToServer, &mut recorded, |_, raw, range| {
+                assert_eq!(raw, &input[range.start as usize..range.end as usize]);
             })
         {
-            assert!(recorder.len() <= recorder.max_entries());
-            assert!(recorder.retained_bytes() <= recorder.max_bytes());
-            match r {
-                Ok(r) => r.unwrap(),
-                Err(_) => break,
+            if result.is_err() {
+                break;
             }
         }
         assert!(recorder.len() <= 8);
@@ -49,7 +62,9 @@ where
             recorder.retained_bytes()
         );
     }
-    assert_eq!(output, expected);
+    if !failed {
+        assert_eq!(output, input[..stream.offset() as usize]);
+    }
     assert!(stream.is_done());
 }
 
@@ -69,12 +84,33 @@ where
     };
     let byte_plan = [
         Rule {
+            when: Trigger::Every(23),
+            fault: ByteFault::Repeat {
+                range: Some(1..3),
+                copies: 3,
+            },
+        },
+        Rule {
+            when: Trigger::Every(19),
+            fault: ByteFault::Drop(Some(1..4)),
+        },
+        Rule {
+            when: Trigger::Every(17),
+            fault: ByteFault::Split {
+                at: 2,
+                delay: Duration::from_millis(3),
+            },
+        },
+        Rule {
             when: Trigger::Every(13),
             fault: ByteFault::Replace(replacement.to_bytes().unwrap()),
         },
         Rule {
             when: Trigger::Every(11),
-            fault: ByteFault::Duplicate(2),
+            fault: ByteFault::Repeat {
+                range: None,
+                copies: 2,
+            },
         },
         Rule {
             when: Trigger::Every(7),
@@ -82,7 +118,7 @@ where
         },
         Rule {
             when: Trigger::Every(5),
-            fault: ByteFault::Drop,
+            fault: ByteFault::Drop(None),
         },
         Rule {
             when: Trigger::Every(3),
@@ -98,70 +134,103 @@ where
     ];
     let item_plan = [
         Rule {
+            when: Trigger::Every(11),
+            fault: ItemFault::Hold { window: 2 },
+        },
+        Rule {
+            when: Trigger::Window { start: 2, end: 3 },
+            fault: ItemFault::Action {
+                delay: Some(Duration::from_millis(1)),
+                rewrite: Rewrite::Raw(vec![0, 1]),
+            },
+        },
+        Rule {
             when: Trigger::Every(7),
-            fault: ItemFault::Delay(Duration::from_millis(2)),
+            fault: ItemFault::Action {
+                delay: Some(Duration::from_millis(2)),
+                rewrite: Rewrite::Forward,
+            },
         },
         Rule {
             when: Trigger::Every(5),
-            fault: ItemFault::Replace(vec![replacement]),
+            fault: ItemFault::Action {
+                delay: None,
+                rewrite: Rewrite::Replace(vec![replacement]),
+            },
         },
         Rule {
             when: Trigger::Chance { take: 1, out_of: 3 },
-            fault: ItemFault::Drop,
+            fault: ItemFault::Action {
+                delay: None,
+                rewrite: Rewrite::Drop,
+            },
         },
         Rule {
             when: Trigger::Chance { take: 1, out_of: 2 },
-            fault: ItemFault::Duplicate(2),
+            fault: ItemFault::Action {
+                delay: None,
+                rewrite: Rewrite::Repeat(2),
+            },
         },
     ];
     let mut stream = Stream::new(make());
-    let mut faults = Faults::new(seed, 512);
-    let proxy = Interceptor::new(65536);
+    let mut faults = Faults::new(seed, 65536, 8);
     let mut recorder = Recorder::new(8, 512);
     let mut output = Vec::new();
     let mut markers = Vec::new();
     let mut bytes = Vec::new();
     for chunk in test_support::chunks(input, &[7, 1, 31]).chain(core::iter::once(&[][..])) {
         bytes.clear();
-        if let Some(delay) = faults.bytes(&byte_plan, chunk, &mut bytes).unwrap() {
-            markers.push((output.len(), delay));
-        }
+        let marker = faults.bytes(&byte_plan, chunk, &mut bytes).unwrap();
         if chunk.is_empty() {
             stream.end();
         }
-        let mut rest = bytes.as_slice();
-        loop {
-            if stream.is_done() {
-                break;
-            }
-            let taken = stream.push(rest);
-            rest = &rest[taken..];
-            let before = stream.offset();
-            while let Some(r) =
-                recorder.with_next(Direction::ServerToClient, &mut stream, |_, raw, _| {
-                    let action = faults.item(&item_plan);
-                    let start = output.len();
-                    if let Some(delay) = action.delay {
-                        markers.push((start, delay));
-                    }
-                    let result = proxy.apply(raw, action.rewrite, &mut output);
-                    if result.is_err() {
-                        assert_eq!(output.len(), start);
-                    }
-                    assert!(output.len() <= proxy.limit());
-                })
-            {
-                if r.is_err() {
-                    break;
+        let split = marker.map_or(0, |marker| marker.at);
+        for (part, mut rest) in [&bytes[..split], &bytes[split..]].into_iter().enumerate() {
+            if part == 1 {
+                if let Some(marker) = marker {
+                    markers.push((output.len(), marker.duration));
                 }
             }
-            assert!(recorder.len() <= 8);
-            assert!(recorder.retained_bytes() <= 512);
-            if rest.is_empty() || stream.is_done() {
-                break;
+            loop {
+                if stream.is_done() {
+                    break;
+                }
+                let taken = stream.push(rest);
+                rest = &rest[taken..];
+                let before = stream.offset();
+                while let Some(result) =
+                    recorder.with_next(Direction::ServerToClient, &mut stream, |_, raw, _| {
+                        let start = output.len();
+                        match faults.item(&item_plan, raw, &mut output) {
+                            Ok(Some(marker)) => markers.push((marker.at, marker.duration)),
+                            Ok(None) => {}
+                            Err(_) => assert_eq!(output.len(), start),
+                        }
+                        assert!(output.len() <= 65536);
+                        assert!(faults.held_count() <= 8);
+                        assert!(faults.held_bytes() <= 65536);
+                    })
+                {
+                    if result.is_err() {
+                        break;
+                    }
+                }
+                assert!(recorder.len() <= 8);
+                assert!(recorder.retained_bytes() <= 512);
+                if rest.is_empty() || stream.is_done() {
+                    break;
+                }
+                assert!(taken != 0 || stream.offset() > before);
             }
-            assert!(taken != 0 || stream.offset() > before);
         }
+    }
+    let start = output.len();
+    if faults.flush(&mut output).is_err() {
+        assert_eq!(output.len(), start);
+    } else {
+        assert_eq!(faults.held_bytes(), 0);
+        assert_eq!(faults.held_count(), 0);
     }
     (output, markers)
 }
@@ -173,6 +242,17 @@ fuzz_target!(|data: &[u8]| {
         .take(8)
         .fold(0u64, |seed, byte| (seed << 8) | u64::from(*byte));
     forward(|| modbus::Frames, input);
+    forward(json::Values::new, input);
+    forward(
+        || {
+            Pipe::new(
+                modbus::Frames,
+                Lines::new(128, Ending::LfOrCrlf),
+                |frame: modbus::Frame| Carry::Bytes(frame.pdu),
+            )
+        },
+        input,
+    );
     forward(|| Lines::new(128, Ending::LfOrCrlf), input);
     assert_eq!(
         faults(|| modbus::Frames, input, seed),

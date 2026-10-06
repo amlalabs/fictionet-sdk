@@ -1362,7 +1362,7 @@ fn http3_header_list_section_preserves_values_and_never_index() {
 
 #[test]
 fn codec_contracts_on_bounded_arbitrary_inputs() {
-    let mut random = codec::test_support::Lcg::new(0xface_1234);
+    let mut random = codec::Lcg::new(0xface_1234);
     for length in [0, 1, 2, 3, 10, 31, 64, 129, 257] {
         let mut bytes = vec![0; length];
         random.fill(&mut bytes);

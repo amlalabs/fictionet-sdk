@@ -1661,7 +1661,7 @@ fn trim(mut b: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fictionet::stdlib::codec::test_support::Lcg;
+    use fictionet::stdlib::codec::Lcg;
     use fictionet::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
 
     #[test]
@@ -1855,7 +1855,7 @@ mod tests {
 
     #[test]
     fn messages_and_wire_contracts() {
-        let mut rng = test_support::Lcg::new(0x67_72_70_63);
+        let mut rng = fictionet::stdlib::codec::Lcg::new(0x67_72_70_63);
         for _ in 0..128 {
             let mut data = [0; 64];
             rng.fill(&mut data);

@@ -3030,11 +3030,11 @@ impl Wire for Crl {
 
 #[cfg(test)]
 mod tests {
-    use fictionet::stdlib::codec::{
-        Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks, decode_all, mutate},
-    };
     use super::*;
+    use fictionet::stdlib::codec::{
+        Fail, Lcg, Stream, contract, finish as finish_stream, pump,
+        test_support::{chunks, decode_all, mutate},
+    };
 
     /// A self-signed P-256 certificate made with OpenSSL, with every
     /// extension this module reads.

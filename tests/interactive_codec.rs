@@ -1,8 +1,8 @@
 //! Telnet sessions and WebSocket frames, assembly, and handoff.
 
 use fictionet::stdlib::codec::{
-    AssembleError, Decode, Fail, Step, Stream, Wire, contract, finish, pump,
-    test_support::{Lcg, chunks, decode_all},
+    AssembleError, Decode, Fail, Lcg, Step, Stream, Wire, contract, finish, pump,
+    test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{telnet as tn, websocket as ws};
 

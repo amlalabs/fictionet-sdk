@@ -1837,8 +1837,8 @@ impl Candidate {
 mod tests {
     use super::*;
     use codec::{
-        Stream, contract,
-        test_support::{Lcg, decode_all, mutate},
+        Lcg, Stream, contract,
+        test_support::{decode_all, mutate},
     };
 
     /// The example in RFC 8866, section 5.

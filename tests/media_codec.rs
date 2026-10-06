@@ -1,8 +1,8 @@
 //! RTSP and SIP lines, bodies, recovery, and strict wire values.
 
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract,
-    test_support::{Lcg, decode_all, mutate},
+    Decode, Fail, Lcg, Step, Stream, Wire, contract,
+    test_support::{decode_all, mutate},
 };
 use fictionet::stdlib::{rtsp, sdp, sip};
 

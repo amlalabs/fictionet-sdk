@@ -1603,8 +1603,8 @@ impl Decode for Frames {
 mod tests {
     use super::*;
     use fictionet::stdlib::codec::{
-        Stream, Fail, pump, contract,
-        test_support::{Lcg, mutate, decode_all},
+        Fail, Lcg, Stream, contract, pump,
+        test_support::{decode_all, mutate},
     };
 
     fn oid(s: &str) -> Oid {
