@@ -15,8 +15,10 @@
 //!   build one from an interface: [`ip::split_protocols`] splits its packets
 //!   by protocol, and [`tcp::endpoint`] and [`udp::endpoint`] give the TCP
 //!   and UDP parts listeners, connections and sockets.
-//! - **Routers.** [`route::router`] forwards packets between sandboxes and
-//!   machines by destination address.
+//! - **Networks.** [`route::router`] forwards packets between routes by
+//!   destination address. [`route::lan`] joins machines on one IP subnet,
+//!   floods broadcast and multicast traffic to its members, and hands
+//!   packets for other subnets to a gateway.
 //! - **Links.** [`delay`] and [`bottleneck`] sit on an interface and change
 //!   how its packets travel, as a slow or distant link would. [`filter`]
 //!   shows each packet to your code, which can drop it.
@@ -74,6 +76,8 @@
 //!   all of the interfaces they returned have closed.
 //! - [`route::router`] stops when the last of its interfaces has closed and
 //!   no [`Router`](route::Router) handle is left to add more.
+//! - [`route::lan`] stops when its members and gateway have all closed and
+//!   no [`Lan`](route::Lan) handle is left to add more.
 //! - [`tcp::endpoint`] and [`udp::endpoint`] stop when their interface
 //!   closes.
 //!
@@ -90,6 +94,7 @@
 //! | [`ip::split_versions`] | an interface | IPv4, IPv6 and other packets, split apart |
 //! | [`ip::split_protocols`] | an interface | TCP, UDP, ICMP and other packets, split apart |
 //! | [`route::router`] | many interfaces with prefixes | a handle for adding routes later; it forwards between them |
+//! | [`route::lan`] | one IP subnet | a handle for adding members and a gateway; it forwards unicast and floods broadcast and multicast |
 //! | [`tcp::endpoint`] | TCP packets and an address | listeners and connections |
 //! | [`udp::endpoint`] | UDP packets and an address | sockets |
 //! | [`web::Sites::serve`] | the attachments, and a callback that gives the site for a hostname | nothing: it builds DNS, routing, machines, TLS and HTTP |
