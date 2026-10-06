@@ -21,7 +21,7 @@
 //!
 //! Nothing here reads a socket or does any cryptography. A world that
 //! plays a VPN gateway passes each UDP payload it gets to
-//! [`Message::parse`] and sends the bytes of [`Message::to_bytes`] back.
+//! [`Message::parse`] and sends the bytes of [`Message::write`] back.
 //! Choosing a proposal, making keys, opening an SK payload and checking
 //! AUTH are up to world code. After it decrypts an SK payload, it can read
 //! the inner payloads with [`parse_payloads`].
@@ -32,6 +32,7 @@
 //! notify once the SA is up.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::ike::{
 //!     Body, KeyExchange, Message, Notify, Payload, Proposal, Transform, exchange, flags, notify, payload, protocol,
 //!     transform,
@@ -56,7 +57,7 @@
 //!         Payload::new(Body::Nonce(vec![9; 32])),
 //!     ],
 //! };
-//! let bytes = request.to_bytes();
+//! let bytes = request.to_bytes().unwrap();
 //! // The header, then SA (4 + 16 bytes), KE (4 + 4 + 256) and nonce (4 + 32).
 //! assert_eq!(bytes.len(), 28 + 20 + 264 + 36);
 //! assert_eq!(bytes[16], payload::SA);
@@ -72,13 +73,16 @@
 //!     kind: notify::INVALID_KE_PAYLOAD,
 //!     data: wanted,
 //! }))]);
-//! let bytes = reply.to_bytes();
+//! let bytes = reply.to_bytes().unwrap();
 //! assert_eq!(bytes.len(), 28 + 4 + 4 + 2);
 //! assert_eq!(bytes[19], flags::RESPONSE);
 //! let back = Message::parse(&bytes).unwrap();
 //! assert!(back.is_response());
 //! assert_eq!(back.notify(notify::INVALID_KE_PAYLOAD).unwrap().data, [0, 19]);
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -135,8 +139,8 @@ pub mod exchange {
     pub const INFORMATIONAL: u8 = 37;
 }
 
-/// Header flags. The other bits are reserved: writers clear them, and
-/// readers drop them.
+/// Header flags. The other bits are reserved. The message reader ignores
+/// them, and the message writer refuses them. A raw [`Header`] keeps them.
 pub mod flags {
     /// Set in every message the original initiator of the IKE SA sends.
     pub const INITIATOR: u8 = 0x08;
@@ -315,6 +319,8 @@ pub mod notify {
 /// Why bytes are not an IKEv2 message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The bytes end before the header does, or before the length the
     /// header gives.
     Short,
@@ -344,6 +350,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Short => f.write_str("message cut short"),
             Error::Version(v) => write!(f, "version byte {v:#04x}, not IKEv2"),
             Error::MessageLength(n) => write!(f, "message length {n}, outside {HEADER_LEN}..={MAX_MESSAGE}"),
@@ -382,25 +389,6 @@ pub struct Header {
 }
 
 impl Header {
-    /// Reads the header at the start of `b`. Only too few bytes is an
-    /// error.
-    pub fn parse(b: &[u8]) -> Result<Header, Error> {
-        let mut r = Reader::new(b);
-        let h = (|| {
-            Some(Header {
-                initiator_spi: r.u64()?,
-                responder_spi: r.u64()?,
-                next_payload: r.u8()?,
-                version: r.u8()?,
-                exchange: r.u8()?,
-                flags: r.u8()?,
-                message_id: r.u32()?,
-                length: r.u32()?,
-            })
-        })();
-        h.ok_or(Error::Short)
-    }
-
     /// The major version.
     pub fn major(&self) -> u8 {
         self.version >> 4
@@ -411,19 +399,7 @@ impl Header {
         self.version & 0x0f
     }
 
-    /// The header's bytes, as they are.
-    pub fn to_bytes(&self) -> [u8; HEADER_LEN] {
-        let mut out = [0u8; HEADER_LEN];
-        out[0..8].copy_from_slice(&self.initiator_spi.to_be_bytes());
-        out[8..16].copy_from_slice(&self.responder_spi.to_be_bytes());
-        out[16] = self.next_payload;
-        out[17] = self.version;
-        out[18] = self.exchange;
-        out[19] = self.flags;
-        out[20..24].copy_from_slice(&self.message_id.to_be_bytes());
-        out[24..28].copy_from_slice(&self.length.to_be_bytes());
-        out
-    }
+
 }
 
 /// One IKEv2 message: the header's fields and the payloads. The header's
@@ -435,13 +411,12 @@ pub struct Message {
     pub initiator_spi: u64,
     /// The SPI the responder chose, or 0 in the first request.
     pub responder_spi: u64,
-    /// The minor version, 0 for RFC 7296. Only its low four bits are
-    /// written.
+    /// The minor version, 0 for RFC 7296. The writer refuses values above 15.
     pub minor_version: u8,
     /// The exchange type: see [`exchange`].
     pub exchange: u8,
-    /// The flags: see [`flags`]. Only the three defined bits are read or
-    /// written.
+    /// The flags: see [`flags`]. The reader keeps only the three defined
+    /// bits. The writer refuses any other bits.
     pub flags: u8,
     /// Counts the requests in each direction. A response carries its
     /// request's ID.
@@ -451,63 +426,6 @@ pub struct Message {
 }
 
 impl Message {
-    /// Reads the message in `b`, which must be exactly one message, as a
-    /// UDP datagram on port 500 carries it.
-    pub fn parse(b: &[u8]) -> Result<Message, Error> {
-        let h = Header::parse(b)?;
-        if h.major() != MAJOR_VERSION {
-            return Err(Error::Version(h.version));
-        }
-        let length = h.length as usize;
-        if !(HEADER_LEN..=MAX_MESSAGE).contains(&length) {
-            return Err(Error::MessageLength(h.length));
-        }
-        if b.len() < length {
-            return Err(Error::Short);
-        }
-        if b.len() > length {
-            return Err(Error::Trailing);
-        }
-        let payloads = parse_payloads(h.next_payload, &b[HEADER_LEN..])?;
-        Ok(Message {
-            initiator_spi: h.initiator_spi,
-            responder_spi: h.responder_spi,
-            minor_version: h.minor(),
-            exchange: h.exchange,
-            flags: h.flags & flags::ALL,
-            message_id: h.message_id,
-            payloads,
-        })
-    }
-
-    /// The message's bytes. Payloads that do not fit in [`MAX_MESSAGE`]
-    /// bytes are cut or left out, as [`payloads_to_bytes`] says.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let (first, chain) = write_chain(&self.payloads, MAX_CHAIN);
-        let header = Header {
-            initiator_spi: self.initiator_spi,
-            responder_spi: self.responder_spi,
-            next_payload: first,
-            version: MAJOR_VERSION << 4 | (self.minor_version & 0x0f),
-            exchange: self.exchange,
-            flags: self.flags & flags::ALL,
-            message_id: self.message_id,
-            length: (HEADER_LEN + chain.len()) as u32,
-        };
-        let mut out = Vec::with_capacity(HEADER_LEN + chain.len());
-        out.extend_from_slice(&header.to_bytes());
-        out.extend_from_slice(&chain);
-        out
-    }
-
-    /// The message's bytes behind the [`NON_ESP_MARKER`], as a UDP
-    /// datagram on port 4500 carries it.
-    pub fn to_nat_t_bytes(&self) -> Vec<u8> {
-        let mut out = NON_ESP_MARKER.to_vec();
-        out.extend_from_slice(&self.to_bytes());
-        out
-    }
-
     /// Whether the message is a response.
     pub fn is_response(&self) -> bool {
         self.flags & flags::RESPONSE != 0
@@ -562,28 +480,13 @@ impl Message {
 
 /// What a UDP datagram on port 4500 holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NatT<'a> {
+pub enum NatT {
     /// An IKE message, after the non-ESP marker.
     Ike(Message),
     /// An ESP packet, all of it, starting with its nonzero SPI.
-    Esp(&'a [u8]),
+    Esp(Vec<u8>),
     /// A NAT keepalive: the single byte [`NAT_KEEPALIVE`].
     Keepalive,
-}
-
-impl<'a> NatT<'a> {
-    /// Reads a datagram that came to port 4500. Fewer than four bytes,
-    /// other than a keepalive, is [`Error::Short`].
-    pub fn parse(b: &'a [u8]) -> Result<NatT<'a>, Error> {
-        if b == [NAT_KEEPALIVE] {
-            return Ok(NatT::Keepalive);
-        }
-        match b.get(..4) {
-            None => Err(Error::Short),
-            Some(m) if m == NON_ESP_MARKER => Message::parse(&b[4..]).map(NatT::Ike),
-            Some(_) => Ok(NatT::Esp(b)),
-        }
-    }
 }
 
 /// One payload: the critical bit from its generic header, and its body.
@@ -640,7 +543,7 @@ pub enum Body {
     /// SKF: one fragment of an SK payload (RFC 7383), kept as bytes.
     EncryptedFragment(EncryptedFragment),
     /// Any other payload type, such as CERT, AUTH, CP or EAP, with its
-    /// body unread. The writer leaves out one whose `kind` is 0 or a type
+    /// body unread. The writer refuses one whose `kind` is 0 or a type
     /// another variant covers.
     Other {
         /// The payload type.
@@ -702,7 +605,7 @@ pub struct Transform {
 /// One transform attribute.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
-    /// The attribute type, 15 bits. Only the low 15 bits are written.
+    /// The attribute type, 15 bits. The writer refuses values above 0x7FFF.
     pub kind: u16,
     /// The value.
     pub value: AttributeValue,
@@ -759,7 +662,7 @@ pub struct Delete {
     pub protocol: u8,
     /// The length of each SPI: 0 for IKE, 4 for ESP and AH.
     pub spi_size: u8,
-    /// The SPIs of the SAs to delete. The writer leaves out any whose
+    /// The SPIs of the SAs to delete. The writer refuses any whose
     /// length is not `spi_size`, and any past [`MAX_DELETE_SPIS`].
     pub spis: Vec<Vec<u8>>,
 }
@@ -793,7 +696,7 @@ pub enum TrafficSelector {
         /// The last address.
         end: Ipv6Addr,
     },
-    /// Any other selector type, unread. The writer leaves out one whose
+    /// Any other selector type, unread. The writer refuses one whose
     /// `kind` is one of the two above.
     Other {
         /// The selector type.
@@ -818,7 +721,7 @@ pub struct Encrypted {
 
 /// The body of an SKF payload. RFC 7383 has a receiver discard a fragment
 /// that breaks the rules in [`EncryptedFragment::is_valid`], so the reader
-/// rejects one, and the writer leaves one out.
+/// and writer refuse one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EncryptedFragment {
     /// The type of the first payload inside, in the first fragment. In
@@ -882,20 +785,6 @@ pub fn parse_payloads(first: u8, b: &[u8]) -> Result<Vec<Payload>, Error> {
         return Err(Error::Trailing);
     }
     Ok(out)
-}
-
-/// Writes a payload chain and gives the type of its first payload, 0 if
-/// there is none. [`parse_payloads`] reads it back. The chain is at most
-/// [`MAX_CHAIN`] bytes, the most a message can hold, so the payloads of
-/// any message read here write back in full. A world that puts the chain
-/// inside an SK payload must check that the ciphertext still fits. A
-/// writer keeps payloads in order and stops at the first one that will not
-/// fit, after [`MAX_PAYLOADS`], or after an SK or SKF payload, which must
-/// come last. Variable-length fields of the last payload written are
-/// cut to fit. It leaves out [`Body::Other`] payloads of a type another
-/// variant covers, and SKF payloads whose fields break RFC 7383.
-pub fn payloads_to_bytes(payloads: &[Payload]) -> (u8, Vec<u8>) {
-    write_chain(payloads, MAX_CHAIN)
 }
 
 /// Whether RFC 7296 or RFC 7383 defines payload type `kind`.
@@ -1138,16 +1027,15 @@ fn parse_selectors(k: u8, b: &[u8]) -> Result<Vec<TrafficSelector>, Error> {
     Ok(out)
 }
 
-/// Writes payloads into at most `cap` bytes, as [`payloads_to_bytes`]
-/// describes.
-fn write_chain(payloads: &[Payload], cap: usize) -> (u8, Vec<u8>) {
+/// Writes a complete payload chain, refusing values that exceed `cap`.
+fn write_chain(payloads: &[Payload], cap: usize) -> Option<(u8, Vec<u8>)> {
     // Each part: its type, the next payload field it would give an SK or
     // SKF payload, its critical bit and its body.
     let mut parts: Vec<(u8, Option<u8>, bool, Vec<u8>)> = Vec::new();
     let mut used = 0usize;
-    for p in payloads {
+    for (i, p) in payloads.iter().enumerate() {
         if parts.len() == MAX_PAYLOADS {
-            break;
+            return None;
         }
         let unreadable = match &p.body {
             Body::Other { kind, .. } => *kind == payload::NONE || is_typed(*kind),
@@ -1155,14 +1043,14 @@ fn write_chain(payloads: &[Payload], cap: usize) -> (u8, Vec<u8>) {
             _ => false,
         };
         if unreadable {
-            continue;
+            return None;
         }
         let room = cap.saturating_sub(used);
         if room < PAYLOAD_HEADER_LEN {
-            break;
+            return None;
         }
         let room = (room - PAYLOAD_HEADER_LEN).min(MAX_BODY);
-        let Some(body) = write_body(&p.body, room) else { break };
+        let body = write_body(&p.body, room)?;
         used += PAYLOAD_HEADER_LEN + body.len();
         let inner = match &p.body {
             Body::Encrypted(e) => Some(e.first_payload),
@@ -1170,9 +1058,7 @@ fn write_chain(payloads: &[Payload], cap: usize) -> (u8, Vec<u8>) {
             _ => None,
         };
         parts.push((p.kind(), inner, p.critical, body));
-        if inner.is_some() {
-            break;
-        }
+        if inner.is_some() && i + 1 != payloads.len() { return None; }
     }
     let first = parts.first().map_or(payload::NONE, |p| p.0);
     let mut out = Vec::with_capacity(used);
@@ -1186,12 +1072,12 @@ fn write_chain(payloads: &[Payload], cap: usize) -> (u8, Vec<u8>) {
         out.extend_from_slice(&((PAYLOAD_HEADER_LEN + body.len()) as u16).to_be_bytes());
         out.extend_from_slice(body);
     }
-    (first, out)
+    Some((first, out))
 }
 
-/// At most the first `room` bytes of `data`.
-fn fit(data: &[u8], room: usize) -> &[u8] {
-    &data[..data.len().min(room)]
+/// The whole slice if it fits in `room`.
+fn fit(data: &[u8], room: usize) -> Option<&[u8]> {
+    (data.len() <= room).then_some(data)
 }
 
 /// A body in at most `room` bytes, or `None` if its fixed fields do not
@@ -1200,35 +1086,35 @@ fn write_body(body: &Body, room: usize) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     let fixed = |n: usize| if room >= n { Some(()) } else { None };
     match body {
-        Body::SecurityAssociation(props) => write_sa(props, room, &mut out),
+        Body::SecurityAssociation(props) => write_sa(props, room, &mut out)?,
         Body::KeyExchange(ke) => {
             fixed(4)?;
             out.extend_from_slice(&ke.group.to_be_bytes());
             out.extend_from_slice(&[0, 0]);
-            out.extend_from_slice(fit(&ke.data, room - 4));
+            out.extend_from_slice(fit(&ke.data, room - 4)?);
         }
         Body::IdInitiator(ident) | Body::IdResponder(ident) => {
             fixed(4)?;
             out.extend_from_slice(&[ident.kind, 0, 0, 0]);
-            out.extend_from_slice(fit(&ident.data, room - 4));
+            out.extend_from_slice(fit(&ident.data, room - 4)?);
         }
         Body::Nonce(data) | Body::VendorId(data) | Body::Other { data, .. } => {
-            out.extend_from_slice(fit(data, room));
+            out.extend_from_slice(fit(data, room)?);
         }
         Body::Notify(n) => {
-            let spi = fit(&n.spi, MAX_SPI);
+            let spi = fit(&n.spi, MAX_SPI)?;
             fixed(4 + spi.len())?;
             out.extend_from_slice(&[n.protocol, spi.len() as u8]);
             out.extend_from_slice(&n.kind.to_be_bytes());
             out.extend_from_slice(spi);
-            out.extend_from_slice(fit(&n.data, room - 4 - spi.len()));
+            out.extend_from_slice(fit(&n.data, room - 4 - spi.len())?);
         }
         Body::Delete(d) => {
             fixed(4)?;
             let size = usize::from(d.spi_size);
             let fits = if size == 0 { MAX_DELETE_SPIS } else { (room - 4) / size };
-            let spis: Vec<&Vec<u8>> =
-                d.spis.iter().filter(|s| s.len() == size).take(MAX_DELETE_SPIS.min(fits)).collect();
+            if d.spis.len() > MAX_DELETE_SPIS.min(fits) || d.spis.iter().any(|s| s.len() != size) { return None; }
+            let spis = &d.spis;
             out.extend_from_slice(&[d.protocol, d.spi_size]);
             out.extend_from_slice(&(spis.len() as u16).to_be_bytes());
             for s in spis {
@@ -1237,41 +1123,44 @@ fn write_body(body: &Body, room: usize) -> Option<Vec<u8>> {
         }
         Body::TsInitiator(sel) | Body::TsResponder(sel) => {
             fixed(4)?;
-            write_selectors(sel, room, &mut out);
+            write_selectors(sel, room, &mut out)?;
         }
-        Body::Encrypted(e) => out.extend_from_slice(fit(&e.data, room)),
+        Body::Encrypted(e) => out.extend_from_slice(fit(&e.data, room)?),
         Body::EncryptedFragment(f) => {
             fixed(4)?;
             out.extend_from_slice(&f.number.to_be_bytes());
             out.extend_from_slice(&f.total.to_be_bytes());
-            out.extend_from_slice(fit(&f.data, room - 4));
+            out.extend_from_slice(fit(&f.data, room - 4)?);
         }
     }
     Some(out)
 }
 
-fn write_sa(props: &[Proposal], room: usize, out: &mut Vec<u8>) {
+fn write_sa(props: &[Proposal], room: usize, out: &mut Vec<u8>) -> Option<()> {
+    if props.len() > MAX_PROPOSALS { return None; }
     let mut last = None;
-    for p in props.iter().take(MAX_PROPOSALS) {
-        let Some(bytes) = write_proposal(p, room - out.len()) else { break };
+    for p in props {
+        let bytes = write_proposal(p, room.checked_sub(out.len())?)?;
         last = Some(out.len());
         out.extend_from_slice(&bytes);
     }
     if let Some(i) = last {
         out[i] = 0;
     }
+    Some(())
 }
 
 fn write_proposal(p: &Proposal, room: usize) -> Option<Vec<u8>> {
-    let spi = fit(&p.spi, MAX_SPI);
+    let spi = fit(&p.spi, MAX_SPI)?;
     if 8 + spi.len() > room {
         return None;
     }
     let mut out = vec![2, 0, 0, 0, p.number, p.protocol, spi.len() as u8, 0];
     out.extend_from_slice(spi);
     let (mut n, mut last) = (0u8, None);
-    for t in p.transforms.iter().take(MAX_TRANSFORMS) {
-        let Some(bytes) = write_transform(t, room - out.len()) else { break };
+    if p.transforms.len() > MAX_TRANSFORMS { return None; }
+    for t in &p.transforms {
+        let bytes = write_transform(t, room.checked_sub(out.len())?)?;
         last = Some(out.len());
         out.extend_from_slice(&bytes);
         n += 1;
@@ -1292,7 +1181,9 @@ fn write_transform(t: &Transform, room: usize) -> Option<Vec<u8>> {
     }
     let mut out = vec![3, 0, 0, 0, t.kind, 0];
     out.extend_from_slice(&t.id.to_be_bytes());
-    for a in t.attributes.iter().take(MAX_ATTRIBUTES) {
+    if t.attributes.len() > MAX_ATTRIBUTES { return None; }
+    for a in &t.attributes {
+        if a.kind > 0x7fff { return None; }
         let kind = a.kind & 0x7fff;
         let mut bytes = Vec::new();
         match &a.value {
@@ -1301,14 +1192,14 @@ fn write_transform(t: &Transform, room: usize) -> Option<Vec<u8>> {
                 bytes.extend_from_slice(&v.to_be_bytes());
             }
             AttributeValue::Long(v) => {
-                let v = fit(v, usize::from(u16::MAX));
+                let v = fit(v, usize::from(u16::MAX))?;
                 bytes.extend_from_slice(&kind.to_be_bytes());
                 bytes.extend_from_slice(&(v.len() as u16).to_be_bytes());
                 bytes.extend_from_slice(v);
             }
         }
         if out.len() + bytes.len() > room {
-            break;
+            return None;
         }
         out.extend_from_slice(&bytes);
     }
@@ -1317,12 +1208,12 @@ fn write_transform(t: &Transform, room: usize) -> Option<Vec<u8>> {
     Some(out)
 }
 
-fn write_selectors(sel: &[TrafficSelector], room: usize, out: &mut Vec<u8>) {
+fn write_selectors(sel: &[TrafficSelector], room: usize, out: &mut Vec<u8>) -> Option<()> {
     out.extend_from_slice(&[0, 0, 0, 0]);
     let mut n = 0u8;
     for s in sel {
         if usize::from(n) == MAX_SELECTORS {
-            break;
+            return None;
         }
         let mut bytes = Vec::new();
         match s {
@@ -1342,22 +1233,23 @@ fn write_selectors(sel: &[TrafficSelector], room: usize, out: &mut Vec<u8>) {
             }
             TrafficSelector::Other { kind, protocol, data } => {
                 if *kind == ts::IPV4_ADDR_RANGE || *kind == ts::IPV6_ADDR_RANGE {
-                    continue;
+                    return None;
                 }
                 let room_left = room.saturating_sub(out.len()).saturating_sub(4);
-                let data = fit(data, room_left.min(usize::from(u16::MAX) - 4));
+                let data = fit(data, room_left.min(usize::from(u16::MAX) - 4))?;
                 bytes.extend_from_slice(&[*kind, *protocol]);
                 bytes.extend_from_slice(&((4 + data.len()) as u16).to_be_bytes());
                 bytes.extend_from_slice(data);
             }
         }
         if out.len() + bytes.len() > room {
-            break;
+            return None;
         }
         out.extend_from_slice(&bytes);
         n += 1;
     }
     out[0] = n;
+    Some(())
 }
 
 /// Reads big-endian fields from a slice, giving `None` past its end.
@@ -1396,8 +1288,179 @@ fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
 }
 
+impl Wire for Header {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly the 28-byte header. Refuses short or trailing input.
+    /// The version and flag bytes are kept without validation.
+    fn parse(b: &[u8]) -> Result<Header, Error> {
+        if b.len() != HEADER_LEN { return Err(if b.len() < HEADER_LEN { Error::Short } else { Error::Trailing }); }
+
+        let mut r = Reader::new(b);
+        let h = (|| {
+            Some(Header {
+                initiator_spi: r.u64()?,
+                responder_spi: r.u64()?,
+                next_payload: r.u8()?,
+                version: r.u8()?,
+                exchange: r.u8()?,
+                flags: r.u8()?,
+                message_id: r.u32()?,
+                length: r.u32()?,
+            })
+        })();
+        h.ok_or(Error::Short)
+    }
+
+    /// Appends all header fields unchanged. Refuses allocation failure.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = [0u8; HEADER_LEN];
+        out[0..8].copy_from_slice(&self.initiator_spi.to_be_bytes());
+        out[8..16].copy_from_slice(&self.responder_spi.to_be_bytes());
+        out[16] = self.next_payload;
+        out[17] = self.version;
+        out[18] = self.exchange;
+        out[19] = self.flags;
+        out[20..24].copy_from_slice(&self.message_id.to_be_bytes());
+        out[24..28].copy_from_slice(&self.length.to_be_bytes());
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads the message in `b`, which must be exactly one message, as a
+    /// UDP datagram on port 500 carries it.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Message, Error> {
+        let h = Header::parse(b.get(..HEADER_LEN).ok_or(Error::Short)?)?;
+        if h.major() != MAJOR_VERSION {
+            return Err(Error::Version(h.version));
+        }
+        let length = h.length as usize;
+        if !(HEADER_LEN..=MAX_MESSAGE).contains(&length) {
+            return Err(Error::MessageLength(h.length));
+        }
+        if b.len() < length {
+            return Err(Error::Short);
+        }
+        if b.len() > length {
+            return Err(Error::Trailing);
+        }
+        let payloads = parse_payloads(h.next_payload, &b[HEADER_LEN..])?;
+        Ok(Message {
+            initiator_spi: h.initiator_spi,
+            responder_spi: h.responder_spi,
+            minor_version: h.minor(),
+            exchange: h.exchange,
+            flags: h.flags & flags::ALL,
+            message_id: h.message_id,
+            payloads,
+        })
+    }
+
+    /// Appends the full payload chain. Refuses oversized fields or counts, values outside
+    /// field widths, typed payloads represented as Other, inconsistent SPI lengths and
+    /// payloads after SK or SKF. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let (first, chain) = write_chain(&self.payloads, MAX_CHAIN).ok_or(Error::Unwritable)?;
+        let header = Header {
+            initiator_spi: self.initiator_spi,
+            responder_spi: self.responder_spi,
+            next_payload: first,
+            version: MAJOR_VERSION << 4 | (self.minor_version & 0x0f),
+            exchange: self.exchange,
+            flags: self.flags & flags::ALL,
+            message_id: self.message_id,
+            length: (HEADER_LEN + chain.len()) as u32,
+        };
+        let mut out = Vec::with_capacity(HEADER_LEN + chain.len());
+        header.write(&mut out)?;
+        out.extend_from_slice(&chain);
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for NatT {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a datagram that came to port 4500. Fewer than four bytes,
+    /// other than a keepalive, is [`Error::Short`].
+    /// Refuses input above MAX_MESSAGE + 4 and malformed or trailing IKE bytes.
+    fn parse(b: &[u8]) -> Result<NatT, Error> {
+        if b.len() > MAX_MESSAGE + NON_ESP_MARKER.len() { return Err(Error::Limit("datagram bytes")); }
+
+        if b == [NAT_KEEPALIVE] {
+            return Ok(NatT::Keepalive);
+        }
+        match b.get(..4) {
+            None => Err(Error::Short),
+            Some(m) if m == NON_ESP_MARKER => Message::parse(&b[4..]).map(NatT::Ike),
+            Some(_) => Ok(NatT::Esp(b.to_vec())),
+        }
+    }
+
+    /// Appends the UDP payload. Refuses unwritable IKE messages and ESP data shorter
+    /// than four bytes, above MAX_MESSAGE + 4, or beginning with the non-ESP marker.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = Vec::new();
+        match self {
+            NatT::Keepalive => out.push(NAT_KEEPALIVE),
+            NatT::Ike(message) => { out.extend_from_slice(&NON_ESP_MARKER); message.write(&mut out)?; }
+            NatT::Esp(data) => {
+                if data.len() < 4 || data.len() > MAX_MESSAGE + 4 || data[..4] == NON_ESP_MARKER {
+                    return Err(Error::Unwritable);
+                }
+                out.extend_from_slice(data);
+            }
+        }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+/// An IKE payload chain whose first payload type is supplied by its enclosing header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Payloads<const FIRST: u8>(
+    /// Payloads in chain order.
+    pub Vec<Payload>,
+);
+
+impl<const FIRST: u8> Wire for Payloads<FIRST> {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a whole chain. Refuses malformed payloads, trailing bytes and named limits.
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        parse_payloads(FIRST, b).map(Self)
+    }
+
+    /// Appends the whole chain. Refuses a different first type or any field that would change.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let (first, bytes) = write_chain(&self.0, MAX_CHAIN).ok_or(Error::Unwritable)?;
+        if first != FIRST || parse_payloads(first, &bytes).as_ref() != Ok(&self.0) {
+            return Err(Error::Unwritable);
+        }
+        out.try_reserve(bytes.len()).map_err(|_| Error::Unwritable)?;
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
 
     /// An IKE_SA_INIT request laid out by hand from the figures in RFC
@@ -1466,7 +1529,7 @@ mod tests {
         assert_eq!(m.notify(notify::NAT_DETECTION_SOURCE_IP).unwrap().data, [0xde, 0xad, 0xbe, 0xef]);
         assert!(m.notify(notify::INITIAL_CONTACT).is_none());
         // Written back, the bytes are the same.
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
     }
 
     #[test]
@@ -1483,15 +1546,15 @@ mod tests {
     #[test]
     fn header_and_version() {
         let mut bytes = sa_init_bytes();
-        let h = Header::parse(&bytes).unwrap();
+        let h = Header::parse(&bytes[..HEADER_LEN]).unwrap();
         assert_eq!((h.major(), h.minor()), (2, 0));
         assert_eq!(h.length as usize, bytes.len());
-        assert_eq!(h.to_bytes(), bytes[..28]);
+        assert_eq!(h.to_bytes().unwrap(), bytes[..28]);
         assert_eq!(Header::parse(&bytes[..27]), Err(Error::Short));
         // IKEv1's version byte, 0x10, is not read, but the header still is.
         bytes[17] = 0x10;
         assert_eq!(Message::parse(&bytes), Err(Error::Version(0x10)));
-        assert_eq!(Header::parse(&bytes).unwrap().major(), 1);
+        assert_eq!(Header::parse(&bytes[..HEADER_LEN]).unwrap().major(), 1);
         // A higher minor version is read and kept.
         bytes[17] = 0x21;
         assert_eq!(Message::parse(&bytes).unwrap().minor_version, 1);
@@ -1528,7 +1591,7 @@ mod tests {
 
     /// A header with `chain` after it and `first` as its next payload.
     fn raw(first: u8, chain: &[u8]) -> Vec<u8> {
-        let mut b = message(vec![]).to_bytes();
+        let mut b = message(vec![]).to_bytes().unwrap();
         b[16] = first;
         b.extend_from_slice(chain);
         let len = (b.len() as u32).to_be_bytes();
@@ -1722,7 +1785,7 @@ mod tests {
     #[test]
     fn every_body_round_trips() {
         let m = message(every_body());
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(Message::parse(&bytes), Ok(m.clone()));
         assert_eq!(m.unsupported_critical(), Some(200));
         // Every prefix is short, and every cut chain is an error.
@@ -1736,7 +1799,9 @@ mod tests {
             }
         }
         // The chain on its own, as inside an SK payload.
-        let (first, chain) = payloads_to_bytes(&m.payloads);
+        let bytes = m.to_bytes().unwrap();
+            let first = bytes[16];
+            let chain = bytes[HEADER_LEN..].to_vec();
         assert_eq!(first, payload::SA);
         assert_eq!(chain, bytes[HEADER_LEN..]);
         assert_eq!(parse_payloads(first, &chain), Ok(m.payloads));
@@ -1752,7 +1817,7 @@ mod tests {
             data: vec![1, 2, 3],
         }));
         let m = message(vec![f.clone()]);
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes[HEADER_LEN..], [payload::IDI, 0, 0, 11, 0, 1, 0, 3, 1, 2, 3]);
         assert_eq!(Message::parse(&bytes), Ok(m));
     }
@@ -1775,19 +1840,20 @@ mod tests {
             let e = Message::parse(&raw(skf, &chain(next, number, total))).unwrap_err();
             assert!(is_body(e, skf), "{next} {number} {total}");
         }
-        // The writer leaves out a fragment the reader would reject.
+        // The writer refuses invalid fragment fields.
         let frag = |first_payload, number, total| {
             Payload::new(Body::EncryptedFragment(EncryptedFragment { first_payload, number, total, data: vec![1] }))
         };
         let nonce = Payload::new(Body::Nonce(vec![1; 16]));
         for bad in [frag(0, 0, 1), frag(0, 2, 1), frag(0, 1, 0), frag(payload::IDI, 2, 3)] {
             let m = message(vec![bad, nonce.clone()]);
-            assert_eq!(Message::parse(&m.to_bytes()).unwrap().payloads, std::slice::from_ref(&nonce));
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+            contract::check_wire_value(&m);
         }
     }
 
     #[test]
-    fn writers_leave_out_what_cannot_be_read() {
+    fn writers_refuse_invalid_values() {
         let m = message(vec![
             Payload::new(Body::Other { kind: payload::SA, data: vec![1] }),
             Payload::new(Body::Other { kind: 0, data: vec![1] }),
@@ -1795,32 +1861,33 @@ mod tests {
             Payload::new(Body::Encrypted(Encrypted { first_payload: 0, data: vec![] })),
             Payload::new(Body::Nonce(vec![2; 16])),
         ]);
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        assert_eq!(back.payloads, m.payloads[2..4]);
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&m);
         // Delete SPIs of the wrong size, and selectors typed as Other.
         let m = message(vec![
             Payload::new(Body::Delete(Delete { protocol: 3, spi_size: 4, spis: vec![vec![1; 4], vec![1; 3]] })),
             Payload::new(Body::TsInitiator(vec![TrafficSelector::Other { kind: 7, protocol: 0, data: vec![0; 12] }])),
         ]);
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        assert_eq!(back.payloads[0].body, Body::Delete(Delete { protocol: 3, spi_size: 4, spis: vec![vec![1; 4]] }));
-        assert_eq!(back.payloads[1].body, Body::TsInitiator(vec![]));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        for payload in &m.payloads {
+            let one = message(vec![payload.clone()]);
+            assert_eq!(one.to_bytes(), Err(Error::Unwritable));
+            contract::check_wire_value(&one);
+        }
         // Reserved flag bits and high minor-version bits.
         let mut m = message(vec![]);
         m.flags = 0xff;
         m.minor_version = 0xf3;
-        let back = Message::parse(&m.to_bytes()).unwrap();
-        assert_eq!((back.flags, back.minor_version), (flags::ALL, 3));
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&m);
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
+    fn writers_refuse_oversized_values() {
         let huge = vec![0xab; 100_000];
         let m = message(vec![Payload::new(Body::Nonce(huge.clone())), Payload::new(Body::VendorId(huge.clone()))]);
-        let bytes = m.to_bytes();
-        assert_eq!(bytes.len(), MAX_MESSAGE);
-        let back = Message::parse(&bytes).unwrap();
-        assert_eq!(back.payloads.len(), 1);
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&m);
         // A long chain of every kind of oversized body.
         // Each attribute value is too long on its own, and the counts are
         // past the limits.
@@ -1853,17 +1920,15 @@ mod tests {
         ];
         for b in &bodies {
             let m = message(vec![Payload::new(b.clone())]);
-            let bytes = m.to_bytes();
-            assert!(bytes.len() <= MAX_MESSAGE);
-            let back = Message::parse(&bytes).unwrap();
-            assert_eq!(Message::parse(&back.to_bytes()), Ok(back));
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable));
+            contract::check_wire_value(&m);
             // Behind a full nonce, there is little room left.
             let m = message(vec![Payload::new(Body::Nonce(vec![0; MAX_BODY - 10])), Payload::new(b.clone())]);
-            assert!(Message::parse(&m.to_bytes()).is_ok());
+            assert_eq!(m.to_bytes(), Err(Error::Unwritable));
         }
         // More payloads than allowed.
         let m = message(vec![Payload::new(Body::Nonce(vec![])); 500]);
-        assert_eq!(Message::parse(&m.to_bytes()).unwrap().payloads.len(), MAX_PAYLOADS);
+        assert_eq!(m.to_bytes(), Err(Error::Unwritable));
     }
 
     /// A message can hold a chain a few bytes longer than one payload body.
@@ -1874,11 +1939,13 @@ mod tests {
         let a = Payload::new(Body::VendorId(vec![1; 40_000]));
         let b = Payload::new(Body::Nonce(vec![2; MAX_CHAIN - 8 - 40_000]));
         let m = message(vec![a, b]);
-        let bytes = m.to_bytes();
+        let bytes = m.to_bytes().unwrap();
         assert_eq!(bytes.len(), MAX_MESSAGE);
         let back = Message::parse(&bytes).unwrap();
         assert_eq!(back, m);
-        let (first, chain) = payloads_to_bytes(&back.payloads);
+        let bytes = back.to_bytes().unwrap();
+        let first = bytes[16];
+        let chain = bytes[HEADER_LEN..].to_vec();
         assert_eq!(chain, bytes[HEADER_LEN..]);
         assert_eq!(parse_payloads(first, &chain), Ok(back.payloads));
         // One byte more than a message can hold.
@@ -1897,15 +1964,21 @@ mod tests {
     #[test]
     fn nat_t() {
         let m = message(every_body());
-        let bytes = m.to_nat_t_bytes();
+        let bytes = NatT::Ike(m.clone()).to_bytes().unwrap();
         assert_eq!(bytes[..4], NON_ESP_MARKER);
         assert_eq!(NatT::parse(&bytes), Ok(NatT::Ike(m)));
         assert_eq!(NatT::parse(&[0xff]), Ok(NatT::Keepalive));
         let esp = [0, 0, 1, 0, 0, 0, 0, 1, 0xaa];
-        assert_eq!(NatT::parse(&esp), Ok(NatT::Esp(&esp)));
+        assert_eq!(NatT::parse(&esp), Ok(NatT::Esp(esp.to_vec())));
         assert_eq!(NatT::parse(&[]), Err(Error::Short));
         assert_eq!(NatT::parse(&[0, 0, 0]), Err(Error::Short));
         assert_eq!(NatT::parse(&[0, 0, 0, 0]), Err(Error::Short));
+        let mut largest = vec![1; MAX_MESSAGE + NON_ESP_MARKER.len()];
+        contract::check_wire::<NatT>(&largest);
+        assert!(matches!(NatT::parse(&largest), Ok(NatT::Esp(_))));
+        largest.push(1);
+        assert_eq!(NatT::parse(&largest), Err(Error::Limit("datagram bytes")));
+        contract::check_wire_value(&NatT::Esp(largest));
         for n in 0..bytes.len() {
             assert!(NatT::parse(&bytes[..n]).is_err() || bytes[..n] == [0xff]);
         }
@@ -1931,69 +2004,71 @@ mod tests {
         assert_eq!(m.unsupported_critical(), None);
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) as u8
-        }
-    }
-
     /// What the fuzz target checks: whatever reads, writes and reads back
     /// the same, and every prefix and chain reader runs without a panic.
     fn check(data: &[u8]) {
+        contract::check_wire::<Header>(data);
+        contract::check_wire::<Message>(data);
+        contract::check_wire::<NatT>(data);
+        contract::check_wire::<Payloads<0>>(data);
+        contract::check_wire::<Payloads<33>>(data);
+        contract::check_wire::<Payloads<40>>(data);
+        contract::check_wire::<Payloads<46>>(data);
+
         if let Ok(m) = Message::parse(data) {
-            let bytes = m.to_bytes();
+            let bytes = m.to_bytes().unwrap();
             assert!(bytes.len() <= data.len());
             assert_eq!(Message::parse(&bytes).as_ref(), Ok(&m));
             for n in 0..bytes.len() {
                 assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
             }
-            let (first, chain) = payloads_to_bytes(&m.payloads);
+            let bytes = m.to_bytes().unwrap();
+            let first = bytes[16];
+            let chain = bytes[HEADER_LEN..].to_vec();
             assert_eq!(parse_payloads(first, &chain).as_ref(), Ok(&m.payloads));
         }
         if let Ok(NatT::Ike(m)) = NatT::parse(data) {
-            assert_eq!(NatT::parse(&m.to_nat_t_bytes()), Ok(NatT::Ike(m)));
+            assert_eq!(NatT::parse(&NatT::Ike(m.clone()).to_bytes().unwrap()), Ok(NatT::Ike(m)));
         }
         let _ = Header::parse(data);
         if let Some((&first, rest)) = data.split_first()
             && let Ok(p) = parse_payloads(first, rest)
         {
-            let (f, chain) = payloads_to_bytes(&p);
-            assert_eq!(parse_payloads(f, &chain), Ok(p));
+            let bytes = message(p.clone()).to_bytes().unwrap();
+            assert_eq!(parse_payloads(bytes[16], &bytes[HEADER_LEN..]), Ok(p));
         }
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut s = Lcg(0x1e2f);
-        let seeds = [sa_init_bytes(), message(every_body()).to_bytes()];
+        let mut s = Lcg::new(0x1e2f);
+        let seeds = [sa_init_bytes(), message(every_body()).to_bytes().unwrap()];
         let mut parsed = 0;
         for i in 0..6000 {
             let mut data = seeds[i % 2].clone();
             match i % 3 {
                 // Flip a few bytes past the header's length.
                 0 => {
-                    for _ in 0..1 + s.next() % 4 {
-                        let at = HEADER_LEN + usize::from(s.next()) * 256 % (data.len() - HEADER_LEN);
-                        data[at] = s.next();
-                    }
+                    let mut chain = data.split_off(HEADER_LEN);
+                    for _ in 0..1 + s.index(4) { mutate(&mut s, &mut chain); }
+                    data.extend(chain);
+                    let len = (data.len() as u32).to_be_bytes();
+                    data[24..28].copy_from_slice(&len);
                 }
                 // Cut it and fix the length.
                 1 => {
                     let n =
-                        HEADER_LEN + (usize::from(s.next()) << 8 | usize::from(s.next())) % (data.len() - HEADER_LEN);
+                        HEADER_LEN + s.index(data.len() - HEADER_LEN);
                     data.truncate(n);
                     let len = (n as u32).to_be_bytes();
                     data[24..28].copy_from_slice(&len);
                 }
                 // Random bytes behind a valid header.
                 _ => {
-                    let n = usize::from(s.next()) + usize::from(s.next());
+                    let n = usize::from(s.next() as u8) + usize::from(s.next() as u8);
                     data.truncate(HEADER_LEN);
-                    data[16] = [33, 34, 40, 41, 42, 44, 46, 53, 0, 99][usize::from(s.next()) % 10];
-                    data.extend((0..n).map(|_| s.next()));
+                    data[16] = [33, 34, 40, 41, 42, 44, 46, 53, 0, 99][s.index(10)];
+                    data.extend((0..n).map(|_| s.next() as u8));
                     let len = (data.len() as u32).to_be_bytes();
                     data[24..28].copy_from_slice(&len);
                 }
@@ -2011,8 +2086,9 @@ mod tests {
         assert!(parsed > 100, "only {parsed} parsed");
         // Plain random buffers.
         for _ in 0..4000 {
-            let n = usize::from(s.next());
-            let data: Vec<u8> = (0..n).map(|_| s.next()).collect();
+            let n = usize::from(s.next() as u8);
+            let mut data = vec![0; n];
+            s.fill(&mut data);
             check(&data);
         }
     }

@@ -36,10 +36,11 @@
 //! is no stream decoder.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Writers never write what the readers refuse; where a value does
-//! not fit, its doc comment says how it is cut.
+//! likes. Writers refuse values that exceed limits or would change when read.
+//! The destination stays unchanged on error.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::bacnet::{Apdu, Bvlc, IAm, Npdu, ObjectId, Segmentation, WhoIs, unconfirmed};
 //!
 //! // A Who-Is with no range, broadcast by a workstation to port 47808.
@@ -59,9 +60,9 @@
 //!     segmentation: Segmentation::NoSegmentation,
 //!     vendor: 260,
 //! };
-//! let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().to_bytes()).to_bytes());
+//! let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().unwrap().to_bytes().unwrap()).to_bytes().unwrap());
 //! assert_eq!(
-//!     reply.to_bytes(),
+//!     reply.to_bytes().unwrap(),
 //!     [
 //!         0x81, 0x0b, 0x00, 0x15, // BVLC: broadcast, 21 bytes in all
 //!         0x01, 0x00, // NPDU: version 1, no addresses, normal priority
@@ -74,6 +75,9 @@
 //! );
 //! ```
 
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
+
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 /// The UDP port BACnet/IP devices listen on, 0xBAC0.
@@ -83,9 +87,8 @@ pub const BVLC_TYPE: u8 = 0x81;
 /// The length of the BVLC header: type, function and a 2-byte length.
 pub const BVLC_HEADER_LEN: usize = 4;
 /// The longest datagram read or written here: the most a UDP datagram over
-/// IPv4 can carry. The BVLC length field could say more, but no datagram
-/// can hold it, so a longer length is refused and writers cut what they
-/// carry to fit.
+/// IPv4 can carry. Readers and writers refuse larger values even when
+/// they would fit the BVLC length field.
 pub const MAX_MESSAGE: usize = 65_507;
 /// The NPDU protocol version: always 1.
 pub const NPDU_VERSION: u8 = 1;
@@ -94,7 +97,7 @@ pub const MAX_MAC_LEN: usize = 255;
 /// The longest APDU a BACnet/IP device can accept (max-APDU code 5).
 pub const MAX_APDU: usize = 1476;
 /// The longest contents of one tagged value read or written here. Longer
-/// values are refused by [`Value::parse`] and cut by [`Value::write`].
+/// values are refused by [`Value::parse`] and [`Value::write`].
 pub const MAX_VALUE_LEN: usize = MAX_MESSAGE;
 /// The highest object instance number: 22 bits. The value 4194303 also
 /// means "no instance" in some properties.
@@ -215,6 +218,8 @@ pub mod tag {
 /// Why bytes are not the BACnet message a reader expected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The bytes ended before the message did.
     Truncated,
     /// Bytes were left over after a message of fixed size.
@@ -271,6 +276,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Truncated => f.write_str("message ends early"),
             Error::TrailingBytes => f.write_str("bytes left over after the message"),
             Error::NotBacnetIp(t) => write!(f, "BVLC type {t:#04x}, not 0x81 (BACnet/IP)"),
@@ -363,68 +369,6 @@ pub enum Bvlc {
 }
 
 impl Bvlc {
-    /// Reads one datagram. The BVLC length field must match the datagram's
-    /// length, so `b` must be the whole datagram and nothing else.
-    pub fn parse(b: &[u8]) -> Result<Bvlc, Error> {
-        if b.len() < BVLC_HEADER_LEN {
-            return Err(Error::Truncated);
-        }
-        if b[0] != BVLC_TYPE {
-            return Err(Error::NotBacnetIp(b[0]));
-        }
-        let code = b[1];
-        let length = be16(b, 2);
-        let n = usize::from(length);
-        if !(BVLC_HEADER_LEN..=MAX_MESSAGE).contains(&n) || n != b.len() {
-            return Err(Error::Length(length));
-        }
-        let data = &b[BVLC_HEADER_LEN..];
-        let exact = |n: usize| if data.len() == n { Ok(()) } else { Err(Error::FunctionData(code)) };
-        let table = |size: usize| {
-            if data.len().is_multiple_of(size) { Ok(data.chunks_exact(size)) } else { Err(Error::FunctionData(code)) }
-        };
-        Ok(match code {
-            function::RESULT => {
-                exact(2)?;
-                Bvlc::Result(be16(data, 0))
-            }
-            function::WRITE_BROADCAST_DISTRIBUTION_TABLE => Bvlc::WriteBdt(table(10)?.map(bdt_entry).collect()),
-            function::READ_BROADCAST_DISTRIBUTION_TABLE => {
-                exact(0)?;
-                Bvlc::ReadBdt
-            }
-            function::READ_BROADCAST_DISTRIBUTION_TABLE_ACK => Bvlc::ReadBdtAck(table(10)?.map(bdt_entry).collect()),
-            function::FORWARDED_NPDU => {
-                if data.len() < 6 {
-                    return Err(Error::FunctionData(code));
-                }
-                Bvlc::ForwardedNpdu { origin: bip_address(data), npdu: data[6..].to_vec() }
-            }
-            function::REGISTER_FOREIGN_DEVICE => {
-                exact(2)?;
-                Bvlc::RegisterForeignDevice { ttl: be16(data, 0) }
-            }
-            function::READ_FOREIGN_DEVICE_TABLE => {
-                exact(0)?;
-                Bvlc::ReadFdt
-            }
-            function::READ_FOREIGN_DEVICE_TABLE_ACK => Bvlc::ReadFdtAck(
-                table(10)?
-                    .map(|e| FdtEntry { address: bip_address(e), ttl: be16(e, 6), remaining: be16(e, 8) })
-                    .collect(),
-            ),
-            function::DELETE_FOREIGN_DEVICE_TABLE_ENTRY => {
-                exact(6)?;
-                Bvlc::DeleteFdtEntry(bip_address(data))
-            }
-            function::DISTRIBUTE_BROADCAST_TO_NETWORK => Bvlc::DistributeBroadcastToNetwork(data.to_vec()),
-            function::ORIGINAL_UNICAST_NPDU => Bvlc::OriginalUnicastNpdu(data.to_vec()),
-            function::ORIGINAL_BROADCAST_NPDU => Bvlc::OriginalBroadcastNpdu(data.to_vec()),
-            function::SECURE_BVLL => Bvlc::SecureBvll(data.to_vec()),
-            c => return Err(Error::Function(c)),
-        })
-    }
-
     /// The BVLC function code.
     pub fn function(&self) -> u8 {
         match self {
@@ -456,43 +400,7 @@ impl Bvlc {
         }
     }
 
-    /// The datagram's bytes. Data past [`MAX_MESSAGE`] is cut: whole table
-    /// entries are dropped from the end, and NPDUs and secure messages lose
-    /// their last bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let room = MAX_MESSAGE - BVLC_HEADER_LEN;
-        let mut out = vec![BVLC_TYPE, self.function(), 0, 0];
-        match self {
-            Bvlc::Result(code) => out.extend_from_slice(&code.to_be_bytes()),
-            Bvlc::WriteBdt(entries) | Bvlc::ReadBdtAck(entries) => {
-                for e in entries.iter().take(room / 10) {
-                    put_bip_address(&mut out, e.address);
-                    out.extend_from_slice(&e.mask.octets());
-                }
-            }
-            Bvlc::ForwardedNpdu { origin, npdu } => {
-                put_bip_address(&mut out, *origin);
-                out.extend_from_slice(&npdu[..npdu.len().min(room - 6)]);
-            }
-            Bvlc::RegisterForeignDevice { ttl } => out.extend_from_slice(&ttl.to_be_bytes()),
-            Bvlc::ReadBdt | Bvlc::ReadFdt => {}
-            Bvlc::ReadFdtAck(entries) => {
-                for e in entries.iter().take(room / 10) {
-                    put_bip_address(&mut out, e.address);
-                    out.extend_from_slice(&e.ttl.to_be_bytes());
-                    out.extend_from_slice(&e.remaining.to_be_bytes());
-                }
-            }
-            Bvlc::DeleteFdtEntry(address) => put_bip_address(&mut out, *address),
-            Bvlc::DistributeBroadcastToNetwork(data)
-            | Bvlc::OriginalUnicastNpdu(data)
-            | Bvlc::OriginalBroadcastNpdu(data)
-            | Bvlc::SecureBvll(data) => out.extend_from_slice(&data[..data.len().min(room)]),
-        }
-        let len = out.len() as u16; // At most MAX_MESSAGE, which fits.
-        out[2..4].copy_from_slice(&len.to_be_bytes());
-        out
-    }
+
 }
 
 fn bip_address(b: &[u8]) -> SocketAddrV4 {
@@ -594,7 +502,7 @@ pub struct Npdu {
     pub destination: Option<Destination>,
     /// The station that first sent the message, set by a router that
     /// passed it on. `None` means a station on the local network. A source
-    /// with an empty address is not allowed, and is left out when written.
+    /// with an empty address is refused by readers and writers.
     pub source: Option<NetAddress>,
     /// Whether the sender expects a reply: set for confirmed requests,
     /// segments of complex acknowledgments, and network layer messages
@@ -620,55 +528,6 @@ impl Npdu {
         }
     }
 
-    /// Reads an NPDU. The body runs to the end of `b`.
-    pub fn parse(b: &[u8]) -> Result<Npdu, Error> {
-        let mut r = Reader::new(b);
-        let version = r.u8()?;
-        if version != NPDU_VERSION {
-            return Err(Error::Version(version));
-        }
-        let control = r.u8()?;
-        let destination = if control & 0x20 != 0 {
-            let a = net_address(&mut r)?;
-            if a.network == 0 {
-                return Err(Error::Network(0));
-            }
-            Some(a)
-        } else {
-            None
-        };
-        let source = if control & 0x08 != 0 {
-            let a = net_address(&mut r)?;
-            if !valid_source_network(a.network) {
-                return Err(Error::Network(a.network));
-            }
-            if a.mac.is_empty() {
-                return Err(Error::SourceAddress);
-            }
-            Some(a)
-        } else {
-            None
-        };
-        let destination = match destination {
-            Some(address) => Some(Destination { address, hop_count: r.u8()? }),
-            None => None,
-        };
-        let body = if control & 0x80 != 0 {
-            let message_type = r.u8()?;
-            let vendor = if message_type >= 0x80 { Some(r.u16()?) } else { None };
-            NpduBody::Network { message_type, vendor, data: r.rest().to_vec() }
-        } else {
-            NpduBody::Apdu(r.rest().to_vec())
-        };
-        Ok(Npdu {
-            destination,
-            source,
-            expecting_reply: control & 0x04 != 0,
-            priority: Priority::from_bits(control),
-            body,
-        })
-    }
-
     /// The APDU this NPDU carries, if it carries one.
     pub fn apdu(&self) -> Option<&[u8]> {
         match &self.body {
@@ -692,48 +551,7 @@ impl Npdu {
         }
     }
 
-    /// The NPDU's bytes. Addresses longer than [`MAX_MAC_LEN`] are cut. A
-    /// source with an empty address or a network of 0 or 0xFFFF is left
-    /// out, and so is a destination on network 0, which Clause 6.2.2.1
-    /// does not allow: such an NPDU is written for the local network.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let source = self.source.as_ref().filter(|s| !s.mac.is_empty() && valid_source_network(s.network));
-        let destination = self.destination.as_ref().filter(|d| d.address.network != 0);
-        let mut control = self.priority.bits();
-        if matches!(self.body, NpduBody::Network { .. }) {
-            control |= 0x80;
-        }
-        if destination.is_some() {
-            control |= 0x20;
-        }
-        if source.is_some() {
-            control |= 0x08;
-        }
-        if self.expecting_reply {
-            control |= 0x04;
-        }
-        let mut out = vec![NPDU_VERSION, control];
-        if let Some(d) = destination {
-            put_net_address(&mut out, &d.address);
-        }
-        if let Some(s) = source {
-            put_net_address(&mut out, s);
-        }
-        if let Some(d) = destination {
-            out.push(d.hop_count);
-        }
-        match &self.body {
-            NpduBody::Apdu(a) => out.extend_from_slice(a),
-            NpduBody::Network { message_type, vendor, data } => {
-                out.push(*message_type);
-                if *message_type >= 0x80 {
-                    out.extend_from_slice(&vendor.unwrap_or(0).to_be_bytes());
-                }
-                out.extend_from_slice(data);
-            }
-        }
-        out
-    }
+
 }
 
 /// Whether a source network number is allowed: 1 to 65534 (Clause
@@ -757,11 +575,13 @@ fn net_address(r: &mut Reader) -> Result<NetAddress, Error> {
     Ok(NetAddress { network, mac: r.take(usize::from(len))?.to_vec() })
 }
 
-fn put_net_address(out: &mut Vec<u8>, a: &NetAddress) {
-    let mac = &a.mac[..a.mac.len().min(MAX_MAC_LEN)];
+fn put_net_address(out: &mut Vec<u8>, a: &NetAddress) -> Result<(), Error> {
+    if a.mac.len() > MAX_MAC_LEN { return Err(Error::Unwritable); }
+    let mac = &a.mac;
     out.extend_from_slice(&a.network.to_be_bytes());
     out.push(mac.len() as u8);
     out.extend_from_slice(mac);
+    Ok(())
 }
 
 /// The segmentation fields of a segmented confirmed request or complex
@@ -786,10 +606,10 @@ pub enum Apdu {
         /// Whether the client can take a segmented answer.
         segmented_response_accepted: bool,
         /// The most segments the client accepts, as a 3-bit code; see
-        /// [`max_segments`]. Only the low 3 bits are written.
+        /// [`max_segments`]. The writer refuses values above 7.
         max_segments: u8,
         /// The longest APDU the client accepts, as a 4-bit code; see
-        /// [`max_apdu_octets`]. Only the low 4 bits are written.
+        /// [`max_apdu_octets`]. The writer refuses values above 15.
         max_apdu: u8,
         /// Chosen by the client and copied into the answer.
         invoke_id: u8,
@@ -868,57 +688,6 @@ pub enum Apdu {
 }
 
 impl Apdu {
-    /// Reads an APDU. Service bodies run to the end of `b`. Simple
-    /// acknowledgments, segment acknowledgments, rejects and aborts have a
-    /// fixed size, and bytes after them are an error. Reserved bits are
-    /// ignored.
-    pub fn parse(b: &[u8]) -> Result<Apdu, Error> {
-        let mut r = Reader::new(b);
-        let first = r.u8()?;
-        let segment = |r: &mut Reader| -> Result<Option<Segment>, Error> {
-            if first & 0x08 == 0 {
-                return Ok(None);
-            }
-            Ok(Some(Segment { sequence: r.u8()?, window: r.u8()?, more_follows: first & 0x04 != 0 }))
-        };
-        let apdu = match first >> 4 {
-            0 => {
-                let limits = r.u8()?;
-                let invoke_id = r.u8()?;
-                let segment = segment(&mut r)?;
-                Apdu::ConfirmedRequest {
-                    segmented_response_accepted: first & 0x02 != 0,
-                    max_segments: (limits >> 4) & 0x07,
-                    max_apdu: limits & 0x0f,
-                    invoke_id,
-                    segment,
-                    service: r.u8()?,
-                    data: r.rest().to_vec(),
-                }
-            }
-            1 => Apdu::UnconfirmedRequest { service: r.u8()?, data: r.rest().to_vec() },
-            2 => Apdu::SimpleAck { invoke_id: r.u8()?, service: r.u8()? },
-            3 => {
-                let invoke_id = r.u8()?;
-                let segment = segment(&mut r)?;
-                Apdu::ComplexAck { invoke_id, segment, service: r.u8()?, data: r.rest().to_vec() }
-            }
-            4 => Apdu::SegmentAck {
-                negative: first & 0x02 != 0,
-                server: first & 0x01 != 0,
-                invoke_id: r.u8()?,
-                sequence: r.u8()?,
-                window: r.u8()?,
-            },
-            5 => Apdu::Error { invoke_id: r.u8()?, service: r.u8()?, data: r.rest().to_vec() },
-            6 => Apdu::Reject { invoke_id: r.u8()?, reason: r.u8()? },
-            7 => Apdu::Abort { server: first & 0x01 != 0, invoke_id: r.u8()?, reason: r.u8()? },
-            t => return Err(Error::PduType(t)),
-        };
-        r.end()?;
-        Ok(apdu)
-    }
-
     /// The APDU type: the high four bits of its first byte.
     pub fn pdu_type(&self) -> u8 {
         match self {
@@ -975,63 +744,7 @@ impl Apdu {
         }
     }
 
-    /// The APDU's bytes.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let head = self.pdu_type() << 4;
-        let seg_bits = |s: &Option<Segment>| match s {
-            Some(s) => 0x08 | if s.more_follows { 0x04 } else { 0 },
-            None => 0,
-        };
-        let put_segment = |out: &mut Vec<u8>, s: &Option<Segment>| {
-            if let Some(s) = s {
-                out.extend_from_slice(&[s.sequence, s.window]);
-            }
-        };
-        let mut out = Vec::new();
-        match self {
-            Apdu::ConfirmedRequest {
-                segmented_response_accepted,
-                max_segments,
-                max_apdu,
-                invoke_id,
-                segment,
-                service,
-                data,
-            } => {
-                let sa = if *segmented_response_accepted { 0x02 } else { 0 };
-                out.push(head | seg_bits(segment) | sa);
-                out.push((max_segments & 0x07) << 4 | (max_apdu & 0x0f));
-                out.push(*invoke_id);
-                put_segment(&mut out, segment);
-                out.push(*service);
-                out.extend_from_slice(data);
-            }
-            Apdu::UnconfirmedRequest { service, data } => {
-                out.extend_from_slice(&[head, *service]);
-                out.extend_from_slice(data);
-            }
-            Apdu::SimpleAck { invoke_id, service } => out.extend_from_slice(&[head, *invoke_id, *service]),
-            Apdu::ComplexAck { invoke_id, segment, service, data } => {
-                out.extend_from_slice(&[head | seg_bits(segment), *invoke_id]);
-                put_segment(&mut out, segment);
-                out.push(*service);
-                out.extend_from_slice(data);
-            }
-            Apdu::SegmentAck { negative, server, invoke_id, sequence, window } => {
-                let flags = if *negative { 0x02 } else { 0 } | if *server { 0x01 } else { 0 };
-                out.extend_from_slice(&[head | flags, *invoke_id, *sequence, *window]);
-            }
-            Apdu::Error { invoke_id, service, data } => {
-                out.extend_from_slice(&[head, *invoke_id, *service]);
-                out.extend_from_slice(data);
-            }
-            Apdu::Reject { invoke_id, reason } => out.extend_from_slice(&[head, *invoke_id, *reason]),
-            Apdu::Abort { server, invoke_id, reason } => {
-                out.extend_from_slice(&[head | if *server { 0x01 } else { 0 }, *invoke_id, *reason]);
-            }
-        }
-        out
-    }
+
 }
 
 /// The longest APDU, in bytes, that a 4-bit max-APDU code allows
@@ -1086,7 +799,7 @@ pub enum TagContent {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tag {
     /// The tag number. Numbers 15 and up take an extra byte. 255 is
-    /// reserved: readers refuse it and [`Tag::write`] writes it as 254.
+    /// reserved: readers and writers refuse it.
     pub number: u8,
     /// Application or context.
     pub class: Class,
@@ -1099,7 +812,7 @@ impl Tag {
     /// took. It does not check that the contents follow. An extended tag
     /// number of 255, which Clause 20.2.1.2 reserves, is refused, and so is
     /// one below 15, which that clause puts in the first byte.
-    pub fn parse(b: &[u8]) -> Result<(Tag, usize), Error> {
+    fn parse_prefix(b: &[u8]) -> Result<(Tag, usize), Error> {
         let mut r = Reader::new(b);
         let first = r.u8()?;
         let class = if first & 0x08 != 0 { Class::Context } else { Class::Application };
@@ -1124,37 +837,7 @@ impl Tag {
         Ok((Tag { number, class, content }, r.at))
     }
 
-    /// Appends the tag header to `out`, in its shortest form. Opening and
-    /// closing tags are always written as context tags. Tag number 255,
-    /// which is reserved, is written as 254.
-    pub fn write(&self, out: &mut Vec<u8>) {
-        let number = self.number.min(254);
-        let nibble = number.min(15);
-        let (class, lvt, extended) = match self.content {
-            TagContent::Opening => (0x08, 6, None),
-            TagContent::Closing => (0x08, 7, None),
-            TagContent::Length(n) => {
-                let class = if self.class == Class::Context { 0x08 } else { 0 };
-                if n <= 4 { (class, n as u8, None) } else { (class, 5, Some(n)) }
-            }
-        };
-        out.push(nibble << 4 | class | lvt);
-        if number >= 15 {
-            out.push(number);
-        }
-        match extended {
-            None => {}
-            Some(n) if n <= 253 => out.push(n as u8),
-            Some(n) if n <= 0xffff => {
-                out.push(254);
-                out.extend_from_slice(&(n as u16).to_be_bytes());
-            }
-            Some(n) => {
-                out.push(255);
-                out.extend_from_slice(&n.to_be_bytes());
-            }
-        }
-    }
+
 }
 
 /// A date (Clause 20.2.12). Any field may be 255 for "unspecified", and
@@ -1236,7 +919,7 @@ impl CharString {
 }
 
 /// An application-tagged primitive value (Clause 20.2).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Value {
     /// Tag 0.
     Null,
@@ -1266,12 +949,33 @@ pub enum Value {
     ObjectId(ObjectId),
 }
 
+impl PartialEq for Value {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Real(a), Self::Real(b)) => a.to_bits() == b.to_bits(),
+            (Self::Double(a), Self::Double(b)) => a.to_bits() == b.to_bits(),
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Unsigned(a), Self::Unsigned(b)) => a == b,
+            (Self::Signed(a), Self::Signed(b)) => a == b,
+            (Self::OctetString(a), Self::OctetString(b)) => a == b,
+            (Self::CharacterString(a), Self::CharacterString(b)) => a == b,
+            (Self::BitString(a), Self::BitString(b)) => a == b,
+            (Self::Enumerated(a), Self::Enumerated(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
+            (Self::Time(a), Self::Time(b)) => a == b,
+            (Self::ObjectId(a), Self::ObjectId(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl Value {
     /// Reads the application-tagged value at the start of `b`, and how
     /// many bytes it took. Integers may carry leading zero bytes, as
     /// some devices send them.
-    pub fn parse(b: &[u8]) -> Result<(Value, usize), Error> {
-        let (t, header) = Tag::parse(b)?;
+    fn parse_prefix(b: &[u8]) -> Result<(Value, usize), Error> {
+        let (t, header) = Tag::parse_prefix(b)?;
         let TagContent::Length(len) = t.content else { return Err(Error::ContextTag(t.number)) };
         if t.class == Class::Context {
             return Err(Error::ContextTag(t.number));
@@ -1288,20 +992,9 @@ impl Value {
         Ok((Value::from_contents(t.number, c)?, end))
     }
 
-    /// Reads a context-tagged primitive at the start of `b`, and how many
-    /// bytes it took. The tag must be context tag `number`, and its
-    /// contents are read as the application type `as_tag`, from [`tag`].
-    /// A context-tagged Boolean holds one byte, 0 or 1 (Clause 20.2.3).
-    /// Any other tag is [`Error::ServiceBody`].
-    ///
-    /// ```
-    /// use fictionet::stdlib::bacnet::{Value, tag};
-    ///
-    /// // ReadProperty's property identifier: context tag 1, Present_Value.
-    /// assert_eq!(Value::parse_context(&[0x19, 0x55], 1, tag::ENUMERATED), Ok((Value::Enumerated(85), 2)));
-    /// ```
-    pub fn parse_context(b: &[u8], number: u8, as_tag: u8) -> Result<(Value, usize), Error> {
-        let (t, header) = Tag::parse(b)?;
+    /// Reads a schema-selected primitive from the input prefix.
+    fn parse_context(b: &[u8], number: u8, as_tag: u8) -> Result<(Value, usize), Error> {
+        let (t, header) = Tag::parse_prefix(b)?;
         let TagContent::Length(len) = t.content else { return Err(Error::ServiceBody) };
         if t.class != Class::Context || t.number != number {
             return Err(Error::ServiceBody);
@@ -1360,23 +1053,6 @@ impl Value {
         })
     }
 
-    /// Reads values one after another until `b` ends. Input longer than
-    /// [`MAX_MESSAGE`] is refused with [`Error::TooLong`], since each value
-    /// takes more memory than its bytes on the wire.
-    pub fn parse_all(b: &[u8]) -> Result<Vec<Value>, Error> {
-        if b.len() > MAX_MESSAGE {
-            return Err(Error::TooLong);
-        }
-        let mut values = Vec::new();
-        let mut at = 0;
-        while at < b.len() {
-            let (v, used) = Value::parse(&b[at..])?;
-            values.push(v);
-            at += used;
-        }
-        Ok(values)
-    }
-
     /// The value's application tag number.
     pub fn tag(&self) -> u8 {
         match self {
@@ -1396,36 +1072,8 @@ impl Value {
         }
     }
 
-    /// Appends the value, tag and all, to `out`, with integers in their
-    /// shortest form. Strings whose contents would pass [`MAX_VALUE_LEN`]
-    /// lose their last bytes or bits. A UTF-8, UCS-2 or UCS-4 character
-    /// string is cut between characters, never inside one.
-    pub fn write(&self, out: &mut Vec<u8>) {
-        if let Value::Boolean(v) = self {
-            let t = Tag { number: tag::BOOLEAN, class: Class::Application, content: TagContent::Length(u32::from(*v)) };
-            return t.write(out);
-        }
-        self.write_tagged(Class::Application, self.tag(), out);
-    }
-
-    /// Appends the value under context tag `number` to `out`, as service
-    /// bodies carry their fields. A Boolean takes one byte of contents,
-    /// and long strings are cut as [`Value::write`] cuts them. Read it
-    /// back with [`Value::parse_context`].
-    ///
-    /// ```
-    /// use fictionet::stdlib::bacnet::{ObjectId, Value, object_type};
-    ///
-    /// let mut out = Vec::new();
-    /// Value::ObjectId(ObjectId { object_type: object_type::ANALOG_INPUT, instance: 5 }).write_context(0, &mut out);
-    /// Value::Enumerated(85).write_context(1, &mut out);
-    /// assert_eq!(out, [0x0c, 0x00, 0x00, 0x00, 0x05, 0x19, 0x55]);
-    /// ```
-    pub fn write_context(&self, number: u8, out: &mut Vec<u8>) {
-        self.write_tagged(Class::Context, number, out);
-    }
-
-    fn write_tagged(&self, class: Class, number: u8, out: &mut Vec<u8>) {
+    fn write_tagged(&self, class: Class, number: u8, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = Vec::new();
         let mut c = Vec::new();
         match self {
             Value::Null => {}
@@ -1434,13 +1082,17 @@ impl Value {
             Value::Signed(v) => c = int_bytes(*v),
             Value::Real(v) => c.extend_from_slice(&v.to_be_bytes()),
             Value::Double(v) => c.extend_from_slice(&v.to_be_bytes()),
-            Value::OctetString(v) => c.extend_from_slice(&v[..v.len().min(MAX_VALUE_LEN)]),
+            Value::OctetString(v) => {
+                if v.len() > MAX_VALUE_LEN { return Err(Error::Unwritable); }
+                c.extend_from_slice(v);
+            },
             Value::CharacterString(s) => {
                 c.push(s.charset);
-                c.extend_from_slice(&s.bytes[..char_cut(s)]);
+                if s.bytes.len() >= MAX_VALUE_LEN { return Err(Error::Unwritable); }
+                c.extend_from_slice(&s.bytes);
             }
             Value::BitString(bits) => {
-                let bits = &bits[..bits.len().min((MAX_VALUE_LEN - 1) * 8)];
+                if bits.len() > (MAX_VALUE_LEN - 1) * 8 { return Err(Error::Unwritable); }
                 c.push(((8 - bits.len() % 8) % 8) as u8);
                 let mut bytes = vec![0u8; bits.len().div_ceil(8)];
                 for (i, _) in bits.iter().enumerate().filter(|(_, b)| **b) {
@@ -1451,19 +1103,20 @@ impl Value {
             Value::Enumerated(v) => c = uint_bytes(u64::from(*v)),
             Value::Date(d) => c.extend_from_slice(&[d.year, d.month, d.day, d.weekday]),
             Value::Time(t) => c.extend_from_slice(&[t.hour, t.minute, t.second, t.hundredths]),
-            Value::ObjectId(id) => c.extend_from_slice(&id.to_u32().to_be_bytes()),
+            Value::ObjectId(id) => {
+                if id.object_type > MAX_OBJECT_TYPE || id.instance > MAX_INSTANCE { return Err(Error::Unwritable); }
+                c.extend_from_slice(&id.to_u32().to_be_bytes());
+            },
         }
         // c is at most MAX_VALUE_LEN long, so it fits in a u32.
-        Tag { number, class, content: TagContent::Length(c.len() as u32) }.write(out);
+        Tag { number, class, content: TagContent::Length(c.len() as u32) }.write(&mut out)?;
         out.extend_from_slice(&c);
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 
-    /// The value's bytes, tag and all.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        self.write(&mut out);
-        out
-    }
+
 }
 
 /// BACnetSegmentation: which directions a device can segment messages in.
@@ -1513,24 +1166,6 @@ pub struct WhoIs {
 }
 
 impl WhoIs {
-    /// Reads a Who-Is body: empty, or context tags 0 and 1 each holding an
-    /// unsigned device instance.
-    pub fn parse(data: &[u8]) -> Result<WhoIs, Error> {
-        if data.is_empty() {
-            return Ok(WhoIs { range: None });
-        }
-        let (low, used) = context_unsigned(data, 0)?;
-        let rest = &data[used..];
-        let (high, used) = context_unsigned(rest, 1)?;
-        if used != rest.len() {
-            return Err(Error::TrailingBytes);
-        }
-        if low > u64::from(MAX_INSTANCE) || high > u64::from(MAX_INSTANCE) {
-            return Err(Error::OutOfRange);
-        }
-        Ok(WhoIs { range: Some((low as u32, high as u32)) })
-    }
-
     /// Whether the device with this instance number should answer.
     pub fn matches(&self, instance: u32) -> bool {
         match self.range {
@@ -1539,20 +1174,9 @@ impl WhoIs {
         }
     }
 
-    /// The service body.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        if let Some((low, high)) = self.range {
-            for (number, v) in [(0, low), (1, high)] {
-                Value::Unsigned(u64::from(v.min(MAX_INSTANCE))).write_context(number, &mut out);
-            }
-        }
-        out
-    }
-
     /// The unconfirmed request that carries this Who-Is.
-    pub fn to_apdu(&self) -> Apdu {
-        Apdu::UnconfirmedRequest { service: unconfirmed::WHO_IS, data: self.to_bytes() }
+    pub fn to_apdu(&self) -> Result<Apdu, Error> {
+        Ok(Apdu::UnconfirmedRequest { service: unconfirmed::WHO_IS, data: self.to_bytes()? })
     }
 }
 
@@ -1561,7 +1185,7 @@ impl WhoIs {
 pub struct IAm {
     /// The device's object identifier. Its type must be
     /// [`object_type::DEVICE`]: [`IAm::parse`] refuses any other, and
-    /// [`IAm::to_bytes`] writes the type as Device whatever it holds.
+    /// [`IAm::write`] writes the type as Device whatever it holds.
     pub device: ObjectId,
     /// The longest APDU the device accepts, in bytes.
     pub max_apdu: u32,
@@ -1572,64 +1196,9 @@ pub struct IAm {
 }
 
 impl IAm {
-    /// Reads an I-Am body: an object identifier, an unsigned, an
-    /// enumerated and an unsigned, all application-tagged.
-    pub fn parse(data: &[u8]) -> Result<IAm, Error> {
-        let mut values = [Value::Null, Value::Null, Value::Null, Value::Null];
-        let mut at = 0;
-        for v in &mut values {
-            let (value, used) = Value::parse(data.get(at..).unwrap_or(&[]))?;
-            *v = value;
-            at += used;
-        }
-        if at != data.len() {
-            return Err(Error::TrailingBytes);
-        }
-        match values {
-            [Value::ObjectId(device), Value::Unsigned(max_apdu), Value::Enumerated(seg), Value::Unsigned(vendor)] => {
-                if device.object_type != object_type::DEVICE {
-                    return Err(Error::OutOfRange);
-                }
-                Ok(IAm {
-                    device,
-                    max_apdu: u32::try_from(max_apdu).map_err(|_| Error::OutOfRange)?,
-                    segmentation: Segmentation::from_code(seg).ok_or(Error::OutOfRange)?,
-                    vendor: u16::try_from(vendor).map_err(|_| Error::OutOfRange)?,
-                })
-            }
-            _ => Err(Error::ServiceBody),
-        }
-    }
-
-    /// The service body.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        Value::ObjectId(ObjectId::device(self.device.instance)).write(&mut out);
-        Value::Unsigned(u64::from(self.max_apdu)).write(&mut out);
-        Value::Enumerated(self.segmentation.code()).write(&mut out);
-        Value::Unsigned(u64::from(self.vendor)).write(&mut out);
-        out
-    }
-
     /// The unconfirmed request that carries this I-Am.
-    pub fn to_apdu(&self) -> Apdu {
-        Apdu::UnconfirmedRequest { service: unconfirmed::I_AM, data: self.to_bytes() }
-    }
-}
-
-/// How many of a character string's bytes fit in one value: all of them,
-/// or as many as fit without cutting a UTF-8, UCS-4 or UCS-2 character.
-fn char_cut(s: &CharString) -> usize {
-    let room = MAX_VALUE_LEN - 1;
-    if s.bytes.len() <= room {
-        return s.bytes.len();
-    }
-    match s.charset {
-        // Back up past continuation bytes to the start of a character.
-        0 => (0..=room).rev().find(|&i| s.bytes[i] & 0xc0 != 0x80).unwrap_or(0),
-        3 => room - room % 4,
-        4 => room - room % 2,
-        _ => room,
+    pub fn to_apdu(&self) -> Result<Apdu, Error> {
+        Ok(Apdu::UnconfirmedRequest { service: unconfirmed::I_AM, data: self.to_bytes()? })
     }
 }
 
@@ -1650,7 +1219,7 @@ fn contents(b: &[u8], header: usize, number: u8, len: u32) -> Result<(&[u8], usi
 
 /// Reads a context tag numbered `number` holding an unsigned integer.
 fn context_unsigned(b: &[u8], number: u8) -> Result<(u64, usize), Error> {
-    let (t, header) = Tag::parse(b)?;
+    let (t, header) = Tag::parse_prefix(b)?;
     let TagContent::Length(len) = t.content else { return Err(Error::ServiceBody) };
     if t.class != Class::Context || t.number != number {
         return Err(Error::ServiceBody);
@@ -1738,8 +1307,591 @@ fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
 }
 
+impl Wire for Tag {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads exactly one tag header without its contents. Refuses trailing bytes,
+    /// extended tag numbers below 15 or equal to 255, and application opening or closing tags.
+    fn parse(b: &[u8]) -> Result<Tag, Error> {
+        let (value, used) = Self::parse_prefix(b)?;
+        if used != b.len() { return Err(Error::TrailingBytes); }
+        Ok(value)
+    }
+
+    /// Appends a tag header without its contents. Refuses tag number 255 and
+    /// application opening or closing tags. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        if self.number == 255 || (self.class == Class::Application && !matches!(self.content, TagContent::Length(_))) { return Err(Error::Unwritable); }
+        let mut out = Vec::new();
+        let number = self.number;
+        let nibble = number.min(15);
+        let (class, lvt, extended) = match self.content {
+            TagContent::Opening => (0x08, 6, None),
+            TagContent::Closing => (0x08, 7, None),
+            TagContent::Length(n) => {
+                let class = if self.class == Class::Context { 0x08 } else { 0 };
+                if n <= 4 { (class, n as u8, None) } else { (class, 5, Some(n)) }
+            }
+        };
+        out.push(nibble << 4 | class | lvt);
+        if number >= 15 {
+            out.push(number);
+        }
+        match extended {
+            None => {}
+            Some(n) if n <= 253 => out.push(n as u8),
+            Some(n) if n <= 0xffff => {
+                out.push(254);
+                out.extend_from_slice(&(n as u16).to_be_bytes());
+            }
+            Some(n) => {
+                out.push(255);
+                out.extend_from_slice(&n.to_be_bytes());
+            }
+        }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Value {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one application-tagged value. Integers may include leading zero bytes.
+    /// Refuses context tags, reserved types, invalid lengths and trailing bytes.
+    fn parse(b: &[u8]) -> Result<Value, Error> {
+        let (value, used) = Self::parse_prefix(b)?;
+        if used != b.len() { return Err(Error::TrailingBytes); }
+        Ok(value)
+    }
+
+    /// Appends an application value. Refuses strings or bit strings above MAX_VALUE_LEN
+    /// and object identifiers outside their field ranges. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        if let Value::Boolean(v) = self {
+            let t = Tag { number: tag::BOOLEAN, class: Class::Application, content: TagContent::Length(u32::from(*v)) };
+            return t.write(dst);
+        }
+        self.write_tagged(Class::Application, self.tag(), dst)
+
+    }
+}
+
+impl Wire for Bvlc {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one datagram. The BVLC length field must match the datagram's
+    /// length, so `b` must be the whole datagram and nothing else.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Bvlc, Error> {
+        if b.len() < BVLC_HEADER_LEN {
+            return Err(Error::Truncated);
+        }
+        if b[0] != BVLC_TYPE {
+            return Err(Error::NotBacnetIp(b[0]));
+        }
+        let code = b[1];
+        let length = be16(b, 2);
+        let n = usize::from(length);
+        if !(BVLC_HEADER_LEN..=MAX_MESSAGE).contains(&n) || n != b.len() {
+            return Err(Error::Length(length));
+        }
+        let data = &b[BVLC_HEADER_LEN..];
+        let exact = |n: usize| if data.len() == n { Ok(()) } else { Err(Error::FunctionData(code)) };
+        let table = |size: usize| {
+            if data.len().is_multiple_of(size) { Ok(data.chunks_exact(size)) } else { Err(Error::FunctionData(code)) }
+        };
+        Ok(match code {
+            function::RESULT => {
+                exact(2)?;
+                Bvlc::Result(be16(data, 0))
+            }
+            function::WRITE_BROADCAST_DISTRIBUTION_TABLE => Bvlc::WriteBdt(table(10)?.map(bdt_entry).collect()),
+            function::READ_BROADCAST_DISTRIBUTION_TABLE => {
+                exact(0)?;
+                Bvlc::ReadBdt
+            }
+            function::READ_BROADCAST_DISTRIBUTION_TABLE_ACK => Bvlc::ReadBdtAck(table(10)?.map(bdt_entry).collect()),
+            function::FORWARDED_NPDU => {
+                if data.len() < 6 {
+                    return Err(Error::FunctionData(code));
+                }
+                Bvlc::ForwardedNpdu { origin: bip_address(data), npdu: data[6..].to_vec() }
+            }
+            function::REGISTER_FOREIGN_DEVICE => {
+                exact(2)?;
+                Bvlc::RegisterForeignDevice { ttl: be16(data, 0) }
+            }
+            function::READ_FOREIGN_DEVICE_TABLE => {
+                exact(0)?;
+                Bvlc::ReadFdt
+            }
+            function::READ_FOREIGN_DEVICE_TABLE_ACK => Bvlc::ReadFdtAck(
+                table(10)?
+                    .map(|e| FdtEntry { address: bip_address(e), ttl: be16(e, 6), remaining: be16(e, 8) })
+                    .collect(),
+            ),
+            function::DELETE_FOREIGN_DEVICE_TABLE_ENTRY => {
+                exact(6)?;
+                Bvlc::DeleteFdtEntry(bip_address(data))
+            }
+            function::DISTRIBUTE_BROADCAST_TO_NETWORK => Bvlc::DistributeBroadcastToNetwork(data.to_vec()),
+            function::ORIGINAL_UNICAST_NPDU => Bvlc::OriginalUnicastNpdu(data.to_vec()),
+            function::ORIGINAL_BROADCAST_NPDU => Bvlc::OriginalBroadcastNpdu(data.to_vec()),
+            function::SECURE_BVLL => Bvlc::SecureBvll(data.to_vec()),
+            c => return Err(Error::Function(c)),
+        })
+    }
+
+    /// Appends one BVLC message. Refuses oversized bodies and tables. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let room = MAX_MESSAGE - BVLC_HEADER_LEN;
+        let mut out = vec![BVLC_TYPE, self.function(), 0, 0];
+        match self {
+            Bvlc::Result(code) => out.extend_from_slice(&code.to_be_bytes()),
+            Bvlc::WriteBdt(entries) | Bvlc::ReadBdtAck(entries) => {
+                if entries.len() > room / 10 { return Err(Error::Unwritable); }
+                for e in entries {
+                    put_bip_address(&mut out, e.address);
+                    out.extend_from_slice(&e.mask.octets());
+                }
+            }
+            Bvlc::ForwardedNpdu { origin, npdu } => {
+                put_bip_address(&mut out, *origin);
+                if npdu.len() > room - 6 { return Err(Error::Unwritable); }
+                out.extend_from_slice(npdu);
+            }
+            Bvlc::RegisterForeignDevice { ttl } => out.extend_from_slice(&ttl.to_be_bytes()),
+            Bvlc::ReadBdt | Bvlc::ReadFdt => {}
+            Bvlc::ReadFdtAck(entries) => {
+                if entries.len() > room / 10 { return Err(Error::Unwritable); }
+                for e in entries {
+                    put_bip_address(&mut out, e.address);
+                    out.extend_from_slice(&e.ttl.to_be_bytes());
+                    out.extend_from_slice(&e.remaining.to_be_bytes());
+                }
+            }
+            Bvlc::DeleteFdtEntry(address) => put_bip_address(&mut out, *address),
+            Bvlc::DistributeBroadcastToNetwork(data)
+            | Bvlc::OriginalUnicastNpdu(data)
+            | Bvlc::OriginalBroadcastNpdu(data)
+            | Bvlc::SecureBvll(data) => {
+                if data.len() > room { return Err(Error::Unwritable); }
+                out.extend_from_slice(data);
+            },
+        }
+        let len = out.len() as u16; // At most MAX_MESSAGE, which fits.
+        out[2..4].copy_from_slice(&len.to_be_bytes());
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Npdu {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads an NPDU. The body runs to the end of `b`.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Npdu, Error> {
+        let mut r = Reader::new(b);
+        let version = r.u8()?;
+        if version != NPDU_VERSION {
+            return Err(Error::Version(version));
+        }
+        let control = r.u8()?;
+        let destination = if control & 0x20 != 0 {
+            let a = net_address(&mut r)?;
+            if a.network == 0 {
+                return Err(Error::Network(0));
+            }
+            Some(a)
+        } else {
+            None
+        };
+        let source = if control & 0x08 != 0 {
+            let a = net_address(&mut r)?;
+            if !valid_source_network(a.network) {
+                return Err(Error::Network(a.network));
+            }
+            if a.mac.is_empty() {
+                return Err(Error::SourceAddress);
+            }
+            Some(a)
+        } else {
+            None
+        };
+        let destination = match destination {
+            Some(address) => Some(Destination { address, hop_count: r.u8()? }),
+            None => None,
+        };
+        let body = if control & 0x80 != 0 {
+            let message_type = r.u8()?;
+            let vendor = if message_type >= 0x80 { Some(r.u16()?) } else { None };
+            NpduBody::Network { message_type, vendor, data: r.rest().to_vec() }
+        } else {
+            NpduBody::Apdu(r.rest().to_vec())
+        };
+        Ok(Npdu {
+            destination,
+            source,
+            expecting_reply: control & 0x04 != 0,
+            priority: Priority::from_bits(control),
+            body,
+        })
+    }
+
+    /// Appends the NPDU and body. Refuses oversized addresses, empty source addresses,
+    /// out-of-range network message fields and oversized bodies. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let source = self.source.as_ref();
+        let destination = self.destination.as_ref();
+        let mut control = self.priority.bits();
+        if matches!(self.body, NpduBody::Network { .. }) {
+            control |= 0x80;
+        }
+        if destination.is_some() {
+            control |= 0x20;
+        }
+        if source.is_some() {
+            control |= 0x08;
+        }
+        if self.expecting_reply {
+            control |= 0x04;
+        }
+        let mut out = vec![NPDU_VERSION, control];
+        if let Some(d) = destination {
+            put_net_address(&mut out, &d.address)?;
+        }
+        if let Some(s) = source {
+            put_net_address(&mut out, s)?;
+        }
+        if let Some(d) = destination {
+            out.push(d.hop_count);
+        }
+        match &self.body {
+            NpduBody::Apdu(a) => {
+                if a.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+                out.extend_from_slice(a);
+            },
+            NpduBody::Network { message_type, vendor, data } => {
+                if data.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+                out.push(*message_type);
+                if *message_type >= 0x80 {
+                    out.extend_from_slice(&vendor.unwrap_or(0).to_be_bytes());
+                }
+                out.extend_from_slice(data);
+            }
+        }
+        if out.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Apdu {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads an APDU. Service bodies run to the end of `b`. Simple
+    /// acknowledgments, segment acknowledgments, rejects and aborts have a
+    /// fixed size, and bytes after them are an error. Reserved bits are
+    /// ignored.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Apdu, Error> {
+        let mut r = Reader::new(b);
+        let first = r.u8()?;
+        let segment = |r: &mut Reader| -> Result<Option<Segment>, Error> {
+            if first & 0x08 == 0 {
+                return Ok(None);
+            }
+            Ok(Some(Segment { sequence: r.u8()?, window: r.u8()?, more_follows: first & 0x04 != 0 }))
+        };
+        let apdu = match first >> 4 {
+            0 => {
+                let limits = r.u8()?;
+                let invoke_id = r.u8()?;
+                let segment = segment(&mut r)?;
+                Apdu::ConfirmedRequest {
+                    segmented_response_accepted: first & 0x02 != 0,
+                    max_segments: (limits >> 4) & 0x07,
+                    max_apdu: limits & 0x0f,
+                    invoke_id,
+                    segment,
+                    service: r.u8()?,
+                    data: r.rest().to_vec(),
+                }
+            }
+            1 => Apdu::UnconfirmedRequest { service: r.u8()?, data: r.rest().to_vec() },
+            2 => Apdu::SimpleAck { invoke_id: r.u8()?, service: r.u8()? },
+            3 => {
+                let invoke_id = r.u8()?;
+                let segment = segment(&mut r)?;
+                Apdu::ComplexAck { invoke_id, segment, service: r.u8()?, data: r.rest().to_vec() }
+            }
+            4 => Apdu::SegmentAck {
+                negative: first & 0x02 != 0,
+                server: first & 0x01 != 0,
+                invoke_id: r.u8()?,
+                sequence: r.u8()?,
+                window: r.u8()?,
+            },
+            5 => Apdu::Error { invoke_id: r.u8()?, service: r.u8()?, data: r.rest().to_vec() },
+            6 => Apdu::Reject { invoke_id: r.u8()?, reason: r.u8()? },
+            7 => Apdu::Abort { server: first & 0x01 != 0, invoke_id: r.u8()?, reason: r.u8()? },
+            t => return Err(Error::PduType(t)),
+        };
+        r.end()?;
+        Ok(apdu)
+    }
+
+    /// Appends the complete APDU. Refuses fields outside their bit widths and bodies
+    /// above MAX_MESSAGE. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let head = self.pdu_type() << 4;
+        let seg_bits = |s: &Option<Segment>| match s {
+            Some(s) => 0x08 | if s.more_follows { 0x04 } else { 0 },
+            None => 0,
+        };
+        let put_segment = |out: &mut Vec<u8>, s: &Option<Segment>| {
+            if let Some(s) = s {
+                out.extend_from_slice(&[s.sequence, s.window]);
+            }
+        };
+        let mut out = Vec::new();
+        match self {
+            Apdu::ConfirmedRequest {
+                segmented_response_accepted,
+                max_segments,
+                max_apdu,
+                invoke_id,
+                segment,
+                service,
+                data,
+            } => {
+                let sa = if *segmented_response_accepted { 0x02 } else { 0 };
+                out.push(head | seg_bits(segment) | sa);
+                out.push((max_segments & 0x07) << 4 | (max_apdu & 0x0f));
+                out.push(*invoke_id);
+                put_segment(&mut out, segment);
+                out.push(*service);
+                if data.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+                out.extend_from_slice(data);
+            }
+            Apdu::UnconfirmedRequest { service, data } => {
+                out.extend_from_slice(&[head, *service]);
+                if data.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+                out.extend_from_slice(data);
+            }
+            Apdu::SimpleAck { invoke_id, service } => out.extend_from_slice(&[head, *invoke_id, *service]),
+            Apdu::ComplexAck { invoke_id, segment, service, data } => {
+                out.extend_from_slice(&[head | seg_bits(segment), *invoke_id]);
+                put_segment(&mut out, segment);
+                out.push(*service);
+                if data.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+                out.extend_from_slice(data);
+            }
+            Apdu::SegmentAck { negative, server, invoke_id, sequence, window } => {
+                let flags = if *negative { 0x02 } else { 0 } | if *server { 0x01 } else { 0 };
+                out.extend_from_slice(&[head | flags, *invoke_id, *sequence, *window]);
+            }
+            Apdu::Error { invoke_id, service, data } => {
+                out.extend_from_slice(&[head, *invoke_id, *service]);
+                if data.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+                out.extend_from_slice(data);
+            }
+            Apdu::Reject { invoke_id, reason } => out.extend_from_slice(&[head, *invoke_id, *reason]),
+            Apdu::Abort { server, invoke_id, reason } => {
+                out.extend_from_slice(&[head | if *server { 0x01 } else { 0 }, *invoke_id, *reason]);
+            }
+        }
+        if out.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for WhoIs {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a Who-Is body: empty, or context tags 0 and 1 each holding an
+    /// unsigned device instance.
+    /// Refuses malformed or trailing input.
+    fn parse(data: &[u8]) -> Result<WhoIs, Error> {
+        if data.is_empty() {
+            return Ok(WhoIs { range: None });
+        }
+        let (low, used) = context_unsigned(data, 0)?;
+        let rest = &data[used..];
+        let (high, used) = context_unsigned(rest, 1)?;
+        if used != rest.len() {
+            return Err(Error::TrailingBytes);
+        }
+        if low > u64::from(MAX_INSTANCE) || high > u64::from(MAX_INSTANCE) {
+            return Err(Error::OutOfRange);
+        }
+        Ok(WhoIs { range: Some((low as u32, high as u32)) })
+    }
+
+    /// Appends both instance limits, or an empty body for an unrestricted query.
+    /// Refuses instance limits above MAX_INSTANCE. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = Vec::new();
+        if let Some((low, high)) = self.range {
+            for (number, v) in [(0, low), (1, high)] {
+                if v > MAX_INSTANCE { return Err(Error::Unwritable); }
+                Value::Unsigned(u64::from(v)).write_tagged(Class::Context, number, &mut out)?;
+            }
+        }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for IAm {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads an I-Am body: an object identifier, an unsigned, an
+    /// enumerated and an unsigned, all application-tagged.
+    /// Refuses malformed or trailing input.
+    fn parse(data: &[u8]) -> Result<IAm, Error> {
+        let mut values = [Value::Null, Value::Null, Value::Null, Value::Null];
+        let mut at = 0;
+        for v in &mut values {
+            let (value, used) = Value::parse_prefix(data.get(at..).unwrap_or(&[]))?;
+            *v = value;
+            at += used;
+        }
+        if at != data.len() {
+            return Err(Error::TrailingBytes);
+        }
+        match values {
+            [Value::ObjectId(device), Value::Unsigned(max_apdu), Value::Enumerated(seg), Value::Unsigned(vendor)] => {
+                if device.object_type != object_type::DEVICE {
+                    return Err(Error::OutOfRange);
+                }
+                Ok(IAm {
+                    device,
+                    max_apdu: u32::try_from(max_apdu).map_err(|_| Error::OutOfRange)?,
+                    segmentation: Segmentation::from_code(seg).ok_or(Error::OutOfRange)?,
+                    vendor: u16::try_from(vendor).map_err(|_| Error::OutOfRange)?,
+                })
+            }
+            _ => Err(Error::ServiceBody),
+        }
+    }
+
+    /// Appends the four I-Am fields. Refuses a non-device object identifier or an
+    /// instance above MAX_INSTANCE. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = Vec::new();
+        Value::ObjectId(self.device).write(&mut out)?;
+        Value::Unsigned(u64::from(self.max_apdu)).write(&mut out)?;
+        Value::Enumerated(self.segmentation.code()).write(&mut out)?;
+        Value::Unsigned(u64::from(self.vendor)).write(&mut out)?;
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(Error::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+/// A context-tagged primitive whose tag number and application type come from its service.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextValue<const TYPE: u8> {
+    /// The context tag number.
+    pub number: u8,
+    /// The primitive value.
+    pub value: Value,
+}
+
+impl<const TYPE: u8> Wire for ContextValue<TYPE> {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one context-tagged primitive as application type TYPE.
+    /// Keeps its context number. A context Boolean holds one byte, 0 or 1.
+    /// Refuses reserved types, application tags, opening or closing tags,
+    /// invalid values and trailing bytes.
+    ///
+    /// ~~~
+    /// use fictionet::stdlib::codec::Wire;
+    /// use fictionet::stdlib::bacnet::{ContextValue, Value, tag};
+    /// let property = ContextValue::<{ tag::ENUMERATED }>::parse(&[0x19, 0x55]).unwrap();
+    /// assert_eq!(property.number, 1);
+    /// assert_eq!(property.value, Value::Enumerated(85));
+    /// ~~~
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        let (tag, _) = Tag::parse_prefix(b)?;
+        let (value, used) = Value::parse_context(b, tag.number, TYPE)?;
+        if used != b.len() { return Err(Error::TrailingBytes); }
+        Ok(Self { number: tag.number, value })
+    }
+
+    /// Appends one context value. Refuses an invalid tag, a different type or oversized contents.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if TYPE != self.value.tag() { return Err(Error::Unwritable); }
+        self.value.write_tagged(Class::Context, self.number, out)
+    }
+}
+
+/// Application-tagged values in one bounded service body.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Values(
+    /// Application values in wire order.
+    pub Vec<Value>,
+);
+
+impl Wire for Values {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads values until the input ends. Refuses invalid or incomplete values
+    /// and input above MAX_MESSAGE.
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        if b.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
+        let mut values = Vec::new();
+        let mut at = 0;
+        while at < b.len() {
+            let (v, used) = Value::parse_prefix(&b[at..])?;
+            values.push(v);
+            at += used;
+        }
+        Ok(Self(values))
+    }
+
+    /// Appends all values. Refuses unwritable values or a body above MAX_MESSAGE.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+        let mut out = Vec::new();
+        for value in &self.0 {
+            value.write(&mut out)?;
+            if out.len() > MAX_MESSAGE { return Err(Error::Unwritable); }
+        }
+        dst.try_reserve(out.len()).map_err(|_| Error::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{contract, test_support::{Lcg}};
     use super::*;
 
     fn hex(s: &str) -> Vec<u8> {
@@ -1748,7 +1900,7 @@ mod tests {
     }
 
     fn value(bytes: &[u8]) -> Value {
-        let (v, used) = Value::parse(bytes).unwrap();
+        let (v, used) = Value::parse(bytes).map(|value| (value, (bytes).len())).unwrap();
         assert_eq!(used, bytes.len());
         v
     }
@@ -1775,13 +1927,13 @@ mod tests {
         for (bytes, v) in cases {
             let bytes = hex(bytes);
             assert_eq!(value(&bytes), v, "{bytes:02x?}");
-            assert_eq!(v.to_bytes(), bytes, "{v:?}");
+            assert_eq!(v.to_bytes().unwrap(), bytes, "{v:?}");
         }
         let s = hex("75 19 00 546869732069732061204241436E657420737472696E6721");
         let v = value(&s);
         let Value::CharacterString(cs) = &v else { panic!() };
         assert_eq!(cs.as_str(), Some("This is a BACnet string!"));
-        assert_eq!(Value::CharacterString(CharString::utf8("This is a BACnet string!")).to_bytes(), s);
+        assert_eq!(Value::CharacterString(CharString::utf8("This is a BACnet string!")).to_bytes().unwrap(), s);
     }
 
     #[test]
@@ -1797,13 +1949,13 @@ mod tests {
             (i64::MAX, "35 08 7FFFFFFFFFFFFFFF"),
         ];
         for (n, bytes) in cases {
-            assert_eq!(Value::Signed(n).to_bytes(), hex(bytes), "{n}");
+            assert_eq!(Value::Signed(n).to_bytes().unwrap(), hex(bytes), "{n}");
             assert_eq!(value(&hex(bytes)), Value::Signed(n));
         }
-        assert_eq!(Value::Unsigned(0).to_bytes(), [0x21, 0]);
-        assert_eq!(Value::Unsigned(256).to_bytes(), [0x22, 1, 0]);
-        assert_eq!(Value::Unsigned(u64::MAX).to_bytes(), hex("25 08 FFFFFFFFFFFFFFFF"));
-        assert_eq!(Value::Enumerated(u32::MAX).to_bytes(), hex("94 FFFFFFFF"));
+        assert_eq!(Value::Unsigned(0).to_bytes().unwrap(), [0x21, 0]);
+        assert_eq!(Value::Unsigned(256).to_bytes().unwrap(), [0x22, 1, 0]);
+        assert_eq!(Value::Unsigned(u64::MAX).to_bytes().unwrap(), hex("25 08 FFFFFFFFFFFFFFFF"));
+        assert_eq!(Value::Enumerated(u32::MAX).to_bytes().unwrap(), hex("94 FFFFFFFF"));
         // Leading zero bytes are read.
         assert_eq!(value(&[0x23, 0, 0, 5]), Value::Unsigned(5));
     }
@@ -1822,80 +1974,75 @@ mod tests {
         for (t, bytes) in cases {
             let bytes = hex(bytes);
             let mut out = Vec::new();
-            t.write(&mut out);
+            t.write(&mut out).unwrap();
             assert_eq!(out, bytes, "{t:?}");
-            assert_eq!(Tag::parse(&bytes), Ok((t, bytes.len())));
+            assert_eq!(Tag::parse(&bytes).map(|value| (value, bytes.len())), Ok((t, bytes.len())));
             for n in 0..bytes.len() {
-                assert_eq!(Tag::parse(&bytes[..n]), Err(Error::Truncated));
+                assert_eq!(Tag::parse(&bytes[..n]).map(|value| (value, bytes[..n].len())), Err(Error::Truncated));
             }
         }
-        assert_eq!(Tag::parse(&[0x26]), Err(Error::ApplicationOpenClose));
-        assert_eq!(Tag::parse(&[0x27]), Err(Error::ApplicationOpenClose));
+        assert_eq!(Tag::parse(&[0x26]).map(|value| (value, [0x26].len())), Err(Error::ApplicationOpenClose));
+        assert_eq!(Tag::parse(&[0x27]).map(|value| (value, [0x27].len())), Err(Error::ApplicationOpenClose));
     }
 
     #[test]
     fn extended_tag_number_255_is_reserved() {
         // Clause 20.2.1.2: the extended tag number octet runs 15 to 254;
         // B'11111111' is reserved by ASHRAE.
-        assert_eq!(Tag::parse(&[0xf9, 0xff, 0x00]), Err(Error::ReservedTag(255)));
-        assert_eq!(Tag::parse(&[0xfe, 0xff]), Err(Error::ReservedTag(255)));
+        assert_eq!(Tag::parse(&[0xf9, 0xff, 0x00]).map(|value| (value, [0xf9, 0xff, 0x00].len())), Err(Error::ReservedTag(255)));
+        assert_eq!(Tag::parse(&[0xfe, 0xff]).map(|value| (value, [0xfe, 0xff].len())), Err(Error::ReservedTag(255)));
         assert_eq!(
-            Tag::parse(&[0xf9, 0xfe, 0x00]),
+            Tag::parse(&[0xf9, 0xfe]).map(|value| (value, [0xf9, 0xfe].len())),
             Ok((Tag { number: 254, class: Class::Context, content: TagContent::Length(1) }, 2))
         );
         // The writer never writes the reserved number.
         let mut out = Vec::new();
-        Tag { number: 255, class: Class::Context, content: TagContent::Opening }.write(&mut out);
-        assert_eq!(out, [0xfe, 0xfe]);
-        assert!(Tag::parse(&out).is_ok());
+        assert_eq!(Tag { number: 255, class: Class::Context, content: TagContent::Opening }.write(&mut out), Err(Error::Unwritable));
+        assert!(out.is_empty());
     }
 
     #[test]
     fn bad_values() {
-        assert_eq!(Value::parse(&[]), Err(Error::Truncated));
-        assert_eq!(Value::parse(&[0x09, 0]), Err(Error::ContextTag(0)));
-        assert_eq!(Value::parse(&[0x3e]), Err(Error::ContextTag(3)));
-        assert_eq!(Value::parse(&[0xd0]), Err(Error::ReservedTag(13)));
-        assert_eq!(Value::parse(&[0xf0, 40]), Err(Error::ReservedTag(40)));
-        assert_eq!(Value::parse(&[0x12]), Err(Error::ValueLength { tag: 1, len: 2 }));
-        assert_eq!(Value::parse(&[0x01, 0]), Err(Error::ValueLength { tag: 0, len: 1 }));
-        assert_eq!(Value::parse(&[0x20]), Err(Error::ValueLength { tag: 2, len: 0 }));
-        assert_eq!(Value::parse(&hex("25 09 000000000000000001")), Err(Error::ValueLength { tag: 2, len: 9 }));
-        assert_eq!(Value::parse(&hex("95 05 0000000001")), Err(Error::ValueLength { tag: 9, len: 5 }));
-        assert_eq!(Value::parse(&hex("43 000000")), Err(Error::ValueLength { tag: 4, len: 3 }));
-        assert_eq!(Value::parse(&hex("54 00000000")), Err(Error::ValueLength { tag: 5, len: 4 }));
-        assert_eq!(Value::parse(&hex("A3 000000")), Err(Error::ValueLength { tag: 10, len: 3 }));
-        assert_eq!(Value::parse(&[0x70]), Err(Error::ValueLength { tag: 7, len: 0 }));
-        assert_eq!(Value::parse(&[0x80]), Err(Error::ValueLength { tag: 8, len: 0 }));
-        assert_eq!(Value::parse(&[0x82, 8, 0]), Err(Error::BitString(8)));
-        assert_eq!(Value::parse(&[0x81, 1]), Err(Error::BitString(1)));
-        assert_eq!(Value::parse(&[0x81, 0]), Ok((Value::BitString(vec![]), 2)));
+        assert_eq!(Value::parse(&[]).map(|value| (value, 0)), Err(Error::Truncated));
+        assert_eq!(Value::parse(&[0x09, 0]).map(|value| (value, [0x09, 0].len())), Err(Error::ContextTag(0)));
+        assert_eq!(Value::parse(&[0x3e]).map(|value| (value, [0x3e].len())), Err(Error::ContextTag(3)));
+        assert_eq!(Value::parse(&[0xd0]).map(|value| (value, [0xd0].len())), Err(Error::ReservedTag(13)));
+        assert_eq!(Value::parse(&[0xf0, 40]).map(|value| (value, [0xf0, 40].len())), Err(Error::ReservedTag(40)));
+        assert_eq!(Value::parse(&[0x12]).map(|value| (value, [0x12].len())), Err(Error::ValueLength { tag: 1, len: 2 }));
+        assert_eq!(Value::parse(&[0x01, 0]).map(|value| (value, [0x01, 0].len())), Err(Error::ValueLength { tag: 0, len: 1 }));
+        assert_eq!(Value::parse(&[0x20]).map(|value| (value, [0x20].len())), Err(Error::ValueLength { tag: 2, len: 0 }));
+        assert_eq!(Value::parse(&hex("25 09 000000000000000001")).map(|value| (value, hex("25 09 000000000000000001").len())), Err(Error::ValueLength { tag: 2, len: 9 }));
+        assert_eq!(Value::parse(&hex("95 05 0000000001")).map(|value| (value, hex("95 05 0000000001").len())), Err(Error::ValueLength { tag: 9, len: 5 }));
+        assert_eq!(Value::parse(&hex("43 000000")).map(|value| (value, hex("43 000000").len())), Err(Error::ValueLength { tag: 4, len: 3 }));
+        assert_eq!(Value::parse(&hex("54 00000000")).map(|value| (value, hex("54 00000000").len())), Err(Error::ValueLength { tag: 5, len: 4 }));
+        assert_eq!(Value::parse(&hex("A3 000000")).map(|value| (value, hex("A3 000000").len())), Err(Error::ValueLength { tag: 10, len: 3 }));
+        assert_eq!(Value::parse(&[0x70]).map(|value| (value, [0x70].len())), Err(Error::ValueLength { tag: 7, len: 0 }));
+        assert_eq!(Value::parse(&[0x80]).map(|value| (value, [0x80].len())), Err(Error::ValueLength { tag: 8, len: 0 }));
+        assert_eq!(Value::parse(&[0x82, 8, 0]).map(|value| (value, [0x82, 8, 0].len())), Err(Error::BitString(8)));
+        assert_eq!(Value::parse(&[0x81, 1]).map(|value| (value, [0x81, 1].len())), Err(Error::BitString(1)));
+        assert_eq!(Value::parse(&[0x81, 0]).map(|value| (value, [0x81, 0].len())), Ok((Value::BitString(vec![]), 2)));
         // A length past the limit, and one past the bytes.
-        assert_eq!(Value::parse(&hex("65 FF FFFFFFFF")), Err(Error::ValueLength { tag: 6, len: u32::MAX }));
-        assert_eq!(Value::parse(&hex("63 0102")), Err(Error::Truncated));
-        assert_eq!(Value::parse_all(&hex("21 01 21")), Err(Error::Truncated));
-        assert_eq!(Value::parse_all(&hex("21 01 10")), Ok(vec![Value::Unsigned(1), Value::Boolean(false)]));
+        assert_eq!(Value::parse(&hex("65 FF FFFFFFFF")).map(|value| (value, hex("65 FF FFFFFFFF").len())), Err(Error::ValueLength { tag: 6, len: u32::MAX }));
+        assert_eq!(Value::parse(&hex("63 0102")).map(|value| (value, hex("63 0102").len())), Err(Error::Truncated));
+        assert_eq!(Values::parse(&hex("21 01 21")).map(|values| values.0), Err(Error::Truncated));
+        assert_eq!(Values::parse(&hex("21 01 10")).map(|values| values.0), Ok(vec![Value::Unsigned(1), Value::Boolean(false)]));
     }
 
     #[test]
-    fn writers_cut_long_strings() {
-        let v = Value::OctetString(vec![7; MAX_VALUE_LEN + 10]);
-        let Value::OctetString(back) = value(&v.to_bytes()) else { panic!() };
-        assert_eq!(back.len(), MAX_VALUE_LEN);
-        let v = Value::BitString(vec![true; MAX_VALUE_LEN * 8]);
-        let Value::BitString(back) = value(&v.to_bytes()) else { panic!() };
-        assert_eq!(back.len(), (MAX_VALUE_LEN - 1) * 8);
-        let v = Value::CharacterString(CharString { charset: 5, bytes: vec![b'a'; MAX_VALUE_LEN] });
-        let Value::CharacterString(back) = value(&v.to_bytes()) else { panic!() };
-        assert_eq!(back.bytes.len(), MAX_VALUE_LEN - 1);
-        assert_eq!(back.as_str(), None);
-        // Object identifier fields are clamped to their widths.
-        let id = ObjectId { object_type: 5000, instance: u32::MAX };
-        assert_eq!(ObjectId::from_u32(id.to_u32()), ObjectId { object_type: MAX_OBJECT_TYPE, instance: MAX_INSTANCE });
+    fn writers_refuse_long_strings() {
+        for value in [
+            Value::OctetString(vec![7; MAX_VALUE_LEN + 10]),
+            Value::BitString(vec![true; MAX_VALUE_LEN * 8]),
+            Value::CharacterString(CharString { charset: 5, bytes: vec![b'a'; MAX_VALUE_LEN] }),
+            Value::ObjectId(ObjectId { object_type: 5000, instance: u32::MAX }),
+        ] {
+            contract::check_wire_value(&value);
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
+        }
         // Bit strings of every length up to 17 round trip.
         for n in 0..17 {
             let bits: Vec<bool> = (0..n).map(|i| i % 3 == 0).collect();
-            assert_eq!(value(&Value::BitString(bits.clone()).to_bytes()), Value::BitString(bits));
+            assert_eq!(value(&Value::BitString(bits.clone()).to_bytes().unwrap()), Value::BitString(bits));
         }
     }
 
@@ -1906,9 +2053,9 @@ mod tests {
         let all = WhoIs::parse(&[]).unwrap();
         assert_eq!(all, WhoIs { range: None });
         assert!(all.matches(0) && all.matches(MAX_INSTANCE));
-        assert_eq!(all.to_bytes(), []);
+        assert_eq!(all.to_bytes().unwrap(), []);
         let some = WhoIs { range: Some((3, 300)) };
-        let bytes = some.to_bytes();
+        let bytes = some.to_bytes().unwrap();
         assert_eq!(bytes, [0x09, 3, 0x1a, 0x01, 0x2c]);
         assert_eq!(WhoIs::parse(&bytes), Ok(some));
         assert!(some.matches(3) && some.matches(300) && !some.matches(2) && !some.matches(301));
@@ -1922,7 +2069,8 @@ mod tests {
         // An instance past 22 bits.
         assert_eq!(WhoIs::parse(&[0x09, 0, 0x1b, 0x40, 0, 0]), Err(Error::OutOfRange));
         let big = WhoIs { range: Some((0, u32::MAX)) };
-        assert_eq!(WhoIs::parse(&big.to_bytes()), Ok(WhoIs { range: Some((0, MAX_INSTANCE)) }));
+        contract::check_wire_value(&big);
+        assert_eq!(big.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -1933,7 +2081,7 @@ mod tests {
             i_am,
             IAm { device: ObjectId::device(1), max_apdu: 1476, segmentation: Segmentation::Both, vendor: 15 }
         );
-        assert_eq!(i_am.to_bytes(), bytes);
+        assert_eq!(i_am.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() {
             assert!(IAm::parse(&bytes[..n]).is_err(), "{n} bytes");
         }
@@ -1960,9 +2108,9 @@ mod tests {
         let Apdu::ConfirmedRequest { max_apdu, invoke_id, service, data, segment, .. } = &apdu else { panic!() };
         assert_eq!((*max_apdu, *invoke_id, *service, *segment), (0, 1, confirmed::READ_PROPERTY, None));
         assert_eq!(max_apdu_octets(*max_apdu), Some(50));
-        assert_eq!(apdu.to_bytes(), req);
+        assert_eq!(apdu.to_bytes().unwrap(), req);
         // The body: context 0 object identifier, context 1 property 85.
-        let (t, used) = Tag::parse(data).unwrap();
+        let (t, used) = Tag::parse(&data[..1]).map(|value| (value, data[..1].len())).unwrap();
         assert_eq!(t, Tag { number: 0, class: Class::Context, content: TagContent::Length(4) });
         assert_eq!(ObjectId::from_u32(u32::from_be_bytes(data[used..used + 4].try_into().unwrap())).instance, 5);
 
@@ -1970,13 +2118,13 @@ mod tests {
         let ack = hex("30 01 0C 0C 00000005 19 55 3E 44 4290999A 3F");
         let apdu = Apdu::parse(&ack).unwrap();
         let Apdu::ComplexAck { invoke_id: 1, segment: None, service: 12, data } = &apdu else { panic!() };
-        assert_eq!(Tag::parse(&data[7..]).unwrap().0.content, TagContent::Opening);
-        assert_eq!(Value::parse(&data[8..]).unwrap(), (Value::Real(72.3), 5));
+        assert_eq!(Tag::parse(&data[7..8]).map(|value| (value, data[7..8].len())).unwrap().0.content, TagContent::Opening);
+        assert_eq!(Value::parse(&data[8..13]).map(|value| (value, data[8..13].len())).unwrap(), (Value::Real(72.3), 5));
         assert_eq!(
-            Tag::parse(&data[13..]).unwrap(),
+            Tag::parse(&data[13..]).map(|value| (value, data[13..].len())).unwrap(),
             (Tag { number: 3, class: Class::Context, content: TagContent::Closing }, 1)
         );
-        assert_eq!(apdu.to_bytes(), ack);
+        assert_eq!(apdu.to_bytes().unwrap(), ack);
     }
 
     #[test]
@@ -2005,7 +2153,7 @@ mod tests {
         ];
         for (apdu, bytes) in cases {
             let bytes = hex(bytes);
-            assert_eq!(apdu.to_bytes(), bytes, "{apdu:?}");
+            assert_eq!(apdu.to_bytes().unwrap(), bytes, "{apdu:?}");
             assert_eq!(Apdu::parse(&bytes), Ok(apdu.clone()));
             // Every prefix short of the fixed header is refused.
             let header = bytes.len() - apdu_data_len(&apdu);
@@ -2015,7 +2163,7 @@ mod tests {
         }
         // Error class and code read as values.
         let Apdu::Error { data, .. } = Apdu::parse(&hex("50 09 0C 91 01 91 1F")).unwrap() else { panic!() };
-        assert_eq!(Value::parse_all(&data), Ok(vec![Value::Enumerated(1), Value::Enumerated(31)]));
+        assert_eq!(Values::parse(&data).map(|values| values.0), Ok(vec![Value::Enumerated(1), Value::Enumerated(31)]));
         assert_eq!(Apdu::parse(&[0x80, 0]), Err(Error::PduType(8)));
         assert_eq!(Apdu::parse(&[0xf0]), Err(Error::PduType(15)));
         assert_eq!(Apdu::parse(&hex("20 09 0F 00")), Err(Error::TrailingBytes));
@@ -2051,7 +2199,7 @@ mod tests {
         );
         assert_eq!(npdu.source, None);
         assert_eq!(npdu.apdu(), Some(&[0x10, 0x00][..]));
-        assert_eq!(npdu.to_bytes(), bytes);
+        assert_eq!(npdu.to_bytes().unwrap(), bytes);
 
         // A routed request from MS/TP station 5 on network 2, expecting a
         // reply at urgent priority.
@@ -2060,10 +2208,10 @@ mod tests {
         assert_eq!(npdu.source, Some(NetAddress { network: 2, mac: vec![5] }));
         assert!(npdu.expecting_reply);
         assert_eq!(npdu.priority, Priority::Urgent);
-        assert_eq!(npdu.to_bytes(), bytes);
+        assert_eq!(npdu.to_bytes().unwrap(), bytes);
         // The reply goes back to that station through the router.
         let reply = npdu.reply(vec![0x20, 0x01, 0x0c]);
-        assert_eq!(reply.to_bytes(), hex("01 21 0002 01 05 FF 20 01 0C"));
+        assert_eq!(reply.to_bytes().unwrap(), hex("01 21 0002 01 05 FF 20 01 0C"));
 
         // Both addresses: destination fields, source fields, then the hop
         // count.
@@ -2072,7 +2220,7 @@ mod tests {
         assert_eq!(npdu.destination.as_ref().unwrap().hop_count, 7);
         assert_eq!(npdu.destination.as_ref().unwrap().address.mac, [0xaa, 0xbb]);
         assert_eq!(npdu.priority, Priority::LifeSafety);
-        assert_eq!(npdu.to_bytes(), bytes);
+        assert_eq!(npdu.to_bytes().unwrap(), bytes);
         for n in 0..bytes.len() - 2 {
             assert!(Npdu::parse(&bytes[..n]).is_err(), "{n} bytes");
         }
@@ -2083,11 +2231,11 @@ mod tests {
         let npdu = Npdu::parse(&bytes).unwrap();
         assert_eq!(npdu.body, NpduBody::Network { message_type: 0, vendor: None, data: vec![] });
         assert_eq!(npdu.apdu(), None);
-        assert_eq!(npdu.to_bytes(), bytes);
+        assert_eq!(npdu.to_bytes().unwrap(), bytes);
         let bytes = hex("01 80 80 0104 AA");
         let npdu = Npdu::parse(&bytes).unwrap();
         assert_eq!(npdu.body, NpduBody::Network { message_type: 0x80, vendor: Some(260), data: vec![0xaa] });
-        assert_eq!(npdu.to_bytes(), bytes);
+        assert_eq!(npdu.to_bytes().unwrap(), bytes);
         assert_eq!(Npdu::parse(&hex("01 80 80 01")), Err(Error::Truncated));
     }
 
@@ -2098,20 +2246,20 @@ mod tests {
         assert_eq!(Npdu::parse(&[2, 0]), Err(Error::Version(2)));
         assert_eq!(Npdu::parse(&hex("01 08 0002 00 10 08")), Err(Error::SourceAddress));
         assert_eq!(Npdu::parse(&hex("01 20 0002 03 0102")), Err(Error::Truncated));
-        // An empty source is left out when written.
+        // An empty source cannot be written.
         let n = Npdu { source: Some(NetAddress { network: 2, mac: vec![] }), ..Npdu::local(vec![0x10, 0x08]) };
-        assert_eq!(n.to_bytes(), [1, 0, 0x10, 0x08]);
-        // A long address is cut to 255 bytes.
+        assert_eq!(n.to_bytes(), Err(Error::Unwritable));
+        // Addresses above 255 bytes cannot be written.
         let n = Npdu {
             destination: Some(Destination { address: NetAddress { network: 1, mac: vec![9; 300] }, hop_count: 1 }),
             ..Npdu::local(vec![])
         };
-        let back = Npdu::parse(&n.to_bytes()).unwrap();
-        assert_eq!(back.destination.unwrap().address.mac.len(), MAX_MAC_LEN);
+        contract::check_wire_value(&n);
+        assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         // A vendor on a standard message type is not written.
         let n =
             Npdu { body: NpduBody::Network { message_type: 1, vendor: Some(5), data: vec![] }, ..Npdu::local(vec![]) };
-        assert_eq!(n.to_bytes(), [1, 0x80, 1]);
+        assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         for p in 0..4 {
             assert_eq!(Priority::from_bits(p).bits(), p);
         }
@@ -2146,7 +2294,7 @@ mod tests {
         ];
         for (bvlc, bytes) in cases {
             let bytes = hex(bytes);
-            assert_eq!(bvlc.to_bytes(), bytes, "{bvlc:?}");
+            assert_eq!(bvlc.to_bytes().unwrap(), bytes, "{bvlc:?}");
             assert_eq!(Bvlc::parse(&bytes), Ok(bvlc.clone()));
             for n in 0..bytes.len() {
                 assert!(Bvlc::parse(&bytes[..n]).is_err(), "{bvlc:?} {n}");
@@ -2174,19 +2322,16 @@ mod tests {
         let mut long = hex("81 0A FFFF");
         long.resize(0xffff, 0);
         assert_eq!(Bvlc::parse(&long), Err(Error::Length(0xffff)));
-        // Writers cut to MAX_MESSAGE, and the reader takes what they write.
-        let big = Bvlc::OriginalUnicastNpdu(vec![0; 70_000]).to_bytes();
-        assert_eq!(big.len(), MAX_MESSAGE);
-        assert!(Bvlc::parse(&big).is_ok());
         let a = SocketAddrV4::new(Ipv4Addr::LOCALHOST, PORT);
-        let big = Bvlc::ForwardedNpdu { origin: a, npdu: vec![0; 70_000] }.to_bytes();
-        assert_eq!(big.len(), MAX_MESSAGE);
-        assert!(Bvlc::parse(&big).is_ok());
         let entry = FdtEntry { address: a, ttl: 1, remaining: 2 };
-        let big = Bvlc::ReadFdtAck(vec![entry; 7000]).to_bytes();
-        assert!(big.len() <= MAX_MESSAGE);
-        let Ok(Bvlc::ReadFdtAck(back)) = Bvlc::parse(&big) else { panic!() };
-        assert_eq!(back.len(), (MAX_MESSAGE - 4) / 10);
+        for value in [
+            Bvlc::OriginalUnicastNpdu(vec![0; 70_000]),
+            Bvlc::ForwardedNpdu { origin: a, npdu: vec![0; 70_000] },
+            Bvlc::ReadFdtAck(vec![entry; 7000]),
+        ] {
+            contract::check_wire_value(&value);
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
+        }
     }
 
     #[test]
@@ -2223,34 +2368,35 @@ mod tests {
         // ReadProperty's request body, written and read field by field.
         let ai5 = ObjectId { object_type: object_type::ANALOG_INPUT, instance: 5 };
         let mut body = Vec::new();
-        Value::ObjectId(ai5).write_context(0, &mut body);
-        Value::Enumerated(85).write_context(1, &mut body);
+        ContextValue::<{ tag::OBJECT_IDENTIFIER }> { number: 0, value: Value::ObjectId(ai5) }.write(&mut body).unwrap();
+        ContextValue::<{ tag::ENUMERATED }> { number: 1, value: Value::Enumerated(85) }.write(&mut body).unwrap();
         assert_eq!(body, hex("0C 00000005 19 55"));
-        let (id, used) = Value::parse_context(&body, 0, tag::OBJECT_IDENTIFIER).unwrap();
+        let id = ContextValue::<{ tag::OBJECT_IDENTIFIER }>::parse(&body[..5]).unwrap().value;
+        let used = 5;
         assert_eq!(id, Value::ObjectId(ai5));
-        assert_eq!(Value::parse_context(&body[used..], 1, tag::ENUMERATED), Ok((Value::Enumerated(85), 2)));
+        assert_eq!(ContextValue::<{ tag::ENUMERATED }>::parse(&body[used..]).map(|context| (context.value, body[used..].len())), Ok((Value::Enumerated(85), 2)));
         // A context Boolean holds one byte (Clause 20.2.3).
-        assert_eq!(Value::Boolean(true).to_bytes(), [0x11]);
+        assert_eq!(Value::Boolean(true).to_bytes().unwrap(), [0x11]);
         let mut out = Vec::new();
-        Value::Boolean(true).write_context(2, &mut out);
+        ContextValue::<{ tag::BOOLEAN }> { number: 2, value: Value::Boolean(true) }.write(&mut out).unwrap();
         assert_eq!(out, [0x29, 0x01]);
-        assert_eq!(Value::parse_context(&out, 2, tag::BOOLEAN), Ok((Value::Boolean(true), 2)));
-        assert_eq!(Value::parse_context(&[0x29, 0x02], 2, tag::BOOLEAN), Err(Error::OutOfRange));
-        assert_eq!(Value::parse_context(&[0x28], 2, tag::BOOLEAN), Err(Error::ValueLength { tag: 1, len: 0 }));
+        assert_eq!(ContextValue::<{ tag::BOOLEAN }>::parse(&out).map(|context| (context.value, out.len())), Ok((Value::Boolean(true), 2)));
+        assert_eq!(ContextValue::<{ tag::BOOLEAN }>::parse(&[0x29, 0x02]).map(|context| (context.value, [0x29, 0x02].len())), Err(Error::OutOfRange));
+        assert_eq!(ContextValue::<{ tag::BOOLEAN }>::parse(&[0x28]).map(|context| (context.value, [0x28].len())), Err(Error::ValueLength { tag: 1, len: 0 }));
         // The wrong number, an application tag, an opening tag, a reserved type.
-        assert_eq!(Value::parse_context(&[0x19, 0x55], 0, tag::ENUMERATED), Err(Error::ServiceBody));
-        assert_eq!(Value::parse_context(&[0x91, 0x55], 9, tag::ENUMERATED), Err(Error::ServiceBody));
-        assert_eq!(Value::parse_context(&[0x3e], 3, tag::NULL), Err(Error::ServiceBody));
-        assert_eq!(Value::parse_context(&[0x19, 0x55], 1, 13), Err(Error::ReservedTag(13)));
-        assert_eq!(Value::parse_context(&[0x1a, 0x55], 1, tag::ENUMERATED), Err(Error::Truncated));
-        assert_eq!(Value::parse_context(&[], 1, tag::ENUMERATED), Err(Error::Truncated));
+        assert_eq!(ContextValue::<{ tag::ENUMERATED }>::parse(&[0x19, 0x55]).unwrap().number, 1);
+        assert_eq!(ContextValue::<{ tag::ENUMERATED }>::parse(&[0x91, 0x55]).map(|context| (context.value, [0x91, 0x55].len())), Err(Error::ServiceBody));
+        assert_eq!(ContextValue::<{ tag::NULL }>::parse(&[0x3e]).map(|context| (context.value, [0x3e].len())), Err(Error::ServiceBody));
+        assert_eq!(ContextValue::<13>::parse(&[0x19, 0x55]).map(|context| (context.value, [0x19, 0x55].len())), Err(Error::ReservedTag(13)));
+        assert_eq!(ContextValue::<{ tag::ENUMERATED }>::parse(&[0x1a, 0x55]).map(|context| (context.value, [0x1a, 0x55].len())), Err(Error::Truncated));
+        assert_eq!(ContextValue::<{ tag::ENUMERATED }>::parse(&[]).map(|context| (context.value, 0)), Err(Error::Truncated));
         // Extended context tag numbers.
         let mut out = Vec::new();
-        Value::Unsigned(300).write_context(40, &mut out);
+        ContextValue::<{ tag::UNSIGNED }> { number: 40, value: Value::Unsigned(300) }.write(&mut out).unwrap();
         assert_eq!(out, hex("FA 28 012C"));
-        assert_eq!(Value::parse_context(&out, 40, tag::UNSIGNED), Ok((Value::Unsigned(300), 4)));
+        assert_eq!(ContextValue::<{ tag::UNSIGNED }>::parse(&out).map(|context| (context.value, out.len())), Ok((Value::Unsigned(300), 4)));
         // Who-Is writes its limits the same way.
-        assert_eq!(WhoIs { range: Some((3, 300)) }.to_bytes(), hex("09 03 1A 012C"));
+        assert_eq!(WhoIs { range: Some((3, 300)) }.to_bytes().unwrap(), hex("09 03 1A 012C"));
     }
 
     #[test]
@@ -2260,9 +2406,9 @@ mod tests {
         assert_eq!(req.data(), Some(&hex("0C 00000005 19 55")[..]));
         // Answer with the request's invoke ID and service.
         let ack = Apdu::SimpleAck { invoke_id: req.invoke_id().unwrap(), service: req.service().unwrap() };
-        assert_eq!(ack.to_bytes(), [0x20, 7, 12]);
+        assert_eq!(ack.to_bytes().unwrap(), [0x20, 7, 12]);
         assert_eq!(ack.data(), None);
-        let who = WhoIs { range: None }.to_apdu();
+        let who = WhoIs { range: None }.to_apdu().unwrap();
         assert_eq!((who.invoke_id(), who.service(), who.data()), (None, Some(unconfirmed::WHO_IS), Some(&[][..])));
         let abort = Apdu::Abort { server: true, invoke_id: 3, reason: 4 };
         assert_eq!((abort.invoke_id(), abort.service()), (Some(3), None));
@@ -2286,8 +2432,8 @@ mod tests {
             segmentation: Segmentation::NoSegmentation,
             vendor: 260,
         };
-        let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().to_bytes()).to_bytes());
-        assert_eq!(reply.to_bytes(), hex("810B0015 0100 1000 C4020004D2 2205C4 9103 220104"));
+        let reply = Bvlc::OriginalBroadcastNpdu(npdu.reply(i_am.to_apdu().unwrap().to_bytes().unwrap()).to_bytes().unwrap());
+        assert_eq!(reply.to_bytes().unwrap(), hex("810B0015 0100 1000 C4020004D2 2205C4 9103 220104"));
     }
 
     // Findings from review: each case below failed before its fix.
@@ -2295,15 +2441,15 @@ mod tests {
     #[test]
     fn value_lists_are_bounded() {
         // 16 MiB of Null tags would have made 16 million values.
-        assert_eq!(Value::parse_all(&vec![0; MAX_MESSAGE + 1]), Err(Error::TooLong));
-        assert_eq!(Value::parse_all(&vec![0; MAX_MESSAGE]).map(|v| v.len()), Ok(MAX_MESSAGE));
+        assert_eq!(Values::parse(&vec![0; MAX_MESSAGE + 1]).map(|values| values.0), Err(Error::TooLong));
+        assert_eq!(Values::parse(&vec![0; MAX_MESSAGE]).map(|values| values.0).map(|v| v.len()), Ok(MAX_MESSAGE));
     }
 
     #[test]
     fn expecting_reply_follows_the_apdu() {
         // A confirmed GetAlarmSummary request expects a reply.
         assert!(Npdu::local(hex("00 05 01 03")).expecting_reply);
-        assert_eq!(Npdu::local(hex("00 05 01 03")).to_bytes(), hex("01 04 00 05 01 03"));
+        assert_eq!(Npdu::local(hex("00 05 01 03")).to_bytes().unwrap(), hex("01 04 00 05 01 03"));
         // A segment of a complex acknowledgment does too; a whole one does not.
         assert!(Npdu::local(hex("38 01 00 04 0C")).expecting_reply);
         assert!(!Npdu::local(hex("30 01 0C")).expecting_reply);
@@ -2325,32 +2471,29 @@ mod tests {
         // Writers leave such addresses out, so a reply never turns a
         // source of 0xFFFF into a global broadcast.
         let n = Npdu { source: Some(NetAddress { network: 0xffff, mac: vec![1] }), ..Npdu::local(hex("10 08")) };
-        assert_eq!(n.to_bytes(), hex("01 00 10 08"));
+        assert_eq!(n.to_bytes(), Err(Error::Unwritable));
         let n = Npdu {
             destination: Some(Destination { address: NetAddress { network: 0, mac: vec![] }, hop_count: 255 }),
             ..Npdu::local(hex("10 08"))
         };
-        assert_eq!(n.to_bytes(), hex("01 00 10 08"));
-        assert!(Npdu::parse(&n.to_bytes()).is_ok());
+        assert_eq!(n.to_bytes(), Err(Error::Unwritable));
+        contract::check_wire_value(&n);
     }
 
     #[test]
-    fn strings_are_cut_between_characters() {
-        let s = "a".repeat(MAX_VALUE_LEN - 2) + "é";
-        let v = Value::CharacterString(CharString::utf8(&s));
-        let Value::CharacterString(back) = value(&v.to_bytes()) else { panic!() };
-        assert_eq!(back.as_str(), Some(&s[..MAX_VALUE_LEN - 2]));
-        // A four-byte character straddling the limit goes whole.
-        let s = "a".repeat(MAX_VALUE_LEN - 3) + "\u{1F600}";
-        let Value::CharacterString(back) = value(&Value::CharacterString(CharString::utf8(&s)).to_bytes()) else {
-            panic!()
-        };
-        assert_eq!(back.as_str(), Some(&s[..MAX_VALUE_LEN - 3]));
-        for (charset, unit) in [(3, 4), (4, 2)] {
-            let v = Value::CharacterString(CharString { charset, bytes: vec![0; MAX_VALUE_LEN + 8] });
-            let Value::CharacterString(back) = value(&v.to_bytes()) else { panic!() };
-            assert_eq!(back.bytes.len() % unit, 0, "charset {charset}");
-            assert!(back.bytes.len() > MAX_VALUE_LEN - 1 - unit);
+    fn oversized_strings_are_refused_without_splitting_characters() {
+        for text in [
+            "a".repeat(MAX_VALUE_LEN - 2) + "é",
+            "a".repeat(MAX_VALUE_LEN - 3) + "\u{1F600}",
+        ] {
+            let value = Value::CharacterString(CharString::utf8(&text));
+            contract::check_wire_value(&value);
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
+        }
+        for charset in [3, 4] {
+            let value = Value::CharacterString(CharString { charset, bytes: vec![0; MAX_VALUE_LEN + 8] });
+            contract::check_wire_value(&value);
+            assert_eq!(value.to_bytes(), Err(Error::Unwritable));
         }
     }
 
@@ -2364,87 +2507,82 @@ mod tests {
             segmentation: Segmentation::NoSegmentation,
             vendor: 15,
         };
-        assert_eq!(i_am.to_bytes(), hex("C4 02000001 22 05C4 91 03 21 0F"));
-        assert_eq!(IAm::parse(&i_am.to_bytes()).map(|i| i.device), Ok(ObjectId::device(1)));
+        contract::check_wire_value(&i_am);
+        assert_eq!(i_am.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
     fn forbidden_tag_forms() {
         // Clause 20.2.1.2: tag numbers 0 to 14 go in the first byte.
-        assert_eq!(Tag::parse(&hex("F9 01 00")), Err(Error::ReservedTag(1)));
-        assert_eq!(Tag::parse(&hex("F9 0E 00")), Err(Error::ReservedTag(14)));
-        assert!(Tag::parse(&hex("F9 0F 00")).is_ok());
+        assert_eq!(Tag::parse(&hex("F9 01 00")).map(|value| (value, hex("F9 01 00").len())), Err(Error::ReservedTag(1)));
+        assert_eq!(Tag::parse(&hex("F9 0E 00")).map(|value| (value, hex("F9 0E 00").len())), Err(Error::ReservedTag(14)));
+        assert!(Tag::parse(&hex("F9 0F")).map(|value| (value, hex("F9 0F").len())).is_ok());
         // Clause 20.2.3: an application Boolean is its length field alone.
-        assert_eq!(Value::parse(&hex("15 00")), Err(Error::ValueLength { tag: tag::BOOLEAN, len: 0 }));
-        assert_eq!(Value::parse(&hex("15 01")), Err(Error::ValueLength { tag: tag::BOOLEAN, len: 1 }));
-        assert_eq!(Value::parse(&hex("10")), Ok((Value::Boolean(false), 1)));
+        assert_eq!(Value::parse(&hex("15 00")).map(|value| (value, hex("15 00").len())), Err(Error::ValueLength { tag: tag::BOOLEAN, len: 0 }));
+        assert_eq!(Value::parse(&hex("15 01")).map(|value| (value, hex("15 01").len())), Err(Error::ValueLength { tag: tag::BOOLEAN, len: 1 }));
+        assert_eq!(Value::parse(&hex("10")).map(|value| (value, hex("10").len())), Ok((Value::Boolean(false), 1)));
     }
 
     // Random input.
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) as u8
-        }
-
-        fn bytes(&mut self, max: usize) -> Vec<u8> {
-            let n = usize::from(self.next()) % (max + 1);
-            (0..n).map(|_| self.next()).collect()
-        }
-    }
-
     /// Reads `b` every way this module can, checking that what reads also
     /// writes and reads back the same.
     fn check(b: &[u8]) {
+        contract::check_wire::<Tag>(b);
+        contract::check_wire::<Value>(b);
+        contract::check_wire::<Values>(b);
+        contract::check_wire::<Bvlc>(b);
+        contract::check_wire::<Npdu>(b);
+        contract::check_wire::<Apdu>(b);
+        contract::check_wire::<WhoIs>(b);
+        contract::check_wire::<IAm>(b);
+
         if let Ok(v) = Bvlc::parse(b) {
-            assert_eq!(v.to_bytes(), b);
+            assert_eq!(v.to_bytes().unwrap(), b);
         }
         if let Ok(n) = Npdu::parse(b) {
-            assert_eq!(Npdu::parse(&n.to_bytes()), Ok(n));
+            assert_eq!(Npdu::parse(&n.to_bytes().unwrap()), Ok(n));
         }
         if let Ok(a) = Apdu::parse(b) {
-            assert_eq!(Apdu::parse(&a.to_bytes()), Ok(a));
+            assert_eq!(Apdu::parse(&a.to_bytes().unwrap()), Ok(a));
         }
-        if let Ok(values) = Value::parse_all(b) {
+        if let Ok(values) = Values::parse(b).map(|values| values.0) {
             let mut once = Vec::new();
-            values.iter().for_each(|v| v.write(&mut once));
-            let again = Value::parse_all(&once).unwrap();
+            values.iter().for_each(|v| v.write(&mut once).unwrap());
+            let again = Values::parse(&once).map(|values| values.0).unwrap();
             let mut twice = Vec::new();
-            again.iter().for_each(|v| v.write(&mut twice));
+            again.iter().for_each(|v| v.write(&mut twice).unwrap());
             assert_eq!(once, twice);
         }
-        if let Ok((t, used)) = Tag::parse(b) {
+        if let Ok((t, used)) = Tag::parse(b).map(|value| (value, (b).len())) {
             assert!(used <= b.len());
             let mut out = Vec::new();
-            t.write(&mut out);
-            assert_eq!(Tag::parse(&out), Ok((t, out.len())));
+            t.write(&mut out).unwrap();
+            assert_eq!(Tag::parse(&out).map(|value| (value, out.len())), Ok((t, out.len())));
         }
         if let Ok(w) = WhoIs::parse(b) {
-            assert_eq!(WhoIs::parse(&w.to_bytes()), Ok(w));
+            assert_eq!(WhoIs::parse(&w.to_bytes().unwrap()), Ok(w));
         }
         if let Ok(i) = IAm::parse(b) {
-            assert_eq!(IAm::parse(&i.to_bytes()), Ok(i));
+            assert_eq!(IAm::parse(&i.to_bytes().unwrap()), Ok(i));
         }
-        if let Ok((t, _)) = Tag::parse(b) {
-            for as_tag in 0..=tag::OBJECT_IDENTIFIER {
-                if let Ok((v, used)) = Value::parse_context(b, t.number, as_tag) {
-                    assert!(used <= b.len());
-                    let mut once = Vec::new();
-                    v.write_context(t.number, &mut once);
-                    let (again, n) = Value::parse_context(&once, t.number, as_tag).unwrap();
-                    assert_eq!(n, once.len());
-                    let mut twice = Vec::new();
-                    again.write_context(t.number, &mut twice);
-                    assert_eq!(once, twice);
-                }
-            }
-        }
+        contract::check_wire::<ContextValue<0>>(b);
+        contract::check_wire::<ContextValue<1>>(b);
+        contract::check_wire::<ContextValue<2>>(b);
+        contract::check_wire::<ContextValue<3>>(b);
+        contract::check_wire::<ContextValue<4>>(b);
+        contract::check_wire::<ContextValue<5>>(b);
+        contract::check_wire::<ContextValue<6>>(b);
+        contract::check_wire::<ContextValue<7>>(b);
+        contract::check_wire::<ContextValue<8>>(b);
+        contract::check_wire::<ContextValue<9>>(b);
+        contract::check_wire::<ContextValue<10>>(b);
+        contract::check_wire::<ContextValue<11>>(b);
+        contract::check_wire::<ContextValue<12>>(b);
+
     }
 
-    /// Feeds `b` to every reader one byte at a time: each prefix in turn,
+    /// Passes `b` to every reader one byte at a time: each prefix in turn,
     /// as a datagram arriving short would be.
     fn check_prefixes(b: &[u8]) {
         for n in 0..=b.len() {
@@ -2454,7 +2592,7 @@ mod tests {
 
     #[test]
     fn random_bytes_never_panic() {
-        let mut rng = Lcg(0x5eed);
+        let mut rng = Lcg::new(0x5eed);
         for _ in 0..4000 {
             let b = rng.bytes(64);
             check(&b);
@@ -2484,78 +2622,78 @@ mod tests {
     }
 
     #[test]
-    fn decoders_fed_one_byte_at_a_time() {
-        let mut rng = Lcg(0xb4c0);
+    fn units_reject_incomplete_prefixes() {
+        let mut rng = Lcg::new(0xb4c0);
         for _ in 0..300 {
             // Random bytes, each prefix in turn.
             check_prefixes(&rng.bytes(40));
             // A valid datagram: BVLC, a routed NPDU, a confirmed request
             // with a random body. No prefix is a whole datagram, and every
             // prefix of the NPDU and APDU reads or fails without a panic.
-            let r = rng.next();
+            let r = rng.next() as u8;
             let segment =
-                (r & 1 != 0).then(|| Segment { sequence: rng.next(), window: rng.next(), more_follows: r & 2 != 0 });
+                (r & 1 != 0).then(|| Segment { sequence: (rng.next() as u8), window: (rng.next() as u8), more_follows: r & 2 != 0 });
             let apdu = Apdu::ConfirmedRequest {
                 segmented_response_accepted: r & 4 != 0,
                 max_segments: r % 8,
                 max_apdu: r % 16,
-                invoke_id: rng.next(),
+                invoke_id: (rng.next() as u8),
                 segment,
-                service: rng.next(),
+                service: (rng.next() as u8),
                 data: rng.bytes(20),
             };
-            let source = NetAddress { network: 1 + u16::from(rng.next()), mac: rng.bytes(6) };
+            let source = NetAddress { network: 1 + u16::from(rng.next() as u8), mac: rng.bytes(6) };
             let npdu = Npdu {
                 destination: (r & 8 != 0).then(|| Destination {
                     address: NetAddress { network: 0xffff, mac: rng.bytes(3) },
-                    hop_count: rng.next(),
+                    hop_count: (rng.next() as u8),
                 }),
                 source: (!source.mac.is_empty()).then_some(source),
                 expecting_reply: true,
                 priority: Priority::from_bits(r >> 4),
-                body: NpduBody::Apdu(apdu.to_bytes()),
+                body: NpduBody::Apdu(apdu.to_bytes().unwrap()),
             };
-            let bvlc = Bvlc::OriginalUnicastNpdu(npdu.to_bytes());
-            let bytes = bvlc.to_bytes();
+            let bvlc = Bvlc::OriginalUnicastNpdu(npdu.to_bytes().unwrap());
+            let bytes = bvlc.to_bytes().unwrap();
             assert_eq!(Bvlc::parse(&bytes), Ok(bvlc));
             check_prefixes(&bytes);
             for n in 0..bytes.len() {
                 assert!(Bvlc::parse(&bytes[..n]).is_err(), "{n} of {bytes:02x?}");
             }
-            let nb = npdu.to_bytes();
+            let nb = npdu.to_bytes().unwrap();
             assert_eq!(Npdu::parse(&nb), Ok(npdu.clone()));
             check_prefixes(&nb);
-            let ab = apdu.to_bytes();
+            let ab = apdu.to_bytes().unwrap();
             assert_eq!(Apdu::parse(&ab), Ok(apdu));
             check_prefixes(&ab);
             // Values, application and context tagged, one byte at a time.
             let i_am = IAm {
-                device: ObjectId::from_u32(u32::from_be_bytes([rng.next(), rng.next(), rng.next(), rng.next()])),
-                max_apdu: u32::from(rng.next()) << 4,
+                device: ObjectId::device(rng.index(MAX_INSTANCE as usize + 1) as u32),
+                max_apdu: u32::from(rng.next() as u8) << 4,
                 segmentation: Segmentation::from_code(u32::from(r % 4)).unwrap(),
-                vendor: u16::from(rng.next()),
+                vendor: u16::from(rng.next() as u8),
             };
-            let ib = i_am.to_bytes();
+            let ib = i_am.to_bytes().unwrap();
             check_prefixes(&ib);
             for n in 0..ib.len() {
                 assert!(IAm::parse(&ib[..n]).is_err());
             }
             let mut ctx = Vec::new();
-            Value::Unsigned(u64::from(rng.next()) << (r % 56)).write_context(r % 40, &mut ctx);
+            ContextValue::<{ tag::UNSIGNED }> { number: r % 40, value: Value::Unsigned(u64::from(rng.next() as u8) << (r % 56)) }.write(&mut ctx).unwrap();
             check_prefixes(&ctx);
             for n in 0..ctx.len() {
-                assert!(Value::parse_context(&ctx[..n], r % 40, tag::UNSIGNED).is_err());
+                assert!(ContextValue::<{ tag::UNSIGNED }>::parse(&ctx[..n]).map(|context| (context.value, ctx[..n].len())).is_err());
             }
         }
     }
 
     #[test]
     fn random_values_round_trip() {
-        let mut rng = Lcg(42);
+        let mut rng = Lcg::new(42);
         for _ in 0..3000 {
-            let r = rng.next();
+            let r = rng.next() as u8;
             let mut wide = [0u8; 8];
-            wide.iter_mut().for_each(|w| *w = rng.next());
+            wide.iter_mut().for_each(|w| *w = rng.next() as u8);
             let n = u64::from_be_bytes(wide) >> (r % 64);
             let v = match r % 13 {
                 0 => Value::Null,
@@ -2572,27 +2710,41 @@ mod tests {
                 11 => Value::Time(Time { hour: wide[0], minute: wide[1], second: wide[2], hundredths: wide[3] }),
                 _ => Value::ObjectId(ObjectId::from_u32(n as u32)),
             };
-            let bytes = v.to_bytes();
-            let (back, used) = Value::parse(&bytes).unwrap();
+            let bytes = v.to_bytes().unwrap();
+            let (back, used) = Value::parse(&bytes).map(|value| (value, bytes.len())).unwrap();
             assert_eq!(used, bytes.len());
-            assert_eq!(back.to_bytes(), bytes);
+            assert_eq!(back.to_bytes().unwrap(), bytes);
             if !matches!(v, Value::Real(_) | Value::Double(_)) {
                 assert_eq!(back, v);
             }
             for k in 0..bytes.len() {
-                assert!(Value::parse(&bytes[..k]).is_err(), "{v:?} {k}");
+                assert!(Value::parse(&bytes[..k]).map(|value| (value, bytes[..k].len())).is_err(), "{v:?} {k}");
             }
             // The same value under a context tag.
-            let number = rng.next();
-            let mut ctx = Vec::new();
-            v.write_context(number, &mut ctx);
-            let (back, used) = Value::parse_context(&ctx, number.min(254), v.tag()).unwrap();
-            assert_eq!(used, ctx.len());
-            let mut again = Vec::new();
-            back.write_context(number, &mut again);
-            assert_eq!(again, ctx);
-            if !matches!(v, Value::Real(_) | Value::Double(_)) {
-                assert_eq!(back, v);
+            let number = rng.index(255) as u8;
+            macro_rules! context {
+                ($typ:expr) => {{
+                    let context = ContextValue::<{ $typ }> { number, value: v.clone() };
+                    contract::check_wire_value(&context);
+                    let bytes = context.to_bytes().unwrap();
+                    assert_eq!(ContextValue::<{ $typ }>::parse(&bytes), Ok(context));
+                }};
+            }
+            match v.tag() {
+                tag::NULL => context!(tag::NULL),
+                tag::BOOLEAN => context!(tag::BOOLEAN),
+                tag::UNSIGNED => context!(tag::UNSIGNED),
+                tag::SIGNED => context!(tag::SIGNED),
+                tag::REAL => context!(tag::REAL),
+                tag::DOUBLE => context!(tag::DOUBLE),
+                tag::OCTET_STRING => context!(tag::OCTET_STRING),
+                tag::CHARACTER_STRING => context!(tag::CHARACTER_STRING),
+                tag::BIT_STRING => context!(tag::BIT_STRING),
+                tag::ENUMERATED => context!(tag::ENUMERATED),
+                tag::DATE => context!(tag::DATE),
+                tag::TIME => context!(tag::TIME),
+                tag::OBJECT_IDENTIFIER => context!(tag::OBJECT_IDENTIFIER),
+                _ => unreachable!(),
             }
         }
     }

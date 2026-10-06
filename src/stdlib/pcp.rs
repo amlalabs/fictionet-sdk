@@ -23,18 +23,19 @@
 //! [`NatPmpRequest`] or a PCP [`Request`]. Which mappings exist, which
 //! ports are free, and whether a request is allowed are up to world code.
 //! A world that plays a client builds a [`Request`], writes it with
-//! [`Request::to_bytes`], and reads the answer with [`Response::parse`] or
+//! [`Request::write`], and reads the answer with [`Response::parse`] or
 //! [`unsupported_version`].
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. No message is longer than [`MAX_MESSAGE`], and the writers clip
-//! what they write to that limit, so what they write always reads back.
+//! likes. No message is longer than [`MAX_MESSAGE`], and the writers refuse
+//! values above that limit without changing the destination.
 //! PCP addresses are 16 bytes. An IPv4 address is carried as an
 //! IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), as RFC 6887 section 5
 //! says.
 //!
 //! ```
 //! use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::pcp::{receive, Incoming, Map, Operation, Request, Response, ResultCode, Speaks};
 //!
 //! let laptop = Ipv4Addr::new(192, 168, 1, 20);
@@ -51,7 +52,7 @@
 //!     }),
 //!     options: vec![],
 //! };
-//! let datagram = ask.to_bytes();
+//! let datagram = ask.to_bytes().unwrap();
 //! assert_eq!(datagram.len(), 60);
 //!
 //! // The gateway, at epoch 1000, grants external port 40000 for an hour.
@@ -63,7 +64,7 @@
 //! map.external_address = Ipv4Addr::new(203, 0, 113, 5).to_ipv6_mapped();
 //! let mut reply = request.reply(ResultCode::Success, 3600, 1000);
 //! reply.operation = Operation::Map(map);
-//! let bytes = reply.to_bytes();
+//! let bytes = reply.to_bytes().unwrap();
 //! assert_eq!(&bytes[..4], &[2, 0x81, 0, 0]);
 //! assert_eq!(Response::parse(&bytes), Ok(reply));
 //!
@@ -73,8 +74,11 @@
 //! let Incoming::Reply(error) = receive(&datagram, Speaks::Both, other, 1000) else {
 //!     panic!("expected an error reply")
 //! };
-//! assert_eq!(Response::parse(&error).unwrap().result, ResultCode::AddressMismatch);
+//! assert_eq!(Response::parse(&error.to_bytes().unwrap()).unwrap().result, ResultCode::AddressMismatch);
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -116,8 +120,7 @@ pub mod opcode {
     pub const ANNOUNCE: u8 = 0;
     pub const MAP: u8 = 1;
     pub const PEER: u8 = 2;
-    /// Reserved by RFC 6887. A writer uses it for an unknown opcode that
-    /// would otherwise look like a known one.
+    /// Reserved by RFC 6887.
     pub const RESERVED: u8 = 127;
 }
 
@@ -376,6 +379,10 @@ impl PcpOption {
 /// Why bytes are not a PCP request or response this module reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ParseError {
+    /// A NAT-PMP response failed while reading a gateway reply.
+    NatPmp(NatPmpError),
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// Too few bytes: under 2 (requests) or 4 (responses) to know the
     /// version, or under the 24-byte header. The value is the length.
     Short(usize),
@@ -407,7 +414,7 @@ impl ParseError {
     /// RFC 6887 says to drop the message without a word.
     pub fn result_code(self) -> Option<ResultCode> {
         match self {
-            ParseError::Short(_) | ParseError::WrongDirection => None,
+            ParseError::Short(_) | ParseError::WrongDirection | ParseError::Unwritable | ParseError::NatPmp(_) => None,
             ParseError::Version(_) => Some(ResultCode::UnsuppVersion),
             ParseError::TooLong(_) | ParseError::Unaligned(_) | ParseError::OpcodeData { .. } => {
                 Some(ResultCode::MalformedRequest)
@@ -420,6 +427,8 @@ impl ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ParseError::NatPmp(e) => write!(f, "NAT-PMP response: {e}"),
+            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::Short(n) => write!(f, "{n} bytes, too short for a PCP message"),
             ParseError::WrongDirection => f.write_str("R bit says the message goes the other way"),
             ParseError::Version(v) => write!(f, "version {v}, not 2 (PCP)"),
@@ -451,49 +460,6 @@ pub struct Request {
 }
 
 impl Request {
-    /// Reads a request. The checks run in the order of RFC 6887 section
-    /// 8.2, so the first error found is the one a server reports. Known
-    /// options must have their exact lengths, and THIRD_PARTY and
-    /// PREFER_FAILURE may each appear once.
-    pub fn parse(b: &[u8]) -> Result<Request, ParseError> {
-        if b.len() < 2 {
-            return Err(ParseError::Short(b.len()));
-        }
-        if b[1] & RESPONSE_FLAG != 0 {
-            return Err(ParseError::WrongDirection);
-        }
-        if b[0] != VERSION {
-            return Err(ParseError::Version(b[0]));
-        }
-        check_length(b)?;
-        let op = b[1];
-        let (operation, options) = read_body(op, &b[HEADER_LEN..], true)?;
-        Ok(Request { lifetime: be32(b, 4), client: ip6(&b[8..24]), operation, options })
-    }
-
-    /// The request's bytes, for a world that plays a client. An unknown
-    /// opcode that looks like a known one (0, 1 or 2, once the R bit is
-    /// cleared) is written as opcode 127, since its data would not read
-    /// back. Options that do not fit in [`MAX_MESSAGE`] are left out, as
-    /// are repeats of THIRD_PARTY and PREFER_FAILURE and any
-    /// [`PcpOption::Other`] with a known code.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let op = match &self.operation {
-            Operation::Other { opcode, .. } => {
-                let o = opcode & !RESPONSE_FLAG;
-                if o <= opcode::PEER { opcode::RESERVED } else { o }
-            }
-            other => other.opcode(),
-        };
-        let mut out = Vec::with_capacity(HEADER_LEN + PEER_LEN);
-        out.extend_from_slice(&[VERSION, op, 0, 0]);
-        out.extend_from_slice(&self.lifetime.to_be_bytes());
-        out.extend_from_slice(&self.client.octets());
-        write_operation(&mut out, &self.operation);
-        write_options(&mut out, &self.options, true);
-        out
-    }
-
     /// Checks what a server checks once a request reads, in the order of
     /// RFC 6887 sections 8.2, 11.3 and 12.3. First the client address
     /// against `source` (ADDRESS_MISMATCH). Then the opcode: an unknown
@@ -591,53 +557,6 @@ pub struct Response {
 }
 
 impl Response {
-    /// Reads a response. The checks run in the order of RFC 6887 section
-    /// 8.3. A reply whose version is not 2 is [`ParseError::Version`], and
-    /// [`unsupported_version`] reads it. Clients must ignore options they
-    /// do not understand, so a known option with the wrong length becomes
-    /// [`PcpOption::Other`], repeats are kept, and MAP or PEER data or
-    /// options that do not read leave the operation as
-    /// [`Operation::Other`].
-    pub fn parse(b: &[u8]) -> Result<Response, ParseError> {
-        if b.len() < 4 {
-            return Err(ParseError::Short(b.len()));
-        }
-        if b[1] & RESPONSE_FLAG == 0 {
-            return Err(ParseError::WrongDirection);
-        }
-        if b[0] != VERSION {
-            return Err(ParseError::Version(b[0]));
-        }
-        check_length(b)?;
-        let op = b[1] & !RESPONSE_FLAG;
-        let body = &b[HEADER_LEN..];
-        let (operation, options) = read_body(op, body, false)
-            .unwrap_or_else(|_| (Operation::Other { opcode: op, data: body.to_vec() }, vec![]));
-        let mut reserved = [0; 12];
-        reserved.copy_from_slice(&b[12..24]);
-        Ok(Response {
-            result: ResultCode::from_code(b[3]),
-            lifetime: be32(b, 4),
-            epoch: be32(b, 8),
-            reserved,
-            operation,
-            options,
-        })
-    }
-
-    /// The response's bytes. Options that do not fit in [`MAX_MESSAGE`]
-    /// are left out.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(HEADER_LEN + PEER_LEN);
-        out.extend_from_slice(&[VERSION, self.operation.opcode() | RESPONSE_FLAG, 0, self.result.code()]);
-        out.extend_from_slice(&self.lifetime.to_be_bytes());
-        out.extend_from_slice(&self.epoch.to_be_bytes());
-        out.extend_from_slice(&self.reserved);
-        write_operation(&mut out, &self.operation);
-        write_options(&mut out, &self.options, false);
-        out
-    }
-
     /// An unsolicited ANNOUNCE response, which a server that lost its
     /// state sends to [`CLIENT_PORT`] with its reset epoch.
     pub fn announce(epoch: u32) -> Response {
@@ -659,17 +578,15 @@ impl Response {
 /// bits keep the last 12 bytes of the request's client address. A request
 /// shorter than the header is padded to [`HEADER_LEN`], so the reply always
 /// reads as a [`Response`].
-pub fn error_reply(request: &[u8], result: ResultCode, lifetime: u32, epoch: u32) -> Vec<u8> {
-    let mut out = request[..request.len().min(MAX_MESSAGE)].to_vec();
-    let len = out.len().next_multiple_of(4).max(HEADER_LEN);
-    out.resize(len, 0);
-    out[0] = VERSION;
-    out[1] |= RESPONSE_FLAG;
-    out[2] = 0;
-    out[3] = result.code();
-    out[4..8].copy_from_slice(&lifetime.to_be_bytes());
-    out[8..12].copy_from_slice(&epoch.to_be_bytes());
-    out
+pub fn error_reply(request: &[u8], result: ResultCode, lifetime: u32, epoch: u32) -> Response {
+    let opcode = request.get(1).copied().unwrap_or(0) & !RESPONSE_FLAG;
+    let mut reserved = [0; 12];
+    for (slot, value) in reserved.iter_mut().zip(request.get(12..request.len().min(24)).unwrap_or_default()) { *slot = *value; }
+    let mut body = request.get(HEADER_LEN..request.len().min(MAX_MESSAGE)).unwrap_or_default().to_vec();
+    body.resize(body.len().next_multiple_of(4), 0);
+    let (operation, options) = read_body(opcode, &body, false)
+        .unwrap_or_else(|_| (Operation::Other { opcode, data: body }, vec![]));
+    Response { result, lifetime, epoch, reserved, operation, options }
 }
 
 // ---------------------------------------------------------------------
@@ -745,6 +662,11 @@ impl NatPmpProtocol {
 /// Why bytes are not a NAT-PMP request or response this module reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NatPmpError {
+    /// Bytes follow a fixed-size message.
+    Trailing,
+
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// Too few bytes for the opcode. The value is the length.
     Short(usize),
     /// Longer than [`MAX_MESSAGE`]. The value is the length.
@@ -758,6 +680,8 @@ pub enum NatPmpError {
 impl std::fmt::Display for NatPmpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            NatPmpError::Trailing => f.write_str("bytes after the message"),
+            NatPmpError::Unwritable => f.write_str("value cannot be written without changing it"),
             NatPmpError::Short(n) => write!(f, "{n} bytes, too short for the NAT-PMP opcode"),
             NatPmpError::TooLong(n) => write!(f, "{n} bytes, longer than {MAX_MESSAGE}"),
             NatPmpError::Version(v) => write!(f, "version {v}, not 0 (NAT-PMP)"),
@@ -797,65 +721,6 @@ pub enum NatPmpRequest {
 }
 
 impl NatPmpRequest {
-    /// Reads a request. Bytes past what the opcode needs are ignored.
-    pub fn parse(b: &[u8]) -> Result<NatPmpRequest, NatPmpError> {
-        if b.len() < 2 {
-            return Err(NatPmpError::Short(b.len()));
-        }
-        if b.len() > MAX_MESSAGE {
-            return Err(NatPmpError::TooLong(b.len()));
-        }
-        if b[0] != NAT_PMP_VERSION {
-            return Err(NatPmpError::Version(b[0]));
-        }
-        let op = b[1];
-        if op & RESPONSE_FLAG != 0 {
-            return Err(NatPmpError::WrongDirection);
-        }
-        Ok(match op {
-            nat_pmp_opcode::EXTERNAL_ADDRESS => NatPmpRequest::ExternalAddress,
-            nat_pmp_opcode::MAP_UDP | nat_pmp_opcode::MAP_TCP => {
-                if b.len() < 12 {
-                    return Err(NatPmpError::Short(b.len()));
-                }
-                let protocol = if op == nat_pmp_opcode::MAP_UDP { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
-                NatPmpRequest::Map {
-                    protocol,
-                    internal_port: be16(b, 4),
-                    external_port: be16(b, 6),
-                    lifetime: be32(b, 8),
-                }
-            }
-            _ => NatPmpRequest::Unsupported { opcode: op, data: b[2..].to_vec() },
-        })
-    }
-
-    /// The request's bytes, for a world that plays a client. An
-    /// [`NatPmpRequest::Unsupported`] whose opcode is known or has the top
-    /// bit set is written as opcode 127, and its data is cut to fit in
-    /// [`MAX_MESSAGE`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            NatPmpRequest::ExternalAddress => {
-                vec![NAT_PMP_VERSION, nat_pmp_opcode::EXTERNAL_ADDRESS]
-            }
-            NatPmpRequest::Map { protocol, internal_port, external_port, lifetime } => {
-                let mut out = vec![NAT_PMP_VERSION, protocol.opcode(), 0, 0];
-                out.extend_from_slice(&internal_port.to_be_bytes());
-                out.extend_from_slice(&external_port.to_be_bytes());
-                out.extend_from_slice(&lifetime.to_be_bytes());
-                out
-            }
-            NatPmpRequest::Unsupported { opcode, data } => {
-                let o = opcode & !RESPONSE_FLAG;
-                let o = if o <= nat_pmp_opcode::MAP_TCP { 127 } else { o };
-                let mut out = vec![NAT_PMP_VERSION, o];
-                out.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 2)]);
-                out
-            }
-        }
-    }
-
     /// The response that refuses this request with `result`, as RFC 6886
     /// section 3.5 says: the internal port copied, the external address,
     /// port and lifetime zero. A failed delete is the exception: RFC 6886
@@ -928,93 +793,6 @@ pub enum NatPmpResponse {
     },
 }
 
-impl NatPmpResponse {
-    /// Reads a response. Bytes past what the opcode needs are ignored.
-    pub fn parse(b: &[u8]) -> Result<NatPmpResponse, NatPmpError> {
-        if b.len() < 4 {
-            return Err(NatPmpError::Short(b.len()));
-        }
-        if b.len() > MAX_MESSAGE {
-            return Err(NatPmpError::TooLong(b.len()));
-        }
-        if b[0] != NAT_PMP_VERSION {
-            return Err(NatPmpError::Version(b[0]));
-        }
-        let (op, result) = (b[1], NatPmpResult::from_code(be16(b, 2)));
-        let need = |n: usize| {
-            if b.len() < n { Err(NatPmpError::Short(b.len())) } else { Ok(()) }
-        };
-        Ok(match op {
-            0 if result == NatPmpResult::UnsupportedVersion => {
-                need(8)?;
-                NatPmpResponse::UnsupportedVersion { epoch: be32(b, 4) }
-            }
-            0..=127 => return Err(NatPmpError::WrongDirection),
-            128 => {
-                need(12)?;
-                NatPmpResponse::ExternalAddress { result, epoch: be32(b, 4), address: ip4(&b[8..12]) }
-            }
-            129 | 130 => {
-                need(16)?;
-                let protocol = if op == 129 { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
-                NatPmpResponse::Map {
-                    protocol,
-                    result,
-                    epoch: be32(b, 4),
-                    internal_port: be16(b, 8),
-                    external_port: be16(b, 10),
-                    lifetime: be32(b, 12),
-                }
-            }
-            _ => NatPmpResponse::Other { opcode: op & !RESPONSE_FLAG, result, data: b[4..].to_vec() },
-        })
-    }
-
-    /// The response's bytes. An [`NatPmpResponse::Other`] whose opcode is
-    /// a known one is padded with zeros to that opcode's length, and its
-    /// data is cut to fit in [`MAX_MESSAGE`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            NatPmpResponse::ExternalAddress { result, epoch, address } => {
-                let mut out = vec![NAT_PMP_VERSION, 128];
-                out.extend_from_slice(&result.code().to_be_bytes());
-                out.extend_from_slice(&epoch.to_be_bytes());
-                out.extend_from_slice(&address.octets());
-                out
-            }
-            NatPmpResponse::Map { protocol, result, epoch, internal_port, external_port, lifetime } => {
-                let mut out = vec![NAT_PMP_VERSION, protocol.opcode() | RESPONSE_FLAG];
-                out.extend_from_slice(&result.code().to_be_bytes());
-                out.extend_from_slice(&epoch.to_be_bytes());
-                out.extend_from_slice(&internal_port.to_be_bytes());
-                out.extend_from_slice(&external_port.to_be_bytes());
-                out.extend_from_slice(&lifetime.to_be_bytes());
-                out
-            }
-            NatPmpResponse::UnsupportedVersion { epoch } => {
-                let mut out = vec![NAT_PMP_VERSION, 0, 0, 1];
-                out.extend_from_slice(&epoch.to_be_bytes());
-                out
-            }
-            NatPmpResponse::Other { opcode, result, data } => {
-                let op = opcode | RESPONSE_FLAG;
-                let mut out = vec![NAT_PMP_VERSION, op];
-                out.extend_from_slice(&result.code().to_be_bytes());
-                out.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 4)]);
-                let min = match op {
-                    128 => 12,
-                    129 | 130 => 16,
-                    _ => 0,
-                };
-                if out.len() < min {
-                    out.resize(min, 0);
-                }
-                out
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------------
 // Serving and version negotiation
 // ---------------------------------------------------------------------
@@ -1039,7 +817,7 @@ pub enum Incoming {
     /// Drop it without a reply.
     Ignore,
     /// Send these bytes back to the sender. Nothing else changes.
-    Reply(Vec<u8>),
+    Reply(Reply),
     /// A NAT-PMP request for the world to answer.
     NatPmp(NatPmpRequest),
     /// A PCP request that passed [`Request::check`], for the world to
@@ -1070,14 +848,14 @@ pub fn receive(datagram: &[u8], speaks: Speaks, source: IpAddr, epoch: u32) -> I
     if b[0] == NAT_PMP_VERSION && speaks != Speaks::Pcp {
         return match NatPmpRequest::parse(b) {
             Ok(r @ NatPmpRequest::Unsupported { .. }) => {
-                Incoming::Reply(r.refuse(NatPmpResult::UnsupportedOpcode, epoch).to_bytes())
+                Incoming::Reply(Reply::NatPmp(r.refuse(NatPmpResult::UnsupportedOpcode, epoch)))
             }
             Ok(r) => Incoming::NatPmp(r),
             Err(_) => Incoming::Ignore,
         };
     }
     if speaks == Speaks::NatPmp {
-        return Incoming::Reply(NatPmpResponse::UnsupportedVersion { epoch }.to_bytes());
+        return Incoming::Reply(Reply::NatPmp(NatPmpResponse::UnsupportedVersion { epoch }));
     }
     let request = match Request::parse(b) {
         Ok(r) => r,
@@ -1092,11 +870,11 @@ pub fn receive(datagram: &[u8], speaks: Speaks, source: IpAddr, epoch: u32) -> I
                 Some(code) => code,
                 None => return Incoming::Ignore,
             };
-            return Incoming::Reply(error_reply(b, code, code.error_lifetime(), epoch));
+            return Incoming::Reply(Reply::Pcp(error_reply(b, code, code.error_lifetime(), epoch)));
         }
     };
     if let Err(code) = request.check(source) {
-        return Incoming::Reply(request.reply(code, code.error_lifetime(), epoch).to_bytes());
+        return Incoming::Reply(Reply::Pcp(request.reply(code, code.error_lifetime(), epoch)));
     }
     Incoming::Pcp(request)
 }
@@ -1306,9 +1084,8 @@ fn read_options(b: &[u8], strict: bool) -> Result<Vec<PcpOption>, ParseError> {
     Ok(out)
 }
 
-/// Writes the opcode's data. [`Operation::Other`] data is cut to fit in
-/// [`MAX_MESSAGE`] and padded with zeros to a multiple of 4.
-fn write_operation(out: &mut Vec<u8>, op: &Operation) {
+/// Writes opcode data. Refuses oversized or unaligned opaque data.
+fn write_operation(out: &mut Vec<u8>, op: &Operation) -> Result<(), ParseError> {
     let write_map =
         |out: &mut Vec<u8>, nonce: &[u8; 12], protocol: u8, internal: u16, external: u16, addr: &Ipv6Addr| {
             out.extend_from_slice(nonce);
@@ -1330,41 +1107,45 @@ fn write_operation(out: &mut Vec<u8>, op: &Operation) {
         }
         Operation::Other { data, .. } => {
             let room = MAX_MESSAGE.saturating_sub(out.len());
-            out.extend_from_slice(&data[..data.len().min(room)]);
-            out.resize(out.len().next_multiple_of(4), 0);
+            if data.len() > room || !data.len().is_multiple_of(4) { return Err(ParseError::Unwritable); }
+            out.extend_from_slice(data);
         }
     }
+    Ok(())
 }
 
-/// Writes options that fit. For a request, repeats of THIRD_PARTY and
-/// PREFER_FAILURE and [`PcpOption::Other`] with a known code are left out.
-fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) {
+/// Writes every option. Refuses oversized options, duplicate request singletons
+/// and opaque request options that name a defined code.
+fn write_options(out: &mut Vec<u8>, options: &[PcpOption], request: bool) -> Result<(), ParseError> {
+    if options.len() > MAX_OPTIONS { return Err(ParseError::Unwritable); }
     let (mut third_party, mut prefer_failure) = (false, false);
     for o in options {
         if request {
             let seen = match o {
                 PcpOption::ThirdParty(_) => Some(&mut third_party),
                 PcpOption::PreferFailure => Some(&mut prefer_failure),
-                PcpOption::Other { code: 1..=3, .. } => continue,
+                PcpOption::Other { code: 1..=3, .. } => return Err(ParseError::Unwritable),
                 _ => None,
             };
             if let Some(seen) = seen {
                 if *seen {
-                    continue;
+                    return Err(ParseError::Unwritable);
                 }
                 *seen = true;
             }
         }
+        if matches!(o, PcpOption::Other { data, .. } if data.len() > MAX_MESSAGE) { return Err(ParseError::Unwritable); }
         let data = o.data();
         let size = OPTION_HEADER_LEN.saturating_add(data.len().next_multiple_of(4));
         if out.len().saturating_add(size) > MAX_MESSAGE {
-            continue;
+            return Err(ParseError::Unwritable);
         }
         out.extend_from_slice(&[o.code(), 0]);
         out.extend_from_slice(&(data.len() as u16).to_be_bytes());
         out.extend_from_slice(&data);
         out.resize(out.len().next_multiple_of(4), 0);
     }
+    Ok(())
 }
 
 fn be16(b: &[u8], i: usize) -> u16 {
@@ -1387,8 +1168,296 @@ fn ip4(b: &[u8]) -> Ipv4Addr {
     Ipv4Addr::new(b[0], b[1], b[2], b[3])
 }
 
+impl Wire for Request {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads a request. The checks run in the order of RFC 6887 section
+    /// 8.2, so the first error found is the one a server reports. Known
+    /// options must have their exact lengths, and THIRD_PARTY and
+    /// PREFER_FAILURE may each appear once.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Request, ParseError> {
+        if b.len() < 2 {
+            return Err(ParseError::Short(b.len()));
+        }
+        if b[1] & RESPONSE_FLAG != 0 {
+            return Err(ParseError::WrongDirection);
+        }
+        if b[0] != VERSION {
+            return Err(ParseError::Version(b[0]));
+        }
+        check_length(b)?;
+        let op = b[1];
+        let (operation, options) = read_body(op, &b[HEADER_LEN..], true)?;
+        Ok(Request { lifetime: be32(b, 4), client: ip6(&b[8..24]), operation, options })
+    }
+
+    /// Appends the request. Refuses oversized fields, unaligned opaque data, duplicate
+    /// singleton options, and variants that would change. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let op = self.operation.opcode();
+        let mut out = Vec::with_capacity(HEADER_LEN + PEER_LEN);
+        out.extend_from_slice(&[VERSION, op, 0, 0]);
+        out.extend_from_slice(&self.lifetime.to_be_bytes());
+        out.extend_from_slice(&self.client.octets());
+        write_operation(&mut out, &self.operation)?;
+        write_options(&mut out, &self.options, true)?;
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Response {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads a response. The checks run in the order of RFC 6887 section
+    /// 8.3. A reply whose version is not 2 is [`ParseError::Version`], and
+    /// [`unsupported_version`] reads it. Clients must ignore options they
+    /// do not understand, so a known option with the wrong length becomes
+    /// [`PcpOption::Other`], repeats are kept, and MAP or PEER data or
+    /// options that do not read leave the operation as
+    /// [`Operation::Other`].
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Response, ParseError> {
+        if b.len() < 4 {
+            return Err(ParseError::Short(b.len()));
+        }
+        if b[1] & RESPONSE_FLAG == 0 {
+            return Err(ParseError::WrongDirection);
+        }
+        if b[0] != VERSION {
+            return Err(ParseError::Version(b[0]));
+        }
+        check_length(b)?;
+        let op = b[1] & !RESPONSE_FLAG;
+        let body = &b[HEADER_LEN..];
+        let (operation, options) = read_body(op, body, false)
+            .unwrap_or_else(|_| (Operation::Other { opcode: op, data: body.to_vec() }, vec![]));
+        let mut reserved = [0; 12];
+        reserved.copy_from_slice(&b[12..24]);
+        Ok(Response {
+            result: ResultCode::from_code(b[3]),
+            lifetime: be32(b, 4),
+            epoch: be32(b, 8),
+            reserved,
+            operation,
+            options,
+        })
+    }
+
+    /// Appends the response. Refuses oversized fields, unaligned opaque data and
+    /// variants that would change. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let mut out = Vec::with_capacity(HEADER_LEN + PEER_LEN);
+        out.extend_from_slice(&[VERSION, self.operation.opcode() | RESPONSE_FLAG, 0, self.result.code()]);
+        out.extend_from_slice(&self.lifetime.to_be_bytes());
+        out.extend_from_slice(&self.epoch.to_be_bytes());
+        out.extend_from_slice(&self.reserved);
+        write_operation(&mut out, &self.operation)?;
+        write_options(&mut out, &self.options, false)?;
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for NatPmpRequest {
+    type ParseError = NatPmpError;
+    type WriteError = NatPmpError;
+
+    /// Reads a request. Bytes past a fixed opcode body are refused.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<NatPmpRequest, NatPmpError> {
+        if b.len() < 2 {
+            return Err(NatPmpError::Short(b.len()));
+        }
+        if b.len() > MAX_MESSAGE {
+            return Err(NatPmpError::TooLong(b.len()));
+        }
+        if b[0] != NAT_PMP_VERSION {
+            return Err(NatPmpError::Version(b[0]));
+        }
+        let op = b[1];
+        if op & RESPONSE_FLAG != 0 {
+            return Err(NatPmpError::WrongDirection);
+        }
+        Ok(match op {
+            nat_pmp_opcode::EXTERNAL_ADDRESS => {
+                if b.len() != 2 { return Err(NatPmpError::Trailing); }
+                NatPmpRequest::ExternalAddress
+            },
+            nat_pmp_opcode::MAP_UDP | nat_pmp_opcode::MAP_TCP => {
+                if b.len() < 12 {
+                    return Err(NatPmpError::Short(b.len()));
+                }
+                if b.len() != 12 { return Err(NatPmpError::Trailing); }
+                let protocol = if op == nat_pmp_opcode::MAP_UDP { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
+                NatPmpRequest::Map {
+                    protocol,
+                    internal_port: be16(b, 4),
+                    external_port: be16(b, 6),
+                    lifetime: be32(b, 8),
+                }
+            }
+            _ => NatPmpRequest::Unsupported { opcode: op, data: b[2..].to_vec() },
+        })
+    }
+
+    /// Appends the request. Refuses oversized opaque data and unsupported opcode
+    /// values that name defined requests or set the response bit. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), NatPmpError> {
+        let out = match self {
+            NatPmpRequest::ExternalAddress => {
+                vec![NAT_PMP_VERSION, nat_pmp_opcode::EXTERNAL_ADDRESS]
+            }
+            NatPmpRequest::Map { protocol, internal_port, external_port, lifetime } => {
+                let mut out = vec![NAT_PMP_VERSION, protocol.opcode(), 0, 0];
+                out.extend_from_slice(&internal_port.to_be_bytes());
+                out.extend_from_slice(&external_port.to_be_bytes());
+                out.extend_from_slice(&lifetime.to_be_bytes());
+                out
+            }
+            NatPmpRequest::Unsupported { opcode, data } => {
+                if *opcode <= nat_pmp_opcode::MAP_TCP || *opcode >= RESPONSE_FLAG { return Err(NatPmpError::Unwritable); }
+                let o = *opcode;
+                let mut out = vec![NAT_PMP_VERSION, o];
+                out.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 2)]);
+                out
+            }
+        };
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(NatPmpError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| NatPmpError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for NatPmpResponse {
+    type ParseError = NatPmpError;
+    type WriteError = NatPmpError;
+
+    /// Reads a response. Bytes past a fixed opcode body are refused.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<NatPmpResponse, NatPmpError> {
+        if b.len() < 4 {
+            return Err(NatPmpError::Short(b.len()));
+        }
+        if b.len() > MAX_MESSAGE {
+            return Err(NatPmpError::TooLong(b.len()));
+        }
+        if b[0] != NAT_PMP_VERSION {
+            return Err(NatPmpError::Version(b[0]));
+        }
+        let (op, result) = (b[1], NatPmpResult::from_code(be16(b, 2)));
+        let need = |n: usize| {
+            if b.len() < n { Err(NatPmpError::Short(b.len())) } else if b.len() > n { Err(NatPmpError::Trailing) } else { Ok(()) }
+        };
+        Ok(match op {
+            0 if result == NatPmpResult::UnsupportedVersion => {
+                need(8)?;
+                NatPmpResponse::UnsupportedVersion { epoch: be32(b, 4) }
+            }
+            0..=127 => return Err(NatPmpError::WrongDirection),
+            128 => {
+                need(12)?;
+                NatPmpResponse::ExternalAddress { result, epoch: be32(b, 4), address: ip4(&b[8..12]) }
+            }
+            129 | 130 => {
+                need(16)?;
+                let protocol = if op == 129 { NatPmpProtocol::Udp } else { NatPmpProtocol::Tcp };
+                NatPmpResponse::Map {
+                    protocol,
+                    result,
+                    epoch: be32(b, 4),
+                    internal_port: be16(b, 8),
+                    external_port: be16(b, 10),
+                    lifetime: be32(b, 12),
+                }
+            }
+            _ => NatPmpResponse::Other { opcode: op & !RESPONSE_FLAG, result, data: b[4..].to_vec() },
+        })
+    }
+
+    /// Appends the response. Refuses oversized opaque data and variants that would
+    /// read as a different response. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), NatPmpError> {
+        let out = match self {
+            NatPmpResponse::ExternalAddress { result, epoch, address } => {
+                let mut out = vec![NAT_PMP_VERSION, 128];
+                out.extend_from_slice(&result.code().to_be_bytes());
+                out.extend_from_slice(&epoch.to_be_bytes());
+                out.extend_from_slice(&address.octets());
+                out
+            }
+            NatPmpResponse::Map { protocol, result, epoch, internal_port, external_port, lifetime } => {
+                let mut out = vec![NAT_PMP_VERSION, protocol.opcode() | RESPONSE_FLAG];
+                out.extend_from_slice(&result.code().to_be_bytes());
+                out.extend_from_slice(&epoch.to_be_bytes());
+                out.extend_from_slice(&internal_port.to_be_bytes());
+                out.extend_from_slice(&external_port.to_be_bytes());
+                out.extend_from_slice(&lifetime.to_be_bytes());
+                out
+            }
+            NatPmpResponse::UnsupportedVersion { epoch } => {
+                let mut out = vec![NAT_PMP_VERSION, 0, 0, 1];
+                out.extend_from_slice(&epoch.to_be_bytes());
+                out
+            }
+            NatPmpResponse::Other { opcode, result, data } => {
+                if *opcode <= 2 || *opcode >= RESPONSE_FLAG { return Err(NatPmpError::Unwritable); }
+                let op = opcode | RESPONSE_FLAG;
+                let mut out = vec![NAT_PMP_VERSION, op];
+                out.extend_from_slice(&result.code().to_be_bytes());
+                out.extend_from_slice(&data[..data.len().min(MAX_MESSAGE - 4)]);
+                out
+            }
+        };
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(NatPmpError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| NatPmpError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+/// A complete gateway response in either supported protocol.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Reply {
+    /// A PCP response.
+    Pcp(Response),
+    /// A NAT-PMP response.
+    NatPmp(NatPmpResponse),
+}
+
+impl Wire for Reply {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads one response. Refuses malformed lengths, versions and directions.
+    fn parse(b: &[u8]) -> Result<Self, ParseError> {
+        if b.first() == Some(&NAT_PMP_VERSION) {
+            NatPmpResponse::parse(b).map(Self::NatPmp).map_err(ParseError::NatPmp)
+        } else {
+            Response::parse(b).map(Self::Pcp)
+        }
+    }
+
+    /// Appends the complete response. Refuses values the selected protocol cannot preserve.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
+        match self {
+            Self::Pcp(value) => value.write(out),
+            Self::NatPmp(value) => value.write(out).map_err(|_| ParseError::Unwritable),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
 
     const LAPTOP: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 20);
@@ -1448,7 +1517,7 @@ mod tests {
     fn map_request_layout() {
         let mut r = map_request();
         r.options = vec![PcpOption::ThirdParty(Ipv4Addr::new(192, 168, 1, 30).to_ipv6_mapped())];
-        let b = r.to_bytes();
+        let b = r.to_bytes().unwrap();
         let mut want = vec![2, 1, 0, 0, 0, 0, 0x1c, 0x20];
         want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 20]);
         want.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
@@ -1467,7 +1536,7 @@ mod tests {
         let mut resp = req.reply(ResultCode::Success, 3600, 77);
         let Operation::Map(m) = &mut resp.operation else { panic!() };
         m.external_address = Ipv4Addr::new(203, 0, 113, 5).to_ipv6_mapped();
-        let b = resp.to_bytes();
+        let b = resp.to_bytes().unwrap();
         assert_eq!(&b[..12], &[2, 0x81, 0, 0, 0, 0, 0x0e, 0x10, 0, 0, 0, 77]);
         assert_eq!(&b[12..24], &[0; 12]);
         assert_eq!(&b[24 + 32..24 + 36], &[203, 0, 113, 5]);
@@ -1478,14 +1547,14 @@ mod tests {
     #[test]
     fn peer_round_trip() {
         let r = peer_request();
-        let b = r.to_bytes();
+        let b = r.to_bytes().unwrap();
         assert_eq!(b.len(), HEADER_LEN + PEER_LEN);
         assert_eq!(b[1], opcode::PEER);
         assert_eq!(&b[24 + 36..24 + 40], &[0x01, 0xbb, 0, 0]);
         assert_eq!(&b[24 + 52..24 + 56], &[198, 51, 100, 7]);
         assert_eq!(Request::parse(&b), Ok(r.clone()));
         let resp = r.reply(ResultCode::Success, 600, 5);
-        assert_eq!(Response::parse(&resp.to_bytes()), Ok(resp));
+        assert_eq!(Response::parse(&resp.to_bytes().unwrap()), Ok(resp));
         assert_eq!(r.check(laptop()), Ok(()));
     }
 
@@ -1494,25 +1563,25 @@ mod tests {
     fn announce() {
         let r =
             Request { lifetime: 0, client: LAPTOP.to_ipv6_mapped(), operation: Operation::Announce, options: vec![] };
-        let b = r.to_bytes();
+        let b = r.to_bytes().unwrap();
         assert_eq!(b.len(), HEADER_LEN);
         assert_eq!(&b[..4], &[2, 0, 0, 0]);
         let Incoming::Pcp(got) = receive(&b, Speaks::Pcp, laptop(), 3) else { panic!() };
         assert_eq!(got, r);
-        let a = Response::announce(0).to_bytes();
+        let a = Response::announce(0).to_bytes().unwrap();
         assert_eq!(a.len(), HEADER_LEN);
         assert_eq!(&a[..4], &[2, 0x80, 0, 0]);
         assert_eq!(Response::parse(&a), Ok(Response::announce(0)));
         // Options may follow ANNOUNCE in future, so they are read.
         let r = with(r, vec![PcpOption::Other { code: 200, data: vec![1, 2, 3] }]);
-        assert_eq!(Request::parse(&r.to_bytes()), Ok(r));
+        assert_eq!(Request::parse(&r.to_bytes().unwrap()), Ok(r));
     }
 
     // RFC 6887 sections 13.2 and 13.3.
     #[test]
     fn options_layout() {
         let r = with(map_request(), vec![PcpOption::PreferFailure, filter(120)]);
-        let b = r.to_bytes();
+        let b = r.to_bytes().unwrap();
         let opts = &b[HEADER_LEN + MAP_LEN..];
         assert_eq!(&opts[..4], &[2, 0, 0, 0]);
         assert_eq!(&opts[4..12], &[3, 0, 0, 20, 0, 120, 0, 0]);
@@ -1521,14 +1590,14 @@ mod tests {
         assert_eq!(r.check(laptop()), Ok(()));
         // An odd-length option is padded, and its length is the real one.
         let r = with(map_request(), vec![PcpOption::Other { code: 130, data: vec![7; 5] }]);
-        let b = r.to_bytes();
+        let b = r.to_bytes().unwrap();
         assert_eq!(&b[HEADER_LEN + MAP_LEN..], &[130, 0, 0, 5, 7, 7, 7, 7, 7, 0, 0, 0]);
         assert_eq!(Request::parse(&b), Ok(r));
     }
 
     #[test]
     fn request_errors() {
-        let good = map_request().to_bytes();
+        let good = map_request().to_bytes().unwrap();
         assert_eq!(Request::parse(&[2]), Err(ParseError::Short(1)));
         let mut b = good.clone();
         b[1] |= 0x80;
@@ -1543,7 +1612,7 @@ mod tests {
         assert_eq!(Request::parse(&b), Err(ParseError::TooLong(1104)));
         assert_eq!(Request::parse(&good[..58]), Err(ParseError::Unaligned(58)));
         assert_eq!(Request::parse(&good[..56]), Err(ParseError::OpcodeData { opcode: 1, len: 32 }));
-        let peer = peer_request().to_bytes();
+        let peer = peer_request().to_bytes().unwrap();
         assert_eq!(Request::parse(&peer[..60]), Err(ParseError::OpcodeData { opcode: 2, len: 36 }));
         // An option header with no room for its data.
         let mut b = good.clone();
@@ -1568,7 +1637,7 @@ mod tests {
         assert_eq!(Request::parse(&b), Err(ParseError::DuplicateOption(1)));
         // FILTER may repeat.
         let r = with(map_request(), vec![filter(0), filter(120)]);
-        assert_eq!(Request::parse(&r.to_bytes()), Ok(r));
+        assert_eq!(Request::parse(&r.to_bytes().unwrap()), Ok(r));
         // Each error's result code.
         assert_eq!(ParseError::Short(3).result_code(), None);
         assert_eq!(ParseError::WrongDirection.result_code(), None);
@@ -1582,9 +1651,9 @@ mod tests {
 
     #[test]
     fn response_errors() {
-        let good = map_request().reply(ResultCode::Success, 1, 2).to_bytes();
+        let good = map_request().reply(ResultCode::Success, 1, 2).to_bytes().unwrap();
         assert_eq!(Response::parse(&good[..3]), Err(ParseError::Short(3)));
-        assert_eq!(Response::parse(&map_request().to_bytes()), Err(ParseError::WrongDirection));
+        assert_eq!(Response::parse(&map_request().to_bytes().unwrap()), Err(ParseError::WrongDirection));
         let mut b = good.clone();
         b[0] = 1;
         assert_eq!(Response::parse(&b), Err(ParseError::Version(1)));
@@ -1596,7 +1665,7 @@ mod tests {
         // Short MAP data in a response is kept, not refused.
         let r = Response::parse(&good[..32]).unwrap();
         assert_eq!(r.operation, Operation::Other { opcode: 1, data: good[24..32].to_vec() });
-        assert_eq!(Response::parse(&r.to_bytes()), Ok(r));
+        assert_eq!(Response::parse(&r.to_bytes().unwrap()), Ok(r));
         // A known option with a wrong length becomes Other, and repeats stay.
         let mut b = good.clone();
         b.extend_from_slice(&[2, 0, 0, 4, 9, 9, 9, 9, 2, 0, 0, 0, 2, 0, 0, 0]);
@@ -1605,7 +1674,7 @@ mod tests {
             r.options,
             [PcpOption::Other { code: 2, data: vec![9; 4] }, PcpOption::PreferFailure, PcpOption::PreferFailure]
         );
-        assert_eq!(r.to_bytes(), b);
+        assert_eq!(r.to_bytes().unwrap(), b);
     }
 
     #[test]
@@ -1705,17 +1774,20 @@ mod tests {
         };
         assert_eq!(r.check(laptop()), Err(ResultCode::UnsuppOpcode));
         assert_eq!(r.check(other), Err(ResultCode::AddressMismatch));
-        let Incoming::Reply(reply) = receive(&r.to_bytes(), Speaks::Both, other, 9) else { panic!() };
+        let Incoming::Reply(reply) = receive(&r.to_bytes().unwrap(), Speaks::Both, other, 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(Response::parse(&reply).unwrap().result, ResultCode::AddressMismatch);
         // A malformed option from the wrong address.
-        let mut b = map_request().to_bytes();
+        let mut b = map_request().to_bytes().unwrap();
         b.extend_from_slice(&[3, 0, 0, 4, 0, 0, 0, 0]);
         let Incoming::Reply(reply) = receive(&b, Speaks::Both, other, 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         let resp = Response::parse(&reply).unwrap();
         assert_eq!(resp.result, ResultCode::AddressMismatch);
         assert_eq!(&reply[12..24], &b[12..24]);
         // From the right address it is still MALFORMED_OPTION.
         let Incoming::Reply(reply) = receive(&b, Speaks::Both, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(Response::parse(&reply).unwrap().result, ResultCode::MalformedOption);
     }
 
@@ -1746,38 +1818,47 @@ mod tests {
 
     #[test]
     fn server_replies() {
+        // A short header keeps the address bytes that arrived and pads the rest.
+        let short = [3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9, 8, 7];
+        let reply = error_reply(&short, ResultCode::UnsuppVersion, 1800, 9);
+        assert_eq!(reply.reserved, [9, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        contract::check_wire_value(&reply);
         // Under 2 bytes, and responses: dropped.
         assert_eq!(receive(&[2], Speaks::Both, laptop(), 0), Incoming::Ignore);
-        let resp = map_request().reply(ResultCode::Success, 0, 0).to_bytes();
+        let resp = map_request().reply(ResultCode::Success, 0, 0).to_bytes().unwrap();
         assert_eq!(receive(&resp, Speaks::Both, laptop(), 0), Incoming::Ignore);
         // A version 2 message under 24 bytes: dropped.
         assert_eq!(receive(&[2, 1, 0, 0], Speaks::Both, laptop(), 0), Incoming::Ignore);
         // A version this server does not speak, with the client address
         // tail in the reserved bits.
-        let mut b = map_request().to_bytes();
+        let mut b = map_request().to_bytes().unwrap();
         b[0] = 3;
         let Incoming::Reply(reply) = receive(&b, Speaks::Pcp, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(reply.len(), b.len());
         assert_eq!(&reply[..4], &[2, 0x81, 0, 1]);
         assert_eq!(&reply[12..24], &b[12..24]);
         let r = Response::parse(&reply).unwrap();
         assert_eq!((r.result, r.lifetime, r.epoch), (ResultCode::UnsuppVersion, 1800, 9));
         // Malformed: unaligned.
-        let mut b = map_request().to_bytes();
+        let mut b = map_request().to_bytes().unwrap();
         b.push(0);
         let Incoming::Reply(reply) = receive(&b, Speaks::Both, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(reply.len(), 64);
         assert_eq!(Response::parse(&reply).unwrap().result, ResultCode::MalformedRequest);
         // Too long: the reply is cut to 1100 bytes.
-        let mut b = map_request().to_bytes();
+        let mut b = map_request().to_bytes().unwrap();
         b.resize(1500, 0);
         let Incoming::Reply(reply) = receive(&b, Speaks::Both, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(reply.len(), MAX_MESSAGE);
         assert!(Response::parse(&reply).is_ok());
         // Malformed option.
-        let mut b = map_request().to_bytes();
+        let mut b = map_request().to_bytes().unwrap();
         b.extend_from_slice(&[3, 0, 0, 4, 0, 0, 0, 0]);
         let Incoming::Reply(reply) = receive(&b, Speaks::Both, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(Response::parse(&reply).unwrap().result, ResultCode::MalformedOption);
         // Unknown opcode: the payload comes back as is.
         let r = Request {
@@ -1786,13 +1867,15 @@ mod tests {
             operation: Operation::Other { opcode: 99, data: vec![1, 2, 3, 4] },
             options: vec![],
         };
-        let Incoming::Reply(reply) = receive(&r.to_bytes(), Speaks::Both, laptop(), 9) else { panic!() };
+        let Incoming::Reply(reply) = receive(&r.to_bytes().unwrap(), Speaks::Both, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         let resp = Response::parse(&reply).unwrap();
         assert_eq!(resp.result, ResultCode::UnsuppOpcode);
         assert_eq!(resp.operation, r.operation);
         // A failed check.
         let r = with(map_request(), vec![PcpOption::Other { code: 50, data: vec![] }]);
-        let Incoming::Reply(reply) = receive(&r.to_bytes(), Speaks::Both, laptop(), 9) else { panic!() };
+        let Incoming::Reply(reply) = receive(&r.to_bytes().unwrap(), Speaks::Both, laptop(), 9) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         let resp = Response::parse(&reply).unwrap();
         assert_eq!(resp.result, ResultCode::UnsuppOption);
         assert_eq!(resp.options, r.options);
@@ -1807,7 +1890,7 @@ mod tests {
             epoch: 300,
             address: Ipv4Addr::new(203, 0, 113, 5),
         };
-        let b = resp.to_bytes();
+        let b = resp.to_bytes().unwrap();
         assert_eq!(b, [0, 128, 0, 0, 0, 0, 1, 44, 203, 0, 113, 5]);
         assert_eq!(NatPmpResponse::parse(&b), Ok(resp));
         let req = [0, 2, 0, 0, 0x1f, 0x90, 0, 80, 0, 0, 0x1c, 0x20];
@@ -1818,7 +1901,7 @@ mod tests {
             lifetime: 7200,
         };
         assert_eq!(NatPmpRequest::parse(&req), Ok(map.clone()));
-        assert_eq!(map.to_bytes(), req);
+        assert_eq!(map.to_bytes().unwrap(), req);
         let resp = NatPmpResponse::Map {
             protocol: NatPmpProtocol::Tcp,
             result: NatPmpResult::Success,
@@ -1827,14 +1910,14 @@ mod tests {
             external_port: 80,
             lifetime: 7200,
         };
-        let b = resp.to_bytes();
+        let b = resp.to_bytes().unwrap();
         assert_eq!(b, [0, 130, 0, 0, 0, 0, 1, 44, 0x1f, 0x90, 0, 80, 0, 0, 0x1c, 0x20]);
         assert_eq!(NatPmpResponse::parse(&b), Ok(resp));
         // Refusals keep the internal port and zero the rest.
         let refused = map.refuse(NatPmpResult::OutOfResources, 1);
-        assert_eq!(refused.to_bytes(), [0, 130, 0, 4, 0, 0, 0, 1, 0x1f, 0x90, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(refused.to_bytes().unwrap(), [0, 130, 0, 4, 0, 0, 0, 1, 0x1f, 0x90, 0, 0, 0, 0, 0, 0]);
         let refused = NatPmpRequest::ExternalAddress.refuse(NatPmpResult::NetworkFailure, 1);
-        assert_eq!(refused.to_bytes(), [0, 128, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(refused.to_bytes().unwrap(), [0, 128, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0]);
         // Through the server.
         assert_eq!(receive(&req, Speaks::Both, laptop(), 0), Incoming::NatPmp(map.clone()));
         assert_eq!(receive(&req, Speaks::NatPmp, laptop(), 0), Incoming::NatPmp(map));
@@ -1842,20 +1925,24 @@ mod tests {
         assert_eq!(receive(&[0, 1, 0, 0], Speaks::Both, laptop(), 0), Incoming::Ignore);
         // Unsupported opcode: the request comes back, top bit set, result 5.
         let Incoming::Reply(reply) = receive(&[0, 9, 0xaa, 0xbb, 1, 2], Speaks::Both, laptop(), 0) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(reply, [0, 0x89, 0, 5, 1, 2]);
         assert_eq!(
             NatPmpResponse::parse(&reply),
             Ok(NatPmpResponse::Other { opcode: 9, result: NatPmpResult::UnsupportedOpcode, data: vec![1, 2] })
         );
         let Incoming::Reply(reply) = receive(&[0, 9], Speaks::Both, laptop(), 0) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(reply, [0, 0x89, 0, 5]);
         // A NAT-PMP-only server answers PCP with Unsupported Version.
-        let Incoming::Reply(reply) = receive(&map_request().to_bytes(), Speaks::NatPmp, laptop(), 7) else { panic!() };
+        let Incoming::Reply(reply) = receive(&map_request().to_bytes().unwrap(), Speaks::NatPmp, laptop(), 7) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(reply, [0, 0, 0, 1, 0, 0, 0, 7]);
         assert_eq!(NatPmpResponse::parse(&reply), Ok(NatPmpResponse::UnsupportedVersion { epoch: 7 }));
         // A PCP-only server answers NAT-PMP with a PCP UNSUPP_VERSION whose
         // first four bytes read as result 1 to NAT-PMP.
         let Incoming::Reply(reply) = receive(&[0, 0], Speaks::Pcp, laptop(), 7) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(&reply[..4], &[2, 0x80, 0, 1]);
         assert_eq!(reply.len(), HEADER_LEN);
         assert_eq!(Response::parse(&reply).unwrap().result, ResultCode::UnsuppVersion);
@@ -1885,14 +1972,16 @@ mod tests {
     #[test]
     fn version_negotiation() {
         // A PCP server that does not speak version 3 offers 2.
-        let mut b = map_request().to_bytes();
+        let mut b = map_request().to_bytes().unwrap();
         b[0] = 3;
         let Incoming::Reply(reply) = receive(&b, Speaks::Pcp, laptop(), 0) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         let u = unsupported_version(&reply).unwrap();
         assert_eq!(u, UnsupportedVersion { version: 2, lifetime: Some(1800) });
         assert_eq!(u.next_step(3), VersionChoice::Pcp);
         // A NAT-PMP server answers a PCP client, which falls back.
-        let Incoming::Reply(reply) = receive(&map_request().to_bytes(), Speaks::NatPmp, laptop(), 0) else { panic!() };
+        let Incoming::Reply(reply) = receive(&map_request().to_bytes().unwrap(), Speaks::NatPmp, laptop(), 0) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         let u = unsupported_version(&reply).unwrap();
         assert_eq!(u, UnsupportedVersion { version: 0, lifetime: None });
         assert_eq!(u.next_step(VERSION), VersionChoice::NatPmp);
@@ -1900,6 +1989,7 @@ mod tests {
         assert_eq!(unsupported_version(&[0, 129, 0, 1, 0, 0, 0, 0]).map(|u| u.version), Some(0));
         // A PCP server answers a NAT-PMP client, which moves up to PCP.
         let Incoming::Reply(reply) = receive(&[0, 0], Speaks::Pcp, laptop(), 0) else { panic!() };
+        let reply = reply.to_bytes().unwrap();
         assert_eq!(unsupported_version(&reply).unwrap().next_step(NAT_PMP_VERSION), VersionChoice::Pcp);
         // A server offering a version the client cannot use: give up.
         let u = UnsupportedVersion { version: 5, lifetime: Some(60) };
@@ -1934,7 +2024,7 @@ mod tests {
             with(peer_request(), vec![PcpOption::ThirdParty(Ipv6Addr::LOCALHOST)]),
         ];
         for r in &requests {
-            let b = r.to_bytes();
+            let b = r.to_bytes().unwrap();
             for n in 0..b.len() {
                 // Cut at an option boundary, a request reads with fewer
                 // options. Cut anywhere else, it does not read.
@@ -1945,7 +2035,7 @@ mod tests {
                 }
             }
             let resp = r.reply(ResultCode::Success, 1, 1);
-            let b = resp.to_bytes();
+            let b = resp.to_bytes().unwrap();
             for n in 0..b.len() {
                 // A response never reads back the same once cut.
                 assert_ne!(Response::parse(&b[..n]), Ok(resp.clone()));
@@ -1956,7 +2046,7 @@ mod tests {
         }
         let nat =
             [NatPmpRequest::Map { protocol: NatPmpProtocol::Udp, internal_port: 1, external_port: 2, lifetime: 3 }
-                .to_bytes()];
+                .to_bytes().unwrap()];
         for b in &nat {
             for n in 0..b.len() {
                 assert!(NatPmpRequest::parse(&b[..n]).is_err());
@@ -1975,7 +2065,7 @@ mod tests {
             NatPmpResponse::UnsupportedVersion { epoch: 1 },
         ];
         for r in &responses {
-            let b = r.to_bytes();
+            let b = r.to_bytes().unwrap();
             for n in 0..b.len() {
                 assert!(NatPmpResponse::parse(&b[..n]).is_err(), "{r:?} cut to {n}");
             }
@@ -1983,20 +2073,18 @@ mod tests {
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
+    fn writers_refuse_values_that_would_change() {
         // Too many options: the ones that do not fit are left out.
         let many = vec![PcpOption::Other { code: 200, data: vec![1; 40] }; 100];
         let r = with(map_request(), many.clone());
-        let b = r.to_bytes();
-        assert!(b.len() <= MAX_MESSAGE);
-        let got = Request::parse(&b).unwrap();
-        assert_eq!(got.options.len(), (MAX_MESSAGE - HEADER_LEN - MAP_LEN) / 44);
+        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&r);
         let resp = Response { options: many, ..map_request().reply(ResultCode::Success, 0, 0) };
-        assert!(resp.to_bytes().len() <= MAX_MESSAGE);
-        assert!(Response::parse(&resp.to_bytes()).is_ok());
+        assert_eq!(resp.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&resp);
         // One huge option is left out, and a later small one still fits.
         let r = with(map_request(), vec![PcpOption::Other { code: 200, data: vec![0; 70000] }, filter(0)]);
-        assert_eq!(Request::parse(&r.to_bytes()).unwrap().options, [filter(0)]);
+        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
         // Repeats and fake known options are left out of requests.
         let r = with(
             map_request(),
@@ -2008,10 +2096,7 @@ mod tests {
                 PcpOption::Other { code: 3, data: vec![1] },
             ],
         );
-        assert_eq!(
-            Request::parse(&r.to_bytes()).unwrap().options,
-            [PcpOption::PreferFailure, PcpOption::ThirdParty(Ipv6Addr::LOCALHOST)]
-        );
+        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
         // An unknown opcode that looks known is written as 127.
         let r = Request {
             lifetime: 0,
@@ -2019,67 +2104,58 @@ mod tests {
             operation: Operation::Other { opcode: 0x81, data: vec![0; 5000] },
             options: vec![],
         };
-        let b = r.to_bytes();
-        assert_eq!(b.len(), MAX_MESSAGE);
-        assert_eq!(b[1], 127);
-        assert!(Request::parse(&b).is_ok());
+        assert_eq!(r.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&r);
         let resp = Response { operation: Operation::Other { opcode: 1, data: vec![] }, ..Response::announce(0) };
-        assert!(Response::parse(&resp.to_bytes()).is_ok());
+        contract::check_wire_value(&resp);
         // NAT-PMP.
         let r = NatPmpRequest::Unsupported { opcode: 1, data: vec![0; 5000] };
-        let b = r.to_bytes();
-        assert_eq!((b.len(), b[1]), (MAX_MESSAGE, 127));
-        assert!(NatPmpRequest::parse(&b).is_ok());
+        assert_eq!(r.to_bytes(), Err(NatPmpError::Unwritable));
+        contract::check_wire_value(&r);
         for opcode in [0, 1, 2, 0x80, 0x81, 3, 77] {
             let r = NatPmpResponse::Other { opcode, result: NatPmpResult::Success, data: vec![] };
-            assert!(NatPmpResponse::parse(&r.to_bytes()).is_ok(), "{opcode}");
+            contract::check_wire_value(&r);
+            assert_eq!(r.to_bytes().is_ok(), matches!(opcode, 3 | 77));
         }
         let r = NatPmpResponse::Other { opcode: 9, result: NatPmpResult::Success, data: vec![0; 5000] };
-        assert_eq!(r.to_bytes().len(), MAX_MESSAGE);
+        assert_eq!(r.to_bytes(), Err(NatPmpError::Unwritable));
         // Error replies to tiny or huge requests still read.
-        assert!(Response::parse(&error_reply(&[], ResultCode::UnsuppVersion, 1, 1)).is_ok());
-        assert!(Response::parse(&error_reply(&[7; 3000], ResultCode::MalformedRequest, 1, 1)).is_ok());
-    }
-
-    /// A small deterministic generator, so the loop below runs the same
-    /// way every time.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
+        assert!(Response::parse(&error_reply(&[],ResultCode::UnsuppVersion,1,1).to_bytes().unwrap()).is_ok());
+        assert!(Response::parse(&error_reply(&[7; 3000],ResultCode::MalformedRequest,1,1).to_bytes().unwrap()).is_ok());
     }
 
     /// Everything a reader of `b` must hold to.
     fn exercise(b: &[u8]) {
+        contract::check_wire::<Request>(b);
+        contract::check_wire::<Response>(b);
+        contract::check_wire::<NatPmpRequest>(b);
+        contract::check_wire::<NatPmpResponse>(b);
+        contract::check_wire::<Reply>(b);
+
         if let Ok(r) = Request::parse(b) {
-            let bytes = r.to_bytes();
+            let bytes = r.to_bytes().unwrap();
             assert!(bytes.len() <= MAX_MESSAGE);
             assert_eq!(Request::parse(&bytes), Ok(r.clone()));
             let _ = r.check(laptop());
             let resp = r.reply(ResultCode::NoResources, 30, 1);
-            assert_eq!(Response::parse(&resp.to_bytes()), Ok(resp));
+            assert_eq!(Response::parse(&resp.to_bytes().unwrap()), Ok(resp));
         }
         if let Ok(r) = Response::parse(b) {
-            let bytes = r.to_bytes();
+            let bytes = r.to_bytes().unwrap();
             assert!(bytes.len() <= MAX_MESSAGE);
             assert_eq!(Response::parse(&bytes), Ok(r));
         }
         if let Ok(r) = NatPmpRequest::parse(b) {
-            assert_eq!(NatPmpRequest::parse(&r.to_bytes()), Ok(r.clone()));
+            assert_eq!(NatPmpRequest::parse(&r.to_bytes().unwrap()), Ok(r.clone()));
             let resp = r.refuse(NatPmpResult::NotAuthorized, 4);
-            assert!(NatPmpResponse::parse(&resp.to_bytes()).is_ok());
+            assert!(NatPmpResponse::parse(&resp.to_bytes().unwrap()).is_ok());
         }
         if let Ok(r) = NatPmpResponse::parse(b) {
-            assert_eq!(NatPmpResponse::parse(&r.to_bytes()), Ok(r));
+            assert_eq!(NatPmpResponse::parse(&r.to_bytes().unwrap()), Ok(r));
         }
         for speaks in [Speaks::Pcp, Speaks::NatPmp, Speaks::Both] {
             if let Incoming::Reply(reply) = receive(b, speaks, laptop(), 11) {
+                let reply = reply.to_bytes().unwrap();
                 assert!(reply.len() <= MAX_MESSAGE);
                 if reply[0] == NAT_PMP_VERSION {
                     assert!(NatPmpResponse::parse(&reply).is_ok());
@@ -2096,41 +2172,29 @@ mod tests {
 
     #[test]
     fn lcg_fuzz() {
-        let mut rng = Lcg(0x5351);
+        let mut rng = Lcg::new(0x5351);
         let seeds: Vec<Vec<u8>> = vec![
-            map_request().to_bytes(),
-            peer_request().to_bytes(),
+            map_request().to_bytes().unwrap(),
+            peer_request().to_bytes().unwrap(),
             with(
                 map_request(),
                 vec![PcpOption::PreferFailure, filter(120), PcpOption::ThirdParty(Ipv6Addr::LOCALHOST)],
             )
-            .to_bytes(),
-            map_request().reply(ResultCode::Success, 1, 2).to_bytes(),
-            Response::announce(3).to_bytes(),
-            NatPmpRequest::ExternalAddress.to_bytes(),
+            .to_bytes().unwrap(),
+            map_request().reply(ResultCode::Success, 1, 2).to_bytes().unwrap(),
+            Response::announce(3).to_bytes().unwrap(),
+            NatPmpRequest::ExternalAddress.to_bytes().unwrap(),
             NatPmpRequest::Map { protocol: NatPmpProtocol::Tcp, internal_port: 1, external_port: 2, lifetime: 3 }
-                .to_bytes(),
-            NatPmpResponse::UnsupportedVersion { epoch: 1 }.to_bytes(),
+                .to_bytes().unwrap(),
+            NatPmpResponse::UnsupportedVersion { epoch: 1 }.to_bytes().unwrap(),
         ];
         for round in 0..4000 {
             let mut b = if round % 4 == 0 {
-                (0..rng.below(120)).map(|_| rng.next() as u8).collect()
+                (0..rng.index(120)).map(|_| rng.next() as u8).collect()
             } else {
-                seeds[rng.below(seeds.len())].clone()
+                seeds[rng.index(seeds.len())].clone()
             };
-            // Flip a few bytes, sometimes to the values that matter most.
-            for _ in 0..rng.below(4) {
-                if !b.is_empty() {
-                    let i = rng.below(b.len());
-                    b[i] = match rng.below(4) {
-                        0 => [0, 1, 2, 3, 16, 20, 0x80, 0x81, 0xff][rng.below(9)],
-                        _ => rng.next() as u8,
-                    };
-                }
-            }
-            if rng.below(8) == 0 {
-                b.resize(rng.below(140), 0);
-            }
+            for _ in 0..rng.index(4) { mutate(&mut rng, &mut b); }
             // The whole buffer, and every prefix, as if it arrived a byte
             // at a time.
             for n in 0..=b.len() {
@@ -2143,20 +2207,20 @@ mod tests {
     /// bytes that read back.
     #[test]
     fn built_values_always_read_back() {
-        let mut rng = Lcg(6887);
+        let mut rng = Lcg::new(6887);
         let addr = |rng: &mut Lcg| {
-            if rng.below(2) == 0 {
-                Ipv4Addr::from(rng.next()).to_ipv6_mapped()
+            if rng.coin() {
+                Ipv4Addr::from(rng.next() as u32).to_ipv6_mapped()
             } else {
                 Ipv6Addr::from([rng.next() as u8; 16])
             }
         };
         let bytes = |rng: &mut Lcg, sizes: &[usize]| -> Vec<u8> {
-            let n = sizes[rng.below(sizes.len())];
+            let n = sizes[rng.index(sizes.len())];
             (0..n).map(|_| rng.next() as u8).collect()
         };
         for _ in 0..3000 {
-            let operation = match rng.below(4) {
+            let operation = match rng.index(4) {
                 0 => Operation::Announce,
                 1 => Operation::Map(Map {
                     nonce: [rng.next() as u8; 12],
@@ -2176,9 +2240,9 @@ mod tests {
                 }),
                 _ => Operation::Other { opcode: rng.next() as u8, data: bytes(&mut rng, &[0, 1, 3, 36, 56, 2000]) },
             };
-            let count = [0, 1, 3, 60, 300][rng.below(5)];
+            let count = [0, 1, 3, 60, 300][rng.index(5)];
             let options = (0..count)
-                .map(|_| match rng.below(4) {
+                .map(|_| match rng.index(4) {
                     0 => PcpOption::ThirdParty(addr(&mut rng)),
                     1 => PcpOption::PreferFailure,
                     2 => PcpOption::Filter {
@@ -2189,31 +2253,29 @@ mod tests {
                     _ => PcpOption::Other { code: rng.next() as u8, data: bytes(&mut rng, &[0, 1, 5, 16, 20, 1200]) },
                 })
                 .collect::<Vec<_>>();
-            let r = Request { lifetime: rng.next(), client: addr(&mut rng), operation, options };
-            let b = r.to_bytes();
-            assert!(b.len() <= MAX_MESSAGE);
-            let read = Request::parse(&b).unwrap();
-            assert_eq!(Request::parse(&read.to_bytes()), Ok(read.clone()));
-            let source = unmapped(r.client);
-            if let Incoming::Reply(reply) = receive(&b, Speaks::Both, source, 9) {
-                assert!(Response::parse(&reply).is_ok());
+            let r = Request { lifetime: (rng.next() as u32), client: addr(&mut rng), operation, options };
+            contract::check_wire_value(&r);
+            if let Ok(b) = r.to_bytes() {
+                let source = unmapped(r.client);
+                if let Incoming::Reply(reply) = receive(&b, Speaks::Both, source, 9) {
+                    contract::check_wire_value(&reply);
+                }
             }
             let resp =
                 Response { reserved: [rng.next() as u8; 12], ..r.reply(ResultCode::from_code(rng.next() as u8), 1, 2) };
-            let b = resp.to_bytes();
-            assert!(b.len() <= MAX_MESSAGE);
-            let read = Response::parse(&b).unwrap();
-            assert_eq!(Response::parse(&read.to_bytes()), Ok(read));
+            contract::check_wire_value(&resp);
             let n = NatPmpResponse::Other {
                 opcode: rng.next() as u8,
                 result: NatPmpResult::from_code(rng.next() as u16),
                 data: bytes(&mut rng, &[0, 1, 3, 20, 2000]),
             };
-            assert!(n.to_bytes().len() <= MAX_MESSAGE);
-            assert!(NatPmpResponse::parse(&n.to_bytes()).is_ok());
+            contract::check_wire_value(&n);
             let n = NatPmpRequest::Unsupported { opcode: rng.next() as u8, data: bytes(&mut rng, &[0, 1, 2, 3, 2000]) };
-            let read = NatPmpRequest::parse(&n.to_bytes()).unwrap();
-            assert!(NatPmpResponse::parse(&read.refuse(NatPmpResult::UnsupportedOpcode, 1).to_bytes()).is_ok());
+            contract::check_wire_value(&n);
+            if let Ok(b) = n.to_bytes() {
+                let read = NatPmpRequest::parse(&b).unwrap();
+                contract::check_wire_value(&read.refuse(NatPmpResult::UnsupportedOpcode, 1));
+            }
         }
     }
 

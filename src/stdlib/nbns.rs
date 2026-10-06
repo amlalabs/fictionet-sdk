@@ -12,7 +12,7 @@
 //! and a suffix byte that says what the name is for (`0x20` for a file
 //! server, `0x00` for a workstation). On the wire each byte becomes two
 //! letters from `A` to `P`, one per half byte. RFC 1001 calls this the
-//! first-level encoding; see [`encode_first_level`]. The 32 letters are the
+//! first-level encoding; see [`Name`]. The 32 letters are the
 //! first label of a DNS-style name, and an optional scope follows it as
 //! more labels. Packets are laid out like DNS messages, and may point back
 //! to a name written earlier in the packet instead of repeating it.
@@ -25,17 +25,18 @@
 //! over UDP, one packet per datagram, so there is no stream decoder.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Writers cut what does not fit, so their bytes always read back.
+//! likes. Writers refuse oversized or invalid values without changing the destination.
 //! A packet is written in at most [`MAX_DATAGRAM`] bytes, as RFC 1002
 //! asks, and a writer that has to leave anything out sets the TC flag.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::nbns::{Name, NbEntry, NodeType, Packet, RData, Request};
 //! use std::net::Ipv4Addr;
 //!
 //! // The agent's machine broadcasts a query for the file server FILES.
 //! let query = Packet::name_query(0x1234, Name::new("files", 0x20), true);
-//! let bytes = query.to_bytes();
+//! let bytes = query.to_bytes().unwrap();
 //! assert_eq!(bytes.len(), 50);
 //! assert_eq!(bytes[..4], [0x12, 0x34, 0x01, 0x10]);
 //! // The first-level encoding: F (0x46) becomes "EG", and I (0x49) "EJ".
@@ -52,11 +53,14 @@
 //!     _ => None,
 //! };
 //!
-//! let answer = Packet::parse(&reply.unwrap().to_bytes()).unwrap();
+//! let answer = Packet::parse(&reply.unwrap().to_bytes().unwrap()).unwrap();
 //! assert!(answer.response);
 //! assert_eq!(answer.id, 0x1234);
 //! assert_eq!(answer.answers[0].data, RData::Nb(vec![owner]));
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::Ipv4Addr;
 
@@ -64,18 +68,13 @@ use std::net::Ipv4Addr;
 pub const PORT: u16 = 137;
 /// The length of the header every packet starts with.
 pub const HEADER_LEN: usize = 12;
-/// The longest datagram this module reads: the most bytes one UDP
-/// datagram over IPv4 can carry. Most packets are under 100 bytes. A
-/// longer datagram is refused. [`Packet::to_bytes_within`] writes up to
-/// this many bytes when asked.
+/// The largest packet read or written here: the IPv4 UDP payload limit.
 pub const MAX_PACKET: usize = 65_507;
-/// The longest packet [`Packet::to_bytes`] writes. RFC 1002 section
-/// 4.2.1.1 limits a name service datagram to 576 bytes, and sets TC on a
-/// packet cut to fit.
+/// The 576-byte datagram budget from RFC 1002 section 4.2.1.1.
+/// Callers choose which records to send and whether to set TC.
+/// Writers preserve those choices and allow up to MAX_PACKET.
 pub const MAX_DATAGRAM: usize = 576;
-/// The most entries one section of a packet may hold here. Real packets
-/// hold one or none. A packet whose header counts more is refused, and a
-/// writer leaves out the rest and sets TC.
+/// The largest section allowed here. Readers and writers refuse larger counts.
 pub const MAX_RECORDS: usize = 64;
 /// The length of a NetBIOS name: 15 characters and a suffix byte.
 pub const NAME_LEN: usize = 16;
@@ -159,7 +158,7 @@ pub mod name_flags {
 
 /// The first-level encoding of a 16-byte NetBIOS name: each byte becomes
 /// two letters, `A` plus its high half, then `A` plus its low half.
-pub fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
+fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
     let mut out = [0u8; ENCODED_LEN];
     for (i, b) in name.iter().enumerate() {
         out[2 * i] = b'A' + (b >> 4);
@@ -188,10 +187,8 @@ pub struct Name {
     /// The 16 bytes: up to 15 characters padded with spaces, then the
     /// suffix.
     pub bytes: [u8; NAME_LEN],
-    /// The scope's labels, such as `["NETBIOS", "COM"]`. Most networks use
-    /// none. A writer leaves out empty labels, cuts labels to
-    /// [`MAX_LABEL`] bytes, and stops adding labels once the name would
-    /// pass [`MAX_NAME_LEN`].
+    /// The scope labels. Writers refuse empty labels, labels above MAX_LABEL,
+    /// and names above MAX_NAME_LEN.
     pub scope: Vec<Vec<u8>>,
 }
 
@@ -217,11 +214,11 @@ impl Name {
     }
 
     /// This name with the scope `scope`, given with dots between labels.
-    /// It keeps what the wire holds, as a writer would write it: empty
+    /// This constructor keeps what the wire holds: empty
     /// labels are left out, labels are cut to [`MAX_LABEL`] bytes, and
     /// labels stop once the name would pass [`MAX_NAME_LEN`].
     pub fn with_scope(mut self, scope: &str) -> Name {
-        self.scope = wire_labels(1 + ENCODED_LEN, scope.split('.').map(str::as_bytes));
+        self.scope = clipped_labels(1 + ENCODED_LEN, scope.split('.').map(str::as_bytes));
         self
     }
 
@@ -237,22 +234,14 @@ impl Name {
         self.bytes[NAME_LEN - 1]
     }
 
-    /// The name on the wire: the first-level label, the scope's labels,
-    /// and a zero byte. It is never longer than [`MAX_NAME_LEN`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
-        out.push(ENCODED_LEN as u8);
-        out.extend_from_slice(&encode_first_level(&self.bytes));
-        put_labels(&mut out, self.scope.iter().map(Vec::as_slice));
-        out
-    }
+
 }
 
-/// The labels a writer keeps of `labels`, in a name whose labels before
+/// The labels a constructor keeps of `labels`, in a name whose labels before
 /// them take `used` bytes: empty labels are left out, labels are cut to
 /// [`MAX_LABEL`] bytes, and labels stop once the name would pass
 /// [`MAX_NAME_LEN`]. It reads `labels` only as far as it keeps them.
-fn wire_labels<'a>(mut used: usize, labels: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
+fn clipped_labels<'a>(mut used: usize, labels: impl Iterator<Item = &'a [u8]>) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     for label in labels {
         let label = &label[..label.len().min(MAX_LABEL)];
@@ -269,14 +258,18 @@ fn wire_labels<'a>(mut used: usize, labels: impl Iterator<Item = &'a [u8]>) -> V
     out
 }
 
-/// Appends `labels` and the final zero to `out`, the start of a name, by
-/// the rules of [`wire_labels`].
-fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) {
-    for label in wire_labels(out.len(), labels) {
+/// Appends valid labels and the final zero to a name. Refuses empty or
+/// oversized labels and names above MAX_NAME_LEN.
+fn put_labels<'a>(out: &mut Vec<u8>, labels: impl Iterator<Item = &'a [u8]>) -> Result<(), ParseError> {
+    for label in labels {
+        if label.is_empty() || label.len() > MAX_LABEL || out.len() + label.len() + 2 > MAX_NAME_LEN {
+            return Err(ParseError::Unwritable);
+        }
         out.push(label.len() as u8);
-        out.extend_from_slice(&label);
+        out.extend_from_slice(label);
     }
     out.push(0);
+    Ok(())
 }
 
 /// Writes `bytes` as text, with bytes that are not printable ASCII, and
@@ -318,8 +311,8 @@ pub enum RrName {
     NetBios(Name),
     /// Any other name, as its labels, such as `["NETBIOS", "COM"]`. No
     /// labels is the null name. A writer writes the labels by the rules
-    /// of [`Name::scope`]. If the first label is 32 letters from `A` to
-    /// `P`, the name reads back as [`RrName::NetBios`].
+    /// of [`Name::scope`]. A first label of 32 letters from `A` to
+    /// `P` is refused here; use [`RrName::NetBios`].
     Domain(Vec<Vec<u8>>),
 }
 
@@ -332,7 +325,7 @@ impl RrName {
     /// The domain name `name`, given with dots between labels, kept by
     /// the rules of [`Name::with_scope`].
     pub fn domain(name: &str) -> RrName {
-        RrName::Domain(wire_labels(0, name.split('.').map(str::as_bytes)))
+        RrName::Domain(clipped_labels(0, name.split('.').map(str::as_bytes)))
     }
 
     /// The NetBIOS name, if this is one.
@@ -343,17 +336,7 @@ impl RrName {
         }
     }
 
-    /// The name on the wire. It is never longer than [`MAX_NAME_LEN`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        match self {
-            RrName::NetBios(n) => n.to_bytes(),
-            RrName::Domain(labels) => {
-                let mut out = Vec::new();
-                put_labels(&mut out, labels.iter().map(Vec::as_slice));
-                out
-            }
-        }
-    }
+
 }
 
 impl From<Name> for RrName {
@@ -397,7 +380,7 @@ pub enum Opcode {
     Registration,
     /// 6: release a name.
     Release,
-    /// 7: wait for acknowledgement; a server needs more time.
+    /// 7: wait for acknowledgment; a server needs more time.
     Wack,
     /// 8: refresh a registered name.
     Refresh,
@@ -565,14 +548,12 @@ impl NodeName {
 /// bytes of statistics.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeStatus {
-    /// The names. A writer lists at most [`MAX_NODE_NAMES`], and fewer if
-    /// the packet would pass its size.
+    /// The node names. Writers refuse more than MAX_NODE_NAMES.
     pub names: Vec<NodeName>,
-    /// The statistics block, unread. RFC 1002 makes it
-    /// [`STATISTICS_LEN`] bytes, starting with the node's 6-byte unit ID
-    /// (its MAC address). Some senders write fewer or more. A writer
-    /// keeps its first [`STATISTICS_LEN`] bytes before any name, and cuts
-    /// the rest to fit.
+    /// The statistics block, kept in full. RFC 1002 specifies
+    /// [`STATISTICS_LEN`] bytes, starting with the node's six-byte unit ID
+    /// (its MAC address). Some senders use fewer or more. Writers refuse
+    /// an oversized packet.
     pub statistics: Vec<u8>,
 }
 
@@ -593,7 +574,7 @@ impl NodeStatus {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RData {
     /// Type NB with a length that is a multiple of 6: the name's owners.
-    /// A writer writes at most [`MAX_NB_ENTRIES`].
+    /// The writer refuses more than [`MAX_NB_ENTRIES`] entries.
     Nb(Vec<NbEntry>),
     /// Type NBSTAT whose names fit its length: a node's names.
     NodeStatus(NodeStatus),
@@ -603,13 +584,9 @@ pub enum RData {
     /// NS data is not one name is refused. A writer writes the labels by
     /// the rules of [`Name::scope`].
     Ns(Vec<Vec<u8>>),
-    /// Any other type, or an NB or NBSTAT record whose data does not
-    /// read as one (such as the 2 bytes of a WACK), unread. Names inside
-    /// it are not followed. A writer leaves out a record whose data does
-    /// not fit, and one of type NS whose data is not one name without
-    /// pointers. If a world builds one of type NB, NBSTAT or NS whose
-    /// data does read as one, it reads back as [`RData::Nb`],
-    /// [`RData::NodeStatus`] or [`RData::Ns`].
+    /// Other record data, including malformed NB or NBSTAT data such as WACK.
+    /// Names within it are not followed. Writers refuse type NS, oversized data,
+    /// and NB or NBSTAT bytes that would read as another variant.
     Other {
         /// The record type; see [`rr_type`].
         rr_type: u16,
@@ -651,66 +628,34 @@ impl RData {
         RData::Other { rr_type: rr, data: data.to_vec() }
     }
 
-    /// The data's bytes in at most `room` bytes, and never more than
-    /// [`MAX_RDATA`], and whether anything was left out to fit. It
-    /// returns `None` if the record cannot be written in that room.
-    fn write_within(&self, room: usize) -> Option<(Vec<u8>, bool)> {
-        let cap = room.min(MAX_RDATA);
-        let mut out = Vec::new();
+    /// Appends complete record data. Refuses oversized or ambiguous values.
+    fn write_data(&self, out: &mut Vec<u8>) -> Result<(), ParseError> {
         match self {
             RData::Nb(entries) => {
-                let n = entries.len().min(MAX_NB_ENTRIES).min(cap / NB_ENTRY_LEN);
-                for e in &entries[..n] {
-                    e.write(&mut out);
-                }
-                Some((out, n < entries.len()))
+                if entries.len() > MAX_NB_ENTRIES { return Err(ParseError::Unwritable); }
+                for entry in entries { entry.write(out); }
             }
-            RData::NodeStatus(s) => {
-                // The count byte, then the first STATISTICS_LEN bytes of
-                // statistics come before any name.
-                let keep = s.statistics.len().min(STATISTICS_LEN).min(cap.checked_sub(1)?);
-                let n = s.names.len().min(MAX_NODE_NAMES).min((cap - 1 - keep) / NODE_NAME_LEN);
-                out.push(n as u8);
-                for name in &s.names[..n] {
+            RData::NodeStatus(status) => {
+                if status.names.len() > MAX_NODE_NAMES || status.statistics.len() > MAX_RDATA {
+                    return Err(ParseError::Unwritable);
+                }
+                out.push(status.names.len() as u8);
+                for name in &status.names {
                     out.extend_from_slice(&name.bytes);
                     out.extend_from_slice(&name.flags.to_be_bytes());
                 }
-                let stats = s.statistics.len().min(cap - out.len());
-                out.extend_from_slice(&s.statistics[..stats]);
-                Some((out, n < s.names.len() || stats < s.statistics.len()))
+                out.extend_from_slice(&status.statistics);
             }
-            RData::Ns(labels) => {
-                put_labels(&mut out, labels.iter().map(Vec::as_slice));
-                (out.len() <= cap).then_some((out, false))
-            }
+            RData::Ns(labels) => put_labels(out, labels.iter().map(Vec::as_slice))?,
             RData::Other { rr_type, data } => {
-                if *rr_type == rr_type::NS && !is_plain_name(data) {
-                    return None;
+                if *rr_type == rr_type::NS || data.len() > MAX_RDATA {
+                    return Err(ParseError::Unwritable);
                 }
-                (data.len() <= cap).then(|| (data.clone(), false))
+                out.extend_from_slice(data);
             }
         }
-    }
-}
-
-/// Whether `data` is exactly one name with no pointers, as a reader
-/// would read it anywhere in a packet.
-fn is_plain_name(data: &[u8]) -> bool {
-    let mut pos = 0;
-    let mut total = 1;
-    loop {
-        let Some(&len) = data.get(pos) else { return false };
-        if len == 0 {
-            return pos + 1 == data.len();
-        }
-        if len & 0xc0 != 0 {
-            return false;
-        }
-        total += 1 + usize::from(len);
-        if total > MAX_NAME_LEN {
-            return false;
-        }
-        pos += 1 + usize::from(len);
+        if out.len() > MAX_RDATA { return Err(ParseError::Unwritable); }
+        Ok(())
     }
 }
 
@@ -740,20 +685,17 @@ pub struct Record {
 }
 
 impl Record {
-    /// Writes the record to `out`, which is empty, in at most `room`
-    /// bytes, pointing to a name in `written` when it can. It returns the
-    /// name's bytes if it wrote the name in full, and whether it left
-    /// out data to fit, or `None` if the record does not fit.
-    fn write(&self, out: &mut Vec<u8>, written: &[(Vec<u8>, u16)], room: usize) -> Option<(Option<Vec<u8>>, bool)> {
-        let full = put_name(out, self.name.to_bytes(), written);
-        let fixed = out.len() + 10;
-        let (data, cut) = self.data.write_within(room.checked_sub(fixed)?)?;
+    /// Appends a complete record, using earlier names when possible.
+    fn write_record(&self, out: &mut Vec<u8>, written: &std::collections::HashMap<Vec<u8>, u16>) -> Result<Option<Vec<u8>>, ParseError> {
+        let full = put_name(out, self.name.to_bytes()?, written);
+        let mut data = Vec::new();
+        self.data.write_data(&mut data)?;
         out.extend_from_slice(&self.data.rr_type().to_be_bytes());
         out.extend_from_slice(&self.class.to_be_bytes());
         out.extend_from_slice(&self.ttl.to_be_bytes());
         out.extend_from_slice(&(data.len() as u16).to_be_bytes());
         out.extend_from_slice(&data);
-        Some((full, cut))
+        Ok(full)
     }
 }
 
@@ -761,8 +703,8 @@ impl Record {
 /// the beginning of `out`. A name written in full earlier, as listed in
 /// `written`, becomes a two-byte pointer to it. It returns the name's
 /// bytes if it wrote the name in full.
-fn put_name(out: &mut Vec<u8>, wire: Vec<u8>, written: &[(Vec<u8>, u16)]) -> Option<Vec<u8>> {
-    if let Some((_, at)) = written.iter().find(|(w, _)| *w == wire) {
+fn put_name(out: &mut Vec<u8>, wire: Vec<u8>, written: &std::collections::HashMap<Vec<u8>, u16>) -> Option<Vec<u8>> {
+    if let Some(at) = written.get(&wire) {
         out.extend_from_slice(&(0xc000 | at).to_be_bytes());
         return None;
     }
@@ -772,17 +714,21 @@ fn put_name(out: &mut Vec<u8>, wire: Vec<u8>, written: &[(Vec<u8>, u16)]) -> Opt
 
 /// Notes that the name `full` was written in full at offset `at`, if a
 /// pointer can reach it: pointers hold 14 bits.
-fn remember(written: &mut Vec<(Vec<u8>, u16)>, full: Option<Vec<u8>>, at: usize) {
+fn remember(written: &mut std::collections::HashMap<Vec<u8>, u16>, full: Option<Vec<u8>>, at: usize) {
     if let (Some(wire), Ok(at)) = (full, u16::try_from(at))
         && at <= 0x3fff
     {
-        written.push((wire, at));
+        written.insert(wire, at);
     }
 }
 
 /// Why a datagram is not an NBNS packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// Bytes follow the complete unit.
+    Trailing(usize),
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The packet ends before its header, a name or a record does.
     Truncated,
     /// The datagram is longer than [`MAX_PACKET`].
@@ -808,6 +754,8 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ParseError::Trailing(n) => write!(f, "{n} bytes after the unit"),
+            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::Truncated => f.write_str("packet ends early"),
             ParseError::TooLong(n) => write!(f, "datagram of {n} bytes, over {MAX_PACKET}"),
             ParseError::TooManyRecords(n) => write!(f, "section of {n} entries, over {MAX_RECORDS}"),
@@ -834,12 +782,10 @@ pub struct Packet {
     pub opcode: Opcode,
     /// The header's flags.
     pub flags: Flags,
-    /// The result code; see [`rcode`]. Only the low 4 bits are written.
+    /// The result code; see [`rcode`]. Values above 15 are refused.
     pub rcode: u8,
-    /// The question section. A writer writes at most [`MAX_RECORDS`] of
-    /// each section, and stops a section early if the packet would pass
-    /// its size. A record's NB owners or node status names may be cut to
-    /// fit. When anything is left out, the writer sets TC.
+    /// The question section. Writers refuse sections above MAX_RECORDS
+    /// or packets above MAX_PACKET. The TC flag is preserved.
     pub questions: Vec<Question>,
     /// The answer section.
     pub answers: Vec<Record>,
@@ -948,139 +894,6 @@ impl Request {
 }
 
 impl Packet {
-    /// Reads one datagram. Bytes after the last record are ignored, as
-    /// real stacks do.
-    pub fn parse(b: &[u8]) -> Result<Packet, ParseError> {
-        if b.len() > MAX_PACKET {
-            return Err(ParseError::TooLong(b.len()));
-        }
-        if b.len() < HEADER_LEN {
-            return Err(ParseError::Truncated);
-        }
-        let word = be16(b, 2);
-        let mut counts = [0usize; 4];
-        for (i, c) in counts.iter_mut().enumerate() {
-            let n = be16(b, 4 + 2 * i);
-            if usize::from(n) > MAX_RECORDS {
-                return Err(ParseError::TooManyRecords(n));
-            }
-            *c = usize::from(n);
-        }
-        let mut pos = HEADER_LEN;
-        let mut questions = Vec::with_capacity(counts[0]);
-        for _ in 0..counts[0] {
-            let (name, next) = read_name(b, pos)?;
-            let fixed = b.get(next..next + 4).ok_or(ParseError::Truncated)?;
-            questions.push(Question { name, qtype: be16(fixed, 0), class: be16(fixed, 2) });
-            pos = next + 4;
-        }
-        let mut sections: [Vec<Record>; 3] = Default::default();
-        for (section, &count) in sections.iter_mut().zip(&counts[1..]) {
-            section.reserve(count);
-            for _ in 0..count {
-                let (name, next) = read_rr_name(b, pos)?;
-                let fixed = b.get(next..next + 10).ok_or(ParseError::Truncated)?;
-                let len = usize::from(be16(fixed, 8));
-                let start = next + 10;
-                let data = b.get(start..start + len).ok_or(ParseError::Truncated)?;
-                let rr = be16(fixed, 0);
-                let data = if rr == rr_type::NS {
-                    // The name server's name, whose pointers are followed
-                    // now, since a writer may move what they point to.
-                    match read_labels(b, start) {
-                        Ok((labels, end)) if end == start + len => RData::Ns(labels),
-                        _ => return Err(ParseError::BadNsData),
-                    }
-                } else {
-                    RData::parse(rr, data)
-                };
-                section.push(Record {
-                    name,
-                    class: be16(fixed, 2),
-                    ttl: u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]),
-                    data,
-                });
-                pos = start + len;
-            }
-        }
-        let [answers, authority, additional] = sections;
-        Ok(Packet {
-            id: be16(b, 0),
-            response: word & 0x8000 != 0,
-            opcode: Opcode::from_bits((word >> 11) as u8),
-            flags: Flags::from_bits(word >> 4),
-            rcode: (word & 0x0f) as u8,
-            questions,
-            answers,
-            authority,
-            additional,
-        })
-    }
-
-    /// The packet's bytes, in at most [`MAX_DATAGRAM`] bytes. A name
-    /// already written in full earlier in the packet is written as a
-    /// pointer to it. RFC 1002 asks for this in registrations and
-    /// releases, whose record repeats the question's name. If anything is
-    /// left out to fit, TC is set.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.to_bytes_within(MAX_DATAGRAM)
-    }
-
-    /// The packet's bytes, as [`Packet::to_bytes`] writes them, in at most
-    /// `limit` bytes instead of [`MAX_DATAGRAM`]. `limit` is taken as at
-    /// least [`HEADER_LEN`] and at most [`MAX_PACKET`]. RFC 1002 sends a
-    /// longer answer over TCP, where a world adds the 2-byte length
-    /// itself.
-    pub fn to_bytes_within(&self, limit: usize) -> Vec<u8> {
-        let limit = limit.clamp(HEADER_LEN, MAX_PACKET);
-        let mut out = Vec::with_capacity(64);
-        out.extend_from_slice(&self.id.to_be_bytes());
-        out.extend_from_slice(&self.header_word().to_be_bytes());
-        out.extend_from_slice(&[0; 8]);
-        let mut counts = [0u16; 4];
-        // Whether anything was left out, which sets TC.
-        let mut cut = self.questions.len() > MAX_RECORDS;
-        // Each name written in full so far, and its offset. It holds at
-        // most one per entry written, so 4 * MAX_RECORDS.
-        let mut written: Vec<(Vec<u8>, u16)> = Vec::new();
-        let mut entry = Vec::new();
-        for q in self.questions.iter().take(MAX_RECORDS) {
-            entry.clear();
-            let full = put_name(&mut entry, q.name.to_bytes(), &written);
-            entry.extend_from_slice(&q.qtype.to_be_bytes());
-            entry.extend_from_slice(&q.class.to_be_bytes());
-            if out.len() + entry.len() > limit {
-                cut = true;
-                break;
-            }
-            remember(&mut written, full, out.len());
-            out.extend_from_slice(&entry);
-            counts[0] += 1;
-        }
-        for (i, section) in [&self.answers, &self.authority, &self.additional].into_iter().enumerate() {
-            cut |= section.len() > MAX_RECORDS;
-            for r in section.iter().take(MAX_RECORDS) {
-                entry.clear();
-                let Some((full, short)) = r.write(&mut entry, &written, limit - out.len()) else {
-                    cut = true;
-                    break;
-                };
-                cut |= short;
-                remember(&mut written, full, out.len());
-                out.extend_from_slice(&entry);
-                counts[i + 1] += 1;
-            }
-        }
-        for (i, c) in counts.iter().enumerate() {
-            out[4 + 2 * i..6 + 2 * i].copy_from_slice(&c.to_be_bytes());
-        }
-        if cut {
-            // TC is bit 9 of the header's second word.
-            out[2] |= 0x02;
-        }
-        out
-    }
-
     /// The header's second 16 bits: the response bit, opcode, flags and
     /// result code.
     fn header_word(&self) -> u16 {
@@ -1321,8 +1134,178 @@ fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
 }
 
+impl Wire for Name {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads one complete name. Refuses invalid labels, pointers outside the input and trailing bytes.
+    fn parse(b: &[u8]) -> Result<Name, ParseError> {
+        let (value, used) = read_name(b, 0)?;
+        if used != b.len() { return Err(ParseError::Trailing(b.len() - used)); }
+        Ok(value)
+    }
+
+    /// Appends the uncompressed name. Refuses empty or oversized scope labels and
+    /// names above MAX_NAME_LEN. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
+        out.push(ENCODED_LEN as u8);
+        out.extend_from_slice(&encode_first_level(&self.bytes));
+        put_labels(&mut out, self.scope.iter().map(Vec::as_slice))?;
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for RrName {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads one complete name. Refuses invalid labels, pointers outside the input and trailing bytes.
+    fn parse(b: &[u8]) -> Result<RrName, ParseError> {
+        let (value, used) = read_rr_name(b, 0)?;
+        if used != b.len() { return Err(ParseError::Trailing(b.len() - used)); }
+        Ok(value)
+    }
+
+    /// Appends an uncompressed resource record name. Refuses invalid labels, oversized
+    /// names and domain values that would read as NetBIOS names. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let mut out = Vec::new();
+        match self {
+            RrName::NetBios(n) => n.write(&mut out)?,
+            RrName::Domain(labels) => put_labels(&mut out, labels.iter().map(Vec::as_slice))?,
+        }
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads a complete datagram with compressed names. Refuses trailing bytes,
+    /// invalid records, and names whose expansion cannot be written within MAX_PACKET.
+    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+        if b.len() > MAX_PACKET {
+            return Err(ParseError::TooLong(b.len()));
+        }
+        if b.len() < HEADER_LEN {
+            return Err(ParseError::Truncated);
+        }
+        let word = be16(b, 2);
+        let mut counts = [0usize; 4];
+        for (i, c) in counts.iter_mut().enumerate() {
+            let n = be16(b, 4 + 2 * i);
+            if usize::from(n) > MAX_RECORDS {
+                return Err(ParseError::TooManyRecords(n));
+            }
+            *c = usize::from(n);
+        }
+        let mut pos = HEADER_LEN;
+        let mut questions = Vec::with_capacity(counts[0]);
+        for _ in 0..counts[0] {
+            let (name, next) = read_name(b, pos)?;
+            let fixed = b.get(next..next + 4).ok_or(ParseError::Truncated)?;
+            questions.push(Question { name, qtype: be16(fixed, 0), class: be16(fixed, 2) });
+            pos = next + 4;
+        }
+        let mut sections: [Vec<Record>; 3] = Default::default();
+        for (section, &count) in sections.iter_mut().zip(&counts[1..]) {
+            section.reserve(count);
+            for _ in 0..count {
+                let (name, next) = read_rr_name(b, pos)?;
+                let fixed = b.get(next..next + 10).ok_or(ParseError::Truncated)?;
+                let len = usize::from(be16(fixed, 8));
+                let start = next + 10;
+                let data = b.get(start..start + len).ok_or(ParseError::Truncated)?;
+                let rr = be16(fixed, 0);
+                let data = if rr == rr_type::NS {
+                    // The name server's name, whose pointers are followed
+                    // now, since a writer may move what they point to.
+                    match read_labels(b, start) {
+                        Ok((labels, end)) if end == start + len => RData::Ns(labels),
+                        _ => return Err(ParseError::BadNsData),
+                    }
+                } else {
+                    RData::parse(rr, data)
+                };
+                section.push(Record {
+                    name,
+                    class: be16(fixed, 2),
+                    ttl: u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]),
+                    data,
+                });
+                pos = start + len;
+            }
+        }
+        if pos != b.len() { return Err(ParseError::Trailing(b.len() - pos)); }
+        let [answers, authority, additional] = sections;
+        let packet = Packet {
+            id: be16(b, 0),
+            response: word & 0x8000 != 0,
+            opcode: Opcode::from_bits((word >> 11) as u8),
+            flags: Flags::from_bits(word >> 4),
+            rcode: (word & 0x0f) as u8,
+            questions,
+            answers,
+            authority,
+            additional,
+        };
+        packet.encode()?;
+        Ok(packet)
+    }
+
+    /// Appends every section, compressing repeated names. Refuses oversized fields,
+    /// sections or packets, and values that would read as another variant.
+    /// Preserves the TC flag. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let out = self.encode()?;
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Packet {
+    /// Stages the complete packet within its byte and record limits.
+    fn encode(&self) -> Result<Vec<u8>, ParseError> {
+        if self.questions.len() > MAX_RECORDS || [&self.answers, &self.authority, &self.additional].iter().any(|s| s.len() > MAX_RECORDS) {
+            return Err(ParseError::Unwritable);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&self.id.to_be_bytes());
+        out.extend_from_slice(&self.header_word().to_be_bytes());
+        for count in [self.questions.len(), self.answers.len(), self.authority.len(), self.additional.len()] {
+            out.extend_from_slice(&(count as u16).to_be_bytes());
+        }
+        let mut written = std::collections::HashMap::new();
+        for q in &self.questions {
+            let at = out.len();
+            let full = put_name(&mut out, q.name.to_bytes()?, &written);
+            out.extend_from_slice(&q.qtype.to_be_bytes());
+            out.extend_from_slice(&q.class.to_be_bytes());
+            remember(&mut written, full, at);
+            if out.len() > MAX_PACKET { return Err(ParseError::Unwritable); }
+        }
+        for record in self.answers.iter().chain(&self.authority).chain(&self.additional) {
+            let at = out.len();
+            let full = record.write_record(&mut out, &written)?;
+            remember(&mut written, full, at);
+            if out.len() > MAX_PACKET { return Err(ParseError::Unwritable); }
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
 
     const FRED: &[u8; 32] = b"EGFCEFEECACACACACACACACACACACACA";
@@ -1356,19 +1339,19 @@ mod tests {
         vec![
             query_bytes(),
             registration_bytes(),
-            req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1), owner(2)]).to_bytes(),
-            req.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR).to_bytes(),
-            status.to_bytes(),
+            req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1), owner(2)]).to_bytes().unwrap(),
+            req.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR).to_bytes().unwrap(),
+            status.to_bytes().unwrap(),
             status
                 .node_status_response(
                     Name::wildcard(),
                     vec![NodeName::unique(&Name::new("FRED", 0))],
                     [1, 2, 3, 4, 5, 6],
                 )
-                .to_bytes(),
-            Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false).to_bytes(),
-            req.wack(Name::new("FRED", 0x20), 5).to_bytes(),
-            req.wack(RrName::null(), 5).to_bytes(),
+                .to_bytes().unwrap(),
+            Packet::name_query(9, Name::new("FRED", 0x20).with_scope("NETBIOS.COM"), false).to_bytes().unwrap(),
+            req.wack(Name::new("FRED", 0x20), 5).to_bytes().unwrap(),
+            req.wack(RrName::null(), 5).to_bytes().unwrap(),
             redirect_bytes(),
         ]
     }
@@ -1377,12 +1360,12 @@ mod tests {
     fn first_level_encoding_example() {
         // RFC 1001 section 14.1: "FRED" padded with spaces.
         let fred = Name::new("Fred", 0x20);
-        assert_eq!(&encode_first_level(&fred.bytes), FRED);
+        assert_eq!(&fred.to_bytes().unwrap()[1..1 + ENCODED_LEN], FRED);
         assert_eq!(decode_first_level(FRED), Some(fred.bytes));
-        assert_eq!(&encode_first_level(&Name::wildcard().bytes), b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
+        assert_eq!(&Name::wildcard().to_bytes().unwrap()[1..1 + ENCODED_LEN], b"CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA");
         for b in 0..=255u8 {
-            let name = [b; NAME_LEN];
-            assert_eq!(decode_first_level(&encode_first_level(&name)), Some(name));
+            let name = Name { bytes: [b; NAME_LEN], scope: Vec::new() };
+            assert_eq!(Name::parse(&name.to_bytes().unwrap()), Ok(name));
         }
         // Wrong lengths and letters outside A to P.
         assert_eq!(decode_first_level(&FRED[..31]), None);
@@ -1397,7 +1380,7 @@ mod tests {
         let mut want = vec![0x20];
         want.extend_from_slice(FRED);
         want.extend_from_slice(b"\x07NETBIOS\x03COM\x00");
-        assert_eq!(name.to_bytes(), want);
+        assert_eq!(name.to_bytes().unwrap(), want);
         assert_eq!(read_name(&want, 0), Ok((name.clone(), want.len())));
         assert_eq!(name.to_string(), "FRED<20>.NETBIOS.COM");
     }
@@ -1418,7 +1401,7 @@ mod tests {
     #[test]
     fn name_query_request() {
         let p = Packet::name_query(0x2a, Name::new("fred", 0x20), true);
-        assert_eq!(p.to_bytes(), query_bytes());
+        assert_eq!(p.to_bytes().unwrap(), query_bytes());
         let back = Packet::parse(&query_bytes()).unwrap();
         assert_eq!(back, p);
         assert!(!back.response);
@@ -1433,7 +1416,7 @@ mod tests {
         let owners =
             vec![owner(1), NbEntry { group: true, node_type: NodeType::H, address: Ipv4Addr::new(192, 0, 2, 7) }];
         let resp = req.query_response(Name::new("FRED", 0x20), 300_000, owners.clone());
-        let bytes = resp.to_bytes();
+        let bytes = resp.to_bytes().unwrap();
         // R, opcode 0, AA and RD, result 0.
         assert_eq!(bytes[..4], [0x00, 0x2a, 0x85, 0x00]);
         assert_eq!(bytes[4..12], [0, 0, 0, 1, 0, 0, 0, 0]);
@@ -1450,7 +1433,7 @@ mod tests {
     fn negative_query_response() {
         let req = Packet::parse(&query_bytes()).unwrap();
         let resp = req.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR);
-        let bytes = resp.to_bytes();
+        let bytes = resp.to_bytes().unwrap();
         assert_eq!(bytes[2..4], [0x85, 0x03]);
         assert_eq!(bytes[12 + 34..], [0, 0x0a, 0, 1, 0, 0, 0, 0, 0, 0]);
         let back = Packet::parse(&bytes).unwrap();
@@ -1461,7 +1444,7 @@ mod tests {
     #[test]
     fn node_status() {
         let req = Packet::node_status_query(0x99, Name::wildcard());
-        let bytes = req.to_bytes();
+        let bytes = req.to_bytes().unwrap();
         assert_eq!(bytes[2..4], [0x00, 0x00]);
         assert_eq!(&bytes[12..15], b"\x20CK");
         assert_eq!(bytes[bytes.len() - 4..], [0, 0x21, 0, 1]);
@@ -1471,7 +1454,7 @@ mod tests {
 
         let names = vec![NodeName::unique(&Name::new("FRED", 0x00)), NodeName::group(&Name::new("WORKGROUP", 0x00))];
         let resp = asked.node_status_response(name, names.clone(), [0, 0x50, 0x56, 1, 2, 3]);
-        let bytes = resp.to_bytes();
+        let bytes = resp.to_bytes().unwrap();
         assert_eq!(bytes[2..4], [0x84, 0x00]);
         let rdata = &bytes[12 + 34 + 10..];
         assert_eq!(rdata.len(), 1 + 2 * NODE_NAME_LEN + STATISTICS_LEN);
@@ -1505,14 +1488,14 @@ mod tests {
         // The writer spells the name out, and reads back the same.
         let built = Packet::registration(7, Name::new("FRED", 0x20), 300_000, owner(9), true);
         assert_eq!(built, p);
-        assert_eq!(Packet::parse(&built.to_bytes()), Ok(p.clone()));
+        assert_eq!(Packet::parse(&built.to_bytes().unwrap()), Ok(p.clone()));
 
         let yes = p.registration_response(Name::new("FRED", 0x20), 300_000, owner(9), rcode::OK);
-        let b = yes.to_bytes();
+        let b = yes.to_bytes().unwrap();
         // R, opcode 5, AA, RD and RA.
         assert_eq!(b[2..4], [0xad, 0x80]);
         let no = p.registration_response(Name::new("FRED", 0x20), 0, owner(4), rcode::ACT_ERR);
-        let back = Packet::parse(&no.to_bytes()).unwrap();
+        let back = Packet::parse(&no.to_bytes().unwrap()).unwrap();
         assert_eq!(back.rcode, rcode::ACT_ERR);
         assert_eq!(back.answers[0].data, RData::Nb(vec![owner(4)]));
     }
@@ -1523,14 +1506,14 @@ mod tests {
         p.opcode = Opcode::Refresh;
         assert_eq!(p.request(), Ok(Request::Refresh { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(3) }));
         let r = p.registration_response(Name::new("FRED", 0x20), 60, owner(3), rcode::OK);
-        assert_eq!(Packet::parse(&r.to_bytes()).unwrap().opcode, Opcode::Registration);
+        assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap().opcode, Opcode::Registration);
 
         let rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), true);
-        let back = Packet::parse(&rel.to_bytes()).unwrap();
-        assert_eq!(back.to_bytes()[2..4], [0x30, 0x10]);
+        let back = Packet::parse(&rel.to_bytes().unwrap()).unwrap();
+        assert_eq!(back.to_bytes().unwrap()[2..4], [0x30, 0x10]);
         assert_eq!(back.request(), Ok(Request::Release { name: Name::new("FRED", 0x20), entry: owner(3) }));
         let resp = back.release_response(Name::new("FRED", 0x20), owner(3), rcode::OK);
-        let b = resp.to_bytes();
+        let b = resp.to_bytes().unwrap();
         assert_eq!(b[2..4], [0xb4, 0x00]);
         assert_eq!(Packet::parse(&b), Ok(resp));
     }
@@ -1539,7 +1522,7 @@ mod tests {
     fn wack() {
         let p = Packet::parse(&registration_bytes()).unwrap();
         let w = p.wack(Name::new("FRED", 0x20), 30);
-        let b = w.to_bytes();
+        let b = w.to_bytes().unwrap();
         assert_eq!(b[2..4], [0xbc, 0x00]);
         // The data: the request's opcode and flags, result code 0.
         assert_eq!(b[b.len() - 4..], [0, 2, 0x29, 0x10]);
@@ -1555,9 +1538,9 @@ mod tests {
         // prints FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF, which has two letters
         // wrong: it decodes to "Tge NetBIOS tame".
         let name = Name { bytes: *b"The NetBIOS name", scope: Vec::new() }.with_scope("SCOPE.ID.COM");
-        assert_eq!(&encode_first_level(&name.bytes), b"FEGIGFCAEOGFHEECEJEPFDCAGOGBGNGF");
+        assert_eq!(&name.to_bytes().unwrap()[1..1 + ENCODED_LEN], b"FEGIGFCAEOGFHEECEJEPFDCAGOGBGNGF");
         assert_eq!(decode_first_level(b"FEGHGFCAEOGFHEECEJEPFDCAHEGBGNGF"), Some(*b"Tge NetBIOS tame"));
-        let wire = name.to_bytes();
+        let wire = name.to_bytes().unwrap();
         assert_eq!(&wire[33..], b"\x05SCOPE\x02ID\x03COM\x00");
         assert_eq!(read_name(&wire, 0), Ok((name, wire.len())));
     }
@@ -1567,13 +1550,13 @@ mod tests {
         // RFC 1002 sections 4.2.2 and 4.2.9: the record's name must point
         // to the question's name.
         let built = Packet::registration(7, Name::new("FRED", 0x20), 300_000, owner(9), true);
-        assert_eq!(built.to_bytes(), registration_bytes());
-        let rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false).to_bytes();
+        assert_eq!(built.to_bytes().unwrap(), registration_bytes());
+        let rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false).to_bytes().unwrap();
         assert_eq!(rel[50..52], [0xc0, 0x0c]);
         // A different name is written in full.
         let mut p = built.clone();
         p.additional[0].name = Name::new("FRED", 0x00).into();
-        let b = p.to_bytes();
+        let b = p.to_bytes().unwrap();
         assert_eq!(b[50], 0x20);
         assert_eq!(Packet::parse(&b), Ok(p));
     }
@@ -1585,7 +1568,7 @@ mod tests {
         let mut p = Packet::registration(1, Name::new("FRED", 0x20), 60, owner(3), false);
         p.opcode = Opcode::Other(9);
         p.flags.recursion_desired = false;
-        let back = Packet::parse(&p.to_bytes()).unwrap();
+        let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
         assert_eq!(back.opcode, Opcode::Other(9));
         assert_eq!(back.request(), Ok(Request::Refresh { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(3) }));
     }
@@ -1598,13 +1581,13 @@ mod tests {
         let mut refresh = Packet::registration(1, Name::new("FRED", 0x20), 60, owner(3), false);
         refresh.opcode = Opcode::Refresh;
         refresh.flags.recursion_desired = false;
-        let r = refresh.registration_response(Name::new("FRED", 0x20), 60, owner(3), rcode::OK).to_bytes();
+        let r = refresh.registration_response(Name::new("FRED", 0x20), 60, owner(3), rcode::OK).to_bytes().unwrap();
         assert_eq!(r[2..4], [0xad, 0x80]);
         // A release response has only AA (section 4.2.10), even when the
         // request set RD.
         let mut rel = Packet::release(2, Name::new("FRED", 0x20), owner(3), false);
         rel.flags.recursion_desired = true;
-        let r = rel.release_response(Name::new("FRED", 0x20), owner(3), rcode::OK).to_bytes();
+        let r = rel.release_response(Name::new("FRED", 0x20), owner(3), rcode::OK).to_bytes().unwrap();
         assert_eq!(r[2..4], [0xb4, 0x00]);
     }
 
@@ -1614,13 +1597,13 @@ mod tests {
         // with RD set, even to a query that had it clear.
         let mut q = Packet::name_query(5, Name::new("FRED", 0x20), false);
         q.flags.recursion_desired = false;
-        let yes = q.query_response(Name::new("FRED", 0x20), 60, vec![owner(1)]).to_bytes();
+        let yes = q.query_response(Name::new("FRED", 0x20), 60, vec![owner(1)]).to_bytes().unwrap();
         assert_eq!(yes[2..4], [0x85, 0x00]);
-        let no = q.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR).to_bytes();
+        let no = q.negative_query_response(Name::new("FRED", 0x20), rcode::NAM_ERR).to_bytes().unwrap();
         assert_eq!(no[2..4], [0x85, 0x03]);
         // Node status (4.2.18) and WACK (4.2.16) keep RD clear.
-        assert_eq!(q.node_status_response(Name::wildcard(), vec![], [0; 6]).to_bytes()[2..4], [0x84, 0x00]);
-        assert_eq!(q.wack(Name::new("FRED", 0x20), 1).to_bytes()[2..4], [0xbc, 0x00]);
+        assert_eq!(q.node_status_response(Name::wildcard(), vec![], [0; 6]).to_bytes().unwrap()[2..4], [0x84, 0x00]);
+        assert_eq!(q.wack(Name::new("FRED", 0x20), 1).to_bytes().unwrap()[2..4], [0xbc, 0x00]);
     }
 
     #[test]
@@ -1650,10 +1633,12 @@ mod tests {
             data: RData::Other { rr_type: rr_type::NB, data: vec![0, 0, 10, 0, 0, 1] },
         });
         p.opcode = Opcode::Other(5);
-        let back = Packet::parse(&p.to_bytes()).unwrap();
-        assert_eq!(back.answers[0].data, RData::Nb(vec![owner(1)]));
-        assert_eq!(back.opcode, Opcode::Registration);
-        assert_eq!(back.to_bytes(), p.to_bytes());
+        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&p);
+        p.answers[0].data = RData::Nb(vec![owner(1)]);
+        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        p.opcode = Opcode::Registration;
+        contract::check_wire_value(&p);
     }
 
     #[test]
@@ -1765,77 +1750,40 @@ mod tests {
     }
 
     #[test]
-    fn trailing_bytes_are_ignored() {
+    fn trailing_bytes_are_refused() {
         let mut b = query_bytes();
         b.extend_from_slice(&[1, 2, 3]);
-        assert_eq!(Packet::parse(&b), Packet::parse(&query_bytes()));
+        assert_eq!(Packet::parse(&b), Err(ParseError::Trailing(3)));
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
-        // A scope with empty and long labels, past 255 bytes.
+    fn writers_refuse_values_that_would_change() {
         let mut name = Name::new("FRED", 0x20);
-        name.scope = vec![vec![], vec![b'a'; 100], vec![b'b'; 63], vec![b'c'; 63], vec![b'd'; 63]];
-        let wire = name.to_bytes();
-        assert!(wire.len() <= MAX_NAME_LEN);
-        let (back, used) = read_name(&wire, 0).unwrap();
-        assert_eq!(used, wire.len());
-        assert_eq!(back.scope, vec![vec![b'a'; 63], vec![b'b'; 63], vec![b'c'; 63]]);
-
-        // Too many node names, and statistics too long for the record.
-        let names = vec![NodeName::unique(&Name::new("X", 0)); 300];
-        let status = RData::NodeStatus(NodeStatus { names, statistics: vec![7; 70_000] });
-        let (data, cut) = status.write_within(usize::MAX).unwrap();
-        assert!(cut);
-        assert_eq!(data.len(), MAX_RDATA);
-        let RData::NodeStatus(s) = RData::parse(rr_type::NBSTAT, &data) else { panic!() };
-        assert_eq!(s.names.len(), MAX_NODE_NAMES);
-        assert_eq!(1 + MAX_NODE_NAMES * NODE_NAME_LEN + s.statistics.len(), MAX_RDATA);
-        // In a small room, the statistics block comes before the names.
-        let (data, cut) = status.write_within(100).unwrap();
-        assert!(cut);
-        let RData::NodeStatus(s) = RData::parse(rr_type::NBSTAT, &data) else { panic!() };
-        assert_eq!((s.names.len(), s.statistics.len()), (2, 100 - 1 - 2 * NODE_NAME_LEN));
-        assert!(status.write_within(0).is_none());
-        let (nb, cut) = RData::Nb(vec![owner(1); 20_000]).write_within(usize::MAX).unwrap();
-        assert!(cut);
-        assert_eq!(nb.len(), MAX_NB_ENTRIES * NB_ENTRY_LEN);
-
-        // Too many questions, and answers past what a datagram holds.
-        let mut p = Packet::name_query(1, name.clone(), false);
-        p.questions = vec![p.questions[0].clone(); 100];
-        let rec = Record { name: name.clone().into(), class: CLASS_IN, ttl: 0, data: RData::Nb(vec![owner(1); 5000]) };
-        p.answers = vec![rec; 3];
-        p.additional = vec![Record { name: name.into(), class: CLASS_IN, ttl: 1, data: RData::Nb(vec![owner(2)]) }];
-        p.rcode = 0xff;
-        let bytes = p.to_bytes_within(MAX_PACKET);
-        assert!(bytes.len() <= MAX_PACKET);
-        let back = Packet::parse(&bytes).unwrap();
-        assert_eq!(back.questions.len(), MAX_RECORDS);
-        assert_eq!(back.rcode, 0x0f);
-        assert!(back.flags.truncated);
-        // Repeated names are pointers, so two answers of 30,012 bytes
-        // fit, and the third is cut to what room is left.
-        assert_eq!(back.answers.len(), 3);
-        let RData::Nb(e) = &back.answers[2].data else { panic!() };
-        assert!(e.len() < 5000);
-        assert!(back.additional.is_empty());
-        // The same packet in one datagram.
-        let small = p.to_bytes();
-        assert!(small.len() <= MAX_DATAGRAM);
-        assert!(Packet::parse(&small).unwrap().flags.truncated);
-        // A record too big for any datagram is left out.
-        let other = RData::Other { rr_type: 0x99, data: vec![1; 70_000] };
-        assert!(other.write_within(MAX_PACKET).is_none());
-        let mut q = Packet::name_query(1, Name::new("Y", 0), false);
-        q.answers = vec![Record { name: Name::new("Y", 0).into(), class: 1, ttl: 0, data: other }];
-        let back = Packet::parse(&q.to_bytes_within(MAX_PACKET)).unwrap();
-        assert!(back.answers.is_empty());
-        assert_eq!(back.questions.len(), 1);
-        assert!(back.flags.truncated);
-        // Limits outside the range are taken as its ends.
-        assert_eq!(q.to_bytes_within(0).len(), HEADER_LEN);
-        assert_eq!(q.to_bytes_within(usize::MAX), q.to_bytes_within(MAX_PACKET));
+        for scope in [vec![vec![]], vec![vec![b'a'; 100]], vec![vec![b'b'; 63]; 4]] {
+            name.scope = scope;
+            contract::check_wire_value(&name);
+            assert_eq!(name.to_bytes(), Err(ParseError::Unwritable));
+        }
+        let name = Name::new("X", 0);
+        for data in [
+            RData::NodeStatus(NodeStatus { names: vec![NodeName::unique(&name); 300], statistics: vec![] }),
+            RData::NodeStatus(NodeStatus { names: vec![], statistics: vec![7; 70_000] }),
+            RData::Nb(vec![owner(1); 20_000]),
+            RData::Other { rr_type: 0x99, data: vec![1; 70_000] },
+        ] {
+            let mut packet = Packet::name_query(1, name.clone(), false);
+            packet.answers.push(Record { name: name.clone().into(), class: CLASS_IN, ttl: 0, data });
+            contract::check_wire_value(&packet);
+            assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+        }
+        let mut packet = Packet::name_query(1, name, false);
+        packet.questions = vec![packet.questions[0].clone(); MAX_RECORDS + 1];
+        contract::check_wire_value(&packet);
+        assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
+        packet.questions.truncate(1);
+        packet.rcode = 0xff;
+        contract::check_wire_value(&packet);
+        assert_eq!(packet.to_bytes(), Err(ParseError::Unwritable));
     }
 
     #[test]
@@ -1859,30 +1807,22 @@ mod tests {
     }
 
     #[test]
-    fn writer_keeps_to_576_bytes_and_sets_tc() {
-        // RFC 1002 section 4.2.1.1: TC is set when the datagram would pass
-        // 576 bytes. Section 4.2.13: the owner list may be cut, with TC.
+    fn writer_preserves_records_and_tc() {
         let req = Packet::parse(&query_bytes()).unwrap();
         let resp = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 100]);
-        let b = resp.to_bytes();
-        assert!(b.len() <= MAX_DATAGRAM, "{} bytes", b.len());
-        let back = Packet::parse(&b).unwrap();
-        assert!(back.flags.truncated);
-        let RData::Nb(e) = &back.answers[0].data else { panic!() };
-        assert_eq!(e.len(), (MAX_DATAGRAM - 12 - 34 - 10) / NB_ENTRY_LEN);
-        // A packet that fits is not marked.
+        let b = resp.to_bytes().unwrap();
+        assert!(b.len() > MAX_DATAGRAM);
+        assert_eq!(Packet::parse(&b), Ok(resp.clone()));
+        assert!(!resp.flags.truncated);
         let small = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 3]);
-        assert!(!Packet::parse(&small.to_bytes()).unwrap().flags.truncated);
-        // A record left out entirely is marked too.
+        contract::check_wire_value(&small);
         let huge = req.query_response(Name::new("FRED", 0x20), 60, vec![owner(1); 10_909]);
-        let back = Packet::parse(&huge.to_bytes_within(MAX_PACKET)).unwrap();
-        assert!(back.flags.truncated);
-        // So is a section over MAX_RECORDS.
+        assert_eq!(huge.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&huge);
         let mut many = Packet::name_query(1, Name::new("FRED", 0x20), false);
         many.questions = vec![many.questions[0].clone(); MAX_RECORDS + 1];
-        let back = Packet::parse(&many.to_bytes_within(MAX_PACKET)).unwrap();
-        assert_eq!(back.questions.len(), MAX_RECORDS);
-        assert!(back.flags.truncated);
+        assert_eq!(many.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&many);
     }
 
     #[test]
@@ -1890,12 +1830,12 @@ mod tests {
         let long = "a.".repeat(1_000_000);
         let name = Name::new("FRED", 0x20).with_scope(&long);
         assert!(name.scope.len() < 128);
-        let wire = name.to_bytes();
+        let wire = name.to_bytes().unwrap();
         assert_eq!(read_name(&wire, 0).unwrap().0, name);
         let label = "x".repeat(64);
         let name = Name::new("FRED", 0x20).with_scope(&label);
         assert_eq!(name.scope, vec![vec![b'x'; MAX_LABEL]]);
-        assert_eq!(read_name(&name.to_bytes(), 0).unwrap().0, name);
+        assert_eq!(read_name(&name.to_bytes().unwrap(), 0).unwrap().0, name);
     }
 
     #[test]
@@ -1929,15 +1869,16 @@ mod tests {
         let p = Packet::parse(&b).unwrap();
         assert_eq!(p.answers[0].name, RrName::null());
         assert_eq!(p.answers[0].name.to_string(), ".");
-        assert_eq!(p.to_bytes(), b);
+        assert_eq!(p.to_bytes().unwrap(), b);
         let req = Packet::parse(&registration_bytes()).unwrap();
         let w = req.wack(RrName::null(), 1);
-        assert_eq!(Packet::parse(&w.to_bytes()), Ok(w));
+        assert_eq!(Packet::parse(&w.to_bytes().unwrap()), Ok(w));
         // Questions still need a NetBIOS name.
         let mut q = hex("0001 0000 0001 0000 0000 0000 00 0020 0001");
         assert_eq!(Packet::parse(&q), Err(ParseError::BadFirstLevel));
         q[5] = 0;
-        assert!(Packet::parse(&q).is_ok());
+        assert_eq!(Packet::parse(&q), Err(ParseError::Trailing(5)));
+        assert!(Packet::parse(&q[..HEADER_LEN]).is_ok());
     }
 
     #[test]
@@ -1951,7 +1892,7 @@ mod tests {
         assert_eq!(p.additional[0].name, RrName::Domain(ns));
         assert_eq!(p.additional[0].data, RData::Other { rr_type: rr_type::A, data: vec![10, 0, 0, 1] });
         assert!(p.authority[0].name.netbios().is_none());
-        let back = Packet::parse(&p.to_bytes()).unwrap();
+        let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
         assert_eq!(back, p);
         // NS data that is more than one name is refused.
         let mut bad = b.clone();
@@ -1967,16 +1908,16 @@ mod tests {
         // moves; the NS data must still name NETBIOS.COM.
         let fred = Name::new("FRED", 0x20).with_scope("NETBIOS.COM");
         let mut b = hex("0009 8100 0001 0000 0001 0000");
-        b.extend_from_slice(&fred.to_bytes());
+        b.extend_from_slice(&fred.to_bytes().unwrap());
         b.extend_from_slice(&hex("0020 0001"));
         assert_eq!(b.len(), 62);
-        b.extend_from_slice(&fred.to_bytes());
+        b.extend_from_slice(&fred.to_bytes().unwrap());
         b.extend_from_slice(&hex("0002 0001 00000000 0002 c05f"));
         assert_eq!(b.len(), 120);
         let p = Packet::parse(&b).unwrap();
         let scope = vec![b"NETBIOS".to_vec(), b"COM".to_vec()];
         assert_eq!(p.authority[0].data, RData::Ns(scope.clone()));
-        let out = p.to_bytes();
+        let out = p.to_bytes().unwrap();
         assert!(out.len() < b.len());
         let back = Packet::parse(&out).unwrap();
         assert_eq!(back.authority[0].data, RData::Ns(scope));
@@ -1984,12 +1925,13 @@ mod tests {
         // Built NS data with a pointer cannot be placed, so it is left out.
         let mut built = p.clone();
         built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: vec![0xc0, 0x5f] };
-        let back = Packet::parse(&built.to_bytes()).unwrap();
-        assert!(back.authority.is_empty() && back.flags.truncated);
+        assert_eq!(built.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&built);
         // Built NS data that is one plain name reads back as Ns.
         built.authority[0].data = RData::Other { rr_type: rr_type::NS, data: b"\x03COM\x00".to_vec() };
-        let back = Packet::parse(&built.to_bytes()).unwrap();
-        assert_eq!(back.authority[0].data, RData::Ns(vec![b"COM".to_vec()]));
+        assert_eq!(built.to_bytes(), Err(ParseError::Unwritable));
+        built.authority[0].data = RData::Ns(vec![b"COM".to_vec()]);
+        contract::check_wire_value(&built);
     }
 
     #[test]
@@ -2000,35 +1942,22 @@ mod tests {
         let reg = p.request().unwrap();
         assert!(matches!(reg, Request::Registration { .. }));
         p.flags.recursion_desired = false;
-        let back = Packet::parse(&p.to_bytes()).unwrap();
+        let back = Packet::parse(&p.to_bytes().unwrap()).unwrap();
         let want = Request::Overwrite { name: Name::new("FRED", 0x20), ttl: 60, entry: owner(9) };
         assert_eq!(back.request(), Ok(want.clone()));
         assert_eq!(want.name(), reg.name());
     }
 
-    /// A fixed linear congruential generator, so failures repeat.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            self.0 >> 33
-        }
-    }
-
     fn check(data: &[u8]) {
-        if let Ok(mut p) = Packet::parse(data) {
-            // With TC clear, TC on the written packet says the writer
-            // left something out. Without it, the packet reads back the
-            // same.
-            p.flags.truncated = false;
-            let bytes = p.to_bytes();
-            assert!(bytes.len() <= MAX_DATAGRAM);
+        contract::check_wire::<Name>(data);
+        contract::check_wire::<RrName>(data);
+        contract::check_wire::<Packet>(data);
+
+        if let Ok(p) = Packet::parse(data) {
+            let bytes = p.to_bytes().unwrap();
+            assert!(bytes.len() <= MAX_PACKET);
             let back = Packet::parse(&bytes).unwrap();
-            if !back.flags.truncated {
-                assert_eq!(back, p);
-                assert_eq!(back.to_bytes(), bytes);
-            }
+            assert_eq!(back, p);
             for r in back.answers.iter().chain(&back.authority).chain(&back.additional) {
                 assert!(!r.name.to_string().is_empty());
             }
@@ -2040,7 +1969,7 @@ mod tests {
                     p.node_status_response(name.clone(), vec![NodeName::unique(&name)], [0; 6]),
                     p.wack(name, 2),
                 ] {
-                    assert_eq!(Packet::parse(&r.to_bytes()), Ok(r));
+                    assert_eq!(Packet::parse(&r.to_bytes().unwrap()), Ok(r));
                 }
             }
             for q in &p.questions {
@@ -2051,34 +1980,25 @@ mod tests {
 
     #[test]
     fn random_buffers() {
-        let mut rng = Lcg(0x6e62_6e73);
+        let mut rng = Lcg::new(0x6e62_6e73);
         let seeds = samples();
         for round in 0..6000 {
             let mut buf = if round % 2 == 0 {
-                let len = (rng.next() % 120) as usize;
-                let mut b: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                let len = rng.index(120);
+                let mut b = vec![0; len];
+            rng.fill(&mut b);
                 // Give most a plausible header, so names get read.
                 if b.len() >= 12 {
                     for i in (4..12).step_by(2) {
                         b[i] = 0;
-                        b[i + 1] = (rng.next() % 3) as u8;
+                        b[i + 1] = rng.index(3) as u8;
                     }
                 }
                 b
             } else {
-                seeds[(rng.next() as usize) % seeds.len()].clone()
+                seeds[rng.index(seeds.len())].clone()
             };
-            // Flip a few bytes, often in the names and counts.
-            for _ in 0..(rng.next() % 4) {
-                if !buf.is_empty() {
-                    let i = (rng.next() as usize) % buf.len();
-                    buf[i] = match rng.next() % 4 {
-                        0 => 0xc0,
-                        1 => rng.next() as u8 & 0x3f,
-                        _ => rng.next() as u8,
-                    };
-                }
-            }
+            for _ in 0..rng.index(4) { mutate(&mut rng, &mut buf); }
             check(&buf);
             // The datagram as it arrives, one byte more at a time: every
             // prefix is read or refused, and never panics.

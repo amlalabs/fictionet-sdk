@@ -17,7 +17,7 @@
 //! and a suffix byte that says what the name is for (`0x00` for a
 //! workstation, `0x1D` for a workgroup's master browser). On the wire each
 //! byte becomes two letters from `A` to `P`, one per half byte; see
-//! [`encode_first_level`]. The 32 letters are the first label of a
+//! [`Name`]. The 32 letters are the first label of a
 //! DNS-style name, and an optional scope follows as more labels.
 //!
 //! A datagram too long for one packet is sent in fragments. The first has
@@ -32,14 +32,15 @@
 //!
 //! Nothing here reads a socket. A world that plays the machines on a LAN
 //! reads each datagram from its UDP socket, passes it to
-//! [`Packet::parse`], and writes the bytes of [`Packet::to_bytes`] back.
+//! [`Packet::parse`], and writes the bytes of [`Packet::write`] back.
 //! The service runs over UDP, one packet per datagram, so there is no
 //! stream decoder.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
-//! likes. Writers cut what does not fit, so their bytes always read back.
+//! likes. Writers refuse oversized or invalid values without changing the destination.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::nbdgm::{Body, DatagramKind, Name, Packet};
 //! use std::net::Ipv4Addr;
 //!
@@ -54,7 +55,7 @@
 //!     Name::new("WORKGROUP", 0x1d),
 //!     announcement.clone(),
 //! );
-//! let bytes = sent.to_bytes();
+//! let bytes = sent.to_bytes().unwrap();
 //! // A 14-byte header, two 34-byte names, then the data.
 //! assert_eq!(bytes.len(), 14 + 34 + 34 + announcement.len());
 //! // A direct group datagram, the first fragment, from a B node.
@@ -70,6 +71,9 @@
 //! assert_eq!(d.source.to_string(), "LAPTOP<00>");
 //! assert_eq!(d.data, announcement);
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 use std::net::Ipv4Addr;
 
@@ -134,7 +138,7 @@ pub mod flag {
 
 /// The first-level encoding of a 16-byte NetBIOS name: each byte becomes
 /// two letters, `A` plus its high half, then `A` plus its low half.
-pub fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
+fn encode_first_level(name: &[u8; NAME_LEN]) -> [u8; ENCODED_LEN] {
     let mut out = [0u8; ENCODED_LEN];
     for (i, b) in name.iter().enumerate() {
         out[2 * i] = b'A' + (b >> 4);
@@ -163,10 +167,8 @@ pub struct Name {
     /// The 16 bytes: up to 15 characters padded with spaces, then the
     /// suffix.
     pub bytes: [u8; NAME_LEN],
-    /// The scope's labels, such as `["NETBIOS", "COM"]`. Most networks use
-    /// none. A writer leaves out empty labels, cuts labels to
-    /// [`MAX_LABEL`] bytes, and stops adding labels once the name would
-    /// pass [`MAX_NAME_LEN`].
+    /// The scope labels. Writers refuse empty labels, labels above MAX_LABEL,
+    /// and names above MAX_NAME_LEN.
     pub scope: Vec<Vec<u8>>,
 }
 
@@ -192,8 +194,18 @@ impl Name {
     }
 
     /// This name with the scope `scope`, given with dots between labels.
+    /// Empty labels are skipped. Labels are cut to [`MAX_LABEL`] bytes
+    /// and stop before the name would exceed [`MAX_NAME_LEN`].
     pub fn with_scope(mut self, scope: &str) -> Name {
-        self.scope = scope.split('.').filter(|l| !l.is_empty()).map(|l| l.as_bytes().to_vec()).collect();
+        self.scope.clear();
+        let mut size = 1 + ENCODED_LEN + 1;
+        for label in scope.split('.').filter(|l| !l.is_empty()) {
+            let bytes = label.as_bytes();
+            let len = bytes.len().min(MAX_LABEL);
+            if size + 1 + len > MAX_NAME_LEN { break; }
+            self.scope.push(bytes[..len].to_vec());
+            size += 1 + len;
+        }
         self
     }
 
@@ -209,32 +221,10 @@ impl Name {
         self.bytes[NAME_LEN - 1]
     }
 
-    /// The name on the wire: the first-level label, the scope's labels,
-    /// and a zero byte. It is never longer than [`MAX_NAME_LEN`].
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
-        out.push(ENCODED_LEN as u8);
-        out.extend_from_slice(&encode_first_level(&self.bytes));
-        for label in &self.scope {
-            let label = &label[..label.len().min(MAX_LABEL)];
-            if label.is_empty() {
-                continue;
-            }
-            // The label, its length byte, and the final zero must fit.
-            if out.len() + 1 + label.len() + 1 > MAX_NAME_LEN {
-                break;
-            }
-            out.push(label.len() as u8);
-            out.extend_from_slice(label);
-        }
-        out.push(0);
-        out
-    }
-
     /// Reads the name at the start of `b`, and how many bytes it took.
     /// Names in datagram packets are written out in full, so a pointer to
     /// an earlier name, as DNS uses, is refused.
-    pub fn parse(b: &[u8]) -> Result<(Name, usize), ParseError> {
+    fn parse_prefix(b: &[u8]) -> Result<(Name, usize), ParseError> {
         let first = *b.first().ok_or(ParseError::Truncated)?;
         if usize::from(first) != ENCODED_LEN {
             return Err(ParseError::Name);
@@ -398,7 +388,7 @@ pub struct Datagram {
     /// The name it is for.
     pub destination: Name,
     /// The data, such as an SMB browser announcement, as raw bytes. A
-    /// writer cuts it to what fits in [`MAX_PACKET`] with the names.
+    /// writer refuses data that does not fit in [`MAX_PACKET`] with the names.
     pub data: Vec<u8>,
 }
 
@@ -485,6 +475,8 @@ pub struct Packet {
 /// Why bytes are not a datagram service packet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The packet ended before a field it needs.
     Truncated,
     /// The packet is longer than [`MAX_PACKET`].
@@ -511,6 +503,7 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::Truncated => f.write_str("packet ends early"),
             ParseError::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
             ParseError::MsgType(t) => write!(f, "unknown message type {t:#04x}"),
@@ -543,102 +536,6 @@ impl Packet {
             source_port,
             body: Body::Datagram(Datagram { kind, offset: 0, source, destination, data }),
         }
-    }
-
-    /// Reads the packet in `b`, which must be one whole UDP datagram.
-    pub fn parse(b: &[u8]) -> Result<Packet, ParseError> {
-        if b.len() > MAX_PACKET {
-            return Err(ParseError::TooLong(b.len()));
-        }
-        let ty = *b.first().ok_or(ParseError::Truncated)?;
-        if !(msg_type::DIRECT_UNIQUE..=msg_type::NEGATIVE_QUERY_RESPONSE).contains(&ty) {
-            return Err(ParseError::MsgType(ty));
-        }
-        if b.len() < HEADER_LEN {
-            return Err(ParseError::Truncated);
-        }
-        let flags = Flags::from_byte(b[1]);
-        let id = be16(b, 2);
-        let source_ip = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
-        let source_port = be16(b, 8);
-        let rest = &b[HEADER_LEN..];
-        let body = match ty {
-            msg_type::DIRECT_UNIQUE | msg_type::DIRECT_GROUP | msg_type::BROADCAST => {
-                let kind = match ty {
-                    msg_type::DIRECT_UNIQUE => DatagramKind::DirectUnique,
-                    msg_type::DIRECT_GROUP => DatagramKind::DirectGroup,
-                    _ => DatagramKind::Broadcast,
-                };
-                if rest.len() < 4 {
-                    return Err(ParseError::Truncated);
-                }
-                let field = be16(rest, 0);
-                let offset = be16(rest, 2);
-                let after = &rest[4..];
-                let want = usize::from(field);
-                if after.len() < want {
-                    return Err(ParseError::Truncated);
-                }
-                if after.len() > want {
-                    return Err(ParseError::Length { field, actual: after.len() });
-                }
-                let (source, used) = Name::parse(after)?;
-                let (destination, used2) = Name::parse(&after[used..])?;
-                let data = after[used + used2..].to_vec();
-                Body::Datagram(Datagram { kind, offset, source, destination, data })
-            }
-            msg_type::ERROR => {
-                let (&code, extra) = rest.split_first().ok_or(ParseError::Truncated)?;
-                if !extra.is_empty() {
-                    return Err(ParseError::Trailing(extra.len()));
-                }
-                Body::Error(ErrorCode::from_code(code))
-            }
-            _ => {
-                let (name, used) = Name::parse(rest)?;
-                if used < rest.len() {
-                    return Err(ParseError::Trailing(rest.len() - used));
-                }
-                match ty {
-                    msg_type::QUERY_REQUEST => Body::QueryRequest(name),
-                    msg_type::POSITIVE_QUERY_RESPONSE => Body::PositiveQueryResponse(name),
-                    _ => Body::NegativeQueryResponse(name),
-                }
-            }
-        };
-        Ok(Packet { flags, id, source_ip, source_port, body })
-    }
-
-    /// The packet's bytes. A datagram's data is cut so the packet fits in
-    /// [`MAX_PACKET`]. The reserved flag bits are written as zero.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(DATAGRAM_HEADER_LEN + 2 * (ENCODED_LEN + 2));
-        out.push(self.body.msg_type());
-        out.push(self.flags.to_byte());
-        out.extend_from_slice(&self.id.to_be_bytes());
-        out.extend_from_slice(&self.source_ip.octets());
-        out.extend_from_slice(&self.source_port.to_be_bytes());
-        match &self.body {
-            Body::Datagram(d) => {
-                let source = d.source.to_bytes();
-                let destination = d.destination.to_bytes();
-                // Names are at most 255 bytes each, so there is always room.
-                let room = MAX_PACKET - DATAGRAM_HEADER_LEN - source.len() - destination.len();
-                let data = &d.data[..d.data.len().min(room)];
-                let length = source.len() + destination.len() + data.len();
-                // MAX_PACKET is under 65,536, so the length fits.
-                out.extend_from_slice(&(length as u16).to_be_bytes());
-                out.extend_from_slice(&d.offset.to_be_bytes());
-                out.extend_from_slice(&source);
-                out.extend_from_slice(&destination);
-                out.extend_from_slice(data);
-            }
-            Body::Error(code) => out.push(code.code()),
-            Body::QueryRequest(n) | Body::PositiveQueryResponse(n) | Body::NegativeQueryResponse(n) => {
-                out.extend_from_slice(&n.to_bytes())
-            }
-        }
-        out
     }
 
     /// The datagram this packet holds, or `None` for an error, query or
@@ -675,18 +572,18 @@ impl Packet {
         Packet { flags: server_flags(), id: self.id, source_ip: ip, source_port: port, body: Body::Error(code) }
     }
 
-    /// This datagram cut into fragments of at most `max_data` data bytes
-    /// each (at least 1, and no more than fits in a packet), with the
-    /// first and more flags and the offsets set. The data is taken as the
-    /// whole datagram's, from offset 0, and cut to [`MAX_REASSEMBLED`]
-    /// bytes. A packet that is not a datagram, or whose data fits in one
-    /// fragment, comes back alone as a whole packet.
-    pub fn split(&self, max_data: usize) -> Vec<Packet> {
-        let Body::Datagram(d) = &self.body else { return vec![self.clone()] };
-        let names = d.source.to_bytes().len() + d.destination.to_bytes().len();
+    /// Splits this datagram into fragments of at most max_data bytes.
+    /// The fragment size is limited to what fits with the names, and at least one.
+    /// Offsets start at zero. Refuses data above MAX_REASSEMBLED or invalid names.
+    /// Non-datagram packets come back as one packet.
+    pub fn split(&self, max_data: usize) -> Result<Vec<Packet>, ParseError> {
+        let Body::Datagram(d) = &self.body else { return Ok(vec![self.clone()]) };
+        let (source, destination) = (d.source.to_bytes()?, d.destination.to_bytes()?);
+        let names = source.len() + destination.len();
         let room = MAX_PACKET - DATAGRAM_HEADER_LEN - names;
         let size = max_data.clamp(1, room);
-        let data = &d.data[..d.data.len().min(MAX_REASSEMBLED)];
+        if d.data.len() > MAX_REASSEMBLED { return Err(ParseError::Unwritable); }
+        let data = &d.data;
         let chunks: Vec<&[u8]> = if data.is_empty() { vec![data] } else { data.chunks(size).collect() };
         let last = chunks.len() - 1;
         let mut out = Vec::with_capacity(chunks.len());
@@ -711,7 +608,7 @@ impl Packet {
                 body: Body::Datagram(fragment),
             });
         }
-        out
+        Ok(out)
     }
 }
 
@@ -727,7 +624,7 @@ struct Pending {
     data: Vec<u8>,
 }
 
-/// Puts fragmented datagrams back together. Feed it each datagram packet
+/// Puts fragmented datagrams back together. Pass each datagram packet
 /// as it comes; it hands back each datagram once its last fragment is in.
 /// Fragments of one datagram share a source address, port and id, and
 /// must come in order. A fragment out of order, or one whose names or
@@ -804,8 +701,152 @@ fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
 }
 
+impl Wire for Name {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads one uncompressed NetBIOS name and scope. Refuses pointers, invalid
+    /// first-level labels, oversized names and trailing bytes.
+    fn parse(b: &[u8]) -> Result<Name, ParseError> {
+        let (value, used) = Self::parse_prefix(b)?;
+        if used != b.len() { return Err(ParseError::Trailing(b.len() - used)); }
+        Ok(value)
+    }
+
+    /// Appends the uncompressed name. Refuses empty or oversized scope labels and
+    /// names above MAX_NAME_LEN. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let mut out = Vec::with_capacity(ENCODED_LEN + 2);
+        out.push(ENCODED_LEN as u8);
+        out.extend_from_slice(&encode_first_level(&self.bytes));
+        for label in &self.scope {
+            if label.len() > MAX_LABEL { return Err(ParseError::Unwritable); }
+            if label.is_empty() {
+                return Err(ParseError::Unwritable);
+            }
+            // The label, its length byte, and the final zero must fit.
+            if out.len() + 1 + label.len() + 1 > MAX_NAME_LEN {
+                return Err(ParseError::Unwritable);
+            }
+            out.push(label.len() as u8);
+            out.extend_from_slice(label);
+        }
+        out.push(0);
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads the packet in `b`, which must be one whole UDP datagram.
+    /// Refuses malformed or trailing input.
+    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+        if b.len() > MAX_PACKET {
+            return Err(ParseError::TooLong(b.len()));
+        }
+        let ty = *b.first().ok_or(ParseError::Truncated)?;
+        if !(msg_type::DIRECT_UNIQUE..=msg_type::NEGATIVE_QUERY_RESPONSE).contains(&ty) {
+            return Err(ParseError::MsgType(ty));
+        }
+        if b.len() < HEADER_LEN {
+            return Err(ParseError::Truncated);
+        }
+        let flags = Flags::from_byte(b[1]);
+        let id = be16(b, 2);
+        let source_ip = Ipv4Addr::new(b[4], b[5], b[6], b[7]);
+        let source_port = be16(b, 8);
+        let rest = &b[HEADER_LEN..];
+        let body = match ty {
+            msg_type::DIRECT_UNIQUE | msg_type::DIRECT_GROUP | msg_type::BROADCAST => {
+                let kind = match ty {
+                    msg_type::DIRECT_UNIQUE => DatagramKind::DirectUnique,
+                    msg_type::DIRECT_GROUP => DatagramKind::DirectGroup,
+                    _ => DatagramKind::Broadcast,
+                };
+                if rest.len() < 4 {
+                    return Err(ParseError::Truncated);
+                }
+                let field = be16(rest, 0);
+                let offset = be16(rest, 2);
+                let after = &rest[4..];
+                let want = usize::from(field);
+                if after.len() < want {
+                    return Err(ParseError::Truncated);
+                }
+                if after.len() > want {
+                    return Err(ParseError::Length { field, actual: after.len() });
+                }
+                let (source, used) = Name::parse_prefix(after)?;
+                let (destination, used2) = Name::parse_prefix(&after[used..])?;
+                let data = after[used + used2..].to_vec();
+                Body::Datagram(Datagram { kind, offset, source, destination, data })
+            }
+            msg_type::ERROR => {
+                let (&code, extra) = rest.split_first().ok_or(ParseError::Truncated)?;
+                if !extra.is_empty() {
+                    return Err(ParseError::Trailing(extra.len()));
+                }
+                Body::Error(ErrorCode::from_code(code))
+            }
+            _ => {
+                let (name, used) = Name::parse_prefix(rest)?;
+                if used < rest.len() {
+                    return Err(ParseError::Trailing(rest.len() - used));
+                }
+                match ty {
+                    msg_type::QUERY_REQUEST => Body::QueryRequest(name),
+                    msg_type::POSITIVE_QUERY_RESPONSE => Body::PositiveQueryResponse(name),
+                    _ => Body::NegativeQueryResponse(name),
+                }
+            }
+        };
+        Ok(Packet { flags, id, source_ip, source_port, body })
+    }
+
+    /// Appends the complete datagram. Refuses invalid names, oversized data and
+    /// values that would change on reading. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let mut out = Vec::with_capacity(DATAGRAM_HEADER_LEN + 2 * (ENCODED_LEN + 2));
+        out.push(self.body.msg_type());
+        out.push(self.flags.to_byte());
+        out.extend_from_slice(&self.id.to_be_bytes());
+        out.extend_from_slice(&self.source_ip.octets());
+        out.extend_from_slice(&self.source_port.to_be_bytes());
+        match &self.body {
+            Body::Datagram(d) => {
+                let source = d.source.to_bytes()?;
+                let destination = d.destination.to_bytes()?;
+                // Names are at most 255 bytes each, so there is always room.
+                let room = MAX_PACKET - DATAGRAM_HEADER_LEN - source.len() - destination.len();
+                if d.data.len() > room { return Err(ParseError::Unwritable); }
+                let data = &d.data;
+                let length = source.len() + destination.len() + data.len();
+                // MAX_PACKET is under 65,536, so the length fits.
+                out.extend_from_slice(&(length as u16).to_be_bytes());
+                out.extend_from_slice(&d.offset.to_be_bytes());
+                out.extend_from_slice(&source);
+                out.extend_from_slice(&destination);
+                out.extend_from_slice(data);
+            }
+            Body::Error(code) => out.push(code.code()),
+            Body::QueryRequest(n) | Body::PositiveQueryResponse(n) | Body::NegativeQueryResponse(n) => {
+                n.write(&mut out)?
+            }
+        }
+        if Self::parse(&out).as_ref() != Ok(self) { return Err(ParseError::Unwritable); }
+        dst.try_reserve(out.len()).map_err(|_| ParseError::Unwritable)?;
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{contract, test_support::{Lcg, mutate}};
     use super::*;
 
     fn ip() -> Ipv4Addr {
@@ -836,12 +877,12 @@ mod tests {
             Packet::datagram(DatagramKind::Broadcast, 9, ip(), 138, Name::new("A", 0), Name::wildcard(), vec![1, 2, 3]);
         b.flags = Flags { more: true, first: true, node_type: NodeType::M };
         vec![
-            sample_datagram().to_bytes(),
-            b.to_bytes(),
-            q.to_bytes(),
-            q.query_response(ip(), 138, true).unwrap().to_bytes(),
-            q.query_response(ip(), 138, false).unwrap().to_bytes(),
-            q.error(ip(), 138, ErrorCode::DestinationNameNotPresent).to_bytes(),
+            sample_datagram().to_bytes().unwrap(),
+            b.to_bytes().unwrap(),
+            q.to_bytes().unwrap(),
+            q.query_response(ip(), 138, true).unwrap().to_bytes().unwrap(),
+            q.query_response(ip(), 138, false).unwrap().to_bytes().unwrap(),
+            q.error(ip(), 138, ErrorCode::DestinationNameNotPresent).to_bytes().unwrap(),
         ]
     }
 
@@ -849,7 +890,7 @@ mod tests {
     fn first_level_encoding_example() {
         // RFC 1001, section 14.1: "FRED" padded with spaces.
         let n = Name::new("Fred", b' ');
-        let enc = encode_first_level(&n.bytes);
+        let enc = n.to_bytes().unwrap()[1..1 + ENCODED_LEN].to_vec();
         assert_eq!(&enc, b"EGFCEFEECACACACACACACACACACACACA");
         assert_eq!(decode_first_level(&enc), Some(n.bytes));
         assert_eq!(decode_first_level(b"EG"), None);
@@ -863,7 +904,7 @@ mod tests {
     #[test]
     fn datagram_layout() {
         let p = sample_datagram();
-        let b = p.to_bytes();
+        let b = p.to_bytes().unwrap();
         assert_eq!(b[0], 0x11);
         assert_eq!(b[1], 0x02);
         assert_eq!(b[2..4], [0x12, 0x34]);
@@ -877,7 +918,7 @@ mod tests {
         assert_eq!(&b[b.len() - 10..], b"\xffSMB%hello");
         assert_eq!(Packet::parse(&b), Ok(p.clone()));
         assert!(p.carries_smb());
-        assert_eq!(Packet::parse(&b).unwrap().to_bytes(), b);
+        assert_eq!(Packet::parse(&b).unwrap().to_bytes().unwrap(), b);
     }
 
     #[test]
@@ -899,7 +940,7 @@ mod tests {
         assert_eq!(ErrorCode::from_code(0x83), ErrorCode::InvalidSourceName);
         assert_eq!(ErrorCode::from_code(0x84), ErrorCode::InvalidDestinationName);
         let p = sample_datagram().error(ip(), 138, ErrorCode::DestinationNameNotPresent);
-        let b = p.to_bytes();
+        let b = p.to_bytes().unwrap();
         assert_eq!(b, [0x13, 0x0e, 0x12, 0x34, 10, 0, 0, 9, 0, 138, 0x82]);
         assert_eq!(Packet::parse(&b), Ok(p));
     }
@@ -914,16 +955,16 @@ mod tests {
             source_port: 138,
             body: Body::QueryRequest(name.clone()),
         };
-        let b = q.to_bytes();
+        let b = q.to_bytes().unwrap();
         assert_eq!(b[0], 0x14);
         assert_eq!(b.len(), HEADER_LEN + 1 + 32 + 5 + 8 + 1);
         assert_eq!(Packet::parse(&b), Ok(q.clone()));
         let yes = q.query_response(ip(), 138, true).unwrap();
         assert_eq!(yes.body, Body::PositiveQueryResponse(name.clone()));
-        assert_eq!(yes.to_bytes()[0], 0x15);
+        assert_eq!(yes.to_bytes().unwrap()[0], 0x15);
         let no = q.query_response(ip(), 138, false).unwrap();
-        assert_eq!(no.to_bytes()[0], 0x16);
-        assert_eq!(Packet::parse(&no.to_bytes()), Ok(no.clone()));
+        assert_eq!(no.to_bytes().unwrap()[0], 0x16);
+        assert_eq!(Packet::parse(&no.to_bytes().unwrap()), Ok(no.clone()));
         assert_eq!(no.query_response(ip(), 138, true), None);
         assert_eq!(sample_datagram().query_response(ip(), 138, true), None);
         assert_eq!(name.to_string(), "FILES<20>.corp.example");
@@ -931,7 +972,7 @@ mod tests {
 
     #[test]
     fn errors() {
-        let good = sample_datagram().to_bytes();
+        let good = sample_datagram().to_bytes().unwrap();
         assert_eq!(Packet::parse(&[]), Err(ParseError::Truncated));
         assert_eq!(Packet::parse(&[0x17]), Err(ParseError::MsgType(0x17)));
         assert_eq!(Packet::parse(&[0x0f, 0, 0]), Err(ParseError::MsgType(0x0f)));
@@ -952,7 +993,7 @@ mod tests {
         b[47 + 34] = 0xc0;
         assert_eq!(Packet::parse(&b), Err(ParseError::Name));
         // Trailing bytes after an error and a query.
-        let e = sample_datagram().error(ip(), 1, ErrorCode::Other(9)).to_bytes();
+        let e = sample_datagram().error(ip(), 1, ErrorCode::Other(9)).to_bytes().unwrap();
         let mut e2 = e.clone();
         e2.extend_from_slice(&[1, 2]);
         assert_eq!(Packet::parse(&e2), Err(ParseError::Trailing(2)));
@@ -963,7 +1004,7 @@ mod tests {
             source_port: 1,
             body: Body::QueryRequest(Name::new("X", 0)),
         };
-        let mut qb = q.to_bytes();
+        let mut qb = q.to_bytes().unwrap();
         qb.push(0);
         assert_eq!(Packet::parse(&qb), Err(ParseError::Trailing(1)));
         // A name past MAX_NAME_LEN on the wire.
@@ -974,12 +1015,12 @@ mod tests {
             n.extend_from_slice(&[b'x'; 63]);
         }
         n.push(0);
-        assert_eq!(Name::parse(&n), Err(ParseError::Name));
+        assert_eq!(Name::parse(&n).map(|value| (value, n.len())), Err(ParseError::Name));
         // A label longer than 63 (and not a pointer).
         let mut n = vec![32];
         n.extend_from_slice(&[b'A'; 32]);
         n.push(64);
-        assert_eq!(Name::parse(&n), Err(ParseError::Name));
+        assert_eq!(Name::parse(&n).map(|value| (value, n.len())), Err(ParseError::Name));
         for e in [ParseError::Truncated, ParseError::Name, ParseError::Length { field: 1, actual: 2 }] {
             assert!(!e.to_string().is_empty());
         }
@@ -988,7 +1029,7 @@ mod tests {
     #[test]
     fn spec_boundaries() {
         // The wildcard: "*" then 15 zero bytes, as "CK" and 30 "A"s.
-        let w = Name::wildcard().to_bytes();
+        let w = Name::wildcard().to_bytes().unwrap();
         assert_eq!(&w[1..3], b"CK");
         assert!(w[3..33].iter().all(|&c| c == b'A'));
         // A name of exactly 255 bytes on the wire is read; 256 is not.
@@ -1002,15 +1043,15 @@ mod tests {
         n.extend_from_slice(&[b'y'; 28]);
         n.push(0);
         assert_eq!(n.len(), MAX_NAME_LEN);
-        assert_eq!(Name::parse(&n).map(|(_, used)| used), Ok(MAX_NAME_LEN));
+        assert_eq!(Name::parse(&n).map(|value| (value, n.len())).map(|(_, used)| used), Ok(MAX_NAME_LEN));
         let mut over = n.clone();
         over.insert(n.len() - 1, b'y');
         over[n.len() - 30] = 29;
-        assert_eq!(Name::parse(&over), Err(ParseError::Name));
+        assert_eq!(Name::parse(&over).map(|value| (value, over.len())), Err(ParseError::Name));
         // The flags bits: M is 0x01, F is 0x02, SNT is 0x0c.
         assert_eq!(Flags { more: true, first: false, node_type: NodeType::M }.to_byte(), 0x09);
         // A length field that ends inside the names refuses the packet.
-        let mut b = sample_datagram().to_bytes();
+        let mut b = sample_datagram().to_bytes().unwrap();
         b.truncate(DATAGRAM_HEADER_LEN + 34);
         b[10..12].copy_from_slice(&34u16.to_be_bytes());
         assert!(Packet::parse(&b).is_err());
@@ -1027,28 +1068,19 @@ mod tests {
     }
 
     #[test]
-    fn writers_cap_what_they_write() {
-        // A scope too long for one name is cut, and still reads back.
-        let long = vec![vec![b'x'; 100]; 10];
-        let name = Name { bytes: Name::new("A", 0).bytes, scope: long };
-        let wire = name.to_bytes();
-        assert!(wire.len() <= MAX_NAME_LEN);
-        let (back, used) = Name::parse(&wire).unwrap();
-        assert_eq!(used, wire.len());
-        assert!(back.scope.iter().all(|l| l.len() == MAX_LABEL));
-        // Data past what a packet can hold is cut.
+    fn writers_refuse_values_that_would_change() {
+        let name = Name { bytes: Name::new("A", 0).bytes, scope: vec![vec![b'x'; 100]; 10] };
+        assert_eq!(name.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&name);
         let mut p = sample_datagram();
         if let Body::Datagram(d) = &mut p.body {
             d.data = vec![7; 70_000];
-            d.source = name.clone();
-            d.destination = name;
         }
-        let b = p.to_bytes();
-        assert_eq!(b.len(), MAX_PACKET);
-        assert!(Packet::parse(&b).is_ok());
-        // Empty labels are left out.
+        assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&p);
         let n = Name { bytes: [b'A'; 16], scope: vec![vec![], b"x".to_vec()] };
-        assert_eq!(Name::parse(&n.to_bytes()).unwrap().0.scope, vec![b"x".to_vec()]);
+        assert_eq!(n.to_bytes(), Err(ParseError::Unwritable));
+        contract::check_wire_value(&n);
     }
 
     #[test]
@@ -1057,7 +1089,7 @@ mod tests {
         if let Body::Datagram(d) = &mut p.body {
             d.data = (0..1000u32).map(|i| i as u8).collect();
         }
-        let parts = p.split(300);
+        let parts = p.split(300).unwrap();
         assert_eq!(parts.len(), 4);
         assert!(parts[0].flags.first && parts[0].flags.more);
         assert!(!parts[3].flags.first && !parts[3].flags.more);
@@ -1069,7 +1101,7 @@ mod tests {
         let mut got = None;
         for f in &parts {
             assert!(got.is_none());
-            got = r.push(Packet::parse(&f.to_bytes()).unwrap());
+            got = r.push(Packet::parse(&f.to_bytes().unwrap()).unwrap());
         }
         assert_eq!(got, Some(p.clone()));
         assert_eq!(r.pending(), 0);
@@ -1103,9 +1135,9 @@ mod tests {
         }
         assert_eq!(r.pending(), MAX_PENDING);
         // Small data, and non-datagrams, stay whole.
-        assert_eq!(sample_datagram().split(1000), vec![sample_datagram()]);
+        assert_eq!(sample_datagram().split(1000).unwrap(), vec![sample_datagram()]);
         let e = sample_datagram().error(ip(), 1, ErrorCode::Other(1));
-        assert_eq!(e.split(1), vec![e.clone()]);
+        assert_eq!(e.split(1).unwrap(), vec![e.clone()]);
         // Too long a whole is dropped.
         let mut big = parts[0].clone();
         big.id = 999;
@@ -1124,9 +1156,9 @@ mod tests {
         // copies only its own byte, so this stays fast.
         let mut p = sample_datagram();
         if let Body::Datagram(d) = &mut p.body {
-            d.data = (0..MAX_REASSEMBLED + 10).map(|i| i as u8).collect();
+            d.data = (0..MAX_REASSEMBLED).map(|i| i as u8).collect();
         }
-        let parts = p.split(1);
+        let parts = p.split(1).unwrap();
         assert_eq!(parts.len(), MAX_REASSEMBLED);
         let mut r = Reassembler::new();
         let mut got = None;
@@ -1138,29 +1170,24 @@ mod tests {
         assert!(whole.data.iter().enumerate().all(|(i, &b)| b == i as u8));
         assert!(p.as_datagram().is_some());
         assert!(sample_datagram().error(ip(), 1, ErrorCode::Other(1)).as_datagram().is_none());
-    }
-
-    /// A fixed linear congruential generator, so failures repeat.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            self.0 >> 33
-        }
+        if let Body::Datagram(d) = &mut p.body { d.data.push(0); }
+        assert_eq!(p.split(1), Err(ParseError::Unwritable));
     }
 
     fn check(data: &[u8], r: &mut Reassembler) {
+        contract::check_wire::<Name>(data);
+        contract::check_wire::<Packet>(data);
+
         if let Ok(p) = Packet::parse(data) {
-            let bytes = p.to_bytes();
+            let bytes = p.to_bytes().unwrap();
             let back = Packet::parse(&bytes).unwrap();
             assert_eq!(back, p);
-            assert_eq!(back.to_bytes(), bytes);
-            for f in p.split(3) {
-                assert_eq!(Packet::parse(&f.to_bytes()).unwrap(), f);
+            assert_eq!(back.to_bytes().unwrap(), bytes);
+            for f in p.split(3).unwrap() {
+                assert_eq!(Packet::parse(&f.to_bytes().unwrap()).unwrap(), f);
             }
             if let Some(q) = p.query_response(ip(), 138, true) {
-                assert_eq!(Packet::parse(&q.to_bytes()), Ok(q));
+                assert_eq!(Packet::parse(&q.to_bytes().unwrap()), Ok(q));
             }
             if let Some(whole) = r.push(p) {
                 assert!(whole.flags.first && !whole.flags.more);
@@ -1171,31 +1198,22 @@ mod tests {
 
     #[test]
     fn random_buffers() {
-        let mut rng = Lcg(0x6e62_6467);
+        let mut rng = Lcg::new(0x6e62_6467);
         let seeds = samples();
         let mut r = Reassembler::new();
         for round in 0..6000 {
             let mut buf = if round % 3 == 0 {
-                let len = (rng.next() % 120) as usize;
-                let mut b: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                let len = rng.index(120);
+                let mut b = vec![0; len];
+            rng.fill(&mut b);
                 if let Some(t) = b.first_mut() {
-                    *t = 0x10 + (rng.next() % 8) as u8;
+                    *t = 0x10 + rng.index(8) as u8;
                 }
                 b
             } else {
-                seeds[(rng.next() as usize) % seeds.len()].clone()
+                seeds[rng.index(seeds.len())].clone()
             };
-            // Flip a few bytes, often in the names, flags and length.
-            for _ in 0..(rng.next() % 4) {
-                if !buf.is_empty() {
-                    let i = (rng.next() as usize) % buf.len();
-                    buf[i] = match rng.next() % 4 {
-                        0 => 0xc0,
-                        1 => b'A' + (rng.next() % 17) as u8,
-                        _ => rng.next() as u8,
-                    };
-                }
-            }
+            for _ in 0..rng.index(4) { mutate(&mut rng, &mut buf); }
             check(&buf, &mut r);
             // The datagram, one byte more at a time: every prefix is read
             // or refused, and never panics.
@@ -1207,30 +1225,30 @@ mod tests {
 
     #[test]
     fn random_fragments() {
-        // Fragments of a few datagrams, shuffled and sometimes lost, fed
+        // Fragments of a few datagrams, shuffled and sometimes lost, passed
         // one at a time: whatever comes out is a datagram that went in.
-        let mut rng = Lcg(42);
+        let mut rng = Lcg::new(42);
         for _ in 0..500 {
             let mut r = Reassembler::new();
             let mut sent = Vec::new();
             let mut stream = Vec::new();
-            for id in 0..(1 + rng.next() % 4) as u16 {
+            for id in 0..(1 + rng.index(4)) as u16 {
                 let mut p = sample_datagram();
                 p.id = id;
                 if let Body::Datagram(d) = &mut p.body {
-                    d.data = (0..rng.next() % 50).map(|_| rng.next() as u8).collect();
+                    d.data = rng.bytes(49);
                 }
-                stream.extend(p.split(1 + (rng.next() % 10) as usize));
+                stream.extend(p.split(1 + rng.index(10)).unwrap());
                 sent.push(p);
             }
             for i in (1..stream.len()).rev() {
-                if rng.next().is_multiple_of(4) {
-                    let j = (rng.next() as usize) % (i + 1);
+                if rng.index(4) == 0 {
+                    let j = rng.index(i + 1);
                     stream.swap(i, j);
                 }
             }
             for f in stream {
-                if rng.next().is_multiple_of(10) {
+                if rng.index(10) == 0 {
                     continue;
                 }
                 if let Some(whole) = r.push(f) {

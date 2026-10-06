@@ -35,7 +35,7 @@ cargo +nightly fuzz list
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
-| `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
+| `bacnet` | complete wire units and shared codec contracts | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
 | `enip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::enip`: EtherNet/IP and CIP |
@@ -55,9 +55,9 @@ cargo +nightly fuzz list
 | `mongodb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mongodb`: MongoDB |
 | `mqtt` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mysql`: MySQL |
-| `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
+| `nbns` | complete wire units and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nfs`: NFS version 3 and MOUNT version 3 |
-| `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
+| `ntp` | complete wire units and shared codec contracts | `stdlib::ntp`: NTP |
 | `ocsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
@@ -80,12 +80,19 @@ cargo +nightly fuzz list
 | `stun` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::stun`: STUN |
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
-| `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
+| `tftp` | complete wire units and shared codec contracts | `stdlib::tftp`: TFTP and bounded netascii text decoding |
 | `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
-| `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
+| `vxlan` | complete wire units and shared codec contracts | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::xml`: XML 1.0 |
+| `dtls` | complete wire units and shared codec contracts | `stdlib::dtls`: DTLS records and handshake bodies |
+| `ike` | complete wire units and shared codec contracts | `stdlib::ike`: IKEv2 and NAT-T |
+| `l2tp` | complete wire units and shared codec contracts | `stdlib::l2tp`: L2TPv2 and L2TPv3 |
+| `nbdgm` | complete wire units and shared codec contracts | `stdlib::nbdgm`: NetBIOS datagrams |
+| `ntlmssp` | complete wire units and shared codec contracts | `stdlib::ntlmssp`: NTLMSSP tokens and fields |
+| `pcp` | complete wire units and shared codec contracts | `stdlib::pcp`: PCP and NAT-PMP |
+| `wireguard` | complete wire units and shared codec contracts | `stdlib::wireguard`: WireGuard messages and replay windows |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules
