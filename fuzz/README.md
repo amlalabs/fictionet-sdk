@@ -68,15 +68,17 @@ cargo +nightly fuzz list
 | `quic` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::quic`: QUIC |
 | `resp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::resp`: RESP, the Redis protocol |
 | `rfb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rfb`: RFB, the remote framebuffer protocol behind VNC |
-| `rtp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtp`: RTP and RTCP |
+| `openvpn` | wrapped control packets, TCP envelopes, and codec contracts | `stdlib::openvpn`: plain, tls-auth, and tls-crypt layouts |
+| `rtcp` | control datagrams, compound rules, strict values, and codec contracts | `stdlib::rtcp`: reports, feedback, and XR blocks |
+| `rtp` | datagrams, RFC 4571 streams, strict values, and codec contracts | `stdlib::rtp`: RTP and multiplexed RTCP |
 | `rtsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::rtsp`: RTSP |
 | `sdp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sdp`: SDP |
 | `sftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sftp`: SFTP version 3 |
 | `sip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sip`: SIP |
-| `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
+| `snmp` | BER messages, object identifiers, strict values, and codec contracts | `stdlib::snmp`: SNMP v1 and v2c |
 | `socks` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
 | `spnego` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::spnego`: SPNEGO |
-| `ssh` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ssh`: The SSH transport layer before encryption |
+| `ssh` | version lines, cleartext packets, messages, and codec contracts | `stdlib::ssh`: The SSH transport layer before encryption |
 | `stun` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::stun`: STUN |
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |

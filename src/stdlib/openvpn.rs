@@ -19,12 +19,13 @@
 //! HMAC, a packet ID and a time after the session ID; one set up with
 //! tls-crypt puts a packet ID, a time and a tag there, and encrypts the
 //! rest. Nothing in the bytes says which is in use, so the caller says
-//! with a [`Wrapping`]. The module reads the wrapping's fields and hands
-//! them over as they are. It neither checks the HMAC nor decrypts.
+//! with a [`Wrapping`] for [`Packet::parse_with`]. Writers use [`Packet`]
+//! for plain control, [`Authenticated`] for tls-auth, and [`Encrypted`]
+//! for tls-crypt. The module reads the wrapping's fields as they are. It neither checks the HMAC nor decrypts.
 //!
-//! Nothing here reads a socket. A world that plays an OpenVPN server feeds
-//! the bytes it reads from a TCP connection to a [`Decoder`], or takes each
-//! UDP datagram whole, reads each packet with [`Packet::parse`], and writes
+//! Nothing here reads a socket. A world that plays an OpenVPN server pushes
+//! TCP bytes through [`Stream<Frames>`](super::codec::Stream), or takes each
+//! UDP datagram whole, reads it with [`Packet::parse_with`], and writes
 //! the reply's bytes back. What the TLS session says, and what the tunnel
 //! carries, is up to world code.
 //!
@@ -41,20 +42,16 @@
 //! many acknowledgements, a packet over [`MAX_PACKET`], and so on. What a
 //! writer writes, the reader reads back as the same value.
 //!
-//! New TCP stacks use [`Frames`] with [`super::codec::Stream`] and
-//! [`Frame`] with [`super::codec::Wire`]. Packet parsing still takes an
-//! explicit wrapping. The legacy [`Decoder`] remains separate because it
-//! clears buffered bytes on failure and repeats its error.
-//!
 //! ```
-//! use fictionet::stdlib::openvpn::{Ack, Control, ControlBody, ControlKind, Decoder, Packet, Wrapping};
+//! use fictionet::stdlib::openvpn::{Ack, Control, ControlBody, ControlKind, Frames, Frame, Packet, Wrapping};
 //!
-//! let mut decoder = Decoder::new();
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! let mut stream = Stream::new(Frames::new());
 //! // A client's P_CONTROL_HARD_RESET_CLIENT_V2 over TCP: length 14,
 //! // opcode 7 and key 0, session ID 1..8, no acks, message packet ID 0.
-//! assert_eq!(decoder.feed(&[0, 14, 0x38, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0]), 16);
-//! let bytes = decoder.next_packet().unwrap().unwrap();
-//! let packet = Packet::parse(&bytes, Wrapping::None).unwrap();
+//! assert_eq!(stream.push(&[0, 14, 0x38, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0]), 16);
+//! let bytes = stream.next().unwrap().unwrap().0;
+//! let packet = Packet::parse_with(&bytes, Wrapping::None).unwrap();
 //! let Packet::Control { kind: ControlKind::HardResetClientV2, key_id: 0, body: ControlBody::Plain(hello) } = packet
 //! else {
 //!     panic!("not a client hard reset");
@@ -73,9 +70,9 @@
 //!         payload: Vec::new(),
 //!     }),
 //! };
-//! let wire = reply.to_tcp_bytes().unwrap();
+//! let wire = Frame::from_packet(&reply).unwrap().to_bytes().unwrap();
 //! assert_eq!(wire[..3], [0, 26, 0x40]);
-//! assert_eq!(Packet::parse(&wire[2..], Wrapping::None), Ok(reply));
+//! assert_eq!(Packet::parse_with(&wire[2..], Wrapping::None), Ok(reply));
 //! ```
 
 use super::codec::{Decode, Step, Wire};
@@ -113,17 +110,27 @@ pub const NO_PEER_ID: u32 = MAX_PEER_ID;
 
 /// Opcodes, the top 5 bits of a packet's first byte.
 pub mod opcode {
-    #![allow(missing_docs)]
+    /// Client hard reset using key method 1.
     pub const P_CONTROL_HARD_RESET_CLIENT_V1: u8 = 1;
+    /// Server hard reset using key method 1.
     pub const P_CONTROL_HARD_RESET_SERVER_V1: u8 = 2;
+    /// Renegotiate keys within a session.
     pub const P_CONTROL_SOFT_RESET_V1: u8 = 3;
+    /// A numbered control-channel payload.
     pub const P_CONTROL_V1: u8 = 4;
+    /// Acknowledgements without a message ID.
     pub const P_ACK_V1: u8 = 5;
+    /// Encrypted data without a peer ID.
     pub const P_DATA_V1: u8 = 6;
+    /// Client hard reset using key method 2.
     pub const P_CONTROL_HARD_RESET_CLIENT_V2: u8 = 7;
+    /// Server hard reset using key method 2.
     pub const P_CONTROL_HARD_RESET_SERVER_V2: u8 = 8;
+    /// Encrypted data with a 24-bit peer ID.
     pub const P_DATA_V2: u8 = 9;
+    /// Client hard reset with a tls-crypt-v2 wrapped key.
     pub const P_CONTROL_HARD_RESET_CLIENT_V3: u8 = 10;
+    /// Control payload carrying a tls-crypt-v2 wrapped key.
     pub const P_CONTROL_WKC_V1: u8 = 11;
 }
 
@@ -350,7 +357,9 @@ impl ControlBody {
     }
 }
 
-/// One OpenVPN packet.
+/// One OpenVPN packet. The wire implementation uses unwrapped control fields.
+/// Use [`Authenticated`] or [`Encrypted`] for protected control packets,
+/// or [`Packet::parse_with`] to read with a runtime wrapping.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Packet {
     /// A control channel packet.
@@ -423,42 +432,16 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Why a [`Packet`] cannot be written: its reader would not give the same
-/// value back.
+/// Why a value cannot be written as it stands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum EncodeError {
-    /// A key ID above [`MAX_KEY_ID`].
-    KeyId(u8),
-    /// A peer ID above [`MAX_PEER_ID`].
-    PeerId(u32),
-    /// A tls-auth HMAC longer than [`MAX_HMAC_LEN`].
-    HmacLen(usize),
-    /// More than [`MAX_ACKS`] acknowledgements.
-    TooManyAcks(usize),
-    /// An [`Ack`] with no packet IDs. Leave the `Ack` out instead.
-    EmptyAck,
-    /// A message packet ID other than 0 in a [`ControlKind::AckV1`]
-    /// packet, which has none.
-    AckMessageId(u32),
-    /// The packet would be longer than [`MAX_PACKET`].
-    TooLong(usize),
-    /// The packet breaks a rule its reader checks: a tls-crypt-v2 kind
-    /// without tls-crypt, a ciphertext too short, or a bad wrapped key.
-    Packet(Error),
+    /// A field, wrapping, or packet length cannot be represented without change.
+    Unwritable,
 }
 
 impl std::fmt::Display for EncodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EncodeError::KeyId(k) => write!(f, "key ID {k}, over {MAX_KEY_ID}"),
-            EncodeError::PeerId(p) => write!(f, "peer ID {p}, over {MAX_PEER_ID}"),
-            EncodeError::HmacLen(n) => write!(f, "tls-auth HMAC of {n} bytes, over {MAX_HMAC_LEN}"),
-            EncodeError::TooManyAcks(n) => write!(f, "{n} acknowledgements, over {MAX_ACKS}"),
-            EncodeError::EmptyAck => write!(f, "acknowledgements with no packet IDs"),
-            EncodeError::AckMessageId(id) => write!(f, "message packet ID {id} in a P_ACK_V1, which has none"),
-            EncodeError::TooLong(n) => write!(f, "packet of {n} bytes, over {MAX_PACKET}"),
-            EncodeError::Packet(e) => write!(f, "{e}"),
-        }
+        f.write_str("value cannot be written without changing it")
     }
 }
 
@@ -505,16 +488,15 @@ pub fn split_first_byte(b: u8) -> (u8, u8) {
     (b >> 3, b & MAX_KEY_ID)
 }
 
-/// A packet's first byte from its opcode and key ID. Only the low 5 bits
-/// of the opcode and the low 3 of the key ID are kept.
-pub fn first_byte(opcode: u8, key_id: u8) -> u8 {
-    (opcode & 0x1f) << 3 | (key_id & MAX_KEY_ID)
+/// Packs a checked opcode and key ID.
+fn first_byte(opcode: u8, key_id: u8) -> u8 {
+    opcode << 3 | key_id
 }
 
 impl Packet {
-    /// Reads one whole packet: a UDP datagram, or what a [`Decoder`]
-    /// returns. `wrapping` says how control packets are wrapped.
-    pub fn parse(b: &[u8], wrapping: Wrapping) -> Result<Packet, Error> {
+    /// Reads one whole datagram or frame payload with explicit control wrapping.
+    /// Refuses invalid fields, short input, and packets over [`MAX_PACKET`].
+    pub fn parse_with(b: &[u8], wrapping: Wrapping) -> Result<Packet, Error> {
         if b.len() > MAX_PACKET {
             return Err(Error::TooLong(b.len()));
         }
@@ -616,25 +598,25 @@ impl Packet {
     }
 
     /// The packet's bytes, without a TCP length prefix. It returns an
-    /// [`EncodeError`] for a packet [`Packet::parse`] would not read back
+    /// [`EncodeError`] for a packet [`Packet::parse_with`] would not read back
     /// as the same value.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
+    fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         let key_id = self.key_id();
         if key_id > MAX_KEY_ID {
-            return Err(EncodeError::KeyId(key_id));
+            return Err(EncodeError::Unwritable);
         }
         let mut out = vec![first_byte(self.opcode(), key_id)];
         let payload: &[u8] = match self {
             Packet::DataV1 { payload, .. } => payload,
             Packet::DataV2 { peer_id, payload, .. } => {
                 if *peer_id > MAX_PEER_ID {
-                    return Err(EncodeError::PeerId(*peer_id));
+                    return Err(EncodeError::Unwritable);
                 }
                 out.extend_from_slice(&peer_id.to_be_bytes()[1..]);
                 payload
             }
             Packet::Control { kind, body: ControlBody::TlsCrypt(c), .. } => {
-                check_tls_crypt(*kind, &c.ciphertext).map_err(EncodeError::Packet)?;
+                check_tls_crypt(*kind, &c.ciphertext).map_err(|_| EncodeError::Unwritable)?;
                 out.extend_from_slice(&c.session_id);
                 out.extend_from_slice(&c.packet_id.to_be_bytes());
                 out.extend_from_slice(&c.net_time.to_be_bytes());
@@ -643,12 +625,12 @@ impl Packet {
             }
             Packet::Control { kind, body: ControlBody::Plain(c), .. } => {
                 if kind.carries_wrapped_key() {
-                    return Err(EncodeError::Packet(Error::NeedsTlsCrypt(*kind)));
+                    return Err(EncodeError::Unwritable);
                 }
                 out.extend_from_slice(&c.session_id);
                 if let Some(a) = &c.tls_auth {
                     if a.hmac.len() > MAX_HMAC_LEN {
-                        return Err(EncodeError::HmacLen(a.hmac.len()));
+                        return Err(EncodeError::Unwritable);
                     }
                     out.extend_from_slice(&a.hmac);
                     out.extend_from_slice(&a.packet_id.to_be_bytes());
@@ -657,13 +639,13 @@ impl Packet {
                 match &c.ack {
                     Some(a) => {
                         if a.ids.is_empty() {
-                            return Err(EncodeError::EmptyAck);
+                            return Err(EncodeError::Unwritable);
                         }
                         let Ok(count) = u8::try_from(a.ids.len()) else {
-                            return Err(EncodeError::TooManyAcks(a.ids.len()));
+                            return Err(EncodeError::Unwritable);
                         };
                         if usize::from(count) > MAX_ACKS {
-                            return Err(EncodeError::TooManyAcks(a.ids.len()));
+                            return Err(EncodeError::Unwritable);
                         }
                         out.push(count);
                         for id in &a.ids {
@@ -675,7 +657,7 @@ impl Packet {
                 }
                 if *kind == ControlKind::AckV1 {
                     if c.message_id != 0 {
-                        return Err(EncodeError::AckMessageId(c.message_id));
+                        return Err(EncodeError::Unwritable);
                     }
                 } else {
                     out.extend_from_slice(&c.message_id.to_be_bytes());
@@ -685,61 +667,23 @@ impl Packet {
         };
         let len = out.len().saturating_add(payload.len());
         if len > MAX_PACKET {
-            return Err(EncodeError::TooLong(len));
+            return Err(EncodeError::Unwritable);
         }
         out.extend_from_slice(payload);
         Ok(out)
     }
-
-    /// The packet's bytes with the 2-byte length prefix TCP uses.
-    pub fn to_tcp_bytes(&self) -> Result<Vec<u8>, EncodeError> {
-        let b = self.to_bytes()?;
-        // to_bytes gives 1 to MAX_PACKET bytes, which frame always takes.
-        frame(&b).ok_or(EncodeError::TooLong(b.len()))
-    }
 }
-
-/// `packet` with the 2-byte length prefix TCP uses. It returns `None` for
-/// an empty packet or one longer than [`MAX_PACKET`], which a reader would
-/// refuse.
-pub fn frame(packet: &[u8]) -> Option<Vec<u8>> {
-    if packet.is_empty() || packet.len() > MAX_PACKET {
-        return None;
-    }
-    let mut out = Vec::with_capacity(LENGTH_PREFIX_LEN + packet.len());
-    out.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-    out.extend_from_slice(packet);
-    Some(out)
-}
-
-/// Why a TCP stream cannot be split into packets. OpenVPN resets the
-/// connection when it sees this.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FrameError {
-    /// A length prefix of 0: no packet is that short.
-    ZeroLength,
-}
-
-impl std::fmt::Display for FrameError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FrameError::ZeroLength => write!(f, "packet length 0 in a TCP stream"),
-        }
-    }
-}
-
-impl std::error::Error for FrameError {}
 
 /// Finds the packet at the start of a TCP stream `b`. It returns
 /// `Ok(None)` if `b` holds only part of one, and otherwise the packet's
 /// bytes, without the prefix, and how many bytes of `b` it took.
-pub fn split_tcp(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
+fn split_tcp(b: &[u8]) -> Result<Option<(&[u8], usize)>, StreamError> {
     if b.len() < LENGTH_PREFIX_LEN {
         return Ok(None);
     }
     let len = usize::from(u16::from_be_bytes([b[0], b[1]]));
     if len == 0 {
-        return Err(FrameError::ZeroLength);
+        return Err(StreamError::ZeroLength);
     }
     let end = LENGTH_PREFIX_LEN + len;
     match b.get(LENGTH_PREFIX_LEN..end) {
@@ -751,7 +695,7 @@ pub fn split_tcp(b: &[u8]) -> Result<Option<(&[u8], usize)>, FrameError> {
 /// A TCP envelope containing one OpenVPN packet, without its length prefix.
 ///
 /// [`Wire`] reads and writes the two-byte prefix and 1 to [`MAX_PACKET`]
-/// payload bytes. The payload is opaque. Parse it with [`Packet::parse`]
+/// payload bytes. The payload is opaque. Parse it with [`Packet::parse_with`]
 /// and an explicit [`Wrapping`]; that context cannot be inferred from bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame(
@@ -763,7 +707,7 @@ pub struct Frame(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamError {
     /// The TCP length prefix is invalid.
-    Frame(FrameError),
+    ZeroLength,
     /// The declared packet exceeds the configured payload limit.
     TooLong {
         /// The declared payload length.
@@ -776,7 +720,7 @@ pub enum StreamError {
 impl core::fmt::Display for StreamError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Frame(e) => e.fmt(f),
+            Self::ZeroLength => f.write_str("OpenVPN TCP frame has zero length"),
             Self::TooLong { length, limit } => {
                 write!(f, "OpenVPN packet of {length} bytes, over {limit}")
             }
@@ -811,8 +755,9 @@ impl core::error::Error for FrameParseError {}
 
 impl Wire for Frame {
     type ParseError = FrameParseError;
-    type WriteError = StreamError;
+    type WriteError = EncodeError;
 
+    /// Reads one envelope. Refuses zero length, truncation, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
         match Frames::new()
             .decode(bytes, true)
@@ -824,17 +769,99 @@ impl Wire for Frame {
         }
     }
 
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), StreamError> {
-        if self.0.is_empty() {
-            return Err(StreamError::Frame(FrameError::ZeroLength));
+    /// Appends one envelope. Refuses empty payloads and lengths over [`MAX_PACKET`].
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+        let length = u16::try_from(self.0.len()).map_err(|_| EncodeError::Unwritable)?;
+        if length == 0 {
+            return Err(EncodeError::Unwritable);
         }
-        let length = u16::try_from(self.0.len()).map_err(|_| StreamError::TooLong {
-            length: self.0.len(),
-            limit: MAX_PACKET,
-        })?;
+        out.try_reserve_exact(2 + self.0.len())
+            .map_err(|_| EncodeError::Unwritable)?;
         out.extend_from_slice(&length.to_be_bytes());
         out.extend_from_slice(&self.0);
         Ok(())
+    }
+}
+
+/// A packet using tls-auth with a fixed HMAC length.
+/// The HMAC is carried as bytes and is not verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Authenticated<const HMAC_LEN: usize>(
+    /// The packet whose control fields use this HMAC length.
+    pub Packet,
+);
+
+/// A packet using tls-crypt. The ciphertext and tag are not verified.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Encrypted(
+    /// The packet whose control fields use tls-crypt.
+    pub Packet,
+);
+
+fn write_packet(packet: &Packet, wrapping: Wrapping, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    if matches!(packet, Packet::Control { .. }) && packet.wrapping() != wrapping {
+        return Err(EncodeError::Unwritable);
+    }
+    let bytes = packet.encode()?;
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| EncodeError::Unwritable)?;
+    out.extend_from_slice(&bytes);
+    Ok(())
+}
+
+macro_rules! packet_wire {
+    ($ty:ty, $wrapping:expr, $wrap:expr, $get:ident $(, $n:ident)?) => {
+        impl $(<const $n: usize>)? Wire for $ty {
+            type ParseError = Error;
+            type WriteError = EncodeError;
+
+            /// Reads one datagram with this type's wrapping. Refuses short input,
+            /// invalid fields, and packets over [`MAX_PACKET`].
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                Packet::parse_with(bytes, $wrapping).map($wrap)
+            }
+
+            /// Appends one datagram. Refuses incompatible wrapping, invalid IDs,
+            /// acknowledgements, ciphertext layout, or a length over [`MAX_PACKET`].
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+                write_packet(self.$get(), $wrapping, out)
+            }
+        }
+    };
+}
+impl Packet {
+    fn packet(&self) -> &Packet {
+        self
+    }
+}
+impl<const N: usize> Authenticated<N> {
+    fn packet(&self) -> &Packet {
+        &self.0
+    }
+}
+impl Encrypted {
+    fn packet(&self) -> &Packet {
+        &self.0
+    }
+}
+packet_wire!(Packet, Wrapping::None, |p| p, packet);
+packet_wire!(
+    Authenticated<N>,
+    Wrapping::TlsAuth { hmac_len: N },
+    Self,
+    packet,
+    N
+);
+packet_wire!(Encrypted, Wrapping::TlsCrypt, Self, packet);
+
+impl Frame {
+    /// Places a packet in a TCP envelope. Refuses any value its writer refuses.
+    pub fn from_packet<P: Wire<WriteError = EncodeError>>(packet: &P) -> Result<Self, EncodeError> {
+        let bytes = packet.to_bytes()?;
+        if bytes.is_empty() || bytes.len() > MAX_PACKET {
+            return Err(EncodeError::Unwritable);
+        }
+        Ok(Self(bytes))
     }
 }
 
@@ -843,7 +870,7 @@ impl Wire for Frame {
 /// Capacity is the payload limit plus [`LENGTH_PREFIX_LEN`]. An oversized
 /// packet is refused from its prefix. Partial envelopes return [`Step::Need`],
 /// including at EOF, so [`super::codec::Stream`] reports truncation.
-/// Map each frame through [`Packet::parse`] with the connection's wrapping
+/// Map each frame through [`Packet::parse_with`] with the connection's wrapping
 /// to receive packet errors as items while framing continues.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
@@ -895,93 +922,38 @@ impl Decode for Frames {
                 });
             }
         }
-        Ok(match split_tcp(input).map_err(StreamError::Frame)? {
+        Ok(match split_tcp(input)? {
             Some((packet, used)) => Step::Item(Frame(packet.to_vec()), used),
             None => Step::Need,
         })
     }
 }
 
-/// Splits an OpenVPN TCP stream into packets. Feed it the bytes a
-/// connection reads, in order, and take packets out until it has none.
-/// Each packet comes out as bytes, for [`Packet::parse`].
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small packets costs time in proportion to their bytes.
-    start: usize,
-    failed: Option<FrameError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds bytes read from the connection and returns how many it took.
-    /// It holds at most [`Decoder::CAPACITY`] bytes not yet taken out, so
-    /// it may take fewer than it is given. Take packets out with
-    /// [`Decoder::next_packet`], then feed it the rest. Once it is full,
-    /// `next_packet` always gives a packet or an error. After a
-    /// [`FrameError`] the stream cannot be read any further, and every
-    /// byte is taken and dropped.
-    #[must_use = "bytes past the returned count were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(Decoder::CAPACITY - self.buffered());
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The most bytes a decoder holds that have not been taken out: one
-    /// packet of the longest length, with its prefix.
-    pub const CAPACITY: usize = MAX_TCP_FRAME;
-
-    /// The next whole packet, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken.
-    pub fn next_packet(&mut self) -> Option<Result<Vec<u8>, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match split_tcp(&self.buf[self.start..]) {
-            Ok(Some((packet, used))) => {
-                let packet = packet.to_vec();
-                self.start += used;
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
-                Some(Ok(packet))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a packet.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::codec::{
+        contract, Stream, Fail,
+        test_support::{decode_all, Lcg, mutate},
+    };
+
+    fn wire(packet: &Packet) -> Result<Vec<u8>, EncodeError> {
+        match packet.wrapping() {
+            Wrapping::None => packet.to_bytes(),
+            Wrapping::TlsCrypt => Encrypted(packet.clone()).to_bytes(),
+            Wrapping::TlsAuth { hmac_len } => match hmac_len {
+                0 => Authenticated::<0>(packet.clone()).to_bytes(),
+                20 => Authenticated::<20>(packet.clone()).to_bytes(),
+                32 => Authenticated::<32>(packet.clone()).to_bytes(),
+                64 => Authenticated::<64>(packet.clone()).to_bytes(),
+                _ => Err(EncodeError::Unwritable),
+            },
+        }
+    }
+
+    fn envelope(packet: &Packet) -> Result<Vec<u8>, EncodeError> {
+        Frame(wire(packet)?).to_bytes()
+    }
 
     const CLIENT_SID: SessionId = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     const SERVER_SID: SessionId = [0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8];
@@ -1010,16 +982,16 @@ mod tests {
         let mut bytes = vec![0x38];
         bytes.extend_from_slice(&CLIENT_SID);
         bytes.extend_from_slice(&[0, 0, 0, 0, 0]);
-        let p = Packet::parse(&bytes, Wrapping::None).unwrap();
+        let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
         let want = plain(
             ControlKind::HardResetClientV2,
             Control { session_id: CLIENT_SID, tls_auth: None, ack: None, message_id: 0, payload: vec![] },
         );
         assert_eq!(p, want);
-        assert_eq!(p.to_bytes().unwrap(), bytes);
+        assert_eq!(wire(&p).unwrap(), bytes);
         let mut tcp = vec![0, 14];
         tcp.extend_from_slice(&bytes);
-        assert_eq!(p.to_tcp_bytes().unwrap(), tcp);
+        assert_eq!(envelope(&p).unwrap(), tcp);
     }
 
     #[test]
@@ -1029,7 +1001,7 @@ mod tests {
         bytes.extend_from_slice(&[1, 0, 0, 0, 0]);
         bytes.extend_from_slice(&CLIENT_SID);
         bytes.extend_from_slice(&[0, 0, 0, 0]);
-        let p = Packet::parse(&bytes, Wrapping::None).unwrap();
+        let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
         let ControlBody::Plain(c) = (match &p {
             Packet::Control { kind: ControlKind::HardResetServerV2, body, .. } => body.clone(),
             _ => panic!(),
@@ -1038,7 +1010,7 @@ mod tests {
         };
         assert_eq!(c.ack, Some(Ack { ids: vec![0], remote_session_id: CLIENT_SID }));
         assert_eq!(c.session_id, SERVER_SID);
-        assert_eq!(p.to_bytes().unwrap(), bytes);
+        assert_eq!(wire(&p).unwrap(), bytes);
     }
 
     #[test]
@@ -1051,12 +1023,12 @@ mod tests {
             payload: vec![0x16, 0x03, 0x01],
         };
         let p = Packet::Control { kind: ControlKind::ControlV1, key_id: 2, body: ControlBody::Plain(c) };
-        let b = p.to_bytes().unwrap();
+        let b = wire(&p).unwrap();
         assert_eq!(b[0], 0x22);
         assert_eq!(b.len(), 1 + 8 + 1 + 8 + 8 + 4 + 3);
         assert_eq!(&b[9..18], &[2, 0, 0, 0, 1, 0, 0, 0, 2]);
         assert_eq!(&b[b.len() - 7..], &[0, 0, 0, 3, 0x16, 0x03, 0x01]);
-        assert_eq!(Packet::parse(&b, Wrapping::None), Ok(p));
+        assert_eq!(Packet::parse_with(&b, Wrapping::None), Ok(p));
     }
 
     #[test]
@@ -1065,34 +1037,37 @@ mod tests {
         bytes.extend_from_slice(&CLIENT_SID);
         bytes.extend_from_slice(&[1, 0, 0, 0, 5]);
         bytes.extend_from_slice(&SERVER_SID);
-        let p = Packet::parse(&bytes, Wrapping::None).unwrap();
-        assert_eq!(p.to_bytes().unwrap(), bytes);
+        let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
+        assert_eq!(wire(&p).unwrap(), bytes);
         // The writer refuses a message ID set by mistake, which the reader
         // would not give back.
         let mut odd = p.clone();
         if let Packet::Control { body: ControlBody::Plain(c), .. } = &mut odd {
             c.message_id = 9;
         }
-        assert_eq!(odd.to_bytes(), Err(EncodeError::AckMessageId(9)));
+        assert_eq!(wire(&odd), Err(EncodeError::Unwritable));
         // OpenVPN ignores bytes after the acknowledgements (ssl.c reads no
         // message ID for P_ACK_V1 and stops), so they are kept as payload.
         bytes.extend_from_slice(&[0xaa, 0xbb]);
-        let p = Packet::parse(&bytes, Wrapping::None).unwrap();
+        let p = Packet::parse_with(&bytes, Wrapping::None).unwrap();
         let Packet::Control { body: ControlBody::Plain(c), .. } = &p else { panic!() };
         assert_eq!((c.message_id, &c.payload[..]), (0, &[0xaa, 0xbb][..]));
-        assert_eq!(p.to_bytes().unwrap(), bytes);
+        assert_eq!(wire(&p).unwrap(), bytes);
     }
 
     #[test]
     fn data_packets() {
-        let p = Packet::parse(&[0x30, 1, 2, 3], Wrapping::None).unwrap();
+        let p = Packet::parse_with(&[0x30, 1, 2, 3], Wrapping::None).unwrap();
         assert_eq!(p, Packet::DataV1 { key_id: 0, payload: vec![1, 2, 3] });
-        let p = Packet::parse(&[0x49, 0x00, 0x00, 0x05, 0xde, 0xad], Wrapping::TlsCrypt).unwrap();
+        let p = Packet::parse_with(&[0x49, 0x00, 0x00, 0x05, 0xde, 0xad], Wrapping::TlsCrypt).unwrap();
         assert_eq!(p, Packet::DataV2 { key_id: 1, peer_id: 5, payload: vec![0xde, 0xad] });
-        assert_eq!(p.to_bytes().unwrap(), [0x49, 0, 0, 5, 0xde, 0xad]);
+        assert_eq!(wire(&p).unwrap(), [0x49, 0, 0, 5, 0xde, 0xad]);
         let p = Packet::DataV2 { key_id: 1, peer_id: NO_PEER_ID, payload: vec![] };
-        assert_eq!(p.to_bytes().unwrap(), [0x49, 0xff, 0xff, 0xff]);
-        assert_eq!(Packet::parse(&p.to_bytes().unwrap(), Wrapping::None), Ok(p));
+        assert_eq!(wire(&p).unwrap(), [0x49, 0xff, 0xff, 0xff]);
+        assert_eq!(
+            Packet::parse_with(&wire(&p).unwrap(), Wrapping::None),
+            Ok(p)
+        );
     }
 
     #[test]
@@ -1102,18 +1077,40 @@ mod tests {
         bytes.extend_from_slice(&[0xee; 20]);
         bytes.extend_from_slice(&[0, 0, 0, 1, 0x5f, 0, 0, 0]);
         bytes.extend_from_slice(&[0, 0, 0, 0, 0]);
-        let p = Packet::parse(&bytes, Wrapping::TlsAuth { hmac_len: 20 }).unwrap();
+        let p = Packet::parse_with(&bytes, Wrapping::TlsAuth { hmac_len: 20 }).unwrap();
         let Packet::Control { body: ControlBody::Plain(c), .. } = &p else { panic!() };
         assert_eq!(c.tls_auth, Some(TlsAuth { hmac: vec![0xee; 20], packet_id: 1, net_time: 0x5f00_0000 }));
         assert_eq!(p.wrapping(), Wrapping::TlsAuth { hmac_len: 20 });
-        assert_eq!(p.to_bytes().unwrap(), bytes);
-        assert_eq!(Packet::parse(&bytes, Wrapping::TlsAuth { hmac_len: 65 }), Err(Error::HmacLen(65)));
+        assert_eq!(wire(&p).unwrap(), bytes);
+        assert_eq!(
+            Packet::parse_with(&bytes, Wrapping::TlsAuth { hmac_len: 65 }),
+            Err(Error::HmacLen(65))
+        );
         // An HMAC length too long is refused before the bytes are read, so
         // even a packet cut short says so.
-        assert_eq!(Packet::parse(&bytes[..3], Wrapping::TlsAuth { hmac_len: 65 }), Err(Error::HmacLen(65)));
-        assert_eq!(Packet::parse(&bytes, Wrapping::TlsAuth { hmac_len: usize::MAX }), Err(Error::HmacLen(usize::MAX)));
+        assert_eq!(
+            Packet::parse_with(&bytes[..3], Wrapping::TlsAuth { hmac_len: 65 }),
+            Err(Error::HmacLen(65))
+        );
+        assert_eq!(
+            Packet::parse_with(
+                &bytes,
+                Wrapping::TlsAuth {
+                    hmac_len: usize::MAX
+                }
+            ),
+            Err(Error::HmacLen(usize::MAX))
+        );
         // Data packets ignore the wrapping, whatever it says.
-        assert!(Packet::parse(&[0x30, 1], Wrapping::TlsAuth { hmac_len: usize::MAX }).is_ok());
+        assert!(
+            Packet::parse_with(
+                &[0x30, 1],
+                Wrapping::TlsAuth {
+                    hmac_len: usize::MAX
+                }
+            )
+            .is_ok()
+        );
         assert_eq!(p.session_id(), Some(CLIENT_SID));
         assert_eq!(Packet::DataV1 { key_id: 0, payload: vec![] }.session_id(), None);
     }
@@ -1134,7 +1131,7 @@ mod tests {
         bytes.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 2]);
         bytes.extend_from_slice(&[0x77; 32]);
         bytes.extend_from_slice(&ciphertext);
-        let p = Packet::parse(&bytes, Wrapping::TlsCrypt).unwrap();
+        let p = Packet::parse_with(&bytes, Wrapping::TlsCrypt).unwrap();
         let want = TlsCrypt { session_id: CLIENT_SID, packet_id: 1, net_time: 2, tag: [0x77; 32], ciphertext };
         assert_eq!(want.split_wrapped_key(), Some((&[9, 8, 7, 6, 5][..], &want.ciphertext[5..])));
         assert_eq!(
@@ -1142,7 +1139,7 @@ mod tests {
             Packet::Control { kind: ControlKind::HardResetClientV3, key_id: 0, body: ControlBody::TlsCrypt(want) }
         );
         assert_eq!(p.wrapping(), Wrapping::TlsCrypt);
-        assert_eq!(p.to_bytes().unwrap(), bytes);
+        assert_eq!(wire(&p).unwrap(), bytes);
     }
 
     /// The tls-crypt header of a packet of `first` byte, then `ct`.
@@ -1163,13 +1160,19 @@ mod tests {
             let mut b = vec![first];
             b.extend_from_slice(&[1; 8]);
             b.extend_from_slice(&[0; 5]);
-            assert_eq!(Packet::parse(&b, Wrapping::None), Err(Error::NeedsTlsCrypt(kind)));
-            assert_eq!(Packet::parse(&b, Wrapping::TlsAuth { hmac_len: 0 }), Err(Error::NeedsTlsCrypt(kind)));
+            assert_eq!(
+                Packet::parse_with(&b, Wrapping::None),
+                Err(Error::NeedsTlsCrypt(kind))
+            );
+            assert_eq!(
+                Packet::parse_with(&b, Wrapping::TlsAuth { hmac_len: 0 }),
+                Err(Error::NeedsTlsCrypt(kind))
+            );
             let p = plain(
                 kind,
                 Control { session_id: CLIENT_SID, tls_auth: None, ack: None, message_id: 0, payload: vec![] },
             );
-            assert_eq!(p.to_bytes(), Err(EncodeError::Packet(Error::NeedsTlsCrypt(kind))));
+            assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         }
     }
 
@@ -1177,13 +1180,22 @@ mod tests {
     fn tls_crypt_v2_wrapped_key_is_checked() {
         // The old fixture: [9, 8, 7] names a 2055-byte key in 3 bytes.
         let b = tls_crypt_bytes(0x50, &[9, 8, 7]);
-        assert_eq!(Packet::parse(&b, Wrapping::TlsCrypt), Err(Error::WrappedKeyLen(0x0807)));
+        assert_eq!(
+            Packet::parse_with(&b, Wrapping::TlsCrypt),
+            Err(Error::WrappedKeyLen(0x0807))
+        );
         // No room for the length at all.
-        assert_eq!(Packet::parse(&tls_crypt_bytes(0x58, &[9]), Wrapping::TlsCrypt), Err(Error::Truncated));
+        assert_eq!(
+            Packet::parse_with(&tls_crypt_bytes(0x58, &[9]), Wrapping::TlsCrypt),
+            Err(Error::Truncated)
+        );
         // A length in range but longer than the ciphertext.
         let mut ct = vec![1; 5];
         ct.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN));
-        assert_eq!(Packet::parse(&tls_crypt_bytes(0x58, &ct[1..]), Wrapping::TlsCrypt), Err(Error::Truncated));
+        assert_eq!(
+            Packet::parse_with(&tls_crypt_bytes(0x58, &ct[1..]), Wrapping::TlsCrypt),
+            Err(Error::Truncated)
+        );
         // Lengths at and past each end of the range.
         for (len, ok) in [
             (MIN_WRAPPED_KEY_LEN - 1, false),
@@ -1193,7 +1205,7 @@ mod tests {
         ] {
             let mut ct = vec![1; 5];
             ct.extend_from_slice(&wrapped_key(len));
-            let got = Packet::parse(&tls_crypt_bytes(0x58, &ct), Wrapping::TlsCrypt);
+            let got = Packet::parse_with(&tls_crypt_bytes(0x58, &ct), Wrapping::TlsCrypt);
             if ok {
                 assert!(got.is_ok(), "{len}");
             } else {
@@ -1204,7 +1216,7 @@ mod tests {
         let t = TlsCrypt { session_id: CLIENT_SID, packet_id: 0, net_time: 0, tag: [0; 32], ciphertext: vec![9, 8, 7] };
         assert_eq!(t.split_wrapped_key(), None);
         let p = Packet::Control { kind: ControlKind::HardResetClientV3, key_id: 0, body: ControlBody::TlsCrypt(t) };
-        assert_eq!(p.to_bytes(), Err(EncodeError::Packet(Error::WrappedKeyLen(0x0807))));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
     }
 
     #[test]
@@ -1212,36 +1224,63 @@ mod tests {
         // A control packet encrypts at least an ack count and a message
         // packet ID, 5 bytes, and a P_ACK_V1 at least the count.
         for (first, kind) in [(0x20, ControlKind::ControlV1), (0x38, ControlKind::HardResetClientV2)] {
-            assert_eq!(Packet::parse(&tls_crypt_bytes(first, &[]), Wrapping::TlsCrypt), Err(Error::Truncated));
-            assert_eq!(Packet::parse(&tls_crypt_bytes(first, &[0; 4]), Wrapping::TlsCrypt), Err(Error::Truncated));
-            assert!(Packet::parse(&tls_crypt_bytes(first, &[0; 5]), Wrapping::TlsCrypt).is_ok());
+            assert_eq!(Packet::parse_with(&tls_crypt_bytes(first, &[]), Wrapping::TlsCrypt), Err(Error::Truncated));
+            assert_eq!(Packet::parse_with(&tls_crypt_bytes(first, &[0; 4]), Wrapping::TlsCrypt), Err(Error::Truncated));
+            assert!(Packet::parse_with(&tls_crypt_bytes(first, &[0; 5]), Wrapping::TlsCrypt).is_ok());
             let t = TlsCrypt { session_id: CLIENT_SID, packet_id: 0, net_time: 0, tag: [0; 32], ciphertext: vec![] };
             let p = Packet::Control { kind, key_id: 0, body: ControlBody::TlsCrypt(t) };
-            assert_eq!(p.to_bytes(), Err(EncodeError::Packet(Error::Truncated)));
+            assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         }
-        assert_eq!(Packet::parse(&tls_crypt_bytes(0x28, &[]), Wrapping::TlsCrypt), Err(Error::Truncated));
-        assert!(Packet::parse(&tls_crypt_bytes(0x28, &[0]), Wrapping::TlsCrypt).is_ok());
+        assert_eq!(
+            Packet::parse_with(&tls_crypt_bytes(0x28, &[]), Wrapping::TlsCrypt),
+            Err(Error::Truncated)
+        );
+        assert!(Packet::parse_with(&tls_crypt_bytes(0x28, &[0]), Wrapping::TlsCrypt).is_ok());
         // With a wrapped key, the room is counted before the key.
         let mut ct = vec![0; 4];
         ct.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN));
-        assert_eq!(Packet::parse(&tls_crypt_bytes(0x50, &ct), Wrapping::TlsCrypt), Err(Error::Truncated));
+        assert_eq!(
+            Packet::parse_with(&tls_crypt_bytes(0x50, &ct), Wrapping::TlsCrypt),
+            Err(Error::Truncated)
+        );
     }
 
     #[test]
     fn errors() {
-        assert_eq!(Packet::parse(&[], Wrapping::None), Err(Error::Empty));
-        assert_eq!(Packet::parse(&[0x00], Wrapping::None), Err(Error::Opcode(0)));
-        assert_eq!(Packet::parse(&[12 << 3], Wrapping::None), Err(Error::Opcode(12)));
-        assert_eq!(Packet::parse(&[0xff], Wrapping::None), Err(Error::Opcode(31)));
-        assert_eq!(Packet::parse(&[0x38, 1, 2], Wrapping::None), Err(Error::Truncated));
-        assert_eq!(Packet::parse(&[0x48, 1, 2], Wrapping::None), Err(Error::Truncated));
+        assert_eq!(Packet::parse_with(&[], Wrapping::None), Err(Error::Empty));
+        assert_eq!(
+            Packet::parse_with(&[0x00], Wrapping::None),
+            Err(Error::Opcode(0))
+        );
+        assert_eq!(
+            Packet::parse_with(&[12 << 3], Wrapping::None),
+            Err(Error::Opcode(12))
+        );
+        assert_eq!(
+            Packet::parse_with(&[0xff], Wrapping::None),
+            Err(Error::Opcode(31))
+        );
+        assert_eq!(
+            Packet::parse_with(&[0x38, 1, 2], Wrapping::None),
+            Err(Error::Truncated)
+        );
+        assert_eq!(
+            Packet::parse_with(&[0x48, 1, 2], Wrapping::None),
+            Err(Error::Truncated)
+        );
         let mut many = vec![0x20];
         many.extend_from_slice(&CLIENT_SID);
         many.push(9);
-        assert_eq!(Packet::parse(&many, Wrapping::None), Err(Error::TooManyAcks(9)));
+        assert_eq!(
+            Packet::parse_with(&many, Wrapping::None),
+            Err(Error::TooManyAcks(9))
+        );
         let long = vec![0x30; MAX_PACKET + 1];
-        assert_eq!(Packet::parse(&long, Wrapping::None), Err(Error::TooLong(MAX_PACKET + 1)));
-        assert!(Packet::parse(&long[..MAX_PACKET], Wrapping::None).is_ok());
+        assert_eq!(
+            Packet::parse_with(&long, Wrapping::None),
+            Err(Error::TooLong(MAX_PACKET + 1))
+        );
+        assert!(Packet::parse_with(&long[..MAX_PACKET], Wrapping::None).is_ok());
         for e in [
             Error::Empty,
             Error::TooLong(1),
@@ -1254,16 +1293,16 @@ mod tests {
         ] {
             assert!(!e.to_string().is_empty());
         }
-        assert!(!FrameError::ZeroLength.to_string().is_empty());
+        assert!(!StreamError::ZeroLength.to_string().is_empty());
         for e in [
-            EncodeError::KeyId(8),
-            EncodeError::PeerId(1 << 24),
-            EncodeError::HmacLen(65),
-            EncodeError::TooManyAcks(9),
-            EncodeError::EmptyAck,
-            EncodeError::AckMessageId(1),
-            EncodeError::TooLong(MAX_PACKET + 1),
-            EncodeError::Packet(Error::Truncated),
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
+            EncodeError::Unwritable,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -1305,9 +1344,9 @@ mod tests {
     #[test]
     fn round_trips() {
         for p in samples() {
-            let b = p.to_bytes().unwrap();
-            assert_eq!(Packet::parse(&b, p.wrapping()), Ok(p.clone()));
-            let tcp = p.to_tcp_bytes().unwrap();
+            let b = wire(&p).unwrap();
+            assert_eq!(Packet::parse_with(&b, p.wrapping()), Ok(p.clone()));
+            let tcp = envelope(&p).unwrap();
             let (inner, used) = split_tcp(&tcp).unwrap().unwrap();
             assert_eq!(inner, &b[..]);
             assert_eq!(used, b.len() + 2);
@@ -1317,7 +1356,7 @@ mod tests {
     #[test]
     fn every_truncated_prefix() {
         for p in samples() {
-            let b = p.to_bytes().unwrap();
+            let b = wire(&p).unwrap();
             let w = p.wrapping();
             // Where the fixed fields end and the payload starts.
             let header = match &p {
@@ -1334,7 +1373,7 @@ mod tests {
                 Packet::Control { body: ControlBody::Plain(c), .. } => b.len() - c.payload.len(),
             };
             for n in 0..b.len() {
-                let got = Packet::parse(&b[..n], w);
+                let got = Packet::parse_with(&b[..n], w);
                 if n == 0 {
                     assert_eq!(got, Err(Error::Empty));
                 } else if n < header {
@@ -1343,7 +1382,7 @@ mod tests {
                     assert!(got.is_ok(), "{p:?} cut to {n}");
                 }
             }
-            let tcp = p.to_tcp_bytes().unwrap();
+            let tcp = envelope(&p).unwrap();
             for n in 0..tcp.len() {
                 assert_eq!(split_tcp(&tcp[..n]), Ok(None));
             }
@@ -1355,154 +1394,105 @@ mod tests {
         // The longest packet is written whole, and one byte more is refused
         // rather than cut.
         let p = Packet::DataV1 { key_id: 0, payload: vec![7; MAX_PACKET - 1] };
-        assert_eq!(Packet::parse(&p.to_bytes().unwrap(), Wrapping::None), Ok(p.clone()));
-        assert_eq!(p.to_tcp_bytes().unwrap().len(), MAX_TCP_FRAME);
+        assert_eq!(Packet::parse_with(&wire(&p).unwrap(), Wrapping::None), Ok(p.clone()));
+        assert_eq!(envelope(&p).unwrap().len(), MAX_TCP_FRAME);
         let p = Packet::DataV1 { key_id: 0, payload: vec![0; MAX_PACKET] };
-        assert_eq!(p.to_bytes(), Err(EncodeError::TooLong(MAX_PACKET + 1)));
-        assert_eq!(p.to_tcp_bytes(), Err(EncodeError::TooLong(MAX_PACKET + 1)));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
+        assert_eq!(envelope(&p), Err(EncodeError::Unwritable));
         // A tls-crypt ciphertext is never cut, which would leave its tag
         // over bytes that are not there.
         let t =
             TlsCrypt { session_id: CLIENT_SID, packet_id: 0, net_time: 0, tag: [0; 32], ciphertext: vec![1; 65487] };
         let p = Packet::Control { kind: ControlKind::ControlV1, key_id: 0, body: ControlBody::TlsCrypt(t) };
-        assert_eq!(p.to_bytes(), Err(EncodeError::TooLong(MAX_PACKET + 1)));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         // Key IDs and peer IDs too large for their bits.
         let p = Packet::DataV2 { key_id: 9, peer_id: 5, payload: vec![] };
-        assert_eq!(p.to_bytes(), Err(EncodeError::KeyId(9)));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         let p = Packet::DataV2 { key_id: 1, peer_id: 0x0100_0005, payload: vec![] };
-        assert_eq!(p.to_bytes(), Err(EncodeError::PeerId(0x0100_0005)));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         let control = |tls_auth, ack| Control { session_id: CLIENT_SID, tls_auth, ack, message_id: 1, payload: vec![] };
         let p =
             Packet::Control { kind: ControlKind::ControlV1, key_id: 8, body: ControlBody::Plain(control(None, None)) };
-        assert_eq!(p.to_bytes(), Err(EncodeError::KeyId(8)));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         // An HMAC too long, too many acks, and an Ack with none.
         let p = plain(
             ControlKind::ControlV1,
             control(Some(TlsAuth { hmac: vec![1; MAX_HMAC_LEN + 1], packet_id: 0, net_time: 0 }), None),
         );
         assert_eq!(p.wrapping(), Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 });
-        assert_eq!(p.to_bytes(), Err(EncodeError::HmacLen(MAX_HMAC_LEN + 1)));
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
         let p = plain(
             ControlKind::ControlV1,
             control(Some(TlsAuth { hmac: vec![1; MAX_HMAC_LEN], packet_id: 0, net_time: 0 }), None),
         );
-        assert_eq!(Packet::parse(&p.to_bytes().unwrap(), p.wrapping()), Ok(p));
+        assert_eq!(Packet::parse_with(&wire(&p).unwrap(), p.wrapping()), Ok(p));
         for (n, want) in [
             (MAX_ACKS, None),
-            (MAX_ACKS + 1, Some(EncodeError::TooManyAcks(9))),
-            (300, Some(EncodeError::TooManyAcks(300))),
+            (MAX_ACKS + 1, Some(EncodeError::Unwritable)),
+            (300, Some(EncodeError::Unwritable)),
         ] {
             let ack = Ack { ids: (0..n as u32).collect(), remote_session_id: SERVER_SID };
             let p = plain(ControlKind::ControlV1, control(None, Some(ack)));
             match want {
-                None => assert_eq!(Packet::parse(&p.to_bytes().unwrap(), Wrapping::None), Ok(p)),
-                Some(e) => assert_eq!(p.to_bytes(), Err(e)),
+                None => assert_eq!(
+                    Packet::parse_with(&wire(&p).unwrap(), Wrapping::None),
+                    Ok(p)
+                ),
+                Some(e) => assert_eq!(wire(&p), Err(e)),
             }
         }
         let p = plain(ControlKind::ControlV1, control(None, Some(Ack { ids: vec![], remote_session_id: SERVER_SID })));
-        assert_eq!(p.to_bytes(), Err(EncodeError::EmptyAck));
-        assert_eq!(frame(&[]), None);
-        assert_eq!(frame(&vec![0; MAX_PACKET + 1]), None);
-        assert_eq!(frame(&[0x30]), Some(vec![0, 1, 0x30]));
-    }
-
-    /// Feeds all of `bytes`, taking packets out whenever the decoder is
-    /// full, and returns what came out, the error included.
-    fn feed_all(d: &mut Decoder, mut bytes: &[u8], out: &mut Vec<Result<Vec<u8>, FrameError>>) {
-        loop {
-            let n = d.feed(bytes);
-            bytes = &bytes[n..];
-            while let Some(p) = d.next_packet() {
-                let failed = p.is_err();
-                out.push(p);
-                if failed {
-                    return;
-                }
-            }
-            if bytes.is_empty() {
-                return;
-            }
-        }
+        assert_eq!(wire(&p), Err(EncodeError::Unwritable));
+        assert_eq!(Frame(vec![]).to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(
+            Frame(vec![0; MAX_PACKET + 1]).to_bytes(),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(Frame(vec![0x30]).to_bytes(), Ok(vec![0, 1, 0x30]));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let a = samples()[0].to_tcp_bytes().unwrap();
-        let b = samples()[5].to_tcp_bytes().unwrap();
-        let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(p) = d.next_packet() {
-                got.push(p.unwrap());
-            }
-        }
-        assert_eq!(got, [a[2..].to_vec(), b[2..].to_vec()]);
-        assert_eq!(d.buffered(), 0);
-        // A length of 0 breaks the stream for good, and every byte after
-        // it is taken and dropped.
-        assert_eq!(d.feed(&[0, 0, 0, 1, 0x30]), 5);
-        assert_eq!(d.next_packet(), Some(Err(FrameError::ZeroLength)));
-        assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_packet(), Some(Err(FrameError::ZeroLength)));
-        assert_eq!(d.buffered(), 0);
+    fn stream_splits_a_stream() {
+        let a = envelope(&samples()[0]).unwrap();
+        let b = envelope(&samples()[5]).unwrap();
+        let bytes = [a.clone(), b.clone()].concat();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_TCP_FRAME);
+        assert_eq!(
+            decode_all(Frames::new, &bytes),
+            (vec![Frame(a[2..].to_vec()), Frame(b[2..].to_vec())], None)
+        );
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[0, 0, 0, 1, 0x30]), 5);
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(StreamError::ZeroLength)))
+        );
+        assert!(stream.next().is_none());
+        assert_eq!(stream.push(&a), a.len());
     }
 
     #[test]
-    fn decoder_holds_a_bounded_number_of_bytes() {
-        // A caller that never takes packets out cannot make it hold more
-        // than its capacity.
-        let mut d = Decoder::new();
-        let mut taken = 0;
-        for _ in 0..100_000 {
-            taken += d.feed(&[0, 1, 0x30]);
-        }
-        assert_eq!(taken, Decoder::CAPACITY);
-        assert_eq!(d.buffered(), Decoder::CAPACITY);
-        // One large feed is cut to the capacity too.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&vec![0x30; 3 * MAX_TCP_FRAME]), Decoder::CAPACITY);
-        // A full decoder always has a whole packet ready.
-        assert_eq!(d.next_packet().unwrap().unwrap().len(), 0x3030);
-        // The longest packet fits, prefix and all.
-        let mut d = Decoder::new();
-        let longest = frame(&vec![0x30; MAX_PACKET]).unwrap();
-        assert_eq!(d.feed(&longest), MAX_TCP_FRAME);
-        assert_eq!(d.next_packet(), Some(Ok(longest[2..].to_vec())));
-        assert_eq!(d.buffered(), 0);
+    fn stream_holds_a_bounded_number_of_bytes() {
+        let longest = Frame(vec![0x30; MAX_PACKET]).to_bytes().unwrap();
+        contract::check_decode_with_alloc_limit(Frames::new, &longest, 2 * MAX_TCP_FRAME);
+        assert_eq!(
+            decode_all(Frames::new, &longest),
+            (vec![Frame(longest[2..].to_vec())], None)
+        );
     }
 
     #[test]
-    fn decoder_takes_many_small_packets_in_linear_time() {
-        let one = frame(&[0x30, 1]).unwrap();
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
-        let started = std::time::Instant::now();
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        feed_all(&mut d, &stream, &mut got);
-        assert_eq!(got.len(), 200_000);
-        assert!(got.iter().all(|p| p.as_deref() == Ok(&[0x30, 1][..])));
-        assert_eq!(d.buffered(), 0);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
-    }
-
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
+    fn stream_takes_many_small_packets_in_linear_time() {
+        let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(200_000);
+        let (items, error) = decode_all(Frames::new, &bytes);
+        assert_eq!(error, None);
+        assert_eq!(items.len(), 200_000);
+        assert!(items.iter().all(|p| p.0 == [0x30, 1]));
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x0b5e_1194);
+        let mut rng = Lcg::new(0x0b5e_1194);
         let wrappings = [
             Wrapping::None,
             Wrapping::TlsAuth { hmac_len: 0 },
@@ -1512,20 +1502,20 @@ mod tests {
             Wrapping::TlsCrypt,
         ];
         for i in 0..20_000 {
-            let len = (rng.next() % 120) as usize;
+            let len = rng.index(120);
             let mut b = rng.bytes(len);
             // Mostly known opcodes and small ack counts, so parsing gets deep.
             if let Some(first) = b.first_mut() {
-                *first = first_byte((rng.next() % 13) as u8, *first);
+                *first = first_byte(rng.index(13) as u8, *first & 7);
             }
             if b.len() > 9 && i % 2 == 0 {
                 b[9] %= 10;
             }
             for w in wrappings {
-                if let Ok(p) = Packet::parse(&b, w) {
+                if let Ok(p) = Packet::parse_with(&b, w) {
                     // Whatever is read is written back byte for byte.
-                    assert_eq!(p.to_bytes(), Ok(b.clone()), "{w:?}");
-                    assert_eq!(Packet::parse(&b, p.wrapping()), Ok(p));
+                    assert_eq!(wire(&p), Ok(b.clone()), "{w:?}");
+                    assert_eq!(Packet::parse_with(&b, p.wrapping()), Ok(p));
                 }
             }
             // An HMAC too long is refused for any control packet, never
@@ -1534,88 +1524,66 @@ mod tests {
                 && ControlKind::from_opcode(split_first_byte(first).0).is_some()
             {
                 let too_long = Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 };
-                assert_eq!(Packet::parse(&b, too_long), Err(Error::HmacLen(MAX_HMAC_LEN + 1)));
+                assert_eq!(Packet::parse_with(&b, too_long), Err(Error::HmacLen(MAX_HMAC_LEN + 1)));
             }
-            // The same bytes as a TCP stream, whole and a byte at a time,
-            // give the same packets and the same error.
-            let mut whole = Decoder::new();
-            let mut all = Vec::new();
-            feed_all(&mut whole, &b, &mut all);
-            let mut bytewise = Decoder::new();
-            let mut again = Vec::new();
-            for byte in &b {
-                if again.last().is_some_and(|p: &Result<_, _>| p.is_err()) {
-                    break;
-                }
-                feed_all(&mut bytewise, std::slice::from_ref(byte), &mut again);
-            }
-            assert_eq!(all, again);
-            assert_eq!(whole.buffered(), bytewise.buffered());
-            for p in all.iter().flatten() {
-                let framed = frame(p).unwrap();
-                let (inner, _) = split_tcp(&framed).unwrap().unwrap();
-                assert_eq!(inner, &p[..]);
-            }
+            contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TCP_FRAME);
+            contract::check_wire::<Frame>(&b);
+            contract::check_wire::<Packet>(&b);
+            contract::check_wire::<Authenticated<20>>(&b);
+            contract::check_wire::<Encrypted>(&b);
+            mutate(&mut rng, &mut b);
+            contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TCP_FRAME);
         }
         // Built packets with random fields: each is written and read back
         // as the same value, or refused for the reason it breaks.
         for _ in 0..20_000 {
-            let kind = ControlKind::ALL[(rng.next() % 9) as usize];
-            let key_id = (rng.next() % 10) as u8;
-            let ids: Vec<u32> = (0..rng.next() % 11).map(|_| rng.next() as u32).collect();
-            let hmac_len = (rng.next() % 70) as usize;
-            let payload_len = (rng.next() % 50) as usize;
-            let message_id = if rng.next().is_multiple_of(2) { 0 } else { rng.next() as u32 };
+            let kind = ControlKind::ALL[rng.index(9)];
+            let key_id = rng.index(10) as u8;
+            let ids: Vec<u32> = (0..rng.index(11)).map(|_| rng.next() as u32).collect();
+            let hmac_len = [0, 20, 32, 64, 65][rng.index(5)];
+            let payload_len = rng.index(50);
+            let message_id = if rng.coin() { 0 } else { rng.next() as u32 };
             let c = Control {
                 session_id: [rng.next() as u8; 8],
-                tls_auth: rng.next().is_multiple_of(2).then(|| TlsAuth {
-                    hmac: rng.bytes(hmac_len),
+                tls_auth: rng.coin().then(|| TlsAuth {
+                    hmac: vec![rng.next() as u8; hmac_len],
                     packet_id: 1,
                     net_time: 2,
                 }),
-                ack: rng.next().is_multiple_of(2).then_some(Ack { ids, remote_session_id: [3; 8] }),
+                ack: rng.coin().then_some(Ack {
+                    ids,
+                    remote_session_id: [3; 8],
+                }),
                 message_id,
                 payload: rng.bytes(payload_len),
             };
-            let want = if key_id > MAX_KEY_ID {
-                Some(EncodeError::KeyId(key_id))
-            } else if kind.carries_wrapped_key() {
-                Some(EncodeError::Packet(Error::NeedsTlsCrypt(kind)))
-            } else if c.tls_auth.as_ref().is_some_and(|a| a.hmac.len() > MAX_HMAC_LEN) {
-                Some(EncodeError::HmacLen(hmac_len))
-            } else if let Some(a) = &c.ack
-                && a.ids.is_empty()
-            {
-                Some(EncodeError::EmptyAck)
-            } else if let Some(a) = &c.ack
-                && a.ids.len() > MAX_ACKS
-            {
-                Some(EncodeError::TooManyAcks(a.ids.len()))
-            } else if kind == ControlKind::AckV1 && message_id != 0 {
-                Some(EncodeError::AckMessageId(message_id))
-            } else {
-                None
-            };
+            let want = (key_id > MAX_KEY_ID
+                || kind.carries_wrapped_key()
+                || c.tls_auth
+                    .as_ref()
+                    .is_some_and(|a| a.hmac.len() > MAX_HMAC_LEN)
+                || c.ack
+                    .as_ref()
+                    .is_some_and(|a| a.ids.is_empty() || a.ids.len() > MAX_ACKS)
+                || (kind == ControlKind::AckV1 && message_id != 0))
+                .then_some(EncodeError::Unwritable);
             let p = Packet::Control { kind, key_id, body: ControlBody::Plain(c) };
             match want {
-                Some(e) => assert_eq!(p.to_bytes(), Err(e), "{p:?}"),
+                Some(e) => assert_eq!(wire(&p), Err(e), "{p:?}"),
                 None => {
-                    let b = p.to_bytes().unwrap();
-                    assert_eq!(Packet::parse(&b, p.wrapping()), Ok(p.clone()));
-                    let mut d = Decoder::new();
-                    for byte in p.to_tcp_bytes().unwrap() {
-                        assert_eq!(d.feed(&[byte]), 1);
-                    }
-                    assert_eq!(d.next_packet(), Some(Ok(b)));
+                    let b = wire(&p).unwrap();
+                    assert_eq!(Packet::parse_with(&b, p.wrapping()), Ok(p.clone()));
+                    let bytes = Frame(b.clone()).to_bytes().unwrap();
+                    assert_eq!(decode_all(Frames::new, &bytes), (vec![Frame(b)], None));
                 }
             }
             // The same kind wrapped with tls-crypt, with a ciphertext that
             // may be too short or lack its wrapped key.
-            let ct_len = (rng.next() % 8) as usize;
+            let ct_len = rng.index(8);
             let mut ciphertext = rng.bytes(ct_len);
-            let with_key = rng.next().is_multiple_of(2);
+            let with_key = rng.coin();
             if with_key {
-                ciphertext.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN + (rng.next() % 4) as usize));
+                ciphertext.extend_from_slice(&wrapped_key(MIN_WRAPPED_KEY_LEN + rng.index(4)));
             }
             let body_len = ciphertext.len() - if with_key { wrapped_key_len(&ciphertext).unwrap() } else { 0 };
             let fits = key_id <= MAX_KEY_ID
@@ -1623,29 +1591,29 @@ mod tests {
                 && if kind.carries_wrapped_key() { body_len } else { ciphertext.len() } >= kind.min_tls_crypt_body();
             let t = TlsCrypt { session_id: [4; 8], packet_id: 5, net_time: 6, tag: [7; 32], ciphertext };
             let p = Packet::Control { kind, key_id, body: ControlBody::TlsCrypt(t) };
-            match p.to_bytes() {
+            match wire(&p) {
                 Ok(b) => {
                     assert!(fits, "{p:?}");
-                    assert_eq!(Packet::parse(&b, Wrapping::TlsCrypt), Ok(p));
+                    assert_eq!(Packet::parse_with(&b, Wrapping::TlsCrypt), Ok(p));
                 }
                 Err(e) => assert!(!fits, "{p:?}: {e}"),
             }
         }
         // Data packets, with key IDs and peer IDs in and out of range.
         for _ in 0..5_000 {
-            let key_id = (rng.next() % 10) as u8;
-            let peer_id = (rng.next() as u32) >> (rng.next() % 9);
-            let payload_len = (rng.next() % 20) as usize;
+            let key_id = rng.index(10) as u8;
+            let peer_id = (rng.next() as u32) >> rng.index(9);
+            let payload_len = rng.index(20);
             let payload = rng.bytes(payload_len);
             for p in [
                 Packet::DataV1 { key_id, payload: payload.clone() },
                 Packet::DataV2 { key_id, peer_id, payload: payload.clone() },
             ] {
-                match p.to_bytes() {
-                    Ok(b) => assert_eq!(Packet::parse(&b, Wrapping::None), Ok(p)),
+                match wire(&p) {
+                    Ok(b) => assert_eq!(Packet::parse_with(&b, Wrapping::None), Ok(p)),
                     Err(e) => assert!(
-                        e == EncodeError::KeyId(key_id) && key_id > MAX_KEY_ID
-                            || e == EncodeError::PeerId(peer_id) && peer_id > MAX_PEER_ID,
+                        e == EncodeError::Unwritable
+                            && (key_id > MAX_KEY_ID || peer_id > MAX_PEER_ID),
                         "{p:?}: {e}"
                     ),
                 }

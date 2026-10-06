@@ -2,11 +2,11 @@
 //! UDP datagrams and TCP streams, and as it builds them to write.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, contract};
 use fictionet::stdlib::openvpn::{Frame, Frames};
 use fictionet::stdlib::openvpn::{
-    Ack, Control, ControlBody, ControlKind, Decoder, EncodeError, Error, FrameError, MAX_HMAC_LEN, MAX_PACKET, Packet,
-    TlsAuth, TlsCrypt, Wrapping, frame, split_first_byte, split_tcp,
+    Ack, Authenticated, Encrypted, Control, ControlBody, ControlKind, Error, MAX_HMAC_LEN,
+    MAX_PACKET, MAX_TCP_FRAME, Packet, TlsAuth, TlsCrypt, Wrapping, split_first_byte,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -18,36 +18,6 @@ const WRAPPINGS: [Wrapping; 6] = [
     Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN },
     Wrapping::TlsCrypt,
 ];
-
-/// Feeds all of `bytes` in pieces of `step`, taking packets out as they
-/// come, and returns them, the error included. The decoder never holds
-/// more than its capacity.
-fn split_stream(bytes: &[u8], step: usize) -> (Vec<Result<Vec<u8>, FrameError>>, usize) {
-    let mut d = Decoder::new();
-    let mut out = Vec::new();
-    for mut piece in bytes.chunks(step) {
-        loop {
-            let before = out.len();
-            let n = d.feed(piece);
-            piece = &piece[n..];
-            assert!(d.buffered() <= Decoder::CAPACITY);
-            while let Some(p) = d.next_packet() {
-                let failed = p.is_err();
-                out.push(p);
-                if failed {
-                    return (out, d.buffered());
-                }
-            }
-            if piece.is_empty() {
-                break;
-            }
-            // Bytes were left over, so the decoder was full and must have
-            // given a packet.
-            assert!(n > 0 || out.len() > before);
-        }
-    }
-    (out, d.buffered())
-}
 
 /// Reads fields for a built packet from the front of the input.
 struct Fields<'a>(&'a [u8]);
@@ -117,76 +87,42 @@ fn build(data: &[u8]) -> Packet {
 }
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Frames::new, data);
-    contract::check_decode(|| Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))), data);
+    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_TCP_FRAME);
+    contract::check_decode_with_alloc_limit(
+        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        data,
+        514,
+    );
     contract::check_wire::<Frame>(data);
-    let envelope = Frame(data.get(..MAX_PACKET + 1).unwrap_or(data).to_vec());
-    contract::check_wire_value(&envelope);
-    if let Ok(bytes) = Wire::to_bytes(&envelope) {
-        contract::check_wire::<Frame>(&bytes);
-    }
+    contract::check_wire::<Packet>(data);
+    contract::check_wire::<Authenticated<0>>(data);
+    contract::check_wire::<Authenticated<20>>(data);
+    contract::check_wire::<Authenticated<32>>(data);
+    contract::check_wire::<Authenticated<64>>(data);
+    contract::check_wire::<Encrypted>(data);
+    contract::check_wire_value(&Frame(data[..data.len().min(MAX_PACKET + 1)].to_vec()));
     for wrapping in WRAPPINGS {
-        contract::check_decode(
-            || Frames::new().map(|frame| Packet::parse(&frame.0, wrapping)),
+        contract::check_decode_with_alloc_limit(
+            || Frames::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
             data,
+            2 * MAX_TCP_FRAME,
         );
     }
-
-    // The bytes as one UDP datagram, read with each wrapping.
-    for w in WRAPPINGS {
-        if let Ok(p) = Packet::parse(data, w) {
-            // A packet read is written back byte for byte.
-            assert_eq!(p.to_bytes().as_deref(), Ok(data));
-            assert_eq!(Packet::parse(data, p.wrapping()), Ok(p.clone()));
-            let tcp = p.to_tcp_bytes().unwrap();
-            let (inner, used) = split_tcp(&tcp).unwrap().unwrap();
-            assert_eq!(inner, data);
-            assert_eq!(used, tcp.len());
-        }
-    }
-
-    // A wrapping with an HMAC too long refuses every control packet.
     let too_long = Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 };
     if let Some(&first) = data.first()
         && data.len() <= MAX_PACKET
         && ControlKind::from_opcode(split_first_byte(first).0).is_some()
     {
-        assert_eq!(Packet::parse(data, too_long), Err(Error::HmacLen(MAX_HMAC_LEN + 1)));
-    } else if let Ok(p) = Packet::parse(data, too_long) {
-        assert_eq!(p.wrapping(), Wrapping::None);
+        assert_eq!(
+            Packet::parse_with(data, too_long),
+            Err(Error::HmacLen(MAX_HMAC_LEN + 1))
+        );
     }
-
-    // The bytes as a TCP stream, split two ways: all at once, and a byte at
-    // a time. Both give the same packets, the same error and the same bytes
-    // left over.
-    let (packets, left) = split_stream(data, data.len().max(1));
-    assert_eq!(split_stream(data, 1), (packets.clone(), left));
-
-    for bytes in packets.iter().flatten() {
-        // A packet taken from the stream frames back the same.
-        let framed = frame(bytes).unwrap();
-        assert_eq!(split_tcp(&framed), Ok(Some((&bytes[..], framed.len()))));
-        for w in WRAPPINGS {
-            if let Ok(p) = Packet::parse(bytes, w) {
-                assert_eq!(p.to_bytes().as_ref(), Ok(bytes));
-            }
-        }
-    }
-
-    // A packet built from the bytes is written and read back as the same
-    // value, or refused.
-    let p = build(data);
-    match p.to_bytes() {
-        Ok(b) => {
-            assert!(!b.is_empty() && b.len() <= MAX_PACKET);
-            assert_eq!(Packet::parse(&b, p.wrapping()), Ok(p.clone()));
-            assert_eq!(p.to_tcp_bytes().map(|t| t[2..].to_vec()), Ok(b));
-        }
-        Err(e) => {
-            assert_eq!(p.to_tcp_bytes(), Err(e));
-            if let EncodeError::KeyId(k) = e {
-                assert!(k > 7);
-            }
-        }
-    }
+    let packet = build(data);
+    contract::check_wire_value(&packet);
+    contract::check_wire_value(&Authenticated::<0>(packet.clone()));
+    contract::check_wire_value(&Authenticated::<20>(packet.clone()));
+    contract::check_wire_value(&Authenticated::<32>(packet.clone()));
+    contract::check_wire_value(&Authenticated::<64>(packet.clone()));
+    contract::check_wire_value(&Encrypted(packet));
 });
