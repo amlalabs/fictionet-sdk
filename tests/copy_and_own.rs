@@ -267,14 +267,19 @@ fn copied_fast_uses_templates_and_the_public_driver() {
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next().unwrap().unwrap(), value);
     assert_eq!(fast::UInt64::parse(&[0x81]).unwrap(), fast::UInt64(1));
-    let mut blocks = Stream::new(fictionet::stdlib::codec::Pipe::new(
-        fast::Blocks,
-        fast::Frames::new(templates),
-        fictionet::stdlib::codec::Carry::Bytes,
-    ));
+    let mut blocks = Stream::new(fast::BlockFrames::new(fast::Frames::new(
+        templates.clone(),
+    )));
     assert_eq!(blocks.push(&[0, 0x82, 0xc0, 0x81]), 4);
-    assert_eq!(
-        blocks.next().unwrap().unwrap(),
-        fictionet::stdlib::codec::Layered::Inner(value)
-    );
+    assert_eq!(blocks.next().unwrap().unwrap(), value);
+    let mut split = Stream::new(fast::BlockFrames::new(fast::Frames::new(
+        templates,
+    )));
+    assert_eq!(split.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
+    assert!(matches!(
+        split.next(),
+        Some(Err(fictionet::stdlib::codec::Fail::Protocol(
+            fast::Error::BlockBoundary
+        )))
+    ));
 }

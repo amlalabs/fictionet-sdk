@@ -2,7 +2,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::{
-    Carry, Pipe, Wire,
+    Wire,
     contract::{check_decode_with_alloc_limit, check_wire, check_wire_value},
     test_support::decode_all,
 };
@@ -56,9 +56,9 @@ fuzz_target!(|data: &[u8]| {
         2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
     );
     check_decode_with_alloc_limit(
-        || Pipe::new(Blocks, Frames::new(templates.clone()), Carry::Bytes),
+        || BlockFrames::new(Frames::new(templates.clone())),
         input,
-        2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+        2 * MAX_MESSAGE_BYTES,
     );
     check_decode_with_alloc_limit(
         || Frames::new(templates.clone()),

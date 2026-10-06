@@ -6,12 +6,14 @@
 //! wire encodings, and appendices 1–2 define the template XML grammar.
 //! No exchange templates or session control protocol are included.
 //!
-//! [`Frames`] reads the message stream of section 10. [`Blocks`] removes
-//! block size headers for `codec::Pipe::new(Blocks, frames, codec::Carry::Bytes)`.
+//! [`Frames`] reads the message stream of section 10. [`BlockFrames`] reads
+//! the block form, `block ::= BlockSize message+`, and refuses a message that
+//! crosses a block boundary. [`Blocks`] yields raw block payloads.
 //! [`Encoder`] writes messages using the same templates. Resets are explicit
 //! and must occur at matching message boundaries at both endpoints (§6.3.1).
 //! Packet feeds usually reset dictionaries per packet. For those feeds, worlds
-//! call `stream.decoder().reset()` between datagrams when using [`Frames`].
+//! call `stream.decoder().reset()` between datagrams when using [`Frames`],
+//! or `stream.decoder().frames().reset()` with [`BlockFrames`].
 //! Primitive units implement [`Wire`]. A message requires template and session
 //! state, so its writer is [`Encoder::write`]. Reportable encoding errors,
 //! including nonminimal encodings, are refused. Block sizes may be overlong (§10).
@@ -112,6 +114,8 @@ pub enum Error {
     Subtraction,
     /// A block has zero payload bytes (§10, D12).
     BlockSize,
+    /// A message does not end within its block (§10).
+    BlockBoundary,
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -2623,19 +2627,46 @@ impl Scanner {
     }
 }
 
-/// Reads the block form of a FAST stream (§10), yielding each block's payload.
+/// Reads one BlockSize header (§10): `Ok(None)` while it is incomplete,
+/// else the header length and the payload size it declares. Refuses zero
+/// (D12), a header longer than [`MAX_INTEGER_BYTES`], and a size above
+/// [`MAX_MESSAGE_BYTES`].
+fn block_header(input: &[u8]) -> Result<Option<(usize, usize)>, Error> {
+    let mut size = 0usize;
+    for at in 0..MAX_INTEGER_BYTES {
+        let Some(&byte) = input.get(at) else {
+            return Ok(None);
+        };
+        size = size
+            .checked_mul(128)
+            .and_then(|n| n.checked_add(usize::from(byte & 0x7f)))
+            .ok_or(Error::Range)?;
+        limit(size, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
+        if byte & 0x80 != 0 {
+            if size == 0 {
+                return Err(Error::BlockSize);
+            }
+            return Ok(Some((add(at, 1)?, size)));
+        }
+    }
+    Err(Error::Limit("MAX_INTEGER_BYTES"))
+}
+
+/// Reads the block form of a FAST stream (§10), yielding each block's raw
+/// payload without reading its messages.
 ///
 /// Block sizes exclude the header and may be overlong. The header is bounded
-/// by [`MAX_INTEGER_BYTES`] and the payload by [`MAX_MESSAGE_BYTES`]. Message
-/// interpretation belongs to [`Frames`]. This decoder keeps no input or state.
+/// by [`MAX_INTEGER_BYTES`] and the payload by [`MAX_MESSAGE_BYTES`]. This
+/// decoder keeps no input or state. To read the messages of a block stream,
+/// use [`BlockFrames`], which also refuses a message that crosses a block
+/// boundary. Joining payloads into one stream (for example with
+/// `codec::Pipe` and `Carry::Bytes`) loses those boundaries.
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Carry, Pipe, Stream}, fast::{Blocks, Frames, Templates}};
-/// let templates = Templates::from_xml(br#"<template
-///     xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Empty" id="1"/>"#)?;
-/// let mut stream = Stream::new(Pipe::new(Blocks, Frames::new(templates), Carry::Bytes));
+/// use fictionet::stdlib::{codec::Stream, fast::Blocks};
+/// let mut stream = Stream::new(Blocks);
 /// assert_eq!(stream.push(&[0x82, 0xc0, 0x81]), 3);
-/// assert!(stream.next().transpose()?.is_some());
+/// assert_eq!(stream.next().transpose()?, Some(vec![0xc0, 0x81]));
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default)]
@@ -2655,29 +2686,106 @@ impl Decode for Blocks {
     /// [`MAX_INTEGER_BYTES`], and a payload above [`MAX_MESSAGE_BYTES`].
     /// Partial headers and payloads return `Need`, including at EOF.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
-        let mut size = 0usize;
-        for at in 0..MAX_INTEGER_BYTES {
-            let Some(&byte) = input.get(at) else {
-                return Ok(Step::Need);
-            };
-            size = size
-                .checked_mul(128)
-                .and_then(|n| n.checked_add(usize::from(byte & 0x7f)))
-                .ok_or(Error::Range)?;
-            limit(size, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
-            if byte & 0x80 != 0 {
-                if size == 0 {
-                    return Err(Error::BlockSize);
-                }
-                let start = add(at, 1)?;
-                let end = add(start, size)?;
-                return Ok(match input.get(start..end) {
-                    Some(payload) => Step::Item(payload.to_vec(), end),
-                    None => Step::Need,
-                });
-            }
+        let Some((start, size)) = block_header(input)? else {
+            return Ok(Step::Need);
+        };
+        let end = add(start, size)?;
+        Ok(match input.get(start..end) {
+            Some(payload) => Step::Item(payload.to_vec(), end),
+            None => Step::Need,
+        })
+    }
+}
+
+/// Reads the messages of a FAST block stream (§10):
+/// `block ::= BlockSize message+`.
+///
+/// Each BlockSize header is skipped, and [`Frames`] reads messages from the
+/// bytes of that block only. A message that would continue past the end of
+/// its block is refused with [`Error::BlockBoundary`], as is a block whose
+/// payload ends inside a message. Block sizes may be overlong. The decoder
+/// holds no input, only the bytes left in the current block and the state
+/// of its [`Frames`].
+///
+/// ```
+/// use fictionet::stdlib::{codec::Stream, fast::{BlockFrames, Error, Frames, Templates}};
+/// let templates = Templates::from_xml(br#"<template
+///     xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Empty" id="1"/>"#)?;
+/// let mut stream = Stream::new(BlockFrames::new(Frames::new(templates.clone())));
+/// assert_eq!(stream.push(&[0x82, 0xc0, 0x81]), 3);
+/// assert!(stream.next().transpose()?.is_some());
+/// // A message split across two blocks is refused.
+/// let mut stream = Stream::new(BlockFrames::new(Frames::new(templates)));
+/// assert_eq!(stream.push(&[0x81, 0xc0, 0x81, 0x81]), 4);
+/// assert!(stream.next().unwrap().is_err());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct BlockFrames {
+    frames: Frames,
+    remaining: usize,
+}
+impl BlockFrames {
+    /// Reads blocks from the start of a stream, each message with `frames`.
+    pub fn new(frames: Frames) -> Self {
+        Self {
+            frames,
+            remaining: 0,
         }
-        Err(Error::Limit("MAX_INTEGER_BYTES"))
+    }
+    /// The message decoder, for resets between messages.
+    pub fn frames(&mut self) -> &mut Frames {
+        &mut self.frames
+    }
+    /// Payload bytes of the current block not yet read as messages. Zero
+    /// between blocks.
+    pub fn remaining(&self) -> usize {
+        self.remaining
+    }
+}
+impl Decode for BlockFrames {
+    type Item = Message;
+    type Error = Error;
+    const NAME: &'static str = "FAST 1.1 block messages";
+
+    /// A message, which never exceeds its block's [`MAX_MESSAGE_BYTES`]
+    /// payload, or a header of at most [`MAX_INTEGER_BYTES`].
+    fn capacity(&self) -> usize {
+        MAX_MESSAGE_BYTES.max(MAX_INTEGER_BYTES)
+    }
+    fn held(&self) -> usize {
+        self.frames.held()
+    }
+    /// Skips a block header, or reads one message from the rest of the
+    /// current block. Refuses what [`Blocks`] and [`Frames`] refuse, and a
+    /// message that does not end within its block ([`Error::BlockBoundary`]).
+    /// Partial headers and partial blocks return `Need`, including at EOF.
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, Error> {
+        if self.remaining == 0 {
+            return Ok(match block_header(input)? {
+                Some((header, size)) => {
+                    self.remaining = size;
+                    Step::Skip(header)
+                }
+                None => Step::Need,
+            });
+        }
+        let block = input
+            .get(..input.len().min(self.remaining))
+            .unwrap_or_default();
+        match self.frames.decode(block, eof)? {
+            Step::Item(message, n) => {
+                self.remaining = self.remaining.checked_sub(n).ok_or(Error::Range)?;
+                Ok(Step::Item(message, n))
+            }
+            Step::Skip(n) => {
+                self.remaining = self.remaining.checked_sub(n).ok_or(Error::Range)?;
+                Ok(Step::Skip(n))
+            }
+            Step::Need if block.len() == self.remaining => Err(Error::BlockBoundary),
+            Step::Need => Ok(Step::Need),
+            Step::End => Ok(Step::End),
+        }
     }
 }
 
@@ -3769,8 +3877,7 @@ mod tests {
         assert_eq!(out, [9]);
     }
     #[test]
-    fn section_10_blocks_allow_overlong_sizes_and_pipe_messages() {
-        use fictionet::stdlib::codec::{Carry, Layered, Pipe};
+    fn section_10_blocks_allow_overlong_sizes_and_frame_messages() {
         // Section 10's BlockSize excludes its own bytes. The second block
         // uses the permitted overlong form of one (§10.6.1).
         let bytes = [0x83, 0xc0, 0x81, 0x80, 0, 0x81, 0x80];
@@ -3784,23 +3891,72 @@ mod tests {
             2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
         );
         let t = templates("<uInt32 name=\"n\"><increment value=\"1\"/></uInt32>");
-        let make = || Pipe::new(Blocks, Frames::new(t.clone()), Carry::Bytes);
+        let make = || BlockFrames::new(Frames::new(t.clone()));
         assert_eq!(
             decode_all(make, &bytes),
             (
-                (1..=3)
-                    .map(|n| Layered::Inner(message(vec![Value::UInt32(n)])))
-                    .collect(),
+                (1..=3).map(|n| message(vec![Value::UInt32(n)])).collect(),
                 None
             )
         );
-        check_decode_with_alloc_limit(make, &bytes, 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES));
+        check_decode_with_alloc_limit(make, &bytes, 2 * MAX_MESSAGE_BYTES);
         for n in 0..=255u8 {
             check_decode_with_alloc_limit(
                 || Blocks,
                 &[n, 0x81, 0x80],
                 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
             );
+        }
+    }
+    #[test]
+    fn block_frames_refuse_messages_that_cross_block_boundaries() {
+        use fictionet::stdlib::codec::Fail;
+        let t = xml_templates(r#"<template name="A" id="1"/>"#);
+        let empty = Message {
+            template_id: 1,
+            fields: Vec::new(),
+        };
+        let make = || BlockFrames::new(Frames::new(t.clone()));
+        // Block 1 holds only the presence map, block 2 the template ID.
+        let split = [0x81, 0xc0, 0x81, 0x81];
+        assert_eq!(
+            decode_all(make, &split),
+            (Vec::new(), Some(Fail::Protocol(Error::BlockBoundary)))
+        );
+        // A whole message, then the start of one that ends in the next block.
+        let tail = [0x83, 0xc0, 0x81, 0xc0, 0x81, 0x81];
+        assert_eq!(
+            decode_all(make, &tail),
+            (
+                vec![empty.clone()],
+                Some(Fail::Protocol(Error::BlockBoundary))
+            )
+        );
+        // A block that ends inside a message at end of input.
+        assert_eq!(
+            decode_all(make, &[0x81, 0xc0]),
+            (Vec::new(), Some(Fail::Protocol(Error::BlockBoundary)))
+        );
+        // A partial block at end of input is truncated, not misframed.
+        assert_eq!(
+            decode_all(make, &[0x82, 0xc0]),
+            (Vec::new(), Some(Fail::Truncated { unread: 1 }))
+        );
+        // Two messages in one block, one in the next.
+        let ok = [0x84, 0xc0, 0x81, 0xc0, 0x81, 0x82, 0xc0, 0x81];
+        assert_eq!(decode_all(make, &ok), (vec![empty; 3], None));
+        let mut decoder = make();
+        assert_eq!(decoder.decode(&ok, false), Ok(Step::Skip(1)));
+        assert_eq!(decoder.remaining(), 4);
+        for input in [
+            &split[..],
+            &tail,
+            &ok,
+            &[0x81, 0xc0],
+            &[0x80],
+            &[0, 0x81, 0x80],
+        ] {
+            check_decode_with_alloc_limit(make, input, 2 * MAX_MESSAGE_BYTES);
         }
     }
     #[test]
