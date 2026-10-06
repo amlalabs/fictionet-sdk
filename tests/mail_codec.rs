@@ -1,86 +1,134 @@
 //! Mail line codecs, mode boundaries, literals, and strict wire values.
 
 use fictionet::stdlib::{
-    codec::{self, Decode, Fail, Step, Stream, Wire, contract, test_support::chunks},
+    codec::{
+        self, Decode, Fail, Step, Stream, Wire, contract,
+        test_support::{chunks, decode_all},
+    },
     imap, pop3, smtp,
 };
 
 #[test]
-fn legacy_imap_event_shape() {
-    let mut decoder = imap::Decoder::new();
-    decoder.feed(b"a LOGIN user {4}\r\n");
-    let event = decoder.next_event().unwrap().unwrap();
-    let size = match event {
-        imap::Event::Command(command) => command.args.len(),
-        imap::Event::Continue { tag, size } => {
-            assert_eq!(tag.as_deref(), Some("a"));
-            size
-        }
-    };
-    assert_eq!(size, 4);
+fn imap_literal_continuation_reports_tag_and_size() {
+    let mut stream = Stream::new(imap::Commands::new());
+    let bytes = b"a LOGIN user {4}\r\n";
+    assert_eq!(stream.push(bytes), bytes.len());
+    assert_eq!(
+        stream.next(),
+        Some(Ok(Ok(imap::Input::Continue {
+            tag: Some("a".into()),
+            size: 4,
+        })))
+    );
 }
 
 #[test]
-fn legacy_pop3_reply_error_shape_and_display() {
-    for error in [
-        pop3::ReplyError::LineTooLong,
-        pop3::ReplyError::BadStatus,
-        pop3::ReplyError::BodyTooLong,
-    ] {
-        let message = match error {
-            pop3::ReplyError::LineTooLong => "reply line too long",
-            pop3::ReplyError::BadStatus => "status is not +OK or -ERR",
-            pop3::ReplyError::BodyTooLong => "reply body too long",
-        };
-        assert_eq!(error.to_string(), message);
-    }
+fn mail_write_errors_share_one_variant_and_phrasing() {
+    assert_eq!(
+        smtp::WriteError::Unwritable.to_string(),
+        "SMTP value cannot be written without changing it"
+    );
+    assert_eq!(
+        pop3::WriteError::Unwritable.to_string(),
+        "POP3 value cannot be written without changing it"
+    );
+    assert_eq!(
+        imap::WriteError::Unwritable.to_string(),
+        "IMAP value cannot be written without changing it"
+    );
+    let mut out = Vec::new();
+    assert_eq!(
+        smtp::Command::new("noop", None).write(&mut out),
+        Err(smtp::WriteError::Unwritable)
+    );
+    assert_eq!(
+        pop3::Command {
+            keyword: "noop".into(),
+            argument: None
+        }
+        .write(&mut out),
+        Err(pop3::WriteError::Unwritable)
+    );
+    assert_eq!(
+        imap::Command::new("bad tag", "NOOP", vec![]).write(&mut out),
+        Err(imap::WriteError::Unwritable)
+    );
 }
 
-fn read<D: Decode>(
-    decoder: D,
-    bytes: &[u8],
-    pattern: &[usize],
-) -> Vec<Result<D::Item, Fail<D::Error>>>
+fn read<D: Decode>(make: impl Fn() -> D, bytes: &[u8]) -> Vec<Result<D::Item, Fail<D::Error>>>
 where
-    D::Error: Clone,
+    D::Item: PartialEq + core::fmt::Debug,
+    D::Error: Clone + PartialEq,
 {
-    read_with(decoder, bytes, pattern, |_, _| {})
+    contract::check_decode(&make, bytes);
+    let (items, failure) = decode_all(&make, bytes);
+    let expected: Vec<_> = items.into_iter().map(Ok).chain(failure.map(Err)).collect();
+    // Preserve the boundary schedules from the protocol and mode-switch cases.
+    for pattern in [
+        &[][..],
+        &[1],
+        &[255, 257],
+        &[11, 5, 2],
+        &[255, 1, 7],
+        &[511, 1, 7],
+        &[3, 7, 1],
+    ] {
+        let mut stream = Stream::new(make());
+        let mut items = Vec::new();
+        for part in chunks(bytes, pattern) {
+            if let Err(error) = codec::pump(&mut stream, part, |item| items.push(Ok(item))) {
+                items.push(Err(error));
+                break;
+            }
+        }
+        if let Err(error) = codec::finish(&mut stream, |item| items.push(Ok(item))) {
+            items.push(Err(error));
+        }
+        assert_eq!(items, expected, "chunk pattern {pattern:?}");
+        assert!(stream.is_done());
+        assert!(stream.next().is_none());
+    }
+    expected
 }
 
 fn read_with<D: Decode>(
-    decoder: D,
+    make: impl Fn() -> D,
     bytes: &[u8],
-    pattern: &[usize],
-    mut between: impl FnMut(&mut D, &D::Item),
+    between: fn(&mut D, &D::Item),
 ) -> Vec<Result<D::Item, Fail<D::Error>>>
 where
-    D::Error: Clone,
+    D::Item: PartialEq + core::fmt::Debug,
+    D::Error: Clone + PartialEq,
 {
-    let mut stream = Stream::new(decoder);
-    let mut items = Vec::new();
-    for mut part in chunks(bytes, pattern) {
-        while !part.is_empty() && !stream.is_done() {
-            let used = stream.push(part);
-            part = part.get(used..).unwrap();
-            while let Some(item) = stream.next() {
-                if let Ok(item) = &item {
-                    between(stream.decoder(), item);
-                }
-                items.push(item);
+    struct World<D: Decode> {
+        decoder: D,
+        between: fn(&mut D, &D::Item),
+    }
+    impl<D: Decode> Decode for World<D> {
+        type Item = D::Item;
+        type Error = D::Error;
+        const NAME: &'static str = D::NAME;
+        fn capacity(&self) -> usize {
+            self.decoder.capacity()
+        }
+        fn held(&self) -> usize {
+            self.decoder.held()
+        }
+        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+            let step = self.decoder.decode(bytes, eof)?;
+            if let Step::Item(item, _) = &step {
+                (self.between)(&mut self.decoder, item);
             }
-            assert!(used > 0 || stream.is_done());
+            Ok(step)
         }
     }
-    stream.end();
-    while let Some(item) = stream.next() {
-        if let Ok(item) = &item {
-            between(stream.decoder(), item);
-        }
-        items.push(item);
-    }
-    assert!(stream.is_done());
-    assert!(stream.next().is_none());
-    items
+    read(
+        || World {
+            decoder: make(),
+            between,
+        },
+        bytes,
+    )
 }
 
 // A test world that accepts each DATA command. Apply its decision on the
@@ -120,7 +168,11 @@ impl Decode for AcceptData {
 fn smtp_chunked_commands_data_and_replies() {
     let wire =
         b"EHLO example.test\r\n!bad\r\nDATA\r\nSubject: x\r\n\r\n..dot\r\n...two\r\n.\r\nNOOP\r\n";
-    contract::check_stack(AcceptData::default, wire);
+    contract::check_decode_with_alloc_limit(
+        AcceptData::default,
+        wire,
+        AcceptData::default().capacity().saturating_mul(2),
+    );
     contract::check_decode_with_held_limit(AcceptData::default, wire, smtp::MAX_DATA);
     let expected = vec![
         Ok(Ok(smtp::Input::Command(smtp::Command::new(
@@ -134,9 +186,7 @@ fn smtp_chunked_commands_data_and_replies() {
         ))),
         Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
     ];
-    for pattern in [&[][..], &[1], &[3, 1, 7], &[512]] {
-        assert_eq!(read(AcceptData::default(), wire, pattern), expected);
-    }
+    assert_eq!(read(AcceptData::default, wire), expected);
     let mut encoded = Vec::new();
     for input in expected
         .iter()
@@ -147,11 +197,15 @@ fn smtp_chunked_commands_data_and_replies() {
                 contract::check_wire_value(command);
                 Wire::write(command, &mut encoded).unwrap();
             }
-            smtp::Input::Message(message) => encoded.extend(smtp::write_data(message).unwrap()),
+            smtp::Input::Message(message) => smtp::Data {
+                bytes: message.clone(),
+            }
+            .write(&mut encoded)
+            .unwrap(),
         }
     }
     assert_eq!(
-        read(AcceptData::default(), &encoded, &[1]),
+        read(AcceptData::default, &encoded),
         expected
             .into_iter()
             .filter(|r| !matches!(r, Ok(Err(_))))
@@ -160,7 +214,12 @@ fn smtp_chunked_commands_data_and_replies() {
 
     let replies = b"250-first\r\n250-..unchanged\r\n250 last\r\nbad\r\n550 refused\r\n";
     contract::check_decode_with_held_limit(smtp::Replies::new, replies, smtp::MAX_REPLY_TEXT);
-    let items = read(smtp::Replies::new(), replies, &[1]);
+    contract::check_decode_with_alloc_limit(
+        smtp::Replies::new,
+        replies,
+        smtp::Replies::new().capacity().saturating_mul(2),
+    );
+    let items = read(smtp::Replies::new, replies);
     assert_eq!(
         items,
         vec![
@@ -175,7 +234,7 @@ fn smtp_chunked_commands_data_and_replies() {
     for reply in items.into_iter().filter_map(|r| r.ok()?.ok()) {
         let wire = Wire::to_bytes(&reply).unwrap();
         contract::check_wire::<smtp::Reply>(&wire);
-        assert_eq!(read(smtp::Replies::new(), &wire, &[1]), vec![Ok(Ok(reply))]);
+        assert_eq!(read(smtp::Replies::new, &wire), vec![Ok(Ok(reply))]);
     }
 }
 
@@ -219,11 +278,13 @@ fn pop3_chunked_expectations_and_dot_stuffing() {
         Ok(Ok(pop3::Output::Reply(pop3::Reply::err("missing")))),
         Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("done")))),
     ];
-    contract::check_stack(pop_replies, bytes);
+    contract::check_decode_with_alloc_limit(
+        pop_replies,
+        bytes,
+        pop_replies().capacity().saturating_mul(2),
+    );
     contract::check_decode_with_held_limit(pop_replies, bytes, pop3::MAX_REPLY_HELD);
-    for pattern in [&[][..], &[1], &[2, 9, 1], &[4096]] {
-        assert_eq!(read(pop_replies(), bytes, pattern), expected);
-    }
+    assert_eq!(read(pop_replies, bytes), expected);
     let mut encoded = Vec::new();
     for item in &expected {
         let pop3::Output::Reply(reply) = item.as_ref().unwrap().as_ref().unwrap() else {
@@ -234,11 +295,15 @@ fn pop3_chunked_expectations_and_dot_stuffing() {
         contract::check_wire::<pop3::Reply>(&wire);
         encoded.extend(wire);
     }
-    assert_eq!(read(pop_replies(), &encoded, &[1]), expected);
+    assert_eq!(read(pop_replies, &encoded), expected);
 
     let commands = b"USER alice\r\n!\r\nRETR 1\r\nQUIT\r\n";
-    contract::check_decode(pop3::Commands::new, commands);
-    let got = read(pop3::Commands::new(), commands, &[1]);
+    contract::check_decode_with_alloc_limit(
+        pop3::Commands::new,
+        commands,
+        (pop3::Commands::new)().capacity().saturating_mul(2),
+    );
+    let got = read(pop3::Commands::new, commands);
     assert_eq!(got.get(1), Some(&Ok(Err(pop3::CommandError::BadKeyword))));
     for item in got.into_iter().filter_map(|r| r.ok()?.ok()) {
         let pop3::Input::Command(command) = item else {
@@ -247,7 +312,7 @@ fn pop3_chunked_expectations_and_dot_stuffing() {
         let wire = Wire::to_bytes(&command).unwrap();
         contract::check_wire::<pop3::Command>(&wire);
         assert_eq!(
-            read(pop3::Commands::new(), &wire, &[1]),
+            read(pop3::Commands::new, &wire),
             vec![Ok(Ok(pop3::Input::Command(command)))]
         );
     }
@@ -296,12 +361,14 @@ fn pop3_expectation_queue_is_explicit_bounded_and_transactional() {
 fn imap_chunked_literals_commands_and_responses() {
     // The first literal contains a line ending. The second is non-synchronizing.
     let bytes = b"a APPEND INBOX {5}\r\nx\r\nyz {3+}\r\nabc\r\nb NOOP\r\ninvalid\r\nc LOGOUT\r\n";
-    contract::check_stack(imap::Commands::new, bytes);
+    contract::check_decode_with_alloc_limit(
+        imap::Commands::new,
+        bytes,
+        imap::Commands::new().capacity().saturating_mul(2),
+    );
     contract::check_decode_with_held_limit(imap::Commands::new, bytes, imap::MAX_HELD);
-    let expected = read(imap::Commands::new(), bytes, &[]);
-    for pattern in [&[1][..], &[3, 1, 7], &[64]] {
-        assert_eq!(read(imap::Commands::new(), bytes, pattern), expected);
-    }
+    let expected = read(imap::Commands::new, bytes);
+    assert_eq!(read(imap::Commands::new, bytes), expected);
     assert!(matches!(
         expected.first(),
         Some(Ok(Ok(imap::Input::Continue { size: 5, .. })))
@@ -332,7 +399,7 @@ fn imap_chunked_literals_commands_and_responses() {
         let bytes = Wire::to_bytes(command).unwrap();
         contract::check_wire::<imap::Command>(&bytes);
         assert_eq!(
-            read(imap::Commands::new(), &bytes, &[1]).last(),
+            read(imap::Commands::new, &bytes).last(),
             Some(&Ok(Ok(imap::Input::Command(command.clone()))))
         );
     }
@@ -350,17 +417,19 @@ fn imap_chunked_literals_commands_and_responses() {
     let mut bytes = Wire::to_bytes(&response).unwrap();
     bytes.extend_from_slice(b"* OK literal-looking text {7}\r\na OK complete\r\n");
     contract::check_decode_with_held_limit(imap::Responses::new, &bytes, imap::MAX_HELD);
-    let replies = read(imap::Responses::new(), &bytes, &[1]);
+    contract::check_decode_with_alloc_limit(
+        imap::Responses::new,
+        &bytes,
+        imap::Responses::new().capacity().saturating_mul(2),
+    );
+    let replies = read(imap::Responses::new, &bytes);
     assert_eq!(replies.first(), Some(&Ok(Ok(response))));
     assert_eq!(replies.len(), 3);
     for reply in replies.into_iter().map(|r| r.unwrap().unwrap()) {
         contract::check_wire_value(&reply);
         let bytes = Wire::to_bytes(&reply).unwrap();
         contract::check_wire::<imap::Response>(&bytes);
-        assert_eq!(
-            read(imap::Responses::new(), &bytes, &[1]),
-            vec![Ok(Ok(reply))]
-        );
+        assert_eq!(read(imap::Responses::new, &bytes), vec![Ok(Ok(reply))]);
     }
 }
 
@@ -382,12 +451,16 @@ fn imap_literal_refusal_zero_length_and_limits() {
         b"a X {0+}\r\n\r\n",
         b"a X {1}\r\nx {0+}\r\n\r\n",
     ] {
-        contract::check_decode(imap::Commands::new, bytes);
+        contract::check_decode_with_alloc_limit(
+            imap::Commands::new,
+            bytes,
+            imap::Commands::new().capacity().saturating_mul(2),
+        );
         contract::check_wire::<imap::Command>(bytes);
         assert!(<imap::Command as Wire>::parse(bytes).is_ok());
     }
     let sync = format!("a X {{{}}}\r\nb NOOP\r\n", imap::MAX_LITERAL + 1);
-    let items = read(imap::Commands::new(), sync.as_bytes(), &[1]);
+    let items = read(imap::Commands::new, sync.as_bytes());
     assert!(matches!(
         items.first(),
         Some(Ok(Err(imap::Error::LiteralTooLarge { waiting: true, .. })))
@@ -398,9 +471,13 @@ fn imap_literal_refusal_zero_length_and_limits() {
     ));
     for size in [imap::MAX_NON_SYNC + 1, imap::MAX_LITERAL + 1] {
         let bytes = format!("a X {{{size}+}}\r\n");
-        contract::check_decode(imap::Commands::new, bytes.as_bytes());
+        contract::check_decode_with_alloc_limit(
+            imap::Commands::new,
+            bytes.as_bytes(),
+            imap::Commands::new().capacity().saturating_mul(2),
+        );
         assert!(matches!(
-            read(imap::Commands::new(), bytes.as_bytes(), &[1]).first(),
+            read(imap::Commands::new, bytes.as_bytes()).first(),
             Some(Err(Fail::Protocol(imap::DecodeError::Limit(_))))
         ));
     }
@@ -410,7 +487,7 @@ fn imap_literal_refusal_zero_length_and_limits() {
         b"a X {0+}\r\n",
     ] {
         assert!(matches!(
-            read(imap::Commands::new(), bytes, &[1]).last(),
+            read(imap::Commands::new, bytes).last(),
             Some(Err(Fail::Protocol(imap::DecodeError::Incomplete)))
         ));
     }
@@ -419,14 +496,14 @@ fn imap_literal_refusal_zero_length_and_limits() {
 #[test]
 fn command_line_errors_recover_and_imap_overflow_ends_streams() {
     assert_eq!(
-        read(smtp::Server::new(), b"NOOP\nQUIT\r\n", &[1]),
+        read(smtp::Server::new, b"NOOP\nQUIT\r\n"),
         vec![
             Ok(Err(smtp::Error::LineEnding)),
             Ok(Ok(smtp::Input::Command(smtp::Command::new("QUIT", None)))),
         ]
     );
     assert_eq!(
-        read(pop3::Commands::new(), b"NOOP\nQUIT\r\n", &[1]),
+        read(pop3::Commands::new, b"NOOP\nQUIT\r\n"),
         vec![
             Ok(Err(pop3::CommandError::BadCharacter)),
             Ok(Ok(pop3::Input::Command(pop3::Command {
@@ -435,7 +512,7 @@ fn command_line_errors_recover_and_imap_overflow_ends_streams() {
             }))),
         ]
     );
-    let imap = read(imap::Commands::new(), b"a NOOP\nb NOOP\r\n", &[1]);
+    let imap = read(imap::Commands::new, b"a NOOP\nb NOOP\r\n");
     assert!(matches!(
         imap.first(),
         Some(Ok(Err(imap::Error::Syntax { .. })))
@@ -443,21 +520,33 @@ fn command_line_errors_recover_and_imap_overflow_ends_streams() {
     assert!(matches!(imap.last(), Some(Ok(Ok(imap::Input::Command(_))))));
 
     let smtp = vec![b'x'; smtp::MAX_LINE];
-    contract::check_decode(smtp::Server::new, &smtp);
+    contract::check_decode_with_alloc_limit(
+        smtp::Server::new,
+        &smtp,
+        smtp::Server::new().capacity().saturating_mul(2),
+    );
     assert!(matches!(
-        read(smtp::Server::new(), &smtp, &[1]).as_slice(),
+        read(smtp::Server::new, &smtp).as_slice(),
         [Ok(Err(smtp::Error::LineTooLong))]
     ));
     let pop = vec![b'x'; pop3::MAX_COMMAND_LINE];
-    contract::check_decode(pop3::Commands::new, &pop);
+    contract::check_decode_with_alloc_limit(
+        pop3::Commands::new,
+        &pop,
+        (pop3::Commands::new)().capacity().saturating_mul(2),
+    );
     assert!(matches!(
-        read(pop3::Commands::new(), &pop, &[1]).as_slice(),
+        read(pop3::Commands::new, &pop).as_slice(),
         [Ok(Err(pop3::CommandError::LineTooLong))]
     ));
     let imap = vec![b'x'; imap::MAX_LINE];
-    contract::check_decode(imap::Commands::new, &imap);
+    contract::check_decode_with_alloc_limit(
+        imap::Commands::new,
+        &imap,
+        imap::Commands::new().capacity().saturating_mul(2),
+    );
     assert!(matches!(
-        read(imap::Commands::new(), &imap, &[1]).as_slice(),
+        read(imap::Commands::new, &imap).as_slice(),
         [Err(Fail::Protocol(imap::DecodeError::Line(
             codec::LineError::TooLong { .. }
         )))]
@@ -520,56 +609,80 @@ fn smtp_exact_limits_and_assembly_errors() {
     let bytes = Wire::to_bytes(&command).unwrap();
     assert_eq!(bytes.len(), smtp::MAX_LINE);
     contract::check_wire::<smtp::Command>(&bytes);
-    contract::check_decode(smtp::Server::new, &bytes);
+    contract::check_decode_with_alloc_limit(
+        smtp::Server::new,
+        &bytes,
+        smtp::Server::new().capacity().saturating_mul(2),
+    );
     let reply = smtp::Reply::new(250, &"x".repeat(smtp::MAX_LINE - 6));
     let bytes = Wire::to_bytes(&reply).unwrap();
     assert_eq!(bytes.len(), smtp::MAX_LINE);
     contract::check_wire::<smtp::Reply>(&bytes);
-    contract::check_decode(smtp::Replies::new, &bytes);
+    contract::check_decode_with_alloc_limit(
+        smtp::Replies::new,
+        &bytes,
+        smtp::Replies::new().capacity().saturating_mul(2),
+    );
 
     let mut message = b".".to_vec();
     message.extend(vec![b'x'; smtp::MAX_DATA_LINE - 3]);
     message.extend_from_slice(b"\r\n");
     let mut bytes = b"DATA\r\n".to_vec();
-    bytes.extend(smtp::write_data(&message).unwrap());
+    smtp::Data {
+        bytes: message.clone(),
+    }
+    .write(&mut bytes)
+    .unwrap();
     bytes.extend_from_slice(b"QUIT\r\n");
-    contract::check_decode(AcceptData::default, &bytes);
-    let items = read(AcceptData::default(), &bytes, &[1]);
+    contract::check_decode_with_alloc_limit(
+        AcceptData::default,
+        &bytes,
+        AcceptData::default().capacity().saturating_mul(2),
+    );
+    let items = read(AcceptData::default, &bytes);
     assert_eq!(items.get(1), Some(&Ok(Ok(smtp::Input::Message(message)))));
     // The extra byte is allowed only when it is a transparency dot.
     let mut oversized = b"DATA\r\n".to_vec();
     oversized.extend(vec![b'x'; smtp::MAX_DATA_LINE - 1]);
     oversized.extend_from_slice(b"\r\n.\r\n");
     assert_eq!(
-        read(AcceptData::default(), &oversized, &[1]).last(),
+        read(AcceptData::default, &oversized).last(),
         Some(&Err(Fail::Protocol(smtp::DecodeError::Limit(
             smtp::Error::LineTooLong
         ))))
     );
     let broken = b"DATA\r\nbad\0line\r\n..valid\r\n.\r\nQUIT\r\n";
-    contract::check_decode(AcceptData::default, broken);
-    let items = read(AcceptData::default(), broken, &[1]);
+    contract::check_decode_with_alloc_limit(
+        AcceptData::default,
+        broken,
+        AcceptData::default().capacity().saturating_mul(2),
+    );
+    let items = read(AcceptData::default, broken);
     assert_eq!(items.get(1), Some(&Ok(Err(smtp::Error::Text))));
     assert!(matches!(items.last(), Some(Ok(Ok(smtp::Input::Command(c)))) if c.verb == "QUIT"));
     assert_eq!(
-        read(AcceptData::default(), b"DATA\r\n", &[1]).last(),
+        read(AcceptData::default, b"DATA\r\n").last(),
         Some(&Err(Fail::Protocol(smtp::DecodeError::Incomplete)))
     );
     assert_eq!(
-        read(smtp::Replies::new(), b"250-continue\r\n", &[1]),
+        read(smtp::Replies::new, b"250-continue\r\n"),
         vec![Err(Fail::Protocol(smtp::DecodeError::Incomplete))]
     );
     let mismatch = b"250-first\r\n550 last\r\n250 next\r\n";
-    contract::check_decode(smtp::Replies::new, mismatch);
+    contract::check_decode_with_alloc_limit(
+        smtp::Replies::new,
+        mismatch,
+        smtp::Replies::new().capacity().saturating_mul(2),
+    );
     assert_eq!(
-        read(smtp::Replies::new(), mismatch, &[1]),
+        read(smtp::Replies::new, mismatch),
         vec![Err(Fail::Protocol(smtp::DecodeError::Reply(
             smtp::Error::ReplyMismatch
         )))]
     );
     let too_many = b"250-\r\n".repeat(smtp::MAX_REPLY_LINES);
     assert_eq!(
-        read(smtp::Replies::new(), &too_many, &[1]),
+        read(smtp::Replies::new, &too_many),
         vec![Err(Fail::Protocol(smtp::DecodeError::Limit(
             smtp::Error::ReplyLines
         )))]
@@ -585,7 +698,11 @@ fn pop3_exact_limits_and_assembly_errors() {
     let bytes = Wire::to_bytes(&command).unwrap();
     assert_eq!(bytes.len(), pop3::MAX_COMMAND_LINE);
     contract::check_wire::<pop3::Command>(&bytes);
-    contract::check_decode(pop3::Commands::new, &bytes);
+    contract::check_decode_with_alloc_limit(
+        pop3::Commands::new,
+        &bytes,
+        (pop3::Commands::new)().capacity().saturating_mul(2),
+    );
     let reply = pop3::Reply::ok(&"x".repeat(pop3::MAX_REPLY_LINE - 6));
     let bytes = Wire::to_bytes(&reply).unwrap();
     assert_eq!(bytes.len(), pop3::MAX_REPLY_LINE);
@@ -602,21 +719,21 @@ fn pop3_exact_limits_and_assembly_errors() {
         replies
     };
     contract::check_wire::<pop3::Reply>(&bytes);
-    contract::check_decode(multi, &bytes);
+    contract::check_decode_with_alloc_limit(multi, &bytes, multi().capacity().saturating_mul(2));
     assert_eq!(
-        read(multi(), &bytes, &[1]),
+        read(multi, &bytes),
         vec![Ok(Ok(pop3::Output::Reply(reply)))]
     );
     assert_eq!(
-        read(multi(), b"+OK x\r\n", &[1]),
+        read(multi, b"+OK x\r\n"),
         vec![Err(Fail::Protocol(pop3::DecodeError::Incomplete))]
     );
     let mut too_long = b"+OK x\r\n".to_vec();
     too_long.extend(vec![b'x'; pop3::MAX_DATA_LINE - 1]);
     too_long.extend_from_slice(b"\r\n.\r\n");
-    contract::check_decode(multi, &too_long);
+    contract::check_decode_with_alloc_limit(multi, &too_long, multi().capacity().saturating_mul(2));
     assert!(matches!(
-        read(multi(), &too_long, &[1]).as_slice(),
+        read(multi, &too_long).as_slice(),
         [Err(Fail::Protocol(pop3::DecodeError::Line(
             codec::LineError::TooLong { .. }
         )))]
@@ -628,18 +745,26 @@ fn pop3_exact_limits_and_assembly_errors() {
         replies
     };
     let broken = b"+OK x\r\nbare\n.\r\n+OK y\r\n";
-    contract::check_decode(expected, broken);
+    contract::check_decode_with_alloc_limit(
+        expected,
+        broken,
+        expected().capacity().saturating_mul(2),
+    );
     assert_eq!(
-        read(expected(), broken, &[1]),
+        read(expected, broken),
         vec![
             Ok(Err(pop3::ReplyItemError::BadBodyLine)),
             Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("y")))),
         ]
     );
     let broken = b"bad\r\n+OK y\r\n";
-    contract::check_decode(expected, broken);
+    contract::check_decode_with_alloc_limit(
+        expected,
+        broken,
+        expected().capacity().saturating_mul(2),
+    );
     assert_eq!(
-        read(expected(), broken, &[1]),
+        read(expected, broken),
         vec![Err(Fail::Protocol(pop3::DecodeError::Reply(
             pop3::ReplyError::BadStatus
         )))]
@@ -657,7 +782,7 @@ fn imap_line_text_and_literal_limits() {
     assert_eq!(bytes.len(), imap::MAX_LINE);
     contract::check_wire::<imap::Command>(&bytes);
     assert!(matches!(
-        read(imap::Commands::new(), &bytes, &[1]).as_slice(),
+        read(imap::Commands::new, &bytes).as_slice(),
         [Ok(Ok(imap::Input::Command(_)))]
     ));
     for (size, non_sync) in [(imap::MAX_LITERAL, false), (imap::MAX_NON_SYNC, true)] {
@@ -672,38 +797,50 @@ fn imap_line_text_and_literal_limits() {
         let bytes = Wire::to_bytes(&command).unwrap();
         contract::check_wire::<imap::Command>(&bytes);
         assert_eq!(
-            read(imap::Commands::new(), &bytes, &[1, 65536]).last(),
+            read(imap::Commands::new, &bytes).last(),
             Some(&Ok(Ok(imap::Input::Command(command))))
         );
     }
     let text = "x".repeat(imap::MAX_TEXT / 2);
     let bytes = format!("a X {text} {{0+}}\r\n {text}\r\n");
     assert_eq!(
-        read(imap::Commands::new(), bytes.as_bytes(), &[1]),
+        read(imap::Commands::new, bytes.as_bytes()),
         vec![Err(Fail::Protocol(imap::DecodeError::Limit(
             imap::Error::TooLong
         )))]
     );
     let bytes = b"a X {999999999999999999999999999999999999+}\r\n";
-    contract::check_decode(imap::Commands::new, bytes);
+    contract::check_decode_with_alloc_limit(
+        imap::Commands::new,
+        bytes,
+        imap::Commands::new().capacity().saturating_mul(2),
+    );
     assert!(matches!(
-        read(imap::Commands::new(), bytes, &[1]).as_slice(),
+        read(imap::Commands::new, bytes).as_slice(),
         [Err(Fail::Protocol(imap::DecodeError::Limit(
             imap::Error::LiteralTooLarge { .. }
         )))]
     ));
     let broken = b"a X {2+}\r\n\0x\r\nb NOOP\r\n";
-    contract::check_decode(imap::Commands::new, broken);
-    let items = read(imap::Commands::new(), broken, &[1]);
+    contract::check_decode_with_alloc_limit(
+        imap::Commands::new,
+        broken,
+        imap::Commands::new().capacity().saturating_mul(2),
+    );
+    let items = read(imap::Commands::new, broken);
     assert!(matches!(
         items.first(),
         Some(Ok(Err(imap::Error::Syntax { .. })))
     ));
     assert!(matches!(items.last(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
     let broken = b"* 1 FETCH (BODY[] {2}\r\nx";
-    contract::check_decode(imap::Responses::new, broken);
+    contract::check_decode_with_alloc_limit(
+        imap::Responses::new,
+        broken,
+        imap::Responses::new().capacity().saturating_mul(2),
+    );
     assert_eq!(
-        read(imap::Responses::new(), broken, &[1]),
+        read(imap::Responses::new, broken),
         vec![Err(Fail::Protocol(imap::DecodeError::Incomplete))]
     );
 }
@@ -711,19 +848,19 @@ fn imap_line_text_and_literal_limits() {
 #[test]
 fn unterminated_lines_fail_once() {
     assert!(matches!(
-        read(smtp::Server::new(), b"NOOP\r", &[1]).as_slice(),
+        read(smtp::Server::new, b"NOOP\r").as_slice(),
         [Err(Fail::Protocol(smtp::DecodeError::Line(
             codec::LineError::Unterminated
         )))]
     ));
     assert!(matches!(
-        read(pop3::Commands::new(), b"NOOP\r", &[1]).as_slice(),
+        read(pop3::Commands::new, b"NOOP\r").as_slice(),
         [Err(Fail::Protocol(pop3::DecodeError::Line(
             codec::LineError::Unterminated
         )))]
     ));
     assert!(matches!(
-        read(imap::Commands::new(), b"a NOOP\r", &[1]).as_slice(),
+        read(imap::Commands::new, b"a NOOP\r").as_slice(),
         [Err(Fail::Protocol(imap::DecodeError::Line(
             codec::LineError::Unterminated
         )))]
@@ -740,15 +877,23 @@ fn unterminated_lines_fail_once() {
 #[test]
 fn imap_bad_line_end_after_a_counted_literal_keeps_sync() {
     let bytes = b"a X {3+}\r\nabc\nb NOOP\r\n";
-    contract::check_decode(imap::Commands::new, bytes);
-    let items = read(imap::Commands::new(), bytes, &[1]);
+    contract::check_decode_with_alloc_limit(
+        imap::Commands::new,
+        bytes,
+        imap::Commands::new().capacity().saturating_mul(2),
+    );
+    let items = read(imap::Commands::new, bytes);
     assert!(
         matches!(items.first(), Some(Ok(Err(imap::Error::Syntax { tag: Some(tag), .. }))) if tag == "a")
     );
     assert!(matches!(items.last(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
     let status = b"* OK text {3}\n* OK next\r\n";
-    contract::check_decode(imap::Responses::new, status);
-    let items = read(imap::Responses::new(), status, &[1]);
+    contract::check_decode_with_alloc_limit(
+        imap::Responses::new,
+        status,
+        imap::Responses::new().capacity().saturating_mul(2),
+    );
+    let items = read(imap::Responses::new, status);
     assert!(matches!(
         items.first(),
         Some(Ok(Err(imap::Error::Syntax { .. })))
@@ -758,9 +903,13 @@ fn imap_bad_line_end_after_a_counted_literal_keeps_sync() {
         Some(&Ok(Ok(imap::Response::greeting("next"))))
     );
     let broken = b"a X {3+}\nabc\r\n";
-    contract::check_decode(imap::Commands::new, broken);
+    contract::check_decode_with_alloc_limit(
+        imap::Commands::new,
+        broken,
+        imap::Commands::new().capacity().saturating_mul(2),
+    );
     assert_eq!(
-        read(imap::Commands::new(), broken, &[1]),
+        read(imap::Commands::new, broken),
         vec![Err(Fail::Protocol(imap::DecodeError::Line(
             codec::LineError::BareLf
         )))]
@@ -803,31 +952,59 @@ fn assemblies_stop_at_named_body_limits() {
 }
 
 #[test]
+fn imap_aggregate_literals_stop_at_the_message_limit() {
+    let mut wire = b"a X".to_vec();
+    let header = format!(" {{{}}}\r\n", imap::MAX_LITERAL);
+    for _ in 0..3 {
+        wire.extend_from_slice(header.as_bytes());
+        wire.extend(std::iter::repeat_n(b'x', imap::MAX_LITERAL));
+    }
+    wire.extend_from_slice(header.as_bytes());
+    wire.extend_from_slice(b"b NOOP\r\n");
+    contract::check_decode_with_alloc_limit(imap::Commands::new, &wire, 2 * imap::MAX_LINE);
+    contract::check_decode_with_held_limit(imap::Commands::new, &wire, imap::MAX_HELD);
+    let items = read(imap::Commands::new, &wire);
+    assert_eq!(items.len(), 5);
+    assert!(
+        matches!(items.get(3), Some(Ok(Err(imap::Error::LiteralTooLarge {
+        size, waiting: true, ..
+    }))) if *size == imap::MAX_LITERAL as u64)
+    );
+    assert!(matches!(items.last(), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
+
+    wire[..3].copy_from_slice(b"* X");
+    contract::check_decode_with_alloc_limit(imap::Responses::new, &wire, 2 * imap::MAX_LINE);
+    contract::check_decode_with_held_limit(imap::Responses::new, &wire, imap::MAX_HELD);
+    assert!(matches!(
+        read(imap::Responses::new, &wire).as_slice(),
+        [Err(Fail::Protocol(imap::DecodeError::Limit(
+            imap::Error::LiteralTooLarge { .. }
+        )))]
+    ));
+}
+
+#[test]
 fn smtp_long_command_recovers() {
     let bytes = [vec![b'X'; 600], b"\r\nNOOP\r\n".to_vec()].concat();
-    for pattern in [&[][..], &[1], &[511, 2, 7]] {
-        assert_eq!(
-            read(smtp::Server::new(), &bytes, pattern),
-            vec![
-                Ok(Err(smtp::Error::LineTooLong)),
-                Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
-            ]
-        );
-    }
+    assert_eq!(
+        read(smtp::Server::new, &bytes),
+        vec![
+            Ok(Err(smtp::Error::LineTooLong)),
+            Ok(Ok(smtp::Input::Command(smtp::Command::new("NOOP", None)))),
+        ]
+    );
 }
 
 #[test]
 fn pop3_long_command_recovers() {
     let bytes = [vec![b'X'; 300], b"\r\nNOOP\r\n".to_vec()].concat();
-    for pattern in [&[][..], &[1], &[254, 2, 7]] {
-        let items = read(pop3::Commands::new(), &bytes, pattern);
-        assert_eq!(
-            items.first(),
-            Some(&Ok(Err(pop3::CommandError::LineTooLong)))
-        );
-        assert!(matches!(items.get(1), Some(Ok(Ok(_)))));
-        assert_eq!(items.len(), 2);
-    }
+    let items = read(pop3::Commands::new, &bytes);
+    assert_eq!(
+        items.first(),
+        Some(&Ok(Err(pop3::CommandError::LineTooLong)))
+    );
+    assert!(matches!(items.get(1), Some(Ok(Ok(_)))));
+    assert_eq!(items.len(), 2);
 }
 
 #[test]
@@ -838,24 +1015,18 @@ fn pop3_auth_answer() {
         b"\r\nQUIT\r\n".to_vec(),
     ]
     .concat();
-    for pattern in [&[][..], &[1], &[255, 1, 7]] {
-        let items = read_with(pop3::Commands::new(), &bytes, pattern, |decoder, item| {
-            if matches!(item, Ok(pop3::Input::Command(c)) if c.keyword == "AUTH") {
-                decoder.expect_line().unwrap();
-            }
-        });
-        assert!(
-            matches!(items.first(), Some(Ok(Ok(pop3::Input::Command(c)))) if c.keyword == "AUTH")
-        );
-        assert_eq!(
-            items.get(1),
-            Some(&Ok(Ok(pop3::Input::Line(vec![b'Y'; 400]))))
-        );
-        assert!(
-            matches!(items.get(2), Some(Ok(Ok(pop3::Input::Command(c)))) if c.keyword == "QUIT")
-        );
-        assert_eq!(items.len(), 3);
-    }
+    let items = read_with(pop3::Commands::new, &bytes, |decoder, item| {
+        if matches!(item, Ok(pop3::Input::Command(c)) if c.keyword == "AUTH") {
+            decoder.expect_line().unwrap();
+        }
+    });
+    assert!(matches!(items.first(), Some(Ok(Ok(pop3::Input::Command(c)))) if c.keyword == "AUTH"));
+    assert_eq!(
+        items.get(1),
+        Some(&Ok(Ok(pop3::Input::Line(vec![b'Y'; 400]))))
+    );
+    assert!(matches!(items.get(2), Some(Ok(Ok(pop3::Input::Command(c)))) if c.keyword == "QUIT"));
+    assert_eq!(items.len(), 3);
 }
 
 #[test]
@@ -863,29 +1034,30 @@ fn pop3_auth_challenge() {
     for size in [600, 1] {
         let challenge = [b"+ ".to_vec(), vec![b'x'; size]].concat();
         let bytes = [challenge.clone(), b"\r\n+OK done\r\n".to_vec()].concat();
-        for pattern in [&[][..], &[1], &[511, 1, 7]] {
+        let replies = || {
             let mut replies = pop3::Replies::new();
             replies.expect(false).unwrap();
             replies.expect(false).unwrap();
             replies.expect_line().unwrap();
-            let items = read_with(replies, &bytes, pattern, |decoder, item| {
-                assert_eq!(
-                    decoder.expected(),
-                    if matches!(item, Ok(pop3::Output::Line(_))) {
-                        2
-                    } else {
-                        1
-                    }
-                );
-            });
+            replies
+        };
+        let items = read_with(replies, &bytes, |decoder, item| {
             assert_eq!(
-                items,
-                vec![
-                    Ok(Ok(pop3::Output::Line(challenge.clone()))),
-                    Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("done")))),
-                ]
+                decoder.expected(),
+                if matches!(item, Ok(pop3::Output::Line(_))) {
+                    2
+                } else {
+                    1
+                }
             );
-        }
+        });
+        assert_eq!(
+            items,
+            vec![
+                Ok(Ok(pop3::Output::Line(challenge.clone()))),
+                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("done")))),
+            ]
+        );
     }
 }
 
@@ -898,19 +1070,15 @@ fn pop3_bad_multiline_status_stops() {
         replies
     };
     let bytes = b"+OK \xff\r\n+OK deleted\r\n.\r\n";
-    for pattern in [&[][..], &[1], &[4, 3, 1]] {
-        let items = read(expected(), bytes, pattern);
-        assert!(matches!(items.as_slice(), [Err(Fail::Protocol(_))]));
-    }
+    let items = read(expected, bytes);
+    assert!(matches!(items.as_slice(), [Err(Fail::Protocol(_))]));
 }
 
 #[test]
 fn smtp_bad_multiline_reply_stops() {
     let bytes = b"250-a\r\n250-\xff\r\n250 c\r\n354 go\r\n";
-    for pattern in [&[][..], &[1], &[4, 3, 1]] {
-        let items = read(smtp::Replies::new(), bytes, pattern);
-        assert!(matches!(items.as_slice(), [Err(Fail::Protocol(_))]));
-    }
+    let items = read(smtp::Replies::new, bytes);
+    assert!(matches!(items.as_slice(), [Err(Fail::Protocol(_))]));
 }
 
 #[test]
@@ -939,16 +1107,14 @@ fn imap_server_non_sync_literals_keep_following_responses() {
         b"* 1 FETCH (BODY[] {3+}\n",
     ] {
         let bytes = [first, b"* OK a\r\n* OK b\r\n"].concat();
-        for pattern in [&[][..], &[1], &[4, 3, 1]] {
-            let items = read(imap::Responses::new(), &bytes, pattern);
-            assert!(matches!(
-                items.first(),
-                Some(Ok(Err(imap::Error::Syntax { .. })))
-            ));
-            assert_eq!(items.get(1), Some(&Ok(Ok(imap::Response::greeting("a")))));
-            assert_eq!(items.get(2), Some(&Ok(Ok(imap::Response::greeting("b")))));
-            assert_eq!(items.len(), 3);
-        }
+        let items = read(imap::Responses::new, &bytes);
+        assert!(matches!(
+            items.first(),
+            Some(Ok(Err(imap::Error::Syntax { .. })))
+        ));
+        assert_eq!(items.get(1), Some(&Ok(Ok(imap::Response::greeting("a")))));
+        assert_eq!(items.get(2), Some(&Ok(Ok(imap::Response::greeting("b")))));
+        assert_eq!(items.len(), 3);
     }
 }
 
@@ -960,24 +1126,17 @@ fn imap_idle_done() {
         ("AUTHENTICATE PLAIN", "*"),
     ] {
         let bytes = format!("a {command}\r\n{answer}\r\nb NOOP\r\n");
-        for pattern in [&[][..], &[1], &[3, 7, 1]] {
-            let items = read_with(
-                imap::Commands::new(),
-                bytes.as_bytes(),
-                pattern,
-                |decoder, item| {
-                    if matches!(item, Ok(imap::Input::Command(c)) if c.tag == "a") {
-                        decoder.expect_line().unwrap();
-                    }
-                },
-            );
-            assert_eq!(
-                items.get(1),
-                Some(&Ok(Ok(imap::Input::Line(answer.as_bytes().to_vec()))))
-            );
-            assert!(matches!(items.get(2), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
-            assert_eq!(items.len(), 3);
-        }
+        let items = read_with(imap::Commands::new, bytes.as_bytes(), |decoder, item| {
+            if matches!(item, Ok(imap::Input::Command(c)) if c.tag == "a") {
+                decoder.expect_line().unwrap();
+            }
+        });
+        assert_eq!(
+            items.get(1),
+            Some(&Ok(Ok(imap::Input::Line(answer.as_bytes().to_vec()))))
+        );
+        assert!(matches!(items.get(2), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
+        assert_eq!(items.len(), 3);
     }
 }
 
@@ -1106,19 +1265,22 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
         let answer = vec![b'Y'; size];
         let wire = [answer.clone(), b"\r\nQUIT\r\n".to_vec()].concat();
         contract::check_decode_with_held_limit(commands, &wire, 0);
-        for pattern in [&[][..], &[1], &[253, 2, 4096]] {
-            let items = read(commands(), &wire, pattern);
-            let first = if size <= pop3::MAX_AUTH_LINE {
-                Ok(pop3::Input::Line(answer.clone()))
-            } else {
-                Err(pop3::CommandError::LineTooLong)
-            };
-            assert_eq!(items.first(), Some(&Ok(first)));
-            assert!(
-                matches!(items.get(1), Some(Ok(Ok(pop3::Input::Command(c)))) if c.keyword == "QUIT")
-            );
-            assert_eq!(items.len(), 2);
-        }
+        contract::check_decode_with_alloc_limit(
+            commands,
+            &wire,
+            commands().capacity().saturating_mul(2),
+        );
+        let items = read(commands, &wire);
+        let first = if size <= pop3::MAX_AUTH_LINE {
+            Ok(pop3::Input::Line(answer.clone()))
+        } else {
+            Err(pop3::CommandError::LineTooLong)
+        };
+        assert_eq!(items.first(), Some(&Ok(first)));
+        assert!(
+            matches!(items.get(1), Some(Ok(Ok(pop3::Input::Command(c)))) if c.keyword == "QUIT")
+        );
+        assert_eq!(items.len(), 2);
         // A server's raw line is a challenge: `+` alone, or `+ ` and data.
         let challenge = match size {
             0 => b"+".to_vec(),
@@ -1126,37 +1288,40 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
         };
         let wire = [challenge.clone(), b"\r\n+OK done\r\n".to_vec()].concat();
         contract::check_decode_with_held_limit(replies, &wire, pop3::MAX_REPLY_HELD);
-        for pattern in [&[][..], &[1], &[511, 2, 4096]] {
-            let items = read(replies(), &wire, pattern);
-            if size <= pop3::MAX_AUTH_LINE {
-                assert_eq!(
-                    items,
-                    vec![
-                        Ok(Ok(pop3::Output::Line(challenge.clone()))),
-                        Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("done")))),
-                    ]
-                );
-            } else {
-                assert_eq!(
-                    items,
-                    vec![Err(Fail::Protocol(pop3::DecodeError::Line(
-                        codec::LineError::TooLong {
-                            max: pop3::MAX_AUTH_LINE
-                        }
-                    )))]
-                );
-            }
+        contract::check_decode_with_alloc_limit(
+            replies,
+            &wire,
+            replies().capacity().saturating_mul(2),
+        );
+        let items = read(replies, &wire);
+        if size <= pop3::MAX_AUTH_LINE {
+            assert_eq!(
+                items,
+                vec![
+                    Ok(Ok(pop3::Output::Line(challenge.clone()))),
+                    Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("done")))),
+                ]
+            );
+        } else {
+            assert_eq!(
+                items,
+                vec![Err(Fail::Protocol(pop3::DecodeError::Line(
+                    codec::LineError::TooLong {
+                        max: pop3::MAX_AUTH_LINE
+                    }
+                )))]
+            );
         }
     }
     // The command and status limits apply again immediately after a raw line.
     let wire = [b"*\r\n".to_vec(), vec![b'X'; 300], b"\r\nNOOP\r\n".to_vec()].concat();
     assert_eq!(
-        read(commands(), &wire, &[1]).get(1),
+        read(commands, &wire).get(1),
         Some(&Ok(Err(pop3::CommandError::LineTooLong)))
     );
     let wire = [b"+ x\r\n".to_vec(), vec![b'X'; 600], b"\r\n".to_vec()].concat();
     assert_eq!(
-        read(replies(), &wire, &[1]).get(1),
+        read(replies, &wire).get(1),
         Some(&Err(Fail::Protocol(pop3::DecodeError::Line(
             codec::LineError::TooLong {
                 max: pop3::MAX_REPLY_LINE - 2
@@ -1168,8 +1333,13 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
     for line in [vec![b'X'; 600], [b"+OK ".as_slice(), &[b'x'; 600]].concat()] {
         let wire = [line, b"\r\n+OK done\r\n".to_vec()].concat();
         contract::check_decode_with_held_limit(replies, &wire, pop3::MAX_REPLY_HELD);
+        contract::check_decode_with_alloc_limit(
+            replies,
+            &wire,
+            replies().capacity().saturating_mul(2),
+        );
         assert_eq!(
-            read(replies(), &wire, &[1]),
+            read(replies, &wire),
             vec![Err(Fail::Protocol(pop3::DecodeError::Line(
                 codec::LineError::TooLong {
                     max: pop3::MAX_REPLY_LINE - 2
@@ -1186,20 +1356,28 @@ fn raw_lines_are_bounded_and_last_for_one_item() {
     for answer in [b"raw {3+}".to_vec(), vec![b'Y'; imap::MAX_LINE - 2], vec![]] {
         let wire = [answer.clone(), b"\r\nb NOOP\r\n".to_vec()].concat();
         contract::check_decode_with_held_limit(commands, &wire, imap::MAX_HELD);
-        for pattern in [&[][..], &[1], &[4096, 1, 2]] {
-            let items = read(commands(), &wire, pattern);
-            assert_eq!(
-                items.first(),
-                Some(&Ok(Ok(imap::Input::Line(answer.clone()))))
-            );
-            assert!(matches!(items.get(1), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
-            assert_eq!(items.len(), 2);
-        }
+        contract::check_decode_with_alloc_limit(
+            commands,
+            &wire,
+            commands().capacity().saturating_mul(2),
+        );
+        let items = read(commands, &wire);
+        assert_eq!(
+            items.first(),
+            Some(&Ok(Ok(imap::Input::Line(answer.clone()))))
+        );
+        assert!(matches!(items.get(1), Some(Ok(Ok(imap::Input::Command(c)))) if c.tag == "b"));
+        assert_eq!(items.len(), 2);
     }
     let wire = [vec![b'Y'; imap::MAX_LINE - 1], b"\r\nb NOOP\r\n".to_vec()].concat();
     contract::check_decode_with_held_limit(commands, &wire, imap::MAX_HELD);
+    contract::check_decode_with_alloc_limit(
+        commands,
+        &wire,
+        commands().capacity().saturating_mul(2),
+    );
     assert_eq!(
-        read(commands(), &wire, &[1]),
+        read(commands, &wire),
         vec![Err(Fail::Protocol(imap::DecodeError::Line(
             codec::LineError::TooLong {
                 max: imap::MAX_LINE - 2
@@ -1220,11 +1398,14 @@ fn reply_parse_reports_invalid_before_trailing() {
             pop3::ReplyError::BadStatus
         )))
     );
-    let mut replies = pop3::Replies::new();
-    replies.expect(false).unwrap();
-    replies.expect(false).unwrap();
+    let replies = || {
+        let mut replies = pop3::Replies::new();
+        replies.expect(false).unwrap();
+        replies.expect(false).unwrap();
+        replies
+    };
     assert_eq!(
-        read(replies, b"abc\r\n+OK x\r\n", &[1]),
+        read(replies, b"abc\r\n+OK x\r\n"),
         vec![
             Ok(Err(pop3::ReplyItemError::Reply(
                 pop3::ReplyError::BadStatus
@@ -1253,12 +1434,11 @@ fn pop3_auth_bare_lf_rejects_one_item_and_keeps_expectation() {
     assert_eq!(stream.decoder().expected(), 0);
     assert!(stream.failed().is_none());
     contract::check_decode_with_held_limit(make, bytes, pop3::MAX_REPLY_HELD);
-    for pattern in [&[][..], &[1], &[5, 1, 2]] {
-        assert_eq!(
-            read(make(), bytes, pattern),
-            vec![Ok(rejected.clone()), Ok(reply.clone())]
-        );
-    }
+    contract::check_decode_with_alloc_limit(make, bytes, make().capacity().saturating_mul(2));
+    assert_eq!(
+        read(make, bytes),
+        vec![Ok(rejected.clone()), Ok(reply.clone())]
+    );
 }
 
 #[test]
@@ -1304,49 +1484,37 @@ fn smtp_reply_code_mismatch_is_invalid_in_exact_parse() {
             <smtp::Reply as Wire>::parse(bytes),
             Err(smtp::ParseError::Invalid(smtp::Error::ReplyMismatch))
         );
-        for pattern in [&[][..], &[1], &[5, 1, 2]] {
-            assert_eq!(
-                read(smtp::Replies::new(), bytes, pattern),
-                vec![Err(Fail::Protocol(smtp::DecodeError::Reply(
-                    smtp::Error::ReplyMismatch
-                )))]
-            );
-        }
+        assert_eq!(
+            read(smtp::Replies::new, bytes),
+            vec![Err(Fail::Protocol(smtp::DecodeError::Reply(
+                smtp::Error::ReplyMismatch
+            )))]
+        );
     }
 }
 
 #[test]
 fn command_eof_skips_overlong_lines_and_rejects_short_partials() {
-    for pattern in [&[][..], &[1], &[255, 257]] {
-        assert_eq!(
-            read(
-                smtp::Server::new(),
-                &vec![b'X'; smtp::MAX_LINE + 1],
-                pattern
-            ),
-            vec![Ok(Err(smtp::Error::LineTooLong))]
-        );
-        assert_eq!(
-            read(
-                pop3::Commands::new(),
-                &vec![b'X'; pop3::MAX_COMMAND_LINE + 1],
-                pattern
-            ),
-            vec![Ok(Err(pop3::CommandError::LineTooLong))]
-        );
-        assert_eq!(
-            read(smtp::Server::new(), b"NOOP\r", pattern),
-            vec![Err(Fail::Protocol(smtp::DecodeError::Line(
-                codec::LineError::Unterminated
-            )))]
-        );
-        assert_eq!(
-            read(pop3::Commands::new(), b"NOOP\r", pattern),
-            vec![Err(Fail::Protocol(pop3::DecodeError::Line(
-                codec::LineError::Unterminated
-            )))]
-        );
-    }
+    assert_eq!(
+        read(smtp::Server::new, &vec![b'X'; smtp::MAX_LINE + 1]),
+        vec![Ok(Err(smtp::Error::LineTooLong))]
+    );
+    assert_eq!(
+        read(pop3::Commands::new, &vec![b'X'; pop3::MAX_COMMAND_LINE + 1]),
+        vec![Ok(Err(pop3::CommandError::LineTooLong))]
+    );
+    assert_eq!(
+        read(smtp::Server::new, b"NOOP\r"),
+        vec![Err(Fail::Protocol(smtp::DecodeError::Line(
+            codec::LineError::Unterminated
+        )))]
+    );
+    assert_eq!(
+        read(pop3::Commands::new, b"NOOP\r"),
+        vec![Err(Fail::Protocol(pop3::DecodeError::Line(
+            codec::LineError::Unterminated
+        )))]
+    );
 }
 
 #[test]
@@ -1358,14 +1526,17 @@ fn smtp_data_line_overflow_has_one_fatal_shape() {
     ] {
         let wire = [b"DATA\r\n".to_vec(), line, b"\r\n.\r\n".to_vec()].concat();
         contract::check_decode_with_held_limit(AcceptData::default, &wire, smtp::MAX_DATA);
-        for pattern in [&[][..], &[1], &[998, 1, 2]] {
-            assert_eq!(
-                read(AcceptData::default(), &wire, pattern).last(),
-                Some(&Err(Fail::Protocol(smtp::DecodeError::Limit(
-                    smtp::Error::LineTooLong
-                ))))
-            );
-        }
+        contract::check_decode_with_alloc_limit(
+            AcceptData::default,
+            &wire,
+            AcceptData::default().capacity().saturating_mul(2),
+        );
+        assert_eq!(
+            read(AcceptData::default, &wire).last(),
+            Some(&Err(Fail::Protocol(smtp::DecodeError::Limit(
+                smtp::Error::LineTooLong
+            ))))
+        );
     }
 }
 
@@ -1375,21 +1546,56 @@ type Pop3ReplyItems =
 /// Reads `bytes` as a client that reads the greeting, then sends `AUTH`
 /// with one raw line selected and `LIST` behind it. Gives the items and the
 /// number of expectations queued after each.
-fn pop3_auth_then_list(bytes: &[u8], pattern: &[usize]) -> (Pop3ReplyItems, Vec<usize>) {
-    let mut replies = pop3::Replies::new();
-    replies.expect(false).unwrap();
-    let mut greeted = false;
-    let mut seen = Vec::new();
-    let items = read_with(replies, bytes, pattern, |decoder, _| {
-        if !greeted {
-            greeted = true;
-            decoder.expect(false).unwrap();
-            decoder.expect_line().unwrap();
-            decoder.expect(true).unwrap();
+fn pop3_auth_then_list(bytes: &[u8]) -> (Pop3ReplyItems, Vec<usize>) {
+    struct AuthThenList {
+        replies: pop3::Replies,
+        greeted: bool,
+        seen: usize,
+    }
+    impl Decode for AuthThenList {
+        type Item = (Result<pop3::Output, pop3::ReplyItemError>, usize);
+        type Error = pop3::DecodeError;
+        const NAME: &'static str = "POP3 AUTH then LIST test world";
+        fn capacity(&self) -> usize {
+            self.replies.capacity()
         }
-        seen.push(decoder.expected());
-    });
-    (items, seen)
+        fn held(&self) -> usize {
+            self.replies.held()
+        }
+        fn decode(&mut self, bytes: &[u8], eof: bool) -> Result<Step<Self::Item>, Self::Error> {
+            Ok(match self.replies.decode(bytes, eof)? {
+                Step::Item(item, used) => {
+                    if !self.greeted {
+                        self.greeted = true;
+                        self.replies.expect(false).unwrap();
+                        self.replies.expect_line().unwrap();
+                        self.replies.expect(true).unwrap();
+                    }
+                    self.seen = self.replies.expected();
+                    Step::Item((item, self.seen), used)
+                }
+                Step::Skip(used) => Step::Skip(used),
+                Step::Need => Step::Need,
+                Step::End => Step::End,
+            })
+        }
+    }
+    let make = || {
+        let mut replies = pop3::Replies::new();
+        replies.expect(false).unwrap();
+        AuthThenList {
+            replies,
+            greeted: false,
+            seen: 0,
+        }
+    };
+    read(make, bytes)
+        .into_iter()
+        .map(|item| {
+            let (item, seen) = item.unwrap();
+            (Ok(item), seen)
+        })
+        .unzip()
 }
 
 #[test]
@@ -1399,18 +1605,16 @@ fn pop3_auth_rejected_at_once_keeps_the_reply_queue() {
     // final reply, and LIST keeps its own expectation.
     let bytes = b"+OK ready\r\n-ERR unsupported\r\n+OK 1 messages\r\n1 120\r\n.\r\n";
     let list = pop3::Reply::ok("1 messages").with_body(b"1 120\r\n".to_vec());
-    for pattern in [&[][..], &[1], &[11, 5, 2]] {
-        let (items, seen) = pop3_auth_then_list(bytes, pattern);
-        assert_eq!(
-            items,
-            vec![
-                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("ready")))),
-                Ok(Ok(pop3::Output::Reply(pop3::Reply::err("unsupported")))),
-                Ok(Ok(pop3::Output::Reply(list.clone()))),
-            ]
-        );
-        assert_eq!(seen, [2, 1, 0]);
-    }
+    let (items, seen) = pop3_auth_then_list(bytes);
+    assert_eq!(
+        items,
+        vec![
+            Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("ready")))),
+            Ok(Ok(pop3::Output::Reply(pop3::Reply::err("unsupported")))),
+            Ok(Ok(pop3::Output::Reply(list.clone()))),
+        ]
+    );
+    assert_eq!(seen, [2, 1, 0]);
 }
 
 #[test]
@@ -1423,17 +1627,15 @@ fn pop3_auth_after_a_challenge_keeps_the_reply_queue() {
     ]
     .concat();
     let list = pop3::Reply::ok("1 messages").with_body(b"1 120\r\n".to_vec());
-    for pattern in [&[][..], &[1], &[11, 5, 2]] {
-        let (items, seen) = pop3_auth_then_list(&bytes, pattern);
-        assert_eq!(
-            items,
-            vec![
-                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("ready")))),
-                Ok(Ok(pop3::Output::Line(challenge.to_vec()))),
-                Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("maildrop locked")))),
-                Ok(Ok(pop3::Output::Reply(list.clone()))),
-            ]
-        );
-        assert_eq!(seen, [2, 2, 1, 0]);
-    }
+    let (items, seen) = pop3_auth_then_list(&bytes);
+    assert_eq!(
+        items,
+        vec![
+            Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("ready")))),
+            Ok(Ok(pop3::Output::Line(challenge.to_vec()))),
+            Ok(Ok(pop3::Output::Reply(pop3::Reply::ok("maildrop locked")))),
+            Ok(Ok(pop3::Output::Reply(list.clone()))),
+        ]
+    );
+    assert_eq!(seen, [2, 2, 1, 0]);
 }

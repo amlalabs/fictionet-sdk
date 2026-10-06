@@ -1,238 +1,107 @@
-//! POP3 commands and replies, as a world playing a mail server or client
-//! reads them.
+//! POP3 commands, reply expectations, AUTH lines, and strict wire values.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::pop3::{
-    Command, CommandDecoder, Commands, MAX_AUTH_LINE, MAX_COMMAND_LINE, MAX_REPLY_HELD, Output,
-    Replies, Reply, ReplyDecoder, ReplyItemError, Request, parse_scan_listing,
-    parse_unique_id_listing, write_scan_listing, write_unique_id_listing,
+    Command, Commands, Input, MAX_AUTH_LINE, MAX_REPLY_HELD, Output, Replies, Reply,
+    ReplyItemError, Request, ScanListing, UniqueIdListing,
 };
 use libfuzzer_sys::fuzz_target;
 
-/// Whether the `i`th reply in the stream has a body if it is `+OK`.
-fn multi_line(i: usize) -> bool {
-    i % 3 != 1
+fn check_reply(reply: &Reply) {
+    contract::check_wire_value(reply);
+    if let Ok(bytes) = reply.to_bytes() {
+        let make = || {
+            let mut replies = Replies::new();
+            replies.expect(reply.body.is_some()).unwrap();
+            replies
+        };
+        contract::check_decode_with_held_limit(make, &bytes, MAX_REPLY_HELD);
+        assert_eq!(
+            decode_all(make, &bytes),
+            (vec![Ok(Output::Reply(reply.clone()))], None)
+        );
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode_with_alloc_limit(Commands::new, data, 2 * (MAX_AUTH_LINE + 2));
     contract::check_decode_with_held_limit(Commands::new, data, 0);
-    contract::check_decode_with_held_limit(
-        || {
-            let mut commands = Commands::new();
-            commands.expect_line().unwrap();
-            commands
-        },
-        data,
-        0,
-    );
-    // AUTH with one raw line selected, then LIST. Only a challenge comes
-    // back raw; any other line is AUTH's final reply.
-    contract::check_decode_with_held_limit(
-        || {
-            let mut replies = Replies::new();
-            replies.expect(false).unwrap();
-            replies.expect_line().unwrap();
-            replies.expect(true).unwrap();
-            replies.map(|item: Result<Output, ReplyItemError>| {
-                if let Ok(Output::Line(line)) = &item {
-                    assert!(line == b"+" || line.starts_with(b"+ "));
-                }
-                item
-            })
-        },
-        data,
-        MAX_REPLY_HELD,
-    );
+    let raw = || {
+        let mut commands = Commands::new();
+        commands.expect_line().unwrap();
+        commands
+    };
+    contract::check_decode_with_alloc_limit(raw, data, 2 * (MAX_AUTH_LINE + 2));
+    let auth = || {
+        let mut replies = Replies::new();
+        replies.expect(false).unwrap();
+        replies.expect_line().unwrap();
+        replies.expect(true).unwrap();
+        replies.map(|item: Result<Output, ReplyItemError>| {
+            if let Ok(Output::Line(line)) = &item {
+                assert!(line == b"+" || line.starts_with(b"+ "));
+            }
+            item
+        })
+    };
+    contract::check_decode_with_alloc_limit(auth, data, 2 * (MAX_AUTH_LINE + 2));
+    contract::check_decode_with_held_limit(auth, data, MAX_REPLY_HELD);
     for multi in [false, true] {
-        contract::check_decode_with_held_limit(
-            || {
-                let mut replies = Replies::new();
-                for _ in 0..4 {
-                    replies.expect(multi).unwrap();
+        let make = || {
+            let mut replies = Replies::new();
+            for _ in 0..4 {
+                replies.expect(multi).unwrap();
+            }
+            replies
+        };
+        contract::check_decode_with_alloc_limit(make, data, 2 * (MAX_AUTH_LINE + 2));
+        contract::check_decode_with_held_limit(make, data, MAX_REPLY_HELD);
+        for item in decode_all(make, data).0 {
+            if let Ok(Output::Reply(reply)) = item {
+                check_reply(&reply);
+                if let Some(code) = &reply.code {
+                    assert!(reply.has_code(code) && reply.has_code(&code.to_ascii_lowercase()));
                 }
-                replies.map(|item: Result<Output, ReplyItemError>| {
-                    if let Ok(Output::Reply(reply)) = &item {
-                        contract::check_wire_value(reply);
-                    }
-                    item
-                })
-            },
-            data,
-            MAX_REPLY_HELD,
-        );
+                if let Some((count, size)) = reply.drop_listing() {
+                    assert_eq!(Reply::stat(count, size).drop_listing(), Some((count, size)));
+                }
+                for line in reply.lines() {
+                    contract::check_wire::<ScanListing>(line);
+                    contract::check_wire::<UniqueIdListing>(line);
+                }
+            }
+        }
     }
     contract::check_wire::<Command>(data);
+    contract::check_wire::<Request>(data);
     contract::check_wire::<Reply>(data);
-    // The stream as commands, split two ways: all at once, and a byte at a
-    // time. A bad line spoils only itself, so every result is kept.
-    let mut whole = CommandDecoder::new();
-    whole.feed(data);
-    let commands: Vec<_> = std::iter::from_fn(|| whole.next_command()).collect();
-    let mut bytewise = CommandDecoder::new();
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        again.extend(std::iter::from_fn(|| bytewise.next_command()));
-        assert!(bytewise.buffered() < MAX_COMMAND_LINE);
-    }
-    assert_eq!(commands, again);
-    // A long run with no line end is not held past MAX_AUTH_LINE bytes.
-    if !data.contains(&b'\n') {
-        let mut long = CommandDecoder::new();
-        long.feed(data);
-        long.feed(data);
-        assert!(long.buffered() <= MAX_AUTH_LINE);
-    }
-
-    for c in commands.iter().flatten() {
-        // A command read can be written, and reads back the same, from
-        // either writer.
-        let mut d = CommandDecoder::new();
-        d.feed(&c.to_bytes());
-        assert_eq!(d.next_command(), Some(Ok(c.clone())));
-        assert_eq!(d.next_command(), None);
-        assert_eq!(c.try_to_bytes(), Ok(c.to_bytes()));
-        if let Ok(req) = Request::from_command(c) {
-            let bytes = req.try_to_bytes().expect("a request read can be written as it is");
-            assert_eq!(bytes, req.to_bytes());
-            let mut d = CommandDecoder::new();
-            d.feed(&bytes);
-            let back = d.next_command().unwrap().unwrap();
-            assert_eq!(Request::from_command(&back), Ok(req));
-        }
-    }
-
-    // The stream as replies, up to the first error, split the same two
-    // ways, with bodies expected as `multi_line` says.
-    let replies = |size: usize| {
-        let mut d = ReplyDecoder::new();
-        let mut out = Vec::new();
-        for chunk in data.chunks(size) {
-            d.feed(chunk);
-            while let Some(r) = d.next_reply(multi_line(out.len())) {
-                let stop = r.is_err();
-                out.push(r);
-                if stop {
-                    return out;
-                }
-            }
-        }
-        out
-    };
-    let got = replies(data.len().max(1));
-    assert_eq!(got, replies(1));
-
-    for r in got.iter().flatten() {
-        let bytes = r.to_bytes();
-        assert_eq!(r.try_to_bytes().as_ref(), Ok(&bytes));
-        let (back, used) = Reply::parse(&bytes, r.body.is_some()).unwrap().unwrap();
-        assert_eq!(&back, r);
-        assert_eq!(used, bytes.len());
-        if let Some(code) = &r.code {
-            assert!(r.has_code(code) && r.has_code(&code.to_ascii_lowercase()));
-        }
-        if let Some((count, octets)) = r.drop_listing() {
-            assert_eq!(
-                Reply::stat(count, octets).drop_listing(),
-                Some((count, octets))
-            );
-        }
-        for line in r.lines() {
-            if let Some((m, o)) = parse_scan_listing(line) {
-                assert_eq!(
-                    parse_scan_listing(write_scan_listing(m, o).as_bytes()),
-                    Some((m, o))
-                );
-            }
-            if let Some((m, u)) = parse_unique_id_listing(line) {
-                let w = write_unique_id_listing(m, &u).expect("a unique-id read can be written");
-                assert_eq!(parse_unique_id_listing(w.as_bytes()), Some((m, u)));
+    contract::check_wire::<ScanListing>(data);
+    contract::check_wire::<UniqueIdListing>(data);
+    for item in decode_all(Commands::new, data).0 {
+        if let Ok(Input::Command(command)) = item {
+            contract::check_wire::<Command>(&command.to_bytes().unwrap());
+            if let Ok(request) = Request::from_command(&command) {
+                contract::check_wire::<Request>(&request.to_bytes().unwrap());
             }
         }
     }
-
-    // Any bytes as one line, or one reply, or one AUTH line.
-    let _ = Command::parse(data);
-    let _ = Reply::parse_line(data);
-    let _ = Reply::parse(data, true);
-    let _ = Reply::parse(data, false);
-    let mut d = ReplyDecoder::new();
-    d.feed(data);
-    while let Some(Ok(_)) = d.next_line() {}
-
-    // Writers never write what readers refuse, with each field chosen on
-    // its own from the input.
-    let half = data.len() / 2;
-    let (a, b) = data.split_at(half);
+    let (a, b) = data.split_at(data.len() / 2);
     let (sa, sb) = (String::from_utf8_lossy(a), String::from_utf8_lossy(b));
     let pick = data.first().copied().unwrap_or(0);
-    let reply = Reply {
-        ok: pick & 1 == 0,
-        code: match (pick >> 1) % 3 {
-            0 => None,
-            1 => Some(sa.to_string()),
-            _ => Some(sb.to_string()),
-        },
-        text: if pick & 8 == 0 { sa.to_string() } else { sb.to_string() },
-        body: match (pick >> 4) % 3 {
-            0 => None,
-            1 => Some(a.to_vec()),
-            _ => Some(data.to_vec()),
-        },
-    };
-    let has_body = reply.ok && reply.body.is_some();
-    contract::check_wire_value(&reply);
-    contract::check_wire_value(&Command {
+    let command = Command {
         keyword: sa.to_string(),
         argument: Some(sb.to_string()),
-    });
-    if let Ok(bytes) = Wire::to_bytes(&reply) {
-        contract::check_decode_with_held_limit(
-            || {
-                let mut replies = Replies::new();
-                replies.expect(has_body).unwrap();
-                replies
-            },
-            &bytes,
-            MAX_REPLY_HELD,
-        );
-    }
-    let bytes = reply.to_bytes();
-    let (back, used) = Reply::parse(&bytes, has_body).unwrap().unwrap();
-    assert_eq!(used, bytes.len());
-    assert_eq!(back.to_bytes(), bytes);
-    if let Ok(strict) = reply.try_to_bytes() {
-        assert_eq!(strict, bytes);
-        assert_eq!(
-            (back.ok, &back.code, &back.text),
-            (reply.ok, &reply.code, &reply.text)
-        );
-    }
-
-    let s = String::from_utf8_lossy(data);
-    let mut d = CommandDecoder::new();
-    d.feed(
-        &Command {
-            keyword: s.to_string(),
-            argument: Some(s.to_string()),
-        }
-        .to_bytes(),
-    );
-    let Some(Ok(back)) = d.next_command() else {
-        panic!("a written command did not read back")
     };
-    // The keyword is written as given, less what it may not hold, or as
-    // NOOP with no argument; never as some other command.
-    let want: String = s
-        .chars()
-        .filter(char::is_ascii_graphic)
-        .map(|c| c.to_ascii_uppercase())
-        .collect();
-    assert!(back.keyword == want || (back.keyword == "NOOP" && back.argument.is_none()));
-    // Typed requests, from any text, write lines the parsers take, and
-    // try_to_bytes writes only what reads back the same.
-    for req in [
+    contract::check_wire_value(&command);
+    check_reply(&Reply {
+        ok: pick & 1 == 0,
+        code: (pick & 2 != 0).then(|| sa.to_string()),
+        text: sb.to_string(),
+        body: (pick & 4 != 0).then(|| data.to_vec()),
+    });
+    for request in [
+        Request::Other(command),
         Request::User(sa.to_string()),
         Request::Pass(sb.to_string()),
         Request::Apop {
@@ -240,18 +109,10 @@ fuzz_target!(|data: &[u8]| {
             digest: [pick; 16],
         },
     ] {
-        let line = req.to_bytes();
-        let c = Command::parse(line.strip_suffix(b"\r\n").unwrap()).unwrap();
-        assert!(Request::from_command(&c).is_ok());
-        if let Some(bytes) = req.try_to_bytes() {
-            let c = Command::parse(bytes.strip_suffix(b"\r\n").unwrap()).unwrap();
-            assert_eq!(Request::from_command(&c), Ok(req));
-        }
+        contract::check_wire_value(&request);
     }
-    if let Some(w) = write_unique_id_listing(std::num::NonZeroU32::MIN, &sa) {
-        assert_eq!(
-            parse_unique_id_listing(w.as_bytes()).map(|(_, u)| u),
-            Some(sa.to_string())
-        );
-    }
+    contract::check_wire_value(&UniqueIdListing {
+        message: std::num::NonZeroU32::MIN,
+        id: sa.to_string(),
+    });
 });

@@ -36,6 +36,7 @@ cargo +nightly fuzz list
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | bytes and constructed values, checked with codec contracts | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | BER/DER elements and writer scripts; checks framing, value readers, DER copies, bounds, and transactional writes | `stdlib::asn1`: ASN.1 BER and DER |
+| `pop3` | commands, replies, AUTH lines, expectations, and listings | `stdlib::pop3`: strict wire values and bounded codec contracts |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | TPKT streams, standalone TPDUs, and input bytes segmented as messages | `cotp`: chunking and EOF, bounded message assembly, class 0 negotiation, error replies, strict TPDU writes, and segmentation round trips |
 | `dhcpv6` | bytes and constructed values, checked with codec contracts | `stdlib::dhcpv6`: DHCPv6 |
@@ -47,7 +48,7 @@ cargo +nightly fuzz list
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | Framed messages with input-selected limits, constructed payloads, header values, and zero-separated header blocks | `grpc`: chunking and EOF, message limits and transactional writes, compression flags, request and rejection round trips, trailers, timeouts, and paths |
-| `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
+| `imap` | commands, responses, literals, raw lines, and refusal decisions | `stdlib::imap`: strict wire values and bounded codec contracts |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
 | `json` | wire values and streams checked with bounded codec contracts | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes and constructed values | `stdlib::kafka`: exact wire values, versioned messages, and bounded codec contracts |
