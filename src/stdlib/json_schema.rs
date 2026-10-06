@@ -1,7 +1,21 @@
 //! Checked JSON schemas for tool arguments, API bodies, and mock values.
 //!
-//! [`Schema`] implements the listed JSON Schema 2020-12 assertions. Unknown
-//! keywords are ignored. `format` is always an annotation, never an assertion.
+//! [`Schema`] supports `type`, `const`, `enum`, numeric bounds and `multipleOf`,
+//! string lengths, array counts, `uniqueItems`, `prefixItems`, `items`, `contains`,
+//! object counts, `properties`, `required`, `additionalProperties`, `propertyNames`,
+//! `dependentRequired`, `dependentSchemas`, `allOf`, `anyOf`, `oneOf`, `not`,
+//! `if`/`then`/`else`, and local `$ref`, `$defs`, and `$anchor`.
+//! Unsupported `unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`,
+//! `$dynamicAnchor`, `$recursiveRef`, and `contentSchema` fail compilation.
+//! Other unknown keywords are ignored.
+//!
+//! `format` is an annotation by default, as in the 2020-12 annotation vocabulary.
+//! This lets callers accept custom formats without inventing assertions.
+//! [`FormatPolicy::Assert`] checks date-time, date, time, email, uuid, uri, ipv4,
+//! ipv6, and hostname. Dates and times use RFC 3339; email uses ASCII mailboxes;
+//! URI uses RFC 3986 syntax. Checks do not perform DNS or network lookups.
+//! Generation uses these formats when a value fits the string length bounds;
+//! otherwise it tries letters, which asserted formats may reject.
 //! There is no regex engine: `pattern` and `patternProperties` are rejected by
 //! default. [`PatternPolicy::Annotate`] records and ignores them, including
 //! their effect on `additionalProperties`. Generation refuses such schemas.
@@ -12,7 +26,9 @@
 //! Out-of-range exponents are errors, including in enum values and instances.
 //! Object order does not affect equality. Duplicate object keys are refused.
 //!
-//! References stay in one document. Pointers and simple anchors are supported;
+//! [`Schema::compile_at`] selects a schema within a document, such as an OpenAPI
+//! component or request body. Only its reachable schemas are compiled.
+//! References stay in that document. Pointers and simple anchors are supported;
 //! `$id` does not establish another resource or change the reference base.
 //! Recursive schemas may descend through instances. Revisiting a schema at the
 //! same instance is a reference-cycle error, even inside `not` or `anyOf`.
@@ -20,11 +36,12 @@
 //!
 //! [`Dialect::OpenApi30`] adds `nullable` for explicit types, boolean exclusive
 //! bounds, single-string types, and Reference Object sibling suppression.
-//! `example`, `default`, and `examples` are generation hints. `discriminator`,
+//! `example`, `default`, and array-valued `examples` are generation hints.
+//! OpenAPI 3.0 ignores non-array `examples`. `discriminator`,
 //! `readOnly`, and `writeOnly` do not assert anything; request/response policy
 //! belongs to the caller. This module performs no I/O.
 
-use fictionet::stdlib::codec::test_support::Lcg;
+use fictionet::stdlib::codec::Lcg;
 use fictionet::stdlib::json::{Number, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,19 +69,30 @@ pub enum Dialect {
 /// let source = Value::Object(vec![("pattern".into(), Value::from("^id-"))]);
 /// let options = Options { patterns: PatternPolicy::Annotate, ..Options::default() };
 /// let schema = Schema::compile_with(&source, options).unwrap();
-/// assert_eq!(schema.validate(&Value::Null).annotations[0].keyword, "pattern");
+/// assert_eq!(schema.annotations()[0].keyword, "pattern");
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PatternPolicy {
     /// Refuse compilation at the unsupported keyword. This is the default.
     #[default]
     Reject,
-    /// Ignore the keyword and expose it in schema and validation annotations.
+    /// Ignore the keyword and expose it in schema annotations.
     /// Generation returns [`GenerationError::UnsupportedPattern`].
     Annotate,
 }
 
-/// Resource bounds. Defaults are also hard ceilings; fields can only lower them.
+/// Whether the common string formats listed in this module are asserted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FormatPolicy {
+    /// Record format as an annotation. Unknown formats always remain annotations.
+    #[default]
+    Annotate,
+    /// Assert date-time, date, time, email, uuid, uri, ipv4, ipv6, and hostname.
+    Assert,
+}
+
+/// Resource bounds. Callers can raise the defaults. Only the documented stack
+/// and decimal arithmetic ceilings are clamped.
 /// Zero is allowed and means no work or storage for that resource.
 ///
 /// ```
@@ -75,17 +103,23 @@ pub enum PatternPolicy {
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// Values in the source schema document, including annotations. Default 16,384.
+    /// Distinct reached source values, including keyword data. Default 16,384.
+    /// Unused definitions and document siblings are excluded.
     pub max_schema_nodes: usize,
     /// Values in an instance. Object names are not nodes. Default 100,000.
     pub max_instance_nodes: usize,
-    /// Sum of string, name, and number bytes plus one per value. Default 1 MiB.
+    /// Sum of string, name, and number bytes plus one per reached source value,
+    /// or per instance value, separately. Default 1 MiB.
     pub max_bytes: usize,
-    /// Value nesting, with the root at zero, before any copying. Default 64.
+    /// Source or instance nesting before copying. Default 128; ceiling 256.
+    /// Each entry or reference target starts at zero. Document ancestors do
+    /// not count. The ceiling bounds recursive value cloning and comparison.
     pub max_depth: usize,
-    /// Simultaneous schema evaluations, including applicators. Default 64.
+    /// Simultaneous evaluations on the explicit stack, including applicators.
+    /// Default 512. Recursive lists fit JSON depth 128.
     pub max_validation_depth: usize,
-    /// Simultaneous reference hops during evaluation. Default 32.
+    /// Reference hops at one instance location. Default 32. The count resets
+    /// on instance descent; `max_validation_depth` also bounds the stack.
     pub max_ref_depth: usize,
     /// Bytes in a JSON Pointer diagnostic or resolved schema path. Default 4,096.
     pub max_pointer_bytes: usize,
@@ -98,18 +132,19 @@ pub struct Limits {
     /// Default 32. The effective budget is the smaller of `max_work` and
     /// this field times `(schema_size + 1) * (instance_size + 1)`.
     pub work_per_pair: usize,
-    /// Absolute decimal exponent, before normalization. Default 10,000.
+    /// Absolute decimal exponent before normalization. Default 10,000;
+    /// ceiling 1,000,000 keeps decimal index arithmetic bounded.
     pub max_number_exponent: usize,
 }
 impl Default for Limits {
-    /// Returns the documented resource ceilings.
+    /// Returns the documented resource defaults.
     fn default() -> Self {
         Self {
             max_schema_nodes: 16_384,
             max_instance_nodes: 100_000,
             max_bytes: 1 << 20,
-            max_depth: 64,
-            max_validation_depth: 64,
+            max_depth: 128,
+            max_validation_depth: 512,
             max_ref_depth: 32,
             max_pointer_bytes: 4096,
             max_errors: 64,
@@ -121,21 +156,9 @@ impl Default for Limits {
 }
 impl Limits {
     fn bounded(mut self) -> Self {
-        let cap = Self::default();
-        macro_rules! clamp { ($($f:ident),*) => { $(self.$f = self.$f.min(cap.$f);)* }; }
-        clamp!(
-            max_schema_nodes,
-            max_instance_nodes,
-            max_bytes,
-            max_depth,
-            max_validation_depth,
-            max_ref_depth,
-            max_pointer_bytes,
-            max_errors,
-            max_work,
-            work_per_pair,
-            max_number_exponent
-        );
+        self.max_depth = self.max_depth.min(256);
+        self.max_number_exponent = self.max_number_exponent.min(1_000_000);
+
         self
     }
 }
@@ -153,6 +176,8 @@ pub struct Options {
     pub dialect: Dialect,
     /// Regex keyword policy. Defaults to rejection.
     pub patterns: PatternPolicy,
+    /// String format policy. Defaults to annotations.
+    pub formats: FormatPolicy,
     /// Shared resource bounds, retained by the compiled schema.
     pub limits: Limits,
 }
@@ -182,6 +207,8 @@ pub enum CompileErrorKind {
     DuplicateKey,
     /// Regex assertions need an explicit annotation-only policy.
     UnsupportedPattern,
+    /// An assertion keyword is not implemented. The string names the keyword.
+    UnsupportedKeyword(String),
     /// A reference names another document.
     ExternalReference,
     /// A fragment, pointer, anchor, or reference target is invalid or missing.
@@ -215,6 +242,8 @@ pub enum ValidationKind {
     FalseSchema,
     /// An assertion failed. The string is its JSON Schema keyword.
     Assertion(&'static str),
+    /// A required property is absent. The string is the missing name.
+    Missing(String),
     /// An instance object repeats a name.
     DuplicateKey,
     /// A schema was revisited without descending to another instance.
@@ -245,7 +274,7 @@ impl std::fmt::Display for ValidationError {
 }
 impl std::error::Error for ValidationError {}
 
-/// A recorded, non-asserting schema keyword.
+/// A recorded format or ignored regex keyword.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Annotation {
     /// Absolute pointer to the keyword.
@@ -256,8 +285,7 @@ pub struct Annotation {
     pub value: Value,
 }
 
-/// Validation output. Annotations describe the compiled schema, including
-/// unused definitions; they are not a record of successful evaluation paths.
+/// Validation output. Static keyword annotations are available from [`Schema::annotations`].
 ///
 /// ```
 /// use fictionet::stdlib::{json::Value, json_schema::Schema};
@@ -267,15 +295,13 @@ pub struct Annotation {
 /// assert_eq!(report.errors[0].instance_path, "");
 /// ```
 #[derive(Debug)]
-pub struct Validation<'a> {
+pub struct Validation {
     /// Failed assertions, or a terminal resource/cycle error.
     pub errors: Vec<ValidationError>,
-    /// Schema annotations, also present when the instance is invalid.
-    pub annotations: &'a [Annotation],
     /// Evaluation stopped early because of policy, an error cap, or a fatal error.
     pub truncated: bool,
 }
-impl Validation<'_> {
+impl Validation {
     /// Whether evaluation completed without any failure.
     pub fn is_valid(&self) -> bool {
         self.errors.is_empty()
@@ -344,6 +370,7 @@ pub enum GenerationError {
     /// All attempted candidates failed assertions or size bounds.
     NoCandidate,
     /// Validation encountered a cycle or exhausted a schema resource bound.
+    /// Work exhaustion is always [`GenerationError::Limit`] with `"work"`.
     Validation(ValidationError),
 }
 impl std::fmt::Display for GenerationError {
@@ -359,9 +386,10 @@ impl std::error::Error for GenerationError {}
 /// Validation preflights input in bounded depth, then evaluates under a shared
 /// work cap. For schema size S and instance size I (nodes plus text bytes),
 /// evaluation performs at most `min(max_work, work_per_pair*(S+1)*(I+1))`
-/// charged operations. Each operation has bounded decimal and pointer costs.
+/// charged operations. Text comparisons and decimal parsing charge bytes read.
 /// Preflight uses ordered sets for duplicate names: O((S+I) log(S+I)) in the
-/// worst case. `uniqueItems`, enum equality, and branch retries spend the same
+/// worst case. `uniqueItems` sorts normalized values in O(n log n) comparisons.
+/// Uniqueness, enum equality, and branch retries spend the same
 /// budget; they can return a limit error instead of finishing a costly check.
 ///
 /// ```
@@ -376,28 +404,73 @@ impl std::error::Error for GenerationError {}
 #[derive(Clone, Debug)]
 pub struct Schema {
     nodes: Vec<Node>,
-    annotations: Vec<Annotation>,
+    paths: Paths,
+    annotations: Vec<StoredAnnotation>,
     options: Options,
     size: usize,
 }
 
+#[derive(Clone, Debug)]
+struct StoredAnnotation {
+    path: usize,
+    keyword: &'static str,
+    value: Value,
+}
+
 #[derive(Clone, Debug, Default)]
 struct Node {
-    path: String,
+    path: usize,
     reject: bool,
     types: Option<u8>,
     constant: Option<Value>,
     enumeration: Option<Vec<Value>>,
-    numbers: BTreeMap<&'static str, Decimal>,
-    counts: BTreeMap<&'static str, Decimal>,
-    single: BTreeMap<&'static str, usize>,
-    groups: BTreeMap<&'static str, Vec<usize>>,
+    minimum: Option<Decimal>,
+    maximum: Option<Decimal>,
+    exclusive_minimum: Option<Decimal>,
+    exclusive_maximum: Option<Decimal>,
+    multiple_of: Option<Decimal>,
+    min_length: Option<Decimal>,
+    max_length: Option<Decimal>,
+    min_items: Option<Decimal>,
+    max_items: Option<Decimal>,
+    min_contains: Option<Decimal>,
+    max_contains: Option<Decimal>,
+    min_properties: Option<Decimal>,
+    max_properties: Option<Decimal>,
+    items: Option<usize>,
+    contains: Option<usize>,
+    additional_properties: Option<usize>,
+    property_names: Option<usize>,
+    not: Option<usize>,
+    condition: Option<usize>,
+    then_schema: Option<usize>,
+    else_schema: Option<usize>,
+    prefix_items: Option<Vec<usize>>,
+    all_of: Option<Vec<usize>>,
+    any_of: Option<Vec<usize>>,
+    one_of: Option<Vec<usize>>,
     properties: BTreeMap<String, usize>,
     required: Vec<String>,
     dependent: BTreeMap<String, Vec<String>>,
+    dependent_schemas: BTreeMap<String, usize>,
+    format: Option<String>,
     unique: bool,
     reference: Option<usize>,
     hints: Vec<Value>,
+}
+
+impl Node {
+    fn numeric_bounds(&self) -> impl Iterator<Item = (&'static str, &Decimal)> {
+        [
+            ("minimum", self.minimum.as_ref()),
+            ("maximum", self.maximum.as_ref()),
+            ("exclusiveMinimum", self.exclusive_minimum.as_ref()),
+            ("exclusiveMaximum", self.exclusive_maximum.as_ref()),
+            ("multipleOf", self.multiple_of.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(key, bound)| bound.map(|bound| (key, bound)))
+    }
 }
 
 fn pointer(base: &str, token: &str, max: usize) -> Result<String, &'static str> {
@@ -697,44 +770,353 @@ fn type_bit(s: &str) -> Option<u8> {
     }
 }
 
+// Each source edge is stored once. Complete pointers are made for reports only.
+#[derive(Clone, Debug)]
+struct Location {
+    parent: Option<usize>,
+    token: String,
+    bytes: usize,
+}
+#[derive(Clone, Debug, Default)]
+struct Paths(Vec<Location>);
+impl Paths {
+    fn root(&mut self) -> usize {
+        let id = self.0.len();
+        self.0.push(Location {
+            parent: None,
+            token: String::new(),
+            bytes: 0,
+        });
+        id
+    }
+    fn child(&mut self, parent: usize, token: &str, max: usize) -> Result<usize, &'static str> {
+        let bytes = token.bytes().try_fold(
+            self.0[parent]
+                .bytes
+                .checked_add(1)
+                .ok_or("max_pointer_bytes")?,
+            |n, b| {
+                n.checked_add(if matches!(b, b'~' | b'/') { 2 } else { 1 })
+                    .ok_or("max_pointer_bytes")
+            },
+        )?;
+        if bytes > max {
+            return Err("max_pointer_bytes");
+        }
+        let id = self.0.len();
+        self.0.push(Location {
+            parent: Some(parent),
+            token: token.into(),
+            bytes,
+        });
+        Ok(id)
+    }
+    fn render(&self, mut id: usize) -> String {
+        let mut tokens = Vec::new();
+        let mut out = String::with_capacity(self.0[id].bytes);
+        while let Some(parent) = self.0[id].parent {
+            tokens.push(self.0[id].token.as_str());
+            id = parent;
+        }
+        for token in tokens.into_iter().rev() {
+            out.push('/');
+            for ch in token.chars() {
+                match ch {
+                    '~' => out.push_str("~0"),
+                    '/' => out.push_str("~1"),
+                    _ => out.push(ch),
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SourceKind {
+    Schema,
+    Map,
+    Array,
+    Data,
+    Definitions,
+}
+impl SourceKind {
+    fn child(self, key: &str) -> Self {
+        match self {
+            Self::Map | Self::Array => Self::Schema,
+            Self::Schema => match key {
+                "$defs" | "definitions" => Self::Definitions,
+                "properties" | "dependentSchemas" | "patternProperties" => Self::Map,
+                "prefixItems" | "allOf" | "anyOf" | "oneOf" => Self::Array,
+                "items"
+                | "contains"
+                | "additionalProperties"
+                | "propertyNames"
+                | "not"
+                | "if"
+                | "then"
+                | "else" => Self::Schema,
+                _ => Self::Data,
+            },
+            _ => Self::Data,
+        }
+    }
+}
+
 struct Compiler<'a> {
     root: &'a Value,
     options: Options,
-    queue: Vec<(&'a Value, String)>,
-    ids: BTreeMap<String, usize>,
+    queue: Vec<(&'a Value, usize)>,
+    ids: BTreeMap<*const Value, usize>,
+    locations: BTreeMap<*const Value, usize>,
+    checked: BTreeSet<*const Value>,
+    paths: Paths,
+    size: usize,
     anchors: BTreeMap<String, usize>,
     refs: Vec<(usize, String)>,
     nodes: Vec<Node>,
-    annotations: Vec<Annotation>,
+    annotations: Vec<StoredAnnotation>,
     work: Work,
 }
 impl<'a> Compiler<'a> {
-    fn error(&self, path: &str, kind: CompileErrorKind) -> CompileError {
+    fn error(&self, path: usize, kind: CompileErrorKind) -> CompileError {
         CompileError {
-            schema_path: path.into(),
+            schema_path: self.paths.render(path),
             kind,
         }
     }
-    fn path(&self, base: &str, token: &str) -> Result<String, CompileError> {
-        pointer(base, token, self.options.limits.max_pointer_bytes)
-            .map_err(|s| self.error(base, CompileErrorKind::Limit(s)))
-    }
-    fn enqueue(&mut self, value: &'a Value, path: String) -> Result<usize, CompileError> {
-        self.work
-            .spend(1)
-            .map_err(|s| self.error(&path, CompileErrorKind::Limit(s)))?;
-        if let Some(&id) = self.ids.get(&path) {
+    fn location(
+        &mut self,
+        value: &'a Value,
+        parent: usize,
+        token: &str,
+    ) -> Result<usize, CompileError> {
+        if let Some(&id) = self.locations.get(&(value as *const Value)) {
             return Ok(id);
         }
-        if self.queue.len() >= self.options.limits.max_schema_nodes {
-            return Err(self.error(&path, CompileErrorKind::Limit("max_schema_nodes")));
+        let id = self
+            .paths
+            .child(parent, token, self.options.limits.max_pointer_bytes)
+            .map_err(|s| self.error(parent, CompileErrorKind::Limit(s)))?;
+        self.locations.insert(value, id);
+        Ok(id)
+    }
+    fn at(&self, value: &Value) -> usize {
+        self.locations[&(value as *const Value)]
+    }
+    fn spend(&mut self, amount: usize, path: usize) -> Result<(), CompileError> {
+        self.work
+            .spend(amount)
+            .map_err(|s| self.error(path, CompileErrorKind::Limit(s)))
+    }
+    fn inspect(&mut self, value: &'a Value, path: usize) -> Result<(), CompileError> {
+        let mut stack = vec![(value, path, 0usize, SourceKind::Schema)];
+        while let Some((v, p, depth, kind)) = stack.pop() {
+            if matches!(kind, SourceKind::Definitions) {
+                continue;
+            }
+            if !self.checked.insert(v as *const Value) {
+                continue;
+            }
+            let l = self.options.limits;
+            if depth > l.max_depth {
+                return Err(self.error(p, CompileErrorKind::Limit("max_depth")));
+            }
+            if self.checked.len() > l.max_schema_nodes {
+                return Err(self.error(p, CompileErrorKind::Limit("max_schema_nodes")));
+            }
+            let text_bytes = match v {
+                Value::String(s) => s.len(),
+                Value::Number(n) => n.text().len(),
+                _ => 0,
+            };
+            let bytes = text_bytes
+                .checked_add(1)
+                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("max_bytes")))?;
+            self.size = self
+                .size
+                .checked_add(bytes)
+                .filter(|&n| n <= l.max_bytes)
+                .ok_or_else(|| self.error(p, CompileErrorKind::Limit("max_bytes")))?;
+            self.spend(bytes, p)?;
+            if let Value::Number(n) = v {
+                Decimal::new(n, &l).map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+            }
+            let children = match v {
+                Value::Array(a) => a.len(),
+                Value::Object(o) if matches!(kind, SourceKind::Schema) => {
+                    let ref_only =
+                        self.options.dialect == Dialect::OpenApi30 && v.get("$ref").is_some();
+                    o.iter()
+                        .filter(|(key, _)| {
+                            (!ref_only || key == "$ref")
+                                && !matches!(kind.child(key), SourceKind::Definitions)
+                        })
+                        .count()
+                }
+                Value::Object(o) => o.len(),
+                _ => 0,
+            };
+            if children
+                > l.max_schema_nodes
+                    .saturating_sub(self.checked.len())
+                    .saturating_sub(stack.len())
+            {
+                return Err(self.error(p, CompileErrorKind::Limit("max_schema_nodes")));
+            }
+            match v {
+                Value::Array(a) => {
+                    for (i, child) in a.iter().enumerate().rev() {
+                        let at = self.location(child, p, &i.to_string())?;
+                        stack.push((child, at, depth + 1, kind.child("")));
+                    }
+                }
+                Value::Object(o) => {
+                    let ref_only = matches!(kind, SourceKind::Schema)
+                        && self.options.dialect == Dialect::OpenApi30
+                        && v.get("$ref").is_some();
+                    let mut names = BTreeSet::new();
+                    for (key, child) in o.iter().rev() {
+                        if ref_only && key != "$ref" {
+                            continue;
+                        }
+                        self.size = self
+                            .size
+                            .checked_add(key.len())
+                            .filter(|&n| n <= l.max_bytes)
+                            .ok_or_else(|| self.error(p, CompileErrorKind::Limit("max_bytes")))?;
+                        self.spend(key.len().saturating_add(1), p)?;
+                        let at = self.location(child, p, key)?;
+                        if !names.insert(key) {
+                            return Err(self.error(at, CompileErrorKind::DuplicateKey));
+                        }
+                        let child_kind = kind.child(key);
+                        if !matches!(child_kind, SourceKind::Definitions) {
+                            stack.push((child, at, depth + 1, child_kind));
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
+        Ok(())
+    }
+    fn enqueue(&mut self, value: &'a Value, path: usize) -> Result<usize, CompileError> {
+        self.spend(1, path)?;
+        if let Some(&id) = self.ids.get(&(value as *const Value)) {
+            return Ok(id);
+        }
+        self.inspect(value, path)?;
         let id = self.queue.len();
-        self.ids.insert(path.clone(), id);
+        self.ids.insert(value, id);
         self.queue.push((value, path));
         Ok(id)
     }
-    fn names(&self, v: &Value, p: &str) -> Result<Vec<String>, CompileError> {
+    fn resolve(&mut self, pointer: &str) -> Result<(&'a Value, usize), CompileErrorKind> {
+        use CompileErrorKind::{InvalidReference, Limit};
+        if pointer.len() > self.options.limits.max_pointer_bytes {
+            return Err(Limit("max_pointer_bytes"));
+        }
+        let mut value = self.root;
+        let mut path = 0;
+        if pointer.is_empty() {
+            return Ok((value, path));
+        }
+        for part in pointer
+            .strip_prefix('/')
+            .ok_or(InvalidReference)?
+            .split('/')
+        {
+            self.work
+                .spend(part.len().saturating_add(1))
+                .map_err(Limit)?;
+            let mut token = String::new();
+            let mut chars = part.chars();
+            while let Some(ch) = chars.next() {
+                token.push(if ch == '~' {
+                    match chars.next().ok_or(InvalidReference)? {
+                        '0' => '~',
+                        '1' => '/',
+                        _ => return Err(InvalidReference),
+                    }
+                } else {
+                    ch
+                });
+            }
+            value = match value {
+                Value::Object(o) => {
+                    let mut found = None;
+                    for (key, v) in o {
+                        self.work
+                            .spend(key.len().min(token.len()).saturating_add(1))
+                            .map_err(Limit)?;
+                        if key == &token {
+                            if found.is_some() {
+                                return Err(CompileErrorKind::DuplicateKey);
+                            }
+                            found = Some(v);
+                        }
+                    }
+                    found.ok_or(InvalidReference)?
+                }
+                Value::Array(a) => {
+                    if token.is_empty()
+                        || (token.len() > 1 && token.starts_with('0'))
+                        || !token.bytes().all(|b| b.is_ascii_digit())
+                    {
+                        return Err(InvalidReference);
+                    }
+                    a.get(token.parse::<usize>().map_err(|_| InvalidReference)?)
+                        .ok_or(InvalidReference)?
+                }
+                _ => return Err(InvalidReference),
+            };
+            path = self.location(value, path, &token).map_err(|e| e.kind)?;
+        }
+        Ok((value, path))
+    }
+    // Anchor lookup is lazy. Pointer-only entry points never scan the document.
+    fn anchor_pointer(&mut self, anchor: &str) -> Result<String, CompileErrorKind> {
+        use CompileErrorKind::{InvalidAnchor, InvalidReference, Limit};
+        let mut found = None;
+        let mut stack = vec![(self.root, 0usize)];
+        let mut tokens: Vec<String> = Vec::new();
+        while let Some((v, next)) = stack.last_mut() {
+            self.work.spend(1).map_err(Limit)?;
+            if *next == 0
+                && let Some(name) = v.get("$anchor").and_then(Value::as_str)
+            {
+                self.work.spend(name.len()).map_err(Limit)?;
+                if name == anchor {
+                    if found.is_some() {
+                        return Err(InvalidAnchor);
+                    }
+                    let mut p = String::new();
+                    for token in &tokens {
+                        p = pointer(&p, token, self.options.limits.max_pointer_bytes)
+                            .map_err(Limit)?;
+                    }
+                    found = Some(p);
+                }
+            }
+            let child = match v {
+                Value::Object(o) => o.get(*next).map(|(k, v)| (k.clone(), v)),
+                Value::Array(a) => a.get(*next).map(|v| (next.to_string(), v)),
+                _ => None,
+            };
+            if let Some((token, child)) = child {
+                *next += 1;
+                self.work.spend(token.len()).map_err(Limit)?;
+                tokens.push(token);
+                stack.push((child, 0));
+            } else {
+                stack.pop();
+                tokens.pop();
+            }
+        }
+        found.ok_or(InvalidReference)
+    }
+    fn names(&self, v: &Value, p: usize) -> Result<Vec<String>, CompileError> {
         let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
         let a = v.as_array().ok_or_else(invalid)?;
         let mut seen = BTreeSet::new();
@@ -748,10 +1130,45 @@ impl<'a> Compiler<'a> {
         }
         Ok(names)
     }
+    fn numeric(
+        &self,
+        v: &Value,
+        p: usize,
+        positive: bool,
+        exclusive: bool,
+    ) -> Result<Option<Decimal>, CompileError> {
+        let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
+        if exclusive && self.options.dialect == Dialect::OpenApi30 {
+            v.as_bool().ok_or_else(invalid)?;
+            return Ok(None);
+        }
+        let n = Decimal::new(v.as_number().ok_or_else(invalid)?, &self.options.limits)
+            .map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+        if positive && (n.negative || n.digits.is_empty()) {
+            return Err(invalid());
+        }
+        Ok(Some(n))
+    }
+    fn count(&self, v: &Value, p: usize) -> Result<Decimal, CompileError> {
+        let invalid = || self.error(p, CompileErrorKind::InvalidKeyword);
+        let n = Decimal::new(v.as_number().ok_or_else(invalid)?, &self.options.limits)
+            .map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
+        if n.negative || !n.integer() {
+            return Err(invalid());
+        }
+        Ok(n)
+    }
+    fn group(&mut self, v: &'a Value, p: usize) -> Result<Vec<usize>, CompileError> {
+        let a = v
+            .as_array()
+            .filter(|a| !a.is_empty())
+            .ok_or_else(|| self.error(p, CompileErrorKind::InvalidKeyword))?;
+        a.iter().map(|v| self.enqueue(v, self.at(v))).collect()
+    }
     fn node(&mut self, id: usize) -> Result<Node, CompileError> {
-        let (value, path) = self.queue[id].clone();
+        let (value, path) = self.queue[id];
         let mut node = Node {
-            path: path.clone(),
+            path,
             ..Node::default()
         };
         if let Value::Bool(b) = value {
@@ -760,19 +1177,19 @@ impl<'a> Compiler<'a> {
         }
         let object = value
             .as_object()
-            .ok_or_else(|| self.error(&path, CompileErrorKind::InvalidKeyword))?;
+            .ok_or_else(|| self.error(path, CompileErrorKind::InvalidKeyword))?;
         // OAS 3.0 Reference Objects have no effective siblings.
         let ref_only = self.options.dialect == Dialect::OpenApi30 && value.get("$ref").is_some();
         for (key, v) in object {
-            let p = self.path(&path, key)?;
-            self.work
-                .spend(key.len().saturating_add(1))
-                .map_err(|s| self.error(&p, CompileErrorKind::Limit(s)))?;
             if ref_only && key != "$ref" {
                 continue;
             }
+            let p = self.location(v, path, key)?;
+            self.work
+                .spend(key.len().saturating_add(1))
+                .map_err(|s| self.error(p, CompileErrorKind::Limit(s)))?;
             let invalid = || CompileError {
-                schema_path: p.clone(),
+                schema_path: self.paths.render(p),
                 kind: CompileErrorKind::InvalidKeyword,
             };
             match key.as_str() {
@@ -809,122 +1226,78 @@ impl<'a> Compiler<'a> {
                     node.enumeration = Some(v.as_array().ok_or_else(invalid)?.to_vec());
                 }
                 "const" => node.constant = Some(v.clone()),
-                "minimum" | "maximum" | "multipleOf" | "exclusiveMinimum" | "exclusiveMaximum" => {
-                    let k = match key.as_str() {
-                        "minimum" => "minimum",
-                        "maximum" => "maximum",
-                        "multipleOf" => "multipleOf",
-                        "exclusiveMinimum" => "exclusiveMinimum",
-                        _ => "exclusiveMaximum",
-                    };
-                    if self.options.dialect == Dialect::OpenApi30 && k.starts_with("exclusive") {
-                        v.as_bool().ok_or_else(invalid)?;
-                    } else {
-                        let n =
-                            Decimal::new(v.as_number().ok_or_else(invalid)?, &self.options.limits)
-                                .map_err(|s| self.error(&p, CompileErrorKind::Limit(s)))?;
-                        if k == "multipleOf" && (n.negative || n.digits.is_empty()) {
-                            return Err(invalid());
-                        }
-                        node.numbers.insert(k, n);
-                    }
-                }
-                "minLength" | "maxLength" | "minItems" | "maxItems" | "minContains"
-                | "maxContains" | "minProperties" | "maxProperties" => {
-                    let k = match key.as_str() {
-                        "minLength" => "minLength",
-                        "maxLength" => "maxLength",
-                        "minItems" => "minItems",
-                        "maxItems" => "maxItems",
-                        "minContains" => "minContains",
-                        "maxContains" => "maxContains",
-                        "minProperties" => "minProperties",
-                        _ => "maxProperties",
-                    };
-                    let n = Decimal::new(v.as_number().ok_or_else(invalid)?, &self.options.limits)
-                        .map_err(|s| self.error(&p, CompileErrorKind::Limit(s)))?;
-                    if n.negative || !n.integer() {
-                        return Err(invalid());
-                    }
-                    node.counts.insert(k, n);
-                }
+                "minimum" => node.minimum = self.numeric(v, p, false, false)?,
+                "maximum" => node.maximum = self.numeric(v, p, false, false)?,
+                "exclusiveMinimum" => node.exclusive_minimum = self.numeric(v, p, false, true)?,
+                "exclusiveMaximum" => node.exclusive_maximum = self.numeric(v, p, false, true)?,
+                "multipleOf" => node.multiple_of = self.numeric(v, p, true, false)?,
+                "minLength" => node.min_length = Some(self.count(v, p)?),
+                "maxLength" => node.max_length = Some(self.count(v, p)?),
+                "minItems" => node.min_items = Some(self.count(v, p)?),
+                "maxItems" => node.max_items = Some(self.count(v, p)?),
+                "minContains" => node.min_contains = Some(self.count(v, p)?),
+                "maxContains" => node.max_contains = Some(self.count(v, p)?),
+                "minProperties" => node.min_properties = Some(self.count(v, p)?),
+                "maxProperties" => node.max_properties = Some(self.count(v, p)?),
                 "uniqueItems" => node.unique = v.as_bool().ok_or_else(invalid)?,
-                "required" => node.required = self.names(v, &p)?,
+                "required" => node.required = self.names(v, p)?,
                 "dependentRequired" => {
                     for (name, required) in v.as_object().ok_or_else(invalid)? {
                         node.dependent
-                            .insert(name.clone(), self.names(required, &self.path(&p, name)?)?);
+                            .insert(name.clone(), self.names(required, self.at(required))?);
                     }
                 }
-                "properties" | "$defs" | "patternProperties" => {
+                "$defs" | "definitions" => {
+                    v.as_object().ok_or_else(invalid)?;
+                }
+                "properties" | "dependentSchemas" | "patternProperties" => {
                     let entries = v.as_object().ok_or_else(invalid)?;
                     if key == "patternProperties" {
                         if self.options.patterns == PatternPolicy::Reject {
-                            return Err(self.error(&p, CompileErrorKind::UnsupportedPattern));
+                            return Err(self.error(p, CompileErrorKind::UnsupportedPattern));
                         }
-                        self.annotations.push(Annotation {
-                            schema_path: p.clone(),
+                        self.annotations.push(StoredAnnotation {
+                            path: p,
                             keyword: "patternProperties",
                             value: v.clone(),
                         });
                     }
                     for (name, child) in entries {
-                        let at = self.enqueue(child, self.path(&p, name)?)?;
+                        let at = self.enqueue(child, self.at(child))?;
                         if key == "properties" {
                             node.properties.insert(name.clone(), at);
+                        } else if key == "dependentSchemas" {
+                            node.dependent_schemas.insert(name.clone(), at);
                         }
                     }
                 }
-                "items"
-                | "contains"
-                | "additionalProperties"
-                | "propertyNames"
-                | "not"
-                | "if"
-                | "then"
-                | "else" => {
-                    let k = match key.as_str() {
-                        "items" => "items",
-                        "contains" => "contains",
-                        "additionalProperties" => "additionalProperties",
-                        "propertyNames" => "propertyNames",
-                        "not" => "not",
-                        "if" => "if",
-                        "then" => "then",
-                        _ => "else",
-                    };
-                    let at = self.enqueue(v, p)?;
-                    node.single.insert(k, at);
-                }
-                "prefixItems" | "allOf" | "anyOf" | "oneOf" => {
-                    let a = v.as_array().ok_or_else(invalid)?;
-                    if a.is_empty() {
-                        return Err(invalid());
-                    }
-                    let k = match key.as_str() {
-                        "prefixItems" => "prefixItems",
-                        "allOf" => "allOf",
-                        "anyOf" => "anyOf",
-                        _ => "oneOf",
-                    };
-                    let mut ids = Vec::new();
-                    for (i, child) in a.iter().enumerate() {
-                        ids.push(self.enqueue(child, self.path(&p, &i.to_string())?)?);
-                    }
-                    node.groups.insert(k, ids);
-                }
+                "items" => node.items = Some(self.enqueue(v, p)?),
+                "contains" => node.contains = Some(self.enqueue(v, p)?),
+                "additionalProperties" => node.additional_properties = Some(self.enqueue(v, p)?),
+                "propertyNames" => node.property_names = Some(self.enqueue(v, p)?),
+                "not" => node.not = Some(self.enqueue(v, p)?),
+                "if" => node.condition = Some(self.enqueue(v, p)?),
+                "then" => node.then_schema = Some(self.enqueue(v, p)?),
+                "else" => node.else_schema = Some(self.enqueue(v, p)?),
+                "prefixItems" => node.prefix_items = Some(self.group(v, p)?),
+                "allOf" => node.all_of = Some(self.group(v, p)?),
+                "anyOf" => node.any_of = Some(self.group(v, p)?),
+                "oneOf" => node.one_of = Some(self.group(v, p)?),
                 "pattern" | "format" => {
-                    v.as_str().ok_or_else(invalid)?;
+                    let name = v.as_str().ok_or_else(invalid)?;
+                    if key == "format" {
+                        node.format = Some(name.into());
+                    }
                     let k = if key == "pattern" {
                         "pattern"
                     } else {
                         "format"
                     };
                     if k == "pattern" && self.options.patterns == PatternPolicy::Reject {
-                        return Err(self.error(&p, CompileErrorKind::UnsupportedPattern));
+                        return Err(self.error(p, CompileErrorKind::UnsupportedPattern));
                     }
-                    self.annotations.push(Annotation {
-                        schema_path: p,
+                    self.annotations.push(StoredAnnotation {
+                        path: p,
                         keyword: k,
                         value: v.clone(),
                     });
@@ -932,20 +1305,31 @@ impl<'a> Compiler<'a> {
                 "$anchor" => {
                     let s = v.as_str().ok_or_else(invalid)?;
                     if !simple_anchor(s) || self.anchors.insert(s.into(), id).is_some() {
-                        return Err(self.error(&p, CompileErrorKind::InvalidAnchor));
+                        return Err(self.error(p, CompileErrorKind::InvalidAnchor));
                     }
                 }
                 "$ref" => {
                     let s = v.as_str().ok_or_else(invalid)?;
                     if !s.starts_with('#') {
-                        return Err(self.error(&p, CompileErrorKind::ExternalReference));
+                        return Err(self.error(p, CompileErrorKind::ExternalReference));
                     }
                     self.refs.push((id, s.into()));
                 }
                 "default" | "example" => node.hints.push(v.clone()),
                 "examples" => {
-                    node.hints
-                        .extend_from_slice(v.as_array().ok_or_else(invalid)?);
+                    if let Some(a) = v.as_array() {
+                        node.hints.extend_from_slice(a);
+                    } else if self.options.dialect != Dialect::OpenApi30 {
+                        return Err(invalid());
+                    }
+                }
+                "unevaluatedProperties"
+                | "unevaluatedItems"
+                | "$dynamicRef"
+                | "$dynamicAnchor"
+                | "$recursiveRef"
+                | "contentSchema" => {
+                    return Err(self.error(p, CompileErrorKind::UnsupportedKeyword(key.clone())));
                 }
                 _ => {}
             }
@@ -956,23 +1340,28 @@ impl<'a> Compiler<'a> {
             {
                 *mask |= NULL;
             }
-            for (exclusive, inclusive) in [
-                ("exclusiveMinimum", "minimum"),
-                ("exclusiveMaximum", "maximum"),
-            ] {
-                if value.get(exclusive).and_then(Value::as_bool) == Some(true)
-                    && let Some(n) = node.numbers.remove(inclusive)
-                {
-                    node.numbers.insert(exclusive, n);
-                }
+            if value.get("exclusiveMinimum").and_then(Value::as_bool) == Some(true) {
+                node.exclusive_minimum = node.minimum.take();
+            }
+            if value.get("exclusiveMaximum").and_then(Value::as_bool) == Some(true) {
+                node.exclusive_maximum = node.maximum.take();
             }
         }
         Ok(node)
     }
-    fn finish(mut self, size: usize) -> Result<Schema, CompileError> {
-        self.enqueue(self.root, String::new())?;
+    fn finish(mut self, entry: &str) -> Result<Schema, CompileError> {
+        let (value, path) = self.resolve(entry).map_err(|kind| CompileError {
+            schema_path: {
+                let mut end = entry.len().min(self.options.limits.max_pointer_bytes);
+                while !entry.is_char_boundary(end) {
+                    end -= 1;
+                }
+                entry[..end].into()
+            },
+            kind,
+        })?;
+        self.enqueue(value, path)?;
         let mut resolved = 0;
-        let mut anchor_refs = Vec::new();
         loop {
             while self.nodes.len() < self.queue.len() {
                 let node = self.node(self.nodes.len())?;
@@ -984,44 +1373,34 @@ impl<'a> Compiler<'a> {
             while resolved < self.refs.len() {
                 let (id, reference) = self.refs[resolved].clone();
                 resolved += 1;
-                let p = self.path(&self.nodes[id].path, "$ref")?;
-                self.work
-                    .spend(reference.len())
-                    .map_err(|l| self.error(&p, CompileErrorKind::Limit(l)))?;
+                let source = self.queue[id].0;
+                let p = source
+                    .get("$ref")
+                    .map_or(self.nodes[id].path, |v| self.at(v));
+                self.spend(reference.len(), p)?;
                 let fragment = decode_fragment(&reference[1..])
-                    .ok_or_else(|| self.error(&p, CompileErrorKind::InvalidReference))?;
-                if fragment.is_empty() || fragment.starts_with('/') {
-                    let (value, canonical) = resolve_pointer(
-                        self.root,
-                        &fragment,
-                        self.options.limits.max_pointer_bytes,
-                        &mut self.work,
-                    )
-                    .map_err(|kind| self.error(&p, kind))?;
-                    let target = self.enqueue(value, canonical)?;
-                    self.nodes[id].reference = Some(target);
+                    .ok_or_else(|| self.error(p, CompileErrorKind::InvalidReference))?;
+                let pointer = if fragment.is_empty() || fragment.starts_with('/') {
+                    fragment
                 } else {
-                    anchor_refs.push((id, fragment));
-                }
+                    self.anchor_pointer(&fragment)
+                        .map_err(|kind| self.error(p, kind))?
+                };
+                let (value, path) = self.resolve(&pointer).map_err(|kind| self.error(p, kind))?;
+                let target = self.enqueue(value, path)?;
+                self.nodes[id].reference = Some(target);
             }
-        }
-        for (id, anchor) in anchor_refs {
-            let p = self.path(&self.nodes[id].path, "$ref")?;
-            let target = self
-                .anchors
-                .get(&anchor)
-                .copied()
-                .ok_or_else(|| self.error(&p, CompileErrorKind::InvalidReference))?;
-            self.nodes[id].reference = Some(target);
         }
         Ok(Schema {
             nodes: self.nodes,
+            paths: self.paths,
             annotations: self.annotations,
             options: self.options,
-            size,
+            size: self.size,
         })
     }
 }
+
 fn simple_anchor(s: &str) -> bool {
     s.bytes()
         .next()
@@ -1043,88 +1422,40 @@ fn decode_fragment(s: &str) -> Option<String> {
     }
     String::from_utf8(bytes).ok()
 }
-fn resolve_pointer<'a>(
-    mut value: &'a Value,
-    p: &str,
-    max: usize,
-    work: &mut Work,
-) -> Result<(&'a Value, String), CompileErrorKind> {
-    use CompileErrorKind::{InvalidReference, Limit};
-    let mut canonical = String::new();
-    if p.is_empty() {
-        return Ok((value, canonical));
-    }
-    for part in p.strip_prefix('/').ok_or(InvalidReference)?.split('/') {
-        work.spend(part.len().saturating_add(1)).map_err(Limit)?;
-        let mut token = String::new();
-        let mut chars = part.chars();
-        while let Some(ch) = chars.next() {
-            if ch == '~' {
-                token.push(match chars.next().ok_or(InvalidReference)? {
-                    '0' => '~',
-                    '1' => '/',
-                    _ => return Err(InvalidReference),
-                });
-            } else {
-                token.push(ch);
-            }
-        }
-        canonical = pointer(&canonical, &token, max).map_err(Limit)?;
-        value = match value {
-            Value::Object(members) => {
-                let mut found = None;
-                for (name, v) in members {
-                    work.spend(name.len().min(token.len()).saturating_add(1))
-                        .map_err(Limit)?;
-                    if name == &token {
-                        found = Some(v);
-                        break;
-                    }
-                }
-                found.ok_or(InvalidReference)?
-            }
-            Value::Array(a) => {
-                if token.is_empty()
-                    || (token.len() > 1 && token.starts_with('0'))
-                    || !token.bytes().all(|c| c.is_ascii_digit())
-                {
-                    return Err(InvalidReference);
-                }
-                a.get(token.parse::<usize>().map_err(|_| InvalidReference)?)
-                    .ok_or(InvalidReference)?
-            }
-            _ => return Err(InvalidReference),
-        };
-    }
-    Ok((value, canonical))
-}
 
 impl Schema {
     /// Compiles a boolean or object schema with default options.
     pub fn compile(source: &Value) -> Result<Self, CompileError> {
         Self::compile_with(source, Options::default())
     }
-    /// Checks all recognized schema locations, resolves local references, and
-    /// owns the resulting arena. Unknown keyword values are not schemas unless
-    /// reached by a pointer reference. No borrowed source data is retained.
-    pub fn compile_with(source: &Value, mut options: Options) -> Result<Self, CompileError> {
+    /// Compiles the document's root schema. This is `compile_at(source, "", options)`.
+    pub fn compile_with(source: &Value, options: Options) -> Result<Self, CompileError> {
+        Self::compile_at(source, "", options)
+    }
+    /// Compiles the schema at a JSON Pointer, resolving local references against
+    /// `document`. Only reachable schemas and their keyword data spend the source
+    /// node, byte, and depth limits. Unused definitions and document siblings are
+    /// not compiled. Reference targets start at depth zero; repeated values count
+    /// once. Pointer lookup spends work, but does not preflight the document.
+    /// Anchor references require a lazy, work-bounded document search.
+    /// No source data is borrowed by the returned schema.
+    pub fn compile_at(
+        document: &Value,
+        entry: &str,
+        mut options: Options,
+    ) -> Result<Self, CompileError> {
         options.limits = options.limits.bounded();
-        let size =
-            inspect(source, &options.limits, options.limits.max_schema_nodes).map_err(|e| {
-                CompileError {
-                    schema_path: e.path,
-                    kind: match e.limit {
-                        Some("max_nodes") => CompileErrorKind::Limit("max_schema_nodes"),
-                        Some(l) => CompileErrorKind::Limit(l),
-                        None => CompileErrorKind::DuplicateKey,
-                    },
-                }
-            })?;
+        let mut paths = Paths::default();
+        let root = paths.root();
         Compiler {
-            root: source,
+            root: document,
             options,
             queue: Vec::new(),
             ids: BTreeMap::new(),
+            locations: BTreeMap::from([(document as *const Value, root)]),
+            checked: BTreeSet::new(),
+            paths,
+            size: 0,
             anchors: BTreeMap::new(),
             refs: Vec::new(),
             nodes: Vec::new(),
@@ -1133,26 +1464,34 @@ impl Schema {
                 left: options.limits.max_work,
             },
         }
-        .finish(size)
+        .finish(entry)
     }
-    /// Returns the effective options after hard ceilings were applied.
+    /// Returns the effective options, including stack and arithmetic ceilings.
     pub fn options(&self) -> Options {
         self.options
     }
-    /// Returns recorded non-asserting keywords, including unused definitions.
-    pub fn annotations(&self) -> &[Annotation] {
-        &self.annotations
+    /// Returns format and ignored regex keywords in reachable schemas.
+    /// These are static metadata, not a record of successful evaluation paths.
+    /// Pointers and values are materialized only when this method is called.
+    pub fn annotations(&self) -> Vec<Annotation> {
+        self.annotations
+            .iter()
+            .map(|a| Annotation {
+                schema_path: self.paths.render(a.path),
+                keyword: a.keyword,
+                value: a.value.clone(),
+            })
+            .collect()
     }
     /// Validates an instance, stopping at the first failed assertion.
-    pub fn validate(&self, instance: &Value) -> Validation<'_> {
+    pub fn validate(&self, instance: &Value) -> Validation {
         self.validate_with(instance, ErrorMode::First)
     }
     /// Validates with the selected error policy. Fatal errors in speculative
     /// branches propagate; they cannot satisfy `not` or be hidden by `anyOf`.
-    pub fn validate_with(&self, instance: &Value, mode: ErrorMode) -> Validation<'_> {
+    pub fn validate_with(&self, instance: &Value, mode: ErrorMode) -> Validation {
         let mut report = Validation {
             errors: Vec::new(),
-            annotations: &self.annotations,
             truncated: false,
         };
         let l = &self.options.limits;
@@ -1178,7 +1517,7 @@ impl Schema {
         let mut eval = Eval {
             schema: self,
             work: &mut work,
-            active: Vec::new(),
+            active: BTreeSet::new(),
             errors: Vec::new(),
             cap: if mode == ErrorMode::First {
                 1
@@ -1258,23 +1597,595 @@ fn equal(a: &Value, b: &Value, limits: &Limits, work: &mut Work) -> Result<bool,
     })
 }
 
+fn digits(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() {
+        return None;
+    }
+    bytes.iter().try_fold(0u32, |n, b| {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n.checked_mul(10)?.checked_add(u32::from(b - b'0'))
+    })
+}
+fn date_parts(s: &str) -> Option<(u32, u32, u32)> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let (year, month, day) = (digits(&b[..4])?, digits(&b[5..7])?, digits(&b[8..])?);
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => return None,
+    };
+    (day > 0 && day <= days).then_some((year, month, day))
+}
+// Returns whether this is a leap second and whether its UTC date is yesterday.
+fn time_parts(s: &str) -> Option<(bool, bool)> {
+    let b = s.as_bytes();
+    if b.len() < 9 || b[2] != b':' || b[5] != b':' {
+        return None;
+    }
+    let (hour, minute, second) = (digits(&b[..2])?, digits(&b[3..5])?, digits(&b[6..8])?);
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut at = 8;
+    if b.get(at) == Some(&b'.') {
+        at += 1;
+        let first = at;
+        while b.get(at).is_some_and(u8::is_ascii_digit) {
+            at += 1;
+        }
+        if first == at {
+            return None;
+        }
+    }
+    let zone = b.get(at..)?;
+    let offset = match zone {
+        [b'Z' | b'z'] => 0,
+        [sign @ (b'+' | b'-'), h1, h2, b':', m1, m2] => {
+            let (h, m) = (digits(&[*h1, *h2])?, digits(&[*m1, *m2])?);
+            if h > 23 || m > 59 {
+                return None;
+            }
+            (h as i32 * 60 + m as i32) * if *sign == b'-' { -1 } else { 1 }
+        }
+        _ => return None,
+    };
+    let utc = hour as i32 * 60 + minute as i32 - offset;
+    if second == 60 && utc.rem_euclid(1440) != 1439 {
+        return None;
+    }
+    Some((second == 60, utc < 0))
+}
+fn hostname(s: &str) -> bool {
+    let s = s.strip_suffix('.').unwrap_or(s);
+    !s.is_empty()
+        && s.len() <= 253
+        && s.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+fn email(s: &str) -> bool {
+    let Some((local, domain)) = s.rsplit_once('@') else {
+        return false;
+    };
+    if local.is_empty() || local.len() > 64 || s.len() > 254 {
+        return false;
+    }
+    let valid_local =
+        if let Some(quoted) = local.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+            let mut bytes = quoted.bytes();
+            let mut valid = true;
+            while let Some(b) = bytes.next() {
+                if b == b'\\' {
+                    valid &= bytes.next().is_some_and(|b| (32..=126).contains(&b));
+                } else {
+                    valid &= (32..=126).contains(&b) && b != b'"';
+                }
+            }
+            valid
+        } else {
+            local.split('.').all(|part| {
+                !part.is_empty()
+                    && part
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b))
+            })
+        };
+    let valid_domain = if let Some(ip) = domain.strip_prefix('[').and_then(|s| s.strip_suffix(']'))
+    {
+        if ip.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("IPv6:")) {
+            ip[5..].parse::<std::net::Ipv6Addr>().is_ok()
+        } else {
+            ip.parse::<std::net::Ipv4Addr>().is_ok()
+        }
+    } else {
+        hostname(domain)
+    };
+    valid_local && valid_domain
+}
+fn unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~".contains(&b)
+}
+fn sub_delim(b: u8) -> bool {
+    b"!$&'()*+,;=".contains(&b)
+}
+fn uri_component(s: &str, extra: &[u8]) -> bool {
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            if !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+                || !bytes.next().is_some_and(|b| b.is_ascii_hexdigit())
+            {
+                return false;
+            }
+        } else if !(unreserved(b) || sub_delim(b) || extra.contains(&b)) {
+            return false;
+        }
+    }
+    true
+}
+fn uri(s: &str) -> bool {
+    let Some((scheme, rest)) = s.split_once(':') else {
+        return false;
+    };
+    if !scheme
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphabetic)
+        || !scheme
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    {
+        return false;
+    }
+    let (rest, fragment) = rest.split_once('#').map_or((rest, ""), |pair| pair);
+    let (path, query) = rest.split_once('?').map_or((rest, ""), |pair| pair);
+    if !uri_component(query, b"/?@:") || !uri_component(fragment, b"/?@:") {
+        return false;
+    }
+    let path = if let Some(rest) = path.strip_prefix("//") {
+        let (authority, path) = rest
+            .find('/')
+            .map_or((rest, ""), |i| (&rest[..i], &rest[i..]));
+        let host = if let Some((user, host)) = authority.rsplit_once('@') {
+            if !uri_component(user, b":") {
+                return false;
+            }
+            host
+        } else {
+            authority
+        };
+        let port = if let Some(ip) = host.strip_prefix('[') {
+            let Some((ip, tail)) = ip.split_once(']') else {
+                return false;
+            };
+            let valid = if let Some(future) = ip.strip_prefix(['v', 'V']) {
+                future.split_once('.').is_some_and(|(version, address)| {
+                    !version.is_empty()
+                        && version.bytes().all(|b| b.is_ascii_hexdigit())
+                        && !address.is_empty()
+                        && address
+                            .bytes()
+                            .all(|b| unreserved(b) || sub_delim(b) || b == b':')
+                })
+            } else {
+                ip.parse::<std::net::Ipv6Addr>().is_ok()
+            };
+            if !valid {
+                return false;
+            }
+            if tail.is_empty() {
+                ""
+            } else if let Some(port) = tail.strip_prefix(':') {
+                port
+            } else {
+                return false;
+            }
+        } else {
+            let (host, port) = host.split_once(':').unwrap_or((host, ""));
+            if !uri_component(host, b"") {
+                return false;
+            }
+            port
+        };
+        if !port.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+        path
+    } else {
+        path
+    };
+    uri_component(path, b"/:@")
+}
+fn valid_format(format: &str, s: &str) -> bool {
+    match format {
+        "date" => date_parts(s).is_some(),
+        "time" => time_parts(s).is_some(),
+        "date-time" => {
+            let Some((_, month, day)) = s.get(..10).and_then(date_parts) else {
+                return false;
+            };
+            if !matches!(s.as_bytes().get(10), Some(b'T' | b't')) {
+                return false;
+            }
+            let Some((leap, yesterday)) = s.get(11..).and_then(time_parts) else {
+                return false;
+            };
+            !leap
+                || if yesterday {
+                    matches!((month, day), (1 | 7, 1))
+                } else {
+                    matches!((month, day), (6, 30) | (12, 31))
+                }
+        }
+        "email" => email(s),
+        "hostname" => hostname(s),
+        "uri" => uri(s),
+        "uuid" => {
+            s.len() == 36
+                && s.bytes().enumerate().all(|(i, b)| {
+                    if matches!(i, 8 | 13 | 18 | 23) {
+                        b == b'-'
+                    } else {
+                        b.is_ascii_hexdigit()
+                    }
+                })
+        }
+        "ipv4" => s.parse::<std::net::Ipv4Addr>().is_ok(),
+        "ipv6" => s.parse::<std::net::Ipv6Addr>().is_ok(),
+        _ => true,
+    }
+}
+fn hostname_example(n: usize) -> Option<String> {
+    if !(1..=253).contains(&n) {
+        return None;
+    }
+    let mut s = String::with_capacity(n);
+    while s.len() < n {
+        let remaining = n - s.len();
+        let size = if remaining == 64 {
+            62
+        } else {
+            remaining.min(63)
+        };
+        s.extend(std::iter::repeat_n('a', size));
+        if s.len() < n {
+            s.push('.');
+        }
+    }
+    Some(s)
+}
+fn ipv4_example(n: usize) -> Option<String> {
+    if !(7..=15).contains(&n) {
+        return None;
+    }
+    let mut extra = n - 7;
+    let mut parts = Vec::new();
+    for _ in 0..4 {
+        let width = extra.min(2);
+        extra -= width;
+        parts.push(["1", "10", "100"][width]);
+    }
+    Some(parts.join("."))
+}
+fn ipv6_example(n: usize) -> Option<String> {
+    if n == 2 {
+        return Some("::".into());
+    }
+    for groups in 1usize..=8 {
+        let base = if groups == 8 { 15 } else { groups * 2 + 1 };
+        if n >= base && n - base <= groups * 3 {
+            let mut extra = n - base;
+            let parts: Vec<_> = (0..groups)
+                .map(|_| {
+                    let add = extra.min(3);
+                    extra -= add;
+                    "1".repeat(add + 1)
+                })
+                .collect();
+            return Some(parts.join(":") + if groups == 8 { "" } else { "::" });
+        }
+    }
+    if (40..=45).contains(&n) {
+        return Some(format!(
+            "1111:1111:1111:1111:1111:1111:{}",
+            ipv4_example(n - 30)?
+        ));
+    }
+    None
+}
+fn format_example(format: &str, low: usize, high: usize) -> Option<String> {
+    let sample = match format {
+        "date-time" => "2000-01-01T00:00:00Z",
+        "date" => "2000-01-01",
+        "time" => "00:00:00Z",
+        "email" => "a@example.test",
+        "uuid" => "00000000-0000-4000-8000-000000000000",
+        "uri" => "https://example.test/",
+        "ipv4" => "192.0.2.1",
+        "ipv6" => "2001:db8::1",
+        "hostname" => "example.test",
+        _ => return None,
+    };
+    if (low..=high).contains(&sample.len()) {
+        return Some(sample.into());
+    }
+    let minimum = match format {
+        "date-time" => 22,
+        "time" => 11,
+        "email" => 3,
+        "uri" | "ipv6" => 2,
+        "ipv4" => 7,
+        "hostname" => 1,
+        _ => return None,
+    };
+    let n = low.max(minimum);
+    if n > high {
+        return None;
+    }
+    let s = match format {
+        "date-time" | "time" => format!(
+            "{}.{}Z",
+            sample.strip_suffix('Z')?,
+            "0".repeat(n - sample.len() - 1)
+        ),
+        "email" if n <= 254 => {
+            let local = (n - 2).min(64);
+            format!("{}@{}", "a".repeat(local), hostname_example(n - local - 1)?)
+        }
+        "uri" => format!("a:{}", "x".repeat(n - 2)),
+        "hostname" => hostname_example(n)?,
+        "ipv4" => ipv4_example(n)?,
+        "ipv6" => ipv6_example(n)?,
+        _ => return None,
+    };
+    valid_format(format, &s).then_some(s)
+}
+
+// Fallible merge sort stops as soon as comparison work runs out.
+fn sorted_indices(
+    len: usize,
+    mut compare: impl FnMut(usize, usize) -> Result<Ordering, &'static str>,
+) -> Result<Vec<usize>, &'static str> {
+    let mut order: Vec<_> = (0..len).collect();
+    let mut next = Vec::with_capacity(len);
+    let mut width = 1usize;
+    while width < len {
+        next.clear();
+        let mut start = 0;
+        while start < len {
+            let mid = start.saturating_add(width).min(len);
+            let end = mid.saturating_add(width).min(len);
+            let (mut a, mut b) = (start, mid);
+            while a < mid && b < end {
+                if compare(order[a], order[b])? != Ordering::Greater {
+                    next.push(order[a]);
+                    a += 1;
+                } else {
+                    next.push(order[b]);
+                    b += 1;
+                }
+            }
+            next.extend_from_slice(&order[a..mid]);
+            next.extend_from_slice(&order[b..end]);
+            start = end;
+        }
+        std::mem::swap(&mut order, &mut next);
+        width = width.saturating_mul(2);
+    }
+    Ok(order)
+}
+fn compare_bytes(a: &[u8], b: &[u8], work: &mut Work) -> Result<Ordering, &'static str> {
+    for (a, b) in a.iter().zip(b) {
+        work.spend(1)?;
+        let order = a.cmp(b);
+        if order != Ordering::Equal {
+            return Ok(order);
+        }
+    }
+    work.spend(1)?;
+    Ok(a.len().cmp(&b.len()))
+}
+// This total order need only agree with JSON equality, not numeric magnitude.
+// Numbers are normalized once; object keys are sorted once.
+enum Canonical<'a> {
+    Null,
+    Bool(bool),
+    Number(Decimal),
+    String(&'a str),
+    Array(Vec<Self>),
+    Object(Vec<(&'a str, Self)>),
+}
+impl<'a> Canonical<'a> {
+    fn new(v: &'a Value, limits: &Limits, work: &mut Work) -> Result<Self, &'static str> {
+        work.spend(1)?;
+        Ok(match v {
+            Value::Null => Self::Null,
+            Value::Bool(b) => Self::Bool(*b),
+            Value::Number(n) => {
+                work.spend(n.text().len())?;
+                Self::Number(Decimal::new(n, limits)?)
+            }
+            Value::String(s) => Self::String(s),
+            Value::Array(a) => Self::Array(
+                a.iter()
+                    .map(|v| Self::new(v, limits, work))
+                    .collect::<Result<_, _>>()?,
+            ),
+            Value::Object(o) => {
+                let order = sorted_indices(o.len(), |a, b| {
+                    compare_bytes(o[a].0.as_bytes(), o[b].0.as_bytes(), work)
+                })?;
+                Self::Object(
+                    order
+                        .into_iter()
+                        .map(|i| Ok((o[i].0.as_str(), Self::new(&o[i].1, limits, work)?)))
+                        .collect::<Result<_, &'static str>>()?,
+                )
+            }
+        })
+    }
+    fn tag(&self) -> u8 {
+        match self {
+            Self::Null => 0,
+            Self::Bool(_) => 1,
+            Self::Number(_) => 2,
+            Self::String(_) => 3,
+            Self::Array(_) => 4,
+            Self::Object(_) => 5,
+        }
+    }
+    fn compare(&self, other: &Self, work: &mut Work) -> Result<Ordering, &'static str> {
+        work.spend(1)?;
+        Ok(match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            (Self::Number(a), Self::Number(b)) => {
+                let order = a
+                    .negative
+                    .cmp(&b.negative)
+                    .then(a.exponent.cmp(&b.exponent));
+                if order == Ordering::Equal {
+                    compare_bytes(&a.digits, &b.digits, work)?
+                } else {
+                    order
+                }
+            }
+            (Self::String(a), Self::String(b)) => compare_bytes(a.as_bytes(), b.as_bytes(), work)?,
+            (Self::Array(a), Self::Array(b)) => {
+                for (a, b) in a.iter().zip(b) {
+                    let order = a.compare(b, work)?;
+                    if order != Ordering::Equal {
+                        return Ok(order);
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            (Self::Object(a), Self::Object(b)) => {
+                for ((ka, a), (kb, b)) in a.iter().zip(b) {
+                    let order = compare_bytes(ka.as_bytes(), kb.as_bytes(), work)?;
+                    if order != Ordering::Equal {
+                        return Ok(order);
+                    }
+                    let order = a.compare(b, work)?;
+                    if order != Ordering::Equal {
+                        return Ok(order);
+                    }
+                }
+                a.len().cmp(&b.len())
+            }
+            _ => self.tag().cmp(&other.tag()),
+        })
+    }
+}
+fn unique(items: &[Value], limits: &Limits, work: &mut Work) -> Result<bool, &'static str> {
+    let keys: Vec<_> = items
+        .iter()
+        .map(|v| Canonical::new(v, limits, work))
+        .collect::<Result<_, _>>()?;
+    let order = sorted_indices(keys.len(), |a, b| keys[a].compare(&keys[b], work))?;
+    for pair in order.windows(2) {
+        if keys[pair[0]].compare(&keys[pair[1]], work)? == Ordering::Equal {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[derive(Clone)]
+enum Instance<'a> {
+    Value(&'a Value),
+    Name(std::rc::Rc<Value>),
+}
+impl Instance<'_> {
+    fn get(&self) -> &Value {
+        match self {
+            Self::Value(v) => v,
+            Self::Name(v) => v,
+        }
+    }
+}
+struct Context<'a> {
+    id: usize,
+    value: Instance<'a>,
+    path: String,
+    depth: usize,
+    refs: usize,
+    collect: bool,
+}
+enum Check<'s, 'v> {
+    Enter,
+    Leaf,
+    Prepare,
+    Child(usize, Instance<'v>, String, usize),
+    Group {
+        keyword: &'static str,
+        ids: &'s [usize],
+        next: usize,
+        count: usize,
+    },
+    Contains {
+        schema: usize,
+        items: &'v [Value],
+        next: usize,
+        count: usize,
+    },
+    Not(usize),
+    If(usize),
+}
+struct Evaluation<'s, 'v> {
+    context: Context<'v>,
+    checks: Vec<Check<'s, 'v>>,
+    waiting: Option<Check<'s, 'v>>,
+    valid: bool,
+}
+impl<'s, 'v> Evaluation<'s, 'v> {
+    fn new(context: Context<'v>) -> Self {
+        Self {
+            context,
+            checks: vec![Check::Prepare, Check::Leaf, Check::Enter],
+            waiting: None,
+            valid: true,
+        }
+    }
+}
+
 struct Eval<'a, 'w> {
     schema: &'a Schema,
     work: &'w mut Work,
-    active: Vec<(usize, *const Value)>,
+    active: BTreeSet<(usize, *const Value)>,
     errors: Vec<ValidationError>,
     cap: usize,
     truncated: bool,
 }
-impl Eval<'_, '_> {
+impl<'s> Eval<'s, '_> {
     fn error(&self, id: usize, path: &str, keyword: &str, kind: ValidationKind) -> ValidationError {
-        let base = &self.schema.nodes[id].path;
+        let base = self.schema.paths.render(self.schema.nodes[id].path);
         ValidationError {
             instance_path: path.into(),
             schema_path: if keyword.is_empty() {
                 base.clone()
             } else {
-                pointer(base, keyword, self.schema.options.limits.max_pointer_bytes)
+                pointer(&base, keyword, self.schema.options.limits.max_pointer_bytes)
                     .unwrap_or_else(|_| base.clone())
             },
             kind,
@@ -1295,6 +2206,19 @@ impl Eval<'_, '_> {
         pointer(p, token, self.schema.options.limits.max_pointer_bytes)
             .map_err(|s| self.error(id, p, "", ValidationKind::Limit(s)))
     }
+    fn assertion(
+        &mut self,
+        c: &Context<'_>,
+        keyword: &'static str,
+        ok: bool,
+        kind: ValidationKind,
+    ) -> bool {
+        if !ok && c.collect {
+            self.errors.push(self.error(c.id, &c.path, keyword, kind));
+            self.truncated |= self.errors.len() >= self.cap;
+        }
+        ok
+    }
     fn run(
         &mut self,
         id: usize,
@@ -1304,29 +2228,406 @@ impl Eval<'_, '_> {
         refs: usize,
         collect: bool,
     ) -> Result<bool, ValidationError> {
-        self.spend(1, id, p, "")?;
-        let l = &self.schema.options.limits;
-        if depth > l.max_validation_depth {
-            return Err(self.error(id, p, "", ValidationKind::Limit("max_validation_depth")));
-        }
-        if refs > l.max_ref_depth {
-            return Err(self.error(id, p, "$ref", ValidationKind::Limit("max_ref_depth")));
-        }
-        if self.active.contains(&(id, value as *const Value)) {
-            return Err(self.error(id, p, "$ref", ValidationKind::ReferenceCycle));
-        }
-        self.active.push((id, value));
-        let result = self.body(id, value, p, depth, refs, collect);
-        self.active.pop();
+        let result = self.evaluate(Context {
+            id,
+            value: Instance::Value(value),
+            path: p.into(),
+            depth,
+            refs,
+            collect,
+        });
+        self.active.clear();
         result
     }
-    fn body(
+    fn evaluate<'v>(&mut self, context: Context<'v>) -> Result<bool, ValidationError> {
+        let mut stack = vec![Evaluation::new(context)];
+        let mut returned: Option<bool> = None;
+        while let Some(frame) = stack.last_mut() {
+            let c = &frame.context;
+            let node = &self.schema.nodes[c.id];
+            if let Some(passed) = returned.take() {
+                match frame.waiting.take() {
+                    Some(Check::Child(..)) => frame.valid &= passed,
+                    Some(Check::Group {
+                        keyword,
+                        ids,
+                        next,
+                        count,
+                    }) => {
+                        frame.checks.push(Check::Group {
+                            keyword,
+                            ids,
+                            next,
+                            count: count + usize::from(passed),
+                        });
+                    }
+                    Some(Check::Contains {
+                        schema,
+                        items,
+                        next,
+                        count,
+                    }) => {
+                        frame.checks.push(Check::Contains {
+                            schema,
+                            items,
+                            next,
+                            count: count + usize::from(passed),
+                        });
+                    }
+                    Some(Check::Not(_)) => {
+                        frame.valid &=
+                            self.assertion(c, "not", !passed, ValidationKind::Assertion("not"))
+                    }
+                    Some(Check::If(_)) => {
+                        if let Some(&id) = if passed {
+                            node.then_schema.as_ref()
+                        } else {
+                            node.else_schema.as_ref()
+                        } {
+                            frame.checks.push(Check::Child(
+                                id,
+                                c.value.clone(),
+                                c.path.clone(),
+                                c.refs,
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !frame.valid && (!c.collect || self.errors.len() >= self.cap) {
+                self.active.remove(&(c.id, c.value.get() as *const Value));
+                stack.pop();
+                returned = Some(false);
+                continue;
+            }
+            let Some(check) = frame.checks.pop() else {
+                let valid = frame.valid;
+                self.active.remove(&(c.id, c.value.get() as *const Value));
+                stack.pop();
+                returned = Some(valid);
+                continue;
+            };
+            let mut child = None;
+            match check {
+                Check::Enter => {
+                    self.spend(1, c.id, &c.path, "")?;
+                    if c.depth > self.schema.options.limits.max_validation_depth {
+                        return Err(self.error(
+                            c.id,
+                            &c.path,
+                            "",
+                            ValidationKind::Limit("max_validation_depth"),
+                        ));
+                    }
+                    if c.refs > self.schema.options.limits.max_ref_depth {
+                        return Err(self.error(
+                            c.id,
+                            &c.path,
+                            "$ref",
+                            ValidationKind::Limit("max_ref_depth"),
+                        ));
+                    }
+                    if !self.active.insert((c.id, c.value.get())) {
+                        return Err(self.error(
+                            c.id,
+                            &c.path,
+                            "$ref",
+                            ValidationKind::ReferenceCycle,
+                        ));
+                    }
+                    if node.reject {
+                        if c.collect {
+                            self.errors.push(self.error(
+                                c.id,
+                                &c.path,
+                                "",
+                                ValidationKind::FalseSchema,
+                            ));
+                            self.truncated |= self.errors.len() >= self.cap;
+                        }
+                        frame.valid = false;
+                        frame.checks.clear();
+                    } else if let Some(id) = node.reference {
+                        frame.checks.push(Check::Child(
+                            id,
+                            c.value.clone(),
+                            c.path.clone(),
+                            c.refs.saturating_add(1),
+                        ));
+                    }
+                }
+                Check::Leaf => frame.valid &= self.leaf(c.id, c.value.get(), &c.path, c.collect)?,
+                Check::Prepare => {
+                    self.prepare(frame)?;
+                }
+                Check::Child(id, value, path, refs) => {
+                    child = Some(Context {
+                        id,
+                        value: value.clone(),
+                        path: path.clone(),
+                        depth: c.depth.saturating_add(1),
+                        refs,
+                        collect: c.collect,
+                    });
+                    frame.waiting = Some(Check::Child(id, value, path, refs));
+                }
+                Check::Group {
+                    keyword,
+                    ids,
+                    next,
+                    count,
+                } => {
+                    if next == ids.len() || (keyword == "anyOf" && count > 0) {
+                        frame.valid &= self.assertion(
+                            c,
+                            keyword,
+                            if keyword == "anyOf" {
+                                count > 0
+                            } else {
+                                count == 1
+                            },
+                            ValidationKind::Assertion(keyword),
+                        );
+                    } else {
+                        child = Some(Context {
+                            id: ids[next],
+                            value: c.value.clone(),
+                            path: c.path.clone(),
+                            depth: c.depth.saturating_add(1),
+                            refs: c.refs,
+                            collect: false,
+                        });
+                        frame.waiting = Some(Check::Group {
+                            keyword,
+                            ids,
+                            next: next + 1,
+                            count,
+                        });
+                    }
+                }
+                Check::Contains {
+                    schema,
+                    items,
+                    next,
+                    count,
+                } => {
+                    if next == items.len() {
+                        let count = Decimal::count(count);
+                        let min = node
+                            .min_contains
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| Decimal::count(1));
+                        let keyword = if node.min_contains.is_some() {
+                            "minContains"
+                        } else {
+                            "contains"
+                        };
+                        frame.valid &= self.assertion(
+                            c,
+                            keyword,
+                            count.cmp(&min) != Ordering::Less,
+                            ValidationKind::Assertion(keyword),
+                        );
+                        if (frame.valid || (c.collect && self.errors.len() < self.cap))
+                            && let Some(max) = node.max_contains.as_ref()
+                        {
+                            frame.valid &= self.assertion(
+                                c,
+                                "maxContains",
+                                count.cmp(max) != Ordering::Greater,
+                                ValidationKind::Assertion("maxContains"),
+                            );
+                        }
+                    } else {
+                        let path = self.child_path(c.id, &c.path, &next.to_string())?;
+                        child = Some(Context {
+                            id: schema,
+                            value: Instance::Value(&items[next]),
+                            path,
+                            depth: c.depth.saturating_add(1),
+                            refs: 0,
+                            collect: false,
+                        });
+                        frame.waiting = Some(Check::Contains {
+                            schema,
+                            items,
+                            next: next + 1,
+                            count,
+                        });
+                    }
+                }
+                Check::Not(id) | Check::If(id) => {
+                    child = Some(Context {
+                        id,
+                        value: c.value.clone(),
+                        path: c.path.clone(),
+                        depth: c.depth.saturating_add(1),
+                        refs: c.refs,
+                        collect: false,
+                    });
+                    frame.waiting = Some(check);
+                }
+            }
+            if let Some(child) = child {
+                stack.push(Evaluation::new(child));
+            }
+        }
+        Ok(returned.unwrap_or(true))
+    }
+    fn prepare<'v>(&mut self, frame: &mut Evaluation<'s, 'v>) -> Result<(), ValidationError> {
+        let c = &frame.context;
+        let node = &self.schema.nodes[c.id];
+        // Collect each node's direct checks once. Reference and branch execution
+        // use the explicit evaluation stack, including property-name instances.
+        let mut checks = Vec::new();
+        if let Instance::Value(Value::Array(items)) = c.value {
+            if node.unique {
+                let ok = unique(items, &self.schema.options.limits, self.work).map_err(|s| {
+                    self.error(c.id, &c.path, "uniqueItems", ValidationKind::Limit(s))
+                })?;
+                frame.valid &= self.assertion(
+                    c,
+                    "uniqueItems",
+                    ok,
+                    ValidationKind::Assertion("uniqueItems"),
+                );
+                if !frame.valid && (!c.collect || self.errors.len() >= self.cap) {
+                    return Ok(());
+                }
+            }
+            let prefix = node.prefix_items.as_deref().unwrap_or_default();
+            for (i, v) in items.iter().enumerate() {
+                self.spend(1, c.id, &c.path, "items")?;
+                if let Some(&id) = prefix.get(i).or(node.items.as_ref()) {
+                    checks.push(Check::Child(
+                        id,
+                        Instance::Value(v),
+                        self.child_path(c.id, &c.path, &i.to_string())?,
+                        0,
+                    ));
+                }
+            }
+            if let Some(&schema) = node.contains.as_ref() {
+                checks.push(Check::Contains {
+                    schema,
+                    items,
+                    next: 0,
+                    count: 0,
+                });
+            }
+        }
+        if let Instance::Value(Value::Object(object)) = c.value {
+            let mut members = BTreeSet::new();
+            for (name, _) in object {
+                self.spend(name.len().saturating_add(1), c.id, &c.path, "properties")?;
+                members.insert(name.as_str());
+            }
+            for name in &node.required {
+                self.spend(name.len().saturating_add(1), c.id, &c.path, "required")?;
+                frame.valid &= self.assertion(
+                    c,
+                    "required",
+                    members.contains(name.as_str()),
+                    ValidationKind::Missing(name.clone()),
+                );
+                if !frame.valid && (!c.collect || self.errors.len() >= self.cap) {
+                    return Ok(());
+                }
+            }
+            for (trigger, names) in &node.dependent {
+                self.spend(
+                    trigger.len().saturating_add(1),
+                    c.id,
+                    &c.path,
+                    "dependentRequired",
+                )?;
+                if members.contains(trigger.as_str()) {
+                    for name in names {
+                        self.spend(
+                            name.len().saturating_add(1),
+                            c.id,
+                            &c.path,
+                            "dependentRequired",
+                        )?;
+                        frame.valid &= self.assertion(
+                            c,
+                            "dependentRequired",
+                            members.contains(name.as_str()),
+                            ValidationKind::Missing(name.clone()),
+                        );
+                        if !frame.valid && (!c.collect || self.errors.len() >= self.cap) {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            for (trigger, &id) in &node.dependent_schemas {
+                self.spend(
+                    trigger.len().saturating_add(1),
+                    c.id,
+                    &c.path,
+                    "dependentSchemas",
+                )?;
+                if members.contains(trigger.as_str()) {
+                    checks.push(Check::Child(id, c.value.clone(), c.path.clone(), c.refs));
+                }
+            }
+            for (name, v) in object {
+                self.spend(1, c.id, &c.path, "properties")?;
+                if let Some(&id) = node.property_names.as_ref() {
+                    checks.push(Check::Child(
+                        id,
+                        Instance::Name(std::rc::Rc::new(Value::String(name.clone()))),
+                        c.path.clone(),
+                        0,
+                    ));
+                }
+                if let Some(&id) = node
+                    .properties
+                    .get(name)
+                    .or(node.additional_properties.as_ref())
+                {
+                    checks.push(Check::Child(
+                        id,
+                        Instance::Value(v),
+                        self.child_path(c.id, &c.path, name)?,
+                        0,
+                    ));
+                }
+            }
+        }
+        if let Some(group) = node.all_of.as_ref() {
+            self.spend(group.len(), c.id, &c.path, "allOf")?;
+            for &id in group {
+                checks.push(Check::Child(id, c.value.clone(), c.path.clone(), c.refs));
+            }
+        }
+        for (keyword, group) in [("anyOf", &node.any_of), ("oneOf", &node.one_of)] {
+            if let Some(ids) = group {
+                checks.push(Check::Group {
+                    keyword,
+                    ids,
+                    next: 0,
+                    count: 0,
+                });
+            }
+        }
+        if let Some(&id) = node.not.as_ref() {
+            checks.push(Check::Not(id));
+        }
+        if let Some(&id) = node.condition.as_ref() {
+            checks.push(Check::If(id));
+        }
+        frame.checks.extend(checks.into_iter().rev());
+        Ok(())
+    }
+    fn leaf(
         &mut self,
         id: usize,
         value: &Value,
         p: &str,
-        depth: usize,
-        refs: usize,
         collect: bool,
     ) -> Result<bool, ValidationError> {
         let node = &self.schema.nodes[id];
@@ -1334,13 +2635,15 @@ impl Eval<'_, '_> {
         let mut valid = true;
         macro_rules! assertion {
             ($ok:expr, $key:expr) => {
+                assertion!($ok, $key, ValidationKind::Assertion($key))
+            };
+            ($ok:expr, $key:expr, $kind:expr) => {
                 if !$ok {
                     valid = false;
                     if !collect {
                         return Ok(false);
                     }
-                    self.errors
-                        .push(self.error(id, p, $key, ValidationKind::Assertion($key)));
+                    self.errors.push(self.error(id, p, $key, $kind));
                     if self.errors.len() >= self.cap {
                         self.truncated = true;
                         return Ok(false);
@@ -1348,27 +2651,19 @@ impl Eval<'_, '_> {
                 }
             };
         }
-        macro_rules! child {
-            ($child:expr, $v:expr, $p:expr, $refs:expr) => {
-                if !self.run($child, $v, $p, depth + 1, $refs, collect)? {
-                    valid = false;
-                    if !collect || self.errors.len() >= self.cap {
-                        return Ok(false);
-                    }
-                }
-            };
-        }
-        if node.reject {
-            if collect {
-                self.errors
-                    .push(self.error(id, p, "", ValidationKind::FalseSchema));
-                self.truncated = self.errors.len() >= self.cap;
+        let decimal = if let Value::Number(n) = value {
+            if node.types.is_some() || node.numeric_bounds().next().is_some() {
+                self.spend(n.text().len(), id, p, "")?;
+                Some(
+                    Decimal::new(n, limits)
+                        .map_err(|s| self.error(id, p, "", ValidationKind::Limit(s)))?,
+                )
+            } else {
+                None
             }
-            return Ok(false);
-        }
-        if let Some(target) = node.reference {
-            child!(target, value, p, refs + 1);
-        }
+        } else {
+            None
+        };
         if let Some(mask) = node.types {
             let bit = match value {
                 Value::Null => NULL,
@@ -1376,11 +2671,8 @@ impl Eval<'_, '_> {
                 Value::String(_) => STRING,
                 Value::Array(_) => ARRAY,
                 Value::Object(_) => OBJECT,
-                Value::Number(n) => {
-                    self.spend(n.text().len(), id, p, "type")?;
-                    let d = Decimal::new(n, limits)
-                        .map_err(|s| self.error(id, p, "type", ValidationKind::Limit(s)))?;
-                    if d.integer() {
+                Value::Number(_) => {
+                    if decimal.as_ref().is_some_and(Decimal::integer) {
                         NUMBER | INTEGER
                     } else {
                         NUMBER
@@ -1406,12 +2698,10 @@ impl Eval<'_, '_> {
             }
             assertion!(found, "enum");
         }
-        if let Value::Number(n) = value {
-            let d = Decimal::new(n, limits)
-                .map_err(|s| self.error(id, p, "", ValidationKind::Limit(s)))?;
-            for (&key, bound) in &node.numbers {
+        if let Some(d) = &decimal {
+            for (key, bound) in node.numeric_bounds() {
                 self.spend(
-                    n.text().len().saturating_add(bound.digits.len()),
+                    d.digits.len().saturating_add(bound.digits.len()),
                     id,
                     p,
                     key,
@@ -1429,19 +2719,43 @@ impl Eval<'_, '_> {
                 assertion!(ok, key);
             }
         }
-        let counts: &[(&str, &str, usize)] = match value {
+        if self.schema.options.formats == FormatPolicy::Assert
+            && let (Value::String(s), Some(format)) = (value, &node.format)
+        {
+            self.spend(s.len(), id, p, "format")?;
+            assertion!(valid_format(format, s), "format");
+        }
+        let count = match value {
             Value::String(s) => {
                 self.spend(s.len(), id, p, "minLength")?;
-                &[("minLength", "maxLength", s.chars().count())]
+                Some((
+                    "minLength",
+                    &node.min_length,
+                    "maxLength",
+                    &node.max_length,
+                    s.chars().count(),
+                ))
             }
-            Value::Array(a) => &[("minItems", "maxItems", a.len())],
-            Value::Object(o) => &[("minProperties", "maxProperties", o.len())],
-            _ => &[],
+            Value::Array(a) => Some((
+                "minItems",
+                &node.min_items,
+                "maxItems",
+                &node.max_items,
+                a.len(),
+            )),
+            Value::Object(o) => Some((
+                "minProperties",
+                &node.min_properties,
+                "maxProperties",
+                &node.max_properties,
+                o.len(),
+            )),
+            _ => None,
         };
-        for &(min, max, count) in counts {
+        if let Some((min, lower, max, upper, count)) = count {
             let n = Decimal::count(count);
-            for (key, lower) in [(min, true), (max, false)] {
-                if let Some((&key, bound)) = node.counts.get_key_value(key) {
+            for (key, bound, lower) in [(min, lower, true), (max, upper, false)] {
+                if let Some(bound) = bound {
                     assertion!(
                         if lower {
                             n.cmp(bound) != Ordering::Less
@@ -1453,135 +2767,17 @@ impl Eval<'_, '_> {
                 }
             }
         }
-        if let Value::Array(items) = value {
-            if node.unique {
-                for (i, a) in items.iter().enumerate() {
-                    for b in &items[..i] {
-                        let same = equal(a, b, limits, self.work).map_err(|s| {
-                            self.error(id, p, "uniqueItems", ValidationKind::Limit(s))
-                        })?;
-                        assertion!(!same, "uniqueItems");
-                    }
-                }
-            }
-            let prefix = node
-                .groups
-                .get("prefixItems")
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            let mut matches = 0usize;
-            for (i, item) in items.iter().enumerate() {
-                self.spend(1, id, p, "items")?;
-                let at = self.child_path(id, p, &i.to_string())?;
-                if let Some(&schema) = prefix.get(i).or_else(|| node.single.get("items")) {
-                    child!(schema, item, &at, refs);
-                }
-                if let Some(&schema) = node.single.get("contains")
-                    && self.run(schema, item, &at, depth + 1, refs, false)?
-                {
-                    matches += 1;
-                }
-            }
-            if node.single.contains_key("contains") {
-                let count = Decimal::count(matches);
-                let min = node
-                    .counts
-                    .get("minContains")
-                    .cloned()
-                    .unwrap_or_else(|| Decimal::count(1));
-                let keyword = if node.counts.contains_key("minContains") {
-                    "minContains"
-                } else {
-                    "contains"
-                };
-                assertion!(count.cmp(&min) != Ordering::Less, keyword);
-                if let Some(max) = node.counts.get("maxContains") {
-                    assertion!(count.cmp(max) != Ordering::Greater, "maxContains");
-                }
-            }
-        }
-        if let Value::Object(object) = value {
-            let mut members = BTreeMap::new();
-            for (name, v) in object {
-                self.spend(name.len().saturating_add(1), id, p, "properties")?;
-                members.insert(name.as_str(), v);
-            }
-            for name in &node.required {
-                self.spend(name.len().saturating_add(1), id, p, "required")?;
-                assertion!(members.contains_key(name.as_str()), "required");
-            }
-            for (trigger, required) in &node.dependent {
-                self.spend(trigger.len().saturating_add(1), id, p, "dependentRequired")?;
-                if members.contains_key(trigger.as_str()) {
-                    for name in required {
-                        self.spend(name.len().saturating_add(1), id, p, "dependentRequired")?;
-                        assertion!(members.contains_key(name.as_str()), "dependentRequired");
-                    }
-                }
-            }
-            for (name, v) in object {
-                let at = self.child_path(id, p, name)?;
-                if let Some(&schema) = node.single.get("propertyNames") {
-                    child!(schema, &Value::String(name.clone()), &at, refs);
-                }
-                if let Some(&schema) = node
-                    .properties
-                    .get(name)
-                    .or_else(|| node.single.get("additionalProperties"))
-                {
-                    child!(schema, v, &at, refs);
-                }
-            }
-        }
-        if let Some(group) = node.groups.get("allOf") {
-            for &schema in group {
-                child!(schema, value, p, refs);
-            }
-        }
-        for key in ["anyOf", "oneOf"] {
-            if let Some(group) = node.groups.get(key) {
-                let mut count = 0usize;
-                for &schema in group {
-                    if self.run(schema, value, p, depth + 1, refs, false)? {
-                        count += 1;
-                    }
-                    if key == "anyOf" && count == 1 {
-                        break;
-                    }
-                }
-                assertion!(
-                    if key == "anyOf" {
-                        count > 0
-                    } else {
-                        count == 1
-                    },
-                    key
-                );
-            }
-        }
-        if let Some(&schema) = node.single.get("not") {
-            assertion!(!self.run(schema, value, p, depth + 1, refs, false)?, "not");
-        }
-        if let Some(&condition) = node.single.get("if") {
-            let key = if self.run(condition, value, p, depth + 1, refs, false)? {
-                "then"
-            } else {
-                "else"
-            };
-            if let Some(&schema) = node.single.get(key) {
-                child!(schema, value, p, refs);
-            }
-        }
         Ok(valid)
     }
 }
 
 impl Schema {
-    /// Searches deterministically for an example using the shared codec LCG.
+    /// Searches deterministically for an example using [`Lcg`].
     /// Every returned value passes this schema's validator and the supplied
     /// size bounds. The search uses hints, exact constants, intersected bounds,
     /// and branch candidates; it is not a complete constraint solver. Numeric
     /// candidate selection may use `f64`, but acceptance always uses exact text.
+    /// Known string formats guide synthesis even when they are annotations.
     /// Identical seeds, schemas, and limits produce identical results.
     pub fn generate(&self, seed: u64, limits: GenerationLimits) -> Result<Value, GenerationError> {
         if self.annotations.iter().any(|a| a.keyword != "format") {
@@ -1601,7 +2797,7 @@ impl Schema {
             let mut room = limits.total_nodes;
             let value = match generator.build(vec![0], 0, &mut room, round) {
                 Ok(v) => v,
-                Err(GenerationError::Limit("max_work")) => {
+                Err(GenerationError::Limit("work")) => {
                     return Err(GenerationError::Limit("work"));
                 }
                 Err(e) => {
@@ -1631,7 +2827,7 @@ impl Schema {
             let result = Eval {
                 schema: self,
                 work: &mut work,
-                active: Vec::new(),
+                active: BTreeSet::new(),
                 errors: Vec::new(),
                 cap: 1,
                 truncated: false,
@@ -1640,10 +2836,13 @@ impl Schema {
             generator
                 .work
                 .spend(budget - work.left)
-                .map_err(GenerationError::Limit)?;
+                .map_err(|_| GenerationError::Limit("work"))?;
             match result {
                 Ok(true) => return Ok(value),
                 Ok(false) => last = GenerationError::NoCandidate,
+                Err(e) if e.kind == ValidationKind::Limit("max_work") => {
+                    return Err(GenerationError::Limit("work"));
+                }
                 Err(e) => return Err(GenerationError::Validation(e)),
             }
         }
@@ -1663,7 +2862,9 @@ struct Generator<'a> {
 }
 impl Generator<'_> {
     fn spend(&mut self, n: usize) -> Result<(), GenerationError> {
-        self.work.spend(n).map_err(GenerationError::Limit)
+        self.work
+            .spend(n)
+            .map_err(|_| GenerationError::Limit("work"))
     }
     fn expand(&mut self, mut ids: Vec<usize>) -> Result<Vec<usize>, GenerationError> {
         let mut seen = BTreeSet::new();
@@ -1681,24 +2882,24 @@ impl Generator<'_> {
             if let Some(target) = node.reference {
                 ids.push(target);
             }
-            if let Some(group) = node.groups.get("allOf") {
+            if let Some(group) = node.all_of.as_ref() {
                 self.spend(group.len())?;
                 ids.extend(group);
             }
-            for key in ["anyOf", "oneOf"] {
-                if let Some(group) = node.groups.get(key)
+            for group in [&node.any_of, &node.one_of] {
+                if let Some(group) = group
                     && let Some(&id) = group.get(self.rng.index(group.len()))
                 {
                     ids.push(id);
                 }
             }
-            if let Some(&condition) = node.single.get("if") {
+            if let Some(&condition) = node.condition.as_ref() {
                 if self.rng.coin() {
                     ids.push(condition);
-                    if let Some(&id) = node.single.get("then") {
+                    if let Some(&id) = node.then_schema.as_ref() {
                         ids.push(id);
                     }
-                } else if let Some(&id) = node.single.get("else") {
+                } else if let Some(&id) = node.else_schema.as_ref() {
                     ids.push(id);
                 }
             }
@@ -1756,17 +2957,17 @@ impl Generator<'_> {
     fn bounds(
         &self,
         ids: &[usize],
-        min: &str,
-        max: &str,
+        select: fn(&Node) -> (Option<&Decimal>, Option<&Decimal>),
         cap: usize,
     ) -> Result<(usize, usize), GenerationError> {
         let (mut low, mut high) = (0, cap);
         for &id in ids {
             let node = &self.schema.nodes[id];
-            if let Some(n) = node.counts.get(min) {
+            let (min, max) = select(node);
+            if let Some(n) = min {
                 low = low.max(n.as_usize().ok_or(GenerationError::NoCandidate)?);
             }
-            if let Some(n) = node.counts.get(max)
+            if let Some(n) = max
                 && let Some(n) = n.as_usize()
             {
                 high = high.min(n);
@@ -1810,18 +3011,18 @@ impl Generator<'_> {
             }
             if !node.properties.is_empty()
                 || !node.required.is_empty()
-                || node.counts.contains_key("minProperties")
+                || node.min_properties.is_some()
             {
                 preferred = OBJECT;
-            } else if node.single.contains_key("items")
-                || node.single.contains_key("contains")
-                || node.groups.contains_key("prefixItems")
-                || node.counts.contains_key("minItems")
+            } else if node.items.is_some()
+                || node.contains.is_some()
+                || node.prefix_items.is_some()
+                || node.min_items.is_some()
             {
                 preferred = ARRAY;
-            } else if node.counts.contains_key("minLength") {
+            } else if node.min_length.is_some() || node.format.is_some() {
                 preferred = STRING;
-            } else if !node.numbers.is_empty() {
+            } else if node.numeric_bounds().next().is_some() {
                 preferred = INTEGER;
             }
             let candidate = if let Some(c) = &node.constant {
@@ -1863,8 +3064,19 @@ impl Generator<'_> {
             BOOL => Ok(Value::Bool(self.rng.coin())),
             INTEGER | NUMBER => self.number(&ids, kind == INTEGER, round),
             STRING => {
-                let (low, high) =
-                    self.bounds(&ids, "minLength", "maxLength", self.limits.string_length)?;
+                let (low, high) = self.bounds(
+                    &ids,
+                    |n| (n.min_length.as_ref(), n.max_length.as_ref()),
+                    self.limits.string_length,
+                )?;
+                for &id in &ids {
+                    if let Some(format) = &self.schema.nodes[id].format {
+                        self.spend(high.saturating_add(1))?;
+                        if let Some(s) = format_example(format, low, high) {
+                            return Ok(Value::String(s));
+                        }
+                    }
+                }
                 let n = low
                     + self.rng.index(
                         high.min(low.saturating_add(8))
@@ -1892,7 +3104,7 @@ impl Generator<'_> {
         let mut candidates = Vec::new();
         let mut multiple = None;
         for &id in ids {
-            for (&key, d) in &self.schema.nodes[id].numbers {
+            for (key, d) in self.schema.nodes[id].numeric_bounds() {
                 self.spend(d.digits.len().saturating_add(1))?;
                 if key == "multipleOf" {
                     multiple = Some(d);
@@ -1986,14 +3198,17 @@ impl Generator<'_> {
         room: &mut usize,
         round: usize,
     ) -> Result<Value, GenerationError> {
-        let (mut low, high) =
-            self.bounds(ids, "minItems", "maxItems", self.limits.items.min(*room))?;
+        let (mut low, high) = self.bounds(
+            ids,
+            |n| (n.min_items.as_ref(), n.max_items.as_ref()),
+            self.limits.items.min(*room),
+        )?;
         for &id in ids {
             let node = &self.schema.nodes[id];
-            if node.single.contains_key("contains") {
+            if node.contains.is_some() {
                 let n = node
-                    .counts
-                    .get("minContains")
+                    .min_contains
+                    .as_ref()
                     .map_or(Some(1), Decimal::as_usize)
                     .ok_or(GenerationError::NoCandidate)?;
                 low = low.max(n);
@@ -2013,17 +3228,17 @@ impl Generator<'_> {
             for &id in ids {
                 let node = &self.schema.nodes[id];
                 let child = node
-                    .groups
-                    .get("prefixItems")
+                    .prefix_items
+                    .as_ref()
                     .and_then(|p| p.get(i))
-                    .or_else(|| node.single.get("items"));
+                    .or(node.items.as_ref());
                 if let Some(&id) = child {
                     children.push(id);
                 }
-                if let Some(&id) = node.single.get("contains") {
+                if let Some(&id) = node.contains.as_ref() {
                     let need = node
-                        .counts
-                        .get("minContains")
+                        .min_contains
+                        .as_ref()
                         .and_then(Decimal::as_usize)
                         .unwrap_or(1);
                     if i < need {
@@ -2042,51 +3257,56 @@ impl Generator<'_> {
         room: &mut usize,
         round: usize,
     ) -> Result<Value, GenerationError> {
-        let (low, high) = self.bounds(
-            ids,
-            "minProperties",
-            "maxProperties",
-            self.limits.items.min(*room),
-        )?;
+        let mut ids = ids.to_vec();
+        let mut seen: BTreeSet<_> = ids.iter().copied().collect();
         let mut names = BTreeSet::new();
-        let mut available = BTreeSet::new();
-        for &id in ids {
-            let node = &self.schema.nodes[id];
-            self.spend(node.required.len().saturating_add(node.properties.len()))?;
-            names.extend(node.required.iter().cloned());
-            available.extend(node.properties.keys().cloned());
-            if let Some(&id) = node.single.get("propertyNames") {
-                let n = &self.schema.nodes[id];
-                if let Some(Value::String(s)) = &n.constant {
-                    available.insert(s.clone());
-                }
-                if let Some(a) = &n.enumeration {
-                    for v in a {
-                        if let Value::String(s) = v {
-                            available.insert(s.clone());
+        let mut processed = 0;
+        loop {
+            let previous = (names.len(), ids.len());
+            let (low, high) = self.bounds(
+                &ids,
+                |n| (n.min_properties.as_ref(), n.max_properties.as_ref()),
+                self.limits.items.min(*room),
+            )?;
+            let mut available = BTreeSet::new();
+            for &id in &ids[processed..] {
+                let node = &self.schema.nodes[id];
+                self.spend(node.required.len().saturating_add(node.properties.len()))?;
+                names.extend(node.required.iter().cloned());
+                available.extend(node.properties.keys().cloned());
+                if let Some(id) = node.property_names {
+                    let n = &self.schema.nodes[id];
+                    if let Some(Value::String(s)) = &n.constant {
+                        available.insert(s.clone());
+                    }
+                    if let Some(a) = &n.enumeration {
+                        for v in a {
+                            if let Value::String(s) = v {
+                                available.insert(s.clone());
+                            }
                         }
                     }
                 }
             }
-        }
-        for s in available {
-            if names.len() >= high {
-                break;
+            processed = ids.len();
+            for s in available {
+                if names.len() >= high {
+                    break;
+                }
+                if names.len() < low || (!round.is_multiple_of(2) && self.rng.coin()) {
+                    names.insert(s);
+                }
             }
-            if names.len() < low || (!round.is_multiple_of(2) && self.rng.coin()) {
-                names.insert(s);
+            for i in 0..=self.limits.items {
+                if names.len() >= low {
+                    break;
+                }
+                names.insert(format!("p{i}"));
             }
-        }
-        for i in 0..=self.limits.items {
-            if names.len() >= low {
-                break;
-            }
-            names.insert(format!("p{i}"));
-        }
-        loop {
-            let previous = names.len();
-            for &id in ids {
-                for (trigger, required) in &self.schema.nodes[id].dependent {
+            let mut triggered = Vec::new();
+            for &id in &ids {
+                let node = &self.schema.nodes[id];
+                for (trigger, required) in &node.dependent {
                     self.spend(
                         trigger
                             .len()
@@ -2097,11 +3317,22 @@ impl Generator<'_> {
                         names.extend(required.iter().cloned());
                     }
                 }
+                for (trigger, &child) in &node.dependent_schemas {
+                    self.spend(trigger.len().saturating_add(1))?;
+                    if names.contains(trigger) && !seen.contains(&child) {
+                        triggered.push(child);
+                    }
+                }
+            }
+            for id in self.expand(triggered)? {
+                if seen.insert(id) {
+                    ids.push(id);
+                }
             }
             if names.len() > high {
                 return Err(GenerationError::NoCandidate);
             }
-            if previous == names.len() {
+            if previous == (names.len(), ids.len()) {
                 break;
             }
         }
@@ -2111,12 +3342,12 @@ impl Generator<'_> {
                 return Err(GenerationError::Limit("string_length"));
             }
             let mut children = Vec::new();
-            for &id in ids {
+            for &id in &ids {
                 let node = &self.schema.nodes[id];
                 if let Some(&id) = node
                     .properties
                     .get(&name)
-                    .or_else(|| node.single.get("additionalProperties"))
+                    .or(node.additional_properties.as_ref())
                 {
                     children.push(id);
                 }
@@ -2401,7 +3632,7 @@ mod tests {
         }
         for s in [
             r#"{"$anchor":"0bad"}"#,
-            r#"{"$defs":{"a":{"$anchor":"x"},"b":{"$anchor":"x"}}}"#,
+            r##"{"$ref":"#x","$defs":{"a":{"$anchor":"x"},"b":{"$anchor":"x"}}}"##,
         ] {
             assert_eq!(
                 Schema::compile(&value(s)).unwrap_err().kind,
@@ -2431,7 +3662,7 @@ mod tests {
             assert_eq!(s.annotations().len(), 1);
             let r = s.validate(&value(r#"{"x":false}"#));
             assert!(r.is_valid());
-            assert_eq!(r.annotations.len(), 1);
+            assert_eq!(s.annotations().len(), 1);
             assert_eq!(
                 s.generate(0, GenerationLimits::default()),
                 Err(GenerationError::UnsupportedPattern)
@@ -2766,7 +3997,7 @@ mod tests {
 
     #[test]
     fn mutated_schema_and_instance_inputs() {
-        let mut rng = test_support::Lcg::new(27);
+        let mut rng = Lcg::new(27);
         let mut bytes =
             br#"{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}"#.to_vec();
         for _ in 0..500 {
@@ -2848,7 +4079,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(s.options().limits, Limits::default());
+        assert_eq!(s.options().limits.max_work, usize::MAX);
+        assert_eq!(s.options().limits.max_depth, 256);
+        assert_eq!(s.options().limits.max_number_exponent, 1_000_000);
         let s = Schema::compile_with(
             &value(r#"{"not":false}"#),
             Options {
@@ -2897,5 +4130,358 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(e.kind, CompileErrorKind::Limit("max_work"));
+    }
+    #[test]
+    fn review_unique_items_scales_and_normalizes() {
+        let s = schema(r#"{"uniqueItems":true}"#);
+        for values in [
+            (0..1000)
+                .map(|i| Value::from(format!("item-{i:06}")))
+                .collect(),
+            (0..20_000).map(Value::from).collect(),
+        ] {
+            let report = s.validate(&Value::Array(values));
+            assert!(report.is_valid(), "{report:?}");
+        }
+        for text in ["[1,1.0]", r#"[{"a":1,"b":2},{"b":2.0,"a":1}]"#] {
+            assert_eq!(
+                s.validate(&value(text)).errors[0].kind,
+                ValidationKind::Assertion("uniqueItems")
+            );
+        }
+    }
+
+    #[test]
+    fn review_dependent_schemas_and_unsupported_keywords() {
+        cases(
+            r#"{"dependentSchemas":{"a":{"required":["b"]}}}"#,
+            &["{}", r#"{"a":1,"b":2}"#],
+            &[r#"{"a":1}"#],
+        );
+        for (key, v) in [
+            ("unevaluatedProperties", Value::Bool(false)),
+            ("unevaluatedItems", Value::Bool(false)),
+            ("$dynamicRef", Value::from("#x")),
+            ("$dynamicAnchor", Value::from("x")),
+            ("$recursiveRef", Value::from("#")),
+            ("contentSchema", Value::Bool(false)),
+        ] {
+            let source = Value::Object(vec![(key.into(), v)]);
+            assert_eq!(
+                Schema::compile(&source).unwrap_err().kind,
+                CompileErrorKind::UnsupportedKeyword(key.into())
+            );
+        }
+    }
+
+    #[test]
+    fn review_format_generation() {
+        for (format, expected) in [
+            ("date-time", "2000-01-01T00:00:00Z"),
+            ("date", "2000-01-01"),
+            ("time", "00:00:00Z"),
+            ("email", "a@example.test"),
+            ("uuid", "00000000-0000-4000-8000-000000000000"),
+            ("uri", "https://example.test/"),
+            ("ipv4", "192.0.2.1"),
+            ("ipv6", "2001:db8::1"),
+            ("hostname", "example.test"),
+        ] {
+            let s = schema(&format!(r#"{{"type":"string","format":"{format}"}}"#));
+            let generated = s.generate(7, GenerationLimits::default()).unwrap();
+            assert_eq!(generated.as_str(), Some(expected), "{format}");
+        }
+    }
+
+    #[test]
+    fn review_path_storage_is_proportional_to_source() {
+        let mut source = Value::Object(vec![(
+            "properties".into(),
+            Value::Object(
+                (0..16_000)
+                    .map(|i| (i.to_string(), Value::Bool(true)))
+                    .collect(),
+            ),
+        )]);
+        for _ in 0..4 {
+            source = Value::Object(vec![(
+                "properties".into(),
+                Value::Object(vec![("x".repeat(1000), source)]),
+            )]);
+        }
+        let s = Schema::compile(&source).unwrap();
+        let path_bytes: usize = s.paths.0.iter().map(|path| path.token.len()).sum();
+        assert!(path_bytes < 100_000, "stored {path_bytes} path bytes");
+    }
+
+    #[test]
+    fn review_recursive_list_reaches_json_depth() {
+        let s = schema(
+            r##"{"$defs":{"n":{"anyOf":[{"type":"null"},{"type":"object","required":["next"],"properties":{"next":{"$ref":"#/$defs/n"}}}]}},"$ref":"#/$defs/n"}"##,
+        );
+        let mut instance = Value::Null;
+        for _ in 0..json::MAX_DEPTH {
+            instance = Value::Object(vec![("next".into(), instance)]);
+        }
+        contract::check_wire_value(&instance);
+        let report = s.validate(&instance);
+        assert!(report.is_valid(), "{report:?}");
+    }
+
+    #[test]
+    fn review_property_names_path_and_oas_examples() {
+        let s = schema(r#"{"propertyNames":{"maxLength":2}}"#);
+        assert_eq!(
+            s.validate(&value(r#"{"abc":1}"#)).errors[0].instance_path,
+            ""
+        );
+        assert!(
+            Schema::compile_with(
+                &value(r#"{"type":"string","examples":{"a":"b"}}"#),
+                Options {
+                    dialect: Dialect::OpenApi30,
+                    ..Options::default()
+                }
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn review_raised_schema_limits_take_effect() {
+        let source = Value::Object(vec![(
+            "enum".into(),
+            Value::Array(vec![Value::Null; 17_000]),
+        )]);
+        let options = Options {
+            limits: Limits {
+                max_schema_nodes: 20_000,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        assert!(Schema::compile_with(&source, options).is_ok());
+        let source = Value::Object(vec![(
+            "description".into(),
+            Value::from("x".repeat((1 << 20) + 1)),
+        )]);
+        let options = Options {
+            limits: Limits {
+                max_bytes: 2 << 20,
+                max_work: 4_000_000,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        assert!(Schema::compile_with(&source, options).is_ok());
+    }
+    #[test]
+    fn review_format_assertions_share_generation_checks() {
+        for (name, good, bad) in [
+            (
+                "date-time",
+                "2024-02-29t23:59:59.01+05:30",
+                "2023-02-29T00:00:00Z",
+            ),
+            ("date", "2024-02-29", "2024-04-31"),
+            ("time", "23:59:60Z", "24:00:00Z"),
+            ("email", "\"a b\"@example.test", "a..b@example.test"),
+            (
+                "uuid",
+                "00000000-0000-4000-8000-000000000000",
+                "urn:uuid:00000000-0000-4000-8000-000000000000",
+            ),
+            (
+                "uri",
+                "https://example.test/a%20b?x=1#ok",
+                "https://example.test/%xx",
+            ),
+            ("ipv4", "192.0.2.1", "192.0.2.256"),
+            ("ipv6", "2001:db8::1", "2001:db8:::1"),
+            ("hostname", "api.example.test", "-api.example.test"),
+        ] {
+            let source = value(&format!(r#"{{"type":"string","format":"{name}"}}"#));
+            let s = Schema::compile_with(
+                &source,
+                Options {
+                    formats: FormatPolicy::Assert,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+            assert!(s.validate(&Value::from(good)).is_valid(), "{name}: {good}");
+            assert_eq!(
+                s.validate(&Value::from(bad)).errors[0].kind,
+                ValidationKind::Assertion("format")
+            );
+            let example = s.generate(1, GenerationLimits::default()).unwrap();
+            assert!(s.validate(&example).is_valid());
+            assert!(valid_format(name, example.as_str().unwrap()));
+            for length in 0..=48 {
+                let bounded = value(&format!(
+                    r#"{{"type":"string","format":"{name}","minLength":{length},"maxLength":{length}}}"#
+                ));
+                let annotation = Schema::compile(&bounded).unwrap();
+                let example = annotation.generate(3, GenerationLimits::default()).unwrap();
+                assert_eq!(example.as_str().unwrap().len(), length);
+                if let Some(expected) = format_example(name, length, length) {
+                    assert!(valid_format(name, &expected), "{name}: {expected}");
+                    assert_eq!(example.as_str(), Some(expected.as_str()));
+                } else {
+                    assert!(
+                        example
+                            .as_str()
+                            .unwrap()
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase())
+                    );
+                }
+            }
+        }
+        let s = Schema::compile_with(
+            &value(r#"{"format":"custom-format"}"#),
+            Options {
+                formats: FormatPolicy::Assert,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert!(s.validate(&Value::from("anything")).is_valid());
+    }
+
+    #[test]
+    fn review_missing_names_and_generation_work_errors() {
+        let s = schema(r#"{"required":["a","b"],"dependentRequired":{"x":["c"]}}"#);
+        let errors = s.validate_with(&value(r#"{"x":1}"#), ErrorMode::All).errors;
+        assert_eq!(
+            errors.iter().map(|e| e.kind.clone()).collect::<Vec<_>>(),
+            [
+                ValidationKind::Missing("a".into()),
+                ValidationKind::Missing("b".into()),
+                ValidationKind::Missing("c".into())
+            ]
+        );
+        for source in [
+            "true",
+            r#"{"const":"example"}"#,
+            r#"{"allOf":[true,true,true,true]}"#,
+        ] {
+            for work in 0..12 {
+                if let Err(e) = schema(source).generate(
+                    7,
+                    GenerationLimits {
+                        work,
+                        ..GenerationLimits::default()
+                    },
+                ) {
+                    assert_eq!(e, GenerationError::Limit("work"));
+                }
+            }
+        }
+    }
+    #[test]
+    fn review_compile_at_limits_exclude_document_ancestors_and_unused_defs() {
+        let unused = value(r#"{"$defs":{"bad":{"unevaluatedProperties":false}}}"#);
+        assert!(
+            Schema::compile_with(
+                &unused,
+                Options {
+                    limits: Limits {
+                        max_schema_nodes: 1,
+                        max_depth: 0,
+                        ..Limits::default()
+                    },
+                    ..Options::default()
+                }
+            )
+            .is_ok()
+        );
+        let source = value(
+            r##"{"entry":{"$ref":"#/target"},"target":{"type":"integer","minimum":1,"$defs":{"unused":{"unevaluatedProperties":false}}},"unused":{"type":17}}"##,
+        );
+        let options = Options {
+            limits: Limits {
+                max_schema_nodes: 8,
+                max_bytes: 100,
+                max_depth: 1,
+                ..Limits::default()
+            },
+            ..Options::default()
+        };
+        let s = Schema::compile_at(&source, "/entry", options).unwrap();
+        assert!(s.validate(&Value::from(1)).is_valid());
+        assert_eq!(
+            s.validate(&Value::from(0)).errors[0].schema_path,
+            "/target/minimum"
+        );
+        assert!(Schema::compile_at(&source, "/unused", options).is_err());
+        for pointer in ["entry", "/missing", "/~2", "/entry/~"] {
+            assert_eq!(
+                Schema::compile_at(&source, pointer, Options::default())
+                    .unwrap_err()
+                    .kind,
+                CompileErrorKind::InvalidReference
+            );
+        }
+        let a = Schema::compile(source.get("target").unwrap()).unwrap();
+        let b = Schema::compile_at(source.get("target").unwrap(), "", Options::default()).unwrap();
+        assert_eq!(
+            a.validate(&Value::from(0)).errors,
+            b.validate(&Value::from(0)).errors
+        );
+        assert_eq!(
+            a.generate(5, GenerationLimits::default()),
+            b.generate(5, GenerationLimits::default())
+        );
+    }
+
+    #[test]
+    fn review_raised_evaluation_ceiling_stays_bounded() {
+        let defs = (0..1030)
+            .map(|i| {
+                (
+                    format!("n{i}"),
+                    Value::Object(vec![(
+                        "$ref".into(),
+                        Value::from(format!("#/$defs/n{}", i + 1)),
+                    )]),
+                )
+            })
+            .chain(std::iter::once(("n1030".into(), Value::Bool(true))))
+            .collect();
+        let source = Value::Object(vec![
+            ("$defs".into(), Value::Object(defs)),
+            ("$ref".into(), Value::from("#/$defs/n0")),
+        ]);
+        let s = Schema::compile_with(
+            &source,
+            Options {
+                limits: Limits {
+                    max_validation_depth: 1024,
+                    max_ref_depth: usize::MAX,
+                    max_work: 100_000_000,
+                    ..Limits::default()
+                },
+                ..Options::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            s.validate(&Value::Null).errors[0].kind,
+            ValidationKind::Limit("max_validation_depth")
+        );
+    }
+
+    #[test]
+    fn review_generation_applies_triggered_dependent_schemas() {
+        let s = schema(
+            r#"{"type":"object","required":["a"],"properties":{"a":{"const":true}},"dependentSchemas":{"a":{"required":["b"],"properties":{"b":{"const":7}},"dependentSchemas":{"b":{"required":["c"],"properties":{"c":{"const":"yes"}}}}}}}"#,
+        );
+        for seed in 0..32 {
+            let generated = s.generate(seed, GenerationLimits::default()).unwrap();
+            assert!(s.validate(&generated).is_valid());
+            assert_eq!(generated.get("b"), Some(&Value::from(7)));
+            assert_eq!(generated.get("c"), Some(&Value::from("yes")));
+        }
     }
 }

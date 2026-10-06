@@ -117,3 +117,41 @@ fn copied_schema_module_composes_with_sdk_json() {
     let example = schema.generate(12, Default::default()).unwrap();
     assert!(schema.validate(&example).is_valid());
 }
+
+#[test]
+fn openapi_document_entries_only_compile_reachable_schemas() {
+    let mut paths: Vec<_> = (0..5000)
+        .map(|i| {
+            (
+                format!("/p{i}"),
+                parse(br#"{"get":{"description":"unused","responses":{}}}"#),
+            )
+        })
+        .collect();
+    paths.push(("/pets".into(), parse(br##"{"post":{"requestBody":{"content":{"application/json":{"schema":{"$ref":"#/components/schemas/Pet"}}}}}}"##)));
+    let document = Value::Object(vec![
+        ("openapi".into(), Value::from("3.0.3")),
+        ("paths".into(), Value::Object(paths)),
+        ("components".into(), parse(br#"{"schemas":{"Pet":{"type":"object","required":["id"],"properties":{"id":{"type":"integer","minimum":1}},"additionalProperties":false},"Unused":{"unevaluatedProperties":false}}}"#)),
+        ("ignored".into(), Value::from("x".repeat(2 << 20))),
+    ]);
+    let options = Options {
+        dialect: Dialect::OpenApi30,
+        ..Options::default()
+    };
+    for entry in [
+        "/components/schemas/Pet",
+        "/paths/~1pets/post/requestBody/content/application~1json/schema",
+    ] {
+        let schema = Schema::compile_at(&document, entry, options).unwrap();
+        assert!(schema.validate(&parse(br#"{"id":1}"#)).is_valid());
+        let report = schema.validate(&parse(br#"{"id":0}"#));
+        assert_eq!(
+            report.errors[0].schema_path,
+            "/components/schemas/Pet/properties/id/minimum"
+        );
+        let example = schema.generate(17, GenerationLimits::default()).unwrap();
+        assert!(schema.validate(&example).is_valid());
+        contract::check_wire_value(&example);
+    }
+}

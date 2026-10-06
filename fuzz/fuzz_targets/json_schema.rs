@@ -1,10 +1,11 @@
-//! Arbitrary schema/instance pairs, dialects, bounded validation, and examples.
+//! Document entries, schema/instance pairs, formats, dependencies, and examples.
 #![no_main]
 
 use fictionet::stdlib::codec::contract;
-use fictionet::stdlib::json;
+use fictionet::stdlib::json::{self, Value};
 use fictionet::stdlib::json_schema::{
-    Dialect, ErrorMode, GenerationLimits, Limits, Options, PatternPolicy, Schema,
+    CompileErrorKind, Dialect, ErrorMode, FormatPolicy, GenerationLimits, Limits, Options,
+    PatternPolicy, Schema,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -39,6 +40,11 @@ fuzz_target!(|input: &[u8]| {
         } else {
             PatternPolicy::Annotate
         },
+        formats: if flags & 4 == 0 {
+            FormatPolicy::Annotate
+        } else {
+            FormatPolicy::Assert
+        },
         limits: Limits {
             max_schema_nodes: 512,
             max_instance_nodes: 512,
@@ -50,7 +56,7 @@ fuzz_target!(|input: &[u8]| {
             ..Limits::default()
         },
     };
-    if let Ok(schema) = Schema::compile_with(&source, options) {
+    let check = |schema: Schema| {
         let first = schema.validate(&instance);
         let all = schema.validate_with(&instance, ErrorMode::All);
         assert_eq!(first.is_valid(), all.is_valid());
@@ -58,7 +64,7 @@ fuzz_target!(|input: &[u8]| {
         let bounds = GenerationLimits {
             depth: 5,
             items: 8,
-            string_length: 32,
+            string_length: 64,
             total_nodes: 64,
             attempts: 64,
             work: 50_000,
@@ -69,6 +75,78 @@ fuzz_target!(|input: &[u8]| {
         if let Ok(example) = result {
             assert!(schema.validate(&example).is_valid());
             contract::check_wire_value(&example);
+        }
+    };
+    if let Ok(schema) = Schema::compile_with(&source, options) {
+        check(schema);
+    }
+    let document = Value::Object(vec![
+        (
+            "components".into(),
+            Value::Object(vec![("schema".into(), source)]),
+        ),
+        (
+            "body".into(),
+            Value::Object(vec![("$ref".into(), Value::from("#/components/schema"))]),
+        ),
+        ("unrelated".into(), instance.clone()),
+    ]);
+    for pointer in ["/body", "/components/schema"] {
+        if let Ok(schema) = Schema::compile_at(&document, pointer, options) {
+            check(schema);
+        }
+    }
+    if let Some(pointer) = instance.as_str() {
+        let _ = Schema::compile_at(&document, pointer, options);
+    }
+    let formats = [
+        "date-time",
+        "date",
+        "time",
+        "email",
+        "uuid",
+        "uri",
+        "ipv4",
+        "ipv6",
+        "hostname",
+    ];
+    let formatted = Value::Object(vec![
+        ("type".into(), Value::from("string")),
+        (
+            "format".into(),
+            Value::from(formats[usize::from(flags) % formats.len()]),
+        ),
+        ("minLength".into(), Value::from(i64::from(split % 48))),
+        ("maxLength".into(), Value::from(i64::from(split % 48 + 16))),
+    ]);
+    if let Ok(schema) = Schema::compile_with(&formatted, options) {
+        check(schema);
+    }
+    let dependent = Value::Object(vec![(
+        "dependentSchemas".into(),
+        Value::Object(vec![("trigger".into(), formatted)]),
+    )]);
+    if let Ok(schema) = Schema::compile_with(&dependent, options) {
+        check(schema);
+    }
+    for keyword in [
+        "unevaluatedProperties",
+        "unevaluatedItems",
+        "$dynamicRef",
+        "$dynamicAnchor",
+        "$recursiveRef",
+        "contentSchema",
+    ] {
+        let source = Value::Object(vec![(keyword.into(), instance.clone())]);
+        if let Err(error) = Schema::compile_with(&source, options) {
+            assert!(matches!(
+                error.kind,
+                CompileErrorKind::UnsupportedKeyword(_)
+                    | CompileErrorKind::Limit(_)
+                    | CompileErrorKind::DuplicateKey
+            ));
+        } else {
+            panic!("unsupported keyword compiled: {keyword}");
         }
     }
 });
