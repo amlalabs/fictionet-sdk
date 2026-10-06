@@ -623,9 +623,15 @@ pub(crate) fn emit(cx: &Cx, name: &str, payload: &str) -> Result<(), NotJson> {
 /// Tells observers that a queue dropped `packet` with `waiting` packets
 /// ahead of it.
 pub(crate) fn note_drop(cx: &Cx, packet: &crate::Packet, waiting: usize) {
+    note_dropped(cx, packet, &format!("the queue was full, {waiting} packets waiting"));
+}
+
+/// Tells observers that `packet` was dropped, and `why`: a note of kind
+/// `drop` with the packet's addresses, protocol and length.
+pub(crate) fn note_dropped(cx: &Cx, packet: &crate::Packet, why: &str) {
     // Only the headers: this runs on the world's own thread.
     let d = decode::Dissector::headers_only().decode(&packet.0, &[]);
-    let text = format!("{} → {} {} ({} bytes): the queue was full, {waiting} packets waiting", d.src, d.dst, d.proto, packet.0.len());
+    let text = format!("{} → {} {} ({} bytes): {why}", d.src, d.dst, d.proto, packet.0.len());
     cx.graph().note("drop", text, Some(&packet.0));
 }
 

@@ -29,17 +29,27 @@ const MEMBERS: &[(&str, u8)] = &[
     ("attacker", 100),
 ];
 
+const USAGE: &str = "\
+usage: goad [WORLD_SOCKET] [A.B.C]
+
+  WORLD_SOCKET  the Unix socket the world listens on (default /run/fictionet/goad.sock)
+  A.B.C         the first three octets of the lab's /24 (default 192.168.56)
+";
+
 fn main() -> Result {
-    let mut args = std::env::args().skip(1);
-    let socket = args
-        .next()
-        .unwrap_or_else(|| "/run/fictionet/goad.sock".into());
-    let prefix = parse_prefix(&args.next().unwrap_or_else(|| "192.168.56".into()))?;
-    if let Some(arg) = args.next() {
-        return Err(
-            format!("unexpected argument {arg:?}; usage: goad [WORLD_SOCKET] [A.B.C]").into(),
-        );
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{USAGE}");
+        return Ok(());
     }
+    if let Some(flag) = args.iter().find(|a| a.starts_with('-')) {
+        return Err(format!("unknown option {flag:?}\n{USAGE}").into());
+    }
+    if args.len() > 2 {
+        return Err(format!("unexpected argument {:?}\n{USAGE}", args[2]).into());
+    }
+    let socket = args.first().cloned().unwrap_or_else(|| "/run/fictionet/goad.sock".into());
+    let prefix = parse_prefix(args.get(1).map_or("192.168.56", String::as_str))?;
 
     let subnet: Prefix = format!("{}.{}.{}.0/24", prefix[0], prefix[1], prefix[2]).parse()?;
     let members: HashMap<&str, IpAddr> = MEMBERS

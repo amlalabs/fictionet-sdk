@@ -25,23 +25,33 @@ the same name.
 ## What Fictionet provides
 
 Each VM gets a separate point-to-point attachment. `fictionet attach` answers
-its ARP requests with proxy ARP, removes the Ethernet header and sends the
-original IP packet to the world. The world's IP LAN sends unicast to the member
-that owns the destination and copies subnet broadcast, limited broadcast and
-IPv4 multicast to every other member. That covers ordinary AD traffic and the
-IP discovery protocols used by tools such as Responder: DNS, Kerberos, LDAP,
-CLDAP, SMB, DCE/RPC, WinRM, RDP, MSSQL, LLMNR and NBNS all come from the real
-machines.
+every ARP request from the VM itself, with its own MAC, removes the Ethernet
+header and sends the IP packet to the world. The world's IP LAN sends unicast
+to the member that owns the destination and copies subnet broadcast, limited
+broadcast and IPv4 multicast to every other member. That covers ordinary AD
+traffic and the IPv4 discovery protocols that tools such as Responder poison:
+DNS, Kerberos, LDAP, CLDAP, SMB, DCE/RPC, WinRM, RDP, MSSQL, LLMNR and NBNS all
+come from the real machines.
+
+The LAN is IPv4 only. The attach flags below give the guests no IPv6, and
+attach keeps each guest's IPv6 link-local traffic on the guest's own link, so
+LLMNR over `ff02::1:3`, mDNS over IPv6 and DHCPv6 never enter the world.
+Windows sends LLMNR over IPv4 as well, and NBNS and DNS are IPv4 here, so
+name resolution between the guests still works. Attacks that need IPv6 on
+the segment, such as DHCPv6 spoofing with mitm6, are outside this lab.
 
 Fictionet is the only data path between members, so the dashboard and observers
-see the real packets and link controls such as delay, loss and capture can be
-inserted later. Unknown destinations are dropped; the lab has no accidental
-route to the host or internet.
+see the real packets, and link controls such as delay, loss and capture can be
+inserted later. A packet for an address with no member, or for another subnet,
+is dropped, and the LAN notes each drop with its reason while the dashboard
+or another observer is connected. This world adds no gateway, so the lab has
+no route to the host or the internet. A world that wants one gives the LAN a
+gateway with `Lan::gateway` and puts a `route::router` behind it.
 
 The boundary is Ethernet-only behavior. Attach terminates ARP and does not pass
 raw Ethernet frames, VLANs or non-IP link protocols into a world. ARP poisoning
 therefore is not part of this topology. Application-level AD attack paths and
-IP multicast/broadcast poisoning remain real.
+IPv4 multicast and broadcast poisoning remain real.
 
 ## Prepare the guests
 
@@ -74,26 +84,34 @@ $ target/release/examples/goad /run/user/$(id -u)/fictionet-goad/world.sock 192.
 Use another three-octet prefix as the second argument when the guests were
 provisioned on a different GOAD range, for example `192.168.100`.
 
-For each Windows VM, start one attach before starting QEMU. Static Windows
-addresses are kept inside the guests, so all address services in attach are
-disabled:
+For each Windows VM, start one attach before starting QEMU. The Windows
+guests keep their static addresses, so attach hands out none, for either
+family. With `--no-ip-addr` it also drops the guest's DHCP requests instead
+of passing them to the world:
 
 ```console
 $ target/release/fictionet attach \
     --world unix:/run/user/$(id -u)/fictionet-goad/world.sock \
     --name dc01 --type tap \
     --vm qemu:/run/user/$(id -u)/fictionet-goad/dc01.sock \
-    --no-ip-addr --no-gateway --no-dns \
-    --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6
+    --no-ip-addr --no-ip-addr-v6
 ```
 
-Add this network device to the VM's normal QEMU command. `e1000` is useful for
-Windows images that do not have virtio-net drivers installed:
+Attach listens on the socket, connects to the world, and then waits for
+QEMU. Add this network device to the VM's normal QEMU command. `e1000` is
+useful for Windows images that do not have virtio-net drivers installed:
 
 ```console
 -netdev stream,id=lab,server=off,addr.type=unix,addr.path=/run/user/UID/fictionet-goad/dc01.sock,reconnect-ms=500 \
 -device e1000,netdev=lab,mac=52:54:00:00:00:10
 ```
+
+`server=off` makes QEMU the client of attach's socket. `reconnect-ms` makes
+QEMU try the socket again every half second if attach is restarted under a
+running VM. It needs QEMU 9.2 or later; older QEMU spells it `reconnect=1`,
+in seconds. QEMU adds its default user-mode network card, which reaches the
+real internet, only when no `-netdev` or `-nic` is given, so this VM has the
+one card.
 
 Repeat with the attachment name, socket and final MAC byte for each guest.
 Only the lab NIC should remain connected during an eval. A provisioning or NAT
@@ -111,7 +129,9 @@ $ sudo target/release/fictionet attach \
     --no-ip-addr-v6 --no-gateway-v6 --no-dns-v6
 ```
 
-Programs run in that namespace without proxy settings:
+The attacker's default route points at `192.168.56.1`, an address with no
+member, so whatever it sends to other subnets is dropped by the LAN and
+noted. Programs run in that namespace without proxy settings:
 
 ```console
 $ sudo ip netns exec goad-attacker dig @192.168.56.10 \

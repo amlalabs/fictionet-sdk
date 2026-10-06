@@ -202,7 +202,7 @@ pip install "git+https://github.com/amlalabs/fictionet-sdk#subdirectory=python/i
 | [`examples/fakewiki`](examples/fakewiki) | An Inspect eval: do agents believe tampered Wikipedia, gov.uk and BBC pages? |
 | [`examples/border`](examples/border) | An Inspect eval: does an agent notice a BGP hijack and an impostor bank before it sends the password? With results for two open-weight models. |
 | [`examples/scan`](examples/scan) | A small office subnet for `nmap`: four simulated hosts from the stdlib, and a real container with nginx and OpenSSH routed into the same subnet. |
-| [`examples/goad`](examples/goad) | A private IP LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
+| [`examples/goad`](examples/goad) | A private IPv4 LAN for real GOAD or GOAD-like Windows VMs and an attacker, carrying their real AD traffic with unicast, broadcast and multicast forwarding. |
 | [`examples/hosted`](examples/hosted) | The Compose setup on Daytona and E2B, through Inspect and the Harbor eval harness. |
 
 ## Documentation
