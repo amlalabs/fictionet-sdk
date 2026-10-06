@@ -263,8 +263,18 @@ fn copied_fast_uses_templates_and_the_public_driver() {
         .write(&value, &mut bytes)
         .unwrap();
     assert_eq!(bytes, [0xc0, 0x81]);
-    let mut stream = Stream::new(fast::Frames::new(templates));
+    let mut stream = Stream::new(fast::Frames::new(templates.clone()));
     assert_eq!(stream.push(&bytes), bytes.len());
     assert_eq!(stream.next().unwrap().unwrap(), value);
     assert_eq!(fast::UInt64::parse(&[0x81]).unwrap(), fast::UInt64(1));
+    let mut blocks = Stream::new(fictionet::stdlib::codec::Pipe::new(
+        fast::Blocks,
+        fast::Frames::new(templates),
+        fictionet::stdlib::codec::Carry::Bytes,
+    ));
+    assert_eq!(blocks.push(&[0, 0x82, 0xc0, 0x81]), 4);
+    assert_eq!(
+        blocks.next().unwrap().unwrap(),
+        fictionet::stdlib::codec::Layered::Inner(value)
+    );
 }

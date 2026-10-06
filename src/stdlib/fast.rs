@@ -1,17 +1,20 @@
-//! FAST 1.1 transfer encoding and user supplied XML templates.
+//! FAST (FIX Adapted for STreaming) 1.1 compresses template-based messages.
+//! It is used for FIX market data, often over UDP multicast.
 //!
 //! The source is the public [FIX Protocol Ltd. specification, 2006-12-20][spec]:
 //! sections 6–7 define templates and dictionaries, sections 10.2–10.7 define
 //! wire encodings, and appendices 1–2 define the template XML grammar.
 //! No exchange templates or session control protocol are included.
 //!
-//! [`Frames`] reads the message stream of section 10. An external transport
-//! must remove block size headers when using that section's block form.
+//! [`Frames`] reads the message stream of section 10. [`Blocks`] removes
+//! block size headers for `codec::Pipe::new(Blocks, frames, codec::Carry::Bytes)`.
 //! [`Encoder`] writes messages using the same templates. Resets are explicit
 //! and must occur at matching message boundaries at both endpoints (§6.3.1).
+//! Packet feeds usually reset dictionaries per packet. For those feeds, worlds
+//! call `stream.decoder().reset()` between datagrams when using [`Frames`].
 //! Primitive units implement [`Wire`]. A message requires template and session
 //! state, so its writer is [`Encoder::write`]. Reportable encoding errors,
-//! including nonminimal encodings, are refused.
+//! including nonminimal encodings, are refused. Block sizes may be overlong (§10).
 //!
 //! ```
 //! use fictionet::stdlib::{codec::{Stream, Wire}, fast::*};
@@ -107,6 +110,8 @@ pub enum Error {
     Value,
     /// A string delta removes more bytes than its base contains (§6.3.7).
     Subtraction,
+    /// A block has zero payload bytes (§10, D12).
+    BlockSize,
 }
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -839,8 +844,9 @@ struct Definitions {
 ///
 /// Parsing follows §§3.1, 6–9 and the template definition schemas in
 /// appendices 1–2. Foreign extensions are ignored. DTDs are refused.
-/// Static references must resolve and cannot form cycles. Numeric `id`
-/// attributes bind wire IDs; other IDs can be bound with [`Templates::bind`].
+/// Static references must resolve. Static cycles and excessive nesting return
+/// [`Error::Limit`] with `MAX_DEPTH`. ASCII digit `id` attributes that fit in
+/// `u32` bind wire IDs; other IDs can be bound with [`Templates::bind`].
 #[derive(Clone, Debug)]
 pub struct Templates {
     definitions: Arc<Definitions>,
@@ -880,6 +886,7 @@ impl Templates {
             let auxiliary_id = x.start.attribute(None, "id").map(str::to_owned);
             let id = auxiliary_id
                 .as_deref()
+                .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
                 .and_then(|id| id.parse::<u32>().ok());
             if d.templates
                 .iter()
@@ -1730,16 +1737,59 @@ fn from_value(kind: Kind, value: &Value) -> Result<Atom, Error> {
         _ => return Err(Error::Value),
     })
 }
-#[derive(Clone, Debug, Default)]
+#[cfg(test)]
+std::thread_local! {
+    // Count dictionary entries copied or shadowed, independent of wall time.
+    static DICTIONARY_WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[derive(Debug, Default)]
 struct Entry {
     kind: Option<Kind>,
     value: Option<Atom>,
 }
-#[derive(Clone, Debug)]
+impl Clone for Entry {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        DICTIONARY_WORK.with(|work| work.set(work.get() + 1));
+        Self {
+            kind: self.kind,
+            value: self.value.clone(),
+        }
+    }
+}
+impl Entry {
+    fn allocated(&self) -> usize {
+        match &self.value {
+            Some(Atom::Bytes(bytes)) => bytes.capacity(),
+            _ => 0,
+        }
+    }
+}
+#[derive(Debug)]
 struct State {
     entries: Vec<Entry>,
     template_id: Option<u32>,
     bytes: usize,
+    allocated: usize,
+    // One moved old entry per touched slot, bounded by MAX_VALUES and
+    // MAX_DICTIONARY_ENTRIES. Marks also serve the scanner's lazy shadows.
+    undo: Vec<(usize, Entry)>,
+    marked: Vec<bool>,
+    transactional: bool,
+}
+impl Clone for State {
+    fn clone(&self) -> Self {
+        let entries = self.entries.clone();
+        Self {
+            allocated: entries.iter().map(Entry::allocated).sum(),
+            entries,
+            template_id: self.template_id,
+            bytes: self.bytes,
+            undo: self.undo.clone(),
+            marked: self.marked.clone(),
+            transactional: self.transactional,
+        }
+    }
 }
 impl State {
     fn new(d: &Definitions) -> Self {
@@ -1747,7 +1797,34 @@ impl State {
             entries: vec![Entry::default(); d.keys.len()],
             template_id: None,
             bytes: 0,
+            allocated: 0,
+            undo: Vec::new(),
+            marked: vec![false; d.keys.len()],
+            transactional: false,
         }
+    }
+    fn transaction<T>(
+        &mut self,
+        run: impl FnOnce(&mut Self) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let saved = (self.template_id, self.bytes, self.allocated);
+        self.transactional = true;
+        let result = run(self);
+        for (slot, old) in self.undo.drain(..).rev() {
+            if result.is_err()
+                && let Some(entry) = self.entries.get_mut(slot)
+            {
+                *entry = old;
+            }
+            if let Some(marked) = self.marked.get_mut(slot) {
+                *marked = false;
+            }
+        }
+        if result.is_err() {
+            (self.template_id, self.bytes, self.allocated) = saved;
+        }
+        self.transactional = false;
+        result
     }
     fn slot(field: &Field, ty: usize) -> Result<usize, Error> {
         field
@@ -1774,15 +1851,31 @@ impl State {
         let e = self.entries.get_mut(slot).ok_or(Error::Template)?;
         let bytes = add(
             self.bytes
-                .saturating_sub(e.value.as_ref().map_or(0, Atom::bytes)),
+                .checked_sub(e.value.as_ref().map_or(0, Atom::bytes))
+                .ok_or(Error::Template)?,
             value.bytes(),
         )?;
         limit(bytes, MAX_DICTIONARY_BYTES, "MAX_DICTIONARY_BYTES")?;
-        *e = Entry {
+        let next = Entry {
             kind: Some(field.kind),
             value: Some(value),
         };
+        let allocated = add(
+            self.allocated
+                .checked_sub(e.allocated())
+                .ok_or(Error::Template)?,
+            next.allocated(),
+        )?;
+        let marked = self.marked.get_mut(slot).ok_or(Error::Template)?;
+        if self.transactional && !*marked {
+            limit(add(self.undo.len(), 1)?, MAX_VALUES, "MAX_VALUES")?;
+            self.undo.push((slot, std::mem::replace(e, next)));
+            *marked = true;
+        } else {
+            *e = next;
+        }
         self.bytes = bytes;
+        self.allocated = allocated;
         Ok(())
     }
     fn reset(&mut self, d: &Definitions, scope: Option<&Dictionary>) {
@@ -1796,23 +1889,26 @@ impl State {
             .iter()
             .map(|e| e.value.as_ref().map_or(0, Atom::bytes))
             .sum();
+        self.allocated = self.entries.iter().map(Entry::allocated).sum();
         if scope.is_none_or(|s| s == &Dictionary::Global) {
             self.template_id = None;
         }
     }
     fn held(&self) -> usize {
         self.entries.capacity() * std::mem::size_of::<Entry>()
+            + self.allocated
+            + self.marked.capacity() * std::mem::size_of::<bool>()
+            + self.undo.capacity() * std::mem::size_of::<(usize, Entry)>()
             + self
-                .entries
+                .undo
                 .iter()
-                .map(|e| match &e.value {
-                    Some(Atom::Bytes(b)) => b.capacity(),
-                    _ => 0,
-                })
+                .map(|(_, entry)| entry.allocated())
                 .sum::<usize>()
     }
 }
 fn shadow(a: &Atom, scan: bool) -> Atom {
+    #[cfg(test)]
+    DICTIONARY_WORK.with(|work| work.set(work.get() + 1));
     if scan && matches!(a, Atom::Bytes(_)) {
         Atom::Bytes(Vec::new())
     } else {
@@ -2223,6 +2319,7 @@ struct ScanFrame {
 struct Scanner {
     frames: Vec<ScanFrame>,
     state: State,
+    dirty: Vec<usize>,
     pos: usize,
     probe: usize,
     values: usize,
@@ -2234,9 +2331,12 @@ impl Clone for Scanner {
         // reservation so a cloned decoder cannot allocate across Need.
         let mut frames = Vec::with_capacity(MAX_DEPTH);
         frames.extend_from_slice(&self.frames);
+        let mut dirty = Vec::with_capacity(self.state.entries.len());
+        dirty.extend_from_slice(&self.dirty);
         Self {
             frames,
             state: self.state.clone(),
+            dirty,
             pos: self.pos,
             probe: self.probe,
             values: self.values,
@@ -2249,6 +2349,7 @@ impl Scanner {
         Self {
             frames: Vec::with_capacity(MAX_DEPTH),
             state: State::new(d),
+            dirty: Vec::with_capacity(d.keys.len()),
             pos: 0,
             probe: 0,
             values: 0,
@@ -2256,9 +2357,10 @@ impl Scanner {
         }
     }
     fn start(&mut self, committed: &State) {
-        for (a, b) in self.state.entries.iter_mut().zip(&committed.entries) {
-            a.kind = b.kind;
-            a.value = b.value.as_ref().map(|a| shadow(a, true));
+        for slot in self.dirty.drain(..) {
+            if let Some(marked) = self.state.marked.get_mut(slot) {
+                *marked = false;
+            }
         }
         self.state.template_id = committed.template_id;
         self.state.bytes = 0;
@@ -2276,6 +2378,28 @@ impl Scanner {
             header: Header::Dynamic,
         });
         self.active = true;
+    }
+    fn prepare(&mut self, field: &Field, ty: usize, committed: &State) -> Result<(), Error> {
+        if !field.op.dictionary() {
+            return Ok(());
+        }
+        let slot = State::slot(field, ty)?;
+        let marked = self.state.marked.get_mut(slot).ok_or(Error::Template)?;
+        if !*marked {
+            limit(
+                add(self.dirty.len(), 1)?,
+                MAX_DICTIONARY_ENTRIES,
+                "MAX_DICTIONARY_ENTRIES",
+            )?;
+            let old = committed.entries.get(slot).ok_or(Error::Template)?;
+            *self.state.entries.get_mut(slot).ok_or(Error::Template)? = Entry {
+                kind: old.kind,
+                value: old.value.as_ref().map(|value| shadow(value, true)),
+            };
+            self.dirty.push(slot);
+            *marked = true;
+        }
+        Ok(())
     }
     fn push(
         &mut self,
@@ -2320,7 +2444,7 @@ impl Scanner {
         self.values = add(self.values, 1)?;
         limit(self.values, MAX_VALUES, "MAX_VALUES")
     }
-    fn run(&mut self, input: &[u8], d: &Definitions) -> Result<usize, Error> {
+    fn run(&mut self, input: &[u8], d: &Definitions, committed: &State) -> Result<usize, Error> {
         loop {
             let Some(mut frame) = self.frames.last().copied() else {
                 return Ok(self.pos);
@@ -2367,6 +2491,32 @@ impl Scanner {
                 }
                 continue;
             };
+            match node {
+                Node::Scalar(index) => self.prepare(
+                    d.fields.get(*index).ok_or(Error::Template)?,
+                    frame.ty,
+                    committed,
+                )?,
+                Node::Decimal(e, m) => {
+                    for index in [e, m] {
+                        self.prepare(
+                            d.fields.get(*index).ok_or(Error::Template)?,
+                            frame.ty,
+                            committed,
+                        )?;
+                    }
+                }
+                Node::Sequence { length, body } => self.prepare(
+                    d.fields.get(*length).ok_or(Error::Template)?,
+                    d.bodies
+                        .get(*body)
+                        .ok_or(Error::Template)?
+                        .type_ref
+                        .unwrap_or(frame.ty),
+                    committed,
+                )?,
+                _ => {}
+            }
             let mut r = Reader {
                 input,
                 pos: self.pos,
@@ -2473,13 +2623,74 @@ impl Scanner {
     }
 }
 
+/// Reads the block form of a FAST stream (§10), yielding each block's payload.
+///
+/// Block sizes exclude the header and may be overlong. The header is bounded
+/// by [`MAX_INTEGER_BYTES`] and the payload by [`MAX_MESSAGE_BYTES`]. Message
+/// interpretation belongs to [`Frames`]. This decoder keeps no input or state.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Carry, Pipe, Stream}, fast::{Blocks, Frames, Templates}};
+/// let templates = Templates::from_xml(br#"<template
+///     xmlns="http://www.fixprotocol.org/ns/fast/td/1.1" name="Empty" id="1"/>"#)?;
+/// let mut stream = Stream::new(Pipe::new(Blocks, Frames::new(templates), Carry::Bytes));
+/// assert_eq!(stream.push(&[0x82, 0xc0, 0x81]), 3);
+/// assert!(stream.next().transpose()?.is_some());
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Blocks;
+
+impl Decode for Blocks {
+    type Item = Vec<u8>;
+    type Error = Error;
+    const NAME: &'static str = "FAST 1.1 blocks";
+
+    /// The largest accepted header and payload together.
+    fn capacity(&self) -> usize {
+        MAX_INTEGER_BYTES + MAX_MESSAGE_BYTES
+    }
+
+    /// Reads one block (§10). Refuses zero size (D12), a header longer than
+    /// [`MAX_INTEGER_BYTES`], and a payload above [`MAX_MESSAGE_BYTES`].
+    /// Partial headers and payloads return `Need`, including at EOF.
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
+        let mut size = 0usize;
+        for at in 0..MAX_INTEGER_BYTES {
+            let Some(&byte) = input.get(at) else {
+                return Ok(Step::Need);
+            };
+            size = size
+                .checked_mul(128)
+                .and_then(|n| n.checked_add(usize::from(byte & 0x7f)))
+                .ok_or(Error::Range)?;
+            limit(size, MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
+            if byte & 0x80 != 0 {
+                if size == 0 {
+                    return Err(Error::BlockSize);
+                }
+                let start = add(at, 1)?;
+                let end = add(start, size)?;
+                return Ok(match input.get(start..end) {
+                    Some(payload) => Step::Item(payload.to_vec(), end),
+                    None => Step::Need,
+                });
+            }
+        }
+        Err(Error::Limit("MAX_INTEGER_BYTES"))
+    }
+}
+
 /// A template-driven message decoder implementing [`Decode`].
 ///
 /// Use [`codec::Stream`](fictionet::stdlib::codec::Stream) to own input.
 /// The scanner retains positions, map cursors, and numeric dictionary shadows.
 /// It does not retain input or decoded strings while returning `Need`.
+/// Shadows are loaded only for touched slots and cleared using a dirty-slot list.
 /// Each field is visited once during framing; partial strings resume scanning.
 /// A complete message is then decoded once and its dictionary changes commit.
+/// An undo journal moves the old entry on the first write to each slot. It
+/// holds at most [`MAX_VALUES`] records and [`MAX_DICTIONARY_BYTES`] old data bytes.
 /// Invalid input terminates the stream. Partial input returns `Need` at EOF.
 #[derive(Clone, Debug)]
 pub struct Frames {
@@ -2513,12 +2724,13 @@ impl Frames {
     /// Failure leaves dictionaries and framing cursors unchanged.
     pub fn parse_exact(&mut self, input: &[u8]) -> Result<Message, Error> {
         limit(input.len(), MAX_MESSAGE_BYTES, "MAX_MESSAGE_BYTES")?;
-        let mut state = self.state.clone();
-        let (message, used) = read_message(input, &self.templates.definitions, &mut state)?;
-        if used != input.len() {
-            return Err(Error::Trailing);
-        }
-        self.state = state;
+        let message = self.state.transaction(|state| {
+            let (message, used) = read_message(input, &self.templates.definitions, state)?;
+            if used != input.len() {
+                return Err(Error::Trailing);
+            }
+            Ok(message)
+        })?;
         self.scanner.active = false;
         Ok(message)
     }
@@ -2535,6 +2747,7 @@ impl Decode for Frames {
             + self.state.held()
             + self.scanner.state.held()
             + self.scanner.frames.capacity() * std::mem::size_of::<ScanFrame>()
+            + self.scanner.dirty.capacity() * std::mem::size_of::<usize>()
     }
     /// Reads one message (§10). Refuses invalid templates, encodings, state,
     /// presence bits, ranges, text, and named limits. Incomplete input returns
@@ -2546,24 +2759,24 @@ impl Decode for Frames {
         if !self.scanner.active {
             self.scanner.start(&self.state);
         }
-        match self.scanner.run(input, &self.templates.definitions) {
+        match self
+            .scanner
+            .run(input, &self.templates.definitions, &self.state)
+        {
             Ok(end) => {
-                let mut state = self.state.clone();
-                let (message, used) = read_message(
-                    input.get(..end).ok_or(Error::Truncated)?,
-                    &self.templates.definitions,
-                    &mut state,
-                )?;
-                if used != end {
-                    return Err(Error::Trailing);
-                }
-                self.state = state;
                 self.scanner.active = false;
+                let message = self.parse_exact(input.get(..end).ok_or(Error::Truncated)?)?;
                 Ok(Step::Item(message, end))
             }
             Err(Error::Truncated) if input.len() < MAX_MESSAGE_BYTES => Ok(Step::Need),
-            Err(Error::Truncated) => Err(Error::Limit("MAX_MESSAGE_BYTES")),
-            Err(e) => Err(e),
+            Err(error) => {
+                self.scanner.active = false;
+                Err(if error == Error::Truncated {
+                    Error::Limit("MAX_MESSAGE_BYTES")
+                } else {
+                    error
+                })
+            }
         }
     }
 }
@@ -2909,17 +3122,17 @@ impl Encoder {
     /// errors, impossible tails, dictionary type conflicts, and named limits.
     /// On failure, both `out` and every dictionary remain unchanged.
     pub fn write(&mut self, message: &Message, out: &mut Vec<u8>) -> Result<(), Error> {
-        let mut state = self.state.clone();
-        let bytes = write_message(
-            message,
-            &self.templates.definitions,
-            0,
-            &mut state,
-            &mut Budget::default(),
-            1,
-        )?;
+        let bytes = self.state.transaction(|state| {
+            write_message(
+                message,
+                &self.templates.definitions,
+                0,
+                state,
+                &mut Budget::default(),
+                1,
+            )
+        })?;
         out.extend_from_slice(&bytes);
-        self.state = state;
         Ok(())
     }
 }
@@ -3556,6 +3769,228 @@ mod tests {
         assert_eq!(out, [9]);
     }
     #[test]
+    fn section_10_blocks_allow_overlong_sizes_and_pipe_messages() {
+        use fictionet::stdlib::codec::{Carry, Layered, Pipe};
+        // Section 10's BlockSize excludes its own bytes. The second block
+        // uses the permitted overlong form of one (§10.6.1).
+        let bytes = [0x83, 0xc0, 0x81, 0x80, 0, 0x81, 0x80];
+        assert_eq!(
+            decode_all(|| Blocks, &bytes),
+            (vec![vec![0xc0, 0x81, 0x80], vec![0x80]], None)
+        );
+        check_decode_with_alloc_limit(
+            || Blocks,
+            &bytes,
+            2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+        );
+        let t = templates("<uInt32 name=\"n\"><increment value=\"1\"/></uInt32>");
+        let make = || Pipe::new(Blocks, Frames::new(t.clone()), Carry::Bytes);
+        assert_eq!(
+            decode_all(make, &bytes),
+            (
+                (1..=3)
+                    .map(|n| Layered::Inner(message(vec![Value::UInt32(n)])))
+                    .collect(),
+                None
+            )
+        );
+        check_decode_with_alloc_limit(make, &bytes, 2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES));
+        for n in 0..=255u8 {
+            check_decode_with_alloc_limit(
+                || Blocks,
+                &[n, 0x81, 0x80],
+                2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+            );
+        }
+    }
+    #[test]
+    fn blocks_refuse_zero_excessive_and_unterminated_sizes() {
+        for bytes in [&[0x80][..], &[0, 0x80]] {
+            assert_eq!(Blocks.decode(bytes, false), Err(Error::BlockSize));
+            check_decode_with_alloc_limit(
+                || Blocks,
+                bytes,
+                2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+            );
+        }
+        let mut over = Vec::new();
+        UInt32((MAX_MESSAGE_BYTES + 1) as u32)
+            .write(&mut over)
+            .unwrap();
+        assert_eq!(
+            Blocks.decode(&over, false),
+            Err(Error::Limit("MAX_MESSAGE_BYTES"))
+        );
+        assert_eq!(
+            Blocks.decode(&[0; MAX_INTEGER_BYTES], false),
+            Err(Error::Limit("MAX_INTEGER_BYTES"))
+        );
+        for bytes in [&over[..], &[0; MAX_INTEGER_BYTES], &[0], &[0x82, 0x80]] {
+            check_decode_with_alloc_limit(
+                || Blocks,
+                bytes,
+                2 * (MAX_MESSAGE_BYTES + MAX_INTEGER_BYTES),
+            );
+        }
+        let mut maximum = vec![0; MAX_INTEGER_BYTES - 1];
+        maximum.extend_from_slice(&[0x81, 0x80]);
+        assert_eq!(
+            Blocks.decode(&maximum, false),
+            Ok(Step::Item(vec![0x80], maximum.len()))
+        );
+        let mut maximum = UInt32(MAX_MESSAGE_BYTES as u32).to_bytes().unwrap();
+        let header = maximum.len();
+        maximum.resize(header + MAX_MESSAGE_BYTES, 0x80);
+        assert_eq!(
+            Blocks.decode(&maximum[..maximum.len() - 1], false),
+            Ok(Step::Need)
+        );
+        assert_eq!(
+            Blocks.decode(&maximum, false),
+            Ok(Step::Item(vec![0x80; MAX_MESSAGE_BYTES], maximum.len()))
+        );
+        let mut framed = vec![0x82];
+        framed.extend_from_slice(&[0xc0, 0x81]);
+        let mut stream = Stream::new(Blocks);
+        let mut got = Vec::new();
+        for part in chunks(&framed, &[1]) {
+            pump(&mut stream, part, |block| got.push(block)).unwrap();
+        }
+        finish(&mut stream, |block| got.push(block)).unwrap();
+        assert_eq!(got, [vec![0xc0, 0x81]]);
+    }
+    #[test]
+    fn tiny_messages_do_not_visit_unrelated_dictionary_slots() {
+        let fields = (0..MAX_DICTIONARY_ENTRIES)
+            .map(|i| format!("<byteVector name=\"v{i}\"><copy/></byteVector>"))
+            .collect::<String>();
+        let t = xml_templates(&format!(
+            "<template name=\"Full\" id=\"1\">{fields}</template><template name=\"Empty\" id=\"2\"/>"
+        ));
+        let mut encoder = Encoder::new(t.clone());
+        let mut frames = Frames::new(t.clone());
+        let mut exact = Frames::new(t);
+        let large = message(
+            (0..MAX_DICTIONARY_ENTRIES)
+                .map(|i| Value::Bytes(if i < 16 { vec![7; 60_000] } else { Vec::new() }))
+                .collect(),
+        );
+        let mut bytes = Vec::new();
+        encoder.write(&large, &mut bytes).unwrap();
+        assert_eq!(
+            frames.decode(&bytes, false),
+            Ok(Step::Item(large.clone(), bytes.len()))
+        );
+        assert_eq!(exact.parse_exact(&bytes), Ok(large));
+        let tiny = Message {
+            template_id: 2,
+            fields: Vec::new(),
+        };
+        bytes.clear();
+        encoder.write(&tiny, &mut bytes).unwrap();
+        assert_eq!(
+            frames.decode(&bytes, false),
+            Ok(Step::Item(tiny.clone(), bytes.len()))
+        );
+        assert_eq!(exact.parse_exact(&bytes), Ok(tiny.clone()));
+        for _ in 0..8 {
+            for operation in 0..3 {
+                DICTIONARY_WORK.with(|work| work.set(0));
+                match operation {
+                    0 => assert_eq!(
+                        frames.decode(&[0x80], false),
+                        Ok(Step::Item(tiny.clone(), 1))
+                    ),
+                    1 => assert_eq!(exact.parse_exact(&[0x80]), Ok(tiny.clone())),
+                    _ => {
+                        bytes.clear();
+                        encoder.write(&tiny, &mut bytes).unwrap();
+                        assert_eq!(bytes, [0x80]);
+                    }
+                }
+                assert_eq!(
+                    DICTIONARY_WORK.with(|work| work.get()),
+                    0,
+                    "operation {operation}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn refused_messages_restore_prior_entries_and_template_id() {
+        let t = xml_templates(
+            "<template name=\"A\" id=\"1\"><sequence name=\"rows\"><length><constant value=\"3\"/></length><string name=\"s\"><copy/></string></sequence><string name=\"text\" charset=\"unicode\"/></template><template name=\"B\" id=\"2\"><string name=\"s\"><copy/></string><string name=\"text\" charset=\"unicode\"/></template>",
+        );
+        let valid = message(vec![
+            Value::Sequence(vec![vec![Value::Ascii("old".into())]; 3]),
+            Value::Unicode("OK".into()),
+        ]);
+        let mut encoder = Encoder::new(t.clone());
+        let mut frames = Frames::new(t.clone());
+        let mut exact = Frames::new(t);
+        let mut first = Vec::new();
+        encoder.write(&valid, &mut first).unwrap();
+        assert_eq!(
+            frames.decode(&first, false),
+            Ok(Step::Item(valid.clone(), first.len()))
+        );
+        assert_eq!(exact.parse_exact(&first), Ok(valid.clone()));
+        // Each row changes the same global entry. Invalid UTF-8 is found
+        // after the scanner has finished and the parser has made all writes.
+        let bad = [
+            0x80, 0xc0, b'n', 0xb1, 0xc0, b'n', 0xb2, 0xc0, b'n', 0xb3, 0x81, 0xff,
+        ];
+        // Also change the copied template ID before failing.
+        let other = [0xe0, 0x82, b'n', 0xb4, 0x81, 0xff];
+        for refused in [&bad[..], &other[..]] {
+            let saved = exact.state.clone();
+            assert_eq!(exact.parse_exact(refused), Err(Error::Text));
+            assert_eq!(frames.decode(refused, false), Err(Error::Text));
+            for state in [&exact.state, &frames.state] {
+                assert_eq!(state.template_id, saved.template_id);
+                assert_eq!(state.bytes, saved.bytes);
+                for (a, b) in state.entries.iter().zip(&saved.entries) {
+                    assert_eq!(a.kind, b.kind);
+                    assert_eq!(a.value, b.value);
+                }
+            }
+            assert_eq!(
+                exact.parse_exact(&[0x80, 0x80, 0x80, 0x80, 0x82, b'O', b'K']),
+                Ok(valid.clone())
+            );
+            assert_eq!(
+                frames.decode(&[0x80, 0x80, 0x80, 0x80, 0x82, b'O', b'K'], false),
+                Ok(Step::Item(valid.clone(), 7))
+            );
+        }
+        let mut bad_value = valid.clone();
+        bad_value.fields[0] = Value::Sequence(vec![vec![Value::Ascii("new".into())]; 3]);
+        bad_value.fields[1] = Value::UInt32(9);
+        let mut out = vec![42];
+        assert_eq!(encoder.write(&bad_value, &mut out), Err(Error::Value));
+        assert_eq!(out, [42]);
+        out.clear();
+        encoder.write(&valid, &mut out).unwrap();
+        assert_eq!(out, [0x80, 0x80, 0x80, 0x80, 0x82, b'O', b'K']);
+    }
+    #[test]
+    fn template_wire_ids_use_only_ascii_digits() {
+        for id in ["+1", "-1", "１", "4294967296", "feed"] {
+            let t = xml_templates(&format!("<template name=\"A\" id=\"{id}\"/>"));
+            assert_eq!(t.templates()[0].id, None, "{id}");
+            assert_eq!(t.templates()[0].auxiliary_id.as_deref(), Some(id));
+        }
+        for id in ["", " 1", "1 "] {
+            let xml = format!("<template xmlns=\"{TEMPLATE_NAMESPACE}\" name=\"A\" id=\"{id}\"/>");
+            assert_eq!(
+                Templates::from_xml(xml.as_bytes()).unwrap_err(),
+                Error::Template
+            );
+        }
+        let t = xml_templates("<template name=\"A\" id=\"0001\"/>");
+        assert_eq!(t.templates()[0].id, Some(1));
+    }
+    #[test]
     fn transactional_writes_and_exact_parse() {
         let t = templates(
             "<uInt32 name=\"n\"><increment value=\"1\"/></uInt32><string name=\"c\"><constant value=\"OK\"/></string>",
@@ -3783,6 +4218,18 @@ mod tests {
             d.parse_exact(&wire),
             Err(Error::Limit("MAX_DICTIONARY_BYTES"))
         );
+        assert_eq!(
+            d.decode(&wire, false),
+            Err(Error::Limit("MAX_DICTIONARY_BYTES"))
+        );
+        let previous = Message {
+            template_id: 16,
+            fields: vec![Value::Bytes(vec![7; MAX_STRING_BYTES])],
+        };
+        let mut after = Vec::new();
+        e.write(&previous, &mut after).unwrap();
+        assert_eq!(after, [0x80]);
+        assert_eq!(d.decode(&after, false), Ok(Step::Item(previous, 1)));
         e.reset();
         d.reset();
         bytes.clear();
