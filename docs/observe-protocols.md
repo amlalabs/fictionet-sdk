@@ -11,9 +11,11 @@ Start with `Registry::default()` to keep the built-ins, or `Registry::new()`
 for an empty registry. `register` takes a name, a matcher, and a factory for
 the two direction decoders. Match `Selection::ports`, `Selection::first`,
 `Selection::transport`, and `Selection::alpn` for decrypted TLS. Return
-`Match::More` to wait for more TCP prefix bytes, up to 64 bytes. UDP treats `More` as `No`. Later registrations
-take precedence. `choose(transport, name)` selects a registration explicitly
-for that transport. `automatic(transport)` restores its matchers. Built-ins
+`Match::More` to wait for more TCP prefix bytes. A matcher still returning
+`More` at 64 bytes rejects the conversation; lower-priority matchers do not
+run. UDP treats `More` as `No`. Later registrations take precedence.
+`choose(transport, name)` selects a registration explicitly for that
+transport. `automatic(transport)` restores its matchers. Built-ins
 use these same methods.
 
 For a pcap reader or live capture, create `Dissector::with_registry(registry)`
@@ -33,24 +35,42 @@ connection state.
 Its `Placement` follows exact `Spans` from inner bytes to packet bytes.
 Record a removed outer header with `Spans::skip`, then record its unchanged
 payload with `Spans::push_exact`. Add hops from the innermost stream outward.
+Each hop must have `Spans::keep() <= 256`; at most 16 hops are accepted.
 Update a live hop with `Placement::hop_mut`. Record the current payload
 before the first `data` call. `Observed::reset` keeps the hops and starts at
 the innermost hop's next byte offset; reset before recording new payloads.
 A coarse span, an expired mapping, a gap, or a message crossing packets
 creates a separate byte buffer. Fields always index the bytes shown.
 
-TLS session processing and HTTP/2 use `Registry::register_protocol` when
+`Conversation::with_registry` supplies the same prefix selection and flush
+logic used by TCP streams. Call `data`, `lost`, and `waiting` for ordered
+bytes, gaps, and partial-message status. `with_alpn` supplies a negotiated
+ALPN to matchers before bytes arrive. Undecided prefixes are not waiting.
+
+TLS, Modbus, and HTTP/2 sessions use `Registry::register_protocol` when
 shared state requires the `Protocol` interface. The session factory receives
 the active registry. TLS clones it for plaintext selection with the outer
 ports. ALPN hints select `http2` for `h2` or `http1` for `http/1.1` only when
 that name is registered. Other cases use the registry matchers, including
-across split plaintext prefixes. User replacements apply inside TLS too.
-HTTP/1 capture parsing remains in observe until a stdlib HTTP/1 module is available. Framing for
-DNS, DHCP, Modbus, HTTP/1, and TLS uses `Stream` and `Present`.
+across split plaintext prefixes. Eight unmatched bytes permanently reject
+plaintext selection in both directions, as in the outer conversation.
+Selection is not retried at each record. User replacements apply inside TLS
+too. HTTP/1 capture parsing remains in observe until a stdlib HTTP/1 module
+is available. Framing for DNS, DHCP, Modbus, HTTP/1, and TLS uses `Stream`
+and `Present`.
 
-The capture presenters in `src/observe/protocols.rs` can also be copied into
-another crate. They use public observe and stdlib APIs, plus `hickory-proto`
-and `httparse`. `Display::from_packet` builds an item from a relative layer,
-summary, and tags. `Decoded::level` and `Decoded::cap_info` expose the summary
+These files can be copied into another crate and edited:
+
+- `src/observe/protocols.rs`: capture decoders and presenters, including
+  `ModbusSession`. Register that session through `register_protocol` to stop
+  both directions after a framing error, as the built-in does. The file uses
+  public observe and stdlib APIs, plus `hickory-proto` and `httparse`.
+- `src/observe/tls.rs`: `TlsSession`, its key schedule, handshake parsing,
+  and record presentation. It uses public observe APIs and `ring`. Register
+  it through `register_protocol`, passing the supplied registry to `new`.
+- `src/observe/conversation.rs`: the public prefix selection driver.
+
+`Display::from_packet` builds an item from a relative layer, summary, and
+tags. `Decoded::level` and `Decoded::cap_info` expose the summary
 policy. The adapter and registry require cloneable decoder errors so `Stream`
 can retain a terminal error while reporting it once.

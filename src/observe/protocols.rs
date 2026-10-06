@@ -1,4 +1,4 @@
-use fictionet::observe::{Decoded, Layer, Placement, Present};
+use fictionet::observe::{Decoded, KeyLine, Layer, Observed, Place, Placement, Present, Protocol};
 use fictionet::stdlib::codec::{Decode, Fail, Step};
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -6,7 +6,7 @@ use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
 /// Bytes retained while an incomplete capture message is being framed.
-pub const MAX_BUFFER: usize = 32 << 10;
+const MAX_BUFFER: usize = 32 << 10;
 
 /// A decoded item's relative layer and packet summary. Capture decoders
 /// produce this value for the shared [`Present`] implementation.
@@ -137,6 +137,52 @@ impl Present for Modbus {
     display_presenter!();
     // An unrecognized Modbus header makes the conversation opaque.
     fn error(_: &Fail<Self::Error>, _: &mut Decoded) {}
+}
+
+/// A Modbus/TCP conversation that stops both directions after a framing error.
+/// Register with [`Registry::register_protocol`](fictionet::observe::Registry::register_protocol)
+/// to keep the built-in session policy when copying this file.
+pub struct ModbusSession {
+    dirs: [Option<Observed<Modbus>>; 2],
+    stopped: bool,
+}
+impl ModbusSession {
+    /// Creates request and response decoders from the conversation's ports.
+    /// A direction is a request when its destination is the Modbus port.
+    pub fn new(ports: (u16, u16)) -> Self {
+        Self {
+            dirs: [
+                Some(Observed::new(Modbus::new(
+                    ports.1 == fictionet::stdlib::modbus::PORT,
+                ))),
+                Some(Observed::new(Modbus::new(
+                    ports.0 == fictionet::stdlib::modbus::PORT,
+                ))),
+            ],
+            stopped: false,
+        }
+    }
+}
+impl Protocol for ModbusSession {
+    fn data(&mut self, reverse: bool, bytes: &[u8], at: Place, d: &mut Decoded, _: &[KeyLine]) {
+        if self.stopped {
+            return;
+        }
+        if let Some(dir) = &mut self.dirs[usize::from(reverse)] {
+            dir.data(bytes, at, d);
+            self.stopped = dir.failed().is_some();
+        }
+    }
+    fn waiting(&self, reverse: bool) -> bool {
+        !self.stopped
+            && self.dirs[usize::from(reverse)]
+                .as_ref()
+                .is_some_and(Observed::waiting)
+    }
+    fn lost(&mut self, reverse: bool) {
+        let slot = &mut self.dirs[usize::from(reverse)];
+        *slot = slot.take().map(Observed::reset);
+    }
 }
 
 /// DNS capture messages, either one UDP datagram or length-prefixed TCP.
@@ -764,7 +810,11 @@ fn modbus_display(frame: &fictionet::stdlib::modbus::Frame, used: usize, request
         (base, base + 2),
     );
     l.field("Protocol identifier", "0".to_owned(), (base + 2, base + 4));
-    l.field("Length", (used - 6).to_string(), (base + 4, base + 6));
+    l.field(
+        "Length",
+        used.saturating_sub(6).to_string(),
+        (base + 4, base + 6),
+    );
     l.field(
         "Unit identifier",
         frame.unit.to_string(),
@@ -933,7 +983,7 @@ fn body_kind(headers: &[httparse::Header<'_>], none: bool, response: bool) -> Ht
 }
 
 /// Text for a preview of bytes: the start, if it reads as text.
-pub fn preview(b: &[u8]) -> Option<String> {
+fn preview(b: &[u8]) -> Option<String> {
     let cut = &b[..b.len().min(160)];
     let text = std::str::from_utf8(cut).ok()?;
     if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {

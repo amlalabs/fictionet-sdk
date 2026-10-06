@@ -235,6 +235,7 @@ dependencies = [
  "fictionet",
  "hickory-proto",
  "httparse",
+ "ring",
 ]
 
 [[package]]

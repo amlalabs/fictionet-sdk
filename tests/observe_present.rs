@@ -76,6 +76,17 @@ fn tiny(d: &Decoded) -> Vec<&Layer> {
 }
 
 #[test]
+fn unidentified_prefixes_do_not_mark_packets_as_partial_messages() {
+    let mut dissector = Dissector::with_registry(Registry::default());
+    for (seq, bytes) in [(1, &b"hi\r\n"[..]), (5, &b"yo"[..])] {
+        let mut packet = tcp(seq, 0x18, bytes);
+        packet[22..24].copy_from_slice(&7u16.to_be_bytes());
+        let decoded = dissector.decode(&packet, &[]);
+        assert!(!decoded.info.contains("[part of a longer message]"));
+    }
+}
+
+#[test]
 fn a_user_decoder_places_split_and_batched_messages_in_packet_output() {
     let mut dissector = Dissector::with_registry(registry());
     dissector.decode(&tcp(100, 2, b""), &[]);

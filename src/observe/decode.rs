@@ -71,7 +71,7 @@ pub(crate) const MAX_DETAIL: usize = 1 << 20;
 const MAX_INFO: usize = 1024;
 
 /// A decoded packet.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Decoded {
     /// Source endpoint.
     pub src: String,

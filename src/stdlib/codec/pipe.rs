@@ -88,6 +88,10 @@ impl Spans {
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Span> {
         self.ring.iter()
     }
+    /// The maximum number of spans this ring retains.
+    pub fn keep(&self) -> usize {
+        self.keep
+    }
     /// The number of retained spans.
     pub fn len(&self) -> usize {
         self.ring.len()
@@ -107,22 +111,36 @@ impl Spans {
     /// Resolves any nonempty range covered by exact, contiguous spans.
     /// Coarse mappings, gaps, evicted spans, and overflow return `None`.
     pub fn locate_exact(&self, range: Range<u64>) -> Option<Range<u64>> {
-        if range.start >= range.end { return None; }
+        if range.start >= range.end {
+            return None;
+        }
         let mut at = range.start;
         let mut result: Option<Range<u64>> = None;
-        for span in &self.ring {
-            if span.inner.end <= at { continue; }
-            if !span.exact || span.inner.start > at { return None; }
-            let start = span.outer.start.checked_add(at.checked_sub(span.inner.start)?)?;
-            let end = span.outer.start.checked_add(range.end.min(span.inner.end).checked_sub(span.inner.start)?)?;
-            if end > span.outer.end { return None; }
+        let first = self.ring.partition_point(|span| span.inner.end <= at);
+        for span in self.ring.range(first..) {
+            if !span.exact || span.inner.start > at {
+                return None;
+            }
+            let start = span
+                .outer
+                .start
+                .checked_add(at.checked_sub(span.inner.start)?)?;
+            let end = span
+                .outer
+                .start
+                .checked_add(range.end.min(span.inner.end).checked_sub(span.inner.start)?)?;
+            if end > span.outer.end {
+                return None;
+            }
             match &mut result {
                 Some(r) if r.end == start => r.end = end,
                 None => result = Some(start..end),
                 _ => return None,
             }
             at = range.end.min(span.inner.end);
-            if at == range.end { return result; }
+            if at == range.end {
+                return result;
+            }
         }
         None
     }

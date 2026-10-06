@@ -132,10 +132,11 @@ impl Placement {
         }
     }
 
-    /// Adds an outward hop. Returns false past 16 hops or 256 retained
-    /// spans per hop. Use [`Spans::push_exact`] for unchanged payload bytes.
+    /// Adds an outward hop. Returns false past 16 hops or a retention limit
+    /// above 256 spans per hop. Use [`Spans::push_exact`] for unchanged
+    /// payload bytes.
     pub fn through(&mut self, spans: Spans) -> bool {
-        if self.hops.len() >= 16 || spans.len() > 256 {
+        if self.hops.len() >= 16 || spans.keep() > 256 {
             return false;
         }
         self.hops.push(spans);
@@ -214,7 +215,7 @@ pub struct Observed<D: Present> {
     origin: Option<u64>,
     pending: bool,
     limit: usize,
-    lost: bool,
+    refused: Option<Fail<D::Error>>,
 }
 
 impl<D: Present> std::fmt::Debug for Observed<D> {
@@ -246,7 +247,7 @@ impl<D: Present> Observed<D> {
             origin: None,
             pending: false,
             limit,
-            lost: false,
+            refused: None,
         }
     }
 
@@ -273,12 +274,12 @@ impl<D: Present> Observed<D> {
 
     /// Whether decoding has stopped, including after an error or refused input.
     pub fn is_done(&self) -> bool {
-        self.lost || self.stream.is_done()
+        self.refused.is_some() || self.stream.is_done()
     }
 
     /// The terminal error, if any.
     pub fn failed(&self) -> Option<&Fail<D::Error>> {
-        self.stream.failed()
+        self.refused.as_ref().or_else(|| self.stream.failed())
     }
 
     /// Drops unread input and resets protocol state after a gap. Keeps the
@@ -319,7 +320,7 @@ where
         packet: &mut Decoded,
         mut present: impl FnMut(D::Item, &[u8], u64, &Placement, &mut Decoded),
     ) {
-        if self.lost {
+        if self.refused.is_some() {
             return;
         }
         self.place.packet(at);
@@ -351,22 +352,26 @@ where
             if n == 0 {
                 // Refused input (including allocation failure) breaks framing.
                 // Stop until reset rather than joining across missing bytes.
-                self.lost = true;
-                packet.tag("malformed");
-                D::error(&Fail::Stuck {
-                    unread: self.stream.buffered(),
-                    capacity: self.stream.decoder().capacity(),
-                }, packet);
+                self.refuse(packet);
                 break;
             }
         }
+    }
+
+    fn refuse(&mut self, packet: &mut Decoded) {
+        let error = Fail::Stuck {
+            unread: self.stream.buffered(),
+            capacity: self.stream.decoder().capacity(),
+        };
+        D::error(&error, packet);
+        self.refused = Some(error);
     }
 
     /// Marks EOF and presents any final item. Partial input uses
     /// [`Present::error`]. Pass the packet used by the last `data` call,
     /// or clear its placement first if EOF arrives in a later packet.
     pub fn end(&mut self, packet: &mut Decoded) {
-        if self.lost {
+        if self.refused.is_some() {
             return;
         }
         self.stream.end();
@@ -389,6 +394,62 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn placement_rejects_hops_that_can_outgrow_the_bound() {
+        let mut placement = Placement::default();
+        assert!(!placement.through(Spans::new(usize::MAX)));
+        assert!(placement.through(Spans::new(256)));
+        for i in 0..40_000 {
+            let hop = placement.hop_mut(0).unwrap();
+            hop.skip(1);
+            hop.push_exact(1);
+            assert!(hop.len() <= 256);
+            assert_eq!(hop.locate_exact(i..i + 1), Some(2 * i + 1..2 * i + 2));
+        }
+    }
+
+    struct QuietRefusal;
+    impl Decode for QuietRefusal {
+        type Item = ();
+        type Error = std::convert::Infallible;
+        const NAME: &'static str = "Quiet refusal";
+        fn capacity(&self) -> usize {
+            1
+        }
+        fn decode(
+            &mut self,
+            _: &[u8],
+            _: bool,
+        ) -> Result<crate::stdlib::codec::Step<()>, Self::Error> {
+            Ok(crate::stdlib::codec::Step::Need)
+        }
+    }
+    impl Present for QuietRefusal {
+        fn summary(_: &()) -> String {
+            String::new()
+        }
+        fn fields(_: &(), _: &[u8], _: &mut Layer) {}
+        fn error(_: &Fail<Self::Error>, packet: &mut Decoded) {
+            packet.info.push_str("refused");
+        }
+    }
+
+    #[test]
+    fn refused_input_uses_the_presenters_error_policy_and_retains_failure() {
+        let mut observed = Observed::new(QuietRefusal);
+        let mut packet = Decoded::default();
+        // Exercise refusal without depending on an allocator failure.
+        observed.refuse(&mut packet);
+        assert!(packet.tags.is_empty());
+        assert!(matches!(observed.failed(), Some(Fail::Stuck { .. })));
+        assert!(observed.is_done());
+        assert!(!observed.waiting());
+        observed.data(b"y", Place::default(), &mut packet);
+        observed.end(&mut packet);
+        assert_eq!(packet.info, "refused");
+        assert!(observed.reset().failed().is_none());
+    }
 
     struct Refused;
     impl Decode for Refused {

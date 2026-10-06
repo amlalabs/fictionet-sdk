@@ -446,6 +446,11 @@
 
 /// Copyable capture decoders and presenters for the built-in protocols.
 pub mod protocols;
+/// Copyable TLS record presentation, handshake state, and decryption.
+pub mod tls;
+mod conversation;
+
+pub use conversation::Conversation;
 mod present;
 mod registry;
 

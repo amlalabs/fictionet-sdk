@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 
-use super::app::Conversation;
+use super::Conversation;
 use super::{Place, Registry};
 use super::decode::Decoded;
 use crate::watch::KeyLine;

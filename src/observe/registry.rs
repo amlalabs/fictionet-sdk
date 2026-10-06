@@ -72,7 +72,9 @@ struct Entry {
 ///
 /// `default()` registers the built-ins. `new()` starts empty. Later
 /// registrations take precedence. A matcher returning [`Match::More`]
-/// postpones lower-priority TCP matchers, up to 64 prefix bytes per direction.
+/// postpones lower-priority TCP matchers. [`Conversation`](super::Conversation)
+/// rejects the conversation if that matcher still returns `More` at 64
+/// prefix bytes in a direction. It does not fall through to other matchers.
 /// For UDP it acts as `No`: a datagram cannot grow. Explicit selection
 /// bypasses matchers only for the chosen transport.
 #[derive(Clone)]
