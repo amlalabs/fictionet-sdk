@@ -501,11 +501,13 @@ impl Decode for Responses {
 /// generic tools whole messages. [`Stream::with_next`] exposes the original
 /// head and all chunk-size lines and endings with each item.
 /// The driver's buffer retains these bytes until Done. The decoder holds
-/// the parsed head and body, reported by [`Decode::held`]. Scan positions
-/// keep one-byte feeding linear. Leading empty CRLF lines remain skips.
+/// only scan positions, which keep one-byte feeding linear, and builds the
+/// head and body from the buffer in one pass at Done. Leading empty CRLF
+/// lines remain skips.
 ///
 /// Default bounds are [`MAX_BODY`] for the decoded body and [`MAX_MESSAGE`]
-/// for the wire message. A message can reach either limit first. Use
+/// for the wire message. A message can reach either limit first. A
+/// Content-Length or chunk size that cannot fit is refused from its header. Use
 /// [`Requests`] when the body must be streamed without accumulation.
 ///
 /// ```
@@ -537,7 +539,7 @@ impl Decode for Responses {
 /// ```
 pub struct RequestMessages {
     inner: Requests,
-    message: Message<RequestHead>,
+    message: Message,
 }
 
 impl RequestMessages {
@@ -570,9 +572,6 @@ impl Decode for RequestMessages {
     fn capacity(&self) -> usize {
         self.message.capacity()
     }
-    fn held(&self) -> usize {
-        self.message.held()
-    }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Request>, Error> {
         Ok(map_message(
             self.message.decode(&mut self.inner, input, eof)?,
@@ -590,7 +589,7 @@ impl Decode for RequestMessages {
 /// CONNECT bytes; replacements of those responses need [`Response::write_for`].
 pub struct ResponseMessages {
     inner: Responses,
-    message: Message<ResponseHead>,
+    message: Message,
 }
 
 impl ResponseMessages {
@@ -629,7 +628,7 @@ impl Decode for ResponseMessages {
         self.message.capacity()
     }
     fn held(&self) -> usize {
-        self.message.held().saturating_add(self.inner.held())
+        self.inner.held()
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Response>, Error> {
         Ok(map_message(
@@ -640,22 +639,49 @@ impl Decode for ResponseMessages {
 }
 
 // The raw message stays in the driver, so generic tools need no HTTP path.
-// Only parsed output and an offset into the stable unread slice live here.
-struct Message<H> {
-    head: Option<H>,
-    head_bytes: usize,
-    body: Vec<u8>,
+// Only scan positions into the stable unread slice live here. The head and
+// body are built from that slice in one pass when the message is done.
+struct Message {
+    // Head length once the inner decoder has read a head.
+    head_bytes: Option<usize>,
+    // Body framing chosen by that head, for the final pass.
+    framing: State,
+    body_bytes: usize,
     scanned: usize,
     body_limit: usize,
     wire_limit: usize,
 }
 
-impl<H> Message<H> {
+// What a whole-message decoder needs from its streaming decoder.
+trait Framed<H>: Decode<Item = Event<H>, Error = Error> {
+    fn reader(&self) -> &Reader;
+    fn parse_head(bytes: &[u8]) -> Result<H, Error>;
+}
+
+impl Framed<RequestHead> for Requests {
+    fn reader(&self) -> &Reader {
+        &self.core
+    }
+    fn parse_head(bytes: &[u8]) -> Result<RequestHead, Error> {
+        Ok(request_head(bytes)?.0)
+    }
+}
+
+impl Framed<ResponseHead> for Responses {
+    fn reader(&self) -> &Reader {
+        &self.core
+    }
+    fn parse_head(bytes: &[u8]) -> Result<ResponseHead, Error> {
+        Ok(response_head(bytes)?.0)
+    }
+}
+
+impl Message {
     fn new(body: usize, wire: usize) -> Self {
         Self {
-            head: None,
-            head_bytes: 0,
-            body: Vec::new(),
+            head_bytes: None,
+            framing: State::Done,
+            body_bytes: 0,
             scanned: 0,
             body_limit: body.min(MAX_BODY),
             wire_limit: wire.min(MAX_MESSAGE),
@@ -664,64 +690,73 @@ impl<H> Message<H> {
     fn capacity(&self) -> usize {
         self.wire_limit.saturating_add(1)
     }
-    fn held(&self) -> usize {
-        self.head_bytes.saturating_add(self.body.len())
+    // Refuses a declared length or chunk size that cannot fit, before any
+    // of its bytes arrive.
+    fn check_declared(&self, state: State) -> Result<(), Error> {
+        let (State::Length(n) | State::Data(n)) = state else {
+            return Ok(());
+        };
+        let n = usize::try_from(n).unwrap_or(usize::MAX);
+        if self.body_bytes.saturating_add(n) > self.body_limit {
+            return Err(Error::BodyTooLong);
+        }
+        if self.scanned.saturating_add(n) > self.wire_limit {
+            return Err(Error::MessageTooLong);
+        }
+        Ok(())
     }
-    fn decode<D: Decode<Item = Event<H>, Error = Error>>(
+    fn decode<H, D: Framed<H>>(
         &mut self,
         inner: &mut D,
         input: &[u8],
         eof: bool,
     ) -> Result<Step<(H, Vec<u8>)>, Error> {
-        let before = self.held();
         let window = &input[..input.len().min(self.wire_limit)];
         loop {
             let rest = window.get(self.scanned..).ok_or(Error::State)?;
             let step = inner.decode(rest, eof && input.len() <= self.wire_limit)?;
             let used = match step {
-                Step::Item(Event::Head(head), n) => {
-                    if self.head.is_some() {
+                Step::Item(Event::Head(_), n) => {
+                    if self.head_bytes.is_some() {
                         return Err(Error::State);
                     }
-                    self.head = Some(head);
-                    self.head_bytes = n;
+                    self.head_bytes = Some(n);
+                    self.framing = inner.reader().state;
                     n
                 }
                 Step::Item(Event::Body(data), n) => {
-                    if self
-                        .body
-                        .len()
+                    self.body_bytes = self
+                        .body_bytes
                         .checked_add(data.len())
-                        .is_none_or(|n| n > self.body_limit)
-                    {
-                        return Err(Error::BodyTooLong);
-                    }
-                    self.body.extend_from_slice(&data);
+                        .filter(|n| *n <= self.body_limit)
+                        .ok_or(Error::BodyTooLong)?;
                     n
                 }
                 Step::Item(Event::Done, n) => {
                     let used = self.scanned.checked_add(n).ok_or(Error::MessageTooLong)?;
-                    let head = self.head.take().ok_or(Error::State)?;
-                    self.head_bytes = 0;
+                    let head_bytes = self.head_bytes.take().ok_or(Error::State)?;
+                    let bytes = window.get(..used).ok_or(Error::State)?;
+                    let head = D::parse_head(&bytes[..head_bytes])?;
+                    let body = collect_body(
+                        inner.reader().limits,
+                        self.framing,
+                        &bytes[head_bytes..],
+                        self.body_bytes,
+                    )?;
+                    self.body_bytes = 0;
                     self.scanned = 0;
-                    return Ok(Step::Item((head, std::mem::take(&mut self.body)), used));
+                    return Ok(Step::Item((head, body), used));
                 }
-                Step::Skip(n) if self.head.is_none() => return Ok(Step::Skip(n)),
+                Step::Skip(n) if self.head_bytes.is_none() => return Ok(Step::Skip(n)),
                 Step::Skip(n) => n,
                 Step::Need => {
                     if input.len() > self.wire_limit {
                         return Err(Error::MessageTooLong);
                     }
-                    // Report newly assembled output as finite state progress.
-                    // The next call resumes at the same partial unit and needs input.
-                    return Ok(if self.held() > before {
-                        Step::Skip(0)
-                    } else {
-                        Step::Need
-                    });
+                    return Ok(Step::Need);
                 }
                 Step::End => {
-                    return if self.head.is_some() {
+                    return if self.head_bytes.is_some() {
                         Err(Error::Incomplete)
                     } else {
                         Ok(Step::End)
@@ -735,7 +770,42 @@ impl<H> Message<H> {
                 .scanned
                 .checked_add(used)
                 .ok_or(Error::MessageTooLong)?;
+            self.check_declared(inner.reader().state)?;
         }
+    }
+}
+
+// Removes the framing from a complete body the scan already checked.
+fn collect_body(
+    limits: Limits,
+    framing: State,
+    bytes: &[u8],
+    size: usize,
+) -> Result<Vec<u8>, Error> {
+    let mut reader = Reader::new(limits);
+    reader.state = framing;
+    reader.lines = Lines::new(MAX_CHUNK_LINE, Ending::Crlf);
+    let mut body = Vec::new();
+    body.try_reserve_exact(size)
+        .map_err(|_| Error::BodyTooLong)?;
+    let mut at = 0;
+    loop {
+        let rest = bytes.get(at..).ok_or(Error::State)?;
+        let n = match reader.body::<()>(rest, true)? {
+            Some(Step::Item(Event::Body(data), n)) => {
+                body.extend_from_slice(&data);
+                n
+            }
+            Some(Step::Skip(n)) => n,
+            Some(Step::Item(Event::Done, _)) if rest.is_empty() && body.len() == size => {
+                return Ok(body);
+            }
+            _ => return Err(Error::State),
+        };
+        if n == 0 {
+            return Err(Error::State);
+        }
+        at = at.checked_add(n).ok_or(Error::State)?;
     }
 }
 
@@ -2434,6 +2504,63 @@ mod tests {
             assert_eq!(stream.failed(), None);
             contract::check_decode(make, bytes);
         }
+    }
+
+    #[test]
+    fn whole_messages_refuse_declared_lengths_from_the_head() {
+        let head = b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 1000000\r\n\r\n";
+        let mut stream = Stream::new(RequestMessages::with_limits(Limits::default(), 10, 4096));
+        assert_eq!(stream.push(head), head.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
+        let mut stream = Stream::new(RequestMessages::with_limits(
+            Limits::default(),
+            MAX_BODY,
+            4096,
+        ));
+        assert_eq!(stream.push(head), head.len());
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::MessageTooLong)))
+        );
+        let mut stream = Stream::new(ResponseMessages::with_limits(Limits::default(), 10, 4096));
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n";
+        assert_eq!(stream.push(head), head.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
+        // A chunk larger than the remaining body bound is refused from its size line.
+        let chunked = request_with("Transfer-Encoding: chunked\r\n", b"4\r\nabcd\r\n10\r\n");
+        let mut stream = Stream::new(RequestMessages::with_limits(small(), 10, 4096));
+        assert_eq!(stream.push(&chunked), chunked.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::BodyTooLong))));
+    }
+
+    #[test]
+    fn whole_messages_hold_no_input_while_they_need_more() {
+        for limits in [Limits::default(), small()] {
+            let mut decoder = RequestMessages::with_limits(limits, MAX_BODY, MAX_MESSAGE);
+            let partial = request_with("Content-Length: 10\r\n", b"hello");
+            assert!(matches!(decoder.decode(&partial, false), Ok(Step::Need)));
+            assert_eq!(decoder.held(), 0);
+            let whole = request_with("Content-Length: 10\r\n", b"helloworld");
+            let Ok(Step::Item(request, n)) = decoder.decode(&whole, false) else {
+                panic!("expected a whole request");
+            };
+            assert_eq!(n, whole.len());
+            assert_eq!(request.body, b"helloworld");
+            assert_eq!(decoder.held(), 0);
+        }
+        let chunked = request_with("Transfer-Encoding: chunked\r\n", b"2\r\nhe\r\n3\r\nllo\r\n");
+        let mut decoder = RequestMessages::with_limits(small(), MAX_BODY, MAX_MESSAGE);
+        assert!(matches!(decoder.decode(&chunked, false), Ok(Step::Need)));
+        assert_eq!(decoder.held(), 0);
+        let mut done = chunked.clone();
+        done.extend_from_slice(b"0\r\n\r\n");
+        let Ok(Step::Item(request, n)) = decoder.decode(&done, false) else {
+            panic!("expected a whole request");
+        };
+        assert_eq!(
+            (request.body.as_slice(), n),
+            (b"hello".as_slice(), done.len())
+        );
     }
 
     #[test]

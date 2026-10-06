@@ -211,6 +211,8 @@ impl Faults {
     /// vector and, separately, all held raw bytes. It is clamped as in
     /// [`Interceptor::new`]. `max_held` bounds queue entries, including empty
     /// items, and is clamped to a representable allocation size.
+    /// With Forward skips, the stream's buffered bytes must fit `max_output`:
+    /// push at most [`room`](Self::room) bytes before each call.
     pub fn new(seed: u64, max_output: usize, max_held: usize) -> Self {
         Self {
             rng: Lcg::new(seed),
@@ -232,6 +234,12 @@ impl Faults {
     /// Total raw bytes retained by held items.
     pub fn held_bytes(&self) -> usize {
         self.held_bytes
+    }
+
+    /// How many bytes to push to `stream` before the next item call, as in
+    /// [`Interceptor::room`] with this plan's output limit and skip policy.
+    pub fn room<D: Decode>(&self, stream: &Stream<D>, out: &[u8]) -> usize {
+        self.output.room(stream, out)
     }
 
     /// Edits one input chunk. Returns a delay at the appended start or at
@@ -353,6 +361,8 @@ impl Faults {
     /// A handler failure rolls back this call's output, including its skips.
     /// A decode failure keeps consumed skips and is returned once. Reserving
     /// room for skips can fail before decoding, leaving input untouched.
+    /// More buffered input than `max_output` is [`RewriteError::Capacity`],
+    /// which draining cannot fix. Keep pushes within [`room`](Self::room).
     /// Hold commits only if the whole item action succeeds. Delay offsets
     /// include any forwarded skips. EOF does not flush holds automatically;
     /// call [`flush`](Self::flush) after honoring the last delay marker.
@@ -597,6 +607,44 @@ mod tests {
         faults.item::<modbus::Frame>(&[], b"", &mut out).unwrap();
         assert_eq!(out, b"abb");
         assert_eq!(faults.held_count(), 0);
+    }
+
+    #[test]
+    fn output_limit_below_buffered_input_is_a_capacity_error_and_room_avoids_it() {
+        let frame = [0, 1, 0, 0, 0, 6, 1, 3, 0, 0, 0, 1];
+        let input = frame.repeat(4);
+        let plan = rule(ItemFault::<modbus::Frame>::Action {
+            delay: None,
+            rewrite: Rewrite::Drop,
+        });
+        let mut faults = Faults::new(0, 16, 4);
+        let mut stream = Stream::new(modbus::Frames);
+        assert_eq!(stream.push(&input), input.len());
+        let mut out = Vec::new();
+        assert!(matches!(
+            faults.next(&mut stream, &mut out, &plan),
+            Some(Err(PumpError::Handler(FaultError::Rewrite(
+                RewriteError::Capacity {
+                    buffered: 48,
+                    limit: 16
+                }
+            ))))
+        ));
+
+        let mut stream = Stream::new(modbus::Frames);
+        let mut accepted = 0;
+        let mut items = 0;
+        while accepted < input.len() {
+            let room = faults.room(&stream, &out);
+            assert!(room > 0);
+            accepted += stream.push(&input[accepted..input.len().min(accepted + room)]);
+            while let Some(result) = faults.next(&mut stream, &mut out, &plan) {
+                result.unwrap();
+                items += 1;
+            }
+            out.clear();
+        }
+        assert_eq!(items, 4);
     }
 
     #[test]

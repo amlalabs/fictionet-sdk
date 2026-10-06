@@ -927,7 +927,8 @@ fn skip_reservation_failure_leaves_decode_failure_for_retry() {
     let mut out = Vec::new();
     assert!(matches!(
         Interceptor::new(1).next(&mut stream, &mut out, |_, _, _| Rewrite::Forward),
-        Some(Err(InterceptError::Rewrite(RewriteError::TooLong {
+        Some(Err(InterceptError::Rewrite(RewriteError::Capacity {
+            buffered: 3,
             limit: 1
         })))
     ));

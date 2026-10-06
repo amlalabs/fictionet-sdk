@@ -35,6 +35,15 @@ pub enum RewriteError<E> {
     },
     /// Storage could not be reserved.
     Allocation,
+    /// With Forward skips, the stream holds more unread bytes than the
+    /// output limit. Draining output cannot help. Push at most
+    /// [`Interceptor::room`] bytes between calls to avoid this.
+    Capacity {
+        /// Bytes buffered in the stream.
+        buffered: usize,
+        /// Maximum total destination length.
+        limit: usize,
+    },
 }
 impl<E: fmt::Display> fmt::Display for RewriteError<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -42,6 +51,9 @@ impl<E: fmt::Display> fmt::Display for RewriteError<E> {
             Self::Write(e) => write!(f, "replacement writer: {e}"),
             Self::TooLong { limit } => write!(f, "replacement exceeds {limit} output bytes"),
             Self::Allocation => f.write_str("replacement allocation failed"),
+            Self::Capacity { buffered, limit } => {
+                write!(f, "{buffered} buffered bytes exceed {limit} output bytes")
+            }
         }
     }
 }
@@ -108,6 +120,11 @@ impl Interceptor {
     /// Bounds the total length of each supplied output vector. Clamps to
     /// [`Buffer::MAX_LIMIT`]. Drain or clear output between calls as needed.
     /// No output queue is retained by this type.
+    ///
+    /// With Forward skips, every buffered byte may reach output, so the
+    /// stream's buffered bytes must fit the limit. [`intercept`](Self::intercept)
+    /// keeps to this. Callers that push directly push at most
+    /// [`room`](Self::room) bytes before each call.
     pub fn new(limit: usize) -> Self {
         Self {
             limit: limit.min(Buffer::MAX_LIMIT),
@@ -124,6 +141,21 @@ impl Interceptor {
     /// Maximum destination length accepted by this interceptor.
     pub fn limit(&self) -> usize {
         self.limit
+    }
+
+    /// How many more bytes `stream` can take while `out` stays within the
+    /// limit. With Forward skips this is the limit minus `out` and the
+    /// stream's buffered bytes, since skips may forward all of them. With
+    /// Drop skips, buffered input never reaches output unasked, so there
+    /// is no bound here and this returns `usize::MAX`.
+    pub fn room<D: Decode>(&self, stream: &Stream<D>, out: &[u8]) -> usize {
+        match self.skips {
+            SkipPolicy::Forward => self
+                .limit
+                .saturating_sub(out.len())
+                .saturating_sub(stream.buffered()),
+            SkipPolicy::Drop => usize::MAX,
+        }
     }
 
     /// Takes one item and applies the policy to its original bytes.
@@ -226,6 +258,9 @@ impl Interceptor {
     /// A reservation failure leaves the stream untouched, so no later item or
     /// decode failure is consumed. This may require draining output even when
     /// the action would drop an item. Drop skips only checks the existing prefix.
+    /// If the stream holds more bytes than the limit, the result is
+    /// [`RewriteError::Capacity`] and draining cannot help, so keep pushes
+    /// within [`room`](Self::room).
     /// `E` converts storage errors with writer error type `W`.
     pub fn with_next_observed<D: Decode, R, E, W>(
         &self,
@@ -246,6 +281,13 @@ impl Interceptor {
         } else {
             0
         };
+        if reserve > self.limit {
+            let error = RewriteError::Capacity {
+                buffered: reserve,
+                limit: self.limit,
+            };
+            return Some(Err(PumpError::Handler(error.into())));
+        }
         if let Err(error) = reserve_output::<W>(out, reserve, self.limit) {
             return Some(Err(PumpError::Handler(error.into())));
         }
@@ -293,7 +335,10 @@ impl Interceptor {
     /// Pushes and drains input, using the decoded type's Wire writer.
     /// Returns the number of bytes accepted. A clean handoff can leave a
     /// suffix unaccepted or unread in the stream. After EOF, no new bytes
-    /// are accepted. Call with empty input
+    /// are accepted. Each push stays within [`room`](Self::room). When
+    /// input remains and there is no room, the result is
+    /// `Err((accepted, TooLong))`: drain `out` and pass the unaccepted
+    /// suffix again. Call with empty input
     /// after [`Stream::end`] to drain EOF items and trailing skips.
     /// Each item has its own output transaction. Errors return the accepted
     /// byte count and keep earlier items' output. A decode failure also keeps
@@ -344,7 +389,14 @@ impl Interceptor {
             if bytes.is_empty() || stream.is_done() {
                 return Ok(length - bytes.len());
             }
-            let taken = stream.push(bytes);
+            let room = self.room(stream, out);
+            if room == 0 {
+                return Err((
+                    length - bytes.len(),
+                    InterceptError::Rewrite(RewriteError::TooLong { limit: self.limit }),
+                ));
+            }
+            let taken = stream.push(&bytes[..bytes.len().min(room)]);
             if taken == 0 {
                 // A live, drained stream has room. A refused push means
                 // its buffer could not reserve storage. Do not retry here.
@@ -616,6 +668,72 @@ mod tests {
                     Rewrite::<modbus::Frame>::Forward
                 })
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn intercept_accepts_only_what_output_can_hold_and_resumes_after_draining() {
+        let input = b"1 ".repeat(16);
+        let proxy = Interceptor::new(16);
+        let mut stream = Stream::new(json::Values::new());
+        let mut out = Vec::new();
+        let mut spaces = 0;
+        let mut accepted = 0;
+        for _ in 0..64 {
+            let result = proxy.intercept(&mut stream, &input[accepted..], &mut out, |_, _, _| {
+                Rewrite::<json::Value>::Drop
+            });
+            let taken = match result {
+                Ok(taken) => taken,
+                Err((taken, InterceptError::Rewrite(RewriteError::TooLong { limit: 16 }))) => taken,
+                Err((_, error)) => panic!("unexpected {error:?}"),
+            };
+            assert!(stream.buffered() <= proxy.limit());
+            accepted += taken;
+            spaces += out.len();
+            out.clear();
+            if accepted == input.len() {
+                break;
+            }
+        }
+        assert_eq!(accepted, input.len());
+        stream.end();
+        assert_eq!(
+            proxy.intercept(&mut stream, b"", &mut out, |_, _, _| {
+                Rewrite::<json::Value>::Drop
+            }),
+            Ok(0)
+        );
+        assert_eq!(spaces + out.len(), 16);
+        assert_eq!(stream.buffered(), 0);
+    }
+
+    #[test]
+    fn buffered_input_over_the_limit_is_a_capacity_error() {
+        let frame = [0, 1, 0, 0, 0, 6, 1, 3, 0, 0, 0, 1];
+        let mut stream = Stream::new(modbus::Frames);
+        for _ in 0..4 {
+            assert_eq!(stream.push(&frame), frame.len());
+        }
+        let proxy = Interceptor::new(16);
+        let mut out = Vec::new();
+        assert_eq!(proxy.room(&stream, &out), 0);
+        assert_eq!(
+            proxy.next(&mut stream, &mut out, |_, _, _| Rewrite::Forward),
+            Some(Err(InterceptError::Rewrite(RewriteError::Capacity {
+                buffered: 48,
+                limit: 16,
+            })))
+        );
+        assert_eq!(stream.buffered(), 48);
+        assert!(out.is_empty());
+
+        let mut stream = Stream::new(modbus::Frames);
+        assert_eq!(stream.push(&frame), frame.len());
+        assert_eq!(proxy.room(&stream, &out), 4);
+        assert_eq!(
+            proxy.with_skips(SkipPolicy::Drop).room(&stream, &out),
+            usize::MAX
         );
     }
 }
