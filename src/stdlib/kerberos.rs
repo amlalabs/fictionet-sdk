@@ -1,10 +1,6 @@
 //! Kerberos V5: reading and writing the messages a client, a KDC and a
 //! service trade, with no I/O and no cryptography.
 //!
-//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
-//! Writing appends to the destination only after validation succeeds.
-//! `Stream<Frames>` reads TCP record payloads.
-//!
 //! Kerberos is how Active Directory and most Unix sites log users in. A
 //! client asks the key distribution center (KDC) for a ticket-granting
 //! ticket with an AS-REQ and gets an AS-REP. It trades that ticket for a
@@ -16,8 +12,8 @@
 //! sections 5 and 7.2.
 //!
 //! Nothing here reads a socket or touches a key. A world that plays a KDC
-//! feeds the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection
-//! to a [`super::codec::Stream`], or takes a UDP datagram as it is, and reads each
+//! pushes the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection
+//! to a [`Stream<Frames>`](super::codec::Stream), or takes a UDP datagram as it is, and reads each
 //! message with [`Message::parse`]. It writes the reply with
 //! [`Wire::write`], with a [`Frame`] around its DER for TCP. The parts
 //! that are encrypted (the ticket's secrets, the reply's session key, the
@@ -35,7 +31,7 @@
 //! use fictionet::stdlib::codec::{Stream, Wire, pump, finish};
 //! use fictionet::stdlib::kerberos::{
 //!     error_code, msg_type, name_type, padata_type, Frame, Frames, KdcReq, KdcReqBody, KerberosTime, KrbError, Message,
-//!     PaData, PrincipalName,
+//!     MethodData, PaData, PrincipalName,
 //! };
 //!
 //! // A client asks for a ticket-granting ticket for alice, without
@@ -84,7 +80,7 @@
 //!     e_text: None,
 //!     e_data: Some(
 //!         // METHOD-DATA: the pre-authentication types the KDC accepts.
-//!         vec![PaData { padata_type: padata_type::ENC_TIMESTAMP, value: Vec::new() }].to_bytes()
+//!         MethodData(vec![PaData { padata_type: padata_type::ENC_TIMESTAMP, value: Vec::new() }]).to_bytes()
 //!             .unwrap(),
 //!     ),
 //! });
@@ -93,8 +89,6 @@
 //! assert_eq!(Message::parse(&der).unwrap(), reply);
 //! assert_eq!(reply.msg_type(), msg_type::KRB_ERROR);
 //! ```
-
-#![deny(missing_docs)]
 
 use super::asn1::{self, Reader, Rules, StringKind, Tag, Writer};
 use super::codec::{Decode, Step, Wire};
@@ -360,7 +354,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Unwritable => f.write_str("value changes when encoded"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Asn1(e) => write!(f, "ASN.1: {e}"),
             Error::UnknownMessage(n) => write!(f, "not a Kerberos message (tag {n})"),
             Error::Version(v) => write!(f, "protocol version {v}, not 5"),
@@ -582,15 +576,11 @@ pub struct EncryptedData {
 }
 
 impl EncryptedData {
-    /// Reads an EncryptedData standing alone in `der`, as a PA-DATA value
-    /// holds one.
-    fn read_der(der: &[u8]) -> Result<EncryptedData, Error> {
+    fn decode(der: &[u8]) -> Result<EncryptedData, Error> {
         whole(der, Rules::Der, EncryptedData::read)
     }
 
-    /// The DER of this EncryptedData on its own, bounded by [`MAX_MESSAGE`].
-    /// [`Wire::parse`] checks this bound after reading a signed kvno as UInt32.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         finish(|w| self.write_fields(w))
     }
 
@@ -628,16 +618,11 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    /// Reads a Ticket standing alone in `der`, as a credential cache holds
-    /// one.
-    fn read_der(der: &[u8]) -> Result<Ticket, Error> {
+    fn decode(der: &[u8]) -> Result<Ticket, Error> {
         whole(der, Rules::Der, Ticket::read)
     }
 
-    /// The DER of this Ticket on its own. As with
-    /// [`EncryptedData::write`], one read near [`MAX_MESSAGE`] may not
-    /// fit when written again.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
         finish(|w| self.write_fields(w))
     }
@@ -705,18 +690,11 @@ pub struct KdcReqBody {
 }
 
 impl KdcReqBody {
-    /// Reads a KDC-REQ-BODY standing alone in `der`, such as the bytes a
-    /// checksum covers.
-    fn read_der(der: &[u8]) -> Result<KdcReqBody, Error> {
+    fn decode(der: &[u8]) -> Result<KdcReqBody, Error> {
         whole(der, Rules::Der, KdcReqBody::read)
     }
 
-    /// The DER of the body on its own. A body read and written again may
-    /// not be the bytes it was read from: options shorter than 32 bits, a
-    /// nonce or kvno written as a negative number, an empty optional list,
-    /// or BER all come out differently. To check a checksum over a body
-    /// that was received, take its bytes with [`Message::kdc_req_body`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
         finish(|w| self.write_fields(w))
     }
@@ -1000,8 +978,7 @@ pub struct KrbError {
     /// Text for a person to read.
     pub e_text: Option<String>,
     /// More data. With [`error_code::KDC_ERR_PREAUTH_REQUIRED`] it is a
-    /// METHOD-DATA. Read and write it with the [`Wire`] implementation
-    /// for `Vec<PaData>`.
+    /// [`MethodData`].
     pub e_data: Option<Vec<u8>>,
 }
 
@@ -1092,9 +1069,7 @@ pub enum Message {
 }
 
 impl Message {
-    /// Reads one message, which must fill `der`, under DER as RFC 4120
-    /// asks.
-    fn read_der(der: &[u8]) -> Result<Message, Error> {
+    fn decode(der: &[u8]) -> Result<Message, Error> {
         Message::parse_with(der, Rules::Der)
     }
 
@@ -1166,13 +1141,7 @@ impl Message {
         }
     }
 
-    /// The message's DER, as a UDP datagram carries it. A list over its
-    /// limit, a Microseconds field over [`MAX_MICROSECONDS`], or a message
-    /// longer than [`MAX_MESSAGE`] is an error, and nothing is written. A
-    /// message read near the limit may not fit when written again, since
-    /// DER can be a few bytes longer than the BER or the short flags it
-    /// was read from.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         match self {
             Message::AsReq(m) | Message::TgsReq(m) => m.check()?,
             Message::AsRep(m) | Message::TgsRep(m) => m.check()?,
@@ -1219,28 +1188,21 @@ impl fmt::Display for FrameError {
 
 impl std::error::Error for FrameError {}
 
-impl Wire for Message {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Reads exactly one DER message whose re-encoding fits [`MAX_MESSAGE`].
-    /// Short flags and signed integer forms can expand when written.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let message = Message::read_der(bytes)?;
-        message.encode_der()?;
-        Ok(message)
-    }
-
-    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Message::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
+asn1::der_wire!(Message,
+    /// Reads one complete DER message, as RFC 4120 requires.
+    /// Refuses invalid tags, versions, fields, and lists, trailing bytes,
+    /// and input or DER output over [`MAX_MESSAGE`]. Short flags and signed
+    /// integer forms can expand when written.
+    parse checks encode;
+    /// Appends the message as DER, as a UDP datagram carries it. A list over its
+    /// limit, a Microseconds field over [`MAX_MICROSECONDS`], or a message
+    /// longer than [`MAX_MESSAGE`] is an error, and nothing is written. A
+    /// message read with [`Message::parse_with`] near the limit may grow
+    /// past it. DER can expand BER forms or short flags. [`Wire::parse`]
+    /// checks that the resulting encoding fits.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
 /// One TCP record's payload, bounded by [`MAX_MESSAGE`].
 ///
@@ -1279,6 +1241,8 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = FrameError;
 
+    /// Reads one TCP record. Refuses a reserved length bit, payloads over
+    /// [`MAX_MESSAGE`], incomplete records, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
         match Frames::new().decode(bytes, true).map_err(FrameParseError::Frame)? {
             Step::Item(data, n) if n == bytes.len() => Ok(Self(data)),
@@ -1287,6 +1251,8 @@ impl Wire for Frame {
         }
     }
 
+    /// Appends the four-byte length and payload. Refuses payloads over
+    /// [`MAX_MESSAGE`], leaving `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
         let length = u32::try_from(self.0.len()).map_err(|_| FrameError::TooLong(u32::MAX))?;
         if self.0.len() > MAX_MESSAGE {
@@ -1300,7 +1266,7 @@ impl Wire for Frame {
 
 /// Reads Kerberos TCP records without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for a buffer limited to
+/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
 /// [`TCP_HEADER_LEN`] plus the configured message limit. The four-byte prefix
 /// suffices to refuse reserved bits and oversized messages. Map each
 /// payload through [`Message::parse`] to interpret it. Partial records
@@ -1533,78 +1499,71 @@ fn w_flags(w: &mut Writer, n: u32, f: u32) {
     w.explicit(n, |w| w.bit_string(&f.to_be_bytes(), 0));
 }
 
-impl Wire for EncryptedData {
+asn1::der_wire!(EncryptedData,
+    /// Reads an EncryptedData standing alone in `bytes`, as a PA-DATA value
+    /// holds one.
+    /// Refuses malformed DER, trailing bytes, and input or DER output over
+    /// [`MAX_MESSAGE`]. Signed kvno values are read as UInt32.
+    parse checks encode;
+    /// Appends this EncryptedData as DER. Refuses output over [`MAX_MESSAGE`].
+    /// Signed kvno input can expand when written as UInt32. The parser checks
+    /// that the resulting encoding still fits.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
+
+asn1::der_wire!(Ticket,
+    /// Reads a Ticket standing alone in `bytes`, as a credential cache holds
+    /// one.
+    /// Refuses malformed DER, invalid realms or names, wrong versions, trailing
+    /// bytes, and input or DER output over [`MAX_MESSAGE`].
+    parse checks encode;
+    /// Appends this Ticket as DER. Refuses invalid realms or names and
+    /// output over [`MAX_MESSAGE`]. As with [`EncryptedData::write`], DER
+    /// may expand a signed kvno; the parser checks that the result fits.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
+
+asn1::der_wire!(KdcReqBody,
+    /// Reads a KDC-REQ-BODY standing alone in `bytes`, such as the bytes a
+    /// checksum covers.
+    /// Refuses malformed DER, invalid fields or lists, trailing bytes,
+    /// and input or DER output over [`MAX_MESSAGE`].
+    parse checks encode;
+    /// Appends the body as DER. A body read and written again may
+    /// not be the bytes it was read from: options shorter than 32 bits, a
+    /// nonce or kvno written as a negative number, an empty optional list,
+    /// or BER all come out differently. To check a checksum over a body
+    /// that was received, take its bytes with [`Message::kdc_req_body`].
+    /// Refuses invalid fields or lists and output over [`MAX_MESSAGE`].
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
+
+/// METHOD-DATA: a DER SEQUENCE OF PA-DATA, bounded by [`MAX_PADATA`].
+/// A KRB-ERROR with [`error_code::KDC_ERR_PREAUTH_REQUIRED`] carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MethodData(
+    /// The pre-authentication methods, in wire order. An empty list is allowed.
+    pub Vec<PaData>,
+);
+
+impl Wire for MethodData {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads one DER METHOD-DATA. Refuses malformed fields, trailing bytes,
+    /// more than [`MAX_PADATA`] methods, and input over [`MAX_MESSAGE`].
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let value = Self::read_der(bytes)?;
-        value.encode_der()?;
-        Ok(value)
+        whole(bytes, Rules::Der, |r| seq_of(r, MAX_PADATA, "padata", PaData::read)).map(Self)
     }
 
+    /// Appends DER METHOD-DATA. Refuses more than [`MAX_PADATA`] methods
+    /// and output over [`MAX_MESSAGE`], leaving `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
-impl Wire for Ticket {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let value = Self::read_der(bytes)?;
-        value.encode_der()?;
-        Ok(value)
-    }
-
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
-impl Wire for KdcReqBody {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let value = Self::read_der(bytes)?;
-        value.encode_der()?;
-        Ok(value)
-    }
-
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
-/// METHOD-DATA is a DER SEQUENCE OF PA-DATA, bounded by [`MAX_PADATA`].
-impl Wire for Vec<PaData> {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        whole(bytes, Rules::Der, |r| seq_of(r, MAX_PADATA, "padata", PaData::read))
-    }
-
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        limit(self.len(), MAX_PADATA, "padata")?;
-        let bytes = finish(|w| w.sequence(|w| self.iter().for_each(|p| p.write_fields(w))))?;
+        limit(self.0.len(), MAX_PADATA, "padata")?;
+        let bytes = finish(|w| w.sequence(|w| self.0.iter().for_each(|p| p.write_fields(w))))?;
         out.extend_from_slice(&bytes);
         Ok(())
     }
@@ -1614,7 +1573,7 @@ impl Wire for Vec<PaData> {
 mod tests {
     use super::super::codec::{
         Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks},
+        test_support::{Lcg, chunks, mutate},
     };
     use super::*;
 
@@ -1786,13 +1745,13 @@ mod tests {
 
     #[test]
     fn method_data() {
-        let p = vec![
+        let p = MethodData(vec![
             PaData { padata_type: padata_type::ENC_TIMESTAMP, value: vec![] },
             PaData { padata_type: padata_type::ETYPE_INFO2, value: vec![0x30, 0x00] },
-        ];
+        ]);
         let der = p.to_bytes().unwrap();
-        assert_eq!(<Vec<PaData> as Wire>::parse(&der).unwrap(), p);
-        let many = vec![p[0].clone(); MAX_PADATA + 1];
+        assert_eq!(MethodData::parse(&der).unwrap(), p);
+        let many = MethodData(vec![p.0[0].clone(); MAX_PADATA + 1]);
         assert_eq!(many.to_bytes(), Err(Error::TooMany("padata")));
     }
 
@@ -1939,7 +1898,7 @@ mod tests {
         t.enc_part.cipher = huge.clone();
         assert_eq!(t.to_bytes(), Err(Error::TooLong));
         let p = PaData { padata_type: 2, value: huge.clone() };
-        assert_eq!(vec![p].to_bytes(), Err(Error::TooLong));
+        assert_eq!(MethodData(vec![p]).to_bytes(), Err(Error::TooLong));
         let mut body = as_req().body;
         body.enc_authorization_data = Some(enc(18, None, &huge));
         assert_eq!(body.to_bytes(), Err(Error::TooLong));
@@ -1978,7 +1937,7 @@ mod tests {
         // A reader takes them as absent; see empty_optional_lists_read_as_absent.
 
         // METHOD-DATA has no such note, so an empty one is fine.
-        assert_eq!(<Vec<PaData> as Wire>::parse(&Vec::<PaData>::new().to_bytes().unwrap()), Ok(Vec::new()));
+        assert_eq!(MethodData::parse(&MethodData::default().to_bytes().unwrap()), Ok(MethodData::default()));
     }
 
     #[test]
@@ -2114,7 +2073,7 @@ mod tests {
         let mut bytes = one.repeat(2);
         bytes.extend_from_slice(&(MAX_MESSAGE as u32 + 1).to_be_bytes());
         bytes.extend_from_slice(&[0; 1000]);
-        contract::check_decode(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
         let mut stream = Stream::new(Frames::new());
         let mut got = Vec::new();
         assert_eq!(
@@ -2299,8 +2258,8 @@ mod tests {
         contract::check_wire::<Ticket>(data);
         contract::check_wire::<EncryptedData>(data);
         contract::check_wire::<KdcReqBody>(data);
-        contract::check_wire::<Vec<PaData>>(data);
-        contract::check_decode(Frames::new, data);
+        contract::check_wire::<MethodData>(data);
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
         contract::check_wire::<Message>(data);
         read
     }
@@ -2315,22 +2274,16 @@ mod tests {
         for i in 0..6000 {
             let data = if i % 3 == 0 {
                 // Random bytes, sometimes behind a plausible header.
-                let len = rng.below(200) as usize;
-                let mut d: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+                let mut d = rng.bytes(199);
                 if i % 2 == 0 && d.len() >= 2 {
-                    d[0] = 0x60 | [10, 11, 12, 13, 14, 15, 30][rng.below(7) as usize];
+                    d[0] = 0x60 | [10, 11, 12, 13, 14, 15, 30][rng.index(7)];
                 }
                 d
             } else {
                 // A real message with a few bytes changed, cut or added.
-                let mut d = seeds[rng.below(seeds.len() as u64) as usize].clone();
-                for _ in 0..1 + (rng.below(4) as usize) {
-                    let at = rng.below(d.len() as u64) as usize;
-                    match rng.below(3) as usize {
-                        0 => d[at] = rng.next() as u8,
-                        1 => d.truncate(at.max(1)),
-                        _ => d.insert(at, rng.next() as u8),
-                    }
+                let mut d = seeds[rng.index(seeds.len())].clone();
+                for _ in 0..1 + rng.index(4) {
+                    mutate(&mut rng, &mut d);
                 }
                 d
             };
@@ -2358,7 +2311,7 @@ mod tests {
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.push(&[0]), 0);
         assert_eq!(stream.next(), Some(Ok(frame.0)));
-        contract::check_decode(Frames::new, &[0, 0, 0, 0, 0x80, 0, 0, 0]);
+        contract::check_decode_with_alloc_limit(Frames::new, &[0, 0, 0, 0, 0x80, 0, 0, 0], 2 * (TCP_HEADER_LEN + MAX_MESSAGE));
         assert_eq!(stream.push(&[0x80, 0, 0, 0]), 4);
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Reserved(0x8000_0000)))));
         assert_eq!(stream.next(), None);

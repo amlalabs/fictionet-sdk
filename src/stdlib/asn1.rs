@@ -1,10 +1,6 @@
 //! ASN.1 BER and DER: reading and writing tags, lengths and values, with no
 //! I/O.
 //!
-//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
-//! Writing appends to the destination only after validation succeeds.
-//! [`Stream<Elements>`](super::codec::Stream) frames BER or DER [`Elements`].
-//!
 //! ASN.1 describes data structures, and its encoding rules turn them into
 //! bytes. The Basic Encoding Rules (BER) allow several encodings of one
 //! value. The Distinguished Encoding Rules (DER) allow exactly one. LDAP,
@@ -14,7 +10,7 @@
 //! TLVs. This module follows ITU-T X.690 (02/2021), the BER and DER
 //! specification, and the character sets and time formats of ITU-T X.680.
 //!
-//! Nothing here reads a socket. A world that plays an LDAP server feeds the
+//! Nothing here reads a socket. A world that plays an LDAP server pushes the
 //! bytes it reads from a connection to a [`Stream<Elements>`](super::codec::Stream),
 //! gets one message's bytes at a time, and walks each one with a [`Reader`]. A world that
 //! checks a certificate reads it with [`Rules::Der`], so any encoding DER
@@ -58,16 +54,55 @@
 //! assert_eq!(Reader::new(&ber, Rules::Der).read_sequence().err(), Some(Error::Indefinite));
 //! ```
 
-#![deny(missing_docs)]
-
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::fmt;
 
 use super::codec::{Decode, Step, Wire};
 
+// Wire for values with decode and encode: write encodes, reads back, and
+// refuses a value that changes. Parse may also check the encoding's limits.
+macro_rules! der_wire {
+    ($ty:ty, $(#[$parse_doc:meta])* parse $(checks $encode:ident)?;
+        $(#[$write_doc:meta])* write;) => {
+        impl $crate::stdlib::codec::Wire for $ty {
+            type ParseError = Error;
+            type WriteError = Error;
+
+            $(#[$parse_doc])*
+            fn parse(bytes: &[u8]) -> Result<Self, Error> {
+                let value = Self::decode(bytes)?;
+                $(value.$encode()?;)?
+                Ok(value)
+            }
+
+            $(#[$write_doc])*
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+                let bytes = self.encode()?;
+                if Self::decode(&bytes).as_ref() != Ok(self) {
+                    return Err(Error::Unwritable);
+                }
+                out.extend_from_slice(&bytes);
+                Ok(())
+            }
+        }
+    };
+    ($($ty:ty),+ $(,)?) => { $(
+        $crate::stdlib::asn1::der_wire!($ty,
+            /// Reads one complete DER value. Refuses malformed fields,
+            /// trailing bytes, and exceeded limits. See this type's docs.
+            parse;
+            /// Appends DER. Refuses invalid fields, exceeded limits, and
+            /// values that change when encoded. See this type's docs.
+            /// Leaves the destination unchanged on error.
+            write;
+        );
+    )+ };
+}
+pub(crate) use der_wire;
+
 /// The longest element, header and contents together, a reader accepts and
-/// a writer writes. A [`super::codec::Stream`] never holds much more than this.
+/// a writer writes. A [`Stream<Elements>`](super::codec::Stream) never holds much more than this.
 pub const MAX_INPUT: usize = 1 << 20;
 /// How deep constructed values may nest. Elements read straight from the
 /// input are at depth 0, their children at depth 1, and so on. A
@@ -379,6 +414,10 @@ pub struct Header {
     pub len: usize,
 }
 
+/// The capacity floor for ASN.1 message decoders. It leaves room for
+/// any header [`Header::parse`] reads or refuses, even with a tiny limit.
+pub const HEADER_ROOM: usize = 16;
+
 impl Header {
     /// Reads the header at the start of `b` under `rules`. It returns
     /// [`Error::Truncated`] if `b` ends inside it.
@@ -601,11 +640,15 @@ impl Wire for Frame {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads exactly one BER element. Refuses bad framing, trailing bytes,
+    /// and input above [`MAX_INPUT`]. Does not interpret the contents.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
         check_frame(bytes)?;
         Ok(Self(bytes.to_vec()))
     }
 
+    /// Appends the stored BER element unchanged. Refuses bad framing,
+    /// trailing bytes, and input above [`MAX_INPUT`], leaving `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         check_frame(&self.0)?;
         out.extend_from_slice(&self.0);
@@ -626,10 +669,10 @@ fn check_frame(bytes: &[u8]) -> Result<(), Error> {
 
 /// Reads ASN.1 elements without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for a buffer limited to [`MAX_INPUT`].
+/// Use with [`Stream<Elements>`](super::codec::Stream) for a buffer limited to [`MAX_INPUT`].
 /// Partial elements return [`Step::Need`], including at EOF. The stream
 /// reports truncation at EOF and framing errors once. An indefinite BER
-/// length keeps a scan position relative to the unread start, so feeding
+/// length keeps a scan position relative to the unread start, so pushing
 /// one byte at a time takes linear time. Only framing is checked.
 ///
 /// ```
@@ -2173,7 +2216,7 @@ fn sorted(contents: &[u8], order: Order) -> Result<Vec<u8>, Error> {
 mod tests {
     use super::super::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, chunks},
+        test_support::{Lcg, chunks, mutate},
     };
     use super::*;
 
@@ -2310,7 +2353,7 @@ mod tests {
     /// What the fuzz target checks, on one input.
     fn check(data: &[u8]) {
         for rules in [Rules::Ber, Rules::Der] {
-            contract::check_decode(|| Elements::new(rules), data);
+            contract::check_decode_with_alloc_limit(|| Elements::new(rules), data, 2 * MAX_INPUT);
         }
         contract::check_wire::<Frame>(data);
         // DER is BER: what DER frames, BER frames the same.
@@ -3093,7 +3136,7 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_elements_in_linear_time() {
-        // One feed of half a million NULLs. Taking each one out must not
+        // One push of half a million NULLs. Taking each one out must not
         // copy the bytes still waiting behind it.
         let n = MAX_INPUT / 2;
         let stream = [0x05, 0x00].repeat(n);
@@ -3106,7 +3149,7 @@ mod tests {
         }
         assert_eq!(count, n);
         assert_eq!(d.buffered(), 0);
-        // Interleaved with feeds, partial elements still join up.
+        // Interleaved with pushes, partial elements still join up.
         let a = [0x30, 0x03, 0x02, 0x01, 0x01];
         let b = [0x30, 0x80, 0x05, 0x00, 0x00, 0x00];
         let stream = [&a[..], &b[..]].concat().repeat(1000);
@@ -3190,31 +3233,24 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x2545_f491_4f6c_dd1d);
-        let mut next = || rng.next() as u32;
         let seeds = samples();
         // Bytes that make up most headers, so random input gets past them.
         const COMMON: [u8; 16] =
             [0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0c, 0x13, 0x17, 0x18, 0x30, 0x31, 0x80, 0x81, 0xa0];
         for round in 0..6000 {
             let mut data = if round % 2 == 0 {
-                seeds[next() as usize % seeds.len()].clone()
+                seeds[rng.index(seeds.len())].clone()
             } else {
-                let len = next() as usize % 48;
-                (0..len)
-                    .map(|_| if next() % 2 == 0 { COMMON[next() as usize % COMMON.len()] } else { next() as u8 })
-                    .collect()
+                let mut bytes = rng.bytes(47);
+                for byte in &mut bytes {
+                    if rng.coin() {
+                        *byte = COMMON[rng.index(COMMON.len())];
+                    }
+                }
+                bytes
             };
-            for _ in 0..next() % 4 {
-                if data.is_empty() {
-                    break;
-                }
-                let i = next() as usize % data.len();
-                match next() % 4 {
-                    0 => data[i] = next() as u8,
-                    1 => data[i] ^= 1 << (next() % 8),
-                    2 => data.truncate(i),
-                    _ => data.insert(i, COMMON[next() as usize % COMMON.len()]),
-                }
+            for _ in 0..rng.index(4) {
+                mutate(&mut rng, &mut data);
             }
             check(&data);
         }
@@ -3406,15 +3442,16 @@ mod tests {
 
     #[test]
     fn decoder_holds_a_bounded_number_of_bytes() {
-        // One large feed is taken only up to MAX_INPUT bytes.
+        // One large push is taken only up to MAX_INPUT bytes.
         let stream = [0x05, 0x00].repeat(MAX_INPUT);
         let mut d = Stream::new(Elements::new(Rules::Der));
         assert_eq!(d.push(&stream), MAX_INPUT);
         assert_eq!(d.buffered(), MAX_INPUT);
-        // Feeding again without taking anything out takes nothing.
+        // Pushing again without taking anything out takes nothing.
         assert_eq!(d.push(&stream[MAX_INPUT..]), 0);
         assert_eq!(d.buffered(), MAX_INPUT);
-        // A loop of feeding and taking out gets every element.
+        assert!(d.into_parts().0.allocated() <= 2 * MAX_INPUT);
+        // A loop of pushing and taking out gets every element.
         let mut d = Stream::new(Elements::new(Rules::Der));
         let mut rest = &stream[..];
         let mut count = 0;
@@ -3428,6 +3465,7 @@ mod tests {
             assert!(d.buffered() <= MAX_INPUT);
         }
         assert_eq!(count, MAX_INPUT);
+        assert!(d.into_parts().0.allocated() <= 2 * MAX_INPUT);
         // An element that never ends gives an error at the limit instead
         // of stalling the loop.
         let mut d = Stream::new(Elements::new(Rules::Ber));
@@ -3449,6 +3487,7 @@ mod tests {
         assert_eq!(d.push(&endless), endless.len());
         assert_eq!(d.buffered(), held);
         assert_eq!(d.next(), None);
+        assert!(d.into_parts().0.allocated() <= 2 * MAX_INPUT);
     }
 
     #[test]
@@ -3490,7 +3529,7 @@ mod tests {
         assert_eq!(stream.decoder().rules(), Rules::Ber);
         assert_eq!(stream.decoder().held(), 0);
         bytes.extend_from_slice(&[0x30, 0x80, 5, 0, 0, 0, 0, 0, 5, 0]);
-        contract::check_decode(|| Elements::new(Rules::Ber), &bytes);
-        contract::check_decode(|| Elements::new(Rules::Der), &bytes);
+        contract::check_decode_with_alloc_limit(|| Elements::new(Rules::Ber), &bytes, 2 * MAX_INPUT);
+        contract::check_decode_with_alloc_limit(|| Elements::new(Rules::Der), &bytes, 2 * MAX_INPUT);
     }
 }

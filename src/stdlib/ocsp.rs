@@ -1,10 +1,6 @@
 //! OCSP: reading and writing certificate status requests and responses,
 //! with no I/O.
 //!
-//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
-//! Writing appends to the destination only after validation succeeds.
-//! `Stream<Frames>` frames DER messages.
-//!
 //! The Online Certificate Status Protocol is how a client asks a
 //! certificate authority whether a certificate is still good. The client
 //! names each certificate by a [`CertId`]: hashes of its issuer's name and
@@ -83,8 +79,6 @@
 //! assert_eq!(basic.data.responses[0].status, CertStatus::Good);
 //! assert_eq!(basic.data.responses[0].cert_id.serial_number, [0x12, 0x34]);
 //! ```
-
-#![deny(missing_docs)]
 
 use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, Tag, Writer};
 use super::codec::{Decode, Step, Wire};
@@ -183,7 +177,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Unwritable => f.write_str("value changes when encoded"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Asn1(e) => write!(f, "OCSP DER: {e}"),
             Error::TooLong => write!(f, "OCSP message longer than {MAX_MESSAGE} bytes"),
             Error::TooMany => f.write_str("OCSP list longer than its limit"),
@@ -344,12 +338,16 @@ impl OcspRequest {
         OcspRequest { version: 0, requestor_name: None, requests, extensions: vec![], signature: None }
     }
 
-    /// Reads a request from its DER, such as a POST body.
-    fn read_der(b: &[u8]) -> Result<OcspRequest, Error> {
+    fn decode(b: &[u8]) -> Result<OcspRequest, Error> {
+        Self::decode_with_tbs(b).map(|(request, _)| request)
+    }
+
+    fn decode_with_tbs(b: &[u8]) -> Result<(OcspRequest, &[u8]), Error> {
         let mut top = outer(b)?;
         let mut req = top.read_sequence()?;
         top.finish()?;
-        let mut tbs = req.read_sequence()?;
+        let tbs_element = req.read_expected(Tag::SEQUENCE)?;
+        let mut tbs = tbs_element.reader()?;
         let version = read_version(&mut tbs)?;
         let requestor_name = match explicit(&mut tbs, 1)? {
             Some(mut inner) => {
@@ -393,15 +391,10 @@ impl OcspRequest {
         if signature.is_some() && requestor_name.is_none() {
             return Err(Error::RequestorName);
         }
-        Ok(OcspRequest { version, requestor_name, requests, extensions, signature })
+        Ok((OcspRequest { version, requestor_name, requests, extensions, signature }, tbs_element.raw()))
     }
 
-    /// The request's DER, for a world that plays a client. It fails if a
-    /// list is empty or over its limit, a hash has the wrong length, a raw
-    /// DER part is not one well-formed element, the requestor name is not
-    /// a GeneralName, the request is signed but names no requestor, or the
-    /// whole is over [`MAX_MESSAGE`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.check_tbs()?;
         if let Some(s) = &self.signature {
             if self.requestor_name.is_none() {
@@ -425,13 +418,12 @@ impl OcspRequest {
         finish(w)
     }
 
-    /// Returns the signed TBSRequest bytes from one complete DER request.
-    /// The returned slice preserves the received encoding.
+    /// Validates one complete DER request and returns its TBSRequest bytes.
+    /// The slice preserves the received encoding for signature verification.
+    /// To sign a new request, write it unsigned, take this slice, sign it,
+    /// then set the signature and write the request again.
     pub fn tbs_request(der: &[u8]) -> Result<&[u8], Error> {
-        Self::parse(der)?;
-        let mut top = outer(der)?;
-        let mut request = top.read_sequence()?;
-        Ok(request.read()?.raw())
+        Self::decode_with_tbs(der).map(|(_, tbs)| tbs)
     }
 
     /// The nonce the request carries, if any. See [`find_nonce`].
@@ -574,9 +566,7 @@ impl OcspResponse {
         }
     }
 
-    /// Reads a response from its DER, such as an HTTP reply's body. A basic
-    /// response inside is read too, and an error in it is an error here.
-    fn read_der(b: &[u8]) -> Result<OcspResponse, Error> {
+    fn decode(b: &[u8]) -> Result<OcspResponse, Error> {
         let mut top = outer(b)?;
         let mut resp = top.read_sequence()?;
         top.finish()?;
@@ -601,18 +591,13 @@ impl OcspResponse {
         Ok(OcspResponse { status, bytes })
     }
 
-    /// The response's DER, for a world that plays a responder. It fails
-    /// where [`BasicResponse::write`] does, if the status and the bytes
-    /// disagree or [`ResponseBytes::Other`] has the basic type's
-    /// identifier ([`Error::ResponseBytes`]), or if the whole is over
-    /// [`MAX_MESSAGE`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_status(self.status, &self.bytes)?;
         let basic;
         let (response_type, response): (Option<&Oid>, &[u8]) = match &self.bytes {
             None => (None, &[]),
             Some(ResponseBytes::Basic(b)) => {
-                basic = (known_oid(oid::BASIC), b.encode_der()?);
+                basic = (known_oid(oid::BASIC), b.encode()?);
                 (Some(&basic.0), &basic.1)
             }
             Some(ResponseBytes::Other { response_type, response }) => {
@@ -657,9 +642,7 @@ pub struct BasicResponse {
 }
 
 impl BasicResponse {
-    /// Reads a basic response from its DER: the contents of a response's
-    /// OCTET STRING.
-    fn read_der(b: &[u8]) -> Result<BasicResponse, Error> {
+    fn decode(b: &[u8]) -> Result<BasicResponse, Error> {
         let mut top = outer(b)?;
         let mut s = top.read_sequence()?;
         top.finish()?;
@@ -671,10 +654,7 @@ impl BasicResponse {
         Ok(BasicResponse { data, signature_algorithm, signature, certs })
     }
 
-    /// The basic response's DER. It fails if a list is over its limit, a
-    /// time is not in the form RFC 5280 allows, a raw DER part is not one
-    /// well-formed element, or the whole is over [`MAX_MESSAGE`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.data.check()?;
         check_certs(&self.certs)?;
         let mut w = Writer::new();
@@ -717,9 +697,14 @@ pub struct ResponseData {
 }
 
 impl ResponseData {
-    /// The DER the responder signs, as it appears inside a
-    /// [`BasicResponse`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn decode(bytes: &[u8]) -> Result<Self, Error> {
+        let mut r = outer(bytes)?;
+        let data = read_response_data(&mut r)?;
+        r.finish()?;
+        Ok(data)
+    }
+
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.check()?;
         let mut w = Writer::new();
         write_response_data(&mut w, self);
@@ -949,66 +934,51 @@ fn hex_digit(c: u8) -> Result<u8, Error> {
     }
 }
 
-impl Wire for OcspRequest {
-    type ParseError = Error;
-    type WriteError = Error;
+asn1::der_wire!(OcspRequest,
+    /// Reads a request from its DER, such as a POST body.
+    /// Refuses trailing bytes, invalid fields, empty requests, exceeded lists,
+    /// and input over [`MAX_MESSAGE`]. Signed requests must name a requestor.
+    parse;
+    /// Appends the request as DER, for a world that plays a client. It fails if a
+    /// list is empty or over its limit, a hash has the wrong length, a raw
+    /// DER part is not one well-formed element, the requestor name is not
+    /// a GeneralName, the request is signed but names no requestor, or the
+    /// whole is over [`MAX_MESSAGE`].
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::read_der(bytes)
-    }
+asn1::der_wire!(OcspResponse,
+    /// Reads a response from its DER, such as an HTTP reply's body. A basic
+    /// response inside is read too, and an error in it is an error here.
+    /// Refuses trailing bytes, unknown status codes, status/bytes mismatches,
+    /// and input over [`MAX_MESSAGE`].
+    parse;
+    /// Appends the response as DER, for a world that plays a responder. It fails
+    /// where [`BasicResponse::write`] does, if the status and the bytes
+    /// disagree or [`ResponseBytes::Other`] has the basic type's
+    /// identifier ([`Error::ResponseBytes`]), or if the whole is over
+    /// [`MAX_MESSAGE`].
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
-    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
-impl Wire for OcspResponse {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::read_der(bytes)
-    }
-
-    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
-impl Wire for BasicResponse {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Self::read_der(bytes)
-    }
-
-    /// Appends DER bounded by [`MAX_MESSAGE`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
+asn1::der_wire!(BasicResponse,
+    /// Reads a basic response from its DER: the contents of a response's
+    /// OCTET STRING.
+    /// Refuses trailing bytes, invalid fields, exceeded lists, and input over
+    /// [`MAX_MESSAGE`].
+    parse;
+    /// Appends the basic response as DER. It fails if a list is over its limit, a
+    /// time is not in the form RFC 5280 allows, a raw DER part is not one
+    /// well-formed element, or the whole is over [`MAX_MESSAGE`].
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
 /// Reads whole DER messages without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for a buffer bounded by the configured
+/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer bounded by the configured
 /// message limit, with at least 16 bytes to read or refuse any ASN.1 header.
 /// Only headers are checked. Map each item through [`OcspRequest::parse`]
 /// or [`OcspResponse::parse`] to interpret it. Partial messages return
@@ -1050,7 +1020,7 @@ impl Decode for Frames {
     const NAME: &'static str = "OCSP";
 
     fn capacity(&self) -> usize {
-        self.limit.max(16)
+        self.limit.max(asn1::HEADER_ROOM)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
@@ -1490,32 +1460,22 @@ fn write_single_response(w: &mut Writer, r: &SingleResponse) {
     });
 }
 
-impl Wire for ResponseData {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let mut r = outer(bytes)?;
-        let data = read_response_data(&mut r)?;
-        r.finish()?;
-        Ok(data)
-    }
-
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::parse(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
+asn1::der_wire!(ResponseData,
+    /// Reads one complete DER ResponseData. Refuses invalid fields, exceeded
+    /// lists, trailing bytes, and input over [`MAX_MESSAGE`].
+    parse;
+    /// Appends the DER the responder signs, as it appears inside a
+    /// [`BasicResponse`]. Refuses invalid fields, exceeded lists, invalid
+    /// responder IDs, hash lengths or times, and output over [`MAX_MESSAGE`].
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
 #[cfg(test)]
 mod tests {
     use super::super::codec::{
         Fail, Stream, contract,
-        test_support::{Lcg, chunks},
+        test_support::{Lcg, chunks, mutate},
     };
     use super::*;
 
@@ -2123,7 +2083,7 @@ mod tests {
 
     #[test]
     fn decoder_holds_at_most_a_message() {
-        // One large feed takes only what fits, and the rest waits.
+        // One large push takes only what fits, and the rest waits.
         let mut big = vec![0; 1 << 20];
         big[..5].copy_from_slice(&[0x04, 0x83, 0x0f, 0xff, 0xfb]);
         let mut d = Stream::new(Frames::new());
@@ -2371,7 +2331,7 @@ mod tests {
             ok += 1;
         }
         let _ = decode_get_path(&String::from_utf8_lossy(b));
-        contract::check_decode(Frames::new, b);
+        contract::check_decode_with_alloc_limit(Frames::new, b, 2 * MAX_MESSAGE);
         contract::check_wire::<OcspRequest>(b);
         contract::check_wire::<OcspResponse>(b);
         contract::check_wire::<BasicResponse>(b);
@@ -2392,23 +2352,12 @@ mod tests {
         for round in 0..6000 {
             let seed = &seeds[round % seeds.len()];
             let mut b = seed.clone();
-            match rng.below(4) as usize {
-                0 => {
-                    for _ in 0..1 + (rng.below(4) as usize) {
-                        let i = rng.below(b.len() as u64) as usize;
-                        b[i] = rng.next() as u8;
-                    }
+            if rng.below(4) == 0 {
+                b = rng.bytes(199);
+            } else {
+                for _ in 0..1 + rng.index(4) {
+                    mutate(&mut rng, &mut b);
                 }
-                1 => {
-                    let i = rng.below(b.len() as u64) as usize;
-                    b[i] ^= 1 << (rng.below(8) as usize);
-                }
-                2 => {
-                    let n = rng.below(b.len() as u64) as usize;
-                    b.truncate(n);
-                    b.extend((0..(rng.below(8) as usize)).map(|_| rng.next() as u8));
-                }
-                _ => b = (0..(rng.below(200) as usize)).map(|_| rng.next() as u8).collect(),
             }
             parsed += exercise(&b);
         }
@@ -2462,7 +2411,7 @@ mod tests {
         assert_eq!(Frames::new().capacity(), MAX_MESSAGE);
         let mut stream = Stream::new(Frames::new());
         let bytes = [0x30, 0x83, 1, 0, 0];
-        contract::check_decode(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_MESSAGE);
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         assert_eq!(stream.next(), None);

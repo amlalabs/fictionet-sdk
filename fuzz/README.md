@@ -34,7 +34,7 @@ cargo +nightly fuzz list
 | `iec104` | APDU streams, ASDU headers and information object layouts | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
-| `asn1` | codec contracts, protocol parsing, and transactional writes | `stdlib::asn1`: ASN.1 BER and DER |
+| `asn1` | BER/DER elements and writer scripts; checks framing, value readers, DER copies, bounds, and transactional writes | `stdlib::asn1`: ASN.1 BER and DER |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
@@ -48,8 +48,8 @@ cargo +nightly fuzz list
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::kafka`: Apache Kafka |
-| `kerberos` | codec contracts, protocol parsing, and transactional writes | `stdlib::kerberos`: Kerberos V5 |
-| `ldap` | codec contracts, protocol parsing, and transactional writes | `stdlib::ldap`: LDAP |
+| `kerberos` | DER/BER messages, TCP records, and METHOD-DATA; checks record bounds, request-body slices, round trips, and write refusal | `stdlib::kerberos`: Kerberos V5 |
+| `ldap` | BER messages, CLDAP datagrams, filters, and DN text; checks stream limits, text round trips, and constructed search writes | `stdlib::ldap`: LDAP |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
 | `mime_multipart` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mongodb`: MongoDB |
@@ -58,7 +58,7 @@ cargo +nightly fuzz list
 | `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nfs`: NFS version 3 and MOUNT version 3 |
 | `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
-| `ocsp` | codec contracts, protocol parsing, and transactional writes | `stdlib::ocsp`: OCSP |
+| `ocsp` | DER requests and responses, GET paths, and constructed values; checks framing, nonce bounds, signed slices, and round trips | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
@@ -75,7 +75,7 @@ cargo +nightly fuzz list
 | `sip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::sip`: SIP |
 | `snmp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::snmp`: SNMP v1 and v2c |
 | `socks` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
-| `spnego` | codec contracts, protocol parsing, and transactional writes | `stdlib::spnego`: SPNEGO |
+| `spnego` | Bare and GSS-wrapped tokens plus constructed wrappers; checks framing, mechanism rules, round trips, and write refusal | `stdlib::spnego`: SPNEGO |
 | `ssh` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ssh`: The SSH transport layer before encryption |
 | `stun` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::stun`: STUN |
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
@@ -84,7 +84,7 @@ cargo +nightly fuzz list
 | `urlencoded_form` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
 | `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::websocket`: WebSocket (RFC 6455) |
-| `x509` | codec contracts, protocol parsing, and transactional writes | `stdlib::x509`: X.509 certificates and CRLs |
+| `x509` | DER certificates, CRLs, extensions, and PEM bundles; checks signed-byte preservation, text framing, limits, and constructed writes | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::xml`: XML 1.0 |
 
 The proxy targets compile the `fictionet` binary's proxy modules from

@@ -1,10 +1,6 @@
 //! X.509 certificates and CRLs: reading them into their parts and writing
 //! them back, with PEM, and with no I/O.
 //!
-//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
-//! Writing appends to the destination only after validation succeeds.
-//! `Stream<PemBlocks>` reads bounded PEM blocks.
-//!
 //! A certificate binds a public key to a name. An issuer signs a
 //! TBSCertificate (the part "to be signed") that holds a serial number,
 //! the issuer's and subject's names, a validity period, the subject's
@@ -82,7 +78,7 @@
 //! // the signature.
 //! let signature = BitString::new(vec![0x30, 0x00], 0).unwrap();
 //! let cert = Certificate::assemble(&tbs_der, ecdsa_sha256, signature).unwrap();
-//! let pem = Pem { label: PEM_CERTIFICATE.into(), data: cert.to_bytes().unwrap() }.to_bytes().unwrap();
+//! let pem = Pem::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap();
 //! let pem = String::from_utf8(pem).unwrap();
 //! assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
 //!
@@ -94,8 +90,6 @@
 //! let san = back.tbs.get::<SubjectAltName>().unwrap().unwrap();
 //! assert_eq!(san.0, [GeneralName::Dns("www.example.com".into())]);
 //! ```
-
-#![deny(missing_docs)]
 
 use super::asn1::{self, BitString, Class, Element, Oid, Reader, Rules, StringKind, Tag, Writer};
 use super::codec::{Decode, Step as DecodeStep, Wire};
@@ -417,6 +411,12 @@ fn write_alg(w: &mut Writer, a: &AlgorithmIdentifier) {
 }
 
 /// One attribute value in a name.
+///
+/// [`Wire::parse`] reads one DER attribute value. [`Wire::write`] writes
+/// it as one DER element. A [`Value::Raw`] holding a string type the
+/// reader decodes, such as UTF8String, is [`Error::Value`] on write.
+/// Use [`Value::Text`] for those strings. Malformed DER and trailing
+/// bytes are refused. Raw values must be valid at [`RAW_CHECK_DEPTH`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Value {
     /// A string of a type [`asn1`] decodes, such as a
@@ -433,9 +433,10 @@ pub enum Value {
 }
 
 impl Value {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         read_value(&single(der)?)
     }
+
     /// The text, for a [`Value::Text`].
     pub fn as_text(&self) -> Option<&str> {
         match self {
@@ -444,10 +445,7 @@ impl Value {
         }
     }
 
-    /// The value as one DER element. A [`Value::Raw`] holding a string
-    /// type a reader decodes, such as a UTF8String, is [`Error::Value`]:
-    /// write it as [`Value::Text`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_value(self)?;
         build(|w| write_value(w, self))
     }
@@ -504,6 +502,12 @@ pub struct Attribute {
 /// each a set of attributes, most general first (country before common
 /// name). Its `Display` is the RFC 4514 text, which lists them the other
 /// way round, such as `CN=www.example.com,O=Example Corp,C=US`.
+///
+/// [`Wire::parse`] reads a DER Name. [`Wire::write`] writes the DER used
+/// by issuer and subject fields. Both refuse malformed attributes and
+/// exceeded list limits. Reading also refuses trailing bytes. Writing
+/// refuses attributes outside DER order and [`Value::Raw`] values the
+/// reader would interpret as text.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Name {
     /// The relative distinguished names, in the order they are encoded.
@@ -532,20 +536,17 @@ impl Name {
         self.rdns.iter().flatten().rfind(|a| a.oid.as_bytes() == oid::COMMON_NAME)?.value.as_text()
     }
 
-    /// Reads a name from its DER.
-    fn read_der(der: &[u8]) -> Result<Name, Error> {
+    fn decode(der: &[u8]) -> Result<Name, Error> {
         let mut r = Reader::new(der, Rules::Der);
         let n = read_name(&mut r)?;
         r.finish()?;
         Ok(n)
     }
 
-    /// The name's DER, as an issuer or subject field holds it. A
-    /// [`Value::Raw`] a reader would read as text is [`Error::Value`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_name(self)?;
         let der = build(|w| write_name(w, self))?;
-        Name::read_der(&der)?;
+        Name::decode(&der)?;
         Ok(der)
     }
 }
@@ -869,6 +870,11 @@ impl Validity {
 }
 
 /// A subject's public key and the algorithm it is for.
+///
+/// [`Wire::parse`] and [`Wire::write`] read and write SubjectPublicKeyInfo
+/// DER. Both refuse malformed key bits and algorithm parameters. Reading
+/// also refuses trailing bytes. Writing refuses values that change when
+/// encoded.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PublicKeyInfo {
     /// The key's algorithm and parameters, such as
@@ -879,15 +885,13 @@ pub struct PublicKeyInfo {
 }
 
 impl PublicKeyInfo {
-    /// The SubjectPublicKeyInfo's DER.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let der = build(|w| write_spki(w, self))?;
-        PublicKeyInfo::read_der(&der)?;
+        PublicKeyInfo::decode(&der)?;
         Ok(der)
     }
 
-    /// Reads a SubjectPublicKeyInfo from its DER.
-    fn read_der(der: &[u8]) -> Result<PublicKeyInfo, Error> {
+    fn decode(der: &[u8]) -> Result<PublicKeyInfo, Error> {
         let mut r = Reader::new(der, Rules::Der);
         let k = read_spki(&mut r)?;
         r.finish()?;
@@ -1037,7 +1041,7 @@ impl ExtensionValue for BasicConstraints {
 }
 
 impl BasicConstraints {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut s = top_sequence(der)?;
         let ca = match s.read_optional(Tag::BOOLEAN)? {
             Some(e) => e.boolean()?,
@@ -1051,7 +1055,7 @@ impl BasicConstraints {
         Ok(BasicConstraints { ca, path_len })
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         verified::<Self>(build(|w| {
             w.sequence(|w| {
                 if self.ca {
@@ -1107,7 +1111,7 @@ impl ExtensionValue for KeyUsage {
 }
 
 impl KeyUsage {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(der, Rules::Der);
         let b = r.read_bit_string()?;
         r.finish()?;
@@ -1117,7 +1121,7 @@ impl KeyUsage {
         }
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         verified::<Self>(build(|w| write_bits(w, self.0))?)
     }
 }
@@ -1143,7 +1147,7 @@ impl ExtensionValue for ExtendedKeyUsage {
 }
 
 impl ExtendedKeyUsage {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut s = top_sequence(der)?;
         let mut list = Vec::new();
         while !s.is_empty() {
@@ -1155,7 +1159,7 @@ impl ExtendedKeyUsage {
         Ok(ExtendedKeyUsage(list))
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         verified::<Self>(build(|w| {
             w.sequence(|w| {
                 for o in &self.0 {
@@ -1349,11 +1353,11 @@ impl ExtensionValue for SubjectAltName {
 }
 
 impl SubjectAltName {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         general_names_from_der(der).map(SubjectAltName)
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_general_names(&self.0)?;
         verified::<Self>(build(|w| w.sequence(|w| write_general_names(w, &self.0)))?)
     }
@@ -1372,14 +1376,14 @@ impl ExtensionValue for SubjectKeyIdentifier {
 }
 
 impl SubjectKeyIdentifier {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(der, Rules::Der);
         let id = r.read_octet_string()?.into_owned();
         r.finish()?;
         Ok(SubjectKeyIdentifier(id))
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         verified::<Self>(build(|w| w.octet_string(&self.0))?)
     }
 }
@@ -1404,7 +1408,7 @@ impl ExtensionValue for AuthorityKeyIdentifier {
 }
 
 impl AuthorityKeyIdentifier {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut s = top_sequence(der)?;
         let key_id = s.read_optional(Tag::context(0))?.map(|e| e.octet_string().map(|b| b.into_owned())).transpose()?;
         let issuer = s.read_optional(Tag::context(1))?.map(|e| read_general_names(e.reader()?)).transpose()?;
@@ -1418,7 +1422,7 @@ impl AuthorityKeyIdentifier {
         Ok(AuthorityKeyIdentifier { key_id, issuer, serial })
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         if let Some(names) = &self.issuer {
             check_general_names(names)?;
         }
@@ -1571,7 +1575,7 @@ impl ExtensionValue for CrlDistributionPoints {
 }
 
 impl CrlDistributionPoints {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut s = top_sequence(der)?;
         let mut list = Vec::new();
         while !s.is_empty() {
@@ -1583,7 +1587,7 @@ impl CrlDistributionPoints {
         Ok(CrlDistributionPoints(list))
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.0.iter().try_for_each(check_distribution_point)?;
         verified::<Self>(build(|w| {
             w.sequence(|w| {
@@ -1619,7 +1623,7 @@ impl ExtensionValue for AuthorityInfoAccess {
 }
 
 impl AuthorityInfoAccess {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut s = top_sequence(der)?;
         let mut list = Vec::new();
         while !s.is_empty() {
@@ -1635,7 +1639,7 @@ impl AuthorityInfoAccess {
         Ok(AuthorityInfoAccess(list))
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         self.0.iter().try_for_each(|d| check_general_name(&d.location))?;
         verified::<Self>(build(|w| {
             w.sequence(|w| {
@@ -1664,11 +1668,11 @@ impl ExtensionValue for IssuerAltName {
 }
 
 impl IssuerAltName {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         general_names_from_der(der).map(IssuerAltName)
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_general_names(&self.0)?;
         verified::<Self>(build(|w| w.sequence(|w| write_general_names(w, &self.0)))?)
     }
@@ -1703,7 +1707,7 @@ impl ExtensionValue for CrlNumber {
 }
 
 impl CrlNumber {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(der, Rules::Der);
         let n = r.read_integer()?;
         r.finish()?;
@@ -1713,7 +1717,7 @@ impl CrlNumber {
         Ok(CrlNumber(n.as_bytes().to_vec()))
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         verified::<Self>(build(|w| w.integer_bytes(&self.0))?)
     }
 }
@@ -1757,7 +1761,7 @@ impl ExtensionValue for CrlReason {
 }
 
 impl CrlReason {
-    fn read_der(der: &[u8]) -> Result<Self, Error> {
+    fn decode(der: &[u8]) -> Result<Self, Error> {
         let mut r = Reader::new(der, Rules::Der);
         let n = r.read_enumerated()?;
         r.finish()?;
@@ -1767,7 +1771,7 @@ impl CrlReason {
         }
     }
 
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         verified::<Self>(build(|w| w.enumerated(i64::from(self.0)))?)
     }
 }
@@ -1787,6 +1791,13 @@ fn minimal_int(b: &[u8]) -> &[u8] {
 }
 
 /// The part of a certificate its issuer signs (RFC 5280 4.1).
+///
+/// [`Wire::parse`] reads one DER TBSCertificate within [`MAX_CERT`]. It
+/// refuses malformed fields, invalid versions, and exceeded list limits.
+/// [`Wire::write`] writes the bytes to sign. The issuer signs them with
+/// its own code and passes them to [`Certificate::assemble`]. Writing
+/// applies the same field and size checks. It also refuses non-minimal
+/// serials and attributes outside DER order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TbsCertificate {
     /// The version. Extensions need [`Version::V3`]; unique identifiers
@@ -1822,21 +1833,18 @@ pub struct TbsCertificate {
 }
 
 impl TbsCertificate {
-    /// Reads a TBSCertificate from its DER.
-    fn read_der(der: &[u8]) -> Result<TbsCertificate, Error> {
+    fn decode(der: &[u8]) -> Result<TbsCertificate, Error> {
         if der.len() > MAX_CERT {
             return Err(Error::TooLong);
         }
         read_tbs(single(der)?)
     }
 
-    /// The TBSCertificate's DER: the bytes to sign. The issuer signs them
-    /// with its own code and passes them to [`Certificate::assemble`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_name(&self.issuer)?;
         check_name(&self.subject)?;
         let der = build(|w| self.write_fields(w))?;
-        TbsCertificate::read_der(&der)?;
+        TbsCertificate::decode(&der)?;
         Ok(der)
     }
 
@@ -1941,13 +1949,20 @@ fn read_tbs(e: Element<'_>) -> Result<TbsCertificate, Error> {
 }
 
 /// A certificate: the signed part, read and as bytes, and the signature.
+///
+/// [`Wire::parse`] reads exactly one DER certificate of at most
+/// [`MAX_CERT`] bytes. It refuses invalid TBS fields and mismatched
+/// signature algorithms. [`Wire::write`] writes [`Certificate::tbs_der`],
+/// the algorithm, and the signature, preserving the signed bytes.
+/// It refuses with [`Error::Unwritable`] if `tbs` no longer matches those
+/// bytes. Field and size checks still apply.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Certificate {
     /// The signed part, read.
     pub tbs: TbsCertificate,
     /// The signed part's DER, exactly as it came: the bytes the signature
     /// covers. [`Certificate::write`] writes these, not `tbs`, and
-    /// refuses with [`Error::Value`] when `tbs` is not what they read as.
+    /// refuses with [`Error::Unwritable`] when `tbs` is not what they read as.
     /// To change a field, change a [`TbsCertificate`], sign its
     /// [`TbsCertificate::write`] again and [`Certificate::assemble`].
     pub tbs_der: Vec<u8>,
@@ -1958,9 +1973,7 @@ pub struct Certificate {
 }
 
 impl Certificate {
-    /// Reads a certificate from its DER. It must be exactly one
-    /// certificate, at most [`MAX_CERT`] bytes.
-    fn read_der(der: &[u8]) -> Result<Certificate, Error> {
+    fn decode(der: &[u8]) -> Result<Certificate, Error> {
         if der.len() > MAX_CERT {
             return Err(Error::TooLong);
         }
@@ -1992,12 +2005,7 @@ impl Certificate {
         Ok(cert)
     }
 
-    /// The certificate's DER: [`Certificate::tbs_der`], the algorithm and
-    /// the signature. A certificate read by [`Certificate::parse`] gives
-    /// back the same bytes. If `tbs` was changed after it was read, so the
-    /// bytes would read back as another certificate, it is
-    /// [`Error::Value`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let der = build(|w| {
             w.sequence(|w| {
                 w.encoded(&self.tbs_der);
@@ -2005,8 +2013,8 @@ impl Certificate {
                 w.bit_string_value(&self.signature);
             })
         })?;
-        if Certificate::read_der(&der)? != *self {
-            return Err(Error::Value);
+        if Certificate::decode(&der)? != *self {
+            return Err(Error::Unwritable);
         }
         Ok(der)
     }
@@ -2044,6 +2052,11 @@ impl RevokedCertificate {
 }
 
 /// The part of a CRL its issuer signs (RFC 5280 5.1).
+///
+/// [`Wire::parse`] reads one DER TBSCertList within [`MAX_CRL`]. It
+/// refuses malformed fields, invalid versions, and exceeded list limits.
+/// [`Wire::write`] writes the bytes to sign and applies the same checks.
+/// It also refuses non-minimal serials and attributes outside DER order.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TbsCertList {
     /// [`Version::V2`] when the CRL has extensions, and otherwise
@@ -2067,19 +2080,17 @@ pub struct TbsCertList {
 }
 
 impl TbsCertList {
-    /// Reads a TBSCertList from its DER.
-    fn read_der(der: &[u8]) -> Result<TbsCertList, Error> {
+    fn decode(der: &[u8]) -> Result<TbsCertList, Error> {
         if der.len() > MAX_CRL {
             return Err(Error::TooLong);
         }
         read_tbs_crl(single(der)?)
     }
 
-    /// The TBSCertList's DER: the bytes to sign.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         check_name(&self.issuer)?;
         let der = build(|w| self.write_fields(w))?;
-        TbsCertList::read_der(&der)?;
+        TbsCertList::decode(&der)?;
         Ok(der)
     }
 
@@ -2176,12 +2187,18 @@ fn read_tbs_crl(e: Element<'_>) -> Result<TbsCertList, Error> {
 
 /// A certificate revocation list: the signed part, read and as bytes, and
 /// the signature.
+///
+/// [`Wire::parse`] reads exactly one DER CRL of at most [`MAX_CRL`]
+/// bytes. It refuses invalid TBS fields and mismatched signature algorithms.
+/// [`Wire::write`] preserves [`Crl::tbs_der`] and appends the algorithm
+/// and signature. It refuses with [`Error::Unwritable`] if `tbs` no longer
+/// matches those bytes. Field and size checks still apply.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Crl {
     /// The signed part, read.
     pub tbs: TbsCertList,
     /// The signed part's DER, exactly as it came. [`Crl::write`] writes
-    /// these, not `tbs`, and refuses with [`Error::Value`] when `tbs` is
+    /// these, not `tbs`, and refuses with [`Error::Unwritable`] when `tbs` is
     /// not what they read as.
     pub tbs_der: Vec<u8>,
     /// The signature algorithm, the same as `tbs.signature`.
@@ -2191,9 +2208,7 @@ pub struct Crl {
 }
 
 impl Crl {
-    /// Reads a CRL from its DER. It must be exactly one CRL, at most
-    /// [`MAX_CRL`] bytes.
-    fn read_der(der: &[u8]) -> Result<Crl, Error> {
+    fn decode(der: &[u8]) -> Result<Crl, Error> {
         if der.len() > MAX_CRL {
             return Err(Error::TooLong);
         }
@@ -2224,10 +2239,7 @@ impl Crl {
         Ok(crl)
     }
 
-    /// The CRL's DER. A CRL read by [`Crl::parse`] gives back the same
-    /// bytes. If `tbs` was changed after it was read, it is
-    /// [`Error::Value`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let der = build(|w| {
             w.sequence(|w| {
                 w.encoded(&self.tbs_der);
@@ -2235,8 +2247,8 @@ impl Crl {
                 w.bit_string_value(&self.signature);
             })
         })?;
-        if Crl::read_der(&der)? != *self {
-            return Err(Error::Value);
+        if Crl::decode(&der)? != *self {
+            return Err(Error::Unwritable);
         }
         Ok(der)
     }
@@ -2280,11 +2292,23 @@ pub struct Pem {
 }
 
 impl Pem {
-    /// The block as text: the `-----BEGIN` line, the base64 in lines of
-    /// 64 characters, and the `-----END` line, each ending in `\n`. A
-    /// label RFC 7468 does not allow is [`Error::Pem`], and data longer
-    /// than [`MAX_PEM_DATA`] is [`Error::TooLong`].
-    fn encode_text(&self) -> Result<String, Error> {
+    /// Builds a PEM block from a wire value. Refuses labels RFC 7468 does
+    /// not allow, values their writer refuses, and data over [`MAX_PEM_DATA`].
+    pub fn new<T: Wire>(label: &str, value: &T) -> Result<Self, Error>
+    where
+        Error: From<T::WriteError>,
+    {
+        if !valid_label(label.as_bytes()) {
+            return Err(Error::Pem);
+        }
+        let data = value.to_bytes()?;
+        if data.len() > MAX_PEM_DATA {
+            return Err(Error::TooLong);
+        }
+        Ok(Self { label: label.into(), data })
+    }
+
+    fn encode(&self) -> Result<String, Error> {
         if !valid_label(self.label.as_bytes()) {
             return Err(Error::Pem);
         }
@@ -2551,10 +2575,13 @@ impl Wire for Pem {
         }
     }
 
-    /// Appends the block with 64-character base64 lines and LF endings.
+    /// Appends the block as text: the `-----BEGIN` line, the base64 in lines of
+    /// 64 characters, and the `-----END` line, each ending in `\n`. A
+    /// label RFC 7468 does not allow is [`Error::Pem`], and data longer
+    /// than [`MAX_PEM_DATA`] is [`Error::TooLong`].
     /// Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let text = self.encode_text()?;
+        let text = self.encode()?;
         out.extend_from_slice(text.as_bytes());
         Ok(())
     }
@@ -2562,7 +2589,7 @@ impl Wire for Pem {
 
 /// Reads PEM blocks without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`]. The buffer holds at most the larger of
+/// Use with [`Stream<PemBlocks>`](super::codec::Stream). The buffer holds at most the larger of
 /// the configured whole-block limit and [`MAX_PEM_LINE`], plus one byte to
 /// refuse oversized input. Blocks are bounded by [`MAX_PEM_FRAME`], including
 /// whitespace. [`pem_decode`] applies per-line and decoded-data bounds.
@@ -2677,30 +2704,7 @@ impl Decode for PemBlocks {
     }
 }
 
-// Keep byte staging and semantic validation identical for every DER value.
-macro_rules! der_wire {
-    ($($ty:ty),+ $(,)?) => { $(
-        impl Wire for $ty {
-            type ParseError = Error;
-            type WriteError = Error;
-
-            fn parse(bytes: &[u8]) -> Result<Self, Error> {
-                Self::read_der(bytes)
-            }
-
-            fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-                let bytes = self.encode_der()?;
-                if Self::read_der(&bytes).as_ref() != Ok(self) {
-                    return Err(Error::Unwritable);
-                }
-                out.extend_from_slice(&bytes);
-                Ok(())
-            }
-        }
-    )+ };
-}
-
-der_wire!(
+asn1::der_wire!(
     CrlReason,
     CrlNumber,
     IssuerAltName,
@@ -2723,16 +2727,11 @@ der_wire!(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    fn pem_text<T: Wire<WriteError = Error>>(value: &T, label: &str) -> Result<String, Error> {
-        let block = Pem { label: label.into(), data: value.to_bytes()? };
-        String::from_utf8(block.to_bytes()?).map_err(|_| Error::Pem)
-    }
-
     use super::super::codec::{
         Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks},
+        test_support::{Lcg, chunks, decode_all, mutate},
     };
+    use super::*;
 
     /// A self-signed P-256 certificate made with OpenSSL, with every
     /// extension this module reads.
@@ -2951,7 +2950,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let cert = Certificate::parse(&der).unwrap();
         assert_eq!(cert.to_bytes().unwrap(), der);
         assert_eq!(cert.tbs.to_bytes().unwrap(), cert.tbs_der);
-        assert_eq!(pem_text(&cert, PEM_CERTIFICATE).unwrap(), CERT_PEM);
+        assert_eq!(Pem::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap(), CERT_PEM.as_bytes());
         assert_eq!(Certificate::from_pem(CERT_PEM.as_bytes()).unwrap(), cert);
         // Each typed extension writes the bytes OpenSSL wrote.
         let tbs = &cert.tbs;
@@ -2996,7 +2995,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(tbs.extension(oid::CRL_NUMBER).unwrap().value, [0x02, 0x02, 0x10, 0x00]);
         assert_eq!(crl.to_bytes().unwrap(), der);
         assert_eq!(crl.tbs.to_bytes().unwrap(), crl.tbs_der);
-        assert_eq!(pem_text(&crl, PEM_CRL).unwrap(), CRL_PEM);
+        assert_eq!(Pem::new(PEM_CRL, &crl).unwrap().to_bytes().unwrap(), CRL_PEM.as_bytes());
         assert_eq!(Crl::from_pem(CRL_PEM.as_bytes()).unwrap(), crl);
         // The issuer's certificate is not a CRL, and the other way round.
         assert_eq!(Crl::from_pem(CERT_PEM.as_bytes()), Err(Error::NoBlock));
@@ -3083,7 +3082,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let tbs_der = tbs.to_bytes().unwrap();
         let signature = BitString::new(vec![0x30, 0x00], 0).unwrap();
         let cert = Certificate::assemble(&tbs_der, ecdsa_sha256, signature).unwrap();
-        let pem = pem_text(&cert, PEM_CERTIFICATE).unwrap();
+        let pem = String::from_utf8(Pem::new(PEM_CERTIFICATE, &cert).unwrap().to_bytes().unwrap()).unwrap();
         assert!(pem.starts_with("-----BEGIN CERTIFICATE-----\n"));
         let back = Certificate::from_pem(pem.as_bytes()).unwrap();
         assert_eq!(back.tbs_der, tbs_der);
@@ -3591,8 +3590,12 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         // Labels the encoder refuses.
         for label in ["-X", "X-", "a\nb", "a  b", &"L".repeat(MAX_PEM_LABEL + 1)] {
             assert_eq!(Pem { label: label.into(), data: vec![] }.to_bytes(), Err(Error::Pem), "{label}");
+            assert_eq!(Pem::new(label, &asn1::Frame(vec![5, 0])), Err(Error::Pem), "{label}");
         }
         assert_eq!(Pem { label: "X".into(), data: vec![0; MAX_PEM_DATA + 1] }.to_bytes(), Err(Error::TooLong));
+        let value = asn1::Frame(vec![5, 0]);
+        assert_eq!(Pem::new("X", &value).unwrap(), Pem { label: "X".into(), data: value.0 });
+        assert_eq!(Pem::new("X", &asn1::Frame(vec![4])), Err(Error::Asn1(asn1::Error::Truncated)));
         // A big block encodes and decodes.
         let big = Pem { label: "X".into(), data: (0..MAX_PEM_DATA).map(|i| i as u8).collect() };
         assert_eq!(pem_decode(&big.to_bytes().unwrap()).unwrap(), [big]);
@@ -3621,22 +3624,13 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         );
     }
 
-    /// Every block the decoder gives, and whether it failed.
-    fn decode_stream(text: &[u8]) -> (Vec<Pem>, bool) {
-        let mut stream = Stream::new(PemBlocks::new());
-        let mut out = Vec::new();
-        let result = pump(&mut stream, text, |block| out.push(block))
-            .and_then(|_| finish_stream(&mut stream, |block| out.push(block)).map(|_| 0));
-        (out, result.is_err())
-    }
-
     #[test]
     fn pem_stream_splits_blocks_and_reports_eof() {
         let text = format!("junk\n{CERT_PEM}{CRL_PEM}{CERT_PEM}");
-        contract::check_decode(PemBlocks::new, text.as_bytes());
-        let whole = decode_stream(text.as_bytes());
+        contract::check_decode_with_alloc_limit(PemBlocks::new, text.as_bytes(), 2 * PemBlocks::new().capacity());
+        let whole = decode_all(PemBlocks::new, text.as_bytes());
         assert_eq!(whole.0.len(), 3);
-        assert!(!whole.1);
+        assert!(whole.1.is_none());
         let mut stream = Stream::new(PemBlocks::new());
         let prefix = &CERT_PEM.as_bytes()[..100];
         assert_eq!(stream.push(prefix), prefix.len());
@@ -3647,7 +3641,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         );
         assert_eq!(stream.next(), None);
         let bad = b"-----BEGIN X-----\n!!!\n-----END X-----";
-        contract::check_decode(PemBlocks::new, bad);
+        contract::check_decode_with_alloc_limit(PemBlocks::new, bad, 2 * PemBlocks::new().capacity());
         let mut stream = Stream::new(PemBlocks::new());
         assert_eq!(pump(&mut stream, bad, |_| panic!("bad base64")), Err(Fail::Protocol(Error::Pem)));
         assert_eq!(stream.push(CERT_PEM.as_bytes()), CERT_PEM.len());
@@ -3677,7 +3671,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         assert_eq!(stream.buffered(), 0);
         assert!(stream.into_parts().0.allocated() <= 2 * capacity);
         let text = format!("{CERT_PEM}{CRL_PEM}").repeat(200);
-        assert_eq!(decode_stream(text.as_bytes()).0.len(), 400);
+        assert_eq!(decode_all(PemBlocks::new, text.as_bytes()).0.len(), 400);
     }
 
     #[test]
@@ -3711,8 +3705,8 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             let tbs = c.tbs.to_bytes().unwrap();
             assert_eq!(TbsCertificate::parse(&tbs).unwrap(), c.tbs);
             let _ = (c.tbs.subject.to_string(), c.tbs.issuer.to_string(), c.tbs.validity.contains(0));
-            let pem = pem_text(&c, PEM_CERTIFICATE).unwrap();
-            assert_eq!(Certificate::from_pem(pem.as_bytes()).unwrap(), c);
+            let pem = Pem::new(PEM_CERTIFICATE, &c).unwrap().to_bytes().unwrap();
+            assert_eq!(Certificate::from_pem(&pem).unwrap(), c);
             for x in &c.tbs.extensions {
                 check_extension_value(&x.value);
             }
@@ -3728,8 +3722,8 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             if let Some(r) = c.tbs.revoked.first() {
                 assert!(c.is_revoked(&r.serial));
             }
-            let pem = pem_text(&c, PEM_CRL).unwrap();
-            assert_eq!(Crl::from_pem(pem.as_bytes()).unwrap(), c);
+            let pem = Pem::new(PEM_CRL, &c).unwrap().to_bytes().unwrap();
+            assert_eq!(Crl::from_pem(&pem).unwrap(), c);
         }
         if let Ok(n) = Name::parse(data) {
             assert_eq!(Name::parse(&n.to_bytes().unwrap()).unwrap(), n);
@@ -3772,28 +3766,12 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             let mut data = match i % 4 {
                 0 => seeds[0].clone(),
                 1 => seeds[1].clone(),
-                2 => exts[rng.below(exts.len() as u64) as usize].clone(),
-                _ => (0..(rng.below(200) as usize)).map(|_| rng.next() as u8).collect(),
+                2 => exts[rng.index(exts.len())].clone(),
+                _ => rng.bytes(199),
             };
             // Change a few bytes, and sometimes cut or grow the buffer.
-            for _ in 0..1 + (rng.below(3) as usize) {
-                if !data.is_empty() {
-                    let at = rng.below(data.len() as u64) as usize;
-                    data[at] = match rng.below(4) as usize {
-                        0 => rng.next() as u8,
-                        1 => data[at] ^ (1 << (rng.below(8) as usize)),
-                        2 => data[at].wrapping_add(1),
-                        _ => data[at].wrapping_sub(1),
-                    };
-                }
-            }
-            match rng.below(6) as usize {
-                0 => data.truncate(rng.below((data.len() + 1) as u64) as usize),
-                1 => {
-                    let at = rng.below((data.len() + 1) as u64) as usize;
-                    data.insert(at, rng.next() as u8);
-                }
-                _ => {}
+            for _ in 0..1 + rng.index(3) {
+                mutate(&mut rng, &mut data);
             }
             check(&data);
             if Certificate::parse(&data).is_ok() || Crl::parse(&data).is_ok() {
@@ -3824,21 +3802,21 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         ];
         for _ in 0..4000 {
             let mut text = Vec::new();
-            for _ in 0..(rng.below(12) as usize) {
-                if (rng.below(8) as usize) == 0 {
+            for _ in 0..rng.index(12) {
+                if rng.index(8) == 0 {
                     text.push(rng.next() as u8);
                 } else {
-                    text.extend_from_slice(pieces[rng.below(pieces.len() as u64) as usize]);
+                    text.extend_from_slice(pieces[rng.index(pieces.len())]);
                 }
             }
-            if (rng.below(10) as usize) == 0 {
+            if rng.index(10) == 0 {
                 text.extend_from_slice(CERT_PEM.as_bytes());
             }
-            let whole = decode_stream(&text);
-            contract::check_decode(PemBlocks::new, &text);
+            let whole = decode_all(PemBlocks::new, &text);
+            contract::check_decode_with_alloc_limit(PemBlocks::new, &text, 2 * PemBlocks::new().capacity());
             match pem_decode(&text) {
                 Ok(blocks) => {
-                    assert!(!whole.1);
+                    assert!(whole.1.is_none());
                     assert_eq!(blocks, whole.0);
                     for b in &blocks {
                         if let Ok(t) = b.to_bytes() {
@@ -3847,7 +3825,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
                         check(&b.data);
                     }
                 }
-                Err(e) => assert!(whole.1, "{e}"),
+                Err(e) => assert!(whole.1.is_some(), "{e}"),
             }
         }
     }
@@ -3927,9 +3905,9 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             let blocks = pem_decode(text.as_bytes()).unwrap();
             assert_eq!(blocks.len(), 1, "{eol:?}");
             assert_eq!(blocks[0].data, cert_der());
-            let whole = decode_stream(text.as_bytes());
-            assert_eq!(whole, (blocks.clone(), false));
-            contract::check_decode(PemBlocks::new, text.as_bytes());
+            let whole = decode_all(PemBlocks::new, text.as_bytes());
+            assert_eq!(whole, (blocks.clone(), None));
+            contract::check_decode_with_alloc_limit(PemBlocks::new, text.as_bytes(), 2 * PemBlocks::new().capacity());
         }
         // Vertical tabs and form feeds are whitespace in base64 text (W in
         // section 3).
@@ -3951,7 +3929,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             }
             text.extend_from_slice(b"-----END X-----\n");
             assert_eq!(pem_decode(&text), Err(Error::TooLong), "{extra}");
-            assert_eq!(decode_stream(&text), (vec![], true), "{extra}");
+            assert_eq!(decode_all(PemBlocks::new, &text), (vec![], Some(Fail::Protocol(Error::TooLong))), "{extra}");
         }
     }
 
@@ -3998,8 +3976,8 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         // broken or holds many blocks.
         let broken_after = format!("{CERT_PEM}-----BEGIN X-----\n!!!\n-----END X-----\n");
         assert_eq!(
-            pem_text(&Certificate::from_pem(broken_after.as_bytes()).unwrap(), PEM_CERTIFICATE).unwrap(),
-            CERT_PEM
+            Pem::new(PEM_CERTIFICATE, &Certificate::from_pem(broken_after.as_bytes()).unwrap()).unwrap().to_bytes().unwrap(),
+            CERT_PEM.as_bytes()
         );
         let unterminated = format!("{CRL_PEM}-----BEGIN X-----\nZg==\n");
         assert!(Crl::from_pem(unterminated.as_bytes()).is_ok());
@@ -4071,12 +4049,12 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
         let mut cert = Certificate::parse(&cert_der()).unwrap();
         assert_eq!(cert.to_bytes().unwrap(), cert_der());
         cert.tbs.serial = vec![2];
-        assert_eq!(cert.to_bytes(), Err(Error::Value));
-        assert_eq!(pem_text(&cert, PEM_CERTIFICATE), Err(Error::Value));
+        assert_eq!(cert.to_bytes(), Err(Error::Unwritable));
+        assert_eq!(Pem::new(PEM_CERTIFICATE, &cert), Err(Error::Unwritable));
         let mut crl = Crl::parse(&crl_der()).unwrap();
         assert_eq!(crl.to_bytes().unwrap(), crl_der());
         crl.tbs.revoked.clear();
-        assert_eq!(crl.to_bytes(), Err(Error::Value));
+        assert_eq!(crl.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -4286,9 +4264,9 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
     fn codec_pem_scans_without_retaining_partial_bytes() {
         use super::super::codec::{Decode, Fail, Stream, contract, finish, pump};
         let text = b"-----BEGIN TEST-----\r\nAQID\r\n-----END TEST-----\r\n";
-        contract::check_decode(PemBlocks::new, text);
+        contract::check_decode_with_alloc_limit(PemBlocks::new, text, 2 * PemBlocks::new().capacity());
         for limit in 0..=text.len() {
-            contract::check_decode(|| PemBlocks::with_limit(limit), text);
+            contract::check_decode_with_alloc_limit(|| PemBlocks::with_limit(limit), text, 2 * PemBlocks::with_limit(limit).capacity());
         }
         assert_eq!(PemBlocks::with_limit(usize::MAX).limit(), MAX_PEM_FRAME);
         for text in [
@@ -4297,7 +4275,7 @@ DsrW/cKuXzHiZH3HJwCIjEBL56j3WttF
             b"-----BEGIN TEST-----\nAQID\n-----END TEST-----\t",
             b"just text",
         ] {
-            contract::check_decode(PemBlocks::new, text);
+            contract::check_decode_with_alloc_limit(PemBlocks::new, text, 2 * PemBlocks::new().capacity());
             let mut stream = Stream::new(PemBlocks::new());
             let mut blocks = Vec::new();
             for byte in chunks(text, &[1]) {

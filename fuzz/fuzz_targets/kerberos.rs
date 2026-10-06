@@ -5,7 +5,7 @@
 use fictionet::stdlib::asn1::Rules;
 use fictionet::stdlib::codec::{Stream, Wire, contract, finish, pump};
 use fictionet::stdlib::kerberos::{
-    EncryptedData, Error, Frame, Frames, KdcReqBody, MAX_MESSAGE, Message, PaData, Ticket,
+    EncryptedData, Error, Frame, Frames, KdcReqBody, MAX_MESSAGE, Message, MethodData, Ticket,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -46,7 +46,7 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Ticket>(data);
     contract::check_wire::<EncryptedData>(data);
     contract::check_wire::<KdcReqBody>(data);
-    contract::check_wire::<Vec<PaData>>(data);
+    contract::check_wire::<MethodData>(data);
 
     // Any bytes as a UDP datagram.
     round_trip(data);

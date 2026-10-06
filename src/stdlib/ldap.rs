@@ -1,10 +1,6 @@
 //! LDAP: reading and writing messages, search filters and distinguished
 //! names, with no I/O.
 //!
-//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
-//! Writing appends to the destination only after validation succeeds.
-//! `Stream<Frames>` reads LDAP messages.
-//!
 //! LDAP is how most directories are read and changed: Active Directory,
 //! OpenLDAP and the address books behind mail servers. A client binds (logs
 //! in), then searches, adds, modifies, renames and deletes entries, each
@@ -15,9 +11,9 @@
 //! module follows RFC 4511 (the protocol), RFC 4515 (search filters as
 //! text) and RFC 4514 (DNs as text).
 //!
-//! Nothing here reads a socket. A world that plays a directory server feeds
+//! Nothing here reads a socket. A world that plays a directory server pushes
 //! the bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`super::codec::Stream`], gets [`Message`]s back, matches on each one's [`Op`], and
+//! [`Stream<Frames>`](super::codec::Stream), gets [`Message`]s back, matches on each one's [`Op`], and
 //! writes the reply's bytes with [`Message::write`]. A CLDAP server reads
 //! each datagram with [`Message::parse`], and a client reads a reply that
 //! may hold several messages with [`Message::parse_datagram`]. Which entries
@@ -30,7 +26,7 @@
 //! constructed strings, so they are refused. Unknown fields at the end of a
 //! SEQUENCE are skipped, as RFC 4511 section 4 asks. RFC 4511 says a server that
 //! cannot read a message sends a notice of disconnection and closes the
-//! connection, so a [`super::codec::Stream`] stops at the first [`Error`]. The writers
+//! connection, so a [`Stream<Frames>`](super::codec::Stream) stops at the first [`Error`]. The writers
 //! check what they are given and return an error instead of bytes a reader
 //! would refuse.
 //!
@@ -63,8 +59,6 @@
 //! assert_eq!(dn.0.len(), 3);
 //! assert_eq!(dn.to_text().unwrap(), "uid=jdoe,dc=example,dc=com");
 //! ```
-
-#![deny(missing_docs)]
 
 use super::asn1::{self, Class, Element, Length, Reader, Rules, Tag};
 use super::codec::{Decode, Step, Wire};
@@ -116,8 +110,8 @@ pub enum Error {
     /// Filter or DN text is longer than [`MAX_TEXT`].
     TextTooLong,
     /// A value has no form a reader would accept, such as an attribute
-    /// name with spaces in filter text. It says what is wrong.
-    Unwritable(&'static str),
+    /// name with spaces in filter text.
+    Unwritable,
 }
 
 impl fmt::Display for Error {
@@ -131,7 +125,7 @@ impl fmt::Display for Error {
             Error::Filter(why) => write!(f, "bad filter: {why}"),
             Error::Syntax(at) => write!(f, "malformed text at byte {at}"),
             Error::TextTooLong => write!(f, "text longer than {MAX_TEXT} bytes"),
-            Error::Unwritable(why) => write!(f, "cannot write: {why}"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -981,9 +975,7 @@ fn unexpected(expected: Tag, found: Tag) -> Error {
 }
 
 impl Message {
-    /// Reads one whole message: a TCP message the caller has framed, or a
-    /// CLDAP datagram that holds one message. Bytes after it are an error.
-    fn read_der(b: &[u8]) -> Result<Message, Error> {
+    fn decode(b: &[u8]) -> Result<Message, Error> {
         if b.len() > MAX_MESSAGE {
             return Err(Error::TooLarge(b.len()));
         }
@@ -1040,17 +1032,7 @@ impl Message {
         }
     }
 
-    /// The message's bytes. It refuses, rather than write bytes
-    /// [`Message::parse`] would refuse or read back as another value: an ID
-    /// or limit over [`MAX_INT`], a version outside 1 to 127, a filter
-    /// [`Message::parse`] would not take, an [`Authentication::Other`],
-    /// [`Filter::Other`], [`Scope::Other`] or [`ModifyOperation::Other`]
-    /// with a number a named choice uses, an added attribute with no
-    /// values, a search reference with no URIs, or more than
-    /// [`MAX_MESSAGE`] bytes. A false criticality or `dnAttributes`, and an
-    /// empty list of controls, are left out, as their defaults. An empty
-    /// referral is left out, as no referral.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         if self.id > MAX_INT {
             return Err(Error::Range("messageID"));
         }
@@ -1319,9 +1301,7 @@ impl Op {
                             contents,
                         } => {
                             if *number == 0 || *number == 3 {
-                                return Err(Error::Unwritable(
-                                    "authentication choice 0 or 3 is simple or SASL",
-                                ));
+                                return Err(Error::Unwritable);
                             }
                             w.put(context(*number, *constructed), contents)
                         }
@@ -1344,9 +1324,7 @@ impl Op {
                     return Err(Error::Range("timeLimit"));
                 }
                 if matches!(s.scope, Scope::Other(0..=2)) {
-                    return Err(Error::Unwritable(
-                        "Scope::Other with a named scope's number",
-                    ));
+                    return Err(Error::Unwritable);
                 }
                 w.nest(app(3), |w| {
                     w.octets(s.base.as_bytes())?;
@@ -1374,9 +1352,7 @@ impl Op {
                 w.nest(Tag::SEQUENCE, |w| {
                     for c in &m.changes {
                         if matches!(c.op, ModifyOperation::Other(0..=2)) {
-                            return Err(Error::Unwritable(
-                                "ModifyOperation::Other with a named operation's number",
-                            ));
+                            return Err(Error::Unwritable);
                         }
                         w.nest(Tag::SEQUENCE, |w| {
                             w.uint(Tag::ENUMERATED, c.op.code())?;
@@ -1389,7 +1365,7 @@ impl Op {
             Op::ModifyResponse(r) => w.nest(app(7), |w| write_result(w, r)),
             Op::AddRequest(a) => {
                 if a.attributes.iter().any(|a| a.values.is_empty()) {
-                    return Err(Error::Unwritable("an added attribute with no values"));
+                    return Err(Error::Unwritable);
                 }
                 w.nest(app(8), |w| {
                     w.octets(a.dn.as_bytes())?;
@@ -1424,7 +1400,7 @@ impl Op {
                 w.uint(app(16), *id)
             }
             Op::SearchResultReference(uris) if uris.is_empty() => {
-                Err(Error::Unwritable("a search reference with no URIs"))
+                Err(Error::Unwritable)
             }
             Op::SearchResultReference(uris) => w.nest(app(19), |w| {
                 for u in uris {
@@ -1779,9 +1755,7 @@ impl Filter {
                 contents,
             } => {
                 if *number <= 9 {
-                    return Err(Error::Unwritable(
-                        "filter choices 0 to 9 have their own variants",
-                    ));
+                    return Err(Error::Unwritable);
                 }
                 w.put(context(*number, *constructed), contents)
             }
@@ -1827,9 +1801,7 @@ impl Filter {
         }
         let name = |out: &mut String, a: &str| {
             if !is_attribute(a) {
-                return Err(Error::Unwritable(
-                    "attribute description is not a name or numeric OID",
-                ));
+                return Err(Error::Unwritable);
             }
             push_text(out, a)
         };
@@ -1870,9 +1842,7 @@ impl Filter {
                 if initial.as_ref().is_some_and(Vec::is_empty)
                     || last.as_ref().is_some_and(Vec::is_empty)
                 {
-                    return Err(Error::Unwritable(
-                        "an empty initial or final substring has no text form",
-                    ));
+                    return Err(Error::Unwritable);
                 }
                 name(out, attribute)?;
                 push_text(out, "=")?;
@@ -1924,16 +1894,12 @@ impl Filter {
                 }
                 if let Some(r) = rule {
                     if !is_oid(r) {
-                        return Err(Error::Unwritable(
-                            "matching rule is not a name or numeric OID",
-                        ));
+                        return Err(Error::Unwritable);
                     }
                     // After a type, text reads a lone `:dn` as the
                     // dnAttributes flag. With no type it can only be a rule.
                     if r.eq_ignore_ascii_case("dn") && !dn_attributes && attribute.is_some() {
-                        return Err(Error::Unwritable(
-                            "a matching rule named dn after a type reads back as the dn flag",
-                        ));
+                        return Err(Error::Unwritable);
                     }
                     push_text(out, ":")?;
                     push_text(out, r)?;
@@ -1942,7 +1908,7 @@ impl Filter {
                 escape_value(out, value)?;
             }
             Filter::Other { .. } => {
-                return Err(Error::Unwritable("filter choice with no text form"));
+                return Err(Error::Unwritable);
             }
         }
         push_text(out, ")")
@@ -2304,16 +2270,14 @@ impl Dn {
                 push_text(out, ",")?;
             }
             if rdn.0.is_empty() {
-                return Err(Error::Unwritable("an RDN with no values"));
+                return Err(Error::Unwritable);
             }
             for (j, ava) in rdn.0.iter().enumerate() {
                 if j > 0 {
                     push_text(out, "+")?;
                 }
                 if !is_oid(&ava.attribute) {
-                    return Err(Error::Unwritable(
-                        "attribute type is not a name or numeric OID",
-                    ));
+                    return Err(Error::Unwritable);
                 }
                 push_text(out, &ava.attribute)?;
                 push_text(out, "=")?;
@@ -2321,7 +2285,7 @@ impl Dn {
                     AttributeValue::Text(v) => escape_dn_value(out, v)?,
                     AttributeValue::Ber(b) => {
                         if b.is_empty() {
-                            return Err(Error::Unwritable("an empty BER value"));
+                            return Err(Error::Unwritable);
                         }
                         push_text(out, "#")?;
                         for &x in b {
@@ -2442,29 +2406,28 @@ fn parse_ava(s: &[u8], start: usize) -> Result<(Ava, usize), Error> {
 // ---------------------------------------------------------------------------
 // The stream.
 
-impl Wire for Message {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        Message::read_der(bytes)
-    }
-
-    /// Appends a message bounded by [`MAX_MESSAGE`]. Refuses values that
-    /// would change when parsed, without changing the destination.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Message::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable("message changes when parsed"));
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
+asn1::der_wire!(Message,
+    /// Reads one whole message: a TCP message the caller has framed, or a
+    /// CLDAP datagram that holds one message. Bytes after it are an error.
+    /// Reads BER. Refuses malformed fields and messages over [`MAX_MESSAGE`].
+    parse;
+    /// Appends DER. Refuses values that
+    /// [`Message::parse`] would refuse or read back as another value: an ID
+    /// or limit over [`MAX_INT`], a version outside 1 to 127, a filter
+    /// [`Message::parse`] would not take, an [`Authentication::Other`],
+    /// [`Filter::Other`], [`Scope::Other`] or [`ModifyOperation::Other`]
+    /// with a number a named choice uses, an added attribute with no
+    /// values, a search reference with no URIs, or more than
+    /// [`MAX_MESSAGE`] bytes. A false criticality or `dnAttributes`, and an
+    /// empty list of controls, are left out, as their defaults. An empty
+    /// referral is left out, as no referral.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
 /// Reads LDAP messages without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for bounded input. Partial messages
+/// Use with [`Stream<Frames>`](super::codec::Stream) for bounded input. Partial messages
 /// return [`super::codec::Step::Need`], including at EOF. The stream reports
 /// truncation at EOF and errors once. A malformed message ends the stream.
 /// This includes a well-framed message that [`Message::parse`] rejects:
@@ -2510,7 +2473,7 @@ impl Decode for Frames {
     const NAME: &'static str = "LDAP";
 
     fn capacity(&self) -> usize {
-        self.limit.max(HEADER_ROOM)
+        self.limit.max(asn1::HEADER_ROOM)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, Error> {
@@ -2537,12 +2500,6 @@ impl Decode for Frames {
     }
 }
 
-/// The fewest bytes a [`super::codec::Stream`] will hold, whatever its limit: enough for
-/// any header [`asn1::Header::parse`] reads or refuses (at most 6 tag and 5
-/// length octets), so a decoder with a tiny limit can still see a message
-/// is too long.
-const HEADER_ROOM: usize = 16;
-
 /// The whole length a header at the start of `b` declares: the header and
 /// the contents. It is for a header [`asn1::Header::parse`] found too long,
 /// so its length octets are all in `b`.
@@ -2565,8 +2522,8 @@ fn declared_total(b: &[u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::super::codec::{
-        Fail, Stream, contract, finish as finish_stream, pump,
-        test_support::{Lcg, chunks},
+        Fail, Stream, contract,
+        test_support::{Lcg, chunks, decode_all, mutate},
     };
     use super::*;
 
@@ -2578,7 +2535,7 @@ mod tests {
         }
     }
 
-    /// Feeds bytes that fit.
+    /// Pushes bytes that fit.
     fn put(d: &mut Stream<Frames>, b: &[u8]) {
         assert_eq!(d.push(b), b.len());
     }
@@ -2990,29 +2947,29 @@ mod tests {
         ));
         assert!(matches!(
             eq("c n", "x").to_text(),
-            Err(Error::Unwritable(_))
+            Err(Error::Unwritable)
         ));
-        assert!(matches!(eq("", "x").to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(eq("", "x").to_text(), Err(Error::Unwritable)));
         let bad_rule = Filter::Extensible {
             rule: Some("1..2".into()),
             attribute: Some("cn".into()),
             value: vec![],
             dn_attributes: false,
         };
-        assert!(matches!(bad_rule.to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(bad_rule.to_text(), Err(Error::Unwritable)));
         let dn_rule = Filter::Extensible {
             rule: Some("dn".into()),
             attribute: Some("cn".into()),
             value: vec![],
             dn_attributes: false,
         };
-        assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(dn_rule.to_text(), Err(Error::Unwritable)));
         let other = Filter::Other {
             number: 12,
             constructed: false,
             contents: vec![1],
         };
-        assert!(matches!(other.to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(other.to_text(), Err(Error::Unwritable)));
         round_trip(&msg(1, Op::SearchRequest(search(other))));
         let other_low = Filter::Other {
             number: 7,
@@ -3021,7 +2978,7 @@ mod tests {
         };
         assert!(matches!(
             msg(1, Op::SearchRequest(search(other_low))).to_bytes(),
-            Err(Error::Unwritable(_))
+            Err(Error::Unwritable)
         ));
         let mut deep = eq("a", "1");
         for _ in 0..MAX_FILTER_DEPTH {
@@ -3059,7 +3016,7 @@ mod tests {
                 any,
                 last,
             };
-            assert!(matches!(f.to_text(), Err(Error::Unwritable(_))), "{f:?}");
+            assert!(matches!(f.to_text(), Err(Error::Unwritable)), "{f:?}");
             // The BER form still holds it.
             round_trip(&msg(1, Op::SearchRequest(search(f))));
         }
@@ -3200,18 +3157,18 @@ mod tests {
         }
         assert!(matches!(
             Dn(vec![Rdn(vec![])]).to_text(),
-            Err(Error::Unwritable(_))
+            Err(Error::Unwritable)
         ));
         let bad_type = Dn(vec![Rdn(vec![Ava {
             attribute: "c n".into(),
             value: AttributeValue::Text("x".into()),
         }])]);
-        assert!(matches!(bad_type.to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(bad_type.to_text(), Err(Error::Unwritable)));
         let empty_ber = Dn(vec![Rdn(vec![Ava {
             attribute: "cn".into(),
             value: AttributeValue::Ber(vec![]),
         }])]);
-        assert!(matches!(empty_ber.to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(empty_ber.to_text(), Err(Error::Unwritable)));
         assert_eq!(
             ava(&"x".repeat(MAX_TEXT)).to_text(),
             Err(Error::TextTooLong)
@@ -3552,11 +3509,11 @@ mod tests {
         };
         assert!(matches!(
             msg(1, other(0)).to_bytes(),
-            Err(Error::Unwritable(_))
+            Err(Error::Unwritable)
         ));
         assert!(matches!(
             msg(1, other(3)).to_bytes(),
-            Err(Error::Unwritable(_))
+            Err(Error::Unwritable)
         ));
         round_trip(&msg(1, other(u32::MAX)));
         // Too large: the writer stops at MAX_MESSAGE.
@@ -3860,7 +3817,7 @@ mod tests {
                 }],
             }),
         );
-        assert!(matches!(add.to_bytes(), Err(Error::Unwritable(_))));
+        assert!(matches!(add.to_bytes(), Err(Error::Unwritable)));
         // 30 0e 02 01 01 68 09 04 01 x 30 04 30 02 04 00 ... built by hand.
         let add_bytes = [
             0x30, 0x13, 0x02, 0x01, 0x01, 0x68, 0x0e, 0x04, 0x04, b'c', b'n', b'=', b'x', 0x30,
@@ -3871,7 +3828,7 @@ mod tests {
         assert!(Message::parse(&empty_ref).is_err());
         assert!(matches!(
             msg(1, Op::SearchResultReference(vec![])).to_bytes(),
-            Err(Error::Unwritable(_))
+            Err(Error::Unwritable)
         ));
         let empty_referral = [
             0x30, 0x0e, 0x02, 0x01, 0x01, 0x65, 0x09, 0x0a, 0x01, 0x0a, 0x04, 0x00, 0x04, 0x00,
@@ -3898,7 +3855,7 @@ mod tests {
             s.scope = Scope::Other(n);
             assert!(matches!(
                 msg(1, Op::SearchRequest(s.clone())).to_bytes(),
-                Err(Error::Unwritable(_))
+                Err(Error::Unwritable)
             ));
             let m = msg(
                 1,
@@ -3913,7 +3870,7 @@ mod tests {
                     }],
                 }),
             );
-            assert!(matches!(m.to_bytes(), Err(Error::Unwritable(_))));
+            assert!(matches!(m.to_bytes(), Err(Error::Unwritable)));
         }
         s.scope = Scope::Other(3);
         round_trip(&msg(1, Op::SearchRequest(s)));
@@ -3937,7 +3894,7 @@ mod tests {
             value: b"x".to_vec(),
             dn_attributes: false,
         };
-        assert!(matches!(typed.to_text(), Err(Error::Unwritable(_))));
+        assert!(matches!(typed.to_text(), Err(Error::Unwritable)));
     }
 
     #[test]
@@ -3977,71 +3934,26 @@ mod tests {
         }
     }
 
-    // A deterministic generator, so failures repeat.
-    trait Generate {
-        fn coin(&mut self) -> bool;
-        fn bytes(&mut self, max: u64) -> Vec<u8>;
-        fn nonempty_bytes(&mut self, max: u64) -> Vec<u8>;
-        fn text(&mut self, max: u64) -> String;
-        fn name(&mut self) -> String;
-        fn opt_bytes(&mut self) -> Option<Vec<u8>>;
-        fn opt_text(&mut self) -> Option<String>;
+    fn nonempty_bytes(g: &mut Lcg, max: usize) -> Vec<u8> {
+        let mut bytes = g.bytes(max);
+        bytes.push(g.next() as u8);
+        bytes
     }
 
-    impl Generate for Lcg {
-        fn coin(&mut self) -> bool {
-            self.below(2) == 0
-        }
+    fn attribute_name(g: &mut Lcg) -> String {
+        const NAMES: &[&str] = &[
+            "cn", "objectClass", "o", "1.2.840.113549.1.9.1", "cn;lang-en", "x-y",
+        ];
+        NAMES[g.index(NAMES.len())].to_string()
+    }
 
-        fn bytes(&mut self, max: u64) -> Vec<u8> {
-            (0..self.below(max + 1))
-                .map(|_| self.next() as u8)
-                .collect()
+    fn value_text(g: &mut Lcg, max: usize) -> String {
+        let mut text = g.text(max);
+        // Keep UTF-8 and NUL in the filter and DN value tests.
+        if g.coin() {
+            text.push(if g.coin() { 'é' } else { '\0' });
         }
-
-        fn nonempty_bytes(&mut self, max: u64) -> Vec<u8> {
-            let mut v = self.bytes(max);
-            v.push(self.next() as u8);
-            v
-        }
-
-        fn text(&mut self, max: u64) -> String {
-            const CHARS: &[&str] = &[
-                "a", "Z", "0", " ", "=", "*", "(", ")", "\\", ",", "+", "#", ";", "\"", "é", "\0",
-                "<", "-",
-            ];
-            (0..self.below(max + 1))
-                .map(|_| CHARS[self.below(CHARS.len() as u64) as usize])
-                .collect()
-        }
-
-        fn name(&mut self) -> String {
-            const NAMES: &[&str] = &[
-                "cn",
-                "objectClass",
-                "o",
-                "1.2.840.113549.1.9.1",
-                "cn;lang-en",
-                "x-y",
-            ];
-            NAMES[self.below(NAMES.len() as u64) as usize].to_string()
-        }
-
-        fn opt_bytes(&mut self) -> Option<Vec<u8>> {
-            if self.coin() {
-                Some(self.bytes(6))
-            } else {
-                None
-            }
-        }
-
-        fn opt_text(&mut self) -> Option<String> {
-            if self.coin() {
-                Some(self.text(6))
-            } else {
-                None
-            }
-        }
+        text
     }
 
     /// A filter text can write: names that are names, no empty initial or
@@ -4054,17 +3966,17 @@ mod tests {
             1 => Filter::Or((0..g.below(4)).map(|_| make_filter(g, depth + 1)).collect()),
             2 => Filter::Not(Box::new(make_filter(g, depth + 1))),
             3 => Filter::Equal {
-                attribute: g.name(),
+                attribute: attribute_name(g),
                 value: g.bytes(6),
             },
             4 => {
                 let initial = if g.coin() {
-                    Some(g.nonempty_bytes(4))
+                    Some(nonempty_bytes(g, 4))
                 } else {
                     None
                 };
                 let last = if g.coin() {
-                    Some(g.nonempty_bytes(4))
+                    Some(nonempty_bytes(g, 4))
                 } else {
                     None
                 };
@@ -4074,33 +3986,33 @@ mod tests {
                     g.below(3)
                 };
                 Filter::Substrings {
-                    attribute: g.name(),
+                    attribute: attribute_name(g),
                     initial,
                     any: (0..n).map(|_| g.bytes(3)).collect(),
                     last,
                 }
             }
             5 => Filter::GreaterOrEqual {
-                attribute: g.name(),
+                attribute: attribute_name(g),
                 value: g.bytes(6),
             },
             6 => Filter::LessOrEqual {
-                attribute: g.name(),
+                attribute: attribute_name(g),
                 value: g.bytes(6),
             },
-            7 => Filter::Present(g.name()),
+            7 => Filter::Present(attribute_name(g)),
             8 => Filter::Approx {
-                attribute: g.name(),
+                attribute: attribute_name(g),
                 value: g.bytes(6),
             },
             _ => {
                 let rule = if g.coin() {
-                    Some(["2.5.13.2", "caseExactMatch"][g.below(2) as usize].to_string())
+                    Some(["2.5.13.2", "caseExactMatch"][g.index(2)].to_string())
                 } else {
                     None
                 };
                 let attribute = if rule.is_none() || g.coin() {
-                    Some(g.name())
+                    Some(attribute_name(g))
                 } else {
                     None
                 };
@@ -4116,7 +4028,7 @@ mod tests {
 
     fn make_attribute(g: &mut Lcg) -> Attribute {
         Attribute {
-            name: g.text(5),
+            name: value_text(g, 5),
             values: (0..g.below(3)).map(|_| g.bytes(5)).collect(),
         }
     }
@@ -4124,9 +4036,9 @@ mod tests {
     fn make_result(g: &mut Lcg) -> LdapResult {
         LdapResult {
             code: ResultCode(g.next() as u32 % 100),
-            matched_dn: g.text(5),
-            message: g.text(8),
-            referral: (0..g.below(3)).map(|_| g.text(5)).collect(),
+            matched_dn: value_text(g, 5),
+            message: value_text(g, 8),
+            referral: (0..g.below(3)).map(|_| value_text(g, 5)).collect(),
         }
     }
 
@@ -4134,15 +4046,15 @@ mod tests {
         let op = match g.below(21) {
             0 => Op::BindRequest(BindRequest {
                 version: 1 + g.below(127) as u8,
-                name: g.text(6),
+                name: value_text(g, 6),
                 auth: match g.below(3) {
                     0 => Authentication::Simple(g.bytes(6)),
                     1 => Authentication::Sasl {
-                        mechanism: g.text(5),
-                        credentials: g.opt_bytes(),
+                        mechanism: value_text(g, 5),
+                        credentials: g.coin().then(|| g.bytes(6)),
                     },
                     _ => Authentication::Other {
-                        number: [1, 2, 4, 9, 40, 1000][g.below(6) as usize],
+                        number: [1, 2, 4, 9, 40, 1000][g.index(6)],
                         constructed: g.coin(),
                         contents: g.bytes(4),
                     },
@@ -4150,11 +4062,11 @@ mod tests {
             }),
             1 => Op::BindResponse(BindResponse {
                 result: make_result(g),
-                server_sasl_creds: g.opt_bytes(),
+                server_sasl_creds: g.coin().then(|| g.bytes(6)),
             }),
             2 => Op::UnbindRequest,
             3 => Op::SearchRequest(SearchRequest {
-                base: g.text(6),
+                base: value_text(g, 6),
                 scope: Scope::from_code(g.below(5) as u32),
                 deref: DerefAliases::from_code(g.below(4) as u32).unwrap(),
                 size_limit: g.next() as u32 % (MAX_INT + 1),
@@ -4169,16 +4081,16 @@ mod tests {
                 } else {
                     make_filter(g, 1)
                 },
-                attributes: (0..g.below(3)).map(|_| g.name()).collect(),
+                attributes: (0..g.below(3)).map(|_| attribute_name(g)).collect(),
             }),
             4 => Op::SearchResultEntry(SearchResultEntry {
-                dn: g.text(6),
+                dn: value_text(g, 6),
                 attributes: (0..g.below(3)).map(|_| make_attribute(g)).collect(),
             }),
             5 => Op::SearchResultDone(make_result(g)),
-            6 => Op::SearchResultReference((0..1 + g.below(3)).map(|_| g.text(6)).collect()),
+            6 => Op::SearchResultReference((0..1 + g.below(3)).map(|_| value_text(g, 6)).collect()),
             7 => Op::ModifyRequest(ModifyRequest {
-                dn: g.text(6),
+                dn: value_text(g, 6),
                 changes: (0..g.below(3))
                     .map(|_| Change {
                         op: ModifyOperation::from_code(g.below(5) as u32),
@@ -4188,7 +4100,7 @@ mod tests {
             }),
             8 => Op::ModifyResponse(make_result(g)),
             9 => Op::AddRequest(AddRequest {
-                dn: g.text(6),
+                dn: value_text(g, 6),
                 attributes: (0..g.below(3))
                     .map(|_| {
                         let mut a = make_attribute(g);
@@ -4198,41 +4110,41 @@ mod tests {
                     .collect(),
             }),
             10 => Op::AddResponse(make_result(g)),
-            11 => Op::DelRequest(g.text(8)),
+            11 => Op::DelRequest(value_text(g, 8)),
             12 => Op::DelResponse(make_result(g)),
             13 => Op::ModifyDnRequest(ModifyDnRequest {
-                dn: g.text(6),
-                new_rdn: g.text(4),
+                dn: value_text(g, 6),
+                new_rdn: value_text(g, 4),
                 delete_old_rdn: g.coin(),
-                new_superior: g.opt_text(),
+                new_superior: g.coin().then(|| value_text(g, 6)),
             }),
             14 => Op::ModifyDnResponse(make_result(g)),
             15 => Op::CompareRequest(CompareRequest {
-                dn: g.text(6),
-                attribute: g.text(3),
+                dn: value_text(g, 6),
+                attribute: value_text(g, 3),
                 value: g.bytes(4),
             }),
             16 => Op::CompareResponse(make_result(g)),
             17 => Op::AbandonRequest(g.next() as u32 % (MAX_INT + 1)),
             18 => Op::ExtendedRequest(ExtendedRequest {
-                name: g.text(6),
-                value: g.opt_bytes(),
+                name: value_text(g, 6),
+                value: g.coin().then(|| g.bytes(6)),
             }),
             19 => Op::ExtendedResponse(ExtendedResponse {
                 result: make_result(g),
-                name: g.opt_text(),
-                value: g.opt_bytes(),
+                name: g.coin().then(|| value_text(g, 6)),
+                value: g.coin().then(|| g.bytes(6)),
             }),
             _ => Op::IntermediateResponse(IntermediateResponse {
-                name: g.opt_text(),
-                value: g.opt_bytes(),
+                name: g.coin().then(|| value_text(g, 6)),
+                value: g.coin().then(|| g.bytes(6)),
             }),
         };
         let controls = (0..g.below(3))
             .map(|_| Control {
-                oid: g.text(5),
+                oid: value_text(g, 5),
                 critical: g.coin(),
-                value: g.opt_bytes(),
+                value: g.coin().then(|| g.bytes(6)),
             })
             .collect();
         Message {
@@ -4248,26 +4160,17 @@ mod tests {
                 Rdn((0..1 + g.below(2))
                     .map(|_| {
                         let attribute =
-                            ["cn", "O", "2.5.4.3", "x-1"][g.below(4) as usize].to_string();
+                            ["cn", "O", "2.5.4.3", "x-1"][g.index(4)].to_string();
                         let value = if g.below(4) == 0 {
-                            AttributeValue::Ber(g.nonempty_bytes(4))
+                            AttributeValue::Ber(nonempty_bytes(g, 4))
                         } else {
-                            AttributeValue::Text(g.text(6))
+                            AttributeValue::Text(value_text(g, 6))
                         };
                         Ava { attribute, value }
                     })
                     .collect())
             })
             .collect())
-    }
-
-    /// Every message from one pump and finish, and the error that stops it.
-    fn decode_all(data: &[u8]) -> (Vec<Message>, Option<Fail<Error>>) {
-        let mut stream = Stream::new(Frames::new());
-        let mut out = Vec::new();
-        let result = pump(&mut stream, data, |m| out.push(m))
-            .and_then(|_| finish_stream(&mut stream, |m| out.push(m)).map(|_| 0));
-        (out, result.err())
     }
 
     fn check_bytes(data: &[u8]) {
@@ -4281,8 +4184,8 @@ mod tests {
                 assert_eq!(Filter::parse_text(&t).as_ref(), Ok(&s.filter), "{t}");
             }
         }
-        let whole = decode_all(data);
-        contract::check_decode(Frames::new, data);
+        let whole = decode_all(Frames::new, data);
+        contract::check_decode_with_alloc_limit(Frames::new, data, 2 * MAX_MESSAGE);
         contract::check_wire::<Message>(data);
         for m in &whole.0 {
             assert_eq!(Message::parse(&m.to_bytes().unwrap()).as_ref(), Ok(m));
@@ -4324,38 +4227,33 @@ mod tests {
             assert_eq!(Dn::parse(&t).as_ref(), Ok(&dn), "{t}");
             // The same bytes, broken: changed, cut, grown, or noise.
             let mut bad = b.clone();
-            match g.below(4) {
-                0 => {
-                    for _ in 0..1 + g.below(3) {
-                        let i = g.below(bad.len() as u64) as usize;
-                        bad[i] = g.next() as u8;
-                    }
+            if g.below(4) == 0 {
+                bad = g.bytes(40);
+            } else {
+                for _ in 0..1 + g.index(3) {
+                    mutate(&mut g, &mut bad);
                 }
-                1 => bad.truncate(g.below(bad.len() as u64) as usize),
-                2 => {
-                    let i = g.below(bad.len() as u64 + 1) as usize;
-                    bad.insert(i, g.next() as u8);
-                }
-                _ => bad = g.bytes(40),
             }
             check_bytes(&bad);
             check_bytes(&b);
             // Text made of the characters filters and DNs use.
             const T: &[u8] = b"()&|!=*~<>:\\0123456789abcdefABCDEFdnDN.;-, +#\"cnou";
-            let n = g.below(30) as usize;
+            let n = g.index(30);
             let text: String = (0..n)
-                .map(|_| char::from(T[g.below(T.len() as u64) as usize]))
+                .map(|_| char::from(T[g.index(T.len())]))
                 .collect();
             check_text(&text);
             let mut tf = f.to_text().unwrap().into_bytes();
             if !tf.is_empty() {
-                let i = g.below(tf.len() as u64) as usize;
-                tf[i] = T[g.below(T.len() as u64) as usize];
+                let i = g.index(tf.len());
+                tf[i] = T[g.index(T.len())];
             }
+            check_text(&String::from_utf8_lossy(&tf));
+            mutate(&mut g, &mut tf);
             check_text(&String::from_utf8_lossy(&tf));
         }
         // The whole stream in one pump. check_bytes covers sample chunking.
-        let (all, err) = decode_all(&stream);
+        let (all, err) = decode_all(Frames::new, &stream);
         assert_eq!(all.len(), ROUNDS);
         assert_eq!(err, None);
     }
@@ -4372,7 +4270,7 @@ mod tests {
         .unwrap();
         for limit in 0..=16 {
             assert_eq!(Frames::with_limit(limit).capacity(), 16);
-            contract::check_decode(|| Frames::with_limit(limit), &bytes);
+            contract::check_decode_with_alloc_limit(|| Frames::with_limit(limit), &bytes, 2 * Frames::with_limit(limit).capacity());
         }
         assert_eq!(Frames::with_limit(usize::MAX).limit(), MAX_MESSAGE);
         let mut stream = Stream::new(Frames::new());

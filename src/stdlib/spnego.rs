@@ -1,10 +1,6 @@
 //! SPNEGO: reading and writing the GSS-API negotiation tokens that HTTP
 //! Negotiate, SMB and LDAP carry, with no I/O.
 //!
-//! Complete wire values use [`Wire::parse`] and [`Wire::write`].
-//! Writing appends to the destination only after validation succeeds.
-//! `Stream<Frames>` frames negotiation tokens.
-//!
 //! SPNEGO lets a client and a server agree on how to authenticate, usually
 //! Kerberos or NTLM, and carries the chosen mechanism's own tokens while
 //! they do. The client opens with a NegTokenInit that lists the mechanisms
@@ -26,7 +22,7 @@
 //! mechanism tokens (a Kerberos AP-REQ, an NTLM message) are kept as bytes.
 //! What they mean, and whether to accept them, is up to world code. HTTP,
 //! SMB and LDAP each give a token's length, so most worlds never need the
-//! [`super::codec::Stream`], which splits tokens sent back to back.
+//! [`Stream<Frames>`](super::codec::Stream), which splits tokens sent back to back.
 //!
 //! Every reader checks lengths and nesting, because the agent can send any
 //! bytes it likes. Tokens are read as BER and written as DER. A token is at
@@ -43,7 +39,7 @@
 //!     mech_token: Some(negotiate.clone()),
 //!     ..NegTokenInit::default()
 //! });
-//! let wire = InitialContextToken { mech: Mech::Spnego, inner: offer.to_bytes().unwrap() }.to_bytes().unwrap();
+//! let wire = InitialContextToken::spnego(&offer).unwrap().to_bytes().unwrap();
 //! assert_eq!(wire[0], 0x60);
 //!
 //! // The world's server reads it and picks NTLM.
@@ -61,8 +57,6 @@
 //! assert_eq!(bytes[..9], [0xa1, 0x25, 0x30, 0x23, 0xa0, 0x03, 0x0a, 0x01, 0x01]);
 //! assert_eq!(NegotiationToken::parse(&bytes).unwrap(), reply);
 //! ```
-
-#![deny(missing_docs)]
 
 use super::asn1::{self, Class, Element, Header, Length, Oid, Reader, Rules, StringKind, Tag, Writer};
 use super::codec::{Decode, Step, Wire};
@@ -98,7 +92,7 @@ pub enum Error {
     /// The first element is not a GSS-API wrapper, a negTokenInit or a
     /// negTokenResp.
     NotToken,
-    /// A GSS-API wrapper, or a token given to the [`super::codec::Stream`], has an
+    /// A GSS-API wrapper, or a token given to the [`Stream<Frames>`](super::codec::Stream), has an
     /// indefinite length. RFC 2743 requires a definite one.
     Indefinite,
     /// A GSS-API wrapper names a mechanism other than SPNEGO.
@@ -122,7 +116,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Unwritable => f.write_str("value changes when encoded"),
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Asn1(e) => write!(f, "ASN.1: {e}"),
             Error::TooLong => write!(f, "token longer than {MAX_TOKEN} bytes"),
             Error::TooManyMechs => write!(f, "more than {MAX_MECHS} mechanisms"),
@@ -282,8 +276,19 @@ pub struct InitialContextToken {
 }
 
 impl InitialContextToken {
-    /// Reads a whole wrapper from `b`, which must hold nothing else.
-    fn read_der(b: &[u8]) -> Result<InitialContextToken, Error> {
+    /// Wraps an initial SPNEGO token for GSS-API. RFC 4178 section 4.1
+    /// permits only negTokenInit here; negTokenResp is [`Error::WrappedResp`].
+    /// Refuses tokens the writer cannot represent within [`MAX_TOKEN`].
+    pub fn spnego(token: &NegotiationToken) -> Result<Self, Error> {
+        if matches!(token, NegotiationToken::Resp(_)) {
+            return Err(Error::WrappedResp);
+        }
+        let wrapper = Self { mech: Mech::Spnego, inner: token.to_bytes()? };
+        wrapper.encode()?;
+        Ok(wrapper)
+    }
+
+    fn decode(b: &[u8]) -> Result<InitialContextToken, Error> {
         if b.len() > MAX_TOKEN {
             return Err(Error::TooLong);
         }
@@ -306,9 +311,7 @@ impl InitialContextToken {
         Ok(InitialContextToken { mech: Mech::from_oid(&oid), inner: r.remaining().to_vec() })
     }
 
-    /// The wrapper's bytes, in DER. It fails with [`Error::TooLong`] if
-    /// they would be longer than [`MAX_TOKEN`].
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let oid = self.mech.element();
         let body = oid.len().checked_add(self.inner.len()).ok_or(Error::TooLong)?;
         if body > MAX_TOKEN {
@@ -477,12 +480,7 @@ pub enum NegotiationToken {
 }
 
 impl NegotiationToken {
-    /// Reads a whole token from `b`, which must hold nothing else. A
-    /// negTokenInit may be inside a GSS-API wrapper, as a first token is,
-    /// or not. A negTokenResp must not be wrapped (RFC 4178 section 4.1),
-    /// and gives [`Error::WrappedResp`] if it is. A wrapper must name
-    /// SPNEGO.
-    fn read_der(b: &[u8]) -> Result<NegotiationToken, Error> {
+    fn decode(b: &[u8]) -> Result<NegotiationToken, Error> {
         if b.len() > MAX_TOKEN {
             return Err(Error::TooLong);
         }
@@ -499,12 +497,7 @@ impl NegotiationToken {
         parse_bare(b)
     }
 
-    /// The token's bytes in DER, without a GSS-API wrapper, as every token
-    /// after the first is sent. It fails if they would be longer than
-    /// [`MAX_TOKEN`], if a NegTokenInit offers more than [`MAX_MECHS`]
-    /// mechanisms or, without hints, none, if hints hold a hintAddress, or
-    /// if a value cannot be written.
-    fn encode_der(&self) -> Result<Vec<u8>, Error> {
+    fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut total: usize = 0;
         let mut add = |v: &Option<Vec<u8>>| {
             total = total.saturating_add(v.as_ref().map_or(0, Vec::len));
@@ -779,60 +772,39 @@ fn token_len_limited(b: &[u8], limit: usize) -> Result<Option<usize>, Error> {
     Ok(if b.len() >= total { Some(total) } else { None })
 }
 
-impl Wire for InitialContextToken {
-    type ParseError = Error;
-    type WriteError = Error;
+asn1::der_wire!(InitialContextToken,
+    /// Reads a whole wrapper from `bytes`, which must hold nothing else.
+    /// Reads BER. Refuses indefinite wrappers, wrapped negTokenResp, and
+    /// input or DER output over [`MAX_TOKEN`].
+    parse checks encode;
+    /// Appends the wrapper as DER. It fails with [`Error::TooLong`] if
+    /// the result would be longer than [`MAX_TOKEN`].
+    /// Refuses a SPNEGO wrapper containing negTokenResp.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
-    /// Reads exactly one wrapper, bounded by [`MAX_TOKEN`]. A SPNEGO
-    /// wrapper containing negTokenResp is [`Error::WrappedResp`].
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let token = Self::read_der(bytes)?;
-        // BER can expand when written as DER. The Wire domain includes
-        // only values that the strict writer can represent.
-        token.encode_der()?;
-        Ok(token)
-    }
-
-    /// Appends DER bounded by [`MAX_TOKEN`]. Refuses a SPNEGO wrapper
-    /// containing negTokenResp. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
-
-impl Wire for NegotiationToken {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Reads exactly one writable token. Refuses values whose DER exceeds
-    /// [`MAX_TOKEN`] and hint addresses that senders must omit.
-    fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let token = Self::read_der(bytes)?;
-        // BER can expand when written as DER. The Wire domain includes
-        // only values that the strict writer can represent.
-        token.encode_der()?;
-        Ok(token)
-    }
-
-    /// Appends DER bounded by [`MAX_TOKEN`]. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        let bytes = self.encode_der()?;
-        if Self::read_der(&bytes).as_ref() != Ok(self) {
-            return Err(Error::Unwritable);
-        }
-        out.extend_from_slice(&bytes);
-        Ok(())
-    }
-}
+asn1::der_wire!(NegotiationToken,
+    /// Reads a whole token from `bytes`, which must hold nothing else. A
+    /// negTokenInit may be inside a GSS-API wrapper, as a first token is,
+    /// or not. A negTokenResp must not be wrapped (RFC 4178 section 4.1),
+    /// and gives [`Error::WrappedResp`] if it is. A wrapper must name
+    /// SPNEGO.
+    /// Reads BER. Refuses invalid fields, exceeded mechanism lists, hintAddress,
+    /// and input or DER output over [`MAX_TOKEN`].
+    parse checks encode;
+    /// Appends the token as DER, without a GSS-API wrapper, as every token
+    /// after the first is sent. It fails if the result would be longer than
+    /// [`MAX_TOKEN`], if a NegTokenInit offers more than [`MAX_MECHS`]
+    /// mechanisms or, without hints, none, if hints hold a hintAddress, or
+    /// if a value cannot be written.
+    /// Refuses values that change when encoded. Leaves `out` unchanged on error.
+    write;
+);
 
 /// Reads complete tokens without holding input bytes.
 ///
-/// Use with [`super::codec::Stream`] for a buffer bounded by the configured
+/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer bounded by the configured
 /// token limit, with at least 16 bytes to read or refuse any ASN.1 header.
 /// Only outer headers are checked. Map items through [`NegotiationToken::parse`]
 /// or [`InitialContextToken::parse`] to interpret them. Partial tokens return
@@ -874,7 +846,7 @@ impl Decode for Frames {
     const NAME: &'static str = "SPNEGO";
 
     fn capacity(&self) -> usize {
-        self.limit.max(16)
+        self.limit.max(asn1::HEADER_ROOM)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Vec<u8>>, Error> {
@@ -888,8 +860,8 @@ impl Decode for Frames {
 #[cfg(test)]
 mod tests {
     use super::super::codec::{
-        Fail, Stream, contract, pump,
-        test_support::{Lcg, chunks},
+        Fail, Stream, contract,
+        test_support::{Lcg, chunks, decode_all, mutate},
     };
     use super::*;
 
@@ -963,9 +935,7 @@ mod tests {
         assert_eq!(t.mech_list_mic, None);
         // Written back, byte for byte.
         assert_eq!(
-            NegotiationToken::Init(t)
-                .to_bytes()
-                .and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes())
+            InitialContextToken::spnego(&NegotiationToken::Init(t)).and_then(|token| token.to_bytes())
                 .unwrap(),
             b
         );
@@ -1070,9 +1040,7 @@ mod tests {
             assert_eq!(NegotiationToken::parse(&bare).unwrap(), t);
             assert_eq!(token_len(&bare), Ok(Some(bare.len())));
             if let NegotiationToken::Init(_) = t {
-                let wrapped = t
-                    .to_bytes()
-                    .and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes())
+                let wrapped = InitialContextToken::spnego(&t).and_then(|token| token.to_bytes())
                     .unwrap();
                 assert_eq!(NegotiationToken::parse(&wrapped).unwrap(), t);
                 assert_eq!(token_len(&wrapped), Ok(Some(wrapped.len())));
@@ -1136,6 +1104,8 @@ mod tests {
 
     #[test]
     fn wrapped_resp_is_rejected() {
+        let response = NegotiationToken::Resp(NegTokenResp::default());
+        assert_eq!(InitialContextToken::spnego(&response), Err(Error::WrappedResp));
         // RFC 4178 4.1: tokens after the first are never wrapped, and a
         // negTokenResp is never a first token.
         for inner in [
@@ -1287,7 +1257,7 @@ mod tests {
         let near = NegotiationToken::Init(near);
         assert_eq!(p(&near.to_bytes().unwrap()).unwrap(), near);
         assert_eq!(
-            near.to_bytes().and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes()),
+            InitialContextToken::spnego(&near).and_then(|token| token.to_bytes()),
             Err(Error::TooLong)
         );
         let big = InitialContextToken { mech: Mech::Ntlm, inner: vec![0; MAX_TOKEN] };
@@ -1346,7 +1316,7 @@ mod tests {
         let mut all = vec![samba_init2(), ACCEPT_COMPLETED.to_vec()];
         for t in sample_tokens() {
             all.push(t.to_bytes().unwrap());
-            if let Ok(w) = t.to_bytes().and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes()) {
+            if let Ok(w) = InitialContextToken::spnego(&t).and_then(|token| token.to_bytes()) {
                 all.push(w);
             }
         }
@@ -1388,16 +1358,18 @@ mod tests {
 
     #[test]
     fn decoder_holds_at_most_max_token() {
-        // Fed again and again without taking tokens out.
+        // Pushed again and again without taking tokens out.
         let mut d = Stream::new(Frames::new());
         for _ in 0..40_000 {
             let _ = d.push(&ACCEPT_COMPLETED);
             assert!(d.buffered() <= MAX_TOKEN);
         }
-        // One feed far longer than a token.
+        assert!(d.into_parts().0.allocated() <= 2 * MAX_TOKEN);
+        // One push far longer than a token.
         let mut d = Stream::new(Frames::new());
         let _ = d.push(&vec![0xa1; 4 * MAX_TOKEN]);
         assert!(d.buffered() <= MAX_TOKEN);
+        assert!(d.into_parts().0.allocated() <= 2 * MAX_TOKEN);
     }
 
     #[test]
@@ -1427,6 +1399,7 @@ mod tests {
         assert_eq!(d.push(&stream), stream.len());
         assert_eq!(d.buffered(), held);
         assert_eq!(d.next(), None);
+        assert!(d.into_parts().0.allocated() <= 2 * MAX_TOKEN);
     }
 
     #[test]
@@ -1496,9 +1469,7 @@ mod tests {
         assert_eq!(NegotiationToken::Init(NegTokenInit::default()).to_bytes(), Err(Error::MissingMechTypes));
         let t = NegTokenInit { mech_list_mic: Some(vec![1]), ..NegTokenInit::default() };
         assert_eq!(
-            NegotiationToken::Init(t)
-                .to_bytes()
-                .and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes()),
+            InitialContextToken::spnego(&NegotiationToken::Init(t)).and_then(|token| token.to_bytes()),
             Err(Error::MissingMechTypes)
         );
     }
@@ -1529,14 +1500,14 @@ mod tests {
             });
             assert_eq!(t.to_bytes(), Err(Error::HintAddress));
             assert_eq!(
-                t.to_bytes().and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes()),
+                InitialContextToken::spnego(&t).and_then(|token| token.to_bytes()),
                 Err(Error::HintAddress)
             );
         }
         // The Wire domain excludes received hint addresses too.
         let b = [0xa0, 0x0e, 0x30, 0x0c, 0xa0, 0x02, 0x30, 0x00, 0xa3, 0x06, 0x30, 0x04, 0xa1, 0x02, 0x04, 0x00];
         assert_eq!(NegotiationToken::parse(&b), Err(Error::HintAddress));
-        contract::check_decode(Frames::new, &b);
+        contract::check_decode_with_alloc_limit(Frames::new, &b, 2 * MAX_TOKEN);
     }
 
     #[test]
@@ -1560,67 +1531,48 @@ mod tests {
         assert_ne!(Mech::Other("1.2.3".parse().unwrap()), Mech::Kerberos);
     }
 
-    /// Protocol values built with the shared deterministic generator.
-    trait Generate {
-        fn bytes(&mut self, max: usize) -> Vec<u8>;
-        fn opt(&mut self, max: usize) -> Option<Vec<u8>>;
-        fn mech(&mut self) -> Mech;
-        fn token(&mut self) -> NegotiationToken;
+    fn make_mech(rng: &mut Lcg) -> Mech {
+        match rng.index(NAMED.len() + 1) {
+            i if i < NAMED.len() => NAMED[i].0.clone(),
+            // A named identifier held in `Other`, which equals the
+            // named variant it is read back as.
+            _ if rng.next().is_multiple_of(4) => {
+                Mech::Other(NAMED[rng.index(NAMED.len())].2.parse().unwrap())
+            }
+            _ => Mech::Other(Oid::from_arcs(&[2, u128::from(rng.next()), u128::from(rng.next())]).unwrap()),
+        }
     }
 
-    impl Generate for Lcg {
-        fn bytes(&mut self, max: usize) -> Vec<u8> {
-            let n = self.below((max + 1) as u64) as usize;
-            (0..n).map(|_| self.next() as u8).collect()
-        }
-
-        fn opt(&mut self, max: usize) -> Option<Vec<u8>> {
-            if self.next().is_multiple_of(2) { None } else { Some(self.bytes(max)) }
-        }
-
-        fn mech(&mut self) -> Mech {
-            match self.below((NAMED.len() + 1) as u64) as usize {
-                i if i < NAMED.len() => NAMED[i].0.clone(),
-                // A named identifier held in `Other`, which equals the
-                // named variant it is read back as.
-                _ if self.next().is_multiple_of(4) => {
-                    Mech::Other(NAMED[self.below(NAMED.len() as u64) as usize].2.parse().unwrap())
-                }
-                _ => Mech::Other(Oid::from_arcs(&[2, u128::from(self.next()), u128::from(self.next())]).unwrap()),
-            }
-        }
-
-        fn token(&mut self) -> NegotiationToken {
-            if self.next().is_multiple_of(2) {
-                // A NegTokenInit offers a mechanism; a NegTokenInit2 need not.
-                let neg_hints = if self.next().is_multiple_of(2) {
+    fn make_token(rng: &mut Lcg) -> NegotiationToken {
+        if !rng.coin() {
+            // A NegTokenInit offers a mechanism; a NegTokenInit2 need not.
+            let neg_hints = if !rng.coin() {
+                None
+            } else {
+                Some(NegHints { hint_name: rng.coin().then(|| rng.bytes(20)), hint_address: None })
+            };
+            let least = usize::from(neg_hints.is_none());
+            NegotiationToken::Init(NegTokenInit {
+                mech_types: (0..least + rng.index(5)).map(|_| make_mech(rng)).collect(),
+                req_flags: if !rng.coin() {
                     None
                 } else {
-                    Some(NegHints { hint_name: self.opt(20), hint_address: None })
-                };
-                let least = usize::from(neg_hints.is_none());
-                NegotiationToken::Init(NegTokenInit {
-                    mech_types: (0..least + (self.below(5) as usize)).map(|_| self.mech()).collect(),
-                    req_flags: if self.next().is_multiple_of(2) {
-                        None
-                    } else {
-                        Some(ContextFlags(self.next() as u32))
-                    },
-                    mech_token: self.opt(40),
-                    neg_hints,
-                    mech_list_mic: self.opt(20),
-                })
-            } else {
-                NegotiationToken::Resp(NegTokenResp {
-                    neg_state: match self.below(5) as usize {
-                        4 => None,
-                        v => Some(NegState::from_value(v as i64).unwrap()),
-                    },
-                    supported_mech: if self.next().is_multiple_of(2) { None } else { Some(self.mech()) },
-                    response_token: self.opt(40),
-                    mech_list_mic: self.opt(20),
-                })
-            }
+                    Some(ContextFlags(rng.next() as u32))
+                },
+                mech_token: rng.coin().then(|| rng.bytes(40)),
+                neg_hints,
+                mech_list_mic: rng.coin().then(|| rng.bytes(20)),
+            })
+        } else {
+            NegotiationToken::Resp(NegTokenResp {
+                neg_state: match rng.index(5) {
+                    4 => None,
+                    v => Some(NegState::from_value(v as i64).unwrap()),
+                },
+                supported_mech: if !rng.coin() { None } else { Some(make_mech(rng)) },
+                response_token: rng.coin().then(|| rng.bytes(40)),
+                mech_list_mic: rng.coin().then(|| rng.bytes(20)),
+            })
         }
     }
 
@@ -1639,10 +1591,10 @@ mod tests {
         let mut rng = Lcg::new(0x0005_eed5_ae90);
         for _ in 0..4000 {
             // A value written and read back.
-            let t = rng.token();
-            let wrap = matches!(t, NegotiationToken::Init(_)) && rng.next().is_multiple_of(2);
+            let t = make_token(&mut rng);
+            let wrap = matches!(t, NegotiationToken::Init(_)) && !rng.coin();
             let bytes = if wrap {
-                t.to_bytes().and_then(|inner| InitialContextToken { mech: Mech::Spnego, inner }.to_bytes())
+                InitialContextToken::spnego(&t).and_then(|token| token.to_bytes())
             } else {
                 t.to_bytes()
             }
@@ -1652,43 +1604,30 @@ mod tests {
 
             // The same bytes, damaged.
             let mut m = bytes.clone();
-            for _ in 0..1 + (rng.below(3) as usize) {
-                match rng.below(4) as usize {
-                    0 if !m.is_empty() => {
-                        let i = rng.below(m.len() as u64) as usize;
-                        m[i] = rng.next() as u8;
-                    }
-                    1 if !m.is_empty() => {
-                        let i = rng.below(m.len() as u64) as usize;
-                        m.remove(i);
-                    }
-                    2 => {
-                        let i = rng.below((m.len() + 1) as u64) as usize;
-                        m.insert(i, rng.next() as u8);
-                    }
-                    _ => m.truncate(rng.below((m.len() + 1) as u64) as usize),
-                }
+            for _ in 0..1 + rng.index(3) {
+                mutate(&mut rng, &mut m);
             }
             check(&m);
 
             // Random bytes, often after a plausible first byte.
             let mut r = rng.bytes(64);
             if let Some(first) = r.first_mut() {
-                *first = [GSS_TAG, INIT_TAG, RESP_TAG, *first][rng.below(4) as usize];
+                *first = [GSS_TAG, INIT_TAG, RESP_TAG, *first][rng.index(4)];
             }
             check(&r);
 
             // A stream of tokens, with chunking checked by the contract.
             let mut stream = Vec::new();
-            for _ in 0..(rng.below(4) as usize) {
-                stream.extend_from_slice(&rng.token().to_bytes().unwrap());
+            for _ in 0..rng.index(4) {
+                stream.extend_from_slice(&make_token(&mut rng).to_bytes().unwrap());
             }
-            if rng.next().is_multiple_of(2) {
+            if !rng.coin() {
                 stream.extend_from_slice(&m);
             }
-            contract::check_decode(Frames::new, &stream);
-            let mut decoder = Stream::new(Frames::new());
-            let _ = pump(&mut decoder, &stream, |token| check(&token));
+            contract::check_decode_with_alloc_limit(Frames::new, &stream, 2 * MAX_TOKEN);
+            for token in decode_all(Frames::new, &stream).0 {
+                check(&token);
+            }
         }
     }
 
@@ -1698,7 +1637,7 @@ mod tests {
         assert_eq!(Frames::new().capacity(), MAX_TOKEN);
         let mut stream = Stream::new(Frames::new());
         let bytes = [GSS_TAG, 0x83, 1, 0, 0];
-        contract::check_decode(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_TOKEN);
         assert_eq!(stream.push(&bytes), bytes.len());
         assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::TooLong))));
         assert_eq!(stream.next(), None);
