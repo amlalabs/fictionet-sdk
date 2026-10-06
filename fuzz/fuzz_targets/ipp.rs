@@ -2,10 +2,36 @@
 //! them.
 #![no_main]
 
-use fictionet::stdlib::ipp::{Decoder, Error, MAX_HEAD, Message};
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::ipp::{
+    Attribute, Decoder, Error, Head, Header, MAX_FIELD, MAX_HEAD, Message, Value, tag,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(Head::new, data);
+    contract::check_decode(|| Head::with_limit(64), data);
+    contract::check_wire::<Header>(data);
+    let mut message = Message::request(2, 7);
+    message.add(
+        tag::JOB_ATTRIBUTES,
+        Attribute::new(
+            "document",
+            Value::OctetString(data.get(..MAX_FIELD + 1).unwrap_or(data).to_vec()),
+        ),
+    );
+    let built = Header::from(message);
+    contract::check_wire_value(&built);
+    let mut body = Wire::to_bytes(&Header {
+        version: (1, 1),
+        code: 2,
+        request_id: 7,
+        groups: vec![],
+    })
+    .unwrap();
+    body.extend_from_slice(data.get(..4096).unwrap_or(data));
+    contract::check_decode(|| Head::with_limit(64), &body);
+
     let whole = Message::parse(data);
 
     // The body, split two ways: all at once, and a byte at a time.

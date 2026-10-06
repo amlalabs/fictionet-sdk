@@ -14,12 +14,12 @@
 //! cancel key.
 //!
 //! Nothing here reads a socket. A world that plays a database server
-//! feeds the bytes it reads from a connection to a [`Decoder`], which
-//! knows the startup phase, and takes [`Frontend`] messages out. It
-//! answers with [`Backend`] messages, written by [`Backend::to_bytes`].
+//! reads connection bytes through [`FrontendMessages`] and
+//! [`super::codec::Stream`], and takes [`Frontend`] messages out. It
+//! answers with [`Backend`] messages, written by [`Wire::write`].
 //! Which users exist, which passwords they have, and what a query returns
 //! are up to world code. A world that plays a client does the reverse,
-//! with a [`BackendDecoder`] and [`Frontend::to_bytes`].
+//! with [`BackendMessages`] and [`Wire::write`] on [`Frontend`].
 //!
 //! Every reader checks lengths, counts, format codes and text, because
 //! the agent can send any bytes it likes. A message longer than
@@ -28,28 +28,35 @@
 //! `client_encoding` is UTF8, which [`Startup::new`] asks for. A server
 //! world that is asked for another encoding should refuse it, since
 //! these readers cannot read that text. Text-format parameters must be
-//! UTF-8 with no NUL byte as well. Every writer produces a message the
-//! readers accept: strings and text values are cut at their first NUL
-//! byte, and a message that would be too long loses items from the end
-//! of its lists, or the end of its last string or byte field.
+//! UTF-8 with no NUL byte as well. [`Wire`] refuses values that cannot
+//! be written unchanged. The inherent `to_bytes` writers retain their
+//! clipping of strings, byte fields and lists.
 //!
-//! The decoders hold at most one message's worth of bytes: `feed` says
-//! how many bytes it took, and the rest is fed again once messages have
-//! been taken out.
+//! The stream holds at most one message's worth of unread bytes. `push`
+//! says how many bytes it accepted; keep the remainder for the next call.
+//!
+//! New streams use [`FrontendMessages`] or [`BackendMessages`] with
+//! [`super::codec::Stream`]. Encryption requests yield an item then End;
+//! unread transport bytes remain available through `Stream::into_parts`.
+//! [`Wire`] provides exact parsing and strict transactional writing for
+//! both message directions. The old decoders and writers keep their behavior.
 //!
 //! ```
 //! use fictionet::stdlib::postgres::{
-//!     oid, Authentication, Backend, Decoder, Field, Frontend, Startup, TransactionStatus,
+//!     oid, Authentication, Backend, Field, Frontend, FrontendMessages, Startup, TransactionStatus,
 //! };
+//! use fictionet::stdlib::codec::{Stream, Wire};
 //!
-//! let mut decoder = Decoder::new();
+//! let mut stream = Stream::new(FrontendMessages::new());
 //! // What psql sends: a StartupMessage, then a simple query.
-//! decoder.feed(&Frontend::Startup(Startup::new("alice", "shop")).to_bytes());
-//! decoder.feed(b"Q\0\0\0\x0dSELECT 1\0");
+//! let mut input = Wire::to_bytes(&Frontend::Startup(Startup::new("alice", "shop"))).unwrap();
+//! Frontend::Query("SELECT 1".into()).write(&mut input).unwrap();
+//! assert_eq!(stream.push(&input), input.len());
+//! stream.end();
 //!
 //! let mut replies = Vec::new();
-//! while let Some(message) = decoder.next_message() {
-//!     match message.unwrap() {
+//! while let Some(message) = stream.next() {
+//!     match message.unwrap().unwrap() {
 //!         Frontend::Startup(startup) => {
 //!             assert_eq!(startup.get("user"), Some("alice"));
 //!             assert_eq!(startup.database(), Some("shop"));
@@ -68,12 +75,15 @@
 //!         other => panic!("unexpected {other:?}"),
 //!     }
 //! }
-//! let bytes: Vec<u8> = replies.iter().flat_map(Backend::to_bytes).collect();
+//! let mut bytes = Vec::new();
+//! for reply in replies { reply.write(&mut bytes).unwrap(); }
 //! // AuthenticationOk: the letter R, length 8, and request code 0.
 //! assert_eq!(bytes[..9], *b"R\0\0\0\x08\0\0\0\0");
 //! // ReadyForQuery, idle, ends the reply.
 //! assert_eq!(bytes[bytes.len() - 6..], *b"Z\0\0\0\x05I");
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port PostgreSQL servers listen on.
 pub const PORT: u16 = 5432;
@@ -114,8 +124,9 @@ pub const MAX_AUTH_MESSAGE: usize = 65_535;
 /// The largest length field this module reads or writes for any other
 /// message: just under 1 GiB, PostgreSQL's own limit.
 pub const MAX_MESSAGE: usize = 0x3fff_fffe;
-/// The largest length field a new [`Decoder`] or [`BackendDecoder`]
-/// accepts: 1 MiB. Raise it with `with_max_message`.
+/// The default length-field limit for [`FrontendMessages`] and
+/// [`BackendMessages`]: 1 MiB. Set it with their `with_limit` constructors.
+/// [`Decoder`] and [`BackendDecoder`] use the same default.
 pub const DEFAULT_MAX_MESSAGE: usize = 1 << 20;
 /// The longest cancel key, in bytes. Protocol 3.0 keys are always 4
 /// bytes; protocol 3.2 keys may be up to this long.
@@ -1462,15 +1473,548 @@ impl std::fmt::Display for Malformed {
 
 impl std::error::Error for Malformed {}
 
-/// Where a [`Decoder`] is in a connection.
+/// Why bytes do not contain exactly one PostgreSQL wire message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// A message header or body was refused.
+    Message(Error),
+    /// The input ends before the message is complete.
+    Truncated,
+    /// Bytes follow the message.
+    Trailing,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Message(e) => e.fmt(f),
+            Self::Truncated => f.write_str("PostgreSQL message ended early"),
+            Self::Trailing => f.write_str("bytes follow the PostgreSQL message"),
+        }
+    }
+}
+impl core::error::Error for ParseError {}
+
+/// A message cannot be written without clipping or changing its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("PostgreSQL message cannot be represented without changing it")
+    }
+}
+impl core::error::Error for WriteError {}
+
+// Sizes include the length field but exclude the type byte. Use the
+// original field lengths: clipping cannot make a strict write succeed.
+fn size_sum(fixed: usize, fields: impl IntoIterator<Item = usize>) -> usize {
+    fields.into_iter().fold(fixed, usize::saturating_add)
+}
+
+fn frontend_size(message: &Frontend) -> usize {
+    match message {
+        Frontend::Startup(s) => size_sum(
+            9,
+            s.params
+                .iter()
+                .map(|(n, v)| size_sum(2, [n.len(), v.len()])),
+        ),
+        Frontend::SslRequest | Frontend::GssEncRequest => 8,
+        Frontend::CancelRequest { secret_key, .. } => secret_key.len().saturating_add(12),
+        Frontend::Bind(b) => size_sum(
+            12,
+            [
+                b.portal.len(),
+                b.statement.len(),
+                b.param_formats.len().saturating_mul(2),
+                size_sum(0, b.params.iter().map(|v| value_size(v.as_deref()))),
+                b.result_formats.len().saturating_mul(2),
+            ],
+        ),
+        Frontend::Close { name, .. } | Frontend::Describe { name, .. } => {
+            name.len().saturating_add(6)
+        }
+        Frontend::CopyData(d) | Frontend::AuthResponse(d) => d.len().saturating_add(4),
+        Frontend::CopyFail(s) | Frontend::Query(s) => s.len().saturating_add(5),
+        Frontend::Execute { portal, .. } => portal.len().saturating_add(9),
+        Frontend::FunctionCall(f) => size_sum(
+            14,
+            [
+                f.arg_formats.len().saturating_mul(2),
+                size_sum(0, f.args.iter().map(|v| value_size(v.as_deref()))),
+            ],
+        ),
+        Frontend::Parse {
+            name,
+            query,
+            param_types,
+        } => size_sum(
+            8,
+            [name.len(), query.len(), param_types.len().saturating_mul(4)],
+        ),
+        Frontend::CopyDone | Frontend::Flush | Frontend::Sync | Frontend::Terminate => 4,
+    }
+}
+
+fn backend_size(message: &Backend) -> usize {
+    match message {
+        Backend::Authentication(a) => match a {
+            Authentication::Md5Password(_) => 12,
+            Authentication::GssContinue(d)
+            | Authentication::SaslContinue(d)
+            | Authentication::SaslFinal(d) => d.len().saturating_add(8),
+            Authentication::Sasl(names) => {
+                size_sum(9, names.iter().map(|s| s.len().saturating_add(1)))
+            }
+            _ => 8,
+        },
+        Backend::BackendKeyData { secret_key, .. } => secret_key.len().saturating_add(8),
+        Backend::CommandComplete(s) => s.len().saturating_add(5),
+        Backend::CopyData(d) => d.len().saturating_add(4),
+        Backend::CopyInResponse(c) | Backend::CopyOutResponse(c) | Backend::CopyBothResponse(c) => {
+            c.columns.len().saturating_mul(2).saturating_add(7)
+        }
+        Backend::DataRow(values) => size_sum(6, values.iter().map(|v| value_size(v.as_deref()))),
+        Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
+            size_sum(5, d.fields.iter().map(|(_, s)| s.len().saturating_add(2)))
+        }
+        Backend::FunctionCallResponse(v) => value_size(v.as_deref()).saturating_add(4),
+        Backend::NegotiateProtocolVersion { unrecognized, .. } => {
+            size_sum(12, unrecognized.iter().map(|s| s.len().saturating_add(1)))
+        }
+        Backend::NotificationResponse {
+            channel, payload, ..
+        } => size_sum(10, [channel.len(), payload.len()]),
+        Backend::ParameterDescription(types) => types.len().saturating_mul(4).saturating_add(6),
+        Backend::ParameterStatus { name, value } => size_sum(6, [name.len(), value.len()]),
+        Backend::ReadyForQuery(_) => 5,
+        Backend::RowDescription(fields) => {
+            size_sum(6, fields.iter().map(|f| f.name.len().saturating_add(19)))
+        }
+        Backend::BindComplete
+        | Backend::CloseComplete
+        | Backend::CopyDone
+        | Backend::EmptyQueryResponse
+        | Backend::NoData
+        | Backend::ParseComplete
+        | Backend::PortalSuspended => 4,
+    }
+}
+
+impl Wire for Frontend {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one startup or typed message under the module limits.
+    /// Startup lengths begin with zero; typed messages begin with a tag.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let parsed = if bytes.first() == Some(&0) {
+            Self::parse_startup(bytes)
+        } else {
+            Self::parse(bytes)
+        };
+        match parsed.map_err(ParseError::Message)? {
+            Some((message, used)) if used == bytes.len() => Ok(message),
+            Some(_) => Err(ParseError::Trailing),
+            None => Err(ParseError::Truncated),
+        }
+    }
+
+    /// Appends a strict encoding. Temporary bytes are bounded by
+    /// `MAX_MESSAGE + 1` and temporary value lists by [`MAX_COUNT`].
+    /// Checks the full size against the message type's limit before staging.
+    /// The legacy [`Frontend::to_bytes`] keeps its clipping behavior.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        // The legacy writer stages a borrowed list for these two variants.
+        // Bound that list before entering it, then check its complete result.
+        match self {
+            Self::Bind(b) if b.params.len() > MAX_COUNT => return Err(WriteError),
+            Self::FunctionCall(f) if f.args.len() > MAX_COUNT => return Err(WriteError),
+            _ => {}
+        }
+        let limit = self
+            .tag()
+            .and_then(frontend_limit)
+            .unwrap_or(MAX_STARTUP + 4);
+        if frontend_size(self) > limit {
+            return Err(WriteError);
+        }
+        let bytes = self.to_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Backend {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    /// Reads exactly one typed message under [`MAX_MESSAGE`].
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        match Self::parse(bytes).map_err(ParseError::Message)? {
+            Some((message, used)) if used == bytes.len() => Ok(message),
+            Some(_) => Err(ParseError::Trailing),
+            None => Err(ParseError::Truncated),
+        }
+    }
+
+    /// Appends a strict encoding, staging at most `MAX_MESSAGE + 1` bytes.
+    /// Checks the full size against [`MAX_MESSAGE`] before staging.
+    /// Refusal leaves `out` unchanged. The legacy writer still clips.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        if backend_size(self) > MAX_MESSAGE {
+            return Err(WriteError);
+        }
+        let bytes = self.to_bytes();
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+/// Reads frontend startup and typed messages without retaining input.
+///
+/// Items are `Result<Frontend, Error>`; error items are always
+/// [`Error::Malformed`] for a complete typed body, preserving its tag.
+/// Invalid framing, malformed startup-phase bodies, unsupported protocols,
+/// repeated encryption requests, and over-limit lengths end the stream.
+/// Partial messages return [`Step::Need`], so [`super::codec::Stream`]
+/// reports truncation at EOF.
+///
+/// A StartupMessage selects typed messages after its item. SSLRequest and
+/// GSSENCRequest each yield an item followed by [`Step::End`]. Call
+/// [`super::codec::Stream::into_parts`] and give its unread bytes to TLS or GSS,
+/// then call [`start_encryption`](Self::start_encryption) on the returned
+/// decoder and use a new stream for decrypted bytes. A direct ClientHello
+/// returns [`Error::DirectTls`] without consuming any bytes; the same
+/// transfer applies. CancelRequest and Terminate also yield an item then End.
+///
+/// To answer `N`, call [`refuse_encryption`](Self::refuse_encryption)
+/// between the request item and the next poll. If End was already polled,
+/// clone the decoder, refuse on that clone, and use [`super::codec::Stream::swap`].
+/// [`super::codec::pump`] polls End after the item, so its users take this swap route.
+/// Keep any unaccepted part of a pushed slice for the next transport.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Stream, Wire}, postgres::{Frontend, FrontendMessages, Startup}};
+///
+/// let mut input = Wire::to_bytes(&Frontend::SslRequest).unwrap();
+/// Frontend::Startup(Startup::new("alice", "shop")).write(&mut input).unwrap();
+/// let mut stream = Stream::new(FrontendMessages::new());
+/// assert_eq!(stream.push(&input), input.len());
+/// let mut count = 0;
+/// while let Some(item) = stream.next() {
+///     match item.unwrap().unwrap() {
+///         Frontend::SslRequest => {
+///             // The world answers N, then changes mode between items.
+///             stream.decoder().refuse_encryption();
+///         }
+///         Frontend::Startup(startup) => assert_eq!(startup.user(), Some("alice")),
+///         other => panic!("unexpected {other:?}"),
+///     }
+///     count += 1;
+/// }
+/// assert_eq!(count, 2);
+/// stream.end();
+/// assert_eq!(stream.next(), None);
+/// ```
+#[derive(Clone, Debug)]
+pub struct FrontendMessages {
+    phase: Phase,
+    limit: usize,
+    started: bool,
+    ssl_seen: bool,
+    gss_seen: bool,
+    handoff: bool,
+}
+
+impl FrontendMessages {
+    /// Starts in the startup phase with [`DEFAULT_MAX_MESSAGE`].
+    pub fn new() -> Self {
+        Self::with_limit(DEFAULT_MAX_MESSAGE)
+    }
+
+    /// Sets the maximum typed length field, clamped to 4 through
+    /// [`MAX_MESSAGE`]. Startup bodies remain bounded by [`MAX_STARTUP`].
+    /// A limit of 4 accepts only empty typed bodies; even Close and Describe
+    /// exceed it. [`Decoder::with_max_message`] has a higher minimum.
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            phase: Phase::Startup,
+            limit: limit.clamp(4, MAX_MESSAGE),
+            started: false,
+            ssl_seen: false,
+            gss_seen: false,
+            handoff: false,
+        }
+    }
+
+    /// Selects typed messages for an already established session.
+    /// Call before reading its bytes, between items.
+    pub fn start_messages(&mut self) {
+        self.phase = Phase::Messages;
+        self.started = true;
+        self.handoff = false;
+    }
+
+    /// The maximum typed length field, including its four length bytes.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// The current startup, typed, or closed phase.
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// Resumes startup after an encryption request was refused with `N`.
+    /// Call between items. Repeated requests remain refused. After End,
+    /// apply this to a clone and swap it into the stream to resume polling.
+    pub fn refuse_encryption(&mut self) {
+        if self.phase == Phase::Startup {
+            self.handoff = false;
+        }
+    }
+
+    /// Prepares this decoder for decrypted startup bytes after handoff.
+    /// Call on the decoder returned by [`super::codec::Stream::into_parts`].
+    /// After a negotiated upgrade, further SSL and GSS requests are refused.
+    /// Direct TLS retains the initial negotiation policy of the old API.
+    pub fn start_encryption(&mut self) {
+        if self.phase == Phase::Startup {
+            if self.started {
+                self.ssl_seen = true;
+                self.gss_seen = true;
+            }
+            self.started = true;
+            self.handoff = false;
+        }
+    }
+}
+
+impl Default for FrontendMessages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for FrontendMessages {
+    type Item = Result<Frontend, Error>;
+    type Error = Error;
+    const NAME: &'static str = "PostgreSQL frontend";
+
+    fn capacity(&self) -> usize {
+        (MAX_STARTUP + 4).max(self.limit + 1)
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        if self.handoff || self.phase == Phase::Closed {
+            return Ok(Step::End);
+        }
+        let (message, used) = if self.phase == Phase::Startup {
+            let Some((body, used)) = split_startup(input, !self.started)? else {
+                return Ok(Step::Need);
+            };
+            (Ok(startup_body(body)?), used)
+        } else {
+            let Some((tag, body, used)) = split_typed(input, frontend_limit, self.limit)? else {
+                return Ok(Step::Need);
+            };
+            (
+                frontend_body(tag, body).map_err(|reason| Error::Malformed { tag, reason }),
+                used,
+            )
+        };
+        match &message {
+            Ok(Frontend::SslRequest) => {
+                if self.ssl_seen {
+                    return Err(Error::UnsupportedProtocol(SSL_REQUEST_CODE));
+                }
+                self.ssl_seen = true;
+                self.handoff = true;
+            }
+            Ok(Frontend::GssEncRequest) => {
+                if self.gss_seen {
+                    return Err(Error::UnsupportedProtocol(GSSENC_REQUEST_CODE));
+                }
+                self.gss_seen = true;
+                self.handoff = true;
+            }
+            Ok(Frontend::Startup(_)) => self.phase = Phase::Messages,
+            Ok(Frontend::CancelRequest { .. } | Frontend::Terminate) => self.phase = Phase::Closed,
+            _ => {}
+        }
+        self.started = true;
+        Ok(Step::Item(message, used))
+    }
+}
+
+/// The one-byte response to an SSLRequest or GSSENCRequest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EncryptionReply {
+    /// `S`: continue with TLS.
+    Ssl,
+    /// `G`: continue with GSS encryption.
+    Gss,
+    /// `N`: continue without this encryption method.
+    Refused,
+}
+
+impl Wire for EncryptionReply {
+    type ParseError = ParseError;
+    type WriteError = core::convert::Infallible;
+
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        match bytes {
+            [ACCEPT_SSL] => Ok(Self::Ssl),
+            [ACCEPT_GSSENC] => Ok(Self::Gss),
+            [REFUSE_ENCRYPTION] => Ok(Self::Refused),
+            [] => Err(ParseError::Truncated),
+            [byte] => Err(ParseError::Message(Error::UnknownType(*byte))),
+            _ => Err(ParseError::Trailing),
+        }
+    }
+
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+        out.push(match self {
+            Self::Ssl => ACCEPT_SSL,
+            Self::Gss => ACCEPT_GSSENC,
+            Self::Refused => REFUSE_ENCRYPTION,
+        });
+        Ok(())
+    }
+}
+
+/// One backend negotiation response or typed message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendEvent {
+    /// A one-byte encryption response.
+    Encryption(EncryptionReply),
+    /// A typed backend message.
+    Message(Backend),
+}
+
+/// Reads backend messages and optional one-byte encryption responses.
+///
+/// Malformed complete bodies are error items. Framing errors end the
+/// stream. Partial messages return [`Step::Need`], including at EOF.
+/// Call [`expect_encryption`](Self::expect_encryption) before the response
+/// to an SSLRequest or GSSENCRequest. An `S` or `G` item is followed by
+/// [`Step::End`]; unread bytes go to the next transport through
+/// [`super::codec::Stream::into_parts`]. Use a new decoder for decrypted messages.
+/// An `N` item resumes typed messages. World code may request another
+/// negotiation response between items if it sends another request.
+/// This mode accepts only `S`, `G` and `N`: an `E` ErrorResponse from an
+/// older server ends the stream with [`Error::UnknownType`].
+///
+/// ```
+/// use fictionet::stdlib::codec::{Stream, finish, pump};
+/// use fictionet::stdlib::postgres::{Backend, BackendEvent, BackendMessages, EncryptionReply, TransactionStatus};
+///
+/// let mut decoder = BackendMessages::with_limit(64);
+/// decoder.expect_encryption();
+/// let mut stream = Stream::new(decoder);
+/// let mut items = Vec::new();
+/// pump(&mut stream, b"NZ\0\0\0\x05I", |item| items.push(item.unwrap()))?;
+/// finish(&mut stream, |_| unreachable!())?;
+/// assert_eq!(items, [
+///     BackendEvent::Encryption(EncryptionReply::Refused),
+///     BackendEvent::Message(Backend::ReadyForQuery(TransactionStatus::Idle)),
+/// ]);
+/// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::postgres::Error>>(())
+/// ```
+#[derive(Clone, Debug)]
+pub struct BackendMessages {
+    limit: usize,
+    encryption: bool,
+    handoff: bool,
+}
+
+impl BackendMessages {
+    /// Reads typed messages up to [`DEFAULT_MAX_MESSAGE`].
+    pub fn new() -> Self {
+        Self::with_limit(DEFAULT_MAX_MESSAGE)
+    }
+
+    /// Sets the maximum length field, clamped to 4 through [`MAX_MESSAGE`].
+    pub fn with_limit(limit: usize) -> Self {
+        Self {
+            limit: limit.clamp(4, MAX_MESSAGE),
+            encryption: false,
+            handoff: false,
+        }
+    }
+
+    /// The maximum length field, including its four length bytes.
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Selects a single encryption response as the next item.
+    /// Call only between items, before reading any part of the next message.
+    pub fn expect_encryption(&mut self) {
+        self.encryption = true;
+    }
+}
+
+impl Default for BackendMessages {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for BackendMessages {
+    type Item = Result<BackendEvent, Error>;
+    type Error = Error;
+    const NAME: &'static str = "PostgreSQL backend";
+
+    fn capacity(&self) -> usize {
+        self.limit + 1
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        if self.handoff {
+            return Ok(Step::End);
+        }
+        if self.encryption {
+            let Some(&byte) = input.first() else {
+                return Ok(Step::Need);
+            };
+            let reply = match byte {
+                ACCEPT_SSL => EncryptionReply::Ssl,
+                ACCEPT_GSSENC => EncryptionReply::Gss,
+                REFUSE_ENCRYPTION => EncryptionReply::Refused,
+                _ => return Err(Error::UnknownType(byte)),
+            };
+            self.encryption = false;
+            self.handoff = reply != EncryptionReply::Refused;
+            return Ok(Step::Item(Ok(BackendEvent::Encryption(reply)), 1));
+        }
+        let Some((tag, body, used)) = split_typed(input, backend_limit, self.limit)? else {
+            return Ok(Step::Need);
+        };
+        let message = backend_body(tag, body)
+            .map(BackendEvent::Message)
+            .map_err(|reason| Error::Malformed { tag, reason });
+        Ok(Step::Item(message, used))
+    }
+}
+
+/// Where [`FrontendMessages`] or a [`Decoder`] is in a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Before the StartupMessage: messages have no type byte.
     Startup,
     /// After the StartupMessage: every message is typed.
     Messages,
-    /// After a CancelRequest or a Terminate. No more messages come, and
-    /// bytes fed are dropped.
+    /// After a CancelRequest or a Terminate. [`FrontendMessages`] returns
+    /// End with remaining bytes unread; [`Decoder`] drops further feeds.
     Closed,
 }
 
@@ -2383,6 +2927,62 @@ fn show_tag(t: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_message_variants_obey_wire_contract() {
+        use crate::stdlib::codec::contract;
+        for message in all_frontend() {
+            contract::check_wire_value(&message);
+            let bytes = Wire::to_bytes(&message).unwrap();
+            assert_eq!(
+                frontend_size(&message),
+                bytes.len() - usize::from(message.tag().is_some())
+            );
+            contract::check_wire::<Frontend>(&bytes);
+        }
+        for message in all_backend() {
+            contract::check_wire_value(&message);
+            let bytes = Wire::to_bytes(&message).unwrap();
+            assert_eq!(backend_size(&message), bytes.len() - 1);
+            contract::check_wire::<Backend>(&bytes);
+        }
+    }
+
+    #[test]
+    fn strict_writes_enforce_frontend_type_sizes() {
+        for (fixed, limit, make) in [
+            (
+                6,
+                SMALL_MESSAGE,
+                (|n| Frontend::Close {
+                    target: Target::Statement,
+                    name: "x".repeat(n),
+                }) as fn(usize) -> Frontend,
+            ),
+            (
+                4,
+                MAX_AUTH_MESSAGE,
+                (|n| Frontend::AuthResponse(vec![0; n])) as fn(usize) -> Frontend,
+            ),
+            (
+                12,
+                MAX_STARTUP + 4,
+                (|n| {
+                    Frontend::Startup(Startup {
+                        minor_version: 0,
+                        params: vec![("u".into(), "x".repeat(n))],
+                    })
+                }) as fn(usize) -> Frontend,
+            ),
+        ] {
+            let message = make(limit - fixed);
+            let bytes = Wire::to_bytes(&message).unwrap();
+            assert_eq!(bytes.len(), limit + usize::from(message.tag().is_some()));
+            let mut out = b"prefix".to_vec();
+            assert_eq!(make(limit - fixed + 1).write(&mut out), Err(WriteError));
+            assert_eq!(out, b"prefix");
+        }
+    }
 
     // Byte layouts from chapter 54 of the PostgreSQL 18 documentation,
     // "Message Formats".

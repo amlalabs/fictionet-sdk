@@ -12,8 +12,8 @@
 //! codes).
 //!
 //! Nothing here reads a socket or parses HTTP. A world that plays a
-//! printer takes the body of each POST, feeds it to a [`Decoder`] (or
-//! hands the whole body to [`Message::parse`]), gets a [`Message`] back,
+//! printer takes the body of each POST, reads its attributes with [`Head`]
+//! and [`super::codec::Stream`] (or hands the whole body to [`Message::parse`]),
 //! and writes the bytes of its reply as the HTTP response body. Which
 //! operations the printer supports, which attributes it has, and what it
 //! does with a document are up to world code.
@@ -27,54 +27,38 @@
 //! reader would refuse: [`Message::to_bytes`] cuts long strings and leaves
 //! out what cannot be written, as each item's documentation says.
 //!
+//! [`Head`] yields one [`Header`] item, then End. The document remains
+//! unread for [`super::codec::Stream::swap`] into a [`super::codec::Collect`]
+//! bounded by [`MAX_DOCUMENT`]. [`Wire`] on [`Header`] writes without
+//! clipping. [`Decoder`] keeps its original behavior.
+//!
 //! ```
-//! use fictionet::stdlib::ipp::{operation, status, tag, Attribute, Decoder, Message, Value};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::ipp::{operation, status, tag, Attribute, Head, Header, Message, Value};
 //!
-//! /// A pretend printer in a lobby, answering one request.
-//! fn answer(request: &Message) -> Message {
-//!     match request.code {
-//!         operation::GET_PRINTER_ATTRIBUTES => {
-//!             let mut reply = request.response(status::SUCCESSFUL_OK);
-//!             reply.add(tag::PRINTER_ATTRIBUTES, Attribute::new("printer-name", Value::Name("lobby".into())));
-//!             // 3 is idle.
-//!             reply.add(tag::PRINTER_ATTRIBUTES, Attribute::new("printer-state", Value::Enum(3)));
-//!             reply
-//!         }
-//!         _ => request.response(status::SERVER_ERROR_OPERATION_NOT_SUPPORTED),
-//!     }
-//! }
-//!
-//! // The body of a POST: IPP 1.1, Get-Printer-Attributes, request ID 7,
-//! // and the operation attributes every request starts with.
-//! let body = [
-//!     &[1, 1, 0x00, 0x0b, 0, 0, 0, 7, tag::OPERATION_ATTRIBUTES][..],
-//!     &[tag::CHARSET, 0, 18],
-//!     b"attributes-charset",
-//!     &[0, 5],
-//!     b"utf-8",
-//!     &[tag::NATURAL_LANGUAGE, 0, 27],
-//!     b"attributes-natural-language",
-//!     &[0, 2],
-//!     b"en",
-//!     &[tag::END_OF_ATTRIBUTES],
-//! ]
-//! .concat();
-//! let mut decoder = Decoder::new();
-//! decoder.feed(&body);
-//! let request = decoder.next_message().unwrap().unwrap();
+//! // An HTTP request body asking for the printer's attributes.
+//! let request = Message::request(operation::GET_PRINTER_ATTRIBUTES, 7);
+//! let body = Wire::to_bytes(&Header::from(request)).unwrap();
+//! let mut stream = Stream::new(Head::new());
+//! assert_eq!(stream.push(&body), body.len());
+//! let request = stream.next().unwrap().unwrap().unwrap();
 //! assert_eq!(request.code, operation::GET_PRINTER_ATTRIBUTES);
-//! let charset = request.attribute(tag::OPERATION_ATTRIBUTES, "attributes-charset").unwrap();
-//! assert_eq!(charset.values, [Value::Charset("utf-8".into())]);
+//! assert_eq!(stream.next(), None);
 //!
-//! let reply = answer(&request).to_bytes();
-//! // The same version and request ID, and status successful-ok.
-//! assert_eq!(&reply[..8], [1, 1, 0, 0, 0, 0, 0, 7]);
-//! let back = Message::parse(&reply).unwrap();
-//! let state = back.attribute(tag::PRINTER_ATTRIBUTES, "printer-state").unwrap();
-//! assert_eq!(state.values, [Value::Enum(3)]);
+//! // The reply echoes the version and request ID.
+//! let mut reply = Message::request(status::SUCCESSFUL_OK, request.request_id);
+//! reply.version = request.version;
+//! reply.add(tag::PRINTER_ATTRIBUTES, Attribute::new("printer-name", Value::Name("lobby".into())));
+//! reply.add(tag::PRINTER_ATTRIBUTES, Attribute::new("printer-state", Value::Enum(3)));
+//! let reply = Header::from(reply);
+//! let bytes = Wire::to_bytes(&reply).unwrap();
+//! assert_eq!(&bytes[..8], [1, 1, 0, 0, 0, 0, 0, 7]);
+//! assert_eq!(<Header as Wire>::parse(&bytes).unwrap(), reply);
 //! ```
 
 use std::collections::BTreeSet;
+
+use super::codec::{Decode, Step, Wire};
 
 /// The TCP port IPP printers listen on.
 pub const PORT: u16 = 631;
@@ -858,6 +842,348 @@ fn standard_operation_group() -> Group {
     }
 }
 
+/// The default document collection limit: 64 MiB. This is a world policy,
+/// not a wire length field. Use it with [`super::codec::Collect`] after
+/// swapping out [`Head`]; worlds may choose a smaller document budget.
+pub const MAX_DOCUMENT: usize = 64 * 1024 * 1024;
+
+/// An IPP message through its end-of-attributes tag, without document data.
+///
+/// [`Wire`] reads exactly this head and writes it without clipping fields.
+/// [`Message::to_bytes`] keeps its original clipping behavior.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Header {
+    /// The major and minor IPP version.
+    pub version: (u8, u8),
+    /// The operation ID or status code.
+    pub code: u16,
+    /// The client's request ID, also used in its response.
+    pub request_id: u32,
+    /// Attribute groups in wire order.
+    pub groups: Vec<Group>,
+}
+
+impl From<Message> for Header {
+    /// Takes the fixed header and attributes, discarding document data.
+    fn from(message: Message) -> Self {
+        Self {
+            version: message.version,
+            code: message.code,
+            request_id: message.request_id,
+            groups: message.groups,
+        }
+    }
+}
+
+/// Why bytes do not contain exactly one IPP head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// The head was refused.
+    Head(Error),
+    /// The input ends before the end-of-attributes tag.
+    Truncated,
+    /// Bytes follow the end-of-attributes tag.
+    Trailing,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Head(e) => e.fmt(f),
+            Self::Truncated => f.write_str("IPP head ended early"),
+            Self::Trailing => f.write_str("bytes follow the IPP head"),
+        }
+    }
+}
+impl core::error::Error for ParseError {}
+
+/// An IPP head cannot be written without clipping or changing its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteError;
+
+impl core::fmt::Display for WriteError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("IPP head cannot be represented without changing it")
+    }
+}
+impl core::error::Error for WriteError {}
+
+impl Wire for Header {
+    type ParseError = ParseError;
+    type WriteError = WriteError;
+
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let end = scan_head(bytes, &mut 0, MAX_HEAD)
+            .map_err(ParseError::Head)?
+            .ok_or(ParseError::Truncated)?;
+        if end != bytes.len() {
+            return Err(ParseError::Trailing);
+        }
+        head(bytes).map(Self::from).map_err(ParseError::Head)
+    }
+
+    /// Stages at most [`MAX_HEAD`] bytes and one scalar record of at most
+    /// `MAX_FIELD + MAX_NAME + 5` bytes. Collections nest at most [`MAX_DEPTH`].
+    /// Invalid values leave the destination unchanged.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&[self.version.0, self.version.1]);
+        bytes.extend_from_slice(&self.code.to_be_bytes());
+        bytes.extend_from_slice(&self.request_id.to_be_bytes());
+        for group in &self.groups {
+            if group.tag == 0 || group.tag >= 0x10 || group.tag == tag::END_OF_ATTRIBUTES {
+                return Err(WriteError);
+            }
+            head_room(&bytes, 1)?;
+            bytes.push(group.tag);
+            for attribute in &group.attributes {
+                if !is_name(attribute.name.as_bytes()) || attribute.values.is_empty() {
+                    return Err(WriteError);
+                }
+                for (i, value) in attribute.values.iter().enumerate() {
+                    let name = if i == 0 {
+                        attribute.name.as_bytes()
+                    } else {
+                        b""
+                    };
+                    strict_value(&mut bytes, name, value, 0)?;
+                }
+            }
+        }
+        bytes.push(tag::END_OF_ATTRIBUTES);
+        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
+            return Err(WriteError);
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+// Leave room for the final end-of-attributes tag throughout encoding.
+fn head_room(out: &[u8], n: usize) -> Result<(), WriteError> {
+    if out.len().checked_add(n).is_none_or(|end| end >= MAX_HEAD) {
+        return Err(WriteError);
+    }
+    Ok(())
+}
+
+fn strict_put(out: &mut Vec<u8>, tag: u8, name: &[u8], value: &[u8]) -> Result<(), WriteError> {
+    if name.len() > MAX_NAME || value.len() > MAX_FIELD {
+        return Err(WriteError);
+    }
+    let size = 5usize
+        .checked_add(name.len())
+        .and_then(|n| n.checked_add(value.len()))
+        .ok_or(WriteError)?;
+    head_room(out, size)?;
+    put(out, tag, name, value);
+    Ok(())
+}
+
+fn strict_value(
+    out: &mut Vec<u8>,
+    name: &[u8],
+    value: &Value,
+    depth: usize,
+) -> Result<(), WriteError> {
+    if let Value::Collection(members) = value {
+        if depth >= MAX_DEPTH {
+            return Err(WriteError);
+        }
+        strict_put(out, tag::BEG_COLLECTION, name, &[])?;
+        for member in members {
+            if !is_name(member.name.as_bytes()) || member.values.is_empty() {
+                return Err(WriteError);
+            }
+            strict_put(out, tag::MEMBER_ATTR_NAME, &[], member.name.as_bytes())?;
+            for value in &member.values {
+                strict_value(out, &[], value, depth + 1)?;
+            }
+        }
+        return strict_put(out, tag::END_COLLECTION, &[], &[]);
+    }
+    // The legacy scalar writer stages at most one bounded record. Comparing
+    // the complete head below rejects any clipping or value normalization.
+    let mut record = Vec::new();
+    if !write_value(&mut record, name, value, depth) {
+        return Err(WriteError);
+    }
+    head_room(out, record.len())?;
+    out.extend_from_slice(&record);
+    Ok(())
+}
+
+/// A refused complete head, with the request ID needed for an error reply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeadError {
+    /// Echo this ID in a client-error-bad-request response.
+    pub request_id: u32,
+    /// Why the attributes were refused.
+    pub error: Error,
+}
+
+impl core::fmt::Display for HeadError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "IPP request {}: {}", self.request_id, self.error)
+    }
+}
+impl core::error::Error for HeadError {}
+
+/// Reads one IPP head item, then returns [`Step::End`] unconditionally.
+///
+/// All document bytes remain unread for [`super::codec::Stream::swap`]
+/// into a [`super::codec::Collect`] with [`MAX_DOCUMENT`] or a world's
+/// smaller named limit. The enclosing HTTP body supplies EOF.
+///
+/// Capacity is the head limit, including the fixed header and end tag.
+/// Incomplete heads return [`Step::Need`], so the stream reports truncation
+/// at EOF. Empty input at EOF is a clean end with no item. Invalid length
+/// fields and over-limit heads end the stream. Attribute errors, including
+/// over-long names, are [`HeadError`] items carrying the request ID; the
+/// document boundary remains known. No input bytes are retained.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, ipp::{Head, MAX_DOCUMENT}};
+/// use core::convert::Infallible;
+///
+/// struct Document(Vec<u8>);
+/// impl Wire for Document {
+///     type ParseError = Infallible;
+///     type WriteError = Infallible;
+///     fn parse(bytes: &[u8]) -> Result<Self, Infallible> { Ok(Self(bytes.to_vec())) }
+///     fn write(&self, out: &mut Vec<u8>) -> Result<(), Infallible> {
+///         out.extend_from_slice(&self.0);
+///         Ok(())
+///     }
+/// }
+/// let input = b"\x01\x01\0\x02\0\0\0\x07\x03document";
+/// let mut stream = Stream::new(Head::new());
+/// let accepted = pump(&mut stream, input, |head| {
+///     assert_eq!(head.unwrap().request_id, 7);
+/// }).unwrap();
+/// assert!(stream.is_done());
+/// let mut document = stream.swap(Collect::<Document>::new(MAX_DOCUMENT));
+/// pump(&mut document, &input[accepted..], |_| unreachable!()).unwrap();
+/// // HTTP signals the end of its body.
+/// finish(&mut document, |Document(bytes)| assert_eq!(bytes, b"document")).unwrap();
+/// ```
+#[derive(Clone, Debug)]
+pub struct Head {
+    head_limit: usize,
+    scanned: usize,
+    done: bool,
+}
+
+impl Head {
+    /// Reads heads up to [`MAX_HEAD`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_HEAD)
+    }
+
+    /// Sets the head limit, including the end tag, clamped from
+    /// `HEADER_LEN + 1` through [`MAX_HEAD`].
+    pub fn with_limit(head_limit: usize) -> Self {
+        Self {
+            head_limit: head_limit.clamp(HEADER_LEN + 1, MAX_HEAD),
+            scanned: 0,
+            done: false,
+        }
+    }
+
+    /// The largest head, including the fixed header and end tag.
+    pub fn head_limit(&self) -> usize {
+        self.head_limit
+    }
+}
+
+impl Default for Head {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Head {
+    type Item = Result<Header, HeadError>;
+    type Error = Error;
+    const NAME: &'static str = "IPP";
+
+    fn capacity(&self) -> usize {
+        self.head_limit
+    }
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Error> {
+        if self.done {
+            return Ok(Step::End);
+        }
+        let Some(end) = scan_head(input, &mut self.scanned, self.head_limit)? else {
+            return Ok(Step::Need);
+        };
+        let bytes = input.get(..end).ok_or(Error::Truncated)?;
+        let fixed = bytes.first_chunk::<HEADER_LEN>().ok_or(Error::Truncated)?;
+        let request_id = u32::from_be_bytes([fixed[4], fixed[5], fixed[6], fixed[7]]);
+        self.done = true;
+        let item = head(bytes)
+            .map(Header::from)
+            .map_err(|error| HeadError { request_id, error });
+        Ok(Step::Item(item, end))
+    }
+}
+
+// Only the scan cursor survives Need. Every complete record is visited once.
+// Reserve space for the end tag. Name validity is checked by head() once
+// the complete attribute section and its document boundary are known.
+fn scan_head(bytes: &[u8], pos: &mut usize, limit: usize) -> Result<Option<usize>, Error> {
+    if *pos < HEADER_LEN {
+        if bytes.len() < HEADER_LEN {
+            return Ok(None);
+        }
+        *pos = HEADER_LEN;
+    }
+    loop {
+        let p = *pos;
+        let Some(&tag) = bytes.get(p) else {
+            return Ok(None);
+        };
+        let next = p.checked_add(1).ok_or(Error::TooLong)?;
+        if next > limit {
+            return Err(Error::TooLong);
+        }
+        if tag == tag::END_OF_ATTRIBUTES {
+            return Ok(Some(next));
+        }
+        if tag < 0x10 {
+            if next >= limit {
+                return Err(Error::TooLong);
+            }
+            *pos = next;
+            continue;
+        }
+        let name_start = p.checked_add(3).ok_or(Error::TooLong)?;
+        if name_start >= limit {
+            return Err(Error::TooLong);
+        }
+        let Some(n) = len_at(bytes, next)? else {
+            return Ok(None);
+        };
+        let at = name_start.checked_add(n).ok_or(Error::TooLong)?;
+        let value_start = at.checked_add(2).ok_or(Error::TooLong)?;
+        if value_start >= limit {
+            return Err(Error::TooLong);
+        }
+        let Some(v) = len_at(bytes, at)? else {
+            return Ok(None);
+        };
+        let end = value_start.checked_add(v).ok_or(Error::TooLong)?;
+        if end >= limit {
+            return Err(Error::TooLong);
+        }
+        if bytes.len() < end {
+            return Ok(None);
+        }
+        *pos = end;
+    }
+}
+
 /// Reads an IPP message from a body that arrives in pieces. Feed it the
 /// body's bytes in order. Once the attribute section has come,
 /// [`Decoder::next_message`] gives the message, and every later byte is
@@ -888,7 +1214,7 @@ const HEAD_HOLD: usize = MAX_HEAD + 3;
 #[derive(Clone, Debug, Default)]
 enum State {
     #[default]
-    Head,
+    Header,
     /// The attribute section is the first this many bytes of `buf`.
     Found(usize),
     Data,
@@ -905,7 +1231,7 @@ impl Decoder {
     /// the bytes are checked as they are added, and the section's lengths
     /// are checked as they arrive. After an [`Error`] bytes are dropped.
     pub fn feed(&mut self, mut bytes: &[u8]) {
-        while let State::Head = self.state {
+        while let State::Header = self.state {
             if bytes.is_empty() {
                 return;
             }
@@ -947,7 +1273,7 @@ impl Decoder {
     pub fn next_message(&mut self) -> Option<Result<Message, Error>> {
         let end = match self.state {
             State::Failed(e) => return Some(Err(e)),
-            State::Data | State::Head => return None,
+            State::Data | State::Header => return None,
             State::Found(end) => end,
         };
         let result = match self.buf.get(..end) {
@@ -1625,6 +1951,45 @@ mod tests {
             Value::Unknown { tag: 0x43, data: b"x".to_vec() },
             Value::Unknown { tag: 0x99, data: vec![1, 2, 3] },
         ]
+    }
+
+    #[test]
+    fn strict_head_covers_all_values_and_bounds_collection_depth() {
+        use crate::stdlib::codec::contract;
+        let mut message = Message::request(operation::PRINT_JOB, 3);
+        message.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute {
+                name: "all".into(),
+                values: every_value(),
+            },
+        );
+        message.add(
+            tag::JOB_ATTRIBUTES,
+            Attribute::new(
+                "c",
+                Value::Collection(vec![Attribute {
+                    name: "m".into(),
+                    values: every_value(),
+                }]),
+            ),
+        );
+        let head = Header::from(message);
+        contract::check_wire_value(&head);
+        let bytes = Wire::to_bytes(&head).unwrap();
+        contract::check_wire::<Header>(&bytes);
+        contract::check_decode(Head::new, &bytes);
+        for (depth, accepted) in [(MAX_DEPTH, true), (MAX_DEPTH + 1, false)] {
+            let mut message = Message::request(operation::PRINT_JOB, 3);
+            message.add(tag::JOB_ATTRIBUTES, Attribute::new("nested", nested(depth)));
+            let head = Header::from(message);
+            contract::check_wire_value(&head);
+            let mut out = b"prefix".to_vec();
+            assert_eq!(head.write(&mut out).is_ok(), accepted);
+            if !accepted {
+                assert_eq!(out, b"prefix");
+            }
+        }
     }
 
     #[test]

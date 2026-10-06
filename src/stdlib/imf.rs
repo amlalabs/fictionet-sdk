@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket. A world that plays a mail server takes the
 //! bytes of a message from its SMTP session and hands them to
-//! [`split_message`], or feeds a stream to a [`Decoder`]. It gets back a
+//! [`split_message`], or uses [`Head`] with [`super::codec::Stream`]. It gets back a
 //! [`Header`] of [`Field`]s and the body bytes. The structured fields are
 //! read on demand: [`parse_address_list`] for `From`, `To` and `Cc`,
 //! [`DateTime::parse`] for `Date`, [`MessageId::parse`] and
@@ -25,18 +25,27 @@
 //! returns an [`Error`] rather than write something the readers here would
 //! refuse.
 //!
+//! [`Head`] yields one header item, then End. The body remains unread for
+//! [`super::codec::Stream::swap`] into a [`super::codec::Collect`] with a
+//! named limit, or a multipart decoder. [`Wire`] on [`Header`] provides
+//! exact parsing and strict writing. [`Decoder`] keeps its original behavior.
+//!
 //! ```
 //! use fictionet::stdlib::imf::{
-//!     decode_text, parse_address_list, split_message, write_address_list, Address, DateTime, Header,
+//!     decode_text, parse_address_list, write_address_list, Address, DateTime, Head, Header,
 //! };
+//! use fictionet::stdlib::codec::{Stream, Wire};
 //!
 //! let message = "From: John Doe <jdoe@machine.example>\r\n\
 //!                Subject: =?utf-8?q?Caf=C3=A9?= hours\r\n\
 //!                Date: Fri, 21 Nov 1997 09:55:06 -0600\r\n\
 //!                \r\n\
 //!                Is it open?\r\n";
-//! let (header, body) = split_message(message.as_bytes()).unwrap();
-//! assert_eq!(body, b"Is it open?\r\n");
+//! let mut stream = Stream::new(Head::new());
+//! assert_eq!(stream.push(message.as_bytes()), message.len());
+//! let header = stream.next().unwrap().unwrap().unwrap();
+//! assert_eq!(stream.next(), None);
+//! assert_eq!(stream.unread(), b"Is it open?\r\n");
 //!
 //! let from = parse_address_list(header.get("from").unwrap()).unwrap();
 //! let Address::Mailbox(sender) = &from[0] else { panic!("not a mailbox") };
@@ -52,9 +61,11 @@
 //! let mut reply = Header::default();
 //! reply.push("To", &write_address_list(&from).unwrap());
 //! reply.push("Subject", "Re: Café hours");
-//! let bytes = reply.to_bytes().unwrap();
+//! let bytes = Wire::to_bytes(&reply).unwrap();
 //! assert_eq!(bytes, "To: John Doe <jdoe@machine.example>\r\nSubject: Re: Café hours\r\n\r\n".as_bytes());
 //! ```
+
+use super::codec::{Decode, Step, Wire};
 
 /// The longest header section, counting the blank line that ends it.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
@@ -229,6 +240,184 @@ impl Header {
             return Err(Error::TooLarge);
         }
         Ok(out)
+    }
+}
+
+/// Why bytes do not contain exactly one writable header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParseError {
+    /// Header fields or their strict encoding were refused.
+    Header(Error),
+    /// The terminating blank line has not arrived.
+    Truncated,
+    /// Bytes follow the terminating blank line.
+    Trailing,
+}
+
+impl core::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Header(e) => e.fmt(f),
+            Self::Truncated => f.write_str("IMF header ended before its blank line"),
+            Self::Trailing => f.write_str("bytes follow the IMF header"),
+        }
+    }
+}
+impl core::error::Error for ParseError {}
+
+impl Wire for Header {
+    type ParseError = ParseError;
+    type WriteError = Error;
+
+    /// Reads exactly one header that the strict writer can represent.
+    /// Obsolete control text and headers whose folding exceeds the size
+    /// limit are refused. [`Header::parse`] and [`Head`] still read them.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let (header, used) = Header::parse(bytes)
+            .map_err(ParseError::Header)?
+            .ok_or(ParseError::Truncated)?;
+        if used != bytes.len() {
+            return Err(ParseError::Trailing);
+        }
+        strict_header(&header).map_err(ParseError::Header)?;
+        Ok(header)
+    }
+
+    /// Appends a header without normalizing its value. Leading value
+    /// whitespace is [`Error::FieldValue`]. Refusal leaves `out` unchanged.
+    /// The legacy [`Header::to_bytes`] still trims leading whitespace.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.extend_from_slice(&strict_header(self)?);
+        Ok(())
+    }
+}
+
+fn strict_header(header: &Header) -> Result<Vec<u8>, Error> {
+    // Bound fields before entering the legacy folding writer. Its temporary
+    // output is at most three times MAX_HEADER_BYTES (one CRLF per byte).
+    if header.fields.len() > MAX_FIELDS {
+        return Err(Error::TooManyFields);
+    }
+    let mut size = 2usize;
+    for field in &header.fields {
+        size = size
+            .saturating_add(field.name.len())
+            .saturating_add(field.value.len())
+            .saturating_add(4);
+        if size > MAX_HEADER_BYTES {
+            return Err(Error::TooLarge);
+        }
+    }
+    let bytes = header.to_bytes()?;
+    match Header::parse(&bytes)? {
+        Some((parsed, used)) if used == bytes.len() && parsed == *header => Ok(bytes),
+        _ => Err(Error::FieldValue),
+    }
+}
+
+/// Reads one header item, then returns [`Step::End`] unconditionally.
+///
+/// The enclosing SMTP or MIME layer supplies EOF. A blank line ends the
+/// header; all following bytes remain unread for [`super::codec::Stream::swap`]
+/// into a body collector or a multipart decoder. No input bytes are retained.
+/// Capacity is the header limit, including the terminating blank line.
+///
+/// At EOF, non-empty input below the limit without a blank line is the
+/// whole header, as RFC 5322 allows. Empty input at EOF is a clean end with
+/// no item. Reaching the limit without a blank line ends the stream with
+/// [`Error::TooLarge`]. Field errors are error items, followed by End too.
+///
+/// ```
+/// use fictionet::stdlib::{codec::{Collect, Stream, Wire, finish, pump}, imf::Head};
+/// use core::convert::Infallible;
+///
+/// // The world chooses a body type and a total size limit.
+/// const MAX_MAIL_BODY: usize = 16 * 1024 * 1024;
+/// struct Body(Vec<u8>);
+/// impl Wire for Body {
+///     type ParseError = Infallible;
+///     type WriteError = Infallible;
+///     fn parse(bytes: &[u8]) -> Result<Self, Infallible> { Ok(Self(bytes.to_vec())) }
+///     fn write(&self, out: &mut Vec<u8>) -> Result<(), Infallible> {
+///         out.extend_from_slice(&self.0);
+///         Ok(())
+///     }
+/// }
+/// let input = b"Subject: hi\r\n\r\nhello";
+/// let mut stream = Stream::new(Head::new());
+/// let accepted = pump(&mut stream, input, |header| {
+///     assert_eq!(header.unwrap().get("Subject"), Some("hi"));
+/// }).unwrap();
+/// assert!(stream.is_done());
+/// let mut body = stream.swap(Collect::<Body>::new(MAX_MAIL_BODY));
+/// pump(&mut body, &input[accepted..], |_| unreachable!()).unwrap();
+/// finish(&mut body, |Body(bytes)| assert_eq!(bytes, b"hello")).unwrap();
+/// ```
+#[derive(Clone, Debug)]
+pub struct Head {
+    header_limit: usize,
+    scanned: usize,
+    done: bool,
+}
+
+impl Head {
+    /// Reads headers up to [`MAX_HEADER_BYTES`].
+    pub fn new() -> Self {
+        Self::with_limit(MAX_HEADER_BYTES)
+    }
+
+    /// Sets the header limit, including the blank line, clamped from 1
+    /// through [`MAX_HEADER_BYTES`].
+    pub fn with_limit(header_limit: usize) -> Self {
+        Self {
+            header_limit: header_limit.clamp(1, MAX_HEADER_BYTES),
+            scanned: 0,
+            done: false,
+        }
+    }
+
+    /// The largest header, including its terminating blank line.
+    pub fn header_limit(&self) -> usize {
+        self.header_limit
+    }
+}
+
+impl Default for Head {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Decode for Head {
+    type Item = Result<Header, Error>;
+    type Error = Error;
+    const NAME: &'static str = "IMF";
+
+    fn capacity(&self) -> usize {
+        self.header_limit
+    }
+
+    fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, Error> {
+        if self.done {
+            return Ok(Step::End);
+        }
+        let window = input
+            .get(..input.len().min(self.header_limit))
+            .ok_or(Error::TooLarge)?;
+        if let Some((fields_end, end)) = find_end(window, self.scanned) {
+            let fields = window.get(..fields_end).ok_or(Error::TooLarge)?;
+            self.done = true;
+            return Ok(Step::Item(parse_fields(fields), end));
+        }
+        if window.len() == self.header_limit {
+            return Err(Error::TooLarge);
+        }
+        if eof && !window.is_empty() {
+            self.done = true;
+            return Ok(Step::Item(parse_fields(window), window.len()));
+        }
+        self.scanned = window.len().saturating_sub(1);
+        Ok(Step::Need)
     }
 }
 

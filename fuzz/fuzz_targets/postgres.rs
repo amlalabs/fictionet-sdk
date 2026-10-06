@@ -2,8 +2,10 @@
 //! database server, or a client, reads them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::postgres::{
-    Backend, BackendDecoder, Decoder, Error, Frontend, SMALL_MESSAGE, SaslInitialResponse, Startup, read_password,
+    Backend, BackendDecoder, BackendMessages, Decoder, EncryptionReply, Error, Frontend,
+    FrontendMessages, SMALL_MESSAGE, SaslInitialResponse, Startup, read_password,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -68,7 +70,37 @@ fn backend(data: &[u8], chunk: usize) -> Vec<Result<Backend, Error>> {
     )
 }
 
+fn typed_frontend() -> FrontendMessages {
+    let mut decoder = FrontendMessages::with_limit(64);
+    decoder.start_messages();
+    decoder
+}
+
 fuzz_target!(|data: &[u8]| {
+    contract::check_decode(|| FrontendMessages::with_limit(64), data);
+    contract::check_decode(typed_frontend, data);
+    contract::check_decode(|| BackendMessages::with_limit(64), data);
+    contract::check_decode(
+        || {
+            let mut messages = BackendMessages::with_limit(64);
+            messages.expect_encryption();
+            messages
+        },
+        data,
+    );
+    contract::check_wire::<Frontend>(data);
+    contract::check_wire::<Backend>(data);
+    contract::check_wire::<EncryptionReply>(data);
+    let text = String::from_utf8_lossy(data.get(..4096).unwrap_or(data)).into_owned();
+    contract::check_wire_value(&Frontend::Query(text.clone()));
+    contract::check_wire_value(&Backend::CommandComplete(text));
+    contract::check_wire_value(&Frontend::CancelRequest {
+        process_id: 7,
+        secret_key: data.get(..257).unwrap_or(data).to_vec(),
+    });
+    let good = Frontend::Query("select 1".into());
+    contract::check_decode(typed_frontend, &Wire::to_bytes(&good).unwrap());
+
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces whose size the first byte picks. The second pass puts a
     // StartupMessage in front, so the fuzzer reaches the typed messages.
@@ -80,6 +112,7 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(whole, frontend(stream, 1));
         assert_eq!(whole, frontend(stream, odd));
         for m in whole.iter().flatten() {
+            contract::check_wire_value(m);
             // A message read can be written, and reads back the same.
             let bytes = m.to_bytes();
             let back = if m.is_startup() { Frontend::parse_startup(&bytes) } else { Frontend::parse(&bytes) };
@@ -105,6 +138,7 @@ fuzz_target!(|data: &[u8]| {
     assert_eq!(whole, backend(data, 1));
     assert_eq!(whole, backend(data, odd));
     for m in whole.iter().flatten() {
+        contract::check_wire_value(m);
         let bytes = m.to_bytes();
         assert_eq!(Backend::parse(&bytes), Ok(Some((m.clone(), bytes.len()))));
     }
