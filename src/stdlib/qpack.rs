@@ -1938,7 +1938,13 @@ impl Wire for Representation {
 /// There are no blocked sections or output bytes hidden in this type.
 /// Every method serves the receiving (decoder) role. The encoding role uses
 /// [`Encoder`], including [`Encoder::apply_instruction`] for peer acknowledgments.
-/// Send returned section acknowledgments before calling [`Table::take_increment`].
+/// Section decoding deliberately borrows `&Table`, matching the codec design's
+/// shared session state: entries are read-only, while a [`core::cell::Cell`]
+/// tracks reported inserts. This makes the table `!Sync`.
+/// Every returned Section Ack must be sent, even if its stream is reset and
+/// a Stream Cancel is also sent. Decoding already counts the ack as reported;
+/// dropping it would make later [`Table::take_increment`] values too small.
+/// Send acknowledgments in return order before taking an increment.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Table {
     dynamic: DynamicTable,
@@ -1997,11 +2003,6 @@ impl Table {
     pub fn set_capacity(&mut self, capacity: u64) -> Result<(), Error> {
         self.dynamic.set_capacity(capacity)
     }
-    /// Evicts oldest entries until their total size is at most `size`.
-    /// Does not change capacity, insert count, or acknowledgment count.
-    pub fn evict_to(&mut self, size: u64) {
-        self.dynamic.evict_to(size);
-    }
     /// Inserts bounded strings and returns the new absolute index.
     /// Evicts oldest entries as needed. Errors leave the table unchanged.
     pub fn insert(&mut self, mut name: Vec<u8>, mut value: Vec<u8>) -> Result<u64, Error> {
@@ -2049,7 +2050,7 @@ impl Table {
     /// No bytes are queued; a second call without new inserts returns `None`.
     pub fn take_increment(&mut self) -> Option<DecoderInstruction> {
         let count = self.insert_count();
-        let increment = count - self.reported.get();
+        let increment = count.saturating_sub(self.reported.get());
         self.reported.set(count);
         (increment != 0).then_some(DecoderInstruction::InsertCountIncrement(increment))
     }
@@ -2097,6 +2098,8 @@ impl BlockedSection {
     }
     /// Retries using the original prefix. If still blocked, returns this
     /// value unchanged. Successful decoding returns its acknowledgment.
+    /// Every returned acknowledgment must be sent, even on stream reset;
+    /// see [`Table`] for the reported-count and ordering requirements.
     pub fn retry(self, table: &Table) -> Result<SectionResult, Error> {
         if self.required_insert_count() > table.insert_count() {
             return Ok(SectionResult::Blocked(self));
@@ -2129,6 +2132,8 @@ fn section_fields(
 /// Successful decoding updates only the decoder's reported count, through
 /// interior mutability; entries stay unchanged. Send returned acknowledgments
 /// in call order before taking [`Table::take_increment`] for the remaining inserts.
+/// Every returned Section Ack must be sent, even when resetting that stream;
+/// a Stream Cancel does not replace it.
 /// No call emits [`Error::Backlog`].
 ///
 /// ```
@@ -2153,6 +2158,7 @@ pub fn decode_section(table: &Table, stream: u64, bytes: &[u8]) -> Result<Sectio
 /// Decodes a section with a field-size limit capped by [`MAX_FIELD_SECTION_SIZE`].
 /// Encoded bytes are bounded by [`MAX_SECTION_BYTES`] before any copy.
 /// Strings and field counts keep [`MAX_STRING`] and [`MAX_FIELDS`] limits.
+/// The acknowledgment requirements are the same as for [`decode_section`].
 pub fn decode_section_with_limit(
     table: &Table,
     stream: u64,

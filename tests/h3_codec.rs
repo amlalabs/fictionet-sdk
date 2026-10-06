@@ -33,7 +33,187 @@ fn literal_headers(fields: &[Field]) -> Frame {
 }
 
 #[test]
-fn review_c_received_lengths_are_normalized_and_request_state_checks_body() {
+fn blocked_stream_keeps_frames_in_connection_budget_until_unpaused() {
+    let mut table = Table::new(4096);
+    table.apply(EI::SetCapacity(4096)).unwrap();
+    let mut state = http3::RequestState::new(0, http3::MessageSide::Response, false).unwrap();
+    let mut connection = Connection::new(Endpoint::Server, 4, http3::MAX_FRAME);
+    let data = Frame::Data(vec![7; 10]);
+    let mut bytes = wire(&Frame::Headers(vec![2, 0, 0x80]));
+    for _ in 0..50 {
+        Wire::write(&data, &mut bytes).unwrap();
+    }
+    assert_eq!(connection.push(0, &bytes), bytes.len());
+    let Some((0, Ok(Ok(StreamItem::Frame(frame))))) = connection.next() else { panic!("expected HEADERS") };
+    let http3::RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else {
+        panic!("expected a blocked section")
+    };
+    connection.pause(0);
+    let buffered = connection.buffered();
+    assert_eq!(buffered, 50 * wire(&data).len());
+    assert_eq!(connection.push(4, &wire(&data)), wire(&data).len());
+    let mut other_frames = 0;
+    while let Some((id, result)) = connection.next() {
+        assert_eq!(id, 4, "blocked stream released buffered frames");
+        assert_eq!(result, Ok(Ok(StreamItem::Frame(data.clone()))));
+        other_frames += 1;
+    }
+    assert_eq!(other_frames, 1);
+    assert_eq!(connection.buffered(), buffered);
+    assert_eq!(connection.push(0, &wire(&data)), 0);
+    table.apply(EI::InsertWithLiteralName { name: b":status".to_vec(), value: b"200".to_vec() }).unwrap();
+    assert!(matches!(
+        state.resume(0, blocked.retry(&table)),
+        Ok(http3::RequestResult::Event { event: Ok(http3::Event::Headers(_)), ack: Some(DI::SectionAck(0)) })
+    ));
+    connection.unpause(0);
+    for _ in 0..50 {
+        assert_eq!(connection.next(), Some((0, Ok(Ok(StreamItem::Frame(data.clone()))))));
+    }
+    assert!(connection.next().is_none());
+    assert_eq!(connection.buffered(), 0);
+    assert_eq!(connection.push(0, &wire(&data)), wire(&data).len());
+}
+
+#[test]
+fn paused_stream_defers_eof_and_preserves_offsets() {
+    for end_before_pause in [false, true] {
+        for partial in [false, true] {
+            let mut connection = Connection::new(Endpoint::Client, 1, http3::MAX_FRAME);
+            let frame = Frame::Data(vec![7; 10]);
+            let mut bytes = wire(&frame);
+            if partial {
+                bytes.extend_from_slice(&[0, 2, 7]);
+            }
+            assert_eq!(connection.push(0, &bytes), bytes.len());
+            if end_before_pause {
+                connection.end(0);
+            }
+            connection.pause(0);
+            connection.pause(0);
+            if !end_before_pause {
+                connection.end(0);
+                connection.end(0);
+            }
+            assert!(connection.next().is_none());
+            assert!(connection.next().is_none());
+            assert_eq!(connection.buffered(), bytes.len());
+            assert_eq!(connection.push(0, &[7]), 0);
+            connection.unpause(0);
+            connection.unpause(0);
+            assert_eq!(connection.next(), Some((0, Ok(Ok(StreamItem::Frame(frame.clone()))))));
+            if partial {
+                assert_eq!(connection.next(), Some((0, Err(Fail::Truncated { unread: 3 }))));
+            }
+            assert!(connection.next().is_none());
+            // A terminal stream cannot be restarted by pause/unpause.
+            connection.pause(0);
+            connection.unpause(0);
+            assert!(connection.next().is_none());
+            let stream = connection.remove(0).unwrap();
+            assert!(stream.is_done());
+            assert_eq!(stream.offset(), wire(&frame).len() as u64);
+            assert_eq!(stream.buffered(), if partial { 3 } else { 0 });
+            assert_eq!(stream.failed(), if partial { Some(&Fail::Truncated { unread: 3 }) } else { None });
+        }
+    }
+}
+
+#[test]
+fn paused_stream_at_capacity_resumes_without_stuck() {
+    let mut connection = Connection::new(Endpoint::Client, 1, http3::MAX_FRAME);
+    connection.pause(4);
+    connection.unpause(4);
+    assert!(connection.is_empty());
+    // Empty DATA frames exactly fill the stream buffer.
+    let bytes = vec![0; http3::MAX_FRAME];
+    assert_eq!(connection.push(0, &bytes), bytes.len());
+    for _ in 0..2 {
+        connection.pause(0);
+        assert!(connection.next().is_none());
+        assert_eq!(connection.buffered(), bytes.len());
+        assert_eq!(connection.push(0, &[0, 0]), 0);
+        connection.unpause(0);
+    }
+    assert_eq!(connection.next(), Some((0, Ok(Ok(StreamItem::Frame(Frame::Data(vec![])))))));
+    assert_eq!(connection.buffered(), bytes.len() - 2);
+}
+
+#[test]
+fn request_field_limit_matches_legacy_rejection() {
+    let mut fields = received_request(&[]);
+    fields[0] = Field::new(":method", "GET");
+    fields.push(Field::new("x-big", vec![b'a'; 2000]));
+    // Keep literal strings uncompressed to exercise the review's 2.1 KB section.
+    let mut section = vec![0, 0];
+    for field in fields {
+        qpack::encode_integer(&mut section, 3, 0x20, field.name.len() as u64);
+        section.extend_from_slice(&field.name);
+        qpack::encode_integer(&mut section, 7, 0, field.value.len() as u64);
+        section.extend_from_slice(&field.value);
+    }
+    let frame = Frame::Headers(section);
+    let bytes = wire(&frame);
+    assert!((2000..2200).contains(&bytes.len()));
+    let mut legacy = http3::RequestDecoder::new(0, http3::MessageSide::Request, false).unwrap();
+    let mut decoder = qpack::Decoder::new(0, 0, 1000);
+    assert_eq!(legacy.feed(&bytes), bytes.len());
+    let expected = http3::Error::Qpack(qpack::Error::FieldSectionTooLarge);
+    assert_eq!(legacy.next_event(&mut decoder), Some(Err(expected)));
+    let mut state = http3::RequestState::new(0, http3::MessageSide::Request, false).unwrap().with_field_limit(1000);
+    assert!(matches!(state.step(&frame, &Table::new(0)), Err(e) if e == expected));
+}
+
+#[test]
+fn request_field_limit_survives_blocked_retries() {
+    use http3::{Event, MessageSide, RequestResult, RequestState};
+    // Cover request HEADERS, push HEADERS, trailers, and PUSH_PROMISE.
+    for kind in 0..4 {
+        let mut table = Table::new(4096);
+        table.apply(EI::SetCapacity(4096)).unwrap();
+        let mut state = match kind {
+            0 => RequestState::new(0, MessageSide::Request, false).unwrap(),
+            1 => RequestState::push(3).unwrap(),
+            _ => RequestState::new(0, MessageSide::Response, false).unwrap(),
+        }
+        .with_field_limit(1000);
+        if kind == 2 {
+            assert!(matches!(
+                state.step(&literal_headers(&[Field::new(":status", "200")]), &table),
+                Ok(RequestResult::Event { event: Ok(Event::Headers(_)), .. })
+            ));
+        }
+        let fields = match kind {
+            0 | 3 => received_request(&[]),
+            1 => vec![Field::new(":status", "200")],
+            _ => vec![],
+        };
+        let mut reps: Vec<_> = fields
+            .into_iter()
+            .map(|field| Rep::LiteralName { never_index: false, name: field.name, value: field.value })
+            .collect();
+        reps.push(Rep::Indexed { static_table: false, index: 0 });
+        let bytes = section(1, 1, table.max_entries(), &reps);
+        let frame =
+            if kind == 3 { Frame::PushPromise { push_id: 0, field_section: bytes } } else { Frame::Headers(bytes) };
+        let RequestResult::Blocked(blocked) = state.step(&frame, &table).unwrap() else { panic!("must block") };
+        let stream = state.stream_id();
+        let RequestResult::Blocked(blocked) = state.resume(stream, blocked.retry(&table)).unwrap() else {
+            panic!("must remain blocked")
+        };
+        table.apply(EI::InsertWithLiteralName { name: b"x-big".to_vec(), value: vec![b'a'; 2000] }).unwrap();
+        assert_eq!(
+            state.resume(stream, blocked.retry(&table)),
+            Err(http3::Error::Qpack(qpack::Error::FieldSectionTooLarge))
+        );
+        assert_eq!(state.finish(), Err(http3::Error::State));
+        // A rejected QPACK section has not reported the insert through an ack.
+        assert_eq!(table.take_increment(), Some(DI::InsertCountIncrement(1)));
+    }
+}
+
+#[test]
+fn received_lengths_are_normalized_and_request_state_checks_body() {
     use http3::{Event, HeaderKind, HeaderList, MessageSide, RequestResult, RequestState};
     let fields = received_request(&["5", "5"]);
     let headers = HeaderList::from_fields(fields.clone(), HeaderKind::Request { extended_connect: false }).unwrap();
@@ -63,7 +243,7 @@ fn review_c_received_lengths_are_normalized_and_request_state_checks_body() {
 }
 
 #[test]
-fn review_c_request_blocked_value_resumes_after_table_update() {
+fn request_blocked_value_resumes_after_table_update() {
     use http3::{Event, MessageSide, RequestResult, RequestState};
     let mut table = Table::new(4096);
     table.set_capacity(4096).unwrap();
@@ -270,7 +450,7 @@ fn http3_stream_errors_keep_role_specific_application_codes() {
 }
 
 #[test]
-fn review_f_wire_errors_distinguish_truncation_trailing_and_protocol() {
+fn wire_errors_distinguish_truncation_trailing_and_protocol() {
     use http3::FrameParseError as H;
     use qpack::ParseError as Q;
     assert_eq!(<EI as Wire>::parse(&[0x3f]), Err(Q::Truncated));
@@ -289,7 +469,7 @@ fn review_f_wire_errors_distinguish_truncation_trailing_and_protocol() {
 
 // Exhaustive external matches ensure the migration preserves both legacy enums.
 #[test]
-fn review_f_legacy_error_shapes() {
+fn legacy_error_shapes() {
     let q = |error| match error {
         qpack::Error::Truncated
         | qpack::Error::IntegerOverflow
@@ -332,14 +512,14 @@ fn review_f_legacy_error_shapes() {
 }
 
 #[test]
-fn review_a_reset_before_section_decode_cancels() {
+fn reset_before_section_decode_cancels() {
     let mut held = qpack::BlockedSections::new(4);
     assert_eq!(held.cancel(&Table::new(4096), 4), Some(DI::StreamCancel(4)));
     assert_eq!(held.cancel(&Table::new(0), 4), None);
 }
 
 #[test]
-fn review_b_increments_without_blocked_streams_and_after_section_acks() {
+fn increments_without_blocked_streams_and_after_section_acks() {
     let mut encoder = qpack::Encoder::new(4096, qpack::MAX_FIELD_SECTION_SIZE);
     encoder.set_capacity(4096).unwrap();
     encoder.insert(b"x-first", b"one").unwrap();
@@ -375,7 +555,7 @@ fn review_b_increments_without_blocked_streams_and_after_section_acks() {
 }
 
 #[test]
-fn review_d_legacy_apis_remain_unmarked() {
+fn legacy_apis_remain_unmarked() {
     for source in [
         include_str!("../src/stdlib/qpack.rs"),
         include_str!("../src/stdlib/http3.rs"),
@@ -388,7 +568,7 @@ fn review_d_legacy_apis_remain_unmarked() {
 }
 
 #[test]
-fn review_e_partial_critical_fin_is_closed_critical_stream() {
+fn partial_critical_fin_is_closed_critical_stream() {
     let mut control = Stream::new(http3::ControlFrames::new(Endpoint::Client));
     assert_eq!(control.push(&[0x04, 0x02, 0x01]), 3);
     control.end();
@@ -396,7 +576,7 @@ fn review_e_partial_critical_fin_is_closed_critical_stream() {
 }
 
 #[test]
-fn review_e_connection_partial_critical_fin_survives_handoff() {
+fn connection_partial_critical_fin_survives_handoff() {
     for bytes in [&[0, 0x04, 0x02, 0x01][..], &[2, 0x3f], &[3, 0xff]] {
         let mut connection = Connection::new(Endpoint::Client, 4, http3::MAX_FRAME);
         assert_eq!(connection.push(2, bytes), bytes.len());
@@ -422,6 +602,13 @@ fn http3_invalid_frame_headers_fail_without_buffering_payloads() {
             fictionet::stdlib::quic::write_varint(length, &mut bytes).unwrap();
             assert_eq!(http3::Frames.decode(&bytes, false), Err(http3::Error::Frame));
         }
+        let mut bytes = vec![kind];
+        fictionet::stdlib::quic::write_varint(http3::MAX_FRAME_PAYLOAD as u64 + 1, &mut bytes).unwrap();
+        assert_eq!(Frame::parse(&bytes), Err(http3::Error::Limit));
+        assert_eq!(<Frame as Wire>::parse(&bytes), Err(http3::FrameParseError::Frame(http3::Error::Limit)));
+        let mut stream = Stream::new(http3::Frames);
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(http3::Error::Limit))));
     }
 }
 
@@ -552,7 +739,7 @@ fn qpack_table_eviction_and_transactional_application() {
     table.apply(EI::Duplicate(0)).unwrap();
     assert!(table.get(0).is_none());
     assert_eq!(table.get_relative(0), Some((&b"b"[..], &b"two"[..])));
-    table.evict_to(36);
+    table.apply(EI::SetCapacity(36)).unwrap();
     assert_eq!(table.first_index(), 2);
     table.set_capacity(0).unwrap();
     assert!(table.is_empty());
@@ -939,7 +1126,7 @@ fn http3_errors_are_items_or_terminal_according_to_boundary() {
     assert_eq!(input.next(), Some(Ok(Err(http3::Error::DuplicateSetting(1)))));
     assert_eq!(input.next(), Some(Ok(Ok(Frame::Data(b"next".to_vec())))));
     assert!(input.failed().is_none());
-    // Even forbidden types are complete-unit errors in the new API.
+    // Forbidden types end framing as soon as their type is known.
     assert_eq!(http3::Frames.decode(&[2, 0], false), Err(http3::Error::UnexpectedFrame(2)));
 
     let mut over = vec![0];

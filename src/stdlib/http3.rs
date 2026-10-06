@@ -1688,12 +1688,7 @@ impl RequestDecoder {
                 return Some(Err(e));
             }
         };
-        let result = if let Some(pending) = pending {
-            let bytes = match &frame {
-                Frame::Headers(b) => b.as_slice(),
-                Frame::PushPromise { field_section, .. } => field_section.as_slice(),
-                _ => &[],
-            };
+        let result = if let Some((pending, bytes)) = pending {
             match qpack.decode_section(self.state.stream, bytes) {
                 Ok(qpack::Section::Fields(fields)) => self.state.accept_fields(pending, fields),
                 Ok(qpack::Section::Blocked) => {
@@ -1707,7 +1702,7 @@ impl RequestDecoder {
                 Err(e) => Err(Error::Qpack(e)),
             }
         } else {
-            self.state.accept_frame(frame)
+            self.state.accept_frame(&frame)
         };
         if result.is_err() {
             self.fail();
@@ -1754,7 +1749,8 @@ pub enum RequestResult {
         /// Send this value on the decoder stream before taking an insert increment.
         ack: Option<qpack::DecoderInstruction>,
     },
-    /// Stop this stream until the section can be retried, then call [`RequestState::resume`].
+    /// Call [`Connection::pause`] until the section can be retried, then
+    /// [`RequestState::resume`] and [`Connection::unpause`] before reading more frames.
     Blocked(qpack::BlockedSection),
 }
 
@@ -1765,9 +1761,13 @@ pub enum RequestResult {
 /// DATA ordering, trailers, interim responses, CONNECT, and Content-Length.
 /// Received duplicate identical Content-Length values are normalized.
 /// No input, blocked field bytes, or acknowledgment queue is retained here.
-/// Hold returned blocked sections in [`qpack::BlockedSections`], stop stepping
-/// this stream, and pass its retried result to [`Self::resume`]. Send returned
-/// acknowledgments in order before calling [`qpack::Table::take_increment`].
+/// Hold returned blocked sections in [`qpack::BlockedSections`] and call
+/// [`Connection::pause`] for this stream (or stop driving its standalone
+/// [`codec::Stream`]). Pass its retried result to [`Self::resume`], then call
+/// [`Connection::unpause`] once it is no longer blocked. Send every returned
+/// acknowledgment in order, even on reset, before [`qpack::Table::take_increment`].
+/// Use [`Self::with_field_limit`] to enforce the advertised
+/// SETTINGS_MAX_FIELD_SECTION_SIZE on immediate and retried sections.
 /// Protocol errors stop the session; local [`Error::State`] leaves it intact.
 /// After the byte decoder reaches a clean FIN, call [`Self::finish`].
 ///
@@ -1798,6 +1798,7 @@ pub struct RequestState {
     extended_connect: bool,
     state: MessageState,
     pending: Option<PendingSection>,
+    field_limit: u64,
     content_length: Option<u64>,
     body_bytes: u64,
     no_content: bool,
@@ -1819,6 +1820,7 @@ impl RequestState {
             extended_connect,
             state: MessageState::Initial,
             pending: None,
+            field_limit: MAX_FIELD_SECTION_SIZE,
             content_length: None,
             body_bytes: 0,
             no_content: false,
@@ -1839,6 +1841,16 @@ impl RequestState {
         decoder.stream = stream;
         decoder.push = true;
         Ok(decoder)
+    }
+    /// Sets the received field-section limit, capped by [`MAX_FIELD_SECTION_SIZE`].
+    /// Call after [`Self::new`] or [`Self::push`] with the endpoint's advertised
+    /// SETTINGS_MAX_FIELD_SECTION_SIZE. The default is [`MAX_FIELD_SECTION_SIZE`].
+    /// Counts name and value bytes plus [`qpack::ENTRY_OVERHEAD`] per field;
+    /// zero permits only empty sections. Blocked sections retain the limit
+    /// used when they were first stepped, including across later retries.
+    pub fn with_field_limit(mut self, limit: u64) -> Self {
+        self.field_limit = limit.min(MAX_FIELD_SECTION_SIZE);
+        self
     }
     /// Sets the promised method's response side on a push stream: Response
     /// or HeadResponse. Push stream bytes can arrive before their PUSH_PROMISE,
@@ -1910,7 +1922,7 @@ impl RequestState {
         self.content_length = if self.tunnel || hypothetical { None } else { info.content_length };
         Ok(Event::Headers(headers))
     }
-    fn pending_section(&self, frame: &Frame) -> Result<Option<PendingSection>, Error> {
+    fn pending_section<'a>(&self, frame: &'a Frame) -> Result<Option<(PendingSection, &'a [u8])>, Error> {
         let t = frame.frame_type();
         // RFC 9114 section 4.4: an open tunnel carries only DATA and extension
         // frames. This is checked before QPACK sees a section.
@@ -1925,15 +1937,17 @@ impl RequestState {
             return Err(e);
         }
         let pending = match frame {
-            Frame::Headers(_) if self.state != MessageState::Trailers => Some(PendingSection::Headers),
-            Frame::PushPromise { push_id, .. } if self.side != MessageSide::Request && !self.push => {
-                Some(PendingSection::Promise(*push_id))
+            Frame::Headers(bytes) if self.state != MessageState::Trailers => {
+                Some((PendingSection::Headers, bytes.as_slice()))
+            }
+            Frame::PushPromise { push_id, field_section } if self.side != MessageSide::Request && !self.push => {
+                Some((PendingSection::Promise(*push_id), field_section.as_slice()))
             }
             _ => None,
         };
         Ok(pending)
     }
-    fn accept_frame(&mut self, frame: Frame) -> Result<Event, Error> {
+    fn accept_frame(&mut self, frame: &Frame) -> Result<Event, Error> {
         let t = frame.frame_type();
         match frame {
             Frame::Data(data) if self.state == MessageState::Body => {
@@ -1944,13 +1958,13 @@ impl RequestState {
                         Err(Error::Message("DATA exceeds Content-Length"))
                     } else {
                         self.body_bytes = total;
-                        Ok(Event::Data(data))
+                        Ok(Event::Data(data.clone()))
                     }
                 } else {
                     Err(Error::Limit)
                 }
             }
-            other @ Frame::Unknown { .. } => Ok(Event::Unknown(other)),
+            other @ Frame::Unknown { .. } => Ok(Event::Unknown(other.clone())),
             _ => Err(Error::UnexpectedFrame(t)),
         }
     }
@@ -1976,7 +1990,8 @@ impl RequestState {
     }
     /// Validates one decoded frame against the receiving QPACK table.
     /// A blocked or finished session returns State without consuming the frame.
-    /// On Blocked, retain the returned section and resume it before the next frame.
+    /// On Blocked, call [`Connection::pause`], retain the returned section, and
+    /// resume it before [`Connection::unpause`] allows the next frame.
     /// Field-validation errors are carried beside their acknowledgment in
     /// [`RequestResult::Event`]; send that acknowledgment even for invalid HTTP
     /// fields. Placement and QPACK decoding failures return `Err`.
@@ -1985,16 +2000,12 @@ impl RequestState {
             return Err(Error::State);
         }
         let result = self.pending_section(frame).and_then(|pending| {
-            if let Some(pending) = pending {
-                let bytes = match frame {
-                    Frame::Headers(bytes) => bytes.as_slice(),
-                    Frame::PushPromise { field_section, .. } => field_section.as_slice(),
-                    _ => unreachable!(),
-                };
-                let section = qpack::decode_section(table, self.stream, bytes).map_err(Error::Qpack)?;
+            if let Some((pending, bytes)) = pending {
+                let section = qpack::decode_section_with_limit(table, self.stream, bytes, self.field_limit)
+                    .map_err(Error::Qpack)?;
                 self.accept_section(pending, section)
             } else {
-                self.accept_frame(frame.clone()).map(|event| RequestResult::Event { event: Ok(event), ack: None })
+                self.accept_frame(frame).map(|event| RequestResult::Event { event: Ok(event), ack: None })
             }
         });
         if result.is_err() {
@@ -2206,13 +2217,13 @@ impl Decode for Frames {
             return Err(Error::UnexpectedFrame(kind));
         }
         let Some((length, b)) = varint(input.get(a..).ok_or(Error::Frame)?) else { return Ok(Step::Need) };
-        if matches!(kind, 3 | 7 | 0x0d) && !(1..=8).contains(&length) {
-            return Err(Error::Frame);
-        }
         let length = usize::try_from(length).map_err(|_| Error::Limit)?;
         let limit = frame_payload_limit(kind);
         if length > limit {
             return Err(Error::Limit);
+        }
+        if matches!(kind, 3 | 7 | 0x0d) && !(1..=8).contains(&length) {
+            return Err(Error::Frame);
         }
         let used = a.checked_add(b).and_then(|header| header.checked_add(length)).ok_or(Error::Limit)?;
         let Some(bytes) = input.get(..used) else { return Ok(Step::Need) };
@@ -2359,16 +2370,18 @@ enum StreamKind {
 #[derive(Clone, Debug)]
 pub struct StreamDecoder {
     kind: StreamKind,
+    paused: bool,
+    deferred_end: bool,
 }
 
 impl StreamDecoder {
     /// Reads request or response frames without a unidirectional prefix.
     pub fn request() -> Self {
-        Self { kind: StreamKind::Frames }
+        Self { kind: StreamKind::Frames, paused: false, deferred_end: false }
     }
     /// Reads one unidirectional header and ends for a driver handoff.
     pub fn unidirectional() -> Self {
-        Self { kind: StreamKind::Header(StreamHeaders::new()) }
+        Self { kind: StreamKind::Header(StreamHeaders::new()), paused: false, deferred_end: false }
     }
     /// Selects the decoder for bytes after a complete stream header.
     /// Use [`codec::Stream::swap`] so unread bytes and EOF are preserved.
@@ -2380,29 +2393,16 @@ impl StreamDecoder {
             StreamHeader::QpackDecoder => StreamKind::Decoder,
             StreamHeader::Unknown(_) => StreamKind::Ignore,
         };
-        Self { kind }
+        Self { kind, paused: false, deferred_end: false }
     }
 }
 
 fn stream_step<T>(
-    step: Step<Result<T, Error>>,
-    wrap: impl FnOnce(T) -> StreamItem,
+    step: Step<T>,
+    wrap: impl FnOnce(T) -> Result<StreamItem, StreamError>,
 ) -> Step<Result<StreamItem, StreamError>> {
     match step {
-        Step::Item(item, used) => Step::Item(item.map(wrap).map_err(StreamError::Http3), used),
-        Step::Need => Step::Need,
-        Step::End => Step::End,
-        Step::Skip(n) => Step::Skip(n),
-    }
-}
-
-fn qpack_step<T>(
-    step: Step<Result<T, qpack::Error>>,
-    wrap: impl FnOnce(T) -> StreamItem,
-    error: fn(qpack::Error) -> StreamError,
-) -> Step<Result<StreamItem, StreamError>> {
-    match step {
-        Step::Item(item, used) => Step::Item(item.map(wrap).map_err(error), used),
+        Step::Item(item, used) => Step::Item(wrap(item), used),
         Step::Need => Step::Need,
         Step::End => Step::End,
         Step::Skip(n) => Step::Skip(n),
@@ -2425,15 +2425,19 @@ impl Decode for StreamDecoder {
     }
 
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Self::Item>, StreamError> {
+        if self.paused {
+            // End keeps the unread suffix for unpause's swap, even at capacity
+            // or after EOF. Need would instead report Stuck or Truncated.
+            return Ok(Step::End);
+        }
         Ok(match &mut self.kind {
-            StreamKind::Header(decoder) => match decoder.decode(input, eof)? {
-                Step::Item(header, used) => Step::Item(Ok(StreamItem::Header(header)), used),
-                Step::Need => Step::Need,
-                Step::End => Step::End,
-                Step::Skip(n) => Step::Skip(n),
-            },
-            StreamKind::Frames => stream_step(Frames.decode(input, eof)?, StreamItem::Frame),
-            StreamKind::Control(decoder) => stream_step(decoder.decode(input, eof)?, StreamItem::Frame),
+            StreamKind::Header(decoder) => {
+                stream_step(decoder.decode(input, eof)?, |header| Ok(StreamItem::Header(header)))
+            }
+            StreamKind::Frames => stream_step(Frames.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?))),
+            StreamKind::Control(decoder) => {
+                stream_step(decoder.decode(input, eof)?, |frame| Ok(StreamItem::Frame(frame?)))
+            }
             StreamKind::Encoder => {
                 if eof && input.is_empty() {
                     return Err(Error::ClosedCriticalStream.into());
@@ -2442,7 +2446,7 @@ impl Decode for StreamDecoder {
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream.into());
                 }
-                qpack_step(step, StreamItem::EncoderInstruction, StreamError::QpackEncoder)
+                stream_step(step, |item| item.map(StreamItem::EncoderInstruction).map_err(StreamError::QpackEncoder))
             }
             StreamKind::Decoder => {
                 if eof && input.is_empty() {
@@ -2452,7 +2456,7 @@ impl Decode for StreamDecoder {
                 if eof && matches!(step, Step::Need) {
                     return Err(Error::ClosedCriticalStream.into());
                 }
-                qpack_step(step, StreamItem::DecoderInstruction, StreamError::QpackDecoder)
+                stream_step(step, |item| item.map(StreamItem::DecoderInstruction).map_err(StreamError::QpackDecoder))
             }
             StreamKind::Ignore if input.is_empty() => Step::Need,
             StreamKind::Ignore => Step::Skip(input.len()),
@@ -2463,6 +2467,7 @@ impl Decode for StreamDecoder {
 
 /// Ordered QUIC stream input under one aggregate connection budget.
 ///
+/// This is an input owner, separate from the I/O [`super::Connection`] trait.
 /// Each stream has its own decoder inside [`codec::Demux`]. The constructor
 /// bounds both stream count and the sum of unread and decoder-held bytes.
 /// Buffers allocate as input arrives. Metadata and allocator overhead are
@@ -2480,6 +2485,9 @@ impl Decode for StreamDecoder {
 /// [`qpack::BlockedSections`]; their limits are separate from input.
 /// Use [`RequestState::step`] for request/push frame items, or
 /// [`HeaderList::from_fields`] for standalone received fields.
+/// On [`RequestResult::Blocked`], call [`Self::pause`] so later frames stay
+/// in the input budget. Retry the section and call [`RequestState::resume`],
+/// then [`Self::unpause`] when it is no longer blocked.
 /// Acknowledgments and insert increments come back as values to send.
 pub struct Connection {
     streams: codec::Demux<u64, StreamDecoder>,
@@ -2503,7 +2511,7 @@ impl Connection {
                     Endpoint::Server => 3,
                 };
                 if *id > MAX_VARINT || (!(*id).is_multiple_of(4) && *id % 4 != uni_sender) {
-                    StreamDecoder { kind: StreamKind::Invalid }
+                    StreamDecoder { kind: StreamKind::Invalid, paused: false, deferred_end: false }
                 } else if id.is_multiple_of(4) {
                     StreamDecoder::request()
                 } else {
@@ -2517,13 +2525,53 @@ impl Connection {
     /// suffix after this count. A zero count means no input currently fits.
     /// If draining makes no progress, reset/remove a stream to free its budget.
     /// After EOF or a terminal result, accepts and drops bytes like `Demux`.
+    /// Paused streams always return zero, including after [`Self::end`].
     #[must_use = "bytes past the returned count were not taken"]
     pub fn push(&mut self, stream: u64, bytes: &[u8]) -> usize {
+        if self.streams.get_mut(&stream).is_some_and(|stream| stream.decoder().paused) {
+            return 0;
+        }
         self.streams.push(&stream, bytes)
+    }
+    /// Stops an existing stream between items, retaining all unread bytes in
+    /// the shared budget. [`Self::push`] refuses its input and [`Self::next`]
+    /// yields nothing for it until [`Self::unpause`]. Other streams keep running.
+    /// Repeated pauses, absent keys, and completed or failed streams are unchanged.
+    pub fn pause(&mut self, stream: u64) {
+        if let Some(stream) = self.streams.get_mut(&stream)
+            && !stream.is_done()
+        {
+            stream.decoder().paused = true;
+        }
+    }
+    /// Resumes a paused stream and applies any EOF recorded while paused.
+    /// Buffered bytes and their offsets are preserved. Call after the blocked
+    /// section has been retried and accepted by [`RequestState::resume`].
+    /// Absent and unpaused keys are unchanged; terminal failures are not restarted.
+    pub fn unpause(&mut self, stream: u64) {
+        if let Some(stream) = self.streams.get_mut(&stream)
+            && stream.decoder().paused
+        {
+            let decoder = stream.decoder();
+            decoder.paused = false;
+            let end = core::mem::take(&mut decoder.deferred_end);
+            let next = decoder.clone();
+            Self::swap_stream(stream, next);
+            if end {
+                stream.end();
+            }
+        }
     }
     /// Marks EOF on an existing stream. Partial request/push units report
     /// truncation; any control or QPACK stream FIN is ClosedCriticalStream.
+    /// On a paused stream, records EOF for [`Self::unpause`] without decoding.
     pub fn end(&mut self, stream: u64) {
+        if let Some(stream) = self.streams.get_mut(&stream)
+            && stream.decoder().paused
+        {
+            stream.decoder().deferred_end = true;
+            return;
+        }
         self.streams.end(&stream);
     }
     /// Takes one item or terminal error, with its QUIC stream ID.
@@ -2539,10 +2587,14 @@ impl Connection {
             // is End, which consumes none of the already buffered payload.
             let _ = stream.next();
             let next = StreamDecoder::after_header(*header, self.sender);
-            let previous = core::mem::replace(stream, codec::Stream::new(StreamDecoder::unidirectional()));
-            *stream = previous.swap(next);
+            Self::swap_stream(stream, next);
         }
         Some((id, result))
+    }
+    fn swap_stream(stream: &mut codec::Stream<StreamDecoder>, next: StreamDecoder) {
+        // swap takes ownership; the temporary stream allocates no input buffer.
+        let previous = core::mem::replace(stream, codec::Stream::new(StreamDecoder::unidirectional()));
+        *stream = previous.swap(next);
     }
     /// The aggregate unread and decoder-held bytes across every stream.
     pub fn buffered(&self) -> usize {
