@@ -69,6 +69,20 @@ doc = false
 bench = false
 
 [[bin]]
+name = "http1_requests"
+path = "fuzz_targets/http1_requests.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "http1_responses"
+path = "fuzz_targets/http1_responses.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "proxy_socks5"
 path = "fuzz_targets/proxy_socks5.rs"
 test = false

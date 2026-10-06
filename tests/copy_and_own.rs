@@ -49,6 +49,8 @@ macro_rules! protocols {
         pub mod gre;
         #[path = "../src/stdlib/grpc.rs"]
         pub mod grpc;
+        #[path = "../src/stdlib/http1.rs"]
+        pub mod http1;
         #[path = "../src/stdlib/http3.rs"]
         pub mod http3;
         #[path = "../src/stdlib/iec104.rs"]
