@@ -272,6 +272,11 @@ fn line_len(proto: &str, software: &str, comments: Option<&str>) -> usize {
         .saturating_add(comments)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static LINE_BYTES_SCANNED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
 /// Whether [`parse_line`] would still return `Ok(None)` for `b`, given
 /// that its first `scanned` bytes hold no LF or NUL. Only the bytes after
 /// those are looked at.
@@ -283,7 +288,11 @@ fn line_pending(b: &[u8], scanned: usize) -> bool {
     };
     b.len() < limit
         && b.get(scanned..)
-            .is_some_and(|new| !new.iter().any(|&c| c == b'\n' || c == 0))
+            .is_some_and(|new| !new.iter().any(|&c| {
+                #[cfg(test)]
+                LINE_BYTES_SCANNED.with(|count| count.set(count.get().saturating_add(1)));
+                c == b'\n' || c == 0
+            }))
 }
 
 /// Whether `b` may be a protocol or software version: not empty, and
@@ -946,7 +955,7 @@ impl<'a> Reader<'a> {
         b.split(|&c| c == b',')
             .map(|name| {
                 if ok(name) {
-                    Ok(String::from_utf8_lossy(name).into_owned())
+                    String::from_utf8(name.to_vec()).map_err(|_| DecodeError::Name)
                 } else {
                     Err(DecodeError::Name)
                 }
@@ -1465,9 +1474,8 @@ impl Wire for Message {
             }
             Self::KexInit(k) => {
                 out.extend_from_slice(&k.cookie);
-                for (list, _) in k.lists() {
-                    let len =
-                        list.iter().map(String::len).sum::<usize>() + list.len().saturating_sub(1);
+                for (list, ok) in k.lists() {
+                    let len = list_len(list, ok)?;
                     write_list(out, list, len);
                 }
                 put_boolean(out, k.first_kex_packet_follows);
@@ -1970,6 +1978,7 @@ mod tests {
             );
         }
         let valid = NameList(names(&["aes@x.org", "b", "x@y"]));
+        assert!(valid.to_bytes().is_ok());
         contract::check_wire_value(&valid);
         assert_eq!(
             NameList(vec!["a".repeat(MAX_NAME); 600]).to_bytes(),
@@ -2304,7 +2313,10 @@ mod tests {
             .unwrap();
         let mut bytes = one.repeat(400_000);
         bytes.extend_from_slice(&one[..3]);
+        let started = std::time::Instant::now();
         let (events, failure) = decode_all(Events::after_version, &bytes);
+        // Allow slow test hosts while catching repeated scans or front removal.
+        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
         assert_eq!(events.len(), 400_000);
         assert_eq!(failure, Some(Fail::Truncated { unread: 3 }));
         assert!(matches!(
@@ -2324,6 +2336,7 @@ mod tests {
         bytes.extend_from_slice(b"SSH-2.0-x\r\n");
         let mut stream = Stream::new(Events::new());
         let mut banners = 0;
+        LINE_BYTES_SCANNED.with(|count| count.set(0));
         for part in chunks(&bytes, &[1]) {
             pump(&mut stream, part, |event| match event {
                 Event::Banner(text) => {
@@ -2337,12 +2350,23 @@ mod tests {
         }
         assert_eq!(banners, MAX_BANNER_LINES);
         assert_eq!(stream.buffered(), 0);
+        let scanned = LINE_BYTES_SCANNED.with(|count| count.get());
+        assert!(scanned <= bytes.len(), "scanned {scanned} bytes for {} input bytes", bytes.len());
     }
 
     #[test]
     fn fuzz_loop() {
         let mut g = Lcg::new(0x5eed);
         let base = stream();
+        let text = |g: &mut Lcg, max| {
+            let pool = ["é", "🙂", "\0", "SSH-", ",", " ", "x@y.z"];
+            let mut value = g.text(max);
+            for _ in 0..g.index(5) {
+                value.push_str(pool[g.index(pool.len())]);
+            }
+            value
+        };
+        let list = |g: &mut Lcg| (0..g.index(6)).map(|_| text(g, 80)).collect();
         for _ in 0..4000 {
             let mut bytes = if g.coin() { g.bytes(300) } else { base.clone() };
             mutate(&mut g, &mut bytes);
@@ -2361,18 +2385,26 @@ mod tests {
             let message = match g.index(7) {
                 0 => Message::Disconnect {
                     reason: DisconnectReason::Other(g.next() as u32),
-                    description: g.text(60),
-                    language: g.text(80),
+                    description: text(&mut g, 60),
+                    language: text(&mut g, 80),
                 },
                 1 => Message::Debug {
                     always_display: g.coin(),
-                    message: g.text(30),
-                    language: g.text(10),
+                    message: text(&mut g, 30),
+                    language: text(&mut g, 10),
                 },
-                2 => Message::ServiceRequest(g.text(100)),
+                2 => Message::ServiceRequest(text(&mut g, 100)),
                 3 => Message::KexInit(KexInit {
-                    kex_algorithms: (0..g.index(6)).map(|_| g.text(80)).collect(),
-                    languages_client_to_server: (0..g.index(6)).map(|_| g.text(80)).collect(),
+                    kex_algorithms: list(&mut g),
+                    server_host_key_algorithms: list(&mut g),
+                    encryption_client_to_server: list(&mut g),
+                    encryption_server_to_client: list(&mut g),
+                    mac_client_to_server: list(&mut g),
+                    mac_server_to_client: list(&mut g),
+                    compression_client_to_server: list(&mut g),
+                    compression_server_to_client: list(&mut g),
+                    languages_client_to_server: list(&mut g),
+                    languages_server_to_client: list(&mut g),
                     first_kex_packet_follows: g.coin(),
                     reserved: g.next() as u32,
                     ..KexInit::default()
@@ -2385,12 +2417,13 @@ mod tests {
                 _ => Message::Unimplemented(g.next() as u32),
             };
             contract::check_wire_value(&message);
+            contract::check_wire_value(&NameList(list(&mut g)));
             let packet = Packet {
                 payload: g.bytes(40),
                 padding: g.bytes(20),
             };
             contract::check_wire_value(&packet);
-            if let Ok(id) = Identification::new(&g.text(3), &g.text(10), Some(&g.text(3))) {
+            if let Ok(id) = Identification::new(&text(&mut g, 3), &text(&mut g, 10), Some(&text(&mut g, 3))) {
                 contract::check_wire_value(&id);
             }
             contract::check_wire_value(&Line::Banner(g.bytes(100)));

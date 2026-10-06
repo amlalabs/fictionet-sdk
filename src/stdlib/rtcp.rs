@@ -1462,6 +1462,18 @@ pub struct Frame(
     pub Vec<u8>,
 );
 
+impl Frame {
+    /// Places a packet in an RFC 4571 envelope. Refuses values its writer
+    /// refuses and payloads longer than [`MAX_FRAME`].
+    pub fn from_packet<P: Wire<WriteError = EncodeError>>(packet: &P) -> Result<Self, EncodeError> {
+        let bytes = packet.to_bytes()?;
+        if bytes.len() > MAX_FRAME {
+            return Err(EncodeError::Unwritable);
+        }
+        Ok(Self(bytes))
+    }
+}
+
 /// An RFC 4571 length prefix exceeds the configured payload limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameError {
@@ -2495,9 +2507,10 @@ mod tests {
             Frame(vec![0; MAX_FRAME + 1]).to_bytes(),
             Err(EncodeError::Unwritable)
         );
-        for e in [EncodeError::Unwritable, EncodeError::Unwritable] {
-            assert!(!e.to_string().is_empty());
-        }
+        assert_eq!(
+            EncodeError::Unwritable.to_string(),
+            "value cannot be written without changing it"
+        );
     }
 
     // RFC 7983 section 7 and RFC 5761 section 4.

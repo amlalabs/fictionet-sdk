@@ -644,7 +644,7 @@ fn snmp_body_error_keeps_stream_and_framing_error_ends_it() {
 }
 
 #[test]
-fn snmp_nonminimal_ber_headers_keep_their_existing_tolerance() {
+fn snmp_accepts_redundant_long_form_ber_lengths() {
     let message = snmp_message();
     let canonical = wire_bytes(&message);
     assert!(canonical[1] < 128);
@@ -664,6 +664,11 @@ fn snmp_nonminimal_ber_headers_keep_their_existing_tolerance() {
 
 #[test]
 fn snmp_wire_is_exact_and_transactional() {
+    assert!(snmp::Element::parse(&[snmp::tag::NULL, 0]).is_ok());
+    assert_eq!(
+        snmp::Element::parse(&[snmp::tag::NULL, 0, snmp::tag::NULL, 0]),
+        Err(snmp::Error::TrailingBytes)
+    );
     let message = snmp_message();
     let mut bytes = wire_bytes(&message);
     bytes.push(0);

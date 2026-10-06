@@ -21,7 +21,8 @@
 //! rest. Nothing in the bytes says which is in use, so the caller says
 //! with a [`Wrapping`] for [`Packet::parse_with`]. Writers use [`Packet`]
 //! for plain control, [`Authenticated`] for tls-auth, and [`Encrypted`]
-//! for tls-crypt. The module reads the wrapping's fields as they are. It neither checks the HMAC nor decrypts.
+//! for tls-crypt. The module reads the wrapping's fields as they are. It
+//! neither checks the HMAC nor decrypts.
 //!
 //! Nothing here reads a socket. A world that plays an OpenVPN server pushes
 //! TCP bytes through [`Stream<Frames>`](super::codec::Stream), or takes each
@@ -785,6 +786,8 @@ impl Wire for Frame {
 
 /// A packet using tls-auth with a fixed HMAC length.
 /// The HMAC is carried as bytes and is not verified.
+/// Control packets require a matching HMAC length from 0 through [`MAX_HMAC_LEN`].
+/// Select the wire type for the connection's configured length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Authenticated<const HMAC_LEN: usize>(
     /// The packet whose control fields use this HMAC length.
@@ -810,7 +813,7 @@ fn write_packet(packet: &Packet, wrapping: Wrapping, out: &mut Vec<u8>) -> Resul
 }
 
 macro_rules! packet_wire {
-    ($ty:ty, $wrapping:expr, $wrap:expr, $get:ident $(, $n:ident)?) => {
+    ($ty:ty, $wrapping:expr, $wrap:expr, |$packet:ident| $get:expr $(, $n:ident)?) => {
         impl $(<const $n: usize>)? Wire for $ty {
             type ParseError = Error;
             type WriteError = EncodeError;
@@ -824,35 +827,21 @@ macro_rules! packet_wire {
             /// Appends one datagram. Refuses incompatible wrapping, invalid IDs,
             /// acknowledgements, ciphertext layout, or a length over [`MAX_PACKET`].
             fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-                write_packet(self.$get(), $wrapping, out)
+                let $packet = self;
+                write_packet($get, $wrapping, out)
             }
         }
     };
 }
-impl Packet {
-    fn packet(&self) -> &Packet {
-        self
-    }
-}
-impl<const N: usize> Authenticated<N> {
-    fn packet(&self) -> &Packet {
-        &self.0
-    }
-}
-impl Encrypted {
-    fn packet(&self) -> &Packet {
-        &self.0
-    }
-}
-packet_wire!(Packet, Wrapping::None, |p| p, packet);
+packet_wire!(Packet, Wrapping::None, |p| p, |p| p);
 packet_wire!(
     Authenticated<N>,
     Wrapping::TlsAuth { hmac_len: N },
     Self,
-    packet,
+    |p| &p.0,
     N
 );
-packet_wire!(Encrypted, Wrapping::TlsCrypt, Self, packet);
+packet_wire!(Encrypted, Wrapping::TlsCrypt, Self, |p| &p.0);
 
 impl Frame {
     /// Places a packet in a TCP envelope. Refuses any value its writer refuses.
@@ -941,12 +930,21 @@ mod tests {
         match packet.wrapping() {
             Wrapping::None => packet.to_bytes(),
             Wrapping::TlsCrypt => Encrypted(packet.clone()).to_bytes(),
-            Wrapping::TlsAuth { hmac_len } => match hmac_len {
-                0 => Authenticated::<0>(packet.clone()).to_bytes(),
-                20 => Authenticated::<20>(packet.clone()).to_bytes(),
-                32 => Authenticated::<32>(packet.clone()).to_bytes(),
-                64 => Authenticated::<64>(packet.clone()).to_bytes(),
-                _ => Err(EncodeError::Unwritable),
+            Wrapping::TlsAuth { hmac_len } => {
+                macro_rules! authenticated {
+                    ($($n:literal),*) => {
+                        match hmac_len {
+                            $($n => Authenticated::<$n>(packet.clone()).to_bytes(),)*
+                            _ => Err(EncodeError::Unwritable),
+                        }
+                    };
+                }
+                authenticated!(
+                    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                    16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+                    32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+                    48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64
+                )
             },
         }
     }
@@ -1484,10 +1482,32 @@ mod tests {
     #[test]
     fn stream_takes_many_small_packets_in_linear_time() {
         let bytes = Frame(vec![0x30, 1]).to_bytes().unwrap().repeat(200_000);
+        let started = std::time::Instant::now();
         let (items, error) = decode_all(Frames::new, &bytes);
+        // Allow slow test hosts while catching repeated scans or front removal.
+        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
         assert_eq!(error, None);
         assert_eq!(items.len(), 200_000);
         assert!(items.iter().all(|p| p.0 == [0x30, 1]));
+    }
+
+    #[test]
+    fn authenticated_writes_every_supported_hmac_length() {
+        for hmac_len in 0..=MAX_HMAC_LEN {
+            let packet = plain(ControlKind::ControlV1, Control {
+                session_id: CLIENT_SID,
+                tls_auth: Some(TlsAuth {
+                    hmac: vec![0x5a; hmac_len],
+                    packet_id: 1,
+                    net_time: 2,
+                }),
+                ack: None,
+                message_id: 3,
+                payload: vec![4],
+            });
+            let bytes = wire(&packet).unwrap();
+            assert_eq!(Packet::parse_with(&bytes, packet.wrapping()), Ok(packet));
+        }
     }
 
     #[test]
@@ -1540,7 +1560,7 @@ mod tests {
             let kind = ControlKind::ALL[rng.index(9)];
             let key_id = rng.index(10) as u8;
             let ids: Vec<u32> = (0..rng.index(11)).map(|_| rng.next() as u32).collect();
-            let hmac_len = [0, 20, 32, 64, 65][rng.index(5)];
+            let hmac_len = rng.index(MAX_HMAC_LEN + 2);
             let payload_len = rng.index(50);
             let message_id = if rng.coin() { 0 } else { rng.next() as u32 };
             let c = Control {

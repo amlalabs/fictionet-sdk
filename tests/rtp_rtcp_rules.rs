@@ -46,6 +46,31 @@ fn refuses(body: Body) {
 }
 
 #[test]
+fn rtp_rtcp_and_frames_share_the_write_error() {
+    fn framed<P: Wire<WriteError = rtp::EncodeError>>(packet: &P) -> Result<Vec<u8>, rtp::EncodeError> {
+        let frame = rtp::Frame::from_packet(packet)?;
+        let mut bytes = Vec::new();
+        frame.write(&mut bytes)?;
+        Ok(bytes)
+    }
+    let media = rtp::RtpPacket {
+        marker: false, payload_type: 96, sequence: 1, timestamp: 2, ssrc: 3,
+        csrcs: vec![], extension: None, payload: vec![4], padding: 0,
+    };
+    for (bytes, packet) in [
+        (framed(&media).unwrap(), rtp::Packet::Rtp(media)),
+        (framed(&report()).unwrap(), rtp::Packet::Rtcp(Datagram(vec![report()]))),
+    ] {
+        let frame = rtp::Frame::parse(&bytes).unwrap();
+        assert_eq!(rtp::Packet::parse(&frame.0), Ok(packet.clone()));
+        assert_eq!(framed(&packet).unwrap(), bytes);
+    }
+    let mut invalid = report();
+    invalid.padding = 1;
+    assert_eq!(framed(&invalid), Err(rtp::EncodeError::Unwritable));
+}
+
+#[test]
 fn rtcp_errors() {
     assert_eq!(Datagram::parse(&[0x80]), Err(ParseError::Truncated));
     assert_eq!(
@@ -121,6 +146,42 @@ fn rtcp_errors() {
 }
 
 #[test]
+fn rtp_demux_checks_typed_feedback_and_xr_layouts() {
+    for (pt, fmt, body) in [
+        (205, 3, vec![0; 8]), // TMMBR needs an entry.
+        (205, 3, vec![0; 12]), // TMMBR and TMMBN entries occupy two words.
+        (205, 4, vec![0; 12]),
+        (206, 4, vec![0; 8]), // FIR needs a two-word entry.
+        (206, 4, vec![0; 12]),
+        (206, 15, [vec![0; 8], b"REMB".to_vec()].concat()),
+        (207, 0, vec![]), // XR needs an SSRC.
+        (207, 0, vec![0, 0, 0, 1, 4, 0, 0, 0]), // RRT needs two words.
+    ] {
+        let mut bytes = vec![0x80 | fmt, pt, 0, (body.len() / 4) as u8];
+        bytes.extend_from_slice(&body);
+        assert_eq!(
+            rtp::Packet::parse(&bytes),
+            Err(rtp::PacketError::Rtcp(ParseError::Malformed(pt)))
+        );
+    }
+    for padding_bits in [31, 32, 48] {
+        let mut bytes = vec![0x83, 206, 0, 4, 0, 0, 0, 1, 0, 0, 0, 2, padding_bits, 96];
+        bytes.extend([0; 6]);
+        assert_eq!(rtp::Packet::parse(&bytes).is_ok(), padding_bits < 32);
+    }
+    let mut remb = Packet::from(Body::PayloadFeedback(PayloadFeedback {
+        sender_ssrc: 1,
+        media_ssrc: 0,
+        message: PayloadMessage::Remb(Remb { exponent: 0, mantissa: 1, ssrcs: vec![2] }),
+    })).to_bytes().unwrap();
+    assert!(rtp::Packet::parse(&remb).is_ok());
+    remb[0] |= 0x20;
+    remb[3] += 1;
+    remb.extend([0, 0, 0, 4]);
+    assert_eq!(rtp::Packet::parse(&remb), Err(rtp::PacketError::Rtcp(ParseError::Malformed(206))));
+}
+
+#[test]
 fn sender_report_bytes() {
     let sr = Packet::from(Body::SenderReport(SenderReport {
         ssrc: 0x0102_0304,
@@ -173,10 +234,12 @@ fn sdes_bye_app_bytes() {
         [0x81, 203, 0, 2, 0, 0, 0, 1, 3, b'b', b'y', b'e']
     );
     for reason in [None, Some(vec![])] {
-        contract::check_wire_value(&Packet::from(Body::Bye(Bye {
+        let bye = Packet::from(Body::Bye(Bye {
             sources: vec![],
             reason,
-        })));
+        }));
+        assert!(bye.to_bytes().is_ok());
+        contract::check_wire_value(&bye);
     }
     assert_eq!(
         Packet::from(Body::Bye(Bye {
@@ -242,10 +305,12 @@ fn feedback_bytes() {
     }));
     assert_eq!(&rpsi.to_bytes().unwrap()[12..], &[11, 96, 0xf8, 0]);
     contract::check_wire_value(&rpsi);
-    contract::check_wire_value(&transport(TransportMessage::Other {
+    let other = transport(TransportMessage::Other {
         fmt: 15,
         fci: vec![1, 2, 3, 4],
-    }));
+    });
+    assert!(other.to_bytes().is_ok());
+    contract::check_wire_value(&other);
     // FMT 3 has the TMMBR layout in the shared implementation.
     assert_eq!(
         transport(TransportMessage::Other {
@@ -276,6 +341,7 @@ fn compound_round_trip_and_truncated_prefixes() {
     ];
     let compound = Compound(packets.clone());
     let bytes = compound.to_bytes().unwrap();
+    assert_eq!(bytes, Datagram(packets.clone()).to_bytes().unwrap());
     assert_eq!(Compound::parse(&bytes), Ok(compound));
     assert_eq!(
         rtp::Packet::parse(&bytes),
@@ -353,13 +419,21 @@ fn compound_rules_and_cname_order() {
         Compound::parse(&Datagram(late).to_bytes().unwrap()),
         Err(ParseError::Compound(CompoundError::FeedbackOrder))
     );
-    contract::check_wire_value(&Compound(vec![
+    let valid = Compound(vec![
         report(),
         report(),
         no_cname,
         cname(),
         payload(PayloadMessage::Pli),
-    ]));
+    ]);
+    assert!(valid.to_bytes().is_ok());
+    contract::check_wire_value(&valid);
+    for late in [report(), cname()] {
+        let packets = vec![report(), cname(), payload(PayloadMessage::Pli), late];
+        let bytes = Datagram(packets.clone()).to_bytes().unwrap();
+        assert_eq!(Compound::parse(&bytes), Err(ParseError::Compound(CompoundError::FeedbackOrder)));
+        assert_eq!(Compound(packets).to_bytes(), Err(EncodeError::Unwritable));
+    }
     let mut chunks = vec![
         SdesChunk {
             ssrc: 9,
@@ -584,10 +658,12 @@ fn long_text_is_refused_without_cutting_characters() {
         }));
     }
     for text in ["é".repeat(127).into_bytes(), b"abc".to_vec()] {
-        contract::check_wire_value(&Packet::from(Body::Bye(Bye {
+        let bye = Packet::from(Body::Bye(Bye {
             sources: vec![1],
             reason: Some(text),
-        })));
+        }));
+        assert!(bye.to_bytes().is_ok());
+        contract::check_wire_value(&bye);
     }
 }
 
@@ -615,11 +691,13 @@ fn priv_prefix_length_is_checked() {
             }],
         }]));
     }
-    contract::check_wire_value(&Packet::from(Body::SourceDescription(vec![SdesChunk {
+    let valid = Packet::from(Body::SourceDescription(vec![SdesChunk {
         ssrc: 1,
         items: vec![SdesItem {
             kind: sdes::PRIV,
             text: b"\x01ab".to_vec(),
         }],
-    }])));
+    }]));
+    assert!(valid.to_bytes().is_ok());
+    contract::check_wire_value(&valid);
 }

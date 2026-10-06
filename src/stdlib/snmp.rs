@@ -89,51 +89,51 @@ pub const SNMP_TRAP_OID_0: &[u32] = &[1, 3, 6, 1, 6, 3, 1, 1, 4, 1, 0];
 
 /// BER tags this module reads and writes.
 pub mod tag {
-    /// Integer tag.
+    /// INTEGER tag.
     pub const INTEGER: u8 = 0x02;
-    /// Octet string tag.
+    /// OCTET STRING tag.
     pub const OCTET_STRING: u8 = 0x04;
-    /// Null tag.
+    /// NULL tag.
     pub const NULL: u8 = 0x05;
-    /// Object identifier tag.
+    /// OBJECT IDENTIFIER tag.
     pub const OBJECT_IDENTIFIER: u8 = 0x06;
-    /// Sequence tag.
+    /// SEQUENCE tag.
     pub const SEQUENCE: u8 = 0x30;
-    /// Ip address tag.
+    /// IpAddress tag.
     pub const IP_ADDRESS: u8 = 0x40;
     /// Counter32 tag.
     pub const COUNTER32: u8 = 0x41;
     /// Gauge32 tag.
     pub const GAUGE32: u8 = 0x42;
-    /// Time ticks tag.
+    /// TimeTicks tag.
     pub const TIME_TICKS: u8 = 0x43;
     /// Opaque tag.
     pub const OPAQUE: u8 = 0x44;
     /// Counter64 tag.
     pub const COUNTER64: u8 = 0x46;
-    /// No such object tag.
+    /// noSuchObject tag.
     pub const NO_SUCH_OBJECT: u8 = 0x80;
-    /// No such instance tag.
+    /// noSuchInstance tag.
     pub const NO_SUCH_INSTANCE: u8 = 0x81;
-    /// End of mib view tag.
+    /// endOfMibView tag.
     pub const END_OF_MIB_VIEW: u8 = 0x82;
-    /// Get request tag.
+    /// GetRequest-PDU tag.
     pub const GET_REQUEST: u8 = 0xa0;
-    /// Get next request tag.
+    /// GetNextRequest-PDU tag.
     pub const GET_NEXT_REQUEST: u8 = 0xa1;
-    /// Response tag.
+    /// Response-PDU tag.
     pub const RESPONSE: u8 = 0xa2;
-    /// Set request tag.
+    /// SetRequest-PDU tag.
     pub const SET_REQUEST: u8 = 0xa3;
-    /// Trap v1 tag.
+    /// Trap-PDU (SNMP v1) tag.
     pub const TRAP_V1: u8 = 0xa4;
-    /// Get bulk request tag.
+    /// GetBulkRequest-PDU tag.
     pub const GET_BULK_REQUEST: u8 = 0xa5;
-    /// Inform request tag.
+    /// InformRequest-PDU tag.
     pub const INFORM_REQUEST: u8 = 0xa6;
-    /// Trap v2 tag.
+    /// SNMPv2-Trap-PDU tag.
     pub const TRAP_V2: u8 = 0xa7;
-    /// Report tag.
+    /// Report-PDU tag.
     pub const REPORT: u8 = 0xa8;
     /// Set in a tag whose content is more elements.
     pub const CONSTRUCTED: u8 = 0x20;
@@ -488,84 +488,6 @@ pub enum OidError {
     Syntax,
 }
 
-impl Wire for Oid {
-    type ParseError = Error;
-    type WriteError = Error;
-
-    /// Reads BER object identifier content without its tag or length.
-    /// Refuses empty, nonminimal, unfinished, oversized, or excess arcs.
-    /// Every arc fits 32 bits. The first sub-identifier combines two arcs
-    /// and may reach 2^32 - 1 + 80 under a first arc of 2.
-    fn parse(content: &[u8]) -> Result<Oid, Error> {
-        if content.is_empty() {
-            return Err(Error::Oid);
-        }
-        let mut arcs = Vec::new();
-        let mut v: u64 = 0;
-        let mut fresh = true;
-        for &b in content {
-            if fresh && b == 0x80 {
-                return Err(Error::Oid);
-            }
-            let limit = if arcs.is_empty() {
-                u64::from(u32::MAX) + 80
-            } else {
-                u64::from(u32::MAX)
-            };
-            v = (v << 7) | u64::from(b & 0x7f);
-            if v > limit {
-                return Err(Error::Oid);
-            }
-            fresh = b & 0x80 == 0;
-            if fresh {
-                if arcs.is_empty() {
-                    let first = (v / 40).min(2);
-                    arcs.push(first as u32);
-                    // At most u32::MAX by the limit above.
-                    arcs.push((v - 40 * first) as u32);
-                } else {
-                    arcs.push(v as u32);
-                }
-                if arcs.len() > MAX_OID_ARCS {
-                    return Err(Error::Oid);
-                }
-                v = 0;
-            }
-        }
-        if !fresh {
-            return Err(Error::Oid);
-        }
-        Ok(Oid(arcs))
-    }
-
-    /// Appends BER object identifier content. Construction checks every
-    /// arc; this refuses allocation failure without changing `out`.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.try_reserve_exact(self.content_len())
-            .map_err(|_| Error::Unwritable)?;
-        // The invariant on the first two arcs keeps this below 2^33, which
-        // five groups of 7 bits hold.
-        let first = u64::from(self.0[0]) * 40 + u64::from(self.0[1]);
-        for v in std::iter::once(first).chain(self.0[2..].iter().map(|&a| u64::from(a))) {
-            let mut groups = [0u8; 5];
-            let mut n = 0;
-            let mut x = v;
-            loop {
-                groups[n] = (x & 0x7f) as u8;
-                n += 1;
-                x >>= 7;
-                if x == 0 {
-                    break;
-                }
-            }
-            for i in (0..n).rev() {
-                out.push(groups[i] | if i > 0 { 0x80 } else { 0 });
-            }
-        }
-        Ok(())
-    }
-}
-
 impl fmt::Display for OidError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -627,6 +549,80 @@ impl Oid {
             .chain(self.0[2..].iter().map(|&a| u64::from(a)))
             .map(|v| ((64 - v.leading_zeros()).max(1) as usize).div_ceil(7))
             .sum()
+    }
+}
+
+impl Wire for Oid {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads BER object identifier content without its tag or length.
+    /// Refuses empty, nonminimal, unfinished, oversized, or excess arcs.
+    /// Every arc fits 32 bits. The first sub-identifier combines two arcs
+    /// and may reach 2^32 - 1 + 80 under a first arc of 2.
+    fn parse(content: &[u8]) -> Result<Oid, Error> {
+        if content.is_empty() {
+            return Err(Error::Oid);
+        }
+        let mut arcs = Vec::new();
+        let mut v: u64 = 0;
+        let mut fresh = true;
+        for &b in content {
+            if fresh && b == 0x80 {
+                return Err(Error::Oid);
+            }
+            let limit = if arcs.is_empty() { u64::from(u32::MAX) + 80 } else { u64::from(u32::MAX) };
+            v = (v << 7) | u64::from(b & 0x7f);
+            if v > limit {
+                return Err(Error::Oid);
+            }
+            fresh = b & 0x80 == 0;
+            if fresh {
+                if arcs.is_empty() {
+                    let first = (v / 40).min(2);
+                    arcs.push(first as u32);
+                    // At most u32::MAX by the limit above.
+                    arcs.push((v - 40 * first) as u32);
+                } else {
+                    arcs.push(v as u32);
+                }
+                if arcs.len() > MAX_OID_ARCS {
+                    return Err(Error::Oid);
+                }
+                v = 0;
+            }
+        }
+        if !fresh {
+            return Err(Error::Oid);
+        }
+        Ok(Oid(arcs))
+    }
+
+    /// Appends BER object identifier content. Construction checks every
+    /// arc; this refuses allocation failure without changing `out`.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        out.try_reserve_exact(self.content_len())
+            .map_err(|_| Error::Unwritable)?;
+        // The invariant on the first two arcs keeps this below 2^33, which
+        // five groups of 7 bits hold.
+        let first = u64::from(self.0[0]) * 40 + u64::from(self.0[1]);
+        for v in std::iter::once(first).chain(self.0[2..].iter().map(|&a| u64::from(a))) {
+            let mut groups = [0u8; 5];
+            let mut n = 0;
+            let mut x = v;
+            loop {
+                groups[n] = (x & 0x7f) as u8;
+                n += 1;
+                x >>= 7;
+                if x == 0 {
+                    break;
+                }
+            }
+            for i in (0..n).rev() {
+                out.push(groups[i] | if i > 0 { 0x80 } else { 0 });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1356,7 +1352,7 @@ pub struct Message {
 }
 
 impl Message {
-    /// How many bytes [`Message::to_bytes`] would write, or `usize::MAX`
+    /// How many bytes [`Wire::write`] would write, or `usize::MAX`
     /// if that does not fit in a `usize`. It allocates nothing in
     /// proportion to the bindings' size. An agent answering GetBulk uses
     /// it to drop rounds of bindings until the response fits the size it
@@ -1547,7 +1543,8 @@ const MAX_BER_HEADER: usize = 128;
 /// when the configured limit is smaller. The header suffices to refuse
 /// an oversized message before its body arrives. Partial messages return
 /// [`Step::Need`], including at EOF, so [`super::codec::Stream`] reports
-/// truncation. The existing BER tolerance and version policy are preserved.
+/// truncation. Redundant long-form BER lengths are accepted. Message bodies
+/// must use SNMP v1 or v2c.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
     limit: usize,
@@ -2187,11 +2184,14 @@ mod tests {
         let bytes = [0x30, 0].repeat(count);
         let mut stream = Stream::new(Frames::new());
         let mut got = 0;
+        let started = std::time::Instant::now();
         pump(&mut stream, &bytes, |item| {
             assert_eq!(item, Err(Error::Truncated));
             got += 1;
         })
         .unwrap();
+        // Allow slow test hosts while catching repeated scans or front removal.
+        assert!(started.elapsed().as_secs() < 20, "took {:?}", started.elapsed());
         assert_eq!(got, count);
         assert_eq!(stream.buffered(), 0);
         let message = Message::parse(&GET_SYS_DESCR).unwrap();

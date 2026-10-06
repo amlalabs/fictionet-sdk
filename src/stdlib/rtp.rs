@@ -60,6 +60,8 @@ pub const TWO_BYTE_PROFILE: u16 = 0x1000;
 
 use super::{codec::Wire, rtcp};
 
+/// The shared error for RTP, RTCP, and RFC 4571 values that cannot be written.
+pub use super::rtcp::EncodeError;
 /// The shared RFC 4571 envelope, including null frames.
 pub use super::rtcp::Frame;
 /// A shared RFC 4571 payload length error.
@@ -165,24 +167,6 @@ impl std::fmt::Display for RtpError {
 }
 
 impl std::error::Error for RtpError {}
-
-/// An RTP packet cannot be written without changing its value.
-///
-/// A field exceeds its wire range or [`MAX_PACKET`], an extension element
-/// would be omitted, or an extension would parse as another variant.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum EncodeError {
-    /// The value cannot be represented without changing it.
-    Unwritable,
-}
-
-impl core::fmt::Display for EncodeError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("value cannot be written without changing it")
-    }
-}
-
-impl core::error::Error for EncodeError {}
 
 impl Wire for RtpPacket {
     type ParseError = RtpError;
@@ -478,7 +462,7 @@ impl Wire for Packet {
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let bytes = match self {
             Self::Rtp(p) => p.to_bytes()?,
-            Self::Rtcp(p) => p.to_bytes().map_err(|_| EncodeError::Unwritable)?,
+            Self::Rtcp(p) => p.to_bytes()?,
         };
         if is_rtcp(&bytes) != matches!(self, Self::Rtcp(_)) {
             return Err(EncodeError::Unwritable);
@@ -901,6 +885,7 @@ mod tests {
             id: 14,
             data: vec![0; 16],
         }]));
+        assert!(p.to_bytes().is_ok());
         contract::check_wire_value(&p);
         for (app_bits, element) in [
             (
@@ -953,61 +938,130 @@ mod tests {
 
     #[test]
     fn stream_splits_packets_and_null_frames() {
-        let a = rtp(&[1]).to_bytes().unwrap();
+        let a = Frame::from_packet(&rtp(&[1])).unwrap();
         let bytes = [
             Frame(vec![]).to_bytes().unwrap(),
-            Frame(a.clone()).to_bytes().unwrap(),
+            a.to_bytes().unwrap(),
             Frame(vec![]).to_bytes().unwrap(),
         ]
         .concat();
         contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (MAX_PACKET + 2));
         let (items, error) = decode_all(Frames::new, &bytes);
         assert_eq!(error, None);
-        assert_eq!(items, [Frame(vec![]), Frame(a.clone()), Frame(vec![])]);
+        assert_eq!(items, [Frame(vec![]), a.clone(), Frame(vec![])]);
         assert_eq!(Packet::parse(&items[1].0), Ok(Packet::Rtp(rtp(&[1]))));
         let large = Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
         contract::check_decode_with_alloc_limit(Frames::new, &large, 2 * (MAX_PACKET + 2));
         assert_eq!(
             Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
-            Err(rtcp::EncodeError::Unwritable)
+            Err(EncodeError::Unwritable)
         );
-        let many = Frame(a).to_bytes().unwrap().repeat(200_000);
+        let many = a.to_bytes().unwrap().repeat(200_000);
+        let started = std::time::Instant::now();
         let (items, error) = decode_all(Frames::new, &many);
+        // Allow slow test hosts while catching repeated scans or front removal.
+        assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
         assert_eq!(items.len(), 200_000);
         assert_eq!(error, None);
     }
 
     #[test]
     fn fuzz_parsers_and_writers() {
+        use rtcp::{Body, SenderReport, ReceiverReport, SdesChunk, SdesItem, Bye, App,
+            TransportFeedback, TransportMessage, Nack, PayloadFeedback, PayloadMessage,
+            ExtendedReport, XrBlock};
+
+        let control = rtcp::Compound(vec![
+            Body::SenderReport(SenderReport {
+                ssrc: 1, ntp_timestamp: 2, rtp_timestamp: 3, packet_count: 4,
+                octet_count: 5, reports: vec![], extension: vec![],
+            }).into(),
+            Body::ReceiverReport(ReceiverReport {
+                ssrc: 1, reports: vec![], extension: vec![],
+            }).into(),
+            Body::SourceDescription(vec![SdesChunk {
+                ssrc: 1, items: vec![SdesItem { kind: rtcp::sdes::CNAME, text: b"a@b".to_vec() }],
+            }]).into(),
+            Body::App(App { subtype: 3, ssrc: 1, name: *b"TEST", data: vec![0; 4] }).into(),
+            Body::TransportFeedback(TransportFeedback {
+                sender_ssrc: 1, media_ssrc: 2,
+                message: TransportMessage::Nack(vec![Nack { pid: 3, blp: 5 }]),
+            }).into(),
+            Body::PayloadFeedback(PayloadFeedback {
+                sender_ssrc: 1, media_ssrc: 2, message: PayloadMessage::Pli,
+            }).into(),
+            Body::ExtendedReport(ExtendedReport {
+                ssrc: 1, blocks: vec![XrBlock::receiver_reference_time(2)],
+            }).into(),
+            Body::Other { packet_type: 208, count: 3, data: vec![1; 4] }.into(),
+            Body::Bye(Bye { sources: vec![1], reason: Some(b"bye".to_vec()) }).into(),
+        ]);
+        let mut seeds = vec![control.to_bytes().unwrap()];
+        seeds.extend(control.0.iter().map(|packet| packet.to_bytes().unwrap()));
+        for extension in [
+            None,
+            Some(HeaderExtension::OneByte(vec![
+                Element { id: 1, data: vec![2] }, Element { id: 14, data: vec![3; 16] },
+            ])),
+            Some(HeaderExtension::TwoByte { app_bits: 7, elements: vec![
+                Element { id: 1, data: vec![] }, Element { id: 255, data: vec![4; 255] },
+            ] }),
+            Some(HeaderExtension::Other { profile: 123, data: vec![5; 8] }),
+        ] {
+            let mut packet = rtp(&[1, 2, 3]);
+            packet.extension = extension;
+            seeds.push(packet.to_bytes().unwrap());
+        }
+        for seed in &seeds {
+            assert!(Packet::parse(seed).is_ok());
+            contract::check_wire::<Packet>(seed);
+        }
+        let stream: Vec<u8> = seeds.iter()
+            .flat_map(|bytes| Frame(bytes.clone()).to_bytes().unwrap()).collect();
+        seeds.push(stream);
         let mut rng = Lcg::new(42);
         for _ in 0..5_000 {
-            let mut bytes = rng.bytes(200);
+            let mut bytes = if rng.coin() {
+                rng.bytes(200)
+            } else {
+                seeds[rng.index(seeds.len())].clone()
+            };
             for _ in 0..2 {
+                if rng.index(4) != 0 && let Some(first) = bytes.first_mut() {
+                    *first = (*first & 0x3f) | (VERSION << 6);
+                }
                 contract::check_wire::<RtpPacket>(&bytes);
                 contract::check_wire::<Packet>(&bytes);
                 contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (MAX_PACKET + 2));
                 mutate(&mut rng, &mut bytes);
             }
             let mut p = rtp(&rng.bytes(40));
+            if rng.index(100) == 0 {
+                p.payload = vec![0; MAX_PACKET + 1];
+            }
             p.marker = rng.coin();
             p.payload_type = rng.next() as u8;
             p.csrcs = (0..rng.index(20)).map(|_| rng.next() as u32).collect();
             p.padding = rng.next() as u8;
             p.extension = match rng.index(4) {
                 0 => None,
-                1 => Some(HeaderExtension::OneByte(vec![Element {
+                1 => Some(HeaderExtension::OneByte((0..rng.index(8)).map(|_| Element {
                     id: rng.index(17) as u8,
                     data: rng.bytes(20),
-                }])),
+                }).collect())),
                 2 => Some(HeaderExtension::TwoByte {
                     app_bits: rng.index(20) as u8,
-                    elements: vec![Element {
+                    elements: (0..rng.index(8)).map(|_| Element {
                         id: rng.next() as u8,
                         data: rng.bytes(260),
-                    }],
+                    }).collect(),
                 }),
                 _ => Some(HeaderExtension::Other {
-                    profile: rng.next() as u16,
+                    profile: match rng.index(3) {
+                        0 => ONE_BYTE_PROFILE,
+                        1 => TWO_BYTE_PROFILE | rng.index(16) as u16,
+                        _ => rng.next() as u16,
+                    },
                     data: rng.bytes(24),
                 }),
             };
