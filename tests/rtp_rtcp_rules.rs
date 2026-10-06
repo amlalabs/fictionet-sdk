@@ -1,7 +1,7 @@
 //! RTCP protocol cases moved from the former RTP control-packet implementation.
 use fictionet::stdlib::{
     codec::{Wire, contract},
-    rtcp::*,
+    rtcp::{self, *},
     rtp,
 };
 
@@ -47,8 +47,8 @@ fn refuses(body: Body) {
 
 #[test]
 fn rtp_rtcp_and_frames_share_the_write_error() {
-    fn framed<P: Wire<WriteError = rtp::EncodeError>>(packet: &P) -> Result<Vec<u8>, rtp::EncodeError> {
-        let frame = rtp::Frame::from_packet(packet)?;
+    fn framed<P: Wire<WriteError = rtcp::EncodeError>>(packet: &P) -> Result<Vec<u8>, rtcp::EncodeError> {
+        let frame = rtcp::Frame::from_packet(packet)?;
         let mut bytes = Vec::new();
         frame.write(&mut bytes)?;
         Ok(bytes)
@@ -61,13 +61,13 @@ fn rtp_rtcp_and_frames_share_the_write_error() {
         (framed(&media).unwrap(), rtp::Packet::Rtp(media)),
         (framed(&report()).unwrap(), rtp::Packet::Rtcp(Datagram(vec![report()]))),
     ] {
-        let frame = rtp::Frame::parse(&bytes).unwrap();
+        let frame = rtcp::Frame::parse(&bytes).unwrap();
         assert_eq!(rtp::Packet::parse(&frame.0), Ok(packet.clone()));
         assert_eq!(framed(&packet).unwrap(), bytes);
     }
     let mut invalid = report();
     invalid.padding = 1;
-    assert_eq!(framed(&invalid), Err(rtp::EncodeError::Unwritable));
+    assert_eq!(framed(&invalid), Err(rtcp::EncodeError::Unwritable));
 }
 
 #[test]
@@ -325,9 +325,39 @@ fn feedback_bytes() {
 #[test]
 fn compound_round_trip_and_truncated_prefixes() {
     let packets = vec![
+        Packet::from(Body::SenderReport(SenderReport {
+            ssrc: 1,
+            ntp_timestamp: 0xe000_0000_8000_0000,
+            rtp_timestamp: 160,
+            packet_count: 2,
+            octet_count: 320,
+            reports: vec![ReportBlock {
+                ssrc: 2,
+                fraction_lost: 64,
+                cumulative_lost: -1,
+                highest_sequence: 0x0001_0005,
+                jitter: 7,
+                last_sr: 0x1234_5678,
+                delay_since_last_sr: 0x0001_0000,
+            }],
+            extension: vec![1, 2, 3, 4],
+        })),
         report(),
         cname(),
+        Packet::from(Body::App(App {
+            subtype: 3,
+            ssrc: 1,
+            name: *b"test",
+            data: vec![1, 2, 3, 4],
+        })),
         payload(PayloadMessage::Pli),
+        payload(PayloadMessage::Sli(vec![Sli { first: 1, number: 2, picture_id: 3 }])),
+        payload(PayloadMessage::Rpsi(Rpsi {
+            padding_bits: 11,
+            payload_type: 96,
+            data: vec![0xf8, 0],
+        })),
+        payload(PayloadMessage::Other { fmt: 8, fci: vec![1, 2, 3, 4] }),
         transport(TransportMessage::Nack(vec![Nack { pid: 5, blp: 3 }])),
         Packet::from(Body::Other {
             packet_type: 208,
@@ -347,6 +377,7 @@ fn compound_round_trip_and_truncated_prefixes() {
         rtp::Packet::parse(&bytes),
         Ok(rtp::Packet::Rtcp(Datagram(packets.clone())))
     );
+    assert_eq!(rtp::Packet::Rtcp(Datagram(packets.clone())).to_bytes(), Ok(bytes.clone()));
     let mut ends = vec![];
     let mut end = 0;
     for p in &packets {
@@ -357,7 +388,15 @@ fn compound_round_trip_and_truncated_prefixes() {
     }
     assert_eq!(Datagram::parse(&[]), Err(ParseError::Empty));
     for n in 1..bytes.len() {
-        assert_eq!(Datagram::parse(&bytes[..n]).is_ok(), ends.contains(&n));
+        if ends.contains(&n) {
+            assert!(Datagram::parse(&bytes[..n]).is_ok());
+            assert!(rtp::Packet::parse(&bytes[..n]).is_ok());
+        } else {
+            assert_eq!(Datagram::parse(&bytes[..n]), Err(ParseError::Truncated));
+            if n >= 2 {
+                assert_eq!(rtp::Packet::parse(&bytes[..n]), Err(rtp::PacketError::Rtcp(ParseError::Truncated)));
+            }
+        }
     }
 }
 
@@ -368,6 +407,28 @@ fn padding_on_the_last_packet() {
     let bytes = Compound(vec![report(), last.clone()]).to_bytes().unwrap();
     let packets = Compound::parse(&bytes).unwrap();
     assert_eq!(packets.0[1], last);
+    assert_eq!(rtp::Packet::parse(&bytes), Ok(rtp::Packet::Rtcp(Datagram(packets.0))));
+    let mut bad = bytes.clone();
+    bad[0] |= 0x20;
+    assert_eq!(rtp::Packet::parse(&bad), Err(rtp::PacketError::Rtcp(ParseError::Padding)));
+
+    // The first packet's padding is valid on its own, but not before SDES.
+    let first = Packet::from(Body::ReceiverReport(ReceiverReport {
+        ssrc: 1,
+        reports: vec![],
+        extension: vec![0, 0, 0, 4],
+    }));
+    let mut bad = Datagram(vec![first, cname()]).to_bytes().unwrap();
+    assert!(rtp::Packet::parse(&bad).is_ok());
+    bad[0] |= 0x20;
+    let datagram = Datagram::parse(&bad).unwrap();
+    assert_eq!(datagram.0[0].padding, 4);
+    assert_eq!(rtp::Packet::parse(&bad), Err(rtp::PacketError::Rtcp(ParseError::Padding)));
+    let packet = rtp::Packet::Rtcp(datagram);
+    let mut out = vec![9, 8, 7];
+    assert_eq!(packet.write(&mut out), Err(EncodeError::Unwritable));
+    assert_eq!(out, [9, 8, 7]);
+    contract::check_wire_value(&packet);
     let mut first = report();
     first.padding = 4;
     assert_eq!(
@@ -607,6 +668,13 @@ fn empty_nack_and_sli_are_rejected() {
 
 #[test]
 fn sdes_and_bye_padding_must_be_null() {
+    for bytes in [
+        vec![0x81, 202, 0, 2, 0, 0, 0, 1, 0, 0, 0, 0],
+        vec![0x81, 203, 0, 2, 0, 0, 0, 1, 2, b'h', b'i', 0],
+    ] {
+        assert!(Datagram::parse(&bytes).is_ok());
+        assert!(rtp::Packet::parse(&bytes).is_ok());
+    }
     for (pt, bytes) in [
         (202, vec![0x81, 202, 0, 2, 0, 0, 0, 1, 0, 0, 1, 0]),
         (203, vec![0x81, 203, 0, 2, 0, 0, 0, 1, 1, b'a', 1, 0]),

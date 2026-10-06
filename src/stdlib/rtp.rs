@@ -20,19 +20,19 @@
 //!
 //! Nothing here reads a socket. A world reads each UDP datagram with
 //! [`Packet::parse`], which tells RTP from RTCP using RFC 5761. Over TCP,
-//! [`Stream<Frames>`](super::codec::Stream) splits RFC 4571 envelopes.
-//! [`Frame`] supplies the length prefix when sending. Media contents and
+//! [`Stream<rtcp::Frames>`](super::codec::Stream) splits RFC 4571 envelopes.
+//! [`rtcp::Frame`] supplies the length prefix when sending. Media contents and
 //! report policy belong to world code. SRTP and SRTCP are not handled here.
 //!
 //! ```
-//! use fictionet::stdlib::{codec::Wire, rtp::{RtpPacket, Packet, Frame}};
+//! use fictionet::stdlib::{codec::Wire, rtcp, rtp::{RtpPacket, Packet}};
 //! let packet = RtpPacket {
 //!     marker: false, payload_type: 111, sequence: 1, timestamp: 160,
 //!     ssrc: 7, csrcs: vec![], extension: None, payload: vec![0xf8], padding: 0,
 //! };
 //! let bytes = packet.to_bytes().unwrap();
 //! assert_eq!(Packet::parse(&bytes), Ok(Packet::Rtp(packet)));
-//! let tcp = Frame(bytes).to_bytes().unwrap();
+//! let tcp = rtcp::Frame(bytes).to_bytes().unwrap();
 //! assert_eq!(&tcp[..2], &[0, 13]);
 //! ```
 
@@ -59,17 +59,6 @@ pub const TWO_BYTE_PROFILE: u16 = 0x1000;
 // RTP
 
 use super::{codec::Wire, rtcp};
-
-/// The shared error for RTP, RTCP, and RFC 4571 values that cannot be written.
-pub use super::rtcp::EncodeError;
-/// The shared RFC 4571 envelope, including null frames.
-pub use super::rtcp::Frame;
-/// A shared RFC 4571 payload length error.
-pub use super::rtcp::FrameError;
-/// An exact RFC 4571 envelope parse error.
-pub use super::rtcp::FrameParseError;
-/// The shared RFC 4571 framer for RTP and RTCP datagrams.
-pub use super::rtcp::Frames;
 
 /// One RTP packet: the header's fields, the extension and the payload.
 /// The version is always 2, and the padding, extension and CSRC count bits
@@ -170,7 +159,7 @@ impl std::error::Error for RtpError {}
 
 impl Wire for RtpPacket {
     type ParseError = RtpError;
-    type WriteError = EncodeError;
+    type WriteError = rtcp::EncodeError;
     /// Reads a whole datagram. Refuses bad versions, truncated fields, invalid
     /// padding or extension lengths, and packets over [`MAX_PACKET`].
     fn parse(b: &[u8]) -> Result<RtpPacket, RtpError> {
@@ -227,12 +216,12 @@ impl Wire for RtpPacket {
     /// Appends the packet. Refuses out-of-range fields, invalid extension
     /// elements, variant aliases, unaligned opaque data, and oversized packets.
     /// Padding counts are preserved; padding octets are zero.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), rtcp::EncodeError> {
         if self.payload_type > 127
             || self.csrcs.len() > MAX_CSRCS
             || self.payload.len() > MAX_PACKET
         {
-            return Err(EncodeError::Unwritable);
+            return Err(rtcp::EncodeError::Unwritable);
         }
         let extension = self
             .extension
@@ -246,10 +235,10 @@ impl Wire for RtpPacket {
             + self.payload.len()
             + extension.as_ref().map_or(0, |(_, data)| 4 + data.len());
         if size > MAX_PACKET {
-            return Err(EncodeError::Unwritable);
+            return Err(rtcp::EncodeError::Unwritable);
         }
         out.try_reserve_exact(size)
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| rtcp::EncodeError::Unwritable)?;
         out.push(
             VERSION << 6
                 | self.csrcs.len() as u8
@@ -298,32 +287,32 @@ impl HeaderExtension {
             HeaderExtension::Other { .. } => None,
         }
     }
-    fn encode(&self) -> Result<(u16, Vec<u8>), EncodeError> {
+    fn encode(&self) -> Result<(u16, Vec<u8>), rtcp::EncodeError> {
         let mut data = Vec::new();
         match self {
             Self::OneByte(elements) | Self::TwoByte { elements, .. } => {
                 let one = matches!(self, Self::OneByte(_));
                 if matches!(self, Self::TwoByte { app_bits, .. } if *app_bits > 15) {
-                    return Err(EncodeError::Unwritable);
+                    return Err(rtcp::EncodeError::Unwritable);
                 }
                 let mut size = 0usize;
                 for e in elements {
                     if (one && (!(1..=14).contains(&e.id) || !(1..=16).contains(&e.data.len())))
                         || (!one && (e.id == 0 || e.data.len() > 255))
                     {
-                        return Err(EncodeError::Unwritable);
+                        return Err(rtcp::EncodeError::Unwritable);
                     }
                     size = size.saturating_add(e.data.len() + if one { 1 } else { 2 });
                     if size > MAX_PACKET {
-                        return Err(EncodeError::Unwritable);
+                        return Err(rtcp::EncodeError::Unwritable);
                     }
                 }
                 let padded = size.div_ceil(4) * 4;
                 if padded > MAX_PACKET {
-                    return Err(EncodeError::Unwritable);
+                    return Err(rtcp::EncodeError::Unwritable);
                 }
                 data.try_reserve_exact(padded)
-                    .map_err(|_| EncodeError::Unwritable)?;
+                    .map_err(|_| rtcp::EncodeError::Unwritable)?;
                 for e in elements {
                     if one {
                         data.push(e.id << 4 | (e.data.len() - 1) as u8);
@@ -340,10 +329,10 @@ impl HeaderExtension {
                     || !raw.len().is_multiple_of(4)
                     || raw.len() > MAX_PACKET
                 {
-                    return Err(EncodeError::Unwritable);
+                    return Err(rtcp::EncodeError::Unwritable);
                 }
                 data.try_reserve_exact(raw.len())
-                    .map_err(|_| EncodeError::Unwritable)?;
+                    .map_err(|_| rtcp::EncodeError::Unwritable)?;
                 data.extend_from_slice(raw);
             }
         }
@@ -441,15 +430,18 @@ impl std::error::Error for PacketError {}
 
 impl Wire for Packet {
     type ParseError = PacketError;
-    type WriteError = EncodeError;
+    type WriteError = rtcp::EncodeError;
     /// Reads a datagram as RTCP if [`is_rtcp`] says so, and as RTP
     /// otherwise.
-    /// Refuses any datagram rejected by its RTP or RTCP reader.
+    /// Refuses any datagram rejected by its RTP or RTCP reader, and RTCP
+    /// padding on a packet other than the last.
     fn parse(b: &[u8]) -> Result<Packet, PacketError> {
         if is_rtcp(b) {
-            rtcp::Datagram::parse(b)
-                .map(Packet::Rtcp)
-                .map_err(PacketError::Rtcp)
+            let datagram = rtcp::Datagram::parse(b).map_err(PacketError::Rtcp)?;
+            if has_early_padding(&datagram) {
+                return Err(PacketError::Rtcp(rtcp::ParseError::Padding));
+            }
+            Ok(Packet::Rtcp(datagram))
         } else {
             RtpPacket::parse(b)
                 .map(Packet::Rtp)
@@ -458,20 +450,33 @@ impl Wire for Packet {
     }
 
     /// Appends a multiplexed datagram. Refuses invalid packets and values
-    /// whose second byte would select the other protocol.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
+    /// whose second byte would select the other protocol, or whose RTCP
+    /// padding appears on a packet other than the last.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), rtcp::EncodeError> {
         let bytes = match self {
             Self::Rtp(p) => p.to_bytes()?,
-            Self::Rtcp(p) => p.to_bytes()?,
+            Self::Rtcp(p) => {
+                if has_early_padding(p) {
+                    return Err(rtcp::EncodeError::Unwritable);
+                }
+                p.to_bytes()?
+            }
         };
         if is_rtcp(&bytes) != matches!(self, Self::Rtcp(_)) {
-            return Err(EncodeError::Unwritable);
+            return Err(rtcp::EncodeError::Unwritable);
         }
         out.try_reserve_exact(bytes.len())
-            .map_err(|_| EncodeError::Unwritable)?;
+            .map_err(|_| rtcp::EncodeError::Unwritable)?;
         out.extend_from_slice(&bytes);
         Ok(())
     }
+}
+
+/// Whether RTCP padding appears before the last packet in a datagram.
+fn has_early_padding(datagram: &rtcp::Datagram) -> bool {
+    datagram.0.split_last().is_some_and(|(_, earlier)| {
+        earlier.iter().any(|packet| packet.padding != 0)
+    })
 }
 
 /// Reads big-endian numbers from a slice, giving `None` past its end.
@@ -832,7 +837,7 @@ mod tests {
             profile: 0xabcd,
             data: vec![1, 2, 3, 4, 5],
         });
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         p.extension = Some(HeaderExtension::Other {
             profile: 0xabcd,
             data: vec![1, 2, 3, 4, 5, 0, 0, 0],
@@ -846,7 +851,7 @@ mod tests {
                 profile: ONE_BYTE_PROFILE,
                 data,
             });
-            assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         }
     }
 
@@ -855,10 +860,10 @@ mod tests {
         let mut p = rtp(&[]);
         p.payload_type = 128;
         contract::check_wire_value(&p);
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         p.payload_type = 127;
         p.csrcs = vec![0; 16];
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         p.csrcs = vec![0; 15];
         for e in [
             Element {
@@ -879,7 +884,7 @@ mod tests {
             },
         ] {
             p.extension = Some(HeaderExtension::OneByte(vec![e]));
-            assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         }
         p.extension = Some(HeaderExtension::OneByte(vec![Element {
             id: 14,
@@ -914,7 +919,7 @@ mod tests {
                 app_bits,
                 elements: vec![element],
             });
-            assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+            assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         }
         p.extension = Some(HeaderExtension::TwoByte {
             app_bits: 0,
@@ -925,40 +930,40 @@ mod tests {
                 })
                 .collect(),
         });
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         p.extension = Some(HeaderExtension::Other {
             profile: 1,
             data: vec![0; 300_000],
         });
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
         p.extension = None;
         p.payload = vec![0; 100_000];
-        assert_eq!(p.to_bytes(), Err(EncodeError::Unwritable));
+        assert_eq!(p.to_bytes(), Err(rtcp::EncodeError::Unwritable));
     }
 
     #[test]
     fn stream_splits_packets_and_null_frames() {
-        let a = Frame::from_packet(&rtp(&[1])).unwrap();
+        let a = rtcp::Frame::from_packet(&rtp(&[1])).unwrap();
         let bytes = [
-            Frame(vec![]).to_bytes().unwrap(),
+            rtcp::Frame(vec![]).to_bytes().unwrap(),
             a.to_bytes().unwrap(),
-            Frame(vec![]).to_bytes().unwrap(),
+            rtcp::Frame(vec![]).to_bytes().unwrap(),
         ]
         .concat();
-        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (MAX_PACKET + 2));
-        let (items, error) = decode_all(Frames::new, &bytes);
+        contract::check_decode_with_alloc_limit(rtcp::Frames::new, &bytes, 2 * (MAX_PACKET + 2));
+        let (items, error) = decode_all(rtcp::Frames::new, &bytes);
         assert_eq!(error, None);
-        assert_eq!(items, [Frame(vec![]), a.clone(), Frame(vec![])]);
+        assert_eq!(items, [rtcp::Frame(vec![]), a.clone(), rtcp::Frame(vec![])]);
         assert_eq!(Packet::parse(&items[1].0), Ok(Packet::Rtp(rtp(&[1]))));
-        let large = Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
-        contract::check_decode_with_alloc_limit(Frames::new, &large, 2 * (MAX_PACKET + 2));
+        let large = rtcp::Frame(vec![1; MAX_PACKET]).to_bytes().unwrap();
+        contract::check_decode_with_alloc_limit(rtcp::Frames::new, &large, 2 * (MAX_PACKET + 2));
         assert_eq!(
-            Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
-            Err(EncodeError::Unwritable)
+            rtcp::Frame(vec![1; MAX_PACKET + 1]).to_bytes(),
+            Err(rtcp::EncodeError::Unwritable)
         );
         let many = a.to_bytes().unwrap().repeat(200_000);
         let started = std::time::Instant::now();
-        let (items, error) = decode_all(Frames::new, &many);
+        let (items, error) = decode_all(rtcp::Frames::new, &many);
         // Allow slow test hosts while catching repeated scans or front removal.
         assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
         assert_eq!(items.len(), 200_000);
@@ -1017,7 +1022,7 @@ mod tests {
             contract::check_wire::<Packet>(seed);
         }
         let stream: Vec<u8> = seeds.iter()
-            .flat_map(|bytes| Frame(bytes.clone()).to_bytes().unwrap()).collect();
+            .flat_map(|bytes| rtcp::Frame(bytes.clone()).to_bytes().unwrap()).collect();
         seeds.push(stream);
         let mut rng = Lcg::new(42);
         for _ in 0..5_000 {
@@ -1032,7 +1037,7 @@ mod tests {
                 }
                 contract::check_wire::<RtpPacket>(&bytes);
                 contract::check_wire::<Packet>(&bytes);
-                contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * (MAX_PACKET + 2));
+                contract::check_decode_with_alloc_limit(rtcp::Frames::new, &bytes, 2 * (MAX_PACKET + 2));
                 mutate(&mut rng, &mut bytes);
             }
             let mut p = rtp(&rng.bytes(40));

@@ -3,7 +3,7 @@
 #![no_main]
 
 use arbitrary::{Result, Unstructured};
-use fictionet::stdlib::codec::{Decode, Wire, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
 use fictionet::stdlib::rtcp::{Frame, Frames};
 use fictionet::stdlib::rtcp::{
     App, Body, Bye, Datagram, Compound, DlrrItem, ExtendedReport, Fir, MAX_DATAGRAM, MAX_PACKET, Nack, Packet,
@@ -17,6 +17,7 @@ fn datagram(data: &[u8]) {
     contract::check_wire::<Datagram>(data);
     contract::check_wire::<Compound>(data);
     if let Ok(packets) = Datagram::parse(data) {
+        assert_eq!(packets.to_bytes().unwrap().len(), data.len());
         assert_eq!(
             Compound::parse(data).is_ok(),
             check_compound(&packets.0).is_ok()
@@ -216,5 +217,8 @@ fuzz_target!(|data: &[u8]| {
 
     // The bytes as one datagram.
     datagram(data);
+    for frame in decode_all(Frames::new, data).0 {
+        datagram(&frame.0);
+    }
     let _ = built(data);
 });

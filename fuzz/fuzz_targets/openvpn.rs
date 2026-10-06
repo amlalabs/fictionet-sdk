@@ -2,7 +2,7 @@
 //! UDP datagrams and TCP streams, and as it builds them to write.
 #![no_main]
 
-use fictionet::stdlib::codec::{Decode, contract};
+use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::openvpn::{Frame, Frames};
 use fictionet::stdlib::openvpn::{
     Ack, Authenticated, Encrypted, Control, ControlBody, ControlKind, Error, MAX_HMAC_LEN,
@@ -102,6 +102,20 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<Encrypted>(data);
     contract::check_wire_value(&Frame(data[..data.len().min(MAX_PACKET + 1)].to_vec()));
     for wrapping in WRAPPINGS {
+        if let Ok(packet) = Packet::parse_with(data, wrapping) {
+            let bytes = match wrapping {
+                Wrapping::None => packet.to_bytes(),
+                Wrapping::TlsAuth { hmac_len: 0 } => Authenticated::<0>(packet).to_bytes(),
+                Wrapping::TlsAuth { hmac_len: 20 } => Authenticated::<20>(packet).to_bytes(),
+                Wrapping::TlsAuth { hmac_len: 32 } => Authenticated::<32>(packet).to_bytes(),
+                Wrapping::TlsAuth { hmac_len } => {
+                    assert_eq!(hmac_len, MAX_HMAC_LEN);
+                    Authenticated::<MAX_HMAC_LEN>(packet).to_bytes()
+                }
+                Wrapping::TlsCrypt => Encrypted(packet).to_bytes(),
+            };
+            assert_eq!(bytes.unwrap(), data);
+        }
         contract::check_decode_with_alloc_limit(
             || Frames::new().map(|frame| Packet::parse_with(&frame.0, wrapping)),
             data,
@@ -109,6 +123,10 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     let too_long = Wrapping::TlsAuth { hmac_len: MAX_HMAC_LEN + 1 };
+    if let Ok(packet) = Packet::parse_with(data, too_long) {
+        assert_eq!(packet.wrapping(), Wrapping::None);
+        assert_eq!(packet.to_bytes().unwrap(), data);
+    }
     if let Some(&first) = data.first()
         && data.len() <= MAX_PACKET
         && ControlKind::from_opcode(split_first_byte(first).0).is_some()

@@ -617,7 +617,11 @@ impl XrBlock {
     /// A DLRR block holding `items`. Refuses a block that cannot fit in a packet.
     pub fn dlrr(items: &[DlrrItem]) -> Result<XrBlock, EncodeError> {
         let len = items.len().checked_mul(12).ok_or(EncodeError::Unwritable)?;
-        check_size(len.saturating_add(8))?;
+        // Include the RTCP header, SSRC, and block header.
+        let packet_len = len.checked_add(12).ok_or(EncodeError::Unwritable)?;
+        if packet_len > MAX_PACKET {
+            return Err(EncodeError::Unwritable);
+        }
         let mut data = Vec::new();
         data.try_reserve_exact(len)
             .map_err(|_| EncodeError::Unwritable)?;
@@ -1554,7 +1558,6 @@ impl Wire for Frame {
 /// from the prefix. Partial frames return [`Step::Need`], including at EOF,
 /// so [`super::codec::Stream`] reports truncation. RTCP body errors belong
 /// in a mapping through [`Datagram::parse`], where they do not end framing.
-/// This type is also exported as [`super::rtp::Frames`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {
     limit: usize,
@@ -2144,6 +2147,21 @@ mod tests {
             Packet::parse(&[0x80, 207, 0, 0]),
             Err(PacketParseError::Packet(ParseError::Malformed(207)))
         );
+    }
+
+    #[test]
+    fn dlrr_packet_size_boundary() {
+        let item = DlrrItem { ssrc: 1, last_rr: 2, delay_since_last_rr: 3 };
+        let mut items = vec![item; (MAX_PACKET - 12) / 12];
+        let block = XrBlock::dlrr(&items).unwrap();
+        assert_eq!(block.dlrr_items(), Some(items.clone()));
+        let packet = Packet::from(Body::ExtendedReport(ExtendedReport {
+            ssrc: 7,
+            blocks: vec![block],
+        }));
+        assert_eq!(round_trip(&packet).len(), MAX_PACKET);
+        items.push(item);
+        assert_eq!(XrBlock::dlrr(&items), Err(EncodeError::Unwritable));
     }
 
     #[test]

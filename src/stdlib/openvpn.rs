@@ -1292,18 +1292,7 @@ mod tests {
             assert!(!e.to_string().is_empty());
         }
         assert!(!StreamError::ZeroLength.to_string().is_empty());
-        for e in [
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-            EncodeError::Unwritable,
-        ] {
-            assert!(!e.to_string().is_empty());
-        }
+        assert_eq!(EncodeError::Unwritable.to_string(), "value cannot be written without changing it");
     }
 
     /// Every packet the tests build, with the wrapping that reads it.
@@ -1566,7 +1555,11 @@ mod tests {
             let c = Control {
                 session_id: [rng.next() as u8; 8],
                 tls_auth: rng.coin().then(|| TlsAuth {
-                    hmac: vec![rng.next() as u8; hmac_len],
+                    hmac: {
+                        let mut hmac = vec![0; hmac_len];
+                        rng.fill(&mut hmac);
+                        hmac
+                    },
                     packet_id: 1,
                     net_time: 2,
                 }),

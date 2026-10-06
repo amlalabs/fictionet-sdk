@@ -4,24 +4,24 @@ use fictionet::stdlib::codec::{Decode, Wire, contract};
 use fictionet::stdlib::{rtcp, rtp::*};
 use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode_with_alloc_limit(Frames::new, data, 2 * (MAX_PACKET + 2));
+    contract::check_decode_with_alloc_limit(rtcp::Frames::new, data, 2 * (MAX_PACKET + 2));
     contract::check_decode_with_alloc_limit(
-        || Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
+        || rtcp::Frames::with_limit(usize::from(data.first().copied().unwrap_or(0))),
         data,
         514,
     );
     contract::check_decode_with_alloc_limit(
-        || Frames::new().map(|frame| Packet::parse(&frame.0)),
+        || rtcp::Frames::new().map(|frame| Packet::parse(&frame.0)),
         data,
         2 * (MAX_PACKET + 2),
     );
-    contract::check_wire::<Frame>(data);
+    contract::check_wire::<rtcp::Frame>(data);
     contract::check_wire::<RtpPacket>(data);
     contract::check_wire::<Packet>(data);
     contract::check_wire::<rtcp::Datagram>(data);
     contract::check_wire::<rtcp::Compound>(data);
     let payload = &data[..data.len().min(MAX_PACKET + 1)];
-    contract::check_wire_value(&Frame(payload.to_vec()));
+    contract::check_wire_value(&rtcp::Frame(payload.to_vec()));
     let elements = vec![Element {
         id: data.first().copied().unwrap_or(0),
         data: payload[..payload.len().min(256)].to_vec(),

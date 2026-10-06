@@ -14,6 +14,7 @@ where
     D::Error: Clone + Debug + PartialEq,
 {
     contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
+    contract::check_decode_with_held_limit(&make, bytes, 0);
     let (items, failure) = decode_all(make, bytes);
     assert_eq!(items, expected);
     assert_eq!(failure, None);
@@ -240,15 +241,15 @@ fn rtp_chunked_rfc4571_round_trip() {
         profile: 0x4321,
         data: vec![1; 4],
     });
-    let mut bytes = wire_bytes(&rtp::Frame::default());
+    let mut bytes = wire_bytes(&rtcp::Frame::default());
     for packet in [&a, &b, &c] {
-        let encoded = wire_bytes(&rtp::Frame(wire_bytes(packet)));
-        truncated(rtp::Frames::new, &encoded);
+        let encoded = wire_bytes(&rtcp::Frame(wire_bytes(packet)));
+        truncated(rtcp::Frames::new, &encoded);
         bytes.extend(encoded);
     }
     round_trip(
         || {
-            rtp::Frames::new().map(|frame| {
+            rtcp::Frames::new().map(|frame| {
                 if frame.0.is_empty() {
                     Ok(None)
                 } else {
@@ -264,15 +265,15 @@ fn rtp_chunked_rfc4571_round_trip() {
 #[test]
 fn rtp_body_error_keeps_stream_and_limit_error_ends_it() {
     let packet = media_packet();
-    let mut bytes = wire_bytes(&rtp::Frame(vec![0, 0]));
-    rtp::Frame(wire_bytes(&packet)).write(&mut bytes).unwrap();
+    let mut bytes = wire_bytes(&rtcp::Frame(vec![0, 0]));
+    rtcp::Frame(wire_bytes(&packet)).write(&mut bytes).unwrap();
     round_trip(
-        || rtp::Frames::new().map(|frame| rtp::RtpPacket::parse(&frame.0)),
+        || rtcp::Frames::new().map(|frame| rtp::RtpPacket::parse(&frame.0)),
         &bytes,
         &[Err(rtp::RtpError::Version(0)), Ok(packet)],
     );
     refused_header(
-        || rtp::Frames::with_limit(12),
+        || rtcp::Frames::with_limit(12),
         &[0, 13],
         rtcp::FrameError {
             length: 13,
@@ -692,7 +693,7 @@ fn configured_limits_and_maximum_envelopes() {
         rtcp::Frames::with_limit(usize::MAX).limit(),
         rtcp::MAX_FRAME
     );
-    assert_eq!(rtp::Frames::with_limit(0).capacity(), 2);
+    assert_eq!(rtcp::Frames::with_limit(0).capacity(), 2);
     assert_eq!(ssh::Frames::with_limit(usize::MAX).limit(), ssh::MAX_PACKET);
     assert_eq!(ssh::Frames::with_limit(0).limit(), ssh::MIN_PACKET);
     assert_eq!(
@@ -736,7 +737,7 @@ fn deterministic_contract_inputs_cover_all_framers() {
                 2 * (openvpn::MAX_TCP_FRAME),
             );
             contract::check_decode_with_alloc_limit(
-                rtp::Frames::new,
+                rtcp::Frames::new,
                 &bytes,
                 2 * (rtp::MAX_PACKET + 2),
             );

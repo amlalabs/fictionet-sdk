@@ -274,6 +274,7 @@ fn line_len(proto: &str, software: &str, comments: Option<&str>) -> usize {
 
 #[cfg(test)]
 std::thread_local! {
+    // Count scan visits inside the reader so the linear-time test needs no timing bound.
     static LINE_BYTES_SCANNED: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
@@ -1444,7 +1445,7 @@ impl Wire for Message {
     /// Appends the payload. Refuses oversized fields or lists, invalid names,
     /// known-number `Other` variants, and values exceeding [`MAX_PAYLOAD`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        let size = self.encoded_len()?;
+        let (size, list_lengths) = self.encoded_lengths()?;
         out.try_reserve_exact(size)
             .map_err(|_| EncodeError::Unwritable)?;
         out.push(self.number());
@@ -1474,8 +1475,7 @@ impl Wire for Message {
             }
             Self::KexInit(k) => {
                 out.extend_from_slice(&k.cookie);
-                for (list, ok) in k.lists() {
-                    let len = list_len(list, ok)?;
+                for ((list, _), len) in k.lists().into_iter().zip(list_lengths) {
                     write_list(out, list, len);
                 }
                 put_boolean(out, k.first_kex_packet_follows);
@@ -1489,7 +1489,9 @@ impl Wire for Message {
 }
 
 impl Message {
-    fn encoded_len(&self) -> Result<usize, EncodeError> {
+    /// Checks the payload size and all ten KEXINIT list lengths before writing.
+    fn encoded_lengths(&self) -> Result<(usize, [usize; 10]), EncodeError> {
+        let mut list_lengths = [0; 10];
         let size = match self {
             Self::Disconnect {
                 reason,
@@ -1526,8 +1528,9 @@ impl Message {
             }
             Self::KexInit(k) => {
                 let mut len = KEXINIT_FIXED;
-                for (list, ok) in k.lists() {
-                    len = len.saturating_add(list_len(list, ok)?);
+                for ((list, ok), length) in k.lists().into_iter().zip(&mut list_lengths) {
+                    *length = list_len(list, ok)?;
+                    len = len.saturating_add(*length);
                 }
                 len
             }
@@ -1542,7 +1545,7 @@ impl Message {
         if size > MAX_PAYLOAD {
             Err(EncodeError::Unwritable)
         } else {
-            Ok(size)
+            Ok((size, list_lengths))
         }
     }
 }
@@ -2297,11 +2300,20 @@ mod tests {
         let bytes = big.repeat(3);
         contract::check_decode_with_alloc_limit(Events::after_version, &bytes, 2 * MAX_PACKET);
         assert_eq!(decode_all(Events::after_version, &bytes).0.len(), 3);
-        contract::check_decode_with_alloc_limit(Events::new, &vec![b'x'; 200_000], 2 * MAX_PACKET);
+        let long_line = vec![b'x'; 200_000];
+        contract::check_decode_with_alloc_limit(Events::new, &long_line, 2 * MAX_PACKET);
+        assert_eq!(
+            decode_all(Events::new, &long_line).1,
+            Some(Fail::Protocol(StreamError::LineTooLong))
+        );
         contract::check_decode_with_alloc_limit(
             Frames::new,
             &[0, 0, 0x88, 0xb4, 4],
             2 * MAX_PACKET,
+        );
+        assert_eq!(
+            decode_all(Events::after_version, &[0, 0, 0x88, 0xb4, 4]).1,
+            Some(Fail::Protocol(StreamError::PayloadTooLong(34_991)))
         );
     }
 
@@ -2358,6 +2370,7 @@ mod tests {
     fn fuzz_loop() {
         let mut g = Lcg::new(0x5eed);
         let base = stream();
+        let payloads: Vec<_> = samples().iter().map(|m| m.to_bytes().unwrap()).collect();
         let text = |g: &mut Lcg, max| {
             let pool = ["é", "🙂", "\0", "SSH-", ",", " ", "x@y.z"];
             let mut value = g.text(max);
@@ -2368,6 +2381,11 @@ mod tests {
         };
         let list = |g: &mut Lcg| (0..g.index(6)).map(|_| text(g, 80)).collect();
         for _ in 0..4000 {
+            for sample in &payloads {
+                let mut payload = sample.clone();
+                mutate(&mut g, &mut payload);
+                contract::check_wire::<Message>(&payload);
+            }
             let mut bytes = if g.coin() { g.bytes(300) } else { base.clone() };
             mutate(&mut g, &mut bytes);
             contract::check_decode_with_alloc_limit(Events::new, &bytes, 2 * MAX_PACKET);
@@ -2384,7 +2402,11 @@ mod tests {
             contract::check_wire::<Boolean>(&bytes);
             let message = match g.index(7) {
                 0 => Message::Disconnect {
-                    reason: DisconnectReason::Other(g.next() as u32),
+                    reason: if g.coin() {
+                        DisconnectReason::from_code(g.index(17) as u32)
+                    } else {
+                        DisconnectReason::Other(g.next() as u32)
+                    },
                     description: text(&mut g, 60),
                     language: text(&mut g, 80),
                 },
@@ -2395,6 +2417,11 @@ mod tests {
                 },
                 2 => Message::ServiceRequest(text(&mut g, 100)),
                 3 => Message::KexInit(KexInit {
+                    cookie: {
+                        let mut cookie = [0; 16];
+                        g.fill(&mut cookie);
+                        cookie
+                    },
                     kex_algorithms: list(&mut g),
                     server_host_key_algorithms: list(&mut g),
                     encryption_client_to_server: list(&mut g),
@@ -2407,7 +2434,6 @@ mod tests {
                     languages_server_to_client: list(&mut g),
                     first_kex_packet_follows: g.coin(),
                     reserved: g.next() as u32,
-                    ..KexInit::default()
                 }),
                 4 => Message::Other {
                     number: g.next() as u8,
