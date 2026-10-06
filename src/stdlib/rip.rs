@@ -26,10 +26,9 @@
 //! sending a RIP message. For pieces of one payload, use
 //! [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Message>`
 //! and a limit of [`MAX_MESSAGE`], or `Collect<NgMessage>` with
-//! [`MAX_NG_MESSAGE`]. Call `end` at the UDP
-//! boundary. Which routes exist,
-//! what their metrics are, and whether a password or a digest is right are
-//! up to world code. The authentication data is kept as bytes.
+//! [`MAX_NG_MESSAGE`]. Call `end` at the UDP boundary. Which routes exist,
+//! what their metrics are, and whether a password or a digest is right
+//! are up to world code. The authentication data is kept as bytes.
 //!
 //! [`Message::parse`] and [`NgMessage::parse`] fail on the first bad entry.
 //! A router does not: it skips the entry and reads the rest (RFC 2453
@@ -82,7 +81,6 @@
 //! );
 //! assert_eq!(Message::parse(&bytes), Ok(reply));
 //! ```
-//!
 
 use super::codec::Wire;
 
@@ -113,7 +111,6 @@ pub const MAX_AUTH_DATA: usize = 255;
 pub const TRAILER_HEADER_LEN: usize = 4;
 /// The longest RIP message: the most entries, then the longest trailer.
 pub const MAX_MESSAGE: usize = HEADER_LEN + MAX_ENTRIES * ENTRY_LEN + TRAILER_HEADER_LEN + MAX_AUTH_DATA;
-
 /// The longest RIP datagram to send: RFC 1058 3.1 limits a datagram to
 /// 512 bytes. RFC 4822 does not say whether its trailer counts.
 /// FRRouting counts it, and drops longer datagrams, so with a 16-byte
@@ -240,8 +237,9 @@ pub struct Crypto {
     pub sequence: u32,
     /// The authentication data from the trailer, at most
     /// [`MAX_AUTH_DATA`] bytes. The digest covers the message as received,
-    /// so check it against the payload from [`Stream::with_next`](super::codec::Stream::with_next), not
-    /// against [`Message::to_bytes`], which writes ignored fields as zero.
+    /// so check it against the payload from
+    /// [`Stream::with_next`](super::codec::Stream::with_next), not against
+    /// [`Message::to_bytes`], which writes ignored fields as zero.
     pub data: Vec<u8>,
 }
 
@@ -971,9 +969,30 @@ mod tests {
     }
 
     fn ng_collect(b: &[u8]) -> Result<NgMessage, RipError> {
-        contract::check_decode_with_alloc_limit(|| Collect::<NgMessage>::new(MAX_NG_MESSAGE), b, 2 * (MAX_NG_MESSAGE + 1));
+        let make = || Collect::<NgMessage>::new(MAX_NG_MESSAGE);
+        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_NG_MESSAGE + 1));
         contract::check_wire::<NgMessage>(b);
-        NgMessage::parse(b)
+        let parsed = NgMessage::parse(b);
+        let (items, failure) = decode_all(make, b);
+        if b.len() <= MAX_NG_MESSAGE {
+            assert_eq!(
+                failure,
+                parsed
+                    .clone()
+                    .err()
+                    .map(|e| Fail::Protocol(CollectError::Parse(e)))
+            );
+            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
+        } else {
+            assert!(items.is_empty());
+            assert_eq!(
+                failure,
+                Some(Fail::Protocol(CollectError::TooLong {
+                    limit: MAX_NG_MESSAGE
+                }))
+            );
+        }
+        parsed
     }
 
     fn check(b: &[u8]) -> Result<Message, RipError> {

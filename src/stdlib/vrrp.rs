@@ -24,14 +24,14 @@
 //! Nothing here reads a socket. A world that plays a router hands each
 //! VRRP payload (the bytes after the IP header) to [`Advertisement::parse`]
 //! with the packet's [`Endpoints`], looks at the [`Advertisement`], and
-//! prepares an [`Advertisement::frame`] to write with [`Wire::write`](super::codec::Wire::write). Use
-//! protocol [`PROTOCOL`] and a TTL or hop limit of [`HOP_LIMIT`], to the
+//! prepares an [`Advertisement::frame`] to write with [`Wire::write`].
+//! Use protocol [`PROTOCOL`] and a TTL or hop limit of [`HOP_LIMIT`], to the
 //! address [`Advertisement::destination`] gives. For pieces of one payload,
 //! use [`Stream<Frames>`](super::codec::Stream), with `Frames = Collect<Datagram>`
 //! and a limit of [`MAX_MESSAGE`]. Map through [`Advertisement::parse`]
-//! and call `end` at the IP boundary.
-//! Which virtual routers exist, their priorities, and the
-//! timers that decide when a backup takes over are up to world code.
+//! and call `end` at the IP boundary. Which virtual routers exist, their
+//! priorities, and the timers that decide when a backup takes over are
+//! up to world code.
 //!
 //! Every reader checks the version, type, VRID, address count, length and
 //! checksum, because the agent can send any bytes it likes. A version 2
@@ -98,7 +98,8 @@
 //! // Written back, the advertisement is the same bytes.
 //! assert_eq!(ad.frame(&master).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
 //! ```
-//!
+
+use super::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -328,7 +329,10 @@ pub enum VrrpError {
     /// The bytes end before the advertisement does.
     Truncated,
     /// The bytes go on past the end the address count gives.
-    Trailing,
+    Trailing {
+        /// Number of bytes after the VRRP advertisement.
+        remaining: usize,
+    },
     /// The version was not 2 or 3.
     Version(u8),
     /// The type was not [`TYPE_ADVERTISEMENT`].
@@ -372,7 +376,9 @@ impl std::fmt::Display for VrrpError {
         match self {
             VrrpError::TooLong => write!(f, "VRRP payload exceeds {MAX_MESSAGE} bytes"),
             VrrpError::Truncated => write!(f, "the advertisement is cut short"),
-            VrrpError::Trailing => write!(f, "bytes follow the end of the advertisement"),
+            VrrpError::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after the VRRP advertisement")
+            }
             VrrpError::Version(v) => write!(f, "version {v}, not 2 or 3"),
             VrrpError::Type(t) => write!(f, "type {t}, not 1 (advertisement)"),
             VrrpError::Vrid => write!(f, "VRID 0, outside 1..=255"),
@@ -493,24 +499,27 @@ fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<usize, VrrpError> {
         Endpoints::V6 { source, .. } if !is_link_local(source) => return Err(VrrpError::LinkLocal),
         _ => {}
     }
-    match b.get(1) {
-        None => return Err(VrrpError::Truncated),
-        Some(0) => return Err(VrrpError::Vrid),
-        Some(_) => {}
+    if b.len() < HEADER_LEN {
+        // Keep field errors ahead of truncation when those fields arrived.
+        return Err(match b {
+            [_, 0, ..] => VrrpError::Vrid,
+            [_, _, _, 0, ..] => VrrpError::NoAddresses,
+            [_, _, _, _, t, ..] if version == 2 && *t > auth::IP_AH => VrrpError::AuthType(*t),
+            _ => VrrpError::Truncated,
+        });
     }
-    let Some(&count) = b.get(3) else { return Err(VrrpError::Truncated) };
+    if b[1] == 0 {
+        return Err(VrrpError::Vrid);
+    }
+    let count = b[3];
     if count == 0 {
         return Err(VrrpError::NoAddresses);
     }
-    if version == 2
-        && let Some(&t) = b.get(4)
-        && t > auth::IP_AH
-    {
-        return Err(VrrpError::AuthType(t));
+    if version == 2 && b[4] > auth::IP_AH {
+        return Err(VrrpError::AuthType(b[4]));
     }
     // At most 8 + 255 * 16, so this cannot overflow.
     let auth = if version == 2 { AUTH_DATA_LEN } else { 0 };
-    if b.len() < HEADER_LEN { return Err(VrrpError::Truncated); }
     Ok(HEADER_LEN + usize::from(count) * endpoints.address_len() + auth)
 }
 
@@ -527,7 +536,7 @@ impl Advertisement {
             return Err(VrrpError::Truncated);
         }
         if b.len() > len {
-            return Err(VrrpError::Trailing);
+            return Err(VrrpError::Trailing { remaining: b.len() - len });
         }
         let got = u16::from_be_bytes([b[6], b[7]]);
         if !checksum_matches(got, checksum(b, endpoints)) && !checksum_matches(got, checksum_rfc5798(b, endpoints)) {
@@ -740,7 +749,7 @@ pub struct Datagram(
     pub Vec<u8>,
 );
 
-impl super::codec::Wire for Datagram {
+impl Wire for Datagram {
     type ParseError = VrrpError;
     type WriteError = VrrpError;
 
@@ -899,7 +908,10 @@ mod tests {
         let moved = Endpoints::V6 { source: "fe80::3".parse().unwrap(), destination: GROUP_V6 };
         assert_eq!(Advertisement::parse(&b, &moved), Err(VrrpError::Checksum));
         // And the same bytes over IPv4 have the wrong length.
-        assert_eq!(Advertisement::parse(&b, &v4_ends()), Err(VrrpError::Trailing));
+        assert_eq!(
+            Advertisement::parse(&b, &v4_ends()),
+            Err(VrrpError::Trailing { remaining: 24 })
+        );
     }
 
     #[test]
@@ -933,7 +945,10 @@ mod tests {
         assert_eq!(Advertisement::parse(&fix(b, &e), &e), Err(VrrpError::NoAddresses));
         let mut b = good.clone();
         b.push(0);
-        assert_eq!(Advertisement::parse(&b, &e), Err(VrrpError::Trailing));
+        assert_eq!(
+            Advertisement::parse(&b, &e),
+            Err(VrrpError::Trailing { remaining: 1 })
+        );
         let mut b = good.clone();
         b[7] ^= 1;
         assert_eq!(Advertisement::parse(&b, &e), Err(VrrpError::Checksum));
@@ -1068,7 +1083,7 @@ mod tests {
             let mut b = a.frame(&e).unwrap().to_bytes().unwrap();
             assert_eq!(collect(&b, &e), Ok(a));
             b.push(0);
-            assert_eq!(collect(&b, &e), Err(VrrpError::Trailing));
+            assert_eq!(collect(&b, &e), Err(VrrpError::Trailing { remaining: 1 }));
         }
         assert_eq!(collect(&[0x41], &v4_ends()), Err(VrrpError::Version(4)));
         let mut b = vec![0; 10_000];
@@ -1117,7 +1132,7 @@ mod tests {
         // Every error has a message.
         for err in [
             VrrpError::Truncated,
-            VrrpError::Trailing,
+            VrrpError::Trailing { remaining: 1 },
             VrrpError::Version(9),
             VrrpError::Type(2),
             VrrpError::Vrid,
@@ -1318,7 +1333,9 @@ mod tests {
             // Flip some bytes, cut or extend, and fix the checksum most of
             // the time so the parser looks past it.
             let mut mutated = b.clone();
-            mutate(&mut rng, &mut mutated);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut mutated);
+            }
             if rng.index(4) != 0 {
                 mutated = fix(mutated, &e);
             }

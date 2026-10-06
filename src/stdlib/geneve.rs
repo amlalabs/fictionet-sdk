@@ -49,7 +49,6 @@
 //! assert_eq!(back, packet);
 //! assert_eq!(back.header.option(0x0105, 1).unwrap().data, [0, 0, 0, 7]);
 //! ```
-//!
 
 use super::codec::Wire;
 
@@ -155,7 +154,10 @@ pub enum GeneveError {
     /// The bytes end before the header and its options do.
     Truncated,
     /// Bytes follow a standalone header.
-    Trailing,
+    Trailing {
+        /// Number of bytes after the Geneve header.
+        remaining: usize,
+    },
     /// The version was not 0. A receiver drops such packets.
     Version(u8),
     /// The option whose header starts at this offset says it is longer
@@ -181,7 +183,9 @@ pub enum GeneveError {
 impl std::fmt::Display for GeneveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GeneveError::Trailing => f.write_str("bytes follow the Geneve header"),
+            GeneveError::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after the Geneve header")
+            }
             GeneveError::Truncated => f.write_str("bytes end inside the Geneve header"),
             GeneveError::Version(v) => write!(f, "Geneve version {v}, not 0"),
             GeneveError::OptionOverrun(at) => {
@@ -395,7 +399,7 @@ impl Wire for Header {
     fn parse(b: &[u8]) -> Result<Self, GeneveError> {
         let (header, used) = Self::parse_prefix(b)?.ok_or(GeneveError::Truncated)?;
         if used != b.len() {
-            return Err(GeneveError::Trailing);
+            return Err(GeneveError::Trailing { remaining: b.len() - used });
         }
         Ok(header)
     }
@@ -724,8 +728,7 @@ mod tests {
             let mut options = Vec::new();
             for _ in 0..rng.index(70) {
                 let n = if rng.index(4) == 0 { rng.index(140) } else { rng.index(8) * 4 };
-                let mut data = vec![0; n];
-                rng.fill(&mut data);
+                let data = rng.bytes(n);
                 options.push(GeneveOption {
                     class: rng.next() as u16,
                     kind: rng.next() as u8,
@@ -787,6 +790,7 @@ mod tests {
     fn errors_display() {
         let all = [
             GeneveError::Truncated,
+            GeneveError::Trailing { remaining: 1 },
             GeneveError::Version(1),
             GeneveError::OptionOverrun(8),
             GeneveError::CriticalBit(true),
@@ -808,8 +812,8 @@ mod tests {
         let mut room = MAX_OPTIONS_LEN;
         for _ in 0..rng.index(6) {
             let words = rng.index(32).min((room - OPTION_HEADER_LEN) / 4);
-            let mut data = vec![0; words * 4];
-            rng.fill(&mut data);
+            let mut data = rng.bytes(words * 4);
+            data.truncate(data.len() / 4 * 4);
             room -= OPTION_HEADER_LEN + data.len();
             let class = rng.next() as u16;
             let kind = rng.index(128) as u8;
@@ -869,7 +873,9 @@ mod tests {
             } else {
                 seeds[rng.index(seeds.len())].clone()
             };
-            mutate(&mut rng, &mut data);
+            for _ in 0..1 + rng.index(4) {
+                mutate(&mut rng, &mut data);
+            }
             // Keep the version 0 most of the time, so mutations reach the
             // options.
             if i % 8 != 0

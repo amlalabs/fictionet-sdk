@@ -4,7 +4,8 @@ use core::fmt::Debug;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Stream, Wire, contract, test_support::decode_all,
+    Collect, CollectError, Decode, Fail, Stream, Wire, contract,
+    test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp};
 
@@ -21,10 +22,12 @@ where
     contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), &bytes, 2 * (limit + 1));
 
     let mut stream = Stream::new(Collect::<M>::new(limit));
-    assert_eq!(stream.push(&bytes), bytes.len());
-    assert!(stream.next().is_none());
-    assert!(stream.buffered() <= limit);
-    assert_eq!(stream.held(), 0);
+    for chunk in chunks(&bytes, &[1, 7, 2, 31]) {
+        assert_eq!(stream.push(chunk), chunk.len());
+        assert!(stream.next().is_none());
+        assert!(stream.buffered() <= limit);
+        assert_eq!(stream.held(), 0);
+    }
     stream.end();
     let (decoded, span) = stream.next_span().unwrap().unwrap();
     assert_eq!(&decoded, value);
@@ -94,6 +97,10 @@ fn geneve_datagram() {
     round_trip(&packet, geneve::MAX_DATAGRAM);
     let mut header = round_trip(&packet.header, geneve::MAX_HEADER_LEN);
     header.push(0);
+    assert_eq!(
+        geneve::Header::parse(&header),
+        Err(geneve::GeneveError::Trailing { remaining: 1 })
+    );
     parse_failure::<geneve::Header>(&header, geneve::MAX_HEADER_LEN);
     parse_failure::<geneve::Packet>(&[], geneve::MAX_DATAGRAM);
     let mut bad = packet;
@@ -224,6 +231,10 @@ fn ipsec_carriers() {
     round_trip(&ah, ipsec::MAX_PACKET);
     let mut header = round_trip(&ah.header, ipsec::MAX_AH_LEN);
     header.push(0);
+    assert_eq!(
+        ipsec::AhHeader::parse(&header),
+        Err(ipsec::IpsecError::Trailing { remaining: 1 })
+    );
     parse_failure::<ipsec::AhHeader>(&header, ipsec::MAX_AH_LEN);
     let plain = ipsec::Plaintext::padded(vec![1, 2, 3], 4, 8).unwrap();
     round_trip(&plain, ipsec::MAX_PACKET);
@@ -451,7 +462,7 @@ fn vrrp_context_stays_in_the_mapping() {
         bytes.push(0);
         assert_eq!(
             vrrp::Advertisement::parse(&bytes, &endpoints),
-            Err(vrrp::VrrpError::Trailing)
+            Err(vrrp::VrrpError::Trailing { remaining: 1 })
         );
         context_round_trip::<vrrp::Datagram, _, _>(&bytes, vrrp::MAX_MESSAGE, |b| {
             vrrp::Advertisement::parse(b, &endpoints)

@@ -100,7 +100,6 @@
 //! assert_eq!(reports.len(), 1);
 //! assert_eq!(reports[0].to_bytes().unwrap(), [0x22, 0, 0xea, 0xf9, 0, 0, 0, 1, 2, 0, 0, 0, 239, 1, 2, 3]);
 //! ```
-//!
 
 use super::codec::Wire;
 
@@ -936,6 +935,7 @@ mod tests {
             let b = fix(b);
             assert_eq!(Message::receive(&b), Ok(m));
             assert_eq!(collect(&b), Err(IgmpError::Trailing { remaining: 5 }));
+            check_bytes(&b);
         }
     }
 
@@ -1350,12 +1350,14 @@ mod tests {
         let parsed = Message::parse(data);
         if let Ok(m) = &parsed {
             assert_eq!(Message::receive(data).as_ref(), Ok(m));
+        }
+        if let Ok(m) = Message::receive(data) {
             // A message read follows the RFCs, can be written, and reads
             // back the same.
-            assert!(conforms(m), "{m:?}");
+            assert!(conforms(&m), "{m:?}");
             let out = m.to_bytes().unwrap();
             assert!(out.len() <= data.len());
-            assert_eq!(Message::parse(&out).as_ref(), Ok(m));
+            assert_eq!(Message::parse(&out), Ok(m));
         }
         assert_eq!(collect(data), parsed);
     }

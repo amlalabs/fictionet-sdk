@@ -77,7 +77,8 @@
 //! // Written back, the Hello is the same bytes.
 //! assert_eq!(hello.frame(&ends).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
 //! ```
-//!
+
+use super::codec::Wire;
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
@@ -441,7 +442,10 @@ pub enum PimError {
     /// The bytes end before the message does.
     Truncated,
     /// Bytes follow the end of the message.
-    Trailing,
+    Trailing {
+        /// Number of bytes after the PIM message.
+        remaining: usize,
+    },
     /// The message is longer than [`MAX_MESSAGE`], or than
     /// [`MAX_MESSAGE_V4`] over IPv4.
     TooLong,
@@ -551,7 +555,9 @@ impl std::fmt::Display for PimError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PimError::Truncated => write!(f, "the message is cut short"),
-            PimError::Trailing => write!(f, "bytes follow the end of the message"),
+            PimError::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after the PIM message")
+            }
             PimError::TooLong => write!(f, "the message is longer than its IP packet can carry"),
             PimError::Version(v) => write!(f, "version {v}, not 2"),
             PimError::Checksum => write!(f, "the checksum is wrong"),
@@ -675,7 +681,7 @@ fn check_inner(p: &[u8], addr_len: usize) -> Result<(), PimError> {
 }
 
 /// Checks a multicast group and conflicting Join/Prune entries.
-/// Fixed-width radix passes keep work and storage proportional to the list size.
+/// The message limit bounds the number of entries sorted.
 fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), PimError> {
     if !g.group.address.is_multicast() || g.group.mask_len != full_mask(g.group.address) {
         return Err(PimError::JoinPruneGroup);
@@ -692,38 +698,16 @@ fn check_join_prune_group(g: &JoinPruneGroup) -> Result<(), PimError> {
                 wildcard = true;
                 continue;
             }
-            let mut key = [0u8; 19];
-            match source.address {
-                IpAddr::V4(a) => key[1..5].copy_from_slice(&a.octets()),
-                IpAddr::V6(a) => {
-                    key[0] = 1;
-                    key[1..17].copy_from_slice(&a.octets());
-                }
-            }
-            key[17] = u8::from(source.rpt);
-            key[18] = u8::from(pruned);
-            entries.push(key);
+            entries.push((source.address, source.rpt, pruned));
         }
     }
-    if entries.len() < 2 { return Ok(()); }
-    let mut scratch = vec![[0u8; 19]; entries.len()];
-    for byte in (0..19).rev() {
-        let mut offsets = [0usize; 256];
-        for key in &entries { offsets[usize::from(key[byte])] += 1; }
-        let mut at = 0;
-        for offset in &mut offsets {
-            let count = *offset;
-            *offset = at;
-            at += count;
-        }
-        for key in &entries {
-            let offset = &mut offsets[usize::from(key[byte])];
-            scratch[*offset] = *key;
-            *offset += 1;
-        }
-        std::mem::swap(&mut entries, &mut scratch);
-    }
-    if entries.windows(2).any(|w| w[0][..18] == w[1][..18] && w[0][18] != w[1][18]) {
+    // Sorted by address, then tree, then list: a joined entry and a pruned
+    // one for the same address and tree end up next to each other.
+    entries.sort_unstable();
+    if entries
+        .windows(2)
+        .any(|w| w[0].0 == w[1].0 && w[0].1 == w[1].1 && w[0].2 != w[1].2)
+    {
         return Err(PimError::SourceList);
     }
     Ok(())
@@ -789,7 +773,13 @@ impl<'a> Reader<'a> {
     }
 
     fn end(&self) -> Result<(), PimError> {
-        if self.b.is_empty() { Ok(()) } else { Err(PimError::Trailing) }
+        if self.b.is_empty() {
+            Ok(())
+        } else {
+            Err(PimError::Trailing {
+                remaining: self.b.len(),
+            })
+        }
     }
 
     /// The family and encoding type bytes, checked, and the address
@@ -1461,21 +1451,25 @@ pub struct Datagram(
     pub Vec<u8>,
 );
 
-impl super::codec::Wire for Datagram {
+impl Wire for Datagram {
     type ParseError = PimError;
     type WriteError = PimError;
 
     /// Copies a complete payload. Refuses more than [`MAX_MESSAGE`] bytes.
     /// Protocol and checksum checks require the contextual parser.
     fn parse(bytes: &[u8]) -> Result<Self, PimError> {
-        if bytes.len() > MAX_MESSAGE { return Err(PimError::TooLong); }
+        if bytes.len() > MAX_MESSAGE {
+            return Err(PimError::TooLong);
+        }
         Ok(Self(bytes.to_vec()))
     }
 
     /// Appends the payload unchanged. Refuses more than [`MAX_MESSAGE`] bytes.
     /// Leaves `out` unchanged on error. Does not compute or check a checksum.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), PimError> {
-        if self.0.len() > MAX_MESSAGE { return Err(PimError::TooLong); }
+        if self.0.len() > MAX_MESSAGE {
+            return Err(PimError::TooLong);
+        }
         out.extend_from_slice(&self.0);
         Ok(())
     }
@@ -1902,7 +1896,10 @@ mod tests {
         assert_eq!(Message::parse(&stop(&[1, 1, 0, 32, 1, 1, 1, 1]), &e), Err(PimError::Encoding(1)));
         assert_eq!(Message::parse(&stop(&[1, 0, 0, 33, 1, 1, 1, 1]), &e), Err(PimError::MaskLen(33)));
         assert_eq!(Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1]), &e), Err(PimError::Truncated));
-        assert_eq!(Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 9]), &e), Err(PimError::Trailing));
+        assert_eq!(
+            Message::parse(&stop(&[1, 0, 0, 32, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 9]), &e),
+            Err(PimError::Trailing { remaining: 1 })
+        );
         // An IPv6 group may have a 128-bit mask, but no more.
         let e6 = v6_ends();
         let stop6 = |rest: &[u8]| fix([&[0x22, 0, 0, 0][..], rest].concat(), &e6);
@@ -1935,7 +1932,10 @@ mod tests {
         });
         let mut b = a.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         b.push(0);
-        assert_eq!(Message::parse(&fix(b, &e), &e), Err(PimError::Trailing));
+        assert_eq!(
+            Message::parse(&fix(b, &e), &e),
+            Err(PimError::Trailing { remaining: 1 })
+        );
         // The IPv6 checksum covers the pseudo-header, so the endpoints
         // must match.
         let b = samples(&v6_ends())[5].frame(&v6_ends()).and_then(|frame| frame.to_bytes()).unwrap();

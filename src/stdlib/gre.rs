@@ -47,7 +47,6 @@
 //! assert_eq!(back, packet);
 //! assert_eq!(back.header.key(), Some(7));
 //! ```
-//!
 
 use super::codec::Wire;
 
@@ -880,16 +879,20 @@ mod tests {
     fn random_packet(rng: &mut Lcg) -> Packet {
         if rng.index(3) == 0 {
             // PPTP carries a sequence number exactly when it carries data.
-            let sequence = rng.maybe();
-            let n = if sequence.is_some() { rng.index(47) + 1 } else { 0 };
+            let n = if rng.coin() { 47 } else { 0 };
+            let payload = rng.bytes(n);
+            let sequence = (!payload.is_empty()).then(|| rng.next() as u32);
             let header = pptp(rng.next() as u16, sequence, rng.maybe());
-            return Packet { header, payload: { let mut bytes = vec![0; n]; rng.fill(&mut bytes); bytes } };
+            return Packet { header, payload };
         }
         let protocols = [protocol::IPV4, protocol::IPV6, protocol::TRANSPARENT_ETHERNET_BRIDGING, rng.next() as u16];
         let proto = protocols[rng.index(protocols.len())];
         let header = gre(proto, !rng.coin(), rng.maybe(), rng.maybe());
         let n = rng.index(48);
-        Packet { header, payload: { let mut bytes = vec![0; n]; rng.fill(&mut bytes); bytes } }
+        Packet {
+            header,
+            payload: rng.bytes(n),
+        }
     }
 
     #[test]

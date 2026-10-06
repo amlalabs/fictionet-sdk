@@ -66,7 +66,6 @@
 //! assert_eq!(Datagram::parse(&[0xff]), Ok(Datagram::Keepalive));
 //! assert_eq!(Datagram::parse(&[0, 0, 0, 0, 1]), Ok(Datagram::Ike(vec![1])));
 //! ```
-//!
 
 use super::codec::Wire;
 
@@ -140,7 +139,10 @@ pub enum IpsecError {
     /// payload shorter than the trailer's two bytes.
     Truncated,
     /// Bytes follow a standalone AH header.
-    Trailing,
+    Trailing {
+        /// Number of bytes after the AH header.
+        remaining: usize,
+    },
     /// The bytes are longer than [`MAX_PACKET`], or a datagram is longer
     /// than [`MAX_DATAGRAM`].
     TooLong,
@@ -167,7 +169,9 @@ pub enum IpsecError {
 impl std::fmt::Display for IpsecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IpsecError::Trailing => f.write_str("bytes follow the AH header"),
+            IpsecError::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after the AH header")
+            }
             IpsecError::Truncated => f.write_str("bytes end inside the IPsec packet"),
             IpsecError::TooLong => write!(f, "IPsec packet longer than {MAX_PACKET} bytes"),
             IpsecError::ZeroSpi => f.write_str("SPI of zero"),
@@ -581,9 +585,9 @@ impl Wire for Datagram {
     type ParseError = IpsecError;
     type WriteError = IpsecError;
 
-    /// Reads the datagram whose UDP payload is `b`. It fails with
-    /// [`IpsecError::TooLong`] for more than [`MAX_DATAGRAM`] bytes.
-    /// Refuses truncation, invalid length fields, and bytes above the carrier limit.
+    /// Reads the datagram whose UDP payload is `b`. Refuses truncation
+    /// and an ESP packet with a zero SPI. Returns [`IpsecError::TooLong`]
+    /// for more than [`MAX_DATAGRAM`] bytes.
     fn parse(b: &[u8]) -> Result<Self, IpsecError> {
         if b == [KEEPALIVE] {
             return Ok(Datagram::Keepalive);
@@ -605,7 +609,9 @@ impl Wire for Datagram {
     /// still exceed an IPv4 payload; see [`Self::fits_ipv4`].
     /// Leaves `out` unchanged on error.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), IpsecError> {
-        if self.wire_len() > MAX_DATAGRAM { return Err(IpsecError::TooLong); }
+        if self.wire_len() > MAX_DATAGRAM {
+            return Err(IpsecError::TooLong);
+        }
         match self {
             Self::Keepalive => out.push(KEEPALIVE),
             Self::Ike(message) => {
@@ -626,7 +632,11 @@ impl Wire for AhHeader {
     /// truncation, and bytes after the header.
     fn parse(b: &[u8]) -> Result<Self, IpsecError> {
         let (header, used) = Self::parse_prefix(b)?;
-        if used != b.len() { return Err(IpsecError::Trailing); }
+        if used != b.len() {
+            return Err(IpsecError::Trailing {
+                remaining: b.len() - used,
+            });
+        }
         Ok(header)
     }
 
@@ -673,6 +683,10 @@ mod tests {
         let _ = check::<EspPacket>(MAX_PACKET, b);
         let _ = check::<AhPacket>(MAX_PACKET, b);
         let _ = check::<Datagram>(MAX_DATAGRAM, b);
+        if let Ok(plain) = Plaintext::parse(b) {
+            assert_eq!(plain.to_bytes().unwrap(), b);
+            assert_eq!(plain.len(), b.len());
+        }
     }
 
     fn esp(spi: u32, sequence: u32, payload: &[u8]) -> EspPacket {
@@ -998,6 +1012,7 @@ mod tests {
     fn errors_display() {
         let all = [
             IpsecError::Truncated,
+            IpsecError::Trailing { remaining: 1 },
             IpsecError::TooLong,
             IpsecError::ZeroSpi,
             IpsecError::AhLength(0),

@@ -26,9 +26,9 @@
 //! [`PROTOCOL`], usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`].
 //! For pieces of one payload, use [`Stream<Frames>`](super::codec::Stream)
 //! with `Frames = Collect<Datagram>` and a limit of [`MAX_MESSAGE`].
-//! Map the payload through [`Packet::parse`], and
-//! call `end` at the IP packet boundary. Which routers and links exist,
-//! when Hellos go out, and how routes are worked out are up to world code.
+//! Map the payload through [`Packet::parse`], and call `end` at the IP
+//! packet boundary. Which routers and links exist, when Hellos go out,
+//! and how routes are worked out are up to world code.
 //!
 //! Every reader checks the version, packet type, lengths, counts and both
 //! checksums, because the agent can send any bytes it likes. A payload
@@ -94,7 +94,6 @@
 //! bad[30] ^= 1;
 //! assert!(Packet::parse(&bad, &link).is_err());
 //! ```
-//!
 
 use super::codec::Wire;
 
@@ -768,7 +767,10 @@ pub enum OspfError {
     /// The bytes end before the packet or LSA does.
     Truncated,
     /// Bytes follow the end the length gives.
-    Trailing,
+    Trailing {
+        /// Number of bytes after the OSPF packet.
+        remaining: usize,
+    },
     /// The version is not 2 or 3.
     Version(u8),
     /// The version does not match the IP family: OSPFv2 over IPv6 or
@@ -812,7 +814,9 @@ impl std::fmt::Display for OspfError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OspfError::Truncated => f.write_str("OSPF packet or LSA cut short"),
-            OspfError::Trailing => f.write_str("bytes after the end of the OSPF packet"),
+            OspfError::Trailing { remaining } => {
+                write!(f, "{remaining} bytes after the OSPF packet")
+            }
             OspfError::Version(v) => write!(f, "OSPF version {v}, not 2 or 3"),
             OspfError::Family => f.write_str("OSPF version does not match the IP family"),
             OspfError::Type(t) => write!(f, "OSPF packet type {t}, not 1 to 5"),
@@ -1725,7 +1729,7 @@ impl Packet {
             return Err(OspfError::Truncated);
         }
         if b.len() > end {
-            return Err(OspfError::Trailing);
+            return Err(OspfError::Trailing { remaining: b.len() - end });
         }
         let v = endpoints.version();
         let len = usize::from(be16(b, 2));
@@ -2734,7 +2738,10 @@ mod tests {
         assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Truncated));
         b = good.clone();
         b.push(0);
-        assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Trailing));
+        assert_eq!(
+            Packet::parse(&b, &e4),
+            Err(OspfError::Trailing { remaining: 1 })
+        );
         b = good.clone();
         b[12] ^= 0x10;
         assert_eq!(Packet::parse(&b, &e4), Err(OspfError::Checksum));
@@ -2779,7 +2786,10 @@ mod tests {
         assert_eq!(Packet::parse(&b[..b.len() - 1], &e), Err(OspfError::Truncated));
         let mut long = b.clone();
         long.push(0);
-        assert_eq!(Packet::parse(&long, &e), Err(OspfError::Trailing));
+        assert_eq!(
+            Packet::parse(&long, &e),
+            Err(OspfError::Trailing { remaining: 1 })
+        );
         // A digest over 255 bytes cannot be written.
         p.header = Header::V2 { auth: Auth::Cryptographic { key_id: 3, sequence: 77, digest: vec![9; 256] } };
         assert_eq!(p.frame(&e).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
@@ -3069,8 +3079,14 @@ mod tests {
         assert_eq!(Packet::parse(&b[..46], &e), Err(OspfError::Truncated));
         let mut long = b.clone();
         long.extend_from_slice(&[0; 4]);
-        assert_eq!(Packet::parse(&long, &e), Err(OspfError::Trailing));
-        assert_eq!(collect(&long, &e), Err(OspfError::Trailing));
+        assert_eq!(
+            Packet::parse(&long, &e),
+            Err(OspfError::Trailing { remaining: 4 })
+        );
+        assert_eq!(
+            collect(&long, &e),
+            Err(OspfError::Trailing { remaining: 4 })
+        );
         // The L bit set and no block: the packet reads, with none.
         let mut alone = p.clone();
         alone.lls = None;
@@ -3092,7 +3108,10 @@ mod tests {
         let mut clear = b.clone();
         clear[30] = 0x02;
         let clear = fix(clear, &e);
-        assert_eq!(Packet::parse(&clear, &e), Err(OspfError::Trailing));
+        assert_eq!(
+            Packet::parse(&clear, &e),
+            Err(OspfError::Trailing { remaining: 12 })
+        );
         // Writers: a block needs the L bit, a Hello or DD, and whole words.
         let mut q = p.clone();
         let Body::HelloV2(h) = &mut q.body else { panic!() };
@@ -3398,9 +3417,17 @@ mod tests {
         assert_eq!(collect(&[2], &v6_ends()), Err(OspfError::Family));
         let mut b = hello_v2(ip4(1, 1, 1, 1), vec![]).frame(&v4_ends()).unwrap().to_bytes().unwrap();
         b.push(0);
-        assert_eq!(collect(&b, &v4_ends()), Err(OspfError::Trailing));
+        assert_eq!(
+            collect(&b, &v4_ends()),
+            Err(OspfError::Trailing { remaining: 1 })
+        );
         b.resize(MAX_MESSAGE + 100, 0);
-        assert_eq!(collect(&b, &v4_ends()), Err(OspfError::Trailing));
+        assert_eq!(
+            collect(&b, &v4_ends()),
+            Err(OspfError::Trailing {
+                remaining: MAX_MESSAGE + 100 - 44
+            })
+        );
         assert_eq!(collect(&[], &v4_ends()), Err(OspfError::Truncated));
     }
 
