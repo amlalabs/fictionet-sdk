@@ -1,5 +1,5 @@
 //! A small office subnet for a port scanner: four simulated machines and
-//! one real container, behind one router.
+//! one real container, on a [`Net`].
 //!
 //! ```text
 //! cargo run --example scan -- /run/fictionet/world.sock
@@ -8,34 +8,35 @@
 //! The world waits for two sandboxes:
 //!
 //! - `container`, a real container at 10.0.0.50 with whatever services it
-//!   runs (nginx and OpenSSH in `examples/scan/compose.yaml`).
-//! - `scanner`, the agent, at 10.0.9.2 in a subnet of its own, so that a
-//!   scan of 10.0.0.0/24 does not find the scanner itself.
+//!   runs (nginx and OpenSSH in `examples/scan/compose.yaml`), wired with
+//!   [`Net::route`] as a trusted host of the office subnet.
+//! - `scanner`, the agent, at 10.0.9.2 in the sandboxes' subnet of the
+//!   `Net`, so that a scan of 10.0.0.0/24 does not find the scanner itself.
 //!
-//! The simulated machines are built from the stdlib. Each has a
-//! [`tcp::endpoint`] with listeners on its open ports, a [`udp::endpoint`]
-//! with none, and answers pings. A port with no listener answers a SYN with
-//! a RST, so a scanner reports it closed rather than filtered. Each open
-//! port sends a banner, or answers HTTP, so `nmap -sV` can name it.
+//! The simulated machines are [`Host`]s. Each open port runs a small
+//! [`Service`]: one sends a banner when a client connects, the other answers
+//! each HTTP request with a page, so `nmap -sV` can name them. A port with no
+//! service answers a SYN with a RST, so a scanner reports it closed rather
+//! than filtered; an address with no host answers "host unreachable".
 //!
-//! The parts are [groups](fictionet::Cx#groups), so the dashboard shows
-//! "scanner", "real container" and "simulated hosts", with one group per
-//! machine inside the last. `examples/scan/README.md` runs it all under
-//! Docker Compose with nmap.
+//! The dashboard shows the network as one group, "simulated hosts", with one group
+//! per machine inside it, and the two sandboxes in groups of their own.
+//! `examples/scan/README.md` runs it all under Docker Compose with nmap.
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::convert::Infallible;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
-use fictionet::prelude::*;
-use fictionet::stdlib::route::{self, Prefix};
-use fictionet::stdlib::{ConnError, icmp, ip, tcp, udp};
+use fictionet::stdlib::codec::{Decode, Step};
+use fictionet::stdlib::net::{Host, Net};
+use fictionet::stdlib::route::Prefix;
+use fictionet::stdlib::serve::{Flow, ServeCtx, Service};
 use fictionet::time::{Duration, ms};
-use fictionet::{Attachments, Cx, End, Interface, Result, pair};
+use fictionet::{Attachments, Cx, Result};
 
 /// What answers on an open port.
 #[derive(Clone, Copy)]
-enum Service {
+enum Kind {
     /// Sends this line when a client connects, then waits for it to leave.
     Banner(&'static str),
     /// Answers every HTTP request with a small page. `status` is the start
@@ -48,10 +49,10 @@ enum Service {
 struct Machine {
     name: &'static str,
     host: u8,
-    ports: &'static [(u16, Service)],
+    ports: &'static [(u16, Kind)],
 }
 
-const OPENSSH: Service = Service::Banner("SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3\r\n");
+const OPENSSH: Kind = Kind::Banner("SSH-2.0-OpenSSH_9.2p1 Debian-2+deb12u3\r\n");
 
 const MACHINES: &[Machine] = &[
     Machine {
@@ -59,29 +60,29 @@ const MACHINES: &[Machine] = &[
         host: 10,
         ports: &[
             (22, OPENSSH),
-            (80, Service::Http { status: "HTTP/1.1 200 OK", server: "Apache/2.4.62 (Debian)", title: "Intranet" }),
+            (80, Kind::Http { status: "HTTP/1.1 200 OK", server: "Apache/2.4.62 (Debian)", title: "Intranet" }),
         ],
     },
     Machine {
         name: "mail",
         host: 11,
         ports: &[
-            (25, Service::Banner("220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n")),
-            (110, Service::Banner("+OK Dovecot ready.\r\n")),
-            (143, Service::Banner("* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN] Dovecot ready.\r\n")),
+            (25, Kind::Banner("220 mail.corp.test ESMTP Postfix (Debian/GNU)\r\n")),
+            (110, Kind::Banner("+OK Dovecot ready.\r\n")),
+            (143, Kind::Banner("* OK [CAPABILITY IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE LITERAL+ STARTTLS AUTH=PLAIN] Dovecot ready.\r\n")),
         ],
     },
     Machine {
         name: "files",
         host: 12,
-        ports: &[(21, Service::Banner("220 (vsFTPd 3.0.3)\r\n")), (22, OPENSSH)],
+        ports: &[(21, Kind::Banner("220 (vsFTPd 3.0.3)\r\n")), (22, OPENSSH)],
     },
     Machine {
         name: "printer",
         host: 13,
         ports: &[
-            (80, Service::Http { status: "HTTP/1.0 200 OK", server: "lighttpd/1.4.69 (Linux)", title: "LaserJet M507" }),
-            (631, Service::Http { status: "HTTP/1.0 200 OK", server: "CUPS/2.4 IPP/2.1", title: "Home - CUPS 2.4.2" }),
+            (80, Kind::Http { status: "HTTP/1.0 200 OK", server: "lighttpd/1.4.69 (Linux)", title: "LaserJet M507" }),
+            (631, Kind::Http { status: "HTTP/1.0 200 OK", server: "CUPS/2.4 IPP/2.1", title: "Home - CUPS 2.4.2" }),
         ],
     },
 ];
@@ -90,7 +91,7 @@ const MACHINES: &[Machine] = &[
 const SUBNET: [u8; 3] = [10, 0, 0];
 /// The real container's address.
 const CONTAINER: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 50);
-/// The scanner's subnet.
+/// The scanner's subnet: the sandboxes' subnet of the `Net`.
 const SCANNER_NET: &str = "10.0.9.0/24";
 
 fn main() -> Result {
@@ -101,141 +102,101 @@ fn main() -> Result {
     fictionet::block_on(fictionet::run(move |cx| world(cx, attachments)))
 }
 
-async fn world(cx: Cx, mut attachments: Attachments) -> Result {
-    let router = route::router(&cx, Vec::new());
-    let hosts = cx.group("simulated hosts");
+async fn world(cx: Cx, attachments: Attachments) -> Result {
+    let mut net = Net::new().group("simulated hosts").subnet(SCANNER_NET.parse()?).ipv4_only();
     for m in MACHINES {
-        let addr = Ipv4Addr::new(SUBNET[0], SUBNET[1], SUBNET[2], m.host);
-        let (router_side, machine_side) = pair();
-        router.add(Prefix { addr: addr.into(), len: 32 }, Box::new(router_side));
-        machine(&hosts.group(format!("{} {addr}", m.name)), machine_side, addr.into(), m.ports)?;
+        let mut host = Host::new(m.name).at(Ipv4Addr::new(SUBNET[0], SUBNET[1], SUBNET[2], m.host));
+        for &(port, kind) in m.ports {
+            host = host.tcp(port, Arc::new(()), move || Port { kind, request: 0 });
+        }
+        net = net.add(host);
     }
     // Each sandbox goes through a short delay started in its own group, so
     // the group holds the task that reads the sandbox, and the sandbox with
-    // it. Sandboxes that come back after detaching are wired again.
-    while let Some(sandbox) = attachments.next(&cx).await {
-        let (prefix, group, by): (Prefix, _, Duration) = match sandbox.name() {
-            "container" => (Prefix { addr: CONTAINER.into(), len: 32 }, cx.group("real container"), ms(1)),
-            "scanner" => (SCANNER_NET.parse()?, cx.group("scanner"), ms(2)),
-            other => {
-                println!("turned away {other}: this world wires only container and scanner");
-                continue;
-            }
+    // it.
+    let delayed = attachments.map(&cx, |cx, sandbox| {
+        let (group, by): (&str, Duration) = match sandbox.name() {
+            "container" => ("real container", ms(1)),
+            _ => ("scanner", ms(2)),
         };
         println!("attached {}", sandbox.name());
-        router.add(prefix, Box::new(fictionet::stdlib::delay(&group, by, sandbox)));
-    }
+        fictionet::stdlib::delay(&cx.group(group), by, sandbox)
+    });
+    net.route("container", Prefix { addr: CONTAINER.into(), len: 32 }).serve(&cx, delayed)?;
     Ok(())
 }
 
-/// Starts one simulated machine at `addr` on `side`, all of it in `cx`'s
-/// group.
-fn machine(cx: &Cx, side: End, addr: IpAddr, ports: &'static [(u16, Service)]) -> Result {
-    let (tcp, udp, icmp, _other) = ip::split_protocols(cx, side);
-    let tcp = tcp::endpoint(cx, tcp, addr);
-    // No UDP ports are open: every datagram gets "port unreachable".
-    let _udp = udp::endpoint(cx, udp, addr);
-    cx.spawn(move |cx| pings(cx, icmp, addr));
-    for &(port, service) in ports {
-        let listener = tcp.listen(port)?;
-        cx.spawn(move |cx| accept(cx, listener, service));
-    }
-    // The endpoint lives on in its task; the listeners keep it reachable.
-    drop(tcp);
-    Ok(())
+/// One open port: a banner, or a page for each request.
+struct Port {
+    kind: Kind,
+    /// Bytes of the request so far, for an HTTP port.
+    request: usize,
 }
 
-/// Answers pings to `addr`.
-async fn pings(cx: Cx, mut icmp: End, addr: IpAddr) -> Result {
-    while let Ok(packet) = icmp.recv(&cx).await {
-        if let Some(reply) = icmp::echo_reply(&packet, addr) {
-            icmp.send(reply);
-        }
-    }
-    Ok(())
+/// The most of a request a page port reads before it answers anyway.
+const REQUEST_LIMIT: usize = 16 << 10;
+
+/// Reads a request up to the end of its head, or [`REQUEST_LIMIT`] bytes,
+/// whichever comes first; and for a banner port, takes and ignores
+/// everything.
+struct Head {
+    ignore: bool,
 }
 
-/// Connections one port serves at once. The agent could otherwise keep
-/// thousands open, each with its task and buffers. Past this, a new
-/// connection is closed as soon as it is accepted.
-const CONNECTIONS: usize = 64;
+impl Decode for Head {
+    type Item = ();
+    type Error = Infallible;
+    const NAME: &'static str = "scan request";
 
-/// Accepts connections on one port, and serves each in a task of its own.
-async fn accept(cx: Cx, mut listener: tcp::Listener, service: Service) -> Result {
-    let open = Arc::new(AtomicUsize::new(0));
-    while let Ok(conn) = listener.accept(&cx).await {
-        if open.load(Ordering::Relaxed) >= CONNECTIONS {
-            drop(conn);
-            continue;
-        }
-        open.fetch_add(1, Ordering::Relaxed);
-        let open = open.clone();
-        cx.spawn(move |cx| async move {
-            // A client that resets or vanishes is no error.
-            let _ = serve(&cx, conn, service).await;
-            open.fetch_sub(1, Ordering::Relaxed);
-            Ok(())
-        });
+    fn capacity(&self) -> usize {
+        REQUEST_LIMIT + 4
     }
-    Ok(())
+
+    fn decode(&mut self, input: &[u8], _eof: bool) -> std::result::Result<Step<()>, Infallible> {
+        if input.is_empty() {
+            return Ok(Step::Need);
+        }
+        if self.ignore {
+            return Ok(Step::Skip(input.len()));
+        }
+        if let Some(at) = input.windows(4).position(|w| w == b"\r\n\r\n") {
+            return Ok(Step::Item((), at + 4));
+        }
+        if input.len() > REQUEST_LIMIT {
+            return Ok(Step::Item((), input.len()));
+        }
+        Ok(Step::Need)
+    }
 }
 
-/// How long a connection may stay quiet before the machine closes it.
-const IDLE: Duration = Duration::from_secs(10);
+impl Service for Port {
+    type Decode = Head;
+    type World = ();
+    type Error = Infallible;
 
-async fn serve(cx: &Cx, mut conn: tcp::TcpConnection, service: Service) -> std::result::Result<(), ConnError> {
-    let mut buf = vec![0u8; 4096];
-    match service {
-        Service::Banner(line) => {
-            conn.write_all(cx, line.as_bytes()).await?;
-            // Read and ignore what the client says until it leaves or goes
-            // quiet.
-            while let Some(Ok(n)) = timeout(cx, conn.read(cx, &mut buf)).await {
-                if n == 0 {
-                    break;
-                }
-            }
-        }
-        Service::Http { status, server, title } => {
-            let mut request = Vec::new();
-            loop {
-                let Some(read) = timeout(cx, conn.read(cx, &mut buf)).await else { break };
-                let n = read?;
-                if n == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buf[..n]);
-                if request.windows(4).any(|w| w == b"\r\n\r\n") || request.len() > 16 << 10 {
-                    let body = format!("<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n");
-                    let head = format!(
-                        "{status}\r\nServer: {server}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        body.len()
-                    );
-                    conn.write_all(cx, head.as_bytes()).await?;
-                    conn.write_all(cx, body.as_bytes()).await?;
-                    break;
-                }
-            }
-        }
+    fn decoder(&self) -> Head {
+        Head { ignore: matches!(self.kind, Kind::Banner(_)) }
     }
-    conn.shutdown(cx).await
-}
 
-/// `work`, or `None` if it takes longer than [`IDLE`].
-async fn timeout<T>(cx: &Cx, work: impl std::future::Future<Output = T>) -> Option<T> {
-    let mut work = std::pin::pin!(work);
-    let sleep = cx.sleep(IDLE);
-    let mut sleep = std::pin::pin!(sleep);
-    std::future::poll_fn(|task| {
-        if let std::task::Poll::Ready(v) = work.as_mut().poll(task) {
-            return std::task::Poll::Ready(Some(v));
+    fn on_open(&mut self, _: &(), ctx: &mut ServeCtx<'_>) -> std::result::Result<Flow, Infallible> {
+        if let Kind::Banner(line) = self.kind {
+            ctx.reply().extend_from_slice(line.as_bytes());
         }
-        if sleep.as_mut().poll(task).is_ready() {
-            return std::task::Poll::Ready(None);
-        }
-        std::task::Poll::Pending
-    })
-    .await
+        Ok(Flow::Continue)
+    }
+
+    fn on_item(&mut self, _: (), _: &(), ctx: &mut ServeCtx<'_>) -> std::result::Result<Flow, Infallible> {
+        let Kind::Http { status, server, title } = self.kind else { return Ok(Flow::Continue) };
+        self.request += 1;
+        let body = format!("<!doctype html><html><head><title>{title}</title></head><body><h1>{title}</h1></body></html>\n");
+        let head = format!(
+            "{status}\r\nServer: {server}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        ctx.reply().extend_from_slice(head.as_bytes());
+        ctx.reply().extend_from_slice(body.as_bytes());
+        Ok(Flow::Close)
+    }
 }
 
 #[cfg(test)]

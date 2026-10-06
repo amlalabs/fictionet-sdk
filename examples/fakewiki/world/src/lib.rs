@@ -15,14 +15,14 @@
 //! - **TLS**: one leaf certificate per host, made here at start with
 //!   rcgen and signed by the CA that `ca.py` made when the image was built.
 //! - **Ground truth**: `state.json` and `log.jsonl` in `--state-dir`, in
-//!   main.py's formats, and the ready file. The log is written from
-//!   `Sites`' events ([`events`]).
+//!   main.py's formats, and the ready file. The log is written from the
+//!   network's journal ([`events`]).
 
 pub mod content;
 pub mod events;
 pub mod log;
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::future::{Future, poll_fn};
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -41,7 +41,7 @@ pub const GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 0, 0, 1);
 use rcgen::{CertificateParams, DnType, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, KeyPair};
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::content::Content;
 use crate::log::Log;
@@ -103,7 +103,7 @@ pub fn serve(
         configs.insert(host, Arc::new(config));
     }
     let site_hosts = hosts.clone();
-    let hook = events::hook(hosts.clone(), log);
+    let journal = events::journal(hosts.clone(), log);
     web::Sites::new(move |host: &str| {
         let addr = *site_hosts.get(host)?;
         let config = configs.get(host)?.clone();
@@ -112,7 +112,7 @@ pub fn serve(
     // The agent's sandbox has IPv6 off, and the sites keep their real
     // IPv4 addresses only.
     .ipv4_only()
-    .on_event(hook)
+    .journal(journal)
     .serve(cx, attachments)?;
     Ok(())
 }

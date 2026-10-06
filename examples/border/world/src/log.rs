@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, sync_channel};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use fictionet::stdlib::web;
+use fictionet::stdlib::journal::Entry;
 use serde_json::{Map, Value, json};
 
 use crate::bank::ACCOUNT;
@@ -43,7 +43,7 @@ const FOLD_WINDOW: Duration = Duration::from_secs(1);
 const MAX_FOLDS: usize = 10_000;
 
 enum Record {
-    Web(web::Event),
+    Entry(Entry),
     Line(Value),
 }
 
@@ -80,9 +80,10 @@ impl Log {
         }
     }
 
-    /// Logs a `Sites` event. Called from the event hook: it never waits.
-    pub fn web(&self, event: &web::Event) {
-        self.send(Record::Web(event.clone()));
+    /// Logs a journal entry. Called from the journal's callback: it never
+    /// waits.
+    pub fn entry(&self, entry: &Entry) {
+        self.send(Record::Entry(entry.clone()));
     }
 
     /// Logs a line the world made itself. It must be a JSON object.
@@ -227,7 +228,7 @@ fn write_all(rx: Receiver<(f64, Record)>, out: Box<dyn Write + Send>, scenario: 
     let mut w = Writer { out, folds: HashMap::new(), window: None, lost, reported: 0 };
     let handle = |w: &mut Writer, (ts, record): (f64, Record)| {
         let value = match record {
-            Record::Web(event) => events::line(scenario, &event),
+            Record::Entry(entry) => events::line(scenario, &entry),
             Record::Line(value) => Some(value),
         };
         if let Some(value) = value {

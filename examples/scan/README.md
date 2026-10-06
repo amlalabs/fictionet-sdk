@@ -11,9 +11,10 @@ answers nmap's service probes.
 
 ## What is in the world
 
-`main.rs` wires the network by hand, without `web::Sites`, because `Sites`
-keeps sandboxes from reaching each other, and here the scanner must reach
-the container. One `route::router` joins everything:
+`main.rs` builds the network with `net::Net`. The simulated machines are
+`Host`s on the office subnet, the scanner is a sandbox in the `Net`'s own
+subnet, and the container is wired in with `Net::route` as a trusted host
+at its fixed address, so the scanner can reach it:
 
 | Address | Host | Open TCP ports |
 |---|---|---|
@@ -24,13 +25,14 @@ the container. One `route::router` joins everything:
 | 10.0.0.50 | `container`, a real container | 22 (OpenSSH), 80 (nginx) |
 | 10.0.9.2 | `scanner`, the agent | |
 
-Each simulated machine is `ip::split_protocols`, a `tcp::endpoint` with a
-listener on each open port, a `udp::endpoint` with no ports open, and a
-task that answers pings with `icmp::echo_reply`. A listener sends a banner
-when a client connects, or answers each HTTP request with a small page.
-The banners are what the real programs send, so `nmap -sV` names them.
-Ports with no listener need no code: the stdlib's TCP answers a SYN to a
-closed port with a RST, as a kernel does.
+Each simulated machine is a `Host` with a small `Service` on each open
+port (`serve::Service`): one sends a banner when a client connects, the
+other answers each HTTP request with a page. The banners are what the real
+programs send, so `nmap -sV` names them. `Net` gives every machine a
+machine of its own: a `tcp::endpoint`, a `udp::endpoint` with no ports
+open, and ping replies. Ports with no service need no code: the stdlib's
+TCP answers a SYN to a closed port with a RST, as a kernel does, and an
+address with no host gets "host unreachable".
 
 The scanner sits in a subnet of its own, `10.0.9.0/24`. Scanning
 `10.0.0.0/24` from inside that range would list the scanner itself as a

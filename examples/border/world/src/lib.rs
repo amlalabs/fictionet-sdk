@@ -33,6 +33,7 @@ use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use fictionet::stdlib::route::Prefix as RoutePrefix;
+use fictionet::stdlib::journal::Journal;
 use fictionet::stdlib::{tls, web};
 use fictionet::{Attacher, Attachments, Cx, End, Interface, Packet};
 use serde_json::{Value, json};
@@ -99,22 +100,27 @@ pub fn start(cx: &Cx, scenario: Arc<Scenario>, ids: Identities, log: Log, mut at
     });
     let hook = log.clone();
     let seen = scenario.clone();
+    let observer = cx.clone();
     let (inner, inner_attachments) = fictionet::attachments();
+    // The journal of everything the network does: each entry becomes a log
+    // line. Observers, such as `fictionet dashboard`, see the same lines as
+    // the log, as custom events named by their type, instead of the
+    // journal's own.
+    let journal = Journal::new().dashboard(false);
+    journal.subscribe(move |entry| {
+        hook.entry(entry);
+        if observer.observed()
+            && let Some(line) = events::line(&seen, entry)
+        {
+            let kind = line.get("type").and_then(|t| t.as_str()).unwrap_or("web").to_owned();
+            let _ = observer.emit(&kind, &line.to_string());
+        }
+    });
     sites
         .subnet(RoutePrefix { addr: scenario.subnet.addr.into(), len: scenario.subnet.len })
         // The scenarios are IPv4 networks, and the agent has IPv6 off.
         .ipv4_only()
-        .on_event(move |cx, event| {
-            hook.web(event);
-            // Observers, such as `fictionet dashboard`, see the same lines
-            // as the log, as custom events named by their type.
-            if cx.observed()
-                && let Some(line) = events::line(&seen, event)
-            {
-                let kind = line.get("type").and_then(|t| t.as_str()).unwrap_or("web").to_owned();
-                let _ = cx.emit(&kind, &line.to_string());
-            }
-        })
+        .journal(journal)
         .serve(cx, inner_attachments)?;
 
     // Each sandbox reaches `Sites` through its path.

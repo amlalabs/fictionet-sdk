@@ -1,19 +1,19 @@
-//! The request log, written from `web::Sites` events: one line per DNS
-//! query, rejected or failed TLS handshake, and HTTP request, in the
-//! formats FakeWiki's main.py used.
+//! The request log, written from the journal of everything the network
+//! does: one line per DNS query, rejected or failed TLS handshake, and HTTP
+//! request, in the formats FakeWiki's main.py used.
 //!
 //! The handler ([`content`](crate::content)) puts what it knows about a
 //! page (its kind, topic, source and stance) in its response's extensions
-//! as a [`Page`]. The `Http` event brings it back here, so one `http` line
-//! holds both what the agent asked for and what it was shown.
+//! as journal fields ([`Page::fields`]). The `http.request` entry brings
+//! them back here, so one `http` line holds both what the agent asked for
+//! and what it was shown.
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use fictionet::Cx;
-use fictionet::stdlib::web::{self, DnsAnswer, Event, HttpAnswer, TlsOutcome};
-use http::header::USER_AGENT;
+use fictionet::stdlib::journal::{Entry, Fields, Journal, opt};
+use fictionet::stdlib::json::Value as J;
 use serde_json::{Value, json};
 
 use crate::log::Log;
@@ -35,47 +35,69 @@ pub struct Page {
     pub error: Option<String>,
 }
 
-/// The event callback for `web::Sites::on_event`.
-pub fn hook(hosts: HashMap<String, Ipv4Addr>, log: Arc<Log>) -> impl Fn(&Cx, &Event) + Send + Sync + 'static {
-    move |_cx, event| {
-        if let Some(line) = line(&hosts, event) {
-            log.write(line);
-        }
+impl Page {
+    /// The page as fields of its request's journal entry.
+    pub fn fields(&self) -> Fields {
+        Fields::new()
+            .with("kind", self.kind.as_str())
+            .with("topic", opt(self.topic.clone()))
+            .with("source", opt(self.source.clone()))
+            .with("stance", opt(self.stance.clone()))
+            .with("bytes", self.bytes)
+            .with("error", opt(self.error.clone()))
     }
 }
 
-/// The log line for `event`, if main.py logged such a thing.
-fn line(hosts: &HashMap<String, Ipv4Addr>, event: &Event) -> Option<Value> {
-    match event {
-        Event::Attached { sandbox, .. } if &*sandbox.name != LOOKUPS => {
-            println!("attached {}", sandbox.name);
+/// The journal that writes the request log.
+pub fn journal(hosts: HashMap<String, Ipv4Addr>, log: Arc<Log>) -> Journal {
+    let journal = Journal::new();
+    journal.subscribe(move |entry| {
+        if let Some(line) = line(&hosts, entry) {
+            log.write(line);
+        }
+    });
+    journal
+}
+
+fn text(e: &Entry, name: &str) -> Option<String> {
+    e.str(name).map(str::to_owned)
+}
+
+/// The log line for `entry`, if main.py logged such a thing.
+fn line(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Option<Value> {
+    let name = e.conn.sandbox.as_ref().map(|s| s.name.clone());
+    let ours = name.as_deref() == Some(LOOKUPS);
+    match (e.event.service, e.event.kind) {
+        ("net", "attached") if !ours => {
+            println!("attached {}", name.as_deref().unwrap_or(""));
             None
         }
-        Event::Detached { sandbox, .. } if &*sandbox.name != LOOKUPS => {
-            println!("detached {}", sandbox.name);
+        ("net", "detached") if !ours => {
+            println!("detached {}", name.as_deref().unwrap_or(""));
             None
         }
-        Event::Dns(d) if &*d.sandbox.name != LOOKUPS => Some(dns(hosts, d)),
-        Event::Tls(t) => tls(t),
-        Event::Http(h) => Some(http(hosts, h)),
+        ("dns", "query") if !ours => Some(dns(hosts, e)),
+        ("tls", "handshake") => tls(e),
+        ("http", "request") => Some(http(hosts, e)),
         _ => None,
     }
 }
 
 /// A DNS query, as main.py's `dns_answer` logged it, or a `dns_error` for
 /// one that could not be read.
-fn dns(hosts: &HashMap<String, Ipv4Addr>, d: &web::Dns) -> Value {
-    let (Some(name), Some(qtype)) = (&d.name, d.qtype) else {
-        let error = match d.answer {
-            DnsAnswer::None => "not a DNS query".to_owned(),
+fn dns(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
+    let (Some(name), Some(qtype)) = (text(e, "name"), e.u64("qtype")) else {
+        let error = match e.str("answer") {
+            Some("none") | None => "not a DNS query".to_owned(),
             _ => "malformed DNS query".to_owned(),
         };
         return json!({"type": "dns_error", "error": error});
     };
-    let ip = hosts.get(name);
+    let ip = hosts.get(&name);
+    let tcp = e.get("tcp").and_then(J::as_bool) == Some(true);
     json!({
         "type": "dns",
-        "via": if d.tcp { "tcp" } else { "udp" },
+        "via": if tcp { "tcp" } else { "udp" },
         "name": name,
         "qtype": qtype,
         "in_world": ip.is_some(),
@@ -85,19 +107,23 @@ fn dns(hosts: &HashMap<String, Ipv4Addr>, d: &web::Dns) -> Value {
     })
 }
 
-/// A TLS handshake that did not finish: `tls_reject` when `Sites` refused
+/// A TLS handshake that did not finish: `tls_reject` when the world refused
 /// the name, `tls_error` when the client gave up or broke the protocol.
-fn tls(t: &web::Tls) -> Option<Value> {
-    let error = match &t.outcome {
-        TlsOutcome::Accepted { .. } => return None,
-        TlsOutcome::Rejected => return Some(json!({"type": "tls_reject", "sni": t.sni, "in_world": false})),
-        TlsOutcome::Alert(a) => format!("the client sent alert {a} ({})", alert_name(*a)),
-        TlsOutcome::Failed(why) => why.chars().take(200).collect(),
-        TlsOutcome::Closed => "the client closed the connection before the handshake finished".to_owned(),
-        TlsOutcome::TimedOut => "the handshake did not finish within 10 seconds".to_owned(),
+fn tls(e: &Entry) -> Option<Value> {
+    let sni = text(e, "sni");
+    let error = match e.str("outcome")? {
+        "accepted" => return None,
+        "rejected" => return Some(json!({"type": "tls_reject", "sni": sni, "in_world": false})),
+        "alert" => {
+            let a = e.u64("alert").unwrap_or(0) as u8;
+            format!("the client sent alert {a} ({})", alert_name(a))
+        }
+        "failed" => e.str("detail").unwrap_or_default().chars().take(200).collect(),
+        "closed" => "the client closed the connection before the handshake finished".to_owned(),
+        "timed_out" => "the handshake did not finish within 10 seconds".to_owned(),
         _ => "the handshake failed".to_owned(),
     };
-    Some(json!({"type": "tls_error", "sni": t.sni, "error": error}))
+    Some(json!({"type": "tls_error", "sni": sni, "error": error}))
 }
 
 fn alert_name(a: u8) -> &'static str {
@@ -131,46 +157,57 @@ fn alert_name(a: u8) -> &'static str {
 
 /// An HTTP request, as main.py's handler logged it: the request, then
 /// what the world made of it.
-fn http(hosts: &HashMap<String, Ipv4Addr>, h: &web::Http) -> Value {
-    let host = h.host.clone().unwrap_or_default();
-    let path = h.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-    let ua = h.headers.get(USER_AGENT).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+fn http(hosts: &HashMap<String, Ipv4Addr>, e: &Entry) -> Value {
+    let host = text(e, "host").unwrap_or_default();
+    let path = match e.str("query") {
+        Some(q) => format!("{}?{q}", e.str("path").unwrap_or("/")),
+        None => e.str("path").unwrap_or("/").to_owned(),
+    };
+    let ua = e
+        .get("headers")
+        .and_then(J::as_array)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(J::as_array)
+        .find(|p| p.first().and_then(J::as_str) == Some("user-agent"))
+        .and_then(|p| p.get(1).and_then(J::as_str))
+        .map(str::to_owned);
     let mut entry = json!({
         "type": "http",
-        "scheme": h.scheme.as_str(),
-        "method": h.method.as_str(),
+        "scheme": e.str("scheme").unwrap_or_default(),
+        "method": e.str("method").unwrap_or_default(),
         "host": host,
-        "sni": h.sni,
+        "sni": text(e, "sni"),
         "path": path,
         "ua": ua.unwrap_or_default(),
     });
     let fields = entry.as_object_mut().expect("an object");
-    let mut bytes = h.sent;
-    match h.answer {
-        HttpAnswer::Handler => match h.extensions.get::<Page>() {
-            Some(page) => {
+    let mut bytes = e.u64("sent").unwrap_or(0);
+    match e.str("answer") {
+        Some("handler") => match text(e, "kind") {
+            Some(kind) => {
                 fields.insert("in_world".into(), json!(true));
-                fields.insert("kind".into(), json!(page.kind));
-                if page.kind != "backend_error" {
-                    fields.insert("topic".into(), json!(page.topic));
-                    fields.insert("source".into(), json!(page.source));
-                    fields.insert("stance".into(), json!(page.stance));
+                fields.insert("kind".into(), json!(kind));
+                if kind != "backend_error" {
+                    fields.insert("topic".into(), json!(text(e, "topic")));
+                    fields.insert("source".into(), json!(text(e, "source")));
+                    fields.insert("stance".into(), json!(text(e, "stance")));
                 }
-                if let Some(error) = &page.error {
+                if let Some(error) = text(e, "error") {
                     fields.insert("error".into(), json!(error));
                 }
-                bytes = page.bytes;
+                bytes = e.u64("bytes").unwrap_or(0);
             }
             None => {
                 fields.insert("in_world".into(), json!(true));
                 fields.insert("kind".into(), json!("other"));
             }
         },
-        HttpAnswer::Redirect => {
+        Some("redirect") => {
             fields.insert("in_world".into(), json!(true));
             fields.insert("kind".into(), json!("http_redirect"));
         }
-        HttpAnswer::Misdirected => {
+        Some("misdirected") => {
             // A FakeWiki host asked for at the wrong address, or over a
             // connection made for another host, is still in the world.
             let in_world = hosts.contains_key(&host);
@@ -179,20 +216,20 @@ fn http(hosts: &HashMap<String, Ipv4Addr>, h: &web::Http) -> Value {
                 fields.insert("kind".into(), json!("misdirected"));
             }
         }
-        HttpAnswer::Error => {
+        Some("error") => {
             fields.insert("in_world".into(), json!(true));
             fields.insert("kind".into(), json!("backend_error"));
         }
         // The agent gave up before the page came: main.py logged the
         // request before answering it, so it is logged here too, with no
         // status.
-        HttpAnswer::Cancelled => {
+        Some("cancelled") => {
             fields.insert("in_world".into(), json!(hosts.contains_key(&host)));
         }
         // No host: main.py logged an empty host, with no in_world.
         _ => {}
     }
-    fields.insert("status".into(), json!(h.status.map(|s| s.as_u16())));
+    fields.insert("status".into(), json!(e.u64("status")));
     fields.insert("bytes".into(), json!(bytes));
     entry
 }

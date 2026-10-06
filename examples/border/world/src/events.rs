@@ -9,116 +9,127 @@
 //!
 //! Requests are logged without anything that could carry the password: the
 //! path without its query (only the query's length), the header names, and
-//! the label the bank's handler put on its response ([`Page`]). A path
+//! the label the bank's handler put on its response ([`Page`](crate::bank::Page)). A path
 //! segment that holds the password, as sent or percent-encoded, is logged as
 //! `[password]`, and the log's writer takes the password out of any other
 //! field ([`crate::log`]).
 
-use fictionet::stdlib::web::{self, DnsAnswer, Event, HttpAnswer, HttpErrorCause, TlsOutcome};
-use http::header::USER_AGENT;
+use fictionet::stdlib::journal::Entry;
+use fictionet::stdlib::json::Value as J;
 use serde_json::{Value, json};
 
-use crate::bank::{ACCOUNT, Page, unquote_to_bytes};
+use crate::bank::{ACCOUNT, unquote_to_bytes};
 use crate::scenario::Scenario;
 
 /// The attachment the world uses for its own startup lookups. Its events
 /// are not logged.
 pub const LOOKUPS: &str = "border-world-lookups";
 
-fn sandbox(s: &web::Sandbox) -> Value {
-    json!({"id": s.id, "name": &*s.name, "addr": s.addr.map(|a| a.to_string())})
+/// A journal value as JSON for the log.
+fn js(v: Option<&J>) -> Value {
+    match v {
+        None | Some(J::Null) => Value::Null,
+        Some(J::Bool(b)) => json!(b),
+        Some(J::Number(n)) => n.as_u64().map(|u| json!(u)).or_else(|| n.as_i64().map(|i| json!(i))).unwrap_or_else(|| json!(n.as_f64())),
+        Some(J::String(s)) => json!(s),
+        Some(J::Array(a)) => Value::Array(a.iter().map(|v| js(Some(v))).collect()),
+        Some(J::Object(o)) => Value::Object(o.iter().map(|(k, v)| (k.clone(), js(Some(v)))).collect()),
+    }
 }
 
-/// The log line for `event`, if it gets one.
-pub fn line(scenario: &Scenario, event: &Event) -> Option<Value> {
-    let of = |s: &web::Sandbox| &*s.name == LOOKUPS;
-    match event {
-        Event::Attached { sandbox: s, .. } if !of(s) => Some(json!({"type": "attached", "sandbox": sandbox(s)})),
-        Event::Bound { sandbox: s, by_dhcp, .. } if !of(s) => {
-            Some(json!({"type": "bound", "sandbox": sandbox(s), "by_dhcp": by_dhcp}))
-        }
-        Event::Detached { sandbox: s, .. } if !of(s) => Some(json!({"type": "detached", "sandbox": sandbox(s)})),
-        Event::Dns(d) if !of(&d.sandbox) => Some(dns(d)),
-        Event::Tls(t) if !of(&t.sandbox) => Some(tls(scenario, t)),
-        Event::Http(h) if !of(&h.sandbox) => Some(http(h)),
-        Event::HttpError(e) if !of(&e.sandbox) => Some(json!({
+fn sandbox(e: &Entry) -> Value {
+    match &e.conn.sandbox {
+        Some(s) => json!({"id": s.id, "name": &*s.name, "addr": s.addr.map(|a| a.to_string())}),
+        None => json!({"id": 0, "name": "", "addr": null}),
+    }
+}
+
+/// The log line for `entry`, if it gets one.
+pub fn line(scenario: &Scenario, e: &Entry) -> Option<Value> {
+    let ours = e.conn.sandbox.as_ref().is_some_and(|s| &*s.name == LOOKUPS);
+    if ours {
+        return None;
+    }
+    let f = |name: &str| js(e.get(name));
+    let conn = e.conn.id.unwrap_or(0);
+    let local = e.conn.local.map(|a| a.to_string()).unwrap_or_default();
+    match (e.event.service, e.event.kind) {
+        ("net", "attached") => Some(json!({"type": "attached", "sandbox": sandbox(e)})),
+        ("net", "bound") => Some(json!({"type": "bound", "sandbox": sandbox(e), "by_dhcp": f("by_dhcp")})),
+        ("net", "detached") => Some(json!({"type": "detached", "sandbox": sandbox(e)})),
+        ("dns", "query") => Some(dns(e)),
+        ("tls", "handshake") => Some(tls(scenario, e)),
+        ("http", "request") => Some(http(e)),
+        ("http", "error") => Some(json!({
             "type": "http_error",
-            "sandbox": sandbox(&e.sandbox),
-            "conn": e.conn,
-            "local": e.local.to_string(),
-            "cause": match e.cause {
-                HttpErrorCause::Protocol => "protocol",
-                HttpErrorCause::Timeout => "timeout",
-                HttpErrorCause::Transport => "transport",
-                _ => "other",
-            },
-            "detail": e.detail.chars().take(200).collect::<String>(),
+            "sandbox": sandbox(e),
+            "conn": conn,
+            "local": local,
+            "cause": f("cause"),
+            "detail": e.str("detail").unwrap_or_default().chars().take(200).collect::<String>(),
         })),
-        Event::Blocked(b) if !of(&b.sandbox) => Some(json!({
+        ("net", "blocked") => Some(json!({
             "type": "blocked",
-            "sandbox": sandbox(&b.sandbox),
-            "why": format!("{:?}", b.why),
-            "protocol": b.protocol,
-            "src": b.src.map(|a| a.to_string()),
-            "dst": b.dst.map(|a| a.to_string()),
-            "dst_port": b.dst_port,
+            "sandbox": sandbox(e),
+            "why": f("why"),
+            "protocol": f("protocol"),
+            "src": f("src"),
+            "dst": f("dst"),
+            "dst_port": f("dst_port"),
         })),
         _ => None,
     }
 }
 
-fn dns(d: &web::Dns) -> Value {
-    let answer = match &d.answer {
-        DnsAnswer::Addr(a) => a.to_string(),
-        DnsAnswer::NoData => "nodata".into(),
-        DnsAnswer::NxDomain => "nxdomain".into(),
-        DnsAnswer::Error(code) => format!("error {code}"),
+fn dns(e: &Entry) -> Value {
+    let answer = match e.str("answer") {
+        Some("addr") => e.str("addr").unwrap_or_default().to_owned(),
+        Some("nodata") => "nodata".into(),
+        Some("nxdomain") => "nxdomain".into(),
+        Some("error") => format!("error {}", e.u64("rcode").unwrap_or(0)),
         _ => "none".into(),
     };
     json!({
         "type": "dns",
-        "sandbox": sandbox(&d.sandbox),
-        "via": if d.tcp { "tcp" } else { "udp" },
-        "name": d.name,
-        "qtype": d.qtype,
+        "sandbox": sandbox(e),
+        "via": if e.get("tcp").and_then(J::as_bool) == Some(true) { "tcp" } else { "udp" },
+        "name": js(e.get("name")),
+        "qtype": js(e.get("qtype")),
         "answer": answer,
     })
 }
 
-fn tls(scenario: &Scenario, t: &web::Tls) -> Value {
+fn tls(scenario: &Scenario, e: &Entry) -> Value {
     // The scenario is IPv4 only (`Sites::ipv4_only`).
-    let addr = match t.addr {
-        std::net::IpAddr::V4(a) => Some(a),
-        std::net::IpAddr::V6(_) => None,
-    };
-    let identity = t.sni.as_deref().zip(addr).and_then(|(n, a)| scenario.identity(n, a)).map(|i| i.as_str());
+    let addr = e.str("addr").and_then(|a| a.parse::<std::net::Ipv4Addr>().ok());
+    let sni = e.str("sni");
+    let identity = sni.zip(addr).and_then(|(n, a)| scenario.identity(n, a)).map(|i| i.as_str());
     let mut line = json!({
         "type": "tls",
-        "sandbox": sandbox(&t.sandbox),
-        "conn": t.conn,
-        "addr": t.addr.to_string(),
-        "sni": t.sni,
+        "sandbox": sandbox(e),
+        "conn": e.conn.id.unwrap_or(0),
+        "addr": e.str("addr").unwrap_or_default(),
+        "sni": sni,
         "identity": identity,
     });
     let fields = line.as_object_mut().expect("an object");
-    let outcome = match &t.outcome {
-        TlsOutcome::Accepted { alpn } => {
-            fields.insert("alpn".into(), json!(alpn.as_ref().map(|a| String::from_utf8_lossy(a).into_owned())));
-            "accepted"
+    let outcome = e.str("outcome").unwrap_or("other");
+    match outcome {
+        "accepted" => {
+            fields.insert("alpn".into(), js(e.get("alpn")));
         }
-        TlsOutcome::Rejected => "rejected",
-        TlsOutcome::Alert(a) => {
-            fields.insert("alert".into(), json!(alert_name(*a)));
+        "alert" => {
+            let a = e.u64("alert").unwrap_or(0) as u8;
+            fields.insert("alert".into(), json!(alert_name(a)));
             fields.insert("alert_code".into(), json!(a));
-            "alert"
         }
-        TlsOutcome::Failed(why) => {
-            fields.insert("detail".into(), json!(why.chars().take(200).collect::<String>()));
-            "failed"
+        "failed" => {
+            fields.insert("detail".into(), json!(e.str("detail").unwrap_or_default().chars().take(200).collect::<String>()));
         }
-        TlsOutcome::Closed => "closed",
-        TlsOutcome::TimedOut => "timed_out",
-        TlsOutcome::Aborted => "aborted",
+        _ => {}
+    }
+    let outcome = match outcome {
+        "accepted" | "rejected" | "alert" | "failed" | "closed" | "timed_out" | "aborted" => outcome,
         _ => "other",
     };
     fields.insert("outcome".into(), json!(outcome));
@@ -155,44 +166,48 @@ pub fn alert_name(a: u8) -> &'static str {
     }
 }
 
-fn http(h: &web::Http) -> Value {
-    let ua = h.headers.get(USER_AGENT).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
-    let mut names: Vec<&str> = h.headers.keys().map(|k| k.as_str()).collect();
-    names.dedup();
-    let answer = match h.answer {
-        HttpAnswer::Handler => "handler",
-        HttpAnswer::Error => "error",
-        HttpAnswer::Redirect => "redirect",
-        HttpAnswer::Misdirected => "misdirected",
-        HttpAnswer::NoHost => "no_host",
-        HttpAnswer::Cancelled => "cancelled",
+fn http(e: &Entry) -> Value {
+    let mut names: Vec<String> = Vec::new();
+    let mut ua = None;
+    for pair in e.get("headers").and_then(J::as_array).unwrap_or_default() {
+        let Some(pair) = pair.as_array() else { continue };
+        let (Some(name), Some(value)) = (pair.first().and_then(J::as_str), pair.get(1).and_then(J::as_str)) else { continue };
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_owned());
+        }
+        if name == "user-agent" && ua.is_none() {
+            ua = Some(value.to_owned());
+        }
+    }
+    let answer = match e.str("answer") {
+        Some(a @ ("handler" | "error" | "redirect" | "misdirected" | "no_host" | "cancelled")) => a,
         _ => "other",
     };
     let mut line = json!({
         "type": "http",
-        "sandbox": sandbox(&h.sandbox),
-        "conn": h.conn,
-        "local": h.local.to_string(),
-        "scheme": h.scheme.as_str(),
-        "sni": h.sni,
-        "host": h.host,
-        "method": h.method.as_str(),
-        "path": redact_path(h.uri.path()),
-        "query_bytes": h.uri.query().map(|q| q.len()),
-        "version": format!("{:?}", h.version),
+        "sandbox": sandbox(e),
+        "conn": e.conn.id.unwrap_or(0),
+        "local": e.conn.local.map(|a| a.to_string()).unwrap_or_default(),
+        "scheme": e.str("scheme").unwrap_or_default(),
+        "sni": e.str("sni"),
+        "host": e.str("host"),
+        "method": e.str("method").unwrap_or_default(),
+        "path": redact_path(e.str("path").unwrap_or_default()),
+        "query_bytes": e.str("query").map(str::len),
+        "version": e.str("version").unwrap_or_default(),
         "ua": ua,
         "headers": names,
         "answer": answer,
-        "status": h.status.map(|s| s.as_u16()),
-        "sent": h.sent,
-        "complete": h.complete,
+        "status": e.u64("status"),
+        "sent": e.u64("sent").unwrap_or(0),
+        "complete": e.get("complete").and_then(J::as_bool) == Some(true),
     });
-    if let Some(page) = h.extensions.get::<Page>() {
+    if e.get("served_by").is_some() {
         let fields = line.as_object_mut().expect("an object");
-        fields.insert("served_by".into(), json!(page.served_by));
-        fields.insert("page".into(), json!(page.page));
-        fields.insert("carries_password".into(), json!(page.carries_password));
-        fields.insert("body_bytes".into(), json!(page.body_bytes));
+        fields.insert("served_by".into(), js(e.get("served_by")));
+        fields.insert("page".into(), js(e.get("page")));
+        fields.insert("carries_password".into(), js(e.get("carries_password")));
+        fields.insert("body_bytes".into(), js(e.get("body_bytes")));
     }
     line
 }

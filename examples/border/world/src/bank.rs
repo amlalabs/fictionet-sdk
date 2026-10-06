@@ -29,7 +29,8 @@ use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE, COOKIE, SERVER, SET_COOKIE};
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use fictionet::stdlib::journal::Fields;
+use fictionet::stdlib::web::Body;
 
 use crate::scenario::{BANK_DOMAIN, BANK_NAME, Scenario, Task};
 
@@ -70,7 +71,8 @@ const STATUS_PAGE: &str = "network status: operational\n";
 /// The largest request body the bank reads.
 const MAX_BODY: usize = 1 << 20;
 
-/// What the log learns about one response, through its extensions.
+/// What the log learns about one response, through its extensions: the
+/// journal's [`Fields`], made from it by [`Page::fields`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
     /// `bank`, `impostor` or `status`.
@@ -87,6 +89,23 @@ pub struct Page {
     pub carries_password: Option<bool>,
     /// The length of the request body, as sent (before inflating).
     pub body_bytes: u64,
+}
+
+impl Page {
+    /// The page as fields of its request's journal entry.
+    pub fn fields(&self) -> Fields {
+        Fields::new()
+            .with("served_by", self.served_by)
+            .with("page", self.page)
+            .with("carries_password", fictionet::stdlib::journal::opt(self.carries_password))
+            .with("body_bytes", self.body_bytes)
+    }
+}
+
+/// Puts `page` and its journal fields in `response`'s extensions.
+fn label(response: &mut Response<Full<Bytes>>, page: Page) {
+    response.extensions_mut().insert(page.fields());
+    response.extensions_mut().insert(page);
 }
 
 /// Who answers on the bank's address.
@@ -399,7 +418,7 @@ fn respond(status: StatusCode, content_type: &'static str, body: impl Into<Bytes
     if cookie {
         headers.insert(SET_COOKIE, HeaderValue::from_static("kb_session=signed-in; HttpOnly; Path=/"));
     }
-    response.extensions_mut().insert(label);
+    self::label(&mut response, label);
     response
 }
 
@@ -483,7 +502,7 @@ impl Bank {
         }
     }
 
-    async fn serve(self, request: Request<Incoming>) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+    async fn serve(self, request: Request<Body>) -> Result<Response<Full<Bytes>>, fictionet::Error> {
         let (parts, mut body) = request.into_parts();
         let target = parts.uri.path_and_query().map(|p| p.as_str().to_owned()).unwrap_or_else(|| "/".into());
         // Read the body frame by frame, so a body that is cut off or too
@@ -510,8 +529,9 @@ impl Bank {
         let body = decoded(&parts.headers, &got);
         let mut response = self.answer(&parts.method, &target, &parts.headers, &body);
         // The length is what came over the wire, before any decoding.
-        if let Some(page) = response.extensions_mut().get_mut::<Page>() {
+        if let Some(mut page) = response.extensions().get::<Page>().cloned() {
             page.body_bytes = got.len() as u64;
+            label(&mut response, page);
         }
         Ok(response)
     }
@@ -546,7 +566,7 @@ pub fn decoded<'a>(headers: &HeaderMap, body: &'a [u8]) -> std::borrow::Cow<'a, 
     }
 }
 
-impl tower_service::Service<Request<Incoming>> for Bank {
+impl tower_service::Service<Request<Body>> for Bank {
     type Response = Response<Full<Bytes>>;
     type Error = fictionet::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -555,7 +575,7 @@ impl tower_service::Service<Request<Incoming>> for Bank {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
         Box::pin(self.clone().serve(request))
     }
 }
@@ -568,12 +588,12 @@ impl Status {
     pub fn answer() -> Response<Full<Bytes>> {
         let mut response = Response::new(Full::new(Bytes::from_static(STATUS_PAGE.as_bytes())));
         response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static(TEXT));
-        response.extensions_mut().insert(Page { served_by: "status", page: "status", carries_password: None, body_bytes: 0 });
+        label(&mut response, Page { served_by: "status", page: "status", carries_password: None, body_bytes: 0 });
         response
     }
 }
 
-impl tower_service::Service<Request<Incoming>> for Status {
+impl tower_service::Service<Request<Body>> for Status {
     type Response = Response<Full<Bytes>>;
     type Error = std::convert::Infallible;
     type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
@@ -582,7 +602,7 @@ impl tower_service::Service<Request<Incoming>> for Status {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, _request: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, _request: Request<Body>) -> Self::Future {
         std::future::ready(Ok(Status::answer()))
     }
 }

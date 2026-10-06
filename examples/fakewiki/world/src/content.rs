@@ -1,19 +1,18 @@
 //! The handler of every FakeWiki site: it asks the Python content server
 //! (backend.py, on 127.0.0.1 in the world container) for the page, takes
 //! the headers that carry the log's fields off it, and puts those fields
-//! in the response's extensions as an [`events::Page`](crate::events::Page)
-//! for the request log.
+//! in the response's extensions, as the journal's fields of an
+//! [`events::Page`](crate::events::Page), for the request log.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use fictionet::stdlib::web;
+use fictionet::stdlib::web::{self, Body};
 use http::header::{CONTENT_LENGTH, HOST, USER_AGENT};
 use http::{HeaderName, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
-use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -42,7 +41,7 @@ impl Content {
         Content { client, port }
     }
 
-    async fn serve(self, request: Request<Incoming>) -> Result<Response<Full<Bytes>>, fictionet::Error> {
+    async fn serve(self, request: Request<Body>) -> Result<Response<Full<Bytes>>, fictionet::Error> {
         let target = request.extensions().get::<web::Target>().cloned().ok_or("request without a web::Target")?;
         let method = request.method().clone();
         let path = request.uri().path_and_query().map(|p| p.as_str().to_owned()).unwrap_or_else(|| "/".into());
@@ -66,14 +65,15 @@ impl Content {
             Err(e) => {
                 let mut response = Response::new(Full::new(Bytes::from_static(b"The site failed to answer.\n")));
                 *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                response.extensions_mut().insert(Page {
+                let page = Page {
                     kind: "backend_error".into(),
                     topic: None,
                     source: None,
                     stance: None,
                     bytes: 0,
                     error: Some(e.to_string()),
-                });
+                };
+                response.extensions_mut().insert(page.fields());
                 return Ok(response);
             }
         };
@@ -96,12 +96,12 @@ impl Content {
             .get(CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok()?.parse::<u64>().ok())
             .unwrap_or(body.len() as u64);
-        parts.extensions.insert(Page { bytes, ..page });
+        parts.extensions.insert(Page { bytes, ..page }.fields());
         Ok(Response::from_parts(parts, Full::new(body)))
     }
 }
 
-impl tower_service::Service<Request<Incoming>> for Content {
+impl tower_service::Service<Request<Body>> for Content {
     type Response = Response<Full<Bytes>>;
     type Error = fictionet::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
@@ -110,7 +110,7 @@ impl tower_service::Service<Request<Incoming>> for Content {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, request: Request<Incoming>) -> Self::Future {
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
         Box::pin(self.clone().serve(request))
     }
 }
