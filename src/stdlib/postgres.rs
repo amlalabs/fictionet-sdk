@@ -14,9 +14,9 @@
 //! cancel key.
 //!
 //! Nothing here reads a socket. A world that plays a database server
-//! reads connection bytes through [`FrontendMessages`] and
-//! [`super::codec::Stream`], and takes [`Frontend`] messages out. It
-//! answers with [`Backend`] messages, written by [`Wire::write`].
+//! reads connection bytes through
+//! [`Stream<FrontendMessages>`](super::codec::Stream) and takes [`Frontend`]
+//! messages out. It answers with [`Backend`] messages, written by [`Wire::write`].
 //! Which users exist, which passwords they have, and what a query returns
 //! are up to world code. A world that plays a client does the reverse,
 //! with [`BackendMessages`] and [`Wire::write`] on [`Frontend`].
@@ -29,17 +29,7 @@
 //! world that is asked for another encoding should refuse it, since
 //! these readers cannot read that text. Text-format parameters must be
 //! UTF-8 with no NUL byte as well. [`Wire`] refuses values that cannot
-//! be written unchanged. The inherent `to_bytes` writers retain their
-//! clipping of strings, byte fields and lists.
-//!
-//! The stream holds at most one message's worth of unread bytes. `push`
-//! says how many bytes it accepted; keep the remainder for the next call.
-//!
-//! New streams use [`FrontendMessages`] or [`BackendMessages`] with
-//! [`super::codec::Stream`]. Encryption requests yield an item then End;
-//! unread transport bytes remain available through `Stream::into_parts`.
-//! [`Wire`] provides exact parsing and strict transactional writing for
-//! both message directions. The old decoders and writers keep their behavior.
+//! be written unchanged.
 //!
 //! ```
 //! use fictionet::stdlib::postgres::{
@@ -126,7 +116,6 @@ pub const MAX_AUTH_MESSAGE: usize = 65_535;
 pub const MAX_MESSAGE: usize = 0x3fff_fffe;
 /// The default length-field limit for [`FrontendMessages`] and
 /// [`BackendMessages`]: 1 MiB. Set it with their `with_limit` constructors.
-/// [`Decoder`] and [`BackendDecoder`] use the same default.
 pub const DEFAULT_MAX_MESSAGE: usize = 1 << 20;
 /// The longest cancel key, in bytes. Protocol 3.0 keys are always 4
 /// bytes; protocol 3.2 keys may be up to this long.
@@ -569,13 +558,15 @@ pub enum Frontend {
     Startup(Startup),
     /// SSLRequest: asks to switch to TLS. The server answers with one
     /// byte, [`ACCEPT_SSL`] or [`REFUSE_ENCRYPTION`]. A server that
-    /// accepts calls [`Decoder::start_encryption`]. A [`Decoder`] refuses
-    /// a second SSLRequest on one connection.
+    /// accepts calls [`super::codec::Stream::into_parts`], then
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// The decoder refuses a second SSLRequest on one connection.
     SslRequest,
     /// GSSENCRequest: asks to switch to GSSAPI encryption. The server
     /// answers with one byte, [`ACCEPT_GSSENC`] or [`REFUSE_ENCRYPTION`],
-    /// and calls [`Decoder::start_encryption`] if it accepts. A
-    /// [`Decoder`] refuses a second GSSENCRequest on one connection.
+    /// then calls [`super::codec::Stream::into_parts`] if it accepts and
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// The decoder refuses a second GSSENCRequest on one connection.
     GssEncRequest,
     /// CancelRequest: stop the query running in another session. The
     /// server answers nothing and closes the connection.
@@ -623,7 +614,7 @@ pub enum Frontend {
     /// The body of a PasswordMessage, SASLInitialResponse, SASLResponse
     /// or GSSResponse. They share one type byte, and which one it is
     /// depends on the Authentication request it answers. Read it with
-    /// [`read_password`] or [`SaslInitialResponse::parse`]; a SASLResponse
+    /// [`Password`] or [`SaslInitialResponse`]; a SASLResponse
     /// and a GSSResponse are the bytes as they are.
     AuthResponse(Vec<u8>),
     /// Parse: prepare a statement.
@@ -655,56 +646,13 @@ pub struct SaslInitialResponse {
     pub data: Option<Vec<u8>>,
 }
 
-impl SaslInitialResponse {
-    /// Reads a SASLInitialResponse from an AuthResponse body.
-    pub fn parse(body: &[u8]) -> Result<SaslInitialResponse, Malformed> {
-        let mut r = Reader { b: body };
-        let mechanism = r.cstr()?;
-        let data = r.value()?;
-        r.end()?;
-        Ok(SaslInitialResponse { mechanism, data })
-    }
-
-    /// The message that carries this response. Data past what the
-    /// message may hold is cut.
-    pub fn to_message(&self) -> Frontend {
-        let mechanism = until_nul(&self.mechanism);
-        // The length field, the mechanism and its NUL, the data length.
-        let room = MAX_AUTH_MESSAGE.saturating_sub(4 + 4);
-        let mechanism = fit(mechanism, room.saturating_sub(1));
-        let room = room.saturating_sub(mechanism.len() + 1);
-        let mut out = mechanism.as_bytes().to_vec();
-        out.push(0);
-        match &self.data {
-            None => out.extend_from_slice(&(-1i32).to_be_bytes()),
-            Some(d) => {
-                let d = &d[..d.len().min(room)];
-                out.extend_from_slice(&len32(d.len()).to_be_bytes());
-                out.extend_from_slice(d);
-            }
-        }
-        Frontend::AuthResponse(out)
-    }
-}
-
-/// Reads the password in a PasswordMessage body: a string and its NUL,
-/// with nothing after. With MD5 authentication the string is `md5`
-/// followed by 32 hex digits.
-pub fn read_password(body: &[u8]) -> Result<String, Malformed> {
-    let mut r = Reader { b: body };
-    let password = r.cstr()?;
-    r.end()?;
-    Ok(password)
-}
-
 impl Frontend {
-    /// A PasswordMessage carrying `password`, cut at its first NUL and to
-    /// what the message may hold.
-    pub fn password(password: &str) -> Frontend {
-        let p = fit(until_nul(password), MAX_AUTH_MESSAGE - 5);
-        let mut body = p.as_bytes().to_vec();
-        body.push(0);
-        Frontend::AuthResponse(body)
+    /// Wraps a password in an authentication message. Refuses NUL and
+    /// passwords whose UTF-8 bytes exceed the authentication message limit.
+    pub fn password(password: &str) -> Result<Frontend, Error> {
+        Ok(Frontend::AuthResponse(
+            Password(password.into()).to_bytes()?,
+        ))
     }
 
     /// Whether this is a startup-phase message, written with no type
@@ -738,176 +686,6 @@ impl Frontend {
             Frontend::Sync => t::SYNC,
             Frontend::Terminate => t::TERMINATE,
         })
-    }
-
-    /// Reads the startup-phase message at the start of `b`. It returns
-    /// `Ok(None)` if `b` holds only part of one, and otherwise the message
-    /// and how many bytes of `b` it took.
-    /// A first byte of 0x16 gives [`Error::DirectTls`].
-    pub fn parse_startup(b: &[u8]) -> Result<Option<(Frontend, usize)>, Error> {
-        parse_startup_from(b, true)
-    }
-
-    /// Reads the typed message at the start of `b`, after the startup
-    /// phase. It returns `Ok(None)` if `b` holds only part of one, and
-    /// otherwise the message and how many bytes of `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Frontend, usize)>, Error> {
-        Frontend::parse_max(b, MAX_MESSAGE)
-    }
-
-    fn parse_max(b: &[u8], max: usize) -> Result<Option<(Frontend, usize)>, Error> {
-        let Some((tag, body, used)) = split_typed(b, frontend_limit, max)? else { return Ok(None) };
-        let message = frontend_body(tag, body).map_err(|reason| Error::Malformed { tag, reason })?;
-        Ok(Some((message, used)))
-    }
-
-    /// The message's bytes, with its type byte (if it has one) and
-    /// length. Strings are cut at their first NUL. A message that would
-    /// be longer than PostgreSQL accepts for its type loses list items
-    /// from the end, or the end of its last string or byte field. A Bind
-    /// or FunctionCall whose format count is not 0, 1 or the number of
-    /// values gets the first format alone. A text-format parameter or
-    /// argument is cut at its first NUL, and before any bytes that are not
-    /// UTF-8; binary ones are written as they are. A cancel key is cut to
-    /// [`MAX_SECRET_KEY`] bytes, and an empty one is written as 4 zero
-    /// bytes, since PostgreSQL refuses an empty key.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.encode(MAX_MESSAGE)
-    }
-
-    /// The message's bytes, with typed messages held to a length of `cap`.
-    fn encode(&self, cap: usize) -> Vec<u8> {
-        let tag = match self.tag() {
-            Some(tag) => tag,
-            None => return self.encode_startup(),
-        };
-        let limit = frontend_limit(tag).unwrap_or(SMALL_MESSAGE).min(cap);
-        let mut o = Out::typed(tag, limit);
-        match self {
-            Frontend::Startup(_) | Frontend::SslRequest | Frontend::GssEncRequest | Frontend::CancelRequest { .. } => {}
-            Frontend::Bind(b) => {
-                let each = b.param_formats.len() > 1 && b.param_formats.len() == b.params.len();
-                let single = !each && !b.param_formats.is_empty();
-                let all: &[Format] = if each {
-                    &b.param_formats
-                } else if single {
-                    &b.param_formats[..1]
-                } else {
-                    &[]
-                };
-                let params = written_values(all, &b.params);
-                // Two NULs and three counts are always written.
-                let fixed = 2 + 6 + if single { 2 } else { 0 };
-                let mut avail = o.room().saturating_sub(fixed);
-                let per = if each { 2 } else { 0 };
-                let (np, used) = fit_count(&params, avail, |v| per + value_size(*v));
-                avail -= used;
-                let (nr, used_r) = fit_count(&b.result_formats, avail, |_| 2);
-                let lists = fixed - 2 + used + used_r;
-                o.cstr(&b.portal, 1 + lists);
-                o.cstr(&b.statement, lists);
-                let formats: &[Format] = if each {
-                    &b.param_formats[..np]
-                } else if single {
-                    &b.param_formats[..1]
-                } else {
-                    &[]
-                };
-                o.formats(formats);
-                o.u16(count16(np));
-                for v in &params[..np] {
-                    o.value(*v);
-                }
-                o.formats(&b.result_formats[..nr]);
-            }
-            Frontend::Close { target, name } | Frontend::Describe { target, name } => {
-                o.u8(target.byte());
-                o.cstr(name, 0);
-            }
-            Frontend::CopyData(d) | Frontend::AuthResponse(d) => o.bytes(d, 0),
-            Frontend::CopyFail(s) | Frontend::Query(s) => o.cstr(s, 0),
-            Frontend::Execute { portal, max_rows } => {
-                o.cstr(portal, 4);
-                o.i32(*max_rows);
-            }
-            Frontend::FunctionCall(f) => {
-                let each = f.arg_formats.len() > 1 && f.arg_formats.len() == f.args.len();
-                let single = !each && !f.arg_formats.is_empty();
-                // The OID, two counts, the result format.
-                o.u32(f.function);
-                let fixed = 6 + if single { 2 } else { 0 };
-                let per = if each { 2 } else { 0 };
-                let all: &[Format] = if each {
-                    &f.arg_formats
-                } else if single {
-                    &f.arg_formats[..1]
-                } else {
-                    &[]
-                };
-                let args = written_values(all, &f.args);
-                let (na, _) = fit_count(&args, o.room().saturating_sub(fixed), |v| per + value_size(*v));
-                let formats: &[Format] = if each {
-                    &f.arg_formats[..na]
-                } else if single {
-                    &f.arg_formats[..1]
-                } else {
-                    &[]
-                };
-                o.formats(formats);
-                o.u16(count16(na));
-                for v in &args[..na] {
-                    o.value(*v);
-                }
-                o.i16(f.result_format.code());
-            }
-            Frontend::Parse { name, query, param_types } => {
-                // Two NULs and a count are always written.
-                let (n, used) = fit_count(param_types, o.room().saturating_sub(4), |_| 4);
-                o.cstr(name, 1 + 2 + used);
-                o.cstr(query, 2 + used);
-                o.u16(count16(n));
-                for t in &param_types[..n] {
-                    o.u32(*t);
-                }
-            }
-            Frontend::CopyDone | Frontend::Flush | Frontend::Sync | Frontend::Terminate => {}
-        }
-        o.done()
-    }
-
-    fn encode_startup(&self) -> Vec<u8> {
-        let mut o = Out::untagged(4 + MAX_STARTUP);
-        match self {
-            Frontend::Startup(s) => {
-                o.u32(PROTOCOL_3_0 | u32::from(s.minor_version));
-                // One byte stays for the terminator.
-                let mut avail = o.room().saturating_sub(1);
-                for (name, value) in &s.params {
-                    let (name, value) = (until_nul(name), until_nul(value));
-                    if name.is_empty() {
-                        // An empty name would end the list.
-                        continue;
-                    }
-                    let size = name.len().saturating_add(value.len()).saturating_add(2);
-                    if size > avail {
-                        break;
-                    }
-                    avail -= size;
-                    o.cstr(name, 0);
-                    o.cstr(value, 0);
-                }
-                o.u8(0);
-            }
-            Frontend::SslRequest => o.u32(SSL_REQUEST_CODE),
-            Frontend::GssEncRequest => o.u32(GSSENC_REQUEST_CODE),
-            Frontend::CancelRequest { process_id, secret_key } => {
-                o.u32(CANCEL_REQUEST_CODE);
-                o.u32(*process_id);
-                o.put(key_bytes(secret_key));
-            }
-            _ => {}
-        }
-        o.done()
     }
 }
 
@@ -961,8 +739,7 @@ impl Authentication {
 /// [`field_code`] and its text, in the order sent.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Diagnostic {
-    /// The fields. Code 0 ends the list on the wire, so a writer leaves
-    /// out a field with that code.
+    /// The fields. Code 0 and repeated codes are refused by the writer.
     pub fields: Vec<(u8, String)>,
 }
 
@@ -1174,188 +951,22 @@ impl Backend {
             Backend::RowDescription(_) => t::ROW_DESCRIPTION,
         }
     }
-
-    /// Reads the message at the start of `b`. It returns `Ok(None)` if
-    /// `b` holds only part of one, and otherwise the message and how many
-    /// bytes of `b` it took.
-    pub fn parse(b: &[u8]) -> Result<Option<(Backend, usize)>, Error> {
-        Backend::parse_max(b, MAX_MESSAGE)
-    }
-
-    fn parse_max(b: &[u8], max: usize) -> Result<Option<(Backend, usize)>, Error> {
-        let Some((tag, body, used)) = split_typed(b, backend_limit, max)? else { return Ok(None) };
-        let message = backend_body(tag, body).map_err(|reason| Error::Malformed { tag, reason })?;
-        Ok(Some((message, used)))
-    }
-
-    /// The message's bytes. Strings are cut at their first NUL, and an
-    /// error field with code 0 or an empty SASL mechanism name is left
-    /// out, since either would end its list. An error field whose code
-    /// came before is left out too, so [`Diagnostic::get`] reads the same
-    /// field on both sides. SASL mechanisms and unrecognized options keep
-    /// at most [`MAX_COUNT`] items. A message that would be
-    /// longer than [`MAX_MESSAGE`] loses list items from the end, or the
-    /// end of its last string or byte field. Lists with a 16-bit count
-    /// keep at most [`MAX_COUNT`] items. A secret key is cut to
-    /// [`MAX_SECRET_KEY`] bytes, and one shorter than [`MIN_BACKEND_KEY`]
-    /// is padded with zero bytes. A copy response in text format writes
-    /// every column as text.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        self.encode(MAX_MESSAGE)
-    }
-
-    /// The message's bytes, held to a length of `cap`.
-    fn encode(&self, cap: usize) -> Vec<u8> {
-        let mut o = Out::typed(self.tag(), MAX_MESSAGE.min(cap));
-        match self {
-            Backend::Authentication(a) => {
-                o.u32(a.code());
-                match a {
-                    Authentication::Md5Password(salt) => o.put(salt),
-                    Authentication::GssContinue(d) | Authentication::SaslContinue(d) | Authentication::SaslFinal(d) => {
-                        o.bytes(d, 0)
-                    }
-                    Authentication::Sasl(names) => {
-                        let mut avail = o.room().saturating_sub(1);
-                        let mut n = 0;
-                        for name in names {
-                            let name = until_nul(name);
-                            if name.is_empty() {
-                                continue;
-                            }
-                            if name.len() + 1 > avail || n == MAX_COUNT {
-                                break;
-                            }
-                            n += 1;
-                            avail -= name.len() + 1;
-                            o.cstr(name, 0);
-                        }
-                        o.u8(0);
-                    }
-                    _ => {}
-                }
-            }
-            Backend::BackendKeyData { process_id, secret_key } => {
-                o.u32(*process_id);
-                let key = key_bytes(secret_key);
-                o.bytes(key, 0);
-                o.put(&[0; MIN_BACKEND_KEY][key.len().min(MIN_BACKEND_KEY)..]);
-            }
-            Backend::CommandComplete(s) => o.cstr(s, 0),
-            Backend::CopyData(d) => o.bytes(d, 0),
-            Backend::CopyInResponse(c) | Backend::CopyOutResponse(c) | Backend::CopyBothResponse(c) => {
-                o.u8(c.format.code() as u8);
-                let (n, _) = fit_count(&c.columns, o.room().saturating_sub(2), |_| 2);
-                // A text copy has text columns only.
-                let columns = if c.format == Format::Text { vec![Format::Text; n] } else { c.columns[..n].to_vec() };
-                o.formats(&columns);
-            }
-            Backend::DataRow(values) => {
-                let (n, _) = fit_count(values, o.room().saturating_sub(2), |v| value_size(v.as_deref()));
-                o.u16(count16(n));
-                for v in &values[..n] {
-                    o.value(v.as_deref());
-                }
-            }
-            Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
-                let mut avail = o.room().saturating_sub(1);
-                let mut seen = [false; 256];
-                for (code, value) in &d.fields {
-                    if *code == 0 || seen[usize::from(*code)] {
-                        continue;
-                    }
-                    seen[usize::from(*code)] = true;
-                    let size = 1 + cstr_size(value);
-                    if size > avail {
-                        break;
-                    }
-                    avail -= size;
-                    o.u8(*code);
-                    o.cstr(value, 0);
-                }
-                o.u8(0);
-            }
-            Backend::FunctionCallResponse(v) => match v {
-                None => o.i32(-1),
-                Some(d) => {
-                    let d = &d[..d.len().min(o.room().saturating_sub(4))];
-                    o.u32(len32(d.len()));
-                    o.put(d);
-                }
-            },
-            Backend::NegotiateProtocolVersion { version, unrecognized } => {
-                o.u32(*version);
-                let mut avail = o.room().saturating_sub(4);
-                let mut n = 0;
-                for name in unrecognized {
-                    let size = cstr_size(name);
-                    if size > avail || n == MAX_COUNT {
-                        break;
-                    }
-                    avail -= size;
-                    n += 1;
-                }
-                o.u32(len32(n));
-                for name in &unrecognized[..n] {
-                    o.cstr(name, 0);
-                }
-            }
-            Backend::NotificationResponse { process_id, channel, payload } => {
-                o.u32(*process_id);
-                o.cstr(channel, 1);
-                o.cstr(payload, 0);
-            }
-            Backend::ParameterDescription(types) => {
-                let (n, _) = fit_count(types, o.room().saturating_sub(2), |_| 4);
-                o.u16(count16(n));
-                for t in &types[..n] {
-                    o.u32(*t);
-                }
-            }
-            Backend::ParameterStatus { name, value } => {
-                o.cstr(name, 1);
-                o.cstr(value, 0);
-            }
-            Backend::ReadyForQuery(status) => o.u8(status.byte()),
-            Backend::RowDescription(fields) => {
-                let (n, _) = fit_count(fields, o.room().saturating_sub(2), |f| cstr_size(&f.name) + 18);
-                o.u16(count16(n));
-                for f in &fields[..n] {
-                    o.cstr(&f.name, 0);
-                    o.u32(f.table_oid);
-                    o.i16(f.column);
-                    o.u32(f.type_oid);
-                    o.i16(f.type_size);
-                    o.i32(f.type_modifier);
-                    o.i16(f.format.code());
-                }
-            }
-            Backend::BindComplete
-            | Backend::CloseComplete
-            | Backend::CopyDone
-            | Backend::EmptyQueryResponse
-            | Backend::NoData
-            | Backend::ParseComplete
-            | Backend::PortalSuspended => {}
-        }
-        o.done()
-    }
 }
 
-/// Why bytes are not a message this module can read. Every one of them
-/// is a protocol violation. PostgreSQL closes the connection after all of
-/// them but one: a typed message whose body is malformed
-/// ([`Error::is_recoverable`]) gets an ERROR, and the session goes on at
-/// the next message (in an extended-query batch, at the next Sync). During
-/// authentication that error is FATAL too.
+/// Why a message was refused. Complete typed body errors are stream items.
+/// Framing and startup errors end the stream. During authentication, world
+/// code also treats malformed typed bodies as fatal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The connection opened with a TLS record, not a startup-phase
     /// message: the client asked for direct TLS (`sslnegotiation=direct`).
     /// A server that supports it starts TLS with the bytes
-    /// [`Decoder::start_encryption`] hands back, and feeds the same
-    /// decoder what TLS decrypts. As in PostgreSQL, only the first byte
-    /// of a connection is read this way.
+    /// [`super::codec::Stream::into_parts`] retains, then calls
+    /// [`FrontendMessages::start_encryption`] on the returned decoder.
+    /// A new stream uses that decoder for decrypted bytes. As in
+    /// PostgreSQL, only the first byte of a connection is read this way.
     DirectTls,
     /// A startup-phase message with a code that is neither protocol
     /// version 3 nor a known request, or a second SSLRequest or
@@ -1383,20 +994,10 @@ pub enum Error {
     },
 }
 
-impl Error {
-    /// Whether the stream goes on after this error: true for a typed
-    /// message whose length and type were sound but whose body was
-    /// malformed. A [`Decoder`] or [`BackendDecoder`] drops that message
-    /// and reads the next one; after any other error it reads nothing
-    /// more.
-    pub fn is_recoverable(&self) -> bool {
-        matches!(self, Error::Malformed { tag, .. } if *tag != 0)
-    }
-}
-
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::DirectTls => f.write_str("the connection opened with TLS, not a startup message"),
             Error::UnsupportedProtocol(code) => {
                 write!(f, "unsupported frontend protocol {}.{}", code >> 16, code & 0xffff)
@@ -1495,19 +1096,8 @@ impl core::fmt::Display for ParseError {
 }
 impl core::error::Error for ParseError {}
 
-/// A message cannot be written without clipping or changing its value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct WriteError;
-
-impl core::fmt::Display for WriteError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str("PostgreSQL message cannot be represented without changing it")
-    }
-}
-impl core::error::Error for WriteError {}
-
 // Sizes include the length field but exclude the type byte. Use the
-// original field lengths: clipping cannot make a strict write succeed.
+// original field lengths.
 fn size_sum(fixed: usize, fields: impl IntoIterator<Item = usize>) -> usize {
     fields.into_iter().fold(fixed, usize::saturating_add)
 }
@@ -1602,78 +1192,431 @@ fn backend_size(message: &Backend) -> usize {
     }
 }
 
-impl Wire for Frontend {
-    type ParseError = ParseError;
-    type WriteError = WriteError;
+/// A PasswordMessage body: UTF-8 text followed by one NUL.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Password(
+    /// The password, or the MD5 response text including its `md5` prefix.
+    pub String,
+);
 
-    /// Reads exactly one startup or typed message under the module limits.
-    /// Startup lengths begin with zero; typed messages begin with a tag.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let parsed = if bytes.first() == Some(&0) {
-            Self::parse_startup(bytes)
-        } else {
-            Self::parse(bytes)
-        };
-        match parsed.map_err(ParseError::Message)? {
-            Some((message, used)) if used == bytes.len() => Ok(message),
-            Some(_) => Err(ParseError::Trailing),
-            None => Err(ParseError::Truncated),
-        }
+impl Wire for Password {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one NUL-terminated UTF-8 password. Refuses trailing bytes,
+    /// missing NUL, invalid UTF-8, and bodies beyond [`MAX_AUTH_MESSAGE`] minus four.
+    fn parse(body: &[u8]) -> Result<Self, Error> {
+        auth_body_limit(body)?;
+        let mut r = Reader { b: body };
+        let password = r.cstr().map_err(auth_error)?;
+        r.end().map_err(auth_error)?;
+        Ok(Self(password))
     }
 
-    /// Appends a strict encoding. Temporary bytes are bounded by
-    /// `MAX_MESSAGE + 1` and temporary value lists by [`MAX_COUNT`].
-    /// Checks the full size against the message type's limit before staging.
-    /// The legacy [`Frontend::to_bytes`] keeps its clipping behavior.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        // The legacy writer stages a borrowed list for these two variants.
-        // Bound that list before entering it, then check its complete result.
-        match self {
-            Self::Bind(b) if b.params.len() > MAX_COUNT => return Err(WriteError),
-            Self::FunctionCall(f) if f.args.len() > MAX_COUNT => return Err(WriteError),
-            _ => {}
+    /// Appends the password and NUL. Refuses embedded NUL and oversized
+    /// passwords with [`Error::Unwritable`]. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.len() > MAX_AUTH_MESSAGE - 5 || self.0.contains('\0') {
+            return Err(Error::Unwritable);
         }
+        out.extend_from_slice(self.0.as_bytes());
+        out.push(0);
+        Ok(())
+    }
+}
+
+impl SaslInitialResponse {
+    /// Wraps this response in an authentication message. Refuses a NUL in
+    /// the mechanism or fields that exceed the authentication message limit.
+    pub fn to_message(&self) -> Result<Frontend, Error> {
+        Ok(Frontend::AuthResponse(self.to_bytes()?))
+    }
+}
+
+fn auth_error(reason: Malformed) -> Error {
+    Error::Malformed {
+        tag: frontend_tag::AUTH_RESPONSE,
+        reason,
+    }
+}
+
+fn auth_body_limit(body: &[u8]) -> Result<(), Error> {
+    if body.len() > MAX_AUTH_MESSAGE - 4 {
+        return Err(Error::TooLong {
+            length: u32::try_from(body.len().saturating_add(4)).unwrap_or(u32::MAX),
+            max: MAX_AUTH_MESSAGE,
+        });
+    }
+    Ok(())
+}
+
+impl Wire for SaslInitialResponse {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one AuthResponse body: a NUL-terminated mechanism, a signed
+    /// data length, and the data. Minus one means no initial data. Refuses
+    /// invalid UTF-8, other negative lengths, incomplete or trailing bytes,
+    /// and bodies beyond [`MAX_AUTH_MESSAGE`] minus four.
+    fn parse(body: &[u8]) -> Result<Self, Error> {
+        auth_body_limit(body)?;
+        let mut r = Reader { b: body };
+        let mechanism = r.cstr().map_err(auth_error)?;
+        let data = r.value().map_err(auth_error)?;
+        r.end().map_err(auth_error)?;
+        Ok(Self { mechanism, data })
+    }
+
+    /// Appends the mechanism and optional data. Refuses
+    /// NUL in the mechanism and oversized bodies. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let size = self
+            .mechanism
+            .len()
+            .saturating_add(1)
+            .saturating_add(value_size(self.data.as_deref()));
+        if size > MAX_AUTH_MESSAGE - 4 {
+            return Err(Error::Unwritable);
+        }
+        let mut body = Out { buf: Vec::new() };
+        body.cstr(&self.mechanism)?;
+        body.value(self.data.as_deref())?;
+        out.extend_from_slice(&body.buf);
+        Ok(())
+    }
+}
+
+// Field writing is shared by both directions. Callers bound the complete
+// message size before staging. Every variable count is checked.
+struct Out {
+    buf: Vec<u8>,
+}
+
+impl Out {
+    fn u8(&mut self, value: u8) {
+        self.buf.push(value);
+    }
+    fn put(&mut self, value: &[u8]) {
+        self.buf.extend_from_slice(value);
+    }
+    fn u16(&mut self, value: u16) {
+        self.put(&value.to_be_bytes());
+    }
+    fn i16(&mut self, value: i16) {
+        self.put(&value.to_be_bytes());
+    }
+    fn u32(&mut self, value: u32) {
+        self.put(&value.to_be_bytes());
+    }
+    fn i32(&mut self, value: i32) {
+        self.put(&value.to_be_bytes());
+    }
+    fn count(&mut self, count: usize) -> Result<(), Error> {
+        self.u16(u16::try_from(count).map_err(|_| Error::Unwritable)?);
+        Ok(())
+    }
+    fn cstr(&mut self, value: &str) -> Result<(), Error> {
+        if value.contains('\0') {
+            return Err(Error::Unwritable);
+        }
+        self.put(value.as_bytes());
+        self.u8(0);
+        Ok(())
+    }
+    fn formats(&mut self, formats: &[Format]) -> Result<(), Error> {
+        self.count(formats.len())?;
+        for format in formats {
+            self.i16(format.code());
+        }
+        Ok(())
+    }
+    fn value(&mut self, value: Option<&[u8]>) -> Result<(), Error> {
+        match value {
+            None => self.i32(-1),
+            Some(bytes) => {
+                self.i32(i32::try_from(bytes.len()).map_err(|_| Error::Unwritable)?);
+                self.put(bytes);
+            }
+        }
+        Ok(())
+    }
+    fn values(&mut self, values: &[Value]) -> Result<(), Error> {
+        self.count(values.len())?;
+        for value in values {
+            self.value(value.as_deref())?;
+        }
+        Ok(())
+    }
+}
+
+fn exact<M>(parsed: Option<(M, usize)>, length: usize) -> Result<M, ParseError> {
+    match parsed {
+        Some((message, used)) if used == length => Ok(message),
+        Some(_) => Err(ParseError::Trailing),
+        None => Err(ParseError::Truncated),
+    }
+}
+
+impl Wire for Frontend {
+    type ParseError = ParseError;
+    type WriteError = Error;
+
+    /// Reads exactly one startup or typed message. Startup lengths begin
+    /// with zero; typed messages begin with a tag. Refuses incomplete or
+    /// trailing bytes, unknown tags or protocols, oversized messages, and
+    /// malformed fields, counts, formats, keys, or UTF-8 text.
+    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
+        let parsed = if bytes.first() == Some(&0) {
+            split_startup(bytes, false).and_then(|part| {
+                part.map(|(body, used)| startup_body(body).map(|message| (message, used)))
+                    .transpose()
+            })
+        } else {
+            split_typed(bytes, frontend_limit, MAX_MESSAGE).and_then(|part| {
+                part.map(|(tag, body, used)| {
+                    frontend_body(tag, body)
+                        .map(|message| (message, used))
+                        .map_err(|reason| Error::Malformed { tag, reason })
+                })
+                .transpose()
+            })
+        };
+        exact(parsed.map_err(ParseError::Message)?, bytes.len())
+    }
+
+    /// Appends the length and complete body, with a type byte for typed messages. Refuses embedded
+    /// NUL in strings, empty startup names, invalid cancel keys, mismatched
+    /// format counts, invalid text parameters, and fields or lists beyond
+    /// their limits. Stages at most [`MAX_MESSAGE`] plus one byte. Returns
+    /// [`Error::Unwritable`] without changing `out` on refusal.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let size = frontend_size(self);
         let limit = self
             .tag()
             .and_then(frontend_limit)
             .unwrap_or(MAX_STARTUP + 4);
-        if frontend_size(self) > limit {
-            return Err(WriteError);
+        if size > limit {
+            return Err(Error::Unwritable);
         }
-        let bytes = self.to_bytes();
-        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError);
+        let mut o = Out { buf: Vec::new() };
+        if let Some(tag) = self.tag() {
+            o.u8(tag);
         }
-        out.extend_from_slice(&bytes);
+        o.u32(u32::try_from(size).map_err(|_| Error::Unwritable)?);
+        match self {
+            Self::Startup(s) => {
+                o.u32(PROTOCOL_3_0 | u32::from(s.minor_version));
+                for (name, value) in &s.params {
+                    if name.is_empty() {
+                        return Err(Error::Unwritable);
+                    }
+                    o.cstr(name)?;
+                    o.cstr(value)?;
+                }
+                o.u8(0);
+            }
+            Self::SslRequest => o.u32(SSL_REQUEST_CODE),
+            Self::GssEncRequest => o.u32(GSSENC_REQUEST_CODE),
+            Self::CancelRequest {
+                process_id,
+                secret_key,
+            } => {
+                if !(1..=MAX_SECRET_KEY).contains(&secret_key.len()) {
+                    return Err(Error::Unwritable);
+                }
+                o.u32(CANCEL_REQUEST_CODE);
+                o.u32(*process_id);
+                o.put(secret_key);
+            }
+            Self::Bind(b) => {
+                check_format_count(b.param_formats.len(), b.params.len())
+                    .map_err(|_| Error::Unwritable)?;
+                check_text_values(&b.param_formats, &b.params).map_err(|_| Error::Unwritable)?;
+                o.cstr(&b.portal)?;
+                o.cstr(&b.statement)?;
+                o.formats(&b.param_formats)?;
+                o.values(&b.params)?;
+                o.formats(&b.result_formats)?;
+            }
+            Self::Close { target, name } | Self::Describe { target, name } => {
+                o.u8(target.byte());
+                o.cstr(name)?;
+            }
+            Self::CopyData(bytes) | Self::AuthResponse(bytes) => o.put(bytes),
+            Self::CopyFail(text) | Self::Query(text) => o.cstr(text)?,
+            Self::Execute { portal, max_rows } => {
+                o.cstr(portal)?;
+                o.i32(*max_rows);
+            }
+            Self::FunctionCall(f) => {
+                check_format_count(f.arg_formats.len(), f.args.len())
+                    .map_err(|_| Error::Unwritable)?;
+                check_text_values(&f.arg_formats, &f.args).map_err(|_| Error::Unwritable)?;
+                o.u32(f.function);
+                o.formats(&f.arg_formats)?;
+                o.values(&f.args)?;
+                o.i16(f.result_format.code());
+            }
+            Self::Parse {
+                name,
+                query,
+                param_types,
+            } => {
+                o.cstr(name)?;
+                o.cstr(query)?;
+                o.count(param_types.len())?;
+                for oid in param_types {
+                    o.u32(*oid);
+                }
+            }
+            Self::CopyDone | Self::Flush | Self::Sync | Self::Terminate => {}
+        }
+        out.extend_from_slice(&o.buf);
         Ok(())
     }
 }
 
 impl Wire for Backend {
     type ParseError = ParseError;
-    type WriteError = WriteError;
+    type WriteError = Error;
 
-    /// Reads exactly one typed message under [`MAX_MESSAGE`].
+    /// Reads exactly one typed message. Refuses unknown tags, incomplete
+    /// or trailing bytes, lengths above [`MAX_MESSAGE`], malformed fields,
+    /// invalid UTF-8, duplicate diagnostic codes, and invalid counts or keys.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match Self::parse(bytes).map_err(ParseError::Message)? {
-            Some((message, used)) if used == bytes.len() => Ok(message),
-            Some(_) => Err(ParseError::Trailing),
-            None => Err(ParseError::Truncated),
-        }
+        let parsed = split_typed(bytes, backend_limit, MAX_MESSAGE)
+            .map_err(ParseError::Message)?
+            .map(|(tag, body, used)| {
+                backend_body(tag, body)
+                    .map(|message| (message, used))
+                    .map_err(|reason| ParseError::Message(Error::Malformed { tag, reason }))
+            })
+            .transpose()?;
+        exact(parsed, bytes.len())
     }
 
-    /// Appends a strict encoding, staging at most `MAX_MESSAGE + 1` bytes.
-    /// Checks the full size against [`MAX_MESSAGE`] before staging.
-    /// Refusal leaves `out` unchanged. The legacy writer still clips.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
-        if backend_size(self) > MAX_MESSAGE {
-            return Err(WriteError);
+    /// Appends the complete message. Refuses oversized fields or lists,
+    /// embedded NUL, short or long keys, binary columns in text COPY,
+    /// empty SASL names, and zero or duplicate diagnostic codes. Stages at
+    /// most [`MAX_MESSAGE`] plus one byte. Returns [`Error::Unwritable`]
+    /// without changing `out` on refusal.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        let size = backend_size(self);
+        if size > MAX_MESSAGE {
+            return Err(Error::Unwritable);
         }
-        let bytes = self.to_bytes();
-        if <Self as Wire>::parse(&bytes).as_ref() != Ok(self) {
-            return Err(WriteError);
+        let mut o = Out { buf: Vec::new() };
+        o.u8(self.tag());
+        o.u32(u32::try_from(size).map_err(|_| Error::Unwritable)?);
+        match self {
+            Self::Authentication(a) => {
+                o.u32(a.code());
+                match a {
+                    Authentication::Md5Password(salt) => o.put(salt),
+                    Authentication::GssContinue(d)
+                    | Authentication::SaslContinue(d)
+                    | Authentication::SaslFinal(d) => o.put(d),
+                    Authentication::Sasl(names) => {
+                        if names.len() > MAX_COUNT {
+                            return Err(Error::Unwritable);
+                        }
+                        for name in names {
+                            if name.is_empty() {
+                                return Err(Error::Unwritable);
+                            }
+                            o.cstr(name)?;
+                        }
+                        o.u8(0);
+                    }
+                    _ => {}
+                }
+            }
+            Self::BackendKeyData {
+                process_id,
+                secret_key,
+            } => {
+                if !(MIN_BACKEND_KEY..=MAX_SECRET_KEY).contains(&secret_key.len()) {
+                    return Err(Error::Unwritable);
+                }
+                o.u32(*process_id);
+                o.put(secret_key);
+            }
+            Self::CommandComplete(s) => o.cstr(s)?,
+            Self::CopyData(d) => o.put(d),
+            Self::CopyInResponse(c) | Self::CopyOutResponse(c) | Self::CopyBothResponse(c) => {
+                if c.format == Format::Text && c.columns.contains(&Format::Binary) {
+                    return Err(Error::Unwritable);
+                }
+                o.u8(c.format.code() as u8);
+                o.formats(&c.columns)?;
+            }
+            Self::DataRow(values) => o.values(values)?,
+            Self::ErrorResponse(d) | Self::NoticeResponse(d) => {
+                let mut seen = [false; 256];
+                for (code, value) in &d.fields {
+                    if *code == 0 || std::mem::replace(&mut seen[usize::from(*code)], true) {
+                        return Err(Error::Unwritable);
+                    }
+                    o.u8(*code);
+                    o.cstr(value)?;
+                }
+                o.u8(0);
+            }
+            Self::FunctionCallResponse(v) => o.value(v.as_deref())?,
+            Self::NegotiateProtocolVersion {
+                version,
+                unrecognized,
+            } => {
+                if unrecognized.len() > MAX_COUNT {
+                    return Err(Error::Unwritable);
+                }
+                o.u32(*version);
+                o.u32(u32::try_from(unrecognized.len()).map_err(|_| Error::Unwritable)?);
+                for name in unrecognized {
+                    o.cstr(name)?;
+                }
+            }
+            Self::NotificationResponse {
+                process_id,
+                channel,
+                payload,
+            } => {
+                o.u32(*process_id);
+                o.cstr(channel)?;
+                o.cstr(payload)?;
+            }
+            Self::ParameterDescription(types) => {
+                o.count(types.len())?;
+                for oid in types {
+                    o.u32(*oid);
+                }
+            }
+            Self::ParameterStatus { name, value } => {
+                o.cstr(name)?;
+                o.cstr(value)?;
+            }
+            Self::ReadyForQuery(status) => o.u8(status.byte()),
+            Self::RowDescription(fields) => {
+                o.count(fields.len())?;
+                for f in fields {
+                    o.cstr(&f.name)?;
+                    o.u32(f.table_oid);
+                    o.i16(f.column);
+                    o.u32(f.type_oid);
+                    o.i16(f.type_size);
+                    o.i32(f.type_modifier);
+                    o.i16(f.format.code());
+                }
+            }
+            Self::BindComplete
+            | Self::CloseComplete
+            | Self::CopyDone
+            | Self::EmptyQueryResponse
+            | Self::NoData
+            | Self::ParseComplete
+            | Self::PortalSuspended => {}
         }
-        out.extend_from_slice(&bytes);
+        out.extend_from_slice(&o.buf);
         Ok(())
     }
 }
@@ -1743,7 +1686,7 @@ impl FrontendMessages {
     /// Sets the maximum typed length field, clamped to 4 through
     /// [`MAX_MESSAGE`]. Startup bodies remain bounded by [`MAX_STARTUP`].
     /// A limit of 4 accepts only empty typed bodies; even Close and Describe
-    /// exceed it. [`Decoder::with_max_message`] has a higher minimum.
+    /// exceed it.
     pub fn with_limit(limit: usize) -> Self {
         Self {
             phase: Phase::Startup,
@@ -1753,6 +1696,15 @@ impl FrontendMessages {
             gss_seen: false,
             handoff: false,
         }
+    }
+
+    /// Selects typed messages for an already established session.
+    /// The length-field limit is clamped as in [`Self::with_limit`].
+    /// Use this when the connection's startup has already been read.
+    pub fn established(limit: usize) -> Self {
+        let mut messages = Self::with_limit(limit);
+        messages.start_messages();
+        messages
     }
 
     /// Selects typed messages for an already established session.
@@ -1785,7 +1737,7 @@ impl FrontendMessages {
     /// Prepares this decoder for decrypted startup bytes after handoff.
     /// Call on the decoder returned by [`super::codec::Stream::into_parts`].
     /// After a negotiated upgrade, further SSL and GSS requests are refused.
-    /// Direct TLS retains the initial negotiation policy of the old API.
+    /// Inside direct TLS, encryption requests may still be refused with `N`.
     pub fn start_encryption(&mut self) {
         if self.phase == Phase::Startup {
             if self.started {
@@ -1870,6 +1822,7 @@ impl Wire for EncryptionReply {
     type ParseError = ParseError;
     type WriteError = core::convert::Infallible;
 
+    /// Reads one `S`, `G`, or `N`. Refuses empty input, other bytes, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         match bytes {
             [ACCEPT_SSL] => Ok(Self::Ssl),
@@ -1881,6 +1834,7 @@ impl Wire for EncryptionReply {
         }
     }
 
+    /// Appends the response byte. Every variant is writable; none is refused.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
         out.push(match self {
             Self::Ssl => ACCEPT_SSL,
@@ -2006,7 +1960,7 @@ impl Decode for BackendMessages {
     }
 }
 
-/// Where [`FrontendMessages`] or a [`Decoder`] is in a connection.
+/// Where [`FrontendMessages`] is in a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     /// Before the StartupMessage: messages have no type byte.
@@ -2014,293 +1968,8 @@ pub enum Phase {
     /// After the StartupMessage: every message is typed.
     Messages,
     /// After a CancelRequest or a Terminate. [`FrontendMessages`] returns
-    /// End with remaining bytes unread; [`Decoder`] drops further feeds.
+    /// End with remaining bytes unread.
     Closed,
-}
-
-/// Splits the bytes a client sends into [`Frontend`] messages, for a
-/// world that plays a server. It starts in the startup phase and moves
-/// on after the StartupMessage. Feed it the bytes a connection reads, in
-/// order, and take messages out until it has none.
-///
-/// After an SSLRequest the decoder stays in the startup phase. A server
-/// that accepts calls [`Decoder::start_encryption`] and goes on to feed
-/// it the bytes TLS decrypts. A second SSLRequest, or a second
-/// GSSENCRequest, is refused, as PostgreSQL does.
-#[derive(Clone, Debug)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    pos: usize,
-    phase: Phase,
-    max: usize,
-    failed: Option<Error>,
-    /// Whether a message has been taken out, after which a TLS record
-    /// is no longer looked for.
-    started: bool,
-    ssl_seen: bool,
-    gss_seen: bool,
-}
-
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder::new()
-    }
-}
-
-impl Decoder {
-    /// A decoder in the startup phase, holding no bytes, that accepts
-    /// messages up to [`DEFAULT_MAX_MESSAGE`].
-    pub fn new() -> Decoder {
-        Decoder {
-            buf: Vec::new(),
-            pos: 0,
-            phase: Phase::Startup,
-            max: DEFAULT_MAX_MESSAGE,
-            failed: None,
-            started: false,
-            ssl_seen: false,
-            gss_seen: false,
-        }
-    }
-
-    /// This decoder, accepting typed messages whose length field is up to
-    /// `max`. It is held between [`SMALL_MESSAGE`] and [`MAX_MESSAGE`],
-    /// and a message type's own limit still applies.
-    pub fn with_max_message(mut self, max: usize) -> Decoder {
-        self.max = max.clamp(SMALL_MESSAGE, MAX_MESSAGE);
-        self
-    }
-
-    /// Adds bytes read from the connection and returns how many it took.
-    /// It holds at most [`Decoder::capacity`] bytes, so it may take fewer
-    /// than it is given. Take messages out with
-    /// [`Decoder::next_message`], then feed it the rest; once it is full,
-    /// `next_message` always gives a message or an error. After an error
-    /// that ends the stream, or once the connection is
-    /// [`Phase::Closed`], every byte is taken and dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() || self.phase == Phase::Closed {
-            return bytes.len();
-        }
-        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
-        if n > 0 {
-            compact(&mut self.buf, &mut self.pos);
-            self.buf.extend_from_slice(&bytes[..n]);
-        }
-        n
-    }
-
-    /// The most bytes the decoder holds: its largest message and its
-    /// header. A whole message always fits.
-    pub fn capacity(&self) -> usize {
-        self.max + 5
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes or the connection is closed. A typed message
-    /// whose body is malformed gives an error that
-    /// [`Error::is_recoverable`] and is dropped, and the next message
-    /// follows, as in PostgreSQL. Any other error ends the stream, and
-    /// the decoder keeps returning it.
-    pub fn next_message(&mut self) -> Option<Result<Frontend, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let rest = self.buf.get(self.pos..).unwrap_or(&[]);
-        let parsed = match self.phase {
-            Phase::Startup => parse_startup_from(rest, !self.started),
-            Phase::Messages => match split_typed(rest, frontend_limit, self.max) {
-                Ok(Some((tag, body, used))) => match frontend_body(tag, body) {
-                    Ok(message) => Ok(Some((message, used))),
-                    Err(reason) => {
-                        self.pos += used;
-                        return Some(Err(Error::Malformed { tag, reason }));
-                    }
-                },
-                Ok(None) => Ok(None),
-                Err(e) => Err(e),
-            },
-            Phase::Closed => return None,
-        };
-        let parsed = match parsed {
-            Ok(Some((Frontend::SslRequest, _))) if self.ssl_seen => Err(Error::UnsupportedProtocol(SSL_REQUEST_CODE)),
-            Ok(Some((Frontend::GssEncRequest, _))) if self.gss_seen => {
-                Err(Error::UnsupportedProtocol(GSSENC_REQUEST_CODE))
-            }
-            other => other,
-        };
-        match parsed {
-            Ok(Some((message, used))) => {
-                self.pos += used;
-                self.started = true;
-                match message {
-                    Frontend::SslRequest => self.ssl_seen = true,
-                    Frontend::GssEncRequest => self.gss_seen = true,
-                    Frontend::Startup(_) => self.phase = Phase::Messages,
-                    Frontend::CancelRequest { .. } | Frontend::Terminate => {
-                        self.phase = Phase::Closed;
-                        self.buf = Vec::new();
-                        self.pos = 0;
-                    }
-                    _ => {}
-                }
-                Some(Ok(message))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                // A ClientHello stays for TLS to read; nothing else is
-                // read again.
-                if e != Error::DirectTls {
-                    self.buf = Vec::new();
-                    self.pos = 0;
-                }
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// Where the connection is.
-    pub fn phase(&self) -> Phase {
-        self.phase
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-
-    /// Switches to the decrypted stream, once the server has accepted an
-    /// SSLRequest or a GSSENCRequest, or has taken up [`Error::DirectTls`].
-    /// It returns the bytes held, which came before encryption. After a
-    /// request they were sent in the clear, and PostgreSQL refuses the
-    /// connection if there are any. After [`Error::DirectTls`] they are
-    /// the TLS ClientHello, and the error is cleared.
-    ///
-    /// After an accepted request, the decoder refuses another SSLRequest
-    /// or GSSENCRequest, as PostgreSQL does. Inside direct TLS it still
-    /// gives them out, and PostgreSQL answers both with
-    /// [`REFUSE_ENCRYPTION`]. After the startup phase, or after any other
-    /// error, this does nothing and returns no bytes.
-    pub fn start_encryption(&mut self) -> Vec<u8> {
-        match (self.failed, self.phase) {
-            (Some(Error::DirectTls), _) => {
-                self.failed = None;
-                self.started = true;
-            }
-            (None, Phase::Startup) if self.started => {
-                self.ssl_seen = true;
-                self.gss_seen = true;
-            }
-            _ => return Vec::new(),
-        }
-        self.take_buffered()
-    }
-
-    /// Takes out the bytes held that no message has used.
-    pub fn take_buffered(&mut self) -> Vec<u8> {
-        let mut rest = std::mem::take(&mut self.buf);
-        rest.drain(..self.pos.min(rest.len()));
-        self.pos = 0;
-        rest
-    }
-}
-
-/// Splits the bytes a server sends into [`Backend`] messages, for a world
-/// that plays a client. Every backend message is typed. The one byte a
-/// server answers an SSLRequest with comes before any of them, and the
-/// caller reads it itself.
-#[derive(Clone, Debug)]
-pub struct BackendDecoder {
-    buf: Vec<u8>,
-    pos: usize,
-    max: usize,
-    failed: Option<Error>,
-}
-
-impl Default for BackendDecoder {
-    fn default() -> BackendDecoder {
-        BackendDecoder::new()
-    }
-}
-
-impl BackendDecoder {
-    /// A decoder holding no bytes, that accepts messages up to
-    /// [`DEFAULT_MAX_MESSAGE`].
-    pub fn new() -> BackendDecoder {
-        BackendDecoder { buf: Vec::new(), pos: 0, max: DEFAULT_MAX_MESSAGE, failed: None }
-    }
-
-    /// This decoder, accepting messages whose length field is up to
-    /// `max`, held between [`SMALL_MESSAGE`] and [`MAX_MESSAGE`].
-    pub fn with_max_message(mut self, max: usize) -> BackendDecoder {
-        self.max = max.clamp(SMALL_MESSAGE, MAX_MESSAGE);
-        self
-    }
-
-    /// Adds bytes read from the connection and returns how many it took.
-    /// It holds at most [`BackendDecoder::capacity`] bytes, so it may take
-    /// fewer than it is given. Take messages out with
-    /// [`BackendDecoder::next_message`], then feed it the rest; once it is
-    /// full, `next_message` always gives a message or an error. After an
-    /// error that ends the stream, every byte is taken and dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        let n = bytes.len().min(self.capacity().saturating_sub(self.buffered()));
-        if n > 0 {
-            compact(&mut self.buf, &mut self.pos);
-            self.buf.extend_from_slice(&bytes[..n]);
-        }
-        n
-    }
-
-    /// The most bytes the decoder holds: its largest message and its
-    /// header. A whole message always fits.
-    pub fn capacity(&self) -> usize {
-        self.max + 5
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes. A message whose body is malformed gives an error
-    /// that [`Error::is_recoverable`] and is dropped, and the next message
-    /// follows, as libpq does. Any other error ends the stream, and the
-    /// decoder keeps returning it.
-    pub fn next_message(&mut self) -> Option<Result<Backend, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let rest = self.buf.get(self.pos..).unwrap_or(&[]);
-        match split_typed(rest, backend_limit, self.max) {
-            Ok(Some((tag, body, used))) => {
-                let parsed = backend_body(tag, body);
-                self.pos += used;
-                Some(parsed.map_err(|reason| Error::Malformed { tag, reason }))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.pos = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a message.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.pos
-    }
-}
-
-/// Drops the bytes before `pos` once they are at least as many as the
-/// bytes after it, so each byte read is moved at most once on average.
-fn compact(buf: &mut Vec<u8>, pos: &mut usize) {
-    if *pos > 0 && *pos >= buf.len() - *pos {
-        buf.drain(..*pos);
-        *pos = 0;
-    }
 }
 
 /// The largest length field each frontend type may have, or `None` for a
@@ -2353,13 +2022,6 @@ fn split_typed(b: &[u8], limit: fn(u8) -> Option<usize>, max: usize) -> Result<O
         return Ok(None);
     }
     Ok(Some((tag, &b[5..end], end)))
-}
-
-/// Reads a startup-phase message, looking for a TLS record first when
-/// `tls` is set: at the opening of a connection.
-fn parse_startup_from(b: &[u8], tls: bool) -> Result<Option<(Frontend, usize)>, Error> {
-    let Some((body, used)) = split_startup(b, tls)? else { return Ok(None) };
-    Ok(Some((startup_body(body)?, used)))
 }
 
 /// The body (after the length) and total size of the startup-phase
@@ -2639,34 +2301,12 @@ fn check_text_values(formats: &[Format], values: &[Value]) -> Result<(), Malform
     for (i, v) in values.iter().enumerate() {
         if let Some(b) = v
             && format_for(formats, i) == Format::Text
-            && text_value(b).len() != b.len()
+            && (b.contains(&0) || std::str::from_utf8(b).is_err())
         {
             return Err(Malformed::NotUtf8);
         }
     }
     Ok(())
-}
-
-/// A text-format value as it may be written: cut at its first NUL, and
-/// before the first bytes that are not UTF-8.
-fn text_value(b: &[u8]) -> &[u8] {
-    let b = b.iter().position(|&c| c == 0).map_or(b, |i| &b[..i]);
-    match std::str::from_utf8(b) {
-        Ok(_) => b,
-        Err(e) => &b[..e.valid_up_to()],
-    }
-}
-
-/// The values of a Bind or FunctionCall as written, under the format
-/// list that is written: text values go through [`text_value`].
-fn written_values<'a>(formats: &[Format], values: &'a [Value]) -> Vec<Option<&'a [u8]>> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, v)| {
-            v.as_deref().map(|b| if format_for(formats, i) == Format::Text { text_value(b) } else { b })
-        })
-        .collect()
 }
 
 /// The format of item `i` under that rule.
@@ -2764,155 +2404,9 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Builds one message, never past `end` bytes in all when the caller
-/// reserves what later fields need.
-struct Out {
-    buf: Vec<u8>,
-    end: usize,
-    len_at: usize,
-}
-
-impl Out {
-    /// A typed message whose length field may be up to `limit`.
-    fn typed(tag: u8, limit: usize) -> Out {
-        Out { buf: vec![tag, 0, 0, 0, 0], end: limit.saturating_add(1), len_at: 1 }
-    }
-
-    /// A startup-phase message whose length field may be up to `limit`.
-    fn untagged(limit: usize) -> Out {
-        Out { buf: vec![0, 0, 0, 0], end: limit, len_at: 0 }
-    }
-
-    /// The bytes left before the limit.
-    fn room(&self) -> usize {
-        self.end.saturating_sub(self.buf.len())
-    }
-
-    fn put(&mut self, b: &[u8]) {
-        self.buf.extend_from_slice(b);
-    }
-
-    fn u8(&mut self, v: u8) {
-        self.buf.push(v);
-    }
-
-    fn u16(&mut self, v: u16) {
-        self.put(&v.to_be_bytes());
-    }
-
-    fn i16(&mut self, v: i16) {
-        self.put(&v.to_be_bytes());
-    }
-
-    fn u32(&mut self, v: u32) {
-        self.put(&v.to_be_bytes());
-    }
-
-    fn i32(&mut self, v: i32) {
-        self.put(&v.to_be_bytes());
-    }
-
-    /// `s` up to its first NUL, cut to leave `reserve` bytes free, and a
-    /// NUL.
-    fn cstr(&mut self, s: &str, reserve: usize) {
-        let s = fit(until_nul(s), self.room().saturating_sub(reserve).saturating_sub(1));
-        self.put(s.as_bytes());
-        self.buf.push(0);
-    }
-
-    /// `b`, cut to leave `reserve` bytes free.
-    fn bytes(&mut self, b: &[u8], reserve: usize) {
-        let n = b.len().min(self.room().saturating_sub(reserve));
-        self.put(&b[..n]);
-    }
-
-    /// A 16-bit count and the format codes. The caller has checked that
-    /// they fit.
-    fn formats(&mut self, formats: &[Format]) {
-        self.u16(count16(formats.len()));
-        for f in formats {
-            self.i16(f.code());
-        }
-    }
-
-    /// A value's length (or -1) and bytes. The caller has checked that it
-    /// fits.
-    fn value(&mut self, v: Option<&[u8]>) {
-        match v {
-            None => self.i32(-1),
-            Some(b) => {
-                self.u32(len32(b.len()));
-                self.put(b);
-            }
-        }
-    }
-
-    /// The message, with its length field filled in.
-    fn done(mut self) -> Vec<u8> {
-        let len = len32(self.buf.len() - self.len_at);
-        self.buf[self.len_at..self.len_at + 4].copy_from_slice(&len.to_be_bytes());
-        self.buf
-    }
-}
-
-/// How many of `items`, from the first, fit in `avail` bytes, at most
-/// [`MAX_COUNT`], and the bytes they take.
-fn fit_count<T>(items: &[T], avail: usize, size: impl Fn(&T) -> usize) -> (usize, usize) {
-    let mut used = 0usize;
-    let mut n = 0;
-    for item in items.iter().take(MAX_COUNT) {
-        match used.checked_add(size(item)) {
-            Some(u) if u <= avail => {
-                used = u;
-                n += 1;
-            }
-            _ => break,
-        }
-    }
-    (n, used)
-}
-
 /// The bytes a value takes: its length field and its bytes.
 fn value_size(v: Option<&[u8]>) -> usize {
     4usize.saturating_add(v.map_or(0, <[u8]>::len))
-}
-
-/// The bytes a string takes: up to its first NUL, and a NUL.
-fn cstr_size(s: &str) -> usize {
-    until_nul(s).len() + 1
-}
-
-/// `s` up to its first NUL.
-fn until_nul(s: &str) -> &str {
-    s.find('\0').map_or(s, |i| &s[..i])
-}
-
-/// `s`, cut to at most `max` bytes on a character boundary.
-fn fit(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut i = max;
-    while !s.is_char_boundary(i) {
-        i -= 1;
-    }
-    &s[..i]
-}
-
-/// The cancel key as written: at most [`MAX_SECRET_KEY`] bytes, and 4
-/// zero bytes in place of an empty key.
-fn key_bytes(key: &[u8]) -> &[u8] {
-    if key.is_empty() { &[0; 4] } else { &key[..key.len().min(MAX_SECRET_KEY)] }
-}
-
-/// A count the writers have already held to [`MAX_COUNT`].
-fn count16(n: usize) -> u16 {
-    u16::try_from(n).unwrap_or(u16::MAX)
-}
-
-/// A length the writers have already held to [`MAX_MESSAGE`].
-fn len32(n: usize) -> u32 {
-    u32::try_from(n).unwrap_or(u32::MAX)
 }
 
 fn be32(b: &[u8], i: usize) -> u32 {
@@ -2927,10 +2421,13 @@ fn show_tag(t: u8) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::codec::{
+        Fail, Stream, contract,
+        test_support::{Lcg, decode_all, mutate},
+    };
 
     #[test]
     fn all_message_variants_obey_wire_contract() {
-        use crate::stdlib::codec::contract;
         for message in all_frontend() {
             contract::check_wire_value(&message);
             let bytes = Wire::to_bytes(&message).unwrap();
@@ -2979,7 +2476,10 @@ mod tests {
             let bytes = Wire::to_bytes(&message).unwrap();
             assert_eq!(bytes.len(), limit + usize::from(message.tag().is_some()));
             let mut out = b"prefix".to_vec();
-            assert_eq!(make(limit - fixed + 1).write(&mut out), Err(WriteError));
+            assert_eq!(
+                make(limit - fixed + 1).write(&mut out),
+                Err(Error::Unwritable)
+            );
             assert_eq!(out, b"prefix");
         }
     }
@@ -2999,44 +2499,46 @@ mod tests {
     fn startup_message() {
         let bytes = startup_bytes();
         assert_eq!(bytes.len(), 55);
-        let (m, used) = Frontend::parse_startup(&bytes).unwrap().unwrap();
-        assert_eq!(used, 55);
+        let m = Frontend::parse(&bytes).unwrap();
         assert_eq!(m, Frontend::Startup(Startup::new("alice", "shop")));
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
         let Frontend::Startup(s) = m else { panic!() };
         assert_eq!(s.user(), Some("alice"));
         // With no database parameter, the database is the user's name.
         let s = Startup { minor_version: 2, params: vec![("user".into(), "bob".into())] };
         assert_eq!(s.database(), Some("bob"));
-        let bytes = Frontend::Startup(s.clone()).to_bytes();
+        let bytes = Frontend::Startup(s.clone()).to_bytes().unwrap();
         assert_eq!(&bytes[4..8], &PROTOCOL_3_2.to_be_bytes());
-        assert_eq!(Frontend::parse_startup(&bytes).unwrap().unwrap().0, Frontend::Startup(s));
+        assert_eq!(Frontend::parse(&bytes).unwrap(), Frontend::Startup(s));
         // No parameters at all is the terminator alone.
-        let empty = Frontend::Startup(Startup::default()).to_bytes();
+        let empty = Frontend::Startup(Startup::default()).to_bytes().unwrap();
         assert_eq!(empty, [0, 0, 0, 9, 0, 3, 0, 0, 0]);
     }
 
     #[test]
     fn encryption_and_cancel_requests() {
         let ssl = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
-        assert_eq!(Frontend::parse_startup(&ssl), Ok(Some((Frontend::SslRequest, 8))));
-        assert_eq!(Frontend::SslRequest.to_bytes(), ssl);
+        assert_eq!(Frontend::parse(&ssl), Ok(Frontend::SslRequest));
+        assert_eq!(Frontend::SslRequest.to_bytes().unwrap(), ssl);
         let gss = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x30];
-        assert_eq!(Frontend::parse_startup(&gss), Ok(Some((Frontend::GssEncRequest, 8))));
-        assert_eq!(Frontend::GssEncRequest.to_bytes(), gss);
+        assert_eq!(Frontend::parse(&gss), Ok(Frontend::GssEncRequest));
+        assert_eq!(Frontend::GssEncRequest.to_bytes().unwrap(), gss);
         let cancel = [0, 0, 0, 16, 0x04, 0xd2, 0x16, 0x2e, 0, 0, 0x10, 0x92, 1, 2, 3, 4];
         let m = Frontend::CancelRequest { process_id: 4242, secret_key: vec![1, 2, 3, 4] };
-        assert_eq!(Frontend::parse_startup(&cancel), Ok(Some((m.clone(), 16))));
-        assert_eq!(m.to_bytes(), cancel);
+        assert_eq!(Frontend::parse(&cancel), Ok(m.clone()));
+        assert_eq!(m.to_bytes().unwrap(), cancel);
         // A protocol 3.2 key of 32 bytes.
         let long = Frontend::CancelRequest { process_id: 1, secret_key: vec![9; 32] };
-        assert_eq!(Frontend::parse_startup(&long.to_bytes()).unwrap().unwrap().0, long);
+        assert_eq!(Frontend::parse(&long.to_bytes().unwrap()).unwrap(), long);
         assert!(m.is_startup() && m.tag().is_none());
     }
 
     #[test]
     fn simple_query_replies() {
-        assert_eq!(Frontend::parse(b"Q\0\0\0\x0dSELECT 1\0"), Ok(Some((Frontend::Query("SELECT 1".into()), 14))));
+        assert_eq!(
+            Frontend::parse(b"Q\0\0\0\x0dSELECT 1\0"),
+            Ok(Frontend::Query("SELECT 1".into()))
+        );
         let cases: Vec<(Backend, &[u8])> = vec![
             (Backend::Authentication(Authentication::Ok), b"R\0\0\0\x08\0\0\0\0"),
             (Backend::Authentication(Authentication::CleartextPassword), b"R\0\0\0\x08\0\0\0\x03"),
@@ -3084,19 +2586,24 @@ mod tests {
             ),
         ];
         for (message, bytes) in cases {
-            assert_eq!(message.to_bytes(), bytes, "{message:?}");
-            assert_eq!(Backend::parse(bytes), Ok(Some((message, bytes.len()))));
+            assert_eq!(message.to_bytes().unwrap(), bytes, "{message:?}");
+            assert_eq!(Backend::parse(bytes), Ok(message));
         }
     }
 
     #[test]
     fn row_description_layout() {
         let field = Field::new("id", oid::INT4);
-        let bytes = Backend::RowDescription(vec![field.clone()]).to_bytes();
+        let bytes = Backend::RowDescription(vec![field.clone()])
+            .to_bytes()
+            .unwrap();
         let mut want = b"T\0\0\0\x1b\0\x01id\0".to_vec();
         want.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 0]);
         assert_eq!(bytes, want);
-        assert_eq!(Backend::parse(&bytes).unwrap().unwrap().0, Backend::RowDescription(vec![field]));
+        assert_eq!(
+            Backend::parse(&bytes).unwrap(),
+            Backend::RowDescription(vec![field])
+        );
         assert_eq!(Field::new("t", oid::TEXT).type_size, -1);
     }
 
@@ -3104,18 +2611,18 @@ mod tests {
     fn error_response_layout() {
         let d = Diagnostic::error(sqlstate::UNDEFINED_TABLE, "relation \"x\" does not exist")
             .with(field_code::POSITION, "15");
-        let bytes = Backend::ErrorResponse(d.clone()).to_bytes();
+        let bytes = Backend::ErrorResponse(d.clone()).to_bytes().unwrap();
         let mut body = b"SERROR\0VERROR\0C42P01\0Mrelation \"x\" does not exist\0P15\0\0".to_vec();
         let mut want = vec![b'E'];
         want.extend_from_slice(&(body.len() as u32 + 4).to_be_bytes());
         want.append(&mut body);
         assert_eq!(bytes, want);
-        let (back, _) = Backend::parse(&bytes).unwrap().unwrap();
+        let back = Backend::parse(&bytes).unwrap();
         assert_eq!(back, Backend::ErrorResponse(d.clone()));
         assert_eq!(d.get(field_code::CODE), Some("42P01"));
         assert_eq!(d.get(field_code::HINT), None);
         let notice = Backend::NoticeResponse(Diagnostic::new("NOTICE", sqlstate::SUCCESSFUL_COMPLETION, "hi"));
-        assert_eq!(Backend::parse(&notice.to_bytes()).unwrap().unwrap().0, notice);
+        assert_eq!(Backend::parse(&notice.to_bytes().unwrap()).unwrap(), notice);
         assert_eq!(Diagnostic::fatal(sqlstate::INVALID_PASSWORD, "no").get(field_code::SEVERITY), Some("FATAL"));
     }
 
@@ -3148,17 +2655,20 @@ mod tests {
     #[test]
     fn extended_query() {
         let bytes = extended_bytes();
-        let mut at = 0;
-        let mut got = Vec::new();
-        while let Some((m, used)) = Frontend::parse(&bytes[at..]).unwrap() {
-            got.push(m);
-            at += used;
+        let (got, failure) = decode_all(|| FrontendMessages::established(SMALL_MESSAGE), &bytes);
+        assert_eq!(failure, None);
+        assert_eq!(
+            got,
+            extended_messages().into_iter().map(Ok).collect::<Vec<_>>()
+        );
+        let mut written = Vec::new();
+        for message in got {
+            message.unwrap().write(&mut written).unwrap();
         }
-        assert_eq!(at, bytes.len());
-        assert_eq!(got, extended_messages());
-        let written: Vec<u8> = got.iter().flat_map(Frontend::to_bytes).collect();
         assert_eq!(written, bytes);
-        let Frontend::Bind(b) = &got[1] else { panic!() };
+        let Frontend::Bind(b) = &extended_messages()[1] else {
+            panic!()
+        };
         assert_eq!(b.param_format(0), Format::Text);
         assert_eq!(b.result_format(3), Format::Binary);
     }
@@ -3172,7 +2682,7 @@ mod tests {
             (Frontend::CopyFail("no".into()), b"f\0\0\0\x07no\0"),
             (Frontend::Flush, b"H\0\0\0\x04"),
             (Frontend::Terminate, b"X\0\0\0\x04"),
-            (Frontend::password("pw"), b"p\0\0\0\x07pw\0"),
+            (Frontend::password("pw").unwrap(), b"p\0\0\0\x07pw\0"),
             (
                 Frontend::FunctionCall(FunctionCall {
                     function: 1598,
@@ -3184,38 +2694,76 @@ mod tests {
             ),
         ];
         for (message, bytes) in cases {
-            assert_eq!(message.to_bytes(), bytes, "{message:?}");
-            assert_eq!(Frontend::parse(bytes), Ok(Some((message, bytes.len()))));
+            assert_eq!(message.to_bytes().unwrap(), bytes, "{message:?}");
+            assert_eq!(Frontend::parse(bytes), Ok(message));
         }
     }
 
     #[test]
     fn auth_responses() {
-        let Frontend::AuthResponse(body) = Frontend::password("md5abc") else { panic!() };
-        assert_eq!(read_password(&body), Ok("md5abc".into()));
-        assert_eq!(read_password(b"pw"), Err(Malformed::UnterminatedString));
-        assert_eq!(read_password(b"pw\0x"), Err(Malformed::TrailingBytes));
-        let sasl = SaslInitialResponse { mechanism: "SCRAM-SHA-256".into(), data: Some(b"n,,n=,r=abc".to_vec()) };
-        let Frontend::AuthResponse(body) = sasl.to_message() else { panic!() };
-        assert_eq!(&body[..14], b"SCRAM-SHA-256\0");
-        assert_eq!(&body[14..18], &[0, 0, 0, 11]);
-        assert_eq!(SaslInitialResponse::parse(&body), Ok(sasl));
+        let Frontend::AuthResponse(body) = Frontend::password("md5abc").unwrap() else {
+            panic!()
+        };
+        assert_eq!(Password::parse(&body), Ok(Password("md5abc".into())));
+        assert_eq!(
+            Password::parse(b"pw"),
+            Err(auth_error(Malformed::UnterminatedString))
+        );
+        assert_eq!(
+            Password::parse(b"pw\0x"),
+            Err(auth_error(Malformed::TrailingBytes))
+        );
+        for data in [None, Some(vec![]), Some(b"n,,n=,r=abc".to_vec())] {
+            let sasl = SaslInitialResponse {
+                mechanism: "SCRAM-SHA-256".into(),
+                data,
+            };
+            let Frontend::AuthResponse(body) = sasl.to_message().unwrap() else {
+                panic!()
+            };
+            assert_eq!(&body[..14], b"SCRAM-SHA-256\0");
+            let length = sasl.data.as_ref().map_or(-1, |bytes| bytes.len() as i32);
+            assert_eq!(&body[14..18], &length.to_be_bytes());
+            assert_eq!(SaslInitialResponse::parse(&body), Ok(sasl.clone()));
+            contract::check_wire_value(&sasl);
+            contract::check_wire::<SaslInitialResponse>(&body);
+        }
         let none = SaslInitialResponse { mechanism: "X".into(), data: None };
-        let Frontend::AuthResponse(body) = none.to_message() else { panic!() };
-        assert_eq!(body, b"X\0\xff\xff\xff\xff");
-        assert_eq!(SaslInitialResponse::parse(&body), Ok(none));
-        assert_eq!(SaslInitialResponse::parse(b"X\0\0\0\0\x05ab"), Err(Malformed::Truncated));
-        assert_eq!(SaslInitialResponse::parse(b"X\0\xff\xff\xff\xfe"), Err(Malformed::BadValueLength(-2)));
-        // Writers cut what does not fit in an auth message.
-        let big = SaslInitialResponse { mechanism: "M".into(), data: Some(vec![7; 100_000]) };
-        let m = big.to_message();
-        let bytes = m.to_bytes();
-        assert!(bytes.len() - 1 <= MAX_AUTH_MESSAGE);
-        let Frontend::AuthResponse(body) = Frontend::parse(&bytes).unwrap().unwrap().0 else { panic!() };
-        assert!(SaslInitialResponse::parse(&body).is_ok());
-        let p = Frontend::password(&"é".repeat(40_000)).to_bytes();
-        let Frontend::AuthResponse(body) = Frontend::parse(&p).unwrap().unwrap().0 else { panic!() };
-        assert!(read_password(&body).is_ok());
+        assert_eq!(none.to_bytes().unwrap(), b"X\0\xff\xff\xff\xff");
+        assert_eq!(
+            SaslInitialResponse::parse(b"X\0\0\0\0\x05ab"),
+            Err(auth_error(Malformed::Truncated))
+        );
+        assert_eq!(
+            SaslInitialResponse::parse(b"X\0\xff\xff\xff\xfe"),
+            Err(auth_error(Malformed::BadValueLength(-2)))
+        );
+        for value in [
+            SaslInitialResponse {
+                mechanism: "M".into(),
+                data: Some(vec![7; 100_000]),
+            },
+            SaslInitialResponse {
+                mechanism: "M\0N".into(),
+                data: None,
+            },
+        ] {
+            assert_unwritable(&value);
+        }
+        assert_eq!(
+            Frontend::password(&"é".repeat(40_000)),
+            Err(Error::Unwritable)
+        );
+        assert_eq!(Frontend::password("a\0b"), Err(Error::Unwritable));
+        let oversized = vec![0; MAX_AUTH_MESSAGE - 3];
+        let too_long = Error::TooLong { length: MAX_AUTH_MESSAGE as u32 + 1, max: MAX_AUTH_MESSAGE };
+        assert_eq!(Password::parse(&oversized), Err(too_long));
+        assert_eq!(SaslInitialResponse::parse(&oversized), Err(too_long));
+        for len in [MAX_AUTH_MESSAGE - 5, MAX_AUTH_MESSAGE - 4] {
+            let password = Password("x".repeat(len));
+            assert_eq!(password.to_bytes().is_ok(), len == MAX_AUTH_MESSAGE - 5);
+            contract::check_wire_value(&password);
+        }
     }
 
     fn startup_with(code: u32, rest: &[u8]) -> Vec<u8> {
@@ -3239,111 +2787,260 @@ mod tests {
     #[test]
     fn startup_errors() {
         // A TLS ClientHello, known from its first byte.
-        assert_eq!(Frontend::parse_startup(&[0x16]), Err(Error::DirectTls));
-        assert_eq!(Frontend::parse_startup(&[0, 0, 0, 7]), Err(Error::BadLength(7)));
         assert_eq!(
-            Frontend::parse_startup(&[0, 0, 0x27, 0x15]),
-            Err(Error::TooLong { length: 10_005, max: MAX_STARTUP + 4 })
+            FrontendMessages::new().decode(&[0x16], false),
+            Err(Error::DirectTls)
         );
-        assert!(Frontend::parse_startup(&[0, 0, 0x27, 0x14]).unwrap().is_none());
-        // Protocol 2.0, refused as soon as its version arrives.
-        assert_eq!(Frontend::parse_startup(&[0, 0, 0, 9, 0, 2, 0, 0]), Err(Error::UnsupportedProtocol(0x2_0000)));
         assert_eq!(
-            Frontend::parse_startup(&startup_with(0x04d2_0000, b"\0")),
-            Err(Error::UnsupportedProtocol(0x04d2_0000))
+            Frontend::parse(&[0, 0, 0, 7]),
+            Err(ParseError::Message(Error::BadLength(7)))
+        );
+        assert_eq!(
+            Frontend::parse(&[0, 0, 0x27, 0x15]),
+            Err(ParseError::Message(Error::TooLong {
+                length: 10_005,
+                max: MAX_STARTUP + 4
+            }))
+        );
+        assert_eq!(
+            Frontend::parse(&[0, 0, 0x27, 0x14]),
+            Err(ParseError::Truncated)
+        );
+        // Protocol 2.0, refused as soon as its version arrives.
+        assert_eq!(
+            Frontend::parse(&[0, 0, 0, 9, 0, 2, 0, 0]),
+            Err(ParseError::Message(Error::UnsupportedProtocol(0x2_0000)))
+        );
+        assert_eq!(
+            Frontend::parse(&startup_with(0x04d2_0000, b"\0")),
+            Err(ParseError::Message(Error::UnsupportedProtocol(0x04d2_0000)))
         );
         // Requests with bytes they should not have.
         assert_eq!(
-            Frontend::parse_startup(&startup_with(SSL_REQUEST_CODE, b"x")),
-            Err(bad(0, Malformed::TrailingBytes))
+            Frontend::parse(&startup_with(SSL_REQUEST_CODE, b"x")),
+            Err(ParseError::Message(bad(0, Malformed::TrailingBytes)))
         );
         assert_eq!(
-            Frontend::parse_startup(&startup_with(GSSENC_REQUEST_CODE, b"x")),
-            Err(bad(0, Malformed::TrailingBytes))
+            Frontend::parse(&startup_with(GSSENC_REQUEST_CODE, b"x")),
+            Err(ParseError::Message(bad(0, Malformed::TrailingBytes)))
         );
         assert_eq!(
-            Frontend::parse_startup(&startup_with(CANCEL_REQUEST_CODE, b"\0\0")),
-            Err(bad(0, Malformed::Truncated))
+            Frontend::parse(&startup_with(CANCEL_REQUEST_CODE, b"\0\0")),
+            Err(ParseError::Message(bad(0, Malformed::Truncated)))
         );
         assert_eq!(
-            Frontend::parse_startup(&startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1])),
-            Err(bad(0, Malformed::BadKeyLength(0)))
+            Frontend::parse(&startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1])),
+            Err(ParseError::Message(bad(0, Malformed::BadKeyLength(0))))
         );
         let mut long = vec![0, 0, 0, 1];
         long.extend_from_slice(&[5; 257]);
         assert_eq!(
-            Frontend::parse_startup(&startup_with(CANCEL_REQUEST_CODE, &long)),
-            Err(bad(0, Malformed::BadKeyLength(257)))
+            Frontend::parse(&startup_with(CANCEL_REQUEST_CODE, &long)),
+            Err(ParseError::Message(bad(0, Malformed::BadKeyLength(257))))
         );
         // Parameters with no terminator, no value, bytes after it, or bad
         // text.
         let v3 = PROTOCOL_3_0;
-        assert_eq!(Frontend::parse_startup(&startup_with(v3, b"")), Err(bad(0, Malformed::UnterminatedString)));
-        assert_eq!(Frontend::parse_startup(&startup_with(v3, b"user\0")), Err(bad(0, Malformed::UnterminatedString)));
         assert_eq!(
-            Frontend::parse_startup(&startup_with(v3, b"user\0a\0")),
-            Err(bad(0, Malformed::UnterminatedString))
+            Frontend::parse(&startup_with(v3, b"")),
+            Err(ParseError::Message(bad(0, Malformed::UnterminatedString)))
         );
-        assert_eq!(Frontend::parse_startup(&startup_with(v3, b"user\0a\0\0x")), Err(bad(0, Malformed::TrailingBytes)));
-        assert_eq!(Frontend::parse_startup(&startup_with(v3, b"user\0\xff\0\0")), Err(bad(0, Malformed::NotUtf8)));
-        assert!(Frontend::parse_startup(&startup_with(v3, b"user\0a\0\0")).is_ok());
+        assert_eq!(
+            Frontend::parse(&startup_with(v3, b"user\0")),
+            Err(ParseError::Message(bad(0, Malformed::UnterminatedString)))
+        );
+        assert_eq!(
+            Frontend::parse(&startup_with(v3, b"user\0a\0")),
+            Err(ParseError::Message(bad(0, Malformed::UnterminatedString)))
+        );
+        assert_eq!(
+            Frontend::parse(&startup_with(v3, b"user\0a\0\0x")),
+            Err(ParseError::Message(bad(0, Malformed::TrailingBytes)))
+        );
+        assert_eq!(
+            Frontend::parse(&startup_with(v3, b"user\0\xff\0\0")),
+            Err(ParseError::Message(bad(0, Malformed::NotUtf8)))
+        );
+        assert!(Frontend::parse(&startup_with(v3, b"user\0a\0\0")).is_ok());
     }
 
     #[test]
     fn typed_errors() {
-        assert_eq!(Frontend::parse(b"Z"), Err(Error::UnknownType(b'Z')));
-        assert_eq!(Frontend::parse(&[0]), Err(Error::UnknownType(0)));
-        assert_eq!(Backend::parse(b"Q"), Err(Error::UnknownType(b'Q')));
-        assert_eq!(Frontend::parse(b"S\0\0\0\x03"), Err(Error::BadLength(3)));
-        assert_eq!(Backend::parse(b"Z\0\0\0\x00"), Err(Error::BadLength(0)));
+        assert_eq!(
+            Frontend::parse(b"Z"),
+            Err(ParseError::Message(Error::UnknownType(b'Z')))
+        );
+        assert_eq!(
+            FrontendMessages::established(SMALL_MESSAGE).decode(&[0], false),
+            Err(Error::UnknownType(0))
+        );
+        assert_eq!(
+            Backend::parse(b"Q"),
+            Err(ParseError::Message(Error::UnknownType(b'Q')))
+        );
+        assert_eq!(
+            Frontend::parse(b"S\0\0\0\x03"),
+            Err(ParseError::Message(Error::BadLength(3)))
+        );
+        assert_eq!(
+            Backend::parse(b"Z\0\0\0\x00"),
+            Err(ParseError::Message(Error::BadLength(0)))
+        );
         // Small messages are capped at 10000, as PostgreSQL does.
-        assert_eq!(Frontend::parse(b"S\0\0\x27\x11"), Err(Error::TooLong { length: 10_001, max: SMALL_MESSAGE }));
-        assert_eq!(Frontend::parse(b"p\0\x01\0\0"), Err(Error::TooLong { length: 65_536, max: MAX_AUTH_MESSAGE }));
-        assert_eq!(Frontend::parse(b"Q\x40\0\0\0"), Err(Error::TooLong { length: 0x4000_0000, max: MAX_MESSAGE }));
-        assert_eq!(Backend::parse(b"D\xff\xff\xff\xff"), Err(Error::TooLong { length: u32::MAX, max: MAX_MESSAGE }));
-        assert!(Frontend::parse(b"Q\x3f\xff\xff\xfe").unwrap().is_none());
+        assert_eq!(
+            Frontend::parse(b"S\0\0\x27\x11"),
+            Err(ParseError::Message(Error::TooLong {
+                length: 10_001,
+                max: SMALL_MESSAGE
+            }))
+        );
+        assert_eq!(
+            Frontend::parse(b"p\0\x01\0\0"),
+            Err(ParseError::Message(Error::TooLong {
+                length: 65_536,
+                max: MAX_AUTH_MESSAGE
+            }))
+        );
+        assert_eq!(
+            Frontend::parse(b"Q\x40\0\0\0"),
+            Err(ParseError::Message(Error::TooLong {
+                length: 0x4000_0000,
+                max: MAX_MESSAGE
+            }))
+        );
+        assert_eq!(
+            Backend::parse(b"D\xff\xff\xff\xff"),
+            Err(ParseError::Message(Error::TooLong {
+                length: u32::MAX,
+                max: MAX_MESSAGE
+            }))
+        );
+        assert_eq!(
+            Frontend::parse(b"Q\x3f\xff\xff\xfe"),
+            Err(ParseError::Truncated)
+        );
 
         let f = |tag, body: &[u8]| Frontend::parse(&typed(tag, body));
         let m = bad;
-        assert_eq!(f(b'Q', b"abc"), Err(m(b'Q', Malformed::UnterminatedString)));
-        assert_eq!(f(b'Q', b"a\0b"), Err(m(b'Q', Malformed::TrailingBytes)));
-        assert_eq!(f(b'Q', b"\xc3\0"), Err(m(b'Q', Malformed::NotUtf8)));
-        assert_eq!(f(b'S', b"x"), Err(m(b'S', Malformed::TrailingBytes)));
-        assert_eq!(f(b'C', b"X\0"), Err(m(b'C', Malformed::BadTarget(b'X'))));
-        assert_eq!(f(b'D', b""), Err(m(b'D', Malformed::Truncated)));
-        assert_eq!(f(b'E', b"\0\0\0"), Err(m(b'E', Malformed::Truncated)));
-        assert_eq!(f(b'P', b"\0q\0\0\x02\0\0\0\x17"), Err(m(b'P', Malformed::Truncated)));
+        assert_eq!(
+            f(b'Q', b"abc"),
+            Err(ParseError::Message(m(b'Q', Malformed::UnterminatedString)))
+        );
+        assert_eq!(
+            f(b'Q', b"a\0b"),
+            Err(ParseError::Message(m(b'Q', Malformed::TrailingBytes)))
+        );
+        assert_eq!(
+            f(b'Q', b"\xc3\0"),
+            Err(ParseError::Message(m(b'Q', Malformed::NotUtf8)))
+        );
+        assert_eq!(
+            f(b'S', b"x"),
+            Err(ParseError::Message(m(b'S', Malformed::TrailingBytes)))
+        );
+        assert_eq!(
+            f(b'C', b"X\0"),
+            Err(ParseError::Message(m(b'C', Malformed::BadTarget(b'X'))))
+        );
+        assert_eq!(
+            f(b'D', b""),
+            Err(ParseError::Message(m(b'D', Malformed::Truncated)))
+        );
+        assert_eq!(
+            f(b'E', b"\0\0\0"),
+            Err(ParseError::Message(m(b'E', Malformed::Truncated)))
+        );
+        assert_eq!(
+            f(b'P', b"\0q\0\0\x02\0\0\0\x17"),
+            Err(ParseError::Message(m(b'P', Malformed::Truncated)))
+        );
         // Bind: a format code of 2, a length of -2, and two formats for
         // three values.
-        assert_eq!(f(b'B', b"\0\0\0\x01\0\x02\0\0\0\0"), Err(m(b'B', Malformed::BadFormat(2))));
-        assert_eq!(f(b'B', b"\0\0\0\0\0\x01\xff\xff\xff\xfe\0\0"), Err(m(b'B', Malformed::BadValueLength(-2))));
+        assert_eq!(
+            f(b'B', b"\0\0\0\x01\0\x02\0\0\0\0"),
+            Err(ParseError::Message(m(b'B', Malformed::BadFormat(2))))
+        );
+        assert_eq!(
+            f(b'B', b"\0\0\0\0\0\x01\xff\xff\xff\xfe\0\0"),
+            Err(ParseError::Message(m(b'B', Malformed::BadValueLength(-2))))
+        );
         let mut three = b"\0\0\0\x02\0\0\0\x01\0\x03".to_vec();
         three.extend_from_slice(&[0xff; 12]);
         three.extend_from_slice(&[0, 0]);
-        assert_eq!(f(b'B', &three), Err(m(b'B', Malformed::FormatCount)));
-        assert_eq!(f(b'B', b"\0\0\0\0\0\x01\0\0\0\x05ab\0\0"), Err(m(b'B', Malformed::Truncated)));
-        assert_eq!(f(b'F', b"\0\0\0\x01\0\x02\0\0\0\0\0\0\0\0"), Err(m(b'F', Malformed::FormatCount)));
-        assert_eq!(f(b'F', b"\0\0\0\x01\0\0\0\0\0\x07"), Err(m(b'F', Malformed::BadFormat(7))));
+        assert_eq!(
+            f(b'B', &three),
+            Err(ParseError::Message(m(b'B', Malformed::FormatCount)))
+        );
+        assert_eq!(
+            f(b'B', b"\0\0\0\0\0\x01\0\0\0\x05ab\0\0"),
+            Err(ParseError::Message(m(b'B', Malformed::Truncated)))
+        );
+        assert_eq!(
+            f(b'F', b"\0\0\0\x01\0\x02\0\0\0\0\0\0\0\0"),
+            Err(ParseError::Message(m(b'F', Malformed::FormatCount)))
+        );
+        assert_eq!(
+            f(b'F', b"\0\0\0\x01\0\0\0\0\0\x07"),
+            Err(ParseError::Message(m(b'F', Malformed::BadFormat(7))))
+        );
 
         let g = |tag, body: &[u8]| Backend::parse(&typed(tag, body));
-        assert_eq!(g(b'R', b"\0\0\0\x06"), Err(m(b'R', Malformed::BadAuth(6))));
-        assert_eq!(g(b'R', b"\0\0\0\x05ab"), Err(m(b'R', Malformed::Truncated)));
-        assert_eq!(g(b'R', b"\0\0\0\x0aSCRAM\0"), Err(m(b'R', Malformed::UnterminatedString)));
-        assert_eq!(g(b'R', b"\0\0\0\0x"), Err(m(b'R', Malformed::TrailingBytes)));
-        assert_eq!(g(b'K', b"\0\0\0\x01"), Err(m(b'K', Malformed::BadKeyLength(0))));
-        assert_eq!(g(b'K', &[0; 261]), Err(m(b'K', Malformed::BadKeyLength(257))));
-        assert_eq!(g(b'Z', b"X"), Err(m(b'Z', Malformed::BadStatus(b'X'))));
-        assert_eq!(g(b'Z', b""), Err(m(b'Z', Malformed::Truncated)));
-        assert_eq!(g(b'G', b"\x02\0\0"), Err(m(b'G', Malformed::BadFormat(2))));
+        assert_eq!(
+            g(b'R', b"\0\0\0\x06"),
+            Err(ParseError::Message(m(b'R', Malformed::BadAuth(6))))
+        );
+        assert_eq!(
+            g(b'R', b"\0\0\0\x05ab"),
+            Err(ParseError::Message(m(b'R', Malformed::Truncated)))
+        );
+        assert_eq!(
+            g(b'R', b"\0\0\0\x0aSCRAM\0"),
+            Err(ParseError::Message(m(b'R', Malformed::UnterminatedString)))
+        );
+        assert_eq!(
+            g(b'R', b"\0\0\0\0x"),
+            Err(ParseError::Message(m(b'R', Malformed::TrailingBytes)))
+        );
+        assert_eq!(
+            g(b'K', b"\0\0\0\x01"),
+            Err(ParseError::Message(m(b'K', Malformed::BadKeyLength(0))))
+        );
+        assert_eq!(
+            g(b'K', &[0; 261]),
+            Err(ParseError::Message(m(b'K', Malformed::BadKeyLength(257))))
+        );
+        assert_eq!(
+            g(b'Z', b""),
+            Err(ParseError::Message(m(b'Z', Malformed::Truncated)))
+        );
+        assert_eq!(
+            g(b'G', b"\x02\0\0"),
+            Err(ParseError::Message(m(b'G', Malformed::BadFormat(2))))
+        );
         assert_eq!(
             g(b'T', b"\0\x01a\0\0\0\0\0\0\0\0\0\0\x17\0\x04\xff\xff\xff\xff\0\x05"),
-            Err(m(b'T', Malformed::BadFormat(5)))
+            Err(ParseError::Message(m(b'T', Malformed::BadFormat(5))))
         );
-        assert_eq!(g(b'E', b"SERROR\0"), Err(m(b'E', Malformed::Truncated)));
-        assert_eq!(g(b'D', b"\0\x01\xff\xff\xff\xf0"), Err(m(b'D', Malformed::BadValueLength(-16))));
-        assert_eq!(g(b'v', b"\0\0\0\0\0\0\0\x01"), Err(m(b'v', Malformed::UnterminatedString)));
-        assert_eq!(g(b'v', b"\0\0\0\0\xff\xff\xff\xff"), Err(m(b'v', Malformed::TooManyItems)));
-        assert_eq!(g(b't', b"\0\x02\0\0\0\x17"), Err(m(b't', Malformed::Truncated)));
+        assert_eq!(
+            g(b'E', b"SERROR\0"),
+            Err(ParseError::Message(m(b'E', Malformed::Truncated)))
+        );
+        assert_eq!(
+            g(b'D', b"\0\x01\xff\xff\xff\xf0"),
+            Err(ParseError::Message(m(b'D', Malformed::BadValueLength(-16))))
+        );
+        assert_eq!(
+            g(b'v', b"\0\0\0\0\0\0\0\x01"),
+            Err(ParseError::Message(m(b'v', Malformed::UnterminatedString)))
+        );
+        assert_eq!(
+            g(b'v', b"\0\0\0\0\xff\xff\xff\xff"),
+            Err(ParseError::Message(m(b'v', Malformed::TooManyItems)))
+        );
+        assert_eq!(
+            g(b't', b"\0\x02\0\0\0\x17"),
+            Err(ParseError::Message(m(b't', Malformed::Truncated)))
+        );
     }
 
     #[test]
@@ -3351,30 +3048,31 @@ mod tests {
         // The spec: "The minimum and maximum key length are 4 and 256
         // bytes", and libpq refuses a shorter key.
         let g = |body: &[u8]| Backend::parse(&typed(b'K', body));
-        assert_eq!(g(&[0, 0, 0, 1, 1, 2, 3]), Err(bad(b'K', Malformed::BadKeyLength(3))));
-        assert!(g(&[0, 0, 0, 1, 1, 2, 3, 4]).is_ok());
-        // A writer pads a short key with zeros.
-        let b = Backend::BackendKeyData { process_id: 0, secret_key: vec![7] }.to_bytes();
         assert_eq!(
-            Backend::parse(&b).unwrap().unwrap().0,
-            Backend::BackendKeyData { process_id: 0, secret_key: vec![7, 0, 0, 0] }
+            g(&[0, 0, 0, 1, 1, 2, 3]),
+            Err(ParseError::Message(bad(b'K', Malformed::BadKeyLength(3))))
         );
+        assert!(g(&[0, 0, 0, 1, 1, 2, 3, 4]).is_ok());
+        assert_unwritable(&Backend::BackendKeyData {
+            process_id: 0,
+            secret_key: vec![7],
+        });
         // The server reads a cancel key of 1 to 256 bytes.
         let c = startup_with(CANCEL_REQUEST_CODE, &[0, 0, 0, 1, 9]);
-        assert!(Frontend::parse_startup(&c).unwrap().is_some());
+        assert!(Frontend::parse(&c).is_ok());
     }
 
     #[test]
     fn text_copy_has_text_columns() {
         // "All must be zero if the overall copy format is textual."
         let g = |body: &[u8]| Backend::parse(&typed(b'G', body));
-        assert_eq!(g(b"   "), Err(bad(b'G', Malformed::BadFormat(1))));
-        assert!(g(b"    ").is_ok());
-        let m = Backend::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Binary] });
         assert_eq!(
-            Backend::parse(&m.to_bytes()).unwrap().unwrap().0,
-            Backend::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Text] })
+            g(b"\0\0\0"),
+            Err(ParseError::Message(bad(b'G', Malformed::BadFormat(1))))
         );
+        assert!(g(b"\0\0\0\0").is_ok());
+        let m = Backend::CopyOutResponse(CopyFormat { format: Format::Text, columns: vec![Format::Binary] });
+        assert_unwritable(&m);
     }
 
     #[test]
@@ -3391,31 +3089,50 @@ mod tests {
 
     #[test]
     fn each_encryption_request_comes_once() {
-        // PostgreSQL reads a second SSLRequest (or GSSENCRequest) as a
-        // StartupMessage of protocol 1234.5679, which it refuses.
-        let mut d = Decoder::new();
-        d.feed(&Frontend::SslRequest.to_bytes());
-        d.feed(&Frontend::GssEncRequest.to_bytes());
-        d.feed(&Frontend::SslRequest.to_bytes());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::SslRequest)));
-        assert_eq!(d.next_message(), Some(Ok(Frontend::GssEncRequest)));
-        assert_eq!(d.next_message(), Some(Err(Error::UnsupportedProtocol(SSL_REQUEST_CODE))));
-        let mut d = Decoder::new();
-        d.feed(&Frontend::GssEncRequest.to_bytes());
-        d.feed(&Frontend::GssEncRequest.to_bytes());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::GssEncRequest)));
-        assert_eq!(d.next_message(), Some(Err(Error::UnsupportedProtocol(GSSENC_REQUEST_CODE))));
+        for (first, second, code) in [
+            (
+                Frontend::SslRequest,
+                Frontend::GssEncRequest,
+                SSL_REQUEST_CODE,
+            ),
+            (
+                Frontend::GssEncRequest,
+                Frontend::SslRequest,
+                GSSENC_REQUEST_CODE,
+            ),
+        ] {
+            let mut input = first.to_bytes().unwrap();
+            second.write(&mut input).unwrap();
+            first.write(&mut input).unwrap();
+            let mut stream = Stream::new(FrontendMessages::new());
+            assert_eq!(stream.push(&input), input.len());
+            assert_eq!(stream.next(), Some(Ok(Ok(first))));
+            stream.decoder().refuse_encryption();
+            assert_eq!(stream.next(), Some(Ok(Ok(second))));
+            stream.decoder().refuse_encryption();
+            assert_eq!(
+                stream.next(),
+                Some(Err(Fail::Protocol(Error::UnsupportedProtocol(code))))
+            );
+            assert_eq!(stream.next(), None);
+        }
     }
 
     #[test]
     fn direct_tls_only_opens_a_connection() {
-        // PostgreSQL looks for a TLS record only at the first byte of a
-        // connection. Later, 0x16 starts a length far over the limit.
-        let mut d = Decoder::new();
-        d.feed(&Frontend::SslRequest.to_bytes());
-        d.feed(&[0x16, 3, 1, 0, 5]);
-        assert_eq!(d.next_message(), Some(Ok(Frontend::SslRequest)));
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 0x1603_0100, max: MAX_STARTUP + 4 })));
+        let mut stream = Stream::new(FrontendMessages::new());
+        let mut input = Frontend::SslRequest.to_bytes().unwrap();
+        input.extend_from_slice(&[0x16, 3, 1, 0, 5]);
+        assert_eq!(stream.push(&input), input.len());
+        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::SslRequest))));
+        stream.decoder().refuse_encryption();
+        assert_eq!(
+            stream.next(),
+            Some(Err(Fail::Protocol(Error::TooLong {
+                length: 0x1603_0100,
+                max: MAX_STARTUP + 4
+            })))
+        );
     }
 
     #[test]
@@ -3438,70 +3155,61 @@ mod tests {
         // The server sends FrontendProtocol, major and minor together, and
         // libpq refuses a version below PG_PROTOCOL(3, 0).
         let m = Backend::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: vec![] };
-        assert_eq!(m.to_bytes(), b"v\0\0\0\x0c\0\x03\0\0\0\0\0\0");
-        let (back, _) = Backend::parse(b"v\0\0\0\x0c\0\x03\0\x02\0\0\0\0").unwrap().unwrap();
+        assert_eq!(m.to_bytes().unwrap(), b"v\0\0\0\x0c\0\x03\0\0\0\0\0\0");
+        let back = Backend::parse(b"v\0\0\0\x0c\0\x03\0\x02\0\0\0\0").unwrap();
         assert_eq!(back, Backend::NegotiateProtocolVersion { version: PROTOCOL_3_2, unrecognized: vec![] });
     }
 
     #[test]
     fn accepted_encryption_ends_negotiation() {
-        // After an accepted SSLRequest, PostgreSQL sets both ssl_done and
-        // gss_done, so a GSSENCRequest is refused, and the reverse.
         for (first, second, code) in [
             (Frontend::SslRequest, Frontend::GssEncRequest, GSSENC_REQUEST_CODE),
             (Frontend::GssEncRequest, Frontend::SslRequest, SSL_REQUEST_CODE),
         ] {
-            let mut d = Decoder::new();
-            d.feed(&first.to_bytes());
-            assert_eq!(d.next_message(), Some(Ok(first)));
-            assert_eq!(d.start_encryption(), b"");
-            d.feed(&second.to_bytes());
-            assert_eq!(d.next_message(), Some(Err(Error::UnsupportedProtocol(code))));
+            let mut input = first.to_bytes().unwrap();
+            input.extend_from_slice(b"injected");
+            let mut stream = Stream::new(FrontendMessages::new());
+            assert_eq!(stream.push(&input), input.len());
+            assert_eq!(stream.next(), Some(Ok(Ok(first))));
+            assert_eq!(stream.next(), None);
+            let (buffer, mut decoder) = stream.into_parts();
+            assert_eq!(buffer.unread(), b"injected");
+            decoder.start_encryption();
+            let startup = Frontend::Startup(Startup::new("alice", "shop"));
+            assert_eq!(
+                decode_all(|| decoder.clone(), &startup.to_bytes().unwrap()),
+                (vec![Ok(startup)], None)
+            );
+            assert_eq!(
+                decoder.decode(&second.to_bytes().unwrap(), false),
+                Err(Error::UnsupportedProtocol(code))
+            );
         }
-        // A refused request leaves the other one open.
-        let mut d = Decoder::new();
-        d.feed(&Frontend::SslRequest.to_bytes());
-        d.feed(&Frontend::GssEncRequest.to_bytes());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::SslRequest)));
-        assert_eq!(d.next_message(), Some(Ok(Frontend::GssEncRequest)));
-        // Bytes sent in the clear before the switch come back.
-        let mut d = Decoder::new();
-        d.feed(&Frontend::SslRequest.to_bytes());
-        d.feed(b"injected");
-        assert_eq!(d.next_message(), Some(Ok(Frontend::SslRequest)));
-        assert_eq!(d.start_encryption(), b"injected");
-        assert_eq!(d.buffered(), 0);
-        d.feed(&startup_bytes());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::Startup(Startup::new("alice", "shop")))));
-        // After the startup phase, or before any request, it does nothing.
-        d.feed(b"Q");
-        assert_eq!(d.start_encryption(), b"");
-        assert_eq!(d.buffered(), 1);
-        assert_eq!(Decoder::new().start_encryption(), b"");
     }
 
     #[test]
     fn direct_tls_goes_on_in_the_same_decoder() {
-        let mut d = Decoder::new();
-        d.feed(&[0x16, 3, 1, 0, 5]);
-        assert_eq!(d.next_message(), Some(Err(Error::DirectTls)));
-        assert_eq!(d.start_encryption(), [0x16, 3, 1, 0, 5]);
-        // The decrypted stream: a 0x16 there is a length, not TLS again.
-        let mut probe = d.clone();
-        probe.feed(&[0x16, 3, 1, 0]);
-        assert_eq!(probe.next_message(), Some(Err(Error::TooLong { length: 0x1603_0100, max: MAX_STARTUP + 4 })));
-        // Requests inside direct TLS still come out, for the server to
-        // refuse with N.
-        d.feed(&Frontend::SslRequest.to_bytes());
-        d.feed(&startup_bytes());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::SslRequest)));
-        assert!(matches!(d.next_message(), Some(Ok(Frontend::Startup(_)))));
-        // Any other error stays.
-        let mut d = Decoder::new();
-        d.feed(&[0, 0, 0, 1]);
-        assert_eq!(d.next_message(), Some(Err(Error::BadLength(1))));
-        assert_eq!(d.start_encryption(), b"");
-        assert_eq!(d.next_message(), Some(Err(Error::BadLength(1))));
+        let hello = [0x16, 3, 1, 0, 5];
+        let mut stream = Stream::new(FrontendMessages::new());
+        assert_eq!(stream.push(&hello), hello.len());
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(Error::DirectTls))));
+        let (buffer, mut decoder) = stream.into_parts();
+        assert_eq!(buffer.unread(), hello);
+        decoder.start_encryption();
+        assert_eq!(
+            decoder.clone().decode(&hello, false),
+            Err(Error::TooLong {
+                length: 0x1603_0100,
+                max: MAX_STARTUP + 4
+            })
+        );
+        let mut stream = Stream::new(decoder);
+        let mut input = Frontend::SslRequest.to_bytes().unwrap();
+        input.extend(startup_bytes());
+        assert_eq!(stream.push(&input), input.len());
+        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::SslRequest))));
+        stream.decoder().refuse_encryption();
+        assert!(matches!(stream.next(), Some(Ok(Ok(Frontend::Startup(_))))));
     }
 
     #[test]
@@ -3537,216 +3245,194 @@ mod tests {
 
     #[test]
     fn every_prefix_waits() {
-        let mut streams: Vec<(bool, Vec<u8>)> = Vec::new();
-        for m in all_frontend() {
-            streams.push((m.is_startup(), m.to_bytes()));
-        }
-        streams.push((true, startup_bytes()));
-        streams.push((false, extended_bytes()[..22].to_vec()));
-        for (startup, bytes) in &streams {
+        for message in all_frontend() {
+            let bytes = message.to_bytes().unwrap();
             for n in 0..bytes.len() {
-                let got = if *startup { Frontend::parse_startup(&bytes[..n]) } else { Frontend::parse(&bytes[..n]) };
-                assert_eq!(got, Ok(None), "{n} bytes of {bytes:?}");
+                let mut decoder = if message.is_startup() {
+                    FrontendMessages::new()
+                } else {
+                    FrontendMessages::established(SMALL_MESSAGE)
+                };
+                assert_eq!(decoder.decode(&bytes[..n], false), Ok(Step::Need));
+                assert_eq!(Frontend::parse(&bytes[..n]), Err(ParseError::Truncated));
             }
         }
-        for m in all_backend() {
-            let bytes = m.to_bytes();
+        for message in all_backend() {
+            let bytes = message.to_bytes().unwrap();
             for n in 0..bytes.len() {
-                assert_eq!(Backend::parse(&bytes[..n]), Ok(None), "{n} bytes of {m:?}");
+                assert_eq!(
+                    BackendMessages::new().decode(&bytes[..n], false),
+                    Ok(Step::Need)
+                );
+                assert_eq!(Backend::parse(&bytes[..n]), Err(ParseError::Truncated));
             }
         }
     }
 
     #[test]
     fn decoder_follows_the_phases() {
-        let mut stream = Frontend::SslRequest.to_bytes();
-        stream.extend(startup_bytes());
-        stream.extend(extended_bytes());
-        stream.extend(Frontend::Terminate.to_bytes());
-        stream.extend(b"Q\0\0\0\x05\0");
-        let mut want = vec![Frontend::SslRequest, Frontend::Startup(Startup::new("alice", "shop"))];
-        want.extend(extended_messages());
-        want.push(Frontend::Terminate);
-        // All at once and a byte at a time give the same messages.
-        for chunk in [stream.len(), 1, 7] {
-            let mut d = Decoder::new();
-            let mut got = Vec::new();
-            let mut phases = Vec::new();
-            for piece in stream.chunks(chunk) {
-                d.feed(piece);
-                while let Some(m) = d.next_message() {
-                    got.push(m.unwrap());
-                    phases.push(d.phase());
-                }
-            }
-            assert_eq!(got, want);
-            assert_eq!(phases[0], Phase::Startup);
-            assert_eq!(phases[1], Phase::Messages);
-            assert_eq!(d.phase(), Phase::Closed);
-            assert_eq!(d.buffered(), 0);
+        let mut input = Frontend::SslRequest.to_bytes().unwrap();
+        input.extend(startup_bytes());
+        input.extend(extended_bytes());
+        Frontend::Terminate.write(&mut input).unwrap();
+        input.extend_from_slice(b"Q\0\0\0\x05\0");
+        let mut stream = Stream::new(FrontendMessages::new());
+        assert_eq!(stream.push(&input), input.len());
+        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::SslRequest))));
+        assert_eq!(stream.decoder().phase(), Phase::Startup);
+        stream.decoder().refuse_encryption();
+        assert!(matches!(stream.next(), Some(Ok(Ok(Frontend::Startup(_))))));
+        assert_eq!(stream.decoder().phase(), Phase::Messages);
+        for message in extended_messages() {
+            assert_eq!(stream.next(), Some(Ok(Ok(message))));
         }
-        // A cancel request closes its connection.
-        let mut d = Decoder::default();
-        d.feed(&Frontend::CancelRequest { process_id: 1, secret_key: vec![1; 4] }.to_bytes());
-        d.feed(b"junk");
-        assert!(matches!(d.next_message(), Some(Ok(Frontend::CancelRequest { .. }))));
-        assert_eq!(d.phase(), Phase::Closed);
-        d.feed(b"more");
-        assert_eq!(d.next_message(), None);
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(stream.next(), Some(Ok(Ok(Frontend::Terminate))));
+        assert_eq!(stream.decoder().phase(), Phase::Closed);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.unread(), b"Q\0\0\0\x05\0");
+        let cancel = Frontend::CancelRequest {
+            process_id: 1,
+            secret_key: vec![1; 4],
+        };
+        let mut input = cancel.to_bytes().unwrap();
+        input.extend_from_slice(b"junk");
+        let mut stream = Stream::new(FrontendMessages::default());
+        assert_eq!(stream.push(&input), input.len());
+        assert_eq!(stream.next(), Some(Ok(Ok(cancel))));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.unread(), b"junk");
     }
 
     #[test]
-    fn decoder_errors_stick() {
-        let mut d = Decoder::new();
-        d.feed(&[0x16, 3, 1, 0, 5]);
-        assert_eq!(d.next_message(), Some(Err(Error::DirectTls)));
-        d.feed(b"more");
-        assert_eq!(d.next_message(), Some(Err(Error::DirectTls)));
-        // The ClientHello is still there for TLS to read.
-        assert_eq!(d.take_buffered(), [0x16, 3, 1, 0, 5]);
-        assert_eq!(d.buffered(), 0);
-
-        // Typed messages before the startup message are refused.
-        let mut d = Decoder::new();
-        d.feed(b"Q\0\0\0\x05\0");
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 0x5100_0000, max: MAX_STARTUP + 4 })));
-
-        // A lower maximum, and an unknown type after the startup.
-        let mut d = Decoder::new().with_max_message(20_000);
-        d.feed(&startup_bytes());
-        assert!(d.next_message().unwrap().is_ok());
-        d.feed(b"Q\0\0\x4e\x21");
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 20_001, max: 20_000 })));
-        let mut d = Decoder::new();
-        d.feed(&startup_bytes());
-        d.feed(b"?");
-        assert!(d.next_message().unwrap().is_ok());
-        assert_eq!(d.next_message(), Some(Err(Error::UnknownType(b'?'))));
-        // The limit cannot go below what small messages need.
-        let mut d = Decoder::new().with_max_message(0);
-        d.feed(&startup_bytes());
-        d.feed(&Frontend::Query("x".repeat(9000)).to_bytes());
-        assert!(d.next_message().unwrap().is_ok());
-        assert!(d.next_message().unwrap().is_ok());
+    fn decoder_errors_are_returned_once() {
+        for (input, expected) in [
+            (
+                b"Q\0\0\0\x05\0".as_slice(),
+                Error::TooLong {
+                    length: 0x5100_0000,
+                    max: MAX_STARTUP + 4,
+                },
+            ),
+            (&[0x16, 3, 1, 0, 5], Error::DirectTls),
+        ] {
+            let mut stream = Stream::new(FrontendMessages::new());
+            assert_eq!(stream.push(input), input.len());
+            assert_eq!(stream.next(), Some(Err(Fail::Protocol(expected))));
+            assert_eq!(stream.next(), None);
+            assert_eq!(stream.failed(), Some(&Fail::Protocol(expected)));
+            assert_eq!(stream.unread(), input);
+        }
+        let mut input = startup_bytes();
+        input.extend_from_slice(b"Q\0\0\x4e\x21");
+        let (_, error) = decode_all(|| FrontendMessages::with_limit(20_000), &input);
+        assert_eq!(
+            error,
+            Some(Fail::Protocol(Error::TooLong {
+                length: 20_001,
+                max: 20_000
+            }))
+        );
+        let mut input = startup_bytes();
+        input.push(b'?');
+        assert_eq!(
+            decode_all(FrontendMessages::new, &input).1,
+            Some(Fail::Protocol(Error::UnknownType(b'?')))
+        );
     }
 
     #[test]
     fn backend_decoder() {
         let messages = all_backend();
-        let stream: Vec<u8> = messages.iter().flat_map(Backend::to_bytes).collect();
-        for chunk in [stream.len(), 1, 5] {
-            let mut d = BackendDecoder::default();
-            let mut got = Vec::new();
-            for piece in stream.chunks(chunk) {
-                d.feed(piece);
-                while let Some(m) = d.next_message() {
-                    got.push(m.unwrap());
-                }
-            }
-            assert_eq!(got, messages);
-            assert_eq!(d.buffered(), 0);
+        let mut input = Vec::new();
+        for message in &messages {
+            message.write(&mut input).unwrap();
         }
-        let mut d = BackendDecoder::new().with_max_message(10_000);
-        d.feed(b"D\0\0\x27\x11");
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 10_001, max: 10_000 })));
-        d.feed(b"Z\0\0\0\x05I");
-        assert_eq!(d.next_message(), Some(Err(Error::TooLong { length: 10_001, max: 10_000 })));
-    }
-
-    /// Startup, then `bytes`, in a decoder that has taken the startup out.
-    fn after_startup() -> Decoder {
-        let mut d = Decoder::new();
-        d.feed(&startup_bytes());
-        assert!(matches!(d.next_message(), Some(Ok(Frontend::Startup(_)))));
-        d
-    }
-
-    #[test]
-    fn feed_holds_at_most_its_capacity() {
-        // A 64 KiB feed to a decoder of 10,000-byte messages is not copied
-        // whole.
-        let mut d = Decoder::new().with_max_message(10_000);
-        let big = vec![b'?'; 65_536];
-        let took = d.feed(&big);
-        assert!(took <= d.capacity() && d.buffered() <= d.capacity(), "{took}");
-        assert!(d.next_message().unwrap().is_err());
-        // After an error that ends the stream, bytes are dropped and the
-        // storage is let go.
-        assert_eq!(d.feed(&big), big.len());
-        assert_eq!(d.buf.capacity(), 0);
-        // Feeding without taking messages out stops at the capacity, and
-        // then every message comes out.
-        let mut d = after_startup();
-        let sync = Frontend::Sync.to_bytes();
-        let mut fed = 0;
-        while d.feed(&sync) == sync.len() {
-            fed += 1;
-        }
-        assert!(d.buffered() <= d.capacity());
-        let mut got = 0;
-        while let Some(m) = d.next_message() {
-            assert_eq!(m, Ok(Frontend::Sync));
-            got += 1;
-        }
-        assert_eq!(got, fed);
-        let mut d = BackendDecoder::new().with_max_message(10_000);
-        assert!(d.feed(&big) <= d.capacity());
-        assert!(d.next_message().unwrap().is_err());
-        assert_eq!(d.feed(&big), big.len());
-        assert_eq!(d.buf.capacity(), 0);
+        contract::check_decode_with_alloc_limit(
+            BackendMessages::new,
+            &input,
+            2 * BackendMessages::new().capacity(),
+        );
+        assert_eq!(
+            decode_all(BackendMessages::new, &input),
+            (
+                messages
+                    .into_iter()
+                    .map(|m| Ok(BackendEvent::Message(m)))
+                    .collect(),
+                None
+            )
+        );
+        let (items, error) = decode_all(
+            || BackendMessages::with_limit(10_000),
+            b"D\0\0\x27\x11Z\0\0\0\x05I",
+        );
+        assert!(items.is_empty());
+        assert_eq!(
+            error,
+            Some(Fail::Protocol(Error::TooLong {
+                length: 10_001,
+                max: 10_000
+            }))
+        );
     }
 
     #[test]
-    fn interleaved_reads_do_not_shift_the_backlog() {
-        // An empty feed copies nothing, and the bytes taken out are only
-        // dropped once they outweigh the rest, so a backlog is not moved
-        // once per message.
-        let mut d = BackendDecoder::new();
-        let one = Backend::ParseComplete.to_bytes();
-        let backlog: Vec<u8> = (0..100).flat_map(|_| one.clone()).collect();
-        d.feed(&backlog);
+    fn stream_holds_at_most_its_capacity() {
+        let input = vec![b'?'; 65_536];
+        contract::check_decode_with_alloc_limit(
+            || FrontendMessages::with_limit(10_000),
+            &input,
+            2 * (MAX_STARTUP + 4),
+        );
+        contract::check_decode_with_alloc_limit(
+            || BackendMessages::with_limit(10_000),
+            &input,
+            2 * 10_001,
+        );
+    }
+
+    #[test]
+    fn interleaved_reads_preserve_the_backlog() {
+        let one = Backend::ParseComplete.to_bytes().unwrap();
+        let input = one.repeat(100);
+        let mut stream = Stream::new(BackendMessages::new());
+        assert_eq!(stream.push(&input), input.len());
         for i in 1..=40 {
-            assert_eq!(d.next_message(), Some(Ok(Backend::ParseComplete)));
-            d.feed(&[]);
-            assert_eq!(d.pos, 5 * i);
+            assert_eq!(
+                stream.next(),
+                Some(Ok(Ok(BackendEvent::Message(Backend::ParseComplete))))
+            );
+            assert_eq!(stream.push(&[]), 0);
+            assert_eq!(stream.offset(), 5 * i);
         }
-        d.feed(&one);
-        assert_eq!(d.pos, 200);
-        let mut d = after_startup();
-        d.feed(&Frontend::Sync.to_bytes());
-        d.feed(&Frontend::Sync.to_bytes());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::Sync)));
-        let pos = d.pos;
-        d.feed(&[]);
-        assert_eq!(d.pos, pos);
+        assert_eq!(stream.push(&one), one.len());
+        assert_eq!(stream.unread(), one.repeat(61));
     }
 
     #[test]
     fn malformed_body_drops_only_its_message() {
-        // PostgreSQL raises an ERROR for a message whose body does not fit
-        // its length and goes on at the next one (pq_getmsgend).
-        let mut d = after_startup();
-        d.feed(b"P\0\0\0\x09\0\0\0\0x");
-        d.feed(&Frontend::Sync.to_bytes());
-        let e = d.next_message().unwrap().unwrap_err();
-        assert_eq!(e, bad(b'P', Malformed::TrailingBytes));
-        assert!(e.is_recoverable());
-        assert_eq!(d.next_message(), Some(Ok(Frontend::Sync)));
-        // A broken frame still ends the stream.
-        d.feed(b"S\0\0\0\x03");
-        let e = d.next_message().unwrap().unwrap_err();
-        assert!(!e.is_recoverable());
-        assert_eq!(d.next_message(), Some(Err(e)));
-        // The same for a client: libpq skips a message whose contents do
-        // not agree with its length.
-        let mut d = BackendDecoder::new();
-        d.feed(b"Z\0\0\0\x05X");
-        d.feed(&Backend::ParseComplete.to_bytes());
-        assert_eq!(d.next_message(), Some(Err(bad(b'Z', Malformed::BadStatus(b'X')))));
-        assert_eq!(d.next_message(), Some(Ok(Backend::ParseComplete)));
-        // Startup-phase errors are fatal in PostgreSQL.
-        assert!(!bad(0, Malformed::TrailingBytes).is_recoverable());
+        let input = b"P\0\0\0\x09\0\0\0\0xS\0\0\0\x04S\0\0\0\x03";
+        assert_eq!(
+            decode_all(|| FrontendMessages::established(SMALL_MESSAGE), input),
+            (
+                vec![Err(bad(b'P', Malformed::TrailingBytes)), Ok(Frontend::Sync)],
+                Some(Fail::Protocol(Error::BadLength(3))),
+            )
+        );
+        assert_eq!(
+            decode_all(BackendMessages::new, b"Z\0\0\0\x05X1\0\0\0\x04"),
+            (
+                vec![
+                    Err(bad(b'Z', Malformed::BadStatus(b'X'))),
+                    Ok(BackendEvent::Message(Backend::ParseComplete))
+                ],
+                None,
+            )
+        );
+        assert_eq!(
+            decode_all(FrontendMessages::new, &startup_with(SSL_REQUEST_CODE, b"x")).1,
+            Some(Fail::Protocol(bad(0, Malformed::TrailingBytes)))
+        );
     }
 
     #[test]
@@ -3762,8 +3448,14 @@ mod tests {
             b.extend_from_slice(&[0, 0]);
             Frontend::parse(&typed(b'B', &b))
         };
-        assert_eq!(bind(b"\0\0", b"a\0b"), Err(bad(b'B', Malformed::NotUtf8)));
-        assert_eq!(bind(b"\0\x01\0\0", b"\xff"), Err(bad(b'B', Malformed::NotUtf8)));
+        assert_eq!(
+            bind(b"\0\0", b"a\0b"),
+            Err(ParseError::Message(bad(b'B', Malformed::NotUtf8)))
+        );
+        assert_eq!(
+            bind(b"\0\x01\0\0", b"\xff"),
+            Err(ParseError::Message(bad(b'B', Malformed::NotUtf8)))
+        );
         assert!(bind(b"\0\x01\0\x01", b"a\0\xff").is_ok());
         let call = |format: u8, value: &[u8]| {
             let mut b = vec![0, 0, 0, 1, 0, 1, 0, format, 0, 1];
@@ -3772,20 +3464,26 @@ mod tests {
             b.extend_from_slice(&[0, 0]);
             Frontend::parse(&typed(b'F', &b))
         };
-        assert_eq!(call(0, b"\0"), Err(bad(b'F', Malformed::NotUtf8)));
+        assert_eq!(
+            call(0, b"\0"),
+            Err(ParseError::Message(bad(b'F', Malformed::NotUtf8)))
+        );
         assert!(call(1, b"\0").is_ok());
-        // Writers cut a text value at its first NUL, or before bytes that
-        // are not UTF-8, and leave binary values alone.
-        let m = Frontend::Bind(Bind {
+        assert_unwritable(&Frontend::Bind(Bind {
             param_formats: vec![Format::Text, Format::Binary],
             params: vec![Some(b"a\0b".to_vec()), Some(b"a\0b".to_vec())],
             ..Bind::default()
+        }));
+        assert_unwritable(&Frontend::FunctionCall(FunctionCall {
+            args: vec![Some(b"ok\xc3".to_vec())],
+            ..FunctionCall::default()
+        }));
+        let binary = Frontend::Bind(Bind {
+            param_formats: vec![Format::Binary],
+            params: vec![Some(b"a\0\xff".to_vec())],
+            ..Bind::default()
         });
-        let Frontend::Bind(back) = Frontend::parse(&m.to_bytes()).unwrap().unwrap().0 else { panic!() };
-        assert_eq!(back.params, [Some(b"a".to_vec()), Some(b"a\0b".to_vec())]);
-        let m = Frontend::FunctionCall(FunctionCall { args: vec![Some(b"ok\xc3".to_vec())], ..FunctionCall::default() });
-        let Frontend::FunctionCall(back) = Frontend::parse(&m.to_bytes()).unwrap().unwrap().0 else { panic!() };
-        assert_eq!(back.args, [Some(b"ok".to_vec())]);
+        assert_eq!(Frontend::parse(&binary.to_bytes().unwrap()), Ok(binary));
     }
 
     #[test]
@@ -3799,10 +3497,9 @@ mod tests {
     fn error_fields_come_once() {
         // "Any given field type should appear at most once per message."
         let g = |body: &[u8]| Backend::parse(&typed(b'E', body));
-        assert_eq!(g(b"C42P01\0C00000\0\0"), Err(bad(b'E', Malformed::DuplicateField(b'C'))));
+        assert_eq!(g(b"C42P01\0C00000\0\0"), Err(ParseError::Message(bad(b'E', Malformed::DuplicateField(b'C')))));
         let d = Diagnostic::error(sqlstate::SYNTAX_ERROR, "x").with(field_code::CODE, sqlstate::INTERNAL_ERROR);
-        let (back, _) = Backend::parse(&Backend::ErrorResponse(d).to_bytes()).unwrap().unwrap();
-        assert_eq!(back, Backend::ErrorResponse(Diagnostic::error(sqlstate::SYNTAX_ERROR, "x")));
+        assert_unwritable(&Backend::ErrorResponse(d));
     }
 
     #[test]
@@ -3813,247 +3510,203 @@ mod tests {
         body.extend(std::iter::repeat_n(0u8, 1_000_000));
         let m = typed(b'v', &body);
         assert_eq!(
-            Backend::parse_max(&m, MAX_MESSAGE),
-            Err(bad(b'v', Malformed::TooManyItems))
+            Backend::parse(&m),
+            Err(ParseError::Message(bad(b'v', Malformed::TooManyItems)))
         );
         let mut body = 10u32.to_be_bytes().to_vec();
         for _ in 0..=MAX_COUNT {
             body.extend_from_slice(b"a\0");
         }
         body.push(0);
-        assert_eq!(Backend::parse(&typed(b'R', &body)), Err(bad(b'R', Malformed::TooManyItems)));
-        // Writers keep to the cap.
+        assert_eq!(
+            Backend::parse(&typed(b'R', &body)),
+            Err(ParseError::Message(bad(b'R', Malformed::TooManyItems)))
+        );
         let names = vec!["a".to_string(); MAX_COUNT + 5];
-        let m = Backend::NegotiateProtocolVersion { version: PROTOCOL_3_0, unrecognized: names.clone() };
-        let Backend::NegotiateProtocolVersion { unrecognized, .. } = Backend::parse(&m.to_bytes()).unwrap().unwrap().0
-        else {
-            panic!()
-        };
-        assert_eq!(unrecognized.len(), MAX_COUNT);
-        let m = Backend::Authentication(Authentication::Sasl(names));
-        let Backend::Authentication(Authentication::Sasl(back)) = Backend::parse(&m.to_bytes()).unwrap().unwrap().0
-        else {
-            panic!()
-        };
-        assert_eq!(back.len(), MAX_COUNT);
+        assert_unwritable(&Backend::NegotiateProtocolVersion {
+            version: PROTOCOL_3_0,
+            unrecognized: names.clone(),
+        });
+        assert_unwritable(&Backend::Authentication(Authentication::Sasl(names)));
     }
 
     #[test]
-    fn writers_keep_to_the_format() {
-        // NUL bytes end strings, and empty names are left out.
-        let s = Startup {
-            minor_version: 0,
-            params: vec![("".into(), "x".into()), ("user".into(), "al\0ice".into()), ("a\0b".into(), "c".into())],
-        };
-        let (back, _) = Frontend::parse_startup(&Frontend::Startup(s).to_bytes()).unwrap().unwrap();
-        assert_eq!(
-            back,
+    fn writers_refuse_values_that_would_change() {
+        for message in [
             Frontend::Startup(Startup {
                 minor_version: 0,
-                params: vec![("user".into(), "al".into()), ("a".into(), "c".into())]
-            })
-        );
-        // A startup message stays within its limit.
-        let s = Startup { minor_version: 0, params: (0..2000).map(|i| (format!("p{i}"), "v".repeat(10))).collect() };
-        let bytes = Frontend::Startup(s).to_bytes();
-        assert!(bytes.len() <= MAX_STARTUP + 4);
-        assert!(Frontend::parse_startup(&bytes).unwrap().is_some());
-        // Cancel keys: empty becomes 4 zero bytes, long ones are cut.
-        let k = |key: Vec<u8>| Frontend::CancelRequest { process_id: 0, secret_key: key }.to_bytes();
-        assert_eq!(&k(vec![])[12..], &[0, 0, 0, 0]);
-        assert_eq!(k(vec![1; 300]).len(), 12 + MAX_SECRET_KEY);
-        let b = Backend::BackendKeyData { process_id: 0, secret_key: vec![] }.to_bytes();
-        assert!(Backend::parse(&b).is_ok());
-        // Format counts that break the rule fall back to the first format.
-        let bind = Frontend::Bind(Bind {
-            param_formats: vec![Format::Binary, Format::Text],
-            params: vec![None, None, None],
-            ..Bind::default()
-        });
-        let Frontend::Bind(back) = Frontend::parse(&bind.to_bytes()).unwrap().unwrap().0 else { panic!() };
-        assert_eq!(back.param_formats, [Format::Binary]);
-        assert_eq!(back.params.len(), 3);
-        // Code-0 error fields and empty SASL names are left out.
-        let e = Backend::ErrorResponse(Diagnostic { fields: vec![(0, "x".into()), (b'M', "m".into())] });
-        assert_eq!(
-            Backend::parse(&e.to_bytes()).unwrap().unwrap().0,
-            Backend::ErrorResponse(Diagnostic { fields: vec![(b'M', "m".into())] })
-        );
-        let a = Backend::Authentication(Authentication::Sasl(vec!["".into(), "A".into()]));
-        assert_eq!(
-            Backend::parse(&a.to_bytes()).unwrap().unwrap().0,
-            Backend::Authentication(Authentication::Sasl(vec!["A".into()]))
-        );
-        // Small messages are cut to their limit, on a character boundary.
-        let fail = Frontend::CopyFail("é".repeat(6000)).to_bytes();
-        assert!(fail.len() - 1 <= SMALL_MESSAGE);
-        assert!(Frontend::parse(&fail).unwrap().is_some());
-        let exec = Frontend::Execute { portal: "p".repeat(20_000), max_rows: 3 }.to_bytes();
-        let Frontend::Execute { max_rows, .. } = Frontend::parse(&exec).unwrap().unwrap().0 else { panic!() };
-        assert_eq!(max_rows, 3);
-        // 16-bit counts.
-        let row = Backend::DataRow(vec![None; 70_000]).to_bytes();
-        let Backend::DataRow(values) = Backend::parse(&row).unwrap().unwrap().0 else { panic!() };
-        assert_eq!(values.len(), MAX_COUNT);
+                params: vec![("".into(), "x".into())],
+            }),
+            Frontend::Startup(Startup::new("al\0ice", "shop")),
+            Frontend::Startup(Startup::default().with("a\0b", "c")),
+            Frontend::Startup(Startup {
+                minor_version: 0,
+                params: (0..2000)
+                    .map(|i| (format!("p{i}"), "v".repeat(10)))
+                    .collect(),
+            }),
+            Frontend::CancelRequest {
+                process_id: 0,
+                secret_key: vec![],
+            },
+            Frontend::CancelRequest {
+                process_id: 0,
+                secret_key: vec![1; 300],
+            },
+            Frontend::Bind(Bind {
+                param_formats: vec![Format::Binary, Format::Text],
+                params: vec![None; 3],
+                ..Bind::default()
+            }),
+            Frontend::CopyFail("é".repeat(6000)),
+            Frontend::Execute {
+                portal: "p".repeat(20_000),
+                max_rows: 3,
+            },
+            Frontend::Parse {
+                name: "".into(),
+                query: "".into(),
+                param_types: vec![0; MAX_COUNT + 1],
+            },
+            Frontend::Bind(Bind {
+                result_formats: vec![Format::Text; MAX_COUNT + 1],
+                ..Bind::default()
+            }),
+            Frontend::FunctionCall(FunctionCall {
+                arg_formats: vec![Format::Text; 2],
+                args: vec![None; 3],
+                ..FunctionCall::default()
+            }),
+        ] {
+            assert_unwritable(&message);
+        }
+        for message in [
+            Backend::BackendKeyData {
+                process_id: 0,
+                secret_key: vec![],
+            },
+            Backend::BackendKeyData {
+                process_id: 0,
+                secret_key: vec![0; MAX_SECRET_KEY + 1],
+            },
+            Backend::ErrorResponse(Diagnostic {
+                fields: vec![(0, "x".into()), (b'M', "m".into())],
+            }),
+            Backend::Authentication(Authentication::Sasl(vec!["".into(), "A".into()])),
+            Backend::DataRow(vec![None; 70_000]),
+            Backend::ParameterDescription(vec![0; MAX_COUNT + 1]),
+            Backend::RowDescription(vec![Field::default(); MAX_COUNT + 1]),
+        ] {
+            assert_unwritable(&message);
+        }
     }
 
     #[test]
-    fn capped_writes_stay_readable() {
-        let mut rng = Lcg(7);
+    fn constructed_writes_are_transactional() {
+        let mut rng = Lcg::new(7);
         for _ in 0..3000 {
-            let cap = 32 + rng.below(200);
-            let m = random_frontend(&mut rng);
-            let bytes = m.encode(cap);
-            if m.is_startup() {
-                assert!(Frontend::parse_startup(&bytes).unwrap().is_some());
-            } else {
-                assert!(bytes.len() - 1 <= cap, "{m:?}");
-                let (back, used) = Frontend::parse_max(&bytes, cap).unwrap().unwrap();
-                assert_eq!(used, bytes.len());
-                assert_eq!(back.encode(cap), bytes);
-            }
-            let m = random_backend(&mut rng);
-            let bytes = m.encode(cap);
-            assert!(bytes.len() - 1 <= cap, "{m:?}");
-            let (back, used) = Backend::parse_max(&bytes, cap).unwrap().unwrap();
-            assert_eq!(used, bytes.len());
-            assert_eq!(back.encode(cap), bytes);
+            contract::check_wire_value(&random_frontend(&mut rng));
+            contract::check_wire_value(&random_backend(&mut rng));
         }
     }
 
     #[test]
     fn random_messages_round_trip() {
-        let mut rng = Lcg(1);
+        let mut rng = Lcg::new(1);
         for _ in 0..3000 {
-            let m = random_frontend(&mut rng);
-            let bytes = m.to_bytes();
-            let parsed = if m.is_startup() { Frontend::parse_startup(&bytes) } else { Frontend::parse(&bytes) };
-            let (back, used) = parsed.unwrap().unwrap();
-            assert_eq!(used, bytes.len());
-            assert_eq!(back.to_bytes(), bytes);
-            if clean_frontend(&m) {
-                assert_eq!(back, m);
+            let message = random_frontend(&mut rng);
+            contract::check_wire_value(&message);
+            let bytes = message.to_bytes();
+            assert_eq!(bytes.is_ok(), clean_frontend(&message), "{message:?}");
+            if let Ok(bytes) = bytes {
+                assert_eq!(Frontend::parse(&bytes), Ok(message));
+                contract::check_wire::<Frontend>(&bytes);
             }
-            let m = random_backend(&mut rng);
-            let bytes = m.to_bytes();
-            let (back, used) = Backend::parse(&bytes).unwrap().unwrap();
-            assert_eq!(used, bytes.len());
-            assert_eq!(back.to_bytes(), bytes);
+            let message = random_backend(&mut rng);
+            contract::check_wire_value(&message);
+            let bytes = message.to_bytes();
+            assert_eq!(bytes.is_ok(), clean_backend(&message), "{message:?}");
+            if let Ok(bytes) = bytes {
+                assert_eq!(Backend::parse(&bytes), Ok(message));
+                contract::check_wire::<Backend>(&bytes);
+            }
         }
     }
 
     #[test]
-    fn random_bytes_never_panic() {
-        let mut rng = Lcg(42);
-        let valid: Vec<u8> = all_frontend().iter().filter(|m| !m.is_startup()).flat_map(Frontend::to_bytes).collect();
-        let valid_back: Vec<u8> = all_backend().iter().flat_map(Backend::to_bytes).collect();
+    fn random_bytes_obey_contracts() {
+        let mut rng = Lcg::new(42);
+        let mut front = Vec::new();
+        for message in all_frontend().iter().filter(|m| !m.is_startup()) {
+            message.write(&mut front).unwrap();
+        }
+        let mut back = Vec::new();
+        for message in all_backend() {
+            message.write(&mut back).unwrap();
+        }
         for i in 0..4000 {
-            let data: Vec<u8> = match i % 3 {
-                0 => (0..rng.below(64)).map(|_| rng.byte()).collect(),
-                1 => mutate(&mut rng, &valid),
-                _ => mutate(&mut rng, &valid_back),
+            let mut data = match i % 3 {
+                0 => rng.bytes(64),
+                1 => front.clone(),
+                _ => back.clone(),
             };
-            // A server decoder, with the startup message in front or not.
-            for front in [Vec::new(), startup_bytes()] {
-                let mut input = front.clone();
-                input.extend_from_slice(&data);
-                let whole = drain_frontend(&input, input.len());
-                assert_eq!(whole, drain_frontend(&input, 1 + rng.below(9)));
-                assert_eq!(whole, drain_frontend(&input, 1));
-                for m in whole.iter().flatten() {
-                    let bytes = m.to_bytes();
-                    let parsed = if m.is_startup() { Frontend::parse_startup(&bytes) } else { Frontend::parse(&bytes) };
-                    assert_eq!(parsed, Ok(Some((m.clone(), bytes.len()))));
+            mutate(&mut rng, &mut data);
+            let mut startup = startup_bytes();
+            startup.extend_from_slice(&data);
+            let make: fn() -> FrontendMessages = || FrontendMessages::with_limit(64);
+            for (make, input) in [
+                (make, &data),
+                (make, &startup),
+                (|| FrontendMessages::established(SMALL_MESSAGE), &data),
+            ] {
+                contract::check_decode_with_alloc_limit(make, input, 2 * make().capacity());
+                for m in decode_all(make, input).0.into_iter().flatten() {
+                    let b = m.to_bytes().unwrap();
+                    assert_eq!(Frontend::parse(&b), Ok(m));
+                    contract::check_wire::<Frontend>(&b);
                 }
             }
-            let whole = drain_backend(&data, data.len());
-            assert_eq!(whole, drain_backend(&data, 1 + rng.below(9)));
-            assert_eq!(whole, drain_backend(&data, 1));
-            for m in whole.iter().flatten() {
-                let bytes = m.to_bytes();
-                assert_eq!(Backend::parse(&bytes), Ok(Some((m.clone(), bytes.len()))));
+            contract::check_decode_with_alloc_limit(|| BackendMessages::with_limit(64), &data, 130);
+            for item in decode_all(|| BackendMessages::with_limit(64), &data)
+                .0
+                .into_iter()
+                .flatten()
+            {
+                if let BackendEvent::Message(m) = item {
+                    let b = m.to_bytes().unwrap();
+                    assert_eq!(Backend::parse(&b), Ok(m));
+                    contract::check_wire::<Backend>(&b);
+                }
             }
-            let _ = Frontend::parse(&data);
-            let _ = Frontend::parse_startup(&data);
-            let _ = read_password(&data);
-            let _ = SaslInitialResponse::parse(&data);
+            contract::check_wire::<Frontend>(&data);
+            contract::check_wire::<Backend>(&data);
+            contract::check_wire::<Password>(&data);
+            contract::check_wire::<SaslInitialResponse>(&data);
         }
-    }
-
-    /// Every message, with the errors on the way and the one that breaks
-    /// the stream, fed in pieces of `chunk` bytes. Whatever a feed does
-    /// not take is fed again once the messages are out.
-    fn drain<M>(
-        input: &[u8],
-        chunk: usize,
-        mut feed: impl FnMut(&[u8]) -> usize,
-        mut next: impl FnMut() -> Option<Result<M, Error>>,
-    ) -> Vec<Result<M, Error>> {
-        let mut out = Vec::new();
-        for mut piece in input.chunks(chunk.max(1)) {
-            loop {
-                let took = feed(piece);
-                piece = &piece[took..];
-                let before = out.len();
-                while let Some(m) = next() {
-                    let stop = matches!(&m, Err(e) if !e.is_recoverable());
-                    out.push(m);
-                    if stop {
-                        return out;
-                    }
-                }
-                if piece.is_empty() {
-                    break;
-                }
-                // A full decoder always has a message or an error.
-                assert!(took > 0 || out.len() > before, "the decoder is stuck");
-            }
-        }
-        out
-    }
-
-    fn drain_frontend(input: &[u8], chunk: usize) -> Vec<Result<Frontend, Error>> {
-        let d = std::cell::RefCell::new(Decoder::new().with_max_message(SMALL_MESSAGE));
-        drain(input, chunk, |b| d.borrow_mut().feed(b), || d.borrow_mut().next_message())
-    }
-
-    fn drain_backend(input: &[u8], chunk: usize) -> Vec<Result<Backend, Error>> {
-        let d = std::cell::RefCell::new(BackendDecoder::new().with_max_message(SMALL_MESSAGE));
-        drain(input, chunk, |b| d.borrow_mut().feed(b), || d.borrow_mut().next_message())
     }
 
     #[test]
-    fn large_feeds_come_out_whole() {
-        // A feed larger than the capacity is taken in parts, and every
-        // message comes out, with a malformed one dropped on the way.
+    fn large_inputs_come_out_whole() {
         let mut input = startup_bytes();
         for i in 0..3000 {
             if i == 1000 {
                 input.extend_from_slice(b"P\0\0\0\x09\0\0\0\0x");
             }
-            input.extend(Frontend::Query(format!("SELECT {i}")).to_bytes());
+            Frontend::Query(format!("SELECT {i}"))
+                .write(&mut input)
+                .unwrap();
         }
-        assert!(input.len() > SMALL_MESSAGE * 3);
-        let got = drain_frontend(&input, input.len());
+        let make = || FrontendMessages::with_limit(SMALL_MESSAGE);
+        contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity());
+        let (got, failure) = decode_all(make, &input);
+        assert_eq!(failure, None);
         assert_eq!(got.len(), 3002);
         assert_eq!(got[1001], Err(bad(b'P', Malformed::TrailingBytes)));
         assert_eq!(got[3001], Ok(Frontend::Query("SELECT 2999".into())));
-        assert_eq!(got, drain_frontend(&input, 7));
-        let stream: Vec<u8> = (0..3000).flat_map(|_| Backend::ParseComplete.to_bytes()).collect();
-        assert_eq!(drain_backend(&stream, stream.len()).len(), 3000);
-    }
-
-    fn mutate(rng: &mut Lcg, valid: &[u8]) -> Vec<u8> {
-        let start = rng.below(valid.len());
-        let len = rng.below(valid.len() - start + 1);
-        let mut data = valid[start..start + len].to_vec();
-        for _ in 0..rng.below(4) {
-            if !data.is_empty() {
-                let at = rng.below(data.len());
-                data[at] = rng.byte();
-            }
-        }
-        data
+        let input = Backend::ParseComplete.to_bytes().unwrap().repeat(3000);
+        let make = || BackendMessages::with_limit(SMALL_MESSAGE);
+        contract::check_decode_with_alloc_limit(make, &input, 2 * make().capacity());
+        assert_eq!(decode_all(make, &input).0.len(), 3000);
     }
 
     /// One of every message, in a valid form.
@@ -4074,7 +3727,7 @@ mod tests {
                 args: vec![Some(vec![1]), None],
                 result_format: Format::Text,
             }),
-            Frontend::password("secret"),
+            Frontend::password("secret").unwrap(),
             Frontend::Query("SELECT 'é'".into()),
             Frontend::Terminate,
         ];
@@ -4121,171 +3774,273 @@ mod tests {
         ]
     }
 
-    /// A deterministic generator, so a failure always repeats.
-    struct Lcg(u64);
+    fn assert_unwritable<M: Wire<WriteError = Error> + PartialEq + std::fmt::Debug>(value: &M) {
+        contract::check_wire_value(value);
+        let mut out = b"prefix".to_vec();
+        assert_eq!(value.write(&mut out), Err(Error::Unwritable));
+        assert_eq!(out, b"prefix");
+    }
 
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            self.0 >> 33
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            if n == 0 { 0 } else { (self.next() % n as u64) as usize }
-        }
-
-        fn byte(&mut self) -> u8 {
-            self.next() as u8
-        }
-
-        fn string(&mut self) -> String {
-            const PARTS: [&str; 8] = ["a", "Z", " ", "é", "漢", "\0", "$1", "'"];
-            let n = if self.below(20) == 0 { 300 } else { self.below(8) };
-            (0..n).map(|_| PARTS[self.below(PARTS.len())]).collect()
-        }
-
-        fn bytes(&mut self) -> Vec<u8> {
-            let n = if self.below(20) == 0 { 300 } else { self.below(8) };
-            (0..n).map(|_| self.byte()).collect()
-        }
-
-        fn value(&mut self) -> Value {
-            if self.below(4) == 0 { None } else { Some(self.bytes()) }
-        }
-
-        fn format(&mut self) -> Format {
-            if self.below(2) == 0 { Format::Text } else { Format::Binary }
-        }
-
-        fn list<T>(&mut self, f: impl Fn(&mut Lcg) -> T) -> Vec<T> {
-            (0..self.below(5)).map(|_| f(self)).collect()
+    fn random_value(rng: &mut Lcg) -> Value {
+        if rng.coin() {
+            None
+        } else {
+            Some(rng.bytes(300))
         }
     }
 
+    fn random_format(rng: &mut Lcg) -> Format {
+        if rng.coin() {
+            Format::Text
+        } else {
+            Format::Binary
+        }
+    }
+
+    fn list<T>(rng: &mut Lcg, make: impl Fn(&mut Lcg) -> T) -> Vec<T> {
+        (0..rng.index(5)).map(|_| make(rng)).collect()
+    }
+
+    fn clean_frontend(m: &Frontend) -> bool {
+        let ok = |s: &String| !s.contains('\0');
+        if frontend_size(m) > m.tag().and_then(frontend_limit).unwrap_or(MAX_STARTUP + 4) {
+            return false;
+        }
+        match m {
+            Frontend::Startup(s) => s
+                .params
+                .iter()
+                .all(|(n, v)| ok(n) && ok(v) && !n.is_empty()),
+            Frontend::CancelRequest { secret_key, .. } => {
+                (1..=MAX_SECRET_KEY).contains(&secret_key.len())
+            }
+            Frontend::Bind(b) => {
+                ok(&b.portal)
+                    && ok(&b.statement)
+                    && (b.param_formats.len() <= 1 || b.param_formats.len() == b.params.len())
+                    && b.param_formats.len() <= MAX_COUNT
+                    && b.params.len() <= MAX_COUNT
+                    && b.result_formats.len() <= MAX_COUNT
+                    && check_text_values(&b.param_formats, &b.params).is_ok()
+            }
+            Frontend::FunctionCall(f) => {
+                (f.arg_formats.len() <= 1 || f.arg_formats.len() == f.args.len())
+                    && f.arg_formats.len() <= MAX_COUNT
+                    && f.args.len() <= MAX_COUNT
+                    && check_text_values(&f.arg_formats, &f.args).is_ok()
+            }
+            Frontend::Close { name, .. } | Frontend::Describe { name, .. } => ok(name),
+            Frontend::CopyFail(s) | Frontend::Query(s) | Frontend::Execute { portal: s, .. } => {
+                ok(s)
+            }
+            Frontend::Parse {
+                name,
+                query,
+                param_types,
+            } => ok(name) && ok(query) && param_types.len() <= MAX_COUNT,
+            _ => true,
+        }
+    }
+
+    fn clean_backend(m: &Backend) -> bool {
+        let ok = |s: &str| !s.contains('\0');
+        if backend_size(m) > MAX_MESSAGE {
+            return false;
+        }
+        match m {
+            Backend::Authentication(Authentication::Sasl(names)) => {
+                names.len() <= MAX_COUNT && names.iter().all(|name| !name.is_empty() && ok(name))
+            }
+            Backend::BackendKeyData { secret_key, .. } => {
+                (MIN_BACKEND_KEY..=MAX_SECRET_KEY).contains(&secret_key.len())
+            }
+            Backend::CommandComplete(s) => ok(s),
+            Backend::CopyInResponse(c)
+            | Backend::CopyOutResponse(c)
+            | Backend::CopyBothResponse(c) => {
+                c.columns.len() <= MAX_COUNT
+                    && (c.format == Format::Binary || c.columns.iter().all(|f| *f == Format::Text))
+            }
+            Backend::DataRow(values) => values.len() <= MAX_COUNT,
+            Backend::ErrorResponse(d) | Backend::NoticeResponse(d) => {
+                let mut seen = [false; 256];
+                d.fields.iter().all(|(code, value)| {
+                    *code != 0
+                        && !std::mem::replace(&mut seen[usize::from(*code)], true)
+                        && ok(value)
+                })
+            }
+            Backend::NegotiateProtocolVersion { unrecognized, .. } => {
+                unrecognized.len() <= MAX_COUNT && unrecognized.iter().all(|name| ok(name))
+            }
+            Backend::NotificationResponse {
+                channel, payload, ..
+            } => ok(channel) && ok(payload),
+            Backend::ParameterDescription(types) => types.len() <= MAX_COUNT,
+            Backend::ParameterStatus { name, value } => ok(name) && ok(value),
+            Backend::RowDescription(fields) => {
+                fields.len() <= MAX_COUNT && fields.iter().all(|f| ok(&f.name))
+            }
+            Backend::Authentication(_)
+            | Backend::BindComplete
+            | Backend::CloseComplete
+            | Backend::CopyData(_)
+            | Backend::CopyDone
+            | Backend::EmptyQueryResponse
+            | Backend::FunctionCallResponse(_)
+            | Backend::NoData
+            | Backend::ParseComplete
+            | Backend::PortalSuspended
+            | Backend::ReadyForQuery(_) => true,
+        }
+    }
+
+    fn random_text(rng: &mut Lcg) -> String {
+        const PIECES: &[&str] = &["", "a", "hello", " ", "\0", "é", "漢"];
+        (0..rng.index(40))
+            .map(|_| PIECES[rng.index(PIECES.len())])
+            .collect()
+    }
+
     fn random_frontend(rng: &mut Lcg) -> Frontend {
-        let target = if rng.below(2) == 0 { Target::Statement } else { Target::Portal };
-        match rng.below(18) {
+        let target = if rng.coin() {
+            Target::Statement
+        } else {
+            Target::Portal
+        };
+        match rng.index(18) {
             0 => Frontend::Startup(Startup {
-                minor_version: rng.below(4) as u16,
-                params: rng.list(|r| (r.string(), r.string())),
+                minor_version: rng.index(4) as u16,
+                params: list(rng, |r| (random_text(r), random_text(r))),
             }),
             1 => Frontend::SslRequest,
             2 => Frontend::GssEncRequest,
-            3 => Frontend::CancelRequest { process_id: rng.next() as u32, secret_key: rng.bytes() },
+            3 => Frontend::CancelRequest {
+                process_id: rng.next() as u32,
+                secret_key: rng.bytes(300),
+            },
             4 => {
-                let params = rng.list(Lcg::value);
-                let param_formats = match rng.below(3) {
+                let params = list(rng, random_value);
+                let param_formats = match rng.index(3) {
                     0 => vec![],
-                    1 => vec![rng.format()],
-                    _ => params.iter().map(|_| rng.format()).collect(),
+                    1 => vec![random_format(rng)],
+                    _ => params.iter().map(|_| random_format(rng)).collect(),
                 };
                 Frontend::Bind(Bind {
-                    portal: rng.string(),
-                    statement: rng.string(),
+                    portal: random_text(rng),
+                    statement: random_text(rng),
                     param_formats,
                     params,
-                    result_formats: rng.list(Lcg::format),
+                    result_formats: list(rng, random_format),
                 })
             }
-            5 => Frontend::Close { target, name: rng.string() },
-            6 => Frontend::CopyData(rng.bytes()),
+            5 => Frontend::Close {
+                target,
+                name: random_text(rng),
+            },
+            6 => Frontend::CopyData(rng.bytes(300)),
             7 => Frontend::CopyDone,
-            8 => Frontend::CopyFail(rng.string()),
-            9 => Frontend::Describe { target, name: rng.string() },
-            10 => Frontend::Execute { portal: rng.string(), max_rows: rng.next() as i32 },
+            8 => Frontend::CopyFail(random_text(rng)),
+            9 => Frontend::Describe {
+                target,
+                name: random_text(rng),
+            },
+            10 => Frontend::Execute {
+                portal: random_text(rng),
+                max_rows: rng.next() as i32,
+            },
             11 => Frontend::Flush,
             12 => Frontend::FunctionCall(FunctionCall {
                 function: rng.next() as u32,
-                arg_formats: rng.list(Lcg::format),
-                args: rng.list(Lcg::value),
-                result_format: rng.format(),
+                arg_formats: list(rng, random_format),
+                args: list(rng, random_value),
+                result_format: random_format(rng),
             }),
-            13 => Frontend::AuthResponse(rng.bytes()),
-            14 => {
-                Frontend::Parse { name: rng.string(), query: rng.string(), param_types: rng.list(|r| r.next() as u32) }
-            }
-            15 => Frontend::Query(rng.string()),
+            13 => Frontend::AuthResponse(rng.bytes(300)),
+            14 => Frontend::Parse {
+                name: random_text(rng),
+                query: random_text(rng),
+                param_types: list(rng, |r| r.next() as u32),
+            },
+            15 => Frontend::Query(random_text(rng)),
             16 => Frontend::Sync,
             _ => Frontend::Terminate,
         }
     }
 
-    /// Whether a message survives writing unchanged: no NUL in its
-    /// strings, no empty startup names, a valid key, and format counts
-    /// that keep the rule. All random messages are far below the limits.
-    fn clean_frontend(m: &Frontend) -> bool {
-        let ok = |s: &String| !s.contains('\0');
-        match m {
-            Frontend::Startup(s) => s.params.iter().all(|(n, v)| ok(n) && ok(v) && !n.is_empty()),
-            Frontend::CancelRequest { secret_key, .. } => (1..=MAX_SECRET_KEY).contains(&secret_key.len()),
-            Frontend::Bind(b) => {
-                ok(&b.portal) && ok(&b.statement) && check_text_values(&b.param_formats, &b.params).is_ok()
-            }
-            Frontend::FunctionCall(f) => {
-                (f.arg_formats.len() <= 1 || f.arg_formats.len() == f.args.len())
-                    && check_text_values(&f.arg_formats, &f.args).is_ok()
-            }
-            Frontend::Close { name, .. } | Frontend::Describe { name, .. } => ok(name),
-            Frontend::CopyFail(s) | Frontend::Query(s) | Frontend::Execute { portal: s, .. } => ok(s),
-            Frontend::Parse { name, query, .. } => ok(name) && ok(query),
-            _ => true,
-        }
-    }
-
     fn random_backend(rng: &mut Lcg) -> Backend {
-        let diagnostic = |r: &mut Lcg| Diagnostic { fields: r.list(|r| (r.byte(), r.string())) };
-        let copy = |r: &mut Lcg| CopyFormat { format: r.format(), columns: r.list(Lcg::format) };
-        match rng.below(24) {
-            0 => Backend::Authentication(match rng.below(10) {
+        let diagnostic = |r: &mut Lcg| Diagnostic {
+            fields: list(r, |r| (r.next() as u8, random_text(r))),
+        };
+        let copy = |r: &mut Lcg| CopyFormat {
+            format: random_format(r),
+            columns: list(r, random_format),
+        };
+        match rng.index(24) {
+            0 => Backend::Authentication(match rng.index(10) {
                 0 => Authentication::Ok,
                 1 => Authentication::KerberosV5,
                 2 => Authentication::CleartextPassword,
-                3 => Authentication::Md5Password([rng.byte(), rng.byte(), rng.byte(), rng.byte()]),
+                3 => Authentication::Md5Password([
+                    rng.next() as u8,
+                    rng.next() as u8,
+                    rng.next() as u8,
+                    rng.next() as u8,
+                ]),
                 4 => Authentication::Gss,
-                5 => Authentication::GssContinue(rng.bytes()),
+                5 => Authentication::GssContinue(rng.bytes(300)),
                 6 => Authentication::Sspi,
-                7 => Authentication::Sasl(rng.list(Lcg::string)),
-                8 => Authentication::SaslContinue(rng.bytes()),
-                _ => Authentication::SaslFinal(rng.bytes()),
+                7 => Authentication::Sasl(list(rng, random_text)),
+                8 => Authentication::SaslContinue(rng.bytes(300)),
+                _ => Authentication::SaslFinal(rng.bytes(300)),
             }),
-            1 => Backend::BackendKeyData { process_id: rng.next() as u32, secret_key: rng.bytes() },
+            1 => Backend::BackendKeyData {
+                process_id: rng.next() as u32,
+                secret_key: rng.bytes(300),
+            },
             2 => Backend::BindComplete,
             3 => Backend::CloseComplete,
-            4 => Backend::CommandComplete(rng.string()),
-            5 => Backend::CopyData(rng.bytes()),
+            4 => Backend::CommandComplete(random_text(rng)),
+            5 => Backend::CopyData(rng.bytes(300)),
             6 => Backend::CopyDone,
             7 => Backend::CopyInResponse(copy(rng)),
             8 => Backend::CopyOutResponse(copy(rng)),
             9 => Backend::CopyBothResponse(copy(rng)),
-            10 => Backend::DataRow(rng.list(Lcg::value)),
+            10 => Backend::DataRow(list(rng, random_value)),
             11 => Backend::EmptyQueryResponse,
             12 => Backend::ErrorResponse(diagnostic(rng)),
-            13 => Backend::FunctionCallResponse(rng.value()),
-            14 => Backend::NegotiateProtocolVersion { version: rng.next() as u32, unrecognized: rng.list(Lcg::string) },
+            13 => Backend::FunctionCallResponse(random_value(rng)),
+            14 => Backend::NegotiateProtocolVersion {
+                version: rng.next() as u32,
+                unrecognized: list(rng, random_text),
+            },
             15 => Backend::NoData,
             16 => Backend::NoticeResponse(diagnostic(rng)),
             17 => Backend::NotificationResponse {
                 process_id: rng.next() as u32,
-                channel: rng.string(),
-                payload: rng.string(),
+                channel: random_text(rng),
+                payload: random_text(rng),
             },
-            18 => Backend::ParameterDescription(rng.list(|r| r.next() as u32)),
-            19 => Backend::ParameterStatus { name: rng.string(), value: rng.string() },
+            18 => Backend::ParameterDescription(list(rng, |r| r.next() as u32)),
+            19 => Backend::ParameterStatus {
+                name: random_text(rng),
+                value: random_text(rng),
+            },
             20 => Backend::ParseComplete,
             21 => Backend::PortalSuspended,
-            22 => Backend::ReadyForQuery(match rng.below(3) {
+            22 => Backend::ReadyForQuery(match rng.index(3) {
                 0 => TransactionStatus::Idle,
                 1 => TransactionStatus::InTransaction,
                 _ => TransactionStatus::Failed,
             }),
-            _ => Backend::RowDescription(rng.list(|r| Field {
-                name: r.string(),
+            _ => Backend::RowDescription(list(rng, |r| Field {
+                name: random_text(r),
                 table_oid: r.next() as u32,
                 column: r.next() as i16,
                 type_oid: r.next() as u32,
                 type_size: r.next() as i16,
                 type_modifier: r.next() as i32,
-                format: r.format(),
+                format: random_format(r),
             })),
         }
     }

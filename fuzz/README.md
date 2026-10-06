@@ -49,11 +49,12 @@ cargo +nightly fuzz list
 | `git_protocol` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::git_protocol`: The Git wire protocol |
 | `grpc` | Framed messages with input-selected limits, constructed payloads, header values, and zero-separated header blocks | `grpc`: chunking and EOF, message limits and transactional writes, compression flags, request and rejection round trips, trailers, timeouts, and paths |
 | `imap` | commands, responses, literals, raw lines, and refusal decisions | `stdlib::imap`: strict wire values and bounded codec contracts |
-| `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
+| `imf` | headers and structured field values | `stdlib::imf`: `Head`, named wire types, and bounded-allocation codec contracts |
 | `json` | wire values and streams checked with bounded codec contracts | `stdlib::json`: JSON |
 | `kafka` | arbitrary bytes and constructed values | `stdlib::kafka`: exact wire values, versioned messages, and bounded codec contracts |
 | `kerberos` | DER/BER messages, TCP records, and METHOD-DATA; checks record bounds, request-body slices, round trips, and write refusal | `stdlib::kerberos`: Kerberos V5 |
 | `ldap` | BER messages, CLDAP datagrams, filters, and DN text; checks stream limits, text round trips, and constructed search writes | `stdlib::ldap`: LDAP |
+| `ipp` | heads, documents, and attribute values | `stdlib::ipp`: `Head`, `Header`, `Message`, and bounded-allocation codec contracts |
 | `memcache` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::memcache`: memcached |
 | `mime_multipart` | wire values and streams checked with bounded codec contracts | `stdlib::mime_multipart`: MIME multipart bodies |
 | `mongodb` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mongodb`: MongoDB |
@@ -66,7 +67,7 @@ cargo +nightly fuzz list
 | `onc_rpc` | TCP record bytes, UDP messages, AUTH_SYS bodies, and XDR arrays | `onc_rpc`: chunking and EOF, record and assembly bounds, fragmented record round trips, exact RPC writes, authentication, and array allocation limits |
 | `opcua` | arbitrary chunks under selected limits and constructed chunks; checks assembly bounds, sequence rules, binary values, reserved-type reads and write rollback | `stdlib::opcua`: OPC UA over TCP |
 | `portmap` | Arguments and results for every procedure and version, RPC streams, universal addresses, and constructed values | `portmap`: version refusal, XDR round trips, string and list limits, address conversion, RPC framing and EOF, and reply writes |
-| `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
+| `postgres` | startup, authentication, and typed messages | `stdlib::postgres`: frontend and backend decoders, wire types, and bounded-allocation codec contracts |
 | `protobuf` | wire values and streams checked with bounded codec contracts | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | exact wire values, header handoff and bounded codec contracts | `stdlib::proxy_protocol`: The PROXY protocol |
 | `qpack` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::qpack`: QPACK, the header compression of HTTP/3 |
