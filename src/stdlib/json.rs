@@ -7,10 +7,10 @@
 //! into a [`Value`], and writes a [`Value`] as compact JSON text.
 //!
 //! Nothing here reads a socket. A world that plays a web API takes the
-//! body of a request, calls [`parse`], looks at the [`Value`] it gets,
-//! and writes its answer with [`Value::write`]. For a stream that carries
+//! body of a request, calls [`Value::parse`], looks at the [`Value`] it gets,
+//! and writes its answer with [`Wire::write`]. For a stream that carries
 //! one JSON text after another, such as JSON-RPC over a TCP connection,
-//! [`Values`] with [`super::codec::Stream`] takes the bytes as they come
+//! [`Stream<Values>`](super::codec::Stream) takes the bytes as they come
 //! and hands back each value once it is whole.
 //!
 //! The agent can send any bytes it likes, so the parser checks
@@ -23,15 +23,12 @@
 //! keeps its members in order, duplicate keys included, since RFC 8259
 //! leaves their meaning to the reader.
 //!
-//! Use [`Values`] with [`super::codec::Stream`] for bounded input and EOF
-//! handling. [`Value`] implements [`Wire`] for exact parsing and appending.
-//! The deprecated [`Decoder`] keeps its original buffering and errors.
-//!
 //! ```
-//! use fictionet::stdlib::json::{self, Number, Value};
+//! use fictionet::stdlib::codec::Wire;
+//! use fictionet::stdlib::json::{Number, Value};
 //!
 //! let body = br#"{"method": "transfer", "amount": 12.50, "to": "Caf\u00e9 \ud83d\ude00"}"#;
-//! let request = json::parse(body).unwrap();
+//! let request = Value::parse(body).unwrap();
 //! assert_eq!(request.get("method").and_then(Value::as_str), Some("transfer"));
 //! let amount = request.get("amount").and_then(Value::as_number).unwrap();
 //! assert_eq!(amount.text(), "12.50");
@@ -43,17 +40,18 @@
 //!     ("balance".to_string(), Value::Number(Number::from_i64(-3))),
 //!     ("note".to_string(), Value::from("line 1\nline 2")),
 //! ]);
-//! assert_eq!(reply.write().unwrap(), r#"{"ok":true,"balance":-3,"note":"line 1\nline 2"}"#);
+//! assert_eq!(reply.to_bytes().unwrap(), br#"{"ok":true,"balance":-3,"note":"line 1\nline 2"}"#);
 //! ```
 
 extern crate alloc;
+extern crate self as fictionet;
 
 use alloc::{
     format,
     string::{String, ToString},
     vec::Vec,
 };
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The deepest nesting of arrays and objects the parser and writer
 /// accept. `[[1]]` has depth 2. [`Limits`] can lower it but not raise it.
@@ -347,18 +345,14 @@ impl Value {
         self.as_object()?.iter().find(|(k, _)| k == key).map(|(_, v)| v)
     }
 
-    /// The value as compact JSON text, within the default [`Limits`].
-    pub fn write(&self) -> Result<String, Error> {
-        self.write_with(&Limits::default())
+    /// Checks whether compact JSON for this value fits `limits`.
+    /// Refuses excessive depth, size, or value count. Limits are clamped
+    /// to this module's caps. The value is unchanged.
+    pub fn validate(&self, limits: &Limits) -> Result<(), Error> {
+        self.render(limits).map(|_| ())
     }
 
-    /// The value as compact JSON text: no whitespace, members in order,
-    /// and only the escapes a string needs. It fails, rather than write
-    /// text [`parse_with`] would refuse, when the value is deeper, larger
-    /// or holds more values than `limits` allow. The error's offset is how
-    /// many bytes had been written, or the size limit for
-    /// [`ErrorKind::TooLarge`].
-    pub fn write_with(&self, limits: &Limits) -> Result<String, Error> {
+    fn render(&self, limits: &Limits) -> Result<String, Error> {
         let mut w = Writer {
             out: String::new(),
             size: limits.size(),
@@ -407,7 +401,7 @@ pub enum ErrorKind {
 pub struct Error {
     /// What went wrong.
     pub kind: ErrorKind,
-    /// The offset into the input (or, for a [`Decoder`], into the whole
+    /// The offset into the input (or, for [`Values`], into the whole
     /// stream) of the byte that was wrong.
     pub offset: usize,
 }
@@ -445,8 +439,7 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// Reads one JSON text, within the default [`Limits`].
-pub fn parse(input: &[u8]) -> Result<Value, Error> {
+fn parse(input: &[u8]) -> Result<Value, Error> {
     parse_with(input, &Limits::default())
 }
 
@@ -760,8 +753,11 @@ struct Writer {
 
 impl Writer {
     fn push(&mut self, s: &str) -> Result<(), Error> {
+        if s.len() > self.size.saturating_sub(self.out.len()) {
+            return Err(Error::at(ErrorKind::TooLarge, self.size));
+        }
         self.out.push_str(s);
-        self.fits()
+        Ok(())
     }
 
     fn fits(&self) -> Result<(), Error> {
@@ -843,12 +839,21 @@ impl Wire for Value {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads one JSON text within the default limits. Refuses malformed
+    /// syntax, a byte order mark, trailing values, and excessive size,
+    /// nesting, number length, or value count. Whitespace may surround it.
     fn parse(input: &[u8]) -> Result<Self, Error> {
         parse(input)
     }
 
+    /// Appends compact JSON with members in order and number text intact.
+    /// Refuses values beyond the default size, depth, or count limits.
+    /// Strings use only required escapes. On error, `out` is unchanged.
+    /// The error offset is the size limit for [`ErrorKind::TooLarge`], or
+    /// the bytes measured before another failure. Use [`Value::validate`]
+    /// for tighter limits.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(self.write()?.as_bytes());
+        out.extend_from_slice(self.render(&Limits::default())?.as_bytes());
         Ok(())
     }
 }
@@ -859,7 +864,9 @@ impl Wire for Value {
 /// values return [`Step::Need`], including at EOF. Syntax and limit errors
 /// end the stream. Error offsets count from the start of the stream.
 /// Capacity is the clamped size limit plus one delimiter or overflow byte.
-/// Use [`codec::Stream`](super::codec::Stream) for bounded input and one-time errors.
+/// Drive it with [`Stream<Values>`](super::codec::Stream).
+/// Values need no separating whitespace. This does not frame JSON Lines;
+/// use a line decoder and parse each line for that format.
 ///
 /// ```
 /// use fictionet::stdlib::{codec::{Stream, finish, pump}, json::{Value, Values}};
@@ -907,7 +914,7 @@ impl Values {
             && let Some(with_next) = input.get(..=end)
             && let Err(e) = parse_with(with_next, &self.limits)
         {
-            // A delimiter interrupted the scalar. Name it as Decoder does.
+            // A delimiter interrupted the scalar. Name the byte that interrupted it.
             result = Err(e);
         }
         let value = match result {
@@ -1000,7 +1007,7 @@ impl Decode for Values {
                             b'{' | b'[' => {
                                 *depth = depth.saturating_add(1);
                                 if *depth > self.limits.depth() {
-                                    // Report an earlier syntax error, as Decoder does.
+                                    // Report an earlier syntax error first.
                                     let prefix = input.get(..=self.pos).unwrap_or_default();
                                     let e = parse_with(prefix, &self.limits)
                                         .err()
@@ -1033,7 +1040,7 @@ impl Decode for Values {
                     }
                 }
             }
-            // Container depth takes precedence, as in Decoder. A scalar
+            // Container depth takes precedence. A scalar
             // at the size limit may already have ended before this byte.
             if self.pos >= self.limits.size() {
                 return Err(self.error(ErrorKind::TooLarge, self.limits.size()));
@@ -1046,42 +1053,15 @@ impl Decode for Values {
         if eof && self.scan == Scan::Scalar {
             return self.value(input, self.pos, true);
         }
+        if eof
+            && matches!(self.scan, Scan::Container { .. } | Scan::Str { .. })
+            && let Err(error) = parse_with(input, &self.limits)
+            && error.kind != ErrorKind::UnexpectedEnd
+        {
+            return Err(self.error(error.kind, error.offset));
+        }
         Ok(Step::Need)
     }
-}
-
-/// Splits a byte stream into JSON values, for protocols that send one
-/// JSON text after another on a connection, such as JSON-RPC over TCP.
-/// Feed it the bytes in order and take values out until it has none.
-/// Whitespace between values is skipped, and values need none between
-/// them, so `{}{}` is two values.
-///
-/// It does not look at line breaks. A protocol that frames each value as
-/// one line (JSON Lines, NDJSON) should split the stream at `\n` and
-/// [`parse`] each line, so that a value spread over two lines, or two
-/// values on one line, is refused.
-///
-/// A value ends at its closing bracket or quote. A top-level number or
-/// literal (`12`, `true`) ends at the first byte that cannot be part of
-/// it, so one at the very end of what has come waits for one more byte,
-/// or for [`Decoder::finish`] to say the stream has ended.
-#[derive(Debug, Default)]
-#[deprecated(note = "use codec::Stream with json::Values")]
-pub struct Decoder {
-    limits: Limits,
-    buf: Vec<u8>,
-    /// Where the unread bytes start in `buf`. Read bytes are dropped from
-    /// the front only when the decoder runs out, so one large feed of
-    /// many values is read in linear time.
-    start: usize,
-    /// The stream offset of `buf[start]`, to give errors stream offsets.
-    consumed: usize,
-    /// How much of the unread bytes has been scanned.
-    pos: usize,
-    scan: Scan,
-    failed: Option<Error>,
-    /// Whether [`Decoder::finish`] said no more bytes will come.
-    ended: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1101,220 +1081,15 @@ fn is_scalar_byte(c: u8) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.')
 }
 
-#[allow(deprecated)] // Preserve the compatibility API.
-impl Decoder {
-    /// A decoder with the default [`Limits`].
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// A decoder that holds each value to `limits`.
-    pub fn with_limits(limits: Limits) -> Decoder {
-        Decoder { limits, ..Decoder::default() }
-    }
-
-    /// Adds bytes read from the connection. After an error, or after
-    /// [`Decoder::finish`], the stream cannot be read any further, and
-    /// they are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_some() || self.ended {
-            return;
-        }
-        // Drop the bytes already read once they are at least as many as
-        // the unread ones, so moving the rest costs no more than reading
-        // them did.
-        if self.start > 0 && self.start >= self.buf.len() - self.start {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        self.buf.extend_from_slice(bytes);
-    }
-
-    /// Says the stream has ended: no more bytes will come. After it,
-    /// [`Decoder::next_value`] gives the values still held, a number or
-    /// literal at the very end included, then an
-    /// [`ErrorKind::UnexpectedEnd`] error if the stream stopped in the
-    /// middle of a value (or the error parsing those bytes finds first),
-    /// or `None` if it stopped between values.
-    pub fn finish(&mut self) {
-        self.ended = true;
-    }
-
-    /// The next whole value, if one has come. It returns `None` when it
-    /// needs more bytes, or after [`Decoder::finish`] when the stream has
-    /// ended cleanly, and keeps returning the same error once the stream
-    /// has broken. Error offsets count from the start of the stream.
-    ///
-    /// The decoder holds the bytes fed and not yet read. Once
-    /// `next_value` has returned `None`, that is at most one unfinished
-    /// value, which the size limit caps, and bytes already read are
-    /// dropped by the next [`Decoder::feed`].
-    pub fn next_value(&mut self) -> Option<Result<Value, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        let size = self.limits.size();
-        let max_depth = self.limits.depth();
-        loop {
-            let Some(&c) = self.buf.get(self.start.saturating_add(self.pos)) else {
-                if !self.ended || self.scan == Scan::Idle {
-                    if self.scan == Scan::Idle {
-                        self.take(self.pos);
-                        self.pos = 0;
-                    }
-                    self.buf.drain(..self.start);
-                    self.start = 0;
-                    // Give back the room a large feed took.
-                    if self.buf.capacity() > size.saturating_mul(2).max(4096) {
-                        self.buf.shrink_to(self.buf.len());
-                    }
-                    return None;
-                }
-                // The stream has ended inside a value. Parsing what came
-                // finds the end, or an earlier error.
-                return Some(self.end_value(self.pos));
-            };
-            let mut end = None;
-            match &mut self.scan {
-                Scan::Idle => {
-                    if is_ws(c) {
-                        self.pos += 1;
-                        continue;
-                    }
-                    self.take(self.pos);
-                    self.pos = 1;
-                    match c {
-                        b'{' | b'[' => {
-                            self.scan = Scan::Container { depth: 1, in_string: false, escape: false };
-                            if max_depth == 0 {
-                                return Some(self.fail(ErrorKind::TooDeep, 0));
-                            }
-                        }
-                        b'"' => self.scan = Scan::Str { escape: false },
-                        c if is_scalar_byte(c) => self.scan = Scan::Scalar,
-                        _ => end = Some(1),
-                    }
-                }
-                Scan::Container { depth, in_string, escape } => {
-                    if *in_string {
-                        if *escape {
-                            *escape = false;
-                        } else if c == b'\\' {
-                            *escape = true;
-                        } else if c == b'"' {
-                            *in_string = false;
-                        }
-                    } else {
-                        match c {
-                            b'"' => *in_string = true,
-                            b'{' | b'[' => {
-                                *depth += 1;
-                                if *depth > max_depth {
-                                    // An earlier byte may already break the
-                                    // value. Report what parsing the same
-                                    // bytes says, as for every other error.
-                                    let at = self.pos;
-                                    let prefix = &self.buf[self.start..=self.start + at];
-                                    let e = parse_with(prefix, &self.limits).err().unwrap_or(Error::at(ErrorKind::TooDeep, at));
-                                    return Some(self.fail(e.kind, e.offset));
-                                }
-                            }
-                            b'}' | b']' => {
-                                *depth = depth.saturating_sub(1);
-                                if *depth == 0 {
-                                    end = Some(self.pos + 1);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    self.pos += 1;
-                }
-                Scan::Str { escape } => {
-                    if *escape {
-                        *escape = false;
-                    } else if c == b'\\' {
-                        *escape = true;
-                    } else if c == b'"' {
-                        end = Some(self.pos + 1);
-                    }
-                    self.pos += 1;
-                }
-                Scan::Scalar => {
-                    if is_scalar_byte(c) {
-                        self.pos += 1;
-                    } else {
-                        end = Some(self.pos);
-                    }
-                }
-            }
-            if let Some(end) = end {
-                return Some(self.end_value(end));
-            }
-            if self.pos > size {
-                return Some(self.fail(ErrorKind::TooLarge, size));
-            }
-        }
-    }
-
-    /// Parses the value in the first `end` unread bytes and moves past it.
-    fn end_value(&mut self, end: usize) -> Result<Value, Error> {
-        let stop = self.start.saturating_add(end).min(self.buf.len());
-        let value = &self.buf[self.start..stop];
-        let mut result = parse_with(value, &self.limits);
-        if let Err(e) = result
-            && self.scan == Scan::Scalar
-            && e.kind == ErrorKind::UnexpectedEnd
-            && let Some(with_next) = self.buf.get(self.start..=stop)
-        {
-            // The stream did not end: the byte after the scalar broke
-            // it. Name that byte, as parsing the scalar and the byte
-            // together does.
-            if let Err(e) = parse_with(with_next, &self.limits) {
-                result = Err(e);
-            }
-        }
-        let base = self.consumed;
-        self.take(end);
-        self.scan = Scan::Idle;
-        self.pos = 0;
-        match result {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let e = Error::at(e.kind, base.saturating_add(e.offset));
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Err(e)
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a value.
-    pub fn buffered(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
-    }
-
-    /// Marks the first `n` unread bytes as read.
-    fn take(&mut self, n: usize) {
-        self.start = self.start.saturating_add(n).min(self.buf.len());
-        self.consumed = self.consumed.saturating_add(n);
-    }
-
-    /// Breaks the stream with an error at `at`, an offset into `buf`.
-    fn fail(&mut self, kind: ErrorKind, at: usize) -> Result<Value, Error> {
-        let e = Error::at(kind, self.consumed.saturating_add(at));
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.start = 0;
-        Err(e)
-    }
-}
-
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+
+    fn check(input: &[u8]) {
+        contract::check_decode_with_alloc_limit(Values::new, input, 2 * (MAX_SIZE + 1));
+    }
 
     fn s(v: &str) -> Value {
         Value::from(v)
@@ -1325,13 +1100,17 @@ mod tests {
     }
 
     fn err(input: &[u8]) -> (ErrorKind, usize) {
-        let e = parse(input).unwrap_err();
+        let e = Value::parse(input).unwrap_err();
         (e.kind, e.offset)
     }
 
+    fn written_text(value: &Value) -> String {
+        String::from_utf8(value.to_bytes().unwrap()).unwrap()
+    }
+
     fn round_trip(v: &Value) {
-        let text = v.write().unwrap();
-        assert_eq!(&parse(text.as_bytes()).unwrap(), v, "{text}");
+        let text = written_text(v);
+        assert_eq!(&Value::parse(text.as_bytes()).unwrap(), v, "{text}");
     }
 
     // RFC 8259, section 13.
@@ -1353,7 +1132,7 @@ mod tests {
                   "IDs": [116, 943, 234, 38793]
                 }
             }"#;
-        let v = parse(text).unwrap();
+        let v = Value::parse(text).unwrap();
         let image = v.get("Image").unwrap();
         assert_eq!(image.get("Width").and_then(Value::as_number).and_then(Number::as_u64), Some(800));
         assert_eq!(image.get("Title").and_then(Value::as_str), Some("View from 15th Floor"));
@@ -1392,7 +1171,7 @@ mod tests {
                  "Country":   "US"
               }
             ]"#;
-        let v = parse(text).unwrap();
+        let v = Value::parse(text).unwrap();
         let items = v.as_array().unwrap();
         assert_eq!(items.len(), 2);
         let lon = items[1].get("Longitude").and_then(Value::as_number).unwrap();
@@ -1405,23 +1184,23 @@ mod tests {
 
     #[test]
     fn rfc_scalar_texts() {
-        assert_eq!(parse(b"\"Hello world!\"").unwrap(), s("Hello world!"));
-        assert_eq!(parse(b"42").unwrap(), n("42"));
-        assert_eq!(parse(b"true").unwrap(), Value::Bool(true));
-        assert_eq!(parse(b"false").unwrap(), Value::Bool(false));
-        assert_eq!(parse(b" \t\r\nnull \n").unwrap(), Value::Null);
+        assert_eq!(Value::parse(b"\"Hello world!\"").unwrap(), s("Hello world!"));
+        assert_eq!(Value::parse(b"42").unwrap(), n("42"));
+        assert_eq!(Value::parse(b"true").unwrap(), Value::Bool(true));
+        assert_eq!(Value::parse(b"false").unwrap(), Value::Bool(false));
+        assert_eq!(Value::parse(b" \t\r\nnull \n").unwrap(), Value::Null);
     }
 
     #[test]
     fn numbers() {
         for good in ["0", "-0", "1", "-1", "10", "1.5", "0.25", "-0.0", "1e5", "1E5", "1e+5", "1e-5", "2.5E-03", "123456789012345678901234567890"] {
-            let v = parse(good.as_bytes()).unwrap();
+            let v = Value::parse(good.as_bytes()).unwrap();
             assert_eq!(v.as_number().unwrap().text(), good);
-            assert_eq!(v.write().unwrap(), good);
+            assert_eq!(written_text(&v), good);
             assert!(Number::from_text(good).is_some());
         }
         for bad in ["-", "01", "-01", "00", "1.", ".5", "+1", "1e", "1e+", "1.e5", "0x10", "Infinity", "NaN", "-Infinity", " 1", "1 ", "1.5.5", ""] {
-            assert!(parse(bad.as_bytes()).is_err() || bad.trim() != bad, "{bad}");
+            assert!(Value::parse(bad.as_bytes()).is_err() || bad.trim() != bad, "{bad}");
             assert!(Number::from_text(bad).is_none(), "{bad}");
         }
         let big = Number::from_text("1e400").unwrap();
@@ -1449,17 +1228,17 @@ mod tests {
 
     #[test]
     fn strings_and_escapes() {
-        let v = parse(br#""a\"b\\c\/d\be\ff\ng\rh\ti\u0041\u00e9\u20ac""#).unwrap();
+        let v = Value::parse(br#""a\"b\\c\/d\be\ff\ng\rh\ti\u0041\u00e9\u20ac""#).unwrap();
         assert_eq!(v, s("a\"b\\c/d\u{8}e\u{c}f\ng\rh\tiAé€"));
         // A surrogate pair, upper and lower case hex.
-        assert_eq!(parse(br#""\ud83d\ude00""#).unwrap(), s("😀"));
-        assert_eq!(parse(br#""\uD834\uDD1E""#).unwrap(), s("𝄞"));
+        assert_eq!(Value::parse(br#""\ud83d\ude00""#).unwrap(), s("😀"));
+        assert_eq!(Value::parse(br#""\uD834\uDD1E""#).unwrap(), s("𝄞"));
         // Raw UTF-8 passes through.
-        assert_eq!(parse("\"日本 😀\"".as_bytes()).unwrap(), s("日本 😀"));
+        assert_eq!(Value::parse("\"日本 😀\"".as_bytes()).unwrap(), s("日本 😀"));
         // U+0000 is allowed as an escape.
-        assert_eq!(parse(br#""\u0000""#).unwrap(), s("\0"));
+        assert_eq!(Value::parse(br#""\u0000""#).unwrap(), s("\0"));
         // The writer escapes only what it must.
-        let w = s("q\"b\\/\n\u{1}\u{7f}é😀").write().unwrap();
+        let w = written_text(&s("q\"b\\/\n\u{1}\u{7f}é😀"));
         assert_eq!(w, "\"q\\\"b\\\\/\\n\\u0001\u{7f}é😀\"");
         round_trip(&s("q\"b\\/\n\u{1}\u{1f}\u{7f}é😀\u{2028}"));
         for c in 0..0x20u32 {
@@ -1469,13 +1248,13 @@ mod tests {
 
     #[test]
     fn duplicate_keys_kept_in_order() {
-        let v = parse(br#"{"a":1,"b":2,"a":3}"#).unwrap();
+        let v = Value::parse(br#"{"a":1,"b":2,"a":3}"#).unwrap();
         let members = v.as_object().unwrap();
         assert_eq!(members.len(), 3);
         assert_eq!(members[2], ("a".to_string(), n("3")));
         assert_eq!(v.get("a"), Some(&n("1")));
         assert_eq!(v.get("c"), None);
-        assert_eq!(v.write().unwrap(), r#"{"a":1,"b":2,"a":3}"#);
+        assert_eq!(written_text(&v), r#"{"a":1,"b":2,"a":3}"#);
     }
 
     #[test]
@@ -1518,7 +1297,7 @@ mod tests {
         let big = vec![b' '; MAX_SIZE + 1];
         assert_eq!(err(&big), (ErrorKind::TooLarge, MAX_SIZE));
         let many = format!("[{}0]", "0,".repeat(MAX_ELEMENTS));
-        assert_eq!(parse(many.as_bytes()).unwrap_err().kind, ErrorKind::TooManyElements);
+        assert_eq!(Value::parse(many.as_bytes()).unwrap_err().kind, ErrorKind::TooManyElements);
         // Every kind prints.
         assert_eq!(Error::at(ErrorKind::BadEscape, 4).to_string(), "an unknown escape at byte 4");
     }
@@ -1526,7 +1305,7 @@ mod tests {
     #[test]
     fn limits() {
         let at = format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
-        let v = parse(at.as_bytes()).unwrap();
+        let v = Value::parse(at.as_bytes()).unwrap();
         round_trip(&v);
         let tight = Limits { depth: 2, size: 20, elements: 4 };
         assert!(parse_with(b"[[1]]", &tight).is_ok());
@@ -1550,22 +1329,25 @@ mod tests {
         for _ in 0..MAX_DEPTH + 1 {
             deep = Value::Array(vec![deep]);
         }
-        assert_eq!(deep.write().unwrap_err().kind, ErrorKind::TooDeep);
+        assert_eq!(deep.to_bytes().unwrap_err().kind, ErrorKind::TooDeep);
         let Value::Array(mut inner) = deep else { panic!() };
         round_trip(&inner.pop().unwrap());
         let big = Value::String("x".repeat(MAX_SIZE));
-        assert_eq!(big.write().unwrap_err().kind, ErrorKind::TooLarge);
-        assert!(Value::String("x".repeat(MAX_SIZE - 2)).write().is_ok());
+        assert_eq!(big.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
+        assert!(Value::String("x".repeat(MAX_SIZE - 2)).to_bytes().is_ok());
         let escapes = Value::String("\u{1}".repeat(MAX_SIZE / 6 + 1));
-        assert_eq!(escapes.write().unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(escapes.to_bytes().unwrap_err().kind, ErrorKind::TooLarge);
         let many = Value::Array(vec![Value::Null; MAX_ELEMENTS]);
-        assert_eq!(many.write().unwrap_err().kind, ErrorKind::TooManyElements);
+        assert_eq!(
+            many.to_bytes().unwrap_err().kind,
+            ErrorKind::TooManyElements
+        );
         let ok = Value::Array(vec![Value::Null; MAX_ELEMENTS - 1]);
         round_trip(&ok);
         let tight = Limits { depth: 1, size: 10, elements: 3 };
-        assert_eq!(Value::Array(vec![Value::Array(vec![])]).write_with(&tight).unwrap_err(), Error::at(ErrorKind::TooDeep, 1));
-        assert_eq!(s("0123456789").write_with(&tight).unwrap_err().kind, ErrorKind::TooLarge);
-        assert_eq!(Value::Array(vec![true.into(), false.into(), Value::Null]).write_with(&Limits { size: 100, ..tight }).unwrap_err().kind, ErrorKind::TooManyElements);
+        assert_eq!(Value::Array(vec![Value::Array(vec![])]).validate(&tight).unwrap_err(), Error::at(ErrorKind::TooDeep, 1));
+        assert_eq!(s("0123456789").validate(&tight).unwrap_err().kind, ErrorKind::TooLarge);
+        assert_eq!(Value::Array(vec![true.into(), false.into(), Value::Null]).validate(&Limits { size: 100, ..tight }).unwrap_err().kind, ErrorKind::TooManyElements);
     }
 
     #[test]
@@ -1580,16 +1362,19 @@ mod tests {
             ("n".into(), Value::from("again")),
         ]);
         round_trip(&v);
-        let text = v.write().unwrap();
-        assert_eq!(parse(text.as_bytes()).unwrap().write().unwrap(), text);
+        let text = written_text(&v);
+        assert_eq!(written_text(&Value::parse(text.as_bytes()).unwrap()), text);
         // Whitespace anywhere it may go.
         let spaced = b" { \"a\" : [ 1 , { } , [ ] ] , \"b\" : null } ";
-        assert_eq!(parse(spaced).unwrap().write().unwrap(), r#"{"a":[1,{},[]],"b":null}"#);
+        assert_eq!(
+            written_text(&Value::parse(spaced).unwrap()),
+            r#"{"a":[1,{},[]],"b":null}"#
+        );
     }
 
     #[test]
     fn every_truncated_prefix() {
-        let docs: [&[u8]; 6] = [
+        let docs: &[&[u8]] = &[
             br#"{"a":[1,2.5e-3,true,false,null],"b":{"c":"d\u00e9\ud83d\ude00\n"}}"#,
             br#"[ "x" , -0.5 , {} , [] ]"#,
             "[\"日本😀\"]".as_bytes(),
@@ -1598,193 +1383,129 @@ mod tests {
             b"[[[[]]]]",
         ];
         for doc in docs {
-            assert!(parse(doc).is_ok());
+            check(doc);
             for cut in 0..doc.len() {
-                let e = parse(&doc[..cut]).unwrap_err();
-                assert_eq!(e.kind, ErrorKind::UnexpectedEnd, "{:?}", String::from_utf8_lossy(&doc[..cut]));
-                assert!(e.offset <= cut);
-                let mut d = Decoder::new();
-                d.feed(&doc[..cut]);
-                assert_eq!(d.next_value(), None);
-                // Once the stream ends, the decoder reports what parsing
-                // reports, or nothing when no value had started.
-                d.finish();
-                let want = if doc[..cut].iter().all(|&c| is_ws(c)) { None } else { Some(Err(e)) };
-                assert_eq!(d.next_value(), want, "{:?}", String::from_utf8_lossy(&doc[..cut]));
+                let error = Value::parse(&doc[..cut]).unwrap_err();
+                assert_eq!(error, Error::at(ErrorKind::UnexpectedEnd, cut));
+                let (items, error) = decode_all(Values::new, &doc[..cut]);
+                assert!(items.is_empty());
+                let whitespace = doc[..cut].iter().take_while(|c| is_ws(**c)).count();
+                let expected = (cut > whitespace).then_some(Fail::Truncated { unread: cut - whitespace });
+                assert_eq!(error, expected);
             }
         }
     }
 
     #[test]
-    fn decoder_drops_bytes_it_has_read() {
-        // One value per feed, taking one value each time and never asking
-        // for the `None` after it. The read bytes must not pile up.
-        let mut d = Decoder::new();
+    fn stream_releases_consumed_bytes() {
+        let mut stream = Stream::new(Values::new());
         for _ in 0..10_000 {
-            d.feed(b"{}");
-            assert_eq!(d.next_value(), Some(Ok(Value::Object(vec![]))));
-            assert_eq!(d.buffered(), 0);
+            assert_eq!(stream.push(b"{}"), 2);
+            assert_eq!(stream.next(), Some(Ok(Value::Object(vec![]))));
+            assert_eq!(stream.buffered(), 0);
         }
-        assert!(d.buf.len() <= 4, "{} bytes held", d.buf.len());
-        // A large feed does not keep its room once it has been read.
-        let mut d = Decoder::new();
-        d.feed(&vec![b' '; 3 * MAX_SIZE]);
-        assert_eq!(d.next_value(), None);
-        assert!(d.buf.capacity() <= 2 * MAX_SIZE, "{} bytes of room kept", d.buf.capacity());
-        d.feed(b"[1]");
-        assert_eq!(d.next_value(), Some(Ok(parse(b"[1]").unwrap())));
+        pump(&mut stream, &vec![b' '; 3 * MAX_SIZE], |_| panic!("no value")).unwrap();
+        assert_eq!(stream.buffered(), 0);
+        assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
     }
 
     #[test]
-    fn decoder_finish_ends_the_stream() {
-        // A number or literal at the very end of the stream.
+    fn stream_eof_completes_scalars() {
         for text in ["42", "-1.5e3", "true", "false", "null", "0"] {
-            let mut d = Decoder::new();
-            d.feed(text.as_bytes());
-            assert_eq!(d.next_value(), None);
-            d.finish();
-            assert_eq!(d.next_value(), Some(Ok(parse(text.as_bytes()).unwrap())), "{text}");
-            assert_eq!(d.next_value(), None);
+            let mut stream = Stream::new(Values::new());
+            assert_eq!(stream.push(text.as_bytes()), text.len());
+            assert_eq!(stream.next(), None);
+            stream.end();
+            assert_eq!(stream.next(), Some(Ok(Value::parse(text.as_bytes()).unwrap())));
+            assert_eq!(stream.next(), None);
+            check(text.as_bytes());
         }
-        // A last line with no line break after it.
-        let mut d = Decoder::new();
-        d.feed(b"{\"a\":1}\n42");
-        d.finish();
-        assert_eq!(d.next_value(), Some(Ok(parse(b"{\"a\":1}").unwrap())));
-        assert_eq!(d.next_value(), Some(Ok(n("42"))));
-        assert_eq!(d.next_value(), None);
-        // A value cut off by the end, with a stream offset.
-        let cases: [(&[u8], Error); 6] = [
-            (b"{\"a\":", Error::at(ErrorKind::UnexpectedEnd, 5)),
-            (b"[1] [2,", Error::at(ErrorKind::UnexpectedEnd, 7)),
-            (b" \"abc", Error::at(ErrorKind::UnexpectedEnd, 5)),
-            (b"tru", Error::at(ErrorKind::UnexpectedEnd, 3)),
-            (b"1e", Error::at(ErrorKind::UnexpectedEnd, 2)),
-            (b"[x", Error::at(ErrorKind::UnexpectedByte(b'x'), 1)),
-        ];
-        for (input, want) in cases {
-            for bytewise in [false, true] {
-                let got = decode_finished(input, bytewise);
-                assert_eq!(got.last(), Some(&Err(want)), "{:?}", String::from_utf8_lossy(input));
-            }
+        assert_eq!(decode_all(Values::new, b"{\"a\":1}\n42"),
+            (vec![Value::parse(b"{\"a\":1}").unwrap(), n("42")], None));
+        assert_eq!(
+            decode_all(Values::new, b"[x"),
+            (
+                vec![],
+                Some(Fail::Protocol(Error::at(
+                    ErrorKind::UnexpectedByte(b'x'),
+                    1
+                )))
+            )
+        );
+        for input in [b"[x".as_slice(), b"{x", b"\"\\q", b"\"a\n"] {
+            check(input);
+            let error = Value::parse(input).unwrap_err();
+            assert_ne!(error.kind, ErrorKind::UnexpectedEnd);
+            assert_eq!(
+                decode_all(Values::new, input),
+                (vec![], Some(Fail::Protocol(error)))
+            );
         }
-        // Bytes after the end are dropped, and the end stays.
-        let mut d = Decoder::new();
-        d.feed(b" ");
-        d.finish();
-        d.feed(b"1 ");
-        assert_eq!(d.next_value(), None);
-        assert_eq!(d.buffered(), 0);
+        for (input, unread) in [(b"{\"a\":".as_slice(), 5), (b"[1] [2,", 3), (b" \"abc", 4), (b"tru", 3), (b"1e", 2)] {
+            check(input);
+            assert_eq!(decode_all(Values::new, input).1, Some(Fail::Truncated { unread }));
+        }
+        let mut stream = Stream::new(Values::new());
+        assert_eq!(stream.push(b" "), 1);
+        stream.end();
+        assert_eq!(stream.push(b"1 "), 2);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.buffered(), 0);
     }
 
     #[test]
-    fn decoder_does_not_frame_lines() {
-        // The decoder splits concatenated JSON texts, not lines. Two
-        // values on one line are two values, and one value may span
-        // lines. A JSON Lines reader splits at `\n` and parses each line.
-        let mut d = Decoder::new();
-        d.feed(b"{}{}\n{\n\"a\":1\n}\n");
-        assert_eq!(d.next_value(), Some(Ok(Value::Object(vec![]))));
-        assert_eq!(d.next_value(), Some(Ok(Value::Object(vec![]))));
-        assert_eq!(d.next_value(), Some(Ok(parse(b"{\"a\":1}").unwrap())));
-        assert_eq!(d.next_value(), None);
+    fn stream_does_not_frame_lines() {
+        let bytes = b"{}{}\n{\n\"a\":1\n}\n";
+        check(bytes);
+        assert_eq!(decode_all(Values::new, bytes),
+            (vec![Value::Object(vec![]), Value::Object(vec![]), Value::parse(b"{\"a\":1}").unwrap()], None));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        let stream = b" {\"id\":1} [2]\n\"three\" 4 true null {\"id\":5}\n";
-        let want = [
-            parse(b"{\"id\":1}").unwrap(),
-            parse(b"[2]").unwrap(),
-            s("three"),
-            n("4"),
-            Value::Bool(true),
-            Value::Null,
-            parse(b"{\"id\":5}").unwrap(),
-        ];
-        // All at once, then a byte at a time.
-        let mut d = Decoder::new();
-        d.feed(stream);
-        let mut got = Vec::new();
-        while let Some(v) = d.next_value() {
-            got.push(v.unwrap());
-        }
-        assert_eq!(got, want);
-        assert_eq!(d.buffered(), 0);
-        let mut d = Decoder::new();
-        let mut got = Vec::new();
-        for b in stream {
-            d.feed(std::slice::from_ref(b));
-            while let Some(v) = d.next_value() {
-                got.push(v.unwrap());
-            }
-        }
-        assert_eq!(got, want);
-        // A number at the end waits for the byte after it.
-        let mut d = Decoder::new();
-        d.feed(b"12");
-        assert_eq!(d.next_value(), None);
-        d.feed(b"3\n");
-        assert_eq!(d.next_value(), Some(Ok(n("123"))));
-        // Brackets inside strings do not count.
-        d.feed(br#"["]\"[", {"}":"{"}]"#);
-        assert_eq!(d.next_value(), Some(Ok(parse(br#"["]\"[", {"}":"{"}]"#).unwrap())));
-        // An error has a stream offset, and stays.
-        d.feed(b" [1,]");
-        assert_eq!(d.next_value(), Some(Err(Error::at(ErrorKind::UnexpectedByte(b']'), 27))));
-        d.feed(b"[1]");
-        assert_eq!(d.next_value(), Some(Err(Error::at(ErrorKind::UnexpectedByte(b']'), 27))));
-        assert_eq!(d.buffered(), 0);
-        // A stray closing bracket.
-        let mut d = Decoder::new();
-        d.feed(b"]");
-        assert_eq!(d.next_value(), Some(Err(Error::at(ErrorKind::UnexpectedByte(b']'), 0))));
+    fn stream_splits_values_and_tracks_error_offsets() {
+        let bytes = b" {\"id\":1} [2]\n\"three\" 4 true null {\"id\":5}\n";
+        check(bytes);
+        assert_eq!(decode_all(Values::new, bytes), (vec![
+            Value::parse(b"{\"id\":1}").unwrap(), Value::parse(b"[2]").unwrap(),
+            s("three"), n("4"), Value::Bool(true), Value::Null,
+            Value::parse(b"{\"id\":5}").unwrap(),
+        ], None));
+        let mut stream = Stream::new(Values::new());
+        assert_eq!(stream.push(b"12"), 2);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(b"3\n"), 2);
+        assert_eq!(stream.next(), Some(Ok(n("123"))));
+        let brackets = br#"["]\"[", {"}":"{"}]"#;
+        assert_eq!(stream.push(brackets), brackets.len());
+        assert_eq!(stream.next(), Some(Ok(Value::parse(brackets).unwrap())));
+        assert_eq!(stream.push(b" [1,]"), 5);
+        let error = Fail::Protocol(Error::at(ErrorKind::UnexpectedByte(b']'), 27));
+        assert_eq!(stream.next(), Some(Err(error.clone())));
+        assert_eq!(stream.push(b"[1]"), 3);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&error));
+        assert_eq!(decode_all(Values::new, b"]").1,
+            Some(Fail::Protocol(Error::at(ErrorKind::UnexpectedByte(b']'), 0))));
     }
 
     #[test]
-    fn decoder_limits() {
+    fn stream_limits_and_earlier_errors() {
         let tight = Limits { depth: 2, size: 8, elements: 100 };
-        let mut d = Decoder::with_limits(tight);
-        d.feed(b"[[]] [[[");
-        assert_eq!(d.next_value(), Some(Ok(parse(b"[[]]").unwrap())));
-        assert_eq!(d.next_value(), Some(Err(Error::at(ErrorKind::TooDeep, 7))));
-        // An unfinished value past the size limit.
-        let mut d = Decoder::with_limits(tight);
-        d.feed(b"  \"abcdefg");
-        assert_eq!(d.next_value(), None);
-        d.feed(b"h");
-        assert_eq!(d.next_value(), Some(Err(Error::at(ErrorKind::TooLarge, 10))));
-        // Whitespace between values is not held.
-        let mut d = Decoder::new();
-        d.feed(&[b' '; 1000]);
-        assert_eq!(d.next_value(), None);
-        assert_eq!(d.buffered(), 0);
-        let mut d = Decoder::with_limits(Limits { depth: 0, ..Limits::default() });
-        d.feed(b"1 {");
-        assert_eq!(d.next_value(), Some(Ok(n("1"))));
-        assert_eq!(d.next_value(), Some(Err(Error::at(ErrorKind::TooDeep, 2))));
-    }
-
-    #[test]
-    fn decoder_too_deep_reports_an_earlier_error() {
-        // `x` breaks the value before the nesting gets too deep, and
-        // `parse` says so. The decoder must agree.
-        let input = format!("[x{}", "[".repeat(MAX_DEPTH + 10));
-        let want = parse(input.as_bytes()).unwrap_err();
-        assert_eq!(want, Error::at(ErrorKind::UnexpectedByte(b'x'), 1));
-        for bytewise in [false, true] {
-            assert_eq!(decode_all(input.as_bytes(), bytewise), [Err(want)]);
+        for (bytes, limits, expected) in [
+            (b"[[]] [[[".as_slice(), tight, Error::at(ErrorKind::TooDeep, 7)),
+            (b"  \"abcdefgh", tight, Error::at(ErrorKind::TooLarge, 10)),
+            (b"1 {", Limits { depth: 0, ..Limits::default() }, Error::at(ErrorKind::TooDeep, 2)),
+            (b"[1,2,[[", Limits { depth: 2, size: 100, elements: 2 }, Error::at(ErrorKind::TooManyElements, 3)),
+        ] {
+            let make = || Values::with_limits(limits);
+            contract::check_decode_with_alloc_limit(make, bytes, 2 * make().capacity());
+            assert_eq!(decode_all(make, bytes).1, Some(Fail::Protocol(expected)));
         }
-        // With nothing wrong before it, the depth is the error.
-        let input = format!(" {}", "[".repeat(MAX_DEPTH + 1));
-        for bytewise in [false, true] {
-            assert_eq!(decode_all(input.as_bytes(), bytewise), [Err(Error::at(ErrorKind::TooDeep, MAX_DEPTH + 1))]);
+        for input in [format!("[x{}", "[".repeat(MAX_DEPTH + 10)), format!(" {}", "[".repeat(MAX_DEPTH + 1))] {
+            check(input.as_bytes());
+            assert_eq!(decode_all(Values::new, input.as_bytes()).1,
+                Some(Fail::Protocol(Value::parse(input.as_bytes()).unwrap_err())));
         }
-        let tight = Limits { depth: 2, size: 100, elements: 2 };
-        let mut d = Decoder::with_limits(tight);
-        d.feed(b"[1,2,[[");
-        assert_eq!(d.next_value(), Some(Err(parse_with(b"[1,2,[[", &tight).unwrap_err())));
-        assert_eq!(d.next_value().unwrap().unwrap_err().kind, ErrorKind::TooManyElements);
     }
 
     #[test]
@@ -1793,9 +1514,12 @@ mod tests {
         assert_eq!(Value::from(3), n("3"));
         assert_eq!(Value::from(-3), n("-3"));
         assert_eq!(Value::from(7u32), n("7"));
-        assert_eq!(Value::from(vec![Value::from(1), Value::Null]).write().unwrap(), "[1,null]");
+        assert_eq!(
+            written_text(&Value::from(vec![Value::from(1), Value::Null])),
+            "[1,null]"
+        );
         assert_eq!(Value::default(), Value::Null);
-        let v = parse(b"[12, 1.5, -1, \"x\"]").unwrap();
+        let v = Value::parse(b"[12, 1.5, -1, \"x\"]").unwrap();
         let items = v.as_array().unwrap();
         assert_eq!(items[0].as_i64(), Some(12));
         assert_eq!(items[0].as_u64(), Some(12));
@@ -1806,7 +1530,7 @@ mod tests {
         // Values can key a hash map, and equal values hash the same.
         let mut seen = std::collections::HashSet::new();
         assert!(seen.insert(v.clone()));
-        assert!(!seen.insert(parse(b"[12,1.5,-1,\"x\"]").unwrap()));
+        assert!(!seen.insert(Value::parse(b"[12,1.5,-1,\"x\"]").unwrap()));
     }
 
     #[test]
@@ -1819,53 +1543,35 @@ mod tests {
     }
 
     #[test]
-    fn decoder_scalar_cut_by_a_byte_is_not_an_end() {
-        // The stream did not end, so the error names the byte that broke
-        // the value, as parsing the same bytes in one text would.
-        let cases: [(&[u8], ErrorKind, usize); 5] = [
-            (b"tru ", ErrorKind::UnexpectedByte(b' '), 3),
+    fn stream_scalar_interrupted_by_delimiter() {
+        for (input, kind, offset) in [
+            (b"tru ".as_slice(), ErrorKind::UnexpectedByte(b' '), 3),
             (b"- ", ErrorKind::BadNumber, 1),
             (b"1e,", ErrorKind::BadNumber, 2),
             (b"1.[", ErrorKind::BadNumber, 2),
             (b"  nul\"", ErrorKind::UnexpectedByte(b'"'), 5),
-        ];
-        for (input, kind, offset) in cases {
-            for bytewise in [false, true] {
-                assert_eq!(decode_all(input, bytewise), [Err(Error::at(kind, offset))], "{:?}", String::from_utf8_lossy(input));
-            }
+        ] {
+            check(input);
+            assert_eq!(decode_all(Values::new, input),
+                (vec![], Some(Fail::Protocol(Error::at(kind, offset)))));
         }
     }
 
     #[test]
-    fn decoder_is_linear_in_one_large_feed() {
-        // A million values in one feed, which takes a tenth of a second.
-        // Shifting the buffer after each value made it take over ten.
-        let stream = "0\n".repeat(MAX_SIZE);
-        let start = std::time::Instant::now();
-        let mut d = Decoder::new();
-        d.feed(stream.as_bytes());
+    fn stream_reads_large_batch() {
+        let started = std::time::Instant::now();
+        let bytes = "0\n".repeat(MAX_SIZE);
+        let mut stream = Stream::new(Values::new());
         let mut count = 0;
-        while let Some(v) = d.next_value() {
-            assert_eq!(v, Ok(n("0")));
+        pump(&mut stream, bytes.as_bytes(), |value| {
+            assert_eq!(value, n("0"));
             count += 1;
-            assert_eq!(d.buffered(), stream.len() - 2 * count + 1);
-        }
+        }).unwrap();
+        finish(&mut stream, |_| panic!("no pending value")).unwrap();
         assert_eq!(count, MAX_SIZE);
-        assert_eq!(d.buffered(), 0);
-        assert!(start.elapsed() < std::time::Duration::from_secs(3), "{:?}", start.elapsed());
-    }
-
-    /// A small deterministic generator, so the fuzz loop needs no crates.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
+        assert_eq!(stream.buffered(), 0);
+        assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     const PIECES: [&str; 32] = [
@@ -1874,131 +1580,65 @@ mod tests {
 
     fn random_input(r: &mut Lcg) -> Vec<u8> {
         let mut b = Vec::new();
-        for _ in 0..r.below(40) {
-            match r.below(10) {
+        for _ in 0..r.index(40) {
+            match r.index(10) {
                 0 => b.push(r.next() as u8),
-                _ => b.extend_from_slice(PIECES[r.below(PIECES.len())].as_bytes()),
+                _ => b.extend_from_slice(PIECES[r.index(PIECES.len())].as_bytes()),
             }
         }
         b
     }
 
     fn random_value(r: &mut Lcg, depth: usize) -> Value {
-        match r.below(if depth > 4 { 4 } else { 6 }) {
+        match r.index(if depth > 4 { 4 } else { 6 }) {
             0 => Value::Null,
-            1 => Value::Bool(r.next() & 1 == 1),
-            2 => match r.below(3) {
+            1 => Value::Bool(r.coin()),
+            2 => match r.index(3) {
                 0 => Value::from(r.next() as i64 - (1 << 31)),
-                1 => Value::from(Number::from_f64(f64::from_bits(u64::from(r.next()) << 32 | u64::from(r.next()))).unwrap_or(Number::from_i64(0))),
-                _ => Value::from(Number::from_text(&format!("{}.{}e-{}", r.next(), r.next(), r.below(400))).unwrap()),
+                1 => Value::from(
+                    Number::from_f64(f64::from_bits(
+                        r.next() | (r.next() << 31) | ((r.next() & 3) << 62),
+                    ))
+                    .unwrap_or(Number::from_i64(0)),
+                ),
+                _ => Value::from(Number::from_text(&format!("{}.{}e-{}", r.next(), r.next(), r.index(400))).unwrap()),
             },
-            3 => Value::String((0..r.below(8)).filter_map(|_| char::from_u32(r.next() % 0x11000)).collect()),
-            4 => Value::Array((0..r.below(5)).map(|_| random_value(r, depth + 1)).collect()),
-            _ => Value::Object((0..r.below(5)).map(|_| (PIECES[r.below(PIECES.len())].to_string(), random_value(r, depth + 1))).collect()),
-        }
-    }
-
-    fn decode_all(data: &[u8], bytewise: bool) -> Vec<Result<Value, Error>> {
-        let mut d = Decoder::new();
-        let mut out = Vec::new();
-        let take = |d: &mut Decoder, out: &mut Vec<Result<Value, Error>>| {
-            while let Some(v) = d.next_value() {
-                let stop = v.is_err();
-                out.push(v);
-                if stop {
-                    return true;
-                }
-            }
-            false
-        };
-        if bytewise {
-            for b in data {
-                d.feed(std::slice::from_ref(b));
-                if take(&mut d, &mut out) {
-                    break;
-                }
-            }
-        } else {
-            d.feed(data);
-            take(&mut d, &mut out);
-        }
-        out
-    }
-
-    /// Every value the decoder gives for `data` as a whole stream, ended
-    /// with [`Decoder::finish`], up to and including its first error.
-    fn decode_finished(data: &[u8], bytewise: bool) -> Vec<Result<Value, Error>> {
-        let mut d = Decoder::new();
-        let mut out = Vec::new();
-        let chunks: Vec<&[u8]> = if bytewise { data.chunks(1).collect() } else { vec![data] };
-        for chunk in chunks {
-            d.feed(chunk);
-            // Take at most one value per feed, so read bytes wait in the
-            // buffer while more come.
-            if let Some(v) = d.next_value() {
-                let stop = v.is_err();
-                out.push(v);
-                if stop {
-                    return out;
-                }
-            }
-        }
-        d.finish();
-        while let Some(v) = d.next_value() {
-            let stop = v.is_err();
-            out.push(v);
-            if stop {
-                break;
-            }
-        }
-        out
-    }
-
-    /// A whole JSON text, as a stream that then ends, gives just its value.
-    fn stream_matches_parse(data: &[u8]) {
-        let whole = decode_finished(data, false);
-        assert_eq!(whole, decode_finished(data, true), "{:?}", String::from_utf8_lossy(data));
-        if let Ok(v) = parse(data) {
-            assert_eq!(whole, [Ok(v)], "{:?}", String::from_utf8_lossy(data));
+            3 => Value::String(
+                (0..r.index(8))
+                    .filter_map(|_| char::from_u32(r.next() as u32 % 0x11000))
+                    .collect(),
+            ),
+            4 => Value::Array((0..r.index(5)).map(|_| random_value(r, depth + 1)).collect()),
+            _ => Value::Object((0..r.index(5)).map(|_| (PIECES[r.index(PIECES.len())].to_string(), random_value(r, depth + 1))).collect()),
         }
     }
 
     #[test]
-    fn lcg_fuzz() {
-        let mut r = Lcg(0x5eed_1234);
+    fn generated_and_mutated_values() {
+        let mut rng = Lcg::new(0x5eed_1234);
         let mut parsed = 0;
         for _ in 0..20_000 {
-            let data = random_input(&mut r);
-            if let Ok(v) = parse(&data) {
-                parsed += 1;
-                round_trip(&v);
-            }
-            assert_eq!(decode_all(&data, false), decode_all(&data, true));
-            stream_matches_parse(&data);
-            for v in decode_all(&data, false).into_iter().flatten() {
-                round_trip(&v);
-            }
+            parsed += usize::from(check_parsed(&random_input(&mut rng)));
         }
-        assert!(parsed > 100, "only {parsed} parsed");
-        // Built values, and valid texts with one byte changed or cut.
+        assert!(parsed > 100, "only {parsed} parsed inputs");
         for _ in 0..5_000 {
-            let v = random_value(&mut r, 0);
-            round_trip(&v);
-            let mut text = v.write().unwrap().into_bytes();
-            assert_eq!(decode_all(&text, false), decode_all(&text, true));
-            stream_matches_parse(&text);
-            if !text.is_empty() {
-                let at = r.below(text.len());
-                text[at] = r.next() as u8;
-                if let Ok(w) = parse(&text) {
-                    round_trip(&w);
-                }
-                let cut = r.below(text.len());
-                let _ = parse(&text[..cut]);
-                assert_eq!(decode_all(&text[..cut], false), decode_all(&text[..cut], true));
-                stream_matches_parse(&text[..cut]);
-                stream_matches_parse(&text);
-            }
+            let value = random_value(&mut rng, 0);
+            contract::check_wire_value(&value);
+            let mut bytes = value.to_bytes().unwrap();
+            assert_eq!(decode_all(Values::new, &bytes), (vec![value], None));
+            mutate(&mut rng, &mut bytes);
+            check_parsed(&bytes);
+        }
+    }
+
+    fn check_parsed(data: &[u8]) -> bool {
+        check(data);
+        contract::check_wire::<Value>(data);
+        if let Ok(value) = Value::parse(data) {
+            assert_eq!(decode_all(Values::new, data), (vec![value], None));
+            true
+        } else {
+            false
         }
     }
 }

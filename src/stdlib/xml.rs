@@ -6,12 +6,12 @@
 //! module follows W3C Extensible Markup Language (XML) 1.0, Fifth Edition,
 //! and Namespaces in XML 1.0, Third Edition.
 //!
-//! Nothing here reads a socket. A world feeds the bytes of a body to
-//! [`Events`] through [`codec::Stream`], as they arrive, and takes [`Event`]s
+//! Nothing here reads a socket. A world passes body bytes to
+//! [`Stream<Events>`](super::codec::Stream) and takes [`Event`]s
 //! out: the declaration, start and end tags with their attributes, text,
 //! CDATA sections, comments and processing instructions. Names come back
-//! with their namespaces resolved. A [`Writer`] builds a document from the
-//! same pieces and escapes what needs escaping.
+//! with their namespaces resolved. A [`Builder`] builds a document from the
+//! same pieces and returns a [`Document`]. Write it with [`Wire::write`].
 //!
 //! The parser does not validate. It checks that a document is well formed,
 //! resolves the five predefined entities (`&lt;` and the rest) and character
@@ -25,18 +25,14 @@
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. Depth, name length, attribute count, namespace bindings and the
 //! size of the whole document are capped by the `MAX_` constants, and a
-//! document past a cap is an [`Error`], not a crash or a long stall. What a
-//! [`Writer`] writes, the [`Parser`] reads. Attribute defaults supplied
+//! document past a cap is an [`Error`], not a crash or a long stall. A
+//! [`Builder`] checks the same grammar as [`Events`]. Attribute defaults supplied
 //! from a DTD count toward the size cap too, so a short declaration used on
 //! many elements cannot grow the events past it.
 //!
-//! Use [`Events`] with [`codec::Stream`] for bounded event decoding.
-//! [`Document`] implements [`Wire`] for complete documents without losing bytes.
-//! The deprecated [`Parser`] keeps its original buffering and errors.
-//!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, finish, pump};
-//! use fictionet::stdlib::xml::{Event, Events, Writer};
+//! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+//! use fictionet::stdlib::xml::{Event, Events, Builder};
 //!
 //! let mut stream = Stream::new(Events::new());
 //! let body = br#"<?xml version="1.0"?>
@@ -68,23 +64,24 @@
 //! assert_eq!(currency.as_deref(), Some("EUR"));
 //! assert_eq!(text, "3 < 4");
 //!
-//! let mut w = Writer::new();
+//! let mut w = Builder::new();
 //! w.start("reply", &[("ok", "a\"b")]).unwrap();
 //! w.text("1 & 2").unwrap();
 //! w.end().unwrap();
-//! assert_eq!(w.finish().unwrap(), r#"<reply ok="a&quot;b">1 &amp; 2</reply>"#);
+//! assert_eq!(w.build().unwrap().to_bytes().unwrap(), br#"<reply ok="a&quot;b">1 &amp; 2</reply>"#);
 //! ```
 
 extern crate alloc;
+extern crate self as fictionet;
 
 use alloc::{
     format,
     string::{String, ToString},
     vec::Vec,
 };
-use super::codec::{self, Decode, Wire};
+use fictionet::stdlib::codec::{self, Decode, Wire};
 
-/// The largest document a [`Parser`] reads or a [`Writer`] writes, in
+/// The largest document [`Events`] reads or a [`Builder`] builds, in
 /// bytes.
 pub const MAX_DOCUMENT: usize = 4 << 20;
 /// The most elements that may be open at once.
@@ -211,7 +208,7 @@ pub enum Event {
     },
 }
 
-/// What is wrong with a document, or with what a [`Writer`] was asked to
+/// What is wrong with a document, or with what a [`Builder`] was asked to
 /// write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
@@ -260,14 +257,14 @@ pub enum ErrorKind {
     UndeclaredPrefix,
     /// A namespace declaration the Namespaces specification forbids, such
     /// as `xmlns:p=""` or binding `xmlns`, or an element named with the
-    /// `xmlns` prefix. A [`Writer`] also gives it for an event whose names
+    /// `xmlns` prefix. A [`Builder`] also gives it for an event whose names
     /// would read back in a different namespace.
     BadNamespace,
     /// The input ended inside markup, with elements still open, or before
     /// any root element.
     UnexpectedEnd,
     /// The document is longer than [`MAX_DOCUMENT`], or the attribute
-    /// defaults it supplies add up to more than that. For a [`Writer`], the
+    /// defaults it supplies add up to more than that. For a [`Builder`], the
     /// piece would not fit with the end tags of the open elements.
     TooLarge,
     /// More than [`MAX_DEPTH`] elements open at once, or groups in a DTD's
@@ -345,10 +342,22 @@ pub struct Document {
     pub data: Vec<u8>,
 }
 
+impl Document {
+    /// Reads this document's events, including resolved namespaces and
+    /// default attributes. Refuses the same syntax and limits as
+    /// [`Document::parse`], including a missing root or incomplete markup.
+    pub fn events(&self) -> Result<Vec<Event>, Error> {
+        parse(&self.data)
+    }
+}
+
 impl Wire for Document {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads a complete UTF-8 XML document and keeps its original bytes.
+    /// Refuses malformed markup, missing roots, extra roots, unsupported
+    /// entities or encodings, and any limit exceeded by [`Events`].
     fn parse(input: &[u8]) -> Result<Self, Error> {
         parse(input)?;
         Ok(Self {
@@ -356,6 +365,8 @@ impl Wire for Document {
         })
     }
 
+    /// Appends the original document bytes. Refuses invalid documents or
+    /// documents beyond the reader limits, leaving `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
         parse(&self.data)?;
         out.extend_from_slice(&self.data);
@@ -370,8 +381,8 @@ impl Wire for Document {
 /// text. Partial markup returns [`codec::Step::Need`]; an open element
 /// returns [`ErrorKind::UnexpectedEnd`]. Syntax and limit errors are terminal.
 /// Capacity is [`MAX_DOCUMENT`] plus one byte to detect overflow.
-/// Use [`codec::Stream`] for bounded buffering and one-time errors.
-/// An empty stream ends cleanly with no items, unlike [`parse`], while
+/// Drive it with [`Stream<Events>`](super::codec::Stream).
+/// An empty stream ends cleanly with no items, unlike [`Document::parse`], while
 /// whitespace-only input is an error.
 ///
 /// ```
@@ -527,33 +538,6 @@ impl Decode for Events {
     }
 }
 
-/// A pull parser. Feed it a document's bytes, in order and in pieces of any
-/// size, call [`Parser::finish`] when they end, and take events out until
-/// it has none.
-///
-/// The events and errors do not depend on how the bytes were split. A
-/// parser holds at most [`MAX_DOCUMENT`] bytes, and scans each byte a
-/// bounded number of times, however the input arrives.
-#[derive(Clone, Debug, Default)]
-#[deprecated(note = "use codec::Stream with xml::Events")]
-pub struct Parser {
-    buf: Vec<u8>,
-    /// Where the next token starts in `buf`.
-    start: usize,
-    /// The document offset of `buf[0]`.
-    base: usize,
-    /// How many bytes have been taken in.
-    total: usize,
-    overflow: bool,
-    finished: bool,
-    done: bool,
-    bom_checked: bool,
-    failed: Option<Error>,
-    pending: Option<Event>,
-    scan: Scan,
-    doc: Doc,
-}
-
 /// What kind of token starts the unread bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
@@ -567,7 +551,7 @@ enum Kind {
 }
 
 /// How far the search for the current token's end has gone, so a parser
-/// fed a byte at a time does not search the same bytes again.
+/// given one byte at a time does not search the same bytes again.
 #[derive(Clone, Copy, Debug, Default)]
 struct Scan {
     pos: usize,
@@ -575,182 +559,26 @@ struct Scan {
     state: u8,
 }
 
-/// What one step of the parser found.
-enum Step {
-    Event(Event),
-    Skip,
-    More,
-}
-
-#[allow(deprecated)] // Preserve the compatibility API.
-impl Parser {
-    /// A parser at the start of a document.
-    pub fn new() -> Parser {
-        Parser::default()
-    }
-
-    /// Adds the document's next bytes. Bytes past [`MAX_DOCUMENT`] are
-    /// dropped, and the parser gives [`ErrorKind::TooLarge`] once it has
-    /// read the rest. Bytes fed after an error or after
-    /// [`Parser::finish`] are dropped too.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_some() || self.finished || self.overflow {
-            return;
-        }
-        let room = MAX_DOCUMENT.saturating_sub(self.total);
-        let take = bytes.len().min(room);
-        if take < bytes.len() {
-            self.overflow = true;
-        }
-        self.buf.extend_from_slice(&bytes[..take]);
-        self.total += take;
-    }
-
-    /// Says the document has no more bytes. Markup or elements still open
-    /// then are an [`ErrorKind::UnexpectedEnd`].
-    pub fn finish(&mut self) {
-        self.finished = true;
-    }
-
-    /// Whether the whole document has been read, well formed, after
-    /// [`Parser::finish`].
-    pub fn is_done(&self) -> bool {
-        self.done
-    }
-
-    /// How many bytes are held, waiting to be read.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
-
-    /// The next event. It returns `None` when it needs more bytes, or when
-    /// the document is done, and keeps returning the same error once the
-    /// document has broken.
-    pub fn next_event(&mut self) -> Option<Result<Event, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        if let Some(ev) = self.pending.take() {
-            return Some(Ok(ev));
-        }
-        if self.done {
-            return None;
-        }
-        loop {
-            let offset = self.base + self.start;
-            match self.step() {
-                Ok(Step::Event(ev)) => return Some(Ok(ev)),
-                Ok(Step::Skip) => continue,
-                Ok(Step::More) => {
-                    if self.overflow {
-                        return Some(Err(self.fail(ErrorKind::TooLarge, offset)));
-                    }
-                    if !self.finished {
-                        return None;
-                    }
-                    if self.start < self.buf.len() {
-                        return Some(Err(self.fail(ErrorKind::UnexpectedEnd, offset)));
-                    }
-                    return match self.doc.finish() {
-                        Ok(()) => {
-                            self.done = true;
-                            self.buf = Vec::new();
-                            self.start = 0;
-                            None
-                        }
-                        Err(kind) => Some(Err(self.fail(kind, offset))),
-                    };
-                }
-                Err(kind) => return Some(Err(self.fail(kind, offset))),
-            }
-        }
-    }
-
-    fn fail(&mut self, kind: ErrorKind, offset: usize) -> Error {
-        let e = Error { kind, offset };
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.start = 0;
-        self.pending = None;
-        e
-    }
-
-    /// Takes `n` bytes as read and moves on to the next token.
-    fn consume(&mut self, n: usize) {
-        self.start += n;
-        self.scan = Scan::default();
-        if self.start == self.buf.len() {
-            self.base += self.start;
-            self.buf.clear();
-            self.start = 0;
-        } else if self.start > 4096 && self.start * 2 > self.buf.len() {
-            self.buf.drain(..self.start);
-            self.base += self.start;
-            self.start = 0;
-        }
-    }
-
-    /// Reads one token, if all of it is there.
-    fn step(&mut self) -> Result<Step, ErrorKind> {
-        // Past the size limit the input did not end; it was cut. A token
-        // still open then waits, and the caller gives TooLarge, whether or
-        // not finish came first.
-        let finished = self.finished && !self.overflow;
-        let rest = &self.buf[self.start..];
-        if rest.is_empty() {
-            return Ok(Step::More);
-        }
-        if !self.bom_checked {
-            match prefix_state(rest, b"\xEF\xBB\xBF") {
-                None if !finished => return Ok(Step::More),
-                Some(true) => {
-                    self.bom_checked = true;
-                    self.consume(3);
-                    return Ok(Step::Skip);
-                }
-                _ => self.bom_checked = true,
-            }
-        }
-        let kind = match token_kind(rest) {
-            Some(k) => k?,
-            None if finished => return Err(ErrorKind::UnexpectedEnd),
-            None => return Ok(Step::More),
-        };
-        let len = match find_end(rest, kind, &mut self.scan, finished)? {
-            Some(n) => n,
-            None if finished => return Err(ErrorKind::UnexpectedEnd),
-            None => return Ok(Step::More),
-        };
-        let tok = core::str::from_utf8(&rest[..len]).map_err(|_| ErrorKind::InvalidUtf8)?;
-        if !tok.chars().all(is_xml_char) {
-            return Err(ErrorKind::InvalidChar);
-        }
-        let empty = kind == Kind::StartTag && tok.ends_with("/>");
-        let event = read_token(&mut self.doc, kind, tok)?;
-        self.consume(len);
-        Ok(match event {
-            Some(Event::Start(start)) if empty => {
-                let name = self.doc.end(&start.name.qname())?;
-                self.pending = Some(Event::End(name));
-                Step::Event(Event::Start(start))
-            }
-            Some(ev) => Step::Event(ev),
-            None => Step::Skip,
-        })
-    }
-}
-
 /// Reads a whole document at once: its events, or the first error.
-#[allow(deprecated)] // Preserve the one-shot parser behavior.
-pub fn parse(document: &[u8]) -> Result<Vec<Event>, Error> {
-    let mut p = Parser::new();
-    p.feed(document);
-    p.finish();
+fn parse(document: &[u8]) -> Result<Vec<Event>, Error> {
+    let mut decoder = Events::new();
+    let mut rest = document;
     let mut events = Vec::new();
-    while let Some(ev) = p.next_event() {
-        events.push(ev?);
+    loop {
+        match decoder.decode(rest, true)? {
+            codec::Step::Item(event, used) => {
+                events.push(event);
+                rest = rest.get(used..).unwrap_or_default();
+            }
+            codec::Step::Skip(used) => rest = rest.get(used..).unwrap_or_default(),
+            codec::Step::Need | codec::Step::End => {
+                if !rest.is_empty() || !decoder.doc.root_seen {
+                    return Err(decoder.error(ErrorKind::UnexpectedEnd));
+                }
+                return Ok(events);
+            }
+        }
     }
-    Ok(events)
 }
 
 /// Whether `b` starts with `pat`: `None` if it is too short to say.
@@ -1996,35 +1824,30 @@ impl Doc {
 }
 
 /// Builds a document, checking each piece as it goes. A method that
-/// returns an error writes nothing, and the writer can go on. What
-/// [`Writer::finish`] returns, a [`Parser`] reads without error, and gives
-/// back the events written, with four exceptions. Whitespace outside the
+/// returns an error adds nothing, and the builder can go on. What
+/// [`Builder::build`] returns, [`Events`] reads without error, and gives
+/// back the events added, with four exceptions. Whitespace outside the
 /// root element gives no event. Text written in more than one call, with
 /// nothing between, reads back as one [`Event::Text`]. Carriage returns in
 /// comments, CDATA and processing instructions read back as newlines. And
 /// whitespace at the start of processing instruction data is dropped.
 ///
-/// A writer keeps room for the end tags of the elements open, so each one
+/// The builder keeps room for the end tags of the elements open, so each one
 /// can always be closed within [`MAX_DOCUMENT`]. It sizes each piece
 /// before it builds it, so a long string given to it costs no more memory
 /// than the room left.
 #[derive(Clone, Debug, Default)]
-pub struct Writer {
+pub struct Builder {
     out: String,
     doc: Doc,
     /// The bytes the end tags of the open elements will take.
     closing: usize,
 }
 
-impl Writer {
-    /// A writer with nothing written.
-    pub fn new() -> Writer {
-        Writer::default()
-    }
-
-    /// What has been written so far.
-    pub fn as_str(&self) -> &str {
-        &self.out
+impl Builder {
+    /// A builder with no document content.
+    pub fn new() -> Builder {
+        Builder::default()
     }
 
     /// How many elements are open.
@@ -2032,10 +1855,10 @@ impl Writer {
         self.doc.stack.len()
     }
 
-    /// The document, once its root element is closed.
-    pub fn finish(self) -> Result<String, ErrorKind> {
+    /// Returns the document. Refuses a missing root or any unclosed element.
+    pub fn build(self) -> Result<Document, ErrorKind> {
         self.doc.finish()?;
-        Ok(self.out)
+        Ok(Document { data: self.out.into_bytes() })
     }
 
     /// How many more bytes may be written, keeping room for the end tags.
@@ -2339,9 +2162,23 @@ fn escape(out: &mut String, s: &str, attr: bool, limit: usize) -> Result<(), Err
 }
 
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, pump};
+    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+
+    fn built_text(builder: Builder) -> Result<String, ErrorKind> {
+        let document = builder.build()?;
+        Ok(String::from_utf8(document.to_bytes().unwrap()).unwrap())
+    }
+
+    fn read_events(input: &[u8]) -> Result<Vec<Event>, Error> {
+        Document::parse(input)?.events()
+    }
+
+    fn check(input: &[u8]) {
+        contract::check_decode_with_alloc_limit(Events::new, input, 2 * (MAX_DOCUMENT + 1));
+    }
 
     #[test]
     fn codec_held_matches_state_fold() {
@@ -2451,18 +2288,14 @@ mod tests {
         let mut streamed = Duration::MAX;
         for _ in 0..3 {
             let start = Instant::now();
-            let events = parse(input).unwrap();
+            let events = read_events(input).unwrap();
             parsed = parsed.min(start.elapsed());
             let expected = events.len();
             drop(events);
 
             let start = Instant::now();
-            let mut stream = codec::Stream::new(Events::new());
-            let mut events = Vec::new();
-            for chunk in input.chunks(64 * 1024) {
-                codec::pump(&mut stream, chunk, |event| events.push(event)).unwrap();
-            }
-            codec::finish(&mut stream, |event| events.push(event)).unwrap();
+            let (events, error) = decode_all(Events::new, input);
+            assert_eq!(error, None);
             streamed = streamed.min(start.elapsed());
             assert_eq!(events.len(), expected);
         }
@@ -2472,46 +2305,9 @@ mod tests {
         );
     }
 
-    /// Feeds `chunks` in order, then finishes, taking events out after
-    /// each piece. It returns the events and the error, if any.
-    fn run<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (Vec<Event>, Option<Error>) {
-        let mut p = Parser::new();
-        let mut events = Vec::new();
-        let drain = |p: &mut Parser, events: &mut Vec<Event>| -> Option<Error> {
-            while let Some(ev) = p.next_event() {
-                match ev {
-                    Ok(e) => events.push(e),
-                    Err(e) => return Some(e),
-                }
-            }
-            None
-        };
-        for c in chunks {
-            p.feed(c);
-            if let Some(e) = drain(&mut p, &mut events) {
-                return (events, Some(e));
-            }
-        }
-        p.finish();
-        let err = drain(&mut p, &mut events);
-        if err.is_none() {
-            assert!(p.is_done());
-        }
-        (events, err)
-    }
-
-    fn whole(doc: &[u8]) -> (Vec<Event>, Option<Error>) {
-        run([doc])
-    }
-
-    fn bytewise(doc: &[u8]) -> (Vec<Event>, Option<Error>) {
-        run(doc.chunks(1))
-    }
-
     fn kind(doc: &str) -> ErrorKind {
-        let r = whole(doc.as_bytes());
-        assert_eq!(r, bytewise(doc.as_bytes()), "{doc:?}");
-        r.1.unwrap_or_else(|| panic!("no error in {doc:?}")).kind
+        check(doc.as_bytes());
+        read_events(doc.as_bytes()).unwrap_err().kind
     }
 
     fn name(local: &str) -> Name {
@@ -2528,7 +2324,7 @@ mod tests {
     fn hello_world() {
         // Section 2.8.
         let doc = b"<?xml version=\"1.0\"?><!DOCTYPE greeting SYSTEM \"hello.dtd\"><greeting>Hello, world!</greeting>";
-        let events = parse(doc).unwrap();
+        let events = read_events(doc).unwrap();
         assert_eq!(
             events,
             [
@@ -2541,17 +2337,17 @@ mod tests {
         );
         // The same with an internal subset, which is skipped.
         let doc = "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<!DOCTYPE greeting [\n  <!ELEMENT greeting (#PCDATA)>\n  <!-- a ] in a comment -->\n  <?pi ]> ?>\n  <!ATTLIST greeting a CDATA \"]>\">\n]>\n<greeting>Hello, world!</greeting>";
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         assert_eq!(events[1], Event::Doctype { name: "greeting".into() });
         assert_eq!(events[3], Event::Text("Hello, world!".into()));
-        assert_eq!(whole(doc.as_bytes()), bytewise(doc.as_bytes()));
+        check(doc.as_bytes());
     }
 
     #[test]
     fn comments_cdata_and_pis() {
         // Sections 2.5, 2.6 and 2.7.
         let doc = "<a><!-- declarations for <head> & <body> --><![CDATA[<greeting>Hello, world!</greeting>]]><?xml-stylesheet href=\"s.css\"?><?t?></a>";
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         assert_eq!(events[1], Event::Comment(" declarations for <head> & <body> ".into()));
         assert_eq!(events[2], Event::CData("<greeting>Hello, world!</greeting>".into()));
         assert_eq!(events[3], Event::Pi { target: "xml-stylesheet".into(), data: "href=\"s.css\"".into() });
@@ -2561,16 +2357,16 @@ mod tests {
 
     #[test]
     fn references_and_line_ends() {
-        let events = parse(b"<a>&lt;&gt;&amp;&apos;&quot;&#38;&#x41;&#x1F600;\r\nx\ry</a>").unwrap();
+        let events = read_events(b"<a>&lt;&gt;&amp;&apos;&quot;&#38;&#x41;&#x1F600;\r\nx\ry</a>").unwrap();
         assert_eq!(events[1], Event::Text("<>&'\"&A\u{1F600}\nx\ny".into()));
         // Section 3.3.3: attribute value normalization.
-        let events = parse(b"<a b=\"&#xd;&#xd;A&#xa;&#xa;B&#xd;&#xa;\" c=\"\r\n\nxyz\tq\"/>").unwrap();
+        let events = read_events(b"<a b=\"&#xd;&#xd;A&#xa;&#xa;B&#xd;&#xa;\" c=\"\r\n\nxyz\tq\"/>").unwrap();
         let Event::Start(s) = &events[0] else { panic!() };
         assert_eq!(s.attribute(None, "b"), Some("\r\rA\n\nB\r\n"));
         assert_eq!(s.attribute(None, "c"), Some("  xyz q"));
         assert_eq!(events[1], Event::End(name("a")));
         // A > in text and in attributes is fine; ]]> in text is not.
-        assert!(parse(b"<a b='>'>x > y</a>").is_ok());
+        assert!(read_events(b"<a b='>'>x > y</a>").is_ok());
         assert_eq!(kind("<a>x ]]> y</a>"), ErrorKind::CdataEndInText);
     }
 
@@ -2579,13 +2375,13 @@ mod tests {
     #[test]
     fn namespaces() {
         let doc = "<x xmlns:edi='http://ecommerce.example.org/schema'><lineItem edi:taxClass=\"exempt\">Baby food</lineItem></x>";
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         let Event::Start(s) = &events[1] else { panic!() };
         assert_eq!(s.attribute(Some("http://ecommerce.example.org/schema"), "taxClass"), Some("exempt"));
         assert_eq!(s.name.namespace, None);
         // A default namespace, and undeclaring it.
         let doc = "<html xmlns='http://www.w3.org/1999/xhtml'><p/><q xmlns=''><r/></q></html>";
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         let ns = |i: usize| match &events[i] {
             Event::Start(s) => s.name.namespace.clone(),
             Event::End(n) => n.namespace.clone(),
@@ -2598,15 +2394,15 @@ mod tests {
         assert_eq!(ns(7).as_deref(), Some("http://www.w3.org/1999/xhtml"));
         // Section 6.3: unique attributes.
         let ok = "<x xmlns:n1=\"http://www.w3.org\" xmlns=\"http://www.w3.org\"><good a=\"1\" b=\"2\"/><good a=\"1\" n1:a=\"2\"/></x>";
-        assert!(parse(ok.as_bytes()).is_ok());
+        assert!(read_events(ok.as_bytes()).is_ok());
         let bad = "<x xmlns:n1=\"http://www.w3.org\" xmlns:n2=\"http://www.w3.org\"><bad n1:a=\"1\" n2:a=\"2\"/></x>";
         assert_eq!(kind(bad), ErrorKind::DuplicateAttribute);
         assert_eq!(kind("<x><bad a=\"1\" a=\"2\"/></x>"), ErrorKind::DuplicateAttribute);
         // The xml prefix is always bound.
-        let events = parse(b"<a xml:lang='en'/>").unwrap();
+        let events = read_events(b"<a xml:lang='en'/>").unwrap();
         let Event::Start(s) = &events[0] else { panic!() };
         assert_eq!(s.attribute(Some(XML_NAMESPACE), "lang"), Some("en"));
-        assert!(parse(b"<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>").is_ok());
+        assert!(read_events(b"<a xmlns:xml='http://www.w3.org/XML/1998/namespace'/>").is_ok());
     }
 
     #[test]
@@ -2622,7 +2418,7 @@ mod tests {
         assert_eq!(kind(&format!("<a>&{};</a>", "e".repeat(MAX_NAME + 1))), ErrorKind::NameTooLong);
         // Production [66] puts no bound on a character reference's digits.
         let zeros = format!("<a b='&#{0}65;'>&#x{0}41;</a>", "0".repeat(1000));
-        let events = parse(zeros.as_bytes()).unwrap();
+        let events = read_events(zeros.as_bytes()).unwrap();
         assert_eq!(events[1], Event::Text("A".into()));
         assert_eq!(kind("<1a/>"), ErrorKind::BadName);
         assert_eq!(kind("<a:b:c/>"), ErrorKind::BadName);
@@ -2665,30 +2461,30 @@ mod tests {
         assert_eq!(kind("<a>"), ErrorKind::UnexpectedEnd);
         assert_eq!(kind("<a><!-- x"), ErrorKind::UnexpectedEnd);
         assert_eq!(kind(&format!("<{}/>", "a".repeat(MAX_NAME + 1))), ErrorKind::NameTooLong);
-        assert!(parse(format!("<{}/>", "a".repeat(MAX_NAME)).as_bytes()).is_ok());
+        assert!(read_events(format!("<{}/>", "a".repeat(MAX_NAME)).as_bytes()).is_ok());
         let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH + 1), "</a>".repeat(MAX_DEPTH + 1));
         assert_eq!(kind(&deep), ErrorKind::TooDeep);
         let deep = format!("{}{}", "<a>".repeat(MAX_DEPTH), "</a>".repeat(MAX_DEPTH));
-        assert!(parse(deep.as_bytes()).is_ok());
+        assert!(read_events(deep.as_bytes()).is_ok());
         let attrs: String = (0..=MAX_ATTRIBUTES).map(|i| format!(" a{i}=''")).collect();
         assert_eq!(kind(&format!("<a{attrs}/>")), ErrorKind::TooManyAttributes);
         let decls: String = (0..200).map(|i| format!(" xmlns:p{i}='u'")).collect();
         let many = format!("{}{}", format!("<a{decls}>").repeat(6), "</a>".repeat(6));
         assert_eq!(kind(&many), ErrorKind::TooManyNamespaces);
         // Bytes that are not UTF-8.
-        assert_eq!(whole(b"<a>\xff</a>").1.unwrap().kind, ErrorKind::InvalidUtf8);
+        assert_eq!(read_events(b"<a>\xff</a>").unwrap_err().kind, ErrorKind::InvalidUtf8);
         // Offsets point at the token that broke.
-        assert_eq!(whole(b"<a><b></c></a>").1, Some(Error { kind: ErrorKind::MismatchedEnd, offset: 6 }));
+        assert_eq!(decode_all(Events::new, b"<a><b></c></a>").1, Some(Fail::Protocol(Error { kind: ErrorKind::MismatchedEnd, offset: 6 })));
     }
 
     #[test]
     fn doctype_grammar() {
         // Section 2.8: S? may come before the internal subset.
-        let events = parse(b"<!DOCTYPE a[<!ELEMENT a ANY>]><a/>").unwrap();
+        let events = read_events(b"<!DOCTYPE a[<!ELEMENT a ANY>]><a/>").unwrap();
         assert_eq!(events[0], Event::Doctype { name: "a".into() });
-        assert!(parse(b"<!DOCTYPE a SYSTEM 'a.dtd'[]><a/>").is_ok());
-        assert!(parse(b"<!DOCTYPE a PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" 'x.dtd' ><a/>").is_ok());
-        assert!(parse(b"<!DOCTYPE a\n>\n<a/>").is_ok());
+        assert!(read_events(b"<!DOCTYPE a SYSTEM 'a.dtd'[]><a/>").is_ok());
+        assert!(read_events(b"<!DOCTYPE a PUBLIC \"-//W3C//DTD XHTML 1.0//EN\" 'x.dtd' ><a/>").is_ok());
+        assert!(read_events(b"<!DOCTYPE a\n>\n<a/>").is_ok());
         // An external identifier is SYSTEM or PUBLIC with its literals.
         assert_eq!(kind("<!DOCTYPE a junk><a/>"), ErrorKind::BadSyntax);
         assert_eq!(kind("<!DOCTYPE a 'x'><a/>"), ErrorKind::BadSyntax);
@@ -2700,27 +2496,27 @@ mod tests {
         assert_eq!(kind("<!DOCTYPE a SYSTEM 's' x [ ]><a/>"), ErrorKind::BadSyntax);
         // Namespaces in XML, section 5: the doctype's name is a QName.
         assert_eq!(kind("<!DOCTYPE a:b:c><a/>"), ErrorKind::BadName);
-        assert_eq!(Writer::new().doctype("a:b:c"), Err(ErrorKind::BadName));
+        assert_eq!(Builder::new().doctype("a:b:c"), Err(ErrorKind::BadName));
     }
 
     #[test]
-    fn writer_whitespace_outside_root() {
+    fn builder_whitespace_outside_root() {
         // A carriage return outside the root must stay a literal, since a
         // character reference there is not whitespace.
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         w.text("\r\n").unwrap();
         w.empty("a", &[]).unwrap();
         w.text(" \r\t").unwrap();
-        let out = w.finish().unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out, "\r\n<a/> \r\t");
-        assert_eq!(parse(out.as_bytes()).unwrap().len(), 2);
+        assert_eq!(read_events(out.as_bytes()).unwrap().len(), 2);
     }
 
     #[test]
     fn namespace_scope() {
         // An inner binding shadows an outer one until its element ends.
         let doc = "<a xmlns:p='u1'><b xmlns:p='u2'><p:c/></b><p:d/></a>";
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         let ns = |i: usize| match &events[i] {
             Event::Start(s) => s.name.namespace.clone(),
             _ => panic!(),
@@ -2728,20 +2524,20 @@ mod tests {
         assert_eq!(ns(2).as_deref(), Some("u2"));
         assert_eq!(ns(5).as_deref(), Some("u1"));
         // A tag that fails leaves no binding behind.
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         w.start("a", &[("xmlns:p", "u1")]).unwrap();
         assert_eq!(w.start("b", &[("xmlns:p", "u2"), ("q:x", "1")]), Err(ErrorKind::UndeclaredPrefix));
         assert_eq!(w.start("c", &[("xmlns", "u3"), ("x", "1"), ("x", "2")]), Err(ErrorKind::DuplicateAttribute));
         w.empty("p:d", &[]).unwrap();
         w.empty("e", &[]).unwrap();
         w.end().unwrap();
-        let events = parse(w.finish().unwrap().as_bytes()).unwrap();
+        let events = read_events(built_text(w).unwrap().as_bytes()).unwrap();
         let Event::Start(d) = &events[1] else { panic!() };
         assert_eq!(d.name.namespace.as_deref(), Some("u1"));
         let Event::Start(e) = &events[3] else { panic!() };
         assert_eq!(e.name.namespace, None);
         // Failed tags do not use up the binding limit either.
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         w.start("a", &[]).unwrap();
         let names: Vec<String> = (0..MAX_ATTRIBUTES).map(|i| format!("xmlns:p{i}")).collect();
         let attrs: Vec<(&str, &str)> = names.iter().map(|n| (n.as_str(), "u")).collect();
@@ -2756,6 +2552,7 @@ mod tests {
 
     #[test]
     fn shared_namespaces() {
+        let started = std::time::Instant::now();
         // A long URI, declared once, is shared by every name in it rather
         // than copied, so a short element does not cost the URI's length.
         let uri = "u".repeat(64 << 10);
@@ -2764,7 +2561,7 @@ mod tests {
             doc.push_str("<p:a p:b=''/><c/>");
         }
         doc.push_str("</p:r>");
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         assert_eq!(events.len(), 80_002);
         let namespace = |i: usize| match &events[i] {
             Event::Start(s) => s.name.namespace.clone().unwrap(),
@@ -2781,29 +2578,30 @@ mod tests {
                 assert!(Arc::ptr_eq(&p, a.name.namespace.as_ref().unwrap()));
             }
         }
+        assert_eq!(decode_all(Events::new, doc.as_bytes()), (events, None));
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
     }
 
     #[test]
     fn too_large() {
         let mut doc = b"<a>".to_vec();
         doc.resize(MAX_DOCUMENT + 10, b'x');
-        let r = whole(&doc);
-        assert_eq!(r.1.unwrap().kind, ErrorKind::TooLarge);
-        let r = run(doc.chunks(65536));
-        assert_eq!(r.1.unwrap().kind, ErrorKind::TooLarge);
+        let r = decode_all(Events::new, &doc);
+        assert_eq!(match r.1.unwrap() { Fail::Protocol(e) => e.kind, other => panic!("{other:?}") }, ErrorKind::TooLarge);
+        check(&doc);
         // A document just under the limit is fine.
         let mut doc = b"<a>".to_vec();
         doc.resize(MAX_DOCUMENT - 4, b'x');
         doc.extend_from_slice(b"</a>");
-        let events = parse(&doc).unwrap();
+        let events = read_events(&doc).unwrap();
         assert_eq!(events.len(), 3);
     }
 
     #[test]
     fn byte_order_mark() {
         let doc = b"\xEF\xBB\xBF<?xml version='1.0'?><a/>";
-        assert_eq!(whole(doc), bytewise(doc));
-        assert!(whole(doc).1.is_none());
+        check(doc);
+        assert!(decode_all(Events::new, doc).1.is_none());
         assert_eq!(kind("\u{FEFF}\u{FEFF}<a/>"), ErrorKind::OutsideRoot);
     }
 
@@ -2812,39 +2610,36 @@ mod tests {
     #[test]
     fn truncated_prefixes() {
         let full = SAMPLE.as_bytes();
-        let (events, err) = whole(full);
+        let (events, err) = decode_all(Events::new, full);
         assert_eq!(err, None);
         for n in 0..full.len() {
-            let (got, err) = whole(&full[..n]);
-            assert!(err.is_some(), "prefix of {n} bytes read as a document");
+            let (got, err) = decode_all(Events::new, &full[..n]);
+            assert!(err.is_some() || n == 0, "prefix of {n} bytes read as a document");
             assert!(got.len() <= events.len(), "{n}");
             // Without finishing, a prefix gives no error, and a prefix of the
             // events.
-            let mut p = Parser::new();
-            p.feed(&full[..n]);
+            let mut stream = Stream::new(Events::new());
             let mut part = Vec::new();
-            while let Some(ev) = p.next_event() {
-                part.push(ev.unwrap());
-            }
+            pump(&mut stream, &full[..n], |event| part.push(event)).unwrap();
             assert!(events.starts_with(&part), "{n}");
         }
     }
 
     #[test]
     fn round_trip() {
-        let (events, err) = whole(SAMPLE.as_bytes());
+        let (events, err) = decode_all(Events::new, SAMPLE.as_bytes());
         assert_eq!(err, None);
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         for e in &events {
             w.event(e).unwrap();
         }
-        let out = w.finish().unwrap();
-        assert_eq!(parse(out.as_bytes()).unwrap(), events);
+        let out = built_text(w).unwrap();
+        assert_eq!(read_events(out.as_bytes()).unwrap(), events);
     }
 
     #[test]
-    fn writer() {
-        let mut w = Writer::new();
+    fn builder() {
+        let mut w = Builder::new();
         w.declaration().unwrap();
         assert_eq!(w.declaration(), Err(ErrorKind::BadDeclaration));
         w.doctype("r").unwrap();
@@ -2871,42 +2666,29 @@ mod tests {
         w.pi("go", "now").unwrap();
         assert_eq!(w.depth(), 1);
         let unfinished = w.clone();
-        assert_eq!(unfinished.finish(), Err(ErrorKind::UnexpectedEnd));
+        assert_eq!(unfinished.build(), Err(ErrorKind::UnexpectedEnd));
         w.end().unwrap();
         assert_eq!(w.start("again", &[]), Err(ErrorKind::OutsideRoot));
         w.text("\n").unwrap();
-        let out = w.finish().unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(
             out,
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?><!DOCTYPE r><!-- hi --><r xmlns:p=\"urn:p\" a=\"&lt;&quot;&amp;'&#9;&#10;&#13;&gt;\"><p:e/>]]&gt; &amp; &lt;&#13;<![CDATA[<raw>]]><?go now?></r>\n"
         );
-        let events = parse(out.as_bytes()).unwrap();
+        let events = read_events(out.as_bytes()).unwrap();
         let Event::Start(s) = &events[3] else { panic!() };
         assert_eq!(s.attribute(None, "a"), Some("<\"&'\t\n\r>"));
         assert_eq!(events[6], Event::Text("]]> & <\r".into()));
         // A writer stops at the size limit.
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         w.start("a", &[]).unwrap();
         let big = "x".repeat(MAX_DOCUMENT);
         assert_eq!(w.text(&big), Err(ErrorKind::TooLarge));
         w.text(&big[..MAX_DOCUMENT - 7]).unwrap();
         w.end().unwrap();
-        let out = w.finish().unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out.len(), MAX_DOCUMENT);
-        assert!(parse(out.as_bytes()).is_ok());
-    }
-
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
+        assert!(read_events(out.as_bytes()).is_ok());
     }
 
     const PIECES: &[&str] = &[
@@ -2959,45 +2741,46 @@ mod tests {
 
     fn random_doc(rng: &mut Lcg) -> Vec<u8> {
         let mut doc = Vec::new();
-        if rng.below(2) == 0 {
+        if rng.coin() {
             doc.extend_from_slice(b"<a>");
         }
-        for _ in 0..rng.below(30) {
-            if rng.below(10) == 0 {
+        for _ in 0..rng.index(30) {
+            if rng.index(10) == 0 {
                 doc.push(rng.next() as u8);
             } else {
-                doc.extend_from_slice(PIECES[rng.below(PIECES.len())].as_bytes());
+                doc.extend_from_slice(PIECES[rng.index(PIECES.len())].as_bytes());
             }
         }
-        if rng.below(2) == 0 {
+        if rng.coin() {
             doc.extend_from_slice(b"</a>");
         }
         doc
     }
 
     #[test]
-    fn fuzz() {
-        let mut rng = Lcg(7);
+    fn generated_and_mutated_values() {
+        let mut rng = Lcg::new(7);
         let mut good = 0;
         for _ in 0..5000 {
             let doc = random_doc(&mut rng);
-            let (events, err) = whole(&doc);
-            assert_eq!((events.clone(), err), bytewise(&doc), "{:?}", String::from_utf8_lossy(&doc));
-            // Split at random places too.
-            let cut = rng.below(doc.len() + 1);
-            assert_eq!((events.clone(), err), run([&doc[..cut], &doc[cut..]]));
-            if err.is_none() {
+            let (events, err) = decode_all(Events::new, &doc);
+            check(&doc);
+            contract::check_wire::<Document>(&doc);
+            let mut changed = doc.clone();
+            mutate(&mut rng, &mut changed);
+            check(&changed);
+            if err.is_none() && !events.is_empty() {
                 good += 1;
-                let mut w = Writer::new();
+                let mut w = Builder::new();
                 for e in &events {
                     w.event(e).unwrap();
                 }
-                let out = w.finish().unwrap();
-                assert_eq!(parse(out.as_bytes()).unwrap(), events, "{out:?}");
+                let out = built_text(w).unwrap();
+                assert_eq!(read_events(out.as_bytes()).unwrap(), events, "{out:?}");
             }
             // Whatever a writer accepts, a parser reads.
             let s = String::from_utf8_lossy(&doc).into_owned();
-            let mut w = Writer::new();
+            let mut w = Builder::new();
             let _ = w.pi("t", &s);
             let _ = w.comment(&s);
             let _ = w.start("r", &[("v", &s), ("xmlns:q", &s)]);
@@ -3011,8 +2794,8 @@ mod tests {
             }
             let _ = w.text(&s);
             let _ = w.text(&s.replace(|c: char| !c.is_ascii_whitespace(), "\r"));
-            if let Ok(out) = w.finish() {
-                assert!(parse(out.as_bytes()).is_ok(), "{out:?}");
+            if let Ok(out) = built_text(w) {
+                assert!(read_events(out.as_bytes()).is_ok(), "{out:?}");
             }
         }
         assert!(good > 100, "only {good} well-formed documents");
@@ -3031,7 +2814,7 @@ mod tests {
             }
             doc.push_str("</r>");
             let begin = std::time::Instant::now();
-            assert!(parse(doc.as_bytes()).is_ok());
+            assert!(read_events(doc.as_bytes()).is_ok());
             begin.elapsed()
         };
         // The same document with one prefixed attribute per tag, which
@@ -3047,13 +2830,13 @@ mod tests {
     }
 
     #[test]
-    fn writer_escapes_within_the_limit() {
+    fn builder_escapes_within_the_limit() {
         // Escaping stops once the piece passes the room left, rather than
         // building all of it first.
         let mut out = String::new();
         assert_eq!(escape(&mut out, &"&".repeat(1 << 20), false, 100), Err(ErrorKind::TooLarge));
         assert!(out.len() <= 100 + 6, "{}", out.len());
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         w.start("r", &[]).unwrap();
         assert_eq!(w.text(&"&".repeat(MAX_DOCUMENT)), Err(ErrorKind::TooLarge));
         assert_eq!(w.comment(&"x".repeat(MAX_DOCUMENT)), Err(ErrorKind::TooLarge));
@@ -3066,7 +2849,7 @@ mod tests {
         assert_eq!(w.start(&long, &[]), Err(ErrorKind::NameTooLong));
         assert_eq!(w.start("x", &[(&long, "")]), Err(ErrorKind::NameTooLong));
         w.end().unwrap();
-        assert!(parse(w.finish().unwrap().as_bytes()).is_ok());
+        assert!(read_events(built_text(w).unwrap().as_bytes()).is_ok());
     }
 
     #[test]
@@ -3085,9 +2868,9 @@ mod tests {
             "<!DOCTYPE r []><r/>",
         ];
         for doc in ok {
-            let r = whole(doc.as_bytes());
+            let r = decode_all(Events::new, doc.as_bytes());
             assert_eq!(r.1, None, "{doc}");
-            assert_eq!(r, bytewise(doc.as_bytes()), "{doc}");
+            check(doc.as_bytes());
         }
         let bad = [
             ("<!DOCTYPE r [garbage]><r/>", ErrorKind::BadSyntax),
@@ -3113,7 +2896,7 @@ mod tests {
         }
         // Content models nest, up to a limit.
         let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(MAX_DEPTH), ")".repeat(MAX_DEPTH));
-        assert!(parse(nested.as_bytes()).is_ok());
+        assert!(read_events(nested.as_bytes()).is_ok());
         let nested = format!("<!DOCTYPE r [<!ELEMENT r {}a{}>]><r/>", "(".repeat(100_000), ")".repeat(100_000));
         assert_eq!(kind(&nested), ErrorKind::TooDeep);
     }
@@ -3122,19 +2905,19 @@ mod tests {
     fn attribute_declarations() {
         // Section 3.3.2: a declared default is supplied, and it can declare
         // a namespace.
-        let events = parse(b"<!DOCTYPE r [<!ATTLIST r xmlns CDATA 'urn:r' a CDATA 'x'>]><r a='y'/>").unwrap();
+        let events = read_events(b"<!DOCTYPE r [<!ATTLIST r xmlns CDATA 'urn:r' a CDATA 'x'>]><r a='y'/>").unwrap();
         let Event::Start(s) = &events[1] else { panic!() };
         assert_eq!(s.name.namespace.as_deref(), Some("urn:r"));
         assert_eq!(s.attribute(None, "a"), Some("y"));
         assert_eq!(s.attribute(Some(XMLNS_NAMESPACE), "xmlns"), Some("urn:r"));
-        let events = parse(b"<!DOCTYPE p:r [<!ATTLIST p:r xmlns:p CDATA 'urn:r'>]><p:r/>").unwrap();
+        let events = read_events(b"<!DOCTYPE p:r [<!ATTLIST p:r xmlns:p CDATA 'urn:r'>]><p:r/>").unwrap();
         let Event::Start(s) = &events[1] else { panic!() };
         assert_eq!(s.name.namespace.as_deref(), Some("urn:r"));
         // Section 3.3.3: values of a tokenized type lose leading, trailing
         // and repeated spaces, defaults and written values alike. The first
         // declaration of an attribute is the one that counts.
         let doc = "<!DOCTYPE r [<!ATTLIST r t NMTOKENS ' a  b ' c CDATA ' a  b '><!ATTLIST r t CDATA 'z' u CDATA 'v'>]><r><r t=' x&#32; y\t'/></r>";
-        let events = parse(doc.as_bytes()).unwrap();
+        let events = read_events(doc.as_bytes()).unwrap();
         let Event::Start(s) = &events[1] else { panic!() };
         assert_eq!(s.attribute(None, "t"), Some("a b"));
         assert_eq!(s.attribute(None, "c"), Some(" a  b "));
@@ -3142,7 +2925,7 @@ mod tests {
         let Event::Start(s) = &events[2] else { panic!() };
         assert_eq!(s.attribute(None, "t"), Some("x y"));
         // #IMPLIED and #REQUIRED supply nothing.
-        let events = parse(b"<!DOCTYPE r [<!ATTLIST r a CDATA #IMPLIED b CDATA #REQUIRED>]><r/>").unwrap();
+        let events = read_events(b"<!DOCTYPE r [<!ATTLIST r a CDATA #IMPLIED b CDATA #REQUIRED>]><r/>").unwrap();
         let Event::Start(s) = &events[1] else { panic!() };
         assert!(s.attributes.is_empty());
         // A default naming an undeclared prefix is an error where it is used.
@@ -3150,12 +2933,15 @@ mod tests {
         // What a parser read with defaults, a writer writes and a parser
         // reads back the same.
         let doc = "<!DOCTYPE r [<!ATTLIST r xmlns CDATA 'urn:r' t NMTOKENS ' a  b '>]><r/>";
-        let events = parse(doc.as_bytes()).unwrap();
-        let mut w = Writer::new();
+        let events = read_events(doc.as_bytes()).unwrap();
+        let mut w = Builder::new();
         for e in &events {
             w.event(e).unwrap();
         }
-        assert_eq!(parse(w.finish().unwrap().as_bytes()).unwrap(), events);
+        assert_eq!(
+            read_events(built_text(w).unwrap().as_bytes()).unwrap(),
+            events
+        );
     }
 
     #[test]
@@ -3174,47 +2960,35 @@ mod tests {
         assert_eq!(kind(&format!("<!DOCTYPE r [<!ATTLIST r{defs}>]><r/>")), ErrorKind::TooManyAttributes);
         // The same declaration repeated counts once.
         let defs = " a CDATA #IMPLIED".repeat(MAX_ATTRIBUTES * 4);
-        assert!(parse(format!("<!DOCTYPE r [<!ATTLIST r{defs}>]><r/>").as_bytes()).is_ok());
+        assert!(read_events(format!("<!DOCTYPE r [<!ATTLIST r{defs}>]><r/>").as_bytes()).is_ok());
     }
 
     #[test]
-    fn overflow_does_not_depend_on_finish() {
-        // A document past the limit gives the same events and error whether
-        // the parser was told it ended before or after reading.
+    fn overflow_does_not_depend_on_eof() {
         for tail in ["<!--", "", "<a b='"] {
             for extra in [0usize, 1, 2] {
                 let mut doc = format!("<r>{tail}").into_bytes();
                 doc.resize(MAX_DOCUMENT - 1 + extra, b'x');
-                let streamed = whole(&doc);
-                let mut p = Parser::new();
-                p.feed(&doc);
-                p.finish();
-                let mut events = Vec::new();
-                let mut err = None;
-                while let Some(ev) = p.next_event() {
-                    match ev {
-                        Ok(e) => events.push(e),
-                        Err(e) => {
-                            err = Some(e);
-                            break;
-                        }
-                    }
-                }
-                assert_eq!((events, err), streamed, "{tail:?} {extra}");
-                if extra > 1 {
-                    assert_eq!(streamed.1.unwrap().kind, ErrorKind::TooLarge);
-                }
+                check(&doc);
+                let (_, error) = decode_all(Events::new, &doc);
+                let expected = if extra > 1 {
+                    Error { kind: ErrorKind::TooLarge, offset: 3 }
+                } else {
+                    let offset = if tail.is_empty() { doc.len() } else { 3 };
+                    Error { kind: ErrorKind::UnexpectedEnd, offset }
+                };
+                assert_eq!(error, Some(Fail::Protocol(expected)));
             }
         }
     }
 
     #[test]
-    fn writer_keeps_namespaces() {
+    fn builder_keeps_namespaces() {
         // An event's names carry namespaces; a writer that cannot give a name
         // the same namespace refuses it rather than change it.
         let ns = |u: &str| Some(Arc::<str>::from(u));
         let r = Name { prefix: None, local: "r".into(), namespace: ns("urn:r") };
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         let start = Event::Start(Start { name: r.clone(), attributes: vec![] });
         assert_eq!(w.event(&start), Err(ErrorKind::BadNamespace));
         assert_eq!(w.depth(), 0);
@@ -3230,22 +3004,22 @@ mod tests {
         assert_eq!(w.depth(), 1);
         assert_eq!(w.event(&Event::End(name("r"))), Err(ErrorKind::BadNamespace));
         w.event(&Event::End(r)).unwrap();
-        let out = w.finish().unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out, "<r xmlns=\"urn:r\"></r>");
         // A failed start leaves nothing behind: the document can still have
         // its root.
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         assert_eq!(w.event(&start), Err(ErrorKind::BadNamespace));
         w.start("r", &[]).unwrap();
         w.end().unwrap();
-        assert!(w.finish().is_ok());
+        assert!(w.build().is_ok());
     }
 
     #[test]
-    fn writer_reserves_end_tags() {
+    fn builder_reserves_end_tags() {
         // Every element a writer opened can be closed: room for the end
         // tags is kept back.
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         w.start("r", &[]).unwrap();
         w.start("s", &[]).unwrap();
         assert_eq!(w.text(&"x".repeat(MAX_DOCUMENT - 3 - 3)), Err(ErrorKind::TooLarge));
@@ -3254,13 +3028,13 @@ mod tests {
         assert_eq!(w.empty("t", &[]), Err(ErrorKind::TooLarge));
         w.end().unwrap();
         w.end().unwrap();
-        let out = w.finish().unwrap();
+        let out = built_text(w).unwrap();
         assert_eq!(out.len(), MAX_DOCUMENT);
-        assert!(parse(out.as_bytes()).is_ok());
+        assert!(read_events(out.as_bytes()).is_ok());
         // The fuzz target's case: spaces escape to nothing longer, and the
         // closing loop must not fail.
         let s = " ".repeat(838_853);
-        let mut w = Writer::new();
+        let mut w = Builder::new();
         let _ = w.comment(&s);
         let _ = w.start("r", &[("v", &s), ("xmlns:q", &s)]);
         let _ = w.start(&s, &[(&s, "x")]);
@@ -3270,6 +3044,6 @@ mod tests {
         while w.depth() > 0 {
             w.end().unwrap();
         }
-        assert!(parse(w.finish().unwrap().as_bytes()).is_ok());
+        assert!(read_events(built_text(w).unwrap().as_bytes()).is_ok());
     }
 }

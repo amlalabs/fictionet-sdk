@@ -7,8 +7,7 @@
 //! The wire type says how long the value is: a varint, 4 bytes, 8 bytes,
 //! a length and that many bytes, or a group of fields closed by an end tag.
 //! This module follows the encoding documentation at
-//! <https://protobuf.dev/programming-guides/encoding/>, and the gRPC
-//! message framing in the gRPC over HTTP/2 protocol document.
+//! <https://protobuf.dev/programming-guides/encoding/>.
 //!
 //! The wire format does not say what a field means. A varint may be an
 //! `int32`, a `bool` or an enum, and length-delimited bytes may be a
@@ -20,33 +19,25 @@
 //! the last scalar wins, embedded messages merge, and repeated numbers may
 //! come packed or one by one.
 //!
-//! Nothing here reads a socket. A world that plays a gRPC server takes
-//! the request body from its HTTP/2 stream, feeds it to [`Frames`] through
-//! [`super::codec::Stream`],
-//! parses each [`Frame`]'s data as a [`Message`], and writes the reply's
-//! bytes back. Every reader checks lengths and limits, because the agent
-//! can send any bytes it likes. Messages are capped at [`MAX_MESSAGE`]
-//! bytes and [`MAX_FIELDS`] fields, and groups and embedded messages nest
-//! at most [`MAX_DEPTH`] deep. Writers keep to the same limits, so whatever they write, the
-//! parser reads back.
-//!
-//! Use [`Frames`] with [`super::codec::Stream`] for bounded framing.
-//! [`Wire`] reads complete messages, gRPC frames, and [`DelimitedFrame`]s.
-//! The deprecated [`Decoder`] keeps its original buffering and errors.
+//! Nothing here reads a socket. Use [`Stream<Frames>`](super::codec::Stream)
+//! for varint-delimited messages. For gRPC, use
+//! [`grpc::Messages`](super::grpc::Messages) and parse each uncompressed
+//! payload as a [`Message`]. Write replies with [`Wire::write`].
+//! Messages are capped at [`MAX_MESSAGE`] bytes and [`MAX_FIELDS`] fields.
+//! Groups and embedded messages nest at most [`MAX_DEPTH`] deep.
 //!
 //! ```
-//! use fictionet::stdlib::codec::{Stream, finish, pump};
-//! use fictionet::stdlib::protobuf::{Frame, Frames, Framing, Message};
+//! use fictionet::stdlib::codec::{Stream, Wire, finish, pump};
+//! use fictionet::stdlib::protobuf::{Frame, Frames, Message};
 //!
-//! // A gRPC request carrying `{ name: "tank-3", level: 150 }`, where
+//! // A delimited request carrying `{ name: "tank-3", level: 150 }`, where
 //! // name is field 1 (a string) and level is field 2 (an int32).
-//! let mut stream = Stream::new(Frames::new(Framing::Grpc));
-//! let bytes = [0, 0, 0, 0, 11, 0x0a, 6, b't', b'a', b'n', b'k', b'-', b'3', 0x10, 0x96, 0x01];
+//! let mut stream = Stream::new(Frames::new());
+//! let bytes = [11, 0x0a, 6, b't', b'a', b'n', b'k', b'-', b'3', 0x10, 0x96, 0x01];
 //! let mut frames = Vec::new();
 //! pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
 //! finish(&mut stream, |frame| frames.push(frame)).unwrap();
 //! let frame = frames.pop().unwrap();
-//! assert!(!frame.compressed);
 //! let request = Message::parse(&frame.data).unwrap();
 //! assert_eq!(request.string(1), Ok(Some("tank-3")));
 //! assert_eq!(request.int32(2), Some(150));
@@ -57,14 +48,15 @@
 //! reply.push_packed_varints(2, &[3, 270]);
 //! let data = reply.to_bytes().unwrap();
 //! assert_eq!(data, [0x08, 0x01, 0x12, 0x03, 0x03, 0x8e, 0x02]);
-//! let bytes = Frame { compressed: false, data }.to_bytes(Framing::Grpc).unwrap();
-//! assert_eq!(bytes[..5], [0, 0, 0, 0, 7]);
+//! let bytes = Frame { data }.to_bytes().unwrap();
+//! assert_eq!(bytes[0], 7);
 //! ```
 
 extern crate alloc;
+extern crate self as fictionet;
 
 use alloc::vec::Vec;
-use super::codec::{Decode, Step, Wire};
+use fictionet::stdlib::codec::{Decode, Step, Wire};
 
 /// The largest message, in bytes, that this module reads or writes. It is
 /// the default limit on a received message in gRPC (4 MiB).
@@ -81,13 +73,6 @@ pub const MAX_DEPTH: usize = 100;
 pub const MAX_FIELD_NUMBER: u32 = (1 << 29) - 1;
 /// The longest varint, in bytes. Ten bytes hold 64 bits.
 pub const MAX_VARINT_LEN: usize = 10;
-/// The length of the header gRPC puts before each message: a flag byte
-/// and a 4-byte length.
-pub const GRPC_HEADER_LEN: usize = 5;
-/// The most bytes a [`Decoder`] holds that have not yet been taken out as
-/// frames: room for two of the largest gRPC frames.
-pub const MAX_BUFFERED: usize = 2 * (GRPC_HEADER_LEN + MAX_MESSAGE);
-
 /// The wire types a tag can carry.
 pub mod wire_type {
     /// A varint: `int32`, `int64`, `uint32`, `uint64`, `sint32`, `sint64`,
@@ -98,9 +83,9 @@ pub mod wire_type {
     /// A varint length, then that many bytes: strings, bytes, embedded
     /// messages and packed repeated fields.
     pub const LEN: u8 = 2;
-    /// The start of a group (deprecated).
+    /// The start of a group, which the protobuf encoding marks as deprecated.
     pub const SGROUP: u8 = 3;
-    /// The end of a group (deprecated).
+    /// The end of a group, which the protobuf encoding marks as deprecated.
     pub const EGROUP: u8 = 4;
     /// Four bytes: `fixed32`, `sfixed32` and `float`.
     pub const I32: u8 = 5;
@@ -131,11 +116,11 @@ pub enum Error {
     TooDeep,
     /// A string field was not UTF-8.
     Utf8,
-    /// A gRPC frame's flag byte was not 0 or 1.
-    Flag(u8),
-    /// A compressed frame was to be written with [`Framing::Delimited`],
-    /// which has no way to say so.
-    Compressed,
+    /// Bytes followed an exact varint or frame.
+    Trailing {
+        /// Bytes after the complete value.
+        remaining: usize,
+    },
 }
 
 impl core::fmt::Display for Error {
@@ -151,8 +136,9 @@ impl core::fmt::Display for Error {
             Error::TooManyFields => write!(f, "protobuf: more than {MAX_FIELDS} fields"),
             Error::TooDeep => write!(f, "protobuf: groups nest deeper than {MAX_DEPTH}"),
             Error::Utf8 => write!(f, "protobuf: a string is not UTF-8"),
-            Error::Flag(b) => write!(f, "gRPC: flag byte {b} is not 0 or 1"),
-            Error::Compressed => write!(f, "protobuf: delimited framing cannot mark compression"),
+            Error::Trailing { remaining } => {
+                write!(f, "protobuf: trailing bytes after the value: {remaining}")
+            }
         }
     }
 }
@@ -179,12 +165,40 @@ pub fn decode_varint(b: &[u8]) -> Result<(u64, usize), Error> {
 }
 
 /// Appends `v` to `out` as a varint, in the shortest form.
-pub fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
+fn encode_varint(mut v: u64, out: &mut Vec<u8>) {
     while v >= 0x80 {
         out.push((v as u8 & 0x7f) | 0x80);
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+/// One unsigned base-128 integer, with no trailing bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Varint(
+    /// The integer value.
+    pub u64,
+);
+
+impl Wire for Varint {
+    type ParseError = Error;
+    type WriteError = core::convert::Infallible;
+
+    /// Reads one varint, including overlong zero groups. Refuses truncated
+    /// input, values beyond 64 bits, and trailing bytes.
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        let (value, used) = decode_varint(input)?;
+        if used != input.len() {
+            return Err(Error::Trailing { remaining: input.len().saturating_sub(used) });
+        }
+        Ok(Self(value))
+    }
+
+    /// Appends the shortest encoding. Every `u64` is writable; no value is refused.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Self::WriteError> {
+        encode_varint(self.0, out);
+        Ok(())
+    }
 }
 
 /// Maps a signed 64-bit number onto an unsigned one, so that small
@@ -260,11 +274,6 @@ impl Message {
         Message::default()
     }
 
-    /// Reads a whole message from `b`. Every byte must belong to a field.
-    pub fn parse(b: &[u8]) -> Result<Message, Error> {
-        Message::parse_at(b, 0)
-    }
-
     /// Reads a message that sits `depth` levels inside others, so that
     /// groups inside it count toward [`MAX_DEPTH`] from there. A world that
     /// walks embedded messages by hand passes the depth it has reached.
@@ -278,17 +287,6 @@ impl Message {
         let mut pos = 0;
         let mut count = 0;
         parse_fields(b, &mut pos, depth, None, &mut count)
-    }
-
-    /// The message's bytes. It fails if a field number is out of range,
-    /// or the message breaks [`MAX_MESSAGE`], [`MAX_FIELDS`] or
-    /// [`MAX_DEPTH`], so that [`Message::parse`] reads back whatever this
-    /// writes.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut out = Vec::new();
-        let mut count = 0;
-        write_fields(self, 0, &mut out, &mut count)?;
-        Ok(out)
     }
 
     /// Every value with field number `number`, in order.
@@ -780,153 +778,55 @@ fn write_fields(m: &Message, depth: usize, out: &mut Vec<u8>, count: &mut usize)
     Ok(())
 }
 
-/// How messages are marked off in a stream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Framing {
-    /// gRPC's framing: a flag byte (1 if the message is compressed), a
-    /// 4-byte big-endian length, then the message.
-    Grpc,
-    /// A varint length, then the message, as the protobuf libraries'
-    /// delimited readers and writers do.
-    Delimited,
-}
-
-/// One message taken from a stream, still as bytes.
-/// Its [`Wire`] form uses gRPC framing to preserve the compression flag;
-/// [`DelimitedFrame`] fixes the wire form to a varint length instead.
+/// One varint-delimited message, still as bytes.
+/// For gRPC framing use [`grpc::Message`](super::grpc::Message).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Frame {
-    /// Whether the sender compressed the message. This module does not
-    /// decompress; a world that accepts compression does that itself.
-    /// Always false with [`Framing::Delimited`].
-    pub compressed: bool,
-    /// The message's bytes.
+    /// The message bytes, bounded by [`MAX_MESSAGE`] on read and write.
     pub data: Vec<u8>,
 }
 
 impl Frame {
-    /// Reads the frame at the start of `b`. It returns `Ok(None)` if `b`
-    /// holds only part of one, and otherwise the frame and how many bytes
-    /// of `b` it took.
-    pub fn parse(framing: Framing, b: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
-        let (compressed, len, start) = match framing {
-            Framing::Grpc => {
-                let Some(&flag) = b.first() else { return Ok(None) };
-                if flag > 1 {
-                    return Err(Error::Flag(flag));
-                }
-                let Some(h) = b.get(1..GRPC_HEADER_LEN) else { return Ok(None) };
-                let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
-                (flag == 1, u64::from(len), GRPC_HEADER_LEN)
-            }
-            Framing::Delimited => match decode_varint(b) {
-                Ok((len, n)) => (false, len, n),
-                Err(Error::Truncated) => return Ok(None),
-                Err(e) => return Err(e),
-            },
-        };
-        if len > MAX_MESSAGE as u64 {
-            return Err(Error::TooLong);
-        }
-        let end = start + len as usize;
-        let Some(data) = b.get(start..end) else { return Ok(None) };
-        Ok(Some((Frame { compressed, data: data.to_vec() }, end)))
-    }
-
-    /// The frame's bytes. It fails if the data is longer than
-    /// [`MAX_MESSAGE`], or if a compressed frame is to be written with
-    /// [`Framing::Delimited`].
-    pub fn to_bytes(&self, framing: Framing) -> Result<Vec<u8>, Error> {
-        if self.data.len() > MAX_MESSAGE {
-            return Err(Error::TooLong);
-        }
-        let mut out = Vec::with_capacity(GRPC_HEADER_LEN + self.data.len());
-        match framing {
-            Framing::Grpc => {
-                out.push(u8::from(self.compressed));
-                out.extend_from_slice(&(self.data.len() as u32).to_be_bytes());
-            }
-            Framing::Delimited => {
-                if self.compressed {
-                    return Err(Error::Compressed);
-                }
-                encode_varint(self.data.len() as u64, &mut out);
-            }
-        }
-        out.extend_from_slice(&self.data);
-        Ok(out)
+    /// Wraps a message for a delimited stream. Refuses messages that cannot
+    /// be written under the field, size, or nesting limits.
+    pub fn from_message(message: &Message) -> Result<Self, Error> {
+        Ok(Self { data: message.to_bytes()? })
     }
 }
 
-/// Why an exact framed parse failed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FrameParseError {
-    /// Invalid framing or incomplete input.
-    Frame(Error),
-    /// Bytes followed the first complete frame.
-    Trailing {
-        /// The number of bytes after the frame.
-        remaining: usize,
-    },
-}
-
-impl core::fmt::Display for FrameParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Frame(e) => e.fmt(f),
-            Self::Trailing { remaining } => {
-                write!(f, "trailing bytes after the frame: {remaining}")
-            }
-        }
-    }
-}
-
-impl core::error::Error for FrameParseError {}
-
-fn exact_frame(framing: Framing, input: &[u8]) -> Result<Frame, FrameParseError> {
-    match Frame::parse(framing, input).map_err(FrameParseError::Frame)? {
-        Some((frame, used)) if used == input.len() => Ok(frame),
-        Some((_, used)) => Err(FrameParseError::Trailing {
-            remaining: input.len().saturating_sub(used),
-        }),
-        None => Err(FrameParseError::Frame(Error::Truncated)),
-    }
+fn parse_frame(input: &[u8]) -> Result<Option<(Frame, usize)>, Error> {
+    let (length, start) = match decode_varint(input) {
+        Ok(header) => header,
+        Err(Error::Truncated) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let length = usize::try_from(length).ok().filter(|n| *n <= MAX_MESSAGE).ok_or(Error::TooLong)?;
+    let end = start.checked_add(length).ok_or(Error::TooLong)?;
+    Ok(input.get(start..end).map(|data| (Frame { data: data.to_vec() }, end)))
 }
 
 impl Wire for Frame {
-    type ParseError = FrameParseError;
+    type ParseError = Error;
     type WriteError = Error;
 
-    /// Reads exactly one gRPC frame. The inherent parser still takes a framing.
-    fn parse(input: &[u8]) -> Result<Self, FrameParseError> {
-        exact_frame(Framing::Grpc, input)
+    /// Reads exactly one varint-delimited frame. Refuses incomplete input,
+    /// overflowing varints, bodies over [`MAX_MESSAGE`], and trailing bytes.
+    fn parse(input: &[u8]) -> Result<Self, Error> {
+        match parse_frame(input)? {
+            Some((frame, used)) if used == input.len() => Ok(frame),
+            Some((_, used)) => Err(Error::Trailing { remaining: input.len().saturating_sub(used) }),
+            None => Err(Error::Truncated),
+        }
     }
 
-    /// Appends one gRPC frame. Refuses oversized bodies before changing `out`.
+    /// Appends a varint length and the body. Refuses bodies over
+    /// [`MAX_MESSAGE`] before changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&self.to_bytes(Framing::Grpc)?);
-        Ok(())
-    }
-}
-
-/// A frame whose [`Wire`] form uses a varint length instead of gRPC framing.
-/// Compressed values are refused by the writer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DelimitedFrame(
-    /// The message bytes and compression flag.
-    pub Frame,
-);
-
-impl Wire for DelimitedFrame {
-    type ParseError = FrameParseError;
-    type WriteError = Error;
-
-    fn parse(input: &[u8]) -> Result<Self, FrameParseError> {
-        exact_frame(Framing::Delimited, input).map(Self)
-    }
-
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&self.0.to_bytes(Framing::Delimited)?);
+        if self.data.len() > MAX_MESSAGE {
+            return Err(Error::TooLong);
+        }
+        encode_varint(self.data.len() as u64, out);
+        out.extend_from_slice(&self.data);
         Ok(())
     }
 }
@@ -935,50 +835,49 @@ impl Wire for Message {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads a whole message. Refuses incomplete fields, invalid tags,
+    /// mismatched groups, overflowing varints, and size, count, or depth
+    /// limit violations. Every byte must belong to a field.
     fn parse(input: &[u8]) -> Result<Self, Error> {
-        Self::parse(input)
+        Self::parse_at(input, 0)
     }
 
+    /// Appends the fields in order. Refuses invalid field numbers and
+    /// messages beyond [`MAX_MESSAGE`], [`MAX_FIELDS`], or [`MAX_DEPTH`].
+    /// On error, `out` is unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&self.to_bytes()?);
+        let mut bytes = Vec::new();
+        write_fields(self, 0, &mut bytes, &mut 0)?;
+        out.extend_from_slice(&bytes);
         Ok(())
     }
 }
 
-/// Reads length-prefixed frames without retaining input bytes.
+/// Reads varint-delimited frames without retaining input bytes.
 ///
-/// Both framings use [`Frame::parse`]. Malformed headers and oversized
-/// lengths end the stream. Incomplete frames return
-/// [`Step::Need`], including at EOF. Capacity is [`MAX_MESSAGE`] plus
-/// [`GRPC_HEADER_LEN`] or [`MAX_VARINT_LEN`], according to the framing.
-/// Map items through [`Message::parse`]
-/// to handle payload errors per item. Use [`codec::Stream`](super::codec::Stream) for bounded input.
+/// Malformed lengths and bodies over [`MAX_MESSAGE`] end the stream.
+/// Incomplete frames return [`Step::Need`], including at EOF.
+/// Map items through [`Message::parse`] to handle payload errors per item.
+/// Drive this decoder with [`Stream<Frames>`](super::codec::Stream).
 ///
 /// ```
-/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protobuf::{Frame, Frames, Framing}};
+/// use fictionet::stdlib::{codec::{Stream, finish, pump}, protobuf::{Frame, Frames}};
 ///
-/// let mut stream = Stream::new(Frames::new(Framing::Delimited));
+/// let mut stream = Stream::new(Frames::new());
 /// let mut frames = Vec::new();
 /// pump(&mut stream, &[2, 0x08], |frame| frames.push(frame))?;
 /// pump(&mut stream, &[1], |frame| frames.push(frame))?;
 /// finish(&mut stream, |frame| frames.push(frame))?;
-/// assert_eq!(frames, vec![Frame { compressed: false, data: vec![0x08, 1] }]);
+/// assert_eq!(frames, vec![Frame { data: vec![0x08, 1] }]);
 /// # Ok::<(), fictionet::stdlib::codec::Fail<fictionet::stdlib::protobuf::Error>>(())
 /// ```
-#[derive(Clone, Copy, Debug)]
-pub struct Frames {
-    framing: Framing,
-}
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Frames;
 
 impl Frames {
-    /// Reads `framing` with bodies bounded by [`MAX_MESSAGE`].
-    pub fn new(framing: Framing) -> Self {
-        Self { framing }
-    }
-
-    /// The framing this decoder reads.
-    pub fn framing(&self) -> Framing {
-        self.framing
+    /// Reads delimited frames with bodies bounded by [`MAX_MESSAGE`].
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -988,129 +887,29 @@ impl Decode for Frames {
     const NAME: &'static str = "Protobuf";
 
     fn capacity(&self) -> usize {
-        match self.framing {
-            Framing::Grpc => GRPC_HEADER_LEN.saturating_add(MAX_MESSAGE),
-            Framing::Delimited => MAX_VARINT_LEN.saturating_add(MAX_MESSAGE),
-        }
+        MAX_VARINT_LEN.saturating_add(MAX_MESSAGE)
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, Error> {
-        Ok(match Frame::parse(self.framing, input)? {
+        Ok(match parse_frame(input)? {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
     }
 }
 
-/// Splits a byte stream into frames. Feed it the bytes a connection or
-/// request body reads, in order, and take frames out until it has none.
-/// It holds at most [`MAX_BUFFERED`] bytes that have not been taken out.
-/// Two decoders are equal when they read the same framing, hold the same
-/// bytes not yet taken out, and have broken in the same way, if at all.
-#[derive(Clone, Debug)]
-#[deprecated(note = "use codec::Stream with protobuf::Frames")]
-pub struct Decoder {
-    framing: Framing,
-    buf: Vec<u8>,
-    // Bytes before `start` belong to frames already taken out.
-    start: usize,
-    failed: Option<Error>,
-}
-
-#[allow(deprecated)] // Preserve the compatibility API.
-impl PartialEq for Decoder {
-    fn eq(&self, other: &Decoder) -> bool {
-        self.framing == other.framing && self.pending() == other.pending() && self.failed == other.failed
-    }
-}
-
-#[allow(deprecated)] // Preserve the compatibility API.
-impl Eq for Decoder {}
-
-#[allow(deprecated)] // Preserve the compatibility API.
-impl Decoder {
-    /// A decoder for `framing`, holding no bytes.
-    pub fn new(framing: Framing) -> Decoder {
-        Decoder { framing, buf: Vec::new(), start: 0, failed: None }
-    }
-
-    /// Adds bytes read from the stream. If they would make the decoder
-    /// hold more than [`MAX_BUFFERED`] bytes, the stream breaks with
-    /// [`Error::TooLong`]. So take frames out between feeds. After an
-    /// error the stream cannot be read any further, and bytes are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) {
-        if self.failed.is_some() {
-            return;
-        }
-        if self.buffered().saturating_add(bytes.len()) > MAX_BUFFERED {
-            self.fail(Error::TooLong);
-            return;
-        }
-        // Drop the bytes of frames taken out once they outweigh the rest,
-        // so each byte moves a bounded number of times.
-        if self.start > 0 && self.start >= self.buffered() {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        self.buf.extend_from_slice(bytes);
-    }
-
-    /// The next whole frame, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Frame::parse(self.framing, self.pending()) {
-            Ok(Some((frame, used))) => {
-                // Move the start instead of the bytes, so that taking out
-                // many small frames costs time in line with their size.
-                self.start = self.start.saturating_add(used).min(self.buf.len());
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.fail(e);
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// The framing this decoder reads.
-    pub fn framing(&self) -> Framing {
-        self.framing
-    }
-
-    /// How many bytes are held that have not been taken out as frames.
-    pub fn buffered(&self) -> usize {
-        self.pending().len()
-    }
-
-    fn pending(&self) -> &[u8] {
-        self.buf.get(self.start..).unwrap_or(&[])
-    }
-
-    fn fail(&mut self, e: Error) {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.start = 0;
-    }
-}
-
 #[cfg(test)]
-#[allow(deprecated)] // These tests cover the compatibility API.
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use fictionet::stdlib::codec::test_support::{Lcg, decode_all, mutate};
+
+    fn check(input: &[u8]) {
+        contract::check_decode_with_alloc_limit(Frames::new, input, 2 * Frames::new().capacity());
+    }
 
     fn varint(v: u64) -> Vec<u8> {
-        let mut out = Vec::new();
-        encode_varint(v, &mut out);
-        out
+        Varint(v).to_bytes().unwrap()
     }
 
     // Examples from https://protobuf.dev/programming-guides/encoding/.
@@ -1268,24 +1067,6 @@ mod tests {
         assert_eq!(p.uint32(1), Some(u32::MAX));
         assert_eq!(p.sfixed32(2), Some(-7));
         assert_eq!(p.sfixed64(3), Some(i64::MIN));
-        // A decoder can be copied, partway through a frame.
-        let mut d = Decoder::new(Framing::Grpc);
-        d.feed(&[0, 0, 0, 0, 2, 0x08]);
-        let mut e = d.clone();
-        assert_eq!(d, e);
-        assert_eq!(e.framing(), Framing::Grpc);
-        e.feed(&[0x01]);
-        assert_eq!(e.next_frame(), Some(Ok(Frame { compressed: false, data: vec![0x08, 0x01] })));
-        assert_eq!(d.next_frame(), None);
-        // Equal by what they hold, not where it sits in the buffer.
-        let mut a = Decoder::new(Framing::Delimited);
-        a.feed(&[0, 0, 1]);
-        assert_eq!(a.next_frame(), Some(Ok(Frame { compressed: false, data: vec![] })));
-        assert_eq!(a.next_frame(), Some(Ok(Frame { compressed: false, data: vec![] })));
-        let mut b = Decoder::new(Framing::Delimited);
-        b.feed(&[1]);
-        assert_eq!(a, b);
-        assert_ne!(a, Decoder::new(Framing::Grpc));
     }
 
     #[test]
@@ -1412,7 +1193,7 @@ mod tests {
         assert_eq!(outer.to_bytes(), Err(Error::TooDeep));
         assert_eq!(outer.clone().push_message(2, &outer), Err(Error::TooDeep));
         // Every error prints.
-        for e in [Error::Truncated, Error::Flag(2), Error::Compressed, Error::TooDeep] {
+        for e in [Error::Truncated, Error::Trailing { remaining: 1 }, Error::TooDeep] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -1443,92 +1224,92 @@ mod tests {
                 Err(e) => assert!(matches!(e, Error::Truncated | Error::UnclosedGroup(4)), "{n} bytes: {e:?}"),
             }
         }
-        for framing in [Framing::Grpc, Framing::Delimited] {
-            let f = Frame { compressed: false, data: b.clone() }.to_bytes(framing).unwrap();
-            for n in 0..f.len() {
-                assert_eq!(Frame::parse(framing, &f[..n]), Ok(None), "{framing:?} {n} bytes");
-            }
-            assert_eq!(Frame::parse(framing, &f), Ok(Some((Frame { compressed: false, data: b.clone() }, f.len()))));
+        let frame = Frame { data: b };
+        let bytes = frame.to_bytes().unwrap();
+        check(&bytes);
+        for n in 0..bytes.len() {
+            assert_eq!(Frame::parse(&bytes[..n]), Err(Error::Truncated));
         }
+        assert_eq!(Frame::parse(&bytes), Ok(frame));
     }
 
     #[test]
     fn frames() {
-        let f = Frame { compressed: true, data: vec![0x08, 0x01] };
-        let b = f.to_bytes(Framing::Grpc).unwrap();
-        assert_eq!(b, [1, 0, 0, 0, 2, 0x08, 0x01]);
-        assert_eq!(Frame::parse(Framing::Grpc, &b), Ok(Some((f.clone(), 7))));
-        assert_eq!(f.to_bytes(Framing::Delimited), Err(Error::Compressed));
-        let plain = Frame { compressed: false, data: vec![0x08, 0x01] };
-        assert_eq!(plain.to_bytes(Framing::Delimited).unwrap(), [2, 0x08, 0x01]);
-        // Errors.
-        assert_eq!(Frame::parse(Framing::Grpc, &[2]), Err(Error::Flag(2)));
-        assert_eq!(Frame::parse(Framing::Grpc, &[0, 0x00, 0x40, 0x00, 0x01]), Err(Error::TooLong));
-        assert_eq!(Frame::parse(Framing::Grpc, &[0, 0x00, 0x40, 0x00, 0x00]), Ok(None));
-        assert_eq!(Frame::parse(Framing::Delimited, &[0x81, 0x80, 0x80, 0x02]), Err(Error::TooLong));
-        assert_eq!(Frame::parse(Framing::Delimited, &[0xff; 10]), Err(Error::VarintOverflow));
-        let big = Frame { compressed: false, data: vec![0; MAX_MESSAGE + 1] };
-        assert_eq!(big.to_bytes(Framing::Grpc), Err(Error::TooLong));
-        let max = Frame { compressed: false, data: vec![0; MAX_MESSAGE] };
-        for framing in [Framing::Grpc, Framing::Delimited] {
-            let b = max.to_bytes(framing).unwrap();
-            assert!(Frame::parse(framing, &b).unwrap().is_some());
-        }
+        let frame = Frame { data: vec![0x08, 0x01] };
+        assert_eq!(frame.to_bytes().unwrap(), [2, 0x08, 0x01]);
+        assert_eq!(Frame::parse(&[2, 0x08, 0x01]), Ok(frame));
+        assert_eq!(Frame::parse(&[0x81, 0x80, 0x80, 0x02]), Err(Error::TooLong));
+        assert_eq!(Frame::parse(&[0xff; 10]), Err(Error::VarintOverflow));
+        let big = Frame { data: vec![0; MAX_MESSAGE + 1] };
+        assert_eq!(big.to_bytes(), Err(Error::TooLong));
+        contract::check_wire_value(&big);
+        let max = Frame { data: vec![0; MAX_MESSAGE] };
+        let bytes = max.to_bytes().unwrap();
+        assert_eq!(Frame::parse(&bytes), Ok(max));
+        assert_eq!(Frame::parse(&[0, 0]), Err(Error::Trailing { remaining: 1 }));
     }
 
     #[test]
-    fn decoder_splits_a_stream() {
-        for framing in [Framing::Grpc, Framing::Delimited] {
-            let a = Frame { compressed: false, data: sample().to_bytes().unwrap() }.to_bytes(framing).unwrap();
-            let b = Frame { compressed: false, data: vec![] }.to_bytes(framing).unwrap();
-            let stream: Vec<u8> = a.iter().chain(&b).chain(&a).copied().collect();
-            let mut d = Decoder::new(framing);
-            let mut got = Vec::new();
-            for byte in &stream {
-                d.feed(std::slice::from_ref(byte));
-                while let Some(f) = d.next_frame() {
-                    got.push(f.unwrap().data.len());
-                }
-            }
-            let n = sample().to_bytes().unwrap().len();
-            assert_eq!(got, [n, 0, n]);
-            assert_eq!(d.buffered(), 0);
-            // A broken stream stays broken.
-            d.feed(&[0xff; 12]);
-            let e = d.next_frame().unwrap().unwrap_err();
-            d.feed(&a);
-            assert_eq!(d.next_frame(), Some(Err(e)));
-            assert_eq!(d.buffered(), 0);
-        }
+    fn grpc_composition() {
+        use fictionet::stdlib::grpc;
+        let frame = grpc::Message { compressed: true, data: vec![0x08, 0x01] };
+        let bytes = Wire::to_bytes(&frame).unwrap();
+        assert_eq!(bytes, [1, 0, 0, 0, 2, 0x08, 0x01]);
+        contract::check_wire_value(&frame);
+        contract::check_decode_with_alloc_limit(grpc::Messages::new, &bytes,
+            2 * (grpc::HEADER_LEN + grpc::DEFAULT_MAX_MESSAGE));
+        let (frames, error) = decode_all(grpc::Messages::new, &bytes);
+        assert_eq!(frames, [frame]);
+        assert_eq!(error, None);
+        assert!(matches!(decode_all(grpc::Messages::new, &[2]).1,
+            Some(Fail::Protocol(grpc::FrameError::Flag(2)))));
+        assert!(matches!(decode_all(grpc::Messages::new, &[0, 0x00, 0x40, 0x00, 0x01]).1,
+            Some(Fail::Protocol(grpc::FrameError::TooLarge { .. }))));
+        assert!(matches!(decode_all(grpc::Messages::new, &[0, 0x00, 0x40, 0x00, 0x00]).1,
+            Some(Fail::Truncated { .. })));
     }
 
     #[test]
-    fn decoder_buffer_is_bounded() {
-        // Feeding without taking frames out stops at MAX_BUFFERED.
-        let mut d = Decoder::new(Framing::Delimited);
-        let chunk = vec![0u8; 1 << 20];
-        for _ in 0..MAX_BUFFERED / chunk.len() {
-            d.feed(&chunk);
-        }
-        assert_eq!(d.buffered(), MAX_BUFFERED / chunk.len() * chunk.len());
-        d.feed(&chunk);
-        assert!(d.buffered() <= MAX_BUFFERED);
-        assert_eq!(d.next_frame(), Some(Err(Error::TooLong)));
+    fn stream_splits_frames_and_reports_errors_once() {
+        let frame = Frame::from_message(&sample()).unwrap();
+        let mut bytes = frame.to_bytes().unwrap();
+        Frame { data: vec![] }.write(&mut bytes).unwrap();
+        frame.write(&mut bytes).unwrap();
+        check(&bytes);
+        assert_eq!(decode_all(Frames::new, &bytes),
+            (vec![frame.clone(), Frame { data: vec![] }, frame], None));
+        let mut stream = Stream::new(Frames::new());
+        assert_eq!(stream.push(&[0xff; 12]), 12);
+        let error = Fail::Protocol(Error::VarintOverflow);
+        assert_eq!(stream.next(), Some(Err(error.clone())));
+        assert_eq!(stream.push(&bytes), bytes.len());
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&error));
     }
 
     #[test]
-    fn decoder_takes_many_small_frames_in_linear_time() {
-        // Each zero byte is an empty delimited frame. Taking them out one
-        // by one must not move the rest of the buffer each time.
-        let mut d = Decoder::new(Framing::Delimited);
-        d.feed(&vec![0u8; MAX_MESSAGE]);
-        let mut n = 0;
-        while let Some(f) = d.next_frame() {
-            assert!(f.unwrap().data.is_empty());
-            n += 1;
-        }
-        assert_eq!(n, MAX_MESSAGE);
-        assert_eq!(d.buffered(), 0);
+    fn stream_buffer_is_bounded() {
+        let mut stream = Stream::new(Frames::new());
+        let input = vec![0; Frames::new().capacity() + 1];
+        assert_eq!(stream.push(&input), Frames::new().capacity());
+        assert_eq!(stream.buffered(), Frames::new().capacity());
+        assert_eq!(stream.push(&[0]), 0);
+        assert!(stream.into_parts().0.allocated() <= 2 * Frames::new().capacity());
+    }
+
+    #[test]
+    fn stream_takes_many_small_frames() {
+        let started = std::time::Instant::now();
+        let mut stream = Stream::new(Frames::new());
+        let mut count = 0;
+        pump(&mut stream, &vec![0; MAX_MESSAGE], |frame| {
+            assert!(frame.data.is_empty());
+            count += 1;
+        }).unwrap();
+        finish(&mut stream, |_| panic!("no pending frame")).unwrap();
+        assert_eq!(count, MAX_MESSAGE);
+        assert_eq!(stream.buffered(), 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     // Counts fields as MAX_FIELDS does: group members included.
@@ -1625,34 +1406,20 @@ mod tests {
         assert_eq!(w.message(1), Err(Error::TooDeep));
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n as u64) as usize
-        }
-        fn bytes(&mut self, max: usize) -> Vec<u8> {
-            (0..self.below(max + 1)).map(|_| self.next() as u8).collect()
-        }
-        fn wide(&mut self) -> u64 {
-            let v = (self.next() << 31) ^ self.next();
-            v >> self.below(64)
-        }
+    fn wide(r: &mut Lcg) -> u64 {
+        let bits = r.next() | (r.next() << 31) | ((r.next() & 3) << 62);
+        bits >> r.index(64)
     }
 
     fn random(r: &mut Lcg, depth: usize) -> Message {
         let mut m = Message::new();
-        for _ in 0..r.below(6) {
-            let number = [1, 2, 15, 16, 2047, 2048, MAX_FIELD_NUMBER][r.below(7)];
-            let value = match r.below(if depth >= 3 { 4 } else { 5 }) {
-                0 => Value::Varint(r.wide()),
-                1 => Value::Fixed64(r.wide()),
+        for _ in 0..r.index(6) {
+            let number = [1, 2, 15, 16, 2047, 2048, MAX_FIELD_NUMBER][r.index(7)];
+            let value = match r.index(if depth >= 3 { 4 } else { 5 }) {
+                0 => Value::Varint(wide(r)),
+                1 => Value::Fixed64(wide(r)),
                 2 => Value::Bytes(r.bytes(10)),
-                3 => Value::Fixed32(r.next() as u32),
+                3 => Value::Fixed32(wide(r) as u32),
                 _ => Value::Group(random(r, depth + 1)),
             };
             m.push(number, value);
@@ -1661,8 +1428,8 @@ mod tests {
     }
 
     #[test]
-    fn lcg_fuzz() {
-        let mut r = Lcg(11);
+    fn generated_and_mutated_values() {
+        let mut r = Lcg::new(11);
         for _ in 0..3000 {
             // Built messages round trip.
             let m = random(&mut r, 0);
@@ -1671,12 +1438,7 @@ mod tests {
             // Damaged copies never panic, and what parses writes and
             // reads back the same.
             let mut bad = b.clone();
-            for _ in 0..r.below(3) + 1 {
-                if !bad.is_empty() {
-                    let i = r.below(bad.len());
-                    bad[i] = r.next() as u8;
-                }
-            }
+            mutate(&mut r, &mut bad);
             let junk = r.bytes(24);
             for input in [&bad[..], &junk[..], &b[..b.len() / 2]] {
                 if let Ok(p) = Message::parse(input) {
@@ -1694,41 +1456,10 @@ mod tests {
                         }
                     }
                 }
-                // Decoders, all at once and a byte at a time.
-                for framing in [Framing::Grpc, Framing::Delimited] {
-                    let mut whole = Decoder::new(framing);
-                    whole.feed(input);
-                    let mut frames = Vec::new();
-                    while let Some(Ok(f)) = whole.next_frame() {
-                        frames.push(f);
-                    }
-                    let mut bytewise = Decoder::new(framing);
-                    let mut again = Vec::new();
-                    for byte in input {
-                        bytewise.feed(std::slice::from_ref(byte));
-                        while let Some(Ok(f)) = bytewise.next_frame() {
-                            again.push(f);
-                        }
-                    }
-                    assert_eq!(frames, again);
-                    // And in chunks of random sizes, several frames at once.
-                    let mut chunked = Decoder::new(framing);
-                    let mut third = Vec::new();
-                    let mut rest = input;
-                    while !rest.is_empty() {
-                        let (head, tail) = rest.split_at(r.below(rest.len()) + 1);
-                        chunked.feed(head);
-                        rest = tail;
-                        while let Some(Ok(f)) = chunked.next_frame() {
-                            third.push(f);
-                        }
-                    }
-                    assert_eq!(frames, third);
-                    for f in &frames {
-                        let bytes = f.to_bytes(framing).unwrap();
-                        assert_eq!(Frame::parse(framing, &bytes), Ok(Some((f.clone(), bytes.len()))));
-                    }
-                }
+                check(input);
+                contract::check_wire::<Frame>(input);
+                contract::check_wire::<Message>(input);
+                contract::check_wire::<Varint>(input);
             }
         }
     }

@@ -1,54 +1,24 @@
 //! XML documents, as a world serving SOAP or XMPP reads them, and the
 //! writer given whatever text the agent sent.
 #![no_main]
-#![allow(deprecated)] // This target also checks the compatibility API.
 
 use std::sync::Arc;
 
-use fictionet::stdlib::codec::contract;
-use fictionet::stdlib::xml::{Attribute, Error, ErrorKind, Event, Name, Parser, Start, Writer, XMLNS_NAMESPACE, parse};
+use fictionet::stdlib::codec::{Wire, contract, test_support::decode_all};
+use fictionet::stdlib::xml::{Attribute, Builder, Document, ErrorKind, Event, Events, Name, Start, XMLNS_NAMESPACE};
 use libfuzzer_sys::fuzz_target;
 
-/// Feeds `chunks` in order, then finishes: the events and the error, if
-/// any.
-fn run<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> (Vec<Event>, Option<Error>) {
-    let mut p = Parser::new();
-    let mut events = Vec::new();
-    let drain = |p: &mut Parser, events: &mut Vec<Event>| -> Option<Error> {
-        while let Some(ev) = p.next_event() {
-            match ev {
-                Ok(e) => events.push(e),
-                Err(e) => return Some(e),
-            }
-        }
-        None
-    };
-    for c in chunks {
-        p.feed(c);
-        if let Some(e) = drain(&mut p, &mut events) {
-            return (events, Some(e));
-        }
-    }
-    p.finish();
-    let err = drain(&mut p, &mut events);
-    assert_eq!(err.is_none(), p.is_done());
-    (events, err)
-}
-
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(fictionet::stdlib::xml::Events::new, data);
+    contract::check_decode_with_alloc_limit(Events::new, data, 2 * (fictionet::stdlib::xml::MAX_DOCUMENT + 1));
     contract::check_wire::<fictionet::stdlib::xml::Document>(data);
     contract::check_wire_value(&fictionet::stdlib::xml::Document {
         data: data.to_vec(),
     });
-    // The document, split two ways: all at once, and a byte at a time.
-    let whole = run([data]);
-    let bytewise = run(data.chunks(1));
-    assert_eq!(whole, bytewise);
+    let whole = decode_all(Events::new, data);
 
     // A document read can be written, and reads back the same.
-    if let (events, None) = &whole {
-        let mut w = Writer::new();
+    if let (events, None) = &whole && !events.is_empty() {
+        let mut w = Builder::new();
         let mut written = true;
         for e in events {
             match w.event(e) {
@@ -62,14 +32,15 @@ fuzz_target!(|data: &[u8]| {
             }
         }
         if written {
-            let out = w.finish().unwrap();
-            assert_eq!(&parse(out.as_bytes()).unwrap(), events);
+            let out = w.build().unwrap();
+            let bytes = out.to_bytes().unwrap();
+            assert_eq!(decode_all(Events::new, &bytes), (events.clone(), None));
         }
     }
 
     // Whatever a writer accepts, a parser reads.
     let s = String::from_utf8_lossy(data);
-    let mut w = Writer::new();
+    let mut w = Builder::new();
     let _ = w.comment(&s);
     let _ = w.start("r", &[("v", &s), ("xmlns:q", &s)]);
     let _ = w.start(&s, &[(&s, "x")]);
@@ -81,8 +52,9 @@ fuzz_target!(|data: &[u8]| {
         w.end().unwrap();
     }
     let _ = w.text(&s);
-    if let Ok(out) = w.finish() {
-        assert!(parse(out.as_bytes()).is_ok());
+    if let Ok(out) = w.build() {
+        contract::check_wire_value(&out);
+        assert!(Document::parse(&out.to_bytes().unwrap()).is_ok());
     }
 
     // Events built from the input, names and namespaces chosen from small
@@ -100,7 +72,7 @@ fn events(data: &[u8]) {
         namespace: uris[usize::from(b / 6 % 3)].clone(),
     };
     let xmlns = Some(Arc::<str>::from(XMLNS_NAMESPACE));
-    let mut w = Writer::new();
+    let mut w = Builder::new();
     let mut tags = Vec::new();
     let mut open: Vec<Name> = Vec::new();
     for op in data.chunks(3) {
@@ -147,9 +119,11 @@ fn events(data: &[u8]) {
         w.event(&Event::End(n.clone())).unwrap();
         tags.push(Event::End(n));
     }
-    if let Ok(out) = w.finish() {
-        let read = parse(out.as_bytes()).unwrap();
+    if let Ok(out) = w.build() {
+        let bytes = out.to_bytes().unwrap();
+        let (read, error) = decode_all(Events::new, &bytes);
+        assert_eq!(error, None);
         let read: Vec<Event> = read.into_iter().filter(|e| matches!(e, Event::Start(_) | Event::End(_))).collect();
-        assert_eq!(read, tags, "{out}");
+        assert_eq!(read, tags, "{out:?}");
     }
 }

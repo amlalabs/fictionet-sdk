@@ -1,103 +1,30 @@
-//! JSON texts and streams of them, as a world playing a web API or a
-//! JSON-RPC server reads them.
+//! JSON texts, bounded values, and streams used by web APIs.
 #![no_main]
-#![allow(deprecated)] // This target also checks the compatibility API.
 
-use fictionet::stdlib::codec::contract;
-use fictionet::stdlib::json::{self, Decoder, Limits, Value};
+use fictionet::stdlib::codec::{Decode, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::json::{self, Limits, Value, Values};
 use libfuzzer_sys::fuzz_target;
 
-/// How the bytes reach the decoder and how its values are taken.
-#[derive(Clone, Copy)]
-enum Schedule {
-    /// All at once, then every value.
-    Whole,
-    /// A byte at a time, every value after each byte.
-    Bytewise,
-    /// Chunks of a few bytes, at most one value taken after each, so
-    /// read bytes wait in the buffer while more come.
-    OnePerFeed(usize),
-}
-
-/// Every value the decoder gives, up to and including its first error.
-/// With `end`, the stream is then ended with `Decoder::finish` and the
-/// rest is taken.
-fn decode(data: &[u8], limits: Limits, schedule: Schedule, end: bool) -> Vec<Result<Value, json::Error>> {
-    let mut d = Decoder::with_limits(limits);
-    let mut out = Vec::new();
-    let (chunks, one): (Vec<&[u8]>, bool) = match schedule {
-        Schedule::Whole => (vec![data], false),
-        Schedule::Bytewise => (data.chunks(1).collect(), false),
-        Schedule::OnePerFeed(n) => (data.chunks(n.max(1)).collect(), true),
-    };
-    let take = |d: &mut Decoder, out: &mut Vec<_>, one: bool| {
-        while let Some(v) = d.next_value() {
-            let stop = v.is_err();
-            out.push(v);
-            if stop {
-                return true;
-            }
-            if one {
-                break;
-            }
-        }
-        false
-    };
-    for chunk in chunks {
-        d.feed(chunk);
-        if take(&mut d, &mut out, one) {
-            return out;
-        }
-        // What is held never passes the bytes fed so far.
-        assert!(d.buffered() <= data.len());
-    }
-    if end {
-        d.finish();
-    }
-    take(&mut d, &mut out, false);
-    out
-}
-
-/// A value written reads back the same, and writes the same text again.
-fn round_trip(v: &Value, limits: &Limits) {
-    let text = v.write_with(limits).unwrap();
-    let back = json::parse_with(text.as_bytes(), limits).unwrap();
-    assert_eq!(&back, v);
-    assert_eq!(back.write_with(limits).unwrap(), text);
-}
-
 fuzz_target!(|input: &[u8]| {
-    // The first two bytes pick tighter limits and a chunk size.
-    let (limits, chunk, data) = match input {
-        [a, b, rest @ ..] if a & 0x80 != 0 => {
-            let limits = Limits { depth: usize::from(a & 0x0f), size: usize::from(*b) * 4, elements: usize::from(a >> 4 & 0x07) * 4 + 1 };
-            (limits, usize::from(b % 7) + 1, rest)
-        }
-        [_, b, rest @ ..] => (Limits::default(), usize::from(b % 7) + 1, rest),
-        _ => (Limits::default(), 1, input),
+    let (limits, data) = match input {
+        [a, b, rest @ ..] if a & 0x80 != 0 => (
+            Limits { depth: usize::from(a & 0x0f), size: usize::from(*b) * 4,
+                elements: usize::from(a >> 4 & 0x07) * 4 + 1 }, rest),
+        [_, _, rest @ ..] => (Limits::default(), rest),
+        _ => (Limits::default(), input),
     };
-    contract::check_decode(|| json::Values::with_limits(limits), data);
+    let make = || Values::with_limits(limits);
+    contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     contract::check_wire::<Value>(data);
-    // The input as one JSON text.
-    let parsed = json::parse_with(data, &limits);
-    if let Ok(v) = &parsed {
-        contract::check_wire_value(v);
-        round_trip(v, &limits);
+    let (values, error) = decode_all(make, data);
+    for value in &values {
+        contract::check_wire_value(value);
+        assert!(value.validate(&limits).is_ok());
+        let bytes = value.to_bytes().unwrap();
+        assert_eq!(json::parse_with(&bytes, &limits).as_ref(), Ok(value));
     }
-    // The input as a stream, split three ways. Each split gives the same
-    // values, whether or not the stream then ends.
-    for end in [false, true] {
-        let whole = decode(data, limits, Schedule::Whole, end);
-        assert_eq!(whole, decode(data, limits, Schedule::Bytewise, end));
-        assert_eq!(whole, decode(data, limits, Schedule::OnePerFeed(chunk), end));
-        for v in whole.iter().flatten() {
-            contract::check_wire_value(v);
-            round_trip(v, &limits);
-        }
-        // A whole JSON text, as a stream that then ends, gives just its
-        // value.
-        if end && let Ok(v) = &parsed {
-            assert_eq!(whole, [Ok(v.clone())]);
-        }
+    if let Ok(value) = json::parse_with(data, &limits) {
+        contract::check_wire_value(&value);
+        assert_eq!((values, error), (vec![value], None));
     }
 });

@@ -1,16 +1,15 @@
-//! MIME multipart bodies, as a world playing a web server reads uploaded
-//! forms.
+//! Multipart body framing, MIME entities, parts, and parameterized headers.
 #![no_main]
-#![allow(deprecated)] // This target also checks the compatibility API.
 
-use fictionet::stdlib::codec::contract;
-use fictionet::stdlib::mime_multipart::{Headers, Multipart, ParamValue, Parser, Part, boundary, valid_boundary};
+use fictionet::stdlib::codec::{Decode, Fail, Wire, contract, test_support::decode_all};
+use fictionet::stdlib::mime_multipart::{
+    Body, Entity, Error, Headers, MAX_ENTITY, Multipart, ParamValue, Part, Parts, boundary,
+    valid_boundary,
+};
 use libfuzzer_sys::fuzz_target;
 
-fuzz_target!(|data: &[u8]| {
-    // The first byte picks how many of the next bytes are the boundary.
-    // If they are not a valid one, the boundary is "a".
-    let (bnd, data) = match data.split_first() {
+fuzz_target!(|input: &[u8]| {
+    let (bnd, data) = match input.split_first() {
         Some((&n, rest)) => {
             let len = usize::from(n % 8);
             match rest.get(..len).and_then(|b| std::str::from_utf8(b).ok()) {
@@ -18,86 +17,57 @@ fuzz_target!(|data: &[u8]| {
                 _ => ("a".to_string(), rest),
             }
         }
-        None => ("a".to_string(), data),
+        None => ("a".to_string(), input),
     };
-
-    contract::check_decode(
-        || fictionet::stdlib::mime_multipart::Parts::new(&bnd).unwrap(),
-        data,
-    );
+    let make = || Parts::new(&bnd).unwrap();
+    contract::check_decode_with_alloc_limit(make, data, 2 * make().capacity());
     contract::check_wire::<Part>(data);
-    // The body, read all at once and a byte at a time.
-    let whole = Multipart::parse(data, &bnd);
-    let mut bytewise = Multipart::default();
-    let mut parser = Parser::new(&bnd).unwrap();
-    let mut failed = None;
-    'feed: for b in data {
-        parser.feed(std::slice::from_ref(b));
-        while let Some(e) = parser.next_event() {
-            match e {
-                Ok(e) => bytewise.push_event(e),
-                Err(e) => {
-                    failed = Some(e);
-                    break 'feed;
-                }
+    contract::check_wire::<Entity>(data);
+    contract::check_wire::<Body>(data);
+    contract::check_wire::<ParamValue>(data);
+    let (parts, error) = decode_all(make, data);
+    for part in &parts {
+        contract::check_wire_value(part);
+        let _ = (part.name(), part.filename(), part.headers.content_type(), part.headers.get_one("x"));
+        let _ = part.headers.get_all("content-type").count();
+    }
+    match Multipart::parse(data, &bnd) {
+        Ok(multipart) => {
+            assert_eq!(error, None);
+            assert_eq!(parts, multipart.parts);
+            // Leave room for a longer free boundary, header spaces, and the MIME header.
+            if data.len() < MAX_ENTITY / 2 {
+                let entity = multipart.with_free_boundary(&bnd).expect("a parsed body picks a boundary");
+                let bytes = entity.to_bytes().expect("a parsed body writes again");
+                assert_eq!(Entity::parse(&bytes).as_ref(), Ok(&entity));
+                contract::check_wire_value(&entity);
+                contract::check_wire_value(&Body {
+                    boundary: entity.boundary,
+                    multipart: entity.multipart,
+                });
             }
         }
+        // Parts has no aggregate body cap.
+        Err(Error::EntityTooLong) if data.len() > MAX_ENTITY => {}
+        Err(expected) if !data.is_empty() => match error {
+            Some(Fail::Protocol(error)) => assert_eq!(error, expected),
+            Some(Fail::Truncated { .. }) => assert_eq!(expected, Error::Truncated),
+            other => panic!("{other:?}"),
+        },
+        Err(_) => assert!(data.is_empty()),
     }
-    if failed.is_none() {
-        parser.finish();
-        while let Some(e) = parser.next_event() {
-            match e {
-                Ok(e) => bytewise.push_event(e),
-                Err(e) => {
-                    failed = Some(e);
-                    break;
-                }
-            }
-        }
-    }
-    match failed {
-        Some(e) => assert_eq!(whole, Err(e)),
-        None => assert_eq!(whole.as_ref(), Ok(&bytewise)),
-    }
-
-    if let Ok(m) = &whole {
-        // A body read can always be written, with a boundary that is
-        // free, and reads back the same.
-        let (b, bytes) = m.write(&bnd).expect("a parsed body writes again");
-        assert_eq!(Multipart::parse(&bytes, &b).as_ref(), Ok(m));
-        for p in &m.parts {
-            contract::check_wire_value(p);
-            let _ = (p.name(), p.filename(), p.headers.content_type(), p.headers.get_one("x"));
-            let _ = p.headers.get_all("content-type").count();
-        }
-    }
-
-    // Any text as a header field: split at the first colon into name and
-    // value. A writer either refuses the field or writes a body that
-    // reads back the same, whatever the boundary.
     let text = String::from_utf8_lossy(data);
     if let Some((name, value)) = text.split_once(':') {
-        let m = Multipart {
+        let multipart = Multipart {
             parts: vec![Part { headers: Headers { fields: vec![(name.into(), value.into())] }, body: Vec::new() }],
             ..Multipart::default()
         };
-        for p in &m.parts {
-            contract::check_wire_value(p);
-        }
-        if let Ok((b, bytes)) = m.write(&bnd) {
-            assert_eq!(Multipart::parse(&bytes, &b).as_ref(), Ok(&m));
+        contract::check_wire_value(&multipart.parts[0]);
+        if let Ok(entity) = multipart.with_free_boundary(&bnd) {
+            contract::check_wire_value(&entity);
         }
     }
-
-    // Any text as a header value with parameters.
-    if let Ok(s) = std::str::from_utf8(data) {
-        if let Some(v) = ParamValue::parse(s) {
-            if let Some(h) = v.to_header() {
-                assert_eq!(ParamValue::parse(&h), Some(v));
-            }
-        }
-        if let Some(b) = boundary(s) {
-            assert!(valid_boundary(&b));
-        }
+    if let Ok(text) = std::str::from_utf8(data) && let Some(bnd) = boundary(text) {
+        assert!(valid_boundary(&bnd));
     }
 });
