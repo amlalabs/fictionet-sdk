@@ -21,6 +21,8 @@ pub struct Selection<'a> {
     pub ports: (u16, u16),
     /// First bytes of the direction currently being identified.
     pub first: &'a [u8],
+    /// The negotiated TLS ALPN, when these bytes came from a TLS session.
+    pub alpn: Option<&'a str>,
 }
 
 /// A protocol matcher's decision.
@@ -28,7 +30,8 @@ pub struct Selection<'a> {
 pub enum Match {
     /// Select this protocol.
     Yes,
-    /// More prefix bytes could identify this protocol.
+    /// More prefix bytes could identify this protocol. UDP treats this
+    /// as `No` because a datagram cannot grow.
     More,
     /// This protocol does not match.
     No,
@@ -57,7 +60,7 @@ pub trait Protocol: Send {
 }
 
 type Matcher = dyn Fn(Selection<'_>) -> Match + Send + Sync;
-type Factory = dyn Fn(Selection<'_>) -> Box<dyn Protocol> + Send + Sync;
+type Factory = dyn Fn(Selection<'_>, &Registry) -> Box<dyn Protocol> + Send + Sync;
 struct Entry {
     name: String,
     matches: Box<Matcher>,
@@ -69,12 +72,22 @@ struct Entry {
 ///
 /// `default()` registers the built-ins. `new()` starts empty. Later
 /// registrations take precedence. A matcher returning [`Match::More`]
-/// postpones lower-priority matchers, up to 64 prefix bytes per direction.
-/// Explicit selection bypasses matchers.
+/// postpones lower-priority TCP matchers, up to 64 prefix bytes per direction.
+/// For UDP it acts as `No`: a datagram cannot grow. Explicit selection
+/// bypasses matchers only for the chosen transport.
 #[derive(Clone)]
 pub struct Registry {
     entries: Vec<Arc<Entry>>,
-    choice: Option<String>,
+    choice: [Option<String>; 2],
+}
+
+impl std::fmt::Debug for Registry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Registry")
+            .field("names", &self.entries.iter().map(|e| &e.name).collect::<Vec<_>>())
+            .field("choice", &self.choice)
+            .finish()
+    }
 }
 
 impl Default for Registry {
@@ -90,7 +103,7 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
-            choice: None,
+            choice: [None, None],
         }
     }
 
@@ -121,7 +134,7 @@ impl Registry {
         D: Present + Send + 'static,
         D::Error: Clone + Send,
     {
-        self.register_protocol(name, matches, move |selection| {
+        self.register_protocol(name, matches, move |selection, _| {
             Box::new(Pair {
                 dirs: make(selection).map(|d| Some(Observed::with_buffer(d, limit))),
             })
@@ -130,11 +143,13 @@ impl Registry {
 
     /// Registers a session factory through the same selection mechanism
     /// as a byte decoder. A duplicate name replaces its earlier factory.
+    /// The factory receives this registry, including all user registrations.
+    /// Clone it to select protocols inside a session such as TLS.
     pub fn register_protocol(
         &mut self,
         name: &str,
         matches: impl Fn(Selection<'_>) -> Match + Send + Sync + 'static,
-        make: impl Fn(Selection<'_>) -> Box<dyn Protocol> + Send + Sync + 'static,
+        make: impl Fn(Selection<'_>, &Registry) -> Box<dyn Protocol> + Send + Sync + 'static,
     ) {
         self.entries.retain(|entry| entry.name != name);
         self.entries.push(Arc::new(Entry {
@@ -144,44 +159,44 @@ impl Registry {
         }));
     }
 
-    /// Selects a registered name explicitly for subsequent conversations.
+    /// Selects a registered name for subsequent conversations on `transport`.
     /// Returns false for an unknown name and leaves the choice unchanged.
-    pub fn choose(&mut self, name: &str) -> bool {
+    pub fn choose(&mut self, transport: Transport, name: &str) -> bool {
         if !self.entries.iter().any(|entry| entry.name == name) {
             return false;
         }
-        self.choice = Some(name.to_owned());
+        self.choice[transport as usize] = Some(name.to_owned());
         true
     }
 
-    /// Restores selection by matchers.
-    pub fn automatic(&mut self) {
-        self.choice = None;
+    /// Restores selection by matchers for `transport`.
+    pub fn automatic(&mut self, transport: Transport) {
+        self.choice[transport as usize] = None;
     }
 
     /// Returns the selected name, or the decision to wait or reject.
     pub fn select(&self, input: Selection<'_>) -> Result<&str, Match> {
-        if let Some(name) = &self.choice {
+        if let Some(name) = &self.choice[input.transport as usize] {
             return Ok(name);
         }
         for entry in self.entries.iter().rev() {
             match (entry.matches)(input) {
                 Match::Yes => return Ok(&entry.name),
-                Match::More => return Err(Match::More),
-                Match::No => {}
+                Match::More if input.transport == Transport::Tcp => return Err(Match::More),
+                Match::More | Match::No => {}
             }
         }
         Err(Match::No)
     }
 
     /// Instantiates the selected conversation. Returns `More` while a
-    /// matcher needs prefix bytes, or `No` when nothing matches.
+    /// TCP matcher needs prefix bytes, or `No` when nothing matches.
     pub fn open(&self, input: Selection<'_>) -> Result<Box<dyn Protocol>, Match> {
         let name = self.select(input)?;
         self.entries
             .iter()
             .find(|e| e.name == name)
-            .map(|e| (e.make)(input))
+            .map(|e| (e.make)(input, self))
             .ok_or(Match::No)
     }
 }
@@ -242,6 +257,7 @@ mod tests {
             transport: Transport::Tcp,
             ports,
             first,
+            alpn: None,
         }
     }
 
@@ -276,12 +292,41 @@ mod tests {
         assert_eq!(registry.select(input((9, 10), b"tiny!")), Ok("prefix"));
         assert_eq!(registry.select(input((9, 42), b"ti")), Err(Match::More));
         assert_eq!(registry.select(input((9, 10), b"other")), Err(Match::No));
-        assert!(registry.choose("port"));
+        assert!(registry.choose(Transport::Tcp, "port"));
         assert_eq!(registry.select(input((9, 10), b"tiny!")), Ok("port"));
-        assert!(!registry.choose("missing"));
+        assert!(!registry.choose(Transport::Tcp, "missing"));
         assert_eq!(registry.select(input((9, 10), b"tiny!")), Ok("port"));
-        registry.automatic();
+        registry.automatic(Transport::Tcp);
         assert_eq!(registry.select(input((9, 10), b"tiny!")), Ok("prefix"));
+    }
+
+    #[test]
+    fn transport_choices_and_incomplete_tcp_matchers_do_not_hide_datagrams() {
+        let mut registry = Registry::default();
+        assert!(registry.choose(Transport::Tcp, "http1"));
+        registry.register(
+            "short-prefix",
+            |_| Match::More,
+            |_| [Modbus::new(true), Modbus::new(false)],
+        );
+        for (ports, name) in [((40000, 53), "dns"), ((67, 68), "dhcp")] {
+            let selection = Selection {
+                transport: Transport::Udp,
+                ..input(ports, &[0])
+            };
+            assert_eq!(registry.select(selection), Ok(name));
+        }
+        assert_eq!(registry.select(input((40000, 53), &[0])), Ok("http1"));
+        assert!(registry.choose(Transport::Udp, "dns"));
+        let selection = Selection {
+            transport: Transport::Udp,
+            ..input((67, 68), &[0])
+        };
+        assert_eq!(registry.select(selection), Ok("dns"));
+        registry.automatic(Transport::Udp);
+        assert_eq!(registry.select(selection), Ok("dhcp"));
+        registry.automatic(Transport::Tcp);
+        assert_eq!(registry.select(input((40000, 53), &[0])), Err(Match::More));
     }
 
     #[test]

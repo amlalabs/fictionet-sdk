@@ -104,6 +104,11 @@ impl Decoded {
         super::app::info(self, level, protocol, text);
     }
 
+    /// The summary priority: 0 for transport, 1 for TLS, 2 for applications.
+    pub fn level(&self) -> u8 {
+        self.level
+    }
+
     /// The layers as a JSON array.
     pub fn layers_json(&self) -> String {
         let mut out = String::new();
@@ -205,8 +210,9 @@ impl Decoded {
         }
     }
 
-    /// Cuts the list line to [`MAX_INFO`] bytes.
-    pub(crate) fn cap_info(&mut self) {
+    /// Keeps at most 1,024 bytes of the list line, then adds an ellipsis
+    /// if it was shortened. The cut preserves UTF-8 character boundaries.
+    pub fn cap_info(&mut self) {
         if self.info.len() > MAX_INFO {
             let mut end = MAX_INFO;
             while !self.info.is_char_boundary(end) {
@@ -224,6 +230,15 @@ pub struct Dissector {
     tcp: super::stream::Streams,
     /// Stop at the transport layer.
     headers_only: bool,
+}
+
+impl std::fmt::Debug for Dissector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Dissector")
+            .field("registry", self.tcp.registry())
+            .field("headers_only", &self.headers_only)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The two big-endian bytes at `i`.
@@ -538,7 +553,7 @@ fn udp(p: &[u8], at: usize, end: usize, d: &mut Decoded, apps: bool, registry: &
         return;
     }
     let bytes = &p[body.0..body.1];
-    let selection = super::Selection { transport: super::Transport::Udp, ports: (sport, dport), first: bytes.get(..bytes.len().min(64)).unwrap_or_default() };
+    let selection = super::Selection { transport: super::Transport::Udp, ports: (sport, dport), alpn: None, first: bytes.get(..bytes.len().min(64)).unwrap_or_default() };
     if let Ok(mut protocol) = registry.open(selection) {
         let place = super::Place { stream_start: 0, buf: 0, offset: Some(body.0), len: bytes.len() };
         protocol.data(false, bytes, place, d, &[]);

@@ -4,13 +4,15 @@
 //! as its library. That build has no `cfg(test)`, so the copied modules' unit
 //! tests are compiled out. The SDK already runs them in `cargo test --lib`;
 //! running their parser and fuzz loops again would nearly double that work.
-//! This integration target runs only the two public-trait checks below.
+//! This integration target runs only the public-trait checks below.
 
 #![allow(dead_code)]
 
 #[cfg(not(test))]
 macro_rules! protocols {
     () => {
+        #[path = "../src/observe/protocols.rs"]
+        pub mod observe_protocols;
         #[path = "../src/stdlib/amqp.rs"]
         pub mod amqp;
         #[path = "../src/stdlib/asn1.rs"]
@@ -247,4 +249,73 @@ fn copied_modbus_uses_the_public_driver_and_map() {
     finish(&mut stream, |item| requests.push(item)).unwrap();
     assert_eq!(requests, [Ok(request)]);
     assert!(stream.is_done());
+}
+
+#[test]
+fn copied_presenters_plug_into_observe_and_construct_display_items() {
+    use fictionet::observe::{
+        Decoded, Layer, Match, Observed, Place, Present, Registry, Selection, Transport,
+    };
+    let mut registry = Registry::new();
+    registry.register(
+        "modbus",
+        |_| Match::Yes,
+        |_| {
+            [
+                observe_protocols::Modbus::new(true),
+                observe_protocols::Modbus::new(false),
+            ]
+        },
+    );
+    let mut protocol = registry
+        .open(Selection {
+            transport: Transport::Tcp,
+            ports: (40000, 502),
+            first: &[],
+            alpn: None,
+        })
+        .unwrap();
+    let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
+    let mut packet = Decoded::default();
+    protocol.data(
+        false,
+        &bytes,
+        Place {
+            offset: Some(0),
+            len: bytes.len(),
+            ..Place::default()
+        },
+        &mut packet,
+        &[],
+    );
+    assert_eq!(packet.proto, "Modbus/TCP");
+    assert_eq!(packet.layers[0].range, (0, bytes.len()));
+    let item = observe_protocols::Display::from_packet(packet, "Copied frame");
+    assert!(observe_protocols::Modbus::summary(&item).contains("transaction 7"));
+    assert!(format!("{registry:?}").contains("modbus"));
+    assert!(
+        format!("{:?}", Observed::new(observe_protocols::Modbus::new(true))).contains("Modbus/TCP")
+    );
+
+    let mut packet = Decoded::default();
+    packet.application(2, "Custom", "message");
+    assert_eq!(packet.level(), 2);
+    packet.push(Layer::new("Custom", 0, (0, 1)));
+    let item = observe_protocols::Display::from_packet(packet, "Custom bytes");
+    let mut layer = Layer::new("Custom", 0, (0, 1));
+    observe_protocols::Dns::fields(&item, b"x", &mut layer);
+    let mut packet = Decoded::default();
+    observe_protocols::Dns::present(
+        &item,
+        b"x",
+        0,
+        &fictionet::observe::Placement::new(Place {
+            offset: Some(4),
+            len: 1,
+            ..Place::default()
+        }),
+        &mut packet,
+    );
+    assert_eq!(packet.layers[0].range, (4, 5));
+    assert_eq!(packet.info, "message");
 }

@@ -72,9 +72,13 @@ fn before(a: u32, b: u32) -> bool {
 }
 
 impl Streams {
-    pub(crate) fn with_registry(registry: Registry) -> Self { Self { registry, ..Self::default() } }
+    pub(crate) fn with_registry(registry: Registry) -> Self {
+        Self { registry, ..Self::default() }
+    }
 
-    pub(crate) fn registry(&self) -> &Registry { &self.registry }
+    pub(crate) fn registry(&self) -> &Registry {
+        &self.registry
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn segment(

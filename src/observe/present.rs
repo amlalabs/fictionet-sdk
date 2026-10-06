@@ -6,6 +6,8 @@ use crate::stdlib::codec::{Decode, Fail, Spans, Stream};
 ///
 /// Implement this trait on a copied protocol decoder or on your own decoder.
 /// Register it with [`Registry::register`](super::Registry::register).
+/// Driving it through [`Observed`] or a registry requires `Self::Error: Clone`.
+/// The stream retains a terminal error while reporting it once to the caller.
 ///
 /// ```
 /// use fictionet::observe::{Layer, Present, Registry, Selection, Match, Transport};
@@ -140,6 +142,13 @@ impl Placement {
         true
     }
 
+    /// Accesses an outward hop, numbered from the innermost stream at zero.
+    /// Record each new payload before feeding its bytes to [`Observed::data`].
+    /// Replacements must keep the same stream offset coordinates.
+    pub fn hop_mut(&mut self, index: usize) -> Option<&mut Spans> {
+        self.hops.get_mut(index)
+    }
+
     /// Changes the terminal packet run without changing the span chain.
     pub fn packet(&mut self, at: Place) {
         self.at = at;
@@ -205,6 +214,20 @@ pub struct Observed<D: Present> {
     origin: Option<u64>,
     pending: bool,
     limit: usize,
+    lost: bool,
+}
+
+impl<D: Present> std::fmt::Debug for Observed<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Observed")
+            .field("protocol", &D::NAME)
+            .field("buffered", &self.stream.buffered())
+            .field("held", &self.stream.held())
+            .field("place", &self.place)
+            .field("origin", &self.origin)
+            .field("done", &self.is_done())
+            .finish()
+    }
 }
 
 impl<D: Present> Observed<D> {
@@ -223,15 +246,17 @@ impl<D: Present> Observed<D> {
             origin: None,
             pending: false,
             limit,
+            lost: false,
         }
     }
 
     /// Whether input or a skipped payload is waiting for more bytes.
     pub fn waiting(&self) -> bool {
-        !self.stream.is_done() && (self.stream.buffered() != 0 || self.pending)
+        !self.is_done() && (self.stream.buffered() != 0 || self.pending)
     }
 
-    /// Accesses the placement chain, for nested byte streams.
+    /// Accesses the placement chain, for nested byte streams. On first use,
+    /// the innermost hop must end at the end of the supplied byte chunk.
     pub fn placement(&mut self) -> &mut Placement {
         &mut self.place
     }
@@ -246,9 +271,9 @@ impl<D: Present> Observed<D> {
         self.stream.buffered()
     }
 
-    /// Whether the decoder has stopped, including after an error.
+    /// Whether decoding has stopped, including after an error or refused input.
     pub fn is_done(&self) -> bool {
-        self.stream.is_done()
+        self.lost || self.stream.is_done()
     }
 
     /// The terminal error, if any.
@@ -256,11 +281,17 @@ impl<D: Present> Observed<D> {
         self.stream.failed()
     }
 
-    /// Drops unread input and resets protocol state after a gap.
+    /// Drops unread input and resets protocol state after a gap. Keeps the
+    /// placement hops and starts at the innermost hop's next byte offset.
+    /// Call this before recording the next payload's spans.
     pub fn reset(self) -> Self {
         let (_, mut decoder) = self.stream.into_parts();
         decoder.reset();
-        Self::with_buffer(decoder, self.limit)
+        Self {
+            origin: self.place.hops.first().map(Spans::inner_offset),
+            place: self.place,
+            ..Self::with_buffer(decoder, self.limit)
+        }
     }
 }
 
@@ -270,7 +301,8 @@ where
 {
     /// Feeds ordered bytes and adds all completed items to `packet`.
     /// `at` describes this chunk in the current packet, even if the chunk
-    /// completes an item that started in a previous packet.
+    /// completes an item that started in a previous packet. Refused buffer
+    /// input marks the direction lost until [`reset`](Self::reset).
     pub fn data(&mut self, bytes: &[u8], at: Place, packet: &mut Decoded) {
         self.data_with(bytes, at, packet, |item, raw, start, place, packet| {
             D::present(&item, raw, start, place, packet);
@@ -287,11 +319,14 @@ where
         packet: &mut Decoded,
         mut present: impl FnMut(D::Item, &[u8], u64, &Placement, &mut Decoded),
     ) {
+        if self.lost {
+            return;
+        }
         self.place.packet(at);
-        let origin = *self.origin.get_or_insert(if self.place.hops.is_empty() {
-            at.stream_start
-        } else {
-            0
+        let origin = *self.origin.get_or_insert_with(|| {
+            self.place.hops.first().map_or(at.stream_start, |spans| {
+                spans.inner_offset().saturating_sub(bytes.len() as u64)
+            })
         });
         loop {
             let n = self.stream.push(bytes);
@@ -310,7 +345,18 @@ where
                 }
             }
             self.pending = self.stream.decoder().pending();
-            if bytes.is_empty() || self.stream.is_done() || n == 0 {
+            if bytes.is_empty() || self.stream.is_done() {
+                break;
+            }
+            if n == 0 {
+                // Refused input (including allocation failure) breaks framing.
+                // Stop until reset rather than joining across missing bytes.
+                self.lost = true;
+                packet.tag("malformed");
+                D::error(&Fail::Stuck {
+                    unread: self.stream.buffered(),
+                    capacity: self.stream.decoder().capacity(),
+                }, packet);
                 break;
             }
         }
@@ -320,6 +366,9 @@ where
     /// [`Present::error`]. Pass the packet used by the last `data` call,
     /// or clear its placement first if EOF arrives in a later packet.
     pub fn end(&mut self, packet: &mut Decoded) {
+        if self.lost {
+            return;
+        }
         self.stream.end();
         while let Some(result) = self.stream.with_next(|item, raw, range| {
             D::present(
@@ -385,6 +434,112 @@ mod tests {
         observed.data(b"y", Place::default(), &mut later);
         assert!(later.tags.is_empty());
         assert!(later.info.is_empty());
+    }
+
+    struct Two;
+    impl Decode for Two {
+        type Item = ();
+        type Error = std::convert::Infallible;
+        const NAME: &'static str = "Two";
+        fn capacity(&self) -> usize {
+            2
+        }
+        fn decode(
+            &mut self,
+            input: &[u8],
+            _: bool,
+        ) -> Result<crate::stdlib::codec::Step<()>, Self::Error> {
+            Ok(if input.len() >= 2 {
+                crate::stdlib::codec::Step::Item((), 2)
+            } else {
+                crate::stdlib::codec::Step::Need
+            })
+        }
+    }
+    impl Present for Two {
+        fn summary(_: &()) -> String {
+            "two bytes".into()
+        }
+        fn fields(_: &(), _: &[u8], _: &mut Layer) {}
+    }
+
+    #[test]
+    fn reset_keeps_hops_and_uses_the_next_inner_offset() {
+        let mut spans = Spans::new(8);
+        spans.skip(4);
+        spans.push_exact(2);
+        let mut observed = Observed::new(Two);
+        assert!(observed.placement().through(spans));
+        let at = Place {
+            offset: Some(0),
+            len: 6,
+            ..Place::default()
+        };
+        let mut packet = Decoded::default();
+        observed.data(b"ab", at, &mut packet);
+        assert_eq!((packet.layers[0].buf, packet.layers[0].range), (0, (4, 6)));
+        observed = observed.reset();
+        let mut packet = Decoded::default();
+        observed.data(
+            b"cd",
+            Place {
+                stream_start: 6,
+                ..at
+            },
+            &mut packet,
+        );
+        // Without a fresh mapping the next item must get its own bytes.
+        assert_eq!((packet.layers[0].buf, packet.layers[0].range), (1, (0, 2)));
+        assert_eq!(packet.extra[0].1, b"cd");
+    }
+
+    #[test]
+    fn live_hops_keep_mapping_payloads_after_reset() {
+        let mut observed = Observed::new(Two);
+        assert!(observed.placement().through(Spans::new(8)));
+        for stream_start in [0, 6, 12] {
+            let spans = observed.placement().hop_mut(0).unwrap();
+            spans.skip(4);
+            spans.push_exact(2);
+            let mut packet = Decoded::default();
+            observed.data(
+                b"ab",
+                Place {
+                    stream_start,
+                    offset: Some(0),
+                    len: 6,
+                    ..Place::default()
+                },
+                &mut packet,
+            );
+            assert_eq!((packet.layers[0].buf, packet.layers[0].range), (0, (4, 6)));
+            assert!(packet.extra.is_empty());
+            observed = observed.reset();
+        }
+        assert!(observed.placement().hop_mut(1).is_none());
+    }
+
+    #[test]
+    fn first_use_starts_at_the_current_inner_run() {
+        let mut spans = Spans::new(8);
+        spans.skip(4);
+        spans.push_exact(2);
+        spans.skip(4);
+        spans.push_exact(2);
+        let mut observed = Observed::new(Two);
+        assert!(observed.placement().through(spans));
+        let mut packet = Decoded::default();
+        observed.data(
+            b"cd",
+            Place {
+                stream_start: 6,
+                offset: Some(0),
+                len: 6,
+                ..Place::default()
+            },
+            &mut packet,
+        );
+        assert_eq!((packet.layers[0].buf, packet.layers[0].range), (0, (4, 6)));
     }
 
     #[test]

@@ -16,6 +16,7 @@ use crate::watch::KeyLine;
 
 use super::{Match, Observed, Place, Placement, Present, Protocol, Registry, Selection, Transport};
 use super::protocols;
+use super::protocols::{MAX_BUFFER, preview};
 
 /// Sets the packet's protocol and info from a message at `level`: 1 for
 /// TLS records, 2 for what they carry and for plain HTTP. A higher level
@@ -36,31 +37,18 @@ pub(super) fn info(d: &mut Decoded, level: u8, proto: &str, text: &str) {
     d.cap_info();
 }
 
-/// Text for a preview of bytes: the start, if it reads as text.
-pub(super) fn preview(b: &[u8]) -> Option<String> {
-    let cut = &b[..b.len().min(160)];
-    let text = std::str::from_utf8(cut).ok()?;
-    if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
-        let mut t = text.replace("\r\n", "\\r\\n").replace('\n', "\\n");
-        if b.len() > cut.len() {
-            t.push('…');
-        }
-        Some(t)
-    } else {
-        None
-    }
-}
-
 // ---------------------------------------------------------------------------
 // TCP conversations
 
 const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
-/// Bytes a direction may hold while waiting for the end of a message. A
-/// longer message whose length its header gives is shown by that header,
-/// and the rest of it is skipped. One whose end cannot be found that way
-/// is dropped. TCP follows at most 512 directions (see `stream`). The
-/// codec presenters also bound input, with read-ahead for one packet.
-const MAX_BUFFER: usize = 32 << 10;
+// Bytes a direction may hold while waiting for the end of a message. A
+// longer message whose length its header gives is shown by that header,
+// and the rest of it is skipped. One whose end cannot be found that way
+// is dropped. TCP follows at most 512 directions (see `stream`). HTTP/1
+// permits capacity + 65,535 bytes of read-ahead, for one IP packet. Its
+// aggregate input storage is at most 96 MiB, including the codec buffer
+// compaction space. Decoder state and TLS record/handshake buffers have
+// separate bounds. User decoders declare their own capacities.
 /// The longest HTTP/2 header block kept across CONTINUATION frames.
 const MAX_HEADER_BLOCK: usize = 64 << 10;
 
@@ -122,6 +110,7 @@ impl Dir {
 /// address and port sort first.
 pub(crate) struct Conversation {
     ports: (u16, u16),
+    alpn: Option<String>,
     registry: Registry,
     protocol: Option<Box<dyn Protocol>>,
     prefix: [Vec<u8>; 2],
@@ -141,11 +130,12 @@ impl Conversation {
     }
 
     pub(crate) fn with_registry(port_a: u16, port_b: u16, registry: Registry) -> Self {
-        Self { ports: (port_a, port_b), registry, protocol: None, prefix: [Vec::new(), Vec::new()], prefix_start: [0; 2], rejected: false }
+        Self { ports: (port_a, port_b), alpn: None, registry, protocol: None, prefix: [Vec::new(), Vec::new()], prefix_start: [0; 2], rejected: false }
     }
 
     pub(crate) fn waiting(&self, dir: bool) -> bool {
-        self.protocol.as_ref().is_some_and(|p| p.waiting(dir))
+        !self.prefix[usize::from(dir)].is_empty()
+            || self.protocol.as_ref().is_some_and(|p| p.waiting(dir))
     }
 
     pub(crate) fn lost(&mut self, dir: bool) {
@@ -156,11 +146,6 @@ impl Conversation {
     pub(crate) fn data(&mut self, dir: bool, bytes: &[u8], place: Place, d: &mut Decoded, keys: &[KeyLine]) {
         if self.rejected { return; }
         if let Some(protocol) = &mut self.protocol {
-            let i = usize::from(dir);
-            if let Some(held) = self.prefix.get_mut(i) && !held.is_empty() {
-                protocol.data(dir, held, Place { stream_start: self.prefix_start[i], len: held.len(), ..Place::default() }, d, keys);
-                held.clear();
-            }
             protocol.data(dir, bytes, place, d, keys);
             return;
         }
@@ -169,12 +154,19 @@ impl Conversation {
         let old = prefix.len();
         if old == 0 { self.prefix_start[i] = place.stream_start; }
         prefix.extend_from_slice(bytes.get(..bytes.len().min(64usize.saturating_sub(old))).unwrap_or_default());
-        match self.registry.open(Selection { transport: Transport::Tcp, ports: self.ports, first: prefix }) {
+        match self.registry.open(Selection { transport: Transport::Tcp, ports: self.ports, first: prefix, alpn: self.alpn.as_deref() }) {
             Ok(mut protocol) => {
                 prefix.truncate(old);
-                if !prefix.is_empty() {
-                    protocol.data(dir, prefix, Place { stream_start: self.prefix_start[i], len: prefix.len(), ..Place::default() }, d, keys);
-                    prefix.clear();
+                // Selection applies to both directions. Flush every earlier
+                // prefix now, including a peer that may never send again.
+                for j in [1 - i, i] {
+                    let held = &mut self.prefix[j];
+                    if !held.is_empty() {
+                        protocol.data(j != 0, held, Place {
+                            stream_start: self.prefix_start[j], len: held.len(), ..Place::default()
+                        }, d, keys);
+                        held.clear();
+                    }
                 }
                 protocol.data(dir, bytes, place, d, keys);
                 self.protocol = Some(protocol);
@@ -192,23 +184,23 @@ impl Conversation {
 fn register_http(registry: &mut Registry) {
     registry.register_with_buffer("http1", |s| {
         if s.transport == Transport::Tcp && looks_like_http1(s.first) { Match::Yes } else { Match::No }
-    }, 128 << 10, |_| protocols::Http1::pair());
+    }, MAX_BUFFER + 1 + 65_535, |_| protocols::Http1::pair());
     registry.register_protocol("http2", |s| {
         if s.transport != Transport::Tcp { Match::No }
         else if s.first.starts_with(HTTP2_PREFACE) { Match::Yes }
         else if HTTP2_PREFACE.starts_with(s.first) { Match::More }
         else { Match::No }
-    }, |_| Box::new(H2Session { dirs: [Dir::default(), Dir::default()] }));
+    }, |_, _| Box::new(H2Session { dirs: [Dir::default(), Dir::default()] }));
 }
 
 pub(super) fn register(registry: &mut Registry) {
     register_http(registry);
     registry.register_protocol("tls", |s| {
         if s.transport == Transport::Tcp && s.first.starts_with(&[0x16, 0x03]) { Match::Yes } else { Match::No }
-    }, |_| Box::new(TlsSession::default()));
+    }, |s, registry| Box::new(TlsSession::new(s.ports, registry.clone())));
     registry.register_protocol("modbus", |s| {
         if s.transport == Transport::Tcp && (s.ports.0 == MODBUS_PORT || s.ports.1 == MODBUS_PORT) { Match::Yes } else { Match::No }
-    }, |s| Box::new(ModbusSession { dirs: [Some(Observed::new(protocols::Modbus::new(s.ports.1 == MODBUS_PORT))), Some(Observed::new(protocols::Modbus::new(s.ports.0 == MODBUS_PORT)))], stopped: false }));
+    }, |s, _| Box::new(ModbusSession { dirs: [Some(Observed::new(protocols::Modbus::new(s.ports.1 == MODBUS_PORT))), Some(Observed::new(protocols::Modbus::new(s.ports.0 == MODBUS_PORT)))], stopped: false }));
     registry.register("dhcp", |s| {
         if s.transport == Transport::Udp && matches!(s.ports, (67, 68) | (68, 67)) { Match::Yes } else { Match::No }
     }, |_| [protocols::Dhcp::default(), protocols::Dhcp::default()]);
@@ -575,6 +567,8 @@ fn unpad(payload: &[u8], flags: u8) -> Option<&[u8]> {
 /// One TLS connection: what its hellos said, and its keys.
 #[derive(Default)]
 struct Tls {
+    registry: Registry,
+    ports: (u16, u16),
     client_random: Option<Vec<u8>>,
     /// Which direction is the client's.
     client: Option<usize>,
@@ -599,9 +593,9 @@ struct TlsSession {
     tls: Tls,
     dirs: [Option<Observed<protocols::TlsRecords>>; 2],
 }
-impl Default for TlsSession {
-    fn default() -> Self {
-        Self { tls: Tls::default(), dirs: std::array::from_fn(|_| Some(Observed::with_buffer(protocols::TlsRecords::default(), 65_540))) }
+impl TlsSession {
+    fn new(ports: (u16, u16), registry: Registry) -> Self {
+        Self { tls: Tls { ports, registry, ..Tls::default() }, dirs: std::array::from_fn(|_| Some(Observed::with_buffer(protocols::TlsRecords::default(), 65_540))) }
     }
 }
 impl Protocol for TlsSession {
@@ -820,29 +814,28 @@ impl Tls {
         let kind = record[0];
         let body = &record[5..];
         let version = |tls: &Tls| if tls.tls13 { "TLSv1.3" } else if tls.cipher.is_some() { "TLSv1.2" } else { "TLS" };
-        let mut l = Layer::new("Transport Layer Security", buf, (base, base + record.len()));
+        let place = Placement::new(Place { stream_start: 0, buf, offset: Some(base), len: record.len() });
+        let push = |d: &mut Decoded, layer| place.push(d, 0, record, "Reassembled TLS record", layer);
+        let mut l = Layer::new("Transport Layer Security", 0, (0, record.len()));
         protocols::TlsRecords::fields(&protocols::Record { length: body.len(), oversized: false }, record, &mut l);
-        for field in &mut l.fields {
-            field.range = field.range.and_then(|(a, b)| Some((base.checked_add(a)?, base.checked_add(b)?)));
-        }
         match kind {
             22 => {
-                let names = self.handshake_records(i, body, buf, base + 5, d, &mut l, false);
+                let names = self.handshake_records(i, body, buf, 5, d, &mut l, false);
                 let version = version(self);
                 l.summary = format!("{version} Handshake: {}", names.join(", "));
-                d.push(l);
+                push(d, l);
                 info(d, 1, version, &names.join(", "));
             }
             20 => {
                 let version = version(self);
                 l.summary = "Change Cipher Spec".into();
-                d.push(l);
+                push(d, l);
                 info(d, 1, version, "Change Cipher Spec");
             }
             21 if body.len() >= 2 => {
                 let version = version(self);
                 l.summary = format!("Alert: level {}, description {}", body[0], body[1]);
-                d.push(l);
+                push(d, l);
                 info(d, 1, version, &format!("Alert ({})", body[1]));
             }
             23 => {
@@ -860,7 +853,7 @@ impl Tls {
                             "could not be decrypted"
                         };
                         l.note("Decryption", why);
-                        d.push(l);
+                        push(d, l);
                         info(d, 1, version, "Application Data");
                     }
                     Some((inner, plain, app)) => {
@@ -880,18 +873,18 @@ impl Tls {
                                 }
                                 l.summary = format!("{version} Application Data: {}", names.join(", "));
                                 hl.summary = names.join(", ");
-                                d.push(l);
+                                push(d, l);
                                 d.push(hl);
                                 info(d, 1, version, &names.join(", "));
                             }
                             21 => {
                                 l.summary = format!("{version} Alert (decrypted)");
-                                d.push(l);
+                                push(d, l);
                                 info(d, 1, version, "Encrypted Alert");
                             }
                             _ => {
                                 l.summary = format!("{version} Application Data, {} bytes decrypted", plain.len());
-                                d.push(l);
+                                push(d, l);
                                 let inner_place = Place { stream_start: self.inner_offsets[i], buf: pb, offset: Some(0), len: plain.len() };
                                 self.inner_data(i, &plain, inner_place, d);
                             }
@@ -901,7 +894,7 @@ impl Tls {
             }
             _ => {
                 l.summary = format!("Record type {kind}");
-                d.push(l);
+                push(d, l);
             }
         }
     }
@@ -910,19 +903,20 @@ impl Tls {
     fn inner_data(&mut self, i: usize, plain: &[u8], place: Place, d: &mut Decoded) {
         self.inner_offsets[i] = self.inner_offsets[i].saturating_add(plain.len() as u64);
         if self.inner.is_none() {
-            let mut registry = Registry::new();
-            register_http(&mut registry);
-            let selected = match self.alpn.as_deref() {
-                Some("h2") => "http2".to_owned(),
-                Some(_) => "http1".to_owned(),
-                None => {
-                    let selection = Selection { transport: Transport::Tcp, ports: (0, 0), first: plain.get(..plain.len().min(64)).unwrap_or_default() };
-                    let Ok(name) = registry.select(selection) else { return };
-                    name.to_owned()
-                }
+            let mut registry = self.registry.clone();
+            registry.automatic(Transport::Tcp);
+            let hint = match self.alpn.as_deref() {
+                Some("h2") => Some("http2"),
+                Some("http/1.1") => Some("http1"),
+                _ => None,
             };
-            registry.choose(&selected);
-            self.inner = Some(Conversation::with_registry(0, 0, registry));
+            if let Some(name) = hint {
+                // Unknown names leave automatic selection in place.
+                registry.choose(Transport::Tcp, name);
+            }
+            let mut inner = Conversation::with_registry(self.ports.0, self.ports.1, registry);
+            inner.alpn.clone_from(&self.alpn);
+            self.inner = Some(inner);
         }
         if let Some(conversation) = &mut self.inner { conversation.data(i != 0, plain, place, d, &[]); }
     }
@@ -954,15 +948,21 @@ impl Tls {
             names.push("part of a handshake message".into());
             return names;
         }
+        // `held` starts with one incomplete message. Checking its length
+        // is constant work until it is complete; append without copying
+        // that prefix on every record.
         held.extend_from_slice(body);
+        let whole = whole_messages(held);
+        if whole == 0 {
+            if held.len() > MAX_HANDSHAKE {
+                held.clear();
+            }
+            return vec!["part of a handshake message".into()];
+        }
         let joined = std::mem::take(held);
-        let whole = whole_messages(&joined);
         if joined.len() - whole <= MAX_HANDSHAKE {
             let held = if decrypted { &mut self.hs_sealed[i] } else { &mut self.hs_plain[i] };
             held.extend_from_slice(&joined[whole..]);
-        }
-        if whole == 0 {
-            return vec!["part of a handshake message".into()];
         }
         let _ = buf;
         let rb = d.buffer("Reassembled TLS handshake", joined[..whole].to_vec());
@@ -1309,6 +1309,251 @@ mod tests {
         }
         key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::from(header), &mut inner).unwrap();
         [&header[..], &inner].concat()
+    }
+
+    struct Tiny;
+    impl crate::stdlib::codec::Decode for Tiny {
+        type Item = Vec<u8>;
+        type Error = std::convert::Infallible;
+        const NAME: &'static str = "Tiny";
+        fn capacity(&self) -> usize {
+            256
+        }
+        fn decode(
+            &mut self,
+            input: &[u8],
+            _: bool,
+        ) -> Result<crate::stdlib::codec::Step<Vec<u8>>, Self::Error> {
+            use crate::stdlib::codec::Step;
+            let Some(&len) = input.first() else {
+                return Ok(Step::Need);
+            };
+            let end = 1 + usize::from(len);
+            Ok(match input.get(1..end) {
+                Some(bytes) => Step::Item(bytes.to_vec(), end),
+                None => Step::Need,
+            })
+        }
+    }
+    impl Present for Tiny {
+        fn summary(item: &Vec<u8>) -> String {
+            String::from_utf8_lossy(item).into_owned()
+        }
+        fn fields(_: &Vec<u8>, _: &[u8], _: &mut Layer) {}
+    }
+
+    fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut message = vec![kind, 0, (body.len() >> 8) as u8, body.len() as u8];
+        message.extend_from_slice(body);
+        message
+    }
+
+    fn tls_user_protocol(alpn: Option<&str>, replacement: bool, http_builtins: bool) {
+        let mut registry = if http_builtins {
+            Registry::default()
+        } else {
+            let mut registry = Registry::new();
+            registry.register_protocol(
+                "tls",
+                |s| {
+                    if s.first.starts_with(&[22, 3]) {
+                        Match::Yes
+                    } else {
+                        Match::No
+                    }
+                },
+                |s, registry| Box::new(TlsSession::new(s.ports, registry.clone())),
+            );
+            registry
+        };
+        let expected_alpn = alpn.map(str::to_owned);
+        registry.register(
+            if replacement { "http1" } else { "tiny" },
+            move |s| {
+                if replacement {
+                    return Match::No;
+                }
+                if s.ports != (40000, 9443) {
+                    return Match::No;
+                }
+                if expected_alpn.as_deref() == Some("alpn-only") {
+                    return if s.alpn == Some("alpn-only") {
+                        Match::Yes
+                    } else {
+                        Match::No
+                    };
+                }
+                if s.first.starts_with(b"\x05hello") {
+                    assert_eq!(s.alpn, expected_alpn.as_deref());
+                    Match::Yes
+                } else if b"\x05hello".starts_with(s.first) {
+                    Match::More
+                } else {
+                    Match::No
+                }
+            },
+            |_| [Tiny, Tiny],
+        );
+        let mut conversation = Conversation::with_registry(40000, 9443, registry);
+        let keys: Vec<_> = [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_TRAFFIC_SECRET_0",
+        ]
+        .into_iter()
+        .map(|label| KeyLine {
+            label: label.into(),
+            client_random: vec![7; 32],
+            secret: vec![if label.contains("HANDSHAKE") { 2 } else { 1 }; 32],
+        })
+        .collect();
+        let mut offsets = [0; 2];
+        let mut feed = |reverse: bool, record: &[u8]| {
+            let i = usize::from(reverse);
+            let mut packet = Decoded::default();
+            conversation.data(
+                reverse,
+                record,
+                Place {
+                    stream_start: offsets[i],
+                    offset: Some(0),
+                    len: record.len(),
+                    ..Place::default()
+                },
+                &mut packet,
+                &keys,
+            );
+            offsets[i] += record.len() as u64;
+            packet
+        };
+        let clear_record = |message: &[u8]| {
+            let mut record = vec![22, 3, 3, (message.len() >> 8) as u8, message.len() as u8];
+            record.extend_from_slice(message);
+            record
+        };
+        let mut client = vec![3, 3];
+        client.extend_from_slice(&[7; 32]);
+        client.extend_from_slice(&[0, 0, 2, 0x13, 1, 1, 0, 0, 0]);
+        feed(false, &clear_record(&handshake_message(1, &client)));
+        let mut server = vec![3, 3];
+        server.extend_from_slice(&[8; 32]);
+        server.extend_from_slice(&[0, 0x13, 1, 0, 0, 6, 0, 43, 0, 2, 3, 4]);
+        feed(true, &clear_record(&handshake_message(2, &server)));
+        if let Some(alpn) = alpn {
+            let mut extension = vec![
+                0,
+                16,
+                0,
+                (alpn.len() + 3) as u8,
+                0,
+                (alpn.len() + 1) as u8,
+                alpn.len() as u8,
+            ];
+            extension.extend_from_slice(alpn.as_bytes());
+            let mut body = (extension.len() as u16).to_be_bytes().to_vec();
+            body.extend_from_slice(&extension);
+            feed(true, &seal(&[2; 32], 0, 22, &handshake_message(8, &body)));
+        }
+        // Split the plaintext prefix across records to exercise deferred selection.
+        feed(false, &seal(&[1; 32], 0, 23, b"\x05he"));
+        let packet = feed(false, &seal(&[1; 32], 1, 23, b"llo"));
+        assert!(packet.tags.contains(&"decrypted"));
+        assert_eq!(packet.proto, "Tiny");
+        assert_eq!(packet.info, "hello");
+        assert_eq!(packet.extra.last().unwrap().1, b"\x05hello");
+    }
+
+    #[test]
+    fn tls_selects_a_user_protocol_with_custom_alpn() {
+        tls_user_protocol(Some("tiny"), false, true);
+    }
+
+    #[test]
+    fn tls_selects_a_user_protocol_without_alpn() {
+        tls_user_protocol(None, false, true);
+    }
+
+    #[test]
+    fn tls_uses_a_user_replacement_for_http1() {
+        tls_user_protocol(Some("http/1.1"), true, true);
+    }
+
+    #[test]
+    fn tls_matchers_can_use_alpn_and_missing_http_hints_fall_back() {
+        tls_user_protocol(Some("alpn-only"), false, true);
+        for alpn in ["h2", "http/1.1"] {
+            tls_user_protocol(Some(alpn), false, false);
+        }
+    }
+
+    #[test]
+    fn selection_flushes_the_other_directions_prefix() {
+        for partial in [false, true] {
+            let mut registry = Registry::new();
+            registry.register(
+                "tiny",
+                |s| {
+                    if s.first == b"\x01b" {
+                        Match::Yes
+                    } else {
+                        Match::More
+                    }
+                },
+                |_| [Tiny, Tiny],
+            );
+            let mut f = Feeder {
+                c: Conversation::with_registry(1, 2, registry),
+                at: [0, 0],
+            };
+            let prefix: &[u8] = if partial { b"\x05he" } else { b"\x01a" };
+            f.send(false, prefix, prefix.len());
+            assert!(f.c.waiting(false));
+            let packet = f.send(true, b"\x01b", 2);
+            assert!(f.c.prefix.iter().all(Vec::is_empty));
+            assert_eq!(f.c.waiting(false), partial);
+            if partial {
+                assert_eq!(f.send(false, b"llo", 3).info, "hello");
+                assert!(!f.c.waiting(false));
+            } else {
+                assert_eq!(packet.info, "a, b");
+                assert_eq!(packet.extra[0].1, prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn partial_handshakes_append_without_reallocating_the_held_prefix() {
+        for decrypted in [false, true] {
+            let mut tls = Tls::default();
+            let held = if decrypted {
+                &mut tls.hs_sealed[0]
+            } else {
+                &mut tls.hs_plain[0]
+            };
+            *held = Vec::with_capacity(MAX_HANDSHAKE);
+            let allocation = held.as_ptr();
+            let message = handshake_message(11, &[0; 4096]);
+            for (i, byte) in message.iter().enumerate() {
+                let mut packet = Decoded::default();
+                let mut layer = Layer::new("TLS", 0, (0, 1));
+                let names =
+                    tls.handshake_records(0, &[*byte], 0, 0, &mut packet, &mut layer, decrypted);
+                let held = if decrypted {
+                    &tls.hs_sealed[0]
+                } else {
+                    &tls.hs_plain[0]
+                };
+                if i + 1 < message.len() {
+                    assert_eq!(held.as_ptr(), allocation);
+                    assert_eq!(held.len(), i + 1);
+                } else {
+                    assert!(held.is_empty());
+                    assert_eq!(names, ["Certificate"]);
+                    assert_eq!(packet.extra[0].1, message);
+                }
+            }
+        }
     }
 
     fn next_secret(secret: &[u8]) -> Vec<u8> {

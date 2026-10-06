@@ -444,6 +444,7 @@
 //! ignores them, as clients should ignore what they do not know, draws
 //! every task on its own.
 
+/// Copyable capture decoders and presenters for the built-in protocols.
 pub mod protocols;
 mod present;
 mod registry;
@@ -702,9 +703,17 @@ mod tests {
         let watched = graph.clone();
         crate::block_on(crate::run::run_with(graph, move |cx| async move {
             let mut registry = Registry::new();
-            registry.register("custom", |s| {
-                if s.ports.0 == 9000 || s.ports.1 == 9000 { Match::Yes } else { Match::No }
-            }, |_| [protocols::Modbus::new(true), protocols::Modbus::new(false)]);
+            registry.register(
+                "custom",
+                |s| {
+                    if s.ports.0 == 9000 || s.ports.1 == 9000 {
+                        Match::Yes
+                    } else {
+                        Match::No
+                    }
+                },
+                |_| [protocols::Modbus::new(true), protocols::Modbus::new(false)],
+            );
             cx.observe_protocols(registry);
             let meter = Meter::new();
             watched.owns(&meter, 0, 1);
@@ -730,7 +739,8 @@ mod tests {
             assert!(detail.contains(r#""buf":0,"range":[40,52]"#), "{detail}");
             assert!(detail.contains("address 2, quantity 1"), "{detail}");
             Ok(())
-        })).unwrap();
+        }))
+        .unwrap();
     }
 
     /// A watch with no subscriber is forgotten after the linger time,

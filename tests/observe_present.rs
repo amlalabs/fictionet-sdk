@@ -123,7 +123,7 @@ fn user_selection_by_prefix_and_explicit_name_runs_the_same_adapter() {
             |_| [Tiny, Tiny],
         );
         if explicit {
-            assert!(registry.choose("tiny"));
+            assert!(registry.choose(Transport::Tcp, "tiny"));
         }
         let mut dissector = Dissector::with_registry(registry);
         let mut seq = 1;

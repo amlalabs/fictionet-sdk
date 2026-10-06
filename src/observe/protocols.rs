@@ -1,16 +1,12 @@
-//! Capture decoders and presenters registered by [`super::Registry::default`].
-//! These tolerate incomplete captures and preserve the packet display policy.
-
-use super::app;
-use super::decode::be32;
-use super::{Decoded, Layer, Placement, Present};
-use crate::stdlib::codec::{Decode, Fail, Step};
+use fictionet::observe::{Decoded, Layer, Placement, Present};
+use fictionet::stdlib::codec::{Decode, Fail, Step};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::fmt::Write;
 use std::sync::{Arc, Mutex};
 
-const MAX_BUFFER: usize = 32 << 10;
+/// Bytes retained while an incomplete capture message is being framed.
+pub const MAX_BUFFER: usize = 32 << 10;
 
 /// A decoded item's relative layer and packet summary. Capture decoders
 /// produce this value for the shared [`Present`] implementation.
@@ -27,14 +23,18 @@ pub struct Display {
 }
 
 impl Display {
-    pub(super) fn from_packet(mut packet: Decoded, buffer: &'static str) -> Self {
+    /// Takes the packet's last layer, summary, and tags as one display item.
+    /// Layer and field ranges must be relative to the item's raw bytes.
+    /// `buffer` names the reassembly buffer used when the item spans packets.
+    pub fn from_packet(mut packet: Decoded, buffer: &'static str) -> Self {
+        let level = packet.level();
         Self {
             layer: packet.layers.pop(),
             protocol: packet.proto,
             info: packet.info,
             tags: packet.tags,
             buffer,
-            level: packet.level,
+            level,
             offset: 0,
             detached: false,
         }
@@ -105,21 +105,21 @@ macro_rules! display_presenter {
 
 /// Modbus/TCP capture frames. Framing is provided by the stdlib decoder.
 pub struct Modbus {
-    frames: crate::stdlib::modbus::Frames,
+    frames: fictionet::stdlib::modbus::Frames,
     request: bool,
 }
 impl Modbus {
     /// Selects request or response presentation for this direction.
     pub fn new(request: bool) -> Self {
         Self {
-            frames: crate::stdlib::modbus::Frames,
+            frames: fictionet::stdlib::modbus::Frames,
             request,
         }
     }
 }
 impl Decode for Modbus {
     type Item = Display;
-    type Error = crate::stdlib::modbus::FrameError;
+    type Error = fictionet::stdlib::modbus::FrameError;
     const NAME: &'static str = "Modbus/TCP";
     fn capacity(&self) -> usize {
         self.frames.capacity()
@@ -185,6 +185,9 @@ impl Decode for Dns {
             if !eof {
                 return Ok(Step::Need);
             }
+            if input.is_empty() {
+                return Ok(Step::End);
+            }
             (0, input.len())
         };
         if self.tcp && len > MAX_BUFFER - 2 && input.len() < len.saturating_add(2) {
@@ -234,7 +237,7 @@ impl Decode for Dhcp {
         65_536
     }
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Display>, Infallible> {
-        if self.taken || input.len() >= self.capacity() {
+        if self.taken || input.len() >= self.capacity() || (eof && input.is_empty()) {
             return Ok(Step::End);
         }
         if !eof {
@@ -254,23 +257,28 @@ impl Present for Dhcp {
 pub struct Http1 {
     state: Http1State,
     methods: Arc<Mutex<Methods>>,
+    // The other decoder in a pair accounts for this shared queue.
+    shared_methods: bool,
     scanned: usize,
     final_chunk: Option<usize>,
 }
 impl Http1 {
     /// Creates request and response decoders with one shared method queue.
+    /// The first decoder accounts for its at most 64 bytes in `held()`.
     pub fn pair() -> [Self; 2] {
         let methods = Arc::default();
         [
             Self {
                 state: Http1State::default(),
                 methods: Arc::clone(&methods),
+                shared_methods: false,
                 scanned: 0,
                 final_chunk: None,
             },
             Self {
                 state: Http1State::default(),
                 methods,
+                shared_methods: true,
                 scanned: 0,
                 final_chunk: None,
             },
@@ -301,11 +309,12 @@ impl Decode for Http1 {
             Http1State::Body { seen, .. } | Http1State::Chunked { seen, .. } => seen.len(),
             _ => 0,
         };
-        let methods = self.methods.lock().unwrap_or_else(|e| e.into_inner());
-        methods
-            .0
-            .iter()
-            .fold(preview, |sum, method| sum.saturating_add(method.len()))
+        if self.shared_methods {
+            preview
+        } else {
+            let methods = self.methods.lock().unwrap_or_else(|e| e.into_inner());
+            preview.saturating_add(methods.0.len())
+        }
     }
     fn decode(&mut self, input: &[u8], _: bool) -> Result<Step<Display>, Infallible> {
         if matches!(self.state, Http1State::Head) {
@@ -337,9 +346,9 @@ impl Decode for Http1 {
                 } else {
                     methods.0.pop_front()
                 };
-                let body = match method.as_deref() {
-                    Some("CONNECT") if (200..300).contains(&code) => Http1State::Tunnel,
-                    Some("HEAD") => Http1State::Head,
+                let body = match method {
+                    Some(Method::Connect) if (200..300).contains(&code) => Http1State::Tunnel,
+                    Some(Method::Head) => Http1State::Head,
                     _ => body_kind(
                         r.headers,
                         (100..200).contains(&code) || code == 204 || code == 304,
@@ -676,7 +685,7 @@ fn dns_display(msg: &[u8]) -> Display {
 
 fn dhcp_display(bytes: &[u8]) -> Display {
     let mut packet = Decoded::default();
-    let Some(m) = crate::stdlib::dhcp::Message::parse(bytes) else {
+    let Some(m) = fictionet::stdlib::dhcp::Message::parse(bytes) else {
         return Display::from_packet(packet, "DHCP message");
     };
     let d = &mut packet;
@@ -711,7 +720,10 @@ fn dhcp_display(bytes: &[u8]) -> Display {
                 .map(|c| format!("{}.{}.{}.{}", c[0], c[1], c[2], c[3]))
                 .collect::<Vec<_>>()
                 .join(", "),
-            (51, 4) => format!("{} s", be32(value, 0)),
+            (51, 4) => format!(
+                "{} s",
+                u32::from_be_bytes([value[0], value[1], value[2], value[3]])
+            ),
             _ => format!("{} bytes", value.len()),
         };
         let name = match code {
@@ -740,8 +752,8 @@ fn dhcp_display(bytes: &[u8]) -> Display {
     Display::from_packet(packet, "DHCP message")
 }
 
-fn modbus_display(frame: &crate::stdlib::modbus::Frame, used: usize, request: bool) -> Display {
-    use crate::stdlib::modbus::{Request, Response};
+fn modbus_display(frame: &fictionet::stdlib::modbus::Frame, used: usize, request: bool) -> Display {
+    use fictionet::stdlib::modbus::{Request, Response};
     let mut decoded = Decoded::default();
     let d = &mut decoded;
     let (buf, base) = (0, 0);
@@ -812,8 +824,7 @@ fn modbus_display(frame: &crate::stdlib::modbus::Frame, used: usize, request: bo
     );
     l.note(if request { "Request" } else { "Response" }, detail.clone());
     d.push(l);
-    app::info(
-        d,
+    d.application(
         2,
         "Modbus/TCP",
         &format!(
@@ -843,14 +854,25 @@ fn modbus_function(f: u8) -> &'static str {
 
 /// HTTP/1.1 request methods waiting for their responses.
 #[derive(Default)]
-struct Methods(VecDeque<String>);
+struct Methods(VecDeque<Method>);
+
+#[repr(u8)]
+enum Method {
+    Head,
+    Connect,
+    Other,
+}
 
 impl Methods {
     fn push(&mut self, m: &str) {
         if self.0.len() >= 64 {
             self.0.pop_front();
         }
-        self.0.push_back(m.to_owned());
+        self.0.push_back(match m {
+            "HEAD" => Method::Head,
+            "CONNECT" => Method::Connect,
+            _ => Method::Other,
+        });
     }
 }
 
@@ -910,10 +932,25 @@ fn body_kind(headers: &[httparse::Header<'_>], none: bool, response: bool) -> Ht
     }
 }
 
+/// Text for a preview of bytes: the start, if it reads as text.
+pub fn preview(b: &[u8]) -> Option<String> {
+    let cut = &b[..b.len().min(160)];
+    let text = std::str::from_utf8(cut).ok()?;
+    if text.chars().all(|c| !c.is_control() || c == '\n' || c == '\r' || c == '\t') {
+        let mut t = text.replace("\r\n", "\\r\\n").replace('\n', "\\n");
+        if b.len() > cut.len() {
+            t.push('…');
+        }
+        Some(t)
+    } else {
+        None
+    }
+}
+
 fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
     let mut l = Layer::new("HTTP body", 0, (0, 0));
     l.summary = format!("{total} bytes");
-    if let Some(text) = app::preview(seen) {
+    if let Some(text) = preview(seen) {
         l.note("Text", text);
     }
     d.push(l);
@@ -922,7 +959,30 @@ fn body_layer(d: &mut Decoded, total: u64, seen: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Stream, contract::check_decode, test_support::Lcg};
+    use fictionet::stdlib::codec::{Stream, contract::check_decode, test_support::Lcg};
+
+    #[test]
+    fn long_http_methods_keep_only_bounded_framing_state() {
+        let [request, response] = Http1::pair();
+        let mut request = Stream::with_buffer(request, MAX_BUFFER + 1 + 65_535);
+        let response = Stream::new(response);
+        let mut bytes = vec![b'A'; 90_000];
+        bytes.extend_from_slice(b" / HTTP/1.1\r\n\r\n");
+        for count in 1..=65 {
+            assert_eq!(request.push(&bytes[..32_000]), 32_000);
+            assert!(request.next().is_none());
+            assert_eq!(request.push(&bytes[32_000..]), bytes.len() - 32_000);
+            assert!(request.next().unwrap().is_ok());
+            assert!(request.next().is_none());
+            assert_eq!(request.held() + response.held(), count.min(64));
+        }
+    }
+
+    #[test]
+    fn empty_datagrams_end_without_a_display_item() {
+        assert!(matches!(Dns::new(false).decode(&[], true), Ok(Step::End)));
+        assert!(matches!(Dhcp::default().decode(&[], true), Ok(Step::End)));
+    }
 
     #[test]
     fn capture_decoders_follow_the_codec_contract() {
