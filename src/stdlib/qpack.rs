@@ -22,6 +22,15 @@
 //!
 //! ```
 //! use fictionet::stdlib::{codec::Wire, qpack::{self, Encoder, Field, Table, SectionResult}};
+//!
+//! // RFC 9204 Appendix B.1: a literal value with static name entry 1.
+//! let mut bytes = vec![0x00, 0x00, 0x51, 0x0b];
+//! bytes.extend_from_slice(b"/index.html");
+//! let SectionResult::Fields { fields, ack } = qpack::decode_section(&Table::new(4096), 0, &bytes).unwrap()
+//!     else { panic!("section is blocked") };
+//! assert_eq!(fields, [Field::new(":path", "/index.html")]);
+//! assert_eq!(ack, None);
+//!
 //! let mut encoder = Encoder::new(4096, 16 << 10);
 //! let mut table = Table::new(4096);
 //! table.apply(encoder.set_capacity(4096).unwrap()).unwrap();
@@ -31,6 +40,8 @@
 //! let fields = vec![Field::new(":method", "GET"), Field::new("x-trace", "abc")];
 //! let section = encoder.section(4, &fields).unwrap();
 //! let bytes = section.to_bytes().unwrap();
+//! // Prefix, then static entry 17 and dynamic entry 0: four bytes.
+//! assert_eq!(bytes.len(), 4);
 //! let SectionResult::Fields { fields: back, ack } = qpack::decode_section(&table, 4, &bytes).unwrap()
 //!     else { panic!("section is blocked") };
 //! assert_eq!(back, fields);
@@ -404,11 +415,8 @@ impl<const PREFIX: u8> Wire for Integer<PREFIX> {
         }
         let mut c = Cursor { b: bytes, i: 0 };
         let value = c.int(PREFIX).map_err(parse_stop)?;
-        if c.i != bytes.len() {
-            return Err(ParseError::Trailing);
-        }
         let mask = ((1u16 << PREFIX) - 1) as u8;
-        Ok(Self { flags: bytes[0] & !mask, value })
+        exact(Ok((Self { flags: bytes[0] & !mask, value }, c.i)), bytes.len())
     }
 
     /// Writes one integer. Refuses invalid prefix widths, overlapping flags, and overflow.
@@ -430,6 +438,14 @@ fn parse_stop(stop: Stop) -> ParseError {
         Stop::More => ParseError::Truncated,
         Stop::Bad(error) => ParseError::Instruction(error),
     }
+}
+
+fn exact<T>(result: Result<(T, usize), ParseError>, len: usize) -> Result<T, ParseError> {
+    let (value, used) = result?;
+    if used != len {
+        return Err(ParseError::Trailing);
+    }
+    Ok(value)
 }
 
 /// A string encoded with the RFC 7541 Huffman code.
@@ -1049,11 +1065,7 @@ impl Wire for EncodedPrefix {
 
     /// Reads one prefix. Refuses overflowing integers, truncation, and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (prefix, used) = Self::parse_prefix(bytes)?;
-        if used != bytes.len() {
-            return Err(ParseError::Trailing);
-        }
-        Ok(prefix)
+        exact(Self::parse_prefix(bytes), bytes.len())
     }
 
     /// Writes one prefix. Refuses integers above [`MAX_INTEGER`].
@@ -1674,11 +1686,11 @@ impl Wire for EncoderInstruction {
     /// Reads exactly one instruction. Refuses truncation, trailing bytes, integer overflow,
     /// invalid Huffman strings, oversized strings or capacity, and invalid static name indexes.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match EncoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
-            Step::Item(item, used) if used == bytes.len() => item.map_err(ParseError::Instruction),
-            Step::Item(_, _) => Err(ParseError::Trailing),
+        let parsed = match EncoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+            Step::Item(item, used) => Ok((item, used)),
             _ => Err(ParseError::Truncated),
-        }
+        };
+        exact(parsed, bytes.len())?.map_err(ParseError::Instruction)
     }
 
     /// Writes one instruction, using Huffman strings when shorter. Refuses oversized strings,
@@ -1719,11 +1731,11 @@ impl Wire for DecoderInstruction {
 
     /// Reads exactly one instruction. Refuses truncation, trailing bytes, overflow, and zero increments.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        match DecoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
-            Step::Item(item, used) if used == bytes.len() => item.map_err(ParseError::Instruction),
-            Step::Item(_, _) => Err(ParseError::Trailing),
+        let parsed = match DecoderInstructions.decode(bytes, true).map_err(ParseError::Instruction)? {
+            Step::Item(item, used) => Ok((item, used)),
             _ => Err(ParseError::Truncated),
-        }
+        };
+        exact(parsed, bytes.len())?.map_err(ParseError::Instruction)
     }
 
     /// Writes one instruction. Refuses integers above MAX_INTEGER and zero increments.
@@ -1745,14 +1757,13 @@ impl Wire for Representation {
     /// Reads one field line. Refuses truncation, trailing bytes, overflow, invalid Huffman
     /// strings, and excessive string lengths. Table references are resolved by decode_section.
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let (rep, used) = Self::parse_prefix(bytes).map_err(|e| match e {
+        let parsed = Self::parse_prefix(bytes).map_err(|e| {
+            match e {
             Error::Truncated => ParseError::Truncated,
             other => ParseError::Instruction(other),
-        })?;
-        if used != bytes.len() {
-            return Err(ParseError::Trailing);
         }
-        Ok(rep)
+        });
+        exact(parsed, bytes.len())
     }
 
     /// Writes one field line, using Huffman strings when shorter. Refuses integers above
@@ -1791,7 +1802,6 @@ impl Wire for Representation {
         Ok(())
     }
 }
-
 
 /// The value produced by [`decode_section`]. No result is queued internally.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2024,6 +2034,7 @@ mod tests {
     fn integer_examples() {
         assert_eq!(Integer::<5> { flags: 0, value: 10 }.to_bytes().unwrap(), [0x0a]);
         assert_eq!(Integer::<5> { flags: 0, value: 1337 }.to_bytes().unwrap(), [0x1f, 0x9a, 0x0a]);
+        assert_eq!(Integer::<5>::parse(&[0x1f, 0x9a, 0x0a]), Ok(Integer { flags: 0, value: 1337 }));
         assert_eq!(Integer::<8> { flags: 0, value: 42 }.to_bytes().unwrap(), [0x2a]);
         assert_eq!(Integer::<5>::parse(&[0xea]), Ok(Integer { flags: 0xe0, value: 10 }));
         for n in 0..3 {
@@ -2034,7 +2045,9 @@ mod tests {
     #[test]
     fn integer_limits() {
         fn check<const P: u8>() {
-            for value in [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_INTEGER - 1, MAX_INTEGER, u64::MAX] {
+            for value in
+                [0, 1, 30, 31, 127, 128, 255, 256, 1 << 40, MAX_INTEGER - 1, MAX_INTEGER, MAX_INTEGER + 1, u64::MAX]
+            {
                 let unit = Integer::<P> { flags: 0, value };
                 contract::check_wire_value(&unit);
                 if value > MAX_INTEGER {
@@ -2054,7 +2067,9 @@ mod tests {
         check::<8>();
         assert_eq!(Integer::<0> { flags: 0, value: 0 }.to_bytes(), Err(Error::Unwritable));
         assert_eq!(Integer::<9>::parse(&[0]), Err(ParseError::Instruction(Error::IntegerOverflow)));
-        for bytes in [vec![0xff; 30], hex("ff 818080808080808040")] {
+        assert_eq!(Integer::<8>::parse(&hex("ff 80feffffffffffff3f")), Ok(Integer { flags: 0, value: MAX_INTEGER }));
+        // MAX_INTEGER + 1 with an eight-bit prefix.
+        for bytes in [vec![0xff; 30], hex("ff 81feffffffffffff3f")] {
             assert_eq!(Integer::<8>::parse(&bytes), Err(ParseError::Instruction(Error::IntegerOverflow)));
         }
         assert_eq!(
@@ -2500,7 +2515,8 @@ mod tests {
         for cap in [0, 64, 220, 500, 4096] {
             let mut encoder = Encoder::new(cap, 1 << 16);
             let mut table = Table::new(cap);
-            table.apply(encoder.set_capacity(cap).unwrap()).unwrap();
+            let capacity = cap - rng.index((cap / 2 + 1) as usize) as u64;
+            table.apply(encoder.set_capacity(capacity).unwrap()).unwrap();
             let mut instructions = Vec::new();
             let mut acknowledgments = Vec::new();
             for step in 0..1600 {
@@ -2662,7 +2678,9 @@ mod tests {
     fn long_instruction_allocation_contract() {
         let ins = EncoderInstruction::InsertWithLiteralName { name: vec![b'0'; 30_000], value: vec![b'1'; 30_000] };
         let bytes = ins.to_bytes().unwrap();
+        let start = std::time::Instant::now();
         contract::check_decode_with_alloc_limit(EncoderInstructions::new, &bytes, 2 * MAX_INSTRUCTION);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2), "instruction decoding exceeded two seconds");
         let mut table = Table::new(MAX_TABLE_CAPACITY);
         table.set_capacity(MAX_TABLE_CAPACITY).unwrap();
         apply(&mut table, &bytes).unwrap();

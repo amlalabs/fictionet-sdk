@@ -384,17 +384,21 @@ pub struct VarInt(
     pub u64,
 );
 
+fn exact<T>(result: Result<(T, usize), Error>, len: usize) -> Result<T, Error> {
+    let (value, used) = result?;
+    if used != len {
+        return Err(Error::Trailing);
+    }
+    Ok(value)
+}
+
 impl Wire for VarInt {
     type ParseError = Error;
     type WriteError = Error;
 
     /// Reads one integer. Refuses truncation and trailing bytes; accepts longer encodings.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let (value, used) = read_varint(bytes)?;
-        if used != bytes.len() {
-            return Err(Error::Trailing);
-        }
-        Ok(Self(value))
+        exact(read_varint(bytes), bytes.len()).map(Self)
     }
 
     /// Writes the shortest encoding. Refuses values above [`MAX_VARINT`].
@@ -1614,11 +1618,7 @@ impl Wire for Frame {
     /// Reads one frame. Refuses trailing bytes, malformed fields, nonminimal frame types,
     /// and payloads larger than [`MAX_PAYLOAD`]. A padding run is one frame.
     fn parse(bytes: &[u8]) -> Result<Self, Error> {
-        let (frame, used) = Self::parse_prefix(bytes)?;
-        if used != bytes.len() {
-            return Err(Error::Trailing);
-        }
-        Ok(frame)
+        exact(Self::parse_prefix(bytes), bytes.len())
     }
 
     /// Writes a frame. Refuses invalid fields, zero padding, and excessive payload size.

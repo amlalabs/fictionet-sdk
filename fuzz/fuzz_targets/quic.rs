@@ -7,6 +7,13 @@ use fictionet::stdlib::{
 };
 use libfuzzer_sys::fuzz_target;
 
+fn check_payload(bytes: &[u8]) {
+    contract::check_wire::<Payload>(bytes);
+    if let Ok(payload) = Payload::parse(bytes) {
+        assert!(payload.to_bytes().unwrap().len() <= bytes.len());
+    }
+}
+
 fn datagram<const N: usize>(bytes: &[u8]) {
     contract::check_wire::<Datagram<N>>(bytes);
     let (packets, _) = quic::split_datagram(bytes, N);
@@ -15,7 +22,7 @@ fn datagram<const N: usize>(bytes: &[u8]) {
     }
     for packet in packets {
         if let Some(payload) = packet.payload() {
-            contract::check_wire::<Payload>(payload);
+            check_payload(payload);
         }
         let value = Datagram::<N>(vec![packet]);
         contract::check_wire_value(&value);
@@ -29,7 +36,7 @@ fuzz_target!(|input: &[u8]| {
     let Some((&pick, bytes)) = input.split_first() else { return };
     contract::check_wire::<VarInt>(bytes);
     contract::check_wire::<Frame>(bytes);
-    contract::check_wire::<Payload>(bytes);
+    check_payload(bytes);
     // Every legal short-header ID length, plus one past the limit.
     macro_rules! dispatch {
         ($($n:literal),* $(,)?) => {

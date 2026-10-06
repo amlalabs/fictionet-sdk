@@ -536,7 +536,7 @@ fn http3_stream_errors_keep_role_specific_application_codes() {
             http3::error_code::QPACK_DECODER_STREAM_ERROR,
         ),
     ] {
-        let mut input = Stream::new(http3::StreamDecoder::after_header(header, Endpoint::Client));
+        let mut input = Stream::new(http3::StreamItems::after_header(header, Endpoint::Client));
         assert_eq!(input.push(&bytes), bytes.len());
         assert_eq!(input.next(), Some(Ok(Err(expected))));
         assert_eq!(expected.application_code(), Some(code));
@@ -562,7 +562,6 @@ fn wire_errors_distinguish_truncation_trailing_and_protocol() {
     assert_eq!(<StreamHeader as Wire>::parse(&[0x40]), Err(H::Truncated));
     assert_eq!(<StreamHeader as Wire>::parse(&[0, 0]), Err(H::Trailing));
 }
-
 
 #[test]
 fn reset_before_section_decode_cancels() {
@@ -606,7 +605,6 @@ fn increments_without_blocked_streams_and_after_section_acks() {
     assert_eq!(qpack::decode_section(&table, 16, &invalid), Err(qpack::Error::InsertCount));
     assert_eq!(table.take_increment(), Some(DI::InsertCountIncrement(1)));
 }
-
 
 #[test]
 fn partial_critical_fin_is_closed_critical_stream() {
@@ -1251,29 +1249,29 @@ fn http3_control_and_selected_stream_contracts() {
     let header = StreamHeader::QpackEncoder;
     let bytes = wire(&EI::SetCapacity(4096));
     contract::check_decode_with_alloc_limit(
-        || http3::StreamDecoder::after_header(header, Endpoint::Client),
+        || http3::StreamItems::after_header(header, Endpoint::Client),
         &bytes,
-        2 * http3::StreamDecoder::after_header(header, Endpoint::Client).capacity(),
+        2 * http3::StreamItems::after_header(header, Endpoint::Client).capacity(),
     );
     contract::check_decode_with_alloc_limit(
-        || http3::StreamDecoder::after_header(StreamHeader::QpackDecoder, Endpoint::Client),
+        || http3::StreamItems::after_header(StreamHeader::QpackDecoder, Endpoint::Client),
         &[1],
-        2 * http3::StreamDecoder::after_header(StreamHeader::QpackDecoder, Endpoint::Client).capacity(),
+        2 * http3::StreamItems::after_header(StreamHeader::QpackDecoder, Endpoint::Client).capacity(),
     );
     contract::check_decode_with_alloc_limit(
-        || http3::StreamDecoder::after_header(StreamHeader::Unknown(64), Endpoint::Client),
+        || http3::StreamItems::after_header(StreamHeader::Unknown(64), Endpoint::Client),
         &[0xff; 128],
-        2 * http3::StreamDecoder::after_header(StreamHeader::Unknown(64), Endpoint::Client).capacity(),
+        2 * http3::StreamItems::after_header(StreamHeader::Unknown(64), Endpoint::Client).capacity(),
     );
     contract::check_decode_with_alloc_limit(
-        http3::StreamDecoder::request,
+        http3::StreamItems::request,
         &wire(&Frame::Data(vec![1, 2])),
-        2 * (http3::StreamDecoder::request)().capacity(),
+        2 * (http3::StreamItems::request)().capacity(),
     );
     contract::check_decode_with_alloc_limit(
-        http3::StreamDecoder::unidirectional,
+        http3::StreamItems::unidirectional,
         &[0x40, 2, 0x20],
-        2 * (http3::StreamDecoder::unidirectional)().capacity(),
+        2 * (http3::StreamItems::unidirectional)().capacity(),
     );
 }
 

@@ -5,11 +5,13 @@ use fictionet::stdlib::{
     codec::{Decode, Wire, contract, test_support::decode_all},
     http3::{
         self, Connection, Endpoint, Event, Frame, Frames, HeaderKind, HeaderList, MessageSide, Priority,
-        PriorityElement, RequestResult, RequestState, Settings, StreamDecoder, StreamHeader, StreamHeaders, StreamItem,
+        PriorityElement, RequestResult, RequestState, Settings, StreamHeader, StreamHeaders, StreamItem, StreamItems,
     },
     qpack::{self, SectionResult, Table},
 };
 use libfuzzer_sys::fuzz_target;
+
+const MAX_FUZZ_INPUT: usize = 16 << 10;
 
 /// Checks an event and its acknowledgment, or pauses/cancels its request stream.
 fn request_result(
@@ -129,48 +131,71 @@ fn shared_qpack(bytes: &[u8], side: MessageSide) {
 }
 
 fuzz_target!(|input: &[u8]| {
-    let bytes = &input[..input.len().min(16 << 10)];
+    let bytes = &input[..input.len().min(MAX_FUZZ_INPUT)];
     contract::check_wire::<Frame>(bytes);
     contract::check_wire::<Settings>(bytes);
     contract::check_wire::<Priority>(bytes);
     contract::check_wire::<StreamHeader>(bytes);
     contract::check_decode_with_alloc_limit(Frames::new, bytes, 2 * http3::MAX_FRAME);
     contract::check_decode_with_alloc_limit(StreamHeaders::new, bytes, 2 * http3::MAX_STREAM_HEADER);
-    contract::check_decode_with_alloc_limit(StreamDecoder::request, bytes, 2 * StreamDecoder::request().capacity());
+    contract::check_decode_with_alloc_limit(StreamItems::request, bytes, 2 * StreamItems::request().capacity());
     contract::check_decode_with_alloc_limit(
-        StreamDecoder::unidirectional,
+        StreamItems::unidirectional,
         bytes,
-        2 * StreamDecoder::unidirectional().capacity(),
+        2 * StreamItems::unidirectional().capacity(),
     );
     for sender in [Endpoint::Client, Endpoint::Server] {
         contract::check_decode_with_alloc_limit(|| http3::ControlFrames::new(sender), bytes, 2 * http3::MAX_FRAME);
         for header in
             [StreamHeader::Control, StreamHeader::QpackEncoder, StreamHeader::QpackDecoder, StreamHeader::Unknown(64)]
         {
-            let make = || StreamDecoder::after_header(header, sender);
+            let make = || StreamItems::after_header(header, sender);
             contract::check_decode_with_alloc_limit(make, bytes, 2 * make().capacity());
         }
     }
+    let budget = http3::MAX_FRAME + MAX_FUZZ_INPUT;
+    let mut connection = Connection::new(Endpoint::Client, 5, budget);
+    for (index, chunk) in bytes.chunks(17).enumerate() {
+        let _ = connection.push([0, 2, 4, 6, 10][index % 5], chunk);
+        while connection.next().is_some() {}
+        assert!(connection.buffered() <= budget);
+    }
+    for id in [0, 2, 4, 6, 10] {
+        connection.end(id);
+    }
+    while connection.next().is_some() {}
+    assert!(connection.buffered() <= budget);
     let table = Table::new(0);
     let (items, _) = decode_all(Frames::new, bytes);
-    for side in [MessageSide::Request, MessageSide::Response, MessageSide::HeadResponse, MessageSide::ConnectResponse] {
-        let mut state = RequestState::new(0, side, false).unwrap();
-        for frame in &items {
-            let Ok(frame) = frame else { break };
-            match state.step(frame, &table) {
-                Ok(RequestResult::Event { event: Ok(_), ack }) => {
-                    if let Some(ack) = ack {
-                        contract::check_wire_value(&ack);
+    for frame in items.iter().flatten() {
+        contract::check_wire_value(frame);
+    }
+    for extended_connect in [false, true] {
+        for mut state in [
+            RequestState::new(0, MessageSide::Request, extended_connect).unwrap(),
+            RequestState::new(0, MessageSide::Response, extended_connect).unwrap(),
+            RequestState::new(0, MessageSide::HeadResponse, extended_connect).unwrap(),
+            RequestState::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(),
+            RequestState::push(3).unwrap(),
+        ] {
+            for frame in &items {
+                let Ok(frame) = frame else { break };
+                match state.step(frame, &table) {
+                    Ok(RequestResult::Event { event: Ok(_), ack }) => {
+                        if let Some(ack) = ack {
+                            contract::check_wire_value(&ack);
+                        }
                     }
+                    _ => break,
                 }
-                _ => break,
             }
+            let _ = state.finish();
         }
-        let _ = state.finish();
     }
     if let Ok(SectionResult::Fields { fields, .. }) = qpack::decode_section(&table, 0, bytes) {
         for kind in [
             HeaderKind::Request { extended_connect: false },
+            HeaderKind::Request { extended_connect: true },
             HeaderKind::Response,
             HeaderKind::Trailers,
             HeaderKind::Promise,

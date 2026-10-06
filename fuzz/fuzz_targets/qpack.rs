@@ -12,6 +12,7 @@ use libfuzzer_sys::fuzz_target;
 
 /// Retains sections from two streams across a partial encoder instruction.
 fn blocked_sections(bytes: &[u8]) {
+    // This caller does not order sections, so no per-stream ordering is checked.
     let Some((&split, rest)) = bytes.split_first() else { return };
     let (instructions, sections) = rest.split_at(usize::from(split) * rest.len() / 255);
     let (early, late) = instructions.split_at(instructions.len() / 2);

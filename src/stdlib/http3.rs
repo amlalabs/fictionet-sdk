@@ -1649,6 +1649,14 @@ impl std::error::Error for StreamError {
     }
 }
 
+fn exact<T>(result: Result<Option<(T, usize)>, Error>, len: usize) -> Result<T, FrameParseError> {
+    match result.map_err(FrameParseError::Frame)? {
+        Some((value, used)) if used == len => Ok(value),
+        Some(_) => Err(FrameParseError::Trailing),
+        None => Err(FrameParseError::Truncated),
+    }
+}
+
 impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = Error;
@@ -1656,11 +1664,7 @@ impl Wire for Frame {
     /// Reads exactly one frame. Refuses truncation, trailing bytes, forbidden types, invalid payloads, and limits.
     /// Nonminimal QUIC integers are accepted. QPACK bytes remain opaque.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(bytes).map_err(FrameParseError::Frame)? {
-            Some((value, used)) if used == bytes.len() => Ok(value),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
-        }
+        exact(Self::parse_prefix(bytes), bytes.len())
     }
 
     /// Writes one frame. Refuses invalid IDs, known types disguised as unknown, invalid payloads, and limits.
@@ -1769,11 +1773,7 @@ impl Wire for StreamHeader {
 
     /// Reads one stream prefix. Refuses truncation and trailing bytes.
     fn parse(bytes: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse_prefix(bytes).map_err(FrameParseError::Frame)? {
-            Some((value, used)) if used == bytes.len() => Ok(value),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
-        }
+        exact(Self::parse_prefix(bytes), bytes.len())
     }
 
     /// Writes the shortest prefix. Refuses oversized IDs and unknown types that alias a defined type.
@@ -1969,11 +1969,11 @@ enum StreamKind {
 /// on a control or QPACK stream, including within a partial unit, returns
 /// [`StreamError::Http3`] carrying [`Error::ClosedCriticalStream`].
 #[derive(Clone, Debug)]
-pub struct StreamDecoder {
+pub struct StreamItems {
     kind: StreamKind,
 }
 
-impl StreamDecoder {
+impl StreamItems {
     /// Reads request or response frames without a unidirectional prefix.
     pub fn request() -> Self {
         Self { kind: StreamKind::Frames }
@@ -2008,7 +2008,7 @@ fn stream_step<T>(
     }
 }
 
-impl Decode for StreamDecoder {
+impl Decode for StreamItems {
     type Item = Result<StreamItem, StreamError>;
     type Error = StreamError;
     const NAME: &'static str = "HTTP/3 stream";
@@ -2095,8 +2095,8 @@ impl Decode for StreamDecoder {
 /// then [`Self::unpause`] when it is no longer blocked.
 /// Acknowledgments and insert increments come back as values to send.
 pub struct Connection {
-    streams: codec::Demux<u64, StreamDecoder>,
-    paused: std::collections::BTreeMap<u64, codec::Stream<StreamDecoder>>,
+    streams: codec::Demux<u64, StreamItems>,
+    paused: std::collections::BTreeMap<u64, codec::Stream<StreamItems>>,
     sender: Endpoint,
 }
 
@@ -2117,11 +2117,11 @@ impl Connection {
                     Endpoint::Server => 3,
                 };
                 if *id > MAX_VARINT || (!(*id).is_multiple_of(4) && *id % 4 != uni_sender) {
-                    StreamDecoder { kind: StreamKind::Invalid }
+                    StreamItems { kind: StreamKind::Invalid }
                 } else if id.is_multiple_of(4) {
-                    StreamDecoder::request()
+                    StreamItems::request()
                 } else {
-                    StreamDecoder::unidirectional()
+                    StreamItems::unidirectional()
                 }
             }),
             paused: std::collections::BTreeMap::new(),
@@ -2152,7 +2152,7 @@ impl Connection {
             && !stream.is_done()
         {
             let held = stream.buffered().saturating_add(stream.held());
-            let idle = codec::Stream::new(StreamDecoder { kind: StreamKind::Paused(held) });
+            let idle = codec::Stream::new(StreamItems { kind: StreamKind::Paused(held) });
             self.paused.insert(id, core::mem::replace(stream, idle));
         }
     }
@@ -2191,14 +2191,14 @@ impl Connection {
             // The header decoder has yielded its one item. Its next step
             // is End, which consumes none of the already buffered payload.
             let _ = stream.next();
-            let next = StreamDecoder::after_header(*header, self.sender);
+            let next = StreamItems::after_header(*header, self.sender);
             Self::swap_stream(stream, next);
         }
         Some((id, result))
     }
-    fn swap_stream(stream: &mut codec::Stream<StreamDecoder>, next: StreamDecoder) {
+    fn swap_stream(stream: &mut codec::Stream<StreamItems>, next: StreamItems) {
         // swap takes ownership; the temporary stream allocates no input buffer.
-        let previous = core::mem::replace(stream, codec::Stream::new(StreamDecoder::unidirectional()));
+        let previous = core::mem::replace(stream, codec::Stream::new(StreamItems::unidirectional()));
         *stream = previous.swap(next);
     }
     /// The aggregate unread and decoder-held bytes across every stream.
@@ -2215,7 +2215,7 @@ impl Connection {
     }
     /// Removes a retired key and returns its stream, including unread bytes
     /// and any terminal failure. The next push for this key can reopen it.
-    pub fn remove(&mut self, stream: u64) -> Option<codec::Stream<StreamDecoder>> {
+    pub fn remove(&mut self, stream: u64) -> Option<codec::Stream<StreamItems>> {
         let active = self.streams.remove(&stream);
         self.paused.remove(&stream).or(active)
     }
@@ -3117,6 +3117,21 @@ mod tests {
         }
     }
     #[test]
+    fn push_stream_refuses_push_promise() {
+        let table = plain_qpack();
+        let promise = Frame::PushPromise { push_id: 7, field_section: encoded(&request()) };
+        for started in [false, true] {
+            let mut state = RequestState::push(3).unwrap();
+            if started {
+                assert_eq!(event(&mut state, headers(&response("200")), &table), Ok(Event::Headers(response("200"))));
+            }
+            assert_eq!(
+                event(&mut state, promise.clone(), &table),
+                Err(Error::UnexpectedFrame(frame_type::PUSH_PROMISE))
+            );
+        }
+    }
+    #[test]
     fn request_fin_refuses_partial_frames_and_missing_headers() {
         for bytes in [vec![], vec![0x21, 0]] {
             let (items, error) = decode_all(Frames::new, &bytes);
@@ -3278,15 +3293,37 @@ mod tests {
             contract::check_wire::<Settings>(&bytes);
             contract::check_wire::<Priority>(&bytes);
             contract::check_wire::<StreamHeader>(&bytes);
+            let budget = MAX_FRAME + MAX_TEST_BYTES;
+            let mut connection = Connection::new(Endpoint::Client, 5, budget);
+            for (index, chunk) in bytes.chunks(17).enumerate() {
+                let _ = connection.push([0, 2, 4, 6, 10][index % 5], chunk);
+                while connection.next().is_some() {}
+                assert!(connection.buffered() <= budget);
+            }
+            for id in [0, 2, 4, 6, 10] {
+                connection.end(id);
+            }
+            while connection.next().is_some() {}
+            assert!(connection.buffered() <= budget);
             let (items, _) = decode_all(Frames::new, &bytes);
-            for side in [MessageSide::Request, MessageSide::Response] {
-                let mut state = RequestState::new(0, side, false).unwrap();
-                for item in &items {
-                    if item.clone().and_then(|frame| event(&mut state, frame, &plain_qpack())).is_err() {
-                        break;
+            for frame in items.iter().flatten() {
+                contract::check_wire_value(frame);
+            }
+            for extended_connect in [false, true] {
+                for mut state in [
+                    RequestState::new(0, MessageSide::Request, extended_connect).unwrap(),
+                    RequestState::new(0, MessageSide::Response, extended_connect).unwrap(),
+                    RequestState::new(0, MessageSide::HeadResponse, extended_connect).unwrap(),
+                    RequestState::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(),
+                    RequestState::push(3).unwrap(),
+                ] {
+                    for item in &items {
+                        if item.clone().and_then(|frame| event(&mut state, frame, &plain_qpack())).is_err() {
+                            break;
+                        }
                     }
+                    let _ = state.finish();
                 }
-                let _ = state.finish();
             }
             let frame = match rng.index(5) {
                 0 => Frame::Data(bytes.clone()),
