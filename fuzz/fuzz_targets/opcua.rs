@@ -68,6 +68,14 @@ fuzz_target!(|data: &[u8]| {
     );
     let mut stream = Stream::new(Messages::with_limits(limits));
     let _ = pump(&mut stream, data, |message| {
+        let mut bytes = Vec::new();
+        for chunk in message.chunks(&limits).unwrap() {
+            chunk.write(&mut bytes).unwrap();
+        }
+        let mut again = Stream::new(Messages::with_limits(limits));
+        let mut back = Vec::new();
+        pump(&mut again, &bytes, |m| back.push(m)).unwrap();
+        assert_eq!(back, [message.clone()]);
         if let Message::Secure(s) = message {
             check_wire::<Service>(&s.body);
         }

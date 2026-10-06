@@ -7,10 +7,11 @@
 //! every CRC and removes them from its data; its writer puts them back.
 //! The framing follows IEEE 1815 (DNP3).
 //!
-//! Push connection bytes to a [`Stream`](super::codec::Stream) of [`Frames`], then read each data frame's
-//! [`Segment`]. A [`Reassembler`] joins transport segments into application
-//! fragments. Use one reassembler per source, destination and direction;
-//! link acknowledgments, duplicate suppression and session state belong to
+//! Push connection bytes to a [`Stream`](super::codec::Stream) of [`Frames`],
+//! then read each data frame's [`Segment`]. A [`Reassembler`] joins transport
+//! segments into application fragments. Use one reassembler per source,
+//! destination and direction. Link acknowledgments, duplicate suppression
+//! and session state belong to
 //! world code. [`Fragment`] reads the application header and leaves object
 //! groups and variations as bytes. Secure authentication is not performed.
 //! Unknown link and application function codes are preserved.
@@ -72,7 +73,7 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+/// [`Frame::parse`] reads a prefix and returns the bytes used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The frame is invalid.

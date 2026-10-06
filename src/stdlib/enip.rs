@@ -94,6 +94,9 @@ pub const MAX_PACKET: usize = u16::MAX as usize;
 /// the header, 65511 bytes. The length field can name more; a packet that
 /// does fails [`Packet::check`].
 pub const MAX_DATA: usize = MAX_PACKET - HEADER_LEN;
+/// The input capacity of [`Frames`]: 65559 bytes, including the header
+/// and every data length the 16-bit length field can name.
+pub const FRAMES_CAPACITY: usize = HEADER_LEN + u16::MAX as usize;
 /// The most items one [`Cpf`] may hold.
 pub const MAX_CPF_ITEMS: usize = 64;
 /// The most bytes one EPATH may hold, set by the word-counted path size.
@@ -263,7 +266,7 @@ impl Wire for Packet {
     type WriteError = EncodeError;
 
     /// Reads exactly one packet that passes [`Packet::check`].
-    /// The inherent prefix parser still accepts nonzero options and every
+    /// [`Packet::parse`] accepts nonzero options and every
     /// length the header can name, so a receiver can apply its own policy.
     fn parse(b: &[u8]) -> Result<Self, DecodeError> {
         let (packet, used) = Self::parse(b).ok_or(DecodeError::Truncated)?;
@@ -307,14 +310,15 @@ impl Wire for Packet {
 ///
 /// Framing accepts every command, option word, and 16-bit data length.
 /// Use [`Packet::check`] to decide whether to act on each packet.
-/// [`Stream::new`](super::codec::Stream::new) holds at most `HEADER_LEN + u16::MAX as usize` bytes, including room
-/// for lengths above [`MAX_DATA`]. Partial packets return [`Step::Need`],
-/// including at EOF, when the stream reports truncation.
+/// [`Stream::new`](super::codec::Stream::new) holds at most [`FRAMES_CAPACITY`]
+/// bytes (65559), including room for lengths above [`MAX_DATA`].
+/// Partial packets return [`Step::Need`], including at EOF, when the stream
+/// reports truncation.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
 
 impl Frames {
-    /// Creates a packet decoder with a capacity of `HEADER_LEN + u16::MAX as usize` bytes.
+    /// Creates a packet decoder with capacity [`FRAMES_CAPACITY`] (65559 bytes).
     pub fn new() -> Self {
         Self
     }
@@ -326,7 +330,7 @@ impl Decode for Frames {
     const NAME: &'static str = "EtherNet/IP";
 
     fn capacity(&self) -> usize {
-        HEADER_LEN + u16::MAX as usize
+        FRAMES_CAPACITY
     }
 
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Infallible> {
@@ -467,23 +471,23 @@ pub mod encap_status {
 
 /// The common packet format item type codes.
 pub mod item {
-    /// The null address code.
+    /// Null address (0x0000).
     pub const NULL_ADDRESS: u16 = 0x0000;
-    /// The list identity response code.
+    /// ListIdentity response (0x000c).
     pub const LIST_IDENTITY_RESPONSE: u16 = 0x000c;
-    /// The connected address code.
+    /// Connection-based address (0x00a1).
     pub const CONNECTED_ADDRESS: u16 = 0x00a1;
-    /// The connected data code.
+    /// Connected transport packet (0x00b1).
     pub const CONNECTED_DATA: u16 = 0x00b1;
-    /// The unconnected data code.
+    /// Unconnected message (0x00b2).
     pub const UNCONNECTED_DATA: u16 = 0x00b2;
-    /// The list services response code.
+    /// ListServices response (0x0100).
     pub const LIST_SERVICES_RESPONSE: u16 = 0x0100;
-    /// The socket address o t code.
+    /// Socket address, originator to target (0x8000).
     pub const SOCKET_ADDRESS_O_T: u16 = 0x8000;
-    /// The socket address t o code.
+    /// Socket address, target to originator (0x8001).
     pub const SOCKET_ADDRESS_T_O: u16 = 0x8001;
-    /// The sequenced address code.
+    /// Sequenced address (0x8002).
     pub const SEQUENCED_ADDRESS: u16 = 0x8002;
 }
 
@@ -1158,51 +1162,51 @@ impl MessageResponse {
 
 /// The CIP service codes this module names.
 pub mod service {
-    /// The get attributes all code.
+    /// Get_Attributes_All (0x01).
     pub const GET_ATTRIBUTES_ALL: u8 = 0x01;
-    /// The set attributes all code.
+    /// Set_Attributes_All (0x02).
     pub const SET_ATTRIBUTES_ALL: u8 = 0x02;
-    /// The get attribute list code.
+    /// Get_Attribute_List (0x03).
     pub const GET_ATTRIBUTE_LIST: u8 = 0x03;
-    /// The reset code.
+    /// Reset (0x05).
     pub const RESET: u8 = 0x05;
-    /// The get attribute single code.
+    /// Get_Attribute_Single (0x0e).
     pub const GET_ATTRIBUTE_SINGLE: u8 = 0x0e;
-    /// The set attribute single code.
+    /// Set_Attribute_Single (0x10).
     pub const SET_ATTRIBUTE_SINGLE: u8 = 0x10;
-    /// The forward close code.
+    /// Forward_Close (0x4e).
     pub const FORWARD_CLOSE: u8 = 0x4e;
-    /// The forward open code.
+    /// Forward_Open (0x54).
     pub const FORWARD_OPEN: u8 = 0x54;
-    /// The large forward open code.
+    /// Large_Forward_Open (0x5b).
     pub const LARGE_FORWARD_OPEN: u8 = 0x5b;
 }
 
 /// Common CIP general status codes.
 pub mod status {
-    /// The success code.
+    /// Success (0x00).
     pub const SUCCESS: u8 = 0x00;
-    /// The connection failure code.
+    /// Connection failure (0x01).
     pub const CONNECTION_FAILURE: u8 = 0x01;
-    /// The resource unavailable code.
+    /// Resource unavailable (0x02).
     pub const RESOURCE_UNAVAILABLE: u8 = 0x02;
-    /// The path segment error code.
+    /// Path segment error (0x04).
     pub const PATH_SEGMENT_ERROR: u8 = 0x04;
-    /// The path destination unknown code.
+    /// Path destination unknown (0x05).
     pub const PATH_DESTINATION_UNKNOWN: u8 = 0x05;
-    /// The service not supported code.
+    /// Service not supported (0x08).
     pub const SERVICE_NOT_SUPPORTED: u8 = 0x08;
-    /// The invalid attribute value code.
+    /// Invalid attribute value (0x09).
     pub const INVALID_ATTRIBUTE_VALUE: u8 = 0x09;
-    /// The attribute not settable code.
+    /// Attribute not settable (0x0e).
     pub const ATTRIBUTE_NOT_SETTABLE: u8 = 0x0e;
-    /// The object does not exist code.
+    /// Object does not exist (0x16).
     pub const OBJECT_DOES_NOT_EXIST: u8 = 0x16;
-    /// The not enough data code.
+    /// Not enough data (0x13).
     pub const NOT_ENOUGH_DATA: u8 = 0x13;
-    /// The attribute not supported code.
+    /// Attribute not supported (0x14).
     pub const ATTRIBUTE_NOT_SUPPORTED: u8 = 0x14;
-    /// The too much data code.
+    /// Too much data (0x15).
     pub const TOO_MUCH_DATA: u8 = 0x15;
 }
 
@@ -2205,8 +2209,8 @@ mod tests {
             .take(one.len() * 500_000)
             .collect();
         let mut d = Stream::new(Frames::new());
-        assert_eq!(d.push(&stream), HEADER_LEN + u16::MAX as usize);
-        assert_eq!(d.buffered(), HEADER_LEN + u16::MAX as usize);
+        assert_eq!(d.push(&stream), FRAMES_CAPACITY);
+        assert_eq!(d.buffered(), FRAMES_CAPACITY);
         // Full, it takes nothing more until packets are taken out.
         assert_eq!(d.push(&stream), 0);
         let mut n = 0;
@@ -2214,17 +2218,14 @@ mod tests {
             packet.unwrap();
             n += 1;
         }
-        pump(&mut d, &stream[HEADER_LEN + u16::MAX as usize..], |_| {
-            n += 1
-        })
-        .unwrap();
+        pump(&mut d, &stream[FRAMES_CAPACITY..], |_| n += 1).unwrap();
         assert_eq!(n, 500_000);
         assert_eq!(d.buffered(), 0);
         // The longest frame the length field can name still fits whole.
         let mut big = vec![0u8; HEADER_LEN];
         big[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
-        big.resize(HEADER_LEN + u16::MAX as usize, 0);
-        assert_eq!(d.push(&big), HEADER_LEN + u16::MAX as usize);
+        big.resize(FRAMES_CAPACITY, 0);
+        assert_eq!(d.push(&big), FRAMES_CAPACITY);
         let p = d.next().unwrap().unwrap();
         assert_eq!(p.data.len(), u16::MAX as usize);
         assert_eq!(p.check(), Err(DecodeError::TooLong));

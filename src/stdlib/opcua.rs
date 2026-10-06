@@ -11,12 +11,13 @@
 //! CloseSecureChannel services with security policy None.
 //!
 //! Nothing here reads a socket. A world pushes connection bytes to a
-//! [`Stream`](super::codec::Stream) of [`Messages`] and gets [`Message`]s back. It answers a [`Hello`] with an
-//! [`Acknowledge`], gives the decoder the negotiated [`Limits`], reads each
-//! [`SecureMessage`]'s body as a [`Service`], and splits replies with
-//! [`Message::chunks`]. Each chunk is written with [`Wire::write`].
-//! Chunks of a long message are put back together before the world sees it. What the address space holds, and which
-//! requests succeed, is up to world code.
+//! [`Stream`](super::codec::Stream) of [`Messages`] and gets [`Message`]s back.
+//! It answers a [`Hello`] with an [`Acknowledge`], gives the decoder the
+//! negotiated [`Limits`], reads each [`SecureMessage`]'s body as a [`Service`],
+//! and splits replies with [`Message::chunks`]. Each chunk is written with
+//! [`Wire::write`].
+//! Chunks of a long message are put back together before the world sees it.
+//! What the address space holds, and which requests succeed, is up to world code.
 //!
 //! There is no cryptography. A secure message's body is kept exactly as it
 //! came, which is the plain body under policy None. A world that is asked
@@ -36,6 +37,13 @@
 //! [`Wire`] for exact parsing and transactional writing under the module's
 //! maximum chunk size. Message assembly and connection sequence checks
 //! use [`Messages`]. [`Message::chunks`] takes explicit peer limits.
+//!
+//! Built-in binary values and services implement [`Wire`]. The borrowed
+//! [`Reader`] and [`Binary`] trait read individual fields, including reserved
+//! Variant types. Exact [`Wire`] parsing rejects those types because senders
+//! may not write them. Writers reject dates, picoseconds, and namespace fields
+//! that would read back differently. NaNs have a canonical wire form and
+//! compare equal within the same floating type.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -99,7 +107,10 @@
 //!
 //! // The server issues channel 7, token 1.
 //! let response = Service::OpenSecureChannelResponse(OpenSecureChannelResponse {
-//!     header: ResponseHeader { request_handle: req.header.request_handle, ..ResponseHeader::default() },
+//!     header: ResponseHeader {
+//!         request_handle: req.header.request_handle,
+//!         ..ResponseHeader::default()
+//!     },
 //!     server_protocol_version: 0,
 //!     security_token: ChannelSecurityToken {
 //!         channel_id: 7,
@@ -614,12 +625,6 @@ impl Writer {
         }
     }
 
-    /// Whether nothing has been written.
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.out.is_empty()
-    }
-
     /// Raw bytes, with no length.
     fn bytes(&mut self, b: &[u8]) {
         if self.error.is_some() {
@@ -811,64 +816,61 @@ impl Binary for StatusCode {
 
 /// Built-in type ids, as a Variant's encoding mask names them.
 pub mod type_id {
-    /// The null identifier.
+    /// Null (0).
     pub const NULL: u8 = 0;
-    /// The boolean identifier.
+    /// Boolean (1).
     pub const BOOLEAN: u8 = 1;
-    /// The sbyte identifier.
+    /// SByte (2).
     pub const SBYTE: u8 = 2;
-    /// The byte identifier.
+    /// Byte (3).
     pub const BYTE: u8 = 3;
-    /// The int16 identifier.
+    /// Int16 (4).
     pub const INT16: u8 = 4;
-    /// The uint16 identifier.
+    /// UInt16 (5).
     pub const UINT16: u8 = 5;
-    /// The int32 identifier.
+    /// Int32 (6).
     pub const INT32: u8 = 6;
-    /// The uint32 identifier.
+    /// UInt32 (7).
     pub const UINT32: u8 = 7;
-    /// The int64 identifier.
+    /// Int64 (8).
     pub const INT64: u8 = 8;
-    /// The uint64 identifier.
+    /// UInt64 (9).
     pub const UINT64: u8 = 9;
-    /// The float identifier.
+    /// Float (10).
     pub const FLOAT: u8 = 10;
-    /// The double identifier.
+    /// Double (11).
     pub const DOUBLE: u8 = 11;
-    /// The string identifier.
+    /// String (12).
     pub const STRING: u8 = 12;
-    /// The date time identifier.
+    /// DateTime (13).
     pub const DATE_TIME: u8 = 13;
-    /// The guid identifier.
+    /// Guid (14).
     pub const GUID: u8 = 14;
-    /// The byte string identifier.
+    /// ByteString (15).
     pub const BYTE_STRING: u8 = 15;
-    /// The xml element identifier.
+    /// XmlElement (16).
     pub const XML_ELEMENT: u8 = 16;
-    /// The node id identifier.
+    /// NodeId (17).
     pub const NODE_ID: u8 = 17;
-    /// The expanded node id identifier.
+    /// ExpandedNodeId (18).
     pub const EXPANDED_NODE_ID: u8 = 18;
-    /// The status code identifier.
+    /// StatusCode (19).
     pub const STATUS_CODE: u8 = 19;
-    /// The qualified name identifier.
+    /// QualifiedName (20).
     pub const QUALIFIED_NAME: u8 = 20;
-    /// The localized text identifier.
+    /// LocalizedText (21).
     pub const LOCALIZED_TEXT: u8 = 21;
-    /// The extension object identifier.
+    /// ExtensionObject (22).
     pub const EXTENSION_OBJECT: u8 = 22;
-    /// The data value identifier.
+    /// DataValue (23).
     pub const DATA_VALUE: u8 = 23;
-    /// The variant identifier.
+    /// Variant (24).
     pub const VARIANT: u8 = 24;
-    /// The diagnostic info identifier.
+    /// DiagnosticInfo (25).
     pub const DIAGNOSTIC_INFO: u8 = 25;
-    /// Ids 26 to 31 are reserved. Readers keep their values as
-    /// ByteStrings, as the specification asks.
-    /// The reserved first identifier.
+    /// First reserved type id (26), read as a ByteString.
     pub const RESERVED_FIRST: u8 = 26;
-    /// The last reserved id.
-    /// The reserved last identifier.
+    /// Last reserved type id (31), read as a ByteString.
     pub const RESERVED_LAST: u8 = 31;
 }
 
@@ -1558,9 +1560,10 @@ pub enum Variant {
     /// One value. It may not be a [`Value::Variant`].
     Scalar(Value),
     /// An array of values, all of built-in type `type_id`, which is never
-    /// 0 or 25 (DiagnosticInfo). A null array reads as empty. With `dimensions`, the array is multi-dimensional:
-    /// there are at least 2 dimensions, as Part 6 asks, every one is above
-    /// 0, and they multiply out to its length.
+    /// 0 or 25 (DiagnosticInfo). A null array reads as empty.
+    /// With `dimensions`, the array is multi-dimensional: there are at least
+    /// 2 dimensions, as Part 6 asks, every one is above 0, and they multiply
+    /// out to its length.
     Array {
         /// The built-in type of every element, 1 to 31 but not 25.
         /// Writers also refuse the reserved ids, 26 to 31.
@@ -2126,7 +2129,8 @@ impl Chunk {
 }
 
 /// Why an exact [`Wire`] parse did not read one complete chunk.
-/// [`Chunk::parse`] keeps its prefix parser and caller-supplied limits.
+/// [`Chunk::parse`] reads a prefix under caller-supplied limits and returns
+/// the bytes used.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ChunkParseError {
     /// The chunk header is invalid or exceeds [`MAX_BUFFER_SIZE`].
@@ -2562,10 +2566,11 @@ pub enum Message {
 
 impl Message {
     /// Splits the message into as few chunks as a peer that takes
-    /// `peer` allows. Write each chunk with [`Wire::write`]. It fails if the message breaks a rule or limit the
-    /// peer's [`Messages`] checks: an OPN or CLO too large for one chunk, a
-    /// MSG with too large a body or needing too many chunks, a buffer size
-    /// below [`MIN_BUFFER_SIZE`], or a string past its limit.
+    /// `peer` allows. Write each chunk with [`Wire::write`]. It fails if the
+    /// message breaks a rule or limit the peer's [`Messages`] checks:
+    /// an OPN or CLO too large for one chunk, a MSG with too large a body or
+    /// needing too many chunks, a buffer size below [`MIN_BUFFER_SIZE`], or a
+    /// string past its limit.
     pub fn chunks(&self, peer: &Limits) -> Result<Vec<Chunk>, EncodeError> {
         Ok(vec![match self {
             Message::Hello(h) => chunk(MessageType::Hello, ChunkType::Final, h.body()?),
@@ -2721,7 +2726,10 @@ fn follows(prev: u32, got: u32) -> bool {
 /// Use with [`Stream`](super::codec::Stream). Each secure chunk must follow
 /// the previous sequence number, including across message boundaries.
 /// Input stays in the stream. Only an unfinished message body is held here.
-/// EOF during an assembly returns [`ChunkError::Incomplete`].
+/// EOF during an assembly returns [`ChunkError::Incomplete`], including when
+/// its body is empty. [`Decode::held`] counts body bytes, so zero held bytes
+/// does not imply a complete message. Set receive limits between messages
+/// through [`Stream::decoder`](super::codec::Stream::decoder).
 #[derive(Debug, Default)]
 pub struct Messages {
     limits: Limits,
@@ -2939,15 +2947,15 @@ impl Decode for Messages {
 /// The numeric ids, in namespace 0, of the binary encodings of the
 /// services this module reads. A message body starts with one.
 pub mod encoding_id {
-    /// The service fault identifier.
+    /// ServiceFault binary encoding (397).
     pub const SERVICE_FAULT: u32 = 397;
-    /// The open secure channel request identifier.
+    /// OpenSecureChannelRequest binary encoding (446).
     pub const OPEN_SECURE_CHANNEL_REQUEST: u32 = 446;
-    /// The open secure channel response identifier.
+    /// OpenSecureChannelResponse binary encoding (449).
     pub const OPEN_SECURE_CHANNEL_RESPONSE: u32 = 449;
-    /// The close secure channel request identifier.
+    /// CloseSecureChannelRequest binary encoding (452).
     pub const CLOSE_SECURE_CHANNEL_REQUEST: u32 = 452;
-    /// The close secure channel response identifier.
+    /// CloseSecureChannelResponse binary encoding (455).
     pub const CLOSE_SECURE_CHANNEL_RESPONSE: u32 = 455;
 }
 
@@ -3439,7 +3447,6 @@ binary_wire!(
     Variant,
     DataValue,
     RequestHeader,
-    Option<String>,
     ResponseHeader,
     RequestType,
     SecurityMode,
@@ -4683,7 +4690,6 @@ mod tests {
         let mut w = Writer::new();
         assert_eq!(w.array_len(MAX_ARRAY_LEN + 1), Err(EncodeError::TooLong));
         assert_eq!(w.string_max(Some("abc"), 2), Err(EncodeError::TooLong));
-        assert!(w.is_empty());
     }
 
     #[test]
@@ -5369,49 +5375,78 @@ mod tests {
     }
 
     #[test]
-    fn a_decoder_says_whether_it_is_between_messages() {
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        assert!((d.buffered() == 0 && d.held() == 0 && d.failed().is_none()));
-        {
-            let input = &msg_chunk(b'C', 7, 1, 1, 5, b"part");
-            assert_eq!(d.push(input), input.len());
+    fn message_completion_at_eof_includes_empty_bodies() {
+        for body in [b"".as_slice(), b"part"] {
+            for complete in [false, true] {
+                let mut d = Stream::new(Messages::new());
+                let input = msg_chunk(b'C', 7, 1, 1, 5, body);
+                assert_eq!(d.push(&input), input.len());
+                assert_eq!(d.next(), None);
+                assert_eq!(d.buffered(), 0);
+                assert_eq!(d.held(), body.len());
+                assert!(d.failed().is_none());
+
+                // Byte counts do not say whether an empty MSG is complete.
+                if complete {
+                    let input = msg_chunk(b'F', 7, 1, 2, 5, b"end");
+                    assert_eq!(d.push(&input), input.len());
+                    assert_eq!(d.next(), Some(Ok(msg(1, 1, 5, [body, b"end"].concat()))));
+                    assert_eq!(d.buffered(), 0);
+                    assert_eq!(d.held(), 0);
+                }
+                d.end();
+                if complete {
+                    assert_eq!(d.next(), None);
+                    assert!(d.failed().is_none());
+                } else {
+                    let error = Fail::Protocol(ChunkError::Incomplete);
+                    assert_eq!(d.next(), Some(Err(error.clone())));
+                    assert_eq!(d.failed(), Some(&error));
+                }
+                assert!(d.is_done());
+                assert_eq!(d.next(), None);
+            }
         }
+    }
+
+    #[test]
+    fn a_partial_header_after_a_message_is_truncated_at_eof() {
+        let mut d = Stream::new(Messages::new());
+        let input = msg_chunk(b'F', 7, 1, 1, 5, b"body");
+        assert_eq!(d.push(&input), input.len());
+        assert_eq!(d.next(), Some(Ok(msg(1, 1, 5, b"body".to_vec()))));
+        assert_eq!(d.push(b"MSG"), 3);
         assert_eq!(d.next(), None);
-        assert_eq!(d.buffered(), 0);
-        assert!(!(d.buffered() == 0 && d.held() == 0 && d.failed().is_none()));
-        {
-            let input = &msg_chunk(b'F', 7, 1, 2, 5, b"end");
-            assert_eq!(d.push(input), input.len());
-        }
-        assert!(d.next().unwrap().is_ok());
-        assert!((d.buffered() == 0 && d.held() == 0 && d.failed().is_none()));
-        {
-            let input = b"MSG";
-            assert_eq!(d.push(input), input.len());
-        }
-        assert!(!(d.buffered() == 0 && d.held() == 0 && d.failed().is_none()));
+        assert_eq!(d.buffered(), 3);
+        d.end();
+        assert_eq!(d.next(), Some(Err(Fail::Truncated { unread: 3 })));
     }
 
     #[test]
     fn an_error_message_ends_a_partial_message() {
-        let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
-        {
-            let input = &msg_chunk(b'C', 7, 1, 1, 5, b"part");
-            assert_eq!(d.push(input), input.len());
-        }
         let err = Message::Error(ErrorMessage {
             error: StatusCode::BAD_TCP_INTERNAL_ERROR,
             reason: "bye".into(),
         });
-        {
-            let input = &err
+        for body in [b"".as_slice(), b"part"] {
+            let mut d = Stream::new(Messages::new());
+            let input = msg_chunk(b'C', 7, 1, 1, 5, body);
+            assert_eq!(d.push(&input), input.len());
+            assert_eq!(d.next(), None);
+            assert_eq!(d.held(), body.len());
+            let input = err
                 .chunks(&Limits::default())
                 .and_then(wire_chunks)
                 .unwrap();
-            assert_eq!(d.push(input), input.len());
+            assert_eq!(d.push(&input), input.len());
+            assert_eq!(d.next(), Some(Ok(err.clone())));
+            assert_eq!(d.buffered(), 0);
+            assert_eq!(d.held(), 0);
+            d.end();
+            assert_eq!(d.next(), None);
+            assert!(d.is_done());
+            assert!(d.failed().is_none());
         }
-        assert_eq!(d.next(), Some(Ok(err)));
-        assert!((d.buffered() == 0 && d.held() == 0 && d.failed().is_none()));
     }
 
     #[test]
@@ -5477,7 +5512,7 @@ mod tests {
             dimensions: None,
         };
         assert_eq!(Wire::to_bytes(&empty), Err(EncodeError::VariantType));
-        // Readers still take them.
+        // Binary readers accept reserved type ids.
         assert!(Reader::new(&[0x9b, 0, 0, 0, 0]).read::<Variant>().is_ok());
         assert_eq!(
             <Variant as Wire>::parse(&[0x9b, 0, 0, 0, 0]),
@@ -5757,7 +5792,7 @@ mod tests {
             assert_eq!(d.push(input), input.len());
         }
         let Some(Ok(m)) = d.next() else { panic!() };
-        // Writers still write 'F'.
+        // Writers use 'F'.
         assert_eq!(
             m.chunks(&Limits::default()).and_then(wire_chunks).unwrap()[3],
             b'F'

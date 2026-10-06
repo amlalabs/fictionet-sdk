@@ -25,6 +25,8 @@
 //! Use [`Frames`] with [`Stream`](super::codec::Stream).
 //! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
 //! The inherent parser reads a prefix.
+//! [`Connection::to_packet`] and [`write_data`] construct typed TPKT packets.
+//! `Vec<DataBlock>` implements [`Wire`] for a bounded GCC block sequence.
 //!
 //! The wire definitions and examples are in [MS-RDPBCGR sections 2.2.1,
 //! 2.2.8 and 4.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/).
@@ -1117,7 +1119,7 @@ impl DataBlock {
 
 /// Reads a complete sequence of GCC blocks, up to [`MAX_BLOCKS`] blocks
 /// and [`MAX_GCC_DATA`] aggregate bytes. Order and duplicates are preserved.
-pub fn read_blocks(b: &[u8]) -> Result<Vec<DataBlock>, Error> {
+fn read_blocks(b: &[u8]) -> Result<Vec<DataBlock>, Error> {
     bound(b.len(), MAX_GCC_DATA, "GCC blocks")?;
     let mut r = Read::new(b);
     let mut blocks = Vec::with_capacity(MAX_BLOCKS);
@@ -1871,6 +1873,8 @@ impl Wire for Vec<DataBlock> {
     type ParseError = Error;
     type WriteError = Error;
 
+    /// Reads a complete GCC block sequence, preserving order and duplicates.
+    /// Accepts at most [`MAX_BLOCKS`] blocks and [`MAX_GCC_DATA`] bytes.
     fn parse(b: &[u8]) -> Result<Self, Error> {
         read_blocks(b)
     }
@@ -2689,8 +2693,11 @@ mod tests {
         roundtrip!(LicenseError);
         roundtrip!(CapabilitySet);
         roundtrip!(ActivePdu);
-        if let Ok(blocks) = read_blocks(b) {
-            assert_eq!(read_blocks(&blocks.to_bytes().unwrap()), Ok(blocks));
+        if let Ok(blocks) = <Vec<DataBlock> as Wire>::parse(b) {
+            assert_eq!(
+                <Vec<DataBlock> as Wire>::parse(&blocks.to_bytes().unwrap()),
+                Ok(blocks)
+            );
         }
         if let Ok(Some((f, n))) = Frame::parse(b) {
             assert!(n <= b.len());
@@ -3088,7 +3095,10 @@ mod tests {
             assert_eq!(DataBlock::parse(&b.to_bytes().unwrap()), Ok(b));
         }
         let b = client_blocks();
-        assert_eq!(read_blocks(&b.to_bytes().unwrap()), Ok(b));
+        assert_eq!(
+            <Vec<DataBlock> as Wire>::parse(&b.to_bytes().unwrap()),
+            Ok(b)
+        );
     }
 
     #[test]
@@ -3255,8 +3265,8 @@ mod tests {
                 .is_err()
         );
         let bytes = hex("06 c0 08 00 00 00 00 00").repeat(MAX_BLOCKS + 1);
-        assert!(read_blocks(&bytes).is_err());
-        assert!(read_blocks(&vec![0; MAX_GCC_DATA + 1]).is_err());
+        assert!(<Vec<DataBlock> as Wire>::parse(&bytes).is_err());
+        assert!(<Vec<DataBlock> as Wire>::parse(&vec![0; MAX_GCC_DATA + 1]).is_err());
         assert!(
             Wire::to_bytes(&vec![
                 DataBlock::Other {

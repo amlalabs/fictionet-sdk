@@ -35,6 +35,10 @@ fuzz_target!(|data: &[u8]| {
         check_wire_value(&frame);
         let bytes = frame.to_bytes().unwrap();
         check_decode(Frames::new, &bytes);
+        let mut again = Stream::new(Frames);
+        let mut back = Vec::new();
+        pump(&mut again, &bytes, |f| back.push(f)).unwrap();
+        assert_eq!(back, [frame]);
     }
     check_wire_value(&Frame {
         control: data.first().copied().unwrap_or(0),

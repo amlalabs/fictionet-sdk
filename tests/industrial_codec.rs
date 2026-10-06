@@ -296,7 +296,7 @@ fn enip_preserves_permissive_framing_and_partial_packets() {
     let mut bytes = valid.to_bytes().unwrap();
     bytes[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
     bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
-    bytes.resize(enip::HEADER_LEN + usize::from(u16::MAX), 0xa5);
+    bytes.resize(enip::FRAMES_CAPACITY, 0xa5);
     let raw = enip::Packet::parse(&bytes).unwrap().0;
     assert_eq!(raw.data.len(), usize::from(u16::MAX));
     assert_eq!(raw.check(), Err(enip::DecodeError::Options));
@@ -314,15 +314,12 @@ fn enip_preserves_permissive_framing_and_partial_packets() {
 
     let mut decoder = Stream::new(enip::Frames);
     bytes.extend_from_slice(&valid.to_bytes().unwrap());
-    assert_eq!(
-        decoder.push(&bytes),
-        (enip::HEADER_LEN + usize::from(u16::MAX))
-    );
+    assert_eq!(decoder.push(&bytes), enip::FRAMES_CAPACITY);
     let oversized = decoder.next().unwrap().unwrap();
     assert_eq!(oversized.data.len(), usize::from(u16::MAX));
     assert_eq!(decoder.buffered(), 0);
     assert_eq!(
-        decoder.push(&bytes[(enip::HEADER_LEN + usize::from(u16::MAX))..]),
+        decoder.push(&bytes[enip::FRAMES_CAPACITY..]),
         enip::HEADER_LEN
     );
     assert_eq!(decoder.next(), Some(Ok(valid.clone())));

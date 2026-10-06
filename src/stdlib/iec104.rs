@@ -76,7 +76,7 @@ impl std::fmt::Display for FrameError {
 impl std::error::Error for FrameError {}
 
 /// Why an exact [`Wire`] parse did not read one complete frame.
-/// [`Frame::parse`] keeps its separate prefix parsing behavior.
+/// [`Frame::parse`] reads a prefix and returns the bytes used.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameParseError {
     /// The frame is invalid.

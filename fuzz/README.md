@@ -155,4 +155,8 @@ served.
 The `dnp3`, `iec104`, `enip`, `opcua`, and `rdp` targets drive `Frames`
 through `codec::Stream` and `codec::contract`. OPC UA also checks `Messages`
 with its assembly limit. Typed values use `Wire` writer contracts.
-See [industrial codecs](../docs/industrial-codecs.md) for the API.
+The module docs describe the APIs:
+[DNP3](../src/stdlib/dnp3.rs), [IEC 104](../src/stdlib/iec104.rs),
+[EtherNet/IP](../src/stdlib/enip.rs), [OPC UA](../src/stdlib/opcua.rs), and
+[RDP](../src/stdlib/rdp.rs). The shared [codec docs](../src/stdlib/codec/mod.rs)
+cover `pump`, `finish`, stream errors, and unread bytes.
