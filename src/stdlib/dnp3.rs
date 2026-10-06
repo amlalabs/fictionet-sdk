@@ -7,7 +7,7 @@
 //! every CRC and removes them from its data; its writer puts them back.
 //! The framing follows IEEE 1815 (DNP3).
 //!
-//! Feed connection bytes to [`Decoder`], then read each data frame's
+//! Push connection bytes to a [`Stream`](super::codec::Stream) of [`Frames`], then read each data frame's
 //! [`Segment`]. A [`Reassembler`] joins transport segments into application
 //! fragments. Use one reassembler per source, destination and direction;
 //! link acknowledgments, duplicate suppression and session state belong to
@@ -15,13 +15,13 @@
 //! groups and variations as bytes. Secure authentication is not performed.
 //! Unknown link and application function codes are preserved.
 //!
-//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream).
+//! Use [`Frames`] with [`Stream`](super::codec::Stream).
 //! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
-//! Its inherent parser still reads a prefix. [`Decoder`] keeps its original
-//! repeating errors and releases buffered bytes on failure.
+//! Its inherent parser reads a prefix.
 //!
 //! ```
-//! use fictionet::stdlib::dnp3::{Decoder, Frame, Fragment, Segment};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::dnp3::{Frames, Frame, Fragment, Segment};
 //!
 //! // Read class 0 data: group 60, variation 1, all objects.
 //! let request = Fragment { control: 0xc0, function: 1, indications: None,
@@ -31,9 +31,9 @@
 //! let frame = Frame { control: 0xc4, destination: 1, source: 1024,
 //!                     data: segment.to_bytes().unwrap() };
 //! let bytes = frame.to_bytes().unwrap();
-//! let mut decoder = Decoder::new();
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! assert_eq!(decoder.next_frame().unwrap().unwrap(), frame);
+//! let mut decoder = Stream::new(Frames::new());
+//! assert_eq!(decoder.push(&bytes), bytes.len());
+//! assert_eq!(decoder.next().unwrap().unwrap(), frame);
 //! ```
 
 use super::codec::{Decode, Step, Wire};
@@ -46,8 +46,6 @@ pub const HEADER_LEN: usize = 10;
 pub const MAX_DATA: usize = 250;
 /// The longest link frame, including all CRCs.
 pub const MAX_FRAME: usize = 292;
-/// The most unread bytes a link decoder holds.
-pub const MAX_BUFFERED: usize = MAX_FRAME;
 /// The local limit on a reassembled application fragment.
 pub const MAX_FRAGMENT: usize = 64 << 10;
 
@@ -180,23 +178,6 @@ impl Frame {
         )))
     }
 
-    /// Writes the header and each data block with freshly calculated CRCs.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameError> {
-        if self.data.len() > MAX_DATA {
-            return Err(FrameError::Length);
-        }
-        let mut out = Vec::with_capacity(MAX_FRAME);
-        out.extend_from_slice(&[5, 0x64, (self.data.len() + 5) as u8, self.control]);
-        out.extend_from_slice(&self.destination.to_le_bytes());
-        out.extend_from_slice(&self.source.to_le_bytes());
-        out.extend_from_slice(&crc(&out).to_le_bytes());
-        for block in self.data.chunks(16) {
-            out.extend_from_slice(block);
-            out.extend_from_slice(&crc(block).to_le_bytes());
-        }
-        Ok(out)
-    }
-
     /// The low four bits of the link control byte.
     pub fn function(&self) -> u8 {
         self.control & 0x0f
@@ -230,9 +211,21 @@ impl Wire for Frame {
         }
     }
 
-    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
-        out.extend_from_slice(&self.to_bytes()?);
+    /// Writes the header and each data block with freshly calculated CRCs.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), FrameError> {
+        if self.data.len() > MAX_DATA {
+            return Err(FrameError::Length);
+        }
+        let mut out = Vec::with_capacity(MAX_FRAME);
+        out.extend_from_slice(&[5, 0x64, (self.data.len() + 5) as u8, self.control]);
+        out.extend_from_slice(&self.destination.to_le_bytes());
+        out.extend_from_slice(&self.source.to_le_bytes());
+        out.extend_from_slice(&crc(&out).to_le_bytes());
+        for block in self.data.chunks(16) {
+            out.extend_from_slice(block);
+            out.extend_from_slice(&crc(block).to_le_bytes());
+        }
+        dst.extend_from_slice(&out);
         Ok(())
     }
 }
@@ -242,7 +235,6 @@ impl Wire for Frame {
 /// Use with [`Stream`](super::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
-/// The existing [`Decoder`] keeps repeating errors and clearing its buffer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
 
@@ -279,64 +271,6 @@ fn check_crc(b: &[u8], at: usize, size: usize) -> Result<(), FrameError> {
         Ok(())
     } else {
         Err(FrameError::Crc(at + size))
-    }
-}
-
-/// A bounded link stream decoder. The first error is sticky: it releases
-/// buffered data and does not try to resynchronize inside a corrupt frame.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    start: usize,
-    failed: Option<FrameError>,
-}
-
-impl Decoder {
-    /// An empty decoder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Takes as many bytes as fit. Drain frames and feed the remainder.
-    /// After an error, takes and drops all bytes.
-    #[must_use = "bytes past the returned count were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next frame, or `None` until more bytes arrive. A full decoder
-    /// always produces a frame or an error.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Frame::parse(&self.buf[self.start..]) {
-            Ok(Some((frame, used))) => {
-                self.start += used;
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// Bytes waiting to be read.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
     }
 }
 
@@ -393,18 +327,6 @@ impl Segment {
         })
     }
 
-    /// Writes a transport header followed by its data.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, TransportError> {
-        self.validate()?;
-        let mut out = vec![
-            self.sequence
-                | if self.first { 0x40 } else { 0 }
-                | if self.final_segment { 0x80 } else { 0 },
-        ];
-        out.extend_from_slice(&self.data);
-        Ok(out)
-    }
-
     fn validate(&self) -> Result<(), TransportError> {
         if self.sequence > 63 {
             return Err(TransportError::Sequence);
@@ -448,7 +370,12 @@ impl Reassembler {
                 return Err(TransportError::Sequence);
             }
         }
-        if self.data.len() + s.data.len() > MAX_FRAGMENT {
+        if self
+            .data
+            .len()
+            .checked_add(s.data.len())
+            .is_none_or(|n| n > MAX_FRAGMENT)
+        {
             return Err(TransportError::TooLong);
         }
         self.data.extend_from_slice(&s.data);
@@ -516,9 +443,40 @@ impl Fragment {
             objects: b[header..].to_vec(),
         })
     }
+}
+
+impl Wire for Segment {
+    type ParseError = TransportError;
+    type WriteError = TransportError;
+
+    fn parse(b: &[u8]) -> Result<Self, TransportError> {
+        Self::parse(b)
+    }
+
+    /// Writes a transport header followed by its data.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), TransportError> {
+        self.validate()?;
+        let mut out = vec![
+            self.sequence
+                | if self.first { 0x40 } else { 0 }
+                | if self.final_segment { 0x80 } else { 0 },
+        ];
+        out.extend_from_slice(&self.data);
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Fragment {
+    type ParseError = FragmentError;
+    type WriteError = FragmentError;
+
+    fn parse(b: &[u8]) -> Result<Self, FragmentError> {
+        Self::parse(b)
+    }
 
     /// Writes an application fragment, requiring IIN exactly for responses.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, FragmentError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), FragmentError> {
         if (self.function & 0x80 != 0) != self.indications.is_some() {
             return Err(FragmentError::Indications);
         }
@@ -531,13 +489,15 @@ impl Fragment {
             out.extend_from_slice(&iin.to_le_bytes());
         }
         out.extend_from_slice(&self.objects);
-        Ok(out)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump};
 
     // Reset link states: master 1024 to outstation 1, no user data.
     const RESET: &[u8] = &[5, 0x64, 5, 0xc0, 1, 0, 0, 4, 0xe9, 0x21];
@@ -612,43 +572,29 @@ mod tests {
         assert_eq!(Frame::parse(&[5, 0x64, 4]), Err(FrameError::Length));
     }
 
-    fn split(bytes: &[u8], size: usize) -> Vec<Frame> {
-        let mut decoder = Decoder::new();
-        let mut frames = Vec::new();
-        for mut chunk in bytes.chunks(size) {
-            while !chunk.is_empty() {
-                let n = decoder.feed(chunk);
-                chunk = &chunk[n..];
-                assert!(decoder.buffered() <= MAX_BUFFERED);
-                let before = frames.len();
-                while let Some(frame) = decoder.next_frame() {
-                    frames.push(frame.unwrap());
-                }
-                assert!(n > 0 || frames.len() > before);
-            }
-        }
-        assert_eq!(decoder.buffered(), 0);
-        frames
-    }
-
     #[test]
-    fn stream_chunking_limits_and_sticky_failure() {
+    fn stream_limits_and_terminal_failure() {
         let frame = Frame {
             control: 0xc4,
             destination: 1,
             source: 2,
             data: vec![0; MAX_DATA],
         };
-        let bytes = frame.to_bytes().unwrap().repeat(10);
-        for size in [1, 7, MAX_FRAME, bytes.len()] {
-            assert_eq!(split(&bytes, size), vec![frame.clone(); 10]);
-        }
-        let mut decoder = Decoder::new();
-        assert_eq!(decoder.feed(&vec![0; MAX_BUFFERED + 10]), MAX_BUFFERED);
-        assert_eq!(decoder.next_frame(), Some(Err(FrameError::Start)));
-        assert_eq!(decoder.buffered(), 0);
-        assert_eq!(decoder.feed(RESET), RESET.len());
-        assert_eq!(decoder.next_frame(), Some(Err(FrameError::Start)));
+        let encoded = frame.to_bytes().unwrap();
+        assert_eq!(encoded.len(), MAX_FRAME);
+        let bytes = encoded.repeat(10);
+        contract::check_decode(Frames::new, &bytes);
+        let mut stream = Stream::new(Frames);
+        let mut frames = Vec::new();
+        pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+        finish(&mut stream, |frame| frames.push(frame)).unwrap();
+        assert_eq!(frames, vec![frame; 10]);
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Start))));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(FrameError::Start)));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.push(&[0]), 1);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! IEC 104 carries telecontrol messages over TCP, usually on port 2404.
 //! [`Frame`] reads the I (information), S (acknowledgment) and U (link
-//! control) formats. [`Decoder`] splits a byte stream into those frames.
+//! control) formats. [`Frames`] splits a byte stream into those frames.
 //! Sequence numbers are checked for their 15-bit range; tracking which
 //! numbers have been sent or acknowledged belongs to world code.
 //!
@@ -13,12 +13,12 @@
 //! form that sends only the first address. Type-specific value validation,
 //! timers, connection state and secure authentication belong to the caller.
 //!
-//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream).
+//! Use [`Frames`] with [`Stream`](super::codec::Stream).
 //! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
-//! Its inherent parser still reads a prefix. [`Decoder`] keeps its original
-//! repeating errors and releases buffered bytes on failure.
+//! Its inherent parser reads a prefix.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::iec104::{Asdu, Frame, Object, UFunction};
 //!
 //! assert_eq!(Frame::Unnumbered(UFunction::StartDtAct).to_bytes().unwrap(),
@@ -45,8 +45,6 @@ pub const MAX_FRAME: usize = 255;
 pub const MAX_ASDU: usize = MAX_FRAME - HEADER_LEN;
 /// Fixed ASDU header length.
 pub const ASDU_HEADER_LEN: usize = 6;
-/// Maximum unread bytes held by a decoder.
-pub const MAX_BUFFERED: usize = MAX_FRAME;
 /// Largest information object address.
 pub const MAX_ADDRESS: u32 = 0x00ff_ffff;
 
@@ -225,9 +223,23 @@ impl Frame {
         };
         Ok(Some((frame, end)))
     }
+}
+
+impl Wire for Frame {
+    type ParseError = FrameParseError;
+    type WriteError = FrameError;
+
+    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
+        match Self::parse(b).map_err(FrameParseError::Frame)? {
+            Some((frame, used)) if used == b.len() => Ok(frame),
+            Some(_) => Err(FrameParseError::Trailing),
+            None => Err(FrameParseError::Truncated),
+        }
+    }
 
     /// Writes an APDU, refusing out-of-range sequence numbers or ASDUs.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameError> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), FrameError> {
         let mut out = vec![0x68, 4];
         match self {
             Self::Information {
@@ -255,26 +267,7 @@ impl Frame {
             }
             Self::Unnumbered(function) => out.extend_from_slice(&[function.code(), 0, 0, 0]),
         }
-        Ok(out)
-    }
-}
-
-impl Wire for Frame {
-    type ParseError = FrameParseError;
-    type WriteError = FrameError;
-
-    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
-    fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
-        match Self::parse(b).map_err(FrameParseError::Frame)? {
-            Some((frame, used)) if used == b.len() => Ok(frame),
-            Some(_) => Err(FrameParseError::Trailing),
-            None => Err(FrameParseError::Truncated),
-        }
-    }
-
-    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
-        out.extend_from_slice(&self.to_bytes()?);
+        dst.extend_from_slice(&out);
         Ok(())
     }
 }
@@ -284,7 +277,6 @@ impl Wire for Frame {
 /// Use with [`Stream`](super::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
-/// The existing [`Decoder`] keeps repeating errors and clearing its buffer.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
 
@@ -317,63 +309,6 @@ fn le16(b: &[u8], at: usize) -> u16 {
 }
 fn le24(b: &[u8]) -> u32 {
     u32::from(b[0]) | u32::from(b[1]) << 8 | u32::from(b[2]) << 16
-}
-
-/// A bounded APDU stream decoder. Its first error is sticky and releases
-/// the buffer; it never scans through a corrupt APDU looking for 0x68.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    start: usize,
-    failed: Option<FrameError>,
-}
-impl Decoder {
-    /// An empty decoder.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Takes the prefix that fits in [`MAX_BUFFERED`]. Drain frames before
-    /// feeding the remainder. After an error, takes and drops every byte.
-    #[must_use = "bytes past the returned count were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED - self.buffered());
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next complete APDU, or `None` until more bytes arrive. A full
-    /// decoder always gives a frame or an error.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Frame::parse(&self.buf[self.start..]) {
-            Ok(Some((frame, used))) => {
-                self.start += used;
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// Bytes not yet returned in frames.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
-    }
 }
 
 /// Why an ASDU or its information objects are malformed.
@@ -451,21 +386,6 @@ impl Asdu {
             common_address: le16(b, 4),
             data: b[6..].to_vec(),
         })
-    }
-
-    /// Writes the ASDU header and opaque data. Use [`Asdu::set_objects`]
-    /// to construct data whose object count and addresses are consistent.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, AsduError> {
-        self.validate()?;
-        let mut out = vec![
-            self.type_id,
-            self.count | if self.sequence { 0x80 } else { 0 },
-            self.cause | if self.negative { 0x40 } else { 0 } | if self.test { 0x80 } else { 0 },
-            self.originator,
-        ];
-        out.extend_from_slice(&self.common_address.to_le_bytes());
-        out.extend_from_slice(&self.data);
-        Ok(out)
     }
 
     fn validate(&self) -> Result<(), AsduError> {
@@ -560,9 +480,35 @@ impl Asdu {
     }
 }
 
+impl Wire for Asdu {
+    type ParseError = AsduError;
+    type WriteError = AsduError;
+
+    fn parse(b: &[u8]) -> Result<Self, AsduError> {
+        Self::parse(b)
+    }
+
+    /// Writes the ASDU header and opaque data. Use [`Asdu::set_objects`]
+    /// to construct data whose object count and addresses are consistent.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), AsduError> {
+        self.validate()?;
+        let mut out = vec![
+            self.type_id,
+            self.count | if self.sequence { 0x80 } else { 0 },
+            self.cause | if self.negative { 0x40 } else { 0 } | if self.test { 0x80 } else { 0 },
+            self.originator,
+        ];
+        out.extend_from_slice(&self.common_address.to_le_bytes());
+        out.extend_from_slice(&self.data);
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump};
 
     const INTERROGATION: &[u8] = &[0x68, 14, 0, 0, 0, 0, 100, 1, 6, 0, 1, 0, 0, 0, 0, 20];
 
@@ -655,40 +601,27 @@ mod tests {
     }
 
     #[test]
-    fn maximum_frame_and_decoder_schedules() {
-        let max = Frame::Information {
+    fn stream_limits_and_terminal_failure() {
+        let frame = Frame::Information {
             send: 32767,
             receive: 32767,
             asdu: vec![0xff; MAX_ASDU],
         };
-        let bytes = max.to_bytes().unwrap();
-        assert_eq!(bytes.len(), MAX_FRAME);
-        let stream = bytes.repeat(7);
-        for size in [1, 7, MAX_FRAME, stream.len()] {
-            let mut d = Decoder::new();
-            let mut count = 0;
-            for mut chunk in stream.chunks(size) {
-                while !chunk.is_empty() {
-                    let n = d.feed(chunk);
-                    chunk = &chunk[n..];
-                    assert!(d.buffered() <= MAX_BUFFERED);
-                    let before = count;
-                    while let Some(frame) = d.next_frame() {
-                        assert_eq!(frame, Ok(max.clone()));
-                        count += 1;
-                    }
-                    assert!(n > 0 || count > before);
-                }
-            }
-            assert_eq!(count, 7);
-            assert_eq!(d.buffered(), 0);
-        }
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&vec![0; MAX_BUFFERED + 1]), MAX_BUFFERED);
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Start)));
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.feed(INTERROGATION), INTERROGATION.len());
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Start)));
+        let encoded = frame.to_bytes().unwrap();
+        assert_eq!(encoded.len(), MAX_FRAME);
+        let bytes = encoded.repeat(7);
+        contract::check_decode(Frames::new, &bytes);
+        let mut stream = Stream::new(Frames);
+        let mut frames = Vec::new();
+        pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
+        finish(&mut stream, |frame| frames.push(frame)).unwrap();
+        assert_eq!(frames, vec![frame; 7]);
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Start))));
+        assert_eq!(stream.failed(), Some(&Fail::Protocol(FrameError::Start)));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.push(&[0]), 1);
     }
 
     #[test]

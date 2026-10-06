@@ -2,58 +2,26 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::{Stream, Wire, pump};
 use fictionet::stdlib::dnp3::Frames;
-use fictionet::stdlib::dnp3::{
-    Decoder, Fragment, Frame, FrameError, MAX_BUFFERED, MAX_FRAGMENT, Reassembler, Segment,
-};
+use fictionet::stdlib::dnp3::{Fragment, Frame, MAX_FRAGMENT, Reassembler, Segment};
 use libfuzzer_sys::fuzz_target;
-
-fn split(data: &[u8], size: usize, drain_each: bool) -> Vec<Result<Frame, FrameError>> {
-    let mut decoder = Decoder::new();
-    let mut out = Vec::new();
-    for mut chunk in data.chunks(size.max(1)) {
-        while !chunk.is_empty() {
-            let n = decoder.feed(chunk);
-            chunk = &chunk[n..];
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            if drain_each || !chunk.is_empty() {
-                let before = out.len();
-                while let Some(frame) = decoder.next_frame() {
-                    let failed = frame.is_err();
-                    out.push(frame);
-                    if failed {
-                        assert_eq!(decoder.buffered(), 0);
-                        assert_eq!(decoder.next_frame(), out.last().cloned());
-                        return out;
-                    }
-                }
-                assert!(n > 0 || out.len() > before);
-            }
-        }
-    }
-    while let Some(frame) = decoder.next_frame() {
-        let failed = frame.is_err();
-        out.push(frame);
-        if failed {
-            break;
-        }
-    }
-    out
-}
 
 fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Frame>(data);
-    let frames = split(data, data.len(), true);
-    for (size, drain) in [(1, true), (7, false), (MAX_BUFFERED + 1, false)] {
-        assert_eq!(split(data, size, drain), frames);
-    }
-    for frame in frames.iter().flatten() {
+    let mut stream = Stream::new(Frames);
+    let mut frames = Vec::new();
+    let _ = pump(&mut stream, data, |frame| frames.push(frame));
+    for frame in &frames {
         check_wire_value(frame);
         let bytes = frame.to_bytes().unwrap();
-        assert_eq!(Frame::parse(&bytes), Ok(Some((frame.clone(), bytes.len()))));
+        assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame.clone()));
         if let Ok(segment) = frame.segment() {
-            assert_eq!(Segment::parse(&segment.to_bytes().unwrap()), Ok(segment));
+            assert_eq!(
+                <Segment as Wire>::parse(&segment.to_bytes().unwrap()),
+                Ok(segment)
+            );
         }
     }
     // Structured input reaches CRC-protected payloads even for random bytes.
@@ -66,7 +34,7 @@ fuzz_target!(|data: &[u8]| {
         };
         check_wire_value(&frame);
         let bytes = frame.to_bytes().unwrap();
-        assert_eq!(split(&bytes, 1, true), vec![Ok(frame)]);
+        check_decode(Frames::new, &bytes);
     }
     check_wire_value(&Frame {
         control: data.first().copied().unwrap_or(0),
@@ -77,12 +45,19 @@ fuzz_target!(|data: &[u8]| {
             .unwrap_or_default()
             .to_vec(),
     });
-    let _ = Frame::parse(data);
-    if let Ok(segment) = Segment::parse(data) {
-        assert_eq!(Segment::parse(&segment.to_bytes().unwrap()), Ok(segment));
+    check_wire::<Segment>(data);
+    check_wire::<Fragment>(data);
+    if let Ok(segment) = <Segment as Wire>::parse(data) {
+        assert_eq!(
+            <Segment as Wire>::parse(&segment.to_bytes().unwrap()),
+            Ok(segment)
+        );
     }
-    if let Ok(fragment) = Fragment::parse(data) {
-        assert_eq!(Fragment::parse(&fragment.to_bytes().unwrap()), Ok(fragment));
+    if let Ok(fragment) = <Fragment as Wire>::parse(data) {
+        assert_eq!(
+            <Fragment as Wire>::parse(&fragment.to_bytes().unwrap()),
+            Ok(fragment)
+        );
     }
     if data.len() >= 4 {
         let fragment = Fragment {
@@ -92,12 +67,12 @@ fuzz_target!(|data: &[u8]| {
             objects: data[4..].to_vec(),
         };
         if let Ok(bytes) = fragment.to_bytes() {
-            assert_eq!(Fragment::parse(&bytes), Ok(fragment));
+            assert_eq!(<Fragment as Wire>::parse(&bytes), Ok(fragment));
         }
     }
     let mut reassembler = Reassembler::new();
     for chunk in data.chunks(250) {
-        if let Ok(segment) = Segment::parse(chunk) {
+        if let Ok(segment) = <Segment as Wire>::parse(chunk) {
             let _ = reassembler.push(&segment);
             assert!(reassembler.buffered() <= MAX_FRAGMENT);
         }

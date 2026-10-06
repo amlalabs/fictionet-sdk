@@ -1,6 +1,6 @@
 //! RDP connection messages from MS-RDPBCGR, with no I/O.
 //!
-//! [`Decoder`] separates TPKT slow-path packets from fast-path packets.
+//! [`Frames`] separates TPKT slow-path packets from fast-path packets.
 //! [`Connection`] reads X.224 connection requests and confirms, including
 //! cookies, routing tokens and security negotiation. [`McsConnect`] reads
 //! the BER connection exchange and its PER GCC data. [`McsPdu`] reads the
@@ -22,23 +22,23 @@
 //! a round trip. Optional client core fields and extended client info are
 //! preserved as bytes. Writers use the same checks as readers.
 //!
-//! New stacks use [`Frames`] with [`Stream`](super::codec::Stream).
+//! Use [`Frames`] with [`Stream`](super::codec::Stream).
 //! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
-//! The prefix parser and [`Decoder`] retain their existing behavior,
-//! including the decoder's repeating errors and fixed storage allocation.
+//! The inherent parser reads a prefix.
 //!
 //! The wire definitions and examples are in [MS-RDPBCGR sections 2.2.1,
 //! 2.2.8 and 4.1](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/).
 //!
 //! ```
-//! use fictionet::stdlib::rdp::{Connection, Decoder, Frame, Negotiation, Protocols};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::rdp::{Connection, Frames, Frame, Negotiation, Protocols};
 //!
 //! // MS-RDPBCGR connection request: TLS and CredSSP are supported.
 //! let bytes = [3, 0, 0, 19, 14, 0xe0, 0, 0, 0, 0, 0,
 //!              1, 0, 8, 0, 3, 0, 0, 0];
-//! let mut decoder = Decoder::new();
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let Frame::SlowPath(packet) = decoder.next_frame().unwrap().unwrap() else {
+//! let mut decoder = Stream::new(Frames::new());
+//! assert_eq!(decoder.push(&bytes), bytes.len());
+//! let Frame::SlowPath(packet) = decoder.next().unwrap().unwrap() else {
 //!     panic!("expected TPKT");
 //! };
 //! let request = Connection::from_packet(&packet).unwrap();
@@ -59,10 +59,6 @@ use super::{
 pub const PORT: u16 = 3389;
 /// The largest transport frame, including its header.
 pub const MAX_FRAME: usize = tpkt::MAX_PACKET;
-/// The largest unconsumed byte count in a [`Decoder`].
-pub const MAX_BUFFERED: usize = MAX_FRAME;
-/// The largest backing allocation in a [`Decoder`], including consumed bytes.
-pub const MAX_STORAGE: usize = 2 * MAX_BUFFERED;
 /// The largest fast-path frame, including its two or three byte header.
 pub const MAX_FAST_PATH: usize = 0x7fff;
 /// The largest plaintext PDU, also the data room in one TPKT data TPDU.
@@ -438,28 +434,6 @@ impl Frame {
             length,
         )))
     }
-
-    /// Writes one frame, using the shortest fast-path length encoding.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        match self {
-            Self::SlowPath(p) => p
-                .to_bytes()
-                .map_err(|_| Error::Invalid("TPKT payload length")),
-            Self::FastPath { header, payload } => {
-                check(header & 3 == 0, "fast-path action")?;
-                bound(payload.len(), MAX_FAST_PATH - 3, "fast-path payload")?;
-                let mut w = Write::new(MAX_FAST_PATH);
-                w.byte(*header)?;
-                if payload.len() <= 125 {
-                    w.byte((payload.len() + 2) as u8)?;
-                } else {
-                    w.be16(((payload.len() + 3) as u16) | 0x8000)?;
-                }
-                w.put(payload)?;
-                Ok(w.b)
-            }
-        }
-    }
 }
 
 impl Wire for Frame {
@@ -475,10 +449,27 @@ impl Wire for Frame {
         }
     }
 
-    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
-        out.extend_from_slice(&self.to_bytes()?);
-        Ok(())
+    /// Writes one frame, using the shortest fast-path length encoding.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        match self {
+            Self::SlowPath(p) => p
+                .write(dst)
+                .map_err(|_| Error::Invalid("TPKT payload length")),
+            Self::FastPath { header, payload } => {
+                check(header & 3 == 0, "fast-path action")?;
+                bound(payload.len(), MAX_FAST_PATH - 3, "fast-path payload")?;
+                let mut w = Write::new(MAX_FAST_PATH);
+                w.byte(*header)?;
+                if payload.len() <= 125 {
+                    w.byte((payload.len() + 2) as u8)?;
+                } else {
+                    w.be16(((payload.len() + 3) as u16) | 0x8000)?;
+                }
+                w.put(payload)?;
+                dst.extend_from_slice(&w.b);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -487,8 +478,7 @@ impl Wire for Frame {
 /// Use with [`Stream`](super::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
-/// Slow-path framing uses the shared [`tpkt`] parser. The existing
-/// [`Decoder`] keeps repeating errors and its fixed storage allocation.
+/// Slow-path framing uses the shared [`tpkt`] parser.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Frames;
 
@@ -516,97 +506,6 @@ impl Decode for Frames {
     }
 }
 
-/// A bounded stream decoder. Unconsumed bytes never exceed [`MAX_BUFFERED`];
-/// the backing storage, including consumed bytes, never exceeds [`MAX_STORAGE`].
-/// It only examines a frame's body when all of it has arrived.
-#[derive(Debug)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    start: usize,
-    failed: Option<Error>,
-}
-impl Clone for Decoder {
-    fn clone(&self) -> Self {
-        // Vec::clone can shrink capacity; preserve the fixed capacity so a
-        // later feed cannot trigger geometric growth beyond MAX_STORAGE.
-        let mut buf = Vec::with_capacity(MAX_STORAGE);
-        buf.extend_from_slice(&self.buf);
-        Self {
-            buf,
-            start: self.start,
-            failed: self.failed,
-        }
-    }
-}
-impl Default for Decoder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-impl Decoder {
-    /// Creates an empty decoder with a fixed [`MAX_STORAGE`] allocation.
-    pub fn new() -> Self {
-        Self {
-            buf: Vec::with_capacity(MAX_STORAGE),
-            start: 0,
-            failed: None,
-        }
-    }
-    /// Takes a prefix of `bytes` and returns its length. Drain frames before
-    /// retrying bytes that did not fit. After an error, takes and drops all
-    /// bytes; [`Self::next_frame`] continues to report the original error.
-    #[must_use = "bytes past the returned count were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        // Moving only after at least a full buffer was consumed bounds the
-        // total copying by the total bytes fed, even with tiny frames.
-        if self.start >= MAX_BUFFERED {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes
-            .len()
-            .min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        if let Some(b) = bytes.get(..n) {
-            self.buf.extend_from_slice(b);
-        }
-        n
-    }
-    /// Returns the next frame, `None` for a partial frame, or a sticky error.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, Error>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Frame::parse(self.buf.get(self.start..).unwrap_or_default()) {
-            Ok(Some((frame, n))) => {
-                self.start += n; // n is inside a buffer bounded by MAX_STORAGE.
-                if self.start == self.buf.len() {
-                    self.buf.clear();
-                    self.start = 0;
-                }
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.buf.clear();
-                self.start = 0;
-                self.failed = Some(e);
-                Some(Err(e))
-            }
-        }
-    }
-    /// Returns the number of unconsumed bytes.
-    pub fn buffered(&self) -> usize {
-        self.buf.len().saturating_sub(self.start)
-    }
-    /// Returns the backing allocation size, at most [`MAX_STORAGE`].
-    pub fn storage_capacity(&self) -> usize {
-        self.buf.capacity()
-    }
-}
-
 /// Extracts the bytes of an unsegmented RDP X.224 Data TPDU using COTP.
 /// Use the sibling COTP reassembler yourself for non-RDP segmented traffic.
 pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
@@ -622,7 +521,7 @@ pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
 }
 
 /// Wraps at most [`MAX_PDU`] bytes in an unsegmented COTP Data TPDU and TPKT.
-/// Checks size first because the sibling COTP writer can truncate large data.
+/// Checks the data size before constructing the packet.
 pub fn write_data(data: &[u8]) -> Result<tpkt::Packet, Error> {
     bound(data.len(), MAX_PDU, "RDP data")?;
     Ok(cotp::over_tpkt::from_tpdu(&cotp::Tpdu::Data(cotp::Data {
@@ -735,22 +634,6 @@ impl Negotiation {
             }
             _ => Err(Error::Invalid("negotiation type")),
         }
-    }
-    /// Writes the negotiation structure, refusing multiple selected protocols.
-    pub fn to_bytes(&self) -> Result<[u8; 8], Error> {
-        let (kind, flags, value) = match *self {
-            Self::Request { flags, protocols } => (1, flags, protocols.0),
-            Self::Response { flags, protocol } => {
-                check(
-                    protocol.0 == 0 || protocol.0.is_power_of_two(),
-                    "selected protocol",
-                )?;
-                (2, flags, protocol.0)
-            }
-            Self::Failure(code) => (3, 0, code.0),
-        };
-        let [a, b, c, d] = value.to_le_bytes();
-        Ok([kind, flags, 8, 0, a, b, c, d])
     }
 }
 
@@ -1230,138 +1113,6 @@ impl DataBlock {
         r.finish()?;
         Ok(out)
     }
-    /// Writes the block and checks its typed shape. Unknown blocks may not
-    /// use known type codes. Padding in SC_NET is written as zero.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut w = Write::new(MAX_GCC_DATA - 4);
-        match self {
-            Self::ClientCore(c) => {
-                w.le32(c.version)?;
-                w.le16(c.desktop_width)?;
-                w.le16(c.desktop_height)?;
-                w.le16(c.color_depth)?;
-                w.le16(c.sas_sequence)?;
-                w.le32(c.keyboard_layout)?;
-                w.le32(c.client_build)?;
-                w.put(&c.client_name)?;
-                w.le32(c.keyboard_type)?;
-                w.le32(c.keyboard_subtype)?;
-                w.le32(c.keyboard_function_keys)?;
-                w.put(&c.ime_file_name)?;
-                bound(
-                    c.optional.len(),
-                    MAX_CORE_OPTIONAL,
-                    "client core optional fields",
-                )?;
-                check(
-                    CORE_BOUNDARIES.contains(&c.optional.len())
-                        && c.optional.len() != 88
-                        && c.optional.len() != 98,
-                    "client core field boundary",
-                )?;
-                w.put(&c.optional)?;
-            }
-            Self::ClientSecurity {
-                encryption_methods,
-                extended_methods,
-            } => {
-                w.le32(*encryption_methods)?;
-                w.le32(*extended_methods)?;
-            }
-            Self::ClientNetwork(channels) => {
-                bound(channels.len(), MAX_CHANNELS, "channels")?;
-                w.le32(channels.len() as u32)?;
-                for c in channels {
-                    w.put(&c.name)?;
-                    w.le32(c.options)?;
-                }
-            }
-            Self::ClientCluster {
-                flags,
-                redirected_session_id,
-            } => {
-                w.le32(*flags)?;
-                w.le32(*redirected_session_id)?;
-            }
-            Self::ClientMonitor(monitors) => {
-                bound(monitors.len(), MAX_MONITORS, "monitors")?;
-                w.le32(0)?;
-                w.le32(monitors.len() as u32)?;
-                for m in monitors {
-                    w.put(&m.left.to_le_bytes())?;
-                    w.put(&m.top.to_le_bytes())?;
-                    w.put(&m.right.to_le_bytes())?;
-                    w.put(&m.bottom.to_le_bytes())?;
-                    w.le32(m.flags)?;
-                }
-            }
-            Self::ClientMessageChannel => w.le32(0)?,
-            Self::ClientMultitransport(flags) | Self::ServerMultitransport(flags) => {
-                w.le32(*flags)?
-            }
-            Self::ServerCore {
-                version,
-                requested_protocols,
-                early_capability_flags,
-            } => {
-                check(
-                    early_capability_flags.is_none() || requested_protocols.is_some(),
-                    "server core optional fields",
-                )?;
-                w.le32(*version)?;
-                if let Some(p) = requested_protocols {
-                    w.le32(p.0)?;
-                }
-                if let Some(f) = early_capability_flags {
-                    w.le32(*f)?;
-                }
-            }
-            Self::ServerSecurity {
-                encryption_method,
-                encryption_level,
-                random,
-                certificate,
-            } => {
-                w.le32(*encryption_method)?;
-                w.le32(*encryption_level)?;
-                if *encryption_method == 0 && *encryption_level == 0 {
-                    check(
-                        random.is_empty() && certificate.is_empty(),
-                        "unencrypted server security",
-                    )?;
-                } else {
-                    check(random.len() == SERVER_RANDOM_LEN, "server random length")?;
-                    bound(certificate.len(), MAX_GCC_DATA, "certificate")?;
-                    w.le32(SERVER_RANDOM_LEN as u32)?;
-                    w.le32(certificate.len() as u32)?;
-                    w.put(random)?;
-                    w.put(certificate)?;
-                }
-            }
-            Self::ServerNetwork {
-                io_channel,
-                channels,
-            } => {
-                bound(channels.len(), MAX_CHANNELS, "channels")?;
-                w.le16(*io_channel)?;
-                w.le16(channels.len() as u16)?;
-                for &id in channels {
-                    w.le16(id)?;
-                }
-                if channels.len() % 2 != 0 {
-                    w.le16(0)?;
-                }
-            }
-            Self::ServerMessageChannel(id) => w.le16(*id)?,
-            Self::Other { data, .. } => w.put(data)?,
-        }
-        let mut out = Write::new(MAX_GCC_DATA);
-        out.le16(self.kind())?;
-        out.le16(u16_len(w.b.len() + 4)?)?;
-        out.put(&w.b)?;
-        check(Self::parse(&out.b)? == *self, "block type or fields")?;
-        Ok(out.b)
-    }
 }
 
 /// Reads a complete sequence of GCC blocks, up to [`MAX_BLOCKS`] blocks
@@ -1379,16 +1130,6 @@ pub fn read_blocks(b: &[u8]) -> Result<Vec<DataBlock>, Error> {
         blocks.push(DataBlock::parse(r.take(n)?)?);
     }
     Ok(blocks)
-}
-
-/// Writes a sequence under the same count and aggregate limits as [`read_blocks`].
-pub fn write_blocks(blocks: &[DataBlock]) -> Result<Vec<u8>, Error> {
-    bound(blocks.len(), MAX_BLOCKS, "GCC block count")?;
-    let mut w = Write::new(MAX_GCC_DATA);
-    for block in blocks {
-        w.put(&block.to_bytes()?)?;
-    }
-    Ok(w.b)
 }
 
 /// An RDP GCC Conference Create request or response, including ConnectData.
@@ -1453,46 +1194,6 @@ impl GccConference {
                 blocks,
             })
         }
-    }
-    /// Writes RDP GCC. Responses use the interoperable outer length 0x2a;
-    /// all inner lengths describe the actual data.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let (blocks, request) = match self {
-            Self::Request(b) => (b, true),
-            Self::Response { blocks, .. } => (blocks, false),
-        };
-        check_block_direction(blocks, request)?;
-        let blocks = write_blocks(blocks)?;
-        let mut body = Write::new(MAX_GCC_RESPONSE);
-        match self {
-            Self::Request(_) => body.put(&[0, 8, 0, 0x10, 0])?,
-            Self::Response {
-                node_id,
-                tag,
-                result,
-                ..
-            } => {
-                check((1001..=65536).contains(node_id), "GCC node ID")?;
-                check(*result <= 4, "GCC result")?;
-                body.byte(0x14)?;
-                body.be16((node_id - 1001) as u16)?;
-                body.per_signed(*tag)?;
-                body.byte(result << 4)?;
-            }
-        }
-        body.put(&[1, 0xc0, 0])?;
-        body.put(if request { b"Duca" } else { b"McDn" })?;
-        body.per_len(blocks.len())?;
-        body.put(&blocks)?;
-        let mut w = Write::new(if request {
-            MAX_GCC_REQUEST
-        } else {
-            MAX_GCC_RESPONSE
-        });
-        w.put(&[0, 5, 0, 0x14, 0x7c, 0, 1])?;
-        w.per_len(if request { body.b.len() } else { 0x2a })?;
-        w.put(&body.b)?;
-        Ok(w.b)
     }
 }
 fn check_block_direction(blocks: &[DataBlock], request: bool) -> Result<(), Error> {
@@ -1657,51 +1358,6 @@ impl McsConnect {
             "MCS/GCC direction",
         )
     }
-    /// Writes canonical definite BER, with a leading zero on positive
-    /// integers whose high bit is set. Readers also accept Microsoft's
-    /// unsigned integer examples without that leading zero.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        self.direction()?;
-        let mut body = Write::new(MAX_PDU);
-        let kind = match self {
-            Self::Initial {
-                calling_domain,
-                called_domain,
-                upward,
-                target,
-                minimum,
-                maximum,
-                conference,
-            } => {
-                bound(calling_domain.len(), MAX_SELECTOR, "calling selector")?;
-                bound(called_domain.len(), MAX_SELECTOR, "called selector")?;
-                body.ber(&[4], calling_domain)?;
-                body.ber(&[4], called_domain)?;
-                body.ber(&[1], &[if *upward { 0xff } else { 0 }])?;
-                target.write(&mut body)?;
-                minimum.write(&mut body)?;
-                maximum.write(&mut body)?;
-                body.ber(&[4], &conference.to_bytes()?)?;
-                0x65
-            }
-            Self::Response {
-                result,
-                called_connect_id,
-                parameters,
-                conference,
-            } => {
-                check(*result <= 15, "MCS result")?;
-                body.ber_uint(10, u32::from(*result))?;
-                body.ber_uint(2, *called_connect_id)?;
-                parameters.write(&mut body)?;
-                body.ber(&[4], &conference.to_bytes()?)?;
-                0x66
-            }
-        };
-        let mut w = Write::new(MAX_PDU);
-        w.ber(&[0x7f, kind], &body.b)?;
-        Ok(w.b)
-    }
 }
 
 /// MCS domain PDUs in the aligned PER form used by RDP. User identifiers
@@ -1852,68 +1508,6 @@ impl McsPdu {
         }
         Ok(())
     }
-    /// Writes one PER PDU, checking ID ranges, results, optional fields,
-    /// priorities and the unfragmented user-data length.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        self.validate()?;
-        let mut w = Write::new(MAX_PDU);
-        match self {
-            Self::ErectDomain {
-                sub_height,
-                sub_interval,
-            } => {
-                w.byte(4)?;
-                w.per_uint(*sub_height)?;
-                w.per_uint(*sub_interval)?;
-            }
-            Self::AttachUserRequest => w.byte(0x28)?,
-            Self::AttachUserConfirm { result, initiator } => {
-                w.byte((if initiator.is_some() { 0x2e } else { 0x2c }) | (result >> 3))?;
-                w.byte((result & 7) << 5)?;
-                if let Some(id) = initiator {
-                    w.user_id(*id)?;
-                }
-            }
-            Self::ChannelJoinRequest {
-                initiator,
-                channel_id,
-            } => {
-                w.byte(0x38)?;
-                w.user_id(*initiator)?;
-                w.be16(*channel_id)?;
-            }
-            Self::ChannelJoinConfirm {
-                result,
-                initiator,
-                requested,
-                channel_id,
-            } => {
-                w.byte((if channel_id.is_some() { 0x3e } else { 0x3c }) | (result >> 3))?;
-                w.byte((result & 7) << 5)?;
-                w.user_id(*initiator)?;
-                w.be16(*requested)?;
-                if let Some(id) = channel_id {
-                    w.be16(*id)?;
-                }
-            }
-            Self::SendData {
-                indication,
-                initiator,
-                channel_id,
-                priority,
-                segmentation,
-                data,
-            } => {
-                w.byte(if *indication { 0x68 } else { 0x64 })?;
-                w.user_id(*initiator)?;
-                w.be16(*channel_id)?;
-                w.byte((priority << 6) | (segmentation << 4))?;
-                w.per_len(data.len())?;
-                w.put(data)?;
-            }
-        }
-        Ok(w.b)
-    }
 }
 fn valid_user(id: u32) -> Result<(), Error> {
     check((1001..=65535).contains(&id), "MCS user ID")
@@ -1961,14 +1555,7 @@ impl SecurityPayload {
             data: r.rest().to_vec(),
         })
     }
-    /// Writes the header and opaque bytes without changing protection fields.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let mut w = Write::new(MAX_PDU);
-        w.le16(self.flags)?;
-        w.le16(self.flags_hi)?;
-        w.put(&self.data)?;
-        Ok(w.b)
-    }
+
     /// Returns plaintext bytes, or refuses an encrypted, redirection or
     /// security-exchange payload. Decryption is the caller's responsibility.
     pub fn plaintext(&self) -> Result<&[u8], Error> {
@@ -2049,38 +1636,6 @@ impl ClientInfo {
             extra_info: r.rest().to_vec(),
         })
     }
-    /// Writes Info with recomputed lengths and null terminators. The opaque
-    /// extended suffix is copied; its version is chosen by the caller.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let fields = [
-            &self.domain,
-            &self.user_name,
-            &self.password,
-            &self.alternate_shell,
-            &self.working_dir,
-        ];
-        let unicode = self.flags & INFO_UNICODE != 0;
-        check(self.flags & INFO_RESERVED == 0, "reserved info flags")?;
-        let mut w = Write::new(MAX_PDU);
-        w.le32(self.code_page)?;
-        w.le32(self.flags)?;
-        for b in fields {
-            bound(
-                b.len() + 1 + usize::from(unicode),
-                MAX_INFO_STRING,
-                "info string",
-            )?;
-            check(!unicode || b.len() % 2 == 0, "Unicode string length")?;
-            w.le16(u16_len(b.len())?)?;
-        }
-        for b in fields {
-            w.put(b)?;
-            w.put(if unicode { &[0, 0] } else { &[0] })?;
-        }
-        bound(self.extra_info.len(), MAX_EXTRA_INFO, "extended info")?;
-        w.put(&self.extra_info)?;
-        Ok(w.b)
-    }
 }
 
 /// A plaintext licensing ERROR_ALERT, including its preamble and error blob.
@@ -2132,22 +1687,6 @@ impl LicenseError {
             blob_type,
             blob,
         })
-    }
-    /// Writes a licensing ERROR_ALERT with recomputed message and blob lengths.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        check(matches!(self.flags & 0x7f, 2 | 3), "license preamble flags")?;
-        check(self.blob_type == 4, "license error blob type")?;
-        bound(self.blob.len(), MAX_PDU - 16, "license error blob")?;
-        let mut w = Write::new(MAX_PDU);
-        w.byte(0xff)?;
-        w.byte(self.flags)?;
-        w.le16(u16_len(self.blob.len() + 16)?)?;
-        w.le32(self.error_code)?;
-        w.le32(self.state_transition)?;
-        w.le16(self.blob_type)?;
-        w.le16(u16_len(self.blob.len())?)?;
-        w.put(&self.blob)?;
-        Ok(w.b)
     }
 }
 
@@ -2236,15 +1775,6 @@ impl CapabilitySet {
             kind,
             data: r.rest().to_vec(),
         })
-    }
-    /// Writes the capability header with the actual body length.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        bound(self.data.len(), MAX_CAPABILITY, "capability")?;
-        let mut w = Write::new(MAX_CAPABILITY + 4);
-        w.le16(self.kind.0)?;
-        w.le16(u16_len(self.data.len() + 4)?)?;
-        w.put(&self.data)?;
-        Ok(w.b)
     }
 }
 
@@ -2335,9 +1865,499 @@ impl ActivePdu {
             padding,
         })
     }
+}
+
+impl Wire for Vec<DataBlock> {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        read_blocks(b)
+    }
+
+    /// Appends a bounded block sequence. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), Error> {
+        bound(self.len(), MAX_BLOCKS, "GCC block count")?;
+        let mut bytes = Vec::new();
+        for block in self {
+            block.write(&mut bytes)?;
+            bound(bytes.len(), MAX_GCC_DATA, "GCC blocks")?;
+        }
+        out.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Negotiation {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes the negotiation structure, refusing multiple selected protocols.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let (kind, flags, value) = match *self {
+            Self::Request { flags, protocols } => (1, flags, protocols.0),
+            Self::Response { flags, protocol } => {
+                check(
+                    protocol.0 == 0 || protocol.0.is_power_of_two(),
+                    "selected protocol",
+                )?;
+                (2, flags, protocol.0)
+            }
+            Self::Failure(code) => (3, 0, code.0),
+        };
+        let [a, b, c, d] = value.to_le_bytes();
+        dst.extend_from_slice(&[kind, flags, 8, 0, a, b, c, d]);
+        Ok(())
+    }
+}
+
+impl Wire for DataBlock {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes the block and checks its typed shape. Unknown blocks may not
+    /// use known type codes. Padding in SC_NET is written as zero.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut w = Write::new(MAX_GCC_DATA - 4);
+        match self {
+            Self::ClientCore(c) => {
+                w.le32(c.version)?;
+                w.le16(c.desktop_width)?;
+                w.le16(c.desktop_height)?;
+                w.le16(c.color_depth)?;
+                w.le16(c.sas_sequence)?;
+                w.le32(c.keyboard_layout)?;
+                w.le32(c.client_build)?;
+                w.put(&c.client_name)?;
+                w.le32(c.keyboard_type)?;
+                w.le32(c.keyboard_subtype)?;
+                w.le32(c.keyboard_function_keys)?;
+                w.put(&c.ime_file_name)?;
+                bound(
+                    c.optional.len(),
+                    MAX_CORE_OPTIONAL,
+                    "client core optional fields",
+                )?;
+                check(
+                    CORE_BOUNDARIES.contains(&c.optional.len())
+                        && c.optional.len() != 88
+                        && c.optional.len() != 98,
+                    "client core field boundary",
+                )?;
+                w.put(&c.optional)?;
+            }
+            Self::ClientSecurity {
+                encryption_methods,
+                extended_methods,
+            } => {
+                w.le32(*encryption_methods)?;
+                w.le32(*extended_methods)?;
+            }
+            Self::ClientNetwork(channels) => {
+                bound(channels.len(), MAX_CHANNELS, "channels")?;
+                w.le32(channels.len() as u32)?;
+                for c in channels {
+                    w.put(&c.name)?;
+                    w.le32(c.options)?;
+                }
+            }
+            Self::ClientCluster {
+                flags,
+                redirected_session_id,
+            } => {
+                w.le32(*flags)?;
+                w.le32(*redirected_session_id)?;
+            }
+            Self::ClientMonitor(monitors) => {
+                bound(monitors.len(), MAX_MONITORS, "monitors")?;
+                w.le32(0)?;
+                w.le32(monitors.len() as u32)?;
+                for m in monitors {
+                    w.put(&m.left.to_le_bytes())?;
+                    w.put(&m.top.to_le_bytes())?;
+                    w.put(&m.right.to_le_bytes())?;
+                    w.put(&m.bottom.to_le_bytes())?;
+                    w.le32(m.flags)?;
+                }
+            }
+            Self::ClientMessageChannel => w.le32(0)?,
+            Self::ClientMultitransport(flags) | Self::ServerMultitransport(flags) => {
+                w.le32(*flags)?
+            }
+            Self::ServerCore {
+                version,
+                requested_protocols,
+                early_capability_flags,
+            } => {
+                check(
+                    early_capability_flags.is_none() || requested_protocols.is_some(),
+                    "server core optional fields",
+                )?;
+                w.le32(*version)?;
+                if let Some(p) = requested_protocols {
+                    w.le32(p.0)?;
+                }
+                if let Some(f) = early_capability_flags {
+                    w.le32(*f)?;
+                }
+            }
+            Self::ServerSecurity {
+                encryption_method,
+                encryption_level,
+                random,
+                certificate,
+            } => {
+                w.le32(*encryption_method)?;
+                w.le32(*encryption_level)?;
+                if *encryption_method == 0 && *encryption_level == 0 {
+                    check(
+                        random.is_empty() && certificate.is_empty(),
+                        "unencrypted server security",
+                    )?;
+                } else {
+                    check(random.len() == SERVER_RANDOM_LEN, "server random length")?;
+                    bound(certificate.len(), MAX_GCC_DATA, "certificate")?;
+                    w.le32(SERVER_RANDOM_LEN as u32)?;
+                    w.le32(certificate.len() as u32)?;
+                    w.put(random)?;
+                    w.put(certificate)?;
+                }
+            }
+            Self::ServerNetwork {
+                io_channel,
+                channels,
+            } => {
+                bound(channels.len(), MAX_CHANNELS, "channels")?;
+                w.le16(*io_channel)?;
+                w.le16(channels.len() as u16)?;
+                for &id in channels {
+                    w.le16(id)?;
+                }
+                if channels.len() % 2 != 0 {
+                    w.le16(0)?;
+                }
+            }
+            Self::ServerMessageChannel(id) => w.le16(*id)?,
+            Self::Other { data, .. } => w.put(data)?,
+        }
+        let mut out = Write::new(MAX_GCC_DATA);
+        out.le16(self.kind())?;
+        out.le16(u16_len(w.b.len() + 4)?)?;
+        out.put(&w.b)?;
+        check(Self::parse(&out.b)? == *self, "block type or fields")?;
+        dst.extend_from_slice(&out.b);
+        Ok(())
+    }
+}
+
+impl Wire for GccConference {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes RDP GCC. Responses use the interoperable outer length 0x2a;
+    /// all inner lengths describe the actual data.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let (blocks, request) = match self {
+            Self::Request(b) => (b, true),
+            Self::Response { blocks, .. } => (blocks, false),
+        };
+        check_block_direction(blocks, request)?;
+        let blocks = blocks.to_bytes()?;
+        let mut body = Write::new(MAX_GCC_RESPONSE);
+        match self {
+            Self::Request(_) => body.put(&[0, 8, 0, 0x10, 0])?,
+            Self::Response {
+                node_id,
+                tag,
+                result,
+                ..
+            } => {
+                check((1001..=65536).contains(node_id), "GCC node ID")?;
+                check(*result <= 4, "GCC result")?;
+                body.byte(0x14)?;
+                body.be16((node_id - 1001) as u16)?;
+                body.per_signed(*tag)?;
+                body.byte(result << 4)?;
+            }
+        }
+        body.put(&[1, 0xc0, 0])?;
+        body.put(if request { b"Duca" } else { b"McDn" })?;
+        body.per_len(blocks.len())?;
+        body.put(&blocks)?;
+        let mut w = Write::new(if request {
+            MAX_GCC_REQUEST
+        } else {
+            MAX_GCC_RESPONSE
+        });
+        w.put(&[0, 5, 0, 0x14, 0x7c, 0, 1])?;
+        w.per_len(if request { body.b.len() } else { 0x2a })?;
+        w.put(&body.b)?;
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for McsConnect {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes canonical definite BER, with a leading zero on positive
+    /// integers whose high bit is set. Readers also accept Microsoft's
+    /// unsigned integer examples without that leading zero.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        self.direction()?;
+        let mut body = Write::new(MAX_PDU);
+        let kind = match self {
+            Self::Initial {
+                calling_domain,
+                called_domain,
+                upward,
+                target,
+                minimum,
+                maximum,
+                conference,
+            } => {
+                bound(calling_domain.len(), MAX_SELECTOR, "calling selector")?;
+                bound(called_domain.len(), MAX_SELECTOR, "called selector")?;
+                body.ber(&[4], calling_domain)?;
+                body.ber(&[4], called_domain)?;
+                body.ber(&[1], &[if *upward { 0xff } else { 0 }])?;
+                target.write(&mut body)?;
+                minimum.write(&mut body)?;
+                maximum.write(&mut body)?;
+                body.ber(&[4], &conference.to_bytes()?)?;
+                0x65
+            }
+            Self::Response {
+                result,
+                called_connect_id,
+                parameters,
+                conference,
+            } => {
+                check(*result <= 15, "MCS result")?;
+                body.ber_uint(10, u32::from(*result))?;
+                body.ber_uint(2, *called_connect_id)?;
+                parameters.write(&mut body)?;
+                body.ber(&[4], &conference.to_bytes()?)?;
+                0x66
+            }
+        };
+        let mut w = Write::new(MAX_PDU);
+        w.ber(&[0x7f, kind], &body.b)?;
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for McsPdu {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes one PER PDU, checking ID ranges, results, optional fields,
+    /// priorities and the unfragmented user-data length.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        self.validate()?;
+        let mut w = Write::new(MAX_PDU);
+        match self {
+            Self::ErectDomain {
+                sub_height,
+                sub_interval,
+            } => {
+                w.byte(4)?;
+                w.per_uint(*sub_height)?;
+                w.per_uint(*sub_interval)?;
+            }
+            Self::AttachUserRequest => w.byte(0x28)?,
+            Self::AttachUserConfirm { result, initiator } => {
+                w.byte((if initiator.is_some() { 0x2e } else { 0x2c }) | (result >> 3))?;
+                w.byte((result & 7) << 5)?;
+                if let Some(id) = initiator {
+                    w.user_id(*id)?;
+                }
+            }
+            Self::ChannelJoinRequest {
+                initiator,
+                channel_id,
+            } => {
+                w.byte(0x38)?;
+                w.user_id(*initiator)?;
+                w.be16(*channel_id)?;
+            }
+            Self::ChannelJoinConfirm {
+                result,
+                initiator,
+                requested,
+                channel_id,
+            } => {
+                w.byte((if channel_id.is_some() { 0x3e } else { 0x3c }) | (result >> 3))?;
+                w.byte((result & 7) << 5)?;
+                w.user_id(*initiator)?;
+                w.be16(*requested)?;
+                if let Some(id) = channel_id {
+                    w.be16(*id)?;
+                }
+            }
+            Self::SendData {
+                indication,
+                initiator,
+                channel_id,
+                priority,
+                segmentation,
+                data,
+            } => {
+                w.byte(if *indication { 0x68 } else { 0x64 })?;
+                w.user_id(*initiator)?;
+                w.be16(*channel_id)?;
+                w.byte((priority << 6) | (segmentation << 4))?;
+                w.per_len(data.len())?;
+                w.put(data)?;
+            }
+        }
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for SecurityPayload {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes the header and opaque bytes without changing protection fields.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut w = Write::new(MAX_PDU);
+        w.le16(self.flags)?;
+        w.le16(self.flags_hi)?;
+        w.put(&self.data)?;
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for ClientInfo {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes Info with recomputed lengths and null terminators. The opaque
+    /// extended suffix is copied; its version is chosen by the caller.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let fields = [
+            &self.domain,
+            &self.user_name,
+            &self.password,
+            &self.alternate_shell,
+            &self.working_dir,
+        ];
+        let unicode = self.flags & INFO_UNICODE != 0;
+        check(self.flags & INFO_RESERVED == 0, "reserved info flags")?;
+        let mut w = Write::new(MAX_PDU);
+        w.le32(self.code_page)?;
+        w.le32(self.flags)?;
+        for b in fields {
+            bound(
+                b.len() + 1 + usize::from(unicode),
+                MAX_INFO_STRING,
+                "info string",
+            )?;
+            check(!unicode || b.len() % 2 == 0, "Unicode string length")?;
+            w.le16(u16_len(b.len())?)?;
+        }
+        for b in fields {
+            w.put(b)?;
+            w.put(if unicode { &[0, 0] } else { &[0] })?;
+        }
+        bound(self.extra_info.len(), MAX_EXTRA_INFO, "extended info")?;
+        w.put(&self.extra_info)?;
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for LicenseError {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes a licensing ERROR_ALERT with recomputed message and blob lengths.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        check(matches!(self.flags & 0x7f, 2 | 3), "license preamble flags")?;
+        check(self.blob_type == 4, "license error blob type")?;
+        bound(self.blob.len(), MAX_PDU - 16, "license error blob")?;
+        let mut w = Write::new(MAX_PDU);
+        w.byte(0xff)?;
+        w.byte(self.flags)?;
+        w.le16(u16_len(self.blob.len() + 16)?)?;
+        w.le32(self.error_code)?;
+        w.le32(self.state_transition)?;
+        w.le16(self.blob_type)?;
+        w.le16(u16_len(self.blob.len())?)?;
+        w.put(&self.blob)?;
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for CapabilitySet {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
+    /// Writes the capability header with the actual body length.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        bound(self.data.len(), MAX_CAPABILITY, "capability")?;
+        let mut w = Write::new(MAX_CAPABILITY + 4);
+        w.le16(self.kind.0)?;
+        w.le16(u16_len(self.data.len() + 4)?)?;
+        w.put(&self.data)?;
+        dst.extend_from_slice(&w.b);
+        Ok(())
+    }
+}
+
+impl Wire for ActivePdu {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        Self::parse(b)
+    }
+
     /// Writes an activation PDU with recomputed nested lengths and counts.
     /// No required capability set is synthesized; that is session policy.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         bound(
             self.source_descriptor.len(),
             MAX_DESCRIPTOR,
@@ -2378,16 +2398,18 @@ impl ActivePdu {
         let mut w = Write::new(MAX_PDU);
         w.le16(u16_len(body.b.len() + 2)?)?;
         w.put(&body.b)?;
-        Ok(w.b)
+        dst.extend_from_slice(&w.b);
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Fail, Stream, contract, pump, test_support::Lcg};
 
     fn hex(s: &str) -> Vec<u8> {
-        assert!(s.len() <= MAX_STORAGE);
+        assert!(s.len() <= 2 * MAX_FRAME);
         s.split_whitespace()
             .map(|x| u8::from_str_radix(x, 16).unwrap())
             .collect()
@@ -2668,7 +2690,7 @@ mod tests {
         roundtrip!(CapabilitySet);
         roundtrip!(ActivePdu);
         if let Ok(blocks) = read_blocks(b) {
-            assert_eq!(read_blocks(&write_blocks(&blocks).unwrap()), Ok(blocks));
+            assert_eq!(read_blocks(&blocks.to_bytes().unwrap()), Ok(blocks));
         }
         if let Ok(Some((f, n))) = Frame::parse(b) {
             assert!(n <= b.len());
@@ -2683,36 +2705,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    fn stream(b: &[u8], step: usize) -> (Vec<Frame>, Option<Error>, usize) {
-        let mut d = Decoder::new();
-        // Tests use at most MAX_STORAGE input bytes, hence at most that many
-        // minimum-size frames. The result list is bounded by this constant.
-        assert!(b.len() <= MAX_STORAGE);
-        let mut frames = Vec::new();
-        for chunk in b.chunks(step.max(1)) {
-            let mut rest = chunk;
-            while !rest.is_empty() {
-                let n = d.feed(rest);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                assert!(d.buf.len() <= MAX_STORAGE);
-                assert!(d.storage_capacity() <= MAX_STORAGE);
-                rest = rest.get(n..).unwrap();
-                let mut progress = n != 0;
-                while let Some(f) = d.next_frame() {
-                    match f {
-                        Ok(f) => {
-                            frames.push(f);
-                            progress = true;
-                        }
-                        Err(e) => return (frames, Some(e), d.buffered()),
-                    }
-                }
-                assert!(progress);
-            }
-        }
-        (frames, None, d.buffered())
     }
 
     #[test]
@@ -3096,7 +3088,7 @@ mod tests {
             assert_eq!(DataBlock::parse(&b.to_bytes().unwrap()), Ok(b));
         }
         let b = client_blocks();
-        assert_eq!(read_blocks(&write_blocks(&b).unwrap()), Ok(b));
+        assert_eq!(read_blocks(&b.to_bytes().unwrap()), Ok(b));
     }
 
     #[test]
@@ -3257,12 +3249,16 @@ mod tests {
             .to_bytes()
             .is_err()
         );
-        assert!(write_blocks(&vec![DataBlock::ClientMessageChannel; MAX_BLOCKS + 1]).is_err());
+        assert!(
+            vec![DataBlock::ClientMessageChannel; MAX_BLOCKS + 1]
+                .to_bytes()
+                .is_err()
+        );
         let bytes = hex("06 c0 08 00 00 00 00 00").repeat(MAX_BLOCKS + 1);
         assert!(read_blocks(&bytes).is_err());
         assert!(read_blocks(&vec![0; MAX_GCC_DATA + 1]).is_err());
         assert!(
-            write_blocks(&[
+            Wire::to_bytes(&vec![
                 DataBlock::Other {
                     kind: 0xff00,
                     data: vec![0; MAX_GCC_DATA / 2]
@@ -3827,17 +3823,14 @@ mod tests {
             .unwrap(),
         ];
         for b in samples {
+            contract::check_decode(Frames::new, &b);
             for n in 0..b.len() {
                 assert_eq!(Frame::parse(&b[..n]), Ok(None));
-                let mut d = Decoder::new();
-                assert_eq!(d.feed(&b[..n]), n);
-                assert_eq!(d.next_frame(), None);
-                assert_eq!(d.feed(&b[n..]), b.len() - n);
-                let frame = d.next_frame().unwrap().unwrap();
-                assert_eq!(d.buffered(), 0);
-                assert!(d.next_frame().is_none());
-                assert_eq!(frame, Frame::parse(&b).unwrap().unwrap().0);
             }
+            let mut stream = Stream::new(Frames);
+            let mut frames = Vec::new();
+            pump(&mut stream, &b, |frame| frames.push(frame)).unwrap();
+            assert_eq!(frames, [Frame::parse(&b).unwrap().unwrap().0]);
         }
     }
 
@@ -3888,42 +3881,38 @@ mod tests {
     }
 
     #[test]
-    fn streaming_backpressure_compaction_and_sticky_error() {
-        let bytes = [0, 2].repeat(MAX_BUFFERED);
-        let (frames, error, left) = stream(&bytes, bytes.len());
-        assert_eq!(frames.len(), MAX_BUFFERED);
-        assert_eq!(error, None);
-        assert_eq!(left, 0);
-        assert_eq!(stream(&bytes, 1), (frames, error, left));
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&bytes), MAX_BUFFERED);
-        assert_eq!(d.feed(&[0]), 0);
-        while d.next_frame().is_some() {}
-        assert!(d.buffered() <= 1);
-        // Force the read-offset compaction branch while a partial frame stays.
-        let room = MAX_BUFFERED - d.buffered();
-        assert_eq!(d.feed(&bytes[MAX_BUFFERED..]), room);
-        while let Some(frame) = d.next_frame() {
+    fn streaming_backpressure_and_terminal_error() {
+        let bytes = [0, 2].repeat(MAX_FRAME);
+        contract::check_decode(Frames::new, &bytes);
+        let mut stream = Stream::new(Frames);
+        let mut count = 0;
+        pump(&mut stream, &bytes, |_| count += 1).unwrap();
+        assert_eq!(count, MAX_FRAME);
+        assert_eq!(stream.buffered(), 0);
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&bytes), MAX_FRAME);
+        assert_eq!(stream.push(&[0]), 0);
+        while let Some(frame) = stream.next() {
             frame.unwrap();
         }
-        assert!(d.start >= MAX_BUFFERED);
-        assert_eq!(d.feed(&bytes[MAX_BUFFERED + room..]), 1);
-        d.next_frame().unwrap().unwrap();
-        assert_eq!(d.buffered(), 0);
-        assert!(d.buf.len() <= MAX_STORAGE);
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[1]), 1);
-        let e = d.next_frame().unwrap().unwrap_err();
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.feed(&bytes), bytes.len());
-        assert_eq!(d.next_frame(), Some(Err(e)));
+        assert!(stream.buffered() <= 1);
+        let mut stream = Stream::new(Frames);
+        assert_eq!(stream.push(&[1]), 1);
+        let error = Fail::Protocol(Error::Invalid("fast-path action"));
+        assert_eq!(stream.next(), Some(Err(error)));
+        assert!(stream.next().is_none());
+        assert_eq!(stream.push(&bytes), bytes.len());
     }
 
     #[test]
     fn maximum_frames_bytewise_and_mixed_stream() {
         let f = Frame::SlowPath(write_data(&vec![0; MAX_PDU]).unwrap());
         let b = f.to_bytes().unwrap();
-        assert_eq!(stream(&b, 1), (vec![f], None, 0));
+        contract::check_decode(Frames::new, &b);
+        let mut stream = Stream::new(Frames);
+        let mut frames = Vec::new();
+        pump(&mut stream, &b, |frame| frames.push(frame)).unwrap();
+        assert_eq!(frames, [f]);
         let mut b = connection().to_packet().unwrap().to_bytes().unwrap();
         b.extend_from_slice(
             &Frame::FastPath {
@@ -3934,9 +3923,11 @@ mod tests {
             .unwrap(),
         );
         b.extend_from_slice(&write_data(&[0x28]).unwrap().to_bytes().unwrap());
-        for step in [1, 3, 64] {
-            assert_eq!(stream(&b, step), stream(&b, b.len()));
-        }
+        contract::check_decode(Frames::new, &b);
+        let mut stream = Stream::new(Frames);
+        let mut frames = Vec::new();
+        pump(&mut stream, &b, |frame| frames.push(frame)).unwrap();
+        assert_eq!(frames.len(), 3);
     }
 
     #[test]
@@ -4032,30 +4023,6 @@ mod tests {
     }
 
     #[test]
-    fn cloning_a_partial_decoder_keeps_allocation_bounded() {
-        let bytes = [0, 2].repeat(MAX_BUFFERED);
-        let mut d = Decoder::new();
-        let first = d.feed(&bytes);
-        for _ in 0..16000 {
-            d.next_frame().unwrap().unwrap();
-        }
-        let second = d.feed(&bytes[first..]);
-        assert!(d.buf.len() > MAX_BUFFERED);
-        let mut cloned = d.clone();
-        for _ in 0..8000 {
-            cloned.next_frame().unwrap().unwrap();
-        }
-        let _ = cloned.feed(&bytes[first + second..]);
-        assert!(cloned.buf.len() <= MAX_STORAGE);
-        assert_eq!(cloned.storage_capacity(), MAX_STORAGE);
-        assert!(cloned.buffered() <= MAX_BUFFERED);
-        let mut failed = Decoder::new();
-        assert_eq!(failed.feed(&[1]), 1);
-        let err = failed.next_frame().unwrap().unwrap_err();
-        assert_eq!(failed.clone().next_frame(), Some(Err(err)));
-    }
-
-    #[test]
     fn exact_gcc_aggregate_limits() {
         let p = GccConference::Request(vec![DataBlock::Other {
             kind: 0xf001,
@@ -4147,19 +4114,9 @@ mod tests {
         }
     }
 
-    struct Lcg(u64);
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            (self.0 >> 32) as u32
-        }
-    }
     #[test]
     fn lcg_fuzz_roundtrips_and_streaming() {
-        let mut rng = Lcg(0x726470);
+        let mut rng = Lcg::new(0x726470);
         let mut seeds = vec![
             initial_example(),
             response_example(),
@@ -4188,16 +4145,14 @@ mod tests {
             let n = rng.next() as usize % 512;
             let random: Vec<_> = (0..n).map(|_| rng.next() as u8).collect();
             check_parsers(&random);
-            assert_eq!(stream(&random, 1), stream(&random, random.len()));
+            contract::check_decode(Frames::new, &random);
             let mut b = seeds[rng.next() as usize % seeds.len()].clone();
             for _ in 0..(rng.next() % 4) {
                 let i = rng.next() as usize % b.len();
                 b[i] ^= rng.next() as u8;
             }
             check_parsers(&b);
-            for step in [1, 7] {
-                assert_eq!(stream(&b, step), stream(&b, b.len()));
-            }
+            contract::check_decode(Frames::new, &b);
         }
     }
 }

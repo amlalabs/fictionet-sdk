@@ -2,14 +2,14 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
+use fictionet::stdlib::codec::{Stream, Wire, pump};
 use fictionet::stdlib::rdp::Frames;
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
-    Connection, ConnectionKind, DataBlock, Decoder, Error, FailureCode, Frame, GccConference,
-    INFO_RESERVED, INFO_UNICODE, LicenseError, MAX_BUFFERED, MAX_CAPABILITY, MAX_CHANNELS,
-    MAX_CONNECTION_DATA, MAX_EXTRA_INFO, MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING,
-    MAX_PDU, MAX_PER_LENGTH, MAX_STORAGE, McsConnect, McsPdu, Negotiation, Protocols,
-    SERVER_CHANNEL_ID, SecurityPayload, read_blocks, read_data, write_blocks, write_data,
+    Connection, ConnectionKind, DataBlock, FailureCode, Frame, GccConference, INFO_RESERVED,
+    INFO_UNICODE, LicenseError, MAX_CAPABILITY, MAX_CHANNELS, MAX_CONNECTION_DATA, MAX_EXTRA_INFO,
+    MAX_FAST_PATH, MAX_FRAME, MAX_GCC_DATA, MAX_INFO_STRING, MAX_PDU, MAX_PER_LENGTH, McsConnect,
+    McsPdu, Negotiation, Protocols, SERVER_CHANNEL_ID, SecurityPayload, read_data, write_data,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -24,10 +24,11 @@ fn prefix(data: &[u8], n: usize) -> &[u8] {
 fn plaintext(data: &[u8]) {
     macro_rules! roundtrip {
         ($ty:ty) => {
-            if let Ok(value) = <$ty>::parse(data) {
+            if let Ok(value) = <$ty as Wire>::parse(data) {
+                check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty>::parse(&bytes), Ok(value));
+                assert_eq!(<$ty as Wire>::parse(&bytes), Ok(value));
             }
         };
     }
@@ -40,10 +41,11 @@ fn plaintext(data: &[u8]) {
 fn pdu(data: &[u8]) {
     macro_rules! roundtrip {
         ($ty:ty) => {
-            if let Ok(value) = <$ty>::parse(data) {
+            if let Ok(value) = <$ty as Wire>::parse(data) {
+                check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty>::parse(&bytes), Ok(value));
+                assert_eq!(<$ty as Wire>::parse(&bytes), Ok(value));
             }
         };
     }
@@ -51,15 +53,15 @@ fn pdu(data: &[u8]) {
     roundtrip!(DataBlock);
     roundtrip!(GccConference);
     roundtrip!(McsConnect);
-    if let Ok(blocks) = read_blocks(data) {
-        let bytes = write_blocks(&blocks).unwrap();
+    if let Ok(blocks) = <Vec<DataBlock> as Wire>::parse(data) {
+        let bytes = blocks.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_GCC_DATA);
-        assert_eq!(read_blocks(&bytes), Ok(blocks));
+        assert_eq!(<Vec<DataBlock> as Wire>::parse(&bytes), Ok(blocks));
     }
-    if let Ok(value) = McsPdu::parse(data) {
+    if let Ok(value) = <McsPdu as Wire>::parse(data) {
         let bytes = value.to_bytes().unwrap();
         assert!(bytes.len() <= MAX_PDU);
-        assert_eq!(McsPdu::parse(&bytes), Ok(value.clone()));
+        assert_eq!(<McsPdu as Wire>::parse(&bytes), Ok(value.clone()));
         if let McsPdu::SendData { data, .. } = value {
             security(&data);
             plaintext(&data);
@@ -70,9 +72,9 @@ fn pdu(data: &[u8]) {
 }
 
 fn security(data: &[u8]) {
-    if let Ok(value) = SecurityPayload::parse(data) {
+    if let Ok(value) = <SecurityPayload as Wire>::parse(data) {
         assert_eq!(
-            SecurityPayload::parse(&value.to_bytes().unwrap()),
+            <SecurityPayload as Wire>::parse(&value.to_bytes().unwrap()),
             Ok(value.clone())
         );
         if let Ok(data) = value.plaintext() {
@@ -85,7 +87,7 @@ fn frame(value: &Frame) -> Vec<u8> {
     check_wire_value(value);
     let bytes = value.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_FRAME);
-    assert_eq!(Frame::parse(&bytes), Ok(Some((value.clone(), bytes.len()))));
+    assert_eq!(<Frame as Wire>::parse(&bytes), Ok(value.clone()));
     if let Frame::SlowPath(packet) = value {
         if let Ok(c) = Connection::from_packet(packet) {
             assert_eq!(Connection::from_packet(&c.to_packet().unwrap()), Ok(c));
@@ -98,41 +100,6 @@ fn frame(value: &Frame) -> Vec<u8> {
     bytes
 }
 
-// Canonical frame bytes also encode frame boundaries, so equality checks
-// both the frames and their order without an unbounded list of objects.
-fn stream(data: &[u8], step: usize) -> (Vec<u8>, Option<Error>, usize) {
-    let mut decoder = Decoder::new();
-    let mut transcript = Vec::with_capacity(MAX_FUZZ_INPUT);
-    for chunk in data.chunks(step.max(1)) {
-        let mut rest = chunk;
-        while !rest.is_empty() {
-            let took = decoder.feed(rest);
-            assert!(took <= rest.len());
-            rest = rest.get(took..).unwrap();
-            assert!(decoder.buffered() <= MAX_BUFFERED);
-            assert!(decoder.storage_capacity() <= MAX_STORAGE);
-            let mut progress = took != 0;
-            while let Some(result) = decoder.next_frame() {
-                match result {
-                    Ok(value) => {
-                        let bytes = frame(&value);
-                        assert!(transcript.len() + bytes.len() <= MAX_FUZZ_INPUT);
-                        transcript.extend_from_slice(&bytes);
-                        progress = true;
-                    }
-                    Err(e) => {
-                        assert_eq!(decoder.next_frame(), Some(Err(e)));
-                        assert_eq!(decoder.buffered(), 0);
-                        return (transcript, Some(e), 0);
-                    }
-                }
-            }
-            assert!(progress, "a full decoder must yield a frame or error");
-        }
-    }
-    (transcript, None, decoder.buffered())
-}
-
 fn built(data: &[u8]) {
     let byte = |i: usize| data.get(i).copied().unwrap_or(0);
     let word = |i: usize| u32::from_le_bytes([byte(i), byte(i + 1), byte(i + 2), byte(i + 3)]);
@@ -140,9 +107,10 @@ fn built(data: &[u8]) {
     macro_rules! check {
         ($ty:ty, $value:expr) => {{
             let value = $value;
+            check_wire_value(&value);
             if let Ok(bytes) = value.to_bytes() {
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty>::parse(&bytes), Ok(value));
+                assert_eq!(<$ty as Wire>::parse(&bytes), Ok(value));
             }
         }};
     }
@@ -183,7 +151,7 @@ fn built(data: &[u8]) {
     };
     check_wire_value(&fast);
     if let Ok(bytes) = fast.to_bytes() {
-        assert_eq!(Frame::parse(&bytes), Ok(Some((fast, bytes.len()))));
+        assert_eq!(<Frame as Wire>::parse(&bytes), Ok(fast));
     }
     check!(
         DataBlock,
@@ -313,13 +281,9 @@ fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Frame>(data);
     pdu(data);
-    if let Ok(Some((value, used))) = Frame::parse(data) {
-        assert!(used <= data.len());
+    let mut stream = Stream::new(Frames);
+    let _ = pump(&mut stream, data, |value| {
         frame(&value);
-    }
-    let whole = stream(data, data.len());
-    for step in [1, 3, 64] {
-        assert_eq!(stream(data, step), whole);
-    }
+    });
     built(data);
 });
