@@ -539,7 +539,9 @@ impl Receiver {
         let next = packet.next_sequence().ok_or(Error::Sequence)?;
         let expected = *s.expected.get_or_insert(first);
         s.high = s.high.max(next);
-        if packet.body == Body::EndOfSession {
+        // An End of Session below the next expected message is stale: the
+        // session's messages already run past it.
+        if packet.body == Body::EndOfSession && first >= expected {
             s.end = Some(s.end.map_or(first, |e| e.max(first)));
         }
         let mut actions = Vec::new();
@@ -1152,6 +1154,34 @@ mod tests {
             Some(&Action::Event(Event::EndOfSession { next: 3 }))
         );
         assert!(r.receive(&end, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stale_end_of_session_is_ignored() {
+        let mut r = Receiver::new(ReceiverConfig::default()).unwrap();
+        let _ = r.receive(&packet(1, &[b"a", b"b", b"c"]), 0).unwrap();
+        assert_eq!(r.expected(), Some(4));
+        // An End of Session marking 2 is below the messages already seen.
+        let stale = Downstream {
+            body: Body::EndOfSession,
+            ..heartbeat(2)
+        };
+        assert!(r.receive(&stale, 1).unwrap().is_empty());
+        let actions = r.receive(&packet(4, &[b"d"]), 2).unwrap();
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Event(Event::EndOfSession { .. })))
+        );
+        // The real one still ends the session.
+        let end = Downstream {
+            body: Body::EndOfSession,
+            ..heartbeat(5)
+        };
+        assert_eq!(
+            r.receive(&end, 3).unwrap(),
+            [Action::Event(Event::EndOfSession { next: 5 })]
+        );
     }
 
     #[test]

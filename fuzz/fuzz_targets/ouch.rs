@@ -36,7 +36,7 @@ fuzz_target!(|input: &[u8]| {
             continue;
         };
         let steer = piece.last().copied().unwrap_or(0);
-        for action in exchange.receive(&message, now) {
+        for action in exchange.receive(&message, now).unwrap() {
             match action {
                 Action::Send(out) => check_wire_value(&out),
                 Action::Event(Event::EnterRequested(t)) => {

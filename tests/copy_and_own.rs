@@ -390,7 +390,7 @@ fn copied_ouch_exchange_accepts_through_wire() {
         user_ref: 1,
     };
     assert_eq!(
-        exchange.receive(&inbound, 0),
+        exchange.receive(&inbound, 0).unwrap(),
         [ouch::Action::Event(ouch::Event::EnterRequested(token))]
     );
     let accepted = exchange.accept(token, 1).unwrap().to_bytes().unwrap();
