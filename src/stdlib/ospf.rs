@@ -21,11 +21,12 @@
 //!
 //! Nothing here reads a socket. A world that plays a router hands each
 //! OSPF payload (the bytes after the IP header) to [`Packet::parse`] with
-//! the packet's [`Endpoints`], looks at the [`Packet`], and sends the bytes
-//! [`Packet::to_bytes`] returns in an IP packet with protocol [`PROTOCOL`],
-//! usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`]. A
-//! [`Decoder`] reads a payload that comes in pieces and reports a bad
-//! header as soon as the bytes show it. Which routers and links exist,
+//! the packet's [`Endpoints`], and prepares a reply with [`Packet::frame`].
+//! Write that frame with [`Wire::write`] in an IP packet with protocol
+//! [`PROTOCOL`], usually to [`ALL_SPF_ROUTERS_V4`] or [`ALL_SPF_ROUTERS_V6`].
+//! For pieces of one payload, use [`Stream<Collect<Datagram>>`](super::codec::Stream)
+//! with [`MAX_MESSAGE`], map the payload through [`Packet::parse`], and
+//! call `end` at the IP packet boundary. Which routers and links exist,
 //! when Hellos go out, and how routes are worked out are up to world code.
 //!
 //! Every reader checks the version, packet type, lengths, counts and both
@@ -44,6 +45,7 @@
 //! step 1). The packet still fails if an LSA's length does not fit.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use std::net::Ipv4Addr;
 //! use fictionet::stdlib::ospf::{ALL_SPF_ROUTERS_V4, Auth, Body, Endpoints, Header, HelloV2, Packet};
 //!
@@ -77,12 +79,12 @@
 //! ];
 //! let packet = Packet::parse(&bytes, &link).unwrap();
 //! assert_eq!(packet, hello(Ipv4Addr::new(1, 1, 1, 1), vec![]));
-//! assert_eq!(packet.to_bytes(&link).unwrap(), bytes);
+//! assert_eq!(packet.frame(&link).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
 //!
 //! // The world's router, 2.2.2.2, answers. Listing 1.1.1.1 tells the
 //! // agent's router that the two can hear each other.
 //! let reply = hello(Ipv4Addr::new(2, 2, 2, 2), vec![packet.router_id]);
-//! let sent = reply.to_bytes(&link).unwrap();
+//! let sent = reply.frame(&link).and_then(|frame| frame.to_bytes()).unwrap();
 //! assert_eq!(sent.len(), 48);
 //! assert_eq!(Packet::parse(&sent, &link), Ok(reply));
 //!
@@ -92,13 +94,8 @@
 //! assert!(Packet::parse(&bad, &link).is_err());
 //! ```
 //!
-//! [`Datagram`] implements [`Wire`](super::codec::Wire) for a bounded,
-//! byte-preserving payload. Collect chunks with `Collect<Datagram>` and
-//! map each payload through [`Packet::parse`] with [`Endpoints`]. End the
-//! stream at the IP packet boundary. Collection errors end the stream;
-//! message and checksum failures are mapped item errors. [`Packet`] stays
-//! outside `Wire` because the payload does not carry its endpoints.
-//! [`Decoder`] keeps its context, constructor, early checks, and feed errors.
+
+use super::codec::Wire;
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
@@ -802,8 +799,8 @@ pub enum OspfError {
     /// option above [`MAX_U24`], or holds a value the protocol never
     /// sends, such as LSA sequence number [`RESERVED_SEQUENCE`].
     Field,
-    /// The body does not match the version or LS type.
-    Mismatch,
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// A link-local signaling block's length is shorter than its header
     /// or runs past [`MAX_MESSAGE`], or a block is set on a packet that
     /// cannot carry one.
@@ -828,7 +825,7 @@ impl std::fmt::Display for OspfError {
             OspfError::PrefixLength(n) => write!(f, "prefix length {n}, over 128"),
             OspfError::TooLong => f.write_str("too long for its length field"),
             OspfError::Field => f.write_str("field out of range"),
-            OspfError::Mismatch => f.write_str("body does not match the version or LS type"),
+            OspfError::Unwritable => f.write_str("value cannot be written without changing it"),
             OspfError::Lls => f.write_str("bad link-local signaling block"),
         }
     }
@@ -1371,13 +1368,13 @@ impl LsaBody {
         Ok(body)
     }
 
-    /// The body's bytes, for an LSA of version `v` and LS type `ls_type`.
-    /// It fails with [`OspfError::Mismatch`] if the variant is not the one
+    /// Prepares an LSA body frame, for an LSA of version `v` and LS type `ls_type`.
+    /// It fails with [`OspfError::Unwritable`] if the variant is not the one
     /// they call for, [`OspfError::Field`] if a value does not fit its
     /// field, and [`OspfError::TooLong`] past what an LSA can hold.
-    pub fn to_bytes(&self, v: Version, ls_type: u16) -> Result<Vec<u8>, OspfError> {
+    pub fn frame(&self, v: Version, ls_type: u16) -> Result<LsaBodyFrame, OspfError> {
         if self.kind() != kind_for(v, ls_type) {
-            return Err(OspfError::Mismatch);
+            return Err(OspfError::Unwritable);
         }
         let room = MAX_LSA - LSA_HEADER_LEN;
         let mut out = Vec::new();
@@ -1535,7 +1532,7 @@ impl LsaBody {
             }
         }
         fits(&out, room)?;
-        Ok(out)
+        Ok(LsaBodyFrame(out))
     }
 }
 
@@ -1573,11 +1570,11 @@ impl Lsa {
         Ok((lsa, n))
     }
 
-    /// The LSA's bytes in version `v`, with its length and Fletcher
+    /// Prepares an LSA frame in version `v`, with its length and Fletcher
     /// checksum worked out.
-    pub fn to_bytes(&self, v: Version) -> Result<Vec<u8>, OspfError> {
+    pub fn frame(&self, v: Version) -> Result<LsaFrame, OspfError> {
         check_age_sequence(self.age, self.sequence)?;
-        let body = self.body.to_bytes(v, self.ls_type)?;
+        let body = self.body.frame(v, self.ls_type).and_then(|frame| frame.to_bytes())?;
         check_designated(&self.body, self.advertising_router).map_err(|_| OspfError::Field)?;
         let mut out = Vec::with_capacity(LSA_HEADER_LEN + body.len());
         let header = LsaHeader {
@@ -1595,14 +1592,14 @@ impl Lsa {
         out.extend_from_slice(&body);
         let c = lsa_checksum(&out).ok_or(OspfError::TooLong)?;
         out[16..18].copy_from_slice(&c.to_be_bytes());
-        Ok(out)
+        Ok(LsaFrame(out))
     }
 
     /// The LSA's header in version `v`, with the checksum and length its
     /// bytes have, as an acknowledgment or a database summary carries it.
     /// For an LSA read with [`Lsa::parse`] it is the header received.
     pub fn header(&self, v: Version) -> Result<LsaHeader, OspfError> {
-        let bytes = self.to_bytes(v)?;
+        let bytes = self.frame(v).and_then(|frame| frame.to_bytes())?;
         read_lsa_header(&mut Rd::new(&bytes, OspfError::Truncated), v)
     }
 
@@ -1647,8 +1644,7 @@ fn lls_checksum(block: &[u8]) -> u16 {
 /// Checks the header fields the bytes so far hold, in the order they come.
 /// Once the length and, for a Hello or Database Description, the L bit
 /// are known it returns the layout. Every error it gives holds for any
-/// bytes that could follow, which lets [`Decoder`] stop early and still
-/// agree with [`Packet::parse`].
+/// bytes that could follow.
 fn check_header(b: &[u8], endpoints: &Endpoints) -> Result<Option<Layout>, OspfError> {
     let Some(base) = check_base(b, endpoints)? else { return Ok(None) };
     let v = endpoints.version();
@@ -1794,16 +1790,16 @@ impl Packet {
         }
     }
 
-    /// The packet's bytes, to send from and to `endpoints`, with the
+    /// Prepares a packet frame, to send from and to `endpoints`, with the
     /// length and checksum worked out. It fails with
     /// [`OspfError::Family`] if the header's version does not match the
-    /// IP family, [`OspfError::Mismatch`] if the body is not for this
+    /// IP family, [`OspfError::Unwritable`] if the body is not for this
     /// version, [`OspfError::Field`] if a value does not fit its field,
     /// [`OspfError::TooLong`] past [`MAX_PACKET`] (or [`MAX_MESSAGE`] with
     /// the digest and signaling block), and [`OspfError::Lls`] if `lls` is
     /// set on a packet other than a Hello or Database Description whose
     /// options set the L bit, or is not a multiple of 4 bytes.
-    pub fn to_bytes(&self, endpoints: &Endpoints) -> Result<Vec<u8>, OspfError> {
+    pub fn frame(&self, endpoints: &Endpoints) -> Result<Datagram, OspfError> {
         let v = self.version();
         if v != endpoints.version() {
             return Err(OspfError::Family);
@@ -1832,7 +1828,7 @@ impl Packet {
                     }
                     Auth::Other { kind, data } => {
                         if *kind <= auth_type::CRYPTOGRAPHIC {
-                            return Err(OspfError::Field);
+                            return Err(OspfError::Unwritable);
                         }
                         out[16..24].copy_from_slice(data);
                     }
@@ -1858,7 +1854,7 @@ impl Packet {
             if !l_set || !tlvs.len().is_multiple_of(4) {
                 return Err(OspfError::Lls);
             }
-            if out.len() + 4 + tlvs.len() > MAX_MESSAGE {
+            if out.len().checked_add(4).and_then(|n| n.checked_add(tlvs.len())).is_none_or(|n| n > MAX_MESSAGE) {
                 return Err(OspfError::TooLong);
             }
             let start = out.len();
@@ -1872,7 +1868,7 @@ impl Packet {
                 out[start..start + 2].copy_from_slice(&c.to_be_bytes());
             }
         }
-        Ok(out)
+        Ok(Datagram(out))
     }
 }
 
@@ -1987,7 +1983,7 @@ fn write_body(out: &mut Vec<u8>, body: &Body, v: Version) -> Result<(), OspfErro
             out.extend_from_slice(&h.backup_designated_router.octets());
             put_ip4s(out, &h.neighbors, MAX_PACKET)?;
         }
-        (Body::HelloV2(_) | Body::HelloV3(_), _) => return Err(OspfError::Mismatch),
+        (Body::HelloV2(_) | Body::HelloV3(_), _) => return Err(OspfError::Unwritable),
         (Body::DatabaseDescription(d), _) => {
             match v {
                 Version::V2 => {
@@ -2028,7 +2024,7 @@ fn write_body(out: &mut Vec<u8>, body: &Body, v: Version) -> Result<(), OspfErro
             let count = u32::try_from(lsas.len()).map_err(|_| OspfError::TooLong)?;
             out.extend_from_slice(&count.to_be_bytes());
             for lsa in lsas {
-                out.extend_from_slice(&lsa.to_bytes(v)?);
+                out.extend_from_slice(&lsa.frame(v).and_then(|frame| frame.to_bytes())?);
                 fits(out, MAX_PACKET)?;
             }
         }
@@ -2100,7 +2096,7 @@ fn put_lsa_header(out: &mut Vec<u8>, h: &LsaHeader, v: Version) -> Result<(), Os
 /// One bounded IP payload, with every received byte preserved.
 ///
 /// [`Wire`](super::codec::Wire) reads the entire payload and checks only
-/// [`MAX_MESSAGE`]. It does not validate a OSPF message or its checksum.
+/// [`MAX_MESSAGE`]. It does not validate an OSPF message or its checksum.
 /// Use [`Packet::parse`] with the packet's [`Endpoints`] for that check.
 /// The endpoints are not encoded in this payload.
 ///
@@ -2123,87 +2119,7 @@ pub struct Datagram(
     pub Vec<u8>,
 );
 
-impl super::codec::Wire for Datagram {
-    type ParseError = OspfError;
-    type WriteError = OspfError;
-
-    /// Copies the entire payload after checking [`MAX_MESSAGE`].
-    /// Message and checksum validation need [`Endpoints`] separately.
-    fn parse(bytes: &[u8]) -> Result<Self, OspfError> {
-        if bytes.len() > MAX_MESSAGE {
-            return Err(OspfError::TooLong);
-        }
-        Ok(Self(bytes.to_vec()))
-    }
-
-    /// Appends the original payload. Leaves `out` unchanged on error.
-    /// No checksum is computed or validated.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), OspfError> {
-        if self.0.len() > MAX_MESSAGE {
-            return Err(OspfError::TooLong);
-        }
-        out.extend_from_slice(&self.0);
-        Ok(())
-    }
-}
-
-/// Reads one packet that comes in pieces. Feed it the bytes in order, then
-/// call [`Decoder::finish`]. It fails as soon as the bytes show a bad
-/// version, type or length, or run past the end the header and any
-/// signaling block give. It
-/// holds at most [`MAX_MESSAGE`] plus one bytes.
-#[derive(Clone, Debug)]
-pub struct Decoder {
-    endpoints: Endpoints,
-    buf: Vec<u8>,
-    failed: Option<OspfError>,
-}
-
-impl Decoder {
-    /// A decoder for a packet sent from and to `endpoints`, holding no
-    /// bytes.
-    pub fn new(endpoints: Endpoints) -> Decoder {
-        Decoder { endpoints, buf: Vec::new(), failed: None }
-    }
-
-    /// Adds the next bytes of the packet. It returns the error once the
-    /// bytes show one, and the same error on every later call; bytes fed
-    /// after that are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), OspfError> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        // One byte past the longest payload is enough to know it is too
-        // long.
-        let room = (MAX_MESSAGE + 1).saturating_sub(self.buf.len());
-        self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        match check_header(&self.buf, &self.endpoints) {
-            Err(e) => Err(self.fail(e)),
-            Ok(Some(Layout { end: Some(end), .. })) if self.buf.len() > end => Err(self.fail(OspfError::Trailing)),
-            Ok(_) => Ok(()),
-        }
-    }
-
-    fn fail(&mut self, e: OspfError) -> OspfError {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        e
-    }
-
-    /// How many bytes are held.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// The packet, when no more bytes will come. It gives the same result
-    /// as [`Packet::parse`] on all the bytes fed.
-    pub fn finish(self) -> Result<Packet, OspfError> {
-        match self.failed {
-            Some(e) => Err(e),
-            None => Packet::parse(&self.buf, &self.endpoints),
-        }
-    }
-}
+crate::bounded_datagram_wire!(Datagram, OspfError, OspfError::TooLong, MAX_MESSAGE);
 
 fn be16(b: &[u8], i: usize) -> u16 {
     u16::from_be_bytes([b[i], b[i + 1]])
@@ -2213,9 +2129,77 @@ fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
+/// Implements byte-preserving [`Wire`] for a named tuple payload with a byte limit.
+/// The payload stores a `Vec<u8>` in its first field. Its protocol parser
+/// supplies any context that is absent from the bytes. Used by OSPF, PIM,
+/// and VRRP so their bounded payloads share the same length checks.
+#[macro_export]
+macro_rules! bounded_datagram_wire {
+    ($unit:ty, $error:ty, $too_long:expr, $limit:expr) => {
+        impl $crate::stdlib::codec::Wire for $unit {
+            type ParseError = $error;
+            type WriteError = $error;
+
+            /// Copies a complete payload. Refuses bytes above this unit's
+            /// documented limit. Protocol and checksum checks require its
+            /// contextual parser.
+            fn parse(bytes: &[u8]) -> Result<Self, $error> {
+                if bytes.len() > $limit { return Err($too_long); }
+                Ok(Self(bytes.to_vec()))
+            }
+
+            /// Appends the payload unchanged. Refuses values above this
+            /// unit's documented limit. Leaves `out` unchanged on error.
+            /// Does not compute or validate a checksum.
+            fn write(&self, out: &mut Vec<u8>) -> Result<(), $error> {
+                if self.0.len() > $limit { return Err($too_long); }
+                out.extend_from_slice(&self.0);
+                Ok(())
+            }
+        }
+    };
+}
+
+/// An LSA's bytes, interpreted with a separate [`Version`].
+/// Construct with [`Lsa::frame`] or copy a bounded payload with [`Wire::parse`].
+/// Use [`Lsa::parse`] to validate its fields and Fletcher checksum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LsaFrame(
+    /// Complete LSA bytes, at most [`MAX_LSA`].
+    pub Vec<u8>,
+);
+crate::bounded_datagram_wire!(LsaFrame, OspfError, OspfError::TooLong, MAX_LSA);
+
+/// An LSA body's bytes, interpreted with a separate version and LS type.
+/// Construct with [`LsaBody::frame`] or copy a bounded payload with [`Wire::parse`].
+/// Use [`LsaBody::parse`] to validate its fields.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LsaBodyFrame(
+    /// Body bytes, at most [`MAX_LSA`] minus [`LSA_HEADER_LEN`].
+    pub Vec<u8>,
+);
+crate::bounded_datagram_wire!(LsaBodyFrame, OspfError, OspfError::TooLong, MAX_LSA - LSA_HEADER_LEN);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+
+    fn collect(b: &[u8], e: &Endpoints) -> Result<Packet, OspfError> {
+        use crate::stdlib::codec::Decode;
+        let make = || Collect::<Datagram>::new(MAX_MESSAGE).map(|d| Packet::parse(&d.0, e));
+        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_MESSAGE + 1));
+        contract::check_wire::<Datagram>(b);
+        let parsed = Packet::parse(b, e);
+        let (items, failure) = decode_all(make, b);
+        if b.len() <= MAX_MESSAGE {
+            assert_eq!(failure, None);
+            assert_eq!(items, vec![parsed.clone()]);
+        } else {
+            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_MESSAGE })));
+        }
+        parsed
+    }
 
     fn ip4(a: u8, b: u8, c: u8, d: u8) -> Ipv4Addr {
         Ipv4Addr::new(a, b, c, d)
@@ -2243,14 +2227,6 @@ mod tests {
             b[16..18].copy_from_slice(&c.to_be_bytes());
         }
         b
-    }
-
-    fn decode_chunked(b: &[u8], e: &Endpoints, size: usize) -> Result<Packet, OspfError> {
-        let mut d = Decoder::new(*e);
-        for c in b.chunks(size.max(1)) {
-            let _ = d.feed(c);
-        }
-        d.finish()
     }
 
     fn hello_v2(me: Ipv4Addr, heard: Vec<Ipv4Addr>) -> Packet {
@@ -2281,9 +2257,9 @@ mod tests {
         ];
         let packet = Packet::parse(&bytes, &link).unwrap();
         assert_eq!(packet, hello_v2(ip4(1, 1, 1, 1), vec![]));
-        assert_eq!(packet.to_bytes(&link).unwrap(), bytes);
+        assert_eq!(packet.frame(&link).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
         let reply = hello_v2(ip4(2, 2, 2, 2), vec![packet.router_id]);
-        let sent = reply.to_bytes(&link).unwrap();
+        let sent = reply.frame(&link).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(sent.len(), 48);
         assert_eq!(Packet::parse(&sent, &link), Ok(reply));
         let mut bad = bytes;
@@ -2312,7 +2288,7 @@ mod tests {
                 neighbors: vec![ip4(2, 2, 2, 2), ip4(3, 3, 3, 3)],
             }),
         };
-        let b = p.to_bytes(&v4_ends()).unwrap();
+        let b = p.frame(&v4_ends()).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(&b[..4], &[2, 1, 0, 52]);
         assert_eq!(&b[14..24], b"\0\x01secret\0\0");
         assert_eq!(&b[12..14], &[0x9d, 0x8c]);
@@ -2351,7 +2327,7 @@ mod tests {
                 }),
             }
         );
-        assert_eq!(p.to_bytes(&v6_ends()).unwrap(), bytes);
+        assert_eq!(p.frame(&v6_ends()).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
         // Another source address changes the pseudo-header.
         let elsewhere = Endpoints::V6 { source: "fe80::2".parse().unwrap(), destination: ALL_SPF_ROUTERS_V6 };
         assert_eq!(Packet::parse(&bytes, &elsewhere), Err(OspfError::Checksum));
@@ -2391,7 +2367,7 @@ mod tests {
                 }),
             }
         );
-        assert_eq!(lsa.to_bytes(Version::V2).unwrap(), bytes);
+        assert_eq!(lsa.frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap(), bytes);
         // The age is outside the checksum, so routers can age LSAs.
         let mut older = bytes;
         older[1] = 200;
@@ -2405,7 +2381,7 @@ mod tests {
 
     #[test]
     fn fletcher_holds_for_all_lengths() {
-        let mut rng = Lcg(7);
+        let mut rng = Lcg::new(7);
         for len in LSA_HEADER_LEN..300 {
             let mut b: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
             b[18..20].copy_from_slice(&(len as u16).to_be_bytes());
@@ -2680,14 +2656,14 @@ mod tests {
     #[test]
     fn round_trips() {
         for (p, e) in samples() {
-            let b = p.to_bytes(&e).unwrap();
+            let b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
             assert_eq!(Packet::parse(&b, &e).as_ref(), Ok(&p), "{p:?}");
-            assert_eq!(decode_chunked(&b, &e, 1).as_ref(), Ok(&p));
-            assert_eq!(Packet::parse(&b, &e).unwrap().to_bytes(&e).unwrap(), b);
+            assert_eq!(collect(&b, &e).as_ref(), Ok(&p));
+            assert_eq!(Packet::parse(&b, &e).unwrap().frame(&e).and_then(|frame| frame.to_bytes()).unwrap(), b);
         }
         for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
             for l in lsas {
-                let b = l.to_bytes(v).unwrap();
+                let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
                 assert!(lsa_checksum_ok(&b));
                 assert_eq!(Lsa::parse(&b, v), Ok((l, b.len())));
             }
@@ -2697,13 +2673,13 @@ mod tests {
     #[test]
     fn prefixes_send_only_the_words_they_need() {
         let l = &v3_lsas()[7];
-        let b = l.to_bytes(Version::V3).unwrap();
+        let b = l.frame(Version::V3).and_then(|frame| frame.to_bytes()).unwrap();
         // Header, 12 fixed bytes, then 4 + 12 and 4 + 8 bytes of prefixes.
         assert_eq!(b.len(), 20 + 12 + 16 + 12);
         let p = Prefix::new(1, 0, "ffff::1".parse().unwrap());
         let ia =
             lsa(lsa_type_v3::INTER_AREA_PREFIX, LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 0, prefix: p }));
-        let b = ia.to_bytes(Version::V3).unwrap();
+        let b = ia.frame(Version::V3).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(b.len(), 20 + 4 + 4 + 4);
         assert_eq!(&b[24..32], &[1, 0, 0, 0, 0x80, 0, 0, 0]);
         assert_eq!(Lsa::parse(&b, Version::V3), Ok((ia, b.len())));
@@ -2719,7 +2695,7 @@ mod tests {
                 lsa_type_v3::INTER_AREA_PREFIX,
                 LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 0, prefix: p }),
             );
-            assert_eq!(ia.to_bytes(Version::V3), Err(OspfError::Field), "{a}/{length}");
+            assert_eq!(ia.frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Field), "{a}/{length}");
         }
         // A reader rejects one: ffff::/1 sent as ff ff 00 00.
         let body = [0, 0, 0, 0, 1, 0, 0, 0, 0xff, 0xff, 0, 0];
@@ -2745,7 +2721,7 @@ mod tests {
                 lsa_type_v3::INTER_AREA_PREFIX,
                 LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 1, prefix: p }),
             );
-            let b = l.to_bytes(Version::V3).unwrap();
+            let b = l.frame(Version::V3).and_then(|frame| frame.to_bytes()).unwrap();
             assert_eq!(Lsa::parse(&b, Version::V3), Ok((l, b.len())), "{length}");
         }
     }
@@ -2754,7 +2730,7 @@ mod tests {
     fn header_errors() {
         let e4 = v4_ends();
         let e6 = v6_ends();
-        let good = hello_v2(ip4(1, 1, 1, 1), vec![]).to_bytes(&e4).unwrap();
+        let good = hello_v2(ip4(1, 1, 1, 1), vec![]).frame(&e4).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(Packet::parse(&[], &e4), Err(OspfError::Truncated));
         let mut b = good.clone();
         b[0] = 4;
@@ -2791,7 +2767,7 @@ mod tests {
         let mut found = 0;
         for id in 0..=0xffffu32 {
             let p = Packet { router_id: Ipv4Addr::from(id), ..hello_v2(ip4(0, 0, 0, 0), vec![]) };
-            let mut b = p.to_bytes(&e).unwrap();
+            let mut b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
             let c = be16(&b, 12);
             if c == 0 || c == 0xffff {
                 b[12..14].copy_from_slice(&(!c).to_be_bytes());
@@ -2809,7 +2785,7 @@ mod tests {
         let e = v4_ends();
         let mut p = hello_v2(ip4(1, 1, 1, 1), vec![]);
         p.header = Header::V2 { auth: Auth::Cryptographic { key_id: 3, sequence: 77, digest: vec![9; 16] } };
-        let b = p.to_bytes(&e).unwrap();
+        let b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(b.len(), 44 + 16);
         assert_eq!(&b[12..24], &[0, 0, 0, 2, 0, 0, 3, 16, 0, 0, 0, 77]);
         assert_eq!(Packet::parse(&b, &e), Ok(p.clone()));
@@ -2820,7 +2796,7 @@ mod tests {
         assert_eq!(Packet::parse(&long, &e), Err(OspfError::Trailing));
         // A digest over 255 bytes cannot be written.
         p.header = Header::V2 { auth: Auth::Cryptographic { key_id: 3, sequence: 77, digest: vec![9; 256] } };
-        assert_eq!(p.to_bytes(&e), Err(OspfError::Field));
+        assert_eq!(p.frame(&e).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
     }
 
     #[test]
@@ -2860,7 +2836,7 @@ mod tests {
         // Updates: the count, then LSAs that must match it.
         assert_eq!(raw(2, 4, &[0; 3], &e4), Err(OspfError::BodyLength));
         assert_eq!(raw(2, 4, &[0, 0, 0, 1], &e4), Err(OspfError::LsaCount));
-        let l = v2_lsas()[1].to_bytes(Version::V2).unwrap();
+        let l = v2_lsas()[1].frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap();
         let mut body = vec![0, 0, 0, 2];
         body.extend_from_slice(&l);
         assert_eq!(raw(2, 4, &body, &e4), Err(OspfError::LsaCount));
@@ -2925,7 +2901,7 @@ mod tests {
         assert_eq!(raw(v3, 0x2009, &[0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), Err(OspfError::LsaBody));
         assert_eq!(raw(v3, 0x2009, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]), Err(OspfError::LsaBody));
         // Bytes past the LSA's length are left for the caller.
-        let mut b = v2_lsas()[1].to_bytes(v2).unwrap();
+        let mut b = v2_lsas()[1].frame(v2).and_then(|frame| frame.to_bytes()).unwrap();
         let n = b.len();
         b.extend_from_slice(&[1, 2, 3]);
         assert_eq!(Lsa::parse(&b, v2).unwrap().1, n);
@@ -2957,9 +2933,9 @@ mod tests {
         let ext = |routes: Vec<ExternalRoute>| {
             lsa(lsa_type_v2::AS_EXTERNAL, LsaBody::AsExternal(AsExternalLsa { network_mask: ip4(0, 0, 0, 0), routes }))
         };
-        assert_eq!(ext(vec![]).to_bytes(Version::V2), Err(OspfError::Field));
-        assert_eq!(ext(vec![ExternalRoute { tos: 4, ..route }]).to_bytes(Version::V2), Err(OspfError::Field));
-        assert!(ext(vec![route, ExternalRoute { tos: 4, ..route }]).to_bytes(Version::V2).is_ok());
+        assert_eq!(ext(vec![]).frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
+        assert_eq!(ext(vec![ExternalRoute { tos: 4, ..route }]).frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
+        assert!(ext(vec![route, ExternalRoute { tos: 4, ..route }]).frame(Version::V2).and_then(|frame| frame.to_bytes()).is_ok());
     }
 
     #[test]
@@ -2967,25 +2943,25 @@ mod tests {
         let e4 = v4_ends();
         let e6 = v6_ends();
         let mut p = hello_v2(ip4(1, 1, 1, 1), vec![]);
-        assert_eq!(p.to_bytes(&e6), Err(OspfError::Family));
+        assert_eq!(p.frame(&e6).and_then(|frame| frame.to_bytes()), Err(OspfError::Family));
         p.header = Header::V3 { instance_id: 0 };
-        assert_eq!(p.to_bytes(&e6), Err(OspfError::Mismatch));
+        assert_eq!(p.frame(&e6).and_then(|frame| frame.to_bytes()), Err(OspfError::Unwritable));
         p.header = Header::V2 { auth: Auth::Other { kind: 1, data: [0; 8] } };
-        assert_eq!(p.to_bytes(&e4), Err(OspfError::Field));
+        assert_eq!(p.frame(&e4).and_then(|frame| frame.to_bytes()), Err(OspfError::Unwritable));
         // Too many neighbors for a 16-bit length.
         p.header = Header::V2 { auth: Auth::Null };
         let Body::HelloV2(h) = &mut p.body else { panic!() };
         h.neighbors = vec![ip4(1, 2, 3, 4); 20_000];
-        assert_eq!(p.to_bytes(&e4), Err(OspfError::TooLong));
+        assert_eq!(p.frame(&e4).and_then(|frame| frame.to_bytes()), Err(OspfError::TooLong));
         let Body::HelloV2(h) = &mut p.body else { panic!() };
         h.neighbors = vec![ip4(1, 2, 3, 4); (MAX_PACKET - 44) / 4];
-        let b = p.to_bytes(&e4).unwrap();
+        let b = p.frame(&e4).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(Packet::parse(&b, &e4), Ok(p));
         // Out-of-range fields.
         let mut q = packets(Version::V3).remove(0);
         let Body::HelloV3(h) = &mut q.body else { panic!() };
         h.options = 0x0100_0000;
-        assert_eq!(q.to_bytes(&e6), Err(OspfError::Field));
+        assert_eq!(q.frame(&e6).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let dd = |options: u32, headers: Vec<LsaHeader>| Packet {
             router_id: ip4(1, 1, 1, 1),
             area_id: ip4(0, 0, 0, 0),
@@ -2993,10 +2969,10 @@ mod tests {
             lls: None,
             body: Body::DatabaseDescription(DatabaseDescription { mtu: 1500, options, flags: 0, sequence: 1, headers }),
         };
-        assert_eq!(dd(0x100, vec![]).to_bytes(&e4), Err(OspfError::Field));
+        assert_eq!(dd(0x100, vec![]).frame(&e4).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let mut h = header_of(&v2_lsas()[0], Version::V2);
         h.ls_type = 0x100;
-        assert_eq!(dd(0, vec![h]).to_bytes(&e4), Err(OspfError::Field));
+        assert_eq!(dd(0, vec![h]).frame(&e4).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let req = Packet {
             router_id: ip4(1, 1, 1, 1),
             area_id: ip4(0, 0, 0, 0),
@@ -3008,21 +2984,21 @@ mod tests {
                 advertising_router: ip4(0, 0, 0, 0),
             }]),
         };
-        assert_eq!(req.to_bytes(&e6), Err(OspfError::Field));
+        assert_eq!(req.frame(&e6).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         // LSAs: a body for another type, a v2 type over 255, v3 options.
         let mut l = v2_lsas().remove(0);
         l.ls_type = 2;
-        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Mismatch));
-        assert_eq!(v2_lsas()[0].to_bytes(Version::V3), Err(OspfError::Mismatch));
+        assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Unwritable));
+        assert_eq!(v2_lsas()[0].frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Unwritable));
         let mut l = v2_lsas().remove(6);
         l.ls_type = 0x100;
-        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Field));
+        assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let mut l = v3_lsas().remove(8);
         l.options = 1;
-        assert_eq!(l.to_bytes(Version::V3), Err(OspfError::Field));
+        assert_eq!(l.frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let summary =
             lsa(3, LsaBody::Summary(SummaryLsa { network_mask: ip4(0, 0, 0, 0), metric: 1 << 24, tos: vec![] }));
-        assert_eq!(summary.to_bytes(Version::V2), Err(OspfError::Field));
+        assert_eq!(summary.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let ext = lsa(
             5,
             LsaBody::AsExternal(AsExternalLsa {
@@ -3045,16 +3021,16 @@ mod tests {
                 ],
             }),
         );
-        assert_eq!(ext.to_bytes(Version::V2), Err(OspfError::Field));
+        assert_eq!(ext.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let ia = lsa(0x2003, LsaBody::InterAreaPrefix(InterAreaPrefixLsa { metric: 0, prefix: pfx(0, "::") }));
         let mut bad = ia.clone();
         let LsaBody::InterAreaPrefix(x) = &mut bad.body else { panic!() };
         x.prefix.length = 129;
-        assert_eq!(bad.to_bytes(Version::V3), Err(OspfError::Field));
+        assert_eq!(bad.frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let mut bad = v3_lsas().remove(4);
         let LsaBody::AsExternalV3(x) = &mut bad.body else { panic!() };
         x.referenced = Some((0, ip4(0, 0, 0, 1)));
-        assert_eq!(bad.to_bytes(Version::V3), Err(OspfError::Field));
+        assert_eq!(bad.frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let router = lsa(
             1,
             LsaBody::Router(RouterLsa {
@@ -3068,11 +3044,11 @@ mod tests {
                 }],
             }),
         );
-        assert_eq!(router.to_bytes(Version::V2), Err(OspfError::Field));
+        assert_eq!(router.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         let big = lsa(10, LsaBody::Other(vec![0; MAX_LSA - LSA_HEADER_LEN + 1]));
-        assert_eq!(big.to_bytes(Version::V2), Err(OspfError::TooLong));
+        assert_eq!(big.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::TooLong));
         let fits = lsa(10, LsaBody::Other(vec![0; MAX_LSA - LSA_HEADER_LEN]));
-        let b = fits.to_bytes(Version::V2).unwrap();
+        let b = fits.frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(Lsa::parse(&b, Version::V2), Ok((fits, MAX_LSA)));
     }
 
@@ -3100,22 +3076,20 @@ mod tests {
         let e = v4_ends();
         let (b, p) = hello_with_lls();
         assert_eq!(Packet::parse(&b, &e).as_ref(), Ok(&p));
-        assert_eq!(p.to_bytes(&e).unwrap(), b);
-        for size in [1, 3, 44, b.len()] {
-            assert_eq!(decode_chunked(&b, &e, size).as_ref(), Ok(&p));
-        }
+        assert_eq!(p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap(), b);
+        assert_eq!(collect(&b, &e).as_ref(), Ok(&p));
         // Cut inside the block, or with bytes past it.
         assert_eq!(Packet::parse(&b[..50], &e), Err(OspfError::Truncated));
         assert_eq!(Packet::parse(&b[..46], &e), Err(OspfError::Truncated));
         let mut long = b.clone();
         long.extend_from_slice(&[0; 4]);
         assert_eq!(Packet::parse(&long, &e), Err(OspfError::Trailing));
-        assert_eq!(decode_chunked(&long, &e, 1), Err(OspfError::Trailing));
+        assert_eq!(collect(&long, &e), Err(OspfError::Trailing));
         // The L bit set and no block: the packet reads, with none.
         let mut alone = p.clone();
         alone.lls = None;
         assert_eq!(Packet::parse(&b[..44], &e), Ok(alone.clone()));
-        assert_eq!(alone.to_bytes(&e).unwrap(), b[..44]);
+        assert_eq!(alone.frame(&e).and_then(|frame| frame.to_bytes()).unwrap(), b[..44]);
         // A wrong block checksum drops the block and keeps the packet.
         let mut bad = b.clone();
         bad[44] ^= 1;
@@ -3124,8 +3098,7 @@ mod tests {
         let mut zero = b.clone();
         zero[46..48].copy_from_slice(&[0, 0]);
         assert_eq!(Packet::parse(&zero, &e), Err(OspfError::Lls));
-        let mut d = Decoder::new(e);
-        assert_eq!(d.feed(&zero[..48]), Err(OspfError::Lls));
+        assert_eq!(collect(&zero[..48], &e), Err(OspfError::Lls));
         let mut huge = b.clone();
         huge[46..48].copy_from_slice(&[0xff, 0xff]);
         assert_eq!(Packet::parse(&huge, &e), Err(OspfError::Lls));
@@ -3138,20 +3111,20 @@ mod tests {
         let mut q = p.clone();
         let Body::HelloV2(h) = &mut q.body else { panic!() };
         h.options = 0x02;
-        assert_eq!(q.to_bytes(&e), Err(OspfError::Lls));
+        assert_eq!(q.frame(&e).and_then(|frame| frame.to_bytes()), Err(OspfError::Lls));
         let mut q = p.clone();
         q.lls = Some(vec![1, 2, 3]);
-        assert_eq!(q.to_bytes(&e), Err(OspfError::Lls));
+        assert_eq!(q.frame(&e).and_then(|frame| frame.to_bytes()), Err(OspfError::Lls));
         let mut q = p.clone();
         q.lls = Some(vec![0; MAX_MESSAGE & !3]);
-        assert_eq!(q.to_bytes(&e), Err(OspfError::TooLong));
+        assert_eq!(q.frame(&e).and_then(|frame| frame.to_bytes()), Err(OspfError::TooLong));
         let mut q = packets(Version::V2).remove(5);
         q.lls = Some(vec![]);
-        assert_eq!(q.to_bytes(&e), Err(OspfError::Lls));
+        assert_eq!(q.frame(&e).and_then(|frame| frame.to_bytes()), Err(OspfError::Lls));
         // After a digest, with its checksum zero and not checked.
         let mut q = p.clone();
         q.header = Header::V2 { auth: Auth::Cryptographic { key_id: 1, sequence: 5, digest: vec![7; 16] } };
-        let c = q.to_bytes(&e).unwrap();
+        let c = q.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(c.len(), 44 + 16 + 12);
         assert_eq!(&c[60..64], &[0, 0, 0, 3]);
         assert_eq!(Packet::parse(&c, &e), Ok(q));
@@ -3164,7 +3137,7 @@ mod tests {
         let Body::HelloV3(h) = &mut hello.body else { panic!() };
         h.options |= OPTION_L_V3;
         hello.lls = Some(vec![0, 1, 0, 4, 0, 0, 0, 1]);
-        let b = hello.to_bytes(&e6).unwrap();
+        let b = hello.frame(&e6).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(usize::from(be16(&b, 2)), b.len() - 12);
         assert_eq!(Packet::parse(&b, &e6), Ok(hello.clone()));
         for (v, e, l) in [(Version::V2, v4_ends(), u32::from(OPTION_L_V2)), (Version::V3, e6, OPTION_L_V3)] {
@@ -3172,9 +3145,9 @@ mod tests {
             let Body::DatabaseDescription(d) = &mut dd.body else { panic!() };
             d.options |= l;
             dd.lls = Some(vec![9; 16]);
-            let b = dd.to_bytes(&e).unwrap();
+            let b = dd.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
             assert_eq!(Packet::parse(&b, &e), Ok(dd.clone()));
-            assert_eq!(decode_chunked(&b, &e, 1), Ok(dd));
+            assert_eq!(collect(&b, &e), Ok(dd));
         }
     }
 
@@ -3235,9 +3208,9 @@ mod tests {
         // its bytes.
         for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
             for l in lsas {
-                let b = l.to_bytes(v).unwrap();
+                let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
                 let (back, _) = Lsa::parse(&b, v).unwrap();
-                assert_eq!(back.to_bytes(v).unwrap(), b);
+                assert_eq!(back.frame(v).and_then(|frame| frame.to_bytes()).unwrap(), b);
                 assert_eq!(back.header(v).unwrap().checksum, be16(&b, 16));
             }
         }
@@ -3255,10 +3228,10 @@ mod tests {
     fn update_keeps_the_lsas_around_a_bad_one() {
         // RFC 2328 section 13, step 1: discard the bad LSA and go on.
         let e = v4_ends();
-        let l = v2_lsas()[1].to_bytes(Version::V2).unwrap();
+        let l = v2_lsas()[1].frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap();
         let mut bad = l.clone();
         bad[21] ^= 1;
-        let mut wrong_body = v2_lsas()[1].to_bytes(Version::V2).unwrap();
+        let mut wrong_body = v2_lsas()[1].frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap();
         wrong_body[24..28].copy_from_slice(&[9, 9, 9, 9]);
         let wrong_body = fix_lsa(wrong_body);
         let mut b = vec![0u8; 24];
@@ -3273,7 +3246,7 @@ mod tests {
         let b = fix(b, &e);
         let p = Packet::parse(&b, &e).unwrap();
         assert_eq!(p.body, Body::LinkStateUpdate(vec![v2_lsas().remove(1), v2_lsas().remove(1)]));
-        assert_eq!(decode_chunked(&b, &e, 1), Ok(p));
+        assert_eq!(collect(&b, &e), Ok(p));
         // The count still covers the dropped ones.
         let mut short = b.clone();
         short[27] = 2;
@@ -3292,7 +3265,7 @@ mod tests {
             lls: None,
             body: Body::LinkStateAck(vec![h]),
         };
-        let b = ack(good).to_bytes(&e).unwrap();
+        let b = ack(good).frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(Packet::parse(&b, &e), Ok(ack(good)));
         let cases = [
             (LsaHeader { length: 0, ..good }, OspfError::LsaLength(0)),
@@ -3304,7 +3277,7 @@ mod tests {
             (LsaHeader { age: DO_NOT_AGE | (MAX_AGE + 1), ..good }, OspfError::Field),
         ];
         for (h, err) in cases {
-            assert_eq!(ack(h).to_bytes(&e), Err(err), "{h:?}");
+            assert_eq!(ack(h).frame(&e).and_then(|frame| frame.to_bytes()), Err(err), "{h:?}");
             // The same header read from bytes.
             let mut raw = b.clone();
             let mut hb = Vec::new();
@@ -3312,12 +3285,12 @@ mod tests {
             raw[24..44].copy_from_slice(&hb);
             assert_eq!(Packet::parse(&fix(raw, &e), &e), Err(err), "{h:?}");
         }
-        assert!(ack(LsaHeader { age: DO_NOT_AGE | MAX_AGE, ..good }).to_bytes(&e).is_ok());
+        assert!(ack(LsaHeader { age: DO_NOT_AGE | MAX_AGE, ..good }).frame(&e).and_then(|frame| frame.to_bytes()).is_ok());
         // Whole LSAs follow the same age and sequence rules.
         for (age, sequence) in [(MAX_AGE + 1, INITIAL_SEQUENCE), (3, RESERVED_SEQUENCE)] {
             let l = Lsa { age, sequence, ..v2_lsas().remove(0) };
-            assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Field));
-            let mut b = Lsa { age: 3, sequence: INITIAL_SEQUENCE, ..l }.to_bytes(Version::V2).unwrap();
+            assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
+            let mut b = Lsa { age: 3, sequence: INITIAL_SEQUENCE, ..l }.frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap();
             b[0..2].copy_from_slice(&age.to_be_bytes());
             b[12..16].copy_from_slice(&sequence.to_be_bytes());
             assert_eq!(Lsa::parse(&fix_lsa(b), Version::V2), Err(OspfError::Field));
@@ -3331,10 +3304,10 @@ mod tests {
             let mut l = v3_lsas().remove(4);
             let LsaBody::AsExternalV3(x) = &mut l.body else { panic!() };
             x.forwarding_address = Some(a.parse().unwrap());
-            assert_eq!(l.to_bytes(Version::V3), Err(OspfError::Field), "{a}");
+            assert_eq!(l.frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Field), "{a}");
             let LsaBody::AsExternalV3(x) = &mut l.body else { panic!() };
             x.forwarding_address = Some("2001:db8::9".parse().unwrap());
-            let mut b = l.to_bytes(Version::V3).unwrap();
+            let mut b = l.frame(Version::V3).and_then(|frame| frame.to_bytes()).unwrap();
             let at = 20 + 4 + 4 + 8;
             b[at..at + 16].copy_from_slice(&a.parse::<Ipv6Addr>().unwrap().octets());
             assert_eq!(Lsa::parse(&fix_lsa(b), Version::V3), Err(OspfError::LsaBody), "{a}");
@@ -3348,11 +3321,11 @@ mod tests {
             let mut l = v2_lsas().remove(0);
             let LsaBody::Router(r) = &mut l.body else { panic!() };
             r.links[0].kind = kind;
-            assert_eq!(l.to_bytes(Version::V2).is_ok(), (1..=4).contains(&kind), "{kind}");
+            assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()).is_ok(), (1..=4).contains(&kind), "{kind}");
             let mut l = v3_lsas().remove(0);
             let LsaBody::RouterV3(r) = &mut l.body else { panic!() };
             r.interfaces[0].kind = kind;
-            assert_eq!(l.to_bytes(Version::V3).is_ok(), matches!(kind, 1 | 2 | 4), "{kind}");
+            assert_eq!(l.frame(Version::V3).and_then(|frame| frame.to_bytes()).is_ok(), matches!(kind, 1 | 2 | 4), "{kind}");
         }
         let mut b = vec![0, 0, 0, 1, 10, 0, 0, 0, 255, 255, 255, 0, 3, 0, 0, 10];
         assert!(LsaBody::parse(&b, Version::V2, lsa_type_v2::ROUTER).is_ok());
@@ -3371,18 +3344,18 @@ mod tests {
         let mut l = v2_lsas().remove(1);
         let LsaBody::Network(n) = &mut l.body else { panic!() };
         n.attached_routers = vec![];
-        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Field));
+        assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         assert_eq!(LsaBody::parse(&[255, 255, 255, 0], Version::V2, lsa_type_v2::NETWORK), Err(OspfError::LsaBody));
         let LsaBody::Network(n) = &mut l.body else { panic!() };
         n.attached_routers = vec![ip4(2, 2, 2, 2)];
-        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Field));
-        let mut b = v2_lsas()[1].to_bytes(Version::V2).unwrap();
+        assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
+        let mut b = v2_lsas()[1].frame(Version::V2).and_then(|frame| frame.to_bytes()).unwrap();
         b[24..28].copy_from_slice(&[3, 3, 3, 3]);
         assert_eq!(Lsa::parse(&fix_lsa(b), Version::V2), Err(OspfError::LsaBody));
         let mut l = v3_lsas().remove(1);
         let LsaBody::NetworkV3(n) = &mut l.body else { panic!() };
         n.attached_routers = vec![ip4(2, 2, 2, 2)];
-        assert_eq!(l.to_bytes(Version::V3), Err(OspfError::Field));
+        assert_eq!(l.frame(Version::V3).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
         assert_eq!(LsaBody::parse(&[0, 0, 0, 0x13], Version::V3, lsa_type_v3::NETWORK), Err(OspfError::LsaBody));
     }
 
@@ -3391,8 +3364,8 @@ mod tests {
         // RFC 2328 A.4.4: for type 4 the mask must be zero.
         let mask = ip4(255, 255, 255, 0);
         let l = lsa(4, LsaBody::Summary(SummaryLsa { network_mask: mask, metric: 1, tos: vec![] }));
-        assert_eq!(l.to_bytes(Version::V2), Err(OspfError::Field));
-        assert!(lsa(3, l.body.clone()).to_bytes(Version::V2).is_ok());
+        assert_eq!(l.frame(Version::V2).and_then(|frame| frame.to_bytes()), Err(OspfError::Field));
+        assert!(lsa(3, l.body.clone()).frame(Version::V2).and_then(|frame| frame.to_bytes()).is_ok());
         let body = [255, 255, 255, 0, 0, 0, 0, 1];
         assert_eq!(LsaBody::parse(&body, Version::V2, 4), Err(OspfError::LsaBody));
         assert!(LsaBody::parse(&body, Version::V2, 3).is_ok());
@@ -3414,15 +3387,15 @@ mod tests {
     #[test]
     fn every_truncated_prefix_fails() {
         for (p, e) in samples() {
-            let b = p.to_bytes(&e).unwrap();
+            let b = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
             for n in 0..b.len() {
                 assert!(Packet::parse(&b[..n], &e).is_err(), "{n} of {p:?}");
-                assert!(decode_chunked(&b[..n], &e, 1).is_err());
+                assert!(collect(&b[..n], &e).is_err());
             }
         }
         for (lsas, v) in [(v2_lsas(), Version::V2), (v3_lsas(), Version::V3)] {
             for l in lsas {
-                let b = l.to_bytes(v).unwrap();
+                let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
                 for n in 0..b.len() {
                     assert!(Lsa::parse(&b[..n], v).is_err());
                 }
@@ -3431,81 +3404,61 @@ mod tests {
     }
 
     #[test]
-    fn decoder_matches_parse() {
+    fn collection_matches_parse() {
         for (p, e) in samples() {
-            let b = p.to_bytes(&e).unwrap();
-            for size in [1, 2, 3, 7, 64, b.len()] {
-                assert_eq!(decode_chunked(&b, &e, size).as_ref(), Ok(&p));
-            }
+            assert_eq!(collect(&p.frame(&e).and_then(|f| f.to_bytes()).unwrap(), &e), Ok(p));
         }
-        // Early errors, and the same error after.
-        let mut d = Decoder::new(v4_ends());
-        assert_eq!(d.feed(&[2]), Ok(()));
-        assert_eq!(d.feed(&[9]), Err(OspfError::Type(9)));
-        assert_eq!(d.feed(&[1]), Err(OspfError::Type(9)));
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.finish(), Err(OspfError::Type(9)));
-        let mut d = Decoder::new(v6_ends());
-        assert_eq!(d.feed(&[2]), Err(OspfError::Family));
-        // Bytes past the length.
-        let b = hello_v2(ip4(1, 1, 1, 1), vec![]).to_bytes(&v4_ends()).unwrap();
-        let mut d = Decoder::new(v4_ends());
-        assert_eq!(d.feed(&b), Ok(()));
-        assert_eq!(d.buffered(), b.len());
-        assert_eq!(d.feed(&[0]), Err(OspfError::Trailing));
-        // A huge feed is cut at the cap and still reads as trailing.
-        let mut big = b.clone();
-        big.resize(MAX_MESSAGE + 100, 0);
-        let mut d = Decoder::new(v4_ends());
-        assert_eq!(d.feed(&big), Err(OspfError::Trailing));
-        assert_eq!(Packet::parse(&big, &v4_ends()), Err(OspfError::Trailing));
-        assert_eq!(Decoder::new(v4_ends()).finish(), Err(OspfError::Truncated));
+        assert_eq!(collect(&[2, 9], &v4_ends()), Err(OspfError::Type(9)));
+        assert_eq!(collect(&[2], &v6_ends()), Err(OspfError::Family));
+        let mut b = hello_v2(ip4(1, 1, 1, 1), vec![]).frame(&v4_ends()).unwrap().to_bytes().unwrap();
+        b.push(0);
+        assert_eq!(collect(&b, &v4_ends()), Err(OspfError::Trailing));
+        b.resize(MAX_MESSAGE + 100, 0);
+        assert_eq!(collect(&b, &v4_ends()), Err(OspfError::Trailing));
+        assert_eq!(collect(&[], &v4_ends()), Err(OspfError::Truncated));
     }
 
     #[test]
     fn errors_display() {
-        for e in [OspfError::Version(9), OspfError::LsaLength(3), OspfError::PrefixLength(200), OspfError::Mismatch] {
+        for e in [OspfError::Version(9), OspfError::LsaLength(3), OspfError::PrefixLength(200), OspfError::Unwritable] {
             assert!(!e.to_string().is_empty());
         }
     }
 
-    // A small deterministic generator, so the fuzz loop runs the same way
-    // every time.
-    struct Lcg(u64);
 
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
+    trait Samples {
+        fn ip4(&mut self) -> Ipv4Addr;
+        fn ip6(&mut self) -> Ipv6Addr;
+        fn u24(&mut self) -> u32;
+        fn prefix(&mut self) -> Prefix;
+        fn age(&mut self) -> u16;
+        fn sequence(&mut self) -> u32;
+    }
+
+    impl Samples for Lcg {
         fn ip4(&mut self) -> Ipv4Addr {
-            Ipv4Addr::from(self.next())
+            Ipv4Addr::from(self.next() as u32)
         }
         fn ip6(&mut self) -> Ipv6Addr {
             let mut a = [0u8; 16];
-            for x in &mut a {
-                *x = self.next() as u8;
-            }
+            self.fill(&mut a);
             Ipv6Addr::from(a)
         }
         fn u24(&mut self) -> u32 {
-            self.next() & MAX_U24
+            (self.next() as u32) & MAX_U24
         }
         fn prefix(&mut self) -> Prefix {
-            let length = self.below(129) as u8;
+            let length = self.index(129) as u8;
             Prefix::new(length, self.next() as u8, self.ip6())
         }
         /// An age a router may send: at most MaxAge, sometimes DoNotAge.
         fn age(&mut self) -> u16 {
-            let age = self.below(usize::from(MAX_AGE) + 1) as u16;
-            if self.below(4) == 0 { age | DO_NOT_AGE } else { age }
+            let age = self.index(usize::from(MAX_AGE) + 1) as u16;
+            if self.index(4) == 0 { age | DO_NOT_AGE } else { age }
         }
         /// A sequence number other than the reserved one.
         fn sequence(&mut self) -> u32 {
-            match self.next() {
+            match self.next() as u32 {
                 RESERVED_SEQUENCE => INITIAL_SEQUENCE,
                 s => s,
             }
@@ -3513,16 +3466,16 @@ mod tests {
     }
 
     fn random_lsa(rng: &mut Lcg, v: Version) -> Lsa {
-        let n = rng.below(4);
+        let n = rng.index(4);
         let advertising_router = rng.ip4();
         // A Network-LSA lists its advertising router, the designated router.
         let attached = |rng: &mut Lcg| {
             let mut list: Vec<Ipv4Addr> = (0..n).map(|_| rng.ip4()).collect();
-            list.insert(rng.below(n + 1), advertising_router);
+            list.insert(rng.index(n + 1), advertising_router);
             list
         };
         let (ls_type, body) = match v {
-            Version::V2 => match rng.below(6) {
+            Version::V2 => match rng.index(6) {
                 0 => (
                     1,
                     LsaBody::Router(RouterLsa {
@@ -3531,9 +3484,9 @@ mod tests {
                             .map(|_| RouterLink {
                                 id: rng.ip4(),
                                 data: rng.ip4(),
-                                kind: 1 + rng.below(4) as u8,
+                                kind: 1 + rng.index(4) as u8,
                                 metric: rng.next() as u16,
-                                tos: (0..rng.below(3))
+                                tos: (0..rng.index(3))
                                     .map(|_| TosMetric { tos: rng.next() as u8, metric: rng.next() as u16 })
                                     .collect(),
                             })
@@ -3542,7 +3495,7 @@ mod tests {
                 ),
                 1 => (2, LsaBody::Network(NetworkLsa { network_mask: rng.ip4(), attached_routers: attached(rng) })),
                 2 => {
-                    let t = 3 + rng.below(2) as u16;
+                    let t = 3 + rng.index(2) as u16;
                     (
                         t,
                         LsaBody::Summary(SummaryLsa {
@@ -3553,26 +3506,26 @@ mod tests {
                     )
                 }
                 3 => (
-                    if rng.below(2) == 0 { 5 } else { 7 },
+                    if !rng.coin() { 5 } else { 7 },
                     LsaBody::AsExternal(AsExternalLsa {
                         network_mask: rng.ip4(),
                         routes: (0..=n)
                             .map(|i| ExternalRoute {
-                                type2: rng.below(2) == 0,
+                                type2: !rng.coin(),
                                 tos: if i == 0 { 0 } else { rng.next() as u8 & 0x7f },
                                 metric: rng.u24(),
                                 forwarding_address: rng.ip4(),
-                                route_tag: rng.next(),
+                                route_tag: (rng.next() as u32),
                             })
                             .collect(),
                     }),
                 ),
                 _ => (
-                    100 + rng.below(100) as u16,
-                    LsaBody::Other((0..rng.below(12)).map(|_| rng.next() as u8).collect()),
+                    100 + rng.index(100) as u16,
+                    LsaBody::Other(rng.bytes(11)),
                 ),
             },
-            Version::V3 => match rng.below(9) {
+            Version::V3 => match rng.index(9) {
                 0 => (
                     lsa_type_v3::ROUTER,
                     LsaBody::RouterV3(RouterLsaV3 {
@@ -3580,10 +3533,10 @@ mod tests {
                         options: rng.u24(),
                         interfaces: (0..n)
                             .map(|_| RouterInterface {
-                                kind: [1, 2, 4][rng.below(3)],
+                                kind: [1, 2, 4][rng.index(3)],
                                 metric: rng.next() as u16,
-                                interface_id: rng.next(),
-                                neighbor_interface_id: rng.next(),
+                                interface_id: (rng.next() as u32),
+                                neighbor_interface_id: (rng.next() as u32),
                                 neighbor_router_id: rng.ip4(),
                             })
                             .collect(),
@@ -3606,20 +3559,20 @@ mod tests {
                     }),
                 ),
                 4 => (
-                    if rng.below(2) == 0 { lsa_type_v3::AS_EXTERNAL } else { lsa_type_v3::NSSA },
+                    if !rng.coin() { lsa_type_v3::AS_EXTERNAL } else { lsa_type_v3::NSSA },
                     LsaBody::AsExternalV3(AsExternalLsaV3 {
-                        type2: rng.below(2) == 0,
+                        type2: !rng.coin(),
                         metric: rng.u24(),
                         prefix: rng.prefix(),
                         // A global address: 2000::/3.
-                        forwarding_address: if rng.below(2) == 0 {
+                        forwarding_address: if !rng.coin() {
                             Some(Ipv6Addr::from((u128::from(rng.ip6()) >> 3) | (1 << 125)))
                         } else {
                             None
                         },
-                        route_tag: if rng.below(2) == 0 { Some(rng.next()) } else { None },
-                        referenced: if rng.below(2) == 0 {
-                            Some((1 + rng.below(0xfffe) as u16, rng.ip4()))
+                        route_tag: if !rng.coin() { Some(rng.next() as u32) } else { None },
+                        referenced: if !rng.coin() {
+                            Some((1 + rng.index(0xfffe) as u16, rng.ip4()))
                         } else {
                             None
                         },
@@ -3644,8 +3597,8 @@ mod tests {
                     }),
                 ),
                 _ => (
-                    0x0100 + rng.below(100) as u16,
-                    LsaBody::Other((0..rng.below(12)).map(|_| rng.next() as u8).collect()),
+                    0x0100 + rng.index(100) as u16,
+                    LsaBody::Other(rng.bytes(11)),
                 ),
             },
         };
@@ -3668,27 +3621,27 @@ mod tests {
             link_state_id: rng.ip4(),
             advertising_router: rng.ip4(),
             sequence: rng.sequence(),
-            checksum: ((1 + rng.below(255) as u16) << 8) | (1 + rng.below(255) as u16),
-            length: (LSA_HEADER_LEN + rng.below(MAX_LSA - LSA_HEADER_LEN + 1)) as u16,
+            checksum: ((1 + rng.index(255) as u16) << 8) | (1 + rng.index(255) as u16),
+            length: (LSA_HEADER_LEN + rng.index(MAX_LSA - LSA_HEADER_LEN + 1)) as u16,
         }
     }
 
     fn random_packet(rng: &mut Lcg, v: Version) -> Packet {
-        let n = rng.below(4);
-        let body = match rng.below(5) {
+        let n = rng.index(4);
+        let body = match rng.index(5) {
             0 => match v {
                 Version::V2 => Body::HelloV2(HelloV2 {
                     network_mask: rng.ip4(),
                     hello_interval: rng.next() as u16,
                     options: rng.next() as u8,
                     priority: rng.next() as u8,
-                    dead_interval: rng.next(),
+                    dead_interval: (rng.next() as u32),
                     designated_router: rng.ip4(),
                     backup_designated_router: rng.ip4(),
                     neighbors: (0..n).map(|_| rng.ip4()).collect(),
                 }),
                 Version::V3 => Body::HelloV3(HelloV3 {
-                    interface_id: rng.next(),
+                    interface_id: (rng.next() as u32),
                     priority: rng.next() as u8,
                     options: rng.u24(),
                     hello_interval: rng.next() as u16,
@@ -3700,15 +3653,15 @@ mod tests {
             },
             1 => Body::DatabaseDescription(DatabaseDescription {
                 mtu: rng.next() as u16,
-                options: if v == Version::V2 { rng.next() & 0xff } else { rng.u24() },
+                options: if v == Version::V2 { (rng.next() as u32) & 0xff } else { rng.u24() },
                 flags: rng.next() as u8,
-                sequence: rng.next(),
+                sequence: (rng.next() as u32),
                 headers: (0..n).map(|_| random_header(rng, v)).collect(),
             }),
             2 => Body::LinkStateRequest(
                 (0..n)
                     .map(|_| LsaKey {
-                        ls_type: if v == Version::V2 { rng.next() } else { rng.next() & 0xffff },
+                        ls_type: if v == Version::V2 { rng.next() as u32 } else { (rng.next() as u32) & 0xffff },
                         link_state_id: rng.ip4(),
                         advertising_router: rng.ip4(),
                     })
@@ -3719,22 +3672,22 @@ mod tests {
         };
         let header = match v {
             Version::V2 => Header::V2 {
-                auth: match rng.below(4) {
+                auth: match rng.index(4) {
                     0 => Auth::Null,
                     1 => Auth::Simple([rng.next() as u8; 8]),
                     2 => Auth::Cryptographic {
                         key_id: rng.next() as u8,
-                        sequence: rng.next(),
-                        digest: (0..rng.below(33)).map(|_| rng.next() as u8).collect(),
+                        sequence: (rng.next() as u32),
+                        digest: rng.bytes(32),
                     },
-                    _ => Auth::Other { kind: 3 + rng.below(100) as u16, data: [rng.next() as u8; 8] },
+                    _ => Auth::Other { kind: 3 + rng.index(100) as u16, data: [rng.next() as u8; 8] },
                 },
             },
             Version::V3 => Header::V3 { instance_id: rng.next() as u8 },
         };
         let mut body = body;
         // Sometimes a signaling block, with the L bit set.
-        let lls = if rng.below(3) == 0 {
+        let lls = if rng.index(3) == 0 {
             let l_set = match &mut body {
                 Body::HelloV2(h) => {
                     h.options |= OPTION_L_V2;
@@ -3750,7 +3703,11 @@ mod tests {
                 }
                 _ => false,
             };
-            l_set.then(|| (0..4 * rng.below(4)).map(|_| rng.next() as u8).collect())
+            l_set.then(|| {
+                let mut bytes = vec![0; 4 * rng.index(4)];
+                rng.fill(&mut bytes);
+                bytes
+            })
         } else {
             None
         };
@@ -3760,11 +3717,10 @@ mod tests {
     /// What the fuzz target checks, for one buffer.
     fn check_bytes(data: &[u8], e: &Endpoints) {
         let parsed = Packet::parse(data, e);
-        assert_eq!(decode_chunked(data, e, 1), parsed);
-        assert_eq!(decode_chunked(data, e, data.len()), parsed);
+        assert_eq!(collect(data, e), parsed);
         if let Ok(p) = &parsed {
             // Dropped LSAs and signaling blocks make it shorter.
-            let b = p.to_bytes(e).unwrap();
+            let b = p.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
             assert!(b.len() <= data.len());
             assert_eq!(Packet::parse(&b, e).as_ref(), Ok(p));
         }
@@ -3773,14 +3729,14 @@ mod tests {
                 // An LSA read writes back to the same bytes, so its header
                 // and checksum are the ones received.
                 assert!(n <= data.len());
-                let b = l.to_bytes(v).unwrap();
+                let b = l.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
                 assert_eq!(b, data[..n]);
                 assert_eq!(l.header(v).map(|h| (h.checksum, h.length)), Ok((be16(data, 16), n as u16)));
             }
             if data.len() >= LSA_HEADER_LEN {
                 let t = if v == Version::V2 { u16::from(data[3]) } else { be16(data, 2) };
                 if let Ok(body) = LsaBody::parse(&data[LSA_HEADER_LEN..], v, t) {
-                    assert_eq!(body.to_bytes(v, t).as_deref(), Ok(&data[LSA_HEADER_LEN..]));
+                    assert_eq!(body.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(), Ok(&data[LSA_HEADER_LEN..]));
                 }
             }
         }
@@ -3789,62 +3745,62 @@ mod tests {
     /// A prefix with a length that may be out of range, built with
     /// [`Prefix::new`] or directly, with bits past the length.
     fn wild_prefix(rng: &mut Lcg) -> Prefix {
-        if rng.below(2) == 0 {
+        if !rng.coin() {
             Prefix::new(rng.next() as u8, rng.next() as u8, rng.ip6())
         } else {
-            Prefix { length: rng.below(140) as u8, options: rng.next() as u8, address: rng.ip6() }
+            Prefix { length: rng.index(140) as u8, options: rng.next() as u8, address: rng.ip6() }
         }
     }
 
     /// Sets one field of `l` to a value that may not fit, as a careless
     /// world might.
     fn perturb_lsa(rng: &mut Lcg, l: &mut Lsa) {
-        match rng.below(6) {
+        match rng.index(6) {
             0 => l.ls_type = rng.next() as u16,
             1 => l.options = rng.next() as u8,
             2 => l.age = rng.next() as u16,
-            3 => l.sequence = if rng.below(2) == 0 { RESERVED_SEQUENCE } else { rng.next() },
+            3 => l.sequence = if !rng.coin() { RESERVED_SEQUENCE } else { rng.next() as u32 },
             4 => match &mut l.body {
                 LsaBody::Router(r) => {
                     if let Some(link) = r.links.first_mut() {
-                        if rng.below(2) == 0 {
-                            link.tos = vec![TosMetric { tos: 1, metric: 1 }; rng.below(300)];
+                        if !rng.coin() {
+                            link.tos = vec![TosMetric { tos: 1, metric: 1 }; rng.index(300)];
                         } else {
                             link.kind = rng.next() as u8;
                         }
                     }
                 }
-                LsaBody::Network(n) => n.attached_routers.truncate(rng.below(2)),
+                LsaBody::Network(n) => n.attached_routers.truncate(rng.index(2)),
                 LsaBody::NetworkV3(n) => {
-                    if rng.below(2) == 0 {
-                        n.options = rng.next();
+                    if !rng.coin() {
+                        n.options = rng.next() as u32;
                     } else {
-                        n.attached_routers.truncate(rng.below(2));
+                        n.attached_routers.truncate(rng.index(2));
                     }
                 }
                 LsaBody::Summary(s) => {
-                    if rng.below(2) == 0 {
-                        s.metric = rng.next();
+                    if !rng.coin() {
+                        s.metric = rng.next() as u32;
                     } else {
                         s.network_mask = rng.ip4();
                     }
                 }
-                LsaBody::AsExternal(e) => match rng.below(3) {
+                LsaBody::AsExternal(e) => match rng.index(3) {
                     0 => e.routes.clear(),
                     1 => e.routes[0].tos = rng.next() as u8,
-                    _ => e.routes[0].metric = rng.next(),
+                    _ => e.routes[0].metric = rng.next() as u32,
                 },
                 LsaBody::RouterV3(r) => match r.interfaces.first_mut() {
-                    Some(i) if rng.below(2) == 0 => i.kind = rng.next() as u8,
-                    _ => r.options = rng.next(),
+                    Some(i) if !rng.coin() => i.kind = rng.next() as u8,
+                    _ => r.options = rng.next() as u32,
                 },
                 LsaBody::InterAreaPrefix(p) => p.prefix = wild_prefix(rng),
-                LsaBody::InterAreaRouter(r) => r.metric = rng.next(),
-                LsaBody::AsExternalV3(e) => match rng.below(3) {
+                LsaBody::InterAreaRouter(r) => r.metric = rng.next() as u32,
+                LsaBody::AsExternalV3(e) => match rng.index(3) {
                     0 => e.prefix = wild_prefix(rng),
-                    1 => e.referenced = Some((rng.below(3) as u16, rng.ip4())),
+                    1 => e.referenced = Some((rng.index(3) as u16, rng.ip4())),
                     _ => {
-                        let a = ["::", "fe80::1", "fe80::", "2001:db8::1"][rng.below(4)];
+                        let a = ["::", "fe80::1", "fe80::", "2001:db8::1"][rng.index(4)];
                         e.forwarding_address = Some(a.parse().unwrap());
                     }
                 },
@@ -3860,7 +3816,7 @@ mod tests {
     fn writers_never_write_what_readers_reject() {
         // Values with fields set out of range: each write either fails or
         // gives bytes that read back as the same value.
-        let mut rng = Lcg(0x77);
+        let mut rng = Lcg::new(0x77);
         let ends = [v4_ends(), v6_ends()];
         let mut written = 0;
         for round in 0..6000 {
@@ -3874,7 +3830,7 @@ mod tests {
                     }
                 }
                 Body::DatabaseDescription(d) => {
-                    d.options = rng.next() >> rng.below(32);
+                    d.options = (rng.next() as u32) >> rng.index(32);
                     if let Some(h) = d.headers.first_mut() {
                         h.options = rng.next() as u8;
                         h.ls_type = rng.next() as u16;
@@ -3882,8 +3838,8 @@ mod tests {
                 }
                 Body::LinkStateAck(hs) => {
                     if let Some(h) = hs.first_mut() {
-                        match rng.below(4) {
-                            0 => h.length = rng.below(40) as u16,
+                        match rng.index(4) {
+                            0 => h.length = rng.index(40) as u16,
                             1 => h.checksum = rng.next() as u16 & 0xff00,
                             2 => h.age = rng.next() as u16,
                             _ => {
@@ -3895,28 +3851,28 @@ mod tests {
                 }
                 Body::LinkStateRequest(keys) => {
                     if let Some(k) = keys.first_mut() {
-                        k.ls_type = rng.next();
+                        k.ls_type = rng.next() as u32;
                     }
                 }
-                Body::HelloV3(h) => h.options = rng.next() >> rng.below(32),
+                Body::HelloV3(h) => h.options = (rng.next() as u32) >> rng.index(32),
                 Body::HelloV2(h) => h.options = rng.next() as u8,
             }
-            if rng.below(4) == 0 {
-                p.lls = Some((0..rng.below(10)).map(|_| rng.next() as u8).collect());
+            if rng.index(4) == 0 {
+                p.lls = Some(rng.bytes(9));
             }
-            match rng.below(4) {
-                0 => p.header = Header::V2 { auth: Auth::Other { kind: rng.below(5) as u16, data: [7; 8] } },
+            match rng.index(4) {
+                0 => p.header = Header::V2 { auth: Auth::Other { kind: rng.index(5) as u16, data: [7; 8] } },
                 1 => p.header = Header::V3 { instance_id: 1 },
                 _ => {}
             }
-            let end = if rng.below(8) == 0 { ends[(round + 1) % 2] } else { e };
-            if let Ok(b) = p.to_bytes(&end) {
+            let end = if rng.index(8) == 0 { ends[(round + 1) % 2] } else { e };
+            if let Ok(b) = p.frame(&end).and_then(|frame| frame.to_bytes()) {
                 assert_eq!(Packet::parse(&b, &end).as_ref(), Ok(&p), "round {round}");
                 written += 1;
             }
             let mut l = random_lsa(&mut rng, v);
             perturb_lsa(&mut rng, &mut l);
-            if let Ok(b) = l.to_bytes(v) {
+            if let Ok(b) = l.frame(v).and_then(|frame| frame.to_bytes()) {
                 assert_eq!(Lsa::parse(&b, v), Ok((l, b.len())), "round {round}");
             }
         }
@@ -3926,45 +3882,31 @@ mod tests {
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x05f5);
+        let mut rng = Lcg::new(0x05f5);
         let ends = [v4_ends(), v6_ends()];
         for round in 0..6000 {
             let e = ends[round % 2];
             let p = random_packet(&mut rng, e.version());
-            let good = p.to_bytes(&e).unwrap();
+            let good = p.frame(&e).and_then(|frame| frame.to_bytes()).unwrap();
             assert_eq!(Packet::parse(&good, &e).as_ref(), Ok(&p), "round {round}");
             check_bytes(&good, &e);
             // Mutations, with the checksums fixed again so the parser
             // looks past them.
             let mut bad = good.clone();
-            for _ in 0..1 + rng.below(4) {
-                if bad.is_empty() {
-                    break;
-                }
-                let i = rng.below(bad.len());
-                match rng.below(4) {
-                    0 => bad[i] = rng.next() as u8,
-                    1 => bad[i] ^= 1 << rng.below(8),
-                    2 => bad.truncate(i),
-                    _ => bad.insert(i, rng.next() as u8),
-                }
-            }
+            mutate(&mut rng, &mut bad);
             check_bytes(&bad, &e);
             check_bytes(&fix(bad.clone(), &e), &e);
             // An LSA, with its checksum set right after mutating it.
             let l = random_lsa(&mut rng, e.version());
-            let mut lb = l.to_bytes(e.version()).unwrap();
-            if !lb.is_empty() {
-                let i = rng.below(lb.len());
-                lb[i] = rng.next() as u8;
-            }
+            let mut lb = l.frame(e.version()).and_then(|frame| frame.to_bytes()).unwrap();
+            mutate(&mut rng, &mut lb);
             check_bytes(&fix_lsa(lb), &e);
             // Random bytes behind a plausible header.
-            let len = rng.below(80);
-            let mut raw: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            let len = rng.index(80);
+            let mut raw = rng.bytes(80);
             if raw.len() >= 4 {
                 raw[0] = e.version().number();
-                raw[1] = 1 + rng.below(5) as u8;
+                raw[1] = 1 + rng.index(5) as u8;
                 raw[2..4].copy_from_slice(&(len as u16).to_be_bytes());
             }
             check_bytes(&fix(raw, &e), &e);

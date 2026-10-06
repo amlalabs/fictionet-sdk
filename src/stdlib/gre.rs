@@ -14,8 +14,9 @@
 //! the payload of each IP packet of protocol [`IP_PROTOCOL`] to
 //! [`Packet::parse`], looks at the [`Header`], and does what it likes with
 //! the inner payload. To send, it builds a [`Packet`] and writes the bytes
-//! [`Packet::to_bytes`] returns. A [`Decoder`] reads a packet that comes
-//! in pieces and reports a bad header as soon as the bytes show it.
+//! [`Wire::to_bytes`] returns. For pieces of one packet, use
+//! [`Stream<Collect<Packet>>`](super::codec::Stream) with a collection
+//! limit of [`MAX_PACKET`], then call `end` at the packet boundary.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A header with an unknown version, with the routing bits or the
@@ -30,6 +31,7 @@
 //! they return always read back.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::gre::{protocol, GreHeader, Header, Packet};
 //!
 //! let packet = Packet {
@@ -46,12 +48,8 @@
 //! assert_eq!(back.header.key(), Some(7));
 //! ```
 //!
-//! [`Packet`] implements [`Wire`](super::codec::Wire) for exact parsing and
-//! transactional writing. Its trait parser refuses trailing PPTP padding;
-//! [`Packet::parse`] keeps accepting it. For chunks of one packet, use
-//! `Stream::new(Collect::<Packet>::new(MAX_PACKET))` and end the stream at
-//! the packet boundary. [`Decoder`] keeps its early header checks, header
-//! access, constructor, and repeated feed errors.
+
+use super::codec::Wire;
 
 /// The IP protocol number that marks a GRE packet.
 pub const IP_PROTOCOL: u8 = 47;
@@ -180,11 +178,17 @@ pub enum GreError {
     Checksum,
     /// The packet is longer than [`MAX_PACKET`].
     TooLong,
+    /// Bytes follow the declared PPTP payload.
+    Trailing {
+        /// Number of bytes after the payload.
+        remaining: usize,
+    },
 }
 
 impl std::fmt::Display for GreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            GreError::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
             GreError::Truncated => f.write_str("bytes end inside the GRE packet"),
             GreError::Version(v) => write!(f, "GRE version {v}, not 0 or 1"),
             GreError::Reserved(bits) => write!(f, "GRE flag bits {bits:#06x} must be zero"),
@@ -373,7 +377,7 @@ impl Header {
     /// Splits a whole packet into its header and its payload, borrowed
     /// from `b`. It checks the checksum if there is one. For PPTP the
     /// payload is as long as the header's payload length field says, and
-    /// any bytes after it are ignored, as link padding would be.
+    /// bytes after it are refused.
     pub fn split(b: &[u8]) -> Result<(Header, &[u8]), GreError> {
         let (header, used) = Header::parse_prefix(b)?.ok_or(GreError::Truncated)?;
         if b.len() > MAX_PACKET {
@@ -387,8 +391,12 @@ impl Header {
                 Ok((header, &b[used..]))
             }
             Header::Pptp(_) => {
-                let end = used + usize::from(be16(b, BASE_HEADER_LEN));
+                let end = used.checked_add(usize::from(be16(b, BASE_HEADER_LEN)))
+                    .ok_or(GreError::TooLong)?;
                 let payload = b.get(used..end).ok_or(GreError::Truncated)?;
+                if end != b.len() {
+                    return Err(GreError::Trailing { remaining: b.len() - end });
+                }
                 Ok((header, payload))
             }
         }
@@ -456,28 +464,21 @@ pub struct Packet {
     pub payload: Vec<u8>,
 }
 
-impl Packet {
-    /// Reads a whole packet, as [`Header::split`] does, and copies out the
-    /// payload.
-    pub fn parse(b: &[u8]) -> Result<Packet, GreError> {
+impl Wire for Packet {
+    type ParseError = GreError;
+    type WriteError = GreError;
+
+    /// Reads exactly one packet and copies its payload.
+    /// Refuses invalid flags, lengths, checksums, and trailing PPTP bytes.
+    fn parse(b: &[u8]) -> Result<Self, GreError> {
         let (header, payload) = Header::split(b)?;
         Ok(Packet { header, payload: payload.to_vec() })
     }
 
-    /// The packet's bytes, with the checksum and the PPTP payload length
-    /// filled in. It fails with [`GreError::TooLong`] if the whole would be
-    /// longer than [`MAX_PACKET`], and with [`GreError::PptpSequence`] if a
-    /// PPTP header has a sequence number and no payload, or a payload and
-    /// no sequence number.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, GreError> {
-        let mut out = Vec::new();
-        self.write(&mut out)?;
-        Ok(out)
-    }
-
-    /// Appends the packet's bytes to `out`, with the same checks as
-    /// [`Packet::to_bytes`]. On an error, `out` is left as it was.
-    pub fn write(&self, out: &mut Vec<u8>) -> Result<(), GreError> {
+    /// Appends a packet with its checksum and PPTP payload length. Refuses
+    /// a packet above [`MAX_PACKET`] or a PPTP sequence number whose presence
+    /// does not match the payload. Leaves `out` unchanged on error.
+    fn write(&self, out: &mut Vec<u8>) -> Result<(), GreError> {
         let start = out.len();
         out.reserve(self.header.len().saturating_add(self.payload.len()).min(MAX_PACKET));
         self.header.write(self.payload.len(), out)?;
@@ -491,120 +492,25 @@ impl Packet {
     }
 }
 
-/// Why an exact [`Wire`](super::codec::Wire) parse refused a packet.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParseError {
-    /// The packet's header, length, or checksum is invalid.
-    Packet(GreError),
-    /// Bytes follow the declared PPTP payload.
-    Trailing {
-        /// Number of bytes after the payload.
-        remaining: usize,
-    },
-}
-
-impl core::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Packet(e) => e.fmt(f),
-            Self::Trailing { remaining } => write!(f, "{remaining} bytes after the GRE packet"),
-        }
-    }
-}
-
-impl core::error::Error for ParseError {}
-
-impl super::codec::Wire for Packet {
-    type ParseError = ParseError;
-    type WriteError = GreError;
-
-    /// Reads exactly one packet. Refuses padding after a PPTP payload.
-    fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
-        let packet = Packet::parse(bytes).map_err(ParseError::Packet)?;
-        let used = packet.header.len().saturating_add(packet.payload.len());
-        if used != bytes.len() {
-            return Err(ParseError::Trailing { remaining: bytes.len().saturating_sub(used) });
-        }
-        Ok(packet)
-    }
-
-    /// Appends at most [`MAX_PACKET`] bytes. Leaves `out` unchanged on error.
-    fn write(&self, out: &mut Vec<u8>) -> Result<(), GreError> {
-        Packet::write(self, out)
-    }
-}
-
-/// Reads one packet that comes in pieces. Feed it the bytes in order, then
-/// call [`Decoder::finish`]. It reads the header as soon as its bytes have
-/// come, and fails as soon as the bytes show a bad one. It holds at most
-/// [`MAX_PACKET`] plus one bytes.
-#[derive(Clone, Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    header: Option<Header>,
-    failed: Option<GreError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Adds the next bytes of the packet. It returns the error once the
-    /// bytes show one, and the same error on every later call; bytes fed
-    /// after that are dropped.
-    pub fn feed(&mut self, bytes: &[u8]) -> Result<(), GreError> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        // One byte past the limit is enough to know the packet is too long.
-        let room = (MAX_PACKET + 1).saturating_sub(self.buf.len());
-        self.buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-        if self.header.is_none() {
-            match Header::parse_prefix(&self.buf) {
-                Ok(Some((h, _))) => self.header = Some(h),
-                Ok(None) => {}
-                Err(e) => return Err(self.fail(e)),
-            }
-        }
-        if self.buf.len() > MAX_PACKET {
-            return Err(self.fail(GreError::TooLong));
-        }
-        Ok(())
-    }
-
-    fn fail(&mut self, e: GreError) -> GreError {
-        self.failed = Some(e);
-        self.buf = Vec::new();
-        self.header = None;
-        e
-    }
-
-    /// The header, once all its bytes have come and passed every check
-    /// but the checksum.
-    pub fn header(&self) -> Option<&Header> {
-        self.header.as_ref()
-    }
-
-    /// How many bytes are held.
-    pub fn buffered(&self) -> usize {
-        self.buf.len()
-    }
-
-    /// The packet, when no more bytes will come. It gives the same result
-    /// as [`Packet::parse`] on all the bytes fed.
-    pub fn finish(self) -> Result<Packet, GreError> {
-        match self.failed {
-            Some(e) => Err(e),
-            None => Packet::parse(&self.buf),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::{Collect, CollectError, Fail, contract, test_support::{Lcg, decode_all, mutate}};
+
+    fn collect(b: &[u8]) -> Result<Packet, GreError> {
+        let make = || Collect::<Packet>::new(MAX_PACKET);
+        contract::check_decode_with_alloc_limit(make, b, 2 * (MAX_PACKET + 1));
+        contract::check_wire::<Packet>(b);
+        let parsed = Packet::parse(b);
+        let (items, failure) = decode_all(make, b);
+        if b.len() <= MAX_PACKET {
+            assert_eq!(failure, parsed.clone().err().map(|e| Fail::Protocol(CollectError::Parse(e))));
+            assert_eq!(items, parsed.clone().ok().into_iter().collect::<Vec<_>>());
+        } else {
+            assert_eq!(failure, Some(Fail::Protocol(CollectError::TooLong { limit: MAX_PACKET })));
+        }
+        parsed
+    }
 
     fn gre(protocol: u16, checksum: bool, key: Option<u32>, sequence: Option<u32>) -> Header {
         Header::Gre(GreHeader { protocol, checksum, key, sequence })
@@ -614,39 +520,11 @@ mod tests {
         Header::Pptp(PptpHeader { call_id, sequence, ack })
     }
 
-    fn decode_whole(b: &[u8]) -> Result<Packet, GreError> {
-        let mut d = Decoder::new();
-        let fed = d.feed(b);
-        let out = d.finish();
-        if let Err(e) = fed {
-            assert_eq!(out, Err(e));
-        }
-        out
-    }
-
-    fn decode_bytewise(b: &[u8]) -> Result<Packet, GreError> {
-        let mut d = Decoder::new();
-        let mut first = None;
-        for byte in b {
-            if let Err(e) = d.feed(std::slice::from_ref(byte)) {
-                // The error sticks.
-                assert_eq!(*first.get_or_insert(e), e);
-            }
-            assert!(d.buffered() <= MAX_PACKET + 1);
-        }
-        let out = d.finish();
-        if let Some(e) = first {
-            assert_eq!(out, Err(e));
-        }
-        out
-    }
-
     /// Parses `b` three ways and checks they agree, and that a packet read
     /// writes back to bytes that read the same.
     fn check(b: &[u8]) -> Result<Packet, GreError> {
         let parsed = Packet::parse(b);
-        assert_eq!(decode_whole(b), parsed);
-        assert_eq!(decode_bytewise(b), parsed);
+        assert_eq!(collect(b), parsed);
         if let Ok(p) = &parsed {
             let bytes = p.to_bytes().unwrap();
             assert!(bytes.len() <= b.len());
@@ -767,8 +645,7 @@ mod tests {
         for bit in [0x40u8, 0x20, 0x10, 0x08] {
             let b = [0x30, 0x01 | bit, 0x88, 0x0b, 0, 1, 0, 1, 0, 0, 0, 1, 0x42];
             assert_eq!(check(&b), Err(GreError::Reserved(u16::from(bit))), "{bit:#04x}");
-            let mut d = Decoder::new();
-            assert_eq!(d.feed(&b[..2]), Err(GreError::Reserved(u16::from(bit))));
+            assert_eq!(Header::parse_prefix(&b[..2]), Err(GreError::Reserved(u16::from(bit))));
         }
     }
 
@@ -781,10 +658,8 @@ mod tests {
         // A sequence number without data:
         let b = [0x30, 0x01, 0x88, 0x0b, 0, 0, 0, 1, 0, 0, 0, 1];
         assert_eq!(check(&b), Err(GreError::PptpSequence));
-        // The decoder sees it as soon as the header is in.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]), Ok(()));
-        assert_eq!(d.feed(&[1]), Err(GreError::PptpSequence));
+        assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0]), Ok(None));
+        assert_eq!(Header::parse_prefix(&[0x20, 0x01, 0x88, 0x0b, 0, 1, 0, 1]), Err(GreError::PptpSequence));
         assert!(!GreError::PptpSequence.to_string().is_empty());
 
         // Writers refuse both, and leave `out` as it was.
@@ -823,9 +698,11 @@ mod tests {
     }
 
     #[test]
-    fn pptp_ignores_trailing_bytes() {
+    fn pptp_refuses_trailing_bytes() {
         let b = [0x30, 0x01, 0x88, 0x0b, 0x00, 0x01, 0, 7, 0, 0, 0, 1, 0x42, 0xee, 0xee];
-        let p = check(&b).unwrap();
+        assert_eq!(check(&b), Err(GreError::Trailing { remaining: 2 }));
+        assert_eq!(Header::split(&b), Err(GreError::Trailing { remaining: 2 }));
+        let p = check(&b[..13]).unwrap();
         assert_eq!(p.header, pptp(7, Some(1), None));
         assert_eq!(p.payload, [0x42]);
         assert_eq!(p.to_bytes().unwrap(), &b[..13]);
@@ -873,31 +750,14 @@ mod tests {
     }
 
     #[test]
-    fn errors_show_early() {
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x00]), Ok(()));
-        assert_eq!(d.feed(&[0x03]), Err(GreError::Version(3)));
-        assert_eq!(d.feed(&[0x08, 0x00]), Err(GreError::Version(3)));
-        assert_eq!(d.buffered(), 0);
-        assert_eq!(d.finish(), Err(GreError::Version(3)));
-
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x20, 0x01, 0x86]), Ok(()));
-        assert!(d.header().is_none());
-        assert_eq!(d.feed(&[0xdd]), Err(GreError::PptpProtocol(0x86dd)));
-
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x20, 0x00, 0x08, 0x00, 0, 0, 0]), Ok(()));
-        assert!(d.header().is_none());
-        assert_eq!(d.feed(&[3]), Ok(()));
-        assert_eq!(d.header(), Some(&gre(protocol::IPV4, false, Some(3), None)));
-
-        // A checksum needs the whole packet, so it fails only at the end.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0x80, 0x00, 0x08, 0x00, 0x32, 0xfe, 0x00, 0x00, 0x45, 0x00]), Ok(()));
-        assert_eq!(d.header(), Some(&gre(protocol::IPV4, true, None, None)));
-        assert_eq!(d.buffered(), 10);
-        assert_eq!(d.finish(), Err(GreError::Checksum));
+    fn header_prefix_errors_and_checksum() {
+        assert_eq!(Header::parse_prefix(&[0]), Ok(None));
+        assert_eq!(Header::parse_prefix(&[0, 3]), Err(GreError::Version(3)));
+        assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86]), Ok(None));
+        assert_eq!(Header::parse_prefix(&[0x20, 1, 0x86, 0xdd]), Err(GreError::PptpProtocol(0x86dd)));
+        assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0]), Ok(None));
+        assert_eq!(Header::parse_prefix(&[0x20, 0, 8, 0, 0, 0, 0, 3]), Ok(Some((gre(protocol::IPV4, false, Some(3), None), 8))));
+        assert_eq!(collect(&[0x80, 0, 8, 0, 0x32, 0xfe, 0, 0, 0x45, 0]), Err(GreError::Checksum));
     }
 
     #[test]
@@ -905,16 +765,9 @@ mod tests {
         let mut b = vec![0x00, 0x00, 0x08, 0x00];
         b.resize(MAX_PACKET + 1, 0);
         assert_eq!(Packet::parse(&b), Err(GreError::TooLong));
-        assert_eq!(decode_whole(&b), Err(GreError::TooLong));
-        assert_eq!(decode_bytewise(&b), Err(GreError::TooLong));
+        assert_eq!(collect(&b), Err(GreError::TooLong));
         b.pop();
         assert!(Packet::parse(&b).is_ok());
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&b), Ok(()));
-        assert_eq!(d.feed(&[1, 2, 3]), Err(GreError::TooLong));
-        assert_eq!(d.feed(&[]), Err(GreError::TooLong));
-        assert_eq!(d.buffered(), 0);
-
         // A bad header is reported before the length.
         let mut b = vec![0x00, 0x05];
         b.resize(MAX_PACKET + 10, 0);
@@ -1013,44 +866,35 @@ mod tests {
         }
     }
 
-    /// A deterministic pseudo-random generator for the fuzz loops.
-    struct Lcg(u64);
+    trait Samples {
+        fn maybe(&mut self) -> Option<u32>;
+    }
 
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: usize) -> usize {
-            self.next() as usize % n.max(1)
-        }
-        fn bytes(&mut self, n: usize) -> Vec<u8> {
-            (0..n).map(|_| self.next() as u8).collect()
-        }
+    impl Samples for Lcg {
         fn maybe(&mut self) -> Option<u32> {
-            (self.below(2) == 0).then(|| self.next())
+            (!self.coin()).then(|| self.next() as u32)
         }
     }
 
     /// A random packet the writer accepts.
     fn random_packet(rng: &mut Lcg) -> Packet {
-        if rng.below(3) == 0 {
+        if rng.index(3) == 0 {
             // PPTP carries a sequence number exactly when it carries data.
             let sequence = rng.maybe();
-            let n = if sequence.is_some() { rng.below(47) + 1 } else { 0 };
+            let n = if sequence.is_some() { rng.index(47) + 1 } else { 0 };
             let header = pptp(rng.next() as u16, sequence, rng.maybe());
-            return Packet { header, payload: rng.bytes(n) };
+            return Packet { header, payload: { let mut bytes = vec![0; n]; rng.fill(&mut bytes); bytes } };
         }
         let protocols = [protocol::IPV4, protocol::IPV6, protocol::TRANSPARENT_ETHERNET_BRIDGING, rng.next() as u16];
-        let proto = protocols[rng.below(protocols.len())];
-        let header = gre(proto, rng.below(2) == 0, rng.maybe(), rng.maybe());
-        let n = rng.below(48);
-        Packet { header, payload: rng.bytes(n) }
+        let proto = protocols[rng.index(protocols.len())];
+        let header = gre(proto, !rng.coin(), rng.maybe(), rng.maybe());
+        let n = rng.index(48);
+        Packet { header, payload: { let mut bytes = vec![0; n]; rng.fill(&mut bytes); bytes } }
     }
 
     #[test]
     fn fuzz_round_trips() {
-        let mut rng = Lcg(0x6e2e);
+        let mut rng = Lcg::new(0x6e2e);
         for _ in 0..3_000 {
             let p = random_packet(&mut rng);
             let b = p.to_bytes().unwrap();
@@ -1060,45 +904,23 @@ mod tests {
 
     #[test]
     fn fuzz_mutated_packets() {
-        let mut rng = Lcg(0xc0de);
+        let mut rng = Lcg::new(0xc0de);
         for _ in 0..4_000 {
             let mut b = random_packet(&mut rng).to_bytes().unwrap();
-            for _ in 0..rng.below(3) + 1 {
-                match rng.below(4) {
-                    0 if !b.is_empty() => {
-                        let at = rng.below(b.len().min(20));
-                        b[at] ^= 1 << rng.below(8);
-                    }
-                    1 if !b.is_empty() => {
-                        let n = rng.below(b.len());
-                        b.truncate(n);
-                    }
-                    2 => {
-                        let n = rng.below(8);
-                        let extra = rng.bytes(n);
-                        b.extend_from_slice(&extra);
-                    }
-                    _ => {
-                        if b.len() > 6 {
-                            let at = rng.below(6);
-                            b[at] = rng.next() as u8;
-                        }
-                    }
-                }
-            }
+            mutate(&mut rng, &mut b);
             let _ = check(&b);
         }
     }
 
     #[test]
     fn fuzz_random_bytes() {
-        let mut rng = Lcg(47);
+        let mut rng = Lcg::new(47);
         for _ in 0..4_000 {
-            let n = rng.below(40);
+            let n = rng.index(40);
             let mut b = rng.bytes(n);
             // Most random first bytes are refused at once; aim some at
             // valid flags and versions.
-            if b.len() >= 4 && rng.below(2) == 0 {
+            if b.len() >= 4 && !rng.coin() {
                 b[0] &= 0xb0;
                 b[1] &= 0x81;
                 if b[1] & 1 == 1 {

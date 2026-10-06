@@ -4,7 +4,7 @@ use core::fmt::Debug;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use fictionet::stdlib::codec::{
-    Collect, CollectError, Decode, Fail, Stream, Wire, contract, finish, pump, test_support::chunks,
+    Collect, CollectError, Decode, Fail, Stream, Wire, contract, test_support::decode_all,
 };
 use fictionet::stdlib::{geneve, gre, igmp, ipsec, ospf, pim, rip, vrrp};
 
@@ -18,33 +18,29 @@ where
     let bytes = Wire::to_bytes(value).unwrap();
     assert!(bytes.len() <= limit);
     contract::check_wire::<M>(&bytes);
-    contract::check_decode(|| Collect::<M>::new(limit), &bytes);
-    for pattern in [&[][..], &[1][..], &[3, 1, 17][..]] {
-        let mut stream = Stream::new(Collect::<M>::new(limit));
-        for part in chunks(&bytes, pattern) {
-            assert_eq!(
-                pump(&mut stream, part, |_| panic!("item before EOF")),
-                Ok(part.len())
-            );
-            assert!(stream.buffered() <= limit);
-            assert_eq!(stream.held(), 0);
-        }
-        stream.end();
-        let (decoded, span) = stream.next_span().unwrap().unwrap();
-        assert_eq!(&decoded, value);
-        assert_eq!(span, 0..bytes.len() as u64);
-        let mut out = vec![0xa5];
-        Wire::write(&decoded, &mut out).unwrap();
-        assert_eq!(out.first(), Some(&0xa5));
-        assert_eq!(M::parse(out.get(1..).unwrap()).as_ref(), Ok(value));
-        assert_eq!(stream.next(), None);
-        assert!(stream.is_done());
-        assert_eq!(stream.failed(), None);
-    }
+    contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), &bytes, 2 * (limit + 1));
+
+    let mut stream = Stream::new(Collect::<M>::new(limit));
+    assert_eq!(stream.push(&bytes), bytes.len());
+    assert!(stream.next().is_none());
+    assert!(stream.buffered() <= limit);
+    assert_eq!(stream.held(), 0);
+    stream.end();
+    let (decoded, span) = stream.next_span().unwrap().unwrap();
+    assert_eq!(&decoded, value);
+    assert_eq!(span, 0..bytes.len() as u64);
+    let mut out = vec![0xa5];
+    Wire::write(&decoded, &mut out).unwrap();
+    assert_eq!(out.first(), Some(&0xa5));
+    assert_eq!(M::parse(out.get(1..).unwrap()).as_ref(), Ok(value));
+    assert_eq!(stream.next(), None);
+    assert!(stream.is_done());
+    assert_eq!(stream.failed(), None);
+
     // The collection's configured limit fails before EOF, once.
     if !bytes.is_empty() {
         let small = bytes.len() - 1;
-        contract::check_decode(|| Collect::<M>::new(small), &bytes);
+        contract::check_decode_with_alloc_limit(|| Collect::<M>::new(small), &bytes, 2 * (small + 1));
         let mut stream = Stream::new(Collect::<M>::new(small));
         assert_eq!(stream.push(&bytes), bytes.len());
         let error = Fail::Protocol(CollectError::TooLong { limit: small });
@@ -61,14 +57,10 @@ where
     M::ParseError: Clone + Debug + PartialEq,
 {
     let expected = M::parse(bytes).unwrap_err();
-    contract::check_decode(|| Collect::<M>::new(limit), bytes);
+    contract::check_decode_with_alloc_limit(|| Collect::<M>::new(limit), bytes, 2 * (limit + 1));
     let mut stream = Stream::new(Collect::<M>::new(limit));
-    for part in chunks(bytes, &[1]) {
-        assert_eq!(
-            pump(&mut stream, part, |_| panic!("item before EOF")),
-            Ok(part.len())
-        );
-    }
+    assert_eq!(stream.push(bytes), bytes.len());
+    assert!(stream.next().is_none());
     stream.end();
     let error = Fail::Protocol(CollectError::Parse(expected));
     assert_eq!(stream.next(), Some(Err(error.clone())));
@@ -100,6 +92,9 @@ fn geneve_datagram() {
         payload: vec![0x45, 0, 0, 20],
     };
     round_trip(&packet, geneve::MAX_DATAGRAM);
+    let mut header = round_trip(&packet.header, geneve::MAX_HEADER_LEN);
+    header.push(0);
+    parse_failure::<geneve::Header>(&header, geneve::MAX_HEADER_LEN);
     parse_failure::<geneve::Packet>(&[], geneve::MAX_DATAGRAM);
     let mut bad = packet;
     bad.header.vni = geneve::MAX_VNI + 1;
@@ -128,14 +123,10 @@ fn gre_packets_and_exact_pptp_boundary() {
     };
     let mut padded = round_trip(&pptp, gre::MAX_PACKET);
     padded.extend_from_slice(&[0, 0]);
-    assert_eq!(gre::Packet::parse(&padded), Ok(pptp.clone()));
     assert_eq!(
         <gre::Packet as Wire>::parse(&padded),
-        Err(gre::ParseError::Trailing { remaining: 2 })
+        Err(gre::GreError::Trailing { remaining: 2 })
     );
-    let mut legacy = gre::Decoder::new();
-    legacy.feed(&padded).unwrap();
-    assert_eq!(legacy.finish(), Ok(pptp.clone()));
     parse_failure::<gre::Packet>(&padded, gre::MAX_PACKET);
     parse_failure::<gre::Packet>(&[], gre::MAX_PACKET);
     refused(&gre::Packet {
@@ -155,6 +146,8 @@ fn igmp_checksum(bytes: &mut [u8]) {
 
 #[test]
 fn igmp_versions_auxiliary_data_and_exact_boundary() {
+    round_trip(&igmp::Code(992), 1);
+    refused(&igmp::Code(1000));
     let group = Ipv4Addr::new(239, 1, 2, 3);
     let messages = [
         igmp::Message::Query {
@@ -188,10 +181,9 @@ fn igmp_versions_auxiliary_data_and_exact_boundary() {
         }
         padded.extend_from_slice(&[0, 0, 0, 0]);
         igmp_checksum(&mut padded);
-        assert_eq!(igmp::Message::parse(&padded).as_ref(), Ok(message));
         assert_eq!(
             <igmp::Message as Wire>::parse(&padded),
-            Err(igmp::ParseError::Trailing { remaining: 4 })
+            Err(igmp::IgmpError::Trailing { remaining: 4 })
         );
         parse_failure::<igmp::Message>(&padded, igmp::MAX_MESSAGE);
     }
@@ -205,9 +197,10 @@ fn igmp_versions_auxiliary_data_and_exact_boundary() {
         Ok(report)
     );
     contract::check_wire::<igmp::Message>(&auxiliary);
-    contract::check_decode(
+    contract::check_decode_with_alloc_limit(
         || Collect::<igmp::Message>::new(igmp::MAX_MESSAGE),
         &auxiliary,
+        2 * (igmp::MAX_MESSAGE + 1),
     );
     parse_failure::<igmp::Message>(&[], igmp::MAX_MESSAGE);
     refused(&igmp::Message::Query {
@@ -229,6 +222,11 @@ fn ipsec_carriers() {
         payload: vec![0x45, 0, 0, 20],
     };
     round_trip(&ah, ipsec::MAX_PACKET);
+    let mut header = round_trip(&ah.header, ipsec::MAX_AH_LEN);
+    header.push(0);
+    parse_failure::<ipsec::AhHeader>(&header, ipsec::MAX_AH_LEN);
+    let plain = ipsec::Plaintext::padded(vec![1, 2, 3], 4, 8).unwrap();
+    round_trip(&plain, ipsec::MAX_PACKET);
     for datagram in [
         ipsec::Datagram::Keepalive,
         ipsec::Datagram::Ike(vec![1, 2]),
@@ -273,14 +271,14 @@ fn rip_and_ripng_messages() {
     };
     let bytes = round_trip(&received, rip::MAX_MESSAGE);
     assert_eq!(bytes.len(), rip::MAX_MESSAGE);
-    assert_eq!(received.to_bytes(), Err(rip::RipError::TooManyEntries));
+    assert_eq!(received.to_bytes().unwrap(), bytes);
     assert_eq!(rip::Message::parse(&bytes), Ok(received));
     round_trip(&rip::NgMessage::whole_table_request(), rip::MAX_NG_MESSAGE);
     let ng = rip::NgMessage {
         command: rip::Command::Response,
         entries: rip::NgEntries::Entries(vec![rip::NgEntry::NextHop(Ipv6Addr::LOCALHOST)]),
     };
-    refused(&ng); // The old parser normalizes this next hop to ::.
+    refused(&ng); // The parser normalizes this next hop to ::.
     parse_failure::<rip::Message>(&[], rip::MAX_MESSAGE);
     parse_failure::<rip::NgMessage>(&[], rip::MAX_NG_MESSAGE);
 }
@@ -298,18 +296,10 @@ where
     assert_eq!(round_trip(&raw, limit), bytes);
     let make =
         || Collect::<D>::new(limit).map(|datagram| parse(&Wire::to_bytes(&datagram).unwrap()));
-    contract::check_stack(make, bytes);
-    for pattern in [&[][..], &[1][..], &[5, 2, 31][..]] {
-        let mut stream = Stream::new(make());
-        for part in chunks(bytes, pattern) {
-            pump(&mut stream, part, |_| panic!("item before EOF")).unwrap();
-        }
-        let mut items = Vec::new();
-        finish(&mut stream, |item| items.push(item)).unwrap();
-        assert_eq!(items, vec![parse(bytes)]);
-        assert!(stream.failed().is_none());
-        assert_eq!(stream.next(), None);
-    }
+    contract::check_decode_with_alloc_limit(make, bytes, 2 * (limit + 1));
+    let (items, failure) = decode_all(make, bytes);
+    assert_eq!(items, vec![parse(bytes)]);
+    assert_eq!(failure, None);
 }
 
 #[test]
@@ -342,7 +332,7 @@ fn ospf_context_stays_in_the_mapping() {
                 advertising_router: Ipv4Addr::new(192, 0, 2, 3),
             }]),
         };
-        let mut bytes = packet.to_bytes(&endpoints).unwrap();
+        let mut bytes = packet.frame(&endpoints).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(ospf::Packet::parse(&bytes, &endpoints), Ok(packet));
         context_round_trip::<ospf::Datagram, _, _>(&bytes, ospf::MAX_MESSAGE, |b| {
             ospf::Packet::parse(b, &endpoints)
@@ -378,7 +368,7 @@ fn pim_context_stays_in_the_mapping() {
     ];
     for endpoints in endpoints {
         let message = pim::Message::Hello(vec![pim::HelloOption::Holdtime(105)]);
-        let mut bytes = message.to_bytes(&endpoints).unwrap();
+        let mut bytes = message.frame(&endpoints).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(pim::Message::parse(&bytes, &endpoints), Ok(message));
         context_round_trip::<pim::Datagram, _, _>(&bytes, pim::MAX_MESSAGE, |b| {
             pim::Message::parse(b, &endpoints)
@@ -441,7 +431,7 @@ fn vrrp_context_stays_in_the_mapping() {
         ),
     ];
     for (endpoints, advertisement) in cases {
-        let mut bytes = advertisement.to_bytes(&endpoints).unwrap();
+        let mut bytes = advertisement.frame(&endpoints).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(
             vrrp::Advertisement::parse(&bytes, &endpoints),
             Ok(advertisement)
@@ -471,14 +461,8 @@ fn vrrp_context_stays_in_the_mapping() {
 }
 
 #[test]
-fn legacy_collectors_keep_early_and_repeated_errors() {
-    let mut geneve = geneve::Decoder::new();
-    assert_eq!(geneve.feed(&[0x40]), Err(geneve::GeneveError::Version(1)));
-    assert_eq!(geneve.feed(&[]), Err(geneve::GeneveError::Version(1)));
-    let mut igmp = igmp::Decoder::new();
-    assert_eq!(igmp.feed(&[0xff]), Err(igmp::IgmpError::UnknownType(0xff)));
-    assert_eq!(igmp.finish(), Err(igmp::IgmpError::UnknownType(0xff)));
-    let mut ipsec = ipsec::Decoder::new(ipsec::Kind::Esp);
-    assert_eq!(ipsec.feed(&[0; 4]), Err(ipsec::IpsecError::ZeroSpi));
-    assert_eq!(ipsec.kind(), ipsec::Kind::Esp);
+fn streams_report_header_errors_once() {
+    parse_failure::<geneve::Packet>(&[0x40], geneve::MAX_DATAGRAM);
+    parse_failure::<igmp::Message>(&[0xff], igmp::MAX_MESSAGE);
+    parse_failure::<ipsec::EspPacket>(&[0; 4], ipsec::MAX_PACKET);
 }

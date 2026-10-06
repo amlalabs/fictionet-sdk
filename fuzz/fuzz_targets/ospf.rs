@@ -6,13 +6,13 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::ospf::{
-    ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body, DatabaseDescription, Decoder,
+    ALL_SPF_ROUTERS_V4, ALL_SPF_ROUTERS_V6, AsExternalLsa, AsExternalLsaV3, Auth, Body, DatabaseDescription,
     Endpoints, ExternalRoute, Header, HelloV2, HelloV3, InterAreaPrefixLsa, InterAreaRouterLsa, IntraAreaPrefixLsa,
     LSA_HEADER_LEN, LinkLsa, Lsa, LsaBody, LsaHeader, LsaKey, MAX_LSA, MAX_MESSAGE, MAX_PACKET, NetworkLsa,
     NetworkLsaV3, OPTION_L_V2, OPTION_L_V3, OspfError, Packet, Prefix, RouterInterface, RouterLink, RouterLsa,
     RouterLsaV3, SummaryLsa, TosMetric, Version, checksum, lsa_checksum, lsa_type_v2, lsa_type_v3,
 };
-use fictionet::stdlib::{codec::{Collect, Decode, contract}, ospf};
+use fictionet::stdlib::{codec::{Wire, Collect, Decode, contract}, ospf};
 use libfuzzer_sys::fuzz_target;
 
 fn ends() -> [Endpoints; 2] {
@@ -23,11 +23,12 @@ fn ends() -> [Endpoints; 2] {
 }
 
 fn check(data: &[u8], e: &Endpoints) {
-    contract::check_decode(|| Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE), data);
-    contract::check_decode(
+    contract::check_decode_with_alloc_limit(|| Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE), data, 2 * (ospf::MAX_MESSAGE + 1));
+    contract::check_decode_with_alloc_limit(
         || Collect::<ospf::Datagram>::new(ospf::MAX_MESSAGE)
             .map(|datagram| Packet::parse(&datagram.0, e)),
         data,
+        2 * (ospf::MAX_MESSAGE + 1),
     );
     contract::check_wire::<ospf::Datagram>(data);
     contract::check_wire_value(&ospf::Datagram(
@@ -36,34 +37,24 @@ fn check(data: &[u8], e: &Endpoints) {
 
     let parsed = Packet::parse(data, e);
 
-    // The packet, fed two ways: all at once, and a byte at a time.
-    let mut whole = Decoder::new(*e);
-    let _ = whole.feed(data);
-    assert!(whole.buffered() <= MAX_MESSAGE + 1);
-    assert_eq!(whole.finish(), parsed);
-    let mut bytewise = Decoder::new(*e);
-    for b in data {
-        let _ = bytewise.feed(std::slice::from_ref(b));
-    }
-    assert!(bytewise.buffered() <= MAX_MESSAGE + 1);
-    assert_eq!(bytewise.finish(), parsed);
-
     if let Ok(p) = &parsed {
         // A packet read can be written, and reads back the same. LSAs an
         // update drops and a signaling block with a wrong checksum make it
         // shorter.
-        let bytes = p.to_bytes(e).unwrap();
+        let bytes = p.frame(e).and_then(|frame| frame.to_bytes()).unwrap();
         assert!(bytes.len() <= data.len());
         assert_eq!(Packet::parse(&bytes, e).as_ref(), Ok(p));
     }
 }
 
 fn check_lsa(data: &[u8], v: Version) {
+    contract::check_wire::<ospf::LsaFrame>(data);
+    contract::check_wire::<ospf::LsaBodyFrame>(data);
     if let Ok((lsa, n)) = Lsa::parse(data, v) {
         // An LSA read writes back to the same bytes, so its header is the
         // one received (RFC 2328 sections 13.1 and 13.7).
         assert!(n <= data.len());
-        let bytes = lsa.to_bytes(v).unwrap();
+        let bytes = lsa.frame(v).and_then(|frame| frame.to_bytes()).unwrap();
         assert_eq!(bytes, data[..n]);
         let h = lsa.header(v).unwrap();
         assert_eq!((h.checksum, usize::from(h.length)), (u16::from_be_bytes([data[16], data[17]]), n));
@@ -77,7 +68,7 @@ fn check_lsa(data: &[u8], v: Version) {
             Version::V3 => u16::from_be_bytes([data[2], data[3]]),
         };
         match LsaBody::parse(body, v, t) {
-            Ok(b) => assert_eq!(b.to_bytes(v, t).as_deref(), Ok(body)),
+            Ok(b) => assert_eq!(b.frame(v, t).and_then(|frame| frame.to_bytes()).as_deref(), Ok(body)),
             Err(e) => assert!(body.len() <= MAX_LSA - LSA_HEADER_LEN || e == OspfError::TooLong),
         }
     }
@@ -335,13 +326,13 @@ fn built(data: &[u8]) -> Result<()> {
     for e in &ends() {
         let v = if u.ratio(1, 8)? { Version::V2 } else { e.version() };
         let p = packet(&mut u, v)?;
-        if let Ok(bytes) = p.to_bytes(e) {
+        if let Ok(bytes) = p.frame(e).and_then(|frame| frame.to_bytes()) {
             assert!(bytes.len() <= MAX_MESSAGE);
             assert!(usize::from(u16::from_be_bytes([bytes[2], bytes[3]])) <= MAX_PACKET);
             assert_eq!(Packet::parse(&bytes, e).as_ref(), Ok(&p));
         }
         let l = lsa(&mut u, e.version())?;
-        if let Ok(bytes) = l.to_bytes(e.version()) {
+        if let Ok(bytes) = l.frame(e.version()).and_then(|frame| frame.to_bytes()) {
             let n = bytes.len();
             assert_eq!(Lsa::parse(&bytes, e.version()), Ok((l, n)));
         }
