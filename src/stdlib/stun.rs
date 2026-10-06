@@ -19,8 +19,8 @@
 //! Nothing here reads a socket. A world that plays a STUN server takes each
 //! UDP datagram it receives, reads it with [`Message::parse`], passes it and
 //! the datagram's source address to [`answer_binding`], and sends the
-//! reply's bytes back. Over TCP, [`Frames`] and [`codec::Stream`] split the
-//! byte stream into messages. Use [`codec::Stream::with_next`] for each
+//! reply's bytes back. Over TCP, [`Stream<Frames>`](super::codec::Stream)
+//! splits the byte stream into messages. Use [`codec::Stream::with_next`] for each
 //! frame's exact bytes. Integrity values stay as raw bytes. World code
 //! computes HMACs over those original bytes, including their padding.
 //! [`codec::Wire::write`] uses zero padding and recomputes FINGERPRINT.
@@ -325,7 +325,7 @@ impl Attribute {
     // Each allocation is bounded by MAX_VALUE. Text uses the parser's
     // limit so every parsed message can be written without changing it.
     fn strict_value(&self, transaction: &[u8; 12]) -> Result<Vec<u8>, WriteError> {
-        let bad = WriteError::Attribute { typ: self.typ() };
+        let bad = WriteError::Unwritable { typ: self.typ() };
         match self {
             Attribute::MappedAddress(a) | Attribute::XorMappedAddress(a) | Attribute::AlternateServer(a) => {
                 if let SocketAddr::V6(a) = a
@@ -495,7 +495,7 @@ pub enum WriteError {
     /// codes, and nonzero IPv6 flow labels or scope IDs. It also includes
     /// known types stored in [`Attribute::Other`] and attributes the parser
     /// would ignore after an integrity attribute.
-    Attribute {
+    Unwritable {
         /// The attribute's type.
         typ: u16,
     },
@@ -507,8 +507,8 @@ impl core::fmt::Display for WriteError {
             Self::Method(method) => write!(f, "method {method:#06x} exceeds 12 bits"),
             Self::TooManyAttributes => write!(f, "more than {MAX_ATTRIBUTES} attributes"),
             Self::BodyTooLong => write!(f, "message body exceeds {MAX_BODY} bytes"),
-            Self::Attribute { typ } => {
-                write!(f, "attribute {typ:#06x} cannot be written unchanged")
+            Self::Unwritable { typ } => {
+                write!(f, "value cannot be written without changing it: attribute {typ:#06x}")
             }
         }
     }
@@ -720,11 +720,32 @@ impl codec::Wire for Message {
     type ParseError = ParseError;
     type WriteError = WriteError;
 
+    /// Reads one complete datagram. Short input returns [`ParseError::Truncated`];
+    /// extra bytes return [`ParseError::TrailingBytes`]. Invalid header bits,
+    /// body alignment, or cookie return [`ParseError::TopBits`], [`ParseError::Length`],
+    /// or [`ParseError::MagicCookie`]. Attribute bounds and values return
+    /// [`ParseError::AttributeTruncated`], [`ParseError::TooManyAttributes`],
+    /// [`ParseError::AttributeValue`], [`ParseError::Text`], or [`ParseError::ErrorCode`].
+    /// A misplaced or incorrect fingerprint returns [`ParseError::FingerprintNotLast`]
+    /// or [`ParseError::Fingerprint`].
+    ///
+    /// Unknown address families are skipped. After MESSAGE-INTEGRITY only
+    /// MESSAGE-INTEGRITY-SHA256 and FINGERPRINT remain; after SHA256 only
+    /// FINGERPRINT remains. Skipped attributes do not appear in the value.
     fn parse(bytes: &[u8]) -> Result<Self, Self::ParseError> {
         Message::parse(bytes)
     }
 
-    /// Appends a strict message. Errors leave `out` unchanged.
+    /// Appends a message with zero padding and a recomputed fingerprint.
+    /// A method over 12 bits returns [`WriteError::Method`]. Attribute count
+    /// and body size limits return [`WriteError::TooManyAttributes`] and
+    /// [`WriteError::BodyTooLong`]. Attributes that exceed their field limits,
+    /// alias another variant, lose IPv6 scope or flow information, or would
+    /// be ignored after integrity return [`WriteError::Unwritable`].
+    /// Errors leave `out` unchanged. Temporary buffers are bounded by
+    /// [`MAX_MESSAGE`] and [`MAX_VALUE`]. Integrity values remain raw bytes;
+    /// callers must compute them for the bytes they send. The caller bounds
+    /// `out` across repeated writes.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), WriteError> {
         if self.method > 0x0fff {
             return Err(WriteError::Method(self.method));
@@ -738,7 +759,7 @@ impl codec::Wire for Message {
         for attribute in &self.attributes {
             let typ = attribute.typ();
             if !integrity_keeps(&mut integrity, typ) {
-                return Err(WriteError::Attribute { typ });
+                return Err(WriteError::Unwritable { typ });
             }
             let value = attribute.strict_value(&self.transaction)?;
             let end = body
@@ -747,7 +768,7 @@ impl codec::Wire for Message {
                 .and_then(|n| n.checked_add(padded(value.len())))
                 .filter(|&n| n <= MAX_BODY - reserve)
                 .ok_or(WriteError::BodyTooLong)?;
-            let len = u16::try_from(value.len()).map_err(|_| WriteError::Attribute { typ })?;
+            let len = u16::try_from(value.len()).map_err(|_| WriteError::Unwritable { typ })?;
             body.extend_from_slice(&typ.to_be_bytes());
             body.extend_from_slice(&len.to_be_bytes());
             body.extend_from_slice(&value);
@@ -844,6 +865,10 @@ impl Decode for Frames {
         MAX_MESSAGE
     }
 
+    /// Reads one frame. Invalid header bits, body alignment, or cookie
+    /// return [`ParseError::TopBits`], [`ParseError::Length`], or
+    /// [`ParseError::MagicCookie`]. Partial input returns [`Step::Need`],
+    /// including at EOF. Attribute validation belongs to [`Message::parse`].
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Self::Item>, Self::Error> {
         let Some(total) = header(input)? else {
             return Ok(Step::Need);
@@ -1332,7 +1357,7 @@ mod tests {
         assert_eq!(d.buffered(), 0);
         assert!(d.failed().is_none());
         // A broken stream stays broken. The error is returned once, and
-        // the decoder drops what it is fed after it.
+        // the decoder drops bytes pushed after it.
         put(&mut d, &[0x00, 0x01, 0x00, 0x00, 1, 2, 3, 4]);
         assert_eq!(
             d.next().map(|r| r.map(|frame| Message::parse(&frame))),
@@ -1362,7 +1387,7 @@ mod tests {
         ] {
             let typ = attribute.typ();
             message.attributes = vec![attribute];
-            assert_write_error(&message, WriteError::Attribute { typ });
+            assert_write_error(&message, WriteError::Unwritable { typ });
         }
         message.fingerprint = true;
         message.attributes = vec![Attribute::Other { typ: 0x8099, value: vec![] }; MAX_ATTRIBUTES + 10];
@@ -1457,7 +1482,7 @@ mod tests {
         w.attributes.push(Attribute::Other { typ: 0x0008, value: vec![0; 20] });
         w.attributes.push(Attribute::Software("late".into()));
         w.fingerprint = true;
-        assert_eq!(w.to_bytes(), Err(WriteError::Attribute { typ: attr::SOFTWARE }));
+        assert_eq!(w.to_bytes(), Err(WriteError::Unwritable { typ: attr::SOFTWARE }));
     }
 
     // Sections 14.5 and 14.6: MESSAGE-INTEGRITY is 20 bytes;
@@ -1476,9 +1501,9 @@ mod tests {
         let mut w = Message::binding_request([0; 12]);
         w.attributes.push(Attribute::Other { typ: 0x0008, value: vec![0; 4] });
         w.attributes.push(Attribute::Other { typ: 0x001c, value: vec![0; 12] });
-        assert_eq!(w.to_bytes(), Err(WriteError::Attribute { typ: attr::MESSAGE_INTEGRITY }));
+        assert_eq!(w.to_bytes(), Err(WriteError::Unwritable { typ: attr::MESSAGE_INTEGRITY }));
         w.attributes.remove(0);
-        assert_eq!(w.to_bytes(), Err(WriteError::Attribute { typ: attr::MESSAGE_INTEGRITY_SHA256 }));
+        assert_eq!(w.to_bytes(), Err(WriteError::Unwritable { typ: attr::MESSAGE_INTEGRITY_SHA256 }));
     }
 
     // Section 14.6: after any MESSAGE-INTEGRITY-SHA256, only FINGERPRINT
@@ -1497,10 +1522,10 @@ mod tests {
         // The writer refuses a second SHA256 attribute.
         let mut w = m.clone();
         w.attributes.push(Attribute::Other { typ: 0x001c, value: vec![0xcc; 16] });
-        assert_eq!(w.to_bytes(), Err(WriteError::Attribute { typ: attr::MESSAGE_INTEGRITY_SHA256 }));
+        assert_eq!(w.to_bytes(), Err(WriteError::Unwritable { typ: attr::MESSAGE_INTEGRITY_SHA256 }));
     }
 
-    // A stream of many small messages fed at once is split in linear time:
+    // A stream of many small messages pushed at once is split in linear time:
     // taking one message out does not move the bytes after it.
     #[test]
     fn decoder_is_linear() {
@@ -1526,7 +1551,7 @@ mod tests {
         assert_eq!(count, n);
         assert_eq!(d.buffered(), 0);
         assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
-        // Interleaved feeds keep working once part of the buffer is read.
+        // Interleaved pushes keep working once part of the buffer is read.
         put(&mut d, &one[..5]);
         assert_eq!(d.next().map(|r| r.map(|frame| Message::parse(&frame))), None);
         assert_eq!(d.buffered(), 5);
@@ -1545,6 +1570,7 @@ mod tests {
     fn stream_is_bounded() {
         let one = Message::binding_request([1; 12]).to_bytes().unwrap();
         let bytes = one.repeat(100_000);
+        contract::check_decode_with_alloc_limit(|| Frames, &bytes, 2 * MAX_MESSAGE);
         let mut stream = Stream::new(Frames);
         let took = stream.push(&bytes);
         assert_eq!(took, MAX_MESSAGE);
@@ -1815,7 +1841,7 @@ mod tests {
             attributes.push(Attribute::Other { typ, value: vec![] });
         }
         for attribute in attributes {
-            let error = WriteError::Attribute { typ: attribute.typ() };
+            let error = WriteError::Unwritable { typ: attribute.typ() };
             let mut message = Message::binding_request([0; 12]);
             message.attributes = vec![Attribute::Software("valid prefix".into()), attribute];
             message.fingerprint = true;
@@ -1841,7 +1867,7 @@ mod tests {
             (sha256.clone(), sha1),
             (sha256.clone(), sha256),
         ] {
-            let error = WriteError::Attribute { typ: second.typ() };
+            let error = WriteError::Unwritable { typ: second.typ() };
             message.attributes = vec![first, second];
             assert_write_error(&message, error);
         }
@@ -1886,15 +1912,10 @@ mod tests {
 
     fn check_decoder(bytes: &[u8]) -> usize {
         contract::check_decode(|| Frames.map(|frame| Message::parse(&frame)), bytes);
-        let mut stream = Stream::new(Frames);
-        let mut count = 0;
-        let _ = codec::pump(&mut stream, bytes, |frame| {
-            if let Ok(message) = Message::parse(&frame) {
-                contract::check_wire_value(&message);
-                count += 1;
-            }
-        });
-        count
+        let (frames, _) = test_support::decode_all(|| Frames, bytes);
+        frames.iter().filter_map(|frame| Message::parse(frame).ok()).inspect(|message| {
+            contract::check_wire_value(message);
+        }).count()
     }
 
     #[test]
@@ -1904,8 +1925,12 @@ mod tests {
         let mut stream = Vec::new();
         let mut streamed = 0;
         for i in 0..4000 {
-            let len = (rng.next() % 200) as usize;
-            let mut b: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            // Start each stream group with a valid sample before mutated input.
+            if i % 16 == 0 {
+                stream.extend_from_slice(samples()[(i / 16) % 3]);
+            }
+            let mut b = rng.bytes(199);
+            let len = b.len();
             match i % 4 {
                 // Random bytes.
                 0 => {}
@@ -1919,12 +1944,12 @@ mod tests {
                     let mut at = HEADER_LEN;
                     while at + 4 <= msg.len() {
                         let room = msg.len() - at - 4;
-                        let len = (rng.next() as usize % (room + 1)).min(24);
+                        let len = (rng.index(room + 1)).min(24);
                         let known = [
                             0x0001, 0x0020, 0x0009, 0x000a, 0x8022, 0x0006, 0x8023, 0x8099, 0x0024, 0x0008,
                             0x001c,
                         ];
-                        let typ: u16 = known[rng.next() as usize % known.len()];
+                        let typ: u16 = known[rng.index(known.len())];
                         msg[at..at + 2].copy_from_slice(&typ.to_be_bytes());
                         msg[at + 2..at + 4].copy_from_slice(&(len as u16).to_be_bytes());
                         at += 4 + padded(len);
@@ -1940,11 +1965,10 @@ mod tests {
                 }
                 // A sample with a few bytes changed.
                 _ => {
-                    let s = samples()[rng.next() as usize % 3];
+                    let s = samples()[rng.index(3)];
                     b = s.to_vec();
-                    for _ in 0..1 + rng.next() % 3 {
-                        let at = rng.next() as usize % b.len();
-                        b[at] = rng.next() as u8;
+                    for _ in 0..1 + rng.below(3) {
+                        test_support::mutate(&mut rng, &mut b);
                     }
                 }
             }
@@ -1952,7 +1976,7 @@ mod tests {
                 parsed += 1;
             }
             check_round_trip(&b);
-            // The decoder gives the same messages fed whole, in pieces, or
+            // The decoder gives the same messages pushed whole, in pieces, or
             // a byte at a time, and over a stream of several messages.
             check_decoder(&b);
             // Random bytes would break most streams at once, so streams

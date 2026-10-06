@@ -7,7 +7,7 @@ use fictionet::stdlib::nfs::{
 };
 use fictionet::stdlib::onc_rpc::{Body, Message};
 use fictionet::stdlib::{
-    codec::{Assembled, Decode, Stream, Wire, contract, pump},
+    codec::{Assembled, Decode, Wire, contract, test_support::decode_all},
     onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;
@@ -71,15 +71,13 @@ fuzz_target!(|data: &[u8]| {
     // NFS arguments need a procedure; Wire belongs to the RPC envelope.
     contract::check_wire::<Message>(data);
     contract::check_wire::<onc_rpc::Record>(data);
-    let mut stream = Stream::new(onc_rpc::records(limit));
-    let mut records = Vec::new();
-    let _ = pump(&mut stream, data, |record| {
-        let Assembled::Message(bytes) = record;
-        records.push(bytes);
-    });
+    let (records, _) = decode_all(|| onc_rpc::records(limit), data);
 
     // Each record, and the bytes on their own as a UDP datagram.
-    for bytes in records.iter().map(Vec::as_slice).chain([data]) {
+    for bytes in records.iter().map(|record| match record {
+        Assembled::Message(bytes) => bytes.as_slice(),
+        Assembled::Whole(never) => match *never {},
+    }).chain([data]) {
         contract::check_wire::<Message>(bytes);
         let Ok(Message { xid, body: Body::Call(call) }) = <Message as Wire>::parse(bytes) else { continue };
         // A request read makes the same call again.

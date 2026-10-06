@@ -21,7 +21,7 @@
 //!
 //! For TCP, [`onc_rpc::messages`](super::onc_rpc::messages) combines record
 //! marking, bounded assembly, and RPC parsing. Read NFS arguments with a
-//! closure. Procedure numbers remain ordinary arguments, outside [`Wire`](super::codec::Wire):
+//! closure that passes the call's procedure number:
 //!
 //! ```
 //! use fictionet::stdlib::{codec::{Decode, Stream}, nfs, onc_rpc};
@@ -43,8 +43,6 @@
 //! File handles, names, paths, data, and lists have explicit limits.
 //! Writers return an error when a value exceeds those limits or would
 //! parse differently. They preserve counts, optional fields, and EOF flags.
-//! Argument and result writers require a procedure, so they stay outside
-//! [`Wire`](super::codec::Wire).
 //!
 //! File names and paths are bytes, not text: RFC 1813 sets no character
 //! set for them, and servers such as Linux's take any bytes but NUL and
@@ -124,18 +122,15 @@ pub const MAX_DIR_ENTRIES: usize = 1 << 16;
 /// The most bytes the entries of one READDIR or READDIRPLUS result take,
 /// each with the word before it that says an entry follows. A client asks
 /// for at most a count of bytes in all, and Linux servers answer at most
-/// 1 MiB. A writer stops before this and writes `eof` as false; a reader
-/// refuses a longer list.
+/// 1 MiB. Readers and writers refuse a longer list.
 pub const MAX_DIR_BYTES: usize = 1 << 20;
 /// The most authentication flavors one MNT result lists.
 pub const MAX_AUTH_FLAVORS: usize = 16;
 /// The most exports one EXPORT result lists.
 pub const MAX_EXPORTS: usize = 1024;
-/// The most bytes in one EXPORT result. A writer leaves out the exports
-/// that would go past it, so the reply fits in one record of
-/// [`MAX_RECORD`](super::onc_rpc::MAX_RECORD) bytes, and a reader refuses
-/// a longer result. Without it, the longest paths and group lists would
-/// make results of about 70 MB.
+/// The most bytes in one EXPORT result. Readers and writers refuse a
+/// longer result. Without this limit, the longest paths and group lists
+/// would make results of about 70 MB.
 pub const MAX_EXPORT_BYTES: usize = 1 << 20;
 /// The most groups one export lists.
 pub const MAX_GROUPS: usize = 256;
@@ -272,8 +267,8 @@ pub enum NfsError {
     BadType,
     /// The server is busy; the client should try again later (10008).
     Jukebox,
-    /// Any other nonzero code. A code that has its own variant writes the
-    /// same, but reads back as that variant.
+    /// Any other nonzero code. A code with a named variant makes the
+    /// result unwritable because it would read back as that variant.
     Other(NonZeroU32),
 }
 
@@ -944,15 +939,13 @@ pub enum Request {
         file: FileHandle,
         /// Where to start.
         offset: u64,
-        /// How many bytes to write. A reader refuses a call where it is
-        /// not the data's length, as Linux servers do, and a writer
-        /// writes the length of the data it writes in its place.
+        /// How many bytes to write. Readers and writers refuse a count
+        /// that differs from the data length.
         count: u32,
         /// How the server must store it before it answers.
         stable: StableHow,
-        /// The data, at most [`MAX_DATA`] bytes. A writer writes only the
-        /// first [`MAX_DATA`], a shorter write that the server's count
-        /// of bytes written then reports.
+        /// The data, at most [`MAX_DATA`] bytes. More data makes the
+        /// request unwritable.
         data: Vec<u8>,
     },
     /// Procedure 8: make a regular file.
@@ -1156,7 +1149,9 @@ impl Request {
     }
 
     /// The call's arguments, which [`Request::read`] always reads back.
-    /// Invalid handles, names, paths, counts, and data return an error.
+    /// Handles, names, or paths over their limits return [`XdrError::TooLong`].
+    /// WRITE data above [`MAX_DATA`], a count that differs from the data
+    /// length, or any field that would read differently returns [`XdrError::Unwritable`].
     pub fn to_args(&self) -> Result<Vec<u8>, XdrError> {
         let w = &mut Writer::new();
         match self {
@@ -1182,7 +1177,7 @@ impl Request {
             }
             Request::Write { file, offset, count, stable, data } => {
                 if data.len() > MAX_DATA || usize::try_from(*count).ok() != Some(data.len()) {
-                    return Err(XdrError::NonCanonical);
+                    return Err(XdrError::Unwritable);
                 }
                 file.write(w);
                 w.uhyper(*offset).uint(*count);
@@ -1223,11 +1218,7 @@ impl Request {
                 w.uhyper(*cookie).opaque_fixed(cookieverf).uint(*dircount).uint(*maxcount);
             }
         }
-        let bytes = std::mem::take(w).finish()?;
-        if Self::read(self.procedure(), &bytes).as_ref() != Ok(self) {
-            return Err(XdrError::NonCanonical);
-        }
-        Ok(bytes)
+        std::mem::take(w).finish_value(self, |bytes| Self::read(self.procedure(), bytes))
     }
 
     /// A call message that makes this request, with AUTH_NONE. A world
@@ -1277,15 +1268,13 @@ pub struct ReadLinkOk {
 pub struct ReadOk {
     /// The file's attributes.
     pub attributes: Option<Fattr>,
-    /// How many bytes were read. A reader refuses results where it is not
-    /// the data's length, as Linux clients do, and a writer writes the
-    /// length of the data it writes in its place.
+    /// How many bytes were read. Readers and writers refuse a count
+    /// that differs from the data length.
     pub count: u32,
-    /// Whether the read reached the end of the file. A writer that cuts
-    /// the data writes it as false.
+    /// Whether the read reached the end of the file. The writer preserves it.
     pub eof: bool,
-    /// The data, at most [`MAX_DATA`] bytes. A writer writes only the
-    /// first [`MAX_DATA`], a short read the client goes on from.
+    /// The data, at most [`MAX_DATA`] bytes. More data makes the result
+    /// unwritable.
     pub data: Vec<u8>,
 }
 
@@ -1306,8 +1295,8 @@ pub struct WriteOk {
 /// The results of a successful CREATE, MKDIR, SYMLINK or MKNOD.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CreateOk {
-    /// The new object's handle, if the server gives it. A writer leaves
-    /// out one longer than [`MAX_FH`].
+    /// The new object's handle, if the server gives it. A handle longer
+    /// than [`MAX_FH`] makes the result unwritable.
     pub object: Option<FileHandle>,
     /// The new object's attributes.
     pub attributes: Option<Fattr>,
@@ -1338,8 +1327,8 @@ pub struct LinkWcc {
 pub struct Entry {
     /// The file's number within the file system.
     pub fileid: u64,
-    /// The name, at most [`MAX_NAME`] bytes. A writer leaves out an entry
-    /// with a longer one.
+    /// The name, at most [`MAX_NAME`] bytes. A longer name makes the
+    /// result unwritable.
     pub name: Vec<u8>,
     /// Where a later READDIR goes on from after this entry.
     pub cookie: u64,
@@ -1352,9 +1341,8 @@ pub struct ReadDirOk {
     pub attributes: Option<Fattr>,
     /// The verifier to send with the next READDIR.
     pub cookieverf: [u8; VERIFIER_LEN],
-    /// The names, at most [`MAX_DIR_ENTRIES`] and [`MAX_DIR_BYTES`]. A
-    /// writer leaves out the rest and writes `eof` as false, so the client
-    /// asks again from the last cookie written.
+    /// The names, at most [`MAX_DIR_ENTRIES`] and [`MAX_DIR_BYTES`].
+    /// A longer list makes the result unwritable.
     pub entries: Vec<Entry>,
     /// Whether the list reaches the end of the directory.
     pub eof: bool,
@@ -1366,15 +1354,15 @@ pub struct ReadDirOk {
 pub struct EntryPlus {
     /// The file's number within the file system.
     pub fileid: u64,
-    /// The name, at most [`MAX_NAME`] bytes. A writer leaves out an entry
-    /// with a longer one.
+    /// The name, at most [`MAX_NAME`] bytes. A longer name makes the
+    /// result unwritable.
     pub name: Vec<u8>,
     /// Where a later READDIRPLUS goes on from after this entry.
     pub cookie: u64,
     /// The file's attributes.
     pub attributes: Option<Fattr>,
-    /// The file's handle. A writer leaves out one longer than
-    /// [`MAX_FH`].
+    /// The file's handle. A handle longer than [`MAX_FH`] makes the
+    /// result unwritable.
     pub handle: Option<FileHandle>,
 }
 
@@ -1385,9 +1373,8 @@ pub struct ReadDirPlusOk {
     pub attributes: Option<Fattr>,
     /// The verifier to send with the next READDIRPLUS.
     pub cookieverf: [u8; VERIFIER_LEN],
-    /// The entries, at most [`MAX_DIR_ENTRIES`] and [`MAX_DIR_BYTES`]. A
-    /// writer leaves out the rest and writes `eof` as false, as for
-    /// [`ReadDirOk`].
+    /// The entries, at most [`MAX_DIR_ENTRIES`] and [`MAX_DIR_BYTES`].
+    /// A longer list makes the result unwritable.
     pub entries: Vec<EntryPlus>,
     /// Whether the list reaches the end of the directory.
     pub eof: bool,
@@ -1742,8 +1729,9 @@ impl Response {
     }
 
     /// The results in XDR, which [`Response::parse`] always reads back.
-    /// Invalid fields and oversized lists return an error. Counts and
-    /// EOF flags must match the value the parser would return.
+    /// Fields or lists over their limits return [`XdrError::TooLong`].
+    /// Counts that differ from the data length or enum variants that read
+    /// differently return [`XdrError::Unwritable`]. EOF flags are preserved.
     pub fn to_results(&self) -> Result<Vec<u8>, XdrError> {
         let w = &mut Writer::new();
         match self {
@@ -1915,11 +1903,7 @@ impl Response {
                 |w, d| d.write(w),
             ),
         }
-        let bytes = std::mem::take(w).finish()?;
-        if Self::parse(self.procedure(), &bytes).as_ref() != Ok(self) {
-            return Err(XdrError::NonCanonical);
-        }
-        Ok(bytes)
+        std::mem::take(w).finish_value(self, |bytes| Self::parse(self.procedure(), bytes))
     }
 
     /// An RPC reply that carries these results, with an AUTH_NONE
@@ -1950,8 +1934,8 @@ pub enum MountError {
     NotSupp,
     /// The server failed in a way no other code covers (10006).
     ServerFault,
-    /// Any other nonzero code. A code that has its own variant writes the
-    /// same, but reads back as that variant.
+    /// Any other nonzero code. A code with a named variant makes the
+    /// result unwritable because it would read back as that variant.
     Other(NonZeroU32),
 }
 
@@ -2015,8 +1999,8 @@ pub enum MountRequest {
     /// Procedure 0: do nothing.
     Null,
     /// Procedure 1: get the handle of an exported directory, by its path
-    /// on the server, at most [`MAX_PATH`] bytes. A longer one is written
-    /// empty.
+    /// on the server, at most [`MAX_PATH`] bytes. A longer path makes the
+    /// request unwritable.
     Mnt(Vec<u8>),
     /// Procedure 2: list which hosts have mounted what.
     Dump,
@@ -2073,17 +2057,13 @@ impl MountRequest {
         }
     }
 
-    /// The call's arguments. Paths above [`MAX_PATH`] return an error.
+    /// The call's arguments. Paths above [`MAX_PATH`] return [`XdrError::TooLong`].
     pub fn to_args(&self) -> Result<Vec<u8>, XdrError> {
         let mut w = Writer::new();
         if let MountRequest::Mnt(path) | MountRequest::Umnt(path) = self {
             write_opaque(&mut w, path, MAX_PATH);
         }
-        let bytes = w.finish()?;
-        if Self::read(self.procedure(), &bytes).as_ref() != Ok(self) {
-            return Err(XdrError::NonCanonical);
-        }
-        Ok(bytes)
+        w.finish_value(self, |bytes| Self::read(self.procedure(), bytes))
     }
 
     /// A call message that makes this request, with AUTH_NONE.
@@ -2108,24 +2088,24 @@ pub struct Mounted {
 /// One mount in a DUMP result (mountbody).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MountEntry {
-    /// The client's host name, at most [`MAX_MOUNT_NAME`] bytes. A writer
-    /// leaves out an entry with a longer one.
+    /// The client's host name, at most [`MAX_MOUNT_NAME`] bytes.
+    /// A longer name makes the result unwritable.
     pub hostname: String,
-    /// The path it mounted, at most [`MAX_PATH`] bytes. A writer leaves
-    /// out an entry with a longer one.
+    /// The path it mounted, at most [`MAX_PATH`] bytes.
+    /// A longer path makes the result unwritable.
     pub directory: Vec<u8>,
 }
 
 /// One exported directory in an EXPORT result (exportnode).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ExportEntry {
-    /// The path, at most [`MAX_PATH`] bytes. A writer leaves out an export
-    /// with a longer one.
+    /// The path, at most [`MAX_PATH`] bytes. A longer path makes the
+    /// result unwritable.
     pub directory: Vec<u8>,
     /// The hosts or groups that may mount it, each at most
     /// [`MAX_MOUNT_NAME`] bytes, and at most [`MAX_GROUPS`] of them. An
-    /// empty list means any host may, so a writer writes a longer name
-    /// empty rather than leave it out.
+    /// empty list means any host may. Longer names or lists make the
+    /// result unwritable.
     pub groups: Vec<String>,
 }
 
@@ -2142,8 +2122,8 @@ pub enum MountResponse {
     Umnt,
     /// To UMNTALL: nothing.
     UmntAll,
-    /// To EXPORT: the exports, at most [`MAX_EXPORTS`]. A writer also stops
-    /// before [`MAX_EXPORT_BYTES`].
+    /// To EXPORT: the exports, at most [`MAX_EXPORTS`] and [`MAX_EXPORT_BYTES`].
+    /// Readers and writers refuse larger lists.
     Export(Vec<ExportEntry>),
 }
 
@@ -2193,7 +2173,9 @@ impl MountResponse {
     }
 
     /// The results in XDR, which [`MountResponse::parse`] always reads
-    /// back. Invalid handles, names, paths, and lists return an error.
+    /// back. Handles, names, paths, and lists over their limits return
+    /// [`XdrError::TooLong`]. Error variants that alias a named status return
+    /// [`XdrError::Unwritable`].
     pub fn to_results(&self) -> Result<Vec<u8>, XdrError> {
         let w = &mut Writer::new();
         match self {
@@ -2231,11 +2213,7 @@ impl MountResponse {
                 });
             }
         }
-        let bytes = std::mem::take(w).finish()?;
-        if Self::parse(self.procedure(), &bytes).as_ref() != Ok(self) {
-            return Err(XdrError::NonCanonical);
-        }
-        Ok(bytes)
+        std::mem::take(w).finish_value(self, |bytes| Self::parse(self.procedure(), bytes))
     }
 
     /// An RPC reply that carries these results, with an AUTH_NONE
@@ -2401,7 +2379,7 @@ mod tests {
     use super::super::onc_rpc::{Body, MAX_RECORD, Record, records};
     use super::*;
     use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
+    use crate::stdlib::codec::{Assembled, Wire, contract, test_support};
 
     fn fh(b: &[u8]) -> FileHandle {
         FileHandle(b.to_vec())
@@ -2820,7 +2798,10 @@ mod tests {
             let message = request.call(19).unwrap();
             let bytes = <Message as Wire>::to_bytes(&message).unwrap();
             contract::check_wire::<Message>(&bytes);
-            contract::check_decode(make, &onc_rpc::encode_fragments(&bytes, 5).unwrap());
+            contract::check_decode_with_alloc_limit(
+                make, &onc_rpc::encode_fragments(&bytes, 5).unwrap(),
+                2 * (RECORD_LIMIT + onc_rpc::RECORD_MARK_LEN),
+            );
         }
     }
 
@@ -3180,8 +3161,7 @@ mod tests {
     #[test]
     fn export_lists_read_only_what_writes_back() {
         // 16 exports, each with 256 groups of 255 bytes: about 1.08 MB,
-        // past MAX_EXPORT_BYTES. A reader refuses it rather than take a
-        // list a writer would cut.
+        // past MAX_EXPORT_BYTES. Both the reader and writer refuse it.
         let exports: Vec<ExportEntry> = (0..16)
             .map(|i| ExportEntry {
                 directory: format!("/e{i:02}").into_bytes(),
@@ -3309,8 +3289,7 @@ mod tests {
             .unwrap(),
         );
         for m in messages {
-            let bytes = m.to_bytes().unwrap();
-            let record = Record(bytes);
+            let record = Record::from_message(&m).unwrap();
             assert_eq!(Record::parse(&record.to_bytes().unwrap()), Ok(record));
         }
     }
@@ -3319,31 +3298,28 @@ mod tests {
     fn calls_over_tcp_one_byte_at_a_time() {
         let mut stream = Vec::new();
         for (i, req) in requests().iter().enumerate() {
-            stream
-                .extend(Record(req.call(i as u32).unwrap().to_bytes().unwrap().to_vec()).to_bytes().unwrap());
+            let record = Record::from_message(&req.call(i as u32).unwrap()).unwrap();
+            stream.extend(record.to_bytes().unwrap());
         }
         stream.extend(
-            Record(MountRequest::Mnt("/export".into()).call(99).unwrap().to_bytes().unwrap().to_vec())
+            Record::from_message(&MountRequest::Mnt("/export".into()).call(99).unwrap())
+                .unwrap()
                 .to_bytes()
                 .unwrap(),
         );
-        let mut d = Stream::new(records(MAX_RECORD));
         let mut got = Vec::new();
         let mut mounts = Vec::new();
         contract::check_decode(|| records(MAX_RECORD), &stream);
-        for b in test_support::chunks(&stream, &[1]) {
-            pump(&mut d, b, |record| {
-                let Assembled::Message(record) = record;
-                let m = Message::parse(&record).unwrap();
-                let Body::Call(c) = &m.body else { panic!() };
-                match c.program {
-                    NFS_PROGRAM => got.push(Request::parse(c).unwrap()),
-                    _ => mounts.push(MountRequest::parse(c).unwrap()),
-                }
-            })
-            .unwrap();
+        let (records, failure) = test_support::decode_all(|| records(MAX_RECORD), &stream);
+        assert_eq!(failure, None);
+        for Assembled::Message(record) in records {
+            let m = Message::parse(&record).unwrap();
+            let Body::Call(c) = &m.body else { panic!() };
+            match c.program {
+                NFS_PROGRAM => got.push(Request::parse(c).unwrap()),
+                _ => mounts.push(MountRequest::parse(c).unwrap()),
+            }
         }
-        finish(&mut d, |_| panic!("unexpected record at EOF")).unwrap();
         assert_eq!(got, requests());
         assert_eq!(mounts, [MountRequest::Mnt("/export".into())]);
     }
@@ -3400,73 +3376,61 @@ mod tests {
             seeds.push((r.procedure(), r.to_results().unwrap()));
         }
         for _ in 0..20_000 {
-            let (p, seed) = &seeds[(rng.below(seeds.len() as u64) as u32) as usize];
+            let (p, seed) = &seeds[rng.index(seeds.len())];
             let mut b = seed.clone();
-            // Mutate: flip bytes, set small words, cut or grow.
-            for _ in 0..=(rng.below(4) as u32) {
-                match rng.below(5) as u32 {
-                    0 if !b.is_empty() => {
-                        let i = (rng.below(b.len() as u64) as u32) as usize;
-                        b[i] = (rng.next() as u32) as u8;
-                    }
-                    1 if b.len() >= 4 => {
-                        let i = (rng.below(b.len() as u64 / 4) as u32) as usize * 4;
-                        b[i..i + 4].copy_from_slice(&(rng.below(4) as u32).to_be_bytes());
-                    }
-                    2 if !b.is_empty() => {
-                        let n = (rng.below(b.len() as u64) as u32) as usize;
-                        b.truncate(n);
-                    }
-                    3 => b.extend((0..(rng.below(12) as u32)).map(|_| (rng.next() as u32) as u8)),
-                    _ => {}
+            // Edit bytes and sometimes replace a complete XDR word.
+            for _ in 0..=rng.below(4) {
+                test_support::mutate(&mut rng, &mut b);
+                if b.len() >= 4 && rng.below(5) == 0 {
+                    let i = rng.index(b.len() / 4) * 4;
+                    b[i..i + 4].copy_from_slice(&(rng.below(4) as u32).to_be_bytes());
                 }
             }
-            let p = if (rng.below(8) as u32) == 0 { rng.below(24) as u32 } else { *p };
+            let p = if rng.below(8) == 0 { rng.below(24) as u32 } else { *p };
             check_any(p, &b);
         }
         // Fully random bytes, for every procedure number and a few past.
         for _ in 0..5_000 {
-            let len = (rng.below(200) as u32) as usize;
+            let len = rng.index(200);
             let b: Vec<u8> = (0..len)
-                .map(|_| if (rng.next() as u32) & 1 == 1 { 0 } else { (rng.next() as u32) as u8 })
+                .map(|_| if rng.coin() { 0 } else { (rng.next() as u32) as u8 })
                 .collect();
             check_any(rng.below(24) as u32, &b);
         }
         // Random values round trip.
         for _ in 0..2_000 {
             let a = random_fattr(&mut rng);
-            let entries: Vec<EntryPlus> = (0..(rng.below(5) as u32))
+            let entries: Vec<EntryPlus> = (0..rng.below(5))
                 .map(|i| EntryPlus {
                     fileid: (rng.next() << 32 | rng.next()),
-                    name: (0..(rng.below(300) as u32)).map(|_| (rng.next() as u32) as u8).collect(),
-                    cookie: u64::from(i),
-                    attributes: ((rng.next() as u32) & 1 == 1).then_some(a),
-                    handle: ((rng.next() as u32) & 1 == 1)
-                        .then(|| FileHandle(vec![7; (rng.below(80) as u32) as usize])),
+                    name: rng.bytes(299),
+                    cookie: i,
+                    attributes: rng.coin().then_some(a),
+                    handle: rng.coin().then(|| FileHandle(vec![7; rng.index(80)])),
                 })
                 .collect();
             let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk {
-                attributes: ((rng.next() as u32) & 1 == 1).then_some(a),
+                attributes: rng.coin().then_some(a),
                 cookieverf: (rng.next() << 32 | rng.next()).to_be_bytes(),
                 entries,
-                eof: ((rng.next() as u32) & 1 == 1),
+                eof: rng.coin(),
             }));
             if let Ok(bytes) = resp.to_results() {
                 assert_eq!(Response::parse(procedure::READDIRPLUS, &bytes), Ok(resp));
             }
             let req = Request::SetAttr {
-                object: FileHandle(vec![3; (rng.below(70) as u32) as usize]),
+                object: FileHandle(vec![3; rng.index(70)]),
                 attributes: Sattr {
-                    mode: ((rng.next() as u32) & 1 == 1).then(|| rng.next() as u32),
-                    uid: ((rng.next() as u32) & 1 == 1).then(|| rng.next() as u32),
-                    gid: ((rng.next() as u32) & 1 == 1).then(|| rng.next() as u32),
-                    size: ((rng.next() as u32) & 1 == 1).then(|| rng.next() << 32 | rng.next()),
+                    mode: rng.coin().then(|| rng.next() as u32),
+                    uid: rng.coin().then(|| rng.next() as u32),
+                    gid: rng.coin().then(|| rng.next() as u32),
+                    size: rng.coin().then(|| rng.next() << 32 | rng.next()),
                     atime: [SetTime::DontChange, SetTime::ServerTime, SetTime::ClientTime(a.mtime)]
-                        [(rng.below(3) as u32) as usize],
+                        [rng.index(3)],
                     mtime: [SetTime::DontChange, SetTime::ServerTime, SetTime::ClientTime(a.ctime)]
-                        [(rng.below(3) as u32) as usize],
+                        [rng.index(3)],
                 },
-                guard: ((rng.next() as u32) & 1 == 1).then_some(a.atime),
+                guard: rng.coin().then_some(a.atime),
             };
             if let Ok(args) = req.to_args() {
                 assert_eq!(Request::read(procedure::SETATTR, &args), Ok(req));
@@ -3475,20 +3439,19 @@ mod tests {
         // A random stream of records, read one byte at a time.
         let mut stream = Vec::new();
         for _ in 0..300 {
-            let mut b = Vec::new();
-            b.extend((0..(rng.below(64) as u32)).map(|_| (rng.next() as u32) as u8));
+            let b = rng.bytes(63);
             stream.extend(Record(b.to_vec()).to_bytes().unwrap());
         }
         contract::check_decode(|| records(1 << 16), &stream);
-        let mut decoder = Stream::new(records(1 << 16));
-        pump(&mut decoder, &stream, |record| {
+        let (decoded, failure) = test_support::decode_all(|| records(1 << 16), &stream);
+        assert_eq!(failure, None);
+        for record in decoded {
             let Assembled::Message(record) = record;
             if let Ok(Message { body: Body::Call(call), .. }) = Message::parse(&record) {
                 let _ = Request::parse(&call);
                 let _ = MountRequest::parse(&call);
             }
             check_any(rng.below(22) as u32, &record);
-        })
-        .unwrap();
+        }
     }
 }

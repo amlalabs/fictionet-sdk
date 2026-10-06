@@ -12,18 +12,12 @@
 //!
 //! Nothing here reads a socket or speaks HTTP/2. A world that plays a gRPC
 //! server takes a stream's headers from its HTTP/2 code and checks them
-//! with [`Request::parse`]. It feeds the stream's DATA bytes to a
-//! [`Messages`] and gets [`Message`]s back. Each message body stays as
+//! with [`Request::parse`]. It pushes the stream's DATA bytes into a
+//! [`Stream<Messages>`](super::codec::Stream) and gets [`Message`]s back. Each message body stays as
 //! bytes: reading it (as protobuf, JSON or anything else) is up to world
 //! code. So is the answer. The world writes [`response_headers`], each
 //! reply with [`Message::to_bytes`], and ends with [`Status::to_trailers`].
 //! A call that fails at once ends with [`Status::trailers_only`] instead.
-//!
-//! For the shared codec driver, use [`Messages`] with [`codec::Stream`]
-//! or one per call in [`codec::Demux`]. [`codec::Pipe`] can feed it DATA
-//! payloads that split messages at any byte. [`Message`] implements
-//! [`codec::Wire`] for exact parsing and transactional writing. Its
-//! inherent [`parse`](Message::parse) reads a prefix.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. The decoder never holds more than one message, and
@@ -87,7 +81,8 @@ pub const DEFAULT_MAX_MESSAGE: usize = 4 * 1024 * 1024;
 /// each header's name and value lengths, plus 32.
 pub const MAX_HEADER_LIST: usize = 8 * 1024;
 /// The longest status message, in bytes of UTF-8 text, before
-/// percent-encoding. Longer text is cut at a character boundary.
+/// percent-encoding. Writers refuse longer text. [`Status::new`] and
+/// [`decode_message`] shorten it at a character boundary.
 pub const MAX_STATUS_MESSAGE: usize = 1024;
 /// The longest content-type subtype, the part after `application/grpc+`.
 pub const MAX_SUBTYPE: usize = 64;
@@ -230,8 +225,11 @@ impl Wire for Message {
     type WriteError = FrameError;
 
     /// Reads exactly one message with at most [`MAX_MESSAGE`] body bytes.
-    /// Incomplete input and trailing bytes are errors. Compressed bodies
-    /// remain flagged bytes.
+    /// Returns [`MessageParseError::Truncated`] for incomplete input and
+    /// [`MessageParseError::Trailing`] for extra bytes. A flag other than
+    /// 0 or 1 or a body above the limit returns [`MessageParseError::Frame`]
+    /// with [`FrameError::Flag`] or [`FrameError::TooLarge`]. Compressed
+    /// bodies remain flagged bytes.
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError> {
         match Message::parse(b).map_err(MessageParseError::Frame)? {
             Some((message, used)) if used == b.len() => Ok(message),
@@ -241,8 +239,11 @@ impl Wire for Message {
     }
 
     /// Appends a header and at most [`MAX_MESSAGE`] body bytes.
-    /// Refuses longer bodies before changing `out`. The bytes match
-    /// [`Message::to_bytes`]. No compression is performed.
+    /// A longer body returns [`FrameError::TooLarge`] without changing `out`.
+    /// Its `length` is the body length, capped at `u32::MAX`. The error's
+    /// [`code`](FrameError::code) is [`Code::ResourceExhausted`]. A stream
+    /// accepts the output when its body fits the stream's own limit.
+    /// No compression is performed.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), FrameError> {
         let length = message_length(self.data.len())?;
         out.push(u8::from(self.compressed));
@@ -312,8 +313,10 @@ impl codec::Decode for Messages {
         HEADER_LEN.saturating_add(self.limit)
     }
 
-    /// Reads one message or waits for more bytes. EOF does not change
-    /// framing; the driver reports incomplete input as truncation.
+    /// Reads one message or waits for more bytes. A flag other than 0 or 1
+    /// returns [`FrameError::Flag`]; a declared body above the configured
+    /// limit returns [`FrameError::TooLarge`]. Partial input returns
+    /// [`Step::Need`], including at EOF.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Message>, FrameError> {
         Ok(match parse_message(input, self.limit)? {
             Some((message, used)) => Step::Item(message, used),
@@ -1710,7 +1713,7 @@ mod tests {
 
             let mut bytes = Vec::new();
             for payload in data.chunks(8) {
-                let message = Message { compressed: rng.below(2) == 1, data: payload.to_vec() };
+                let message = Message { compressed: rng.coin(), data: payload.to_vec() };
                 let encoded = message.to_bytes().unwrap();
                 contract::check_wire::<Message>(&encoded);
                 bytes.extend(encoded);
@@ -1718,6 +1721,9 @@ mod tests {
             // Exercise accepted messages, small-limit refusals, and every EOF prefix.
             for limit in [0, 7, 8, MAX_MESSAGE] {
                 contract::check_decode_with_held_limit(|| Messages::with_limit(limit), &bytes, 0);
+                contract::check_decode_with_alloc_limit(
+                    || Messages::with_limit(limit), &bytes, 2 * (HEADER_LEN + limit),
+                );
             }
         }
     }
@@ -2401,8 +2407,7 @@ mod tests {
     fn fuzz_loop() {
         let mut rng = Lcg::new(0x67_72_70_63);
         for round in 0..4000 {
-            let len = rng.next() as usize % 64;
-            let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            let mut data = rng.bytes(63);
             // Keep flags and lengths small often, so real messages come up.
             if round % 2 == 0 {
                 let mut i = 0;
@@ -2456,20 +2461,10 @@ mod tests {
         for _ in 0..3000 {
             let mut h: Vec<(Vec<u8>, Vec<u8>)> =
                 base.iter().map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())).collect();
-            for _ in 0..1 + rng.next() % 4 {
-                let i = rng.next() as usize % h.len();
+            for _ in 0..1 + rng.below(4) {
+                let i = rng.index(h.len());
                 let v = &mut h[i].1;
-                match rng.next() % 3 {
-                    0 if !v.is_empty() => {
-                        let j = rng.next() as usize % v.len();
-                        v[j] = rng.next() as u8;
-                    }
-                    1 => {
-                        let n = rng.next() as usize % (v.len() + 1);
-                        v.truncate(n);
-                    }
-                    _ => v.push(rng.next() as u8),
-                }
+                test_support::mutate(&mut rng, v);
             }
             match Request::parse(h.iter().map(|(n, v)| (n, v))) {
                 Ok(r) => {

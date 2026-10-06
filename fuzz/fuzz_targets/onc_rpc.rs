@@ -5,7 +5,7 @@
 use fictionet::stdlib::onc_rpc::{AuthSys, Body, MAX_ARRAY_RESERVE, Message, Reader, encode_fragments};
 use fictionet::stdlib::portmap::{PmapResult, Request, procedure};
 use fictionet::stdlib::{
-    codec::{Assembled, Stream, Wire, contract, pump},
+    codec::{Assembled, Wire, contract, test_support::decode_all},
     onc_rpc,
 };
 use libfuzzer_sys::fuzz_target;
@@ -20,15 +20,13 @@ fuzz_target!(|data: &[u8]| {
     contract::check_wire::<onc_rpc::Fragment>(data);
     contract::check_wire::<AuthSys>(data);
     contract::check_wire::<Message>(data);
-    let mut stream = Stream::new(onc_rpc::records(limit));
-    let mut records = Vec::new();
-    let _ = pump(&mut stream, data, |record| {
-        let Assembled::Message(bytes) = record;
-        records.push(bytes);
-    });
+    let (records, _) = decode_all(|| onc_rpc::records(limit), data);
 
     // Each record, and the bytes on their own as a UDP datagram.
-    for bytes in records.iter().map(Vec::as_slice).chain([data]) {
+    for bytes in records.iter().map(|record| match record {
+        Assembled::Message(bytes) => bytes.as_slice(),
+        Assembled::Whole(never) => match *never {},
+    }).chain([data]) {
         contract::check_wire::<Message>(bytes);
         // A record written in fragments reads back the same.
         if let Ok(encoded) = encode_fragments(bytes, 7) {

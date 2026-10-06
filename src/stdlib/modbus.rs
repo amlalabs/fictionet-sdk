@@ -9,18 +9,12 @@
 //! Protocol Specification v1.1b3 and the Modbus Messaging on TCP/IP
 //! Implementation Guide v1.0b.
 //!
-//! Nothing here reads a socket. A world that plays a PLC feeds the bytes
-//! it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Frames`], gets [`Frame`]s back, reads each one's [`Request`], and
+//! Nothing here reads a socket. A world that plays a PLC pushes bytes
+//! from a [`tcp`](crate::stdlib::tcp) connection into a
+//! [`Stream<Frames>`](super::codec::Stream), gets [`Frame`]s back, reads each one's [`Request`], and
 //! writes the reply's bytes back to the connection. Which coils and
 //! registers exist, and what they hold, is up to world code. So is whether
 //! a write succeeds.
-//!
-//! Use [`Frames`] with [`codec::Stream`](super::codec::Stream).
-//! It reports a framing error once and checks for partial frames at EOF.
-//! [`Wire`] reads exactly one frame and appends its bytes with a strict
-//! writer. Use `<Frame as Wire>::parse(bytes)` for exact parsing;
-//! [`Frame::parse`] reads a prefix and allows trailing bytes.
 //!
 //! Every reader checks lengths and ranges, because the agent can send any
 //! bytes it likes. A request that breaks the specification becomes an
@@ -255,7 +249,10 @@ impl Wire for Frame {
     type ParseError = FrameParseError;
     type WriteError = EncodeError;
 
-    /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    /// Reads exactly one frame. Returns [`FrameParseError::Truncated`] for
+    /// incomplete input and [`FrameParseError::Trailing`] for trailing bytes.
+    /// A nonzero protocol ID or length outside 2..=254 returns
+    /// [`FrameParseError::Frame`] with [`FrameError::Protocol`] or [`FrameError::Length`].
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
         match Self::parse(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
@@ -264,7 +261,9 @@ impl Wire for Frame {
         }
     }
 
-    /// Appends one frame. Invalid PDUs leave `out` unchanged.
+    /// Appends one frame. An empty PDU returns [`EncodeError::EmptyPdu`];
+    /// a PDU over [`MAX_PDU`] bytes returns [`EncodeError::TooLong`].
+    /// Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let pdu = &self.pdu[..];
         if pdu.is_empty() {
@@ -316,6 +315,9 @@ impl Decode for Frames {
         MAX_FRAME
     }
 
+    /// Reads one frame. A nonzero protocol ID returns [`FrameError::Protocol`].
+    /// A length outside 2..=254 returns [`FrameError::Length`]. Partial input
+    /// returns [`Step::Need`], including at EOF.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
         Ok(match Frame::parse(input)? {
             Some((frame, used)) => Step::Item(frame, used),
@@ -1226,25 +1228,24 @@ mod tests {
     }
 
     fn split(data: &[u8]) -> Vec<Frame> {
-        contract::check_decode(|| Frames, data);
-        let mut stream = Stream::new(Frames);
-        let mut frames = Vec::new();
-        pump(&mut stream, data, |frame| frames.push(frame)).unwrap();
-        finish(&mut stream, |frame| frames.push(frame)).unwrap();
+        contract::check_decode_with_alloc_limit(|| Frames, data, 2 * MAX_FRAME);
+        let (frames, failure) = test_support::decode_all(|| Frames, data);
+        assert_eq!(failure, None);
         frames
     }
 
     #[test]
     fn review_decoder_holds_at_most_max_buffered() {
-        // 64 KiB of zeros in one feed: the decoder takes only what it may
+        // 64 KiB of zeros in one push: the decoder takes only what it may
         // hold, and the header it sees is already broken.
         let mut d = Stream::new(Frames);
         let zeros = vec![0u8; 64 * 1024];
+        contract::check_decode_with_alloc_limit(|| Frames, &zeros, 2 * MAX_FRAME);
         let took = d.push(&zeros);
         assert!(took <= MAX_FRAME);
         assert!(d.buffered() <= MAX_FRAME);
         assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Length(0)))));
-        // Many longest frames fed in one go come out the same as fed in
+        // Many longest frames pushed in one go come out the same as in
         // other chunk sizes, and the buffer never grows past the bound.
         let mut stream = Vec::new();
         for t in 0..50u16 {

@@ -4,7 +4,7 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Assembled, Stream, Wire, pump};
+use fictionet::stdlib::codec::{Assembled, Wire, test_support::decode_all};
 use fictionet::stdlib::cotp::{Connect, Data, Parameter, Tpdu, Variable};
 use fictionet::stdlib::cotp::{messages, over_tpkt};
 use fictionet::stdlib::tpkt::{EncodeError, Header, MAX_PACKET, MAX_PAYLOAD, MIN_PACKET, Packet, Packets};
@@ -45,7 +45,7 @@ fn built(data: &[u8]) -> Result<()> {
         }
         Err(e) => {
             assert!(!fits);
-            assert_eq!(e, EncodeError::Unrepresentable);
+            assert_eq!(e, EncodeError::Unwritable);
         }
     }
     // A connection request a world builds, with any fields, parameters,
@@ -87,9 +87,8 @@ fn built(data: &[u8]) -> Result<()> {
     let n = u.int_in_range(0..=4000usize)?;
     let message = u.bytes(n)?;
     let bytes = over_tpkt::write_message(message, tpdu_size).unwrap();
-    let mut stream = Stream::new(messages(MAX_PACKET, 4000));
-    let mut got = Vec::new();
-    pump(&mut stream, &bytes, |item| got.push(item)).unwrap();
+    let (got, failure) = decode_all(|| messages(MAX_PACKET, 4000), &bytes);
+    assert_eq!(failure, None);
     assert_eq!(got, [Assembled::Message(message.to_vec())]);
     Ok(())
 }
@@ -104,14 +103,14 @@ fuzz_target!(|data: &[u8]| {
     };
     for limit in [MAX_PACKET, limit] {
         check_decode(|| Packets::with_limit(limit), data);
-        let mut stream = Stream::new(Packets::with_limit(limit));
-        let _ = pump(&mut stream, data, |packet| {
+        let (packets, _) = decode_all(|| Packets::with_limit(limit), data);
+        for packet in packets {
             check_wire_value(&packet);
             check_wire::<Tpdu>(&packet.payload);
             if let Ok(tpdu) = over_tpkt::tpdu(&packet) {
                 assert_eq!(over_tpkt::tpdu(&over_tpkt::from_tpdu(&tpdu).unwrap()), Ok(tpdu));
             }
-        });
+        }
     }
     let _ = built(data);
 });

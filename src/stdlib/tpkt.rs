@@ -9,17 +9,12 @@
 //! session on port 3389 starts with it. RFC 2126 keeps the same header for
 //! ISO transport over TCP on IPv6 and for transport classes other than 0.
 //!
-//! Nothing here reads a socket. A world feeds the bytes it reads from a
-//! TCP connection to a [`super::codec::Stream`] of [`Packets`], takes each
+//! Nothing here reads a socket. A world pushes bytes from a
+//! TCP connection into a [`Stream<Packets>`](super::codec::Stream), takes each
 //! [`Packet`] out, and reads its payload. Most payloads are COTP TPDUs;
 //! [`super::cotp::over_tpkt`] provides conversions and a message writer.
 //! A world may set a size limit lower than the 65535 bytes the header allows, as
 //! real stacks often do.
-//!
-//! [`Packets`] implements [`super::codec::Decode`] for a caller-owned input
-//! buffer. Use [`super::codec::Stream`] to drive it with bounded storage
-//! and EOF handling. [`Packet`] implements [`Wire`] for exact parsing and
-//! transactional writing. Its inherent `parse` reads one prefix.
 //!
 //! Every reader checks lengths, because the agent can send any bytes it
 //! likes. A stream that breaks the format gives a [`TpktError`], and a
@@ -95,7 +90,7 @@ pub enum EncodeError {
     /// or a parameter does not fit in one packet, or a field is wider than
     /// its format, such as a credit over 15.
     /// [`cotp::over_tpkt::from_tpdu`](super::cotp::over_tpkt::from_tpdu) gives it.
-    Unrepresentable,
+    Unwritable,
 }
 
 impl core::fmt::Display for EncodeError {
@@ -103,7 +98,7 @@ impl core::fmt::Display for EncodeError {
         match self {
             EncodeError::TooShort(n) => write!(f, "TPKT payload of {n} bytes, below {MIN_PAYLOAD}"),
             EncodeError::TooLong(n) => write!(f, "{n} bytes, more than TPKT may carry"),
-            EncodeError::Unrepresentable => f.write_str("TPDU that one TPKT packet cannot carry as it is"),
+            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -213,6 +208,10 @@ impl Wire for Header {
     type ParseError = ParseError;
     type WriteError = EncodeError;
 
+    /// Reads exactly four header bytes. Returns [`ParseError::Incomplete`]
+    /// for a partial header and [`ParseError::Trailing`] for extra bytes.
+    /// A version other than 3 or a length below [`MIN_PACKET`] returns
+    /// [`ParseError::Header`] with [`TpktError::Version`] or [`TpktError::Length`].
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let header =
             Header::parse(bytes, MAX_PACKET).map_err(ParseError::Header)?.ok_or(ParseError::Incomplete)?;
@@ -222,6 +221,8 @@ impl Wire for Header {
         Ok(header)
     }
 
+    /// Appends the header. A length below [`MIN_PACKET`] returns
+    /// [`EncodeError::TooShort`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         if usize::from(self.length) < MIN_PACKET {
             return Err(EncodeError::TooShort(self.payload_len()));
@@ -285,6 +286,10 @@ impl Wire for Packet {
     type ParseError = ParseError;
     type WriteError = EncodeError;
 
+    /// Reads exactly one packet. Returns [`ParseError::Incomplete`] for
+    /// partial input and [`ParseError::Trailing`] for extra bytes. A version
+    /// other than 3 or a length below [`MIN_PACKET`] returns [`ParseError::Header`]
+    /// with [`TpktError::Version`] or [`TpktError::Length`].
     fn parse(bytes: &[u8]) -> Result<Self, ParseError> {
         let (packet, used) =
             Packet::parse(bytes).map_err(ParseError::Header)?.ok_or(ParseError::Incomplete)?;
@@ -294,6 +299,9 @@ impl Wire for Packet {
         Ok(packet)
     }
 
+    /// Appends one packet. Payloads below [`MIN_PAYLOAD`] return
+    /// [`EncodeError::TooShort`]; those above [`MAX_PAYLOAD`] return
+    /// [`EncodeError::TooLong`]. Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         self.header()?.write(out)?;
         out.extend_from_slice(&self.payload);
@@ -351,6 +359,10 @@ impl Decode for Packets {
         self.limit
     }
 
+    /// Reads one packet. Returns [`TpktError::Version`] for a version other
+    /// than 3, [`TpktError::Length`] below [`MIN_PACKET`], or
+    /// [`TpktError::TooLong`] above the configured limit. Partial input
+    /// returns [`Step::Need`], including at EOF.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, TpktError> {
         Ok(match Packet::parse_limited(input, self.limit)? {
             Some((packet, used)) => Step::Item(packet, used),
@@ -444,15 +456,14 @@ mod tests {
     use super::super::cotp;
     use super::*;
     use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Fail, Stream, contract, pump};
+    use crate::stdlib::codec::{Fail, Stream, contract, test_support};
     use cotp::{Data, Reassembler, Tpdu};
 
     fn split(data: &[u8], limit: usize) -> (Vec<Packet>, Option<Fail<TpktError>>) {
-        contract::check_decode(|| Packets::with_limit(limit), data);
-        let mut stream = Stream::new(Packets::with_limit(limit));
-        let mut packets = Vec::new();
-        let result = pump(&mut stream, data, |packet| packets.push(packet));
-        (packets, result.err())
+        contract::check_decode_with_alloc_limit(
+            || Packets::with_limit(limit), data, 2 * clamp_limit(limit),
+        );
+        test_support::decode_all(|| Packets::with_limit(limit), data)
     }
 
     // RFC 1006 section 6: version 3, reserved, then the length of the
@@ -568,7 +579,7 @@ mod tests {
             cotp::over_tpkt::write_message(&vec![0; cotp::MAX_MESSAGE + 1], 1024),
             Err(EncodeError::TooLong(cotp::MAX_MESSAGE + 1))
         );
-        for e in [EncodeError::TooShort(1), EncodeError::TooLong(1), EncodeError::Unrepresentable] {
+        for e in [EncodeError::TooShort(1), EncodeError::TooLong(1), EncodeError::Unwritable] {
             assert!(!e.to_string().is_empty());
         }
     }
@@ -583,9 +594,9 @@ mod tests {
         let p = cotp::over_tpkt::from_tpdu(&fits).unwrap();
         assert_eq!(p.payload.len(), MAX_PAYLOAD);
         assert_eq!(cotp::over_tpkt::tpdu(&p), Ok(fits));
-        assert_eq!(cotp::over_tpkt::from_tpdu(&data(MAX_PAYLOAD - 2, 0)), Err(EncodeError::Unrepresentable));
-        assert_eq!(cotp::over_tpkt::from_tpdu(&data(65529, 0)), Err(EncodeError::Unrepresentable));
-        assert_eq!(cotp::over_tpkt::from_tpdu(&data(0, 0x80)), Err(EncodeError::Unrepresentable));
+        assert_eq!(cotp::over_tpkt::from_tpdu(&data(MAX_PAYLOAD - 2, 0)), Err(EncodeError::Unwritable));
+        assert_eq!(cotp::over_tpkt::from_tpdu(&data(65529, 0)), Err(EncodeError::Unwritable));
+        assert_eq!(cotp::over_tpkt::from_tpdu(&data(0, 0x80)), Err(EncodeError::Unwritable));
         let connect = |f: &dyn Fn(&mut cotp::Connect)| {
             let mut c = cotp::Connect::request(7);
             f(&mut c);
@@ -593,21 +604,21 @@ mod tests {
         };
         assert!(connect(&|_| ()).is_ok());
         assert!(connect(&|c| c.credit = 15).is_ok());
-        assert_eq!(connect(&|c| c.credit = 16), Err(EncodeError::Unrepresentable));
-        assert_eq!(connect(&|c| c.class = 16), Err(EncodeError::Unrepresentable));
-        assert_eq!(connect(&|c| c.options = 16), Err(EncodeError::Unrepresentable));
+        assert_eq!(connect(&|c| c.credit = 16), Err(EncodeError::Unwritable));
+        assert_eq!(connect(&|c| c.class = 16), Err(EncodeError::Unwritable));
+        assert_eq!(connect(&|c| c.options = 16), Err(EncodeError::Unwritable));
         // A parameter longer than its length byte, or more than a header holds.
-        assert_eq!(connect(&|c| c.variable.set(0xc1, vec![0; 256])), Err(EncodeError::Unrepresentable));
+        assert_eq!(connect(&|c| c.variable.set(0xc1, vec![0; 256])), Err(EncodeError::Unwritable));
         assert_eq!(
             connect(&|c| {
                 c.variable.set(0xc1, vec![0; 200]);
                 c.variable.set(0xc2, vec![0; 200]);
             }),
-            Err(EncodeError::Unrepresentable)
+            Err(EncodeError::Unwritable)
         );
         assert_eq!(
             connect(&|c| c.variable = cotp::Variable::Raw(vec![0; 249])),
-            Err(EncodeError::Unrepresentable)
+            Err(EncodeError::Unwritable)
         );
         // Strict conversion refuses Raw bytes that read back as parameters,
         // including empty Raw. Use Variable::parse to choose the wire form.
@@ -704,7 +715,7 @@ mod tests {
             // Mostly well-formed packets, with some bytes changed.
             let mut data = Vec::new();
             for _ in 0..rng.below(4) {
-                let n = 3 + rng.below(if i % 50 == 0 { 3000 } else { 40 }) as usize;
+                let n = 3 + rng.index(if i % 50 == 0 { 3000 } else { 40 });
                 let p = Packet {
                     reserved: rng.next() as u8,
                     payload: {
@@ -715,19 +726,11 @@ mod tests {
                 };
                 data.extend_from_slice(&p.to_bytes().unwrap());
             }
-            let extra = rng.below(12) as usize;
-            data.extend({
-                let mut bytes = vec![0; extra];
-                rng.fill(&mut bytes);
-                bytes
-            });
+            data.extend(rng.bytes(11));
             for _ in 0..rng.below(3) {
-                if !data.is_empty() {
-                    let at = rng.below(data.len() as u64) as usize;
-                    data[at] = rng.next() as u8;
-                }
+                test_support::mutate(&mut rng, &mut data);
             }
-            let limit = [MAX_PACKET, 7, 20, 64, 1000][rng.below(5) as usize];
+            let limit = [MAX_PACKET, 7, 20, 64, 1000][rng.index(5)];
             let whole = split(&data, limit);
             for p in &whole.0 {
                 assert!(p.payload.len() + HEADER_LEN <= limit);
@@ -753,26 +756,21 @@ mod tests {
             }
             // Payloads shaped like TPDUs: whatever reads as one is written
             // back whole.
-            let n = rng.below(40) as usize;
+            let n = rng.index(40);
             let mut b = {
                 let mut bytes = vec![0; n + 2];
                 rng.fill(&mut bytes);
                 bytes
             };
             b[0] = rng.below(n as u64 + 2) as u8;
-            b[1] = [0xe0, 0xd3, 0x80, 0xf0, 0x70][rng.below(5) as usize];
+            b[1] = [0xe0, 0xd3, 0x80, 0xf0, 0x70][rng.index(5)];
             if let Ok(t) = cotp::over_tpkt::tpdu(&Packet::new(b.clone())) {
                 assert_eq!(cotp::over_tpkt::from_tpdu(&t), Ok(Packet::new(b)));
             }
             // Raw bytes, never panicking.
-            let n = rng.below(20) as usize;
-            let raw = {
-                let mut bytes = vec![0; n];
-                rng.fill(&mut bytes);
-                bytes
-            };
+            let raw = rng.bytes(19);
             let _ = Packet::parse(&raw);
-            let _ = Packet::parse_limited(&raw, rng.next() as usize);
+            let _ = Packet::parse_limited(&raw, rng.index(usize::MAX));
             let _ = split(&raw, MAX_PACKET);
         }
     }

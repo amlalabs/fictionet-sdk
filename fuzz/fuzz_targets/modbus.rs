@@ -4,7 +4,7 @@
 
 use arbitrary::{Result, Unstructured};
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::modbus::{Exception, Frame, Frames, MAX_PDU, Request, Response, function};
 use libfuzzer_sys::fuzz_target;
 
@@ -101,11 +101,11 @@ fuzz_target!(|data: &[u8]| {
     check_decode(|| Frames, data);
     check_wire::<Frame>(data);
 
-    let mut stream = Stream::new(Frames);
-    let _ = pump(&mut stream, data, |frame| {
+    let (frames, _) = decode_all(|| Frames, data);
+    for frame in frames {
         check_wire_value(&frame);
         pdu(&frame.pdu);
-    });
+    }
     // Any bytes as a PDU on their own, including ones longer than a frame
     // holds.
     pdu(data);

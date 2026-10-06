@@ -14,10 +14,10 @@
 //! for XDR, RFC 5531 for ONC RPC and record marking, and RFC 1833 for
 //! portmap and rpcbind.
 //!
-//! Use [`Fragments`], [`records`], or [`messages`] with [`codec::Stream`]
-//! for TCP. UDP datagrams contain one [`Message`]. [`Wire::write`] writes
-//! strict messages and records. It leaves the destination unchanged on
-//! error. [`Reader`] and [`Writer`] handle XDR arguments and results.
+//! For TCP, [`Stream<Fragments>`](super::codec::Stream) reads record
+//! fragments; [`records`] joins them and [`messages`] reads each RPC header.
+//! UDP datagrams contain one [`Message`]. [`Reader`] and [`Writer`] handle
+//! XDR arguments and results.
 //! [`Writer::finish`] reports values that exceed its record budget.
 //! World code selects the program, procedure, and reply.
 //!
@@ -51,7 +51,7 @@
 //! let mapping = Mapping { program: 100_003, version: 3, protocol: IPPROTO_TCP, port: 0 };
 //! let request = Request::Pmap(PmapRequest::GetPort(mapping)).call(7).unwrap();
 //! let mut decoder = Stream::new(records(MAX_RECORD));
-//! let bytes = Record(request.to_bytes().unwrap()).to_bytes().unwrap();
+//! let bytes = Record::from_message(&request).unwrap().to_bytes().unwrap();
 //! assert_eq!(decoder.push(&bytes), bytes.len());
 //! let Assembled::Message(record) = decoder.next().unwrap().unwrap();
 //! let message = Message::parse(&record).unwrap();
@@ -152,7 +152,7 @@ pub enum XdrError {
     /// A string was not UTF-8.
     Utf8,
     /// A value would read back differently.
-    NonCanonical,
+    Unwritable,
     /// Bytes were left over after the value: this many.
     Trailing(usize),
 }
@@ -165,7 +165,7 @@ impl std::fmt::Display for XdrError {
             XdrError::Bool(n) => write!(f, "XDR boolean {n}, not 0 or 1"),
             XdrError::Discriminant(n) => write!(f, "XDR discriminant {n} not known"),
             XdrError::TooLong(n) => write!(f, "XDR length or count {n} over the limit"),
-            XdrError::NonCanonical => f.write_str("XDR value would change when parsed"),
+            XdrError::Unwritable => f.write_str("value cannot be written without changing it"),
             XdrError::Utf8 => f.write_str("XDR string not UTF-8"),
             XdrError::Trailing(n) => write!(f, "{n} bytes after the XDR value"),
         }
@@ -347,6 +347,20 @@ impl Writer {
         }
     }
 
+    /// Finishes an XDR value and checks it with its procedure-specific reader.
+    /// A value that would read differently returns [`XdrError::Unwritable`].
+    pub(crate) fn finish_value<T: PartialEq>(
+        self,
+        value: &T,
+        read: impl FnOnce(&[u8]) -> Result<T, XdrError>,
+    ) -> Result<Vec<u8>, XdrError> {
+        let bytes = self.finish()?;
+        if read(&bytes).as_ref() != Ok(value) {
+            return Err(XdrError::Unwritable);
+        }
+        Ok(bytes)
+    }
+
     /// Refuses this value. The first error is returned by [`Self::finish`].
     pub(crate) fn reject(&mut self, error: XdrError) {
         if self.error.is_none() {
@@ -503,9 +517,18 @@ impl AuthSys {
 impl Wire for AuthSys {
     type ParseError = XdrError;
     type WriteError = XdrError;
+
+    /// Reads the complete AUTH_SYS body. Short fields return [`XdrError::Short`];
+    /// nonzero padding returns [`XdrError::Padding`]; invalid UTF-8 returns
+    /// [`XdrError::Utf8`]. A name above [`MAX_MACHINE_NAME`] or group count
+    /// above [`MAX_GIDS`] returns [`XdrError::TooLong`]. Extra bytes return
+    /// [`XdrError::Trailing`].
     fn parse(bytes: &[u8]) -> Result<Self, XdrError> {
         Self::parse(bytes)
     }
+    /// Appends AUTH_SYS credentials. A name above [`MAX_MACHINE_NAME`] or
+    /// a group count above [`MAX_GIDS`] returns [`XdrError::TooLong`].
+    /// Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), XdrError> {
         if self.machine_name.len() > MAX_MACHINE_NAME || self.gids.len() > MAX_GIDS {
             return Err(XdrError::TooLong(
@@ -574,7 +597,7 @@ impl Auth {
     /// Appends authentication fields after checking their limits.
     fn write(&self, w: &mut Writer) {
         if auth_wire_len(self).is_err() {
-            w.reject(XdrError::NonCanonical);
+            w.reject(XdrError::Unwritable);
             return;
         }
         let body = match self {
@@ -876,20 +899,28 @@ pub enum MessageWriteError {
         /// The maximum bytes or entries for that field.
         limit: usize,
     },
-    /// An authentication variant would parse as another variant.
-    NonCanonical,
+    /// An XDR value cannot be written unchanged. Variant aliases return
+    /// [`XdrError::Unwritable`].
+    Xdr(XdrError),
 }
 
 impl core::fmt::Display for MessageWriteError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::TooLong { limit } => write!(f, "RPC message field exceeds {limit}"),
-            Self::NonCanonical => f.write_str("RPC authentication variant would change on parsing"),
+            Self::Xdr(error) => error.fmt(f),
         }
     }
 }
 
-impl core::error::Error for MessageWriteError {}
+impl core::error::Error for MessageWriteError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            Self::Xdr(error) => Some(error),
+            Self::TooLong { .. } => None,
+        }
+    }
+}
 
 fn auth_wire_len(auth: &Auth) -> Result<usize, MessageWriteError> {
     let body_len = match auth {
@@ -913,7 +944,7 @@ fn auth_wire_len(auth: &Auth) -> Result<usize, MessageWriteError> {
             if (*flavor == flavor::NONE && body.is_empty())
                 || (*flavor == flavor::SYS && AuthSys::parse(body).is_ok())
             {
-                return Err(MessageWriteError::NonCanonical);
+                return Err(MessageWriteError::Xdr(XdrError::Unwritable));
             }
             body.len()
         }
@@ -925,15 +956,22 @@ impl Wire for Message {
     type ParseError = XdrError;
     type WriteError = MessageWriteError;
 
-    /// Reads one RPC message of at most [`MAX_RECORD`] bytes.
-    /// Trailing bytes are part of a successful result or call arguments.
+    /// Reads one UDP datagram or TCP record. Input above [`MAX_RECORD`] or
+    /// authentication bodies above [`MAX_AUTH_BODY`] return [`XdrError::TooLong`].
+    /// Short fields, nonzero padding, and unknown union tags return
+    /// [`XdrError::Short`], [`XdrError::Padding`], and [`XdrError::Discriminant`].
+    /// Bytes after a call header or successful reply are arguments or results.
+    /// Extra bytes after any other reply return [`XdrError::Trailing`].
     fn parse(bytes: &[u8]) -> Result<Self, XdrError> {
-        if bytes.len() > MAX_RECORD {
-            return Err(XdrError::TooLong(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
-        }
         Message::parse(bytes)
     }
 
+    /// Appends one RPC message. Messages above [`MAX_RECORD`], authentication
+    /// bodies above [`MAX_AUTH_BODY`], names above [`MAX_MACHINE_NAME`], or
+    /// group counts above [`MAX_GIDS`] return [`MessageWriteError::TooLong`].
+    /// An `Other` authentication or status value that aliases a typed variant
+    /// returns [`MessageWriteError::Xdr`] with [`XdrError::Unwritable`].
+    /// Errors leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), MessageWriteError> {
         let size = match &self.body {
             Body::Call(call) => 24usize
@@ -950,7 +988,7 @@ impl Wire for Message {
             Body::Reply(Reply::Denied(Reject::RpcMismatch { .. })) => 24,
             Body::Reply(Reply::Denied(Reject::AuthError(status))) => {
                 if AuthStat::from_code(status.code()) != *status {
-                    return Err(MessageWriteError::NonCanonical);
+                    return Err(MessageWriteError::Xdr(XdrError::Unwritable));
                 }
                 20
             }
@@ -1045,6 +1083,10 @@ impl Wire for Fragment {
     type ParseError = RecordParseError;
     type WriteError = RecordError;
 
+    /// Reads exactly one fragment. A declared payload above [`MAX_RECORD`]
+    /// returns [`RecordParseError::Framing`] with [`RecordError::TooLong`].
+    /// Short input returns [`RecordParseError::Truncated`]; bytes after the
+    /// fragment return [`RecordParseError::Trailing`].
     fn parse(bytes: &[u8]) -> Result<Self, RecordParseError> {
         match Fragments::new()
             .decode(bytes, true)
@@ -1056,6 +1098,8 @@ impl Wire for Fragment {
         }
     }
 
+    /// Appends a record mark and payload. A payload above [`MAX_RECORD`]
+    /// returns [`RecordError::TooLong`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
         write_fragment(&self.data, self.last, out)
     }
@@ -1106,6 +1150,9 @@ impl Decode for Fragments {
         self.limit.saturating_add(RECORD_MARK_LEN)
     }
 
+    /// Reads one fragment. A fragment or record length above the configured
+    /// limit returns [`RecordError::TooLong`] before reading the payload.
+    /// Partial input returns [`Step::Need`], including at EOF.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Fragment>, RecordError> {
         let Some(mark) = input.get(..RECORD_MARK_LEN) else {
             return Ok(Step::Need);
@@ -1193,10 +1240,23 @@ impl core::fmt::Display for RecordParseError {
 
 impl core::error::Error for RecordParseError {}
 
+impl Record {
+    /// Wraps a complete RPC message for TCP. Invalid message fields return
+    /// the same [`MessageWriteError`] as [`Message::write`].
+    pub fn from_message(message: &Message) -> Result<Self, MessageWriteError> {
+        message.to_bytes().map(Self)
+    }
+}
+
 impl Wire for Record {
     type ParseError = RecordParseError;
     type WriteError = RecordError;
 
+    /// Reads all fragments of exactly one record. A fragment or their sum
+    /// above [`MAX_RECORD`] returns [`RecordParseError::Framing`]. The same
+    /// variant reports an assembly that ends before its final fragment.
+    /// A partial mark or payload returns [`RecordParseError::Truncated`];
+    /// bytes after the final fragment return [`RecordParseError::Trailing`].
     fn parse(mut input: &[u8]) -> Result<Self, RecordParseError> {
         let mut decoder = records(MAX_RECORD);
         loop {
@@ -1216,6 +1276,8 @@ impl Wire for Record {
         }
     }
 
+    /// Appends a record mark and payload. A payload above [`MAX_RECORD`]
+    /// returns [`RecordError::TooLong`] without changing `out`.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), RecordError> {
         write_fragment(&self.0, true, out)
     }
@@ -1326,7 +1388,7 @@ pub fn silent_on_failure(call: &Call) -> bool {
 mod tests {
     use super::*;
     use crate::stdlib::codec::test_support::Lcg;
-    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump, test_support};
     use crate::stdlib::portmap::{
         self, ParseError, PmapRequest, PmapResult, Request, RpcbRequest, RpcbResult,
     };
@@ -1338,7 +1400,9 @@ mod tests {
         let mut wire = vec![0; RECORD_MARK_LEN]; // Empty nonfinal fragment.
         wire.extend(encode_fragments(payload, 3).unwrap());
         wire.extend(Record((b"").to_vec()).to_bytes().unwrap());
-        contract::check_decode(|| Fragments::with_limit(payload.len()), &wire);
+        contract::check_decode_with_alloc_limit(
+            || Fragments::with_limit(payload.len()), &wire, 2 * (payload.len() + RECORD_MARK_LEN),
+        );
         contract::check_decode_with_held_limit(|| super::records(payload.len()), &wire, payload.len());
 
         let mut stream = Stream::new(super::records(payload.len()));
@@ -1363,7 +1427,9 @@ mod tests {
         assert_eq!(Fragments::with_limit(usize::MAX).capacity(), MAX_RECORD + RECORD_MARK_LEN);
 
         let wire = [0, 0, 0, 2, 1, 2, 0x80, 0, 0, 2];
-        contract::check_decode(|| super::records(3), &wire);
+        contract::check_decode_with_alloc_limit(
+            || super::records(3), &wire, 2 * (3 + RECORD_MARK_LEN),
+        );
         let mut stream = Stream::new(super::records(3));
         let error = Fail::Protocol(AssembleError::Inner(RecordError::TooLong(3)));
         assert_eq!(pump(&mut stream, &wire, |_| {}), Err(error.clone()));
@@ -1491,10 +1557,10 @@ mod tests {
                 Auth::Other { flavor: 99, body: vec![0; MAX_AUTH_BODY + 1] },
                 MessageWriteError::TooLong { limit: MAX_AUTH_BODY },
             ),
-            (Auth::Other { flavor: flavor::NONE, body: vec![] }, MessageWriteError::NonCanonical),
+            (Auth::Other { flavor: flavor::NONE, body: vec![] }, MessageWriteError::Xdr(XdrError::Unwritable)),
             (
                 Auth::Other { flavor: flavor::SYS, body: sys.to_bytes().unwrap() },
-                MessageWriteError::NonCanonical,
+                MessageWriteError::Xdr(XdrError::Unwritable),
             ),
         ] {
             let mut call = Call::new(1, 2, 3, Vec::new());
@@ -1516,7 +1582,7 @@ mod tests {
         }
         let alias =
             Message { xid: 1, body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(0)))) };
-        assert_eq!(alias.write(&mut Vec::new()), Err(MessageWriteError::NonCanonical));
+        assert_eq!(alias.write(&mut Vec::new()), Err(MessageWriteError::Xdr(XdrError::Unwritable)));
         contract::check_wire_value(&alias);
     }
 
@@ -1829,12 +1895,12 @@ mod tests {
             let mut call = Call::new(1, 2, 3, vec![]);
             call.cred = auth;
             let message = Message { xid: 1, body: Body::Call(call) };
-            assert_eq!(message.to_bytes(), Err(MessageWriteError::NonCanonical));
+            assert_eq!(message.to_bytes(), Err(MessageWriteError::Xdr(XdrError::Unwritable)));
             contract::check_wire_value(&message);
         }
         let message =
             Message { xid: 1, body: Body::Reply(Reply::Denied(Reject::AuthError(AuthStat::Other(5)))) };
-        assert_eq!(message.to_bytes(), Err(MessageWriteError::NonCanonical));
+        assert_eq!(message.to_bytes(), Err(MessageWriteError::Xdr(XdrError::Unwritable)));
         assert_eq!(AuthSys::parse(&sys.to_bytes().unwrap()), Ok(sys));
     }
 
@@ -2123,18 +2189,18 @@ mod tests {
     }
 
     fn random_auth(rng: &mut Lcg) -> Auth {
-        match rng.below(4) as u32 {
+        match rng.below(4) {
             0 => Auth::None,
             1 => Auth::Sys(AuthSys {
                 stamp: (rng.next() as u32),
-                machine_name: "h".repeat((rng.below(8) as u32) as usize),
+                machine_name: rng.text(7),
                 uid: (rng.below(2000) as u32),
                 gid: (rng.below(200) as u32),
-                gids: (0..(rng.below(4) as u32)).map(|_| rng.below(100) as u32).collect(),
+                gids: (0..rng.below(4)).map(|_| rng.below(100) as u32).collect(),
             }),
             _ => Auth::Other {
                 flavor: (rng.below(8) as u32),
-                body: (0..(rng.below(12) as u32)).map(|_| (rng.next() as u32) as u8).collect(),
+                body: rng.bytes(11),
             },
         }
     }
@@ -2144,12 +2210,12 @@ mod tests {
     fn random_message(rng: &mut Lcg) -> Message {
         let words = |rng: &mut Lcg| -> Vec<u8> {
             let mut w = Writer::new();
-            for _ in 0..(rng.below(6) as u32) {
-                w.uint(if (rng.below(2) as u32) == 0 { rng.below(4) as u32 } else { rng.next() as u32 });
+            for _ in 0..rng.below(6) {
+                w.uint(if !rng.coin() { rng.below(4) as u32 } else { rng.next() as u32 });
             }
             w.finish().unwrap()
         };
-        let body = match rng.below(4) as u32 {
+        let body = match rng.below(4) {
             0 => {
                 let map = Mapping {
                     program: (rng.below(3) as u32),
@@ -2157,7 +2223,7 @@ mod tests {
                     protocol: 6,
                     port: (rng.below(3) as u32),
                 };
-                let req = match rng.below(5) as u32 {
+                let req = match rng.below(5) {
                     0 => PmapRequest::Null,
                     1 => PmapRequest::Set(map),
                     2 => PmapRequest::Unset(map),
@@ -2185,7 +2251,7 @@ mod tests {
                 Body::Call(call)
             }
             2 => {
-                let status = match rng.below(6) as u32 {
+                let status = match rng.below(6) {
                     0 => Accept::Success(words(rng)),
                     1 => Accept::ProgUnavail,
                     2 => Accept::ProgMismatch { low: (rng.below(4) as u32), high: (rng.below(4) as u32) },
@@ -2195,7 +2261,7 @@ mod tests {
                 };
                 Body::Reply(Reply::Accepted { verf: random_auth(rng), status })
             }
-            _ => Body::Reply(Reply::Denied(if (rng.below(2) as u32) == 0 {
+            _ => Body::Reply(Reply::Denied(if !rng.coin() {
                 Reject::RpcMismatch { low: (rng.below(4) as u32), high: (rng.below(4) as u32) }
             } else {
                 Reject::AuthError(AuthStat::from_code(rng.below(20) as u32))
@@ -2210,16 +2276,8 @@ mod tests {
         let message = random_message(rng);
         contract::check_wire_value(&message);
         let mut b = message.to_bytes().unwrap_or_default();
-        for _ in 0..(rng.below(3) as u32) {
-            match rng.below(4) as u32 {
-                0 if !b.is_empty() => {
-                    let i = (rng.below(b.len() as u64) as u32) as usize;
-                    b[i] = (rng.next() as u32) as u8;
-                }
-                1 => b.truncate((rng.below(b.len() as u64 + 1) as u32) as usize),
-                2 => b.push((rng.next() as u32) as u8),
-                _ => {}
-            }
+        for _ in 0..rng.below(3) {
+            test_support::mutate(rng, &mut b);
         }
         b
     }
@@ -2244,11 +2302,11 @@ mod tests {
             let _ = RpcbResult::parse(procedure::GETADDR, &bytes);
             let mut r = Reader::new(&bytes);
             let _ = r.array(64, |r| r.optional(|r| r.opaque(64).map(<[u8]>::to_vec)));
-            let limit = (rng.below(64) as u32) as usize;
+            let limit = rng.index(64);
             contract::check_decode(|| super::records(limit), &bytes);
             contract::check_wire::<Message>(&bytes);
             contract::check_wire::<Record>(&bytes);
-            let wire = encode_fragments(&bytes, 1 + (rng.below(16) as u32) as usize).unwrap();
+            let wire = encode_fragments(&bytes, 1 + rng.index(16)).unwrap();
             assert_eq!(Record::parse(&wire), Ok(Record(bytes.clone())));
         }
         assert!(parsed > 500, "only {parsed} messages parsed");

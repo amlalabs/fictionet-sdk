@@ -5,7 +5,7 @@
 use fictionet::stdlib::codec::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::cotp::{ErrorTpdu, MAX_MESSAGE, ParseError, Reassembler, Tpdu, segment};
 use fictionet::stdlib::{cotp, tpkt};
 use libfuzzer_sys::fuzz_target;
@@ -15,13 +15,11 @@ fuzz_target!(|data: &[u8]| {
     check_decode(|| cotp::tpdus(tpkt::MAX_PACKET), data);
     check_decode_with_held_limit(|| cotp::messages(tpkt::MAX_PACKET, MESSAGE_LIMIT), data, MESSAGE_LIMIT);
     check_wire::<Tpdu>(data);
-    let mut stream = Stream::new(tpkt::Packets::new());
-    let mut packets = Vec::new();
-    let _ = pump(&mut stream, data, |packet| packets.push(packet.payload));
+    let (packets, _) = decode_all(tpkt::Packets::new, data);
 
     let mut messages = Reassembler::with_limit(MESSAGE_LIMIT);
     // Each packet's TPDU, and any bytes as a TPDU on their own.
-    for tpdu in packets.iter().map(Vec::as_slice).chain([data]) {
+    for tpdu in packets.iter().map(|packet| packet.payload.as_slice()).chain([data]) {
         check_wire::<Tpdu>(tpdu);
         check_wire_value(&tpkt::Packet::new(tpdu.to_vec()));
         match <Tpdu as Wire>::parse(tpdu) {

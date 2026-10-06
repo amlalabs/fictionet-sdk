@@ -1052,30 +1052,21 @@ mod tests {
     use crate::stdlib::codec::test_support::Lcg;
     use crate::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
 
-    fn text(rng: &mut Lcg, max: u32) -> String {
-        let n = rng.below(u64::from(max) + 1) as u32;
-        (0..n).map(|_| char::from(b'a' + (rng.below(26) as u32) as u8)).collect()
-    }
     fn rpcb(rng: &mut Lcg) -> Rpcb {
         Rpcb {
             program: rng.next() as u32,
             version: rng.next() as u32,
-            netid: text(rng, 6),
-            addr: text(rng, 20),
-            owner: text(rng, 5),
+            netid: rng.text(6),
+            addr: rng.text(20),
+            owner: rng.text(5),
         }
     }
     fn call_args(rng: &mut Lcg) -> CallArgs {
-        let n = rng.below(40) as usize;
         CallArgs {
             program: rng.next() as u32,
             version: rng.next() as u32,
             procedure: rng.next() as u32,
-            args: {
-                let mut bytes = vec![0; n];
-                rng.fill(&mut bytes);
-                bytes
-            },
+            args: rng.bytes(39),
         }
     }
     fn mapping(rng: &mut Lcg) -> Mapping {
@@ -1095,16 +1086,16 @@ mod tests {
         for n in &mut s.info {
             *n = rng.next() as u32 as i32;
         }
-        for _ in 0..(rng.below(3) as u32) {
+        for _ in 0..rng.below(3) {
             s.addrinfo.push(AddrStat {
                 program: rng.next() as u32,
                 version: rng.next() as u32,
                 success: rng.next() as u32 as i32,
                 failure: rng.next() as u32 as i32,
-                netid: text(rng, 4),
+                netid: rng.text(4),
             });
         }
-        for _ in 0..(rng.below(3) as u32) {
+        for _ in 0..rng.below(3) {
             s.rmtinfo.push(RmtCallStat {
                 program: rng.next() as u32,
                 version: rng.next() as u32,
@@ -1112,14 +1103,14 @@ mod tests {
                 success: rng.next() as u32 as i32,
                 failure: rng.next() as u32 as i32,
                 indirect: rng.next() as u32 as i32,
-                netid: text(rng, 4),
+                netid: rng.text(4),
             });
         }
         s
     }
     fn request(rng: &mut Lcg) -> Request {
-        if (rng.below(3) as u32) == 0 {
-            return Request::Pmap(match rng.below(6) as u32 {
+        if rng.below(3) == 0 {
+            return Request::Pmap(match rng.below(6) {
                 0 => PmapRequest::Null,
                 1 => PmapRequest::Set(mapping(rng)),
                 2 => PmapRequest::Unset(mapping(rng)),
@@ -1128,7 +1119,7 @@ mod tests {
                 _ => PmapRequest::CallIt(call_args(rng)),
             });
         }
-        let request = match rng.below(13) as u32 {
+        let request = match rng.below(13) {
             0 => RpcbRequest::Null,
             1 => RpcbRequest::Set(rpcb(rng)),
             2 => RpcbRequest::Unset(rpcb(rng)),
@@ -1136,16 +1127,12 @@ mod tests {
             4 => RpcbRequest::Dump,
             5 => RpcbRequest::CallIt(call_args(rng)),
             6 => RpcbRequest::GetTime,
-            7 => RpcbRequest::Uaddr2Taddr(text(rng, 30)),
+            7 => RpcbRequest::Uaddr2Taddr(rng.text(30)),
             8 => {
-                let n = rng.below(20) as usize;
+                let buf = rng.bytes(19);
                 RpcbRequest::Taddr2Uaddr(Netbuf {
-                    maxlen: n as u32 + (rng.below(100) as u32),
-                    buf: {
-                        let mut bytes = vec![0; n];
-                        rng.fill(&mut bytes);
-                        bytes
-                    },
+                    maxlen: buf.len() as u32 + (rng.below(100) as u32),
+                    buf,
                 })
             }
             9 => RpcbRequest::GetVersAddr(rpcb(rng)),
@@ -1157,61 +1144,47 @@ mod tests {
         Request::Rpcb { version, request }
     }
     fn pmap_result(rng: &mut Lcg) -> PmapResult {
-        match rng.below(5) as u32 {
+        match rng.below(5) {
             0 => PmapResult::Null,
-            1 => PmapResult::Bool((rng.below(2) as u32) == 1),
+            1 => PmapResult::Bool(rng.coin()),
             2 => PmapResult::Port(rng.next() as u32),
-            3 => PmapResult::Dump((0..(rng.below(4) as u32)).map(|_| mapping(rng)).collect()),
+            3 => PmapResult::Dump((0..rng.below(4)).map(|_| mapping(rng)).collect()),
             _ => {
-                let n = rng.below(30) as usize;
                 PmapResult::CallIt(CallResult {
                     port: rng.next() as u32,
-                    results: {
-                        let mut bytes = vec![0; n];
-                        rng.fill(&mut bytes);
-                        bytes
-                    },
+                    results: rng.bytes(29),
                 })
             }
         }
     }
     fn rpcb_result(rng: &mut Lcg) -> RpcbResult {
-        match rng.below(9) as u32 {
+        match rng.below(9) {
             0 => RpcbResult::Null,
-            1 => RpcbResult::Bool((rng.below(2) as u32) == 1),
-            2 => RpcbResult::Addr(text(rng, 30)),
-            3 => RpcbResult::Dump((0..(rng.below(4) as u32)).map(|_| rpcb(rng)).collect()),
+            1 => RpcbResult::Bool(rng.coin()),
+            2 => RpcbResult::Addr(rng.text(30)),
+            3 => RpcbResult::Dump((0..rng.below(4)).map(|_| rpcb(rng)).collect()),
             4 => {
-                let n = rng.below(30) as usize;
                 RpcbResult::CallIt(RmtCallResult {
-                    addr: text(rng, 20),
-                    results: {
-                        let mut bytes = vec![0; n];
-                        rng.fill(&mut bytes);
-                        bytes
-                    },
+                    addr: rng.text(20),
+                    results: rng.bytes(29),
                 })
             }
             5 => RpcbResult::Time(rng.next() as u32),
             6 => {
-                let n = rng.below(20) as usize;
+                let buf = rng.bytes(19);
                 RpcbResult::Netbuf(Netbuf {
-                    maxlen: n as u32 + (rng.below(100) as u32),
-                    buf: {
-                        let mut bytes = vec![0; n];
-                        rng.fill(&mut bytes);
-                        bytes
-                    },
+                    maxlen: buf.len() as u32 + (rng.below(100) as u32),
+                    buf,
                 })
             }
             7 => RpcbResult::AddrList(
-                (0..(rng.below(4) as u32))
+                (0..rng.below(4))
                     .map(|_| RpcbEntry {
-                        maddr: text(rng, 20),
-                        netid: text(rng, 5),
+                        maddr: rng.text(20),
+                        netid: rng.text(5),
                         semantics: rng.next() as u32,
-                        protofmly: text(rng, 5),
-                        proto: text(rng, 3),
+                        protofmly: rng.text(5),
+                        proto: rng.text(3),
                     })
                     .collect(),
             ),
@@ -1758,13 +1731,13 @@ mod tests {
         let mut g = Lcg::new(3);
         for _ in 0..5000 {
             let port = g.next() as u16;
-            let ip = if g.below(2) == 0 {
+            let ip = if !g.coin() {
                 IpAddr::from((g.next() as u32).to_be_bytes())
             } else {
                 let mut b = [0u8; 16];
                 for x in &mut b {
                     // Plenty of zeros, so "::" shows up.
-                    *x = if g.below(2) == 0 { 0 } else { g.next() as u8 };
+                    *x = if !g.coin() { 0 } else { g.next() as u8 };
                 }
                 IpAddr::from(b)
             };
@@ -1814,34 +1787,31 @@ mod tests {
                 // Random bytes, mostly small values so bools and lengths
                 // sometimes read.
                 0 => {
-                    let n = g.below(80) as usize;
+                    let n = g.index(80);
                     (0..n).map(|_| if g.below(3) == 0 { g.next() as u8 } else { 0 }).collect::<Vec<u8>>()
                 }
-                // A valid encoding with a byte changed.
+                // A valid encoding with one byte edit.
                 1 => {
-                    let mut b = if g.below(2) == 0 {
+                    let mut b = if !g.coin() {
                         rpcb_result(&mut g).to_bytes().unwrap()
                     } else {
                         request(&mut g).to_call().unwrap().args
                     };
-                    if !b.is_empty() {
-                        let at = g.below(b.len() as u64) as usize;
-                        b[at] = g.next() as u8;
-                    }
+                    test_support::mutate(&mut g, &mut b);
                     b
                 }
                 // Text that looks like a universal address.
                 _ => {
                     let alphabet = b"0123456789.:abcdef";
-                    let n = g.below(30) as usize;
-                    (0..n).map(|_| alphabet[g.below(alphabet.len() as u64) as usize]).collect()
+                    let n = g.index(30);
+                    (0..n).map(|_| alphabet[g.index(alphabet.len())]).collect()
                 }
             };
             reread(&data);
         }
     }
 
-    /// Calls in TCP records, fed to a record decoder a byte at a time and
+    /// Calls in TCP records, pushed into a record decoder a byte at a time and
     /// all at once, read the same.
     #[test]
     fn lcg_fuzz_stream() {
@@ -1851,24 +1821,22 @@ mod tests {
             let mut want = Vec::new();
             for xid in 0..g.below(4) {
                 let req = request(&mut g);
-                let mut bytes = req.call(xid as u32).unwrap().to_bytes().unwrap();
-                if g.below(4) == 0 && bytes.len() > 40 {
-                    let at = 40 + g.below((bytes.len() - 40) as u64) as usize;
-                    bytes[at] ^= 1 + g.below(255) as u8;
+                let mut message = req.call(xid as u32).unwrap();
+                if g.below(4) == 0 && let Body::Call(call) = &mut message.body {
+                    // Change arguments while keeping the RPC header valid.
+                    test_support::mutate(&mut g, &mut call.args);
                 }
+                let bytes = message.to_bytes().unwrap();
                 stream.extend_from_slice(&Record(bytes.to_vec()).to_bytes().unwrap());
                 want.push(bytes);
             }
-            contract::check_decode(|| records(MAX_RECORD), &stream);
+            contract::check_decode_with_alloc_limit(
+                || records(MAX_RECORD), &stream, 2 * (MAX_RECORD + super::super::onc_rpc::RECORD_MARK_LEN),
+            );
             {
-                let mut decoder = Stream::new(records(MAX_RECORD));
-                let mut got = Vec::new();
-                pump(&mut decoder, &stream, |item| {
-                    let Assembled::Message(bytes) = item;
-                    got.push(bytes);
-                })
-                .unwrap();
-                finish(&mut decoder, |_| panic!("unexpected record at EOF")).unwrap();
+                let (items, failure) = test_support::decode_all(|| records(MAX_RECORD), &stream);
+                assert_eq!(failure, None);
+                let got: Vec<_> = items.into_iter().map(|Assembled::Message(bytes)| bytes).collect();
                 assert_eq!(got, want);
                 for rec in &got {
                     let Ok(msg) = Message::parse(rec) else {
