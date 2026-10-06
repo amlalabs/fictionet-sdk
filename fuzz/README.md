@@ -37,6 +37,7 @@ cargo +nightly fuzz list
 | `web_http` | HTTP/1.1 and HTTP/2 bytes, plain or over TLS | `web::Sites` serving HTTP through hyper and h2 |
 | `proxy_http` | a request head | the HTTP proxy door of `fictionet attach`: CONNECT and absolute URIs, `Proxy-Authorization` |
 | `proxy_socks5` | a SOCKS5 client's bytes | the SOCKS5 door: greeting, login and request |
+| `fix` | arbitrary and constructed tag=value messages, corrupt lengths and envelopes followed by valid frames, malformed field items, SOH-bearing data, caller group layouts, and timed sessions | `stdlib::fix`: exact wire and allocation contracts, resynchronization, BodyLength/CheckSum, data pairs, groups, typed views, Logon, bounded resend retries, field Rejects, deferred Logout, and liveness |
 | `modbus` | TCP bytes, standalone PDUs, and constructed frames, requests, and responses | `modbus`: stream chunking and EOF, MBAP and PDU limits, exception replies, value round trips, and transactional frame writes |
 | `sbe` | XML schemas, arbitrary and mutated car messages, and constructed value trees | `stdlib::sbe`: bounded XML and refs, both byte orders, schema-defined headers, primitive ranges/nulls, enums, sets, arrays, nested groups, variable data, versions, exact wire round trips, transactional writes, and stream allocation/chunking contracts |
 | `dnp3` | arbitrary and constructed CRC-protected frames; checks chunking, CRCs, transport reassembly, application fragments and write rollback | `stdlib::dnp3`: framing, transport reassembly and application headers |

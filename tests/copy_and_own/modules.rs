@@ -40,6 +40,8 @@ macro_rules! protocols {
         pub mod enip;
         #[path = "../../src/stdlib/fastcgi.rs"]
         pub mod fastcgi;
+        #[path = "../../src/stdlib/fix.rs"]
+        pub mod fix;
         #[path = "../../src/stdlib/ftp.rs"]
         pub mod ftp;
         #[path = "../../codegen/tests/golden/recursive.rs"]

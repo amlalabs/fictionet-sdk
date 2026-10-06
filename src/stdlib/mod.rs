@@ -171,6 +171,7 @@ pub mod dns;
 pub mod dtls;
 pub mod enip;
 pub mod fastcgi;
+pub mod fix;
 pub mod ftp;
 pub mod geneve;
 pub mod git_protocol;

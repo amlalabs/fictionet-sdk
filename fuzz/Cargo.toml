@@ -858,3 +858,10 @@ path = "fuzz_targets/codegen_ir.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fix"
+path = "fuzz_targets/fix.rs"
+test = false
+doc = false
+bench = false
