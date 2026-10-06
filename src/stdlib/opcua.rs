@@ -11,7 +11,7 @@
 //! CloseSecureChannel services with security policy None.
 //!
 //! Nothing here reads a socket. A world pushes connection bytes to a
-//! [`Stream`](super::codec::Stream) of [`Messages`] and gets [`Message`]s back.
+//! [`Stream<Messages>`](super::codec::Stream) and gets [`Message`]s back.
 //! It answers a [`Hello`] with an [`Acknowledge`], gives the decoder the
 //! negotiated [`Limits`], reads each [`SecureMessage`]'s body as a [`Service`],
 //! and splits replies with [`Message::chunks`]. Each chunk is written with
@@ -31,19 +31,6 @@
 //! sends back in an ERR message before it closes the connection. Every
 //! message writer checks the same limits and returns an [`EncodeError`]
 //! rather than write bytes a reader would refuse.
-//!
-//! Use [`Frames`] with [`Stream`](super::codec::Stream) to read
-//! individual [`Chunk`]s under negotiated limits. [`Chunk`] implements
-//! [`Wire`] for exact parsing and transactional writing under the module's
-//! maximum chunk size. Message assembly and connection sequence checks
-//! use [`Messages`]. [`Message::chunks`] takes explicit peer limits.
-//!
-//! Built-in binary values and services implement [`Wire`]. The borrowed
-//! [`Reader`] and [`Binary`] trait read individual fields, including reserved
-//! Variant types. Exact [`Wire`] parsing rejects those types because senders
-//! may not write them. Writers reject dates, picoseconds, and namespace fields
-//! that would read back differently. NaNs have a canonical wire form and
-//! compare equal within the same floating type.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -350,9 +337,6 @@ pub enum EncodeError {
     /// A Hello or Acknowledge names a buffer smaller than
     /// [`MIN_BUFFER_SIZE`].
     BufferSize(u32),
-    /// A [`Service::Other`] carries the type id of a service this module
-    /// reads, so its body would be read as that service.
-    KnownTypeId,
     /// A NodeId's String identifier or a QualifiedName's name holds a C0
     /// or C1 control character.
     ControlChar,
@@ -360,8 +344,9 @@ pub enum EncodeError {
     /// receiver thumbprint under policy None, or a thumbprint that is not
     /// 20 bytes.
     SecurityHeader,
-    /// A field would read back as a different value.
-    Value,
+    /// A field would read back as a different value, or [`Service::Other`]
+    /// carries a known service type ID.
+    Unwritable,
 }
 
 impl std::fmt::Display for EncodeError {
@@ -373,10 +358,9 @@ impl std::fmt::Display for EncodeError {
             EncodeError::VariantType => f.write_str("a Variant holds a value of the wrong type"),
             EncodeError::Dimensions => f.write_str("array dimensions do not match the array"),
             EncodeError::BufferSize(n) => write!(f, "buffer size {n} is below {MIN_BUFFER_SIZE}"),
-            EncodeError::KnownTypeId => f.write_str("an unread service carries a known type id"),
             EncodeError::ControlChar => f.write_str("a name holds a control character"),
             EncodeError::SecurityHeader => f.write_str("the security header breaks its policy"),
-            EncodeError::Value => f.write_str("a field would change on the wire"),
+            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
         }
     }
 }
@@ -680,7 +664,7 @@ impl Writer {
     /// A canonical DateTime. Values changed by the reader are refused.
     fn date_time(&mut self, v: i64) {
         if v != clamp_date_time(v) {
-            self.error = Some(EncodeError::Value);
+            self.error = Some(EncodeError::Unwritable);
         }
         self.i64(v);
     }
@@ -1801,7 +1785,7 @@ impl DataValue {
         }
         if let Some(p) = self.source_picoseconds {
             if p > MAX_PICOSECONDS {
-                return Err(EncodeError::Value);
+                return Err(EncodeError::Unwritable);
             }
             w.u16(p);
         }
@@ -1810,7 +1794,7 @@ impl DataValue {
         }
         if let Some(p) = self.server_picoseconds {
             if p > MAX_PICOSECONDS {
-                return Err(EncodeError::Value);
+                return Err(EncodeError::Unwritable);
             }
             w.u16(p);
         }
@@ -2168,6 +2152,11 @@ impl Wire for Chunk {
     /// Reads exactly one chunk bounded by [`MAX_BUFFER_SIZE`].
     /// The body stays opaque. Negotiated limits belong to [`Frames`].
     /// Handshake chunk type bytes read as [`ChunkType::Final`].
+    /// Returns [`ChunkParseError::Truncated`] for incomplete input and
+    /// [`ChunkParseError::Trailing`] for extra bytes. Invalid message types,
+    /// chunk types or sizes return [`ChunkParseError::Chunk`] containing
+    /// [`ChunkError::MessageType`], [`ChunkError::ChunkType`],
+    /// [`ChunkError::TooSmall`] or [`ChunkError::TooLarge`].
     fn parse(b: &[u8]) -> Result<Self, ChunkParseError> {
         let limits = Limits {
             receive_buffer_size: MAX_BUFFER_SIZE,
@@ -2182,6 +2171,8 @@ impl Wire for Chunk {
 
     /// Appends at most [`MAX_BUFFER_SIZE`] bytes, leaving `out` unchanged
     /// on error. Only MSG chunks may be intermediate or abort chunks.
+    /// Returns [`ChunkError::ChunkType`] for an intermediate or abort chunk
+    /// outside MSG, and [`ChunkError::TooLarge`] above [`MAX_BUFFER_SIZE`].
     fn write(&self, out: &mut Vec<u8>) -> Result<(), ChunkError> {
         if self.message_type != MessageType::Message && self.chunk_type != ChunkType::Final {
             return Err(ChunkError::ChunkType(
@@ -2259,6 +2250,10 @@ impl Decode for Frames {
         self.limits.chunk_limit().max(MAX_HANDSHAKE_SIZE) as usize
     }
 
+    /// Reads a chunk prefix, returning [`Step::Need`] while incomplete.
+    /// Returns [`ChunkError::MessageType`] or [`ChunkError::ChunkType`] for
+    /// invalid type bytes, [`ChunkError::TooSmall`] below the header size,
+    /// and [`ChunkError::TooLarge`] above the negotiated limit.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Chunk>, ChunkError> {
         Ok(match Chunk::parse(input, &self.limits)? {
             Some((chunk, used)) => Step::Item(chunk, used),
@@ -2724,7 +2719,7 @@ fn follows(prev: u32, got: u32) -> bool {
 
 /// Reads OPC UA messages and assembles MSG chunks under negotiated limits.
 ///
-/// Use with [`Stream`](super::codec::Stream). Each secure chunk must follow
+/// Use with [`Stream<Messages>`](super::codec::Stream). Each secure chunk must follow
 /// the previous sequence number, including across message boundaries.
 /// Input stays in the stream. Only an unfinished message body is held here.
 /// EOF during an assembly returns [`ChunkError::Incomplete`], including when
@@ -2939,6 +2934,14 @@ impl Decode for Messages {
         self.partial.as_ref().map_or(0, |p| p.body.len())
     }
 
+    /// Reads chunks and joins secure messages. Chunk header errors are those
+    /// of [`Frames::decode`]. Invalid bodies return [`ChunkError::Decode`];
+    /// undersized handshake buffers return [`ChunkError::BufferSize`].
+    /// Broken order or changed secure headers return [`ChunkError::Sequence`]
+    /// or [`ChunkError::Interleaved`]. Changed channel or token IDs return
+    /// [`ChunkError::Mismatch`]. Excess assembly bytes or chunks return
+    /// [`ChunkError::MessageTooLarge`] or [`ChunkError::TooManyChunks`].
+    /// EOF during assembly returns [`ChunkError::Incomplete`].
     fn decode(&mut self, input: &[u8], eof: bool) -> Result<Step<Message>, ChunkError> {
         match Chunk::parse(input, &self.limits)? {
             Some((chunk, used)) => Ok(match self.take(chunk)? {
@@ -3186,39 +3189,6 @@ pub enum Service {
 }
 
 impl Service {
-    /// Reads a message body. A known service must fill the body exactly.
-    pub fn parse(body: &[u8]) -> Result<Service, DecodeError> {
-        if body.len() > MAX_MESSAGE_SIZE as usize {
-            return Err(DecodeError::Length(
-                i32::try_from(body.len()).unwrap_or(i32::MAX),
-            ));
-        }
-        let mut r = Reader::new(body);
-        let type_id: NodeId = r.read()?;
-        let service = match type_id.ns0() {
-            Some(encoding_id::OPEN_SECURE_CHANNEL_REQUEST) => {
-                Service::OpenSecureChannelRequest(r.read()?)
-            }
-            Some(encoding_id::OPEN_SECURE_CHANNEL_RESPONSE) => {
-                Service::OpenSecureChannelResponse(r.read()?)
-            }
-            Some(encoding_id::CLOSE_SECURE_CHANNEL_REQUEST) => {
-                Service::CloseSecureChannelRequest(r.read()?)
-            }
-            Some(encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE) => {
-                Service::CloseSecureChannelResponse(r.read()?)
-            }
-            Some(encoding_id::SERVICE_FAULT) => Service::ServiceFault(r.read()?),
-            _ => {
-                return Ok(Service::Other {
-                    type_id,
-                    body: r.rest().to_vec(),
-                });
-            }
-        };
-        r.finish()?;
-        Ok(service)
-    }
 
     /// The NodeId of the service's encoding.
     pub fn type_id(&self) -> NodeId {
@@ -3270,7 +3240,7 @@ impl BinaryWrite for ExpandedNodeId {
         if (uri.is_some() && self.node_id.namespace != 0)
             || self.namespace_uri.as_deref() == Some("")
         {
-            return Err(EncodeError::Value);
+            return Err(EncodeError::Unwritable);
         }
         self.node_id.encode_flags(w, flags)?;
         if let Some(uri) = uri {
@@ -3420,11 +3390,15 @@ impl BinaryWrite for OpenSecureChannelResponse {
 }
 
 macro_rules! binary_wire {
-    ($($ty:ty),+ $(,)?) => { $(
+    ($($ty:ty => ($read:literal, $write:literal)),+ $(,)?) => { $(
         impl Wire for $ty {
             type ParseError = DecodeError;
             type WriteError = EncodeError;
 
+            /// Reads one complete binary value. Returns [`DecodeError::End`]
+            /// for short fields, [`DecodeError::Trailing`] for extra bytes,
+            /// and [`DecodeError::Length`] above [`MAX_MESSAGE_SIZE`].
+            #[doc = $read]
             fn parse(bytes: &[u8]) -> Result<Self, DecodeError> {
                 if bytes.len() > MAX_MESSAGE_SIZE as usize {
                     return Err(DecodeError::Length(i32::try_from(bytes.len()).unwrap_or(i32::MAX)));
@@ -3436,6 +3410,8 @@ macro_rules! binary_wire {
                 Ok(value)
             }
 
+            /// Appends the binary value. Leaves `out` unchanged on error.
+            #[doc = $write]
             fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
                 let mut writer = Writer::new();
                 self.encode(&mut writer)?;
@@ -3447,33 +3423,197 @@ macro_rules! binary_wire {
 }
 
 binary_wire!(
-    StatusCode,
-    Guid,
-    NodeId,
-    ExpandedNodeId,
-    QualifiedName,
-    LocalizedText,
-    ExtensionObject,
-    DiagnosticInfo,
-    Variant,
-    DataValue,
-    RequestHeader,
-    ResponseHeader,
-    RequestType,
-    SecurityMode,
-    OpenSecureChannelRequest,
-    ChannelSecurityToken,
-    OpenSecureChannelResponse
+    StatusCode => (
+        "Every four-byte status code is accepted.",
+        "Every status code is writable; this method never returns an error."
+    ),
+    Guid => (
+        "Every 16-byte GUID is accepted.",
+        "Every GUID is writable; this method never returns an error."
+    ),
+    NodeId => (
+        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
+[`DecodeError::ControlChar`].",
+        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
+[`EncodeError::ControlChar`] for control characters in names."
+    ),
+    ExpandedNodeId => (
+        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
+[`DecodeError::ControlChar`]. Namespace URI lengths and UTF-8 use the same string
+errors.",
+        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
+[`EncodeError::ControlChar`] for control characters in names. Returns
+[`EncodeError::Unwritable`] for an empty namespace URI or a nonzero namespace index with
+a URI. Excess total or URI sizes return [`EncodeError::TooLong`]."
+    ),
+    QualifiedName => (
+        "Invalid string lengths or UTF-8 return [`DecodeError::Length`] or [`DecodeError::Utf8`].
+Excess name characters or control characters return [`DecodeError::Length`] or
+[`DecodeError::ControlChar`].",
+        "Returns [`EncodeError::TooLong`] above [`MAX_QUALIFIED_NAME_LEN`] characters and
+[`EncodeError::ControlChar`] for control characters."
+    ),
+    LocalizedText => (
+        "Invalid string lengths or UTF-8 return [`DecodeError::Length`] or [`DecodeError::Utf8`].
+Unknown mask bits return [`DecodeError::Mask`].",
+        "Returns [`EncodeError::TooLong`] for strings above [`MAX_STRING_LEN`] or total bytes
+above [`MAX_MESSAGE_SIZE`]."
+    ),
+    ExtensionObject => (
+        "Invalid identifier forms return [`DecodeError::NodeIdForm`]. Invalid lengths, UTF-8 or
+control characters in names return [`DecodeError::Length`], [`DecodeError::Utf8`] or
+[`DecodeError::ControlChar`]. Unknown body encodings return [`DecodeError::Mask`];
+invalid body lengths return [`DecodeError::Length`].",
+        "Returns [`EncodeError::TooLong`] for excess name or identifier lengths and
+[`EncodeError::ControlChar`] for control characters in names. Excess body or total sizes
+return [`EncodeError::TooLong`]."
+    ),
+    DiagnosticInfo => (
+        "Unknown mask bits return [`DecodeError::Mask`]. Invalid string lengths or UTF-8 return
+[`DecodeError::Length`] or [`DecodeError::Utf8`]. Excess nesting or value counts return
+[`DecodeError::Depth`] or [`DecodeError::TooManyValues`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
+[`EncodeError::TooManyValues`] above [`MAX_VALUES`]."
+    ),
+    Variant => (
+        "Invalid or reserved type IDs, including reserved types inside arrays, return
+[`DecodeError::VariantType`]. Invalid array dimensions return
+[`DecodeError::Dimensions`]. Nested fields may also return [`DecodeError::Length`],
+[`DecodeError::Utf8`], [`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`],
+[`DecodeError::Mask`], [`DecodeError::Depth`] or [`DecodeError::TooManyValues`] for
+invalid encodings or limits. Use [`Reader`] for reserved types.",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
+[`EncodeError::TooManyValues`] above [`MAX_VALUES`]. Returns
+[`EncodeError::VariantType`] for reserved types, mismatched array elements, scalar
+Variants, DiagnosticInfo or a DataValue inside another DataValue. Invalid dimensions
+return [`EncodeError::Dimensions`]. Control characters in names return
+[`EncodeError::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
+picoseconds above [`MAX_PICOSECONDS`] return [`EncodeError::Unwritable`]. NaNs are
+written in canonical form."
+    ),
+    DataValue => (
+        "Unknown mask bits return [`DecodeError::Mask`]. Invalid or reserved type IDs, including
+reserved types inside arrays, return [`DecodeError::VariantType`]. Invalid array
+dimensions return [`DecodeError::Dimensions`]. Nested fields may also return
+[`DecodeError::Length`], [`DecodeError::Utf8`], [`DecodeError::NodeIdForm`],
+[`DecodeError::ControlChar`], [`DecodeError::Mask`], [`DecodeError::Depth`] or
+[`DecodeError::TooManyValues`] for invalid encodings or limits. Use [`Reader`] for
+reserved types.",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::TooDeep`] for nesting above [`MAX_DEPTH`], and
+[`EncodeError::TooManyValues`] above [`MAX_VALUES`]. Returns
+[`EncodeError::VariantType`] for reserved types, mismatched array elements, scalar
+Variants, DiagnosticInfo or a DataValue inside another DataValue. Invalid dimensions
+return [`EncodeError::Dimensions`]. Control characters in names return
+[`EncodeError::ControlChar`]. Noncanonical dates or namespaces, empty namespace URIs or
+picoseconds above [`MAX_PICOSECONDS`] return [`EncodeError::Unwritable`]. NaNs are
+written in canonical form."
+    ),
+    RequestHeader => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps."
+    ),
+    ResponseHeader => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
+Excess diagnostic nesting or array value counts return [`DecodeError::Depth`] or
+[`DecodeError::TooManyValues`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
+array value counts return [`EncodeError::TooDeep`] or [`EncodeError::TooManyValues`]."
+    ),
+    RequestType => (
+        "An integer other than zero or one returns [`DecodeError::Enum`].",
+        "Both request types are writable; this method never returns an error."
+    ),
+    SecurityMode => (
+        "An integer outside zero through three returns [`DecodeError::Enum`].",
+        "All four modes are writable, including Invalid; this method never returns an error."
+    ),
+    OpenSecureChannelRequest => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
+Unknown request types or security modes return [`DecodeError::Enum`]. Invalid nonce
+lengths return [`DecodeError::Length`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps."
+    ),
+    ChannelSecurityToken => (
+        "All fields are accepted; the creation time is clamped as in [`Reader::date_time`].",
+        "Returns [`EncodeError::Unwritable`] if the creation time is negative or is at least
+[`MAX_DATE_TIME`] without being `i64::MAX`."
+    ),
+    OpenSecureChannelResponse => (
+        "Invalid nested fields return [`DecodeError::Length`], [`DecodeError::Utf8`],
+[`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`] or [`DecodeError::Mask`].
+Excess diagnostic nesting or array value counts return [`DecodeError::Depth`] or
+[`DecodeError::TooManyValues`]. Invalid nonce lengths return [`DecodeError::Length`].",
+        "Returns [`EncodeError::TooLong`] for excess field or total sizes,
+[`EncodeError::ControlChar`] for control characters in names, and
+[`EncodeError::Unwritable`] for noncanonical timestamps. Excess diagnostic nesting or
+array value counts return [`EncodeError::TooDeep`] or [`EncodeError::TooManyValues`]."
+    )
 );
 
 impl Wire for Service {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a message body. A known service must fill the body exactly.
+    /// Returns [`DecodeError::Length`] above [`MAX_MESSAGE_SIZE`] or for
+    /// invalid field lengths, [`DecodeError::End`] for short fields, and
+    /// [`DecodeError::Trailing`] after a known service. Nested fields can return
+    /// [`DecodeError::Utf8`], [`DecodeError::NodeIdForm`], [`DecodeError::ControlChar`],
+    /// [`DecodeError::Mask`], [`DecodeError::Enum`], [`DecodeError::Depth`] or
+    /// [`DecodeError::TooManyValues`] for their invalid encodings or limits.
+    fn parse(body: &[u8]) -> Result<Service, DecodeError> {
+        if body.len() > MAX_MESSAGE_SIZE as usize {
+            return Err(DecodeError::Length(
+                i32::try_from(body.len()).unwrap_or(i32::MAX),
+            ));
+        }
+        let mut r = Reader::new(body);
+        let type_id: NodeId = r.read()?;
+        let service = match type_id.ns0() {
+            Some(encoding_id::OPEN_SECURE_CHANNEL_REQUEST) => {
+                Service::OpenSecureChannelRequest(r.read()?)
+            }
+            Some(encoding_id::OPEN_SECURE_CHANNEL_RESPONSE) => {
+                Service::OpenSecureChannelResponse(r.read()?)
+            }
+            Some(encoding_id::CLOSE_SECURE_CHANNEL_REQUEST) => {
+                Service::CloseSecureChannelRequest(r.read()?)
+            }
+            Some(encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE) => {
+                Service::CloseSecureChannelResponse(r.read()?)
+            }
+            Some(encoding_id::SERVICE_FAULT) => Service::ServiceFault(r.read()?),
+            _ => {
+                return Ok(Service::Other {
+                    type_id,
+                    body: r.rest().to_vec(),
+                });
+            }
+        };
+        r.finish()?;
+        Ok(service)
     }
 
+    /// Writes the encoding NodeId and service fields. Returns
+    /// [`EncodeError::Unwritable`] for `Other` with a known service ID or a
+    /// noncanonical timestamp. Returns [`EncodeError::TooLong`] for excess
+    /// field or message sizes, [`EncodeError::TooDeep`] or
+    /// [`EncodeError::TooManyValues`] for nested diagnostics, and
+    /// [`EncodeError::ControlChar`] for control characters in names.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
         let mut w = Writer::new();
         self.type_id().encode(&mut w)?;
@@ -3493,7 +3633,7 @@ impl Wire for Service {
                     encoding_id::CLOSE_SECURE_CHANNEL_RESPONSE,
                 ];
                 if type_id.ns0().is_some_and(|id| known.contains(&id)) {
-                    return Err(EncodeError::KnownTypeId);
+                    return Err(EncodeError::Unwritable);
                 }
                 w.bytes(body);
             }
@@ -3506,7 +3646,7 @@ impl Wire for Service {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use super::super::codec::{
         Fail, Stream, contract, pump,
         test_support::{self, Lcg, decode_all},
     };
@@ -3559,18 +3699,9 @@ mod tests {
         b
     }
 
-    fn all(
-        d: &mut Stream<Messages>,
-    ) -> Vec<Result<Message, crate::stdlib::codec::Fail<ChunkError>>> {
-        let mut out = Vec::new();
-        while let Some(m) = d.next() {
-            let stop = m.is_err();
-            out.push(m);
-            if stop {
-                break;
-            }
-        }
-        out
+    // Drain staged chunks without marking EOF; later pushes remain valid.
+    fn drain(d: &mut Stream<Messages>) -> Vec<Result<Message, Fail<ChunkError>>> {
+        std::iter::from_fn(|| d.next()).collect()
     }
 
     // Examples from OPC UA Part 6, section 5.2.
@@ -4205,7 +4336,7 @@ mod tests {
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         assert_eq!(d.push(&bytes), bytes.len());
         assert_eq!(d.push(&rh_bytes), rh_bytes.len());
-        assert_eq!(all(&mut d), [Ok(e), Ok(rh)]);
+        assert_eq!(drain(&mut d), [Ok(e), Ok(rh)]);
         let long = ErrorMessage {
             error: StatusCode::GOOD,
             reason: "r".repeat(MAX_REASON_LEN + 1),
@@ -4399,7 +4530,7 @@ mod tests {
             type_id: NodeId::numeric(0, 446),
             body: vec![],
         };
-        assert_eq!(fake.to_bytes(), Err(EncodeError::KnownTypeId));
+        assert_eq!(fake.to_bytes(), Err(EncodeError::Unwritable));
         assert_eq!(Service::parse(&[]), Err(DecodeError::End));
     }
 
@@ -4467,6 +4598,9 @@ mod tests {
         assert_eq!(chunks[2].body[8..12], le32(0));
         let bytes = wire_chunks(chunks);
         contract::check_decode_with_held_limit(Messages::new, &bytes, MAX_MESSAGE_SIZE as usize);
+        contract::check_decode_with_alloc_limit(
+            Messages::new, &bytes, 2 * MAX_HANDSHAKE_SIZE as usize,
+        );
         let mut stream = Stream::new(Messages::new());
         let mut messages = Vec::new();
         pump(&mut stream, &bytes, |message| messages.push(message)).unwrap();
@@ -4608,7 +4742,7 @@ mod tests {
             for c in &chunks {
                 assert_eq!(d.push(c), c.len());
             }
-            let got = all(&mut d);
+            let got = drain(&mut d);
             assert_eq!(
                 got.last(),
                 Some(&Err(Fail::Protocol(want.clone()))),
@@ -5269,7 +5403,7 @@ mod tests {
         let input = &msg_chunk(b'F', 7, 1, 10, 2, b"b");
         assert_eq!(d.push(input), input.len());
         assert_eq!(
-            all(&mut d),
+            drain(&mut d),
             [
                 Ok(msg(1, 10, 1, b"a".to_vec())),
                 Err(Fail::Protocol(ChunkError::Sequence {
@@ -5303,14 +5437,14 @@ mod tests {
         });
         let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(d.push(input), input.len());
-        assert!(all(&mut d).iter().all(Result::is_ok));
+        assert!(drain(&mut d).iter().all(Result::is_ok));
         let mut d = Stream::new(Messages::new());
         let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(d.push(input), input.len());
         let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(d.push(input), input.len());
         assert_eq!(
-            all(&mut d).last(),
+            drain(&mut d).last(),
             Some(&Err(Fail::Protocol(ChunkError::Sequence {
                 expected: 6,
                 got: 8
@@ -5594,7 +5728,7 @@ mod tests {
             namespace_uri: Some("urn:x".into()),
             server_index: 0,
         };
-        assert_eq!(e.to_bytes(), Err(EncodeError::Value));
+        assert_eq!(e.to_bytes(), Err(EncodeError::Unwritable));
         let e = ExpandedNodeId {
             node_id: NodeId::numeric(0, 42),
             ..e
@@ -5616,7 +5750,7 @@ mod tests {
             namespace_uri: Some(String::new()),
             server_index: 0,
         };
-        assert_eq!(empty.to_bytes(), Err(EncodeError::Value));
+        assert_eq!(empty.to_bytes(), Err(EncodeError::Unwritable));
         assert_eq!(
             <ExpandedNodeId as Wire>::parse(&[0x80, 42, 0, 0, 0, 0])
                 .unwrap()
@@ -5640,7 +5774,7 @@ mod tests {
             server_picoseconds: Some(10_000),
             ..Default::default()
         };
-        assert_eq!(d.to_bytes(), Err(EncodeError::Value));
+        assert_eq!(d.to_bytes(), Err(EncodeError::Unwritable));
         let d = DataValue {
             server_picoseconds: Some(MAX_PICOSECONDS),
             ..d
@@ -5768,11 +5902,11 @@ mod tests {
         // Part 6, 5.2.2.5.
         assert_eq!(
             Wire::to_bytes(&Variant::Scalar(Value::DateTime(-1))),
-            Err(EncodeError::Value)
+            Err(EncodeError::Unwritable)
         );
         assert_eq!(
             Wire::to_bytes(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME))),
-            Err(EncodeError::Value)
+            Err(EncodeError::Unwritable)
         );
         assert_eq!(
             Wire::to_bytes(&Variant::Scalar(Value::DateTime(MAX_DATE_TIME - 1))).unwrap()[1..],
@@ -5793,7 +5927,7 @@ mod tests {
             timestamp: -9,
             ..Default::default()
         };
-        assert_eq!(Wire::to_bytes(&h), Err(EncodeError::Value));
+        assert_eq!(Wire::to_bytes(&h), Err(EncodeError::Unwritable));
     }
 
     /// Checks permissive reads, including reserved Variant types that cannot be written.
@@ -5827,7 +5961,7 @@ mod tests {
                 let mut v = rng.bytes(299);
                 let n = v.len();
                 // Start some with a real header so the parsers go deeper.
-                if n >= 8 && rng.below(2) == 0 {
+                if n >= 8 && rng.coin() {
                     let types: [&[u8; 4]; 7] = [
                         b"HELF", b"ACKF", b"ERRF", b"RHEF", b"OPNF", b"CLOF", b"MSGC",
                     ];

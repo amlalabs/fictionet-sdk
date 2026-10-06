@@ -3,7 +3,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::opcua::{
     Binary, Chunk, ChunkType, DataValue, DiagnosticInfo, EncodeError, ExpandedNodeId,
     ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName, Reader,
@@ -78,20 +78,19 @@ fuzz_target!(|data: &[u8]| {
         data,
         limits.message_limit() as usize,
     );
-    let mut stream = Stream::new(Messages::with_limits(limits));
-    let _ = pump(&mut stream, data, |message| {
+    let (messages, _) = decode_all(|| Messages::with_limits(limits), data);
+    for message in messages {
         let mut bytes = Vec::new();
         for chunk in message.chunks(&limits).unwrap() {
             chunk.write(&mut bytes).unwrap();
         }
-        let mut again = Stream::new(Messages::with_limits(limits));
-        let mut back = Vec::new();
-        pump(&mut again, &bytes, |m| back.push(m)).unwrap();
+        let (back, failure) = decode_all(|| Messages::with_limits(limits), &bytes);
+        assert!(failure.is_none());
         assert_eq!(back, [message.clone()]);
         if let Message::Secure(s) = message {
             check_wire::<Service>(&s.body);
         }
-    });
+    }
 
     // Any bytes as values on their own.
     check_wire::<Variant>(data);

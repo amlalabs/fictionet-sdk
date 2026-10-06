@@ -2,7 +2,7 @@
 
 use core::fmt::Debug;
 use fictionet::stdlib::codec::{
-    Decode, Fail, Step, Stream, Wire, contract, finish, pump, test_support::chunks,
+    Decode, Fail, Step, Stream, Wire, contract, finish, pump, test_support::{chunks, decode_all},
 };
 use fictionet::stdlib::{dnp3, enip, iec104, opcua, rdp, tpkt};
 
@@ -12,7 +12,7 @@ where
     D::Item: PartialEq + Debug,
     D::Error: Clone + PartialEq + Debug,
 {
-    contract::check_decode(&make, bytes);
+    contract::check_decode_with_alloc_limit(&make, bytes, 2 * make().capacity());
     for pattern in [&[][..], &[3, 1, 37][..], &[1][..]] {
         let mut stream = Stream::new(make());
         let capacity = stream.decoder().capacity();
@@ -374,13 +374,8 @@ fn opcua_handshake_and_multichunk_message() {
             chunk.write(&mut original).unwrap();
         }
     }
-    let mut rest = original.as_slice();
-    let mut frames = Vec::new();
-    while let Some((frame, used)) = opcua::Chunk::parse(rest, &limits).unwrap() {
-        frames.push(frame);
-        rest = &rest[used..];
-    }
-    assert!(rest.is_empty());
+    let (frames, failure) = decode_all(|| opcua::Frames::with_limits(limits), &original);
+    assert!(failure.is_none());
     assert!(
         frames
             .iter()

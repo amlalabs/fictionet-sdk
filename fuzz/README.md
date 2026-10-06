@@ -30,16 +30,16 @@ cargo +nightly fuzz list
 | `proxy_http` | a request head | the HTTP proxy door of `fictionet attach`: CONNECT and absolute URIs, `Proxy-Authorization` |
 | `proxy_socks5` | a SOCKS5 client's bytes | the SOCKS5 door: greeting, login and request |
 | `modbus` | a Modbus/TCP byte stream, whole and a byte at a time | `modbus::Decoder`, `Frame`, `Request` and `Response`, reading and writing |
-| `dnp3` | arbitrary and constructed link frames, CRC blocks and transport segments | `stdlib::dnp3`: framing, transport reassembly and application headers |
-| `iec104` | APDU streams, ASDU headers and information object layouts | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
-| `rdp` | mixed slow-path and fast-path streams, connection and plaintext PDUs | `stdlib::rdp`: codec contracts, X.224, GCC and MCS |
+| `dnp3` | arbitrary and constructed CRC-protected frames; checks chunking, CRCs, transport reassembly, application fragments and write rollback | `stdlib::dnp3`: framing, transport reassembly and application headers |
+| `iec104` | arbitrary APDUs and constructed frames/ASDUs; checks chunking, sequence ranges, both object address layouts and write rollback | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
+| `rdp` | bounded arbitrary transport and plaintext bytes plus constructed values; checks chunking, TPKT/COTP composition, GCC/MCS fields, body limits and write rollback | `stdlib::rdp`: codec contracts, X.224, GCC and MCS |
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
-| `enip` | packet streams and CIP bodies through codec contracts | `stdlib::enip`: EtherNet/IP and CIP |
+| `enip` | arbitrary packet streams and CIP bodies plus constructed packets; checks chunking, packet policy, nested body round trips and write rollback | `stdlib::enip`: EtherNet/IP and CIP |
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
@@ -61,7 +61,7 @@ cargo +nightly fuzz list
 | `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
 | `ocsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
-| `opcua` | chunks, assembled messages and binary values through codec contracts | `stdlib::opcua`: OPC UA over TCP |
+| `opcua` | arbitrary chunks under selected limits and constructed chunks; checks assembly bounds, sequence rules, binary values, reserved-type reads and write rollback | `stdlib::opcua`: OPC UA over TCP |
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
 | `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
 | `proxy_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::proxy_protocol`: The PROXY protocol |

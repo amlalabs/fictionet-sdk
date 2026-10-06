@@ -11,9 +11,9 @@
 //! and the Wireshark `enip` and `cip` dissectors. All multi-byte fields
 //! are little-endian.
 //!
-//! Nothing here reads a socket. A world that plays a device feeds the
-//! bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Stream`](super::codec::Stream) of [`Frames`], gets [`Packet`]s back,
+//! Nothing here reads a socket. A world that plays a device pushes the
+//! bytes it reads from a [`tcp`](super::tcp) connection to a
+//! [`Stream<Frames>`](super::codec::Stream), gets [`Packet`]s back,
 //! checks each one with [`Packet::check`], reads its command, and for the
 //! data commands reads the [`SendData`] envelope, its [`Cpf`] items and
 //! the [`MessageRequest`] inside. It writes replies with the same types,
@@ -29,11 +29,6 @@
 //! an [`EncodeError`] instead of writing a value its reader would refuse
 //! or read back as something else, so nothing is cut short in silence.
 //!
-//! [`Frames`] works with [`Stream`](super::codec::Stream) and preserves the
-//! prefix parser's permissive framing. [`Packet`] implements [`Wire`] for
-//! exact parsing of packets that pass [`Packet::check`] and transactional
-//! writing.
-//!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::enip::{
@@ -42,11 +37,7 @@
 //!
 //! // A client with a session asks the identity object for one attribute
 //! // with Get_Attribute_Single: class 1, instance 1, attribute 7.
-//! let request = MessageRequest {
-//!     service: service::GET_ATTRIBUTE_SINGLE,
-//!     path: vec![PathSegment::Class(1), PathSegment::Instance(1), PathSegment::Attribute(7)],
-//!     data: Vec::new(),
-//! };
+//! let request = MessageRequest::get_attribute(1, 1, 7);
 //! // The CIP message rides inside an unconnected data item.
 //! let send = SendData {
 //!     interface_handle: 0,
@@ -271,6 +262,9 @@ impl Wire for Packet {
     /// Reads exactly one packet that passes [`Packet::check`].
     /// [`Packet::parse`] accepts nonzero options and every
     /// length the header can name, so a receiver can apply its own policy.
+    /// Returns [`DecodeError::Truncated`] for an incomplete packet,
+    /// [`DecodeError::Trailing`] for extra bytes, [`DecodeError::Options`]
+    /// for nonzero options, and [`DecodeError::TooLong`] above [`MAX_DATA`].
     fn parse(b: &[u8]) -> Result<Self, DecodeError> {
         let (packet, used) = Self::parse(b).ok_or(DecodeError::Truncated)?;
         if used != b.len() {
@@ -283,7 +277,7 @@ impl Wire for Packet {
     /// The packet's bytes: the header, then the data. Data longer than
     /// [`MAX_DATA`] is [`EncodeError::TooLong`], options other than 0 are
     /// [`EncodeError::Options`], and a [`Command::Other`] holding a code
-    /// with a name of its own is [`EncodeError::Command`], since it would
+    /// with a name of its own is [`EncodeError::Unwritable`], since it would
     /// read back as that name.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         if self.data.len() > MAX_DATA {
@@ -294,7 +288,7 @@ impl Wire for Packet {
         }
         let code = self.command.code();
         if Command::from_code(code) != self.command {
-            return Err(EncodeError::Command);
+            return Err(EncodeError::Unwritable);
         }
         let mut out = Vec::with_capacity(HEADER_LEN + self.data.len());
         out.extend_from_slice(&code.to_le_bytes());
@@ -336,6 +330,9 @@ impl Decode for Frames {
         FRAMES_CAPACITY
     }
 
+    /// Reads a packet prefix, returning [`Step::Need`] while incomplete.
+    /// Accepts all header fields and never returns an error. Use
+    /// [`Packet::check`] for protocol limits and options.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Packet>, Infallible> {
         Ok(match Packet::parse(input) {
             Some((packet, used)) => Step::Item(packet, used),
@@ -401,7 +398,7 @@ pub enum EncodeError {
     /// A packet's options were not 0.
     Options,
     /// A [`Command::Other`] held a code that has a name of its own.
-    Command,
+    Unwritable,
     /// An EPATH segment's fields do not form a segment of its type.
     BadSegment,
     /// A [`SendData`] envelope did not start with an address item and a
@@ -416,7 +413,7 @@ impl std::fmt::Display for EncodeError {
             EncodeError::OddLength => f.write_str("word-counted bytes are an odd number"),
             EncodeError::ReplyFlag => f.write_str("service code has the reply bit set"),
             EncodeError::Options => f.write_str("encapsulation options are not zero"),
-            EncodeError::Command => f.write_str("Command::Other holds a named command code"),
+            EncodeError::Unwritable => f.write_str("value cannot be written without changing it"),
             EncodeError::BadSegment => f.write_str("EPATH segment fields do not fit its type"),
             EncodeError::Items => {
                 f.write_str("send-data items are not an address item and a data item")
@@ -435,23 +432,6 @@ pub struct RegisterSession {
     pub protocol_version: u16,
     /// The options flags, usually 0.
     pub options: u16,
-}
-
-impl RegisterSession {
-    /// Reads a register-session body: a version and options flags.
-    pub fn parse(b: &[u8]) -> Result<RegisterSession, DecodeError> {
-        if b.len() != 4 {
-            return Err(if b.len() < 4 {
-                DecodeError::Truncated
-            } else {
-                DecodeError::Trailing
-            });
-        }
-        Ok(RegisterSession {
-            protocol_version: le16(b, 0),
-            options: le16(b, 2),
-        })
-    }
 }
 
 /// The encapsulation status codes a reply's [`Packet::status`] carries.
@@ -525,48 +505,6 @@ pub struct Cpf {
     pub items: Vec<CpfItem>,
 }
 
-impl Cpf {
-    /// Reads a common packet format that fills `b`. Extra bytes after the
-    /// last item are a [`DecodeError::Trailing`], and more than
-    /// [`MAX_DATA`] bytes, which no packet can carry, are a
-    /// [`DecodeError::TooLong`].
-    pub fn parse(b: &[u8]) -> Result<Cpf, DecodeError> {
-        if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
-        }
-        if b.len() < 2 {
-            return Err(DecodeError::Truncated);
-        }
-        let count = usize::from(le16(b, 0));
-        if count > MAX_CPF_ITEMS {
-            return Err(DecodeError::TooLong);
-        }
-        let mut items = Vec::with_capacity(count);
-        let mut i = 2;
-        for _ in 0..count {
-            if i + 4 > b.len() {
-                return Err(DecodeError::Truncated);
-            }
-            let type_id = le16(b, i);
-            let len = usize::from(le16(b, i + 2));
-            let start = i + 4;
-            let end = start.checked_add(len).ok_or(DecodeError::TooLong)?;
-            if end > b.len() {
-                return Err(DecodeError::Truncated);
-            }
-            items.push(CpfItem {
-                type_id,
-                data: b[start..end].to_vec(),
-            });
-            i = end;
-        }
-        if i != b.len() {
-            return Err(DecodeError::Trailing);
-        }
-        Ok(Cpf { items })
-    }
-}
-
 /// The identity a device gives in a [`ListIdentity`](Command::ListIdentity)
 /// reply. It fills a [`CpfItem`] of type
 /// [`LIST_IDENTITY_RESPONSE`](item::LIST_IDENTITY_RESPONSE), the one item
@@ -605,45 +543,6 @@ pub struct Identity {
 /// The bytes of an [`Identity`] before its product name.
 const IDENTITY_FIXED: usize = 32;
 
-impl Identity {
-    /// Reads an identity that fills `b`. The eight zero bytes that end the
-    /// socket address are not checked. A product name longer than
-    /// [`MAX_PRODUCT_NAME`] is a [`DecodeError::TooLong`].
-    pub fn parse(b: &[u8]) -> Result<Identity, DecodeError> {
-        // The fixed part, the name length byte, and the state byte.
-        if b.len() < IDENTITY_FIXED + 2 {
-            return Err(DecodeError::Truncated);
-        }
-        let name_len = usize::from(b[IDENTITY_FIXED]);
-        if name_len > MAX_PRODUCT_NAME {
-            return Err(DecodeError::TooLong);
-        }
-        let name_start = IDENTITY_FIXED + 1;
-        let end = name_start + name_len + 1;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        if end != b.len() {
-            return Err(DecodeError::Trailing);
-        }
-        Ok(Identity {
-            protocol_version: le16(b, 0),
-            socket_family: u16::from_be_bytes([b[2], b[3]]),
-            socket_port: u16::from_be_bytes([b[4], b[5]]),
-            socket_address: [b[6], b[7], b[8], b[9]],
-            // b[10..18] are the socket address's zero bytes.
-            vendor_id: le16(b, 18),
-            device_type: le16(b, 20),
-            product_code: le16(b, 22),
-            revision: [b[24], b[25]],
-            status: le16(b, 26),
-            serial_number: le32(b, 28),
-            product_name: b[name_start..name_start + name_len].to_vec(),
-            state: b[end - 1],
-        })
-    }
-}
-
 /// The data of a [`SendRRData`](Command::SendRRData) or
 /// [`SendUnitData`](Command::SendUnitData) packet: a handle, a timeout and
 /// the common packet format. The items start with an address item and a
@@ -675,28 +574,6 @@ fn send_items_ok(items: &[CpfItem]) -> bool {
     };
     address.data.len() == address_len
         && matches!(data.type_id, item::CONNECTED_DATA | item::UNCONNECTED_DATA)
-}
-
-impl SendData {
-    /// Reads a send-data envelope that fills `b`. Items that do not start
-    /// with an address item and a data item are a [`DecodeError::Items`].
-    pub fn parse(b: &[u8]) -> Result<SendData, DecodeError> {
-        if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
-        }
-        if b.len() < 6 {
-            return Err(DecodeError::Truncated);
-        }
-        let cpf = Cpf::parse(&b[6..])?;
-        if !send_items_ok(&cpf.items) {
-            return Err(DecodeError::Items);
-        }
-        Ok(SendData {
-            interface_handle: le32(b, 0),
-            timeout: le16(b, 4),
-            cpf,
-        })
-    }
 }
 
 /// One segment of a CIP path (EPATH). A path names an object by class,
@@ -1086,31 +963,17 @@ pub struct MessageRequest {
 }
 
 impl MessageRequest {
-    /// Reads a message router request. A service code with the
-    /// [`REPLY_FLAG`] bit set is a reply, so it is a
-    /// [`DecodeError::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
-    /// [`DecodeError::TooLong`].
-    pub fn parse(b: &[u8]) -> Result<MessageRequest, DecodeError> {
-        if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
+    /// Requests one attribute of a class instance with no request data.
+    pub fn get_attribute(class: u16, instance: u32, attribute: u16) -> Self {
+        Self {
+            service: service::GET_ATTRIBUTE_SINGLE,
+            path: vec![
+                PathSegment::Class(class),
+                PathSegment::Instance(instance),
+                PathSegment::Attribute(attribute),
+            ],
+            data: Vec::new(),
         }
-        if b.len() < 2 {
-            return Err(DecodeError::Truncated);
-        }
-        let service = b[0];
-        if service & REPLY_FLAG != 0 {
-            return Err(DecodeError::ReplyFlag);
-        }
-        let path_bytes = usize::from(b[1]) * 2;
-        let end = 2usize.checked_add(path_bytes).ok_or(DecodeError::TooLong)?;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        Ok(MessageRequest {
-            service,
-            path: parse_path(&b[2..end])?,
-            data: b[end..].to_vec(),
-        })
     }
 }
 
@@ -1128,41 +991,6 @@ pub struct MessageResponse {
     pub additional_status: Vec<u16>,
     /// The service's reply data, if any.
     pub data: Vec<u8>,
-}
-
-impl MessageResponse {
-    /// Reads a message router response. A service code without the
-    /// [`REPLY_FLAG`] bit is a request, so it is a
-    /// [`DecodeError::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
-    /// [`DecodeError::TooLong`].
-    pub fn parse(b: &[u8]) -> Result<MessageResponse, DecodeError> {
-        if b.len() > MAX_DATA {
-            return Err(DecodeError::TooLong);
-        }
-        if b.len() < 4 {
-            return Err(DecodeError::Truncated);
-        }
-        if b[0] & REPLY_FLAG == 0 {
-            return Err(DecodeError::ReplyFlag);
-        }
-        let service = b[0] & !REPLY_FLAG;
-        let status = b[2];
-        let extra_words = usize::from(b[3]);
-        let extra_bytes = extra_words * 2;
-        let end = 4usize
-            .checked_add(extra_bytes)
-            .ok_or(DecodeError::TooLong)?;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        let additional_status = (0..extra_words).map(|w| le16(b, 4 + 2 * w)).collect();
-        Ok(MessageResponse {
-            service,
-            status,
-            additional_status,
-            data: b[end..].to_vec(),
-        })
-    }
 }
 
 /// The CIP service codes this module names.
@@ -1253,42 +1081,6 @@ pub struct ForwardOpenRequest {
 
 const FORWARD_OPEN_FIXED: usize = 36;
 
-impl ForwardOpenRequest {
-    /// Reads a Forward Open request body.
-    pub fn parse(b: &[u8]) -> Result<ForwardOpenRequest, DecodeError> {
-        if b.len() < FORWARD_OPEN_FIXED {
-            return Err(DecodeError::Truncated);
-        }
-        let path_bytes = usize::from(b[35]) * 2;
-        let end = FORWARD_OPEN_FIXED
-            .checked_add(path_bytes)
-            .ok_or(DecodeError::TooLong)?;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        if end != b.len() {
-            return Err(DecodeError::Trailing);
-        }
-        Ok(ForwardOpenRequest {
-            priority_time_tick: b[0],
-            timeout_ticks: b[1],
-            o_t_connection_id: le32(b, 2),
-            t_o_connection_id: le32(b, 6),
-            connection_serial: le16(b, 10),
-            vendor_id: le16(b, 12),
-            originator_serial: le32(b, 14),
-            timeout_multiplier: b[18],
-            // b[19..22] are three reserved bytes.
-            o_t_rpi: le32(b, 22),
-            o_t_params: le16(b, 26),
-            t_o_rpi: le32(b, 28),
-            t_o_params: le16(b, 32),
-            transport_class_trigger: b[34],
-            connection_path: parse_path(&b[FORWARD_OPEN_FIXED..end])?,
-        })
-    }
-}
-
 /// A Forward Open reply body: the connection the manager opened. It is the
 /// `data` of a [`MessageResponse`] to a Forward Open on success.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1314,36 +1106,6 @@ pub struct ForwardOpenResponse {
 
 const FORWARD_OPEN_REPLY_FIXED: usize = 26;
 
-impl ForwardOpenResponse {
-    /// Reads a Forward Open reply body.
-    pub fn parse(b: &[u8]) -> Result<ForwardOpenResponse, DecodeError> {
-        if b.len() < FORWARD_OPEN_REPLY_FIXED {
-            return Err(DecodeError::Truncated);
-        }
-        let reply_bytes = usize::from(b[24]) * 2;
-        // b[25] is a reserved byte.
-        let end = FORWARD_OPEN_REPLY_FIXED
-            .checked_add(reply_bytes)
-            .ok_or(DecodeError::TooLong)?;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        if end != b.len() {
-            return Err(DecodeError::Trailing);
-        }
-        Ok(ForwardOpenResponse {
-            o_t_connection_id: le32(b, 0),
-            t_o_connection_id: le32(b, 4),
-            connection_serial: le16(b, 8),
-            vendor_id: le16(b, 10),
-            originator_serial: le32(b, 12),
-            o_t_api: le32(b, 16),
-            t_o_api: le32(b, 20),
-            application_reply: b[FORWARD_OPEN_REPLY_FIXED..end].to_vec(),
-        })
-    }
-}
-
 /// A Forward Close request body. It is the `data` of a [`MessageRequest`]
 /// whose service is [`FORWARD_CLOSE`](service::FORWARD_CLOSE).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1364,34 +1126,6 @@ pub struct ForwardCloseRequest {
 
 const FORWARD_CLOSE_FIXED: usize = 12;
 
-impl ForwardCloseRequest {
-    /// Reads a Forward Close request body.
-    pub fn parse(b: &[u8]) -> Result<ForwardCloseRequest, DecodeError> {
-        if b.len() < FORWARD_CLOSE_FIXED {
-            return Err(DecodeError::Truncated);
-        }
-        let path_bytes = usize::from(b[10]) * 2;
-        // b[11] is a reserved byte.
-        let end = FORWARD_CLOSE_FIXED
-            .checked_add(path_bytes)
-            .ok_or(DecodeError::TooLong)?;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        if end != b.len() {
-            return Err(DecodeError::Trailing);
-        }
-        Ok(ForwardCloseRequest {
-            priority_time_tick: b[0],
-            timeout_ticks: b[1],
-            connection_serial: le16(b, 2),
-            vendor_id: le16(b, 4),
-            originator_serial: le32(b, 6),
-            connection_path: parse_path(&b[FORWARD_CLOSE_FIXED..end])?,
-        })
-    }
-}
-
 /// A Forward Close reply body. It is the `data` of a [`MessageResponse`] to
 /// a Forward Close on success.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1409,30 +1143,16 @@ pub struct ForwardCloseResponse {
 
 const FORWARD_CLOSE_REPLY_FIXED: usize = 10;
 
-impl ForwardCloseResponse {
-    /// Reads a Forward Close reply body.
-    pub fn parse(b: &[u8]) -> Result<ForwardCloseResponse, DecodeError> {
-        if b.len() < FORWARD_CLOSE_REPLY_FIXED {
-            return Err(DecodeError::Truncated);
-        }
-        let reply_bytes = usize::from(b[8]) * 2;
-        // b[9] is a reserved byte.
-        let end = FORWARD_CLOSE_REPLY_FIXED
-            .checked_add(reply_bytes)
-            .ok_or(DecodeError::TooLong)?;
-        if end > b.len() {
-            return Err(DecodeError::Truncated);
-        }
-        if end != b.len() {
-            return Err(DecodeError::Trailing);
-        }
-        Ok(ForwardCloseResponse {
-            connection_serial: le16(b, 0),
-            vendor_id: le16(b, 2),
-            originator_serial: le32(b, 4),
-            application_reply: b[FORWARD_CLOSE_REPLY_FIXED..end].to_vec(),
-        })
+// Forward Open and Close end in one byte-counted number of 16-bit words.
+fn word_tail(b: &[u8], fixed: usize, count_at: usize) -> Result<&[u8], DecodeError> {
+    let header = b.get(..fixed).ok_or(DecodeError::Truncated)?;
+    let count = usize::from(*header.get(count_at).ok_or(DecodeError::Truncated)?);
+    let end = fixed.checked_add(count * 2).ok_or(DecodeError::TooLong)?;
+    let tail = b.get(fixed..end).ok_or(DecodeError::Truncated)?;
+    if end != b.len() {
+        return Err(DecodeError::Trailing);
     }
+    Ok(tail)
 }
 
 /// `b`, if it is a whole number of words that a word count byte can name.
@@ -1458,11 +1178,25 @@ impl Wire for RegisterSession {
     type ParseError = DecodeError;
     type WriteError = Infallible;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a register-session body: a version and options flags.
+    /// Returns [`DecodeError::Truncated`] below four bytes and
+    /// [`DecodeError::Trailing`] above four bytes.
+    fn parse(b: &[u8]) -> Result<RegisterSession, DecodeError> {
+        if b.len() != 4 {
+            return Err(if b.len() < 4 {
+                DecodeError::Truncated
+            } else {
+                DecodeError::Trailing
+            });
+        }
+        Ok(RegisterSession {
+            protocol_version: le16(b, 0),
+            options: le16(b, 2),
+        })
     }
 
     /// The four bytes of a register-session body.
+    /// Every version and options word is writable; this method never returns an error.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), Infallible> {
         let mut out = Vec::with_capacity(4);
         out.extend_from_slice(&self.protocol_version.to_le_bytes());
@@ -1476,8 +1210,46 @@ impl Wire for Cpf {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a common packet format that fills `b`. Extra bytes after the
+    /// last item are a [`DecodeError::Trailing`], and more than
+    /// [`MAX_DATA`] bytes, which no packet can carry, are a
+    /// [`DecodeError::TooLong`].
+    /// Short headers or item bodies return [`DecodeError::Truncated`].
+    /// More than [`MAX_CPF_ITEMS`] items return [`DecodeError::TooLong`].
+    fn parse(b: &[u8]) -> Result<Cpf, DecodeError> {
+        if b.len() > MAX_DATA {
+            return Err(DecodeError::TooLong);
+        }
+        if b.len() < 2 {
+            return Err(DecodeError::Truncated);
+        }
+        let count = usize::from(le16(b, 0));
+        if count > MAX_CPF_ITEMS {
+            return Err(DecodeError::TooLong);
+        }
+        let mut items = Vec::with_capacity(count);
+        let mut i = 2;
+        for _ in 0..count {
+            if i + 4 > b.len() {
+                return Err(DecodeError::Truncated);
+            }
+            let type_id = le16(b, i);
+            let len = usize::from(le16(b, i + 2));
+            let start = i + 4;
+            let end = start.checked_add(len).ok_or(DecodeError::TooLong)?;
+            if end > b.len() {
+                return Err(DecodeError::Truncated);
+            }
+            items.push(CpfItem {
+                type_id,
+                data: b[start..end].to_vec(),
+            });
+            i = end;
+        }
+        if i != b.len() {
+            return Err(DecodeError::Trailing);
+        }
+        Ok(Cpf { items })
     }
 
     /// The bytes of the common packet format. More than [`MAX_CPF_ITEMS`]
@@ -1512,8 +1284,43 @@ impl Wire for Identity {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads an identity that fills `b`. The eight zero bytes that end the
+    /// socket address are not checked. A product name longer than
+    /// [`MAX_PRODUCT_NAME`] is a [`DecodeError::TooLong`].
+    /// Short fields return [`DecodeError::Truncated`]. Bytes after the
+    /// state byte return [`DecodeError::Trailing`].
+    fn parse(b: &[u8]) -> Result<Identity, DecodeError> {
+        // The fixed part, the name length byte, and the state byte.
+        if b.len() < IDENTITY_FIXED + 2 {
+            return Err(DecodeError::Truncated);
+        }
+        let name_len = usize::from(b[IDENTITY_FIXED]);
+        if name_len > MAX_PRODUCT_NAME {
+            return Err(DecodeError::TooLong);
+        }
+        let name_start = IDENTITY_FIXED + 1;
+        let end = name_start + name_len + 1;
+        if end > b.len() {
+            return Err(DecodeError::Truncated);
+        }
+        if end != b.len() {
+            return Err(DecodeError::Trailing);
+        }
+        Ok(Identity {
+            protocol_version: le16(b, 0),
+            socket_family: u16::from_be_bytes([b[2], b[3]]),
+            socket_port: u16::from_be_bytes([b[4], b[5]]),
+            socket_address: [b[6], b[7], b[8], b[9]],
+            // b[10..18] are the socket address's zero bytes.
+            vendor_id: le16(b, 18),
+            device_type: le16(b, 20),
+            product_code: le16(b, 22),
+            revision: [b[24], b[25]],
+            status: le16(b, 26),
+            serial_number: le32(b, 28),
+            product_name: b[name_start..name_start + name_len].to_vec(),
+            state: b[end - 1],
+        })
     }
 
     /// The bytes of an identity. A product name longer than
@@ -1547,8 +1354,28 @@ impl Wire for SendData {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a send-data envelope that fills `b`. Items that do not start
+    /// with an address item and a data item are a [`DecodeError::Items`].
+    /// Short fields return [`DecodeError::Truncated`], excess bytes return
+    /// [`DecodeError::Trailing`], and excess items or input above [`MAX_DATA`]
+    /// return [`DecodeError::TooLong`]. Known address items must have their
+    /// fixed lengths or parsing returns [`DecodeError::Items`].
+    fn parse(b: &[u8]) -> Result<SendData, DecodeError> {
+        if b.len() > MAX_DATA {
+            return Err(DecodeError::TooLong);
+        }
+        if b.len() < 6 {
+            return Err(DecodeError::Truncated);
+        }
+        let cpf = Cpf::parse(&b[6..])?;
+        if !send_items_ok(&cpf.items) {
+            return Err(DecodeError::Items);
+        }
+        Ok(SendData {
+            interface_handle: le32(b, 0),
+            timeout: le16(b, 4),
+            cpf,
+        })
     }
 
     /// The bytes of a send-data envelope. Items that do not start with an
@@ -1575,13 +1402,41 @@ impl Wire for MessageRequest {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a message router request. A service code with the
+    /// [`REPLY_FLAG`] bit set is a reply, so it is a
+    /// [`DecodeError::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
+    /// [`DecodeError::TooLong`].
+    /// Short headers or paths return [`DecodeError::Truncated`]. Unsupported
+    /// path types return [`DecodeError::UnknownSegment`]; malformed segments
+    /// return [`DecodeError::BadSegment`]. Path limits return [`DecodeError::TooLong`].
+    fn parse(b: &[u8]) -> Result<MessageRequest, DecodeError> {
+        if b.len() > MAX_DATA {
+            return Err(DecodeError::TooLong);
+        }
+        if b.len() < 2 {
+            return Err(DecodeError::Truncated);
+        }
+        let service = b[0];
+        if service & REPLY_FLAG != 0 {
+            return Err(DecodeError::ReplyFlag);
+        }
+        let path_bytes = usize::from(b[1]) * 2;
+        let end = 2usize.checked_add(path_bytes).ok_or(DecodeError::TooLong)?;
+        if end > b.len() {
+            return Err(DecodeError::Truncated);
+        }
+        Ok(MessageRequest {
+            service,
+            path: parse_path(&b[2..end])?,
+            data: b[end..].to_vec(),
+        })
     }
 
     /// The bytes of a message router request. A service code with the
     /// [`REPLY_FLAG`] bit set is [`EncodeError::ReplyFlag`], and a path or
     /// a request too long for its length fields is [`EncodeError::TooLong`].
+    /// Malformed path fields return [`EncodeError::BadSegment`]. Odd
+    /// word-counted path data returns [`EncodeError::OddLength`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         if self.service & REPLY_FLAG != 0 {
             return Err(EncodeError::ReplyFlag);
@@ -1604,8 +1459,38 @@ impl Wire for MessageResponse {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a message router response. A service code without the
+    /// [`REPLY_FLAG`] bit is a request, so it is a
+    /// [`DecodeError::ReplyFlag`]. More than [`MAX_DATA`] bytes is a
+    /// [`DecodeError::TooLong`].
+    /// Short headers or additional status words return [`DecodeError::Truncated`].
+    fn parse(b: &[u8]) -> Result<MessageResponse, DecodeError> {
+        if b.len() > MAX_DATA {
+            return Err(DecodeError::TooLong);
+        }
+        if b.len() < 4 {
+            return Err(DecodeError::Truncated);
+        }
+        if b[0] & REPLY_FLAG == 0 {
+            return Err(DecodeError::ReplyFlag);
+        }
+        let service = b[0] & !REPLY_FLAG;
+        let status = b[2];
+        let extra_words = usize::from(b[3]);
+        let extra_bytes = extra_words * 2;
+        let end = 4usize
+            .checked_add(extra_bytes)
+            .ok_or(DecodeError::TooLong)?;
+        if end > b.len() {
+            return Err(DecodeError::Truncated);
+        }
+        let additional_status = (0..extra_words).map(|w| le16(b, 4 + 2 * w)).collect();
+        Ok(MessageResponse {
+            service,
+            status,
+            additional_status,
+            data: b[end..].to_vec(),
+        })
     }
 
     /// The bytes of a message router response, with the reply bit set. A
@@ -1641,12 +1526,36 @@ impl Wire for ForwardOpenRequest {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a Forward Open request body.
+    /// Short fields return [`DecodeError::Truncated`]; extra bytes return
+    /// [`DecodeError::Trailing`]. Unsupported path types return
+    /// [`DecodeError::UnknownSegment`], malformed segments return
+    /// [`DecodeError::BadSegment`], and path limits return [`DecodeError::TooLong`].
+    fn parse(b: &[u8]) -> Result<ForwardOpenRequest, DecodeError> {
+        let tail = word_tail(b, FORWARD_OPEN_FIXED, 35)?;
+        Ok(ForwardOpenRequest {
+            priority_time_tick: b[0],
+            timeout_ticks: b[1],
+            o_t_connection_id: le32(b, 2),
+            t_o_connection_id: le32(b, 6),
+            connection_serial: le16(b, 10),
+            vendor_id: le16(b, 12),
+            originator_serial: le32(b, 14),
+            timeout_multiplier: b[18],
+            // b[19..22] are three reserved bytes.
+            o_t_rpi: le32(b, 22),
+            o_t_params: le16(b, 26),
+            t_o_rpi: le32(b, 28),
+            t_o_params: le16(b, 32),
+            transport_class_trigger: b[34],
+            connection_path: parse_path(tail)?,
+        })
     }
 
     /// The bytes of a Forward Open request body. A connection path too
     /// long for its word count is [`EncodeError::TooLong`].
+    /// Malformed path fields return [`EncodeError::BadSegment`]. Odd
+    /// word-counted path data returns [`EncodeError::OddLength`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         let path = write_path(&self.connection_path)?;
         let mut out = Vec::with_capacity(FORWARD_OPEN_FIXED + path.len());
@@ -1675,8 +1584,21 @@ impl Wire for ForwardOpenResponse {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a Forward Open reply body.
+    /// Short fields or reply data return [`DecodeError::Truncated`].
+    /// Bytes beyond the word-counted reply return [`DecodeError::Trailing`].
+    fn parse(b: &[u8]) -> Result<ForwardOpenResponse, DecodeError> {
+        let tail = word_tail(b, FORWARD_OPEN_REPLY_FIXED, 24)?;
+        Ok(ForwardOpenResponse {
+            o_t_connection_id: le32(b, 0),
+            t_o_connection_id: le32(b, 4),
+            connection_serial: le16(b, 8),
+            vendor_id: le16(b, 10),
+            originator_serial: le32(b, 12),
+            o_t_api: le32(b, 16),
+            t_o_api: le32(b, 20),
+            application_reply: tail.to_vec(),
+        })
     }
 
     /// The bytes of a Forward Open reply body. An application reply of an
@@ -1704,12 +1626,27 @@ impl Wire for ForwardCloseRequest {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a Forward Close request body.
+    /// Short fields return [`DecodeError::Truncated`]; extra bytes return
+    /// [`DecodeError::Trailing`]. Unsupported path types return
+    /// [`DecodeError::UnknownSegment`], malformed segments return
+    /// [`DecodeError::BadSegment`], and path limits return [`DecodeError::TooLong`].
+    fn parse(b: &[u8]) -> Result<ForwardCloseRequest, DecodeError> {
+        let tail = word_tail(b, FORWARD_CLOSE_FIXED, 10)?;
+        Ok(ForwardCloseRequest {
+            priority_time_tick: b[0],
+            timeout_ticks: b[1],
+            connection_serial: le16(b, 2),
+            vendor_id: le16(b, 4),
+            originator_serial: le32(b, 6),
+            connection_path: parse_path(tail)?,
+        })
     }
 
     /// The bytes of a Forward Close request body. A connection path too
     /// long for its word count is [`EncodeError::TooLong`].
+    /// Malformed path fields return [`EncodeError::BadSegment`]. Odd
+    /// word-counted path data returns [`EncodeError::OddLength`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), EncodeError> {
         let path = write_path(&self.connection_path)?;
         let mut out = Vec::with_capacity(FORWARD_CLOSE_FIXED + path.len());
@@ -1730,8 +1667,17 @@ impl Wire for ForwardCloseResponse {
     type ParseError = DecodeError;
     type WriteError = EncodeError;
 
-    fn parse(b: &[u8]) -> Result<Self, DecodeError> {
-        Self::parse(b)
+    /// Reads a Forward Close reply body.
+    /// Short fields or reply data return [`DecodeError::Truncated`].
+    /// Bytes beyond the word-counted reply return [`DecodeError::Trailing`].
+    fn parse(b: &[u8]) -> Result<ForwardCloseResponse, DecodeError> {
+        let tail = word_tail(b, FORWARD_CLOSE_REPLY_FIXED, 8)?;
+        Ok(ForwardCloseResponse {
+            connection_serial: le16(b, 0),
+            vendor_id: le16(b, 2),
+            originator_serial: le32(b, 4),
+            application_reply: tail.to_vec(),
+        })
     }
 
     /// The bytes of a Forward Close reply body. An application reply of an
@@ -1754,7 +1700,7 @@ impl Wire for ForwardCloseResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{
+    use super::super::codec::{
         Stream, contract, pump,
         test_support::{self, Lcg, decode_all},
     };
@@ -2018,15 +1964,7 @@ mod tests {
 
     #[test]
     fn message_request_round_trip() {
-        let req = MessageRequest {
-            service: service::GET_ATTRIBUTE_SINGLE,
-            path: vec![
-                PathSegment::Class(1),
-                PathSegment::Instance(1),
-                PathSegment::Attribute(7),
-            ],
-            data: Vec::new(),
-        };
+        let req = MessageRequest::get_attribute(1, 1, 7);
         let bytes = req.to_bytes().unwrap();
         assert_eq!(bytes, [0x0e, 0x03, 0x20, 0x01, 0x24, 0x01, 0x30, 0x07]);
         assert_eq!(MessageRequest::parse(&bytes), Ok(req));
@@ -2233,6 +2171,7 @@ mod tests {
         let mut big = vec![0u8; HEADER_LEN];
         big[2..4].copy_from_slice(&u16::MAX.to_le_bytes());
         big.resize(FRAMES_CAPACITY, 0);
+        contract::check_decode_with_alloc_limit(Frames::new, &big, 2 * FRAMES_CAPACITY);
         assert_eq!(d.push(&big), FRAMES_CAPACITY);
         let p = d.next().unwrap().unwrap();
         assert_eq!(p.data.len(), u16::MAX as usize);
@@ -2608,7 +2547,7 @@ mod tests {
         // A named code held in Other would read back as its name.
         assert_eq!(
             packet(Command::Other(0x65), 0, Vec::new()).to_bytes(),
-            Err(EncodeError::Command)
+            Err(EncodeError::Unwritable)
         );
         let other = packet(Command::Other(0x72), 0, Vec::new());
         assert_eq!(Packet::parse(&other.to_bytes().unwrap()).unwrap().0, other);
@@ -2887,15 +2826,7 @@ mod tests {
             options: 0,
             data: Vec::new(),
         };
-        let read = MessageRequest {
-            service: service::GET_ATTRIBUTE_SINGLE,
-            path: vec![
-                PathSegment::Class(1),
-                PathSegment::Instance(1),
-                PathSegment::Attribute(7),
-            ],
-            data: Vec::new(),
-        };
+        let read = MessageRequest::get_attribute(1, 1, 7);
         let send = Packet {
             command: Command::SendRRData,
             session_handle: 1,

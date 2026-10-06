@@ -2,7 +2,7 @@
 #![no_main]
 
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
-use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::codec::{Wire, test_support::decode_all};
 use fictionet::stdlib::rdp::Frames;
 use fictionet::stdlib::rdp::{
     ActiveKind, ActivePdu, CapabilitySet, CapabilityType, ChannelDefinition, ClientInfo,
@@ -22,36 +22,26 @@ fn prefix(data: &[u8], n: usize) -> &[u8] {
     data.get(..data.len().min(n)).unwrap_or_default()
 }
 
-fn plaintext(data: &[u8]) {
-    macro_rules! roundtrip {
-        ($ty:ty) => {
-            if let Ok(value) = <$ty as Wire>::parse(data) {
-                check_wire_value(&value);
-                let bytes = value.to_bytes().unwrap();
-                assert!(bytes.len() <= MAX_PDU);
-            }
-        };
+fn roundtrip<T: Wire + PartialEq + core::fmt::Debug>(data: &[u8]) {
+    if let Ok(value) = T::parse(data) {
+        check_wire_value(&value);
+        let bytes = value.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_PDU);
     }
-    roundtrip!(ClientInfo);
-    roundtrip!(LicenseError);
-    roundtrip!(ActivePdu);
-    roundtrip!(CapabilitySet);
+}
+
+fn plaintext(data: &[u8]) {
+    roundtrip::<ClientInfo>(data);
+    roundtrip::<LicenseError>(data);
+    roundtrip::<ActivePdu>(data);
+    roundtrip::<CapabilitySet>(data);
 }
 
 fn pdu(data: &[u8]) {
-    macro_rules! roundtrip {
-        ($ty:ty) => {
-            if let Ok(value) = <$ty as Wire>::parse(data) {
-                check_wire_value(&value);
-                let bytes = value.to_bytes().unwrap();
-                assert!(bytes.len() <= MAX_PDU);
-            }
-        };
-    }
-    roundtrip!(Negotiation);
-    roundtrip!(DataBlock);
-    roundtrip!(GccConference);
-    roundtrip!(McsConnect);
+    roundtrip::<Negotiation>(data);
+    roundtrip::<DataBlock>(data);
+    roundtrip::<GccConference>(data);
+    roundtrip::<McsConnect>(data);
     check_wire::<DataBlocks>(data);
     if let Ok(blocks) = DataBlocks::parse(data) {
         let bytes = blocks.to_bytes().unwrap();
@@ -272,9 +262,9 @@ fuzz_target!(|data: &[u8]| {
     check_decode(Frames::new, data);
     check_wire::<Frame>(data);
     pdu(data);
-    let mut stream = Stream::new(Frames);
-    let _ = pump(&mut stream, data, |value| {
+    let (frames, _) = decode_all(Frames::new, data);
+    for value in frames {
         frame(&value);
-    });
+    }
     built(data);
 });

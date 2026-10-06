@@ -7,7 +7,7 @@
 //! every CRC and removes them from its data; its writer puts them back.
 //! The framing follows IEEE 1815 (DNP3).
 //!
-//! Push connection bytes to a [`Stream`](super::codec::Stream) of [`Frames`],
+//! Push connection bytes to a [`Stream<Frames>`](super::codec::Stream),
 //! then read each data frame's [`Segment`]. A [`Reassembler`] joins transport
 //! segments into application fragments. Use one reassembler per source,
 //! destination and direction. Link acknowledgments, duplicate suppression
@@ -15,10 +15,6 @@
 //! application header and leaves object groups and variations as bytes.
 //! Secure authentication is not performed.
 //! Unknown link and application function codes are preserved.
-//!
-//! Use [`Frames`] with [`Stream`](super::codec::Stream).
-//! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
-//! Its inherent parser reads a prefix.
 //!
 //! ```
 //! use fictionet::stdlib::codec::{Stream, Wire};
@@ -204,6 +200,10 @@ impl Wire for Frame {
     type WriteError = FrameError;
 
     /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    /// Returns [`FrameParseError::Truncated`] for an incomplete frame and
+    /// [`FrameParseError::Trailing`] for extra bytes. Bad start bytes, lengths
+    /// and CRCs return [`FrameParseError::Frame`] with [`FrameError::Start`],
+    /// [`FrameError::Length`] or [`FrameError::Crc`].
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
         match Self::parse(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
@@ -213,6 +213,7 @@ impl Wire for Frame {
     }
 
     /// Writes the header and each data block with freshly calculated CRCs.
+    /// Returns [`FrameError::Length`] if data exceeds [`MAX_DATA`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), FrameError> {
         if self.data.len() > MAX_DATA {
             return Err(FrameError::Length);
@@ -233,7 +234,7 @@ impl Wire for Frame {
 
 /// Reads DNP3 frames without holding input bytes.
 ///
-/// Use with [`Stream`](super::codec::Stream) for a buffer limited to
+/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
 #[derive(Clone, Copy, Debug, Default)]
@@ -255,6 +256,9 @@ impl Decode for Frames {
         MAX_FRAME
     }
 
+    /// Reads a frame prefix, returning [`Step::Need`] while incomplete.
+    /// Returns [`FrameError::Start`], [`FrameError::Length`] or
+    /// [`FrameError::Crc`] for invalid start bytes, lengths or CRCs.
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
         Ok(match Frame::parse(input)? {
             Some((frame, used)) => Step::Item(frame, used),
@@ -315,19 +319,6 @@ pub struct Segment {
     pub data: Vec<u8>,
 }
 impl Segment {
-    /// Reads a whole transport segment, without link framing.
-    pub fn parse(b: &[u8]) -> Result<Self, TransportError> {
-        if !(2..=MAX_DATA).contains(&b.len()) {
-            return Err(TransportError::Length);
-        }
-        Ok(Self {
-            first: b[0] & 0x40 != 0,
-            final_segment: b[0] & 0x80 != 0,
-            sequence: b[0] & 0x3f,
-            data: b[1..].to_vec(),
-        })
-    }
-
     fn validate(&self) -> Result<(), TransportError> {
         if self.sequence > 63 {
             return Err(TransportError::Sequence);
@@ -426,35 +417,28 @@ pub struct Fragment {
     /// Encoded object headers and values.
     pub objects: Vec<u8>,
 }
-impl Fragment {
-    /// Reads one complete application fragment.
-    pub fn parse(b: &[u8]) -> Result<Self, FragmentError> {
-        if b.len() < 2 || b.len() > MAX_FRAGMENT {
-            return Err(FragmentError::Length);
-        }
-        let response = b[1] & 0x80 != 0;
-        let header = if response { 4 } else { 2 };
-        if b.len() < header {
-            return Err(FragmentError::Length);
-        }
-        Ok(Self {
-            control: b[0],
-            function: b[1],
-            indications: response.then(|| le16(b, 2)),
-            objects: b[header..].to_vec(),
-        })
-    }
-}
-
 impl Wire for Segment {
     type ParseError = TransportError;
     type WriteError = TransportError;
 
+    /// Reads a whole transport segment, without link framing.
+    /// Returns [`TransportError::Length`] unless the input has 2 through
+    /// [`MAX_DATA`] bytes.
     fn parse(b: &[u8]) -> Result<Self, TransportError> {
-        Self::parse(b)
+        if !(2..=MAX_DATA).contains(&b.len()) {
+            return Err(TransportError::Length);
+        }
+        Ok(Self {
+            first: b[0] & 0x40 != 0,
+            final_segment: b[0] & 0x80 != 0,
+            sequence: b[0] & 0x3f,
+            data: b[1..].to_vec(),
+        })
     }
 
     /// Writes a transport header followed by its data.
+    /// Returns [`TransportError::Sequence`] above sequence 63 and
+    /// [`TransportError::Length`] unless data has 1 through 249 bytes.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), TransportError> {
         self.validate()?;
         let mut out = vec![
@@ -472,11 +456,30 @@ impl Wire for Fragment {
     type ParseError = FragmentError;
     type WriteError = FragmentError;
 
+    /// Reads one complete application fragment.
+    /// Returns [`FragmentError::Length`] for a short header, a response
+    /// without its two IIN bytes, or input above [`MAX_FRAGMENT`].
     fn parse(b: &[u8]) -> Result<Self, FragmentError> {
-        Self::parse(b)
+        if b.len() < 2 || b.len() > MAX_FRAGMENT {
+            return Err(FragmentError::Length);
+        }
+        let response = b[1] & 0x80 != 0;
+        let header = if response { 4 } else { 2 };
+        if b.len() < header {
+            return Err(FragmentError::Length);
+        }
+        Ok(Self {
+            control: b[0],
+            function: b[1],
+            indications: response.then(|| le16(b, 2)),
+            objects: b[header..].to_vec(),
+        })
     }
 
     /// Writes an application fragment, requiring IIN exactly for responses.
+    /// Returns [`FragmentError::Indications`] if IIN presence disagrees
+    /// with the response bit. Returns [`FragmentError::Length`] when the
+    /// header and objects exceed [`MAX_FRAGMENT`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), FragmentError> {
         if (self.function & 0x80 != 0) != self.indications.is_some() {
             return Err(FragmentError::Indications);
@@ -498,7 +501,7 @@ impl Wire for Fragment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use super::super::codec::{Fail, Stream, contract, test_support::decode_all};
 
     // Reset link states: master 1024 to outstation 1, no user data.
     const RESET: &[u8] = &[5, 0x64, 5, 0xc0, 1, 0, 0, 4, 0xe9, 0x21];
@@ -584,11 +587,9 @@ mod tests {
         let encoded = frame.to_bytes().unwrap();
         assert_eq!(encoded.len(), MAX_FRAME);
         let bytes = encoded.repeat(10);
-        contract::check_decode(Frames::new, &bytes);
-        let mut stream = Stream::new(Frames);
-        let mut frames = Vec::new();
-        pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
-        finish(&mut stream, |frame| frames.push(frame)).unwrap();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
+        let (frames, failure) = decode_all(Frames::new, &bytes);
+        assert!(failure.is_none());
         assert_eq!(frames, vec![frame; 10]);
         let mut stream = Stream::new(Frames);
         assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);

@@ -2,7 +2,8 @@
 //!
 //! IEC 104 carries telecontrol messages over TCP, usually on port 2404.
 //! [`Frame`] reads the I (information), S (acknowledgment) and U (link
-//! control) formats. [`Frames`] splits a byte stream into those frames.
+//! control) formats. [`Stream<Frames>`](super::codec::Stream) splits a byte
+//! stream into those frames.
 //! Sequence numbers are checked for their 15-bit range; tracking which
 //! numbers have been sent or acknowledged belongs to world code.
 //!
@@ -12,10 +13,6 @@
 //! opaque. [`Asdu::objects`] splits fixed-width values, including the SQ
 //! form that sends only the first address. Type-specific value validation,
 //! timers, connection state and secure authentication belong to the caller.
-//!
-//! Use [`Frames`] with [`Stream`](super::codec::Stream).
-//! [`Frame`] implements [`Wire`] for exact parsing and transactional writing.
-//! Its inherent parser reads a prefix.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -230,6 +227,11 @@ impl Wire for Frame {
     type WriteError = FrameError;
 
     /// Reads exactly one frame. Incomplete input and trailing bytes are errors.
+    /// Returns [`FrameParseError::Truncated`] for an incomplete APDU and
+    /// [`FrameParseError::Trailing`] for extra bytes. Invalid start bytes,
+    /// lengths, control fields or ASDU lengths return [`FrameParseError::Frame`]
+    /// with [`FrameError::Start`], [`FrameError::Length`],
+    /// [`FrameError::Control`] or [`FrameError::AsduLength`].
     fn parse(b: &[u8]) -> Result<Self, FrameParseError> {
         match Self::parse(b).map_err(FrameParseError::Frame)? {
             Some((frame, used)) if used == b.len() => Ok(frame),
@@ -239,6 +241,8 @@ impl Wire for Frame {
     }
 
     /// Writes an APDU, refusing out-of-range sequence numbers or ASDUs.
+    /// Returns [`FrameError::Sequence`] above sequence 32767 and
+    /// [`FrameError::AsduLength`] unless an I-frame ASDU has 6 through 249 bytes.
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), FrameError> {
         let mut out = vec![0x68, 4];
         match self {
@@ -274,7 +278,7 @@ impl Wire for Frame {
 
 /// Reads IEC 104 frames without holding input bytes.
 ///
-/// Use with [`Stream`](super::codec::Stream) for a buffer limited to
+/// Use with [`Stream<Frames>`](super::codec::Stream) for a buffer limited to
 /// [`MAX_FRAME`]. Partial frames return [`Step::Need`], including at EOF.
 /// The stream reports truncation at EOF and framing errors once.
 #[derive(Clone, Copy, Debug, Default)]
@@ -296,6 +300,10 @@ impl Decode for Frames {
         MAX_FRAME
     }
 
+    /// Reads an APDU prefix, returning [`Step::Need`] while incomplete.
+    /// Invalid start bytes, lengths, control fields or ASDU lengths return
+    /// [`FrameError::Start`], [`FrameError::Length`], [`FrameError::Control`]
+    /// or [`FrameError::AsduLength`].
     fn decode(&mut self, input: &[u8], _eof: bool) -> Result<Step<Frame>, FrameError> {
         Ok(match Frame::parse(input)? {
             Some((frame, used)) => Step::Item(frame, used),
@@ -370,24 +378,6 @@ pub struct Object {
 }
 
 impl Asdu {
-    /// Reads one complete ASDU with IEC 104's fixed field sizes.
-    pub fn parse(b: &[u8]) -> Result<Self, AsduError> {
-        if !(ASDU_HEADER_LEN..=MAX_ASDU).contains(&b.len()) {
-            return Err(AsduError::Length);
-        }
-        Ok(Self {
-            type_id: b[0],
-            sequence: b[1] & 0x80 != 0,
-            count: b[1] & 0x7f,
-            cause: b[2] & 0x3f,
-            negative: b[2] & 0x40 != 0,
-            test: b[2] & 0x80 != 0,
-            originator: b[3],
-            common_address: le16(b, 4),
-            data: b[6..].to_vec(),
-        })
-    }
-
     fn validate(&self) -> Result<(), AsduError> {
         if self.count > 127 || self.cause > 63 {
             return Err(AsduError::Field);
@@ -484,12 +474,30 @@ impl Wire for Asdu {
     type ParseError = AsduError;
     type WriteError = AsduError;
 
+    /// Reads one complete ASDU with IEC 104's fixed field sizes.
+    /// Returns [`AsduError::Length`] unless input has 6 through 249 bytes.
+    /// Object layout is checked separately by [`Asdu::objects`].
     fn parse(b: &[u8]) -> Result<Self, AsduError> {
-        Self::parse(b)
+        if !(ASDU_HEADER_LEN..=MAX_ASDU).contains(&b.len()) {
+            return Err(AsduError::Length);
+        }
+        Ok(Self {
+            type_id: b[0],
+            sequence: b[1] & 0x80 != 0,
+            count: b[1] & 0x7f,
+            cause: b[2] & 0x3f,
+            negative: b[2] & 0x40 != 0,
+            test: b[2] & 0x80 != 0,
+            originator: b[3],
+            common_address: le16(b, 4),
+            data: b[6..].to_vec(),
+        })
     }
 
     /// Writes the ASDU header and opaque data. Use [`Asdu::set_objects`]
     /// to construct data whose object count and addresses are consistent.
+    /// Returns [`AsduError::Field`] above count 127 or cause 63, and
+    /// [`AsduError::Length`] if the header and data exceed [`MAX_ASDU`].
     fn write(&self, dst: &mut Vec<u8>) -> Result<(), AsduError> {
         self.validate()?;
         let mut out = vec![
@@ -508,7 +516,7 @@ impl Wire for Asdu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::stdlib::codec::{Fail, Stream, contract, finish, pump};
+    use super::super::codec::{Fail, Stream, contract, test_support::decode_all};
 
     const INTERROGATION: &[u8] = &[0x68, 14, 0, 0, 0, 0, 100, 1, 6, 0, 1, 0, 0, 0, 0, 20];
 
@@ -610,11 +618,9 @@ mod tests {
         let encoded = frame.to_bytes().unwrap();
         assert_eq!(encoded.len(), MAX_FRAME);
         let bytes = encoded.repeat(7);
-        contract::check_decode(Frames::new, &bytes);
-        let mut stream = Stream::new(Frames);
-        let mut frames = Vec::new();
-        pump(&mut stream, &bytes, |frame| frames.push(frame)).unwrap();
-        finish(&mut stream, |frame| frames.push(frame)).unwrap();
+        contract::check_decode_with_alloc_limit(Frames::new, &bytes, 2 * MAX_FRAME);
+        let (frames, failure) = decode_all(Frames::new, &bytes);
+        assert!(failure.is_none());
         assert_eq!(frames, vec![frame; 7]);
         let mut stream = Stream::new(Frames);
         assert_eq!(stream.push(&vec![0; MAX_FRAME + 1]), MAX_FRAME);
