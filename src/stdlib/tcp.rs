@@ -1060,7 +1060,7 @@ impl Endpoint {
     /// still to be sent to it. Handles see [`ConnError::Reset`]. For a
     /// peer that is gone for good, whose address someone else may take
     /// next.
-    pub(crate) fn abort_peer(&self, peer: IpAddr) {
+    pub fn abort_peer(&self, peer: IpAddr) {
         let mut st = self.shared.state.lock().unwrap();
         let hs: Vec<Id> = st.conns.iter().filter(|(_, c)| c.remote.ip() == peer).map(|(h, _)| *h).collect();
         if hs.is_empty() {
@@ -1289,7 +1289,7 @@ impl TcpConnection {
     /// A watch that says when this connection has been reset, by either
     /// side, or is gone, without reading from it. For a server that is not
     /// reading, such as HTTP/1.1 while a handler works.
-    pub(crate) fn gone_watch(&self) -> GoneWatch {
+    pub fn gone_watch(&self) -> GoneWatch {
         GoneWatch { shared: self.shared.clone(), handle: self.handle }
     }
 
@@ -1298,7 +1298,7 @@ impl TcpConnection {
     /// LAST-ACK) for up to a minute. Limits that count connections hold
     /// their count here, so a peer that never finishes closing cannot open
     /// more past the limit.
-    pub(crate) fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
+    pub fn hold_until_gone(&self, item: Box<dyn std::any::Any + Send>) {
         let mut st = self.shared.state.lock().unwrap();
         if let Some(c) = st.conns.get_mut(&self.handle) {
             c.held = Some(item);
@@ -1306,15 +1306,17 @@ impl TcpConnection {
     }
 }
 
-/// See [`TcpConnection::gone_watch`].
-pub(crate) struct GoneWatch {
+/// Says when a connection has been reset or is gone, without reading
+/// from it. See [`TcpConnection::gone_watch`].
+#[derive(Clone)]
+pub struct GoneWatch {
     shared: Arc<Shared>,
     handle: Id,
 }
 
 impl GoneWatch {
     /// Ready once the connection was reset, or is gone.
-    pub(crate) fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
+    pub fn poll_gone(&self, task: &mut Context<'_>) -> Poll<()> {
         let mut st = self.shared.state.lock().unwrap();
         if st.stopped {
             return Poll::Ready(());

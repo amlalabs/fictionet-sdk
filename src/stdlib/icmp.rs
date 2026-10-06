@@ -106,3 +106,74 @@ fn set_icmp_checksum(icmp: &mut [u8], pseudo: u32) {
     let c = wire::checksum(pseudo, icmp);
     icmp[2..4].copy_from_slice(&c.to_be_bytes());
 }
+
+/// The ICMP "host unreachable" answer (type 3, code 1) to the IPv4 packet
+/// `packet`, sent from `from`, as a router with no route to the packet's
+/// destination sends it. A client then fails at once with "No route to
+/// host", instead of waiting for a timeout.
+///
+/// `None` where RFC 1122 forbids an answer: for ICMP errors (only ICMP
+/// queries are answered), for fragments after the first, and for packets
+/// from or to an address that is not one host. The answer quotes as much
+/// of the packet as fits in 576 bytes (RFC 1812).
+pub fn host_unreachable(packet: &[u8], from: std::net::Ipv4Addr) -> Option<Packet> {
+    let v4 = V4::parse(packet, false)?;
+    if v4.frag_offset() != 0 {
+        return None;
+    }
+    let (src, dst) = (v4.src(), v4.dst());
+    if src.is_unspecified() || src.is_broadcast() || src.is_multicast() || src.is_loopback() {
+        return None;
+    }
+    if dst.is_broadcast() || dst.is_multicast() {
+        return None;
+    }
+    if v4.proto() == wire::PROTO_ICMP {
+        // Only queries (echo, timestamp, information, mask) get an answer.
+        let kind = *v4.payload().first()?;
+        if !matches!(kind, 0 | 8 | 13..=18) {
+            return None;
+        }
+    }
+    let quote = &packet[..v4.total.min(576 - 28)];
+    let mut icmp = vec![3, 1, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(quote);
+    let sum = wire::checksum(0, &icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    Some(crate::stdlib::udp::ip_packet(from.into(), src.into(), wire::PROTO_ICMP, 0, &icmp))
+}
+
+/// The ICMPv6 "destination unreachable, address unreachable" answer (type
+/// 1, code 3) to the IPv6 packet `packet`, sent from `from`. Linux reports
+/// it to the program as "No route to host", as it does ICMP "host
+/// unreachable".
+///
+/// `None` where RFC 4443 forbids an answer: for ICMPv6 errors and
+/// redirects, fragments after the first, and packets from or to an address
+/// that is not one host. Also `None` for neighbor discovery messages. The
+/// answer quotes as much of the packet as fits in the minimum MTU, 1280
+/// bytes.
+pub fn address_unreachable(packet: &[u8], from: std::net::Ipv6Addr) -> Option<Packet> {
+    let v6 = V6::parse(packet, false)?;
+    if let Some((at, _)) = v6.frag
+        && u16::from_be_bytes([packet[at + 2], packet[at + 3]]) & 0xfff8 != 0
+    {
+        return None;
+    }
+    let (src, dst) = (v6.src(), v6.dst());
+    if src.is_unspecified() || src.is_multicast() || src.is_loopback() || dst.is_multicast() {
+        return None;
+    }
+    // Error messages (types below 128) and redirects (137) never get an
+    // error. Neither do the other neighbor discovery messages (133 to 136),
+    // which belong to one link and are never routed.
+    if v6.proto == wire::PROTO_ICMPV6 && v6.payload().first().is_none_or(|t| *t < 128 || (133..=137).contains(t)) {
+        return None;
+    }
+    let quote = &packet[..v6.end.min(1280 - 48)];
+    let mut icmp = vec![1, 3, 0, 0, 0, 0, 0, 0];
+    icmp.extend_from_slice(quote);
+    let sum = crate::stdlib::udp::transport_checksum(from.into(), src.into(), wire::PROTO_ICMPV6, &icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    Some(crate::stdlib::udp::ip_packet(from.into(), src.into(), wire::PROTO_ICMPV6, 0, &icmp))
+}

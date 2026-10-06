@@ -524,8 +524,11 @@ where
 /// How many packets a stdlib task handles in a row before it yields.
 pub(crate) const BUDGET: usize = 64;
 
+pub(crate) use PortEvent as Event;
+
 /// What [`Ports::next`] saw.
-pub(crate) enum Event {
+#[derive(Debug)]
+pub enum PortEvent {
     /// A packet arrived on port `.0`.
     Packet(usize, Packet),
     /// Port `.0` closed. [`Ports`] has already dropped it.
@@ -538,8 +541,9 @@ pub(crate) enum Event {
     Cancelled,
 }
 
-/// The interfaces one stdlib task serves, and the waiting that is common to
-/// all of them. It waits for the first packet on any interface, a deadline,
+/// The interfaces one task serves, and the waiting that is common to all
+/// of them. The stdlib's routers, filters and links are built on it, and
+/// so can a world's own. It waits for the first packet on any interface, a deadline,
 /// or one extra source. It takes interfaces in turn, so that a busy one
 /// cannot starve the others. It yields after [`BUDGET`] packets in a row.
 ///
@@ -548,7 +552,7 @@ pub(crate) enum Event {
 /// queue, so the cost of a packet does not grow with the number of idle
 /// interfaces. A
 /// router with thousands of routes stays as fast as one with ten.
-pub(crate) struct Ports {
+pub struct Ports {
     ports: Vec<Option<Box<dyn Interface>>>,
     /// One waker per slot, which marks the slot ready.
     wakers: Vec<Waker>,
@@ -620,7 +624,8 @@ impl Wake for SlotWaker {
 
 #[allow(dead_code)]
 impl Ports {
-    pub(crate) fn new(ports: Vec<Box<dyn Interface>>) -> Ports {
+    /// Serves `ports`, numbered from 0 in order.
+    pub fn new(ports: Vec<Box<dyn Interface>>) -> Ports {
         let mut p = Ports {
             ports: Vec::new(),
             wakers: Vec::new(),
@@ -641,18 +646,18 @@ impl Ports {
     }
 
     /// How many ports are still open.
-    pub(crate) fn open(&self) -> usize {
+    pub fn open(&self) -> usize {
         self.open
     }
 
     /// Whether port `i` is open.
-    pub(crate) fn is_open(&self, i: usize) -> bool {
+    pub fn is_open(&self, i: usize) -> bool {
         matches!(self.ports.get(i), Some(Some(_)))
     }
 
     /// Adds a port and returns its index. Reuses a closed slot, the lowest
     /// one first.
-    pub(crate) fn add(&mut self, port: Box<dyn Interface>) -> usize {
+    pub fn add(&mut self, port: Box<dyn Interface>) -> usize {
         let i = match self.free.pop_first() {
             Some(i) => i,
             None => {
@@ -670,7 +675,7 @@ impl Ports {
     }
 
     /// Puts `port` at `i`, dropping what was there, which closes its interface.
-    pub(crate) fn replace(&mut self, i: usize, port: Box<dyn Interface>) {
+    pub fn replace(&mut self, i: usize, port: Box<dyn Interface>) {
         let old = self.ports[i].replace(port);
         if old.is_none() {
             self.open += 1;
@@ -681,7 +686,7 @@ impl Ports {
     }
 
     /// Drops port `i`, which closes its interface.
-    pub(crate) fn close(&mut self, i: usize) {
+    pub fn close(&mut self, i: usize) {
         if let Some(p) = self.ports.get_mut(i) && p.take().is_some() {
             self.open -= 1;
             self.free.insert(i);
@@ -689,7 +694,7 @@ impl Ports {
     }
 
     /// Sends a packet out on port `i`. Lost if the port is closed.
-    pub(crate) fn send(&mut self, i: usize, packet: Packet) {
+    pub fn send(&mut self, i: usize, packet: Packet) {
         if let Some(Some(p)) = self.ports.get_mut(i) {
             p.send(packet);
         }
@@ -697,14 +702,14 @@ impl Ports {
 
     /// Counts `n` packets handled outside [`next`](Ports::next), such as
     /// packets released by a timer, toward the budget.
-    pub(crate) fn spend(&mut self, n: usize) {
+    pub fn spend(&mut self, n: usize) {
         self.run += n;
     }
 
     /// Waits for the next event: a packet or a close on any port, the
     /// deadline, `extra` being ready, or a cancel. Yields first if the
     /// budget is spent.
-    pub(crate) async fn next(
+    pub async fn next(
         &mut self,
         cx: &Cx,
         deadline: Option<Instant>,

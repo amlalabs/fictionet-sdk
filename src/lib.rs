@@ -225,7 +225,7 @@ pub mod prelude {
 }
 
 pub use attach::{AttachError, Attachment, Attacher, Attachments, attachments};
-pub use cable::{End, pair};
+pub use cable::{End, pair, pair_with_limit};
 pub use cx::{Cancelled, Cx, Task};
 pub use listen::{Listening, ParseWorldSocketError, WorldSocket, block_on, listen};
 pub use run::run;

@@ -288,11 +288,12 @@ impl<C: Connection> Io<C> {
     }
 }
 
-/// How a handshake failed, in more detail than [`ConnError`]. `web::Sites`
-/// reports it in its events. The public functions turn it into a
-/// `ConnError`.
+/// How a handshake failed, in more detail than [`ConnError`]: what
+/// [`server_detailed`] and [`ClientHello::finish_detailed`] return, for a
+/// world that logs how each handshake ended.
 #[derive(Debug)]
-pub(crate) enum HandshakeError {
+#[non_exhaustive]
+pub enum HandshakeError {
     /// The client closed the connection before the handshake finished.
     Closed,
     /// The client sent this fatal alert.
@@ -302,6 +303,19 @@ pub(crate) enum HandshakeError {
     /// The connection underneath failed.
     Conn(ConnError),
 }
+
+impl std::fmt::Display for HandshakeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HandshakeError::Closed => f.write_str("the client closed the connection before the handshake finished"),
+            HandshakeError::Alert(a) => write!(f, "the client sent alert {a}"),
+            HandshakeError::Failed(why) => f.write_str(why),
+            HandshakeError::Conn(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for HandshakeError {}
 
 impl HandshakeError {
     fn into_conn(self) -> ConnError {
@@ -327,7 +341,7 @@ pub async fn server<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHello<C>, C
 }
 
 /// [`server`], failing with how the hello went wrong.
-pub(crate) async fn server_detailed<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHello<C>, HandshakeError> {
+pub async fn server_detailed<C: Connection>(cx: &Cx, conn: C) -> Result<ClientHello<C>, HandshakeError> {
     let mut io = Io::new(conn);
     let mut acceptor = Acceptor::default();
     let accepted = poll_fn(|task| {
@@ -414,7 +428,7 @@ impl<C: Connection> ClientHello<C> {
 
     /// [`finish`](ClientHello::finish), failing with how the handshake went
     /// wrong.
-    pub(crate) async fn finish_detailed(
+    pub async fn finish_detailed(
         self,
         cx: &Cx,
         config: Arc<ServerConfig>,

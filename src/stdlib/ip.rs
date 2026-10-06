@@ -345,12 +345,14 @@ struct Partial {
 }
 
 /// Fragment reassembly, for [`split_protocols`] and for each sandbox's
-/// filter in [`web::Sites`](crate::stdlib::web::Sites).
+/// filter in [`net::Net`](crate::stdlib::net::Net).
 ///
 /// Every step costs at most a logarithm of the number of unfinished
-/// packets, since the agent decides how many there are.
+/// packets, since the agent decides how many there are. At most 4 MiB of
+/// fragments wait at once; past that, the packets that expire soonest are
+/// dropped. IPv4 packets wait at most 30 seconds, IPv6 packets 60.
 #[derive(Default)]
-pub(crate) struct Reassembly {
+pub struct Reassembly {
     partial: HashMap<Key, Partial>,
     /// Every unfinished packet by when it expires, soonest first.
     by_expiry: BTreeSet<(Instant, Key)>,
@@ -358,7 +360,8 @@ pub(crate) struct Reassembly {
 }
 
 /// What [`Reassembly::intake`] made of a packet.
-pub(crate) enum Intake {
+#[derive(Debug)]
+pub enum Intake {
     /// A whole packet. An IPv6 packet's extension headers are checked and
     /// taken out.
     Whole(Packet),
@@ -367,7 +370,12 @@ pub(crate) enum Intake {
     /// A packet dropped for its IPv6 extension headers: the packet, and the
     /// ICMPv6 "parameter problem" its destination sends back to its source,
     /// if RFC 8200 asks for one.
-    Refused { packet: Packet, answer: Option<Packet> },
+    Refused {
+        /// The packet that was refused.
+        packet: Packet,
+        /// The ICMPv6 "parameter problem" to send back, if any.
+        answer: Option<Packet>,
+    },
 }
 
 /// One fragment, read from a packet.
@@ -393,7 +401,7 @@ impl Reassembly {
     /// ([`push`](Reassembly::push)). A whole IPv6 packet is checked again
     /// and its extension headers taken out ([`wire::strip_ext6`]); that
     /// also drops a packet whose fragments held another fragment.
-    pub(crate) fn intake(&mut self, packet: Packet, now: Instant) -> Intake {
+    pub fn intake(&mut self, packet: Packet, now: Instant) -> Intake {
         let refused = |packet: Packet, reject| {
             let answer = wire::parameter_problem(&packet.0, reject).map(Packet);
             Intake::Refused { packet, answer }
@@ -557,7 +565,7 @@ impl Reassembly {
     }
 
     /// When the next unfinished packet times out.
-    pub(crate) fn next_expiry(&self) -> Option<Instant> {
+    pub fn next_expiry(&self) -> Option<Instant> {
         self.by_expiry.first().map(|(t, _)| *t)
     }
 
@@ -586,7 +594,7 @@ impl Reassembly {
     }
 
     /// Drops every unfinished packet whose time is up.
-    pub(crate) fn expire(&mut self, now: Instant) {
+    pub fn expire(&mut self, now: Instant) {
         while let Some(&(t, k)) = self.by_expiry.first() {
             if t > now {
                 break;
@@ -945,4 +953,119 @@ mod tests {
         assert!(r.push(frag4_of(1, 8, &[2; 8], false), at(0)).is_none());
         assert!(r.push(frag4_of(1, 0, &[1; 8], true), at(0)).is_some());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reading and building IP headers, for code that sees whole packets
+
+/// The IP version of a packet, from the top four bits of its first byte:
+/// 4 or 6 for an IP packet. `None` for an empty packet.
+pub fn version(packet: &[u8]) -> Option<u8> {
+    wire::version(packet)
+}
+
+/// The destination address of an IPv4 or IPv6 packet, if its fixed header
+/// is there.
+pub fn destination(packet: &[u8]) -> Option<std::net::IpAddr> {
+    wire::destination(packet)
+}
+
+/// A checked view of an IPv4 or IPv6 header: what a filter or a router
+/// needs to decide where a packet goes.
+///
+/// Every reader checks lengths, since the agent can send any bytes it
+/// likes. For IPv6, the extension headers are walked to find the
+/// upper-layer protocol.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Header {
+    /// The source address.
+    pub src: std::net::IpAddr,
+    /// The destination address.
+    pub dst: std::net::IpAddr,
+    /// The upper-layer protocol: 6 for TCP, 17 for UDP, 1 for ICMP, 58 for
+    /// ICMPv6. For IPv6, the protocol after the extension headers, or 59
+    /// ("no next header") when they could not be read.
+    pub protocol: u8,
+    /// Where the upper-layer header starts and the packet ends, as byte
+    /// offsets into the packet. The end is cut to the bytes present.
+    pub payload: std::ops::Range<usize>,
+    /// Whether the packet is a fragment of a larger one.
+    pub fragment: bool,
+    /// The fragment's offset in its packet, in bytes. Zero for the first
+    /// fragment and for a whole packet. Only the first fragment carries
+    /// the upper-layer header.
+    pub fragment_offset: usize,
+}
+
+impl Header {
+    /// Reads the header of a whole packet, whose length fields fit the
+    /// bytes present. `None` if it is not IPv4 or IPv6, or is cut short.
+    pub fn parse(packet: &[u8]) -> Option<Header> {
+        Header::read(packet, false)
+    }
+
+    /// Reads a header that may be followed by fewer bytes than its length
+    /// field says, as the copy of a packet inside an ICMP error is, or a
+    /// packet a world logs without trusting.
+    pub fn parse_truncated(packet: &[u8]) -> Option<Header> {
+        Header::read(packet, true)
+    }
+
+    fn read(packet: &[u8], truncated: bool) -> Option<Header> {
+        if let Some(v4) = V4::parse(packet, truncated) {
+            return Some(Header {
+                src: v4.src().into(),
+                dst: v4.dst().into(),
+                protocol: v4.proto(),
+                payload: v4.ihl..v4.total,
+                fragment: v4.is_fragment(),
+                fragment_offset: v4.frag_offset(),
+            });
+        }
+        let v6 = V6::parse(packet, truncated)?;
+        let offset = v6.frag.map_or(0, |(at, _)| usize::from(u16::from_be_bytes([packet[at + 2], packet[at + 3]]) & 0xfff8));
+        Some(Header {
+            src: v6.src().into(),
+            dst: v6.dst().into(),
+            protocol: v6.proto,
+            payload: v6.upper..v6.end,
+            fragment: v6.frag.is_some(),
+            fragment_offset: offset,
+        })
+    }
+
+    /// Reads the header of a whole packet that a host would take in: not a
+    /// fragment, and for IPv6, with extension headers a host accepts.
+    /// This is what the TCP and UDP endpoints read.
+    pub fn parse_whole(packet: &[u8]) -> Option<Header> {
+        let ip = crate::stdlib::udp::parse_ip(packet)?;
+        Some(Header { src: ip.src, dst: ip.dst, protocol: ip.proto, payload: ip.payload..ip.end, fragment: false, fragment_offset: 0 })
+    }
+
+    /// The upper-layer bytes of `packet`, which this header was read from.
+    pub fn payload<'a>(&self, packet: &'a [u8]) -> &'a [u8] {
+        packet.get(self.payload.clone()).unwrap_or_default()
+    }
+}
+
+/// Builds an IP packet from `src` to `dst` around `payload`, with a TTL or
+/// hop limit of 64. The IPv4 header checksum is filled in. The payload's
+/// own checksum must already be done: see [`transport_checksum`]. `src`
+/// and `dst` must be of the same family.
+pub fn packet(src: std::net::IpAddr, dst: std::net::IpAddr, protocol: u8, payload: &[u8]) -> Packet {
+    crate::stdlib::udp::ip_packet(src, dst, protocol, 0, payload)
+}
+
+/// The TCP, UDP or ICMPv6 checksum of `data` over the pseudo-header for
+/// `src`, `dst` and `protocol`. Over data whose checksum field is filled
+/// in, a correct checksum gives 0.
+pub fn transport_checksum(src: std::net::IpAddr, dst: std::net::IpAddr, protocol: u8, data: &[u8]) -> u16 {
+    crate::stdlib::udp::transport_checksum(src, dst, protocol, data)
+}
+
+/// Whether a UDP datagram has a good checksum. A zero checksum field means
+/// "no checksum" over IPv4, and is never valid over IPv6.
+pub fn udp_checksum_ok(src: std::net::IpAddr, dst: std::net::IpAddr, udp: &[u8]) -> bool {
+    crate::stdlib::udp::udp_checksum_ok(src, dst, udp)
 }

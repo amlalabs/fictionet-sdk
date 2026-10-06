@@ -362,7 +362,7 @@ impl Cx {
     /// region. Its work then ends on its own, as after any cancel, but
     /// nothing waits for it and its errors are lost.
     #[allow(dead_code)]
-    pub(crate) async fn region<F, Fut>(&self, f: F) -> crate::Result
+    pub async fn region<F, Fut>(&self, f: F) -> crate::Result
     where
         F: FnOnce(Cx) -> Fut,
         Fut: Future<Output = crate::Result>,

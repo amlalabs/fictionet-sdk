@@ -39,12 +39,12 @@ pub(crate) fn pair_with_guard(guard: Option<Box<dyn Send>>) -> (End, End) {
 /// in the queue. So a flood of tiny packets is bounded too.
 pub(crate) const PACKET_COST: usize = 64;
 
-/// Makes a cable whose queues each hold at most `limit` bytes, counting
-/// each packet's length plus [`PACKET_COST`]. A packet sent past that is
-/// dropped, as on a congested link. For the stdlib's own links on the
-/// agent's path, where an unlimited queue would let the agent grow the
-/// world's memory without end.
-pub(crate) fn pair_with_limit(limit: usize) -> (End, End) {
+/// Makes a [`pair`] whose queues each hold at most `limit` bytes, counting
+/// each packet's length plus 64 bytes. A packet sent past that is dropped,
+/// as on a congested link. Use it for links on the agent's path, where an
+/// unlimited queue would let the agent grow the world's memory without
+/// end.
+pub fn pair_with_limit(limit: usize) -> (End, End) {
     make(None, Some(limit))
 }
 
