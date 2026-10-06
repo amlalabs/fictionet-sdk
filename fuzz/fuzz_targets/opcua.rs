@@ -5,15 +5,27 @@
 use fictionet::stdlib::codec::contract::{check_decode, check_wire, check_wire_value};
 use fictionet::stdlib::codec::{Stream, Wire, pump};
 use fictionet::stdlib::opcua::{
-    Chunk, ChunkType, DataValue, DiagnosticInfo, ExpandedNodeId, ExtensionObject, Limits,
-    LocalizedText, Message, MessageType, NodeId, QualifiedName, ResponseHeader, Service, Variant,
+    Binary, Chunk, ChunkType, DataValue, DiagnosticInfo, EncodeError, ExpandedNodeId,
+    ExtensionObject, Limits, LocalizedText, Message, MessageType, NodeId, QualifiedName, Reader,
+    ResponseHeader, Service, Variant,
 };
 use fictionet::stdlib::opcua::{Frames, Messages};
 use libfuzzer_sys::fuzz_target;
 
-/// Checks the shared contract for an exact binary value.
-fn round_trip<T: Wire + PartialEq + core::fmt::Debug>(data: &[u8]) {
-    check_wire::<T>(data);
+/// Checks permissive reads, including reserved Variant types that cannot be written.
+fn check_reader<T: Binary + Wire<WriteError = EncodeError> + PartialEq + core::fmt::Debug>(
+    data: &[u8],
+) {
+    let mut reader = Reader::new(data);
+    if let Ok(value) = reader.read::<T>()
+        && reader.finish().is_ok()
+    {
+        match value.to_bytes() {
+            Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
+            Err(EncodeError::VariantType) => {}
+            Err(error) => panic!("{error}"),
+        }
+    }
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -82,17 +94,17 @@ fuzz_target!(|data: &[u8]| {
     });
 
     // Any bytes as values on their own.
-    round_trip::<Variant>(data);
-    round_trip::<DataValue>(data);
-    round_trip::<DiagnosticInfo>(data);
-    round_trip::<ExpandedNodeId>(data);
-    round_trip::<NodeId>(data);
-    round_trip::<QualifiedName>(data);
-    round_trip::<LocalizedText>(data);
-    round_trip::<ExtensionObject>(data);
-    round_trip::<ResponseHeader>(data);
-    if let Ok(s) = <Service as Wire>::parse(data) {
-        let out = s.to_bytes().unwrap();
-        assert_eq!(<Service as Wire>::parse(&out), Ok(s));
-    }
+    check_wire::<Variant>(data);
+    check_wire::<DataValue>(data);
+    check_wire::<DiagnosticInfo>(data);
+    check_reader::<Variant>(data);
+    check_reader::<DataValue>(data);
+    check_reader::<DiagnosticInfo>(data);
+    check_wire::<ExpandedNodeId>(data);
+    check_wire::<NodeId>(data);
+    check_wire::<QualifiedName>(data);
+    check_wire::<LocalizedText>(data);
+    check_wire::<ExtensionObject>(data);
+    check_wire::<ResponseHeader>(data);
+    check_wire::<Service>(data);
 });

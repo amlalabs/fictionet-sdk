@@ -800,7 +800,9 @@ pub trait Binary: Sized {
     fn decode(r: &mut Reader<'_>) -> Result<Self, DecodeError>;
 }
 
+/// A type that writes an OPC UA binary encoding.
 trait BinaryWrite {
+    /// Writes one value to `w`.
     fn encode(&self, w: &mut Writer) -> Result<(), EncodeError>;
 }
 
@@ -3497,12 +3499,15 @@ mod tests {
     use super::*;
     use crate::stdlib::codec::{Fail, Stream, contract, pump, test_support::Lcg};
 
-    fn wire_chunks(chunks: Vec<Chunk>) -> Result<Vec<u8>, EncodeError> {
+    /// Writes chunks and fails the test with the original error on refusal.
+    fn wire_chunks(chunks: Vec<Chunk>) -> Vec<u8> {
         let mut out = Vec::new();
         for chunk in chunks {
-            chunk.write(&mut out).map_err(|_| EncodeError::TooLong)?;
+            chunk
+                .write(&mut out)
+                .expect("message chunks must be writable");
         }
-        Ok(out)
+        out
     }
 
     fn le32(v: u32) -> [u8; 4] {
@@ -3804,14 +3809,66 @@ mod tests {
         let bytes = Wire::to_bytes(&every).unwrap();
         let back: Variant = Wire::parse(&bytes).unwrap();
         assert_eq!(Wire::to_bytes(&back).unwrap(), bytes);
-        // Reserved type ids are kept as ByteStrings.
-        assert_eq!(
-            Reader::new(&[27, 1, 0, 0, 0, 5]).read::<Variant>(),
-            Ok(Variant::Scalar(Value::Reserved {
-                type_id: 27,
-                bytes: Some(vec![5])
-            }))
-        );
+    }
+
+    #[test]
+    fn reserved_variants_read_but_do_not_write() {
+        for type_id in type_id::RESERVED_FIRST..=type_id::RESERVED_LAST {
+            let reserved = Value::Reserved {
+                type_id,
+                bytes: Some(vec![5]),
+            };
+            let cases = [
+                (
+                    vec![type_id, 1, 0, 0, 0, 5],
+                    Variant::Scalar(reserved.clone()),
+                ),
+                (
+                    vec![type_id | 0x80, 1, 0, 0, 0, 1, 0, 0, 0, 5],
+                    Variant::Array {
+                        type_id,
+                        values: vec![reserved],
+                        dimensions: None,
+                    },
+                ),
+                (
+                    vec![type_id | 0x80, 0, 0, 0, 0],
+                    Variant::Array {
+                        type_id,
+                        values: vec![],
+                        dimensions: None,
+                    },
+                ),
+            ];
+            for (bytes, expected) in cases {
+                let mut reader = Reader::new(&bytes);
+                let value = reader.read::<Variant>().unwrap();
+                assert_eq!(reader.finish(), Ok(()));
+                assert_eq!(value, expected);
+                assert_eq!(
+                    <Variant as Wire>::parse(&bytes),
+                    Err(DecodeError::VariantType(type_id))
+                );
+                let mut out = vec![0xa5];
+                assert_eq!(value.write(&mut out), Err(EncodeError::VariantType));
+                assert_eq!(out, [0xa5]);
+                check_reader::<Variant>(&bytes);
+
+                let mut data_value_bytes = vec![1];
+                data_value_bytes.extend_from_slice(&bytes);
+                let mut reader = Reader::new(&data_value_bytes);
+                let value = reader.read::<DataValue>().unwrap();
+                assert_eq!(reader.finish(), Ok(()));
+                assert_eq!(value.value, Some(expected));
+                assert_eq!(
+                    <DataValue as Wire>::parse(&data_value_bytes),
+                    Err(DecodeError::VariantType(type_id))
+                );
+                assert_eq!(value.write(&mut out), Err(EncodeError::VariantType));
+                assert_eq!(out, [0xa5]);
+                check_reader::<DataValue>(&data_value_bytes);
+            }
+        }
     }
 
     #[test]
@@ -3996,7 +4053,7 @@ mod tests {
         assert_eq!(
             Message::Hello(h.clone())
                 .chunks(&Limits::default())
-                .and_then(wire_chunks)
+                .map(wire_chunks)
                 .unwrap(),
             bytes
         );
@@ -4018,7 +4075,7 @@ mod tests {
         );
         let ack_bytes = Message::Acknowledge(ack)
             .chunks(&h.limits())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap();
         assert_eq!(ack_bytes[..8], [b'A', b'C', b'K', b'F', 28, 0, 0, 0]);
         let mut c = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
@@ -4054,7 +4111,7 @@ mod tests {
         assert_eq!(
             Message::Hello(low)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks),
+                .map(wire_chunks),
             Err(EncodeError::BufferSize(100))
         );
         let low = Acknowledge {
@@ -4064,7 +4121,7 @@ mod tests {
         assert_eq!(
             Message::Acknowledge(low)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks),
+                .map(wire_chunks),
             Err(EncodeError::BufferSize(100))
         );
         let mut c = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
@@ -4086,7 +4143,7 @@ mod tests {
         assert_eq!(
             Message::Hello(long)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks),
+                .map(wire_chunks),
             Err(EncodeError::TooLong)
         );
         let longest = Hello {
@@ -4095,7 +4152,7 @@ mod tests {
         };
         let bytes = Message::Hello(longest.clone())
             .chunks(&Limits::default())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap();
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         {
@@ -4140,7 +4197,7 @@ mod tests {
             error: StatusCode::BAD_TCP_ENDPOINT_URL_INVALID,
             reason: "no".into(),
         });
-        let bytes = e.chunks(&Limits::default()).and_then(wire_chunks).unwrap();
+        let bytes = e.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(
             bytes,
             [
@@ -4151,7 +4208,7 @@ mod tests {
             server_uri: "a".repeat(MAX_URL_LEN),
             endpoint_url: "b".repeat(MAX_URL_LEN),
         });
-        let rh_bytes = rh.chunks(&Limits::default()).and_then(wire_chunks).unwrap();
+        let rh_bytes = rh.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(rh_bytes.len() as u32, MAX_HANDSHAKE_SIZE);
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         {
@@ -4170,7 +4227,7 @@ mod tests {
         assert_eq!(
             Message::Error(long)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks),
+                .map(wire_chunks),
             Err(EncodeError::TooLong)
         );
         // An ERR missing its reason.
@@ -4293,10 +4350,7 @@ mod tests {
             request_id: 1,
             body,
         });
-        let bytes = opn
-            .chunks(&Limits::default())
-            .and_then(wire_chunks)
-            .unwrap();
+        let bytes = opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(bytes[..4], *b"OPNF");
         assert_eq!(bytes[8..12], [0, 0, 0, 0]);
         assert_eq!(bytes[12..16], le32(SECURITY_POLICY_NONE.len() as u32));
@@ -4379,10 +4433,7 @@ mod tests {
                 .to_bytes()
                 .unwrap(),
         });
-        let bytes = clo
-            .chunks(&Limits::default())
-            .and_then(wire_chunks)
-            .unwrap();
+        let bytes = clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
         assert_eq!(bytes[..4], *b"CLOF");
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         {
@@ -4399,7 +4450,7 @@ mod tests {
             body: vec![0; MIN_BUFFER_SIZE as usize],
         });
         assert_eq!(
-            big.chunks(&Limits::default()).and_then(wire_chunks),
+            big.chunks(&Limits::default()).map(wire_chunks),
             Err(EncodeError::TooLong)
         );
         let opn = Message::Secure(SecureMessage {
@@ -4413,7 +4464,7 @@ mod tests {
             body: vec![],
         });
         assert_eq!(
-            opn.chunks(&Limits::default()).and_then(wire_chunks),
+            opn.chunks(&Limits::default()).map(wire_chunks),
             Err(EncodeError::TooLong)
         );
     }
@@ -4436,7 +4487,7 @@ mod tests {
         assert_eq!(chunks[3].chunk_type, ChunkType::Final);
         // The sequence numbers wrap past u32::MAX.
         assert_eq!(chunks[2].body[8..12], le32(0));
-        let bytes = wire_chunks(chunks).unwrap();
+        let bytes = wire_chunks(chunks);
         contract::check_decode_with_held_limit(Messages::new, &bytes, MAX_MESSAGE_SIZE as usize);
         let mut stream = Stream::new(Messages::new());
         let mut messages = Vec::new();
@@ -4446,10 +4497,7 @@ mod tests {
         // An empty MSG is one chunk.
         let e = msg(1, 1, 1, vec![]);
         assert_eq!(
-            e.chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap()
-                .len(),
+            e.chunks(&Limits::default()).map(wire_chunks).unwrap().len(),
             24
         );
         // A legacy wrap below 1024 is accepted.
@@ -4498,7 +4546,7 @@ mod tests {
         assert_eq!(d.next(), Some(Ok(msg(1, 12, 6, b"z".to_vec()))));
         let bytes = Message::Abort(abort.clone())
             .chunks(&Limits::default())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap();
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         {
@@ -4627,15 +4675,12 @@ mod tests {
             ..Limits::default()
         };
         assert_eq!(
-            opn.chunks(&small).and_then(wire_chunks),
+            opn.chunks(&small).map(wire_chunks),
             Err(EncodeError::TooLong)
         );
         let mut d = Stream::with_buffer(Messages::with_limits(small), MAX_BUFFER_SIZE as usize);
         {
-            let input = &opn
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
             assert_eq!(d.push(input), input.len());
         }
         assert_eq!(
@@ -4652,20 +4697,16 @@ mod tests {
             max_chunk_count: 2,
         };
         assert_eq!(
-            msg(1, 0, 0, vec![0; 20_001])
-                .chunks(&peer)
-                .and_then(wire_chunks),
+            msg(1, 0, 0, vec![0; 20_001]).chunks(&peer).map(wire_chunks),
             Err(EncodeError::TooLong)
         );
         // 20000 bytes need 3 chunks of 8192.
         assert_eq!(
-            msg(1, 0, 0, vec![0; 20_000])
-                .chunks(&peer)
-                .and_then(wire_chunks),
+            msg(1, 0, 0, vec![0; 20_000]).chunks(&peer).map(wire_chunks),
             Err(EncodeError::TooLong)
         );
         let ok = msg(1, 0, 0, vec![0; 16_000]);
-        let bytes = ok.chunks(&peer).and_then(wire_chunks).unwrap();
+        let bytes = ok.chunks(&peer).map(wire_chunks).unwrap();
         let mut d = Stream::with_buffer(Messages::with_limits(peer), MAX_BUFFER_SIZE as usize);
         {
             let input = &bytes;
@@ -4810,7 +4851,7 @@ mod tests {
         {
             let input = &Message::Error(ok.clone())
                 .chunks(&Limits::default())
-                .and_then(wire_chunks)
+                .map(wire_chunks)
                 .unwrap();
             assert_eq!(d.push(input), input.len());
         }
@@ -4842,7 +4883,7 @@ mod tests {
         assert_eq!(
             Message::ReverseHello(rh)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks),
+                .map(wire_chunks),
             Err(EncodeError::TooLong)
         );
     }
@@ -4967,14 +5008,14 @@ mod tests {
                 reason: "r".into(),
             })
             .chunks(&Limits::default())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap(),
             Message::ReverseHello(ReverseHello {
                 server_uri: "u".into(),
                 endpoint_url: "e".into(),
             })
             .chunks(&Limits::default())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap(),
             Message::Secure(SecureMessage {
                 kind: SecureKind::Open(AsymmetricHeader::none()),
@@ -4984,11 +5025,11 @@ mod tests {
                 body: open_request().to_bytes().unwrap(),
             })
             .chunks(&Limits::default())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap(),
             msg(1, 2, 3, vec![1; 9000])
                 .chunks(&Limits::default())
-                .and_then(wire_chunks)
+                .map(wire_chunks)
                 .unwrap(),
         ];
         let mut ack = b"ACKF".to_vec();
@@ -5006,7 +5047,7 @@ mod tests {
         out.push(
             msg(1, 1, 1, body)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks)
+                .map(wire_chunks)
                 .unwrap(),
         );
         out
@@ -5143,7 +5184,7 @@ mod tests {
             stream.extend_from_slice(
                 &msg(1, seq, 1, vec![1, 2, 3])
                     .chunks(&Limits::default())
-                    .and_then(wire_chunks)
+                    .map(wire_chunks)
                     .unwrap(),
             );
         }
@@ -5177,7 +5218,7 @@ mod tests {
         assert_eq!(server.decoder().limits(), ack.limits());
         let reply = Message::Acknowledge(ack)
             .chunks(&hello.limits())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap();
         assert_eq!(&reply[..4], b"ACKF");
         assert_eq!(reply.len(), 28);
@@ -5200,7 +5241,7 @@ mod tests {
             body: request.to_bytes().unwrap(),
         });
         {
-            let input = &opn.chunks(&ack.limits()).and_then(wire_chunks).unwrap();
+            let input = &opn.chunks(&ack.limits()).map(wire_chunks).unwrap();
             assert_eq!(server.push(input), input.len());
         }
         let Some(Ok(Message::Secure(msg))) = server.next() else {
@@ -5234,10 +5275,7 @@ mod tests {
             request_id: msg.request_id,
             body: response.to_bytes().unwrap(),
         });
-        let bytes = answer
-            .chunks(&hello.limits())
-            .and_then(wire_chunks)
-            .unwrap();
+        let bytes = answer.chunks(&hello.limits()).map(wire_chunks).unwrap();
         assert_eq!(&bytes[..4], b"OPNF");
         assert_eq!(&bytes[8..12], &7u32.to_le_bytes());
     }
@@ -5245,7 +5283,7 @@ mod tests {
     // Findings from review, each checked against Part 6 or Part 3.
 
     #[test]
-    fn feed_holds_a_bounded_amount() {
+    fn push_holds_a_bounded_amount() {
         let one = hel_bytes(8192, 8192, b"x");
         let stream: Vec<u8> = one
             .iter()
@@ -5322,16 +5360,13 @@ mod tests {
             body: vec![],
         });
         {
-            let input = &opn
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
             assert_eq!(d.push(input), input.len());
         }
         {
             let input = &msg(1, 6, 2, vec![0; 9000])
                 .chunks(&Limits::default())
-                .and_then(wire_chunks)
+                .map(wire_chunks)
                 .unwrap();
             assert_eq!(d.push(input), input.len());
         }
@@ -5343,26 +5378,17 @@ mod tests {
             body: vec![],
         });
         {
-            let input = &clo
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
             assert_eq!(d.push(input), input.len());
         }
         assert!(all(&mut d).iter().all(Result::is_ok));
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         {
-            let input = &opn
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let input = &opn.chunks(&Limits::default()).map(wire_chunks).unwrap();
             assert_eq!(d.push(input), input.len());
         }
         {
-            let input = &clo
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let input = &clo.chunks(&Limits::default()).map(wire_chunks).unwrap();
             assert_eq!(d.push(input), input.len());
         }
         assert_eq!(
@@ -5434,10 +5460,7 @@ mod tests {
             assert_eq!(d.push(&input), input.len());
             assert_eq!(d.next(), None);
             assert_eq!(d.held(), body.len());
-            let input = err
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let input = err.chunks(&Limits::default()).map(wire_chunks).unwrap();
             assert_eq!(d.push(&input), input.len());
             assert_eq!(d.next(), Some(Ok(err.clone())));
             assert_eq!(d.buffered(), 0);
@@ -5716,9 +5739,7 @@ mod tests {
             },
         ] {
             assert_eq!(
-                opn(h.clone())
-                    .chunks(&Limits::default())
-                    .and_then(wire_chunks),
+                opn(h.clone()).chunks(&Limits::default()).map(wire_chunks),
                 Err(EncodeError::SecurityHeader)
             );
             // The same header, written by hand, does not read.
@@ -5726,10 +5747,7 @@ mod tests {
                 policy_uri: h.policy_uri.clone(),
                 ..AsymmetricHeader::none()
             });
-            let mut bytes = good
-                .chunks(&Limits::default())
-                .and_then(wire_chunks)
-                .unwrap();
+            let mut bytes = good.chunks(&Limits::default()).map(wire_chunks).unwrap();
             let at = 12 + 4 + h.policy_uri.len();
             let mut fields = Writer::new();
             fields.byte_string(h.sender_certificate.as_deref()).unwrap();
@@ -5760,7 +5778,7 @@ mod tests {
         };
         let bytes = opn(empty.clone())
             .chunks(&Limits::default())
-            .and_then(wire_chunks)
+            .map(wire_chunks)
             .unwrap();
         let mut d = Stream::with_buffer(Messages::new(), MAX_BUFFER_SIZE as usize);
         {
@@ -5776,7 +5794,7 @@ mod tests {
         assert!(
             opn(signed)
                 .chunks(&Limits::default())
-                .and_then(wire_chunks)
+                .map(wire_chunks)
                 .is_ok()
         );
     }
@@ -5794,7 +5812,7 @@ mod tests {
         let Some(Ok(m)) = d.next() else { panic!() };
         // Writers use 'F'.
         assert_eq!(
-            m.chunks(&Limits::default()).and_then(wire_chunks).unwrap()[3],
+            m.chunks(&Limits::default()).map(wire_chunks).unwrap()[3],
             b'F'
         );
     }
@@ -5849,9 +5867,20 @@ mod tests {
         assert_eq!(Wire::to_bytes(&h), Err(EncodeError::Value));
     }
 
-    /// Checks exact parsing and transactional writing through the shared contract.
-    fn round_trip<T: Wire + PartialEq + core::fmt::Debug>(bytes: &[u8]) {
-        contract::check_wire::<T>(bytes);
+    /// Checks permissive reads, including reserved Variant types that cannot be written.
+    fn check_reader<T: Binary + Wire<WriteError = EncodeError> + PartialEq + core::fmt::Debug>(
+        bytes: &[u8],
+    ) {
+        let mut reader = Reader::new(bytes);
+        if let Ok(value) = reader.read::<T>()
+            && reader.finish().is_ok()
+        {
+            match value.to_bytes() {
+                Ok(bytes) => assert_eq!(<T as Wire>::parse(&bytes).unwrap(), value),
+                Err(EncodeError::VariantType) => {}
+                Err(error) => panic!("{error}"),
+            }
+        }
     }
 
     #[test]
@@ -5911,7 +5940,7 @@ mod tests {
                 // A message read writes, and reads back the same.
                 let out = m
                     .chunks(&limits)
-                    .and_then(wire_chunks)
+                    .map(wire_chunks)
                     .expect("a message read can be written");
                 let mut d =
                     Stream::with_buffer(Messages::with_limits(limits), MAX_BUFFER_SIZE as usize);
@@ -5920,30 +5949,28 @@ mod tests {
                     assert_eq!(d.push(input), input.len());
                 }
                 assert_eq!(d.next().as_ref(), Some(&Ok(m.clone())));
-                if let Message::Secure(s) = m
-                    && let Ok(service) = Service::parse(&s.body)
-                {
-                    let body = service.to_bytes().expect("a service read can be written");
-                    assert_eq!(Service::parse(&body), Ok(service.clone()));
-                    if let Service::Other { body, .. } = service {
-                        round_trip::<Variant>(&body);
+                if let Message::Secure(s) = m {
+                    contract::check_wire::<Service>(&s.body);
+                    if let Ok(Service::Other { body, .. }) = Service::parse(&s.body) {
+                        contract::check_wire::<Variant>(&body);
+                        check_reader::<Variant>(&body);
                     }
                 }
             }
 
             // The same bytes as values.
-            round_trip::<Variant>(&b);
-            round_trip::<DataValue>(&b);
-            round_trip::<DiagnosticInfo>(&b);
-            round_trip::<ExpandedNodeId>(&b);
-            round_trip::<NodeId>(&b);
-            round_trip::<LocalizedText>(&b);
-            round_trip::<ExtensionObject>(&b);
-            round_trip::<ResponseHeader>(&b);
-            if let Ok(s) = Service::parse(&b) {
-                let out = s.to_bytes().expect("a service read can be written");
-                assert_eq!(Service::parse(&out), Ok(s));
-            }
+            contract::check_wire::<Variant>(&b);
+            contract::check_wire::<DataValue>(&b);
+            contract::check_wire::<DiagnosticInfo>(&b);
+            check_reader::<Variant>(&b);
+            check_reader::<DataValue>(&b);
+            check_reader::<DiagnosticInfo>(&b);
+            contract::check_wire::<ExpandedNodeId>(&b);
+            contract::check_wire::<NodeId>(&b);
+            contract::check_wire::<LocalizedText>(&b);
+            contract::check_wire::<ExtensionObject>(&b);
+            contract::check_wire::<ResponseHeader>(&b);
+            contract::check_wire::<Service>(&b);
             // Every value at every offset, one byte at a time through a reader.
             let mut r = Reader::new(&b);
             while r.remaining() > 0 {

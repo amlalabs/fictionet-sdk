@@ -11,9 +11,9 @@
 //! then read each data frame's [`Segment`]. A [`Reassembler`] joins transport
 //! segments into application fragments. Use one reassembler per source,
 //! destination and direction. Link acknowledgments, duplicate suppression
-//! and session state belong to
-//! world code. [`Fragment`] reads the application header and leaves object
-//! groups and variations as bytes. Secure authentication is not performed.
+//! and session state belong to world code. [`Fragment`] reads the
+//! application header and leaves object groups and variations as bytes.
+//! Secure authentication is not performed.
 //! Unknown link and application function codes are preserved.
 //!
 //! Use [`Frames`] with [`Stream`](super::codec::Stream).

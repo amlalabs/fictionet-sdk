@@ -13,13 +13,13 @@
 //!
 //! Nothing here reads a socket. A world that plays a device feeds the
 //! bytes it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Stream`](super::codec::Stream) of [`Frames`], gets [`Packet`]s back, checks each one with
-//! [`Packet::check`], reads its command, and for the data commands reads
-//! the [`SendData`] envelope, its [`Cpf`] items and the [`MessageRequest`]
-//! inside. It writes replies with the same types, starting from
-//! [`Packet::reply`], and answers a list-identity request with an
-//! [`Identity`]. Which objects exist, and what their attributes hold, is
-//! up to world code.
+//! [`Stream`](super::codec::Stream) of [`Frames`], gets [`Packet`]s back,
+//! checks each one with [`Packet::check`], reads its command, and for the
+//! data commands reads the [`SendData`] envelope, its [`Cpf`] items and
+//! the [`MessageRequest`] inside. It writes replies with the same types,
+//! starting from [`Packet::reply`], and answers a list-identity request
+//! with an [`Identity`]. Which objects exist, and what their attributes
+//! hold, is up to world code.
 //!
 //! Every reader checks lengths and bounds, because the agent can send any
 //! bytes it likes. The encapsulation layer accepts any command code and
@@ -29,9 +29,10 @@
 //! an [`EncodeError`] instead of writing a value its reader would refuse
 //! or read back as something else, so nothing is cut short in silence.
 //!
-//! [`Frames`] works with [`Stream`](super::codec::Stream) and preserves the prefix parser's
-//! permissive framing. [`Packet`] implements [`Wire`] for exact parsing
-//! of packets that pass [`Packet::check`] and transactional writing.
+//! [`Frames`] works with [`Stream`](super::codec::Stream) and preserves the
+//! prefix parser's permissive framing. [`Packet`] implements [`Wire`] for
+//! exact parsing of packets that pass [`Packet::check`] and transactional
+//! writing.
 //!
 //! ```
 //! use fictionet::stdlib::codec::Wire;
@@ -2199,7 +2200,7 @@ mod tests {
     }
 
     #[test]
-    fn decoder_holds_at_most_max_buffered() {
+    fn stream_holds_at_most_frames_capacity() {
         // A stream of empty NOPs far longer than the decoder may hold.
         let one = packet(Command::Nop, 0, Vec::new()).to_bytes().unwrap();
         let stream: Vec<u8> = one

@@ -28,7 +28,6 @@ fn plaintext(data: &[u8]) {
                 check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty as Wire>::parse(&bytes), Ok(value));
             }
         };
     }
@@ -45,7 +44,6 @@ fn pdu(data: &[u8]) {
                 check_wire_value(&value);
                 let bytes = value.to_bytes().unwrap();
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty as Wire>::parse(&bytes), Ok(value));
             }
         };
     }
@@ -87,7 +85,6 @@ fn frame(value: &Frame) -> Vec<u8> {
     check_wire_value(value);
     let bytes = value.to_bytes().unwrap();
     assert!(bytes.len() <= MAX_FRAME);
-    assert_eq!(<Frame as Wire>::parse(&bytes), Ok(value.clone()));
     if let Frame::SlowPath(packet) = value {
         if let Ok(c) = Connection::from_packet(packet) {
             assert_eq!(Connection::from_packet(&c.to_packet().unwrap()), Ok(c));
@@ -106,11 +103,10 @@ fn built(data: &[u8]) {
     let body = prefix(data, MAX_BUILT_BODY);
     macro_rules! check {
         ($ty:ty, $value:expr) => {{
-            let value = $value;
+            let value: $ty = $value;
             check_wire_value(&value);
             if let Ok(bytes) = value.to_bytes() {
                 assert!(bytes.len() <= MAX_PDU);
-                assert_eq!(<$ty as Wire>::parse(&bytes), Ok(value));
             }
         }};
     }
@@ -150,9 +146,6 @@ fn built(data: &[u8]) {
         payload: prefix(data, MAX_FAST_PATH).to_vec(),
     };
     check_wire_value(&fast);
-    if let Ok(bytes) = fast.to_bytes() {
-        assert_eq!(<Frame as Wire>::parse(&bytes), Ok(fast));
-    }
     check!(
         DataBlock,
         DataBlock::Other {

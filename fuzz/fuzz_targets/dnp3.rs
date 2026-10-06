@@ -15,8 +15,6 @@ fuzz_target!(|data: &[u8]| {
     let _ = pump(&mut stream, data, |frame| frames.push(frame));
     for frame in &frames {
         check_wire_value(frame);
-        let bytes = frame.to_bytes().unwrap();
-        assert_eq!(<Frame as Wire>::parse(&bytes), Ok(frame.clone()));
         if let Ok(segment) = frame.segment() {
             assert_eq!(
                 <Segment as Wire>::parse(&segment.to_bytes().unwrap()),
@@ -51,18 +49,6 @@ fuzz_target!(|data: &[u8]| {
     });
     check_wire::<Segment>(data);
     check_wire::<Fragment>(data);
-    if let Ok(segment) = <Segment as Wire>::parse(data) {
-        assert_eq!(
-            <Segment as Wire>::parse(&segment.to_bytes().unwrap()),
-            Ok(segment)
-        );
-    }
-    if let Ok(fragment) = <Fragment as Wire>::parse(data) {
-        assert_eq!(
-            <Fragment as Wire>::parse(&fragment.to_bytes().unwrap()),
-            Ok(fragment)
-        );
-    }
     if data.len() >= 4 {
         let fragment = Fragment {
             control: data[0],
@@ -70,9 +56,7 @@ fuzz_target!(|data: &[u8]| {
             indications: (data[2] & 1 != 0).then_some(u16::from_le_bytes([data[2], data[3]])),
             objects: data[4..].to_vec(),
         };
-        if let Ok(bytes) = fragment.to_bytes() {
-            assert_eq!(<Fragment as Wire>::parse(&bytes), Ok(fragment));
-        }
+        check_wire_value(&fragment);
     }
     let mut reassembler = Reassembler::new();
     for chunk in data.chunks(250) {

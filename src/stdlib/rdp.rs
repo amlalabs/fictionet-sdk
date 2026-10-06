@@ -526,11 +526,12 @@ pub fn read_data(packet: &tpkt::Packet) -> Result<Vec<u8>, Error> {
 /// Checks the data size before constructing the packet.
 pub fn write_data(data: &[u8]) -> Result<tpkt::Packet, Error> {
     bound(data.len(), MAX_PDU, "RDP data")?;
-    Ok(cotp::over_tpkt::from_tpdu(&cotp::Tpdu::Data(cotp::Data {
+    cotp::over_tpkt::try_from_tpdu(&cotp::Tpdu::Data(cotp::Data {
         eot: true,
         number: 0,
         data: data.to_vec(),
-    })))
+    }))
+    .map_err(|_| Error::Limit("RDP data"))
 }
 
 /// Requested protocol bits, or one selected protocol. Unknown bits survive.
@@ -783,7 +784,7 @@ impl Connection {
             ConnectionKind::Request => cotp::Tpdu::ConnectionRequest(c),
             ConnectionKind::Confirm => cotp::Tpdu::ConnectionConfirm(c),
         };
-        Ok(cotp::over_tpkt::from_tpdu(&t))
+        cotp::over_tpkt::try_from_tpdu(&t).map_err(|_| Error::Limit("connection data"))
     }
 }
 
