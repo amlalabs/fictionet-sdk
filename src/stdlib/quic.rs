@@ -2896,6 +2896,8 @@ mod tests {
                     if let Some(payload) = packet.payload() {
                         check_payload(payload);
                     }
+                    let wire = datagram(std::slice::from_ref(&packet)).unwrap();
+                    assert_eq!(Packet::parse(&wire, dcid_len), Ok((packet, wire.len())));
                 }
             }
             if round % 10 == 1 {

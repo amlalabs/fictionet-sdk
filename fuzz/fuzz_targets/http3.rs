@@ -13,6 +13,40 @@ use libfuzzer_sys::fuzz_target;
 
 const MAX_FUZZ_INPUT: usize = 16 << 10;
 
+/// A valid header list writes, reads back equal, and its Priority does too.
+fn check_headers(headers: &HeaderList, kind: HeaderKind) {
+    if headers.validate(kind).is_err() {
+        return;
+    }
+    let section = headers.section(&mut qpack::Encoder::new(0, http3::MAX_FIELD_SECTION_SIZE), 0, kind).unwrap();
+    contract::check_wire_value(&section);
+    let SectionResult::Fields { fields, ack } =
+        qpack::decode_section(&Table::new(0), 0, &section.to_bytes().unwrap()).unwrap()
+    else {
+        panic!("a literal section blocked");
+    };
+    assert_eq!(ack, None);
+    assert_eq!(HeaderList::from_fields(fields, kind).as_ref(), Ok(headers));
+    if let Ok(priority) = headers.priority() {
+        assert_eq!(Priority::parse(&priority.to_bytes().unwrap()), Ok(priority));
+    }
+}
+
+/// Checks a received event. `request` is the header kind of a request stream's headers;
+/// other streams carry responses.
+fn check_event(event: &Event, request: Option<HeaderKind>) {
+    let (headers, kind) = match event {
+        Event::Headers(headers) => (headers, request.unwrap_or(HeaderKind::Response)),
+        Event::Informational(headers) => (headers, HeaderKind::Response),
+        Event::Trailers(headers) => (headers, HeaderKind::Trailers),
+        Event::PushPromise { headers, .. } => (headers, HeaderKind::Promise),
+        Event::Unknown(frame) => return contract::check_wire_value(frame),
+        Event::Data(data) => return assert!(data.len() <= http3::MAX_FRAME),
+    };
+    assert_eq!(headers.validate(kind), Ok(()));
+    check_headers(headers, kind);
+}
+
 /// Checks an event and its acknowledgment, or pauses/cancels its request stream.
 fn request_result(
     result: Result<RequestResult, http3::Error>,
@@ -33,18 +67,8 @@ fn request_result(
                 contract::check_wire_value(&ack);
             }
             if let Ok(event) = event {
-                match event {
-                    Event::Headers(headers) if side == MessageSide::Request => {
-                        assert_eq!(headers.validate(HeaderKind::Request { extended_connect: true }), Ok(()));
-                    }
-                    Event::Headers(headers) | Event::Informational(headers) => {
-                        assert_eq!(headers.validate(HeaderKind::Response), Ok(()));
-                    }
-                    Event::Trailers(headers) => assert_eq!(headers.validate(HeaderKind::Trailers), Ok(())),
-                    Event::PushPromise { headers, .. } => assert_eq!(headers.validate(HeaderKind::Promise), Ok(())),
-                    Event::Unknown(frame) => contract::check_wire_value(&frame),
-                    Event::Data(data) => assert!(data.len() <= http3::MAX_FRAME),
-                }
+                let request = (side == MessageSide::Request).then_some(HeaderKind::Request { extended_connect: true });
+                check_event(&event, request);
                 return true;
             }
         }
@@ -171,17 +195,19 @@ fuzz_target!(|input: &[u8]| {
         contract::check_wire_value(frame);
     }
     for extended_connect in [false, true] {
-        for mut state in [
-            RequestState::new(0, MessageSide::Request, extended_connect).unwrap(),
-            RequestState::new(0, MessageSide::Response, extended_connect).unwrap(),
-            RequestState::new(0, MessageSide::HeadResponse, extended_connect).unwrap(),
-            RequestState::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(),
-            RequestState::push(3).unwrap(),
+        let request = Some(HeaderKind::Request { extended_connect });
+        for (mut state, request) in [
+            (RequestState::new(0, MessageSide::Request, extended_connect).unwrap(), request),
+            (RequestState::new(0, MessageSide::Response, extended_connect).unwrap(), None),
+            (RequestState::new(0, MessageSide::HeadResponse, extended_connect).unwrap(), None),
+            (RequestState::new(0, MessageSide::ConnectResponse, extended_connect).unwrap(), None),
+            (RequestState::push(3).unwrap(), None),
         ] {
             for frame in &items {
                 let Ok(frame) = frame else { break };
                 match state.step(frame, &table) {
-                    Ok(RequestResult::Event { event: Ok(_), ack }) => {
+                    Ok(RequestResult::Event { event: Ok(event), ack }) => {
+                        check_event(&event, request);
                         if let Some(ack) = ack {
                             contract::check_wire_value(&ack);
                         }
@@ -201,11 +227,7 @@ fuzz_target!(|input: &[u8]| {
             HeaderKind::Promise,
         ] {
             if let Ok(headers) = HeaderList::from_fields(fields.clone(), kind) {
-                if headers.validate(kind).is_ok() {
-                    let section =
-                        headers.section(&mut qpack::Encoder::new(0, http3::MAX_FIELD_SECTION_SIZE), 0, kind).unwrap();
-                    contract::check_wire_value(&section);
-                }
+                check_headers(&headers, kind);
                 if let Ok(priority) = headers.priority() {
                     contract::check_wire_value(&priority);
                 }

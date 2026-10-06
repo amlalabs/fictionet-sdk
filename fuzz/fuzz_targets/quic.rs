@@ -17,8 +17,14 @@ fn check_payload(bytes: &[u8]) {
 fn datagram<const N: usize>(bytes: &[u8]) {
     contract::check_wire::<Datagram<N>>(bytes);
     let (packets, _) = quic::split_datagram(bytes, N);
+    // With a legal ID length, every packet read can be written, together and one at a time.
+    let writable = N <= 20;
     if !packets.is_empty() {
-        contract::check_wire_value(&Datagram::<N>(packets.clone()));
+        let value = Datagram::<N>(packets.clone());
+        contract::check_wire_value(&value);
+        if writable {
+            assert_eq!(quic::split_datagram(&value.to_bytes().unwrap(), N), (packets.clone(), None));
+        }
     }
     for packet in packets {
         if let Some(payload) = packet.payload() {
@@ -26,7 +32,11 @@ fn datagram<const N: usize>(bytes: &[u8]) {
         }
         let value = Datagram::<N>(vec![packet]);
         contract::check_wire_value(&value);
-        if let Ok(bytes) = value.to_bytes() {
+        let written = value.to_bytes();
+        if writable {
+            assert!(written.is_ok());
+        }
+        if let Ok(bytes) = written {
             assert_eq!(quic::Packet::parse(&bytes, N), Ok((value.0[0].clone(), bytes.len())));
         }
     }
