@@ -1,9 +1,9 @@
 //! JSON-RPC envelopes and stdio/HTTP framing through public codec tools.
 
 use fictionet::stdlib::codec::{
-    Carry, Collect, CollectError, Demux, Ending, Fail, Layered, Lines, Pipe, Stream, Wire,
+    Carry, Collect, CollectError, Demux, Ending, Fail, Layered, Lcg, Lines, Pipe, Stream, Wire,
     contract, finish, pump,
-    test_support::{Lcg, chunks, decode_all, mutate},
+    test_support::{chunks, decode_all, mutate},
     try_pump,
 };
 use fictionet::stdlib::json::{self, Limits, Value};
