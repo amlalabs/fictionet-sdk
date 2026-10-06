@@ -1558,19 +1558,24 @@ mod tests {
 
     #[test]
     fn stream_reads_large_batch() {
-        let started = std::time::Instant::now();
-        let bytes = "0\n".repeat(MAX_SIZE);
-        let mut stream = Stream::new(Values::new());
-        let mut count = 0;
-        pump(&mut stream, bytes.as_bytes(), |value| {
-            assert_eq!(value, n("0"));
-            count += 1;
-        }).unwrap();
-        finish(&mut stream, |_| panic!("no pending value")).unwrap();
-        assert_eq!(count, MAX_SIZE);
-        assert_eq!(stream.buffered(), 0);
-        assert!(stream.into_parts().0.allocated() <= 2 * (MAX_SIZE + 1));
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        // Returns the bytes the decoder allocated.
+        let read = |size: usize| {
+            let bytes = "0\n".repeat(size);
+            let mut stream = Stream::new(Values::new());
+            let mut count = 0;
+            pump(&mut stream, bytes.as_bytes(), |value| {
+                assert_eq!(value, n("0"));
+                count += 1;
+            }).unwrap();
+            finish(&mut stream, |_| panic!("no pending value")).unwrap();
+            assert_eq!(count, size);
+            assert_eq!(stream.buffered(), 0);
+            stream.into_parts().0.allocated()
+        };
+        assert!(read(MAX_SIZE) <= 2 * (MAX_SIZE + 1));
+        fictionet::stdlib::codec::test_support::assert_linear("json values", MAX_SIZE / 16, |size| {
+            read(size);
+        });
     }
 
     const PIECES: [&str; 32] = [

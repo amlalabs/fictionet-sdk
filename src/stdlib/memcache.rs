@@ -3017,19 +3017,19 @@ mod tests {
 
     #[test]
     fn decoder_takes_many_small_commands_in_linear_time() {
+        use fictionet::stdlib::codec::test_support::assert_linear;
         let one = b"set k 0 0 1\r\nx\r\nget k\r\n";
-        let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 100_000).collect();
-        let started = std::time::Instant::now();
-        let got = commands(&stream);
-        assert_eq!(got.len(), 200_000);
-        assert!(got.iter().all(Result::is_ok));
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("memcache commands", 6_250, |n| {
+            let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * n).collect();
+            let got = commands(&stream);
+            assert_eq!(got.len(), 2 * n);
+            assert!(got.iter().all(Result::is_ok));
+        });
         // Shared schedules include single-byte pushes and must stay linear.
         let line = [vec![b' '; MAX_LINE - 3], b"\r\n".to_vec()].concat();
-        let stream = line.repeat(50);
-        let started = std::time::Instant::now();
-        contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
-        assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
+        assert_linear("memcache long lines", 5, |n| {
+            contract::check_decode_with_alloc_limit(Commands::new, &line.repeat(n), 2 * MAX_LINE);
+        });
     }
 
     fn fuzz_buffer(rng: &mut Lcg, pieces: &[Vec<u8>]) -> Vec<u8> {

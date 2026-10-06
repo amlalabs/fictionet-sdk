@@ -14,12 +14,44 @@ A pull request must pass the same checks as CI, in both feature sets:
 
 ```console
 $ cargo build --all-targets
-$ cargo test
+$ cargo nextest run --workspace
+$ cargo test --doc --workspace
 $ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 $ cargo clippy --all-targets -- -D warnings
 ```
 
 Then run each command again with `--features tokio`.
+
+## Running the tests
+
+The tests run under [cargo-nextest](https://nexte.st), installed with
+`cargo install cargo-nextest --locked`. It runs each test in its own process
+and runs all the test binaries at once. The slowest tests wait on 10-second
+protocol timeouts, so a whole run takes about as long as the slowest test.
+`cargo nextest run` does not run doctests, so `cargo test --doc` runs them.
+`.config/nextest.toml` holds the settings: tests are never retried, a test
+is flagged after 15 seconds, and the tests that run whole worlds run a few
+at a time.
+
+`cargo test` runs everything too, doctests included, one test binary after
+another. It takes about a minute longer.
+
+The test profile builds the crate with `opt-level = 1` and its dependencies
+with `opt-level = 2` (see `Cargo.toml`). The randomized protocol tests run
+about five times faster that way, and the dependencies are built once.
+
+Randomized and large-input tests size their loops with
+`stdlib::codec::test_support::rounds`. A default run is fast. For a deep
+run, scale them up:
+
+```console
+$ FICTIONET_TEST_SCALE=100 cargo nextest run --workspace
+```
+
+A test that checks for linear time uses
+`stdlib::codec::test_support::assert_linear`. It compares the time for an
+input with the time for one 4 times larger, so it does not fail on a busy
+machine the way a fixed time limit would.
 
 A change to `fictionet attach` or to how a world is reached should also pass the
 Docker tests (`tests/docker/*/run.sh`), and for the Helm chart, the Kubernetes test

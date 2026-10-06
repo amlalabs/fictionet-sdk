@@ -3146,7 +3146,7 @@ mod tests {
     #[test]
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5e_ed1f);
-        for _ in 0..4000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
             let mut data = random_message(&mut rng);
             mutate(&mut rng, &mut data);
             check(&data);
@@ -3158,7 +3158,7 @@ mod tests {
             }
         }
         // Fully random bytes, too.
-        for _ in 0..2000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(500) {
             let data: Vec<u8> = rng.bytes(120);
             check(&data);
             check_value(&String::from_utf8_lossy(&data));

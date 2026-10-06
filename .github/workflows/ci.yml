@@ -29,10 +29,15 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: Build
         run: cargo build --locked --all-targets ${{ matrix.features }}
       - name: Test
-        run: cargo test --locked ${{ matrix.features }}
+        run: cargo nextest run --locked --workspace ${{ matrix.features }}
+      - name: Doctests
+        run: cargo test --locked --doc --workspace ${{ matrix.features }}
       - name: Docs
         run: cargo doc --locked --no-deps ${{ matrix.features }}
         env:

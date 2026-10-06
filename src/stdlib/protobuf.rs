@@ -1298,17 +1298,19 @@ mod tests {
 
     #[test]
     fn stream_takes_many_small_frames() {
-        let started = std::time::Instant::now();
-        let mut stream = Stream::new(Frames::new());
-        let mut count = 0;
-        pump(&mut stream, &vec![0; MAX_MESSAGE], |frame| {
-            assert!(frame.data.is_empty());
-            count += 1;
-        }).unwrap();
-        finish(&mut stream, |_| panic!("no pending frame")).unwrap();
-        assert_eq!(count, MAX_MESSAGE);
-        assert_eq!(stream.buffered(), 0);
-        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        let read = |size: usize| {
+            let mut stream = Stream::new(Frames::new());
+            let mut count = 0;
+            pump(&mut stream, &vec![0; size], |frame| {
+                assert!(frame.data.is_empty());
+                count += 1;
+            }).unwrap();
+            finish(&mut stream, |_| panic!("no pending frame")).unwrap();
+            assert_eq!(count, size);
+            assert_eq!(stream.buffered(), 0);
+        };
+        read(MAX_MESSAGE);
+        fictionet::stdlib::codec::test_support::assert_linear("protobuf frames", MAX_MESSAGE / 64, read);
     }
 
     // Counts fields as MAX_FIELDS does: group members included.

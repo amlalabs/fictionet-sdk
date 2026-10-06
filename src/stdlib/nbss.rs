@@ -914,7 +914,7 @@ mod tests {
     #[test]
     fn generated_packets_and_names() {
         let mut rng = Lcg::new(0x5eed);
-        for _ in 0..70_000 {
+        for _ in 0..fictionet::stdlib::codec::test_support::rounds(17_500) {
             let mut data = if rng.coin() {
                 request().to_bytes().unwrap()
             } else {

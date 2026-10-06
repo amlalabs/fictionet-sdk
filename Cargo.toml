@@ -62,3 +62,16 @@ required-features = ["tokio"]
 [[bench]]
 name = "perf"
 harness = false
+
+# Dependencies are built optimized once and then cached; ring, rustls and
+# tokio are much faster that way, and debug builds of the crate itself are
+# unchanged.
+[profile.dev.package."*"]
+opt-level = 2
+
+# The tests run the protocol code through randomized and large inputs, which
+# runs about five times faster at opt-level 1. Line tables keep file and line
+# numbers in backtraces and make the test binaries quicker to link.
+[profile.test]
+debug = "line-tables-only"
+opt-level = 1

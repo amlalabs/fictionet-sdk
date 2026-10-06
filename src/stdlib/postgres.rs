@@ -3644,7 +3644,7 @@ mod tests {
         for message in all_backend() {
             message.write(&mut back).unwrap();
         }
-        for i in 0..4000 {
+        for i in 0..fictionet::stdlib::codec::test_support::rounds(1000) {
             let mut data = match i % 3 {
                 0 => rng.bytes(64),
                 1 => front.clone(),

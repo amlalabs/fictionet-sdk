@@ -2172,23 +2172,15 @@ mod tests {
 
     #[test]
     fn decoders_take_many_small_lines_in_linear_time() {
-        let wire = b"NOOP\r\n".repeat(200_000);
-        let started = std::time::Instant::now();
-        let (items, error) = decode_all(Commands::new, &wire);
-        assert_eq!(error, None);
-        assert_eq!(items.len(), 200_000);
-        let body = [
-            b"+OK\r\n".to_vec(),
-            b"a\r\n".repeat(200_000),
-            b".\r\n".to_vec(),
-        ]
-        .concat();
-        assert_eq!(Reply::parse(&body).unwrap().lines().count(), 200_000);
-        assert!(
-            started.elapsed().as_secs() < 5,
-            "took {:?}",
-            started.elapsed()
-        );
+        let wire = |n: usize| b"NOOP\r\n".repeat(n);
+        let body = |n: usize| [b"+OK\r\n".to_vec(), b"a\r\n".repeat(n), b".\r\n".to_vec()].concat();
+        fictionet::stdlib::codec::test_support::assert_linear("POP3 lines", 12_500, |n| {
+            let (items, error) = decode_all(Commands::new, &wire(n));
+            assert_eq!(error, None);
+            assert_eq!(items.len(), n);
+            assert_eq!(Reply::parse(&body(n)).unwrap().lines().count(), n);
+        });
+        let (wire, body) = (wire(50_000), body(50_000));
         contract::check_decode_with_alloc_limit(Commands::new, &wire, 2 * (MAX_AUTH_LINE + 2));
         contract::check_decode_with_alloc_limit(
             || reply_reader(true),

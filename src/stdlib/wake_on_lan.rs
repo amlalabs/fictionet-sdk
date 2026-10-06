@@ -632,7 +632,8 @@ mod tests {
     fn lcg_fuzz() {
         let mut rng = Lcg::new(0x5eed);
         let mut found = 0;
-        for round in 0..4000 {
+        let rounds = fictionet::stdlib::codec::test_support::rounds(1000);
+        for round in 0..rounds {
             let len = rng.index(400);
             // Bytes from a small alphabet, so sync streams and repeats turn
             // up often.
@@ -675,6 +676,6 @@ mod tests {
                 }
             }
         }
-        assert!(found > 1000, "found {found}");
+        assert!(found > rounds / 4, "found {found} in {rounds} rounds");
     }
 }
