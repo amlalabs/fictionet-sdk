@@ -2,13 +2,21 @@
 //! window it keeps for transport data counters.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::wireguard::{
-    CookieReply, DATA_HEADER_LEN, Data, Error, Initiation, MAX_ENCRYPTED, MAX_PLAINTEXT, Message,
-    REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, message_type, pad, padding,
+    CookieReply, Data, Error, Initiation, MAX_ENCRYPTED, MAX_PLAINTEXT, Message, Plaintext,
+    REJECT_AFTER_MESSAGES, ReplayWindow, Response, TAG_LEN, padding,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<Initiation>(data);
+    contract::check_wire::<Response>(data);
+    contract::check_wire::<CookieReply>(data);
+    contract::check_wire::<Data>(data);
+    contract::check_wire::<Plaintext>(data);
+
     // A message read can be written, and gives back the same bytes.
     if let Ok(m) = Message::parse(data) {
         let bytes = m.to_bytes().unwrap();
@@ -31,6 +39,7 @@ fuzz_target!(|data: &[u8]| {
         let receiver = u32::from_le_bytes(data[..4].try_into().unwrap());
         let counter = u64::from_le_bytes(data[4..12].try_into().unwrap());
         let d = Data { receiver, counter, encrypted: data[12..].to_vec() };
+        contract::check_wire_value(&d);
         let n = d.encrypted.len();
         match d.to_bytes() {
             Ok(b) => {
@@ -39,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
             }
             Err(e) => {
                 assert!(!(TAG_LEN..=MAX_ENCRYPTED).contains(&n));
-                assert_eq!(e, Error::Length { kind: message_type::DATA, len: DATA_HEADER_LEN + n });
+                assert_eq!(e, Error::Unwritable);
             }
         }
     }
@@ -66,8 +75,10 @@ fuzz_target!(|data: &[u8]| {
         assert!(n < 16);
         let plaintext = &data[4..];
         let n = padding(plaintext.len(), mtu);
-        match pad(plaintext, mtu) {
+        match Plaintext::padded(plaintext, mtu) {
             Ok(padded) => {
+                contract::check_wire_value(&padded);
+                let padded = padded.to_bytes().unwrap();
                 assert_eq!(padded.len(), plaintext.len() + n);
                 assert_eq!(&padded[..plaintext.len()], plaintext);
                 assert!(padded[plaintext.len()..].iter().all(|&x| x == 0));

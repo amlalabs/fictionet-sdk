@@ -2,10 +2,13 @@
 //! reads them, and packets built from the bytes, as world code writes them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::vxlan::{Error, GpePacket, HEADER_LEN, MAX_DATAGRAM, MAX_PAYLOAD, MAX_VNI, Packet};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Packet>(data);
+    contract::check_wire::<GpePacket>(data);
     // The bytes as a VXLAN datagram. A packet read can be written, at the
     // same length, and reads back the same.
     if let Ok(p) = Packet::parse(data) {
@@ -56,26 +59,12 @@ fuzz_target!(|data: &[u8]| {
     let mut payload = rest.to_vec();
     payload.resize(len, head[6]);
     let p = Packet { vni, frame: payload.clone() };
-    match p.to_bytes() {
-        Ok(bytes) => {
-            assert_eq!(bytes.len(), HEADER_LEN + len);
-            assert_eq!(Packet::parse(&bytes), Ok(p));
-        }
-        Err(Error::VniTooLarge(v)) => assert!(v == vni && vni > MAX_VNI),
-        Err(Error::PayloadTooLong(n)) => assert!(n == len && vni <= MAX_VNI && len > MAX_PAYLOAD),
-        Err(e) => panic!("{e}"),
-    }
+    contract::check_wire_value(&p);
+    assert_eq!(p.to_bytes().is_ok(), vni <= MAX_VNI && len <= MAX_PAYLOAD);
     let g = GpePacket { vni, next_protocol, bum: head[4] & 2 != 0, oam: head[4] & 4 != 0, payload };
-    match g.to_bytes() {
-        Ok(bytes) => {
-            assert_eq!(bytes.len(), HEADER_LEN + len);
-            assert_eq!(GpePacket::parse(&bytes), Ok(g));
-        }
-        Err(Error::ReservedNextProtocol) => assert_eq!(next_protocol, Some(0)),
-        Err(Error::VniTooLarge(v)) => assert!(v == vni && vni > MAX_VNI && next_protocol != Some(0)),
-        Err(Error::PayloadTooLong(n)) => {
-            assert!(n == len && vni <= MAX_VNI && len > MAX_PAYLOAD && next_protocol != Some(0))
-        }
-        Err(e) => panic!("{e}"),
-    }
+    contract::check_wire_value(&g);
+    assert_eq!(
+        g.to_bytes().is_ok(),
+        next_protocol != Some(0) && vni <= MAX_VNI && len <= MAX_PAYLOAD
+    );
 });

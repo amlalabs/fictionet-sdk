@@ -37,7 +37,7 @@ cargo +nightly fuzz list
 | `amqp` | bytes and constructed values, checked with codec contracts | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | BER/DER elements and writer scripts; checks framing, value readers, DER copies, bounds, and transactional writes | `stdlib::asn1`: ASN.1 BER and DER |
 | `pop3` | commands, replies, AUTH lines, expectations, and listings | `stdlib::pop3`: strict wire values and bounded codec contracts |
-| `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
+| `bacnet` | wire units, service prefix readers, bounded decoder allocations and strict writers | `stdlib::bacnet`: BACnet/IP |
 | `cotp` | TPKT streams, standalone TPDUs, and input bytes segmented as messages | `cotp`: chunking and EOF, bounded message assembly, class 0 negotiation, error replies, strict TPDU writes, and segmentation round trips |
 | `dhcpv6` | bytes and constructed values, checked with codec contracts | `stdlib::dhcpv6`: DHCPv6 |
 | `enip` | arbitrary packet streams and CIP bodies plus constructed packets; checks chunking, packet policy, nested body round trips and write rollback | `stdlib::enip`: EtherNet/IP and CIP |
@@ -64,9 +64,9 @@ cargo +nightly fuzz list
 | `mqtt` | bytes and constructed values, checked with codec contracts | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes and typed values; wire, chunking, EOF, and allocation contracts | `stdlib::mysql`: MySQL |
 | `http3` | bounded frame and stream contracts, field validation, connection routing, and QPACK pause/resume | `stdlib::http3`: HTTP/3 |
-| `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
+| `nbns` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbns`: NetBIOS Name Service |
 | `nfs` | Procedure-selected NFS and MOUNT arguments and results, RPC streams, and constructed handles and names | `nfs`: argument and result round trips, handle and name limits, failure replies, RPC framing and EOF, and envelope writes |
-| `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
+| `ntp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntp`: NTP |
 | `ocsp` | DER requests and responses, GET paths, and constructed values; checks framing, nonce bounds, signed slices, and round trips | `stdlib::ocsp`: OCSP |
 | `onc_rpc` | TCP record bytes, UDP messages, AUTH_SYS bodies, and XDR arrays | `onc_rpc`: chunking and EOF, record and assembly bounds, fragmented record round trips, exact RPC writes, authentication, and array allocation limits |
 | `opcua` | arbitrary chunks under selected limits and constructed chunks; checks assembly bounds, sequence rules, binary values, reserved-type reads and write rollback | `stdlib::opcua`: OPC UA over TCP |
@@ -93,7 +93,7 @@ cargo +nightly fuzz list
 | `telnet` | events, binary mode changes, strict writers, and bounded codec contracts | `stdlib::telnet`: Telnet |
 | `openvpn` | wrapped control packets, TCP envelopes, and codec contracts | `stdlib::openvpn`: plain, tls-auth, and tls-crypt layouts |
 | `rtcp` | control datagrams, compound rules, strict values, and codec contracts | `stdlib::rtcp`: reports, feedback, and XR blocks |
-| `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |
+| `tftp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::tftp`: TFTP and bounded netascii text decoding |
 | `tpkt` | TCP bytes with limits selected from the input, plus constructed headers, packets, and COTP messages | `tpkt` and `cotp::over_tpkt`: chunking and EOF, exact headers and packets, size limits, TPDU round trips, and segmented message assembly |
 | `thrift` | arbitrary bytes and constructed values | `stdlib::thrift`: framed and unframed messages, typed values, and bounded codec contracts |
 | `urlencoded_form` | wire values and streams checked with bounded codec contracts | `stdlib::urlencoded_form`: application/x-www-form-urlencoded |
@@ -101,13 +101,20 @@ cargo +nightly fuzz list
 | `pim` | messages and checksum-corrected inputs; contextual parsing and bounded payload contracts | `stdlib::pim`: PIMv2 |
 | `rip` | RIP and RIPng routes and authentication; bounded collection and wire contracts | `stdlib::rip`: RIP |
 | `vrrp` | advertisements, checksum oracles, and constructed values; bounded payload contracts | `stdlib::vrrp`: VRRP |
-| `vxlan` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
+| `vxlan` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::vxlan`: VXLAN and VXLAN-GPE |
 | `websocket` | frames, messages, close payloads, handshake fields, and bounded codec contracts | `stdlib::websocket`: WebSocket (RFC 6455) |
 | `x509` | DER certificates, CRLs, extensions, and PEM bundles; checks signed-byte preservation, text framing, limits, and constructed writes | `stdlib::x509`: X.509 certificates and CRLs |
 | `xml` | wire values and streams checked with bounded codec contracts | `stdlib::xml`: XML 1.0 |
 | `zabbix` | arbitrary bytes and constructed values | `stdlib::zabbix`: exact headers, packets, JSON messages, and bounded codec contracts |
 | `wake_on_lan` | arbitrary payloads, bounded EOF decoding, exact packet writing, and password checks | `stdlib::wake_on_lan`: Wake-on-LAN |
 | `whois` | query streams, EOF responses, fields, and constructed values | `stdlib::whois`: strict wire values and bounded codec contracts |
+| `dtls` | every runtime CID length, record and datagram construction, handshake rules and wire contracts | `stdlib::dtls`: Datagram TLS |
+| `ike` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ike`: IKEv2 and NAT-T |
+| `l2tp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::l2tp`: L2TPv2 and L2TPv3 |
+| `nbdgm` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::nbdgm`: NetBIOS datagrams |
+| `ntlmssp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::ntlmssp`: NTLMSSP tokens and fields |
+| `pcp` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::pcp`: PCP and NAT-PMP |
+| `wireguard` | wire units, constructed values, protocol helpers and shared codec contracts | `stdlib::wireguard`: WireGuard messages and replay windows |
 
 The proxy targets compile the `fictionet` binary's proxy modules from
 their source files (`src/proxy.rs` here), because a binary's modules

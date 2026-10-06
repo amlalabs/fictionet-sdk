@@ -1,37 +1,60 @@
-//! IKEv2 messages, as a world playing a VPN gateway reads them on port 500
-//! and port 4500.
+//! IKE wire units and their codec contracts.
 #![no_main]
 
-use fictionet::stdlib::ike::{Error, Header, Message, NatT, parse_payloads, payloads_to_bytes};
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::ike::*;
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    // A message read can be written, and reads back the same.
-    if let Ok(m) = Message::parse(data) {
-        let bytes = m.to_bytes();
-        assert!(bytes.len() <= data.len());
-        assert_eq!(Message::parse(&bytes).as_ref(), Ok(&m));
-        // Every prefix of a written message is short.
+    contract::check_wire::<Header>(data);
+    contract::check_wire::<Message>(data);
+    contract::check_wire::<NatT>(data);
+    contract::check_wire::<Payloads<33>>(data);
+    contract::check_wire::<Payloads<40>>(data);
+    contract::check_wire::<Payloads<41>>(data);
+    contract::check_wire::<Payloads<46>>(data);
+    if let Ok(message) = Message::parse(data) {
+        let bytes = message.to_bytes().unwrap();
         for n in 0..bytes.len().min(200) {
             assert_eq!(Message::parse(&bytes[..n]), Err(Error::Short));
         }
-        // Its payloads on their own, as inside an SK payload.
-        let (first, chain) = payloads_to_bytes(&m.payloads);
-        assert_eq!(parse_payloads(first, &chain).as_ref(), Ok(&m.payloads));
+        let natt = NatT::Ike(message);
+        contract::check_wire_value(&natt);
+        assert!(natt.to_bytes().is_ok());
     }
-    // The same bytes on port 4500.
-    if let Ok(NatT::Ike(m)) = NatT::parse(data) {
-        assert_eq!(NatT::parse(&m.to_nat_t_bytes()), Ok(NatT::Ike(m)));
+    if let Some((&first, rest)) = data.split_first() {
+        // The runtime reader still accepts any first type, including unknown types.
+        let _ = parse_payloads(first, rest);
+        match first {
+            0 => contract::check_wire::<Payloads<0>>(rest),
+            1 => contract::check_wire::<Payloads<1>>(rest),
+            33 => contract::check_wire::<Payloads<33>>(rest),
+            34 => contract::check_wire::<Payloads<34>>(rest),
+            35 => contract::check_wire::<Payloads<35>>(rest),
+            36 => contract::check_wire::<Payloads<36>>(rest),
+            37 => contract::check_wire::<Payloads<37>>(rest),
+            38 => contract::check_wire::<Payloads<38>>(rest),
+            39 => contract::check_wire::<Payloads<39>>(rest),
+            40 => contract::check_wire::<Payloads<40>>(rest),
+            41 => contract::check_wire::<Payloads<41>>(rest),
+            42 => contract::check_wire::<Payloads<42>>(rest),
+            43 => contract::check_wire::<Payloads<43>>(rest),
+            44 => contract::check_wire::<Payloads<44>>(rest),
+            45 => contract::check_wire::<Payloads<45>>(rest),
+            46 => contract::check_wire::<Payloads<46>>(rest),
+            47 => contract::check_wire::<Payloads<47>>(rest),
+            48 => contract::check_wire::<Payloads<48>>(rest),
+            49 => contract::check_wire::<Payloads<49>>(rest),
+            50 => contract::check_wire::<Payloads<50>>(rest),
+            51 => contract::check_wire::<Payloads<51>>(rest),
+            52 => contract::check_wire::<Payloads<52>>(rest),
+            53 => contract::check_wire::<Payloads<53>>(rest),
+            54 => contract::check_wire::<Payloads<54>>(rest),
+            127 => contract::check_wire::<Payloads<127>>(rest),
+            255 => contract::check_wire::<Payloads<255>>(rest),
+            _ => {}
+        }
     }
-    let _ = Header::parse(data);
-    // Any bytes as a payload chain, the first byte naming the first type.
-    if let Some((&first, rest)) = data.split_first()
-        && let Ok(p) = parse_payloads(first, rest)
-    {
-        let (f, chain) = payloads_to_bytes(&p);
-        assert_eq!(parse_payloads(f, &chain), Ok(p));
-    }
-    // Every prefix, as a datagram that came in cut.
     for n in 0..data.len().min(200) {
         let _ = Message::parse(&data[..n]);
         let _ = NatT::parse(&data[..n]);

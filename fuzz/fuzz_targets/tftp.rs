@@ -3,9 +3,10 @@
 //! the agent picks.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::tftp::{
-    DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, NetasciiDecoder, Packet, ReadTransfer,
-    TftpOption, from_netascii, negotiate, parse_number, to_netascii,
+    DEFAULT_BLOCK_SIZE, Event, MAX_BLOCK_SIZE, MAX_REQUEST, Negotiated, Netascii, NetasciiByte,
+    Packet, ReadTransfer, TftpOption, negotiate, parse_number,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -18,10 +19,15 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
     let mut got = Vec::new();
     let mut packet = t.current().expect("a new transfer has a packet in flight");
     loop {
+        contract::check_wire_value(&packet);
+        assert!(packet.to_bytes().is_ok());
         let ack = match &packet {
             Packet::OptionAck { options } => {
                 assert!(!options.is_empty());
-                assert_eq!(Packet::parse(&packet.to_bytes()), Ok(packet.clone()));
+                assert_eq!(
+                    Packet::parse(&packet.to_bytes().unwrap()),
+                    Ok(packet.clone())
+                );
                 if let Some(o) = options.iter().find(|o| o.name.eq_ignore_ascii_case("blksize")) {
                     size = parse_number(&o.value).and_then(|v| usize::try_from(v).ok()).expect("a valid blksize");
                 }
@@ -47,9 +53,12 @@ fn receive(mut t: ReadTransfer) -> Vec<u8> {
 }
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Packet>(data);
+    contract::check_wire::<NetasciiByte>(data);
+    contract::check_decode_with_alloc_limit(|| Netascii, data, 4);
     if let Ok(p) = Packet::parse(data) {
         // What was read can be written, and reads back the same.
-        let bytes = p.to_bytes();
+        let bytes = p.to_bytes().unwrap();
         if matches!(p, Packet::ReadRequest(_) | Packet::WriteRequest(_)) {
             assert!(bytes.len() <= MAX_REQUEST);
         }
@@ -62,7 +71,8 @@ fuzz_target!(|data: &[u8]| {
         if let Some(options) = options {
             let agreed = negotiate(options, Some(data.len() as u64), MAX_BLOCK_SIZE);
             let oack = Packet::OptionAck { options: agreed.oack.clone() };
-            assert_eq!(Packet::parse(&oack.to_bytes()), Ok(oack));
+            contract::check_wire_value(&oack);
+            assert!(oack.to_bytes().is_ok());
             // The transfer follows the parsed options as given, too, even
             // when they were not negotiated.
             for agreed in [agreed.clone(), Negotiated { oack: options.clone(), ..agreed }] {
@@ -83,17 +93,13 @@ fuzz_target!(|data: &[u8]| {
         let _ = t.current();
         assert_eq!(receive(ReadTransfer::negotiated(rest.to_vec(), &agreed)), rest);
         assert_eq!(receive(ReadTransfer::new(rest.to_vec())), rest);
-        // Netascii read block by block gives what the whole file does.
-        let size = usize::from(*a % 16) + 1;
-        let mut d = NetasciiDecoder::new();
-        let mut text = Vec::new();
-        for block in rest.chunks(size) {
-            let out = d.decode(block);
-            assert!(out.len() <= block.len() + 1);
-            text.extend(out);
-        }
-        text.extend(d.finish());
-        assert_eq!(text, from_netascii(rest));
     }
-    assert_eq!(from_netascii(&to_netascii(data)), data);
+    let mut encoded = Vec::new();
+    for &byte in data {
+        NetasciiByte(byte).write(&mut encoded).unwrap();
+    }
+    let (decoded, failure) =
+        fictionet::stdlib::codec::test_support::decode_all(|| Netascii, &encoded);
+    assert_eq!(failure, None);
+    assert_eq!(decoded.into_iter().map(|b| b.0).collect::<Vec<_>>(), data);
 });

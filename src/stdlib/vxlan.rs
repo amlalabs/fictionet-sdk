@@ -35,6 +35,7 @@
 //! next-protocol value 0.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::vxlan::{GpePacket, Packet, next_protocol};
 //!
 //! // A datagram to port 4789: VNI 5001, then a 14-byte Ethernet header
@@ -46,7 +47,7 @@
 //! assert_eq!(packet.vni, 5001);
 //! assert_eq!(packet.frame.len(), 14);
 //! assert_eq!(packet.frame[12..], [0x08, 0x06]);
-//! assert_eq!(packet.to_bytes(), Ok(datagram));
+//! assert_eq!(packet.to_bytes().unwrap(), datagram);
 //!
 //! // The same network over VXLAN-GPE, carrying an IPv4 packet instead.
 //! let gpe = GpePacket {
@@ -60,6 +61,9 @@
 //! assert_eq!(bytes[..8], [0x0c, 0, 0, 0x01, 0x00, 0x13, 0x89, 0]);
 //! assert_eq!(GpePacket::parse(&bytes), Ok(gpe));
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 /// The UDP port VXLAN endpoints listen on (RFC 7348).
 pub const PORT: u16 = 4789;
@@ -151,10 +155,12 @@ impl Default for GpePacket {
     }
 }
 
-/// Why a datagram is not a VXLAN or VXLAN-GPE packet. A real endpoint
-/// drops such a datagram and sends nothing back.
+/// Why a VXLAN or VXLAN-GPE packet cannot be read or written. A real
+/// endpoint drops an unreadable datagram and sends nothing back.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The datagram was shorter than the 8-byte header. It holds how long
     /// it was.
     Truncated(usize),
@@ -169,40 +175,70 @@ pub enum Error {
     /// was not zero. It holds the field.
     NextProtocolWithoutP(u8),
     /// VXLAN-GPE only: the P flag was set with the next-protocol field 0,
-    /// a value the draft reserves, so the header names no protocol. A
-    /// writer returns it for `next_protocol: Some(0)`.
+    /// a value the draft reserves, so the header names no protocol. The
+    /// writer reports [`Error::Unwritable`] for `next_protocol: Some(0)`.
     ReservedNextProtocol,
-    /// Writers only: the VNI was wider than 24 bits, more than
-    /// [`MAX_VNI`]. It holds the VNI.
-    VniTooLarge(u32),
-    /// Writers only: the frame or payload was longer than [`MAX_PAYLOAD`],
-    /// so no datagram could carry it. It holds how long it was.
-    PayloadTooLong(usize),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Truncated(n) => write!(f, "{n} bytes, shorter than the {HEADER_LEN}-byte VXLAN header"),
             Error::TooLong(n) => write!(f, "{n} bytes, longer than a UDP datagram can carry"),
             Error::NoVni => write!(f, "I flag clear, so no valid VNI"),
             Error::Version(v) => write!(f, "VXLAN-GPE version {v}, not 0"),
             Error::NextProtocolWithoutP(p) => write!(f, "next protocol {p} with the P flag clear"),
             Error::ReservedNextProtocol => write!(f, "next protocol 0, which is reserved, with the P flag set"),
-            Error::VniTooLarge(v) => write!(f, "VNI {v} is wider than 24 bits"),
-            Error::PayloadTooLong(n) => {
-                write!(f, "{n}-byte payload, longer than the {MAX_PAYLOAD} bytes a datagram can carry")
-            }
         }
     }
 }
 
-impl std::error::Error for Error {}
+impl GpePacket {
+    /// What the payload is, with the P flag's absence read as Ethernet.
+    pub fn protocol(&self) -> u8 {
+        self.next_protocol.unwrap_or(next_protocol::ETHERNET)
+    }
+}
 
-impl Packet {
+/// Checks a datagram's length and splits it into the flags byte, the VNI
+/// and what follows the header.
+fn split(b: &[u8]) -> Result<(u8, u32, &[u8]), Error> {
+    if b.len() > MAX_DATAGRAM {
+        return Err(Error::TooLong(b.len()));
+    }
+    let Some((header, rest)) = b.split_first_chunk::<HEADER_LEN>() else {
+        return Err(Error::Truncated(b.len()));
+    };
+    let vni = u32::from_be_bytes([0, header[4], header[5], header[6]]);
+    Ok((header[0], vni, rest))
+}
+
+/// Writes a header with the given flags byte, next-protocol field and
+/// VNI, then the payload. Checks the VNI and the payload's length before
+/// it allocates.
+fn write(first: u8, next: u8, vni: u32, payload: &[u8]) -> Result<Vec<u8>, Error> {
+    if vni > MAX_VNI {
+        return Err(Error::Unwritable);
+    }
+    if payload.len() > MAX_PAYLOAD {
+        return Err(Error::Unwritable);
+    }
+    let v = vni.to_be_bytes();
+    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
+    out.extend_from_slice(&[first, 0, 0, next, v[1], v[2], v[3], 0]);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+impl Wire for Packet {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a whole VXLAN datagram, the UDP payload. Reserved bits are
     /// ignored, as RFC 7348 says.
-    pub fn parse(b: &[u8]) -> Result<Packet, Error> {
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<Packet, Error> {
         let (first, vni, frame) = split(b)?;
         if first & flags::I == 0 {
             return Err(Error::NoVni);
@@ -210,19 +246,24 @@ impl Packet {
         Ok(Packet { vni, frame: frame.to_vec() })
     }
 
-    /// The datagram's bytes: the header, with only the I flag set and the
-    /// reserved bits zero, then the frame. Fails with
-    /// [`Error::VniTooLarge`] for a VNI over [`MAX_VNI`] and with
-    /// [`Error::PayloadTooLong`] for a frame longer than [`MAX_PAYLOAD`].
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        write(flags::I, 0, self.vni, &self.frame)
+    /// Appends the VXLAN header and Ethernet frame. Refuses VNIs wider than 24 bits
+    /// and frames above [`MAX_PAYLOAD`]. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let out = write(flags::I, 0, self.vni, &self.frame)?;
+
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
-impl GpePacket {
+impl Wire for GpePacket {
+    type ParseError = Error;
+    type WriteError = Error;
+
     /// Reads a whole VXLAN-GPE datagram, the UDP payload. Reserved bits
     /// are ignored, as the draft says.
-    pub fn parse(b: &[u8]) -> Result<GpePacket, Error> {
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<GpePacket, Error> {
         let (first, vni, payload) = split(b)?;
         let version = (first & flags::VERSION) >> 4;
         if version != GPE_VERSION {
@@ -252,15 +293,12 @@ impl GpePacket {
         })
     }
 
-    /// The datagram's bytes: the header, with version 0, the I flag, the
-    /// P, B and O flags as the fields say, and the reserved bits zero,
-    /// then the payload. Fails with [`Error::ReservedNextProtocol`] for
-    /// `next_protocol: Some(0)`, [`Error::VniTooLarge`] for a VNI over
-    /// [`MAX_VNI`] and [`Error::PayloadTooLong`] for a payload longer than
-    /// [`MAX_PAYLOAD`].
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
+    /// Appends the GPE header and payload. Refuses VNIs wider than 24 bits,
+    /// payloads above [`MAX_PAYLOAD`] and next protocol Some(0).
+    /// Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
         if self.next_protocol == Some(0) {
-            return Err(Error::ReservedNextProtocol);
+            return Err(Error::Unwritable);
         }
         let mut first = flags::I;
         if self.next_protocol.is_some() {
@@ -272,48 +310,19 @@ impl GpePacket {
         if self.oam {
             first |= flags::O;
         }
-        write(first, self.next_protocol.unwrap_or(0), self.vni, &self.payload)
-    }
+        let out = write(first, self.next_protocol.unwrap_or(0), self.vni, &self.payload)?;
 
-    /// What the payload is, with the P flag's absence read as Ethernet.
-    pub fn protocol(&self) -> u8 {
-        self.next_protocol.unwrap_or(next_protocol::ETHERNET)
+        dst.extend_from_slice(&out);
+        Ok(())
     }
 }
 
-/// Checks a datagram's length and splits it into the flags byte, the VNI
-/// and what follows the header.
-fn split(b: &[u8]) -> Result<(u8, u32, &[u8]), Error> {
-    if b.len() > MAX_DATAGRAM {
-        return Err(Error::TooLong(b.len()));
-    }
-    let Some((header, rest)) = b.split_first_chunk::<HEADER_LEN>() else {
-        return Err(Error::Truncated(b.len()));
-    };
-    let vni = u32::from_be_bytes([0, header[4], header[5], header[6]]);
-    Ok((header[0], vni, rest))
-}
-
-/// Writes a header with the given flags byte, next-protocol field and
-/// VNI, then the payload. Checks the VNI and the payload's length before
-/// it allocates.
-fn write(first: u8, next: u8, vni: u32, payload: &[u8]) -> Result<Vec<u8>, Error> {
-    if vni > MAX_VNI {
-        return Err(Error::VniTooLarge(vni));
-    }
-    if payload.len() > MAX_PAYLOAD {
-        return Err(Error::PayloadTooLong(payload.len()));
-    }
-    let v = vni.to_be_bytes();
-    let mut out = Vec::with_capacity(HEADER_LEN + payload.len());
-    out.extend_from_slice(&[first, 0, 0, next, v[1], v[2], v[3], 0]);
-    out.extend_from_slice(payload);
-    Ok(out)
-}
+impl std::error::Error for Error {}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{contract, test_support::Lcg};
 
     /// The ARP request from the module doc: VNI 5001 and a 14-byte frame.
     fn example() -> Vec<u8> {
@@ -405,8 +414,7 @@ mod tests {
             Error::Version(2),
             Error::NextProtocolWithoutP(1),
             Error::ReservedNextProtocol,
-            Error::VniTooLarge(0x0100_0000),
-            Error::PayloadTooLong(70_000),
+            Error::Unwritable,
         ] {
             assert!(!e.to_string().is_empty());
         }
@@ -435,9 +443,9 @@ mod tests {
         // RFC 7348 section 5: the VNI is 24 bits. Masking would send the
         // frame to another network, so the writer refuses.
         let p = Packet { vni: 0x0100_0001, frame: vec![0; 60] };
-        assert_eq!(p.to_bytes(), Err(Error::VniTooLarge(0x0100_0001)));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let g = GpePacket { vni: 0xab00_0001, ..GpePacket::default() };
-        assert_eq!(g.to_bytes(), Err(Error::VniTooLarge(0xab00_0001)));
+        assert_eq!(g.to_bytes(), Err(Error::Unwritable));
         let p = Packet { vni: MAX_VNI, frame: vec![] };
         assert_eq!(p.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0xff, 0xff, 0xff, 0]));
     }
@@ -455,9 +463,9 @@ mod tests {
         assert_eq!(GpePacket::parse(&bytes), Ok(g));
         // One byte more is an error, not a cut frame.
         let p = Packet { vni: 1, frame: vec![1; MAX_PAYLOAD + 1] };
-        assert_eq!(p.to_bytes(), Err(Error::PayloadTooLong(MAX_PAYLOAD + 1)));
+        assert_eq!(p.to_bytes(), Err(Error::Unwritable));
         let g = GpePacket { vni: 2, payload: vec![2; 70_000], ..GpePacket::default() };
-        assert_eq!(g.to_bytes(), Err(Error::PayloadTooLong(70_000)));
+        assert_eq!(g.to_bytes(), Err(Error::Unwritable));
     }
 
     #[test]
@@ -467,7 +475,7 @@ mod tests {
         assert_eq!(GpePacket::parse(&[0x0c, 0, 0, 0, 0, 0, 1, 0]), Err(Error::ReservedNextProtocol));
         assert_eq!(GpePacket::parse(&[0x0f, 0, 0, 0, 0, 0, 1, 0, 9]), Err(Error::ReservedNextProtocol));
         let g = GpePacket { vni: 1, next_protocol: Some(0), ..GpePacket::default() };
-        assert_eq!(g.to_bytes(), Err(Error::ReservedNextProtocol));
+        assert_eq!(g.to_bytes(), Err(Error::Unwritable));
         // P clear with a zero field is still implicit Ethernet.
         let g = GpePacket { vni: 1, next_protocol: None, ..GpePacket::default() };
         assert_eq!(g.to_bytes(), Ok(vec![0x08, 0, 0, 0, 0, 0, 1, 0]));
@@ -490,18 +498,10 @@ mod tests {
         assert_eq!(g.to_bytes().unwrap()[..8], [0x0c, 0, 0, 0x03, 0, 0, 1, 0]);
     }
 
-    /// A deterministic linear congruential generator, so the fuzz loop
-    /// runs the same way every time.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (self.0 >> 33) as u8
-        }
-    }
-
     fn check(data: &[u8]) {
+        contract::check_wire::<Packet>(data);
+        contract::check_wire::<GpePacket>(data);
+
         if let Ok(p) = Packet::parse(data) {
             let bytes = p.to_bytes().unwrap();
             assert_eq!(bytes.len(), data.len());
@@ -516,14 +516,15 @@ mod tests {
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x5eed_4789);
+        let mut rng = Lcg::new(0x5eed_4789);
         let mut parsed = 0;
         for _ in 0..20_000 {
-            let len = usize::from(rng.next() % 40);
-            let mut data: Vec<u8> = (0..len).map(|_| rng.next()).collect();
+            let len = rng.index(40);
+            let mut data = vec![0; len];
+            rng.fill(&mut data);
             // Often set the I flag and clear the version, so many buffers
             // get past the header checks.
-            if !data.is_empty() && rng.next().is_multiple_of(2) {
+            if !data.is_empty() && rng.coin() {
                 data[0] = (data[0] | flags::I) & !flags::VERSION;
             }
             check(&data);
@@ -548,25 +549,25 @@ mod tests {
         // Random packets, any VNI and any next protocol, written and
         // read back. A write either keeps the whole value or fails.
         for _ in 0..5_000 {
-            let vni = u32::from_be_bytes([rng.next() % 4, rng.next(), rng.next(), rng.next()]);
-            let payload: Vec<u8> = (0..rng.next() % 32).map(|_| rng.next()).collect();
+            let vni = u32::from_be_bytes([rng.index(4) as u8, (rng.next() as u8), (rng.next() as u8), (rng.next() as u8)]);
+            let payload: Vec<u8> = rng.bytes(31);
             let p = Packet { vni, frame: payload.clone() };
             match p.to_bytes() {
                 Ok(bytes) => assert_eq!(Packet::parse(&bytes), Ok(p)),
-                Err(e) => assert!(vni > MAX_VNI && e == Error::VniTooLarge(vni)),
+                Err(e) => assert!(vni > MAX_VNI && e == Error::Unwritable),
             }
-            let flags = rng.next();
+            let flags = rng.next() as u8;
             let g = GpePacket {
                 vni,
-                next_protocol: if flags & 1 == 0 { None } else { Some(rng.next() % 8) },
+                next_protocol: if flags & 1 == 0 { None } else { Some(rng.index(8) as u8) },
                 bum: flags & 2 != 0,
                 oam: flags & 4 != 0,
                 payload,
             };
             match g.to_bytes() {
                 Ok(bytes) => assert_eq!(GpePacket::parse(&bytes), Ok(g)),
-                Err(Error::VniTooLarge(v)) => assert!(v == vni && vni > MAX_VNI),
-                Err(e) => assert!(e == Error::ReservedNextProtocol && g.next_protocol == Some(0)),
+                Err(Error::Unwritable) => assert!(vni > MAX_VNI || g.next_protocol == Some(0)),
+                Err(e) => panic!("{e}"),
             }
         }
     }

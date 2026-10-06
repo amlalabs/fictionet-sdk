@@ -20,11 +20,12 @@
 //! stream decoder.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::ntp::{Mode, Packet, ServerInfo, Timestamp, server_reply};
 //!
 //! // A client asks for the time. Its own clock says 2023-11-14 22:13:20 UTC.
 //! let request = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0));
-//! let bytes = request.to_bytes();
+//! let bytes = request.to_bytes().unwrap();
 //! assert_eq!(bytes.len(), 48);
 //! assert_eq!(bytes[0], 0x23); // No leap warning, version 4, client mode.
 //!
@@ -33,12 +34,15 @@
 //! let now = Timestamp::from_unix(1_552_521_600, 500_000_000);
 //! let reply = server_reply(&asked, &ServerInfo::default(), now, now).unwrap();
 //!
-//! let answer = Packet::parse(&reply.to_bytes()).unwrap();
+//! let answer = Packet::parse(&reply.to_bytes().unwrap()).unwrap();
 //! assert_eq!(answer.mode, Mode::Server);
 //! assert_eq!(answer.transmit.to_unix(), (1_552_521_600, 500_000_000));
 //! // The client matches the reply to its request by this field.
 //! assert_eq!(answer.origin, request.transmit);
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 /// The UDP port NTP servers listen on.
 pub const PORT: u16 = 123;
@@ -51,7 +55,7 @@ pub const HEADER_LEN: usize = 48;
 /// after the header. Most packets carry nothing, or a MAC of 20 or 24
 /// bytes. NTS (RFC 8915) packets carry extension fields that can run past
 /// a kilobyte, and RFC 7822 sets no limit of its own. A longer datagram is
-/// refused, and a writer cuts a longer trailer.
+/// refused by readers and writers.
 pub const MAX_TRAILER: usize = (65_507 - HEADER_LEN) / 4 * 4;
 /// The longest packet: the header and the longest trailer.
 pub const MAX_PACKET: usize = HEADER_LEN + MAX_TRAILER;
@@ -231,11 +235,6 @@ impl Timestamp {
     fn read(b: &[u8], i: usize) -> Timestamp {
         Timestamp { seconds: be32(b, i), fraction: be32(b, i + 4) }
     }
-
-    fn write(self, out: &mut Vec<u8>) {
-        out.extend_from_slice(&self.seconds.to_be_bytes());
-        out.extend_from_slice(&self.fraction.to_be_bytes());
-    }
 }
 
 /// A kiss code: the four ASCII letters a stratum-0 server puts where the
@@ -245,9 +244,8 @@ impl Timestamp {
 /// less often. Codes that start with `X` are for experiments, and a client
 /// ignores those it does not know.
 ///
-/// [`KissCode::from_bytes`] gives a named code as its variant, so build
-/// codes with it: `KissCode::Other(*b"DENY")` writes the same bytes as
-/// [`KissCode::Deny`] but does not compare equal to it.
+/// Construct named codes with [`KissCode::from_bytes`]. The writer refuses
+/// `Other` values that name a defined code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KissCode {
     /// `ACST`: the association belongs to a unicast server.
@@ -309,7 +307,7 @@ impl KissCode {
     }
 
     /// The four bytes this kiss code is written as.
-    pub fn to_bytes(self) -> [u8; 4] {
+    fn octets(self) -> [u8; 4] {
         match self {
             KissCode::Other(b) => b,
             named => KissCode::NAMED.iter().find(|(code, _)| *code == named).map_or([0; 4], |(_, bytes)| *bytes),
@@ -319,7 +317,7 @@ impl KissCode {
 
 impl std::fmt::Display for KissCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for b in self.to_bytes() {
+        for b in self.octets() {
             if b.is_ascii_graphic() {
                 write!(f, "{}", char::from(b))?;
             } else {
@@ -332,14 +330,14 @@ impl std::fmt::Display for KissCode {
 
 /// One NTP packet: the 48-byte header's fields, and whatever followed it.
 ///
-/// [`Packet::parse`] followed by [`Packet::to_bytes`] gives back the same
+/// [`Packet::parse`] followed by [`Packet::write`] gives back the same
 /// bytes, since every field is kept as it was.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Packet {
     /// Whether a leap second is coming, or the clock is unset.
     pub leap: Leap,
     /// The NTP version, 1 to 7. 4 is current. The reader refuses 0, and the
-    /// writer clamps it to that range. [`server_reply`] and [`kiss_reply`]
+    /// writer refuses values outside that range. [`server_reply`] and [`kiss_reply`]
     /// answer only versions 1 to 4.
     pub version: u8,
     /// What kind of packet this is.
@@ -378,14 +376,22 @@ pub struct Packet {
     pub transmit: Timestamp,
     /// The bytes after the header: extension fields (RFC 7822), or a key
     /// ID and MAC. They are kept raw. The reader requires a multiple of 4
-    /// bytes, at most [`MAX_TRAILER`]; the writer writes at most that many,
-    /// cut to a multiple of 4.
+    /// bytes, at most [`MAX_TRAILER`]. The writer enforces the same limits.
     pub trailer: Vec<u8>,
 }
 
 /// Why a datagram is not an NTP packet this module can read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParseError {
+    /// A fixed field has the wrong byte count.
+    FieldLength {
+        /// The required byte count.
+        want: usize,
+        /// The supplied byte count.
+        got: usize,
+    },
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// The datagram was shorter than the 48-byte header. Holds its length.
     Short(usize),
     /// The datagram was longer than [`MAX_PACKET`]. Holds its length.
@@ -403,6 +409,8 @@ pub enum ParseError {
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ParseError::FieldLength { want, got } => write!(f, "{got} bytes, expected {want}"),
+            ParseError::Unwritable => f.write_str("value cannot be written without changing it"),
             ParseError::Short(n) => write!(f, "{n} bytes, shorter than the {HEADER_LEN}-byte NTP header"),
             ParseError::Long(n) => write!(f, "{n} bytes, longer than the {MAX_PACKET} an NTP packet may have here"),
             ParseError::Version(v) => write!(f, "NTP version {v}, not 1 to 7"),
@@ -415,64 +423,6 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 impl Packet {
-    /// Reads one NTP packet from a whole UDP datagram.
-    pub fn parse(b: &[u8]) -> Result<Packet, ParseError> {
-        if b.len() < HEADER_LEN {
-            return Err(ParseError::Short(b.len()));
-        }
-        if b.len() > MAX_PACKET {
-            return Err(ParseError::Long(b.len()));
-        }
-        let version = (b[0] >> 3) & 7;
-        if version == 0 {
-            return Err(ParseError::Version(version));
-        }
-        let mode = Mode::from_bits(b[0] & 7).ok_or(ParseError::Mode(b[0] & 7))?;
-        let trailer = &b[HEADER_LEN..];
-        if !trailer.len().is_multiple_of(4) {
-            return Err(ParseError::Trailer(trailer.len()));
-        }
-        Ok(Packet {
-            leap: Leap::from_bits(b[0] >> 6),
-            version,
-            mode,
-            stratum: b[1],
-            poll: b[2] as i8,
-            precision: b[3] as i8,
-            root_delay: be32(b, 4),
-            root_dispersion: be32(b, 8),
-            reference_id: [b[12], b[13], b[14], b[15]],
-            reference: Timestamp::read(b, 16),
-            origin: Timestamp::read(b, 24),
-            receive: Timestamp::read(b, 32),
-            transmit: Timestamp::read(b, 40),
-            trailer: trailer.to_vec(),
-        })
-    }
-
-    /// The packet as bytes, ready to send as one UDP datagram. A version
-    /// outside 1 to 7 is written as the nearest of the two. A trailer
-    /// longer than [`MAX_TRAILER`] is cut to it, and one that is not a
-    /// multiple of 4 bytes loses its last few, so [`Packet::parse`] always
-    /// reads what this writes.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let trailer = &self.trailer[..self.trailer.len().min(MAX_TRAILER) / 4 * 4];
-        let mut out = Vec::with_capacity(HEADER_LEN + trailer.len());
-        out.push((self.leap.bits() << 6) | (self.version.clamp(1, 7) << 3) | self.mode.bits());
-        out.push(self.stratum);
-        out.push(self.poll as u8);
-        out.push(self.precision as u8);
-        out.extend_from_slice(&self.root_delay.to_be_bytes());
-        out.extend_from_slice(&self.root_dispersion.to_be_bytes());
-        out.extend_from_slice(&self.reference_id);
-        self.reference.write(&mut out);
-        self.origin.write(&mut out);
-        self.receive.write(&mut out);
-        self.transmit.write(&mut out);
-        out.extend_from_slice(trailer);
-        out
-    }
-
     /// A version 4 client request sent at `transmit`, by the client's own
     /// clock. Every other field is zero, as a minimal SNTP client sends it
     /// (RFC 4330, section 5). The server copies `transmit` into its reply's
@@ -646,7 +596,7 @@ pub fn kiss_reply(request: &Packet, code: KissCode) -> Result<Packet, ReplyError
         precision: 0,
         root_delay: 0,
         root_dispersion: 0,
-        reference_id: code.to_bytes(),
+        reference_id: code.octets(),
         reference: t,
         origin: t,
         receive: t,
@@ -659,8 +609,116 @@ fn be32(b: &[u8], i: usize) -> u32 {
     u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]])
 }
 
+impl Wire for Packet {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads one NTP packet from a whole UDP datagram.
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<Packet, ParseError> {
+        if b.len() < HEADER_LEN {
+            return Err(ParseError::Short(b.len()));
+        }
+        if b.len() > MAX_PACKET {
+            return Err(ParseError::Long(b.len()));
+        }
+        let version = (b[0] >> 3) & 7;
+        if version == 0 {
+            return Err(ParseError::Version(version));
+        }
+        let mode = Mode::from_bits(b[0] & 7).ok_or(ParseError::Mode(b[0] & 7))?;
+        let trailer = &b[HEADER_LEN..];
+        if !trailer.len().is_multiple_of(4) {
+            return Err(ParseError::Trailer(trailer.len()));
+        }
+        Ok(Packet {
+            leap: Leap::from_bits(b[0] >> 6),
+            version,
+            mode,
+            stratum: b[1],
+            poll: b[2] as i8,
+            precision: b[3] as i8,
+            root_delay: be32(b, 4),
+            root_dispersion: be32(b, 8),
+            reference_id: [b[12], b[13], b[14], b[15]],
+            reference: Timestamp::read(b, 16),
+            origin: Timestamp::read(b, 24),
+            receive: Timestamp::read(b, 32),
+            transmit: Timestamp::read(b, 40),
+            trailer: trailer.to_vec(),
+        })
+    }
+
+    /// Appends the packet. Refuses versions outside 1 to 7, trailers above [`MAX_TRAILER`],
+    /// and trailer lengths that are not multiples of four. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        if !(1..=7).contains(&self.version) || self.trailer.len() > MAX_TRAILER || !self.trailer.len().is_multiple_of(4) {
+            return Err(ParseError::Unwritable);
+        }
+        let trailer = &self.trailer;
+        let mut out = Vec::with_capacity(HEADER_LEN + trailer.len());
+        out.push((self.leap.bits() << 6) | (self.version << 3) | self.mode.bits());
+        out.push(self.stratum);
+        out.push(self.poll as u8);
+        out.push(self.precision as u8);
+        out.extend_from_slice(&self.root_delay.to_be_bytes());
+        out.extend_from_slice(&self.root_dispersion.to_be_bytes());
+        out.extend_from_slice(&self.reference_id);
+        self.reference.write(&mut out)?;
+        self.origin.write(&mut out)?;
+        self.receive.write(&mut out)?;
+        self.transmit.write(&mut out)?;
+        out.extend_from_slice(trailer);
+
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for KissCode {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads exactly four bytes. Refuses short or trailing input.
+    fn parse(b: &[u8]) -> Result<Self, ParseError> {
+        let bytes = b.try_into().map_err(|_| ParseError::FieldLength { want: 4, got: b.len() })?;
+        Ok(Self::from_bytes(bytes))
+    }
+
+    /// Appends four bytes. Refuses an Other value that names a defined code.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        let bytes = self.octets();
+        if Self::from_bytes(bytes) != *self {
+            return Err(ParseError::Unwritable);
+        }
+        dst.extend_from_slice(&bytes);
+        Ok(())
+    }
+}
+
+impl Wire for Timestamp {
+    type ParseError = ParseError;
+    type WriteError = ParseError;
+
+    /// Reads exactly eight bytes. Refuses short or trailing input.
+    fn parse(b: &[u8]) -> Result<Self, ParseError> {
+        if b.len() != 8 {
+            return Err(ParseError::FieldLength { want: 8, got: b.len() });
+        }
+        Ok(Self::read(b, 0))
+    }
+
+    /// Appends seconds and fraction in network order. Refuses no values.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), ParseError> {
+        dst.extend_from_slice(&self.seconds.to_be_bytes());
+        dst.extend_from_slice(&self.fraction.to_be_bytes());
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use fictionet::stdlib::codec::{contract, test_support::Lcg};
     use super::*;
 
     /// A server reply as an SNTP client might receive it: version 4,
@@ -697,7 +755,7 @@ mod tests {
         assert_eq!(p.transmit.to_bits(), 0xe8f0_0011_4000_0100);
         assert_eq!(p.trailer, [0x11; 20]);
         assert_eq!(p.kiss_code(), None);
-        assert_eq!(p.to_bytes(), sample());
+        assert_eq!(p.to_bytes().unwrap(), sample());
     }
 
     #[test]
@@ -780,7 +838,7 @@ mod tests {
     fn client_request_and_server_reply() {
         let t1 = Timestamp::from_unix(1_700_000_000, 250_000_000);
         let req = Packet::client_request(t1);
-        let bytes = req.to_bytes();
+        let bytes = req.to_bytes().unwrap();
         assert_eq!(bytes[0], 0x23);
         assert!(bytes[1..40].iter().all(|&b| b == 0));
         assert_eq!(&bytes[40..48], &t1.to_bits().to_be_bytes());
@@ -803,19 +861,19 @@ mod tests {
         assert_eq!(reply.poll, 6);
         assert_eq!(reply.reference_id, [192, 0, 2, 7]);
         assert_eq!((reply.origin, reply.receive, reply.transmit), (t1, t2, t3));
-        assert_eq!(Packet::parse(&reply.to_bytes()).unwrap(), reply);
-        assert_eq!(reply.to_bytes()[0], 0x24);
+        assert_eq!(Packet::parse(&reply.to_bytes().unwrap()).unwrap(), reply);
+        assert_eq!(reply.to_bytes().unwrap()[0], 0x24);
 
         // A version 3 request gets a version 3 reply.
         asked.version = 3;
-        assert_eq!(server_reply(&asked, &server, t2, t3).unwrap().to_bytes()[0], 0x1c);
+        assert_eq!(server_reply(&asked, &server, t2, t3).unwrap().to_bytes().unwrap()[0], 0x1c);
     }
 
     #[test]
     fn kiss_codes() {
         let req = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0));
         let kod = kiss_reply(&req, KissCode::Rate).unwrap();
-        let bytes = kod.to_bytes();
+        let bytes = kod.to_bytes().unwrap();
         assert_eq!(&bytes[..2], &[0xe4, 0x00]);
         assert_eq!(&bytes[12..16], b"RATE");
         let back = Packet::parse(&bytes).unwrap();
@@ -824,11 +882,11 @@ mod tests {
         assert_eq!(back.transmit, req.transmit);
         for (code, bytes) in KissCode::NAMED {
             assert_eq!(KissCode::from_bytes(bytes), code);
-            assert_eq!(code.to_bytes(), bytes);
+            assert_eq!(code.to_bytes().unwrap(), bytes);
             assert_eq!(code.to_string(), std::str::from_utf8(&bytes).unwrap());
         }
         assert_eq!(KissCode::from_bytes(*b"XYZW"), KissCode::Other(*b"XYZW"));
-        assert_eq!(KissCode::Other(*b"DENY").to_bytes(), *b"DENY");
+        assert_eq!(KissCode::Other(*b"DENY").to_bytes(), Err(ParseError::Unwritable));
         assert_eq!(KissCode::Other(*b"GPS\0").to_string(), "GPS\\x00");
     }
 
@@ -836,17 +894,17 @@ mod tests {
     fn a_symmetric_active_peer_gets_a_symmetric_passive_reply() {
         // RFC 4330, section 5: mode 1 is answered with mode 2, so Windows
         // Time with its symmetric-active flag (0x4) gets the time too.
-        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes();
+        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes().unwrap();
         b[0] = 0x21; // LI 0, version 4, symmetric active.
         let req = Packet::parse(&b).unwrap();
         let t = Timestamp::from_unix(1_700_000_001, 0);
         let reply = server_reply(&req, &ServerInfo::default(), t, t).unwrap();
         assert_eq!(reply.mode, Mode::SymmetricPassive);
         assert_eq!(reply.origin, req.transmit);
-        assert_eq!(reply.to_bytes()[0], 0x22);
+        assert_eq!(reply.to_bytes().unwrap()[0], 0x22);
         let kod = kiss_reply(&req, KissCode::Rate).unwrap();
         assert_eq!(kod.mode, Mode::SymmetricPassive);
-        assert_eq!(Packet::parse(&kod.to_bytes()).unwrap().kiss_code(), Some(KissCode::Rate));
+        assert_eq!(Packet::parse(&kod.to_bytes().unwrap()).unwrap().kiss_code(), Some(KissCode::Rate));
     }
 
     #[test]
@@ -854,11 +912,11 @@ mod tests {
         // RFC 5905, appendix A.5.1, drops versions past its own, and RFC
         // 4330 defines versions 1 to 4. A reply must not claim version 5.
         let t = Timestamp::from_unix(1_700_000_001, 0);
-        let mut b = Packet::client_request(t).to_bytes();
+        let mut b = Packet::client_request(t).to_bytes().unwrap();
         for v in 1..=7u8 {
             b[0] = (v << 3) | 3;
             let req = Packet::parse(&b).unwrap();
-            assert_eq!(req.to_bytes(), b);
+            assert_eq!(req.to_bytes().unwrap(), b);
             let r = server_reply(&req, &ServerInfo::default(), t, t);
             let k = kiss_reply(&req, KissCode::Deny);
             if v <= 4 {
@@ -939,24 +997,28 @@ mod tests {
             } else if !(n - HEADER_LEN).is_multiple_of(4) {
                 assert_eq!(r, Err(ParseError::Trailer(n - HEADER_LEN)), "{n} bytes");
             } else {
-                assert_eq!(r.unwrap().to_bytes(), &good[..n], "{n} bytes");
+                assert_eq!(r.unwrap().to_bytes().unwrap(), &good[..n], "{n} bytes");
             }
         }
     }
 
     #[test]
-    fn writers_clamp_what_they_write() {
+    fn writers_refuse_values_that_would_change() {
         let mut p = Packet::client_request(Timestamp::from_unix(5, 5));
-        p.version = 0;
-        assert_eq!(Packet::parse(&p.to_bytes()).unwrap().version, 1);
-        p.version = 200;
-        assert_eq!(Packet::parse(&p.to_bytes()).unwrap().version, 7);
-        p.trailer = vec![9; MAX_TRAILER + 5000];
-        let bytes = p.to_bytes();
-        assert_eq!(bytes.len(), MAX_PACKET);
-        assert_eq!(Packet::parse(&bytes).unwrap().trailer.len(), MAX_TRAILER);
-        p.trailer = vec![9; 23];
-        assert_eq!(Packet::parse(&p.to_bytes()).unwrap().trailer.len(), 20);
+        for version in [0, 8, 200] {
+            p.version = version;
+            assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+            contract::check_wire_value(&p);
+        }
+        p.version = 4;
+        for len in [MAX_TRAILER + 5000, 23] {
+            p.trailer = vec![9; len];
+            assert_eq!(p.to_bytes(), Err(ParseError::Unwritable));
+            contract::check_wire_value(&p);
+        }
+        p.trailer = vec![9; MAX_TRAILER];
+        contract::check_wire_value(&p);
+        assert_eq!(p.to_bytes().unwrap().len(), MAX_PACKET);
     }
 
     /// How far apart two timestamps are, going the short way round the era.
@@ -1014,36 +1076,36 @@ mod tests {
     fn long_extension_fields_are_read() {
         // NTS (RFC 8915) requests carry a cookie and placeholders for more,
         // and can run past a kilobyte. RFC 7822 sets no limit.
-        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes();
+        let mut b = Packet::client_request(Timestamp::from_unix(1_700_000_000, 0)).to_bytes().unwrap();
         b.extend(std::iter::repeat_n(0xab, 1200));
         let p = Packet::parse(&b).unwrap();
         assert_eq!(p.trailer.len(), 1200);
-        assert_eq!(p.to_bytes(), b);
+        assert_eq!(p.to_bytes().unwrap(), b);
     }
 
     #[test]
     fn random_buffers() {
-        let mut state = 0x2545_f491_4f6c_dd1du64;
-        let mut next = move || {
-            state = state.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
-            (state >> 33) as u32
-        };
+        let mut rng = Lcg::new(0x2545_f491_4f6c_dd1d);
         let mut read = 0;
         for i in 0..5000 {
             let len = match i % 4 {
-                0 => HEADER_LEN + 4 * (next() as usize % 8),
-                1 => next() as usize % 64,
-                2 => HEADER_LEN + next() as usize % 32,
-                _ => next() as usize % 2100,
+                0 => HEADER_LEN + 4 * (rng.index(8)),
+                1 => rng.index(64),
+                2 => HEADER_LEN + rng.index(32),
+                _ => rng.index(2100),
             };
-            let mut b: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let mut b = vec![0; len];
+            rng.fill(&mut b);
             if i % 2 == 0 && !b.is_empty() {
                 // Often a readable first byte: version 1 to 7, mode 1 to 5.
-                b[0] = (b[0] & 0xc0) | ((1 + next() as u8 % 7) << 3) | (1 + next() as u8 % 5);
+                b[0] = (b[0] & 0xc0) | ((1 + rng.index(7) as u8) << 3) | (1 + rng.index(5) as u8);
             }
+            contract::check_wire::<Packet>(&b);
+            contract::check_wire::<Timestamp>(&b);
+            contract::check_wire::<KissCode>(&b);
             if let Ok(p) = Packet::parse(&b) {
                 read += 1;
-                assert_eq!(p.to_bytes(), b);
+                assert_eq!(p.to_bytes().unwrap(), b);
                 let _ = p.kiss_code().map(|k| k.to_string());
                 let (s, n) = p.transmit.to_unix();
                 assert!(n < 1_000_000_000);
@@ -1052,17 +1114,17 @@ mod tests {
                 // measured round the era: the last fraction of an era comes back as second 0.
                 assert!(gap(t, p.transmit) <= 3, "{:?}", p.transmit);
                 if let Ok(r) = server_reply(&p, &ServerInfo::default(), p.receive, p.reference) {
-                    assert_eq!(Packet::parse(&r.to_bytes()).unwrap(), r);
+                    assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap(), r);
                 }
                 if let Ok(r) = kiss_reply(&p, KissCode::from_bytes(p.reference_id)) {
-                    assert_eq!(Packet::parse(&r.to_bytes()).unwrap(), r);
+                    assert_eq!(Packet::parse(&r.to_bytes().unwrap()).unwrap(), r);
                 }
             }
-            let secs = (u64::from(next()) << 32 | u64::from(next())) as i64;
-            let nanos = next() % 1_000_000_000;
+            let secs = (rng.next() << 32 | rng.next()) as i64;
+            let nanos = rng.index(1_000_000_000) as u32;
             let t = Timestamp::from_unix(secs, nanos);
             assert_eq!(t.to_unix_near(secs), (secs, nanos));
-            let _ = Timestamp::from_unix(secs, next()).to_unix_near(secs.wrapping_neg());
+            let _ = Timestamp::from_unix(secs, rng.next() as u32).to_unix_near(secs.wrapping_neg());
         }
         assert!(read > 1000, "{read}");
     }

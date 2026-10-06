@@ -10,7 +10,7 @@
 //!
 //! Nothing here reads a socket or does any cryptography. A world that plays
 //! a peer passes each UDP payload it gets to [`Message::parse`] and writes
-//! the bytes of [`Message::to_bytes`] back. Encrypted fields, ephemeral
+//! the bytes of [`Message::write`] back. Encrypted fields, ephemeral
 //! keys, nonces and MACs are kept as bytes. Checking a MAC, opening a
 //! ciphertext or making keys is up to world code. So is which peers exist.
 //!
@@ -28,6 +28,7 @@
 //! and a real peer drops the datagram without an answer.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::wireguard::{Data, Initiation, Message, ReplayWindow, INITIATION_LEN};
 //!
 //! // A handshake initiation from sender index 7, with stand-in crypto bytes.
@@ -55,6 +56,9 @@
 //! assert!(window.accept(0));
 //! assert!(!window.accept(0));
 //! ```
+
+extern crate self as fictionet;
+use fictionet::stdlib::codec::Wire;
 
 /// The UDP port WireGuard peers usually listen on.
 pub const PORT: u16 = 51820;
@@ -109,7 +113,7 @@ pub const MAX_ENCRYPTED: usize = MAX_MESSAGE - DATA_HEADER_LEN;
 /// Plaintexts are padded with zeros to a multiple of this many bytes.
 pub const PADDING_MULTIPLE: usize = 16;
 /// The longest padded plaintext that fits in one message once its tag is
-/// added. [`pad`] refuses a plaintext whose padded length would pass it.
+/// added. [`Plaintext::padded`] refuses a plaintext whose padded length would pass it.
 pub const MAX_PLAINTEXT: usize = MAX_ENCRYPTED - TAG_LEN;
 /// A key pair may send counters below this, and no more: 2^64 - 2^13 - 1
 /// (the paper's Reject-After-Messages).
@@ -196,6 +200,8 @@ pub enum Message {
 /// datagram without an answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
+    /// The value cannot be written without changing it.
+    Unwritable,
     /// Fewer than 4 bytes, so there is no type field.
     Short(usize),
     /// The type byte is not 1 to 4.
@@ -212,7 +218,8 @@ pub enum Error {
     Reserved([u8; 3]),
     /// The message has the wrong length for its type: not the exact size
     /// of a handshake message, or a transport data message shorter than
-    /// [`MIN_DATA_LEN`] or longer than [`MAX_MESSAGE`].
+    /// [`MIN_DATA_LEN`] or longer than [`MAX_MESSAGE`]. Also used for plaintext
+    /// above [`MAX_PLAINTEXT`], with kind [`message_type::DATA`] and its plaintext length.
     Length {
         /// The type byte.
         kind: u8,
@@ -224,6 +231,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Error::Unwritable => f.write_str("value cannot be written without changing it"),
             Error::Short(n) => write!(f, "{n} bytes, too short for a message type"),
             Error::Type(t) => write!(f, "message type {t}, not 1 to 4"),
             Error::Unexpected { want, found } => write!(f, "message type {found}, not the type {want} wanted here"),
@@ -236,30 +244,6 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Message {
-    /// Reads one message from a whole UDP payload. The payload must be
-    /// exactly one message: extra bytes after a handshake message are an
-    /// error.
-    pub fn parse(b: &[u8]) -> Result<Message, Error> {
-        let kind = check_type(b)?;
-        Ok(match kind {
-            message_type::INITIATION => Message::Initiation(Initiation::parse(b)?),
-            message_type::RESPONSE => Message::Response(Response::parse(b)?),
-            message_type::COOKIE_REPLY => Message::CookieReply(CookieReply::parse(b)?),
-            _ => Message::Data(Data::parse(b)?),
-        })
-    }
-
-    /// The message's bytes, ready to send as one UDP payload. Only a
-    /// transport data message can fail, as [`Data::to_bytes`] says.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        match self {
-            Message::Initiation(m) => Ok(m.to_bytes()),
-            Message::Response(m) => Ok(m.to_bytes()),
-            Message::CookieReply(m) => Ok(m.to_bytes()),
-            Message::Data(m) => m.to_bytes(),
-        }
-    }
-
     /// The message's type byte.
     pub fn kind(&self) -> u8 {
         match self {
@@ -283,144 +267,20 @@ impl Message {
 }
 
 impl Initiation {
-    /// Reads a handshake initiation. `b` must be exactly
-    /// [`INITIATION_LEN`] bytes with type 1.
-    pub fn parse(b: &[u8]) -> Result<Initiation, Error> {
-        let mut r = Reader::exact(b, message_type::INITIATION, INITIATION_LEN)?;
-        Ok(Initiation {
-            sender: r.u32()?,
-            ephemeral: r.array()?,
-            encrypted_static: r.array()?,
-            encrypted_timestamp: r.array()?,
-            mac1: r.array()?,
-            mac2: r.array()?,
-        })
-    }
-
-    /// The message's bytes, [`INITIATION_LEN`] of them.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = header(message_type::INITIATION, INITIATION_LEN);
-        out.extend_from_slice(&self.sender.to_le_bytes());
-        out.extend_from_slice(&self.ephemeral);
-        out.extend_from_slice(&self.encrypted_static);
-        out.extend_from_slice(&self.encrypted_timestamp);
-        out.extend_from_slice(&self.mac1);
-        out.extend_from_slice(&self.mac2);
-        out
-    }
-
-    /// The bytes mac1 is computed over: every byte before it.
-    pub fn mac1_input(&self) -> Vec<u8> {
-        let mut b = self.to_bytes();
-        b.truncate(INITIATION_LEN - 2 * MAC_LEN);
-        b
-    }
-
-    /// The bytes mac2 is computed over: every byte before it, mac1
-    /// included.
-    pub fn mac2_input(&self) -> Vec<u8> {
-        let mut b = self.to_bytes();
-        b.truncate(INITIATION_LEN - MAC_LEN);
-        b
-    }
+    /// The byte range covered by mac1 in the serialized initiation.
+    pub const MAC1_INPUT: std::ops::Range<usize> = 0..INITIATION_LEN - 2 * MAC_LEN;
+    /// The byte range covered by mac2, including mac1.
+    pub const MAC2_INPUT: std::ops::Range<usize> = 0..INITIATION_LEN - MAC_LEN;
 }
 
 impl Response {
-    /// Reads a handshake response. `b` must be exactly [`RESPONSE_LEN`]
-    /// bytes with type 2.
-    pub fn parse(b: &[u8]) -> Result<Response, Error> {
-        let mut r = Reader::exact(b, message_type::RESPONSE, RESPONSE_LEN)?;
-        Ok(Response {
-            sender: r.u32()?,
-            receiver: r.u32()?,
-            ephemeral: r.array()?,
-            encrypted_nothing: r.array()?,
-            mac1: r.array()?,
-            mac2: r.array()?,
-        })
-    }
-
-    /// The message's bytes, [`RESPONSE_LEN`] of them.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = header(message_type::RESPONSE, RESPONSE_LEN);
-        out.extend_from_slice(&self.sender.to_le_bytes());
-        out.extend_from_slice(&self.receiver.to_le_bytes());
-        out.extend_from_slice(&self.ephemeral);
-        out.extend_from_slice(&self.encrypted_nothing);
-        out.extend_from_slice(&self.mac1);
-        out.extend_from_slice(&self.mac2);
-        out
-    }
-
-    /// The bytes mac1 is computed over: every byte before it.
-    pub fn mac1_input(&self) -> Vec<u8> {
-        let mut b = self.to_bytes();
-        b.truncate(RESPONSE_LEN - 2 * MAC_LEN);
-        b
-    }
-
-    /// The bytes mac2 is computed over: every byte before it, mac1
-    /// included.
-    pub fn mac2_input(&self) -> Vec<u8> {
-        let mut b = self.to_bytes();
-        b.truncate(RESPONSE_LEN - MAC_LEN);
-        b
-    }
-}
-
-impl CookieReply {
-    /// Reads a cookie reply. `b` must be exactly [`COOKIE_REPLY_LEN`]
-    /// bytes with type 3.
-    pub fn parse(b: &[u8]) -> Result<CookieReply, Error> {
-        let mut r = Reader::exact(b, message_type::COOKIE_REPLY, COOKIE_REPLY_LEN)?;
-        Ok(CookieReply { receiver: r.u32()?, nonce: r.array()?, encrypted_cookie: r.array()? })
-    }
-
-    /// The message's bytes, [`COOKIE_REPLY_LEN`] of them.
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = header(message_type::COOKIE_REPLY, COOKIE_REPLY_LEN);
-        out.extend_from_slice(&self.receiver.to_le_bytes());
-        out.extend_from_slice(&self.nonce);
-        out.extend_from_slice(&self.encrypted_cookie);
-        out
-    }
+    /// The byte range covered by mac1 in the serialized response.
+    pub const MAC1_INPUT: std::ops::Range<usize> = 0..RESPONSE_LEN - 2 * MAC_LEN;
+    /// The byte range covered by mac2, including mac1.
+    pub const MAC2_INPUT: std::ops::Range<usize> = 0..RESPONSE_LEN - MAC_LEN;
 }
 
 impl Data {
-    /// Reads a transport data message. `b` must have type 4 and be from
-    /// [`MIN_DATA_LEN`] to [`MAX_MESSAGE`] bytes long. The encrypted part
-    /// need not be a multiple of 16 bytes, since padding stops at the MTU.
-    pub fn parse(b: &[u8]) -> Result<Data, Error> {
-        let kind = check_type(b)?;
-        if kind != message_type::DATA {
-            return Err(Error::Unexpected { want: message_type::DATA, found: kind });
-        }
-        if b.len() < MIN_DATA_LEN || b.len() > MAX_MESSAGE {
-            return Err(Error::Length { kind, len: b.len() });
-        }
-        let mut r = Reader { b, pos: 4, kind };
-        let receiver = r.u32()?;
-        let counter = u64::from_le_bytes(r.array()?);
-        let encrypted = b.get(DATA_HEADER_LEN..).unwrap_or_default().to_vec();
-        Ok(Data { receiver, counter, encrypted })
-    }
-
-    /// The message's bytes, with the encrypted part exactly as given. An
-    /// encrypted part shorter than a tag ([`TAG_LEN`]) or longer than
-    /// [`MAX_ENCRYPTED`] gives the [`Error::Length`] that [`Data::parse`]
-    /// would give for the message it makes, since no peer could take it.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Error> {
-        let len = DATA_HEADER_LEN.saturating_add(self.encrypted.len());
-        if !(TAG_LEN..=MAX_ENCRYPTED).contains(&self.encrypted.len()) {
-            return Err(Error::Length { kind: message_type::DATA, len });
-        }
-        let mut out = header(message_type::DATA, len);
-        out.extend_from_slice(&self.receiver.to_le_bytes());
-        out.extend_from_slice(&self.counter.to_le_bytes());
-        out.extend_from_slice(&self.encrypted);
-        Ok(out)
-    }
-
     /// Whether this is a keepalive: an empty plaintext, so only a tag.
     pub fn is_keepalive(&self) -> bool {
         self.encrypted.len() == TAG_LEN
@@ -445,20 +305,48 @@ pub fn padding(len: usize, mtu: usize) -> usize {
     }
 }
 
-/// A plaintext with its padding added, ready for encryption: every byte
-/// of `plaintext`, then [`padding`] zeros. If the padded plaintext would
-/// be longer than [`MAX_PLAINTEXT`], so that its encryption could not fit
-/// in one message, it gives the [`Error::Length`] of that message instead.
-pub fn pad(plaintext: &[u8], mtu: usize) -> Result<Vec<u8>, Error> {
-    let padded = plaintext.len().saturating_add(padding(plaintext.len(), mtu));
-    if padded > MAX_PLAINTEXT {
-        let len = padded.saturating_add(DATA_HEADER_LEN + TAG_LEN);
-        return Err(Error::Length { kind: message_type::DATA, len });
+/// A plaintext ready for encryption, including any chosen padding.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Plaintext(
+    /// The bytes to encrypt, including any selected padding.
+    pub Vec<u8>,
+);
+
+impl Plaintext {
+    /// Copies a plaintext and adds the zeros chosen by [padding].
+    /// Refuses a padded length above [`MAX_PLAINTEXT`].
+    pub fn padded(plaintext: &[u8], mtu: usize) -> Result<Self, Error> {
+        let padded = plaintext.len().checked_add(padding(plaintext.len(), mtu)).ok_or(Error::Unwritable)?;
+        if padded > MAX_PLAINTEXT {
+            return Err(Error::Unwritable);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(plaintext);
+        out.resize(padded, 0);
+        Ok(Self(out))
     }
-    let mut out = Vec::with_capacity(padded);
-    out.extend_from_slice(plaintext);
-    out.resize(padded, 0);
-    Ok(out)
+}
+
+impl Wire for Plaintext {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Keeps every byte, including zeros. Refuses input above [`MAX_PLAINTEXT`].
+    fn parse(b: &[u8]) -> Result<Self, Error> {
+        if b.len() > MAX_PLAINTEXT {
+            return Err(Error::Length { kind: message_type::DATA, len: b.len() });
+        }
+        Ok(Self(b.to_vec()))
+    }
+
+    /// Appends the stored plaintext. Refuses oversized values.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        if self.0.len() > MAX_PLAINTEXT {
+            return Err(Error::Unwritable);
+        }
+        dst.extend_from_slice(&self.0);
+        Ok(())
+    }
 }
 
 /// Remembers which transport data counters a receiver has taken, so it
@@ -601,9 +489,168 @@ impl<'a> Reader<'a> {
     }
 }
 
+impl Wire for Message {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads one message from a whole UDP payload. The payload must be
+    /// exactly one message: extra bytes after a handshake message are an
+    /// error.
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<Message, Error> {
+        let kind = check_type(b)?;
+        Ok(match kind {
+            message_type::INITIATION => Message::Initiation(Initiation::parse(b)?),
+            message_type::RESPONSE => Message::Response(Response::parse(b)?),
+            message_type::COOKIE_REPLY => Message::CookieReply(CookieReply::parse(b)?),
+            _ => Message::Data(Data::parse(b)?),
+        })
+    }
+
+    /// Appends the complete wire form. Refuses values outside the wire limits.
+    /// Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        match self {
+            Message::Initiation(m) => m.write(dst),
+            Message::Response(m) => m.write(dst),
+            Message::CookieReply(m) => m.write(dst),
+            Message::Data(m) => m.write(dst),
+        }
+    }
+}
+
+impl Wire for Initiation {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a handshake initiation. `b` must be exactly
+    /// [`INITIATION_LEN`] bytes with type 1.
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<Initiation, Error> {
+        let mut r = Reader::exact(b, message_type::INITIATION, INITIATION_LEN)?;
+        Ok(Initiation {
+            sender: r.u32()?,
+            ephemeral: r.array()?,
+            encrypted_static: r.array()?,
+            encrypted_timestamp: r.array()?,
+            mac1: r.array()?,
+            mac2: r.array()?,
+        })
+    }
+
+    /// Appends the complete 148-byte initiation. Refuses no values.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = header(message_type::INITIATION, INITIATION_LEN);
+        out.extend_from_slice(&self.sender.to_le_bytes());
+        out.extend_from_slice(&self.ephemeral);
+        out.extend_from_slice(&self.encrypted_static);
+        out.extend_from_slice(&self.encrypted_timestamp);
+        out.extend_from_slice(&self.mac1);
+        out.extend_from_slice(&self.mac2);
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Response {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a handshake response. `b` must be exactly [`RESPONSE_LEN`]
+    /// bytes with type 2.
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<Response, Error> {
+        let mut r = Reader::exact(b, message_type::RESPONSE, RESPONSE_LEN)?;
+        Ok(Response {
+            sender: r.u32()?,
+            receiver: r.u32()?,
+            ephemeral: r.array()?,
+            encrypted_nothing: r.array()?,
+            mac1: r.array()?,
+            mac2: r.array()?,
+        })
+    }
+
+    /// Appends the complete 92-byte response. Refuses no values.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = header(message_type::RESPONSE, RESPONSE_LEN);
+        out.extend_from_slice(&self.sender.to_le_bytes());
+        out.extend_from_slice(&self.receiver.to_le_bytes());
+        out.extend_from_slice(&self.ephemeral);
+        out.extend_from_slice(&self.encrypted_nothing);
+        out.extend_from_slice(&self.mac1);
+        out.extend_from_slice(&self.mac2);
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for CookieReply {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a cookie reply. `b` must be exactly [`COOKIE_REPLY_LEN`]
+    /// bytes with type 3.
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<CookieReply, Error> {
+        let mut r = Reader::exact(b, message_type::COOKIE_REPLY, COOKIE_REPLY_LEN)?;
+        Ok(CookieReply { receiver: r.u32()?, nonce: r.array()?, encrypted_cookie: r.array()? })
+    }
+
+    /// Appends the complete 64-byte cookie reply. Refuses no values.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let mut out = header(message_type::COOKIE_REPLY, COOKIE_REPLY_LEN);
+        out.extend_from_slice(&self.receiver.to_le_bytes());
+        out.extend_from_slice(&self.nonce);
+        out.extend_from_slice(&self.encrypted_cookie);
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
+impl Wire for Data {
+    type ParseError = Error;
+    type WriteError = Error;
+
+    /// Reads a transport data message. `b` must have type 4 and be from
+    /// [`MIN_DATA_LEN`] to [`MAX_MESSAGE`] bytes long. The encrypted part
+    /// need not be a multiple of 16 bytes, since padding stops at the MTU.
+    /// Refuses invalid headers and lengths. Reads the whole input.
+    fn parse(b: &[u8]) -> Result<Data, Error> {
+        let kind = check_type(b)?;
+        if kind != message_type::DATA {
+            return Err(Error::Unexpected { want: message_type::DATA, found: kind });
+        }
+        if b.len() < MIN_DATA_LEN || b.len() > MAX_MESSAGE {
+            return Err(Error::Length { kind, len: b.len() });
+        }
+        let mut r = Reader { b, pos: 4, kind };
+        let receiver = r.u32()?;
+        let counter = u64::from_le_bytes(r.array()?);
+        let encrypted = b.get(DATA_HEADER_LEN..).unwrap_or_default().to_vec();
+        Ok(Data { receiver, counter, encrypted })
+    }
+
+    /// Appends the complete transport message. Refuses ciphertext shorter than [`TAG_LEN`]
+    /// or longer than [`MAX_ENCRYPTED`]. Leaves the destination unchanged on error.
+    fn write(&self, dst: &mut Vec<u8>) -> Result<(), Error> {
+        let len = DATA_HEADER_LEN.saturating_add(self.encrypted.len());
+        if !(TAG_LEN..=MAX_ENCRYPTED).contains(&self.encrypted.len()) {
+            return Err(Error::Unwritable);
+        }
+        let mut out = header(message_type::DATA, len);
+        out.extend_from_slice(&self.receiver.to_le_bytes());
+        out.extend_from_slice(&self.counter.to_le_bytes());
+        out.extend_from_slice(&self.encrypted);
+        dst.extend_from_slice(&out);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fictionet::stdlib::codec::{contract, test_support::Lcg};
 
     fn init() -> Initiation {
         Initiation {
@@ -657,7 +704,7 @@ mod tests {
 
     #[test]
     fn initiation_layout() {
-        let b = init().to_bytes();
+        let b = init().to_bytes().unwrap();
         assert_eq!(b.len(), 148);
         assert_eq!(b[..4], [1, 0, 0, 0]);
         assert_eq!(b[4..8], [1, 2, 3, 4]); // little-endian sender
@@ -666,13 +713,13 @@ mod tests {
         assert_eq!(b[88..116], [0x33; 28]);
         assert_eq!(b[116..132], [0x44; 16]);
         assert_eq!(b[132..148], [0x55; 16]);
-        assert_eq!(init().mac1_input(), b[..116]);
-        assert_eq!(init().mac2_input(), b[..132]);
+        assert_eq!(b[Initiation::MAC1_INPUT], b[..116]);
+        assert_eq!(b[Initiation::MAC2_INPUT], b[..132]);
     }
 
     #[test]
     fn response_layout() {
-        let b = resp().to_bytes();
+        let b = resp().to_bytes().unwrap();
         assert_eq!(b.len(), 92);
         assert_eq!(b[..4], [2, 0, 0, 0]);
         assert_eq!(b[4..8], [0xef, 0xbe, 0xad, 0xde]);
@@ -681,13 +728,13 @@ mod tests {
         assert_eq!(b[44..60], [0x77; 16]);
         assert_eq!(b[60..76], [0x88; 16]);
         assert_eq!(b[76..92], [0; 16]);
-        assert_eq!(resp().mac1_input(), b[..60]);
-        assert_eq!(resp().mac2_input(), b[..76]);
+        assert_eq!(b[Response::MAC1_INPUT], b[..60]);
+        assert_eq!(b[Response::MAC2_INPUT], b[..76]);
     }
 
     #[test]
     fn cookie_reply_layout() {
-        let b = cookie().to_bytes();
+        let b = cookie().to_bytes().unwrap();
         assert_eq!(b.len(), 64);
         assert_eq!(b[..8], [3, 0, 0, 0, 5, 0, 0, 0]);
         assert_eq!(b[8..32], [0x99; 24]);
@@ -714,9 +761,9 @@ mod tests {
             assert_eq!(Message::parse(&b), Ok(m.clone()));
             assert_eq!(Message::parse(&b).unwrap().to_bytes(), Ok(b));
         }
-        assert_eq!(Initiation::parse(&init().to_bytes()), Ok(init()));
-        assert_eq!(Response::parse(&resp().to_bytes()), Ok(resp()));
-        assert_eq!(CookieReply::parse(&cookie().to_bytes()), Ok(cookie()));
+        assert_eq!(Initiation::parse(&init().to_bytes().unwrap()), Ok(init()));
+        assert_eq!(Response::parse(&resp().to_bytes().unwrap()), Ok(resp()));
+        assert_eq!(CookieReply::parse(&cookie().to_bytes().unwrap()), Ok(cookie()));
         assert_eq!(Data::parse(&data().to_bytes().unwrap()), Ok(data()));
     }
 
@@ -753,14 +800,14 @@ mod tests {
         assert_eq!(Message::parse(&[0, 0, 0, 0]), Err(Error::Type(0)));
         assert_eq!(Message::parse(&[5, 0, 0, 0]), Err(Error::Type(5)));
         assert_eq!(Message::parse(&[0xff, 0, 0, 0]), Err(Error::Type(0xff)));
-        let mut b = init().to_bytes();
+        let mut b = init().to_bytes().unwrap();
         b[2] = 1;
         assert_eq!(Message::parse(&b), Err(Error::Reserved([0, 1, 0])));
         // One byte too many.
-        let mut b = init().to_bytes();
+        let mut b = init().to_bytes().unwrap();
         b.push(0);
         assert_eq!(Message::parse(&b), Err(Error::Length { kind: 1, len: 149 }));
-        let mut b = cookie().to_bytes();
+        let mut b = cookie().to_bytes().unwrap();
         b.push(0);
         assert_eq!(Message::parse(&b), Err(Error::Length { kind: 3, len: 65 }));
         // A data message too long for UDP.
@@ -771,10 +818,10 @@ mod tests {
         assert!(Message::parse(&b).is_ok());
         // The per-type readers check the type. A known type that is not the
         // one a reader wants is its own error, not an unknown type.
-        assert_eq!(Initiation::parse(&resp().to_bytes()), Err(Error::Unexpected { want: 1, found: 2 }));
-        assert_eq!(Response::parse(&init().to_bytes()), Err(Error::Unexpected { want: 2, found: 1 }));
+        assert_eq!(Initiation::parse(&resp().to_bytes().unwrap()), Err(Error::Unexpected { want: 1, found: 2 }));
+        assert_eq!(Response::parse(&init().to_bytes().unwrap()), Err(Error::Unexpected { want: 2, found: 1 }));
         assert_eq!(CookieReply::parse(&data().to_bytes().unwrap()), Err(Error::Unexpected { want: 3, found: 4 }));
-        assert_eq!(Data::parse(&cookie().to_bytes()), Err(Error::Unexpected { want: 4, found: 3 }));
+        assert_eq!(Data::parse(&cookie().to_bytes().unwrap()), Err(Error::Unexpected { want: 4, found: 3 }));
         assert_eq!(Data::parse(&[9, 0, 0, 0]), Err(Error::Type(9)));
         assert!(!Error::Unexpected { want: 1, found: 2 }.to_string().contains("not 1 to 4"));
         // Every error has a message.
@@ -811,17 +858,17 @@ mod tests {
 
     #[test]
     fn per_type_readers_on_every_prefix() {
-        let b = init().to_bytes();
+        let b = init().to_bytes().unwrap();
         for n in 0..b.len() {
             let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 1, len: n } };
             assert_eq!(Initiation::parse(&b[..n]), Err(want));
         }
-        let b = resp().to_bytes();
+        let b = resp().to_bytes().unwrap();
         for n in 0..b.len() {
             let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 2, len: n } };
             assert_eq!(Response::parse(&b[..n]), Err(want));
         }
-        let b = cookie().to_bytes();
+        let b = cookie().to_bytes().unwrap();
         for n in 0..b.len() {
             let want = if n < 4 { Error::Short(n) } else { Error::Length { kind: 3, len: n } };
             assert_eq!(CookieReply::parse(&b[..n]), Err(want));
@@ -842,12 +889,13 @@ mod tests {
     #[test]
     fn data_writer_output_always_parses() {
         // The writer takes exactly the encrypted lengths the reader takes,
-        // writes them unchanged, and refuses the rest with the reader's error.
-        let mut s = Lcg(0xda7a);
+        // writes them unchanged, and refuses the rest with Unwritable.
+        let mut s = Lcg::new(0xda7a);
         let edges = [0, 1, 15, 16, 17, MAX_ENCRYPTED - 1, MAX_ENCRYPTED, MAX_ENCRYPTED + 1, MAX_MESSAGE];
         for i in 0..400 {
-            let n = if i < edges.len() { edges[i] } else { (s.next() % 2000) as usize };
-            let encrypted: Vec<u8> = (0..n).map(|_| s.next() as u8).collect();
+            let n = if i < edges.len() { edges[i] } else { s.index(2000) };
+            let mut encrypted = vec![0; n];
+            s.fill(&mut encrypted);
             let d = Data { receiver: s.next() as u32, counter: s.next() << 20, encrypted };
             match d.to_bytes() {
                 Ok(b) => {
@@ -858,7 +906,7 @@ mod tests {
                 }
                 Err(e) => {
                     assert!(!(TAG_LEN..=MAX_ENCRYPTED).contains(&n), "{n}");
-                    assert_eq!(e, Error::Length { kind: message_type::DATA, len: DATA_HEADER_LEN + n });
+                    assert_eq!(e, Error::Unwritable);
                     assert_eq!(Message::Data(d.clone()).to_bytes(), Err(e));
                 }
             }
@@ -870,7 +918,7 @@ mod tests {
         // A short or long encrypted part is refused, not padded or cut.
         for n in [0, 1, 3, 15, MAX_ENCRYPTED + 1, MAX_MESSAGE * 2] {
             let d = Data { receiver: 1, counter: 2, encrypted: vec![7; n] };
-            assert_eq!(d.to_bytes(), Err(Error::Length { kind: 4, len: DATA_HEADER_LEN + n }), "{n}");
+            assert_eq!(d.to_bytes(), Err(Error::Unwritable), "{n}");
         }
         // An empty encrypted part is not a keepalive, and does not become one.
         let empty = Data { receiver: 0, counter: 0, encrypted: Vec::new() };
@@ -901,42 +949,42 @@ mod tests {
         assert_eq!(padding(usize::MAX, 0), 1);
         assert_eq!(padding(usize::MAX, usize::MAX), 0);
         assert_eq!(padding(usize::MAX - 3, usize::MAX), 3);
-        assert_eq!(pad(&[1, 2, 3], 0), Ok(vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
-        assert_eq!(pad(&[], 1420), Ok(Vec::new()));
+        assert_eq!(Plaintext::padded(&[1, 2, 3], 0).map(|v| v.0), Ok(vec![1, 2, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(Plaintext::padded(&[], 1420).map(|v| v.0), Ok(Vec::new()));
         // Too long for one message: refused, not cut.
-        assert_eq!(pad(&vec![1; MAX_MESSAGE], 0), Err(Error::Length { kind: 4, len: MAX_MESSAGE + 9 + 32 }));
+        assert_eq!(Plaintext::padded(&vec![1; MAX_MESSAGE], 0).map(|v| v.0), Err(Error::Unwritable));
     }
 
     #[test]
-    fn pad_keeps_every_plaintext_byte() {
+    fn padding_keeps_every_plaintext_byte() {
         assert_eq!(MAX_PLAINTEXT, 65_495);
         // 65,480 bytes pad to 65,488, a 65,520-byte message: it fits, whole.
         let mut p = vec![0x5a; 65_480];
         p[65_479] = 0xee;
-        let out = pad(&p, 0).unwrap();
+        let out = Plaintext::padded(&p, 0).map(|v| v.0).unwrap();
         assert_eq!(out.len(), 65_488);
         assert_eq!(out[..p.len()], p[..]);
         assert!(out[p.len()..].iter().all(|&x| x == 0));
         // The limits with no MTU: 65,488 is the longest padded length.
-        assert_eq!(pad(&vec![1; 65_488], 0).map(|v| v.len()), Ok(65_488));
-        assert_eq!(pad(&vec![1; 65_489], 0), Err(Error::Length { kind: 4, len: 65_504 + 32 }));
+        assert_eq!(Plaintext::padded(&vec![1; 65_488], 0).map(|v| v.0).map(|v| v.len()), Ok(65_488));
+        assert_eq!(Plaintext::padded(&vec![1; 65_489], 0).map(|v| v.0), Err(Error::Unwritable));
         // With an MTU the padding can stop short of 16, so a longer one fits.
-        assert_eq!(pad(&vec![1; MAX_PLAINTEXT], MAX_PLAINTEXT).map(|v| v.len()), Ok(MAX_PLAINTEXT));
-        assert!(pad(&vec![1; MAX_PLAINTEXT + 1], MAX_PLAINTEXT + 1).is_err());
+        assert_eq!(Plaintext::padded(&vec![1; MAX_PLAINTEXT], MAX_PLAINTEXT).map(|v| v.0).map(|v| v.len()), Ok(MAX_PLAINTEXT));
+        assert!(Plaintext::padded(&vec![1; MAX_PLAINTEXT + 1], MAX_PLAINTEXT + 1).map(|v| v.0).is_err());
         // Any length and MTU: either every byte and zeros after, or refused
         // because the padded length passes the limit. Whatever it gives can
         // be sent once encrypted.
-        let mut s = Lcg(0x9ad);
+        let mut s = Lcg::new(0x9ad);
         for i in 0..3_000 {
-            let len = if i % 2 == 0 { 65_400 + (s.next() % 200) as usize } else { (s.next() % 3000) as usize };
-            let mtu = match s.next() % 3 {
+            let len = if i % 2 == 0 { 65_400 + s.index(200) } else { s.index(3000) };
+            let mtu = match s.index(3) {
                 0 => 0,
-                1 => 1 + (s.next() % 70_000) as usize,
-                _ => 1280 + (s.next() % 200) as usize,
+                1 => 1 + s.index(70_000),
+                _ => 1280 + s.index(200),
             };
             let p: Vec<u8> = (0..len).map(|_| s.next() as u8 | 1).collect();
             let n = padding(len, mtu);
-            match pad(&p, mtu) {
+            match Plaintext::padded(&p, mtu).map(|v| v.0) {
                 Ok(out) => {
                     assert_eq!(out.len(), len + n);
                     assert_eq!(out[..len], p[..]);
@@ -946,7 +994,7 @@ mod tests {
                 }
                 Err(e) => {
                     assert!(len + n > MAX_PLAINTEXT, "{len} {mtu}");
-                    assert_eq!(e, Error::Length { kind: 4, len: len + n + MIN_DATA_LEN });
+                    assert_eq!(e, Error::Unwritable);
                 }
             }
         }
@@ -993,14 +1041,14 @@ mod tests {
         let mut w = ReplayWindow::new();
         let mut seen = std::collections::BTreeSet::new();
         let mut highest: Option<u64> = None;
-        let mut s = Lcg(7);
+        let mut s = Lcg::new(7);
         for _ in 0..20_000 {
             let base = highest.unwrap_or(0);
-            let c = match s.next() % 4 {
-                0 => base.saturating_sub(s.next() % (WINDOW_BITS + 10)),
-                1 => base + s.next() % 70,
-                2 => base + s.next() % (3 * WINDOW_BITS),
-                _ => base.saturating_sub(s.next() % 16),
+            let c = match s.index(4) {
+                0 => base.saturating_sub(s.below(WINDOW_BITS + 10)),
+                1 => base + s.below(70),
+                2 => base + s.below(3 * WINDOW_BITS),
+                _ => base.saturating_sub(s.below(16)),
             };
             let expect = match highest {
                 Some(h) if c <= h => h - c < WINDOW_BITS && !seen.contains(&c),
@@ -1014,27 +1062,19 @@ mod tests {
         }
     }
 
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u64 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            self.0 >> 33
-        }
-    }
-
     #[test]
     fn fuzz_loop() {
-        let mut s = Lcg(0x5eed);
+        let mut s = Lcg::new(0x5eed);
         let sizes = [0, 3, 4, 31, 32, 63, 64, 65, 91, 92, 93, 147, 148, 149, 200, 1500];
         for i in 0..20_000 {
             let len =
-                if i % 2 == 0 { sizes[(s.next() % sizes.len() as u64) as usize] } else { (s.next() % 300) as usize };
-            let mut b: Vec<u8> = (0..len).map(|_| s.next() as u8).collect();
-            if !b.is_empty() && !s.next().is_multiple_of(4) {
-                b[0] = (s.next() % 5) as u8;
+                if i % 2 == 0 { sizes[s.index(sizes.len())] } else { s.index(300) };
+            let mut b = vec![0; len];
+            s.fill(&mut b);
+            if !b.is_empty() && s.index(4) != 0 {
+                b[0] = s.index(5) as u8;
                 for x in b.iter_mut().skip(1).take(3) {
-                    if !s.next().is_multiple_of(8) {
+                    if s.index(8) != 0 {
                         *x = 0;
                     }
                 }
@@ -1049,7 +1089,7 @@ mod tests {
         }
         // Random messages written, then read back.
         for _ in 0..5_000 {
-            let mut bytes = |n: usize| -> Vec<u8> { (0..n).map(|_| s.next() as u8).collect() };
+            let mut bytes = |n: usize| -> Vec<u8> { let mut out = vec![0; n]; s.fill(&mut out); out };
             let m = match bytes(1)[0] % 4 {
                 0 => Message::Initiation(Initiation {
                     sender: u32::from_le_bytes(bytes(4).try_into().unwrap()),
@@ -1088,6 +1128,13 @@ mod tests {
 
     /// Any bytes: no panic, and what parses writes back the same.
     fn check(b: &[u8]) {
+        contract::check_wire::<Message>(b);
+        contract::check_wire::<Initiation>(b);
+        contract::check_wire::<Response>(b);
+        contract::check_wire::<CookieReply>(b);
+        contract::check_wire::<Data>(b);
+        contract::check_wire::<Plaintext>(b);
+
         if let Ok(m) = Message::parse(b) {
             assert_eq!(m.to_bytes().as_deref(), Ok(b));
         }

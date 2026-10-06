@@ -1,95 +1,103 @@
-//! L2TP datagrams, control messages and AVPs, as a world playing an LNS
-//! reads them.
+//! L2TP wire units and their codec contracts.
 #![no_main]
 
-use fictionet::stdlib::l2tp::{
-    Avp, ControlMessage, Error, MAX_AVP_VALUE, MAX_AVPS, MAX_MESSAGE, MessageType, Packet, V3Control, V3Data,
-};
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::l2tp::*;
 use libfuzzer_sys::fuzz_target;
 
-/// What `m` reads back as once written: reserved bits zero, values cut
-/// to MAX_AVP_VALUE, AVPs past the limits left out, the type read from
-/// its number, and a ZLB holding nothing.
-fn written(m: &ControlMessage) -> ControlMessage {
-    let Some(t) = m.message_type else {
-        return ControlMessage::zlb();
-    };
-    let message_type = if m.vendor == 0 { MessageType::from_code(t.code()) } else { MessageType::Other(t.code()) };
-    let mut used = 8;
-    let mut avps = Vec::new();
-    for a in &m.avps {
-        if avps.len() + 1 >= MAX_AVPS || used + a.encoded_len() > MAX_MESSAGE {
-            break;
-        }
-        used += a.encoded_len();
-        let mut value = a.value.clone();
-        value.truncate(MAX_AVP_VALUE);
-        avps.push(Avp { reserved: 0, value, ..a.clone() });
-    }
-    ControlMessage { message_type: Some(message_type), mandatory: m.mandatory, vendor: m.vendor, reserved: 0, avps }
-}
-
 fuzz_target!(|data: &[u8]| {
-    // The bytes as a datagram. A packet read can be written, no longer
-    // than it came, and reads back the same. Its control message reads
-    // back as the writer's rules say.
-    if let Ok(p) = Packet::parse(data) {
-        let bytes = p.to_bytes().expect("a packet read has a cookie the writer takes");
-        assert!(bytes.len() <= data.len());
-        assert_eq!(Packet::parse(&bytes).as_ref(), Ok(&p));
-        let body = match &p {
-            Packet::V2(v) if v.control => Some(v.payload.as_slice()),
-            Packet::V3Control(c) => Some(c.payload.as_slice()),
-            _ => None,
-        };
-        if let Some(Ok(m)) = body.map(ControlMessage::parse) {
-            assert_eq!(ControlMessage::parse(&m.to_bytes()), Ok(written(&m)));
-        }
-    }
-
-    // The bytes as an L2TPv3 data message with each cookie length.
-    for cookie in [4, 8] {
-        if let Ok(d) = V3Data::parse(data, cookie) {
-            let bytes = d.to_bytes().expect("a cookie of 4 or 8 bytes is written");
-            assert_eq!(bytes.len(), data.len());
-            assert_eq!(V3Data::parse(&bytes, cookie), Ok(d));
-        }
-    }
-    // A cookie of any other length is refused, not cut.
-    let cookie = &data[..data.len().min(12)];
-    let d = V3Data { session: 1, cookie: cookie.to_vec(), payload: vec![] };
-    match d.to_bytes() {
-        Ok(b) => assert_eq!(V3Data::parse(&b, cookie.len()), Ok(d)),
-        Err(e) => assert_eq!(e, Error::Cookie(cookie.len())),
-    }
-
-    // The bytes as a control message body, and as one AVP.
-    if let Ok(m) = ControlMessage::parse(data) {
-        let body = m.to_bytes();
-        assert_eq!(ControlMessage::parse(&body), Ok(written(&m)));
-        // The body repeated past what a datagram holds: the writer cuts
-        // it between AVPs, so its message still reads.
-        if !body.is_empty() {
-            let long = body.repeat(MAX_MESSAGE / body.len() + 1);
-            let c = V3Control { connection: 1, ns: 0, nr: 0, payload: long };
-            let read = V3Control::parse(&c.to_bytes()).map(|c| c.message());
-            assert!(matches!(read, Ok(Ok(_) | Err(Error::TooManyAvps))), "{read:?}");
-        }
-    }
-    if let Ok((a, used)) = Avp::parse(data) {
-        // Reserved bits are read, and written as zero.
-        let mut zeroed = data[..used].to_vec();
-        zeroed[0] &= 0xc3;
-        assert_eq!(a.to_bytes(), zeroed);
-    }
-
-    // The datagram growing a byte at a time: each prefix reads or fails
-    // without a panic, and one shorter than 2 bytes is Truncated.
-    for n in 0..data.len().min(256) {
+    contract::check_wire::<Avp>(data);
+    contract::check_wire::<ControlMessage>(data);
+    contract::check_wire::<V2Packet>(data);
+    contract::check_wire::<V3Control>(data);
+    contract::check_wire::<V3Data<0>>(data);
+    contract::check_wire::<V3Data<4>>(data);
+    contract::check_wire::<V3Data<8>>(data);
+    contract::check_wire::<Packet>(data);
+    contract::check_wire_value(&ControlMessage::zlb());
+    assert!(ControlMessage::zlb().to_bytes().is_ok());
+    for n in 0..=data.len().min(256) {
         let part = Packet::parse(&data[..n]);
         if n < 2 {
             assert_eq!(part, Err(Error::Truncated));
         }
         let _ = ControlMessage::parse(&data[..n]);
+    }
+    if let Ok(message) = ControlMessage::parse(data) {
+        let control = V3Control::new(1, 2, 3, &message).unwrap();
+        contract::check_wire_value(&control);
+        assert!(control.to_bytes().is_ok());
+        assert_eq!(control.message(), Ok(message.clone()));
+        let body = message.to_bytes().unwrap();
+        if !body.is_empty() {
+            let long = body.repeat(MAX_MESSAGE / body.len() + 1);
+            let control = V3Control {
+                connection: 1,
+                ns: 0,
+                nr: 0,
+                payload: long,
+            };
+            contract::check_wire_value(&control);
+            assert_eq!(control.to_bytes(), Err(Error::Unwritable));
+        }
+    }
+    // Reserved bits are read, and written as zero.
+    if let Ok(avp) = Avp::parse(data) {
+        assert_eq!(Avp::reserved_bits(data).unwrap(), (data[0] >> 2) & 15);
+        assert_eq!(Avp::reserved_bits(&avp.to_bytes().unwrap()), Ok(0));
+    }
+    if let Ok(message) = ControlMessage::parse(data)
+        && !message.is_zlb()
+    {
+        assert_eq!(Avp::reserved_bits(&message.to_bytes().unwrap()), Ok(0));
+        let bits = ControlMessage::reserved_bits(data).unwrap();
+        assert_eq!(bits.len(), 1 + message.avps.len());
+        assert_eq!(bits[0], Avp::reserved_bits(data).unwrap());
+        let written = ControlMessage::reserved_bits(&message.to_bytes().unwrap()).unwrap();
+        assert!(written.iter().all(|&b| b == 0));
+    }
+    let byte = |i: usize| data.get(i).copied().unwrap_or(0);
+    let code = u16::from_be_bytes([byte(0), byte(1)]);
+    assert_eq!(MessageType::from_code(code).code(), code);
+    let avp = Avp {
+        mandatory: byte(2) & 1 != 0,
+        hidden: byte(2) & 2 != 0,
+        vendor: u16::from(byte(4)),
+        attribute: code,
+        value: data[..data.len().min(MAX_AVP_VALUE + 1)].to_vec(),
+    };
+    contract::check_wire_value(&avp);
+    let message = ControlMessage {
+        message_type: (byte(2) & 4 != 0).then(|| MessageType::from_code(code)),
+        mandatory: byte(2) & 1 != 0,
+        vendor: u16::from(byte(4)),
+        avps: vec![avp],
+    };
+    contract::check_wire_value(&message);
+    let packet = V2Packet {
+        control: byte(2) & 1 != 0,
+        has_length: byte(2) & 2 != 0,
+        sequence: (byte(2) & 4 != 0).then_some((code, 0)),
+        offset_pad: (byte(2) & 8 != 0).then_some(vec![byte(3)]),
+        priority: byte(2) & 16 != 0,
+        tunnel: code,
+        session: code,
+        payload: data[..data.len().min(MAX_DATAGRAM + 1)].to_vec(),
+    };
+    contract::check_wire_value(&packet);
+    let cookie = data[..data.len().min(12)].to_vec();
+    macro_rules! cookie {
+        ($len:expr) => {
+            contract::check_wire_value(&V3Data::<$len> {
+                session: 1,
+                cookie,
+                payload: vec![],
+            })
+        };
+    }
+    match cookie.len() {
+        4 => cookie!(4),
+        8 => cookie!(8),
+        _ => cookie!(0),
     }
 });

@@ -2,13 +2,18 @@
 //! builds from them.
 #![no_main]
 
+use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::ntp::{KissCode, Mode, Packet, ServerInfo, Timestamp, kiss_reply, server_reply};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Packet>(data);
+    contract::check_wire::<Timestamp>(data);
+    contract::check_wire::<KissCode>(data);
+
     if let Ok(p) = Packet::parse(data) {
         // Every field is kept, so what was read writes back the same bytes.
-        assert_eq!(p.to_bytes(), data);
+        assert_eq!(p.to_bytes().unwrap(), data);
         let _ = p.kiss_code().map(|k| k.to_string());
         // Only requests of versions 1 to 4 are answered: a client gets
         // mode 4, and a symmetric active peer mode 2, in its own version.
@@ -20,12 +25,16 @@ fuzz_target!(|data: &[u8]| {
         let r = server_reply(&p, &ServerInfo::default(), p.receive, p.transmit);
         assert_eq!(r.as_ref().ok().map(|r| (r.mode, r.version)), answer.map(|m| (m, p.version)));
         if let Ok(r) = r {
-            assert_eq!(Packet::parse(&r.to_bytes()).as_ref(), Ok(&r));
+            contract::check_wire_value(&r);
+            assert!(r.to_bytes().is_ok());
+            assert_eq!(Packet::parse(&r.to_bytes().unwrap()).as_ref(), Ok(&r));
         }
         let r = kiss_reply(&p, KissCode::from_bytes(p.reference_id));
         assert_eq!(r.as_ref().ok().map(|r| (r.mode, r.version)), answer.map(|m| (m, p.version)));
         if let Ok(r) = r {
-            assert_eq!(Packet::parse(&r.to_bytes()).as_ref(), Ok(&r));
+            contract::check_wire_value(&r);
+            assert!(r.to_bytes().is_ok());
+            assert_eq!(Packet::parse(&r.to_bytes().unwrap()).as_ref(), Ok(&r));
         }
         // A timestamp read as Unix time comes back within a few units,
         // measured round the era: the last fraction of an era rounds up to

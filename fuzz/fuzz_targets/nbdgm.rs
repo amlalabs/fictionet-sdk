@@ -2,31 +2,41 @@
 //! LAN reads them, and the reassembler that puts fragments back together.
 #![no_main]
 
-use fictionet::stdlib::nbdgm::{ErrorCode, MAX_PENDING, Packet, Reassembler};
+use fictionet::stdlib::codec::{Wire, contract};
+use fictionet::stdlib::nbdgm::{ErrorCode, MAX_PENDING, Name, Packet, Reassembler};
 use libfuzzer_sys::fuzz_target;
 use std::net::Ipv4Addr;
 
 fuzz_target!(|data: &[u8]| {
+    contract::check_wire::<Name>(data);
+    contract::check_wire::<Packet>(data);
+
     let here = Ipv4Addr::new(10, 0, 0, 1);
     let mut reassembler = Reassembler::new();
-    // The whole input as one datagram, and every prefix of it, as if it
-    // came one byte more at a time.
-    for n in 0..=data.len() {
-        let Ok(p) = Packet::parse(&data[..n]) else { continue };
+    // Check short prefixes and the whole datagram with bounded prefix work.
+    for n in (0..=data.len().min(256)).chain((data.len() > 256).then_some(data.len())) {
+        let Ok(p) = Packet::parse(&data[..n]) else {
+            continue;
+        };
         // A packet read can be written, and reads back the same.
-        let bytes = p.to_bytes();
+        let bytes = p.to_bytes().unwrap();
         let back = Packet::parse(&bytes).unwrap();
         assert_eq!(back, p);
-        assert_eq!(back.to_bytes(), bytes);
+        assert_eq!(back.to_bytes().unwrap(), bytes);
         // Replies and fragments read back too.
-        if let Some(r) = p.query_response(here, 138, true) {
-            assert_eq!(Packet::parse(&r.to_bytes()).unwrap(), r);
+        for present in [true, false] {
+            if let Some(r) = p.query_response(here, 138, present) {
+                contract::check_wire_value(&r);
+                assert!(r.to_bytes().is_ok());
+            }
         }
         let e = p.error(here, 138, ErrorCode::DestinationNameNotPresent);
-        assert_eq!(Packet::parse(&e.to_bytes()).unwrap(), e);
+        contract::check_wire_value(&e);
+        assert!(e.to_bytes().is_ok());
         let mut whole = None;
-        for f in p.split(1 + n % 64) {
-            assert_eq!(Packet::parse(&f.to_bytes()).unwrap(), f);
+        for f in p.split(1 + n % 64).unwrap() {
+            contract::check_wire_value(&f);
+            assert!(f.to_bytes().is_ok());
             if let Some(w) = reassembler.push(f) {
                 assert!(w.flags.first && !w.flags.more);
                 whole = Some(w);
