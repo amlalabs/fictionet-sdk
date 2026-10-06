@@ -2,11 +2,12 @@
 //! as a world playing an RPC server reads them.
 #![no_main]
 
-use fictionet::stdlib::onc_rpc::{
-    AuthSys, Body, Decoder, MAX_ARRAY_RESERVE, Message, PortmapRequest, Reader, RpcbRequest,
-    encode_fragments, parse_dump,
+use fictionet::stdlib::onc_rpc::{AuthSys, Body, MAX_ARRAY_RESERVE, Message, Reader, encode_fragments};
+use fictionet::stdlib::portmap::{PmapResult, Request, procedure};
+use fictionet::stdlib::{
+    codec::{Assembled, Stream, Wire, contract, pump},
+    onc_rpc,
 };
-use fictionet::stdlib::{codec::contract, onc_rpc};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
@@ -16,55 +17,36 @@ fuzz_target!(|data: &[u8]| {
     contract::check_decode(|| onc_rpc::records(limit), data);
     contract::check_decode_with_held_limit(|| onc_rpc::messages(limit), data, limit);
     contract::check_wire::<onc_rpc::Record>(data);
+    contract::check_wire::<onc_rpc::Fragment>(data);
+    contract::check_wire::<AuthSys>(data);
     contract::check_wire::<Message>(data);
-    let mut whole = Decoder::with_limit(limit);
-    whole.feed(data);
+    let mut stream = Stream::new(onc_rpc::records(limit));
     let mut records = Vec::new();
-    while let Some(Ok(r)) = whole.next_record() {
-        records.push(r);
-    }
-    let mut bytewise = Decoder::with_limit(limit);
-    let mut again = Vec::new();
-    for b in data {
-        bytewise.feed(std::slice::from_ref(b));
-        while let Some(Ok(r)) = bytewise.next_record() {
-            again.push(r);
-        }
-    }
-    assert_eq!(records, again);
-    // A drained decoder holds at most one record's worth, and both agree
-    // on whether the stream stopped inside a record.
-    assert!(whole.buffered() <= limit + 4);
-    assert!(bytewise.buffered() <= limit + 4);
-    assert_eq!(whole.mid_record(), bytewise.mid_record());
-    assert_eq!(whole.next_record(), bytewise.next_record());
+    let _ = pump(&mut stream, data, |record| {
+        let Assembled::Message(bytes) = record;
+        records.push(bytes);
+    });
 
     // Each record, and the bytes on their own as a UDP datagram.
     for bytes in records.iter().map(Vec::as_slice).chain([data]) {
         contract::check_wire::<Message>(bytes);
         // A record written in fragments reads back the same.
-        let mut d = if bytes.len() <= limit { Decoder::with_limit(limit) } else { Decoder::new() };
-        d.feed(&encode_fragments(bytes, 7));
-        assert_eq!(d.next_record(), Some(Ok(bytes.to_vec())));
-        assert!(!d.mid_record());
-        let Ok(m) = Message::parse(bytes) else { continue };
+        if let Ok(encoded) = encode_fragments(bytes, 7) {
+            assert_eq!(onc_rpc::Record::parse(&encoded), Ok(onc_rpc::Record(bytes.to_vec())));
+        }
+        let Ok(m) = <Message as Wire>::parse(bytes) else { continue };
         contract::check_wire_value(&m);
         // A message read writes back as the same bytes.
-        assert_eq!(m.to_bytes(), bytes);
+        assert_eq!(m.to_bytes().unwrap(), bytes);
         if let Body::Call(call) = &m.body {
-            if let Ok(req) = PortmapRequest::parse(call) {
-                let Body::Call(c) = req.call(m.xid).body else { unreachable!() };
-                assert_eq!(PortmapRequest::parse(&c), Ok(req));
-            }
-            if let Ok(req) = RpcbRequest::parse(call) {
-                let Body::Call(c) = req.call(m.xid, call.version).body else { unreachable!() };
-                assert_eq!(RpcbRequest::parse(&c), Ok(req));
+            if let Ok(req) = Request::from_call(call) {
+                assert_eq!(Request::from_call(&req.to_call().unwrap()), Ok(req));
             }
         }
     }
     // Any bytes as other XDR.
-    let _ = AuthSys::parse(data);
-    let _ = parse_dump(data);
+    let _ = <AuthSys as Wire>::parse(data);
+    let _ = PmapResult::parse(procedure::DUMP, data);
     let mut r = Reader::new(data);
     let _ = r.array(64, |r| r.optional(|r| r.opaque(256).map(<[u8]>::to_vec)));
     // Items of no bytes: a count over MAX_ARRAY_RESERVE still needs 4 bytes

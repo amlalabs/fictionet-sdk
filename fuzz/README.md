@@ -29,21 +29,21 @@ cargo +nightly fuzz list
 | `web_http` | HTTP/1.1 and HTTP/2 bytes, plain or over TLS | `web::Sites` serving HTTP through hyper and h2 |
 | `proxy_http` | a request head | the HTTP proxy door of `fictionet attach`: CONNECT and absolute URIs, `Proxy-Authorization` |
 | `proxy_socks5` | a SOCKS5 client's bytes | the SOCKS5 door: greeting, login and request |
-| `modbus` | a Modbus/TCP byte stream, whole and a byte at a time | `modbus::Decoder`, `Frame`, `Request` and `Response`, reading and writing |
+| `modbus` | a Modbus/TCP byte stream, whole and a byte at a time | `codec::Stream<modbus::Frames>`, `Frame`, `Request` and `Response`, reading and writing |
 | `dnp3` | arbitrary and constructed link frames, CRC blocks and transport segments | `stdlib::dnp3`: framing, transport reassembly and application headers |
 | `iec104` | APDU streams, ASDU headers and information object layouts | `stdlib::iec104`: I/S/U frames and sequential or explicit object addresses |
 | `smtp` | command and reply streams, DATA bodies, and constructed values | `stdlib::smtp`: commands, multiline replies, dot-stuffing and bounded decoders |
 | `amqp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::amqp`: AMQP 0-9-1 |
 | `asn1` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::asn1`: ASN.1 BER and DER |
 | `bacnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::bacnet`: BACnet/IP |
-| `cotp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::cotp`: TPKT and COTP |
+| `cotp` | wire values and codec contract checks over stream partitions | `stdlib::cotp`: TPKT and COTP |
 | `dhcpv6` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::dhcpv6`: DHCPv6 |
 | `enip` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::enip`: EtherNet/IP and CIP |
 | `fastcgi` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::fastcgi`: FastCGI |
 | `ftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ftp`: FTP |
 | `geneve` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::geneve`: Geneve |
 | `git_protocol` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::git_protocol`: The Git wire protocol |
-| `grpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::grpc`: gRPC |
+| `grpc` | wire values and codec contract checks over stream partitions | `stdlib::grpc`: gRPC |
 | `imap` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imap`: IMAP |
 | `imf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::imf`: Internet Message Format headers |
 | `json` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::json`: JSON |
@@ -56,10 +56,10 @@ cargo +nightly fuzz list
 | `mqtt` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mqtt`: MQTT 3.1.1 |
 | `mysql` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::mysql`: MySQL |
 | `nbns` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nbns`: NetBIOS Name Service |
-| `nfs` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::nfs`: NFS version 3 and MOUNT version 3 |
+| `nfs` | wire values and codec contract checks over stream partitions | `stdlib::nfs`: NFS version 3 and MOUNT version 3 |
 | `ntp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ntp`: NTP |
 | `ocsp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ocsp`: OCSP |
-| `onc_rpc` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::onc_rpc`: ONC RPC and XDR |
+| `onc_rpc` | wire values and codec contract checks over stream partitions | `stdlib::onc_rpc`: ONC RPC and XDR |
 | `opcua` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::opcua`: OPC UA over TCP |
 | `postgres` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::postgres`: PostgreSQL |
 | `protobuf` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::protobuf`: Protocol Buffers |
@@ -77,7 +77,7 @@ cargo +nightly fuzz list
 | `socks` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::socks`: SOCKS4, SOCKS4a and SOCKS5 |
 | `spnego` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::spnego`: SPNEGO |
 | `ssh` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::ssh`: The SSH transport layer before encryption |
-| `stun` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::stun`: STUN |
+| `stun` | wire values and codec contract checks over stream partitions | `stdlib::stun`: STUN |
 | `syslog` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::syslog`: Syslog |
 | `telnet` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::telnet`: Telnet |
 | `tftp` | arbitrary bytes, and its decoder fed whole and in pieces | `stdlib::tftp`: TFTP |

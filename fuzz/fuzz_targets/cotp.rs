@@ -1,68 +1,34 @@
 //! TPKT packets and class 0 COTP TPDUs, as a world playing an ISO
 //! transport server reads them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the legacy decoder and packet helpers.
 
 use fictionet::stdlib::codec::contract::{
     check_decode, check_decode_with_held_limit, check_wire, check_wire_value,
 };
-use fictionet::stdlib::cotp::{
-    Decoder, ErrorTpdu, MAX_MESSAGE, Reassembler, Tpdu, TpktError, parse_packet, segment,
-    write_packet,
-};
+use fictionet::stdlib::codec::{Stream, Wire, pump};
+use fictionet::stdlib::cotp::{ErrorTpdu, MAX_MESSAGE, ParseError, Reassembler, Tpdu, segment};
 use fictionet::stdlib::{cotp, tpkt};
 use libfuzzer_sys::fuzz_target;
-
-/// Every packet a decoder gives for `data` fed in pieces of `step` bytes,
-/// the error that ended the stream, if any, and how many bytes are left.
-fn decode(data: &[u8], step: usize) -> (Vec<Vec<u8>>, Option<TpktError>, usize) {
-    let mut d = Decoder::new();
-    let mut packets = Vec::new();
-    for piece in data.chunks(step.max(1)) {
-        d.feed(piece);
-        while let Some(r) = d.next_packet() {
-            match r {
-                Ok(p) => packets.push(p),
-                Err(e) => return (packets, Some(e), d.buffered()),
-            }
-        }
-    }
-    (packets, None, d.buffered())
-}
 
 fuzz_target!(|data: &[u8]| {
     const MESSAGE_LIMIT: usize = 4096;
     check_decode(|| cotp::tpdus(tpkt::MAX_PACKET), data);
-    check_decode_with_held_limit(
-        || cotp::messages(tpkt::MAX_PACKET, MESSAGE_LIMIT),
-        data,
-        MESSAGE_LIMIT,
-    );
+    check_decode_with_held_limit(|| cotp::messages(tpkt::MAX_PACKET, MESSAGE_LIMIT), data, MESSAGE_LIMIT);
     check_wire::<Tpdu>(data);
-    // The stream, split several ways, gives the same packets, the same
-    // error and the same bytes left over.
-    let (packets, error, left) = decode(data, data.len());
-    for step in [1, 3, 64] {
-        assert_eq!(decode(data, step), (packets.clone(), error, left));
-    }
+    let mut stream = Stream::new(tpkt::Packets::new());
+    let mut packets = Vec::new();
+    let _ = pump(&mut stream, data, |packet| packets.push(packet.payload));
 
     let mut messages = Reassembler::with_limit(MESSAGE_LIMIT);
     // Each packet's TPDU, and any bytes as a TPDU on their own.
     for tpdu in packets.iter().map(Vec::as_slice).chain([data]) {
         check_wire::<Tpdu>(tpdu);
-        // A packet written reads back whole.
-        let packet = write_packet(tpdu);
-        let (_, used) = parse_packet(&packet).unwrap().unwrap();
-        assert_eq!(used, packet.len());
-        match Tpdu::parse(tpdu) {
+        check_wire_value(&tpkt::Packet::new(tpdu.to_vec()));
+        match <Tpdu as Wire>::parse(tpdu) {
             Ok(t) => {
                 check_wire_value(&t);
-                // A TPDU read can be written, and reads back the same once
-                // the writer has cut what does not fit.
-                let back = Tpdu::parse(&t.to_bytes()).unwrap();
-                assert_eq!(Tpdu::parse(&back.to_bytes()), Ok(back.clone()));
-                if tpdu.len() <= fictionet::stdlib::cotp::MAX_TPDU {
-                    assert_eq!(back, t);
+                if let Ok(bytes) = t.to_bytes() {
+                    assert_eq!(<Tpdu as Wire>::parse(&bytes), Ok(t.clone()));
                 }
                 match &t {
                     Tpdu::Data(d) => {
@@ -74,17 +40,18 @@ fuzz_target!(|data: &[u8]| {
                             assert!(c.allows_class0());
                             assert_eq!(cc.class, 0);
                             let cc = Tpdu::ConnectionConfirm(cc);
-                            assert_eq!(Tpdu::parse(&cc.to_bytes()), Ok(cc));
+                            assert_eq!(<Tpdu as Wire>::parse(&cc.to_bytes().unwrap()), Ok(cc));
                         }
                         None => assert!(!c.allows_class0()),
                     },
                     _ => {}
                 }
             }
-            Err(e) => {
+            Err(ParseError::Tpdu(e)) => {
                 let er = Tpdu::Error(ErrorTpdu::rejecting(0, tpdu, &e));
-                assert_eq!(Tpdu::parse(&er.to_bytes()), Ok(er));
+                assert_eq!(<Tpdu as Wire>::parse(&er.to_bytes().unwrap()), Ok(er));
             }
+            Err(ParseError::TooLong { .. }) => {}
         }
     }
     // Any bytes cut into segments read back as the same data TPDUs, and
@@ -94,7 +61,8 @@ fuzz_target!(|data: &[u8]| {
         let mut whole = Reassembler::new();
         let mut got = None;
         for s in segment(data, size) {
-            let Ok(Tpdu::Data(back)) = Tpdu::parse(&Tpdu::Data(s.clone()).to_bytes()) else {
+            let Ok(Tpdu::Data(back)) = <Tpdu as Wire>::parse(&Tpdu::Data(s.clone()).to_bytes().unwrap())
+            else {
                 panic!()
             };
             assert_eq!(back, s);

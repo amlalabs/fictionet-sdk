@@ -11,14 +11,13 @@
 //!
 //! Nothing here reads a socket. A world that plays a PLC feeds the bytes
 //! it reads from a [`tcp`](crate::stdlib::tcp) connection to a
-//! [`Decoder`], gets [`Frame`]s back, reads each one's [`Request`], and
+//! [`Frames`], gets [`Frame`]s back, reads each one's [`Request`], and
 //! writes the reply's bytes back to the connection. Which coils and
 //! registers exist, and what they hold, is up to world code. So is whether
 //! a write succeeds.
 //!
-//! New stacks can use [`Frames`] with [`codec::Stream`](super::codec::Stream).
+//! Use [`Frames`] with [`codec::Stream`](super::codec::Stream).
 //! It reports a framing error once and checks for partial frames at EOF.
-//! [`Decoder`] keeps its original behavior, including repeated errors.
 //! [`Wire`] reads exactly one frame and appends its bytes with a strict
 //! writer. Use `<Frame as Wire>::parse(bytes)` for exact parsing;
 //! [`Frame::parse`] still reads a prefix and allows trailing bytes.
@@ -30,7 +29,8 @@
 //! or read back as something else.
 //!
 //! ```
-//! use fictionet::stdlib::modbus::{Decoder, Exception, Frame, Request, Response};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::modbus::{Frames, Exception, Frame, Request, Response};
 //!
 //! /// Holding registers 0 to 9 of a pretend tank controller.
 //! fn answer(registers: &mut [u16; 10], frame: &Frame) -> Frame {
@@ -59,11 +59,11 @@
 //!
 //! let mut registers = [0u16; 10];
 //! registers[2] = 1234;
-//! let mut decoder = Decoder::new();
+//! let mut decoder = Stream::new(Frames);
 //! // Read 1 holding register at address 2, transaction 7, unit 1.
 //! let bytes = [0, 7, 0, 0, 0, 6, 1, 3, 0, 2, 0, 1];
-//! assert_eq!(decoder.feed(&bytes), bytes.len());
-//! let frame = decoder.next_frame().unwrap().unwrap();
+//! assert_eq!(decoder.push(&bytes), bytes.len());
+//! let frame = decoder.next().unwrap().unwrap();
 //! let reply = answer(&mut registers, &frame);
 //! assert_eq!(reply.to_bytes().unwrap(), [0, 7, 0, 0, 0, 5, 1, 3, 2, 0x04, 0xd2]);
 //! ```
@@ -78,9 +78,6 @@ pub const MAX_PDU: usize = 253;
 pub const HEADER_LEN: usize = 7;
 /// The longest frame: the header and the longest PDU.
 pub const MAX_FRAME: usize = HEADER_LEN + MAX_PDU;
-/// The most bytes a [`Decoder`] holds that have not been taken out: one
-/// longest frame.
-pub const MAX_BUFFERED: usize = MAX_FRAME;
 
 /// Function codes this module reads and writes.
 pub mod function {
@@ -241,26 +238,6 @@ impl Frame {
         Ok(Some((frame, end)))
     }
 
-    /// The frame's bytes: the MBAP header, then the PDU. A PDU that is
-    /// empty, or longer than [`MAX_PDU`], is an error, since no frame can
-    /// hold it.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, EncodeError> {
-        let pdu = &self.pdu[..];
-        if pdu.is_empty() {
-            return Err(EncodeError::EmptyPdu);
-        }
-        if pdu.len() > MAX_PDU {
-            return Err(EncodeError::TooLong);
-        }
-        let mut out = Vec::with_capacity(HEADER_LEN + pdu.len());
-        out.extend_from_slice(&self.transaction.to_be_bytes());
-        out.extend_from_slice(&[0, 0]);
-        out.extend_from_slice(&(pdu.len() as u16 + 1).to_be_bytes());
-        out.push(self.unit);
-        out.extend_from_slice(pdu);
-        Ok(out)
-    }
-
     /// The function code: the PDU's first byte. A frame read by
     /// [`Frame::parse`] always has one.
     pub fn function(&self) -> Option<u8> {
@@ -287,9 +264,20 @@ impl Wire for Frame {
         }
     }
 
-    /// Appends at most [`MAX_FRAME`] bytes. Leaves `out` unchanged on error.
+    /// Appends one frame. Invalid PDUs leave `out` unchanged.
     fn write(&self, out: &mut Vec<u8>) -> Result<(), EncodeError> {
-        out.extend_from_slice(&self.to_bytes()?);
+        let pdu = &self.pdu[..];
+        if pdu.is_empty() {
+            return Err(EncodeError::EmptyPdu);
+        }
+        if pdu.len() > MAX_PDU {
+            return Err(EncodeError::TooLong);
+        }
+        out.extend_from_slice(&self.transaction.to_be_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out.extend_from_slice(&(pdu.len() as u16 + 1).to_be_bytes());
+        out.push(self.unit);
+        out.extend_from_slice(pdu);
         Ok(())
     }
 }
@@ -333,73 +321,6 @@ impl Decode for Frames {
             Some((frame, used)) => Step::Item(frame, used),
             None => Step::Need,
         })
-    }
-}
-
-/// Splits a Modbus/TCP byte stream into frames. Feed it the bytes a
-/// connection reads, in order, and take frames out until it has none.
-#[derive(Debug, Default)]
-pub struct Decoder {
-    buf: Vec<u8>,
-    /// Where the bytes not yet taken out start. Bytes before it are
-    /// dropped in `feed` once they are half the buffer, so taking out many
-    /// small frames costs time in proportion to their bytes.
-    start: usize,
-    failed: Option<FrameError>,
-}
-
-impl Decoder {
-    /// A decoder holding no bytes.
-    pub fn new() -> Decoder {
-        Decoder::default()
-    }
-
-    /// Takes bytes read from the connection, from the start of `bytes`,
-    /// and returns how many it took. It takes them all unless that would
-    /// make it hold more than [`MAX_BUFFERED`] bytes. Then take frames out
-    /// with [`Decoder::next_frame`] and feed it the rest. Once it is full,
-    /// `next_frame` always gives a frame or an error, so a loop of feeding
-    /// and taking out always ends. After a [`FrameError`] the stream
-    /// cannot be read any further, and every byte is taken and dropped.
-    #[must_use = "bytes past the count returned were not taken"]
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        if self.start > 0 && self.start >= self.buf.len() / 2 {
-            self.buf.drain(..self.start);
-            self.start = 0;
-        }
-        let n = bytes.len().min(MAX_BUFFERED.saturating_sub(self.buffered()));
-        self.buf.extend_from_slice(&bytes[..n]);
-        n
-    }
-
-    /// The next whole frame, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken.
-    pub fn next_frame(&mut self) -> Option<Result<Frame, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        match Frame::parse(&self.buf[self.start..]) {
-            Ok(Some((frame, used))) => {
-                self.start += used;
-                Some(Ok(frame))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                self.failed = Some(e);
-                self.buf = Vec::new();
-                self.start = 0;
-                Some(Err(e))
-            }
-        }
-    }
-
-    /// How many bytes are held, waiting for the rest of a frame.
-    pub fn buffered(&self) -> usize {
-        self.buf.len() - self.start
     }
 }
 
@@ -575,7 +496,8 @@ impl Request {
                 Request::WriteSingleRegister { address: be16(data, 0), value: be16(data, 2) }
             }
             function::WRITE_MULTIPLE_COILS => {
-                let (address, quantity, bytes) = multiple(data, MAX_WRITE_BITS, |q| usize::from(q).div_ceil(8))?;
+                let (address, quantity, bytes) =
+                    multiple(data, MAX_WRITE_BITS, |q| usize::from(q).div_ceil(8))?;
                 let values = (0..usize::from(quantity)).map(|i| bytes[i / 8] >> (i % 8) & 1 == 1).collect();
                 Request::WriteMultipleCoils { address, values }
             }
@@ -617,7 +539,8 @@ impl Request {
                 out.extend_from_slice(&address.to_be_bytes());
                 out.extend_from_slice(&quantity.to_be_bytes());
             }
-            Request::ReadHoldingRegisters { address, quantity } | Request::ReadInputRegisters { address, quantity } => {
+            Request::ReadHoldingRegisters { address, quantity }
+            | Request::ReadInputRegisters { address, quantity } => {
                 check_quantity(*address, usize::from(*quantity), MAX_READ_REGISTERS)?;
                 out.extend_from_slice(&address.to_be_bytes());
                 out.extend_from_slice(&quantity.to_be_bytes());
@@ -747,7 +670,8 @@ impl Response {
             }
             function::WRITE_MULTIPLE_COILS | function::WRITE_MULTIPLE_REGISTERS => {
                 let (address, quantity) = pair()?;
-                let max = if code == function::WRITE_MULTIPLE_COILS { MAX_WRITE_BITS } else { MAX_WRITE_REGISTERS };
+                let max =
+                    if code == function::WRITE_MULTIPLE_COILS { MAX_WRITE_BITS } else { MAX_WRITE_REGISTERS };
                 check_quantity(address, usize::from(quantity), max).map_err(|_| ResponseError)?;
                 Response::WriteMultiple { address, quantity }
             }
@@ -881,7 +805,11 @@ fn multiple(data: &[u8], max: u16, need: impl Fn(u16) -> usize) -> Result<(u16, 
 /// Whether `quantity` items from `address` stay within the 65536
 /// addresses.
 fn in_range(address: u16, quantity: u16) -> Result<(), Exception> {
-    if u32::from(address) + u32::from(quantity) > 0x1_0000 { Err(Exception::IllegalDataAddress) } else { Ok(()) }
+    if u32::from(address) + u32::from(quantity) > 0x1_0000 {
+        Err(Exception::IllegalDataAddress)
+    } else {
+        Ok(())
+    }
 }
 
 /// Bits packed into bytes, the first in the lowest bit of the first byte.
@@ -980,13 +908,19 @@ mod tests {
         // Missing bytes after a correct count.
         assert_eq!(Request::parse(&[0x10, 0, 1, 0, 2, 4, 0, 0, 0]), Err(Exception::IllegalDataValue));
         // Functions this module does not read stay as they are.
-        assert_eq!(Request::parse(&[0x2b, 0x0e, 1, 0]), Ok(Request::Other { function: 0x2b, data: vec![0x0e, 1, 0] }));
+        assert_eq!(
+            Request::parse(&[0x2b, 0x0e, 1, 0]),
+            Ok(Request::Other { function: 0x2b, data: vec![0x0e, 1, 0] })
+        );
     }
 
     #[test]
     fn exceptions() {
         assert_eq!(Exception::IllegalDataAddress.to_pdu(3), [0x83, 0x02]);
-        assert_eq!(Response::parse(&[0x83, 0x02]).unwrap(), (3, Response::Exception(Exception::IllegalDataAddress)));
+        assert_eq!(
+            Response::parse(&[0x83, 0x02]).unwrap(),
+            (3, Response::Exception(Exception::IllegalDataAddress))
+        );
         assert_eq!(Response::parse(&[0x83]), Err(ResponseError));
         for c in 0..=255u8 {
             assert_eq!(Exception::from_code(c).code(), c);
@@ -1176,10 +1110,12 @@ mod tests {
             (10, 17, Ok((3, Response::Exception(Exception::IllegalDataAddress)))),
             (11, 17, Ok((3, Response::Registers(vec![1234])))),
         ];
-        let make_requests = || Frames.map(|frame| {
-            let request = Request::parse(&frame.pdu);
-            (frame, request)
-        });
+        let make_requests = || {
+            Frames.map(|frame| {
+                let request = Request::parse(&frame.pdu);
+                (frame, request)
+            })
+        };
         contract::check_stack(make_requests, &input);
         for sizes in [&[][..], &[1][..], &[7, 1, 13][..]] {
             let mut registers = [0u16; 10];
@@ -1199,7 +1135,10 @@ mod tests {
                         }
                         Ok(Request::ReadHoldingRegisters { address, quantity }) => {
                             let start = usize::from(address);
-                            match start.checked_add(usize::from(quantity)).and_then(|end| registers.get(start..end)) {
+                            match start
+                                .checked_add(usize::from(quantity))
+                                .and_then(|end| registers.get(start..end))
+                            {
                                 Some(values) => Response::Registers(values.to_vec()),
                                 None => Response::Exception(Exception::IllegalDataAddress),
                             }
@@ -1210,20 +1149,24 @@ mod tests {
                     let pdu = response.to_pdu(frame.function().unwrap_or(0))?;
                     assert!(output.len() <= MAX_TEST_BYTES - MAX_FRAME);
                     frame.reply(pdu).write(&mut output)
-                }).unwrap();
+                })
+                .unwrap();
                 assert_eq!(accepted, chunk.len());
             }
             finish(&mut server, |_| panic!("unexpected request at EOF")).unwrap();
             assert_eq!(registers.get(2), Some(&1234));
-            let mut client = Stream::new(Frames.map(|frame| {
-                (frame.transaction, frame.unit, Response::parse(&frame.pdu))
-            }));
+            let mut client =
+                Stream::new(Frames.map(|frame| (frame.transaction, frame.unit, Response::parse(&frame.pdu))));
             let mut got = Vec::new();
             for chunk in test_support::chunks(&output, sizes) {
-                assert_eq!(pump(&mut client, chunk, |response| {
-                    assert!(got.len() < MAX_TEST_FRAMES);
-                    got.push(response);
-                }).unwrap(), chunk.len());
+                assert_eq!(
+                    pump(&mut client, chunk, |response| {
+                        assert!(got.len() < MAX_TEST_FRAMES);
+                        got.push(response);
+                    })
+                    .unwrap(),
+                    chunk.len()
+                );
             }
             finish(&mut client, |_| panic!("unexpected response at EOF")).unwrap();
             assert_eq!(got, expected);
@@ -1238,24 +1181,24 @@ mod tests {
         let a = Frame { transaction: 1, unit: 1, pdu: vec![3, 0, 0, 0, 1] }.to_bytes().unwrap();
         let b = Frame { transaction: 2, unit: 1, pdu: vec![6, 0, 1, 0, 9] }.to_bytes().unwrap();
         let stream: Vec<u8> = a.iter().chain(&b).copied().collect();
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames);
         // One byte at a time.
         let mut got = Vec::new();
-        for byte in &stream {
-            assert_eq!(d.feed(std::slice::from_ref(byte)), 1);
-            while let Some(f) = d.next_frame() {
+        for byte in test_support::chunks(&stream, &[1]) {
+            assert_eq!(d.push(byte), 1);
+            while let Some(f) = d.next() {
                 got.push(f.unwrap().transaction);
             }
         }
         assert_eq!(got, [1, 2]);
         assert_eq!(d.buffered(), 0);
         // A broken stream stays broken.
-        assert_eq!(d.feed(&[0, 3, 0, 9, 0, 6, 1, 3, 0, 0, 0, 1]), 12);
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Protocol(9))));
+        assert_eq!(d.push(&[0, 3, 0, 9, 0, 6, 1, 3, 0, 0, 0, 1]), 12);
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Protocol(9)))));
         // Bytes after the break are taken and dropped.
-        assert_eq!(d.feed(&a), a.len());
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Protocol(9))));
-        assert_eq!(d.buffered(), 0);
+        assert_eq!(d.push(&a), a.len());
+        assert_eq!(d.next(), None);
+        assert_eq!(d.failed(), Some(&Fail::Protocol(FrameError::Protocol(9))));
     }
 
     #[test]
@@ -1263,12 +1206,12 @@ mod tests {
         let one = Frame { transaction: 1, unit: 1, pdu: vec![3, 0, 0, 0, 1] }.to_bytes().unwrap();
         let stream: Vec<u8> = one.iter().copied().cycle().take(one.len() * 200_000).collect();
         let started = std::time::Instant::now();
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames);
         let mut rest = &stream[..];
         let mut n = 0;
         while !rest.is_empty() {
-            rest = &rest[d.feed(rest)..];
-            while let Some(f) = d.next_frame() {
+            rest = &rest[d.push(rest)..];
+            while let Some(f) = d.next() {
                 f.unwrap();
                 n += 1;
             }
@@ -1278,42 +1221,25 @@ mod tests {
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
     }
 
-    /// Feeds `data` in chunks of `chunk` bytes, taking frames out after
-    /// each feed. Every frame, then the error that broke the stream, if one
-    /// did.
-    fn split(data: &[u8], chunk: usize) -> (Vec<Frame>, Option<FrameError>) {
-        let mut d = Decoder::new();
+    fn split(data: &[u8]) -> Vec<Frame> {
+        contract::check_decode(|| Frames, data);
+        let mut stream = Stream::new(Frames);
         let mut frames = Vec::new();
-        for piece in data.chunks(chunk) {
-            let mut rest = piece;
-            while !rest.is_empty() {
-                let took = d.feed(rest);
-                assert!(d.buffered() <= MAX_BUFFERED);
-                rest = &rest[took..];
-                let mut progress = took > 0;
-                while let Some(r) = d.next_frame() {
-                    match r {
-                        Ok(f) => frames.push(f),
-                        Err(e) => return (frames, Some(e)),
-                    }
-                    progress = true;
-                }
-                assert!(progress, "a full decoder gave nothing");
-            }
-        }
-        (frames, None)
+        pump(&mut stream, data, |frame| frames.push(frame)).unwrap();
+        finish(&mut stream, |frame| frames.push(frame)).unwrap();
+        frames
     }
 
     #[test]
     fn review_decoder_holds_at_most_max_buffered() {
         // 64 KiB of zeros in one feed: the decoder takes only what it may
         // hold, and the header it sees is already broken.
-        let mut d = Decoder::new();
+        let mut d = Stream::new(Frames);
         let zeros = vec![0u8; 64 * 1024];
-        let took = d.feed(&zeros);
-        assert!(took <= MAX_BUFFERED);
-        assert!(d.buffered() <= MAX_BUFFERED);
-        assert_eq!(d.next_frame(), Some(Err(FrameError::Length(0))));
+        let took = d.push(&zeros);
+        assert!(took <= MAX_FRAME);
+        assert!(d.buffered() <= MAX_FRAME);
+        assert_eq!(d.next(), Some(Err(Fail::Protocol(FrameError::Length(0)))));
         // Many longest frames fed in one go come out the same as fed in
         // other chunk sizes, and the buffer never grows past the bound.
         let mut stream = Vec::new();
@@ -1322,18 +1248,13 @@ mod tests {
             pdu.resize(MAX_PDU, t as u8);
             stream.extend(Frame { transaction: t, unit: 1, pdu }.to_bytes().unwrap());
         }
-        let whole = split(&stream, stream.len());
-        assert_eq!(whole.0.len(), 50);
-        assert_eq!(whole.1, None);
-        for chunk in [1, 7, 259, 260, 261, 1000] {
-            assert_eq!(split(&stream, chunk), whole, "chunks of {chunk}");
-        }
+        assert_eq!(split(&stream).len(), 50);
         // A decoder that is full gives room back once frames are taken out.
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&stream), MAX_BUFFERED);
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), 0);
-        assert!(d.next_frame().unwrap().is_ok());
-        assert_eq!(d.feed(&stream[MAX_BUFFERED..]), MAX_FRAME);
+        let mut d = Stream::new(Frames);
+        assert_eq!(d.push(&stream), MAX_FRAME);
+        assert_eq!(d.push(&stream[MAX_FRAME..]), 0);
+        assert!(d.next().unwrap().is_ok());
+        assert_eq!(d.push(&stream[MAX_FRAME..]), MAX_FRAME);
     }
 
     #[test]
@@ -1354,7 +1275,10 @@ mod tests {
         let req = Request::WriteMultipleCoils { address: 0, values: vec![true; 1969] };
         assert_eq!(req.to_pdu(), Err(EncodeError::Quantity));
         assert_eq!(Response::Registers(vec![7; 126]).to_pdu(3), Err(EncodeError::Quantity));
-        assert_eq!(Request::Other { function: 0x41, data: vec![0; MAX_PDU] }.to_pdu(), Err(EncodeError::TooLong));
+        assert_eq!(
+            Request::Other { function: 0x41, data: vec![0; MAX_PDU] }.to_pdu(),
+            Err(EncodeError::TooLong)
+        );
         assert_eq!(Response::Other(vec![0; MAX_PDU]).to_pdu(0x41), Err(EncodeError::TooLong));
         let frame = Frame { transaction: 0, unit: 0, pdu: vec![0; 1000] };
         assert_eq!(frame.to_bytes(), Err(EncodeError::TooLong));
@@ -1373,12 +1297,27 @@ mod tests {
 
     #[test]
     fn review_request_writers_check_quantity_and_range() {
-        assert_eq!(Request::ReadHoldingRegisters { address: 0, quantity: 0 }.to_pdu(), Err(EncodeError::Quantity));
-        assert_eq!(Request::ReadInputRegisters { address: 0, quantity: 126 }.to_pdu(), Err(EncodeError::Quantity));
+        assert_eq!(
+            Request::ReadHoldingRegisters { address: 0, quantity: 0 }.to_pdu(),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Request::ReadInputRegisters { address: 0, quantity: 126 }.to_pdu(),
+            Err(EncodeError::Quantity)
+        );
         assert_eq!(Request::ReadCoils { address: 0, quantity: 2001 }.to_pdu(), Err(EncodeError::Quantity));
-        assert_eq!(Request::ReadHoldingRegisters { address: 65535, quantity: 2 }.to_pdu(), Err(EncodeError::Address));
-        assert_eq!(Request::WriteMultipleRegisters { address: 0, values: vec![] }.to_pdu(), Err(EncodeError::Quantity));
-        assert_eq!(Request::WriteMultipleCoils { address: 0, values: vec![] }.to_pdu(), Err(EncodeError::Quantity));
+        assert_eq!(
+            Request::ReadHoldingRegisters { address: 65535, quantity: 2 }.to_pdu(),
+            Err(EncodeError::Address)
+        );
+        assert_eq!(
+            Request::WriteMultipleRegisters { address: 0, values: vec![] }.to_pdu(),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Request::WriteMultipleCoils { address: 0, values: vec![] }.to_pdu(),
+            Err(EncodeError::Quantity)
+        );
         assert_eq!(
             Request::WriteMultipleCoils { address: 65535, values: vec![true; 2] }.to_pdu(),
             Err(EncodeError::Address)
@@ -1400,9 +1339,18 @@ mod tests {
     fn review_response_writers_check_the_function() {
         assert_eq!(Response::Bits(vec![true]).to_pdu(3), Err(EncodeError::Function(3)));
         assert_eq!(Response::Registers(vec![1]).to_pdu(1), Err(EncodeError::Function(1)));
-        assert_eq!(Response::WriteSingleCoil { address: 0, value: true }.to_pdu(6), Err(EncodeError::Function(6)));
-        assert_eq!(Response::WriteSingleRegister { address: 0, value: 1 }.to_pdu(5), Err(EncodeError::Function(5)));
-        assert_eq!(Response::WriteMultiple { address: 0, quantity: 1 }.to_pdu(3), Err(EncodeError::Function(3)));
+        assert_eq!(
+            Response::WriteSingleCoil { address: 0, value: true }.to_pdu(6),
+            Err(EncodeError::Function(6))
+        );
+        assert_eq!(
+            Response::WriteSingleRegister { address: 0, value: 1 }.to_pdu(5),
+            Err(EncodeError::Function(5))
+        );
+        assert_eq!(
+            Response::WriteMultiple { address: 0, quantity: 1 }.to_pdu(3),
+            Err(EncodeError::Function(3))
+        );
         assert_eq!(Response::Bits(vec![true]).to_pdu(0x81), Err(EncodeError::Function(0x81)));
         // An exception answers any function.
         assert_eq!(Response::Exception(Exception::ServerDeviceBusy).to_pdu(0x41), Ok(vec![0xc1, 0x06]));
@@ -1433,9 +1381,18 @@ mod tests {
         assert_eq!(Response::Bits(vec![false; 2001]).to_pdu(1), Err(EncodeError::Quantity));
         assert_eq!(Response::Bits(vec![]).to_pdu(1), Err(EncodeError::Quantity));
         assert_eq!(Response::Registers(vec![]).to_pdu(3), Err(EncodeError::Quantity));
-        assert_eq!(Response::WriteMultiple { address: 0, quantity: 0 }.to_pdu(16), Err(EncodeError::Quantity));
-        assert_eq!(Response::WriteMultiple { address: 0, quantity: 124 }.to_pdu(16), Err(EncodeError::Quantity));
-        assert_eq!(Response::WriteMultiple { address: 65535, quantity: 2 }.to_pdu(15), Err(EncodeError::Address));
+        assert_eq!(
+            Response::WriteMultiple { address: 0, quantity: 0 }.to_pdu(16),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Response::WriteMultiple { address: 0, quantity: 124 }.to_pdu(16),
+            Err(EncodeError::Quantity)
+        );
+        assert_eq!(
+            Response::WriteMultiple { address: 65535, quantity: 2 }.to_pdu(15),
+            Err(EncodeError::Address)
+        );
         assert_eq!(Response::Other(vec![1]).to_pdu(0), Err(EncodeError::Function(0)));
         let pdu = Response::Bits(vec![true; 2000]).to_pdu(2).unwrap();
         assert_eq!(Response::parse(&pdu), Ok((2, Response::Bits(vec![true; 2000]))));
@@ -1446,7 +1403,10 @@ mod tests {
         let req = Request::Other { function: 3, data: vec![0, 0, 0, 1] };
         assert_eq!(req.to_pdu(), Err(EncodeError::Function(3)));
         assert_eq!(Request::Other { function: 0, data: vec![] }.to_pdu(), Err(EncodeError::Function(0)));
-        assert_eq!(Request::Other { function: 0x83, data: vec![2] }.to_pdu(), Err(EncodeError::Function(0x83)));
+        assert_eq!(
+            Request::Other { function: 0x83, data: vec![2] }.to_pdu(),
+            Err(EncodeError::Function(0x83))
+        );
         assert_eq!(Response::Other(vec![2, 0, 1]).to_pdu(3), Err(EncodeError::Function(3)));
         assert_eq!(Response::Other(vec![2]).to_pdu(0x83), Err(EncodeError::Function(0x83)));
         // An exception's code is what makes it, so `Other(1)` reads back

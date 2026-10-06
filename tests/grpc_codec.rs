@@ -1,5 +1,5 @@
 use fictionet::stdlib::codec::{
-    Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Stream, contract, finish, pump,
+    Carry, Decode, Demux, Fail, Layered, Pipe, PipeError, Step, Stream, Wire, contract, finish, pump,
 };
 use fictionet::stdlib::grpc::{FrameError, HEADER_LEN, Message, Messages};
 use std::collections::BTreeMap;
@@ -24,66 +24,24 @@ struct Data<'a> {
 
 fn frames() -> [Data<'static>; 11] {
     [
-        Data {
-            key: (0, 1),
-            payload: &[0, 0],
-            end: false,
-        },
-        Data {
-            key: (0, 3),
-            payload: &[1, 0, 0],
-            end: false,
-        },
-        Data {
-            key: (0, 5),
-            payload: &[0, 0, 0, 0],
-            end: false,
-        },
-        Data {
-            key: (0, 1),
-            payload: &[0, 0, 5, b'a'],
-            end: false,
-        },
-        Data {
-            key: (0, 3),
-            payload: &[0, 3, 0xff],
-            end: false,
-        },
+        Data { key: (0, 1), payload: &[0, 0], end: false },
+        Data { key: (0, 3), payload: &[1, 0, 0], end: false },
+        Data { key: (0, 5), payload: &[0, 0, 0, 0], end: false },
+        Data { key: (0, 1), payload: &[0, 0, 5, b'a'], end: false },
+        Data { key: (0, 3), payload: &[0, 3, 0xff], end: false },
         // Only the final header byte arrives. There is no oversized body.
-        Data {
-            key: (0, 5),
-            payload: &[9],
-            end: false,
-        },
-        Data {
-            key: (0, 7),
-            payload: &[0, 0, 0, 0, 4, b't'],
-            end: true,
-        },
-        Data {
-            key: (1, 1),
-            payload: &[0, 0, 0, 0, 1, b'r'],
-            end: true,
-        },
+        Data { key: (0, 5), payload: &[9], end: false },
+        Data { key: (0, 7), payload: &[0, 0, 0, 0, 4, b't'], end: true },
+        Data { key: (1, 1), payload: &[0, 0, 0, 0, 1, b'r'], end: true },
         // Finishes the first body, then carries two complete messages.
         // This payload is larger than one gRPC driver's buffer.
         Data {
             key: (0, 1),
-            payload: &[
-                b'b', b'c', b'd', b'e', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, b'x', b'y',
-            ],
+            payload: &[b'b', b'c', b'd', b'e', 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, b'x', b'y'],
             end: false,
         },
-        Data {
-            key: (0, 3),
-            payload: &[0, 0x7f],
-            end: true,
-        },
-        Data {
-            key: (0, 1),
-            payload: &[],
-            end: true,
-        },
+        Data { key: (0, 3), payload: &[0, 0x7f], end: true },
+        Data { key: (0, 1), payload: &[], end: true },
     ]
 }
 
@@ -95,14 +53,12 @@ fn drain(calls: &mut Calls, results: &mut Results) {
 }
 
 fn route(chunk_size: usize) {
-    let mut calls = Calls::new(MAX_STREAMS, MAX_BYTES, |_| {
-        Messages::with_limit(MESSAGE_LIMIT)
-    });
+    let mut calls = Calls::new(MAX_STREAMS, MAX_BYTES, |_| Messages::with_limit(MESSAGE_LIMIT));
     let mut results = Results::new();
     let mut saw_backpressure = false;
     for frame in frames() {
         assert!(frame.payload.len() <= MAX_DATA);
-        for chunk in frame.payload.chunks(chunk_size) {
+        for chunk in fictionet::stdlib::codec::test_support::chunks(frame.payload, &[chunk_size]) {
             let mut rest = chunk;
             while !rest.is_empty() {
                 let n = calls.push(&frame.key, rest);
@@ -118,10 +74,7 @@ fn route(chunk_size: usize) {
             let stream = calls.get_mut(&frame.key).unwrap();
             assert_eq!(
                 stream.failed(),
-                Some(&Fail::Protocol(FrameError::TooLarge {
-                    length: 9,
-                    limit: MESSAGE_LIMIT,
-                }))
+                Some(&Fail::Protocol(FrameError::TooLarge { length: 9, limit: MESSAGE_LIMIT }))
             );
             assert_eq!(stream.buffered(), HEADER_LEN);
             assert_eq!(stream.held(), 0);
@@ -139,39 +92,15 @@ fn route(chunk_size: usize) {
         (
             (0, 1),
             vec![
-                Ok(Message {
-                    compressed: false,
-                    data: b"abcde".to_vec(),
-                }),
+                Ok(Message { compressed: false, data: b"abcde".to_vec() }),
                 Ok(Message::default()),
-                Ok(Message {
-                    compressed: false,
-                    data: b"xy".to_vec(),
-                }),
+                Ok(Message { compressed: false, data: b"xy".to_vec() }),
             ],
         ),
-        (
-            (0, 3),
-            vec![Ok(Message {
-                compressed: true,
-                data: vec![0xff, 0, 0x7f],
-            })],
-        ),
-        (
-            (0, 5),
-            vec![Err(Fail::Protocol(FrameError::TooLarge {
-                length: 9,
-                limit: MESSAGE_LIMIT,
-            }))],
-        ),
+        ((0, 3), vec![Ok(Message { compressed: true, data: vec![0xff, 0, 0x7f] })]),
+        ((0, 5), vec![Err(Fail::Protocol(FrameError::TooLarge { length: 9, limit: MESSAGE_LIMIT }))]),
         ((0, 7), vec![Err(Fail::Truncated { unread: 6 })]),
-        (
-            (1, 1),
-            vec![Ok(Message {
-                compressed: false,
-                data: b"r".to_vec(),
-            })],
-        ),
+        ((1, 1), vec![Ok(Message { compressed: false, data: b"r".to_vec() })]),
     ]);
     assert_eq!(results, expected);
     assert_eq!(calls.len(), MAX_STREAMS);
@@ -185,11 +114,7 @@ fn route(chunk_size: usize) {
             let mut stream = Stream::new(Messages::with_limit(MESSAGE_LIMIT));
             let mut decoded = Vec::new();
             for byte in &bytes {
-                assert_eq!(
-                    pump(&mut stream, core::slice::from_ref(byte), |m| decoded
-                        .push(m)),
-                    Ok(1)
-                );
+                assert_eq!(pump(&mut stream, core::slice::from_ref(byte), |m| decoded.push(m)), Ok(1));
             }
             finish(&mut stream, |m| decoded.push(m)).unwrap();
             assert_eq!(decoded, std::slice::from_ref(message));
@@ -274,14 +199,7 @@ fn data_bytes(stream: u32, payloads: &[(&[u8], bool)]) -> Vec<u8> {
 #[test]
 fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
     let make = || {
-        Pipe::new(
-            DataFrames {
-                stream: 1,
-                ended: false,
-            },
-            Messages::with_limit(MESSAGE_LIMIT),
-            Carry::Bytes,
-        )
+        Pipe::new(DataFrames { stream: 1, ended: false }, Messages::with_limit(MESSAGE_LIMIT), Carry::Bytes)
     };
     let cases = [
         (
@@ -294,28 +212,16 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
                 ],
             ),
             vec![
-                Message {
-                    compressed: false,
-                    data: b"abc".to_vec(),
-                },
-                Message {
-                    compressed: true,
-                    data: vec![],
-                },
-                Message {
-                    compressed: false,
-                    data: b"z".to_vec(),
-                },
+                Message { compressed: false, data: b"abc".to_vec() },
+                Message { compressed: true, data: vec![] },
+                Message { compressed: false, data: b"z".to_vec() },
             ],
             None,
         ),
         (
             data_bytes(1, &[(&[0, 0], false), (&[0, 0, 9], false)]),
             vec![],
-            Some(Fail::Protocol(FrameError::TooLarge {
-                length: 9,
-                limit: MESSAGE_LIMIT,
-            })),
+            Some(Fail::Protocol(FrameError::TooLarge { length: 9, limit: MESSAGE_LIMIT })),
         ),
         (
             data_bytes(1, &[(&[0, 0], false), (&[0, 0, 4, b'x'], true)]),
@@ -329,7 +235,7 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
             let mut stream = Stream::new(make());
             let mut items = Vec::new();
             let mut failed = None;
-            for chunk in bytes.chunks(chunk_size) {
+            for chunk in fictionet::stdlib::codec::test_support::chunks(&bytes, &[chunk_size]) {
                 match pump(&mut stream, chunk, |item| items.push(item)) {
                     Ok(n) => assert_eq!(n, chunk.len()),
                     Err(e) => {
@@ -341,18 +247,8 @@ fn pipe_carries_http2_data_across_frames_and_checks_inner_eof() {
             if failed.is_none() {
                 failed = finish(&mut stream, |item| items.push(item)).err();
             }
-            assert_eq!(
-                items,
-                expected
-                    .iter()
-                    .cloned()
-                    .map(Layered::Inner)
-                    .collect::<Vec<_>>()
-            );
-            assert_eq!(
-                failed,
-                failure.clone().map(|e| Fail::Protocol(PipeError::Inner(e)))
-            );
+            assert_eq!(items, expected.iter().cloned().map(Layered::Inner).collect::<Vec<_>>());
+            assert_eq!(failed, failure.clone().map(|e| Fail::Protocol(PipeError::Inner(e))));
             assert_eq!(stream.failed(), failed.as_ref());
             assert!(stream.is_done());
             assert_eq!(stream.next(), None);

@@ -13,7 +13,7 @@
 //! Nothing here reads a socket or speaks HTTP/2. A world that plays a gRPC
 //! server takes a stream's headers from its HTTP/2 code and checks them
 //! with [`Request::parse`]. It feeds the stream's DATA bytes to a
-//! [`Decoder`] and gets [`Message`]s back. Each message body stays as
+//! [`Messages`] and gets [`Message`]s back. Each message body stays as
 //! bytes: reading it (as protobuf, JSON or anything else) is up to world
 //! code. So is the answer. The world writes [`response_headers`], each
 //! reply with [`Message::to_bytes`], and ends with [`Status::to_trailers`].
@@ -30,7 +30,8 @@
 //! refuses a message longer than its limit as soon as the length arrives.
 //!
 //! ```
-//! use fictionet::stdlib::grpc::{response_headers, Code, Decoder, Message, Request, Status};
+//! use fictionet::stdlib::codec::{Stream, Wire};
+//! use fictionet::stdlib::grpc::{response_headers, Code, Messages, Message, Request, Status};
 //!
 //! let request = Request::parse([
 //!     (":method", "POST"),
@@ -47,18 +48,19 @@
 //!
 //! // One DATA frame: an uncompressed message of 3 bytes.
 //! let data = [0, 0, 0, 0, 3, 0x0a, 0x01, b'x'];
-//! let mut decoder = Decoder::new();
-//! assert_eq!(decoder.feed(&data), data.len());
-//! let message = decoder.next_message().unwrap().unwrap();
+//! let mut decoder = Stream::new(Messages::new());
+//! assert_eq!(decoder.push(&data), data.len());
+//! let message = decoder.next().unwrap().unwrap();
 //! assert_eq!(message.data, [0x0a, 0x01, b'x']);
-//! assert!(decoder.finish().is_ok());
+//! decoder.end();
+//! assert_eq!(decoder.next(), None);
 //!
 //! // The reply: headers, the same message back, then the status.
 //! let headers = response_headers(&request.content_type);
 //! assert_eq!(headers[0], (":status".to_string(), "200".to_string()));
 //! let reply = Message { compressed: false, data: message.data }.to_bytes().unwrap();
 //! assert_eq!(reply, data);
-//! let trailers = Status::new(Code::NotFound, "no user 'x'").to_trailers();
+//! let trailers = Status::new(Code::NotFound, "no user 'x'").to_trailers().unwrap();
 //! assert_eq!(trailers[0], ("grpc-status".to_string(), "5".to_string()));
 //! assert_eq!(trailers[1], ("grpc-message".to_string(), "no user 'x'".to_string()));
 //! ```
@@ -77,7 +79,7 @@ pub const HEADER_LEN: usize = 5;
 /// The longest message this module reads or writes: 16 MiB. The format
 /// allows up to 4 GiB, but no decoder here holds more than this.
 pub const MAX_MESSAGE: usize = 16 * 1024 * 1024;
-/// The body limit a [`Decoder`] or [`Messages`] starts with: 4 MiB, the
+/// The body limit [`Messages`] starts with: 4 MiB, the
 /// default most gRPC servers use.
 pub const DEFAULT_MAX_MESSAGE: usize = 4 * 1024 * 1024;
 /// The largest request header block [`Request::parse`] accepts: 8 KiB, the
@@ -128,11 +130,6 @@ pub enum FrameError {
         /// The limit it broke.
         limit: usize,
     },
-    /// The stream ended inside a message.
-    Truncated {
-        /// How many bytes of the message had come.
-        buffered: usize,
-    },
 }
 
 impl FrameError {
@@ -141,7 +138,7 @@ impl FrameError {
     pub fn code(self) -> Code {
         match self {
             FrameError::TooLarge { .. } => Code::ResourceExhausted,
-            FrameError::Flag(_) | FrameError::Truncated { .. } => Code::Internal,
+            FrameError::Flag(_) => Code::Internal,
         }
     }
 
@@ -159,9 +156,6 @@ impl fmt::Display for FrameError {
             FrameError::TooLarge { length, limit } => {
                 write!(f, "message of {length} bytes, over the limit of {limit}")
             }
-            FrameError::Truncated { buffered } => {
-                write!(f, "stream ended inside a message, after {buffered} bytes")
-            }
         }
     }
 }
@@ -172,6 +166,11 @@ impl std::error::Error for FrameError {}
 /// The inherent [`Message::parse`] remains a prefix parser.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MessageParseError {
+    /// Input ended before a complete message.
+    Truncated {
+        /// Number of available bytes.
+        unread: usize,
+    },
     /// Invalid framing or an incomplete message, including empty input.
     Frame(FrameError),
     /// Bytes followed the first complete message.
@@ -184,6 +183,7 @@ pub enum MessageParseError {
 impl fmt::Display for MessageParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Truncated { unread } => write!(f, "message ended after {unread} bytes"),
             Self::Frame(e) => e.fmt(f),
             Self::Trailing { remaining } => write!(f, "trailing bytes after the message: {remaining}"),
         }
@@ -194,7 +194,7 @@ impl core::error::Error for MessageParseError {
     fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
         match self {
             Self::Frame(e) => Some(e),
-            Self::Trailing { .. } => None,
+            Self::Truncated { .. } | Self::Trailing { .. } => None,
         }
     }
 }
@@ -206,22 +206,6 @@ impl Message {
     /// `b` it took.
     pub fn parse(b: &[u8]) -> Result<Option<(Message, usize)>, FrameError> {
         parse_message(b, MAX_MESSAGE)
-    }
-
-    /// The message with its length prefix. A body longer than
-    /// [`MAX_MESSAGE`] is refused with [`FrameError::TooLarge`], whose
-    /// [`code`](FrameError::code) is the `RESOURCE_EXHAUSTED` a sender
-    /// ends the call with. Its `length` is the body's length, or
-    /// `u32::MAX` if that does not fit. [`Message::parse`] reads every
-    /// message this writes, and a [`Decoder`] reads it when the body is
-    /// within the decoder's own limit.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, FrameError> {
-        let len = message_length(self.data.len())?;
-        let mut out = Vec::with_capacity(HEADER_LEN.saturating_add(self.data.len()));
-        out.push(u8::from(self.compressed));
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(&self.data);
-        Ok(out)
     }
 
     /// Checks the compressed flag against the call's `grpc-encoding`. A
@@ -249,12 +233,8 @@ impl Wire for Message {
     fn parse(b: &[u8]) -> Result<Self, Self::ParseError> {
         match Message::parse(b).map_err(MessageParseError::Frame)? {
             Some((message, used)) if used == b.len() => Ok(message),
-            Some((_, used)) => Err(MessageParseError::Trailing {
-                remaining: b.len().saturating_sub(used),
-            }),
-            None => Err(MessageParseError::Frame(FrameError::Truncated {
-                buffered: b.len(),
-            })),
+            Some((_, used)) => Err(MessageParseError::Trailing { remaining: b.len().saturating_sub(used) }),
+            None => Err(MessageParseError::Truncated { unread: b.len() }),
         }
     }
 
@@ -305,9 +285,7 @@ impl Messages {
     /// Creates a decoder accepting at most `limit` body bytes per message.
     /// Limits above [`MAX_MESSAGE`] are clamped. Zero accepts empty bodies.
     pub fn with_limit(limit: usize) -> Self {
-        Self {
-            limit: limit.min(MAX_MESSAGE),
-        }
+        Self { limit: limit.min(MAX_MESSAGE) }
     }
 
     /// The largest accepted body, excluding its five-byte header.
@@ -358,178 +336,15 @@ fn parse_message(b: &[u8], limit: usize) -> Result<Option<(Message, usize)>, Fra
         Ok(n) if n <= limit => n,
         _ => return Err(FrameError::TooLarge { length, limit }),
     };
-    let end = HEADER_LEN
-        .checked_add(len)
-        .ok_or(FrameError::TooLarge { length, limit })?;
-    Ok(b.get(HEADER_LEN..end).map(|data| {
-        (
-            Message {
-                compressed: flag == 1,
-                data: data.to_vec(),
-            },
-            end,
-        )
-    }))
+    let end = HEADER_LEN.checked_add(len).ok_or(FrameError::TooLarge { length, limit })?;
+    Ok(b.get(HEADER_LEN..end).map(|data| (Message { compressed: flag == 1, data: data.to_vec() }, end)))
 }
 
 fn message_length(len: usize) -> Result<u32, FrameError> {
     match u32::try_from(len) {
         Ok(n) if len <= MAX_MESSAGE => Ok(n),
-        Ok(n) => Err(FrameError::TooLarge {
-            length: n,
-            limit: MAX_MESSAGE,
-        }),
-        Err(_) => Err(FrameError::TooLarge {
-            length: u32::MAX,
-            limit: MAX_MESSAGE,
-        }),
-    }
-}
-
-/// Splits a call's DATA bytes into messages. Feed it the bytes in order
-/// and take messages out until it has none. It holds at most one message,
-/// so `feed` stops taking bytes once a whole message is waiting.
-///
-/// ```
-/// use fictionet::stdlib::grpc::Decoder;
-///
-/// let stream = [0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 1, 8];
-/// let mut decoder = Decoder::new();
-/// let mut rest = &stream[..];
-/// let mut bodies = Vec::new();
-/// loop {
-///     let used = decoder.feed(rest);
-///     rest = &rest[used..];
-///     match decoder.next_message() {
-///         Some(Ok(m)) => bodies.push(m.data),
-///         Some(Err(e)) => panic!("{e}"),
-///         None => break,
-///     }
-/// }
-/// assert_eq!(bodies, [[7], [8]]);
-/// ```
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Decoder {
-    limit: usize,
-    head: [u8; HEADER_LEN],
-    head_len: usize,
-    want: usize,
-    body: Vec<u8>,
-    ready: bool,
-    failed: Option<FrameError>,
-}
-
-impl Default for Decoder {
-    fn default() -> Decoder {
-        Decoder::new()
-    }
-}
-
-impl Decoder {
-    /// A decoder holding no bytes, with the limit [`DEFAULT_MAX_MESSAGE`].
-    pub fn new() -> Decoder {
-        Decoder::with_limit(DEFAULT_MAX_MESSAGE)
-    }
-
-    /// A decoder that refuses messages longer than `limit` bytes. A limit
-    /// above [`MAX_MESSAGE`] is lowered to it.
-    pub fn with_limit(limit: usize) -> Decoder {
-        Decoder {
-            limit: limit.min(MAX_MESSAGE),
-            head: [0; HEADER_LEN],
-            head_len: 0,
-            want: 0,
-            body: Vec::new(),
-            ready: false,
-            failed: None,
-        }
-    }
-
-    /// The longest message this decoder accepts.
-    pub fn limit(&self) -> usize {
-        self.limit
-    }
-
-    /// Takes bytes from the start of `bytes` and returns how many it took.
-    /// It stops after the end of a message, and takes no more until that
-    /// message is taken out with [`next_message`](Self::next_message).
-    /// After a [`FrameError`] it takes every byte and drops it.
-    pub fn feed(&mut self, bytes: &[u8]) -> usize {
-        if self.failed.is_some() {
-            return bytes.len();
-        }
-        let mut used = 0;
-        while used < bytes.len() && !self.ready {
-            let rest = &bytes[used..];
-            if self.head_len < HEADER_LEN {
-                let n = (HEADER_LEN - self.head_len).min(rest.len());
-                self.head[self.head_len..self.head_len + n].copy_from_slice(&rest[..n]);
-                self.head_len += n;
-                used += n;
-                if self.head[0] > 1 {
-                    return self.fail(FrameError::Flag(self.head[0]), bytes.len());
-                }
-                if self.head_len == HEADER_LEN {
-                    let h = self.head;
-                    let length = u32::from_be_bytes([h[1], h[2], h[3], h[4]]);
-                    match usize::try_from(length) {
-                        Ok(n) if n <= self.limit => self.want = n,
-                        _ => {
-                            let e = FrameError::TooLarge { length, limit: self.limit };
-                            return self.fail(e, bytes.len());
-                        }
-                    }
-                    self.body = Vec::new();
-                    self.ready = self.want == 0;
-                }
-            } else {
-                let n = (self.want - self.body.len()).min(rest.len());
-                self.body.extend_from_slice(&rest[..n]);
-                used += n;
-                self.ready = self.body.len() == self.want;
-            }
-        }
-        used
-    }
-
-    fn fail(&mut self, e: FrameError, all: usize) -> usize {
-        self.failed = Some(e);
-        self.head_len = 0;
-        self.body = Vec::new();
-        self.ready = false;
-        all
-    }
-
-    /// The next whole message, if one has come. It returns `None` when it
-    /// needs more bytes, and keeps returning the same error once the
-    /// stream has broken.
-    pub fn next_message(&mut self) -> Option<Result<Message, FrameError>> {
-        if let Some(e) = self.failed {
-            return Some(Err(e));
-        }
-        if !self.ready {
-            return None;
-        }
-        self.ready = false;
-        self.head_len = 0;
-        Some(Ok(Message { compressed: self.head[0] == 1, data: std::mem::take(&mut self.body) }))
-    }
-
-    /// Checks that the stream can end here: at end of stream, the bytes
-    /// held must not be part of a message.
-    pub fn finish(&self) -> Result<(), FrameError> {
-        if let Some(e) = self.failed {
-            return Err(e);
-        }
-        if self.head_len > 0 && !self.ready {
-            return Err(FrameError::Truncated { buffered: self.buffered() });
-        }
-        Ok(())
-    }
-
-    /// How many bytes are held, prefix included.
-    pub fn buffered(&self) -> usize {
-        if self.head_len == 0 { 0 } else { self.head_len + self.body.len() }
+        Ok(n) => Err(FrameError::TooLarge { length: n, limit: MAX_MESSAGE }),
+        Err(_) => Err(FrameError::TooLarge { length: u32::MAX, limit: MAX_MESSAGE }),
     }
 }
 
@@ -700,7 +515,7 @@ impl Status {
     /// A status with this code and message. A message longer than
     /// [`MAX_STATUS_MESSAGE`] bytes is cut at a character boundary.
     pub fn new(code: Code, message: &str) -> Status {
-        Status { code, message: floor_char(message, MAX_STATUS_MESSAGE).to_string() }
+        Status { code, message: clip_text(message, MAX_STATUS_MESSAGE).to_string() }
     }
 
     /// The status of a call that succeeded, with no message.
@@ -715,23 +530,22 @@ impl Status {
 
     /// The trailers that end a call: `grpc-status`, then `grpc-message`
     /// if the message is not empty. Custom metadata may follow them. A
-    /// message longer than [`MAX_STATUS_MESSAGE`] bytes is cut, as
-    /// [`encode_message`] does, so it reads back shorter.
-    pub fn to_trailers(&self) -> Vec<(String, String)> {
+    /// message longer than [`MAX_STATUS_MESSAGE`] bytes returns an error.
+    pub fn to_trailers(&self) -> Result<Vec<(String, String)>, HeaderError> {
         let mut out = vec![("grpc-status".to_string(), self.code.number().to_string())];
         if !self.message.is_empty() {
-            out.push(("grpc-message".to_string(), encode_message(&self.message)));
+            out.push(("grpc-message".to_string(), encode_message(&self.message)?));
         }
-        out
+        Ok(out)
     }
 
     /// The single header block of a call that fails before any message:
     /// `:status` 200, the content-type, then the trailers. The HTTP/2
     /// HEADERS frame carrying it ends the stream.
-    pub fn trailers_only(&self, content_type: &ContentType) -> Vec<(String, String)> {
+    pub fn trailers_only(&self, content_type: &ContentType) -> Result<Vec<(String, String)>, HeaderError> {
         let mut out = response_headers(content_type);
-        out.extend(self.to_trailers());
-        out
+        out.extend(self.to_trailers()?);
+        Ok(out)
     }
 
     /// Reads a status from trailers, or from a trailers-only header block.
@@ -783,7 +597,9 @@ impl Status {
         let from_http = |h: u16| Status::new(Code::from_http_status(h), &format!("HTTP status {h}"));
         match (t.status(), t.http) {
             (_, Some(h)) if !t.grpc_type && h != 200 => from_http(h),
-            (_, Some(_)) if !t.grpc_type => Status::new(Code::Unknown, &TrailerError::ContentType.to_string()),
+            (_, Some(_)) if !t.grpc_type => {
+                Status::new(Code::Unknown, &TrailerError::ContentType.to_string())
+            }
             (Ok(s), _) => s,
             (Err(TrailerError::MissingStatus), Some(h)) if h != 200 => from_http(h),
             (Err(e @ TrailerError::BadDetails), _) => Status::new(Code::Internal, &e.to_string()),
@@ -910,10 +726,12 @@ pub fn response_headers(content_type: &ContentType) -> Vec<(String, String)> {
 /// Percent-encodes status message text for `grpc-message`. Bytes from
 /// space to `~` stay as they are, except `%`. Every other byte of the
 /// UTF-8 becomes `%` and two capital hex digits. Text longer than
-/// [`MAX_STATUS_MESSAGE`] bytes is cut at a character boundary first.
-pub fn encode_message(text: &str) -> String {
+/// [`MAX_STATUS_MESSAGE`] bytes returns an error.
+pub fn encode_message(text: &str) -> Result<String, HeaderError> {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let text = floor_char(text, MAX_STATUS_MESSAGE);
+    if text.len() > MAX_STATUS_MESSAGE {
+        return Err(HeaderError::Value("grpc-message".into()));
+    }
     let mut out = String::with_capacity(text.len());
     for &b in text.as_bytes() {
         if (0x20..=0x7e).contains(&b) && b != b'%' {
@@ -924,7 +742,7 @@ pub fn encode_message(text: &str) -> String {
             out.push(char::from(HEX[usize::from(b & 15)]));
         }
     }
-    out
+    Ok(out)
 }
 
 /// Decodes a `grpc-message` value. It never fails, as the specification
@@ -950,7 +768,7 @@ pub fn decode_message(value: &[u8]) -> String {
         i += 1;
     }
     let text = String::from_utf8_lossy(&bytes);
-    floor_char(&text, MAX_STATUS_MESSAGE).to_string()
+    clip_text(&text, MAX_STATUS_MESSAGE).to_string()
 }
 
 // ---------------------------------------------------------------------
@@ -1325,14 +1143,15 @@ pub enum Rejection {
 
 impl Rejection {
     /// The header block that answers the request and ends the stream. An
-    /// HTTP status outside 400 to 599 cannot end a stream as a refusal
-    /// (1xx needs a final response after it, and the rest are not
-    /// errors or not HTTP statuses), so it is written as 500.
-    pub fn to_headers(&self) -> Vec<(String, String)> {
+    /// HTTP status outside 400 to 599 returns an error. A status message
+    /// above [`MAX_STATUS_MESSAGE`] also returns an error.
+    pub fn to_headers(&self) -> Result<Vec<(String, String)>, HeaderError> {
         match self {
             Rejection::Http(s) => {
-                let s = if (400..=599).contains(s) { *s } else { 500 };
-                vec![(":status".to_string(), s.to_string())]
+                if !(400..=599).contains(s) {
+                    return Err(HeaderError::Value(":status".into()));
+                }
+                Ok(vec![(":status".to_string(), s.to_string())])
             }
             Rejection::Status(s) => s.trailers_only(&ContentType::plain()),
         }
@@ -1392,7 +1211,8 @@ impl Request {
         N: AsRef<[u8]>,
         V: AsRef<[u8]>,
     {
-        const ONCE: [&[u8]; 6] = [b":method", b":scheme", b":path", b"content-type", b"grpc-timeout", b"grpc-encoding"];
+        const ONCE: [&[u8]; 6] =
+            [b":method", b":scheme", b":path", b"content-type", b"grpc-timeout", b"grpc-encoding"];
         let mut seen: [Option<Vec<u8>>; 6] = Default::default();
         let mut size: usize = 0;
         let mut authority = None;
@@ -1512,7 +1332,9 @@ impl Request {
                 _ => return Err(HeaderError::Value(name.clone())),
             }
         }
-        let size = out.iter().fold(0usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(v.len()).saturating_add(32));
+        let size = out
+            .iter()
+            .fold(0usize, |n, (k, v)| n.saturating_add(k.len()).saturating_add(v.len()).saturating_add(32));
         if size > MAX_HEADER_LIST {
             return Err(HeaderError::TooLarge(size));
         }
@@ -1526,7 +1348,7 @@ impl Request {
 
 /// The longest start of `s` that is at most `max` bytes and ends on a
 /// character boundary.
-fn floor_char(s: &str, max: usize) -> &str {
+fn clip_text(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
     }
@@ -1603,7 +1425,8 @@ fn is_connection_header(name: &str) -> bool {
 
 /// Whether `name` is a gRPC metadata name: one or more of `0-9 a-z _ - .`.
 fn is_metadata_name(name: &str) -> bool {
-    !name.is_empty() && name.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || b"_-.".contains(&c))
+    !name.is_empty()
+        && name.bytes().all(|c| c.is_ascii_digit() || c.is_ascii_lowercase() || b"_-.".contains(&c))
 }
 
 fn base64_digit(c: u8) -> Option<u8> {
@@ -1716,6 +1539,7 @@ fn trim(mut b: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stdlib::codec::test_support::Lcg;
     use crate::stdlib::codec::{Decode, Fail, Stream, contract, finish, pump, test_support};
 
     #[test]
@@ -1730,10 +1554,7 @@ mod tests {
             assert!(d.capacity() <= codec::Buffer::MAX_LIMIT);
         }
         for flag in 2..=255 {
-            assert_eq!(
-                Messages::new().decode(&[flag], false),
-                Err(FrameError::Flag(flag))
-            );
+            assert_eq!(Messages::new().decode(&[flag], false), Err(FrameError::Flag(flag)));
         }
         for (limit, header, length) in [
             (0, [0, 0, 0, 0, 1], 1),
@@ -1759,10 +1580,7 @@ mod tests {
         }
         let mut empty = Messages::with_limit(0);
         for compressed in [false, true] {
-            let message = Message {
-                compressed,
-                data: vec![],
-            };
+            let message = Message { compressed, data: vec![] };
             assert_eq!(
                 empty.decode(&message.to_bytes().unwrap(), false),
                 Ok(Step::Item(message, HEADER_LEN))
@@ -1772,10 +1590,7 @@ mod tests {
 
     #[test]
     fn messages_eof_at_every_prefix() {
-        let message = Message {
-            compressed: true,
-            data: b"opaque bytes".to_vec(),
-        };
+        let message = Message { compressed: true, data: b"opaque bytes".to_vec() };
         let bytes = message.to_bytes().unwrap();
         for cut in 0..=bytes.len() {
             let prefix = bytes.get(..cut).unwrap();
@@ -1797,10 +1612,7 @@ mod tests {
     #[test]
     fn messages_bytewise_and_raw_ranges() {
         const LIMIT: usize = 64 * 1024;
-        let message = Message {
-            compressed: true,
-            data: vec![0xa5; LIMIT],
-        };
+        let message = Message { compressed: true, data: vec![0xa5; LIMIT] };
         let bytes = message.to_bytes().unwrap();
         let mut stream = Stream::new(Messages::with_limit(LIMIT));
         for (at, byte) in bytes.iter().enumerate() {
@@ -1825,32 +1637,22 @@ mod tests {
 
     #[test]
     fn message_wire_exact_parse_preserves_prefix_api() {
-        let message = Message {
-            compressed: true,
-            data: vec![0xff, 0, 7],
-        };
+        let message = Message { compressed: true, data: vec![0xff, 0, 7] };
         let bytes = message.to_bytes().unwrap();
         assert_eq!(<Message as Wire>::parse(&bytes), Ok(message.clone()));
         assert_eq!(Wire::to_bytes(&message), Ok(bytes.clone()));
         for cut in 0..bytes.len() {
             assert_eq!(
                 <Message as Wire>::parse(bytes.get(..cut).unwrap()),
-                Err(MessageParseError::Frame(FrameError::Truncated {
-                    buffered: cut
-                }))
+                Err(MessageParseError::Truncated { unread: cut })
             );
         }
         for tail in [&[0xff][..], &[0, 0, 0, 0, 0]] {
             let joined = [bytes.as_slice(), tail].concat();
-            assert_eq!(
-                Message::parse(&joined),
-                Ok(Some((message.clone(), bytes.len())))
-            );
+            assert_eq!(Message::parse(&joined), Ok(Some((message.clone(), bytes.len()))));
             assert_eq!(
                 <Message as Wire>::parse(&joined),
-                Err(MessageParseError::Trailing {
-                    remaining: tail.len()
-                })
+                Err(MessageParseError::Trailing { remaining: tail.len() })
             );
         }
         let error = MessageParseError::Frame(FrameError::Flag(2));
@@ -1865,29 +1667,17 @@ mod tests {
     fn message_wire_appends_and_rolls_back() {
         let prefix = [0xaa, 0xbb];
         for compressed in [false, true] {
-            let message = Message {
-                compressed,
-                data: vec![1, 2, 3],
-            };
+            let message = Message { compressed, data: vec![1, 2, 3] };
             let mut out = prefix.to_vec();
             message.write(&mut out).unwrap();
-            assert_eq!(
-                out,
-                [prefix.as_slice(), &message.to_bytes().unwrap()].concat()
-            );
+            assert_eq!(out, [prefix.as_slice(), &message.to_bytes().unwrap()].concat());
             contract::check_wire_value(&message);
         }
-        let too_large = Message {
-            compressed: false,
-            data: vec![0; MAX_MESSAGE + 1],
-        };
+        let too_large = Message { compressed: false, data: vec![0; MAX_MESSAGE + 1] };
         let mut out = prefix.to_vec();
         assert_eq!(
             too_large.write(&mut out),
-            Err(FrameError::TooLarge {
-                length: MAX_MESSAGE as u32 + 1,
-                limit: MAX_MESSAGE,
-            })
+            Err(FrameError::TooLarge { length: MAX_MESSAGE as u32 + 1, limit: MAX_MESSAGE })
         );
         assert_eq!(out, prefix);
         contract::check_wire_value(&too_large);
@@ -1895,17 +1685,11 @@ mod tests {
 
     #[test]
     fn messages_and_wire_accept_maximum_body() {
-        let message = Message {
-            compressed: true,
-            data: vec![0x42; MAX_MESSAGE],
-        };
+        let message = Message { compressed: true, data: vec![0x42; MAX_MESSAGE] };
         let bytes = Wire::to_bytes(&message).unwrap();
         assert_eq!(<Message as Wire>::parse(&bytes), Ok(message.clone()));
         let mut stream = Stream::new(Messages::with_limit(usize::MAX));
-        assert_eq!(
-            pump(&mut stream, &bytes, |item| assert_eq!(item, message)),
-            Ok(bytes.len())
-        );
+        assert_eq!(pump(&mut stream, &bytes, |item| assert_eq!(item, message)), Ok(bytes.len()));
         finish(&mut stream, |_| panic!("extra message")).unwrap();
     }
 
@@ -1920,10 +1704,7 @@ mod tests {
 
             let mut bytes = Vec::new();
             for payload in data.chunks(8) {
-                let message = Message {
-                    compressed: rng.below(2) == 1,
-                    data: payload.to_vec(),
-                };
+                let message = Message { compressed: rng.below(2) == 1, data: payload.to_vec() };
                 let encoded = message.to_bytes().unwrap();
                 contract::check_wire::<Message>(&encoded);
                 bytes.extend(encoded);
@@ -1931,47 +1712,6 @@ mod tests {
             // Exercise accepted messages, small-limit refusals, and every EOF prefix.
             for limit in [0, 7, 8, MAX_MESSAGE] {
                 contract::check_decode_with_held_limit(|| Messages::with_limit(limit), &bytes, 0);
-            }
-        }
-    }
-
-    /// Everything a decoder gives for `data`, fed `chunk` bytes at a time.
-    fn decode(mut d: Decoder, data: &[u8], chunk: usize) -> Vec<Result<Message, FrameError>> {
-        let mut out = Vec::new();
-        for piece in data.chunks(chunk.max(1)) {
-            let mut rest = piece;
-            loop {
-                let used = d.feed(rest);
-                rest = &rest[used..];
-                match d.next_message() {
-                    Some(Ok(m)) => out.push(Ok(m)),
-                    Some(Err(e)) => {
-                        out.push(Err(e));
-                        return out;
-                    }
-                    None => break,
-                }
-            }
-            assert!(rest.is_empty());
-        }
-        out
-    }
-
-    /// Everything [`Message::parse`] finds in `data`, one after another.
-    fn parse_all(data: &[u8]) -> Vec<Result<Message, FrameError>> {
-        let mut out = Vec::new();
-        let mut at = 0;
-        loop {
-            match Message::parse(&data[at..]) {
-                Ok(Some((m, used))) => {
-                    out.push(Ok(m));
-                    at += used;
-                }
-                Ok(None) => return out,
-                Err(e) => {
-                    out.push(Err(e));
-                    return out;
-                }
             }
         }
     }
@@ -2004,7 +1744,10 @@ mod tests {
         assert_eq!(r.content_type.subtype(), Some("proto"));
         assert_eq!(r.encoding.as_deref(), Some("gzip"));
         assert!(!r.te_trailers);
-        assert_eq!(r.metadata, [("authorization".to_string(), b"Bearer y235.wef315yfh138vh31hv93hv8h3v".to_vec())]);
+        assert_eq!(
+            r.metadata,
+            [("authorization".to_string(), b"Bearer y235.wef315yfh138vh31hv93hv8h3v".to_vec())]
+        );
         // What it writes reads back the same, with te added.
         let again = Request::parse(strings(&r.to_headers().unwrap())).unwrap();
         assert!(again.te_trailers);
@@ -2020,7 +1763,7 @@ mod tests {
         );
         let trailers = [("grpc-status", "0"), ("trace-proto-bin", "jher831yy13JHy3hc")];
         assert_eq!(Status::parse_trailers(trailers), Ok(Status::ok()));
-        assert_eq!(strings(&Status::ok().to_trailers()), [("grpc-status", "0")]);
+        assert_eq!(strings(&Status::ok().to_trailers().unwrap()), [("grpc-status", "0")]);
     }
 
     #[test]
@@ -2037,25 +1780,21 @@ mod tests {
         let (b, used2) = Message::parse(&stream[8..]).unwrap().unwrap();
         assert_eq!((b, used2), (c.clone(), 5));
         assert_eq!(Message::parse(&stream[13..]), Ok(None));
-        assert_eq!(parse_all(&stream), [Ok(m), Ok(c)]);
+        contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), &stream);
     }
 
     #[test]
     fn every_truncated_prefix_waits() {
         let bytes = Message { compressed: true, data: (0..40).collect() }.to_bytes().unwrap();
+        contract::check_decode(Messages::new, &bytes);
         for n in 0..bytes.len() {
-            assert_eq!(Message::parse(&bytes[..n]), Ok(None), "{n} bytes");
-            let mut d = Decoder::new();
-            assert_eq!(d.feed(&bytes[..n]), n);
-            assert_eq!(d.next_message(), None);
-            assert_eq!(d.buffered(), n);
-            if n == 0 {
-                assert_eq!(d.finish(), Ok(()));
-            } else {
-                assert_eq!(d.finish(), Err(FrameError::Truncated { buffered: n }));
-            }
+            let mut stream = Stream::new(Messages::new());
+            assert_eq!(stream.push(&bytes[..n]), n);
+            assert_eq!(stream.next(), None);
+            stream.end();
+            assert_eq!(stream.next(), (n > 0).then_some(Err(Fail::Truncated { unread: n })));
+            assert_eq!(stream.next(), None);
         }
-        assert!(Message::parse(&bytes).unwrap().is_some());
     }
 
     #[test]
@@ -2064,61 +1803,60 @@ mod tests {
         assert_eq!(Message::parse(&[0xff, 0, 0]), Err(FrameError::Flag(0xff)));
         let big = (MAX_MESSAGE as u32 + 1).to_be_bytes();
         let b = [0, big[0], big[1], big[2], big[3]];
-        assert_eq!(Message::parse(&b), Err(FrameError::TooLarge { length: MAX_MESSAGE as u32 + 1, limit: MAX_MESSAGE }));
-        assert_eq!(Message::parse(&[0, 0xff, 0xff, 0xff, 0xff]), Err(FrameError::TooLarge { length: u32::MAX, limit: MAX_MESSAGE }));
+        assert_eq!(
+            Message::parse(&b),
+            Err(FrameError::TooLarge { length: MAX_MESSAGE as u32 + 1, limit: MAX_MESSAGE })
+        );
+        assert_eq!(
+            Message::parse(&[0, 0xff, 0xff, 0xff, 0xff]),
+            Err(FrameError::TooLarge { length: u32::MAX, limit: MAX_MESSAGE })
+        );
         // Exactly the limit is allowed, and waits for its bytes.
         let at = (MAX_MESSAGE as u32).to_be_bytes();
         assert_eq!(Message::parse(&[0, at[0], at[1], at[2], at[3]]), Ok(None));
         assert_eq!(FrameError::Flag(2).code(), Code::Internal);
         assert_eq!(FrameError::TooLarge { length: 9, limit: 1 }.code(), Code::ResourceExhausted);
-        assert_eq!(FrameError::Truncated { buffered: 1 }.to_status().code, Code::Internal);
+        assert_eq!(FrameError::Flag(2).to_status().code, Code::Internal);
         assert!(FrameError::TooLarge { length: 9, limit: 1 }.to_string().contains("limit of 1"));
     }
 
     #[test]
-    fn decoder_limit() {
-        let mut d = Decoder::with_limit(3);
-        assert_eq!(d.limit(), 3);
-        let ok = Message { compressed: false, data: vec![1, 2, 3] }.to_bytes().unwrap();
+    fn stream_limit() {
+        let mut stream = Stream::new(Messages::with_limit(3));
+        let ok = Message { compressed: false, data: vec![1, 2, 3] };
         let over = Message { compressed: false, data: vec![1, 2, 3, 4] }.to_bytes().unwrap();
-        let mut stream = ok.clone();
-        stream.extend(&over);
-        let got = decode(Decoder::with_limit(3), &stream, 1);
-        assert_eq!(got, [Ok(Message { compressed: false, data: vec![1, 2, 3] }), Err(FrameError::TooLarge { length: 4, limit: 3 })]);
-        // Refused as soon as the length is in, before the body.
-        assert_eq!(d.feed(&over[..5]), 5);
-        assert_eq!(d.next_message(), Some(Err(FrameError::TooLarge { length: 4, limit: 3 })));
-        // A broken stream stays broken, takes everything, and holds nothing.
-        assert_eq!(d.feed(&ok), ok.len());
-        assert_eq!(d.next_message(), Some(Err(FrameError::TooLarge { length: 4, limit: 3 })));
-        assert_eq!(d.buffered(), 0);
-        assert!(d.finish().is_err());
-        assert_eq!(Decoder::with_limit(usize::MAX).limit(), MAX_MESSAGE);
-        assert_eq!(Decoder::default().limit(), DEFAULT_MAX_MESSAGE);
+        assert_eq!(stream.push(&ok.to_bytes().unwrap()), 8);
+        assert_eq!(stream.next(), Some(Ok(ok)));
+        assert_eq!(stream.push(&over[..5]), 5);
+        let error = Fail::Protocol(FrameError::TooLarge { length: 4, limit: 3 });
+        assert_eq!(stream.next(), Some(Err(error.clone())));
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.failed(), Some(&error));
+        assert_eq!(stream.push(&over), over.len());
+        assert_eq!(Messages::with_limit(usize::MAX).limit(), MAX_MESSAGE);
+        assert_eq!(Messages::default().limit(), DEFAULT_MAX_MESSAGE);
     }
 
     #[test]
-    fn decoder_bad_flag_and_waiting_message() {
-        let mut d = Decoder::new();
-        assert_eq!(d.feed(&[0, 0, 0, 0, 1, 9, 0, 0]), 6);
-        assert_eq!(d.feed(&[0, 0]), 0);
-        assert_eq!(d.finish(), Ok(()));
-        assert_eq!(d.next_message(), Some(Ok(Message { compressed: false, data: vec![9] })));
-        assert_eq!(d.next_message(), None);
-        assert_eq!(d.feed(&[7, 0]), 2);
-        assert_eq!(d.next_message(), Some(Err(FrameError::Flag(7))));
+    fn stream_bad_flag_after_message() {
+        let mut stream = Stream::new(Messages::new());
+        assert_eq!(stream.push(&[0, 0, 0, 0, 1, 9, 7, 0]), 8);
+        assert_eq!(stream.next(), Some(Ok(Message { compressed: false, data: vec![9] })));
+        assert_eq!(stream.next(), Some(Err(Fail::Protocol(FrameError::Flag(7)))));
+        assert_eq!(stream.next(), None);
     }
 
     #[test]
     fn decoder_splits_a_stream() {
-        let msgs: Vec<Message> = (0..5u8)
-            .map(|i| Message { compressed: i % 2 == 1, data: vec![i; usize::from(i) * 3] })
-            .collect();
+        let msgs: Vec<Message> =
+            (0..5u8).map(|i| Message { compressed: i % 2 == 1, data: vec![i; usize::from(i) * 3] }).collect();
         let stream: Vec<u8> = msgs.iter().flat_map(|m| m.to_bytes().unwrap()).collect();
-        let want: Vec<_> = msgs.into_iter().map(Ok).collect();
-        for chunk in [1, 2, 3, 5, 7, stream.len()] {
-            assert_eq!(decode(Decoder::new(), &stream, chunk), want, "chunk {chunk}");
-        }
+        contract::check_decode(Messages::new, &stream);
+        let mut decoder = Stream::new(Messages::new());
+        let mut got = Vec::new();
+        codec::pump(&mut decoder, &stream, |message| got.push(message)).unwrap();
+        codec::finish(&mut decoder, |message| got.push(message)).unwrap();
+        assert_eq!(got, msgs);
     }
 
     #[test]
@@ -2135,12 +1873,12 @@ mod tests {
         let long = "é".repeat(MAX_STATUS_MESSAGE);
         let s = Status::new(Code::Internal, &long);
         assert!(s.message.len() <= MAX_STATUS_MESSAGE);
-        assert_eq!(Status::parse_trailers(strings(&s.to_trailers())), Ok(s.clone()));
+        assert_eq!(Status::parse_trailers(strings(&s.to_trailers().unwrap())), Ok(s.clone()));
         // A status's trailers fit in a request-sized header block.
-        let size: usize = s.trailers_only(&ContentType::plain()).iter().map(|(n, v)| n.len() + v.len() + 32).sum();
+        let size: usize =
+            s.trailers_only(&ContentType::plain()).unwrap().iter().map(|(n, v)| n.len() + v.len() + 32).sum();
         assert!(size <= MAX_HEADER_LIST);
-        let enc = encode_message(&"x".repeat(5000));
-        assert_eq!(enc.len(), MAX_STATUS_MESSAGE);
+        assert!(encode_message(&"x".repeat(5000)).is_err());
     }
 
     #[test]
@@ -2190,11 +1928,11 @@ mod tests {
 
     #[test]
     fn percent_encoding() {
-        assert_eq!(encode_message("hello world"), "hello world");
-        assert_eq!(encode_message("100%"), "100%25");
-        assert_eq!(encode_message("a\nb"), "a%0Ab");
-        assert_eq!(encode_message("\u{7f}"), "%7F");
-        assert_eq!(encode_message("日"), "%E6%97%A5");
+        assert_eq!(encode_message("hello world").unwrap(), "hello world");
+        assert_eq!(encode_message("100%").unwrap(), "100%25");
+        assert_eq!(encode_message("a\nb").unwrap(), "a%0Ab");
+        assert_eq!(encode_message("\u{7f}").unwrap(), "%7F");
+        assert_eq!(encode_message("日").unwrap(), "%E6%97%A5");
         assert_eq!(decode_message(b"%E6%97%A5 ok"), "日 ok");
         assert_eq!(decode_message(b"%e6%97%a5"), "日");
         // Broken escapes stay as they are.
@@ -2205,7 +1943,7 @@ mod tests {
         assert_eq!(decode_message(b"%FF!"), "\u{fffd}!");
         assert_eq!(decode_message(b""), "");
         for s in ["", "plain", "tab\there", "%%%", "naïve 🦀 50%", "~ !$&'()"] {
-            assert_eq!(decode_message(encode_message(s).as_bytes()), s);
+            assert_eq!(decode_message(encode_message(s).unwrap().as_bytes()), s);
         }
         let long = "y".repeat(3 * MAX_STATUS_MESSAGE);
         assert_eq!(decode_message(long.as_bytes()).len(), MAX_STATUS_MESSAGE);
@@ -2261,10 +1999,21 @@ mod tests {
     fn content_types() {
         assert_eq!(ContentType::parse(b"application/grpc"), Some(ContentType::plain()));
         assert_eq!(ContentType::parse(b"Application/GRPC+Proto").unwrap().subtype(), Some("proto"));
-        assert_eq!(ContentType::parse(b"application/grpc+json; charset=utf-8").unwrap().subtype(), Some("json"));
+        assert_eq!(
+            ContentType::parse(b"application/grpc+json; charset=utf-8").unwrap().subtype(),
+            Some("json")
+        );
         assert_eq!(ContentType::parse(b"application/grpc;x=y"), Some(ContentType::plain()));
         assert_eq!(ContentType::parse(b"  application/grpc  "), Some(ContentType::plain()));
-        for bad in [&b"application/json"[..], b"application/grpc-web", b"application/grpcx", b"application/grpc+", b"application/grp", b"", b"application/grpc+a b"] {
+        for bad in [
+            &b"application/json"[..],
+            b"application/grpc-web",
+            b"application/grpcx",
+            b"application/grpc+",
+            b"application/grp",
+            b"",
+            b"application/grpc+a b",
+        ] {
             assert_eq!(ContentType::parse(bad), None, "{:?}", String::from_utf8_lossy(bad));
         }
         let long = format!("application/grpc+{}", "a".repeat(MAX_SUBTYPE + 1));
@@ -2316,9 +2065,9 @@ mod tests {
         big.push(("x-filler", Box::leak(filler.into_boxed_str())));
         assert_eq!(code(Request::parse(big)), Code::ResourceExhausted);
         // Rejections write headers a client can read.
-        assert_eq!(strings(&Rejection::Http(415).to_headers()), [(":status", "415")]);
+        assert_eq!(strings(&Rejection::Http(415).to_headers().unwrap()), [(":status", "415")]);
         let r = Rejection::Status(Status::new(Code::Unimplemented, "unknown method /x"));
-        let h = r.to_headers();
+        let h = r.to_headers().unwrap();
         assert_eq!(Status::parse_trailers(strings(&h)).unwrap().code, Code::Unimplemented);
         assert!(r.to_string().starts_with("UNIMPLEMENTED"));
     }
@@ -2329,9 +2078,15 @@ mod tests {
         assert_eq!(Status::parse_trailers([("grpc-status", "")]), Err(TrailerError::BadStatus));
         assert_eq!(Status::parse_trailers([("grpc-status", "abc")]), Err(TrailerError::BadStatus));
         assert_eq!(Status::parse_trailers([("grpc-status", "99999999999")]), Err(TrailerError::BadStatus));
-        assert_eq!(Status::parse_trailers([("grpc-status", "1"), ("grpc-status", "1")]), Err(TrailerError::BadStatus));
+        assert_eq!(
+            Status::parse_trailers([("grpc-status", "1"), ("grpc-status", "1")]),
+            Err(TrailerError::BadStatus)
+        );
         assert_eq!(Status::parse_trailers([(":status", "503")]), Err(TrailerError::HttpStatus(503)));
-        assert_eq!(Status::parse_trailers([(":status", "x"), ("grpc-status", "0")]), Err(TrailerError::HttpStatus(0)));
+        assert_eq!(
+            Status::parse_trailers([(":status", "x"), ("grpc-status", "0")]),
+            Err(TrailerError::HttpStatus(0))
+        );
         // Unknown numbers read as UNKNOWN; names match any case.
         assert_eq!(Status::parse_trailers([("GRPC-STATUS", "42")]).unwrap().code, Code::Unknown);
         let s = Status::parse_trailers([
@@ -2356,8 +2111,8 @@ mod tests {
         for (code, _) in CODES {
             for msg in ["", "x", "100% wrong\r\n", "ünïcödé"] {
                 let s = Status::new(code, msg);
-                assert_eq!(Status::parse_trailers(strings(&s.to_trailers())), Ok(s.clone()));
-                let only = s.trailers_only(&ContentType::with_subtype("proto").unwrap());
+                assert_eq!(Status::parse_trailers(strings(&s.to_trailers().unwrap())), Ok(s.clone()));
+                let only = s.trailers_only(&ContentType::with_subtype("proto").unwrap()).unwrap();
                 assert_eq!(Status::parse_trailers(strings(&only)), Ok(s));
             }
         }
@@ -2367,7 +2122,8 @@ mod tests {
     fn grpc_status_wins_over_http_status() {
         // The HTTP mapping is only for responses with no grpc-status.
         let ct = ("content-type", "application/grpc");
-        let s = Status::from_trailers([(":status", "503"), ct, ("grpc-status", "5"), ("grpc-message", "gone")]);
+        let s =
+            Status::from_trailers([(":status", "503"), ct, ("grpc-status", "5"), ("grpc-message", "gone")]);
         assert_eq!(s, Status::new(Code::NotFound, "gone"));
         // A response that is not gRPC maps its HTTP status, whatever it says.
         assert_eq!(Status::from_trailers([(":status", "503"), ("grpc-status", "5")]).code, Code::Unavailable);
@@ -2381,7 +2137,10 @@ mod tests {
         assert_eq!(ContentType::parse(b"application/grpc +proto"), None);
         assert_eq!(ContentType::parse(b"application/grpc+ proto"), None);
         assert_eq!(ContentType::parse(b"application/grpc ;charset=utf-8"), Some(ContentType::plain()));
-        assert_eq!(ContentType::parse(b"application/grpc+proto ;x"), Some(ContentType::with_subtype("proto").unwrap()));
+        assert_eq!(
+            ContentType::parse(b"application/grpc+proto ;x"),
+            Some(ContentType::with_subtype("proto").unwrap())
+        );
     }
 
     #[test]
@@ -2402,13 +2161,11 @@ mod tests {
         let mut routes = std::collections::HashMap::new();
         routes.insert(path.clone(), 1);
         assert_eq!(routes.get(&back.path), Some(&1));
-        let mut d = Decoder::new();
-        d.feed(&[0, 0, 0, 0, 2, 7]);
-        let mut copy = d.clone();
-        assert_eq!(copy, d);
-        assert_eq!(copy.feed(&[8]), 1);
-        assert_eq!(copy.next_message(), Some(Ok(Message { compressed: false, data: vec![7, 8] })));
-        assert_eq!(d.buffered(), 6);
+        let mut stream = Stream::new(Messages::new());
+        assert_eq!(stream.push(&[0, 0, 0, 0, 2, 7]), 6);
+        assert_eq!(stream.next(), None);
+        assert_eq!(stream.push(&[8]), 1);
+        assert_eq!(stream.next(), Some(Ok(Message { compressed: false, data: vec![7, 8] })));
         assert!(Status::ok().is_ok());
         assert!(!Status::new(Code::Aborted, "").is_ok());
         assert_eq!(Message::default().to_bytes().unwrap(), [0; HEADER_LEN]);
@@ -2424,7 +2181,20 @@ mod tests {
         };
         // Names the parser would read as something else, that are not
         // gRPC metadata names, or that HTTP/2 forbids.
-        for name in ["grpc-timeout", "content-type", "te", "grpc-encoding", ":path", "Content-Type", "X-Test", "bad name", "", "connection", "upgrade", "transfer-encoding"] {
+        for name in [
+            "grpc-timeout",
+            "content-type",
+            "te",
+            "grpc-encoding",
+            ":path",
+            "Content-Type",
+            "X-Test",
+            "bad name",
+            "",
+            "connection",
+            "upgrade",
+            "transfer-encoding",
+        ] {
             assert_eq!(bad_name(name), Err(HeaderError::Name(name.to_string())), "{name:?}");
         }
         let bad_value = |name: &str, value: &[u8]| {
@@ -2432,7 +2202,16 @@ mod tests {
             r.metadata.push((name.to_string(), value.to_vec()));
             r.to_headers()
         };
-        for (name, value) in [("x-ctl", &b"a\x01b"[..]), ("x-tab", b"a\tb"), ("x-lead", b" a"), ("x-trail", b"a "), ("x-bin", b"!"), ("x-bin", b"abcde"), ("x-bin", b"ab=c"), ("x-bin", b"YQ")] {
+        for (name, value) in [
+            ("x-ctl", &b"a\x01b"[..]),
+            ("x-tab", b"a\tb"),
+            ("x-lead", b" a"),
+            ("x-trail", b"a "),
+            ("x-bin", b"!"),
+            ("x-bin", b"abcde"),
+            ("x-bin", b"ab=c"),
+            ("x-bin", b"YQ"),
+        ] {
             let got = bad_value(name, value);
             if name == "x-bin" && value == b"YQ" {
                 // Unpadded base64 is what gRPC sends.
@@ -2533,7 +2312,12 @@ mod tests {
     fn malformed_grpc_status_is_unknown_whatever_the_http_status() {
         let t = [(":status", "503"), ("content-type", "application/grpc"), ("grpc-status", "x")];
         assert_eq!(Status::from_trailers(t).code, Code::Unknown);
-        let t = [(":status", "503"), ("content-type", "application/grpc"), ("grpc-status", "1"), ("grpc-status", "1")];
+        let t = [
+            (":status", "503"),
+            ("content-type", "application/grpc"),
+            ("grpc-status", "1"),
+            ("grpc-status", "1"),
+        ];
         assert_eq!(Status::from_trailers(t).code, Code::Unknown);
     }
 
@@ -2573,7 +2357,21 @@ mod tests {
 
     #[test]
     fn method_paths_hold_only_uri_path_characters() {
-        for bad in ["Call#frag", "Call?x=1", "a\\b", "50%", "%zz", "%4", "a\"b", "a{b}", "a|b", "a^b", "a`b", "a[0]", "<a>"] {
+        for bad in [
+            "Call#frag",
+            "Call?x=1",
+            "a\\b",
+            "50%",
+            "%zz",
+            "%4",
+            "a\"b",
+            "a{b}",
+            "a|b",
+            "a^b",
+            "a`b",
+            "a[0]",
+            "<a>",
+        ] {
             assert_eq!(MethodPath::new("svc", bad), None, "{bad}");
             assert_eq!(MethodPath::new(bad, "m"), None, "{bad}");
         }
@@ -2584,29 +2382,21 @@ mod tests {
     }
 
     #[test]
-    fn http_rejections_write_a_final_error_status() {
-        for (code, want) in [(0, "500"), (103, "500"), (200, "500"), (65535, "500"), (400, "400"), (599, "599")] {
-            assert_eq!(strings(&Rejection::Http(code).to_headers()), [(":status", want)], "{code}");
+    fn http_rejections_require_a_final_error_status() {
+        for code in [0, 103, 200, 65535] {
+            assert!(Rejection::Http(code).to_headers().is_err());
         }
-    }
-
-    /// A small linear congruential generator, so the loop is the same on
-    /// every run.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u8 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u8
+        for (code, expected) in [(400, "400"), (599, "599")] {
+            assert_eq!(strings(&Rejection::Http(code).to_headers().unwrap()), [(":status", expected)]);
         }
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x67_72_70_63);
+        let mut rng = Lcg::new(0x67_72_70_63);
         for round in 0..4000 {
-            let len = usize::from(rng.next()) % 64;
-            let mut data: Vec<u8> = (0..len).map(|_| rng.next()).collect();
+            let len = rng.next() as usize % 64;
+            let mut data: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
             // Keep flags and lengths small often, so real messages come up.
             if round % 2 == 0 {
                 let mut i = 0;
@@ -2619,18 +2409,8 @@ mod tests {
                     i += HEADER_LEN + usize::from(data[i + 4]);
                 }
             }
-            let want = parse_all(&data);
-            let whole = decode(Decoder::with_limit(MAX_MESSAGE), &data, data.len());
-            let bytewise = decode(Decoder::with_limit(MAX_MESSAGE), &data, 1);
-            assert_eq!(whole, want);
-            assert_eq!(bytewise, want);
-            for m in want.iter().flatten() {
-                let b = m.to_bytes().unwrap();
-                assert_eq!(Message::parse(&b), Ok(Some((m.clone(), b.len()))));
-            }
-            for n in 0..data.len() {
-                let _ = Message::parse(&data[..n]);
-            }
+            contract::check_decode(|| Messages::with_limit(MAX_MESSAGE), &data);
+            contract::check_wire::<Message>(&data);
             // Header readers on the same bytes.
             if let Ok(t) = Timeout::parse(&data) {
                 assert_eq!(Timeout::parse(t.to_header().as_bytes()), Ok(t));
@@ -2642,7 +2422,7 @@ mod tests {
                 assert_eq!(MethodPath::parse(p.to_path().as_bytes()), Some(p));
             }
             let text = decode_message(&data);
-            assert_eq!(decode_message(encode_message(&text).as_bytes()), text);
+            assert_eq!(decode_message(encode_message(&text).unwrap().as_bytes()), text);
             let mut parts = data.split(|&b| b == 0);
             let mut headers = Vec::new();
             while let (Some(n), Some(v)) = (parts.next(), parts.next()) {
@@ -2652,7 +2432,7 @@ mod tests {
             if let Ok(s) = Status::parse_trailers(headers.iter().copied()) {
                 // A client uses a status it can read as it is.
                 assert_eq!(synthesized, s);
-                assert_eq!(Status::parse_trailers(strings(&s.to_trailers())), Ok(s));
+                assert_eq!(Status::parse_trailers(strings(&s.to_trailers().unwrap())), Ok(s));
             }
             if let Ok(r) = Request::parse(headers.iter().copied())
                 && let Ok(h) = r.to_headers()
@@ -2665,24 +2445,24 @@ mod tests {
     #[test]
     fn fuzz_requests() {
         // Mutations of a good request, so the checks past content-type run.
-        let mut rng = Lcg(7);
+        let mut rng = Lcg::new(7);
         let base = good_request();
         for _ in 0..3000 {
             let mut h: Vec<(Vec<u8>, Vec<u8>)> =
                 base.iter().map(|(n, v)| (n.as_bytes().to_vec(), v.as_bytes().to_vec())).collect();
             for _ in 0..1 + rng.next() % 4 {
-                let i = usize::from(rng.next()) % h.len();
+                let i = rng.next() as usize % h.len();
                 let v = &mut h[i].1;
                 match rng.next() % 3 {
                     0 if !v.is_empty() => {
-                        let j = usize::from(rng.next()) % v.len();
-                        v[j] = rng.next();
+                        let j = rng.next() as usize % v.len();
+                        v[j] = rng.next() as u8;
                     }
                     1 => {
-                        let n = usize::from(rng.next()) % (v.len() + 1);
+                        let n = rng.next() as usize % (v.len() + 1);
                         v.truncate(n);
                     }
-                    _ => v.push(rng.next()),
+                    _ => v.push(rng.next() as u8),
                 }
             }
             match Request::parse(h.iter().map(|(n, v)| (n, v))) {
@@ -2693,7 +2473,7 @@ mod tests {
                     }
                 }
                 Err(rej) => {
-                    let headers = rej.to_headers();
+                    let headers = rej.to_headers().unwrap();
                     if let Rejection::Status(s) = &rej {
                         assert_eq!(Status::parse_trailers(strings(&headers)).as_ref(), Ok(s));
                     }

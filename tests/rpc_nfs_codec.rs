@@ -59,13 +59,13 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
             owner: String::new(),
         }),
     };
-    let calls = [lookup.call(101), pmap.call(102)?, rpcb.call(103)?];
+    let calls = [lookup.call(101)?, pmap.call(102)?, rpcb.call(103)?];
     let mut tcp = Vec::new();
     for (call, fragment_len) in calls.iter().zip([1, 7, 13]) {
         let payload = <Message as Wire>::to_bytes(call)?;
         // Empty nonfinal fragments are legal even before nonempty data.
         tcp.extend_from_slice(&0u32.to_be_bytes());
-        tcp.extend(onc_rpc::encode_fragments(&payload, fragment_len));
+        tcp.extend(onc_rpc::encode_fragments(&payload, fragment_len)?);
     }
     contract::check_decode(request_stream, &tcp);
     contract::check_decode_with_held_limit(|| onc_rpc::records(RECORD_LIMIT), &tcp, RECORD_LIMIT);
@@ -112,7 +112,7 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
         let mut replies = Vec::new();
         for (message, request) in requests {
             let reply = match request {
-                Request::Nfs(_) => lookup_result.reply(),
+                Request::Nfs(_) => lookup_result.reply()?,
                 Request::Portmap(portmap::Request::Pmap(_)) => {
                     Reply::success(portmap::PmapResult::Port(u32::from(nfs::PORT)).to_bytes()?)
                 }
@@ -162,9 +162,9 @@ fn tcp_requests_and_replies() -> Result<(), Box<dyn core::error::Error>> {
 
 #[test]
 fn bad_rpc_record_does_not_hide_the_next_request() -> Result<(), Box<dyn core::error::Error>> {
-    let good = nfs::Request::Null.call(7);
-    let mut tcp = onc_rpc::encode_record(&[0, 1, 2]);
-    tcp.extend(onc_rpc::encode_fragments(&<Message as Wire>::to_bytes(&good)?, 1));
+    let good = nfs::Request::Null.call(7)?;
+    let mut tcp = onc_rpc::Record(vec![0, 1, 2]).to_bytes()?;
+    tcp.extend(onc_rpc::encode_fragments(&<Message as Wire>::to_bytes(&good)?, 1)?);
     let mut stream = Stream::new(request_stream());
     let mut items = Vec::new();
     for byte in &tcp {

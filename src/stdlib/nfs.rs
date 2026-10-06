@@ -40,20 +40,18 @@
 //! assert!(stream.next().is_none());
 //! ```
 //!
-//! Every reader checks lengths, because the agent can send any bytes it
-//! likes. File handles, names, paths, data and lists all have limits,
-//! given below as constants. The writers keep to those limits, so the
-//! readers take back everything the writers write. A writer never cuts a
-//! handle, name or path short, since the shorter one could name a
-//! different file: one past its limit is written empty, which names
-//! nothing, or, in a list, left out. Data past its limit is cut, and the
-//! count and end-of-file flag written with it say so.
+//! File handles, names, paths, data, and lists have explicit limits.
+//! Writers return an error when a value exceeds those limits or would
+//! parse differently. They preserve counts, optional fields, and EOF flags.
+//! Argument and result writers require a procedure, so they stay outside
+//! [`Wire`](super::codec::Wire).
 //!
 //! File names and paths are bytes, not text: RFC 1813 sets no character
 //! set for them, and servers such as Linux's take any bytes but NUL and
 //! `/` in a name. Host and group names in MOUNT results are text.
 //!
 //! ```
+//! use fictionet::stdlib::codec::Wire;
 //! use fictionet::stdlib::nfs::{procedure, DirOp, FileHandle, LookupOk, NfsError, Request, Response};
 //! use fictionet::stdlib::onc_rpc::{Accept, Body, Message, Reply};
 //!
@@ -72,13 +70,13 @@
 //!
 //! // A client looks up notes.txt in the root. Call 9.
 //! let lookup = Request::Lookup(DirOp { dir: FileHandle(vec![1]), name: "notes.txt".into() });
-//! let message = Message::parse(&lookup.call(9).to_bytes()).unwrap();
+//! let message = Message::parse(&lookup.call(9).unwrap().to_bytes().unwrap()).unwrap();
 //! let Body::Call(call) = &message.body else { panic!("not a call") };
 //! let reply = match Request::parse(call) {
-//!     Ok(request) => answer(&request).reply(),
+//!     Ok(request) => answer(&request).reply().unwrap(),
 //!     Err(status) => Reply::accepted(status),
 //! };
-//! let bytes = message.reply(reply).to_bytes();
+//! let bytes = message.reply(reply).to_bytes().unwrap();
 //!
 //! // The client reads the results.
 //! let Body::Reply(Reply::Accepted { status: Accept::Success(results), .. }) = Message::parse(&bytes).unwrap().body
@@ -392,8 +390,7 @@ impl std::error::Error for NfsError {}
 
 /// A file handle: bytes the server chose to name a file. The client never
 /// looks inside. At most [`MAX_FH`] bytes. A writer writes a longer one
-/// as an empty handle, which names no file, rather than cut it to the
-/// handle of another.
+/// with a writer error. It is never replaced by a different handle.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileHandle(pub Vec<u8>);
 
@@ -403,10 +400,9 @@ impl FileHandle {
         Ok(FileHandle(r.opaque(MAX_FH)?.to_vec()))
     }
 
-    /// Writes the handle, or an empty one if it is longer than
-    /// [`MAX_FH`] bytes.
+    /// Writes the handle. More than [`MAX_FH`] bytes sets a writer error.
     pub fn write(&self, w: &mut Writer) {
-        w.opaque(fit(&self.0, MAX_FH));
+        write_opaque(w, &self.0, MAX_FH);
     }
 
     /// Whether it is at most [`MAX_FH`] bytes, so a writer writes it as it
@@ -749,10 +745,10 @@ impl DirOp {
     }
 
     /// Writes the diropargs3. A name longer than [`MAX_NAME`] bytes is
-    /// written empty.
+    /// refused by the writer.
     pub fn write(&self, w: &mut Writer) {
         self.dir.write(w);
-        w.opaque(fit(&self.name, MAX_NAME));
+        write_opaque(w, &self.name, MAX_NAME);
     }
 }
 
@@ -878,7 +874,9 @@ impl MknodData {
     /// Reads a mknoddata3.
     pub fn read(r: &mut Reader<'_>) -> Result<MknodData, XdrError> {
         Ok(match FileType::read(r)? {
-            FileType::Character => MknodData::Character { attributes: Sattr::read(r)?, spec: SpecData::read(r)? },
+            FileType::Character => {
+                MknodData::Character { attributes: Sattr::read(r)?, spec: SpecData::read(r)? }
+            }
             FileType::Block => MknodData::Block { attributes: Sattr::read(r)?, spec: SpecData::read(r)? },
             FileType::Socket => MknodData::Socket(Sattr::read(r)?),
             FileType::Fifo => MknodData::Fifo(Sattr::read(r)?),
@@ -978,7 +976,7 @@ pub enum Request {
         /// The attributes to set.
         attributes: Sattr,
         /// The link's target, at most [`MAX_SYMLINK`] bytes. A longer
-        /// one is written empty.
+        /// one is refused by the writer.
         target: Vec<u8>,
     },
     /// Procedure 11: make a device, socket or named pipe.
@@ -1082,7 +1080,9 @@ impl Request {
             procedure::LOOKUP => Request::Lookup(DirOp::read(r)?),
             procedure::ACCESS => Request::Access { object: FileHandle::read(r)?, access: r.uint()? },
             procedure::READLINK => Request::ReadLink(FileHandle::read(r)?),
-            procedure::READ => Request::Read { file: FileHandle::read(r)?, offset: r.uhyper()?, count: r.uint()? },
+            procedure::READ => {
+                Request::Read { file: FileHandle::read(r)?, offset: r.uhyper()?, count: r.uint()? }
+            }
             procedure::WRITE => {
                 let file = FileHandle::read(r)?;
                 let offset = r.uhyper()?;
@@ -1092,9 +1092,11 @@ impl Request {
             }
             procedure::CREATE => Request::Create { location: DirOp::read(r)?, how: CreateHow::read(r)? },
             procedure::MKDIR => Request::Mkdir { location: DirOp::read(r)?, attributes: Sattr::read(r)? },
-            procedure::SYMLINK => {
-                Request::Symlink { location: DirOp::read(r)?, attributes: Sattr::read(r)?, target: read_symlink(r)? }
-            }
+            procedure::SYMLINK => Request::Symlink {
+                location: DirOp::read(r)?,
+                attributes: Sattr::read(r)?,
+                target: read_symlink(r)?,
+            },
             procedure::MKNOD => Request::Mknod { location: DirOp::read(r)?, what: MknodData::read(r)? },
             procedure::REMOVE => Request::Remove(DirOp::read(r)?),
             procedure::RMDIR => Request::Rmdir(DirOp::read(r)?),
@@ -1116,7 +1118,9 @@ impl Request {
             procedure::FSSTAT => Request::FsStat(FileHandle::read(r)?),
             procedure::FSINFO => Request::FsInfo(FileHandle::read(r)?),
             procedure::PATHCONF => Request::PathConf(FileHandle::read(r)?),
-            procedure::COMMIT => Request::Commit { file: FileHandle::read(r)?, offset: r.uhyper()?, count: r.uint()? },
+            procedure::COMMIT => {
+                Request::Commit { file: FileHandle::read(r)?, offset: r.uhyper()?, count: r.uint()? }
+            }
             n => return Err(XdrError::Discriminant(n)),
         };
         r.finish()?;
@@ -1152,9 +1156,8 @@ impl Request {
     }
 
     /// The call's arguments, which [`Request::read`] always reads back.
-    /// Handles, names and paths past their limits are written empty, and
-    /// WRITE data past [`MAX_DATA`] is cut, with the count it carries.
-    pub fn to_args(&self) -> Vec<u8> {
+    /// Invalid handles, names, paths, counts, and data return an error.
+    pub fn to_args(&self) -> Result<Vec<u8>, XdrError> {
         let w = &mut Writer::new();
         match self {
             Request::Null => {}
@@ -1177,10 +1180,12 @@ impl Request {
                 file.write(w);
                 w.uhyper(*offset).uint(*count);
             }
-            Request::Write { file, offset, count: _, stable, data } => {
-                let data = &data[..data.len().min(MAX_DATA)];
+            Request::Write { file, offset, count, stable, data } => {
+                if data.len() > MAX_DATA || usize::try_from(*count).ok() != Some(data.len()) {
+                    return Err(XdrError::NonCanonical);
+                }
                 file.write(w);
-                w.uhyper(*offset).uint(data.len() as u32);
+                w.uhyper(*offset).uint(*count);
                 stable.write(w);
                 w.opaque(data);
             }
@@ -1195,7 +1200,7 @@ impl Request {
             Request::Symlink { location, attributes, target } => {
                 location.write(w);
                 attributes.write(w);
-                w.opaque(fit(target, MAX_SYMLINK));
+                write_opaque(w, target, MAX_SYMLINK);
             }
             Request::Mknod { location, what } => {
                 location.write(w);
@@ -1218,14 +1223,18 @@ impl Request {
                 w.uhyper(*cookie).opaque_fixed(cookieverf).uint(*dircount).uint(*maxcount);
             }
         }
-        std::mem::take(w).finish()
+        let bytes = std::mem::take(w).finish()?;
+        if Self::read(self.procedure(), &bytes).as_ref() != Ok(self) {
+            return Err(XdrError::NonCanonical);
+        }
+        Ok(bytes)
     }
 
     /// A call message that makes this request, with AUTH_NONE. A world
     /// that needs AUTH_SYS sets the call's `cred` afterwards.
-    pub fn call(&self, xid: u32) -> Message {
-        let call = Call::new(NFS_PROGRAM, NFS_VERSION, self.procedure(), self.to_args());
-        Message { xid, body: super::onc_rpc::Body::Call(call) }
+    pub fn call(&self, xid: u32) -> Result<Message, XdrError> {
+        let call = Call::new(NFS_PROGRAM, NFS_VERSION, self.procedure(), self.to_args()?);
+        Ok(Message { xid, body: super::onc_rpc::Body::Call(call) })
     }
 }
 
@@ -1259,7 +1268,7 @@ pub struct ReadLinkOk {
     /// The link's attributes.
     pub attributes: Option<Fattr>,
     /// The link's target, at most [`MAX_SYMLINK`] bytes. A longer one is
-    /// written empty.
+    /// refused by the writer.
     pub target: Vec<u8>,
 }
 
@@ -1733,11 +1742,9 @@ impl Response {
     }
 
     /// The results in XDR, which [`Response::parse`] always reads back.
-    /// Handles, names and paths past their limits are written empty, or
-    /// left out where they are optional or in a list. READ data and
-    /// directory lists past their limits are cut, with a count and `eof`
-    /// that say so.
-    pub fn to_results(&self) -> Vec<u8> {
+    /// Invalid fields and oversized lists return an error. Counts and
+    /// EOF flags must match the value the parser would return.
+    pub fn to_results(&self) -> Result<Vec<u8>, XdrError> {
         let w = &mut Writer::new();
         match self {
             Response::Null => {}
@@ -1777,7 +1784,7 @@ impl Response {
                 res,
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
-                    w.opaque(fit(&ok.target, MAX_SYMLINK));
+                    write_opaque(w, &ok.target, MAX_SYMLINK);
                 },
                 write_post_op,
             ),
@@ -1786,8 +1793,8 @@ impl Response {
                 res,
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
-                    let data = &ok.data[..ok.data.len().min(MAX_DATA)];
-                    w.uint(data.len() as u32).bool(ok.eof && data.len() == ok.data.len()).opaque(data);
+                    w.uint(ok.count).bool(ok.eof);
+                    write_opaque(w, &ok.data, MAX_DATA);
                 },
                 write_post_op,
             ),
@@ -1807,7 +1814,7 @@ impl Response {
                     w,
                     res,
                     |w, ok| {
-                        w.optional(ok.object.as_ref().filter(|fh| fh.fits()), |w, fh| fh.write(w));
+                        w.optional(ok.object.as_ref(), |w, fh| fh.write(w));
                         write_post_op(w, &ok.attributes);
                         ok.dir_wcc.write(w);
                     },
@@ -1834,11 +1841,13 @@ impl Response {
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
                     w.opaque_fixed(&ok.cookieverf);
-                    let named = ok.entries.iter().filter(|e| e.name.len() <= MAX_NAME);
-                    let all = write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
-                        w.uhyper(e.fileid).opaque(&e.name).uhyper(e.cookie);
+                    let named = ok.entries.iter();
+                    write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
+                        w.uhyper(e.fileid);
+                        write_opaque(w, &e.name, MAX_NAME);
+                        w.uhyper(e.cookie);
                     });
-                    w.bool(ok.eof && all);
+                    w.bool(ok.eof);
                 },
                 write_post_op,
             ),
@@ -1848,13 +1857,15 @@ impl Response {
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
                     w.opaque_fixed(&ok.cookieverf);
-                    let named = ok.entries.iter().filter(|e| e.name.len() <= MAX_NAME);
-                    let all = write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
-                        w.uhyper(e.fileid).opaque(&e.name).uhyper(e.cookie);
+                    let named = ok.entries.iter();
+                    write_list(w, named, MAX_DIR_ENTRIES, MAX_DIR_BYTES, |w, e| {
+                        w.uhyper(e.fileid);
+                        write_opaque(w, &e.name, MAX_NAME);
+                        w.uhyper(e.cookie);
                         write_post_op(w, &e.attributes);
-                        w.optional(e.handle.as_ref().filter(|fh| fh.fits()), |w, fh| fh.write(w));
+                        w.optional(e.handle.as_ref(), |w, fh| fh.write(w));
                     });
-                    w.bool(ok.eof && all);
+                    w.bool(ok.eof);
                 },
                 write_post_op,
             ),
@@ -1887,7 +1898,10 @@ impl Response {
                 |w, ok| {
                     write_post_op(w, &ok.attributes);
                     w.uint(ok.linkmax).uint(ok.name_max);
-                    w.bool(ok.no_trunc).bool(ok.chown_restricted).bool(ok.case_insensitive).bool(ok.case_preserving);
+                    w.bool(ok.no_trunc)
+                        .bool(ok.chown_restricted)
+                        .bool(ok.case_insensitive)
+                        .bool(ok.case_preserving);
                 },
                 write_post_op,
             ),
@@ -1901,13 +1915,17 @@ impl Response {
                 |w, d| d.write(w),
             ),
         }
-        std::mem::take(w).finish()
+        let bytes = std::mem::take(w).finish()?;
+        if Self::parse(self.procedure(), &bytes).as_ref() != Ok(self) {
+            return Err(XdrError::NonCanonical);
+        }
+        Ok(bytes)
     }
 
     /// An RPC reply that carries these results, with an AUTH_NONE
     /// verifier.
-    pub fn reply(&self) -> Reply {
-        Reply::success(self.to_results())
+    pub fn reply(&self) -> Result<Reply, XdrError> {
+        Ok(Reply::success(self.to_results()?))
     }
 }
 
@@ -2055,20 +2073,23 @@ impl MountRequest {
         }
     }
 
-    /// The call's arguments, with a path longer than [`MAX_PATH`] bytes
-    /// written empty.
-    pub fn to_args(&self) -> Vec<u8> {
+    /// The call's arguments. Paths above [`MAX_PATH`] return an error.
+    pub fn to_args(&self) -> Result<Vec<u8>, XdrError> {
         let mut w = Writer::new();
         if let MountRequest::Mnt(path) | MountRequest::Umnt(path) = self {
-            w.opaque(fit(path, MAX_PATH));
+            write_opaque(&mut w, path, MAX_PATH);
         }
-        w.finish()
+        let bytes = w.finish()?;
+        if Self::read(self.procedure(), &bytes).as_ref() != Ok(self) {
+            return Err(XdrError::NonCanonical);
+        }
+        Ok(bytes)
     }
 
     /// A call message that makes this request, with AUTH_NONE.
-    pub fn call(&self, xid: u32) -> Message {
-        let call = Call::new(MOUNT_PROGRAM, MOUNT_VERSION, self.procedure(), self.to_args());
-        Message { xid, body: super::onc_rpc::Body::Call(call) }
+    pub fn call(&self, xid: u32) -> Result<Message, XdrError> {
+        let call = Call::new(MOUNT_PROGRAM, MOUNT_VERSION, self.procedure(), self.to_args()?);
+        Ok(Message { xid, body: super::onc_rpc::Body::Call(call) })
     }
 }
 
@@ -2134,9 +2155,10 @@ impl MountResponse {
         let response = match procedure {
             mount_procedure::NULL => MountResponse::Null,
             mount_procedure::MNT => MountResponse::Mnt(match MountError::from_code(r.uint()?) {
-                None => {
-                    Ok(Mounted { handle: FileHandle::read(r)?, auth_flavors: r.array(MAX_AUTH_FLAVORS, Reader::uint)? })
-                }
+                None => Ok(Mounted {
+                    handle: FileHandle::read(r)?,
+                    auth_flavors: r.array(MAX_AUTH_FLAVORS, Reader::uint)?,
+                }),
                 Some(e) => Err(e),
             }),
             mount_procedure::DUMP => MountResponse::Dump(read_list(r, MAX_MOUNTS, usize::MAX, |r| {
@@ -2144,12 +2166,14 @@ impl MountResponse {
             })?),
             mount_procedure::UMNT => MountResponse::Umnt,
             mount_procedure::UMNTALL => MountResponse::UmntAll,
-            mount_procedure::EXPORT => MountResponse::Export(read_list(r, MAX_EXPORTS, EXPORT_LIST_BYTES, |r| {
-                Ok(ExportEntry {
-                    directory: read_path(r)?,
-                    groups: read_list(r, MAX_GROUPS, usize::MAX, read_mount_name)?,
-                })
-            })?),
+            mount_procedure::EXPORT => {
+                MountResponse::Export(read_list(r, MAX_EXPORTS, EXPORT_LIST_BYTES, |r| {
+                    Ok(ExportEntry {
+                        directory: read_path(r)?,
+                        groups: read_list(r, MAX_GROUPS, usize::MAX, read_mount_name)?,
+                    })
+                })?)
+            }
             n => return Err(XdrError::Discriminant(n)),
         };
         r.finish()?;
@@ -2169,17 +2193,18 @@ impl MountResponse {
     }
 
     /// The results in XDR, which [`MountResponse::parse`] always reads
-    /// back. A handle past its limit is written empty, entries with a
-    /// host name or path past its limit are left out, and lists stop at
-    /// their limits.
-    pub fn to_results(&self) -> Vec<u8> {
+    /// back. Invalid handles, names, paths, and lists return an error.
+    pub fn to_results(&self) -> Result<Vec<u8>, XdrError> {
         let w = &mut Writer::new();
         match self {
             MountResponse::Null | MountResponse::Umnt | MountResponse::UmntAll => {}
             MountResponse::Mnt(Ok(m)) => {
                 w.uint(0);
                 m.handle.write(w);
-                let flavors = &m.auth_flavors[..m.auth_flavors.len().min(MAX_AUTH_FLAVORS)];
+                if m.auth_flavors.len() > MAX_AUTH_FLAVORS {
+                    return Err(XdrError::TooLong(u32::try_from(m.auth_flavors.len()).unwrap_or(u32::MAX)));
+                }
+                let flavors = &m.auth_flavors;
                 w.array(flavors, |w, f| {
                     w.uint(*f);
                 });
@@ -2188,31 +2213,35 @@ impl MountResponse {
                 w.uint(e.code());
             }
             MountResponse::Dump(mounts) => {
-                let kept =
-                    mounts.iter().filter(|m| m.hostname.len() <= MAX_MOUNT_NAME && m.directory.len() <= MAX_PATH);
+                let kept = mounts.iter();
                 write_list(w, kept, MAX_MOUNTS, usize::MAX, |w, m| {
-                    w.string(&m.hostname).opaque(&m.directory);
+                    write_opaque(w, m.hostname.as_bytes(), MAX_MOUNT_NAME);
+                    write_opaque(w, &m.directory, MAX_PATH);
                 });
             }
             MountResponse::Export(exports) => {
                 // One export is at most about 68 KB, so the first always
                 // fits in EXPORT_LIST_BYTES.
-                let kept = exports.iter().filter(|e| e.directory.len() <= MAX_PATH);
+                let kept = exports.iter();
                 write_list(w, kept, MAX_EXPORTS, EXPORT_LIST_BYTES, |w, e| {
-                    w.opaque(&e.directory);
+                    write_opaque(w, &e.directory, MAX_PATH);
                     write_list(w, e.groups.iter(), MAX_GROUPS, usize::MAX, |w, g| {
-                        w.string(if g.len() <= MAX_MOUNT_NAME { g } else { "" });
+                        write_opaque(w, g.as_bytes(), MAX_MOUNT_NAME);
                     });
                 });
             }
         }
-        std::mem::take(w).finish()
+        let bytes = std::mem::take(w).finish()?;
+        if Self::parse(self.procedure(), &bytes).as_ref() != Ok(self) {
+            return Err(XdrError::NonCanonical);
+        }
+        Ok(bytes)
     }
 
     /// An RPC reply that carries these results, with an AUTH_NONE
     /// verifier.
-    pub fn reply(&self) -> Reply {
-        Reply::success(self.to_results())
+    pub fn reply(&self) -> Result<Reply, XdrError> {
+        Ok(Reply::success(self.to_results()?))
     }
 }
 
@@ -2275,33 +2304,38 @@ fn read_list<'a, T>(
     Ok(out)
 }
 
-/// Writes a linked list of at most `max` items, which with the word before
-/// each take at most `max_bytes`. It stops at the first item past either
-/// limit, and says whether it wrote them all.
+/// Appends a complete linked list within its count and byte limits.
 fn write_list<'a, T: 'a>(
     w: &mut Writer,
     items: impl IntoIterator<Item = &'a T>,
     max: usize,
     max_bytes: usize,
     mut item: impl FnMut(&mut Writer, &T),
-) -> bool {
+) {
     let mut used = 0usize;
-    let mut all = true;
-    for (written, i) in items.into_iter().enumerate() {
+    for (written, value) in items.into_iter().enumerate() {
+        if written >= max {
+            w.reject(XdrError::TooLong(u32::try_from(written).unwrap_or(u32::MAX)));
+            return;
+        }
         let mut one = Writer::new();
         one.bool(true);
-        item(&mut one, i);
-        let one = one.finish();
-        if written == max || used.saturating_add(one.len()) > max_bytes {
-            all = false;
-            break;
-        }
-        // XDR items are whole words, so this adds no padding.
+        item(&mut one, value);
+        let one = match one.finish() {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                w.reject(error);
+                return;
+            }
+        };
+        let Some(total) = used.checked_add(one.len()).filter(|n| *n <= max_bytes) else {
+            w.reject(XdrError::TooLong(u32::try_from(max_bytes).unwrap_or(u32::MAX)));
+            return;
+        };
         w.opaque_fixed(&one);
-        used += one.len();
+        used = total;
     }
     w.bool(false);
-    all
 }
 
 /// Reads variable-length data of at most [`MAX_DATA`] bytes, which must be
@@ -2315,7 +2349,11 @@ fn read_data(r: &mut Reader<'_>, count: u32) -> Result<Vec<u8>, XdrError> {
 }
 
 fn read_create_ok(r: &mut Reader<'_>) -> Result<CreateOk, XdrError> {
-    Ok(CreateOk { object: r.optional(FileHandle::read)?, attributes: read_post_op(r)?, dir_wcc: WccData::read(r)? })
+    Ok(CreateOk {
+        object: r.optional(FileHandle::read)?,
+        attributes: read_post_op(r)?,
+        dir_wcc: WccData::read(r)?,
+    })
 }
 
 fn read_rename_wcc(r: &mut Reader<'_>) -> Result<RenameWcc, XdrError> {
@@ -2349,36 +2387,21 @@ fn read_mount_name(r: &mut Reader<'_>) -> Result<String, XdrError> {
     Ok(r.string(MAX_MOUNT_NAME)?.to_owned())
 }
 
-/// `b` if it is at most `max` bytes long, else nothing. A writer never
-/// cuts a handle, name or path short, since the shorter one could name a
-/// different file.
-fn fit(b: &[u8], max: usize) -> &[u8] {
-    if b.len() <= max { b } else { &[] }
+/// Appends a bounded opaque field, or records a writer error.
+fn write_opaque(w: &mut Writer, bytes: &[u8], max: usize) {
+    if bytes.len() > max {
+        w.reject(XdrError::TooLong(u32::try_from(bytes.len()).unwrap_or(u32::MAX)));
+    } else {
+        w.opaque(bytes);
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::onc_rpc::{Body, Decoder, encode_record};
+    use super::super::onc_rpc::{Body, MAX_RECORD, Record, records};
     use super::*;
-
-    /// A small deterministic generator for the fuzz loop.
-    struct Lcg(u64);
-
-    impl Lcg {
-        fn next(&mut self) -> u32 {
-            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-            (self.0 >> 33) as u32
-        }
-        fn below(&mut self, n: u32) -> u32 {
-            self.next() % n
-        }
-        fn u64(&mut self) -> u64 {
-            u64::from(self.next()) << 32 | u64::from(self.next())
-        }
-        fn chance(&mut self) -> bool {
-            self.next() & 1 == 1
-        }
-    }
+    use crate::stdlib::codec::test_support::Lcg;
+    use crate::stdlib::codec::{Assembled, Stream, Wire, contract, finish, pump, test_support};
 
     fn fh(b: &[u8]) -> FileHandle {
         FileHandle(b.to_vec())
@@ -2408,7 +2431,11 @@ mod tests {
 
     fn wcc() -> WccData {
         WccData {
-            before: Some(WccAttr { size: 1, mtime: Time::default(), ctime: Time { seconds: 9, nseconds: 0 } }),
+            before: Some(WccAttr {
+                size: 1,
+                mtime: Time::default(),
+                ctime: Time { seconds: 9, nseconds: 0 },
+            }),
             after: Some(attrs()),
         }
     }
@@ -2429,7 +2456,11 @@ mod tests {
         vec![
             Request::Null,
             Request::GetAttr(fh(&[1, 2, 3])),
-            Request::SetAttr { object: fh(&[1]), attributes: sattr(), guard: Some(Time { seconds: 5, nseconds: 6 }) },
+            Request::SetAttr {
+                object: fh(&[1]),
+                attributes: sattr(),
+                guard: Some(Time { seconds: 5, nseconds: 6 }),
+            },
             Request::SetAttr { object: fh(&[1]), attributes: Sattr::default(), guard: None },
             Request::Lookup(op(&[1], "notes.txt")),
             Request::Access { object: fh(&[2]), access: access::READ | access::LOOKUP },
@@ -2447,14 +2478,21 @@ mod tests {
             Request::Create { location: op(&[1], "b"), how: CreateHow::Guarded(Sattr::default()) },
             Request::Create { location: op(&[1], "c"), how: CreateHow::Exclusive([1, 2, 3, 4, 5, 6, 7, 8]) },
             Request::Mkdir { location: op(&[1], "dir"), attributes: sattr() },
-            Request::Symlink { location: op(&[1], "ln"), attributes: Sattr::default(), target: "/etc/passwd".into() },
+            Request::Symlink {
+                location: op(&[1], "ln"),
+                attributes: Sattr::default(),
+                target: "/etc/passwd".into(),
+            },
             Request::Mknod {
                 location: op(&[1], "tty"),
                 what: MknodData::Character { attributes: sattr(), spec: SpecData { major: 4, minor: 1 } },
             },
             Request::Mknod {
                 location: op(&[1], "sda"),
-                what: MknodData::Block { attributes: Sattr::default(), spec: SpecData { major: 8, minor: 0 } },
+                what: MknodData::Block {
+                    attributes: Sattr::default(),
+                    spec: SpecData { major: 8, minor: 0 },
+                },
             },
             Request::Mknod { location: op(&[1], "sock"), what: MknodData::Socket(sattr()) },
             Request::Mknod { location: op(&[1], "pipe"), what: MknodData::Fifo(Sattr::default()) },
@@ -2466,7 +2504,13 @@ mod tests {
             Request::Rename { from: op(&[1], "a"), to: op(&[9, 9], "b") },
             Request::Link { file: fh(&[2]), link: op(&[1], "hard") },
             Request::ReadDir { dir: fh(&[1]), cookie: 0, cookieverf: [0; 8], count: 8192 },
-            Request::ReadDirPlus { dir: fh(&[1]), cookie: 3, cookieverf: [9; 8], dircount: 1024, maxcount: 8192 },
+            Request::ReadDirPlus {
+                dir: fh(&[1]),
+                cookie: 3,
+                cookieverf: [9; 8],
+                dircount: 1024,
+                maxcount: 8192,
+            },
             Request::FsStat(fh(&[1])),
             Request::FsInfo(fh(&[1])),
             Request::PathConf(fh(&[1])),
@@ -2484,15 +2528,29 @@ mod tests {
             Response::GetAttr(Err(NfsError::Stale)),
             Response::SetAttr(Ok(wcc())),
             Response::SetAttr(Err((NfsError::NotSync, wcc()))),
-            Response::Lookup(Ok(LookupOk { object: fh(&[2]), object_attributes: Some(attrs()), dir_attributes: None })),
+            Response::Lookup(Ok(LookupOk {
+                object: fh(&[2]),
+                object_attributes: Some(attrs()),
+                dir_attributes: None,
+            })),
             Response::Lookup(Err((NfsError::NoEnt, Some(attrs())))),
             Response::Access(Ok(AccessOk { attributes: None, access: access::READ })),
             Response::Access(Err((NfsError::Acces, None))),
             Response::ReadLink(Ok(ReadLinkOk { attributes: Some(attrs()), target: "../x".into() })),
             Response::ReadLink(Err((NfsError::Inval, None))),
-            Response::Read(Ok(ReadOk { attributes: Some(attrs()), count: 5, eof: true, data: b"hello".to_vec() })),
+            Response::Read(Ok(ReadOk {
+                attributes: Some(attrs()),
+                count: 5,
+                eof: true,
+                data: b"hello".to_vec(),
+            })),
             Response::Read(Err((NfsError::IsDir, None))),
-            Response::Write(Ok(WriteOk { wcc: wcc(), count: 5, committed: StableHow::Unstable, verf: [7; 8] })),
+            Response::Write(Ok(WriteOk {
+                wcc: wcc(),
+                count: 5,
+                committed: StableHow::Unstable,
+                verf: [7; 8],
+            })),
             Response::Write(Err((NfsError::Nospc, WccData::default()))),
             Response::Create(Ok(create.clone())),
             Response::Create(Err((NfsError::Exist, wcc()))),
@@ -2616,8 +2674,8 @@ mod tests {
     #[test]
     fn getattr_call_bytes() {
         // RFC 1813, section 3.3.1: GETATTR3args is one nfs_fh3.
-        let call = Request::GetAttr(fh(&[0xab, 0xcd, 0xef])).call(1);
-        let bytes = call.to_bytes();
+        let call = Request::GetAttr(fh(&[0xab, 0xcd, 0xef])).call(1).unwrap();
+        let bytes = call.to_bytes().unwrap();
         assert_eq!(
             bytes,
             [
@@ -2640,7 +2698,7 @@ mod tests {
     fn fattr_is_84_bytes() {
         let mut w = Writer::new();
         attrs().write(&mut w);
-        let b = w.finish();
+        let b = w.finish().unwrap();
         assert_eq!(b.len(), 84);
         // type, mode, nlink, uid, gid, size: in that order.
         assert_eq!(
@@ -2654,11 +2712,16 @@ mod tests {
 
     #[test]
     fn lookup_and_write_args_bytes() {
-        let args = Request::Lookup(op(&[1, 2], "a")).to_args();
+        let args = Request::Lookup(op(&[1, 2], "a")).to_args().unwrap();
         assert_eq!(args, [0, 0, 0, 2, 1, 2, 0, 0, 0, 0, 0, 1, b'a', 0, 0, 0]);
         let args =
-            Request::Write { file: fh(&[]), offset: 2, count: 1, stable: StableHow::FileSync, data: vec![9] }.to_args();
-        assert_eq!(args, [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1, 9, 0, 0, 0]);
+            Request::Write { file: fh(&[]), offset: 2, count: 1, stable: StableHow::FileSync, data: vec![9] }
+                .to_args()
+                .unwrap();
+        assert_eq!(
+            args,
+            [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1, 9, 0, 0, 0]
+        );
     }
 
     #[test]
@@ -2669,7 +2732,7 @@ mod tests {
             entries: vec![Entry { fileid: 5, name: "x".into(), cookie: 6 }],
             eof: true,
         }));
-        let b = resp.to_results();
+        let b = resp.to_results().unwrap();
         assert_eq!(
             b,
             [
@@ -2689,26 +2752,29 @@ mod tests {
 
     #[test]
     fn mount_bytes() {
-        let m = MountRequest::Mnt("/x".into()).call(3);
+        let m = MountRequest::Mnt("/x".into()).call(3).unwrap();
         let Body::Call(c) = &m.body else { panic!() };
         assert_eq!((c.program, c.version, c.procedure), (100_005, 3, 1));
         assert_eq!(c.args, [0, 0, 0, 2, b'/', b'x', 0, 0]);
         let r = MountResponse::Mnt(Ok(Mounted { handle: fh(&[7]), auth_flavors: vec![1] }));
-        assert_eq!(r.to_results(), [0, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1]);
+        assert_eq!(r.to_results().unwrap(), [0, 0, 0, 0, 0, 0, 0, 1, 7, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1]);
         let e = MountResponse::Export(vec![ExportEntry { directory: "/".into(), groups: vec!["g".into()] }]);
         assert_eq!(
-            e.to_results(),
-            [0, 0, 0, 1, 0, 0, 0, 1, b'/', 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, b'g', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            e.to_results().unwrap(),
+            [
+                0, 0, 0, 1, 0, 0, 0, 1, b'/', 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, b'g', 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0
+            ]
         );
-        assert_eq!(MountResponse::Mnt(Err(MountError::NoEnt)).to_results(), [0, 0, 0, 2]);
+        assert_eq!(MountResponse::Mnt(Err(MountError::NoEnt)).to_results().unwrap(), [0, 0, 0, 2]);
     }
 
     #[test]
     fn requests_round_trip() {
         for req in requests() {
-            let args = req.to_args();
+            let args = req.to_args().unwrap();
             assert_eq!(Request::read(req.procedure(), &args), Ok(req.clone()), "{req:?}");
-            let m = Message::parse(&req.call(5).to_bytes()).unwrap();
+            let m = Message::parse(&req.call(5).unwrap().to_bytes().unwrap()).unwrap();
             let Body::Call(c) = &m.body else { panic!() };
             assert_eq!(Request::parse(c), Ok(req.clone()));
             // Every strict prefix is refused.
@@ -2721,9 +2787,9 @@ mod tests {
             assert_eq!(Request::read(req.procedure(), &longer), Err(XdrError::Trailing(4)));
         }
         for req in mount_requests() {
-            let args = req.to_args();
+            let args = req.to_args().unwrap();
             assert_eq!(MountRequest::read(req.procedure(), &args), Ok(req.clone()));
-            let Body::Call(c) = req.call(1).body else { panic!() };
+            let Body::Call(c) = req.call(1).unwrap().body else { panic!() };
             assert_eq!(MountRequest::parse(&c), Ok(req.clone()));
             for n in 0..args.len() {
                 assert!(MountRequest::read(req.procedure(), &args[..n]).is_err());
@@ -2751,19 +2817,19 @@ mod tests {
             })
         };
         for request in requests() {
-            let message = request.call(19);
+            let message = request.call(19).unwrap();
             let bytes = <Message as Wire>::to_bytes(&message).unwrap();
             contract::check_wire::<Message>(&bytes);
-            contract::check_decode(make, &onc_rpc::encode_fragments(&bytes, 5));
+            contract::check_decode(make, &onc_rpc::encode_fragments(&bytes, 5).unwrap());
         }
     }
 
     #[test]
     fn responses_round_trip() {
         for resp in responses() {
-            let b = resp.to_results();
+            let b = resp.to_results().unwrap();
             assert_eq!(Response::parse(resp.procedure(), &b), Ok(resp.clone()), "{resp:?}");
-            assert_eq!(resp.reply(), Reply::success(b.clone()));
+            assert_eq!(resp.reply().unwrap(), Reply::success(b.clone()));
             for n in 0..b.len() {
                 assert!(Response::parse(resp.procedure(), &b[..n]).is_err(), "{resp:?} at {n}");
             }
@@ -2772,9 +2838,9 @@ mod tests {
             assert_eq!(Response::parse(resp.procedure(), &longer), Err(XdrError::Trailing(1)));
         }
         for resp in mount_responses() {
-            let b = resp.to_results();
+            let b = resp.to_results().unwrap();
             assert_eq!(MountResponse::parse(resp.procedure(), &b), Ok(resp.clone()), "{resp:?}");
-            assert_eq!(resp.reply(), Reply::success(b.clone()));
+            assert_eq!(resp.reply().unwrap(), Reply::success(b.clone()));
             for n in 0..b.len() {
                 assert!(MountResponse::parse(resp.procedure(), &b[..n]).is_err(), "{resp:?} at {n}");
             }
@@ -2786,7 +2852,7 @@ mod tests {
         for req in requests() {
             let resp = Response::failed(&req, NfsError::Perm);
             assert_eq!(resp.procedure(), req.procedure());
-            let b = resp.to_results();
+            let b = resp.to_results().unwrap();
             if req != Request::Null {
                 assert_eq!(&b[..4], &[0, 0, 0, 1]);
             }
@@ -2796,7 +2862,12 @@ mod tests {
 
     #[test]
     fn calls_that_are_not_nfs() {
-        let mut c = Call::new(NFS_PROGRAM, NFS_VERSION, procedure::GETATTR, Request::GetAttr(fh(&[1])).to_args());
+        let mut c = Call::new(
+            NFS_PROGRAM,
+            NFS_VERSION,
+            procedure::GETATTR,
+            Request::GetAttr(fh(&[1])).to_args().unwrap(),
+        );
         assert!(Request::parse(&c).is_ok());
         c.program = 100_000;
         assert_eq!(Request::parse(&c), Err(Accept::ProgUnavail));
@@ -2849,16 +2920,16 @@ mod tests {
         w.opaque(&[1]).uhyper(0).uint(0).uint(3).opaque(&[]);
         assert_eq!(Request::read(procedure::WRITE, w.as_bytes()), Err(XdrError::Discriminant(3)));
         // createmode 3.
-        let mut args = Request::Lookup(op(&[1], "a")).to_args();
+        let mut args = Request::Lookup(op(&[1], "a")).to_args().unwrap();
         args.extend_from_slice(&[0, 0, 0, 3]);
         assert_eq!(Request::read(procedure::CREATE, &args), Err(XdrError::Discriminant(3)));
         // time_how 3, in an sattr3 with nothing else set.
-        let mut args = Request::Lookup(op(&[1], "a")).to_args();
+        let mut args = Request::Lookup(op(&[1], "a")).to_args().unwrap();
         args.extend_from_slice(&[0; 16]);
         args.extend_from_slice(&[0, 0, 0, 3, 0, 0, 0, 0]);
         assert_eq!(Request::read(procedure::MKDIR, &args), Err(XdrError::Discriminant(3)));
         // ftype3 0 and 8.
-        let mut args = Request::Lookup(op(&[1], "a")).to_args();
+        let mut args = Request::Lookup(op(&[1], "a")).to_args().unwrap();
         args.extend_from_slice(&[0, 0, 0, 8]);
         assert_eq!(Request::read(procedure::MKNOD, &args), Err(XdrError::Discriminant(8)));
         let mut b = vec![0, 0, 0, 0];
@@ -2873,7 +2944,10 @@ mod tests {
         // Data over MAX_DATA in WRITE, refused by its length alone.
         let mut w = Writer::new();
         w.opaque(&[1]).uhyper(0).uint(0).uint(0).uint(MAX_DATA as u32 + 1);
-        assert_eq!(Request::read(procedure::WRITE, w.as_bytes()), Err(XdrError::TooLong(MAX_DATA as u32 + 1)));
+        assert_eq!(
+            Request::read(procedure::WRITE, w.as_bytes()),
+            Err(XdrError::TooLong(MAX_DATA as u32 + 1))
+        );
         // A symlink target over MAX_SYMLINK.
         let mut w = Writer::new();
         w.opaque(&[1]).string("l");
@@ -2895,10 +2969,11 @@ mod tests {
         // nfspath3 is string<>, with no MNTPATHLEN bound. Linux servers
         // allow PATH_MAX (4096) bytes, so a 2000-byte target must read.
         let target = "t".repeat(2000);
-        let req = Request::Symlink { location: op(&[1], "l"), attributes: Sattr::default(), target: target.into() };
-        assert_eq!(Request::read(procedure::SYMLINK, &req.to_args()), Ok(req));
+        let req =
+            Request::Symlink { location: op(&[1], "l"), attributes: Sattr::default(), target: target.into() };
+        assert_eq!(Request::read(procedure::SYMLINK, &req.to_args().unwrap()), Ok(req));
         let resp = Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: vec![b'x'; MAX_SYMLINK] }));
-        assert_eq!(Response::parse(procedure::READLINK, &resp.to_results()), Ok(resp));
+        assert_eq!(Response::parse(procedure::READLINK, &resp.to_results().unwrap()), Ok(resp));
         let mut w = Writer::new();
         w.uint(0).bool(false).string(&"x".repeat(MAX_SYMLINK + 1));
         assert_eq!(Response::parse(procedure::READLINK, w.as_bytes()), Err(XdrError::TooLong(4097)));
@@ -2917,7 +2992,7 @@ mod tests {
                 w.bool(true).uhyper(i as u64).string("e").uhyper(i as u64);
             }
             w.bool(false).bool(true);
-            w.finish()
+            w.finish().unwrap()
         };
         // Each entry takes 28 bytes with the word before it.
         let most = MAX_DIR_BYTES / 28;
@@ -2933,7 +3008,7 @@ mod tests {
                 w.bool(true).string("g");
             }
             w.bool(false).bool(false);
-            w.finish()
+            w.finish().unwrap()
         };
         assert!(MountResponse::parse(mount_procedure::EXPORT, &groups(MAX_GROUPS)).is_ok());
         assert_eq!(
@@ -2967,102 +3042,71 @@ mod tests {
         let b = [0, 0, 0, 99];
         let resp = Response::parse(procedure::GETATTR, &b).unwrap();
         assert_eq!(resp, Response::GetAttr(Err(NfsError::Other(NonZeroU32::new(99).unwrap()))));
-        assert_eq!(resp.to_results(), b);
+        assert_eq!(resp.to_results().unwrap(), b);
     }
 
     #[test]
-    fn writers_never_cut_a_name_to_another() {
-        // RFC 1813 has no truncation in the protocol: a REMOVE for a
-        // 256-byte name must not become a REMOVE of the 255-byte name that
-        // starts it.
-        let mut long = vec![b'a'; MAX_NAME];
-        long.push(b'b');
-        let req = Request::Remove(DirOp { dir: fh(&[1]), name: long });
-        let Ok(Request::Remove(back)) = Request::read(procedure::REMOVE, &req.to_args()) else { panic!() };
-        assert_eq!(back.name, b"");
-        // The same for handles, symlink targets and MOUNT paths.
+    fn writers_refuse_long_handles_names_and_paths() {
         let long_fh = FileHandle(vec![1; MAX_FH + 1]);
         assert!(!long_fh.fits());
-        let req = Request::GetAttr(long_fh.clone());
-        assert_eq!(Request::read(procedure::GETATTR, &req.to_args()), Ok(Request::GetAttr(fh(&[]))));
-        let req = Request::Symlink {
-            location: op(&[1], "l"),
-            attributes: Sattr::default(),
-            target: vec![b't'; MAX_SYMLINK + 1],
-        };
-        let Ok(Request::Symlink { target, .. }) = Request::read(procedure::SYMLINK, &req.to_args()) else { panic!() };
-        assert_eq!(target, b"");
-        let resp = Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: vec![b'x'; MAX_SYMLINK + 1] }));
-        let Ok(Response::ReadLink(Ok(back))) = Response::parse(procedure::READLINK, &resp.to_results()) else {
-            panic!()
-        };
-        assert_eq!(back.target, b"");
-        assert_eq!(
-            MountRequest::read(1, &MountRequest::Mnt(vec![b'p'; MAX_PATH + 1]).to_args()),
-            Ok(MountRequest::Mnt(vec![]))
-        );
-        // Optional handles too long to write are left out.
-        let resp = Response::Create(Ok(CreateOk { object: Some(long_fh.clone()), ..CreateOk::default() }));
-        let Ok(Response::Create(Ok(back))) = Response::parse(procedure::CREATE, &resp.to_results()) else { panic!() };
-        assert_eq!(back.object, None);
-        let resp = MountResponse::Mnt(Ok(Mounted { handle: long_fh, auth_flavors: vec![1; 100] }));
-        let MountResponse::Mnt(Ok(m)) = MountResponse::parse(mount_procedure::MNT, &resp.to_results()).unwrap() else {
-            panic!()
-        };
-        assert_eq!((m.handle.0.len(), m.auth_flavors.len()), (0, MAX_AUTH_FLAVORS));
+        for request in [
+            Request::GetAttr(long_fh.clone()),
+            Request::Lookup(DirOp { dir: fh(&[1]), name: vec![b'n'; MAX_NAME + 1] }),
+            Request::Symlink {
+                location: op(&[1], "l"),
+                attributes: Sattr::default(),
+                target: vec![b't'; MAX_SYMLINK + 1],
+            },
+        ] {
+            assert!(request.to_args().is_err());
+        }
+        for response in [
+            Response::ReadLink(Ok(ReadLinkOk { attributes: None, target: vec![b'x'; MAX_SYMLINK + 1] })),
+            Response::Create(Ok(CreateOk { object: Some(long_fh.clone()), ..CreateOk::default() })),
+        ] {
+            assert!(response.to_results().is_err());
+        }
+        assert!(MountRequest::Mnt(vec![b'p'; MAX_PATH + 1]).to_args().is_err());
+        for mounted in [
+            Mounted { handle: long_fh, auth_flavors: vec![1] },
+            Mounted { handle: fh(&[1]), auth_flavors: vec![1; MAX_AUTH_FLAVORS + 1] },
+        ] {
+            assert!(MountResponse::Mnt(Ok(mounted)).to_results().is_err());
+        }
     }
 
     #[test]
-    fn list_items_too_long_to_write_are_left_out() {
-        let long = vec![b'n'; MAX_NAME + 1];
-        let resp = Response::ReadDir(Ok(ReadDirOk {
-            entries: vec![
-                Entry { fileid: 1, name: b"a".to_vec(), cookie: 1 },
-                Entry { fileid: 2, name: long.clone(), cookie: 2 },
-                Entry { fileid: 3, name: b"c".to_vec(), cookie: 3 },
-            ],
+    fn list_writers_refuse_invalid_entries() {
+        let response = Response::ReadDir(Ok(ReadDirOk {
+            entries: vec![Entry { fileid: 2, name: vec![b'n'; MAX_NAME + 1], cookie: 2 }],
             eof: true,
             ..ReadDirOk::default()
         }));
-        let Ok(Response::ReadDir(Ok(back))) = Response::parse(procedure::READDIR, &resp.to_results()) else { panic!() };
-        assert_eq!(back.entries.iter().map(|e| e.fileid).collect::<Vec<_>>(), [1, 3]);
-        assert!(back.eof);
-        let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk {
-            entries: vec![
-                EntryPlus { name: long, ..EntryPlus::default() },
-                EntryPlus { fileid: 4, handle: Some(FileHandle(vec![1; MAX_FH + 1])), ..EntryPlus::default() },
-            ],
-            ..ReadDirPlusOk::default()
-        }));
-        let Ok(Response::ReadDirPlus(Ok(back))) = Response::parse(procedure::READDIRPLUS, &resp.to_results()) else {
-            panic!()
-        };
-        assert_eq!(back.entries, [EntryPlus { fileid: 4, ..EntryPlus::default() }]);
-        // MOUNT lists: entries with a long path or host are left out; a
-        // long group is written empty, so the list still limits who may
-        // mount.
-        let resp = MountResponse::Export(vec![
+        assert!(response.to_results().is_err());
+        for entry in [
+            EntryPlus { name: vec![b'n'; MAX_NAME + 1], ..EntryPlus::default() },
+            EntryPlus { handle: Some(FileHandle(vec![1; MAX_FH + 1])), ..EntryPlus::default() },
+        ] {
+            assert!(
+                Response::ReadDirPlus(Ok(ReadDirPlusOk { entries: vec![entry], ..ReadDirPlusOk::default() }))
+                    .to_results()
+                    .is_err()
+            );
+        }
+        for entry in [
             ExportEntry { directory: vec![b'd'; MAX_PATH + 1], groups: vec![] },
             ExportEntry { directory: b"/x".to_vec(), groups: vec!["g".repeat(MAX_MOUNT_NAME + 1)] },
-        ]);
-        assert_eq!(
-            MountResponse::parse(mount_procedure::EXPORT, &resp.to_results()),
-            Ok(MountResponse::Export(vec![ExportEntry { directory: b"/x".to_vec(), groups: vec![String::new()] }]))
-        );
-        let resp = MountResponse::Dump(vec![
+        ] {
+            assert!(MountResponse::Export(vec![entry]).to_results().is_err());
+        }
+        for entry in [
             MountEntry { hostname: "h".repeat(MAX_MOUNT_NAME + 1), directory: b"/".to_vec() },
-            MountEntry { hostname: "h".into(), directory: b"/".to_vec() },
-        ]);
-        assert_eq!(
-            MountResponse::parse(mount_procedure::DUMP, &resp.to_results()),
-            Ok(MountResponse::Dump(vec![MountEntry { hostname: "h".into(), directory: b"/".to_vec() }]))
-        );
-        let resp =
-            MountResponse::Dump(vec![MountEntry { hostname: "h".into(), directory: b"/".to_vec() }; MAX_MOUNTS + 1]);
-        let MountResponse::Dump(back) = MountResponse::parse(mount_procedure::DUMP, &resp.to_results()).unwrap() else {
-            panic!()
-        };
-        assert_eq!(back.len(), MAX_MOUNTS);
+            MountEntry { hostname: "h".into(), directory: vec![b'd'; MAX_PATH + 1] },
+        ] {
+            assert!(MountResponse::Dump(vec![entry]).to_results().is_err());
+        }
+        let entry = MountEntry { hostname: "h".into(), directory: b"/".to_vec() };
+        assert!(MountResponse::Dump(vec![entry; MAX_MOUNTS + 1]).to_results().is_err());
     }
 
     #[test]
@@ -3089,7 +3133,7 @@ mod tests {
         let resp = Response::parse(procedure::READDIR, &b).unwrap();
         let Response::ReadDir(Ok(ok)) = &resp else { panic!() };
         assert_eq!(ok.entries[0].name, [0xe9, b't']);
-        assert_eq!(resp.to_results(), b);
+        assert_eq!(resp.to_results().unwrap(), b);
         // And a MOUNT path.
         let mut w = Writer::new();
         w.opaque(b"/caf\xe9");
@@ -3106,31 +3150,31 @@ mod tests {
         let mut w = Writer::new();
         w.opaque(&[1]).uhyper(0).uint(2).uint(0).opaque(b"xyz");
         assert_eq!(Request::read(procedure::WRITE, w.as_bytes()), Err(XdrError::TooLong(3)));
-        // A writer writes the count of the data it writes.
-        let req = Request::Write { file: fh(&[1]), offset: 0, count: 9, stable: StableHow::Unstable, data: vec![1; 4] };
-        let Ok(Request::Write { count, data, .. }) = Request::read(procedure::WRITE, &req.to_args()) else { panic!() };
-        assert_eq!((count, data.len()), (4, 4));
-        // Data past MAX_DATA is cut: a short write, with its count.
-        let req = Request::Write {
+        let request = Request::Write {
+            file: fh(&[1]),
+            offset: 0,
+            count: 9,
+            stable: StableHow::Unstable,
+            data: vec![1; 4],
+        };
+        assert!(request.to_args().is_err());
+        let request = Request::Write {
             file: fh(&[1]),
             offset: 0,
             count: MAX_DATA as u32 + 3,
             stable: StableHow::Unstable,
             data: vec![1; MAX_DATA + 3],
         };
-        let Ok(Request::Write { count, data, .. }) = Request::read(procedure::WRITE, &req.to_args()) else { panic!() };
-        assert_eq!((count as usize, data.len()), (MAX_DATA, MAX_DATA));
-        // A READ cut short is not the end of the file.
-        let resp = Response::Read(Ok(ReadOk {
+        assert!(request.to_args().is_err());
+        let response = Response::Read(Ok(ReadOk {
             attributes: None,
             count: MAX_DATA as u32 + 1,
             eof: true,
             data: vec![0; MAX_DATA + 1],
         }));
-        let Ok(Response::Read(Ok(back))) = Response::parse(procedure::READ, &resp.to_results()) else { panic!() };
-        assert_eq!((back.count as usize, back.data.len(), back.eof), (MAX_DATA, MAX_DATA, false));
+        assert!(response.to_results().is_err());
         let resp = Response::Read(Ok(ReadOk { attributes: None, count: 3, eof: true, data: vec![0; 3] }));
-        assert_eq!(Response::parse(procedure::READ, &resp.to_results()), Ok(resp));
+        assert_eq!(Response::parse(procedure::READ, &resp.to_results().unwrap()), Ok(resp));
     }
 
     #[test]
@@ -3153,62 +3197,52 @@ mod tests {
             w.bool(false);
         }
         w.bool(false);
-        let b = w.finish();
+        let b = w.finish().unwrap();
         assert!(b.len() > MAX_EXPORT_BYTES);
         assert!(matches!(MountResponse::parse(mount_procedure::EXPORT, &b), Err(XdrError::TooLong(_))));
-        // The writer stops before the limit, and what it writes reads back.
-        let resp = MountResponse::Export(exports);
-        let out = resp.to_results();
-        assert!(out.len() <= MAX_EXPORT_BYTES);
-        let back = MountResponse::parse(mount_procedure::EXPORT, &out).unwrap();
-        let MountResponse::Export(list) = &back else { panic!() };
-        assert_eq!(list.len(), 15);
-        assert_eq!(back.to_results(), out);
-        // Short exports stop at the count.
-        let resp =
-            MountResponse::Export(vec![ExportEntry { directory: b"/".to_vec(), groups: vec![] }; MAX_EXPORTS + 5]);
-        let MountResponse::Export(back) = MountResponse::parse(mount_procedure::EXPORT, &resp.to_results()).unwrap()
-        else {
-            panic!()
-        };
-        assert_eq!(back.len(), MAX_EXPORTS);
+        assert!(MountResponse::Export(exports.clone()).to_results().is_err());
+        let response = MountResponse::Export(exports[..15].to_vec());
+        let bytes = response.to_results().unwrap();
+        assert_eq!(MountResponse::parse(mount_procedure::EXPORT, &bytes), Ok(response));
+        assert!(
+            MountResponse::Export(vec![
+                ExportEntry { directory: b"/".to_vec(), groups: vec![] };
+                MAX_EXPORTS + 5
+            ])
+            .to_results()
+            .is_err()
+        );
     }
 
     #[test]
     fn directory_lists_follow_a_byte_limit() {
         // A READDIR asked with count 65536 may carry 1025 short entries.
-        let entries: Vec<Entry> =
-            (0..1025).map(|i| Entry { fileid: i, name: format!("{i:04}").into_bytes(), cookie: i + 1 }).collect();
-        let resp = Response::ReadDir(Ok(ReadDirOk { entries, eof: true, ..ReadDirOk::default() }));
-        let b = resp.to_results();
-        assert!(b.len() < 65536);
-        assert_eq!(Response::parse(procedure::READDIR, &b), Ok(resp));
-        // A writer that leaves entries out must not tell the client it saw
-        // the whole directory.
-        let entries: Vec<Entry> = (0..MAX_DIR_BYTES as u64 / 28 + 1)
-            .map(|i| Entry { fileid: i, name: b"e".to_vec(), cookie: i + 1 })
+        let entries: Vec<Entry> = (0..1025)
+            .map(|i| Entry { fileid: i, name: format!("{i:04}").into_bytes(), cookie: i + 1 })
             .collect();
         let resp = Response::ReadDir(Ok(ReadDirOk { entries, eof: true, ..ReadDirOk::default() }));
-        let Ok(Response::ReadDir(Ok(back))) = Response::parse(procedure::READDIR, &resp.to_results()) else { panic!() };
-        assert_eq!(back.entries.len(), MAX_DIR_BYTES / 28);
-        assert!(!back.eof);
-        assert_eq!(back.entries.last().unwrap().cookie, (MAX_DIR_BYTES / 28) as u64);
+        let b = resp.to_results().unwrap();
+        assert!(b.len() < 65536);
+        assert_eq!(Response::parse(procedure::READDIR, &b), Ok(resp));
+        let entries = (0..MAX_DIR_BYTES as u64 / 28 + 1)
+            .map(|i| Entry { fileid: i, name: b"e".to_vec(), cookie: i + 1 })
+            .collect();
+        let response = Response::ReadDir(Ok(ReadDirOk { entries, eof: true, ..ReadDirOk::default() }));
+        assert!(response.to_results().is_err());
         let entries = vec![EntryPlus::default(); MAX_DIR_BYTES / 32 + 1];
-        let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk { entries, eof: true, ..ReadDirPlusOk::default() }));
-        let Ok(Response::ReadDirPlus(Ok(back))) = Response::parse(procedure::READDIRPLUS, &resp.to_results()) else {
-            panic!()
-        };
-        assert_eq!(back.entries.len(), MAX_DIR_BYTES / 32);
-        assert!(!back.eof);
+        let response =
+            Response::ReadDirPlus(Ok(ReadDirPlusOk { entries, eof: true, ..ReadDirPlusOk::default() }));
+        assert!(response.to_results().is_err());
         // A list within the limit keeps its eof.
         let entries = vec![EntryPlus::default(); MAX_DIR_BYTES / 32];
-        let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk { entries, eof: true, ..ReadDirPlusOk::default() }));
-        assert_eq!(Response::parse(procedure::READDIRPLUS, &resp.to_results()), Ok(resp));
+        let resp =
+            Response::ReadDirPlus(Ok(ReadDirPlusOk { entries, eof: true, ..ReadDirPlusOk::default() }));
+        assert_eq!(Response::parse(procedure::READDIRPLUS, &resp.to_results().unwrap()), Ok(resp));
     }
 
     #[test]
     fn largest_messages_fit_in_a_record() {
-        // Each writer at its limits makes a message a Decoder takes.
+        // Values within each protocol limit fit in a strict RPC record.
         let fat = FileHandle(vec![1; MAX_FH]);
         let name = vec![b'n'; MAX_NAME];
         let path = vec![b'p'; MAX_PATH];
@@ -3221,33 +3255,49 @@ mod tests {
             handle: Some(fat.clone()),
         };
         let replies = [
-            Response::Read(Ok(ReadOk { attributes: Some(attrs()), count: 0, eof: true, data: vec![7; MAX_DATA] }))
-                .reply(),
+            Response::Read(Ok(ReadOk {
+                attributes: Some(attrs()),
+                count: MAX_DATA as u32,
+                eof: true,
+                data: vec![7; MAX_DATA],
+            }))
+            .reply()
+            .unwrap(),
             Response::ReadDirPlus(Ok(ReadDirPlusOk {
                 attributes: Some(attrs()),
-                entries: vec![plus; MAX_DIR_ENTRIES],
+                entries: vec![plus; MAX_DIR_BYTES / 440],
                 ..ReadDirPlusOk::default()
             }))
-            .reply(),
+            .reply()
+            .unwrap(),
             MountResponse::Export(vec![
-                ExportEntry { directory: path.clone(), groups: vec![group; MAX_GROUPS] };
-                MAX_EXPORTS
+                ExportEntry {
+                    directory: path.clone(),
+                    groups: vec![group; MAX_GROUPS]
+                };
+                MAX_EXPORT_BYTES / (MAX_PATH + 12 + MAX_GROUPS * (MAX_MOUNT_NAME + 9))
             ])
-            .reply(),
-            MountResponse::Dump(vec![MountEntry { hostname: "h".repeat(MAX_MOUNT_NAME), directory: path }; MAX_MOUNTS])
-                .reply(),
+            .reply()
+            .unwrap(),
+            MountResponse::Dump(vec![
+                MountEntry { hostname: "h".repeat(MAX_MOUNT_NAME), directory: path };
+                MAX_MOUNTS
+            ])
+            .reply()
+            .unwrap(),
         ];
-        let call = Message::parse(&Request::Null.call(1).to_bytes()).unwrap();
+        let call = Message::parse(&Request::Null.call(1).unwrap().to_bytes().unwrap()).unwrap();
         let mut messages: Vec<Message> = replies.into_iter().map(|r| call.reply(r)).collect();
         messages.push(
             Request::Write {
                 file: fat.clone(),
                 offset: 0,
-                count: 0,
+                count: MAX_DATA as u32,
                 stable: StableHow::Unstable,
                 data: vec![1; MAX_DATA],
             }
-            .call(2),
+            .call(2)
+            .unwrap(),
         );
         messages.push(
             Request::Symlink {
@@ -3255,13 +3305,13 @@ mod tests {
                 attributes: sattr(),
                 target: vec![b't'; MAX_SYMLINK],
             }
-            .call(3),
+            .call(3)
+            .unwrap(),
         );
         for m in messages {
-            let bytes = m.to_bytes();
-            let mut d = Decoder::new();
-            d.feed(&encode_record(&bytes));
-            assert_eq!(d.next_record(), Some(Ok(bytes)));
+            let bytes = m.to_bytes().unwrap();
+            let record = Record(bytes);
+            assert_eq!(Record::parse(&record.to_bytes().unwrap()), Ok(record));
         }
     }
 
@@ -3269,42 +3319,50 @@ mod tests {
     fn calls_over_tcp_one_byte_at_a_time() {
         let mut stream = Vec::new();
         for (i, req) in requests().iter().enumerate() {
-            stream.extend(encode_record(&req.call(i as u32).to_bytes()));
+            stream
+                .extend(Record(req.call(i as u32).unwrap().to_bytes().unwrap().to_vec()).to_bytes().unwrap());
         }
-        stream.extend(encode_record(&MountRequest::Mnt("/export".into()).call(99).to_bytes()));
-        let mut d = Decoder::new();
+        stream.extend(
+            Record(MountRequest::Mnt("/export".into()).call(99).unwrap().to_bytes().unwrap().to_vec())
+                .to_bytes()
+                .unwrap(),
+        );
+        let mut d = Stream::new(records(MAX_RECORD));
         let mut got = Vec::new();
         let mut mounts = Vec::new();
-        for b in &stream {
-            d.feed(std::slice::from_ref(b));
-            while let Some(record) = d.next_record() {
-                let m = Message::parse(&record.unwrap()).unwrap();
+        contract::check_decode(|| records(MAX_RECORD), &stream);
+        for b in test_support::chunks(&stream, &[1]) {
+            pump(&mut d, b, |record| {
+                let Assembled::Message(record) = record;
+                let m = Message::parse(&record).unwrap();
                 let Body::Call(c) = &m.body else { panic!() };
                 match c.program {
                     NFS_PROGRAM => got.push(Request::parse(c).unwrap()),
                     _ => mounts.push(MountRequest::parse(c).unwrap()),
                 }
-            }
+            })
+            .unwrap();
         }
+        finish(&mut d, |_| panic!("unexpected record at EOF")).unwrap();
         assert_eq!(got, requests());
         assert_eq!(mounts, [MountRequest::Mnt("/export".into())]);
     }
 
     fn random_fattr(rng: &mut Lcg) -> Fattr {
         Fattr {
-            kind: FileType::from_code(rng.below(7) + 1).unwrap(),
-            mode: rng.next(),
-            nlink: rng.next(),
-            uid: rng.next(),
-            gid: rng.next(),
-            size: rng.u64(),
-            used: rng.u64(),
-            rdev: SpecData { major: rng.next(), minor: rng.next() },
-            fsid: rng.u64(),
-            fileid: rng.u64(),
-            atime: Time { seconds: rng.next(), nseconds: rng.next() },
-            mtime: Time { seconds: rng.next(), nseconds: rng.next() },
-            ctime: Time { seconds: rng.next(), nseconds: rng.next() },
+            kind: FileType::from_code((rng.below(7) as u32) + 1).unwrap(),
+            mode: (rng.next() as u32),
+            nlink: (rng.next() as u32),
+            uid: (rng.next() as u32),
+            gid: (rng.next() as u32),
+            size: (rng.next() << 32 | rng.next()),
+            used: (rng.next() << 32 | rng.next()),
+            rdev: SpecData { major: (rng.next() as u32), minor: (rng.next() as u32) },
+            fsid: (rng.next() << 32 | rng.next()),
+            fileid: (rng.next() << 32 | rng.next()),
+            atime: Time { seconds: (rng.next() as u32), nseconds: (rng.next() as u32) },
+            mtime: Time { seconds: (rng.next() as u32), nseconds: (rng.next() as u32) },
+            ctime: Time { seconds: (rng.next() as u32), nseconds: (rng.next() as u32) },
         }
     }
 
@@ -3312,121 +3370,125 @@ mod tests {
     /// back to exactly the same bytes, for every reader.
     fn check_any(p: u32, bytes: &[u8]) {
         if let Ok(req) = Request::read(p, bytes) {
-            assert_eq!(req.to_args(), bytes);
+            assert_eq!(req.to_args().unwrap(), bytes);
         }
         if let Ok(resp) = Response::parse(p, bytes) {
-            assert_eq!(resp.to_results(), bytes);
+            assert_eq!(resp.to_results().unwrap(), bytes);
         }
         if let Ok(req) = MountRequest::read(p, bytes) {
-            assert_eq!(req.to_args(), bytes);
+            assert_eq!(req.to_args().unwrap(), bytes);
         }
         if let Ok(resp) = MountResponse::parse(p, bytes) {
-            assert_eq!(resp.to_results(), bytes);
+            assert_eq!(resp.to_results().unwrap(), bytes);
         }
     }
 
     #[test]
     fn fuzz_loop() {
-        let mut rng = Lcg(0x1813_1833);
+        let mut rng = Lcg::new(0x1813_1833);
         let mut seeds: Vec<(u32, Vec<u8>)> = Vec::new();
         for r in requests() {
-            seeds.push((r.procedure(), r.to_args()));
+            seeds.push((r.procedure(), r.to_args().unwrap()));
         }
         for r in responses() {
-            seeds.push((r.procedure(), r.to_results()));
+            seeds.push((r.procedure(), r.to_results().unwrap()));
         }
         for r in mount_requests() {
-            seeds.push((r.procedure(), r.to_args()));
+            seeds.push((r.procedure(), r.to_args().unwrap()));
         }
         for r in mount_responses() {
-            seeds.push((r.procedure(), r.to_results()));
+            seeds.push((r.procedure(), r.to_results().unwrap()));
         }
         for _ in 0..20_000 {
-            let (p, seed) = &seeds[rng.below(seeds.len() as u32) as usize];
+            let (p, seed) = &seeds[(rng.below(seeds.len() as u64) as u32) as usize];
             let mut b = seed.clone();
             // Mutate: flip bytes, set small words, cut or grow.
-            for _ in 0..=rng.below(4) {
-                match rng.below(5) {
+            for _ in 0..=(rng.below(4) as u32) {
+                match rng.below(5) as u32 {
                     0 if !b.is_empty() => {
-                        let i = rng.below(b.len() as u32) as usize;
-                        b[i] = rng.next() as u8;
+                        let i = (rng.below(b.len() as u64) as u32) as usize;
+                        b[i] = (rng.next() as u32) as u8;
                     }
                     1 if b.len() >= 4 => {
-                        let i = rng.below(b.len() as u32 / 4) as usize * 4;
-                        b[i..i + 4].copy_from_slice(&rng.below(4).to_be_bytes());
+                        let i = (rng.below(b.len() as u64 / 4) as u32) as usize * 4;
+                        b[i..i + 4].copy_from_slice(&(rng.below(4) as u32).to_be_bytes());
                     }
                     2 if !b.is_empty() => {
-                        let n = rng.below(b.len() as u32) as usize;
+                        let n = (rng.below(b.len() as u64) as u32) as usize;
                         b.truncate(n);
                     }
-                    3 => b.extend((0..rng.below(12)).map(|_| rng.next() as u8)),
+                    3 => b.extend((0..(rng.below(12) as u32)).map(|_| (rng.next() as u32) as u8)),
                     _ => {}
                 }
             }
-            let p = if rng.below(8) == 0 { rng.below(24) } else { *p };
+            let p = if (rng.below(8) as u32) == 0 { rng.below(24) as u32 } else { *p };
             check_any(p, &b);
         }
         // Fully random bytes, for every procedure number and a few past.
         for _ in 0..5_000 {
-            let len = rng.below(200) as usize;
-            let b: Vec<u8> = (0..len).map(|_| if rng.chance() { 0 } else { rng.next() as u8 }).collect();
-            check_any(rng.below(24), &b);
+            let len = (rng.below(200) as u32) as usize;
+            let b: Vec<u8> = (0..len)
+                .map(|_| if (rng.next() as u32) & 1 == 1 { 0 } else { (rng.next() as u32) as u8 })
+                .collect();
+            check_any(rng.below(24) as u32, &b);
         }
         // Random values round trip.
         for _ in 0..2_000 {
             let a = random_fattr(&mut rng);
-            let entries: Vec<EntryPlus> = (0..rng.below(5))
+            let entries: Vec<EntryPlus> = (0..(rng.below(5) as u32))
                 .map(|i| EntryPlus {
-                    fileid: rng.u64(),
-                    name: (0..rng.below(300)).map(|_| rng.next() as u8).collect(),
+                    fileid: (rng.next() << 32 | rng.next()),
+                    name: (0..(rng.below(300) as u32)).map(|_| (rng.next() as u32) as u8).collect(),
                     cookie: u64::from(i),
-                    attributes: rng.chance().then_some(a),
-                    handle: rng.chance().then(|| FileHandle(vec![7; rng.below(80) as usize])),
+                    attributes: ((rng.next() as u32) & 1 == 1).then_some(a),
+                    handle: ((rng.next() as u32) & 1 == 1)
+                        .then(|| FileHandle(vec![7; (rng.below(80) as u32) as usize])),
                 })
                 .collect();
             let resp = Response::ReadDirPlus(Ok(ReadDirPlusOk {
-                attributes: rng.chance().then_some(a),
-                cookieverf: rng.u64().to_be_bytes(),
+                attributes: ((rng.next() as u32) & 1 == 1).then_some(a),
+                cookieverf: (rng.next() << 32 | rng.next()).to_be_bytes(),
                 entries,
-                eof: rng.chance(),
+                eof: ((rng.next() as u32) & 1 == 1),
             }));
-            let b = resp.to_results();
-            let back = Response::parse(procedure::READDIRPLUS, &b).unwrap();
-            assert_eq!(back.to_results(), b);
+            if let Ok(bytes) = resp.to_results() {
+                assert_eq!(Response::parse(procedure::READDIRPLUS, &bytes), Ok(resp));
+            }
             let req = Request::SetAttr {
-                object: FileHandle(vec![3; rng.below(70) as usize]),
+                object: FileHandle(vec![3; (rng.below(70) as u32) as usize]),
                 attributes: Sattr {
-                    mode: rng.chance().then(|| rng.next()),
-                    uid: rng.chance().then(|| rng.next()),
-                    gid: rng.chance().then(|| rng.next()),
-                    size: rng.chance().then(|| rng.u64()),
+                    mode: ((rng.next() as u32) & 1 == 1).then(|| rng.next() as u32),
+                    uid: ((rng.next() as u32) & 1 == 1).then(|| rng.next() as u32),
+                    gid: ((rng.next() as u32) & 1 == 1).then(|| rng.next() as u32),
+                    size: ((rng.next() as u32) & 1 == 1).then(|| rng.next() << 32 | rng.next()),
                     atime: [SetTime::DontChange, SetTime::ServerTime, SetTime::ClientTime(a.mtime)]
-                        [rng.below(3) as usize],
+                        [(rng.below(3) as u32) as usize],
                     mtime: [SetTime::DontChange, SetTime::ServerTime, SetTime::ClientTime(a.ctime)]
-                        [rng.below(3) as usize],
+                        [(rng.below(3) as u32) as usize],
                 },
-                guard: rng.chance().then_some(a.atime),
+                guard: ((rng.next() as u32) & 1 == 1).then_some(a.atime),
             };
-            let args = req.to_args();
-            assert_eq!(Request::read(procedure::SETATTR, &args).unwrap().to_args(), args);
+            if let Ok(args) = req.to_args() {
+                assert_eq!(Request::read(procedure::SETATTR, &args), Ok(req));
+            }
         }
         // A random stream of records, read one byte at a time.
         let mut stream = Vec::new();
         for _ in 0..300 {
             let mut b = Vec::new();
-            b.extend((0..rng.below(64)).map(|_| rng.next() as u8));
-            stream.extend(encode_record(&b));
+            b.extend((0..(rng.below(64) as u32)).map(|_| (rng.next() as u32) as u8));
+            stream.extend(Record(b.to_vec()).to_bytes().unwrap());
         }
-        let mut d = Decoder::with_limit(1 << 16);
-        for b in &stream {
-            d.feed(std::slice::from_ref(b));
-            while let Some(Ok(record)) = d.next_record() {
-                if let Ok(Message { body: Body::Call(c), .. }) = Message::parse(&record) {
-                    let _ = Request::parse(&c);
-                    let _ = MountRequest::parse(&c);
-                }
-                check_any(rng.below(22), &record);
+        contract::check_decode(|| records(1 << 16), &stream);
+        let mut decoder = Stream::new(records(1 << 16));
+        pump(&mut decoder, &stream, |record| {
+            let Assembled::Message(record) = record;
+            if let Ok(Message { body: Body::Call(call), .. }) = Message::parse(&record) {
+                let _ = Request::parse(&call);
+                let _ = MountRequest::parse(&call);
             }
-        }
+            check_any(rng.below(22) as u32, &record);
+        })
+        .unwrap();
     }
 }
