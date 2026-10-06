@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use etherparse::PacketBuilder;
 use fictionet::prelude::*;
-use fictionet::stdlib::route::{Prefix, router};
+use fictionet::stdlib::route::{Prefix, lan, router};
 use fictionet::stdlib::{bottleneck, delay, icmp, ip};
 use fictionet::time::ms;
 use fictionet::{Cx, End, Interface, Packet, RecvError, block_on, pair, run};
@@ -582,6 +582,52 @@ fn router_keeps_running_while_the_handle_can_add_routes() {
         assert_eq!(recv_soon(&cx, &mut b).await.0[28], 1);
         drop(r);
         drop((b, c));
+        Ok(())
+    });
+}
+
+#[test]
+fn lan_forwards_unicast_and_floods_ip_group_traffic() {
+    world(|cx| async move {
+        let network: Prefix = "192.168.56.0/24".parse()?;
+        let lan = lan(&cx, network);
+        let (a_lan, mut a) = pair();
+        let (b_lan, mut b) = pair();
+        let (c_lan, mut c) = pair();
+        lan.add("192.168.56.10".parse()?, Box::new(a_lan))?;
+        lan.add("192.168.56.11".parse()?, Box::new(b_lan))?;
+        lan.add("192.168.56.22".parse()?, Box::new(c_lan))?;
+
+        // Unicast goes only to the member that owns the destination.
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[1])));
+        assert_eq!(recv_soon(&cx, &mut b).await.0[28], 1);
+        assert!(recv_within(&cx, &mut c, ms(20)).await.is_none());
+
+        // The subnet broadcast, limited broadcast and multicast are copied
+        // to every member except the sender.
+        for (dst, tag) in [
+            ([192, 168, 56, 255], 2),
+            ([255, 255, 255, 255], 3),
+            ([224, 0, 0, 252], 4),
+        ] {
+            a.send(Packet(v4_udp([192, 168, 56, 10], dst, &[tag])));
+            assert_eq!(recv_soon(&cx, &mut b).await.0[28], tag);
+            assert_eq!(recv_soon(&cx, &mut c).await.0[28], tag);
+            assert!(recv_within(&cx, &mut a, ms(20)).await.is_none());
+        }
+
+        // Reconnecting an address replaces the old member.
+        let (new_b_lan, mut new_b) = pair();
+        lan.add("192.168.56.11".parse()?, Box::new(new_b_lan))?;
+        assert_eq!(b.recv(&cx).await, Err(RecvError::Closed));
+        a.send(Packet(v4_udp([192, 168, 56, 10], [192, 168, 56, 11], &[5])));
+        assert_eq!(recv_soon(&cx, &mut new_b).await.0[28], 5);
+
+        let (outside_lan, _outside) = pair();
+        assert!(lan.add("192.168.57.1".parse()?, Box::new(outside_lan)).is_err());
+
+        drop(lan);
+        drop((a, b, c, new_b));
         Ok(())
     });
 }

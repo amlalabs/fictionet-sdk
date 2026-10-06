@@ -7,6 +7,11 @@
 //! matches the packet's destination. The [`router`] docs show a sandbox and
 //! two machines wired together.
 //!
+//! Use a [`lan`] when real or simulated machines share one IP subnet. It
+//! forwards unicast by exact address and floods IP broadcast and multicast
+//! packets to the other members, including the NBNS and LLMNR traffic common
+//! on Windows networks.
+//!
 //! To build a whole network of websites, routes and all, use
 //! [`web::Sites`](crate::stdlib::web::Sites) instead.
 
@@ -59,6 +64,10 @@ impl Prefix {
     /// The same prefix with the bits past its length cleared.
     fn canonical(self) -> Prefix {
         Prefix { addr: mask(self.addr, self.len), len: self.len }
+    }
+
+    fn contains(self, addr: IpAddr) -> bool {
+        self.addr.is_ipv4() == addr.is_ipv4() && mask(addr, self.len) == self.canonical().addr
     }
 }
 
@@ -325,5 +334,200 @@ impl Router {
     /// If the router has stopped, `interface` is dropped.
     pub fn add(&self, prefix: Prefix, interface: Box<dyn Interface>) {
         self.handle.add(prefix, interface);
+    }
+}
+
+/// Starts an IP LAN that joins real or simulated machines on one subnet.
+///
+/// Unlike [`router`], a LAN floods IPv4 broadcast and multicast packets to
+/// every other member. Unicast packets go only to the member registered for
+/// their destination address. The packets themselves are unchanged: the LAN
+/// does not lower their TTL or hop limit.
+///
+/// This is useful for virtual machines attached through
+/// `fictionet attach --type tap`. Attach answers each VM's ARP locally and
+/// hands the LAN its IP packets, so machines configured for the same subnet
+/// can communicate even though every VM has a point-to-point attachment. IP
+/// broadcasts such as NetBIOS Name Service and LLMNR still reach the other
+/// members. Ethernet-only traffic, including ARP, does not reach a world and
+/// is outside this LAN.
+///
+/// Add members with [`Lan::add`]. An address may have one member; adding it
+/// again replaces and closes the old interface. The task stops when every
+/// member has disconnected and the last handle has been dropped.
+#[track_caller]
+pub fn lan(cx: &Cx, subnet: Prefix) -> Lan {
+    let subnet = subnet.canonical();
+    let shared = Arc::new(Mutex::new(LanShared {
+        adds: Vec::new(),
+        handles_gone: false,
+        stopped: false,
+        waker: None,
+    }));
+    let lan = Lan { handle: Arc::new(LanHandle { subnet, shared: shared.clone() }) };
+    cx.spawn_as(|| "lan".into(), move |cx| async move {
+        let _stopped = LanStopped(shared.clone());
+        let mut ports = Ports::new(Vec::new());
+        let mut by_addr = HashMap::<IpAddr, usize>::new();
+        let mut by_port = HashMap::<usize, IpAddr>::new();
+        let mut handles_gone = false;
+        loop {
+            let (adds, gone) = {
+                let mut s = shared.lock().unwrap();
+                (std::mem::take(&mut s.adds), s.handles_gone)
+            };
+            handles_gone = handles_gone || gone;
+            for (addr, interface) in adds {
+                if let Some(link) = interface.observe_link() {
+                    cx.graph().label(&link.0, addr.to_string());
+                }
+                match by_addr.get(&addr).copied() {
+                    Some(i) => ports.replace(i, interface),
+                    None => {
+                        let i = ports.add(interface);
+                        by_addr.insert(addr, i);
+                        by_port.insert(i, addr);
+                    }
+                }
+            }
+            if by_addr.is_empty() && handles_gone {
+                return Ok(());
+            }
+            match ports
+                .next(&cx, None, |task| {
+                    let mut s = shared.lock().unwrap();
+                    if !s.adds.is_empty() || (s.handles_gone && !handles_gone) {
+                        return Poll::Ready(());
+                    }
+                    match &s.waker {
+                        Some(w) if w.will_wake(task.waker()) => {}
+                        _ => s.waker = Some(task.waker().clone()),
+                    }
+                    Poll::Pending
+                })
+                .await
+            {
+                Event::Packet(from, packet) => {
+                    let Some(dst) = wire::destination(&packet.0) else { continue };
+                    if lan_group_destination(subnet, dst) {
+                        let mut recipients = 0;
+                        for i in by_addr.values().copied().filter(|&i| i != from) {
+                            ports.send(i, packet.clone());
+                            recipients += 1;
+                        }
+                        ports.spend(recipients);
+                    } else if let Some(&to) = by_addr.get(&dst) {
+                        ports.send(to, packet);
+                    }
+                }
+                Event::Closed(i) => {
+                    if let Some(addr) = by_port.remove(&i) {
+                        by_addr.remove(&addr);
+                        if cx.observed() {
+                            cx.graph().note("lan_member_removed", format!("{addr}: its interface closed"), None);
+                        }
+                    }
+                }
+                Event::Extra | Event::Timer => {}
+                Event::Cancelled => return Ok(()),
+            }
+        }
+    });
+    lan
+}
+
+/// Whether `dst` is delivered to every other member of `subnet`.
+fn lan_group_destination(subnet: Prefix, dst: IpAddr) -> bool {
+    match (subnet.addr, dst) {
+        (IpAddr::V4(network), IpAddr::V4(dst)) => {
+            if dst.is_multicast() || dst == Ipv4Addr::BROADCAST {
+                return true;
+            }
+            if subnet.len >= 31 {
+                return false;
+            }
+            let host = u32::MAX >> subnet.len;
+            dst == Ipv4Addr::from(u32::from(network) | host)
+        }
+        (IpAddr::V6(_), IpAddr::V6(dst)) => dst.is_multicast(),
+        _ => false,
+    }
+}
+
+struct LanShared {
+    adds: Vec<(IpAddr, Box<dyn Interface>)>,
+    handles_gone: bool,
+    stopped: bool,
+    waker: Option<Waker>,
+}
+
+struct LanStopped(Arc<Mutex<LanShared>>);
+
+impl Drop for LanStopped {
+    fn drop(&mut self) {
+        let adds = {
+            let mut s = self.0.lock().unwrap();
+            s.stopped = true;
+            std::mem::take(&mut s.adds)
+        };
+        drop(adds);
+    }
+}
+
+struct LanHandle {
+    subnet: Prefix,
+    shared: Arc<Mutex<LanShared>>,
+}
+
+impl Drop for LanHandle {
+    fn drop(&mut self) {
+        let waker = {
+            let mut s = self.shared.lock().unwrap();
+            s.handles_gone = true;
+            s.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+/// A handle to a running IP [`lan`].
+///
+/// Clones share the same LAN. Dropping a handle does not disconnect members.
+/// Once every handle has gone, the LAN stops after its last member closes.
+#[derive(Clone)]
+pub struct Lan {
+    handle: Arc<LanHandle>,
+}
+
+impl Lan {
+    /// Adds one member at `addr`.
+    ///
+    /// `addr` must belong to the LAN's subnet and use the same address
+    /// family. Adding an address already present replaces and closes its old
+    /// interface. If the LAN has stopped, `interface` is dropped.
+    pub fn add(&self, addr: IpAddr, interface: Box<dyn Interface>) -> Result<(), Error> {
+        if !self.handle.subnet.contains(addr) {
+            return Err(format!(
+                "{addr} is outside LAN subnet {}/{}",
+                self.handle.subnet.addr, self.handle.subnet.len
+            )
+            .into());
+        }
+        let waker = {
+            let mut s = self.handle.shared.lock().unwrap();
+            if s.stopped {
+                drop(s);
+                drop(interface);
+                return Ok(());
+            }
+            s.adds.push((addr, interface));
+            s.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+        Ok(())
     }
 }
