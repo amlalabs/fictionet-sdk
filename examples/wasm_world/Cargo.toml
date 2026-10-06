@@ -6,6 +6,10 @@ description = "A small Fictionet world that runs in a browser: one DNS name, one
 license = "MIT OR Apache-2.0"
 publish = false
 
+# Its own workspace, so its dependencies stay out of the fictionet crate's
+# workspace and lock file.
+[workspace]
+
 # cdylib for `wasm-pack build`, rlib for the tests.
 [lib]
 crate-type = ["cdylib", "rlib"]
