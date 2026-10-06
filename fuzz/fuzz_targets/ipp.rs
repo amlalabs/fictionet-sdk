@@ -1,27 +1,36 @@
 //! IPP request and response bodies, as a world playing a printer reads
 //! them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the unchanged compatibility API.
 
 use fictionet::stdlib::codec::{Wire, contract};
-use fictionet::stdlib::ipp::{Attribute, Decoder, Error, Head, MAX_FIELD, MAX_HEAD, Message, Messages, Value, tag};
+use fictionet::stdlib::ipp::{
+    Attribute, Decoder, Error, Head, Header, MAX_FIELD, MAX_HEAD, Message, Value, tag,
+};
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
-    contract::check_decode(Messages::new, data);
-    contract::check_decode(|| Messages::with_limits(64, 7), data);
-    contract::check_wire::<Head>(data);
+    contract::check_decode(Head::new, data);
+    contract::check_decode(|| Head::with_limit(64), data);
+    contract::check_wire::<Header>(data);
     let mut message = Message::request(2, 7);
     message.add(
         tag::JOB_ATTRIBUTES,
-        Attribute::new("document", Value::OctetString(data.get(..MAX_FIELD + 1).unwrap_or(data).to_vec())),
+        Attribute::new(
+            "document",
+            Value::OctetString(data.get(..MAX_FIELD + 1).unwrap_or(data).to_vec()),
+        ),
     );
-    let built =
-        Head { version: message.version, code: message.code, request_id: message.request_id, groups: message.groups };
+    let built = Header::from(message);
     contract::check_wire_value(&built);
-    let mut body = Wire::to_bytes(&Head { version: (1, 1), code: 2, request_id: 7, groups: vec![] }).unwrap();
+    let mut body = Wire::to_bytes(&Header {
+        version: (1, 1),
+        code: 2,
+        request_id: 7,
+        groups: vec![],
+    })
+    .unwrap();
     body.extend_from_slice(data.get(..4096).unwrap_or(data));
-    contract::check_decode(|| Messages::with_limits(64, 7), &body);
+    contract::check_decode(|| Head::with_limit(64), &body);
 
     let whole = Message::parse(data);
 

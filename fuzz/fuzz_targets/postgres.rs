@@ -1,12 +1,11 @@
 //! PostgreSQL frontend and backend messages, as a world playing a
 //! database server, or a client, reads them.
 #![no_main]
-#![allow(deprecated)] // Also exercise the unchanged compatibility API.
 
 use fictionet::stdlib::codec::{Wire, contract};
 use fictionet::stdlib::postgres::{
-    Backend, BackendDecoder, BackendMessages, Decoder, EncryptionReply, Error, Frontend, FrontendMessages,
-    SMALL_MESSAGE, SaslInitialResponse, Startup, read_password,
+    Backend, BackendDecoder, BackendMessages, Decoder, EncryptionReply, Error, Frontend,
+    FrontendMessages, SMALL_MESSAGE, SaslInitialResponse, Startup, read_password,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -71,9 +70,15 @@ fn backend(data: &[u8], chunk: usize) -> Vec<Result<Backend, Error>> {
     )
 }
 
+fn typed_frontend() -> FrontendMessages {
+    let mut decoder = FrontendMessages::with_limit(64);
+    decoder.start_messages();
+    decoder
+}
+
 fuzz_target!(|data: &[u8]| {
     contract::check_decode(|| FrontendMessages::with_limit(64), data);
-    contract::check_decode(|| FrontendMessages::typed(64), data);
+    contract::check_decode(typed_frontend, data);
     contract::check_decode(|| BackendMessages::with_limit(64), data);
     contract::check_decode(
         || {
@@ -94,7 +99,7 @@ fuzz_target!(|data: &[u8]| {
         secret_key: data.get(..257).unwrap_or(data).to_vec(),
     });
     let good = Frontend::Query("select 1".into());
-    contract::check_decode(|| FrontendMessages::typed(64), &Wire::to_bytes(&good).unwrap());
+    contract::check_decode(typed_frontend, &Wire::to_bytes(&good).unwrap());
 
     // The stream, split three ways: all at once, a byte at a time, and in
     // pieces whose size the first byte picks. The second pass puts a
