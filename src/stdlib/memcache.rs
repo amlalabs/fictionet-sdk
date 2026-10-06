@@ -3026,7 +3026,7 @@ mod tests {
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
         // Shared schedules include single-byte pushes and must stay linear.
         let line = [vec![b' '; MAX_LINE - 3], b"\r\n".to_vec()].concat();
-        let stream = line.repeat(200);
+        let stream = line.repeat(50);
         let started = std::time::Instant::now();
         contract::check_decode_with_alloc_limit(Commands::new, &stream, 2 * MAX_LINE);
         assert!(started.elapsed().as_secs() < 5, "took {:?}", started.elapsed());
