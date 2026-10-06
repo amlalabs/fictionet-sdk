@@ -136,6 +136,7 @@ fn ftp_line_limits_escape_boundaries_and_eof() {
         );
     }
     let bad = [b"220-hello\n".as_slice(), &[0], b"\n220 done\n"].concat();
+    contract::check_decode(ftp::Replies::new, &bad);
     assert_eq!(
         decode_all(ftp::Replies::new, &bad).1,
         Some(Fail::Protocol(ftp::DecodeError::Reply(
@@ -486,6 +487,11 @@ fn memcache_limits_are_checked_before_body_assembly() {
     let mut bytes = vec![b'x'; memcache::MAX_LINE];
     bytes.extend_from_slice(b"\r\nversion\r\n");
     contract::check_decode_with_alloc_limit(memcache::Commands::new, &bytes, 2 * memcache::MAX_LINE);
+    contract::check_decode_with_alloc_limit(
+        memcache::Responses::new,
+        &bytes,
+        2 * memcache::MAX_LINE,
+    );
     assert_eq!(
         decode_all(memcache::Commands::new, &bytes).1,
         Some(Fail::Protocol(memcache::TextFrameError::LineTooLong))
@@ -542,6 +548,7 @@ fn memcache_eof_inside_headers_bodies_trailers_and_skips() {
     );
     let bytes = written(&[cache_packet(b"body")]);
     for cut in [1, 23, 24, bytes.len() - 1] {
+        contract::check_decode(memcache::Frames::new, &bytes[..cut]);
         let (items, failure) = decode_all(memcache::Frames::new, &bytes[..cut]);
         assert!(items.is_empty());
         assert_eq!(failure, Some(Fail::Truncated { unread: cut }));
@@ -559,6 +566,7 @@ fn memcache_multiget_uses_its_own_line_limit() {
     round_trip(memcache::Commands::new, &bytes, &[Ok(command)]);
     let mut long = b"get ".to_vec();
     long.resize(memcache::MAX_GET_LINE, b'x');
+    contract::check_decode(memcache::Commands::new, &long);
     let (items, failure) = decode_all(memcache::Commands::new, &long);
     assert!(items.is_empty());
     assert_eq!(

@@ -8,8 +8,9 @@ use fictionet::stdlib::codec::{
     test_support::decode_all,
 };
 use fictionet::stdlib::memcache::{
-    Command, Commands, CounterExtras, Frames, MAX_BINARY_BUFFERED, MAX_LINE, MAX_TEXT_HELD,
-    MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras, UDP_MAX_DATAGRAM, UdpFrame,
+    BINARY_HEADER_LEN, Command, Commands, CounterExtras, Frames, MAX_BINARY_BUFFERED, MAX_LINE,
+    MAX_TEXT_HELD, MetaFlag, MetaStatus, Packet, Response, Responses, Status, StoreExtras,
+    UDP_HEADER_LEN, UDP_MAX_DATAGRAM, UdpError, UdpFrame,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -21,7 +22,11 @@ fuzz_target!(|data: &[u8]| {
     check_decode_with_held_limit(Responses::new, data, MAX_TEXT_HELD);
     check_decode_with_alloc_limit(|| Commands::with_limit(17), data, 2 * MAX_LINE);
     check_decode_with_alloc_limit(|| Responses::with_limit(17), data, 2 * MAX_LINE);
-    check_decode_with_alloc_limit(|| Frames::with_limit(17), data, 2 * (24 + 17));
+    check_decode_with_alloc_limit(
+        || Frames::with_limit(17),
+        data,
+        2 * (BINARY_HEADER_LEN + 17),
+    );
     check_decode_with_held_limit(|| Commands::with_limit(17), data, MAX_TEXT_HELD);
     check_decode_with_held_limit(|| Responses::with_limit(17), data, MAX_TEXT_HELD);
     check_decode_with_held_limit(Frames::new, data, 0);
@@ -69,7 +74,13 @@ fuzz_target!(|data: &[u8]| {
         assert_eq!(f.to_bytes().unwrap(), data);
     }
     // Any bytes as a reply, split into datagrams and put back together.
-    let Ok(frames) = UdpFrame::split(7, data) else { return };
+    let split = UdpFrame::split(7, data);
+    // Even an unusually large corpus entry must not panic at the count limit.
+    if data.len().div_ceil(UDP_MAX_DATAGRAM - UDP_HEADER_LEN) > usize::from(u16::MAX) {
+        assert_eq!(split, Err(UdpError::TooLong(data.len())));
+        return;
+    }
+    let frames = split.unwrap();
     let mut back = Vec::new();
     for (i, f) in frames.iter().enumerate() {
         let bytes = f.to_bytes().unwrap();

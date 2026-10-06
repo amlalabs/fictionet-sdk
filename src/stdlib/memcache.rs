@@ -136,7 +136,8 @@ pub enum Error {
     /// The data block did not end with CR LF. A decoder has skipped it.
     BadDataChunk,
     /// A command or response would be refused or change when read back
-    /// after its fields pass the writer's checks. Readers never yield this.
+    /// after its fields pass the writer's checks. The stream readers
+    /// ([`Commands`] and [`Responses`]) never yield this.
     Unwritable,
 }
 
@@ -1939,16 +1940,11 @@ impl Commands {
         self.inner.quiet
     }
 }
-macro_rules! default_reader {
-    ($($reader:ty),+ $(,)?) => {$(
-        impl Default for $reader {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-    )+};
+impl Default for Commands {
+    fn default() -> Self {
+        Self::new()
+    }
 }
-default_reader!(Commands, Responses, Frames);
 
 impl Decode for Commands {
     type Item = Result<Command, Error>;
@@ -2001,6 +1997,11 @@ impl Responses {
         self.inner.limit
     }
 }
+impl Default for Responses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 impl Decode for Responses {
     type Item = Result<Response, Error>;
     type Error = TextFrameError;
@@ -2017,25 +2018,44 @@ impl Decode for Responses {
     }
 }
 
-fn exact_command(mut bytes: &[u8]) -> Result<Command, CommandParseError> {
-    let mut decoder = Commands::new();
+/// Reads one text unit under its size limit and refuses trailing bytes.
+fn exact_text<D, T, E>(
+    mut decoder: D,
+    mut bytes: &[u8],
+    text_error: impl Fn(Error) -> E,
+    framing_error: impl Fn(TextFrameError) -> E,
+    incomplete: E,
+    trailing: E,
+) -> Result<T, E>
+where
+    D: Decode<Item = Result<T, Error>, Error = TextFrameError>,
+{
     if bytes.len() > MAX_TEXT_UNIT {
-        return Err(CommandParseError::Text(Error::LineTooLong));
+        return Err(text_error(Error::LineTooLong));
     }
     loop {
-        match decoder
-            .decode(bytes, true)
-            .map_err(CommandParseError::Framing)?
-        {
-            Step::Item(item, used) if used == bytes.len() => {
-                return item.map_err(CommandParseError::Text);
-            }
-            Step::Item(Err(e), _) => return Err(CommandParseError::Text(e)),
-            Step::Item(_, _) => return Err(CommandParseError::Trailing),
-            Step::Skip(used) => bytes = bytes.get(used..).ok_or(CommandParseError::Incomplete)?,
-            Step::Need | Step::End => return Err(CommandParseError::Incomplete),
+        match decoder.decode(bytes, true).map_err(&framing_error)? {
+            Step::Item(Err(e), _) => return Err(text_error(e)),
+            Step::Item(Ok(item), used) if used == bytes.len() => return Ok(item),
+            Step::Item(_, _) => return Err(trailing),
+            Step::Skip(used) => match bytes.get(used..) {
+                Some(rest) => bytes = rest,
+                None => return Err(incomplete),
+            },
+            Step::Need | Step::End => return Err(incomplete),
         }
     }
+}
+
+fn exact_command(bytes: &[u8]) -> Result<Command, CommandParseError> {
+    exact_text(
+        Commands::new(),
+        bytes,
+        CommandParseError::Text,
+        CommandParseError::Framing,
+        CommandParseError::Incomplete,
+        CommandParseError::Trailing,
+    )
 }
 
 impl Wire for Command {
@@ -2145,25 +2165,15 @@ impl Wire for Command {
     }
 }
 
-fn exact_response(mut bytes: &[u8]) -> Result<Response, ResponseParseError> {
-    let mut decoder = Responses::new();
-    if bytes.len() > MAX_TEXT_UNIT {
-        return Err(ResponseParseError::Text(Error::LineTooLong));
-    }
-    loop {
-        match decoder
-            .decode(bytes, true)
-            .map_err(ResponseParseError::Framing)?
-        {
-            Step::Item(item, used) if used == bytes.len() => {
-                return item.map_err(ResponseParseError::Text);
-            }
-            Step::Item(Err(e), _) => return Err(ResponseParseError::Text(e)),
-            Step::Item(_, _) => return Err(ResponseParseError::Trailing),
-            Step::Skip(used) => bytes = bytes.get(used..).ok_or(ResponseParseError::Incomplete)?,
-            Step::Need | Step::End => return Err(ResponseParseError::Incomplete),
-        }
-    }
+fn exact_response(bytes: &[u8]) -> Result<Response, ResponseParseError> {
+    exact_text(
+        Responses::new(),
+        bytes,
+        ResponseParseError::Text,
+        ResponseParseError::Framing,
+        ResponseParseError::Incomplete,
+        ResponseParseError::Trailing,
+    )
 }
 
 impl Wire for Response {
@@ -2269,6 +2279,11 @@ impl Frames {
     /// The maximum accepted body size, excluding the header.
     pub fn limit(&self) -> usize {
         self.limit
+    }
+}
+impl Default for Frames {
+    fn default() -> Self {
+        Self::new()
     }
 }
 impl Decode for Frames {

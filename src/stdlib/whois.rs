@@ -1373,13 +1373,13 @@ mod tests {
         assert_eq!(Response::new(text.as_bytes()).unwrap().fields(), Err(TooManyFields));
         assert!(!TooManyFields.to_string().is_empty());
         let fields = vec![Field::new(0, "k", "v"); MAX_FIELDS + 1];
-        assert_eq!(Response::from_fields(&fields).map(|r| r.text().into_owned()), Err(EncodeError::TooLong));
-        assert!(Response::from_fields(&fields[..MAX_FIELDS]).map(|r| r.text().into_owned()).is_ok());
+        assert_eq!(Response::from_fields(&fields), Err(EncodeError::TooLong));
+        assert!(Response::from_fields(&fields[..MAX_FIELDS]).is_ok());
     }
 
     #[test]
     fn writer_errors() {
-        let one = |k: &str, v: &str| Response::from_fields(&[Field::new(0, k, v)]).map(|r| r.text().into_owned());
+        let one = |k: &str, v: &str| Response::from_fields(&[Field::new(0, k, v)]);
         for key in ["", " k", "k ", "a:b", "%k", "#k", ">k", "+k", "k\tx", "k\u{7f}"] {
             assert_eq!(one(key, "v"), Err(EncodeError::Unwritable), "{key:?}");
         }
@@ -1387,9 +1387,22 @@ mod tests {
         for value in [" v", "v ", "v\r", "a\n b", "\nb", "a\u{1}"] {
             assert_eq!(one("k", value), Err(EncodeError::Unwritable), "{value:?}");
         }
-        assert_eq!(Response::from_fields(&[Field::new(1, "k", "v")]).map(|r| r.text().into_owned()), Err(EncodeError::Unwritable));
-        assert_eq!(Response::from_fields(&[Field::new(0, "k", "v"), Field::new(2, "k", "v")]).map(|r| r.text().into_owned()), Err(EncodeError::Unwritable));
-        assert_eq!(Response::from_fields(&[Field::new(0, "k", "v"), Field::new(1, "k", "v"), Field::new(0, "k", "v")]).map(|r| r.text().into_owned()), Err(EncodeError::Unwritable));
+        assert_eq!(
+            Response::from_fields(&[Field::new(1, "k", "v")]),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", "v"), Field::new(2, "k", "v")]),
+            Err(EncodeError::Unwritable)
+        );
+        assert_eq!(
+            Response::from_fields(&[
+                Field::new(0, "k", "v"),
+                Field::new(1, "k", "v"),
+                Field::new(0, "k", "v")
+            ]),
+            Err(EncodeError::Unwritable)
+        );
         let big = "v".repeat(MAX_RESPONSE);
         assert_eq!(one("k", &big), Err(EncodeError::TooLong));
         assert_eq!(Response::from_fields(&[Field::new(0, "k", &big)]), Err(EncodeError::TooLong));
@@ -1413,10 +1426,14 @@ mod tests {
             Field::new(1, "tab", "a\tb"),
             Field::new(2, "trailing", "a\n"),
         ];
-        let text = Response::from_fields(&fields).map(|r| r.text().into_owned()).unwrap();
-        assert!(text.contains("descr: line one\r\n+\r\n        +plus\r\n"));
-        assert_eq!(parse_fields(&text).unwrap(), fields);
-        assert_eq!(Response::from_fields(&[]).map(|r| r.text().into_owned()).unwrap(), "");
+        let response = Response::from_fields(&fields).unwrap();
+        assert!(
+            response
+                .text()
+                .contains("descr: line one\r\n+\r\n        +plus\r\n")
+        );
+        assert_eq!(response.fields().unwrap(), fields);
+        assert_eq!(Response::from_fields(&[]).unwrap().as_bytes(), b"");
     }
 
     #[test]
@@ -1501,7 +1518,31 @@ mod tests {
                 }
             }
             assert_eq!(response.referral(), find_referral(&fields));
-            let fields = [Field::new(0, &rng.text(12), &rng.text(80))];
+            let mut fields = Vec::new();
+            let mut block = 0;
+            for i in 0..rng.index(6) {
+                if i > 0 {
+                    // A skipped block also exercises the ordering refusal.
+                    block += rng.index(3);
+                }
+                let key_bytes = rng.bytes(12);
+                let value_bytes = rng.bytes(80);
+                let key = if rng.coin() {
+                    String::from_utf8_lossy(&key_bytes).into_owned()
+                } else {
+                    // Valid keys let the value and continuation checks run.
+                    format!("key{i}")
+                };
+                let prefixes = [
+                    "", "+", "%", "\t", "\r", "\n", "\x01", "a\n", "a\n+", "a\n%",
+                ];
+                let value = format!(
+                    "{}{}",
+                    prefixes[rng.index(prefixes.len())],
+                    String::from_utf8_lossy(&value_bytes),
+                );
+                fields.push(Field { block, key, value });
+            }
             if let Ok(response) = Response::from_fields(&fields) {
                 assert_eq!(response.fields().unwrap(), fields);
                 contract::check_wire_value(&response);
@@ -1608,17 +1649,30 @@ mod tests {
     #[test]
     fn writer_takes_what_fits() {
         // "k: " and CR LF around a value make exactly MAX_RESPONSE bytes.
-        let text = Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 5))]).map(|r| r.text().into_owned()).unwrap();
-        assert_eq!(text.len(), MAX_RESPONSE);
-        assert_eq!(Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 4))]).map(|r| r.text().into_owned()), Err(EncodeError::TooLong));
+        let response =
+            Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 5))]).unwrap();
+        assert_eq!(response.as_bytes().len(), MAX_RESPONSE);
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", &"a".repeat(MAX_RESPONSE - 4))]),
+            Err(EncodeError::TooLong)
+        );
         // Empty further lines are written as "+" and CR LF.
         let value = format!("a{}", "\n".repeat(100_000));
-        assert_eq!(Response::from_fields(&[Field::new(0, "k", &value)]).map(|r| r.text().into_owned()).unwrap().len(), 300_006);
+        assert_eq!(
+            Response::from_fields(&[Field::new(0, "k", &value)])
+                .unwrap()
+                .as_bytes()
+                .len(),
+            300_006
+        );
         // A blank line between blocks counts too.
         let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 11))];
-        assert_eq!(Response::from_fields(&fields).map(|r| r.text().into_owned()).unwrap().len(), MAX_RESPONSE);
+        assert_eq!(
+            Response::from_fields(&fields).unwrap().as_bytes().len(),
+            MAX_RESPONSE
+        );
         let fields = [Field::new(0, "k", ""), Field::new(1, "k", &"a".repeat(MAX_RESPONSE - 10))];
-        assert_eq!(Response::from_fields(&fields).map(|r| r.text().into_owned()), Err(EncodeError::TooLong));
+        assert_eq!(Response::from_fields(&fields), Err(EncodeError::TooLong));
     }
 
     #[test]
@@ -1663,9 +1717,8 @@ mod tests {
                 }
                 fields.push(Field { block, key, value });
             }
-            let text = Response::from_fields(&fields).map(|r| r.text().into_owned()).unwrap();
-            assert_eq!(parse_fields(&text).unwrap(), fields);
             let resp = Response::from_fields(&fields).unwrap();
+            assert_eq!(resp.fields().unwrap(), fields);
             contract::check_decode_with_alloc_limit(Responses::new, resp.as_bytes(), 2 * RESPONSE_WINDOW);
             assert_eq!(decode_all(Responses::new, resp.as_bytes()).0[0].response.fields().unwrap(), fields);
         }
